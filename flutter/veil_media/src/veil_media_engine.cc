@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdint>
@@ -945,7 +946,7 @@ struct WebrtcState {
   std::unique_ptr<veil_media::CameraCapturer> camera;  // real capture source
   std::unique_ptr<veil_media::ScreenCapturer> screen;  // screen-share source
   int video_target_bitrate_bps = 0;
-  std::atomic<int> video_max_fps{0};
+  std::atomic<double> video_max_fps{0};
   // Route-specific RTP packet ceiling configured before the send stream is
   // created. Relay compact mode uses 1000 so the symmetrically sealed Delivery
   // frame remains one QUIC DATAGRAM instead of a loss-amplifying fragment pair.
@@ -970,10 +971,10 @@ struct WebrtcState {
 template <typename VideoState>
 bool should_encode_video_frame(VideoState* ws) {
   if (ws == nullptr) return false;
-  const int fps = ws->video_max_fps.load(std::memory_order_relaxed);
+  const double fps = ws->video_max_fps.load(std::memory_order_relaxed);
   if (fps <= 0) return true;
   const int64_t now_us = webrtc::TimeMicros();
-  const int64_t min_interval_us = 1'000'000 / fps;
+  const int64_t min_interval_us = static_cast<int64_t>(std::ceil(1'000'000.0 / fps));
   // Keep an ideal send timeline instead of storing the wall-clock time of the
   // last accepted frame.  A plain `now - last >= interval` gate turns a 60 Hz
   // source into 30 fps for every target between 31 and 59 because the first
@@ -1039,7 +1040,7 @@ struct GroupWebrtcState {
   std::thread test_video_thread;
   std::atomic<bool> test_video_run{false};
   int video_target_bitrate_bps = 0;
-  std::atomic<int> video_max_fps{0};
+  std::atomic<double> video_max_fps{0};
   std::atomic<int64_t> video_last_encoded_frame_us{0};
   std::unique_ptr<veil_media::CameraCapturer> camera;
   std::unique_ptr<veil_media::ScreenCapturer> screen;
@@ -1073,6 +1074,11 @@ class LowLatencyFieldTrials final : public webrtc::FieldTrialsView {
       }
       return "min_ms:" + std::to_string(min_ms) + ",max_ms:200";
     }
+    // VideoSendStreamImpl otherwise raises even an explicit low-rate layer
+    // back to its 30-kbit/s registration floor. The per-stream layer and Call
+    // budgets still set their own minima; allow the endpoint policy to go
+    // down to 1 kbit/s without altering audio or any transport/relay metadata.
+    if (key == "WebRTC-Video-MinVideoBitrate") return "Enabled,br:1kbps";
     // libwebrtc's send-side feedback profile paces at only 1.1x and permits a
     // two-second queue by default. That is appropriate for a UDP transport
     // whose congestion controller receives TWCC, but our authenticated veil
@@ -2101,9 +2107,11 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
 #endif
 }
 
-int veil_media_group_engine_set_video_bitrate(VeilGroupMediaEngine* engine,
-                                               int max_bitrate_kbps, int max_fps) {
+static int veil_media_group_engine_apply_video_budget(VeilGroupMediaEngine* engine,
+    int max_bitrate_kbps, double max_fps, int minimum_kbps) {
   if (!engine) return VEIL_MEDIA_ERR_ARG;
+  if (max_bitrate_kbps <= 0 || !std::isfinite(max_fps) || max_fps <= 0)
+    return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!engine->ws || !engine->video_running.load()) return VEIL_MEDIA_ERR_STATE;
   GroupWebrtcState* ws = engine->ws.get();
@@ -2115,8 +2123,8 @@ int veil_media_group_engine_set_video_bitrate(VeilGroupMediaEngine* engine,
       const int configured = std::atoi(value);
       if (configured > 0) kbps = configured;
     }
-    kbps = std::clamp(kbps, 30, 2500);
-    const int fps = std::clamp(max_fps > 0 ? max_fps : 15, 1, 60);
+    kbps = std::clamp(kbps, minimum_kbps, 2500);
+    const double fps = std::clamp(max_fps, 0.02, 60.0);
     const int bps = kbps * 1000;
     if (ws->video_target_bitrate_bps != bps || ws->video_max_fps.load() != fps) {
       webrtc::VideoEncoderConfig ec;
@@ -2128,13 +2136,17 @@ int veil_media_group_engine_set_video_bitrate(VeilGroupMediaEngine* engine,
       ec.max_bitrate_bps = bps;
       webrtc::VideoStream layer;
       layer.active = true;
-      layer.min_bitrate_bps = 30000;
-      layer.target_bitrate_bps = bps * 2 / 3;
+      layer.min_bitrate_bps = std::min(30000, bps);
+      layer.target_bitrate_bps = std::max(layer.min_bitrate_bps, bps * 2 / 3);
       layer.max_bitrate_bps = bps;
-      layer.max_framerate = fps;
+      layer.max_framerate = static_cast<int>(std::ceil(fps));
       layer.max_qp = 63;
       ec.simulcast_layers.push_back(layer);
       ws->video_send_stream->ReconfigureVideoEncoder(std::move(ec));
+      webrtc::BitrateSettings bs;
+      bs.min_bitrate_bps = std::min(30000, bps);
+      bs.max_bitrate_bps = bps + 128000;
+      ws->video_call->SetClientBitratePreferences(bs);
       ws->video_target_bitrate_bps = bps;
       ws->video_max_fps.store(fps, std::memory_order_relaxed);
       ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
@@ -2145,8 +2157,22 @@ int veil_media_group_engine_set_video_bitrate(VeilGroupMediaEngine* engine,
 #else
   (void)max_bitrate_kbps;
   (void)max_fps;
+  (void)minimum_kbps;
   return VEIL_MEDIA_ERR_STATE;
 #endif
+}
+
+int veil_media_group_engine_set_video_budget(VeilGroupMediaEngine* engine,
+    int max_bitrate_kbps, double max_fps) {
+  return veil_media_group_engine_apply_video_budget(engine, max_bitrate_kbps, max_fps, 1);
+}
+
+int veil_media_group_engine_set_video_bitrate(VeilGroupMediaEngine* engine,
+                                        int max_bitrate_kbps, int max_fps) {
+  // Preserve integer ABI defaults for older callers.
+  return veil_media_group_engine_apply_video_budget(engine,
+      std::clamp(max_bitrate_kbps > 0 ? max_bitrate_kbps : 150, 30, 2500),
+      std::clamp(max_fps > 0 ? max_fps : 15, 1, 60), 30);
 }
 
 char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
@@ -2158,7 +2184,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   int playout_peers = 0, playout_reports = 0, playout_ms = -1;
   int64_t rtt = 0;
   uint64_t video_frames = 0;
-  int fps = 0, kbps = 0;
+  double fps = 0;
+  int kbps = 0, encoder_target_bps = 0;
   const int64_t now_us = webrtc::TimeMicros();
   for (const auto& entry : ws->peers) {
     const auto playout = entry.second->shim->audio_playout_feedback();
@@ -2216,7 +2243,11 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
           entry.second->audio_ssrc, sample_sequence, -1, now_us);
   }
   const bool video_sampled = veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&] {
-    if (ws->video_send_stream) video_frames = ws->video_send_stream->GetStats().frames_encoded;
+    if (ws->video_send_stream) {
+      const auto video = ws->video_send_stream->GetStats();
+      video_frames = video.frames_encoded;
+      encoder_target_bps = video.target_media_bitrate_bps;
+    }
     fps = ws->video_max_fps.load(std::memory_order_relaxed);
     kbps = ws->video_target_bitrate_bps / 1000;
   }, std::chrono::milliseconds(20));
@@ -2224,10 +2255,10 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   const int written = std::snprintf(json, sizeof(json),
       "{\"audio_feedback_reports\":%d,\"rtt_ms\":%lld,\"tx_loss_pct\":%d,"
       "\"tx_jitter_ms\":%d,\"tx_drops\":%llu,\"video_tx_frames\":%llu,"
-      "\"max_fps\":%d,\"video_kbps\":%d,\"worker_stalled\":%d,\"video_worker_stalled\":%d}",
+      "\"max_fps\":%.3f,\"video_kbps\":%d,\"video_encoder_target_bps\":%d,\"worker_stalled\":%d,\"video_worker_stalled\":%d}",
       reports, static_cast<long long>(rtt), loss, jitter,
       static_cast<unsigned long long>(ws->fanout->audio_drops()),
-      static_cast<unsigned long long>(video_frames), fps, kbps,
+      static_cast<unsigned long long>(video_frames), fps, kbps, encoder_target_bps,
       audio_sampled ? 0 : 1, video_sampled ? 0 : 1);
   if (written <= 0 || static_cast<size_t>(written) >= sizeof(json)) return nullptr;
   // Capability remains explicit on a stalled worker: unknown audio never
@@ -2859,9 +2890,11 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
 #endif
 }
 
-int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
-                                        int max_bitrate_kbps, int max_fps) {
+static int veil_media_engine_apply_video_budget(VeilMediaEngine* engine,
+    int max_bitrate_kbps, double max_fps, int minimum_kbps) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
+  if (max_bitrate_kbps <= 0 || !std::isfinite(max_fps) || max_fps <= 0)
+    return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!engine->ws || !engine->ws->video_call) return VEIL_MEDIA_ERR_STATE;
   WebrtcState* ws = engine->ws.get();
@@ -2875,15 +2908,15 @@ int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
   // host retries the latest budget. Work that already started is waited out.
   (void)veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&]() {
     if (ws->video_send_stream == nullptr) return;
-    // Same budget rules as start_video: the explicit debug pin wins, and the
-    // clamps keep the encoder inside the padded-onion / direct envelopes.
+    // The explicit debug pin wins. Low rates are a sender policy; capture
+    // remains live and every route/relay sees the same opaque media bytes.
     int kbps = max_bitrate_kbps > 0 ? max_bitrate_kbps : 150;
     if (const char* e = std::getenv("VEIL_MEDIA_VIDEO_KBPS")) {
       int v = std::atoi(e);
       if (v > 0) kbps = v;
     }
-    kbps = std::clamp(kbps, 30, 2500);
-    const int fps = std::clamp(max_fps > 0 ? max_fps : 15, 1, 60);
+    kbps = std::clamp(kbps, minimum_kbps, 2500);
+    const double fps = std::clamp(max_fps, 0.02, 60.0);
     const int bps = kbps * 1000;
     if (bps == ws->video_target_bitrate_bps &&
         fps == ws->video_max_fps.load(std::memory_order_relaxed)) {
@@ -2899,10 +2932,10 @@ int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
     ec.max_bitrate_bps = bps;
     webrtc::VideoStream layer;
     layer.active = true;
-    layer.min_bitrate_bps = 30000;
-    layer.target_bitrate_bps = bps * 2 / 3;
+    layer.min_bitrate_bps = std::min(30000, bps);
+    layer.target_bitrate_bps = std::max(layer.min_bitrate_bps, bps * 2 / 3);
     layer.max_bitrate_bps = bps;
-    layer.max_framerate = fps;
+    layer.max_framerate = static_cast<int>(std::ceil(fps));
     layer.max_qp = 63;
     ec.simulcast_layers.push_back(layer);
     ws->video_send_stream->ReconfigureVideoEncoder(std::move(ec));
@@ -2910,7 +2943,7 @@ int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
     // change. The legacy no-feedback mode still tracks the whole profile.
     {
       webrtc::BitrateSettings bs;
-      bs.min_bitrate_bps = ws->shim->independent_transport_feedback() ? 30'000 : bps;
+      bs.min_bitrate_bps = ws->shim->independent_transport_feedback() ? std::min(30'000, bps) : bps;
       if (!ws->shim->independent_transport_feedback()) bs.start_bitrate_bps = bps;
       bs.max_bitrate_bps = bps + 128'000;
       ws->video_call->SetClientBitratePreferences(bs);
@@ -2918,15 +2951,29 @@ int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
     ws->video_target_bitrate_bps = bps;
     ws->video_max_fps.store(fps, std::memory_order_relaxed);
     ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
-    vlog("video: retuned to %d kbps @ %d fps", kbps, fps);
+    vlog("video: retuned to %d kbps @ %.3f fps", kbps, fps);
     rc = VEIL_MEDIA_OK;
   }, std::chrono::milliseconds(20));
   return rc;
 #else
   (void)max_bitrate_kbps;
   (void)max_fps;
+  (void)minimum_kbps;
   return VEIL_MEDIA_ERR_STATE;
 #endif
+}
+
+int veil_media_engine_set_video_budget(VeilMediaEngine* engine,
+    int max_bitrate_kbps, double max_fps) {
+  return veil_media_engine_apply_video_budget(engine, max_bitrate_kbps, max_fps, 1);
+}
+
+int veil_media_engine_set_video_bitrate(VeilMediaEngine* engine,
+                                        int max_bitrate_kbps, int max_fps) {
+  // Preserve integer ABI defaults for older callers.
+  return veil_media_engine_apply_video_budget(engine,
+      std::clamp(max_bitrate_kbps > 0 ? max_bitrate_kbps : 150, 30, 2500),
+      std::clamp(max_fps > 0 ? max_fps : 15, 1, 60), 30);
 }
 
 int veil_media_engine_stop_video(VeilMediaEngine* engine) {
@@ -3429,6 +3476,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     uint32_t audio_delay_ms = 0;
     uint32_t audio_jb_ms = 0;
     int video_delay_ms = 0;
+    int video_encoder_target_bps = 0;
     int video_jb_ms = 0;
     // Sender-side standing queue: RTCP bypasses the pacer, so a video RTP
     // packet can wait SECONDS in the pacer while rtt_ms stays flat — the
@@ -3496,6 +3544,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         ws->video_worker_tq.get(), [&] {
           if (ws->video_call)
             pacer_delay_ms = ws->video_call->GetStats().pacer_delay_ms;
+          if (ws->video_send_stream)
+            video_encoder_target_bps = ws->video_send_stream->GetStats().target_media_bitrate_bps;
           if (ws->video_recv_stream) {
             const auto v = ws->video_recv_stream->GetStats();
             video_delay_ms = v.current_delay_ms;
@@ -3563,7 +3613,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         "\"android420_submitted\":%llu,"
         "\"android420_processed\":%llu,"
         "\"android420_replaced\":%llu,"
-        "\"target_bitrate_bps\":%d,\"max_fps\":%d}",
+        "\"target_bitrate_bps\":%d,\"video_encoder_target_bps\":%d,\"max_fps\":%.3f}",
         static_cast<unsigned long long>(ws->shim->outbound_packet_count()),
         static_cast<unsigned long long>(ws->shim->inbound_packet_count()),
         static_cast<unsigned long long>(audio_rx_pkts),
@@ -3597,7 +3647,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<unsigned long long>(android420_submitted),
         static_cast<unsigned long long>(android420_processed),
         static_cast<unsigned long long>(android420_replaced),
-        ws->video_target_bitrate_bps,
+        ws->video_target_bitrate_bps, video_encoder_target_bps,
         ws->video_max_fps.load(std::memory_order_relaxed));
     if (written < 0 || static_cast<size_t>(written) >= sizeof(json)) {
       vlog("stats: JSON did not fit in %zu bytes (needed %d) — returning the "

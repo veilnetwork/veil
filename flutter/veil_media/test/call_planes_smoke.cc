@@ -3,6 +3,8 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -110,8 +112,8 @@ static int inject(void* ctx, uint64_t chan, uint32_t audio, uint32_t video) {
     if (!valid || std::chrono::steady_clock::now() - start >
         std::chrono::milliseconds(250)) return 1;
     const auto retune_start = std::chrono::steady_clock::now();
-    if (veil_media_engine_set_video_bitrate(
-            static_cast<VeilMediaEngine*>(ctx), 45, 2) != VEIL_MEDIA_ERR_STATE ||
+    if (veil_media_engine_set_video_budget(
+            static_cast<VeilMediaEngine*>(ctx), 2, 0.02) != VEIL_MEDIA_ERR_STATE ||
         std::chrono::steady_clock::now() - retune_start >
             std::chrono::milliseconds(250)) return 2;
   }
@@ -148,7 +150,7 @@ static int inject_group(void* ctx, uint64_t chan, uint32_t audio, uint32_t video
   const bool valid = json && std::strstr(json, "\"worker_stalled\":0") &&
                      std::strstr(json, "\"video_worker_stalled\":1");
   veil_media_free_string(json);
-  if (!valid || veil_media_group_engine_set_video_bitrate(engine, 100, 8) != VEIL_MEDIA_ERR_STATE)
+  if (!valid || veil_media_group_engine_set_video_budget(engine, 8, 0.3) != VEIL_MEDIA_ERR_STATE)
     return 2;
   return std::chrono::steady_clock::now() - start < std::chrono::milliseconds(250) ? 0 : 3;
 }
@@ -462,6 +464,8 @@ int main() {
     assert(recovered >= 8);
     assert(veil_media_engine_set_video_bitrate(e.get(), 150, 1) == VEIL_MEDIA_OK);
     assert(stat(e.get(), "max_fps") == 1);
+    // Encoder reconfigure is asynchronous; exclude work queued at 12 fps.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
     const auto floor_start = stat(e.get(), "video_tx_frames");
     std::this_thread::sleep_for(std::chrono::milliseconds(2200));
     const auto floor = stat(e.get(), "video_tx_frames") - floor_start;
@@ -541,6 +545,116 @@ int main() {
     assert(group_stat(e.get(), "audio_feedback_reports") == 0);
     assert(veil_media_group_engine_stop_video(e.get()) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_set_video_bitrate(e.get(), 150, 15) == VEIL_MEDIA_ERR_STATE);
+  }
+  // Same real source gate for unicast and room capture. Keep bitrate high
+  // while testing cadence, so codec starvation cannot make this pass falsely.
+  for (bool room : {false, true}) {
+    std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> one(
+        room ? nullptr : veil_media_engine_create(71, local, peer), veil_media_engine_destroy);
+    std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> group(
+        room ? veil_media_group_engine_create(local) : nullptr, veil_media_group_engine_destroy);
+    if (room) {
+      assert(group);
+      assert(veil_media_group_engine_add_peer(group.get(), 82, peer) == VEIL_MEDIA_OK);
+      assert(veil_media_group_engine_set_mic_muted(group.get(), 1) == VEIL_MEDIA_OK);
+      assert(veil_media_group_engine_start_audio(group.get()) == VEIL_MEDIA_OK);
+      assert(veil_media_group_engine_start_video(group.get()) == VEIL_MEDIA_OK);
+    } else {
+      assert(one);
+      assert(veil_media_engine_start_audio(one.get(), 0, 1) == VEIL_MEDIA_OK);
+      assert(veil_media_engine_start_video(one.get(), 1, 1, 150, 15) == VEIL_MEDIA_OK);
+    }
+    const auto budget = [&](int kbps, double fps) {
+      return room ? veil_media_group_engine_set_video_budget(group.get(), kbps, fps)
+                  : veil_media_engine_set_video_budget(one.get(), kbps, fps);
+    };
+    const auto metric = [&](const char* name) {
+      return room ? group_stat(group.get(), name) : stat(one.get(), name);
+    };
+    const auto fps = [&] {
+      char* json = room ? veil_media_group_engine_get_stats(group.get())
+                        : veil_media_engine_get_stats(one.get());
+      assert(json);
+      const char* at = std::strstr(json, "\"max_fps\":");
+      assert(at);
+      const double value = std::strtod(at + std::strlen("\"max_fps\":"), nullptr);
+      veil_media_free_string(json);
+      return value;
+    };
+    assert(budget(150, 12) == VEIL_MEDIA_OK);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const auto initial = metric("video_tx_frames");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    assert(metric("video_tx_frames") - initial >= 8);
+    assert(budget(150, 0.02) == VEIL_MEDIA_OK);
+    assert(std::abs(fps() - 0.02) < 0.0001);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const auto sparse_start = metric("video_tx_frames");
+    std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+    assert(metric("video_tx_frames") == sparse_start);
+
+    // Cadence gate must not freeze self-preview. Feed two visibly different
+    // local frames before the next 50-second encoder slot, then pull RGBA.
+    std::array<uint8_t, 16 * 16> y;
+    std::array<uint8_t, 8 * 8> uv;
+    std::array<uint8_t, 16 * 16 * 4> preview;
+    uv.fill(128);
+    uint8_t first_pixel = 0;
+    for (int brightness : {32, 220}) {
+      y.fill(static_cast<uint8_t>(brightness));
+      const int pushed = room
+          ? veil_media_group_engine_push_video_frame(group.get(), y.data(), uv.data(), uv.data(),
+                16, 16, 16, 8, 8, 0)
+          : veil_media_engine_push_video_frame(one.get(), y.data(), uv.data(), uv.data(),
+                16, 16, 16, 8, 8, 0);
+      assert(pushed == VEIL_MEDIA_OK);
+      int width = 0, height = 0;
+      const int got = room
+          ? veil_media_group_engine_get_local_video_frame(group.get(), preview.data(), preview.size(), &width, &height)
+          : veil_media_engine_get_local_video_frame(one.get(), preview.data(), preview.size(), &width, &height);
+      assert(got > 0 && width == 16 && height == 16);
+      if (brightness == 32) first_pixel = preview[0];
+      else assert(preview[0] > first_pixel + 100);
+    }
+    assert(inject(nullptr, room ? 82 : 71,
+        room ? group_ssrc(peer) : 0x02000000u,
+        room ? group_ssrc(peer, 0x47564944u) : (0x02000000u ^ 0x000000FFu ^ 0x56440000u)) == 0);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((room ? group_audio_packets(group.get(), peer) : metric("audio_rx_pkts")) != 4 &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    assert((room ? group_audio_packets(group.get(), peer) : metric("audio_rx_pkts")) == 4);
+
+    assert(budget(8, 0.3) == VEIL_MEDIA_OK);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    assert(metric(room ? "video_kbps" : "target_bitrate_bps") == (room ? 8 : 8000));
+    const auto allocated = metric("video_encoder_target_bps");
+    std::printf("low-rate %s: encoder target=%llu bps, cadence=%.3f fps\n",
+        room ? "room" : "unicast", static_cast<unsigned long long>(allocated), fps());
+    assert(allocated > 0 && allocated <= 8000);
+    assert(std::abs(fps() - 0.3) < 0.0001);
+    assert(budget(1, 0.02) == VEIL_MEDIA_OK);
+    assert(metric(room ? "video_kbps" : "target_bitrate_bps") == (room ? 1 : 1000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const auto minimum_allocated = metric("video_encoder_target_bps");
+    assert(minimum_allocated > 0 && minimum_allocated <= 1000);
+    assert(budget(8, 0) == VEIL_MEDIA_ERR_ARG);
+    assert(budget(8, -1) == VEIL_MEDIA_ERR_ARG);
+    assert(budget(0, 0.3) == VEIL_MEDIA_ERR_ARG);
+    assert(budget(8, std::numeric_limits<double>::quiet_NaN()) == VEIL_MEDIA_ERR_ARG);
+    assert(budget(8, std::numeric_limits<double>::infinity()) == VEIL_MEDIA_ERR_ARG);
+    assert(std::abs(fps() - 0.02) < 0.0001);
+    assert(budget(150, 12) == VEIL_MEDIA_OK);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const auto resumed = metric("video_tx_frames");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    assert(metric("video_tx_frames") - resumed >= 8);
+    // An old zero/default integer call must still mean 150 kbit/s, 15 fps.
+    assert((room ? veil_media_group_engine_set_video_bitrate(group.get(), 0, 0)
+                 : veil_media_engine_set_video_bitrate(one.get(), 0, 0)) == VEIL_MEDIA_OK);
+    assert(fps() == 15);
+    std::printf("low-rate %s: actual sparse encoding, fresh preview, accepted audio, recovery and legacy defaults verified\n",
+        room ? "room" : "unicast");
   }
   {
     std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> e(

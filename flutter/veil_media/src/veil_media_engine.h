@@ -110,6 +110,12 @@ int veil_media_group_engine_stop_video(VeilGroupMediaEngine *engine);
  * or relay priority is added. The video-worker scheduling wait is 20 ms. */
 int veil_media_group_engine_set_video_bitrate(VeilGroupMediaEngine *engine,
                                               int max_bitrate_kbps, int max_fps);
+/* Low-rate adaptation: 1..2500 kbit/s and 0.02..60 fps. Encoder handoff
+ * uses the fractional cadence; local preview/capture remain live. Zero,
+ * negative and non-finite budgets are errors, never legacy defaults.
+ * Existing 20 ms video-worker scheduling wait and debug pin apply. */
+int veil_media_group_engine_set_video_budget(VeilGroupMediaEngine *engine,
+                                        int max_bitrate_kbps, double max_fps);
 /* Group audio quality: maxima over fresh RTCP audio report blocks (15 s).
  * `audio_receivers` maps peer-id hex to accepted `audio_rx_pkts` and the
  * native `audio_delay_ms` estimate. `audio_rx_supported` stays 1 even when
@@ -177,6 +183,12 @@ int veil_media_engine_set_max_rtp_packet_size(VeilMediaEngine *engine,
  * video send isn't running. */
 int veil_media_engine_set_video_bitrate(VeilMediaEngine *engine,
                                         int max_bitrate_kbps, int max_fps);
+/* Low-rate adaptation: 1..2500 kbit/s and 0.02..60 fps. Encoder handoff
+ * uses the fractional cadence; local preview/capture remain live. Zero,
+ * negative and non-finite budgets are errors, never legacy defaults.
+ * Existing 20 ms video-worker scheduling wait and debug pin apply. */
+int veil_media_engine_set_video_budget(VeilMediaEngine *engine,
+                                        int max_bitrate_kbps, double max_fps);
 
 /* Open the platform camera and drive the video send stream from it (near
  * width x height at fps; the camera picks the closest supported format). Video
