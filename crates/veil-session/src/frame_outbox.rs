@@ -84,6 +84,11 @@ pub struct FrameSender {
 }
 
 impl FrameSender {
+    /// Generic transport readiness only; does not alter relay scheduling.
+    pub fn has_datagram_transport(&self) -> bool {
+        self.status.has_datagram_transport()
+    }
+
     pub fn request_local_datagram_channel(
         &self,
         local_lane: u8,
@@ -201,6 +206,13 @@ impl From<mpsc::Receiver<PriorityFrame>> for FrameOutbox {
 }
 
 impl FrameOutbox {
+    /// The runner owns this lease only while its datagram sender is usable.
+    pub fn activate_datagram_transport(&self) -> Option<crate::DatagramTransportLease> {
+        self.status
+            .as_ref()
+            .map(|status| status.activate_transport())
+    }
+
     pub(crate) fn local_datagram_status(
         &self,
     ) -> Option<std::sync::Arc<crate::local_datagram_status::LocalDatagramStatus>> {
