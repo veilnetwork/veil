@@ -46,6 +46,12 @@ use std::sync::Arc;
 /// `Arc<Mutex<node::session::tx_registry::SessionTxRegistry>>` via a small
 /// adapter newtype in `node::session_glue`.
 pub trait FrameBroadcaster: Send + Sync {
+    /// Current endpoint-local generic datagram transport readiness. Legacy
+    /// implementations retain ordered fallback. Never a remote service hint.
+    fn has_datagram_transport(&self, _peer_id: &[u8; 32]) -> bool {
+        false
+    }
+
     /// Send `bytes` to a single registered peer at `priority`. Returns
     /// `false` if the peer is not registered or its channel is closed/full.
     fn send_to(&self, peer_id: &[u8; 32], priority: u8, bytes: Vec<u8>) -> bool;

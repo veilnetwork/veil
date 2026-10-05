@@ -1276,13 +1276,20 @@ pub(crate) async fn handle_ipc_send(
                 .await;
                 ordinary_relay_hops(discovered, &send.dst_node_id, route_cache, reg, will_seal)
             };
-            let forced_relay_hops = without_other_devices(
+            let mut forced_relay_hops = without_other_devices(
                 forced_relay_hops,
                 reg,
                 &send.dst_node_id,
                 sealed_for,
                 &|device| device_instance(ctx, device),
             );
+            // An origin may choose a generic datagram link over an ordered
+            // stream that stalls behind reliable writes. Preserve route order
+            // within each transport group and all existing fallback hops.
+            // This does not change relay policy or independent-flow consent.
+            if relay_media_sealed {
+                forced_relay_hops.sort_by_key(|hop| !reg.has_datagram_transport(hop));
+            }
             if !forced_relay_hops.is_empty() {
                 use veil_proto::delivery::DeliveryEnvelope;
                 use veil_proto::family::DeliveryMsg;
@@ -2193,6 +2200,7 @@ mod ratchet_send_tests {
     #[derive(Default)]
     struct Outbox {
         live: Vec<[u8; 32]>,
+        datagram: Vec<[u8; 32]>,
         sent: Mutex<Vec<([u8; 32], Vec<u8>)>>,
         /// The devices the session layer knows under identity `PEER`. Empty
         /// for every single-name fixture, which keeps them on the path they
@@ -2381,6 +2389,9 @@ mod ratchet_send_tests {
     }
 
     impl FrameBroadcaster for Outbox {
+        fn has_datagram_transport(&self, peer: &[u8; 32]) -> bool {
+            self.datagram.contains(peer)
+        }
         fn send_to(&self, peer_id: &[u8; 32], _priority: u8, bytes: Vec<u8>) -> bool {
             if !self.live.contains(peer_id) {
                 return false;
@@ -2584,6 +2595,7 @@ mod ratchet_send_tests {
             pairing_device: None,
             outbox: Arc::new(Outbox {
                 live: live_peers,
+                datagram: Vec::new(),
                 sent: Mutex::new(Vec::new()),
                 family: Vec::new(),
             }),
@@ -2639,6 +2651,7 @@ mod ratchet_send_tests {
         let (mut fx, sibling) = family_fixture();
         fx.outbox = Arc::new(Outbox {
             live: vec![RELAY],
+            datagram: Vec::new(),
             sent: Mutex::new(Vec::new()),
             family: Vec::new(),
         });
@@ -2943,6 +2956,7 @@ mod ratchet_send_tests {
         let (mut fx, sibling) = family_fixture();
         fx.outbox = Arc::new(Outbox {
             live: vec![DEVICE_ONE, DEVICE_TWO, RELAY],
+            datagram: Vec::new(),
             sent: Mutex::new(Vec::new()),
             family: vec![DEVICE_ONE, DEVICE_TWO],
         });
@@ -3027,6 +3041,7 @@ mod ratchet_send_tests {
         fx.certs = Arc::new(FamilyCerts(vec![sibling_row]));
         fx.outbox = Arc::new(Outbox {
             live: vec![DEVICE_ONE, DEVICE_TWO, RELAY],
+            datagram: Vec::new(),
             sent: Mutex::new(Vec::new()),
             family: vec![DEVICE_ONE, DEVICE_TWO],
         });
@@ -3082,6 +3097,7 @@ mod ratchet_send_tests {
         };
         let both = Outbox {
             live: vec![E, F],
+            datagram: Vec::new(),
             sent: Mutex::new(Vec::new()),
             family: vec![E, F],
         };
@@ -3098,6 +3114,7 @@ mod ratchet_send_tests {
 
         let only_e = Outbox {
             live: vec![E],
+            datagram: Vec::new(),
             sent: Mutex::new(Vec::new()),
             family: vec![E],
         };
@@ -3116,6 +3133,7 @@ mod ratchet_send_tests {
 
         let unsealed = Outbox {
             live: vec![E, F],
+            datagram: Vec::new(),
             sent: Mutex::new(Vec::new()),
             family: vec![E, F],
         };
@@ -3172,6 +3190,7 @@ mod ratchet_send_tests {
         };
         let reg = Outbox {
             live: vec![E, F, RELAY],
+            datagram: Vec::new(),
             sent: Mutex::new(Vec::new()),
             family: vec![E, F],
         };
@@ -3405,6 +3424,31 @@ mod ratchet_send_tests {
             veil_proto::delivery::ForwardPayload::decode(&forwards[0].1[veil_proto::HEADER_SIZE..])
                 .unwrap();
         assert_eq!(fwd.envelope.payload, sealed);
+    }
+
+    #[tokio::test]
+    async fn relay_media_prefers_usable_datagrams_and_keeps_ordered_fallback() {
+        const DATAGRAM: [u8; 32] = [0xB8; 32];
+        for ready in [true, false] {
+            let mut fx = fixture(vec![RELAY, DATAGRAM]);
+            Arc::get_mut(&mut fx.outbox).unwrap().datagram =
+                if ready { vec![DATAGRAM] } else { Vec::new() };
+            let mut ctx = fx.ctx(false);
+            ctx.local_priority = veil_proto::priority::BULK; // one copy
+            let sealed = veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC.to_vec();
+            let mut body = payload_to(PEER, &sealed);
+            let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+                | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
+            body[100..104].copy_from_slice(&flags.to_be_bytes());
+            let mut wh = sink().await;
+            handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+                .await
+                .unwrap();
+            let sent = fx.taken();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].0, if ready { DATAGRAM } else { RELAY });
+            assert_eq!(codec::decode_header(&sent[0].1).unwrap().flags, 0);
+        }
     }
 
     #[tokio::test]
