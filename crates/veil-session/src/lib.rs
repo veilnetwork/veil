@@ -22,6 +22,7 @@ pub mod dispatcher_sink;
 pub mod frame_diag;
 pub mod frame_outbox;
 mod local_datagram_status;
+mod local_source_activity;
 pub use local_datagram_status::DatagramTransportLease;
 pub use local_datagram_status::LocalDatagramChannelState;
 pub mod fsm;
