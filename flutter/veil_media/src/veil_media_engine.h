@@ -286,9 +286,13 @@ int veil_media_engine_select_audio_output(VeilMediaEngine *engine,
  * `audio_concealment_events`, `audio_interruption_count` and
  * `audio_interruption_duration_ms` expose cumulative receive-stream playout
  * statistics, valid only with worker_stalled=0.
- * each; an operation already started is waited out for lifetime safety.
+ * An operation already started is waited out for lifetime safety.
  * `audio_tx_pkts` counts audio RTP emitted by the send stream, with the same
  * sample-validity rule. `mic_muted` is the native mute intent, not device state.
+ * `audio_tx_rtp_*` report endpoint-local Opus RTP generation and local queue
+ * admission independently of video/RTCP and the audio worker stats timeout.
+ * Source/queue ages are -1 before a matching packet, never a zero-delay pass.
+ * Gaps include legitimate DTX silence; successful admission is not delivery.
  * Heap JSON snapshot {"tx_pkts","rx_pkts","tx_bytes","rx_bytes",
  * "rtt_ms","jitter_ms","loss_pct","target_bitrate_bps",...} or NULL.
  * Free with veil_media_free_string. */

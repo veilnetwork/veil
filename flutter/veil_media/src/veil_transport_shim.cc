@@ -134,6 +134,10 @@ VideoCadenceSnapshot VeilTransportShim::delivered_video_cadence() const {
   return Snapshot(delivered_video_cadence_);
 }
 
+AudioSendSnapshot VeilTransportShim::audio_send_stats() const {
+  return audio_send_stats_.snapshot(webrtc::TimeMicros() * 1000);
+}
+
 void VeilTransportShim::Start() {
   bool expected = false;
   if (!started_.compare_exchange_strong(expected, true)) return;
@@ -159,8 +163,14 @@ void VeilTransportShim::Stop() {
 bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
                                 const webrtc::PacketOptions& options) {
   MarkVideoFrame(packet, &outbound_video_cadence_);
+  const int64_t started_ns = webrtc::TimeMicros() * 1000;
+  const bool audio = audio_send_stats_.mark_attempt(
+      packet, local_audio_ssrc_.load(std::memory_order_relaxed), started_ns);
   const int rc =
       veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
+  if (audio) {
+    audio_send_stats_.mark_result(started_ns, webrtc::TimeMicros() * 1000, rc == 0);
+  }
   static const bool diagnostics_enabled = diag::enabled();
   if (diagnostics_enabled) {
     static std::atomic<uint64_t> n{0};
