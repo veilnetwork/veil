@@ -16,7 +16,7 @@ async fn runner_channels_over_real_quic(
     shared: bool,
     resumed: bool,
 ) {
-    runner_channels_with_backlog(flows, parallel, rotate, shared, resumed, None).await;
+    runner_channels_with_backlog(flows, parallel, rotate, shared, resumed, None, None).await;
 }
 
 async fn runner_channels_with_backlog(
@@ -26,6 +26,7 @@ async fn runner_channels_with_backlog(
     shared: bool,
     resumed: bool,
     reliable_priority: Option<u8>,
+    idle_probe: Option<Duration>,
 ) {
     let blocked_reliable = reliable_priority.is_some();
     let context = Arc::new(TransportContext::for_debug().unwrap());
@@ -179,6 +180,7 @@ async fn runner_channels_with_backlog(
     }
 
     let mut tasks = Vec::new();
+    let mut runner_indices = Vec::new();
     if let Some(listener) = listener {
         let registry = Arc::clone(&registry);
         tasks.push(tokio::spawn(async move {
@@ -256,21 +258,29 @@ async fn runner_channels_with_backlog(
                 runner.rekey.time_threshold_secs = 1;
             }
         }
+        if let Some(timeout) = idle_probe {
+            runner.idle_timeout = timeout;
+            runner.keepalive_interval = Duration::ZERO;
+        }
         runner.outbox = Some(out_rx.into());
         runner.ban_list = Arc::clone(&dispatcher.abuse.ban_list);
         runner.violation_tracker = Arc::clone(&dispatcher.abuse.violation_tracker);
         runner.logger = Arc::clone(&dispatcher.logger);
         runner.dispatcher = dispatcher;
+        runner_indices.push(tasks.len());
         tasks.push(tokio::spawn(async move { runner.run().await }));
         receivers.push(receiver);
         senders.push(out_tx);
     }
     let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let probe_started = tokio::time::Instant::now();
         // Exercise BOTH queue selections and both directions through actual
         // SessionRunners, QUIC DATAGRAM I/O, frame parsing and app dispatch.
         for direction in 0..2 {
             let mut backlog_start: Option<[u64; 3]> = None;
-            for seq in 0..if rotate {
+            for seq in 0..if idle_probe.is_some() {
+                450
+            } else if rotate {
                 400
             } else if parallel {
                 200
@@ -308,10 +318,24 @@ async fn runner_channels_with_backlog(
                 } else {
                     2
                 };
+                let frame = veil_bufpool::pooled_shared_from_vec(frame);
                 senders[direction]
-                    .send((local_priority, veil_bufpool::pooled_shared_from_vec(frame)))
+                    .send((local_priority, frame.clone()))
                     .await
                     .unwrap();
+                if idle_probe.is_some() {
+                    senders[1 - direction]
+                        .send((local_priority, frame))
+                        .await
+                        .unwrap();
+                    match receivers[direction].recv().await.unwrap() {
+                        AppMessage::RtData { payload, .. } => {
+                            assert_eq!(payload.seq, seq);
+                            assert_eq!(payload.payload, data);
+                        }
+                        other => panic!("unexpected reverse dispatch {other:?}"),
+                    }
+                }
                 match receivers[1 - direction].recv().await.unwrap() {
                     AppMessage::RtData {
                         src_node_id,
@@ -340,6 +364,10 @@ async fn runner_channels_with_backlog(
                         && diagnostics[direction].sent_this_generation(3) >= 8
                         && (!rotate || diagnostics[direction].rekeys() >= 1)
                     {
+                        if idle_probe.is_some() && probe_started.elapsed() < Duration::from_secs(2)
+                        {
+                            continue;
+                        }
                         if blocked_reliable {
                             if backlog_start.is_none() {
                                 backlog_start =
@@ -388,6 +416,17 @@ async fn runner_channels_with_backlog(
         }
     })
     .await;
+    if let Some(timeout) = idle_probe {
+        // Silence must still reap the parent; observing the old last-RX stamp
+        // again is not a new packet and must not keep it alive indefinitely.
+        tokio::time::sleep(timeout * 2).await;
+        assert!(
+            runner_indices
+                .iter()
+                .all(|index| tasks[*index].is_finished()),
+            "authenticated datagram liveness masked a genuinely silent peer"
+        );
+    }
     // Aborting a runner must also drop its receive task and transport clones.
     for task in tasks {
         task.abort();
@@ -450,22 +489,22 @@ async fn runner_channels_with_backlog(
 
 #[tokio::test]
 async fn local_sources_keep_sending_with_a_full_reliable_writer_queue() {
-    runner_channels_with_backlog(true, true, false, true, false, Some(1)).await;
+    runner_channels_with_backlog(true, true, false, true, false, Some(1), None).await;
 }
 
 #[tokio::test]
 async fn local_sources_bypass_reliable_primary_backlog() {
-    runner_channels_with_backlog(true, true, false, true, false, Some(0)).await;
+    runner_channels_with_backlog(true, true, false, true, false, Some(0), None).await;
 }
 
 #[tokio::test]
 async fn local_sources_bypass_reliable_secondary_backlog() {
-    runner_channels_with_backlog(true, true, false, true, false, Some(2)).await;
+    runner_channels_with_backlog(true, true, false, true, false, Some(2), None).await;
 }
 
 #[tokio::test]
 async fn local_sources_bypass_reliable_background_backlog() {
-    runner_channels_with_backlog(true, true, false, true, false, Some(3)).await;
+    runner_channels_with_backlog(true, true, false, true, false, Some(3), None).await;
 }
 
 #[tokio::test]
@@ -1106,3 +1145,17 @@ async fn warm_receive_only_channels(senders: &[FrameSender]) {
 
 #[path = "neutral_chain_tests.rs"]
 mod neutral_chain_tests;
+
+#[tokio::test]
+async fn authenticated_independent_datagrams_keep_parent_alive_then_silence_reaps_it() {
+    runner_channels_with_backlog(
+        true,
+        true,
+        false,
+        true,
+        false,
+        None,
+        Some(Duration::from_millis(800)),
+    )
+    .await;
+}
