@@ -2348,11 +2348,24 @@ fn loss_probe_requests_immediate_ack() {
     pair.drive_client();
     pair.mtu = default_mtu;
 
+    // Diagnostic snapshots must distinguish acknowledged idleness from a
+    // lost packet still occupying the congestion window and PTO recovery.
+    let before_probe = pair.client_conn_mut(client_ch).stats();
+    assert!(before_probe.path.in_flight_bytes > 0);
+    assert_eq!(before_probe.path.pto_count, 0);
+    pair.time = pair.client_conn_mut(client_ch).poll_timeout().unwrap();
+    pair.drive_client();
+    let probing = pair.client_conn_mut(client_ch).stats();
+    assert!(probing.path.in_flight_bytes > 0);
+    assert!(probing.path.pto_count > 0);
+
     // Drive the connection further so a loss probe is sent
     pair.drive();
 
     // Assert that two IMMEDIATE_ACKs were sent (two loss probes)
     let stats_after_recovery = pair.client_conn_mut(client_ch).stats();
+    assert_eq!(stats_after_recovery.path.in_flight_bytes, 0);
+    assert_eq!(stats_after_recovery.path.pto_count, 0);
     assert_eq!(
         stats_after_recovery.frame_tx.immediate_ack - stats_after_connect.frame_tx.immediate_ack,
         2

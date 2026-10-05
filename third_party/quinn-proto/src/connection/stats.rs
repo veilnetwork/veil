@@ -138,6 +138,10 @@ pub struct PathStats {
     pub rtt: Duration,
     /// Current congestion window of the connection
     pub cwnd: u64,
+    /// Bytes currently awaiting acknowledgment on this path (local snapshot).
+    pub in_flight_bytes: u64,
+    /// Consecutive probe timeout count, before acknowledgment progress resets it.
+    pub pto_count: u32,
     /// Congestion events on the connection
     pub congestion_events: u64,
     /// The amount of packets lost on this path

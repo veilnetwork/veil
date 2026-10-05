@@ -78,6 +78,8 @@ pub struct QuicDatagramHandle {
 pub struct QuicDatagramPathStats {
     pub rtt_us: u64,
     pub congestion_window_bytes: u64,
+    pub in_flight_bytes: u64,
+    pub pto_count: u32,
     pub lost_packets: u64,
     pub congestion_events: u64,
     pub udp_sent: u64,
@@ -93,6 +95,8 @@ impl QuicDatagramHandle {
         QuicDatagramPathStats {
             rtt_us: stats.path.rtt.as_micros().min(u64::MAX as u128) as u64,
             congestion_window_bytes: stats.path.cwnd,
+            in_flight_bytes: stats.path.in_flight_bytes,
+            pto_count: stats.path.pto_count,
             lost_packets: stats.path.lost_packets,
             congestion_events: stats.path.congestion_events,
             udp_sent: stats.udp_tx.datagrams,

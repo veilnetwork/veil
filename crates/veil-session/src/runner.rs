@@ -279,10 +279,11 @@ impl RealtimeSender {
         logger.info(
             "session.rt_trace.datagram_admission",
             format!(
-                "peer_id={} local_slot={priority} accepted={} buffer_drops={} bandwidth_drops={} queued_wire_bytes={} independent={independent} rtt_us={} cwnd_bytes={} lost_packets={} congestion_events={} udp_sent={} udp_received={} acks_received={} expired_outgoing_datagrams={}",
+                "peer_id={} local_slot={priority} accepted={} buffer_drops={} bandwidth_drops={} queued_wire_bytes={} independent={independent} rtt_us={} cwnd_bytes={} in_flight_bytes={} pto_count={} lost_packets={} congestion_events={} udp_sent={} udp_received={} acks_received={} expired_outgoing_datagrams={}",
                 hex_short(peer), entry.0, entry.1, entry.2,
                 veil_transport::REALTIME_DATAGRAM_BUFFER_BYTES.saturating_sub(available),
-                path.rtt_us, path.congestion_window_bytes, path.lost_packets,
+                path.rtt_us, path.congestion_window_bytes, path.in_flight_bytes,
+                path.pto_count, path.lost_packets,
                 path.congestion_events, path.udp_sent, path.udp_received,
                 path.acknowledgments_received,
                 path.expired_outgoing_datagrams,
@@ -636,12 +637,13 @@ fn spawn_realtime_receiver(
                     logger.info(
                         "session.rt_trace.datagram_receive",
                         format!(
-                            "peer_id={} receiver={} datagrams={} fragments_pending={} decode_rejected={} ineligible={} dispatched={} rate_limited={} violations={} unexpected={} max_dispatch_us={} udp_sent={} udp_received={} acks_received={} rtt_us={} lost_packets={} congestion_events={}",
+                            "peer_id={} receiver={} datagrams={} fragments_pending={} decode_rejected={} ineligible={} dispatched={} rate_limited={} violations={} unexpected={} max_dispatch_us={} udp_sent={} udp_received={} acks_received={} rtt_us={} cwnd_bytes={} in_flight_bytes={} pto_count={} lost_packets={} congestion_events={}",
                             hex_short(&peer_id), trace.id, w.datagrams,
                             w.fragments_pending, w.decode_rejected, w.ineligible,
                             w.dispatched, w.rate_limited, w.violations, w.unexpected,
                             w.max_dispatch_us, path.udp_sent, path.udp_received,
                             path.acknowledgments_received, path.rtt_us,
+                            path.congestion_window_bytes, path.in_flight_bytes, path.pto_count,
                             path.lost_packets, path.congestion_events,
                         ),
                     );
