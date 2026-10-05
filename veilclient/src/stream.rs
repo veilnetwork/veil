@@ -38,7 +38,7 @@ pub struct VeilStream {
     /// Backpressure-aware sender for the `AsyncWrite` poll paths. Wraps a
     /// clone of the writer channel; `poll_reserve` registers the task waker
     /// when the channel is full (no busy-spin).
-    tx: PollSender<Vec<u8>>,
+    tx: PollSender<crate::client::IpcWriterFrame>,
     /// Leftover bytes from the last partial read.
     read_buf: Vec<u8>,
     /// Set when a StreamClose event has been received.
@@ -215,7 +215,7 @@ impl AsyncWrite for VeilStream {
                 };
                 let frame = encode_frame(LocalAppMsg::StreamData as u16, &payload.encode());
                 self.tx
-                    .send_item(frame)
+                    .send_item(frame.into())
                     .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, WRITER_CLOSED))?;
                 Poll::Ready(Ok(chunk_len))
             }
@@ -242,7 +242,7 @@ impl AsyncWrite for VeilStream {
                 };
                 let frame = encode_frame(LocalAppMsg::StreamClose as u16, &payload.encode());
                 self.tx
-                    .send_item(frame)
+                    .send_item(frame.into())
                     .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, WRITER_CLOSED))?;
                 self.shutdown_sent = true;
                 Poll::Ready(Ok(()))
@@ -293,7 +293,7 @@ mod tests {
     #[tokio::test]
     async fn bounded_stream_frames_preserve_bytes_and_one_close_under_backpressure() {
         use veil_proto::{codec::decode_header, header::HEADER_SIZE};
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(2);
+        let (tx, mut rx) = mpsc::channel::<crate::client::IpcWriterFrame>(2);
         let writer = SharedWriter::new(tx);
         let (_ev_tx, ev_rx) = mpsc::channel::<StreamEvent>(8);
         let mut stream = VeilStream::new(7, writer, ev_rx);
@@ -341,7 +341,7 @@ mod tests {
     #[tokio::test]
     async fn poll_write_chunks_large_writes_m3() {
         use veil_proto::header::HEADER_SIZE;
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = mpsc::channel::<crate::client::IpcWriterFrame>(64);
         let writer = SharedWriter::new(tx);
         let (_ev_tx, ev_rx) = mpsc::channel::<StreamEvent>(8);
         let mut stream = VeilStream::new(7, writer, ev_rx);

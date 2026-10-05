@@ -433,3 +433,25 @@ stream runner checks, 18 real-QUIC opaque/parallel/rekey checks, production
 session Clippy with warnings denied and production Android ARM64 Rust build.
 These prove session-local freshness and transport regressions, not physical
 playout/acoustic latency or current live relay capability negotiation.
+
+The native direct/relay pumps now retain their original 200-ms producer
+deadline inside the SDK IPC writer queue. Previously the 1024-frame FIFO held
+only bytes and could replay cells after an IPC stall. Timed admission may
+expire while waiting for capacity; every queued timed frame is checked again
+before socket writing, including already-drained batch entries. A started
+write always completes under the existing socket timeout so partial IPC
+headers/bodies are never abandoned. Reliable frames have no producer deadline
+and preserve FIFO/backpressure. The deadline is never encoded into IPC or
+network bytes and does not change crypto or relay priorities. The anonymous
+circuit path continues its existing native freshness checks. Bytes already
+committed to a socket and end-to-end playout remain outside this local bound.
+
+SDK/native gates passed: 38 SDK unit tests, 27 real Unix IPC integration tests,
+27 media-pump tests, production SDK/FFI Clippy with warnings denied and Android
+ARM64 Rust compilation. The bounded-byte-stream writer test completes a
+partial frame, sheds later expired primary/secondary cells and verifies fresh
+and reliable FIFO delivery plus clean EOF. Removing pre-write expiry replays
+both obsolete cells (six frames versus four). The real IPC daemon compares
+legacy/deadline-aware direct bytes and relay transport/application fields;
+relay content IDs and creation times are normalized as per-send bookkeeping.
+Physical loaded calls and acoustic delay are still unverified.
