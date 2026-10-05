@@ -220,6 +220,7 @@ struct RealtimeSender {
     // independently so its first send cannot hide a later producer's path.
     logged_send_kinds: [u8; 4],
     congestion_drops: u64,
+    admission_trace: [(u64, u64, u64, Option<std::time::Instant>); 4],
     last_congestion_log: std::time::Instant,
     broken: bool,
     sent_counter: Option<(Arc<parallel_lanes::ParallelDiagnostics>, usize)>,
@@ -236,10 +237,49 @@ impl RealtimeSender {
             tx,
             logged_send_kinds: [0; 4],
             congestion_drops: 0,
+            admission_trace: [(0, 0, 0, None); 4],
             last_congestion_log: std::time::Instant::now(),
             broken: false,
             sent_counter: None,
         }
+    }
+
+    fn trace_admission(
+        &mut self,
+        logger: &veil_observability::NodeLogger,
+        peer: &NodeIdBytes,
+        priority: u8,
+        outcome: u8,
+        independent: bool,
+        available: usize,
+    ) {
+        if !crate::rt_trace::rt_trace_enabled() {
+            return;
+        }
+        let Some(entry) = self.admission_trace.get_mut(usize::from(priority)) else {
+            return;
+        };
+        match outcome {
+            0 => entry.0 = entry.0.saturating_add(1),
+            1 => entry.1 = entry.1.saturating_add(1),
+            _ => entry.2 = entry.2.saturating_add(1),
+        }
+        let now = std::time::Instant::now();
+        if entry
+            .3
+            .is_some_and(|last| now.duration_since(last).as_secs() < 1)
+        {
+            return;
+        }
+        logger.info(
+            "session.rt_trace.datagram_admission",
+            format!(
+                "peer_id={} local_slot={priority} accepted={} buffer_drops={} bandwidth_drops={} queued_wire_bytes={} independent={independent}",
+                hex_short(peer), entry.0, entry.1, entry.2,
+                veil_transport::REALTIME_DATAGRAM_BUFFER_BYTES.saturating_sub(available),
+            ),
+        );
+        *entry = (0, 0, 0, Some(now));
     }
 }
 
@@ -4178,13 +4218,37 @@ impl SessionRunner {
                             // independent primary also bounds its own backlog.
                             // Relayed cells use neutral capacity admission. Drop this
                             // loss-tolerant cell before sending any fragments.
+                            lane.trace_admission(
+                                &self.logger,
+                                &self.peer_id,
+                                outgoing_priority,
+                                1,
+                                using_parallel,
+                                available,
+                            );
                             datagram_drained += 1;
                             continue;
                         }
                         if !self.dispatcher.allow_outbound_bandwidth(planned_wire_len) {
+                            lane.trace_admission(
+                                &self.logger,
+                                &self.peer_id,
+                                outgoing_priority,
+                                2,
+                                using_parallel,
+                                available,
+                            );
                             datagram_drained += 1;
                             continue;
                         }
+                        lane.trace_admission(
+                            &self.logger,
+                            &self.peer_id,
+                            outgoing_priority,
+                            0,
+                            using_parallel,
+                            available,
+                        );
                         self.dispatcher.capture_outbound(self.peer_id, outgoing);
                         let mut sent_wire_len = 0usize;
                         let mut send_error = None;
