@@ -159,6 +159,7 @@ async fn chain(rotate: bool) {
                 peer_rotates: true,
                 peer_flows: true,
                 peer_circuit_datagrams: true,
+                peer_neutral_forwards: true,
                 parallel: Some(offer),
             });
             runner.local_node_id = ids[node];

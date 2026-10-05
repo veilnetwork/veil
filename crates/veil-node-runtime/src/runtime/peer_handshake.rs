@@ -92,6 +92,7 @@ pub struct RemoteHandshakeInfo {
     /// Negotiated opaque datagram channels, with no application-role labels.
     pub supports_datagram_flows: bool,
     pub supports_circuit_datagrams: bool,
+    pub supports_neutral_forward_datagrams: bool,
     pub supports_parallel_quic: bool,
     pub supports_shared_parallel_quic: bool,
     pub supports_duplex_parallel_quic: bool,
@@ -884,6 +885,9 @@ pub async fn register_connection_session(
                         supports_circuit_datagrams: r
                             .remote_capabilities
                             .supports_circuit_datagrams(),
+                        supports_neutral_forward_datagrams: r
+                            .remote_capabilities
+                            .supports_neutral_forward_datagrams(),
                         supports_parallel_quic: r.remote_capabilities.supports_parallel_quic(),
                         supports_shared_parallel_quic: r
                             .remote_capabilities
@@ -1453,6 +1457,7 @@ pub async fn register_connection_session(
                 peer_rotates: remote_identity.supports_realtime_rekey,
                 peer_flows: remote_identity.supports_datagram_flows,
                 peer_circuit_datagrams: remote_identity.supports_circuit_datagrams,
+                peer_neutral_forwards: remote_identity.supports_neutral_forward_datagrams,
                 parallel: parallel_quic
                     .filter(|handle| {
                         remote_identity.supports_parallel_quic

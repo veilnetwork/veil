@@ -1229,6 +1229,7 @@ fn local_capabilities(
     caps.flags |= cap_flags::SUPPORTS_REALTIME_REKEY;
     caps.flags |= cap_flags::SUPPORTS_DATAGRAM_FLOWS;
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_CIRCUIT_DATAGRAMS;
+    caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_NEUTRAL_FORWARD_DATAGRAMS;
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_PARALLEL_QUIC;
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_SHARED_PARALLEL_QUIC;
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_DUPLEX_PARALLEL_QUIC;

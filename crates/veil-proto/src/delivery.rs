@@ -328,9 +328,9 @@ pub struct ForwardPayload {
     /// wire form. Relays validate the bounded range and deduplicate each
     /// attempt separately; the final recipient deliberately ignores it.
     pub delivery_attempt: Option<u8>,
-    /// Legacy transport hint ([`crate::header::priority`]). Relays preserve
-    /// it for wire compatibility and loss-tolerant datagram eligibility,
-    /// but it never grants queueing priority to forwarded user traffic.
+    /// Loss-tolerant transport hint ([`crate::header::priority`]). Relays
+    /// normalize legacy REALTIME to neutral INTERACTIVE and omit other hints
+    /// so downstream legacy relays cannot grant sender-selected priority.
     pub traffic_class: Option<u8>,
 }
 
@@ -341,9 +341,9 @@ impl ForwardPayload {
     /// This is deliberately stricter than [`Self::decode`]. The ordinary
     /// ordered stream remains the compatibility path for unknown extensions,
     /// acknowledged delivery, long-lived messages, oversized payloads, and
-    /// retry attempts. Only the canonical `traffic_class=REALTIME` form
-    /// emitted by `IPC_SEND_FLAG_RELAY_REALTIME` is eligible to be dropped or
-    /// reordered hop-by-hop.
+    /// retry attempts. Neutral INTERACTIVE hints and legacy REALTIME hints
+    /// share the same bounded loss-tolerant contract. Sending the neutral form
+    /// as a datagram additionally requires explicit peer capability negotiation.
     pub fn is_realtime_datagram_eligible(buf: &[u8]) -> bool {
         const NEXT_HOP_LEN: usize = 32;
         const FORWARD_FIXED_SUFFIX_LEN: usize = 8 + 1; // trace_id + relay_hops
@@ -402,7 +402,10 @@ impl ForwardPayload {
             return false;
         }
         buf[extension_start] == FORWARD_TRAFFIC_CLASS_MARKER
-            && buf[extension_start + 1] == crate::header::priority::REALTIME
+            && matches!(
+                buf[extension_start + 1],
+                crate::header::priority::REALTIME | crate::header::priority::INTERACTIVE
+            )
     }
 
     /// Encode to wire bytes. Always appends `trace_id` (8 bytes) and
@@ -1386,6 +1389,12 @@ mod tests {
         assert!(ForwardPayload::is_realtime_datagram_eligible(
             &payload.encode()
         ));
+
+        payload.traffic_class = Some(priority::INTERACTIVE);
+        assert!(ForwardPayload::is_realtime_datagram_eligible(
+            &payload.encode()
+        ));
+        assert_eq!(payload.relay_traffic_class(), priority::INTERACTIVE);
 
         payload.envelope.require_ack = true;
         assert!(!ForwardPayload::is_realtime_datagram_eligible(

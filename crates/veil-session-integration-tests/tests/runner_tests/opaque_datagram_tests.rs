@@ -237,6 +237,8 @@ async fn runner_channels_with_backlog(
             peer_rotates: caps.is_none_or(|caps| caps.supports_realtime_rekey()),
             peer_flows: caps.map_or(flows, |caps| caps.supports_datagram_flows()),
             peer_circuit_datagrams: caps.is_some_and(|caps| caps.supports_circuit_datagrams()),
+            peer_neutral_forwards: caps
+                .is_some_and(|caps| caps.supports_neutral_forward_datagrams()),
             parallel: (parallel && caps.is_none_or(|caps| caps.supports_parallel_quic()))
                 .then_some(offer),
         });
@@ -529,6 +531,136 @@ struct StoppedStreamWriter {
     attempted: Arc<tokio::sync::Notify>,
 }
 
+#[tokio::test]
+async fn neutral_forward_datagrams_require_capability_and_keep_legacy_ordered_fallback() {
+    use veil_proto::{
+        delivery::{DeliveryEnvelope, ForwardPayload},
+        family::DeliveryMsg,
+    };
+    for (negotiated, stopped) in [(true, true), (false, true), (false, false)] {
+        let context = Arc::new(TransportContext::for_debug().unwrap());
+        let uri: TransportUri = "quic://127.0.0.1:0".parse().unwrap();
+        let listener = QuicTransport.bind(&uri, context.clone()).await.unwrap();
+        let uri: TransportUri = format!("quic://{}", listener.local_addr()).parse().unwrap();
+        let accepted = tokio::spawn(async move { listener.accept().await });
+        let a = QuicTransport.connect(&uri, context).await.unwrap();
+        let a_datagrams = a.quic_datagrams().unwrap();
+        let mut a_stream = a.into_stream().unwrap();
+        a_stream.write_all(b"test").await.unwrap();
+        let b = accepted.await.unwrap().unwrap();
+        let b_datagrams = b.quic_datagrams().unwrap();
+        let mut b_stream = b.into_stream().unwrap();
+        b_stream.read_exact(&mut [0; 4]).await.unwrap();
+        let mut tasks = Vec::new();
+        let mut senders = Vec::new();
+        let mut receivers = Vec::new();
+        let mut endpoints = Vec::new();
+        let mut attempts = Vec::new();
+        let ids = [[1; 32], [2; 32]];
+        let app = [0xa0; 32];
+        for (direction, (stream, datagrams, tx, rx)) in [
+            (a_stream, a_datagrams, [1; 32], [2; 32]),
+            (b_stream, b_datagrams, [2; 32], [1; 32]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (_, dummy) = tokio::io::duplex(64);
+            let (mut runner, _) = make_swap_runner(dummy);
+            let mut dispatcher = make_test_dispatcher(NodeRole::Core);
+            dispatcher.local_node_id = ids[direction];
+            let (endpoint, receiver) = dispatcher.app_registry.register(app, 1, 8);
+            endpoints.push(endpoint);
+            receivers.push(receiver);
+            let attempted = Arc::new(tokio::sync::Notify::new());
+            attempts.push(attempted.clone());
+            runner.stream = if stopped {
+                Box::new(StoppedStreamWriter { stream, attempted })
+            } else {
+                stream
+            };
+            runner.quic_datagrams = Some(RealtimeLaneOffer {
+                handle: datagrams,
+                peer_rotates: true,
+                peer_flows: true,
+                peer_circuit_datagrams: false,
+                peer_neutral_forwards: negotiated,
+                parallel: None,
+            });
+            runner.local_node_id = ids[direction];
+            runner.peer_id = ids[1 - direction];
+            runner.session_id = [3; 32];
+            runner.raw_session_keys = Some((tx, rx, [3; 32]));
+            runner.crypto.tx_cipher =
+                Some(veil_crypto::session_cipher::SessionCipher::new(&tx, true));
+            runner.crypto.rx_cipher =
+                Some(veil_crypto::session_cipher::SessionCipher::new(&rx, true));
+            let (sender, outbox) = mpsc::channel(8);
+            senders.push(sender);
+            runner.outbox = Some(outbox.into());
+            let dispatcher = Arc::new(dispatcher);
+            runner.ban_list = dispatcher.abuse.ban_list.clone();
+            runner.violation_tracker = dispatcher.abuse.violation_tracker.clone();
+            runner.dispatcher = dispatcher;
+            tasks.push(tokio::spawn(async move { runner.run().await }));
+        }
+        let body = ForwardPayload {
+            next_hop_node_id: ids[1],
+            relay_hops: 0,
+            delivery_attempt: None,
+            traffic_class: Some(veil_proto::priority::INTERACTIVE),
+            envelope: DeliveryEnvelope {
+                recipient: veil_proto::recipient::Recipient::any(ids[1]),
+                sender_node_id: ids[0],
+                src_app_id: [0xb0; 32],
+                app_id: app,
+                endpoint_id: 1,
+                content_id: [9; 32],
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                ttl_secs: veil_proto::delivery::FORWARD_REALTIME_TTL_SECS,
+                payload: b"neutral opaque data".to_vec(),
+                trace_id: 0,
+                require_ack: false,
+            },
+        }
+        .encode();
+        let mut header = FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+        header.set_priority(veil_proto::priority::INTERACTIVE);
+        header.body_len = body.len() as u32;
+        let mut frame = encode_header(&header).to_vec();
+        frame.extend(body);
+        senders[0]
+            .send((0, veil_bufpool::pooled_shared_from_vec(frame)))
+            .await
+            .unwrap();
+        let receive = tokio::time::timeout(Duration::from_millis(300), receivers[1].recv()).await;
+        if negotiated || !stopped {
+            match receive
+                .expect("neutral data did not reach the endpoint")
+                .unwrap()
+            {
+                AppMessage::Deliver { data, .. } => assert_eq!(&*data, b"neutral opaque data"),
+                other => panic!("unexpected neutral delivery: {other:?}"),
+            }
+        } else {
+            assert!(
+                receive.is_err(),
+                "unnegotiated neutral datagram reached an old decoder"
+            );
+            tokio::time::timeout(Duration::from_secs(1), attempts[0].notified())
+                .await
+                .expect("legacy ordered fallback was never attempted");
+        }
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
 impl tokio::io::AsyncRead for StoppedStreamWriter {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
@@ -663,6 +795,7 @@ async fn runner_circuit_datagrams_over_real_quic(
             peer_rotates: true,
             peer_flows: true,
             peer_circuit_datagrams: negotiated,
+            peer_neutral_forwards: false,
             parallel: None,
         });
         runner.session_id = [3; 32];
@@ -910,6 +1043,7 @@ async fn duplex_children_through_neutral_relay(rotate: bool) {
                 peer_rotates: true,
                 peer_flows: true,
                 peer_circuit_datagrams: true,
+                peer_neutral_forwards: true,
                 parallel: Some(offer),
             });
             runner.local_node_id = local;
