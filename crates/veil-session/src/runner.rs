@@ -275,12 +275,16 @@ impl RealtimeSender {
         {
             return;
         }
+        let path = self.handle.path_stats();
         logger.info(
             "session.rt_trace.datagram_admission",
             format!(
-                "peer_id={} local_slot={priority} accepted={} buffer_drops={} bandwidth_drops={} queued_wire_bytes={} independent={independent}",
+                "peer_id={} local_slot={priority} accepted={} buffer_drops={} bandwidth_drops={} queued_wire_bytes={} independent={independent} rtt_us={} cwnd_bytes={} lost_packets={} congestion_events={} udp_sent={} udp_received={} acks_received={}",
                 hex_short(peer), entry.0, entry.1, entry.2,
                 veil_transport::REALTIME_DATAGRAM_BUFFER_BYTES.saturating_sub(available),
+                path.rtt_us, path.congestion_window_bytes, path.lost_packets,
+                path.congestion_events, path.udp_sent, path.udp_received,
+                path.acknowledgments_received,
             ),
         );
         *entry = (0, 0, 0, Some(now));
