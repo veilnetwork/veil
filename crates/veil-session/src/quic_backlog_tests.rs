@@ -349,6 +349,8 @@ enum StreamBudget {
     Default,
     Manual(u64),
     LocalPrimary,
+    IndependentPrimary,
+    ReturnedToSharedPrimary,
     TransitPrimary,
     ExpiredLocalPrimary,
     DroppedLocalPrimary,
@@ -366,26 +368,31 @@ fn apply_stream_budget(
     match mode {
         StreamBudget::Default => {}
         StreamBudget::Manual(bytes) => tx.set_reliable_send_window(bytes),
-        StreamBudget::LocalPrimary => admission.observe(REALTIME, &frame, now),
+        StreamBudget::LocalPrimary => admission.observe(REALTIME, &frame, now, false),
+        StreamBudget::IndependentPrimary => admission.observe(REALTIME, &frame, now, true),
+        StreamBudget::ReturnedToSharedPrimary => {
+            admission.observe(REALTIME, &frame, now, true);
+            admission.observe(REALTIME, &frame, now, false);
+        }
         StreamBudget::TransitPrimary => {
             // Neither an invalid local frame nor a forged wire priority may
             // activate a source-only budget on an ordinary forwarding lane.
-            admission.observe(REALTIME, &[0; 8], now);
+            admission.observe(REALTIME, &[0; 8], now, false);
             let mut header =
                 veil_proto::decode_header(&frame[..veil_proto::header::HEADER_SIZE]).unwrap();
             header.set_priority(REALTIME);
             let mut forged = frame;
             forged[..veil_proto::header::HEADER_SIZE]
                 .copy_from_slice(&veil_proto::encode_header(&header));
-            admission.observe(INTERACTIVE, &forged, now);
+            admission.observe(INTERACTIVE, &forged, now, false);
         }
         StreamBudget::ExpiredLocalPrimary => {
-            admission.observe(REALTIME, &frame, now);
+            admission.observe(REALTIME, &frame, now, false);
             admission.expire(now + Duration::from_secs(3));
         }
         StreamBudget::DroppedLocalPrimary => {
             let mut guard = LocalReliableAdmission::new(tx.clone());
-            guard.observe(REALTIME, &frame, now);
+            guard.observe(REALTIME, &frame, now, false);
             drop(guard);
         }
     }
@@ -572,6 +579,7 @@ async fn measure_continuous_for_ticks(
                     },
                     &primary,
                     std::time::Instant::now(),
+                    false,
                 );
             }
             let packets = cipher
@@ -775,4 +783,50 @@ async fn continuous_primary_delivery_under_video_and_reliable_stream_load() {
     assert!(report.secondary_sent > 0 && report.secondary_dropped > 0);
     assert!(report.file_bytes > 0, "file must actually cross the link");
     require_primary_quality(&report);
+}
+
+#[tokio::test]
+async fn independent_primary_budget_allows_file_progress_and_returns_to_shared_bound() {
+    // Actual QUIC admission policy; not a media quality assertion. Production
+    // obtains readiness from the selected, prepared independent connection.
+    let shared = measure_continuous_with_stream_budget(
+        true,
+        None,
+        2,
+        StreamBudget::LocalPrimary,
+        Duration::ZERO,
+    )
+    .await;
+    let independent = measure_continuous_with_stream_budget(
+        true,
+        None,
+        2,
+        StreamBudget::IndependentPrimary,
+        Duration::ZERO,
+    )
+    .await;
+    let returned = measure_continuous_with_stream_budget(
+        true,
+        None,
+        2,
+        StreamBudget::ReturnedToSharedPrimary,
+        Duration::ZERO,
+    )
+    .await;
+    assert!(
+        independent.file_bytes > shared.file_bytes * 2,
+        "independent readiness must not retain the one-KiB bottleneck"
+    );
+    assert!(
+        independent.file_accepted < 4 * 1024 * 1024,
+        "source write-ahead remains bounded"
+    );
+    assert!(
+        returned.file_bytes < independent.file_bytes / 2,
+        "fallback must reapply the shared admission bound"
+    );
+    assert!(
+        returned.file_bytes > 0,
+        "shared fallback must still make file progress"
+    );
 }

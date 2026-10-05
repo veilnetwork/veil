@@ -5,11 +5,14 @@ use std::time::{Duration, Instant};
 use veil_transport::{DEFAULT_RELIABLE_SEND_WINDOW_BYTES, QuicDatagramHandle};
 
 pub(super) const ACTIVE_RELIABLE_BYTES: u64 = 1024;
+// A prepared independent primary never sits behind this canonical stream.
+pub(super) const INDEPENDENT_RELIABLE_BYTES: u64 = 16 * 1024;
 const IDLE_GRACE: Duration = Duration::from_secs(3);
 
 pub(super) struct LocalReliableAdmission {
     handle: QuicDatagramHandle,
     active_until: Option<Instant>,
+    active_window: Option<u64>,
 }
 
 impl LocalReliableAdmission {
@@ -17,17 +20,30 @@ impl LocalReliableAdmission {
         Self {
             handle,
             active_until: None,
+            active_window: None,
         }
     }
 
-    pub(super) fn observe(&mut self, local_priority: u8, frame: &[u8], now: Instant) {
+    pub(super) fn observe(
+        &mut self,
+        local_priority: u8,
+        frame: &[u8],
+        now: Instant,
+        independent: bool,
+    ) {
         if local_priority != veil_proto::priority::REALTIME
             || super::decode_realtime_lane_frame(frame).is_none()
         {
             return;
         }
-        if self.active_until.is_none() {
-            self.handle.set_reliable_send_window(ACTIVE_RELIABLE_BYTES);
+        let window = if independent {
+            INDEPENDENT_RELIABLE_BYTES
+        } else {
+            ACTIVE_RELIABLE_BYTES
+        };
+        if self.active_window != Some(window) {
+            self.handle.set_reliable_send_window(window);
+            self.active_window = Some(window);
         }
         self.active_until = Some(now + IDLE_GRACE);
     }
@@ -40,6 +56,7 @@ impl LocalReliableAdmission {
 
     fn restore(&mut self) {
         if self.active_until.take().is_some() {
+            self.active_window = None;
             self.handle
                 .set_reliable_send_window(DEFAULT_RELIABLE_SEND_WINDOW_BYTES);
         }
