@@ -167,6 +167,7 @@ impl FrameSender {
 
 #[derive(Debug)]
 pub struct FrameOutbox {
+    source_activity: std::sync::Arc<crate::local_source_activity::LocalSourceActivity>,
     ordinary: EnvelopeReceiver,
     status: Option<std::sync::Arc<crate::local_datagram_status::LocalDatagramStatus>>,
     reserved: Option<EnvelopeReceiver>,
@@ -175,6 +176,13 @@ pub struct FrameOutbox {
 
 /// Keep the existing ordinary budget; add a small independent reserve.
 pub fn frame_channel(capacity: usize) -> (FrameSender, FrameOutbox) {
+    frame_channel_with_source_activity(capacity, std::sync::Arc::default())
+}
+
+pub(crate) fn frame_channel_with_source_activity(
+    capacity: usize,
+    source_activity: std::sync::Arc<crate::local_source_activity::LocalSourceActivity>,
+) -> (FrameSender, FrameOutbox) {
     let status = std::sync::Arc::default();
     let (ordinary_tx, ordinary) = mpsc::channel(capacity);
     let (reserved_tx, reserved) = mpsc::channel(capacity.min(RESERVED_QUEUE_DEPTH));
@@ -185,6 +193,7 @@ pub fn frame_channel(capacity: usize) -> (FrameSender, FrameOutbox) {
             reserved: reserved_tx,
         },
         FrameOutbox {
+            source_activity,
             ordinary: EnvelopeReceiver::Live(ordinary),
             status: Some(status),
             reserved: Some(EnvelopeReceiver::Live(reserved)),
@@ -197,6 +206,7 @@ pub fn frame_channel(capacity: usize) -> (FrameSender, FrameOutbox) {
 impl From<mpsc::Receiver<PriorityFrame>> for FrameOutbox {
     fn from(ordinary: mpsc::Receiver<PriorityFrame>) -> Self {
         Self {
+            source_activity: std::sync::Arc::default(),
             ordinary: EnvelopeReceiver::Legacy(ordinary),
             status: None,
             reserved: None,
@@ -206,6 +216,10 @@ impl From<mpsc::Receiver<PriorityFrame>> for FrameOutbox {
 }
 
 impl FrameOutbox {
+    pub(crate) fn source_activity(&self) -> &crate::local_source_activity::LocalSourceActivity {
+        &self.source_activity
+    }
+
     /// The runner owns this lease only while its datagram sender is usable.
     pub fn activate_datagram_transport(&self) -> Option<crate::DatagramTransportLease> {
         self.status

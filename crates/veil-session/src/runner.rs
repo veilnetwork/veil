@@ -450,12 +450,13 @@ fn enqueue_outbox_frame(
     priority: u8,
     frame: veil_bufpool::PooledShared,
 ) -> bool {
-    enqueue_outbox_envelope(pq, (priority, frame).into())
+    enqueue_outbox_envelope(pq, (priority, frame).into(), None)
 }
 
 fn enqueue_outbox_envelope(
     pq: &mut PriorityQueue,
     envelope: crate::frame_outbox::FrameEnvelope,
+    source_activity: Option<&crate::local_source_activity::LocalSourceActivity>,
 ) -> bool {
     let lossy = decode_realtime_lane_frame(&envelope.frame.1).is_some();
     // CircuitDatagram is downgraded before enqueueing for some legacy hops.
@@ -474,7 +475,11 @@ fn enqueue_outbox_envelope(
         && envelope.carrier.is_none()
         && (lossy || legacy_circuit)
     {
-        pq.note_local_primary(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        pq.note_local_primary(now);
+        if let Some(activity) = source_activity {
+            activity.note(now);
+        }
     }
     pq.push_envelope(envelope, lossy);
     lossy
@@ -2080,7 +2085,8 @@ impl SessionRunner {
                 Ok(envelope) => {
                     // chunking is always supported (single protocol version),
                     // so no CHUNK-flag gating is needed here.
-                    any_realtime |= enqueue_outbox_envelope(pq, envelope);
+                    any_realtime |=
+                        enqueue_outbox_envelope(pq, envelope, Some(outbox.source_activity()));
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -4343,7 +4349,11 @@ impl SessionRunner {
                 let mut encrypted_batch_frames = Vec::new();
                 let mut encrypted_batch_wire_len = 0usize;
                 let mut batch_has_local_source = false;
-                let local_primary_active = pq.local_primary_active(std::time::Instant::now());
+                let now = std::time::Instant::now();
+                let local_primary_active = pq.local_primary_active(now)
+                    || outbox
+                        .as_ref()
+                        .is_some_and(|outbox| outbox.source_activity().active(now));
                 let mut source_bulk_waiting_for_writer = false;
                 while !coalesce_active
                     && drained_this_pass < drain_cap
@@ -4519,7 +4529,11 @@ impl SessionRunner {
                         break;
                     }
                     NextInput::OutboxFrame(envelope) => {
-                        if enqueue_outbox_envelope(&mut pq, envelope) {
+                        if enqueue_outbox_envelope(
+                            &mut pq,
+                            envelope,
+                            outbox.as_ref().map(|outbox| outbox.source_activity()),
+                        ) {
                             // Outbound media in flight — arm/refresh the
                             // accelerated liveness cadence (mobility slice).
                             timers.note_realtime_activity(tokio::time::Instant::now());
@@ -5584,6 +5598,77 @@ mod m1_empty_frame_aead_tests {
 #[cfg(test)]
 mod realtime_lane_frame_tests {
     use super::*;
+
+    #[test]
+    fn local_primary_protects_own_background_on_other_links_but_not_transit_or_other_nodes() {
+        use veil_proto::{
+            family::RelayChainMsg,
+            priority::{BACKGROUND, INTERACTIVE, REALTIME},
+        };
+        let mut registry = crate::SessionTxRegistry::new();
+        let primary = registry.register([0xA1; 32]);
+        let other_link = registry.register([0xB1; 32]);
+        let mut other_node = crate::SessionTxRegistry::new();
+        let unrelated = other_node.register([0xC1; 32]);
+        let encoded = frame(
+            FrameFamily::RelayChain,
+            RelayChainMsg::CircuitData as u16,
+            &[0x81; 200],
+        );
+        let mut pq = PriorityQueue::with_default_weights();
+        enqueue_outbox_envelope(
+            &mut pq,
+            (
+                INTERACTIVE,
+                veil_bufpool::pooled_shared_from_vec(encoded.clone()),
+            )
+                .into(),
+            Some(primary.source_activity()),
+        );
+        assert!(
+            !other_link
+                .source_activity()
+                .active(std::time::Instant::now()),
+            "transit cannot activate source policy"
+        );
+        enqueue_outbox_envelope(
+            &mut pq,
+            (REALTIME, veil_bufpool::pooled_shared_from_vec(encoded)).into(),
+            Some(primary.source_activity()),
+        );
+        let now = std::time::Instant::now();
+        assert!(other_link.source_activity().active(now));
+        assert!(!unrelated.source_activity().active(now));
+        assert!(!local_source_stream_budget::fits(
+            other_link.source_activity().active(now),
+            BACKGROUND,
+            1,
+            0,
+            2000,
+            false
+        ));
+        assert!(local_source_stream_budget::fits(
+            other_link.source_activity().active(now),
+            INTERACTIVE,
+            7,
+            0,
+            60_000,
+            false
+        ));
+        assert!(local_source_stream_budget::fits(
+            unrelated.source_activity().active(now),
+            BACKGROUND,
+            7,
+            0,
+            60_000,
+            false
+        ));
+        assert!(
+            !other_link
+                .source_activity()
+                .active(now + std::time::Duration::from_secs(3))
+        );
+    }
 
     #[test]
     fn local_source_stream_budget_is_not_activated_by_neutral_transit() {
