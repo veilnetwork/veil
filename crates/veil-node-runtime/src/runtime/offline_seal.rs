@@ -63,6 +63,7 @@ fn local_verified_cert(
     let ratchet_x25519_pubkey =
         *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*ratchet_sk)).as_bytes();
     Ok(VerifiedMlkemCert {
+        device_id: None,
         node_id,
         instance_id,
         mlkem_algo: veil_proto::prekey_bundle::ALGO_ML_KEM_768,

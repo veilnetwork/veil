@@ -1496,6 +1496,9 @@ pub struct Opened {
     /// *name* on it that is unconfirmed. Callers surface this as
     /// `SenderProvenance::Claimed`, exactly as they do for the anonymous path.
     pub authenticated: bool,
+    /// Device address from the verified certificate of the opened key.
+    /// Never taken from the outer relay envelope or a routing alias.
+    pub sender_device_id: Option<[u8; 32]>,
 }
 
 /// Whether a payload is one of ours, cheaply, without parsing it.
@@ -1724,6 +1727,13 @@ fn open_inner(
                         entry.authenticated_until = entry.authenticated_until.max(until);
                     }
                     let authenticated = entry.is_authenticated(now_unix);
+                    let sender_device_id = if authenticated {
+                        peer_devices.and_then(|devices| {
+                            devices.device_for_key(&sender_instance_id, &entry.peer_ik, now_unix)
+                        })
+                    } else {
+                        None
+                    };
                     g.commit_change(key);
                     // A frame that opened may have banked keys for the ones it
                     // arrived ahead of. Checked HERE, after the tag verified,
@@ -1738,6 +1748,7 @@ fn open_inner(
                         ack_key: [0u8; ACK_KEY_LEN],
                         key,
                         authenticated,
+                        sender_device_id,
                     });
                 }
                 Err(e) => {
@@ -1899,6 +1910,13 @@ fn open_inner(
                     ack_key: [0u8; ACK_KEY_LEN],
                     key,
                     authenticated,
+                    sender_device_id: if authenticated {
+                        peer_devices.and_then(|devices| {
+                            devices.device_for_key(&sender_instance_id, &peer_ik, now_unix)
+                        })
+                    } else {
+                        None
+                    },
                 });
             }
             // Keep the first refusal that says something. A wrong epoch fails
@@ -1954,7 +1972,15 @@ pub struct PeerDeviceKeys {
     /// since expired went on authenticating conversations for as long as the
     /// process lived, and the authenticated bit is persisted, so it outlived
     /// that too (report16 V16-H1).
-    keys: Vec<([u8; 16], [u8; 32], u64)>,
+    keys: Vec<PublishedDeviceKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PublishedDeviceKey {
+    instance: [u8; 16],
+    key: [u8; 32],
+    valid_until: u64,
+    device: Option<[u8; 32]>,
 }
 
 impl PeerDeviceKeys {
@@ -1968,14 +1994,34 @@ impl PeerDeviceKeys {
     /// Record a key from a verified certificate, with the device it named and
     /// the moment that certificate stops saying so. Newest wins the room.
     pub fn remember(&mut self, instance_id: [u8; 16], key: [u8; 32], valid_until: u64) {
+        self.remember_with_device(instance_id, key, valid_until, None);
+    }
+
+    /// Remember a transport address only after its document subkey and the
+    /// certificate signature/key/instance/validity binding have been checked.
+    pub fn remember_with_device(
+        &mut self,
+        instance_id: [u8; 16],
+        key: [u8; 32],
+        valid_until: u64,
+        device: Option<[u8; 32]>,
+    ) {
         if let Some(at) = self
             .keys
             .iter()
-            .position(|(i, k, _)| *i == instance_id && *k == key)
+            .position(|entry| entry.instance == instance_id && entry.key == key)
         {
             self.keys.remove(at);
         }
-        self.keys.insert(0, (instance_id, key, valid_until));
+        self.keys.insert(
+            0,
+            PublishedDeviceKey {
+                instance: instance_id,
+                key,
+                valid_until,
+                device,
+            },
+        );
         self.keys.truncate(Self::MAX);
     }
 
@@ -2002,8 +2048,23 @@ impl PeerDeviceKeys {
     pub fn authorized_until(&self, instance_id: &[u8; 16], key: &[u8; 32]) -> Option<u64> {
         self.keys
             .iter()
-            .find(|(i, k, _)| i == instance_id && k == key)
-            .map(|(_, _, until)| *until)
+            .find(|entry| &entry.instance == instance_id && &entry.key == key)
+            .map(|entry| entry.valid_until)
+    }
+
+    /// Exact cryptographic key and instance, not an outer transport claim.
+    fn device_for_key(
+        &self,
+        instance: &[u8; 16],
+        key: &[u8; 32],
+        now_unix: u64,
+    ) -> Option<[u8; 32]> {
+        self.keys
+            .iter()
+            .find(|entry| {
+                &entry.instance == instance && &entry.key == key && now_unix <= entry.valid_until
+            })
+            .and_then(|entry| entry.device)
     }
 
     /// Whether an unexpired verified certificate names this instance.
@@ -2011,14 +2072,14 @@ impl PeerDeviceKeys {
     pub fn names_instance(&self, instance: &[u8; 16], now_unix: u64) -> bool {
         self.keys
             .iter()
-            .any(|(i, _, until)| i == instance && now_unix <= *until)
+            .any(|entry| &entry.instance == instance && now_unix <= entry.valid_until)
     }
 
     /// The most recently published key, for callers that need ONE — a
     /// diagnostic, or a readiness check.
     #[must_use]
     pub fn newest(&self) -> Option<[u8; 32]> {
-        self.keys.first().map(|(_, k, _)| *k)
+        self.keys.first().map(|entry| entry.key)
     }
 
     #[must_use]
@@ -2264,6 +2325,63 @@ mod tests {
         let mut d = PeerDeviceKeys::default();
         d.remember(instance_id, *pk, u64::MAX);
         d
+    }
+
+    #[test]
+    fn device_proof_follows_the_opened_key_instance_and_certificate_window() {
+        let (a, b) = (device(0xA9), device(0xB9));
+        let transport = [0xD9; 32];
+        let a_pk = a.ratchet_pk();
+        let mut published = PeerDeviceKeys::default();
+        published.remember_with_device(a.instance_id, a_pk, NOW + 5, Some(transport));
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"proof", NOW)
+            .unwrap()
+            .0;
+        let opened = open(
+            &b.store,
+            &b.me(),
+            &a.node_id,
+            &payload,
+            Some(&published),
+            NOW,
+        )
+        .unwrap();
+        assert!(opened.authenticated);
+        assert_eq!(opened.sender_device_id, Some(transport));
+        assert_eq!(published.device_for_key(&[0; 16], &a_pk, NOW), None);
+        assert_eq!(
+            published.device_for_key(&a.instance_id, &[0; 32], NOW),
+            None
+        );
+        assert_eq!(
+            published.device_for_key(&a.instance_id, &a_pk, NOW + 6),
+            None
+        );
+        // Persisted authentication alone is insufficient to manufacture a
+        // transport device when the current verified cache lacks that key.
+        let mut other_key = PeerDeviceKeys::default();
+        other_key.remember_with_device(a.instance_id, [0; 32], NOW + 5, Some([0xF9; 32]));
+        let payload = seal(
+            &a.store,
+            &a.me(),
+            keys(&b, &ek, &pk),
+            b"no guessed device",
+            NOW,
+        )
+        .unwrap()
+        .0;
+        let opened = open(
+            &b.store,
+            &b.me(),
+            &a.node_id,
+            &payload,
+            Some(&other_key),
+            NOW,
+        )
+        .unwrap();
+        assert!(opened.authenticated);
+        assert_eq!(opened.sender_device_id, None);
     }
 
     struct Device {

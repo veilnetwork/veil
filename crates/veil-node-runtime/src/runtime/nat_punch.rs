@@ -27,6 +27,29 @@ use std::sync::Arc;
 
 use super::*;
 
+/// Address the device whose key the peer's verified certificate names.
+/// This selects a NAT routing target only: the subsequent TLS/OVL1 handshake
+/// still pins the original registered identity. Unchecked endpoint/DHT claims
+/// are never a device-membership source here.
+fn certified_punch_target(
+    identity: [u8; 32],
+    cached: Option<&(
+        veil_identity::mlkem_fanout::VerifiedMlkemCert,
+        std::time::Instant,
+    )>,
+    now_unix: u64,
+) -> [u8; 32] {
+    cached
+        .filter(|(cert, cached_at)| {
+            cert.node_id == identity
+                && cert.valid_until_unix >= now_unix
+                && cached_at.elapsed() < crate::mlkem_resolver::CERT_CACHE_TTL
+        })
+        .and_then(|(cert, _)| cert.device_id)
+        .filter(|device| *device != [0; 32])
+        .unwrap_or(identity)
+}
+
 impl NodeServices {
     /// try NAT traversal toward `target_node_id`
     /// using ANY currently-connected peer as the signaling coordinator.
@@ -380,6 +403,14 @@ impl NodeServices {
         if !config.nat.enabled {
             return Err(HolePunchDialFailure::NoReflector);
         }
+        // A registered peer is an identity; legacy coordinators route their
+        // actual sessions by physical device. Keep handshake identity pinning
+        // intact while asking the certified device to answer the NAT probe.
+        let target_node_id = certified_punch_target(
+            target_node_id,
+            rlock!(self.identity.peer_mlkem_certs).get(&target_node_id),
+            veil_util::unix_secs_now_u64(),
+        );
         let mut reflectors =
             self.available_udp_reflectors(target_node_id, &config.nat.udp_reflectors);
         let Some(first_reflector) = reflectors.first().copied() else {
@@ -1033,5 +1064,56 @@ impl NodeServices {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod certified_target_tests {
+    use super::*;
+
+    #[test]
+    fn physical_punch_target_needs_current_matching_certificate_evidence() {
+        let identity = [0x11; 32];
+        let device = [0x22; 32];
+        let now = 1_800_000_000;
+        let mut cached = (
+            veil_identity::mlkem_fanout::VerifiedMlkemCert {
+                device_id: Some(device),
+                node_id: identity,
+                instance_id: [0x33; 16],
+                mlkem_algo: veil_proto::prekey_bundle::ALGO_ML_KEM_768,
+                mlkem_pubkey: vec![],
+                ratchet_x25519_pubkey: [0x44; 32],
+                cert_version: 1,
+                valid_until_unix: now + 60,
+            },
+            std::time::Instant::now(),
+        );
+        assert_eq!(certified_punch_target(identity, Some(&cached), now), device);
+        assert_eq!(certified_punch_target(identity, None, now), identity);
+        assert_eq!(
+            certified_punch_target([0x55; 32], Some(&cached), now),
+            [0x55; 32]
+        );
+        assert_eq!(
+            certified_punch_target(identity, Some(&cached), now + 61),
+            identity
+        );
+        cached.1 -= crate::mlkem_resolver::CERT_CACHE_TTL;
+        assert_eq!(
+            certified_punch_target(identity, Some(&cached), now),
+            identity
+        );
+        cached.1 = std::time::Instant::now();
+        cached.0.device_id = None;
+        assert_eq!(
+            certified_punch_target(identity, Some(&cached), now),
+            identity
+        );
+        cached.0.device_id = Some([0; 32]);
+        assert_eq!(
+            certified_punch_target(identity, Some(&cached), now),
+            identity
+        );
     }
 }
