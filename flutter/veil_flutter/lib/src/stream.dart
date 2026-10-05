@@ -17,9 +17,10 @@
 // Threading note (diff-audit H3): the underlying FFI calls block the calling
 // Dart thread for one daemon round-trip (`block_on` in Rust).  `read()` — which
 // can block INDEFINITELY waiting for data — runs on a WORKER isolate via
-// `Isolate.run` so it never freezes the UI isolate (Android ANR).  `write()`
-// completes promptly (flow-controlled) so it stays on `Future(() {...})` like
-// the rest of the surface.  Safe to drive the stream from a worker isolate: the
+// `Isolate.run` so it never freezes the UI isolate (Android ANR). `write()`
+// can also block under backpressure and runs on a worker. Per-stream FIFO
+// preserves invocation order; bounded write workers leave reads independent.
+// Safe to drive the stream from a worker isolate: the
 // stream handle is a generational handle-table KEY (see `veil_stream_close` in
 // veilclient-ffi), Arc-looked-up per call, so a read racing `close()` returns a
 // clean table-miss error rather than a use-after-free.
@@ -49,6 +50,8 @@ int _clampAnonStreamConcurrency(int value) {
   if (value > 16) return 16;
   return value;
 }
+
+final _streamWriteGate = _AsyncGate(16);
 
 final _anonStreamReadGate = _AsyncGate(
   _clampAnonStreamConcurrency(_anonStreamReadConcurrency),
@@ -105,6 +108,30 @@ class _AsyncGate {
   }
 }
 
+/// Native reliable writes can wait for IPC or peer flow control. Only the
+/// address and bytes cross into the worker; no Finalizable stream is captured.
+void _ffiStreamWriteOffIsolate(int streamAddr, Uint8List data) {
+  final stream = Pointer<ffi.VeilStreamFfi>.fromAddress(streamAddr);
+  final dataPtr = data.isEmpty ? nullptr : calloc<Uint8>(data.length);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    if (data.isNotEmpty) dataPtr.asTypedList(data.length).setAll(0, data);
+    final rc = ffi.veilStreamWrite(stream, dataPtr, data.length, errOut);
+    if (rc != ffi.veilOk) {
+      throw VeilException(
+        'stream write failed: ${_readErrAndFree(errOut)}',
+        code: rc,
+      );
+    }
+  } finally {
+    if (dataPtr != nullptr) calloc.free(dataPtr);
+    calloc.free(errOut);
+  }
+}
+
+Future<void> _writeStreamOnWorker(int streamAddr, Uint8List data) =>
+    Isolate.run(() => _ffiStreamWriteOffIsolate(streamAddr, data));
+
 /// Top-level FFI stream read, run on a WORKER isolate via [Isolate.run]
 /// (diff-audit H3). Top-level (not a method) so the closure captures only the
 /// sendable `int` address + `maxBytes`, never `this`. The stream handle is a
@@ -149,6 +176,7 @@ class VeilStream implements Finalizable {
   }
 
   final Pointer<ffi.VeilStreamFfi> _stream;
+  final _writeGate = _AsyncGate(1);
   bool _closed = false;
 
   /// Background read-loop controller, lazily started on first [reads]
@@ -173,25 +201,15 @@ class VeilStream implements Finalizable {
         '(${ffi.veilMaxDataLen})',
       );
     }
-    return Future(() {
-      final dataPtr = data.isEmpty ? nullptr : calloc<Uint8>(data.length);
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        if (data.isNotEmpty) {
-          dataPtr.asTypedList(data.length).setAll(0, data);
-        }
-        final rc = ffi.veilStreamWrite(_stream, dataPtr, data.length, errOut);
-        if (rc != ffi.veilOk) {
-          throw VeilException(
-            'stream write failed: ${_readErrAndFree(errOut)}',
-            code: rc,
-          );
-        }
-      } finally {
-        if (dataPtr != nullptr) calloc.free(dataPtr);
-        calloc.free(errOut);
-      }
-    });
+    return _writeGate.run(
+      () => _streamWriteGate.run(() => _writeWhenOpen(data)),
+    );
+  }
+
+  Future<void> _writeWhenOpen(Uint8List data) {
+    // A queued write must not start after close while waiting for admission.
+    _ensureOpen();
+    return _writeStreamOnWorker(_stream.address, data);
   }
 
   /// Read up to [maxBytes] bytes from the stream.  Returns an empty
