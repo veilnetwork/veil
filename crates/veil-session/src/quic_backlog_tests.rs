@@ -338,6 +338,7 @@ struct ContinuousReport {
     primary_received: usize,
     primary_p95: Option<Duration>,
     secondary_sent: usize,
+    secondary_received: usize,
     secondary_dropped: usize,
     file_bytes: u64,
     file_accepted: u64,
@@ -411,6 +412,25 @@ async fn measure_continuous_with_stream_budget(
     primary_tick_period: u32,
     stream_budget: StreamBudget,
     file_lead: Duration,
+) -> ContinuousReport {
+    measure_continuous_for_ticks(
+        file,
+        video_tick_period,
+        primary_tick_period,
+        stream_budget,
+        file_lead,
+        200,
+    )
+    .await
+}
+
+async fn measure_continuous_for_ticks(
+    file: bool,
+    video_tick_period: Option<u32>,
+    primary_tick_period: u32,
+    stream_budget: StreamBudget,
+    file_lead: Duration,
+    ticks: u32,
 ) -> ContinuousReport {
     use crate::datagram_flows::{SessionDatagramRx, SessionDatagramTx};
     use veil_anonymity::circuit_wire::CircuitDataPayload;
@@ -495,6 +515,8 @@ async fn measure_continuous_with_stream_budget(
         apply_stream_budget(stream_budget, &tx, &mut admission);
     }
     let started = Instant::now();
+    let secondary_received = Arc::new(AtomicU64::new(0));
+    let received_secondary = Arc::clone(&secondary_received);
     let (received_tx, mut received_rx) = mpsc::unbounded_channel();
     let media_reader = tokio::spawn(async move {
         let mut cipher = SessionDatagramRx::new(&[7; 32], &[8; 32], true);
@@ -516,6 +538,7 @@ async fn measure_continuous_with_stream_budget(
                         .unwrap();
                 } else {
                     assert_eq!(cell.circuit_id, 2);
+                    received_secondary.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -524,9 +547,10 @@ async fn measure_continuous_with_stream_budget(
     let mut primary_sent = 0;
     let mut secondary_sent = 0;
     let mut secondary_dropped = 0;
-    // 50 primary cells/s and 100 secondary cells/s overload this link. The
-    // reliable stream is independent application traffic on the same QUIC.
-    for tick in 0..200u32 {
+    // Tick periods 2/1 produce 50 primary and 100 secondary cells/s,
+    // overloading this link. The reliable stream is independent application
+    // traffic on the same QUIC.
+    for tick in 0..ticks {
         sleep_until(started + Duration::from_millis(u64::from(tick) * 10)).await;
         let ceiling = tx.max_size().unwrap();
         if tick % primary_tick_period == 0 {
@@ -597,10 +621,11 @@ async fn measure_continuous_with_stream_budget(
     samples.sort_unstable();
     let p95 = samples.get(samples.len() * 95 / 100).copied();
     eprintln!(
-        "continuous: file={file} video_tick_period={video_tick_period:?} primary_tick_period={primary_tick_period} stream_budget={stream_budget:?} file_lead_ms={} primary_sent={primary_sent} primary_received={} primary_p95_ms={:?} secondary_sent={secondary_sent} secondary_dropped={secondary_dropped} file_bytes={} file_accepted={} neutral_udp_drops={}",
+        "continuous: ticks={ticks} file={file} video_tick_period={video_tick_period:?} primary_tick_period={primary_tick_period} stream_budget={stream_budget:?} file_lead_ms={} primary_sent={primary_sent} primary_received={} primary_p95_ms={:?} secondary_sent={secondary_sent} secondary_received={} secondary_dropped={secondary_dropped} file_bytes={} file_accepted={} neutral_udp_drops={}",
         file_lead.as_millis(),
         samples.len(),
         p95.map(|v| v.as_secs_f64() * 1000.0),
+        secondary_received.load(Ordering::Relaxed),
         file_bytes.load(Ordering::Relaxed),
         file_accepted.load(Ordering::Relaxed),
         link.dropped.load(Ordering::Relaxed)
@@ -614,6 +639,7 @@ async fn measure_continuous_with_stream_budget(
         primary_received: samples.len(),
         primary_p95: p95,
         secondary_sent,
+        secondary_received: secondary_received.load(Ordering::Relaxed) as usize,
         secondary_dropped,
         file_bytes: file_bytes.load(Ordering::Relaxed),
         file_accepted: file_accepted.load(Ordering::Relaxed),
@@ -621,9 +647,13 @@ async fn measure_continuous_with_stream_budget(
 }
 
 fn require_primary_quality(report: &ContinuousReport) {
-    assert_eq!(report.primary_sent, 100);
+    require_primary_quality_for(report, 100);
+}
+
+fn require_primary_quality_for(report: &ContinuousReport, expected: usize) {
+    assert_eq!(report.primary_sent, expected);
     assert!(
-        report.primary_received >= 95,
+        report.primary_received >= expected * 95 / 100,
         "too many primary cells lost: {report:?}"
     );
     assert!(
@@ -693,6 +723,29 @@ async fn local_primary_bounds_new_file_admission_and_preserves_delivery() {
     .await;
     assert!(report.file_bytes > 0, "file must actually progress");
     require_primary_quality(&report);
+}
+
+#[tokio::test]
+async fn local_primary_stays_fresh_with_low_cadence_video_and_file_for_ten_seconds() {
+    // Exercise the current endpoint reliable budget together with compact
+    // secondary frames at 2/s. The old overload characterization below keeps
+    // its unbounded reliable admission and 100 secondary frames/s. This
+    // neutral FIFO sees no roles, priorities or special flow treatment.
+    let report = measure_continuous_for_ticks(
+        true,
+        Some(50),
+        2,
+        StreamBudget::LocalPrimary,
+        Duration::ZERO,
+        1000,
+    )
+    .await;
+    assert!(report.secondary_sent > 0 && report.secondary_received > 0);
+    assert!(
+        report.file_bytes > 0,
+        "file payload must actually cross the link"
+    );
+    require_primary_quality_for(&report, 500);
 }
 
 #[tokio::test]
