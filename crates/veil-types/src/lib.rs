@@ -56,6 +56,17 @@ pub trait FrameBroadcaster: Send + Sync {
     /// `false` if the peer is not registered or its channel is closed/full.
     fn send_to(&self, peer_id: &[u8; 32], priority: u8, bytes: Vec<u8>) -> bool;
 
+    /// Admit an endpoint-owned reliable byte-stream frame with backpressure.
+    /// Production implementations retain a bounded local credit until the
+    /// scheduler consumes the frame; relay traffic must not use this API.
+    fn send_reliable_to<'a>(
+        &'a self,
+        peer_id: &'a [u8; 32],
+        bytes: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move { self.send_to(peer_id, 3, bytes) })
+    }
+
     /// Fan `bytes` out to every registered session at `priority`. Closed
     /// channels are evicted; full channels drop the frame.
     fn send_to_all_with_priority(&self, priority: u8, bytes: Arc<[u8]>);

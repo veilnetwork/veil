@@ -769,6 +769,64 @@ async fn ipc_stream_bidirectional_ping_pong() {
 }
 
 // ── Cross-client hijack: third client cannot push bytes into a stream ──
+
+#[tokio::test]
+async fn failed_remote_acceptor_send_notifies_its_sdk_and_releases_ownership() {
+    struct Unavailable;
+    impl veil_types::FrameBroadcaster for Unavailable {
+        fn send_to(&self, _: &[u8; 32], _: u8, _: Vec<u8>) -> bool {
+            false
+        }
+        fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+        fn active_node_ids(&self) -> Vec<[u8; 32]> {
+            Vec::new()
+        }
+    }
+    let sock = temp_socket_path();
+    let (server, shutdown_tx, registry) = make_server(sock.clone());
+    let mut server = server.with_session_tx_registry(Arc::new(Unavailable));
+    let sh = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut client = connect_and_hello(&sock).await;
+    let bind = AppBindPayload {
+        endpoint_id: 9,
+        flags: 0,
+        namespace: b"remote-pressure".to_vec(),
+        name: b"svc".to_vec(),
+    };
+    send_ipc_frame(&mut client, LocalAppMsg::AppBind as u16, &bind.encode()).await;
+    let (_, body) = recv_ipc_frame(&mut client).await;
+    let app = AppBindOkPayload::decode(&body).unwrap().app_id;
+    assert!(registry.route_stream_open(
+        app,
+        9,
+        41,
+        [0xee; 32],
+        veil_proto::SenderProvenance::Claimed,
+        STREAM_INITIAL_WINDOW,
+    ));
+    let (hdr, _) = recv_ipc_frame(&mut client).await;
+    assert_eq!(hdr.msg_type, LocalAppMsg::StreamOpenInbound as u16);
+    let data = StreamDataPayload {
+        stream_id: 41,
+        data: b"cannot vanish".to_vec(),
+    };
+    send_ipc_frame(&mut client, LocalAppMsg::StreamData as u16, &data.encode()).await;
+    let (hdr, body) = recv_ipc_frame(&mut client).await;
+    assert_eq!(hdr.msg_type, LocalAppMsg::StreamClose as u16);
+    assert_eq!(StreamClosePayload::decode(&body).unwrap().stream_id, 41);
+    // A queued write after failure no longer owns the route and cannot emit
+    // another close or route bytes into a future stream with this id.
+    send_ipc_frame(&mut client, LocalAppMsg::StreamData as u16, &data.encode()).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), recv_ipc_frame(&mut client))
+            .await
+            .is_err()
+    );
+    drop(client);
+    let _ = shutdown_tx.send(true);
+    sh.await.unwrap().unwrap();
+}
 //
 // Closes the same hijack vector that the original (opener-only) ownership
 // check guarded against — the new A/B model must NOT widen this surface.
