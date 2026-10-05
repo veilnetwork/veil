@@ -2632,8 +2632,9 @@ class AppHandle implements Finalizable {
         appAddr, myNodeId, dstAppId, dstEndpointId, data));
   }
 
-  /// Send a loss-tolerant datagram over an already-active direct peer session
-  /// at realtime priority. No route discovery or relay fallback is attempted;
+  /// Send loss-tolerant signaling on an active direct peer session using a
+  /// source channel separate from native audio and video. No route discovery
+  /// or relay fallback is attempted;
   /// callers should catch failure and keep a durable transport for control
   /// messages that must eventually arrive.
   Future<void> sendRealtime({
