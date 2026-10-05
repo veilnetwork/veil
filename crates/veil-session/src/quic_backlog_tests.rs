@@ -1523,3 +1523,100 @@ async fn bound_independent_primary_survives_competing_endpoint_producers() {
         "competing producers made no progress: {report:?}"
     );
 }
+
+#[tokio::test]
+async fn primary_ack_blackout_limits_secondary_before_rtt_or_expiry_changes() {
+    use veil_proto::priority::{BULK, INTERACTIVE, REALTIME};
+    let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let link = NeutralLink::new(
+        left.local_addr().unwrap(),
+        right.local_addr().unwrap(),
+        1_000_000,
+        Duration::from_millis(1),
+    )
+    .await;
+    let ctx = Arc::new(TransportContext::for_debug().unwrap());
+    let remote = tokio::spawn(promote_punched_quic(
+        right,
+        link.right_addr,
+        Arc::clone(&ctx),
+        PunchedQuicRole::Responder,
+    ));
+    let local = promote_punched_quic(left, link.left_addr, ctx, PunchedQuicRole::Initiator)
+        .await
+        .unwrap();
+    let close = local.quic_connection().unwrap();
+    let handle = local.quic_datagrams().unwrap();
+    let mut stream = local.into_stream().unwrap();
+    stream.write_all(b"warm").await.unwrap();
+    let remote = remote.await.unwrap().unwrap();
+    let mut remote_stream = remote.into_stream().unwrap();
+    let mut prefix = [0; 4];
+    remote_stream.read_exact(&mut prefix).await.unwrap();
+    assert_eq!(&prefix, b"warm");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let s = handle.path_stats();
+            if s.rtt_us < 150_000 && s.in_flight_bytes == 0 && s.pto_count == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut admission =
+        super::local_reliable_admission::LocalReliableAdmission::new(handle.clone());
+    let frame = circuit_frame(1, 0x11);
+    admission.observe(REALTIME, &frame, std::time::Instant::now(), true);
+    link.blackout.store(true, Ordering::Relaxed);
+    handle.send(&[0x11; 200]).unwrap();
+    timeout(Duration::from_secs(2), async {
+        while handle.path_stats().pto_count == 0 {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let stalled = handle.path_stats();
+    assert!(
+        stalled.rtt_us < 150_000,
+        "RTT must still look healthy: {stalled:?}"
+    );
+    assert_eq!(stalled.expired_outgoing_datagrams, 0);
+    assert!(stalled.in_flight_bytes > 0 && link.dropped.load(Ordering::Relaxed) > 0);
+    let now = std::time::Instant::now();
+    admission.observe_primary_path(&handle, now);
+    let probe_allowed = admission.allow_secondary(BULK, now);
+    let burst_allowed = admission.allow_secondary(BULK, now + Duration::from_millis(1));
+    for priority in [REALTIME, INTERACTIVE, veil_proto::priority::BACKGROUND] {
+        assert!(admission.allow_secondary(priority, now));
+    }
+    link.blackout.store(false, Ordering::Relaxed);
+    handle.send(&[0x22; 200]).unwrap();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let s = handle.path_stats();
+            if s.in_flight_bytes == 0 && s.pto_count == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // ACK progress and the bounded grace permit full production again.
+    admission.observe_primary_path(&handle, now + Duration::from_secs(2));
+    let recovered = admission.allow_secondary(BULK, now + Duration::from_secs(2));
+    close.close(0u32.into(), b"ack blackout gate complete");
+    assert!(
+        probe_allowed,
+        "one sparse recovery probe must remain possible"
+    );
+    assert!(
+        !burst_allowed,
+        "stale low RTT allowed a secondary burst during primary PTO"
+    );
+    assert!(recovered, "secondary failed to resume after pressure grace");
+}
