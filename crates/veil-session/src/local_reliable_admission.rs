@@ -5,14 +5,20 @@ use std::time::{Duration, Instant};
 use veil_transport::{DEFAULT_RELIABLE_SEND_WINDOW_BYTES, QuicDatagramHandle};
 
 pub(super) const ACTIVE_RELIABLE_BYTES: u64 = 1024;
-// A prepared independent primary never sits behind this canonical stream.
+// Independent congestion controllers still share the endpoint's physical path.
 pub(super) const INDEPENDENT_RELIABLE_BYTES: u64 = 16 * 1024;
 const IDLE_GRACE: Duration = Duration::from_secs(3);
+const PRIMARY_PRESSURE_RTT: Duration = Duration::from_millis(150);
+const PRESSURE_GRACE: Duration = Duration::from_secs(2);
+const SECONDARY_PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
 pub(super) struct LocalReliableAdmission {
     handle: QuicDatagramHandle,
     active_until: Option<Instant>,
     active_window: Option<u64>,
+    pressure_until: Option<Instant>,
+    last_expired: u64,
+    secondary_next: Option<Instant>,
 }
 
 impl LocalReliableAdmission {
@@ -21,6 +27,9 @@ impl LocalReliableAdmission {
             handle,
             active_until: None,
             active_window: None,
+            pressure_until: None,
+            last_expired: 0,
+            secondary_next: None,
         }
     }
 
@@ -36,7 +45,7 @@ impl LocalReliableAdmission {
         {
             return;
         }
-        let window = if independent {
+        let window = if independent && !self.pressured(now) {
             INDEPENDENT_RELIABLE_BYTES
         } else {
             ACTIVE_RELIABLE_BYTES
@@ -48,6 +57,42 @@ impl LocalReliableAdmission {
         self.active_until = Some(now + IDLE_GRACE);
     }
 
+    /// Called only for the local primary's authenticated independent sender.
+    /// Feedback remains local: relays receive no role, deadline or priority hint.
+    pub(super) fn observe_primary_path(&mut self, handle: &QuicDatagramHandle, now: Instant) {
+        let stats = handle.path_stats();
+        self.observe_pressure(stats.rtt_us, stats.expired_outgoing_datagrams, now);
+    }
+
+    fn observe_pressure(&mut self, rtt_us: u64, expired: u64, now: Instant) {
+        if rtt_us > PRIMARY_PRESSURE_RTT.as_micros() as u64 || expired > self.last_expired {
+            self.pressure_until = Some(now + PRESSURE_GRACE);
+        }
+        // A retired child can be replaced by a fresh connection with zero counters.
+        self.last_expired = expired;
+    }
+
+    fn pressured(&self, now: Instant) -> bool {
+        self.pressure_until.is_some_and(|until| now < until)
+    }
+
+    /// Reduce only this endpoint's loss-tolerant secondary producer under
+    /// primary pressure. A sparse probe permits recovery without total starvation.
+    pub(super) fn allow_secondary(&mut self, local_priority: u8, now: Instant) -> bool {
+        if local_priority != veil_proto::priority::BULK {
+            return true;
+        }
+        if !self.active_until.is_some_and(|until| now < until) || !self.pressured(now) {
+            self.secondary_next = None;
+            return true;
+        }
+        if self.secondary_next.is_some_and(|next| now < next) {
+            return false;
+        }
+        self.secondary_next = Some(now + SECONDARY_PROBE_INTERVAL);
+        true
+    }
+
     pub(super) fn expire(&mut self, now: Instant) {
         if self.active_until.is_some_and(|until| now >= until) {
             self.restore();
@@ -57,6 +102,8 @@ impl LocalReliableAdmission {
     fn restore(&mut self) {
         if self.active_until.take().is_some() {
             self.active_window = None;
+            self.pressure_until = None;
+            self.secondary_next = None;
             self.handle
                 .set_reliable_send_window(DEFAULT_RELIABLE_SEND_WINDOW_BYTES);
         }

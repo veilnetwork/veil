@@ -304,11 +304,17 @@ impl RealtimeDatagramLane {
             .parallel
             .as_mut()
             .and_then(|parallel| parallel.prepare_frame(priority, body, kind));
-        self.local_reliable
-            .observe(priority, frame, std::time::Instant::now(), ready.is_some());
+        let now = std::time::Instant::now();
         if let Some(index) = ready {
-            (self.parallel.as_ref().unwrap().sender(index), true)
+            let sender = self.parallel.as_ref().unwrap().sender(index);
+            if priority == veil_proto::priority::REALTIME {
+                self.local_reliable
+                    .observe_primary_path(&sender.handle, now);
+            }
+            self.local_reliable.observe(priority, frame, now, true);
+            (sender, true)
         } else {
+            self.local_reliable.observe(priority, frame, now, false);
             (lock!(self.sender), false)
         }
     }
@@ -4207,6 +4213,15 @@ impl SessionRunner {
                                 }
                                 CarrierSend::Unavailable => {}
                             }
+                        }
+                        if !lane
+                            .local_reliable
+                            .allow_secondary(outgoing_priority, std::time::Instant::now())
+                        {
+                            // Source feedback only; neutral ChildCarrier traffic
+                            // above and forwarded INTERACTIVE cells bypass this.
+                            datagram_drained += 1;
+                            continue;
                         }
                         let (_, body, lane_kind) = decode_realtime_lane_frame(outgoing)
                             .expect("realtime queue predicate accepted this frame");
