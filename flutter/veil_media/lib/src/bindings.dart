@@ -912,3 +912,41 @@ Pointer<Utf8> Function(Pointer<VeilGroupMediaEngineHandle>)?
 
 final veilMediaGroupEngineSetVideoBitrate = _lookupGroupVideoBitrate();
 final veilMediaGroupEngineGetStats = _lookupGroupStats();
+
+// Optional low-rate ABI; never send fractional fps to the integer setter.
+int Function(Pointer<VeilMediaEngineHandle>, int, double)?
+    _lookupveilMediaEngineSetVideoBudget() {
+  try {
+    return nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<VeilMediaEngineHandle>, Int32, Double)>>(
+          'veil_media_engine_set_video_budget',
+        )
+        .asFunction();
+  } on ArgumentError {
+    return null;
+  }
+}
+
+final veilMediaEngineSetVideoBudget = _lookupveilMediaEngineSetVideoBudget();
+
+// Optional low-rate ABI; never send fractional fps to the integer setter.
+int Function(Pointer<VeilGroupMediaEngineHandle>, int, double)?
+    _lookupveilMediaGroupEngineSetVideoBudget() {
+  try {
+    return nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(
+                    Pointer<VeilGroupMediaEngineHandle>, Int32, Double)>>(
+          'veil_media_group_engine_set_video_budget',
+        )
+        .asFunction();
+  } on ArgumentError {
+    return null;
+  }
+}
+
+final veilMediaGroupEngineSetVideoBudget =
+    _lookupveilMediaGroupEngineSetVideoBudget();
