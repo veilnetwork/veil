@@ -49,7 +49,7 @@ use veil_cfg::NodeId;
 use veil_types::NodeIdBytes;
 
 use super::priority_queue::INTERACTIVE;
-use crate::frame_outbox::{FrameOutbox, FrameSender, frame_channel};
+use crate::frame_outbox::{FrameOutbox, FrameSender, frame_channel_with_source_activity};
 
 /// A priority-tagged frame: `(priority, frame_bytes)`.
 ///
@@ -80,6 +80,7 @@ struct SessionTxEntry {
 /// Registry of outbound send channels, one per active session.
 #[derive(Debug)]
 pub struct SessionTxRegistry {
+    source_activity: Arc<crate::local_source_activity::LocalSourceActivity>,
     senders: HashMap<NodeIdBytes, SessionTxEntry>,
     /// Last send time per peer (Unix milliseconds). `AtomicU64` so the
     /// hot send path can update from `&self` under the outer read lock —
@@ -107,6 +108,7 @@ pub enum SendToError {
 impl Default for SessionTxRegistry {
     fn default() -> Self {
         Self {
+            source_activity: Arc::default(),
             senders: HashMap::new(),
             last_active: HashMap::new(),
             capacity: DEFAULT_TX_QUEUE_DEPTH,
@@ -130,6 +132,7 @@ impl SessionTxRegistry {
     /// Create with a custom per-session channel capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
+            source_activity: Arc::default(),
             senders: HashMap::new(),
             last_active: HashMap::new(),
             capacity,
@@ -143,6 +146,7 @@ impl SessionTxRegistry {
     /// visible in Prometheus metrics.
     pub fn with_capacity_and_drop_counter(capacity: usize, drops_total: Arc<AtomicU64>) -> Self {
         Self {
+            source_activity: Arc::default(),
             senders: HashMap::new(),
             last_active: HashMap::new(),
             capacity,
@@ -198,7 +202,8 @@ impl SessionTxRegistry {
     pub fn register(&mut self, peer_id: impl Into<NodeId>) -> FrameOutbox {
         let peer_id = *peer_id.into().as_bytes();
         self.prune_closed();
-        let (tx, rx) = frame_channel(self.capacity);
+        let (tx, rx) =
+            frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
         self.senders
             .insert(peer_id, SessionTxEntry { tx, owner: None });
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
@@ -214,7 +219,8 @@ impl SessionTxRegistry {
     ) -> FrameOutbox {
         let peer_id = *peer_id.into().as_bytes();
         self.prune_closed();
-        let (tx, rx) = frame_channel(self.capacity);
+        let (tx, rx) =
+            frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
         self.senders.insert(
             peer_id,
             SessionTxEntry {
@@ -242,7 +248,8 @@ impl SessionTxRegistry {
         if self.senders.contains_key(&peer_id) {
             return None;
         }
-        let (tx, rx) = frame_channel(self.capacity);
+        let (tx, rx) =
+            frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
         self.senders
             .insert(peer_id, SessionTxEntry { tx, owner: None });
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
@@ -333,7 +340,8 @@ impl SessionTxRegistry {
         self.senders.remove(&peer_id);
         self.last_active.remove(&peer_id);
 
-        let (tx, rx) = frame_channel(self.capacity);
+        let (tx, rx) =
+            frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
         self.senders.insert(
             peer_id,
             SessionTxEntry {
