@@ -280,6 +280,12 @@ int veil_media_engine_select_audio_output(VeilMediaEngine *engine,
  * Additive `audio_rx_pkts` counts RTP packets accepted by the audio receive
  * stream, excluding video and RTCP. It is valid only with worker_stalled=0;
  * it does not measure decoded/played audio. Worker scheduling waits are 20 ms
+ * `audio_rx_native_age_ms` is elapsed local native time since the receive
+ * stream's last accepted RTP packet (-1 before audio or on worker timeout).
+ * It excludes host timer lag. `audio_concealed_samples`,
+ * `audio_concealment_events`, `audio_interruption_count` and
+ * `audio_interruption_duration_ms` expose cumulative receive-stream playout
+ * statistics, valid only with worker_stalled=0.
  * each; an operation already started is waited out for lifetime safety.
  * `audio_tx_pkts` counts audio RTP emitted by the send stream, with the same
  * sample-validity rule. `mic_muted` is the native mute intent, not device state.

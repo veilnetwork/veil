@@ -111,6 +111,7 @@
 #include "third_party/libyuv/include/libyuv/convert_argb.h"  // I420ToABGR
 #include "third_party/libyuv/include/libyuv/rotate.h"  // Android420ToI420Rotate
 #include "rtc_base/time_utils.h"  // webrtc::TimeMicros
+#include "system_wrappers/include/clock.h"
 #include "rtc_base/network/sent_packet.h"  // webrtc::SentPacketInfo
 
 #if defined(__APPLE__)
@@ -3472,6 +3473,11 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     // measurements — NetEq's total audio path estimate (jitter buffer + ADM
     // playout) and the video render delay target.
     uint64_t audio_rx_pkts = 0;
+    int64_t audio_rx_native_age_ms = -1;
+    uint64_t audio_concealed_samples = 0;
+    uint64_t audio_concealment_events = 0;
+    int audio_interruption_count = 0;
+    int audio_interruption_duration_ms = 0;
     uint64_t audio_tx_pkts = 0;
     uint32_t audio_delay_ms = 0;
     uint32_t audio_jb_ms = 0;
@@ -3524,6 +3530,20 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         const auto r =
             ws->recv_stream->GetStats(/*get_and_clear_legacy_stats=*/false);
         audio_rx_pkts = r.packets_received;
+        // WebRTC exports the accepted RTP time on the Unix epoch; convert
+        // the same native clock before comparing (CurrentTime is monotonic).
+        // A host timer sampling packet counts can lag while the UI is busy;
+        // that lag must not masquerade as a gap in the native audio stream.
+        if (r.last_packet_received) {
+          const int64_t unix_now_ms = ws->env.clock().CurrentNtpInMilliseconds()
+                                     - webrtc::kNtpJan1970Millisecs;
+          audio_rx_native_age_ms = std::max<int64_t>(
+              0, unix_now_ms - r.last_packet_received->ms());
+        }
+        audio_concealed_samples = r.concealed_samples;
+        audio_concealment_events = r.concealment_events;
+        audio_interruption_count = r.interruption_count;
+        audio_interruption_duration_ms = r.total_interruption_duration_ms;
         jitter_ms = r.jitter_ms;
         audio_delay_ms = r.delay_estimate_ms;
         audio_jb_ms = r.jitter_buffer_ms;
@@ -3585,10 +3605,13 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     // silence, and a truncated object is not a smaller answer — it is one the
     // Dart side cannot parse at all, so the return is checked below rather
     // than trusted.
-    char json[2048];
+    char json[3072];
     const int written = std::snprintf(
         json, sizeof(json),
         "{\"tx_pkts\":%llu,\"rx_pkts\":%llu,\"audio_rx_pkts\":%llu,"
+        "\"audio_rx_native_age_ms\":%lld,\"audio_concealed_samples\":%llu,"
+        "\"audio_concealment_events\":%llu,\"audio_interruption_count\":%d,"
+        "\"audio_interruption_duration_ms\":%d,"
         "\"audio_tx_pkts\":%llu,\"mic_muted\":%d,\"tx_bytes\":%llu,"
         "\"rx_bytes\":%llu,\"tx_drops\":%llu,\"rx_drops\":%llu,"
         "\"rtt_ms\":%lld,\"jitter_ms\":%u,\"loss_pct\":%d,"
@@ -3617,6 +3640,10 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<unsigned long long>(ws->shim->outbound_packet_count()),
         static_cast<unsigned long long>(ws->shim->inbound_packet_count()),
         static_cast<unsigned long long>(audio_rx_pkts),
+        static_cast<long long>(audio_rx_native_age_ms),
+        static_cast<unsigned long long>(audio_concealed_samples),
+        static_cast<unsigned long long>(audio_concealment_events),
+        audio_interruption_count, audio_interruption_duration_ms,
         static_cast<unsigned long long>(audio_tx_pkts), engine->mic_muted ? 1 : 0,
         static_cast<unsigned long long>(ws->shim->outbound_byte_count()),
         static_cast<unsigned long long>(ws->shim->inbound_byte_count()),

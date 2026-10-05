@@ -268,6 +268,18 @@ int main() {
     // report unknown via worker_stalled rather than reuse a cached success.
     assert(stat(e.get(), "audio_rx_pkts") == 4);
     assert(stat(e.get(), "rx_pkts") > stat(e.get(), "audio_rx_pkts"));
+    const auto age_before = stat(e.get(), "audio_rx_native_age_ms");
+    assert(age_before >= 0 && age_before < 10000);
+    const auto wait_started = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(160));
+    // RTCP arriving during the gap must not reset the audio RTP timestamp.
+    report(chan, 2, 1, 0, 0);
+    assert(stat(e.get(), "audio_rx_pkts") == 4);
+    const auto age_after = stat(e.get(), "audio_rx_native_age_ms");
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - wait_started).count();
+    assert(age_after >= age_before + 150);
+    assert(age_after <= age_before + elapsed_ms + 100);
     // The abandoned retune must not run after the held queue is released.
     // An explicit retry may then update both bitrate and source cadence.
     assert(stat(e.get(), "max_fps") == 15);
