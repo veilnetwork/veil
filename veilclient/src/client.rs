@@ -120,7 +120,11 @@ pub(crate) struct SharedWriter {
     /// (`FrameHeader.request_id`). Non-zero by construction — zero is the
     /// legacy "no id" marker on the wire.
     next_request_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    stream_credits: Option<SharedStreamCredits>,
 }
+
+type SharedStreamCredits =
+    Arc<std::sync::Mutex<std::collections::HashMap<u32, Arc<crate::stream::StreamWriteCredit>>>>;
 
 pub(crate) const FRAME_TX_CAPACITY: usize = 1024;
 
@@ -163,6 +167,82 @@ impl SharedWriter {
         Self {
             tx,
             next_request_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
+            stream_credits: None,
+        }
+    }
+
+    pub(crate) fn with_stream_credit(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.stream_credits = Some(Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )));
+        }
+        self
+    }
+
+    pub(crate) fn register_stream_credit(
+        &self,
+        id: u32,
+    ) -> Option<Arc<crate::stream::StreamWriteCredit>> {
+        let credits = self.stream_credits.as_ref()?;
+        let credit = Arc::new(crate::stream::StreamWriteCredit::new());
+        let old = credits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, credit.clone());
+        if let Some(old) = old {
+            old.close();
+        }
+        Some(credit)
+    }
+
+    pub(crate) fn unregister_stream_credit(
+        &self,
+        id: u32,
+        own: &Arc<crate::stream::StreamWriteCredit>,
+    ) {
+        if let Some(credits) = &self.stream_credits {
+            let mut credits = credits.lock().unwrap_or_else(|e| e.into_inner());
+            if credits
+                .get(&id)
+                .is_some_and(|current| Arc::ptr_eq(current, own))
+            {
+                credits.remove(&id);
+            }
+        }
+        own.close();
+    }
+
+    pub(crate) fn refund_stream_credit(&self, id: u32, bytes: u32) {
+        if let Some(credits) = &self.stream_credits {
+            let credit = credits
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&id)
+                .cloned();
+            if let Some(credit) = credit {
+                credit.refund(bytes);
+            }
+        }
+    }
+
+    pub(crate) fn close_stream_credit(&self, id: u32) {
+        if let Some(credits) = &self.stream_credits {
+            let credit = credits
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+            if let Some(credit) = credit {
+                credit.close();
+            }
+        }
+    }
+
+    fn close_all_stream_credits(&self) {
+        if let Some(credits) = &self.stream_credits {
+            for (_, credit) in credits.lock().unwrap_or_else(|e| e.into_inner()).drain() {
+                credit.close();
+            }
         }
     }
 
@@ -644,6 +724,7 @@ pub struct VeilClient {
 
 impl Drop for VeilClient {
     fn drop(&mut self) {
+        self.writer.close_all_stream_credits();
         if let Some(task) = self.reader_task.take() {
             task.abort();
         }
@@ -943,7 +1024,7 @@ impl VeilClient {
         // ── Send APP_HELLO ────────────────────────────────────────────────
         let hello = AppIpcHelloPayload {
             version: IPC_PROTOCOL_VERSION,
-            flags: 0,
+            flags: veilcore::proto::ipc::IPC_CAP_STREAM_WRITE_CREDIT,
         };
         tokio::time::timeout(
             timeout,
@@ -992,7 +1073,9 @@ impl VeilClient {
         let (rh, wh) = stream.into_split();
         let (frame_tx, frame_rx) = mpsc::channel::<IpcWriterFrame>(FRAME_TX_CAPACITY);
         tokio::spawn(run_writer_task(wh, frame_rx));
-        let writer = SharedWriter::new(frame_tx);
+        let writer = SharedWriter::new(frame_tx).with_stream_credit(
+            hdr.flags & veilcore::proto::ipc::IPC_HELLO_OK_STREAM_WRITE_CREDIT != 0,
+        );
         let dispatch = Arc::new(Mutex::new(DispatchTable::new()));
 
         // ── Spawn reader task ────────────────────────────────────────────
@@ -3053,6 +3136,11 @@ async fn reader_task(
                     }
                 }
             }
+            LocalAppMsg::StreamWindow => {
+                if let Ok(p) = veilcore::proto::StreamWindowPayload::decode(&body) {
+                    writer.refund_stream_credit(p.stream_id, p.increment);
+                }
+            }
             LocalAppMsg::StreamData => {
                 use veilcore::proto::StreamDataPayload;
                 if let Ok(p) = StreamDataPayload::decode(&body) {
@@ -3079,6 +3167,7 @@ async fn reader_task(
                         // from daemon will clean the table entry).
                     }
                     if close_stream {
+                        writer.close_stream_credit(stream_id);
                         d.streams.remove(&stream_id);
                         // Sender drop here makes the consumer's `recv()`
                         // return None on the next poll = EOF, matching
@@ -3089,6 +3178,7 @@ async fn reader_task(
             LocalAppMsg::StreamClose => {
                 use veilcore::proto::StreamClosePayload;
                 if let Ok(p) = StreamClosePayload::decode(&body) {
+                    writer.close_stream_credit(p.stream_id);
                     let mut d = dispatch.lock().await;
                     if let Some(tx) = d.streams.remove(&p.stream_id) {
                         // `try_send`: on a full queue we simply drop
@@ -3568,6 +3658,8 @@ async fn reader_task(
             _ => {}
         }
     }
+
+    writer.close_all_stream_credits();
 
     // audit cycle-6 (P3): the read loop only exits when the IPC connection is
     // closed (daemon death / socket error). Drain every pending stream-open

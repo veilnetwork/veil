@@ -2212,13 +2212,17 @@ async fn handle_ipc_client(
         version: IPC_PROTOCOL_VERSION,
         client_token,
     };
-    write_frame_stream(
-        &mut stream,
-        FrameFamily::LocalApp as u8,
-        LocalAppMsg::AppHelloOk as u16,
-        &ok.encode(),
-    )
-    .await?;
+    let stream_write_credit = hello.flags & veil_proto::ipc::IPC_CAP_STREAM_WRITE_CREDIT != 0;
+    let mut hello_header =
+        FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppHelloOk as u16);
+    hello_header.body_len = AppIpcHelloOkPayload::WIRE_SIZE as u32;
+    if stream_write_credit {
+        hello_header.flags |= veil_proto::ipc::IPC_HELLO_OK_STREAM_WRITE_CREDIT;
+    }
+    stream
+        .write_all(&codec::encode_header(&hello_header))
+        .await?;
+    stream.write_all(&ok.encode()).await?;
 
     // ── Step 4: split socket + bidirectional message loop ───────────────
     let (mut rh, mut wh) = stream.into_split();
@@ -2303,13 +2307,46 @@ async fn handle_ipc_client(
     tokio::pin!(idle);
     let bump = || tokio::time::Instant::now() + IPC_SESSION_IDLE_TIMEOUT;
 
+    let mut remote_writes = crate::remote_stream_writer::RemoteStreamWriter::default();
     loop {
         tokio::select! {
+            // Network backpressure retains this future in `remote_writes` and
+            // never holds the IPC loop (media/control requests keep flowing).
+            done = remote_writes.next(session_tx_registry.clone()), if stream_write_credit => {
+                idle.as_mut().reset(bump());
+                if done.sent && !done.close {
+                    write_frame_wh(&mut wh, FrameFamily::LocalApp as u8,
+                        LocalAppMsg::StreamWindow as u16,
+                        &StreamWindowPayload { stream_id: done.id, increment: done.charge }.encode(),
+                    ).await?;
+                } else {
+                    if let Some(target) = stream_table.close_remote(done.id) {
+                        teardown_remote_target(&target, None, stream_bridge.as_ref());
+                    } else if !done.sent && let Some(b) = session_tx_registry.as_deref() {
+                        crate::handlers::stream::send_app_close(b, &done.route.peer,
+                            done.route.wire_id, done.route.app, done.route.endpoint);
+                    }
+                    client_state.release_stream(done.id);
+                    if !done.sent {
+                        write_frame_wh(&mut wh, FrameFamily::LocalApp as u8,
+                            LocalAppMsg::StreamClose as u16,
+                            &StreamClosePayload { stream_id: done.id }.encode(),
+                        ).await?;
+                    }
+                }
+            }
             // Incoming veil → IPC delivery
             Some(frame_bytes) = delivery_rx.recv() => {
                 // Release the in-flight byte budget reserved at enqueue as soon
                 // as the frame leaves the queue for the socket.
                 delivery_inflight.fetch_sub(frame_bytes.len(), Ordering::AcqRel);
+                if stream_write_credit
+                    && let Ok(header) = codec::decode_header(&frame_bytes)
+                    && header.msg_type == LocalAppMsg::StreamClose as u16
+                    && let Ok(close) = StreamClosePayload::decode(&frame_bytes[veil_proto::HEADER_SIZE..])
+                {
+                    remote_writes.cancel(close.stream_id);
+                }
                 idle.as_mut().reset(bump());
                 if wh.write_all(&frame_bytes).await.is_err() {
                     break;
@@ -2556,6 +2593,38 @@ async fn handle_ipc_client(
                     }
                     Ok(LocalAppMsg::StreamData) => {
                         if let Ok(p) = StreamDataPayload::decode(&body) {
+                            let source_charge = p.data.len().checked_add(veil_proto::ipc::IPC_STREAM_WRITE_OVERHEAD as usize)
+                                .and_then(|n| u32::try_from(n).ok()).unwrap_or(u32::MAX);
+                            if stream_write_credit {
+                                let route = if client_state.owns_stream_as_opener(p.stream_id) {
+                                    stream_table.remote_route(p.stream_id).map(|t| crate::remote_stream_writer::Route {
+                                        peer: t.dst_node_id, wire_id: t.wire_stream_id, app: t.app_id, endpoint: t.endpoint_id,
+                                    })
+                                } else if client_state.owns_stream_as_acceptor(p.stream_id) {
+                                    client_state.acceptor_remote_route(p.stream_id).map(|r| crate::remote_stream_writer::Route {
+                                        peer: r.opener_node_id, wire_id: p.stream_id, app: r.app_id, endpoint: r.endpoint_id,
+                                    })
+                                } else { None };
+                                if let Some(route) = route {
+                                    if !remote_writes.data(p.stream_id, route, p.data) {
+                                        // Invalid credit/closed-stream writes cannot grow the
+                                        // queue or block another application's IPC messages.
+                                        remote_writes.cancel(p.stream_id);
+                                        if let Some(b) = session_tx_registry.as_deref() {
+                                            crate::handlers::stream::send_app_close(b, &route.peer,
+                                                route.wire_id, route.app, route.endpoint);
+                                        }
+                                        close_owned_stream(p.stream_id, &stream_table, None, stream_bridge.as_ref());
+                                        client_state.release_stream(p.stream_id);
+                                        write_frame_wh(&mut wh, FrameFamily::LocalApp as u8,
+                                            LocalAppMsg::StreamClose as u16,
+                                            &StreamClosePayload { stream_id: p.stream_id }.encode(),
+                                        ).await?;
+                                    }
+                                    continue;
+                                }
+                            }
+
                             // Route based on the client's role on this
                             // stream.  Opener (A) → forward to B endpoint;
                             // acceptor (B) → forward to A delivery channel.
@@ -2692,6 +2761,13 @@ async fn handle_ipc_client(
                                     }
                                 }
                             }
+                            if stream_write_credit && (client_state.owns_stream_as_opener(p.stream_id)
+                                || client_state.owns_stream_as_acceptor(p.stream_id)) {
+                                write_frame_wh(&mut wh, FrameFamily::LocalApp as u8,
+                                    LocalAppMsg::StreamWindow as u16,
+                                    &StreamWindowPayload { stream_id: p.stream_id, increment: source_charge }.encode(),
+                                ).await?;
+                            }
                             // else: silent drop (cross-client hijack attempt).
                         }
                     }
@@ -2700,6 +2776,29 @@ async fn handle_ipc_client(
                             && (client_state.owns_stream_as_opener(p.stream_id)
                                 || client_state.owns_stream_as_acceptor(p.stream_id))
                         {
+                            if stream_write_credit {
+                                let route = stream_table.remote_route(p.stream_id).map(|t| crate::remote_stream_writer::Route {
+                                    peer: t.dst_node_id, wire_id: t.wire_stream_id, app: t.app_id, endpoint: t.endpoint_id,
+                                }).or_else(|| client_state.acceptor_remote_route(p.stream_id).map(|r| crate::remote_stream_writer::Route {
+                                    peer: r.opener_node_id, wire_id: p.stream_id, app: r.app_id, endpoint: r.endpoint_id,
+                                }));
+                                if let Some(route) = route {
+                                    // Keep ownership and the wire lease until ordered close
+                                    // completes, so new opens cannot reuse a queued stream id.
+                                    if !remote_writes.close(p.stream_id, route) {
+                                        remote_writes.cancel(p.stream_id);
+                                        close_owned_stream(p.stream_id, &stream_table,
+                                            session_tx_registry.as_deref(), stream_bridge.as_ref());
+                                        client_state.release_stream(p.stream_id);
+                                        write_frame_wh(&mut wh, FrameFamily::LocalApp as u8,
+                                            LocalAppMsg::StreamClose as u16,
+                                            &StreamClosePayload { stream_id: p.stream_id }.encode(),
+                                        ).await?;
+                                    }
+                                    continue;
+                                }
+                            }
+
                             // Acceptor of a REMOTE-opened stream: send the wire
                             // `AppClose` to the opener's node. `close_owned_stream`
                             // only knows OPENER-side remote routes (via the stream

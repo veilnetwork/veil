@@ -21,6 +21,98 @@ use crate::client::{SharedWriter, StreamEvent, encode_frame};
 /// connection. This is a sender limit; older peers may still send larger frames.
 const MAX_STREAM_CHUNK: usize = 2 * 1024;
 
+/// Negotiated app→node admission credit, independent of incoming stream data.
+/// The IPC reader refunds it without awaiting a file consumer.
+pub(crate) struct StreamWriteCredit(std::sync::Mutex<WriteCreditState>);
+struct WriteCreditState {
+    bytes: usize,
+    closed: bool,
+    wakers: Vec<std::task::Waker>,
+}
+impl StreamWriteCredit {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::Mutex::new(WriteCreditState {
+            bytes: veilcore::proto::ipc::IPC_STREAM_WRITE_WINDOW as usize,
+            closed: false,
+            wakers: Vec::new(),
+        }))
+    }
+    pub(crate) fn refund(&self, n: u32) {
+        let wakers = {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.bytes = state
+                .bytes
+                .saturating_add(n as usize)
+                .min(veilcore::proto::ipc::IPC_STREAM_WRITE_WINDOW as usize);
+            std::mem::take(&mut state.wakers)
+        };
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+    pub(crate) fn close(&self) {
+        let wakers = {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.closed = true;
+            std::mem::take(&mut state.wakers)
+        };
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+}
+
+fn poll_stream_write(
+    id: u32,
+    tx: &mut PollSender<crate::client::IpcWriterFrame>,
+    credit: Option<&StreamWriteCredit>,
+    cx: &mut Context<'_>,
+    buf: &[u8],
+) -> Poll<io::Result<usize>> {
+    if buf.is_empty() {
+        return Poll::Ready(Ok(0));
+    }
+    let overhead = veilcore::proto::ipc::IPC_STREAM_WRITE_OVERHEAD as usize;
+    let mut state = credit.map(|credit| credit.0.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut n = buf.len().min(MAX_STREAM_CHUNK);
+    if let Some(state) = state.as_mut() {
+        if state.closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                WRITER_CLOSED,
+            )));
+        }
+        if state.bytes <= overhead {
+            if !state.wakers.iter().any(|w| w.will_wake(cx.waker())) {
+                state.wakers.push(cx.waker().clone());
+            }
+            return Poll::Pending;
+        }
+        n = n.min(state.bytes - overhead);
+    }
+    // Reserve the IPC slot while holding the short credit lock: concurrent
+    // send_data callers cannot spend the same credit. Neither operation awaits.
+    match tx.poll_reserve(cx) {
+        Poll::Ready(Ok(())) => {
+            let payload = StreamDataPayload {
+                stream_id: id,
+                data: buf[..n].to_vec(),
+            };
+            tx.send_item(encode_frame(LocalAppMsg::StreamData as u16, &payload.encode()).into())
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, WRITER_CLOSED))?;
+            if let Some(state) = state.as_mut() {
+                state.bytes -= n + overhead;
+            }
+            Poll::Ready(Ok(n))
+        }
+        Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            WRITER_CLOSED,
+        ))),
+        Poll::Pending => Poll::Pending,
+    }
+}
+
 const WRITER_CLOSED: &str = "veil IPC writer task closed";
 
 /// Bidirectional stream between two veil endpoints.
@@ -30,6 +122,7 @@ const WRITER_CLOSED: &str = "veil IPC writer task closed";
 pub struct VeilStream {
     stream_id: u32,
     writer: SharedWriter,
+    write_credit: Option<std::sync::Arc<StreamWriteCredit>>,
     /// Incoming data/close events from the reader task.  Bounded to
     /// `STREAM_EVENT_QUEUE_CAP`; a slow consumer that fills the queue
     /// has its stream silently closed (visible through `recv()` → None
@@ -87,9 +180,11 @@ impl VeilStream {
         is_acceptor: bool,
     ) -> Self {
         let tx = writer.poll_sender();
+        let write_credit = writer.register_stream_credit(stream_id);
         Self {
             stream_id,
             writer,
+            write_credit,
             rx,
             tx,
             read_buf: Vec::new(),
@@ -129,14 +224,22 @@ impl VeilStream {
 
     /// Send raw bytes over the stream.
     pub async fn send_data(&self, data: &[u8]) -> io::Result<()> {
-        let payload = StreamDataPayload {
-            stream_id: self.stream_id,
-            data: data.to_vec(),
-        };
-        self.writer
-            .write_frame(LocalAppMsg::StreamData as u16, &payload.encode())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "veil writer closed"))
+        let mut tx = self.writer.poll_sender();
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            let n = std::future::poll_fn(|cx| {
+                poll_stream_write(
+                    self.stream_id,
+                    &mut tx,
+                    self.write_credit.as_deref(),
+                    cx,
+                    remaining,
+                )
+            })
+            .await?;
+            remaining = &remaining[n..];
+        }
+        Ok(())
     }
 
     /// Send a STREAM_CLOSE and mark write side closed.
@@ -147,7 +250,11 @@ impl VeilStream {
         self.writer
             .write_frame(LocalAppMsg::StreamClose as u16, &payload.encode())
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "veil writer closed"))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "veil writer closed"))?;
+        if let Some(credit) = &self.write_credit {
+            credit.close();
+        }
+        Ok(())
     }
 }
 
@@ -196,35 +303,8 @@ impl AsyncWrite for VeilStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        // Reserve a channel slot first. `PollSender` registers the task waker
-        // with the bounded IPC writer channel, so when the writer task frees
-        // capacity this task is woken exactly once — no `wake_by_ref` busy-spin
-        // under backpressure.
-        match self.tx.poll_reserve(cx) {
-            Poll::Ready(Ok(())) => {
-                // Chunk: cap each frame's payload so a single large `write()`
-                // is split across multiple bounded STREAM_DATA frames the
-                // receiver accepts, instead of one oversized frame it rejects.
-                let chunk_len = buf.len().min(MAX_STREAM_CHUNK);
-                let payload = StreamDataPayload {
-                    stream_id: self.stream_id,
-                    data: buf[..chunk_len].to_vec(),
-                };
-                let frame = encode_frame(LocalAppMsg::StreamData as u16, &payload.encode());
-                self.tx
-                    .send_item(frame.into())
-                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, WRITER_CLOSED))?;
-                Poll::Ready(Ok(chunk_len))
-            }
-            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                WRITER_CLOSED,
-            ))),
-            Poll::Pending => Poll::Pending,
-        }
+        let credit = self.write_credit.clone();
+        poll_stream_write(self.stream_id, &mut self.tx, credit.as_deref(), cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -245,6 +325,9 @@ impl AsyncWrite for VeilStream {
                     .send_item(frame.into())
                     .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, WRITER_CLOSED))?;
                 self.shutdown_sent = true;
+                if let Some(credit) = &self.write_credit {
+                    credit.close();
+                }
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
@@ -258,6 +341,9 @@ impl AsyncWrite for VeilStream {
 
 impl Drop for VeilStream {
     fn drop(&mut self) {
+        if let Some(credit) = &self.write_credit {
+            self.writer.unregister_stream_credit(self.stream_id, credit);
+        }
         if self.shutdown_sent {
             return;
         }
@@ -369,5 +455,32 @@ mod tests {
         }
         assert_eq!(total_data, payload_len, "all bytes delivered across frames");
         assert_eq!(frames, 3, "large write split into 3 bounded frames");
+    }
+    #[tokio::test]
+    async fn closing_source_credit_wakes_a_blocked_sdk_writer() {
+        let (tx, mut frames) = mpsc::channel::<crate::client::IpcWriterFrame>(64);
+        let writer = SharedWriter::new(tx).with_stream_credit(true);
+        let (_events, rx) = mpsc::channel(8);
+        let mut stream = VeilStream::new(7, writer.clone(), rx);
+        let write = tokio::spawn(async move { stream.write_all(&vec![1; 64 * 1024]).await });
+        // All four initial source writes can reach IPC, but their payload plus
+        // per-frame allocation cost consumes exactly the initial 8 KiB credit.
+        let mut charged = 0;
+        while charged < veilcore::proto::ipc::IPC_STREAM_WRITE_WINDOW as usize {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(1), frames.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let data = StreamDataPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+            charged += data.data.len() + veilcore::proto::ipc::IPC_STREAM_WRITE_OVERHEAD as usize;
+        }
+        assert!(!write.is_finished());
+        writer.close_stream_credit(7);
+        let error = tokio::time::timeout(std::time::Duration::from_millis(250), write)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 }

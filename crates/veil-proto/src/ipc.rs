@@ -27,6 +27,19 @@ pub const CLIENT_MIN_VERSION: u16 = 1;
 /// rejected with `ipc_hello_err::VERSION_MISMATCH`.
 pub const CLIENT_MAX_VERSION: u16 = 1;
 
+/// Request bounded, asynchronous local stream-write admission. This capability
+/// exists only on app↔node IPC; it is never sent to remote peers or relays.
+pub const IPC_CAP_STREAM_WRITE_CREDIT: u32 = 1;
+/// APP_HELLO_OK header acknowledgment of the requested local capability.
+/// Other message headers do not use this flag.
+pub const IPC_HELLO_OK_STREAM_WRITE_CREDIT: u16 = 0x0080;
+/// Source bytes an IPC stream may enqueue before the node admits them. This is
+/// separate from the receiver's network/local-pair read window.
+pub const IPC_STREAM_WRITE_WINDOW: u32 = 8 * 1024;
+/// Charge a minimum per-frame allocation cost as well as payload bytes, so a
+/// producer of tiny writes cannot turn a byte bound into millions of jobs.
+pub const IPC_STREAM_WRITE_OVERHEAD: u32 = 128;
+
 // ── AppIpcHelloPayload ──────────────────────────────────────────────────────
 
 /// Sent by the IPC client immediately after connecting. // STABLE v1
@@ -34,13 +47,13 @@ pub const CLIENT_MAX_VERSION: u16 = 1;
 /// Wire layout:
 /// ```text
 /// [0..2] version u16 BE — IPC protocol version the client supports
-/// [2..6] flags u32 BE — capability flags (reserved, must be 0)
+/// [2..6] flags u32 BE — capability flags (unknown bits ignored)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppIpcHelloPayload {
     /// IPC protocol version the client supports.
     pub version: u16,
-    /// Capability flags (reserved; must be 0).
+    /// Capability flags; see `IPC_CAP_STREAM_WRITE_CREDIT`.
     pub flags: u32,
 }
 
