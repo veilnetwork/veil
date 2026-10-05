@@ -266,6 +266,24 @@ async fn handle_stream_open_remote(
     }
 }
 
+/// Resolve only through the verified live-session index. Explicit device
+/// targets and legacy identity-keyed sessions retain their exact route.
+fn stream_session_peer(broadcaster: &dyn FrameBroadcaster, dst: [u8; 32]) -> [u8; 32] {
+    let devices = broadcaster.devices_of(&dst);
+    if devices.is_empty() {
+        return dst;
+    }
+    let active = broadcaster.active_node_ids();
+    if active.contains(&dst) {
+        return dst;
+    }
+    devices
+        .into_iter()
+        .filter(|peer| *peer != [0; 32] && active.contains(peer))
+        .min()
+        .unwrap_or(dst)
+}
+
 /// Core of the cross-node open — everything except the per-connection pieces
 /// (ownership claim + reply write), so it can run either inline on the
 /// connection loop or in a spawned task (request-id concurrency). On success
@@ -282,7 +300,9 @@ async fn open_remote_stream(
 ) -> Result<u32, u16> {
     use std::sync::atomic::Ordering;
 
-    let dst = p.dst_node_id;
+    // Bind identity-addressed streams to ONE verified live device before
+    // registering receipts or data. Fan-out would mix independent endpoints.
+    let dst = stream_session_peer(broadcaster.as_ref(), p.dst_node_id);
     // Take an id that is FREE for this destination.
     //
     // The counter is a `u32` shared by every surface that opens wire streams
@@ -650,6 +670,128 @@ mod tests {
         }
         assert!(opened && closed);
         assert_eq!(bytes, payload, "loss, duplication or close overtaking data");
+    }
+
+    #[tokio::test]
+    async fn identity_stream_binds_one_live_device_and_matches_its_receipt_and_data() {
+        use std::sync::{Mutex, atomic::AtomicU32};
+        const IDENTITY: [u8; 32] = [9; 32];
+        const LIVE: [u8; 32] = [3; 32];
+        const OTHER: [u8; 32] = [4; 32];
+        const STALE: [u8; 32] = [1; 32];
+        struct Source {
+            bridge: IpcStreamBridge,
+            sent: Mutex<Vec<([u8; 32], Vec<u8>)>>,
+        }
+        impl FrameBroadcaster for Source {
+            fn devices_of(&self, identity: &[u8; 32]) -> Vec<[u8; 32]> {
+                if identity == &IDENTITY {
+                    vec![OTHER, STALE, LIVE]
+                } else {
+                    vec![]
+                }
+            }
+            fn active_node_ids(&self) -> Vec<[u8; 32]> {
+                vec![LIVE, OTHER]
+            }
+            fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {
+                panic!("a byte stream must never fan out")
+            }
+            fn send_to(&self, peer: &[u8; 32], _: u8, frame: Vec<u8>) -> bool {
+                let header = veil_proto::codec::decode_header(&frame).unwrap();
+                self.sent.lock().unwrap().push((*peer, frame));
+                if *peer != LIVE {
+                    return false;
+                }
+                if header.msg_type == AppMsg::AppOpen as u16 {
+                    assert!(
+                        self.bridge
+                            .pending_receipts
+                            .lock()
+                            .unwrap()
+                            .remove(&(OTHER, header.stream_id))
+                            .is_none()
+                    );
+                    self.bridge
+                        .pending_receipts
+                        .lock()
+                        .unwrap()
+                        .remove(&(LIVE, header.stream_id))
+                        .unwrap()
+                        .send(receipt_status::ACCEPTED)
+                        .unwrap();
+                    self.bridge
+                        .veil_stream_rx
+                        .lock()
+                        .unwrap()
+                        .get(&(LIVE, header.stream_id))
+                        .unwrap()
+                        .try_send(b"device-bound".to_vec())
+                        .unwrap();
+                }
+                true
+            }
+        }
+        let bridge = IpcStreamBridge {
+            veil_stream_rx: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            pending_receipts: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            wire_stream_counter: Arc::new(AtomicU32::new(40)),
+        };
+        let source = Arc::new(Source {
+            bridge: bridge.clone(),
+            sent: Mutex::new(vec![]),
+        });
+        assert_eq!(stream_session_peer(source.as_ref(), OTHER), OTHER);
+        assert_eq!(stream_session_peer(source.as_ref(), [8; 32]), [8; 32]);
+        let table = IpcStreamTable::new();
+        let app = [7; 32];
+        let p = StreamOpenPayload {
+            dst_node_id: IDENTITY,
+            app_id: app,
+            endpoint_id: 5,
+            initial_window: STREAM_INITIAL_WINDOW,
+        };
+        let (tx, mut rx) = mpsc::channel::<veil_bufpool::PooledShared>(8);
+        let ipc_id = open_remote_stream(
+            &p,
+            tx.into(),
+            &table,
+            source.clone() as Arc<dyn FrameBroadcaster>,
+            &bridge,
+        )
+        .await
+        .unwrap();
+        let route = table.remote_route(ipc_id).unwrap();
+        assert_eq!(route.dst_node_id, LIVE);
+        assert_eq!(route.app_id, app);
+        let frame = rx.recv().await.unwrap();
+        let (msg, body) = parse_local_frame(&frame);
+        assert_eq!(msg, LocalAppMsg::StreamData as u16);
+        assert_eq!(
+            StreamDataPayload::decode(&body).unwrap().data,
+            b"device-bound"
+        );
+        assert!(send_app_data(
+            source.as_ref(),
+            &route.dst_node_id,
+            route.wire_stream_id,
+            route.app_id,
+            route.endpoint_id,
+            b"request".to_vec()
+        ));
+        bridge
+            .veil_stream_rx
+            .lock()
+            .unwrap()
+            .remove(&(LIVE, route.wire_stream_id));
+        let frame = rx.recv().await.unwrap();
+        assert_eq!(parse_local_frame(&frame).0, LocalAppMsg::StreamClose as u16);
+        assert!(table.remote_route(ipc_id).is_none());
+        let sent = source.sent.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|(peer, _)| *peer == LIVE));
+        let open = AppOpenPayload::decode(&sent[0].1[HEADER_SIZE..]).unwrap();
+        assert_eq!(open.app_id, app);
     }
 
     /// Test `FrameBroadcaster` that captures every `(peer, frame)` sent so a
