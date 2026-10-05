@@ -72,7 +72,33 @@ pub struct QuicDatagramHandle {
     connection: quinn::Connection,
 }
 
+/// Local counters for a generic encrypted connection. No source role,
+/// endpoint address, identity material, or decrypted application data.
+#[derive(Clone, Copy, Debug)]
+pub struct QuicDatagramPathStats {
+    pub rtt_us: u64,
+    pub congestion_window_bytes: u64,
+    pub lost_packets: u64,
+    pub congestion_events: u64,
+    pub udp_sent: u64,
+    pub udp_received: u64,
+    pub acknowledgments_received: u64,
+}
+
 impl QuicDatagramHandle {
+    /// Snapshot actual transport progress, separately from queue admission.
+    pub fn path_stats(&self) -> QuicDatagramPathStats {
+        let stats = self.connection.stats();
+        QuicDatagramPathStats {
+            rtt_us: stats.path.rtt.as_micros().min(u64::MAX as u128) as u64,
+            congestion_window_bytes: stats.path.cwnd,
+            lost_packets: stats.path.lost_packets,
+            congestion_events: stats.path.congestion_events,
+            udp_sent: stats.udp_tx.datagrams,
+            udp_received: stats.udp_rx.datagrams,
+            acknowledgments_received: stats.frame_rx.acks,
+        }
+    }
     /// TLS exporter for authenticating a new, independent transport against
     /// an existing OVL1 session. This is secret keying material, not a peer
     /// identity or a wire field; callers must not log it.
