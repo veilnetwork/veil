@@ -1,11 +1,15 @@
 //! A temporary endpoint budget for new reliable writes, while its local
 //! primary producer is active. Transit traffic never selects this policy.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use veil_transport::{DEFAULT_RELIABLE_SEND_WINDOW_BYTES, QuicDatagramHandle};
+use veil_util::lock;
 
 pub(super) const ACTIVE_RELIABLE_BYTES: u64 = 1024;
-// Independent congestion controllers still share the endpoint's physical path.
+// Small bounded control writes on the parent must not inherit child pressure.
 pub(super) const INDEPENDENT_RELIABLE_BYTES: u64 = 16 * 1024;
 const IDLE_GRACE: Duration = Duration::from_secs(3);
 const PRIMARY_PRESSURE_RTT: Duration = Duration::from_millis(150);
@@ -13,9 +17,8 @@ const PRESSURE_GRACE: Duration = Duration::from_secs(2);
 const SECONDARY_PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
 pub(super) struct LocalReliableAdmission {
-    handle: QuicDatagramHandle,
+    writes: Arc<ReliableWriteAdmission>,
     active_until: Option<Instant>,
-    active_window: Option<u64>,
     pressure_until: Option<Instant>,
     ack_pressure_until: Option<Instant>,
     last_expired: u64,
@@ -25,14 +28,17 @@ pub(super) struct LocalReliableAdmission {
 impl LocalReliableAdmission {
     pub(super) fn new(handle: QuicDatagramHandle) -> Self {
         Self {
-            handle,
+            writes: Arc::new(ReliableWriteAdmission::new(handle)),
             active_until: None,
-            active_window: None,
             pressure_until: None,
             ack_pressure_until: None,
             last_expired: 0,
             secondary_next: None,
         }
+    }
+
+    pub(super) fn writer_admission(&self) -> Arc<ReliableWriteAdmission> {
+        Arc::clone(&self.writes)
     }
 
     pub(super) fn observe(
@@ -52,11 +58,9 @@ impl LocalReliableAdmission {
         } else {
             ACTIVE_RELIABLE_BYTES
         };
-        if self.active_window != Some(window) {
-            self.handle.set_reliable_send_window(window);
-            self.active_window = Some(window);
-        }
-        self.active_until = Some(now + IDLE_GRACE);
+        let until = now + IDLE_GRACE;
+        self.writes.update(window, independent.then_some(until));
+        self.active_until = Some(until);
     }
 
     /// Called only for the local primary's authenticated independent sender.
@@ -77,9 +81,9 @@ impl LocalReliableAdmission {
     }
 
     fn observe_pressure(&mut self, rtt_us: u64, expired: u64, ack_blocked: bool, now: Instant) {
-        // An independent primary's missing ACK must curb lossy secondary
-        // production without also shrinking the reliable parent carrying
-        // session control/rekeys. Retain that path's previous window policy.
+        // Pressure limits bulk admission and competing local lossy production.
+        // The writer grants a separate bounded budget only while actually
+        // writing locally authored control; bulk and transit never acquire it.
         if ack_blocked {
             self.ack_pressure_until = Some(now + PRESSURE_GRACE);
         }
@@ -121,12 +125,10 @@ impl LocalReliableAdmission {
 
     fn restore(&mut self) {
         if self.active_until.take().is_some() {
-            self.active_window = None;
             self.pressure_until = None;
             self.ack_pressure_until = None;
             self.secondary_next = None;
-            self.handle
-                .set_reliable_send_window(DEFAULT_RELIABLE_SEND_WINDOW_BYTES);
+            self.writes.update(DEFAULT_RELIABLE_SEND_WINDOW_BYTES, None);
         }
     }
 }
@@ -134,5 +136,76 @@ impl LocalReliableAdmission {
 impl Drop for LocalReliableAdmission {
     fn drop(&mut self) {
         self.restore();
+    }
+}
+
+/// Endpoint-local write metadata never changes a frame or travels over QUIC.
+/// Holding a control lease through every partial write prevents concurrent
+/// primary observations from shrinking its window before the blob is admitted.
+pub(super) struct ReliableWriteAdmission {
+    handle: QuicDatagramHandle,
+    state: Mutex<WriteState>,
+}
+
+struct WriteState {
+    bulk_window: u64,
+    independent_until: Option<Instant>,
+    control_writes: usize,
+    applied_window: u64,
+}
+
+impl ReliableWriteAdmission {
+    fn new(handle: QuicDatagramHandle) -> Self {
+        Self {
+            handle,
+            state: Mutex::new(WriteState {
+                bulk_window: DEFAULT_RELIABLE_SEND_WINDOW_BYTES,
+                independent_until: None,
+                control_writes: 0,
+                applied_window: DEFAULT_RELIABLE_SEND_WINDOW_BYTES,
+            }),
+        }
+    }
+
+    fn apply(&self, state: &mut WriteState) {
+        let window = if state.control_writes > 0 {
+            state.bulk_window.max(INDEPENDENT_RELIABLE_BYTES)
+        } else {
+            state.bulk_window
+        };
+        if state.applied_window != window {
+            self.handle.set_reliable_send_window(window);
+            state.applied_window = window;
+        }
+    }
+
+    fn update(&self, window: u64, until: Option<Instant>) {
+        let mut state = lock!(&self.state);
+        state.bulk_window = window;
+        state.independent_until = until;
+        self.apply(&mut state);
+    }
+
+    pub(super) fn begin_control(self: &Arc<Self>) -> Option<ControlWrite> {
+        let mut state = lock!(&self.state);
+        if !state
+            .independent_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return None;
+        }
+        state.control_writes += 1;
+        self.apply(&mut state);
+        Some(ControlWrite(Arc::clone(self)))
+    }
+}
+
+pub(super) struct ControlWrite(Arc<ReliableWriteAdmission>);
+
+impl Drop for ControlWrite {
+    fn drop(&mut self) {
+        let mut state = lock!(&self.0.state);
+        state.control_writes -= 1;
+        self.0.apply(&mut state);
     }
 }

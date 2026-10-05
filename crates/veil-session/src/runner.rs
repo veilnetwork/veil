@@ -141,7 +141,7 @@ async fn await_next_input(
     rpc_outbox: Option<&mut mpsc::Receiver<OutboxRequest>>,
     swap_rx: Option<&mut mpsc::Receiver<BoxIoStream>>,
     sleep_until: Option<tokio::time::Instant>,
-    wire_tx: &mpsc::Sender<veil_bufpool::PooledShared>,
+    wire_tx: &mpsc::Sender<WireBlob>,
     local_datagram_status: Option<&crate::local_datagram_status::LocalDatagramStatus>,
     wire_capacity_needed: Option<usize>,
 ) -> NextInput {
@@ -1233,6 +1233,25 @@ pub const ENCRYPTED_BATCH_BYTES_CAP: usize = 64 * 1024;
 /// the full post-priority bound is ≈ 512 KiB here + 256 KiB kernel.
 pub const WIRE_CHANNEL_CAPACITY: usize = 8;
 
+/// Classification is supplied only by local producers, never from wire priority.
+struct WireBlob {
+    bytes: veil_bufpool::PooledShared,
+    control: bool,
+}
+
+impl From<veil_bufpool::PooledShared> for WireBlob {
+    fn from(bytes: veil_bufpool::PooledShared) -> Self {
+        Self {
+            bytes,
+            control: false,
+        }
+    }
+}
+
+fn local_control_write(priority: u8, frame: &[u8]) -> bool {
+    priority == veil_proto::priority::REALTIME && decode_realtime_lane_frame(frame).is_none()
+}
+
 /// writer task — owns the `WriteHalf<BoxIoStream>` and
 /// drains pre-encrypted/pre-coalesced wire bytes pushed onto it from
 /// the runner's main loop. Each `write_all` is wrapped in a
@@ -1243,21 +1262,28 @@ pub const WIRE_CHANNEL_CAPACITY: usize = 8;
 /// via `on_primary_write_error`.
 ///
 /// The task NEVER reads the socket, NEVER touches AEAD ciphers, and
-/// holds NO state beyond the write half + receiver — so it is impossible
-/// for the writer to be transitively waiting on anything the runner
-/// owns. In particular: the previous design's deadlock (writer blocked
+/// holds only the write half, receiver and a local admission lease — so it cannot
+/// wait on async work owned by the runner. In particular: the previous design's deadlock (writer blocked
 /// on TCP send buffer because peer's recv buffer is full because peer
 /// is itself blocked on its own send buffer because we haven't drained
 /// our recv buffer because we are blocked on our writer) cannot form —
 /// our reader is now in a separate task path that always drains.
-async fn writer_task(
+async fn writer_task<B: Into<WireBlob>>(
     mut write_half: tokio::io::WriteHalf<BoxIoStream>,
-    mut wire_rx: mpsc::Receiver<veil_bufpool::PooledShared>,
+    mut wire_rx: mpsc::Receiver<B>,
+    admission: Option<Arc<local_reliable_admission::ReliableWriteAdmission>>,
     metrics: Option<Arc<NodeMetrics>>,
     logger: Arc<NodeLogger>,
     peer_id_short: String,
 ) {
-    while let Some(bytes) = wire_rx.recv().await {
+    while let Some(blob) = wire_rx.recv().await {
+        let blob = blob.into();
+        let _control_write = if blob.control {
+            admission.as_ref().and_then(|a| a.begin_control())
+        } else {
+            None
+        };
+        let bytes = blob.bytes;
         let wire_len = bytes.len();
         let trace_started = crate::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
         let queued_behind = wire_rx.len();
@@ -1342,6 +1368,7 @@ pub fn spawn_writer_task(
     tokio::spawn(writer_task(
         write_half,
         wire_rx,
+        None,
         metrics,
         logger,
         peer_id_short,
@@ -1374,11 +1401,20 @@ impl SessionRunner {
     /// whole loop (read AND dispatch) for up to 30 s during the
     /// symmetric-deadlock window observed on testnet.
     fn push_wire(
-        wire_tx: &mpsc::Sender<veil_bufpool::PooledShared>,
+        wire_tx: &mpsc::Sender<WireBlob>,
         bytes: veil_bufpool::PooledShared,
         metrics: &Option<Arc<NodeMetrics>>,
-    ) -> Result<(), mpsc::error::TrySendError<veil_bufpool::PooledShared>> {
-        match wire_tx.try_send(bytes) {
+    ) -> Result<(), mpsc::error::TrySendError<WireBlob>> {
+        Self::push_wire_classified(wire_tx, bytes, metrics, true)
+    }
+
+    fn push_wire_classified(
+        wire_tx: &mpsc::Sender<WireBlob>,
+        bytes: veil_bufpool::PooledShared,
+        metrics: &Option<Arc<NodeMetrics>>,
+        control: bool,
+    ) -> Result<(), mpsc::error::TrySendError<WireBlob>> {
+        match wire_tx.try_send(WireBlob { bytes, control }) {
             Ok(()) => Ok(()),
             Err(e @ mpsc::error::TrySendError::Full(_)) => {
                 if let Some(m) = metrics {
@@ -1403,7 +1439,7 @@ impl SessionRunner {
     /// to match the original inline `return`.
     fn send_pending_session_ticket(
         &mut self,
-        wire_tx: &mpsc::Sender<veil_bufpool::PooledShared>,
+        wire_tx: &mpsc::Sender<WireBlob>,
         write_error_count: &mut crate::write_error_tracker::WriteErrorTracker,
     ) -> Result<(), ()> {
         let Some(blob) = self.ticket_to_send.take() else {
@@ -1660,7 +1696,7 @@ impl SessionRunner {
     fn handle_mlkem_rekey_ek_arm(
         &mut self,
         body: &[u8],
-        wire_tx: &mpsc::Sender<veil_bufpool::PooledShared>,
+        wire_tx: &mpsc::Sender<WireBlob>,
         write_error_count: &mut crate::write_error_tracker::WriteErrorTracker,
     ) -> std::ops::ControlFlow<()> {
         use std::ops::ControlFlow;
@@ -2679,7 +2715,7 @@ impl SessionRunner {
         rekey: &mut crate::rekey_context::RekeyContext,
         rx_cipher_prev: &mut crate::rekey_rx_grace_buffer::RekeyRxGraceBuffer,
         realtime: RealtimeRekeyTargets<'_>,
-        wire_tx: &mpsc::Sender<veil_bufpool::PooledShared>,
+        wire_tx: &mpsc::Sender<WireBlob>,
         write_error_count: &mut crate::write_error_tracker::WriteErrorTracker,
     ) -> std::ops::ControlFlow<()> {
         use std::ops::ControlFlow;
@@ -3791,15 +3827,17 @@ impl SessionRunner {
         // replacement transport.
         let stream = std::mem::replace(&mut self.stream, broken_stream_sentinel());
         let (mut read_half, write_half) = tokio::io::split(stream);
-        let (mut wire_tx, wire_rx) =
-            mpsc::channel::<veil_bufpool::PooledShared>(WIRE_CHANNEL_CAPACITY);
-        let mut writer_handle = spawn_writer_task(
+        let (mut wire_tx, wire_rx) = mpsc::channel::<WireBlob>(WIRE_CHANNEL_CAPACITY);
+        let mut writer_handle = tokio::spawn(writer_task(
             write_half,
             wire_rx,
+            realtime_lane
+                .as_ref()
+                .map(|lane| lane.local_reliable.writer_admission()),
             self.metrics.clone(),
             Arc::clone(&self.logger),
             hex_short(&self.peer_id),
-        );
+        ));
         // stage (c): consecutive-error counter for
         // on_primary_write_error. Not reset on successful write — a
         // half-dead primary may flap between OK and err, and we want the
@@ -4563,6 +4601,7 @@ impl SessionRunner {
                 let mut encrypted_batch_frames = Vec::new();
                 let mut encrypted_batch_wire_len = 0usize;
                 let mut batch_has_local_source = false;
+                let mut batch_control = None;
                 let now = std::time::Instant::now();
                 let local_primary_active = pq.local_primary_active(now)
                     || outbox
@@ -4591,6 +4630,13 @@ impl SessionRunner {
                         source_bulk_waiting_for_writer = local_primary_active
                             && priority >= veil_proto::priority::BULK
                             && pending_blobs != 0;
+                        // Do not let a control lease admit a coalesced file or
+                        // neutral transit frame. The immutable ciphertext batch
+                        // keeps one local classification through partial writes.
+                        let control = local_control_write(priority, frame);
+                        if batch_control.is_some_and(|kind| kind != control) {
+                            return false;
+                        }
                         local_source_stream_budget::fits(
                             local_primary_active,
                             priority,
@@ -4603,6 +4649,8 @@ impl SessionRunner {
                 {
                     drained_this_pass += 1;
                     batch_has_local_source |= envelope.frame.0 != veil_proto::priority::INTERACTIVE;
+                    let control = local_control_write(envelope.frame.0, &envelope.frame.1);
+                    batch_control = Some(control);
                     let outgoing = envelope.frame.1;
                     // A stream-only / old peer must see the old discriminant.
                     // Fallback is reliable for this hop; never reinterpret other
@@ -4627,7 +4675,12 @@ impl SessionRunner {
                         // is an encrypted session frame.
                         let tx_len = outgoing.len() as u64;
                         // outgoing is already a PooledShared — pass through.
-                        match Self::push_wire(&wire_tx, outgoing.clone(), &self.metrics) {
+                        match Self::push_wire_classified(
+                            &wire_tx,
+                            outgoing.clone(),
+                            &self.metrics,
+                            control,
+                        ) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => continue,
                             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -4674,7 +4727,14 @@ impl SessionRunner {
                     let wire = coalesce_with_padding(&encrypted_batch, Some(cipher));
                     let tx_len = wire.len() as u64;
                     let wire_pool = veil_bufpool::pooled_shared_from_vec(wire);
-                    if Self::push_wire(&wire_tx, wire_pool, &self.metrics).is_err() {
+                    if Self::push_wire_classified(
+                        &wire_tx,
+                        wire_pool,
+                        &self.metrics,
+                        batch_control == Some(true),
+                    )
+                    .is_err()
+                    {
                         // Capacity was checked before popping/encrypting. A
                         // failure now therefore means the writer closed (or
                         // an invariant broke); encrypted frames cannot be
@@ -5291,7 +5351,7 @@ impl SessionRunner {
     /// the writer task and the socket write half alive with nobody holding a
     /// handle to them (report9 V-12).
     async fn stop_writer(
-        wire_tx: mpsc::Sender<veil_bufpool::PooledShared>,
+        wire_tx: mpsc::Sender<WireBlob>,
         writer_handle: &mut tokio::task::JoinHandle<()>,
     ) {
         drop(wire_tx);
@@ -5337,11 +5397,11 @@ impl SessionRunner {
     async fn swap_transport_plumbing(
         &self,
         new_stream: veil_transport::BoxIoStream,
-        old_wire_tx: mpsc::Sender<veil_bufpool::PooledShared>,
+        old_wire_tx: mpsc::Sender<WireBlob>,
         mut old_writer_handle: tokio::task::JoinHandle<()>,
     ) -> (
         tokio::io::ReadHalf<veil_transport::BoxIoStream>,
-        mpsc::Sender<veil_bufpool::PooledShared>,
+        mpsc::Sender<WireBlob>,
         tokio::task::JoinHandle<()>,
     ) {
         self.logger.info(
@@ -5356,14 +5416,15 @@ impl SessionRunner {
         drop(old_wire_tx);
         let _ = (&mut old_writer_handle).await;
         let (new_read, new_write) = tokio::io::split(new_stream);
-        let (new_tx, new_rx) = mpsc::channel::<veil_bufpool::PooledShared>(WIRE_CHANNEL_CAPACITY);
-        let new_writer_handle = spawn_writer_task(
+        let (new_tx, new_rx) = mpsc::channel::<WireBlob>(WIRE_CHANNEL_CAPACITY);
+        let new_writer_handle = tokio::spawn(writer_task(
             new_write,
             new_rx,
+            None,
             self.metrics.clone(),
             Arc::clone(&self.logger),
             hex_short(&self.peer_id),
-        );
+        ));
         (new_read, new_tx, new_writer_handle)
     }
 
@@ -5376,7 +5437,7 @@ impl SessionRunner {
     fn process_dispatch_result(
         &mut self,
         result: DispatchResult,
-        wire_tx: &mpsc::Sender<veil_bufpool::PooledShared>,
+        wire_tx: &mpsc::Sender<WireBlob>,
         rekey: &mut crate::rekey_context::RekeyContext,
         mlkem_rekey: &mut crate::mlkem_rekey_context::MlKemRekeyContext,
         bp_signal: &mut crate::backpressure_signal::BackpressureSignal,
@@ -5403,6 +5464,11 @@ impl SessionRunner {
                 if !self.dispatcher.allow_outbound_bandwidth(planned_wire_len) {
                     return false;
                 }
+                // Only locally generated session/control responses get the
+                // bounded control budget. Remote header priority is ignored.
+                let control = decode_header(&resp_bytes).is_ok_and(|h| {
+                    h.family == FrameFamily::Session as u8 || h.family == FrameFamily::Control as u8
+                });
                 // Capture the plaintext response before any encryption.
                 self.dispatcher.capture_outbound(self.peer_id, &resp_bytes);
                 // Encrypt the response body if the session uses encryption.
@@ -5421,7 +5487,8 @@ impl SessionRunner {
                 }
                 rekey.record_bytes(resp_len);
                 mlkem_rekey.record_bytes(resp_len);
-                if Self::push_wire(wire_tx, wire_bytes, &self.metrics).is_err() {
+                if Self::push_wire_classified(wire_tx, wire_bytes, &self.metrics, control).is_err()
+                {
                     self.on_primary_write_error(write_error_count);
                     return true;
                 }

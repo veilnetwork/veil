@@ -35,3 +35,21 @@ async fn blocked_partial_write_still_expires_without_progress() {
             .is_err()
     );
 }
+
+#[test]
+fn remote_priority_cannot_select_local_control_admission() {
+    use veil_proto::{
+        family::{AppMsg, FrameFamily},
+        header::FrameHeader,
+        priority::{BACKGROUND, BULK, INTERACTIVE, REALTIME},
+    };
+    let mut h = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppData as u16);
+    h.set_priority(REALTIME);
+    let frame = veil_proto::encode_header(&h);
+    assert!(super::local_control_write(REALTIME, &frame));
+    for local in [INTERACTIVE, BULK, BACKGROUND] {
+        assert!(!super::local_control_write(local, &frame));
+    }
+    let raw = veil_bufpool::pooled_shared_from_vec(frame.to_vec());
+    assert!(!super::WireBlob::from(raw).control);
+}
