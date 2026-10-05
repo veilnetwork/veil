@@ -1,0 +1,12 @@
+[
+  {
+    "name": "quinn",
+    "version": "0.11.9",
+    "registry_archive_sha256": "b9e20a958963c291dc322d98411f541009df2ced7b5a4f2bd52337638cfccf20"
+  },
+  {
+    "name": "quinn-proto",
+    "version": "0.11.15",
+    "registry_archive_sha256": "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
+  }
+]

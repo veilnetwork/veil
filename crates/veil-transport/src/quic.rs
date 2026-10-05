@@ -83,6 +83,7 @@ pub struct QuicDatagramPathStats {
     pub udp_sent: u64,
     pub udp_received: u64,
     pub acknowledgments_received: u64,
+    pub expired_outgoing_datagrams: u64,
 }
 
 impl QuicDatagramHandle {
@@ -97,6 +98,7 @@ impl QuicDatagramHandle {
             udp_sent: stats.udp_tx.datagrams,
             udp_received: stats.udp_rx.datagrams,
             acknowledgments_received: stats.frame_rx.acks,
+            expired_outgoing_datagrams: self.connection.expired_outgoing_datagrams(),
         }
     }
     /// TLS exporter for authenticating a new, independent transport against
@@ -135,6 +137,27 @@ impl QuicDatagramHandle {
     pub fn send(&self, payload: &[u8]) -> std::result::Result<(), QuicDatagramSendError> {
         self.connection
             .send_datagram(payload.to_vec().into())
+            .map_err(|error| match error {
+                quinn::SendDatagramError::UnsupportedByPeer => {
+                    QuicDatagramSendError::UnsupportedByPeer
+                }
+                quinn::SendDatagramError::Disabled => QuicDatagramSendError::Disabled,
+                quinn::SendDatagramError::TooLarge => QuicDatagramSendError::TooLarge,
+                quinn::SendDatagramError::ConnectionLost(error) => {
+                    QuicDatagramSendError::ConnectionLost(error.to_string())
+                }
+            })
+    }
+
+    /// Queue an unreliable datagram with a local monotonic deadline. Expiry
+    /// applies only while unsent; it is not a wire field or a delivery promise.
+    pub fn send_before(
+        &self,
+        payload: &[u8],
+        expires_at: std::time::Instant,
+    ) -> std::result::Result<(), QuicDatagramSendError> {
+        self.connection
+            .send_datagram_with_expiry(payload.to_vec().into(), expires_at)
             .map_err(|error| match error {
                 quinn::SendDatagramError::UnsupportedByPeer => {
                     QuicDatagramSendError::UnsupportedByPeer
