@@ -618,6 +618,8 @@ class VeilGroupMediaEngine {
   /// `audio_receivers` holds accepted audio packet counts and native playout
   /// estimates per peer. A stalled audio worker keeps `audio_rx_supported: 1`
   /// but supplies no valid receiver samples.
+  /// Optional encrypted RTCP APP feedback supplies `audio_playout_peers`,
+  /// `audio_playout_reports` and worst `audio_playout_ms` (-1 when unknown).
   Map<String, dynamic> getStats() {
     _ensure();
     final get = ffi.veilMediaGroupEngineGetStats;

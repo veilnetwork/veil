@@ -115,6 +115,10 @@ int veil_media_group_engine_set_video_bitrate(VeilGroupMediaEngine *engine,
  * native `audio_delay_ms` estimate. `audio_rx_supported` stays 1 even when
  * `worker_stalled` is 1 and the receiver map is empty (unknown, not healthy).
  * Audio and video telemetry have separate 20 ms scheduling waits.
+ * `audio_playout_peers` counts active peers that advertised encrypted RTCP APP
+ * playout feedback; `audio_playout_reports` counts fresh measured estimates
+ * (12 s), and `audio_playout_ms` is their maximum or -1 when unknown. Receiver
+ * samples are appended to existing RTCP only, with no relay-visible role.
  * Free this JSON with veil_media_free_string. */
 char *veil_media_group_engine_get_stats(VeilGroupMediaEngine *engine);
 int veil_media_group_engine_start_camera(VeilGroupMediaEngine *engine,
