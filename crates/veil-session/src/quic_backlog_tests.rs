@@ -1590,6 +1590,16 @@ async fn primary_ack_blackout_limits_secondary_before_rtt_or_expiry_changes() {
     admission.observe_primary_path(&handle, now);
     let probe_allowed = admission.allow_secondary(BULK, now);
     let burst_allowed = admission.allow_secondary(BULK, now + Duration::from_millis(1));
+    admission.observe(REALTIME, &frame, now, true);
+    // A stalled independent primary must not shrink the parent control path
+    // before RTT/expiry feedback arrives. A PQ rekey-sized control write
+    // must still fit the normal independent reliable admission window.
+    let control_admitted = timeout(
+        Duration::from_millis(50),
+        stream.write_all(&[0x33; 12 * 1024]),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok());
     for priority in [REALTIME, INTERACTIVE, veil_proto::priority::BACKGROUND] {
         assert!(admission.allow_secondary(priority, now));
     }
@@ -1619,4 +1629,8 @@ async fn primary_ack_blackout_limits_secondary_before_rtt_or_expiry_changes() {
         "stale low RTT allowed a secondary burst during primary PTO"
     );
     assert!(recovered, "secondary failed to resume after pressure grace");
+    assert!(
+        control_admitted,
+        "primary PTO shrank reliable control admission"
+    );
 }
