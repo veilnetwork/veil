@@ -287,6 +287,7 @@ impl RealtimeDatagramLane {
     fn select_sender(
         &mut self,
         priority: u8,
+        frame: &[u8],
         body: &[u8],
         kind: RealtimeLaneFrameKind,
     ) -> (std::sync::MutexGuard<'_, RealtimeSender>, bool) {
@@ -294,6 +295,8 @@ impl RealtimeDatagramLane {
             .parallel
             .as_mut()
             .and_then(|parallel| parallel.prepare_frame(priority, body, kind));
+        self.local_reliable
+            .observe(priority, frame, std::time::Instant::now(), ready.is_some());
         if let Some(index) = ready {
             (self.parallel.as_ref().unwrap().sender(index), true)
         } else {
@@ -4178,13 +4181,8 @@ impl SessionRunner {
                         }
                         let (_, body, lane_kind) = decode_realtime_lane_frame(outgoing)
                             .expect("realtime queue predicate accepted this frame");
-                        lane.local_reliable.observe(
-                            outgoing_priority,
-                            outgoing,
-                            std::time::Instant::now(),
-                        );
                         let (mut lane, using_parallel) =
-                            lane.select_sender(outgoing_priority, body, lane_kind);
+                            lane.select_sender(outgoing_priority, outgoing, body, lane_kind);
                         let max_datagram_size = lane.max_datagram_size;
                         let datagrams = match lane.tx.encode_frame(
                             local_datagram_flow(outgoing_priority, body, lane_kind),
