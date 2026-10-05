@@ -15,10 +15,7 @@
 use std::sync::{Arc, Mutex};
 use veil_util::{lock, rlock, wlock};
 
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::mpsc,
-};
+use tokio::{io::AsyncWriteExt, sync::mpsc};
 
 use veil_abuse::{BanList, ViolationTracker};
 use veil_crypto::{kex, session_cipher::SessionCipher, session_kdf};
@@ -93,8 +90,14 @@ impl Drop for BudgetGuard {
 
 // ── await_next_input ──────────────────────────────────────────────────────────
 
+#[path = "ordered_reader.rs"]
+pub mod ordered_reader;
+
 /// Return type [`await_next_input`].
 pub enum NextInput {
+    /// Complete ordered frame, retaining its node-wide memory reservation.
+    Frame(Box<ordered_reader::Frame>),
+    ReadFailed(ordered_reader::ReadError),
     /// First byte of the next incoming frame.
     Byte(u8),
     /// A priority-tagged frame was received from the outbox.
@@ -132,6 +135,8 @@ pub enum NextInput {
 #[allow(clippy::too_many_arguments)]
 async fn await_next_input(
     read_half: &mut tokio::io::ReadHalf<BoxIoStream>,
+    frame_reader: &mut ordered_reader::Reader,
+    max_frame_body: u32,
     outbox: Option<&mut crate::FrameOutbox>,
     rpc_outbox: Option<&mut mpsc::Receiver<OutboxRequest>>,
     swap_rx: Option<&mut mpsc::Receiver<BoxIoStream>>,
@@ -141,8 +146,6 @@ async fn await_next_input(
     wire_capacity_needed: Option<usize>,
 ) -> NextInput {
     use std::future::pending;
-    use tokio::io::AsyncReadExt as _;
-
     tokio::select! {
         result = async {
             match wire_capacity_needed {
@@ -160,9 +163,10 @@ async fn await_next_input(
                 None => pending::<()>().await,
             }
         } => NextInput::LocalDatagramWarm,
-        r = read_half.read_u8() => match r {
-            Ok(b)  => NextInput::Byte(b),
-            Err(e) => NextInput::ReadClosed(e.to_string()),
+        r = frame_reader.read(read_half, max_frame_body) => match r {
+            Ok(frame) => NextInput::Frame(Box::new(frame)),
+            Err(ordered_reader::ReadError::Closed(e)) => NextInput::ReadClosed(e),
+            Err(e) => NextInput::ReadFailed(e),
         },
         Some(frame) = async {
             match outbox {
@@ -3536,7 +3540,7 @@ impl SessionRunner {
     /// runtime (e.g. periodic ROUTE_PROBEs) are written directly to the peer.
     /// Returns when the stream is closed or an I/O error occurs.
     pub async fn run(&mut self) {
-        let mut hdr_buf = [0u8; veil_proto::header::HEADER_SIZE];
+        let mut frame_reader = ordered_reader::Reader::default();
         // WRR priority queue for outgoing frames from the runtime outbox.
         // Weights are configurable via SessionConfig.qos_weights.
         let mut pq = if let Some(m) = &self.metrics {
@@ -3890,17 +3894,24 @@ impl SessionRunner {
             crate::rotation_deadline::SessionRotationDeadline::compute(tokio::time::Instant::now());
 
         loop {
-            // ── Outbox drain + header read (concurrent) ───────────────────────
-            //
-            // We select between:
-            // (a) reading a header byte from the peer stream, and
-            // (b) receiving a priority-tagged frame from the outbox.
-            //
-            // Because read_exact is not cancel-safe we use a two-phase approach:
-            // peek the first byte (cancel-safe), then read the rest after the
-            // select resolves.
-            let first_byte: u8;
+            // Partial ordered reads retain their cursor while outbox,
+            // timer and independent-source work continues through this loop.
+            let incoming_frame;
             loop {
+                if let Some((progress, header)) = frame_reader.take_progress() {
+                    timers.note_rx_activity(progress);
+                    stall_trigger.clear();
+                    if let Some((family, msg)) = header
+                        && !is_liveness_frame(family, msg)
+                    {
+                        // Real body progress must keep an otherwise healthy
+                        // large transfer alive while the scheduler continues.
+                        timers.note_frame_received(progress);
+                        if family == FrameFamily::App as u8 && msg == AppMsg::AppRtData as u16 {
+                            timers.note_realtime_activity(progress);
+                        }
+                    }
+                }
                 // Outbox drain returns `ControlFlow::Break` if the Sender
                 // was dropped — that means run must exit.
                 if let Some(ref mut outbox) = outbox
@@ -4589,6 +4600,8 @@ impl SessionRunner {
                 );
                 match await_next_input(
                     &mut read_half,
+                    &mut frame_reader,
+                    self.max_frame_body,
                     outbox.as_mut(),
                     rpc_outbox.as_mut(),
                     swap_rx.as_mut(),
@@ -4607,9 +4620,24 @@ impl SessionRunner {
                 )
                 .await
                 {
-                    NextInput::Byte(b) => {
-                        first_byte = b;
+                    NextInput::Frame(frame) => {
+                        incoming_frame = *frame;
                         break;
+                    }
+                    NextInput::Byte(_) => unreachable!("reader returns complete frames"),
+                    NextInput::ReadFailed(error) => {
+                        match error {
+                            ordered_reader::ReadError::BadHeader(error) => {
+                                self.logger.warn("session.bad_header", format!("peer_id={} error={error}", hex_short(&self.peer_id)));
+                                self.record_violation("bad OVL1 header");
+                            }
+                            ordered_reader::ReadError::BodyBudget(length) => self.logger.warn(
+                                "session.rx_body_budget_timeout", format!("peer_id={} body_len={length} — node-wide inbound body budget stayed exhausted; shedding this session", hex_short(&self.peer_id))),
+                            ordered_reader::ReadError::BodyTimeout => self.record_violation("frame body read timeout (slow-loris)"),
+                            ordered_reader::ReadError::Closed(_) => unreachable!(),
+                        }
+                        Self::stop_writer(wire_tx, &mut writer_handle).await;
+                        return;
                     }
                     NextInput::OutboxFrame(envelope) => {
                         if enqueue_outbox_envelope(
@@ -4624,6 +4652,13 @@ impl SessionRunner {
                         continue;
                     }
                     NextInput::SwapStream(new_stream) => {
+                        if frame_reader.has_partial_frame() {
+                            // A partial encrypted frame cannot be discarded while
+                            // preserving the ordered cipher's implicit nonce.
+                            self.logger.warn("session.swap_partial_frame", "closing rather than carrying a partial frame onto a replacement stream");
+                            Self::stop_writer(wire_tx, &mut writer_handle).await;
+                            return;
+                        }
                         // The replacement API carries only a byte stream, not
                         // a handle to its QUIC connection. Stop using the old
                         // connection's datagram plane immediately; queued media
@@ -4791,31 +4826,25 @@ impl SessionRunner {
             // stage (c.2): peer is responsive again, so a
             // future stall can re-fire the trigger.
             stall_trigger.clear();
-            // Read the rest of the header (HEADER_SIZE - 1 remaining bytes).
-            hdr_buf[0] = first_byte;
-            match read_half.read_exact(&mut hdr_buf[1..]).await {
-                Ok(_) => {}
-                Err(e) => {
-                    self.logger.warn(
-                        "session.read_header_failed",
-                        format!("peer_id={} error={e}", hex_short(&self.peer_id),),
-                    );
-                    break;
-                }
+            let ordered_reader::Frame {
+                header,
+                body: mut raw_body,
+                body_budget: _body_budget,
+                body_elapsed,
+            } = incoming_frame;
+            if crate::rt_trace::rt_trace_enabled() && body_elapsed.as_millis() >= 500 {
+                self.logger.warn(
+                    "session.rt_trace.slow_body_read",
+                    format!(
+                        "peer_id={} family={} msg={} body_len={} read_ms={}",
+                        hex_short(&self.peer_id),
+                        header.family,
+                        header.msg_type,
+                        header.body_len,
+                        body_elapsed.as_millis()
+                    ),
+                );
             }
-
-            let header = match decode_header_with_limit(&hdr_buf, self.max_frame_body) {
-                Ok(h) => h,
-                Err(e) => {
-                    self.logger.warn(
-                        "session.bad_header",
-                        format!("peer_id={} error={e}", hex_short(&self.peer_id)),
-                    );
-                    self.record_violation("bad OVL1 header");
-                    break;
-                }
-            };
-
             // Genuine-liveness gate: a DATA-bearing frame (anything that is
             // NOT a keepalive / keepalive-ack / cover-padding) resets the
             // genuine-RX ticker the keepalive-probe teardown reaps on. A
@@ -4841,120 +4870,6 @@ impl SessionRunner {
                     && header.msg_type == AppMsg::AppRtData as u16
                 {
                     timers.note_realtime_activity(now);
-                }
-            }
-
-            // ── Read body ────────────────────────────────────────────────────
-            // Safety: `decode_header` already rejected body_len > MAX_FRAME_BODY
-            // (16 MiB), so this allocation is bounded even in adversarial cases.
-            //
-            // bufpool refactor: the encrypted frame body buffer is
-            // acquired from the global bufpool instead of a fresh
-            // `Vec::with_capacity`.  Pool capacity is controlled by the
-            // `VEIL_BUFPOOL_CAP` env var (default 64 buffers/bucket);
-            // when set to 0 every acquire falls through to a direct heap
-            // alloc (behaviourally identical to pre-pool code).  The
-            // `Pooled` handle drops at the end of this scope iteration —
-            // returning the buffer to the pool's cache OR freeing it to heap.
-            let body_len = header.body_len as usize;
-            // Reserve node-wide body memory BEFORE allocating. The 16 MiB
-            // per-frame cap and the deadline below are both per session;
-            // nothing summed them, so N sessions admitted N × 16 MiB of
-            // simultaneous reservations — and a body that never arrives
-            // costs the sender nothing. See `rx_body_budget`.
-            //
-            // The permit is bound to the loop iteration, so it is returned
-            // at exactly the point `raw_body` is dropped.
-            let _body_budget = if body_len > 0 {
-                match tokio::time::timeout(
-                    BODY_BUDGET_DEADLINE,
-                    crate::rx_body_budget::reserve(body_len),
-                )
-                .await
-                {
-                    Ok(permit) => Some(permit),
-                    Err(_) => {
-                        // Saturation is OUR condition, not this peer's
-                        // misbehaviour — deliberately not `record_violation`,
-                        // which feeds the ban list. Shedding one session
-                        // under memory pressure is fine; banning peers for
-                        // our own congestion turns it into a mesh-wide
-                        // disconnect storm.
-                        self.logger.warn(
-                            "session.rx_body_budget_timeout",
-                            format!(
-                                "peer_id={} body_len={body_len} — node-wide inbound body \
-                                 budget stayed exhausted; shedding this session",
-                                hex_short(&self.peer_id),
-                            ),
-                        );
-                        break;
-                    }
-                }
-            } else {
-                None
-            };
-            let mut raw_body = veil_bufpool::global().acquire(body_len);
-            raw_body.as_vec_mut().resize(body_len, 0);
-            // slow-loris hardening: authenticated peer that
-            // announced a body_len and then stops sending data should not be
-            // able to pin a pool buffer + this task indefinitely. 30 s is
-            // far above the 95-th percentile body-arrival latency on any
-            // realistic link and bounds the worst-case memory exposure.
-            if header.body_len > 0 {
-                // rt_trace probe: a frame whose BODY takes whole seconds to
-                // arrive pins this loop — no dispatch, no PQ drain — for the
-                // duration. Name any oversized frame BEFORE the read and any
-                // slow body AFTER, so a live run identifies the sender and
-                // frame kind (the call-media stall investigation's probe).
-                let rt_trace_read = crate::rt_trace::rt_trace_enabled();
-                if rt_trace_read && body_len >= 128 * 1024 {
-                    self.logger.warn(
-                        "session.rt_trace.large_frame",
-                        format!(
-                            "peer_id={} family={} msg={} body_len={body_len}",
-                            hex_short(&self.peer_id),
-                            header.family,
-                            header.msg_type,
-                        ),
-                    );
-                }
-                let rt_trace_read_t0 = rt_trace_read.then(std::time::Instant::now);
-                match tokio::time::timeout(BODY_DEADLINE, read_half.read_exact(&mut raw_body[..]))
-                    .await
-                {
-                    Ok(Ok(_)) => {
-                        if let Some(t0) = rt_trace_read_t0 {
-                            let ms = t0.elapsed().as_millis();
-                            if ms >= 500 {
-                                self.logger.warn(
-                                    "session.rt_trace.slow_body_read",
-                                    format!(
-                                        "peer_id={} family={} msg={} body_len={body_len} \
-                                         read_ms={ms}",
-                                        hex_short(&self.peer_id),
-                                        header.family,
-                                        header.msg_type,
-                                    ),
-                                );
-                            }
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        self.logger.warn(
-                            "session.read_body_failed",
-                            format!(
-                                "peer_id={} body_len={} error={e}",
-                                hex_short(&self.peer_id),
-                                body_len,
-                            ),
-                        );
-                        break;
-                    }
-                    Err(_) => {
-                        self.record_violation("frame body read timeout (slow-loris)");
-                        break;
-                    }
                 }
             }
 
