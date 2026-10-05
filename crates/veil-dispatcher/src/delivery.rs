@@ -1884,7 +1884,13 @@ impl FrameDispatcher {
                     // Not a peer protocol violation: a conversation whose state
                     // the host has not restored yet, or a device of ours the
                     // frame was not addressed to, look exactly like this.
-                    self.note_decrypt_failure(envelope.sender_node_id, &format!("ratchet: {e}"));
+                    self.note_decrypt_failure(
+                        envelope.sender_node_id,
+                        &format!(
+                            "ratchet kind={}: {e}",
+                            envelope.payload.get(2).copied().unwrap_or(255)
+                        ),
+                    );
                     // The same three failures that earn a direct-session
                     // sender `AppSendUnopenable` (see `dispatch_app`). A
                     // relayed sender used to hear nothing at all, and kept
@@ -5029,6 +5035,109 @@ mod ratchet_terminal_tests {
             "one reply per interval per peer"
         );
         assert_eq!(asked.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn repeated_ratchet_payloads_neither_reset_nor_wedge_the_conversation() {
+        use veil_session::SessionTxRegistry;
+        fn dispatch_payload(
+            disp: &FrameDispatcher,
+            direct: bool,
+            id: [u8; 32],
+            payload: Vec<u8>,
+        ) -> crate::DispatchResult {
+            if direct {
+                let body = veil_proto::app::AppSendPayload {
+                    src_app_id: [0xA1; 32],
+                    app_id: APP,
+                    endpoint_id: ENDPOINT,
+                    data: veil_bufpool::pooled_shared_from_vec(payload),
+                }
+                .encode();
+                let mut hdr = veil_proto::header::FrameHeader::new(
+                    veil_proto::family::FrameFamily::App as u8,
+                    veil_proto::family::AppMsg::AppSendSealed as u16,
+                );
+                hdr.body_len = body.len() as u32;
+                disp.dispatch(&hdr, &body, NodeId::from(ALICE))
+            } else {
+                let (hdr, body) = forward_frame(id, payload);
+                disp.dispatch(&hdr, &body, NodeId::from(RELAY))
+            }
+        }
+        for (direct, restore, certificates) in [
+            (false, false, true),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+            (false, true, false),
+            (true, true, false),
+        ] {
+            let (alice, bob) = (party(ALICE, 0xA7), party(BOB, 0xB7));
+            learn(&bob, &alice);
+            learn(&alice, &bob);
+            let (mut disp, _handle, mut rx) = dispatcher_for(&bob);
+            let reg = Arc::new(RwLock::new(SessionTxRegistry::new()));
+            let mut relay_rx = reg.write().unwrap().register(RELAY);
+            disp.session_tx_registry = Some(reg);
+            let resets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = Arc::clone(&resets);
+            *disp.unopenable_signer.lock().unwrap() = Some(Arc::new(move |peer| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(fake_reply(*peer))
+            }));
+            let prologue = seal(&alice, &bob, b"first");
+            dispatch_payload(&disp, direct, [0x61; 32], prologue.clone());
+            assert_eq!(take(&mut rx).unwrap().2, b"first");
+            let answer = seal(&bob, &alice, b"answer");
+            alice
+                .runtime
+                .open_payload(&BOB, &answer, veil_util::unix_secs_now_u64())
+                .unwrap();
+            let bare = seal(&alice, &bob, b"second");
+            assert_eq!(bare[2], 1);
+            dispatch_payload(&disp, direct, [0x62; 32], bare.clone());
+            assert_eq!(take(&mut rx).unwrap().2, b"second");
+            let key = bob.runtime.store.keys()[0];
+            if restore {
+                let blob = bob.runtime.store.export(&key).unwrap();
+                bob.runtime
+                    .store
+                    .import(&key, &blob, veil_util::unix_secs_now_u64())
+                    .unwrap();
+                if !certificates {
+                    bob.runtime.peer_ratchet_keys.write().unwrap().clear();
+                }
+            }
+            let version = bob.runtime.store.version();
+            let before = bob.runtime.store.export(&key).unwrap();
+            for (index, replay) in [prologue, bare].iter().enumerate() {
+                for i in 0..9 {
+                    // Bypass carrier dedup, as alternate paths can do. The
+                    // ratchet must still reject this plaintext without reset.
+                    let result = dispatch_payload(
+                        &disp,
+                        direct,
+                        [0x70 + index as u8 * 16 + i; 32],
+                        replay.clone(),
+                    );
+                    if direct {
+                        assert!(
+                            matches!(result, crate::DispatchResult::NoResponse),
+                            "direct replay caused reset"
+                        );
+                    }
+                    assert!(take(&mut rx).is_none());
+                    assert!(relay_rx.try_recv().is_err(), "replay caused a reset reply");
+                }
+            }
+            assert_eq!(resets.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert_eq!(bob.runtime.store.version(), version);
+            assert_eq!(*bob.runtime.store.export(&key).unwrap(), *before);
+            let fresh = seal(&alice, &bob, b"still the same conversation");
+            dispatch_payload(&disp, direct, [0x9A; 32], fresh);
+            assert_eq!(take(&mut rx).unwrap().2, b"still the same conversation");
+        }
     }
 
     /// The receiving half: a relayed reply is for the ratchet and only the
