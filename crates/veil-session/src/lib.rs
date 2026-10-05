@@ -17,6 +17,7 @@
 pub mod backpressure_signal;
 pub mod battery_adjusted_keepalive;
 pub mod cover_traffic;
+mod datagram_activity;
 mod datagram_flows;
 pub mod dispatcher_sink;
 pub mod frame_diag;
