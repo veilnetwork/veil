@@ -787,10 +787,12 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
             let stats = Arc::clone(&high_stats);
             async move {
                 let lock_started = std::time::Instant::now();
-                let Some(guard) = cell.sealed.lock_while_fresh(&sender).await else {
+                let guard = cell.sealed.lock_while_fresh(&sender).await;
+                // A wait that expires must remain visible in diagnostics.
+                stats.observe_sender_lock(lock_started.elapsed());
+                let Some(guard) = guard else {
                     return true;
                 };
-                stats.observe_sender_lock(lock_started.elapsed());
                 let Some(sender) = guard.as_ref() else {
                     return false;
                 };
@@ -801,16 +803,18 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                     .local_deadline()
                     .expect("native pump retains packet deadline");
                 let result = sender
-                    .send_relay_media_sealed_on_local_lane_before_owned(
+                    .send_relay_media_sealed_on_local_lane_before_tracked_owned(
                         veil_proto::priority::REALTIME,
                         peer,
                         peer_app,
                         peer_endpoint_id,
                         cell.sealed.into_vec(),
                         deadline,
+                        Some(Arc::clone(&stats.ipc_send_failures)),
                     )
                     .await;
-                stats.observe_ipc_cell(ipc_started.elapsed(), result.is_err());
+                // Ok(false) is expired IPC admission, not a transmitted cell.
+                stats.observe_ipc_cell(ipc_started.elapsed(), !matches!(result, Ok(true)));
                 true
             }
         },
@@ -827,10 +831,11 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
             let stats = Arc::clone(&video_stats);
             async move {
                 let lock_started = std::time::Instant::now();
-                let Some(guard) = sealed.lock_while_fresh(&sender).await else {
+                let guard = sealed.lock_while_fresh(&sender).await;
+                stats.observe_sender_lock(lock_started.elapsed());
+                let Some(guard) = guard else {
                     return true;
                 };
-                stats.observe_sender_lock(lock_started.elapsed());
                 let Some(sender) = guard.as_ref() else {
                     return false;
                 };
@@ -839,16 +844,17 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                     .local_deadline()
                     .expect("native pump retains packet deadline");
                 let result = sender
-                    .send_relay_media_sealed_on_local_lane_before_owned(
+                    .send_relay_media_sealed_on_local_lane_before_tracked_owned(
                         veil_proto::priority::BULK,
                         peer,
                         peer_app,
                         peer_endpoint_id,
                         sealed.into_vec(),
                         deadline,
+                        Some(Arc::clone(&stats.ipc_send_failures)),
                     )
                     .await;
-                stats.observe_ipc_cell(ipc_started.elapsed(), result.is_err());
+                stats.observe_ipc_cell(ipc_started.elapsed(), !matches!(result, Ok(true)));
                 true
             }
         },
@@ -1500,7 +1506,7 @@ struct RelayMediaStats {
     video_frame_ipc_holds_33ms: std::sync::atomic::AtomicU64,
     ipc_cell_max_ms: std::sync::atomic::AtomicU64,
     ipc_cell_holds_16ms: std::sync::atomic::AtomicU64,
-    ipc_send_failures: std::sync::atomic::AtomicU64,
+    ipc_send_failures: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[cfg(feature = "node-embedded")]
