@@ -130,6 +130,8 @@ pub(crate) const FRAME_TX_CAPACITY: usize = 1024;
 pub(crate) struct IpcWriterFrame {
     bytes: Vec<u8>,
     deadline: Option<tokio::time::Instant>,
+    // Process-local diagnostics only; never serialized into IPC/network bytes.
+    prewrite_expirations: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl From<Vec<u8>> for IpcWriterFrame {
@@ -137,6 +139,7 @@ impl From<Vec<u8>> for IpcWriterFrame {
         Self {
             bytes,
             deadline: None,
+            prewrite_expirations: None,
         }
     }
 }
@@ -205,7 +208,7 @@ impl SharedWriter {
         hdr.set_priority(local_priority.min(3));
         let mut frame = codec::encode_header(&hdr).to_vec();
         frame.extend_from_slice(body);
-        self.enqueue(frame, deadline).await
+        self.enqueue(frame, deadline, None).await
     }
 
     /// Cancel only the capacity reservation. Once queued, the writer either
@@ -214,6 +217,7 @@ impl SharedWriter {
         &self,
         bytes: Vec<u8>,
         deadline: Option<tokio::time::Instant>,
+        prewrite_expirations: Option<Arc<std::sync::atomic::AtomicU64>>,
     ) -> Result<bool, ClientError> {
         if let Some(at) = deadline {
             if tokio::time::Instant::now() >= at {
@@ -226,7 +230,11 @@ impl SharedWriter {
             if tokio::time::Instant::now() >= at {
                 return Ok(false);
             }
-            permit.send(IpcWriterFrame { bytes, deadline });
+            permit.send(IpcWriterFrame {
+                bytes,
+                deadline,
+                prewrite_expirations,
+            });
         } else {
             self.tx
                 .send(bytes.into())
@@ -347,6 +355,7 @@ impl SharedWriter {
             flags,
             data,
             None,
+            None,
         )
         .await
         .map(|_| ())
@@ -373,6 +382,7 @@ impl SharedWriter {
             flags,
             data,
             None,
+            None,
         )
         .await
         .map(|_| ())
@@ -389,6 +399,7 @@ impl SharedWriter {
         flags: u32,
         data: &[u8],
         deadline: tokio::time::Instant,
+        prewrite_expirations: Option<Arc<std::sync::atomic::AtomicU64>>,
     ) -> Result<bool, ClientError> {
         self.write_app_ipc_send_with_queue_hint_owned(
             local_priority,
@@ -400,6 +411,7 @@ impl SharedWriter {
             flags,
             data,
             Some(deadline),
+            prewrite_expirations,
         )
         .await
     }
@@ -416,6 +428,7 @@ impl SharedWriter {
         flags: u32,
         data: &[u8],
         deadline: Option<tokio::time::Instant>,
+        prewrite_expirations: Option<Arc<std::sync::atomic::AtomicU64>>,
     ) -> Result<bool, ClientError> {
         use veil_proto::header::HEADER_SIZE;
         const FIXED_SIZE: usize = 32 + 32 + 32 + 4 + 4 + 4; // matches AppIpcSendPayload::FIXED_SIZE
@@ -445,7 +458,7 @@ impl SharedWriter {
 
         debug_assert_eq!(frame.len(), total, "single-buffer encode size mismatch");
 
-        self.enqueue(frame, deadline).await
+        self.enqueue(frame, deadline, prewrite_expirations).await
     }
 
     /// Reply-channel-aware `APP_IPC_SEND` encoder: like
@@ -574,6 +587,9 @@ pub(crate) async fn run_writer_task<W: tokio::io::AsyncWrite + Unpin>(
             if f.deadline
                 .is_some_and(|at| tokio::time::Instant::now() >= at)
             {
+                if let Some(counter) = &f.prewrite_expirations {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 continue;
             }
             // Do not apply the producer deadline to an in-progress write:
