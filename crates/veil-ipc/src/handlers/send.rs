@@ -1741,6 +1741,16 @@ pub(crate) async fn handle_ipc_send(
                         },
                         fwd_frame.clone(),
                     );
+                    if relay_media_sealed {
+                        crate::route_trace::observe(
+                            *local_node_id,
+                            send.dst_node_id,
+                            ctx.local_priority,
+                            next_hop,
+                            relayed,
+                            reg.has_datagram_transport(&next_hop),
+                        );
+                    }
                     if relayed {
                         // Bounded origin fan-out for lifecycle controls and
                         // small primary cells. ACK-mode keeps its existing
