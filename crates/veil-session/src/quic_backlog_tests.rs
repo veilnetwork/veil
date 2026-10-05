@@ -1097,3 +1097,429 @@ async fn prepared_primary_expires_stale_packets_after_neutral_udp_loss() {
         fresh.max_post_age
     );
 }
+
+struct BoundTestLane {
+    tx: QuicDatagramHandle,
+    rx: QuicDatagramHandle,
+    tx_cipher: crate::datagram_flows::SessionDatagramTx,
+    rx_cipher: crate::datagram_flows::SessionDatagramRx,
+    _tx_stream: veil_transport::BoxIoStream,
+    _rx_stream: veil_transport::BoxIoStream,
+}
+
+async fn bind_test_lane(
+    local: &veil_transport::QuicParallelHandle,
+    remote: &veil_transport::QuicParallelHandle,
+    local_parent: &crate::parallel_binding::ParallelParent,
+    remote_parent: &crate::parallel_binding::ParallelParent,
+) -> BoundTestLane {
+    use crate::parallel_binding::HELLO_BYTES;
+    let remote = remote.clone();
+    let remote_parent = remote_parent.handle();
+    let accept = tokio::spawn(async move {
+        let connection = remote.accept().await.unwrap();
+        let datagrams = connection.quic_datagrams().unwrap();
+        let exporter = datagrams.channel_binding().unwrap();
+        let mut stream = connection.into_stream().unwrap();
+        let mut hello = [0; HELLO_BYTES];
+        stream.read_exact(&mut hello).await.unwrap();
+        let (ack, keys) = remote_parent.accept(&hello, exporter).unwrap();
+        stream.write_all(&ack).await.unwrap();
+        (datagrams, stream, keys)
+    });
+    let connection = local.connect().await.unwrap();
+    let tx = connection.quic_datagrams().unwrap();
+    let (hello, pending) = local_parent.begin(tx.channel_binding().unwrap()).unwrap();
+    let mut tx_stream = connection.into_stream().unwrap();
+    tx_stream.write_all(&hello).await.unwrap();
+    let mut ack = [0; 32];
+    tx_stream.read_exact(&mut ack).await.unwrap();
+    let tx_keys = pending.finish(&ack).unwrap();
+    let (rx, rx_stream, rx_keys) = accept.await.unwrap();
+    assert_eq!(tx_keys.session_id, rx_keys.session_id);
+    assert!(tx_keys.tx_key() == rx_keys.rx_key());
+    BoundTestLane {
+        tx,
+        rx,
+        tx_cipher: crate::datagram_flows::SessionDatagramTx::new(
+            tx_keys.tx_key(),
+            &tx_keys.session_id,
+            true,
+        ),
+        rx_cipher: crate::datagram_flows::SessionDatagramRx::new(
+            rx_keys.rx_key(),
+            &rx_keys.session_id,
+            true,
+        ),
+        _tx_stream: tx_stream,
+        _rx_stream: rx_stream,
+    }
+}
+
+fn primary_test_frame(large: bool, seq: u32, sent_us: u64) -> Vec<u8> {
+    use veil_proto::{
+        app::AppRtDataPayload,
+        family::{AppMsg, FrameFamily},
+        header::{FrameHeader, HEADER_SIZE},
+    };
+    if large {
+        let mut frame = circuit_frame(1, 0x11);
+        frame[HEADER_SIZE + 4..HEADER_SIZE + 8].copy_from_slice(&seq.to_be_bytes());
+        frame[HEADER_SIZE + 10..HEADER_SIZE + 18].copy_from_slice(&sent_us.to_be_bytes());
+        frame
+    } else {
+        let body = AppRtDataPayload {
+            src_app_id: [1; 32],
+            app_id: [2; 32],
+            endpoint_id: 1,
+            seq,
+            timestamp_us: sent_us,
+            marker: 0,
+            payload_type: 111,
+            payload: vec![0x11; 128],
+        }
+        .encode();
+        let mut header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppRtData as u16);
+        header.set_priority(veil_proto::priority::REALTIME);
+        header.body_len = body.len() as u32;
+        let mut frame = veil_proto::encode_header(&header).to_vec();
+        frame.extend_from_slice(&body);
+        frame
+    }
+}
+
+#[derive(Debug)]
+struct IndependentLoadReport {
+    large_primary: bool,
+    loaded: bool,
+    primary_sent: usize,
+    primary_received: usize,
+    primary_duplicates: usize,
+    primary_p95_ms: f64,
+    primary_max_age_ms: f64,
+    primary_max_gap_ms: f64,
+    secondary_sent: usize,
+    secondary_received: u64,
+    secondary_dropped: usize,
+    file_bytes: u64,
+    file_accepted: u64,
+    neutral_drops: u64,
+}
+
+async fn measure_bound_independent_load(
+    large_primary: bool,
+    loaded: bool,
+) -> IndependentLoadReport {
+    use crate::parallel_binding::ParallelParent;
+    use std::collections::HashSet;
+    use veil_proto::{
+        app::AppRtDataPayload,
+        header::HEADER_SIZE,
+        priority::{BULK, REALTIME},
+    };
+    let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let link = NeutralLink::new(
+        left.local_addr().unwrap(),
+        right.local_addr().unwrap(),
+        1_000_000,
+        Duration::from_millis(20),
+    )
+    .await;
+    link.enabled.store(true, Ordering::Relaxed);
+    let context = Arc::new(TransportContext::for_debug().unwrap());
+    let remote_context = Arc::clone(&context);
+    let remote_addr = link.right_addr;
+    let remote = tokio::spawn(promote_punched_quic(
+        right,
+        remote_addr,
+        remote_context,
+        PunchedQuicRole::Responder,
+    ));
+    let local = promote_punched_quic(left, link.left_addr, context, PunchedQuicRole::Initiator)
+        .await
+        .unwrap();
+    let close = local.quic_connection().unwrap();
+    let local_handle = local.parallel_quic().unwrap();
+    let canonical = local.quic_datagrams().unwrap();
+    let mut local_stream = local.into_stream().unwrap();
+    local_stream.write_all(b"stand").await.unwrap();
+    let remote = remote.await.unwrap().unwrap();
+    let remote_handle = remote.parallel_quic().unwrap();
+    let mut remote_stream = remote.into_stream().unwrap();
+    let mut prefix = [0; 5];
+    remote_stream.read_exact(&mut prefix).await.unwrap();
+    assert_eq!(&prefix, b"stand");
+    // Credentials stand in for a previously authenticated canonical session.
+    // This test verifies exporter-bound child activation, not identity mining.
+    let local_parent = ParallelParent::new([1; 32], [2; 32], [3; 32]);
+    let remote_parent = ParallelParent::new([1; 32], [3; 32], [2; 32]);
+    let mut primary =
+        bind_test_lane(&local_handle, &remote_handle, &local_parent, &remote_parent).await;
+    let mut secondary =
+        bind_test_lane(&local_handle, &remote_handle, &local_parent, &remote_parent).await;
+    assert!(primary.tx.channel_binding().unwrap() != secondary.tx.channel_binding().unwrap());
+    assert!(primary.tx.channel_binding().unwrap() != canonical.channel_binding().unwrap());
+    let mut admission = super::local_reliable_admission::LocalReliableAdmission::new(canonical);
+    let fixture = primary_test_frame(large_primary, 0, 0);
+    admission.observe(REALTIME, &fixture, std::time::Instant::now(), true);
+    sleep(Duration::from_millis(100)).await;
+    let started = Instant::now();
+    let file_bytes = Arc::new(AtomicU64::new(0));
+    let file_accepted = Arc::new(AtomicU64::new(0));
+    let file_rx = Arc::clone(&file_bytes);
+    let file_tx = Arc::clone(&file_accepted);
+    let file_reader = tokio::spawn(async move {
+        let mut bytes = [0; 16384];
+        while let Ok(len) = remote_stream.read(&mut bytes).await {
+            if len == 0 {
+                return;
+            }
+            assert!(bytes[..len].iter().all(|byte| *byte == 0xb2));
+            file_rx.fetch_add(len as u64, Ordering::Relaxed);
+        }
+    });
+    let file_writer = tokio::spawn(async move {
+        if loaded {
+            sleep_until(started + Duration::from_secs(2)).await;
+            let bytes = vec![0xb2; 4 * 1024 * 1024];
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let len = local_stream.write(&bytes[offset..]).await.unwrap();
+                offset += len;
+                file_tx.fetch_add(len as u64, Ordering::Relaxed);
+            }
+        }
+        std::future::pending::<()>().await;
+        drop(local_stream);
+    });
+    let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+    let primary_rx = primary.rx.clone();
+    let mut primary_cipher_rx = primary.rx_cipher;
+    let primary_reader = tokio::spawn(async move {
+        while let Ok(packet) = primary_rx.recv().await {
+            if let Some(frame) = primary_cipher_rx
+                .decode_datagram(&packet, std::time::Instant::now())
+                .unwrap()
+            {
+                let (seq, timestamp) = if large_primary {
+                    let cell = veil_anonymity::circuit_wire::CircuitDataPayload::decode(
+                        &frame[HEADER_SIZE..],
+                    )
+                    .unwrap();
+                    assert_eq!(cell.circuit_id, 1);
+                    assert!(cell.ciphertext[8..].iter().all(|byte| *byte == 0x11));
+                    (
+                        cell.seq,
+                        u64::from_be_bytes(cell.ciphertext[..8].try_into().unwrap()),
+                    )
+                } else {
+                    let rt = AppRtDataPayload::decode(&frame[HEADER_SIZE..]).unwrap();
+                    assert_eq!(rt.payload, vec![0x11; 128]);
+                    (rt.seq, rt.timestamp_us)
+                };
+                if observed_tx
+                    .send((seq, timestamp, started.elapsed()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
+    let secondary_received = Arc::new(AtomicU64::new(0));
+    let secondary_count = Arc::clone(&secondary_received);
+    let secondary_rx = secondary.rx.clone();
+    let mut secondary_cipher_rx = secondary.rx_cipher;
+    let secondary_reader = tokio::spawn(async move {
+        while let Ok(packet) = secondary_rx.recv().await {
+            if let Some(frame) = secondary_cipher_rx
+                .decode_datagram(&packet, std::time::Instant::now())
+                .unwrap()
+            {
+                let cell =
+                    veil_anonymity::circuit_wire::CircuitDataPayload::decode(&frame[HEADER_SIZE..])
+                        .unwrap();
+                assert_eq!(cell.circuit_id, 2);
+                assert!(cell.ciphertext.iter().all(|byte| *byte == 0x22));
+                secondary_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+    let mut primary_sent = 0;
+    let mut secondary_sent = 0;
+    let mut secondary_dropped = 0;
+    for tick in 0u32..1200 {
+        sleep_until(started + Duration::from_millis(u64::from(tick) * 10)).await;
+        if tick % 2 == 0 {
+            let seq = tick / 2;
+            let frame =
+                primary_test_frame(large_primary, seq, started.elapsed().as_micros() as u64);
+            let now = std::time::Instant::now();
+            admission.observe_primary_path(&primary.tx, now);
+            admission.observe(REALTIME, &frame, now, true);
+            let packets = primary
+                .tx_cipher
+                .encode_frame(u64::from(REALTIME), &frame, primary.tx.max_size().unwrap())
+                .unwrap();
+            if super::local_primary_datagram_fits(
+                packets.iter().map(Vec::len).sum(),
+                primary.tx.send_buffer_space(),
+            ) {
+                let deadline =
+                    super::local_primary_datagram_expiry(REALTIME, true, std::time::Instant::now())
+                        .unwrap();
+                for packet in packets {
+                    primary.tx.send_before(&packet, deadline).unwrap();
+                }
+                if tick >= 200 {
+                    primary_sent += 1;
+                }
+            }
+        }
+        // Interleaved neutral traffic cannot select or reset the local gate.
+        for priority in [
+            veil_proto::priority::INTERACTIVE,
+            REALTIME,
+            veil_proto::priority::BACKGROUND,
+        ] {
+            assert!(admission.allow_secondary(priority, std::time::Instant::now()));
+        }
+        if loaded && tick >= 200 {
+            let frame = circuit_frame(2, 0x22);
+            let packets = secondary
+                .tx_cipher
+                .encode_frame(u64::from(BULK), &frame, secondary.tx.max_size().unwrap())
+                .unwrap();
+            if admission.allow_secondary(BULK, std::time::Instant::now())
+                && super::local_datagram_fits(
+                    BULK,
+                    packets.iter().map(Vec::len).sum(),
+                    secondary.tx.send_buffer_space(),
+                )
+            {
+                for packet in packets {
+                    secondary.tx.send(&packet).unwrap();
+                }
+                secondary_sent += 1;
+            } else {
+                secondary_dropped += 1;
+            }
+        }
+    }
+    sleep(Duration::from_millis(400)).await;
+    // Close before evaluating quality so a failed assertion cannot strand
+    // child transports, blocked writes or stand reader tasks.
+    close.close(0u32.into(), b"independent stand complete");
+    let tasks = [file_reader, file_writer, primary_reader, secondary_reader];
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        match task.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => panic!("independent stand worker failed: {error}"),
+        }
+    }
+    let mut ages = Vec::new();
+    let mut previous = None;
+    let mut max_gap = Duration::ZERO;
+    let mut seen = HashSet::new();
+    let mut duplicates = 0;
+    while let Ok((seq, timestamp, arrived)) = observed_rx.try_recv() {
+        if seq < 100 {
+            continue;
+        }
+        if !seen.insert(seq) {
+            duplicates += 1;
+        }
+        ages.push(
+            arrived
+                .saturating_sub(Duration::from_micros(timestamp))
+                .as_secs_f64()
+                * 1000.0,
+        );
+        max_gap = max_gap.max(arrived - previous.unwrap_or(Duration::from_secs(2)));
+        previous = Some(arrived);
+    }
+    max_gap = max_gap
+        .max(Duration::from_secs(12).saturating_sub(previous.unwrap_or(Duration::from_secs(2))));
+    ages.sort_by(f64::total_cmp);
+    let report = IndependentLoadReport {
+        large_primary,
+        loaded,
+        primary_sent,
+        primary_received: ages.len(),
+        primary_duplicates: duplicates,
+        primary_p95_ms: ages
+            .get((ages.len() * 95 / 100).min(ages.len().saturating_sub(1)))
+            .copied()
+            .unwrap_or(f64::INFINITY),
+        primary_max_age_ms: ages.last().copied().unwrap_or(f64::INFINITY),
+        primary_max_gap_ms: max_gap.as_secs_f64() * 1000.0,
+        secondary_sent,
+        secondary_received: secondary_received.load(Ordering::Relaxed),
+        secondary_dropped,
+        file_bytes: file_bytes.load(Ordering::Relaxed),
+        file_accepted: file_accepted.load(Ordering::Relaxed),
+        neutral_drops: link.dropped.load(Ordering::Relaxed),
+    };
+    eprintln!(
+        "bound_independent large_primary={} loaded={} primary_sent={} primary_received={} duplicates={} primary_p95_ms={} primary_max_age_ms={} primary_max_gap_ms={} secondary_sent={} secondary_received={} secondary_dropped={} file_bytes={} file_accepted={} neutral_drops={}",
+        report.large_primary,
+        report.loaded,
+        report.primary_sent,
+        report.primary_received,
+        report.primary_duplicates,
+        report.primary_p95_ms,
+        report.primary_max_age_ms,
+        report.primary_max_gap_ms,
+        report.secondary_sent,
+        report.secondary_received,
+        report.secondary_dropped,
+        report.file_bytes,
+        report.file_accepted,
+        report.neutral_drops
+    );
+    report
+}
+
+#[tokio::test]
+#[ignore = "Manual exporter-bound independent connection load characterization"]
+async fn characterize_bound_independent_primary_under_secondary_and_file_load() {
+    for large in [false, true] {
+        for loaded in [false, true] {
+            let report = measure_bound_independent_load(large, loaded).await;
+            assert_eq!(report.primary_duplicates, 0);
+            assert!(report.primary_received > 0);
+            if loaded {
+                assert!(report.secondary_received > 0 && report.file_bytes > 0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn bound_independent_primary_survives_competing_endpoint_producers() {
+    let report = measure_bound_independent_load(true, true).await;
+    // The denominator is all 500 source attempts, including local admission
+    // drops; counting only accepted frames would hide primary starvation.
+    assert!(
+        report.primary_received >= 450,
+        "primary starvation: {report:?}"
+    );
+    assert!(
+        report.primary_p95_ms < 350.0,
+        "sustained queue delay: {report:?}"
+    );
+    assert!(
+        report.primary_max_gap_ms < 300.0,
+        "primary freeze: {report:?}"
+    );
+    assert_eq!(report.primary_duplicates, 0);
+    assert!(
+        report.secondary_received > 0 && report.file_bytes >= 16 * 1024,
+        "competing producers made no progress: {report:?}"
+    );
+}
