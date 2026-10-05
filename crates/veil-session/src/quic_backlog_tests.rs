@@ -1923,3 +1923,6 @@ impl tokio::io::AsyncWrite for ObservedControlStream {
         std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
+
+#[path = "primary_recovery_quic_tests.rs"]
+mod primary_recovery_quic_tests;

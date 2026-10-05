@@ -3,6 +3,8 @@
 use super::*;
 use crate::parallel_binding::{HELLO_BYTES, ParallelKeys, ParallelParent, ParallelParentHandle};
 
+#[path = "primary_recovery.rs"]
+mod primary_recovery;
 #[path = "parallel_registry.rs"]
 mod registry;
 pub use registry::{ParallelPeekOutcome, ParallelRegistry};
@@ -25,6 +27,8 @@ pub struct ParallelDiagnostics {
     rekeys: AtomicU64,
     active: AtomicUsize,
     replies: AtomicU64,
+    recovery_attempts: AtomicU64,
+    recovery_switches: AtomicU64,
 }
 
 impl ParallelDiagnostics {
@@ -58,6 +62,13 @@ impl ParallelDiagnostics {
             .iter()
             .filter(|counter| counter.load(Ordering::Relaxed) != 0)
             .count()
+    }
+
+    pub fn recovery_attempts(&self) -> u64 {
+        self.recovery_attempts.load(Ordering::Acquire)
+    }
+    pub fn recovery_switches(&self) -> u64 {
+        self.recovery_switches.load(Ordering::Acquire)
     }
 
     pub fn replies(&self) -> u64 {
@@ -169,6 +180,7 @@ struct Slot {
         RealtimeReceiverTask,
     )>,
     retry_after: Option<std::time::Instant>,
+    replacing: bool,
 }
 
 async fn connect_sender(
@@ -374,7 +386,23 @@ fn spawn_acceptor(
 ) -> RealtimeReceiverTask {
     RealtimeReceiverTask(tokio::spawn(async move {
         let mut children = tokio::task::JoinSet::new();
+        let mut accepts = tokio::task::JoinSet::new();
         loop {
+            // Two generic handshakes can progress independently. The shared
+            // transport's eight-connection quota still bounds live children.
+            // No producer role is inspected by this receiver.
+            if offer.handle.has_exclusive_accept() {
+                while accepts.len() < 2 {
+                    let handle = offer.handle.clone();
+                    accepts.spawn(async move {
+                        let result = handle.accept().await;
+                        if result.is_err() {
+                            tokio::time::sleep(RETRY_DELAY).await;
+                        }
+                        result
+                    });
+                }
+            }
             tokio::select! {
                 _ = children.join_next(), if !children.is_empty() => {},
                 Some(mut child) = incoming.recv() => {
@@ -393,14 +421,10 @@ fn spawn_acceptor(
                         receive_authenticated(child.channel, child.keys, child.parent, context, duplex).await;
                     });
                 },
-                accepted = offer.handle.accept(), if offer.handle.has_exclusive_accept() => {
-                    match accepted {
-                        Ok(connection) => {
-                            if let Ok(channel) = Channel::new(connection, Arc::clone(&offer.diagnostics)) {
-                                children.spawn(receive_child(channel, parent.clone(), context.clone(), offer.duplex));
-                            }
-                        }
-                        Err(_) => tokio::time::sleep(RETRY_DELAY).await,
+                Some(accepted) = accepts.join_next(), if !accepts.is_empty() => {
+                    if let Ok(Ok(connection)) = accepted
+                        && let Ok(channel) = Channel::new(connection, Arc::clone(&offer.diagnostics)) {
+                        children.spawn(receive_child(channel, parent.clone(), context.clone(), offer.duplex));
                     }
                 },
                 // A full registry or missing shared dispatcher leaves the
@@ -420,6 +444,7 @@ pub(super) struct ParallelSession {
     _registration: Option<registry::Registration>,
     slots: [Slot; TOTAL_SLOTS],
     transit_salt: [u8; 32],
+    primary_recovery: primary_recovery::PrimaryRecovery,
 }
 
 impl ParallelSession {
@@ -450,6 +475,7 @@ impl ParallelSession {
             _registration: registration,
             slots: Default::default(),
             transit_salt: blake3::derive_key("veil/transit-shard/v1", &sid),
+            primary_recovery: Default::default(),
         }
     }
 
@@ -492,6 +518,11 @@ impl ParallelSession {
         body: &[u8],
         kind: RealtimeLaneFrameKind,
     ) -> Option<usize> {
+        // Only a locally selected primary frame can request replacement.
+        // Neutral transit and the secondary/background producers cannot do so.
+        if priority == veil_proto::priority::REALTIME {
+            self.recover_primary(std::time::Instant::now());
+        }
         let index = channel_index(priority).or_else(|| {
             (self.offer.duplex
                 && priority == veil_proto::priority::INTERACTIVE
@@ -514,11 +545,30 @@ impl ParallelSession {
         if let Some((rx, _)) = slot.warm.as_mut() {
             match rx.try_recv() {
                 Ok(ready) => {
+                    // connect_sender verified the live parent's exporter-bound
+                    // ACK before returning ReadySender. Drop the old channel
+                    // only now; a failed candidate never displaces it.
                     slot.ready = Some(ready);
                     slot.warm = None;
+                    if std::mem::take(&mut slot.replacing) {
+                        self.offer
+                            .diagnostics
+                            .recovery_switches
+                            .fetch_add(1, Ordering::AcqRel);
+                        self.primary_recovery.reset();
+                        self.context.logger.info(
+                            "session.parallel.recovery_switched",
+                            format!(
+                                "peer_id={} local_slot={}",
+                                hex_short(&self.context.peer_id),
+                                veil_proto::priority::REALTIME
+                            ),
+                        );
+                    }
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                     slot.warm = None;
+                    slot.replacing = false;
                     slot.retry_after = Some(std::time::Instant::now() + RETRY_DELAY);
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
@@ -538,27 +588,74 @@ impl ParallelSession {
                 .retry_after
                 .is_none_or(|deadline| std::time::Instant::now() >= deadline)
         {
-            let offer = self.offer.clone();
-            let parent = self.parent.handle();
-            let context = self.context.clone();
-            let status = self.readiness.as_ref().map(|lease| lease.status());
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let task = RealtimeReceiverTask(tokio::spawn(async move {
-                if let Ok(Ok(ready)) = tokio::time::timeout(
-                    BIND_TIMEOUT,
-                    connect_sender(offer, parent, index, context),
-                )
-                .await
-                {
-                    let _ = tx.send(ready);
-                }
-                if let Some(status) = status {
-                    status.wake();
-                }
-            }));
-            slot.warm = Some((rx, task));
+            self.start_warm(index);
         }
         false
+    }
+
+    fn start_warm(&mut self, index: usize) {
+        let offer = self.offer.clone();
+        let parent = self.parent.handle();
+        let context = self.context.clone();
+        let status = self.readiness.as_ref().map(|lease| lease.status());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = RealtimeReceiverTask(tokio::spawn(async move {
+            if let Ok(Ok(ready)) =
+                tokio::time::timeout(BIND_TIMEOUT, connect_sender(offer, parent, index, context))
+                    .await
+            {
+                let _ = tx.send(ready);
+            }
+            if let Some(status) = status {
+                status.wake();
+            }
+        }));
+        self.slots[index].warm = Some((rx, task));
+    }
+
+    fn recover_primary(&mut self, now: std::time::Instant) {
+        use primary_recovery::Action;
+        let index = channel_index(veil_proto::priority::REALTIME).unwrap();
+        let slot = &mut self.slots[index];
+        let Some(ready) = &slot.ready else {
+            self.primary_recovery.reset();
+            return;
+        };
+        let stats = {
+            let sender = lock!(ready.sender);
+            if sender.broken {
+                return;
+            }
+            sender.handle.path_stats()
+        };
+        match self.primary_recovery.observe(stats, now) {
+            Action::Progress if slot.replacing => {
+                // The old channel recovered while proof was pending. Reap the
+                // redundant task/channel instead of churning a healthy sender.
+                slot.warm = None;
+                slot.replacing = false;
+            }
+            Action::Probe if slot.warm.is_none() => {
+                self.primary_recovery.attempted(now);
+                slot.replacing = true;
+                self.offer
+                    .diagnostics
+                    .recovery_attempts
+                    .fetch_add(1, Ordering::AcqRel);
+                self.context.logger.info(
+                    "session.parallel.recovery_started",
+                    format!(
+                        "peer_id={} local_slot={} pto_count={} expired={}",
+                        hex_short(&self.context.peer_id),
+                        veil_proto::priority::REALTIME,
+                        stats.pto_count,
+                        stats.expired_outgoing_datagrams
+                    ),
+                );
+                self.start_warm(index);
+            }
+            _ => {}
+        }
     }
 
     pub(super) fn sender(&self, index: usize) -> std::sync::MutexGuard<'_, RealtimeSender> {
