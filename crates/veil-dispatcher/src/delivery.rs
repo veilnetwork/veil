@@ -4734,6 +4734,83 @@ mod ratchet_terminal_tests {
         assert_eq!(take(&mut rx).expect("delivered").2, b"third");
     }
 
+    #[test]
+    fn a_restored_relay_conversation_opens_before_device_certificates_are_resolved() {
+        const PHYSICAL: [u8; 32] = [0xD7; 32];
+        for certified in [false, true] {
+            let (alice, bob) = (party(ALICE, 0xA7), party(BOB, 0xB7));
+            if certified {
+                learn(&bob, &alice);
+            }
+            let first = seal(&alice, &bob, b"before restart");
+            bob.runtime
+                .open_payload(&ALICE, &first, veil_util::unix_secs_now_u64())
+                .unwrap();
+            let answer = seal(&bob, &alice, b"answer");
+            alice
+                .runtime
+                .open_payload(&BOB, &answer, veil_util::unix_secs_now_u64())
+                .unwrap();
+            let bare = seal(&alice, &bob, b"after restart");
+            assert_eq!(bare[2], 1);
+            let key = bob.runtime.store.keys()[0];
+            let blob = bob.runtime.store.export(&key).unwrap();
+            bob.runtime.store.forget(&key);
+            bob.runtime
+                .store
+                .import(&key, &blob, veil_util::unix_secs_now_u64())
+                .unwrap();
+            wlock!(bob.runtime.peer_ratchet_keys).clear();
+            let now = veil_util::unix_secs_now_u64();
+            assert_eq!(
+                bob.runtime.peer_identity_for_payload(&bare, now),
+                Some(ALICE)
+            );
+
+            let (disp, _h, mut rx) = dispatcher_for(&bob);
+            let (hdr, body) = forward_frame([0xDA; 32], bare.clone());
+            let mut forward = veil_proto::delivery::ForwardPayload::decode(&body).unwrap();
+            forward.envelope.sender_node_id = PHYSICAL;
+            let good = forward.envelope.payload.clone();
+            *forward.envelope.payload.last_mut().unwrap() ^= 1;
+            disp.dispatch(&hdr, &forward.encode(), NodeId::from(RELAY));
+            assert!(
+                take(&mut rx).is_none(),
+                "the restored context cannot authenticate a forgery"
+            );
+            forward.envelope.payload = good;
+            forward.envelope.content_id = [0xDC; 32];
+            disp.dispatch(&hdr, &forward.encode(), NodeId::from(RELAY));
+            let AppMessage::Deliver {
+                src_node_id,
+                provenance,
+                origin_device,
+                data,
+                ..
+            } = rx
+                .try_recv()
+                .expect("resumed bare frame must open before certificate warmup")
+            else {
+                panic!("expected Deliver")
+            };
+            assert_eq!(src_node_id, ALICE);
+            assert_eq!(data.as_ref(), b"after restart");
+            // Bob's outbound answer resolved Alice's certificate through seal_for
+            // even when no receive-side certificate was cached beforehand.
+            assert_eq!(provenance, SenderProvenance::Signed);
+            assert_eq!(
+                origin_device, None,
+                "neither the outer claim nor the context proves a device"
+            );
+            assert_eq!(rlock!(disp.route_cache).lookup(&ALICE), None);
+
+            let mut ambiguous = key;
+            ambiguous.peer_node_id = [0xDB; 32];
+            bob.runtime.store.import(&ambiguous, &blob, now).unwrap();
+            assert_eq!(bob.runtime.peer_identity_for_payload(&bare, now), None);
+        }
+    }
+
     /// The anonymous path is STANDARD traffic, not an attack, and gating it
     /// behind the ratchet would have broken it. A meta-E2E envelope must still
     /// open, and must still arrive anonymous — a named ratchet conversation is
