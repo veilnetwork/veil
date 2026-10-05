@@ -43,6 +43,26 @@ async fn full_ipc_admission_expires_media_without_consuming_reliable_capacity() 
         .unwrap();
     let at = tokio::time::Instant::now() + Duration::from_millis(200);
     assert!(!direct(&sender, 1, at).await);
+    let expirations = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    assert!(
+        !sender
+            .send_relay_media_sealed_on_local_lane_before_tracked_owned(
+                0,
+                [8; 32],
+                [9; 32],
+                10,
+                b"admission expired".to_vec(),
+                tokio::time::Instant::now() + Duration::from_millis(200),
+                Some(Arc::clone(&expirations)),
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        expirations.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "admission failure is reported to the caller, not counted twice"
+    );
     assert_eq!(rx.len(), 1, "media cannot displace reliable admission");
     let frame = rx.recv().await.unwrap();
     assert_eq!(
@@ -91,6 +111,7 @@ async fn full_ipc_admission_expires_media_without_consuming_reliable_capacity() 
 /// reliable data, fresh direct/relay media, FIFO and clean EOF.
 #[tokio::test(start_paused = true)]
 async fn ipc_recovery_finishes_partial_frames_and_sheds_only_unstarted_expired_media() {
+    let expirations = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (tx, rx) = mpsc::channel::<IpcWriterFrame>(16);
     let writer = SharedWriter::new(tx);
     let sender = sender(writer.clone());
@@ -99,13 +120,14 @@ async fn ipc_recovery_finishes_partial_frames_and_sheds_only_unstarted_expired_m
     assert!(direct(&sender, 2, at).await);
     assert!(
         sender
-            .send_relay_media_sealed_on_local_lane_before_owned(
+            .send_relay_media_sealed_on_local_lane_before_tracked_owned(
                 2,
                 [8; 32],
                 [9; 32],
                 10,
                 b"stale sealed cell".to_vec(),
                 at,
+                Some(Arc::clone(&expirations)),
             )
             .await
             .unwrap()
@@ -124,13 +146,14 @@ async fn ipc_recovery_finishes_partial_frames_and_sheds_only_unstarted_expired_m
     assert!(direct(&sender, 3, fresh_at).await);
     assert!(
         sender
-            .send_relay_media_sealed_on_local_lane_before_owned(
+            .send_relay_media_sealed_on_local_lane_before_tracked_owned(
                 2,
                 [8; 32],
                 [9; 32],
                 10,
                 b"fresh sealed cell".to_vec(),
                 fresh_at,
+                Some(Arc::clone(&expirations)),
             )
             .await
             .unwrap()
@@ -152,6 +175,11 @@ async fn ipc_recovery_finishes_partial_frames_and_sheds_only_unstarted_expired_m
         bytes.drain(..end);
     }
     assert_eq!(frames.len(), 4, "stale SDK media was replayed");
+    assert_eq!(
+        expirations.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "only the tracked, admitted-but-expired relay cell is counted"
+    );
     for (index, seq) in [(0, 1), (2, 3)] {
         assert_eq!(frames[index].0.msg_type, LocalAppMsg::AppRtSend as u16);
         let data = AppIpcRtSendPayload::decode(&frames[index].1).unwrap();

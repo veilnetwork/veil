@@ -867,6 +867,33 @@ impl AppSender {
         data: Vec<u8>,
         deadline: tokio::time::Instant,
     ) -> Result<bool, ClientError> {
+        self.send_relay_media_sealed_on_local_lane_before_tracked_owned(
+            local_priority,
+            dst_node_id,
+            dst_app_id,
+            dst_endpoint_id,
+            data,
+            deadline,
+            None,
+        )
+        .await
+    }
+
+    /// As above, with an optional process-local counter of frames discarded
+    /// by the IPC writer after successful queue admission. Admission expiry is
+    /// still reported as Ok(false) and is not counted here. A started frame is
+    /// completed even after its deadline; its expiry is not counted either.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_relay_media_sealed_on_local_lane_before_tracked_owned(
+        &self,
+        local_priority: u8,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        data: Vec<u8>,
+        deadline: tokio::time::Instant,
+        prewrite_expirations: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Result<bool, ClientError> {
         self.writer
             .write_app_ipc_send_on_local_lane_before_owned(
                 local_priority,
@@ -878,6 +905,7 @@ impl AppSender {
                     | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED,
                 &data,
                 deadline,
+                prewrite_expirations,
             )
             .await
     }
