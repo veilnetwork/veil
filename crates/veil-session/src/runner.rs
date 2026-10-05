@@ -3607,6 +3607,13 @@ impl SessionRunner {
             _ => None,
         };
 
+        // Publish actual generic transport readiness to local origin routing.
+        // Independent children are not required; no remote class is exposed.
+        let mut _datagram_transport_lease = realtime_lane
+            .as_ref()
+            .and(outbox.as_ref())
+            .and_then(|outbox| outbox.activate_datagram_transport());
+
         // ── b: reader/writer split ─────────────────────────────────
         // Architectural fix for the symmetric `write_all` deadlock (testnet
         // Instead of one task that interleaves reads and
@@ -4259,6 +4266,7 @@ impl SessionRunner {
                 }
                 if disable_realtime_sender {
                     realtime_lane = None;
+                    _datagram_transport_lease = None;
                 }
                 if crate::rt_trace::rt_trace_enabled() {
                     let realtime_blocked = pq.peek_priority()
@@ -4524,6 +4532,7 @@ impl SessionRunner {
                         // connection's datagram plane immediately; queued media
                         // continues through the ordered fallback.
                         realtime_lane = None;
+                        _datagram_transport_lease = None;
                         drop(realtime_receiver_task.take());
                         // Tear-down + re-spawn lifecycle is mechanical;
                         // rebind locals from the tuple result, reset

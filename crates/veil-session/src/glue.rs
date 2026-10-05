@@ -50,6 +50,10 @@ impl SessionTxBroadcaster {
 }
 
 impl veil_types::FrameBroadcaster for SessionTxBroadcaster {
+    fn has_datagram_transport(&self, peer_id: &[u8; 32]) -> bool {
+        rlock!(self.inner).has_datagram_transport(peer_id)
+    }
+
     fn send_to(&self, peer_id: &[u8; 32], priority: u8, bytes: Vec<u8>) -> bool {
         rlock!(self.inner).send_to(peer_id, priority, bytes)
     }

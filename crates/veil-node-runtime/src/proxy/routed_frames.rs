@@ -222,6 +222,10 @@ impl RoutedFrameBroadcaster {
 }
 
 impl FrameBroadcaster for RoutedFrameBroadcaster {
+    fn has_datagram_transport(&self, peer_id: &[u8; 32]) -> bool {
+        self.direct.has_datagram_transport(peer_id)
+    }
+
     fn send_to(&self, peer_id: &[u8; 32], priority: u8, bytes: Vec<u8>) -> bool {
         if self.direct.send_to(peer_id, priority, bytes.clone()) {
             return true;

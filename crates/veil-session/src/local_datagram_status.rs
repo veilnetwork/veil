@@ -25,6 +25,7 @@ pub(crate) struct LocalDatagramStatus {
 #[derive(Debug, Default)]
 struct State {
     owner: Weak<()>,
+    transport_owner: Weak<()>,
     ready: u8,
     requested: u8,
 }
@@ -37,6 +38,16 @@ fn bit(local_lane: u8) -> Option<u8> {
 }
 
 impl LocalDatagramStatus {
+    pub(crate) fn has_datagram_transport(&self) -> bool {
+        lock!(self.state).transport_owner.strong_count() != 0
+    }
+
+    pub(crate) fn activate_transport(self: &Arc<Self>) -> DatagramTransportLease {
+        let owner = Arc::new(());
+        lock!(self.state).transport_owner = Arc::downgrade(&owner);
+        DatagramTransportLease { _owner: owner }
+    }
+
     pub(crate) fn state(&self, local_lane: u8) -> LocalDatagramChannelState {
         let Some(bit) = bit(local_lane) else {
             return LocalDatagramChannelState::Unsupported;
@@ -74,16 +85,21 @@ impl LocalDatagramStatus {
 
     pub(crate) fn activate(self: &Arc<Self>) -> LocalDatagramLease {
         let owner = Arc::new(());
-        *lock!(self.state) = State {
-            owner: Arc::downgrade(&owner),
-            ready: 0,
-            requested: 0,
-        };
+        let mut state = lock!(self.state);
+        state.owner = Arc::downgrade(&owner);
+        state.ready = 0;
+        state.requested = 0;
         LocalDatagramLease {
             status: Arc::clone(self),
             owner,
         }
     }
+}
+
+/// Readiness of the existing generic QUIC transport, not of an independent
+/// child connection. A retired runner cannot clear its replacement's lease.
+pub struct DatagramTransportLease {
+    _owner: Arc<()>,
 }
 
 pub(crate) struct LocalDatagramLease {
@@ -115,7 +131,9 @@ impl Drop for LocalDatagramLease {
     fn drop(&mut self) {
         let mut state = lock!(self.status.state);
         if Weak::ptr_eq(&state.owner, &Arc::downgrade(&self.owner)) {
-            *state = State::default();
+            state.owner = Weak::new();
+            state.ready = 0;
+            state.requested = 0;
         }
     }
 }
@@ -124,6 +142,24 @@ impl Drop for LocalDatagramLease {
 mod tests {
     use super::*;
     use LocalDatagramChannelState::*;
+
+    #[test]
+    fn generic_transport_readiness_expires_and_does_not_claim_independent_support() {
+        let status = Arc::new(LocalDatagramStatus::default());
+        assert!(!status.has_datagram_transport());
+        let old = status.activate_transport();
+        assert!(status.has_datagram_transport());
+        assert_eq!(status.state(0), Unsupported);
+        let replacement = status.activate_transport();
+        drop(old);
+        assert!(status.has_datagram_transport());
+        let independent = status.activate();
+        independent.mark(0, true);
+        drop(independent);
+        assert!(status.has_datagram_transport());
+        drop(replacement);
+        assert!(!status.has_datagram_transport());
+    }
 
     #[test]
     fn source_readiness_is_independent_and_never_applies_to_transit() {
