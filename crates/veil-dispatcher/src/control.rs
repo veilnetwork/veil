@@ -131,14 +131,19 @@ impl FrameDispatcher {
 
                 // relay-mode dispatch. Three cases:
                 // 1. target == [0; 32] sentinel → STUN-echo (legacy).
-                // 2. target == self_node_id → addressed to us (also
+                // 2. target == self_node_id or our configured identity → us (also
                 // STUN-echo in practice — answer locally).
                 // 3. target!= self → forward via existing
                 // session to that peer. Receiver will respond with
                 // `final_target_node_id == request.initiator_node_id`
                 // so WE can route the reply back without state.
                 let is_relay_target = request.target_node_id != [0u8; 32]
-                    && request.target_node_id != self.local_node_id;
+                    && request.target_node_id != self.local_node_id
+                    && self
+                        .local_recipient
+                        .as_ref()
+                        .and_then(|current| current())
+                        .is_none_or(|current| current.node_id != request.target_node_id);
                 if is_relay_target {
                     // A NAT coordinator is only the first signalling hop. In
                     // a real sparse overlay it is not guaranteed to hold a
