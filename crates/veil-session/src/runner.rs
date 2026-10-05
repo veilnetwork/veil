@@ -608,7 +608,15 @@ fn spawn_realtime_receiver(
             activity,
         } = context;
         let mut logged_receive_kinds = 0u8;
+        let mut trace = datagram_receive_trace::ReceiveTrace::new();
+        let mut trace_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        trace_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            let tracing = crate::rt_trace::rt_trace_enabled();
+            if !tracing {
+                // A disabled interval is not polled; discard its old window.
+                trace.take();
+            }
             let datagram = match tokio::select! {
                 // Biased so a rekey that is already waiting is applied before
                 // the next datagram is opened: the other side switched keys
@@ -620,6 +628,23 @@ fn spawn_realtime_receiver(
                     // select never loses the rotation: the value stays in the
                     // watch until it is observed.
                     apply_pending_rekey(&mut rx, &mut rekeys, std::time::Instant::now());
+                    continue;
+                }
+                _ = trace_tick.tick(), if tracing => {
+                    let w = trace.take();
+                    let path = handle.path_stats();
+                    logger.info(
+                        "session.rt_trace.datagram_receive",
+                        format!(
+                            "peer_id={} receiver={} datagrams={} fragments_pending={} decode_rejected={} ineligible={} dispatched={} rate_limited={} violations={} unexpected={} max_dispatch_us={} udp_sent={} udp_received={} acks_received={} rtt_us={} lost_packets={} congestion_events={}",
+                            hex_short(&peer_id), trace.id, w.datagrams,
+                            w.fragments_pending, w.decode_rejected, w.ineligible,
+                            w.dispatched, w.rate_limited, w.violations, w.unexpected,
+                            w.max_dispatch_us, path.udp_sent, path.udp_received,
+                            path.acknowledgments_received, path.rtt_us,
+                            path.lost_packets, path.congestion_events,
+                        ),
+                    );
                     continue;
                 }
                 received = handle.recv() => received,
@@ -636,14 +661,31 @@ fn spawn_realtime_receiver(
             if let Some(m) = &metrics {
                 m.add_transport_bytes_rx(datagram.len() as u64);
             }
+            if tracing {
+                trace.window.datagrams += 1;
+            }
             let frame = match rx.decode_datagram(&datagram, std::time::Instant::now()) {
                 Ok(Some(frame)) => frame,
-                Ok(None) | Err(_) => continue,
+                Ok(None) => {
+                    if tracing {
+                        trace.window.fragments_pending += 1;
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    if tracing {
+                        trace.window.decode_rejected += 1;
+                    }
+                    continue;
+                }
             };
             let Some((header, body, kind)) = decode_realtime_lane_frame(&frame) else {
                 // Authenticated but not an exact eligible realtime frame. Keep
                 // the lane lossy: discard it without tearing down the reliable
                 // session or letting it bypass the normal parser.
+                if tracing {
+                    trace.window.ineligible += 1;
+                }
                 continue;
             };
             // Only a fully authenticated, replay-checked and eligible complete
@@ -664,14 +706,31 @@ fn spawn_realtime_receiver(
                     ),
                 );
             }
-            match dispatcher.dispatch_with_carrier(
+            let dispatch_started = tracing.then(std::time::Instant::now);
+            let result = dispatcher.dispatch_with_carrier(
                 &header,
                 body,
                 peer_id,
                 carrier.as_ref().map(Arc::downgrade),
-            ) {
-                DispatchResult::NoResponse | DispatchResult::RateLimited => {}
+            );
+            if let Some(started) = dispatch_started {
+                trace.window.dispatched += 1;
+                trace.window.max_dispatch_us = trace
+                    .window
+                    .max_dispatch_us
+                    .max(started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+            }
+            match result {
+                DispatchResult::NoResponse => {}
+                DispatchResult::RateLimited => {
+                    if tracing {
+                        trace.window.rate_limited += 1;
+                    }
+                }
                 DispatchResult::Violation(reason) => {
+                    if tracing {
+                        trace.window.violations += 1;
+                    }
                     logger.warn(
                         "session.realtime_datagram.violation",
                         format!("peer_id={} reason={reason}", hex_short(&peer_id)),
@@ -687,6 +746,9 @@ fn spawn_realtime_receiver(
                 DispatchResult::Response(_)
                 | DispatchResult::NotHandled
                 | DispatchResult::SolvePow(_) => {
+                    if tracing {
+                        trace.window.unexpected += 1;
+                    }
                     logger.warn(
                         "session.realtime_datagram.unexpected_dispatch_result",
                         format!("peer_id={}", hex_short(&peer_id)),
@@ -696,6 +758,9 @@ fn spawn_realtime_receiver(
         }
     }))
 }
+
+#[path = "datagram_receive_trace.rs"]
+mod datagram_receive_trace;
 
 // ── SessionRunner ─────────────────────────────────────────────────────────────
 
