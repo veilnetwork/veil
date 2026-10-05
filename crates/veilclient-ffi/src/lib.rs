@@ -1756,8 +1756,9 @@ pub unsafe extern "C" fn veil_send_to_my_devices(
     }
 }
 
-/// Send a loss-tolerant datagram over an already-active direct peer session at
-/// REALTIME priority.
+/// Send a loss-tolerant signaling datagram over an active direct peer session.
+/// Its endpoint-local source channel is separate from native audio/video.
+/// The legacy REALTIME wire classifier is unchanged; no source lane is sent.
 ///
 /// Unlike [`veil_send`], this never performs route discovery and never falls
 /// back to a relay. `VEIL_ERR` therefore means there is no usable direct
@@ -1828,7 +1829,8 @@ pub unsafe extern "C" fn veil_send_realtime(
             return Err(ClientError::Protocol("app already closed".to_string()));
         };
         sender
-            .send_rt_data(
+            .send_rt_data_on_local_lane(
+                veil_proto::priority::BACKGROUND,
                 dst_node,
                 dst_app,
                 dst_endpoint_id,

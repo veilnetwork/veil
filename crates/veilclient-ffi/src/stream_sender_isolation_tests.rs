@@ -202,3 +202,74 @@ fn dedicated_p2p_file_sender_keeps_chat_live_during_remote_open_wait() {
         assert!(bridge.veil_stream_rx.lock().unwrap().is_empty());
     }
 }
+
+#[test]
+fn ffi_signalling_datagrams_use_a_separate_source_lane_without_wire_hints() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("ipc.sock");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (frames, received) = std::sync::mpsc::channel();
+    let mut server = IpcServer::new(
+        IpcEndpoint::Unix(socket.clone()),
+        shutdown_rx,
+        Arc::new(veil_app::registry::AppEndpointRegistry::new()),
+        [0x42; 32],
+    )
+    .with_session_tx_registry(Arc::new(Capture(frames)));
+    let task = rt.spawn(async move { server.run().await.unwrap() });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let bound = unsafe { connect_and_bind(socket.to_str().unwrap(), 0) };
+    let mut error = ptr::null_mut();
+    let bytes = b"opaque application control";
+    let result = unsafe {
+        veil_send_realtime(
+            bound.1 as *mut VeilApp,
+            PEER.as_ptr(),
+            [0xa1; 32].as_ptr(),
+            7,
+            bytes.as_ptr(),
+            bytes.len(),
+            &mut error,
+        )
+    };
+    let error_text = if error.is_null() {
+        None
+    } else {
+        let text = unsafe { CStr::from_ptr(error) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { veil_free_string(error) };
+        Some(text)
+    };
+    let capture = received.recv_timeout(Duration::from_secs(2));
+    unsafe {
+        veil_app_close(bound.1 as *mut VeilApp);
+        veil_close(bound.0 as *mut VeilHandle);
+    }
+    shutdown.send(true).unwrap();
+    rt.block_on(task).unwrap();
+    assert_eq!(result, VEIL_OK, "{error_text:?}");
+    let (local_lane, frame) = capture.unwrap();
+    assert_eq!(local_lane, veil_proto::priority::BACKGROUND);
+    let header = veil_proto::codec::decode_header(&frame).unwrap();
+    assert_eq!(header.msg_type, AppMsg::AppRtData as u16);
+    assert_eq!(header.priority(), veil_proto::priority::REALTIME);
+    assert_eq!(
+        header.flags, 0,
+        "endpoint lane must not appear on the network"
+    );
+    let payload = veil_proto::app::AppRtDataPayload::decode(&frame[HEADER_SIZE..]).unwrap();
+    assert_eq!(payload.payload, bytes);
+    assert_eq!(payload.app_id, [0xa1; 32]);
+    assert_eq!(payload.endpoint_id, 7);
+}
