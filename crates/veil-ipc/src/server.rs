@@ -2582,7 +2582,7 @@ async fn handle_ipc_client(
                                             target.app_id,
                                             target.endpoint_id,
                                             p.data,
-                                        )
+                                        ).await
                                     } else {
                                         false
                                     };
@@ -2650,7 +2650,7 @@ async fn handle_ipc_client(
                                     // the inbound bridge that delivers to its IPC
                                     // client). p.stream_id IS the wire stream id
                                     // (the acceptor saw it in STREAM_OPEN_INBOUND).
-                                    if let Some(b) = session_tx_registry.as_deref() {
+                                    let sent = if let Some(b) = session_tx_registry.as_deref() {
                                         crate::handlers::stream::send_app_data(
                                             b,
                                             &route.opener_node_id,
@@ -2658,13 +2658,27 @@ async fn handle_ipc_client(
                                             route.app_id,
                                             route.endpoint_id,
                                             p.data,
-                                        );
+                                        ).await
                                     } else {
-                                        // No session registry → can't reach the
-                                        // opener; tear the stream down so the loss
-                                        // surfaces rather than silently vanishing.
+                                        false
+                                    };
+                                    if !sent {
+                                        // Remote inbound streams do not have a
+                                        // local-pair table entry. Closing only
+                                        // that table would never notify this SDK.
+                                        if let Some(b) = session_tx_registry.as_deref() {
+                                            crate::handlers::stream::send_app_close(
+                                                b, &route.opener_node_id, p.stream_id,
+                                                route.app_id, route.endpoint_id,
+                                            );
+                                        }
                                         stream_table.close(p.stream_id);
                                         client_state.release_stream(p.stream_id);
+                                        write_frame_wh(
+                                            &mut wh, FrameFamily::LocalApp as u8,
+                                            LocalAppMsg::StreamClose as u16,
+                                            &StreamClosePayload { stream_id: p.stream_id }.encode(),
+                                        ).await?;
                                     }
                                 } else {
                                     let outcome =
@@ -2696,13 +2710,24 @@ async fn handle_ipc_client(
                             if let Some(route) = client_state.acceptor_remote_route(p.stream_id)
                                 && let Some(b) = session_tx_registry.as_deref()
                             {
-                                crate::handlers::stream::send_app_close(
+                                crate::handlers::stream::send_app_close_wait(
                                     b,
                                     &route.opener_node_id,
                                     p.stream_id,
                                     route.app_id,
                                     route.endpoint_id,
-                                );
+                                ).await;
+                            }
+                            // Graceful remote opener close shares the same
+                            // reliable source credit/lane as its preceding data.
+                            if let Some(target) = stream_table.close_remote(p.stream_id) {
+                                if let Some(b) = session_tx_registry.as_deref() {
+                                    crate::handlers::stream::send_app_close_wait(
+                                        b, &target.dst_node_id, target.wire_stream_id,
+                                        target.app_id, target.endpoint_id,
+                                    ).await;
+                                }
+                                teardown_remote_target(&target, None, stream_bridge.as_ref());
                             }
                             // Ownership is checked above, so a guessed stream_id
                             // cannot close another client's (or another peer's)

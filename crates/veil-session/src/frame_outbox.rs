@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use crate::PriorityFrame;
 
 pub const RESERVED_QUEUE_DEPTH: usize = 64;
+pub const RELIABLE_SOURCE_QUEUE_DEPTH: usize = 64;
 const MAX_RESERVED_BURST: usize = 8;
 
 /// Local transport metadata follows a frame through the ordinary queue. It
@@ -25,6 +26,9 @@ pub struct FrameEnvelope {
     /// runner, but residence in this upstream queue must count toward its age.
     /// Never serialized, and never derived from a peer's clock or wire hint.
     pub(crate) queued_at: Instant,
+    /// Endpoint-only reliable admission. Held through the scheduler, never
+    /// serialized or inferred from a remote frame's priority or contents.
+    pub(crate) reliable_credit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl From<PriorityFrame> for FrameEnvelope {
@@ -33,6 +37,7 @@ impl From<PriorityFrame> for FrameEnvelope {
             frame,
             carrier: None,
             queued_at: Instant::now(),
+            reliable_credit: None,
         }
     }
 }
@@ -81,6 +86,7 @@ pub struct FrameSender {
     ordinary: mpsc::Sender<FrameEnvelope>,
     status: std::sync::Arc<crate::local_datagram_status::LocalDatagramStatus>,
     reserved: mpsc::Sender<FrameEnvelope>,
+    reliable_credits: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl FrameSender {
@@ -134,6 +140,23 @@ impl FrameSender {
             .map_err(|error| mpsc::error::SendError(error.0.frame))
     }
 
+    /// A bounded reliable source keeps its admission credit while waiting in
+    /// ingress AND the scheduler, so draining ingress cannot erase pressure.
+    pub(crate) async fn send_reliable(&self, bytes: veil_bufpool::PooledShared) -> bool {
+        let Ok(credit) = self.reliable_credits.clone().acquire_owned().await else {
+            return false;
+        };
+        self.ordinary
+            .send(FrameEnvelope {
+                frame: (veil_proto::priority::BACKGROUND, bytes),
+                carrier: None,
+                queued_at: Instant::now(),
+                reliable_credit: Some(credit),
+            })
+            .await
+            .is_ok()
+    }
+
     /// A return carrier always uses the ordinary neutral FIFO; callers cannot
     /// promote a routed cell by tagging its wire header or source queue.
     pub(crate) fn try_send_on_carrier(
@@ -145,6 +168,7 @@ impl FrameSender {
             frame: (veil_proto::priority::INTERACTIVE, bytes),
             carrier: Some(carrier),
             queued_at: Instant::now(),
+            reliable_credit: None,
         })
     }
 
@@ -191,6 +215,9 @@ pub(crate) fn frame_channel_with_source_activity(
             ordinary: ordinary_tx,
             status: std::sync::Arc::clone(&status),
             reserved: reserved_tx,
+            reliable_credits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                RELIABLE_SOURCE_QUEUE_DEPTH,
+            )),
         },
         FrameOutbox {
             source_activity,
@@ -353,6 +380,74 @@ impl FrameOutbox {
 mod tests {
     use super::*;
     use veil_proto::priority::{INTERACTIVE, REALTIME};
+
+    #[tokio::test]
+    async fn reliable_credit_survives_ingress_drain_and_scheduler_overflow() {
+        use crate::priority_queue::PriorityQueue;
+        use std::future::Future;
+        let (tx, mut rx) = frame_channel(1);
+        let mut pq = PriorityQueue::with_capacity([8, 4, 2, 1], 1);
+        for byte in 0..RELIABLE_SOURCE_QUEUE_DEPTH as u8 {
+            assert!(tx.send_reliable(frame(3, byte).1).await);
+            pq.push_envelope(rx.recv_envelope().await.unwrap(), false);
+        }
+        let mut waiting = Box::pin(tx.send_reliable(frame(3, 64).1));
+        std::future::poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        // Ordinary overflow retains its own bounded budget and cannot evict
+        // an already admitted byte-stream frame, regardless of priority.
+        for byte in 100..200 {
+            pq.push(INTERACTIVE, frame(INTERACTIVE, byte).1);
+        }
+        assert_eq!(pq.len(), RELIABLE_SOURCE_QUEUE_DEPTH + 1);
+        assert_eq!(pq.drops_total(), 99);
+        // A stalled reliable source still cannot exhaust primary ingress.
+        tx.try_send(frame(REALTIME, 250)).unwrap();
+        assert_eq!(rx.recv().await.unwrap().0, REALTIME);
+        assert_eq!(&*pq.pop().unwrap(), &[199]);
+        let first = pq.pop_envelope_if(|_, _| true).unwrap();
+        assert_eq!(&*first.frame.1, &[0]);
+        std::future::poll_fn(|cx| {
+            assert!(
+                waiting.as_mut().poll(cx).is_pending(),
+                "pop lost its credit before consumption"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        drop(first);
+        assert!(waiting.await);
+        pq.push_envelope(rx.recv_envelope().await.unwrap(), false);
+        for byte in 1..=64 {
+            assert_eq!(&*pq.pop().unwrap(), &[byte]);
+        }
+        assert!(pq.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closing_a_stalled_reliable_source_releases_waiters() {
+        use crate::priority_queue::PriorityQueue;
+        let (tx, mut rx) = frame_channel(1);
+        let mut pq = PriorityQueue::with_default_weights();
+        for byte in 0..RELIABLE_SOURCE_QUEUE_DEPTH as u8 {
+            assert!(tx.send_reliable(frame(3, byte).1).await);
+            pq.push_envelope(rx.recv_envelope().await.unwrap(), false);
+        }
+        let waiting = tokio::spawn(async move { tx.send_reliable(frame(3, 64).1).await });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(rx);
+        drop(pq);
+        assert!(
+            !tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+    }
 
     #[tokio::test]
     async fn waiting_for_ingress_capacity_counts_toward_lossy_age() {

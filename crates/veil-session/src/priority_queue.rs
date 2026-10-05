@@ -73,6 +73,7 @@ struct QueuedFrame {
     enqueued_at: Option<Instant>,
     lossy_realtime: bool,
     carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
+    reliable_credit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 // ── PriorityQueue ─────────────────────────────────────────────────────────────
@@ -149,7 +150,7 @@ impl PriorityQueue {
     /// expense of BULK/BACKGROUND. Drops increment `drops_total` so the
     /// runner can forward them to Prometheus.
     pub fn push(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
-        self.push_entry(priority, frame, None, None);
+        self.push_entry(priority, frame, None, None, None);
     }
 
     /// Enqueue a canonical loss-tolerant realtime frame. When its dedicated
@@ -178,7 +179,13 @@ impl PriorityQueue {
         if lossy {
             self.push_lossy_with_carrier(priority, frame, envelope.carrier, envelope.queued_at);
         } else {
-            self.push_entry(priority, frame, None, envelope.carrier);
+            self.push_entry(
+                priority,
+                frame,
+                None,
+                envelope.carrier,
+                envelope.reliable_credit,
+            );
         }
     }
 
@@ -208,7 +215,7 @@ impl PriorityQueue {
             self.lossy_realtime_len[p] -= 1;
             self.drops_total.fetch_add(1, Ordering::Relaxed);
         }
-        self.push_entry(priority, frame, Some(queued_at), carrier);
+        self.push_entry(priority, frame, Some(queued_at), carrier, None);
     }
 
     fn push_entry(
@@ -217,10 +224,24 @@ impl PriorityQueue {
         frame: veil_bufpool::PooledShared,
         enqueued_at: Option<Instant>,
         carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
+        reliable_credit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
         let lossy_realtime = enqueued_at.is_some();
         let p = priority.min(3) as usize;
-        if self.len() >= self.max_depth {
+        // Endpoint-owned reliable entries retain bounded source credits. They
+        // cannot be shed after successful admission. Their independent budget
+        // is at most RELIABLE_SOURCE_QUEUE_DEPTH, shared with upstream ingress;
+        // the ordinary/transit budget and its WRR/FIFO behavior stay unchanged.
+        if reliable_credit.is_none()
+            && self.len() >= self.max_depth
+            && self
+                .queues
+                .iter()
+                .flatten()
+                .filter(|q| q.reliable_credit.is_none())
+                .count()
+                >= self.max_depth
+        {
             // Shed one frame from the lowest priority that has any queued —
             // prefer victimising lower-priority traffic over dropping the
             // incoming frame, so REALTIME/INTERACTIVE stays responsive when
@@ -232,9 +253,12 @@ impl PriorityQueue {
             // (audit cycle-8 F4.)
             let mut shed = false;
             for shed_p in (p..4).rev() {
-                if !self.queues[shed_p].is_empty() {
+                if let Some(index) = self.queues[shed_p]
+                    .iter()
+                    .position(|q| q.reliable_credit.is_none())
+                {
                     if self.queues[shed_p]
-                        .pop_front()
+                        .remove(index)
                         .is_some_and(|queued| queued.lossy_realtime)
                     {
                         self.lossy_realtime_len[shed_p] -= 1;
@@ -255,6 +279,7 @@ impl PriorityQueue {
             enqueued_at,
             lossy_realtime,
             carrier,
+            reliable_credit,
         });
         if lossy_realtime {
             self.lossy_realtime_len[p] += 1;
@@ -407,6 +432,7 @@ impl PriorityQueue {
             enqueued_at: Some(envelope.queued_at),
             lossy_realtime: true,
             carrier: envelope.carrier,
+            reliable_credit: None,
         });
         self.lossy_realtime_len[priority.min(3) as usize] += 1;
     }
@@ -466,6 +492,7 @@ impl PriorityQueue {
                         frame: (priority, queued.frame),
                         carrier: queued.carrier,
                         queued_at: queued.enqueued_at.unwrap_or_else(Instant::now),
+                        reliable_credit: queued.reliable_credit,
                     });
                 }
             }
@@ -517,6 +544,7 @@ impl PriorityQueue {
                         frame: (p as u8, queued.frame),
                         carrier: queued.carrier,
                         queued_at: queued.enqueued_at.unwrap_or_else(Instant::now),
+                        reliable_credit: queued.reliable_credit,
                     });
                 }
             }
