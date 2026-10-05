@@ -58,6 +58,25 @@ impl veil_types::FrameBroadcaster for SessionTxBroadcaster {
         rlock!(self.inner).send_to(peer_id, priority, bytes)
     }
 
+    fn send_reliable_to<'a>(
+        &'a self,
+        peer_id: &'a [u8; 32],
+        bytes: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        // Never hold the registry lock while a source waits for capacity.
+        let sender = rlock!(self.inner).get_sender(peer_id).cloned();
+        Box::pin(async move {
+            match sender {
+                Some(sender) => {
+                    sender
+                        .send_reliable(veil_bufpool::pooled_shared_from_vec(bytes))
+                        .await
+                }
+                None => false,
+            }
+        })
+    }
+
     fn devices_of(&self, identity: &[u8; 32]) -> Vec<[u8; 32]> {
         let Some(sessions) = self.sessions.as_ref() else {
             return Vec::new();

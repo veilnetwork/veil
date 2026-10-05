@@ -362,7 +362,9 @@ async fn open_remote_stream(
         wire_stream_id,
         p.app_id,
         p.endpoint_id,
-    ) {
+    )
+    .await
+    {
         deregister_wire_stream(bridge, &dst, wire_stream_id);
         return Err(stream_open_err::NO_SESSION);
     }
@@ -515,7 +517,7 @@ fn deregister_wire_stream(bridge: &IpcStreamBridge, dst: &[u8; 32], wire_stream_
 
 /// Encode + send an `AppOpen` frame on `wire_stream_id`. Returns `false` if
 /// there is no session to `dst` (the send was dropped).
-pub(crate) fn send_app_open(
+pub(crate) async fn send_app_open(
     broadcaster: &dyn FrameBroadcaster,
     dst: &[u8; 32],
     wire_stream_id: u32,
@@ -528,11 +530,11 @@ pub(crate) fn send_app_open(
         flags: 0,
     }
     .encode();
-    send_app_frame(broadcaster, dst, wire_stream_id, AppMsg::AppOpen, &body)
+    send_app_frame_wait(broadcaster, dst, wire_stream_id, AppMsg::AppOpen, &body).await
 }
 
 /// Encode + send an `AppData` frame carrying `data` on `wire_stream_id`.
-pub(crate) fn send_app_data(
+pub(crate) async fn send_app_data(
     broadcaster: &dyn FrameBroadcaster,
     dst: &[u8; 32],
     wire_stream_id: u32,
@@ -547,7 +549,7 @@ pub(crate) fn send_app_data(
         data,
     }
     .encode();
-    send_app_frame(broadcaster, dst, wire_stream_id, AppMsg::AppData, &body)
+    send_app_frame_wait(broadcaster, dst, wire_stream_id, AppMsg::AppData, &body).await
 }
 
 /// Encode + send an `AppClose` frame on `wire_stream_id`.
@@ -567,6 +569,39 @@ pub(crate) fn send_app_close(
     send_app_frame(broadcaster, dst, wire_stream_id, AppMsg::AppClose, &body)
 }
 
+pub(crate) async fn send_app_close_wait(
+    broadcaster: &dyn FrameBroadcaster,
+    dst: &[u8; 32],
+    wire_stream_id: u32,
+    app_id: [u8; 32],
+    endpoint_id: u32,
+) -> bool {
+    let body = AppClosePayload {
+        app_id,
+        endpoint_id,
+        reason: close_reason::NORMAL,
+    }
+    .encode();
+    send_app_frame_wait(broadcaster, dst, wire_stream_id, AppMsg::AppClose, &body).await
+}
+
+async fn send_app_frame_wait(
+    broadcaster: &dyn FrameBroadcaster,
+    dst: &[u8; 32],
+    wire_stream_id: u32,
+    msg: AppMsg,
+    body: &[u8],
+) -> bool {
+    let frame = app_frame(wire_stream_id, msg, body);
+    // Bound an unresponsive source session; false is surfaced as stream close.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        broadcaster.send_reliable_to(dst, frame),
+    )
+    .await
+    .unwrap_or(false)
+}
+
 /// Build the `[header || body]` wire frame for an App-family message on
 /// `wire_stream_id`. Reliable byte streams use the endpoint's background source
 /// lane, while the wire header stays neutral. Open/data/close MUST share a lane:
@@ -578,13 +613,21 @@ fn send_app_frame(
     msg: AppMsg,
     body: &[u8],
 ) -> bool {
+    broadcaster.send_to(
+        dst,
+        priority::BACKGROUND,
+        app_frame(wire_stream_id, msg, body),
+    )
+}
+
+fn app_frame(wire_stream_id: u32, msg: AppMsg, body: &[u8]) -> Vec<u8> {
     let mut hdr = FrameHeader::new(FrameFamily::App as u8, msg as u16);
     hdr.body_len = body.len() as u32;
     hdr.stream_id = wire_stream_id;
     hdr.set_priority(priority::INTERACTIVE);
     let mut frame = encode_header(&hdr).to_vec();
     frame.extend_from_slice(body);
-    broadcaster.send_to(dst, priority::BACKGROUND, frame)
+    frame
 }
 
 #[cfg(test)]
@@ -592,8 +635,8 @@ mod tests {
     use super::*;
     use veil_proto::{StreamClosePayload, StreamDataPayload, header::HEADER_SIZE};
 
-    #[test]
-    fn reliable_stream_lifecycle_uses_one_local_lane_and_neutral_wire_headers() {
+    #[tokio::test]
+    async fn reliable_stream_lifecycle_uses_one_local_lane_and_neutral_wire_headers() {
         use std::sync::Mutex;
         use veil_session::priority_queue::PriorityQueue;
 
@@ -612,10 +655,10 @@ mod tests {
         let source = Source::default();
         let dst = [9; 32];
         let app = [7; 32];
-        assert!(send_app_open(&source, &dst, 41, app, 5));
+        assert!(send_app_open(&source, &dst, 41, app, 5).await);
         let payload: Vec<_> = (0..33 * 2048 + 19).map(|n| (n % 251) as u8).collect();
         for chunk in payload.chunks(2048) {
-            assert!(send_app_data(&source, &dst, 41, app, 5, chunk.to_vec()));
+            assert!(send_app_data(&source, &dst, 41, app, 5, chunk.to_vec()).await);
         }
         assert!(send_app_close(&source, &dst, 41, app, 5));
 
@@ -771,14 +814,17 @@ mod tests {
             StreamDataPayload::decode(&body).unwrap().data,
             b"device-bound"
         );
-        assert!(send_app_data(
-            source.as_ref(),
-            &route.dst_node_id,
-            route.wire_stream_id,
-            route.app_id,
-            route.endpoint_id,
-            b"request".to_vec()
-        ));
+        assert!(
+            send_app_data(
+                source.as_ref(),
+                &route.dst_node_id,
+                route.wire_stream_id,
+                route.app_id,
+                route.endpoint_id,
+                b"request".to_vec()
+            )
+            .await
+        );
         bridge
             .veil_stream_rx
             .lock()
