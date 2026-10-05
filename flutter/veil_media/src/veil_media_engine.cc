@@ -3592,6 +3592,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
       vlog("stats: worker queue did not schedule; call/stream figures are "
            "defaults, not measurements");
     const auto tx_video = ws->shim->outbound_video_cadence();
+    const auto tx_audio = ws->shim->audio_send_stats();
     const auto rx_video = ws->shim->inbound_video_cadence();
     const auto delivered_video = ws->shim->delivered_video_cadence();
     const auto cadence_fps = [](const veil_media::VideoCadenceSnapshot& c) {
@@ -3605,7 +3606,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     // silence, and a truncated object is not a smaller answer — it is one the
     // Dart side cannot parse at all, so the return is checked below rather
     // than trusted.
-    char json[3072];
+    char json[4096];
     const int written = std::snprintf(
         json, sizeof(json),
         "{\"tx_pkts\":%llu,\"rx_pkts\":%llu,\"audio_rx_pkts\":%llu,"
@@ -3613,6 +3614,9 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         "\"audio_concealment_events\":%llu,\"audio_interruption_count\":%d,"
         "\"audio_interruption_duration_ms\":%d,"
         "\"audio_tx_pkts\":%llu,\"mic_muted\":%d,\"tx_bytes\":%llu,"
+        "\"audio_tx_rtp_attempts\":%llu,\"audio_tx_rtp_queued\":%llu,"
+        "\"audio_tx_rtp_age_ms\":%lld,\"audio_tx_rtp_queue_age_ms\":%lld,"
+        "\"audio_tx_rtp_max_gap_ms\":%lld,\"audio_tx_rtp_admission_max_ms\":%lld,"
         "\"rx_bytes\":%llu,\"tx_drops\":%llu,\"rx_drops\":%llu,"
         "\"rtt_ms\":%lld,\"jitter_ms\":%u,\"loss_pct\":%d,"
         "\"tx_jitter_ms\":%d,\"tx_loss_pct\":%d,\"audio_feedback_reports\":%d,"
@@ -3646,6 +3650,12 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         audio_interruption_count, audio_interruption_duration_ms,
         static_cast<unsigned long long>(audio_tx_pkts), engine->mic_muted ? 1 : 0,
         static_cast<unsigned long long>(ws->shim->outbound_byte_count()),
+        static_cast<unsigned long long>(tx_audio.attempts),
+        static_cast<unsigned long long>(tx_audio.queued),
+        static_cast<long long>(tx_audio.age_ms),
+        static_cast<long long>(tx_audio.queue_age_ms),
+        static_cast<long long>(tx_audio.max_gap_ms),
+        static_cast<long long>(tx_audio.max_admission_ms),
         static_cast<unsigned long long>(ws->shim->inbound_byte_count()),
         static_cast<unsigned long long>(ws->shim->outbound_dropped_count()),
         static_cast<unsigned long long>(ws->shim->inbound_dropped_count()),

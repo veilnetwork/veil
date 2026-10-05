@@ -37,6 +37,7 @@
 
 #include "api/call/transport.h"  // webrtc::Transport, webrtc::PacketOptions
 #include "veil_inbound_packet_queue.h"
+#include "veil_audio_send_stats.h"
 
 namespace webrtc {
 class Call;
@@ -158,6 +159,7 @@ class VeilTransportShim : public webrtc::Transport {
   VideoCadenceSnapshot outbound_video_cadence() const;
   VideoCadenceSnapshot inbound_video_cadence() const;
   VideoCadenceSnapshot delivered_video_cadence() const;
+  AudioSendSnapshot audio_send_stats() const;
 
  private:
   struct AtomicVideoCadence {
@@ -206,6 +208,7 @@ class VeilTransportShim : public webrtc::Transport {
   webrtc::TaskQueueBase* const video_network_queue_;
   std::atomic<uint32_t> remote_video_ssrc_{0};
   std::atomic<uint32_t> local_audio_ssrc_{0};
+  AudioSendStats audio_send_stats_;
   mutable std::mutex audio_feedback_mu_;
   AudioFeedbackSnapshot audio_feedback_;
   AudioPlayoutSnapshot audio_playout_feedback_;
