@@ -141,7 +141,10 @@ async fn remote_stream_sdk_ipc_preserves_bounded_bytes_and_source_lane_through_c
         .await
         .unwrap();
     let payload: Vec<_> = (0..128 * 1024 + 19).map(|n| (n % 251) as u8).collect();
-    stream.write_all(&payload).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), stream.write_all(&payload))
+        .await
+        .unwrap()
+        .unwrap();
     stream.shutdown().await.unwrap();
     drop(stream);
     let received = tokio::time::timeout(Duration::from_secs(3), async {
@@ -353,7 +356,11 @@ async fn source_lane_survives_sdk_ipc_but_is_absent_from_network_frame() {
         assert_eq!(fresh.0, original.0);
         let decode_relay = |frame: &[u8]| {
             let header = veil_proto::codec::decode_header(frame).unwrap();
-            assert_eq!(header.flags, 0, "no source/deadline field on relay wire");
+            assert_eq!(
+                header.flags,
+                veil_proto::priority::INTERACTIVE as u16,
+                "neutral forwarding header must contain no source/deadline field"
+            );
             let mut forward =
                 veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
                     .unwrap();
@@ -1667,4 +1674,156 @@ async fn t1_4_followup_bind_times_out_when_daemon_unresponsive() {
 
     let _ = shutdown_tx.send(true);
     let _ = server_handle.await;
+}
+
+/// Real SDK + IPC: a stopped reliable producer must neither fill the shared
+/// writer indefinitely nor prevent direct media/control from reaching the node.
+#[tokio::test]
+async fn blocked_remote_file_keeps_sdk_ipc_media_and_control_live() {
+    use std::sync::Mutex;
+    use tokio::io::AsyncWriteExt;
+    use veil_proto::{AppDataPayload, AppMsg, codec, header::HEADER_SIZE};
+    const PEER: [u8; 32] = [0xC7; 32];
+    struct Gate {
+        entered: tokio::sync::Notify,
+        permits: tokio::sync::Semaphore,
+        frames: Mutex<Vec<Vec<u8>>>,
+        rt: tokio::sync::Notify,
+    }
+    impl veil_types::FrameBroadcaster for Gate {
+        fn send_to(&self, _: &[u8; 32], _: u8, frame: Vec<u8>) -> bool {
+            if codec::decode_header(&frame).unwrap().msg_type == AppMsg::AppRtData as u16 {
+                self.rt.notify_one();
+            }
+            true
+        }
+        fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+        fn active_node_ids(&self) -> Vec<[u8; 32]> {
+            vec![PEER]
+        }
+        fn send_reliable_to<'a>(
+            &'a self,
+            _: &'a [u8; 32],
+            bytes: Vec<u8>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.permits.acquire().await.unwrap().forget();
+                self.frames.lock().unwrap().push(bytes);
+                true
+            })
+        }
+    }
+    let sock = temp_socket();
+    let registry = Arc::new(AppEndpointRegistry::new());
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let gate = Arc::new(Gate {
+        entered: tokio::sync::Notify::new(),
+        rt: tokio::sync::Notify::new(),
+        permits: tokio::sync::Semaphore::new(0),
+        frames: Mutex::new(Vec::new()),
+    });
+    let mut server = IpcServer::new(
+        IpcEndpoint::Unix(sock.clone()),
+        shutdown_rx,
+        registry.clone(),
+        node_id(),
+    )
+    .with_session_tx_registry(gate.clone());
+    let task = tokio::spawn(async move { server.run().await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let client = veilclient::VeilClient::connect(&sock).await.unwrap();
+    let mut app = client.bind_named("credit.test", "file", 9).await.unwrap();
+    assert!(registry.route_stream_open(
+        *app.app_id(),
+        9,
+        41,
+        PEER,
+        veil_proto::SenderProvenance::SessionPeer,
+        veil_proto::STREAM_INITIAL_WINDOW
+    ));
+    let mut file = tokio::time::timeout(Duration::from_secs(1), app.accept_stream())
+        .await
+        .unwrap()
+        .unwrap()
+        .stream;
+    let payload: Vec<_> = (0..512 * 1024 + 19).map(|n| (n % 251) as u8).collect();
+    let expected = payload.clone();
+    let write = tokio::spawn(async move {
+        file.write_all(&payload).await.unwrap();
+        file.shutdown().await.unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(1), gate.entered.notified())
+        .await
+        .unwrap();
+    // Give the producer a chance to exhaust its negotiated 8 KiB source credit.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !write.is_finished(),
+        "producer ignored reliable source credit"
+    );
+    let identity = tokio::time::timeout(Duration::from_millis(250), client.node_identity()).await;
+    let (sender, receiver) = app.into_split();
+    let rt_sent = tokio::time::timeout(
+        Duration::from_millis(250),
+        sender.send_rt_data_on_local_lane(
+            0,
+            PEER,
+            [0xAA; 32],
+            9,
+            13,
+            42,
+            0,
+            111,
+            b"opaque media cell",
+        ),
+    )
+    .await;
+    let rt_admitted = tokio::time::timeout(Duration::from_millis(250), gate.rt.notified()).await;
+    // Release on both positive and negative paths before asserting progress.
+    gate.permits.add_permits(1024);
+    tokio::time::timeout(Duration::from_secs(3), write)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if gate.frames.lock().unwrap().last().is_some_and(|f| {
+                codec::decode_header(f).unwrap().msg_type == AppMsg::AppClose as u16
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let frames = gate.frames.lock().unwrap();
+    let mut actual = Vec::new();
+    for f in frames.iter().take(frames.len() - 1) {
+        let h = codec::decode_header(f).unwrap();
+        assert_eq!(h.msg_type, AppMsg::AppData as u16);
+        assert_eq!(
+            h.flags,
+            veil_proto::priority::INTERACTIVE as u16,
+            "local credit leaked to network header"
+        );
+        actual.extend(AppDataPayload::decode(&f[HEADER_SIZE..]).unwrap().data);
+    }
+    assert_eq!(
+        actual, expected,
+        "loss/duplication/reordering across many source windows"
+    );
+    drop(frames);
+    drop(sender);
+    drop(receiver);
+    drop(client);
+    let _ = shutdown.send(true);
+    task.await.unwrap();
+    assert_eq!(
+        identity.expect("file held IPC control").unwrap().node_id,
+        node_id()
+    );
+    rt_sent.expect("file held SDK media write").unwrap();
+    rt_admitted.expect("file held media admission at node");
 }
