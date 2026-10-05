@@ -17,6 +17,7 @@ pub(super) struct LocalReliableAdmission {
     active_until: Option<Instant>,
     active_window: Option<u64>,
     pressure_until: Option<Instant>,
+    ack_pressure_until: Option<Instant>,
     last_expired: u64,
     secondary_next: Option<Instant>,
 }
@@ -28,6 +29,7 @@ impl LocalReliableAdmission {
             active_until: None,
             active_window: None,
             pressure_until: None,
+            ack_pressure_until: None,
             last_expired: 0,
             secondary_next: None,
         }
@@ -75,10 +77,13 @@ impl LocalReliableAdmission {
     }
 
     fn observe_pressure(&mut self, rtt_us: u64, expired: u64, ack_blocked: bool, now: Instant) {
-        if ack_blocked
-            || rtt_us > PRIMARY_PRESSURE_RTT.as_micros() as u64
-            || expired > self.last_expired
-        {
+        // An independent primary's missing ACK must curb lossy secondary
+        // production without also shrinking the reliable parent carrying
+        // session control/rekeys. Retain that path's previous window policy.
+        if ack_blocked {
+            self.ack_pressure_until = Some(now + PRESSURE_GRACE);
+        }
+        if rtt_us > PRIMARY_PRESSURE_RTT.as_micros() as u64 || expired > self.last_expired {
             self.pressure_until = Some(now + PRESSURE_GRACE);
         }
         // A retired child can be replaced by a fresh connection with zero counters.
@@ -95,7 +100,9 @@ impl LocalReliableAdmission {
         if local_priority != veil_proto::priority::BULK {
             return true;
         }
-        if !self.active_until.is_some_and(|until| now < until) || !self.pressured(now) {
+        let secondary_pressured =
+            self.pressured(now) || self.ack_pressure_until.is_some_and(|until| now < until);
+        if !self.active_until.is_some_and(|until| now < until) || !secondary_pressured {
             self.secondary_next = None;
             return true;
         }
@@ -116,6 +123,7 @@ impl LocalReliableAdmission {
         if self.active_until.take().is_some() {
             self.active_window = None;
             self.pressure_until = None;
+            self.ack_pressure_until = None;
             self.secondary_next = None;
             self.handle
                 .set_reliable_send_window(DEFAULT_RELIABLE_SEND_WINDOW_BYTES);
