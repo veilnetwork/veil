@@ -87,10 +87,10 @@ const MEDIA_SEALED_TAG_LEN: usize = 16;
 pub(crate) const MEDIA_SEAL_OVERHEAD: usize = MEDIA_SEALED_HEADER_LEN + MEDIA_SEALED_TAG_LEN;
 const MEDIA_SEALED_MAX_EPOCHS: usize = 4;
 const MEDIA_SEALED_KDF_CONTEXT: &str = "xveil/call-media/channel-epoch/v1";
-/// How many peers' replay windows are retained across channel teardown. A
+/// How many receive-key replay windows survive channel teardown. A
 /// device holds one live call at a time and rebuilds its route a handful of
 /// times; eight covers that with room to spare and bounds the residue.
-const MEDIA_REPLAY_PEERS_MAX: usize = 8;
+const MEDIA_REPLAY_KEYS_MAX: usize = 8;
 
 fn media_nonce(sequence: u64) -> Nonce {
     let mut nonce = [0u8; 12];
@@ -201,7 +201,7 @@ impl MediaCipherTx {
     }
 }
 
-/// What has already been played from one peer, per epoch salt.
+/// What has already been played under one receive key, per epoch salt.
 ///
 /// Deliberately holds NO key material — a salt is a public wire value and a
 /// window is a bitmap — because it deliberately OUTLIVES the channel that
@@ -245,42 +245,37 @@ impl MediaReplayState {
     }
 }
 
-/// Replay state per PEER, retained across channel teardown.
+/// Replay state per exact directional receive key, retained across teardown.
 ///
-/// A call rebuilds its media channel as a matter of course — a failed direct
-/// attempt falls back to relay, a session rebuild re-opens, an onion route is
-/// repaired — and the rebuilt channel derives the same keys from the same call.
-/// Were the window owned by the channel, every rebuild would hand an attacker a
-/// clean slate: capture a sealed cell now, replay it into the new channel
-/// afterwards, and the AEAD would accept it as a fresh epoch. Tying the window
-/// to the peer instead makes "this cell was already played" survive the
-/// rebuild.
+/// Direct sessions attribute the sender to its identity, while relay envelopes
+/// carry its physical device. A call switching between those addresses retains
+/// the same directional key. Address-scoped history allowed a captured valid
+/// cell to open again after that switch. Key scope shares the existing replay
+/// window without accepting an alias or searching unrelated channel keys.
 ///
-/// Keyed by peer node id — an identifier the process already handles
-/// everywhere — rather than by anything derived from the call key, so retaining
-/// it leaves behind nothing that was not already public. Bounded LRU: a stale
-/// entry can only ever cause a false reject if a future epoch salt collides
-/// with a retained one (2^-64), and a new call's cells fail that peer's old
-/// AEAD anyway.
+/// The bounded, process-local LRU retains only a domain-separated digest of the
+/// random 256-bit key, never the key itself. Nothing is logged or persisted.
+/// Ciphertext still must authenticate before the shared window is committed.
 type SharedReplayState = Arc<Mutex<MediaReplayState>>;
 type ReplayLru = VecDeque<([u8; 32], SharedReplayState)>;
 
 static REPLAY: LazyLock<Mutex<ReplayLru>> = LazyLock::new(|| Mutex::new(VecDeque::new()));
 
-fn replay_state_for(peer: &[u8; 32]) -> SharedReplayState {
+fn replay_state_for(master: &[u8; 32]) -> SharedReplayState {
+    let scope = blake3::derive_key("xveil/call-media/receive-replay-scope/v1", master);
     let mut states = REPLAY.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(index) = states.iter().position(|(known, _)| known == peer)
+    if let Some(index) = states.iter().position(|(known, _)| known == &scope)
         && let Some(entry) = states.remove(index)
     {
         let state = Arc::clone(&entry.1);
         states.push_front(entry);
         return state;
     }
-    if states.len() >= MEDIA_REPLAY_PEERS_MAX {
+    if states.len() >= MEDIA_REPLAY_KEYS_MAX {
         states.pop_back();
     }
     let state = Arc::new(Mutex::new(MediaReplayState::default()));
-    states.push_front((*peer, Arc::clone(&state)));
+    states.push_front((scope, Arc::clone(&state)));
     state
 }
 
@@ -332,11 +327,11 @@ fn open_sealed(cipher: &ChaCha20Poly1305, sequence: u64, sealed: &[u8]) -> Optio
 }
 
 impl MediaCipherRx {
-    fn new(peer: &[u8; 32], master: &[u8; 32]) -> Self {
+    fn new(_peer: &[u8; 32], master: &[u8; 32]) -> Self {
         Self {
             master: Zeroizing::new(*master),
             ciphers: VecDeque::new(),
-            replay: replay_state_for(peer),
+            replay: replay_state_for(master),
         }
     }
 
@@ -389,8 +384,8 @@ impl MediaCipherRx {
         // THE SECOND CHECK, under the same guard as the commit.
         //
         // The pre-check above releases the lock before the AEAD runs, and the
-        // replay window is SHARED per peer — `replay_state_for` hands the same
-        // `Arc` to every receiver built for one peer, which is what makes the
+        // replay window is SHARED per receive key — `replay_state_for` hands the same
+        // `Arc` to every receiver built with that key, which is what makes the
         // history survive a channel rebuild. So two receivers can both pass
         // `accepts` for one cell and then both commit it, and both deliver it:
         // the window said "not played" to each of them, truthfully, before
@@ -469,7 +464,7 @@ impl SealedMediaCell {
 /// fresh random epoch salt is mixed into the TX sub-key, so rebuilding a route
 /// during the same call can safely restart its sequence at one without nonce
 /// reuse. RX keeps a tiny bounded set of recent epochs for make-before-break
-/// overlap, shared per peer (see [`REPLAY`]). The two local producers have
+/// overlap, shared per receive key (see [`REPLAY`]). The two local producers have
 /// independent epochs and counters, so a video burst cannot age delayed audio
 /// out of its replay window. Their wire salts are random and encode no role.
 pub(crate) struct MediaCipher {
@@ -1234,8 +1229,8 @@ mod tests {
 
     /// One cell is delivered once, even when two receivers admit it together.
     ///
-    /// The replay window is SHARED per peer — `replay_state_for` hands the same
-    /// `Arc` to every receiver built for one peer, which is what makes the
+    /// The replay window is SHARED per receive key — `replay_state_for` hands the same
+    /// `Arc` to every receiver built with that key, which is what makes the
     /// history survive a channel rebuild — and the pre-check released it
     /// before the AEAD ran. Two receivers could therefore both be told "not
     /// played" for one cell, truthfully, before either had played it, and both
@@ -1875,6 +1870,36 @@ mod tests {
             "the rebuilt channel must still carry the call"
         );
         clear_recv_callback(peer, 11);
+    }
+
+    #[test]
+    fn replay_survives_an_identity_to_device_route_rebind() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let identity = [0xe1u8; 32];
+        let device = [0xe2u8; 32];
+        let a_to_b = [0x91u8; 32];
+        let b_to_a = [0x92u8; 32];
+        let theirs = peer_cipher(b_to_a, a_to_b);
+        let captured = theirs.seal(&[0x80u8; 90]).expect("peer seals");
+
+        let direct = cipher(identity, a_to_b, b_to_a);
+        assert!(
+            direct.open(captured.as_bytes()).is_some(),
+            "direct original opens"
+        );
+        drop(direct);
+        // The same authenticated call switches from session attribution to
+        // the physical sender carried by a relay envelope, retaining its keys.
+        let relay = cipher(device, a_to_b, b_to_a);
+        assert!(
+            relay.open(captured.as_bytes()).is_none(),
+            "address change must not reset replay"
+        );
+        let fresh = theirs.seal(&[0x80u8; 90]).expect("peer seals next");
+        assert!(
+            relay.open(fresh.as_bytes()).is_some(),
+            "new relay data still opens"
+        );
     }
 
     #[test]
