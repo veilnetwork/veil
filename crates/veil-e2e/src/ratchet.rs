@@ -180,6 +180,12 @@ pub enum RatchetSpliceError {
     #[error("no ratchet session for this conversation")]
     NoSession,
 
+    /// A prologue was refused against a held conversation. It may be a
+    /// replay or a restart waiting for certificate lookup/admission; neither
+    /// case justifies telling the sender to discard its working chain.
+    #[error("prologue refused while retaining conversation: {0}")]
+    PrologueRefused(RatchetError),
+
     /// The peer's certificate carries no usable device Diffie-Hellman key, so
     /// there is nothing to authenticate them by and no key agreement to run.
     #[error("peer certificate carries no ratchet key")]
@@ -434,9 +440,9 @@ struct Entry {
     /// A REPLAY of the prologue this entry was built from is never counted:
     /// duplicate delivery of one prologue is ordinary on a lossy network, and
     /// treating it as evidence would let a recorded prologue unseat a live
-    /// conversation. Anything else that will not open is real evidence — a bare
-    /// frame from a chain that moved on, or a NEW prologue, which is the peer
-    /// saying it has started over.
+    /// conversation. Only a bare frame with an available message key can
+    /// provide mismatch evidence. A consumed key and a refused new prologue
+    /// never count; the latter must wait for verified freshness admission.
     frame_failures: u32,
     /// The prologue this conversation was built from, kept so a replay of it
     /// can be told from a peer genuinely re-keying. In memory only.
@@ -1530,6 +1536,15 @@ fn count_frame_failure(entry: &mut Entry) -> bool {
     entry.frame_failures >= WEDGED_AFTER_FRAME_FAILURES
 }
 
+impl RatchetSpliceError {
+    /// This refusal is compatible with an already delivered packet; it
+    /// cannot justify resetting a live chain.
+    #[must_use]
+    pub fn is_unavailable_message_key(&self) -> bool {
+        matches!(self, Self::Ratchet(RatchetError::MessageKeyUnavailable))
+    }
+}
+
 pub fn open(
     store: &RatchetStore,
     me: &RatchetIdentity,
@@ -1767,6 +1782,20 @@ fn open_inner(
                             .accepted_prologue
                             .as_deref()
                             .is_some_and(|p| blob.len() >= p.len() && &blob[..p.len()] == p);
+                    // A consumed message key and an already accepted prologue
+                    // cannot diagnose a broken conversation. Reject them
+                    // without counting a wedge or asking the sender to reset
+                    // its still-valid half. No plaintext or authority is granted.
+                    if e == RatchetError::MessageKeyUnavailable {
+                        return Err(RatchetSpliceError::Ratchet(
+                            RatchetError::MessageKeyUnavailable,
+                        ));
+                    }
+                    if is_replay_of_our_own {
+                        // Preserve the crypto refusal (including downgrade
+                        // attempts); only the reset policy differs here.
+                        return Err(RatchetSpliceError::PrologueRefused(e));
+                    }
                     // Whether this prologue gets to ask `fresher`. The very
                     // prologue this conversation was built from is known on
                     // sight and is never fresher.
@@ -1785,12 +1814,15 @@ fn open_inner(
                         entry.last_displace_try = now_unix;
                         only_to_ask_fresher = Some(RatchetSpliceError::Ratchet(e));
                     } else {
-                        if !is_replay_of_our_own && count_frame_failure(entry) {
+                        if kind == KIND_FRAME && count_frame_failure(entry) {
                             g.entries.remove(&key);
                             g.commit_change(key);
                             return Err(RatchetSpliceError::WedgedConversationDropped);
                         }
                         if !displaceable(entry) {
+                            if kind == KIND_PROLOGUE {
+                                return Err(RatchetSpliceError::PrologueRefused(e));
+                            }
                             return Err(RatchetSpliceError::Ratchet(e));
                         }
                     }
@@ -1872,13 +1904,11 @@ fn open_inner(
                 if admit.is_none()
                     && let Some(refusal) = only_to_ask_fresher
                 {
-                    // Opened, but only to ask whether it was newer, and it was
-                    // not. Refused as it would have been without asking — and
-                    // counted now, as it would have been.
-                    if g.entries.get_mut(&key).is_some_and(count_frame_failure) {
-                        g.entries.remove(&key);
-                        g.commit_change(key);
-                        return Err(RatchetSpliceError::WedgedConversationDropped);
+                    // Cryptographically valid but older than the held peer
+                    // send time, including after restore. A recorded prologue
+                    // must neither wedge this chain nor reset the sender's.
+                    if let RatchetSpliceError::Ratchet(error) = refusal {
+                        return Err(RatchetSpliceError::PrologueRefused(error));
                     }
                     return Err(refusal);
                 }
@@ -3257,6 +3287,70 @@ mod tests {
     }
 
     #[test]
+    fn consumed_bare_frames_never_wedge_a_live_conversation() {
+        let (a, b) = (device(0xC7), device(0xD7));
+        a_to_b(&a, &b, b"first").unwrap();
+        let back = seal(
+            &b.store,
+            &b.me(),
+            keys(&a, &a.ek(), &a.ratchet_pk()),
+            b"answer",
+            NOW,
+        )
+        .unwrap()
+        .0;
+        open(
+            &a.store,
+            &a.me(),
+            &b.node_id,
+            &back,
+            Some(&dev(b.instance_id, &b.ratchet_pk())),
+            NOW,
+        )
+        .unwrap();
+        let bare = seal(
+            &a.store,
+            &a.me(),
+            keys(&b, &b.ek(), &b.ratchet_pk()),
+            b"delivered once",
+            NOW,
+        )
+        .unwrap()
+        .0;
+        assert_eq!(bare[2], KIND_FRAME);
+        open(
+            &b.store,
+            &b.me(),
+            &a.node_id,
+            &bare,
+            Some(&dev(a.instance_id, &a.ratchet_pk())),
+            NOW,
+        )
+        .unwrap();
+        let version = b.store.version();
+        for _ in 0..WEDGED_AFTER_FRAME_FAILURES * 3 {
+            assert_eq!(
+                open(
+                    &b.store,
+                    &b.me(),
+                    &a.node_id,
+                    &bare,
+                    Some(&dev(a.instance_id, &a.ratchet_pk())),
+                    NOW
+                )
+                .unwrap_err(),
+                RatchetSpliceError::Ratchet(RatchetError::MessageKeyUnavailable)
+            );
+        }
+        assert_eq!(b.store.version(), version);
+        assert_eq!(b.store.len(), 1);
+        assert_eq!(
+            a_to_b(&a, &b, b"next fresh message").unwrap().plaintext,
+            b"next fresh message"
+        );
+    }
+
+    #[test]
     fn a_conversation_flows_both_ways() {
         let (a, b) = (device(0xA2), device(0xB2));
         a_to_b(&a, &b, b"one").expect("open");
@@ -4123,7 +4217,7 @@ mod tests {
                 NOW
             )
             .unwrap_err(),
-            RatchetSpliceError::Ratchet(RatchetError::AuthFailed),
+            RatchetSpliceError::PrologueRefused(RatchetError::AuthFailed),
         );
         assert_eq!(*b.store.export(&key).expect("held"), *before);
         assert_eq!(
@@ -5525,16 +5619,17 @@ mod tests {
         // built from, so it is not caught on sight — it has to be opened, and
         // opening it must not deliver "first ever" again.
         let version_before = b.store.version();
-        let replayed = open_at(&b, &a, &old_prologue, NOW + 100);
-        assert!(
-            replayed.is_err(),
-            "a replayed prologue is refused, not read: got {:?}",
-            replayed.map(|o| o.plaintext)
-        );
-        assert_eq!(b.store.version(), version_before, "nothing was replaced");
-        let still = seal_at(&a_again, &b, b"still here", NOW + 101);
+        for i in 0..9 {
+            let replayed = open_at(&b, &a, &old_prologue, NOW + 100 + i);
+            assert!(
+                matches!(replayed, Err(RatchetSpliceError::PrologueRefused(_))),
+                "recorded prologue must not ask either side to reset: {replayed:?}"
+            );
+            assert_eq!(b.store.version(), version_before, "nothing was replaced");
+        }
+        let still = seal_at(&a_again, &b, b"still here", NOW + 110);
         assert_eq!(
-            open_at(&b, &a_again, &still, NOW + 101)
+            open_at(&b, &a_again, &still, NOW + 110)
                 .expect("the live conversation is untouched")
                 .plaintext,
             b"still here"
@@ -5560,7 +5655,7 @@ mod tests {
         let restart = seal_at(&a_again, &b, b"restart", NOW + 51);
         let refused = open_at(&b, &a_again, &restart, NOW + 51);
         assert!(
-            matches!(refused, Err(RatchetSpliceError::Ratchet(_))),
+            matches!(refused, Err(RatchetSpliceError::PrologueRefused(_))),
             "inside the interval the question is not asked again: {:?}",
             refused.map(|o| o.plaintext),
         );
