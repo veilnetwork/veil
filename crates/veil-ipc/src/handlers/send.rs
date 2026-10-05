@@ -1054,6 +1054,7 @@ pub(crate) async fn handle_ipc_send(
             for hop in hops.into_iter().take(3) {
                 let mut header =
                     FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+                header.set_priority(veil_proto::priority::INTERACTIVE);
                 header.body_len = (32 + bytes.len() + 8 + 1) as u32;
                 let mut frame = codec::encode_header(&header).to_vec();
                 frame.extend_from_slice(&hop);
@@ -1597,6 +1598,7 @@ pub(crate) async fn handle_ipc_send(
                                 FrameFamily::Delivery as u8,
                                 DeliveryMsg::Forward as u16,
                             );
+                            hdr.set_priority(veil_proto::priority::INTERACTIVE);
                             hdr.body_len = body_len as u32;
                             let mut frame = codec::encode_header(&hdr).to_vec();
                             frame.extend_from_slice(&next_hop);
@@ -1670,10 +1672,9 @@ pub(crate) async fn handle_ipc_send(
                 // transit_relay capability; the IPC originator uses ForwardPayload for now.
                 let make_fwd_frame = |next_hop: [u8; 32]| -> Vec<u8> {
                     let attempt_suffix_len = if send.require_ack { 2 } else { 0 };
-                    // Real-time media stamps its class so every relay on the
-                    // path re-queues it in the REALTIME lane instead of
-                    // behind bulk delivery chatter (legacy relays ignore the
-                    // optional tail and forward unchanged).
+                    // Neutral loss-tolerant data never asks a relay for a
+                    // faster queue. Older relays use their ordered ordinary
+                    // transport; new peers explicitly negotiate datagram support.
                     let class_suffix_len = if relay_wire_realtime { 2 } else { 0 };
                     let body_len =
                         32 + env_bytes.len() + 8 + 1 + attempt_suffix_len + class_suffix_len;
@@ -1681,6 +1682,7 @@ pub(crate) async fn handle_ipc_send(
                         veil_proto::family::FrameFamily::Delivery as u8,
                         DeliveryMsg::Forward as u16,
                     );
+                    hdr.set_priority(veil_proto::priority::INTERACTIVE);
                     hdr.body_len = body_len as u32;
                     let mut frame = codec::encode_header(&hdr).to_vec();
                     frame.extend_from_slice(&next_hop);
@@ -1693,7 +1695,7 @@ pub(crate) async fn handle_ipc_send(
                     }
                     if relay_wire_realtime {
                         frame.push(veil_proto::delivery::FORWARD_TRAFFIC_CLASS_MARKER);
-                        frame.push(veil_proto::header::priority::REALTIME);
+                        frame.push(veil_proto::header::priority::INTERACTIVE);
                     }
                     frame
                 };
@@ -2262,12 +2264,19 @@ mod ratchet_send_tests {
                 "only the sender's local scheduler sees the choice"
             );
             let header = codec::decode_header(&bytes).unwrap();
-            assert_eq!(header.flags, 0, "no local priority bits on the relay wire");
+            assert_eq!(
+                header.priority(),
+                veil_proto::priority::INTERACTIVE,
+                "relay wire is neutral for every local lane"
+            );
             let mut forward =
                 veil_proto::delivery::ForwardPayload::decode(&bytes[veil_proto::HEADER_SIZE..])
                     .unwrap();
             assert_eq!(forward.envelope.payload, sealed);
-            assert_eq!(forward.traffic_class, Some(veil_proto::priority::REALTIME));
+            assert_eq!(
+                forward.traffic_class,
+                Some(veil_proto::priority::INTERACTIVE)
+            );
             // Delivery bookkeeping may vary; transport/application fields may not.
             forward.envelope.content_id = [0; 32];
             forward.envelope.created_at = 0;
@@ -2303,7 +2312,15 @@ mod ratchet_send_tests {
             let (priority, frame) = &sent[0];
             assert_eq!(*priority, veil_proto::priority::BACKGROUND);
             let header = codec::decode_header(frame).unwrap();
-            assert_eq!(header.flags, 0, "no lane sent to peers");
+            assert_eq!(
+                header.priority(),
+                if direct {
+                    0
+                } else {
+                    veil_proto::priority::INTERACTIVE
+                },
+                "local lane is never a relay priority"
+            );
             let sealed = if direct {
                 veil_proto::app::AppSendPayload::decode(&frame[veil_proto::HEADER_SIZE..])
                     .unwrap()
@@ -3447,7 +3464,10 @@ mod ratchet_send_tests {
             let sent = fx.taken();
             assert_eq!(sent.len(), 1);
             assert_eq!(sent[0].0, if ready { DATAGRAM } else { RELAY });
-            assert_eq!(codec::decode_header(&sent[0].1).unwrap().flags, 0);
+            assert_eq!(
+                codec::decode_header(&sent[0].1).unwrap().priority(),
+                veil_proto::priority::INTERACTIVE
+            );
         }
     }
 
@@ -3487,7 +3507,11 @@ mod ratchet_send_tests {
                 assert_ne!(hop, PEER);
                 assert!(hops.insert(hop), "copies require distinct first hops");
                 let header = veil_proto::codec::decode_header(&frame).unwrap();
-                assert_eq!(header.flags, 0, "local lane is not a wire priority");
+                assert_eq!(
+                    header.priority(),
+                    veil_proto::priority::INTERACTIVE,
+                    "local lane is not a relay priority"
+                );
                 let fwd =
                     veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
                         .unwrap();

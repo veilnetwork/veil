@@ -108,8 +108,8 @@ impl DecryptedForward {
 
 /// Encode the Forward trailer shared by direct-sovereign, route-cache and
 /// gateway forwarding. Keeping the optional delivery-attempt and traffic-
-/// class extensions here prevents a fallback path from silently downgrading
-/// relay-safe retries or a downstream hop's queueing class.
+/// class extensions here preserves retries while removing sender-selected
+/// priority before another relay (including a legacy relay) sees the frame.
 fn forward_suffix(payload: &ForwardPayload, relay_hops_out: u8) -> Vec<u8> {
     let mut suffix = Vec::with_capacity(
         9 + usize::from(payload.delivery_attempt.is_some()) * 2
@@ -121,9 +121,12 @@ fn forward_suffix(payload: &ForwardPayload, relay_hops_out: u8) -> Vec<u8> {
         suffix.push(veil_proto::delivery::FORWARD_DELIVERY_ATTEMPT_MARKER);
         suffix.push(attempt);
     }
-    if let Some(tc) = payload.traffic_class {
+    if matches!(
+        payload.traffic_class,
+        Some(veil_proto::priority::REALTIME | veil_proto::priority::INTERACTIVE)
+    ) {
         suffix.push(veil_proto::delivery::FORWARD_TRAFFIC_CLASS_MARKER);
-        suffix.push(tc);
+        suffix.push(veil_proto::priority::INTERACTIVE);
     }
     suffix
 }
@@ -267,6 +270,7 @@ impl FrameDispatcher {
 
             let mut fwd_hdr =
                 FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+            fwd_hdr.set_priority(veil_proto::priority::INTERACTIVE);
             fwd_hdr.body_len = body_len as u32;
             let mut frame = Vec::with_capacity(total_wire_len);
             frame.extend_from_slice(&encode_header(&fwd_hdr));
@@ -955,6 +959,7 @@ impl FrameDispatcher {
             veil_proto::family::FrameFamily::Delivery as u8,
             veil_proto::family::DeliveryMsg::Forward as u16,
         );
+        fwd_hdr.set_priority(veil_proto::priority::INTERACTIVE);
         fwd_hdr.body_len = body_len as u32;
         let mut frame = Vec::with_capacity(veil_proto::header::HEADER_SIZE + body_len);
         frame.extend_from_slice(&veil_proto::codec::encode_header(&fwd_hdr));
@@ -1149,6 +1154,7 @@ impl FrameDispatcher {
             let make_fwd_frame = |hop: NodeIdBytes| -> Vec<u8> {
                 let mut fwd_hdr =
                     FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+                fwd_hdr.set_priority(veil_proto::priority::INTERACTIVE);
                 fwd_hdr.body_len = body_len as u32;
                 // single allocation sized for the whole wire frame.
                 // The previous `encode_header(...).to_vec` pattern allocated
@@ -2238,6 +2244,7 @@ impl FrameDispatcher {
                 veil_proto::family::FrameFamily::Delivery as u8,
                 DeliveryMsg::Forward as u16,
             );
+            fwd_hdr.set_priority(veil_proto::priority::INTERACTIVE);
             fwd_hdr.body_len = rr.payload.len() as u32;
             // single-allocation frame assembly.
             let frame = veil_proto::codec::encode_frame(&fwd_hdr, &rr.payload);
@@ -2368,6 +2375,7 @@ pub(crate) fn relayed_unopenable_frame(
     }
     .encode();
     let mut hdr = FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+    hdr.set_priority(veil_proto::priority::INTERACTIVE);
     hdr.body_len = body.len() as u32;
     veil_proto::codec::encode_frame(&hdr, &body)
 }
@@ -2701,7 +2709,7 @@ mod tests {
             (hdr, body)
         };
 
-        // Marked REALTIME → neutral queue class + transport hint preserved.
+        // Legacy REALTIME → neutral queue and neutral downstream transport hint.
         let (hdr, body) = mk_frame(0x51, Some(veil_proto::header::priority::REALTIME));
         let r = disp.dispatch(&hdr, &body, sender_peer);
         assert!(matches!(r, DispatchResult::NoResponse), "got {r:?}");
@@ -2709,13 +2717,13 @@ mod tests {
         assert_eq!(priority, veil_proto::header::priority::INTERACTIVE);
         assert_eq!(
             veil_proto::codec::decode_header(&bytes).unwrap().priority(),
-            veil_proto::header::priority::REALTIME, // legacy wire bits, not scheduler input
+            veil_proto::header::priority::INTERACTIVE, // neutral on legacy relays too
         );
         let relayed = ForwardPayload::decode(&bytes[veil_proto::header::HEADER_SIZE..]).unwrap();
         assert_eq!(
             relayed.traffic_class,
-            Some(veil_proto::header::priority::REALTIME),
-            "marker must survive the re-encode for further hops",
+            Some(veil_proto::header::priority::INTERACTIVE),
+            "legacy priority must become a neutral transport hint",
         );
 
         // Unmarked legacy frame → INTERACTIVE, even though the frame header's
@@ -2740,11 +2748,11 @@ mod tests {
             assert_eq!(priority, veil_proto::header::priority::INTERACTIVE);
             assert_eq!(
                 veil_proto::codec::decode_header(&bytes).unwrap().priority(),
-                veil_proto::header::priority::REALTIME, // legacy wire bits, not scheduler input
+                veil_proto::header::priority::INTERACTIVE, // neutral on legacy relays too
             );
             let relayed =
                 ForwardPayload::decode(&bytes[veil_proto::header::HEADER_SIZE..]).unwrap();
-            assert_eq!(relayed.traffic_class, Some(class));
+            assert_eq!(relayed.traffic_class, (class == 1).then_some(1));
         }
     }
 

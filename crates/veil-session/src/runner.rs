@@ -208,6 +208,7 @@ struct RealtimeDatagramLane {
     local_reliable: local_reliable_admission::LocalReliableAdmission,
     peer_rotates: bool,
     peer_circuit_datagrams: bool,
+    peer_neutral_forwards: bool,
     parallel: Option<parallel_lanes::ParallelSession>,
 }
 
@@ -713,6 +714,9 @@ pub struct RealtimeLaneOffer {
     pub peer_flows: bool,
     /// Explicitly negotiated generic loss-tolerant circuit-cell decoder.
     pub peer_circuit_datagrams: bool,
+    /// Explicit decoding support for neutral forwarded datagrams. Without it
+    /// these frames retain the ordinary ordered compatibility path.
+    pub peer_neutral_forwards: bool,
     pub parallel: Option<ParallelQuicOffer>,
 }
 
@@ -3596,6 +3600,7 @@ impl SessionRunner {
                         ))),
                         peer_rotates: offer.peer_rotates,
                         peer_circuit_datagrams: offer.peer_circuit_datagrams,
+                        peer_neutral_forwards: offer.peer_neutral_forwards,
                         parallel: offer
                             .parallel
                             .filter(|_| offer.peer_flows && offer.peer_rotates)
@@ -4086,9 +4091,12 @@ impl SessionRunner {
                     lane.local_reliable.expire(std::time::Instant::now());
                     for _ in 0..PQ_DRAIN_FRAMES_PER_PASS {
                         let supported = |frame: &[u8]| {
-                            decode_realtime_lane_frame(frame).is_some_and(|(_, _, kind)| {
-                                kind != RealtimeLaneFrameKind::CircuitDatagram
-                                    || lane.peer_circuit_datagrams
+                            decode_realtime_lane_frame(frame).is_some_and(|(_, body, kind)| {
+                                (kind != RealtimeLaneFrameKind::CircuitDatagram
+                                    || lane.peer_circuit_datagrams)
+                                    && (kind != RealtimeLaneFrameKind::RelayForward
+                                        || body.last() != Some(&veil_proto::priority::INTERACTIVE)
+                                        || lane.peer_neutral_forwards)
                             })
                         };
                         let Some(envelope) = pq

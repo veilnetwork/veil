@@ -409,6 +409,9 @@ pub mod cap_extra_flags {
     pub const SUPPORTS_SHARED_PARALLEL_QUIC: u8 = 1 << 2;
     /// Reading and replying on a generic child connection in both directions.
     pub const SUPPORTS_DUPLEX_PARALLEL_QUIC: u8 = 1 << 3;
+    /// Neutral short-lived forwarded datagrams. Older decoders require a
+    /// REALTIME hint, which must no longer be emitted to request relay service.
+    pub const SUPPORTS_NEUTRAL_FORWARD_DATAGRAMS: u8 = 1 << 4;
 }
 
 // c: role_bits moved to veil-types alongside NodeRole.
@@ -497,6 +500,11 @@ impl CapabilitiesPayload {
     pub fn supports_circuit_datagrams(&self) -> bool {
         self.supports_realtime_datagrams()
             && self.extra_flags & cap_extra_flags::SUPPORTS_CIRCUIT_DATAGRAMS != 0
+    }
+
+    pub fn supports_neutral_forward_datagrams(&self) -> bool {
+        self.supports_realtime_datagrams()
+            && self.extra_flags & cap_extra_flags::SUPPORTS_NEUTRAL_FORWARD_DATAGRAMS != 0
     }
 
     /// Requires the opaque datagram codec and coordinated key rotation too.
@@ -2509,6 +2517,25 @@ mod tests {
         );
         caps.flags &= !cap_flags::SUPPORTS_REALTIME_DATAGRAMS;
         assert!(!caps.supports_circuit_datagrams());
+    }
+
+    #[test]
+    fn neutral_forward_support_requires_explicit_decoder_and_transport() {
+        let mut caps = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Core);
+        caps.extra_flags |= cap_extra_flags::SUPPORTS_NEUTRAL_FORWARD_DATAGRAMS;
+        assert!(!caps.supports_neutral_forward_datagrams());
+        caps.flags |= cap_flags::SUPPORTS_REALTIME_DATAGRAMS;
+        assert!(caps.supports_neutral_forward_datagrams());
+        assert!(
+            CapabilitiesPayload::decode(&caps.encode())
+                .unwrap()
+                .supports_neutral_forward_datagrams()
+        );
+        let legacy = CapabilitiesPayload::decode(&caps.encode()[..3]).unwrap();
+        assert!(
+            !legacy.supports_neutral_forward_datagrams(),
+            "legacy datagram transport is insufficient"
+        );
     }
 
     #[test]
