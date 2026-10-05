@@ -108,6 +108,9 @@ pub enum MlkemFanoutError {
 /// ready for use in encapsulation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedMlkemCert {
+    /// Transport device address certified by the document subkey.
+    /// Local reconstruction without a checked subkey leaves this absent.
+    pub device_id: Option<[u8; 32]>,
     pub node_id: [u8; 32],
     pub instance_id: [u8; 16],
     pub mlkem_algo: u8,
@@ -214,6 +217,7 @@ pub fn verify_mlkem_cert(
     })?;
 
     Ok(VerifiedMlkemCert {
+        device_id: Some(subkey.device_id),
         node_id: cert.node_id,
         instance_id: cert.instance_id,
         mlkem_algo: cert.mlkem_algo,
@@ -951,6 +955,11 @@ mod tests {
         assert_doc_verifies(&env);
         let cert = build_cert(&env);
         let verified = verify_mlkem_cert(&cert, &env.doc, env.now_unix_secs).unwrap();
+        assert_eq!(
+            verified.device_id,
+            Some(env.doc.identity_keys[cert.signing_identity_key_idx as usize].device_id)
+        );
+        assert_ne!(verified.device_id, Some(env.doc.node_id));
         assert_eq!(verified.ratchet_x25519_pubkey, cert.ratchet_x25519_pubkey);
         assert_ne!(verified.ratchet_x25519_pubkey, [0u8; 32]);
     }

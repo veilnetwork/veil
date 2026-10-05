@@ -84,6 +84,7 @@ pub(crate) struct DecryptedForward {
     /// published key, so anyone who read that key can produce one naming
     /// anyone.
     pub(crate) sender_proven: bool,
+    pub(crate) sender_device_id: Option<[u8; 32]>,
     /// Who the application is told the payload is from, when that is not the
     /// envelope's sender: the IDENTITY a relayed device's ratchet frame was
     /// sealed under. The envelope keeps the device, which is where
@@ -99,6 +100,7 @@ impl DecryptedForward {
             payload,
             ack_key,
             sender_proven: false,
+            sender_device_id: None,
             app_sender: None,
         }
     }
@@ -1645,20 +1647,12 @@ impl FrameDispatcher {
             wlock!(self.route_cache).insert(deliver_sender_node_id, *peer_id.as_bytes(), 1_000, 1);
         }
 
-        // A relayed ratchet frame names the app its IDENTITY and says which
-        // DEVICE sent it — the same pair a direct session reports. Without the
-        // device the app can only answer the identity, and anything that has to
-        // reach the device holding some state (a file offer's bytes live on the
-        // device that offered them) lands on whichever sibling owns the
-        // identity's rendezvous slots: measured on the stand, every 3 MB pull
-        // from a two-device identity went to the sibling without the file. The
-        // envelope's device is a hint for replies and routing, never for
-        // authorization. The ratchet proves the identity and instance inside
-        // its ciphertext; the outer transport address can be rewritten by a
-        // relay and must not be treated as that proof.
-        let origin_device = decrypted_app_sender
-            .filter(|identity| *identity != deliver_sender_node_id)
-            .map(|_| deliver_sender_node_id);
+        // Ratchet provenance proves the identity, not the outer envelope's
+        // device hint. Only the opened key's verified certificate can name the
+        // device to an IPC consumer that uses that pair for authorization.
+        // Without current certificate evidence, omit the device rather than
+        // teaching the app an attacker-selected device/identity association.
+        let origin_device = decrypted.sender_device_id;
         self.app_registry.route_ipc_deliver_with_reply(
             decrypted_app_sender.unwrap_or(deliver_sender_node_id),
             provenance,
@@ -1875,6 +1869,7 @@ impl FrameDispatcher {
                         payload: opened.plaintext,
                         ack_key: opened.ack_key,
                         sender_proven: opened.authenticated,
+                        sender_device_id: opened.sender_device_id,
                         app_sender: (ratchet_peer != envelope.sender_node_id)
                             .then_some(ratchet_peer),
                     });
@@ -4316,6 +4311,18 @@ mod ratchet_terminal_tests {
         let open_with = |lookup: bool| {
             let (alice, bob) = (party(ALICE, 0xA3), party(BOB, 0xB3));
             learn(&bob, &alice);
+            bob.runtime
+                .peer_ratchet_keys
+                .write()
+                .unwrap()
+                .get_mut(&ALICE)
+                .unwrap()
+                .remember_with_device(
+                    alice.instance_id,
+                    alice.ring.current_ratchet_pk(),
+                    u64::MAX,
+                    Some(ALICE_DEVICE),
+                );
             let payload = seal(&alice, &bob, b"from a sibling device");
             let (disp, _h, mut rx) = dispatcher_for(&bob);
             if lookup {
@@ -4361,6 +4368,47 @@ mod ratchet_terminal_tests {
         // ...and, as on a direct session, which device sent it: the device is
         // who holds whatever the message offers (a file's bytes).
         assert_eq!(origin_device, Some(ALICE_DEVICE));
+    }
+
+    #[test]
+    fn relay_cannot_choose_an_authenticated_origin_device() {
+        const VERIFIED: [u8; 32] = [0xD1; 32];
+        const FORGED: [u8; 32] = [0xF1; 32];
+        for certified in [false, true] {
+            let (alice, bob) = (party(ALICE, 0xA8), party(BOB, 0xB8));
+            learn(&bob, &alice);
+            if certified {
+                wlock!(bob.runtime.peer_ratchet_keys)
+                    .get_mut(&ALICE)
+                    .unwrap()
+                    .remember_with_device(
+                        alice.instance_id,
+                        alice.ring.current_ratchet_pk(),
+                        u64::MAX,
+                        Some(VERIFIED),
+                    );
+            }
+            let payload = seal(&alice, &bob, b"relay-rewritten outer device");
+            let (disp, _h, mut rx) = dispatcher_for(&bob);
+            let (hdr, body) = forward_frame([0x18; 32], payload);
+            let mut forward = veil_proto::delivery::ForwardPayload::decode(&body).unwrap();
+            forward.envelope.sender_node_id = FORGED;
+            disp.dispatch(&hdr, &forward.encode(), NodeId::from(RELAY));
+            let AppMessage::Deliver {
+                src_node_id,
+                provenance,
+                origin_device,
+                data,
+                ..
+            } = rx.try_recv().unwrap()
+            else {
+                panic!("expected delivery")
+            };
+            assert_eq!(src_node_id, ALICE);
+            assert_eq!(provenance, SenderProvenance::Signed);
+            assert_eq!(data.as_ref(), b"relay-rewritten outer device");
+            assert_eq!(origin_device, certified.then_some(VERIFIED));
+        }
     }
 
     #[test]
