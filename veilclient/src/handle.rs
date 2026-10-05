@@ -855,6 +855,33 @@ impl AppSender {
             .await
     }
 
+    /// Deadline-aware sealed relay media, with the same local admission and
+    /// pre-write expiry semantics as `send_rt_data_on_local_lane_before`.
+    /// The deadline changes no IPC payload, encryption or network header.
+    pub async fn send_relay_media_sealed_on_local_lane_before_owned(
+        &self,
+        local_priority: u8,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        data: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, ClientError> {
+        self.writer
+            .write_app_ipc_send_on_local_lane_before_owned(
+                local_priority,
+                &dst_node_id,
+                &self.app_id,
+                &dst_app_id,
+                dst_endpoint_id,
+                veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+                    | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED,
+                &data,
+                deadline,
+            )
+            .await
+    }
+
     /// Send one loss-tolerant media datagram at REALTIME session priority.
     ///
     /// Mirrors [`AppHandle::send_rt_data`] for split handles used by native
@@ -900,6 +927,69 @@ impl AppSender {
         payload_type: u32,
         data: &[u8],
     ) -> Result<(), ClientError> {
+        self.send_rt_data_with_local_deadline(
+            local_priority,
+            dst_node_id,
+            dst_app_id,
+            dst_endpoint_id,
+            seq,
+            timestamp_us,
+            marker,
+            payload_type,
+            data,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Queue a datagram only while the producer's local deadline is fresh.
+    /// `false` means expired before admission; `true` means queued, and the
+    /// writer can still discard it if it expires before socket writing begins.
+    /// This deadline is not serialized. A started write always finishes.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_rt_data_on_local_lane_before(
+        &self,
+        local_priority: u8,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        seq: u32,
+        timestamp_us: u64,
+        marker: u8,
+        payload_type: u32,
+        data: &[u8],
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, ClientError> {
+        self.send_rt_data_with_local_deadline(
+            local_priority,
+            dst_node_id,
+            dst_app_id,
+            dst_endpoint_id,
+            seq,
+            timestamp_us,
+            marker,
+            payload_type,
+            data,
+            Some(deadline),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_rt_data_with_local_deadline(
+        &self,
+        local_priority: u8,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        seq: u32,
+        timestamp_us: u64,
+        marker: u8,
+        payload_type: u32,
+        data: &[u8],
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<bool, ClientError> {
         let payload = AppIpcRtSendPayload {
             dst_node_id,
             src_app_id: self.app_id,
@@ -912,10 +1002,11 @@ impl AppSender {
             data: data.to_vec(),
         };
         self.writer
-            .write_frame_on_local_lane(
+            .write_frame_on_local_lane_with_deadline(
                 local_priority,
                 LocalAppMsg::AppRtSend as u16,
                 &payload.encode(),
+                deadline,
             )
             .await
     }
@@ -1196,6 +1287,10 @@ impl AppReceiver {
 }
 
 #[cfg(test)]
+#[path = "writer_freshness_tests.rs"]
+mod writer_freshness_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::client::{DispatchTable, SharedWriter};
@@ -1203,9 +1298,10 @@ mod tests {
     /// Build an `AppSender` whose IPC frame channel is ALREADY FULL and whose
     /// receiver is never drained — the shape a wedged daemon presents, and the
     /// one that made an untimed `close` park forever.
-    fn sender_on_a_wedged_writer() -> (AppSender, mpsc::Receiver<Vec<u8>>) {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
-        tx.try_send(vec![0u8; 4]).expect("prime the single slot");
+    fn sender_on_a_wedged_writer() -> (AppSender, mpsc::Receiver<crate::client::IpcWriterFrame>) {
+        let (tx, rx) = mpsc::channel::<crate::client::IpcWriterFrame>(1);
+        tx.try_send(vec![0u8; 4].into())
+            .expect("prime the single slot");
         (
             AppSender {
                 app_id: [7u8; 32],
@@ -1250,7 +1346,7 @@ mod tests {
     /// pins that the unbind is still actually emitted on the healthy path.
     #[tokio::test(start_paused = true)]
     async fn close_emits_the_unbind_when_the_writer_is_healthy() {
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        let (tx, mut rx) = mpsc::channel::<crate::client::IpcWriterFrame>(4);
         let sender = AppSender {
             app_id: [7u8; 32],
             endpoint_id: 9,
@@ -1272,9 +1368,9 @@ mod tests {
     async fn bound_handle_async() -> (
         Arc<Mutex<DispatchTable>>,
         AppHandle,
-        mpsc::Receiver<Vec<u8>>,
+        mpsc::Receiver<crate::client::IpcWriterFrame>,
     ) {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, rx) = mpsc::channel::<crate::client::IpcWriterFrame>(8);
         let dispatch = Arc::new(Mutex::new(DispatchTable::new()));
         let (mtx, mrx) = mpsc::channel::<IncomingMessage>(1);
         let (stx, srx) = mpsc::channel::<IncomingStream>(1);
