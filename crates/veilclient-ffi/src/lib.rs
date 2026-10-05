@@ -709,6 +709,8 @@ pub mod media_ffi;
 #[unsafe(no_mangle)]
 pub extern "C" fn veil_debug_set_rt_trace(on: c_int) {
     veil_session::rt_trace::set_rt_trace(on != 0);
+    #[cfg(feature = "node-embedded")]
+    veil_ipc::route_trace::set_enabled(on != 0);
 }
 
 /// EXPERIMENT SWITCH (call-RTT-spike investigation): pause/resume the

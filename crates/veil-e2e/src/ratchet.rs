@@ -2287,7 +2287,8 @@ impl RatchetRuntime {
     }
 
     /// Find the identity whose verified certificates name the payload's sending
-    /// instance, or an existing conversation for a bare frame after restart.
+    /// instance, or an existing conversation after restart, including a retained
+    /// prologue whose sender has not yet received an answer.
     /// This chooses a decryption context, never grants provenance:
     /// `open_payload` must still authenticate the ciphertext and device key.
     /// Ambiguous instance IDs fail closed rather than depend on map order.
@@ -2310,11 +2311,19 @@ impl RatchetRuntime {
         // keys and AEAD associated data name identities. Without this lookup a
         // valid resumed frame gets NoSession under the physical address, and
         // the signed error makes the sender destroy its correct conversation.
-        // Only select a held bare-frame context: this cannot create a session,
-        // authorize a device, refresh a certificate, or teach a route. The
+        // A sender keeps attaching its original prologue until it receives an
+        // answer. That still carries frames for the held conversation; refusing
+        // its context here opens under the physical address instead, fails AEAD
+        // and asks the sender to destroy its correct half after every restart.
+        // Only select a uniquely held context: this cannot authorize a device,
+        // refresh a certificate, or teach a route. Prologue replacement retains
+        // open_inner's verified-authorship and freshness requirements. The
         // exact local instance and sending instance must match uniquely, and
         // open_payload still verifies the tag under that identity's keys.
-        if payload[2] != KIND_FRAME || self.identity()?.local_instance_id != recipient_instance {
+        if payload[1] != RATCHET_PAYLOAD_V1
+            || !matches!(payload[2], KIND_FRAME | KIND_PROLOGUE)
+            || self.identity()?.local_instance_id != recipient_instance
+        {
             return None;
         }
         let held = self.store.lock();

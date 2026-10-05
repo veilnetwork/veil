@@ -39,6 +39,7 @@ packet-tunnel = ["dep:tun2proxy", "dep:tun", "dep:serde", "dep:serde_json"]
 # persistent DHT on desktop/server.
 node-embedded = [
     "dep:veil-node-runtime",
+    "dep:veil-ipc",
     "dep:veil-cfg",
     "dep:veil-util",
     "dep:veil-e2e",
@@ -61,6 +62,8 @@ veil-types = { path = "../veil-types" }
 veil-session = { path = "../veil-session" }
 # Embedded node runtime — optional, NO default features (see `node-embedded`).
 veil-node-runtime = { path = "../veil-node-runtime", default-features = false, optional = true }
+# Origin admission tracing shares the embedded node's existing stand toggle.
+veil-ipc = { path = "../veil-ipc", optional = true }
 veil-cfg = { path = "../veil-cfg", optional = true }
 veil-util = { path = "../veil-util", optional = true }
 # Ratchet conversation state — the half of a one-to-one conversation veil

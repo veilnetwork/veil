@@ -4817,6 +4817,132 @@ mod ratchet_terminal_tests {
         }
     }
 
+    #[test]
+    fn a_restored_relay_opens_a_pending_prologue_without_granting_device_authority() {
+        const PHYSICAL: [u8; 32] = [0xD8; 32];
+        let (alice, bob) = (party(ALICE, 0xA8), party(BOB, 0xB8));
+        learn(&bob, &alice);
+        let first = seal(&alice, &bob, b"before receiver restart");
+        bob.runtime
+            .open_payload(&ALICE, &first, veil_util::unix_secs_now_u64())
+            .unwrap();
+        // Alice has not received an answer: her next frame still carries the
+        // original prologue, even though Bob already holds this conversation.
+        let pending = seal(&alice, &bob, b"pending prologue after restart");
+        assert_eq!(pending[2], 0);
+        let key = bob.runtime.store.keys()[0];
+        let blob = bob.runtime.store.export(&key).unwrap();
+        bob.runtime.store.forget(&key);
+        bob.runtime
+            .store
+            .import(&key, &blob, veil_util::unix_secs_now_u64())
+            .unwrap();
+        wlock!(bob.runtime.peer_ratchet_keys).clear();
+
+        let (disp, _h, mut rx) = dispatcher_for(&bob);
+        let (hdr, body) = forward_frame([0xDD; 32], pending.clone());
+        let mut forward = veil_proto::delivery::ForwardPayload::decode(&body).unwrap();
+        forward.envelope.sender_node_id = PHYSICAL;
+        let good = forward.envelope.payload.clone();
+        *forward.envelope.payload.last_mut().unwrap() ^= 1;
+        disp.dispatch(&hdr, &forward.encode(), NodeId::from(RELAY));
+        assert!(
+            take(&mut rx).is_none(),
+            "a held context cannot authenticate a forgery"
+        );
+        assert_eq!(bob.runtime.store.export(&key).unwrap(), blob);
+        assert!(
+            lock!(disp.unopenable_replied).is_empty(),
+            "a refused retained prologue must not reset the sender"
+        );
+
+        forward.envelope.payload = good;
+        forward.envelope.content_id = [0xDE; 32];
+        disp.dispatch(&hdr, &forward.encode(), NodeId::from(RELAY));
+        let AppMessage::Deliver {
+            src_node_id,
+            provenance,
+            origin_device,
+            data,
+            ..
+        } = rx
+            .try_recv()
+            .expect("the retained prologue must use its restored conversation")
+        else {
+            panic!("expected Deliver")
+        };
+        assert_eq!(src_node_id, ALICE);
+        assert_eq!(provenance, SenderProvenance::Signed);
+        assert_eq!(data.as_ref(), b"pending prologue after restart");
+        assert_eq!(
+            origin_device, None,
+            "a decryption context proves no physical device"
+        );
+        assert_eq!(rlock!(disp.route_cache).lookup(&ALICE), None);
+        let held = bob.runtime.store.export(&key).unwrap();
+
+        forward.envelope.content_id = [0xDF; 32];
+        disp.dispatch(&hdr, &forward.encode(), NodeId::from(RELAY));
+        assert!(
+            take(&mut rx).is_none(),
+            "a distinct carrier cannot replay the prologue's frame"
+        );
+        assert_eq!(bob.runtime.store.export(&key).unwrap(), held);
+        assert!(lock!(disp.unopenable_replied).is_empty());
+
+        let now = veil_util::unix_secs_now_u64();
+        // The retained context does not stand in for a resolved certificate:
+        // even Alice's new, genuine prologue cannot replace the held chain
+        // without its verified device key and the normal freshness checks.
+        alice.runtime.forget_peer(&BOB);
+        let fresh = seal(&alice, &bob, b"new unverified conversation");
+        assert_eq!(fresh[2], 0);
+        assert_eq!(
+            bob.runtime.peer_identity_for_payload(&fresh, now),
+            Some(ALICE)
+        );
+        forward.envelope.payload = fresh;
+        forward.envelope.content_id = [0xE0; 32];
+        disp.dispatch(&hdr, &forward.encode(), NodeId::from(RELAY));
+        assert!(
+            take(&mut rx).is_none(),
+            "a context must not authorize a replacement prologue"
+        );
+        assert_eq!(bob.runtime.store.export(&key).unwrap(), held);
+        assert!(lock!(disp.unopenable_replied).is_empty());
+
+        let mut unsupported = pending.clone();
+        unsupported[1] = 0xFF;
+        assert_eq!(
+            bob.runtime.peer_identity_for_payload(&unsupported, now),
+            None
+        );
+        unsupported = pending.clone();
+        unsupported[2] = 0xFF;
+        assert_eq!(
+            bob.runtime.peer_identity_for_payload(&unsupported, now),
+            None
+        );
+        let mut wrong_recipient = pending.clone();
+        wrong_recipient[19..35].fill(0xF0);
+        assert_eq!(
+            bob.runtime.peer_identity_for_payload(&wrong_recipient, now),
+            None
+        );
+
+        let mut ambiguous = key;
+        ambiguous.peer_node_id = [0xDB; 32];
+        bob.runtime.store.import(&ambiguous, &held, now).unwrap();
+        assert_eq!(bob.runtime.peer_identity_for_payload(&pending, now), None);
+        bob.runtime.store.forget(&ambiguous);
+        bob.runtime.store.forget(&key);
+        assert_eq!(
+            bob.runtime.peer_identity_for_payload(&pending, now),
+            None,
+            "no held context means no authority to start a conversation"
+        );
+    }
+
     /// The anonymous path is STANDARD traffic, not an attack, and gating it
     /// behind the ratchet would have broken it. A meta-E2E envelope must still
     /// open, and must still arrive anonymous — a named ratchet conversation is
