@@ -327,3 +327,25 @@ written down so the next attempt skips the re-discovery:
 
 Out-of-scope items from the plan (stream multiplexing, cross-daemon
 resumption, E2E-on-stream `flags`) remain out of scope.
+
+## Endpoint scheduling during concurrent realtime traffic
+
+Remote IPC byte streams now enqueue `AppOpen`, `AppData` and `AppClose` in
+the endpoint's background source lane. The entire lifecycle shares one FIFO
+class so close cannot overtake queued data. Wire headers retain INTERACTIVE;
+the local lane is absent from the encoded frame and relay scheduling stays
+neutral. The endpoint's existing active-primary writer budget applies to these
+frames on an ordered compatibility connection.
+
+The Rust SDK accepts at most 2048 application bytes per stream write frame.
+`write_all` and the bounded IPC writer queue preserve backpressure, byte order
+and completeness. Receivers continue accepting larger frames from older SDKs.
+Explicit shutdown marks the stream closed for Drop, avoiding a second close.
+
+Gates include the IPC lifecycle/priority-queue regression, a bounded SDK writer
+with a slow consumer, and a real SDK/Unix IPC remote-open/data/close test. The
+integration checks all 128 KiB + 19 input bytes, frame size, local lane, neutral
+wire priority, final close order and bridge cleanup. Reverting either source
+lane or SDK frame size makes that integration fail. Acoustic quality under
+loaded two-phone calls and independent flow support on older first-hop relays
+still require live verification.

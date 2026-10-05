@@ -15,10 +15,11 @@ use crate::client::{SharedWriter, StreamEvent, encode_frame};
 ///
 /// A single `write()` larger than this is split across multiple bounded frames
 /// (`AsyncWrite::poll_write` is allowed to accept fewer bytes than offered, and
-/// `write_all` loops). Kept well below the IPC `DEFAULT_MAX_FRAME_BODY` (1 MiB)
-/// so the receiver never rejects a stream frame for being oversized, and so a
-/// single huge user write cannot force a multi-megabyte frame allocation.
-const MAX_STREAM_CHUNK: usize = 256 * 1024;
+/// `write_all` loops). The daemon schedules remote stream frames in its local
+/// background lane. Keep each body below the endpoint's active-primary 4 KiB
+/// wire budget: a whole frame cannot be preempted once committed to the ordered
+/// connection. This is a sender limit; older peers may still send larger frames.
+const MAX_STREAM_CHUNK: usize = 2 * 1024;
 
 const WRITER_CLOSED: &str = "veil IPC writer task closed";
 
@@ -257,6 +258,9 @@ impl AsyncWrite for VeilStream {
 
 impl Drop for VeilStream {
     fn drop(&mut self) {
+        if self.shutdown_sent {
+            return;
+        }
         // `tokio::spawn` from `Drop` panics when no Tokio runtime is in
         // TLS — common when the host app drops the stream from a non-
         // tokio context (sync FFI shutdown, Flutter `NativeFinalizer`
@@ -285,6 +289,50 @@ mod tests {
     use super::*;
     use crate::client::SharedWriter;
     use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn bounded_stream_frames_preserve_bytes_and_one_close_under_backpressure() {
+        use veil_proto::{codec::decode_header, header::HEADER_SIZE};
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(2);
+        let writer = SharedWriter::new(tx);
+        let (_ev_tx, ev_rx) = mpsc::channel::<StreamEvent>(8);
+        let mut stream = VeilStream::new(7, writer, ev_rx);
+        let payload: Vec<_> = (0..128 * 1024 + 19).map(|n| (n % 251) as u8).collect();
+        let read = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            let mut closed = false;
+            while let Some(frame) = rx.recv().await {
+                let header = decode_header(&frame).unwrap();
+                let body = &frame[HEADER_SIZE..];
+                if header.msg_type == LocalAppMsg::StreamClose as u16 {
+                    assert!(!closed, "shutdown and drop must not duplicate close");
+                    assert_eq!(StreamClosePayload::decode(body).unwrap().stream_id, 7);
+                    closed = true;
+                } else {
+                    assert!(!closed, "close overtook data");
+                    assert_eq!(header.msg_type, LocalAppMsg::StreamData as u16);
+                    let data = StreamDataPayload::decode(body).unwrap();
+                    assert_eq!(data.stream_id, 7);
+                    // Independent of MAX_STREAM_CHUNK: restoring the old 256
+                    // KiB producer must fail the latency-granularity contract.
+                    assert!(data.data.len() <= 2048, "oversized committed stream body");
+                    bytes.extend(data.data);
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(closed);
+            bytes
+        });
+        stream.write_all(&payload).await.unwrap();
+        stream.shutdown().await.unwrap();
+        stream.shutdown().await.unwrap();
+        drop(stream);
+        assert_eq!(
+            read.await.unwrap(),
+            payload,
+            "loss, duplication or reordering"
+        );
+    }
 
     /// Audit M3: a single large `write()` must be split into multiple frames,
     /// each carrying at most `MAX_STREAM_CHUNK` application bytes, so the

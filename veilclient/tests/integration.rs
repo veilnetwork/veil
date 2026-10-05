@@ -72,6 +72,123 @@ async fn start_server(sock: PathBuf) -> (watch::Sender<bool>, tokio::task::JoinH
 // ── 35.6: echo server + client, single datagram round-trip ───────────────────
 
 #[tokio::test]
+async fn remote_stream_sdk_ipc_preserves_bounded_bytes_and_source_lane_through_close() {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, atomic::AtomicU32};
+    use tokio::io::AsyncWriteExt;
+    use veil_proto::{
+        app::{AppDataPayload, receipt_status},
+        family::AppMsg,
+        header::HEADER_SIZE,
+    };
+
+    const PEER: [u8; 32] = [0xB7; 32];
+    struct Capture {
+        tx: tokio::sync::mpsc::UnboundedSender<(u8, Vec<u8>)>,
+        bridge: veil_ipc::bridge::IpcStreamBridge,
+    }
+    impl veil_types::FrameBroadcaster for Capture {
+        fn send_to(&self, peer: &[u8; 32], lane: u8, frame: Vec<u8>) -> bool {
+            assert_eq!(peer, &PEER);
+            let header = veil_proto::codec::decode_header(&frame).unwrap();
+            if header.msg_type == AppMsg::AppOpen as u16 {
+                self.bridge
+                    .pending_receipts
+                    .lock()
+                    .unwrap()
+                    .remove(&(*peer, header.stream_id))
+                    .unwrap()
+                    .send(receipt_status::ACCEPTED)
+                    .unwrap();
+            }
+            self.tx.send((lane, frame)).is_ok()
+        }
+        fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+        fn active_node_ids(&self) -> Vec<[u8; 32]> {
+            vec![PEER]
+        }
+    }
+    let bridge = veil_ipc::bridge::IpcStreamBridge {
+        veil_stream_rx: Arc::new(Mutex::new(HashMap::new())),
+        pending_receipts: Arc::new(Mutex::new(HashMap::new())),
+        wire_stream_counter: Arc::new(AtomicU32::new(1)),
+    };
+    let sock = temp_socket();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut server = IpcServer::new(
+        IpcEndpoint::Unix(sock.clone()),
+        shutdown_rx,
+        Arc::new(AppEndpointRegistry::new()),
+        node_id(),
+    )
+    .with_session_tx_registry(Arc::new(Capture {
+        tx,
+        bridge: bridge.clone(),
+    }))
+    .with_stream_bridge(bridge.clone());
+    let task = tokio::spawn(async move {
+        server.run().await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let client = veilclient::VeilClient::connect(&sock).await.unwrap();
+    let app = client
+        .bind_named("test.stream.source-lane", "sender", 31)
+        .await
+        .unwrap();
+    let mut stream = app
+        .open_stream(PEER, [0xAA; 32], 9, 256 * 1024)
+        .await
+        .unwrap();
+    let payload: Vec<_> = (0..128 * 1024 + 19).map(|n| (n % 251) as u8).collect();
+    stream.write_all(&payload).await.unwrap();
+    stream.shutdown().await.unwrap();
+    drop(stream);
+    let received = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut opened = false;
+        let mut bytes = Vec::new();
+        loop {
+            let (lane, frame) = rx.recv().await.unwrap();
+            let header = veil_proto::codec::decode_header(&frame).unwrap();
+            assert_eq!(lane, veil_proto::priority::BACKGROUND);
+            assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+            assert_eq!(header.stream_id, 1);
+            match AppMsg::try_from(header.msg_type).unwrap() {
+                AppMsg::AppOpen => {
+                    assert!(!opened);
+                    opened = true;
+                }
+                AppMsg::AppData => {
+                    assert!(opened);
+                    let data = AppDataPayload::decode(&frame[HEADER_SIZE..]).unwrap();
+                    assert_eq!(data.app_id, [0xAA; 32]);
+                    assert_eq!(data.endpoint_id, 9);
+                    assert!(data.data.len() <= 2048);
+                    bytes.extend(data.data);
+                }
+                AppMsg::AppClose => {
+                    assert!(opened);
+                    break bytes;
+                }
+                _ => panic!("unexpected stream message"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        received, payload,
+        "close overtook bytes or stream data diverged"
+    );
+    assert!(bridge.pending_receipts.lock().unwrap().is_empty());
+    assert!(bridge.veil_stream_rx.lock().unwrap().is_empty());
+    drop(app);
+    drop(client);
+    let _ = shutdown_tx.send(true);
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn source_lane_survives_sdk_ipc_but_is_absent_from_network_frame() {
     const PEER: [u8; 32] = [0xB9; 32];
     struct Capture(tokio::sync::mpsc::UnboundedSender<(u8, Vec<u8>)>);
