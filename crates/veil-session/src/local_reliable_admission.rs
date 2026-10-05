@@ -61,11 +61,24 @@ impl LocalReliableAdmission {
     /// Feedback remains local: relays receive no role, deadline or priority hint.
     pub(super) fn observe_primary_path(&mut self, handle: &QuicDatagramHandle, now: Instant) {
         let stats = handle.path_stats();
-        self.observe_pressure(stats.rtt_us, stats.expired_outgoing_datagrams, now);
+        // RTT remains the last successful sample while ACKs stop arriving.
+        // Pause competing local producers before queued primary cells expire.
+        let ack_blocked = stats.pto_count > 0
+            || (stats.congestion_window_bytes > 0
+                && stats.in_flight_bytes >= stats.congestion_window_bytes);
+        self.observe_pressure(
+            stats.rtt_us,
+            stats.expired_outgoing_datagrams,
+            ack_blocked,
+            now,
+        );
     }
 
-    fn observe_pressure(&mut self, rtt_us: u64, expired: u64, now: Instant) {
-        if rtt_us > PRIMARY_PRESSURE_RTT.as_micros() as u64 || expired > self.last_expired {
+    fn observe_pressure(&mut self, rtt_us: u64, expired: u64, ack_blocked: bool, now: Instant) {
+        if ack_blocked
+            || rtt_us > PRIMARY_PRESSURE_RTT.as_micros() as u64
+            || expired > self.last_expired
+        {
             self.pressure_until = Some(now + PRESSURE_GRACE);
         }
         // A retired child can be replaced by a fresh connection with zero counters.
