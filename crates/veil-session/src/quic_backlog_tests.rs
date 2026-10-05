@@ -846,11 +846,19 @@ async fn independent_primary_budget_allows_file_progress_and_returns_to_shared_b
     );
 }
 
+struct BlackoutReport {
+    max_post_age: Duration,
+    first_fresh: Option<Duration>,
+}
+
 // Diagnose transport recovery independently of call control, ratchets, video,
-// files and route repair. This is a characterization, not a phone-quality gate.
-#[tokio::test]
-#[ignore = "Manual neutral UDP blackout characterization; run with --ignored --nocapture"]
-async fn characterize_primary_datagram_recovery_after_neutral_udp_blackout() {
+// files and route repair. A prepared source's production policy is used when
+// expiry is enabled; the neutral link never learns that local selection.
+async fn measure_primary_blackout(
+    large_cells: bool,
+    link_delay: Duration,
+    expiry: bool,
+) -> BlackoutReport {
     use crate::datagram_flows::{SessionDatagramRx, SessionDatagramTx};
     use std::collections::HashSet;
     use veil_proto::{
@@ -860,194 +868,232 @@ async fn characterize_primary_datagram_recovery_after_neutral_udp_blackout() {
         priority::REALTIME,
     };
 
-    for (large_cells, link_delay) in [
-        (false, Duration::from_millis(20)),
-        (true, Duration::from_millis(20)),
-        (false, Duration::from_secs(1)),
-        (true, Duration::from_secs(1)),
-    ] {
-        // Warm the congestion controller on the actual link before loss.
-        let blackout_start = Duration::from_secs(6);
-        let blackout_end = blackout_start + Duration::from_secs(2);
-        let total_ticks = 900;
-        let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let link = NeutralLink::new(
-            left.local_addr().unwrap(),
-            right.local_addr().unwrap(),
-            1_000_000,
-            link_delay,
+    // Warm the congestion controller on the actual link before loss.
+    let blackout_start = Duration::from_secs(6);
+    let blackout_end = blackout_start + Duration::from_secs(2);
+    let total_ticks = 900;
+    let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let link = NeutralLink::new(
+        left.local_addr().unwrap(),
+        right.local_addr().unwrap(),
+        1_000_000,
+        link_delay,
+    )
+    .await;
+    link.enabled.store(true, Ordering::Relaxed);
+    let context = Arc::new(TransportContext::for_debug().unwrap());
+    let remote_context = Arc::clone(&context);
+    let remote_addr = link.right_addr;
+    let remote = tokio::spawn(async move {
+        promote_punched_quic(
+            right,
+            remote_addr,
+            remote_context,
+            PunchedQuicRole::Responder,
         )
-        .await;
-        link.enabled.store(true, Ordering::Relaxed);
-        let context = Arc::new(TransportContext::for_debug().unwrap());
-        let remote_context = Arc::clone(&context);
-        let remote_addr = link.right_addr;
-        let remote = tokio::spawn(async move {
-            promote_punched_quic(
-                right,
-                remote_addr,
-                remote_context,
-                PunchedQuicRole::Responder,
-            )
-            .await
-            .unwrap()
-        });
-        let local = promote_punched_quic(left, link.left_addr, context, PunchedQuicRole::Initiator)
-            .await
-            .unwrap();
-        let tx = local.quic_datagrams().unwrap();
-        let mut local_stream = local.into_stream().unwrap();
-        local_stream.write_all(b"stand").await.unwrap();
-        let remote = remote.await.unwrap();
-        let rx = remote.quic_datagrams().unwrap();
-        let stats_rx = rx.clone();
-        let mut remote_stream = remote.into_stream().unwrap();
-        let mut prefix = [0; 5];
-        remote_stream.read_exact(&mut prefix).await.unwrap();
-        assert_eq!(&prefix, b"stand");
-        sleep(Duration::from_millis(100)).await;
+        .await
+        .unwrap()
+    });
+    let local = promote_punched_quic(left, link.left_addr, context, PunchedQuicRole::Initiator)
+        .await
+        .unwrap();
+    let tx = local.quic_datagrams().unwrap();
+    let mut local_stream = local.into_stream().unwrap();
+    local_stream.write_all(b"stand").await.unwrap();
+    let remote = remote.await.unwrap();
+    let rx = remote.quic_datagrams().unwrap();
+    let stats_rx = rx.clone();
+    let mut remote_stream = remote.into_stream().unwrap();
+    let mut prefix = [0; 5];
+    remote_stream.read_exact(&mut prefix).await.unwrap();
+    assert_eq!(&prefix, b"stand");
+    sleep(Duration::from_millis(100)).await;
 
-        let started = Instant::now();
-        let (received_tx, mut received_rx) = mpsc::unbounded_channel();
-        let reader = tokio::spawn(async move {
-            let mut cipher = SessionDatagramRx::new(&[7; 32], &[8; 32], true);
-            while let Ok(packet) = rx.recv().await {
-                if let Some(frame) = cipher
-                    .decode_datagram(&packet, std::time::Instant::now())
-                    .unwrap()
-                {
-                    let (seq, sent_us) = if large_cells {
-                        let cell = veil_anonymity::circuit_wire::CircuitDataPayload::decode(
-                            &frame[HEADER_SIZE..],
-                        )
-                        .unwrap();
-                        assert_eq!(cell.circuit_id, 1);
-                        assert!(cell.ciphertext[8..].iter().all(|byte| *byte == 0x11));
-                        (
-                            cell.seq,
-                            u64::from_be_bytes(cell.ciphertext[..8].try_into().unwrap()),
-                        )
-                    } else {
-                        let payload = AppRtDataPayload::decode(&frame[HEADER_SIZE..]).unwrap();
-                        assert_eq!(payload.payload, vec![0x11; 128]);
-                        assert_eq!(payload.src_app_id, [1; 32]);
-                        (payload.seq, payload.timestamp_us)
-                    };
-                    if received_tx.send((seq, sent_us, started.elapsed())).is_err() {
-                        return;
-                    }
+    let started = Instant::now();
+    let (received_tx, mut received_rx) = mpsc::unbounded_channel();
+    let reader = tokio::spawn(async move {
+        let mut cipher = SessionDatagramRx::new(&[7; 32], &[8; 32], true);
+        while let Ok(packet) = rx.recv().await {
+            if let Some(frame) = cipher
+                .decode_datagram(&packet, std::time::Instant::now())
+                .unwrap()
+            {
+                let (seq, sent_us) = if large_cells {
+                    let cell = veil_anonymity::circuit_wire::CircuitDataPayload::decode(
+                        &frame[HEADER_SIZE..],
+                    )
+                    .unwrap();
+                    assert_eq!(cell.circuit_id, 1);
+                    assert!(cell.ciphertext[8..].iter().all(|byte| *byte == 0x11));
+                    (
+                        cell.seq,
+                        u64::from_be_bytes(cell.ciphertext[..8].try_into().unwrap()),
+                    )
+                } else {
+                    let payload = AppRtDataPayload::decode(&frame[HEADER_SIZE..]).unwrap();
+                    assert_eq!(payload.payload, vec![0x11; 128]);
+                    assert_eq!(payload.src_app_id, [1; 32]);
+                    (payload.seq, payload.timestamp_us)
+                };
+                if received_tx.send((seq, sent_us, started.elapsed())).is_err() {
+                    return;
                 }
-            }
-        });
-        let mut cipher = SessionDatagramTx::new(&[7; 32], &[8; 32], true);
-        let mut accepted = 0;
-        let mut admission_drops = 0;
-        let mut max_queued_bytes = 0;
-        for tick in 0u32..total_ticks {
-            sleep_until(started + Duration::from_millis(u64::from(tick) * 20)).await;
-            // Both directions lose every packet, including ACKs, for exactly
-            // two seconds. Handshake and steady-state RTT use the same FIFO.
-            link.blackout.store(
-                (blackout_start..blackout_end).contains(&started.elapsed()),
-                Ordering::Relaxed,
-            );
-            let sent_us = started.elapsed().as_micros() as u64;
-            let frame = if large_cells {
-                let mut frame = circuit_frame(1, 0x11);
-                frame[HEADER_SIZE + 4..HEADER_SIZE + 8].copy_from_slice(&tick.to_be_bytes());
-                frame[HEADER_SIZE + 10..HEADER_SIZE + 18].copy_from_slice(&sent_us.to_be_bytes());
-                frame
-            } else {
-                let body = AppRtDataPayload {
-                    src_app_id: [1; 32],
-                    app_id: [2; 32],
-                    endpoint_id: 1,
-                    seq: tick,
-                    timestamp_us: sent_us,
-                    marker: 0,
-                    payload_type: 111,
-                    payload: vec![0x11; 128],
-                }
-                .encode();
-                let mut header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppRtData as u16);
-                header.set_priority(REALTIME);
-                header.body_len = body.len() as u32;
-                let mut frame = veil_proto::encode_header(&header).to_vec();
-                frame.extend_from_slice(&body);
-                frame
-            };
-            let packets = cipher
-                .encode_frame(u64::from(REALTIME), &frame, tx.max_size().unwrap())
-                .unwrap();
-            if super::local_primary_datagram_fits(
-                packets.iter().map(Vec::len).sum(),
-                tx.send_buffer_space(),
-            ) {
-                for packet in packets {
-                    tx.send(&packet).unwrap();
-                }
-                accepted += 1;
-            } else {
-                admission_drops += 1;
-            }
-            max_queued_bytes = max_queued_bytes
-                .max(REALTIME_DATAGRAM_BUFFER_BYTES.saturating_sub(tx.send_buffer_space()));
-        }
-        sleep(link_delay + Duration::from_millis(300)).await;
-        reader.abort();
-        assert!(reader.await.unwrap_err().is_cancelled());
-        let mut seen = HashSet::new();
-        let mut pre_blackout = 0;
-        let mut post_blackout = 0;
-        let mut duplicates = 0;
-        let mut first_fresh = None;
-        let mut max_post_age = Duration::ZERO;
-        let mut latest_seq = 0;
-        let mut max_post_gap = Duration::ZERO;
-        let mut previous_post = None;
-        while let Ok((seq, sent_us, arrived)) = received_rx.try_recv() {
-            if !seen.insert(seq) {
-                duplicates += 1;
-            }
-            latest_seq = latest_seq.max(seq);
-            if arrived < blackout_start {
-                pre_blackout += 1;
-            }
-            if arrived >= blackout_end {
-                post_blackout += 1;
-                max_post_age =
-                    max_post_age.max(arrived.saturating_sub(Duration::from_micros(sent_us)));
-                if Duration::from_micros(sent_us) >= blackout_end && first_fresh.is_none() {
-                    first_fresh = Some(arrived - blackout_end);
-                }
-                if let Some(previous) = previous_post {
-                    max_post_gap = max_post_gap.max(arrived - previous);
-                }
-                previous_post = Some(arrived);
             }
         }
-        eprintln!(
-            "blackout large_cells={large_cells} link_delay_ms={} accepted={accepted} admission_drops={admission_drops} pre={pre_blackout} post={post_blackout} first_fresh_ms={:?} max_post_age_ms={} max_post_gap_ms={} latest_seq={latest_seq} duplicates={duplicates} max_queued_bytes={max_queued_bytes} neutral_drops={} tx={:?} rx={:?}",
-            link_delay.as_millis(),
-            first_fresh.map(|v| v.as_millis()),
-            max_post_age.as_millis(),
-            max_post_gap.as_millis(),
-            link.dropped.load(Ordering::Relaxed),
-            tx.path_stats(),
-            stats_rx.path_stats(),
+    });
+    let mut cipher = SessionDatagramTx::new(&[7; 32], &[8; 32], true);
+    let mut accepted = 0;
+    let mut admission_drops = 0;
+    let mut max_queued_bytes = 0;
+    for tick in 0u32..total_ticks {
+        sleep_until(started + Duration::from_millis(u64::from(tick) * 20)).await;
+        // Both directions lose every packet, including ACKs, for exactly
+        // two seconds. Handshake and steady-state RTT use the same FIFO.
+        link.blackout.store(
+            (blackout_start..blackout_end).contains(&started.elapsed()),
+            Ordering::Relaxed,
         );
-        assert!(
-            pre_blackout > 0,
-            "must actually establish delivery before the blackout"
-        );
-        assert!(
-            post_blackout > 0 && latest_seq >= total_ticks - 100,
-            "must actually recover on the same connection"
-        );
-        assert_eq!(duplicates, 0);
-        // No tight latency assertion: report actual recovery before attributing
-        // a many-second phone outage to QUIC's loss-probe backoff.
-        drop((local_stream, remote_stream));
+        let sent_us = started.elapsed().as_micros() as u64;
+        let frame = if large_cells {
+            let mut frame = circuit_frame(1, 0x11);
+            frame[HEADER_SIZE + 4..HEADER_SIZE + 8].copy_from_slice(&tick.to_be_bytes());
+            frame[HEADER_SIZE + 10..HEADER_SIZE + 18].copy_from_slice(&sent_us.to_be_bytes());
+            frame
+        } else {
+            let body = AppRtDataPayload {
+                src_app_id: [1; 32],
+                app_id: [2; 32],
+                endpoint_id: 1,
+                seq: tick,
+                timestamp_us: sent_us,
+                marker: 0,
+                payload_type: 111,
+                payload: vec![0x11; 128],
+            }
+            .encode();
+            let mut header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppRtData as u16);
+            header.set_priority(REALTIME);
+            header.body_len = body.len() as u32;
+            let mut frame = veil_proto::encode_header(&header).to_vec();
+            frame.extend_from_slice(&body);
+            frame
+        };
+        let packets = cipher
+            .encode_frame(u64::from(REALTIME), &frame, tx.max_size().unwrap())
+            .unwrap();
+        if super::local_primary_datagram_fits(
+            packets.iter().map(Vec::len).sum(),
+            tx.send_buffer_space(),
+        ) {
+            let deadline =
+                super::local_primary_datagram_expiry(REALTIME, expiry, std::time::Instant::now());
+            for packet in packets {
+                match deadline {
+                    Some(deadline) => tx.send_before(&packet, deadline).unwrap(),
+                    None => tx.send(&packet).unwrap(),
+                }
+            }
+            accepted += 1;
+        } else {
+            admission_drops += 1;
+        }
+        max_queued_bytes = max_queued_bytes
+            .max(REALTIME_DATAGRAM_BUFFER_BYTES.saturating_sub(tx.send_buffer_space()));
     }
+    sleep(link_delay + Duration::from_millis(300)).await;
+    reader.abort();
+    assert!(reader.await.unwrap_err().is_cancelled());
+    let mut seen = HashSet::new();
+    let mut pre_blackout = 0;
+    let mut post_blackout = 0;
+    let mut duplicates = 0;
+    let mut first_fresh = None;
+    let mut max_post_age = Duration::ZERO;
+    let mut latest_seq = 0;
+    let mut max_post_gap = Duration::ZERO;
+    let mut previous_post = None;
+    while let Ok((seq, sent_us, arrived)) = received_rx.try_recv() {
+        if !seen.insert(seq) {
+            duplicates += 1;
+        }
+        latest_seq = latest_seq.max(seq);
+        if arrived < blackout_start {
+            pre_blackout += 1;
+        }
+        if arrived >= blackout_end {
+            post_blackout += 1;
+            max_post_age = max_post_age.max(arrived.saturating_sub(Duration::from_micros(sent_us)));
+            if Duration::from_micros(sent_us) >= blackout_end && first_fresh.is_none() {
+                first_fresh = Some(arrived - blackout_end);
+            }
+            if let Some(previous) = previous_post {
+                max_post_gap = max_post_gap.max(arrived - previous);
+            }
+            previous_post = Some(arrived);
+        }
+    }
+    eprintln!(
+        "blackout expiry={expiry} large_cells={large_cells} link_delay_ms={} accepted={accepted} admission_drops={admission_drops} pre={pre_blackout} post={post_blackout} first_fresh_ms={:?} max_post_age_ms={} max_post_gap_ms={} latest_seq={latest_seq} duplicates={duplicates} max_queued_bytes={max_queued_bytes} neutral_drops={} tx={:?} rx={:?}",
+        link_delay.as_millis(),
+        first_fresh.map(|v| v.as_millis()),
+        max_post_age.as_millis(),
+        max_post_gap.as_millis(),
+        link.dropped.load(Ordering::Relaxed),
+        tx.path_stats(),
+        stats_rx.path_stats(),
+    );
+    assert!(
+        pre_blackout > 0,
+        "must actually establish delivery before the blackout"
+    );
+    assert!(
+        post_blackout > 0 && latest_seq >= total_ticks - 100,
+        "must actually recover on the same connection"
+    );
+    assert_eq!(duplicates, 0);
+    // No tight latency assertion: report actual recovery before attributing
+    // a many-second phone outage to QUIC's loss-probe backoff.
+    drop((local_stream, remote_stream));
+    BlackoutReport {
+        max_post_age,
+        first_fresh,
+    }
+}
+
+#[tokio::test]
+#[ignore = "Manual neutral UDP blackout/expiry characterization; run with --ignored --nocapture"]
+async fn characterize_primary_datagram_recovery_after_neutral_udp_blackout() {
+    for expiry in [false, true] {
+        for (large_cells, link_delay) in [
+            (false, Duration::from_millis(20)),
+            (true, Duration::from_millis(20)),
+            (false, Duration::from_secs(1)),
+            (true, Duration::from_secs(1)),
+        ] {
+            let report = measure_primary_blackout(large_cells, link_delay, expiry).await;
+            assert!(report.first_fresh.is_some());
+        }
+    }
+}
+
+#[tokio::test]
+async fn prepared_primary_expires_stale_packets_after_neutral_udp_loss() {
+    // The unchanged admission/capacity policy alone keeps old packets for
+    // seconds. Same link/loss/frame sizes, fresh real connections in both cases.
+    let old = measure_primary_blackout(false, Duration::from_millis(20), false).await;
+    let fresh = measure_primary_blackout(false, Duration::from_millis(20), true).await;
+    assert!(
+        old.max_post_age > Duration::from_secs(1),
+        "control must reproduce stale delivery"
+    );
+    assert!(
+        fresh.first_fresh.is_some(),
+        "fresh logical frames must resume"
+    );
+    assert!(
+        fresh.max_post_age < Duration::from_millis(400),
+        "200 ms sender deadline plus link delay must replace stale backlog: {:?}",
+        fresh.max_post_age
+    );
 }

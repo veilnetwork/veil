@@ -279,12 +279,13 @@ impl RealtimeSender {
         logger.info(
             "session.rt_trace.datagram_admission",
             format!(
-                "peer_id={} local_slot={priority} accepted={} buffer_drops={} bandwidth_drops={} queued_wire_bytes={} independent={independent} rtt_us={} cwnd_bytes={} lost_packets={} congestion_events={} udp_sent={} udp_received={} acks_received={}",
+                "peer_id={} local_slot={priority} accepted={} buffer_drops={} bandwidth_drops={} queued_wire_bytes={} independent={independent} rtt_us={} cwnd_bytes={} lost_packets={} congestion_events={} udp_sent={} udp_received={} acks_received={} expired_outgoing_datagrams={}",
                 hex_short(peer), entry.0, entry.1, entry.2,
                 veil_transport::REALTIME_DATAGRAM_BUFFER_BYTES.saturating_sub(available),
                 path.rtt_us, path.congestion_window_bytes, path.lost_packets,
                 path.congestion_events, path.udp_sent, path.udp_received,
                 path.acknowledgments_received,
+                path.expired_outgoing_datagrams,
             ),
         );
         *entry = (0, 0, 0, Some(now));
@@ -341,6 +342,19 @@ fn local_datagram_fits(priority: u8, wire_len: usize, available: usize) -> bool 
     // 4 KiB, admitting one larger complete cell only when that queue is empty.
     // Relay user cells all use INTERACTIVE and never enter this endpoint rule.
     local_datagram_backlog_fits(wire_len, available)
+}
+
+/// Only this endpoint's primary source on its prepared sibling may opt in.
+/// Neutral forwarding and shared fallback retain their ordinary policy.
+const LOCAL_PRIMARY_QUEUE_AGE: std::time::Duration = std::time::Duration::from_millis(200);
+
+fn local_primary_datagram_expiry(
+    priority: u8,
+    independent: bool,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    (priority == veil_proto::priority::REALTIME && independent)
+        .then_some(now + LOCAL_PRIMARY_QUEUE_AGE)
 }
 
 /// A prepared primary sibling carries only this endpoint source, so it need
@@ -4265,6 +4279,13 @@ impl SessionRunner {
                         self.dispatcher.capture_outbound(self.peer_id, outgoing);
                         let mut sent_wire_len = 0usize;
                         let mut send_error = None;
+                        // A complete frame's fragments share one deadline.
+                        // Expiration never changes nonce/counter allocation.
+                        let expires_at = local_primary_datagram_expiry(
+                            outgoing_priority,
+                            using_parallel,
+                            std::time::Instant::now(),
+                        );
                         for datagram in &datagrams {
                             if lane.handle.send_buffer_space() < datagram.len() {
                                 lane.congestion_drops = lane.congestion_drops.saturating_add(1);
@@ -4284,7 +4305,11 @@ impl SessionRunner {
                                     lane.last_congestion_log = std::time::Instant::now();
                                 }
                             }
-                            match lane.handle.send(datagram) {
+                            let sent = match expires_at {
+                                Some(deadline) => lane.handle.send_before(datagram, deadline),
+                                None => lane.handle.send(datagram),
+                            };
+                            match sent {
                                 Ok(()) => sent_wire_len += datagram.len(),
                                 Err(error) => {
                                     send_error = Some(error);
@@ -5700,6 +5725,29 @@ mod realtime_lane_frame_tests {
             )),
         );
         assert!(pq.local_primary_active(std::time::Instant::now()));
+    }
+
+    #[test]
+    fn outgoing_expiry_is_only_an_independent_local_primary_policy() {
+        let now = std::time::Instant::now();
+        assert!(
+            super::local_primary_datagram_expiry(veil_proto::priority::REALTIME, true, now)
+                .is_some()
+        );
+        assert!(
+            super::local_primary_datagram_expiry(veil_proto::priority::REALTIME, false, now)
+                .is_none()
+        );
+        // A relay's outgoing local class is INTERACTIVE even if a remote
+        // packet claimed REALTIME. No transit or throughput role opts in.
+        for priority in [
+            veil_proto::priority::INTERACTIVE,
+            veil_proto::priority::BULK,
+            veil_proto::priority::BACKGROUND,
+        ] {
+            assert!(super::local_primary_datagram_expiry(priority, true, now).is_none());
+            assert!(super::local_primary_datagram_expiry(priority, false, now).is_none());
+        }
     }
 
     #[test]
