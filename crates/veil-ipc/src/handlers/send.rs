@@ -1696,7 +1696,24 @@ pub(crate) async fn handle_ipc_send(
                 // live-session tail included when the payload is sealed.
                 let hops_to_try: Vec<[u8; 32]> = forced_relay_hops.clone();
                 let mut any_send_failed = false;
-                let mut any_compat_sent = false;
+                // Queue admission at a first hop is not end-to-end receipt.
+                // Small, locally primary lossy cells take a second path so a
+                // black-holed/slow accepted hop cannot silence the endpoint.
+                // Keep ciphertext and content_id identical: the receiver's
+                // existing replay/dedup gates admit only the first arrival.
+                // This is an origin decision, with no new wire metadata or
+                // relay scheduling policy. Secondary/bulk keeps one copy.
+                let diverse_primary = relay_media_sealed
+                    && ctx.local_priority == veil_proto::priority::REALTIME
+                    && send.data.len() <= 512;
+                let fanout_limit = if relay_control_compat {
+                    3
+                } else if diverse_primary {
+                    2
+                } else {
+                    1
+                };
+                let mut accepted_copies = 0;
                 for (compat_attempts, next_hop) in hops_to_try.into_iter().enumerate() {
                     if relay_control_compat && compat_attempts >= 3 {
                         break;
@@ -1716,14 +1733,14 @@ pub(crate) async fn handle_ipc_send(
                         fwd_frame.clone(),
                     );
                     if relayed {
-                        // Call lifecycle frames are tiny and rare. Fan them to
-                        // up to three independently-operated legacy relays so
-                        // one stale route/overloaded operator cannot add a
-                        // whole retry interval. Stable content_id dedup at the
-                        // recipient makes the copies harmless. ACK-mode keeps
-                        // its existing single-hop tracker semantics.
-                        if relay_control_compat && !send.require_ack {
-                            any_compat_sent = true;
+                        // Bounded origin fan-out for lifecycle controls and
+                        // small primary cells. ACK-mode keeps its existing
+                        // single-hop tracker semantics.
+                        if fanout_limit > 1 && !send.require_ack {
+                            accepted_copies += 1;
+                            if accepted_copies >= fanout_limit {
+                                return Ok(());
+                            }
                             continue;
                         }
                         // register for ACK tracking if requested.
@@ -1759,7 +1776,7 @@ pub(crate) async fn handle_ipc_send(
                     }
                     any_send_failed = true;
                 }
-                if any_compat_sent {
+                if accepted_copies != 0 {
                     return Ok(());
                 }
                 // All cached hops were dead. Flush the entire dst bucket so
@@ -3388,6 +3405,56 @@ mod ratchet_send_tests {
             veil_proto::delivery::ForwardPayload::decode(&forwards[0].1[veil_proto::HEADER_SIZE..])
                 .unwrap();
         assert_eq!(fwd.envelope.payload, sealed);
+    }
+
+    #[tokio::test]
+    async fn small_primary_relay_cells_have_a_second_path_with_the_same_replay_id() {
+        const ALTERNATE: [u8; 32] = [0xB8; 32];
+        const OTHER: [u8; 32] = [0xBA; 32];
+        // The preferred hop accepts into its queue even when it will not
+        // deliver. A successful admission there must not prevent the second
+        // hop from receiving a copy. Never use the final peer as a relay.
+        for (lane, size, expected) in [
+            (veil_proto::priority::REALTIME, 512, 2),
+            (veil_proto::priority::REALTIME, 513, 1),
+            (veil_proto::priority::INTERACTIVE, 128, 1),
+            (veil_proto::priority::BULK, 128, 1),
+            (veil_proto::priority::BACKGROUND, 128, 1),
+        ] {
+            let fx = fixture(vec![PEER, RELAY, ALTERNATE, OTHER]);
+            let mut ctx = fx.ctx(false);
+            ctx.local_priority = lane;
+            let mut sealed = veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC.to_vec();
+            sealed.resize(size, 0xA5);
+            let mut body = payload_to(PEER, &sealed);
+            let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+                | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
+            body[100..104].copy_from_slice(&flags.to_be_bytes());
+            let mut wh = sink().await;
+            handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+                .await
+                .unwrap();
+            let sent = fx.taken();
+            assert_eq!(sent.len(), expected, "lane {lane}, size {size}");
+            assert_eq!(sent[0].0, RELAY, "cached path remains first");
+            let mut replay_id = None;
+            let mut hops = std::collections::HashSet::new();
+            for (hop, frame) in sent {
+                assert_ne!(hop, PEER);
+                assert!(hops.insert(hop), "copies require distinct first hops");
+                let header = veil_proto::codec::decode_header(&frame).unwrap();
+                assert_eq!(header.flags, 0, "local lane is not a wire priority");
+                let fwd =
+                    veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                        .unwrap();
+                assert_eq!(fwd.envelope.payload, sealed);
+                if let Some(id) = replay_id {
+                    assert_eq!(fwd.envelope.content_id, id, "earliest arrival wins");
+                } else {
+                    replay_id = Some(fwd.envelope.content_id);
+                }
+            }
+        }
     }
 
     #[tokio::test]
