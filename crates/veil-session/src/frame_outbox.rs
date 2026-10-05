@@ -3,7 +3,10 @@
 //! These lanes are process-local; they add no field to an OVL1 wire frame.
 //! Relayed user data always uses the ordinary lane, regardless of wire hints.
 
-use std::task::{Context, Poll};
+use std::{
+    task::{Context, Poll},
+    time::Instant,
+};
 
 use tokio::sync::mpsc;
 
@@ -18,6 +21,10 @@ const MAX_RESERVED_BURST: usize = 8;
 pub struct FrameEnvelope {
     pub frame: PriorityFrame,
     pub carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
+    /// Process-local admission time. Loss tolerance is classified by the
+    /// runner, but residence in this upstream queue must count toward its age.
+    /// Never serialized, and never derived from a peer's clock or wire hint.
+    pub(crate) queued_at: Instant,
 }
 
 impl From<PriorityFrame> for FrameEnvelope {
@@ -25,6 +32,7 @@ impl From<PriorityFrame> for FrameEnvelope {
         Self {
             frame,
             carrier: None,
+            queued_at: Instant::now(),
         }
     }
 }
@@ -131,6 +139,7 @@ impl FrameSender {
         self.ordinary.try_send(FrameEnvelope {
             frame: (veil_proto::priority::INTERACTIVE, bytes),
             carrier: Some(carrier),
+            queued_at: Instant::now(),
         })
     }
 
@@ -319,6 +328,30 @@ mod tests {
     use super::*;
     use veil_proto::priority::{INTERACTIVE, REALTIME};
 
+    #[tokio::test]
+    async fn waiting_for_ingress_capacity_counts_toward_lossy_age() {
+        use crate::priority_queue::{LOSSY_REALTIME_MAX_AGE, PriorityQueue};
+        use std::{future::Future, time::Duration};
+        let (tx, mut rx) = frame_channel(1);
+        tx.try_send(frame(REALTIME, 1)).unwrap();
+        let mut waiting = Box::pin(tx.send(frame(REALTIME, 2)));
+        std::future::poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::sleep(LOSSY_REALTIME_MAX_AGE + Duration::from_millis(60)).await;
+        rx.recv_envelope().await.unwrap();
+        waiting.await.unwrap();
+        let mut pq = PriorityQueue::with_default_weights();
+        pq.push_envelope(rx.recv_envelope().await.unwrap(), true);
+        assert!(pq.pop().is_none(), "blocked send renewed old media age");
+        assert_eq!(pq.drops_total(), 1);
+        tx.try_send(frame(REALTIME, 3)).unwrap();
+        pq.push_envelope(rx.recv_envelope().await.unwrap(), true);
+        assert_eq!(&*pq.pop().unwrap(), &[3]);
+    }
+
     fn frame(priority: u8, byte: u8) -> PriorityFrame {
         (priority, veil_bufpool::pooled_shared_from_vec(vec![byte]))
     }
@@ -362,6 +395,10 @@ mod tests {
         assert!(pq.pop_datagram_envelope_if(|bytes| bytes == [2]).is_none());
         assert_eq!(&*pq.pop().unwrap(), &[1]);
         let routed = pq.pop_datagram_envelope_if(|bytes| bytes == [2]).unwrap();
+        let admitted = routed.queued_at;
+        pq.restore_lossy_envelope(routed);
+        let routed = pq.pop_datagram_envelope_if(|bytes| bytes == [2]).unwrap();
+        assert_eq!(routed.queued_at, admitted);
         assert_eq!(routed.frame.0, INTERACTIVE);
         assert_eq!(&*routed.frame.1, &[2]);
         assert!(std::sync::Weak::ptr_eq(

@@ -4,6 +4,134 @@ use tokio::io::AsyncReadExt;
 use veil_crypto::session_cipher::SessionCipher;
 use veil_proto::{codec::decode_header, family::AppMsg, header::HEADER_SIZE};
 
+/// Freshness includes the real producer outbox, not just the runner's WRR
+/// queue. On recovery, stale source and neutral datagrams must not be replayed
+/// on an encrypted stream; reliable data and freshly admitted datagrams remain.
+#[tokio::test]
+async fn encrypted_stream_recovery_discards_media_aged_in_the_producer_outbox() {
+    use veil_anonymity::{circuit_data::CircuitCellBytes, circuit_wire::CircuitDataPayload};
+    use veil_proto::{AppRtDataPayload, family::RelayChainMsg};
+    use veil_session::priority_queue::LOSSY_REALTIME_MAX_AGE;
+
+    let cell = CircuitCellBytes::new(1024).unwrap();
+    let packet = |p: u8, seq: u32| {
+        let (family, kind, body) = if p == 1 {
+            (
+                FrameFamily::RelayChain,
+                RelayChainMsg::CircuitDatagram as u16,
+                CircuitDataPayload {
+                    circuit_id: 4242,
+                    seq,
+                    ciphertext: vec![seq as u8; cell.get()],
+                }
+                .encode(cell)
+                .unwrap(),
+            )
+        } else {
+            (
+                FrameFamily::App,
+                AppMsg::AppRtData as u16,
+                AppRtDataPayload {
+                    src_app_id: [0xa1; 32],
+                    app_id: [0xb2; 32],
+                    endpoint_id: 13,
+                    seq,
+                    timestamp_us: 0,
+                    marker: 0,
+                    payload_type: 0,
+                    payload: vec![seq as u8; 128],
+                }
+                .encode(),
+            )
+        };
+        let mut header = FrameHeader::new(family as u8, kind);
+        if p == 1 {
+            header.set_priority(veil_proto::priority::INTERACTIVE);
+        }
+        header.body_len = body.len() as u32;
+        let mut frame = encode_header(&header).to_vec();
+        frame.extend(body);
+        (p, veil_bufpool::pooled_shared_from_vec(frame))
+    };
+    let (tx, outbox) = veil_session::frame_outbox::frame_channel(16);
+    for p in 0..4 {
+        tx.try_send(packet(p, p.into())).unwrap();
+    }
+    let reliable_body = b"reliable before stall";
+    let mut header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppData as u16);
+    header.body_len = reliable_body.len() as u32;
+    let mut reliable = encode_header(&header).to_vec();
+    reliable.extend(reliable_body);
+    tx.try_send((3, veil_bufpool::pooled_shared_from_vec(reliable)))
+        .unwrap();
+    tokio::time::sleep(LOSSY_REALTIME_MAX_AGE + Duration::from_millis(60)).await;
+    for p in 0..4 {
+        tx.try_send(packet(p, 100 + u32::from(p))).unwrap();
+    }
+    let (_, legacy_rx) = mpsc::channel(1);
+    let (stream, mut receiver) = tokio::io::duplex(4096);
+    let key = [0x44; 32];
+    let mut runner = make_mobility_blackhole_runner(legacy_rx);
+    runner.outbox = Some(outbox);
+    runner.stream = Box::new(stream);
+    runner.crypto.tx_cipher = Some(SessionCipher::new(&key, true));
+    let task = tokio::spawn(async move { runner.run().await });
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut cipher = SessionCipher::new(&key, true);
+        let mut media = Vec::new();
+        let mut reliable = false;
+        while media.len() < 4 || !reliable {
+            let mut header_bytes = [0; HEADER_SIZE];
+            receiver.read_exact(&mut header_bytes).await.unwrap();
+            let header = decode_header(&header_bytes).unwrap();
+            let mut encrypted = vec![0; header.body_len as usize];
+            receiver.read_exact(&mut encrypted).await.unwrap();
+            let body = cipher
+                .open(&encrypted, &veil_proto::codec::frame_aad(&header))
+                .unwrap();
+            if header.family == FrameFamily::Session as u8 {
+                assert_eq!(header.msg_type, SessionMsg::Padding as u16);
+                continue;
+            }
+            if header.family == FrameFamily::Control as u8 {
+                assert_eq!(header.msg_type, ControlMsg::Keepalive as u16);
+                continue;
+            }
+            if header.family == FrameFamily::App as u8 && header.msg_type == AppMsg::AppData as u16
+            {
+                assert!(!reliable, "reliable frame duplicated");
+                assert_eq!(body, reliable_body);
+                reliable = true;
+                continue;
+            }
+            let seq = if header.family == FrameFamily::RelayChain as u8 {
+                assert_eq!(header.msg_type, RelayChainMsg::CircuitData as u16);
+                assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+                let data = CircuitDataPayload::decode(&body).unwrap();
+                assert_eq!(data.ciphertext, vec![data.seq as u8; cell.get()]);
+                data.seq
+            } else {
+                assert_eq!(header.family, FrameFamily::App as u8);
+                assert_eq!(header.msg_type, AppMsg::AppRtData as u16);
+                let data = AppRtDataPayload::decode(&body).unwrap();
+                assert_eq!(data.payload, vec![data.seq as u8; 128]);
+                data.seq
+            };
+            media.push(seq);
+        }
+        media.sort_unstable();
+        media
+    })
+    .await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        result.unwrap(),
+        [100, 101, 102, 103],
+        "stale outbox media replayed"
+    );
+}
+
 /// Exercise the real encrypted SessionRunner and its writer channel on a
 /// stream-only hop. The receiving endpoint adds uniform pacing to all bytes;
 /// it has no application labels or differentiated transport service.
