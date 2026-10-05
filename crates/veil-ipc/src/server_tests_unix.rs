@@ -50,11 +50,14 @@ impl veil_types::FrameBroadcaster for CapturingPeerBroadcaster {
 }
 
 async fn connect_and_hello(sock: &PathBuf) -> UnixStream {
+    connect_with_flags(sock, 0).await
+}
+async fn connect_with_flags(sock: &PathBuf, flags: u32) -> UnixStream {
     let mut client = UnixStream::connect(sock).await.unwrap();
     // Write HELLO frame
     let hello = AppIpcHelloPayload {
         version: IPC_PROTOCOL_VERSION,
-        flags: 0,
+        flags,
     };
     let mut hdr = FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppHello as u16);
     hdr.body_len = AppIpcHelloPayload::WIRE_SIZE as u32;
@@ -65,6 +68,14 @@ async fn connect_and_hello(sock: &PathBuf) -> UnixStream {
     client.read_exact(&mut hdr_buf).await.unwrap();
     let hdr = codec::decode_header(&hdr_buf).unwrap();
     assert_eq!(hdr.msg_type, LocalAppMsg::AppHelloOk as u16);
+    assert_eq!(
+        hdr.flags,
+        if flags & veil_proto::ipc::IPC_CAP_STREAM_WRITE_CREDIT != 0 {
+            veil_proto::ipc::IPC_HELLO_OK_STREAM_WRITE_CREDIT
+        } else {
+            0
+        }
+    );
     let mut body = vec![0u8; hdr.body_len as usize];
     if !body.is_empty() {
         client.read_exact(&mut body).await.unwrap();
@@ -3012,4 +3023,298 @@ async fn a_delivery_names_its_origin_device_to_the_client() {
     }
     drop(app_tx);
     let _ = tokio::time::timeout(Duration::from_millis(100), fwd).await;
+}
+
+/// An actual local IPC connection must keep serving control commands while a
+/// remote file waits for reliable source admission. The broadcaster gate models
+/// that production await; this is not a QUIC/network quality test.
+#[tokio::test]
+async fn remote_file_backpressure_does_not_hold_shared_ipc_loop() {
+    struct Blocked {
+        entered: tokio::sync::Notify,
+        permits: tokio::sync::Semaphore,
+        frames: Mutex<Vec<Vec<u8>>>,
+    }
+    impl FrameBroadcaster for Blocked {
+        fn send_to(&self, _: &[u8; 32], _: u8, _: Vec<u8>) -> bool {
+            true
+        }
+        fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+        fn active_node_ids(&self) -> Vec<[u8; 32]> {
+            vec![[0xee; 32]]
+        }
+        fn send_reliable_to<'a>(
+            &'a self,
+            _: &'a [u8; 32],
+            bytes: Vec<u8>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.permits.acquire().await.unwrap().forget();
+                self.frames.lock().unwrap().push(bytes);
+                true
+            })
+        }
+    }
+    let sock = temp_socket_path();
+    let (server, shutdown, registry) = make_server(sock.clone());
+    let blocked = Arc::new(Blocked {
+        entered: tokio::sync::Notify::new(),
+        permits: tokio::sync::Semaphore::new(0),
+        frames: Mutex::new(Vec::new()),
+    });
+    let mut server = server.with_session_tx_registry(blocked.clone());
+    let task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut client = UnixStream::connect(&sock).await.unwrap();
+    send_ipc_frame(
+        &mut client,
+        LocalAppMsg::AppHello as u16,
+        &AppIpcHelloPayload {
+            version: IPC_PROTOCOL_VERSION,
+            flags: 1,
+        }
+        .encode(),
+    )
+    .await;
+    let (hello_header, _) = recv_ipc_frame(&mut client).await;
+    assert_eq!(hello_header.msg_type, LocalAppMsg::AppHelloOk as u16);
+    let bind = AppBindPayload {
+        endpoint_id: 9,
+        flags: 0,
+        namespace: b"blocked-file".to_vec(),
+        name: b"svc".to_vec(),
+    };
+    send_ipc_frame(&mut client, LocalAppMsg::AppBind as u16, &bind.encode()).await;
+    let (_, body) = recv_ipc_frame(&mut client).await;
+    let app = AppBindOkPayload::decode(&body).unwrap().app_id;
+    assert!(registry.route_stream_open(
+        app,
+        9,
+        41,
+        [0xee; 32],
+        veil_proto::SenderProvenance::Claimed,
+        STREAM_INITIAL_WINDOW
+    ));
+    assert_eq!(
+        recv_ipc_frame(&mut client).await.0.msg_type,
+        LocalAppMsg::StreamOpenInbound as u16
+    );
+    for data in [b"first".to_vec(), b"second".to_vec()] {
+        send_ipc_frame(
+            &mut client,
+            LocalAppMsg::StreamData as u16,
+            &StreamDataPayload {
+                stream_id: 41,
+                data,
+            }
+            .encode(),
+        )
+        .await;
+    }
+    tokio::time::timeout(Duration::from_secs(1), blocked.entered.notified())
+        .await
+        .unwrap();
+    send_ipc_frame(&mut client, LocalAppMsg::GetNodeIdentity as u16, &[]).await;
+    let fast = tokio::time::timeout(Duration::from_millis(250), recv_ipc_frame(&mut client)).await;
+    // Always release the blocked operation and close the server, also on the
+    // negative baseline, so the regression reports instead of stranding tasks.
+    blocked.permits.add_permits(3);
+    send_ipc_frame(
+        &mut client,
+        LocalAppMsg::StreamClose as u16,
+        &StreamClosePayload { stream_id: 41 }.encode(),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if blocked.frames.lock().unwrap().len() == 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(client);
+    let _ = shutdown.send(true);
+    task.await.unwrap().unwrap();
+    let (header, _) = fast.expect("file source admission held the shared IPC loop");
+    assert_eq!(header.msg_type, LocalAppMsg::NodeIdentity as u16);
+    let frames = blocked.frames.lock().unwrap();
+    let headers: Vec<_> = frames
+        .iter()
+        .map(|f| codec::decode_header(f).unwrap())
+        .collect();
+    assert_eq!(
+        headers.iter().map(|h| h.msg_type).collect::<Vec<_>>(),
+        vec![
+            veil_proto::AppMsg::AppData as u16,
+            veil_proto::AppMsg::AppData as u16,
+            veil_proto::AppMsg::AppClose as u16
+        ]
+    );
+    assert_eq!(
+        veil_proto::AppDataPayload::decode(&frames[0][veil_proto::HEADER_SIZE..])
+            .unwrap()
+            .data,
+        b"first"
+    );
+    assert_eq!(
+        veil_proto::AppDataPayload::decode(&frames[1][veil_proto::HEADER_SIZE..])
+            .unwrap()
+            .data,
+        b"second"
+    );
+}
+
+/// A producer exceeding its negotiated local credit must lose only its file;
+/// dropping the in-flight reliable await releases admission resources at once.
+#[tokio::test]
+async fn remote_stream_credit_violation_cancels_file_without_closing_ipc() {
+    struct Gate {
+        entered: tokio::sync::Notify,
+        dropped: Arc<AtomicUsize>,
+    }
+    impl FrameBroadcaster for Gate {
+        fn send_to(&self, _: &[u8; 32], _: u8, _: Vec<u8>) -> bool {
+            true
+        }
+        fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+        fn active_node_ids(&self) -> Vec<[u8; 32]> {
+            vec![[0xee; 32]]
+        }
+        fn send_reliable_to<'a>(
+            &'a self,
+            _: &'a [u8; 32],
+            _: Vec<u8>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            struct DropWatch(Arc<AtomicUsize>);
+            impl Drop for DropWatch {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            Box::pin(async move {
+                let _guard = DropWatch(self.dropped.clone());
+                self.entered.notify_one();
+                std::future::pending().await
+            })
+        }
+    }
+    let sock = temp_socket_path();
+    let (server, shutdown, registry) = make_server(sock.clone());
+    let gate = Arc::new(Gate {
+        entered: tokio::sync::Notify::new(),
+        dropped: Arc::new(AtomicUsize::new(0)),
+    });
+    let mut server = server.with_session_tx_registry(gate.clone());
+    let task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let mut client = connect_with_flags(&sock, veil_proto::ipc::IPC_CAP_STREAM_WRITE_CREDIT).await;
+    let bind = AppBindPayload {
+        endpoint_id: 9,
+        flags: 0,
+        namespace: b"credit-limit".to_vec(),
+        name: b"svc".to_vec(),
+    };
+    send_ipc_frame(&mut client, LocalAppMsg::AppBind as u16, &bind.encode()).await;
+    let (_, body) = recv_ipc_frame(&mut client).await;
+    let app = AppBindOkPayload::decode(&body).unwrap().app_id;
+    assert!(registry.route_stream_open(
+        app,
+        9,
+        41,
+        [0xee; 32],
+        veil_proto::SenderProvenance::SessionPeer,
+        STREAM_INITIAL_WINDOW
+    ));
+    recv_ipc_frame(&mut client).await;
+    let chunk = StreamDataPayload {
+        stream_id: 41,
+        data: vec![1; 2048],
+    };
+    send_ipc_frame(&mut client, LocalAppMsg::StreamData as u16, &chunk.encode()).await;
+    tokio::time::timeout(Duration::from_secs(1), gate.entered.notified())
+        .await
+        .unwrap();
+    // Another IPC client guessing the id cannot spend this credit or cancel
+    // this file. Its control RPC proves the malicious frame was consumed.
+    let mut stranger =
+        connect_with_flags(&sock, veil_proto::ipc::IPC_CAP_STREAM_WRITE_CREDIT).await;
+    send_ipc_frame(
+        &mut stranger,
+        LocalAppMsg::StreamClose as u16,
+        &StreamClosePayload { stream_id: 41 }.encode(),
+    )
+    .await;
+    send_ipc_frame(
+        &mut stranger,
+        LocalAppMsg::StreamData as u16,
+        &chunk.encode(),
+    )
+    .await;
+    send_ipc_frame(&mut stranger, LocalAppMsg::GetNodeIdentity as u16, &[]).await;
+    assert_eq!(
+        recv_ipc_frame(&mut stranger).await.0.msg_type,
+        LocalAppMsg::NodeIdentity as u16
+    );
+    assert_eq!(
+        gate.dropped.load(Ordering::SeqCst),
+        0,
+        "foreign client cancelled another file"
+    );
+    for _ in 0..3 {
+        send_ipc_frame(&mut client, LocalAppMsg::StreamData as u16, &chunk.encode()).await;
+    }
+    let (header, body) =
+        tokio::time::timeout(Duration::from_millis(250), recv_ipc_frame(&mut client))
+            .await
+            .unwrap();
+    assert_eq!(header.msg_type, LocalAppMsg::StreamClose as u16);
+    assert_eq!(StreamClosePayload::decode(&body).unwrap().stream_id, 41);
+    assert_eq!(
+        gate.dropped.load(Ordering::SeqCst),
+        1,
+        "pending source admission not cancelled"
+    );
+    send_ipc_frame(&mut client, LocalAppMsg::GetNodeIdentity as u16, &[]).await;
+    assert_eq!(
+        recv_ipc_frame(&mut client).await.0.msg_type,
+        LocalAppMsg::NodeIdentity as u16
+    );
+    // Disconnect has the same cancellation guarantee for another open file.
+    assert!(registry.route_stream_open(
+        app,
+        9,
+        42,
+        [0xee; 32],
+        veil_proto::SenderProvenance::SessionPeer,
+        STREAM_INITIAL_WINDOW
+    ));
+    recv_ipc_frame(&mut client).await;
+    send_ipc_frame(
+        &mut client,
+        LocalAppMsg::StreamData as u16,
+        &StreamDataPayload {
+            stream_id: 42,
+            data: vec![2; 2048],
+        }
+        .encode(),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(1), gate.entered.notified())
+        .await
+        .unwrap();
+    drop(client);
+    tokio::time::timeout(Duration::from_millis(250), async {
+        while gate.dropped.load(Ordering::SeqCst) != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(stranger);
+    let _ = shutdown.send(true);
+    task.await.unwrap().unwrap();
 }
