@@ -5572,6 +5572,37 @@ mod tests {
         )
     }
 
+    #[test]
+    #[ignore = "Known crossed-init defect: resolver must preserve pending-peer recovery and replay protection"]
+    fn simultaneous_initiations_converge_before_the_next_bare_frame() {
+        for reverse_delivery in [false, true] {
+            let (a, b) = (device(0xA3), device(0xB3));
+            assert!(a.node_id < b.node_id);
+            let a_first = seal_at(&a, &b, b"A first", NOW);
+            let b_first = seal_at(&b, &a, b"B first", NOW);
+            assert_eq!((a_first[2], b_first[2]), (0, 0));
+            if reverse_delivery {
+                let _ = open_at(&a, &b, &b_first, NOW);
+                open_at(&b, &a, &a_first, NOW).unwrap();
+            } else {
+                open_at(&b, &a, &a_first, NOW).unwrap();
+                let _ = open_at(&a, &b, &b_first, NOW);
+            }
+            let b_next = seal_at(&b, &a, b"B retry after A's initiation", NOW + 1);
+            assert_eq!(b_next[2], 1);
+            assert_eq!(
+                open_at(&a, &b, &b_next, NOW + 1).unwrap().plaintext,
+                b"B retry after A's initiation"
+            );
+            let a_next = seal_at(&a, &b, b"A next", NOW + 2);
+            assert_eq!(a_next[2], 1);
+            assert_eq!(
+                open_at(&b, &a, &a_next, NOW + 2).unwrap().plaintext,
+                b"A next"
+            );
+        }
+    }
+
     /// The case this exists for. Alice and Bob are proven and answered; Alice
     /// loses her state (a reinstall, a restore) and seals again from nothing.
     /// Her new prologue used to be refused by the conversation Bob still held,
