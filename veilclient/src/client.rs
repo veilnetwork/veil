@@ -115,7 +115,7 @@ pub(crate) fn take_pending_slot<T>(
 /// `AppSender::send` does not block on a per-socket mutex (Phase E25).
 #[derive(Clone)]
 pub(crate) struct SharedWriter {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<IpcWriterFrame>,
     /// Monotonic request-id source for request/response correlation
     /// (`FrameHeader.request_id`). Non-zero by construction — zero is the
     /// legacy "no id" marker on the wire.
@@ -123,6 +123,30 @@ pub(crate) struct SharedWriter {
 }
 
 pub(crate) const FRAME_TX_CAPACITY: usize = 1024;
+
+/// Local producer deadline only: not encoded into IPC or network bytes.
+/// Reliable requests have no deadline and retain the existing FIFO semantics.
+#[derive(Debug)]
+pub(crate) struct IpcWriterFrame {
+    bytes: Vec<u8>,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl From<Vec<u8>> for IpcWriterFrame {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            deadline: None,
+        }
+    }
+}
+
+impl std::ops::Deref for IpcWriterFrame {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
 
 /// Number of uninit bytes a caller must reserve at the FRONT of a
 /// `Vec<u8>` before calling [`AppSender::send_prepared`]. Equal to
@@ -132,7 +156,7 @@ pub(crate) const FRAME_TX_CAPACITY: usize = 1024;
 pub const APP_IPC_SEND_PREFIX_BYTES: usize = 24 + 108;
 
 impl SharedWriter {
-    pub(crate) fn new(tx: mpsc::Sender<Vec<u8>>) -> Self {
+    pub(crate) fn new(tx: mpsc::Sender<IpcWriterFrame>) -> Self {
         Self {
             tx,
             next_request_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
@@ -164,15 +188,52 @@ impl SharedWriter {
         msg_type: u16,
         body: &[u8],
     ) -> Result<(), ClientError> {
+        self.write_frame_on_local_lane_with_deadline(local_priority, msg_type, body, None)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn write_frame_on_local_lane_with_deadline(
+        &self,
+        local_priority: u8,
+        msg_type: u16,
+        body: &[u8],
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<bool, ClientError> {
         let mut hdr = FrameHeader::new(FrameFamily::LocalApp as u8, msg_type);
         hdr.body_len = body.len() as u32;
         hdr.set_priority(local_priority.min(3));
         let mut frame = codec::encode_header(&hdr).to_vec();
         frame.extend_from_slice(body);
-        self.tx
-            .send(frame)
-            .await
-            .map_err(|_| ClientError::ConnectionClosed)
+        self.enqueue(frame, deadline).await
+    }
+
+    /// Cancel only the capacity reservation. Once queued, the writer either
+    /// drops an expired whole frame or finishes its already-started write.
+    async fn enqueue(
+        &self,
+        bytes: Vec<u8>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<bool, ClientError> {
+        if let Some(at) = deadline {
+            if tokio::time::Instant::now() >= at {
+                return Ok(false);
+            }
+            let permit = match tokio::time::timeout_at(at, self.tx.reserve()).await {
+                Err(_) => return Ok(false),
+                Ok(result) => result.map_err(|_| ClientError::ConnectionClosed)?,
+            };
+            if tokio::time::Instant::now() >= at {
+                return Ok(false);
+            }
+            permit.send(IpcWriterFrame { bytes, deadline });
+        } else {
+            self.tx
+                .send(bytes.into())
+                .await
+                .map_err(|_| ClientError::ConnectionClosed)?;
+        }
+        Ok(true)
     }
 
     /// Request variant: stamps `request_id` into the frame header so the
@@ -185,7 +246,7 @@ impl SharedWriter {
     ) -> Result<(), ClientError> {
         let frame = encode_frame_with_id(msg_type, request_id, body);
         self.tx
-            .send(frame)
+            .send(frame.into())
             .await
             .map_err(|_| ClientError::ConnectionClosed)
     }
@@ -196,7 +257,9 @@ impl SharedWriter {
     /// keeps the pending amount and retries on a later poll, so no credit is
     /// lost.
     pub(crate) fn try_send_frame(&self, msg_type: u16, body: &[u8]) -> bool {
-        self.tx.try_send(encode_frame(msg_type, body)).is_ok()
+        self.tx
+            .try_send(encode_frame(msg_type, body).into())
+            .is_ok()
     }
 
     /// Zero-data-copy variant: caller supplies a `Vec<u8>` that already
@@ -246,7 +309,7 @@ impl SharedWriter {
         buf[p..p + 4].copy_from_slice(&(data_len as u32).to_be_bytes());
 
         self.tx
-            .send(buf)
+            .send(buf.into())
             .await
             .map_err(|_| ClientError::ConnectionClosed)
     }
@@ -283,8 +346,10 @@ impl SharedWriter {
             endpoint_id,
             flags,
             data,
+            None,
         )
         .await
+        .map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -307,6 +372,34 @@ impl SharedWriter {
             endpoint_id,
             flags,
             data,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_app_ipc_send_on_local_lane_before_owned(
+        &self,
+        local_priority: u8,
+        dst_node_id: &[u8; 32],
+        src_app_id: &[u8; 32],
+        dst_app_id: &[u8; 32],
+        endpoint_id: u32,
+        flags: u32,
+        data: &[u8],
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, ClientError> {
+        self.write_app_ipc_send_with_queue_hint_owned(
+            local_priority,
+            true,
+            dst_node_id,
+            src_app_id,
+            dst_app_id,
+            endpoint_id,
+            flags,
+            data,
+            Some(deadline),
         )
         .await
     }
@@ -322,7 +415,8 @@ impl SharedWriter {
         endpoint_id: u32,
         flags: u32,
         data: &[u8],
-    ) -> Result<(), ClientError> {
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<bool, ClientError> {
         use veil_proto::header::HEADER_SIZE;
         const FIXED_SIZE: usize = 32 + 32 + 32 + 4 + 4 + 4; // matches AppIpcSendPayload::FIXED_SIZE
         let body_len = FIXED_SIZE + data.len();
@@ -351,10 +445,7 @@ impl SharedWriter {
 
         debug_assert_eq!(frame.len(), total, "single-buffer encode size mismatch");
 
-        self.tx
-            .send(frame)
-            .await
-            .map_err(|_| ClientError::ConnectionClosed)
+        self.enqueue(frame, deadline).await
     }
 
     /// Reply-channel-aware `APP_IPC_SEND` encoder: like
@@ -401,7 +492,7 @@ impl SharedWriter {
         debug_assert_eq!(frame.len(), total, "reply-aware encode size mismatch");
 
         self.tx
-            .send(frame)
+            .send(frame.into())
             .await
             .map_err(|_| ClientError::ConnectionClosed)
     }
@@ -414,7 +505,7 @@ impl SharedWriter {
     /// once when capacity frees — replacing the previous `try_send` +
     /// `cx.waker().wake_by_ref()` busy-spin that re-polled continuously under
     /// backpressure.
-    pub(crate) fn poll_sender(&self) -> tokio_util::sync::PollSender<Vec<u8>> {
+    pub(crate) fn poll_sender(&self) -> tokio_util::sync::PollSender<IpcWriterFrame> {
         tokio_util::sync::PollSender::new(self.tx.clone())
     }
 }
@@ -457,7 +548,7 @@ pub(crate) const WRITE_DEADLINE: std::time::Duration = std::time::Duration::from
 /// portably.
 pub(crate) async fn run_writer_task<W: tokio::io::AsyncWrite + Unpin>(
     mut wh: W,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<IpcWriterFrame>,
 ) {
     /// Cap on frames drained in one batch — bounds the worst-case syscall
     /// size at writev-style concat and keeps tail-latency for interactive
@@ -470,7 +561,7 @@ pub(crate) async fn run_writer_task<W: tokio::io::AsyncWrite + Unpin>(
         // a recv()→write→recv()→write ping-pong when the egress task is
         // bursty (e.g. ogate has just shipped multiple back-to-back batch
         // envelopes), turning N awaits into 1 + N − 1 cheap try_recv calls.
-        let mut frames: Vec<Vec<u8>> = Vec::with_capacity(DRAIN_CAP);
+        let mut frames = Vec::with_capacity(DRAIN_CAP);
         frames.push(first);
         while frames.len() < DRAIN_CAP {
             match rx.try_recv() {
@@ -480,6 +571,13 @@ pub(crate) async fn run_writer_task<W: tokio::io::AsyncWrite + Unpin>(
         }
         let mut failed = false;
         for f in frames {
+            if f.deadline
+                .is_some_and(|at| tokio::time::Instant::now() >= at)
+            {
+                continue;
+            }
+            // Do not apply the producer deadline to an in-progress write:
+            // cancellation after a partial header/body would corrupt IPC.
             match tokio::time::timeout(WRITE_DEADLINE, wh.write_all(&f)).await {
                 Ok(Ok(())) => {}
                 // Either the socket errored or the peer stopped reading. Both
@@ -876,7 +974,7 @@ impl VeilClient {
 
         // ── Split socket ─────────────────────────────────────────────────
         let (rh, wh) = stream.into_split();
-        let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(FRAME_TX_CAPACITY);
+        let (frame_tx, frame_rx) = mpsc::channel::<IpcWriterFrame>(FRAME_TX_CAPACITY);
         tokio::spawn(run_writer_task(wh, frame_rx));
         let writer = SharedWriter::new(frame_tx);
         let dispatch = Arc::new(Mutex::new(DispatchTable::new()));
@@ -3649,7 +3747,7 @@ mod tests {
                 .write_app_ipc_send_owned(&[1; 32], &[2; 32], &[3; 32], 13, flags, data)
                 .await
                 .unwrap();
-            let legacy = rx.recv().await.unwrap();
+            let legacy = rx.recv().await.unwrap().bytes;
             let legacy_header = veil_proto::codec::decode_header(&legacy).unwrap();
             assert_eq!(legacy_header.flags, 0, "legacy SDK framing is unchanged");
             assert_eq!(
@@ -3663,7 +3761,7 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                let mut explicit = rx.recv().await.unwrap();
+                let mut explicit = rx.recv().await.unwrap().bytes;
                 let header = veil_proto::codec::decode_header(&explicit).unwrap();
                 assert_eq!(veil_proto::ipc::ipc_local_source_lane(&header), lane);
                 explicit[..veil_proto::HEADER_SIZE]
@@ -3715,9 +3813,9 @@ mod tests {
     /// deadline rather than a shortened one.
     #[tokio::test(start_paused = true)]
     async fn the_writer_gives_up_on_a_peer_that_stopped_reading() {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(4);
+        let (tx, rx) = mpsc::channel::<IpcWriterFrame>(4);
         let task = tokio::spawn(run_writer_task(StalledWriter, rx));
-        tx.send(vec![1, 2, 3]).await.expect("queued");
+        tx.send(vec![1, 2, 3].into()).await.expect("queued");
         // Held open on purpose: the task must end because the WRITE gave up,
         // not because the channel closed.
         let finished = tokio::time::timeout(WRITE_DEADLINE * 3, task).await;
@@ -3733,10 +3831,10 @@ mod tests {
     /// everything would pass the test above and break every send.
     #[tokio::test(start_paused = true)]
     async fn a_writer_whose_peer_reads_keeps_serving() {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(4);
+        let (tx, rx) = mpsc::channel::<IpcWriterFrame>(4);
         let (client, mut server) = tokio::io::duplex(64 * 1024);
         let task = tokio::spawn(run_writer_task(client, rx));
-        tx.send(vec![7, 7, 7]).await.expect("queued");
+        tx.send(vec![7, 7, 7].into()).await.expect("queued");
         let mut got = [0u8; 3];
         tokio::io::AsyncReadExt::read_exact(&mut server, &mut got)
             .await

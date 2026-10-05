@@ -191,14 +191,15 @@ async fn remote_stream_sdk_ipc_preserves_bounded_bytes_and_source_lane_through_c
 #[tokio::test]
 async fn source_lane_survives_sdk_ipc_but_is_absent_from_network_frame() {
     const PEER: [u8; 32] = [0xB9; 32];
+    const RELAY: [u8; 32] = [0xBA; 32];
     struct Capture(tokio::sync::mpsc::UnboundedSender<(u8, Vec<u8>)>);
     impl veil_types::FrameBroadcaster for Capture {
         fn send_to(&self, peer: &[u8; 32], lane: u8, frame: Vec<u8>) -> bool {
-            *peer == PEER && self.0.send((lane, frame)).is_ok()
+            (*peer == PEER || *peer == RELAY) && self.0.send((lane, frame)).is_ok()
         }
         fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
         fn active_node_ids(&self) -> Vec<[u8; 32]> {
-            vec![PEER]
+            vec![PEER, RELAY]
         }
     }
     let sock = temp_socket();
@@ -257,6 +258,141 @@ async fn source_lane_survives_sdk_ipc_but_is_absent_from_network_frame() {
         assert_eq!(queued, lane);
         assert_eq!(frame, original, "no source hint on the inter-node wire");
     }
+    // Freshness remains local to the SDK writer, including the deadline-aware
+    // direct and sealed-relay APIs used by native media pumps. The real Unix
+    // IPC daemon must emit byte-identical network frames and source queues.
+    for lane in [0, 2, 3] {
+        sender
+            .send_rt_data_on_local_lane(
+                lane,
+                PEER,
+                [0xAA; 32],
+                9,
+                13,
+                42,
+                0,
+                0,
+                b"opaque direct cell",
+            )
+            .await
+            .unwrap();
+        let original = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            sender
+                .send_rt_data_on_local_lane_before(
+                    lane,
+                    PEER,
+                    [0xAA; 32],
+                    9,
+                    13,
+                    42,
+                    0,
+                    0,
+                    b"opaque direct cell",
+                    tokio::time::Instant::now() + Duration::from_secs(1)
+                )
+                .await
+                .unwrap()
+        );
+        let fresh = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fresh, original,
+            "deadline must not change direct bytes or source queue"
+        );
+        assert!(
+            !sender
+                .send_rt_data_on_local_lane_before(
+                    lane,
+                    PEER,
+                    [0xAA; 32],
+                    9,
+                    14,
+                    42,
+                    0,
+                    0,
+                    b"expired direct cell",
+                    tokio::time::Instant::now()
+                )
+                .await
+                .unwrap()
+        );
+        let mut cell = veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC.to_vec();
+        cell.extend(b"opaque relay cell");
+        sender
+            .send_relay_media_sealed_on_local_lane_owned(lane, PEER, [0xAA; 32], 9, cell.clone())
+            .await
+            .unwrap();
+        let original = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.0, lane);
+        assert!(
+            sender
+                .send_relay_media_sealed_on_local_lane_before_owned(
+                    lane,
+                    PEER,
+                    [0xAA; 32],
+                    9,
+                    cell.clone(),
+                    tokio::time::Instant::now() + Duration::from_secs(1)
+                )
+                .await
+                .unwrap()
+        );
+        let fresh = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.0, original.0);
+        let decode_relay = |frame: &[u8]| {
+            let header = veil_proto::codec::decode_header(frame).unwrap();
+            assert_eq!(header.flags, 0, "no source/deadline field on relay wire");
+            let mut forward =
+                veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                    .unwrap();
+            // Per-send bookkeeping is random/time-dependent even in the
+            // legacy API; only those two fields are normalized.
+            forward.envelope.content_id = [0; 32];
+            forward.envelope.created_at = 0;
+            forward
+        };
+        assert_eq!(
+            decode_relay(&fresh.1),
+            decode_relay(&original.1),
+            "deadline must not change relay transport or application fields"
+        );
+        assert!(
+            !sender
+                .send_relay_media_sealed_on_local_lane_before_owned(
+                    lane,
+                    PEER,
+                    [0xAA; 32],
+                    9,
+                    cell,
+                    tokio::time::Instant::now()
+                )
+                .await
+                .unwrap()
+        );
+    }
+    // A final reliable send is an ordered barrier; expired datagrams must not
+    // have entered the IPC stream ahead of it or become extra network frames.
+    sender
+        .send(PEER, [0xAA; 32], 9, b"same encrypted application bytes")
+        .await
+        .unwrap();
+    let (_, barrier) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(barrier, original);
     sender.close().await;
     let _ = shutdown_tx.send(true);
     task.await.unwrap();

@@ -653,7 +653,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
                 };
                 let timestamp_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                 let _ = sender
-                    .send_rt_data_on_local_lane(
+                    .send_rt_data_on_local_lane_before(
                         veil_proto::priority::REALTIME,
                         peer,
                         peer_app,
@@ -663,6 +663,9 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
                         cell.marker,
                         cell.payload_type,
                         cell.sealed.as_bytes(),
+                        cell.sealed
+                            .local_deadline()
+                            .expect("native pump retains packet deadline"),
                     )
                     .await;
                 true
@@ -687,7 +690,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
                 };
                 let timestamp_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                 let _ = sender
-                    .send_rt_data_on_local_lane(
+                    .send_rt_data_on_local_lane_before(
                         veil_proto::priority::BULK,
                         peer,
                         peer_app,
@@ -697,6 +700,9 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
                         cell.marker,
                         cell.payload_type,
                         cell.sealed.as_bytes(),
+                        cell.sealed
+                            .local_deadline()
+                            .expect("native pump retains packet deadline"),
                     )
                     .await;
                 true
@@ -790,12 +796,18 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                 };
                 media::trace_sealed_cell("relay_send", &peer, cell.sealed.as_bytes());
                 let ipc_started = std::time::Instant::now();
+                let deadline = cell
+                    .sealed
+                    .local_deadline()
+                    .expect("native pump retains packet deadline");
                 let result = sender
-                    .send_relay_media_sealed_owned(
+                    .send_relay_media_sealed_on_local_lane_before_owned(
+                        veil_proto::priority::REALTIME,
                         peer,
                         peer_app,
                         peer_endpoint_id,
                         cell.sealed.into_vec(),
+                        deadline,
                     )
                     .await;
                 stats.observe_ipc_cell(ipc_started.elapsed(), result.is_err());
@@ -823,13 +835,17 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                     return false;
                 };
                 let ipc_started = std::time::Instant::now();
+                let deadline = sealed
+                    .local_deadline()
+                    .expect("native pump retains packet deadline");
                 let result = sender
-                    .send_relay_media_sealed_on_local_lane_owned(
+                    .send_relay_media_sealed_on_local_lane_before_owned(
                         veil_proto::priority::BULK,
                         peer,
                         peer_app,
                         peer_endpoint_id,
                         sealed.into_vec(),
+                        deadline,
                     )
                     .await;
                 stats.observe_ipc_cell(ipc_started.elapsed(), result.is_err());

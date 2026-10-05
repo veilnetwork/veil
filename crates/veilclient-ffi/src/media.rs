@@ -434,8 +434,9 @@ impl SealedMediaCell {
             .is_some_and(|at| tokio::time::Instant::now() >= at)
     }
 
-    /// Only lock acquisition may be cancelled. Once IPC writing begins its
-    /// future must complete, so a timeout can never truncate a protocol frame.
+    /// Bound only shared-handle lock acquisition here. The SDK can also expire
+    /// an unadmitted or queued whole frame. Neither layer cancels an already
+    /// started socket write, which would truncate the IPC protocol frame.
     pub(crate) async fn lock_while_fresh<'a, T>(
         &self,
         lock: &'a tokio::sync::Mutex<T>,
