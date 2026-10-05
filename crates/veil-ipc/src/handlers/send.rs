@@ -1018,7 +1018,16 @@ pub(crate) async fn handle_ipc_send(
                 continue;
             }
             let hops = ordinary_relay_hops(None, &device, route_cache, reg, true);
-            if hops.is_empty() {
+            // A cached device route can accept frames while its attachment is
+            // stale. Also use the identity's current attachment, restricted to
+            // this same verified instance. Queue admission on either path is
+            // not receipt. No DHT wait or new alias authority is introduced.
+            let identity_hops = if device != send.dst_node_id {
+                ordinary_relay_hops(None, &send.dst_node_id, route_cache, reg, true)
+            } else {
+                Vec::new()
+            };
+            if hops.is_empty() && identity_hops.is_empty() {
                 continue;
             }
             let Ok((payload, _)) = ratchet.seal_for(
@@ -1034,34 +1043,47 @@ pub(crate) async fn handle_ipc_send(
             ) else {
                 continue;
             };
-            let mut nonce = [0u8; 32];
-            use rand_core::RngCore;
-            rand_core::OsRng.fill_bytes(&mut nonce);
-            let envelope = DeliveryEnvelope {
-                recipient: veil_proto::recipient::Recipient::any(device),
-                sender_node_id: *local_node_id,
-                src_app_id: send.src_app_id,
-                app_id: send.app_id,
-                endpoint_id: send.endpoint_id,
-                content_id: *blake3::hash(&nonce).as_bytes(),
-                created_at: now,
-                ttl_secs: veil_proto::delivery::FORWARD_REALTIME_TTL_SECS,
-                payload,
-                trace_id: 0,
-                require_ack: false,
-            };
-            let bytes = envelope.encode();
-            for hop in hops.into_iter().take(3) {
-                let mut header =
-                    FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
-                header.set_priority(veil_proto::priority::INTERACTIVE);
-                header.body_len = (32 + bytes.len() + 8 + 1) as u32;
-                let mut frame = codec::encode_header(&header).to_vec();
-                frame.extend_from_slice(&hop);
-                frame.extend_from_slice(&bytes);
-                frame.extend_from_slice(&0u64.to_be_bytes());
-                frame.push(0);
-                any_sent |= reg.send_to(&hop, veil_proto::header::priority::REALTIME, frame);
+            use veil_proto::recipient::Recipient;
+            for (recipient, hops) in [
+                (Recipient::any(device), hops),
+                (
+                    Recipient::specific(send.dst_node_id, cert.instance_id),
+                    identity_hops,
+                ),
+            ] {
+                // Relay dedup precedes recipient resolution. Each addressing
+                // path needs its own outer id, retaining identical ciphertext
+                // sealed once for the same device. Ratchet/app replay authority
+                // still admits the first logical signal only.
+                let mut nonce = [0u8; 32];
+                use rand_core::RngCore;
+                rand_core::OsRng.fill_bytes(&mut nonce);
+                let envelope = DeliveryEnvelope {
+                    recipient,
+                    sender_node_id: *local_node_id,
+                    src_app_id: send.src_app_id,
+                    app_id: send.app_id,
+                    endpoint_id: send.endpoint_id,
+                    content_id: *blake3::hash(&nonce).as_bytes(),
+                    created_at: now,
+                    ttl_secs: veil_proto::delivery::FORWARD_REALTIME_TTL_SECS,
+                    payload: payload.clone(),
+                    trace_id: 0,
+                    require_ack: false,
+                };
+                let bytes = envelope.encode();
+                for hop in hops.into_iter().take(3) {
+                    let mut header =
+                        FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+                    header.set_priority(veil_proto::priority::INTERACTIVE);
+                    header.body_len = (32 + bytes.len() + 8 + 1) as u32;
+                    let mut frame = codec::encode_header(&header).to_vec();
+                    frame.extend_from_slice(&hop);
+                    frame.extend_from_slice(&bytes);
+                    frame.extend_from_slice(&0u64.to_be_bytes());
+                    frame.push(0);
+                    any_sent |= reg.send_to(&hop, veil_proto::header::priority::REALTIME, frame);
+                }
             }
         }
         if any_sent {
@@ -2692,20 +2714,36 @@ mod ratchet_send_tests {
         let frames = fx.taken();
         assert_eq!(
             frames.len(),
-            2,
-            "one copy per device even without P2P sessions"
+            4,
+            "device and identity-instance copy per device without P2P sessions"
         );
         for (hop, frame) in frames {
             assert_eq!(hop, RELAY);
             let (envelope, _) = DeliveryEnvelope::decode(&frame[veil_proto::HEADER_SIZE + 32..])
                 .expect("relay envelope");
             let (_, instance) = veil_e2e::payload_instances(&envelope.payload).expect("sealed");
-            assert_eq!(&envelope.recipient.node_id[..16], &instance);
+            if envelope.recipient.node_id != PEER {
+                assert_eq!(&envelope.recipient.node_id[..16], &instance);
+                continue; // alternate addressing of the same sealed payload
+            }
+            assert_eq!(
+                envelope.recipient,
+                veil_proto::recipient::Recipient::specific(PEER, instance)
+            );
             let receiver = if instance == PEER_INSTANCE {
                 &fx.peer
             } else {
                 &sibling
             };
+            let wrong_receiver = if instance == PEER_INSTANCE {
+                &sibling
+            } else {
+                &fx.peer
+            };
+            assert!(matches!(
+                wrong_receiver.open_payload(&ME, &envelope.payload, veil_util::unix_secs_now_u64()),
+                Err(veil_e2e::RatchetSpliceError::NotForThisDevice)
+            ));
             let opened = receiver
                 .open_payload(&ME, &envelope.payload, veil_util::unix_secs_now_u64())
                 .expect("the device opens its own copy");
@@ -3403,6 +3441,95 @@ mod ratchet_send_tests {
             opened.authenticated,
             "a relay offer needs origin proof, not only confidentiality"
         );
+    }
+
+    #[tokio::test]
+    async fn relay_call_control_keeps_identity_instance_copy_when_device_queue_accepts() {
+        use veil_proto::recipient::{InstanceTag, Recipient};
+        let mut fx = fixture(vec![RELAY]);
+        let cert = fx.certs.resolve_cert_cached(PEER).unwrap();
+        let device = {
+            let mut device = [0; 32];
+            device[..16].copy_from_slice(&cert.instance_id);
+            device
+        };
+        fx.certs = Arc::new(FamilyCerts(vec![cert]));
+        // The first hop accepts a stale device route but knows the current
+        // identity route. Admission to that queue cannot prove delivery.
+        wlock!(fx.route_cache).insert(device, RELAY, 10_000, 2);
+        let mut body = payload(false, b"call answer");
+        let flags = u32::from_be_bytes(body[100..104].try_into().unwrap())
+            | veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT;
+        body[100..104].copy_from_slice(&flags.to_be_bytes());
+        let mut wh = sink().await;
+        handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &fx.ctx(true))
+            .await
+            .unwrap();
+        let forwards: Vec<_> = fx
+            .taken()
+            .into_iter()
+            .map(|(hop, frame)| {
+                assert_eq!(hop, RELAY);
+                assert_eq!(
+                    codec::decode_header(&frame).unwrap().priority(),
+                    veil_proto::priority::INTERACTIVE
+                );
+                veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                    .unwrap()
+            })
+            .collect();
+        let physical = forwards
+            .iter()
+            .find(|f| f.envelope.recipient == Recipient::any(device))
+            .expect("physical device copy");
+        let identity = forwards
+            .iter()
+            .find(|f| f.envelope.recipient == Recipient::specific(PEER, PEER_INSTANCE))
+            .expect("accepted device queue must not suppress current identity route");
+        assert_eq!(forwards.len(), 2, "one bounded copy per addressing path");
+        assert_eq!(
+            identity.envelope.recipient.instance_tag,
+            InstanceTag::Specific(PEER_INSTANCE)
+        );
+        assert_eq!(
+            physical.envelope.payload, identity.envelope.payload,
+            "seal once per device"
+        );
+        assert_ne!(
+            physical.envelope.content_id, identity.envelope.content_id,
+            "relay dedup must not discard the alternate recipient before routing"
+        );
+        assert!(
+            forwards
+                .iter()
+                .all(|f| f.traffic_class.is_none() && !f.envelope.require_ack)
+        );
+        let opened = fx
+            .peer
+            .open_payload(
+                &ME,
+                &identity.envelope.payload,
+                veil_util::unix_secs_now_u64(),
+            )
+            .unwrap();
+        assert!(opened.authenticated);
+        assert_eq!(opened.plaintext, b"call answer");
+        assert_eq!(
+            veil_e2e::payload_instances(&identity.envelope.payload)
+                .unwrap()
+                .1,
+            PEER_INSTANCE
+        );
+        let duplicate = fx.peer.open_payload(
+            &ME,
+            &physical.envelope.payload,
+            veil_util::unix_secs_now_u64(),
+        );
+        assert!(
+            matches!(&duplicate, Err(error) if error.is_unavailable_message_key()),
+            "alternate addressing must be a benign cryptographic replay: {duplicate:?}"
+        );
+        assert_eq!(fx.peer.peer_entry_authenticated(&ME), Some(true));
     }
 
     #[tokio::test]
