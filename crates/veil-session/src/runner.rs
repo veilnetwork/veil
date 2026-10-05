@@ -3765,6 +3765,7 @@ impl SessionRunner {
         // current zombie episode. Reset to 0 on inbound KeepaliveAck (TX
         // confirmed) and on a completed SwapStream (TX re-established).
         let mut keepalive_swap_attempts: u32 = 0u32;
+        let mut keepalive_last_probe_spawned = false;
         // Timeout = 1 × keepalive_interval. A healthy peer acks within
         // < 1 s on a LAN, so waiting one full interval for the ack is
         // already generous. Initial c.2.2 shipped with 2 ×
@@ -4021,7 +4022,8 @@ impl SessionRunner {
                     // Enqueue a keepalive if the interval has elapsed.
                     // `PendingKeepaliveProbe::try_arm` preserves the
                     // oldest-armed timestamp on subsequent calls.
-                    if timers.keepalive_due_and_reschedule(now) {
+                    let keepalive_tick = timers.keepalive_due_and_reschedule(now);
+                    if keepalive_tick {
                         pq.push(
                             veil_proto::priority::INTERACTIVE,
                             veil_bufpool::pooled_shared_from_vec(
@@ -4077,14 +4079,16 @@ impl SessionRunner {
                     // session is detected in seconds, not minutes.
                     let probe_timeout_now =
                         timers.effective_keepalive_probe_timeout(keepalive_probe_timeout, now);
-                    if keepalive_enabled
+                    let probe_fired_now = keepalive_enabled
                         && !keepalive_probe_trigger.has_fired()
                         && probe_timeout_now > std::time::Duration::ZERO
-                        && let Some(t) = pending_keepalive_probe.oldest()
-                        && now.duration_since(t) >= probe_timeout_now
-                        && keepalive_probe_trigger.try_fire()
-                    {
+                        && pending_keepalive_probe
+                            .oldest()
+                            .is_some_and(|t| now.duration_since(t) >= probe_timeout_now)
+                        && keepalive_probe_trigger.try_fire();
+                    if probe_fired_now {
                         let spawned = self.fire_hot_standby_trigger("keepalive_probe_timeout");
+                        keepalive_last_probe_spawned = spawned;
                         keepalive_swap_attempts = keepalive_swap_attempts.saturating_add(1);
                         self.logger.info(
                             "session.keepalive.probe_fired",
@@ -4094,22 +4098,27 @@ impl SessionRunner {
                             ),
                         );
                     }
-                    // Stage B: RE-EVAL each keepalive tick while the trigger stays
-                    // fired (no KeepaliveAck cleared the ledger). The dedicated
-                    // probe wake is dropped after first fire
-                    // (compute_sleep_deadline gates on !fired) so this arm is
-                    // woken by next_keepalive every keepalive_interval; budget
-                    // ~2×probe_timeout + 1×interval. Re-spawn (bump counter) each
-                    // tick until an ack clears it or the helper says reap.
-                    else if keepalive_enabled
+                    // Stage B: stale teardown is re-evaluated on loop progress,
+                    // but retrying a warm probe requires a NEW keepalive tick.
+                    // Genuine RX still protects a live peer even with missing
+                    // ACKs; the two-attempt budget bounds trigger calls as well
+                    // as failover. No-failover peers can be reaped immediately,
+                    // without an extra base keepalive interval of delay.
+                    if keepalive_enabled
                         && keepalive_probe_trigger.has_fired()
                         && probe_timeout_now > std::time::Duration::ZERO
                         && let Some(t) = pending_keepalive_probe.oldest()
                     {
                         let probe_age = now.duration_since(t);
                         if probe_age >= probe_timeout_now {
-                            let spawned = self.fire_hot_standby_trigger("keepalive_probe_timeout");
-                            keepalive_swap_attempts = keepalive_swap_attempts.saturating_add(1);
+                            if keepalive_tick
+                                && !probe_fired_now
+                                && keepalive_swap_attempts < KEEPALIVE_SWAP_ATTEMPT_CEILING
+                            {
+                                keepalive_swap_attempts += 1;
+                                keepalive_last_probe_spawned =
+                                    self.fire_hot_standby_trigger("keepalive_probe_timeout");
+                            }
                             let genuine_age = timers.genuine_rx_age(now);
                             if should_reeval_teardown(
                                 probe_age,
@@ -4117,7 +4126,7 @@ impl SessionRunner {
                                 keepalive_swap_attempts,
                                 KEEPALIVE_SWAP_ATTEMPT_CEILING,
                                 genuine_age,
-                                spawned,
+                                keepalive_last_probe_spawned,
                             ) {
                                 self.logger.info(
                                     "session.keepalive.timeout_close",
@@ -4731,6 +4740,7 @@ impl SessionRunner {
                         pending_keepalive_probe.clear();
                         keepalive_probe_trigger.clear();
                         keepalive_swap_attempts = 0;
+                        keepalive_last_probe_spawned = false;
                         continue;
                     }
                     NextInput::RpcRequest(req) => {
@@ -5125,6 +5135,7 @@ impl SessionRunner {
                 pending_keepalive_probe.clear();
                 keepalive_probe_trigger.clear();
                 keepalive_swap_attempts = 0;
+                keepalive_last_probe_spawned = false;
             }
 
             // ── Intercept RPC responses before general dispatch ───────────────
