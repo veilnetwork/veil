@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <span>
 #include <utility>
+#include <vector>
 
 #include "api/task_queue/task_queue_base.h"
 #include "call/call.h"
@@ -45,6 +46,16 @@ namespace veil_media {
 namespace {
 constexpr uint8_t kVp8PayloadType = 96;
 constexpr int64_t kHoldThresholdNs = 75 * 1000 * 1000;
+constexpr uint32_t kAudioPlayoutAppName = 0x56415031u;  // "VAP1"
+constexpr uint32_t kUnknownPlayout = 0xffffffffu;
+
+uint32_t read_be32(const uint8_t* p) {
+  return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 |
+         uint32_t(p[2]) << 8 | uint32_t(p[3]);
+}
+void write_be32(uint8_t* p, uint32_t value) {
+  for (int i = 0; i < 4; ++i) p[i] = value >> (24 - i * 8);
+}
 
 void slog(const char* fmt, ...) {
   va_list ap;
@@ -182,6 +193,43 @@ bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
 bool VeilTransportShim::SendRtcp(std::span<const uint8_t> packet,
                                  const webrtc::PacketOptions& options) {
   (void)options;  // RTCP carries no packet_id to feed back.
+  std::vector<uint8_t> compound;
+  LocalAudioPlayout sample;
+  {
+    std::lock_guard lock(audio_feedback_mu_);
+    sample = local_audio_playout_;
+  }
+  bool append = sample.enabled && started_.load(std::memory_order_acquire);
+  // Keep RTCP's original report/SDES framing and do not append after BYE or
+  // padding. Old endpoints can ignore the optional APP name (RFC 3550 §6.7).
+  for (size_t offset = 0; append && offset < packet.size();) {
+    webrtc::rtcp::CommonHeader header;
+    if (!header.Parse(packet.data() + offset, packet.size() - offset) ||
+        header.type() == 203 || (packet[offset] & 0x20) != 0) {
+      append = false;
+      break;
+    }
+    offset += header.packet_size();
+  }
+  if (append && !packet.empty()) {
+    compound.assign(packet.begin(), packet.end());
+    const size_t at = compound.size();
+    compound.resize(at + 28);
+    auto* app = compound.data() + at;
+    app[0] = 0x80; app[1] = 204; app[2] = 0; app[3] = 6;
+    write_be32(app + 4, local_audio_ssrc_.load(std::memory_order_relaxed));
+    write_be32(app + 8, kAudioPlayoutAppName);
+    write_be32(app + 12, sample.remote_ssrc);
+    write_be32(app + 16, static_cast<uint32_t>(sample.sequence >> 32));
+    write_be32(app + 20, static_cast<uint32_t>(sample.sequence));
+    const int64_t now_us = webrtc::TimeMicros();
+    const bool fresh = sample.sampled_us > 0 && sample.sampled_us <= now_us &&
+                       now_us - sample.sampled_us <= 3'000'000;
+    write_be32(app + 24, fresh && sample.delay_ms >= 0
+                            ? static_cast<uint32_t>(sample.delay_ms)
+                            : kUnknownPlayout);
+    packet = std::span<const uint8_t>(compound);
+  }
   const int rc =
       veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
   if (rc == 0) {
@@ -260,11 +308,27 @@ AudioFeedbackSnapshot VeilTransportShim::audio_feedback() const {
   return audio_feedback_;
 }
 
+AudioPlayoutSnapshot VeilTransportShim::audio_playout_feedback() const {
+  if (!started_.load(std::memory_order_acquire)) return {};
+  std::lock_guard lock(audio_feedback_mu_);
+  return audio_playout_feedback_;
+}
+
+void VeilTransportShim::SetLocalAudioPlayout(uint32_t remote_audio_ssrc,
+                                            uint64_t sequence, int delay_ms,
+                                            int64_t sampled_us) {
+  std::lock_guard lock(audio_feedback_mu_);
+  local_audio_playout_ = {true, remote_audio_ssrc, sequence,
+                        delay_ms >= 0 && delay_ms <= 60000 ? delay_ms : -1,
+                        sampled_us};
+}
+
 void VeilTransportShim::ObserveAudioFeedback(std::span<const uint8_t> packet,
                                              int64_t arrived_us) {
   const uint32_t local = local_audio_ssrc_.load(std::memory_order_relaxed);
   if (local == 0) return;
   AudioFeedbackSnapshot candidate;
+  AudioPlayoutSnapshot playout;
   const auto observe = [&](const auto& blocks) {
     for (const auto& block : blocks) {
       if (block.source_ssrc() != local) continue;
@@ -293,13 +357,31 @@ void VeilTransportShim::ObserveAudioFeedback(std::span<const uint8_t> packet,
       webrtc::rtcp::SenderReport report;
       if (!report.Parse(header)) return;
       observe(report.report_blocks());
+    } else if (header.type() == 204 && header.payload_size_bytes() >= 8 &&
+               read_be32(header.payload() + 4) == kAudioPlayoutAppName) {
+      if (header.count() != 0 || header.payload_size_bytes() != 24) return;
+      const auto* app = header.payload();
+      const uint32_t delay = read_be32(app + 20);
+      if (delay != kUnknownPlayout && delay > 60000) return;
+      // The authenticated channel identifies the participant; the target
+      // SSRC binds the measurement to OUR audio, independently of video.
+      if (read_be32(app + 8) == local) {
+        const uint64_t sequence = uint64_t(read_be32(app + 12)) << 32 |
+                                  read_be32(app + 16);
+        if (!playout.supported || sequence > playout.sequence)
+          playout = {true, sequence, arrived_us,
+                     delay == kUnknownPlayout ? -1 : static_cast<int>(delay)};
+      }
     }
     offset += header.packet_size();
   }
-  if (candidate.arrived_us > 0) {
+  if (candidate.arrived_us > 0 || playout.supported) {
     std::lock_guard lock(audio_feedback_mu_);
-    if (candidate.arrived_us >= audio_feedback_.arrived_us)
+    if (candidate.arrived_us > 0 && candidate.arrived_us >= audio_feedback_.arrived_us)
       audio_feedback_ = candidate;
+    if (playout.supported && (!audio_playout_feedback_.supported ||
+        playout.sequence > audio_playout_feedback_.sequence))
+      audio_playout_feedback_ = playout;
   }
 }
 

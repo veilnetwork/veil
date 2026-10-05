@@ -58,6 +58,21 @@ struct AudioFeedbackSnapshot {
   }
 };
 
+// Optional endpoint feedback carried inside the encrypted media channel.
+// Unknown/stale playout is not a zero delay. Receipt time is local and replay
+// cannot renew it; support remains known until this peer channel is replaced.
+struct AudioPlayoutSnapshot {
+  bool supported = false;
+  uint64_t sequence = 0;
+  int64_t arrived_us = 0;
+  int delay_ms = -1;
+
+  bool fresh_at(int64_t now_us) const {
+    return supported && delay_ms >= 0 && arrived_us > 0 &&
+           arrived_us <= now_us && now_us - arrived_us <= 12'000'000;
+  }
+};
+
 struct VideoCadenceSnapshot {
   uint64_t frames = 0;
   int64_t first_ns = 0;
@@ -105,6 +120,11 @@ class VeilTransportShim : public webrtc::Transport {
   // before WebRTC's per-source cache overwrites one participant with another.
   void SetLocalAudioSsrc(uint32_t ssrc) { local_audio_ssrc_.store(ssrc); }
   AudioFeedbackSnapshot audio_feedback() const;
+  AudioPlayoutSnapshot audio_playout_feedback() const;
+  // Group receive-worker samples only. Setting an unknown sample still
+  // advertises support; unicast uses its negotiated call-health feedback.
+  void SetLocalAudioPlayout(uint32_t remote_audio_ssrc, uint64_t sequence,
+                           int delay_ms, int64_t sampled_us);
 
   // Enable only when both endpoints have independent audio/video counters.
   // Older engines used one sequence space and cannot consume split feedback.
@@ -188,6 +208,15 @@ class VeilTransportShim : public webrtc::Transport {
   std::atomic<uint32_t> local_audio_ssrc_{0};
   mutable std::mutex audio_feedback_mu_;
   AudioFeedbackSnapshot audio_feedback_;
+  AudioPlayoutSnapshot audio_playout_feedback_;
+  struct LocalAudioPlayout {
+    bool enabled = false;
+    uint32_t remote_ssrc = 0;
+    uint64_t sequence = 0;
+    int delay_ms = -1;
+    int64_t sampled_us = 0;
+  };
+  LocalAudioPlayout local_audio_playout_;
   std::atomic<bool> independent_transport_feedback_{false};
   std::atomic<bool> started_{false};
   InboundPacketQueue inbound_queue_;
