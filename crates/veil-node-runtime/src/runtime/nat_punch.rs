@@ -807,14 +807,20 @@ impl NodeServices {
     /// rotation/handoff must not try to re-dial it — recovery of a dead
     /// punched session belongs to the standard outbound connector via the
     /// SessionGuard refresh bump (mobility slice).
-    fn spawn_punched_outbound(
+    pub(super) fn spawn_punched_outbound(
         &self,
         session: AttachedDebugSession,
         peer: &crate::types::PeerConfigEntry,
     ) {
         let access = self.clone();
         let peer = peer.clone();
+        // Rust's precise async capture otherwise moves only the referenced
+        // session fields and drops the unreferenced guard before task start.
+        // Keep registration owned by the runner, including cancellation before
+        // the spawned future's first poll.
+        let session_guard = session._guard;
         let handle = tokio::spawn(async move {
+            let _session_guard = session_guard;
             let dispatcher = Arc::clone(&access.dispatcher);
             let ban_list = Arc::clone(&dispatcher.abuse.ban_list);
             let violation_tracker = Arc::clone(&dispatcher.abuse.violation_tracker);
