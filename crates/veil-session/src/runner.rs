@@ -338,6 +338,7 @@ struct RealtimeReceiverContext {
     metrics: Option<Arc<NodeMetrics>>,
     ban_list: Arc<Mutex<BanList>>,
     violation_tracker: Arc<Mutex<ViolationTracker>>,
+    activity: Arc<crate::datagram_activity::AuthenticatedDatagramActivity>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -532,6 +533,7 @@ fn spawn_realtime_receiver(
             metrics,
             ban_list,
             violation_tracker,
+            activity,
         } = context;
         let mut logged_receive_kinds = 0u8;
         loop {
@@ -572,6 +574,12 @@ fn spawn_realtime_receiver(
                 // session or letting it bypass the normal parser.
                 continue;
             };
+            // Only a fully authenticated, replay-checked and eligible complete
+            // frame proves liveness. Rejected fragments never reach this point.
+            activity.note(
+                tokio::time::Instant::now(),
+                kind == RealtimeLaneFrameKind::DirectApp,
+            );
             if logged_receive_kinds & kind.bit() == 0 {
                 logged_receive_kinds |= kind.bit();
                 logger.info(
@@ -3519,6 +3527,8 @@ impl SessionRunner {
         // attached. Raw direction keys are required because the ordered
         // session cipher's implicit nonce counter cannot safely be shared with
         // an unordered/lossy transport.
+        let datagram_activity =
+            Arc::new(crate::datagram_activity::AuthenticatedDatagramActivity::new());
         let mut realtime_receiver_task = None;
         // `None` when the peer did not advertise lane rotation: it keeps the
         // static key, so telling our receiver to move would strand it.
@@ -3558,6 +3568,7 @@ impl SessionRunner {
                             metrics: self.metrics.clone(),
                             ban_list: Arc::clone(&self.ban_list),
                             violation_tracker: Arc::clone(&self.violation_tracker),
+                            activity: Arc::clone(&datagram_activity),
                         },
                         None,
                     ));
@@ -3601,6 +3612,7 @@ impl SessionRunner {
                                         metrics: self.metrics.clone(),
                                         ban_list: Arc::clone(&self.ban_list),
                                         violation_tracker: Arc::clone(&self.violation_tracker),
+                            activity: Arc::clone(&datagram_activity),
                                     },
                                     outbox
                                         .as_ref()
@@ -3853,6 +3865,7 @@ impl SessionRunner {
                 if let Some(ref mut rpc_outbox) = rpc_outbox {
                     self.drain_rpc_outbox_into_pq(rpc_outbox, &mut pq, &mut pending_responses);
                 }
+                datagram_activity.apply(&mut timers);
                 // ── keepalive / idle timeout checks ──────────────────
                 if timer_enabled {
                     let now = tokio::time::Instant::now();

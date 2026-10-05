@@ -243,8 +243,8 @@ impl SessionTimers {
     /// signal that resets the liveness ceiling and the keepalive-probe
     /// teardown's staleness check.
     pub fn note_frame_received(&mut self, now: Instant) {
-        self.last_rx = now;
-        self.last_genuine_rx = now;
+        self.last_rx = self.last_rx.max(now);
+        self.last_genuine_rx = self.last_genuine_rx.max(now);
     }
 
     /// Mark a transport-swap event. Resets `last_rx` (the new transport deserves
@@ -265,7 +265,7 @@ impl SessionTimers {
     /// detection pipeline by that much.
     pub fn note_realtime_activity(&mut self, now: Instant) {
         let was_active = self.realtime_active(now);
-        self.last_realtime = Some(now);
+        self.last_realtime = Some(self.last_realtime.map_or(now, |previous| previous.max(now)));
         if !self.keepalive_enabled || was_active {
             return;
         }
