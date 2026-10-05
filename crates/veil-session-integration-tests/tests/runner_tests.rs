@@ -6673,3 +6673,133 @@ mod opaque_datagram_tests;
 
 #[path = "runner_tests/source_stream_budget_tests.rs"]
 mod source_stream_budget_tests;
+
+/// Fresh genuine data protects a live session whose keepalive ACK is missing,
+/// but must not cause a hot-standby retry on every frame/loop iteration. The
+/// real runner emits at most two trigger calls per probe episode, then still
+/// reaps after genuine traffic stops. This reuses the established post-session
+/// plaintext duplex fixture; it is a timer-policy test, not handshake coverage.
+#[tokio::test(flavor = "current_thread")]
+async fn fresh_rx_with_unacked_keepalive_does_not_storm_failover_attempts() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncReadExt;
+    use veil_session::handoff::{HandoffAckWaiters, SessionSwapRegistry};
+    use veil_session::hot_standby::HotStandbyController;
+    use veil_transport::{TransportContext, TransportRegistry};
+    use veil_types::{LogFormat, LogLevel, LogsConfig};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let log_path = std::env::temp_dir().join(format!(
+        "veil-probe-rate-{}-{}.log",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let logger = Arc::new(
+        veil_observability::NodeLogger::from_parts(
+            LogsConfig::File,
+            Some(&log_path),
+            LogLevel::Debug,
+            LogFormat::Text,
+        )
+        .unwrap(),
+    );
+    let (client, server) = tokio::io::duplex(65536);
+    let (mut runner, _swap_tx) = make_swap_runner(server);
+    runner.logger = logger.clone();
+    runner.keepalive_interval = std::time::Duration::from_millis(50);
+    runner.mobile.base_keepalive_interval = runner.keepalive_interval;
+    runner.idle_timeout = std::time::Duration::from_secs(5);
+    runner.raw_session_keys = Some(([3; 32], [4; 32], [5; 32]));
+    let controller = Arc::new(HotStandbyController::new(
+        Arc::new(TransportRegistry::with_defaults()),
+        Arc::new(TransportContext::for_debug().unwrap()),
+        Arc::new(RwLock::new(SessionTxRegistry::new())),
+        Arc::new(HandoffAckWaiters::new()),
+        Arc::new(SessionSwapRegistry::new()),
+        veil_cfg::HotStandbyConfig {
+            enabled: true,
+            max_swaps_per_minute: 4,
+            ..veil_cfg::HotStandbyConfig::default()
+        },
+        logger,
+    ));
+    controller.set_alt_uri(runner.peer_id.into(), "tcp://127.0.0.1:1".to_owned());
+    runner.hot_standby.controller = Some(controller);
+    let (mut read, mut write) = tokio::io::split(client);
+    let pongs = Arc::new(AtomicUsize::new(0));
+    let received = pongs.clone();
+    let reader = tokio::spawn(async move {
+        let mut header = [0; veil_proto::HEADER_SIZE];
+        while read.read_exact(&mut header).await.is_ok() {
+            let h = veil_proto::codec::decode_header(&header).unwrap();
+            let mut body = vec![0; h.body_len as usize];
+            if read.read_exact(&mut body).await.is_err() {
+                break;
+            }
+            if h.family == FrameFamily::Control as u8 && h.msg_type == ControlMsg::Pong as u16 {
+                received.fetch_add(1, Ordering::Relaxed);
+            }
+            // Deliberately never acknowledge the runner's keepalives.
+        }
+    });
+    let mut task = tokio::spawn(async move { runner.run().await });
+    let ping = encode_header(&FrameHeader::new(
+        FrameFamily::Control as u8,
+        ControlMsg::Ping as u16,
+    ));
+    for _ in 0..80 {
+        write.write_all(&ping).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let stayed_live = !task.is_finished();
+    // Keep the socket open, but stop genuine data; stale protection must still
+    // close it in the next keepalive episode rather than leaving a zombie.
+    let reaped = tokio::time::timeout(std::time::Duration::from_secs(1), &mut task)
+        .await
+        .is_ok();
+    if !reaped {
+        task.abort();
+        let _ = task.await;
+    }
+    drop(write);
+    reader.abort();
+    let _ = reader.await;
+    let logs = std::fs::read_to_string(&log_path).unwrap();
+    std::fs::remove_file(&log_path).unwrap();
+    let triggers = logs
+        .lines()
+        .filter(|l| {
+            l.contains("session.hot_standby.trigger_raised")
+                && l.contains("reason=keepalive_probe_timeout")
+        })
+        .count();
+    assert!(
+        stayed_live && pongs.load(Ordering::Relaxed) >= 70,
+        "fresh genuine traffic lost liveness protection"
+    );
+    assert!(
+        reaped,
+        "exhausted failover left a genuinely silent session alive"
+    );
+    let events: Vec<_> = logs.lines().collect();
+    let trigger_indices: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            (l.contains("session.hot_standby.trigger_raised")
+                && l.contains("reason=keepalive_probe_timeout"))
+            .then_some(i)
+        })
+        .collect();
+    assert!(
+        trigger_indices.windows(2).all(|pair| {
+            events[pair[0] + 1..pair[1]]
+                .iter()
+                .any(|l| l.contains("session.keepalive.sent"))
+        }),
+        "a failover retry occurred without a new keepalive tick"
+    );
+    assert!(
+        (1..=2).contains(&triggers),
+        "real runner called keepalive failover {triggers} times during one episode (ceiling 2)"
+    );
+}
