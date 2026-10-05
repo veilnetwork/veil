@@ -6155,6 +6155,60 @@ mod tests {
     }
 
     #[test]
+    fn token_nat_probe_accepts_only_the_current_local_identity_or_device() {
+        use veil_proto::{control::NatProbeRequestPayload, recipient::Recipient};
+        let mut disp = make_test_dispatcher(NodeRole::Leaf);
+        disp.local_node_id = [0xDD; 32];
+        let identity = [0xEE; 32];
+        let foreign = [0xFF; 32];
+        let current = Arc::new(Mutex::new(Some(Recipient::specific(identity, [0x11; 16]))));
+        disp.local_recipient = Some(Arc::new({
+            let current = Arc::clone(&current);
+            move || *lock!(current)
+        }));
+        let reg = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let mut foreign_rx = wlock!(reg).register(foreign);
+        let mut old_identity_rx = wlock!(reg).register(identity);
+        disp.session_tx_registry = Some(reg);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        *lock!(disp.nat_punch_offer_tx) = Some(tx);
+        let header = FrameHeader::new(
+            FrameFamily::Control as u8,
+            ControlMsg::NatProbeRequest as u16,
+        );
+        let request = |target, session_token| NatProbeRequestPayload {
+            initiator_node_id: [0xAA; 32],
+            target_node_id: target,
+            session_token,
+            punch_token: Some([0x42; 16]),
+            candidates: vec![],
+        };
+        for (target, token) in [(disp.local_node_id, 1), (identity, 2)] {
+            let req = request(target, token);
+            assert!(matches!(
+                disp.dispatch(&header, &req.encode(), [0xCC; 32]),
+                DispatchResult::NoResponse
+            ));
+            assert_eq!(
+                rx.try_recv()
+                    .expect("our target reaches the socket worker")
+                    .request,
+                req
+            );
+        }
+        disp.dispatch(&header, &request(foreign, 3).encode(), [0xCC; 32]);
+        assert!(rx.try_recv().is_err(), "a foreign identity is never local");
+        assert!(
+            foreign_rx.try_recv().is_ok(),
+            "foreign target keeps forwarding"
+        );
+        *lock!(current) = None;
+        disp.dispatch(&header, &request(identity, 4).encode(), [0xCC; 32]);
+        assert!(rx.try_recv().is_err(), "retired identity is no longer ours");
+        assert!(old_identity_rx.try_recv().is_ok());
+    }
+
+    #[test]
     fn token_nat_probe_is_handed_to_async_socket_worker() {
         use veil_proto::control::NatProbeRequestPayload;
 
