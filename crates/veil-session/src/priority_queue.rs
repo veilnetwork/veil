@@ -61,8 +61,9 @@ pub const DEFAULT_MAX_DEPTH: usize = 4096;
 /// bounding the amount of stale realtime work retained per session.
 pub const LOSSY_REALTIME_MAX_DEPTH: usize = 64;
 
-/// Maximum time a loss-tolerant realtime frame may wait in the reorderable
-/// priority queue. Bytes already committed to the socket cannot be recalled,
+/// Maximum time a loss-tolerant realtime frame may wait in the session outbox
+/// and reorderable priority queue, including failed side-channel attempts.
+/// Bytes already committed to the socket cannot be recalled,
 /// so dropping here is the last point where newest-wins media semantics can be
 /// preserved on transports without a QUIC DATAGRAM lane.
 pub const LOSSY_REALTIME_MAX_AGE: Duration = Duration::from_millis(500);
@@ -148,7 +149,7 @@ impl PriorityQueue {
     /// expense of BULK/BACKGROUND. Drops increment `drops_total` so the
     /// runner can forward them to Prometheus.
     pub fn push(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
-        self.push_entry(priority, frame, false, None);
+        self.push_entry(priority, frame, None, None);
     }
 
     /// Enqueue a canonical loss-tolerant realtime frame. When its dedicated
@@ -165,7 +166,7 @@ impl PriorityQueue {
     /// Loss tolerance is independent of queue priority. In particular relayed
     /// datagrams share INTERACTIVE FIFO order with other forwarded user data.
     pub fn push_lossy(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
-        self.push_lossy_with_carrier(priority, frame, None);
+        self.push_lossy_with_carrier(priority, frame, None, Instant::now());
     }
 
     pub(crate) fn push_envelope(
@@ -175,9 +176,9 @@ impl PriorityQueue {
     ) {
         let (priority, frame) = envelope.frame;
         if lossy {
-            self.push_lossy_with_carrier(priority, frame, envelope.carrier);
+            self.push_lossy_with_carrier(priority, frame, envelope.carrier, envelope.queued_at);
         } else {
-            self.push_entry(priority, frame, false, envelope.carrier);
+            self.push_entry(priority, frame, None, envelope.carrier);
         }
     }
 
@@ -186,7 +187,13 @@ impl PriorityQueue {
         priority: u8,
         frame: veil_bufpool::PooledShared,
         carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
+        queued_at: Instant,
     ) {
+        // Expired ingress must not evict a fresh frame from a full class.
+        if queued_at.elapsed() > LOSSY_REALTIME_MAX_AGE {
+            self.drops_total.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let p = priority.min(3) as usize;
         // Lossy capacity is independent for each local producer class. Transit
         // has only INTERACTIVE, so no relay/user role gets a separate budget.
@@ -201,16 +208,17 @@ impl PriorityQueue {
             self.lossy_realtime_len[p] -= 1;
             self.drops_total.fetch_add(1, Ordering::Relaxed);
         }
-        self.push_entry(priority, frame, true, carrier);
+        self.push_entry(priority, frame, Some(queued_at), carrier);
     }
 
     fn push_entry(
         &mut self,
         priority: u8,
         frame: veil_bufpool::PooledShared,
-        lossy_realtime: bool,
+        enqueued_at: Option<Instant>,
         carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
     ) {
+        let lossy_realtime = enqueued_at.is_some();
         let p = priority.min(3) as usize;
         if self.len() >= self.max_depth {
             // Shed one frame from the lowest priority that has any queued —
@@ -244,7 +252,7 @@ impl PriorityQueue {
         }
         self.queues[p].push_back(QueuedFrame {
             frame,
-            enqueued_at: lossy_realtime.then(Instant::now),
+            enqueued_at,
             lossy_realtime,
             carrier,
         });
@@ -380,13 +388,25 @@ impl PriorityQueue {
         self.push_lossy_front(REALTIME, frame);
     }
 
-    /// Restore a popped datagram to its original queue on transport failure.
+    /// Legacy byte-only reinsertion starts a new local age because it has no
+    /// envelope. The runner uses `restore_lossy_envelope` to preserve age.
     pub fn push_lossy_front(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
+        self.restore_lossy_envelope((priority, frame).into());
+    }
+
+    /// Restore the exact popped datagram without renewing its lifetime or
+    /// losing its return carrier. No producer runs between pop and restore.
+    pub(crate) fn restore_lossy_envelope(&mut self, envelope: crate::frame_outbox::FrameEnvelope) {
+        if envelope.queued_at.elapsed() > LOSSY_REALTIME_MAX_AGE {
+            self.drops_total.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let (priority, frame) = envelope.frame;
         self.queues[priority.min(3) as usize].push_front(QueuedFrame {
             frame,
-            enqueued_at: Some(Instant::now()),
+            enqueued_at: Some(envelope.queued_at),
             lossy_realtime: true,
-            carrier: None,
+            carrier: envelope.carrier,
         });
         self.lossy_realtime_len[priority.min(3) as usize] += 1;
     }
@@ -445,6 +465,7 @@ impl PriorityQueue {
                     return Some(crate::frame_outbox::FrameEnvelope {
                         frame: (priority, queued.frame),
                         carrier: queued.carrier,
+                        queued_at: queued.enqueued_at.unwrap_or_else(Instant::now),
                     });
                 }
             }
@@ -495,6 +516,7 @@ impl PriorityQueue {
                     return Some(crate::frame_outbox::FrameEnvelope {
                         frame: (p as u8, queued.frame),
                         carrier: queued.carrier,
+                        queued_at: queued.enqueued_at.unwrap_or_else(Instant::now),
                     });
                 }
             }
@@ -510,6 +532,66 @@ impl PriorityQueue {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn datagram_restore_keeps_original_age_in_both_scheduler_rounds() {
+        use crate::frame_outbox::FrameEnvelope;
+        for local_round in [false, true] {
+            for priority in [REALTIME, INTERACTIVE, BULK, BACKGROUND] {
+                if local_round && priority == INTERACTIVE {
+                    continue; // neutral transit never uses the local bypass
+                }
+                let mut pq = PriorityQueue::with_default_weights();
+                let admitted = Instant::now() - Duration::from_millis(400);
+                let mut envelope = FrameEnvelope::from((priority, arc(b"media")));
+                envelope.queued_at = admitted;
+                pq.push_envelope(envelope, true);
+                let pop = |pq: &mut PriorityQueue| {
+                    if local_round {
+                        pq.pop_local_datagram_envelope_if(|_| true)
+                    } else {
+                        pq.pop_datagram_envelope_if(|_| true)
+                    }
+                };
+                let envelope = pop(&mut pq).unwrap();
+                pq.restore_lossy_envelope(envelope);
+                let mut envelope = pop(&mut pq).unwrap();
+                assert_eq!(envelope.queued_at, admitted, "restore renewed age");
+                // The transport attempt crosses the deadline. No reliable
+                // fallback is allowed to give this same datagram a new life.
+                envelope.queued_at =
+                    Instant::now() - LOSSY_REALTIME_MAX_AGE - Duration::from_millis(1);
+                pq.restore_lossy_envelope(envelope);
+                assert!(pq.is_empty());
+                assert_eq!(pq.lossy_realtime_len, [0; 4]);
+                assert_eq!(pq.drops_total(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn expired_ingress_cannot_evict_fresh_media_or_expire_reliable_data() {
+        use crate::frame_outbox::FrameEnvelope;
+        for priority in [REALTIME, INTERACTIVE, BULK, BACKGROUND] {
+            let mut pq = PriorityQueue::with_default_weights();
+            let mut reliable = FrameEnvelope::from((priority, arc(b"reliable")));
+            reliable.queued_at = Instant::now() - Duration::from_secs(60);
+            pq.push_envelope(reliable, false);
+            for seq in 0..LOSSY_REALTIME_MAX_DEPTH {
+                pq.push_lossy(priority, arc(&[seq as u8]));
+            }
+            let mut expired = FrameEnvelope::from((priority, arc(b"stale")));
+            expired.queued_at = Instant::now() - LOSSY_REALTIME_MAX_AGE - Duration::from_millis(1);
+            pq.push_envelope(expired, true);
+            assert_eq!(pq.len(), LOSSY_REALTIME_MAX_DEPTH + 1);
+            assert_eq!(pq.drops_total(), 1);
+            assert_eq!(&*pq.pop().unwrap(), b"reliable");
+            for seq in 0..LOSSY_REALTIME_MAX_DEPTH {
+                assert_eq!(&*pq.pop().unwrap(), &[seq as u8]);
+            }
+            assert_eq!(pq.lossy_realtime_len, [0; 4]);
+        }
+    }
+
     #[test]
     fn rejected_stream_head_preserves_fifo_and_round() {
         let mut pq = super::PriorityQueue::with_default_weights();

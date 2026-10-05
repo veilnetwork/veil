@@ -4071,17 +4071,19 @@ impl SessionRunner {
                         else {
                             break;
                         };
-                        let (outgoing_priority, outgoing) = envelope.frame;
-                        if let Some(carrier) =
-                            envelope.carrier.and_then(|carrier| carrier.upgrade())
+                        let (outgoing_priority, ref outgoing) = envelope.frame;
+                        if let Some(carrier) = envelope
+                            .carrier
+                            .as_ref()
+                            .and_then(|carrier| carrier.upgrade())
                         {
                             use veil_anonymity::circuit_carrier::CarrierSend;
                             let result =
-                                carrier.try_send(&self.peer_id, &outgoing, &mut |wire_bytes| {
+                                carrier.try_send(&self.peer_id, outgoing, &mut |wire_bytes| {
                                     if !self.dispatcher.allow_outbound_bandwidth(wire_bytes) {
                                         return false;
                                     }
-                                    self.dispatcher.capture_outbound(self.peer_id, &outgoing);
+                                    self.dispatcher.capture_outbound(self.peer_id, outgoing);
                                     true
                                 });
                             match result {
@@ -4100,11 +4102,11 @@ impl SessionRunner {
                                 CarrierSend::Unavailable => {}
                             }
                         }
-                        let (_, body, lane_kind) = decode_realtime_lane_frame(&outgoing)
+                        let (_, body, lane_kind) = decode_realtime_lane_frame(outgoing)
                             .expect("realtime queue predicate accepted this frame");
                         lane.local_reliable.observe(
                             outgoing_priority,
-                            &outgoing,
+                            outgoing,
                             std::time::Instant::now(),
                         );
                         let (mut lane, using_parallel) =
@@ -4112,7 +4114,7 @@ impl SessionRunner {
                         let max_datagram_size = lane.max_datagram_size;
                         let datagrams = match lane.tx.encode_frame(
                             local_datagram_flow(outgoing_priority, body, lane_kind),
-                            &outgoing,
+                            outgoing,
                             max_datagram_size,
                         ) {
                             Ok(datagrams) => datagrams,
@@ -4125,7 +4127,7 @@ impl SessionRunner {
                                         outgoing.len(),
                                     ),
                                 );
-                                pq.push_lossy_front(outgoing_priority, outgoing);
+                                pq.restore_lossy_envelope(envelope);
                                 break;
                             }
                         };
@@ -4149,7 +4151,7 @@ impl SessionRunner {
                             datagram_drained += 1;
                             continue;
                         }
-                        self.dispatcher.capture_outbound(self.peer_id, &outgoing);
+                        self.dispatcher.capture_outbound(self.peer_id, outgoing);
                         let mut sent_wire_len = 0usize;
                         let mut send_error = None;
                         for datagram in &datagrams {
@@ -4220,7 +4222,7 @@ impl SessionRunner {
                                     sent_wire_len,
                                 ),
                             );
-                            pq.push_lossy_front(outgoing_priority, outgoing);
+                            pq.restore_lossy_envelope(envelope);
                             // Quinn's non-blocking send only errors for a lost
                             // connection, disabled/unsupported DATAGRAMs, or a
                             // path-MTU shrink. Stop retrying every media frame;

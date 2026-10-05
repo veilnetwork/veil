@@ -407,3 +407,29 @@ checks and 18 real-QUIC opaque-flow/parallel/rekey checks passed. Production
 session Clippy with warnings denied and Android ARM64 Rust compilation passed.
 This is source admission isolation; it does not claim physical acoustic quality
 or independent connections on the old live relay hops.
+
+Loss-tolerant frames also retain their original process-local admission time
+across the production FrameSender outbox and runner queues. Waiting for ingress
+capacity counts toward the existing 500-ms age ceiling. Datagram fallback
+restores that same envelope and weak return carrier instead of renewing its
+lifetime. Already expired ingress/failed sends are dropped before admission;
+they cannot evict fresh frames. Reliable data is not subject to this ceiling,
+and neutral transit keeps the same FIFO and limits for every forwarded user.
+Legacy byte-only FIFO adapters start the age when converting to an envelope
+because they do not carry upstream timestamps. No wire deadline, timestamp or
+clear source/media role is introduced; committed socket bytes remain outside
+this bound.
+
+An encrypted stream-only SessionRunner recovery regression holds real
+FrameSender ingress past the age limit, then verifies only newly admitted
+primary/secondary/background/neutral datagrams and the older reliable message
+arrive. The former policy demonstrably replays old sequence numbers 0..3.
+Unit coverage includes blocked async ingress, original age through ordinary
+and independent local pops, expiry while restoring fallback, fresh class
+capacity preservation and retaining the weak return carrier.
+
+Final gates passed: 366 session unit tests (3 existing ignored), 3 encrypted
+stream runner checks, 18 real-QUIC opaque/parallel/rekey checks, production
+session Clippy with warnings denied and production Android ARM64 Rust build.
+These prove session-local freshness and transport regressions, not physical
+playout/acoustic latency or current live relay capability negotiation.
