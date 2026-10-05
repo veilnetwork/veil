@@ -23,6 +23,9 @@ struct Faults {
     drop_all_b_to_a: bool,
     dropped_synacks: usize,
     dropped_b_to_a: usize,
+    defer_a_data_until_fin: bool,
+    deferred_a_data: Vec<Vec<u8>>,
+    fin_before_data: usize,
 }
 
 struct Bus {
@@ -103,6 +106,29 @@ impl CellSender for BusSender {
             }
         }
 
+        let deferred = if self.me.node == self.bus.a && dst.node == self.bus.b {
+            let mut faults = self.bus.faults.lock().unwrap_or_else(|p| p.into_inner());
+            if faults.defer_a_data_until_fin
+                && matches!(Frame::decode(&cell), Some(Frame::Data { .. }))
+            {
+                faults.deferred_a_data.push(cell);
+                return Ok(());
+            }
+            if faults.defer_a_data_until_fin
+                && matches!(Frame::decode(&cell), Some(Frame::Fin { .. }))
+            {
+                assert!(
+                    !faults.deferred_a_data.is_empty(),
+                    "fault did not hold DATA before FIN"
+                );
+                faults.fin_before_data += 1;
+                std::mem::take(&mut faults.deferred_a_data)
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
         let tx = self
             .bus
             .routes
@@ -112,6 +138,11 @@ impl CellSender for BusSender {
             .cloned();
         if let Some(tx) = tx {
             let _ = tx.try_send((self.me, cell));
+            // A faster control lane delivered FIN first. Release the delayed
+            // byte segments only afterwards, reproducing the source scheduler.
+            for held in deferred {
+                tx.try_send((self.me, held)).unwrap();
+            }
         }
         Ok(())
     }
@@ -199,6 +230,38 @@ async fn read_exact(stream: &mut OnionStream, n: usize) -> io::Result<Vec<u8>> {
         out.extend_from_slice(&buf[..got]);
     }
     Ok(out)
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn faster_control_lane_fin_waits_for_background_data_before_eof() {
+    let (bus, mux_a, mux_b, a, b) = mux_pair();
+    bus.faults.lock().unwrap().defer_a_data_until_fin = true;
+    let sender = mux_a.open(b);
+    let payload: Vec<_> = (0..512).map(|n| (n % 251) as u8).collect();
+    sender.write_all(&payload).await.unwrap();
+    sender.finish().await.unwrap();
+    let (mut receiver, source) = tokio::time::timeout(Duration::from_secs(1), mux_b.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.node, a.node);
+    let bytes = tokio::time::timeout(Duration::from_secs(2), read_to_end(&mut receiver))
+        .await
+        .expect("FIN ahead of DATA must still complete")
+        .unwrap();
+    assert_eq!(
+        bytes, payload,
+        "FIN discarded, duplicated or reordered pending bytes"
+    );
+    assert_eq!(receiver.end_reason(), veil_onion_stream::End::Eof);
+    let faults = bus.faults.lock().unwrap();
+    assert_eq!(
+        faults.fin_before_data, 1,
+        "test did not deliver FIN before DATA"
+    );
+    assert!(faults.deferred_a_data.is_empty());
+    drop(faults);
+    sender.reset(reset_reason::APP).await;
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
