@@ -54,7 +54,10 @@ pub const DEFAULT_MAX_DEPTH: usize = 4096;
 /// A loss-tolerant media frame is useful only while it is fresh.  Keeping a
 /// large FIFO here turns TCP fallback congestion into seconds of video replay
 /// after the link recovers.  This cap is deliberately independent of the
-/// aggregate queue cap: roughly 64 relay cells cover a few video frames while
+/// aggregate queue cap. Each process-local class has its own 64-frame budget;
+/// forwarded user traffic shares the single neutral INTERACTIVE budget. This
+/// prevents a local source burst from evicting another source or transit data.
+/// Roughly 64 relay cells cover a few video frames while
 /// bounding the amount of stale realtime work retained per session.
 pub const LOSSY_REALTIME_MAX_DEPTH: usize = 64;
 
@@ -91,7 +94,7 @@ pub struct PriorityQueue {
     /// `NodeMetrics::priority_queue_drops_total` so overflow surfaces
     /// in Prometheus the same scrape cycle it happens.
     drops_total: Arc<AtomicU64>,
-    lossy_realtime_len: usize,
+    lossy_realtime_len: [usize; 4],
     local_primary_seen: Option<Instant>,
 }
 
@@ -126,7 +129,7 @@ impl PriorityQueue {
             local_datagram_slots: weights,
             max_depth,
             drops_total,
-            lossy_realtime_len: 0,
+            lossy_realtime_len: [0; 4],
             local_primary_seen: None,
         }
     }
@@ -184,24 +187,19 @@ impl PriorityQueue {
         frame: veil_bufpool::PooledShared,
         carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
     ) {
-        if self.lossy_realtime_len >= LOSSY_REALTIME_MAX_DEPTH
-            && let Some((p, index, _)) = self
-                .queues
+        let p = priority.min(3) as usize;
+        // Lossy capacity is independent for each local producer class. Transit
+        // has only INTERACTIVE, so no relay/user role gets a separate budget.
+        // At capacity drop the oldest lossy entry of THIS class, preserving
+        // its reliable FIFO entries and every other producer's pending work.
+        if self.lossy_realtime_len[p] >= LOSSY_REALTIME_MAX_DEPTH {
+            let index = self.queues[p]
                 .iter()
-                .enumerate()
-                .skip(priority.min(3) as usize)
-                .filter_map(|(p, queue)| {
-                    let index = queue.iter().position(|queued| queued.lossy_realtime)?;
-                    Some((p, index, queue[index].enqueued_at?))
-                })
-                .min_by_key(|(_, _, at)| *at)
-        {
+                .position(|queued| queued.lossy_realtime)
+                .expect("lossy class counter requires an entry");
             self.queues[p].remove(index);
-            self.lossy_realtime_len -= 1;
+            self.lossy_realtime_len[p] -= 1;
             self.drops_total.fetch_add(1, Ordering::Relaxed);
-        } else if self.lossy_realtime_len >= LOSSY_REALTIME_MAX_DEPTH {
-            self.drops_total.fetch_add(1, Ordering::Relaxed);
-            return;
         }
         self.push_entry(priority, frame, true, carrier);
     }
@@ -231,7 +229,7 @@ impl PriorityQueue {
                         .pop_front()
                         .is_some_and(|queued| queued.lossy_realtime)
                     {
-                        self.lossy_realtime_len -= 1;
+                        self.lossy_realtime_len[shed_p] -= 1;
                     }
                     self.drops_total.fetch_add(1, Ordering::Relaxed);
                     shed = true;
@@ -251,7 +249,7 @@ impl PriorityQueue {
             carrier,
         });
         if lossy_realtime {
-            self.lossy_realtime_len += 1;
+            self.lossy_realtime_len[p] += 1;
         }
     }
 
@@ -292,13 +290,13 @@ impl PriorityQueue {
                         .is_some_and(|at| at.elapsed() > LOSSY_REALTIME_MAX_AGE)
             }) {
                 self.queues[p].pop_front();
-                self.lossy_realtime_len -= 1;
+                self.lossy_realtime_len[p] -= 1;
                 self.drops_total.fetch_add(1, Ordering::Relaxed);
             }
             if let Some(queued) = self.queues[p].pop_front() {
                 self.slots[p] -= 1;
                 if queued.lossy_realtime {
-                    self.lossy_realtime_len -= 1;
+                    self.lossy_realtime_len[p] -= 1;
                 }
                 return Some(queued.frame);
             }
@@ -360,7 +358,7 @@ impl PriorityQueue {
             })
         {
             self.queues[REALTIME as usize].pop_front();
-            self.lossy_realtime_len -= 1;
+            self.lossy_realtime_len[REALTIME as usize] -= 1;
             self.drops_total.fetch_add(1, Ordering::Relaxed);
         }
         let head = self.queues[REALTIME as usize].front()?;
@@ -369,7 +367,7 @@ impl PriorityQueue {
                 .pop_front()
                 .expect("REALTIME head checked above");
             if queued.lossy_realtime {
-                self.lossy_realtime_len -= 1;
+                self.lossy_realtime_len[REALTIME as usize] -= 1;
             }
             queued.frame
         })
@@ -390,7 +388,7 @@ impl PriorityQueue {
             lossy_realtime: true,
             carrier: None,
         });
-        self.lossy_realtime_len += 1;
+        self.lossy_realtime_len[priority.min(3) as usize] += 1;
     }
 
     /// Select the next frame using the SAME WRR order as the ordered stream,
@@ -434,7 +432,7 @@ impl PriorityQueue {
                         .is_some_and(|at| at.elapsed() > LOSSY_REALTIME_MAX_AGE)
                     {
                         self.queues[p].remove(index);
-                        self.lossy_realtime_len -= 1;
+                        self.lossy_realtime_len[p] -= 1;
                         self.drops_total.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
@@ -443,7 +441,7 @@ impl PriorityQueue {
                     }
                     let queued = self.queues[p].remove(index).expect("entry checked above");
                     self.local_datagram_slots[p] -= 1;
-                    self.lossy_realtime_len -= 1;
+                    self.lossy_realtime_len[p] -= 1;
                     return Some(crate::frame_outbox::FrameEnvelope {
                         frame: (priority, queued.frame),
                         carrier: queued.carrier,
@@ -482,7 +480,7 @@ impl PriorityQueue {
                             .is_some_and(|at| at.elapsed() > LOSSY_REALTIME_MAX_AGE)
                 }) {
                     self.queues[p].pop_front();
-                    self.lossy_realtime_len -= 1;
+                    self.lossy_realtime_len[p] -= 1;
                     self.drops_total.fetch_add(1, Ordering::Relaxed);
                 }
                 if let Some(head) = self.queues[p].front() {
@@ -492,7 +490,7 @@ impl PriorityQueue {
                     let queued = self.queues[p].pop_front().expect("head checked above");
                     self.slots[p] -= 1;
                     if queued.lossy_realtime {
-                        self.lossy_realtime_len -= 1;
+                        self.lossy_realtime_len[p] -= 1;
                     }
                     return Some(crate::frame_outbox::FrameEnvelope {
                         frame: (p as u8, queued.frame),
@@ -567,7 +565,7 @@ mod tests {
             }
             assert_eq!(pq.slots, ordinary_slots);
         }
-        assert_eq!(pq.lossy_realtime_len, 0);
+        assert_eq!(pq.lossy_realtime_len.iter().sum::<usize>(), 0);
         assert_eq!(pq.drops_total(), 0);
         assert_eq!(&*pq.pop().unwrap(), b"first file");
         assert_eq!(&*pq.pop().unwrap(), b"second file");
@@ -629,7 +627,7 @@ mod tests {
         pq.push_lossy(BULK, arc(b"fresh"));
         let envelope = pq.pop_local_datagram_envelope_if(|_| true).unwrap();
         assert_eq!(&*envelope.frame.1, b"fresh");
-        assert_eq!(pq.lossy_realtime_len, 0);
+        assert_eq!(pq.lossy_realtime_len.iter().sum::<usize>(), 0);
         assert_eq!(pq.drops_total(), 1);
         assert_eq!(&*pq.pop().unwrap(), b"reliable");
     }
@@ -719,6 +717,73 @@ mod tests {
     }
 
     #[test]
+    fn lossy_sources_have_independent_capacity_and_preserve_neutral_transit() {
+        let mut pq = PriorityQueue::with_default_weights();
+        let packet = |p: u8, seq: u16| arc(&[p, (seq >> 8) as u8, seq as u8]);
+        // Older primary packets must survive a newer secondary burst and
+        // another primary arrival. The former shared cap evicted primary[0].
+        for p in [REALTIME, BULK, BACKGROUND, INTERACTIVE] {
+            pq.push(p, arc(&[p, 0xff, 0xff])); // reliable entries cannot be shed
+            for seq in 0..LOSSY_REALTIME_MAX_DEPTH as u16 {
+                pq.push_lossy(p, packet(p, seq));
+            }
+        }
+        assert_eq!(pq.len(), 4 * (LOSSY_REALTIME_MAX_DEPTH + 1));
+        assert_eq!(pq.drops_total(), 0);
+        for p in [REALTIME, BULK, BACKGROUND, INTERACTIVE] {
+            pq.push_lossy(p, packet(p, LOSSY_REALTIME_MAX_DEPTH as u16));
+        }
+        assert_eq!(pq.drops_total(), 4);
+        let mut seen: [Vec<u16>; 4] = Default::default();
+        while let Some(frame) = pq.pop() {
+            let p = frame[0] as usize;
+            seen[p].push(u16::from_be_bytes([frame[1], frame[2]]));
+        }
+        for lane in seen {
+            assert_eq!(
+                lane,
+                std::iter::once(u16::MAX)
+                    .chain(1..=LOSSY_REALTIME_MAX_DEPTH as u16)
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(pq.lossy_realtime_len, [0; 4]);
+    }
+
+    #[test]
+    fn lossy_class_counters_survive_restore_expiry_and_aggregate_shedding() {
+        let mut pq = PriorityQueue::with_capacity(DEFAULT_WEIGHTS, 4);
+        for p in [REALTIME, BULK] {
+            pq.push_lossy(p, arc(b"first"));
+            pq.push_lossy(p, arc(b"second"));
+        }
+        let frame = pq.pop_realtime_if(|_| true).unwrap();
+        assert_eq!(pq.lossy_realtime_len, [1, 0, 2, 0]);
+        pq.push_realtime_front(frame);
+        assert_eq!(pq.lossy_realtime_len, [2, 0, 2, 0]);
+        pq.push_lossy(BACKGROUND, arc(b"must not evict higher classes"));
+        assert_eq!(pq.lossy_realtime_len, [2, 0, 2, 0]);
+        pq.push(INTERACTIVE, arc(b"reliable"));
+        assert_eq!(pq.lossy_realtime_len, [2, 0, 1, 0]);
+        for queued in &mut pq.queues[REALTIME as usize] {
+            queued.enqueued_at =
+                Some(Instant::now() - LOSSY_REALTIME_MAX_AGE - Duration::from_millis(1));
+        }
+        assert_eq!(
+            &*pq.pop_envelope_if(|_, _| true).unwrap().frame.1,
+            b"reliable"
+        );
+        assert_eq!(pq.lossy_realtime_len, [0, 0, 1, 0]);
+        assert_eq!(
+            &*pq.pop_local_datagram_envelope_if(|_| true).unwrap().frame.1,
+            b"second"
+        );
+        assert_eq!(pq.lossy_realtime_len, [0; 4]);
+        assert_eq!(pq.drops_total(), 4); // incoming, secondary victim, 2 expired
+        assert!(pq.is_empty());
+    }
+
+    #[test]
     fn lossy_realtime_queue_keeps_newest_frames() {
         let drops = Arc::new(AtomicU64::new(0));
         let mut pq = PriorityQueue::with_capacity_and_drop_counter(
@@ -729,7 +794,10 @@ mod tests {
         for i in 0..=LOSSY_REALTIME_MAX_DEPTH {
             pq.push_lossy_realtime(REALTIME, arc(&(i as u16).to_be_bytes()));
         }
-        assert_eq!(pq.lossy_realtime_len, LOSSY_REALTIME_MAX_DEPTH);
+        assert_eq!(
+            pq.lossy_realtime_len.iter().sum::<usize>(),
+            LOSSY_REALTIME_MAX_DEPTH
+        );
         assert_eq!(drops.load(Ordering::Relaxed), 1);
         assert_eq!(pq.pop().unwrap().as_ref(), 1u16.to_be_bytes());
     }
@@ -747,7 +815,7 @@ mod tests {
         pq.push(REALTIME, arc(b"control"));
         assert_eq!(pq.pop().unwrap().as_ref(), b"control");
         assert_eq!(drops.load(Ordering::Relaxed), 1);
-        assert_eq!(pq.lossy_realtime_len, 0);
+        assert_eq!(pq.lossy_realtime_len.iter().sum::<usize>(), 0);
     }
 
     /// 29.5: REALTIME frames sent before BULK frames when both are enqueued.
