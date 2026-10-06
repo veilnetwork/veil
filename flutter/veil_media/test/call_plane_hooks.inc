@@ -123,6 +123,64 @@ extern "C" int veil_media_test_group_emit_rtcp(VeilGroupMediaEngine* e) {
   return e->ws->peers.begin()->second->shim->SendRtcp(packet, options) ? 0 : 1;
 }
 
+// The audio-only controller must not inherit the video-sized startup budget.
+// Run the real Opus sender and independent video controller against a counting
+// ADM and synthetic camera, with no hardware capture or network endpoint.
+extern "C" int veil_media_test_audio_probe_budget() {
+  struct ResetFactory {
+    const char* prior = std::getenv("VEIL_MEDIA_TEST_VIDEO");
+    std::string saved = prior ? prior : "";
+    ResetFactory() {
+      g_call_plane_recording_adm = true;
+      setenv("VEIL_MEDIA_TEST_VIDEO", "1", 1);
+    }
+    ~ResetFactory() {
+      g_call_plane_recording_adm = false;
+      if (prior) setenv("VEIL_MEDIA_TEST_VIDEO", saved.c_str(), 1);
+      else unsetenv("VEIL_MEDIA_TEST_VIDEO");
+    }
+  } reset;
+  uint8_t local[32] = {0x71}, peer[32] = {0x72};
+  for (bool room : {false, true}) {
+    std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> one(
+        room ? nullptr : veil_media_engine_create(99, local, peer),
+        veil_media_engine_destroy);
+    std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> group(
+        room ? veil_media_group_engine_create(local) : nullptr,
+        veil_media_group_engine_destroy);
+    if ((!room && !one) || (room && !group)) return 1;
+    if (room && veil_media_group_engine_add_peer(group.get(), 99, peer) != VEIL_MEDIA_OK)
+      return 2;
+    if ((room ? veil_media_group_engine_start_audio(group.get())
+              : veil_media_engine_start_audio(one.get(), 1, 1)) != VEIL_MEDIA_OK)
+      return 3;
+    if ((room ? veil_media_group_engine_start_video(group.get())
+              : veil_media_engine_start_video(one.get(), 1, 0, 900, 15)) != VEIL_MEDIA_OK)
+      return 4;
+    if (room && veil_media_group_engine_set_video_bitrate(group.get(), 900, 15) != VEIL_MEDIA_OK)
+      return 4;
+    auto check = [room](auto* ws) {
+      static_cast<StandRecordingAdm*>(ws->adm.get())->Capture(60);
+      int audio = 0, video = 0;
+      uint64_t packets = 0;
+      if (!run_on(ws->worker_tq.get(), [&] {
+            audio = ws->call->GetStats().send_bandwidth_bps;
+            if (ws->send_stream) packets = ws->send_stream->GetStats().packets_sent;
+          }) || !run_on(ws->video_worker_tq.get(), [&] {
+            video = ws->video_call->GetStats().send_bandwidth_bps;
+          })) return 5;
+      std::fprintf(stderr, "audio probe budget room=%d: audio=%d video=%d packets=%llu\n",
+                   room, audio, video, (unsigned long long)packets);
+      if (packets == 0 || audio <= 0 || audio > 96000 || video <= 96000)
+        return 6;
+      return 0;
+    };
+    const int result = room ? check(group->ws.get()) : check(one->ws.get());
+    if (result) return result;
+  }
+  return 0;
+}
+
 // Two engine generations reproduce starting/rebuilding an already-muted call.
 // The real AudioState, stream and Opus encoder run against a counting ADM.
 extern "C" int veil_media_test_muted_capture_lifecycle() {
