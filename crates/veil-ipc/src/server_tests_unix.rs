@@ -3031,7 +3031,7 @@ async fn a_delivery_names_its_origin_device_to_the_client() {
 #[tokio::test]
 async fn remote_file_backpressure_does_not_hold_shared_ipc_loop() {
     struct Blocked {
-        entered: tokio::sync::Notify,
+        entered: std::sync::atomic::AtomicUsize,
         permits: tokio::sync::Semaphore,
         frames: Mutex<Vec<Vec<u8>>>,
     }
@@ -3049,7 +3049,8 @@ async fn remote_file_backpressure_does_not_hold_shared_ipc_loop() {
             bytes: Vec<u8>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
             Box::pin(async move {
-                self.entered.notify_one();
+                self.entered
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.permits.acquire().await.unwrap().forget();
                 self.frames.lock().unwrap().push(bytes);
                 true
@@ -3059,8 +3060,8 @@ async fn remote_file_backpressure_does_not_hold_shared_ipc_loop() {
     let sock = temp_socket_path();
     let (server, shutdown, registry) = make_server(sock.clone());
     let blocked = Arc::new(Blocked {
-        entered: tokio::sync::Notify::new(),
-        permits: tokio::sync::Semaphore::new(0),
+        entered: std::sync::atomic::AtomicUsize::new(0),
+        permits: tokio::sync::Semaphore::new(1),
         frames: Mutex::new(Vec::new()),
     });
     let mut server = server.with_session_tx_registry(blocked.clone());
@@ -3100,7 +3101,9 @@ async fn remote_file_backpressure_does_not_hold_shared_ipc_loop() {
         recv_ipc_frame(&mut client).await.0.msg_type,
         LocalAppMsg::StreamOpenInbound as u16
     );
-    for data in [b"first".to_vec(), b"second".to_vec()] {
+    // Commit one segment, then block in the middle of a single large write.
+    let first: Vec<u8> = (0..6000).map(|n| (n % 251) as u8).collect();
+    for data in [first.clone(), b"second".to_vec()] {
         send_ipc_frame(
             &mut client,
             LocalAppMsg::StreamData as u16,
@@ -3112,9 +3115,13 @@ async fn remote_file_backpressure_does_not_hold_shared_ipc_loop() {
         )
         .await;
     }
-    tokio::time::timeout(Duration::from_secs(1), blocked.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while blocked.entered.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     send_ipc_frame(&mut client, LocalAppMsg::GetNodeIdentity as u16, &[]).await;
     let fast = tokio::time::timeout(Duration::from_millis(250), recv_ipc_frame(&mut client)).await;
     // Always release the blocked operation and close the server, also on the
@@ -3128,7 +3135,7 @@ async fn remote_file_backpressure_does_not_hold_shared_ipc_loop() {
     .await;
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            if blocked.frames.lock().unwrap().len() == 3 {
+            if blocked.frames.lock().unwrap().len() == 4 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -3151,17 +3158,25 @@ async fn remote_file_backpressure_does_not_hold_shared_ipc_loop() {
         vec![
             veil_proto::AppMsg::AppData as u16,
             veil_proto::AppMsg::AppData as u16,
+            veil_proto::AppMsg::AppData as u16,
             veil_proto::AppMsg::AppClose as u16
         ]
     );
+    let reconstructed: Vec<u8> = frames[..2]
+        .iter()
+        .flat_map(|frame| {
+            assert!(frame.len() + 16 <= 4096);
+            veil_proto::AppDataPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                .unwrap()
+                .data
+        })
+        .collect();
     assert_eq!(
-        veil_proto::AppDataPayload::decode(&frames[0][veil_proto::HEADER_SIZE..])
-            .unwrap()
-            .data,
-        b"first"
+        reconstructed, first,
+        "partial admission duplicated or lost bytes"
     );
     assert_eq!(
-        veil_proto::AppDataPayload::decode(&frames[1][veil_proto::HEADER_SIZE..])
+        veil_proto::AppDataPayload::decode(&frames[2][veil_proto::HEADER_SIZE..])
             .unwrap()
             .data,
         b"second"

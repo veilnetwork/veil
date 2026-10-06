@@ -147,10 +147,18 @@ async fn local_source_stream_budget_limits_committed_bulk_and_resumes_without_in
     tx.try_send(primary()).unwrap();
     const COUNT: u32 = 64;
     for seq in 0..COUNT {
-        let mut body = vec![seq as u8; 2048];
-        body[..4].copy_from_slice(&seq.to_le_bytes());
+        let mut data = vec![seq as u8; veil_proto::budget::LOCAL_STREAM_SEGMENT_DATA_BYTES];
+        data[..4].copy_from_slice(&seq.to_le_bytes());
+        let body = veil_proto::AppDataPayload {
+            app_id: [0x71; 32],
+            endpoint_id: 9,
+            seq: 0,
+            data,
+        }
+        .encode();
         let mut header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppData as u16);
         header.body_len = body.len() as u32;
+        header.set_priority(veil_proto::priority::INTERACTIVE);
         let mut frame = encode_header(&header).to_vec();
         frame.extend(body);
         tx.try_send((3, veil_bufpool::pooled_shared_from_vec(frame)))
@@ -191,8 +199,17 @@ async fn local_source_stream_budget_limits_committed_bulk_and_resumes_without_in
                     }
                 } else {
                     assert_eq!(header.msg_type, AppMsg::AppData as u16);
-                    let seq = u32::from_le_bytes(body[..4].try_into().unwrap());
-                    assert_eq!(&body[4..], vec![seq as u8; 2044]);
+                    assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+                    assert!(
+                        HEADER_SIZE + encrypted.len() <= 4096,
+                        "oversized source wire frame"
+                    );
+                    let segment = veil_proto::AppDataPayload::decode(&body).unwrap();
+                    let seq = u32::from_le_bytes(segment.data[..4].try_into().unwrap());
+                    assert_eq!(
+                        &segment.data[4..],
+                        vec![seq as u8; veil_proto::budget::LOCAL_STREAM_SEGMENT_DATA_BYTES - 4]
+                    );
                     bulk.push(seq);
                 }
             } else {
