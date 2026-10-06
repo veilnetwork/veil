@@ -5,6 +5,8 @@ use crate::parallel_binding::{HELLO_BYTES, ParallelKeys, ParallelParent, Paralle
 
 #[path = "primary_recovery.rs"]
 mod primary_recovery;
+#[path = "parallel_recovery_trace.rs"]
+mod recovery_trace;
 #[path = "parallel_registry.rs"]
 mod registry;
 pub use registry::{ParallelPeekOutcome, ParallelRegistry};
@@ -188,36 +190,49 @@ async fn connect_sender(
     parent: ParallelParentHandle,
     index: usize,
     context: RealtimeReceiverContext,
-) -> Result<ReadySender, String> {
+    trace: Option<&recovery_trace::Attempt>,
+) -> Result<ReadySender, &'static str> {
+    use recovery_trace::{Attempt, Phase};
     let connection = offer
         .handle
         .connect()
         .await
-        .map_err(|error| error.to_string())?;
-    let mut channel = Channel::new(connection, Arc::clone(&offer.diagnostics))?;
+        .map_err(recovery_trace::connect_failure)?;
+    Attempt::phase(trace, Phase::Channel);
+    let mut channel =
+        Channel::new(connection, Arc::clone(&offer.diagnostics)).map_err(|_| "channel_error")?;
+    Attempt::phase(trace, Phase::Exporter);
     let exporter = channel
         .handle
         .channel_binding()
-        .map_err(|error| error.to_string())?;
-    let (hello, pending) = parent.begin(exporter).map_err(|error| error.to_string())?;
+        .map_err(|_| "exporter_error")?;
+    Attempt::phase(trace, Phase::Begin);
+    let (hello, pending) = parent.begin(exporter).map_err(|_| "parent_retired")?;
+    Attempt::phase(trace, Phase::HelloWrite);
     channel
         .stream
         .write_all(&hello)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| "hello_write_error")?;
     let mut ack = [0; 32];
+    Attempt::phase(trace, Phase::AckRead);
     channel
         .stream
         .read_exact(&mut ack)
         .await
-        .map_err(|error| error.to_string())?;
-    let keys = pending.finish(&ack).map_err(|error| error.to_string())?;
+        .map_err(|_| "ack_read_error")?;
+    Attempt::phase(trace, Phase::AckVerify);
+    let keys = pending.finish(&ack).map_err(|error| match error {
+        crate::parallel_binding::BindingError::Retired => "parent_retired",
+        crate::parallel_binding::BindingError::InvalidProof => "invalid_ack_proof",
+    })?;
+    Attempt::phase(trace, Phase::DatagramCeiling);
     if channel
         .handle
         .max_size()
         .is_none_or(|size| size < crate::datagram_flows::MIN_FLOW_DATAGRAM_SIZE)
     {
-        return Err("parallel datagram ceiling unavailable".to_owned());
+        return Err("datagram_ceiling");
     }
     let tx = crate::datagram_flows::SessionDatagramTx::new(keys.tx_key(), &keys.session_id, true);
     let mut sender = RealtimeSender::new(channel.handle.clone(), tx);
@@ -226,6 +241,7 @@ async fn connect_sender(
     let receiver = offer
         .duplex
         .then(|| spawn_child_receiver(&channel, &keys, parent, context, Arc::clone(&sender)));
+    Attempt::phase(trace, Phase::Ready);
     Ok(ReadySender {
         sender,
         _receiver: receiver,
@@ -598,13 +614,33 @@ impl ParallelSession {
         let parent = self.parent.handle();
         let context = self.context.clone();
         let status = self.readiness.as_ref().map(|lease| lease.status());
+        let mut trace = self.slots[index]
+            .replacing
+            .then(|| recovery_trace::Attempt::new(&context, offer.handle.clone()));
         let (tx, rx) = tokio::sync::oneshot::channel();
         let task = RealtimeReceiverTask(tokio::spawn(async move {
-            if let Ok(Ok(ready)) =
-                tokio::time::timeout(BIND_TIMEOUT, connect_sender(offer, parent, index, context))
-                    .await
+            match tokio::time::timeout(
+                BIND_TIMEOUT,
+                connect_sender(offer, parent, index, context, trace.as_ref()),
+            )
+            .await
             {
-                let _ = tx.send(ready);
+                Ok(Ok(ready)) => {
+                    if let Some(trace) = trace.as_mut() {
+                        trace.finish("verified", "authenticated");
+                    }
+                    let _ = tx.send(ready);
+                }
+                Ok(Err(reason)) => {
+                    if let Some(trace) = trace.as_mut() {
+                        trace.finish("failed", reason);
+                    }
+                }
+                Err(_) => {
+                    if let Some(trace) = trace.as_mut() {
+                        trace.finish("timeout", "binding_deadline");
+                    }
+                }
             }
             if let Some(status) = status {
                 status.wake();
@@ -634,6 +670,14 @@ impl ParallelSession {
                 // redundant task/channel instead of churning a healthy sender.
                 slot.warm = None;
                 slot.replacing = false;
+                self.context.logger.info(
+                    "session.parallel.recovery_cancelled",
+                    format!(
+                        "peer_id={} local_slot={} reason=ack_progress",
+                        hex_short(&self.context.peer_id),
+                        veil_proto::priority::REALTIME,
+                    ),
+                );
             }
             Action::Probe if slot.warm.is_none() => {
                 self.primary_recovery.attempted(now);
