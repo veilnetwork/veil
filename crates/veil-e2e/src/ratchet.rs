@@ -1072,6 +1072,24 @@ impl RatchetStore {
             .and_then(|e| e.session.send_position())
     }
 
+    /// Sending positions retained by a conversation, read under one lock.
+    /// Hosts reserve every retained chain before publishing and keep those
+    /// reservations until a durable snapshot no longer contains the chain.
+    #[must_use]
+    pub fn send_positions(&self, key: &ConversationKey) -> Vec<veil_ratchet::SendPosition> {
+        self.send_position(key).into_iter().collect()
+    }
+
+    /// Public sending positions in this exact exported snapshot. Decoding
+    /// here keeps key material and the private state format out of the host.
+    /// This never imports the snapshot or changes a live conversation.
+    pub fn stored_send_positions(
+        blob: &[u8],
+    ) -> Result<Vec<veil_ratchet::SendPosition>, RatchetSpliceError> {
+        let entry = Entry::decode(blob)?;
+        Ok(entry.session.send_position().into_iter().collect())
+    }
+
     /// Step a conversation's sending chain past every index that might
     /// already have been spent, and report how many were burned.
     ///
@@ -5570,6 +5588,37 @@ mod tests {
             Some(&dev(from.instance_id, &pk)),
             at,
         )
+    }
+
+    #[test]
+    fn stored_sending_positions_describe_the_snapshot_not_live_state() {
+        let (a, b) = settled_pair(0xA4);
+        let key = ConversationKey {
+            local_instance_id: a.instance_id,
+            peer_node_id: b.node_id,
+            peer_instance_id: b.instance_id,
+        };
+        let snapshot = a.store.export(&key).unwrap();
+        let at = a.store.send_position(&key).unwrap();
+        let positions = RatchetStore::stored_send_positions(&snapshot).unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0], at);
+        assert_eq!(a.store.send_positions(&key), positions);
+        let outbound = seal_at(&a, &b, b"after snapshot", NOW + 1);
+        open_at(&b, &a, &outbound, NOW + 1).unwrap();
+        let reply = seal_at(&b, &a, b"new DH epoch", NOW + 2);
+        open_at(&a, &b, &reply, NOW + 2).unwrap();
+        assert_ne!(a.store.send_position(&key).unwrap().chain, at.chain);
+        assert_eq!(
+            RatchetStore::stored_send_positions(&snapshot).unwrap(),
+            positions
+        );
+        let version = a.store.version();
+        let mut trailing = snapshot.to_vec();
+        trailing.push(0);
+        assert!(RatchetStore::stored_send_positions(&trailing).is_err());
+        assert!(RatchetStore::stored_send_positions(&snapshot[..snapshot.len() - 1]).is_err());
+        assert_eq!(a.store.version(), version);
     }
 
     #[test]
