@@ -4894,7 +4894,7 @@ mod ratchet_terminal_tests {
         // The retained context does not stand in for a resolved certificate:
         // even Alice's new, genuine prologue cannot replace the held chain
         // without its verified device key and the normal freshness checks.
-        alice.runtime.forget_peer(&BOB);
+        assert_eq!(alice.runtime.forget_peer(&BOB), 1);
         let fresh = seal(&alice, &bob, b"new unverified conversation");
         assert_eq!(fresh[2], 0);
         assert_eq!(

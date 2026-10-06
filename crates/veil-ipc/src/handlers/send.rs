@@ -38,7 +38,7 @@ use crate::IpcMetrics;
 
 #[path = "source_envelope.rs"]
 mod source_envelope;
-use source_envelope::{DirectAdmission, EnvelopeChunks, admit_direct_sealed};
+use source_envelope::{DirectAdmission, EnvelopeChunks, admit_direct_plain, admit_direct_sealed};
 
 /// How long a discovery that found no route is believed.
 ///
@@ -1170,6 +1170,14 @@ pub(crate) async fn handle_ipc_send(
                     && payload.len() > veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES
                 {
                     admit_direct_sealed(ctx, request, *device, payload, deadline).await
+                } else if sealed.is_none()
+                    && request.data.len() > veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES
+                    && ctx
+                        .session_instance_lookup
+                        .as_deref()
+                        .is_some_and(|lookup| lookup.supports_direct_app_chunks(device))
+                {
+                    admit_direct_plain(ctx, request, *device, deadline).await
                 } else if reg.send_to(
                     device,
                     ctx.local_priority,
@@ -1328,6 +1336,54 @@ pub(crate) async fn handle_ipc_send(
             } else {
                 false
             }
+        } else if !relay_realtime
+            && sealed.is_none()
+            && send.data.len() > veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES
+        {
+            use futures::{StreamExt, stream};
+            let mut devices = reg.devices_of(&send.dst_node_id);
+            if devices.is_empty() {
+                devices.push(send.dst_node_id);
+            }
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            let request = &send;
+            let mut copies = stream::iter(devices)
+                .map(|device| async move {
+                    if device != request.dst_node_id
+                        && !device_matches_identity(ctx, &device, &request.dst_node_id)
+                    {
+                        return DirectAdmission::Rejected;
+                    }
+                    if ctx
+                        .session_instance_lookup
+                        .as_deref()
+                        .is_some_and(|lookup| lookup.supports_direct_app_chunks(&device))
+                    {
+                        admit_direct_plain(ctx, request, device, deadline).await
+                    } else if reg.send_to(
+                        &device,
+                        ctx.local_priority,
+                        app_send_frame(request, None),
+                    ) {
+                        // Old decoders retain their existing typed whole-frame contract.
+                        DirectAdmission::Accepted
+                    } else {
+                        DirectAdmission::Missing
+                    }
+                })
+                .buffer_unordered(8);
+            let mut accepted = false;
+            while let Some(outcome) = copies.next().await {
+                accepted |= outcome == DirectAdmission::Accepted;
+                direct_admission_failed |= matches!(
+                    outcome,
+                    DirectAdmission::TimedOut | DirectAdmission::Rejected
+                );
+            }
+            if accepted {
+                direct_admission_failed = false;
+            }
+            accepted
         } else {
             !relay_realtime
                 && hand_to_sealed_device(
@@ -2320,6 +2376,13 @@ mod ratchet_send_tests {
             lock!(self.0).push((priority, bytes));
             true
         }
+        fn send_direct_app_chunk_to<'a>(
+            &'a self,
+            peer: &'a [u8; 32],
+            frame: Vec<u8>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            self.send_reliable_to(peer, frame)
+        }
         fn send_to_all_with_priority(&self, _priority: u8, _bytes: Arc<[u8]>) {}
         fn active_node_ids(&self) -> Vec<[u8; 32]> {
             self.1.clone()
@@ -2952,6 +3015,124 @@ mod ratchet_send_tests {
         (fx, sibling_rt)
     }
 
+    struct PlainChunkPeers(Vec<[u8; 32]>);
+    impl veil_types::SessionInstanceLookup for PlainChunkPeers {
+        fn session_instance(&self, _: &[u8; 32]) -> Option<[u8; 16]> {
+            None
+        }
+        fn supports_direct_app_chunks(&self, peer: &[u8; 32]) -> bool {
+            self.0.contains(peer)
+        }
+    }
+
+    fn feed_plain(dispatcher: &veil_dispatcher::FrameDispatcher, frame: &[u8]) {
+        let header = codec::decode_header(frame).unwrap();
+        assert_eq!(header.family, FrameFamily::App as u8);
+        assert_eq!(
+            header.msg_type,
+            veil_proto::family::AppMsg::AppSendChunk as u16
+        );
+        assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+        assert!(
+            frame.len() + 16 + 40 <= 4096,
+            "plain source chunk must fit a 4 KiB bucket"
+        );
+        let result = dispatcher.dispatch(
+            &header,
+            &frame[veil_proto::HEADER_SIZE..],
+            veil_cfg::NodeId::from(ME),
+        );
+        assert!(
+            matches!(result, veil_dispatcher::DispatchResult::NoResponse),
+            "plain dispatch: {result:?}"
+        );
+    }
+
+    fn take_plain(
+        receiver: &mut tokio::sync::mpsc::Receiver<veil_app::registry::AppMessage>,
+    ) -> Vec<u8> {
+        match receiver.try_recv().expect("real dispatcher must deliver") {
+            veil_app::registry::AppMessage::Deliver {
+                src_node_id,
+                provenance,
+                origin_device,
+                src_app_id,
+                data,
+                ..
+            } => {
+                assert_eq!(src_node_id, ME);
+                assert_eq!(src_app_id, [0x11; 32]);
+                assert_eq!(origin_device, Some(ME));
+                assert_eq!(
+                    provenance,
+                    veil_app::registry::SenderProvenance::SessionPeer
+                );
+                data.to_vec()
+            }
+            other => panic!("unexpected delivery: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_plain_chunks_preserve_every_first_byte_metadata_and_once_only_delivery() {
+        let fx = fixture(vec![PEER, RELAY]);
+        let capture = Arc::new(LaneCapture(Mutex::new(Vec::new()), vec![PEER, RELAY]));
+        let mut ctx = fx.ctx(false);
+        ctx.session_tx_registry = Some(capture.clone());
+        ctx.session_instance_lookup = Some(Arc::new(PlainChunkPeers(vec![PEER])));
+        let tracker = Arc::new(Mutex::new(veil_pending_ack::PendingAckTracker::new()));
+        ctx.pending_ack = Some(tracker.clone());
+        for first in 0..=255u8 {
+            // Independent byte-shape cases; do not mistake the ordinary 1000/s
+            // abuse limit for a wire codec failure in a 2048-frame test burst.
+            let dispatcher = veil_dispatcher::make_test_dispatcher(veil_cfg::NodeRole::Core);
+            let (_endpoint, mut receiver) = dispatcher.app_registry.register([0x22; 32], 7, 16);
+            let mut data: Vec<_> = (0..12_000).map(|i| (i % 251) as u8).collect();
+            data[0] = first;
+            let mut request = AppIpcSendPayload::decode(&payload(false, &data)).unwrap();
+            request.require_ack = true;
+            let mut wh = sink().await;
+            handle_ipc_send(&mut SendReply::Inline(&mut wh), &request.encode(), &ctx)
+                .await
+                .unwrap();
+            let frames = std::mem::take(&mut *lock!(capture.0));
+            assert!(frames.len() > 1, "negotiated plain send must be packetized");
+            for (lane, frame) in frames {
+                assert_eq!(lane, veil_proto::priority::BACKGROUND);
+                feed_plain(&dispatcher, &frame);
+                feed_plain(&dispatcher, &frame);
+            }
+            assert_eq!(take_plain(&mut receiver), data);
+            assert!(receiver.try_recv().is_err());
+        }
+        assert!(lock!(tracker).is_empty());
+    }
+
+    #[tokio::test]
+    async fn direct_plain_legacy_peer_keeps_existing_typed_frame() {
+        let fx = fixture(vec![PEER]);
+        let data = vec![0x83; 12_000];
+        let mut wh = sink().await;
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload(false, &data),
+            &fx.ctx(false),
+        )
+        .await
+        .unwrap();
+        let sent = fx.taken();
+        assert_eq!(sent.len(), 1);
+        let header = codec::decode_header(&sent[0].1).unwrap();
+        assert_eq!(header.msg_type, veil_proto::family::AppMsg::AppSend as u16);
+        assert_eq!(
+            veil_proto::app::AppSendPayload::decode(&sent[0].1[veil_proto::HEADER_SIZE..])
+                .unwrap()
+                .data
+                .as_ref(),
+            data
+        );
+    }
+
     fn direct_receiver(
         runtime: &veil_e2e::RatchetRuntime,
         device: [u8; 32],
@@ -3103,6 +3284,72 @@ mod ratchet_send_tests {
     }
 
     #[tokio::test]
+    async fn direct_plain_source_waits_for_credit_and_preserves_primary() {
+        use std::time::Duration;
+        let fx = fixture(vec![PEER, RELAY]);
+        let registry = Arc::new(RwLock::new(veil_session::SessionTxRegistry::with_capacity(
+            1,
+        )));
+        let mut outbox = wlock!(registry).register_owned(PEER, [1; 32]);
+        assert!(wlock!(registry).set_direct_app_chunks_owned(&PEER, &[1; 32], true));
+        let mut relay = wlock!(registry).register(RELAY);
+        let mut ctx = fx.ctx(false);
+        ctx.session_instance_lookup = Some(Arc::new(PlainChunkPeers(vec![PEER])));
+        ctx.session_tx_registry = Some(Arc::new(veil_session::glue::SessionTxBroadcaster::new(
+            registry.clone(),
+        )));
+        assert!(rlock!(registry).send_to(&PEER, veil_proto::priority::BACKGROUND, vec![0]));
+        let data = vec![0x39; 12_000];
+        let body = payload(false, &data);
+        let mut wh = sink().await;
+        let mut reply = SendReply::Inline(&mut wh);
+        let mut admission = Box::pin(handle_ipc_send(&mut reply, &body, &ctx));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut admission)
+                .await
+                .is_err(),
+            "direct source must wait for credit"
+        );
+        assert!(
+            registry.try_write().is_ok(),
+            "no registry guard spans source wait"
+        );
+        assert!(rlock!(registry).send_to(&PEER, veil_proto::priority::REALTIME, vec![1]));
+        assert_eq!(
+            &*outbox.recv().await.unwrap().1,
+            [1],
+            "reserved primary overtakes full background"
+        );
+        assert_eq!(&*outbox.recv().await.unwrap().1, [0]);
+        let mut frames = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    result=&mut admission => {result.unwrap();break;}
+                    frame=outbox.recv() => {frames.push(frame.unwrap());}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        while let Ok(frame) = outbox.try_recv() {
+            frames.push(frame);
+        }
+        assert!(frames.len() > 1);
+        assert!(
+            relay.try_recv().is_err(),
+            "a full healthy direct queue must not spray an alternate copy"
+        );
+        let (dispatcher, _endpoint, mut receiver) = direct_receiver(&fx.peer, PEER, PEER_INSTANCE);
+        for (lane, frame) in frames {
+            assert_eq!(lane, veil_proto::priority::BACKGROUND);
+            feed_plain(&dispatcher, &frame);
+        }
+        assert_eq!(take_plain(&mut receiver), data);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn direct_source_waits_for_credit_without_losing_a_suffix_or_blocking_primary() {
         use std::time::Duration;
         let fx = fixture(vec![PEER, RELAY]);
@@ -3181,6 +3428,13 @@ mod ratchet_send_tests {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
             self.inner.send_reliable_to(peer, frame)
         }
+        fn send_direct_app_chunk_to<'a>(
+            &'a self,
+            peer: &'a [u8; 32],
+            frame: Vec<u8>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            self.inner.send_direct_app_chunk_to(peer, frame)
+        }
         fn send_to_all_with_priority(&self, priority: u8, frames: Arc<[u8]>) {
             self.inner.send_to_all_with_priority(priority, frames)
         }
@@ -3194,6 +3448,71 @@ mod ratchet_send_tests {
                 Vec::new()
             }
         }
+    }
+
+    #[tokio::test]
+    async fn direct_plain_family_source_delivers_a_sibling_while_other_credit_is_full() {
+        const ONE: [u8; 32] = [0xb7; 32];
+        const TWO: [u8; 32] = [0xb8; 32];
+        let fx = fixture(vec![ONE, TWO]);
+        let registry = Arc::new(RwLock::new(veil_session::SessionTxRegistry::with_capacity(
+            1,
+        )));
+        let mut first = wlock!(registry).register_owned(ONE, [1; 32]);
+        let mut second = wlock!(registry).register_owned(TWO, [2; 32]);
+        assert!(wlock!(registry).set_direct_app_chunks_owned(&ONE, &[1; 32], true));
+        assert!(wlock!(registry).set_direct_app_chunks_owned(&TWO, &[2; 32], true));
+        let mut ctx = fx.ctx(false);
+        ctx.session_instance_lookup = Some(Arc::new(PlainChunkPeers(vec![ONE, TWO])));
+        ctx.session_tx_registry = Some(Arc::new(DirectFamilySource {
+            inner: veil_session::glue::SessionTxBroadcaster::new(registry.clone()),
+            devices: vec![ONE, TWO],
+        }));
+        assert!(rlock!(registry).send_to(&ONE, veil_proto::priority::BACKGROUND, vec![0]));
+        let data = vec![0x83; 12_000];
+        let body = payload(false, &data);
+        let mut wh = sink().await;
+        let mut reply = SendReply::Inline(&mut wh);
+        let mut admission = Box::pin(handle_ipc_send(&mut reply, &body, &ctx));
+        let mut frames = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while frames.len() < data.len().div_ceil(veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES) {
+                tokio::select! {
+                    result = &mut admission => panic!("request ended before blocked sibling was released: {result:?}"),
+                    frame = second.recv() => frames.push(frame.unwrap()),
+                }
+            }
+        }).await.expect("second plain sibling progresses independently");
+        let dispatcher = veil_dispatcher::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let (_endpoint, mut receiver) = dispatcher.app_registry.register([0x22; 32], 7, 16);
+        for (lane, frame) in frames {
+            assert_eq!(lane, veil_proto::priority::BACKGROUND);
+            feed_plain(&dispatcher, &frame);
+        }
+        assert_eq!(take_plain(&mut receiver), data);
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(&*first.recv().await.unwrap().1, [0]);
+        let mut frames = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    result = &mut admission => {result.unwrap();break;},
+                    frame = first.recv() => frames.push(frame.unwrap()),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        while let Ok(frame) = first.try_recv() {
+            frames.push(frame);
+        }
+        let other = veil_dispatcher::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let (_endpoint, mut receiver) = other.app_registry.register([0x22; 32], 7, 16);
+        for (_, frame) in frames {
+            feed_plain(&other, &frame);
+        }
+        assert_eq!(take_plain(&mut receiver), data);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -3416,6 +3735,62 @@ mod ratchet_send_tests {
         }
         assert_eq!(take_direct(&mut receiver), data);
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_plain_source_deadline_does_not_fallback_or_leak_credit() {
+        use tokio::io::AsyncReadExt;
+        let fx = fixture(vec![PEER, RELAY]);
+        let registry = Arc::new(RwLock::new(veil_session::SessionTxRegistry::with_capacity(
+            1,
+        )));
+        let mut outbox = wlock!(registry).register_owned(PEER, [1; 32]);
+        assert!(wlock!(registry).set_direct_app_chunks_owned(&PEER, &[1; 32], true));
+        let mut relay = wlock!(registry).register(RELAY);
+        let mut ctx = fx.ctx(false);
+        ctx.session_instance_lookup = Some(Arc::new(PlainChunkPeers(vec![PEER])));
+        ctx.session_tx_registry = Some(Arc::new(veil_session::glue::SessionTxBroadcaster::new(
+            registry.clone(),
+        )));
+        assert!(rlock!(registry).send_to(&PEER, veil_proto::priority::BACKGROUND, vec![0]));
+        let (writer, mut reader) = tokio::net::UnixStream::pair().unwrap();
+        let (_, wh) = writer.into_split();
+        let mut wh = veil_local_transport::LocalWriteHalf::Unix(wh);
+        let mut reply = SendReply::Inline(&mut wh);
+        let body = payload(false, &vec![9; 12_000]);
+        let mut admission = Box::pin(handle_ipc_send(&mut reply, &body, &ctx));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut admission)
+                .await
+                .is_err()
+        );
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        admission.await.unwrap();
+        let mut status = vec![0; veil_proto::HEADER_SIZE + 2];
+        reader.read_exact(&mut status).await.unwrap();
+        assert_eq!(
+            codec::decode_header(&status).unwrap().msg_type,
+            LocalAppMsg::AppSendFailed as u16
+        );
+        assert_eq!(
+            &status[veil_proto::HEADER_SIZE..],
+            &ipc_send_err::NO_ROUTE.to_be_bytes()
+        );
+        assert!(relay.try_recv().is_err());
+        assert!(registry.try_write().is_ok());
+        assert_eq!(&*outbox.recv().await.unwrap().1, [0]);
+        assert!(
+            ctx.session_tx_registry
+                .as_ref()
+                .unwrap()
+                .send_reliable_to(&PEER, vec![2])
+                .await
+        );
+        assert_eq!(
+            &*outbox.recv().await.unwrap().1,
+            [2],
+            "timed-out source released its credit"
+        );
     }
 
     #[tokio::test(start_paused = true)]

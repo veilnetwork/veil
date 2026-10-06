@@ -1879,13 +1879,13 @@ impl tokio::io::AsyncWrite for ObservedControlStream {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         use std::{future::Future, pin::Pin, task::Poll};
-        if self.written > 0 {
-            if let Some(resume) = &mut self.resume {
-                if Pin::new(resume).poll(cx).is_pending() {
-                    return Poll::Pending;
-                }
-                self.resume = None;
+        if self.written > 0
+            && let Some(resume) = &mut self.resume
+        {
+            if Pin::new(resume).poll(cx).is_pending() {
+                return Poll::Pending;
             }
+            self.resume = None;
         }
         let bytes = if self.written == 0 {
             &buf[..buf.len().min(1024)]
@@ -1900,10 +1900,10 @@ impl tokio::io::AsyncWrite for ObservedControlStream {
             if let Some(partial) = self.partial.take() {
                 let _ = partial.send(());
             }
-            if self.written == 12 * 1024 {
-                if let Some(done) = self.done.take() {
-                    let _ = done.send(());
-                }
+            if self.written == 12 * 1024
+                && let Some(done) = self.done.take()
+            {
+                let _ = done.send(());
             }
         }
         result

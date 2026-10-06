@@ -232,6 +232,55 @@ impl FrameDispatcher {
                 }
                 DispatchResult::NoResponse
             }
+            AppMsg::AppSendChunk => {
+                let payload = match AppSendPayload::decode(body) {
+                    Ok(p) => p,
+                    Err(e) => return DispatchResult::Violation(format!("bad AppSendChunk: {e}")),
+                };
+                let chunk =
+                    match veil_proto::delivery::ChunkedEnvelopePayload::decode(&payload.data) {
+                        Ok(chunk) if !chunk.require_ack => chunk,
+                        Ok(_) => {
+                            return DispatchResult::Violation(
+                                "direct app chunk requests delivery ACK".into(),
+                            );
+                        }
+                        Err(e) => {
+                            return DispatchResult::Violation(format!("bad direct app chunk: {e}"));
+                        }
+                    };
+                let envelope = veil_proto::delivery::DeliveryEnvelope {
+                    recipient: veil_proto::recipient::Recipient::any(self.local_node_id),
+                    sender_node_id: *node_id.as_bytes(),
+                    src_app_id: payload.src_app_id,
+                    app_id: payload.app_id,
+                    endpoint_id: payload.endpoint_id,
+                    content_id: chunk.orig_content_id,
+                    created_at: 0,
+                    ttl_secs: 0,
+                    payload: Vec::new(),
+                    trace_id: 0,
+                    require_ack: false,
+                };
+                let result = lock!(self.chunk_reassembler).add_direct_app(
+                    &envelope,
+                    *node_id.as_bytes(),
+                    chunk,
+                    veil_util::unix_secs_now_u64(),
+                );
+                if let crate::envelope_chunks::AddChunkResult::Complete(message) = result {
+                    self.app_registry.route_ipc_deliver_from_device(
+                        sender,
+                        veil_app::registry::SenderProvenance::SessionPeer,
+                        *node_id.as_bytes(),
+                        message.src_app_id,
+                        message.app_id,
+                        message.endpoint_id,
+                        veil_bufpool::pooled_shared_from_vec(message.payload),
+                    );
+                }
+                DispatchResult::NoResponse
+            }
             AppMsg::AppSend => {
                 let payload = match AppSendPayload::decode(body) {
                     Ok(p) => p,

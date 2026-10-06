@@ -528,6 +528,9 @@ pub enum AppMsg {
     /// acting on it costs one prologue, and the peer that sends it could have
     /// dropped the frame anyway.
     AppSendUnopenable = 8,
+    /// Reliable direct application bytes in bounded chunks. Negotiated through
+    /// SUPPORTS_DIRECT_APP_CHUNKS; data markers never classify application bytes.
+    AppSendChunk = 9,
 }
 
 impl TryFrom<u16> for AppMsg {
@@ -543,6 +546,7 @@ impl TryFrom<u16> for AppMsg {
             6 => Ok(AppMsg::AppRtData),
             7 => Ok(AppMsg::AppSendSealed),
             8 => Ok(AppMsg::AppSendUnopenable),
+            9 => Ok(AppMsg::AppSendChunk),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::App as u8,
                 msg_type: v,

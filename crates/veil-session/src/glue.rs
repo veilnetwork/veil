@@ -81,6 +81,26 @@ impl veil_types::FrameBroadcaster for SessionTxBroadcaster {
         })
     }
 
+    fn send_direct_app_chunk_to<'a>(
+        &'a self,
+        peer_id: &'a [u8; 32],
+        bytes: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        let sender = rlock!(self.inner)
+            .get_direct_app_chunk_sender(peer_id)
+            .cloned();
+        Box::pin(async move {
+            match sender {
+                Some(sender) => {
+                    sender
+                        .send_reliable(veil_bufpool::pooled_shared_from_vec(bytes))
+                        .await
+                }
+                None => false,
+            }
+        })
+    }
+
     fn devices_of(&self, identity: &[u8; 32]) -> Vec<[u8; 32]> {
         let Some(sessions) = self.sessions.as_ref() else {
             return Vec::new();
@@ -129,6 +149,14 @@ impl SessionInstanceDirectory {
 }
 
 impl veil_types::SessionInstanceLookup for SessionInstanceDirectory {
+    fn supports_direct_app_chunks(&self, peer_node_id: &[u8; 32]) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_by_peer_id(&veil_cfg::NodeId::from(*peer_node_id))
+            .is_some_and(|entry| entry.remote_capabilities.supports_direct_app_chunks())
+    }
+
     fn session_instance(&self, peer_node_id: &[u8; 32]) -> Option<[u8; 16]> {
         self.inner
             .lock()
@@ -162,6 +190,75 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use veil_types::FrameBroadcaster;
+
+    #[tokio::test]
+    async fn direct_chunk_admission_binds_capability_and_sender_across_reconnect() {
+        use veil_types::FrameBroadcaster;
+        let registry = Arc::new(RwLock::new(SessionTxRegistry::with_capacity(1)));
+        let adapter = SessionTxBroadcaster::new(registry.clone());
+        let mut old = registry.write().unwrap().register_owned(DEVICE_A, [1; 32]);
+        assert!(
+            registry
+                .write()
+                .unwrap()
+                .set_direct_app_chunks_owned(&DEVICE_A, &[1; 32], true)
+        );
+        assert!(adapter.send_to(&DEVICE_A, veil_proto::priority::BACKGROUND, vec![0]));
+        let mut admission = adapter.send_direct_app_chunk_to(&DEVICE_A, vec![1]);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut admission)
+                .await
+                .is_err()
+        );
+        let mut replacement = registry.write().unwrap().register_owned(DEVICE_A, [2; 32]);
+        assert!(
+            !registry
+                .write()
+                .unwrap()
+                .set_direct_app_chunks_owned(&DEVICE_A, &[1; 32], true)
+        );
+        assert!(
+            !adapter.send_direct_app_chunk_to(&DEVICE_A, vec![2]).await,
+            "old capability must not activate replacement"
+        );
+        assert_eq!(&*old.recv().await.unwrap().1, [0]);
+        assert!(admission.await);
+        assert_eq!(
+            &*old.recv().await.unwrap().1,
+            [1],
+            "waiting credit retains exact modern sender"
+        );
+        assert!(
+            replacement.try_recv().is_err(),
+            "no typed bytes on old decoder"
+        );
+        assert!(
+            registry
+                .write()
+                .unwrap()
+                .set_direct_app_chunks_owned(&DEVICE_A, &[2; 32], true)
+        );
+        assert!(adapter.send_direct_app_chunk_to(&DEVICE_A, vec![3]).await);
+        assert_eq!(&*replacement.recv().await.unwrap().1, [3]);
+    }
+
+    #[test]
+    fn direct_app_capability_reads_only_current_live_session_and_disappears_on_close() {
+        use veil_types::SessionInstanceLookup;
+        let registry = Arc::new(Mutex::new(crate::manager::SessionRegistry::new()));
+        let lookup = SessionInstanceDirectory::new(registry.clone());
+        assert!(!lookup.supports_direct_app_chunks(&DEVICE_A));
+        let mut entry = sovereign_entry(DEVICE_A, IDENTITY, [1; 16], 1);
+        registry.lock().unwrap().insert(entry.clone());
+        assert!(!lookup.supports_direct_app_chunks(&DEVICE_A));
+        registry.lock().unwrap().remove(&entry.session_id);
+        entry.remote_capabilities.extra_flags |=
+            veil_proto::session::cap_extra_flags::SUPPORTS_DIRECT_APP_CHUNKS;
+        registry.lock().unwrap().insert(entry.clone());
+        assert!(lookup.supports_direct_app_chunks(&DEVICE_A));
+        registry.lock().unwrap().remove(&entry.session_id);
+        assert!(!lookup.supports_direct_app_chunks(&DEVICE_A));
+    }
 
     const DEVICE_A: [u8; 32] = [0xaau8; 32];
     const DEVICE_B: [u8; 32] = [0xbbu8; 32];
