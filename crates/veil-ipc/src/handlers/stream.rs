@@ -533,7 +533,9 @@ pub(crate) async fn send_app_open(
     send_app_frame_wait(broadcaster, dst, wire_stream_id, AppMsg::AppOpen, &body).await
 }
 
-/// Encode + send an `AppData` frame carrying `data` on `wire_stream_id`.
+/// Packetize a reliable byte-stream write before committing it to the session.
+/// Segment boundaries are not byte-stream message boundaries. Keep one write
+/// deadline and ordering; a partial failed write closes the stream at caller.
 pub(crate) async fn send_app_data(
     broadcaster: &dyn FrameBroadcaster,
     dst: &[u8; 32],
@@ -542,14 +544,31 @@ pub(crate) async fn send_app_data(
     endpoint_id: u32,
     data: Vec<u8>,
 ) -> bool {
-    let body = AppDataPayload {
-        app_id,
-        endpoint_id,
-        seq: 0, // ordering is maintained by the underlying session transport
-        data,
-    }
-    .encode();
-    send_app_frame_wait(broadcaster, dst, wire_stream_id, AppMsg::AppData, &body).await
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut offset = 0;
+        loop {
+            let end = data
+                .len()
+                .min(offset + veil_proto::budget::LOCAL_STREAM_SEGMENT_DATA_BYTES);
+            let body = AppDataPayload {
+                app_id,
+                endpoint_id,
+                seq: 0, // ordering is maintained by the underlying session transport
+                data: data[offset..end].to_vec(),
+            }
+            .encode();
+            if !send_app_frame_wait(broadcaster, dst, wire_stream_id, AppMsg::AppData, &body).await
+            {
+                return false;
+            }
+            offset = end;
+            if offset == data.len() {
+                return true;
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Encode + send an `AppClose` frame on `wire_stream_id`.
@@ -636,6 +655,56 @@ mod tests {
     use veil_proto::{StreamClosePayload, StreamDataPayload, header::HEADER_SIZE};
 
     #[tokio::test]
+    async fn segmented_stream_write_reports_partial_failure_without_resending_prefix() {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        #[derive(Default)]
+        struct Source {
+            attempts: AtomicUsize,
+            accepted: Mutex<Vec<Vec<u8>>>,
+        }
+        impl FrameBroadcaster for Source {
+            fn send_to(&self, _: &[u8; 32], _: u8, frame: Vec<u8>) -> bool {
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 1 {
+                    return false;
+                }
+                self.accepted.lock().unwrap().push(frame);
+                true
+            }
+            fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+            fn active_node_ids(&self) -> Vec<[u8; 32]> {
+                Vec::new()
+            }
+        }
+        let source = Source::default();
+        let bytes: Vec<u8> = (0..8000).map(|n| (n % 251) as u8).collect();
+        assert!(!send_app_data(&source, &[9; 32], 41, [7; 32], 5, bytes.clone()).await);
+        assert_eq!(source.attempts.load(Ordering::SeqCst), 2);
+        {
+            let accepted = source.accepted.lock().unwrap();
+            assert_eq!(accepted.len(), 1);
+            let segment = AppDataPayload::decode(&accepted[0][HEADER_SIZE..]).unwrap();
+            assert_eq!(segment.data, bytes[..segment.data.len()]);
+            assert!(
+                segment.data.len() < bytes.len(),
+                "whole write was accepted as one frame"
+            );
+        }
+        // Keep the historical empty-write behavior without a zero-progress loop.
+        let empty = Source::default();
+        assert!(send_app_data(&empty, &[9; 32], 41, [7; 32], 5, Vec::new()).await);
+        assert_eq!(empty.attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            AppDataPayload::decode(&empty.accepted.lock().unwrap()[0][HEADER_SIZE..])
+                .unwrap()
+                .data
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn reliable_stream_lifecycle_uses_one_local_lane_and_neutral_wire_headers() {
         use std::sync::Mutex;
         use veil_session::priority_queue::PriorityQueue;
@@ -657,9 +726,8 @@ mod tests {
         let app = [7; 32];
         assert!(send_app_open(&source, &dst, 41, app, 5).await);
         let payload: Vec<_> = (0..33 * 2048 + 19).map(|n| (n % 251) as u8).collect();
-        for chunk in payload.chunks(2048) {
-            assert!(send_app_data(&source, &dst, 41, app, 5, chunk.to_vec()).await);
-        }
+        // One large IPC write must be packetized by the actual producer.
+        assert!(send_app_data(&source, &dst, 41, app, 5, payload.clone()).await);
         assert!(send_app_close(&source, &dst, 41, app, 5));
 
         let mut queue = PriorityQueue::with_default_weights();
@@ -676,6 +744,11 @@ mod tests {
                 "local lane leaked onto the wire"
             );
             assert_eq!(header.stream_id, 41);
+            if header.msg_type == AppMsg::AppData as u16 {
+                // Include the session AEAD tag. No encrypted segment may
+                // consume the old 60-KiB ordered writer exception.
+                assert!(frame.len() + 16 <= 4096, "oversized source segment");
+            }
             queue.push(lane, veil_bufpool::pooled_shared_from_vec(frame));
         }
         // A new local primary may pass all queued stream bytes. Afterwards the

@@ -3979,12 +3979,14 @@ mod direct_reply_sentinel_tests {
     /// reply_endpoint_id)`, absent when the caller wants no reply.
     type ReplyPath = Option<([u8; 32], u32)>;
 
+    type CapturedDatagram = (u8, [u8; 32], [u8; 32], u32, Vec<u8>);
+
     /// Records the `reply` argument of every direct send; every other method is
     /// off this path and panics rather than silently passing.
     #[derive(Default)]
     pub(super) struct RecordingSender {
         replies: Mutex<Vec<ReplyPath>>,
-        pub(super) lanes: Mutex<Vec<(u8, [u8; 32], [u8; 32], u32, Vec<u8>)>>,
+        pub(super) lanes: Mutex<Vec<CapturedDatagram>>,
     }
 
     impl veil_types::AnonOnionSender for RecordingSender {
