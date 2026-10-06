@@ -3804,12 +3804,14 @@ impl SessionRunner {
             _ => None,
         };
 
-        // Publish actual generic transport readiness to local origin routing.
-        // Independent children are not required; no remote class is exposed.
-        let mut _datagram_transport_lease = realtime_lane
-            .as_ref()
-            .and(outbox.as_ref())
-            .and_then(|outbox| outbox.activate_datagram_transport());
+        // Publish this runner's generic readiness and separately its negotiated
+        // neutral Forward support. QUIC alone cannot carry a newer neutral
+        // frame to a legacy decoder. No remote class is exposed.
+        let mut _datagram_transport_lease = realtime_lane.as_ref().and_then(|lane| {
+            outbox.as_ref().and_then(|outbox| {
+                outbox.activate_datagram_transport_with_neutral_forwards(lane.peer_neutral_forwards)
+            })
+        });
 
         // ── b: reader/writer split ─────────────────────────────────
         // Architectural fix for the symmetric `write_all` deadlock (testnet

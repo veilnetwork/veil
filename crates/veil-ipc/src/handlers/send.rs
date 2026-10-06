@@ -1311,7 +1311,8 @@ pub(crate) async fn handle_ipc_send(
             // within each transport group and all existing fallback hops.
             // This does not change relay policy or independent-flow consent.
             if relay_media_sealed {
-                forced_relay_hops.sort_by_key(|hop| !reg.has_datagram_transport(hop));
+                forced_relay_hops
+                    .sort_by_key(|hop| !reg.has_neutral_forward_datagram_transport(hop));
             }
             if !forced_relay_hops.is_empty() {
                 use veil_proto::delivery::DeliveryEnvelope;
@@ -1770,7 +1771,7 @@ pub(crate) async fn handle_ipc_send(
                             ctx.local_priority,
                             next_hop,
                             relayed,
-                            reg.has_datagram_transport(&next_hop),
+                            reg.has_neutral_forward_datagram_transport(&next_hop),
                         );
                     }
                     if relayed {
@@ -2439,6 +2440,11 @@ mod ratchet_send_tests {
 
     impl FrameBroadcaster for Outbox {
         fn has_datagram_transport(&self, peer: &[u8; 32]) -> bool {
+            // All live fixture peers offer generic QUIC; only the explicit
+            // subset negotiated the neutral forwarding format.
+            self.live.contains(peer)
+        }
+        fn has_neutral_forward_datagram_transport(&self, peer: &[u8; 32]) -> bool {
             self.datagram.contains(peer)
         }
         fn send_to(&self, peer_id: &[u8; 32], _priority: u8, bytes: Vec<u8>) -> bool {
@@ -3589,6 +3595,8 @@ mod ratchet_send_tests {
                 if ready { vec![DATAGRAM] } else { Vec::new() };
             let mut ctx = fx.ctx(false);
             ctx.local_priority = veil_proto::priority::BULK; // one copy
+            assert!(fx.outbox.has_datagram_transport(&RELAY));
+            assert!(!fx.outbox.has_neutral_forward_datagram_transport(&RELAY));
             let sealed = veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC.to_vec();
             let mut body = payload_to(PEER, &sealed);
             let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME

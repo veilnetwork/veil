@@ -629,14 +629,26 @@ async fn neutral_forward_datagrams_require_capability_and_keep_legacy_ordered_fa
                 Some(veil_crypto::session_cipher::SessionCipher::new(&tx, true));
             runner.crypto.rx_cipher =
                 Some(veil_crypto::session_cipher::SessionCipher::new(&rx, true));
-            let (sender, outbox) = mpsc::channel(8);
+            let (sender, outbox) = veil_session::frame_outbox::frame_channel(8);
             senders.push(sender);
-            runner.outbox = Some(outbox.into());
+            runner.outbox = Some(outbox);
             let dispatcher = Arc::new(dispatcher);
             runner.ban_list = dispatcher.abuse.ban_list.clone();
             runner.violation_tracker = dispatcher.abuse.violation_tracker.clone();
             runner.dispatcher = dispatcher;
             tasks.push(tokio::spawn(async move { runner.run().await }));
+        }
+        // Query the actual runner generation before choosing an origin hop.
+        // Both links offer QUIC; only negotiated peers can carry this Forward.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !senders.iter().all(|s| s.has_datagram_transport()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runner did not publish generic transport readiness");
+        for sender in &senders {
+            assert_eq!(sender.has_neutral_forward_datagram_transport(), negotiated);
         }
         let body = ForwardPayload {
             next_hop_node_id: ids[1],
@@ -667,8 +679,7 @@ async fn neutral_forward_datagrams_require_capability_and_keep_legacy_ordered_fa
         let mut frame = encode_header(&header).to_vec();
         frame.extend(body);
         senders[0]
-            .send((0, veil_bufpool::pooled_shared_from_vec(frame)))
-            .await
+            .try_send((0, veil_bufpool::pooled_shared_from_vec(frame)))
             .unwrap();
         let receive = tokio::time::timeout(Duration::from_millis(300), receivers[1].recv()).await;
         if negotiated || !stopped {
@@ -691,6 +702,10 @@ async fn neutral_forward_datagrams_require_capability_and_keep_legacy_ordered_fa
         for task in tasks {
             task.abort();
             let _ = task.await;
+        }
+        for sender in &senders {
+            assert!(!sender.has_datagram_transport());
+            assert!(!sender.has_neutral_forward_datagram_transport());
         }
     }
 }
