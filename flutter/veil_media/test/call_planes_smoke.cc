@@ -26,6 +26,7 @@ extern "C" int veil_media_test_group_emit_rtcp(VeilGroupMediaEngine*);
 extern "C" int veil_media_test_group_fanout_packet(VeilGroupMediaEngine*, int);
 extern "C" int veil_media_test_video_bandwidth(VeilMediaEngine*);
 extern "C" int veil_media_test_direct_packet(VeilMediaEngine*, int);
+extern "C" uint64_t veil_media_test_direct_encoded_frames(VeilMediaEngine*);
 extern "C" int veil_media_test_pause_with_held_video_worker(VeilMediaEngine*, VeilGroupMediaEngine*);
 struct Callback { void (*fn)(void*, const uint8_t*, size_t); void* ctx; };
 static std::atomic<bool> hold_fanout_video{false};
@@ -669,6 +670,21 @@ int main() {
     assert((room ? group_audio_packets(group.get(), peer) : metric("audio_rx_pkts")) == 4);
 
     assert(pause(0) == VEIL_MEDIA_OK);
+    // The portable Android420 push has its own conversion branch. A closed
+    // RTP gate alone must not hide continuing expensive encoder work.
+    if (!room) {
+      assert(pause(1) == VEIL_MEDIA_OK);
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      const auto encoded = veil_media_test_direct_encoded_frames(one.get());
+      for (int i = 0; i < 30; ++i) {
+        assert(veil_media_engine_push_android420_frame(one.get(), y.data(), uv.data(), uv.data(),
+            16, 16, 16, 8, 8, 1, 0, 0) == VEIL_MEDIA_OK);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      assert(veil_media_test_direct_encoded_frames(one.get()) == encoded);
+      assert(pause(0) == VEIL_MEDIA_OK);
+    }
     assert(budget(8, 0.3) == VEIL_MEDIA_OK);
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     assert(metric(room ? "video_kbps" : "target_bitrate_bps") == (room ? 8 : 8000));

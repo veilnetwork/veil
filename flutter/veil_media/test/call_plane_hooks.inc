@@ -242,4 +242,14 @@ extern "C" int veil_media_test_pause_with_held_video_worker(
   return 0;
 }
 
+// Count actual encoding independently of the final send gate.
+extern "C" uint64_t veil_media_test_direct_encoded_frames(VeilMediaEngine* e) {
+  uint64_t frames = 0;
+  auto* ws = e->ws.get();
+  if (!veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&] {
+    if (ws->video_send_stream) frames = ws->video_send_stream->GetStats().frames_encoded;
+  }, std::chrono::seconds(1))) return UINT64_MAX;
+  return frames;
+}
+
 #pragma GCC visibility pop
