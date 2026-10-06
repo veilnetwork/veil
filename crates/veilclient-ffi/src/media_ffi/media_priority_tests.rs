@@ -16,9 +16,9 @@ use super::{
     MEDIA_BATCHING_COMPACT_RELAY, MEDIA_BATCHING_OFF, MEDIA_CHANNELS, MEDIA_LOCAL_QUEUE_AGE,
     MEDIA_NEXT_ID, MediaChannel, MediaIngress, MediaSenderSlot, MediaVideoIngress,
     QueuedMediaPacket, RelayVideoFrame, drain_anonymous_media, drain_media_packets,
-    drain_media_packets_on_plane, drain_relay_video, media_batched_cells, media_ready_batch,
-    timed_media_cells, veil_media_channel_set_screen_sharing, veil_media_close_channel,
-    veil_media_send_datagram,
+    drain_media_packets_on_plane, drain_relay_video, media_batched_cells, media_is_rtcp,
+    media_ready_batch, timed_media_cells, veil_media_channel_set_screen_sharing,
+    veil_media_close_channel, veil_media_send_datagram, veil_media_send_video_control_datagram,
 };
 use super::{
     RELAY_VIDEO_FRAME_MAX_BYTES, RelayMediaStats, RelayVideoFrameAssembler, RelayVideoFramePush,
@@ -1209,4 +1209,98 @@ async fn blocked_screen_writer_does_not_hold_audio_or_camera() {
     audio_task.await.unwrap();
     camera_task.await.unwrap();
     assert!(received.contains(&audio) && received.contains(&camera));
+}
+
+fn send_video_control_when_available(id: u64, packet: &[u8]) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let rc =
+            unsafe { veil_media_send_video_control_datagram(id, packet.as_ptr(), packet.len()) };
+        if rc != 1 || Instant::now() >= deadline {
+            return rc;
+        }
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn video_control_accepts_only_complete_rtcp_compounds() {
+    let rr = [0x80, 201, 0, 1, 1, 2, 3, 4];
+    assert!(media_is_rtcp(&rr));
+    assert!(media_is_rtcp(&[rr, rr].concat()));
+    for packet in [
+        vec![],
+        vec![0x80, 201],
+        vec![0x80, 201, 0, 2, 1, 2, 3, 4],
+        vec![0x80, 111, 0, 1, 1, 2, 3, 4],
+        vec![0x80, 224, 0, 1, 1, 2, 3, 4],
+        vec![0xa0, 201, 0, 1, 1, 2, 3, 0],
+        vec![0xa0, 201, 0, 1, 1, 2, 3, 5],
+        [vec![0xa0, 201, 0, 1, 1, 2, 3, 4], rr.to_vec()].concat(),
+    ] {
+        assert!(!media_is_rtcp(&packet), "malformed control: {packet:?}");
+    }
+}
+
+#[tokio::test]
+async fn video_control_backpressure_never_falls_into_audio() {
+    let (audio, mut audio_rx) = mpsc::channel(2);
+    let (camera, mut camera_rx) = mpsc::channel(1);
+    let (screen, mut screen_rx) = mpsc::channel(1);
+    let ingress = MediaIngress::with_screen(
+        audio,
+        MediaVideoIngress::Packets(camera),
+        MediaVideoIngress::Packets(screen),
+    );
+    let (id, _) = register_test_ingress(Arc::clone(&ingress), [0xe6; 32]);
+    let rr = [0x80, 201, 0, 1, 1, 2, 3, 4];
+    assert_eq!(send_video_control_when_available(id, &rr), 0);
+    assert_eq!(
+        unsafe { veil_media_send_video_control_datagram(id, rr.as_ptr(), rr.len()) },
+        1
+    );
+    assert_eq!(veil_media_channel_set_screen_sharing(id, 1), 0);
+    assert_eq!(send_video_control_when_available(id, &rr), 0);
+    assert_eq!(
+        unsafe { veil_media_send_video_control_datagram(id, rr.as_ptr(), rr.len()) },
+        1
+    );
+    assert_eq!(send_when_registry_available(id, &[0x80, 111, 1, 2]), 0);
+    assert_eq!(send_when_registry_available(id, &rr), 0);
+    assert_eq!(audio_rx.try_recv().unwrap().payload, [0x80, 111, 1, 2]);
+    assert_eq!(audio_rx.try_recv().unwrap().payload, rr);
+    assert!(audio_rx.try_recv().is_err());
+    assert_eq!(camera_rx.try_recv().unwrap().payload, rr);
+    assert_eq!(screen_rx.try_recv().unwrap().payload, rr);
+    assert_eq!(
+        unsafe { veil_media_send_video_control_datagram(id, rr.as_ptr(), 3) },
+        -1
+    );
+    unsafe { veil_media_close_channel(id) };
+    assert_eq!(send_video_control_when_available(id, &rr), -1);
+    assert_eq!(ingress.enqueue_video_control(rr.to_vec().into()), -1);
+}
+
+#[tokio::test]
+async fn relay_video_control_cannot_consume_partial_frame_or_audio_capacity() {
+    let (audio, mut audio_rx) = mpsc::channel(1);
+    let (video, mut video_rx) = mpsc::channel(3);
+    let stats = Arc::new(RelayMediaStats::default());
+    let ingress = MediaIngress::new(
+        audio,
+        MediaVideoIngress::relay_frames(video, Arc::clone(&stats)),
+    );
+    assert_eq!(ingress.enqueue(vec![0x80, 111, 1, 2].into()), 0);
+    assert_eq!(ingress.enqueue(video_packet(7, false, 1).into()), 0);
+    let rr = vec![0x80, 201, 0, 1, 1, 2, 3, 4];
+    assert_eq!(ingress.enqueue_video_control(rr.clone().into()), 0);
+    assert_eq!(ingress.enqueue(video_packet(7, true, 2).into()), 0);
+    assert_eq!(video_rx.try_recv().unwrap().packets, vec![rr]);
+    assert_eq!(
+        video_rx.try_recv().unwrap().packets,
+        vec![video_packet(7, false, 1), video_packet(7, true, 2)]
+    );
+    assert_eq!(audio_rx.try_recv().unwrap().payload, [0x80, 111, 1, 2]);
+    assert!(audio_rx.try_recv().is_err());
+    assert_eq!(stats.snapshot().video_frames_enqueued, 2);
 }

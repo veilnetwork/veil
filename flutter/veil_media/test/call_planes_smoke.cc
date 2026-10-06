@@ -36,11 +36,12 @@ static std::atomic<bool> fanout_audio_passed{false};
 static std::mutex callback_mu;
 static std::map<uint64_t, Callback> callbacks;
 static std::map<uint64_t, std::set<std::pair<uint32_t, uint16_t>>> feedback;
+static std::map<uint64_t, std::set<std::pair<uint32_t, uint16_t>>> primary_feedback, secondary_feedback;
 static std::map<uint64_t, std::pair<uint32_t, uint32_t>> expected_ssrcs;
 static std::map<uint64_t, std::vector<uint8_t>> playout_wire;
-extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t len) {
-  if (chan == 90 && len >= 12) {
-    if ((p[1] & 0x7f) == 96 && hold_fanout_video.load()) {
+static int record_send(uint64_t chan, const uint8_t* p, size_t len, bool video_control) {
+  if (chan == 90 && len >= 2) {
+    if ((video_control || (p[1] & 0x7f) == 96) && hold_fanout_video.load()) {
       fanout_video_entered.store(true);
       while (hold_fanout_video.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     } else if ((p[1] & 0x7f) == 111) {
@@ -57,12 +58,19 @@ extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t 
                             uint32_t(b[10]) << 8 | b[11];
       const uint16_t base = uint16_t(b[12]) << 8 | b[13];
       feedback[chan].insert({ssrc, base});
+      (video_control ? secondary_feedback : primary_feedback)[chan].insert({ssrc, base});
     }
     if (b[1] == 204 && size == 28 && std::memcmp(b + 8, "VAP1", 4) == 0)
       playout_wire[chan] = std::vector<uint8_t>(p, p + len);
     offset += size;
   }
   return 0;
+}
+extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t len) {
+  return record_send(chan, p, len, false);
+}
+extern "C" int veil_media_send_video_control_datagram(uint64_t chan, const uint8_t* p, size_t len) {
+  return record_send(chan, p, len, true);
 }
 extern "C" int veil_media_set_recv_callback(
     uint64_t chan, void (*cb)(void*, const uint8_t*, size_t), void* ctx) {
@@ -304,9 +312,13 @@ int main() {
       {
         std::lock_guard lock(callback_mu);
         const auto [audio, video] = expected_ssrcs.at(chan);
-        for (const auto& [ssrc, base] : feedback[chan]) {
+        for (const auto& [ssrc, base] : primary_feedback[chan]) {
           audio_feedback |= ssrc == audio && base >= 1000 && base < 1004;
+          assert(ssrc != video);
+        }
+        for (const auto& [ssrc, base] : secondary_feedback[chan]) {
           video_feedback |= ssrc == video && base >= 2000 && base < 2020;
+          assert(ssrc != audio);
         }
       }
       if (enabled && audio_feedback && video_feedback) break;
@@ -727,24 +739,28 @@ int main() {
         veil_media_group_engine_create(local), veil_media_group_engine_destroy);
     assert(e);
     assert(veil_media_group_engine_add_peer(e.get(), 90, peer) == VEIL_MEDIA_OK);
-    hold_fanout_video.store(true);
-    int video_result = -1, audio_result = -1;
-    std::thread video([&] { video_result = veil_media_test_group_fanout_packet(e.get(), 1); });
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-    while (!fanout_video_entered.load() && std::chrono::steady_clock::now() < deadline)
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    const bool video_held = fanout_video_entered.load();
-    std::thread audio([&] { audio_result = veil_media_test_group_fanout_packet(e.get(), 0); });
-    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
-    while (!fanout_audio_passed.load() && std::chrono::steady_clock::now() < deadline)
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    const bool audio_while_held = fanout_audio_passed.load();
-    hold_fanout_video.store(false);
-    video.join(); audio.join();
-    assert(video_held && audio_while_held && video_result == 0 && audio_result == 0);
+    for (int kind : {1, 2}) {
+      fanout_video_entered.store(false);
+      fanout_audio_passed.store(false);
+      hold_fanout_video.store(true);
+      int video_result = -1, audio_result = -1;
+      std::thread video([&] { video_result = veil_media_test_group_fanout_packet(e.get(), kind); });
+      auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      while (!fanout_video_entered.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      const bool video_held = fanout_video_entered.load();
+      std::thread audio([&] { audio_result = veil_media_test_group_fanout_packet(e.get(), 0); });
+      deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+      while (!fanout_audio_passed.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      const bool audio_while_held = fanout_audio_passed.load();
+      hold_fanout_video.store(false);
+      video.join(); audio.join();
+      assert(video_held && audio_while_held && video_result == 0 && audio_result == 0);
+    }
     assert(veil_media_group_engine_remove_peer(e.get(), peer) == VEIL_MEDIA_OK);
     assert(veil_media_test_group_fanout_packet(e.get(), 0) != 0);
-    std::puts("group fanout: audio passed while video send was held; removed peer excluded");
+    std::puts("group fanout: audio passed while video RTP/RTCP send was held; removed peer excluded");
   }
   unsetenv("VEIL_MEDIA_TEST_VIDEO");
   assert(callbacks.empty());

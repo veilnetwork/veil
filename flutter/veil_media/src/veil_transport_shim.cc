@@ -38,6 +38,7 @@
 // into the app), so we declare them here rather than crossing the crate include.
 extern "C" {
 int veil_media_send_datagram(uint64_t chan, const uint8_t* ptr, size_t len);
+int veil_media_send_video_control_datagram(uint64_t chan, const uint8_t* ptr, size_t len);
 typedef void (*VeilMediaRecvFn)(void* ctx, const uint8_t* ptr, size_t len);
 int veil_media_set_recv_callback(uint64_t chan, VeilMediaRecvFn cb, void* ctx);
 }
@@ -203,14 +204,25 @@ bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
 
 bool VeilTransportShim::SendRtcp(std::span<const uint8_t> packet,
                                  const webrtc::PacketOptions& options) {
+  return SendRtcpOnSource(packet, options, false);
+}
+
+bool VeilTransportShim::SendVideoRtcp(std::span<const uint8_t> packet,
+                                      const webrtc::PacketOptions& options) {
+  return SendRtcpOnSource(packet, options, true);
+}
+
+bool VeilTransportShim::SendRtcpOnSource(std::span<const uint8_t> packet,
+                                         const webrtc::PacketOptions& options,
+                                         bool video) {
   (void)options;  // RTCP carries no packet_id to feed back.
   std::vector<uint8_t> compound;
   LocalAudioPlayout sample;
-  {
+  if (!video) {
     std::lock_guard lock(audio_feedback_mu_);
     sample = local_audio_playout_;
   }
-  bool append = sample.enabled && started_.load(std::memory_order_acquire);
+  bool append = !video && sample.enabled && started_.load(std::memory_order_acquire);
   // Keep RTCP's original report/SDES framing and do not append after BYE or
   // padding. Old endpoints can ignore the optional APP name (RFC 3550 §6.7).
   for (size_t offset = 0; append && offset < packet.size();) {
@@ -241,9 +253,14 @@ bool VeilTransportShim::SendRtcp(std::span<const uint8_t> packet,
                             : kUnknownPlayout);
     packet = std::span<const uint8_t>(compound);
   }
-  const int rc =
-      veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
+  const int rc = video
+      ? veil_media_send_video_control_datagram(veil_chan_, packet.data(), packet.size())
+      : veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
   if (rc == 0) {
+    if (video) {
+      outbound_video_rtcp_packet_count_.fetch_add(1, std::memory_order_relaxed);
+      outbound_video_rtcp_byte_count_.fetch_add(packet.size(), std::memory_order_relaxed);
+    }
     outbound_rtcp_packet_count_.fetch_add(1, std::memory_order_relaxed);
     outbound_rtcp_byte_count_.fetch_add(packet.size(), std::memory_order_relaxed);
     outbound_packet_count_.fetch_add(1, std::memory_order_relaxed);

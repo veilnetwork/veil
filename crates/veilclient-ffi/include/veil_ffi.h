@@ -3610,6 +3610,18 @@ uint64_t veil_media_open_relay_channel(VeilApp *app,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Enqueue video-engine RTCP on the channel's independent local video source.
+ * Screen sharing selects its independent source instead. This is endpoint
+ * scheduling only: no media role or priority is added to relay framing.
+ * Compound RTCP is validated; RTP and malformed control return -1. Admission
+ * remains nonblocking (0 queued, 1 full/busy, -1 invalid/closed), with no
+ * fallback into the audio queue when the selected source is full.
+ */
+ int veil_media_send_video_control_datagram(uint64_t chan, const uint8_t *ptr, size_t len) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Snapshot per-channel relay drain diagnostics. Direct/onion channels return
  * a zeroed snapshot. Returns -1 for an invalid channel or null output.
  */

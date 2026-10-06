@@ -19,6 +19,11 @@ extern "C" int veil_media_send_datagram(uint64_t, const uint8_t*, size_t) {
   return 0;
 }
 
+extern "C" int veil_media_send_video_control_datagram(uint64_t, const uint8_t*, size_t) {
+  sent_datagrams.fetch_add(1);
+  return 0;
+}
+
 using VeilMediaRecvFn = void (*)(void*, const uint8_t*, size_t);
 extern "C" int veil_media_set_recv_callback(uint64_t, VeilMediaRecvFn cb,
                                               void*) {
