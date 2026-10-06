@@ -25,6 +25,8 @@ extern "C" int veil_media_test_group_blocked_audio_stats(VeilGroupMediaEngine*, 
 extern "C" int veil_media_test_group_emit_rtcp(VeilGroupMediaEngine*);
 extern "C" int veil_media_test_group_fanout_packet(VeilGroupMediaEngine*, int);
 extern "C" int veil_media_test_video_bandwidth(VeilMediaEngine*);
+extern "C" int veil_media_test_direct_packet(VeilMediaEngine*, int);
+extern "C" int veil_media_test_pause_with_held_video_worker(VeilMediaEngine*, VeilGroupMediaEngine*);
 struct Callback { void (*fn)(void*, const uint8_t*, size_t); void* ctx; };
 static std::atomic<bool> hold_fanout_video{false};
 static std::atomic<bool> fanout_video_entered{false};
@@ -598,6 +600,35 @@ int main() {
     const auto initial = metric("video_tx_frames");
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
     assert(metric("video_tx_frames") - initial >= 8);
+    const auto pause = [&](int value) {
+      return room ? veil_media_group_engine_set_video_send_paused(group.get(), value)
+                  : veil_media_engine_set_video_send_paused(one.get(), value);
+    };
+    assert(pause(2) == VEIL_MEDIA_ERR_ARG);
+    assert(veil_media_test_pause_with_held_video_worker(one.get(), group.get()) == 0);
+    assert(metric("video_send_paused") == 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const auto paused_frames = metric("video_tx_frames");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    assert(metric("video_tx_frames") == paused_frames);
+    // Sending remains closed even for video already encoded by the pacer.
+    assert((room ? veil_media_test_group_fanout_packet(group.get(), 1)
+                 : veil_media_test_direct_packet(one.get(), 1)) == 1);
+    assert((room ? veil_media_test_group_fanout_packet(group.get(), 0)
+                 : veil_media_test_direct_packet(one.get(), 0)) == 0);
+    assert((room ? veil_media_test_group_emit_rtcp(group.get())
+                 : veil_media_test_direct_packet(one.get(), 2)) == 0);
+    // Resume is retried after the held worker was released; recovery keeps
+    // the same streams/SSRCs and generates a fresh keyframe.
+    auto resume_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (pause(0) != VEIL_MEDIA_OK && std::chrono::steady_clock::now() < resume_deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    assert(metric("video_send_paused") == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const auto after_resume = metric("video_tx_frames");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    assert(metric("video_tx_frames") - after_resume >= 8);
+    assert(pause(1) == VEIL_MEDIA_OK);
     assert(budget(150, 0.02) == VEIL_MEDIA_OK);
     assert(std::abs(fps() - 0.02) < 0.0001);
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -637,6 +668,7 @@ int main() {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     assert((room ? group_audio_packets(group.get(), peer) : metric("audio_rx_pkts")) == 4);
 
+    assert(pause(0) == VEIL_MEDIA_OK);
     assert(budget(8, 0.3) == VEIL_MEDIA_OK);
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     assert(metric(room ? "video_kbps" : "target_bitrate_bps") == (room ? 8 : 8000));

@@ -205,6 +205,16 @@ class VeilMediaEngine {
     return setPacketSize != null && setPacketSize(_ptr, bytes) == 0;
   }
 
+  /// Pause outbound video only; capture, preview and remote media stay live.
+  bool get supportsVideoSendPause =>
+      ffi.veilMediaEngineSetVideoSendPaused != null;
+
+  bool setVideoSendPaused(bool paused) {
+    _ensure();
+    final set = ffi.veilMediaEngineSetVideoSendPaused;
+    return set != null && set(_ptr, paused ? 1 : 0) == 0;
+  }
+
   /// Native support for budgets below 30 kbit/s and fractional fps.
   bool get supportsLowRateVideo => ffi.veilMediaEngineSetVideoBudget != null;
 
@@ -623,6 +633,16 @@ class VeilGroupMediaEngine {
   bool stopVideo() {
     _ensure();
     return ffi.veilMediaGroupEngineStopVideo(_ptr) == 0;
+  }
+
+  /// Pause outbound video only; capture, preview and remote media stay live.
+  bool get supportsVideoSendPause =>
+      ffi.veilMediaGroupEngineSetVideoSendPaused != null;
+
+  bool setVideoSendPaused(bool paused) {
+    _ensure();
+    final set = ffi.veilMediaGroupEngineSetVideoSendPaused;
+    return set != null && set(_ptr, paused ? 1 : 0) == 0;
   }
 
   /// Native support for budgets below 30 kbit/s and fractional fps.

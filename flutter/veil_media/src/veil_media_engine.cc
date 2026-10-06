@@ -328,8 +328,12 @@ class GroupFanoutTransport : public webrtc::Transport {
                     channels_.end());
   }
 
+  void SetVideoSendPaused(bool paused) { video_send_paused_.store(paused); }
+
   bool SendRtp(std::span<const uint8_t> packet,
                const webrtc::PacketOptions& options) override {
+    if (video_send_paused_.load() && veil_media::IsSecondaryInboundRtp(packet))
+      return false;
     // Membership is caller-owned opaque handles, not raw engine pointers.
     // Snapshot under a short lock; video/RTCP sends must not hold audio here.
     // A removed/closed handle rejects a late already-selected send in Veil.
@@ -371,6 +375,7 @@ class GroupFanoutTransport : public webrtc::Transport {
     return channels_;
   }
   std::atomic<uint64_t> audio_drops_{0};
+  std::atomic<bool> video_send_paused_{false};
   webrtc::Call* const call_;
   webrtc::Call* const video_call_;
   std::mutex mu_;
@@ -948,6 +953,7 @@ struct WebrtcState {
   std::unique_ptr<veil_media::ScreenCapturer> screen;  // screen-share source
   int video_target_bitrate_bps = 0;
   std::atomic<double> video_max_fps{0};
+  std::atomic<bool> video_send_paused{false};
   // Route-specific RTP packet ceiling configured before the send stream is
   // created. Relay compact mode uses 1000 so the symmetrically sealed Delivery
   // frame remains one QUIC DATAGRAM instead of a loss-amplifying fragment pair.
@@ -972,6 +978,7 @@ struct WebrtcState {
 template <typename VideoState>
 bool should_encode_video_frame(VideoState* ws) {
   if (ws == nullptr) return false;
+  if (ws->video_send_paused.load()) return false;
   const double fps = ws->video_max_fps.load(std::memory_order_relaxed);
   if (fps <= 0) return true;
   const int64_t now_us = webrtc::TimeMicros();
@@ -1042,6 +1049,7 @@ struct GroupWebrtcState {
   std::atomic<bool> test_video_run{false};
   int video_target_bitrate_bps = 0;
   std::atomic<double> video_max_fps{0};
+  std::atomic<bool> video_send_paused{false};
   std::atomic<int64_t> video_last_encoded_frame_us{0};
   std::unique_ptr<veil_media::CameraCapturer> camera;
   std::unique_ptr<veil_media::ScreenCapturer> screen;
@@ -2163,6 +2171,29 @@ static int veil_media_group_engine_apply_video_budget(VeilGroupMediaEngine* engi
 #endif
 }
 
+int veil_media_group_engine_set_video_send_paused(VeilGroupMediaEngine* engine, int paused) {
+  if (!engine || (paused != 0 && paused != 1)) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws) return VEIL_MEDIA_ERR_STATE;
+  GroupWebrtcState* ws = engine->ws.get();
+  if (paused) {
+    ws->video_send_paused.store(true);
+    ws->fanout->SetVideoSendPaused(true);
+    return VEIL_MEDIA_OK;
+  }
+  if (!ws->video_send_paused.load()) return VEIL_MEDIA_OK;
+  const bool scheduled = veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&] {
+    if (ws->video_send_stream) ws->video_send_stream->GenerateKeyFrame({});
+    ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
+    ws->fanout->SetVideoSendPaused(false);
+    ws->video_send_paused.store(false);
+  }, std::chrono::milliseconds(20));
+  return scheduled ? VEIL_MEDIA_OK : VEIL_MEDIA_ERR_STATE;
+#else
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
 int veil_media_group_engine_set_video_budget(VeilGroupMediaEngine* engine,
     int max_bitrate_kbps, double max_fps) {
   return veil_media_group_engine_apply_video_budget(engine, max_bitrate_kbps, max_fps, 1);
@@ -2268,6 +2299,7 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   snapshot += ",\"audio_playout_peers\":" + std::to_string(playout_peers) +
               ",\"audio_playout_reports\":" + std::to_string(playout_reports) +
               ",\"audio_playout_ms\":" + std::to_string(playout_ms);
+  snapshot += ",\"video_send_paused\":" + std::to_string(ws->video_send_paused.load() ? 1 : 0);
   snapshot += ",\"audio_rx_supported\":1,\"audio_receivers\":{";
   if (audio_sampled) snapshot += audio_receivers;
   snapshot += "}}";
@@ -2960,6 +2992,29 @@ static int veil_media_engine_apply_video_budget(VeilMediaEngine* engine,
   (void)max_bitrate_kbps;
   (void)max_fps;
   (void)minimum_kbps;
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
+int veil_media_engine_set_video_send_paused(VeilMediaEngine* engine, int paused) {
+  if (!engine || (paused != 0 && paused != 1)) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws) return VEIL_MEDIA_ERR_STATE;
+  WebrtcState* ws = engine->ws.get();
+  if (paused) {
+    ws->video_send_paused.store(true);
+    ws->shim->SetVideoSendPaused(true);
+    return VEIL_MEDIA_OK;
+  }
+  if (!ws->video_send_paused.load()) return VEIL_MEDIA_OK;
+  const bool scheduled = veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&] {
+    if (ws->video_send_stream) ws->video_send_stream->GenerateKeyFrame({});
+    ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
+    ws->shim->SetVideoSendPaused(false);
+    ws->video_send_paused.store(false);
+  }, std::chrono::milliseconds(20));
+  return scheduled ? VEIL_MEDIA_OK : VEIL_MEDIA_ERR_STATE;
+#else
   return VEIL_MEDIA_ERR_STATE;
 #endif
 }
@@ -3691,7 +3746,9 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
            "minimal shape rather than a truncated object",
            sizeof(json), written);
     } else {
-      return dup_cstr(json);
+      std::string snapshot(json, static_cast<size_t>(written) - 1);
+      snapshot += ",\"video_send_paused\":" + std::to_string(ws->video_send_paused.load() ? 1 : 0) + "}";
+      return dup_cstr(snapshot.c_str());
     }
   }
 #endif
