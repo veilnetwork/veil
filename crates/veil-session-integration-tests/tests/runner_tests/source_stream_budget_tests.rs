@@ -380,3 +380,119 @@ async fn local_lossy_sources_keep_complete_bursts_on_an_encrypted_stream_hop() {
         sources[0]
     );
 }
+
+/// Use the real proxy producer and source credit adapter. A stream-only hop
+/// must admit fresh primary traffic without committing a 64-KiB proxy write
+/// ahead of it, and must retain every byte and the final close in order.
+#[tokio::test]
+async fn actual_proxy_bridge_yields_to_primary_on_encrypted_ordered_fallback() {
+    use std::sync::RwLock;
+    use tokio::io::AsyncWriteExt;
+    const SIZE: usize = 256 * 1024;
+    let expected: Vec<_> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+    let peer = [2; 32];
+    let registry = Arc::new(RwLock::new(veil_session::SessionTxRegistry::with_capacity(
+        32,
+    )));
+    let outbox = registry.write().unwrap().register(peer);
+    let primary = realtime_media_frame;
+    assert!(registry.read().unwrap().send_to(&peer, 0, primary()));
+    let (_, dummy_rx) = mpsc::channel(1);
+    let (stream, mut receiver) = tokio::io::duplex(4096);
+    let key = [0x32; 32];
+    let mut runner = make_mobility_blackhole_runner(dummy_rx);
+    runner.outbox = Some(outbox);
+    runner.stream = Box::new(stream);
+    runner.crypto.tx_cipher = Some(SessionCipher::new(&key, true));
+    let runner_task = tokio::spawn(async move { runner.run().await });
+    let broadcaster = Arc::new(veil_session::glue::SessionTxBroadcaster::new(
+        registry.clone(),
+    ));
+    let (mut app, inner) = tokio::io::duplex(65536);
+    let (_data_tx, data_rx) = mpsc::channel(4);
+    let bridge = tokio::spawn(veil_proxy::run_server_bridge(
+        inner,
+        data_rx,
+        peer,
+        42,
+        broadcaster,
+    ));
+    let data = expected.clone();
+    let writer = tokio::spawn(async move {
+        app.write_all(&data).await.unwrap();
+        app.shutdown().await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(registry.read().unwrap().send_to(&peer, 0, primary()));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut cipher = SessionCipher::new(&key, true);
+        let mut wire_bytes = 0;
+        let mut primary_count = 0;
+        let mut second_primary_at = None;
+        let mut received = Vec::new();
+        let mut closed = false;
+        while !closed || primary_count < 2 {
+            let mut header_bytes = [0; HEADER_SIZE];
+            receiver.read_exact(&mut header_bytes).await.unwrap();
+            let header = decode_header(&header_bytes).unwrap();
+            let mut encrypted = vec![0; header.body_len as usize];
+            receiver.read_exact(&mut encrypted).await.unwrap();
+            wire_bytes += HEADER_SIZE + encrypted.len();
+            let body = cipher
+                .open(&encrypted, &veil_proto::codec::frame_aad(&header))
+                .unwrap();
+            if header.family == FrameFamily::Session as u8 {
+                assert_eq!(header.msg_type, SessionMsg::Padding as u16);
+            } else if header.msg_type == AppMsg::AppRtData as u16 {
+                assert_eq!(header.family, FrameFamily::App as u8);
+                assert_eq!(body, [0xEE; 48]);
+                primary_count += 1;
+                if primary_count == 2 {
+                    second_primary_at = Some(wire_bytes);
+                }
+            } else {
+                assert_eq!(header.family, FrameFamily::App as u8);
+                assert_eq!(header.stream_id, 42);
+                assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+                assert!(
+                    HEADER_SIZE + encrypted.len() <= 4096,
+                    "oversized proxy wire frame"
+                );
+                if header.msg_type == AppMsg::AppData as u16 {
+                    assert!(!closed);
+                    let segment = veil_proto::AppDataPayload::decode(&body).unwrap();
+                    assert_eq!(segment.app_id, veil_proxy::EXIT_PROXY_APP_ID);
+                    assert_eq!(segment.endpoint_id, veil_proxy::EXIT_PROXY_ENDPOINT_ID);
+                    assert_eq!(segment.seq, 0);
+                    received.extend(segment.data);
+                } else {
+                    assert_eq!(header.msg_type, AppMsg::AppClose as u16);
+                    assert!(!closed);
+                    closed = true;
+                    assert_eq!(
+                        received, expected,
+                        "proxy completeness/order/no repeated prefix"
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(4)).await;
+        }
+        assert!(
+            second_primary_at.unwrap() < 16 * 1024,
+            "proxy committed too much before primary: {second_primary_at:?}"
+        );
+    })
+    .await;
+    runner_task.abort();
+    let _ = runner_task.await;
+    if result.is_err() {
+        bridge.abort();
+        writer.abort();
+    }
+    let bridge_result = bridge.await;
+    let writer_result = writer.await;
+    assert!(result.is_ok(), "proxy did not resume without new input");
+    bridge_result.unwrap();
+    writer_result.unwrap();
+}

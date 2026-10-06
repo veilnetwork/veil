@@ -81,6 +81,8 @@ const OPEN_RECEIPT_TIMEOUT: Duration = Duration::from_secs(10);
 const OPEN_ROUTE_RETRY_ATTEMPTS: usize = 120;
 const OPEN_ROUTE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
+const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// per-bridge duplex buffer size — pulled from
 /// `veil_proto::budget::PROXY_DUPLEX_BUF_SIZE`. Was 256 KiB locally;
 /// reduced to 64 KiB to bound aggregate memory at 256 × 64 KiB = 16 MiB
@@ -247,19 +249,29 @@ impl ProxyConnector for VeilConnector {
         let mut frame = encode_header(&hdr).to_vec();
         frame.extend_from_slice(&body);
 
-        let mut sent = false;
-        for attempt in 0..OPEN_ROUTE_RETRY_ATTEMPTS {
-            if self
-                .broadcaster
-                .send_to(&exit_node_id, priority::INTERACTIVE, frame.clone())
-            {
-                sent = true;
-                break;
-            }
-            if attempt + 1 < OPEN_ROUTE_RETRY_ATTEMPTS {
-                tokio::time::sleep(OPEN_ROUTE_RETRY_INTERVAL).await;
-            }
-        }
+        // Bound route discovery AND source backpressure by the original open
+        // budget. All stream lifecycle frames use the same local source lane;
+        // the wire header remains neutral INTERACTIVE.
+        let sent = timeout(
+            OPEN_ROUTE_RETRY_INTERVAL * OPEN_ROUTE_RETRY_ATTEMPTS as u32,
+            async {
+                for attempt in 0..OPEN_ROUTE_RETRY_ATTEMPTS {
+                    if self
+                        .broadcaster
+                        .send_reliable_to(&exit_node_id, frame.clone())
+                        .await
+                    {
+                        return true;
+                    }
+                    if attempt + 1 < OPEN_ROUTE_RETRY_ATTEMPTS {
+                        tokio::time::sleep(OPEN_ROUTE_RETRY_INTERVAL).await;
+                    }
+                }
+                false
+            },
+        )
+        .await
+        .unwrap_or(false);
         if !sent {
             cleanup_regs();
             return Err(Socks5Error::ConnectFailed(
@@ -435,18 +447,18 @@ async fn run_client_bridge(
 
     // ── Outbound: duplex read → veil APP_DATA ──────────────────────────────
     // Send the initial proxy-connect header first.
-    if !initial_data.is_empty() {
-        send_app_data(broadcaster.as_ref(), &peer_id, stream_id, &initial_data);
-    }
-
-    let mut buf = vec![0u8; 65536];
-    loop {
-        let n = match ir.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        if !send_app_data(broadcaster.as_ref(), &peer_id, stream_id, &buf[..n]) {
-            break;
+    if initial_data.is_empty()
+        || send_app_data(broadcaster.as_ref(), &peer_id, stream_id, &initial_data).await
+    {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = match ir.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if !send_app_data(broadcaster.as_ref(), &peer_id, stream_id, &buf[..n]).await {
+                break;
+            }
         }
     }
 
@@ -457,51 +469,73 @@ async fn run_client_bridge(
         .remove(&(peer_id, stream_id));
 
     // Send APP_CLOSE.
-    send_app_close(broadcaster.as_ref(), &peer_id, stream_id);
+    send_app_close(broadcaster.as_ref(), &peer_id, stream_id).await;
 
     iw_task.abort();
+    let _ = iw_task.await;
 }
 
 // ── Frame encoding helpers ────────────────────────────────────────────────────
 
-/// Encode and send an APP_DATA frame. Returns `false` if the session is gone.
-fn send_app_data(
+/// Packetize one proxy byte-stream write with one overall admission deadline.
+/// Partial failure stops here; callers close instead of replaying the prefix.
+async fn send_app_data(
     broadcaster: &dyn FrameBroadcaster,
     peer_id: &[u8; 32],
     stream_id: u32,
     data: &[u8],
 ) -> bool {
-    let payload = AppDataPayload {
-        app_id: EXIT_PROXY_APP_ID,
-        endpoint_id: EXIT_PROXY_ENDPOINT_ID,
-        seq: 0, // ordering maintained by the underlying session transport
-        data: data.to_vec(),
-    };
-    let body = payload.encode();
-    let mut hdr = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppData as u16);
-    hdr.body_len = body.len() as u32;
-    hdr.stream_id = stream_id;
-    hdr.set_priority(priority::INTERACTIVE);
-    let mut frame = encode_header(&hdr).to_vec();
-    frame.extend_from_slice(&body);
-    broadcaster.send_to(peer_id, priority::INTERACTIVE, frame)
+    timeout(STREAM_WRITE_TIMEOUT, async {
+        let mut offset = 0;
+        loop {
+            let end = data
+                .len()
+                .min(offset + veil_proto::budget::LOCAL_PROXY_STREAM_SEGMENT_DATA_BYTES);
+            let body = AppDataPayload {
+                app_id: EXIT_PROXY_APP_ID,
+                endpoint_id: EXIT_PROXY_ENDPOINT_ID,
+                seq: 0,
+                data: data[offset..end].to_vec(),
+            }
+            .encode();
+            let frame = app_frame(stream_id, AppMsg::AppData, &body);
+            if !broadcaster.send_reliable_to(peer_id, frame).await {
+                return false;
+            }
+            offset = end;
+            if offset == data.len() {
+                return true;
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Encode and send an APP_CLOSE frame.
-fn send_app_close(broadcaster: &dyn FrameBroadcaster, peer_id: &[u8; 32], stream_id: u32) {
+async fn send_app_close(broadcaster: &dyn FrameBroadcaster, peer_id: &[u8; 32], stream_id: u32) {
     let payload = AppClosePayload {
         app_id: EXIT_PROXY_APP_ID,
         endpoint_id: EXIT_PROXY_ENDPOINT_ID,
         reason: close_reason::NORMAL,
     };
     let body = payload.encode();
-    let mut hdr = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppClose as u16);
+    let frame = app_frame(stream_id, AppMsg::AppClose, &body);
+    let _ = timeout(
+        STREAM_WRITE_TIMEOUT,
+        broadcaster.send_reliable_to(peer_id, frame),
+    )
+    .await;
+}
+
+fn app_frame(stream_id: u32, msg: AppMsg, body: &[u8]) -> Vec<u8> {
+    let mut hdr = FrameHeader::new(FrameFamily::App as u8, msg as u16);
     hdr.body_len = body.len() as u32;
     hdr.stream_id = stream_id;
     hdr.set_priority(priority::INTERACTIVE);
     let mut frame = encode_header(&hdr).to_vec();
-    frame.extend_from_slice(&body);
-    broadcaster.send_to(peer_id, priority::INTERACTIVE, frame);
+    frame.extend_from_slice(body);
+    frame
 }
 
 // ── Server-side bridge task (exit node) ──────────────────────────────────────
@@ -548,13 +582,16 @@ pub async fn run_server_bridge(
             &initiator_peer_id,
             stream_id,
             &buf[..n],
-        ) {
+        )
+        .await
+        {
             break;
         }
     }
 
-    send_app_close(broadcaster.as_ref(), &initiator_peer_id, stream_id);
+    send_app_close(broadcaster.as_ref(), &initiator_peer_id, stream_id).await;
     iw_task.abort();
+    let _ = iw_task.await;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -636,6 +673,223 @@ mod tests {
         fn active_node_ids(&self) -> Vec<[u8; 32]> {
             Vec::new()
         }
+    }
+
+    #[tokio::test]
+    async fn connect_preserves_open_header_data_close_order_and_consumes_ready() {
+        struct Exit {
+            sent: mpsc::UnboundedSender<(u8, Vec<u8>)>,
+        }
+        impl FrameBroadcaster for Exit {
+            fn send_to(&self, _: &[u8; 32], lane: u8, frame: Vec<u8>) -> bool {
+                self.sent.send((lane, frame)).is_ok()
+            }
+            fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+            fn active_node_ids(&self) -> Vec<[u8; 32]> {
+                Vec::new()
+            }
+        }
+        let pending: PendingReceiptMap = Arc::default();
+        let rx: VeilStreamRxMap = Arc::default();
+        let (sent, mut frames) = mpsc::unbounded_channel();
+        let conn = VeilConnector::new(
+            Arc::new(Exit { sent }),
+            [0; 32],
+            [1; 32],
+            pending.clone(),
+            rx.clone(),
+            Arc::new(AtomicU32::new(0)),
+        );
+        let exit_task = tokio::spawn(async move {
+            let mut types = Vec::new();
+            let mut user_bytes = Vec::new();
+            loop {
+                let (lane, frame) = frames.recv().await.unwrap();
+                let header = decode_header(&frame).unwrap();
+                assert_eq!(lane, priority::BACKGROUND);
+                assert_eq!(header.priority(), priority::INTERACTIVE);
+                types.push(header.msg_type);
+                let key = ([2; 32], header.stream_id);
+                if header.msg_type == AppMsg::AppOpen as u16 {
+                    pending
+                        .lock()
+                        .unwrap()
+                        .remove(&key)
+                        .unwrap()
+                        .send(veil_proto::app::receipt_status::ACCEPTED)
+                        .unwrap();
+                } else if header.msg_type == AppMsg::AppData as u16 {
+                    let data = AppDataPayload::decode(&frame[HEADER_SIZE..]).unwrap().data;
+                    if types.len() == 2 {
+                        assert_eq!(data, encode_proxy_header("example.com", 443));
+                        let inbound = rx.lock().unwrap().get(&key).unwrap().clone();
+                        inbound.send(b"\x00ready payload".to_vec()).await.unwrap();
+                    } else {
+                        user_bytes.extend(data);
+                    }
+                } else {
+                    assert_eq!(header.msg_type, AppMsg::AppClose as u16);
+                    assert!(!rx.lock().unwrap().contains_key(&key));
+                    assert_eq!(user_bytes, b"user payload");
+                    assert_eq!(
+                        types,
+                        vec![
+                            AppMsg::AppOpen as u16,
+                            AppMsg::AppData as u16,
+                            AppMsg::AppData as u16,
+                            AppMsg::AppClose as u16
+                        ]
+                    );
+                    break;
+                }
+            }
+        });
+        timeout(Duration::from_secs(2), async {
+            let stream = conn
+                .connect(
+                    [2; 32],
+                    &crate::socks5::ProxyDestination::tcp("example.com", 443),
+                )
+                .await
+                .unwrap();
+            let (mut reader, mut writer) = stream.split();
+            let mut ready_payload = [0; 13];
+            reader.read_exact(&mut ready_payload).await.unwrap();
+            assert_eq!(&ready_payload, b"ready payload");
+            writer.write_all(b"user payload").await.unwrap();
+            writer.shutdown().await.unwrap();
+            exit_task.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_write_segments_reassemble_and_do_not_expose_local_lane() {
+        let sink = RecordingBroadcaster::default();
+        let data: Vec<_> = (0..67_000).map(|i| (i % 251) as u8).collect();
+        assert!(send_app_data(&sink, &[4; 32], 42, &data).await);
+        let frames = sink.drain();
+        assert!(frames.len() > 1);
+        let mut decoded = Vec::new();
+        for (lane, bytes) in frames {
+            assert_eq!(lane, priority::BACKGROUND);
+            let hdr = decode_header(&bytes).unwrap();
+            assert_eq!(hdr.priority(), priority::INTERACTIVE);
+            assert_eq!(hdr.stream_id, 42);
+            assert_eq!(hdr.msg_type, AppMsg::AppData as u16);
+            let payload = AppDataPayload::decode(&bytes[HEADER_SIZE..]).unwrap();
+            assert_eq!(payload.app_id, EXIT_PROXY_APP_ID);
+            assert_eq!(payload.endpoint_id, EXIT_PROXY_ENDPOINT_ID);
+            assert_eq!(payload.seq, 0);
+            assert!(
+                payload.data.len() <= veil_proto::budget::LOCAL_PROXY_STREAM_SEGMENT_DATA_BYTES
+            );
+            decoded.extend(payload.data);
+        }
+        assert_eq!(decoded, data);
+        assert!(send_app_data(&sink, &[4; 32], 42, &[]).await);
+        let empty = sink.drain();
+        assert_eq!(empty.len(), 1);
+        assert!(
+            AppDataPayload::decode(&empty[0].1[HEADER_SIZE..])
+                .unwrap()
+                .data
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_proxy_write_stops_without_replaying_accepted_prefix() {
+        struct FailSecond {
+            attempts: StdMutex<Vec<Vec<u8>>>,
+        }
+        impl FrameBroadcaster for FailSecond {
+            fn send_to(&self, _: &[u8; 32], lane: u8, data: Vec<u8>) -> bool {
+                assert_eq!(lane, priority::BACKGROUND);
+                let mut attempts = self.attempts.lock().unwrap();
+                attempts.push(data);
+                attempts.len() != 2
+            }
+            fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+            fn active_node_ids(&self) -> Vec<[u8; 32]> {
+                Vec::new()
+            }
+        }
+        let sink = FailSecond {
+            attempts: StdMutex::new(Vec::new()),
+        };
+        let data: Vec<_> = (0..8000).map(|i| (i % 251) as u8).collect();
+        assert!(!send_app_data(&sink, &[4; 32], 42, &data).await);
+        let attempts = sink.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        for (index, frame) in attempts.iter().enumerate() {
+            let payload = AppDataPayload::decode(&frame[HEADER_SIZE..]).unwrap();
+            let begin = index * veil_proto::budget::LOCAL_PROXY_STREAM_SEGMENT_DATA_BYTES;
+            assert_eq!(payload.data, data[begin..begin + payload.data.len()]);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_initial_proxy_header_closes_before_user_bytes() {
+        struct FailHeader {
+            frames: RecordingBroadcaster,
+        }
+        impl FrameBroadcaster for FailHeader {
+            fn send_to(&self, peer: &[u8; 32], lane: u8, data: Vec<u8>) -> bool {
+                let accepted = decode_header(&data).unwrap().msg_type == AppMsg::AppClose as u16;
+                self.frames.send_to(peer, lane, data);
+                accepted
+            }
+            fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+            fn active_node_ids(&self) -> Vec<[u8; 32]> {
+                Vec::new()
+            }
+        }
+        let sink = Arc::new(FailHeader {
+            frames: RecordingBroadcaster::default(),
+        });
+        let (mut client, inner) = tokio::io::duplex(256);
+        client
+            .write_all(b"must not follow failed header")
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        let map = Arc::new(Mutex::new(HashMap::from([(([4; 32], 42), tx)])));
+        timeout(
+            Duration::from_secs(1),
+            run_client_bridge(
+                inner,
+                rx,
+                [4; 32],
+                42,
+                [1; 32],
+                sink.clone(),
+                map.clone(),
+                b"header".to_vec(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(map.lock().unwrap().is_empty());
+        let frames = sink.frames.drain();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            AppDataPayload::decode(&frames[0].1[HEADER_SIZE..])
+                .unwrap()
+                .data,
+            b"header"
+        );
+        assert_eq!(
+            decode_header(&frames[1].1).unwrap().msg_type,
+            AppMsg::AppClose as u16
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|(lane, frame)| *lane == priority::BACKGROUND
+                    && decode_header(frame).unwrap().priority() == priority::INTERACTIVE)
+        );
     }
 
     /// BridgeSlot enforces `MAX_PROXY_BRIDGES`.
