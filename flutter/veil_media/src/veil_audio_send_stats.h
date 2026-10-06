@@ -10,6 +10,13 @@ namespace veil_media {
 struct AudioSendSnapshot {
   uint64_t attempts = 0;
   uint64_t queued = 0;
+  uint64_t payload_packets = 0;
+  uint64_t padding_packets = 0;
+  uint64_t payload_bytes = 0;
+  uint64_t padding_bytes = 0;
+  uint64_t unclassified_packets = 0;
+  int64_t payload_age_ms = -1;
+  int64_t max_payload_gap_ms = 0;
   int64_t age_ms = -1;
   int64_t queue_age_ms = -1;
   int64_t max_gap_ms = 0;
@@ -33,6 +40,39 @@ class AudioSendStats {
     const int64_t previous = last_attempt_ns_.exchange(now_ns, std::memory_order_relaxed);
     if (previous > 0 && now_ns >= previous) raise(max_gap_ns_, now_ns - previous);
     attempts_.fetch_add(1, std::memory_order_relaxed);
+    // BWE padding shares the Opus payload type and SSRC, but contains no
+    // encoded audio. Count it separately so probes cannot make the encoder
+    // appear active or hide a real capture gap. No payload data is retained.
+    size_t header = 12 + (packet[0] & 0x0f) * 4;
+    bool valid = header <= packet.size();
+    if (valid && (packet[0] & 0x10)) {
+      if (packet.size() - header < 4) {
+        valid = false;
+      } else {
+        const size_t words = size_t(packet[header + 2]) * 256 + packet[header + 3];
+        header += 4 + words * 4;
+        valid = header <= packet.size();
+      }
+    }
+    const size_t padding = (packet[0] & 0x20) ? packet.back() : 0;
+    if (valid && (packet[0] & 0x20))
+      valid = padding > 0 && padding <= packet.size() - header;
+    if (!valid) {
+      unclassified_packets_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      const size_t payload = packet.size() - header - padding;
+      padding_bytes_.fetch_add(padding, std::memory_order_relaxed);
+      if (payload == 0) {
+        padding_packets_.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        payload_packets_.fetch_add(1, std::memory_order_relaxed);
+        payload_bytes_.fetch_add(payload, std::memory_order_relaxed);
+        const int64_t previous_payload =
+            last_payload_ns_.exchange(now_ns, std::memory_order_relaxed);
+        if (previous_payload > 0 && now_ns >= previous_payload)
+          raise(max_payload_gap_ns_, now_ns - previous_payload);
+      }
+    }
     return true;
   }
 
@@ -49,6 +89,13 @@ class AudioSendStats {
     return {
         attempts_.load(std::memory_order_relaxed),
         queued_.load(std::memory_order_relaxed),
+        payload_packets_.load(std::memory_order_relaxed),
+        padding_packets_.load(std::memory_order_relaxed),
+        payload_bytes_.load(std::memory_order_relaxed),
+        padding_bytes_.load(std::memory_order_relaxed),
+        unclassified_packets_.load(std::memory_order_relaxed),
+        age(last_payload_ns_.load(std::memory_order_relaxed), now_ns),
+        max_payload_gap_ns_.load(std::memory_order_relaxed) / 1'000'000,
         age(last_attempt_ns_.load(std::memory_order_relaxed), now_ns),
         age(last_queued_ns_.load(std::memory_order_relaxed), now_ns),
         max_gap_ns_.load(std::memory_order_relaxed) / 1'000'000,
@@ -67,6 +114,9 @@ class AudioSendStats {
   }
   std::atomic<uint64_t> attempts_{0};
   std::atomic<uint64_t> queued_{0};
+  std::atomic<uint64_t> payload_packets_{0}, padding_packets_{0};
+  std::atomic<uint64_t> payload_bytes_{0}, padding_bytes_{0}, unclassified_packets_{0};
+  std::atomic<int64_t> last_payload_ns_{0}, max_payload_gap_ns_{0};
   std::atomic<int64_t> last_attempt_ns_{0};
   std::atomic<int64_t> last_queued_ns_{0};
   std::atomic<int64_t> max_gap_ns_{0};
