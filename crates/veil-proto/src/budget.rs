@@ -1006,6 +1006,11 @@ pub const MAX_NEW_ROUTES_PER_PEER_PER_WINDOW: u32 = 20;
 /// Relays keep their neutral FIFO/WRR; no application role is transmitted.
 pub const LOCAL_STREAM_SEGMENT_DATA_BYTES: usize = 3900;
 
+/// Proxy streams may wrap AppData in an ML-KEM Delivery envelope before the
+/// first ordered hop. Leave room for that wrapper as well as hop AEAD/padding
+/// in the 4096-byte bucket. Endpoint recommendation, not a wire receive limit.
+pub const LOCAL_PROXY_STREAM_SEGMENT_DATA_BYTES: usize = 2500;
+
 /// Maximum bytes per chunk body inside a `ChunkPayload` frame (64 KiB).
 ///
 /// Chosen to fit a chunk + frame header comfortably within the 1 MiB default

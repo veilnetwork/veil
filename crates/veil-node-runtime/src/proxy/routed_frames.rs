@@ -39,6 +39,8 @@ const RESPONSE_RETRY_ATTEMPTS: usize = 50;
 const RESPONSE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const MAX_PENDING_RESPONSES: usize = 256;
 
+type RoutedFrames = Vec<([u8; 32], Vec<u8>)>;
+
 fn build_routed_envelope(
     sender: [u8; 32],
     destination: [u8; 32],
@@ -142,19 +144,24 @@ impl RoutedFrameBroadcaster {
         }
     }
 
-    fn send_routed(&self, destination: &[u8; 32], priority: u8, frame: Vec<u8>) -> bool {
+    fn prepare_routed(
+        &self,
+        destination: &[u8; 32],
+        priority: u8,
+        frame: &[u8],
+    ) -> Option<RoutedFrames> {
         // This internal transport is intentionally limited to the APP family;
         // it must never become a generic bypass around family-specific relay
         // admission and abuse controls.
-        let Ok(header) = decode_header(&frame) else {
+        let Ok(header) = decode_header(frame) else {
             log::warn!("proxy.routed.invalid_app_frame reason=header");
-            return false;
+            return None;
         };
         if header.family != FrameFamily::App as u8
             || frame.len() != HEADER_SIZE.saturating_add(header.body_len as usize)
         {
             log::warn!("proxy.routed.invalid_app_frame reason=shape");
-            return false;
+            return None;
         }
 
         // A routed proxy frame is never allowed to fall back to plaintext.
@@ -171,22 +178,20 @@ impl RoutedFrameBroadcaster {
             // bounded retry observe the write-through cache on completion.
             self.resolve_key_once(*destination);
             self.signal_route_discovery(*destination, priority);
-            return false;
+            return None;
         };
-        let Some(envelope) = build_routed_envelope(
+        let envelope = build_routed_envelope(
             self.dispatcher.local_node_id,
             *destination,
             &recipient_ek,
-            &frame,
-        ) else {
-            return false;
-        };
+            frame,
+        )?;
         let envelope_bytes = envelope.encode();
 
         let mut hops = rlock!(self.dispatcher.route_cache).lookup_all(destination);
         if hops.is_empty() {
             self.signal_route_discovery(*destination, priority);
-            return false;
+            return None;
         }
         // RouteCache normally returns the best path first. Avoid retrying the
         // final peer immediately after the direct send above already failed;
@@ -195,27 +200,25 @@ impl RoutedFrameBroadcaster {
         hops.dedup();
         if hops.is_empty() {
             self.signal_route_discovery(*destination, priority);
-            return false;
+            return None;
         }
-        let suffix_len = 8 + 1; // trace_id + relay_hops
-        let body_len = 32 + envelope_bytes.len() + suffix_len;
-        let mut routed_header =
-            FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
-        routed_header.body_len = body_len as u32;
+        Some(
+            hops.into_iter()
+                .map(|hop| (hop, routed_frame(hop, &envelope_bytes)))
+                .collect(),
+        )
+    }
 
-        for hop in hops {
-            let mut routed = Vec::with_capacity(HEADER_SIZE + body_len);
-            routed.extend_from_slice(&encode_header(&routed_header));
-            routed.extend_from_slice(&hop);
-            routed.extend_from_slice(&envelope_bytes);
-            routed.extend_from_slice(&0u64.to_be_bytes());
-            routed.push(0); // locally originated: no relay traversed yet
+    fn send_routed(&self, destination: &[u8; 32], priority: u8, frame: Vec<u8>) -> bool {
+        let Some(frames) = self.prepare_routed(destination, priority, &frame) else {
+            return false;
+        };
+        for (hop, routed) in frames {
             if self.direct.send_to(&hop, priority, routed) {
                 return true;
             }
             wlock!(self.dispatcher.route_cache).invalidate_hop(destination, &hop);
         }
-
         self.signal_route_discovery(*destination, priority);
         false
     }
@@ -237,6 +240,38 @@ impl FrameBroadcaster for RoutedFrameBroadcaster {
         self.send_routed(peer_id, priority, bytes)
     }
 
+    fn send_reliable_to<'a>(
+        &'a self,
+        destination: &'a [u8; 32],
+        frame: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            // This is an endpoint's own proxy stream, never transit admission.
+            // Clone before the await so a disappeared direct session can fall
+            // back without replaying an already accepted prefix. No locks wait.
+            if self
+                .direct
+                .send_reliable_to(destination, frame.clone())
+                .await
+            {
+                return true;
+            }
+            let Some(frames) =
+                self.prepare_routed(destination, veil_proto::priority::BACKGROUND, &frame)
+            else {
+                return false;
+            };
+            for (hop, routed) in frames {
+                if self.direct.send_reliable_to(&hop, routed).await {
+                    return true;
+                }
+                wlock!(self.dispatcher.route_cache).invalidate_hop(destination, &hop);
+            }
+            self.signal_route_discovery(*destination, veil_proto::priority::BACKGROUND);
+            false
+        })
+    }
+
     fn send_to_all_with_priority(&self, priority: u8, bytes: Arc<[u8]>) {
         self.direct.send_to_all_with_priority(priority, bytes);
     }
@@ -244,6 +279,20 @@ impl FrameBroadcaster for RoutedFrameBroadcaster {
     fn active_node_ids(&self) -> Vec<[u8; 32]> {
         self.direct.active_node_ids()
     }
+}
+
+fn routed_frame(hop: [u8; 32], envelope_bytes: &[u8]) -> Vec<u8> {
+    let body_len = 32 + envelope_bytes.len() + 8 + 1;
+    let mut header = FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+    header.set_priority(veil_proto::priority::INTERACTIVE);
+    header.body_len = body_len as u32;
+    let mut frame = Vec::with_capacity(HEADER_SIZE + body_len);
+    frame.extend_from_slice(&encode_header(&header));
+    frame.extend_from_slice(&hop);
+    frame.extend_from_slice(envelope_bytes);
+    frame.extend_from_slice(&0u64.to_be_bytes());
+    frame.push(0);
+    frame
 }
 
 /// Spawn the endpoint that unwraps routed raw APP frames on every node.
@@ -349,6 +398,172 @@ mod tests {
             flags: 0,
         };
         assert!(!payload.encode().is_empty());
+    }
+
+    struct NoResolver;
+    impl veil_types::MlKemEkResolver for NoResolver {
+        fn resolve_cert(
+            &self,
+            _: [u8; 32],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<veil_types::VerifiedPeerCert>> + Send + '_>,
+        > {
+            Box::pin(async { None })
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_source_backpressure_waits_without_invalidating_route_or_blocking_primary() {
+        use std::time::Duration;
+        for direct in [true, false] {
+            let destination = [2; 32];
+            let relay = [3; 32];
+            let first = if direct { destination } else { relay };
+            let registry = Arc::new(RwLock::new(SessionTxRegistry::with_capacity(1)));
+            let mut outbox = registry.write().unwrap().register(first);
+            let mut alternate = if direct {
+                Some(registry.write().unwrap().register(relay))
+            } else {
+                None
+            };
+            let dispatcher = Arc::new(veil_dispatcher::make_test_dispatcher(
+                veil_cfg::NodeRole::Core,
+            ));
+            let (ek, dk) = veil_e2e::generate_keypair();
+            dispatcher.crypto.peer_mlkem_keys.write().unwrap().insert(
+                destination,
+                (
+                    veil_e2e::PeerMlKemKey::signed_until(
+                        ek.to_vec(),
+                        veil_util::unix_secs_now_u64() + 60,
+                    ),
+                    std::time::Instant::now(),
+                ),
+            );
+            dispatcher
+                .route_cache
+                .write()
+                .unwrap()
+                .insert(destination, relay, 1, 2);
+            let sender = RoutedFrameBroadcaster::new(
+                registry.clone(),
+                dispatcher.clone(),
+                Arc::new(NoResolver),
+            );
+            let body = veil_proto::app::AppDataPayload {
+                app_id: veil_proxy::EXIT_PROXY_APP_ID,
+                endpoint_id: 0,
+                seq: 0,
+                data: vec![7; 2500],
+            }
+            .encode();
+            let mut header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppData as u16);
+            header.body_len = body.len() as u32;
+            header.set_priority(veil_proto::priority::INTERACTIVE);
+            let mut frame = encode_header(&header).to_vec();
+            frame.extend(body);
+            assert!(registry.read().unwrap().send_to(
+                &first,
+                veil_proto::priority::BACKGROUND,
+                frame.clone()
+            ));
+            let mut pending = sender.send_reliable_to(&destination, frame.clone());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut pending)
+                    .await
+                    .is_err(),
+                "full source queue must wait, not route away or fail"
+            );
+            assert!(
+                registry.try_write().is_ok(),
+                "no registry lock across source wait"
+            );
+            assert_eq!(
+                dispatcher
+                    .route_cache
+                    .read()
+                    .unwrap()
+                    .lookup_all(&destination),
+                vec![relay]
+            );
+            let mut control = FrameHeader::new(
+                FrameFamily::Control as u8,
+                veil_proto::family::ControlMsg::Keepalive as u16,
+            );
+            control.set_priority(veil_proto::priority::INTERACTIVE);
+            let control = encode_header(&control).to_vec();
+            assert!(registry.read().unwrap().send_to(
+                &first,
+                veil_proto::priority::REALTIME,
+                control.clone()
+            ));
+            assert_eq!(&*outbox.recv().await.unwrap().1, control);
+            assert_eq!(&*outbox.recv().await.unwrap().1, frame);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), pending)
+                    .await
+                    .unwrap()
+            );
+            let (lane, admitted) = outbox.recv().await.unwrap();
+            assert_eq!(lane, veil_proto::priority::BACKGROUND);
+            assert_eq!(
+                decode_header(&admitted).unwrap().priority(),
+                veil_proto::priority::INTERACTIVE
+            );
+            if direct {
+                assert_eq!(&*admitted, frame);
+                assert!(
+                    alternate.as_mut().unwrap().try_recv().is_err(),
+                    "no duplicate fallback while direct queue is full"
+                );
+            } else {
+                let forwarded =
+                    veil_proto::delivery::ForwardPayload::decode(&admitted[HEADER_SIZE..]).unwrap();
+                let e2e =
+                    veil_proto::E2eEnvelope::decode(&forwarded.envelope.payload[1..]).unwrap();
+                assert_eq!(
+                    veil_e2e::decrypt(&dk, &dispatcher.local_node_id, &destination, &e2e).unwrap(),
+                    frame
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn maximal_proxy_segment_keeps_encrypted_first_hop_in_one_4k_bucket() {
+        let sender = [0x11; 32];
+        let destination = [0x22; 32];
+        let (ek, dk) = veil_e2e::generate_keypair();
+        let body = veil_proto::app::AppDataPayload {
+            app_id: veil_proxy::EXIT_PROXY_APP_ID,
+            endpoint_id: veil_proxy::EXIT_PROXY_ENDPOINT_ID,
+            seq: 0,
+            data: vec![7; veil_proto::budget::LOCAL_PROXY_STREAM_SEGMENT_DATA_BYTES],
+        }
+        .encode();
+        let mut header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppData as u16);
+        header.set_priority(veil_proto::priority::INTERACTIVE);
+        header.body_len = body.len() as u32;
+        header.stream_id = 42;
+        let mut raw = encode_header(&header).to_vec();
+        raw.extend(body);
+        let envelope = build_routed_envelope(sender, destination, &ek, &raw).unwrap();
+        let frame = routed_frame([3; 32], &envelope.encode());
+        // Hop AEAD (16) and enough space for an encrypted padding frame (40).
+        assert!(
+            frame.len() + 16 + 40 <= 4096,
+            "oversized routed source segment: {}",
+            frame.len()
+        );
+        assert_eq!(
+            decode_header(&frame).unwrap().priority(),
+            veil_proto::priority::INTERACTIVE
+        );
+        let encrypted = veil_proto::E2eEnvelope::decode(&envelope.payload[1..]).unwrap();
+        assert_eq!(
+            veil_e2e::decrypt(&dk, &sender, &destination, &encrypted).unwrap(),
+            raw
+        );
     }
 
     #[test]
