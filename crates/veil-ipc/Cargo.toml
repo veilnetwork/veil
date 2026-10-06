@@ -33,12 +33,14 @@ veil-types = { path = "../veil-types" }
 veil-util = { path = "../veil-util" }
 
 blake3 = "1.5"
+futures = "0.3"
 log = "0.4"
 rand_core = { version = "0.6", features = ["getrandom"] }
 thiserror = "2.0"
 tokio = { version = "1.42", features = ["sync", "rt", "macros", "time", "io-util", "net"] }
 
 [dev-dependencies]
+tokio = { version = "1.42", features = ["test-util"] }
 # Only the tests behind veilcore-internals-test touch these, and only as
 # dev-dependencies can they be here at all: veil-session pulls veil-cfg, which
 # reaches veil-observability, which depends back on veil-ipc. Cargo permits a
@@ -46,6 +48,8 @@ tokio = { version = "1.42", features = ["sync", "rt", "macros", "time", "io-util
 # not, so a normal dependency - optional or otherwise - is not an option.
 veil-dht = { path = "../veil-dht" }
 veil-session = { path = "../veil-session" }
+veil-dispatcher = { path = "../veil-dispatcher" }
+veil-cfg = { path = "../veil-cfg" }
 
 [lints]
 workspace = true
