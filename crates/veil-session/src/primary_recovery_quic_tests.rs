@@ -9,6 +9,7 @@ use veil_proto::{
     header::FrameHeader,
     priority::{INTERACTIVE, REALTIME},
 };
+use veil_transport::context::QuicCongestionControl;
 use veil_types::NodeIdBytes;
 
 struct Capture {
@@ -89,7 +90,7 @@ struct Report {
     post_received: usize,
 }
 
-async fn measure(large: bool, recover: bool) -> Report {
+async fn measure(large: bool, recover: bool, congestion: QuicCongestionControl) -> Report {
     use super::super::parallel_lanes::{ParallelQuicOffer, ParallelSession};
     let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -101,7 +102,9 @@ async fn measure(large: bool, recover: bool) -> Report {
     )
     .await;
     link.enabled.store(true, Ordering::Relaxed);
-    let ctx = Arc::new(TransportContext::for_debug().unwrap());
+    let mut ctx = TransportContext::for_debug().unwrap();
+    ctx.quic.congestion_control = congestion;
+    let ctx = Arc::new(ctx);
     let remote = tokio::spawn(promote_punched_quic(
         right,
         link.right_addr,
@@ -268,8 +271,11 @@ async fn measure(large: bool, recover: bool) -> Report {
 #[tokio::test]
 async fn authenticated_primary_replacement_recovers_after_four_second_neutral_outage() {
     for large in [false, true] {
-        let old = measure(large, false).await;
-        let repaired = measure(large, true).await;
+        // Keep the historical stall reproducible independently of the
+        // production congestion controller. All existing recovery gates
+        // still apply to the authenticated replacement path.
+        let old = measure(large, false, QuicCongestionControl::Cubic).await;
+        let repaired = measure(large, true, QuicCongestionControl::Cubic).await;
         assert!(
             old.first_fresh.unwrap() > Duration::from_millis(600),
             "baseline must reproduce excess recovery delay: {old:?}"
@@ -288,5 +294,24 @@ async fn authenticated_primary_replacement_recovers_after_four_second_neutral_ou
             repaired.post_received >= 140,
             "too many post-outage source opportunities lost: {repaired:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn bbr_recovers_fresh_datagrams_after_neutral_outage() {
+    for large in [false, true] {
+        for recover in [false, true] {
+            let report = measure(large, recover, QuicCongestionControl::Bbr).await;
+            assert!(
+                report.first_fresh.unwrap() < Duration::from_millis(600),
+                "{report:?}"
+            );
+            assert!(
+                report.max_post_age < Duration::from_millis(400),
+                "{report:?}"
+            );
+            assert_eq!(report.duplicates, 0);
+            assert!(report.post_received >= 140, "{report:?}");
+        }
     }
 }
