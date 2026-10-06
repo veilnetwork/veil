@@ -4908,6 +4908,7 @@ name = "veil-ipc"
 version = "0.11.39"
 dependencies = [
  "blake3",
+ "futures",
  "log",
  "rand_core 0.6.4",
  "thiserror 2.0.18",
@@ -4916,7 +4917,9 @@ dependencies = [
  "veil-anycast",
  "veil-app",
  "veil-bufpool",
+ "veil-cfg",
  "veil-dht",
+ "veil-dispatcher",
  "veil-dispatcher-state",
  "veil-e2e",
  "veil-error",
