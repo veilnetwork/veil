@@ -1228,6 +1228,7 @@ fn local_capabilities(
     // bit keeps the static key it always had (report12 V-M12).
     caps.flags |= cap_flags::SUPPORTS_REALTIME_REKEY;
     caps.flags |= cap_flags::SUPPORTS_DATAGRAM_FLOWS;
+    caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_DIRECT_APP_CHUNKS;
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_CIRCUIT_DATAGRAMS;
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_NEUTRAL_FORWARD_DATAGRAMS;
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_PARALLEL_QUIC;
@@ -2407,6 +2408,8 @@ mod tests {
 
         assert!(r1.remote_capabilities.supports_circuit_datagrams());
         assert!(r2.remote_capabilities.supports_circuit_datagrams());
+        assert!(r1.remote_capabilities.supports_direct_app_chunks());
+        assert!(r2.remote_capabilities.supports_direct_app_chunks());
 
         // Node IDs are BLAKE3(verifying_key_bytes), not BLAKE3(seed).
         let id_a = test_identity(0xAA).node_id;
@@ -3145,6 +3148,7 @@ mod tests {
             assert!(result.remote_capabilities.supports_circuit_datagrams());
             assert!(result.remote_capabilities.supports_shared_parallel_quic());
             assert!(result.remote_capabilities.supports_duplex_parallel_quic());
+            assert!(result.remote_capabilities.supports_direct_app_chunks());
         }
         assert!(!srv2.remote_capabilities.dht_service());
         assert_ne!(

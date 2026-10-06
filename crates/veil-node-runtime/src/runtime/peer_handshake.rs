@@ -1292,6 +1292,16 @@ pub async fn register_connection_session(
                 evict_stale_on_dedup,
                 session_owner,
             );
+            if rx.is_some() {
+                reg.set_direct_app_chunks_owned(
+                    &remote_nid,
+                    &remote_identity.session_keys.session_id,
+                    pending_peer_state
+                        .entry
+                        .remote_capabilities
+                        .supports_direct_app_chunks(),
+                );
+            }
             if evicted_open && rx.is_some() {
                 runtime.logger.info(
                     "session.reconnect_evict",

@@ -412,6 +412,8 @@ pub mod cap_extra_flags {
     /// Neutral short-lived forwarded datagrams. Older decoders require a
     /// REALTIME hint, which must no longer be emitted to request relay service.
     pub const SUPPORTS_NEUTRAL_FORWARD_DATAGRAMS: u8 = 1 << 4;
+    /// Bounded reliable direct AppSendChunk frames. Independent of QUIC/media.
+    pub const SUPPORTS_DIRECT_APP_CHUNKS: u8 = 1 << 5;
 }
 
 // c: role_bits moved to veil-types alongside NodeRole.
@@ -500,6 +502,11 @@ impl CapabilitiesPayload {
     pub fn supports_circuit_datagrams(&self) -> bool {
         self.supports_realtime_datagrams()
             && self.extra_flags & cap_extra_flags::SUPPORTS_CIRCUIT_DATAGRAMS != 0
+    }
+
+    /// Explicit decoder support; legacy padding or datagram support is insufficient.
+    pub fn supports_direct_app_chunks(&self) -> bool {
+        self.extra_flags & cap_extra_flags::SUPPORTS_DIRECT_APP_CHUNKS != 0
     }
 
     pub fn supports_neutral_forward_datagrams(&self) -> bool {
@@ -2517,6 +2524,32 @@ mod tests {
         );
         caps.flags &= !cap_flags::SUPPORTS_REALTIME_DATAGRAMS;
         assert!(!caps.supports_circuit_datagrams());
+    }
+
+    #[test]
+    fn direct_app_chunks_require_explicit_capability_without_transport_inference() {
+        let mut caps = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Core);
+        caps.flags = u8::MAX;
+        assert!(!caps.supports_direct_app_chunks());
+        caps.extra_flags |= cap_extra_flags::SUPPORTS_DIRECT_APP_CHUNKS;
+        caps.flags = 0;
+        assert!(
+            CapabilitiesPayload::decode(&caps.encode())
+                .unwrap()
+                .supports_direct_app_chunks()
+        );
+        assert!(
+            !CapabilitiesPayload::decode(&caps.encode()[..3])
+                .unwrap()
+                .supports_direct_app_chunks()
+        );
+        let mut padded = vec![0; 128];
+        padded[19] = cap_extra_flags::SUPPORTS_DIRECT_APP_CHUNKS;
+        assert!(
+            !CapabilitiesPayload::decode(&padded)
+                .unwrap()
+                .supports_direct_app_chunks()
+        );
     }
 
     #[test]
