@@ -244,6 +244,8 @@ bool VeilTransportShim::SendRtcp(std::span<const uint8_t> packet,
   const int rc =
       veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
   if (rc == 0) {
+    outbound_rtcp_packet_count_.fetch_add(1, std::memory_order_relaxed);
+    outbound_rtcp_byte_count_.fetch_add(packet.size(), std::memory_order_relaxed);
     outbound_packet_count_.fetch_add(1, std::memory_order_relaxed);
     outbound_byte_count_.fetch_add(packet.size(), std::memory_order_relaxed);
     return true;
