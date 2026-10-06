@@ -50,10 +50,15 @@ pub(crate) const DECRYPT_FAILURE_LOG_INTERVAL: std::time::Duration =
 pub(crate) const UNOPENABLE_REPLY_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(10);
 
+const MAX_FAILURE_SENDERS: usize = 1024;
+
 impl FrameDispatcher {
     /// Whether `peer` may be told `AppSendUnopenable` now, recording it if so.
     pub(crate) fn unopenable_reply_due(&self, peer: [u8; 32]) -> bool {
-        let now = std::time::Instant::now();
+        self.unopenable_reply_due_at(peer, std::time::Instant::now())
+    }
+
+    fn unopenable_reply_due_at(&self, peer: [u8; 32], now: std::time::Instant) -> bool {
         let mut replied = self
             .unopenable_replied
             .lock()
@@ -64,8 +69,11 @@ impl FrameDispatcher {
             return false;
         }
         // Bounded: entries past the interval carry no information.
-        if replied.len() >= 1024 {
+        if !replied.contains_key(&peer) && replied.len() >= MAX_FAILURE_SENDERS {
             replied.retain(|_, at| now.duration_since(*at) < UNOPENABLE_REPLY_INTERVAL);
+            if replied.len() >= MAX_FAILURE_SENDERS {
+                return false;
+            }
         }
         replied.insert(peer, now);
         true
@@ -82,23 +90,32 @@ impl FrameDispatcher {
     /// whoever the envelope CLAIMS, and a flood of forged claims must not turn
     /// into a flood of lines.
     pub(crate) fn note_decrypt_failure(&self, sender: [u8; 32], what: &str) {
+        self.note_decrypt_failure_at(sender, what, std::time::Instant::now());
+    }
+
+    fn note_decrypt_failure_at(&self, sender: [u8; 32], what: &str, now: std::time::Instant) {
         if let Some(m) = &self.metrics {
             m.inc_decrypt_failures();
         }
-        let now = std::time::Instant::now();
         let mut log = self
             .decrypt_failure_log
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        if log.len() >= 1024 {
+        if !log.contains_key(&sender) && log.len() >= MAX_FAILURE_SENDERS {
             log.retain(|_, (at, _)| now.duration_since(*at) < DECRYPT_FAILURE_LOG_INTERVAL);
+            if log.len() >= MAX_FAILURE_SENDERS {
+                // Claimed sender labels are free to vary. Preserve the global
+                // bound and known senders' aggregates; the metric above still
+                // counts refusals whose labels cannot get a log slot.
+                return;
+            }
         }
         let entry = log.entry(sender).or_insert((
             now.checked_sub(DECRYPT_FAILURE_LOG_INTERVAL).unwrap_or(now),
             0,
         ));
-        entry.1 += 1;
-        if entry.1 > 1 && now.duration_since(entry.0) < DECRYPT_FAILURE_LOG_INTERVAL {
+        entry.1 = entry.1.saturating_add(1);
+        if now.duration_since(entry.0) < DECRYPT_FAILURE_LOG_INTERVAL {
             return;
         }
         let count = entry.1;
@@ -699,6 +716,113 @@ mod tests {
     use veil_proto::app::AppOpenPayload;
     use veil_proto::family::{AppMsg, FrameFamily};
     use veil_proto::header::FrameHeader;
+
+    #[test]
+    fn decrypt_failure_log_aggregates_repeats_until_the_interval_expires() {
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+        use veil_types::{LogFormat, LogLevel, LogsConfig};
+
+        struct LogFile(std::path::PathBuf);
+        impl Drop for LogFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let file = LogFile(std::env::temp_dir().join(format!(
+            "veil-decrypt-failures-{}-{}.log",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        )));
+        let mut dispatcher = super::super::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        dispatcher.logger = veil_observability::NodeLogger::from_parts(
+            LogsConfig::File,
+            Some(&file.0),
+            LogLevel::Info,
+            LogFormat::Text,
+        )
+        .unwrap()
+        .into();
+        let now = Instant::now();
+        dispatcher.note_decrypt_failure_at([1; 32], "first", now);
+        dispatcher.note_decrypt_failure_at([2; 32], "other peer", now);
+        for _ in 0..100 {
+            dispatcher.note_decrypt_failure_at(
+                [1; 32],
+                "repeated replay",
+                now + std::time::Duration::from_secs(1),
+            );
+        }
+        dispatcher.note_decrypt_failure_at(
+            [1; 32],
+            "before boundary",
+            now + super::DECRYPT_FAILURE_LOG_INTERVAL - std::time::Duration::from_nanos(1),
+        );
+        let lines = std::fs::read_to_string(&file.0).unwrap();
+        assert_eq!(
+            lines.lines().count(),
+            2,
+            "known sender must not flood the log"
+        );
+        dispatcher.note_decrypt_failure_at(
+            [1; 32],
+            "at boundary",
+            now + super::DECRYPT_FAILURE_LOG_INTERVAL,
+        );
+        let lines = std::fs::read_to_string(&file.0).unwrap();
+        assert_eq!(lines.lines().count(), 3);
+        assert!(
+            lines
+                .lines()
+                .last()
+                .unwrap()
+                .contains("102 such since the last line")
+        );
+        assert!(lines.lines().last().unwrap().contains("at boundary"));
+    }
+
+    #[test]
+    fn failure_sender_flood_keeps_logs_and_reset_replies_bounded_then_recovers() {
+        let mut dispatcher = super::super::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let metrics = Arc::new(veil_observability::NodeMetrics::new());
+        dispatcher.metrics = Some(metrics.clone());
+        dispatcher.logger = Arc::new(veil_observability::NodeLogger::new_noop());
+        let now = std::time::Instant::now();
+        for index in 0..super::MAX_FAILURE_SENDERS {
+            let mut sender = [0; 32];
+            sender[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            dispatcher.note_decrypt_failure_at(sender, "refused", now);
+            assert!(dispatcher.unopenable_reply_due_at(sender, now));
+        }
+        for tag in 1..=200u8 {
+            let sender = [tag; 32];
+            dispatcher.note_decrypt_failure_at(sender, "varying claimed sender", now);
+            assert!(!dispatcher.unopenable_reply_due_at(sender, now));
+        }
+        assert_eq!(
+            dispatcher.decrypt_failure_log.lock().unwrap().len(),
+            super::MAX_FAILURE_SENDERS
+        );
+        assert_eq!(
+            dispatcher.unopenable_replied.lock().unwrap().len(),
+            super::MAX_FAILURE_SENDERS
+        );
+        // Existing senders retain their aggregate despite new-label pressure.
+        dispatcher.note_decrypt_failure_at([0; 32], "known sender", now);
+        assert_eq!(
+            dispatcher.decrypt_failure_log.lock().unwrap()[&[0; 32]].1,
+            1
+        );
+        let later = now + super::DECRYPT_FAILURE_LOG_INTERVAL;
+        dispatcher.note_decrypt_failure_at([255; 32], "new after expiry", later);
+        assert!(dispatcher.unopenable_reply_due_at([255; 32], later));
+        assert_eq!(dispatcher.decrypt_failure_log.lock().unwrap().len(), 1);
+        assert_eq!(dispatcher.unopenable_replied.lock().unwrap().len(), 1);
+        assert_eq!(
+            metrics.snapshot().decrypt_failures_total,
+            super::MAX_FAILURE_SENDERS as u64 + 202,
+            "all crypto refusals count, including labels denied a log slot"
+        );
+    }
 
     fn ratchet_runtime(node_id: [u8; 32], instance: [u8; 16]) -> veil_e2e::RatchetRuntime {
         let (ek, dk) = veil_e2e::generate_keypair();
