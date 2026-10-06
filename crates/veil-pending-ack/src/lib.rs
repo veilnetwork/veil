@@ -14,7 +14,7 @@
 //! call `register` / `ack` / `tick` directly.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -328,6 +328,14 @@ impl PendingAckTracker {
             .map(|e| (e.next_hop, e.src_app_id, e.ack_key))
     }
 
+    /// Admission must stop if an ACK cleared this message or a new registration
+    /// replaced the attempt while it waited for source capacity.
+    pub fn retry_is_current(&self, content_id: &[u8; 32], attempt: u32) -> bool {
+        self.pending
+            .get(content_id)
+            .is_some_and(|entry| entry.attempts == attempt)
+    }
+
     // cleanup: `peek_src_app_id` removed — ended up
     // using `ack_and_get_info` (consume on DELIVERED) at delivery.rs:1086, so
     // this non-consuming peek had zero non-test callers. Re-introduce from git
@@ -339,6 +347,18 @@ impl PendingAckTracker {
     ///
     /// Call this on every `DELIVERY_ACK_CHECK_INTERVAL_MS` tick.
     pub fn tick(&mut self) -> Vec<AckTickOutcome> {
+        self.tick_with_batch_admission(&HashSet::new(), usize::MAX)
+    }
+
+    /// A bounded local chunk sender owns these retries until admission ends.
+    /// Do not spend another attempt or expire an in-flight batch. When worker
+    /// slots are full, leave other chunk deadlines/attempts intact; ordinary
+    /// single-frame delivery still ticks normally.
+    pub fn tick_with_batch_admission(
+        &mut self,
+        in_flight: &HashSet<[u8; 32]>,
+        mut batch_slots: usize,
+    ) -> Vec<AckTickOutcome> {
         let now = Instant::now();
         let mut outcomes = Vec::new();
         let timeout = Duration::from_millis(DELIVERY_ACK_TIMEOUT_MS);
@@ -347,7 +367,7 @@ impl PendingAckTracker {
         let total_bytes = &mut self.total_bytes;
 
         self.pending.retain(|&content_id, entry| {
-            if now < entry.deadline {
+            if now < entry.deadline || in_flight.contains(&content_id) {
                 return true;
             }
             if entry.attempts >= MAX_DELIVERY_ATTEMPTS {
@@ -363,6 +383,12 @@ impl PendingAckTracker {
                 *total_bytes = total_bytes.saturating_sub(entry.frame_bytes_len);
                 false
             } else {
+                if entry.frames.len() > 1 {
+                    if batch_slots == 0 {
+                        return true;
+                    }
+                    batch_slots -= 1;
+                }
                 entry.attempts += 1;
                 entry.deadline = now + timeout;
                 outcomes.push(AckTickOutcome::Retransmit {
@@ -377,6 +403,25 @@ impl PendingAckTracker {
         });
 
         outcomes
+    }
+
+    /// Start the ACK wait after a retry's bounded source admission finishes.
+    /// An ACK that already removed the entry wins; a stale completion cannot
+    /// replace another attempt's next hop or deadline.
+    pub fn finish_retry_admission(
+        &mut self,
+        content_id: &[u8; 32],
+        attempt: u32,
+        accepted_hop: Option<[u8; 32]>,
+    ) {
+        if let Some(entry) = self.pending.get_mut(content_id)
+            && entry.attempts == attempt
+        {
+            if let Some(hop) = accepted_hop {
+                entry.next_hop = hop;
+            }
+            entry.deadline = Instant::now() + Duration::from_millis(DELIVERY_ACK_TIMEOUT_MS);
+        }
     }
 
     /// Number of in-flight entries currently tracked.
@@ -550,6 +595,79 @@ mod tests {
                 if next_hop == hop() && dst_node_id == dst()
         ));
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn bounded_batch_admission_keeps_attempts_and_single_frame_timer_live() {
+        let mut tracker = PendingAckTracker::new();
+        for id in [1, 2, 3] {
+            tracker.register_batch(
+                cid(id),
+                hop(),
+                dst(),
+                src(),
+                [4; 32],
+                vec![vec![1], vec![2]],
+            );
+        }
+        tracker.register(cid(4), hop(), dst(), src(), [4; 32], vec![3]);
+        for entry in tracker.pending.values_mut() {
+            entry.deadline = Instant::now() - Duration::from_secs(1);
+        }
+        let busy = HashSet::from([cid(1)]);
+        let outcomes = tracker.tick_with_batch_admission(&busy, 1);
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "one chunk worker and the ordinary single frame"
+        );
+        assert!(outcomes.iter().any(
+            |o| matches!(o,AckTickOutcome::Retransmit {content_id,..} if *content_id==cid(4))
+        ));
+        assert_eq!(tracker.pending[&cid(1)].attempts, 1);
+        assert_eq!(
+            [2, 3]
+                .into_iter()
+                .filter(|id| tracker.pending[&cid(*id)].attempts == 2)
+                .count(),
+            1
+        );
+        assert!(tracker.tick_with_batch_admission(&busy, 0).is_empty());
+        tracker.pending.get_mut(&cid(1)).unwrap().attempts = MAX_DELIVERY_ATTEMPTS;
+        assert!(
+            tracker.tick_with_batch_admission(&busy, 0).is_empty(),
+            "busy admission cannot expire"
+        );
+        assert!(
+            tracker
+                .tick_with_batch_admission(&HashSet::new(), 0)
+                .iter()
+                .any(|o| matches!(o,AckTickOutcome::Failed {content_id,..} if *content_id==cid(1)))
+        );
+    }
+
+    #[test]
+    fn retry_completion_rearms_only_current_attempt_and_ack_wins() {
+        let mut tracker = PendingAckTracker::new();
+        tracker.register_batch(cid(1), hop(), dst(), src(), [4; 32], vec![vec![1], vec![2]]);
+        let entry = tracker.pending.get_mut(&cid(1)).unwrap();
+        entry.attempts = 2;
+        entry.deadline = Instant::now() - Duration::from_secs(1);
+        let old_deadline = entry.deadline;
+        assert!(tracker.retry_is_current(&cid(1), 2));
+        assert!(!tracker.retry_is_current(&cid(1), 1));
+        tracker.finish_retry_admission(&cid(1), 1, Some([5; 32]));
+        assert_eq!(tracker.pending[&cid(1)].deadline, old_deadline);
+        assert_eq!(tracker.pending[&cid(1)].next_hop, hop());
+        tracker.finish_retry_admission(&cid(1), 2, Some([5; 32]));
+        assert_eq!(tracker.pending[&cid(1)].next_hop, [5; 32]);
+        assert!(tracker.pending[&cid(1)].deadline > Instant::now());
+        assert!(tracker.tick().is_empty());
+        tracker.ack(&cid(1));
+        assert!(!tracker.retry_is_current(&cid(1), 2));
+        tracker.finish_retry_admission(&cid(1), 2, Some(hop()));
+        assert!(tracker.is_empty());
+        assert_eq!(tracker.total_bytes, 0);
     }
 
     #[test]

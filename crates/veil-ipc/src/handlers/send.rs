@@ -1541,7 +1541,7 @@ pub(crate) async fn handle_ipc_send(
                     require_ack: send.require_ack,
                 };
                 // Oversized payload → relay-preserving chunking. Split the
-                // (already-E2E) payload into ≤ MAX_CHUNK_PAYLOAD pieces, each
+                // (already-E2E) payload into small endpoint-owned pieces, each
                 // carried in its OWN relayable `DeliveryEnvelope` (same addressing
                 // metadata, a unique per-chunk content_id, payload = the chunk
                 // wrapper). Every chunk rides the proven Forward relay path; the
@@ -1552,14 +1552,31 @@ pub(crate) async fn handle_ipc_send(
                 // NO_ROUTE on the relay path) and reassembled via a metadata-
                 // losing epidemic broadcast.
                 //
-                if envelope.payload.len() > veil_proto::delivery::ENVELOPE_CHUNKING_THRESHOLD {
-                    use veil_proto::budget::{MAX_CHUNK_PAYLOAD, MAX_REASSEMBLY_BYTES};
+                if (!relay_realtime
+                    && envelope.payload.len()
+                        > veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES)
+                    || envelope.payload.len() > veil_proto::delivery::ENVELOPE_CHUNKING_THRESHOLD
+                {
+                    use veil_proto::budget::{
+                        LOCAL_ENVELOPE_SEGMENT_DATA_BYTES, MAX_CHUNK_PAYLOAD, MAX_REASSEMBLY_BYTES,
+                        MAX_TRANSFER_CHUNKS,
+                    };
                     use veil_proto::delivery::{ChunkedEnvelopePayload, DeliveryEnvelope};
                     use veil_proto::family::DeliveryMsg;
 
                     let total_size = envelope.payload.len();
+                    // The small source-credit path is for reliable messages.
+                    // Preserve the existing lossy IPC cell contract.
+                    let segment_size = if relay_realtime {
+                        MAX_CHUNK_PAYLOAD
+                    } else {
+                        LOCAL_ENVELOPE_SEGMENT_DATA_BYTES
+                    };
                     // Bounded by the receiver's reassembly cap — refuse early.
-                    if total_size > MAX_REASSEMBLY_BYTES {
+                    let chunk_count = total_size.div_ceil(segment_size);
+                    if total_size > MAX_REASSEMBLY_BYTES
+                        || chunk_count > MAX_TRANSFER_CHUNKS as usize
+                    {
                         let mut hdr = FrameHeader::new(
                             FrameFamily::LocalApp as u8,
                             LocalAppMsg::AppSendFailed as u16,
@@ -1570,7 +1587,7 @@ pub(crate) async fn handle_ipc_send(
                         return sink.write_all(&frame).await;
                     }
 
-                    let chunk_count = total_size.div_ceil(MAX_CHUNK_PAYLOAD) as u32;
+                    let chunk_count = chunk_count as u32;
                     let mut transfer_id = [0u8; 16];
                     {
                         use rand_core::RngCore;
@@ -1635,16 +1652,42 @@ pub(crate) async fn handle_ipc_send(
                     // (Reassembly is index-deduped, so the partial chunks left on
                     // a hop that dies mid-stream are harmless on retry.)
                     let mut delivered = false;
+                    let remaining_secs = envelope
+                        .created_at
+                        .saturating_add(envelope.ttl_secs as u64)
+                        .saturating_sub(veil_util::unix_secs_now_u64())
+                        .min(30);
+                    let admission_deadline = tokio::time::Instant::now()
+                        + std::time::Duration::from_secs(remaining_secs);
+                    if !relay_realtime && remaining_secs == 0 {
+                        return app_send_error(sink, ipc_send_err::NO_ROUTE).await;
+                    }
                     for next_hop in &hops_to_try {
                         let frames: Vec<Vec<u8>> = envelope
                             .payload
-                            .chunks(MAX_CHUNK_PAYLOAD)
+                            .chunks(segment_size)
                             .enumerate()
                             .map(|(i, piece)| make_chunk_frame(*next_hop, i as u32, piece))
                             .collect();
-                        let all_ok = frames
-                            .iter()
-                            .all(|frame| reg.send_to(next_hop, ctx.local_priority, frame.clone()));
+                        // Endpoint-owned bulk admission, never relay transit.
+                        // Queue saturation waits instead of losing a suffix or
+                        // invalidating a healthy route. One deadline bounds the
+                        // entire batch; only a missing/closed hop tries another.
+                        let admitted = tokio::time::timeout_at(admission_deadline, async {
+                            for frame in &frames {
+                                let accepted = if relay_realtime {
+                                    reg.send_to(next_hop, ctx.local_priority, frame.clone())
+                                } else {
+                                    reg.send_reliable_to(next_hop, frame.clone()).await
+                                };
+                                if !accepted {
+                                    return false;
+                                }
+                            }
+                            true
+                        })
+                        .await;
+                        let all_ok = admitted.as_ref().is_ok_and(|accepted| *accepted);
                         if all_ok {
                             delivered = true;
                             if want_ack && let Some(tracker) = ctx.pending_ack.as_deref() {
@@ -1658,6 +1701,11 @@ pub(crate) async fn handle_ipc_send(
                                 );
                             }
                             break;
+                        }
+                        if admitted.is_err() {
+                            // A slow source queue is not evidence of a dead hop.
+                            // Do not spray another full copy after the deadline.
+                            return app_send_error(sink, ipc_send_err::NO_ROUTE).await;
                         }
                         if let Some(cache) = route_cache {
                             wlock!(cache).invalidate_hop(&send.dst_node_id, next_hop);
@@ -1853,6 +1901,17 @@ pub(crate) async fn handle_ipc_send(
 /// single-stream throughput cap measured ~150 Mbps (12K pps) before
 /// and after this fix.  Honoring `require_ack=false` halves the IPC
 /// syscall count per send and frees enough budget to push pps higher.
+async fn app_send_error(sink: &mut SendReply<'_>, code: u16) -> std::io::Result<()> {
+    let mut header = FrameHeader::new(
+        FrameFamily::LocalApp as u8,
+        LocalAppMsg::AppSendFailed as u16,
+    );
+    header.body_len = 2;
+    let mut frame = codec::encode_header(&header).to_vec();
+    frame.extend_from_slice(&code.to_be_bytes());
+    sink.write_all(&frame).await
+}
+
 async fn app_send_ok(sink: &mut SendReply<'_>, require_ack: bool) -> std::io::Result<()> {
     if require_ack {
         let ok_hdr = FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppSendOk as u16);
@@ -2318,6 +2377,197 @@ mod ratchet_send_tests {
             }
             previous = Some(forward);
         }
+    }
+
+    #[tokio::test]
+    async fn loss_tolerant_relay_payload_keeps_its_existing_cell_and_lane() {
+        let fx = fixture(vec![RELAY]);
+        let capture = Arc::new(LaneCapture::default());
+        let mut ctx = fx.ctx(false);
+        ctx.session_tx_registry = Some(capture.clone());
+        ctx.local_priority = veil_proto::priority::BULK;
+        for size in [5000, 70_000] {
+            let sealed = [
+                veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC.as_slice(),
+                vec![7; size].as_slice(),
+            ]
+            .concat();
+            let mut body = payload(false, &sealed);
+            let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+                | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
+            body[100..104].copy_from_slice(&flags.to_be_bytes());
+            let mut wh = sink().await;
+            handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+                .await
+                .unwrap();
+            let mut frames = lock!(capture.0);
+            assert_eq!(frames.len(), if size == 5000 { 1 } else { 2 });
+            for (lane, frame) in frames.drain(..) {
+                assert_eq!(lane, veil_proto::priority::BULK);
+                let f =
+                    veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                        .unwrap();
+                if size == 5000 {
+                    assert_eq!(f.envelope.payload, sealed);
+                } else {
+                    assert!(
+                        veil_proto::delivery::ChunkedEnvelopePayload::decode(&f.envelope.payload)
+                            .unwrap()
+                            .data
+                            .len()
+                            <= veil_proto::budget::MAX_CHUNK_PAYLOAD
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn routed_envelope_segments_keep_crypto_metadata_ack_and_wire_bound() {
+        for size in [12_000, 100_000] {
+            let fx = fixture(vec![RELAY]);
+            let capture = Arc::new(LaneCapture::default());
+            let mut ctx = fx.ctx(true);
+            ctx.session_tx_registry = Some(capture.clone());
+            let tracker = Arc::new(Mutex::new(veil_pending_ack::PendingAckTracker::default()));
+            ctx.pending_ack = Some(tracker.clone());
+            let data: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
+            let mut request = AppIpcSendPayload::decode(&payload(false, &data)).unwrap();
+            request.require_ack = true;
+            let mut wh = sink().await;
+            handle_ipc_send(&mut SendReply::Inline(&mut wh), &request.encode(), &ctx)
+                .await
+                .unwrap();
+            let frames = lock!(capture.0);
+            assert!(
+                frames.len() > 1,
+                "even a sub-64KiB payload must be packetized"
+            );
+            let mut joined = Vec::new();
+            let mut transfer = None;
+            let mut cids = std::collections::HashSet::new();
+            for (index, (lane, frame)) in frames.iter().enumerate() {
+                assert_eq!(*lane, veil_proto::priority::BACKGROUND);
+                assert_eq!(
+                    codec::decode_header(frame).unwrap().priority(),
+                    veil_proto::priority::INTERACTIVE
+                );
+                assert!(
+                    frame.len() + 16 + 40 <= 4096,
+                    "oversized source chunk: {}",
+                    frame.len()
+                );
+                let f =
+                    veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                        .unwrap();
+                assert_eq!(f.next_hop_node_id, RELAY);
+                assert_eq!(f.envelope.recipient.node_id, PEER);
+                assert_eq!(f.envelope.sender_node_id, ME);
+                assert_eq!(f.envelope.src_app_id, request.src_app_id);
+                assert_eq!(f.envelope.app_id, request.app_id);
+                assert_eq!(f.envelope.endpoint_id, request.endpoint_id);
+                assert!(!f.envelope.require_ack);
+                assert!(cids.insert(f.envelope.content_id));
+                let chunk =
+                    veil_proto::delivery::ChunkedEnvelopePayload::decode(&f.envelope.payload)
+                        .unwrap();
+                assert_eq!(chunk.chunk_index, index as u32);
+                assert_eq!(chunk.chunk_count as usize, frames.len());
+                assert!(chunk.require_ack);
+                let identity = (chunk.transfer_id, chunk.orig_content_id, chunk.total_size);
+                assert_eq!(*transfer.get_or_insert(identity), identity);
+                joined.extend(chunk.data);
+            }
+            let (_, original, total) = transfer.unwrap();
+            assert_eq!(joined.len(), total as usize);
+            assert_eq!(
+                lock!(tracker).tracked_frame_count(&original),
+                Some(frames.len())
+            );
+            assert_ne!(lock!(tracker).peek_ack_info(&original).unwrap().2, [0; 32]);
+            let opened = fx
+                .peer
+                .open_payload(&ME, &joined, veil_util::unix_secs_now_u64())
+                .unwrap();
+            assert!(opened.authenticated);
+            assert_eq!(opened.plaintext, data);
+        }
+    }
+
+    #[tokio::test]
+    async fn routed_envelope_waits_for_source_capacity_without_invalidating_route() {
+        struct BoundedSource(tokio::sync::mpsc::Sender<Vec<u8>>);
+        impl FrameBroadcaster for BoundedSource {
+            fn send_to(&self, peer: &[u8; 32], _: u8, _: Vec<u8>) -> bool {
+                assert_ne!(*peer, RELAY, "chunk producer must await source credit");
+                false
+            }
+            fn send_reliable_to<'a>(
+                &'a self,
+                peer: &'a [u8; 32],
+                frame: Vec<u8>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
+            {
+                Box::pin(async move { *peer == RELAY && self.0.send(frame).await.is_ok() })
+            }
+            fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+            fn active_node_ids(&self) -> Vec<[u8; 32]> {
+                vec![RELAY]
+            }
+        }
+        let fx = fixture(vec![RELAY]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.send(vec![]).await.unwrap();
+        let mut ctx = fx.ctx(true);
+        ctx.session_tx_registry = Some(Arc::new(BoundedSource(tx)));
+        let data = vec![9; 12_000];
+        let body = payload(false, &data);
+        let mut wh = sink().await;
+        let mut sink = SendReply::Inline(&mut wh);
+        let mut send = Box::pin(handle_ipc_send(&mut sink, &body, &ctx));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut send)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fx.route_cache.try_write().unwrap().lookup(&PEER),
+            Some(RELAY)
+        );
+        assert!(rx.recv().await.unwrap().is_empty());
+        let mut frames = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    result = &mut send => { result.unwrap(); break; }
+                    frame = rx.recv() => { frames.push(frame.unwrap()); }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        while let Ok(frame) = rx.try_recv() {
+            frames.push(frame);
+        }
+        let joined: Vec<u8> = frames
+            .iter()
+            .flat_map(|frame| {
+                let f =
+                    veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                        .unwrap();
+                veil_proto::delivery::ChunkedEnvelopePayload::decode(&f.envelope.payload)
+                    .unwrap()
+                    .data
+            })
+            .collect();
+        assert_eq!(
+            fx.peer
+                .open_payload(&ME, &joined, veil_util::unix_secs_now_u64())
+                .unwrap()
+                .plaintext,
+            data
+        );
+        assert_eq!(rlock!(fx.route_cache).lookup(&PEER), Some(RELAY));
     }
 
     #[tokio::test]

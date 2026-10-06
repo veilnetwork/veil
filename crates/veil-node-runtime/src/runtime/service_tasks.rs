@@ -20,6 +20,9 @@ use veil_cfg;
 
 use super::{NodeRuntime, lock_state, lock_tasks, supervised_spawn};
 
+#[path = "ack_chunk_retry.rs"]
+mod ack_chunk_retry;
+
 /// Maximum number of bootstrap-discovered seeds a single source (one HTTPS
 /// bundle or one DNS answer) may dial at join. A signed bundle can legitimately
 /// carry hundreds of peers; dialing all of them — and flooding the k-buckets
@@ -1676,6 +1679,8 @@ impl NodeRuntime {
     }
 
     pub fn spawn_pending_ack_tick(&mut self) {
+        use ack_chunk_retry::{ChunkRetry, admit_chunk_retry};
+        use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
         use veil_dispatcher::pending_ack::AckTickOutcome;
         use veil_proto::budget::DELIVERY_ACK_CHECK_INTERVAL_MS;
 
@@ -1709,9 +1714,22 @@ impl NodeRuntime {
             const LOSS_THRESHOLD: f32 = 0.20;
             const MIN_SAMPLES: u32 = 10;
             const DEMOTE_FACTOR: f64 = 2.0;
+            const MAX_CHUNK_RETRIES: usize = 8;
+            let broadcaster = Arc::new(veil_session::glue::SessionTxBroadcaster::new(
+                session_tx_registry.clone(),
+            ));
+            let mut in_flight = std::collections::HashSet::new();
+            type RetryResult = ([u8; 32], u32, Option<[u8; 32]>);
+            let mut retries: FuturesUnordered<BoxFuture<'static, RetryResult>> =
+                FuturesUnordered::new();
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {}
+                    Some((content_id, attempt, accepted_hop)) = retries.next(), if !retries.is_empty() => {
+                        in_flight.remove(&content_id);
+                        lock!(pending_ack).finish_retry_admission(&content_id, attempt, accepted_hop);
+                        continue;
+                    }
                     _ = shutdown_rx.changed() => { break; }
                 }
 
@@ -1758,7 +1776,10 @@ impl NodeRuntime {
                     }
                 }
 
-                let outcomes = lock!(pending_ack).tick();
+                let outcomes = lock!(pending_ack).tick_with_batch_admission(
+                    &in_flight,
+                    MAX_CHUNK_RETRIES.saturating_sub(retries.len()),
+                );
                 if outcomes.is_empty() {
                     continue;
                 }
@@ -1782,7 +1803,6 @@ impl NodeRuntime {
                         .collect()
                 };
 
-                let reg = rlock!(session_tx_registry);
                 for outcome in outcomes {
                     match outcome {
                         AckTickOutcome::Retransmit {
@@ -1809,6 +1829,33 @@ impl NodeRuntime {
                                     frames.len(),
                                 ),
                             );
+                            if frames.len() > 1 {
+                                // Scoped futures drop on shutdown, so a blocked
+                                // source batch cannot orphan a background task.
+                                // It does not hold up health/timer/single-frame
+                                // work, or acquire a registry lock while waiting.
+                                in_flight.insert(content_id);
+                                let sender = broadcaster.clone();
+                                let tracker = pending_ack.clone();
+                                let retry = ChunkRetry {
+                                    content_id,
+                                    next_hop,
+                                    alternative_hop: reroute_hops.get(&dst_node_id).copied(),
+                                    frames,
+                                    attempt,
+                                };
+                                retries.push(
+                                    async move {
+                                        let accepted_hop =
+                                            admit_chunk_retry(sender.as_ref(), &tracker, retry)
+                                                .await;
+                                        (content_id, attempt, accepted_hop)
+                                    }
+                                    .boxed(),
+                                );
+                                continue;
+                            }
+                            let reg = rlock!(session_tx_registry);
                             // Every chunk carrier gets a fresh OUTER content id
                             // per attempt. Its transfer/index/original id stays
                             // unchanged, so the destination fills only missing
