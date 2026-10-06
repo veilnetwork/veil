@@ -262,6 +262,8 @@ fn channel(me: [u8; 32], peer: [u8; 32], tx_key: [u8; 32], rx_key: [u8; 32]) -> 
     let (routes, files) = MediaRoutes::on_node_for_test(me, peer, id, Arc::clone(&cipher));
     let (tx_hi, rx_hi) = mpsc::channel(MEDIA_TX_HI_QUEUE);
     let (tx_video, rx_video) = mpsc::channel(MEDIA_TX_VIDEO_QUEUE);
+    let (tx_screen, rx_screen) = mpsc::channel(MEDIA_TX_VIDEO_QUEUE);
+    let (repair_screen, repair_screen_rx) = mpsc::channel(1);
     let (repair_hi, repair_hi_rx) = mpsc::channel(1);
     let (repair_video, repair_video_rx) = mpsc::channel(1);
     let spawn = |rx, repairs, plane| {
@@ -284,15 +286,22 @@ fn channel(me: [u8; 32], peer: [u8; 32], tx_key: [u8; 32], rx_key: [u8; 32]) -> 
     };
     let task = spawn(rx_hi, repair_hi_rx, LocalMediaPlane::Primary);
     let video_task = spawn(rx_video, repair_video_rx, LocalMediaPlane::Secondary);
+    let screen_task = spawn(rx_screen, repair_screen_rx, LocalMediaPlane::Screen);
     MEDIA_CHANNELS.lock().unwrap().insert(
         id,
         MediaChannel {
-            ingress: MediaIngress::new(tx_hi, MediaVideoIngress::Packets(tx_video)),
-            repair_tx: Some([repair_hi, repair_video]),
+            ingress: MediaIngress::with_screen(
+                tx_hi,
+                MediaVideoIngress::Packets(tx_video),
+                MediaVideoIngress::Packets(tx_screen),
+            ),
+            repair_tx: Some([repair_hi, repair_video, repair_screen]),
             peer,
             task,
             video_task: Some(video_task),
+            screen_task: Some(screen_task),
             video_sender: None,
+            screen_sender: None,
             sender_app_id: None,
             batching: None,
             cipher,
@@ -494,6 +503,33 @@ async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stall
     let after = packet(111, 0x74);
     assert_eq!(send(ca.id, &after), 0);
     expect_packet(&mut cc.rx, &after).await;
+    // Keep the two-address VMR1 offer for old peers; the third producer
+    // opens its own circuit and return registration to the secondary address.
+    assert_eq!(super::veil_media_channel_set_screen_sharing(ca.id, 1), 0);
+    let screen = packet(96, 0x75);
+    assert_eq!(send(ca.id, &screen), 0);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while ca.routes.outgoing_for_test().await.len() != 3 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let outgoing_three = ca.routes.outgoing_for_test().await;
+    assert_eq!(cc.routes.receive_addresses_for_test().len(), 2);
+    assert_eq!(outgoing_three[2].destination_cookie, incoming[1].1);
+    for other in &outgoing_three[..2] {
+        assert_ne!(outgoing_three[2].origin, other.origin);
+        assert_ne!(outgoing_three[2].return_cookie, other.return_cookie);
+    }
+    // The first cell may expire during route construction. Fresh cells must
+    // decrypt at the other endpoint, not merely enter a source queue.
+    assert_eq!(send(ca.id, &screen), 0);
+    expect_packet(&mut cc.rx, &screen).await;
+    assert_eq!(super::veil_media_channel_set_screen_sharing(ca.id, 0), 0);
+    let camera_after_screen = packet(96, 0x76);
+    assert_eq!(send(ca.id, &camera_after_screen), 0);
+    expect_packet(&mut cc.rx, &camera_after_screen).await;
     let mut cookies = ca.routes.receive_addresses_for_test();
     cookies.extend(cc.routes.receive_addresses_for_test());
     let mut returns = ca.routes.outgoing_for_test().await;
