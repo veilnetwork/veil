@@ -101,7 +101,10 @@ impl LocalReliableAdmission {
     /// Reduce only this endpoint's loss-tolerant secondary producer under
     /// primary pressure. A sparse probe permits recovery without total starvation.
     pub(super) fn allow_secondary(&mut self, local_priority: u8, now: Instant) -> bool {
-        if local_priority != veil_proto::priority::BULK {
+        if !matches!(
+            local_priority,
+            veil_proto::priority::BULK | veil_proto::priority::BACKGROUND
+        ) {
             return true;
         }
         let secondary_pressured =

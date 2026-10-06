@@ -2156,6 +2156,21 @@ final int Function(int, Pointer<VeilApp>, Pointer<Pointer<Utf8>>)
             'veil_media_channel_set_secondary_sender')
         .asFunction();
 
+// Independent local screen writer; the app identity remains unchanged.
+final int Function(int, Pointer<VeilApp>, Pointer<Pointer<Utf8>>)
+    veilMediaChannelSetScreenSender = nativeLib
+        .lookup<
+                NativeFunction<
+                    Int32 Function(
+                        Uint64, Pointer<VeilApp>, Pointer<Pointer<Utf8>>)>>(
+            'veil_media_channel_set_screen_sender')
+        .asFunction();
+
+final int Function(int, int) veilMediaChannelSetScreenSharing = nativeLib
+    .lookup<NativeFunction<Int32 Function(Uint64, Int32)>>(
+        'veil_media_channel_set_screen_sharing')
+    .asFunction();
+
 // start_direct_receiver(app, source_ns, ns_len, source_name, name_len, err)
 // -> VEIL_OK or error. Inbound RTP stays native and never crosses Dart.
 final int Function(

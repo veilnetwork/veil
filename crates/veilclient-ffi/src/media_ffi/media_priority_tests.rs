@@ -16,8 +16,9 @@ use super::{
     MEDIA_BATCHING_COMPACT_RELAY, MEDIA_BATCHING_OFF, MEDIA_CHANNELS, MEDIA_LOCAL_QUEUE_AGE,
     MEDIA_NEXT_ID, MediaChannel, MediaIngress, MediaSenderSlot, MediaVideoIngress,
     QueuedMediaPacket, RelayVideoFrame, drain_anonymous_media, drain_media_packets,
-    drain_relay_video, media_batched_cells, media_ready_batch, timed_media_cells,
-    veil_media_close_channel, veil_media_send_datagram,
+    drain_media_packets_on_plane, drain_relay_video, media_batched_cells, media_ready_batch,
+    timed_media_cells, veil_media_channel_set_screen_sharing, veil_media_close_channel,
+    veil_media_send_datagram,
 };
 use super::{
     RELAY_VIDEO_FRAME_MAX_BYTES, RelayMediaStats, RelayVideoFrameAssembler, RelayVideoFramePush,
@@ -425,7 +426,11 @@ async fn anonymous_audio_continues_during_blocked_video_send_or_warm() {
 
 #[tokio::test]
 async fn anonymous_active_producers_rewarm_on_repair_and_stop_with_closed_ingress() {
-    for plane in [LocalMediaPlane::Primary, LocalMediaPlane::Secondary] {
+    for plane in [
+        LocalMediaPlane::Primary,
+        LocalMediaPlane::Secondary,
+        LocalMediaPlane::Screen,
+    ] {
         let cipher = Arc::new(cipher_for_test(&[0x8e; 32], &[1; 32], &[2; 32]).unwrap());
         let receiver = cipher_for_test(&[0x8f; 32], &[2; 32], &[1; 32]).unwrap();
         let (tx, rx) = mpsc::channel(1);
@@ -511,6 +516,7 @@ async fn anonymous_repair_fans_out_with_independent_backpressure() {
     let (tx_video, _video_rx) = mpsc::channel(1);
     let (repair_hi, mut repair_hi_rx) = mpsc::channel(1);
     let (repair_video, mut repair_video_rx) = mpsc::channel(1);
+    let (repair_screen, mut repair_screen_rx) = mpsc::channel(1);
     let id = MEDIA_NEXT_ID.fetch_add(1, Ordering::Relaxed);
     MEDIA_CHANNELS
         .lock()
@@ -519,11 +525,13 @@ async fn anonymous_repair_fans_out_with_independent_backpressure() {
             id,
             MediaChannel {
                 ingress: MediaIngress::new(tx_hi, MediaVideoIngress::Packets(tx_video)),
-                repair_tx: Some([repair_hi, repair_video]),
+                repair_tx: Some([repair_hi, repair_video, repair_screen]),
                 peer: [0x8a; 32],
                 task: tokio::spawn(std::future::pending()),
                 video_task: Some(tokio::spawn(std::future::pending())),
+                screen_task: None,
                 video_sender: None,
+                screen_sender: None,
                 sender_app_id: None,
                 batching: None,
                 cipher: Arc::new(cipher_for_test(&[0x8a; 32], &[1; 32], &[2; 32]).unwrap()),
@@ -538,6 +546,8 @@ async fn anonymous_repair_fans_out_with_independent_backpressure() {
     repair_hi_rx.try_recv().unwrap();
     repair_video_rx.try_recv().unwrap();
     assert!(repair_video_rx.try_recv().is_err());
+    repair_screen_rx.try_recv().unwrap();
+    assert!(repair_screen_rx.try_recv().is_err());
     unsafe { veil_media_close_channel(id) };
 }
 
@@ -566,6 +576,8 @@ fn relay_audio_batches_respect_compact_size_and_packet_limits() {
 async fn closing_channel_cancels_both_blocked_pumps() {
     let task = tokio::spawn(std::future::pending::<()>());
     let video_task = tokio::spawn(std::future::pending::<()>());
+    let screen_task = tokio::spawn(std::future::pending::<()>());
+    let abort_screen = screen_task.abort_handle();
     let abort_audio = task.abort_handle();
     let abort_video = video_task.abort_handle();
     let (tx_hi, _hi_rx) = mpsc::channel(1);
@@ -582,7 +594,9 @@ async fn closing_channel_cancels_both_blocked_pumps() {
                 peer: [0xf3; 32],
                 task,
                 video_task: Some(video_task),
+                screen_task: Some(screen_task),
                 video_sender: None,
+                screen_sender: None,
                 sender_app_id: None,
                 batching: None,
                 cipher: Arc::new(cipher_for_test(&[0xf3; 32], &[1; 32], &[2; 32]).unwrap()),
@@ -592,7 +606,10 @@ async fn closing_channel_cancels_both_blocked_pumps() {
         );
     unsafe { veil_media_close_channel(id) };
     tokio::time::timeout(Duration::from_secs(1), async {
-        while !abort_audio.is_finished() || !abort_video.is_finished() {
+        while !abort_audio.is_finished()
+            || !abort_video.is_finished()
+            || !abort_screen.is_finished()
+        {
             tokio::task::yield_now().await;
         }
     })
@@ -634,7 +651,9 @@ async fn private_address_control_requires_call_aead_and_never_reaches_the_engine
             peer,
             task: tokio::spawn(std::future::pending()),
             video_task: None,
+            screen_task: None,
             video_sender: None,
+            screen_sender: None,
             sender_app_id: None,
             batching: None,
             cipher: Arc::clone(&cipher),
@@ -903,7 +922,9 @@ fn register_test_ingress(
             peer,
             task: tokio::spawn(std::future::pending()),
             video_task: Some(tokio::spawn(std::future::pending())),
+            screen_task: None,
             video_sender: None,
+            screen_sender: None,
             sender_app_id: None,
             batching: None,
             cipher,
@@ -1056,4 +1077,136 @@ async fn native_video_contention_discards_tail_and_close_retires_surviving_ingre
     assert_eq!(ingress.enqueue(video_packet(12, true, 6).into()), -1);
     assert!(rx_hi.try_recv().is_err());
     assert!(rx_video.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn screen_switch_routes_at_ingress_and_backpressure_stays_local() {
+    let (audio_tx, mut audio_rx) = mpsc::channel(2);
+    let (camera_tx, mut camera_rx) = mpsc::channel(2);
+    let (screen_tx, mut screen_rx) = mpsc::channel(1);
+    let ingress = MediaIngress::with_screen(
+        audio_tx,
+        MediaVideoIngress::Packets(camera_tx),
+        MediaVideoIngress::Packets(screen_tx),
+    );
+    let (id, _) = register_test_ingress(Arc::clone(&ingress), [0xd3; 32]);
+    let old_camera = video_packet(1, true, 1);
+    let screen = video_packet(2, true, 2);
+    let new_camera = video_packet(3, true, 3);
+    assert_eq!(ingress.enqueue(old_camera.clone().into()), 0);
+    assert_eq!(veil_media_channel_set_screen_sharing(id, 1), 0);
+    assert_eq!(ingress.enqueue(screen.clone().into()), 0);
+    assert_eq!(
+        ingress.enqueue(screen.clone().into()),
+        1,
+        "screen queue is full"
+    );
+    assert_eq!(ingress.enqueue(vec![0x80, 111, 1, 2].into()), 0);
+    assert_eq!(ingress.enqueue(vec![0x80, 72, 1, 2].into()), 0);
+    assert_eq!(veil_media_channel_set_screen_sharing(id, 0), 0);
+    assert_eq!(ingress.enqueue(new_camera.clone().into()), 0);
+    assert_eq!(camera_rx.try_recv().unwrap().payload, old_camera);
+    assert_eq!(camera_rx.try_recv().unwrap().payload, new_camera);
+    assert_eq!(screen_rx.try_recv().unwrap().payload, screen);
+    assert_eq!(audio_rx.try_recv().unwrap().payload, [0x80, 111, 1, 2]);
+    assert_eq!(audio_rx.try_recv().unwrap().payload, [0x80, 72, 1, 2]);
+    assert_eq!(veil_media_channel_set_screen_sharing(id, 2), -1);
+    unsafe { veil_media_close_channel(id) };
+    assert_eq!(veil_media_channel_set_screen_sharing(id, 1), -1);
+    assert_eq!(ingress.enqueue(screen.clone().into()), -1);
+}
+
+#[tokio::test]
+async fn camera_and_screen_relay_assemblers_cannot_merge_equal_timestamps() {
+    let (audio_tx, _audio_rx) = mpsc::channel(2);
+    let (camera_tx, mut camera_rx) = mpsc::channel(2);
+    let (screen_tx, mut screen_rx) = mpsc::channel(2);
+    let ingress = MediaIngress::with_screen(
+        audio_tx,
+        MediaVideoIngress::relay_frames(camera_tx, Arc::default()),
+        MediaVideoIngress::relay_frames(screen_tx, Arc::default()),
+    );
+    assert_eq!(ingress.enqueue(video_packet(7, false, 1).into()), 0);
+    ingress.screen_sharing.store(true, Ordering::Release);
+    assert_eq!(ingress.enqueue(video_packet(7, true, 2).into()), 0);
+    ingress.screen_sharing.store(false, Ordering::Release);
+    assert_eq!(ingress.enqueue(video_packet(7, true, 3).into()), 0);
+    assert_eq!(
+        screen_rx.try_recv().unwrap().packets,
+        vec![video_packet(7, true, 2)]
+    );
+    assert_eq!(
+        camera_rx.try_recv().unwrap().packets,
+        vec![video_packet(7, false, 1), video_packet(7, true, 3)]
+    );
+}
+
+#[tokio::test]
+async fn blocked_screen_writer_does_not_hold_audio_or_camera() {
+    let peer = [0xd4; 32];
+    let cipher = Arc::new(cipher_for_test(&peer, &[1; 32], &[2; 32]).unwrap());
+    let receiver = cipher_for_test(&peer, &[2; 32], &[1; 32]).unwrap();
+    let (audio_tx, audio_rx) = mpsc::channel(2);
+    let (camera_tx, camera_rx) = mpsc::channel(2);
+    let (screen_tx, screen_rx) = mpsc::channel(2);
+    let (sent_tx, mut sent_rx) = mpsc::channel(2);
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let mut entered = Some(entered_tx);
+    let batching = Arc::new(AtomicU8::new(MEDIA_BATCHING_OFF));
+    let screen_task = tokio::spawn(drain_media_packets_on_plane(
+        screen_rx,
+        Arc::clone(&batching),
+        Arc::clone(&cipher),
+        false,
+        Some(LocalMediaPlane::Screen),
+        move |_| {
+            entered.take().unwrap().send(()).unwrap();
+            std::future::pending::<bool>()
+        },
+    ));
+    let spawn = |rx, plane| {
+        let sent_tx = sent_tx.clone();
+        tokio::spawn(drain_media_packets_on_plane(
+            rx,
+            Arc::clone(&batching),
+            Arc::clone(&cipher),
+            false,
+            Some(plane),
+            move |cell| {
+                let tx = sent_tx.clone();
+                async move {
+                    tx.send(cell.sealed.into_vec()).await.unwrap();
+                    true
+                }
+            },
+        ))
+    };
+    let audio_task = spawn(audio_rx, LocalMediaPlane::Primary);
+    let camera_task = spawn(camera_rx, LocalMediaPlane::Secondary);
+    screen_tx
+        .send(video_packet(1, true, 1).into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let audio = vec![0x80, 111, 1, 2];
+    let camera = video_packet(2, true, 2);
+    audio_tx.send(audio.clone().into()).await.unwrap();
+    camera_tx.send(camera.clone().into()).await.unwrap();
+    let mut received = Vec::new();
+    for _ in 0..2 {
+        let cell = tokio::time::timeout(Duration::from_secs(1), sent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        received.push(receiver.open(&cell).unwrap());
+    }
+    screen_task.abort();
+    assert!(screen_task.await.unwrap_err().is_cancelled());
+    drop((audio_tx, camera_tx, screen_tx));
+    audio_task.await.unwrap();
+    camera_task.await.unwrap();
+    assert!(received.contains(&audio) && received.contains(&camera));
 }

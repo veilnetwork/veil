@@ -228,7 +228,8 @@ int _directMediaOpenChannelWorker(
     int peerEndpoint,
     Uint8List txKey,
     Uint8List rxKey,
-    int secondaryAppAddr) {
+    int secondaryAppAddr,
+    int screenAppAddr) {
   final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
   final pn = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerNode);
   final pa = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerApp);
@@ -243,6 +244,7 @@ int _directMediaOpenChannelWorker(
           'direct media open failed: ${_readErrAndFree(errOut)}');
     }
     _setSecondaryMediaSender(chan, secondaryAppAddr, errOut);
+    _setScreenMediaSender(chan, screenAppAddr, errOut);
     return chan;
   } finally {
     calloc.free(pn);
@@ -263,7 +265,8 @@ int _relayMediaOpenChannelWorker(
     int peerEndpoint,
     Uint8List txKey,
     Uint8List rxKey,
-    int secondaryAppAddr) {
+    int secondaryAppAddr,
+    int screenAppAddr) {
   final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
   final pn = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerNode);
   final pa = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerApp);
@@ -278,6 +281,7 @@ int _relayMediaOpenChannelWorker(
           'relay media open failed: ${_readErrAndFree(errOut)}');
     }
     _setSecondaryMediaSender(chan, secondaryAppAddr, errOut);
+    _setScreenMediaSender(chan, screenAppAddr, errOut);
     return chan;
   } finally {
     calloc.free(pn);
@@ -301,6 +305,20 @@ void _setSecondaryMediaSender(
     ffi.veilMediaCloseChannel(chan);
     throw VeilException(
         'secondary media sender failed: ${_readErrAndFree(errOut)}',
+        code: rc);
+  }
+}
+
+// Install the screen writer before exposing the native channel to capture.
+void _setScreenMediaSender(
+    int chan, int screenAppAddr, Pointer<Pointer<Utf8>> errOut) {
+  if (screenAppAddr == 0) return;
+  final rc = ffi.veilMediaChannelSetScreenSender(
+      chan, Pointer<ffi.VeilApp>.fromAddress(screenAppAddr), errOut);
+  if (rc != 0) {
+    ffi.veilMediaCloseChannel(chan);
+    throw VeilException(
+        'screen media sender failed: ${_readErrAndFree(errOut)}',
         code: rc);
   }
 }
@@ -2802,9 +2820,11 @@ class AppHandle implements Finalizable {
     required Uint8List txKey,
     required Uint8List rxKey,
     AppHandle? secondarySender,
+    AppHandle? screenSender,
   }) async {
     _ensureOpen();
     secondarySender?._ensureOpen();
+    screenSender?._ensureOpen();
     if (dstNodeId.length != 32 || dstAppId.length != 32) {
       throw ArgumentError('dst_node_id and dst_app_id must be 32 bytes');
     }
@@ -2813,8 +2833,16 @@ class AppHandle implements Finalizable {
     }
     final appAddr = _app.address;
     final secondaryAppAddr = secondarySender?._app.address ?? 0;
-    return Isolate.run(() => _directMediaOpenChannelWorker(appAddr, dstNodeId,
-        dstAppId, dstEndpointId, txKey, rxKey, secondaryAppAddr));
+    final screenAppAddr = screenSender?._app.address ?? 0;
+    return Isolate.run(() => _directMediaOpenChannelWorker(
+        appAddr,
+        dstNodeId,
+        dstAppId,
+        dstEndpointId,
+        txKey,
+        rxKey,
+        secondaryAppAddr,
+        screenAppAddr));
   }
 
   /// Open a media channel over the non-onion Delivery relay path, sealed with
@@ -2830,9 +2858,11 @@ class AppHandle implements Finalizable {
     required Uint8List txKey,
     required Uint8List rxKey,
     AppHandle? secondarySender,
+    AppHandle? screenSender,
   }) async {
     _ensureOpen();
     secondarySender?._ensureOpen();
+    screenSender?._ensureOpen();
     if (dstNodeId.length != 32 || dstAppId.length != 32) {
       throw ArgumentError('dst_node_id and dst_app_id must be 32 bytes');
     }
@@ -2841,8 +2871,23 @@ class AppHandle implements Finalizable {
     }
     final appAddr = _app.address;
     final secondaryAppAddr = secondarySender?._app.address ?? 0;
-    return Isolate.run(() => _relayMediaOpenChannelWorker(appAddr, dstNodeId,
-        dstAppId, dstEndpointId, txKey, rxKey, secondaryAppAddr));
+    final screenAppAddr = screenSender?._app.address ?? 0;
+    return Isolate.run(() => _relayMediaOpenChannelWorker(
+        appAddr,
+        dstNodeId,
+        dstAppId,
+        dstEndpointId,
+        txKey,
+        rxKey,
+        secondaryAppAddr,
+        screenAppAddr));
+  }
+
+  /// Select the endpoint-local capture queue before starting screen capture.
+  /// Clear it after capture stops. This never changes any network role label.
+  int setMediaScreenSharing(int chan, bool on) {
+    _ensureOpen();
+    return ffi.veilMediaChannelSetScreenSharing(chan, on ? 1 : 0);
   }
 
   /// Select the batching wire format on a direct/relay media channel.

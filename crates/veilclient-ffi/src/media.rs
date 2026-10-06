@@ -85,7 +85,8 @@ const MEDIA_SEALED_TAG_LEN: usize = 16;
 /// Bytes a seal adds on top of the plaintext cell. Send paths subtract this
 /// from their cell budget.
 pub(crate) const MEDIA_SEAL_OVERHEAD: usize = MEDIA_SEALED_HEADER_LEN + MEDIA_SEALED_TAG_LEN;
-const MEDIA_SEALED_MAX_EPOCHS: usize = 4;
+// Three local producers across two overlapping channel generations.
+const MEDIA_SEALED_MAX_EPOCHS: usize = 6;
 const MEDIA_SEALED_KDF_CONTEXT: &str = "xveil/call-media/channel-epoch/v1";
 /// How many receive-key replay windows survive channel teardown. A
 /// device holds one live call at a time and rebuilds its route a handful of
@@ -468,7 +469,7 @@ impl SealedMediaCell {
 /// independent epochs and counters, so a video burst cannot age delayed audio
 /// out of its replay window. Their wire salts are random and encode no role.
 pub(crate) struct MediaCipher {
-    tx: [Mutex<MediaCipherTx>; 2],
+    tx: [Mutex<MediaCipherTx>; 3],
     rx: Mutex<MediaCipherRx>,
 }
 
@@ -490,6 +491,7 @@ pub(crate) fn cipher_for_test(
 pub(crate) enum LocalMediaPlane {
     Primary,
     Secondary,
+    Screen,
 }
 
 impl MediaCipher {
@@ -517,8 +519,16 @@ impl MediaCipher {
         while secondary.salt == primary.salt {
             secondary = MediaCipherTx::new(tx_key);
         }
+        let mut screen = MediaCipherTx::new(tx_key);
+        while screen.salt == primary.salt || screen.salt == secondary.salt {
+            screen = MediaCipherTx::new(tx_key);
+        }
         Some(Self {
-            tx: [Mutex::new(primary), Mutex::new(secondary)],
+            tx: [
+                Mutex::new(primary),
+                Mutex::new(secondary),
+                Mutex::new(screen),
+            ],
             rx: Mutex::new(MediaCipherRx::new(peer, rx_key)),
         })
     }
@@ -536,6 +546,7 @@ impl MediaCipher {
         let index = match plane {
             LocalMediaPlane::Primary => 0,
             LocalMediaPlane::Secondary => 1,
+            LocalMediaPlane::Screen => 2,
         };
         self.tx[index]
             .lock()
@@ -1623,14 +1634,18 @@ mod tests {
     }
 
     #[test]
-    fn both_producers_survive_make_before_break_route_overlap() {
+    fn three_producers_survive_make_before_break_route_overlap() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let receiver = cipher([0xb3; 32], [0x73; 32], [0x74; 32]);
         let old_route = peer_cipher([0x74; 32], [0x73; 32]);
         let new_route = peer_cipher([0x74; 32], [0x73; 32]);
         let mut delayed = Vec::new();
         for sender in [&old_route, &new_route] {
-            for plane in [LocalMediaPlane::Primary, LocalMediaPlane::Secondary] {
+            for plane in [
+                LocalMediaPlane::Primary,
+                LocalMediaPlane::Secondary,
+                LocalMediaPlane::Screen,
+            ] {
                 delayed.push(sender.seal_on_plane(plane, b"delayed").unwrap());
                 let later = sender.seal_on_plane(plane, b"later").unwrap();
                 assert_eq!(receiver.open(later.as_bytes()), Some(b"later".to_vec()));
@@ -1661,10 +1676,39 @@ mod tests {
     }
 
     #[test]
+    fn held_screen_cipher_lock_does_not_block_camera_or_audio() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let sender = cipher([0xb6; 32], [0x79; 32], [0x80; 32]);
+        let held = sender.tx[2].lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = {
+            let sender = Arc::clone(&sender);
+            std::thread::spawn(move || {
+                tx.send(
+                    sender.seal(b"audio").is_some()
+                        && sender
+                            .seal_on_plane(LocalMediaPlane::Secondary, b"camera")
+                            .is_some(),
+                )
+                .unwrap();
+            })
+        };
+        let result = rx.recv_timeout(std::time::Duration::from_secs(1));
+        drop(held);
+        worker.join().unwrap();
+        assert!(result.unwrap());
+    }
+
+    #[test]
     fn parallel_producers_use_distinct_keys_and_unique_sequences() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let sender = cipher([0xb5; 32], [0x77; 32], [0x78; 32]);
-        let workers = [LocalMediaPlane::Primary, LocalMediaPlane::Secondary].map(|plane| {
+        let workers = [
+            LocalMediaPlane::Primary,
+            LocalMediaPlane::Secondary,
+            LocalMediaPlane::Screen,
+        ]
+        .map(|plane| {
             let sender = Arc::clone(&sender);
             std::thread::spawn(move || {
                 (0..512)
@@ -1672,9 +1716,11 @@ mod tests {
                     .collect::<Vec<_>>()
             })
         });
-        let [primary, secondary] = workers.map(|worker| worker.join().unwrap());
+        let [primary, secondary, screen] = workers.map(|worker| worker.join().unwrap());
         assert_ne!(&primary[0][4..12], &secondary[0][4..12]);
-        for cells in [primary, secondary] {
+        assert_ne!(&primary[0][4..12], &screen[0][4..12]);
+        assert_ne!(&secondary[0][4..12], &screen[0][4..12]);
+        for cells in [primary, secondary, screen] {
             for (index, cell) in cells.iter().enumerate() {
                 assert_eq!(&cell[4..12], &cells[0][4..12]);
                 assert_eq!(
@@ -2102,10 +2148,11 @@ mod tests {
 
     #[test]
     fn unauthenticated_epoch_cannot_evict_receive_state() {
-        let key = [0x42u8; 32];
+        let mut key = [0u8; 32];
+        OsRng.fill_bytes(&mut key);
         let mut tx = MediaCipherTx::new(&key);
-        // A peer of its own: replay state is shared per peer, and this test
-        // asserts on an untouched window.
+        // Replay state is shared per directional key, across peer addresses.
+        // Use fresh material so earlier fixtures cannot populate this window.
         let mut rx = MediaCipherRx::new(&[0x02u8; 32], &key);
         let valid = tx.seal(b"authenticated").unwrap();
         let mut forged = valid.clone();

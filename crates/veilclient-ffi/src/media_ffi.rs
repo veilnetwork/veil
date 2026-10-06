@@ -235,10 +235,25 @@ struct MediaOutboundCell {
 /// Each producer also owns its cipher epoch and synchronous seal lock.
 #[cfg(feature = "node-embedded")]
 async fn drain_media_packets<F, Fut>(
+    rx: mpsc::Receiver<QueuedMediaPacket>,
+    batching: Arc<std::sync::atomic::AtomicU8>,
+    cipher: Arc<media::MediaCipher>,
+    relay: bool,
+    send: F,
+) where
+    F: FnMut(MediaOutboundCell) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    drain_media_packets_on_plane(rx, batching, cipher, relay, None, send).await;
+}
+
+#[cfg(feature = "node-embedded")]
+async fn drain_media_packets_on_plane<F, Fut>(
     mut rx: mpsc::Receiver<QueuedMediaPacket>,
     batching: Arc<std::sync::atomic::AtomicU8>,
     cipher: Arc<media::MediaCipher>,
     relay: bool,
+    local_plane: Option<media::LocalMediaPlane>,
     mut send: F,
 ) where
     F: FnMut(MediaOutboundCell) -> Fut,
@@ -281,7 +296,10 @@ async fn drain_media_packets<F, Fut>(
             } else {
                 (0, 0)
             };
-            let Some(sealed) = cipher.seal_on_plane(media_cell_plane(&packet), &packet) else {
+            let Some(sealed) = cipher.seal_on_plane(
+                local_plane.unwrap_or_else(|| media_cell_plane(&packet)),
+                &packet,
+            ) else {
                 continue;
             };
             let sealed = sealed.with_local_deadline(queued.deadline);
@@ -301,10 +319,33 @@ async fn drain_media_packets<F, Fut>(
 
 #[cfg(feature = "node-embedded")]
 async fn drain_relay_video<F, Fut>(
+    rx: mpsc::Receiver<RelayVideoFrame>,
+    batching: Arc<std::sync::atomic::AtomicU8>,
+    cipher: Arc<media::MediaCipher>,
+    stats: Arc<RelayMediaStats>,
+    send: F,
+) where
+    F: FnMut(media::SealedMediaCell) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    drain_relay_video_on_plane(
+        rx,
+        batching,
+        cipher,
+        stats,
+        media::LocalMediaPlane::Secondary,
+        send,
+    )
+    .await;
+}
+
+#[cfg(feature = "node-embedded")]
+async fn drain_relay_video_on_plane<F, Fut>(
     mut rx: mpsc::Receiver<RelayVideoFrame>,
     batching: Arc<std::sync::atomic::AtomicU8>,
     cipher: Arc<media::MediaCipher>,
     stats: Arc<RelayMediaStats>,
+    plane: media::LocalMediaPlane,
     mut send: F,
 ) where
     F: FnMut(media::SealedMediaCell) -> Fut,
@@ -330,8 +371,7 @@ async fn drain_relay_video<F, Fut>(
                 continue;
             }
             let cell = queued.payload;
-            let Some(sealed) = cipher.seal_on_plane(media::LocalMediaPlane::Secondary, &cell)
-            else {
+            let Some(sealed) = cipher.seal_on_plane(plane, &cell) else {
                 continue;
             };
             let sealed = sealed.with_local_deadline(queued.deadline);
@@ -436,8 +476,10 @@ pub unsafe extern "C" fn veil_media_open_channel(
     }
     let (tx_hi, rx_hi) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_HI_QUEUE);
     let (tx_video, rx_video) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_VIDEO_QUEUE);
+    let (tx_screen, rx_screen) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_VIDEO_QUEUE);
     let (repair_hi_tx, repair_hi_rx) = mpsc::channel::<()>(1);
     let (repair_video_tx, repair_video_rx) = mpsc::channel::<()>(1);
+    let (repair_screen_tx, repair_screen_rx) = mpsc::channel::<()>(1);
     let spawn_producer = |rx, repair_rx, plane| {
         let send_hub = Arc::clone(&hub);
         let warm_hub = Arc::clone(&hub);
@@ -474,18 +516,25 @@ pub unsafe extern "C" fn veil_media_open_channel(
     };
     let task = spawn_producer(rx_hi, repair_hi_rx, media::LocalMediaPlane::Primary);
     let video_task = spawn_producer(rx_video, repair_video_rx, media::LocalMediaPlane::Secondary);
+    let screen_task = spawn_producer(rx_screen, repair_screen_rx, media::LocalMediaPlane::Screen);
     MEDIA_CHANNELS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(
             id,
             MediaChannel {
-                ingress: MediaIngress::new(tx_hi, MediaVideoIngress::Packets(tx_video)),
-                repair_tx: Some([repair_hi_tx, repair_video_tx]),
+                ingress: MediaIngress::with_screen(
+                    tx_hi,
+                    MediaVideoIngress::Packets(tx_video),
+                    MediaVideoIngress::Packets(tx_screen),
+                ),
+                repair_tx: Some([repair_hi_tx, repair_video_tx, repair_screen_tx]),
                 peer,
                 task,
                 video_task: Some(video_task),
+                screen_task: Some(screen_task),
                 video_sender: None,
+                screen_sender: None,
                 sender_app_id: None,
                 batching: None,
                 cipher,
@@ -630,8 +679,10 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
 
     let (tx_hi, rx_hi) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_HI_QUEUE);
     let (tx_video, rx_video) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_VIDEO_QUEUE);
+    let (tx_screen, rx_screen) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_VIDEO_QUEUE);
     let sender = Arc::clone(&app_ref.sender);
     let video_sender = Arc::new(MediaSenderSlot::new(Arc::clone(&sender)));
+    let screen_sender = Arc::new(MediaSenderSlot::new(Arc::clone(&sender)));
     let batching = Arc::new(std::sync::atomic::AtomicU8::new(MEDIA_BATCHING_OFF));
     let started = std::time::Instant::now();
     let transport_seq = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -674,6 +725,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
         },
     ));
     let video_source = Arc::clone(&video_sender);
+    let seq_video = Arc::clone(&transport_seq);
     let video_task = app_ref.bundle.runtime.spawn(drain_media_packets(
         rx_video,
         Arc::clone(&batching),
@@ -681,7 +733,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
         false,
         move |cell| {
             let sender = video_source.current();
-            let seq = Arc::clone(&transport_seq);
+            let seq = Arc::clone(&seq_video);
             async move {
                 let Some(guard) = cell.sealed.lock_while_fresh(&sender).await else {
                     return true;
@@ -710,6 +762,44 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
             }
         },
     ));
+    let screen_source = Arc::clone(&screen_sender);
+    let screen_task = app_ref.bundle.runtime.spawn(drain_media_packets_on_plane(
+        rx_screen,
+        Arc::clone(&batching),
+        Arc::clone(&cipher),
+        false,
+        Some(media::LocalMediaPlane::Screen),
+        move |cell| {
+            let sender = screen_source.current();
+            let seq = Arc::clone(&transport_seq);
+            async move {
+                let Some(guard) = cell.sealed.lock_while_fresh(&sender).await else {
+                    return true;
+                };
+                let Some(sender) = guard.as_ref() else {
+                    return false;
+                };
+                let timestamp_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                let _ = sender
+                    .send_rt_data_on_local_lane_before(
+                        veil_proto::priority::BACKGROUND,
+                        peer,
+                        peer_app,
+                        peer_endpoint_id,
+                        seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                        timestamp_us,
+                        cell.marker,
+                        cell.payload_type,
+                        cell.sealed.as_bytes(),
+                        cell.sealed
+                            .local_deadline()
+                            .expect("native pump retains packet deadline"),
+                    )
+                    .await;
+                true
+            }
+        },
+    ));
     let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     MEDIA_CHANNELS
         .lock()
@@ -717,12 +807,18 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
         .insert(
             id,
             MediaChannel {
-                ingress: MediaIngress::new(tx_hi, MediaVideoIngress::Packets(tx_video)),
+                ingress: MediaIngress::with_screen(
+                    tx_hi,
+                    MediaVideoIngress::Packets(tx_video),
+                    MediaVideoIngress::Packets(tx_screen),
+                ),
                 repair_tx: None,
                 peer,
                 task,
                 video_task: Some(video_task),
+                screen_task: Some(screen_task),
                 video_sender: Some(video_sender),
+                screen_sender: Some(screen_sender),
                 sender_app_id: Some(app_ref.app_id),
                 batching: Some(batching),
                 cipher,
@@ -773,8 +869,11 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
     let (tx_hi, rx_hi) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_HI_QUEUE);
     let (tx_video_frames, rx_video_frames) =
         mpsc::channel::<RelayVideoFrame>(RELAY_VIDEO_FRAME_QUEUE);
+    let (tx_screen_frames, rx_screen_frames) =
+        mpsc::channel::<RelayVideoFrame>(RELAY_VIDEO_FRAME_QUEUE);
     let sender = Arc::clone(&app_ref.sender);
     let video_sender = Arc::new(MediaSenderSlot::new(Arc::clone(&sender)));
+    let screen_sender = Arc::new(MediaSenderSlot::new(Arc::clone(&sender)));
     let batching = Arc::new(std::sync::atomic::AtomicU8::new(MEDIA_BATCHING_OFF));
     let relay_stats = Arc::new(RelayMediaStats::default());
     let high_stats = Arc::clone(&relay_stats);
@@ -860,6 +959,47 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
             }
         },
     ));
+    let screen_source = Arc::clone(&screen_sender);
+    let screen_stats = Arc::clone(&relay_stats);
+    let screen_task = app_ref.bundle.runtime.spawn(drain_relay_video_on_plane(
+        rx_screen_frames,
+        Arc::clone(&batching),
+        Arc::clone(&cipher),
+        Arc::clone(&relay_stats),
+        media::LocalMediaPlane::Screen,
+        move |sealed| {
+            let sender = screen_source.current();
+            let stats = Arc::clone(&screen_stats);
+            async move {
+                let lock_started = std::time::Instant::now();
+                let guard = sealed.lock_while_fresh(&sender).await;
+                stats.observe_sender_lock(lock_started.elapsed());
+                let Some(guard) = guard else {
+                    return true;
+                };
+                let Some(sender) = guard.as_ref() else {
+                    return false;
+                };
+                let ipc_started = std::time::Instant::now();
+                let deadline = sealed
+                    .local_deadline()
+                    .expect("native pump retains packet deadline");
+                let result = sender
+                    .send_relay_media_sealed_on_local_lane_before_tracked_owned(
+                        veil_proto::priority::BACKGROUND,
+                        peer,
+                        peer_app,
+                        peer_endpoint_id,
+                        sealed.into_vec(),
+                        deadline,
+                        Some(Arc::clone(&stats.ipc_send_failures)),
+                    )
+                    .await;
+                stats.observe_ipc_cell(ipc_started.elapsed(), !matches!(result, Ok(true)));
+                true
+            }
+        },
+    ));
     let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     MEDIA_CHANNELS
         .lock()
@@ -867,15 +1007,18 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
         .insert(
             id,
             MediaChannel {
-                ingress: MediaIngress::new(
+                ingress: MediaIngress::with_screen(
                     tx_hi,
                     MediaVideoIngress::relay_frames(tx_video_frames, Arc::clone(&relay_stats)),
+                    MediaVideoIngress::relay_frames(tx_screen_frames, Arc::clone(&relay_stats)),
                 ),
                 repair_tx: None,
                 peer,
                 task,
                 video_task: Some(video_task),
+                screen_task: Some(screen_task),
                 video_sender: Some(video_sender),
+                screen_sender: Some(screen_sender),
                 sender_app_id: Some(app_ref.app_id),
                 batching: Some(batching),
                 cipher,
@@ -916,6 +1059,67 @@ pub unsafe extern "C" fn veil_media_channel_set_secondary_sender(
         return -1;
     };
     slot.replace(Arc::clone(&app_ref.sender));
+    0
+}
+
+/// Set the channel's screen local IPC sender before starting media. It must
+/// bind the same application identity as the primary sender. No sender role
+/// or local endpoint id is added to network packets. Returns 0 on success,
+/// -1 on an invalid channel/app or an anonymous channel without this plane.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_media_channel_set_screen_sender(
+    chan: u64,
+    app: *mut VeilApp,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if unsafe { guard::ffi_prelude(err_out, "veil_media_channel_set_screen_sender") }.is_err() {
+        return -1;
+    }
+    null_check_with_default!(err_out, -1, "app" => app);
+    get_or_return!(app_ref, app_table(), app, err_out, -1, "VeilApp");
+    let channels = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(channel) = channels.get(&chan) else {
+        unsafe { write_err(err_out, "unknown media channel") };
+        return -1;
+    };
+    if channel.sender_app_id != Some(app_ref.app_id) {
+        unsafe { write_err(err_out, "screen sender must have the same app identity") };
+        return -1;
+    }
+    let Some(slot) = channel.screen_sender.as_ref() else {
+        unsafe { write_err(err_out, "media channel has no screen IPC plane") };
+        return -1;
+    };
+    slot.replace(Arc::clone(&app_ref.sender));
+    0
+}
+
+/// Select the local screen producer before starting capture; clear after it
+/// stops. RTP is still sealed in the same role-free wire format. Returns -1
+/// for a closed/invalid channel or a channel without screen ingress.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub extern "C" fn veil_media_channel_set_screen_sharing(chan: u64, on: c_int) -> c_int {
+    if on != 0 && on != 1 {
+        return -1;
+    }
+    let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(channel) = map.get(&chan) else {
+        return -1;
+    };
+    if channel.ingress.screen.is_none()
+        || channel
+            .ingress
+            .closed
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return -1;
+    }
+    channel
+        .ingress
+        .screen_sharing
+        .store(on != 0, std::sync::atomic::Ordering::Release);
     0
 }
 
@@ -1239,7 +1443,7 @@ pub unsafe extern "C" fn veil_media_set_recv_callback(
     0
 }
 
-/// Close a media channel: stops both drain tasks, drops the outbound queues, and
+/// Close a media channel: stops all producer tasks, drops the outbound queues, and
 /// clears the peer's recv callback. Idempotent (unknown `chan` is a no-op).
 #[cfg(feature = "node-embedded")]
 #[unsafe(no_mangle)]
@@ -1297,11 +1501,13 @@ struct MediaChannel {
     /// The receiver of the media asks the sender to refresh its outbound
     /// rendezvous pool when RTP/RTCP has gone dark even though signaling is
     /// still alive. Direct channels leave this `None`.
-    repair_tx: Option<[mpsc::Sender<()>; 2]>,
+    repair_tx: Option<[mpsc::Sender<()>; 3]>,
     peer: [u8; 32],
     task: tokio::task::JoinHandle<()>,
     video_task: Option<tokio::task::JoinHandle<()>>,
+    screen_task: Option<tokio::task::JoinHandle<()>>,
     video_sender: Option<Arc<MediaSenderSlot<AppSender>>>,
+    screen_sender: Option<Arc<MediaSenderSlot<AppSender>>>,
     sender_app_id: Option<[u8; 32]>,
     /// Opt-in media batching on direct/RELAY send paths (see
     /// `veil_media_channel_set_batching`). Off by default: a batched cell is
@@ -1335,6 +1541,9 @@ impl MediaChannel {
         if let Some(video_task) = self.video_task.as_ref() {
             video_task.abort();
         }
+        if let Some(screen_task) = &self.screen_task {
+            screen_task.abort();
+        }
     }
 }
 
@@ -1367,6 +1576,8 @@ enum MediaVideoIngress {
 struct MediaIngress {
     tx_hi: mpsc::Sender<QueuedMediaPacket>,
     video: MediaVideoIngress,
+    screen: Option<MediaVideoIngress>,
+    screen_sharing: std::sync::atomic::AtomicBool,
     closed: std::sync::atomic::AtomicBool,
 }
 
@@ -1384,10 +1595,29 @@ impl MediaVideoIngress {
 
 #[cfg(feature = "node-embedded")]
 impl MediaIngress {
+    #[cfg(test)]
     fn new(tx_hi: mpsc::Sender<QueuedMediaPacket>, video: MediaVideoIngress) -> Arc<Self> {
+        Self::make(tx_hi, video, None)
+    }
+
+    fn with_screen(
+        tx_hi: mpsc::Sender<QueuedMediaPacket>,
+        video: MediaVideoIngress,
+        screen: MediaVideoIngress,
+    ) -> Arc<Self> {
+        Self::make(tx_hi, video, Some(screen))
+    }
+
+    fn make(
+        tx_hi: mpsc::Sender<QueuedMediaPacket>,
+        video: MediaVideoIngress,
+        screen: Option<MediaVideoIngress>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             tx_hi,
             video,
+            screen,
+            screen_sharing: std::sync::atomic::AtomicBool::new(false),
             closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -1400,7 +1630,15 @@ impl MediaIngress {
         if !media_is_vp8_rtp(&payload.payload) {
             return Self::send_packet(&self.tx_hi, payload);
         }
-        match &self.video {
+        let source = if self.screen_sharing.load(Acquire) {
+            match &self.screen {
+                Some(screen) => screen,
+                None => return -1,
+            }
+        } else {
+            &self.video
+        };
+        match source {
             MediaVideoIngress::Packets(tx) => Self::send_packet(tx, payload),
             MediaVideoIngress::RelayFrames {
                 tx,

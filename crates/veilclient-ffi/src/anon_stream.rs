@@ -1512,6 +1512,7 @@ impl CircuitCells {
             local_datagram_lane: match plane {
                 LocalMediaPlane::Primary => veil_proto::priority::REALTIME,
                 LocalMediaPlane::Secondary => veil_proto::priority::BULK,
+                LocalMediaPlane::Screen => veil_proto::priority::BACKGROUND,
             },
             outbound_circuits: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             stream_routes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -3204,7 +3205,7 @@ pub struct AnonStreamHub {
     cells: Arc<HubCells>,
     /// Local producers have separate pools, repair and route-selection state.
     /// They reuse the hub's registration and authenticated receive demux.
-    media_cells: Option<[CircuitCells; 2]>,
+    media_cells: Option<[CircuitCells; 3]>,
     _sender: Arc<AppSender>,
 }
 
@@ -3478,6 +3479,7 @@ impl AnonStreamHub {
             HubCells::Circuit(c) => Some([
                 c.isolated_producer(LocalMediaPlane::Primary),
                 c.isolated_producer(LocalMediaPlane::Secondary),
+                c.isolated_producer(LocalMediaPlane::Screen),
             ]),
             HubCells::Anon(_) => None,
         };
@@ -3530,6 +3532,7 @@ impl AnonStreamHub {
         let index = match plane {
             LocalMediaPlane::Primary => 0,
             LocalMediaPlane::Secondary => 1,
+            LocalMediaPlane::Screen => 2,
         };
         self.media_cells.as_ref().map(|cells| &cells[index])
     }
@@ -5414,9 +5417,12 @@ mod tests {
         let files = super::try_open_circuit(me, in_tx, CircuitMode::PublishedRendezvous).unwrap();
         let audio = files.isolated_producer(crate::media::LocalMediaPlane::Primary);
         let video = files.isolated_producer(crate::media::LocalMediaPlane::Secondary);
+        let screen = files.isolated_producer(crate::media::LocalMediaPlane::Screen);
+        assert!(screen.private_outbound_registration);
+        assert_eq!(screen.local_datagram_lane, veil_proto::priority::BACKGROUND);
         assert!(!files.private_outbound_registration);
         assert!(audio.private_outbound_registration && video.private_outbound_registration);
-        // Receive authentication remains common to all three local producers.
+        // Receive authentication remains common to files and all media producers.
         assert!(Arc::ptr_eq(&files.peer_tags, &audio.peer_tags));
         assert!(Arc::ptr_eq(&files.peer_aliases, &video.peer_aliases));
         let held_files = files.outbound_circuits.lock().await;
@@ -5424,11 +5430,18 @@ mod tests {
         let held_video_opening = video.outbound_opening.lock().await;
         let sender = crate::media::cipher_for_test(&[0x8b; 32], &[1; 32], &[2; 32]).unwrap();
         let sealed = sender.seal(b"offline fixture").unwrap();
+        let screen_sealed = sender
+            .seal_on_plane(crate::media::LocalMediaPlane::Screen, b"screen")
+            .unwrap();
         let result = tokio::time::timeout(Duration::from_millis(100), async {
             audio
                 .ensure_outbound_opening([0x8b; 32], super::RouteClass::Bulk)
                 .await;
-            audio.send_datagram([0x8b; 32], &sealed).await
+            let audio_result = audio.send_datagram([0x8b; 32], &sealed).await;
+            screen
+                .ensure_outbound_opening([0x8b; 32], super::RouteClass::Bulk)
+                .await;
+            audio_result || screen.send_datagram([0x8b; 32], &screen_sealed).await
         })
         .await;
         drop((held_files, held_video, held_video_opening));
