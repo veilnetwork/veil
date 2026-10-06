@@ -1292,6 +1292,10 @@ async fn measure_bound_independent_load(
         bind_test_lane(&local_handle, &remote_handle, &local_parent, &remote_parent).await;
     let mut secondary =
         bind_test_lane(&local_handle, &remote_handle, &local_parent, &remote_parent).await;
+    let mut screen =
+        bind_test_lane(&local_handle, &remote_handle, &local_parent, &remote_parent).await;
+    assert!(screen.tx.channel_binding().unwrap() != primary.tx.channel_binding().unwrap());
+    assert!(screen.tx.channel_binding().unwrap() != secondary.tx.channel_binding().unwrap());
     assert!(primary.tx.channel_binding().unwrap() != secondary.tx.channel_binding().unwrap());
     assert!(primary.tx.channel_binding().unwrap() != canonical.channel_binding().unwrap());
     let mut admission = super::local_reliable_admission::LocalReliableAdmission::new(canonical);
@@ -1380,9 +1384,29 @@ async fn measure_bound_independent_load(
             }
         }
     });
+    let screen_received = Arc::new(AtomicU64::new(0));
+    let screen_count = Arc::clone(&screen_received);
+    let screen_rx = screen.rx.clone();
+    let mut screen_cipher_rx = screen.rx_cipher;
+    let screen_reader = tokio::spawn(async move {
+        while let Ok(packet) = screen_rx.recv().await {
+            if let Some(frame) = screen_cipher_rx
+                .decode_datagram(&packet, std::time::Instant::now())
+                .unwrap()
+            {
+                let cell =
+                    veil_anonymity::circuit_wire::CircuitDataPayload::decode(&frame[HEADER_SIZE..])
+                        .unwrap();
+                assert_eq!(cell.circuit_id, 3);
+                assert!(cell.ciphertext.iter().all(|byte| *byte == 0x33));
+                screen_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
     let mut primary_sent = 0;
     let mut secondary_sent = 0;
     let mut secondary_dropped = 0;
+    let mut screen_sent = 0;
     for tick in 0u32..1200 {
         sleep_until(started + Duration::from_millis(u64::from(tick) * 10)).await;
         if tick % 2 == 0 {
@@ -1412,14 +1436,10 @@ async fn measure_bound_independent_load(
             }
         }
         // Interleaved neutral traffic cannot select or reset the local gate.
-        for priority in [
-            veil_proto::priority::INTERACTIVE,
-            REALTIME,
-            veil_proto::priority::BACKGROUND,
-        ] {
+        for priority in [veil_proto::priority::INTERACTIVE, REALTIME] {
             assert!(admission.allow_secondary(priority, std::time::Instant::now()));
         }
-        if loaded && tick >= 200 {
+        if loaded && tick >= 200 && tick % 2 == 0 {
             let frame = circuit_frame(2, 0x22);
             let packets = secondary
                 .tx_cipher
@@ -1440,12 +1460,38 @@ async fn measure_bound_independent_load(
                 secondary_dropped += 1;
             }
         }
+        if loaded && tick >= 200 && tick % 2 == 1 {
+            let frame = circuit_frame(3, 0x33);
+            let priority = veil_proto::priority::BACKGROUND;
+            let packets = screen
+                .tx_cipher
+                .encode_frame(u64::from(priority), &frame, screen.tx.max_size().unwrap())
+                .unwrap();
+            if admission.allow_secondary(priority, std::time::Instant::now())
+                && super::local_datagram_fits(
+                    priority,
+                    packets.iter().map(Vec::len).sum(),
+                    screen.tx.send_buffer_space(),
+                )
+            {
+                for packet in packets {
+                    screen.tx.send(&packet).unwrap();
+                }
+                screen_sent += 1;
+            }
+        }
     }
     sleep(Duration::from_millis(400)).await;
     // Close before evaluating quality so a failed assertion cannot strand
     // child transports, blocked writes or stand reader tasks.
     close.close(0u32.into(), b"independent stand complete");
-    let tasks = [file_reader, file_writer, primary_reader, secondary_reader];
+    let tasks = [
+        file_reader,
+        file_writer,
+        primary_reader,
+        secondary_reader,
+        screen_reader,
+    ];
     for task in &tasks {
         task.abort();
     }
@@ -1480,6 +1526,17 @@ async fn measure_bound_independent_load(
     max_gap = max_gap
         .max(Duration::from_secs(12).saturating_sub(previous.unwrap_or(Duration::from_secs(2))));
     ages.sort_by(f64::total_cmp);
+    if loaded {
+        assert!(
+            screen_sent > 0 && screen_received.load(Ordering::Relaxed) > 0,
+            "screen's independent child made no decrypted progress"
+        );
+    }
+    eprintln!(
+        "bound_independent screen_sent={} screen_received={}",
+        screen_sent,
+        screen_received.load(Ordering::Relaxed)
+    );
     let report = IndependentLoadReport {
         large_primary,
         loaded,
@@ -1624,6 +1681,13 @@ async fn primary_ack_blackout_limits_secondary_before_rtt_or_expiry_changes() {
     admission.observe_primary_path(&handle, now);
     let probe_allowed = admission.allow_secondary(BULK, now);
     let burst_allowed = admission.allow_secondary(BULK, now + Duration::from_millis(1));
+    assert!(
+        !admission.allow_secondary(
+            veil_proto::priority::BACKGROUND,
+            now + Duration::from_millis(1)
+        ),
+        "screen must not bypass the local audio pressure budget"
+    );
     admission.observe(REALTIME, &frame, now, true);
     // A stalled independent primary must not shrink the parent control path
     // before RTT/expiry feedback arrives. A PQ rekey-sized control write
@@ -1634,7 +1698,7 @@ async fn primary_ack_blackout_limits_secondary_before_rtt_or_expiry_changes() {
     )
     .await
     .is_ok_and(|result| result.is_ok());
-    for priority in [REALTIME, INTERACTIVE, veil_proto::priority::BACKGROUND] {
+    for priority in [REALTIME, INTERACTIVE] {
         assert!(admission.allow_secondary(priority, now));
     }
     link.blackout.store(false, Ordering::Relaxed);

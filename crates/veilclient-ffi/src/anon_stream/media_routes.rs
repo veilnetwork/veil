@@ -235,12 +235,13 @@ async fn open_private_route(
 pub(crate) struct MediaRoutes {
     peer: [u8; 32],
     channel: u64,
-    cores: [CircuitCells; 2],
+    cores: [CircuitCells; 3],
     cipher: Arc<crate::media::MediaCipher>,
-    outgoing: [tokio::sync::Mutex<Option<(ReceiveAddress, PinnedRoute, u64)>>; 2],
-    repair_generation: [AtomicU64; 2],
+    outgoing: [tokio::sync::Mutex<Option<(ReceiveAddress, PinnedRoute, u64)>>; 3],
+    repair_generation: [AtomicU64; 3],
     offers: Mutex<OfferInbox>,
     closed: AtomicBool,
+    screen_active: AtomicBool,
     incoming: Mutex<([Option<ReceiveAddress>; 2], u64)>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -249,7 +250,7 @@ impl MediaRoutes {
     pub(super) fn new(
         peer: [u8; 32],
         channel: u64,
-        cores: [CircuitCells; 2],
+        cores: [CircuitCells; 3],
         cipher: Arc<crate::media::MediaCipher>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -261,6 +262,7 @@ impl MediaRoutes {
             repair_generation: std::array::from_fn(|_| AtomicU64::new(0)),
             offers: Mutex::new(OfferInbox::default()),
             closed: AtomicBool::new(false),
+            screen_active: AtomicBool::new(false),
             incoming: Mutex::new(([None, None], 0)),
             tasks: Mutex::new(Vec::new()),
         })
@@ -275,6 +277,8 @@ impl MediaRoutes {
             let routes = Arc::clone(self);
             tasks.push(runtime.spawn(routes.run_plane(plane)));
         }
+        let routes = Arc::clone(self);
+        tasks.push(runtime.spawn(routes.run_screen_sender()));
         let routes = Arc::clone(self);
         tasks.push(runtime.spawn(routes.advertise()));
     }
@@ -311,13 +315,16 @@ impl MediaRoutes {
 
     pub(crate) async fn warm(&self, plane: LocalMediaPlane) {
         let i = plane_index(plane);
+        if i == 2 {
+            self.screen_active.store(true, Ordering::Release);
+        }
         self.cores[i]
             .ensure_outbound_opening(self.peer, RouteClass::Bulk)
             .await;
     }
 
     pub(crate) fn repair(&self) {
-        for i in 0..2 {
+        for i in 0..3 {
             self.repair_generation[i].fetch_add(1, Ordering::AcqRel);
             if let Ok(mut route) = self.outgoing[i].try_lock() {
                 route.take();
@@ -380,6 +387,56 @@ impl MediaRoutes {
         core.send_datagram(self.peer, sealed).await
     }
 
+    async fn refresh_outgoing(self: &Arc<Self>, i: usize) {
+        let core = &self.cores[i];
+        let offer = self
+            .offers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .highest
+            .clone();
+        if let Some(offer) = offer
+            && let Some(address) = offer.routes.iter().find(|r| r.plane as usize == i.min(1))
+        {
+            let repair_generation = self.repair_generation[i].load(Ordering::Acquire);
+            let ready =
+                self.outgoing[i]
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|(old, route, generation)| {
+                        old == address && route.is_live() && *generation == repair_generation
+                    });
+            if ready && let Some((_, route, _)) = self.outgoing[i].lock().await.as_ref() {
+                route.probe();
+            }
+            if !ready && let Some(route) = open_private_route(core, address.relay, self).await {
+                let mut outgoing = self.outgoing[i].lock().await;
+                let offers = self.offers.lock().unwrap_or_else(|p| p.into_inner());
+                if offers.is_current(&offer)
+                    && !self.closed.load(Ordering::Acquire)
+                    && self.repair_generation[i].load(Ordering::Acquire) == repair_generation
+                {
+                    *outgoing = Some((address.clone(), route, repair_generation));
+                }
+            }
+        }
+    }
+
+    async fn run_screen_sender(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            if self.closed.load(Ordering::Acquire) {
+                break;
+            }
+            if self.screen_active.load(Ordering::Acquire) {
+                self.refresh_outgoing(2).await;
+            }
+        }
+    }
+
     /// Construction, repair and expiry are independent for each local producer.
     /// A stalled secondary build cannot delay the primary offer or its repair.
     async fn run_plane(self: Arc<Self>, i: usize) {
@@ -396,36 +453,7 @@ impl MediaRoutes {
             if self.closed.load(Ordering::Acquire) {
                 break;
             }
-            let offer = self
-                .offers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .highest
-                .clone();
-            if let Some(offer) = offer
-                && let Some(address) = offer.routes.iter().find(|r| r.plane as usize == i)
-            {
-                let repair_generation = self.repair_generation[i].load(Ordering::Acquire);
-                let ready = self.outgoing[i].lock().await.as_ref().is_some_and(
-                    |(old, route, generation)| {
-                        old == address && route.is_live() && *generation == repair_generation
-                    },
-                );
-                if ready && let Some((_, route, _)) = self.outgoing[i].lock().await.as_ref() {
-                    route.probe();
-                }
-                if !ready && let Some(route) = open_private_route(core, address.relay, &self).await
-                {
-                    let mut outgoing = self.outgoing[i].lock().await;
-                    let offers = self.offers.lock().unwrap_or_else(|p| p.into_inner());
-                    if offers.is_current(&offer)
-                        && !self.closed.load(Ordering::Acquire)
-                        && self.repair_generation[i].load(Ordering::Acquire) == repair_generation
-                    {
-                        *outgoing = Some((address.clone(), route, repair_generation));
-                    }
-                }
-            }
+            self.refresh_outgoing(i).await;
             retired.retain(|(since, _)| since.elapsed() < PRIVATE_RETIRE_GRACE);
             if !incoming.as_ref().is_some_and(PinnedRoute::is_live) {
                 for relay in core.services.local_published_rendezvous_relays() {
@@ -493,6 +521,7 @@ fn plane_index(plane: LocalMediaPlane) -> usize {
     match plane {
         LocalMediaPlane::Primary => 0,
         LocalMediaPlane::Secondary => 1,
+        LocalMediaPlane::Screen => 2,
     }
 }
 
@@ -514,7 +543,16 @@ pub(crate) async fn fixture(
         CircuitMode::PublishedRendezvous,
     )
     .unwrap();
-    let routes = MediaRoutes::new(peer, channel, [core.clone(), core], cipher);
+    let routes = MediaRoutes::new(
+        peer,
+        channel,
+        [
+            core.isolated_producer(LocalMediaPlane::Primary),
+            core.isolated_producer(LocalMediaPlane::Secondary),
+            core.isolated_producer(LocalMediaPlane::Screen),
+        ],
+        cipher,
+    );
     (dir, runtime, routes)
 }
 
@@ -552,6 +590,7 @@ impl MediaRoutes {
         let cores = [
             core.isolated_producer(LocalMediaPlane::Primary),
             core.isolated_producer(LocalMediaPlane::Secondary),
+            core.isolated_producer(LocalMediaPlane::Screen),
         ];
         (Self::new(peer, channel, cores, cipher), rx)
     }
@@ -569,7 +608,7 @@ impl MediaRoutes {
 
     pub(crate) async fn outgoing_for_test(&self) -> Vec<RouteSnapshot> {
         let mut routes = Vec::new();
-        for i in 0..2 {
+        for i in 0..3 {
             if let Some((address, route, _)) = self.outgoing[i].lock().await.as_ref() {
                 routes.push(RouteSnapshot {
                     plane: i as u8,
@@ -677,7 +716,8 @@ mod tests {
             .iter()
             .map(|t| t.abort_handle())
             .collect();
-        assert_eq!(aborts.len(), 3);
+        assert_eq!(aborts.len(), 4);
+        assert!(!routes.screen_active.load(Ordering::Acquire));
         routes.stop();
         routes.accept_control(&offer(1, 1).encode());
         assert!(routes.received_offer_for_test().is_none());
