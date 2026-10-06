@@ -3251,6 +3251,7 @@ int veil_media_engine_push_android420_frame(
              ? VEIL_MEDIA_OK
              : VEIL_MEDIA_ERR_STATE;
 #else
+  if (!should_encode_video_frame(ws)) return VEIL_MEDIA_OK;
   const bool swap = rotation == 90 || rotation == 270;
   const int out_width = swap ? height : width;
   const int out_height = swap ? width : height;
