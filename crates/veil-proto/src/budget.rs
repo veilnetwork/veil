@@ -1011,6 +1011,11 @@ pub const LOCAL_STREAM_SEGMENT_DATA_BYTES: usize = 3900;
 /// in the 4096-byte bucket. Endpoint recommendation, not a wire receive limit.
 pub const LOCAL_PROXY_STREAM_SEGMENT_DATA_BYTES: usize = 2500;
 
+/// Locally originated sealed envelopes use the existing chunk wrapper, with
+/// room for its metadata, Forward header, hop AEAD and padding in 4 KiB.
+/// This does not change the receiver's chunk/transfer limits or relay policy.
+pub const LOCAL_ENVELOPE_SEGMENT_DATA_BYTES: usize = 3600;
+
 /// Maximum bytes per chunk body inside a `ChunkPayload` frame (64 KiB).
 ///
 /// Chosen to fit a chunk + frame header comfortably within the 1 MiB default
