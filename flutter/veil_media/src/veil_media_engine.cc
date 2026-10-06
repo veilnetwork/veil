@@ -127,6 +127,8 @@
 
 extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* ptr,
                                          size_t len);
+extern "C" int veil_media_send_video_control_datagram(uint64_t chan, const uint8_t* ptr,
+                                                       size_t len);
 
 namespace {
 
@@ -364,6 +366,19 @@ class GroupFanoutTransport : public webrtc::Transport {
 
   bool SendRtcp(std::span<const uint8_t> packet,
                 const webrtc::PacketOptions& options) override {
+    return SendRtcpOnSource(packet, options, false);
+  }
+
+  bool SendVideoRtcp(std::span<const uint8_t> packet,
+                     const webrtc::PacketOptions& options) {
+    return SendRtcpOnSource(packet, options, true);
+  }
+
+  webrtc::Transport* video_transport() { return &video_transport_; }
+
+ private:
+  bool SendRtcpOnSource(std::span<const uint8_t> packet,
+                        const webrtc::PacketOptions& options, bool video) {
     (void)options;
     // Membership is caller-owned opaque handles, not raw engine pointers.
     // Snapshot under a short lock; video/RTCP sends must not hold audio here.
@@ -371,15 +386,19 @@ class GroupFanoutTransport : public webrtc::Transport {
     const auto channels = Snapshot();
     bool any = false;
     for (const uint64_t chan : channels) {
-      any = veil_media_send_datagram(chan, packet.data(), packet.size()) == 0 ||
-            any;
+      const int rc = video
+          ? veil_media_send_video_control_datagram(chan, packet.data(), packet.size())
+          : veil_media_send_datagram(chan, packet.data(), packet.size());
+      any = rc == 0 || any;
     }
     return any;
   }
 
+ public:
   uint64_t audio_drops() const { return audio_drops_.load(std::memory_order_relaxed); }
 
  private:
+  veil_media::VideoControlTransport<GroupFanoutTransport> video_transport_{*this};
   std::vector<uint64_t> Snapshot() {
     std::lock_guard<std::mutex> lock(mu_);
     return channels_;
@@ -1166,7 +1185,7 @@ bool start_group_peer_video(GroupWebrtcState* ws, GroupPeerState* peer) {
   if (peer->video_recv_stream) return true;
   if (!ws->video_decoder_factory || !peer->video_sink) return false;
   webrtc::VideoReceiveStreamInterface::Config rc(
-      peer->shim.get(), ws->video_decoder_factory.get());
+      peer->shim->video_transport(), ws->video_decoder_factory.get());
   rc.rtp.remote_ssrc = peer->video_ssrc;
   rc.rtp.nack.rtp_history_ms = kVideoNackHistoryMs;
   rc.renderer = peer->video_sink.get();
@@ -2036,7 +2055,7 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
                                         webrtc::kNetworkUp);
     ensure_group_video_codecs(ws);
     if (ws->video_send_stream == nullptr) {
-      webrtc::VideoSendStream::Config sc(ws->fanout.get());
+      webrtc::VideoSendStream::Config sc(ws->fanout->video_transport());
       sc.rtp.ssrcs = {local_ssrc};
       sc.rtp.payload_name = "VP8";
       sc.rtp.payload_type = kGroupVp8PayloadType;
@@ -2812,7 +2831,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
       ws->video_source = std::make_unique<webrtc::VideoBroadcaster>();
 
     if (send && ws->video_send_stream == nullptr) {
-      webrtc::VideoSendStream::Config sc(ws->shim.get());  // sets send_transport
+      webrtc::VideoSendStream::Config sc(ws->shim->video_transport());  // sets send_transport
       sc.rtp.ssrcs = {local_v};                            // NOTE: vector
       sc.rtp.payload_name = "VP8";
       sc.rtp.payload_type = kVp8Pt;
@@ -2882,7 +2901,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
     }
     if (recv && ws->video_recv_stream == nullptr) {
       webrtc::VideoReceiveStreamInterface::Config rc(
-          ws->shim.get(), ws->video_decoder_factory.get());
+          ws->shim->video_transport(), ws->video_decoder_factory.get());
       rc.rtp.remote_ssrc = remote_v;    // do NOT set local_ssrc (deprecated)
       rc.rtp.nack.rtp_history_ms = kVideoNackHistoryMs;
       rc.renderer = ws->video_sink.get();
@@ -3692,6 +3711,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         "\"audio_tx_unclassified_pkts\":%llu,\"audio_tx_payload_age_ms\":%lld,"
         "\"audio_tx_payload_max_gap_ms\":%lld,\"audio_tx_retransmitted_pkts\":%llu,"
         "\"rtcp_tx_pkts\":%llu,\"rtcp_tx_bytes\":%llu,"
+        "\"video_rtcp_tx_pkts\":%llu,\"video_rtcp_tx_bytes\":%llu,"
         "\"audio_tx_rtp_age_ms\":%lld,\"audio_tx_rtp_queue_age_ms\":%lld,"
         "\"audio_tx_rtp_max_gap_ms\":%lld,\"audio_tx_rtp_admission_max_ms\":%lld,"
         "\"rx_bytes\":%llu,\"tx_drops\":%llu,\"rx_drops\":%llu,"
@@ -3739,6 +3759,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<unsigned long long>(audio_tx_retransmitted_pkts),
         static_cast<unsigned long long>(ws->shim->outbound_rtcp_packet_count()),
         static_cast<unsigned long long>(ws->shim->outbound_rtcp_byte_count()),
+        static_cast<unsigned long long>(ws->shim->outbound_video_rtcp_packet_count()),
+        static_cast<unsigned long long>(ws->shim->outbound_video_rtcp_byte_count()),
         static_cast<long long>(tx_audio.age_ms),
         static_cast<long long>(tx_audio.queue_age_ms),
         static_cast<long long>(tx_audio.max_gap_ms),

@@ -38,6 +38,7 @@
 #include "api/call/transport.h"  // webrtc::Transport, webrtc::PacketOptions
 #include "veil_inbound_packet_queue.h"
 #include "veil_audio_send_stats.h"
+#include "veil_video_control_transport.h"
 
 namespace webrtc {
 class Call;
@@ -115,6 +116,9 @@ class VeilTransportShim : public webrtc::Transport {
                const webrtc::PacketOptions& options) override;
   bool SendRtcp(std::span<const uint8_t> packet,
                 const webrtc::PacketOptions& options) override;
+  bool SendVideoRtcp(std::span<const uint8_t> packet,
+                     const webrtc::PacketOptions& options);
+  webrtc::Transport* video_transport() { return &video_transport_; }
 
   // Tell the shim which inbound RTP SSRC is video, so DeliverRtpPacket is called
   // with MediaType::VIDEO (the Call routes to the audio vs video demuxer BY the
@@ -157,6 +161,12 @@ class VeilTransportShim : public webrtc::Transport {
   uint64_t outbound_rtcp_byte_count() const {
     return outbound_rtcp_byte_count_.load(std::memory_order_relaxed);
   }
+  uint64_t outbound_video_rtcp_packet_count() const {
+    return outbound_video_rtcp_packet_count_.load(std::memory_order_relaxed);
+  }
+  uint64_t outbound_video_rtcp_byte_count() const {
+    return outbound_video_rtcp_byte_count_.load(std::memory_order_relaxed);
+  }
   uint64_t outbound_byte_count() const {
     return outbound_byte_count_.load(std::memory_order_relaxed);
   }
@@ -172,6 +182,9 @@ class VeilTransportShim : public webrtc::Transport {
   AudioSendSnapshot audio_send_stats() const;
 
  private:
+  VideoControlTransport<VeilTransportShim> video_transport_{*this};
+  bool SendRtcpOnSource(std::span<const uint8_t> packet,
+                        const webrtc::PacketOptions& options, bool video);
   std::atomic<bool> video_send_paused_{false};
   struct AtomicVideoCadence {
     std::atomic<uint64_t> frames{0};
@@ -239,6 +252,7 @@ class VeilTransportShim : public webrtc::Transport {
   std::atomic<uint64_t> inbound_byte_count_{0};
   std::atomic<uint64_t> outbound_packet_count_{0};
   std::atomic<uint64_t> outbound_rtcp_packet_count_{0}, outbound_rtcp_byte_count_{0};
+  std::atomic<uint64_t> outbound_video_rtcp_packet_count_{0}, outbound_video_rtcp_byte_count_{0};
   std::atomic<uint64_t> outbound_byte_count_{0};
   std::atomic<uint64_t> outbound_dropped_count_{0};
   AtomicVideoCadence outbound_video_cadence_;
