@@ -209,4 +209,37 @@ extern "C" int veil_media_test_group_fanout_packet(VeilGroupMediaEngine* e,
   return e->ws->fanout->SendRtp(packet, options) ? 0 : 1;
 }
 
+// Exercise queued/retransmitted RTP at the final plaintext send boundary.
+extern "C" int veil_media_test_direct_packet(VeilMediaEngine* e, int kind) {
+  std::array<uint8_t, 15> packet{0x80, uint8_t(kind == 1 ? 96 : 111)};
+  webrtc::PacketOptions options;
+  if (kind == 2) {
+    std::array<uint8_t, 8> rtcp{0x80, 201, 0, 1};
+    return e->ws->shim->SendRtcp(rtcp, options) ? 0 : 1;
+  }
+  return e->ws->shim->SendRtp(packet, options) ? 0 : 1;
+}
+
+extern "C" int veil_media_test_pause_with_held_video_worker(
+    VeilMediaEngine* one, VeilGroupMediaEngine* room) {
+  auto* work = room ? room->ws->video_worker_tq.get() : one->ws->video_worker_tq.get();
+  auto* net = room ? room->ws->video_network_tq.get() : one->ws->video_network_tq.get();
+  HeldQueues held(net, work);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!held.first->entered.load() || !held.second->entered.load()) {
+    if (std::chrono::steady_clock::now() >= deadline) return 1;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const auto pause = [&](int value) {
+    return room ? veil_media_group_engine_set_video_send_paused(room, value)
+                : veil_media_engine_set_video_send_paused(one, value);
+  };
+  const auto started = std::chrono::steady_clock::now();
+  if (pause(1) != VEIL_MEDIA_OK) return 2;
+  if (std::chrono::steady_clock::now() - started > std::chrono::milliseconds(20)) return 3;
+  if (pause(0) != VEIL_MEDIA_ERR_STATE) return 4;
+  held.Release();
+  return 0;
+}
+
 #pragma GCC visibility pop

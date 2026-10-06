@@ -162,6 +162,7 @@ void VeilTransportShim::Stop() {
 
 bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
                                 const webrtc::PacketOptions& options) {
+  if (video_send_paused_.load() && IsSecondaryInboundRtp(packet)) return false;
   MarkVideoFrame(packet, &outbound_video_cadence_);
   const int64_t started_ns = webrtc::TimeMicros() * 1000;
   const bool audio = audio_send_stats_.mark_attempt(

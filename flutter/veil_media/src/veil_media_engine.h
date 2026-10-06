@@ -116,6 +116,12 @@ int veil_media_group_engine_set_video_bitrate(VeilGroupMediaEngine *engine,
  * Existing 20 ms video-worker scheduling wait and debug pin apply. */
 int veil_media_group_engine_set_video_budget(VeilGroupMediaEngine *engine,
                                         int max_bitrate_kbps, double max_fps);
+/* Optional endpoint-local send pause (0/1). Camera/screen capture, preview,
+ * audio, RTCP and receiving video remain live. Already queued Veil packets
+ * cannot be recalled. Pausing never waits on the video worker; resuming
+ * requests a keyframe with a 20 ms scheduling wait, retry on ERR_STATE.
+ * The pause persists across video source/stream changes on this engine. */
+int veil_media_group_engine_set_video_send_paused(VeilGroupMediaEngine *engine, int paused);
 /* Group audio quality: maxima over fresh RTCP audio report blocks (15 s).
  * `audio_receivers` maps peer-id hex to accepted `audio_rx_pkts` and the
  * native `audio_delay_ms` estimate. `audio_rx_supported` stays 1 even when
@@ -189,6 +195,12 @@ int veil_media_engine_set_video_bitrate(VeilMediaEngine *engine,
  * Existing 20 ms video-worker scheduling wait and debug pin apply. */
 int veil_media_engine_set_video_budget(VeilMediaEngine *engine,
                                         int max_bitrate_kbps, double max_fps);
+/* Optional endpoint-local send pause (0/1). Camera/screen capture, preview,
+ * audio, RTCP and receiving video remain live. Already queued Veil packets
+ * cannot be recalled. Pausing never waits on the video worker; resuming
+ * requests a keyframe with a 20 ms scheduling wait, retry on ERR_STATE.
+ * The pause persists across video source/stream changes on this engine. */
+int veil_media_engine_set_video_send_paused(VeilMediaEngine *engine, int paused);
 
 /* Open the platform camera and drive the video send stream from it (near
  * width x height at fps; the camera picks the closest supported format). Video
