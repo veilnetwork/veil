@@ -124,7 +124,7 @@ impl QuicParallelHandle {
             // a better initial loss-timer estimate than a cold-connect default.
             // This local rule applies to every generic sibling and changes no
             // transport parameter, role metadata or receiver admission.
-            let mut transport = chrome_mimic_transport_config();
+            let mut transport = context_transport_config(&ctx);
             transport.initial_rtt(self.0.parent.rtt().clamp(
                 std::time::Duration::from_millis(50),
                 std::time::Duration::from_secs(1),

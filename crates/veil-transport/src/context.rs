@@ -82,6 +82,16 @@ impl Default for TcpTransportSettings {
     }
 }
 
+/// Congestion control for all connections owned by a QUIC context.
+/// No application role or packet priority participates in this choice.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum QuicCongestionControl {
+    /// Opt-in controller for measured congestion experiments.
+    Bbr,
+    #[default]
+    Cubic,
+}
+
 /// Per-process QUIC tunables for the `quinn` endpoint.
 #[derive(Clone, Debug)]
 pub struct QuicTransportSettings {
@@ -91,6 +101,8 @@ pub struct QuicTransportSettings {
     pub handshake_timeout: Duration,
     /// Local socket to bind the QUIC endpoint (default: `0.0.0.0:0`).
     pub bind_addr: SocketAddr,
+    /// Applies equally to the parent, accepted connections and generic siblings.
+    pub congestion_control: QuicCongestionControl,
 }
 
 impl Default for QuicTransportSettings {
@@ -99,6 +111,7 @@ impl Default for QuicTransportSettings {
             connect_timeout: Duration::from_secs(10),
             handshake_timeout: Duration::from_secs(10),
             bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            congestion_control: QuicCongestionControl::default(),
         }
     }
 }
