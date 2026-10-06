@@ -82,6 +82,12 @@ impl QuicParallelHandle {
         self.0.requires_shared_dispatch
     }
 
+    /// Local diagnostic snapshot, including pending handshakes and accepted
+    /// siblings. It is not a reservation or a receiver scheduling decision.
+    pub fn available_connection_slots(&self) -> usize {
+        self.0.slots.available_permits()
+    }
+
     /// Adopt an already authenticated shared-listener child into the SAME
     /// connection budget as outgoing siblings. The caller verifies the session
     /// proof first and closes rejected children; TLS alone is not identity.
