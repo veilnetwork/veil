@@ -513,6 +513,18 @@ pub fn chrome_mimic_transport_config() -> quinn::TransportConfig {
     cfg
 }
 
+fn context_transport_config(ctx: &TransportContext) -> quinn::TransportConfig {
+    let mut cfg = chrome_mimic_transport_config();
+    if ctx.quic.congestion_control == super::context::QuicCongestionControl::Bbr {
+        // A context-wide experiment, without payload inspection or service
+        // priority. Preserve Cubic's 10-MSS startup window for comparison.
+        let mut congestion = quinn::congestion::BbrConfig::default();
+        congestion.initial_window(12_000);
+        cfg.congestion_controller_factory(Arc::new(congestion));
+    }
+    cfg
+}
+
 #[derive(Debug)]
 struct SessionBoundQuicServerVerifier(Arc<rustls::crypto::CryptoProvider>);
 
@@ -589,7 +601,7 @@ fn build_quic_client_config(
     let mut client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
     // Anti-censorship P1 #4: Chrome-mimic transport parameters
     // (see chrome_mimic_transport_config docs above).
-    client_config.transport_config(Arc::new(chrome_mimic_transport_config()));
+    client_config.transport_config(Arc::new(context_transport_config(ctx)));
     Ok(client_config)
 }
 
@@ -606,7 +618,7 @@ fn build_quic_server_config(
     // the accept side.  Servers and clients negotiate the min of each
     // side's advertised value, so symmetry minimizes the chance that
     // a DPI middlebox observes a transport-params mismatch.
-    server_config.transport_config(Arc::new(chrome_mimic_transport_config()));
+    server_config.transport_config(Arc::new(context_transport_config(ctx)));
     Ok(server_config)
 }
 
