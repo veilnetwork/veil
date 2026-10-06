@@ -1,16 +1,17 @@
 /* SPDX-License-Identifier: MIT
  *
- * veil_win_datagram_thunk.cc — resolve the two veilclient datagram entry
+ * veil_win_datagram_thunk.cc — resolve the veilclient datagram entry
  * points at runtime instead of importing them.
  *
- * veil_media_send_datagram and veil_media_set_recv_callback are defined by
+ * veil_media_send_datagram, veil_media_send_video_control_datagram and
+ * veil_media_set_recv_callback are defined by
  * veilclient_ffi, not by this engine. On ELF they are simply left undefined
  * and the loader resolves them from the sibling library (a DT_NEEDED plus an
  * $ORIGIN rpath — see build_veil_media_so_linux.sh). A Windows DLL cannot do
  * that: every symbol must be resolved at link time, which would make building
  * the engine depend on veilclient_ffi.lib, which is a Rust build output. That
  * is a build-order dependency between two artifacts produced on different
- * machines by different toolchains, for two function pointers.
+ * machines by different toolchains, for three function pointers.
  *
  * So resolve them the way Windows actually offers: GetProcAddress against the
  * veilclient_ffi.dll the host process has already loaded. GetModuleHandle
@@ -51,6 +52,7 @@ using SetRecvCallbackFn = int (*)(uint64_t, VeilMediaRecvFn, void*);
 
 struct Resolved {
   SendDatagramFn send = nullptr;
+  SendDatagramFn video_control = nullptr;
   SetRecvCallbackFn set_recv = nullptr;
 };
 
@@ -68,9 +70,11 @@ const Resolved& resolved() {
     }
     out.send = reinterpret_cast<SendDatagramFn>(
         GetProcAddress(module, "veil_media_send_datagram"));
+    out.video_control = reinterpret_cast<SendDatagramFn>(
+        GetProcAddress(module, "veil_media_send_video_control_datagram"));
     out.set_recv = reinterpret_cast<SetRecvCallbackFn>(
         GetProcAddress(module, "veil_media_set_recv_callback"));
-    if (out.send == nullptr || out.set_recv == nullptr) {
+    if (out.send == nullptr || out.video_control == nullptr || out.set_recv == nullptr) {
       veil_media::diag::log(
           "veilclient_ffi.dll is loaded but exports no datagram ABI — "
           "version mismatch between the engine and the client");
@@ -97,6 +101,12 @@ extern "C" int veil_media_set_recv_callback(uint64_t chan, VeilMediaRecvFn cb,
   // Non-zero is failure here too (veil_transport_shim.cc checks rc != 0), so a
   // missing client must not look like a successful subscription.
   return fn != nullptr ? fn(chan, cb, ctx) : -1;
+}
+
+extern "C" int veil_media_send_video_control_datagram(uint64_t chan, const uint8_t* ptr,
+                                                      size_t len) {
+  const SendDatagramFn fn = resolved().video_control;
+  return fn != nullptr ? fn(chan, ptr, len) : -1;
 }
 
 #endif  // defined(_WIN32)

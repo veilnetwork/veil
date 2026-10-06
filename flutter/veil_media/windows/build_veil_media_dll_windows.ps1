@@ -210,10 +210,10 @@ try {
   # exists to catch, twelve commits too late.
   $nm = Join-Path $compilerDir 'llvm-nm.exe'
   if (-not (Test-Path $nm)) { $nm = 'llvm-nm.exe' }
-  # The two datagram entry points are thunks into veilclient_ffi.dll, not part
+  # The datagram entry points are thunks into veilclient_ffi.dll, not part
   # of this DLL's ABI. Exporting them would put a second definition of the
   # client's own symbols into the process's export namespace.
-  $thunks = @('veil_media_send_datagram', 'veil_media_set_recv_callback')
+  $thunks = @('veil_media_send_datagram', 'veil_media_send_video_control_datagram', 'veil_media_set_recv_callback')
   $exported = & $nm --defined-only $objects |
     ForEach-Object { ($_ -split '\s+')[-1] } |
     Where-Object { $_ -like 'veil_media_*' -and $thunks -notcontains $_ } |

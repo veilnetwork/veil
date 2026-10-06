@@ -38,6 +38,30 @@ fn media_is_vp8_rtp(payload: &[u8]) -> bool {
     (payload[1] & 0x7f) == 96
 }
 
+#[cfg(feature = "node-embedded")]
+fn media_is_rtcp(mut packet: &[u8]) -> bool {
+    if packet.is_empty() {
+        return false;
+    }
+    while !packet.is_empty() {
+        if packet.len() < 4 || packet[0] >> 6 != 2 || !(192..=223).contains(&packet[1]) {
+            return false;
+        }
+        let len = 4 * (usize::from(u16::from_be_bytes([packet[2], packet[3]])) + 1);
+        if len > packet.len() {
+            return false;
+        }
+        if packet[0] & 0x20 != 0 {
+            let padding = usize::from(packet[len - 1]);
+            if len != packet.len() || padding == 0 || padding > len - 4 {
+                return false;
+            }
+        }
+        packet = &packet[len..];
+    }
+    true
+}
+
 // Local scheduling classification. This is computed before sealing and is
 // sent only to our IPC daemon; no audio/video class is added to relay frames.
 #[cfg(feature = "node-embedded")]
@@ -726,11 +750,12 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
     ));
     let video_source = Arc::clone(&video_sender);
     let seq_video = Arc::clone(&transport_seq);
-    let video_task = app_ref.bundle.runtime.spawn(drain_media_packets(
+    let video_task = app_ref.bundle.runtime.spawn(drain_media_packets_on_plane(
         rx_video,
         Arc::clone(&batching),
         Arc::clone(&cipher),
         false,
+        Some(media::LocalMediaPlane::Secondary),
         move |cell| {
             let sender = video_source.current();
             let seq = Arc::clone(&seq_video);
@@ -1148,6 +1173,40 @@ pub unsafe extern "C" fn veil_media_send_datagram(chan: u64, ptr: *const u8, len
     };
     let payload = QueuedMediaPacket::from(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec());
     ingress.enqueue(payload)
+}
+
+/// Enqueue video-engine RTCP on the channel's independent local video source.
+/// Screen sharing selects its independent source instead. This is endpoint
+/// scheduling only: no media role or priority is added to relay framing.
+/// Compound RTCP is validated; RTP and malformed control return -1. Admission
+/// remains nonblocking (0 queued, 1 full/busy, -1 invalid/closed), with no
+/// fallback into the audio queue when the selected source is full.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_media_send_video_control_datagram(
+    chan: u64,
+    ptr: *const u8,
+    len: size_t,
+) -> c_int {
+    if chan == 0 || ptr.is_null() || len == 0 {
+        return -1;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    if !media_is_rtcp(bytes) {
+        return -1;
+    }
+    let ingress = {
+        let map = match MEDIA_CHANNELS.try_lock() {
+            Ok(map) => map,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return 1,
+        };
+        let Some(ch) = map.get(&chan) else {
+            return -1;
+        };
+        Arc::clone(&ch.ingress)
+    };
+    ingress.enqueue_video_control(QueuedMediaPacket::from(bytes.to_vec()))
 }
 
 /// Snapshot per-channel relay drain diagnostics. Direct/onion channels return
@@ -1687,6 +1746,44 @@ impl MediaIngress {
                                 -1
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    fn enqueue_video_control(&self, payload: QueuedMediaPacket) -> c_int {
+        use std::sync::atomic::Ordering::Acquire;
+        if self.closed.load(Acquire) {
+            return -1;
+        }
+        let source = if self.screen_sharing.load(Acquire) {
+            match &self.screen {
+                Some(screen) => screen,
+                None => return -1,
+            }
+        } else {
+            &self.video
+        };
+        match source {
+            MediaVideoIngress::Packets(tx) => Self::send_packet(tx, payload),
+            MediaVideoIngress::RelayFrames { tx, stats, .. } => {
+                // Control is an independently complete work item. It must not
+                // consume or discard a partially assembled VP8 frame.
+                let frame = RelayVideoFrame {
+                    enqueued_at: payload.deadline.into_std() - MEDIA_LOCAL_QUEUE_AGE,
+                    packets: vec![payload.payload],
+                };
+                stats.enqueue_frame();
+                match tx.try_send(frame) {
+                    Ok(()) => 0,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        stats.undo_enqueue_frame();
+                        1
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        stats.undo_enqueue_frame();
+                        -1
                     }
                 }
             }
