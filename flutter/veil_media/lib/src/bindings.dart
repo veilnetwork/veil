@@ -950,3 +950,37 @@ int Function(Pointer<VeilGroupMediaEngineHandle>, int, double)?
 
 final veilMediaGroupEngineSetVideoBudget =
     _lookupveilMediaGroupEngineSetVideoBudget();
+
+// Optional endpoint-local video pause; old native libraries keep low-rate fallback.
+int Function(Pointer<VeilMediaEngineHandle>, int)?
+    _lookupveilMediaEngineSetVideoSendPaused() {
+  try {
+    return nativeLib.lookupFunction<
+        Int32 Function(Pointer<VeilMediaEngineHandle>, Int32),
+        int Function(Pointer<VeilMediaEngineHandle>, int)>(
+      'veil_media_engine_set_video_send_paused',
+    );
+  } on ArgumentError {
+    return null;
+  }
+}
+
+final veilMediaEngineSetVideoSendPaused =
+    _lookupveilMediaEngineSetVideoSendPaused();
+
+// Optional endpoint-local video pause; old native libraries keep low-rate fallback.
+int Function(Pointer<VeilGroupMediaEngineHandle>, int)?
+    _lookupveilMediaGroupEngineSetVideoSendPaused() {
+  try {
+    return nativeLib.lookupFunction<
+        Int32 Function(Pointer<VeilGroupMediaEngineHandle>, Int32),
+        int Function(Pointer<VeilGroupMediaEngineHandle>, int)>(
+      'veil_media_group_engine_set_video_send_paused',
+    );
+  } on ArgumentError {
+    return null;
+  }
+}
+
+final veilMediaGroupEngineSetVideoSendPaused =
+    _lookupveilMediaGroupEngineSetVideoSendPaused();

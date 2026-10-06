@@ -106,6 +106,10 @@ class VeilTransportShim : public webrtc::Transport {
   // datagram is delivered to a half-torn-down receiver.
   void Stop();
 
+  // Endpoint-local shedding. Keep audio, RTCP and remote video live; do not
+  // enqueue video already encoded or retransmitted by the pacer while paused.
+  void SetVideoSendPaused(bool paused) { video_send_paused_.store(paused); }
+
   // webrtc::Transport.
   bool SendRtp(std::span<const uint8_t> packet,
                const webrtc::PacketOptions& options) override;
@@ -162,6 +166,7 @@ class VeilTransportShim : public webrtc::Transport {
   AudioSendSnapshot audio_send_stats() const;
 
  private:
+  std::atomic<bool> video_send_paused_{false};
   struct AtomicVideoCadence {
     std::atomic<uint64_t> frames{0};
     std::atomic<int64_t> first_ns{0};
