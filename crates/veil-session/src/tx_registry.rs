@@ -75,6 +75,7 @@ pub type SessionTxOwner = [u8; 32];
 struct SessionTxEntry {
     tx: FrameSender,
     owner: Option<SessionTxOwner>,
+    direct_app_chunks: bool,
 }
 
 /// Registry of outbound send channels, one per active session.
@@ -204,8 +205,14 @@ impl SessionTxRegistry {
         self.prune_closed();
         let (tx, rx) =
             frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
-        self.senders
-            .insert(peer_id, SessionTxEntry { tx, owner: None });
+        self.senders.insert(
+            peer_id,
+            SessionTxEntry {
+                tx,
+                owner: None,
+                direct_app_chunks: false,
+            },
+        );
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
         rx
     }
@@ -226,6 +233,7 @@ impl SessionTxRegistry {
             SessionTxEntry {
                 tx,
                 owner: Some(owner),
+                direct_app_chunks: false,
             },
         );
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
@@ -250,8 +258,14 @@ impl SessionTxRegistry {
         }
         let (tx, rx) =
             frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
-        self.senders
-            .insert(peer_id, SessionTxEntry { tx, owner: None });
+        self.senders.insert(
+            peer_id,
+            SessionTxEntry {
+                tx,
+                owner: None,
+                direct_app_chunks: false,
+            },
+        );
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
         Some(rx)
     }
@@ -347,6 +361,7 @@ impl SessionTxRegistry {
             SessionTxEntry {
                 tx,
                 owner: Some(owner),
+                direct_app_chunks: false,
             },
         );
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
@@ -381,6 +396,33 @@ impl SessionTxRegistry {
         self.senders.remove(peer_id);
         self.last_active.remove(peer_id);
         true
+    }
+
+    /// Stamp decoder support while holding the registration write lock, and
+    /// only for the session that owns that outbox. A late old handshake cannot
+    /// enable a replacement's decoder capability.
+    pub fn set_direct_app_chunks_owned(
+        &mut self,
+        peer: &NodeIdBytes,
+        owner: &SessionTxOwner,
+        enabled: bool,
+    ) -> bool {
+        let Some(entry) = self.senders.get_mut(peer) else {
+            return false;
+        };
+        if entry.owner.as_ref() != Some(owner) {
+            return false;
+        }
+        entry.direct_app_chunks = enabled;
+        true
+    }
+
+    /// Capability and sender are read in one registry snapshot.
+    pub fn get_direct_app_chunk_sender(&self, peer: &NodeIdBytes) -> Option<&FrameSender> {
+        self.senders
+            .get(peer)
+            .filter(|entry| entry.direct_app_chunks && !entry.tx.is_closed())
+            .map(|entry| &entry.tx)
     }
 
     /// Get a reference to the sender channel for `peer_id`, skipping

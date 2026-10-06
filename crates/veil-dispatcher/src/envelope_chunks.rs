@@ -102,11 +102,16 @@ struct CompletedTransfer {
     deadline: u64,
 }
 
-/// Bounded reassembler for relay-chunked envelopes.
+// Reliable direct application data and encrypted delivery envelopes must not
+// complete each other's transfers. Direct state is also scoped to its proven
+// session peer. All domains share the existing byte/slot/fairness budgets.
+type TransferKey = (Option<[u8; 32]>, TransferId);
+
+/// Bounded reassembler for relay-chunked envelopes and typed direct app chunks.
 #[derive(Default)]
 pub struct EnvelopeChunkReassembler {
-    transfers: HashMap<TransferId, TransferState>,
-    completed: HashMap<TransferId, CompletedTransfer>,
+    transfers: HashMap<TransferKey, TransferState>,
+    completed: HashMap<TransferKey, CompletedTransfer>,
     total_buffered: usize,
 }
 
@@ -138,10 +143,34 @@ impl EnvelopeChunkReassembler {
         chunk: ChunkedEnvelopePayload,
         now: u64,
     ) -> AddChunkResult {
+        self.add_scoped(envelope, peer_id, chunk, now, None)
+    }
+
+    /// Typed direct AppSend bytes: scoped to the authenticated device and never
+    /// handed to terminal_deliver's payload-marker or cryptographic parser.
+    pub(crate) fn add_direct_app(
+        &mut self,
+        envelope: &DeliveryEnvelope,
+        peer_id: [u8; 32],
+        chunk: ChunkedEnvelopePayload,
+        now: u64,
+    ) -> AddChunkResult {
+        self.add_scoped(envelope, peer_id, chunk, now, Some(peer_id))
+    }
+
+    fn add_scoped(
+        &mut self,
+        envelope: &DeliveryEnvelope,
+        peer_id: [u8; 32],
+        chunk: ChunkedEnvelopePayload,
+        now: u64,
+        direct_peer: Option<[u8; 32]>,
+    ) -> AddChunkResult {
+        let key = (direct_peer, chunk.transfer_id);
         // Opportunistic eviction of timed-out partials on each add.
         self.evict_expired(now);
 
-        if let Some(done) = self.completed.get(&chunk.transfer_id) {
+        if let Some(done) = self.completed.get(&key) {
             return if done.orig_content_id == chunk.orig_content_id {
                 AddChunkResult::CompletedReplay(done.orig_content_id)
             } else {
@@ -149,7 +178,7 @@ impl EnvelopeChunkReassembler {
             };
         }
 
-        if !self.transfers.contains_key(&chunk.transfer_id) {
+        if !self.transfers.contains_key(&key) {
             // New transfer — enforce concurrency + global byte caps before
             // allocating the per-chunk vector.
             if self.transfers.len() >= MAX_CONCURRENT_TRANSFERS {
@@ -185,7 +214,7 @@ impl EnvelopeChunkReassembler {
             received[chunk.chunk_index as usize] = Some(chunk.data);
             self.total_buffered += data_len;
             self.transfers.insert(
-                chunk.transfer_id,
+                key,
                 TransferState {
                     chunk_count: chunk.chunk_count,
                     total_size: chunk.total_size,
@@ -204,18 +233,21 @@ impl EnvelopeChunkReassembler {
                 },
             );
             // A 1-chunk transfer completes immediately.
-            return self.try_complete(&chunk.transfer_id);
+            return self.try_complete(&key);
         }
 
-        let state = self
-            .transfers
-            .get(&chunk.transfer_id)
-            .expect("checked present above");
+        let state = self.transfers.get(&key).expect("checked present above");
         // Reject chunks whose framing disagrees with the established transfer —
         // a confused or malicious relay must not be able to corrupt reassembly.
         if chunk.chunk_count != state.chunk_count
             || chunk.total_size != state.total_size
             || chunk.orig_content_id != state.orig_content_id
+            || chunk.require_ack != state.require_ack
+            || envelope.recipient != state.recipient
+            || envelope.sender_node_id != state.sender_node_id
+            || envelope.src_app_id != state.src_app_id
+            || envelope.app_id != state.app_id
+            || envelope.endpoint_id != state.endpoint_id
         {
             return AddChunkResult::Rejected("inconsistent chunk metadata");
         }
@@ -237,7 +269,7 @@ impl EnvelopeChunkReassembler {
         // realtime datagram assembler already guards against.)
         let owner = self
             .transfers
-            .get(&chunk.transfer_id)
+            .get(&key)
             .map(|s| (s.sender_node_id, s.peer_id))
             .expect("checked present above");
         let data_len = chunk.data.len();
@@ -249,15 +281,12 @@ impl EnvelopeChunkReassembler {
         if peer_bytes.saturating_add(data_len) > MAX_REASSEMBLY_BYTES_PER_PEER {
             return AddChunkResult::Rejected("per-peer reassembly byte quota exceeded");
         }
-        let state = self
-            .transfers
-            .get_mut(&chunk.transfer_id)
-            .expect("checked present above");
+        let state = self.transfers.get_mut(&key).expect("checked present above");
         state.received[idx] = Some(chunk.data);
         state.received_count += 1;
         state.received_bytes += data_len;
         self.total_buffered += data_len;
-        self.try_complete(&chunk.transfer_id)
+        self.try_complete(&key)
     }
 
     /// Test shim for the same-hop case where the carrying peer IS the sender,
@@ -287,7 +316,7 @@ impl EnvelopeChunkReassembler {
 
     /// If `transfer_id` has all chunks, concatenate them, validate the total
     /// size, remove the state, and return the reconstructed original envelope.
-    fn try_complete(&mut self, transfer_id: &TransferId) -> AddChunkResult {
+    fn try_complete(&mut self, transfer_id: &TransferKey) -> AddChunkResult {
         let Some(state) = self.transfers.get(transfer_id) else {
             return AddChunkResult::Pending;
         };
@@ -410,6 +439,126 @@ mod tests {
             require_ack: true,
             data,
         }
+    }
+
+    #[test]
+    fn direct_and_envelope_domains_cannot_complete_each_other() {
+        let mut r = EnvelopeChunkReassembler::new();
+        let envelope = carrier([0; 32]);
+        let head = chunk([3; 16], 0, 2, 2, vec![10]);
+        let tail = chunk([3; 16], 1, 2, 2, vec![11]);
+        let peer = envelope.sender_node_id;
+        assert!(matches!(
+            r.add_direct_app(&envelope, peer, head.clone(), 0),
+            AddChunkResult::Pending
+        ));
+        assert!(matches!(
+            r.add(&envelope, peer, tail.clone(), 0),
+            AddChunkResult::Pending
+        ));
+        assert_eq!(r.transfer_count(), 2);
+        assert_eq!(r.buffered_bytes(), 2);
+        assert!(matches!(
+            r.add_direct_app(&envelope, peer, tail.clone(), 0),
+            AddChunkResult::Complete(_)
+        ));
+        assert!(matches!(
+            r.add(&envelope, peer, head, 0),
+            AddChunkResult::Complete(_)
+        ));
+        assert_eq!(r.buffered_bytes(), 0);
+        assert!(matches!(
+            r.add_direct_app(&envelope, peer, tail.clone(), 0),
+            AddChunkResult::CompletedReplay(_)
+        ));
+        assert!(matches!(
+            r.add(&envelope, peer, tail, 0),
+            AddChunkResult::CompletedReplay(_)
+        ));
+    }
+
+    #[test]
+    fn direct_app_transfers_and_replays_are_scoped_to_authenticated_device() {
+        let mut r = EnvelopeChunkReassembler::new();
+        let a = carrier_from([7; 32]);
+        let b = carrier_from([8; 32]);
+        let head = chunk([3; 16], 0, 2, 2, vec![10]);
+        let tail = chunk([3; 16], 1, 2, 2, vec![11]);
+        assert!(matches!(
+            r.add_direct_app(&a, a.sender_node_id, head.clone(), 0),
+            AddChunkResult::Pending
+        ));
+        assert!(matches!(
+            r.add_direct_app(&b, b.sender_node_id, tail.clone(), 0),
+            AddChunkResult::Pending
+        ));
+        assert_eq!(r.transfer_count(), 2);
+        assert!(matches!(
+            r.add_direct_app(&a, a.sender_node_id, tail, 0),
+            AddChunkResult::Complete(_)
+        ));
+        assert!(matches!(
+            r.add_direct_app(&b, b.sender_node_id, head, 0),
+            AddChunkResult::Complete(_)
+        ));
+    }
+
+    #[test]
+    fn reassembly_refuses_changed_addressing_or_ack_before_app_delivery() {
+        let mut r = EnvelopeChunkReassembler::new();
+        let original = carrier([0; 32]);
+        let head = chunk([3; 16], 0, 2, 2, vec![10]);
+        let tail = chunk([3; 16], 1, 2, 2, vec![11]);
+        let peer = original.sender_node_id;
+        assert!(matches!(
+            r.add_direct_app(&original, peer, head, 0),
+            AddChunkResult::Pending
+        ));
+        for field in 0..6 {
+            let mut envelope = original.clone();
+            let mut changed = tail.clone();
+            match field {
+                0 => envelope.app_id = [4; 32],
+                1 => envelope.src_app_id = [4; 32],
+                2 => envelope.endpoint_id += 1,
+                3 => envelope.recipient = veil_proto::recipient::Recipient::any([4; 32]),
+                4 => envelope.sender_node_id = [4; 32],
+                _ => changed.require_ack = !changed.require_ack,
+            }
+            assert!(matches!(
+                r.add_direct_app(&envelope, peer, changed, 0),
+                AddChunkResult::Rejected(_)
+            ));
+            assert_eq!(r.buffered_bytes(), 1);
+        }
+        assert!(matches!(
+            r.add_direct_app(&original, peer, tail, 0),
+            AddChunkResult::Complete(_)
+        ));
+    }
+
+    #[test]
+    fn direct_and_envelope_domains_share_the_existing_global_transfer_budget() {
+        let mut r = EnvelopeChunkReassembler::new();
+        for i in 0..MAX_CONCURRENT_TRANSFERS {
+            let peer = [i as u8; 32];
+            let envelope = carrier_from(peer);
+            let head = chunk([i as u8; 16], 0, 2, 2, vec![10]);
+            let result = if i % 2 == 0 {
+                r.add_direct_app(&envelope, peer, head, 0)
+            } else {
+                r.add(&envelope, peer, head, 0)
+            };
+            assert!(matches!(result, AddChunkResult::Pending));
+        }
+        let envelope = carrier_from([250; 32]);
+        let head = chunk([250; 16], 0, 2, 2, vec![10]);
+        assert!(matches!(
+            r.add_direct_app(&envelope, envelope.sender_node_id, head, 0),
+            AddChunkResult::Rejected(_)
+        ));
+        assert_eq!(r.transfer_count(), MAX_CONCURRENT_TRANSFERS);
+        assert_eq!(r.buffered_bytes(), MAX_CONCURRENT_TRANSFERS);
     }
 
     #[test]

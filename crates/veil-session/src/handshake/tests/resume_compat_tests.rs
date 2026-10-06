@@ -173,6 +173,7 @@ async fn upgraded_client_and_server_keep_legacy_resume_fallback() {
         assert!(!new.remote_caps_stated);
         assert!(!new.remote_capabilities.supports_circuit_datagrams());
         assert!(!new.remote_capabilities.supports_parallel_quic());
+        assert!(!new.remote_capabilities.supports_direct_app_chunks());
     }
 }
 

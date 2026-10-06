@@ -38,6 +38,44 @@ impl<'a> EnvelopeChunks<'a> {
         })
     }
 
+    pub(super) fn direct_app_frames(&self) -> impl Iterator<Item = Vec<u8>> + '_ {
+        self.envelope
+            .payload
+            .chunks(self.segment_size)
+            .enumerate()
+            .map(move |(index, data)| {
+                let body = veil_proto::app::AppSendPayload {
+                    src_app_id: self.envelope.src_app_id,
+                    app_id: self.envelope.app_id,
+                    endpoint_id: self.envelope.endpoint_id,
+                    data: veil_bufpool::pooled_shared_from_vec(self.chunk_payload(index, data)),
+                }
+                .encode();
+                let mut header = FrameHeader::new(
+                    FrameFamily::App as u8,
+                    veil_proto::family::AppMsg::AppSendChunk as u16,
+                );
+                header.set_priority(veil_proto::priority::INTERACTIVE);
+                header.body_len = body.len() as u32;
+                let mut frame = codec::encode_header(&header).to_vec();
+                frame.extend(body);
+                frame
+            })
+    }
+
+    fn chunk_payload(&self, index: usize, data: &[u8]) -> Vec<u8> {
+        ChunkedEnvelopePayload {
+            transfer_id: self.transfer_id,
+            chunk_index: index as u32,
+            chunk_count: self.chunk_count,
+            total_size: self.envelope.payload.len() as u32,
+            orig_content_id: self.envelope.content_id,
+            require_ack: self.require_ack,
+            data: data.to_vec(),
+        }
+        .encode()
+    }
+
     pub(super) fn frames_for(&self, next_hop: [u8; 32]) -> impl Iterator<Item = Vec<u8>> + '_ {
         self.envelope
             .payload
@@ -55,16 +93,7 @@ impl<'a> EnvelopeChunks<'a> {
                     content_id,
                     created_at: self.envelope.created_at,
                     ttl_secs: self.envelope.ttl_secs,
-                    payload: ChunkedEnvelopePayload {
-                        transfer_id: self.transfer_id,
-                        chunk_index: index as u32,
-                        chunk_count: self.chunk_count,
-                        total_size: self.envelope.payload.len() as u32,
-                        orig_content_id: self.envelope.content_id,
-                        require_ack: self.require_ack,
-                        data: data.to_vec(),
-                    }
-                    .encode(),
+                    payload: self.chunk_payload(index, data),
                     trace_id: self.envelope.trace_id,
                     require_ack: false,
                 };
@@ -162,6 +191,67 @@ pub(super) async fn admit_direct_sealed(
     {
         Ok(true) => DirectAdmission::Accepted,
         Ok(false) => DirectAdmission::Missing,
+        Err(_) => DirectAdmission::TimedOut,
+    }
+}
+
+/// Arbitrary application bytes use an explicit App family type. This path is
+/// direct only; it never acquires encrypted-envelope semantics or relay authority.
+pub(super) async fn admit_direct_plain(
+    ctx: &super::IpcSendContext,
+    send: &veil_proto::AppIpcSendPayload,
+    device: [u8; 32],
+    deadline: tokio::time::Instant,
+) -> DirectAdmission {
+    let Some(reg) = ctx.session_tx_registry.as_deref() else {
+        return DirectAdmission::Missing;
+    };
+    let supports = || {
+        ctx.session_instance_lookup
+            .as_deref()
+            .is_some_and(|lookup| lookup.supports_direct_app_chunks(&device))
+    };
+    if !supports() {
+        return DirectAdmission::Missing;
+    }
+    let mut content_id = [0; 32];
+    rand_core::OsRng.fill_bytes(&mut content_id);
+    let envelope = DeliveryEnvelope {
+        recipient: veil_proto::recipient::Recipient::any(send.dst_node_id),
+        sender_node_id: ctx.local_node_id,
+        src_app_id: send.src_app_id,
+        app_id: send.app_id,
+        endpoint_id: send.endpoint_id,
+        content_id,
+        created_at: 0,
+        ttl_secs: 0,
+        payload: send.data.to_vec(),
+        trace_id: 0,
+        require_ack: false,
+    };
+    let Some(chunks) = EnvelopeChunks::new(
+        &envelope,
+        false,
+        veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES,
+    ) else {
+        return DirectAdmission::Rejected;
+    };
+    match tokio::time::timeout_at(deadline, async {
+        for frame in chunks.direct_app_frames() {
+            if device != send.dst_node_id
+                && !super::device_matches_identity(ctx, &device, &send.dst_node_id)
+            {
+                return DirectAdmission::Rejected;
+            }
+            if !supports() || !reg.send_direct_app_chunk_to(&device, frame).await {
+                return DirectAdmission::Missing;
+            }
+        }
+        DirectAdmission::Accepted
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
         Err(_) => DirectAdmission::TimedOut,
     }
 }

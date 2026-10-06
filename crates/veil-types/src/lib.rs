@@ -115,6 +115,18 @@ pub trait FrameBroadcaster: Send + Sync {
         Vec::new()
     }
 
+    /// Admit a typed direct application chunk only on the exact sender whose
+    /// authenticated handshake advertised its decoder. Capture that sender
+    /// before awaiting credit; a reconnect must not lend the old capability
+    /// to a replacement session. Unknown adapters safely decline.
+    fn send_direct_app_chunk_to<'a>(
+        &'a self,
+        _peer_id: &'a [u8; 32],
+        _bytes: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async { false })
+    }
+
     /// Send `bytes` to `dst`, which may name either a device or an identity.
     ///
     /// Resolution first, because it is the cheap one: `devices_of` is an O(1)
@@ -338,6 +350,12 @@ pub struct VerifiedPeerCert {
 /// sovereign identity" (a legacy peer) — callers keep their singular,
 /// identity-addressed behaviour for both.
 pub trait SessionInstanceLookup: Send + Sync {
+    /// The live authenticated session advertised the typed direct chunk decoder.
+    /// Never infer this from cached discovery records or transport type.
+    fn supports_direct_app_chunks(&self, _peer_node_id: &[u8; 32]) -> bool {
+        false
+    }
+
     fn session_instance(&self, peer_node_id: &[u8; 32]) -> Option<[u8; 16]>;
 
     /// BOTH names the handshake proved for the far end of this session: the

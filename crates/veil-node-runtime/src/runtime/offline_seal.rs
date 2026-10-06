@@ -228,6 +228,10 @@ pub(crate) struct OwnDeviceAwareLookup {
 }
 
 impl veil_types::SessionInstanceLookup for OwnDeviceAwareLookup {
+    fn supports_direct_app_chunks(&self, peer_node_id: &[u8; 32]) -> bool {
+        self.sessions.supports_direct_app_chunks(peer_node_id)
+    }
+
     fn session_instance(&self, peer_node_id: &[u8; 32]) -> Option<[u8; 16]> {
         self.sessions.session_instance(peer_node_id)
     }
