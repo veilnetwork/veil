@@ -999,6 +999,13 @@ pub const MAX_NEW_ROUTES_PER_PEER_PER_WINDOW: u32 = 20;
 
 // ── Large payload chunking ─────────────────────────────────────────
 
+/// Endpoint packetization for reliable byte streams, not a receive/wire limit.
+/// A segment plus AppData fields, OVL1 header, AEAD tag and padding fits the
+/// 4096-byte session bucket. An ordered compatibility hop cannot interleave
+/// new local realtime data inside a previously committed larger frame.
+/// Relays keep their neutral FIFO/WRR; no application role is transmitted.
+pub const LOCAL_STREAM_SEGMENT_DATA_BYTES: usize = 3900;
+
 /// Maximum bytes per chunk body inside a `ChunkPayload` frame (64 KiB).
 ///
 /// Chosen to fit a chunk + frame header comfortably within the 1 MiB default
