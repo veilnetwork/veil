@@ -428,6 +428,11 @@ impl SessionTxRegistry {
             .is_some_and(FrameSender::has_datagram_transport)
     }
 
+    pub fn has_neutral_forward_datagram_transport(&self, peer_id: &NodeIdBytes) -> bool {
+        self.get_sender(peer_id)
+            .is_some_and(FrameSender::has_neutral_forward_datagram_transport)
+    }
+
     /// Send `bytes` to every registered session at `INTERACTIVE` priority.
     ///
     /// `bytes` is an `Arc<[u8]>` so the payload is shared across sessions

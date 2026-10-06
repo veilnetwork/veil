@@ -1,5 +1,7 @@
 //! Sparse origin observations for local IPC relay admission. No relay policy,
 //! payload parsing or wire fields; queue admission is not end-to-end delivery.
+//! `datagram_transport` reports live support for this neutral Forward format,
+//! not merely generic QUIC readiness and not proof of a particular send path.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};

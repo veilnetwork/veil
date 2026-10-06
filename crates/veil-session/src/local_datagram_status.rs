@@ -26,6 +26,7 @@ pub(crate) struct LocalDatagramStatus {
 struct State {
     owner: Weak<()>,
     transport_owner: Weak<()>,
+    neutral_forwards: bool,
     ready: u8,
     requested: u8,
 }
@@ -42,9 +43,19 @@ impl LocalDatagramStatus {
         lock!(self.state).transport_owner.strong_count() != 0
     }
 
-    pub(crate) fn activate_transport(self: &Arc<Self>) -> DatagramTransportLease {
+    pub(crate) fn has_neutral_forward_datagram_transport(&self) -> bool {
+        let state = lock!(self.state);
+        state.transport_owner.strong_count() != 0 && state.neutral_forwards
+    }
+
+    pub(crate) fn activate_transport(
+        self: &Arc<Self>,
+        neutral_forwards: bool,
+    ) -> DatagramTransportLease {
         let owner = Arc::new(());
-        lock!(self.state).transport_owner = Arc::downgrade(&owner);
+        let mut state = lock!(self.state);
+        state.transport_owner = Arc::downgrade(&owner);
+        state.neutral_forwards = neutral_forwards;
         DatagramTransportLease { _owner: owner }
     }
 
@@ -147,10 +158,10 @@ mod tests {
     fn generic_transport_readiness_expires_and_does_not_claim_independent_support() {
         let status = Arc::new(LocalDatagramStatus::default());
         assert!(!status.has_datagram_transport());
-        let old = status.activate_transport();
+        let old = status.activate_transport(false);
         assert!(status.has_datagram_transport());
         assert_eq!(status.state(0), Unsupported);
-        let replacement = status.activate_transport();
+        let replacement = status.activate_transport(false);
         drop(old);
         assert!(status.has_datagram_transport());
         let independent = status.activate();
@@ -159,6 +170,28 @@ mod tests {
         assert!(status.has_datagram_transport());
         drop(replacement);
         assert!(!status.has_datagram_transport());
+    }
+
+    #[test]
+    fn neutral_forward_readiness_requires_current_negotiation_and_live_transport() {
+        let status = Arc::new(LocalDatagramStatus::default());
+        assert!(!status.has_neutral_forward_datagram_transport());
+        let legacy = status.activate_transport(false);
+        assert!(status.has_datagram_transport());
+        assert!(!status.has_neutral_forward_datagram_transport());
+        let negotiated = status.activate_transport(true);
+        drop(legacy);
+        assert!(status.has_neutral_forward_datagram_transport());
+        let replacement = status.activate_transport(false);
+        drop(negotiated);
+        assert!(status.has_datagram_transport());
+        assert!(!status.has_neutral_forward_datagram_transport());
+        drop(replacement);
+        let negotiated = status.activate_transport(true);
+        assert!(status.has_neutral_forward_datagram_transport());
+        drop(negotiated);
+        assert!(!status.has_datagram_transport());
+        assert!(!status.has_neutral_forward_datagram_transport());
     }
 
     #[test]
