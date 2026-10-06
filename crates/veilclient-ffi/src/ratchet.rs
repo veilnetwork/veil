@@ -657,6 +657,123 @@ pub unsafe extern "C" fn veil_ratchet_send_position(
     VEIL_OK
 }
 
+/// Maximum number of sending positions returned by the snapshot helpers.
+#[cfg(feature = "node-embedded")]
+pub const VEIL_RATCHET_MAX_SEND_POSITIONS: size_t = 2;
+
+#[cfg(feature = "node-embedded")]
+unsafe fn write_send_positions(
+    positions: &[veil_e2e::ratchet::SendPosition],
+    out_buf: *mut u8,
+    out_buf_cap: size_t,
+    out_count: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe { *out_count = positions.len() };
+    if positions.len() > VEIL_RATCHET_MAX_SEND_POSITIONS {
+        unsafe { write_err(err_out, "too many retained sending chains") };
+        return VEIL_ERR;
+    }
+    if out_buf_cap < positions.len() * 36 {
+        unsafe { write_err(err_out, "sending-position buffer too small") };
+        return VEIL_ERR_RATCHET_BUFFER_TOO_SMALL;
+    }
+    for (i, at) in positions.iter().enumerate() {
+        unsafe {
+            ptr::copy_nonoverlapping(at.chain.as_ptr(), out_buf.add(i * 36), 32);
+            ptr::copy_nonoverlapping(at.next.to_be_bytes().as_ptr(), out_buf.add(i * 36 + 32), 4);
+        }
+    }
+    VEIL_OK
+}
+
+/// Read all retained sending positions under one store lock. Each output
+/// record is 32 public chain bytes followed by a big-endian u32 next index.
+/// `out_count` reports a record count, including on buffer-too-small; no
+/// record is written on error. An absent conversation returns zero records.
+///
+/// # Safety
+/// `handle` must be live; `key_64` points to 64 readable bytes. `out_buf`
+/// points to `out_buf_cap` writable bytes; `out_count` is writable.
+#[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
+pub unsafe extern "C" fn veil_ratchet_send_positions(
+    handle: *mut VeilHandle,
+    key_64: *const u8,
+    out_buf: *mut u8,
+    out_buf_cap: size_t,
+    out_count: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_ratchet_send_positions") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "handle" => handle, "key_64" => key_64,
+        "out_buf" => out_buf, "out_count" => out_count,
+    );
+    unsafe { *out_count = 0 };
+    get_or_return!(
+        handle_live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let ratchet = match ratchet_for_bundle(&handle_live.bundle) {
+        Ok(r) => r,
+        Err(e) => {
+            unsafe { write_err(err_out, e) };
+            return VEIL_ERR;
+        }
+    };
+    let key = unsafe { ratchet_key_from(key_64) };
+    let positions = ratchet.store.send_positions(&key);
+    unsafe { write_send_positions(&positions, out_buf, out_buf_cap, out_count, err_out) }
+}
+
+/// Read public sending positions in an exact exported conversation blob.
+/// Never imports it or changes live state. The record layout and sizing
+/// contract match `veil_ratchet_send_positions`. Malformed blobs are refused.
+/// Hosts use this on DURABLE bytes before retiring old chain reservations.
+///
+/// # Safety
+/// `blob` points to `blob_len` readable bytes. `out_buf` points to
+/// `out_buf_cap` writable bytes; `out_count` is writable.
+#[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
+pub unsafe extern "C" fn veil_ratchet_stored_send_positions(
+    blob: *const u8,
+    blob_len: size_t,
+    out_buf: *mut u8,
+    out_buf_cap: size_t,
+    out_count: *mut size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_ratchet_stored_send_positions") } {
+        return rc;
+    }
+    null_check!(err_out,
+        "blob" => blob, "out_buf" => out_buf, "out_count" => out_count,
+    );
+    unsafe { *out_count = 0 };
+    if blob_len == 0 || blob_len > VEIL_RATCHET_MAX_STATE_LEN {
+        unsafe { write_err(err_out, "implausible conversation state length") };
+        return VEIL_ERR_INVALID_ARG;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(blob, blob_len) };
+    match veil_e2e::ratchet::RatchetStore::stored_send_positions(bytes) {
+        Ok(positions) => unsafe {
+            write_send_positions(&positions, out_buf, out_buf_cap, out_count, err_out)
+        },
+        Err(e) => {
+            unsafe { write_err(err_out, format!("ratchet state rejected: {e}")) };
+            VEIL_ERR_INVALID_ARG
+        }
+    }
+}
+
 /// Step a conversation's sending chain past every index that might already
 /// have been spent, and report how many keys were burned.
 ///
@@ -855,5 +972,88 @@ pub unsafe extern "C" fn veil_ratchet_forget(
     } else {
         unsafe { write_err(err_out, "no conversation under that key") };
         VEIL_ERR_RATCHET_NO_CONVERSATION
+    }
+}
+
+#[cfg(all(test, feature = "node-embedded"))]
+mod send_position_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn positions_use_record_counts_and_never_partially_write() {
+        let positions = [
+            veil_e2e::ratchet::SendPosition {
+                chain: [17; 32],
+                next: 0x0102_0304,
+            },
+            veil_e2e::ratchet::SendPosition {
+                chain: [23; 32],
+                next: 0x1020_3040,
+            },
+        ];
+        let mut buf = [0xa5; 80];
+        let mut count = 99;
+        let mut err = ptr::null_mut();
+        let rc =
+            unsafe { write_send_positions(&positions, buf.as_mut_ptr(), 71, &mut count, &mut err) };
+        assert_eq!(rc, VEIL_ERR_RATCHET_BUFFER_TOO_SMALL);
+        assert_eq!(count, 2);
+        assert_eq!(buf, [0xa5; 80]);
+        unsafe { crate::veil_free_string(err) };
+        err = ptr::null_mut();
+        let rc = unsafe {
+            write_send_positions(
+                &positions,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut count,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_OK);
+        assert_eq!(count, 2);
+        assert_eq!(&buf[..32], &[17; 32]);
+        assert_eq!(&buf[32..36], &[1, 2, 3, 4]);
+        assert_eq!(&buf[36..68], &[23; 32]);
+        assert_eq!(&buf[68..72], &[16, 32, 48, 64]);
+        assert_eq!(&buf[72..], &[0xa5; 8]);
+        assert!(err.is_null());
+    }
+
+    #[test]
+    fn malformed_snapshot_is_refused_without_output() {
+        let blob = [0; 12];
+        let mut buf = [0xa5; 72];
+        let mut count = 99;
+        let mut err = ptr::null_mut();
+        let rc = unsafe {
+            veil_ratchet_stored_send_positions(
+                blob.as_ptr(),
+                blob.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut count,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert_eq!(count, 0);
+        assert_eq!(buf, [0xa5; 72]);
+        unsafe { crate::veil_free_string(err) };
+        err = ptr::null_mut();
+        let rc = unsafe {
+            veil_ratchet_stored_send_positions(
+                blob.as_ptr(),
+                VEIL_RATCHET_MAX_STATE_LEN + 1,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut count,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert_eq!(count, 0);
+        assert_eq!(buf, [0xa5; 72]);
+        unsafe { crate::veil_free_string(err) };
     }
 }
