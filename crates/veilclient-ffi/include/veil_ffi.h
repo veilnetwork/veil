@@ -582,6 +582,13 @@
 #define VEIL_RATCHET_MAX_ACK_KEYS 4096
 #endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Maximum number of sending positions returned by the snapshot helpers.
+ */
+#define VEIL_RATCHET_MAX_SEND_POSITIONS 2
+#endif
+
 typedef struct Option_MediaRecvFn Option_MediaRecvFn;
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
@@ -4562,6 +4569,48 @@ int veil_ratchet_send_position(VeilHandle *handle,
                                uint8_t *out_chain_32,
                                uint32_t *out_next,
                                char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Read all retained sending positions under one store lock. Each output
+ * record is 32 public chain bytes followed by a big-endian u32 next index.
+ * `out_count` reports a record count, including on buffer-too-small; no
+ * record is written on error. An absent conversation returns zero records.
+ *
+ * # Safety
+ * `handle` must be live; `key_64` points to 64 readable bytes. `out_buf`
+ * points to `out_buf_cap` writable bytes; `out_count` is writable.
+ */
+
+int veil_ratchet_send_positions(VeilHandle *handle,
+                                const uint8_t *key_64,
+                                uint8_t *out_buf,
+                                size_t out_buf_cap,
+                                size_t *out_count,
+                                char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Read public sending positions in an exact exported conversation blob.
+ * Never imports it or changes live state. The record layout and sizing
+ * contract match `veil_ratchet_send_positions`. Malformed blobs are refused.
+ * Hosts use this on DURABLE bytes before retiring old chain reservations.
+ *
+ * # Safety
+ * `blob` points to `blob_len` readable bytes. `out_buf` points to
+ * `out_buf_cap` writable bytes; `out_count` is writable.
+ */
+
+int veil_ratchet_stored_send_positions(const uint8_t *blob,
+                                       size_t blob_len,
+                                       uint8_t *out_buf,
+                                       size_t out_buf_cap,
+                                       size_t *out_count,
+                                       char **err_out)
 ;
 #endif
 
