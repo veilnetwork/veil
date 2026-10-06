@@ -95,6 +95,10 @@ impl FrameSender {
         self.status.has_datagram_transport()
     }
 
+    pub fn has_neutral_forward_datagram_transport(&self) -> bool {
+        self.status.has_neutral_forward_datagram_transport()
+    }
+
     pub fn request_local_datagram_channel(
         &self,
         local_lane: u8,
@@ -249,9 +253,16 @@ impl FrameOutbox {
 
     /// The runner owns this lease only while its datagram sender is usable.
     pub fn activate_datagram_transport(&self) -> Option<crate::DatagramTransportLease> {
+        self.activate_datagram_transport_with_neutral_forwards(false)
+    }
+
+    pub(crate) fn activate_datagram_transport_with_neutral_forwards(
+        &self,
+        negotiated: bool,
+    ) -> Option<crate::DatagramTransportLease> {
         self.status
             .as_ref()
-            .map(|status| status.activate_transport())
+            .map(|status| status.activate_transport(negotiated))
     }
 
     pub(crate) fn local_datagram_status(

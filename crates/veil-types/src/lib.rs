@@ -52,6 +52,13 @@ pub trait FrameBroadcaster: Send + Sync {
         false
     }
 
+    /// A usable link whose peer negotiated neutral Delivery::Forward cells.
+    /// Generic QUIC alone does not imply this frame can avoid the ordered
+    /// writer. Unknown/legacy adapters conservatively retain route order.
+    fn has_neutral_forward_datagram_transport(&self, _peer_id: &[u8; 32]) -> bool {
+        false
+    }
+
     /// Send `bytes` to a single registered peer at `priority`. Returns
     /// `false` if the peer is not registered or its channel is closed/full.
     fn send_to(&self, peer_id: &[u8; 32], priority: u8, bytes: Vec<u8>) -> bool;
