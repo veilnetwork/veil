@@ -3535,6 +3535,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     int audio_interruption_count = 0;
     int audio_interruption_duration_ms = 0;
     uint64_t audio_tx_pkts = 0;
+    uint64_t audio_tx_retransmitted_pkts = 0;
     uint32_t audio_delay_ms = 0;
     uint32_t audio_jb_ms = 0;
     int video_delay_ms = 0;
@@ -3575,8 +3576,11 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         ws->android420_stats.replaced.load(std::memory_order_relaxed);
 #endif
     const bool sampled = veil_media::run_on_with_timeout(ws->worker_tq.get(), [&] {
-      if (ws->send_stream)
-        audio_tx_pkts = ws->send_stream->GetStats().packets_sent;
+      if (ws->send_stream) {
+        const auto sent = ws->send_stream->GetStats();
+        audio_tx_pkts = sent.packets_sent;
+        audio_tx_retransmitted_pkts = sent.retransmitted_packets_sent;
+      }
       if (ws->call) {
         const auto cs = ws->call->GetStats();
         if (cs.rtt_ms >= 0) rtt_ms = cs.rtt_ms;
@@ -3671,6 +3675,11 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         "\"audio_interruption_duration_ms\":%d,"
         "\"audio_tx_pkts\":%llu,\"mic_muted\":%d,\"tx_bytes\":%llu,"
         "\"audio_tx_rtp_attempts\":%llu,\"audio_tx_rtp_queued\":%llu,"
+        "\"audio_tx_payload_pkts\":%llu,\"audio_tx_padding_pkts\":%llu,"
+        "\"audio_tx_payload_bytes\":%llu,\"audio_tx_padding_bytes\":%llu,"
+        "\"audio_tx_unclassified_pkts\":%llu,\"audio_tx_payload_age_ms\":%lld,"
+        "\"audio_tx_payload_max_gap_ms\":%lld,\"audio_tx_retransmitted_pkts\":%llu,"
+        "\"rtcp_tx_pkts\":%llu,\"rtcp_tx_bytes\":%llu,"
         "\"audio_tx_rtp_age_ms\":%lld,\"audio_tx_rtp_queue_age_ms\":%lld,"
         "\"audio_tx_rtp_max_gap_ms\":%lld,\"audio_tx_rtp_admission_max_ms\":%lld,"
         "\"rx_bytes\":%llu,\"tx_drops\":%llu,\"rx_drops\":%llu,"
@@ -3708,6 +3717,16 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<unsigned long long>(ws->shim->outbound_byte_count()),
         static_cast<unsigned long long>(tx_audio.attempts),
         static_cast<unsigned long long>(tx_audio.queued),
+        static_cast<unsigned long long>(tx_audio.payload_packets),
+        static_cast<unsigned long long>(tx_audio.padding_packets),
+        static_cast<unsigned long long>(tx_audio.payload_bytes),
+        static_cast<unsigned long long>(tx_audio.padding_bytes),
+        static_cast<unsigned long long>(tx_audio.unclassified_packets),
+        static_cast<long long>(tx_audio.payload_age_ms),
+        static_cast<long long>(tx_audio.max_payload_gap_ms),
+        static_cast<unsigned long long>(audio_tx_retransmitted_pkts),
+        static_cast<unsigned long long>(ws->shim->outbound_rtcp_packet_count()),
+        static_cast<unsigned long long>(ws->shim->outbound_rtcp_byte_count()),
         static_cast<long long>(tx_audio.age_ms),
         static_cast<long long>(tx_audio.queue_age_ms),
         static_cast<long long>(tx_audio.max_gap_ms),

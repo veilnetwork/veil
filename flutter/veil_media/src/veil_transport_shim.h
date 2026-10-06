@@ -151,6 +151,12 @@ class VeilTransportShim : public webrtc::Transport {
   uint64_t outbound_packet_count() const {
     return outbound_packet_count_.load(std::memory_order_relaxed);
   }
+  uint64_t outbound_rtcp_packet_count() const {
+    return outbound_rtcp_packet_count_.load(std::memory_order_relaxed);
+  }
+  uint64_t outbound_rtcp_byte_count() const {
+    return outbound_rtcp_byte_count_.load(std::memory_order_relaxed);
+  }
   uint64_t outbound_byte_count() const {
     return outbound_byte_count_.load(std::memory_order_relaxed);
   }
@@ -232,6 +238,7 @@ class VeilTransportShim : public webrtc::Transport {
   std::atomic<uint64_t> inbound_packet_count_{0};
   std::atomic<uint64_t> inbound_byte_count_{0};
   std::atomic<uint64_t> outbound_packet_count_{0};
+  std::atomic<uint64_t> outbound_rtcp_packet_count_{0}, outbound_rtcp_byte_count_{0};
   std::atomic<uint64_t> outbound_byte_count_{0};
   std::atomic<uint64_t> outbound_dropped_count_{0};
   AtomicVideoCadence outbound_video_cadence_;

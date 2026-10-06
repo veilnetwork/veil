@@ -1,6 +1,7 @@
 #include "veil_audio_send_stats.h"
 #include <array>
 #include <cassert>
+#include <vector>
 
 int main() {
   constexpr int64_t ms = 1'000'000;
@@ -34,4 +35,39 @@ int main() {
   assert(s.attempts == 2 && s.queued == 1 && s.age_ms == 10 && s.queue_age_ms == 1008);
   assert(s.max_gap_ms == 1000 && s.max_admission_ms == 5);
   assert(stats.snapshot(100 * ms).age_ms == -1);  // no fresh-looking clock reversal
+
+  // Padding probes must not renew the encoded-audio clock. Include a CSRC,
+  // an RTP extension and actual audio with trailing padding in the fixture.
+  veil_media::AudioSendStats diagnostic;
+  std::vector<uint8_t> extended(28);
+  extended[0] = 0xb1; extended[1] = 111;
+  extended[8] = 1; extended[9] = 2; extended[10] = 3; extended[11] = 4;
+  extended[16] = 0xbe; extended[17] = 0xde; extended[19] = 1;
+  extended[24] = 0xf8; extended[25] = 0xaa; extended[27] = 2;
+  assert(diagnostic.mark_attempt(extended, ssrc, 1000 * ms));
+  s = diagnostic.snapshot(1010 * ms);
+  assert(s.payload_packets == 1 && s.padding_packets == 0);
+  assert(s.payload_bytes == 2 && s.padding_bytes == 2);
+  assert(s.payload_age_ms == 10 && s.max_payload_gap_ms == 0);
+  extended[27] = 4;  // All bytes after the RTP/extension header are padding.
+  assert(diagnostic.mark_attempt(extended, ssrc, 1100 * ms));
+  s = diagnostic.snapshot(1110 * ms);
+  assert(s.attempts == 2 && s.age_ms == 10 && s.payload_age_ms == 110);
+  assert(s.payload_packets == 1 && s.padding_packets == 1 && s.padding_bytes == 6);
+  extended[27] = 2;
+  assert(diagnostic.mark_attempt(extended, ssrc, 2000 * ms));
+  assert(diagnostic.snapshot(2010 * ms).max_payload_gap_ms == 1000);
+
+  // Malformed lengths must not underflow the accounting or claim a payload.
+  extended[27] = 0;  // P set with a zero padding length.
+  assert(diagnostic.mark_attempt(extended, ssrc, 2100 * ms));
+  extended[27] = 5;  // Padding exceeds the bytes after the header.
+  assert(diagnostic.mark_attempt(extended, ssrc, 2200 * ms));
+  extended[27] = 2; extended[18] = 0xff; extended[19] = 0xff;
+  assert(diagnostic.mark_attempt(extended, ssrc, 2300 * ms));
+  extended.resize(15); extended[0] = 0x81;  // Truncated CSRC.
+  assert(diagnostic.mark_attempt(extended, ssrc, 2400 * ms));
+  s = diagnostic.snapshot(2410 * ms);
+  assert(s.unclassified_packets == 4 && s.payload_packets == 2);
+  assert(s.payload_age_ms == 410 && s.payload_bytes == 4);
 }
