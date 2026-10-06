@@ -165,6 +165,16 @@ webrtc::SdpAudioFormat VeilOpusSendFormat() {
 }
 
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
+// This Call carries only Opus and its feedback. WebRTC's default 300-kbit
+// prior with no ceiling generated video-sized padding probes on the audio
+// source connection. Keep room for Opus/FEC/RTP overhead without competing
+// with real audio for a budget that only the separate video Call can use.
+// This caps estimator/probe traffic; codec and Veil/relay policies are unchanged.
+void configure_call_audio_transport(webrtc::CallConfig& config) {
+  config.bitrate_config.start_bitrate_bps = 48'000;
+  config.bitrate_config.max_bitrate_bps = 96'000;
+}
+
 // NetEq's default 200-packet buffer permits a 3-second target delay at our
 // 20-ms Opus cadence. Relay bursts on a cellular link made the receiver retain
 // over a second of audio even after packet delivery recovered. Keep enough
@@ -1612,6 +1622,7 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
   webrtc::CallConfig call_cfg(ws->env, ws->worker_tq.get(),
                               ws->network_tq.get());
   call_cfg.audio_state = ws->audio_state;
+  configure_call_audio_transport(call_cfg);
   ws->call = webrtc::Call::Create(std::move(call_cfg));
   webrtc::CallConfig video_cfg(ws->env, ws->video_worker_tq.get(),
                                 ws->video_network_tq.get());
@@ -1689,6 +1700,7 @@ VeilGroupMediaEngine* veil_media_group_engine_create(
   webrtc::CallConfig call_cfg(ws->env, ws->worker_tq.get(),
                               ws->network_tq.get());
   call_cfg.audio_state = ws->audio_state;
+  configure_call_audio_transport(call_cfg);
   ws->call = webrtc::Call::Create(std::move(call_cfg));
   webrtc::CallConfig video_cfg(ws->env, ws->video_worker_tq.get(),
                                 ws->video_network_tq.get());

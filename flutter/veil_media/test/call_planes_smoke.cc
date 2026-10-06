@@ -20,6 +20,7 @@ using Injector = int (*)(void*, uint64_t, uint32_t, uint32_t);
 extern "C" int veil_media_test_direct_call_planes(VeilMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_blocked_audio_stats(VeilMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_muted_capture_lifecycle();
+extern "C" int veil_media_test_audio_probe_budget();
 extern "C" int veil_media_test_group_call_planes(VeilGroupMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_group_blocked_audio_stats(VeilGroupMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_group_emit_rtcp(VeilGroupMediaEngine*);
@@ -244,6 +245,11 @@ static void wait_playout(VeilGroupMediaEngine* e, uint64_t reports, uint64_t del
   if (reports) assert(group_stat(e, "audio_playout_ms") == delay);
 }
 int main() {
+  const int budget_result = veil_media_test_audio_probe_budget();
+  if (budget_result != 0) {
+    std::fprintf(stderr, "audio probe budget failed: %d\n", budget_result);
+    return 1;
+  }
   const int capture_result = veil_media_test_muted_capture_lifecycle();
   if (capture_result != 0) {
     std::fprintf(stderr, "muted capture lifecycle failed: %d\n", capture_result);
