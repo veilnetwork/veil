@@ -332,10 +332,16 @@ void VeilTransportShim::PostInboundDrain(bool secondary) {
       });
 }
 
-AudioFeedbackSnapshot VeilTransportShim::audio_feedback() const {
+RtcpFeedbackSnapshot VeilTransportShim::audio_feedback() const {
   if (!started_.load(std::memory_order_acquire)) return {};
   std::lock_guard lock(audio_feedback_mu_);
   return audio_feedback_;
+}
+
+RtcpFeedbackSnapshot VeilTransportShim::video_feedback() const {
+  if (!started_.load(std::memory_order_acquire)) return {};
+  std::lock_guard lock(audio_feedback_mu_);
+  return video_feedback_;
 }
 
 AudioPlayoutSnapshot VeilTransportShim::audio_playout_feedback() const {
@@ -353,23 +359,27 @@ void VeilTransportShim::SetLocalAudioPlayout(uint32_t remote_audio_ssrc,
                         sampled_us};
 }
 
-void VeilTransportShim::ObserveAudioFeedback(std::span<const uint8_t> packet,
+void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
                                              int64_t arrived_us) {
   const uint32_t local = local_audio_ssrc_.load(std::memory_order_relaxed);
-  if (local == 0) return;
-  AudioFeedbackSnapshot candidate;
+  const uint32_t video = local_video_ssrc_.load(std::memory_order_relaxed);
+  if (local == 0 && video == 0) return;
+  RtcpFeedbackSnapshot candidate, video_candidate;
   AudioPlayoutSnapshot playout;
   const auto observe = [&](const auto& blocks) {
     for (const auto& block : blocks) {
-      if (block.source_ssrc() != local) continue;
-      candidate.arrived_us = arrived_us;
-      candidate.loss_pct = (int(block.fraction_lost()) * 100 + 128) / 256;
-      candidate.jitter_ms = static_cast<int>(uint64_t(block.jitter()) * 1000 / 48000);
+      const bool audio = local != 0 && block.source_ssrc() == local;
+      if (!audio && (video == 0 || block.source_ssrc() != video)) continue;
+      auto& sample = audio ? candidate : video_candidate;
+      sample.arrived_us = arrived_us;
+      sample.loss_pct = (int(block.fraction_lost()) * 100 + 128) / 256;
+      const uint32_t clock_rate = audio ? 48000 : 90000;
+      sample.jitter_ms = static_cast<int>(uint64_t(block.jitter()) * 1000 / clock_rate);
       if (block.last_sr() != 0) {
         auto* clock = webrtc::Clock::GetRealTimeClock();
         const uint32_t now = webrtc::CompactNtp(clock->ConvertTimestampToNtpTime(
             webrtc::Timestamp::Micros(arrived_us)));
-        candidate.rtt_ms = webrtc::CompactNtpRttToTimeDelta(
+        sample.rtt_ms = webrtc::CompactNtpRttToTimeDelta(
             now - block.delay_since_last_sr() - block.last_sr()).ms();
       }
     }
@@ -395,7 +405,7 @@ void VeilTransportShim::ObserveAudioFeedback(std::span<const uint8_t> packet,
       if (delay != kUnknownPlayout && delay > 60000) return;
       // The authenticated channel identifies the participant; the target
       // SSRC binds the measurement to OUR audio, independently of video.
-      if (read_be32(app + 8) == local) {
+      if (local != 0 && read_be32(app + 8) == local) {
         const uint64_t sequence = uint64_t(read_be32(app + 12)) << 32 |
                                   read_be32(app + 16);
         if (!playout.supported || sequence > playout.sequence)
@@ -405,10 +415,12 @@ void VeilTransportShim::ObserveAudioFeedback(std::span<const uint8_t> packet,
     }
     offset += header.packet_size();
   }
-  if (candidate.arrived_us > 0 || playout.supported) {
+  if (candidate.arrived_us > 0 || video_candidate.arrived_us > 0 || playout.supported) {
     std::lock_guard lock(audio_feedback_mu_);
     if (candidate.arrived_us > 0 && candidate.arrived_us >= audio_feedback_.arrived_us)
       audio_feedback_ = candidate;
+    if (video_candidate.arrived_us > 0 && video_candidate.arrived_us >= video_feedback_.arrived_us)
+      video_feedback_ = video_candidate;
     if (playout.supported && (!audio_playout_feedback_.supported ||
         playout.sequence > audio_playout_feedback_.sequence))
       audio_playout_feedback_ = playout;
@@ -423,7 +435,7 @@ void VeilTransportShim::DeliverOnNetworkThread(
 
   // rtcp-mux demux (RFC 5761): route by packet type.
   if (webrtc::IsRtcpPacket(packet)) {
-    if (!secondary) ObserveAudioFeedback(packet, arrived_us);
+    if (!secondary) ObserveReceiverFeedback(packet, arrived_us);
     receiver->DeliverRtcpPacket(
         webrtc::CopyOnWriteBuffer(packet.data(), packet.size()));
     return;
