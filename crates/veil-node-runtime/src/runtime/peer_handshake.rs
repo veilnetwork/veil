@@ -1453,37 +1453,37 @@ pub async fn register_connection_session(
         peer_public_key: remote_identity.public_key.clone(),
         peer_algo: remote_identity.algo,
         peer_nonce: remote_identity.nonce.clone(),
-        // Never send media into a side channel an older peer does not read.
+        // Keep local QUIC path feedback for ordered fallback too. Sending
+        // into a side channel still requires authenticated peer permission.
         // Legacy fast resumes without authenticated capability metadata
         // preserve ordered-stream fallback; upgraded peers restate support.
         // The lane at all needs both sides to speak it; rotating its key needs
         // both sides again, separately — a peer can understand the lane and
         // still keep the handshake-derived key for the session's life
         // (report12 V-M12).
-        quic_datagrams: quic_datagrams
-            .filter(|_| remote_identity.supports_realtime_datagrams)
-            .map(|handle| veil_session::runner::RealtimeLaneOffer {
-                handle,
-                peer_rotates: remote_identity.supports_realtime_rekey,
-                peer_flows: remote_identity.supports_datagram_flows,
-                peer_circuit_datagrams: remote_identity.supports_circuit_datagrams,
-                peer_neutral_forwards: remote_identity.supports_neutral_forward_datagrams,
-                parallel: parallel_quic
-                    .filter(|handle| {
-                        remote_identity.supports_parallel_quic
-                            && (!handle.requires_shared_dispatch()
-                                || remote_identity.supports_shared_parallel_quic)
-                    })
-                    .map(|handle| {
-                        let offer = veil_session::runner::ParallelQuicOffer::new(handle)
-                            .with_registry(Arc::clone(&runtime.handoff.parallel));
-                        if remote_identity.supports_duplex_parallel_quic {
-                            offer.with_duplex()
-                        } else {
-                            offer
-                        }
-                    }),
-            }),
+        quic_datagrams: quic_datagrams.map(|handle| veil_session::runner::RealtimeLaneOffer {
+            peer_datagrams: remote_identity.supports_realtime_datagrams,
+            handle,
+            peer_rotates: remote_identity.supports_realtime_rekey,
+            peer_flows: remote_identity.supports_datagram_flows,
+            peer_circuit_datagrams: remote_identity.supports_circuit_datagrams,
+            peer_neutral_forwards: remote_identity.supports_neutral_forward_datagrams,
+            parallel: parallel_quic
+                .filter(|handle| {
+                    remote_identity.supports_parallel_quic
+                        && (!handle.requires_shared_dispatch()
+                            || remote_identity.supports_shared_parallel_quic)
+                })
+                .map(|handle| {
+                    let offer = veil_session::runner::ParallelQuicOffer::new(handle)
+                        .with_registry(Arc::clone(&runtime.handoff.parallel));
+                    if remote_identity.supports_duplex_parallel_quic {
+                        offer.with_duplex()
+                    } else {
+                        offer
+                    }
+                }),
+        }),
         metrics: runtime.metrics.clone(),
         peer_id: remote_identity.node_id,
         peer_instance_id,

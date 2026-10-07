@@ -517,6 +517,26 @@ fn decode_realtime_lane_frame(frame: &[u8]) -> Option<(FrameHeader, &[u8], Realt
     Some((header, body, kind))
 }
 
+/// Source-only classification also covers the old ordered circuit discriminant.
+/// Remote forwarding is excluded by its trusted local slot and return carrier.
+fn local_primary_stream_frame(priority: u8, frame: &[u8]) -> bool {
+    if priority != veil_proto::priority::REALTIME {
+        return false;
+    }
+    if decode_realtime_lane_frame(frame).is_some() {
+        return true;
+    }
+    let Some(header) = frame
+        .get(..veil_proto::header::HEADER_SIZE)
+        .and_then(|bytes| decode_header_with_limit(bytes, u32::MAX).ok())
+    else {
+        return false;
+    };
+    header.family == FrameFamily::RelayChain as u8
+        && header.msg_type == veil_proto::family::RelayChainMsg::CircuitData as u16
+        && frame.len() == veil_proto::header::HEADER_SIZE + header.body_len as usize
+}
+
 /// Circuit bodies have already passed `decode_realtime_lane_frame`. Separate
 /// transit circuits' fragment/replay state while keeping every one in the same
 /// INTERACTIVE queue. The per-link circuit id is already known to this hop;
@@ -876,6 +896,10 @@ pub(crate) struct RealtimeRekeyTargets<'a> {
 /// by struct literal in dozens of places, and a new field touches all of them
 /// while this touches only the places that actually offer a lane.
 pub struct RealtimeLaneOffer {
+    /// Authenticated permission to use the datagram carrier. A false value
+    /// retains transport feedback for ordered compatibility without sending
+    /// datagrams to a peer that never offered their decoder.
+    pub peer_datagrams: bool,
     pub handle: veil_transport::QuicDatagramHandle,
     /// Whether the peer re-derives the lane's key when the session rekeys.
     ///
@@ -3737,8 +3761,9 @@ impl SessionRunner {
         let mut rpc_outbox = self.rpc_outbox.take();
         // hot-standby swap inbox, taken out for the same reason.
         let mut swap_rx = self.hot_standby.swap_rx.take();
-        // Capability filtering happened in node-runtime before the handle was
-        // attached. Raw direction keys are required because the ordered
+        // Retain local transport feedback even when the peer cannot receive
+        // datagrams. Carrier permission is authenticated independently below.
+        // Raw direction keys are required because the ordered
         // session cipher's implicit nonce counter cannot safely be shared with
         // an unordered/lossy transport.
         let datagram_activity =
@@ -3747,7 +3772,17 @@ impl SessionRunner {
         // `None` when the peer did not advertise lane rotation: it keeps the
         // static key, so telling our receiver to move would strand it.
         let mut realtime_rekey_tx: Option<tokio::sync::watch::Sender<Option<RealtimeRekey>>> = None;
-        let mut realtime_lane = match (self.quic_datagrams.take(), self.raw_session_keys.as_ref()) {
+        let offer = self.quic_datagrams.take();
+        let mut ordered_feedback = offer.as_ref().map(|offer| {
+            local_reliable_admission::LocalReliableAdmission::for_source(
+                offer.handle.clone(),
+                outbox
+                    .as_ref()
+                    .map(|outbox| outbox.shared_source_activity())
+                    .unwrap_or_default(),
+            )
+        });
+        let mut realtime_lane = match (offer.filter(|offer| offer.peer_datagrams), self.raw_session_keys.as_ref()) {
             (Some(offer), Some((raw_tx_key, raw_rx_key, session_id))) => offer
                 .handle
                 .max_size()
@@ -4044,6 +4079,7 @@ impl SessionRunner {
         // scheduler boundary implicated by relay-video pauses.
         let mut realtime_writer_blocked_since: Option<std::time::Instant> = None;
         let mut source_reliable_pressure_logged: Option<std::time::Instant> = None;
+        let mut ordered_primary_pressure_logged: Option<std::time::Instant> = None;
 
         // connection-rotation deadline. Computed once
         // at session start from the global SESSION_MAX_AGE_SECS
@@ -4713,6 +4749,24 @@ impl SessionRunner {
                     })
                 {
                     drained_this_pass += 1;
+                    if envelope.carrier.is_none()
+                        && local_primary_stream_frame(envelope.frame.0, &envelope.frame.1)
+                        && let Some(feedback) = realtime_lane
+                            .as_mut()
+                            .map(|lane| &mut lane.local_reliable)
+                            .or(ordered_feedback.as_mut())
+                        && feedback.observe_ordered_primary(now)
+                        && crate::rt_trace::rt_trace_enabled()
+                        && ordered_primary_pressure_logged.is_none_or(|last| {
+                            now.saturating_duration_since(last) >= std::time::Duration::from_secs(1)
+                        })
+                    {
+                        ordered_primary_pressure_logged = Some(now);
+                        self.logger.info(
+                            "session.rt_trace.ordered_primary_pressure",
+                            format!("peer_id={} scope=endpoint", hex_short(&self.peer_id)),
+                        );
+                    }
                     batch_has_local_source |= envelope.frame.0 != veil_proto::priority::INTERACTIVE;
                     let control = local_control_write(envelope.frame.0, &envelope.frame.1);
                     batch_control = Some(control);
@@ -4934,6 +4988,9 @@ impl SessionRunner {
                         // connection's datagram plane immediately; queued media
                         // continues through the ordered fallback.
                         realtime_lane = None;
+                        // The new stream has no QUIC metadata. Feedback from
+                        // the retired connection must not affect its producer.
+                        ordered_feedback = None;
                         _datagram_transport_lease = None;
                         drop(realtime_receiver_task.take());
                         // Tear-down + re-spawn lifecycle is mechanical;
