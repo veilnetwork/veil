@@ -26,6 +26,7 @@
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -33,6 +34,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "api/audio/audio_device_defines.h"
@@ -176,6 +178,15 @@ void alog(const char* fmt, ...) {
 
 class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
                        webrtc::AudioDeviceModule> {
+  // Notification handlers run on Apple's internal queue. They never touch the
+  // ADM directly: queued recovery owns this small state, whose owner is cleared
+  // on engine_queue_ before teardown. A delayed callback cannot revive or access
+  // a destroyed ADM or a replacement engine.
+  struct ConfigurationState {
+    dispatch_queue_t queue = nil;
+    VeilAvfAdm* owner = nullptr; // Accessed only on queue.
+    std::atomic<bool> pending{false};
+  };
  public:
   explicit VeilAvfAdm(const webrtc::Environment& env)
       : env_(env),
@@ -365,9 +376,72 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   }
   bool Playing() const override { return playing_.load(); }
 
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+  int TestConfigurationRecovery(bool pending_teardown) {
+    const auto wait_for_render = [&](uint64_t previous) {
+      const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+      while (std::chrono::steady_clock::now() < until) {
+        if (play_count_.load() > previous + 3) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      return false;
+    };
+    if (!wait_for_render(0)) return 1;
+    __block AVAudioEngine* stopped = nil;
+    dispatch_sync(engine_queue_, ^{
+      stopped = engine_;
+      [stopped stop];
+    });
+    const auto before = play_count_.load();
+    // Equivalent to the documented hardware-rate-change notification. Only
+    // this stand engine is stopped; system defaults and other apps are untouched.
+    for (int i = 0; i < 3; ++i) {
+      [[NSNotificationCenter defaultCenter]
+          postNotificationName:AVAudioEngineConfigurationChangeNotification
+                        object:stopped];
+    }
+    if (pending_teardown) return 0;
+    return wait_for_render(before) ? 0 : 2;
+  }
+#endif
+
  private:
   // Guards the single engine rebuild attempted after a failed start.
   int rebuild_depth_ = 0;
+
+  void RemoveConfigurationObserverLocked() {
+    if (configuration_state_) configuration_state_->owner = nullptr;
+    if (configuration_observer_ != nil) {
+      [[NSNotificationCenter defaultCenter] removeObserver:configuration_observer_];
+      configuration_observer_ = nil;
+    }
+    configuration_state_.reset();
+  }
+
+  void ObserveConfigurationLocked() {
+    auto state = std::make_shared<ConfigurationState>();
+    state->queue = engine_queue_;
+    state->owner = this;
+    configuration_state_ = state;
+    configuration_observer_ = [[NSNotificationCenter defaultCenter]
+        addObserverForName:AVAudioEngineConfigurationChangeNotification
+                    object:engine_
+                     queue:nil
+                usingBlock:^(NSNotification* /*notification*/) {
+                  if (state->pending.exchange(true)) return;
+                  // Coalesce the input/output changes of a Bluetooth profile
+                  // switch and leave Apple's notification queue immediately.
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+                                 state->queue, ^{
+                    state->pending.store(false);
+                    auto* self = state->owner;
+                    if (!self || !self->engine_ || self->engine_.isRunning ||
+                        (!self->recording_.load() && !self->playing_.load())) return;
+                    alog("avf_adm: hardware configuration stopped engine — restoring audio");
+                    self->ReconfigureLocked();
+                  });
+                }];
+  }
 
   // Rebuild engine run-state to match recording_/playing_. Runs on engine_queue_.
   void ReconfigureLocked() {
@@ -504,6 +578,7 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
               alog("avf_adm: rebuild stop threw (%s)",
                    e.reason.UTF8String ? e.reason.UTF8String : "?");
             }
+            RemoveConfigurationObserverLocked();
             engine_ = nil;
             source_node_ = nil;
             ReconfigureLocked();
@@ -717,6 +792,7 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
       engine_ = nil;  // leave un-built; ReconfigureLocked bails on engine_==nil
       source_node_ = nil;
     }
+    if (engine_ != nil) ObserveConfigurationLocked();
   }
 
   // Runs on the CoreAudio render thread.
@@ -734,6 +810,9 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     }
     play_fine_->GetPlayoutData(std::span<int16_t>(play_tmp_.data(), need),
                                kPlayoutDelayMs);
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+    play_count_.fetch_add(1);
+#endif
     const float inv = 1.0f / 32768.0f;
     for (AVAudioFrameCount i = 0; i < frame_count; ++i) {
       dst[i] = (float)play_tmp_[i] * inv;
@@ -743,6 +822,7 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
 
   void TeardownEngineLocked() {
     CancelMicAuthorizationTimerLocked();
+    RemoveConfigurationObserverLocked();
     if (engine_ == nil) return;
     if (engine_.isRunning) [engine_ stop];
     if (capture_tap_installed_) {
@@ -783,9 +863,14 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   std::atomic<bool> recording_{false};
   std::atomic<bool> playing_{false};
   std::atomic<uint64_t> cap_count_{0};
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+  std::atomic<uint64_t> play_count_{0};
+#endif
 
   dispatch_queue_t engine_queue_ = nil;
   dispatch_source_t mic_auth_timer_ = nil;
+  id configuration_observer_ = nil;
+  std::shared_ptr<ConfigurationState> configuration_state_;
   AVAudioEngine* engine_ = nil;
   AVAudioSourceNode* source_node_ = nil;
   AVAudioConverter* capture_converter_ = nil;
@@ -806,6 +891,13 @@ webrtc::scoped_refptr<webrtc::AudioDeviceModule> CreateVeilAvfAdm(
     const webrtc::Environment& env) {
   return webrtc::make_ref_counted<VeilAvfAdm>(env);
 }
+
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+int TestVeilAvfConfigurationRecovery(webrtc::AudioDeviceModule* adm,
+                                     bool pending_teardown) {
+  return static_cast<VeilAvfAdm*>(adm)->TestConfigurationRecovery(pending_teardown);
+}
+#endif
 
 }  // namespace veil_media
 #endif  // VEIL_MEDIA_HAVE_WEBRTC
