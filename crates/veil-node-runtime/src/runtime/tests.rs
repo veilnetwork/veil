@@ -3273,6 +3273,164 @@ async fn udp_discovery_punch_and_same_socket_quic_roundtrip() {
 
 // ── Explicit call-path hole punch (real-P2P Stage B) ───────────────────────
 
+/// Exercise the responder's actual spawn + authenticated OVL1 handshake.
+/// A configured peer whose id is larger can only reach us through this punched
+/// connection: rejecting its inbound direction strands both endpoints.
+#[tokio::test]
+async fn punched_inbound_accepts_noncanonical_direction_without_evicting_a_live_session() {
+    use crate::types::{PeerConfigEntry, PeerSource};
+    use veil_transport::{PunchedQuicRole, TransportContext, promote_punched_quic};
+
+    async fn connection_pair() -> (
+        Box<dyn veil_transport::TransportConnection>,
+        JoinHandle<Box<dyn veil_transport::TransportConnection>>,
+    ) {
+        let left = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let right = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let left_addr = left.local_addr().unwrap();
+        let right_addr = right.local_addr().unwrap();
+        let ctx = Arc::new(TransportContext::for_debug().unwrap());
+        let responder_ctx = Arc::clone(&ctx);
+        let responder = tokio::spawn(async move {
+            promote_punched_quic(right, left_addr, responder_ctx, PunchedQuicRole::Responder)
+                .await
+                .unwrap()
+        });
+        let initiator = promote_punched_quic(left, right_addr, ctx, PunchedQuicRole::Initiator)
+            .await
+            .unwrap();
+        (initiator, responder)
+    }
+
+    let mut config = runtime_config_with_listen();
+    config.peers.clear();
+    config.identity.as_mut().unwrap().lazy_mining = false;
+    config.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+    let path = save_test_config("punched-inbound-direction", config).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.unwrap();
+    let services = runtime.access();
+    let local = services.identity.local_identity.node_id;
+    let peer = loop {
+        let keys = test_support::ed25519_keypair();
+        let id = NodeId::from_public_key(SignatureAlgorithm::Ed25519, &keys.public_key).unwrap();
+        if id.as_bytes() > local.as_bytes() {
+            break HandshakeIdentity {
+                algo: SignatureAlgorithm::Ed25519,
+                public_key: keys.public_key,
+                private_key: keys.private_key,
+                nonce: veil_cfg::default_nonce_base64(),
+                node_id: id,
+            };
+        }
+    };
+    // No outbound connector is started: the configured reverse URI is
+    // unreachable, as it is for the real NAT'd contact.
+    lock_state(&services.state).peers.insert(
+        PeerId::new(999),
+        PeerConfigEntry {
+            peer_id: PeerId::new(999),
+            node_id: peer.node_id,
+            public_key: peer.public_key.clone(),
+            nonce: peer.nonce.clone(),
+            transport: "quic://127.0.0.1:9".into(),
+            algo: peer.algo,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            bootstrap_only: false,
+            source: PeerSource::Configured,
+        },
+    );
+
+    let mut held_stream = None;
+    for punched in [false, true, true] {
+        let (initiator, responder) = connection_pair().await;
+        // QUIC announces a lazily-opened stream only when its first bytes are
+        // written. Start HELLO before awaiting the responder's accept_bi.
+        let remote_peer = peer.clone();
+        let remote = tokio::spawn(async move {
+            let mut stream = initiator.into_stream().unwrap();
+            let authenticated = perform_ovl1_handshake(
+                &mut stream,
+                &remote_peer,
+                veil_cfg::NodeRole::Core,
+                veil_cfg::DiscoveryMode::Public,
+                None,
+                None,
+                None,
+                Some(*local.as_bytes()),
+                None,
+                None,
+                None,
+                &[],
+                false,
+                true,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(authenticated.node_id, local);
+            stream
+        });
+        let responder = responder.await.unwrap();
+        if punched {
+            services.spawn_punched_inbound(responder);
+        } else {
+            let handle = spawn_inbound_session(
+                InboundSessionContext {
+                    runtime: services.make_session_context(),
+                    listen_id: ListenId::new(0),
+                    listener_handle: ListenerHandle::new(0),
+                },
+                responder,
+            );
+            push_session_handle(&services.tasks, handle);
+        }
+        let mut stream = remote.await.unwrap();
+        if !punched {
+            sleep(Duration::from_millis(100)).await;
+            assert!(
+                !services.has_live_session(peer.node_id.as_bytes()),
+                "ordinary inbound must keep configured mesh direction selection"
+            );
+        } else if held_stream.is_none() {
+            timeout(Duration::from_secs(2), async {
+                while !services.has_live_session(peer.node_id.as_bytes()) {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("punched responder must admit the authenticated peer");
+            held_stream = Some(stream);
+        } else {
+            // A second recovery must still lose to the first live session.
+            sleep(Duration::from_millis(100)).await;
+            assert!(services.has_live_session(peer.node_id.as_bytes()));
+            assert_eq!(
+                runtime
+                    .sessions()
+                    .iter()
+                    .filter(|s| s.node_id == Some(peer.node_id))
+                    .count(),
+                1
+            );
+            assert!(
+                timeout(Duration::from_secs(1), stream.read_u8())
+                    .await
+                    .unwrap()
+                    .is_err(),
+                "duplicate punched session must be closed"
+            );
+        }
+    }
+    drop(held_stream);
+    runtime.stop().await.unwrap();
+    assert!(!services.has_live_session(peer.node_id.as_bytes()));
+    let _ = fs::remove_file(path);
+}
+
 /// The dial-stage failure enum maps 1:1 onto the wire outcomes so an
 /// early exit never loses its stage identity crossing the API boundary.
 #[test]

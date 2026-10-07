@@ -890,7 +890,7 @@ impl NodeServices {
         &self,
         connection: Box<dyn veil_transport::TransportConnection>,
     ) {
-        let handle = spawn_inbound_session(
+        let handle = spawn_punched_inbound_session(
             InboundSessionContext {
                 runtime: self.make_session_context(),
                 // Synthetic source labels: punched QUIC does not originate
