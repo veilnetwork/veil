@@ -79,6 +79,13 @@ int check_call_planes(webrtc::Call* audio, webrtc::Call* video,
 }
 }
 #pragma GCC visibility push(default)
+#if defined(__APPLE__)
+extern "C" int veil_media_test_avf_configuration_recovery(VeilMediaEngine* e,
+                                                          int pending_teardown) {
+  return veil_media::TestVeilAvfConfigurationRecovery(e->ws->adm.get(),
+                                                     pending_teardown != 0);
+}
+#endif
 extern "C" int veil_media_test_direct_call_planes(
     VeilMediaEngine* e, PlaneInjector inject, void* ctx) {
   auto* ws = e->ws.get();
