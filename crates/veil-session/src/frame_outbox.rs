@@ -15,6 +15,8 @@ use crate::PriorityFrame;
 pub const RESERVED_QUEUE_DEPTH: usize = 64;
 pub const RELIABLE_SOURCE_QUEUE_DEPTH: usize = 64;
 const MAX_RESERVED_BURST: usize = 8;
+const MAX_CONTROL_BURST: usize = 4;
+pub(crate) const NETWORK_CONTROL_QUEUE_DEPTH: usize = 64;
 
 /// Local transport metadata follows a frame through the ordinary queue. It
 /// never changes the wire header, priority, FIFO position or queue budget.
@@ -84,6 +86,8 @@ impl EnvelopeReceiver {
 #[derive(Clone, Debug)]
 pub struct FrameSender {
     ordinary: mpsc::Sender<FrameEnvelope>,
+    network_control: mpsc::Sender<FrameEnvelope>,
+    control_credits: std::sync::Arc<tokio::sync::Semaphore>,
     status: std::sync::Arc<crate::local_datagram_status::LocalDatagramStatus>,
     reserved: mpsc::Sender<FrameEnvelope>,
     reliable_credits: std::sync::Arc<tokio::sync::Semaphore>,
@@ -122,24 +126,61 @@ impl FrameSender {
         &self,
         frame: PriorityFrame,
     ) -> Result<(), mpsc::error::TrySendError<PriorityFrame>> {
-        self.lane(&frame)
-            .try_send(frame.into())
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(envelope) => {
-                    mpsc::error::TrySendError::Full(envelope.frame)
-                }
-                mpsc::error::TrySendError::Closed(envelope) => {
-                    mpsc::error::TrySendError::Closed(envelope.frame)
-                }
-            })
+        let control = frame.0 == crate::LOCAL_NETWORK_CONTROL_LANE;
+        let lane = if control {
+            &self.network_control
+        } else {
+            self.lane(&frame)
+        };
+        let credit = if control {
+            if lane.is_closed() {
+                return Err(mpsc::error::TrySendError::Closed(frame));
+            }
+            match self.control_credits.clone().try_acquire_owned() {
+                Ok(credit) => Some(credit),
+                Err(_) => return Err(mpsc::error::TrySendError::Full(frame)),
+            }
+        } else {
+            None
+        };
+        let mut envelope = FrameEnvelope::from(frame);
+        envelope.reliable_credit = credit;
+        lane.try_send(envelope).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(envelope) => {
+                mpsc::error::TrySendError::Full(envelope.frame)
+            }
+            mpsc::error::TrySendError::Closed(envelope) => {
+                mpsc::error::TrySendError::Closed(envelope.frame)
+            }
+        })
     }
 
     pub async fn send(
         &self,
         frame: PriorityFrame,
     ) -> Result<(), mpsc::error::SendError<PriorityFrame>> {
-        self.lane(&frame)
-            .send(frame.into())
+        let control = frame.0 == crate::LOCAL_NETWORK_CONTROL_LANE;
+        let lane = if control {
+            &self.network_control
+        } else {
+            self.lane(&frame)
+        };
+        let credit = if control {
+            let credits = self.control_credits.clone();
+            tokio::select! {
+                biased;
+                _ = lane.closed() => return Err(mpsc::error::SendError(frame)),
+                permit = credits.acquire_owned() => match permit {
+                    Ok(credit) => Some(credit),
+                    Err(_) => return Err(mpsc::error::SendError(frame)),
+                },
+            }
+        } else {
+            None
+        };
+        let mut envelope = FrameEnvelope::from(frame);
+        envelope.reliable_credit = credit;
+        lane.send(envelope)
             .await
             .map_err(|error| mpsc::error::SendError(error.0.frame))
     }
@@ -177,15 +218,17 @@ impl FrameSender {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.ordinary.is_closed() && self.reserved.is_closed()
+        self.ordinary.is_closed() && self.reserved.is_closed() && self.network_control.is_closed()
     }
 
     pub fn capacity(&self) -> usize {
-        self.ordinary.capacity() + self.reserved.capacity()
+        self.ordinary.capacity() + self.reserved.capacity() + self.network_control.capacity()
     }
 
     pub fn max_capacity(&self) -> usize {
-        self.ordinary.max_capacity() + self.reserved.max_capacity()
+        self.ordinary.max_capacity()
+            + self.reserved.max_capacity()
+            + self.network_control.max_capacity()
     }
 
     pub fn queued(&self) -> usize {
@@ -197,6 +240,8 @@ impl FrameSender {
 pub struct FrameOutbox {
     source_activity: std::sync::Arc<crate::local_source_activity::LocalSourceActivity>,
     ordinary: EnvelopeReceiver,
+    network_control: Option<EnvelopeReceiver>,
+    control_burst: usize,
     status: Option<std::sync::Arc<crate::local_datagram_status::LocalDatagramStatus>>,
     reserved: Option<EnvelopeReceiver>,
     reserved_burst: usize,
@@ -213,10 +258,15 @@ pub(crate) fn frame_channel_with_source_activity(
 ) -> (FrameSender, FrameOutbox) {
     let status = std::sync::Arc::default();
     let (ordinary_tx, ordinary) = mpsc::channel(capacity);
+    let (control_tx, control) = mpsc::channel(capacity.min(NETWORK_CONTROL_QUEUE_DEPTH));
     let (reserved_tx, reserved) = mpsc::channel(capacity.min(RESERVED_QUEUE_DEPTH));
     (
         FrameSender {
             ordinary: ordinary_tx,
+            network_control: control_tx,
+            control_credits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                NETWORK_CONTROL_QUEUE_DEPTH,
+            )),
             status: std::sync::Arc::clone(&status),
             reserved: reserved_tx,
             reliable_credits: std::sync::Arc::new(tokio::sync::Semaphore::new(
@@ -226,6 +276,8 @@ pub(crate) fn frame_channel_with_source_activity(
         FrameOutbox {
             source_activity,
             ordinary: EnvelopeReceiver::Live(ordinary),
+            network_control: Some(EnvelopeReceiver::Live(control)),
+            control_burst: 0,
             status: Some(status),
             reserved: Some(EnvelopeReceiver::Live(reserved)),
             reserved_burst: 0,
@@ -239,6 +291,8 @@ impl From<mpsc::Receiver<PriorityFrame>> for FrameOutbox {
         Self {
             source_activity: std::sync::Arc::default(),
             ordinary: EnvelopeReceiver::Legacy(ordinary),
+            network_control: None,
+            control_burst: 0,
             status: None,
             reserved: None,
             reserved_burst: 0,
@@ -290,41 +344,57 @@ impl FrameOutbox {
         std::future::poll_fn(|cx| self.poll_recv_envelope(cx)).await
     }
 
+    fn receive_order(&self) -> [usize; 3] {
+        let lower = if self.control_burst >= MAX_CONTROL_BURST {
+            [2, 1]
+        } else {
+            [1, 2]
+        };
+        if self.reserved_burst >= MAX_RESERVED_BURST {
+            [lower[0], lower[1], 0]
+        } else {
+            [0, lower[0], lower[1]]
+        }
+    }
+
+    fn received_from(&mut self, lane: usize) {
+        if lane == 0 {
+            self.reserved_burst = self.reserved_burst.saturating_add(1);
+        } else {
+            self.reserved_burst = 0;
+            self.control_burst = if lane == 1 {
+                self.control_burst.saturating_add(1)
+            } else {
+                0
+            };
+        }
+    }
+
     pub(crate) fn poll_recv_envelope(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<FrameEnvelope>> {
-        let Some(reserved) = self.reserved.as_mut() else {
-            return self.ordinary.poll_recv(cx);
-        };
-        let ordinary_first = self.reserved_burst >= MAX_RESERVED_BURST;
-        let (first, second) = if ordinary_first {
-            (&mut self.ordinary, reserved)
-        } else {
-            (reserved, &mut self.ordinary)
-        };
-        let first_result = first.poll_recv(cx);
-        if let Poll::Ready(Some(frame)) = first_result {
-            self.reserved_burst = if ordinary_first {
-                0
-            } else {
-                self.reserved_burst + 1
+        let mut pending = false;
+        for lane in self.receive_order() {
+            let receiver = match lane {
+                0 => self.reserved.as_mut(),
+                1 => self.network_control.as_mut(),
+                _ => Some(&mut self.ordinary),
             };
-            return Poll::Ready(Some(frame));
+            let Some(receiver) = receiver else { continue };
+            match receiver.poll_recv(cx) {
+                Poll::Ready(Some(frame)) => {
+                    self.received_from(lane);
+                    return Poll::Ready(Some(frame));
+                }
+                Poll::Pending => pending = true,
+                Poll::Ready(None) => {}
+            }
         }
-        let second_result = second.poll_recv(cx);
-        if let Poll::Ready(Some(frame)) = second_result {
-            self.reserved_burst = if ordinary_first {
-                self.reserved_burst.saturating_add(1)
-            } else {
-                0
-            };
-            return Poll::Ready(Some(frame));
-        }
-        if matches!(first_result, Poll::Ready(None)) && matches!(second_result, Poll::Ready(None)) {
-            Poll::Ready(None)
-        } else {
+        if pending {
             Poll::Pending
+        } else {
+            Poll::Ready(None)
         }
     }
 
@@ -333,44 +403,37 @@ impl FrameOutbox {
     }
 
     pub(crate) fn try_recv_envelope(&mut self) -> Result<FrameEnvelope, mpsc::error::TryRecvError> {
-        let Some(reserved) = self.reserved.as_mut() else {
-            return self.ordinary.try_recv();
-        };
-        let ordinary_first = self.reserved_burst >= MAX_RESERVED_BURST;
-        let (first, second) = if ordinary_first {
-            (&mut self.ordinary, reserved)
-        } else {
-            (reserved, &mut self.ordinary)
-        };
-        let first_result = first.try_recv();
-        if let Ok(frame) = first_result {
-            self.reserved_burst = if ordinary_first {
-                0
-            } else {
-                self.reserved_burst + 1
+        let mut empty = false;
+        for lane in self.receive_order() {
+            let receiver = match lane {
+                0 => self.reserved.as_mut(),
+                1 => self.network_control.as_mut(),
+                _ => Some(&mut self.ordinary),
             };
-            return Ok(frame);
+            let Some(receiver) = receiver else { continue };
+            match receiver.try_recv() {
+                Ok(frame) => {
+                    self.received_from(lane);
+                    return Ok(frame);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => empty = true,
+                Err(mpsc::error::TryRecvError::Disconnected) => {}
+            }
         }
-        let second_result = second.try_recv();
-        if let Ok(frame) = second_result {
-            self.reserved_burst = if ordinary_first {
-                self.reserved_burst.saturating_add(1)
-            } else {
-                0
-            };
-            return Ok(frame);
-        }
-        if matches!(first_result, Err(mpsc::error::TryRecvError::Disconnected))
-            && matches!(second_result, Err(mpsc::error::TryRecvError::Disconnected))
-        {
-            Err(mpsc::error::TryRecvError::Disconnected)
+        Err(if empty {
+            mpsc::error::TryRecvError::Empty
         } else {
-            Err(mpsc::error::TryRecvError::Empty)
-        }
+            mpsc::error::TryRecvError::Disconnected
+        })
     }
 
     pub fn len(&self) -> usize {
-        self.ordinary.len() + self.reserved.as_ref().map_or(0, EnvelopeReceiver::len)
+        self.ordinary.len()
+            + self.reserved.as_ref().map_or(0, EnvelopeReceiver::len)
+            + self
+                .network_control
+                .as_ref()
+                .map_or(0, EnvelopeReceiver::len)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -380,6 +443,10 @@ impl FrameOutbox {
     pub fn is_closed(&self) -> bool {
         self.ordinary.is_closed()
             && self
+                .network_control
+                .as_ref()
+                .is_none_or(EnvelopeReceiver::is_closed)
+            && self
                 .reserved
                 .as_ref()
                 .is_none_or(EnvelopeReceiver::is_closed)
@@ -387,6 +454,9 @@ impl FrameOutbox {
 
     pub fn close(&mut self) {
         self.ordinary.close();
+        if let Some(control) = &mut self.network_control {
+            control.close();
+        }
         if let Some(reserved) = &mut self.reserved {
             reserved.close();
         }
@@ -397,6 +467,100 @@ impl FrameOutbox {
 mod tests {
     use super::*;
     use veil_proto::priority::{INTERACTIVE, REALTIME};
+
+    #[tokio::test]
+    async fn own_control_has_reserved_ingress_and_keeps_credit_through_scheduler() {
+        use crate::{LOCAL_NETWORK_CONTROL_LANE as CONTROL, PriorityQueue};
+        let (tx, mut rx) = frame_channel(1);
+        tx.try_send(frame(INTERACTIVE, 200)).unwrap();
+        let mut pq = PriorityQueue::with_capacity([8, 4, 2, 1], 1);
+        for byte in 0..NETWORK_CONTROL_QUEUE_DEPTH as u8 {
+            tx.try_send(frame(CONTROL, byte)).unwrap();
+            if byte == 0 {
+                tx.try_send(frame(REALTIME, 250)).unwrap();
+                assert_eq!(rx.recv().await.unwrap().1[0], 250);
+            }
+            // Account for the bounded ordinary interleave.
+            let mut envelope = rx.recv_envelope().await.unwrap();
+            if envelope.frame.0 == INTERACTIVE {
+                assert_eq!(envelope.frame.1[0], 200);
+                envelope = rx.recv_envelope().await.unwrap();
+            }
+            assert_eq!(envelope.frame.0, CONTROL);
+            pq.push_envelope(envelope, false);
+        }
+        assert!(matches!(
+            tx.try_send(frame(CONTROL, 64)),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        for byte in 100..200 {
+            pq.push(INTERACTIVE, frame(INTERACTIVE, byte).1);
+        }
+        assert_eq!(pq.len(), NETWORK_CONTROL_QUEUE_DEPTH + 1);
+        assert_eq!(&*pq.pop().unwrap(), &[199]);
+        let head = pq.pop_envelope_if(|_, _| true).unwrap();
+        assert_eq!(head.frame.1[0], 0);
+        assert!(matches!(
+            tx.try_send(frame(CONTROL, 64)),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        drop(head);
+        tx.try_send(frame(CONTROL, 64)).unwrap();
+        pq.push_envelope(rx.recv_envelope().await.unwrap(), false);
+        for byte in 1..=64 {
+            assert_eq!(&*pq.pop().unwrap(), &[byte]);
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_control_wakes_waiter_even_with_all_credits_held_by_scheduler() {
+        use crate::{LOCAL_NETWORK_CONTROL_LANE as CONTROL, PriorityQueue};
+        let (tx, mut rx) = frame_channel(1);
+        let mut pq = PriorityQueue::with_default_weights();
+        for byte in 0..NETWORK_CONTROL_QUEUE_DEPTH as u8 {
+            tx.send(frame(CONTROL, byte)).await.unwrap();
+            pq.push_envelope(rx.recv_envelope().await.unwrap(), false);
+        }
+        let waiting = tokio::spawn(async move { tx.send(frame(CONTROL, 64)).await });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        rx.close();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(pq.len(), NETWORK_CONTROL_QUEUE_DEPTH);
+    }
+
+    #[tokio::test]
+    async fn neutral_transit_is_not_starved_by_continuous_control_and_primary() {
+        use crate::LOCAL_NETWORK_CONTROL_LANE as CONTROL;
+        let (tx, mut rx) = frame_channel(64);
+        tx.try_send(frame(INTERACTIVE, 99)).unwrap();
+        for _ in 0..64 {
+            tx.try_send(frame(REALTIME, 1)).unwrap();
+            tx.try_send(frame(CONTROL, 2)).unwrap();
+        }
+        for control in 0..=MAX_CONTROL_BURST {
+            for n in 0..MAX_RESERVED_BURST {
+                let got = if n % 2 == 0 {
+                    rx.recv().await.unwrap()
+                } else {
+                    rx.try_recv().unwrap()
+                };
+                assert_eq!(got.0, REALTIME);
+            }
+            let got = rx.recv().await.unwrap();
+            if control == MAX_CONTROL_BURST {
+                assert_eq!(got.1[0], 99);
+            } else {
+                assert_eq!(got.0, CONTROL);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn reliable_credit_survives_ingress_drain_and_scheduler_overflow() {
@@ -518,7 +682,7 @@ mod tests {
             Err(mpsc::error::TrySendError::Full(_))
         ));
         // The reserved capacity still exists; a carrier cannot spend it.
-        assert_eq!(tx.capacity(), 1);
+        assert_eq!(tx.capacity(), 2);
         let mut pq = crate::priority_queue::PriorityQueue::with_default_weights();
         pq.push_envelope(rx.recv_envelope().await.unwrap(), false);
         tx.try_send_on_carrier(frame(REALTIME, 2).1, weak.clone())

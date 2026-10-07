@@ -989,3 +989,205 @@ async fn verify_stream_only_primary_backpressure(neutral_prefix: usize) {
         .unwrap()
         .unwrap();
 }
+
+fn network_query(id: u32) -> Vec<u8> {
+    use veil_proto::{discovery::FindNodeV2Payload, family::DiscoveryMsg};
+    let body = FindNodeV2Payload {
+        target: [id as u8; 32],
+        k: 8,
+    }
+    .encode();
+    let mut h = FrameHeader::new(
+        FrameFamily::Discovery as u8,
+        DiscoveryMsg::FindNodeV2 as u16,
+    );
+    h.request_id = id;
+    h.set_priority(INTERACTIVE);
+    h.body_len = body.len() as u32;
+    let mut bytes = veil_proto::codec::encode_header(&h).to_vec();
+    bytes.extend_from_slice(&body);
+    bytes
+}
+
+#[tokio::test]
+async fn own_rpc_admission_survives_drain_overflow_and_reconnect_ownership() {
+    use crate::pending_response_table::PendingResponseTable;
+    use crate::{LOCAL_NETWORK_CONTROL_LANE, PriorityQueue, SessionOutbox};
+    let outbox = SessionOutbox::with_capacity(2);
+    let peer = [0xB1; 32];
+    let mut requests = outbox.register_owned(peer, [1; 32]);
+    let first = outbox.send_request(peer, 1, network_query(1)).unwrap();
+    assert!(outbox.send_oneway(peer, network_query(2)));
+    let mut pq = PriorityQueue::with_capacity([8, 4, 2, 1], 1);
+    let mut pending = PendingResponseTable::new(8, Duration::from_secs(30));
+    while let Ok(req) = requests.try_recv() {
+        SessionRunner::queue_rpc_request(req, &mut pq, &mut pending);
+    }
+    assert!(
+        outbox.send_request(peer, 3, network_query(3)).is_none(),
+        "mpsc drain must not renew source credits"
+    );
+    for id in 100..200 {
+        pq.push(
+            INTERACTIVE,
+            veil_bufpool::pooled_shared_from_vec(network_query(id)),
+        );
+    }
+    assert_eq!(pq.len(), 3);
+    assert_eq!(pq.drops_total(), 99);
+    assert_eq!(&*pq.pop().unwrap(), &network_query(199));
+    let held = pq.pop_envelope_if(|_, _| true).unwrap();
+    assert_eq!(held.frame.0, LOCAL_NETWORK_CONTROL_LANE);
+    assert_eq!(&*held.frame.1, &network_query(1));
+    assert!(outbox.send_request(peer, 3, network_query(3)).is_none());
+    drop(held);
+    assert!(outbox.send_request(peer, 3, network_query(3)).is_some());
+    pending
+        .take(1)
+        .unwrap()
+        .send(Some(b"reply".to_vec()))
+        .unwrap();
+    assert_eq!(first.await.unwrap(), Some(b"reply".to_vec()));
+    let mut replacement = outbox.register_owned(peer, [2; 32]);
+    assert!(!outbox.unregister_owned(peer, &[1; 32]));
+    assert!(outbox.send_oneway(peer, network_query(4)));
+    assert!(outbox.send_oneway(peer, network_query(5)));
+    assert!(!outbox.send_oneway(peer, network_query(6)));
+    drop(pq);
+    drop(requests);
+    assert!(
+        !outbox.send_oneway(peer, network_query(6)),
+        "old credits must not grant new owner capacity"
+    );
+    drop(replacement.try_recv().unwrap());
+    assert!(outbox.send_oneway(peer, network_query(6)));
+}
+
+async fn verify_own_network_pressure(rpc: bool) {
+    use super::super::local_reliable_admission::LocalReliableAdmission;
+    let (primary_link, primary, _primary_stream, _primary_peer) = pair().await;
+    let (_query_link, query_handle, query_stream, mut peer) = pair().await;
+    let mut node = crate::SessionTxRegistry::new();
+    let primary_outbox = node.register([0xA1; 32]);
+    let query_outbox = node.register([0xB1; 32]);
+    let sender = node.get_sender(&[0xB1; 32]).unwrap().clone();
+    let source = primary_outbox.shared_source_activity();
+    let mut admission = LocalReliableAdmission::for_source(primary.clone(), Arc::clone(&source));
+    admission.observe(
+        REALTIME,
+        &circuit_frame(1, 0x11),
+        std::time::Instant::now(),
+        true,
+    );
+    primary_link.blackout.store(true, Ordering::Relaxed);
+    primary.send(&[0x11; 200]).unwrap();
+    timeout(Duration::from_secs(2), async {
+        while primary.path_stats().pto_count == 0 {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pressured = std::time::Instant::now();
+    admission.observe_primary_path(&primary, pressured);
+    admission.observe(REALTIME, &circuit_frame(1, 0x11), pressured, true);
+    // A exhausted DATA allowance cannot starve this node's route recovery.
+    source
+        .admit_reliable_secondary(
+            crate::local_source_activity::RELIABLE_SECONDARY_BYTES,
+            pressured,
+        )
+        .unwrap();
+    let outbox = crate::SessionOutbox::with_capacity(64);
+    let mut runner = make_runner(query_stream, query_outbox, None);
+    if rpc {
+        runner.rpc_outbox = Some(outbox.register([0xB1; 32]));
+    }
+    for id in 1..=48 {
+        if rpc {
+            assert!(outbox.send_oneway([0xB1; 32], network_query(id)));
+        } else {
+            assert!(node.send_to(
+                &[0xB1; 32],
+                crate::LOCAL_NETWORK_CONTROL_LANE,
+                network_query(id)
+            ));
+        }
+    }
+    // Same encoded message family and priority; the neutral origin must pass.
+    assert!(node.send_to(&[0xB1; 32], INTERACTIVE, network_query(90)));
+    let job = tokio::spawn(async move { runner.run().await });
+    let mut reader = super::super::ordered_reader::Reader::default();
+    let mut cipher = SessionCipher::new(&[0x51; 32], true);
+    let mut ids = Vec::new();
+    let mut neutral = false;
+    let mut early_wire_bytes = 0;
+    let ended = timeout(Duration::from_secs(6), async {
+        while ids.len() < 48 || !neutral {
+            let wire = reader.read(&mut peer, 65536).await.unwrap();
+            let body = cipher
+                .open(&wire.body, &veil_proto::codec::frame_aad(&wire.header))
+                .unwrap();
+            if wire.header.family == FrameFamily::Session as u8 {
+                continue;
+            }
+            assert_eq!(
+                wire.header.priority(),
+                INTERACTIVE,
+                "local origin must not appear on wire"
+            );
+            let expected = network_query(wire.header.request_id);
+            let expected_header = veil_proto::codec::decode_header(&expected).unwrap();
+            assert_eq!(wire.header.family, expected_header.family);
+            assert_eq!(wire.header.msg_type, expected_header.msg_type);
+            assert_eq!(&body, &expected[veil_proto::header::HEADER_SIZE..]);
+            if wire.header.request_id == 90 {
+                assert!(!neutral);
+                assert!(
+                    pressured.elapsed() < Duration::from_millis(180),
+                    "own source pressure held neutral transit"
+                );
+                neutral = true;
+            } else {
+                if pressured.elapsed() < Duration::from_millis(180) {
+                    early_wire_bytes += super::super::encrypted_wire_len(expected.len()).unwrap();
+                }
+                ids.push(wire.header.request_id);
+            }
+        }
+        pressured.elapsed()
+    })
+    .await
+    .unwrap();
+    assert!(
+        early_wire_bytes > 0,
+        "DATA exhausted the independent network allowance"
+    );
+    assert!(
+        early_wire_bytes <= crate::local_source_activity::NETWORK_CONTROL_BYTES,
+        "own network source bypassed audio pressure: {early_wire_bytes}"
+    );
+    assert!(
+        ended >= Duration::from_millis(400),
+        "query burst did not wait for pressure deadlines"
+    );
+    assert_eq!(
+        ids,
+        (1..=48).collect::<Vec<_>>(),
+        "queries lost, duplicated or reordered"
+    );
+    drop(sender);
+    query_handle.close();
+    primary.close();
+    timeout(Duration::from_secs(2), job).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn pressured_rpc_queries_preserve_transit_and_resume_without_input() {
+    verify_own_network_pressure(true).await;
+}
+
+#[tokio::test]
+async fn pressured_own_fanout_preserves_transit_and_resumes_without_input() {
+    verify_own_network_pressure(false).await;
+}

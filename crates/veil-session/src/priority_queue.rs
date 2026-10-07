@@ -2,7 +2,8 @@
 //!
 //! Four original classes match the 2-bit priority
 //! field in `FrameHeader.flags`. Recoverable local DATA has a separate fifth
-//! queue with the background weight; its selector never enters this wire field:
+//! queue with the background weight; own network RPC has a sixth queue with
+//! the interactive weight. Neither local selector enters this wire field:
 //!
 //! | Level | Class | Weight |
 //! |-------|-------------|--------|
@@ -31,10 +32,15 @@ pub use veil_proto::header::priority::{BACKGROUND, BULK, INTERACTIVE, REALTIME};
 pub const DEFAULT_WEIGHTS: [u32; 4] = [8, 4, 2, 1];
 
 // The fifth queue is trusted endpoint-only DATA. Remote traffic stays in the
-// four original classes; no wire priority can select this source queue.
-const LOCAL_QUEUE_COUNT: usize = 5;
+// four original classes; neither local source selector enters the wire field.
+/// Trusted locally originated network maintenance/RPC. Not an IPC selector
+/// or a wire priority; received/forwarded frames cannot select this queue.
+pub const LOCAL_NETWORK_CONTROL_LANE: u8 = 5;
+const LOCAL_QUEUE_COUNT: usize = 6;
 fn queue_index(priority: u8) -> usize {
-    if priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE {
+    if priority == LOCAL_NETWORK_CONTROL_LANE {
+        5
+    } else if priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE {
         4
     } else {
         priority.min(3) as usize
@@ -157,7 +163,9 @@ impl PriorityQueue {
             weights.iter().any(|&w| w > 0),
             "PriorityQueue: all weights are zero — pop() would always return None"
         );
-        let weights = [weights[0], weights[1], weights[2], weights[3], weights[3]];
+        let weights = [
+            weights[0], weights[1], weights[2], weights[3], weights[3], weights[1],
+        ];
         Self {
             queues: Default::default(),
             weights,
@@ -1029,13 +1037,13 @@ mod tests {
             pq.push_lossy(p, arc(b"second"));
         }
         let frame = pq.pop_realtime_if(|_| true).unwrap();
-        assert_eq!(pq.lossy_realtime_len, [1, 0, 2, 0, 0]);
+        assert_eq!(pq.lossy_realtime_len, [1, 0, 2, 0, 0, 0]);
         pq.push_realtime_front(frame);
-        assert_eq!(pq.lossy_realtime_len, [2, 0, 2, 0, 0]);
+        assert_eq!(pq.lossy_realtime_len, [2, 0, 2, 0, 0, 0]);
         pq.push_lossy(BACKGROUND, arc(b"must not evict higher classes"));
-        assert_eq!(pq.lossy_realtime_len, [2, 0, 2, 0, 0]);
+        assert_eq!(pq.lossy_realtime_len, [2, 0, 2, 0, 0, 0]);
         pq.push(INTERACTIVE, arc(b"reliable"));
-        assert_eq!(pq.lossy_realtime_len, [2, 0, 1, 0, 0]);
+        assert_eq!(pq.lossy_realtime_len, [2, 0, 1, 0, 0, 0]);
         for queued in &mut pq.queues[REALTIME as usize] {
             queued.enqueued_at =
                 Some(Instant::now() - LOSSY_REALTIME_MAX_AGE - Duration::from_millis(1));
@@ -1044,7 +1052,7 @@ mod tests {
             &*pq.pop_envelope_if(|_, _| true).unwrap().frame.1,
             b"reliable"
         );
-        assert_eq!(pq.lossy_realtime_len, [0, 0, 1, 0, 0]);
+        assert_eq!(pq.lossy_realtime_len, [0, 0, 1, 0, 0, 0]);
         assert_eq!(
             &*pq.pop_local_datagram_envelope_if(|_| true).unwrap().frame.1,
             b"second"
