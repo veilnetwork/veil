@@ -602,3 +602,225 @@ async fn ordered_primary_feedback_survives_peer_without_neutral_forward_datagram
 async fn ordered_primary_feedback_survives_legacy_circuit_carrier() {
     verify_ordered_primary_feedback(OrderedPrimary::LegacyCircuit).await;
 }
+
+#[tokio::test]
+async fn stream_only_primary_backpressure_holds_a_healthy_neighbor_file() {
+    use veil_proto::app::AppDataPayload;
+    let (primary_stream, mut primary_peer) = tokio::io::duplex(64);
+    let (_link, file_handle, file_stream, mut file_peer) = pair().await;
+    let mut node = crate::SessionTxRegistry::new();
+    let primary_outbox = node.register([0xB1; 32]);
+    let source = primary_outbox.shared_source_activity();
+    let primary_sender = node.get_sender(&[0xB1; 32]).unwrap().clone();
+    let file_outbox = node.register([0xB2; 32]);
+    let file_sender = node.get_sender(&[0xB2; 32]).unwrap().clone();
+    let secondary_outbox = node.register([0xB3; 32]);
+    let secondary_sender = node.get_sender(&[0xB3; 32]).unwrap().clone();
+    let bytes = primary_frame(OrderedPrimary::NeutralForward);
+    primary_sender
+        .send((REALTIME, bytes.clone()))
+        .await
+        .unwrap();
+    let mut runner = make_runner(Box::new(primary_stream), primary_outbox, None);
+    let primary_job = tokio::spawn(async move {
+        runner.run().await;
+    });
+    // The encrypted primary blocks on a transport with no QUIC handle.
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let now = std::time::Instant::now();
+            assert!(source.admit_reliable_secondary(4096, now).is_ok());
+            if source.admit_reliable_secondary(4096, now).is_err() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stream-only primary never published cross-neighbor pressure");
+    // Retain producer activity, as a live call would, while the old blob waits.
+    primary_sender
+        .send((REALTIME, bytes.clone()))
+        .await
+        .unwrap();
+    // Secondary lossy bytes use a different, healthy stream-only neighbor.
+    // They still share one endpoint probe budget and neutral work must pass.
+    let (secondary_stream, mut secondary_peer) = tokio::io::duplex(262144);
+    for _ in 0..50 {
+        secondary_sender
+            .send((veil_proto::priority::BULK, bytes.clone()))
+            .await
+            .unwrap();
+    }
+    secondary_sender
+        .send((INTERACTIVE, frame(AppMsg::AppSend, b"neutral-secondary")))
+        .await
+        .unwrap();
+    let mut secondary_runner = make_runner(Box::new(secondary_stream), secondary_outbox, None);
+    let secondary_job = tokio::spawn(async move {
+        secondary_runner.run().await;
+    });
+    let secondary_received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let neutral_received = Arc::new(AtomicBool::new(false));
+    let count = Arc::clone(&secondary_received);
+    let neutral_count = Arc::clone(&neutral_received);
+    let expected_secondary = bytes.clone();
+    let secondary_read = tokio::spawn(async move {
+        let mut reader = super::super::ordered_reader::Reader::default();
+        let mut cipher = SessionCipher::new(&[0x51; 32], true);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let wire = reader.read(&mut secondary_peer, 65536).await.unwrap();
+                let body = cipher
+                    .open(&wire.body, &veil_proto::codec::frame_aad(&wire.header))
+                    .unwrap();
+                if wire.header.family == FrameFamily::Session as u8 {
+                    continue;
+                }
+                assert_eq!(
+                    wire.header.priority(),
+                    INTERACTIVE,
+                    "no source role on wire"
+                );
+                if wire.header.family == FrameFamily::App as u8 {
+                    assert_eq!(body, b"neutral-secondary");
+                    neutral_count.store(true, Ordering::Relaxed);
+                } else {
+                    assert_eq!(body, &expected_secondary[veil_proto::header::HEADER_SIZE..]);
+                    count.fetch_add(1, Ordering::Relaxed);
+                    if wire.header.stream_id == 72 {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        secondary_peer
+    });
+    sleep(Duration::from_millis(180)).await;
+    assert!(
+        secondary_received.load(Ordering::Relaxed) <= 1,
+        "ordered secondary bypassed endpoint pressure"
+    );
+    assert!(
+        neutral_received.load(Ordering::Relaxed),
+        "secondary hold starved neutral work"
+    );
+    let expected: Vec<u8> = (0..3 * 3900).map(|n| (n % 251) as u8).collect();
+    for data in expected.chunks(3900) {
+        assert!(
+            file_sender
+                .send_reliable(frame(
+                    AppMsg::AppData,
+                    &AppDataPayload {
+                        app_id: [0x42; 32],
+                        endpoint_id: 9,
+                        seq: 0,
+                        data: data.to_vec(),
+                    }
+                    .encode()
+                ))
+                .await
+        );
+    }
+    file_sender
+        .send((INTERACTIVE, frame(AppMsg::AppSend, b"neutral")))
+        .await
+        .unwrap();
+    let mut file_runner = make_runner(file_stream, file_outbox, None);
+    let file_job = tokio::spawn(async move {
+        file_runner.run().await;
+    });
+    let began = std::time::Instant::now();
+    let mut reader = super::super::ordered_reader::Reader::default();
+    let mut cipher = SessionCipher::new(&[0x51; 32], true);
+    let mut output = Vec::new();
+    let mut neutral = false;
+    timeout(Duration::from_secs(2), async {
+        while output.len() < expected.len() {
+            let wire = reader.read(&mut file_peer, 65536).await.unwrap();
+            let body = cipher
+                .open(&wire.body, &veil_proto::codec::frame_aad(&wire.header))
+                .unwrap();
+            if wire.header.family == FrameFamily::Session as u8 {
+                continue;
+            }
+            assert_eq!(wire.header.priority(), INTERACTIVE);
+            if wire.header.msg_type == AppMsg::AppSend as u16 {
+                assert_eq!(body, b"neutral");
+                assert!(output.len() < expected.len());
+                neutral = true;
+            } else {
+                assert_eq!(wire.header.msg_type, AppMsg::AppData as u16);
+                let p = AppDataPayload::decode(&body).unwrap();
+                assert_eq!(p.seq, 0);
+                output.extend(p.data);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(output, expected);
+    assert!(neutral);
+    assert!(
+        began.elapsed() >= Duration::from_millis(350),
+        "file bypassed stalled primary"
+    );
+    // Unblock and decrypt both primary frames. Pressure ticks never cancel or
+    // restart partial encrypted writes or consume an extra cipher nonce.
+    let mut reader = super::super::ordered_reader::Reader::default();
+    let mut cipher = SessionCipher::new(&[0x51; 32], true);
+    timeout(Duration::from_secs(2), async {
+        let mut received = 0;
+        while received < 2 {
+            let wire = reader.read(&mut primary_peer, 65536).await.unwrap();
+            let body = cipher
+                .open(&wire.body, &veil_proto::codec::frame_aad(&wire.header))
+                .unwrap();
+            if wire.header.family == FrameFamily::Session as u8 {
+                continue;
+            }
+            assert_eq!(wire.header.priority(), INTERACTIVE);
+            assert_eq!(body, &bytes[veil_proto::header::HEADER_SIZE..]);
+            received += 1;
+        }
+    })
+    .await
+    .unwrap();
+    drop(primary_peer);
+    // Old lossy frames should expire before encryption. A fresh secondary
+    // frame after pressure grace must pass with the same session cipher.
+    sleep(crate::local_source_activity::PRESSURE_GRACE + Duration::from_millis(30)).await;
+    let mut fresh = bytes.to_vec();
+    let mut header = veil_proto::codec::decode_header(&fresh).unwrap();
+    header.stream_id = 72;
+    fresh[..veil_proto::header::HEADER_SIZE]
+        .copy_from_slice(&veil_proto::codec::encode_header(&header));
+    secondary_sender
+        .send((
+            veil_proto::priority::BULK,
+            veil_bufpool::pooled_shared_from_vec(fresh),
+        ))
+        .await
+        .unwrap();
+    let secondary_peer = secondary_read.await.unwrap();
+    assert!(
+        secondary_received.load(Ordering::Relaxed) < 50,
+        "stale secondary backlog must not drain after pressure"
+    );
+    drop(secondary_peer);
+    timeout(Duration::from_secs(2), secondary_job)
+        .await
+        .unwrap()
+        .unwrap();
+    file_handle.close();
+    timeout(Duration::from_secs(2), primary_job)
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(Duration::from_secs(2), file_job)
+        .await
+        .unwrap()
+        .unwrap();
+}

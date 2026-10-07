@@ -1862,6 +1862,7 @@ async fn independent_primary_expiry_keeps_parent_control_admission() {
         veil_bufpool::pooled_shared_from_vec(vec![0x33; 12 * 1024]),
         &None,
         true,
+        None,
     )
     .unwrap();
     let partial = timeout(Duration::from_millis(100), partial_rx)
@@ -1881,6 +1882,7 @@ async fn independent_primary_expiry_keeps_parent_control_admission() {
         veil_bufpool::pooled_shared_from_vec(vec![0x44; 2 * 1024]),
         &None,
         false,
+        None,
     )
     .unwrap();
     sleep(Duration::from_millis(50)).await;

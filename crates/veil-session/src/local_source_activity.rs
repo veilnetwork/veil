@@ -34,7 +34,7 @@ impl LocalSourceActivity {
             .is_some_and(|at| now.saturating_duration_since(at) < IDLE_GRACE)
     }
 
-    /// Only a locally authored primary's authenticated path can publish this.
+    /// Only a locally authored primary's authenticated path or trusted writer can publish this.
     /// Other runners consume it exclusively for their own secondary producers.
     pub(crate) fn note_pressure(&self, now: Instant) {
         let mut state = lock!(self.0);
@@ -84,6 +84,12 @@ impl LocalSourceActivity {
     /// One sparse probe across this endpoint, including different neighbors.
     /// Callers must exclude primary, control and neutral transit beforehand.
     pub(crate) fn allow_secondary(&self, now: Instant) -> bool {
+        self.admit_lossy_secondary(now).is_ok()
+    }
+
+    /// Ordered compatibility needs the wake deadline while retaining its
+    /// plaintext frame. The sparse probe is shared with DATAGRAM senders.
+    pub(crate) fn admit_lossy_secondary(&self, now: Instant) -> Result<(), Instant> {
         let mut state = lock!(self.0);
         let active = state
             .last_primary
@@ -91,13 +97,15 @@ impl LocalSourceActivity {
         let pressured = state.pressure_until.is_some_and(|until| now < until);
         if !active || !pressured {
             state.secondary_next = None;
-            return true;
+            return Ok(());
         }
-        if state.secondary_next.is_some_and(|next| now < next) {
-            return false;
+        if let Some(next) = state.secondary_next.filter(|next| now < *next) {
+            return Err(next
+                .min(state.last_primary.unwrap() + IDLE_GRACE)
+                .min(state.pressure_until.unwrap()));
         }
         state.secondary_next = Some(now + SECONDARY_PROBE_INTERVAL);
-        true
+        Ok(())
     }
 }
 
