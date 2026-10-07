@@ -80,6 +80,12 @@ mod tests {
             acknowledgments_received: 20,
             expired_outgoing_datagrams: 0,
             residual_window_transmits: 0,
+            event_queue_last_us: 0,
+            event_queue_max_us: 0,
+            event_queue_stalls: 0,
+            timer_late_last_us: 0,
+            timer_late_max_us: 0,
+            timer_stalls: 0,
         }
     }
 

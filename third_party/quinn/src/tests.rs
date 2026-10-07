@@ -775,6 +775,40 @@ async fn stream_id_flow_control() {
     );
 }
 
+// Exercise the actual connection driver, UDP endpoints and runtime timer.
+// Blocking this single-thread runtime must appear as local scheduling lateness,
+// rather than being attributed exclusively to network round-trip time.
+#[tokio::test(flavor = "current_thread")]
+async fn driver_stats_detect_runtime_stall() {
+    let mut cfg = TransportConfig::default();
+    cfg.keep_alive_interval(Some(Duration::from_millis(10)));
+    let endpoint = endpoint_with_config(cfg);
+    let (client, server) = tokio::join!(
+        endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap(),
+        async { endpoint.accept().await.unwrap().await }
+    );
+    let client = client.unwrap();
+    let server = server.unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let before = client.driver_stats();
+    std::thread::sleep(Duration::from_millis(250));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let after = client.driver_stats();
+    assert!(
+        after.timer_stalls > before.timer_stalls,
+        "{before:?} -> {after:?}"
+    );
+    assert!(after.timer_late_max_us >= 100_000, "{after:?}");
+    // Scheduling observation must leave normal application delivery intact.
+    client
+        .send_datagram(Bytes::from_static(b"after-stall"))
+        .unwrap();
+    assert_eq!(server.read_datagram().await.unwrap(), &b"after-stall"[..]);
+    endpoint.close(0u32.into(), b"test complete");
+}
+
 #[tokio::test]
 async fn two_datagram_readers() {
     let _guard = subscribe();

@@ -87,12 +87,19 @@ pub struct QuicDatagramPathStats {
     pub acknowledgments_received: u64,
     pub expired_outgoing_datagrams: u64,
     pub residual_window_transmits: u64,
+    pub event_queue_last_us: u64,
+    pub event_queue_max_us: u64,
+    pub event_queue_stalls: u64,
+    pub timer_late_last_us: u64,
+    pub timer_late_max_us: u64,
+    pub timer_stalls: u64,
 }
 
 impl QuicDatagramHandle {
     /// Snapshot actual transport progress, separately from queue admission.
     pub fn path_stats(&self) -> QuicDatagramPathStats {
         let stats = self.connection.stats();
+        let driver = self.connection.driver_stats();
         QuicDatagramPathStats {
             rtt_us: stats.path.rtt.as_micros().min(u64::MAX as u128) as u64,
             congestion_window_bytes: stats.path.cwnd,
@@ -105,6 +112,12 @@ impl QuicDatagramHandle {
             acknowledgments_received: stats.frame_rx.acks,
             expired_outgoing_datagrams: self.connection.expired_outgoing_datagrams(),
             residual_window_transmits: stats.path.residual_window_transmits,
+            event_queue_last_us: driver.event_queue_last_us,
+            event_queue_max_us: driver.event_queue_max_us,
+            event_queue_stalls: driver.event_queue_stalls,
+            timer_late_last_us: driver.timer_late_last_us,
+            timer_late_max_us: driver.timer_late_max_us,
+            timer_stalls: driver.timer_stalls,
         }
     }
     /// TLS exporter for authenticating a new, independent transport against

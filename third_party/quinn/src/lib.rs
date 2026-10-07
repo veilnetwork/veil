@@ -75,8 +75,8 @@ pub use rustls;
 pub use udp;
 
 pub use crate::connection::{
-    AcceptBi, AcceptUni, Connecting, Connection, OpenBi, OpenUni, ReadDatagram, SendDatagram,
-    SendDatagramError, ZeroRttAccepted,
+    AcceptBi, AcceptUni, Connecting, Connection, ConnectionDriverStats, OpenBi, OpenUni,
+    ReadDatagram, SendDatagram, SendDatagramError, ZeroRttAccepted,
 };
 pub use crate::endpoint::{Accept, Endpoint, EndpointStats};
 pub use crate::incoming::{Incoming, IncomingFuture, RetryError};
@@ -99,7 +99,10 @@ enum ConnectionEvent {
         error_code: VarInt,
         reason: bytes::Bytes,
     },
-    Proto(proto::ConnectionEvent),
+    Proto {
+        event: proto::ConnectionEvent,
+        queued_at: Instant,
+    },
     Rebind(Arc<dyn AsyncUdpSocket>),
 }
 
