@@ -32,8 +32,26 @@ fn fingerprint(bytes: &[u8]) -> u64 {
     hash.finish()
 }
 
+pub(crate) fn enabled() -> bool {
+    enabled_cell().load(Ordering::Relaxed)
+}
+
 pub(crate) fn record(stage: &'static str, bytes: &[u8], segment_size: Option<usize>) {
-    if !enabled_cell().load(Ordering::Relaxed) || bytes.is_empty() {
+    record_inner(stage, bytes, segment_size, None, false);
+}
+
+pub(crate) fn record_receive(bytes: &[u8], kernel_recv_unix_ns: Option<u64>, grouped: bool) {
+    record_inner("receive", bytes, None, kernel_recv_unix_ns, grouped);
+}
+
+fn record_inner(
+    stage: &'static str,
+    bytes: &[u8],
+    segment_size: Option<usize>,
+    kernel_recv_unix_ns: Option<u64>,
+    grouped: bool,
+) {
+    if !enabled() || bytes.is_empty() {
         return;
     }
     for datagram in bytes.chunks(segment_size.filter(|n| *n > 0).unwrap_or(bytes.len())) {
@@ -48,8 +66,9 @@ pub(crate) fn record(stage: &'static str, bytes: &[u8], segment_size: Option<usi
             .unwrap_or_default()
             .as_millis();
         log::info!(
-            "quic.udp_wire.sample stage={stage} at_ms={at_ms} digest={digest:016x} bytes={}",
-            datagram.len()
+            "quic.udp_wire.sample stage={stage} at_ms={at_ms} digest={digest:016x} bytes={} kernel_recv_ns={} kernel_grouped={grouped}",
+            datagram.len(),
+            kernel_recv_unix_ns.unwrap_or(0)
         );
     }
 }
@@ -89,12 +108,13 @@ mod tests {
         set_udp_wire_trace(true);
         record("send", &batch, Some(1200));
         record("receive", &a, None);
+        record_receive(&a, Some(123456789), true);
         set_udp_wire_trace(false);
         record("send", &batch, Some(1200));
         let rows = LOGGER.0.lock().unwrap();
         assert_eq!(
             rows.len(),
-            3,
+            4,
             "SDK log bridge must receive sampled datagrams"
         );
         assert!(rows[0].contains("stage=send"));
@@ -108,6 +128,9 @@ mod tests {
         assert_eq!(digest(&rows[0]), digest(&rows[2]));
         assert!(rows[0].contains("bytes=1200"));
         assert!(rows[1].contains("bytes=500"));
+        assert!(rows[0].contains("kernel_recv_ns=0"));
+        assert!(rows[3].contains("kernel_recv_ns=123456789"));
+        assert!(rows[3].contains("kernel_grouped=true"));
     }
 
     #[test]
