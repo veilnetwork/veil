@@ -152,14 +152,29 @@ class VeilMediaEngine {
   }
 
   bool get supportsChannelRebind => ffi.veilMediaEngineRebindChannel != null;
+  bool get supportsReceiveChannelOverlap =>
+      ffi.veilMediaEngineRebindChannelKeepReceiver != null &&
+      ffi.veilMediaEngineReleaseReceiveChannel != null;
 
   /// Switch to an authenticated channel for the same call, keeping capture,
   /// decoders, RTP sequence spaces and queued audio alive. Caller closes the
-  /// previous channel after success; failure preserves its registration.
-  bool rebindChannel(int channel) {
+  /// previous channel after success; with [retainPreviousReceiver], keep it
+  /// open until its inbound binding is superseded or the call ends.
+  /// Failure preserves its registration.
+  bool rebindChannel(int channel, {bool retainPreviousReceiver = false}) {
     _ensure();
-    final rebind = ffi.veilMediaEngineRebindChannel;
+    final rebind = retainPreviousReceiver
+        ? ffi.veilMediaEngineRebindChannelKeepReceiver
+        : ffi.veilMediaEngineRebindChannel;
     return rebind != null && rebind(_ptr, channel) == 0;
+  }
+
+  /// Fence an older inbound binding before closing its caller-owned handle.
+  /// The current outbound binding cannot be released.
+  bool releaseReceiveChannel(int channel) {
+    _ensure();
+    final release = ffi.veilMediaEngineReleaseReceiveChannel;
+    return release != null && release(_ptr, channel) == 0;
   }
 
   /// Start the VP8 video session over the same veil channel (distinct SSRC).

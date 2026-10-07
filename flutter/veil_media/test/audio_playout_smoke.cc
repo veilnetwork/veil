@@ -65,7 +65,8 @@ static void deliver() {
   Callback callback{};
   {
     std::lock_guard lock(mu);
-    callback = callbacks.at(receiver_channel);
+    const auto target = callbacks.find(receiver_channel);
+    if (target != callbacks.end()) callback = target->second;
     const auto now = Clock::now();
     for (auto it = pending.begin(); it != pending.end();) {
       if (it->due <= now) { ready.push_back(std::move(*it)); it = pending.erase(it); }
@@ -75,7 +76,9 @@ static void deliver() {
   std::sort(ready.begin(), ready.end(), [](const auto& a, const auto& b) {
     return a.due < b.due;
   });
-  for (const auto& p : ready) callback.fn(callback.ctx, p.bytes.data(), p.bytes.size());
+  for (const auto& p : ready) {
+    if (callback.fn) callback.fn(callback.ctx, p.bytes.data(), p.bytes.size());
+  }
 }
 static uint64_t metric(VeilMediaEngine* e, const char* name) {
   char* json = veil_media_engine_get_stats(e); assert(json);
@@ -85,7 +88,7 @@ static uint64_t metric(VeilMediaEngine* e, const char* name) {
   veil_media_free_string(json); return value;
 }
 
-static void verify_handover() {
+static void verify_handover(bool asymmetric = false) {
   perfect_network = true;
   handover_network = true;
   const uint8_t local[32] = {1}, peer[32] = {2};
@@ -110,15 +113,43 @@ static void verify_handover() {
         const uint64_t source_next = tick == 200 ? 201 : 202;
         const uint64_t receive_next = tick == 200 ? 301 : 302;
         const auto before_rx = metric(receiver.get(), "audio_rx_pkts");
-        assert(veil_media_engine_rebind_channel(source.get(), source_next) == VEIL_MEDIA_OK);
-        assert(veil_media_engine_rebind_channel(receiver.get(), receive_next) == VEIL_MEDIA_OK);
-        assert(veil_media_engine_rebind_channel(receiver.get(), receive_next) == VEIL_MEDIA_OK);
+        if (!asymmetric)
+          assert(veil_media_engine_rebind_channel(source.get(), source_next) == VEIL_MEDIA_OK);
+        const auto rebind_receiver = asymmetric
+            ? veil_media_engine_rebind_channel_keep_receiver
+            : veil_media_engine_rebind_channel;
+        assert(rebind_receiver(receiver.get(), receive_next) == VEIL_MEDIA_OK);
+        assert(rebind_receiver(receiver.get(), receive_next) == VEIL_MEDIA_OK);
         assert(metric(receiver.get(), "audio_rx_pkts") >= before_rx);
         {
           std::lock_guard lock(mu);
-          assert(callbacks.size() == 2 && callbacks.contains(source_next) && callbacks.contains(receive_next));
-          source_channel = source_next; receiver_channel = receive_next;
+          if (!asymmetric) {
+            assert(callbacks.size() == 2 && callbacks.contains(source_next) && callbacks.contains(receive_next));
+            source_channel = source_next; receiver_channel = receive_next;
+          }
         }
+      }
+      if (asymmetric && tick == 300) {
+        assert(veil_media_engine_rebind_channel_keep_receiver(receiver.get(), 0) == VEIL_MEDIA_ERR_ARG);
+        assert(veil_media_engine_rebind_channel_keep_receiver(receiver.get(), 999) != VEIL_MEDIA_OK);
+        assert(veil_media_engine_release_receive_channel(receiver.get(), 301) != VEIL_MEDIA_OK);
+        std::lock_guard lock(mu);
+        assert(callbacks.contains(300) && callbacks.contains(301));
+      }
+      if (asymmetric && tick == 900) {
+        // Teardown must fence a retained leg whose peer never switched.
+        assert(veil_media_engine_rebind_channel_keep_receiver(receiver.get(), 303) == VEIL_MEDIA_OK);
+      }
+      if (asymmetric && (tick == 400 || tick == 800)) {
+        const uint64_t source_next = tick == 400 ? 201 : 202;
+        const uint64_t receive_next = tick == 400 ? 301 : 302;
+        assert(veil_media_engine_rebind_channel(source.get(), source_next) == VEIL_MEDIA_OK);
+        const uint64_t retired = tick == 400 ? 300 : 301;
+        assert(veil_media_engine_release_receive_channel(receiver.get(), receive_next) != VEIL_MEDIA_OK);
+        assert(veil_media_engine_release_receive_channel(receiver.get(), retired) == VEIL_MEDIA_OK);
+        assert(veil_media_engine_release_receive_channel(receiver.get(), retired) == VEIL_MEDIA_OK);
+        std::lock_guard lock(mu);
+        source_channel = source_next; receiver_channel = receive_next;
       }
       if (tick == 400) {
         assert(veil_media_engine_rebind_channel(source.get(), 0) == VEIL_MEDIA_ERR_ARG);
@@ -147,6 +178,8 @@ static void verify_handover() {
       if (rendered_high && !was_high) rendered_edges.push_back(milliseconds(Clock::now()));
       was_high = rendered_high;
     }
+    std::fprintf(stderr, "handover%s rendered %zu/1000 nonsilent PCM ticks; max timer lateness %.2f ms\n",
+        asymmetric ? " asynchronous" : "", nonsilent_ticks, max_lateness);
     assert(max_lateness < 30 && nonsilent_ticks > 950);
     for (double sent : source_edges) {
       const auto rendered = std::find_if(rendered_edges.begin(), rendered_edges.end(),
@@ -163,7 +196,7 @@ static void verify_handover() {
       if (i) assert(uint16_t(handover_sequences[i].second - handover_sequences[i - 1].second) == 1);
     }
     assert(used == handover_sources);
-    std::printf("handover: two channel switches, failed candidate preserved, continuous RTP/PCM, no added concealment or interruptions; lateness %.2f ms\n", max_lateness);
+    std::printf("handover%s: channel switches, failed candidate preserved, continuous RTP/PCM, no added concealment or interruptions; lateness %.2f ms\n", asymmetric ? " asynchronous" : "", max_lateness);
   }
   { std::lock_guard lock(mu); assert(callbacks.empty()); }
 }
@@ -207,6 +240,10 @@ static void verify_silence() {
 }
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--asymmetric-handover") == 0) {
+    verify_handover(true);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--handover") == 0) {
     verify_handover();
     return 0;
