@@ -203,6 +203,7 @@ static int64_t group_audio_age(VeilGroupMediaEngine* engine, const uint8_t peer[
   const auto prefix = "\"" + id + "\":{\"audio_rx_pkts\":";
   const char* receiver = std::strstr(json, prefix.c_str());
   assert(receiver);
+  assert(std::strstr(receiver, "\"audio_interruption_count\":"));
   const char* at = std::strstr(receiver, "\"audio_rx_native_age_ms\":");
   assert(at);
   const auto age = std::strtoll(at + std::strlen("\"audio_rx_native_age_ms\":"), nullptr, 10);
