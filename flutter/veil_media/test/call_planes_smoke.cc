@@ -287,7 +287,7 @@ int main() {
   for (int enabled : {0, 1}) {
     const uint64_t chan = 21 + enabled;
     std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(
-        veil_media_engine_create(chan, local, peer), veil_media_engine_destroy);
+        veil_media_engine_create(chan + 100, local, peer), veil_media_engine_destroy);
     assert(e);
     assert(veil_media_engine_set_independent_transport_feedback(e.get(), enabled) == VEIL_MEDIA_OK);
     assert(veil_media_engine_set_mic_muted(e.get(), 1) == VEIL_MEDIA_OK);
@@ -295,6 +295,11 @@ int main() {
     assert(veil_media_engine_set_video_send_paused(e.get(), 1) == VEIL_MEDIA_OK);
     assert(veil_media_engine_start_video(e.get(), 1, 1, 150, 15) == VEIL_MEDIA_OK);
     assert(stat(e.get(), "video_send_paused") == 1);
+    assert(veil_media_engine_rebind_channel(e.get(), chan) == VEIL_MEDIA_OK);
+    {
+      std::lock_guard lock(callback_mu);
+      assert(callbacks.contains(chan) && !callbacks.contains(chan + 100));
+    }
     assert(veil_media_engine_set_video_send_paused(e.get(), 0) == VEIL_MEDIA_OK);
     const int result = veil_media_test_direct_call_planes(e.get(), inject, e.get());
     if (result) { std::fprintf(stderr, "direct isolation failed: %d\n", result); return 1; }

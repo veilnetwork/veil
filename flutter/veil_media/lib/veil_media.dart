@@ -151,6 +151,17 @@ class VeilMediaEngine {
     return ffi.veilMediaEngineStopAudio(_ptr) == 0;
   }
 
+  bool get supportsChannelRebind => ffi.veilMediaEngineRebindChannel != null;
+
+  /// Switch to an authenticated channel for the same call, keeping capture,
+  /// decoders, RTP sequence spaces and queued audio alive. Caller closes the
+  /// previous channel after success; failure preserves its registration.
+  bool rebindChannel(int channel) {
+    _ensure();
+    final rebind = ffi.veilMediaEngineRebindChannel;
+    return rebind != null && rebind(_ptr, channel) == 0;
+  }
+
   /// Start the VP8 video session over the same veil channel (distinct SSRC).
   /// With VEIL_MEDIA_TEST_VIDEO=1 the send stream is driven by a built-in
   /// synthetic frame generator (pipeline bring-up); otherwise feed it via a

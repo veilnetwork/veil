@@ -145,7 +145,7 @@ void VeilTransportShim::Start() {
   const int rc = veil_media_set_recv_callback(
       veil_chan_, &VeilTransportShim::OnVeilDatagram, this);
   // A failed registration is a silently dead inbound leg — surface it.
-  slog("shim Start chan=%llu recv_cb rc=%d", (unsigned long long)veil_chan_,
+  slog("shim Start chan=%llu recv_cb rc=%d", (unsigned long long)veil_chan_.load(),
        rc);
 }
 
@@ -153,12 +153,26 @@ void VeilTransportShim::Stop() {
   bool expected = true;
   if (!started_.compare_exchange_strong(expected, false)) return;
   veil_media_set_recv_callback(veil_chan_, nullptr, nullptr);
-  slog("shim Stop chan=%llu recv_cb cleared", (unsigned long long)veil_chan_);
+  slog("shim Stop chan=%llu recv_cb cleared", (unsigned long long)veil_chan_.load());
   // Fence a delivery already in progress before the owner destroys Call.
   // Pending tasks need not run: release their packets here, with no one-second
   // wait on a busy WebRTC network queue.
   std::scoped_lock lock(task_guards_[0]->mu, task_guards_[1]->mu);
   inbound_queue_.Clear();
+}
+
+bool VeilTransportShim::RebindChannel(uint64_t veil_chan) {
+  if (veil_chan == 0 || !started_.load(std::memory_order_acquire)) return false;
+  const auto previous = veil_chan_.load(std::memory_order_acquire);
+  if (previous == veil_chan) return true;
+  // The SDK validates the candidate before replacing any registration, and
+  // fences a callback already running on the old owner. With different peers
+  // both registrations can coexist until the explicit clear below.
+  if (veil_media_set_recv_callback(
+          veil_chan, &VeilTransportShim::OnVeilDatagram, this) != 0) return false;
+  veil_chan_.store(veil_chan, std::memory_order_release);
+  veil_media_set_recv_callback(previous, nullptr, nullptr);
+  return true;
 }
 
 bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
@@ -179,7 +193,7 @@ bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
     const uint64_t c = n.fetch_add(1);
     if (c % 100 == 0)
       slog("shim SendRtp #%llu chan=%llu len=%zu rc=%d",
-           (unsigned long long)c, (unsigned long long)veil_chan_,
+           (unsigned long long)c, (unsigned long long)veil_chan_.load(),
            packet.size(), rc);
   }
   // rc: 0 queued, 1 dropped (queue full), -1 invalid. Queue-full means this
@@ -290,7 +304,7 @@ void VeilTransportShim::OnVeilDatagram(void* ctx, const uint8_t* ptr,
           1, std::memory_order_relaxed) + 1;
       if (dropped == 1 || dropped % 500 == 0)
         slog("shim drop inbound overload chan=%llu len=%zu drops=%llu",
-             (unsigned long long)self->veil_chan_, len, (unsigned long long)dropped);
+             (unsigned long long)self->veil_chan_.load(), len, (unsigned long long)dropped);
       return false;
     }
     if (admission == InboundPacketQueue::Admission::ScheduleDrain)
@@ -305,7 +319,7 @@ void VeilTransportShim::OnVeilDatagram(void* ctx, const uint8_t* ptr,
   if (rtcp) enqueue(true);
   if (accepted) {
     if (self->inbound_packet_count_.load(std::memory_order_relaxed) == 0)
-      slog("shim first inbound chan=%llu len=%zu", (unsigned long long)self->veil_chan_, len);
+      slog("shim first inbound chan=%llu len=%zu", (unsigned long long)self->veil_chan_.load(), len);
     self->inbound_packet_count_.fetch_add(1, std::memory_order_relaxed);
     self->inbound_byte_count_.fetch_add(len, std::memory_order_relaxed);
   }
