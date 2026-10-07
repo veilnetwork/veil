@@ -1681,6 +1681,30 @@ int veil_media_engine_rebind_channel(VeilMediaEngine* engine, uint64_t veil_chan
 #endif
 }
 
+int veil_media_engine_rebind_channel_keep_receiver(VeilMediaEngine* engine, uint64_t veil_chan) {
+  if (!engine || !veil_chan) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  auto* ws = engine->ws.get();
+  if (!ws || !ws->shim || !ws->shim->RebindChannel(veil_chan, true))
+    return VEIL_MEDIA_ERR_STATE;
+  engine->veil_chan = veil_chan;
+  return VEIL_MEDIA_OK;
+#else
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
+int veil_media_engine_release_receive_channel(VeilMediaEngine* engine, uint64_t veil_chan) {
+  if (!engine || !veil_chan) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  auto* ws = engine->ws.get();
+  return ws && ws->shim && ws->shim->ReleaseReceiveChannel(veil_chan)
+      ? VEIL_MEDIA_OK : VEIL_MEDIA_ERR_STATE;
+#else
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
 void veil_media_engine_destroy(VeilMediaEngine* engine) {
   if (engine == nullptr) return;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC) && defined(__ANDROID__)

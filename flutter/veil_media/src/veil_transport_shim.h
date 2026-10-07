@@ -34,6 +34,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <vector>
 
 #include "api/call/transport.h"  // webrtc::Transport, webrtc::PacketOptions
 #include "veil_inbound_packet_queue.h"
@@ -109,7 +110,10 @@ class VeilTransportShim : public webrtc::Transport {
 
   // Control-thread handover. Keep Calls, RTP sequence spaces, receive buffers
   // and capture devices alive. A failed registration leaves the old channel.
-  bool RebindChannel(uint64_t veil_chan);
+  bool RebindChannel(uint64_t veil_chan, bool retain_previous_receiver = false);
+  // Release a superseded inbound binding on the serialized control thread.
+  // The active outbound channel cannot be released through this method.
+  bool ReleaseReceiveChannel(uint64_t veil_chan);
 
   // Endpoint-local shedding. Keep audio, RTCP and remote video live; do not
   // enqueue video already encoded or retransmitted by the pacer while paused.
@@ -232,6 +236,10 @@ class VeilTransportShim : public webrtc::Transport {
       std::make_shared<TaskGuard>(), std::make_shared<TaskGuard>()};
 
   std::atomic<uint64_t> veil_chan_;
+  // Control-thread ownership only; SDK callbacks never access this vector.
+  // The host retains one binding per physical peer and explicitly releases
+  // superseded handles. Stop fences every remaining binding before teardown.
+  std::vector<uint64_t> receive_channels_;
   webrtc::Call* const call_;
   webrtc::TaskQueueBase* const network_queue_;
   webrtc::Call* const video_call_;
