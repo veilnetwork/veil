@@ -1679,7 +1679,7 @@ impl NodeRuntime {
     }
 
     pub fn spawn_pending_ack_tick(&mut self) {
-        use ack_chunk_retry::{ChunkRetry, admit_chunk_retry};
+        use ack_chunk_retry::{ChunkRetry, admit_chunk_retry, try_admit_single_retry};
         use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
         use veil_dispatcher::pending_ack::AckTickOutcome;
         use veil_proto::budget::DELIVERY_ACK_CHECK_INTERVAL_MS;
@@ -1856,36 +1856,19 @@ impl NodeRuntime {
                                 continue;
                             }
                             let reg = rlock!(session_tx_registry);
-                            // Every chunk carrier gets a fresh OUTER content id
-                            // per attempt. Its transfer/index/original id stays
-                            // unchanged, so the destination fills only missing
-                            // pieces while relay replay caches cannot suppress a
-                            // retry that was lost after the first hop.
-                            let send_batch = |hop: [u8; 32]| -> bool {
-                                for frame in frames.iter() {
-                                    let Some(prepared) =
-                                        prepare_ack_retransmit_frame(frame, hop, attempt)
-                                    else {
-                                        return false;
-                                    };
-                                    if !reg.send_to(
-                                        &hop,
-                                        veil_proto::header::priority::INTERACTIVE,
-                                        prepared,
-                                    ) {
-                                        return false;
-                                    }
-                                }
-                                true
+                            let send_single = |hop: [u8; 32]| -> bool {
+                                frames.first().is_some_and(|frame| {
+                                    try_admit_single_retry(&reg, hop, frame, attempt)
+                                })
                             };
                             // Try original hop first.
-                            let sent = send_batch(next_hop);
+                            let sent = send_single(next_hop);
                             if !sent {
                                 // Original hop dead — re-route via the
                                 // pre-computed route-cache hop (looked up above,
                                 // before the registry guard was taken).
                                 if let Some(new_hop) = reroute_hops.get(&dst_node_id).copied()
-                                    && send_batch(new_hop)
+                                    && send_single(new_hop)
                                 {
                                     // Update stored next_hop for future retransmits.
                                     lock!(pending_ack).update_next_hop(&content_id, new_hop);
