@@ -1297,6 +1297,8 @@ pub const WIRE_CHANNEL_CAPACITY: usize = 8;
 struct WireBlob {
     bytes: veil_bufpool::PooledShared,
     control: bool,
+    // Set only before encryption from trusted local primary metadata.
+    primary_feedback: Option<Arc<crate::local_source_activity::LocalSourceActivity>>,
 }
 
 impl From<veil_bufpool::PooledShared> for WireBlob {
@@ -1304,6 +1306,7 @@ impl From<veil_bufpool::PooledShared> for WireBlob {
         Self {
             bytes,
             control: false,
+            primary_feedback: None,
         }
     }
 }
@@ -1347,7 +1350,9 @@ async fn writer_task<B: Into<WireBlob>>(
         let wire_len = bytes.len();
         let trace_started = crate::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
         let queued_behind = wire_rx.len();
-        match write_with_progress_timeout(&mut write_half, &bytes, WRITE_PROGRESS_TIMEOUT).await {
+        match write_with_source_feedback(
+            &mut write_half, &bytes, WRITE_PROGRESS_TIMEOUT, blob.primary_feedback.as_deref(),
+        ).await {
             Ok(Ok(())) => {
                 if let Some(started) = trace_started {
                     let elapsed = started.elapsed();
@@ -1355,8 +1360,9 @@ async fn writer_task<B: Into<WireBlob>>(
                         logger.info(
                             "session.rt_trace.slow_wire_write",
                             format!(
-                                "peer_id={peer_id_short} len={wire_len} elapsed_ms={} queued_behind={queued_behind}",
+                                "peer_id={peer_id_short} len={wire_len} elapsed_ms={} queued_behind={queued_behind} primary_source={}",
                                 elapsed.as_millis(),
+                                blob.primary_feedback.is_some(),
                             ),
                         );
                     }
@@ -1394,14 +1400,46 @@ async fn writer_task<B: Into<WireBlob>>(
 
 /// Preserve the complete ordered blob even when a small admission window
 /// requires many RTTs. A progressing writer must not be treated as stalled.
+#[cfg(test)]
 async fn write_with_progress_timeout<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     bytes: &[u8],
     idle: std::time::Duration,
 ) -> Result<std::io::Result<()>, tokio::time::error::Elapsed> {
+    write_with_source_feedback(writer, bytes, idle, None).await
+}
+
+/// A stalled locally authored primary publishes pressure even on a stream-only
+/// transport. The pinned partial write is never cancelled by a feedback tick;
+/// ordering, ciphertext and the original idle-progress deadline are preserved.
+async fn write_with_source_feedback<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    idle: std::time::Duration,
+    source: Option<&crate::local_source_activity::LocalSourceActivity>,
+) -> Result<std::io::Result<()>, tokio::time::error::Elapsed> {
     let mut written = 0;
     while written < bytes.len() {
-        match tokio::time::timeout(idle, writer.write(&bytes[written..])).await? {
+        let progress = async {
+            let write = writer.write(&bytes[written..]);
+            tokio::pin!(write);
+            let Some(source) = source else { return write.await; };
+            let interval = std::time::Duration::from_millis(150);
+            let mut pressure = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+            pressure.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut write => return result,
+                    _ = pressure.tick() => {
+                        // Activity comes from the producer, not an old blocked
+                        // blob: its existing idle grace still expires normally.
+                        source.note_pressure(std::time::Instant::now());
+                    }
+                }
+            }
+        };
+        match tokio::time::timeout(idle, progress).await? {
             Ok(0) => return Ok(Err(std::io::ErrorKind::WriteZero.into())),
             Ok(len) => written += len,
             Err(error) => return Ok(Err(error)),
@@ -1465,7 +1503,7 @@ impl SessionRunner {
         bytes: veil_bufpool::PooledShared,
         metrics: &Option<Arc<NodeMetrics>>,
     ) -> Result<(), mpsc::error::TrySendError<WireBlob>> {
-        Self::push_wire_classified(wire_tx, bytes, metrics, true)
+        Self::push_wire_classified(wire_tx, bytes, metrics, true, None)
     }
 
     fn push_wire_classified(
@@ -1473,8 +1511,9 @@ impl SessionRunner {
         bytes: veil_bufpool::PooledShared,
         metrics: &Option<Arc<NodeMetrics>>,
         control: bool,
+        primary_feedback: Option<Arc<crate::local_source_activity::LocalSourceActivity>>,
     ) -> Result<(), mpsc::error::TrySendError<WireBlob>> {
-        match wire_tx.try_send(WireBlob { bytes, control }) {
+        match wire_tx.try_send(WireBlob { bytes, control, primary_feedback }) {
             Ok(()) => Ok(()),
             Err(e @ mpsc::error::TrySendError::Full(_)) => {
                 if let Some(m) = metrics {
@@ -4685,6 +4724,7 @@ impl SessionRunner {
                 let mut encrypted_batch_frames = Vec::new();
                 let mut encrypted_batch_wire_len = 0usize;
                 let mut batch_has_local_source = false;
+                let mut batch_has_local_primary = false;
                 let mut batch_control = None;
                 let now = std::time::Instant::now();
                 let local_primary_active = pq.local_primary_active(now)
@@ -4733,6 +4773,19 @@ impl SessionRunner {
                         ) {
                             return HeadAdmission::FlushBatch;
                         }
+                        // Old peers may put local lossy secondary frames on
+                        // the ordered carrier too. They share the endpoint's
+                        // DATAGRAM probe allowance; neutral transit keeps its
+                        // trusted INTERACTIVE slot and cannot enter this gate.
+                        if !owned_reliable
+                            && matches!(priority, veil_proto::priority::BULK | veil_proto::priority::BACKGROUND)
+                            && decode_realtime_lane_frame(frame).is_some()
+                            && let Some(outbox) = outbox.as_ref()
+                            && let Err(retry) = outbox.source_activity().admit_lossy_secondary(now)
+                        {
+                            source_pressure_retry = Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
+                            return HeadAdmission::DeferSource;
+                        }
                         // Trusted local admission credits distinguish authored
                         // ordered streams from opaque transit. A remote header
                         // cannot select this endpoint-only pressure policy.
@@ -4749,8 +4802,10 @@ impl SessionRunner {
                     })
                 {
                     drained_this_pass += 1;
-                    if envelope.carrier.is_none()
-                        && local_primary_stream_frame(envelope.frame.0, &envelope.frame.1)
+                    let local_primary = envelope.carrier.is_none()
+                        && local_primary_stream_frame(envelope.frame.0, &envelope.frame.1);
+                    batch_has_local_primary |= local_primary;
+                    if local_primary
                         && let Some(feedback) = realtime_lane
                             .as_mut()
                             .map(|lane| &mut lane.local_reliable)
@@ -4799,6 +4854,7 @@ impl SessionRunner {
                             outgoing.clone(),
                             &self.metrics,
                             control,
+                            local_primary.then(|| outbox.as_ref().map(|o| o.shared_source_activity())).flatten(),
                         ) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => continue,
@@ -4851,6 +4907,7 @@ impl SessionRunner {
                         wire_pool,
                         &self.metrics,
                         batch_control == Some(true),
+                        batch_has_local_primary.then(|| outbox.as_ref().map(|o| o.shared_source_activity())).flatten(),
                     )
                     .is_err()
                     {
@@ -5634,7 +5691,7 @@ impl SessionRunner {
                 }
                 rekey.record_bytes(resp_len);
                 mlkem_rekey.record_bytes(resp_len);
-                if Self::push_wire_classified(wire_tx, wire_bytes, &self.metrics, control).is_err()
+                if Self::push_wire_classified(wire_tx, wire_bytes, &self.metrics, control, None).is_err()
                 {
                     self.on_primary_write_error(write_error_count);
                     return true;
