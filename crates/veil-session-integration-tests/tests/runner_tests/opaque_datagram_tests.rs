@@ -267,6 +267,7 @@ async fn runner_channels_with_partial_read(
         diagnostics.push(offer.diagnostics());
         let caps = resumed_caps.as_ref().map(|caps| &caps[direction]);
         runner.quic_datagrams = Some(RealtimeLaneOffer {
+            peer_datagrams: true,
             handle: datagrams,
             peer_rotates: caps.is_none_or(|caps| caps.supports_realtime_rekey()),
             peer_flows: caps.map_or(flows, |caps| caps.supports_datagram_flows()),
@@ -614,6 +615,7 @@ async fn neutral_forward_datagrams_require_capability_and_keep_legacy_ordered_fa
                 stream
             };
             runner.quic_datagrams = Some(RealtimeLaneOffer {
+                peer_datagrams: true,
                 handle: datagrams,
                 peer_rotates: true,
                 peer_flows: true,
@@ -840,6 +842,7 @@ async fn runner_circuit_datagrams_over_real_quic(
             stream
         };
         runner.quic_datagrams = offer_lane.then_some(RealtimeLaneOffer {
+            peer_datagrams: true,
             handle: datagrams,
             peer_rotates: true,
             peer_flows: true,
@@ -1088,6 +1091,7 @@ async fn duplex_children_through_neutral_relay(rotate: bool) {
                 })
             };
             runner.quic_datagrams = Some(RealtimeLaneOffer {
+                peer_datagrams: true,
                 handle: datagrams,
                 peer_rotates: true,
                 peer_flows: true,
