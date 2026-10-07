@@ -1895,6 +1895,183 @@ fn datagram_send_recv() {
     assert_matches!(pair.server_datagrams(server_ch).recv(), None);
 }
 
+// A fixed, ordinary connection budget makes the residual-window boundary
+// deterministic without depending on loss or a particular congestion algorithm.
+#[derive(Clone)]
+struct FixedDatagramWindow(Arc<std::sync::atomic::AtomicU64>);
+
+impl congestion::Controller for FixedDatagramWindow {
+    fn on_congestion_event(&mut self, _: Instant, _: Instant, _: bool, _: u64) {}
+    fn on_mtu_update(&mut self, _: u16) {}
+    fn window(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn clone_box(&self) -> Box<dyn congestion::Controller> {
+        Box::new(self.clone())
+    }
+    fn initial_window(&self) -> u64 {
+        12_000
+    }
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+impl congestion::ControllerFactory for FixedDatagramWindow {
+    fn build(self: Arc<Self>, _: Instant, _: u16) -> Box<dyn congestion::Controller> {
+        Box::new((*self).clone())
+    }
+}
+
+fn residual_window_pair(pad: bool) -> (Pair, ConnectionHandle, ConnectionHandle) {
+    let mut pair = Pair::default();
+    let window = Arc::new(std::sync::atomic::AtomicU64::new(12_000));
+    let mut config = client_config();
+    let mut transport = TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(FixedDatagramWindow(Arc::clone(&window))));
+    transport.mtu_discovery_config(None);
+    transport.pad_to_mtu(pad);
+    config.transport_config(Arc::new(transport));
+    let (client_ch, server_ch) = pair.connect_with(config);
+    let limit = 3_000 + pair.client_conn_mut(client_ch).stats().path.in_flight_bytes;
+    window.store(limit, std::sync::atomic::Ordering::Relaxed);
+    let now = pair.time;
+    // Leave less than an MTU in a valid congestion window, keeping both
+    // ordinary packets outstanding until the next packet has been considered.
+    for fill in [1u8, 2] {
+        pair.client_datagrams(client_ch)
+            .send(vec![fill; 1_000].into(), false)
+            .unwrap();
+        let mut buf = Vec::new();
+        let tx = pair
+            .client_conn_mut(client_ch)
+            .poll_transmit(now, 1, &mut buf)
+            .unwrap();
+        assert!(tx.size <= 1_200);
+        pair.client.outbound.push_back((tx, buf.into()));
+    }
+    assert!(pair.client_conn_mut(client_ch).stats().path.in_flight_bytes < limit);
+    (pair, client_ch, server_ch)
+}
+
+#[test]
+fn small_datagram_uses_residual_congestion_window_before_expiry() {
+    for max_datagrams in [1, 16] {
+        let (mut pair, client_ch, server_ch) = residual_window_pair(false);
+        let now = pair.time;
+        const SMALL: &[u8] = &[3; 64];
+        pair.client_datagrams(client_ch)
+            .send_with_expiry(SMALL.into(), false, now + Duration::from_millis(75))
+            .unwrap();
+        let mut buf = Vec::new();
+        let tx = pair
+            .client_conn_mut(client_ch)
+            .poll_transmit(now, max_datagrams, &mut buf)
+            .expect("small datagram fits the remaining window without waiting for an ACK");
+        assert!(tx.size < 150);
+        assert!(pair.client_conn_mut(client_ch).stats().path.in_flight_bytes < 3_000);
+        assert_eq!(
+            pair.client_conn_mut(client_ch)
+                .stats()
+                .path
+                .residual_window_transmits,
+            1
+        );
+        pair.client.outbound.push_back((tx, buf.into()));
+        // A whole larger datagram still waits: never exceed cwnd or fragment
+        // DATAGRAM payloads to make room. It must survive and resume on ACK.
+        pair.client_datagrams(client_ch)
+            .send(vec![4; 1_000].into(), false)
+            .unwrap();
+        assert!(
+            pair.client_conn_mut(client_ch)
+                .poll_transmit(now, max_datagrams, &mut Vec::new())
+                .is_none()
+        );
+        pair.drive();
+        for fill in [1u8, 2] {
+            assert_eq!(
+                pair.server_datagrams(server_ch).recv().unwrap(),
+                vec![fill; 1_000]
+            );
+        }
+        assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), SMALL);
+        assert_eq!(
+            pair.server_datagrams(server_ch).recv().unwrap(),
+            vec![4; 1_000]
+        );
+        assert_eq!(pair.server_datagrams(server_ch).recv(), None);
+        assert_eq!(pair.client_datagrams(client_ch).expired_outgoing(), 0);
+    }
+}
+
+#[test]
+fn residual_window_keeps_requested_mtu_padding() {
+    let (mut pair, client_ch, server_ch) = residual_window_pair(true);
+    let now = pair.time;
+    pair.client_datagrams(client_ch)
+        .send(vec![3; 64].into(), false)
+        .unwrap();
+    assert!(
+        pair.client_conn_mut(client_ch)
+            .poll_transmit(now, 16, &mut Vec::new())
+            .is_none()
+    );
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .path
+            .residual_window_transmits,
+        0
+    );
+    pair.drive();
+    for fill in [1u8, 2] {
+        assert_eq!(
+            pair.server_datagrams(server_ch).recv().unwrap(),
+            vec![fill; 1_000]
+        );
+    }
+    assert_eq!(
+        pair.server_datagrams(server_ch).recv().unwrap(),
+        vec![3; 64]
+    );
+}
+
+#[test]
+fn reliable_stream_uses_residual_window_without_exceeding_it() {
+    let (mut pair, client_ch, server_ch) = residual_window_pair(false);
+    let now = pair.time;
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let data = vec![7; 1_500];
+    assert_eq!(
+        pair.client_send(client_ch, stream).write(&data).unwrap(),
+        data.len()
+    );
+    pair.client_send(client_ch, stream).finish().unwrap();
+    let available = 3_000 - pair.client_conn_mut(client_ch).stats().path.in_flight_bytes;
+    let mut buf = Vec::new();
+    let tx = pair
+        .client_conn_mut(client_ch)
+        .poll_transmit(now, 16, &mut buf)
+        .unwrap();
+    assert!((tx.size as u64) < available);
+    assert!(pair.client_conn_mut(client_ch).stats().path.in_flight_bytes < 3_000);
+    pair.client.outbound.push_back((tx, buf.into()));
+    pair.drive();
+    assert_eq!(
+        pair.server_streams(server_ch).accept(Dir::Uni),
+        Some(stream)
+    );
+    let mut recv = pair.server_recv(server_ch, stream);
+    let mut chunks = recv.read(true).unwrap();
+    let mut delivered = Vec::new();
+    while let Some(chunk) = chunks.next(usize::MAX).unwrap() {
+        delivered.extend_from_slice(&chunk.bytes);
+    }
+    chunks.finalize();
+    assert_eq!(delivered, data);
+}
+
 #[test]
 fn datagram_expiry_discards_only_expired_unsent_packets() {
     let mut pair = Pair::default();

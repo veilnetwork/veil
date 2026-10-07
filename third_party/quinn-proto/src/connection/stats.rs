@@ -140,6 +140,9 @@ pub struct PathStats {
     pub cwnd: u64,
     /// Bytes currently awaiting acknowledgment on this path (local snapshot).
     pub in_flight_bytes: u64,
+    /// Transmits containing an ordinary packet built with less than an MTU of
+    /// remaining congestion-window capacity. No application role is inspected.
+    pub residual_window_transmits: u64,
     /// Consecutive probe timeout count, before acknowledgment progress resets it.
     pub pto_count: u32,
     /// Congestion events on the connection

@@ -519,6 +519,7 @@ impl Connection {
         let mut pad_datagram = false;
         let mut pad_datagram_to_mtu = false;
         let mut congestion_blocked = false;
+        let mut residual_window_packet = false;
 
         // Iterate over all spaces and find data to send
         let mut space_idx = 0;
@@ -538,7 +539,7 @@ impl Connection {
                 segment_size.saturating_sub(self.predict_1rtt_overhead(Some(pn)));
 
             // Is there data or a close message to send in this space?
-            let can_send = self.space_can_send(space_id, frame_space_1rtt);
+            let mut can_send = self.space_can_send(space_id, frame_space_1rtt);
             if can_send.is_empty() && (!close || self.spaces[space_id].crypto.is_none()) {
                 space_idx += 1;
                 continue;
@@ -594,6 +595,8 @@ impl Connection {
                     break;
                 }
 
+                let mut next_datagram_limit = segment_size;
+
                 // Congestion control and pacing checks
                 // Tail loss probes must not be blocked by congestion, or a deadlock could arise
                 if ack_eliciting && self.spaces[space_id].loss_probes == 0 {
@@ -605,7 +608,47 @@ impl Connection {
                     } as u64;
                     debug_assert!(untracked_bytes <= segment_size as u64);
 
-                    let bytes_to_send = segment_size as u64 + untracked_bytes;
+                    // Bound an ordinary 1-RTT packet by residual window
+                    // capacity instead of requiring a whole MTU. A shorter
+                    // final GSO segment is legal; preceding segments retain
+                    // their existing alignment. No application role is read.
+                    // Initials, requested padding, path responses and loss
+                    // probes retain their existing size requirements.
+                    if space_id == SpaceId::Data
+                        && self.state.is_established()
+                        && !close
+                        && !self.config.pad_to_mtu
+                        && self.path_responses.is_empty()
+                    {
+                        let remaining = self
+                            .path
+                            .congestion
+                            .window()
+                            .saturating_sub(self.path.in_flight.bytes)
+                            .saturating_sub(untracked_bytes)
+                            .saturating_sub(1);
+                        if remaining >= (MIN_PACKET_SPACE + tag_len) as u64
+                            && remaining < next_datagram_limit as u64
+                        {
+                            next_datagram_limit = remaining as usize;
+                            let frame_space = next_datagram_limit
+                                .saturating_sub(self.predict_1rtt_overhead(Some(pn)));
+                            can_send = self.space_can_send(space_id, frame_space);
+                            // A whole DATAGRAM must fit. Retain an oversized
+                            // one for ACK progress, keeping congestion state.
+                            if can_send.is_empty() {
+                                congestion_blocked = true;
+                                space_idx += 1;
+                                continue;
+                            }
+                            ack_eliciting = !self.spaces[space_id].pending.is_empty(&self.streams)
+                                || self.spaces[space_id].ping_pending
+                                || self.spaces[space_id].immediate_ack_pending
+                                || self.can_send_1rtt(frame_space);
+                        }
+                    }
+
+                    let bytes_to_send = next_datagram_limit as u64 + untracked_bytes;
                     if self.path.in_flight.bytes + bytes_to_send >= self.path.congestion.window() {
                         space_idx += 1;
                         congestion_blocked = true;
@@ -650,8 +693,8 @@ impl Connection {
                         // Additionally, if this datagram is a loss probe and `segment_size` is
                         // larger than `INITIAL_MTU`, then padding it to `segment_size` to continue
                         // the GSO batch would risk failure to recover from a reduction in path
-                        // MTU. Loss probes are the only packets for which we might grow
-                        // `buf_capacity` by less than `segment_size`.
+                        // MTU. A residual congestion window can also allocate a
+                        // shorter final segment. Never exceed either capacity.
                         const MAX_PADDING: usize = 16;
                         let packet_len_unpadded = cmp::max(builder.min_size, buf.len())
                             - datagram_start
@@ -705,7 +748,11 @@ impl Connection {
 
                 // Allocate space for another datagram
                 let next_datagram_size_limit = match self.spaces[space_id].loss_probes {
-                    0 => segment_size,
+                    0 => {
+                        let limit = next_datagram_limit.min(segment_size);
+                        residual_window_packet |= limit < segment_size;
+                        limit
+                    }
                     _ => {
                         self.spaces[space_id].loss_probes -= 1;
                         // Clamp the datagram to at most the minimum MTU to ensure that loss probes
@@ -920,8 +967,8 @@ impl Connection {
             // If this datagram is a loss probe and `segment_size` is larger than `INITIAL_MTU`,
             // then padding it to `segment_size` would risk failure to recover from a reduction in
             // path MTU.
-            // Loss probes are the only packets for which we might grow `buf_capacity`
-            // by less than `segment_size`.
+            // A residual congestion window can also allocate a shorter final
+            // segment. Never extend either case beyond its capacity.
             if pad_datagram_to_mtu && buf_capacity >= datagram_start + segment_size {
                 builder.pad_to(segment_size as u16);
             }
@@ -941,6 +988,10 @@ impl Connection {
         }
 
         self.app_limited = buf.is_empty() && !congestion_blocked;
+        if residual_window_packet && !buf.is_empty() {
+            self.stats.path.residual_window_transmits =
+                self.stats.path.residual_window_transmits.saturating_add(1);
+        }
 
         // Send MTU probe if necessary
         if buf.is_empty() && self.state.is_established() {

@@ -79,6 +79,7 @@ mod tests {
             udp_received: 20,
             acknowledgments_received: 20,
             expired_outgoing_datagrams: 0,
+            residual_window_transmits: 0,
         }
     }
 
