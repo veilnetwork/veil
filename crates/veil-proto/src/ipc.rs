@@ -1172,7 +1172,30 @@ impl AuthDeliverFragment {
 /// This bit and the lane are never copied to an inter-node header.
 pub const IPC_HEADER_EXPLICIT_LOCAL_LANE: u16 = 0x0004;
 
+/// Process-local source selector for recoverable DATA, separate from the
+/// background media producer. It is not a fifth wire priority. Old local
+/// daemons see BACKGROUND; new daemons consume this IPC-only header bit.
+pub const LOCAL_RECOVERABLE_DATA_LANE: u8 = 4;
+const IPC_HEADER_RECOVERABLE_DATA_LANE: u16 = 0x0008;
+
+pub fn set_ipc_local_source_lane(header: &mut crate::FrameHeader, lane: u8, explicit: bool) {
+    header.flags &= !(IPC_HEADER_EXPLICIT_LOCAL_LANE | IPC_HEADER_RECOVERABLE_DATA_LANE);
+    header.set_priority(lane.min(crate::priority::BACKGROUND));
+    if explicit {
+        header.flags |= IPC_HEADER_EXPLICIT_LOCAL_LANE;
+        if lane == LOCAL_RECOVERABLE_DATA_LANE {
+            header.flags |= IPC_HEADER_RECOVERABLE_DATA_LANE;
+        }
+    }
+}
+
 pub fn ipc_local_source_lane(header: &crate::FrameHeader) -> u8 {
+    if header.flags & (IPC_HEADER_EXPLICIT_LOCAL_LANE | IPC_HEADER_RECOVERABLE_DATA_LANE)
+        == (IPC_HEADER_EXPLICIT_LOCAL_LANE | IPC_HEADER_RECOVERABLE_DATA_LANE)
+        && header.priority() == crate::priority::BACKGROUND
+    {
+        return LOCAL_RECOVERABLE_DATA_LANE;
+    }
     if header.flags & IPC_HEADER_EXPLICIT_LOCAL_LANE != 0 || header.priority() != 0 {
         header.priority()
     } else {
@@ -6492,6 +6515,25 @@ impl MailboxOpenResultPayload {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recoverable_lane_is_ipc_only_and_old_daemons_keep_background() {
+        let mut header = crate::FrameHeader::new(
+            crate::family::FrameFamily::LocalApp as u8,
+            crate::family::LocalAppMsg::AppIpcSend as u16,
+        );
+        set_ipc_local_source_lane(&mut header, LOCAL_RECOVERABLE_DATA_LANE, true);
+        let decoded = crate::codec::decode_header(&crate::encode_header(&header)).unwrap();
+        assert_eq!(ipc_local_source_lane(&decoded), LOCAL_RECOVERABLE_DATA_LANE);
+        // The legacy decoder uses the same original 2-bit priority field.
+        assert_eq!(decoded.priority(), crate::priority::BACKGROUND);
+        set_ipc_local_source_lane(&mut header, crate::priority::BACKGROUND, true);
+        assert_eq!(ipc_local_source_lane(&header), crate::priority::BACKGROUND);
+        set_ipc_local_source_lane(&mut header, crate::priority::REALTIME, true);
+        assert_eq!(ipc_local_source_lane(&header), crate::priority::REALTIME);
+        set_ipc_local_source_lane(&mut header, 0, false);
+        assert_eq!(header.flags, 0);
+        assert_eq!(ipc_local_source_lane(&header), crate::priority::INTERACTIVE);
+    }
 
     /// An encoder that can emit what its own decoder refuses is a bug with a
     /// convention wrapped around it (report18 V18-L4).

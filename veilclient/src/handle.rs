@@ -724,8 +724,8 @@ impl AppSender {
         data: &[u8],
         anonymous_authenticated: bool,
     ) -> Result<(), ClientError> {
-        if local_lane > 3 {
-            return Err(ClientError::Protocol("local lane must be in 0..3".into()));
+        if local_lane > veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE {
+            return Err(ClientError::Protocol("invalid local source lane".into()));
         }
         self.writer
             .write_app_ipc_send_on_local_lane_owned(

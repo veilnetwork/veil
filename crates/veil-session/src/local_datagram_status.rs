@@ -3,10 +3,11 @@
 use std::sync::{Arc, Mutex, Weak};
 use veil_util::lock;
 
-pub(crate) const LOCAL_DATAGRAM_PRIORITIES: [u8; 3] = [
+pub(crate) const LOCAL_DATAGRAM_PRIORITIES: [u8; 4] = [
     veil_proto::priority::REALTIME,
     veil_proto::priority::BULK,
     veil_proto::priority::BACKGROUND,
+    veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -204,6 +205,12 @@ mod tests {
         assert_eq!(status.request(3), Warming);
         assert_eq!(status.pending(), 4);
         lease.mark(3, true);
+        assert_eq!(status.state(3), Ready);
+        let data = veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE;
+        assert_eq!(status.request(data), Warming);
+        assert_eq!(status.pending(), 8);
+        lease.mark(data, true);
+        assert_eq!(status.state(data), Ready);
         assert_eq!(status.state(3), Ready);
         assert_eq!(status.request(1), Unsupported);
         assert_eq!(status.pending(), 0);

@@ -1697,6 +1697,13 @@ async fn primary_ack_blackout_limits_secondary_before_rtt_or_expiry_changes() {
         ),
         "screen must not bypass the local audio pressure budget"
     );
+    assert!(
+        !admission.allow_secondary(
+            veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
+            now + Duration::from_millis(1)
+        ),
+        "recoverable DATA must not bypass the local audio pressure budget"
+    );
     admission.observe(REALTIME, &frame, now, true);
     // A stalled independent primary must not shrink the parent control path
     // before RTT/expiry feedback arrives. A PQ rekey-sized control write

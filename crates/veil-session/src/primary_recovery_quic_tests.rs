@@ -316,3 +316,141 @@ async fn bbr_recovers_fresh_datagrams_after_neutral_outage() {
         }
     }
 }
+
+#[tokio::test]
+async fn recoverable_source_has_its_own_quic_connection_and_survives_screen_close() {
+    use veil_proto::{
+        ipc::LOCAL_RECOVERABLE_DATA_LANE,
+        priority::{BACKGROUND, BULK},
+    };
+    timeout(Duration::from_secs(20), async {
+        use super::super::parallel_lanes::{ParallelQuicOffer, ParallelSession};
+        let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let link = NeutralLink::new(
+            left.local_addr().unwrap(),
+            right.local_addr().unwrap(),
+            1_000_000,
+            Duration::from_millis(20),
+        )
+        .await;
+        link.enabled.store(true, Ordering::Relaxed);
+        let mut ctx = TransportContext::for_debug().unwrap();
+        ctx.quic.congestion_control = QuicCongestionControl::Cubic;
+        let ctx = Arc::new(ctx);
+        let remote = tokio::spawn(promote_punched_quic(
+            right,
+            link.right_addr,
+            Arc::clone(&ctx),
+            PunchedQuicRole::Responder,
+        ));
+        let local = promote_punched_quic(left, link.left_addr, ctx, PunchedQuicRole::Initiator)
+            .await
+            .unwrap();
+        let close = local.quic_connection().unwrap();
+        let a_offer = ParallelQuicOffer::new(local.parallel_quic().unwrap()).with_duplex();
+        let diagnostics = a_offer.diagnostics();
+        let mut a_stream = local.into_stream().unwrap();
+        a_stream.write_all(b"main").await.unwrap();
+        let remote = remote.await.unwrap().unwrap();
+        let b_offer = ParallelQuicOffer::new(remote.parallel_quic().unwrap()).with_duplex();
+        let mut b_stream = remote.into_stream().unwrap();
+        let mut prefix = [0; 4];
+        b_stream.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(&prefix, b"main");
+        let started = Instant::now();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let logger = Arc::new(veil_observability::NodeLogger::new_noop());
+        let sink: Arc<dyn crate::dispatcher_sink::DispatcherSink> = Arc::new(Capture {
+            started,
+            received: tx,
+            logger: Arc::clone(&logger),
+        });
+        let context = RealtimeReceiverContext {
+            peer_id: [9; 32],
+            dispatcher: sink,
+            logger,
+            metrics: None,
+            ban_list: Arc::new(Mutex::new(veil_abuse::BanList::new())),
+            violation_tracker: Arc::new(Mutex::new(
+                veil_abuse::ViolationTracker::with_fixed_duration(
+                    10,
+                    Duration::from_secs(10),
+                    Duration::from_secs(10),
+                )
+                .unwrap(),
+            )),
+            activity: Arc::new(crate::datagram_activity::AuthenticatedDatagramActivity::new()),
+        };
+        let mut a =
+            ParallelSession::new(a_offer, &[2; 32], &[3; 32], [1; 32], context.clone(), None);
+        let b = ParallelSession::new(b_offer, &[3; 32], &[2; 32], [1; 32], context, None);
+        let lanes = [REALTIME, BULK, BACKGROUND, LOCAL_RECOVERABLE_DATA_LANE];
+        for lane in lanes {
+            timeout(Duration::from_secs(5), async {
+                while !a.prepare(lane) {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(diagnostics.active_connections(), 4);
+        let mut bindings = HashSet::new();
+        let mut handles = Vec::new();
+        for (seq, lane) in lanes.into_iter().enumerate() {
+            // Identical neutral circuit framing for every trusted local source.
+            let frame = primary_test_frame(true, seq as u32, 0);
+            let (header, body, kind) = super::super::decode_realtime_lane_frame(&frame).unwrap();
+            assert_eq!(header.priority(), INTERACTIVE);
+            let index = a.prepare_frame(lane, body, kind).unwrap();
+            let sender = a.sender(index);
+            assert!(bindings.insert(sender.handle.channel_binding().unwrap()));
+            handles.push(sender.handle.clone());
+        }
+        // Retiring only the screen connection cannot retire the file source
+        // or silently fall back to a shared canonical congestion controller.
+        let screen_binding = handles[2].channel_binding().unwrap();
+        handles[2].close();
+        timeout(Duration::from_secs(1), handles[2].closed())
+            .await
+            .unwrap();
+        for (seq, lane) in [REALTIME, BULK, LOCAL_RECOVERABLE_DATA_LANE]
+            .into_iter()
+            .enumerate()
+        {
+            let frame = primary_test_frame(true, seq as u32, 0);
+            let (_, body, kind) = super::super::decode_realtime_lane_frame(&frame).unwrap();
+            let index = a.prepare_frame(lane, body, kind).unwrap();
+            let mut sender = a.sender(index);
+            assert_ne!(sender.handle.channel_binding().unwrap(), screen_binding);
+            let max_size = sender.max_datagram_size;
+            for packet in sender
+                .tx
+                .encode_frame(u64::from(lane), &frame, max_size)
+                .unwrap()
+            {
+                sender.handle.send(&packet).unwrap();
+            }
+        }
+        let mut received = HashSet::new();
+        timeout(Duration::from_secs(2), async {
+            while received.len() < 3 {
+                let (seq, _, _) = rx.recv().await.unwrap();
+                assert!(received.insert(seq), "one source delivered a duplicate");
+            }
+        })
+        .await
+        .unwrap();
+        drop((a, b));
+        close.close(0u32.into(), b"local source separation stand complete");
+        for handle in handles {
+            timeout(Duration::from_secs(1), handle.closed())
+                .await
+                .unwrap();
+        }
+        assert_eq!(diagnostics.active_connections(), 0);
+    })
+    .await
+    .unwrap();
+}

@@ -103,7 +103,9 @@ impl LocalReliableAdmission {
     pub(super) fn allow_secondary(&mut self, local_priority: u8, now: Instant) -> bool {
         if !matches!(
             local_priority,
-            veil_proto::priority::BULK | veil_proto::priority::BACKGROUND
+            veil_proto::priority::BULK
+                | veil_proto::priority::BACKGROUND
+                | veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
         ) {
             return true;
         }

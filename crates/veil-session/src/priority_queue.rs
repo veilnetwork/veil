@@ -1,7 +1,8 @@
 //! Weighted round-robin priority queue for outgoing frames.
 //!
-//! Frames are classified into 4 priority levels matching the 2-bit priority
-//! field in `FrameHeader.flags`:
+//! Four original classes match the 2-bit priority
+//! field in `FrameHeader.flags`. Recoverable local DATA has a separate fifth
+//! queue with the background weight; its selector never enters this wire field:
 //!
 //! | Level | Class | Weight |
 //! |-------|-------------|--------|
@@ -29,8 +30,19 @@ pub use veil_proto::header::priority::{BACKGROUND, BULK, INTERACTIVE, REALTIME};
 /// Default WRR weights: [REALTIME=8, INTERACTIVE=4, BULK=2, BACKGROUND=1].
 pub const DEFAULT_WEIGHTS: [u32; 4] = [8, 4, 2, 1];
 
-/// g: maximum aggregate frames buffered across all four
-/// priority levels per session. Above this, lowest-priority frames are
+// The fifth queue is trusted endpoint-only DATA. Remote traffic stays in the
+// four original classes; no wire priority can select this source queue.
+const LOCAL_QUEUE_COUNT: usize = 5;
+fn queue_index(priority: u8) -> usize {
+    if priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE {
+        4
+    } else {
+        priority.min(3) as usize
+    }
+}
+
+/// g: maximum aggregate frames buffered across all local
+/// queues per session. Above this, lowest-priority frames are
 /// shed first; same priority shed front-of-queue (oldest).
 ///
 /// Sized to match the upstream mpsc cap (64 frames in `tx_queue_depth`)
@@ -96,20 +108,20 @@ struct QueuedFrame {
 /// Frames are stored as `veil_bufpool::PooledShared` so that broadcast callers can share the
 /// same backing buffer across sessions without extra copies.
 pub struct PriorityQueue {
-    queues: [VecDeque<QueuedFrame>; 4],
-    weights: [u32; 4],
+    queues: [VecDeque<QueuedFrame>; LOCAL_QUEUE_COUNT],
+    weights: [u32; LOCAL_QUEUE_COUNT],
     /// Remaining slots in the current WRR round for each priority.
-    slots: [u32; 4],
+    slots: [u32; LOCAL_QUEUE_COUNT],
     /// Endpoint-only rounds when the ordinary scheduler is blocked by a
     /// reliable head. Transit traffic never enters these local slots.
-    local_datagram_slots: [u32; 4],
+    local_datagram_slots: [u32; LOCAL_QUEUE_COUNT],
     /// g: aggregate frame cap across all priorities.
     max_depth: usize,
     /// g: shared cumulative drop counter — typically
     /// `NodeMetrics::priority_queue_drops_total` so overflow surfaces
     /// in Prometheus the same scrape cycle it happens.
     drops_total: Arc<AtomicU64>,
-    lossy_realtime_len: [usize; 4],
+    lossy_realtime_len: [usize; LOCAL_QUEUE_COUNT],
     local_primary_seen: Option<Instant>,
 }
 
@@ -137,6 +149,7 @@ impl PriorityQueue {
             weights.iter().any(|&w| w > 0),
             "PriorityQueue: all weights are zero — pop() would always return None"
         );
+        let weights = [weights[0], weights[1], weights[2], weights[3], weights[3]];
         Self {
             queues: Default::default(),
             weights,
@@ -144,7 +157,7 @@ impl PriorityQueue {
             local_datagram_slots: weights,
             max_depth,
             drops_total,
-            lossy_realtime_len: [0; 4],
+            lossy_realtime_len: [0; LOCAL_QUEUE_COUNT],
             local_primary_seen: None,
         }
     }
@@ -153,7 +166,8 @@ impl PriorityQueue {
         Self::new(DEFAULT_WEIGHTS)
     }
 
-    /// Push a frame at the given priority level (clamped [0, 3]).
+    /// Push a frame at the given local class. Unknown choices clamp to BACKGROUND;
+    /// the recoverable DATA selector retains its independent source queue.
     ///
     /// g: when the aggregate depth would exceed
     /// `max_depth`, shed one frame from the lowest non-empty priority
@@ -214,7 +228,7 @@ impl PriorityQueue {
             self.drops_total.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let p = priority.min(3) as usize;
+        let p = queue_index(priority);
         // Lossy capacity is independent for each local producer class. Transit
         // has only INTERACTIVE, so no relay/user role gets a separate budget.
         // At capacity drop the oldest lossy entry of THIS class, preserving
@@ -240,7 +254,7 @@ impl PriorityQueue {
         reliable_credit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
         let lossy_realtime = enqueued_at.is_some();
-        let p = priority.min(3) as usize;
+        let p = queue_index(priority);
         // Endpoint-owned reliable entries retain bounded source credits. They
         // cannot be shed after successful admission. Their independent budget
         // is at most RELIABLE_SOURCE_QUEUE_DEPTH, shared with upstream ingress;
@@ -259,13 +273,13 @@ impl PriorityQueue {
             // prefer victimising lower-priority traffic over dropping the
             // incoming frame, so REALTIME/INTERACTIVE stays responsive when
             // BULK floods the queue. Larger index = lower priority, so scan
-            // 3→p and only victimise frames AT OR BELOW the incoming frame's
+            // lowest→p and only victimise frames AT OR BELOW the incoming frame's
             // priority. If everything queued outranks the incoming frame (e.g.
             // a BACKGROUND cover frame arriving into a queue full of REALTIME
             // data), drop the INCOMING frame instead of inverting priority.
             // (audit cycle-8 F4.)
             let mut shed = false;
-            for shed_p in (p..4).rev() {
+            for shed_p in (p..LOCAL_QUEUE_COUNT).rev() {
                 if let Some(index) = self.queues[shed_p]
                     .iter()
                     .position(|q| q.reliable_credit.is_none())
@@ -325,7 +339,7 @@ impl PriorityQueue {
     }
 
     fn try_pop_with_current_slots(&mut self) -> Option<veil_bufpool::PooledShared> {
-        for p in 0..4 {
+        for p in 0..LOCAL_QUEUE_COUNT {
             if self.slots[p] == 0 {
                 continue;
             }
@@ -375,7 +389,7 @@ impl PriorityQueue {
     /// Note this does NOT advance the WRR slot counter — it's a pure
     /// inspection of the queue state.
     pub fn peek_priority(&self) -> Option<u8> {
-        (0..4u8).find(|&p| !self.queues[p as usize].is_empty())
+        (0..LOCAL_QUEUE_COUNT as u8).find(|&p| !self.queues[p as usize].is_empty())
     }
 
     pub(crate) fn note_local_primary(&mut self, now: Instant) {
@@ -440,14 +454,14 @@ impl PriorityQueue {
             return;
         }
         let (priority, frame) = envelope.frame;
-        self.queues[priority.min(3) as usize].push_front(QueuedFrame {
+        self.queues[queue_index(priority)].push_front(QueuedFrame {
             frame,
             enqueued_at: Some(envelope.queued_at),
             lossy_realtime: true,
             carrier: envelope.carrier,
             reliable_credit: None,
         });
-        self.lossy_realtime_len[priority.min(3) as usize] += 1;
+        self.lossy_realtime_len[queue_index(priority)] += 1;
     }
 
     /// Select the next frame using the SAME WRR order as the ordered stream,
@@ -530,7 +544,7 @@ impl PriorityQueue {
         predicate: impl FnOnce(u8, &[u8]) -> bool,
     ) -> Option<crate::frame_outbox::FrameEnvelope> {
         for attempt in 0..2 {
-            for p in 0..4 {
+            for p in 0..LOCAL_QUEUE_COUNT {
                 if self.slots[p] == 0 {
                     continue;
                 }
@@ -574,6 +588,29 @@ impl PriorityQueue {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn recoverable_source_does_not_evict_screen_and_retains_its_selector() {
+        // These are trusted local choices; both encode the same ordinary
+        // inter-node header. A file burst must not consume the screen budget.
+        let recoverable = veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE;
+        let mut pq = PriorityQueue::with_default_weights();
+        pq.push_lossy(BACKGROUND, arc(b"screen"));
+        for _ in 0..LOSSY_REALTIME_MAX_DEPTH + 2 {
+            pq.push_lossy(recoverable, arc(b"file"));
+        }
+        assert_eq!(pq.drops_total(), 2);
+        let screen = pq.pop_local_datagram_envelope_if(|_| true).unwrap();
+        assert_eq!(screen.frame.0, BACKGROUND);
+        assert_eq!(&*screen.frame.1, b"screen");
+        let file = pq.pop_local_datagram_envelope_if(|_| true).unwrap();
+        assert_eq!(file.frame.0, recoverable);
+        assert_eq!(&*file.frame.1, b"file");
+        pq.restore_lossy_envelope(file);
+        let restored = pq.pop_datagram_envelope_if(|_| true).unwrap();
+        assert_eq!(restored.frame.0, recoverable);
+        assert_eq!(&*restored.frame.1, b"file");
+    }
+
+    #[test]
     fn every_scheduler_discards_old_local_primary_and_keeps_neutral_transit() {
         // Both sources claim the same wire priority. Only the trusted local
         // envelope class chooses age; relays cannot infer a media role.
@@ -607,7 +644,7 @@ mod tests {
                 };
                 assert_eq!(returned.is_some(), priority == INTERACTIVE, "mode={mode}");
                 assert_eq!(pq.drops_total(), u64::from(priority == REALTIME));
-                assert_eq!(pq.lossy_realtime_len, [0; 4]);
+                assert_eq!(pq.lossy_realtime_len, [0; LOCAL_QUEUE_COUNT]);
                 assert!(pq.is_empty());
             }
         }
@@ -629,7 +666,7 @@ mod tests {
             assert_eq!(pq.len(), 1);
             assert_eq!(pq.drops_total(), 1);
             assert_eq!(&*pq.pop().unwrap(), b"fresh");
-            assert_eq!(pq.lossy_realtime_len, [0; 4]);
+            assert_eq!(pq.lossy_realtime_len, [0; LOCAL_QUEUE_COUNT]);
         }
         let mut pq = PriorityQueue::with_default_weights();
         let mut reliable = FrameEnvelope::from((REALTIME, arc(b"reliable control")));
@@ -669,7 +706,7 @@ mod tests {
                     Instant::now() - LOSSY_REALTIME_MAX_AGE - Duration::from_millis(1);
                 pq.restore_lossy_envelope(envelope);
                 assert!(pq.is_empty());
-                assert_eq!(pq.lossy_realtime_len, [0; 4]);
+                assert_eq!(pq.lossy_realtime_len, [0; LOCAL_QUEUE_COUNT]);
                 assert_eq!(pq.drops_total(), 1);
             }
         }
@@ -695,7 +732,7 @@ mod tests {
             for seq in 0..LOSSY_REALTIME_MAX_DEPTH {
                 assert_eq!(&*pq.pop().unwrap(), &[seq as u8]);
             }
-            assert_eq!(pq.lossy_realtime_len, [0; 4]);
+            assert_eq!(pq.lossy_realtime_len, [0; LOCAL_QUEUE_COUNT]);
         }
     }
 
@@ -767,7 +804,8 @@ mod tests {
         pq.push_lossy(INTERACTIVE, arc(b"transit"));
         assert!(pq.pop_local_datagram_envelope_if(|_| true).is_none());
         assert_eq!(pq.len(), 2);
-        assert_eq!(pq.slots, DEFAULT_WEIGHTS);
+        assert_eq!(pq.slots[..4], DEFAULT_WEIGHTS);
+        assert_eq!(pq.slots[4], DEFAULT_WEIGHTS[3]);
         assert_eq!(&*pq.pop().unwrap(), b"reliable");
         assert!(pq.pop_local_datagram_envelope_if(|_| true).is_none());
         let envelope = pq.pop_datagram_envelope_if(|_| true).unwrap();
@@ -800,7 +838,8 @@ mod tests {
         }
         // Bypassing the independent reliable transport must neither drop nor
         // reorder its controls. The ordinary round remains untouched.
-        assert_eq!(pq.slots, DEFAULT_WEIGHTS);
+        assert_eq!(pq.slots[..4], DEFAULT_WEIGHTS);
+        assert_eq!(pq.slots[4], DEFAULT_WEIGHTS[3]);
         assert_eq!(&*pq.pop().unwrap(), b"control1");
         assert_eq!(&*pq.pop().unwrap(), b"control2");
         assert!(pq.is_empty());
@@ -936,7 +975,7 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
-        assert_eq!(pq.lossy_realtime_len, [0; 4]);
+        assert_eq!(pq.lossy_realtime_len, [0; LOCAL_QUEUE_COUNT]);
     }
 
     #[test]
@@ -947,13 +986,13 @@ mod tests {
             pq.push_lossy(p, arc(b"second"));
         }
         let frame = pq.pop_realtime_if(|_| true).unwrap();
-        assert_eq!(pq.lossy_realtime_len, [1, 0, 2, 0]);
+        assert_eq!(pq.lossy_realtime_len, [1, 0, 2, 0, 0]);
         pq.push_realtime_front(frame);
-        assert_eq!(pq.lossy_realtime_len, [2, 0, 2, 0]);
+        assert_eq!(pq.lossy_realtime_len, [2, 0, 2, 0, 0]);
         pq.push_lossy(BACKGROUND, arc(b"must not evict higher classes"));
-        assert_eq!(pq.lossy_realtime_len, [2, 0, 2, 0]);
+        assert_eq!(pq.lossy_realtime_len, [2, 0, 2, 0, 0]);
         pq.push(INTERACTIVE, arc(b"reliable"));
-        assert_eq!(pq.lossy_realtime_len, [2, 0, 1, 0]);
+        assert_eq!(pq.lossy_realtime_len, [2, 0, 1, 0, 0]);
         for queued in &mut pq.queues[REALTIME as usize] {
             queued.enqueued_at =
                 Some(Instant::now() - LOSSY_REALTIME_MAX_AGE - Duration::from_millis(1));
@@ -962,12 +1001,12 @@ mod tests {
             &*pq.pop_envelope_if(|_, _| true).unwrap().frame.1,
             b"reliable"
         );
-        assert_eq!(pq.lossy_realtime_len, [0, 0, 1, 0]);
+        assert_eq!(pq.lossy_realtime_len, [0, 0, 1, 0, 0]);
         assert_eq!(
             &*pq.pop_local_datagram_envelope_if(|_| true).unwrap().frame.1,
             b"second"
         );
-        assert_eq!(pq.lossy_realtime_len, [0; 4]);
+        assert_eq!(pq.lossy_realtime_len, [0; LOCAL_QUEUE_COUNT]);
         assert_eq!(pq.drops_total(), 4); // incoming, secondary victim, 2 expired
         assert!(pq.is_empty());
     }

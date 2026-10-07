@@ -123,9 +123,9 @@ impl AnonOnionSender for Provider {
 }
 
 #[tokio::test]
-async fn fallback_data_and_resends_keep_anonymous_routing_on_the_background_source_lane() {
+async fn fallback_data_and_resends_keep_anonymous_routing_on_the_recoverable_source_lane() {
     use veil_onion_stream::wire::{SackVec, reset_reason};
-    use veil_proto::priority::{BACKGROUND, INTERACTIVE};
+    use veil_proto::{ipc::LOCAL_RECOVERABLE_DATA_LANE, priority::INTERACTIVE};
     let directory = tempfile::tempdir().unwrap();
     let sock = directory.path().join("node.sock");
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -181,7 +181,7 @@ async fn fallback_data_and_resends_keep_anonymous_routing_on_the_background_sour
             },
         ),
         (
-            BACKGROUND,
+            LOCAL_RECOVERABLE_DATA_LANE,
             Frame::Data {
                 stream_id: 7,
                 seq: 11,
@@ -191,7 +191,7 @@ async fn fallback_data_and_resends_keep_anonymous_routing_on_the_background_sour
         ),
         // Identical retransmission also keeps its lane and exact payload.
         (
-            BACKGROUND,
+            LOCAL_RECOVERABLE_DATA_LANE,
             Frame::Data {
                 stream_id: 7,
                 seq: 11,

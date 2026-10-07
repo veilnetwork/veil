@@ -1535,7 +1535,8 @@ pub unsafe extern "C" fn veil_send(
     }
 }
 
-/// Send with a process-local queue (0..3). The lane is never a relay priority.
+/// Send with a process-local queue (0..4). Selector 4 isolates recoverable DATA.
+/// The lane is never a relay priority.
 /// `anonymous_authenticated=1` retains authenticated onion-only routing; 0 is
 /// the ordinary sealed delivery path. IDs must each address 32 readable bytes.
 /// Invalid lanes/flags fail before touching the app or input pointers.
@@ -1554,7 +1555,7 @@ pub unsafe extern "C" fn veil_send_on_local_lane(
     if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_send_on_local_lane") } {
         return rc;
     }
-    if local_lane > 3 || anonymous_authenticated > 1 {
+    if local_lane > veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE || anonymous_authenticated > 1 {
         unsafe {
             write_err(err_out, "invalid local lane or anonymity flag");
         }
