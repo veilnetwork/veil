@@ -605,6 +605,20 @@ async fn ordered_primary_feedback_survives_legacy_circuit_carrier() {
 
 #[tokio::test]
 async fn stream_only_primary_backpressure_holds_a_healthy_neighbor_file() {
+    verify_stream_only_primary_backpressure(0).await;
+}
+
+#[tokio::test]
+async fn primary_queued_behind_neutral_ciphertext_holds_other_producers() {
+    verify_stream_only_primary_backpressure(1).await;
+}
+
+#[tokio::test]
+async fn primary_queued_behind_a_full_neutral_writer_holds_other_producers() {
+    verify_stream_only_primary_backpressure(128).await;
+}
+
+async fn verify_stream_only_primary_backpressure(neutral_prefix: usize) {
     use veil_proto::app::AppDataPayload;
     let (primary_stream, mut primary_peer) = tokio::io::duplex(64);
     let (_link, file_handle, file_stream, mut file_peer) = pair().await;
@@ -617,14 +631,23 @@ async fn stream_only_primary_backpressure_holds_a_healthy_neighbor_file() {
     let secondary_outbox = node.register([0xB3; 32]);
     let secondary_sender = node.get_sender(&[0xB3; 32]).unwrap().clone();
     let bytes = primary_frame(OrderedPrimary::NeutralForward);
-    primary_sender
-        .send((REALTIME, bytes.clone()))
-        .await
-        .unwrap();
+    for _ in 0..neutral_prefix {
+        primary_sender
+            .send((INTERACTIVE, frame(AppMsg::AppSend, &[0xCC; 5000])))
+            .await
+            .unwrap();
+    }
     let mut runner = make_runner(Box::new(primary_stream), primary_outbox, None);
     let primary_job = tokio::spawn(async move {
         runner.run().await;
     });
+    if neutral_prefix != 0 {
+        sleep(Duration::from_millis(50)).await;
+    }
+    primary_sender
+        .send((REALTIME, bytes.clone()))
+        .await
+        .unwrap();
     // The encrypted primary blocks on a transport with no QUIC handle.
     timeout(Duration::from_secs(1), async {
         loop {
@@ -769,11 +792,29 @@ async fn stream_only_primary_backpressure_holds_a_healthy_neighbor_file() {
     );
     // Unblock and decrypt both primary frames. Pressure ticks never cancel or
     // restart partial encrypted writes or consume an extra cipher nonce.
+    if neutral_prefix != 0 {
+        let mut fresh = bytes.to_vec();
+        let mut header = veil_proto::codec::decode_header(&fresh).unwrap();
+        header.stream_id = 73;
+        fresh[..veil_proto::header::HEADER_SIZE]
+            .copy_from_slice(&veil_proto::codec::encode_header(&header));
+        primary_sender
+            .send((REALTIME, veil_bufpool::pooled_shared_from_vec(fresh)))
+            .await
+            .unwrap();
+    }
     let mut reader = super::super::ordered_reader::Reader::default();
     let mut cipher = SessionCipher::new(&[0x51; 32], true);
     timeout(Duration::from_secs(2), async {
         let mut received = 0;
-        while received < 2 {
+        let mut prefix_received = 0;
+        let mut fresh_received = false;
+        while (if neutral_prefix == 0 {
+            received < 2
+        } else {
+            !fresh_received
+        }) || prefix_received < neutral_prefix
+        {
             let wire = reader.read(&mut primary_peer, 65536).await.unwrap();
             let body = cipher
                 .open(&wire.body, &veil_proto::codec::frame_aad(&wire.header))
@@ -782,8 +823,24 @@ async fn stream_only_primary_backpressure_holds_a_healthy_neighbor_file() {
                 continue;
             }
             assert_eq!(wire.header.priority(), INTERACTIVE);
-            assert_eq!(body, &bytes[veil_proto::header::HEADER_SIZE..]);
-            received += 1;
+            if wire.header.family == FrameFamily::App as u8 {
+                assert_eq!(body, [0xCC; 5000]);
+                prefix_received += 1;
+            } else {
+                assert_eq!(body, &bytes[veil_proto::header::HEADER_SIZE..]);
+                if wire.header.stream_id == 73 {
+                    fresh_received = true;
+                } else {
+                    received += 1;
+                }
+            }
+        }
+        if neutral_prefix != 0 {
+            assert_eq!(
+                received,
+                if neutral_prefix >= 128 { 0 } else { 2 },
+                "old primary remained in the scheduler and must expire before encryption"
+            );
         }
     })
     .await
