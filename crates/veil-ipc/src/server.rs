@@ -2472,6 +2472,9 @@ async fn handle_ipc_client(
                         }
                     }
                     Ok(LocalAppMsg::AppIpcSend) => {
+                        crate::route_trace::sealed_local_sample(
+                            "daemon_read", veil_proto::ipc::ipc_local_source_lane(&hdr), &body,
+                        );
                         // validate src_app_id belongs to this client.
                         // src_app_id is at bytes [32..64] of the wire payload.
                         let src_app_id_valid = if body.len() >= 64 {
@@ -2482,6 +2485,9 @@ async fn handle_ipc_client(
                             false // malformed — handle_ipc_send will drop it anyway
                         };
                         if !src_app_id_valid {
+                            crate::route_trace::sealed_local_sample(
+                                "source_refused", veil_proto::ipc::ipc_local_source_lane(&hdr), &body,
+                            );
                             let mut hdr = FrameHeader::new(
                                 FrameFamily::LocalApp as u8,
                                 LocalAppMsg::AppSendFailed as u16,
@@ -2580,6 +2586,10 @@ async fn handle_ipc_client(
                                         log::warn!("ipc send job ended: {e}");
                                     }
                                 });
+                            } else {
+                                crate::route_trace::sealed_local_sample(
+                                    "rate_refused", ctx.local_priority, &body,
+                                );
                             }
                         }
                     }

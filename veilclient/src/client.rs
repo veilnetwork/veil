@@ -664,6 +664,7 @@ pub(crate) async fn run_writer_task<W: tokio::io::AsyncWrite + Unpin>(
             if f.deadline
                 .is_some_and(|at| tokio::time::Instant::now() >= at)
             {
+                veil_ipc::route_trace::sealed_local_frame_sample("writer_expired", &f);
                 if let Some(counter) = &f.prewrite_expirations {
                     counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -672,11 +673,14 @@ pub(crate) async fn run_writer_task<W: tokio::io::AsyncWrite + Unpin>(
             // Do not apply the producer deadline to an in-progress write:
             // cancellation after a partial header/body would corrupt IPC.
             match tokio::time::timeout(WRITE_DEADLINE, wh.write_all(&f)).await {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    veil_ipc::route_trace::sealed_local_frame_sample("socket_written", &f);
+                }
                 // Either the socket errored or the peer stopped reading. Both
                 // mean this connection is finished; holding the task open on
                 // the second is what leaked it.
                 Ok(Err(_)) | Err(_) => {
+                    veil_ipc::route_trace::sealed_local_frame_sample("socket_failed", &f);
                     failed = true;
                     break;
                 }
