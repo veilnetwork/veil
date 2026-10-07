@@ -28,6 +28,7 @@ static std::vector<Packet> pending;
 static Clock::time_point origin;
 static uint64_t source_channel = 0, receiver_channel = 0;
 static size_t sent_packets = 0;
+static bool perfect_network = false;
 static double milliseconds(Clock::time_point t) {
   return std::chrono::duration<double, std::milli>(t - origin).count();
 }
@@ -42,7 +43,7 @@ extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t 
   const auto now = Clock::now();
   const double at = milliseconds(now);
   // Reproducible short jitter bursts, then ten seconds of a recovered path.
-  const int delay = at >= 2000 && at < 4000
+  const int delay = !perfect_network && at >= 2000 && at < 4000
       ? (static_cast<int>(at) / 200 % 2 ? 300 : 40) : 40;
   pending.push_back({now + std::chrono::milliseconds(delay), {p, p + len}});
   ++sent_packets;
@@ -74,7 +75,50 @@ static uint64_t metric(VeilMediaEngine* e, const char* name) {
   const auto value = std::strtoull(at + key.size(), nullptr, 10);
   veil_media_free_string(json); return value;
 }
-int main() {
+static void verify_silence() {
+  perfect_network = true;
+  const uint8_t local[32] = {1}, peer[32] = {2};
+  source_channel = 200; receiver_channel = 300;
+  using Engine = std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)>;
+  Engine receiver(veil_media_test_audio_playout_create(receiver_channel, peer, local, 0, 30), veil_media_engine_destroy);
+  Engine source(veil_media_test_audio_playout_create(source_channel, local, peer, 1, 30), veil_media_engine_destroy);
+  assert(source && receiver);
+  origin = Clock::now();
+  std::array<int16_t, 480> pcm{};
+  uint64_t before_interruptions = 0, before_concealed = 0, max_age = 0;
+  size_t silent_start_packets = 0, silent_end_packets = 0, recovered_ticks = 0;
+  double max_lateness = 0;
+  for (int tick = 0; tick < 1600; ++tick) {
+    std::this_thread::sleep_until(origin + std::chrono::milliseconds(10 * tick));
+    max_lateness = std::max(max_lateness, milliseconds(Clock::now()) - 10 * tick);
+    assert(veil_media_test_audio_capture_tone(source.get(), tick < 200 ? 440 : tick < 1200 ? 0 : 1200) == 0);
+    deliver();
+    assert(veil_media_test_audio_playout_pcm(receiver.get(), pcm.data(), pcm.size()) == 480);
+    if (tick >= 1250) {
+      double power = 0;
+      for (const auto sample : pcm) power += static_cast<double>(sample) * sample;
+      if (power / pcm.size() > 500 * 500) ++recovered_ticks;
+    }
+    if (tick == 200) { before_interruptions = metric(receiver.get(), "audio_interruption_count"); before_concealed = metric(receiver.get(), "audio_concealed_samples"); silent_start_packets = sent_packets; }
+    if (tick == 1200) silent_end_packets = sent_packets;
+    if (tick % 10 == 0 && tick >= 300 && tick < 1200) max_age = std::max(max_age, metric(receiver.get(), "audio_rx_native_age_ms"));
+  }
+  std::printf("{\"silence_rtp_packets\":%zu,\"max_silence_rx_age_ms\":%llu,\"interruption_delta\":%llu,\"concealed_delta\":%llu,\"max_tick_lateness_ms\":%.2f}\n", silent_end_packets - silent_start_packets, (unsigned long long)max_age, (unsigned long long)(metric(receiver.get(), "audio_interruption_count") - before_interruptions), (unsigned long long)(metric(receiver.get(), "audio_concealed_samples") - before_concealed), max_lateness);
+  std::fflush(stdout);
+  assert(max_lateness < 30);
+  assert(silent_end_packets - silent_start_packets > 20);
+  assert(silent_end_packets - silent_start_packets < 150); // Opus DTX is exercised
+  assert(max_age < 500); // intentional silence must not trigger receive repair
+  assert(recovered_ticks > 250); // real decoded tone resumes after silence
+  assert(metric(receiver.get(), "audio_concealed_samples") == before_concealed);
+  assert(metric(receiver.get(), "audio_interruption_count") == before_interruptions);
+}
+
+int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--silence") == 0) {
+    verify_silence();
+    return 0;
+  }
   const uint8_t local[32] = {1}, peer[32] = {2};
   uint64_t baseline_concealed = 0;
   uint64_t baseline_flushes = 0;

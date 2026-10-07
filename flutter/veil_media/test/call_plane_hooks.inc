@@ -342,7 +342,8 @@ extern "C" VeilMediaEngine* veil_media_test_audio_playout_create(
 
 extern "C" int veil_media_test_audio_capture_tone(
     VeilMediaEngine* e, int frequency_hz) {
-  if (!e || !e->ws || frequency_hz <= 0 || frequency_hz > 8000)
+  // Zero supplies exact silent PCM through the same capture/Opus pipeline.
+  if (!e || !e->ws || frequency_hz < 0 || frequency_hz > 8000)
     return VEIL_MEDIA_ERR_ARG;
   static_cast<StandRecordingAdm*>(e->ws->adm.get())->CaptureTone(frequency_hz);
   return VEIL_MEDIA_OK;
