@@ -1,6 +1,7 @@
 //! A temporary endpoint budget for new reliable writes, while its local
 //! primary producer is active. Transit traffic never selects this policy.
 
+use crate::local_source_activity::{IDLE_GRACE, PRESSURE_GRACE};
 use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -11,30 +12,34 @@ use veil_util::lock;
 pub(super) const ACTIVE_RELIABLE_BYTES: u64 = 1024;
 // Small bounded control writes on the parent must not inherit child pressure.
 pub(super) const INDEPENDENT_RELIABLE_BYTES: u64 = 16 * 1024;
-const IDLE_GRACE: Duration = Duration::from_secs(3);
 const PRIMARY_PRESSURE_RTT: Duration = Duration::from_millis(150);
-const PRESSURE_GRACE: Duration = Duration::from_secs(2);
-const SECONDARY_PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
 pub(super) struct LocalReliableAdmission {
     writes: Arc<ReliableWriteAdmission>,
+    source_activity: Arc<crate::local_source_activity::LocalSourceActivity>,
     active_until: Option<Instant>,
     pressure_until: Option<Instant>,
-    ack_pressure_until: Option<Instant>,
     last_expired: u64,
-    secondary_next: Option<Instant>,
 }
 
 impl LocalReliableAdmission {
     pub(super) fn new(handle: QuicDatagramHandle) -> Self {
         Self {
             writes: Arc::new(ReliableWriteAdmission::new(handle)),
+            source_activity: Arc::default(),
             active_until: None,
             pressure_until: None,
-            ack_pressure_until: None,
             last_expired: 0,
-            secondary_next: None,
         }
+    }
+
+    pub(super) fn for_source(
+        handle: QuicDatagramHandle,
+        source_activity: Arc<crate::local_source_activity::LocalSourceActivity>,
+    ) -> Self {
+        let mut admission = Self::new(handle);
+        admission.source_activity = source_activity;
+        admission
     }
 
     pub(super) fn writer_admission(&self) -> Arc<ReliableWriteAdmission> {
@@ -58,6 +63,7 @@ impl LocalReliableAdmission {
         } else {
             ACTIVE_RELIABLE_BYTES
         };
+        self.source_activity.note(now);
         let until = now + IDLE_GRACE;
         self.writes.update(window, independent.then_some(until));
         self.active_until = Some(until);
@@ -84,10 +90,12 @@ impl LocalReliableAdmission {
         // Pressure limits bulk admission and competing local lossy production.
         // The writer grants a separate bounded budget only while actually
         // writing locally authored control; bulk and transit never acquire it.
-        if ack_blocked {
-            self.ack_pressure_until = Some(now + PRESSURE_GRACE);
+        let delayed =
+            rtt_us > PRIMARY_PRESSURE_RTT.as_micros() as u64 || expired > self.last_expired;
+        if ack_blocked || delayed {
+            self.source_activity.note_pressure(now);
         }
-        if rtt_us > PRIMARY_PRESSURE_RTT.as_micros() as u64 || expired > self.last_expired {
+        if delayed {
             self.pressure_until = Some(now + PRESSURE_GRACE);
         }
         // A retired child can be replaced by a fresh connection with zero counters.
@@ -98,8 +106,8 @@ impl LocalReliableAdmission {
         self.pressure_until.is_some_and(|until| now < until)
     }
 
-    /// Reduce only this endpoint's loss-tolerant secondary producer under
-    /// primary pressure. A sparse probe permits recovery without total starvation.
+    /// Reduce this endpoint's secondary production on any neighbor under local
+    /// primary pressure. All runners share one sparse recovery-probe budget.
     pub(super) fn allow_secondary(&mut self, local_priority: u8, now: Instant) -> bool {
         if !matches!(
             local_priority,
@@ -109,17 +117,7 @@ impl LocalReliableAdmission {
         ) {
             return true;
         }
-        let secondary_pressured =
-            self.pressured(now) || self.ack_pressure_until.is_some_and(|until| now < until);
-        if !self.active_until.is_some_and(|until| now < until) || !secondary_pressured {
-            self.secondary_next = None;
-            return true;
-        }
-        if self.secondary_next.is_some_and(|next| now < next) {
-            return false;
-        }
-        self.secondary_next = Some(now + SECONDARY_PROBE_INTERVAL);
-        true
+        self.source_activity.allow_secondary(now)
     }
 
     pub(super) fn expire(&mut self, now: Instant) {
@@ -131,8 +129,6 @@ impl LocalReliableAdmission {
     fn restore(&mut self) {
         if self.active_until.take().is_some() {
             self.pressure_until = None;
-            self.ack_pressure_until = None;
-            self.secondary_next = None;
             self.writes.update(DEFAULT_RELIABLE_SEND_WINDOW_BYTES, None);
         }
     }

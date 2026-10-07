@@ -2010,3 +2010,136 @@ impl tokio::io::AsyncWrite for ObservedControlStream {
 
 #[path = "primary_recovery_quic_tests.rs"]
 mod primary_recovery_quic_tests;
+
+/// Local primary feedback must protect local producers using a DIFFERENT
+/// neighbor connection. Neutral forwarding and another node keep their policy.
+#[tokio::test]
+async fn primary_blackout_limits_local_data_on_a_different_neighbor() {
+    use super::local_reliable_admission::LocalReliableAdmission;
+    use veil_proto::{
+        ipc::LOCAL_RECOVERABLE_DATA_LANE,
+        priority::{BACKGROUND, BULK, INTERACTIVE, REALTIME},
+    };
+
+    async fn pair() -> (NeutralLink, QuicDatagramHandle, QuicDatagramHandle) {
+        let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let link = NeutralLink::new(
+            left.local_addr().unwrap(),
+            right.local_addr().unwrap(),
+            1_000_000,
+            Duration::from_millis(1),
+        )
+        .await;
+        let ctx = Arc::new(TransportContext::for_debug().unwrap());
+        let remote = tokio::spawn(promote_punched_quic(
+            right,
+            link.right_addr,
+            Arc::clone(&ctx),
+            PunchedQuicRole::Responder,
+        ));
+        let local = promote_punched_quic(left, link.left_addr, ctx, PunchedQuicRole::Initiator)
+            .await
+            .unwrap();
+        let tx = local.quic_datagrams().unwrap();
+        let mut stream = local.into_stream().unwrap();
+        stream.write_all(b"warm").await.unwrap();
+        let remote = remote.await.unwrap().unwrap();
+        let rx = remote.quic_datagrams().unwrap();
+        let mut stream = remote.into_stream().unwrap();
+        let mut warm = [0; 4];
+        stream.read_exact(&mut warm).await.unwrap();
+        assert_eq!(&warm, b"warm");
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let stats = tx.path_stats();
+                if stats.rtt_us < 150_000 && stats.in_flight_bytes == 0 && stats.pto_count == 0 {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        (link, tx, rx)
+    }
+
+    let (primary_link, primary_tx, _primary_rx) = pair().await;
+    let (_bulk_link, bulk_tx, bulk_rx) = pair().await;
+    assert_ne!(
+        primary_tx.channel_binding().unwrap(),
+        bulk_tx.channel_binding().unwrap()
+    );
+    let mut node = crate::SessionTxRegistry::new();
+    let primary_outbox = node.register([0xA1; 32]);
+    let bulk_outbox = node.register([0xB1; 32]);
+    let mut admission = LocalReliableAdmission::for_source(
+        primary_tx.clone(),
+        primary_outbox.shared_source_activity(),
+    );
+    let mut bulk =
+        LocalReliableAdmission::for_source(bulk_tx.clone(), bulk_outbox.shared_source_activity());
+    let mut another_node = LocalReliableAdmission::new(bulk_tx.clone());
+    let frame = circuit_frame(1, 0x11);
+    admission.observe(REALTIME, &frame, std::time::Instant::now(), true);
+    primary_link.blackout.store(true, Ordering::Relaxed);
+    primary_tx.send(&[0x11; 200]).unwrap();
+    timeout(Duration::from_secs(2), async {
+        while primary_tx.path_stats().pto_count == 0 {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(primary_tx.path_stats().rtt_us < 150_000);
+    assert_eq!(primary_tx.path_stats().expired_outgoing_datagrams, 0);
+    let now = std::time::Instant::now();
+    admission.observe_primary_path(&primary_tx, now);
+    admission.observe(REALTIME, &frame, now, true);
+    // One endpoint-wide sparse probe remains possible, on an otherwise healthy
+    // connection. Neither TLS exporter nor RTT is shared between these paths.
+    assert!(bulk.allow_secondary(LOCAL_RECOVERABLE_DATA_LANE, now));
+    bulk_tx.send(&[0x33; 200]).unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(1), bulk_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        vec![0x33; 200]
+    );
+    let later = now + Duration::from_millis(1);
+    for priority in [BULK, BACKGROUND, LOCAL_RECOVERABLE_DATA_LANE] {
+        assert!(
+            !bulk.allow_secondary(priority, later),
+            "local secondary burst bypassed primary feedback on another neighbor"
+        );
+        assert!(
+            !admission.allow_secondary(priority, later),
+            "probes must share the endpoint budget"
+        );
+        assert!(
+            another_node.allow_secondary(priority, later),
+            "another node must not inherit source priority"
+        );
+    }
+    for priority in [REALTIME, INTERACTIVE] {
+        assert!(
+            bulk.allow_secondary(priority, later),
+            "primary/control/transit must keep normal admission"
+        );
+    }
+    // A publishing runner's teardown must not reset the other neighbors' grace.
+    drop(admission);
+    assert!(!bulk.allow_secondary(LOCAL_RECOVERABLE_DATA_LANE, later));
+    assert!(bulk.allow_secondary(
+        LOCAL_RECOVERABLE_DATA_LANE,
+        now + Duration::from_millis(200)
+    ));
+    assert!(
+        bulk.allow_secondary(LOCAL_RECOVERABLE_DATA_LANE, now + Duration::from_secs(2)),
+        "bounded pressure grace must expire"
+    );
+    primary_link.blackout.store(false, Ordering::Relaxed);
+    primary_tx.close();
+    bulk_tx.close();
+}
