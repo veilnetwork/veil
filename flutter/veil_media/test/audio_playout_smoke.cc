@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -29,17 +30,25 @@ static Clock::time_point origin;
 static uint64_t source_channel = 0, receiver_channel = 0;
 static size_t sent_packets = 0;
 static bool perfect_network = false;
+static bool handover_network = false;
+static const std::set<uint64_t> handover_sources{200, 201, 202};
+static std::vector<std::pair<uint64_t, uint16_t>> handover_sequences;
 static double milliseconds(Clock::time_point t) {
   return std::chrono::duration<double, std::milli>(t - origin).count();
 }
-extern "C" void veil_media_set_recv_callback(uint64_t chan,
+extern "C" int veil_media_set_recv_callback(uint64_t chan,
     void (*fn)(void*, const uint8_t*, size_t), void* ctx) {
   std::lock_guard lock(mu);
+  if (fn && chan == 999) return -1; // unknown native candidate, no replacement
   if (fn) callbacks[chan] = {fn, ctx}; else callbacks.erase(chan);
+  return 0;
 }
 extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t len) {
   std::lock_guard lock(mu);
-  if (chan != source_channel || len < 12 || (p[1] & 0x7f) != 111) return 0;
+  if ((handover_network ? !handover_sources.contains(chan) : chan != source_channel) ||
+      len < 12 || (p[1] & 0x7f) != 111) return 0;
+  if (handover_network)
+    handover_sequences.emplace_back(chan, uint16_t(p[2]) << 8 | p[3]);
   const auto now = Clock::now();
   const double at = milliseconds(now);
   // Reproducible short jitter bursts, then ten seconds of a recovered path.
@@ -74,6 +83,89 @@ static uint64_t metric(VeilMediaEngine* e, const char* name) {
   const auto* at = std::strstr(json, key.c_str()); assert(at);
   const auto value = std::strtoull(at + key.size(), nullptr, 10);
   veil_media_free_string(json); return value;
+}
+
+static void verify_handover() {
+  perfect_network = true;
+  handover_network = true;
+  const uint8_t local[32] = {1}, peer[32] = {2};
+  source_channel = 200; receiver_channel = 300;
+  using Engine = std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)>;
+  {
+    Engine receiver(veil_media_test_audio_playout_create(300, peer, local, 0, 0), veil_media_engine_destroy);
+    Engine source(veil_media_test_audio_playout_create(200, local, peer, 1, 0), veil_media_engine_destroy);
+    assert(source && receiver);
+    origin = Clock::now();
+    std::array<int16_t, 480> pcm{};
+    std::vector<double> source_edges, rendered_edges;
+    bool was_high = false;
+    double max_lateness = 0;
+    size_t nonsilent_ticks = 0;
+    uint64_t baseline_interruptions = 0, baseline_concealed = 0;
+    for (int tick = 0; tick < 1000; ++tick) {
+      std::this_thread::sleep_until(origin + std::chrono::milliseconds(10 * tick));
+      const double now = milliseconds(Clock::now());
+      max_lateness = std::max(max_lateness, now - 10 * tick);
+      if (tick == 200 || tick == 600) {
+        const uint64_t source_next = tick == 200 ? 201 : 202;
+        const uint64_t receive_next = tick == 200 ? 301 : 302;
+        const auto before_rx = metric(receiver.get(), "audio_rx_pkts");
+        assert(veil_media_engine_rebind_channel(source.get(), source_next) == VEIL_MEDIA_OK);
+        assert(veil_media_engine_rebind_channel(receiver.get(), receive_next) == VEIL_MEDIA_OK);
+        assert(veil_media_engine_rebind_channel(receiver.get(), receive_next) == VEIL_MEDIA_OK);
+        assert(metric(receiver.get(), "audio_rx_pkts") >= before_rx);
+        {
+          std::lock_guard lock(mu);
+          assert(callbacks.size() == 2 && callbacks.contains(source_next) && callbacks.contains(receive_next));
+          source_channel = source_next; receiver_channel = receive_next;
+        }
+      }
+      if (tick == 400) {
+        assert(veil_media_engine_rebind_channel(source.get(), 0) == VEIL_MEDIA_ERR_ARG);
+        assert(veil_media_engine_rebind_channel(source.get(), 999) != VEIL_MEDIA_OK);
+        assert(veil_media_engine_rebind_channel(receiver.get(), 999) != VEIL_MEDIA_OK);
+        std::lock_guard lock(mu);
+        assert(callbacks.size() == 2 && callbacks.contains(201) && callbacks.contains(301));
+      }
+      if (tick == 150) {
+        baseline_interruptions = metric(receiver.get(), "audio_interruption_count");
+        baseline_concealed = metric(receiver.get(), "audio_concealed_samples");
+      }
+      const bool high = (tick / 100) % 2;
+      if (high && tick % 100 == 0) source_edges.push_back(now);
+      assert(veil_media_test_audio_capture_tone(source.get(), high ? 1200 : 440) == 0);
+      deliver();
+      assert(veil_media_test_audio_playout_pcm(receiver.get(), pcm.data(), pcm.size()) == 480);
+      double power = 0; int crossings = 0;
+      for (size_t i = 0; i < pcm.size(); ++i) {
+        power += static_cast<double>(pcm[i]) * pcm[i];
+        if (i && ((pcm[i] > 0) != (pcm[i - 1] > 0))) ++crossings;
+      }
+      const bool nonsilent = power / pcm.size() > 500 * 500;
+      if (nonsilent) ++nonsilent_ticks;
+      const bool rendered_high = nonsilent && crossings >= 17;
+      if (rendered_high && !was_high) rendered_edges.push_back(milliseconds(Clock::now()));
+      was_high = rendered_high;
+    }
+    assert(max_lateness < 30 && nonsilent_ticks > 950);
+    for (double sent : source_edges) {
+      const auto rendered = std::find_if(rendered_edges.begin(), rendered_edges.end(),
+          [&](double at) { return at >= sent && at < sent + 180; });
+      assert(rendered != rendered_edges.end());
+    }
+    assert(metric(receiver.get(), "audio_interruption_count") == baseline_interruptions);
+    assert(metric(receiver.get(), "audio_concealed_samples") == baseline_concealed);
+    std::lock_guard lock(mu);
+    assert(handover_sequences.size() > 400);
+    std::set<uint64_t> used;
+    for (size_t i = 0; i < handover_sequences.size(); ++i) {
+      used.insert(handover_sequences[i].first);
+      if (i) assert(uint16_t(handover_sequences[i].second - handover_sequences[i - 1].second) == 1);
+    }
+    assert(used == handover_sources);
+    std::printf("handover: two channel switches, failed candidate preserved, continuous RTP/PCM, no added concealment or interruptions; lateness %.2f ms\n", max_lateness);
+  }
+  { std::lock_guard lock(mu); assert(callbacks.empty()); }
 }
 static void verify_silence() {
   perfect_network = true;
@@ -115,6 +207,10 @@ static void verify_silence() {
 }
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--handover") == 0) {
+    verify_handover();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--silence") == 0) {
     verify_silence();
     return 0;

@@ -65,6 +65,12 @@ VeilMediaEngine *veil_media_engine_create(uint64_t veil_chan,
  * engine. Does NOT close the veil media channel (caller owns it). */
 void veil_media_engine_destroy(VeilMediaEngine *engine);
 
+/* Rebind an already-running engine to a caller-owned, authenticated channel
+ * for the SAME logical call/peer/key material. The old channel stays caller-
+ * owned. On failure it remains active; on success its callback is unregistered.
+ * Does not recreate audio/video streams, reset RTP or stop capture/playout. */
+int veil_media_engine_rebind_channel(VeilMediaEngine *engine, uint64_t veil_chan);
+
 /* ---- Audio ---------------------------------------------------------------
  * Start/stop a bidirectional (or one-way) Opus audio session. `send` mounts
  * mic capture -> Opus encode -> RTP -> Transport; `recv` mounts RTP ->
