@@ -18,6 +18,8 @@ const BIND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const SOURCE_SLOTS: usize = crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES.len();
 const TRANSIT_SLOTS: usize = 2;
 const TOTAL_SLOTS: usize = SOURCE_SLOTS + TRANSIT_SLOTS;
+// One bounded authenticated replacement can coexist with all local slots.
+const _: () = assert!(TOTAL_SLOTS < QuicParallelHandle::CONNECTIONS_PER_DIRECTION);
 
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -405,7 +407,7 @@ fn spawn_acceptor(
         let mut accepts = tokio::task::JoinSet::new();
         loop {
             // Two generic handshakes can progress independently. The shared
-            // transport's eight-connection quota still bounds live children.
+            // transport's per-direction and aggregate quotas bound live children.
             // No producer role is inspected by this receiver.
             if offer.handle.has_exclusive_accept() {
                 while accepts.len() < 2 {
