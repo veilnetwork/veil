@@ -52,6 +52,7 @@ use veil_session::tx_registry::SessionTxRegistry;
 
 pub mod anonymity;
 pub mod app;
+pub mod auth_trace;
 pub mod control;
 pub mod delivery;
 pub mod diag;
