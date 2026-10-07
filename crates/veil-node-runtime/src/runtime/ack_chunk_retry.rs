@@ -1,4 +1,4 @@
-//! Endpoint-owned acknowledged chunk retries. Relay forwarding never uses this.
+//! Endpoint-owned acknowledged retries. Relay forwarding never uses this.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,6 +12,21 @@ pub(super) struct ChunkRetry {
     pub alternative_hop: Option<[u8; 32]>,
     pub frames: Arc<[Arc<[u8]>]>,
     pub attempt: u32,
+}
+
+/// A single-frame retry is still this endpoint's authored data. Preserve its
+/// source queue through scheduling without putting that classification on the
+/// wire. Keep the existing nonblocking admission and next-attempt semantics.
+pub(super) fn try_admit_single_retry(
+    registry: &veil_session::SessionTxRegistry,
+    hop: [u8; 32],
+    frame: &[u8],
+    attempt: u32,
+) -> bool {
+    let Some(prepared) = super::prepare_ack_retransmit_frame(frame, hop, attempt) else {
+        return false;
+    };
+    registry.send_to(&hop, veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE, prepared)
 }
 
 /// Wait for source credits with one admission deadline. A closed original hop
@@ -78,6 +93,91 @@ mod tests {
     use veil_proto::delivery::{ChunkedEnvelopePayload, DeliveryEnvelope, ForwardPayload};
     use veil_proto::family::{DeliveryMsg, FrameFamily};
     use veil_proto::{FrameHeader, HEADER_SIZE};
+
+    #[tokio::test]
+    async fn single_retry_burst_leaves_primary_and_transit_ahead_without_changing_e2e_bytes() {
+        let data = b"acknowledged source message";
+        let (ek, dk) = veil_e2e::generate_keypair();
+        let mut payload = vec![veil_proto::E2E_MARKER];
+        payload.extend(
+            veil_e2e::encrypt(&ek, &[1; 32], &[2; 32], data)
+                .unwrap()
+                .encode(),
+        );
+        let hop = [9; 32];
+        let mut registry = veil_session::SessionTxRegistry::with_capacity(64);
+        let mut outbox = registry.register(hop);
+        let mut originals = Vec::new();
+        for n in 0..32u8 {
+            let body = ForwardPayload {
+                next_hop_node_id: [8; 32],
+                envelope: DeliveryEnvelope {
+                    recipient: veil_proto::recipient::Recipient::any([2; 32]),
+                    sender_node_id: [1; 32],
+                    src_app_id: [3; 32],
+                    app_id: [4; 32],
+                    endpoint_id: 5,
+                    content_id: [n; 32],
+                    created_at: veil_util::unix_secs_now_u64(),
+                    ttl_secs: 30,
+                    payload: payload.clone(),
+                    trace_id: 0,
+                    require_ack: true,
+                },
+                relay_hops: 0,
+                delivery_attempt: Some(1),
+                traffic_class: None,
+            }
+            .encode();
+            let mut header =
+                FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+            header.set_priority(veil_proto::priority::INTERACTIVE);
+            header.body_len = body.len() as u32;
+            let mut frame = veil_proto::codec::encode_header(&header).to_vec();
+            frame.extend(body);
+            assert!(try_admit_single_retry(&registry, hop, &frame, 2));
+            originals.push(frame);
+        }
+        // The runner's WRR queue sees the real retry producer's local marker.
+        // A burst of authored retries must not acquire the neutral FIFO's turn.
+        let mut queue = veil_session::priority_queue::PriorityQueue::with_default_weights();
+        while let Ok((lane, frame)) = outbox.try_recv() {
+            queue.push(lane, frame);
+        }
+        assert!(registry.send_to(&hop, veil_proto::priority::INTERACTIVE, b"transit".to_vec()));
+        assert!(registry.send_to(&hop, veil_proto::priority::REALTIME, b"primary".to_vec()));
+        while let Ok((lane, frame)) = outbox.try_recv() {
+            queue.push(lane, frame);
+        }
+        assert_eq!(&*queue.pop().unwrap(), b"primary");
+        assert_eq!(&*queue.pop().unwrap(), b"transit");
+        for original in &originals {
+            let frame = queue.pop().unwrap();
+            assert_eq!(&frame[..HEADER_SIZE], &original[..HEADER_SIZE]);
+            let forwarded = ForwardPayload::decode(&frame[HEADER_SIZE..]).unwrap();
+            let old = ForwardPayload::decode(&original[HEADER_SIZE..]).unwrap();
+            assert_eq!(forwarded.next_hop_node_id, hop);
+            assert_eq!(forwarded.delivery_attempt, Some(2));
+            assert_eq!(forwarded.envelope.encode(), old.envelope.encode());
+            assert_eq!(forwarded.traffic_class, None);
+            let encrypted =
+                veil_proto::E2eEnvelope::decode(&forwarded.envelope.payload[1..]).unwrap();
+            assert_eq!(
+                veil_e2e::decrypt(&dk, &[1; 32], &[2; 32], &encrypted).unwrap(),
+                data
+            );
+        }
+        assert!(queue.is_empty(), "one frame per retry, with no duplicate");
+        assert!(!try_admit_single_retry(
+            &registry,
+            [10; 32],
+            &originals[0],
+            2
+        ));
+        assert!(!try_admit_single_retry(&registry, hop, &[], 2));
+        assert!(!try_admit_single_retry(&registry, hop, &originals[0], 256));
+        assert!(outbox.try_recv().is_err());
+    }
 
     fn sealed_batch() -> (ChunkRetry, Vec<u8>, Vec<u8>) {
         let data: Vec<_> = (0..20_000).map(|i| (i % 251) as u8).collect();
