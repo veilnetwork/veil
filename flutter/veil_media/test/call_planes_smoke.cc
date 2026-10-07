@@ -291,7 +291,10 @@ int main() {
     assert(veil_media_engine_set_independent_transport_feedback(e.get(), enabled) == VEIL_MEDIA_OK);
     assert(veil_media_engine_set_mic_muted(e.get(), 1) == VEIL_MEDIA_OK);
     assert(veil_media_engine_start_audio(e.get(), 0, 1) == VEIL_MEDIA_OK);
+    assert(veil_media_engine_set_video_send_paused(e.get(), 1) == VEIL_MEDIA_OK);
     assert(veil_media_engine_start_video(e.get(), 1, 1, 150, 15) == VEIL_MEDIA_OK);
+    assert(stat(e.get(), "video_send_paused") == 1);
+    assert(veil_media_engine_set_video_send_paused(e.get(), 0) == VEIL_MEDIA_OK);
     const int result = veil_media_test_direct_call_planes(e.get(), inject, e.get());
     if (result) { std::fprintf(stderr, "direct isolation failed: %d\n", result); return 1; }
     if (veil_media_test_blocked_audio_stats(e.get(), check_blocked_audio_stats, e.get()) != 0) {
@@ -356,7 +359,10 @@ int main() {
     assert(veil_media_group_engine_set_mic_muted(e.get(), 1) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_add_peer(e.get(), 22, peer) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_start_audio(e.get()) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_set_video_send_paused(e.get(), 1) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_start_video(e.get()) == VEIL_MEDIA_OK);
+    assert(group_stat(e.get(), "video_send_paused") == 1);
+    assert(veil_media_group_engine_set_video_send_paused(e.get(), 0) == VEIL_MEDIA_OK);
     const int result = veil_media_test_group_call_planes(e.get(), inject_group, e.get());
     if (result) { std::fprintf(stderr, "group isolation failed: %d\n", result); return 2; }
     // The caller stops polling for over a second. Native accepted RTP time
