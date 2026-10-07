@@ -1,6 +1,7 @@
 //! OVL1 node runtime crate — Phase 4 of veilcore extraction.
 
 pub mod admin;
+pub use veil_dispatcher::auth_trace::set_enabled as set_terminal_auth_trace;
 pub mod admin_audit;
 pub mod admin_transport;
 pub mod bootstrap_invite_create;
