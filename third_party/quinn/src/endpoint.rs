@@ -540,7 +540,10 @@ impl State {
                 .senders
                 .get_mut(&ch)
                 .unwrap()
-                .send(ConnectionEvent::Proto(event));
+                .send(ConnectionEvent::Proto {
+                    event,
+                    queued_at: self.runtime.now(),
+                });
         }
 
         true
@@ -815,12 +818,13 @@ impl RecvState {
                                 Some(DatagramEvent::ConnectionEvent(handle, event)) => {
                                     // Ignoring errors from dropped connections that haven't yet been cleaned up
                                     received_connection_packet = true;
-                                    let _ = self
-                                        .connections
-                                        .senders
-                                        .get_mut(&handle)
-                                        .unwrap()
-                                        .send(ConnectionEvent::Proto(event));
+                                    let _ =
+                                        self.connections.senders.get_mut(&handle).unwrap().send(
+                                            ConnectionEvent::Proto {
+                                                event,
+                                                queued_at: runtime.now(),
+                                            },
+                                        );
                                 }
                                 Some(DatagramEvent::Response(transmit)) => {
                                     respond(transmit, &response_buffer, socket);

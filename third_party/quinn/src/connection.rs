@@ -29,6 +29,30 @@ use proto::{
     StreamId, congestion::Controller,
 };
 
+/// Local scheduling delays, independent of protocol or application contents.
+/// All fields are cumulative for this connection; no measurements go on wire.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ConnectionDriverStats {
+    /// Last delay between endpoint dispatch and connection processing.
+    pub event_queue_last_us: u64,
+    /// Largest endpoint-to-connection dispatch delay.
+    pub event_queue_max_us: u64,
+    /// Number of protocol events delayed at least 100 ms locally.
+    pub event_queue_stalls: u64,
+    /// Last delay beyond an expired timer's scheduled deadline.
+    pub timer_late_last_us: u64,
+    /// Largest observed timer lateness.
+    pub timer_late_max_us: u64,
+    /// Number of timers processed at least 100 ms late.
+    pub timer_stalls: u64,
+}
+
+fn scheduling_delay_us(now: Instant, scheduled: Instant) -> u64 {
+    now.saturating_duration_since(scheduled)
+        .as_micros()
+        .min(u64::MAX as u128) as u64
+}
+
 /// In-progress connection attempt future
 #[derive(Debug)]
 pub struct Connecting {
@@ -578,6 +602,11 @@ impl Connection {
         self.0.state.lock("stats").inner.stats()
     }
 
+    /// Local event dispatch and timer scheduling delays.
+    pub fn driver_stats(&self) -> ConnectionDriverStats {
+        self.0.state.lock("driver_stats").driver_stats
+    }
+
     /// Current state of the congestion control algorithm, for debugging purposes
     pub fn congestion_state(&self) -> Box<dyn Controller> {
         self.0
@@ -938,6 +967,7 @@ impl ConnectionRef {
                 connected: false,
                 timer: None,
                 timer_deadline: None,
+                driver_stats: ConnectionDriverStats::default(),
                 conn_events,
                 endpoint_events,
                 blocked_writers: FxHashMap::default(),
@@ -1017,6 +1047,7 @@ pub(crate) struct State {
     connected: bool,
     timer: Option<Pin<Box<dyn AsyncTimer>>>,
     timer_deadline: Option<Instant>,
+    driver_stats: ConnectionDriverStats,
     conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
     endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
@@ -1123,7 +1154,15 @@ impl State {
                     self.io_poller = self.socket.clone().create_io_poller();
                     self.inner.local_address_changed();
                 }
-                Poll::Ready(Some(ConnectionEvent::Proto(event))) => {
+                Poll::Ready(Some(ConnectionEvent::Proto { event, queued_at })) => {
+                    let delay = scheduling_delay_us(self.runtime.now(), queued_at);
+                    self.driver_stats.event_queue_last_us = delay;
+                    self.driver_stats.event_queue_max_us =
+                        self.driver_stats.event_queue_max_us.max(delay);
+                    if delay >= 100_000 {
+                        self.driver_stats.event_queue_stalls =
+                            self.driver_stats.event_queue_stalls.saturating_add(1);
+                    }
                     self.inner.handle_event(event);
                 }
                 Poll::Ready(Some(ConnectionEvent::Close { reason, error_code })) => {
@@ -1241,7 +1280,14 @@ impl State {
 
         // A timer expired, so the caller needs to check for
         // new transmits, which might cause new timers to be set.
-        self.inner.handle_timeout(self.runtime.now());
+        let now = self.runtime.now();
+        let late = scheduling_delay_us(now, self.timer_deadline.expect("expired timer deadline"));
+        self.driver_stats.timer_late_last_us = late;
+        self.driver_stats.timer_late_max_us = self.driver_stats.timer_late_max_us.max(late);
+        if late >= 100_000 {
+            self.driver_stats.timer_stalls = self.driver_stats.timer_stalls.saturating_add(1);
+        }
+        self.inner.handle_timeout(now);
         self.timer_deadline = None;
         true
     }
