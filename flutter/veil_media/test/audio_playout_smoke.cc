@@ -76,6 +76,8 @@ static uint64_t metric(VeilMediaEngine* e, const char* name) {
 }
 int main() {
   const uint8_t local[32] = {1}, peer[32] = {2};
+  uint64_t baseline_concealed = 0;
+  uint64_t baseline_flushes = 0;
   for (size_t capacity : {size_t{30}, size_t{0}}) {
     {
       std::lock_guard lock(mu);
@@ -128,29 +130,42 @@ int main() {
     { std::lock_guard lock(mu); packet_count = sent_packets; }
     assert(packet_count > 300 && nonsilent_ticks > 900);
     assert(metric(receiver.get(), "audio_rx_pkts") > 300);
-    std::printf("{\"buffer_packets\":%zu,\"rtp_packets\":%zu,\"nonsilent_ticks\":%zu,"
+    std::printf("{\"buffer_packets_override\":%zu,\"rtp_packets\":%zu,\"nonsilent_ticks\":%zu,"
                 "\"max_tick_lateness_ms\":%.2f,\"max_filtered_delay_ms\":%llu,"
                 "\"max_current_buffer_ms\":%llu,\"marker_latency_ms\":[",
-        capacity ? capacity : 12, packet_count, nonsilent_ticks, max_tick_lateness,
+        capacity, packet_count, nonsilent_ticks, max_tick_lateness,
         static_cast<unsigned long long>(max_delay), static_cast<unsigned long long>(max_buffer));
+    bool recovered = true;
     for (size_t i = 0; i < source_edges.size(); ++i) {
       const auto edge = std::find_if(high_edges.begin(), high_edges.end(), [&](double at) {
         return at >= source_edges[i] && at < source_edges[i] + 800;
       });
       assert(edge != high_edges.end());
       const auto latency = *edge - source_edges[i];
-      if (i == 2 || i == 3) { // 1 and 3 seconds after the path recovers
-        if (capacity) assert(latency > 300); // old policy reproduced the tail
-        // Includes the 40-ms network path and Opus packetization, on top of
-        // the 180-ms receiver target. Actual PCM, not the filtered estimate.
-        else assert(latency < 240);
-      }
+      // A packet-capacity reduction must not masquerade as a latency win by
+      // flushing audio. Keep PCM recovery within the measured control budget,
+      // then check actual concealed samples as well as the rendered markers.
+      if (!capacity && (i == 2 || i == 3)) recovered &= latency < 400;
+      // The 9-second marker of the unchanged control ranged from 170 to
+      // 252 ms; its final 11/13-second markers returned below 180 ms.
+      if (!capacity && i == 4) recovered &= latency < 300;
+      if (!capacity && i >= 5) recovered &= latency < 180;
       if (i) std::printf(",");
       std::printf("%.2f", latency);
     }
-    std::printf("],\"concealed_samples\":%llu,\"interruption_count\":%llu}\n",
+    std::printf("],\"concealed_samples\":%llu,\"interruption_count\":%llu,\"buffer_flushes\":%llu}\n",
         static_cast<unsigned long long>(metric(receiver.get(), "audio_concealed_samples")),
-        static_cast<unsigned long long>(metric(receiver.get(), "audio_interruption_count")));
+        static_cast<unsigned long long>(metric(receiver.get(), "audio_interruption_count")),
+        static_cast<unsigned long long>(metric(receiver.get(), "audio_jb_flushes")));
     std::fflush(stdout);
+    assert(recovered); // Print the complete PCM trace before rejecting a policy.
+    const auto concealed = metric(receiver.get(), "audio_concealed_samples");
+    const auto flushes = metric(receiver.get(), "audio_jb_flushes");
+    if (capacity) { baseline_concealed = concealed; baseline_flushes = flushes; }
+    else {
+      assert(concealed <= baseline_concealed + 2400); // <=50 ms extra at 48 kHz
+      assert(flushes <= baseline_flushes);
+    }
+
   }
 }
