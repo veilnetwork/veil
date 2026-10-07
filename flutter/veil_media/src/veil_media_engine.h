@@ -71,6 +71,15 @@ void veil_media_engine_destroy(VeilMediaEngine *engine);
  * Does not recreate audio/video streams, reset RTP or stop capture/playout. */
 int veil_media_engine_rebind_channel(VeilMediaEngine *engine, uint64_t veil_chan);
 
+/* Same call/key contract as rebind_channel, retaining the previous inbound
+ * binding so independent peer route changes do not interrupt receive audio.
+ * Caller retains ownership of both handles and releases superseded bindings.
+ * Destroy unregisters and fences all remaining bindings. */
+int veil_media_engine_rebind_channel_keep_receiver(VeilMediaEngine *engine, uint64_t veil_chan);
+/* Unregister/fence an older inbound binding. Refuses the active outbound
+ * channel; repeated release of an already-released binding is harmless. */
+int veil_media_engine_release_receive_channel(VeilMediaEngine *engine, uint64_t veil_chan);
+
 /* ---- Audio ---------------------------------------------------------------
  * Start/stop a bidirectional (or one-way) Opus audio session. `send` mounts
  * mic capture -> Opus encode -> RTP -> Transport; `recv` mounts RTP ->

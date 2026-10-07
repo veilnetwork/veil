@@ -29,12 +29,13 @@ final void Function(Pointer<VeilMediaEngineHandle>) veilMediaEngineDestroy =
 
 // Optional for existing deployed engines: callers can retain the legacy route
 // rebuild until the native library supports preserving streams during handover.
-int Function(Pointer<VeilMediaEngineHandle>, int)? _lookupRebindChannel() {
+int Function(Pointer<VeilMediaEngineHandle>, int)? _lookupChannelOperation(
+    String symbol) {
   try {
     return nativeLib.lookupFunction<
         Int32 Function(Pointer<VeilMediaEngineHandle>, Uint64),
         int Function(Pointer<VeilMediaEngineHandle>, int)>(
-      'veil_media_engine_rebind_channel',
+      symbol,
     );
   } on ArgumentError {
     return null;
@@ -42,7 +43,14 @@ int Function(Pointer<VeilMediaEngineHandle>, int)? _lookupRebindChannel() {
 }
 
 final int Function(Pointer<VeilMediaEngineHandle>, int)?
-    veilMediaEngineRebindChannel = _lookupRebindChannel();
+    veilMediaEngineRebindChannel =
+    _lookupChannelOperation('veil_media_engine_rebind_channel');
+final int Function(Pointer<VeilMediaEngineHandle>, int)?
+    veilMediaEngineRebindChannelKeepReceiver =
+    _lookupChannelOperation('veil_media_engine_rebind_channel_keep_receiver');
+final int Function(Pointer<VeilMediaEngineHandle>, int)?
+    veilMediaEngineReleaseReceiveChannel =
+    _lookupChannelOperation('veil_media_engine_release_receive_channel');
 
 // start_audio(engine*, send int, recv int) -> int
 final int Function(Pointer<VeilMediaEngineHandle>, int, int)

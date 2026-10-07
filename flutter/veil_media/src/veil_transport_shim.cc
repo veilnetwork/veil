@@ -7,6 +7,7 @@
  */
 
 #include "veil_transport_shim.h"
+#include <algorithm>
 #include "veil_diag_log.h"
 
 #include <atomic>
@@ -144,6 +145,7 @@ void VeilTransportShim::Start() {
   if (!started_.compare_exchange_strong(expected, true)) return;
   const int rc = veil_media_set_recv_callback(
       veil_chan_, &VeilTransportShim::OnVeilDatagram, this);
+  if (rc == 0) receive_channels_.push_back(veil_chan_.load());
   // A failed registration is a silently dead inbound leg — surface it.
   slog("shim Start chan=%llu recv_cb rc=%d", (unsigned long long)veil_chan_.load(),
        rc);
@@ -152,7 +154,9 @@ void VeilTransportShim::Start() {
 void VeilTransportShim::Stop() {
   bool expected = true;
   if (!started_.compare_exchange_strong(expected, false)) return;
-  veil_media_set_recv_callback(veil_chan_, nullptr, nullptr);
+  for (const auto channel : receive_channels_)
+    veil_media_set_recv_callback(channel, nullptr, nullptr);
+  receive_channels_.clear();
   slog("shim Stop chan=%llu recv_cb cleared", (unsigned long long)veil_chan_.load());
   // Fence a delivery already in progress before the owner destroys Call.
   // Pending tasks need not run: release their packets here, with no one-second
@@ -161,17 +165,28 @@ void VeilTransportShim::Stop() {
   inbound_queue_.Clear();
 }
 
-bool VeilTransportShim::RebindChannel(uint64_t veil_chan) {
+bool VeilTransportShim::RebindChannel(uint64_t veil_chan, bool retain_previous_receiver) {
   if (veil_chan == 0 || !started_.load(std::memory_order_acquire)) return false;
   const auto previous = veil_chan_.load(std::memory_order_acquire);
   if (previous == veil_chan) return true;
   // The SDK validates the candidate before replacing any registration, and
   // fences a callback already running on the old owner. With different peers
-  // both registrations can coexist until the explicit clear below.
+  // both registrations can coexist: each direction may choose a different
+  // route, and a local outbound switch does not move the peer's outbound leg.
   if (veil_media_set_recv_callback(
           veil_chan, &VeilTransportShim::OnVeilDatagram, this) != 0) return false;
   veil_chan_.store(veil_chan, std::memory_order_release);
-  veil_media_set_recv_callback(previous, nullptr, nullptr);
+  receive_channels_.push_back(veil_chan);
+  if (!retain_previous_receiver) ReleaseReceiveChannel(previous);
+  return true;
+}
+
+bool VeilTransportShim::ReleaseReceiveChannel(uint64_t veil_chan) {
+  if (!veil_chan || veil_chan == veil_chan_.load(std::memory_order_acquire)) return false;
+  const auto found = std::find(receive_channels_.begin(), receive_channels_.end(), veil_chan);
+  if (found == receive_channels_.end()) return true;
+  veil_media_set_recv_callback(veil_chan, nullptr, nullptr);
+  receive_channels_.erase(found);
   return true;
 }
 
