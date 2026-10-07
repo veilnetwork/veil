@@ -1875,15 +1875,17 @@ pub(crate) async fn handle_ipc_send(
                     );
                     if relay_media_sealed {
                         if relayed {
-                            crate::route_trace::sealed_local_sample(
+                            crate::route_trace::sealed_relay_hop_sample(
                                 "relay_queued",
                                 ctx.local_priority,
+                                &next_hop,
                                 body,
                             );
                         } else {
-                            crate::route_trace::sealed_local_sample(
+                            crate::route_trace::sealed_relay_hop_sample(
                                 "relay_refused",
                                 ctx.local_priority,
+                                &next_hop,
                                 body,
                             );
                         }
@@ -2057,6 +2059,7 @@ pub(crate) async fn handle_rt_send(
         Ok(s) => s,
         Err(_) => return Ok(()), // drop malformed — no response
     };
+    crate::route_trace::sealed_rt_local_sample("handler_enter", local_priority, body);
 
     let reg = match session_tx_registry {
         Some(r) => r,
@@ -2096,6 +2099,11 @@ pub(crate) async fn handle_rt_send(
     // Same reason as the interactive path: the destination may name an
     // identity, and the session is registered under a device of it.
     let sent = reg.send_to_peer_or_identity(&send.dst_node_id, local_priority.min(3), frame);
+    crate::route_trace::sealed_rt_local_sample(
+        if sent { "direct_queued" } else { "direct_refused" },
+        local_priority,
+        body,
+    );
 
     if sent {
         if let Some(m) = metrics {
