@@ -4043,6 +4043,7 @@ impl SessionRunner {
         // preserves the protocol and payload privacy while measuring the exact
         // scheduler boundary implicated by relay-video pauses.
         let mut realtime_writer_blocked_since: Option<std::time::Instant> = None;
+        let mut source_reliable_pressure_logged: Option<std::time::Instant> = None;
 
         // connection-rotation deadline. Computed once
         // at session start from the global SESSION_MAX_AGE_SECS
@@ -4655,6 +4656,7 @@ impl SessionRunner {
                         .as_ref()
                         .is_some_and(|outbox| outbox.source_activity().active(now));
                 let mut source_bulk_waiting_for_writer = false;
+                let mut source_pressure_retry: Option<std::time::Instant> = None;
                 while !coalesce_active
                     && drained_this_pass < drain_cap
                     // Real-time latency bound: one encrypted batch becomes one
@@ -4672,9 +4674,10 @@ impl SessionRunner {
                     // a write failure below and tore down the whole obfs4/TCP
                     // session during a short bulk burst.
                     && wire_tx.capacity() > 0
-                    && let Some(envelope) = pq.pop_envelope_if(|priority, frame| {
+                    && let Some(envelope) = pq.pop_admitted_envelope(|priority, frame, owned_reliable| {
+                        use crate::priority_queue::HeadAdmission;
                         let pending_blobs = wire_tx.max_capacity().saturating_sub(wire_tx.capacity());
-                        source_bulk_waiting_for_writer = local_primary_active
+                        source_bulk_waiting_for_writer |= local_primary_active
                             && priority >= veil_proto::priority::BULK
                             && pending_blobs != 0;
                         // Do not let a control lease admit a coalesced file or
@@ -4682,16 +4685,31 @@ impl SessionRunner {
                         // keeps one local classification through partial writes.
                         let control = local_control_write(priority, frame);
                         if batch_control.is_some_and(|kind| kind != control) {
-                            return false;
+                            return HeadAdmission::FlushBatch;
                         }
-                        local_source_stream_budget::fits(
+                        if !local_source_stream_budget::fits(
                             local_primary_active,
                             priority,
                             pending_blobs,
                             encrypted_batch_wire_len,
                             encrypted_wire_len(frame.len()).unwrap_or(usize::MAX),
                             batch_has_local_source,
-                        )
+                        ) {
+                            return HeadAdmission::FlushBatch;
+                        }
+                        // Trusted local admission credits distinguish authored
+                        // ordered streams from opaque transit. A remote header
+                        // cannot select this endpoint-only pressure policy.
+                        if (owned_reliable || priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE)
+                            && let Some(outbox) = outbox.as_ref()
+                            && let Err(retry) = outbox.source_activity().admit_reliable_secondary(
+                                encrypted_wire_len(frame.len()).unwrap_or(usize::MAX), now,
+                            )
+                        {
+                            source_pressure_retry = Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
+                            return HeadAdmission::DeferSource;
+                        }
+                        HeadAdmission::Allow
                     })
                 {
                     drained_this_pass += 1;
@@ -4825,6 +4843,27 @@ impl SessionRunner {
                     coalesce_until,
                     session_rotation.deadline(),
                 );
+                if crate::rt_trace::rt_trace_enabled()
+                    && let Some(retry) = source_pressure_retry
+                    && source_reliable_pressure_logged.is_none_or(|last| {
+                        now.saturating_duration_since(last) >= std::time::Duration::from_secs(1)
+                    })
+                {
+                    source_reliable_pressure_logged = Some(now);
+                    self.logger.info(
+                        "session.rt_trace.local_reliable_pressure",
+                        format!(
+                            "peer_id={} pq_depth={} retry_ms={}",
+                            hex_short(&self.peer_id),
+                            pq.len(),
+                            retry.saturating_duration_since(now).as_millis()
+                        ),
+                    );
+                }
+                let sleep_until = source_pressure_retry.map_or(sleep_until, |retry| {
+                    let retry = tokio::time::Instant::from_std(retry);
+                    Some(sleep_until.map_or(retry, |other| other.min(retry)))
+                });
                 match await_next_input(
                     &mut read_half,
                     &mut frame_reader,
@@ -4835,8 +4874,12 @@ impl SessionRunner {
                     sleep_until,
                     &wire_tx,
                     local_datagram_status.as_deref(),
-                    if !pq.is_empty() && !coalesce_active {
-                        Some(if source_bulk_waiting_for_writer {
+                    if !pq.is_empty() && !coalesce_active
+                        // An idle writer is already ready: polling it during
+                        // a source pressure wait would spin until the deadline.
+                        && (source_pressure_retry.is_none() || wire_tx.capacity() < wire_tx.max_capacity())
+                    {
+                        Some(if source_bulk_waiting_for_writer || source_pressure_retry.is_some() {
                             wire_tx.max_capacity()
                         } else {
                             1

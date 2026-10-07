@@ -6,6 +6,7 @@ use veil_util::lock;
 
 pub(crate) const IDLE_GRACE: Duration = Duration::from_secs(3);
 pub(crate) const PRESSURE_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const RELIABLE_SECONDARY_BYTES: usize = 4096;
 const SECONDARY_PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Default)]
@@ -13,6 +14,7 @@ struct SourceState {
     last_primary: Option<Instant>,
     pressure_until: Option<Instant>,
     secondary_next: Option<Instant>,
+    reliable_window: Option<(Instant, usize)>,
 }
 
 #[derive(Debug, Default)]
@@ -38,6 +40,45 @@ impl LocalSourceActivity {
         let mut state = lock!(self.0);
         let until = now + PRESSURE_GRACE;
         state.pressure_until = Some(state.pressure_until.map_or(until, |old| old.max(until)));
+    }
+
+    /// Hold reliable local producers before encryption, never discard their
+    /// bytes. All neighbors of this endpoint share the same bounded allowance.
+    /// Whole oversized compatibility frames may progress alone. The caller
+    /// must retain FIFO and admission credits while waiting for the deadline.
+    pub(crate) fn admit_reliable_secondary(
+        &self,
+        bytes: usize,
+        now: Instant,
+    ) -> Result<(), Instant> {
+        let mut state = lock!(self.0);
+        let active_until = state.last_primary.map(|at| at + IDLE_GRACE);
+        let pressure_until = state.pressure_until;
+        let (Some(active_until), Some(pressure_until)) = (active_until, pressure_until) else {
+            state.reliable_window = None;
+            return Ok(());
+        };
+        if now >= active_until || now >= pressure_until {
+            state.reliable_window = None;
+            return Ok(());
+        }
+        let (deadline, used) = state
+            .reliable_window
+            .get_or_insert((now + SECONDARY_PROBE_INTERVAL, 0));
+        if now >= *deadline {
+            *deadline = now + SECONDARY_PROBE_INTERVAL;
+            *used = 0;
+        }
+        if *used == 0
+            || used
+                .checked_add(bytes)
+                .is_some_and(|n| n <= RELIABLE_SECONDARY_BYTES)
+        {
+            *used = used.saturating_add(bytes);
+            Ok(())
+        } else {
+            Err((*deadline).min(active_until).min(pressure_until))
+        }
     }
 
     /// One sparse probe across this endpoint, including different neighbors.
@@ -98,6 +139,68 @@ mod tests {
         assert!(!activity.allow_secondary(now + SECONDARY_PROBE_INTERVAL));
         assert!(activity.allow_secondary(now + PRESSURE_GRACE));
         assert!(activity.allow_secondary(now + PRESSURE_GRACE));
+    }
+
+    #[test]
+    fn reliable_neighbors_share_bytes_and_resume_at_pressure_or_idle_expiry() {
+        let activity = Arc::new(LocalSourceActivity::default());
+        let now = Instant::now();
+        activity.note(now);
+        activity.note_pressure(now);
+        let barrier = Arc::new(Barrier::new(16));
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let activity = Arc::clone(&activity);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    usize::from(
+                        activity
+                            .admit_reliable_secondary(RELIABLE_SECONDARY_BYTES, now)
+                            .is_ok(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            activity.admit_reliable_secondary(1, now),
+            Err(now + SECONDARY_PROBE_INTERVAL)
+        );
+        // Old compatibility frames stay whole rather than becoming a deadlock.
+        let next = now + SECONDARY_PROBE_INTERVAL;
+        assert!(activity.admit_reliable_secondary(60_000, next).is_ok());
+        assert_eq!(
+            activity.admit_reliable_secondary(1, next),
+            Err(next + SECONDARY_PROBE_INTERVAL)
+        );
+        assert!(
+            activity
+                .admit_reliable_secondary(60_000, now + PRESSURE_GRACE)
+                .is_ok()
+        );
+        assert!(
+            activity
+                .admit_reliable_secondary(60_000, now + PRESSURE_GRACE)
+                .is_ok()
+        );
+        activity.note_pressure(now + IDLE_GRACE);
+        assert!(
+            activity
+                .admit_reliable_secondary(60_000, now + IDLE_GRACE)
+                .is_ok()
+        );
+        assert!(
+            activity
+                .admit_reliable_secondary(60_000, now + IDLE_GRACE)
+                .is_ok()
+        );
     }
 
     #[test]

@@ -2143,3 +2143,6 @@ async fn primary_blackout_limits_local_data_on_a_different_neighbor() {
     primary_tx.close();
     bulk_tx.close();
 }
+
+#[path = "reliable_source_pressure_quic_tests.rs"]
+mod reliable_source_pressure_quic_tests;
