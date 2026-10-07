@@ -86,6 +86,10 @@ mod tests {
             timer_late_last_us: 0,
             timer_late_max_us: 0,
             timer_stalls: 0,
+            udp_send_wait_last_us: 0,
+            udp_send_wait_max_us: 0,
+            udp_send_stalls: 0,
+            udp_send_pending_us: 0,
         }
     }
 
