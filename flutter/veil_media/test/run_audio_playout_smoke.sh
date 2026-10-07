@@ -12,3 +12,5 @@ clang++ -std=c++20 -Wall -Wextra -Werror -Wl,-export_dynamic \
 "$STAND_DIR/smoke"
 "$STAND_DIR/smoke" --handover
 "$STAND_DIR/smoke" --asymmetric-handover
+"$STAND_DIR/smoke" --delivery-stall
+"$STAND_DIR/smoke" --delivery-loss
