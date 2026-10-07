@@ -68,6 +68,19 @@ pub const LOSSY_REALTIME_MAX_DEPTH: usize = 64;
 /// preserved on transports without a QUIC DATAGRAM lane.
 pub const LOSSY_REALTIME_MAX_AGE: Duration = Duration::from_millis(500);
 
+/// One endpoint-local primary frame keeps the same lifetime through ingress,
+/// scheduling and QUIC. Forwarded users all have INTERACTIVE and retain the
+/// common queue age; no source role or deadline is sent to a relay.
+pub const LOCAL_PRIMARY_MAX_AGE: Duration = Duration::from_millis(200);
+
+pub(crate) fn lossy_realtime_max_age(priority: u8) -> Duration {
+    if priority == REALTIME {
+        LOCAL_PRIMARY_MAX_AGE
+    } else {
+        LOSSY_REALTIME_MAX_AGE
+    }
+}
+
 struct QueuedFrame {
     frame: veil_bufpool::PooledShared,
     enqueued_at: Option<Instant>,
@@ -197,7 +210,7 @@ impl PriorityQueue {
         queued_at: Instant,
     ) {
         // Expired ingress must not evict a fresh frame from a full class.
-        if queued_at.elapsed() > LOSSY_REALTIME_MAX_AGE {
+        if queued_at.elapsed() > lossy_realtime_max_age(priority) {
             self.drops_total.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -320,7 +333,7 @@ impl PriorityQueue {
                 queued.lossy_realtime
                     && queued
                         .enqueued_at
-                        .is_some_and(|at| at.elapsed() > LOSSY_REALTIME_MAX_AGE)
+                        .is_some_and(|at| at.elapsed() > lossy_realtime_max_age(p as u8))
             }) {
                 self.queues[p].pop_front();
                 self.lossy_realtime_len[p] -= 1;
@@ -387,7 +400,7 @@ impl PriorityQueue {
                 queued.lossy_realtime
                     && queued
                         .enqueued_at
-                        .is_some_and(|at| at.elapsed() > LOSSY_REALTIME_MAX_AGE)
+                        .is_some_and(|at| at.elapsed() > LOCAL_PRIMARY_MAX_AGE)
             })
         {
             self.queues[REALTIME as usize].pop_front();
@@ -422,7 +435,7 @@ impl PriorityQueue {
     /// Restore the exact popped datagram without renewing its lifetime or
     /// losing its return carrier. No producer runs between pop and restore.
     pub(crate) fn restore_lossy_envelope(&mut self, envelope: crate::frame_outbox::FrameEnvelope) {
-        if envelope.queued_at.elapsed() > LOSSY_REALTIME_MAX_AGE {
+        if envelope.queued_at.elapsed() > lossy_realtime_max_age(envelope.frame.0) {
             self.drops_total.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -475,7 +488,7 @@ impl PriorityQueue {
                     let head = &self.queues[p][index];
                     if head
                         .enqueued_at
-                        .is_some_and(|at| at.elapsed() > LOSSY_REALTIME_MAX_AGE)
+                        .is_some_and(|at| at.elapsed() > lossy_realtime_max_age(priority))
                     {
                         self.queues[p].remove(index);
                         self.lossy_realtime_len[p] -= 1;
@@ -525,7 +538,7 @@ impl PriorityQueue {
                     queued.lossy_realtime
                         && queued
                             .enqueued_at
-                            .is_some_and(|at| at.elapsed() > LOSSY_REALTIME_MAX_AGE)
+                            .is_some_and(|at| at.elapsed() > lossy_realtime_max_age(p as u8))
                 }) {
                     self.queues[p].pop_front();
                     self.lossy_realtime_len[p] -= 1;
@@ -561,6 +574,72 @@ impl PriorityQueue {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn every_scheduler_discards_old_local_primary_and_keeps_neutral_transit() {
+        // Both sources claim the same wire priority. Only the trusted local
+        // envelope class chooses age; relays cannot infer a media role.
+        let wire = {
+            let mut header = veil_proto::header::FrameHeader::new(1, 1);
+            header.set_priority(REALTIME);
+            veil_proto::encode_header(&header).to_vec()
+        };
+        for mode in 0..4 {
+            for priority in [REALTIME, INTERACTIVE] {
+                let mut pq = PriorityQueue::with_default_weights();
+                pq.push_lossy(priority, arc(&wire));
+                pq.queues[priority as usize][0].enqueued_at =
+                    Some(Instant::now() - Duration::from_millis(250));
+                let returned = match mode {
+                    0 => pq.pop(),
+                    1 => pq.pop_datagram_envelope_if(|_| true).map(|e| e.frame.1),
+                    2 => {
+                        let local = pq
+                            .pop_local_datagram_envelope_if(|_| true)
+                            .map(|e| e.frame.1);
+                        if priority == INTERACTIVE {
+                            assert!(local.is_none(), "neutral traffic entered local bypass");
+                            pq.pop()
+                        } else {
+                            local
+                        }
+                    }
+                    _ if priority == REALTIME => pq.pop_realtime_if(|_| true),
+                    _ => pq.pop(),
+                };
+                assert_eq!(returned.is_some(), priority == INTERACTIVE, "mode={mode}");
+                assert_eq!(pq.drops_total(), u64::from(priority == REALTIME));
+                assert_eq!(pq.lossy_realtime_len, [0; 4]);
+                assert!(pq.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn stale_primary_ingress_and_restore_do_not_evict_fresh_frames() {
+        use crate::frame_outbox::FrameEnvelope;
+        for restore in [false, true] {
+            let mut pq = PriorityQueue::with_default_weights();
+            pq.push_lossy(REALTIME, arc(b"fresh"));
+            let mut stale = FrameEnvelope::from((REALTIME, arc(b"old")));
+            stale.queued_at = Instant::now() - Duration::from_millis(250);
+            if restore {
+                pq.restore_lossy_envelope(stale);
+            } else {
+                pq.push_envelope(stale, true);
+            }
+            assert_eq!(pq.len(), 1);
+            assert_eq!(pq.drops_total(), 1);
+            assert_eq!(&*pq.pop().unwrap(), b"fresh");
+            assert_eq!(pq.lossy_realtime_len, [0; 4]);
+        }
+        let mut pq = PriorityQueue::with_default_weights();
+        let mut reliable = FrameEnvelope::from((REALTIME, arc(b"reliable control")));
+        reliable.queued_at = Instant::now() - Duration::from_secs(60);
+        pq.push_envelope(reliable, false);
+        assert_eq!(&*pq.pop().unwrap(), b"reliable control");
+        assert_eq!(pq.drops_total(), 0);
+    }
+
+    #[test]
     fn datagram_restore_keeps_original_age_in_both_scheduler_rounds() {
         use crate::frame_outbox::FrameEnvelope;
         for local_round in [false, true] {
@@ -569,7 +648,7 @@ mod tests {
                     continue; // neutral transit never uses the local bypass
                 }
                 let mut pq = PriorityQueue::with_default_weights();
-                let admitted = Instant::now() - Duration::from_millis(400);
+                let admitted = Instant::now() - lossy_realtime_max_age(priority) / 2;
                 let mut envelope = FrameEnvelope::from((priority, arc(b"media")));
                 envelope.queued_at = admitted;
                 pq.push_envelope(envelope, true);

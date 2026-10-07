@@ -214,9 +214,10 @@ async fn measure(large: bool, recover: bool, congestion: QuicCongestionControl) 
             sender.handle.send_buffer_space(),
         ) {
             let expiry = super::super::local_primary_datagram_expiry(
-                REALTIME,
-                true,
-                std::time::Instant::now(),
+                &crate::frame_outbox::FrameEnvelope::from((
+                    REALTIME,
+                    veil_bufpool::pooled_shared_from_vec(frame.clone()),
+                )),
             )
             .unwrap();
             for packet in packets {
