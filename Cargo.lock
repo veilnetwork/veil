@@ -5500,6 +5500,7 @@ dependencies = [
  "veil-node-runtime",
  "veil-onion-stream",
  "veil-proto",
+ "veil-ratchet",
  "veil-session",
  "veil-types",
  "veil-util",

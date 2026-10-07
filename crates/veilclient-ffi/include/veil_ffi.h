@@ -518,12 +518,12 @@
 /**
  * Upper bound on one conversation's exported state.
  *
- * An established session is about 1.4 kB; the rest is the skipped-message-key
- * cache, at 68 bytes per key banked for a frame that has not arrived yet, and
- * the ratchet caps that. A host sizing a buffer to this never sees a short
- * write.
+ * Ordinary state is about 1.4 kB. A crossed initiation retains at most two
+ * primitive sessions, each bounded by skipped-key and tree-node limits. One
+ * MiB covers both worst-case banks and prologues; it is a buffer ceiling,
+ * not an allocation made for every conversation.
  */
-#define VEIL_RATCHET_MAX_STATE_LEN (256 * 1024)
+#define VEIL_RATCHET_MAX_STATE_LEN (1024 * 1024)
 #endif
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
@@ -1070,7 +1070,8 @@ int veil_send(VeilApp *app,
 ;
 
 /**
- * Send with a process-local queue (0..3). The lane is never a relay priority.
+ * Send with a process-local queue (0..4). Selector 4 isolates recoverable DATA.
+ * The lane is never a relay priority.
  * `anonymous_authenticated=1` retains authenticated onion-only routing; 0 is
  * the ordinary sealed delivery path. IDs must each address 32 readable bytes.
  * Invalid lanes/flags fail before touching the app or input pointers.
