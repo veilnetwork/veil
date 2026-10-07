@@ -2981,6 +2981,7 @@ version = "0.11.9"
 dependencies = [
  "bytes",
  "cfg_aliases",
+ "log",
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",

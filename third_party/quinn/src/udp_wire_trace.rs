@@ -47,7 +47,7 @@ pub(crate) fn record(stage: &'static str, bytes: &[u8], segment_size: Option<usi
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        tracing::info!(
+        log::info!(
             "quic.udp_wire.sample stage={stage} at_ms={at_ms} digest={digest:016x} bytes={}",
             datagram.len()
         );
@@ -57,6 +57,59 @@ pub(crate) fn record(stage: &'static str, bytes: &[u8], segment_size: Option<usi
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct TestLogger(std::sync::Mutex<Vec<String>>);
+    static LOGGER: TestLogger = TestLogger(std::sync::Mutex::new(Vec::new()));
+    impl log::Log for TestLogger {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            self.0.lock().unwrap().push(format!("{}", record.args()));
+        }
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn enabled_trace_reaches_embedded_log_bridge_and_disabled_trace_is_silent() {
+        log::set_logger(&LOGGER).unwrap();
+        log::set_max_level(log::LevelFilter::Info);
+        let selected = |len| {
+            (0u32..8192)
+                .map(|n| {
+                    let mut bytes = vec![0x51; len];
+                    bytes[..4].copy_from_slice(&n.to_be_bytes());
+                    bytes
+                })
+                .find(|b| fingerprint(b) & 15 == 0)
+                .unwrap()
+        };
+        let a = selected(1200);
+        let b = selected(500);
+        let batch = [a.as_slice(), b.as_slice()].concat();
+        set_udp_wire_trace(true);
+        record("send", &batch, Some(1200));
+        record("receive", &a, None);
+        set_udp_wire_trace(false);
+        record("send", &batch, Some(1200));
+        let rows = LOGGER.0.lock().unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "SDK log bridge must receive sampled datagrams"
+        );
+        assert!(rows[0].contains("stage=send"));
+        assert!(rows[2].contains("stage=receive"));
+        let digest = |s: &str| {
+            s.split_whitespace()
+                .find(|v| v.starts_with("digest="))
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(digest(&rows[0]), digest(&rows[2]));
+        assert!(rows[0].contains("bytes=1200"));
+        assert!(rows[1].contains("bytes=500"));
+    }
+
     #[test]
     fn correlation_matches_gso_segments_and_distinguishes_ciphertext() {
         let a = [0x51; 1200];
