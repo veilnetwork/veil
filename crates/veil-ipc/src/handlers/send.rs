@@ -810,6 +810,8 @@ pub(crate) async fn handle_ipc_send(
         return Ok(());
     }
 
+    crate::route_trace::sealed_local_sample("handler_enter", ctx.local_priority, body);
+
     // explicit application-payload size cap before
     // any E2E encryption / fragmentation work. Frame body is already
     // bounded by `MAX_FRAME_BODY` at the codec layer, but enforcing the
@@ -1872,6 +1874,11 @@ pub(crate) async fn handle_ipc_send(
                         fwd_frame.clone(),
                     );
                     if relay_media_sealed {
+                        if relayed {
+                            crate::route_trace::sealed_local_sample("relay_queued", ctx.local_priority, body);
+                        } else {
+                            crate::route_trace::sealed_local_sample("relay_refused", ctx.local_priority, body);
+                        }
                         crate::route_trace::observe(
                             *local_node_id,
                             send.dst_node_id,
