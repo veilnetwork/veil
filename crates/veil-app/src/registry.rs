@@ -118,6 +118,8 @@ pub enum AppMessage {
     StreamOpen {
         stream_id: u32,
         src_node_id: [u8; 32],
+        /// Identity proved by this opening session; transport replies still use src_node_id.
+        src_identity: [u8; 32],
         /// What the node KNOWS about `src_node_id` — same contract as
         /// [`Self::Deliver`]'s field of the same name (X/V-01). A stream
         /// initiator reaches the app as a raw 32 bytes exactly like a datagram
@@ -594,6 +596,30 @@ impl AppEndpointRegistry {
         provenance: SenderProvenance,
         initial_window: u32,
     ) -> bool {
+        self.route_stream_open_from_identity(
+            app_id,
+            endpoint_id,
+            stream_id,
+            src_node_id,
+            src_node_id,
+            provenance,
+            initial_window,
+        )
+    }
+
+    /// Keep a stream's physical return route separate from its proved owner.
+    /// This is local endpoint metadata, never a peer-supplied stream field.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_stream_open_from_identity(
+        &self,
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        stream_id: u32,
+        src_node_id: [u8; 32],
+        src_identity: [u8; 32],
+        provenance: SenderProvenance,
+        initial_window: u32,
+    ) -> bool {
         let key = EndpointKey {
             app_id,
             endpoint_id,
@@ -603,6 +629,7 @@ impl AppEndpointRegistry {
             AppMessage::StreamOpen {
                 stream_id,
                 src_node_id,
+                src_identity,
                 provenance,
                 initial_window,
             },

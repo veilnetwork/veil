@@ -206,6 +206,7 @@ impl IpcStreamTable {
             .try_send(AppMessage::StreamOpen {
                 stream_id,
                 src_node_id,
+                src_identity: src_node_id,
                 // `open_local`: both ends are endpoints on THIS node and the
                 // opener came in over the local IPC socket, so `src_node_id` is
                 // our own id and nothing crossed the network to claim it. The
