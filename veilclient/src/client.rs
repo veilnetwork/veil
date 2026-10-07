@@ -519,10 +519,7 @@ impl SharedWriter {
         // FrameHeader.
         let mut hdr = FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppIpcSend as u16);
         hdr.body_len = body_len as u32;
-        hdr.set_priority(local_priority.min(3));
-        if explicit {
-            hdr.flags |= veil_proto::ipc::IPC_HEADER_EXPLICIT_LOCAL_LANE;
-        }
+        veil_proto::ipc::set_ipc_local_source_lane(&mut hdr, local_priority, explicit);
         frame.extend_from_slice(&codec::encode_header(&hdr));
 
         // AppIpcSendPayload fixed fields.
@@ -3862,7 +3859,7 @@ mod tests {
                 veil_proto::ipc::ipc_local_source_lane(&legacy_header),
                 veil_proto::priority::INTERACTIVE
             );
-            for lane in [0, 2, 3] {
+            for lane in [0, 2, 3, veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE] {
                 writer
                     .write_app_ipc_send_on_local_lane_owned(
                         lane, &[1; 32], &[2; 32], &[3; 32], 13, flags, data,
