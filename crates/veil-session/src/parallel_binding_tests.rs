@@ -244,11 +244,14 @@ async fn actual_parallel_quic_has_fresh_keys_independent_queues_and_parent_lifet
         a_stream.write_all(b"live").await.unwrap();
         b_stream.read_exact(&mut main).await.unwrap();
         assert_eq!(&main, b"live");
-        // Budget follows live QUIC connections, shared across handle clones.
+        // Fill one direction first. Its full incoming pool must preserve the
+        // peer's independent outgoing capacity, with the aggregate still bounded.
         let mut others = Vec::new();
-        others.push(child_roundtrip(&b_handle, &a_handle, &b_parent, &a_parent).await);
-        for _ in 0..5 {
+        for _ in 2..veil_transport::QuicParallelHandle::CONNECTIONS_PER_DIRECTION {
             others.push(child_roundtrip(&a_handle, &b_handle, &a_parent, &b_parent).await);
+        }
+        for _ in 0..veil_transport::QuicParallelHandle::CONNECTIONS_PER_DIRECTION {
+            others.push(child_roundtrip(&b_handle, &a_handle, &b_parent, &a_parent).await);
         }
         let error = a_handle.clone().connect().await.err().unwrap();
         assert!(error.to_string().contains("budget exhausted"));

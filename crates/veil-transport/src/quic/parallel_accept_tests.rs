@@ -167,7 +167,8 @@ async fn idle_accept_has_no_handshake_deadline_and_parent_close_cancels_it() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        idle_permits, MAX_CONNECTIONS,
+        idle_permits,
+        QuicParallelHandle::CONNECTION_LIMIT,
         "idle accept reserved a child slot"
     );
     assert_eq!(&bytes, b"late");

@@ -88,9 +88,18 @@ struct Report {
     switches: u64,
     duplicates: usize,
     post_received: usize,
+    reverse_switches: u64,
+    reverse_post_received: usize,
+    reverse_first_fresh: Option<Duration>,
+    reverse_max_post_age: Duration,
 }
 
-async fn measure(large: bool, recover: bool, congestion: QuicCongestionControl) -> Report {
+async fn measure(
+    large: bool,
+    recover: bool,
+    congestion: QuicCongestionControl,
+    full_duplex: bool,
+) -> Report {
     use super::super::parallel_lanes::{ParallelQuicOffer, ParallelSession};
     let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -121,6 +130,7 @@ async fn measure(large: bool, recover: bool, congestion: QuicCongestionControl) 
     a_stream.write_all(b"main").await.unwrap();
     let remote = remote.await.unwrap().unwrap();
     let b_offer = ParallelQuicOffer::new(remote.parallel_quic().unwrap()).with_duplex();
+    let b_diagnostics = b_offer.diagnostics();
     let mut b_stream = remote.into_stream().unwrap();
     let mut prefix = [0; 4];
     b_stream.read_exact(&mut prefix).await.unwrap();
@@ -150,7 +160,41 @@ async fn measure(large: bool, recover: bool, congestion: QuicCongestionControl) 
         activity: Arc::new(crate::datagram_activity::AuthenticatedDatagramActivity::new()),
     };
     let mut a = ParallelSession::new(a_offer, &[2; 32], &[3; 32], [1; 32], context.clone(), None);
-    let b = ParallelSession::new(b_offer, &[3; 32], &[2; 32], [1; 32], context, None);
+    let mut b = ParallelSession::new(b_offer, &[3; 32], &[2; 32], [1; 32], context, None);
+    if full_duplex {
+        for session in [&mut a, &mut b] {
+            for lane in crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES {
+                timeout(Duration::from_secs(3), async {
+                    while !session.prepare(lane) {
+                        sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("full-duplex source connection budget");
+            }
+            let mut transit = HashSet::new();
+            timeout(Duration::from_secs(3), async {
+                // Opaque circuit ids exercise both neutral shards, with no
+                // role-specific treatment at the receiver or neutral link.
+                while transit.len() < 2 {
+                    for id in 1u32..64 {
+                        if let Some(index) = session.prepare_frame(
+                            INTERACTIVE,
+                            &id.to_be_bytes(),
+                            super::super::RealtimeLaneFrameKind::CircuitDatagram,
+                        ) {
+                            transit.insert(index);
+                        }
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("full-duplex neutral connection budget");
+        }
+        assert_eq!(diagnostics.active_connections(), 12);
+        assert_eq!(b_diagnostics.active_connections(), 12);
+    }
     timeout(Duration::from_secs(5), async {
         while !a.prepare(REALTIME) {
             sleep(Duration::from_millis(5)).await;
@@ -164,13 +208,14 @@ async fn measure(large: bool, recover: bool, congestion: QuicCongestionControl) 
     let blackout_start = started.elapsed() + Duration::from_secs(6);
     let blackout_end = blackout_start + Duration::from_secs(4);
     let end = blackout_end + Duration::from_secs(4);
+    let media_started = Instant::now();
     let mut last_attempt = 0;
     let mut last_switch = 0;
     let mut seq = 0u32;
     let mut changed_exporter = false;
     let mut retained_during_pending = true;
     while started.elapsed() < end {
-        sleep_until(started + Duration::from_millis(u64::from(seq) * 20)).await;
+        sleep_until(media_started + Duration::from_millis(u64::from(seq) * 20)).await;
         let now = started.elapsed();
         link.blackout.store(
             (blackout_start..blackout_end).contains(&now),
@@ -225,10 +270,35 @@ async fn measure(large: bool, recover: bool, congestion: QuicCongestionControl) 
             }
         }
         seq += 1;
+        drop(sender);
+        if full_duplex {
+            let frame = primary_test_frame(large, seq | (1 << 31), now.as_micros() as u64);
+            let (_, body, kind) = super::super::decode_realtime_lane_frame(&frame).unwrap();
+            let index = b.prepare_frame(REALTIME, body, kind).unwrap();
+            let mut sender = b.sender(index);
+            let max_size = sender.max_datagram_size;
+            let packets = sender.tx.encode_frame(0, &frame, max_size).unwrap();
+            if super::super::local_primary_datagram_fits(
+                packets.iter().map(Vec::len).sum(),
+                sender.handle.send_buffer_space(),
+            ) {
+                let expiry = super::super::local_primary_datagram_expiry(
+                    &crate::frame_outbox::FrameEnvelope::from((
+                        REALTIME,
+                        veil_bufpool::pooled_shared_from_vec(frame),
+                    )),
+                )
+                .unwrap();
+                for packet in packets {
+                    sender.handle.send_before(&packet, expiry).unwrap();
+                }
+            }
+        }
     }
     sleep(Duration::from_millis(100)).await;
     let attempts = diagnostics.recovery_attempts();
     let switches = diagnostics.recovery_switches();
+    let reverse_switches = b_diagnostics.recovery_switches();
     // Teardown first, including held old connection handles and candidate tasks.
     drop((a, b));
     close.close(0u32.into(), b"primary recovery stand complete");
@@ -238,6 +308,9 @@ async fn measure(large: bool, recover: bool, congestion: QuicCongestionControl) 
     let mut seen = HashSet::new();
     let mut duplicates = 0;
     let mut post = 0;
+    let mut reverse_post_received = 0;
+    let mut reverse_first_fresh = None;
+    let mut reverse_max_post_age = Duration::ZERO;
     let mut first_fresh = None;
     let mut max_age = Duration::ZERO;
     while let Ok((s, sent, arrived)) = rx.try_recv() {
@@ -245,6 +318,15 @@ async fn measure(large: bool, recover: bool, congestion: QuicCongestionControl) 
             duplicates += 1;
         }
         if arrived >= blackout_end {
+            if s & (1 << 31) != 0 {
+                reverse_post_received += 1;
+                reverse_max_post_age =
+                    reverse_max_post_age.max(arrived.saturating_sub(Duration::from_micros(sent)));
+                if Duration::from_micros(sent) >= blackout_end && reverse_first_fresh.is_none() {
+                    reverse_first_fresh = Some(arrived - blackout_end);
+                }
+                continue;
+            }
             post += 1;
             max_age = max_age.max(arrived.saturating_sub(Duration::from_micros(sent)));
             if Duration::from_micros(sent) >= blackout_end && first_fresh.is_none() {
@@ -264,9 +346,44 @@ async fn measure(large: bool, recover: bool, congestion: QuicCongestionControl) 
         switches,
         duplicates,
         post_received: post,
+        reverse_switches,
+        reverse_post_received,
+        reverse_first_fresh,
+        reverse_max_post_age,
     };
     eprintln!("production primary recovery {report:?}");
     report
+}
+
+#[tokio::test]
+async fn full_duplex_sources_and_neutral_shards_leave_room_for_primary_recovery() {
+    timeout(Duration::from_secs(25), async {
+        let report = measure(false, true, QuicCongestionControl::Cubic, true).await;
+        assert!(
+            report.switches > 0 && report.reverse_switches > 0,
+            "{report:?}"
+        );
+        assert!(
+            report.first_fresh.unwrap() < Duration::from_millis(600),
+            "{report:?}"
+        );
+        assert!(
+            report.max_post_age < Duration::from_millis(400),
+            "{report:?}"
+        );
+        assert!(
+            report.reverse_first_fresh.unwrap() < Duration::from_millis(600)
+                && report.reverse_max_post_age < Duration::from_millis(400),
+            "reverse audio recovery must be equally prompt: {report:?}"
+        );
+        assert_eq!(report.duplicates, 0);
+        assert!(
+            report.post_received >= 140 && report.reverse_post_received >= 140,
+            "{report:?}"
+        );
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -275,8 +392,8 @@ async fn authenticated_primary_replacement_recovers_after_four_second_neutral_ou
         // Keep the historical stall reproducible independently of the
         // production congestion controller. All existing recovery gates
         // still apply to the authenticated replacement path.
-        let old = measure(large, false, QuicCongestionControl::Cubic).await;
-        let repaired = measure(large, true, QuicCongestionControl::Cubic).await;
+        let old = measure(large, false, QuicCongestionControl::Cubic, false).await;
+        let repaired = measure(large, true, QuicCongestionControl::Cubic, false).await;
         assert!(
             old.first_fresh.unwrap() > Duration::from_millis(600),
             "baseline must reproduce excess recovery delay: {old:?}"
@@ -302,7 +419,7 @@ async fn authenticated_primary_replacement_recovers_after_four_second_neutral_ou
 async fn bbr_recovers_fresh_datagrams_after_neutral_outage() {
     for large in [false, true] {
         for recover in [false, true] {
-            let report = measure(large, recover, QuicCongestionControl::Bbr).await;
+            let report = measure(large, recover, QuicCongestionControl::Bbr, false).await;
             assert!(
                 report.first_fresh.unwrap() < Duration::from_millis(600),
                 "{report:?}"
