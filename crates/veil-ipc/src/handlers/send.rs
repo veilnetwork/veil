@@ -51,10 +51,15 @@ use source_envelope::{DirectAdmission, EnvelopeChunks, admit_direct_plain, admit
 /// has the live-session relays to fall back on.
 const ROUTE_MISS_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// `(this node, destination) → when discovery last found nothing`. Keyed by
-/// the local node too, because several nodes share one process in tests and a
-/// miss is a fact about the asking node's view of the network.
-type RouteMisses = std::collections::HashMap<([u8; 32], [u8; 32]), std::time::Instant>;
+// Keep relay-only misses independent of ordinary/direct discovery. A usable
+// direct route is neither a successful relay lookup nor a relay miss.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum RouteDiscoveryKind {
+    Any,
+    RelayOnly,
+}
+type RouteMisses =
+    std::collections::HashMap<([u8; 32], [u8; 32], RouteDiscoveryKind), std::time::Instant>;
 static ROUTE_MISSES: std::sync::LazyLock<std::sync::Mutex<RouteMisses>> =
     std::sync::LazyLock::new(Default::default);
 
@@ -80,7 +85,15 @@ fn warm_media_route(ctx: &IpcSendContext, dst: [u8; 32]) {
     ) else {
         return;
     };
-    if rlock!(cache).lookup(&dst).is_some() || route_recently_missed(&ctx.local_node_id, &dst) {
+    if cached_discovery_hop(
+        &rlock!(cache),
+        &dst,
+        Some(reg.as_ref()),
+        RouteDiscoveryKind::RelayOnly,
+    )
+    .is_some()
+        || route_recently_missed(&ctx.local_node_id, &dst, RouteDiscoveryKind::RelayOnly)
+    {
         return;
     }
     let key = (ctx.local_node_id, dst);
@@ -97,7 +110,7 @@ fn warm_media_route(ctx: &IpcSendContext, dst: [u8; 32]) {
     let pending = ctx.pending_recursive.clone();
     tokio::spawn(async move {
         let _probe = probe;
-        let _ = try_lookup_or_discover(
+        let _ = discover_route(
             &dst,
             &key.0,
             Some(&cache),
@@ -105,25 +118,42 @@ fn warm_media_route(ctx: &IpcSendContext, dst: [u8; 32]) {
             Some(&notify),
             None, // the call cipher already sealed the packet
             pending.as_deref(),
+            RouteDiscoveryKind::RelayOnly,
         )
         .await;
     });
 }
 
-fn route_recently_missed(local: &[u8; 32], dst: &[u8; 32]) -> bool {
+fn route_recently_missed(local: &[u8; 32], dst: &[u8; 32], kind: RouteDiscoveryKind) -> bool {
     ROUTE_MISSES
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .get(&(*local, *dst))
+        .get(&(*local, *dst, kind))
         .is_some_and(|at| at.elapsed() < ROUTE_MISS_TTL)
 }
 
-fn note_route_miss(local: &[u8; 32], dst: &[u8; 32]) {
+fn note_route_miss(local: &[u8; 32], dst: &[u8; 32], kind: RouteDiscoveryKind) {
     let mut misses = ROUTE_MISSES.lock().unwrap_or_else(|p| p.into_inner());
     if misses.len() >= 4_096 {
         misses.retain(|_, at| at.elapsed() < ROUTE_MISS_TTL);
     }
-    misses.insert((*local, *dst), std::time::Instant::now());
+    misses.insert((*local, *dst, kind), std::time::Instant::now());
+}
+
+fn cached_discovery_hop(
+    cache: &veil_routing::RouteCache,
+    dst: &[u8; 32],
+    reg: Option<&dyn FrameBroadcaster>,
+    kind: RouteDiscoveryKind,
+) -> Option<[u8; 32]> {
+    if kind == RouteDiscoveryKind::Any {
+        return cache.lookup(dst);
+    }
+    let active = reg?.active_node_ids();
+    cache
+        .lookup_all(dst)
+        .into_iter()
+        .find(|hop| hop != dst && active.contains(hop))
 }
 
 async fn try_lookup_or_discover(
@@ -136,6 +166,32 @@ async fn try_lookup_or_discover(
     pending_recursive: Option<
         &Mutex<std::collections::HashMap<[u8; 16], veil_dispatcher_state::PendingRecursive>>,
     >,
+) -> Option<[u8; 32]> {
+    discover_route(
+        dst,
+        local_node_id,
+        route_cache,
+        session_tx_registry,
+        route_updated,
+        peer_mlkem_keys,
+        pending_recursive,
+        RouteDiscoveryKind::Any,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn discover_route(
+    dst: &[u8; 32],
+    local_node_id: &[u8; 32],
+    route_cache: Option<&RwLock<veil_routing::RouteCache>>,
+    session_tx_registry: Option<&dyn FrameBroadcaster>,
+    route_updated: Option<&tokio::sync::Notify>,
+    peer_mlkem_keys: Option<&std::sync::RwLock<veil_e2e::PeerMlKemCache>>,
+    pending_recursive: Option<
+        &Mutex<std::collections::HashMap<[u8; 16], veil_dispatcher_state::PendingRecursive>>,
+    >,
+    kind: RouteDiscoveryKind,
 ) -> Option<[u8; 32]> {
     use veil_proto::{
         codec::encode_header,
@@ -162,15 +218,17 @@ async fn try_lookup_or_discover(
         .unwrap_or(true); // if no E2E infrastructure, route alone is sufficient
     if mlkem_ready
         && let Some(cache) = route_cache
-        && let Some(hop) = rlock!(cache).lookup(dst)
+        && let Some(hop) = cached_discovery_hop(&rlock!(cache), dst, session_tx_registry, kind)
     {
         return Some(hop);
     }
 
     // A discovery that just found nothing is not repeated: the cache is what
     // it would have filled, and it has been asked above.
-    if route_recently_missed(local_node_id, dst) {
-        return route_cache.and_then(|cache| rlock!(cache).lookup(dst));
+    if route_recently_missed(local_node_id, dst, kind) {
+        return route_cache.and_then(|cache| {
+            cached_discovery_hop(&rlock!(cache), dst, session_tx_registry, kind)
+        });
     }
 
     // No route cached — try reactive discovery if we have the infrastructure.
@@ -246,6 +304,11 @@ async fn try_lookup_or_discover(
         // fragmented topology it frequently forwarded *away* from `dst`
         // wasting a whole discovery round on the unlucky direction.
         let mut peers = reg.active_node_ids();
+        if kind == RouteDiscoveryKind::RelayOnly {
+            // A direct reply would only refresh the direct route that cannot
+            // carry this relay-only send. Discover through ordinary mesh peers.
+            peers.retain(|peer| peer != dst);
+        }
         peers.sort_by_key(|pid| {
             let mut xor = [0u8; 32];
             for i in 0..32 {
@@ -277,7 +340,7 @@ async fn try_lookup_or_discover(
     }
 
     // Retry the cache lookup.
-    let result = rlock!(cache).lookup(dst);
+    let result = cached_discovery_hop(&rlock!(cache), dst, session_tx_registry, kind);
     let elapsed = discovery_start.elapsed();
     if result.is_some() {
         log::debug!(
@@ -286,7 +349,7 @@ async fn try_lookup_or_discover(
             elapsed.as_millis()
         );
     } else {
-        note_route_miss(local_node_id, dst);
+        note_route_miss(local_node_id, dst, kind);
         log::warn!(
             "route.discovery.miss dst={} elapsed_ms={}",
             veil_util::bytes_to_hex(&dst[..4]),
@@ -2100,7 +2163,11 @@ pub(crate) async fn handle_rt_send(
     // identity, and the session is registered under a device of it.
     let sent = reg.send_to_peer_or_identity(&send.dst_node_id, local_priority.min(3), frame);
     crate::route_trace::sealed_rt_local_sample(
-        if sent { "direct_queued" } else { "direct_refused" },
+        if sent {
+            "direct_queued"
+        } else {
+            "direct_refused"
+        },
         local_priority,
         body,
     );
@@ -2361,6 +2428,7 @@ mod relay_hop_tests {
 mod ratchet_send_tests {
     use super::*;
     use std::sync::Arc;
+    use std::time::Duration;
     use veil_proto::AppIpcSendPayload;
 
     const ME: [u8; 32] = [0xA0u8; 32];
@@ -4447,6 +4515,94 @@ mod ratchet_send_tests {
         );
     }
 
+    #[tokio::test]
+    async fn relay_warming_discovers_through_mesh_despite_a_cached_direct_route() {
+        const LOCAL: [u8; 32] = [0x61; 32];
+        const DST: [u8; 32] = [0x62; 32];
+        const NEAR: [u8; 32] = [0x63; 32];
+        const FAR: [u8; 32] = [0x70; 32];
+        const DEAD: [u8; 32] = [0x80; 32];
+        let fx = fixture(vec![DST, FAR, NEAR]);
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let mut ctx = fx.ctx(false);
+        ctx.local_node_id = LOCAL;
+        ctx.route_updated = Some(Arc::clone(&notify));
+        wlock!(fx.route_cache).insert(DST, DST, 1, 1);
+        wlock!(fx.route_cache).insert(DST, DEAD, 2, 2);
+        // The ordinary path may still use the direct session. Do not delete
+        // that route merely to discover an independent fallback.
+        assert_eq!(
+            try_lookup_or_discover(
+                &DST,
+                &LOCAL,
+                Some(&fx.route_cache),
+                Some(fx.outbox.as_ref()),
+                Some(&notify),
+                None,
+                None,
+            )
+            .await,
+            Some(DST),
+        );
+        assert!(fx.taken().is_empty());
+        let started = std::time::Instant::now();
+        warm_media_route(&ctx, DST);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        tokio::task::yield_now().await;
+        let sent = fx.taken();
+        assert_eq!(
+            sent.len(),
+            2,
+            "direct-only/dead cached routes must not suppress discovery"
+        );
+        assert_eq!(
+            sent.iter().map(|(peer, _)| *peer).collect::<Vec<_>>(),
+            vec![NEAR, FAR]
+        );
+        for (_, frame) in sent {
+            let header = codec::decode_header(&frame).expect("routing header");
+            assert_eq!(
+                header.family,
+                veil_proto::family::FrameFamily::Routing as u8
+            );
+            assert_eq!(
+                header.msg_type,
+                veil_proto::family::RoutingMsg::RecursiveQuery as u16
+            );
+            let query = veil_proto::routing::RecursiveQueryPayload::decode(
+                &frame[veil_proto::header::HEADER_SIZE..],
+            )
+            .expect("ordinary recursive query");
+            assert_eq!(query.target_key, DST);
+        }
+        warm_media_route(&ctx, DST);
+        tokio::task::yield_now().await;
+        assert!(
+            fx.taken().is_empty(),
+            "one probe per destination while in flight"
+        );
+        wlock!(fx.route_cache).insert(DST, NEAR, 3, 2);
+        notify.notify_waiters();
+        tokio::task::yield_now().await;
+        assert!(!lock!(MEDIA_ROUTE_PROBES).contains(&(LOCAL, DST)));
+        assert_eq!(rlock!(fx.route_cache).lookup(&DST), Some(DST));
+        assert_eq!(
+            cached_discovery_hop(
+                &rlock!(fx.route_cache),
+                &DST,
+                Some(fx.outbox.as_ref()),
+                RouteDiscoveryKind::RelayOnly
+            ),
+            Some(NEAR),
+        );
+        warm_media_route(&ctx, DST);
+        tokio::task::yield_now().await;
+        assert!(
+            fx.taken().is_empty(),
+            "a live cached relay needs no new discovery"
+        );
+    }
+
     /// A discovery that found no route is not repeated at once: the next send
     /// to the same unreachable destination neither waits the half second nor
     /// sends another query.
@@ -4486,10 +4642,14 @@ mod ratchet_send_tests {
     #[test]
     fn a_remembered_route_miss_lapses() {
         let (local, dst) = ([0x5Au8; 32], [0x5Bu8; 32]);
-        note_route_miss(&local, &dst);
-        assert!(route_recently_missed(&local, &dst));
+        note_route_miss(&local, &dst, RouteDiscoveryKind::Any);
+        assert!(route_recently_missed(&local, &dst, RouteDiscoveryKind::Any));
         assert!(
-            !route_recently_missed(&[0x5Cu8; 32], &dst),
+            !route_recently_missed(&local, &dst, RouteDiscoveryKind::RelayOnly),
+            "a direct-route miss must not suppress an independent relay discovery",
+        );
+        assert!(
+            !route_recently_missed(&[0x5Cu8; 32], &dst, RouteDiscoveryKind::Any),
             "per asking node"
         );
         let long_ago = std::time::Instant::now()
@@ -4498,9 +4658,9 @@ mod ratchet_send_tests {
         ROUTE_MISSES
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert((local, dst), long_ago);
+            .insert((local, dst, RouteDiscoveryKind::Any), long_ago);
         assert!(
-            !route_recently_missed(&local, &dst),
+            !route_recently_missed(&local, &dst, RouteDiscoveryKind::Any),
             "past the window it is not believed"
         );
     }
