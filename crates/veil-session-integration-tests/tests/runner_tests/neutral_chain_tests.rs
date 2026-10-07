@@ -155,6 +155,7 @@ async fn chain(rotate: bool) {
                 })
             };
             runner.quic_datagrams = Some(RealtimeLaneOffer {
+                peer_datagrams: true,
                 handle: datagrams,
                 peer_rotates: true,
                 peer_flows: true,

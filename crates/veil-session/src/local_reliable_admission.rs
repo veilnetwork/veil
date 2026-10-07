@@ -71,7 +71,11 @@ impl LocalReliableAdmission {
 
     /// Called only for the local primary's authenticated independent sender.
     /// Feedback remains local: relays receive no role, deadline or priority hint.
-    pub(super) fn observe_primary_path(&mut self, handle: &QuicDatagramHandle, now: Instant) {
+    pub(super) fn observe_primary_path(
+        &mut self,
+        handle: &QuicDatagramHandle,
+        now: Instant,
+    ) -> bool {
         let stats = handle.path_stats();
         // RTT remains the last successful sample while ACKs stop arriving.
         // Pause competing local producers before queued primary cells expire.
@@ -83,10 +87,25 @@ impl LocalReliableAdmission {
             stats.expired_outgoing_datagrams,
             ack_blocked,
             now,
-        );
+        )
     }
 
-    fn observe_pressure(&mut self, rtt_us: u64, expired: u64, ack_blocked: bool, now: Instant) {
+    /// The caller checked the trusted local slot and complete primary frame.
+    /// Publish ordered-path feedback without shrinking the shared parent
+    /// window: the primary itself needs that window to carry its stream bytes.
+    pub(super) fn observe_ordered_primary(&mut self, now: Instant) -> bool {
+        self.restore();
+        self.source_activity.note(now);
+        self.observe_primary_path(&self.writes.handle.clone(), now)
+    }
+
+    fn observe_pressure(
+        &mut self,
+        rtt_us: u64,
+        expired: u64,
+        ack_blocked: bool,
+        now: Instant,
+    ) -> bool {
         // Pressure limits bulk admission and competing local lossy production.
         // The writer grants a separate bounded budget only while actually
         // writing locally authored control; bulk and transit never acquire it.
@@ -100,6 +119,7 @@ impl LocalReliableAdmission {
         }
         // A retired child can be replaced by a fresh connection with zero counters.
         self.last_expired = expired;
+        ack_blocked || delayed
     }
 
     fn pressured(&self, now: Instant) -> bool {

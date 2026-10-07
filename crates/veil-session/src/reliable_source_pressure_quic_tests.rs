@@ -4,6 +4,7 @@
 use super::super::{CryptoState, HotStandbyState, MobileConfig, RekeyConfig, SessionRunner};
 use super::*;
 use std::sync::{Mutex, RwLock, Weak};
+use veil_crypto::session_cipher::SessionCipher;
 use veil_proto::{
     family::{AppMsg, FrameFamily},
     header::FrameHeader,
@@ -57,8 +58,9 @@ impl crate::dispatcher_sink::DispatcherSink for Capture {
     }
 }
 
-async fn pair() -> (
+async fn pair_full() -> (
     NeutralLink,
+    QuicDatagramHandle,
     QuicDatagramHandle,
     veil_transport::BoxIoStream,
     veil_transport::BoxIoStream,
@@ -85,7 +87,9 @@ async fn pair() -> (
     let handle = local.quic_datagrams().unwrap();
     let mut tx = local.into_stream().unwrap();
     tx.write_all(b"warm").await.unwrap();
-    let mut rx = remote.await.unwrap().unwrap().into_stream().unwrap();
+    let remote = remote.await.unwrap().unwrap();
+    let remote_handle = remote.quic_datagrams().unwrap();
+    let mut rx = remote.into_stream().unwrap();
     let mut warm = [0; 4];
     rx.read_exact(&mut warm).await.unwrap();
     assert_eq!(&warm, b"warm");
@@ -96,6 +100,16 @@ async fn pair() -> (
     })
     .await
     .unwrap();
+    (link, handle, remote_handle, tx, rx)
+}
+
+async fn pair() -> (
+    NeutralLink,
+    QuicDatagramHandle,
+    veil_transport::BoxIoStream,
+    veil_transport::BoxIoStream,
+) {
+    let (link, handle, _remote, tx, rx) = pair_full().await;
     (link, handle, tx, rx)
 }
 
@@ -109,46 +123,16 @@ fn frame(msg: AppMsg, body: &[u8]) -> veil_bufpool::PooledShared {
     veil_bufpool::pooled_shared_from_vec(wire)
 }
 
-#[tokio::test]
-async fn pressured_ordered_file_keeps_bytes_and_wakes_without_input() {
-    use super::super::local_reliable_admission::LocalReliableAdmission;
-    use veil_crypto::session_cipher::SessionCipher;
-    use veil_proto::app::{AppClosePayload, AppDataPayload, AppOpenPayload};
-    let (primary_link, primary, _primary_stream, _primary_peer) = pair().await;
-    let (_file_link, file_handle, file_stream, mut peer) = pair().await;
-    let mut node = crate::SessionTxRegistry::new();
-    let primary_outbox = node.register([0xA1; 32]);
-    let file_outbox = node.register([0xB1; 32]);
-    let sender = node.get_sender(&[0xB1; 32]).unwrap().clone();
-    let mut admission = LocalReliableAdmission::for_source(
-        primary.clone(),
-        primary_outbox.shared_source_activity(),
-    );
-    admission.observe(
-        REALTIME,
-        &circuit_frame(1, 0x11),
-        std::time::Instant::now(),
-        true,
-    );
-    primary_link.blackout.store(true, Ordering::Relaxed);
-    primary.send(&[0x11; 200]).unwrap();
-    timeout(Duration::from_secs(2), async {
-        while primary.path_stats().pto_count == 0 {
-            sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let pressured = std::time::Instant::now();
-    admission.observe_primary_path(&primary, pressured);
-    admission.observe(REALTIME, &circuit_frame(1, 0x11), pressured, true);
-    assert!(primary.path_stats().rtt_us < 150_000);
-    assert_eq!(primary.path_stats().expired_outgoing_datagrams, 0);
+fn make_runner(
+    file_stream: veil_transport::BoxIoStream,
+    outbox: crate::FrameOutbox,
+    offer: Option<super::super::RealtimeLaneOffer>,
+) -> SessionRunner {
     let logger = Arc::new(veil_observability::NodeLogger::new_noop());
     let key = [0x51; 32];
-    let mut runner = SessionRunner {
+    SessionRunner {
         stream: file_stream,
-        quic_datagrams: None,
+        quic_datagrams: offer,
         peer_id: [0xB1; 32],
         dispatcher: Arc::new(Capture {
             logger: Arc::clone(&logger),
@@ -170,7 +154,7 @@ async fn pressured_ordered_file_keeps_bytes_and_wakes_without_input() {
             peer_mlkem_keys: None,
             per_session_mlkem_dk: None,
         },
-        outbox: Some(file_outbox),
+        outbox: Some(outbox),
         rpc_outbox: None,
         keepalive_interval: Duration::ZERO,
         idle_timeout: Duration::ZERO,
@@ -205,7 +189,45 @@ async fn pressured_ordered_file_keeps_bytes_and_wakes_without_input() {
             auto_trigger_after_write_errors: 0,
         },
         primary_uri: None,
-    };
+    }
+}
+
+#[tokio::test]
+async fn pressured_ordered_file_keeps_bytes_and_wakes_without_input() {
+    use super::super::local_reliable_admission::LocalReliableAdmission;
+    use veil_proto::app::{AppClosePayload, AppDataPayload, AppOpenPayload};
+    let (primary_link, primary, _primary_stream, _primary_peer) = pair().await;
+    let (_file_link, file_handle, file_stream, mut peer) = pair().await;
+    let mut node = crate::SessionTxRegistry::new();
+    let primary_outbox = node.register([0xA1; 32]);
+    let file_outbox = node.register([0xB1; 32]);
+    let sender = node.get_sender(&[0xB1; 32]).unwrap().clone();
+    let mut admission = LocalReliableAdmission::for_source(
+        primary.clone(),
+        primary_outbox.shared_source_activity(),
+    );
+    admission.observe(
+        REALTIME,
+        &circuit_frame(1, 0x11),
+        std::time::Instant::now(),
+        true,
+    );
+    primary_link.blackout.store(true, Ordering::Relaxed);
+    primary.send(&[0x11; 200]).unwrap();
+    timeout(Duration::from_secs(2), async {
+        while primary.path_stats().pto_count == 0 {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pressured = std::time::Instant::now();
+    admission.observe_primary_path(&primary, pressured);
+    admission.observe(REALTIME, &circuit_frame(1, 0x11), pressured, true);
+    assert!(primary.path_stats().rtt_us < 150_000);
+    assert_eq!(primary.path_stats().expired_outgoing_datagrams, 0);
+    let key = [0x51; 32];
+    let mut runner = make_runner(file_stream, file_outbox, None);
     let app_id = [0x42; 32];
     assert!(
         sender
@@ -328,4 +350,255 @@ async fn pressured_ordered_file_keeps_bytes_and_wakes_without_input() {
     file_handle.close();
     primary.close();
     timeout(Duration::from_secs(2), job).await.unwrap().unwrap();
+}
+
+#[derive(Clone, Copy)]
+enum OrderedPrimary {
+    NoDatagrams,
+    NeutralForward,
+    LegacyCircuit,
+}
+
+fn primary_frame(mode: OrderedPrimary) -> veil_bufpool::PooledShared {
+    if matches!(mode, OrderedPrimary::LegacyCircuit) {
+        return veil_bufpool::pooled_shared_from_vec(circuit_frame(1, 0x71));
+    }
+    use veil_proto::{
+        delivery::{DeliveryEnvelope, ForwardPayload},
+        family::DeliveryMsg,
+    };
+    let body = ForwardPayload {
+        next_hop_node_id: [0xD1; 32],
+        envelope: DeliveryEnvelope {
+            recipient: veil_proto::recipient::Recipient::any([0xC1; 32]),
+            sender_node_id: [0xA0; 32],
+            src_app_id: [0x42; 32],
+            app_id: [0x42; 32],
+            endpoint_id: 9,
+            content_id: [0x43; 32],
+            created_at: veil_util::unix_secs_now_u64(),
+            ttl_secs: veil_proto::delivery::FORWARD_REALTIME_TTL_SECS,
+            payload: vec![0x71; 256],
+            trace_id: 0,
+            require_ack: false,
+        },
+        relay_hops: 0,
+        delivery_attempt: None,
+        traffic_class: Some(INTERACTIVE),
+    }
+    .encode();
+    let mut h = FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+    h.set_priority(INTERACTIVE);
+    h.body_len = body.len() as u32;
+    let mut bytes = veil_proto::codec::encode_header(&h).to_vec();
+    bytes.extend_from_slice(&body);
+    veil_bufpool::pooled_shared_from_vec(bytes)
+}
+
+async fn verify_ordered_primary_feedback(mode: OrderedPrimary) {
+    use super::super::RealtimeLaneOffer;
+    use veil_proto::app::AppDataPayload;
+    let (link, handle, remote_handle, stream, mut peer) = pair_full().await;
+    let (_file_link, file_handle, file_stream, mut file_peer) = pair().await;
+    let mut node = crate::SessionTxRegistry::new();
+    let primary_outbox = node.register([0xB1; 32]);
+    let source = primary_outbox.shared_source_activity();
+    let sender = node.get_sender(&[0xB1; 32]).unwrap().clone();
+    let file_outbox = node.register([0xB2; 32]);
+    let file_sender = node.get_sender(&[0xB2; 32]).unwrap().clone();
+    let offer = RealtimeLaneOffer {
+        peer_datagrams: !matches!(mode, OrderedPrimary::NoDatagrams),
+        handle: handle.clone(),
+        peer_rotates: false,
+        peer_flows: false,
+        peer_circuit_datagrams: false,
+        peer_neutral_forwards: false,
+        parallel: None,
+    };
+    let mut runner = make_runner(stream, primary_outbox, Some(offer));
+    runner.raw_session_keys = Some(([0x51; 32], [0x52; 32], [0; 32]));
+    let job = tokio::spawn(async move {
+        runner.run().await;
+    });
+    let bytes = primary_frame(mode);
+    assert!(super::super::decode_realtime_lane_frame(&bytes).is_some());
+    // A transit packet claiming REALTIME on wire cannot publish source policy.
+    let mut claimed = bytes.to_vec();
+    let mut claimed_header = veil_proto::codec::decode_header(&claimed).unwrap();
+    claimed_header.set_priority(REALTIME);
+    claimed[..veil_proto::header::HEADER_SIZE]
+        .copy_from_slice(&veil_proto::codec::encode_header(&claimed_header));
+    sender
+        .send((INTERACTIVE, veil_bufpool::pooled_shared_from_vec(claimed)))
+        .await
+        .unwrap();
+    let mut primary_reader = super::super::ordered_reader::Reader::default();
+    let mut primary_cipher = SessionCipher::new(&[0x51; 32], true);
+    timeout(Duration::from_secs(1), async {
+        let wire = primary_reader.read(&mut peer, 65536).await.unwrap();
+        primary_cipher
+            .open(&wire.body, &veil_proto::codec::frame_aad(&wire.header))
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    assert!(!source.active(std::time::Instant::now()));
+    timeout(Duration::from_secs(1), async {
+        while handle.path_stats().in_flight_bytes != 0 {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    link.blackout.store(true, Ordering::Relaxed);
+    let stop = Arc::new(AtomicBool::new(false));
+    let producer_stop = Arc::clone(&stop);
+    let producer = tokio::spawn(async move {
+        for _ in 0..100 {
+            if producer_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            sender.send((REALTIME, bytes.clone())).await.unwrap();
+            sleep(Duration::from_millis(20)).await;
+        }
+    });
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if handle.path_stats().pto_count > 0
+                && !source.allow_secondary(std::time::Instant::now())
+            {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("ordered primary path never published pressure to another neighbor");
+    let stats = handle.path_stats();
+    assert!(
+        stats.rtt_us < 150_000,
+        "no delayed RTT is needed to detect the ACK blackout"
+    );
+    assert_eq!(stats.expired_outgoing_datagrams, 0);
+    assert!(
+        stats.in_flight_bytes > 2048,
+        "ordered primary cannot inherit a 1-KiB reliable window"
+    );
+    assert!(
+        timeout(Duration::from_millis(30), remote_handle.recv())
+            .await
+            .is_err(),
+        "no datagrams may be sent to this compatibility peer"
+    );
+    stop.store(true, Ordering::Relaxed);
+    producer.await.unwrap();
+    link.blackout.store(false, Ordering::Relaxed);
+    // Read and decrypt the actual fallback framing, including the old circuit
+    // discriminant; the peer does not need a datagram decoder or a new role.
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let wire = primary_reader.read(&mut peer, 65536).await.unwrap();
+            primary_cipher
+                .open(&wire.body, &veil_proto::codec::frame_aad(&wire.header))
+                .unwrap();
+            if wire.header.family == FrameFamily::Session as u8 {
+                continue;
+            }
+            assert_eq!(wire.header.priority(), INTERACTIVE);
+            if matches!(mode, OrderedPrimary::LegacyCircuit) {
+                assert_eq!(
+                    wire.header.msg_type,
+                    veil_proto::family::RelayChainMsg::CircuitData as u16
+                );
+            } else {
+                assert_eq!(
+                    wire.header.msg_type,
+                    veil_proto::family::DeliveryMsg::Forward as u16
+                );
+            }
+            break;
+        }
+    })
+    .await
+    .unwrap();
+    // Retiring this publisher must leave the other session's pressure grace.
+    handle.close();
+    timeout(Duration::from_secs(2), job).await.unwrap().unwrap();
+    let expected: Vec<u8> = (0..3 * 3900).map(|n| (n % 251) as u8).collect();
+    for data in expected.chunks(3900) {
+        assert!(
+            file_sender
+                .send_reliable(frame(
+                    AppMsg::AppData,
+                    &AppDataPayload {
+                        app_id: [0x42; 32],
+                        endpoint_id: 9,
+                        seq: 0,
+                        data: data.to_vec()
+                    }
+                    .encode()
+                ))
+                .await
+        );
+    }
+    file_sender
+        .send((INTERACTIVE, frame(AppMsg::AppSend, b"neutral")))
+        .await
+        .unwrap();
+    let mut file_runner = make_runner(file_stream, file_outbox, None);
+    let file_job = tokio::spawn(async move {
+        file_runner.run().await;
+    });
+    let began = std::time::Instant::now();
+    let mut output = Vec::new();
+    let mut neutral = false;
+    let mut reader = super::super::ordered_reader::Reader::default();
+    let mut cipher = SessionCipher::new(&[0x51; 32], true);
+    timeout(Duration::from_secs(2), async {
+        while output.len() < expected.len() {
+            let wire = reader.read(&mut file_peer, 65536).await.unwrap();
+            let body = cipher
+                .open(&wire.body, &veil_proto::codec::frame_aad(&wire.header))
+                .unwrap();
+            if wire.header.family == FrameFamily::Session as u8 {
+                continue;
+            }
+            if wire.header.msg_type == AppMsg::AppSend as u16 {
+                assert_eq!(body, b"neutral");
+                assert!(output.len() < expected.len());
+                neutral = true;
+            } else {
+                assert_eq!(wire.header.msg_type, AppMsg::AppData as u16);
+                let p = AppDataPayload::decode(&body).unwrap();
+                assert_eq!(p.seq, 0);
+                output.extend(p.data);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(neutral);
+    assert_eq!(output, expected);
+    assert!(
+        began.elapsed() >= Duration::from_millis(350),
+        "other neighbor's ordered file bypassed primary pressure"
+    );
+    file_handle.close();
+    timeout(Duration::from_secs(2), file_job)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn ordered_primary_feedback_survives_peer_without_datagram_decoder() {
+    verify_ordered_primary_feedback(OrderedPrimary::NoDatagrams).await;
+}
+#[tokio::test]
+async fn ordered_primary_feedback_survives_peer_without_neutral_forward_datagrams() {
+    verify_ordered_primary_feedback(OrderedPrimary::NeutralForward).await;
+}
+#[tokio::test]
+async fn ordered_primary_feedback_survives_legacy_circuit_carrier() {
+    verify_ordered_primary_feedback(OrderedPrimary::LegacyCircuit).await;
 }
