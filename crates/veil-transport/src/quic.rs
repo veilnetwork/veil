@@ -86,6 +86,7 @@ pub struct QuicDatagramPathStats {
     pub udp_received: u64,
     pub acknowledgments_received: u64,
     pub expired_outgoing_datagrams: u64,
+    pub residual_window_transmits: u64,
 }
 
 impl QuicDatagramHandle {
@@ -103,6 +104,7 @@ impl QuicDatagramHandle {
             udp_received: stats.udp_rx.datagrams,
             acknowledgments_received: stats.frame_rx.acks,
             expired_outgoing_datagrams: self.connection.expired_outgoing_datagrams(),
+            residual_window_transmits: stats.path.residual_window_transmits,
         }
     }
     /// TLS exporter for authenticating a new, independent transport against
