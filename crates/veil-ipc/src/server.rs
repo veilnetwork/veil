@@ -2867,6 +2867,9 @@ async fn handle_ipc_client(
                             }
                     }
                     Ok(LocalAppMsg::AppRtSend) => {
+                        crate::route_trace::sealed_rt_local_sample(
+                            "daemon_read", hdr.priority(), &body,
+                        );
                         // src_app_id is at bytes [32..64] of the wire payload (same offset as AppIpcSend).
                         let src_app_id_valid = if body.len() >= 64 {
                             let mut id = [0u8; 32];
@@ -2876,6 +2879,9 @@ async fn handle_ipc_client(
                             false
                         };
                         if !src_app_id_valid {
+                            crate::route_trace::sealed_rt_local_sample(
+                                "source_refused", hdr.priority(), &body,
+                            );
                             let err_code = ipc_send_err::SPOOFED_SRC.to_be_bytes();
                             let mut hdr = FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppSendFailed as u16);
                             hdr.body_len = 2;
