@@ -74,6 +74,9 @@ impl AsyncUdpSocket for UdpSocket {
         bufs: &mut [std::io::IoSliceMut<'_>],
         meta: &mut [udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        self.inner
+            .set_receive_timestamp_trace((&self.io).into(), crate::udp_wire_trace::enabled());
         loop {
             ready!(self.io.poll_recv_ready(cx))?;
             if let Ok(res) = self.io.try_io(Interest::READABLE, || {
