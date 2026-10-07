@@ -282,6 +282,20 @@ impl EndpointFactory {
     }
 
     fn endpoint_with_config(&self, transport_config: TransportConfig) -> Endpoint {
+        use crate::runtime::Runtime as _;
+        let socket = TokioRuntime
+            .wrap_udp_socket(
+                UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap(),
+            )
+            .unwrap();
+        self.endpoint_with_socket(transport_config, socket)
+    }
+
+    fn endpoint_with_socket(
+        &self,
+        transport_config: TransportConfig,
+        socket: Arc<dyn crate::AsyncUdpSocket>,
+    ) -> Endpoint {
         let key = PrivateKeyDer::Pkcs8(self.cert.signing_key.serialize_der().into());
         let transport_config = Arc::new(transport_config);
         let mut server_config =
@@ -290,10 +304,10 @@ impl EndpointFactory {
 
         let mut roots = rustls::RootCertStore::empty();
         roots.add(self.cert.cert.der().clone()).unwrap();
-        let mut endpoint = Endpoint::new(
+        let mut endpoint = Endpoint::new_with_abstract_socket(
             self.endpoint_config.clone(),
             Some(server_config),
-            UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap(),
+            socket,
             Arc::new(TokioRuntime),
         )
         .unwrap();
@@ -807,6 +821,159 @@ async fn driver_stats_detect_runtime_stall() {
         .unwrap();
     assert_eq!(server.read_datagram().await.unwrap(), &b"after-stall"[..]);
     endpoint.close(0u32.into(), b"test complete");
+}
+
+// Hold only socket writability, without blocking the executor. The packet has
+// already left the protocol queue: admission and timer stats cannot measure
+// this wait. Use real UDP delivery to check both the observation and retry.
+#[tokio::test]
+async fn driver_stats_detect_udp_socket_wait() {
+    use crate::runtime::Runtime as _;
+    let factory = EndpointFactory::new();
+    let gate = Arc::new(UdpSendGate::default());
+    let socket = Arc::new(GatedUdpSocket {
+        inner: TokioRuntime
+            .wrap_udp_socket(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
+            .unwrap(),
+        gate: gate.clone(),
+    });
+    let client_endpoint = factory.endpoint_with_socket(TransportConfig::default(), socket);
+    let server_endpoint = factory.endpoint();
+    let (client, server) = tokio::join!(
+        client_endpoint
+            .connect(server_endpoint.local_addr().unwrap(), "localhost")
+            .unwrap(),
+        async { server_endpoint.accept().await.unwrap().await }
+    );
+    let client = client.unwrap();
+    let server = server.unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let before = client.driver_stats();
+    gate.state.lock().unwrap().0 = true;
+    client
+        .send_datagram(Bytes::from_static(b"held-udp"))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            gate.entered.notified().await;
+            if client.driver_stats().udp_send_pending_us > 0 {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("driver must prepare a transmit before waiting for UDP");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let pending = client.driver_stats();
+    assert!(pending.udp_send_pending_us >= 100_000, "{pending:?}");
+    assert_eq!(pending.udp_send_stalls, before.udp_send_stalls);
+    gate.release();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), server.read_datagram())
+            .await
+            .unwrap()
+            .unwrap(),
+        &b"held-udp"[..]
+    );
+    let after = client.driver_stats();
+    assert!(after.udp_send_stalls > before.udp_send_stalls, "{after:?}");
+    assert!(
+        after.udp_send_wait_max_us >= pending.udp_send_pending_us,
+        "{after:?}"
+    );
+    assert_eq!(after.udp_send_pending_us, 0);
+    client_endpoint.close(0u32.into(), b"test complete");
+    server_endpoint.close(0u32.into(), b"test complete");
+}
+
+#[derive(Debug, Default)]
+struct UdpSendGate {
+    state: std::sync::Mutex<(bool, Vec<std::task::Waker>)>,
+    entered: tokio::sync::Notify,
+}
+
+impl UdpSendGate {
+    fn poll(&self, cx: &std::task::Context<'_>) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !state.0 {
+            return false;
+        }
+        if !state.1.iter().any(|w| w.will_wake(cx.waker())) {
+            state.1.push(cx.waker().clone());
+        }
+        self.entered.notify_one();
+        true
+    }
+
+    fn release(&self) {
+        let wakers = {
+            let mut state = self.state.lock().unwrap();
+            state.0 = false;
+            std::mem::take(&mut state.1)
+        };
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GatedUdpSocket {
+    inner: Arc<dyn crate::AsyncUdpSocket>,
+    gate: Arc<UdpSendGate>,
+}
+
+impl crate::AsyncUdpSocket for GatedUdpSocket {
+    fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn crate::UdpPoller>> {
+        Box::pin(GatedUdpPoller {
+            inner: self.inner.clone().create_io_poller(),
+            gate: self.gate.clone(),
+        })
+    }
+    fn try_send(&self, transmit: &udp::Transmit<'_>) -> io::Result<()> {
+        if self.gate.state.lock().unwrap().0 {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        self.inner.try_send(transmit)
+    }
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        bufs: &mut [io::IoSliceMut<'_>],
+        meta: &mut [udp::RecvMeta],
+    ) -> std::task::Poll<io::Result<usize>> {
+        self.inner.poll_recv(cx, bufs, meta)
+    }
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+    fn max_transmit_segments(&self) -> usize {
+        self.inner.max_transmit_segments()
+    }
+    fn max_receive_segments(&self) -> usize {
+        self.inner.max_receive_segments()
+    }
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
+    }
+}
+
+#[derive(Debug)]
+struct GatedUdpPoller {
+    inner: std::pin::Pin<Box<dyn crate::UdpPoller>>,
+    gate: Arc<UdpSendGate>,
+}
+
+impl crate::UdpPoller for GatedUdpPoller {
+    fn poll_writable(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        if self.gate.poll(cx) {
+            return std::task::Poll::Pending;
+        }
+        self.inner.as_mut().poll_writable(cx)
+    }
 }
 
 #[tokio::test]
