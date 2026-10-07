@@ -31,6 +31,10 @@ static uint64_t source_channel = 0, receiver_channel = 0;
 static size_t sent_packets = 0;
 static bool perfect_network = false;
 static bool handover_network = false;
+static bool delivery_stall = false;
+static bool drop_during_stall = false;
+static size_t dropped_packets = 0;
+static size_t max_delivery_batch = 0;
 static const std::set<uint64_t> handover_sources{200, 201, 202};
 static std::vector<std::pair<uint64_t, uint16_t>> handover_sequences;
 static double milliseconds(Clock::time_point t) {
@@ -54,8 +58,18 @@ extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t 
   // Reproducible short jitter bursts, then ten seconds of a recovered path.
   const int delay = !perfect_network && at >= 2000 && at < 4000
       ? (static_cast<int>(at) / 200 % 2 ? 300 : 40) : 40;
-  pending.push_back({now + std::chrono::milliseconds(delay), {p, p + len}});
   ++sent_packets;
+  auto due = now + std::chrono::milliseconds(delay);
+  if (delivery_stall) {
+    // Stall before the receiver, matching the observed kernel-receipt boundary.
+    // Release old packets together in send order, beside newly arriving audio.
+    const int release_at = at >= 2000 && at < 3000 ? 3040
+        : at >= 6000 && at < 8700 ? 8740 : 0;
+    if (release_at && drop_during_stall) { ++dropped_packets; return 0; }
+    due = release_at ? origin + std::chrono::milliseconds(release_at)
+                     : now + std::chrono::milliseconds(40);
+  }
+  pending.push_back({due, {p, p + len}});
   return 0;
 }
 extern "C" int veil_media_send_video_control_datagram(uint64_t,
@@ -73,9 +87,10 @@ static void deliver() {
       else ++it;
     }
   }
-  std::sort(ready.begin(), ready.end(), [](const auto& a, const auto& b) {
+  std::stable_sort(ready.begin(), ready.end(), [](const auto& a, const auto& b) {
     return a.due < b.due;
   });
+  max_delivery_batch = std::max(max_delivery_batch, ready.size());
   for (const auto& p : ready) {
     if (callback.fn) callback.fn(callback.ctx, p.bytes.data(), p.bytes.size());
   }
@@ -239,7 +254,86 @@ static void verify_silence() {
   assert(metric(receiver.get(), "audio_interruption_count") == before_interruptions);
 }
 
+static void verify_delivery_stall(bool drop) {
+  delivery_stall = true;
+  drop_during_stall = drop;
+  const uint8_t local[32] = {1}, peer[32] = {2};
+  source_channel = 200; receiver_channel = 300;
+  using Engine = std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)>;
+  {
+    Engine receiver(veil_media_test_audio_playout_create(300, peer, local, 0, 0), veil_media_engine_destroy);
+    Engine source(veil_media_test_audio_playout_create(200, local, peer, 1, 0), veil_media_engine_destroy);
+    assert(source && receiver);
+    { std::lock_guard lock(mu); origin = Clock::now(); }
+    std::array<int16_t, 480> pcm{};
+    std::vector<double> source_edges, rendered_edges;
+    bool was_high = false;
+    double max_lateness = 0;
+    size_t recovered_ticks = 0;
+    uint64_t max_buffer = 0;
+    for (int tick = 0; tick < 2000; ++tick) {
+      std::this_thread::sleep_until(origin + std::chrono::milliseconds(10 * tick));
+      const double now = milliseconds(Clock::now());
+      max_lateness = std::max(max_lateness, now - 10 * tick);
+      const bool high = (tick / 100) % 2;
+      if (high && tick % 100 == 0) source_edges.push_back(now);
+      assert(veil_media_test_audio_capture_tone(source.get(), high ? 1200 : 440) == 0);
+      deliver();
+      assert(veil_media_test_audio_playout_pcm(receiver.get(), pcm.data(), pcm.size()) == 480);
+      double power = 0; int crossings = 0;
+      for (size_t i = 0; i < pcm.size(); ++i) {
+        power += static_cast<double>(pcm[i]) * pcm[i];
+        if (i && ((pcm[i] > 0) != (pcm[i - 1] > 0))) ++crossings;
+      }
+      const bool nonsilent = power / pcm.size() > 500 * 500;
+      if (tick >= 1700 && nonsilent) ++recovered_ticks;
+      const bool rendered_high = nonsilent && crossings >= 17;
+      if (rendered_high && !was_high) rendered_edges.push_back(milliseconds(Clock::now()));
+      was_high = rendered_high;
+      if (tick % 10 == 0)
+        max_buffer = std::max(max_buffer, metric(receiver.get(), "audio_jb_ms"));
+    }
+    size_t sent, dropped, batch;
+    { std::lock_guard lock(mu); sent = sent_packets; dropped = dropped_packets; batch = max_delivery_batch; }
+    std::printf("{\"delivery_stall_drop\":%s,\"sent_packets\":%zu,\"dropped_packets\":%zu,"
+                "\"max_delivery_batch\":%zu,\"max_tick_lateness_ms\":%.2f,"
+                "\"final_nonsilent_ticks\":%zu,\"max_buffer_ms\":%llu,\"post_stall_marker_latency_ms\":[",
+        drop ? "true" : "false", sent, dropped, batch,
+        max_lateness, recovered_ticks, static_cast<unsigned long long>(max_buffer));
+    bool recovered = true;
+    size_t markers = 0;
+    for (double sent : source_edges) {
+      if (sent < 9000) continue; // speech during the outage cannot be timely
+      const auto rendered = std::find_if(rendered_edges.begin(), rendered_edges.end(),
+          [&](double at) { return at >= sent && at < sent + 800; });
+      const double latency = rendered == rendered_edges.end() ? -1 : *rendered - sent;
+      if (markers++) std::printf(",");
+      std::printf("%.2f", latency);
+      // Measure genuine decoded PCM recovery, not only a falling jitter gauge.
+      recovered &= latency >= 0 && latency < (sent < 11000 ? 300 : 180);
+    }
+    std::printf("],\"concealed_samples\":%llu,\"interruption_count\":%llu,\"buffer_flushes\":%llu}\n",
+        static_cast<unsigned long long>(metric(receiver.get(), "audio_concealed_samples")),
+        static_cast<unsigned long long>(metric(receiver.get(), "audio_interruption_count")),
+        static_cast<unsigned long long>(metric(receiver.get(), "audio_jb_flushes")));
+    std::fflush(stdout);
+    assert(max_lateness < 30 && sent > 800 && markers == 6);
+    assert(drop ? dropped > 150 && batch < 10
+                : dropped == 0 && batch > 100);
+    assert(recovered && recovered_ticks > 290);
+  }
+  { std::lock_guard lock(mu); assert(callbacks.empty()); }
+}
+
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--delivery-stall") == 0) {
+    verify_delivery_stall(false);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--delivery-loss") == 0) {
+    verify_delivery_stall(true);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--asymmetric-handover") == 0) {
     verify_handover(true);
     return 0;
