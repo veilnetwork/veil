@@ -93,6 +93,10 @@ pub struct QuicDatagramPathStats {
     pub timer_late_last_us: u64,
     pub timer_late_max_us: u64,
     pub timer_stalls: u64,
+    pub udp_send_wait_last_us: u64,
+    pub udp_send_wait_max_us: u64,
+    pub udp_send_stalls: u64,
+    pub udp_send_pending_us: u64,
 }
 
 impl QuicDatagramHandle {
@@ -118,6 +122,10 @@ impl QuicDatagramHandle {
             timer_late_last_us: driver.timer_late_last_us,
             timer_late_max_us: driver.timer_late_max_us,
             timer_stalls: driver.timer_stalls,
+            udp_send_wait_last_us: driver.udp_send_wait_last_us,
+            udp_send_wait_max_us: driver.udp_send_wait_max_us,
+            udp_send_stalls: driver.udp_send_stalls,
+            udp_send_pending_us: driver.udp_send_pending_us,
         }
     }
     /// TLS exporter for authenticating a new, independent transport against

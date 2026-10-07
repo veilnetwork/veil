@@ -45,6 +45,14 @@ pub struct ConnectionDriverStats {
     pub timer_late_max_us: u64,
     /// Number of timers processed at least 100 ms late.
     pub timer_stalls: u64,
+    /// Last wait from packet preparation until successful UDP socket handoff.
+    pub udp_send_wait_last_us: u64,
+    /// Largest completed packet-to-socket wait (does not measure kernel/network time).
+    pub udp_send_wait_max_us: u64,
+    /// Number of completed UDP handoffs delayed at least 100 ms locally.
+    pub udp_send_stalls: u64,
+    /// Age of a prepared transmit still waiting for the UDP socket, at snapshot time.
+    pub udp_send_pending_us: u64,
 }
 
 fn scheduling_delay_us(now: Instant, scheduled: Instant) -> u64 {
@@ -602,9 +610,14 @@ impl Connection {
         self.0.state.lock("stats").inner.stats()
     }
 
-    /// Local event dispatch and timer scheduling delays.
+    /// Local event dispatch, timer scheduling and packet-to-socket delays.
     pub fn driver_stats(&self) -> ConnectionDriverStats {
-        self.0.state.lock("driver_stats").driver_stats
+        let state = self.0.state.lock("driver_stats");
+        let mut stats = state.driver_stats;
+        stats.udp_send_pending_us = state.buffered_transmit.as_ref().map_or(0, |(_, prepared)| {
+            scheduling_delay_us(state.runtime.now(), *prepared)
+        });
+        stats
     }
 
     /// Current state of the congestion control algorithm, for debugging purposes
@@ -1062,7 +1075,7 @@ pub(crate) struct State {
     runtime: Arc<dyn Runtime>,
     send_buffer: Vec<u8>,
     /// We buffer a transmit when the underlying I/O would block
-    buffered_transmit: Option<proto::Transmit>,
+    buffered_transmit: Option<(proto::Transmit, Instant)>,
 }
 
 impl State {
@@ -1077,7 +1090,7 @@ impl State {
 
         loop {
             // Retry the last transmit, or get a new one.
-            let t = match self.buffered_transmit.take() {
+            let (t, prepared) = match self.buffered_transmit.take() {
                 Some(t) => t,
                 None => {
                     self.send_buffer.clear();
@@ -1091,7 +1104,7 @@ impl State {
                                 None => 1,
                                 Some(s) => t.size.div_ceil(s), // round up
                             };
-                            t
+                            (t, self.runtime.now())
                         }
                         None => break,
                     }
@@ -1100,7 +1113,7 @@ impl State {
 
             if self.io_poller.as_mut().poll_writable(cx)?.is_pending() {
                 // Retry after a future wakeup
-                self.buffered_transmit = Some(t);
+                self.buffered_transmit = Some((t, prepared));
                 return Ok(false);
             }
 
@@ -1118,8 +1131,17 @@ impl State {
                 // `poll_writable` call determines that the socket is indeed not writable and
                 // registers us for a wakeup, or the send succeeds if this really was just a
                 // transient failure.
-                self.buffered_transmit = Some(t);
+                self.buffered_transmit = Some((t, prepared));
                 continue;
+            }
+
+            let wait_us = scheduling_delay_us(self.runtime.now(), prepared);
+            self.driver_stats.udp_send_wait_last_us = wait_us;
+            self.driver_stats.udp_send_wait_max_us =
+                self.driver_stats.udp_send_wait_max_us.max(wait_us);
+            if wait_us >= 100_000 {
+                self.driver_stats.udp_send_stalls =
+                    self.driver_stats.udp_send_stalls.saturating_add(1);
             }
 
             if transmits >= MAX_TRANSMIT_DATAGRAMS {
