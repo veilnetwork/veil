@@ -409,6 +409,24 @@ impl PriorityQueue {
             .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(3))
     }
 
+    /// Only locally classified complete primary frames can mark a source
+    /// waiting behind committed bytes. Remote return carriers and expired
+    /// media cannot select this endpoint-only feedback.
+    pub(crate) fn local_primary_waiting_deadline(
+        &self,
+        now: Instant,
+        predicate: impl Fn(&[u8]) -> bool,
+    ) -> Option<Instant> {
+        self.queues[REALTIME as usize]
+            .iter()
+            .filter(|queued| queued.carrier.is_none() && predicate(&queued.frame))
+            .filter_map(|queued| {
+                let until = queued.enqueued_at.unwrap_or(now) + LOCAL_PRIMARY_MAX_AGE;
+                (now < until).then_some(until)
+            })
+            .max()
+    }
+
     /// Pop the FIFO head of the REALTIME queue only when `predicate` accepts
     /// it. This does not consume a WRR slot: the frame leaves the ordered
     /// stream scheduler and is carried by an independent realtime lane.

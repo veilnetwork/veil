@@ -420,6 +420,8 @@ mod quic_backlog_tests;
 
 #[path = "local_reliable_admission.rs"]
 mod local_reliable_admission;
+#[path = "local_primary_write.rs"]
+mod local_primary_write;
 
 #[path = "local_source_stream_budget.rs"]
 mod local_source_stream_budget;
@@ -1298,7 +1300,7 @@ struct WireBlob {
     bytes: veil_bufpool::PooledShared,
     control: bool,
     // Set only before encryption from trusted local primary metadata.
-    primary_feedback: Option<Arc<crate::local_source_activity::LocalSourceActivity>>,
+    primary_feedback: Option<local_primary_write::PrimaryWriteLease>,
 }
 
 impl From<veil_bufpool::PooledShared> for WireBlob {
@@ -1335,6 +1337,7 @@ async fn writer_task<B: Into<WireBlob>>(
     mut write_half: tokio::io::WriteHalf<BoxIoStream>,
     mut wire_rx: mpsc::Receiver<B>,
     admission: Option<Arc<local_reliable_admission::ReliableWriteAdmission>>,
+    source: Option<Arc<local_primary_write::PrimaryWriteState>>,
     metrics: Option<Arc<NodeMetrics>>,
     logger: Arc<NodeLogger>,
     peer_id_short: String,
@@ -1350,8 +1353,9 @@ async fn writer_task<B: Into<WireBlob>>(
         let wire_len = bytes.len();
         let trace_started = crate::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
         let queued_behind = wire_rx.len();
+        let pressure_before = source.as_ref().map_or(0, |s| s.observations());
         match write_with_source_feedback(
-            &mut write_half, &bytes, WRITE_PROGRESS_TIMEOUT, blob.primary_feedback.as_deref(),
+            &mut write_half, &bytes, WRITE_PROGRESS_TIMEOUT, source.as_deref(),
         ).await {
             Ok(Ok(())) => {
                 if let Some(started) = trace_started {
@@ -1360,9 +1364,10 @@ async fn writer_task<B: Into<WireBlob>>(
                         logger.info(
                             "session.rt_trace.slow_wire_write",
                             format!(
-                                "peer_id={peer_id_short} len={wire_len} elapsed_ms={} queued_behind={queued_behind} primary_source={}",
+                                "peer_id={peer_id_short} len={wire_len} elapsed_ms={} queued_behind={queued_behind} primary_source={} source_pressure_ticks={}",
                                 elapsed.as_millis(),
                                 blob.primary_feedback.is_some(),
+                                source.as_ref().map_or(0,|s| s.observations()).saturating_sub(pressure_before),
                             ),
                         );
                     }
@@ -1409,32 +1414,39 @@ async fn write_with_progress_timeout<W: tokio::io::AsyncWrite + Unpin>(
     write_with_source_feedback(writer, bytes, idle, None).await
 }
 
-/// A stalled locally authored primary publishes pressure even on a stream-only
-/// transport. The pinned partial write is never cancelled by a feedback tick;
+/// A blocked stream publishes pressure while a trusted local primary is
+/// waiting on that connection, including behind another committed blob. The
+/// pinned partial write is never cancelled by a feedback tick;
 /// ordering, ciphertext and the original idle-progress deadline are preserved.
 async fn write_with_source_feedback<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     bytes: &[u8],
     idle: std::time::Duration,
-    source: Option<&crate::local_source_activity::LocalSourceActivity>,
+    source: Option<&local_primary_write::PrimaryWriteState>,
 ) -> Result<std::io::Result<()>, tokio::time::error::Elapsed> {
     let mut written = 0;
+    let interval = std::time::Duration::from_millis(150);
+    // Partial progress renews the idle deadline, but cannot conceal the total
+    // time a primary waits behind this blob on the same ordered connection.
+    let mut pressure_due = tokio::time::Instant::now() + interval;
     while written < bytes.len() {
         let progress = async {
             let write = writer.write(&bytes[written..]);
             tokio::pin!(write);
             let Some(source) = source else { return write.await; };
-            let interval = std::time::Duration::from_millis(150);
-            let mut pressure = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
-            pressure.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
+                if tokio::time::Instant::now() >= pressure_due {
+                    source.observe_stalled(std::time::Instant::now());
+                    pressure_due = tokio::time::Instant::now() + interval;
+                }
                 tokio::select! {
                     biased;
                     result = &mut write => return result,
-                    _ = pressure.tick() => {
+                    _ = tokio::time::sleep_until(pressure_due) => {
                         // Activity comes from the producer, not an old blocked
                         // blob: its existing idle grace still expires normally.
-                        source.note_pressure(std::time::Instant::now());
+                        source.observe_stalled(std::time::Instant::now());
+                        pressure_due = tokio::time::Instant::now() + interval;
                     }
                 }
             }
@@ -1466,6 +1478,7 @@ pub fn spawn_writer_task(
     tokio::spawn(writer_task(
         write_half,
         wire_rx,
+        None,
         None,
         metrics,
         logger,
@@ -1511,7 +1524,7 @@ impl SessionRunner {
         bytes: veil_bufpool::PooledShared,
         metrics: &Option<Arc<NodeMetrics>>,
         control: bool,
-        primary_feedback: Option<Arc<crate::local_source_activity::LocalSourceActivity>>,
+        primary_feedback: Option<local_primary_write::PrimaryWriteLease>,
     ) -> Result<(), mpsc::error::TrySendError<WireBlob>> {
         match wire_tx.try_send(WireBlob { bytes, control, primary_feedback }) {
             Ok(()) => Ok(()),
@@ -3942,12 +3955,16 @@ impl SessionRunner {
         let stream = std::mem::replace(&mut self.stream, broken_stream_sentinel());
         let (mut read_half, write_half) = tokio::io::split(stream);
         let (mut wire_tx, wire_rx) = mpsc::channel::<WireBlob>(WIRE_CHANNEL_CAPACITY);
+        let mut writer_source = outbox.as_ref().map(|outbox| {
+            local_primary_write::PrimaryWriteState::new(outbox.shared_source_activity())
+        });
         let mut writer_handle = tokio::spawn(writer_task(
             write_half,
             wire_rx,
             realtime_lane
                 .as_ref()
                 .map(|lane| lane.local_reliable.writer_admission()),
+            writer_source.clone(),
             self.metrics.clone(),
             Arc::clone(&self.logger),
             hex_short(&self.peer_id),
@@ -4649,6 +4666,12 @@ impl SessionRunner {
                     realtime_lane = None;
                     _datagram_transport_lease = None;
                 }
+                if let Some(source) = writer_source.as_ref() {
+                    source.note_queued(pq.local_primary_waiting_deadline(
+                        std::time::Instant::now(),
+                        |frame| local_primary_stream_frame(veil_proto::priority::REALTIME, frame),
+                    ));
+                }
                 if crate::rt_trace::rt_trace_enabled() {
                     let realtime_blocked = pq.peek_priority()
                         == Some(veil_proto::priority::REALTIME)
@@ -4854,7 +4877,7 @@ impl SessionRunner {
                             outgoing.clone(),
                             &self.metrics,
                             control,
-                            local_primary.then(|| outbox.as_ref().map(|o| o.shared_source_activity())).flatten(),
+                            local_primary.then(|| writer_source.as_ref().map(|source| source.retain())).flatten(),
                         ) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => continue,
@@ -4870,6 +4893,12 @@ impl SessionRunner {
                         rekey.record_bytes(tx_len);
                         mlkem_rekey.record_bytes(tx_len);
                     }
+                }
+                if let Some(source) = writer_source.as_ref() {
+                    source.note_queued(pq.local_primary_waiting_deadline(
+                        std::time::Instant::now(),
+                        |frame| local_primary_stream_frame(veil_proto::priority::REALTIME, frame),
+                    ));
                 }
                 if !encrypted_batch_frames.is_empty() {
                     // Check the operator bandwidth bucket BEFORE encrypting. A
@@ -4907,7 +4936,7 @@ impl SessionRunner {
                         wire_pool,
                         &self.metrics,
                         batch_control == Some(true),
-                        batch_has_local_primary.then(|| outbox.as_ref().map(|o| o.shared_source_activity())).flatten(),
+                        batch_has_local_primary.then(|| writer_source.as_ref().map(|source| source.retain())).flatten(),
                     )
                     .is_err()
                     {
@@ -5053,12 +5082,19 @@ impl SessionRunner {
                         // Tear-down + re-spawn lifecycle is mechanical;
                         // rebind locals from the tuple result, reset
                         // timer + trigger, continue.
+                        if let Some(source) = writer_source.as_ref() {
+                            source.note_queued(None);
+                        }
+                        let new_source = outbox.as_ref().map(|outbox| {
+                            local_primary_write::PrimaryWriteState::new(outbox.shared_source_activity())
+                        });
                         let (new_read, new_tx, new_handle) = self
-                            .swap_transport_plumbing(new_stream, wire_tx, writer_handle)
+                            .swap_transport_plumbing(new_stream, wire_tx, writer_handle, new_source.clone())
                             .await;
                         read_half = new_read;
                         wire_tx = new_tx;
                         writer_handle = new_handle;
+                        writer_source = new_source;
                         timers.note_swap(tokio::time::Instant::now());
                         // stage (c.2): the swap clears any prior
                         // rx-stall condition, so a subsequent stall can
@@ -5603,6 +5639,7 @@ impl SessionRunner {
         new_stream: veil_transport::BoxIoStream,
         old_wire_tx: mpsc::Sender<WireBlob>,
         mut old_writer_handle: tokio::task::JoinHandle<()>,
+        source: Option<Arc<local_primary_write::PrimaryWriteState>>,
     ) -> (
         tokio::io::ReadHalf<veil_transport::BoxIoStream>,
         mpsc::Sender<WireBlob>,
@@ -5625,6 +5662,7 @@ impl SessionRunner {
             new_write,
             new_rx,
             None,
+            source,
             self.metrics.clone(),
             Arc::clone(&self.logger),
             hex_short(&self.peer_id),
