@@ -3093,6 +3093,24 @@ pub fn spawn_inbound_session(
     inbound: InboundSessionContext,
     connection: Box<dyn veil_transport::TransportConnection>,
 ) -> JoinHandle<()> {
+    spawn_inbound_session_with_directional_override(inbound, connection, false)
+}
+
+/// The responder half of a coordinated NAT recovery has no reverse dial to
+/// fall back to. Match the initiator's directional exemption without changing
+/// authentication, capacity limits, or replacement of an existing session.
+fn spawn_punched_inbound_session(
+    inbound: InboundSessionContext,
+    connection: Box<dyn veil_transport::TransportConnection>,
+) -> JoinHandle<()> {
+    spawn_inbound_session_with_directional_override(inbound, connection, true)
+}
+
+fn spawn_inbound_session_with_directional_override(
+    inbound: InboundSessionContext,
+    connection: Box<dyn veil_transport::TransportConnection>,
+    bypass_directional: bool,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         // B5: Ok(None) means the inbound connection was bound
         // to an existing session via HandoffAttach — no new runner to
@@ -3105,7 +3123,7 @@ pub fn spawn_inbound_session(
             Some(inbound.listener_handle),
             SessionState::Active,
             connection,
-            false,
+            bypass_directional,
         )
         .await
         {
