@@ -25,6 +25,8 @@ use veil_cfg::NodeId;
 pub struct OutboxRequest {
     /// Request ID that matches `FrameHeader::request_id` (u32).
     pub request_id: u32,
+    /// Trusted own-RPC admission, retained until the scheduler consumes it.
+    pub(crate) source_credit: tokio::sync::OwnedSemaphorePermit,
     /// Pre-encoded OVL1 frame (header + body).
     pub frame: Vec<u8>,
     /// Receives the raw body of the response frame.
@@ -41,6 +43,7 @@ pub const DEFAULT_OUTBOX_DEPTH: usize = 256;
 
 struct SessionOutboxEntry {
     tx: mpsc::Sender<OutboxRequest>,
+    source_credits: Arc<tokio::sync::Semaphore>,
     owner: Option<[u8; 32]>,
 }
 
@@ -105,7 +108,14 @@ impl SessionOutbox {
         // H9 ergonomic accept: see `send_request` for rationale.
         let peer_id: NodeId = peer_id.into();
         let (tx, rx) = mpsc::channel(self.capacity);
-        lock!(self.senders).insert(*peer_id.as_bytes(), SessionOutboxEntry { tx, owner: None });
+        lock!(self.senders).insert(
+            *peer_id.as_bytes(),
+            SessionOutboxEntry {
+                tx,
+                source_credits: Arc::new(tokio::sync::Semaphore::new(self.capacity)),
+                owner: None,
+            },
+        );
         rx
     }
 
@@ -123,6 +133,7 @@ impl SessionOutbox {
             *peer_id.as_bytes(),
             SessionOutboxEntry {
                 tx,
+                source_credits: Arc::new(tokio::sync::Semaphore::new(self.capacity)),
                 owner: Some(owner),
             },
         );
@@ -178,14 +189,22 @@ impl SessionOutbox {
         // callers both work without explicit conversion.
         let peer_id: NodeId = peer_id.into();
         crate::frame_diag::note_outbound(peer_id.as_bytes(), &frame, "outbox");
+        let guard = lock!(self.senders);
+        let entry = guard.get(peer_id.as_bytes())?;
+        let source_credit = match entry.source_credits.clone().try_acquire_owned() {
+            Ok(credit) => credit,
+            Err(_) => {
+                self.drops_total.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
         let (response_tx, response_rx) = oneshot::channel();
         let req = OutboxRequest {
             request_id,
+            source_credit,
             frame,
             response_tx,
         };
-        let guard = lock!(self.senders);
-        let entry = guard.get(peer_id.as_bytes())?;
         if entry.tx.try_send(req).is_err() {
             self.drops_total.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -206,15 +225,23 @@ impl SessionOutbox {
     pub fn send_oneway(&self, peer_id: impl Into<NodeId>, frame: Vec<u8>) -> bool {
         // H9 ergonomic accept: see `send_request` for rationale.
         let peer_id: NodeId = peer_id.into();
-        let (response_tx, _response_rx) = oneshot::channel();
-        let req = OutboxRequest {
-            request_id: 0,
-            frame,
-            response_tx,
-        };
         let guard = lock!(self.senders);
         let Some(entry) = guard.get(peer_id.as_bytes()) else {
             return false;
+        };
+        let source_credit = match entry.source_credits.clone().try_acquire_owned() {
+            Ok(credit) => credit,
+            Err(_) => {
+                self.drops_total.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        };
+        let (response_tx, _response_rx) = oneshot::channel();
+        let req = OutboxRequest {
+            request_id: 0,
+            source_credit,
+            frame,
+            response_tx,
         };
         if entry.tx.try_send(req).is_err() {
             self.drops_total.fetch_add(1, Ordering::Relaxed);

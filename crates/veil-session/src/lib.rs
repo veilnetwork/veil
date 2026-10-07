@@ -68,5 +68,5 @@ pub use frame_outbox::{FrameOutbox, FrameSender};
 pub use fsm::{SessionFsm, SessionHandshakeData, SessionPhase};
 pub use manager::{RemoteRole, SessionEntry, SessionId, SessionRegistry};
 pub use outbox::SessionOutbox;
-pub use priority_queue::{DEFAULT_WEIGHTS, PriorityQueue};
+pub use priority_queue::{DEFAULT_WEIGHTS, LOCAL_NETWORK_CONTROL_LANE, PriorityQueue};
 pub use tx_registry::{PriorityFrame, SendToError, SessionTxRegistry};

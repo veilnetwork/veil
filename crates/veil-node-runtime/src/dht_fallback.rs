@@ -284,7 +284,7 @@ impl IterativeDhtFallback for DhtRouteFallback {
             {
                 let guard = rlock!(services.session_tx_registry);
                 for pid in peers.iter().take(2) {
-                    guard.send_to(pid, priority::INTERACTIVE, frame.clone());
+                    guard.send_to(pid, veil_session::LOCAL_NETWORK_CONTROL_LANE, frame.clone());
                 }
             }
 

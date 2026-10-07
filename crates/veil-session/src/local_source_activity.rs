@@ -7,6 +7,7 @@ use veil_util::lock;
 pub(crate) const IDLE_GRACE: Duration = Duration::from_secs(3);
 pub(crate) const PRESSURE_GRACE: Duration = Duration::from_secs(2);
 pub(crate) const RELIABLE_SECONDARY_BYTES: usize = 4096;
+pub(crate) const NETWORK_CONTROL_BYTES: usize = 1024;
 const SECONDARY_PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Default)]
@@ -15,6 +16,7 @@ struct SourceState {
     pressure_until: Option<Instant>,
     secondary_next: Option<Instant>,
     reliable_window: Option<(Instant, usize)>,
+    network_window: Option<(Instant, usize)>,
 }
 
 #[derive(Debug, Default)]
@@ -51,29 +53,48 @@ impl LocalSourceActivity {
         bytes: usize,
         now: Instant,
     ) -> Result<(), Instant> {
+        self.admit_reliable(bytes, now, false)
+    }
+
+    /// Own network queries have an independent small allowance, so a held
+    /// file burst cannot prevent route/certificate recovery under pressure.
+    pub(crate) fn admit_network_control(&self, bytes: usize, now: Instant) -> Result<(), Instant> {
+        self.admit_reliable(bytes, now, true)
+    }
+
+    fn admit_reliable(
+        &self,
+        bytes: usize,
+        now: Instant,
+        network_control: bool,
+    ) -> Result<(), Instant> {
         let mut state = lock!(self.0);
         let active_until = state.last_primary.map(|at| at + IDLE_GRACE);
         let pressure_until = state.pressure_until;
+        let window = if network_control {
+            &mut state.network_window
+        } else {
+            &mut state.reliable_window
+        };
+        let budget = if network_control {
+            NETWORK_CONTROL_BYTES
+        } else {
+            RELIABLE_SECONDARY_BYTES
+        };
         let (Some(active_until), Some(pressure_until)) = (active_until, pressure_until) else {
-            state.reliable_window = None;
+            *window = None;
             return Ok(());
         };
         if now >= active_until || now >= pressure_until {
-            state.reliable_window = None;
+            *window = None;
             return Ok(());
         }
-        let (deadline, used) = state
-            .reliable_window
-            .get_or_insert((now + SECONDARY_PROBE_INTERVAL, 0));
+        let (deadline, used) = window.get_or_insert((now + SECONDARY_PROBE_INTERVAL, 0));
         if now >= *deadline {
             *deadline = now + SECONDARY_PROBE_INTERVAL;
             *used = 0;
         }
-        if *used == 0
-            || used
-                .checked_add(bytes)
-                .is_some_and(|n| n <= RELIABLE_SECONDARY_BYTES)
-        {
+        if *used == 0 || used.checked_add(bytes).is_some_and(|n| n <= budget) {
             *used = used.saturating_add(bytes);
             Ok(())
         } else {
@@ -113,6 +134,72 @@ impl LocalSourceActivity {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn own_rpc_neighbors_share_a_separate_byte_allowance() {
+        let activity = Arc::new(LocalSourceActivity::default());
+        let now = Instant::now();
+        activity.note(now);
+        activity.note_pressure(now);
+        assert!(
+            activity
+                .admit_reliable_secondary(RELIABLE_SECONDARY_BYTES, now)
+                .is_ok()
+        );
+        assert!(activity.admit_reliable_secondary(1, now).is_err());
+        let barrier = Arc::new(Barrier::new(16));
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let activity = Arc::clone(&activity);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    usize::from(
+                        activity
+                            .admit_network_control(NETWORK_CONTROL_BYTES, now)
+                            .is_ok(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            threads
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            activity.admit_network_control(1, now),
+            Err(now + SECONDARY_PROBE_INTERVAL)
+        );
+        let next = now + SECONDARY_PROBE_INTERVAL;
+        assert!(activity.admit_network_control(60000, next).is_ok());
+        assert_eq!(
+            activity.admit_network_control(1, next),
+            Err(next + SECONDARY_PROBE_INTERVAL)
+        );
+        assert!(
+            activity
+                .admit_reliable_secondary(RELIABLE_SECONDARY_BYTES, next)
+                .is_ok()
+        );
+        for end in [PRESSURE_GRACE, IDLE_GRACE] {
+            assert!(activity.admit_network_control(60000, now + end).is_ok());
+            assert!(activity.admit_network_control(60000, now + end).is_ok());
+        }
+        activity.note_pressure(now + IDLE_GRACE);
+        assert!(
+            activity
+                .admit_network_control(60000, now + IDLE_GRACE)
+                .is_ok()
+        );
+        assert!(
+            activity
+                .admit_network_control(60000, now + IDLE_GRACE)
+                .is_ok()
+        );
+    }
 
     #[test]
     fn simultaneous_neighbors_share_one_probe_and_grace_expires() {

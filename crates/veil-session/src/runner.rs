@@ -207,7 +207,7 @@ async fn await_next_input(
 
 /// Session-scoped state for the independently encrypted, loss-tolerant media
 /// lane. It exists only after capability AND transport negotiation succeed.
-const LOCAL_TRACE_SLOTS: usize = veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE as usize + 1;
+const LOCAL_TRACE_SLOTS: usize = crate::LOCAL_NETWORK_CONTROL_LANE as usize + 1;
 
 struct RealtimeDatagramLane {
     sender: Arc<Mutex<RealtimeSender>>,
@@ -418,10 +418,10 @@ fn local_datagram_backlog_fits(wire_len: usize, available: usize) -> bool {
 #[path = "quic_backlog_tests.rs"]
 mod quic_backlog_tests;
 
-#[path = "local_reliable_admission.rs"]
-mod local_reliable_admission;
 #[path = "local_primary_write.rs"]
 mod local_primary_write;
+#[path = "local_reliable_admission.rs"]
+mod local_reliable_admission;
 
 #[path = "local_source_stream_budget.rs"]
 mod local_source_stream_budget;
@@ -1355,8 +1355,13 @@ async fn writer_task<B: Into<WireBlob>>(
         let queued_behind = wire_rx.len();
         let pressure_before = source.as_ref().map_or(0, |s| s.observations());
         match write_with_source_feedback(
-            &mut write_half, &bytes, WRITE_PROGRESS_TIMEOUT, source.as_deref(),
-        ).await {
+            &mut write_half,
+            &bytes,
+            WRITE_PROGRESS_TIMEOUT,
+            source.as_deref(),
+        )
+        .await
+        {
             Ok(Ok(())) => {
                 if let Some(started) = trace_started {
                     let elapsed = started.elapsed();
@@ -1433,7 +1438,9 @@ async fn write_with_source_feedback<W: tokio::io::AsyncWrite + Unpin>(
         let progress = async {
             let write = writer.write(&bytes[written..]);
             tokio::pin!(write);
-            let Some(source) = source else { return write.await; };
+            let Some(source) = source else {
+                return write.await;
+            };
             loop {
                 if tokio::time::Instant::now() >= pressure_due {
                     source.observe_stalled(std::time::Instant::now());
@@ -1526,7 +1533,11 @@ impl SessionRunner {
         control: bool,
         primary_feedback: Option<local_primary_write::PrimaryWriteLease>,
     ) -> Result<(), mpsc::error::TrySendError<WireBlob>> {
-        match wire_tx.try_send(WireBlob { bytes, control, primary_feedback }) {
+        match wire_tx.try_send(WireBlob {
+            bytes,
+            control,
+            primary_feedback,
+        }) {
             Ok(()) => Ok(()),
             Err(e @ mpsc::error::TrySendError::Full(_)) => {
                 if let Some(m) = metrics {
@@ -2410,9 +2421,9 @@ impl SessionRunner {
     ///
     /// Cap + TTL eviction (`evict_expired` + `evict_oldest_if_at_capacity`)
     /// runs once per inserted request so the response table stays
-    /// bounded under sustained RPC traffic. Frame is pushed at
-    /// `INTERACTIVE` priority to match the latency expectation of
-    /// request-response patterns.
+    /// bounded under sustained RPC traffic. Trusted own requests retain a
+    /// bounded admission credit and use the endpoint's separate network lane;
+    /// the encoded wire header and forwarded peers' scheduling never change.
     fn drain_rpc_outbox_into_pq(
         &self,
         rpc_outbox: &mut mpsc::Receiver<crate::outbox::OutboxRequest>,
@@ -2420,15 +2431,31 @@ impl SessionRunner {
         pending_responses: &mut crate::pending_response_table::PendingResponseTable,
     ) {
         while let Ok(req) = rpc_outbox.try_recv() {
-            let now = tokio::time::Instant::now();
-            pending_responses.evict_expired(now);
-            pending_responses.evict_oldest_if_at_capacity();
-            pending_responses.insert(req.request_id, req.response_tx, now);
-            pq.push(
-                veil_proto::priority::INTERACTIVE,
-                veil_bufpool::pooled_shared_from_vec(req.frame),
-            );
+            Self::queue_rpc_request(req, pq, pending_responses);
         }
+    }
+
+    fn queue_rpc_request(
+        req: crate::outbox::OutboxRequest,
+        pq: &mut crate::priority_queue::PriorityQueue,
+        pending_responses: &mut crate::pending_response_table::PendingResponseTable,
+    ) {
+        let now = tokio::time::Instant::now();
+        pending_responses.evict_expired(now);
+        pending_responses.evict_oldest_if_at_capacity();
+        pending_responses.insert(req.request_id, req.response_tx, now);
+        pq.push_envelope(
+            crate::frame_outbox::FrameEnvelope {
+                frame: (
+                    crate::LOCAL_NETWORK_CONTROL_LANE,
+                    veil_bufpool::pooled_shared_from_vec(req.frame),
+                ),
+                carrier: None,
+                queued_at: std::time::Instant::now(),
+                reliable_credit: Some(req.source_credit),
+            },
+            false,
+        );
     }
 
     /// Session-ticket store-on-receive. Server sent us an encrypted
@@ -4667,10 +4694,11 @@ impl SessionRunner {
                     _datagram_transport_lease = None;
                 }
                 if let Some(source) = writer_source.as_ref() {
-                    source.note_queued(pq.local_primary_waiting_deadline(
-                        std::time::Instant::now(),
-                        |frame| local_primary_stream_frame(veil_proto::priority::REALTIME, frame),
-                    ));
+                    source.note_queued(
+                        pq.local_primary_waiting_deadline(std::time::Instant::now(), |frame| {
+                            local_primary_stream_frame(veil_proto::priority::REALTIME, frame)
+                        }),
+                    );
                 }
                 if crate::rt_trace::rt_trace_enabled() {
                     let realtime_blocked = pq.peek_priority()
@@ -4809,10 +4837,20 @@ impl SessionRunner {
                             source_pressure_retry = Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
                             return HeadAdmission::DeferSource;
                         }
+                        if priority == crate::LOCAL_NETWORK_CONTROL_LANE
+                            && let Some(outbox) = outbox.as_ref()
+                            && let Err(retry) = outbox.source_activity().admit_network_control(
+                                encrypted_wire_len(frame.len()).unwrap_or(usize::MAX), now,
+                            )
+                        {
+                            source_pressure_retry = Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
+                            return HeadAdmission::DeferSource;
+                        }
                         // Trusted local admission credits distinguish authored
                         // ordered streams from opaque transit. A remote header
                         // cannot select this endpoint-only pressure policy.
-                        if (owned_reliable || priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE)
+                        if priority != crate::LOCAL_NETWORK_CONTROL_LANE
+                            && (owned_reliable || priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE)
                             && let Some(outbox) = outbox.as_ref()
                             && let Err(retry) = outbox.source_activity().admit_reliable_secondary(
                                 encrypted_wire_len(frame.len()).unwrap_or(usize::MAX), now,
@@ -4877,7 +4915,9 @@ impl SessionRunner {
                             outgoing.clone(),
                             &self.metrics,
                             control,
-                            local_primary.then(|| writer_source.as_ref().map(|source| source.retain())).flatten(),
+                            local_primary
+                                .then(|| writer_source.as_ref().map(|source| source.retain()))
+                                .flatten(),
                         ) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => continue,
@@ -4895,10 +4935,11 @@ impl SessionRunner {
                     }
                 }
                 if let Some(source) = writer_source.as_ref() {
-                    source.note_queued(pq.local_primary_waiting_deadline(
-                        std::time::Instant::now(),
-                        |frame| local_primary_stream_frame(veil_proto::priority::REALTIME, frame),
-                    ));
+                    source.note_queued(
+                        pq.local_primary_waiting_deadline(std::time::Instant::now(), |frame| {
+                            local_primary_stream_frame(veil_proto::priority::REALTIME, frame)
+                        }),
+                    );
                 }
                 if !encrypted_batch_frames.is_empty() {
                     // Check the operator bandwidth bucket BEFORE encrypting. A
@@ -4936,7 +4977,9 @@ impl SessionRunner {
                         wire_pool,
                         &self.metrics,
                         batch_control == Some(true),
-                        batch_has_local_primary.then(|| writer_source.as_ref().map(|source| source.retain())).flatten(),
+                        batch_has_local_primary
+                            .then(|| writer_source.as_ref().map(|source| source.retain()))
+                            .flatten(),
                     )
                     .is_err()
                     {
@@ -5111,18 +5154,7 @@ impl SessionRunner {
                         continue;
                     }
                     NextInput::RpcRequest(req) => {
-                        let now = tokio::time::Instant::now();
-                        // Symmetric with the drain-loop path: TTL-evict AND
-                        // capacity-evict before insert, so single-at-a-time
-                        // arrivals via this select-arm can't transiently push
-                        // the table past `capacity`.
-                        pending_responses.evict_expired(now);
-                        pending_responses.evict_oldest_if_at_capacity();
-                        pending_responses.insert(req.request_id, req.response_tx, now);
-                        pq.push(
-                            veil_proto::priority::INTERACTIVE,
-                            veil_bufpool::pooled_shared_from_vec(req.frame),
-                        );
+                        Self::queue_rpc_request(req, &mut pq, &mut pending_responses);
                         continue;
                     }
                     NextInput::LocalDatagramWarm | NextInput::WriterReady => continue,
@@ -5729,7 +5761,8 @@ impl SessionRunner {
                 }
                 rekey.record_bytes(resp_len);
                 mlkem_rekey.record_bytes(resp_len);
-                if Self::push_wire_classified(wire_tx, wire_bytes, &self.metrics, control, None).is_err()
+                if Self::push_wire_classified(wire_tx, wire_bytes, &self.metrics, control, None)
+                    .is_err()
                 {
                     self.on_primary_write_error(write_error_count);
                     return true;
