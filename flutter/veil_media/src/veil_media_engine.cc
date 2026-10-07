@@ -1047,8 +1047,6 @@ struct GroupPeerState {
   uint32_t video_ssrc = 0;
   std::unique_ptr<veil_media::VeilTransportShim> shim;
   webrtc::AudioReceiveStreamInterface* recv_stream = nullptr;  // owned by Call
-  uint64_t sampled_audio_packets = 0;
-  int64_t last_audio_packet_us = 0;
   std::unique_ptr<VeilVideoSink> video_sink;
   webrtc::VideoReceiveStreamInterface* video_recv_stream = nullptr;
 };
@@ -2276,12 +2274,17 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
           if (!entry.second->recv_stream) continue;
           const auto sample = entry.second->recv_stream->GetStats(false);
           auto* peer = entry.second.get();
-          if (sample.packets_received > peer->sampled_audio_packets)
-            peer->last_audio_packet_us = now_us;
-          peer->sampled_audio_packets = sample.packets_received;
+          int64_t native_age_ms = -1;
+          if (sample.last_packet_received) {
+            // The accepted RTP timestamp is on the Unix epoch, not the
+            // monotonic host poll clock. Delayed polling cannot refresh it.
+            const int64_t unix_now_ms = ws->env.clock().CurrentNtpInMilliseconds()
+                                       - webrtc::kNtpJan1970Millisecs;
+            native_age_ms = std::max<int64_t>(
+                0, unix_now_ms - sample.last_packet_received->ms());
+          }
           const bool active = sample.packets_received > 0 &&
-              peer->last_audio_packet_us > 0 && peer->last_audio_packet_us <= now_us &&
-              now_us - peer->last_audio_packet_us <= 3'000'000;
+              native_age_ms >= 0 && native_age_ms <= 3000;
           peer->shim->SetLocalAudioPlayout(peer->audio_ssrc, sample_sequence,
               active ? static_cast<int>(sample.delay_estimate_ms) : -1, now_us);
           char id[65];
@@ -2290,11 +2293,12 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
             id[2 * i + 1] = hex[entry.second->id[i] & 15];
           }
           id[64] = '\0';
-          char receiver[192];
+          char receiver[256];
           const int size = std::snprintf(receiver, sizeof(receiver),
-              "\"%s\":{\"audio_rx_pkts\":%llu,\"audio_delay_ms\":%u}", id,
+              "\"%s\":{\"audio_rx_pkts\":%llu,\"audio_delay_ms\":%u,"
+              "\"audio_rx_native_age_ms\":%lld}", id,
               static_cast<unsigned long long>(sample.packets_received),
-              sample.delay_estimate_ms);
+              sample.delay_estimate_ms, static_cast<long long>(native_age_ms));
           if (size <= 0 || static_cast<size_t>(size) >= sizeof(receiver)) continue;
           if (!audio_receivers.empty()) audio_receivers += ',';
           audio_receivers.append(receiver, static_cast<size_t>(size));
@@ -2331,7 +2335,7 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               ",\"audio_playout_reports\":" + std::to_string(playout_reports) +
               ",\"audio_playout_ms\":" + std::to_string(playout_ms);
   snapshot += ",\"video_send_paused\":" + std::to_string(ws->video_send_paused.load() ? 1 : 0);
-  snapshot += ",\"audio_rx_supported\":1,\"audio_receivers\":{";
+  snapshot += ",\"audio_rx_supported\":1,\"audio_rx_native_age_supported\":1,\"audio_receivers\":{";
   if (audio_sampled) snapshot += audio_receivers;
   snapshot += "}}";
   return dup_cstr(snapshot.c_str());
