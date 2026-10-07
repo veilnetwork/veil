@@ -179,14 +179,24 @@ void configure_call_audio_transport(webrtc::CallConfig& config) {
 
 // NetEq's default 200-packet buffer permits a 3-second target delay at our
 // 20-ms Opus cadence. Relay bursts on a cellular link made the receiver retain
-// over a second of audio even after packet delivery recovered. Keep enough
-// room for short bursts (600 ms), but bound the adaptive target to 450 ms
-// (NetEq uses at most 75% of the packet capacity) and let it shed excess delay
+// over a second of audio even after packet delivery recovered. Even the later
+// 30-packet limit retained ~340-ms decoded PCM latency for several seconds
+// after a controlled 300-ms jitter burst. Keep room for short bursts (240 ms),
+// bound the adaptive target to 180 ms (75% of packet capacity), and shed delay
 // with fast time stretching. A longer outage should be concealed rather than
 // turning the rest of an interactive conversation into delayed playback.
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+// Compare candidate buffer limits with actual decoded PCM before changing
+// production policy. Scoped by the stand factory; absent from shipped builds.
+size_t g_call_plane_audio_buffer_packets = 0;
+#endif
 void configure_call_audio_receive(
     webrtc::AudioReceiveStreamInterface::Config& config) {
-  config.jitter_buffer_max_packets = 30;
+  config.jitter_buffer_max_packets = 12;
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+  if (g_call_plane_audio_buffer_packets)
+    config.jitter_buffer_max_packets = g_call_plane_audio_buffer_packets;
+#endif
   config.jitter_buffer_fast_accelerate = true;
 }
 

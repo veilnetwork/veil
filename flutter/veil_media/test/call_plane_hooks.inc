@@ -315,4 +315,37 @@ extern "C" uint64_t veil_media_test_direct_encoded_frames(VeilMediaEngine* e) {
   return frames;
 }
 
+extern "C" VeilMediaEngine* veil_media_test_audio_playout_create(
+    uint64_t chan, const uint8_t local[32], const uint8_t peer[32],
+    int send, size_t buffer_packets) {
+  g_call_plane_recording_adm = true;
+  g_call_plane_audio_buffer_packets = buffer_packets;
+  auto* e = veil_media_engine_create(chan, local, peer);
+  if (e) {
+    veil_media_engine_set_mic_muted(e, send ? 0 : 1);
+    if (veil_media_engine_start_audio(e, send, 1) != VEIL_MEDIA_OK) {
+      veil_media_engine_destroy(e);
+      e = nullptr;
+    }
+  }
+  g_call_plane_recording_adm = false;
+  g_call_plane_audio_buffer_packets = 0;
+  return e;
+}
+
+extern "C" int veil_media_test_audio_capture_tone(
+    VeilMediaEngine* e, int frequency_hz) {
+  if (!e || !e->ws || frequency_hz <= 0 || frequency_hz > 8000)
+    return VEIL_MEDIA_ERR_ARG;
+  static_cast<StandRecordingAdm*>(e->ws->adm.get())->CaptureTone(frequency_hz);
+  return VEIL_MEDIA_OK;
+}
+
+extern "C" int veil_media_test_audio_playout_pcm(
+    VeilMediaEngine* e, int16_t* pcm, size_t capacity) {
+  if (!e || !e->ws || !pcm || capacity < 480) return VEIL_MEDIA_ERR_ARG;
+  return static_cast<int>(
+      static_cast<StandRecordingAdm*>(e->ws->adm.get())->Playout(pcm, capacity));
+}
+
 #pragma GCC visibility pop
