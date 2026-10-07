@@ -251,6 +251,12 @@ impl FrameOutbox {
         &self.source_activity
     }
 
+    pub(crate) fn shared_source_activity(
+        &self,
+    ) -> std::sync::Arc<crate::local_source_activity::LocalSourceActivity> {
+        std::sync::Arc::clone(&self.source_activity)
+    }
+
     /// The runner owns this lease only while its datagram sender is usable.
     pub fn activate_datagram_transport(&self) -> Option<crate::DatagramTransportLease> {
         self.activate_datagram_transport_with_neutral_forwards(false)

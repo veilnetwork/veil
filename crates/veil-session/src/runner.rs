@@ -207,9 +207,12 @@ async fn await_next_input(
 
 /// Session-scoped state for the independently encrypted, loss-tolerant media
 /// lane. It exists only after capability AND transport negotiation succeed.
+const LOCAL_TRACE_SLOTS: usize = veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE as usize + 1;
+
 struct RealtimeDatagramLane {
     sender: Arc<Mutex<RealtimeSender>>,
     local_reliable: local_reliable_admission::LocalReliableAdmission,
+    pressure_trace: [(u64, Option<std::time::Instant>); LOCAL_TRACE_SLOTS],
     peer_rotates: bool,
     peer_circuit_datagrams: bool,
     peer_neutral_forwards: bool,
@@ -222,9 +225,9 @@ struct RealtimeSender {
     max_datagram_size: usize,
     // A shared fallback can carry several source slots. Observe each slot
     // independently so its first send cannot hide a later producer's path.
-    logged_send_kinds: [u8; 4],
+    logged_send_kinds: [u8; LOCAL_TRACE_SLOTS],
     congestion_drops: u64,
-    admission_trace: [(u64, u64, u64, Option<std::time::Instant>); 4],
+    admission_trace: [(u64, u64, u64, Option<std::time::Instant>); LOCAL_TRACE_SLOTS],
     last_congestion_log: std::time::Instant,
     broken: bool,
     sent_counter: Option<(Arc<parallel_lanes::ParallelDiagnostics>, usize)>,
@@ -239,9 +242,9 @@ impl RealtimeSender {
             max_datagram_size: handle.max_size().unwrap_or(0),
             handle,
             tx,
-            logged_send_kinds: [0; 4],
+            logged_send_kinds: [0; LOCAL_TRACE_SLOTS],
             congestion_drops: 0,
-            admission_trace: [(0, 0, 0, None); 4],
+            admission_trace: [(0, 0, 0, None); LOCAL_TRACE_SLOTS],
             last_congestion_log: std::time::Instant::now(),
             broken: false,
             sent_counter: None,
@@ -302,6 +305,34 @@ impl RealtimeSender {
 }
 
 impl RealtimeDatagramLane {
+    fn trace_source_pressure(
+        &mut self,
+        logger: &veil_observability::NodeLogger,
+        peer: &NodeIdBytes,
+        priority: u8,
+    ) {
+        if !crate::rt_trace::rt_trace_enabled() {
+            return;
+        }
+        let Some((drops, last)) = self.pressure_trace.get_mut(usize::from(priority)) else {
+            return;
+        };
+        *drops = drops.saturating_add(1);
+        let now = std::time::Instant::now();
+        if last.is_some_and(|last| now.duration_since(last).as_secs() < 1) {
+            return;
+        }
+        logger.info(
+            "session.rt_trace.local_source_pressure",
+            format!(
+                "peer_id={} local_slot={priority} drops={drops} scope=endpoint",
+                hex_short(peer)
+            ),
+        );
+        *drops = 0;
+        *last = Some(now);
+    }
+
     fn select_sender(
         &mut self,
         priority: u8,
@@ -3766,8 +3797,10 @@ impl SessionRunner {
                         ),
                     );
                     RealtimeDatagramLane {
-                        local_reliable: local_reliable_admission::LocalReliableAdmission::new(
+                        pressure_trace: [(0, None); LOCAL_TRACE_SLOTS],
+                        local_reliable: local_reliable_admission::LocalReliableAdmission::for_source(
                             offer.handle.clone(),
+                            outbox.as_ref().map(|outbox| outbox.shared_source_activity()).unwrap_or_default(),
                         ),
                         sender: Arc::new(Mutex::new(RealtimeSender::new(
                             offer.handle,
@@ -4347,6 +4380,11 @@ impl SessionRunner {
                         {
                             // Source feedback only; neutral ChildCarrier traffic
                             // above and forwarded INTERACTIVE cells bypass this.
+                            lane.trace_source_pressure(
+                                &self.logger,
+                                &self.peer_id,
+                                outgoing_priority,
+                            );
                             datagram_drained += 1;
                             continue;
                         }
