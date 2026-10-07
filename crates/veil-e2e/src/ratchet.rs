@@ -319,6 +319,10 @@ const CONVERSATION_BLOB_V2: u8 = 2;
 /// reads a field at a fixed offset reads it where it always did. Written from
 /// here on; `2` is still read.
 const CONVERSATION_BLOB_V3: u8 = 3;
+/// V4 adds one bounded receive session for messages sealed during crossed
+/// initiation. Ordinary conversations still write V3. The wire is unchanged;
+/// downgrading a host with a V4 conversation requires a reader supporting V4.
+const CONVERSATION_BLOB_V4: u8 = 4;
 
 /// The most conversations one PEER may hold that this device has never
 /// answered.
@@ -393,8 +397,26 @@ pub const UNPROVEN_TTL_SECS: u64 = 14 * 24 * 60 * 60;
 /// patience.
 pub const WEDGED_AFTER_FRAME_FAILURES: u32 = 3;
 
+struct HeldOpenContext<'a> {
+    ad: &'a [u8],
+    kind: u8,
+    peer_devices: Option<&'a PeerDeviceKeys>,
+    sender_instance: &'a [u8; 16],
+    now_unix: u64,
+}
+
+struct HeldOpened {
+    plaintext: Vec<u8>,
+    authenticated: bool,
+    sender_device_id: Option<[u8; 32]>,
+}
+
 struct Entry {
     session: RatchetSession,
+    /// One other root, only after verified simultaneous initiation. It is
+    /// receive-only until a bare frame proves the peer selected it. No nested
+    /// alternates: memory and persistence cost at most two primitive sessions.
+    crossed_receive: Option<Box<Entry>>,
     /// The peer's device X25519 key this session was keyed to.
     peer_ik: [u8; 32],
     /// How long the evidence that keyed this conversation stays good.
@@ -445,7 +467,8 @@ struct Entry {
     /// never count; the latter must wait for verified freshness admission.
     frame_failures: u32,
     /// The prologue this conversation was built from, kept so a replay of it
-    /// can be told from a peer genuinely re-keying. In memory only.
+    /// can be told from a peer genuinely re-keying. Persisted in V4 when a
+    /// crossed root must also retain consumed-key replay protection.
     accepted_prologue: Option<Vec<u8>>,
     /// Local unix seconds at the last message this conversation carried, in
     /// either direction. Persisted, so a restart does not make every stale
@@ -513,13 +536,166 @@ impl Entry {
         !self.ever_proven()
     }
 
+    fn send_positions(&self) -> Vec<veil_ratchet::SendPosition> {
+        self.session
+            .send_position()
+            .into_iter()
+            .chain(
+                self.crossed_receive
+                    .as_ref()
+                    .and_then(|e| e.session.send_position()),
+            )
+            .collect()
+    }
+
+    fn skipped_len(&self) -> usize {
+        self.session.skipped_len()
+            + self
+                .crossed_receive
+                .as_ref()
+                .map_or(0, |e| e.session.skipped_len())
+    }
+
+    /// Consume under either held root before considering a new PQXDH. Failed
+    /// decrypts are transactional in the primitive; neither root advances.
+    fn open_held(
+        &mut self,
+        frame: &[u8],
+        context: &HeldOpenContext<'_>,
+        rng: &mut impl RatchetRng,
+    ) -> Result<HeldOpened, RatchetError> {
+        let error = match self.session.decrypt(frame, context.ad, rng) {
+            Ok(plaintext) => {
+                let (authenticated, device) = self.note_opened(
+                    &plaintext,
+                    context.peer_devices,
+                    context.sender_instance,
+                    context.now_unix,
+                );
+                return Ok(HeldOpened {
+                    plaintext,
+                    authenticated,
+                    sender_device_id: device,
+                });
+            }
+            Err(error) => error,
+        };
+        if let Some(other) = self.crossed_receive.as_mut() {
+            match other.session.decrypt(frame, context.ad, rng) {
+                Ok(plaintext) => {
+                    let (authenticated, device) = other.note_opened(
+                        &plaintext,
+                        context.peer_devices,
+                        context.sender_instance,
+                        context.now_unix,
+                    );
+                    self.peer_sent_at = self.peer_sent_at.max(other.peer_sent_at);
+                    self.last_used_at = context.now_unix;
+                    self.frame_failures = 0;
+                    if context.kind == KIND_FRAME {
+                        // A bare frame means the peer has heard back under
+                        // this root. Honour its choice, including an older
+                        // peer that cannot arbitrate crossed initiations.
+                        let mut selected = self.crossed_receive.take().unwrap();
+                        std::mem::swap(self, &mut selected);
+                        self.peer_sent_at = self.peer_sent_at.max(selected.peer_sent_at);
+                        self.crossed_receive = Some(selected);
+                    }
+                    return Ok(HeldOpened {
+                        plaintext,
+                        authenticated,
+                        sender_device_id: device,
+                    });
+                }
+                Err(RatchetError::MessageKeyUnavailable) => {
+                    // A consumed key under EITHER root is a replay, not a
+                    // wedge and not permission to repeat a key agreement.
+                    return Err(RatchetError::MessageKeyUnavailable);
+                }
+                Err(_) => {}
+            }
+        }
+        Err(error)
+    }
+
+    fn note_opened(
+        &mut self,
+        plaintext: &[u8],
+        peer_devices: Option<&PeerDeviceKeys>,
+        sender_instance: &[u8; 16],
+        now_unix: u64,
+    ) -> (bool, Option<[u8; 32]>) {
+        self.pending_prologue = None;
+        self.frame_failures = 0;
+        if let Some(t) = sent_at(plaintext, now_unix) {
+            self.peer_sent_at = self.peer_sent_at.max(t);
+        }
+        if announces_tree(plaintext, now_unix) {
+            self.session.note_peer_supports_tree();
+        }
+        self.last_used_at = now_unix;
+        if let Some(until) =
+            peer_devices.and_then(|d| d.authorized_until(sender_instance, &self.peer_ik))
+        {
+            self.authenticated_until = self.authenticated_until.max(until);
+        }
+        let authenticated = self.is_authenticated(now_unix);
+        let device = if authenticated {
+            peer_devices.and_then(|d| d.device_for_key(sender_instance, &self.peer_ik, now_unix))
+        } else {
+            None
+        };
+        (authenticated, device)
+    }
+
+    fn recognizes_prologue(&self, blob: &[u8]) -> bool {
+        self.accepted_prologue
+            .as_deref()
+            .is_some_and(|p| blob.starts_with(p))
+            || self.crossed_receive.as_ref().is_some_and(|e| {
+                e.accepted_prologue
+                    .as_deref()
+                    .is_some_and(|p| blob.starts_with(p))
+            })
+    }
+
     fn encode(&self) -> Zeroizing<Vec<u8>> {
         let session = self.session.export_state();
         let prologue = self.pending_prologue.as_deref().unwrap_or(&[]);
-        let mut out =
-            Vec::with_capacity(4 + 1 + 32 + 1 + 8 + 1 + 2 + prologue.len() + 4 + session.len());
+        let alternate = self.crossed_receive.as_ref().map(|e| e.encode());
+        let accepted = self.accepted_prologue.as_deref().unwrap_or(&[]);
+        let alternate_accepted = self
+            .crossed_receive
+            .as_ref()
+            .and_then(|e| e.accepted_prologue.as_deref())
+            .unwrap_or(&[]);
+        // Reserve the COMPLETE V3/V4 shape before copying any key material.
+        // Growing a plain Vec midway abandons an unwiped old allocation.
+        let exact = 4
+            + 1
+            + 32
+            + 1
+            + 8
+            + 1
+            + if self.pending_prologue.is_some() {
+                2 + prologue.len()
+            } else {
+                0
+            }
+            + 4
+            + session.len()
+            + 8
+            + 8
+            + alternate.as_ref().map_or(0, |a| {
+                2 + accepted.len() + 4 + a.len() + 2 + alternate_accepted.len()
+            });
+        let mut out = Zeroizing::new(Vec::with_capacity(exact));
         out.extend_from_slice(&CONVERSATION_BLOB_MAGIC);
-        out.push(CONVERSATION_BLOB_V3);
+        out.push(if self.crossed_receive.is_some() {
+            CONVERSATION_BLOB_V4
+        } else {
+            CONVERSATION_BLOB_V3
+        });
         out.extend_from_slice(&self.peer_ik);
         // The byte stays where it was, and still says only "was there ever
         // evidence" — a build that predates the stamp reads this file and gets
@@ -550,7 +726,18 @@ impl Entry {
         out.extend_from_slice(&self.authenticated_until.to_be_bytes());
         // V3: the same layout, then this. The next field goes in a V4.
         out.extend_from_slice(&self.peer_sent_at.to_be_bytes());
-        Zeroizing::new(out)
+        if let Some(other) = &self.crossed_receive {
+            debug_assert!(other.crossed_receive.is_none());
+            out.extend_from_slice(&(accepted.len() as u16).to_be_bytes());
+            out.extend_from_slice(accepted);
+            let alternate = alternate.as_ref().unwrap(); // V3, never recursive
+            out.extend_from_slice(&(alternate.len() as u32).to_be_bytes());
+            out.extend_from_slice(alternate);
+            out.extend_from_slice(&(alternate_accepted.len() as u16).to_be_bytes());
+            out.extend_from_slice(alternate_accepted);
+        }
+        debug_assert_eq!(out.len(), exact);
+        out
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, RatchetSpliceError> {
@@ -570,7 +757,13 @@ impl Entry {
             return Err(RatchetSpliceError::Malformed("bad conversation blob magic"));
         }
         let version = take(1)?[0];
-        if version != CONVERSATION_BLOB_V2 && version != CONVERSATION_BLOB_V3 {
+        if ![
+            CONVERSATION_BLOB_V2,
+            CONVERSATION_BLOB_V3,
+            CONVERSATION_BLOB_V4,
+        ]
+        .contains(&version)
+        {
             return Err(RatchetSpliceError::UnsupportedVersion(version));
         }
         let mut peer_ik = [0u8; 32];
@@ -620,7 +813,7 @@ impl Entry {
                 return Err(RatchetSpliceError::Malformed("authorization stamp"));
             }
         };
-        let peer_sent_at = if version == CONVERSATION_BLOB_V3 {
+        let peer_sent_at = if version >= CONVERSATION_BLOB_V3 {
             u64::from_be_bytes(
                 take(8)?
                     .try_into()
@@ -634,6 +827,37 @@ impl Entry {
             // the side of refusing, which leaves the old recovery in place.
             last_used_at
         };
+        let (accepted_prologue, crossed_receive) = if version == CONVERSATION_BLOB_V4 {
+            let len = u16::from_be_bytes(take(2)?.try_into().unwrap()) as usize;
+            if len != 0 && len != PQXDH_PROLOGUE_LEN {
+                return Err(RatchetSpliceError::Malformed("accepted prologue length"));
+            }
+            let accepted = (len != 0)
+                .then(|| take(len))
+                .transpose()?
+                .map(<[u8]>::to_vec);
+            let len = u32::from_be_bytes(take(4)?.try_into().unwrap()) as usize;
+            let alternate = take(len)?;
+            // Check BEFORE recursion: a malicious blob cannot grow a stack or
+            // hide a third session behind an otherwise valid outer entry.
+            if alternate.get(4) != Some(&CONVERSATION_BLOB_V3) {
+                return Err(RatchetSpliceError::Malformed(
+                    "nested crossed receive session",
+                ));
+            }
+            let mut other = Self::decode(alternate)?;
+            let len = u16::from_be_bytes(take(2)?.try_into().unwrap()) as usize;
+            if len != 0 && len != PQXDH_PROLOGUE_LEN {
+                return Err(RatchetSpliceError::Malformed("alternate prologue length"));
+            }
+            other.accepted_prologue = (len != 0)
+                .then(|| take(len))
+                .transpose()?
+                .map(<[u8]>::to_vec);
+            (accepted, Some(Box::new(other)))
+        } else {
+            (None, None)
+        };
         if at != bytes.len() {
             return Err(RatchetSpliceError::Malformed(
                 "trailing bytes in conversation blob",
@@ -641,6 +865,7 @@ impl Entry {
         }
         Ok(Self {
             session,
+            crossed_receive,
             peer_ik,
             authenticated_until,
             proven_before: ever_authenticated,
@@ -648,7 +873,7 @@ impl Entry {
             last_used_at,
             // Never encoded: a restart forgives a wedged conversation anyway.
             frame_failures: 0,
-            accepted_prologue: None,
+            accepted_prologue,
             peer_sent_at,
             last_displace_try: 0,
         })
@@ -720,7 +945,7 @@ impl Inner {
     /// can drive the policy — which entries are swept and which are spared —
     /// without banking sixty-four thousand keys to reach the real one.
     fn enforce_skipped_budget_to(&mut self, budget: usize) -> usize {
-        let total: usize = self.entries.values().map(|e| e.session.skipped_len()).sum();
+        let total: usize = self.entries.values().map(Entry::skipped_len).sum();
         if total <= budget {
             return 0;
         }
@@ -729,8 +954,8 @@ impl Inner {
             let victim = self
                 .entries
                 .iter()
-                .filter(|(_, e)| e.droppable() && e.session.skipped_len() > 0)
-                .max_by_key(|(k, e)| (e.session.skipped_len(), **k))
+                .filter(|(_, e)| e.droppable() && e.skipped_len() > 0)
+                .max_by_key(|(k, e)| (e.skipped_len(), **k))
                 .map(|(k, _)| *k);
             let Some(key) = victim else { break };
             let Some(entry) = self.entries.get_mut(&key) else {
@@ -745,6 +970,13 @@ impl Inner {
             let mut dropped = entry.session.prune_skipped_to_current_epoch();
             if dropped == 0 {
                 dropped = entry.session.clear_skipped();
+            }
+            if let Some(other) = &mut entry.crossed_receive {
+                let mut alternate = other.session.prune_skipped_to_current_epoch();
+                if alternate == 0 {
+                    alternate = other.session.clear_skipped();
+                }
+                dropped += alternate;
             }
             if dropped == 0 {
                 break;
@@ -1077,7 +1309,10 @@ impl RatchetStore {
     /// reservations until a durable snapshot no longer contains the chain.
     #[must_use]
     pub fn send_positions(&self, key: &ConversationKey) -> Vec<veil_ratchet::SendPosition> {
-        self.send_position(key).into_iter().collect()
+        self.lock()
+            .entries
+            .get(key)
+            .map_or_else(Vec::new, Entry::send_positions)
     }
 
     /// Public sending positions in this exact exported snapshot. Decoding
@@ -1087,7 +1322,7 @@ impl RatchetStore {
         blob: &[u8],
     ) -> Result<Vec<veil_ratchet::SendPosition>, RatchetSpliceError> {
         let entry = Entry::decode(blob)?;
-        Ok(entry.session.send_position().into_iter().collect())
+        Ok(entry.send_positions())
     }
 
     /// Step a conversation's sending chain past every index that might
@@ -1111,8 +1346,18 @@ impl RatchetStore {
             .entries
             .get_mut(key)
             .ok_or(RatchetSkipError::NoConversation)?;
-        let burned = entry
+        let session = if entry
             .session
+            .send_position()
+            .is_some_and(|p| p.chain == to.chain)
+        {
+            &mut entry.session
+        } else if let Some(other) = &mut entry.crossed_receive {
+            &mut other.session
+        } else {
+            &mut entry.session
+        };
+        let burned = session
             .skip_send_to(to)
             .map_err(|e| RatchetSkipError::Ratchet(e.to_string()))?;
         if burned > 0 {
@@ -1153,7 +1398,11 @@ impl RatchetStore {
         // quiet moment to sweep: once per conversation per session, off every
         // hot path. Measured before this existed: 324 banked keys spanning 42
         // epochs, in a 23 KB state rewritten on every advance.
-        let dropped = entry.session.prune_skipped_to_current_epoch();
+        let dropped = entry.session.prune_skipped_to_current_epoch()
+            + entry
+                .crossed_receive
+                .as_mut()
+                .map_or(0, |e| e.session.prune_skipped_to_current_epoch());
         let mut g = self.lock();
         if !g.entries.contains_key(key) && !g.make_room(key, now_unix) {
             return Err(RatchetSpliceError::StoreFull);
@@ -1468,6 +1717,7 @@ fn seal_inner(
                 key,
                 Entry {
                     session,
+                    crossed_receive: None,
                     peer_ik: *peer.ratchet_pk,
                     // Read out of a certificate whose signature chain the
                     // caller verified — proven from the reply on, and only for
@@ -1643,6 +1893,13 @@ fn open_inner(
         &me.local_node_id,
         &me.local_instance_id,
     );
+    let held_context = HeldOpenContext {
+        ad: &ad,
+        kind,
+        peer_devices,
+        sender_instance: &sender_instance_id,
+        now_unix,
+    };
     let mut rng = OsRatchetRng;
 
     let (message, frame) = match kind {
@@ -1686,8 +1943,9 @@ fn open_inner(
     // * one nothing has ever confirmed — a stranger who got in first holds it,
     //   and the contact whose certificate we verified is asking for it back;
     // * one we opened ourselves and have never heard a word back on — the peer
-    //   is starting over, and there is nothing received to lose. Our own frames
-    //   on it went unread either way.
+    //   is starting over, or both endpoints initiated at once. Crossed
+    //   initiation retains a bounded second receive root rather than dropping
+    //   already sealed messages.
     //
     // A proven, answered conversation is untouchable, so a stranger's prologue
     // and a replay of the peer's own both stop here — the second could
@@ -1727,46 +1985,12 @@ fn open_inner(
     {
         let mut g = store.lock();
         if let Some(entry) = g.entries.get_mut(&key) {
-            match entry.session.decrypt(&frame, &ad, &mut rng) {
-                Ok(plaintext) => {
-                    // Something of theirs opened, so they have our half of the
-                    // exchange and the prologue has done its job.
-                    entry.pending_prologue = None;
-                    // Opening again — whatever streak there was is history.
-                    entry.frame_failures = 0;
-                    // After the tag verified, like everything else here.
-                    if let Some(t) = sent_at(&plaintext, now_unix) {
-                        entry.peer_sent_at = entry.peer_sent_at.max(t);
-                    }
-                    // Likewise only once the tag verified. Our next NEW
-                    // sending chain to them is then a tree.
-                    if announces_tree(&plaintext, now_unix) {
-                        entry.session.note_peer_supports_tree();
-                    }
-                    // Only here, after the tag verified. A frame that failed
-                    // moved nothing else and must not move this either, or the
-                    // eviction order becomes something an attacker writes by
-                    // aiming garbage at whichever conversation it wants kept.
-                    entry.last_used_at = now_unix;
-                    // Refreshed on EVERY frame that opens, not only the first
-                    // time. The stamp is the certificate's, so a peer that
-                    // re-published moves it forward and a peer whose
-                    // certificate lapsed lets it run out — which is the whole
-                    // difference between asking "was this ever proven" and
-                    // "is it proven now".
-                    if let Some(until) = peer_devices
-                        .and_then(|d| d.authorized_until(&sender_instance_id, &entry.peer_ik))
-                    {
-                        entry.authenticated_until = entry.authenticated_until.max(until);
-                    }
-                    let authenticated = entry.is_authenticated(now_unix);
-                    let sender_device_id = if authenticated {
-                        peer_devices.and_then(|devices| {
-                            devices.device_for_key(&sender_instance_id, &entry.peer_ik, now_unix)
-                        })
-                    } else {
-                        None
-                    };
+            match entry.open_held(&frame, &held_context, &mut rng) {
+                Ok(HeldOpened {
+                    plaintext,
+                    authenticated,
+                    sender_device_id,
+                }) => {
                     g.commit_change(key);
                     // A frame that opened may have banked keys for the ones it
                     // arrived ahead of. Checked HERE, after the tag verified,
@@ -1795,11 +2019,8 @@ fn open_inner(
                     // session nobody can read, forever. Give the conversation
                     // up and say so; the caller's answer is what gets the peer
                     // to start over.
-                    let is_replay_of_our_own = kind == KIND_PROLOGUE
-                        && entry
-                            .accepted_prologue
-                            .as_deref()
-                            .is_some_and(|p| blob.len() >= p.len() && &blob[..p.len()] == p);
+                    let is_replay_of_our_own =
+                        kind == KIND_PROLOGUE && entry.recognizes_prologue(blob);
                     // A consumed message key and an already accepted prologue
                     // cannot diagnose a broken conversation. Reject them
                     // without counting a wedge or asking the sender to reset
@@ -1908,6 +2129,29 @@ fn open_inner(
                 // does not keep the session: the message opened and still goes
                 // up, because refusing to *read* a genuine message would be a
                 // worse answer than refusing to remember the conversation.
+                if let Some(entry) = g.entries.get_mut(&key)
+                    && entry.recognizes_prologue(blob)
+                {
+                    // Another receiver may have admitted this prologue while
+                    // PQXDH ran unlocked. Consume against its stored session;
+                    // never hand up the independently opened plaintext twice.
+                    let HeldOpened {
+                        plaintext,
+                        authenticated,
+                        sender_device_id,
+                    } = entry
+                        .open_held(&frame, &held_context, &mut rng)
+                        .map_err(RatchetSpliceError::PrologueRefused)?;
+                    g.commit_change(key);
+                    g.enforce_skipped_budget();
+                    return Ok(Opened {
+                        plaintext,
+                        ack_key: [0u8; ACK_KEY_LEN],
+                        key,
+                        authenticated,
+                        sender_device_id,
+                    });
+                }
                 let sealed_at = sent_at(&plaintext, now_unix);
                 let admit = match g.entries.get(&key) {
                     // Replacing one we hold: allowed, and costs no room.
@@ -1933,25 +2177,58 @@ fn open_inner(
                 if let Some(replaces) = admit
                     && (replaces || g.make_room(&key, now_unix))
                 {
-                    g.entries.insert(
-                        key,
-                        Entry {
-                            session,
-                            peer_ik,
-                            authenticated_until,
-                            proven_before: false,
-                            pending_prologue: None,
-                            last_used_at: now_unix,
-                            frame_failures: 0,
-                            // Reached only down the prologue path, so this IS
-                            // the prologue the conversation was built from.
-                            accepted_prologue: Some(blob[..PQXDH_PROLOGUE_LEN].to_vec()),
-                            // The bar the NEXT prologue has to clear.
-                            peer_sent_at: sealed_at.unwrap_or(0),
-                            last_displace_try: 0,
-                        },
-                    );
+                    let mut incoming = Entry {
+                        session,
+                        crossed_receive: None,
+                        peer_ik,
+                        authenticated_until,
+                        proven_before: false,
+                        pending_prologue: None,
+                        last_used_at: now_unix,
+                        frame_failures: 0,
+                        accepted_prologue: Some(blob[..PQXDH_PROLOGUE_LEN].to_vec()),
+                        peer_sent_at: sealed_at.unwrap_or(0),
+                        last_displace_try: 0,
+                    };
+                    let crossed = g.entries.get(&key).is_some_and(|e| {
+                        proves_authorship && e.pending_prologue.is_some() && e.peer_ik == peer_ik
+                    });
+                    if crossed {
+                        let mut held = g.entries.remove(&key).unwrap();
+                        if held.crossed_receive.is_some() && !fresher(&held, sealed_at) {
+                            g.entries.insert(key, held);
+                            return Err(RatchetSpliceError::PrologueRefused(
+                                RatchetError::AuthFailed,
+                            ));
+                        }
+                        // Canonical initiator is a device tuple, so it also
+                        // works for two devices belonging to the same node.
+                        // Do not pin an old unanswered chain beyond the fresh
+                        // responder's linear skip limit: that would block a
+                        // one-way peer restart rather than heal it.
+                        let keep_local = (me.local_node_id, me.local_instance_id)
+                            < (*sender_node_id, sender_instance_id)
+                            && held
+                                .session
+                                .send_position()
+                                .is_some_and(|p| p.next as usize <= veil_ratchet::MAX_SKIP);
+                        if keep_local {
+                            held.peer_sent_at = held.peer_sent_at.max(incoming.peer_sent_at);
+                            held.last_used_at = now_unix;
+                            held.frame_failures = 0;
+                            held.crossed_receive = Some(Box::new(incoming));
+                            g.entries.insert(key, held);
+                        } else {
+                            held.crossed_receive = None;
+                            incoming.peer_sent_at = incoming.peer_sent_at.max(held.peer_sent_at);
+                            incoming.crossed_receive = Some(Box::new(held));
+                            g.entries.insert(key, incoming);
+                        }
+                    } else {
+                        g.entries.insert(key, incoming);
+                    }
                     g.commit_change(key);
+                    g.enforce_skipped_budget();
                 }
                 return Ok(Opened {
                     plaintext,
@@ -4096,11 +4373,13 @@ mod tests {
         assert_eq!(got.plaintext, b"starting over");
         assert!(got.authenticated);
 
-        // And the conversation now runs on the session the peer opened.
+        // The answer opens immediately. With crossed-init arbitration it
+        // can carry our own pending prologue: these inputs are identical to
+        // simultaneous initiation, so insisting on a bare reply would force
+        // both endpoints to discard opposite roots again.
         let back = seal(&a.store, &a.me(), keys(&b, &bek, &bpk), b"here now", NOW)
             .expect("seal")
             .0;
-        assert_eq!(back[2], KIND_FRAME);
         let a_pk = a.ratchet_pk();
         assert_eq!(
             open(
@@ -5622,7 +5901,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Known crossed-init defect: resolver must preserve pending-peer recovery and replay protection"]
     fn simultaneous_initiations_converge_before_the_next_bare_frame() {
         for reverse_delivery in [false, true] {
             let (a, b) = (device(0xA3), device(0xB3));
@@ -5631,11 +5909,17 @@ mod tests {
             let b_first = seal_at(&b, &a, b"B first", NOW);
             assert_eq!((a_first[2], b_first[2]), (0, 0));
             if reverse_delivery {
-                let _ = open_at(&a, &b, &b_first, NOW);
+                assert_eq!(
+                    open_at(&a, &b, &b_first, NOW).unwrap().plaintext,
+                    b"B first"
+                );
                 open_at(&b, &a, &a_first, NOW).unwrap();
             } else {
                 open_at(&b, &a, &a_first, NOW).unwrap();
-                let _ = open_at(&a, &b, &b_first, NOW);
+                assert_eq!(
+                    open_at(&a, &b, &b_first, NOW).unwrap().plaintext,
+                    b"B first"
+                );
             }
             let b_next = seal_at(&b, &a, b"B retry after A's initiation", NOW + 1);
             assert_eq!(b_next[2], 1);
@@ -5650,6 +5934,293 @@ mod tests {
                 b"A next"
             );
         }
+    }
+
+    fn restore_device_conversation(device: &Device, at: u64) {
+        let key = device.store.keys()[0];
+        let snapshot = device.store.export(&key).unwrap();
+        assert!(device.store.forget(&key));
+        device.store.import(&key, &snapshot, at).unwrap();
+        assert_eq!(
+            device.store.export(&key).unwrap().as_slice(),
+            snapshot.as_slice()
+        );
+    }
+
+    #[test]
+    fn crossed_bursts_open_once_after_reordering_and_restore() {
+        for reverse_delivery in [false, true] {
+            let (a, b) = (device(0xA3), device(0xB3));
+            let seal_message = |from: &Device, to: &Device, i: u8| {
+                let (ek, pk) = (to.ek(), to.ratchet_pk());
+                seal(&from.store, &from.me(), keys(to, &ek, &pk), &[i; 280], NOW).unwrap()
+            };
+            let a_burst: Vec<_> = (0..32).map(|i| seal_message(&a, &b, i)).collect();
+            let b_burst: Vec<_> = (0..32).map(|i| seal_message(&b, &a, i)).collect();
+            for (to, from, burst) in [(&a, &b, &b_burst), (&b, &a, &a_burst)] {
+                let opened = open_at(to, from, &burst[31].0, NOW).unwrap();
+                assert_eq!(opened.plaintext, vec![31; 280]);
+                assert_eq!(opened.ack_key, burst[31].1);
+                assert!(opened.authenticated);
+            }
+            restore_device_conversation(&a, NOW + 1);
+            restore_device_conversation(&b, NOW + 1);
+            let order: Vec<usize> = if reverse_delivery {
+                (0..31).rev().collect()
+            } else {
+                (0..31).collect()
+            };
+            for i in order {
+                for (to, from, burst) in [(&a, &b, &b_burst), (&b, &a, &a_burst)] {
+                    let opened = open_at(to, from, &burst[i].0, NOW + 2).unwrap();
+                    assert_eq!(opened.plaintext, vec![i as u8; 280]);
+                    assert_eq!(opened.ack_key, burst[i].1);
+                    assert!(opened.authenticated);
+                }
+            }
+            let b_next = seal_at(&b, &a, b"canonical reply", NOW + 3);
+            assert_eq!(b_next[2], KIND_FRAME);
+            open_at(&a, &b, &b_next, NOW + 3).unwrap();
+            let a_next = seal_at(&a, &b, b"canonical return", NOW + 4);
+            assert_eq!(a_next[2], KIND_FRAME);
+            open_at(&b, &a, &a_next, NOW + 4).unwrap();
+            restore_device_conversation(&a, NOW + 5);
+            restore_device_conversation(&b, NOW + 5);
+            for (to, from, burst) in [(&a, &b, &b_burst), (&b, &a, &a_burst)] {
+                let key = to.store.keys()[0];
+                let before = to.store.export(&key).unwrap();
+                let version = to.store.version();
+                for (payload, _) in burst {
+                    assert!(open_at(to, from, payload, NOW + 60).is_err());
+                }
+                assert_eq!(
+                    to.store.version(),
+                    version,
+                    "replay never wedges either root"
+                );
+                assert_eq!(to.store.export(&key).unwrap().as_slice(), before.as_slice());
+                let next = seal_at(from, to, b"live after replay", NOW + 61);
+                assert_eq!(
+                    open_at(to, from, &next, NOW + 61).unwrap().plaintext,
+                    b"live after replay"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn crossed_devices_of_one_identity_choose_by_instance() {
+        let (a, mut b) = (device(0x71), device(0x72));
+        b.node_id = a.node_id;
+        let a_first = seal_at(&a, &b, b"device A", NOW);
+        let b_first = seal_at(&b, &a, b"device B", NOW);
+        open_at(&a, &b, &b_first, NOW).unwrap();
+        open_at(&b, &a, &a_first, NOW).unwrap();
+        let reply = seal_at(&b, &a, b"joined", NOW + 1);
+        assert_eq!(reply[2], KIND_FRAME);
+        open_at(&a, &b, &reply, NOW + 1).unwrap();
+        let reply = seal_at(&a, &b, b"joined too", NOW + 2);
+        assert_eq!(reply[2], KIND_FRAME);
+        open_at(&b, &a, &reply, NOW + 2).unwrap();
+    }
+
+    #[test]
+    fn a_pending_chain_beyond_the_fresh_skip_window_does_not_pin_a_restart() {
+        let (a, b) = (device(0x73), device(0x74));
+        seal_at(&a, &b, b"unanswered", NOW);
+        let key = a.store.keys()[0];
+        let mut position = a.store.send_position(&key).unwrap();
+        position.next = veil_ratchet::MAX_SKIP as u32 + 2;
+        a.store.skip_send_to(&key, position).unwrap();
+        let restart = seal_at(&b, &a, b"new peer root", NOW + 20);
+        open_at(&a, &b, &restart, NOW + 20).unwrap();
+        let reply = seal_at(&a, &b, b"immediate readable reply", NOW + 21);
+        assert_eq!(reply[2], KIND_FRAME);
+        assert_eq!(
+            open_at(&b, &a, &reply, NOW + 21).unwrap().plaintext,
+            b"immediate readable reply"
+        );
+    }
+
+    #[test]
+    fn crossed_auxiliary_reservations_survive_restore_and_root_selection() {
+        let (a, b) = (device(0x75), device(0x76));
+        let a_first = seal_at(&a, &b, b"A", NOW);
+        seal_at(&b, &a, b"B", NOW);
+        let b_key = b.store.keys()[0];
+        let old_position = b.store.send_position(&b_key).unwrap();
+        open_at(&b, &a, &a_first, NOW).unwrap();
+        let snapshot = b.store.export(&b_key).unwrap();
+        let positions = RatchetStore::stored_send_positions(&snapshot).unwrap();
+        assert_eq!(positions.len(), 2);
+        assert_eq!(positions, b.store.send_positions(&b_key));
+        assert!(positions.contains(&old_position));
+        restore_device_conversation(&b, NOW + 1);
+        let mut reserved = old_position;
+        reserved.next += 8;
+        assert_eq!(b.store.skip_send_to(&b_key, reserved).unwrap(), 8);
+        assert!(b.store.send_positions(&b_key).contains(&reserved));
+        let restored = b.store.export(&b_key).unwrap();
+        assert!(
+            RatchetStore::stored_send_positions(&restored)
+                .unwrap()
+                .contains(&reserved)
+        );
+    }
+
+    #[test]
+    fn a_bare_frame_from_a_non_arbitrating_peer_selects_the_held_other_root() {
+        let (a, b) = (device(0x77), device(0x78));
+        let a_first = seal_at(&a, &b, b"A", NOW);
+        let b_first = seal_at(&b, &a, b"B", NOW);
+        open_at(&a, &b, &b_first, NOW).unwrap();
+        // Model the old peer's displacement: it always follows the incoming
+        // root, even when its tuple would retain its own initiation now.
+        {
+            let key = a.store.keys()[0];
+            let mut g = a.store.lock();
+            let entry = g.entries.get_mut(&key).unwrap();
+            let mut selected = entry.crossed_receive.take().unwrap();
+            std::mem::swap(entry, &mut selected);
+            // The old build has no alternate receive state at all.
+        }
+        open_at(&b, &a, &a_first, NOW).unwrap();
+        restore_device_conversation(&b, NOW + 1);
+        let legacy_reply = seal_at(&a, &b, b"old peer answered B root", NOW + 2);
+        assert_eq!(legacy_reply[2], KIND_FRAME);
+        assert_eq!(
+            open_at(&b, &a, &legacy_reply, NOW + 2).unwrap().plaintext,
+            b"old peer answered B root"
+        );
+        let back = seal_at(&b, &a, b"B follows peer choice", NOW + 3);
+        assert_eq!(back[2], KIND_FRAME);
+        assert_eq!(
+            open_at(&a, &b, &back, NOW + 3).unwrap().plaintext,
+            b"B follows peer choice"
+        );
+    }
+
+    #[test]
+    fn crossed_v4_refuses_truncation_trailing_bytes_and_nested_sessions() {
+        let (a, b) = (device(0x79), device(0x7A));
+        seal_at(&a, &b, b"A", NOW);
+        let b_first = seal_at(&b, &a, b"B", NOW);
+        open_at(&a, &b, &b_first, NOW).unwrap();
+        let key = a.store.keys()[0];
+        let snapshot = a.store.export(&key).unwrap();
+        assert_eq!(snapshot[4], CONVERSATION_BLOB_V4);
+        assert_eq!(
+            snapshot.capacity(),
+            snapshot.len(),
+            "export must not abandon a secret allocation"
+        );
+        for cut in [1, 2, PQXDH_PROLOGUE_LEN, snapshot.len() / 2] {
+            assert!(Entry::decode(&snapshot[..snapshot.len() - cut]).is_err());
+        }
+        let mut trailing = snapshot.to_vec();
+        trailing.push(0);
+        assert!(Entry::decode(&trailing).is_err());
+        // Locate the nested V3 record by its magic, and claim it is V4.
+        let offset = snapshot[5..]
+            .windows(5)
+            .position(|w| w == [b'V', b'R', b'C', b'1', 3])
+            .unwrap()
+            + 5;
+        let mut nested = snapshot.to_vec();
+        nested[offset + 4] = CONVERSATION_BLOB_V4;
+        assert!(matches!(
+            Entry::decode(&nested),
+            Err(RatchetSpliceError::Malformed(
+                "nested crossed receive session"
+            ))
+        ));
+    }
+
+    #[test]
+    fn a_forged_prologue_cannot_create_a_crossed_receive_root() {
+        let (a, b, mut stranger) = (device(0x7B), device(0x7C), device(0x7D));
+        // Same claimed node and instance, different secret: actually target
+        // the held conversation instead of an unrelated fresh entry.
+        stranger.node_id = b.node_id;
+        stranger.instance_id = b.instance_id;
+        seal_at(&a, &b, b"pending genuine", NOW);
+        let forged = seal_at(&stranger, &a, b"forged", NOW);
+        let key = a.store.keys()[0];
+        let before = a.store.export(&key).unwrap();
+        let pk = b.ratchet_pk();
+        for _ in 0..4 {
+            let result = open(
+                &a.store,
+                &a.me(),
+                &b.node_id,
+                &forged,
+                Some(&dev(stranger.instance_id, &pk)),
+                NOW,
+            );
+            assert!(result.is_err());
+        }
+        assert_eq!(a.store.export(&key).unwrap().as_slice(), before.as_slice());
+        assert!(a.store.lock().entries[&key].crossed_receive.is_none());
+        let genuine = seal_at(&b, &a, b"genuine", NOW);
+        assert_eq!(
+            open_at(&a, &b, &genuine, NOW).unwrap().plaintext,
+            b"genuine"
+        );
+    }
+
+    #[test]
+    fn concurrent_crossed_prologue_receivers_deliver_one_plaintext() {
+        let (a, b) = (device(0x7E), device(0x7F));
+        let a_first = seal_at(&a, &b, b"A", NOW);
+        let b_first = seal_at(&b, &a, b"one B message", NOW);
+        let start = std::sync::Barrier::new(16);
+        let opened = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        open_at(&a, &b, &b_first, NOW).ok()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .filter_map(|t| t.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].plaintext, b"one B message");
+        assert_eq!(a.store.len(), 1);
+        open_at(&b, &a, &a_first, NOW).unwrap();
+        let reply = seal_at(&b, &a, b"healthy after race", NOW + 1);
+        assert_eq!(
+            open_at(&a, &b, &reply, NOW + 1).unwrap().plaintext,
+            b"healthy after race"
+        );
+    }
+
+    #[test]
+    fn skipped_budget_counts_both_crossed_roots_and_preserves_proven_keys() {
+        let (a, b) = (device(0x81), device(0x82));
+        seal_at(&a, &b, b"A", NOW);
+        let b_burst: Vec<_> = (0..8).map(|i| seal_at(&b, &a, &[i], NOW)).collect();
+        open_at(&a, &b, &b_burst[7], NOW).unwrap();
+        let key = a.store.keys()[0];
+        let mut g = a.store.lock();
+        assert_eq!(g.entries[&key].session.skipped_len(), 0);
+        assert_eq!(g.entries[&key].skipped_len(), 7);
+        assert_eq!(g.enforce_skipped_budget_to(0), 0);
+        assert_eq!(
+            g.entries[&key].skipped_len(),
+            7,
+            "a proven peer keeps the alternate bank"
+        );
+        let entry = g.entries.get_mut(&key).unwrap();
+        // Drive the quota policy's unproven case with the real two-root bank.
+        entry.authenticated_until = 0;
+        entry.proven_before = false;
+        assert_eq!(g.enforce_skipped_budget_to(0), 7);
+        assert_eq!(g.entries[&key].skipped_len(), 0);
     }
 
     /// The case this exists for. Alice and Bob are proven and answered; Alice

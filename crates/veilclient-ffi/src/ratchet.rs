@@ -74,12 +74,12 @@ pub const VEIL_RATCHET_KEY_LEN: size_t = 64;
 
 /// Upper bound on one conversation's exported state.
 ///
-/// An established session is about 1.4 kB; the rest is the skipped-message-key
-/// cache, at 68 bytes per key banked for a frame that has not arrived yet, and
-/// the ratchet caps that. A host sizing a buffer to this never sees a short
-/// write.
+/// Ordinary state is about 1.4 kB. A crossed initiation retains at most two
+/// primitive sessions, each bounded by skipped-key and tree-node limits. One
+/// MiB covers both worst-case banks and prologues; it is a buffer ceiling,
+/// not an allocation made for every conversation.
 #[cfg(feature = "node-embedded")]
-pub const VEIL_RATCHET_MAX_STATE_LEN: size_t = 256 * 1024;
+pub const VEIL_RATCHET_MAX_STATE_LEN: size_t = 1024 * 1024;
 
 /// Returned when a conversation key names nothing this node holds.
 #[cfg(feature = "node-embedded")]
@@ -1018,6 +1018,107 @@ mod send_position_snapshot_tests {
         assert_eq!(&buf[68..72], &[16, 32, 48, 64]);
         assert_eq!(&buf[72..], &[0xa5; 8]);
         assert!(err.is_null());
+    }
+
+    #[test]
+    fn the_state_ceiling_covers_two_bounded_ratchets() {
+        // Fixed primitive fields occupy less than 2 KiB; bank/tree limits
+        // below also bound import. Include both sender and receiver trees,
+        // both pending and accepted prologues, and wrapper overhead.
+        let primitive = 2048
+            + veil_ratchet::MAX_SKIP_TOTAL * 68
+            + (veil_ratchet::MAX_TREE_NODES_TOTAL + veil_ratchet::MAX_TREE_NODES_PER_CHAIN) * 37;
+        let crossed = 2 * primitive + 4 * veil_ratchet::PQXDH_PROLOGUE_LEN + 512;
+        assert!(crossed < VEIL_RATCHET_MAX_STATE_LEN);
+    }
+
+    #[test]
+    fn a_real_crossed_v4_snapshot_reports_both_retained_positions() {
+        use veil_e2e::ratchet::{PeerDeviceKeys, PeerRatchetKeys, RatchetIdentity, RatchetStore};
+        let identity = |tag: u8| {
+            let seed = [tag; veil_e2e::DK_SEED_BYTES];
+            let (ek, _) = veil_e2e::keypair_from_dk_seed(&seed).unwrap();
+            RatchetIdentity {
+                local_node_id: [tag; 32],
+                local_instance_id: [tag; 16],
+                seed_ring: std::sync::Arc::new(veil_e2e::MlKemSeedRing::new(0, seed, ek)),
+            }
+        };
+        let (a, b) = (identity(0x31), identity(0x32));
+        let (a_store, b_store) = (RatchetStore::new(), RatchetStore::new());
+        let (a_ek, b_ek) = (a.seed_ring.current_ek(), b.seed_ring.current_ek());
+        let (a_pk, b_pk) = (
+            a.seed_ring.current_ratchet_pk(),
+            b.seed_ring.current_ratchet_pk(),
+        );
+        let a_peer = PeerRatchetKeys {
+            node_id: &a.local_node_id,
+            instance_id: &a.local_instance_id,
+            mlkem_ek: &a_ek,
+            ratchet_pk: &a_pk,
+            authorized_until_unix: u64::MAX,
+        };
+        let b_peer = PeerRatchetKeys {
+            node_id: &b.local_node_id,
+            instance_id: &b.local_instance_id,
+            mlkem_ek: &b_ek,
+            ratchet_pk: &b_pk,
+            authorized_until_unix: u64::MAX,
+        };
+        let (a_first, _) = veil_e2e::ratchet::seal(&a_store, &a, b_peer, b"A", 1_000).unwrap();
+        veil_e2e::ratchet::seal(&b_store, &b, a_peer, b"B", 1_000).unwrap();
+        let mut devices = PeerDeviceKeys::default();
+        devices.remember(a.local_instance_id, a_pk, u64::MAX);
+        veil_e2e::ratchet::open(
+            &b_store,
+            &b,
+            &a.local_node_id,
+            &a_first,
+            Some(&devices),
+            1_000,
+        )
+        .unwrap();
+        let key = b_store.keys()[0];
+        let snapshot = b_store.export(&key).unwrap();
+        assert_eq!(snapshot[4], 4);
+        let positions = b_store.send_positions(&key);
+        assert_eq!(positions.len(), 2);
+        let mut buf = [0xa5; 80];
+        let mut count = 99;
+        let mut err = ptr::null_mut();
+        let rc = unsafe {
+            veil_ratchet_stored_send_positions(
+                snapshot.as_ptr(),
+                snapshot.len(),
+                buf.as_mut_ptr(),
+                71,
+                &mut count,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR_RATCHET_BUFFER_TOO_SMALL);
+        assert_eq!(count, 2);
+        assert_eq!(buf, [0xa5; 80]);
+        unsafe { crate::veil_free_string(err) };
+        err = ptr::null_mut();
+        let rc = unsafe {
+            veil_ratchet_stored_send_positions(
+                snapshot.as_ptr(),
+                snapshot.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut count,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_OK);
+        assert!(err.is_null());
+        assert_eq!(count, 2);
+        for (i, at) in positions.iter().enumerate() {
+            assert_eq!(&buf[i * 36..i * 36 + 32], &at.chain);
+            assert_eq!(&buf[i * 36 + 32..i * 36 + 36], &at.next.to_be_bytes());
+        }
+        assert_eq!(&buf[72..], &[0xa5; 8]);
     }
 
     #[test]
