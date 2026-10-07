@@ -1,5 +1,5 @@
 //! Sparse origin observations for local IPC relay admission. No relay policy,
-//! payload parsing or wire fields; queue admission is not end-to-end delivery.
+//! relay payload parsing or wire fields; queue admission is not end-to-end delivery.
 //! `datagram_transport` reports live support for this neutral Forward format,
 //! not merely generic QUIC readiness and not proof of a particular send path.
 
@@ -29,6 +29,72 @@ pub fn set_enabled(on: bool) {
     if !on {
         SAMPLES.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
+}
+
+/// Sample only the existing sealed header of a LOCAL IPC send. This is an
+/// observation, never an authorization, routing or scheduling decision. Match
+/// its epoch/sequence to the SDK's pre-write and authenticated receive samples.
+pub fn sealed_local_sample(stage: &str, local_lane: u8, body: &[u8]) {
+    if !enabled().load(Ordering::Relaxed) {
+        return;
+    }
+    let flags = body
+        .get(100..104)
+        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+        .map(u32::from_be_bytes)
+        .unwrap_or(0);
+    let required = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+        | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
+    if flags & required != required || flags & veil_proto::ipc::IPC_SEND_FLAG_REQUIRE_ACK != 0 {
+        return;
+    }
+    // Borrow the existing bytes. Decoding into PooledShared would copy every
+    // video cell even though only one in fifty is sampled, skewing the stand.
+    let Some(length) = body
+        .get(104..108)
+        .map(|b| u32::from_be_bytes(b.try_into().unwrap()) as usize)
+    else {
+        return;
+    };
+    let Some(end) = 108usize.checked_add(length) else {
+        return;
+    };
+    let Some(data) = body.get(108..end) else {
+        return;
+    };
+    if data.len() < 36 || !data.starts_with(&veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC) {
+        return;
+    }
+    let epoch = u64::from_be_bytes(data[4..12].try_into().unwrap());
+    let seq = u64::from_be_bytes(data[12..20].try_into().unwrap());
+    if seq != 0 && seq.is_multiple_of(50) {
+        log::info!(
+            "ipc.rt_trace.sealed_sample at={} stage={stage} dst={} local_slot={local_lane} epoch={epoch:016x} seq={seq} bytes={}",
+            veil_util::unix_secs_now_u64(),
+            veil_util::bytes_to_hex(&body[..4]),
+            data.len(),
+        );
+    }
+}
+
+/// Called by the local SDK writer after writing a complete IPC frame, or
+/// before dropping it. The daemon entry sample alone cannot prove socket write.
+pub fn sealed_local_frame_sample(stage: &str, frame: &[u8]) {
+    if !enabled().load(Ordering::Relaxed) {
+        return;
+    }
+    let Ok(header) = veil_proto::codec::decode_header(frame) else {
+        return;
+    };
+    if header.family != veil_proto::family::FrameFamily::LocalApp as u8
+        || header.msg_type != veil_proto::family::LocalAppMsg::AppIpcSend as u16
+    {
+        return;
+    }
+    let Some(body) = frame.get(veil_proto::header::HEADER_SIZE..) else {
+        return;
+    };
+    sealed_local_sample(stage, veil_proto::ipc::ipc_local_source_lane(&header), body);
 }
 
 pub(crate) fn observe(
