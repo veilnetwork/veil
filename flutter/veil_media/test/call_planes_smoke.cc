@@ -171,6 +171,7 @@ static int check_group_blocked_audio_stats(void* ctx, uint64_t, uint32_t, uint32
   char* json = veil_media_group_engine_get_stats(static_cast<VeilGroupMediaEngine*>(ctx));
   const bool valid = json && std::strstr(json, "\"worker_stalled\":1") &&
                      std::strstr(json, "\"audio_rx_supported\":1") &&
+                     std::strstr(json, "\"audio_rx_native_age_supported\":1") &&
                      std::strstr(json, "\"audio_receivers\":{}");
   veil_media_free_string(json);
   return valid && std::chrono::steady_clock::now() - start <
@@ -190,6 +191,23 @@ static uint64_t group_audio_packets(VeilGroupMediaEngine* engine, const uint8_t 
   const auto packets = std::strtoull(at + prefix.size(), nullptr, 10);
   veil_media_free_string(json);
   return packets;
+}
+static int64_t group_audio_age(VeilGroupMediaEngine* engine, const uint8_t peer[32]) {
+  constexpr char hex[] = "0123456789abcdef";
+  std::string id;
+  for (size_t i = 0; i < 32; ++i) {
+    id += hex[peer[i] >> 4]; id += hex[peer[i] & 15];
+  }
+  char* json = veil_media_group_engine_get_stats(engine);
+  assert(json && std::strstr(json, "\"audio_rx_native_age_supported\":1"));
+  const auto prefix = "\"" + id + "\":{\"audio_rx_pkts\":";
+  const char* receiver = std::strstr(json, prefix.c_str());
+  assert(receiver);
+  const char* at = std::strstr(receiver, "\"audio_rx_native_age_ms\":");
+  assert(at);
+  const auto age = std::strtoll(at + std::strlen("\"audio_rx_native_age_ms\":"), nullptr, 10);
+  veil_media_free_string(json);
+  return age;
 }
 static void inject_non_audio(uint64_t chan, uint32_t audio, uint32_t video) {
   Callback cb;
@@ -341,6 +359,11 @@ int main() {
     assert(veil_media_group_engine_start_video(e.get()) == VEIL_MEDIA_OK);
     const int result = veil_media_test_group_call_planes(e.get(), inject_group, e.get());
     if (result) { std::fprintf(stderr, "group isolation failed: %d\n", result); return 2; }
+    // The caller stops polling for over a second. Native accepted RTP time
+    // must keep ageing; video/RTCP ingress must not make audio look fresh.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    const int64_t age = group_audio_age(e.get(), peer);
+    assert(age >= 1000 && age < 10000);
     assert(group_audio_packets(e.get(), peer) == 4);
     assert(veil_media_group_engine_peer_rx_packets(e.get(), peer) > 4);
     std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> receiver(
@@ -380,6 +403,7 @@ int main() {
     assert(veil_media_group_engine_remove_peer(e.get(), peer) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_add_peer(e.get(), 23, peer) == VEIL_MEDIA_OK);
     assert(group_audio_packets(e.get(), peer) == 0);
+    assert(group_audio_age(e.get(), peer) == -1);
     assert(veil_media_group_engine_stop_video(e.get()) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_stop_audio(e.get()) == VEIL_MEDIA_OK);
   }
