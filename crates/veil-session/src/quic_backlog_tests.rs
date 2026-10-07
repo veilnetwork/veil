@@ -987,8 +987,13 @@ async fn measure_primary_blackout(
             packets.iter().map(Vec::len).sum(),
             tx.send_buffer_space(),
         ) {
-            let deadline =
-                super::local_primary_datagram_expiry(REALTIME, expiry, std::time::Instant::now());
+            let deadline = expiry.then(|| {
+                super::local_primary_datagram_expiry(&crate::frame_outbox::FrameEnvelope::from((
+                    REALTIME,
+                    veil_bufpool::pooled_shared_from_vec(frame.clone()),
+                )))
+                .unwrap()
+            });
             for packet in packets {
                 match deadline {
                     Some(deadline) => tx.send_before(&packet, deadline).unwrap(),
@@ -1424,9 +1429,13 @@ async fn measure_bound_independent_load(
                 packets.iter().map(Vec::len).sum(),
                 primary.tx.send_buffer_space(),
             ) {
-                let deadline =
-                    super::local_primary_datagram_expiry(REALTIME, true, std::time::Instant::now())
-                        .unwrap();
+                let deadline = super::local_primary_datagram_expiry(
+                    &crate::frame_outbox::FrameEnvelope::from((
+                        REALTIME,
+                        veil_bufpool::pooled_shared_from_vec(frame.clone()),
+                    )),
+                )
+                .unwrap();
                 for packet in packets {
                     primary.tx.send_before(&packet, deadline).unwrap();
                 }
@@ -1791,9 +1800,13 @@ async fn independent_primary_expiry_keeps_parent_control_admission() {
                 packets.iter().map(Vec::len).sum(),
                 primary.tx.send_buffer_space(),
             ) {
-                let expiry =
-                    super::local_primary_datagram_expiry(REALTIME, true, std::time::Instant::now())
-                        .unwrap();
+                let expiry = super::local_primary_datagram_expiry(
+                    &crate::frame_outbox::FrameEnvelope::from((
+                        REALTIME,
+                        veil_bufpool::pooled_shared_from_vec(frame.clone()),
+                    )),
+                )
+                .unwrap();
                 for packet in packets {
                     primary.tx.send_before(&packet, expiry).unwrap();
                 }

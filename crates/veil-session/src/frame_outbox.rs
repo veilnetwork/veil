@@ -462,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_for_ingress_capacity_counts_toward_lossy_age() {
-        use crate::priority_queue::{LOSSY_REALTIME_MAX_AGE, PriorityQueue};
+        use crate::priority_queue::{LOCAL_PRIMARY_MAX_AGE, PriorityQueue};
         use std::{future::Future, time::Duration};
         let (tx, mut rx) = frame_channel(1);
         tx.try_send(frame(REALTIME, 1)).unwrap();
@@ -472,7 +472,7 @@ mod tests {
             Poll::Ready(())
         })
         .await;
-        tokio::time::sleep(LOSSY_REALTIME_MAX_AGE + Duration::from_millis(60)).await;
+        tokio::time::sleep(LOCAL_PRIMARY_MAX_AGE + Duration::from_millis(60)).await;
         rx.recv_envelope().await.unwrap();
         waiting.await.unwrap();
         let mut pq = PriorityQueue::with_default_weights();
