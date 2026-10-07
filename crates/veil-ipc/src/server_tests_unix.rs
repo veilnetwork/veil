@@ -3333,3 +3333,78 @@ async fn remote_stream_credit_violation_cancels_file_without_closing_ipc() {
     let _ = shutdown.send(true);
     task.await.unwrap().unwrap();
 }
+
+/// Authorization uses the session proof; accepted stream replies retain the
+/// physical opener route. An untrusted identity hint cannot rename an opener.
+#[tokio::test]
+async fn stream_identity_authorization_preserves_device_return_route() {
+    use veil_proto::{SenderProvenance, StreamDataPayload, StreamOpenInboundPayload};
+    let physical = [0xEE; 32];
+    let identity = [0xDD; 32];
+    for provenance in [SenderProvenance::SessionPeer, SenderProvenance::Claimed] {
+        let sock = temp_socket_path();
+        let (server, shutdown, registry) = make_server(sock.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut server = server.with_session_tx_registry(Arc::new(CapturingPeerBroadcaster {
+            peer_id: physical,
+            tx,
+        }));
+        let task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut client = connect_and_hello(&sock).await;
+        let bind = AppBindPayload {
+            endpoint_id: 9,
+            flags: 0,
+            namespace: b"identity-stream".to_vec(),
+            name: b"svc".to_vec(),
+        };
+        send_ipc_frame(&mut client, LocalAppMsg::AppBind as u16, &bind.encode()).await;
+        let (_, body) = recv_ipc_frame(&mut client).await;
+        let app = AppBindOkPayload::decode(&body).unwrap().app_id;
+        assert!(registry.route_stream_open_from_identity(
+            app,
+            9,
+            41,
+            physical,
+            identity,
+            provenance,
+            STREAM_INITIAL_WINDOW,
+        ));
+        let (header, body) = recv_ipc_frame(&mut client).await;
+        assert_eq!(header.msg_type, LocalAppMsg::StreamOpenInbound as u16);
+        let inbound = StreamOpenInboundPayload::decode(&body).unwrap();
+        assert_eq!(
+            inbound.src_node_id,
+            if provenance.is_authenticated() {
+                identity
+            } else {
+                physical
+            }
+        );
+        send_ipc_frame(
+            &mut client,
+            LocalAppMsg::StreamData as u16,
+            &StreamDataPayload {
+                stream_id: inbound.stream_id,
+                data: b"reply".to_vec(),
+            }
+            .encode(),
+        )
+        .await;
+        let captured = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
+        drop(client);
+        let _ = shutdown.send(true);
+        task.await.unwrap().unwrap();
+        let (_, frame) = captured
+            .expect("reply was sent to identity instead of physical opener")
+            .unwrap();
+        let header = codec::decode_header(&frame).unwrap();
+        assert_eq!(header.msg_type, veil_proto::AppMsg::AppData as u16);
+        assert_eq!(
+            veil_proto::AppDataPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                .unwrap()
+                .data,
+            b"reply"
+        );
+    }
+}

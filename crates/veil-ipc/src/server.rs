@@ -802,6 +802,7 @@ async fn forward_endpoint(
             AppMessage::StreamOpen {
                 stream_id,
                 src_node_id,
+                src_identity,
                 provenance,
                 initial_window,
             } => {
@@ -846,7 +847,14 @@ async fn forward_endpoint(
                     stream_id,
                     app_id: endpoint_app_id,
                     endpoint_id,
-                    src_node_id,
+                    // The application's allow-list names identities. Its
+                    // stream object still returns bytes through the physical
+                    // opener route recorded above, including on multi-device peers.
+                    src_node_id: if provenance.is_authenticated() {
+                        src_identity
+                    } else {
+                        src_node_id
+                    },
                     initial_window,
                     // Carried through verbatim from whichever open path produced
                     // this message — decided there, at the only place that

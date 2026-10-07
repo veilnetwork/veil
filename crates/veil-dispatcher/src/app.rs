@@ -564,14 +564,15 @@ impl FrameDispatcher {
                     }
                 };
                 // Notify the registered endpoint that a new stream was opened.
-                self.app_registry.route_stream_open(
+                self.app_registry.route_stream_open_from_identity(
                     payload.app_id,
                     payload.endpoint_id,
                     stream_id,
                     // The opener is the authenticated OVL1 session peer this
-                    // APP_OPEN arrived on — read from the session, never from
-                    // the frame body, so it is an identity and not a claim.
+                    // APP_OPEN arrived on. Keep that device as the return route;
+                    // `sender` carries its session-proved identity for app policy.
                     *node_id.as_bytes(),
+                    sender,
                     veil_app::registry::SenderProvenance::SessionPeer,
                     veil_app::APP_STREAM_INITIAL_WINDOW,
                 );
@@ -1184,6 +1185,42 @@ mod sender_identity_tests {
             DEVICE,
             "no registry must not mean no sender",
         );
+    }
+
+    #[test]
+    fn stream_open_keeps_device_route_and_proved_identity_separate() {
+        for identity in [Some(IDENTITY), None] {
+            let mut disp = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+            disp.session_registry = Some(std::sync::Arc::new(Mutex::new(registry_with(identity))));
+            let app_id = [0xCC; 32];
+            let (_handle, mut rx) = disp.app_registry.register(app_id, 9, 16);
+            let body = AppOpenPayload {
+                app_id,
+                endpoint_id: 9,
+                flags: 0,
+            }
+            .encode();
+            let mut header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppOpen as u16);
+            header.body_len = body.len() as u32;
+            header.stream_id = 41;
+            disp.dispatch(&header, &body, DEVICE);
+            match rx.try_recv().unwrap() {
+                veil_app::registry::AppMessage::StreamOpen {
+                    src_node_id,
+                    src_identity,
+                    provenance,
+                    ..
+                } => {
+                    assert_eq!(
+                        src_node_id, DEVICE,
+                        "replies need the original device route"
+                    );
+                    assert_eq!(src_identity, identity.unwrap_or(DEVICE));
+                    assert_eq!(provenance, veil_proto::SenderProvenance::SessionPeer);
+                }
+                other => panic!("expected stream open, got {other:?}"),
+            }
+        }
     }
 
     fn registry_with(sovereign: Option<[u8; 32]>) -> veil_session::SessionRegistry {
