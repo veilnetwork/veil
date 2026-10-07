@@ -359,17 +359,14 @@ fn local_datagram_fits(priority: u8, wire_len: usize, available: usize) -> bool 
     local_datagram_backlog_fits(wire_len, available)
 }
 
-/// Only this endpoint's primary source on its prepared sibling may opt in.
-/// Neutral forwarding and shared fallback retain their ordinary policy.
-const LOCAL_PRIMARY_QUEUE_AGE: std::time::Duration = std::time::Duration::from_millis(200);
-
+/// The primary source deadline is based on original local ingress, including
+/// on the shared fallback. Forwarded cells have INTERACTIVE local class and
+/// do not opt in; no deadline or role is transmitted.
 fn local_primary_datagram_expiry(
-    priority: u8,
-    independent: bool,
-    now: std::time::Instant,
+    envelope: &crate::frame_outbox::FrameEnvelope,
 ) -> Option<std::time::Instant> {
-    (priority == veil_proto::priority::REALTIME && independent)
-        .then_some(now + LOCAL_PRIMARY_QUEUE_AGE)
+    (envelope.frame.0 == veil_proto::priority::REALTIME)
+        .then_some(envelope.queued_at + crate::priority_queue::LOCAL_PRIMARY_MAX_AGE)
 }
 
 /// A prepared primary sibling carries only this endpoint source, so it need
@@ -4308,6 +4305,12 @@ impl SessionRunner {
                             break;
                         };
                         let (outgoing_priority, ref outgoing) = envelope.frame;
+                        if local_primary_datagram_expiry(&envelope)
+                            .is_some_and(|deadline| deadline <= std::time::Instant::now())
+                        {
+                            datagram_drained += 1;
+                            continue;
+                        }
                         if let Some(carrier) = envelope
                             .carrier
                             .as_ref()
@@ -4420,11 +4423,7 @@ impl SessionRunner {
                         let mut send_error = None;
                         // A complete frame's fragments share one deadline.
                         // Expiration never changes nonce/counter allocation.
-                        let expires_at = local_primary_datagram_expiry(
-                            outgoing_priority,
-                            using_parallel,
-                            std::time::Instant::now(),
-                        );
+                        let expires_at = local_primary_datagram_expiry(&envelope);
                         for datagram in &datagrams {
                             if lane.handle.send_buffer_space() < datagram.len() {
                                 lane.congestion_drops = lane.congestion_drops.saturating_add(1);
@@ -5898,25 +5897,31 @@ mod realtime_lane_frame_tests {
     }
 
     #[test]
-    fn outgoing_expiry_is_only_an_independent_local_primary_policy() {
-        let now = std::time::Instant::now();
-        assert!(
-            super::local_primary_datagram_expiry(veil_proto::priority::REALTIME, true, now)
-                .is_some()
+    fn outgoing_expiry_keeps_original_local_primary_ingress_on_every_route() {
+        use crate::frame_outbox::FrameEnvelope;
+        let mut envelope = FrameEnvelope::from((
+            veil_proto::priority::REALTIME,
+            veil_bufpool::pooled_shared_from_vec(vec![1]),
+        ));
+        envelope.queued_at = std::time::Instant::now() - std::time::Duration::from_millis(150);
+        let deadline = super::local_primary_datagram_expiry(&envelope).unwrap();
+        assert_eq!(
+            deadline,
+            envelope.queued_at + crate::priority_queue::LOCAL_PRIMARY_MAX_AGE
         );
         assert!(
-            super::local_primary_datagram_expiry(veil_proto::priority::REALTIME, false, now)
-                .is_none()
+            deadline.duration_since(std::time::Instant::now())
+                <= std::time::Duration::from_millis(50)
         );
-        // A relay's outgoing local class is INTERACTIVE even if a remote
-        // packet claimed REALTIME. No transit or throughput role opts in.
+        // A relay sanitizes every user's local class to INTERACTIVE, even if
+        // the claimed wire priority is REALTIME. Their common age is unchanged.
         for priority in [
             veil_proto::priority::INTERACTIVE,
             veil_proto::priority::BULK,
             veil_proto::priority::BACKGROUND,
         ] {
-            assert!(super::local_primary_datagram_expiry(priority, true, now).is_none());
-            assert!(super::local_primary_datagram_expiry(priority, false, now).is_none());
+            envelope.frame.0 = priority;
+            assert!(super::local_primary_datagram_expiry(&envelope).is_none());
         }
     }
 
