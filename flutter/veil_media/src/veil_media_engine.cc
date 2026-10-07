@@ -177,22 +177,16 @@ void configure_call_audio_transport(webrtc::CallConfig& config) {
   config.bitrate_config.max_bitrate_bps = 96'000;
 }
 
-// NetEq's default 200-packet buffer permits a 3-second target delay at our
-// 20-ms Opus cadence. Relay bursts on a cellular link made the receiver retain
-// over a second of audio even after packet delivery recovered. Even the later
-// 30-packet limit retained ~340-ms decoded PCM latency for several seconds
-// after a controlled 300-ms jitter burst. Keep room for short bursts (240 ms),
-// bound the adaptive target to 180 ms (75% of packet capacity), and shed delay
-// with fast time stretching. A longer outage should be concealed rather than
-// turning the rest of an interactive conversation into delayed playback.
+// Preserve room for 600-ms Opus bursts. A smaller 12-packet capacity reduced
+// decoded PCM latency but flushed useful audio and substantially increased
+// physical call interruptions. A target-delay cap alone also failed the PCM
+// recovery gate. Keep fast time stretching without that lossy capacity change.
 #if defined(VEIL_MEDIA_TEST_HOOKS)
-// Compare candidate buffer limits with actual decoded PCM before changing
-// production policy. Scoped by the stand factory; absent from shipped builds.
 size_t g_call_plane_audio_buffer_packets = 0;
 #endif
 void configure_call_audio_receive(
     webrtc::AudioReceiveStreamInterface::Config& config) {
-  config.jitter_buffer_max_packets = 12;
+  config.jitter_buffer_max_packets = 30;
 #if defined(VEIL_MEDIA_TEST_HOOKS)
   if (g_call_plane_audio_buffer_packets)
     config.jitter_buffer_max_packets = g_call_plane_audio_buffer_packets;
@@ -2303,12 +2297,13 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
             id[2 * i + 1] = hex[entry.second->id[i] & 15];
           }
           id[64] = '\0';
-          char receiver[256];
+          char receiver[320];
           const int size = std::snprintf(receiver, sizeof(receiver),
               "\"%s\":{\"audio_rx_pkts\":%llu,\"audio_delay_ms\":%u,"
-              "\"audio_rx_native_age_ms\":%lld}", id,
+              "\"audio_rx_native_age_ms\":%lld,\"audio_interruption_count\":%d}", id,
               static_cast<unsigned long long>(sample.packets_received),
-              sample.delay_estimate_ms, static_cast<long long>(native_age_ms));
+              sample.delay_estimate_ms, static_cast<long long>(native_age_ms),
+              sample.interruption_count);
           if (size <= 0 || static_cast<size_t>(size) >= sizeof(receiver)) continue;
           if (!audio_receivers.empty()) audio_receivers += ',';
           audio_receivers.append(receiver, static_cast<size_t>(size));
@@ -3577,6 +3572,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     int64_t audio_rx_native_age_ms = -1;
     uint64_t audio_concealed_samples = 0;
     uint64_t audio_concealment_events = 0;
+    uint64_t audio_jb_flushes = 0;
+    uint64_t audio_discarded_packets = 0;
     int audio_interruption_count = 0;
     int audio_interruption_duration_ms = 0;
     uint64_t audio_tx_pkts = 0;
@@ -3647,6 +3644,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         }
         audio_concealed_samples = r.concealed_samples;
         audio_concealment_events = r.concealment_events;
+        audio_jb_flushes = r.jitter_buffer_flushes;
+        audio_discarded_packets = r.packets_discarded;
         audio_interruption_count = r.interruption_count;
         audio_interruption_duration_ms = r.total_interruption_duration_ms;
         jitter_ms = r.jitter_ms;
@@ -3717,6 +3716,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         "{\"tx_pkts\":%llu,\"rx_pkts\":%llu,\"audio_rx_pkts\":%llu,"
         "\"audio_rx_native_age_ms\":%lld,\"audio_concealed_samples\":%llu,"
         "\"audio_concealment_events\":%llu,\"audio_interruption_count\":%d,"
+        "\"audio_jb_flushes\":%llu,\"audio_discarded_packets\":%llu,"
         "\"audio_interruption_duration_ms\":%d,"
         "\"audio_tx_pkts\":%llu,\"mic_muted\":%d,\"tx_bytes\":%llu,"
         "\"audio_tx_rtp_attempts\":%llu,\"audio_tx_rtp_queued\":%llu,"
@@ -3758,7 +3758,10 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<long long>(audio_rx_native_age_ms),
         static_cast<unsigned long long>(audio_concealed_samples),
         static_cast<unsigned long long>(audio_concealment_events),
-        audio_interruption_count, audio_interruption_duration_ms,
+        audio_interruption_count,
+        static_cast<unsigned long long>(audio_jb_flushes),
+        static_cast<unsigned long long>(audio_discarded_packets),
+        audio_interruption_duration_ms,
         static_cast<unsigned long long>(audio_tx_pkts), engine->mic_muted ? 1 : 0,
         static_cast<unsigned long long>(ws->shim->outbound_byte_count()),
         static_cast<unsigned long long>(tx_audio.attempts),
