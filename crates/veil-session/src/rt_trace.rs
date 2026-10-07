@@ -45,6 +45,7 @@ pub fn rt_trace_enabled() -> bool {
 /// Runtime toggle (FFI/debug-hook path for embedded nodes).
 pub fn set_rt_trace(on: bool) {
     cell().store(on, Ordering::Relaxed);
+    veil_transport::set_udp_wire_trace(on);
 }
 
 static PUBLISH_PAUSE: OnceLock<AtomicBool> = OnceLock::new();
