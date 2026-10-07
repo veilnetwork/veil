@@ -425,9 +425,22 @@ impl SharedWriter {
         flags: u32,
         data: &[u8],
     ) -> Result<(), ClientError> {
+        // Ordinary app data is authored here, unlike opaque transit entering
+        // a session's neutral INTERACTIVE queue. Retain that distinction up to
+        // source admission so a burst of small messages cannot bypass audio
+        // pressure just because it needs no envelope fragmentation.
+        // Legacy media/control still selects its established daemon path.
+        let source_data = flags
+            & (veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+                | veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT)
+            == 0;
         self.write_app_ipc_send_with_queue_hint_owned(
-            0,
-            false,
+            if source_data {
+                veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
+            } else {
+                0
+            },
+            source_data,
             dst_node_id,
             src_app_id,
             dst_app_id,
@@ -564,6 +577,11 @@ impl SharedWriter {
 
         let mut hdr = FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppIpcSend as u16);
         hdr.body_len = body_len as u32;
+        veil_proto::ipc::set_ipc_local_source_lane(
+            &mut hdr,
+            veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
+            true,
+        );
         frame.extend_from_slice(&codec::encode_header(&hdr));
 
         // AppIpcSendPayload fixed fields.
@@ -3848,7 +3866,9 @@ mod tests {
         let data = b"opaque sealed payload";
         for flags in [
             0,
+            veil_proto::ipc::IPC_SEND_FLAG_REQUIRE_ACK,
             veil_proto::ipc::IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED,
+            veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT,
             veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
                 | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED,
         ] {
@@ -3858,10 +3878,28 @@ mod tests {
                 .unwrap();
             let legacy = rx.recv().await.unwrap().bytes;
             let legacy_header = veil_proto::codec::decode_header(&legacy).unwrap();
-            assert_eq!(legacy_header.flags, 0, "legacy SDK framing is unchanged");
+            let source_data = flags
+                & (veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+                    | veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT)
+                == 0;
             assert_eq!(
                 veil_proto::ipc::ipc_local_source_lane(&legacy_header),
-                veil_proto::priority::INTERACTIVE
+                if source_data {
+                    veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
+                } else {
+                    veil_proto::priority::INTERACTIVE
+                },
+                "ordinary authored data keeps its origin; controls/media keep their legacy path"
+            );
+            if !source_data {
+                assert_eq!(legacy_header.flags, 0);
+            }
+            let payload =
+                veil_proto::AppIpcSendPayload::decode(&legacy[veil_proto::HEADER_SIZE..]).unwrap();
+            assert_eq!(&*payload.data, data);
+            assert_eq!(
+                payload.require_ack,
+                flags & veil_proto::ipc::IPC_SEND_FLAG_REQUIRE_ACK != 0
             );
             for lane in [0, 2, 3, veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE] {
                 writer
@@ -3880,6 +3918,42 @@ mod tests {
                     "only the local header differs; sealing and anonymous flags survive"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn reply_aware_app_data_retains_origin_and_reply_fields() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let writer = super::SharedWriter::new(tx);
+        for flags in [
+            veil_proto::ipc::IPC_SEND_FLAG_IS_REPLY,
+            veil_proto::ipc::IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED
+                | veil_proto::ipc::IPC_SEND_FLAG_EXPECT_REPLY,
+        ] {
+            writer
+                .write_app_ipc_send_reply_aware(
+                    &[1; 32],
+                    &[2; 32],
+                    &[3; 32],
+                    13,
+                    flags,
+                    987,
+                    42,
+                    b"reply bytes",
+                )
+                .await
+                .unwrap();
+            let bytes = rx.recv().await.unwrap().bytes;
+            let header = veil_proto::codec::decode_header(&bytes).unwrap();
+            assert_eq!(
+                veil_proto::ipc::ipc_local_source_lane(&header),
+                veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
+            );
+            let payload =
+                veil_proto::AppIpcSendPayload::decode(&bytes[veil_proto::HEADER_SIZE..]).unwrap();
+            assert_eq!(&*payload.data, b"reply bytes");
+            assert_eq!(payload.reply_id, 987);
+            assert_eq!(payload.reply_endpoint_id, 42);
         }
     }
 

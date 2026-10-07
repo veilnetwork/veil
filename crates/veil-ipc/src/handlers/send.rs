@@ -1875,9 +1875,17 @@ pub(crate) async fn handle_ipc_send(
                     );
                     if relay_media_sealed {
                         if relayed {
-                            crate::route_trace::sealed_local_sample("relay_queued", ctx.local_priority, body);
+                            crate::route_trace::sealed_local_sample(
+                                "relay_queued",
+                                ctx.local_priority,
+                                body,
+                            );
                         } else {
-                            crate::route_trace::sealed_local_sample("relay_refused", ctx.local_priority, body);
+                            crate::route_trace::sealed_local_sample(
+                                "relay_refused",
+                                ctx.local_priority,
+                                body,
+                            );
                         }
                         crate::route_trace::observe(
                             *local_node_id,
@@ -4538,6 +4546,58 @@ mod ratchet_send_tests {
         let body = veil_proto::app::AppSendPayload::decode(&sent[0].1[veil_proto::HEADER_SIZE..])
             .expect("body");
         assert_eq!(&*body.data, b"plain", "in the clear, exactly as before");
+    }
+
+    #[tokio::test]
+    async fn small_authored_data_retains_its_local_lane_without_disclosing_it() {
+        for direct in [true, false] {
+            let fx = fixture(vec![if direct { PEER } else { RELAY }]);
+            let capture = Arc::new(LaneCapture(
+                Mutex::new(Vec::new()),
+                vec![if direct { PEER } else { RELAY }],
+            ));
+            let mut ctx = fx.ctx(true);
+            ctx.local_priority = veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE;
+            ctx.session_tx_registry = Some(capture.clone());
+            let mut wh = sink().await;
+            handle_ipc_send(
+                &mut SendReply::Inline(&mut wh),
+                &payload(false, b"small authored message"),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            let (lane, frame) = lock!(capture.0).pop().unwrap();
+            assert!(lock!(capture.0).is_empty());
+            assert_eq!(lane, veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE);
+            let header = codec::decode_header(&frame).unwrap();
+            let mut expected_header = FrameHeader::new(header.family, header.msg_type);
+            if !direct {
+                expected_header.set_priority(veil_proto::priority::INTERACTIVE);
+            }
+            assert_eq!(
+                header.flags, expected_header.flags,
+                "retain the existing direct/relay wire header, never the local source selector"
+            );
+            let sealed = if direct {
+                veil_proto::app::AppSendPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                    .unwrap()
+                    .data
+                    .to_vec()
+            } else {
+                let forward =
+                    veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                        .unwrap();
+                assert_eq!(forward.traffic_class, None);
+                forward.envelope.payload
+            };
+            let opened = fx
+                .peer
+                .open_payload(&ME, &sealed, veil_util::unix_secs_now_u64())
+                .unwrap();
+            assert!(opened.authenticated);
+            assert_eq!(opened.plaintext, b"small authored message");
+        }
     }
 
     /// The relay path carries the same payload, under the delivery envelope.

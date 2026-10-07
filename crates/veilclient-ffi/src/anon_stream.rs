@@ -731,8 +731,18 @@ impl CellSender for AnonCells {
                 )
                 .await
         } else {
+            // This producer knows SYN/ACK/FIN/RST are stream flow control.
+            // Preserve their established local admission explicitly instead
+            // of inheriting the SDK's ordinary app-data source default.
             self.sender
-                .send_anonymous_authenticated(dst.node, dst.app, STREAM_ENDPOINT_ID, &cell)
+                .send_on_local_lane(
+                    veil_proto::priority::INTERACTIVE,
+                    dst.node,
+                    dst.app,
+                    STREAM_ENDPOINT_ID,
+                    &cell,
+                    true,
+                )
                 .await
         };
         sent.map_err(|e| io::Error::other(format!("anon stream send: {e}")))
