@@ -44,7 +44,7 @@ use std::ffi::CStr;
 /// while the cbindgen diff fails.
 #[test]
 fn local_lane_send_rejects_invalid_hints_before_inputs() {
-    for (lane, anonymous) in [(4, 0), (0, 2), (255, 255)] {
+    for (lane, anonymous) in [(5, 0), (0, 2), (255, 255)] {
         let mut err = ptr::null_mut();
         let rc = unsafe {
             veil_send_on_local_lane(

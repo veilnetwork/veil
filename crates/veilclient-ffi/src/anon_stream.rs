@@ -10,7 +10,7 @@
 //!   FRESH onion circuit + per-cell signature/verify. Reliable, but the per-cell
 //!   circuit build inflates the RTT and the varying paths cause reordering →
 //!   spurious recoveries → ~42 KB/s (device-measured).
-//!   DATA selects the endpoint's background source lane; controls keep their
+//!   DATA selects the endpoint's recoverable source lane; controls keep their
 //!   ordinary lane. The source choice is absent from relay frames.
 //! - PINNED CIRCUIT (`CircuitCells`, opt-in `VEIL_ONION_STREAM_CIRCUIT=1`): a
 //!   build-once inbound stateful circuit to this node's published rendezvous relay
@@ -722,7 +722,7 @@ impl CellSender for AnonCells {
             self.data_pacer.wait(dst.node).await;
             self.sender
                 .send_on_local_lane(
-                    veil_proto::priority::BACKGROUND,
+                    veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
                     dst.node,
                     dst.app,
                     STREAM_ENDPOINT_ID,
@@ -1946,7 +1946,7 @@ impl CircuitCells {
             self.services.send_circuit_datagram_on_local_lane_detailed(
                 circuit,
                 envelope,
-                veil_proto::priority::BACKGROUND,
+                veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
             )
         } else {
             self.services.send_circuit_cell_detailed(circuit, envelope)

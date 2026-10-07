@@ -2410,6 +2410,7 @@ mod ratchet_send_tests {
             veil_proto::priority::REALTIME,
             veil_proto::priority::BULK,
             veil_proto::priority::BACKGROUND,
+            veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
         ] {
             ctx.local_priority = lane;
             handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)

@@ -170,7 +170,7 @@ impl Stand {
                 if from >= 2 {
                     assert_eq!(priority, veil_proto::priority::INTERACTIVE);
                 }
-                if from < 2 && priority == veil_proto::priority::BACKGROUND {
+                if from < 2 && priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE {
                     use std::sync::atomic::Ordering;
                     assert_eq!(
                         header.msg_type,
