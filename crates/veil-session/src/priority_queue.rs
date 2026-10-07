@@ -93,6 +93,14 @@ pub(crate) fn lossy_realtime_max_age(priority: u8) -> Duration {
     }
 }
 
+/// A source pressure wait must not prevent other WRR classes from running.
+/// A batch boundary instead flushes immediately to retain ciphertext ordering.
+pub(crate) enum HeadAdmission {
+    Allow,
+    DeferSource,
+    FlushBatch,
+}
+
 struct QueuedFrame {
     frame: veil_bufpool::PooledShared,
     enqueued_at: Option<Instant>,
@@ -543,6 +551,20 @@ impl PriorityQueue {
         &mut self,
         predicate: impl FnOnce(u8, &[u8]) -> bool,
     ) -> Option<crate::frame_outbox::FrameEnvelope> {
+        let mut predicate = Some(predicate);
+        self.pop_admitted_envelope(|priority, frame, _owned_reliable| {
+            if predicate.take().expect("selected FIFO head evaluated once")(priority, frame) {
+                HeadAdmission::Allow
+            } else {
+                HeadAdmission::FlushBatch
+            }
+        })
+    }
+
+    pub(crate) fn pop_admitted_envelope(
+        &mut self,
+        mut predicate: impl FnMut(u8, &[u8], bool) -> HeadAdmission,
+    ) -> Option<crate::frame_outbox::FrameEnvelope> {
         for attempt in 0..2 {
             for p in 0..LOCAL_QUEUE_COUNT {
                 if self.slots[p] == 0 {
@@ -559,8 +581,11 @@ impl PriorityQueue {
                     self.drops_total.fetch_add(1, Ordering::Relaxed);
                 }
                 if let Some(head) = self.queues[p].front() {
-                    if !predicate(p as u8, &head.frame) {
-                        return None;
+                    let owned_reliable = head.reliable_credit.is_some() && head.carrier.is_none();
+                    match predicate(p as u8, &head.frame, owned_reliable) {
+                        HeadAdmission::Allow => {}
+                        HeadAdmission::DeferSource => continue,
+                        HeadAdmission::FlushBatch => return None,
                     }
                     let queued = self.queues[p].pop_front().expect("head checked above");
                     self.slots[p] -= 1;
