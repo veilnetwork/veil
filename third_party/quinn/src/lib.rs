@@ -51,6 +51,8 @@ mod recv_stream;
 mod runtime;
 mod send_stream;
 mod work_limiter;
+mod udp_wire_trace;
+pub use udp_wire_trace::set_udp_wire_trace;
 
 #[cfg(not(wasm_browser))]
 pub(crate) use std::time::{Duration, Instant};

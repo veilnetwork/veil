@@ -398,3 +398,6 @@ mod tests {
         std::env::temp_dir().join(format!("veil-transport-{seed}.sock"))
     }
 }
+
+/// Enable endpoint-local encrypted UDP correlation; never changes wire data.
+pub use ::quinn::set_udp_wire_trace;

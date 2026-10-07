@@ -1136,6 +1136,7 @@ impl State {
             }
 
             let wait_us = scheduling_delay_us(self.runtime.now(), prepared);
+            crate::udp_wire_trace::record("send", &self.send_buffer[..len], t.segment_size);
             self.driver_stats.udp_send_wait_last_us = wait_us;
             self.driver_stats.udp_send_wait_max_us =
                 self.driver_stats.udp_send_wait_max_us.max(wait_us);

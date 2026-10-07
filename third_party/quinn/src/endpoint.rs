@@ -797,6 +797,7 @@ impl RecvState {
                         let mut data: BytesMut = buf[0..meta.len].into();
                         while !data.is_empty() {
                             let buf = data.split_to(meta.stride.min(data.len()));
+                            crate::udp_wire_trace::record("receive", &buf, None);
                             let mut response_buffer = Vec::new();
                             match endpoint.handle(
                                 now,
