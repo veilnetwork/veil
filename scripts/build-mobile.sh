@@ -102,6 +102,10 @@ build_one() {
   fi
 
   if [[ "$triple" == *android* ]]; then
+    # Match veil_flutter's Android build: its default pure-Rust TLS backend
+    # does not require an unbundled libc++_shared.so. BoringSSL remains an
+    # explicit opt-in through --features tls-boring, as in Gradle.
+    cargo_args+=(--no-default-features)
     if command -v cargo-ndk >/dev/null 2>&1; then
       # Keep the local helper aligned with mobile-build.yml.  In particular,
       # 32-bit armv7 needs bionic's fseeko/ftello declarations, which are only
