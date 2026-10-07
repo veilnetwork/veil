@@ -27,6 +27,23 @@ final void Function(Pointer<VeilMediaEngineHandle>) veilMediaEngineDestroy =
             'veil_media_engine_destroy')
         .asFunction();
 
+// Optional for existing deployed engines: callers can retain the legacy route
+// rebuild until the native library supports preserving streams during handover.
+int Function(Pointer<VeilMediaEngineHandle>, int)? _lookupRebindChannel() {
+  try {
+    return nativeLib.lookupFunction<
+        Int32 Function(Pointer<VeilMediaEngineHandle>, Uint64),
+        int Function(Pointer<VeilMediaEngineHandle>, int)>(
+      'veil_media_engine_rebind_channel',
+    );
+  } on ArgumentError {
+    return null;
+  }
+}
+
+final int Function(Pointer<VeilMediaEngineHandle>, int)?
+    veilMediaEngineRebindChannel = _lookupRebindChannel();
+
 // start_audio(engine*, send int, recv int) -> int
 final int Function(Pointer<VeilMediaEngineHandle>, int, int)
     veilMediaEngineStartAudio = nativeLib

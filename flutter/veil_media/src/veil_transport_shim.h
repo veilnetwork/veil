@@ -107,6 +107,10 @@ class VeilTransportShim : public webrtc::Transport {
   // datagram is delivered to a half-torn-down receiver.
   void Stop();
 
+  // Control-thread handover. Keep Calls, RTP sequence spaces, receive buffers
+  // and capture devices alive. A failed registration leaves the old channel.
+  bool RebindChannel(uint64_t veil_chan);
+
   // Endpoint-local shedding. Keep audio, RTCP and remote video live; do not
   // enqueue video already encoded or retransmitted by the pacer while paused.
   void SetVideoSendPaused(bool paused) { video_send_paused_.store(paused); }
@@ -227,7 +231,7 @@ class VeilTransportShim : public webrtc::Transport {
   const std::array<std::shared_ptr<TaskGuard>, 2> task_guards_ = {
       std::make_shared<TaskGuard>(), std::make_shared<TaskGuard>()};
 
-  const uint64_t veil_chan_;
+  std::atomic<uint64_t> veil_chan_;
   webrtc::Call* const call_;
   webrtc::TaskQueueBase* const network_queue_;
   webrtc::Call* const video_call_;
