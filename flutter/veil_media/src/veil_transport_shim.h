@@ -47,8 +47,8 @@ class TaskQueueBase;
 
 namespace veil_media {
 
-// Endpoint-local audio RR/SR observation for this authenticated peer channel.
-struct AudioFeedbackSnapshot {
+// Endpoint-local RR/SR observation for this authenticated peer channel.
+struct RtcpFeedbackSnapshot {
   int64_t arrived_us = 0;
   int64_t rtt_ms = 0;
   int loss_pct = 0;
@@ -128,7 +128,9 @@ class VeilTransportShim : public webrtc::Transport {
   // Group calls use one send SSRC for all peers. Keep their reports separate
   // before WebRTC's per-source cache overwrites one participant with another.
   void SetLocalAudioSsrc(uint32_t ssrc) { local_audio_ssrc_.store(ssrc); }
-  AudioFeedbackSnapshot audio_feedback() const;
+  RtcpFeedbackSnapshot audio_feedback() const;
+  void SetLocalVideoSsrc(uint32_t ssrc) { local_video_ssrc_.store(ssrc); }
+  RtcpFeedbackSnapshot video_feedback() const;
   AudioPlayoutSnapshot audio_playout_feedback() const;
   // Group receive-worker samples only. Setting an unknown sample still
   // advertises support; unicast uses its negotiated call-health feedback.
@@ -203,7 +205,7 @@ class VeilTransportShim : public webrtc::Transport {
   // Post one bounded drain turn. The packet buffers stay in separate local
   // queues, allowing newly arrived audio to pass already queued video.
   void PostInboundDrain(bool secondary);
-  void ObserveAudioFeedback(std::span<const uint8_t> packet, int64_t arrived_us);
+  void ObserveReceiverFeedback(std::span<const uint8_t> packet, int64_t arrived_us);
   // Runs on the selected local network queue and delivers into its Call.
   void DeliverOnNetworkThread(std::span<const uint8_t> packet, bool secondary,
                               int64_t arrived_us);
@@ -232,9 +234,11 @@ class VeilTransportShim : public webrtc::Transport {
   webrtc::TaskQueueBase* const video_network_queue_;
   std::atomic<uint32_t> remote_video_ssrc_{0};
   std::atomic<uint32_t> local_audio_ssrc_{0};
+  std::atomic<uint32_t> local_video_ssrc_{0};
   AudioSendStats audio_send_stats_;
   mutable std::mutex audio_feedback_mu_;
-  AudioFeedbackSnapshot audio_feedback_;
+  RtcpFeedbackSnapshot audio_feedback_;
+  RtcpFeedbackSnapshot video_feedback_;
   AudioPlayoutSnapshot audio_playout_feedback_;
   struct LocalAudioPlayout {
     bool enabled = false;

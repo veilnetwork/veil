@@ -469,6 +469,9 @@ int main() {
     report(chan, peer_audio, local_audio ^ 0x000000FFu ^ 0x56440000u, 255, 900000);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     assert(stat(e.get(), "audio_feedback_reports") == 0);
+    assert(stat(e.get(), "video_feedback_reports") == 1);
+    assert(stat(e.get(), "video_feedback_loss_pct") == 100);
+    assert(stat(e.get(), "video_feedback_jitter_ms") == 10000);
     const auto report_time = std::chrono::steady_clock::now();
     report(chan, peer_audio, local_audio, 32, 4800);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -477,12 +480,15 @@ int main() {
     assert(stat(e.get(), "audio_feedback_reports") == 1);
     assert(stat(e.get(), "audio_rx_pkts") == 0);  // reports are not received audio
 
+    assert(stat(e.get(), "video_feedback_loss_pct") == 100);
     assert(stat(e.get(), "tx_loss_pct") == 13);
     assert(stat(e.get(), "tx_jitter_ms") == 100);
     // Cached WebRTC values can outlive the last peer report. The explicit
     // freshness flag must expire instead of turning their zeros into health.
     std::this_thread::sleep_until(report_time + std::chrono::milliseconds(15500));
     assert(stat(e.get(), "audio_feedback_reports") == 0);
+    assert(stat(e.get(), "video_feedback_reports") == 0);
+    assert(stat(e.get(), "video_feedback_loss_pct") == 0);
     assert(stat(e.get(), "tx_loss_pct") == 0);
     assert(stat(e.get(), "tx_jitter_ms") == 0);
     std::printf("unicast audio feedback: absent, video-only, fresh RR and expired RR verified\n");
@@ -561,6 +567,14 @@ int main() {
     while (group_stat(e.get(), "audio_feedback_reports") != 2 && std::chrono::steady_clock::now() < deadline)
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     assert(group_stat(e.get(), "audio_feedback_reports") == 2);
+    assert(group_stat(e.get(), "video_feedback_reports") == 1);
+    report(80, group_ssrc(peer, 0x47564944u), group_ssrc(local, 0x47564944u), 0, 90);
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (group_stat(e.get(), "video_feedback_reports") != 2 && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    assert(group_stat(e.get(), "video_feedback_reports") == 2);
+    assert(group_stat(e.get(), "video_feedback_loss_pct") == 100);
+    assert(group_stat(e.get(), "video_feedback_jitter_ms") == 10000);
     assert(group_stat(e.get(), "tx_loss_pct") == 13);
     assert(group_stat(e.get(), "tx_jitter_ms") == 100);
     inject_raw(80, playout_report(group_ssrc(local), 1, 400));
