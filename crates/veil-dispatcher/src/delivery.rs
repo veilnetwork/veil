@@ -1620,6 +1620,7 @@ impl FrameDispatcher {
         } else {
             transport_provenance
         };
+        crate::auth_trace::terminal(first_byte, provenance);
 
         // Cache reverse route: sender → peer_id (direct hop). ONLY once the
         // sender is authenticated.
