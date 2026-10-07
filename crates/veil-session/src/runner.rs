@@ -282,7 +282,7 @@ impl RealtimeSender {
         logger.info(
             "session.rt_trace.datagram_admission",
             format!(
-                "peer_id={} local_slot={priority} accepted={} buffer_drops={} bandwidth_drops={} queued_wire_bytes={} independent={independent} rtt_us={} cwnd_bytes={} in_flight_bytes={} pto_count={} lost_packets={} congestion_events={} udp_sent={} udp_received={} acks_received={} expired_outgoing_datagrams={} residual_window_transmits={} event_queue_last_us={} event_queue_max_us={} event_queue_stalls={} timer_late_last_us={} timer_late_max_us={} timer_stalls={}",
+                "peer_id={} local_slot={priority} accepted={} buffer_drops={} bandwidth_drops={} queued_wire_bytes={} independent={independent} rtt_us={} cwnd_bytes={} in_flight_bytes={} pto_count={} lost_packets={} congestion_events={} udp_sent={} udp_received={} acks_received={} expired_outgoing_datagrams={} residual_window_transmits={} event_queue_last_us={} event_queue_max_us={} event_queue_stalls={} timer_late_last_us={} timer_late_max_us={} timer_stalls={} udp_send_wait_last_us={} udp_send_wait_max_us={} udp_send_stalls={} udp_send_pending_us={}",
                 hex_short(peer), entry.0, entry.1, entry.2,
                 veil_transport::REALTIME_DATAGRAM_BUFFER_BYTES.saturating_sub(available),
                 path.rtt_us, path.congestion_window_bytes, path.in_flight_bytes,
@@ -297,6 +297,10 @@ impl RealtimeSender {
                 path.timer_late_last_us,
                 path.timer_late_max_us,
                 path.timer_stalls,
+                path.udp_send_wait_last_us,
+                path.udp_send_wait_max_us,
+                path.udp_send_stalls,
+                path.udp_send_pending_us,
 
             ),
         );
