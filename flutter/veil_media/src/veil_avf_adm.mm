@@ -2,7 +2,8 @@
  *
  * veil_avf_adm.mm — AVAudioEngine-backed AudioDeviceModule (see veil_avf_adm.h).
  *
- * Capture:  engine.inputNode --tap--> AVAudioConverter(-> 48k int16 mono)
+ * Capture:  engine.inputNode --sink on macOS / tap on iOS-->
+ *           AVAudioConverter(-> 48k int16 mono)
  *           --> FineAudioBuffer::DeliverRecordedData --> AudioDeviceBuffer
  *           --> AudioTransport (send stream / Opus).
  * Playout:  AudioTransport (mixed recv) --> AudioDeviceBuffer
@@ -27,9 +28,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -449,6 +452,8 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     if (engine_ == nil) return;
     if (engine_.isRunning) [engine_ stop];
 
+    RemoveCaptureSinkLocked();
+
     if (!recording_.load()) CancelMicAuthorizationTimerLocked();
 
     // `engine_.inputNode` is not a harmless getter on macOS: while microphone
@@ -523,7 +528,13 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
               [[AVAudioConverter alloc] initFromFormat:tap_fmt
                                               toFormat:int16_format_];
           const double ratio = (double)kSampleRate / tap_fmt.sampleRate;
+#if TARGET_OS_OSX
+          if (!InstallCaptureSinkLocked(input, tap_fmt, ratio)) {
+            InstallCaptureTapLocked(input, tap_fmt, ratio);
+          }
+#else
           InstallCaptureTapLocked(input, tap_fmt, ratio);
+#endif
         }
       } else {
         alog("avf_adm: mic not authorized (auth=%ld) — playout only, no capture",
@@ -579,6 +590,7 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
                    e.reason.UTF8String ? e.reason.UTF8String : "?");
             }
             RemoveConfigurationObserverLocked();
+            RemoveCaptureSinkLocked();
             engine_ = nil;
             source_node_ = nil;
             ReconfigureLocked();
@@ -635,6 +647,76 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     mic_auth_timer_ = nil;
   }
 
+  void RemoveCaptureSinkLocked() {
+#if TARGET_OS_OSX
+    if (capture_sink_node_ != nil) {
+      @try {
+        [engine_ detachNode:capture_sink_node_];
+      } @catch (NSException* e) {
+        alog("avf_adm: detach capture sink threw (%s)",
+             e.reason.UTF8String ? e.reason.UTF8String : "?");
+      }
+      capture_sink_node_ = nil;
+    }
+    capture_input_buffer_ = nil;
+    capture_output_buffer_ = nil;
+#endif
+  }
+
+#if TARGET_OS_OSX
+  bool InstallCaptureSinkLocked(AVAudioInputNode* input,
+                                AVAudioFormat* format, double ratio) {
+    // A tap is asynchronous and coalesced ~100 ms of microphone PCM on the
+    // Bluetooth stand. The sink receives the hardware IO quantum directly.
+    // Keep its native format (sink nodes cannot convert rates) and allocate
+    // conversion storage before the IO callback starts.
+    const AVAudioFrameCount capacity = std::max<AVAudioFrameCount>(
+        4096, input.AUAudioUnit.maximumFramesToRender);
+    capture_input_buffer_ = [[AVAudioPCMBuffer alloc]
+        initWithPCMFormat:format frameCapacity:capacity];
+    capture_output_buffer_ = [[AVAudioPCMBuffer alloc]
+        initWithPCMFormat:int16_format_
+            frameCapacity:(AVAudioFrameCount)std::ceil(capacity * ratio) + 256];
+    if (!capture_input_buffer_ || !capture_output_buffer_) {
+      RemoveCaptureSinkLocked();
+      return false;
+    }
+    VeilAvfAdm* self = this;
+    @try {
+      capture_sink_node_ = [[AVAudioSinkNode alloc]
+          initWithReceiverBlock:^OSStatus(const AudioTimeStamp* /*when*/,
+                                          AVAudioFrameCount frames,
+                                          const AudioBufferList* source) {
+            if (!self->recording_.load()) return noErr;
+            auto* buffer = self->capture_input_buffer_;
+            if (!buffer || frames > buffer.frameCapacity) return kAudio_ParamError;
+            buffer.frameLength = frames;
+            AudioBufferList* destination = buffer.mutableAudioBufferList;
+            if (!source || source->mNumberBuffers != destination->mNumberBuffers)
+              return kAudio_ParamError;
+            for (UInt32 i = 0; i < source->mNumberBuffers; ++i) {
+              if (!source->mBuffers[i].mData ||
+                  source->mBuffers[i].mNumberChannels != destination->mBuffers[i].mNumberChannels ||
+                  source->mBuffers[i].mDataByteSize < destination->mBuffers[i].mDataByteSize)
+                return kAudio_ParamError;
+              std::memcpy(destination->mBuffers[i].mData, source->mBuffers[i].mData,
+                          destination->mBuffers[i].mDataByteSize);
+            }
+            self->OnCaptureBuffer(buffer, ratio);
+            return noErr;
+          }];
+      [engine_ attachNode:capture_sink_node_];
+      [engine_ connect:input to:capture_sink_node_ format:format];
+      return true;
+    } @catch (NSException* e) {
+      alog("avf_adm: capture sink connection threw (%s)",
+           e.reason.UTF8String ? e.reason.UTF8String : "?");
+      RemoveCaptureSinkLocked();
+      return false;
+    }
+  }
+#endif
+
   void InstallCaptureTapLocked(AVAudioInputNode* input,
                                AVAudioFormat* tap_fmt,
                                double ratio) {
@@ -665,11 +747,19 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   // Runs on a CoreAudio capture thread.
   void OnCaptureBuffer(AVAudioPCMBuffer* buffer, double ratio) {
     if (!recording_.load() || capture_converter_ == nil || !rec_fine_) return;
-    const AVAudioFrameCount cap =
-        (AVAudioFrameCount)(buffer.frameLength * ratio) + 256;
-    AVAudioPCMBuffer* out =
-        [[AVAudioPCMBuffer alloc] initWithPCMFormat:int16_format_
-                                      frameCapacity:cap];
+    AVAudioPCMBuffer* out = nil;
+#if TARGET_OS_OSX
+    out = capture_output_buffer_;
+    if (out != nil) out.frameLength = 0;
+#endif
+    // iOS and the asynchronous tap fallback retain their original allocation
+    // path. The macOS hardware sink always reuses its prepared storage.
+    if (out == nil) {
+      const AVAudioFrameCount cap =
+          (AVAudioFrameCount)(buffer.frameLength * ratio) + 256;
+      out = [[AVAudioPCMBuffer alloc] initWithPCMFormat:int16_format_
+                                            frameCapacity:cap];
+    }
     if (out == nil) return;
     __block BOOL fed = NO;
     NSError* err = nil;
@@ -693,6 +783,7 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
         std::span<const int16_t>(data, (size_t)n * kChannels), kRecordDelayMs);
     // Diagnostic: is the tap firing, and is it real audio (maxAbs>0) or silence?
     const uint64_t c = cap_count_.fetch_add(1);
+    const uint64_t total = captured_frames_.fetch_add(n) + n;
     if (c % 100 == 0) {
       int16_t mx = 0;
       for (AVAudioFrameCount i = 0; i < n; ++i) {
@@ -700,8 +791,12 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
         int16_t a = v < 0 ? (int16_t)-v : v;
         if (a > mx) mx = a;
       }
-      alog("avf_adm: capture #%llu frames=%u maxAbs=%d",
-           (unsigned long long)c, (unsigned)n, (int)mx);
+      const auto at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      alog("avf_adm: capture #%llu input_frames=%u frames=%u maxAbs=%d "
+           "total_frames=%llu at_ms=%lld",
+           (unsigned long long)c, (unsigned)buffer.frameLength, (unsigned)n,
+           (int)mx, (unsigned long long)total, (long long)at_ms);
     }
   }
 
@@ -825,6 +920,7 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     RemoveConfigurationObserverLocked();
     if (engine_ == nil) return;
     if (engine_.isRunning) [engine_ stop];
+    RemoveCaptureSinkLocked();
     if (capture_tap_installed_) {
       @try {
         [engine_.inputNode removeTapOnBus:0];
@@ -863,6 +959,7 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   std::atomic<bool> recording_{false};
   std::atomic<bool> playing_{false};
   std::atomic<uint64_t> cap_count_{0};
+  std::atomic<uint64_t> captured_frames_{0};
 #if defined(VEIL_MEDIA_TEST_HOOKS)
   std::atomic<uint64_t> play_count_{0};
 #endif
@@ -877,6 +974,9 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   AVAudioFormat* int16_format_ = nil;
   bool capture_tap_installed_ = false;
 #if TARGET_OS_OSX
+  AVAudioSinkNode* capture_sink_node_ = nil;
+  AVAudioPCMBuffer* capture_input_buffer_ = nil;
+  AVAudioPCMBuffer* capture_output_buffer_ = nil;
   std::mutex devices_mu_;
   std::vector<CoreAudioDeviceInfo> recording_devices_;
   std::vector<CoreAudioDeviceInfo> playout_devices_;
