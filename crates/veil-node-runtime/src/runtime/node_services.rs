@@ -217,7 +217,7 @@ impl NodeServices {
             for w in &work {
                 guard.send_to(
                     &w.peer,
-                    veil_proto::header::priority::INTERACTIVE,
+                    veil_session::LOCAL_NETWORK_CONTROL_LANE,
                     w.frame.clone(),
                 );
             }
@@ -330,11 +330,7 @@ impl NodeServices {
         {
             let guard = rlock!(self.session_tx_registry);
             for pid in peers.iter().take(2) {
-                guard.send_to(
-                    pid,
-                    veil_proto::header::priority::INTERACTIVE,
-                    frame.clone(),
-                );
+                guard.send_to(pid, veil_session::LOCAL_NETWORK_CONTROL_LANE, frame.clone());
             }
         }
 
