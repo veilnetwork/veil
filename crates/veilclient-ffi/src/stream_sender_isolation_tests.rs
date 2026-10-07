@@ -186,7 +186,7 @@ fn dedicated_p2p_file_sender_keeps_chat_live_during_remote_open_wait() {
             isolated,
             "shared sender must block; dedicated sender must progress"
         );
-        assert_eq!(chat.0, veil_proto::priority::INTERACTIVE);
+        assert_eq!(chat.0, veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE);
         let chat_header = veil_proto::codec::decode_header(&chat.1).unwrap();
         assert_eq!(chat_header.msg_type, AppMsg::AppSend as u16);
         let chat_body = veil_proto::AppSendPayload::decode(&chat.1[HEADER_SIZE..]).unwrap();

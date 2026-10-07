@@ -352,6 +352,114 @@ async fn pressured_ordered_file_keeps_bytes_and_wakes_without_input() {
     timeout(Duration::from_secs(2), job).await.unwrap().unwrap();
 }
 
+// A burst below the envelope fragmentation threshold must share the endpoint
+// pressure policy with files. Its neutral wire header must not throttle transit.
+// Read the real encrypted stream to check ordering and wakeups, not just a gate.
+#[tokio::test]
+async fn pressured_small_authored_messages_preserve_transit_and_all_bytes() {
+    use super::super::local_reliable_admission::LocalReliableAdmission;
+    let (primary_link, primary, _primary_stream, _primary_peer) = pair().await;
+    let (_data_link, data_handle, data_stream, mut peer) = pair().await;
+    let mut node = crate::SessionTxRegistry::new();
+    let primary_outbox = node.register([0xA1; 32]);
+    let data_outbox = node.register([0xB1; 32]);
+    let sender = node.get_sender(&[0xB1; 32]).unwrap().clone();
+    let mut admission = LocalReliableAdmission::for_source(
+        primary.clone(),
+        primary_outbox.shared_source_activity(),
+    );
+    admission.observe(
+        REALTIME,
+        &circuit_frame(1, 0x11),
+        std::time::Instant::now(),
+        true,
+    );
+    primary_link.blackout.store(true, Ordering::Relaxed);
+    primary.send(&[0x11; 200]).unwrap();
+    timeout(Duration::from_secs(2), async {
+        while primary.path_stats().pto_count == 0 {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pressured = std::time::Instant::now();
+    admission.observe_primary_path(&primary, pressured);
+    admission.observe(REALTIME, &circuit_frame(1, 0x11), pressured, true);
+    let mut runner = make_runner(data_stream, data_outbox, None);
+    let expected: Vec<Vec<u8>> = (0..32u8).map(|n| vec![n; 400]).collect();
+    for body in &expected {
+        sender
+            .send((
+                veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
+                frame(AppMsg::AppSend, body),
+            ))
+            .await
+            .unwrap();
+    }
+    let job = tokio::spawn(async move {
+        runner.run().await;
+    });
+    sleep(Duration::from_millis(30)).await;
+    sender
+        .send((INTERACTIVE, frame(AppMsg::AppSend, b"neutral-transit")))
+        .await
+        .unwrap();
+    let mut reader = super::super::ordered_reader::Reader::default();
+    let mut cipher = SessionCipher::new(&[0x51; 32], true);
+    let mut received = Vec::new();
+    let mut neutral = false;
+    let mut early_bytes = 0;
+    let ended = timeout(Duration::from_secs(6), async {
+        while received.len() < expected.len() || !neutral {
+            let wire = reader.read(&mut peer, 65536).await.unwrap();
+            let body = cipher
+                .open(&wire.body, &veil_proto::codec::frame_aad(&wire.header))
+                .unwrap();
+            if wire.header.family == FrameFamily::Session as u8 {
+                continue;
+            }
+            assert_eq!(
+                wire.header.priority(),
+                INTERACTIVE,
+                "wire does not reveal origin"
+            );
+            assert_eq!(wire.header.msg_type, AppMsg::AppSend as u16);
+            if body == b"neutral-transit" {
+                assert!(
+                    pressured.elapsed() < Duration::from_millis(180),
+                    "transit blocked by this endpoint's authored burst"
+                );
+                assert!(!neutral, "duplicate transit");
+                neutral = true;
+            } else {
+                if pressured.elapsed() < Duration::from_millis(180) {
+                    early_bytes += body.len();
+                }
+                received.push(body);
+            }
+        }
+        pressured.elapsed()
+    })
+    .await
+    .unwrap();
+    assert!(
+        early_bytes <= 3900,
+        "small messages bypassed audio pressure: {early_bytes}"
+    );
+    assert!(
+        ended >= Duration::from_millis(400),
+        "source did not wait for pressure windows"
+    );
+    assert_eq!(
+        received, expected,
+        "lost, duplicated or reordered authored message"
+    );
+    data_handle.close();
+    primary.close();
+    timeout(Duration::from_secs(2), job).await.unwrap().unwrap();
+}
+
 #[derive(Clone, Copy)]
 enum OrderedPrimary {
     NoDatagrams,

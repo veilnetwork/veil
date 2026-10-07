@@ -1126,8 +1126,12 @@ pub(crate) fn trace_sealed_cell(stage: &str, peer: &[u8; 32], payload: &[u8]) {
     let epoch = u64::from_be_bytes(payload[4..12].try_into().unwrap());
     let seq = u64::from_be_bytes(payload[12..20].try_into().unwrap());
     if seq.is_multiple_of(50) {
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
         log::info!(
-            "media.cell.sample stage={stage} peer={:02x}{:02x}{:02x}{:02x} epoch={epoch:016x} seq={seq} bytes={}",
+            "media.cell.sample at_ms={at_ms} stage={stage} peer={:02x}{:02x}{:02x}{:02x} epoch={epoch:016x} seq={seq} bytes={}",
             peer[0],
             peer[1],
             peer[2],
