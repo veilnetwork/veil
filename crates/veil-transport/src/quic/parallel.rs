@@ -8,7 +8,10 @@
 use super::*;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
-const MAX_CONNECTIONS: usize = 8;
+struct ChildSlot {
+    _total: OwnedSemaphorePermit,
+    _direction: OwnedSemaphorePermit,
+}
 
 struct Inner {
     endpoint: quinn::Endpoint,
@@ -17,6 +20,8 @@ struct Inner {
     peer: PeerMeta,
     accept: Mutex<()>,
     slots: Arc<Semaphore>,
+    outgoing_slots: Arc<Semaphore>,
+    incoming_slots: Arc<Semaphore>,
     exclusive_accept: bool,
     requires_shared_dispatch: bool,
 }
@@ -30,6 +35,12 @@ struct Inner {
 pub struct QuicParallelHandle(Arc<Inner>);
 
 impl QuicParallelHandle {
+    /// Six generic connections plus one replacement per direction. All peers
+    /// receive the same bound, independent of producer or payload. Partitioning
+    /// directions prevents incoming siblings from consuming every local slot.
+    pub const CONNECTIONS_PER_DIRECTION: usize = 7;
+    pub const CONNECTION_LIMIT: usize = 2 * Self::CONNECTIONS_PER_DIRECTION;
+
     pub(super) fn new(
         endpoint: quinn::Endpoint,
         parent: quinn::Connection,
@@ -44,22 +55,31 @@ impl QuicParallelHandle {
             peer,
             context,
             accept: Mutex::new(()),
-            slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            slots: Arc::new(Semaphore::new(Self::CONNECTION_LIMIT)),
+            outgoing_slots: Arc::new(Semaphore::new(Self::CONNECTIONS_PER_DIRECTION)),
+            incoming_slots: Arc::new(Semaphore::new(Self::CONNECTIONS_PER_DIRECTION)),
             exclusive_accept,
             requires_shared_dispatch,
         }))
     }
 
-    fn reserve(&self) -> Result<OwnedSemaphorePermit> {
+    fn reserve(&self, direction: &Arc<Semaphore>) -> Result<ChildSlot> {
         if self.0.parent.close_reason().is_some() {
             return Err(quic_error("parallel QUIC parent closed"));
         }
-        Arc::clone(&self.0.slots)
+        let total = Arc::clone(&self.0.slots)
             .try_acquire_owned()
-            .map_err(|_| quic_error("parallel QUIC connection budget exhausted"))
+            .map_err(|_| quic_error("parallel QUIC connection budget exhausted"))?;
+        let direction = Arc::clone(direction)
+            .try_acquire_owned()
+            .map_err(|_| quic_error("parallel QUIC connection budget exhausted"))?;
+        Ok(ChildSlot {
+            _total: total,
+            _direction: direction,
+        })
     }
 
-    fn watch_child(&self, child: quinn::Connection, permit: OwnedSemaphorePermit) {
+    fn watch_child(&self, child: quinn::Connection, permit: ChildSlot) {
         let parent = self.0.parent.clone();
         tokio::spawn(async move {
             let _permit = permit;
@@ -82,17 +102,20 @@ impl QuicParallelHandle {
         self.0.requires_shared_dispatch
     }
 
-    /// Local diagnostic snapshot, including pending handshakes and accepted
-    /// siblings. It is not a reservation or a receiver scheduling decision.
+    /// Remaining local outgoing capacity, including pending handshakes. The
+    /// aggregate cap still includes incoming siblings. This is not a reservation.
     pub fn available_connection_slots(&self) -> usize {
-        self.0.slots.available_permits()
+        self.0
+            .slots
+            .available_permits()
+            .min(self.0.outgoing_slots.available_permits())
     }
 
     /// Adopt an already authenticated shared-listener child into the SAME
     /// connection budget as outgoing siblings. The caller verifies the session
     /// proof first and closes rejected children; TLS alone is not identity.
     pub fn track_incoming(&self, child: &QuicDatagramHandle) -> Result<()> {
-        let permit = self.reserve()?;
+        let permit = self.reserve(&self.0.incoming_slots)?;
         self.watch_child(child.connection.clone(), permit);
         Ok(())
     }
@@ -101,7 +124,7 @@ impl QuicParallelHandle {
         &self,
         connection: quinn::Connection,
         stream: BoxIoStream,
-        permit: OwnedSemaphorePermit,
+        permit: ChildSlot,
     ) -> Box<dyn TransportConnection> {
         // The slot follows the actual QUIC lifetime, including raw connection
         // and DATAGRAM clones, rather than only the first byte stream wrapper.
@@ -116,7 +139,7 @@ impl QuicParallelHandle {
     /// send the authentication preface before awaiting the remote accept.
     pub async fn connect(&self) -> Result<Box<dyn TransportConnection>> {
         let ctx = Arc::clone(&self.0.context);
-        let permit = self.reserve()?;
+        let permit = self.reserve(&self.0.outgoing_slots)?;
         let operation = async {
             let (host, _, sni, alpn) = quic_connect_parts(&self.0.peer.uri)?;
             let mut config = build_quic_client_config(&ctx, alpn)?;
@@ -171,7 +194,7 @@ impl QuicParallelHandle {
         if self.0.parent.close_reason().is_some() {
             return Err(quic_error("parallel QUIC parent closed"));
         }
-        if self.0.slots.available_permits() == 0 {
+        if self.0.slots.available_permits() == 0 || self.0.incoming_slots.available_permits() == 0 {
             return Err(quic_error("parallel QUIC connection budget exhausted"));
         }
         let ctx = Arc::clone(&self.0.context);
@@ -194,7 +217,7 @@ impl QuicParallelHandle {
                 }
                 break incoming;
             };
-            let permit = self.reserve()?;
+            let permit = self.reserve(&self.0.incoming_slots)?;
             timeout(ctx.quic.handshake_timeout, async {
                 let connection = incoming.accept().map_err(quic_error)?.await?;
                 let (send, recv) = match connection.accept_bi().await {

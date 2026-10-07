@@ -159,22 +159,23 @@ async fn shared_registry_authenticates_once_and_rejects_cross_connection_replay_
 }
 
 #[tokio::test]
-async fn shared_registry_bounds_incoming_and_outgoing_together_and_preserves_ordinary_accepts() {
+async fn shared_registry_bounds_incoming_preserves_outgoing_capacity_and_ordinary_accepts() {
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
         let mut f = Fixture::new().await;
         let mut children = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..veil_transport::QuicParallelHandle::CONNECTIONS_PER_DIRECTION {
             let (outcome, handle, stream, _) = f.dispatch(None).await;
             assert!(matches!(outcome, ParallelPeekOutcome::Bound));
             children.push((handle, stream));
         }
-        assert_eq!(f.offer.diagnostics.active_connections(), 8);
+        assert_eq!(f.offer.diagnostics.active_connections(), 7);
         let (outcome, rejected, _stream, _) = f.dispatch(None).await;
         assert!(matches!(outcome, ParallelPeekOutcome::Drop(_)));
         rejected.closed().await;
-        assert!(
-            f.offer.handle.connect().await.is_err(),
-            "outgoing must share the incoming cap"
+        assert_eq!(
+            f.offer.handle.available_connection_slots(),
+            7,
+            "unclassified incoming children consumed local outgoing capacity"
         );
         // Child saturation must not consume or authenticate an unrelated
         // canonical connection, nor take the shared accept loop away from it.
