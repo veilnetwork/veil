@@ -210,13 +210,52 @@ async fn await_next_input(
 const LOCAL_TRACE_SLOTS: usize = crate::LOCAL_NETWORK_CONTROL_LANE as usize + 1;
 
 struct RealtimeDatagramLane {
-    sender: Arc<Mutex<RealtimeSender>>,
-    local_reliable: local_reliable_admission::LocalReliableAdmission,
+    sender: Option<Arc<Mutex<RealtimeSender>>>,
+    local_reliable: Option<local_reliable_admission::LocalReliableAdmission>,
+    source_activity: Arc<crate::local_source_activity::LocalSourceActivity>,
+    primary_record_expired: u64,
     pressure_trace: [(u64, Option<std::time::Instant>); LOCAL_TRACE_SLOTS],
     peer_rotates: bool,
     peer_circuit_datagrams: bool,
     peer_neutral_forwards: bool,
-    parallel: Option<parallel_lanes::ParallelSession>,
+    parallel: Option<ParallelChannels>,
+}
+
+#[path = "ordered_lanes.rs"]
+mod ordered_lanes;
+pub use ordered_lanes::ParallelOrderedOffer;
+
+enum ParallelChannels {
+    Quic(parallel_lanes::ParallelSession),
+    Ordered(ordered_lanes::OrderedSession),
+}
+impl ParallelChannels {
+    fn rekey(&mut self, tx: &[u8; 32], rx: &[u8; 32], sid: [u8; 32]) {
+        match self {
+            Self::Quic(s) => s.rekey(tx, rx, sid),
+            Self::Ordered(s) => s.rekey(tx, rx, sid),
+        }
+    }
+    fn prepare(&mut self, priority: u8) {
+        if let Self::Quic(s) = self {
+            s.prepare(priority);
+        }
+        // Ordered pools prewarm all generic children independently of roles.
+    }
+    fn sender(
+        &mut self,
+        priority: u8,
+        body: &[u8],
+        kind: RealtimeLaneFrameKind,
+    ) -> Option<Arc<Mutex<RealtimeSender>>> {
+        match self {
+            Self::Quic(s) => {
+                let index = s.prepare_frame(priority, body, kind)?;
+                Some(s.sender_arc(index))
+            }
+            Self::Ordered(s) => s.sender(priority, body, kind),
+        }
+    }
 }
 
 #[path = "lossy_transport.rs"]
@@ -329,30 +368,59 @@ impl RealtimeDatagramLane {
         *last = Some(now);
     }
 
+    fn allow_secondary(&mut self, priority: u8, now: std::time::Instant) -> bool {
+        if let Some(feedback) = self.local_reliable.as_mut() {
+            return feedback.allow_secondary(priority, now);
+        }
+        !matches!(
+            priority,
+            veil_proto::priority::BULK
+                | veil_proto::priority::BACKGROUND
+                | veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
+        ) || self.source_activity.allow_secondary(now)
+    }
+
     fn select_sender(
         &mut self,
         priority: u8,
         frame: &[u8],
         body: &[u8],
         kind: RealtimeLaneFrameKind,
-    ) -> (std::sync::MutexGuard<'_, RealtimeSender>, bool) {
+    ) -> Option<(Arc<Mutex<RealtimeSender>>, bool)> {
         let ready = self
             .parallel
             .as_mut()
-            .and_then(|parallel| parallel.prepare_frame(priority, body, kind));
+            .and_then(|parallel| parallel.sender(priority, body, kind));
         let now = std::time::Instant::now();
-        if let Some(index) = ready {
-            let sender = self.parallel.as_ref().unwrap().sender(index);
-            if priority == veil_proto::priority::REALTIME
-                && let Some(quic) = sender.handle.quic()
-            {
-                self.local_reliable.observe_primary_path(quic, now);
+        if let Some(sender) = ready {
+            if priority == veil_proto::priority::REALTIME {
+                let sender = lock!(sender);
+                if let Some(quic) = sender.handle.quic()
+                    && let Some(feedback) = self.local_reliable.as_mut()
+                {
+                    feedback.observe_primary_path(quic, now);
+                }
+                if let LossyTransportHandle::Ordered(handle) = &sender.handle {
+                    let progress = handle.progress();
+                    if progress.expired_records > self.primary_record_expired
+                        || progress
+                            .active_record_age
+                            .is_some_and(|age| age >= std::time::Duration::from_millis(150))
+                    {
+                        self.source_activity.note_pressure(now);
+                    }
+                    self.primary_record_expired = progress.expired_records;
+                }
             }
-            self.local_reliable.observe(priority, frame, now, true);
-            (sender, true)
+            if let Some(feedback) = self.local_reliable.as_mut() {
+                feedback.observe(priority, frame, now, true);
+            }
+            Some((sender, true))
         } else {
-            self.local_reliable.observe(priority, frame, now, false);
-            (lock!(self.sender), false)
+            if let Some(feedback) = self.local_reliable.as_mut() {
+                feedback.observe(priority, frame, now, false);
+            }
+            self.sender.as_ref().map(|sender| (sender.clone(), false))
         }
     }
 }
@@ -428,6 +496,26 @@ mod local_source_stream_budget;
 /// cancelled with their owning session so they cannot retain a QUIC connection
 /// or key material after stream close/hot-swap.
 struct RealtimeReceiverTask(tokio::task::JoinHandle<()>);
+
+/// A session cancellation must also cancel its writer. A bare JoinHandle
+/// detaches on drop, leaving the socket's WriteHalf and canonical transport
+/// authority alive while a blocked write waits for its I/O timeout.
+struct OwnedWriter(tokio::task::JoinHandle<()>);
+
+impl Drop for OwnedWriter {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+impl std::future::Future for OwnedWriter {
+    type Output = Result<(), tokio::task::JoinError>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
 
 impl Drop for RealtimeReceiverTask {
     fn drop(&mut self) {
@@ -897,7 +985,7 @@ pub struct RealtimeLaneOffer {
     /// retains transport feedback for ordered compatibility without sending
     /// datagrams to a peer that never offered their decoder.
     pub peer_datagrams: bool,
-    pub handle: veil_transport::QuicDatagramHandle,
+    pub transport: RealtimeTransportOffer,
     /// Whether the peer re-derives the lane's key when the session rekeys.
     ///
     /// Both sides must, or the one that rotates leaves the other unable to
@@ -913,6 +1001,22 @@ pub struct RealtimeLaneOffer {
     /// these frames retain the ordinary ordered compatibility path.
     pub peer_neutral_forwards: bool,
     pub parallel: Option<ParallelQuicOffer>,
+}
+
+/// The codec permission is separate from its physical transport. Ordered
+/// children require their own explicitly authenticated marked capability.
+#[derive(Clone)]
+pub enum RealtimeTransportOffer {
+    Quic(veil_transport::QuicDatagramHandle),
+    Ordered(ParallelOrderedOffer),
+}
+impl RealtimeTransportOffer {
+    fn quic(&self) -> Option<&veil_transport::QuicDatagramHandle> {
+        match self {
+            Self::Quic(handle) => Some(handle),
+            Self::Ordered(_) => None,
+        }
+    }
 }
 
 /// Hot-standby transport-swap state for one session.
@@ -1768,9 +1872,11 @@ impl SessionRunner {
             if let Some(lane) = realtime.lane
                 && lane.peer_rotates
             {
-                lock!(lane.sender)
-                    .tx
-                    .rekey(&new_keys.tx_key, &new_keys.session_id);
+                if let Some(sender) = lane.sender.as_ref() {
+                    lock!(sender)
+                        .tx
+                        .rekey(&new_keys.tx_key, &new_keys.session_id);
+                }
                 if let Some(parallel) = lane.parallel.as_mut() {
                     parallel.rekey(&new_keys.tx_key, &new_keys.rx_key, new_keys.session_id);
                 }
@@ -3045,9 +3151,11 @@ impl SessionRunner {
             if let Some(lane) = realtime.lane
                 && lane.peer_rotates
             {
-                lock!(lane.sender)
-                    .tx
-                    .rekey(&new_keys.tx_key, &new_keys.session_id);
+                if let Some(sender) = lane.sender.as_ref() {
+                    lock!(sender)
+                        .tx
+                        .rekey(&new_keys.tx_key, &new_keys.session_id);
+                }
                 if let Some(parallel) = lane.parallel.as_mut() {
                     parallel.rekey(&new_keys.tx_key, &new_keys.rx_key, new_keys.session_id);
                 }
@@ -3865,108 +3973,133 @@ impl SessionRunner {
         // `None` when the peer did not advertise lane rotation: it keeps the
         // static key, so telling our receiver to move would strand it.
         let mut realtime_rekey_tx: Option<tokio::sync::watch::Sender<Option<RealtimeRekey>>> = None;
+        let source_activity = outbox
+            .as_ref()
+            .map(|outbox| outbox.shared_source_activity())
+            .unwrap_or_default();
         let offer = self.quic_datagrams.take();
-        let mut ordered_feedback = offer.as_ref().map(|offer| {
-            local_reliable_admission::LocalReliableAdmission::for_source(
-                offer.handle.clone(),
-                outbox
+        let mut ordered_feedback =
+            offer
+                .as_ref()
+                .and_then(|offer| offer.transport.quic())
+                .map(|handle| {
+                    local_reliable_admission::LocalReliableAdmission::for_source(
+                        handle.clone(),
+                        source_activity.clone(),
+                    )
+                });
+        let mut realtime_lane = match (
+            offer.filter(|offer| offer.peer_datagrams),
+            self.raw_session_keys.as_ref(),
+        ) {
+            (Some(offer), Some((raw_tx_key, raw_rx_key, session_id))) => {
+                let context = RealtimeReceiverContext {
+                    peer_id: self.peer_id,
+                    dispatcher: self.dispatcher.clone(),
+                    logger: self.logger.clone(),
+                    metrics: self.metrics.clone(),
+                    ban_list: self.ban_list.clone(),
+                    violation_tracker: self.violation_tracker.clone(),
+                    activity: datagram_activity.clone(),
+                };
+                let status = outbox
                     .as_ref()
-                    .map(|outbox| outbox.shared_source_activity())
-                    .unwrap_or_default(),
-            )
-        });
-        let mut realtime_lane = match (offer.filter(|offer| offer.peer_datagrams), self.raw_session_keys.as_ref()) {
-            (Some(offer), Some((raw_tx_key, raw_rx_key, session_id))) => offer
-                .handle
-                .max_size()
-                .filter(|size| {
-                    *size
-                        >= if offer.peer_flows {
-                            crate::datagram_flows::MIN_FLOW_DATAGRAM_SIZE
-                        } else {
-                            41
-                        }
-                })
-                .map(|max_datagram_size| {
-                    let rx = crate::datagram_flows::SessionDatagramRx::new(
-                        raw_rx_key,
-                        session_id,
-                        offer.peer_flows,
-                    );
-                    // The latest rotation, not a queue of them: a second
-                    // before the first is applied overwrites it, which is what
-                    // the receiver wants — the older one is already superseded
-                    // on the sending side and at the peer.
-                    let (rekey_tx, rekey_rx) = tokio::sync::watch::channel(None);
-                    realtime_rekey_tx = offer.peer_rotates.then_some(rekey_tx);
-                    realtime_receiver_task = Some(spawn_realtime_receiver(
-                        offer.handle.clone(),
-                        rx,
-                        rekey_rx,
-                        RealtimeReceiverContext {
-                            peer_id: self.peer_id,
-                            dispatcher: Arc::clone(&self.dispatcher),
-                            logger: Arc::clone(&self.logger),
-                            metrics: self.metrics.clone(),
-                            ban_list: Arc::clone(&self.ban_list),
-                            violation_tracker: Arc::clone(&self.violation_tracker),
-                            activity: Arc::clone(&datagram_activity),
-                        },
-                        None,
-                    ));
-                    self.logger.info(
-                        "session.realtime_datagram.enabled",
-                        format!(
-                            "peer_id={} max_datagram_size={max_datagram_size} opaque_flows={} independent_available={} circuit_datagrams={}",
-                            hex_short(&self.peer_id),
+                    .filter(|_| offer.peer_circuit_datagrams)
+                    .and_then(|outbox| outbox.local_datagram_status());
+                match offer.transport {
+                    RealtimeTransportOffer::Quic(handle)
+                        if handle.max_size().is_some_and(|size| {
+                            size >= if offer.peer_flows {
+                                crate::datagram_flows::MIN_FLOW_DATAGRAM_SIZE
+                            } else {
+                                41
+                            }
+                        }) =>
+                    {
+                        let max_datagram_size = handle.max_size().unwrap();
+                        let rx = crate::datagram_flows::SessionDatagramRx::new(
+                            raw_rx_key,
+                            session_id,
                             offer.peer_flows,
-                            offer.parallel.is_some() && offer.peer_flows && offer.peer_rotates,
-                            offer.peer_circuit_datagrams,
-                        ),
-                    );
-                    RealtimeDatagramLane {
-                        pressure_trace: [(0, None); LOCAL_TRACE_SLOTS],
-                        local_reliable: local_reliable_admission::LocalReliableAdmission::for_source(
-                            offer.handle.clone(),
-                            outbox.as_ref().map(|outbox| outbox.shared_source_activity()).unwrap_or_default(),
-                        ),
-                        sender: Arc::new(Mutex::new(RealtimeSender::new(
-                            offer.handle,
-                            crate::datagram_flows::SessionDatagramTx::new(
-                                raw_tx_key,
-                                session_id,
-                                offer.peer_flows,
+                        );
+                        let (rekey_tx, rekey_rx) = tokio::sync::watch::channel(None);
+                        realtime_rekey_tx = offer.peer_rotates.then_some(rekey_tx);
+                        realtime_receiver_task = Some(spawn_realtime_receiver(
+                            handle.clone(),
+                            rx,
+                            rekey_rx,
+                            context.clone(),
+                            None,
+                        ));
+                        self.logger.info("session.realtime_datagram.enabled", format!(
+                            "peer_id={} transport=quic max_datagram_size={max_datagram_size} opaque_flows={} independent_available={} circuit_datagrams={}",
+                            hex_short(&self.peer_id), offer.peer_flows, offer.parallel.is_some() && offer.peer_flows && offer.peer_rotates, offer.peer_circuit_datagrams));
+                        Some(RealtimeDatagramLane {
+                            pressure_trace: [(0, None); LOCAL_TRACE_SLOTS],
+                            source_activity: source_activity.clone(),
+                            primary_record_expired: 0,
+                            local_reliable: Some(
+                                local_reliable_admission::LocalReliableAdmission::for_source(
+                                    handle.clone(),
+                                    source_activity.clone(),
+                                ),
                             ),
-                        ))),
-                        peer_rotates: offer.peer_rotates,
-                        peer_circuit_datagrams: offer.peer_circuit_datagrams,
-                        peer_neutral_forwards: offer.peer_neutral_forwards,
-                        parallel: offer
-                            .parallel
-                            .filter(|_| offer.peer_flows && offer.peer_rotates)
-                            .map(|parallel| {
-                                parallel_lanes::ParallelSession::new(
+                            sender: Some(Arc::new(Mutex::new(RealtimeSender::new(
+                                handle,
+                                crate::datagram_flows::SessionDatagramTx::new(
+                                    raw_tx_key,
+                                    session_id,
+                                    offer.peer_flows,
+                                ),
+                            )))),
+                            peer_rotates: offer.peer_rotates,
+                            peer_circuit_datagrams: offer.peer_circuit_datagrams,
+                            peer_neutral_forwards: offer.peer_neutral_forwards,
+                            parallel: offer
+                                .parallel
+                                .filter(|_| offer.peer_flows && offer.peer_rotates)
+                                .map(|parallel| {
+                                    ParallelChannels::Quic(parallel_lanes::ParallelSession::new(
+                                        parallel,
+                                        raw_tx_key,
+                                        raw_rx_key,
+                                        *session_id,
+                                        context,
+                                        status,
+                                    ))
+                                }),
+                        })
+                    }
+                    RealtimeTransportOffer::Ordered(parallel)
+                        if offer.peer_flows && offer.peer_rotates =>
+                    {
+                        self.logger.info("session.realtime_datagram.enabled", format!(
+                            "peer_id={} transport=ordered max_datagram_size={} opaque_flows=true independent_available=true circuit_datagrams={}",
+                            hex_short(&self.peer_id), veil_transport::ordered_records::MAX_RECORD_BYTES, offer.peer_circuit_datagrams));
+                        Some(RealtimeDatagramLane {
+                            pressure_trace: [(0, None); LOCAL_TRACE_SLOTS],
+                            source_activity: source_activity.clone(),
+                            primary_record_expired: 0,
+                            local_reliable: None,
+                            sender: None,
+                            peer_rotates: true,
+                            peer_circuit_datagrams: offer.peer_circuit_datagrams,
+                            peer_neutral_forwards: offer.peer_neutral_forwards,
+                            parallel: Some(ParallelChannels::Ordered(
+                                ordered_lanes::OrderedSession::new(
                                     parallel,
                                     raw_tx_key,
                                     raw_rx_key,
                                     *session_id,
-                                    RealtimeReceiverContext {
-                                        peer_id: self.peer_id,
-                                        dispatcher: Arc::clone(&self.dispatcher),
-                                        logger: Arc::clone(&self.logger),
-                                        metrics: self.metrics.clone(),
-                                        ban_list: Arc::clone(&self.ban_list),
-                                        violation_tracker: Arc::clone(&self.violation_tracker),
-                            activity: Arc::clone(&datagram_activity),
-                                    },
-                                    outbox
-                                        .as_ref()
-                                        .filter(|_| offer.peer_circuit_datagrams)
-                                        .and_then(|outbox| outbox.local_datagram_status()),
-                                )
-                            }),
+                                    context,
+                                    status,
+                                ),
+                            )),
+                        })
                     }
-                }),
+                    _ => None,
+                }
+            }
             _ => None,
         };
 
@@ -3999,17 +4132,19 @@ impl SessionRunner {
         let mut writer_source = outbox.as_ref().map(|outbox| {
             local_primary_write::PrimaryWriteState::new(outbox.shared_source_activity())
         });
-        let mut writer_handle = tokio::spawn(writer_task(
+        let mut writer_handle = OwnedWriter(tokio::spawn(writer_task(
             write_half,
             wire_rx,
-            realtime_lane
-                .as_ref()
-                .map(|lane| lane.local_reliable.writer_admission()),
+            realtime_lane.as_ref().and_then(|lane| {
+                lane.local_reliable
+                    .as_ref()
+                    .map(|feedback| feedback.writer_admission())
+            }),
             writer_source.clone(),
             self.metrics.clone(),
             Arc::clone(&self.logger),
             hex_short(&self.peer_id),
-        ));
+        )));
         // stage (c): consecutive-error counter for
         // on_primary_write_error. Not reset on successful write — a
         // half-dead primary may flap between OK and err, and we want the
@@ -4455,7 +4590,9 @@ impl SessionRunner {
                 let mut datagram_drained = 0usize;
                 let mut disable_realtime_sender = false;
                 if let Some(lane) = realtime_lane.as_mut() {
-                    lane.local_reliable.expire(std::time::Instant::now());
+                    if let Some(feedback) = lane.local_reliable.as_mut() {
+                        feedback.expire(std::time::Instant::now());
+                    }
                     for _ in 0..PQ_DRAIN_FRAMES_PER_PASS {
                         let supported = |frame: &[u8]| {
                             decode_realtime_lane_frame(frame).is_some_and(|(_, body, kind)| {
@@ -4509,10 +4646,7 @@ impl SessionRunner {
                                 CarrierSend::Unavailable => {}
                             }
                         }
-                        if !lane
-                            .local_reliable
-                            .allow_secondary(outgoing_priority, std::time::Instant::now())
-                        {
+                        if !lane.allow_secondary(outgoing_priority, std::time::Instant::now()) {
                             // Source feedback only; neutral ChildCarrier traffic
                             // above and forwarded INTERACTIVE cells bypass this.
                             lane.trace_source_pressure(
@@ -4525,8 +4659,15 @@ impl SessionRunner {
                         }
                         let (_, body, lane_kind) = decode_realtime_lane_frame(outgoing)
                             .expect("realtime queue predicate accepted this frame");
-                        let (mut lane, using_parallel) =
-                            lane.select_sender(outgoing_priority, outgoing, body, lane_kind);
+                        let Some((sender, using_parallel)) =
+                            lane.select_sender(outgoing_priority, outgoing, body, lane_kind)
+                        else {
+                            // Before the fixed pool is mutually authenticated,
+                            // preserve ordinary ordered compatibility.
+                            pq.restore_lossy_envelope(envelope);
+                            break;
+                        };
+                        let mut lane = lock!(sender);
                         let max_datagram_size = lane.max_datagram_size;
                         let datagrams = match lane.tx.encode_frame(
                             local_datagram_flow(outgoing_priority, body, lane_kind),
@@ -4915,7 +5056,7 @@ impl SessionRunner {
                     if local_primary
                         && let Some(feedback) = realtime_lane
                             .as_mut()
-                            .map(|lane| &mut lane.local_reliable)
+                            .and_then(|lane| lane.local_reliable.as_mut())
                             .or(ordered_feedback.as_mut())
                         && feedback.observe_ordered_primary(now)
                         && crate::rt_trace::rt_trace_enabled()
@@ -5668,16 +5809,14 @@ impl SessionRunner {
     /// early return. Eleven of those returns used to skip it entirely, leaving
     /// the writer task and the socket write half alive with nobody holding a
     /// handle to them (report9 V-12).
-    async fn stop_writer(
-        wire_tx: mpsc::Sender<WireBlob>,
-        writer_handle: &mut tokio::task::JoinHandle<()>,
-    ) {
+    async fn stop_writer(wire_tx: mpsc::Sender<WireBlob>, writer_handle: &mut OwnedWriter) {
         drop(wire_tx);
         if tokio::time::timeout(std::time::Duration::from_secs(5), &mut *writer_handle)
             .await
             .is_err()
         {
-            writer_handle.abort();
+            writer_handle.0.abort();
+            let _ = (&mut *writer_handle).await;
         }
     }
 
@@ -5716,12 +5855,12 @@ impl SessionRunner {
         &self,
         new_stream: veil_transport::BoxIoStream,
         old_wire_tx: mpsc::Sender<WireBlob>,
-        mut old_writer_handle: tokio::task::JoinHandle<()>,
+        mut old_writer_handle: OwnedWriter,
         source: Option<Arc<local_primary_write::PrimaryWriteState>>,
     ) -> (
         tokio::io::ReadHalf<veil_transport::BoxIoStream>,
         mpsc::Sender<WireBlob>,
-        tokio::task::JoinHandle<()>,
+        OwnedWriter,
     ) {
         self.logger.info(
             "session.transport_swapped",
@@ -5732,11 +5871,10 @@ impl SessionRunner {
         );
         // Drop wire_tx first → writer's `wire_rx.recv.await` returns
         // None → writer cleanly exits → JoinHandle resolves.
-        drop(old_wire_tx);
-        let _ = (&mut old_writer_handle).await;
+        Self::stop_writer(old_wire_tx, &mut old_writer_handle).await;
         let (new_read, new_write) = tokio::io::split(new_stream);
         let (new_tx, new_rx) = mpsc::channel::<WireBlob>(WIRE_CHANNEL_CAPACITY);
-        let new_writer_handle = tokio::spawn(writer_task(
+        let new_writer_handle = OwnedWriter(tokio::spawn(writer_task(
             new_write,
             new_rx,
             None,
@@ -5744,7 +5882,7 @@ impl SessionRunner {
             self.metrics.clone(),
             Arc::clone(&self.logger),
             hex_short(&self.peer_id),
-        ));
+        )));
         (new_read, new_tx, new_writer_handle)
     }
 

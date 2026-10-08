@@ -39,6 +39,18 @@ pub struct ParallelDiagnostics {
 }
 
 impl ParallelDiagnostics {
+    pub(super) fn connection_opened(&self) {
+        self.active.fetch_add(1, Ordering::AcqRel);
+    }
+    pub(super) fn connection_closed(&self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+    pub(super) fn rotate_generation(&self) {
+        for counter in &self.epoch_sent {
+            counter.store(0, Ordering::Relaxed);
+        }
+        self.rekeys.fetch_add(1, Ordering::Release);
+    }
     /// Successfully admitted frames on the selected independent connection.
     pub fn sent(&self, local_priority: u8) -> u64 {
         channel_index(local_priority).map_or(0, |index| self.sent[index].load(Ordering::Relaxed))
@@ -727,6 +739,7 @@ impl ParallelSession {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn sender(&self, index: usize) -> std::sync::MutexGuard<'_, RealtimeSender> {
         lock!(
             self.slots[index]
@@ -736,11 +749,19 @@ impl ParallelSession {
                 .sender
         )
     }
+    pub(super) fn sender_arc(&self, index: usize) -> Arc<Mutex<RealtimeSender>> {
+        self.slots[index]
+            .ready
+            .as_ref()
+            .expect("prepared sender")
+            .sender
+            .clone()
+    }
 }
 
 // The caller has validated the CircuitDataPayload. Only its existing per-link
 // ID participates; ciphertext, sender hints and claimed priority never do.
-fn transit_index(salt: &[u8; 32], body: &[u8]) -> usize {
+pub(super) fn transit_index(salt: &[u8; 32], body: &[u8]) -> usize {
     SOURCE_SLOTS + usize::from(blake3::keyed_hash(salt, &body[..4]).as_bytes()[0]) % TRANSIT_SLOTS
 }
 

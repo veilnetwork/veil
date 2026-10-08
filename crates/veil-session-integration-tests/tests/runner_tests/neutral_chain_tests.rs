@@ -156,7 +156,7 @@ async fn chain(rotate: bool) {
             };
             runner.quic_datagrams = Some(RealtimeLaneOffer {
                 peer_datagrams: true,
-                handle: datagrams,
+                transport: veil_session::runner::RealtimeTransportOffer::Quic(datagrams),
                 peer_rotates: true,
                 peer_flows: true,
                 peer_circuit_datagrams: true,

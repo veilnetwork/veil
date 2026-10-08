@@ -523,7 +523,7 @@ async fn verify_ordered_primary_feedback(mode: OrderedPrimary) {
     let file_sender = node.get_sender(&[0xB2; 32]).unwrap().clone();
     let offer = RealtimeLaneOffer {
         peer_datagrams: !matches!(mode, OrderedPrimary::NoDatagrams),
-        handle: handle.clone(),
+        transport: super::super::RealtimeTransportOffer::Quic(handle.clone()),
         peer_rotates: false,
         peer_flows: false,
         peer_circuit_datagrams: false,
