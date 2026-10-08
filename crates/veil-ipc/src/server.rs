@@ -2329,8 +2329,9 @@ async fn handle_ipc_client(
     let mut remote_writes = crate::remote_stream_writer::RemoteStreamWriter::default();
     loop {
         tokio::select! {
-            // Network backpressure retains this future in `remote_writes` and
-            // never holds the IPC loop (media/control requests keep flowing).
+            // Each stream retains its own admission in `remote_writes`;
+            // network backpressure holds neither independent streams nor the
+            // IPC read loop (media/control requests keep flowing).
             done = remote_writes.next(session_tx_registry.clone()), if stream_write_credit => {
                 idle.as_mut().reset(bump());
                 if done.sent && !done.close {

@@ -3335,6 +3335,127 @@ async fn remote_file_backpressure_does_not_hold_shared_ipc_loop() {
     );
 }
 
+/// One stalled source session cannot hold another stream's IPC write credit.
+#[tokio::test]
+async fn blocked_remote_stream_keeps_independent_ipc_stream_credit_flowing() {
+    struct Source {
+        entered: tokio::sync::Notify,
+        admitted: tokio::sync::mpsc::UnboundedSender<([u8; 32], Vec<u8>)>,
+    }
+    impl FrameBroadcaster for Source {
+        fn send_to(&self, _: &[u8; 32], _: u8, _: Vec<u8>) -> bool {
+            true
+        }
+        fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+        fn active_node_ids(&self) -> Vec<[u8; 32]> {
+            vec![[0xee; 32], [0xdd; 32]]
+        }
+        fn send_reliable_to<'a>(
+            &'a self,
+            peer: &'a [u8; 32],
+            bytes: Vec<u8>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async move {
+                if peer == &[0xee; 32] {
+                    self.entered.notify_one();
+                    return std::future::pending().await;
+                }
+                self.admitted.send((*peer, bytes)).is_ok()
+            })
+        }
+    }
+    let sock = temp_socket_path();
+    let (server, shutdown, registry) = make_server(sock.clone());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let source = Arc::new(Source {
+        entered: tokio::sync::Notify::new(),
+        admitted: tx,
+    });
+    let mut server = server.with_session_tx_registry(source.clone());
+    let task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let mut client = connect_with_flags(&sock, veil_proto::ipc::IPC_CAP_STREAM_WRITE_CREDIT).await;
+    let bind = AppBindPayload {
+        endpoint_id: 9,
+        flags: 0,
+        namespace: b"independent-streams".to_vec(),
+        name: b"svc".to_vec(),
+    };
+    send_ipc_frame(&mut client, LocalAppMsg::AppBind as u16, &bind.encode()).await;
+    let (_, body) = recv_ipc_frame(&mut client).await;
+    let app = AppBindOkPayload::decode(&body).unwrap().app_id;
+    let mut ids = Vec::new();
+    for (wire, peer) in [(41, [0xee; 32]), (42, [0xdd; 32])] {
+        assert!(registry.route_stream_open(
+            app,
+            9,
+            wire,
+            peer,
+            veil_proto::SenderProvenance::SessionPeer,
+            STREAM_INITIAL_WINDOW
+        ));
+        let (header, body) = recv_ipc_frame(&mut client).await;
+        assert_eq!(header.msg_type, LocalAppMsg::StreamOpenInbound as u16);
+        ids.push(
+            veil_proto::StreamOpenInboundPayload::decode(&body)
+                .unwrap()
+                .stream_id,
+        );
+    }
+    send_ipc_frame(
+        &mut client,
+        LocalAppMsg::StreamData as u16,
+        &StreamDataPayload {
+            stream_id: ids[0],
+            data: b"blocked".to_vec(),
+        }
+        .encode(),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(1), source.entered.notified())
+        .await
+        .unwrap();
+    send_ipc_frame(
+        &mut client,
+        LocalAppMsg::StreamData as u16,
+        &StreamDataPayload {
+            stream_id: ids[1],
+            data: b"independent".to_vec(),
+        }
+        .encode(),
+    )
+    .await;
+    let independent = tokio::time::timeout(Duration::from_millis(250), async {
+        let accepted = rx.recv().await.unwrap();
+        let credit = recv_ipc_frame(&mut client).await;
+        (accepted, credit)
+    })
+    .await;
+    // The negative baseline also terminates the server and its owned awaits.
+    drop(client);
+    let _ = shutdown.send(true);
+    task.await.unwrap().unwrap();
+    let ((peer, bytes), (header, body)) =
+        independent.expect("blocked stream held another IPC stream's credit");
+    assert_eq!(peer, [0xdd; 32]);
+    let wire_header = codec::decode_header(&bytes).unwrap();
+    assert_eq!(wire_header.priority(), veil_proto::priority::INTERACTIVE);
+    assert_eq!(wire_header.msg_type, veil_proto::AppMsg::AppData as u16);
+    assert_eq!(
+        veil_proto::AppDataPayload::decode(&bytes[veil_proto::HEADER_SIZE..])
+            .unwrap()
+            .data,
+        b"independent"
+    );
+    assert_eq!(header.msg_type, LocalAppMsg::StreamWindow as u16);
+    let credit = StreamWindowPayload::decode(&body).unwrap();
+    assert_eq!(credit.stream_id, ids[1]);
+    assert_eq!(
+        credit.increment,
+        11 + veil_proto::ipc::IPC_STREAM_WRITE_OVERHEAD
+    );
+}
+
 /// A producer exceeding its negotiated local credit must lose only its file;
 /// dropping the in-flight reliable await releases admission resources at once.
 #[tokio::test]
