@@ -25,6 +25,7 @@ pub mod obfs4_tcp;
 pub mod on_demand;
 /// Bounded generic record framing after auxiliary-session authentication.
 pub mod ordered_records;
+pub mod reliable_records;
 /// QUIC `Transport` built on `quinn`.
 pub mod quic;
 /// Scheme-keyed lookup of transport implementations.
