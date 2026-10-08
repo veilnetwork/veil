@@ -110,19 +110,21 @@ class _AsyncGate {
 
 /// Native reliable writes can wait for IPC or peer flow control. Only the
 /// address and bytes cross into the worker; no Finalizable stream is captured.
-void _ffiStreamWriteOffIsolate(int streamAddr, Uint8List data) {
+void _ffiStreamWriteOffIsolate(int streamAddr, Uint8List data,
+    [SendPort? progress]) {
   final stream = Pointer<ffi.VeilStreamFfi>.fromAddress(streamAddr);
   final dataPtr = data.isEmpty ? nullptr : calloc<Uint8>(data.length);
   final errOut = calloc<Pointer<Utf8>>();
   try {
     if (data.isNotEmpty) dataPtr.asTypedList(data.length).setAll(0, data);
-    final rc = ffi.veilStreamWrite(stream, dataPtr, data.length, errOut);
-    if (rc != ffi.veilOk) {
-      throw VeilException(
-        'stream write failed: ${_readErrAndFree(errOut)}',
-        code: rc,
-      );
-    }
+    _writeNativeChunks(data.length, progress, (offset, length) {
+      final rc = ffi.veilStreamWrite(
+          stream, data.isEmpty ? nullptr : dataPtr + offset, length, errOut);
+      if (rc != ffi.veilOk) {
+        throw VeilException('stream write failed: ${_readErrAndFree(errOut)}',
+            code: rc);
+      }
+    });
   } finally {
     if (dataPtr != nullptr) calloc.free(dataPtr);
     calloc.free(errOut);
@@ -131,6 +133,65 @@ void _ffiStreamWriteOffIsolate(int streamAddr, Uint8List data) {
 
 Future<void> _writeStreamOnWorker(int streamAddr, Uint8List data) =>
     Isolate.run(() => _ffiStreamWriteOffIsolate(streamAddr, data));
+
+// Keep the caller's observer (which may capture a Finalizable stream) outside
+// the isolate closure. Only the handle key, bytes and SendPort cross threads.
+Future<void> _writeProgressOnWorker(
+        int addr, Uint8List data, SendPort port, bool anonymous) =>
+    Isolate.run(() => anonymous
+        ? _ffiAnonStreamWriteOffIsolate(addr, data, port)
+        : _ffiStreamWriteOffIsolate(addr, data, port));
+
+Future<void> _observeWriteProgress(int addr, Uint8List data,
+    void Function(int) onProgress, bool anonymous) async {
+  final port = ReceivePort();
+  var last = 0;
+  Object? observerError;
+  StackTrace? observerStack;
+  final subscription = port.listen((value) {
+    if (value is int && value > last) {
+      last = value;
+      if (observerError == null) {
+        try {
+          onProgress(value);
+        } catch (error, stack) {
+          observerError = error;
+          observerStack = stack;
+        }
+      }
+    }
+  });
+  try {
+    await _writeProgressOnWorker(addr, data, port.sendPort, anonymous);
+    if (observerError != null) {
+      Error.throwWithStackTrace(observerError!, observerStack!);
+    }
+    if (last < data.length) onProgress(data.length);
+  } finally {
+    port.close();
+    await subscription.cancel();
+  }
+}
+
+void _writeNativeChunks(int total, SendPort? progress,
+    void Function(int offset, int length) write) {
+  // Two endpoint AppData segments, within the negotiated 8 KiB IPC window.
+  // Only an observation granularity; no receive limit or wire priority.
+  const progressChunkBytes = 7800;
+  var offset = 0;
+  do {
+    // A single worker and allocation for the entire application write. With
+    // progress enabled, bounded native calls reveal actual admission rather
+    // than starting a new isolate for every small piece.
+    final remaining = total - offset;
+    final length = progress != null && remaining > progressChunkBytes
+        ? progressChunkBytes
+        : remaining;
+    write(offset, length);
+    offset += length;
+    if (offset > 0) progress?.send(offset);
+  } while (offset < total);
+}
 
 /// Top-level FFI stream read, run on a WORKER isolate via [Isolate.run]
 /// (diff-audit H3). Top-level (not a method) so the closure captures only the
@@ -193,7 +254,11 @@ class VeilStream implements Finalizable {
   ///   * Argument error: empty [data] is OK (no-op); oversized [data] is
   ///     not — the FFI surface caps a single call at
   ///     [ffi.veilMaxDataLen] (16 MiB).  Chunk larger payloads.
-  Future<void> write(Uint8List data) async {
+  ///
+  /// [onProgress] observes admitted byte counts on the caller isolate. It
+  /// enables bounded native calls inside the same worker, allocation and
+  /// per-stream write gate; counts do not acknowledge remote delivery.
+  Future<void> write(Uint8List data, {void Function(int)? onProgress}) async {
     _ensureOpen();
     if (data.length > ffi.veilMaxDataLen) {
       throw ArgumentError(
@@ -202,14 +267,16 @@ class VeilStream implements Finalizable {
       );
     }
     return _writeGate.run(
-      () => _streamWriteGate.run(() => _writeWhenOpen(data)),
+      () => _streamWriteGate.run(() => _writeWhenOpen(data, onProgress)),
     );
   }
 
-  Future<void> _writeWhenOpen(Uint8List data) {
+  Future<void> _writeWhenOpen(Uint8List data, void Function(int)? onProgress) {
     // A queued write must not start after close while waiting for admission.
     _ensureOpen();
-    return _writeStreamOnWorker(_stream.address, data);
+    return onProgress == null
+        ? _writeStreamOnWorker(_stream.address, data)
+        : _observeWriteProgress(_stream.address, data, onProgress, false);
   }
 
   /// Read up to [maxBytes] bytes from the stream.  Returns an empty
@@ -328,7 +395,8 @@ String _readErrAndFree(Pointer<Pointer<Utf8>> errOut) {
 /// only the sendable address + bytes. CRITICAL: the FFI write `block_on`s and can
 /// BLOCK when the send buffer back-pressures (a slow onion can't drain it) — on
 /// the UI isolate that is an ANR, so writes run on a worker isolate like reads.
-void _ffiAnonStreamWriteOffIsolate(int streamAddr, Uint8List data) {
+void _ffiAnonStreamWriteOffIsolate(int streamAddr, Uint8List data,
+    [SendPort? progress]) {
   final stream = Pointer<ffi.VeilAnonStreamFfi>.fromAddress(streamAddr);
   final dataPtr = data.isEmpty ? nullptr : calloc<Uint8>(data.length);
   final errOut = calloc<Pointer<Utf8>>();
@@ -336,13 +404,15 @@ void _ffiAnonStreamWriteOffIsolate(int streamAddr, Uint8List data) {
     if (data.isNotEmpty) {
       dataPtr.asTypedList(data.length).setAll(0, data);
     }
-    final rc = ffi.veilAnonStreamWrite(stream, dataPtr, data.length, errOut);
-    if (rc != ffi.veilOk) {
-      throw VeilException(
-        'anon stream write failed: ${_readErrAndFree(errOut)}',
-        code: rc,
-      );
-    }
+    _writeNativeChunks(data.length, progress, (offset, length) {
+      final rc = ffi.veilAnonStreamWrite(
+          stream, data.isEmpty ? nullptr : dataPtr + offset, length, errOut);
+      if (rc != ffi.veilOk) {
+        throw VeilException(
+            'anon stream write failed: ${_readErrAndFree(errOut)}',
+            code: rc);
+      }
+    });
   } finally {
     if (dataPtr != nullptr) calloc.free(dataPtr);
     calloc.free(errOut);
@@ -399,22 +469,31 @@ class VeilAnonStream {
   VeilAnonStream._(this._stream);
 
   final Pointer<ffi.VeilAnonStreamFfi> _stream;
+  final _writeGate = _AsyncGate(1);
   bool _closed = false;
 
   /// Queue [data] for reliable delivery (flow-controlled). Empty is a no-op.
   /// Runs on a worker isolate — the FFI write can block on back-pressure, which
   /// on the UI isolate would freeze the app (ANR).
-  Future<void> write(Uint8List data) async {
+  /// [onProgress] reports local admission within this write, as for VeilStream.
+  Future<void> write(Uint8List data, {void Function(int)? onProgress}) async {
     _ensureOpen();
     if (data.length > ffi.veilMaxDataLen) {
       throw ArgumentError(
         'data length ${data.length} exceeds veilMaxDataLen (${ffi.veilMaxDataLen})',
       );
     }
-    final addr = _stream.address;
-    return _anonStreamWriteGate.run(
-      () => Isolate.run(() => _ffiAnonStreamWriteOffIsolate(addr, data)),
+    return _writeGate.run(
+      () => _anonStreamWriteGate.run(() => _writeWhenOpen(data, onProgress)),
     );
+  }
+
+  Future<void> _writeWhenOpen(Uint8List data, void Function(int)? onProgress) {
+    _ensureOpen();
+    final addr = _stream.address;
+    return onProgress == null
+        ? Isolate.run(() => _ffiAnonStreamWriteOffIsolate(addr, data))
+        : _observeWriteProgress(addr, data, onProgress, true);
   }
 
   /// Read up to [maxBytes]. Empty = clean EOF. Runs on a worker isolate (the
@@ -434,10 +513,13 @@ class VeilAnonStream {
   /// peer reads EOF. Off-isolate (same ANR concern as [write]).
   Future<void> finish() async {
     _ensureOpen();
+    return _writeGate.run(() => _anonStreamWriteGate.run(_finishWhenOpen));
+  }
+
+  Future<void> _finishWhenOpen() {
+    _ensureOpen();
     final addr = _stream.address;
-    return _anonStreamWriteGate.run(
-      () => Isolate.run(() => _ffiAnonStreamFinishOffIsolate(addr)),
-    );
+    return Isolate.run(() => _ffiAnonStreamFinishOffIsolate(addr));
   }
 
   /// Close + release the handle (idempotent).
