@@ -654,6 +654,7 @@ impl SessionTxRegistry {
         carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
     ) -> Result<(), SendToError> {
         crate::frame_diag::note_outbound(peer_id, &frame, "tx_registry");
+        crate::frame_diag::note_chunk_frame("relay_enqueue", &frame);
         let tx = match self.senders.get(peer_id) {
             Some(entry) => &entry.tx,
             None => return Err(SendToError::Missing),
