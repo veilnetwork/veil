@@ -926,9 +926,8 @@ impl Inner {
 
     /// Bring the banked skipped keys back under [`MAX_SKIPPED_KEYS_TOTAL`].
     ///
-    /// Swept from UNPROVEN conversations only, largest bank first, with the
-    /// same operation the import path already uses: keys from epochs the chain
-    /// has moved past. A conversation this device has spoken on keeps its bank
+    /// Swept from UNPROVEN conversations only, largest bank first. A
+    /// conversation this device has spoken on keeps its bank
     /// whole — the quota must not become a way to make somebody else's
     /// messages unreadable, which is the same rule `make_room` follows.
     ///
@@ -961,8 +960,8 @@ impl Inner {
             let Some(entry) = self.entries.get_mut(&key) else {
                 break;
             };
-            // The gentle sweep first: keys from epochs the chain has moved
-            // past cost nothing to lose. It is not enough on its own — a
+            // Reclaim older gaps first, only in never-answered conversations.
+            // This alone is insufficient:
             // flood fills the CURRENT epoch, which that sweep keeps — so a
             // bank still standing after it is cleared outright. Only for a
             // conversation this device has never answered: for one it has,
@@ -1371,8 +1370,9 @@ impl RatchetStore {
     /// Put a conversation back, from bytes [`export`](Self::export) produced.
     ///
     /// Replaces whatever is held under that key. Importing does not mark the
-    /// conversation dirty — the host just read it, so writing it straight back
-    /// would be pointless — but it does advance
+    /// conversation dirty unless an untrusted-entry quota is reclaimed — the
+    /// host just read it, so writing it straight back would be pointless. It
+    /// does advance
     /// [`version`](Self::version), because the store's contents changed.
     ///
     /// Subject to the same quota as everything else, and for the same reason:
@@ -1390,32 +1390,18 @@ impl RatchetStore {
         blob: &[u8],
         now_unix: u64,
     ) -> Result<(), RatchetSpliceError> {
-        let mut entry = Entry::decode(blob)?;
-        // Sweep the skipped-key bank on the way in. The step rule keeps two
-        // epochs but only runs when a step runs, and a peer that stopped
-        // answering never causes one — so its bank stays fat while our own
-        // sends keep rewriting the whole state around it. Restoring is the
-        // quiet moment to sweep: once per conversation per session, off every
-        // hot path. Measured before this existed: 324 banked keys spanning 42
-        // epochs, in a 23 KB state rewritten on every advance.
-        let dropped = entry.session.prune_skipped_to_current_epoch()
-            + entry
-                .crossed_receive
-                .as_mut()
-                .map_or(0, |e| e.session.prune_skipped_to_current_epoch());
+        let entry = Entry::decode(blob)?;
+        // Restoring must preserve unconsumed keys from older epochs: queued
+        // ciphertexts may return after reconnect or higher-priority messages.
+        // Untrusted entry quotas are enforced separately, never by trimming
+        // an established correspondent's message keys on every launch.
         let mut g = self.lock();
         if !g.entries.contains_key(key) && !g.make_room(key, now_unix) {
             return Err(RatchetSpliceError::StoreFull);
         }
         g.entries.insert(*key, entry);
         g.version = g.version.wrapping_add(1);
-        // An import does NOT normally mark the conversation dirty — the host
-        // just read those bytes, so writing them straight back is pointless.
-        // A sweep changes that: what is now held is smaller than what is on
-        // disk, and only a mark gets the smaller version written.
-        if dropped > 0 {
-            g.commit_change(*key);
-        }
+        g.enforce_skipped_budget();
         Ok(())
     }
 
@@ -5944,6 +5930,31 @@ mod tests {
         assert_eq!(
             device.store.export(&key).unwrap().as_slice(),
             snapshot.as_slice()
+        );
+    }
+
+    #[test]
+    fn priority_turns_and_store_restore_preserve_delayed_file_keys() {
+        let (a, b) = settled_pair(0xD2);
+        let queued = seal_at(&a, &b, b"queued file", NOW + 1);
+        let health = seal_at(&a, &b, b"priority health", NOW + 1);
+        open_at(&b, &a, &health, NOW + 1).unwrap();
+        for turn in 2..10 {
+            let reply = seal_at(&b, &a, b"health reply", NOW + turn);
+            open_at(&a, &b, &reply, NOW + turn).unwrap();
+            let health = seal_at(&a, &b, b"priority health", NOW + turn);
+            open_at(&b, &a, &health, NOW + turn).unwrap();
+        }
+        restore_device_conversation(&b, NOW + 10);
+        assert_eq!(
+            open_at(&b, &a, &queued, NOW + 11).unwrap().plaintext,
+            b"queued file"
+        );
+        assert!(open_at(&b, &a, &queued, NOW + 11).is_err(), "replay");
+        let next = seal_at(&a, &b, b"still live", NOW + 12);
+        assert_eq!(
+            open_at(&b, &a, &next, NOW + 12).unwrap().plaintext,
+            b"still live"
         );
     }
 

@@ -7,6 +7,7 @@ use veil_util::lock;
 pub(crate) const IDLE_GRACE: Duration = Duration::from_secs(3);
 pub(crate) const PRESSURE_GRACE: Duration = Duration::from_secs(2);
 pub(crate) const RELIABLE_SECONDARY_BYTES: usize = 4096;
+pub(crate) const PRESSURED_RELIABLE_BYTES: usize = 1024;
 pub(crate) const NETWORK_CONTROL_BYTES: usize = 1024;
 const SECONDARY_PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -85,9 +86,17 @@ impl LocalSourceActivity {
             if let Some(next) = state.reliable_next.filter(|next| now < *next) {
                 return Err(next.min(until));
             }
+            // Pressure must release bandwidth beyond the healthy-source
+            // ceiling. Retain existing debt through feedback transitions;
+            // only a newly admitted frame earns the current rate.
+            let budget = if state.pressure_until.is_some_and(|until| now < until) {
+                PRESSURED_RELIABLE_BYTES
+            } else {
+                RELIABLE_SECONDARY_BYTES
+            };
             let nanos = (bytes as u128)
                 .saturating_mul(SECONDARY_PROBE_INTERVAL.as_nanos())
-                .div_ceil(RELIABLE_SECONDARY_BYTES as u128)
+                .div_ceil(budget as u128)
                 .min(SECONDARY_PROBE_INTERVAL.as_nanos() * u32::MAX as u128);
             let charge = Duration::new(
                 (nanos / 1_000_000_000) as u64,
@@ -217,6 +226,35 @@ mod tests {
     }
 
     #[test]
+    fn pressure_reduces_data_rate_without_erasing_debt_or_blocking_recovery() {
+        let source = LocalSourceActivity::default();
+        let now = Instant::now();
+        source.note(now);
+        assert!(source.admit_reliable_secondary(4096, now).is_ok());
+        source.note_pressure(now + Duration::from_millis(50));
+        let next = now + Duration::from_millis(200);
+        assert_eq!(
+            source.admit_reliable_secondary(1, now + Duration::from_millis(50)),
+            Err(next)
+        );
+        assert!(source.admit_reliable_secondary(4096, next).is_ok());
+        assert_eq!(
+            source.admit_reliable_secondary(1, next),
+            Err(now + Duration::from_secs(1))
+        );
+        // DATA's longer debt does not consume route-recovery credits.
+        assert!(source.admit_network_control(1024, next).is_ok());
+        // Once the pressure lease expires, new DATA recovers its healthy rate.
+        let healthy = now + Duration::from_millis(2100);
+        source.note(healthy);
+        assert!(source.admit_reliable_secondary(4096, healthy).is_ok());
+        assert_eq!(
+            source.admit_reliable_secondary(1, healthy),
+            Err(healthy + Duration::from_millis(200))
+        );
+    }
+
+    #[test]
     fn oversized_reliable_frames_pay_their_byte_budget_across_refreshes() {
         for network_control in [false, true] {
             let activity = LocalSourceActivity::default();
@@ -224,7 +262,7 @@ mod tests {
             let budget = if network_control {
                 NETWORK_CONTROL_BYTES
             } else {
-                RELIABLE_SECONDARY_BYTES
+                PRESSURED_RELIABLE_BYTES
             };
             let bytes = budget * 15 + 1;
             activity.note(now);
@@ -236,7 +274,7 @@ mod tests {
             let charged_until = if network_control {
                 now + SECONDARY_PROBE_INTERVAL * 16
             } else {
-                now + SECONDARY_PROBE_INTERVAL * 15 + Duration::from_nanos(48_829)
+                now + SECONDARY_PROBE_INTERVAL * 15 + Duration::from_nanos(195_313)
             };
             for tick in 1..16 {
                 let at = now + SECONDARY_PROBE_INTERVAL * tick;
@@ -272,7 +310,7 @@ mod tests {
         activity.note_pressure(now);
         assert!(
             activity
-                .admit_reliable_secondary(RELIABLE_SECONDARY_BYTES, now)
+                .admit_reliable_secondary(PRESSURED_RELIABLE_BYTES, now)
                 .is_ok()
         );
         assert!(activity.admit_reliable_secondary(1, now).is_err());
@@ -310,7 +348,7 @@ mod tests {
         );
         assert!(
             activity
-                .admit_reliable_secondary(RELIABLE_SECONDARY_BYTES, next)
+                .admit_reliable_secondary(PRESSURED_RELIABLE_BYTES, next)
                 .is_ok()
         );
         for end in [PRESSURE_GRACE, IDLE_GRACE] {
@@ -380,7 +418,7 @@ mod tests {
                     barrier.wait();
                     usize::from(
                         activity
-                            .admit_reliable_secondary(RELIABLE_SECONDARY_BYTES, now)
+                            .admit_reliable_secondary(PRESSURED_RELIABLE_BYTES, now)
                             .is_ok(),
                     )
                 })
