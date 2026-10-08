@@ -13,7 +13,17 @@ use tokio::sync::mpsc;
 use crate::PriorityFrame;
 
 pub const RESERVED_QUEUE_DEPTH: usize = 64;
-pub const RELIABLE_SOURCE_QUEUE_DEPTH: usize = 64;
+/// Keep only a small lookahead of already sealed local DATA. At the pressure
+/// rate, 64 packet-sized frames can wait about 14 seconds here, on top of the
+/// producer's admission wait. That exhausted ordinary Forward's 30-second
+/// lifetime before a relay could forward the last fragments. Backpressure
+/// belongs before publishing, not in a large buffer of aging wire envelopes.
+/// This does not change the independent primary or ordinary transit budgets.
+pub const RELIABLE_SOURCE_QUEUE_DEPTH: usize = 4;
+// One packet-sized frame uses one credit. Compatibility frames use several,
+// and an oversized frame owns the whole lookahead rather than sitting behind
+// three other huge envelopes. Capping its cost permits eventual admission.
+const RELIABLE_SOURCE_CREDIT_BYTES: usize = 1536;
 const MAX_RESERVED_BURST: usize = 8;
 const MAX_CONTROL_BURST: usize = 4;
 pub(crate) const NETWORK_CONTROL_QUEUE_DEPTH: usize = 64;
@@ -188,9 +198,14 @@ impl FrameSender {
     /// A bounded reliable source keeps its admission credit while waiting in
     /// ingress AND the scheduler, so draining ingress cannot erase pressure.
     pub(crate) async fn send_reliable(&self, bytes: veil_bufpool::PooledShared) -> bool {
-        let Ok(credit) = self.reliable_credits.clone().acquire_owned().await else {
+        let cost = bytes
+            .len()
+            .div_ceil(RELIABLE_SOURCE_CREDIT_BYTES)
+            .clamp(1, RELIABLE_SOURCE_QUEUE_DEPTH) as u32;
+        let Ok(credit) = self.reliable_credits.clone().acquire_many_owned(cost).await else {
             return false;
         };
+        crate::frame_diag::note_chunk_frame("source_enqueue", &bytes);
         self.ordinary
             .send(FrameEnvelope {
                 frame: (veil_proto::priority::BACKGROUND, bytes),
@@ -507,9 +522,10 @@ mod tests {
         drop(head);
         tx.try_send(frame(CONTROL, 64)).unwrap();
         pq.push_envelope(rx.recv_envelope().await.unwrap(), false);
-        for byte in 1..=64 {
+        for byte in 1..NETWORK_CONTROL_QUEUE_DEPTH as u8 {
             assert_eq!(&*pq.pop().unwrap(), &[byte]);
         }
+        assert_eq!(&*pq.pop().unwrap(), &[64]);
     }
 
     #[tokio::test]
@@ -602,10 +618,32 @@ mod tests {
         drop(first);
         assert!(waiting.await);
         pq.push_envelope(rx.recv_envelope().await.unwrap(), false);
-        for byte in 1..=64 {
+        for byte in 1..RELIABLE_SOURCE_QUEUE_DEPTH as u8 {
             assert_eq!(&*pq.pop().unwrap(), &[byte]);
         }
+        assert_eq!(&*pq.pop().unwrap(), &[64]);
         assert!(pq.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_source_frame_owns_lookahead_without_blocking_primary() {
+        use std::future::Future;
+        let (tx, mut rx) = frame_channel(8);
+        let big = veil_bufpool::pooled_shared_from_vec(vec![7; 60 * 1024]);
+        assert!(tx.send_reliable(big).await);
+        let held = rx.recv_envelope().await.unwrap();
+        let mut waiting = Box::pin(tx.send_reliable(frame(3, 9).1));
+        std::future::poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tx.try_send(frame(REALTIME, 250)).unwrap();
+        assert_eq!(rx.recv().await.unwrap().0, REALTIME);
+        // Draining ingress does not erase the large frame's debt/credit.
+        drop(held);
+        assert!(waiting.await);
+        assert_eq!(&*rx.recv().await.unwrap().1, &[9]);
     }
 
     #[tokio::test]

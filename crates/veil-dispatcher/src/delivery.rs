@@ -1426,6 +1426,7 @@ impl FrameDispatcher {
         // cheap TTL pre-check before full decode — drops stale
         // envelopes without the 1 MiB envelope-payload clone that `decode`
         // would perform.
+        veil_session::frame_diag::note_chunk_body("receive", Some(&self.local_node_id), body);
         if self.forward_ttl_already_expired(body) {
             return DispatchResult::NoResponse;
         }

@@ -229,49 +229,55 @@ async fn pressured_ordered_file_keeps_bytes_and_wakes_without_input() {
     let key = [0x51; 32];
     let mut runner = make_runner(file_stream, file_outbox, None);
     let app_id = [0x42; 32];
-    assert!(
-        sender
-            .send_reliable(frame(
-                AppMsg::AppOpen,
-                &AppOpenPayload {
-                    app_id,
-                    endpoint_id: 9,
-                    flags: 0
-                }
-                .encode()
-            ))
-            .await
-    );
     let data: Vec<u8> = (0..48 * 3900).map(|n| (n % 251) as u8).collect();
-    for segment in data.chunks(veil_proto::budget::LOCAL_STREAM_SEGMENT_DATA_BYTES) {
+    let produced = data.clone();
+    let producer_sender = sender.clone();
+    // Exercise backpressure with a live consumer. Preloading the entire file
+    // before starting the runner assumes all file frames fit in lookahead.
+    let producer = tokio::spawn(async move {
         assert!(
-            sender
+            producer_sender
                 .send_reliable(frame(
-                    AppMsg::AppData,
-                    &AppDataPayload {
+                    AppMsg::AppOpen,
+                    &AppOpenPayload {
                         app_id,
                         endpoint_id: 9,
-                        seq: 0,
-                        data: segment.to_vec()
+                        flags: 0
                     }
                     .encode()
                 ))
                 .await
         );
-    }
-    assert!(
-        sender
-            .send_reliable(frame(
-                AppMsg::AppClose,
-                &AppClosePayload {
-                    app_id,
-                    endpoint_id: 9,
-                    reason: 0
-                }
-                .encode()
-            ))
-            .await
-    );
+        for segment in produced.chunks(veil_proto::budget::LOCAL_STREAM_SEGMENT_DATA_BYTES) {
+            assert!(
+                producer_sender
+                    .send_reliable(frame(
+                        AppMsg::AppData,
+                        &AppDataPayload {
+                            app_id,
+                            endpoint_id: 9,
+                            seq: 0,
+                            data: segment.to_vec()
+                        }
+                        .encode()
+                    ))
+                    .await
+            );
+        }
+        assert!(
+            producer_sender
+                .send_reliable(frame(
+                    AppMsg::AppClose,
+                    &AppClosePayload {
+                        app_id,
+                        endpoint_id: 9,
+                        reason: 0
+                    }
+                    .encode()
+                ))
+                .await
+        );
+    });
     // Queue neutral work only AFTER the file was held. It must still pass.
     let job = tokio::spawn(async move {
         runner.run().await;
@@ -333,6 +339,7 @@ async fn pressured_ordered_file_keeps_bytes_and_wakes_without_input() {
     })
     .await
     .unwrap();
+    producer.await.unwrap();
     assert!(
         early_bytes <= 3900,
         "ordered file bypassed pressure on another neighbor: {early_bytes}"
@@ -633,22 +640,28 @@ async fn verify_ordered_primary_feedback(mode: OrderedPrimary) {
     handle.close();
     timeout(Duration::from_secs(2), job).await.unwrap().unwrap();
     let expected: Vec<u8> = (0..3 * 3900).map(|n| (n % 251) as u8).collect();
-    for data in expected.chunks(3900) {
-        assert!(
-            file_sender
-                .send_reliable(frame(
-                    AppMsg::AppData,
-                    &AppDataPayload {
-                        app_id: [0x42; 32],
-                        endpoint_id: 9,
-                        seq: 0,
-                        data: data.to_vec()
-                    }
-                    .encode()
-                ))
-                .await
-        );
-    }
+    // Run the consumer while the bounded source lookahead applies backpressure.
+    let produced = expected.clone();
+    let producer_sender = file_sender.clone();
+    let file_producer = tokio::spawn(async move {
+        for data in produced.chunks(3900) {
+            assert!(
+                producer_sender
+                    .send_reliable(frame(
+                        AppMsg::AppData,
+                        &AppDataPayload {
+                            app_id: [0x42; 32],
+                            endpoint_id: 9,
+                            seq: 0,
+                            data: data.to_vec()
+                        }
+                        .encode()
+                    ))
+                    .await
+            );
+        }
+    });
+    // Neutral traffic is independent of the blocked file producer.
     file_sender
         .send((INTERACTIVE, frame(AppMsg::AppSend, b"neutral")))
         .await
@@ -686,6 +699,7 @@ async fn verify_ordered_primary_feedback(mode: OrderedPrimary) {
     .await
     .unwrap();
     assert!(neutral);
+    file_producer.await.unwrap();
     assert_eq!(output, expected);
     assert!(
         began.elapsed() >= Duration::from_millis(350),
@@ -841,22 +855,28 @@ async fn verify_stream_only_primary_backpressure(neutral_prefix: usize) {
         "secondary hold starved neutral work"
     );
     let expected: Vec<u8> = (0..3 * 3900).map(|n| (n % 251) as u8).collect();
-    for data in expected.chunks(3900) {
-        assert!(
-            file_sender
-                .send_reliable(frame(
-                    AppMsg::AppData,
-                    &AppDataPayload {
-                        app_id: [0x42; 32],
-                        endpoint_id: 9,
-                        seq: 0,
-                        data: data.to_vec(),
-                    }
-                    .encode()
-                ))
-                .await
-        );
-    }
+    // Run the consumer while the bounded source lookahead applies backpressure.
+    let produced = expected.clone();
+    let producer_sender = file_sender.clone();
+    let file_producer = tokio::spawn(async move {
+        for data in produced.chunks(3900) {
+            assert!(
+                producer_sender
+                    .send_reliable(frame(
+                        AppMsg::AppData,
+                        &AppDataPayload {
+                            app_id: [0x42; 32],
+                            endpoint_id: 9,
+                            seq: 0,
+                            data: data.to_vec(),
+                        }
+                        .encode()
+                    ))
+                    .await
+            );
+        }
+    });
+    // Neutral traffic is independent of the blocked file producer.
     file_sender
         .send((INTERACTIVE, frame(AppMsg::AppSend, b"neutral")))
         .await
@@ -894,6 +914,7 @@ async fn verify_stream_only_primary_backpressure(neutral_prefix: usize) {
     })
     .await
     .unwrap();
+    file_producer.await.unwrap();
     assert_eq!(output, expected);
     assert!(neutral);
     assert!(
