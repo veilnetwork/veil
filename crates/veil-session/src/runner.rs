@@ -428,8 +428,9 @@ impl RealtimeDatagramLane {
 #[path = "parallel_lanes.rs"]
 mod parallel_lanes;
 pub use parallel_lanes::{
-    BoundOrderedChild, ParallelDiagnostics, ParallelPeekOutcome, ParallelQuicOffer,
-    ParallelRegistration, ParallelRegistry, RegisteredOrderedChannel,
+    BoundOrderedChild, BoundReliableChild, ParallelDiagnostics, ParallelPeekOutcome,
+    ParallelQuicOffer, ParallelRegistration, ParallelRegistry, RegisteredOrderedChannel,
+    RegisteredReliableChannel,
 };
 
 const LOCAL_DATAGRAM_BACKLOG_BYTES: usize = 4 * 1024;
