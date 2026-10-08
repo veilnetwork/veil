@@ -19,7 +19,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::kdf::{kdf_ck, kdf_rk, zeroize_opt};
 use crate::pq::{ML_KEM_768_CT_LEN, ML_KEM_768_EK_LEN, PqEpoch, encapsulate_to};
-use crate::tree::{Holes, MAX_TREE_NODES_PER_CHAIN};
+use crate::tree::{Holes, MAX_TREE_NODES_PER_CHAIN, MAX_TREE_NODES_TOTAL};
 use crate::{KEY_LEN, RatchetError, RatchetRng, random_array};
 
 /// How many message keys one arriving message may cause us to skip.
@@ -130,9 +130,9 @@ pub(crate) struct RatchetCore {
     /// `tree_holes` under the peer's current ratchet key, and `ckr` is `None`.
     recv_tree: bool,
     /// `peer ratchet key → subtrees still wanted` for every receiving chain
-    /// that is a tree: the current one (future indices and any gaps behind the
-    /// highest received) and the one before it (only its gaps, cut at the `pn`
-    /// its successor announced). Aged by epoch exactly like `skipped`.
+    /// that is a tree: the current one (future indices and gaps) and closed
+    /// chains with unconsumed gaps, cut at the `pn` their successor announced.
+    /// Delayed DATA can arrive after several higher-priority epoch turns.
     tree_holes: BTreeMap<[u8; 32], Holes>,
 
     /// Whether we have ever emitted a header. Once we have, the peer has seen
@@ -408,6 +408,9 @@ impl RatchetCore {
             let mk = holes
                 .take_leaf(header.n)
                 .ok_or(RatchetError::MessageKeyUnavailable)?;
+            if holes.is_empty() {
+                self.tree_holes.remove(&header.dh_pk);
+            }
             self.check_tree_limits()?;
             return Ok(mk);
         }
@@ -529,26 +532,12 @@ impl RatchetCore {
         self.pn = self.ns;
         self.ns = 0;
         self.nr = 0;
-        // Age the bank by epoch. A skipped key is filed under the remote public
-        // key of the epoch that would open it, and it only ever left this map
-        // when its message arrived — so keys for messages that never came sat
-        // here until MAX_SKIP_TOTAL. That is not a memory problem, it is a DISK
-        // one: the host persists the whole session on every advance into a
-        // container that may never reuse the slots it leaves behind. Measured
-        // on a real profile: 23,421 bytes of stored state, 324 banked keys
-        // spread over 42 epochs, and NONE in the current one — about 64 MB a
-        // day rewritten for keys nothing could still use.
-        //
-        // Two epochs are kept: the one just ending and the one starting. A
-        // step happens when the conversation changes direction, so that is the
-        // window in which a straggler from the old chain can still turn up;
-        // beyond it the peer has ratcheted twice and anything that old would
-        // have to be re-sent anyway.
-        let ending = self.dh_pk_remote;
-        self.skipped
-            .retain(|(pk, _), _| Some(*pk) == ending || *pk == header.dh_pk);
-        self.tree_holes
-            .retain(|pk, _| Some(*pk) == ending || *pk == header.dh_pk);
+        // Keep unconsumed message keys across epoch turns. Priority health
+        // messages can overtake DATA queued after sealing, so even several
+        // direction changes do not prove an older ciphertext is obsolete.
+        // Closed tree chains hold only gaps below authenticated pn; drop empty
+        // chains, and enforce the existing per-chain and total memory bounds.
+        self.tree_holes.retain(|_, holes| !holes.is_empty());
         // A new sending chain: its mode is settled when it is first used.
         self.send_tree = None;
         self.send_mode = SendMode::Undecided;
@@ -590,18 +579,17 @@ impl RatchetCore {
         Ok(())
     }
 
-    /// Hold the tree state to its bounds. See [`MAX_TREE_NODES_PER_CHAIN`].
-    ///
-    /// Per chain only. The conversation-wide bound follows from it: tree
-    /// chains age by epoch to the current one and the one before it (see
-    /// `asymmetric_step`), so two chains at their ceiling are the most there
-    /// can be — which is what [`MAX_TREE_NODES_TOTAL`](crate::MAX_TREE_NODES_TOTAL)
-    /// states, and `tree_chains_age_out_by_epoch` pins.
+    /// Bound both individual trees and the complete receiving-key bank.
+    /// A failed check is rolled back with the unauthenticated trial state.
     fn check_tree_limits(&self) -> Result<(), RatchetError> {
         for holes in self.tree_holes.values() {
             if holes.len() > MAX_TREE_NODES_PER_CHAIN {
                 return Err(RatchetError::TooManySkipped(holes.len()));
             }
+        }
+        let total: usize = self.tree_holes.values().map(Holes::len).sum();
+        if total > MAX_TREE_NODES_TOTAL {
+            return Err(RatchetError::TooManySkipped(total));
         }
         Ok(())
     }
@@ -732,17 +720,9 @@ impl RatchetCore {
     /// Drop banked keys from every epoch except the one now being received.
     /// Returns how many went.
     ///
-    /// The step rule keeps two epochs, but it only runs WHEN A STEP RUNS — and
-    /// a peer that has stopped answering never causes one, so its bank sits
-    /// there while our own sends keep rewriting the whole state around it.
-    /// Measured: 324 keys over 42 epochs on a conversation with nobody at the
-    /// other end. This is the sweep for that case, meant for a quiet moment
-    /// (a restore), not for the hot path.
-    ///
-    /// More aggressive than the step rule by one epoch, deliberately: after a
-    /// restart there is no record of which epoch ended, and the alternative is
-    /// keeping every epoch forever. What it can cost is a straggler from the
-    /// chain that ended before the restart — a message the peer must re-send.
+    /// This intentionally destroys decryptability of delayed ciphertexts.
+    /// Only a caller reclaiming an untrusted, never-answered conversation's
+    /// quota may use it; it is not safe for ordinary epoch turns or restore.
     pub fn prune_skipped_to_current_epoch(&mut self) -> usize {
         let before = self.skipped_len();
         match self.dh_pk_remote {
@@ -763,12 +743,7 @@ impl RatchetCore {
     /// How many distinct DH epochs the bank spans, and how many of its keys
     /// belong to the CURRENT one.
     ///
-    /// Which decides whether the bank can be aged at all. Keys are filed under
-    /// the remote public key of the epoch that would open them, so a bank
-    /// spread over many old epochs is mostly keys for messages that stopped
-    /// being reachable long ago — and a bank concentrated in the current epoch
-    /// is not, in which case epoch-ageing would cost decryptability and buy
-    /// nothing. Counts only; no key material leaves.
+    /// Counts only; older epochs can still contain deliverable messages.
     #[must_use]
     pub fn skipped_epochs(&self) -> (usize, usize) {
         let mut epochs: std::collections::BTreeSet<[u8; 32]> =
@@ -1120,13 +1095,8 @@ mod tests {
     }
 
     #[test]
-    fn the_bank_forgets_epochs_it_has_ratcheted_past() {
-        // A skipped key only ever left the bank when its message arrived, so
-        // keys for messages that never came stayed for the life of the
-        // conversation. Measured on a real profile: 324 banked keys across 42
-        // epochs, none in the current one, in a 23 KB state the host rewrites
-        // WHOLE on every advance into a container that cannot reuse the slots
-        // it frees. Two epochs are kept; older ones are gone.
+    fn the_bank_keeps_unconsumed_keys_across_epoch_turns() {
+        // Direction changes do not make delayed ciphertexts obsolete.
         let (mut alice, mut bob, mut ar, mut br) = pair();
 
         // Epoch 1: Alice sends two, Bob sees only the second — one key banked.
@@ -1149,8 +1119,7 @@ mod tests {
             "the ending epoch's key is kept — a straggler can still turn up",
         );
 
-        // Turn it again: the first epoch is now two back and is dropped, while
-        // the second one's key survives.
+        // Turn again: all three unconsumed keys must remain reachable.
         let (hb2, _) = bob.send_step().expect("chain");
         alice.recv_step(&hb2, &mut ar).expect("b→a");
         let (_skipped_3, _) = alice.send_step().expect("chain");
@@ -1158,11 +1127,11 @@ mod tests {
         bob.recv_step(&h3, &mut br).expect("a→b (epoch 3)");
         assert_eq!(
             bob.skipped_len(),
-            2,
-            "two epochs' worth, not three — the bank stopped growing",
+            3,
+            "all unconsumed keys remain within the bounded bank",
         );
         let (epochs, _) = bob.skipped_epochs();
-        assert_eq!(epochs, 2, "and it spans exactly the two kept epochs");
+        assert_eq!(epochs, 3, "older gaps remain decryptable");
     }
 
     #[test]
