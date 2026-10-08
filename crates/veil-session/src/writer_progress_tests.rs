@@ -36,6 +36,22 @@ async fn blocked_partial_write_still_expires_without_progress() {
     );
 }
 
+#[tokio::test]
+async fn buffered_final_blob_reaches_peer_without_waiting_for_another_blob() {
+    let (stream, mut peer) = tokio::io::duplex(1024);
+    let mut buffered = tokio::io::BufWriter::with_capacity(1024, stream);
+    write_with_progress_timeout(&mut buffered, b"final blob", Duration::from_secs(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut received = [0; 10];
+    tokio::time::timeout(Duration::from_millis(100), peer.read_exact(&mut received))
+        .await
+        .expect("accepted bytes were left buffered until a later blob")
+        .unwrap();
+    assert_eq!(&received, b"final blob");
+}
+
 #[test]
 fn remote_priority_cannot_select_local_control_admission() {
     use veil_proto::{
@@ -58,6 +74,15 @@ fn remote_priority_cannot_select_local_control_admission() {
 
 #[tokio::test]
 async fn stalled_stream_primary_holds_other_producers_without_losing_bytes() {
+    stalled_primary_preserves_bytes(false).await;
+}
+
+#[tokio::test]
+async fn buffered_primary_flush_retains_pressure_and_all_bytes() {
+    stalled_primary_preserves_bytes(true).await;
+}
+
+async fn stalled_primary_preserves_bytes(buffered: bool) {
     use super::{WireBlob, writer_task};
     use crate::local_source_activity::{LocalSourceActivity, NETWORK_CONTROL_BYTES};
     use std::sync::Arc;
@@ -66,7 +91,11 @@ async fn stalled_stream_primary_holds_other_producers_without_losing_bytes() {
     activity.note(std::time::Instant::now());
     let source = super::local_primary_write::PrimaryWriteState::new(Arc::clone(&activity));
     let (stream, mut peer) = tokio::io::duplex(1);
-    let stream: veil_transport::BoxIoStream = Box::new(stream);
+    let stream: veil_transport::BoxIoStream = if buffered {
+        Box::new(tokio::io::BufWriter::with_capacity(1024, stream))
+    } else {
+        Box::new(stream)
+    };
     let (_read, write) = split(stream);
     let (tx, rx) = tokio::sync::mpsc::channel::<WireBlob>(2);
     let writer = tokio::spawn(writer_task(

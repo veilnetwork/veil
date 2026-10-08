@@ -1325,7 +1325,8 @@ fn local_control_write(priority: u8, frame: &[u8]) -> bool {
 /// drains pre-encrypted/pre-coalesced wire bytes pushed onto it from
 /// the runner's main loop. Each `write_all` is wrapped in a
 /// [`WRITE_PROGRESS_TIMEOUT`] idle deadline, renewed by each successful
-/// partial write; on expiry the task exits, its
+/// partial write; the final flush has the same bounded completion budget.
+/// On expiry the task exits, its
 /// `wire_rx` drops, and the runner sees `wire_tx.try_send` return Err
 /// on its next push — at which point the main loop closes the session
 /// via `on_primary_write_error`.
@@ -1397,7 +1398,7 @@ async fn writer_task<B: Into<WireBlob>>(
                 logger.warn(
                     "session.writer.stalled",
                     format!(
-                        "peer_id={peer_id_short} write made no progress for {:?} — closing writer; \
+                        "peer_id={peer_id_short} partial-write idle or flush-completion budget expired after {:?} — closing writer; \
                          main loop will see wire channel disconnect on next push",
                         WRITE_PROGRESS_TIMEOUT,
                     ),
@@ -1439,36 +1440,54 @@ async fn write_with_source_feedback<W: tokio::io::AsyncWrite + Unpin>(
     // time a primary waits behind this blob on the same ordered connection.
     let mut pressure_due = tokio::time::Instant::now() + interval;
     while written < bytes.len() {
-        let progress = async {
-            let write = writer.write(&bytes[written..]);
-            tokio::pin!(write);
-            let Some(source) = source else {
-                return write.await;
-            };
-            loop {
-                if tokio::time::Instant::now() >= pressure_due {
-                    source.observe_stalled(std::time::Instant::now());
-                    pressure_due = tokio::time::Instant::now() + interval;
-                }
-                tokio::select! {
-                    biased;
-                    result = &mut write => return result,
-                    _ = tokio::time::sleep_until(pressure_due) => {
-                        // Activity comes from the producer, not an old blocked
-                        // blob: its existing idle grace still expires normally.
-                        source.observe_stalled(std::time::Instant::now());
-                        pressure_due = tokio::time::Instant::now() + interval;
-                    }
-                }
-            }
-        };
+        let progress = with_write_source_feedback(
+            writer.write(&bytes[written..]),
+            source,
+            &mut pressure_due,
+            interval,
+        );
         match tokio::time::timeout(idle, progress).await? {
             Ok(0) => return Ok(Err(std::io::ErrorKind::WriteZero.into())),
             Ok(len) => written += len,
             Err(error) => return Ok(Err(error)),
         }
     }
-    Ok(Ok(()))
+    // AsyncWrite may accept plaintext into a framing buffer while the raw
+    // socket is Pending (obfs4 does exactly this). Finish that frame now,
+    // rather than leaving the final ciphertext until the next queued blob.
+    // Flush exposes no partial-progress result, so it has its own bounded
+    // completion deadline and keeps the same source lease/feedback alive.
+    tokio::time::timeout(
+        idle,
+        with_write_source_feedback(writer.flush(), source, &mut pressure_due, interval),
+    )
+    .await
+}
+
+async fn with_write_source_feedback<F: std::future::Future>(
+    operation: F,
+    source: Option<&local_primary_write::PrimaryWriteState>,
+    pressure_due: &mut tokio::time::Instant,
+    interval: std::time::Duration,
+) -> F::Output {
+    tokio::pin!(operation);
+    let Some(source) = source else {
+        return operation.await;
+    };
+    loop {
+        if tokio::time::Instant::now() >= *pressure_due {
+            source.observe_stalled(std::time::Instant::now());
+            *pressure_due = tokio::time::Instant::now() + interval;
+        }
+        tokio::select! {
+            biased;
+            result = &mut operation => return result,
+            _ = tokio::time::sleep_until(*pressure_due) => {
+                source.observe_stalled(std::time::Instant::now());
+                *pressure_due = tokio::time::Instant::now() + interval;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
