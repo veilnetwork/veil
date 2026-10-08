@@ -641,18 +641,50 @@ impl ParallelSession {
         body: &[u8],
         kind: RealtimeLaneFrameKind,
     ) -> Option<usize> {
-        // Only a locally selected primary frame can request replacement.
-        // Neutral transit and the secondary/background producers cannot do so.
-        if priority == veil_proto::priority::REALTIME {
-            self.recover_primary(std::time::Instant::now());
-        }
         let index = channel_index(priority).or_else(|| {
             (self.offer.duplex
                 && priority == veil_proto::priority::INTERACTIVE
                 && kind == RealtimeLaneFrameKind::CircuitDatagram)
                 .then(|| transit_index(&self.transit_salt, body))
         })?;
-        self.prepare_index(index).then_some(index)
+        // Adopt an already authenticated replacement before observing the old
+        // sender. A late ACK on that sender must not discard a completed proof
+        // sitting in the warm result channel. Pending candidates may still be
+        // cancelled when the old path recovers.
+        let prepared = self.prepare_index(index);
+        // Only a locally selected primary frame can request replacement.
+        // Neutral transit and the secondary/background producers cannot do so.
+        if priority == veil_proto::priority::REALTIME {
+            self.recover_primary(std::time::Instant::now());
+        }
+        prepared.then_some(index)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn stage_verified_primary_replacement(&mut self) {
+        // A real exporter-bound handshake completes before the runner's next
+        // poll, matching a replacement result racing an ACK on the old path.
+        let old_stats = lock!(self.slots[0].ready.as_ref().unwrap().sender)
+            .handle
+            .quic()
+            .unwrap()
+            .path_stats();
+        self.primary_recovery
+            .observe(old_stats, std::time::Instant::now());
+        let ready = connect_sender(
+            self.offer.clone(),
+            self.parent.handle(),
+            0,
+            self.context.clone(),
+            None,
+        )
+        .await
+        .expect("replacement proof");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        assert!(tx.send(ready).is_ok());
+        let task = RealtimeReceiverTask(tokio::spawn(std::future::pending()));
+        self.slots[0].warm = Some((rx, task));
+        self.slots[0].replacing = true;
     }
 
     fn prepare_index(&mut self, index: usize) -> bool {

@@ -574,3 +574,153 @@ async fn recoverable_source_has_its_own_quic_connection_and_survives_screen_clos
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn verified_primary_replacement_wins_over_old_ack_progress() {
+    timeout(Duration::from_secs(20), async {
+        use super::super::parallel_lanes::{ParallelQuicOffer, ParallelSession};
+        let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let link = NeutralLink::new(
+            left.local_addr().unwrap(),
+            right.local_addr().unwrap(),
+            1_000_000,
+            Duration::from_millis(20),
+        )
+        .await;
+        link.enabled.store(true, Ordering::Relaxed);
+        let mut ctx = TransportContext::for_debug().unwrap();
+        ctx.quic.congestion_control = QuicCongestionControl::Cubic;
+        let ctx = Arc::new(ctx);
+        let remote = tokio::spawn(promote_punched_quic(
+            right,
+            link.right_addr,
+            Arc::clone(&ctx),
+            PunchedQuicRole::Responder,
+        ));
+        let local = promote_punched_quic(left, link.left_addr, ctx, PunchedQuicRole::Initiator)
+            .await
+            .unwrap();
+        let close = local.quic_connection().unwrap();
+        let a_offer = ParallelQuicOffer::new(local.parallel_quic().unwrap()).with_duplex();
+        let diagnostics = a_offer.diagnostics();
+        let mut a_stream = local.into_stream().unwrap();
+        a_stream.write_all(b"main").await.unwrap();
+        let remote = remote.await.unwrap().unwrap();
+        let b_offer = ParallelQuicOffer::new(remote.parallel_quic().unwrap()).with_duplex();
+        let mut b_stream = remote.into_stream().unwrap();
+        let mut prefix = [0; 4];
+        b_stream.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(&prefix, b"main");
+        let started = Instant::now();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let logger = Arc::new(veil_observability::NodeLogger::new_noop());
+        let sink: Arc<dyn crate::dispatcher_sink::DispatcherSink> = Arc::new(Capture {
+            started,
+            received: tx,
+            logger: Arc::clone(&logger),
+        });
+        let context = RealtimeReceiverContext {
+            peer_id: [9; 32],
+            dispatcher: sink,
+            logger,
+            metrics: None,
+            ban_list: Arc::new(Mutex::new(veil_abuse::BanList::new())),
+            violation_tracker: Arc::new(Mutex::new(
+                veil_abuse::ViolationTracker::with_fixed_duration(
+                    10,
+                    Duration::from_secs(10),
+                    Duration::from_secs(10),
+                )
+                .unwrap(),
+            )),
+            activity: Arc::new(crate::datagram_activity::AuthenticatedDatagramActivity::new()),
+        };
+        let mut a =
+            ParallelSession::new(a_offer, &[2; 32], &[3; 32], [1; 32], context.clone(), None);
+        let b = ParallelSession::new(b_offer, &[3; 32], &[2; 32], [1; 32], context, None);
+        timeout(Duration::from_secs(5), async {
+            while !a.prepare(REALTIME) {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let old = a.sender(0).handle.quic().unwrap().clone();
+        let old_binding = old.channel_binding().unwrap();
+        a.stage_verified_primary_replacement().await;
+        // Supply a real datagram and wait for its ACK on the OLD child while
+        // the authenticated candidate stays queued for the runner to adopt.
+        let old_acks = old.path_stats().acknowledgments_received;
+        let old_frame = primary_test_frame(true, 36, started.elapsed().as_micros() as u64);
+        {
+            let mut sender = a.sender(0);
+            let size = sender.max_datagram_size;
+            for packet in sender
+                .tx
+                .encode_frame(u64::from(REALTIME), &old_frame, size)
+                .unwrap()
+            {
+                sender.handle.send(&packet).unwrap();
+            }
+        }
+        assert_eq!(
+            timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            36
+        );
+        timeout(Duration::from_secs(2), async {
+            while old.path_stats().acknowledgments_received <= old_acks {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("old child datagram ACK");
+        assert_eq!(
+            old.path_stats().pto_count,
+            0,
+            "the old path can report ACK progress"
+        );
+        let frame = primary_test_frame(true, 37, started.elapsed().as_micros() as u64);
+        let (_, body, kind) = super::super::decode_realtime_lane_frame(&frame).unwrap();
+        let index = a.prepare_frame(REALTIME, body, kind).unwrap();
+        assert_eq!(
+            diagnostics.recovery_switches(),
+            1,
+            "a completed replacement must be adopted before old ACK progress cancels it"
+        );
+        {
+            let mut sender = a.sender(index);
+            assert_ne!(
+                sender.handle.quic().unwrap().channel_binding().unwrap(),
+                old_binding
+            );
+            let size = sender.max_datagram_size;
+            for packet in sender
+                .tx
+                .encode_frame(u64::from(REALTIME), &frame, size)
+                .unwrap()
+            {
+                sender.handle.send(&packet).unwrap();
+            }
+        }
+        let received = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            received.0, 37,
+            "the adopted child must deliver fresh datagrams"
+        );
+        a_stream.write_all(b"live").await.unwrap();
+        b_stream.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(&prefix, b"live", "the canonical parent remains usable");
+        drop((a, b));
+        close.close(0u32.into(), b"verified replacement race complete");
+    })
+    .await
+    .expect("verified replacement race stand timed out");
+}
