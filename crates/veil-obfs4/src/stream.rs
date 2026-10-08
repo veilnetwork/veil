@@ -31,8 +31,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use crate::{
     ClientHandshake, FrameError, HANDSHAKE_MAX_BYTES, HANDSHAKE_MIN_BYTES, HandshakeError,
     InboundStream, NodeIdMacKey, OutboundStream, ServerHandshake,
-    elligator2::REPRESENTATIVE_LEN,
-    ntor::{MAC_LEN, TWEAK_LEN},
 };
 
 // ── Errors ───────────────────────────────────────────────────────────────────
@@ -62,56 +60,21 @@ fn frame_to_io(e: FrameError) -> io::Error {
 async fn read_handshake_message<S: AsyncRead + Unpin>(
     stream: &mut S,
 ) -> Result<Vec<u8>, UpgradeError> {
-    // Handshake message has variable padding 0..=128 bytes, but a
-    // valid message is bounded by HANDSHAKE_MAX_BYTES.  We don't know
-    // the exact length until parsed — so read up to the max and hand the
-    // fully-buffered slice to the parser.  Read in chunks; stop when
-    // we have enough to verify (parser will complain on excess trailing
-    // bytes, but we'd never read past HANDSHAKE_MAX_BYTES).
-    let mut buf = Vec::with_capacity(HANDSHAKE_MAX_BYTES);
-    let mut chunk = [0u8; 64];
-    while buf.len() < HANDSHAKE_MAX_BYTES {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        // Try parsing with current buffer; if `TooShort`, keep reading. Once we
-        // have the declared total we accept.
-        if buf.len() >= HANDSHAKE_MIN_BYTES {
-            // Peek at declared pad_len to determine total length.
-            // (No timestamp field on the wire since C-01.)
-            let pad_len_offset = REPRESENTATIVE_LEN + TWEAK_LEN + MAC_LEN;
-            if buf.len() > pad_len_offset {
-                let pad_len = buf[pad_len_offset] as usize;
-                let total = pad_len_offset + 1 + pad_len;
-                if buf.len() >= total {
-                    // No-pipeline invariant: obfs4 is strictly request/response
-                    // up to and including this handshake flight — the peer sends
-                    // NO post-handshake data until both handshakes complete, so a
-                    // single read never carries bytes past `total`. `truncate`
-                    // therefore only ever drops zero bytes. If a future framing
-                    // ever pipelines data into the handshake segment, those bytes
-                    // would be silently lost here; assert loudly in debug builds
-                    // so that change is caught rather than corrupting the stream.
-                    debug_assert_eq!(
-                        buf.len(),
-                        total,
-                        "obfs4 handshake read over-read past the message — peer \
-                         pipelined post-handshake data; truncate would drop it"
-                    );
-                    buf.truncate(total);
-                    return Ok(buf);
-                }
-            }
-        }
-    }
-    if buf.len() < HANDSHAKE_MIN_BYTES {
+    // Read exactly one message: a server can finish its transport flight
+    // and immediately write a higher-layer frame before the client reads
+    // the response. Arbitrary chunk reads can consume that frame's prefix.
+    let mut buf = vec![0; HANDSHAKE_MIN_BYTES];
+    stream.read_exact(&mut buf).await?;
+    let padding = buf[HANDSHAKE_MIN_BYTES - 1] as usize;
+    let total = HANDSHAKE_MIN_BYTES + padding;
+    if total > HANDSHAKE_MAX_BYTES {
         return Err(UpgradeError::Io(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "stream closed before handshake completed",
+            io::ErrorKind::InvalidData,
+            "obfs4 handshake padding exceeds maximum",
         )));
     }
+    buf.resize(total, 0);
+    stream.read_exact(&mut buf[HANDSHAKE_MIN_BYTES..]).await?;
     Ok(buf)
 }
 
@@ -151,7 +114,8 @@ where
         stream,
         OutboundStream::new(out.dk_c_to_s),
         InboundStream::new(out.dk_s_to_c),
-    ))
+    )
+    .with_binding(out.channel_binding))
 }
 
 /// Perform the obfs4 server handshake on the supplied raw stream and
@@ -199,7 +163,8 @@ where
             stream,
             OutboundStream::new(out.dk_s_to_c),
             InboundStream::new(out.dk_c_to_s),
-        ),
+        )
+        .with_binding(out.channel_binding),
         matched,
     ))
 }
@@ -234,6 +199,7 @@ pin_project! {
         inner: S,
         outbound: OutboundStream,
         inbound: InboundStream,
+        binding: Option<crate::ntor::ChannelBinding>,
         write_state: WriteState,
         read_state: ReadState,
     }
@@ -245,12 +211,27 @@ impl<S> Obfs4Stream<S> {
             inner,
             outbound,
             inbound,
+            binding: None,
             write_state: WriteState::Idle,
             read_state: ReadState::Length {
                 buf: [0u8; 2],
                 filled: 0,
             },
         }
+    }
+
+    fn with_binding(mut self, binding: crate::ntor::ChannelBinding) -> Self {
+        self.binding = Some(binding);
+        self
+    }
+
+    /// Per-connection exporter from the authenticated obfs4 handshake.
+    /// Manually assembled streams have no exporter. No producer role is
+    /// encoded here and no I/O is performed to obtain it.
+    pub fn channel_binding(&self) -> Option<[u8; 32]> {
+        self.binding
+            .as_ref()
+            .map(crate::ntor::ChannelBinding::bytes)
     }
 
     /// Borrow the underlying stream for read-only socket diagnostics.
@@ -498,6 +479,61 @@ mod tests {
 
     fn test_psk() -> NodeIdMacKey {
         NodeIdMacKey([0x42; 32])
+    }
+
+    #[tokio::test]
+    async fn handshake_reader_leaves_following_bytes_in_the_stream() {
+        for padding in 0..=crate::ntor::MAX_HANDSHAKE_PADDING {
+            let (mut writer, mut reader) = duplex(1024);
+            let mut message = vec![0; HANDSHAKE_MIN_BYTES + padding];
+            message[HANDSHAKE_MIN_BYTES - 1] = padding as u8;
+            let mut coalesced = message.clone();
+            coalesced.extend_from_slice(b"following frame");
+            writer.write_all(&coalesced).await.unwrap();
+            assert_eq!(read_handshake_message(&mut reader).await.unwrap(), message);
+            let mut following = [0; 15];
+            reader.read_exact(&mut following).await.unwrap();
+            assert_eq!(&following, b"following frame");
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_exporters_match_and_are_fresh_per_connection() {
+        let psk = test_psk();
+        let mut previous = None;
+        for variant in [crate::WireFormatVariant::V1, crate::WireFormatVariant::V2] {
+            for _ in 0..2 {
+                let (client_raw, server_raw) = duplex(64 * 1024);
+                let variants = [variant];
+                let (client, server) = tokio::join!(
+                    obfs4_client_connect_variant(client_raw, &psk, variant),
+                    obfs4_server_accept_multi(server_raw, &psk, &variants),
+                );
+                let mut client = client.unwrap();
+                let mut server = server.unwrap().0;
+                let binding = client.channel_binding().unwrap();
+                assert_eq!(Some(binding), server.channel_binding());
+                assert_ne!(binding, [0; 32]);
+                assert_ne!(Some(binding), previous);
+                client.write_all(b"framing unaffected").await.unwrap();
+                client.flush().await.unwrap();
+                let mut received = [0; 18];
+                server.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"framing unaffected");
+                assert_eq!(client.channel_binding(), Some(binding));
+                previous = Some(binding);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_reader_rejects_oversized_padding_without_reading_it() {
+        let (mut writer, mut reader) = duplex(1024);
+        let mut message = vec![0; HANDSHAKE_MIN_BYTES];
+        message[HANDSHAKE_MIN_BYTES - 1] = u8::MAX;
+        writer.write_all(&message).await.unwrap();
+        let error = read_handshake_message(&mut reader).await.unwrap_err();
+        assert!(matches!(error, UpgradeError::Io(e) if e.kind() == io::ErrorKind::InvalidData));
     }
 
     /// End-to-end: bind a duplex pair, run client handshake on one

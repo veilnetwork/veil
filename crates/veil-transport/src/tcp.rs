@@ -133,6 +133,8 @@ pub(crate) struct StreamConnection {
     capabilities: TransportCapabilities,
     peer_meta: PeerMeta,
     stream: Option<BoxIoStream>,
+    stream_binding: Option<[u8; 32]>,
+    parallel_stream: Option<super::stream_parallel::StreamParallelHandle>,
 }
 
 impl StreamConnection {
@@ -141,7 +143,19 @@ impl StreamConnection {
             capabilities: TransportCapabilities::stream_connection(),
             peer_meta,
             stream: Some(Box::new(stream)),
+            stream_binding: None,
+            parallel_stream: None,
         }
+    }
+
+    pub(crate) fn with_auxiliary_stream(
+        mut self,
+        binding: Option<[u8; 32]>,
+        parallel: Option<super::stream_parallel::StreamParallelHandle>,
+    ) -> Self {
+        self.stream_binding = binding;
+        self.parallel_stream = parallel;
+        self
     }
 }
 
@@ -152,6 +166,14 @@ impl TransportConnection for StreamConnection {
 
     fn peer_meta(&self) -> &PeerMeta {
         &self.peer_meta
+    }
+
+    fn stream_channel_binding(&self) -> Option<[u8; 32]> {
+        self.stream_binding
+    }
+
+    fn parallel_stream(&self) -> Option<super::stream_parallel::StreamParallelHandle> {
+        self.parallel_stream.clone()
     }
 
     fn into_stream(mut self: Box<Self>) -> Result<BoxIoStream> {
