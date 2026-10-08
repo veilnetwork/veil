@@ -349,6 +349,24 @@ extern "C" int veil_media_test_audio_capture_tone(
   return VEIL_MEDIA_OK;
 }
 
+// Production codec/Call wiring with a deterministic duplex ADM and the
+// negotiated v4 transport settings. These controls must precede StartAudio,
+// which freezes transport feedback; the older playout helper starts at once.
+extern "C" VeilMediaEngine* veil_media_test_duplex_codec_create(
+    uint64_t chan, const uint8_t local[32], const uint8_t peer[32]) {
+  g_call_plane_recording_adm = true;
+  auto* e = veil_media_engine_create(chan, local, peer);
+  g_call_plane_recording_adm = false;
+  if (!e) return nullptr;
+  if (veil_media_engine_set_independent_transport_feedback(e, 1) != VEIL_MEDIA_OK ||
+      veil_media_engine_set_max_rtp_packet_size(e, 1000) != VEIL_MEDIA_OK ||
+      veil_media_engine_start_audio(e, 1, 1) != VEIL_MEDIA_OK) {
+    veil_media_engine_destroy(e);
+    return nullptr;
+  }
+  return e;
+}
+
 extern "C" int veil_media_test_audio_playout_pcm(
     VeilMediaEngine* e, int16_t* pcm, size_t capacity) {
   if (!e || !e->ws || !pcm || capacity < 480) return VEIL_MEDIA_ERR_ARG;
