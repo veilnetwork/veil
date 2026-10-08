@@ -124,6 +124,34 @@ mod tests {
     }
 
     #[test]
+    fn reliable_child_permission_is_fresh_authenticated_resume_metadata() {
+        use veil_proto::session::cap_extra_flags;
+        let mut attach = vec![0; AttachPayload::WIRE_SIZE];
+        let caps = CapabilitiesPayload {
+            roles_supported: 1,
+            flags: cap_flags::SUPPORTS_REALTIME_DATAGRAMS
+                | cap_flags::SUPPORTS_DATAGRAM_FLOWS
+                | cap_flags::SUPPORTS_REALTIME_REKEY,
+            discovery_mode: 0,
+            extra_flags: cap_extra_flags::SUPPORTS_PARALLEL_ORDERED
+                | cap_extra_flags::SUPPORTS_RELIABLE_PARALLEL,
+        };
+        append(&mut attach, &caps, &[3; 32], &[1; 32], &[2; 32]);
+        assert!(
+            verify(&attach, &[3; 32], &[1; 32], &[2; 32])
+                .unwrap()
+                .unwrap()
+                .supports_reliable_parallel()
+        );
+        let extra = AttachPayload::WIRE_SIZE + 4 + MARKER.len() + 4;
+        attach[extra] ^= cap_extra_flags::SUPPORTS_RELIABLE_PARALLEL;
+        assert!(
+            verify(&attach, &[3; 32], &[1; 32], &[2; 32]).is_err(),
+            "capability downgrade/upgrade must invalidate authentication"
+        );
+    }
+
+    #[test]
     fn legacy_attach_and_unknown_trailers_do_not_enable_capabilities() {
         let mut attach = vec![0; AttachPayload::WIRE_SIZE];
         append_resume_nonce_to_attach(&mut attach, &[8; 32]);

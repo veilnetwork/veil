@@ -235,7 +235,7 @@ enum ParallelChannels {
     Ordered(ordered_lanes::OrderedSession),
 }
 impl ParallelChannels {
-    fn note_reliable_frame(&self, canonical_full: bool) {
+    fn note_reliable_frame(&self, canonical_full: bool) -> bool {
         match self {
             Self::Quic(s) => s.note_reliable_frame(canonical_full),
             Self::Ordered(s) => s.note_reliable_frame(canonical_full),
@@ -5172,7 +5172,10 @@ impl SessionRunner {
                             continue;
                         }
                         self.dispatcher.capture_outbound(self.peer_id, &plain);
-                        if let Some(parallel) = realtime_lane.as_ref().and_then(|lane| lane.parallel.as_ref()) { parallel.note_reliable_frame(wire_tx.capacity() == 0); }
+                        if let Some(parallel) = realtime_lane.as_ref().and_then(|lane| lane.parallel.as_ref())
+                            && parallel.note_reliable_frame(wire_tx.capacity() == 0) {
+                            self.logger.info("session.reliable_child.first_send",format!("peer_id={} wire_bytes={bytes}",hex_short(&self.peer_id)));
+                        }
                         if let Some(m) = &self.metrics { m.add_transport_bytes_tx(bytes as u64); }
                         rekey.record_bytes(bytes as u64);
                         mlkem_rekey.record_bytes(bytes as u64);

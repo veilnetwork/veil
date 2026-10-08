@@ -417,6 +417,9 @@ pub mod cap_extra_flags {
     /// Parent-bound duplex ordered records, shared-listener dispatch and a
     /// fixed generic child pool. Independent of QUIC; no producer role is sent.
     pub const SUPPORTS_PARALLEL_ORDERED: u8 = 1 << 6;
+    /// Parent-bound, separately encrypted lossless App stream carrier. Generic
+    /// transport support only: no producer role, urgency or relay privilege.
+    pub const SUPPORTS_RELIABLE_PARALLEL: u8 = 1 << 7;
 }
 
 // c: role_bits moved to veil-types alongside NodeRole.
@@ -540,6 +543,13 @@ impl CapabilitiesPayload {
         self.supports_datagram_flows()
             && self.supports_realtime_rekey()
             && self.extra_flags & cap_extra_flags::SUPPORTS_PARALLEL_ORDERED != 0
+    }
+
+    /// Reliable children require the parent's coordinated key rotation and
+    /// either its ordered codec or its explicit QUIC duplex implementation.
+    pub fn supports_reliable_parallel(&self) -> bool {
+        self.extra_flags & cap_extra_flags::SUPPORTS_RELIABLE_PARALLEL != 0
+            && (self.supports_parallel_ordered() || self.supports_duplex_parallel_quic())
     }
 
     // ── Capability helpers ───────────────────────────────────────────────
@@ -2443,6 +2453,59 @@ mod tests {
         caps.extra_flags |= cap_extra_flags::SUPPORTS_PARALLEL_QUIC;
         caps.flags &= !cap_flags::SUPPORTS_REALTIME_REKEY;
         assert!(!caps.supports_shared_parallel_quic());
+    }
+
+    #[test]
+    fn reliable_children_require_explicit_codec_parent_and_coordinated_rekey() {
+        let mut caps = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Leaf);
+        caps.flags = cap_flags::SUPPORTS_REALTIME_DATAGRAMS
+            | cap_flags::SUPPORTS_DATAGRAM_FLOWS
+            | cap_flags::SUPPORTS_REALTIME_REKEY;
+        caps.extra_flags = cap_extra_flags::SUPPORTS_RELIABLE_PARALLEL;
+        assert!(
+            !caps.supports_reliable_parallel(),
+            "bit alone lacks parent codec"
+        );
+        for parent in [
+            cap_extra_flags::SUPPORTS_PARALLEL_ORDERED,
+            cap_extra_flags::SUPPORTS_PARALLEL_QUIC
+                | cap_extra_flags::SUPPORTS_DUPLEX_PARALLEL_QUIC,
+        ] {
+            let mut modern = caps.clone();
+            modern.extra_flags |= parent;
+            assert!(modern.supports_reliable_parallel());
+            assert!(
+                CapabilitiesPayload::decode(&modern.encode())
+                    .unwrap()
+                    .supports_reliable_parallel()
+            );
+            assert!(
+                !CapabilitiesPayload::decode(&modern.encode()[..3])
+                    .unwrap()
+                    .supports_reliable_parallel()
+            );
+            for missing in [
+                cap_flags::SUPPORTS_REALTIME_DATAGRAMS,
+                cap_flags::SUPPORTS_DATAGRAM_FLOWS,
+                cap_flags::SUPPORTS_REALTIME_REKEY,
+            ] {
+                let mut legacy = modern.clone();
+                legacy.flags &= !missing;
+                assert!(!legacy.supports_reliable_parallel());
+            }
+            modern.extra_flags &= !cap_extra_flags::SUPPORTS_RELIABLE_PARALLEL;
+            assert!(
+                !modern.supports_reliable_parallel(),
+                "old loss-tolerant support cannot authorize lossless children"
+            );
+        }
+        let mut padding = vec![caps.roles_supported, caps.flags, caps.discovery_mode];
+        padding.resize(40, 255);
+        assert!(
+            !CapabilitiesPayload::decode(&padding)
+                .unwrap()
+                .supports_reliable_parallel()
+        );
     }
 
     #[test]
