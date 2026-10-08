@@ -1486,7 +1486,21 @@ impl FrameDispatcher {
         let created_at = u64::from_be_bytes(created);
         let ttl_secs = u32::from_be_bytes(ttl_wire) & !DELIVERY_FLAG_REQUIRE_ACK;
         let now = veil_util::unix_secs_now_u64();
-        now > created_at.saturating_add(ttl_secs as u64)
+        let expired = now > created_at.saturating_add(ttl_secs as u64);
+        if expired && veil_session::rt_trace::rt_trace_enabled() {
+            // Generic opaque-envelope diagnostic, not a traffic classifier.
+            // Logarithmic sampling bounds work even for a flood of stale frames.
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static EXPIRED: AtomicU64 = AtomicU64::new(0);
+            let count = EXPIRED.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+            if count.is_power_of_two() {
+                log::info!(
+                    "delivery.rt_trace.forward_expired count={count} age_secs={} ttl_secs={ttl_secs}",
+                    now.saturating_sub(created_at),
+                );
+            }
+        }
+        expired
     }
 
     /// Terminal delivery: decrypt E2E/meta-E2E payload (if marked), cache the
