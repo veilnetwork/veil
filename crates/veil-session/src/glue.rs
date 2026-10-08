@@ -59,6 +59,10 @@ impl veil_types::FrameBroadcaster for SessionTxBroadcaster {
         true
     }
 
+    fn local_source_segment_data_bytes(&self) -> Option<usize> {
+        rlock!(self.inner).local_source_segment_data_bytes()
+    }
+
     fn has_datagram_transport(&self, peer_id: &[u8; 32]) -> bool {
         rlock!(self.inner).has_datagram_transport(peer_id)
     }

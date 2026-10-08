@@ -4166,6 +4166,7 @@ impl SessionRunner {
         // scheduler boundary implicated by relay-video pauses.
         let mut realtime_writer_blocked_since: Option<std::time::Instant> = None;
         let mut source_reliable_pressure_logged: Option<std::time::Instant> = None;
+        let mut source_reliable_admitted_logged: Option<std::time::Instant> = None;
         let mut ordered_primary_pressure_logged: Option<std::time::Instant> = None;
 
         // connection-rotation deadline. Computed once
@@ -4856,12 +4857,25 @@ impl SessionRunner {
                         if priority != crate::LOCAL_NETWORK_CONTROL_LANE
                             && (owned_reliable || priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE)
                             && let Some(outbox) = outbox.as_ref()
-                            && let Err(retry) = outbox.source_activity().admit_reliable_secondary(
-                                encrypted_wire_len(frame.len()).unwrap_or(usize::MAX), now,
-                            )
                         {
-                            source_pressure_retry = Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
-                            return HeadAdmission::DeferSource;
+                            let wire_bytes = encrypted_wire_len(frame.len()).unwrap_or(usize::MAX);
+                            if let Err(retry) = outbox.source_activity().admit_reliable_secondary(wire_bytes, now) {
+                                source_pressure_retry = Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
+                                return HeadAdmission::DeferSource;
+                            }
+                            // Endpoint-only trace of actual admission cost. No
+                            // application role/content or remote scheduling hint.
+                            if crate::rt_trace::rt_trace_enabled()
+                                && source_reliable_admitted_logged.is_none_or(|last| {
+                                    now.saturating_duration_since(last) >= std::time::Duration::from_secs(1)
+                                })
+                            {
+                                source_reliable_admitted_logged = Some(now);
+                                self.logger.info(
+                                    "session.rt_trace.source_reliable_admission",
+                                    format!("wire_bytes={wire_bytes} pending_blobs={pending_blobs} primary_active={local_primary_active}"),
+                                );
+                            }
                         }
                         HeadAdmission::Allow
                     })

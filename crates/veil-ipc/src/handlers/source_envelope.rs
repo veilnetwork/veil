@@ -5,6 +5,22 @@ use veil_proto::delivery::{ChunkedEnvelopePayload, DeliveryEnvelope, ForwardPayl
 use veil_proto::family::{DeliveryMsg, FrameFamily};
 use veil_proto::{FrameHeader, codec};
 
+/// Advice comes only from the origin's local registry. Preserve canonical
+/// fallback for old adapters and large payloads: smaller pieces must never
+/// make an otherwise valid transfer exceed the receiver's chunk limit.
+pub(super) fn source_segment_bytes(reg: &dyn veil_types::FrameBroadcaster, bytes: usize) -> usize {
+    let canonical = veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES;
+    match reg
+        .local_source_segment_data_bytes()
+        .filter(|hint| *hint > 0)
+    {
+        None => canonical,
+        Some(hint) => hint
+            .max(bytes.div_ceil(veil_proto::budget::MAX_TRANSFER_CHUNKS as usize))
+            .min(canonical),
+    }
+}
+
 pub(super) struct EnvelopeChunks<'a> {
     envelope: &'a DeliveryEnvelope,
     transfer_id: [u8; 16],
@@ -175,7 +191,7 @@ pub(super) async fn admit_direct_sealed(
     let Some(chunks) = EnvelopeChunks::new(
         &envelope,
         false,
-        veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES,
+        source_segment_bytes(reg, envelope.payload.len()),
     ) else {
         return DirectAdmission::Rejected;
     };
@@ -232,7 +248,7 @@ pub(super) async fn admit_direct_plain(
     let Some(chunks) = EnvelopeChunks::new(
         &envelope,
         false,
-        veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES,
+        source_segment_bytes(reg, envelope.payload.len()),
     ) else {
         return DirectAdmission::Rejected;
     };
@@ -253,5 +269,59 @@ pub(super) async fn admit_direct_plain(
     {
         Ok(outcome) => outcome,
         Err(_) => DirectAdmission::TimedOut,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, RwLock};
+
+    #[test]
+    fn smaller_origin_chunks_preserve_wire_budget_and_large_transfer_bounds() {
+        let registry = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let source = veil_session::glue::SessionTxBroadcaster::new(registry.clone());
+        assert_eq!(source_segment_bytes(&source, 12000), 3600);
+        registry
+            .read()
+            .unwrap()
+            .note_local_source_feedback(false, std::time::Instant::now());
+        let bytes = vec![0xa5; 12000];
+        let envelope = DeliveryEnvelope {
+            recipient: veil_proto::recipient::Recipient::any([1; 32]),
+            sender_node_id: [2; 32],
+            src_app_id: [3; 32],
+            app_id: [4; 32],
+            endpoint_id: 7,
+            content_id: [5; 32],
+            created_at: 123,
+            ttl_secs: 30,
+            payload: bytes.clone(),
+            trace_id: 0,
+            require_ack: false,
+        };
+        let chunks =
+            EnvelopeChunks::new(&envelope, false, source_segment_bytes(&source, bytes.len()))
+                .unwrap();
+        let mut reassembled = Vec::new();
+        for (index, frame) in chunks.frames_for([6; 32]).enumerate() {
+            // Reserve the 16-byte hop AEAD tag: each new piece stays below a typical
+            // datagram payload rather than sending a multi-packet burst.
+            assert!(frame.len() + 16 <= 1200);
+            let header = codec::decode_header(&frame).unwrap();
+            assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+            let forward =
+                ForwardPayload::decode(&frame[veil_proto::header::HEADER_SIZE..]).unwrap();
+            assert_eq!(forward.traffic_class, None);
+            let chunk = ChunkedEnvelopePayload::decode(&forward.envelope.payload).unwrap();
+            assert_eq!(chunk.chunk_index, index as u32);
+            reassembled.extend_from_slice(&chunk.data);
+        }
+        assert_eq!(reassembled, bytes);
+        let largest = veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES
+            * veil_proto::budget::MAX_TRANSFER_CHUNKS as usize;
+        let segment = source_segment_bytes(&source, largest);
+        assert!(largest.div_ceil(segment) <= veil_proto::budget::MAX_TRANSFER_CHUNKS as usize);
+        assert_eq!(segment, 3600);
     }
 }

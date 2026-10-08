@@ -15,7 +15,7 @@ struct SourceState {
     last_primary: Option<Instant>,
     pressure_until: Option<Instant>,
     secondary_next: Option<Instant>,
-    reliable_window: Option<(Instant, usize)>,
+    reliable_next: Option<Instant>,
     network_window: Option<(Instant, usize)>,
 }
 
@@ -49,7 +49,7 @@ impl LocalSourceActivity {
     /// permits a file burst to fill a fast relay's slower downstream path.
     /// All neighbors of this endpoint share the same bounded allowance.
     /// Whole oversized compatibility frames may progress alone, but spend
-    /// enough future windows to pay for their bytes. The caller must retain
+    /// proportional future time to pay for their bytes. The caller must retain
     /// FIFO and admission credits while waiting for the deadline.
     pub(crate) fn admit_reliable_secondary(
         &self,
@@ -73,37 +73,40 @@ impl LocalSourceActivity {
     ) -> Result<(), Instant> {
         let mut state = lock!(self.0);
         let active_until = state.last_primary.map(|at| at + IDLE_GRACE);
-        let pressure_until = state.pressure_until;
-        let window = if network_control {
-            &mut state.network_window
-        } else {
-            &mut state.reliable_window
-        };
-        let budget = if network_control {
-            NETWORK_CONTROL_BYTES
-        } else {
-            RELIABLE_SECONDARY_BYTES
-        };
-        let Some(active_until) = active_until else {
-            *window = None;
-            return Ok(());
-        };
-        // Data keeps its budget during healthy audio, including intervals
-        // between remote feedback samples. Recovery RPCs are limited only
-        // under pressure and retain their independent allowance.
-        let limited_until = if network_control {
-            let Some(pressure_until) = pressure_until else {
-                *window = None;
+        // DATA is paced even during healthy primary activity. Charge exact
+        // wire bytes, rather than rounding each frame up to a 200-ms bucket:
+        // that wastes the remainder and emits each bucket as a short burst.
+        // No unused allowance accumulates while the source is idle.
+        if !network_control {
+            let Some(until) = active_until.filter(|until| now < *until) else {
+                state.reliable_next = None;
                 return Ok(());
             };
-            active_until.min(pressure_until)
-        } else {
-            active_until
-        };
-        if now >= limited_until {
-            *window = None;
+            if let Some(next) = state.reliable_next.filter(|next| now < *next) {
+                return Err(next.min(until));
+            }
+            let nanos = (bytes as u128)
+                .saturating_mul(SECONDARY_PROBE_INTERVAL.as_nanos())
+                .div_ceil(RELIABLE_SECONDARY_BYTES as u128)
+                .min(SECONDARY_PROBE_INTERVAL.as_nanos() * u32::MAX as u128);
+            let charge = Duration::new(
+                (nanos / 1_000_000_000) as u64,
+                (nanos % 1_000_000_000) as u32,
+            );
+            state.reliable_next = Some(now + charge);
             return Ok(());
         }
+        // Recovery RPCs keep a separate pressure-only allowance. DATA debt
+        // must never prevent route/certificate recovery.
+        let limited_until = active_until
+            .zip(state.pressure_until)
+            .map(|(active, pressure)| active.min(pressure));
+        let window = &mut state.network_window;
+        let budget = NETWORK_CONTROL_BYTES;
+        let Some(limited_until) = limited_until.filter(|until| now < *until) else {
+            *window = None;
+            return Ok(());
+        };
         let (deadline, used) = window.get_or_insert((now + SECONDARY_PROBE_INTERVAL, 0));
         if now >= *deadline {
             *deadline = now + SECONDARY_PROBE_INTERVAL;
@@ -187,6 +190,33 @@ mod tests {
     }
 
     #[test]
+    fn data_pacing_preserves_partial_frame_credit_without_catch_up_bursts() {
+        let activity = LocalSourceActivity::default();
+        let now = Instant::now();
+        activity.note(now);
+        // Two half-budget frames take one interval, never two rounded ones.
+        assert!(activity.admit_reliable_secondary(2048, now).is_ok());
+        assert_eq!(
+            activity.admit_reliable_secondary(2048, now),
+            Err(now + Duration::from_millis(100))
+        );
+        let half = now + Duration::from_millis(100);
+        assert!(activity.admit_reliable_secondary(2048, half).is_ok());
+        assert_eq!(
+            activity.admit_reliable_secondary(2048, half),
+            Err(now + Duration::from_millis(200))
+        );
+        // A stalled sender does not accumulate a bucket to flush on wake.
+        let late = now + Duration::from_secs(1);
+        activity.note(late);
+        assert!(activity.admit_reliable_secondary(2048, late).is_ok());
+        assert_eq!(
+            activity.admit_reliable_secondary(2048, late),
+            Err(late + Duration::from_millis(100))
+        );
+    }
+
+    #[test]
     fn oversized_reliable_frames_pay_their_byte_budget_across_refreshes() {
         for network_control in [false, true] {
             let activity = LocalSourceActivity::default();
@@ -203,7 +233,11 @@ mod tests {
             // Different runners keep publishing fresh primary activity and
             // pressure. They must not replenish a large frame's spent bytes
             // every 200 ms, even though that frame had to stay whole.
-            let charged_until = now + SECONDARY_PROBE_INTERVAL * 16;
+            let charged_until = if network_control {
+                now + SECONDARY_PROBE_INTERVAL * 16
+            } else {
+                now + SECONDARY_PROBE_INTERVAL * 15 + Duration::from_nanos(48_829)
+            };
             for tick in 1..16 {
                 let at = now + SECONDARY_PROBE_INTERVAL * tick;
                 activity.note(at);
