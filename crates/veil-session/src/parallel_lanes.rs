@@ -29,6 +29,8 @@ const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 /// Local observations, never wire fields or relay scheduling requests.
 #[derive(Default)]
 pub struct ParallelDiagnostics {
+    reliable_frames: AtomicU64,
+    reliable_full_writer_bypasses: AtomicU64,
     sent: [AtomicU64; TOTAL_SLOTS],
     epoch_sent: [AtomicU64; TOTAL_SLOTS],
     rekeys: AtomicU64,
@@ -39,6 +41,21 @@ pub struct ParallelDiagnostics {
 }
 
 impl ParallelDiagnostics {
+    pub fn reliable_frames_sent(&self) -> u64 {
+        self.reliable_frames.load(Ordering::Relaxed)
+    }
+    /// Child admissions while the canonical writer queue had zero capacity.
+    /// Local witness only; never advertises a traffic class to the transport.
+    pub fn reliable_full_writer_bypasses(&self) -> u64 {
+        self.reliable_full_writer_bypasses.load(Ordering::Relaxed)
+    }
+    pub(crate) fn note_reliable_frame(&self, canonical_full: bool) {
+        self.reliable_frames.fetch_add(1, Ordering::Relaxed);
+        if canonical_full {
+            self.reliable_full_writer_bypasses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
     pub(super) fn connection_opened(&self) {
         self.active.fetch_add(1, Ordering::AcqRel);
     }
@@ -526,6 +543,9 @@ impl Drop for ParallelSession {
 }
 
 impl ParallelSession {
+    pub(super) fn note_reliable_frame(&self, canonical_full: bool) {
+        self.offer.diagnostics.note_reliable_frame(canonical_full);
+    }
     pub(super) fn reliable(&self) -> Option<&super::reliable_session::ReliableSession> {
         self.reliable.as_ref()
     }

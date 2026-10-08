@@ -103,6 +103,9 @@ impl ReliableSession {
     pub fn ready(&self) -> Option<Arc<ReliableReady>> {
         self.state.borrow().clone()
     }
+    pub fn running(&self) -> bool {
+        !self.worker.is_finished()
+    }
     pub fn acknowledge_failure(&self, child: [u8; 32]) {
         let _ = self.failed.try_send(child);
     }

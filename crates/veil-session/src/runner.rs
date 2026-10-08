@@ -120,6 +120,7 @@ pub enum NextInput {
     WriterClosed,
     /// The writer freed the slots required by the pending ordered batch.
     WriterReady,
+    Reliable(reliable_session::ReliableEvent),
 }
 
 /// Wait for the next interesting event:
@@ -144,9 +145,13 @@ async fn await_next_input(
     wire_tx: &mpsc::Sender<WireBlob>,
     local_datagram_status: Option<&crate::local_datagram_status::LocalDatagramStatus>,
     wire_capacity_needed: Option<usize>,
+    reliable: Option<&reliable_session::ReliableSession>,
 ) -> NextInput {
     use std::future::pending;
     tokio::select! {
+        event = async {
+            match reliable { Some(pool) => pool.next().await, None => pending().await }
+        } => NextInput::Reliable(event),
         result = async {
             match wire_capacity_needed {
                 Some(count) => wire_tx.reserve_many(count).await,
@@ -230,6 +235,12 @@ enum ParallelChannels {
     Ordered(ordered_lanes::OrderedSession),
 }
 impl ParallelChannels {
+    fn note_reliable_frame(&self, canonical_full: bool) {
+        match self {
+            Self::Quic(s) => s.note_reliable_frame(canonical_full),
+            Self::Ordered(s) => s.note_reliable_frame(canonical_full),
+        }
+    }
     fn reliable(&self) -> Option<&reliable_session::ReliableSession> {
         match self {
             Self::Quic(s) => s.reliable(),
@@ -438,6 +449,8 @@ impl RealtimeDatagramLane {
 mod parallel_lanes;
 #[path = "reliable_session.rs"]
 pub mod reliable_session;
+#[path = "reliable_streams.rs"]
+mod reliable_streams;
 pub use parallel_lanes::{
     BoundOrderedChild, BoundReliableChild, ParallelDiagnostics, ParallelPeekOutcome,
     ParallelQuicOffer, ParallelRegistration, ParallelRegistry, RegisteredOrderedChannel,
@@ -4130,6 +4143,18 @@ impl SessionRunner {
             );
         }
 
+        let reliable_enabled = realtime_lane
+            .as_ref()
+            .and_then(|lane| lane.parallel.as_ref())
+            .and_then(ParallelChannels::reliable)
+            .is_some();
+        let mut reliable_streams = reliable_streams::ReliableStreams::new(
+            reliable_enabled,
+            self.dispatcher.clone(),
+            self.peer_id,
+        );
+        let mut reliable_replies = reliable_streams::Replies::new();
+
         // Publish this runner's generic readiness and separately its negotiated
         // neutral Forward support. QUIC alone cannot carry a newer neutral
         // frame to a legacy decoder. No remote class is exposed.
@@ -4985,6 +5010,34 @@ impl SessionRunner {
                         .is_some_and(|outbox| outbox.source_activity().active(now));
                 let mut source_bulk_waiting_for_writer = false;
                 let mut source_pressure_retry: Option<std::time::Instant> = None;
+                let reliable_ready = realtime_lane
+                    .as_ref()
+                    .and_then(|lane| lane.parallel.as_ref())
+                    .and_then(ParallelChannels::reliable)
+                    .and_then(|pool| pool.ready());
+                let reliable_id = reliable_ready.as_ref().map(|ready| ready.id());
+                reliable_streams.reconcile(reliable_id);
+                reliable_replies.reconcile(reliable_id);
+                match self.flush_reliable_replies(
+                    reliable_ready.as_deref(),
+                    &mut reliable_replies,
+                    &mut rekey,
+                    &mut mlkem_rekey,
+                ) {
+                    Ok(retry) => source_pressure_retry = retry,
+                    Err(child) => {
+                        reliable_streams.fail_child(child);
+                        if let Some(ready) =
+                            reliable_ready.as_ref().filter(|ready| ready.id() == child)
+                        {
+                            ready.handle().close();
+                        }
+                        reliable_replies.reconcile(None);
+                    }
+                }
+                let mut child_reservation = None;
+                let mut selected_route = reliable_streams::Route::Canonical;
+                let mut failed_child = None;
                 while !coalesce_active
                     && drained_this_pass < drain_cap
                     // Real-time latency bound: one encrypted batch becomes one
@@ -5001,9 +5054,30 @@ impl SessionRunner {
                     // it. Previously a full (but healthy) channel was treated as
                     // a write failure below and tore down the whole obfs4/TCP
                     // session during a short bulk burst.
-                    && wire_tx.capacity() > 0
                     && let Some(envelope) = pq.pop_admitted_envelope(|priority, frame, owned_reliable| {
                         use crate::priority_queue::HeadAdmission;
+                        use crate::reliable_frames::FrameReservationError;
+                        use reliable_streams::Route;
+                        let route = reliable_streams.route(frame, reliable_id);
+                        let reservation = match route {
+                            Route::Failed => { selected_route = route; return HeadAdmission::Allow; },
+                            Route::Child(id) => {
+                                let Some(ready) = reliable_ready.as_ref().filter(|ready| ready.id() == id) else {
+                                    failed_child = Some(id); selected_route = Route::Failed; return HeadAdmission::Allow;
+                                };
+                                match ready.handle().try_reserve(frame) {
+                                    Ok(reservation) => Some(reservation),
+                                    Err(FrameReservationError::Full) => {
+                                        let retry = now + std::time::Duration::from_millis(10);
+                                        source_pressure_retry = Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
+                                        return HeadAdmission::DeferSource;
+                                    },
+                                    Err(_) => { failed_child = Some(id); selected_route = Route::Failed; return HeadAdmission::Allow; },
+                                }
+                            },
+                            Route::Canonical if wire_tx.capacity() == 0 => return HeadAdmission::DeferSource,
+                            Route::Canonical => None,
+                        };
                         let pending_blobs = wire_tx.max_capacity().saturating_sub(wire_tx.capacity());
                         source_bulk_waiting_for_writer |= local_primary_active
                             && priority >= veil_proto::priority::BULK
@@ -5012,10 +5086,10 @@ impl SessionRunner {
                         // neutral transit frame. The immutable ciphertext batch
                         // keeps one local classification through partial writes.
                         let control = local_control_write(priority, frame);
-                        if batch_control.is_some_and(|kind| kind != control) {
+                        if reservation.is_none() && batch_control.is_some_and(|kind| kind != control) {
                             return HeadAdmission::FlushBatch;
                         }
-                        if !local_source_stream_budget::fits(
+                        if reservation.is_none() && !local_source_stream_budget::fits(
                             local_primary_active,
                             priority,
                             pending_blobs,
@@ -5073,10 +5147,38 @@ impl SessionRunner {
                                 );
                             }
                         }
+                        selected_route = route;
+                        child_reservation = reservation;
                         HeadAdmission::Allow
                     })
                 {
                     drained_this_pass += 1;
+                    if selected_route == reliable_streams::Route::Failed {
+                        if let Some(child) = failed_child.take() {
+                            reliable_streams.fail_child(child);
+                            if let Some(ready) = reliable_ready.as_ref().filter(|ready| ready.id() == child) { ready.handle().close(); }
+                        }
+                        continue;
+                    }
+                    if let Some(reservation) = child_reservation.take() {
+                        let plain = envelope.frame.1.clone();
+                        reliable_streams.admitted(&plain, selected_route);
+                        let bytes = plain.len() + veil_crypto::session_cipher::AEAD_OVERHEAD + 2;
+                        if !self.dispatcher.allow_outbound_bandwidth(bytes) || reservation.commit(envelope).is_err() {
+                            if let reliable_streams::Route::Child(child) = selected_route {
+                                reliable_streams.fail_child(child);
+                                if let Some(ready) = &reliable_ready { ready.handle().close(); }
+                            }
+                            continue;
+                        }
+                        self.dispatcher.capture_outbound(self.peer_id, &plain);
+                        if let Some(parallel) = realtime_lane.as_ref().and_then(|lane| lane.parallel.as_ref()) { parallel.note_reliable_frame(wire_tx.capacity() == 0); }
+                        if let Some(m) = &self.metrics { m.add_transport_bytes_tx(bytes as u64); }
+                        rekey.record_bytes(bytes as u64);
+                        mlkem_rekey.record_bytes(bytes as u64);
+                        continue;
+                    }
+                    reliable_streams.admitted(&envelope.frame.1, reliable_streams::Route::Canonical);
                     let local_primary = envelope.carrier.is_none()
                         && local_primary_stream_frame(envelope.frame.0, &envelope.frame.1);
                     batch_has_local_primary |= local_primary;
@@ -5284,9 +5386,34 @@ impl SessionRunner {
                     } else {
                         None
                     },
+                    realtime_lane.as_ref().and_then(|lane| lane.parallel.as_ref()).and_then(ParallelChannels::reliable).filter(|pool| pool.running()),
                 )
                 .await
                 {
+                    NextInput::Reliable(event) => {
+                        match event {
+                            reliable_session::ReliableEvent::Changed => {},
+                            reliable_session::ReliableEvent::Stopped => reliable_streams.reconcile(None),
+                            reliable_session::ReliableEvent::Frame { child, result } => {
+                                let ready = realtime_lane.as_ref().and_then(|lane| lane.parallel.as_ref()).and_then(ParallelChannels::reliable).and_then(|pool| pool.ready());
+                                let failed = match result {
+                                    Ok(frame) => {
+                                        stall_trigger.clear();
+                                        rekey.record_bytes(frame.len() as u64);
+                                        mlkem_rekey.record_bytes(frame.len() as u64);
+                                        self.dispatch_reliable_frame(child, &frame, &mut reliable_replies, &mut reliable_streams, &mut timers)
+                                    },
+                                    Err(_) => true,
+                                };
+                                if failed {
+                                    reliable_streams.fail_child(child);
+                                    if let Some(ready) = ready.as_ref().filter(|ready| ready.id() == child) { ready.handle().close(); }
+                                    if let Some(pool) = realtime_lane.as_ref().and_then(|lane| lane.parallel.as_ref()).and_then(ParallelChannels::reliable) { pool.acknowledge_failure(child); }
+                                }
+                            },
+                        }
+                        continue;
+                    },
                     NextInput::Frame(frame) => {
                         incoming_frame = *frame;
                         break;
@@ -5582,6 +5709,12 @@ impl SessionRunner {
             } else {
                 unreachable!("decrypt outcome state machine produced inconsistent slot");
             };
+            if let Err(reason) =
+                reliable_streams.incoming_parts(&header, body, reliable_streams::Route::Canonical)
+            {
+                self.record_violation(reason);
+                continue;
+            }
 
             // ── Track RX bytes for rekey thresholds ──────────────────────────
             let rx_bytes = (veil_proto::header::HEADER_SIZE + body.len()) as u64;
@@ -5919,6 +6052,97 @@ impl SessionRunner {
     /// Returns `true` if the caller's run-loop should `break`
     /// (cipher error during response encryption, or push_wire fatal
     /// error).  Returns `false` otherwise — caller continues the loop.
+    fn dispatch_reliable_frame(
+        &mut self,
+        child: [u8; 32],
+        frame: &[u8],
+        replies: &mut reliable_streams::Replies,
+        streams: &mut reliable_streams::ReliableStreams,
+        timers: &mut crate::timers::SessionTimers,
+    ) -> bool {
+        let Ok(h) = decode_header(frame) else {
+            return true;
+        };
+        if h.body_len
+            .saturating_add(veil_crypto::session_cipher::AEAD_OVERHEAD as u32)
+            > self.max_frame_body
+        {
+            self.record_violation("reliable child frame exceeds session body limit");
+            return true;
+        }
+        if let Err(reason) = streams.incoming(frame, reliable_streams::Route::Child(child)) {
+            self.record_violation(reason);
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        timers.note_rx_activity(now);
+        timers.note_frame_received(now);
+        let bytes = (frame.len() + veil_crypto::session_cipher::AEAD_OVERHEAD + 2) as u64;
+        if let Some(m) = &self.metrics {
+            m.add_transport_bytes_rx(bytes);
+            m.add_transport_bytes_rx_family(h.family, h.msg_type, bytes);
+        }
+        match self
+            .dispatcher
+            .dispatch(&h, &frame[veil_proto::header::HEADER_SIZE..], self.peer_id)
+        {
+            DispatchResult::Response(response) => {
+                if let Err(reason) = replies.push(child, response) {
+                    self.record_violation(reason);
+                    return true;
+                }
+                streams.dispatched(&h);
+                false
+            }
+            DispatchResult::Violation(reason) => {
+                self.record_violation(&reason);
+                true
+            }
+            DispatchResult::RateLimited => true,
+            DispatchResult::NoResponse => {
+                streams.dispatched(&h);
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// Full writer admission is ordinary backpressure. A queued reply consumes
+    /// no nonce or bandwidth until both queue/byte reservation and commit.
+    fn flush_reliable_replies(
+        &self,
+        ready: Option<&reliable_session::ReliableReady>,
+        replies: &mut reliable_streams::Replies,
+        rekey: &mut crate::rekey_context::RekeyContext,
+        mlkem_rekey: &mut crate::mlkem_rekey_context::MlKemRekeyContext,
+    ) -> Result<Option<std::time::Instant>, [u8; 32]> {
+        use crate::reliable_frames::FrameReservationError;
+        while let Some((child, _)) = replies.front() {
+            let Some(ready) = ready.filter(|ready| ready.id() == child) else {
+                return Err(child);
+            };
+            let (frame, bytes) = match replies.try_flush(&ready.handle(), |bytes| {
+                self.dispatcher.allow_outbound_bandwidth(bytes)
+            }) {
+                Ok(Some(sent)) => sent,
+                Ok(None) => break,
+                Err(FrameReservationError::Full) => {
+                    return Ok(Some(
+                        std::time::Instant::now() + std::time::Duration::from_millis(10),
+                    ));
+                }
+                Err(_) => return Err(child),
+            };
+            self.dispatcher.capture_outbound(self.peer_id, &frame);
+            if let Some(m) = &self.metrics {
+                m.add_transport_bytes_tx(bytes as u64);
+            }
+            rekey.record_bytes(bytes as u64);
+            mlkem_rekey.record_bytes(bytes as u64);
+        }
+        Ok(None)
+    }
+
     fn process_dispatch_result(
         &mut self,
         result: DispatchResult,
