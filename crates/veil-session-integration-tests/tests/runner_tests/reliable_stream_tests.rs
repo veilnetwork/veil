@@ -93,7 +93,7 @@ impl tokio::io::AsyncWrite for BlockedMain {
 }
 
 #[allow(clippy::await_holding_lock)]
-async fn run_reliable(abort: bool, rotate: bool) {
+async fn run_reliable(abort: bool, rotate: bool, slow_ipc: bool) {
     // Rekey changes session keys, not transport lifetime. Do not inherit the
     // concurrent rotation test's process-wide 1–2 second close deadline.
     let _rotation = epic488_1_lock();
@@ -310,6 +310,76 @@ async fn run_reliable(abort: bool, rotate: bool) {
             }
             other => panic!("unexpected Open {other:?}"),
         }
+    }
+    if slow_ipc {
+        let peer = [2; 32];
+        let id = streams[0];
+        let (tx, mut reader) = tokio::sync::mpsc::channel(1);
+        dispatchers[0]
+            .veil_stream_rx
+            .lock()
+            .unwrap()
+            .insert((peer, id), tx);
+        let body = AppDataPayload {
+            app_id,
+            endpoint_id: 1,
+            seq: 0,
+            data: vec![0x88; 2048],
+        }
+        .encode();
+        send_app(&senders[1], id, AppMsg::AppData, &body).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while reader.len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("return data never reached the actual IPC reader");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatchers[0]
+            .pending_stream_receipts
+            .lock()
+            .unwrap()
+            .insert((peer, id), tx);
+        send_app(
+            &senders[1],
+            id,
+            AppMsg::AppData,
+            &AppDataPayload {
+                app_id,
+                endpoint_id: 1,
+                seq: 1,
+                data: vec![0x99; 2048],
+            }
+            .encode(),
+        )
+        .await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            receipt_status::ACCEPTED
+        );
+        assert_eq!(reader.recv().await.unwrap(), vec![0x88; 2048]);
+        assert!(
+            reader.recv().await.is_none(),
+            "full reader must close after its completed tail"
+        );
+        assert!(
+            matches!(receivers[1].recv().await.unwrap(),AppMessage::StreamClose {stream_id} if stream_id==id)
+        );
+        tasks.0[1].abort();
+        assert!(
+            matches!(tokio::time::timeout(Duration::from_secs(1),receivers[0].recv()).await.unwrap().unwrap(),
+            AppMessage::StreamClose {stream_id} if stream_id==streams[1]),
+            "only the still-active stream may notify on retirement"
+        );
+        assert!(
+            receivers[0].try_recv().is_err(),
+            "already-acknowledged IPC close repeated on retirement"
+        );
+        return;
     }
     for seq in 0..24u64 {
         for direction in 0..2 {
@@ -575,15 +645,20 @@ async fn send_app(
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reliable_app_streams_and_receipts_bypass_blocked_canonical_writers() {
-    run_reliable(false, false).await;
+    run_reliable(false, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reliable_runner_retirement_wakes_open_receipts_and_stream_readers() {
-    run_reliable(true, false).await;
+    run_reliable(true, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reliable_runner_rekey_aborts_old_streams_and_reopens_with_fresh_child_cipher() {
-    run_reliable(false, true).await;
+    run_reliable(false, true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reliable_dispatcher_close_after_full_ipc_reader_is_acknowledged_once() {
+    run_reliable(false, false, true).await;
 }
