@@ -46,6 +46,7 @@ pub fn rt_trace_enabled() -> bool {
 pub fn set_rt_trace(on: bool) {
     cell().store(on, Ordering::Relaxed);
     veil_transport::set_udp_wire_trace(on);
+    veil_transport::tcp_trace::set_enabled(on);
 }
 
 static PUBLISH_PAUSE: OnceLock<AtomicBool> = OnceLock::new();

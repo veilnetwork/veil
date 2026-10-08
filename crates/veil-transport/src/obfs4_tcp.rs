@@ -116,7 +116,7 @@ impl Transport for Obfs4TcpTransport {
             .map_err(|e| TransportError::Tls(format!("obfs4 client handshake: {e}")))?;
 
             let peer = peer_meta("obfs4-tcp", uri.clone(), local_addr, remote_addr);
-            let boxed_stream: BoxIoStream = Box::new(Obfs4IoStream(wrapped));
+            let boxed_stream: BoxIoStream = Box::new(Obfs4IoStream::new(wrapped));
             Ok(boxed_stream_connection_obfs4(peer, boxed_stream))
         })
     }
@@ -190,7 +190,7 @@ impl TransportListener for Obfs4TcpListener {
                 local_addr,
                 Some(remote_addr),
             );
-            let boxed_stream: BoxIoStream = Box::new(Obfs4IoStream(wrapped));
+            let boxed_stream: BoxIoStream = Box::new(Obfs4IoStream::new(wrapped));
             Ok(boxed_stream_connection_obfs4(peer, boxed_stream))
         })
     }
@@ -220,7 +220,7 @@ impl TransportListener for Obfs4TcpListener {
                     })?
                     .map_err(|e| TransportError::Tls(format!("obfs4 server handshake: {e}")))?;
                     let peer = peer_meta("obfs4-tcp", bind_uri, local_addr, Some(remote_addr));
-                    let boxed_stream: BoxIoStream = Box::new(Obfs4IoStream(wrapped));
+                    let boxed_stream: BoxIoStream = Box::new(Obfs4IoStream::new(wrapped));
                     Ok(boxed_stream_connection_obfs4(peer, boxed_stream))
                 });
             Ok(RawInbound {
@@ -240,7 +240,28 @@ impl TransportListener for Obfs4TcpListener {
 
 /// Newtype wrapping `Obfs4Stream<TcpStream>` so we can implement the
 /// crate's local `IoStream` marker trait.
-struct Obfs4IoStream(Obfs4Stream<tokio::net::TcpStream>);
+struct Obfs4IoStream {
+    stream: Obfs4Stream<tokio::net::TcpStream>,
+    write_trace: super::tcp_trace::WriteTrace,
+}
+
+impl Obfs4IoStream {
+    fn new(stream: Obfs4Stream<tokio::net::TcpStream>) -> Self {
+        Self {
+            stream,
+            write_trace: Default::default(),
+        }
+    }
+
+    fn trace_write(&mut self, operation: &'static str, pending: bool) {
+        self.write_trace.observe(
+            self.stream.get_ref(),
+            operation,
+            pending,
+            self.stream.pending_ciphertext_bytes(),
+        );
+    }
+}
 
 impl tokio::io::AsyncRead for Obfs4IoStream {
     fn poll_read(
@@ -248,7 +269,7 @@ impl tokio::io::AsyncRead for Obfs4IoStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
     }
 }
 
@@ -258,19 +279,25 @@ impl tokio::io::AsyncWrite for Obfs4IoStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+        let result = std::pin::Pin::new(&mut self.stream).poll_write(cx, buf);
+        self.trace_write("write", result.is_pending());
+        result
     }
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+        let result = std::pin::Pin::new(&mut self.stream).poll_flush(cx);
+        self.trace_write("flush", result.is_pending());
+        result
     }
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+        let result = std::pin::Pin::new(&mut self.stream).poll_shutdown(cx);
+        self.trace_write("shutdown", result.is_pending());
+        result
     }
 }
 
