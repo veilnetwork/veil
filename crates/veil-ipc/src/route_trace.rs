@@ -17,6 +17,107 @@ struct Sample {
 }
 static SAMPLES: LazyLock<Mutex<HashMap<Key, Sample>>> = LazyLock::new(Default::default);
 
+/// Process-local receipt boundaries, recorded without publishing an
+/// unauthenticated cell's header. The owning SDK consumes these observations
+/// only after opening the cell with its channel key. Nothing travels on IPC or
+/// the network; a separate-process SDK simply has no daemon observation.
+#[derive(Clone, Copy)]
+pub enum LocalDeliveryStage {
+    DaemonEncode,
+    SdkRead,
+}
+
+#[derive(Default)]
+struct LocalDeliveryTimes {
+    daemon: Option<Instant>,
+    sdk: Option<Instant>,
+}
+
+#[derive(Default)]
+struct LocalDeliveries(HashMap<[u8; 32], LocalDeliveryTimes>);
+
+impl LocalDeliveries {
+    const CAP: usize = 256;
+    const TTL: Duration = Duration::from_secs(30);
+
+    fn record(&mut self, digest: [u8; 32], stage: LocalDeliveryStage, now: Instant) {
+        self.0.retain(|_, times| {
+            times
+                .daemon
+                .or(times.sdk)
+                .is_some_and(|first| now.saturating_duration_since(first) < Self::TTL)
+        });
+        if !self.0.contains_key(&digest) && self.0.len() >= Self::CAP {
+            return;
+        }
+        let times = self.0.entry(digest).or_default();
+        match stage {
+            LocalDeliveryStage::DaemonEncode => times.daemon.get_or_insert(now),
+            LocalDeliveryStage::SdkRead => times.sdk.get_or_insert(now),
+        };
+    }
+
+    fn take(&mut self, digest: &[u8; 32], now: Instant) -> Option<LocalDeliveryAges> {
+        let times = self.0.remove(digest)?;
+        let age = |stamp: Option<Instant>| {
+            stamp.and_then(|at| {
+                let elapsed = now.saturating_duration_since(at);
+                (elapsed < Self::TTL).then(|| elapsed.as_micros().min(i64::MAX as u128) as i64)
+            })
+        };
+        Some(LocalDeliveryAges {
+            daemon_age_us: age(times.daemon),
+            sdk_age_us: age(times.sdk),
+        })
+    }
+}
+
+static LOCAL_DELIVERIES: LazyLock<Mutex<LocalDeliveries>> = LazyLock::new(Default::default);
+
+/// Ages measured on this process's monotonic clock, not a remote clock.
+pub struct LocalDeliveryAges {
+    pub daemon_age_us: Option<i64>,
+    pub sdk_age_us: Option<i64>,
+}
+
+fn delivery_digest(data: &[u8]) -> Option<[u8; 32]> {
+    if data.len() < 36 || !data.starts_with(&veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC) {
+        return None;
+    }
+    let seq = u64::from_be_bytes(data[12..20].try_into().ok()?);
+    // Inspect only a fixed encrypted header for sparse sampling. Hash the
+    // ENTIRE ciphertext so an unverified header cannot alias an authentic cell.
+    (seq != 0 && seq.is_multiple_of(50)).then(|| *blake3::hash(data).as_bytes())
+}
+
+/// Record a bounded, silent observation on the locally terminating delivery
+/// path. This never authorizes, classifies or schedules a network packet.
+pub fn observe_local_delivery(stage: LocalDeliveryStage, data: &[u8]) {
+    if !enabled().load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(digest) = delivery_digest(data) else {
+        return;
+    };
+    let mut samples = LOCAL_DELIVERIES.lock().unwrap_or_else(|p| p.into_inner());
+    if enabled().load(Ordering::Relaxed) {
+        samples.record(digest, stage, Instant::now());
+    }
+}
+
+/// Consume timings only AFTER the endpoint authenticates `data`. Observations
+/// that never authenticate expire without a log. Missing stages remain unknown.
+pub fn authenticated_local_delivery_ages(data: &[u8]) -> Option<LocalDeliveryAges> {
+    if !enabled().load(Ordering::Relaxed) {
+        return None;
+    }
+    let digest = delivery_digest(data)?;
+    LOCAL_DELIVERIES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take(&digest, Instant::now())
+}
+
 fn enabled() -> &'static AtomicBool {
     ENABLED.get_or_init(|| {
         AtomicBool::new(std::env::var("VEIL_RT_TRACE").is_ok_and(|v| v.trim() == "1"))
@@ -28,6 +129,11 @@ pub fn set_enabled(on: bool) {
     enabled().store(on, Ordering::Relaxed);
     if !on {
         SAMPLES.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        LOCAL_DELIVERIES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .0
+            .clear();
     }
 }
 
@@ -304,5 +410,91 @@ mod tests {
         assert_eq!(rt_sample(&direct(foreign_magic)), None);
         assert_eq!(rt_sample(&direct(cell(50)[..35].to_vec())), None);
         assert_eq!(rt_sample(&direct(vec![0xa5; 1200])), None);
+    }
+
+    #[test]
+    fn authenticated_delivery_timing_keeps_first_receipt_and_unknown_stages() {
+        let now = Instant::now();
+        let digest = delivery_digest(&cell(50)).unwrap();
+        let mut samples = LocalDeliveries::default();
+        samples.record(digest, LocalDeliveryStage::DaemonEncode, now);
+        samples.record(
+            digest,
+            LocalDeliveryStage::SdkRead,
+            now + Duration::from_millis(150),
+        );
+        // A duplicate ciphertext must not erase time spent in the first queue.
+        samples.record(
+            digest,
+            LocalDeliveryStage::SdkRead,
+            now + Duration::from_millis(200),
+        );
+        let ages = samples
+            .take(&digest, now + Duration::from_millis(250))
+            .unwrap();
+        assert_eq!(ages.daemon_age_us, Some(250_000));
+        assert_eq!(ages.sdk_age_us, Some(100_000));
+        assert!(
+            samples
+                .take(&digest, now + Duration::from_millis(251))
+                .is_none()
+        );
+
+        // Separate-process IPC cannot supply a local daemon stamp.
+        samples.record(digest, LocalDeliveryStage::SdkRead, now);
+        let ages = samples
+            .take(&digest, now + Duration::from_millis(20))
+            .unwrap();
+        assert_eq!(ages.daemon_age_us, None);
+        assert_eq!(ages.sdk_age_us, Some(20_000));
+    }
+
+    #[test]
+    fn unverified_delivery_observations_are_bounded_expire_and_cannot_alias() {
+        let now = Instant::now();
+        let mut samples = LocalDeliveries::default();
+        for i in 0..LocalDeliveries::CAP {
+            let mut data = cell(50);
+            data.extend_from_slice(&i.to_be_bytes());
+            samples.record(
+                delivery_digest(&data).unwrap(),
+                LocalDeliveryStage::SdkRead,
+                now,
+            );
+        }
+        let authentic = cell(100);
+        let digest = delivery_digest(&authentic).unwrap();
+        samples.record(digest, LocalDeliveryStage::SdkRead, now);
+        assert_eq!(samples.0.len(), LocalDeliveries::CAP);
+        assert!(
+            samples.take(&digest, now).is_none(),
+            "overflow is unknown, not a fabricated timing"
+        );
+        samples.record(
+            digest,
+            LocalDeliveryStage::SdkRead,
+            now + LocalDeliveries::TTL,
+        );
+        assert_eq!(samples.0.len(), 1);
+        let ages = samples
+            .take(&digest, now + LocalDeliveries::TTL * 2)
+            .unwrap();
+        assert_eq!(ages.sdk_age_us, None, "expired timings are never current");
+
+        let mut forged = authentic.clone();
+        forged[35] ^= 1;
+        assert_eq!(&forged[..20], &authentic[..20]);
+        let forged_digest = delivery_digest(&forged).unwrap();
+        assert_ne!(
+            forged_digest, digest,
+            "same unverified epoch/sequence cannot alias a ciphertext"
+        );
+        samples.record(forged_digest, LocalDeliveryStage::SdkRead, now);
+        assert!(samples.take(&digest, now).is_none());
+        for seq in [0, 1, 49, 51] {
+            assert!(delivery_digest(&cell(seq)).is_none());
+        }
+        assert!(delivery_digest(&authentic[..35]).is_none());
+        assert!(delivery_digest(&[0xa5; 100]).is_none());
     }
 }

@@ -1126,12 +1126,25 @@ pub(crate) fn trace_sealed_cell(stage: &str, peer: &[u8; 32], payload: &[u8]) {
     let epoch = u64::from_be_bytes(payload[4..12].try_into().unwrap());
     let seq = u64::from_be_bytes(payload[12..20].try_into().unwrap());
     if seq.is_multiple_of(50) {
+        #[cfg(feature = "node-embedded")]
+        let delivery = (stage == "received")
+            .then(|| veil_ipc::route_trace::authenticated_local_delivery_ages(payload))
+            .flatten();
+        #[cfg(feature = "node-embedded")]
+        let (daemon_age_us, sdk_age_us) = delivery.map_or((-1, -1), |times| {
+            (
+                times.daemon_age_us.unwrap_or(-1),
+                times.sdk_age_us.unwrap_or(-1),
+            )
+        });
+        #[cfg(not(feature = "node-embedded"))]
+        let (daemon_age_us, sdk_age_us) = (-1i64, -1i64);
         let at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
         log::info!(
-            "media.cell.sample at_ms={at_ms} stage={stage} peer={:02x}{:02x}{:02x}{:02x} epoch={epoch:016x} seq={seq} bytes={}",
+            "media.cell.sample at_ms={at_ms} stage={stage} peer={:02x}{:02x}{:02x}{:02x} epoch={epoch:016x} seq={seq} bytes={} delivery_daemon_age_us={daemon_age_us} delivery_sdk_age_us={sdk_age_us}",
             peer[0],
             peer[1],
             peer[2],
