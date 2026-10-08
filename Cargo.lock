@@ -5339,6 +5339,7 @@ dependencies = [
  "btls",
  "futures",
  "hickory-resolver",
+ "libc",
  "log",
  "quinn",
  "rand 0.9.4",
