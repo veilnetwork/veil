@@ -1024,6 +1024,25 @@ void _sendRealtimeWorker(int appAddr, Uint8List dstNodeId, Uint8List dstAppId,
   }
 }
 
+bool _reportLocalSourcePressureWorker(
+    int appAddr, bool pressured, int sampledAtMs) {
+  final report = ffi.veilAppReportLocalSourcePressure;
+  if (report == null) return false;
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final rc = report(Pointer<ffi.VeilApp>.fromAddress(appAddr),
+        pressured ? 1 : 0, sampledAtMs, errOut);
+    if (rc < 0) {
+      throw VeilException(
+          'local source feedback failed: ${_readErrAndFree(errOut)}',
+          code: rc);
+    }
+    return rc == ffi.veilOk;
+  } finally {
+    calloc.free(errOut);
+  }
+}
+
 /// Off-isolate relay-realtime path for latency-critical control when the
 /// destination has no admitted direct session. Older native packages do not
 /// expose the symbol; surface that as an ordinary failure so callers can keep
@@ -2589,6 +2608,19 @@ class AppHandle implements Finalizable {
 
   /// Configured local endpoint id.
   int get endpointId => _endpointId;
+
+  /// Submit a fresh measurement to this host's producer admission. False means
+  /// unsupported or expired; true means queued, not acknowledged by the daemon.
+  Future<bool> reportLocalSourcePressure({
+    required bool pressured,
+    required DateTime sampledAt,
+  }) async {
+    _ensureOpen();
+    final appAddr = _app.address;
+    final sampledAtMs = sampledAt.millisecondsSinceEpoch;
+    return Isolate.run(() =>
+        _reportLocalSourcePressureWorker(appAddr, pressured, sampledAtMs));
+  }
 
   /// Send a datagram to a remote peer.
   Future<void> send({

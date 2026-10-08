@@ -1057,6 +1057,20 @@ VeilApp *veil_bind_device_scoped(VeilHandle *handle,
  void veil_app_close(VeilApp *app) ;
 
 /**
+ * Publish measured pressure to this host's own source admission only.
+ * `pressured` must be 0/1; `sampled_at_unix_ms` is the original host sampling
+ * time, not the time a delayed FFI worker started. Nothing is sent to peers.
+ * Returns 0 if queued, 1 if unsupported/expired; negative on error. Queued
+ * does not mean the daemon has already applied the observation.
+ */
+
+int veil_app_report_local_source_pressure(VeilApp *app,
+                                          uint8_t pressured,
+                                          uint64_t sampled_at_unix_ms,
+                                          char **err_out)
+;
+
+/**
  * Send a datagram from `app` to `(dst_node_id, dst_app_id, dst_endpoint_id)`.
  */
 

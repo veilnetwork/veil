@@ -46,6 +46,17 @@ use std::sync::Arc;
 /// `Arc<Mutex<node::session::tx_registry::SessionTxRegistry>>` via a small
 /// adapter newtype in `node::session_glue`.
 pub trait FrameBroadcaster: Send + Sync {
+    /// Whether fresh local source observations can reach admission state.
+    fn supports_local_source_feedback(&self) -> bool {
+        false
+    }
+
+    /// Called only after local IPC ownership/freshness validation. Restrains
+    /// this endpoint's sources; never changes ordinary transit or wire flags.
+    fn note_local_source_feedback(&self, _pressured: bool, _now: std::time::Instant) -> bool {
+        false
+    }
+
     /// Current endpoint-local generic datagram transport readiness. Legacy
     /// implementations retain ordered fallback. Never a remote service hint.
     fn has_datagram_transport(&self, _peer_id: &[u8; 32]) -> bool {

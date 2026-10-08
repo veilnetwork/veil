@@ -1421,6 +1421,67 @@ pub unsafe extern "C" fn veil_app_close(app: *mut VeilApp) {
 
 // ── Datagram I/O ─────────────────────────────────────────────────────────────
 
+/// Publish measured pressure to this host's own source admission only.
+/// `pressured` must be 0/1; `sampled_at_unix_ms` is the original host sampling
+/// time, not the time a delayed FFI worker started. Nothing is sent to peers.
+/// Returns 0 if queued, 1 if unsupported/expired; negative on error. Queued
+/// does not mean the daemon has already applied the observation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_app_report_local_source_pressure(
+    app: *mut VeilApp,
+    pressured: u8,
+    sampled_at_unix_ms: u64,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_app_report_local_source_pressure") }
+    {
+        return rc;
+    }
+    if pressured > 1 {
+        unsafe {
+            write_err(err_out, "pressured must be 0 or 1");
+        }
+        return VEIL_ERR_INVALID_ARG;
+    }
+    null_check!(err_out, "app" => app);
+    get_or_return!(
+        app_ref,
+        app_table(),
+        app,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilApp"
+    );
+    let result = app_ref.bundle.runtime.block_on(async {
+        // A report must not block behind an unrelated reliable send forever.
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            let sender = app_ref.sender.lock().await;
+            let Some(sender) = sender.as_ref() else {
+                return Err(ClientError::Protocol("app already closed".into()));
+            };
+            sender
+                .report_local_source_pressure(pressured == 1, sampled_at_unix_ms)
+                .await
+        })
+        .await
+    });
+    match result {
+        Ok(Ok(true)) => VEIL_OK,
+        Ok(Ok(false)) | Err(_) => 1,
+        Ok(Err(e)) => {
+            let detail = e.to_string();
+            unsafe {
+                write_err(err_out, &detail);
+            }
+            if detail.contains("app already closed") {
+                VEIL_ERR_CLOSED
+            } else {
+                VEIL_ERR
+            }
+        }
+    }
+}
+
 /// Send a datagram from `app` to `(dst_node_id, dst_app_id, dst_endpoint_id)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_send(

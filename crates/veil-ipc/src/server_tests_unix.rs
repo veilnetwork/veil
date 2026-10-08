@@ -70,11 +70,15 @@ async fn connect_with_flags(sock: &PathBuf, flags: u32) -> UnixStream {
     assert_eq!(hdr.msg_type, LocalAppMsg::AppHelloOk as u16);
     assert_eq!(
         hdr.flags,
-        if flags & veil_proto::ipc::IPC_CAP_STREAM_WRITE_CREDIT != 0 {
+        (if flags & veil_proto::ipc::IPC_CAP_STREAM_WRITE_CREDIT != 0 {
             veil_proto::ipc::IPC_HELLO_OK_STREAM_WRITE_CREDIT
         } else {
             0
-        }
+        }) | (if flags & veil_proto::ipc::IPC_CAP_LOCAL_SOURCE_FEEDBACK != 0 {
+            veil_proto::ipc::IPC_HELLO_OK_LOCAL_SOURCE_FEEDBACK
+        } else {
+            0
+        })
     );
     let mut body = vec![0u8; hdr.body_len as usize];
     if !body.is_empty() {
@@ -90,6 +94,154 @@ async fn send_ipc_frame(client: &mut UnixStream, msg_type: u16, body: &[u8]) {
     if !body.is_empty() {
         client.write_all(body).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn local_source_feedback_is_bound_fresh_negotiated_and_never_forwarded() {
+    use veil_proto::ipc::{IPC_CAP_LOCAL_SOURCE_FEEDBACK, LocalSourceFeedbackPayload};
+    #[derive(Default)]
+    struct Observer(AtomicUsize);
+    impl FrameBroadcaster for Observer {
+        fn supports_local_source_feedback(&self) -> bool {
+            true
+        }
+        fn note_local_source_feedback(&self, pressured: bool, _: std::time::Instant) -> bool {
+            self.0
+                .fetch_add(if pressured { 1 } else { 100 }, Ordering::SeqCst);
+            true
+        }
+        fn send_to(&self, _: &[u8; 32], _: u8, _: Vec<u8>) -> bool {
+            panic!("local feedback cannot be forwarded");
+        }
+        fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {
+            panic!("local feedback cannot be forwarded");
+        }
+        fn active_node_ids(&self) -> Vec<[u8; 32]> {
+            vec![]
+        }
+    }
+    async fn barrier(client: &mut UnixStream) {
+        send_ipc_frame(client, LocalAppMsg::ListenTransportsQuery as u16, &[]).await;
+        let (hdr, _) = recv_ipc_frame(client).await;
+        assert_eq!(hdr.msg_type, LocalAppMsg::ListenTransportsResult as u16);
+    }
+    let sock = temp_socket_path();
+    let (server, shutdown, _) = make_server(sock.clone());
+    let observer = Arc::new(Observer::default());
+    let mut server = server.with_session_tx_registry(observer.clone());
+    let task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let mut client = connect_with_flags(&sock, IPC_CAP_LOCAL_SOURCE_FEEDBACK).await;
+    let bind = AppBindPayload {
+        endpoint_id: 9,
+        flags: 0,
+        namespace: b"feedback".to_vec(),
+        name: b"source".to_vec(),
+    };
+    send_ipc_frame(&mut client, LocalAppMsg::AppBind as u16, &bind.encode()).await;
+    let (_, body) = recv_ipc_frame(&mut client).await;
+    let app_id = AppBindOkPayload::decode(&body).unwrap().app_id;
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    let mut report = LocalSourceFeedbackPayload {
+        source_app_id: app_id,
+        pressured: true,
+        sampled_at_unix_ms: now_ms(),
+    };
+    send_ipc_frame(
+        &mut client,
+        LocalAppMsg::LocalSourceFeedback as u16,
+        &report.encode(),
+    )
+    .await;
+    barrier(&mut client).await;
+    assert_eq!(observer.0.load(Ordering::SeqCst), 1);
+    let mut stranger = connect_with_flags(&sock, IPC_CAP_LOCAL_SOURCE_FEEDBACK).await;
+    send_ipc_frame(
+        &mut stranger,
+        LocalAppMsg::LocalSourceFeedback as u16,
+        &report.encode(),
+    )
+    .await;
+    barrier(&mut stranger).await;
+    report.sampled_at_unix_ms = now_ms() - 2000;
+    send_ipc_frame(
+        &mut client,
+        LocalAppMsg::LocalSourceFeedback as u16,
+        &report.encode(),
+    )
+    .await;
+    report.sampled_at_unix_ms = now_ms();
+    send_ipc_frame(
+        &mut client,
+        LocalAppMsg::LocalSourceFeedback as u16,
+        &report.encode()[..40],
+    )
+    .await;
+    barrier(&mut client).await;
+    assert_eq!(observer.0.load(Ordering::SeqCst), 1);
+    let mut legacy = connect_and_hello(&sock).await;
+    let legacy_bind = AppBindPayload {
+        endpoint_id: 10,
+        ..bind
+    };
+    send_ipc_frame(
+        &mut legacy,
+        LocalAppMsg::AppBind as u16,
+        &legacy_bind.encode(),
+    )
+    .await;
+    let (_, legacy_body) = recv_ipc_frame(&mut legacy).await;
+    assert_eq!(
+        AppBindOkPayload::decode(&legacy_body).unwrap().app_id,
+        app_id
+    );
+    // It owns the source too; missing negotiation alone must reject it.
+    send_ipc_frame(
+        &mut legacy,
+        LocalAppMsg::LocalSourceFeedback as u16,
+        &report.encode(),
+    )
+    .await;
+    barrier(&mut legacy).await;
+    assert_eq!(observer.0.load(Ordering::SeqCst), 1);
+    report.pressured = false;
+    send_ipc_frame(
+        &mut client,
+        LocalAppMsg::LocalSourceFeedback as u16,
+        &report.encode(),
+    )
+    .await;
+    barrier(&mut client).await;
+    assert_eq!(observer.0.load(Ordering::SeqCst), 101);
+    drop((client, stranger, legacy));
+    shutdown.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn local_source_feedback_is_not_advertised_without_an_admission_sink() {
+    use veil_proto::ipc::{IPC_CAP_LOCAL_SOURCE_FEEDBACK, IPC_HELLO_OK_LOCAL_SOURCE_FEEDBACK};
+    let sock = temp_socket_path();
+    let (mut server, shutdown, _) = make_server(sock.clone());
+    let task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let mut client = UnixStream::connect(&sock).await.unwrap();
+    let hello = AppIpcHelloPayload {
+        version: IPC_PROTOCOL_VERSION,
+        flags: IPC_CAP_LOCAL_SOURCE_FEEDBACK,
+    };
+    send_ipc_frame(&mut client, LocalAppMsg::AppHello as u16, &hello.encode()).await;
+    let (hdr, _) = recv_ipc_frame(&mut client).await;
+    assert_eq!(hdr.msg_type, LocalAppMsg::AppHelloOk as u16);
+    assert_eq!(hdr.flags & IPC_HELLO_OK_LOCAL_SOURCE_FEEDBACK, 0);
+    drop(client);
+    shutdown.send(true).unwrap();
+    task.await.unwrap().unwrap();
 }
 
 /// How long a test waits for one IPC frame before calling it a failure.

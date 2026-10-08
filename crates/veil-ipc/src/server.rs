@@ -2225,11 +2225,18 @@ async fn handle_ipc_client(
         client_token,
     };
     let stream_write_credit = hello.flags & veil_proto::ipc::IPC_CAP_STREAM_WRITE_CREDIT != 0;
+    let local_source_feedback = hello.flags & veil_proto::ipc::IPC_CAP_LOCAL_SOURCE_FEEDBACK != 0
+        && session_tx_registry
+            .as_ref()
+            .is_some_and(|r| r.supports_local_source_feedback());
     let mut hello_header =
         FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppHelloOk as u16);
     hello_header.body_len = AppIpcHelloOkPayload::WIRE_SIZE as u32;
     if stream_write_credit {
         hello_header.flags |= veil_proto::ipc::IPC_HELLO_OK_STREAM_WRITE_CREDIT;
+    }
+    if local_source_feedback {
+        hello_header.flags |= veil_proto::ipc::IPC_HELLO_OK_LOCAL_SOURCE_FEEDBACK;
     }
     stream
         .write_all(&codec::encode_header(&hello_header))
@@ -2910,6 +2917,16 @@ async fn handle_ipc_client(
                                 hdr.priority(),
                             ).await?;
                         }
+                    }
+                    Ok(LocalAppMsg::LocalSourceFeedback) => {
+                        crate::handlers::source_feedback::handle_local_source_feedback(
+                            &body, local_source_feedback,
+                            |id| client_state.has_app_id(id),
+                            session_tx_registry.as_deref(),
+                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64).unwrap_or(0),
+                            std::time::Instant::now(),
+                        );
                     }
                     Ok(LocalAppMsg::AnycastResolve) => {
                         handle_anycast_resolve(&mut wh, &body, anycast_service.as_ref()).await?;

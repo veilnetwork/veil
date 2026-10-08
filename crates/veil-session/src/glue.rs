@@ -50,6 +50,15 @@ impl SessionTxBroadcaster {
 }
 
 impl veil_types::FrameBroadcaster for SessionTxBroadcaster {
+    fn supports_local_source_feedback(&self) -> bool {
+        true
+    }
+
+    fn note_local_source_feedback(&self, pressured: bool, now: std::time::Instant) -> bool {
+        rlock!(self.inner).note_local_source_feedback(pressured, now);
+        true
+    }
+
     fn has_datagram_transport(&self, peer_id: &[u8; 32]) -> bool {
         rlock!(self.inner).has_datagram_transport(peer_id)
     }

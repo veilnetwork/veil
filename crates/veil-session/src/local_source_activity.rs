@@ -44,8 +44,10 @@ impl LocalSourceActivity {
         state.pressure_until = Some(state.pressure_until.map_or(until, |old| old.max(until)));
     }
 
-    /// Hold reliable local producers before encryption, never discard their
-    /// bytes. All neighbors of this endpoint share the same bounded allowance.
+    /// Hold reliable local producers before encryption whenever a local
+    /// primary is active, never discard bytes. Waiting for pressure first
+    /// permits a file burst to fill a fast relay's slower downstream path.
+    /// All neighbors of this endpoint share the same bounded allowance.
     /// Whole oversized compatibility frames may progress alone, but spend
     /// enough future windows to pay for their bytes. The caller must retain
     /// FIFO and admission credits while waiting for the deadline.
@@ -82,11 +84,23 @@ impl LocalSourceActivity {
         } else {
             RELIABLE_SECONDARY_BYTES
         };
-        let (Some(active_until), Some(pressure_until)) = (active_until, pressure_until) else {
+        let Some(active_until) = active_until else {
             *window = None;
             return Ok(());
         };
-        if now >= active_until || now >= pressure_until {
+        // Data keeps its budget during healthy audio, including intervals
+        // between remote feedback samples. Recovery RPCs are limited only
+        // under pressure and retain their independent allowance.
+        let limited_until = if network_control {
+            let Some(pressure_until) = pressure_until else {
+                *window = None;
+                return Ok(());
+            };
+            active_until.min(pressure_until)
+        } else {
+            active_until
+        };
+        if now >= limited_until {
             *window = None;
             return Ok(());
         }
@@ -107,7 +121,7 @@ impl LocalSourceActivity {
             *used = used.saturating_add(bytes);
             Ok(())
         } else {
-            Err((*deadline).min(active_until).min(pressure_until))
+            Err((*deadline).min(limited_until))
         }
     }
 
@@ -143,6 +157,34 @@ impl LocalSourceActivity {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn healthy_primary_already_bounds_file_bursts_but_not_recovery_rpcs() {
+        let source = LocalSourceActivity::default();
+        let now = Instant::now();
+        source.note(now);
+        assert!(
+            source
+                .admit_reliable_secondary(RELIABLE_SECONDARY_BYTES, now)
+                .is_ok()
+        );
+        assert_eq!(
+            source.admit_reliable_secondary(1, now),
+            Err(now + SECONDARY_PROBE_INTERVAL)
+        );
+        assert!(source.admit_network_control(60000, now).is_ok());
+        assert!(source.admit_network_control(60000, now).is_ok());
+        assert!(
+            source
+                .admit_reliable_secondary(60000, now + IDLE_GRACE)
+                .is_ok()
+        );
+        assert!(
+            source
+                .admit_reliable_secondary(60000, now + IDLE_GRACE)
+                .is_ok()
+        );
+    }
 
     #[test]
     fn oversized_reliable_frames_pay_their_byte_budget_across_refreshes() {
@@ -290,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn reliable_neighbors_share_bytes_and_resume_at_pressure_or_idle_expiry() {
+    fn reliable_neighbors_share_bytes_and_resume_only_at_primary_idle_expiry() {
         let activity = Arc::new(LocalSourceActivity::default());
         let now = Instant::now();
         activity.note(now);
@@ -326,17 +368,17 @@ mod tests {
         assert!(activity.admit_reliable_secondary(60_000, next).is_ok());
         assert_eq!(
             activity.admit_reliable_secondary(1, next),
-            Err(now + PRESSURE_GRACE)
+            Err(now + IDLE_GRACE)
         );
         assert!(
             activity
                 .admit_reliable_secondary(60_000, now + PRESSURE_GRACE)
-                .is_ok()
+                .is_err()
         );
         assert!(
             activity
                 .admit_reliable_secondary(60_000, now + PRESSURE_GRACE)
-                .is_ok()
+                .is_err()
         );
         activity.note_pressure(now + IDLE_GRACE);
         assert!(
