@@ -122,6 +122,7 @@ use libc::{size_t, ssize_t};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use veilclient::{
     AppHandle, AppSender, ClientError, IncomingMessage, IncomingStream, VeilClient,
     VeilStream as SdkStream,
@@ -643,8 +644,33 @@ pub struct VeilApp {
 /// halves → the underlying stream → its `Drop` sends STREAM_CLOSE.
 pub struct VeilStreamFfi {
     bundle: Arc<RuntimeBundle>,
+    closed: watch::Sender<bool>,
     reader: TokioMutex<Option<tokio::io::ReadHalf<SdkStream>>>,
     writer: TokioMutex<Option<tokio::io::WriteHalf<SdkStream>>>,
+}
+
+impl Drop for VeilStreamFfi {
+    fn drop(&mut self) {
+        // The last Arc can leave from a foreign FFI worker or finalizer.
+        // Drop both halves under their own runtime, so SdkStream::Drop sends
+        // STREAM_CLOSE rather than skipping it for lack of a Tokio context.
+        let _entered = self.bundle.runtime.enter();
+        drop(self.reader.get_mut().take());
+        drop(self.writer.get_mut().take());
+    }
+}
+
+async fn stream_io_until_closed<T>(
+    closed: &watch::Sender<bool>,
+    operation: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    let mut stop = closed.subscribe();
+    tokio::select! {
+        biased;
+        _ = stop.wait_for(|closed| *closed) => Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected, "stream already closed")),
+        result = operation => result,
+    }
 }
 
 /// Handle to one ANONYMOUS reliable byte-stream (onion-routed, congestion-
@@ -2839,6 +2865,7 @@ pub unsafe extern "C" fn veil_stream_open(
     let (rd, wr) = tokio::io::split(sdk_stream);
     let stream = VeilStreamFfi {
         bundle: Arc::clone(&app_ref.bundle),
+        closed: watch::Sender::new(false),
         reader: TokioMutex::new(Some(rd)),
         writer: TokioMutex::new(Some(wr)),
     };
@@ -2912,6 +2939,7 @@ pub unsafe extern "C" fn veil_stream_accept(
             let (rd, wr) = tokio::io::split(incoming.stream);
             let stream = VeilStreamFfi {
                 bundle: Arc::clone(&app_ref.bundle),
+                closed: watch::Sender::new(false),
                 reader: TokioMutex::new(Some(rd)),
                 writer: TokioMutex::new(Some(wr)),
             };
@@ -3085,19 +3113,23 @@ pub unsafe extern "C" fn veil_stream_write(
     } else {
         unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
     };
-    let res: std::io::Result<()> = stream_ref.bundle.runtime.block_on(async {
-        // Locks only the WRITE half — independent of an in-flight read (H4).
-        let mut wguard = stream_ref.writer.lock().await;
-        let Some(w) = wguard.as_mut() else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "stream already closed",
-            ));
-        };
-        // write_all via AsyncWrite chunks at MAX_STREAM_CHUNK + is backpressure-
-        // aware (vs send_data's single unchunked frame); poll_flush is a no-op.
-        w.write_all(&payload).await
-    });
+    let res: std::io::Result<()> =
+        stream_ref
+            .bundle
+            .runtime
+            .block_on(stream_io_until_closed(&stream_ref.closed, async {
+                // Locks only the WRITE half — independent of an in-flight read (H4).
+                let mut wguard = stream_ref.writer.lock().await;
+                let Some(w) = wguard.as_mut() else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "stream already closed",
+                    ));
+                };
+                // write_all via AsyncWrite chunks at MAX_STREAM_CHUNK + is backpressure-
+                // aware (vs send_data's single unchunked frame); poll_flush is a no-op.
+                w.write_all(&payload).await
+            }));
     match res {
         Ok(()) => VEIL_OK,
         Err(e) => {
@@ -3163,17 +3195,21 @@ pub unsafe extern "C" fn veil_stream_read(
         "VeilStreamFfi"
     );
     let mut local_buf = vec![0u8; cap];
-    let read_res: std::io::Result<usize> = stream_ref.bundle.runtime.block_on(async {
-        // Locks only the READ half — a parked read no longer blocks writes (H4).
-        let mut rguard = stream_ref.reader.lock().await;
-        let Some(r) = rguard.as_mut() else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "stream already closed",
-            ));
-        };
-        r.read(&mut local_buf).await
-    });
+    let read_res: std::io::Result<usize> =
+        stream_ref
+            .bundle
+            .runtime
+            .block_on(stream_io_until_closed(&stream_ref.closed, async {
+                // Locks only the READ half — a parked read no longer blocks writes (H4).
+                let mut rguard = stream_ref.reader.lock().await;
+                let Some(r) = rguard.as_mut() else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "stream already closed",
+                    ));
+                };
+                r.read(&mut local_buf).await
+            }));
     match read_res {
         Ok(n) => {
             // n == 0 indicates EOF per AsyncRead contract.
@@ -3204,10 +3240,12 @@ pub unsafe extern "C" fn veil_stream_close(stream: *mut VeilStreamFfi) {
     if stream.is_null() {
         return;
     }
-    // Remove from the generational table (see [`veil_close`]); the returned
-    // Arc (if any) drops here. In-flight calls that already cloned it keep the
-    // stream alive until they finish.
-    drop(HandleTable::remove(stream_table(), stream as usize));
+    // Closing wakes both I/O halves, including operations still awaiting
+    // their mutex. Retain the closed state for calls that already cloned an
+    // Arc but have not subscribed yet; no peer activity is needed to stop.
+    if let Some(state) = HandleTable::remove(stream_table(), stream as usize) {
+        state.closed.send_replace(true);
+    }
 }
 
 // ── Mobile lifecycle events ─────────────────────────────

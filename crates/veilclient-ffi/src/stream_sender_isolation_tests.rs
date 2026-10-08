@@ -44,6 +44,265 @@ unsafe fn connect_and_bind(path: &str, endpoint: u32) -> (usize, usize) {
 }
 
 #[test]
+fn close_cancels_blocked_ffi_stream_halves_and_releases_peer_state() {
+    struct Source {
+        frames: std::sync::mpsc::Sender<(u8, Vec<u8>)>,
+        entered: std::sync::mpsc::Sender<()>,
+        permits: tokio::sync::Semaphore,
+    }
+    impl veil_types::FrameBroadcaster for Source {
+        fn send_to(&self, peer: &[u8; 32], lane: u8, frame: Vec<u8>) -> bool {
+            *peer == PEER && self.frames.send((lane, frame)).is_ok()
+        }
+        fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+        fn active_node_ids(&self) -> Vec<[u8; 32]> {
+            vec![PEER]
+        }
+        fn send_reliable_to<'a>(
+            &'a self,
+            _: &'a [u8; 32],
+            frame: Vec<u8>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async move {
+                if veil_proto::codec::decode_header(&frame).unwrap().msg_type
+                    == AppMsg::AppOpen as u16
+                {
+                    return self
+                        .frames
+                        .send((veil_proto::priority::BACKGROUND, frame))
+                        .is_ok();
+                }
+                self.entered.send(()).unwrap();
+                self.permits.acquire().await.unwrap().forget();
+                self.frames
+                    .send((veil_proto::priority::BACKGROUND, frame))
+                    .is_ok()
+            })
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("ipc.sock");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let bridge = IpcStreamBridge {
+        veil_stream_rx: Arc::new(Mutex::new(HashMap::new())),
+        pending_receipts: Arc::new(Mutex::new(HashMap::new())),
+        wire_stream_counter: Arc::new(AtomicU32::new(1)),
+    };
+    let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (frames, received) = std::sync::mpsc::channel();
+    let (entered, waiting) = std::sync::mpsc::channel();
+    let source = Arc::new(Source {
+        frames,
+        entered,
+        permits: tokio::sync::Semaphore::new(0),
+    });
+    let mut server = IpcServer::new(
+        IpcEndpoint::Unix(socket.clone()),
+        shutdown_rx,
+        Arc::new(veil_app::registry::AppEndpointRegistry::new()),
+        [0x42; 32],
+    )
+    .with_session_tx_registry(source.clone())
+    .with_stream_bridge(bridge.clone());
+    let task = rt.spawn(async move { server.run().await.unwrap() });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let bound = unsafe { connect_and_bind(socket.to_str().unwrap(), 16) };
+    let open_stream = || {
+        let open = std::thread::spawn(move || {
+            let mut err = ptr::null_mut();
+            let stream = unsafe {
+                veil_stream_open(
+                    bound.1 as *mut VeilApp,
+                    PEER.as_ptr(),
+                    [0xaa; 32].as_ptr(),
+                    0,
+                    256 * 1024,
+                    &mut err,
+                )
+            };
+            assert!(err.is_null() && !stream.is_null());
+            stream as usize
+        });
+        let (_, opening) = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        let header = veil_proto::codec::decode_header(&opening).unwrap();
+        assert_eq!(header.msg_type, AppMsg::AppOpen as u16);
+        bridge
+            .pending_receipts
+            .lock()
+            .unwrap()
+            .remove(&(PEER, header.stream_id))
+            .unwrap()
+            .send(veil_proto::app::receipt_status::ACCEPTED)
+            .unwrap();
+        (open.join().unwrap(), header.stream_id)
+    };
+    let (stream, wire_id) = open_stream();
+    let (other, other_wire) = open_stream();
+    let state = HandleTable::get(stream_table(), other).unwrap();
+    let other_weak = Arc::downgrade(&state);
+    drop(state);
+    let other_read = std::thread::spawn(move || {
+        let mut err = ptr::null_mut();
+        let mut byte = 0;
+        let rc = unsafe { veil_stream_read(other as *mut VeilStreamFfi, &mut byte, 1, &mut err) };
+        if !err.is_null() {
+            unsafe {
+                veil_free_string(err);
+            }
+        }
+        (rc, byte)
+    });
+    let state = HandleTable::get(stream_table(), stream).unwrap();
+    let weak = Arc::downgrade(&state);
+    drop(state);
+    let (done, results) = std::sync::mpsc::channel();
+    let mut workers = Vec::new();
+    // First writer exhausts IPC credit while the source waits for capacity.
+    // Second writer waits for its mutex; two readers wait for data and mutex.
+    for (label, reading) in [(0, false), (1, false), (2, true), (3, true)] {
+        let done = done.clone();
+        workers.push(std::thread::spawn(move || {
+            let mut err = ptr::null_mut();
+            let rc = if reading {
+                let mut byte = 0;
+                unsafe {
+                    veil_stream_read(stream as *mut VeilStreamFfi, &mut byte, 1, &mut err) as i32
+                }
+            } else {
+                let bytes = vec![label + 5; 25001];
+                unsafe {
+                    veil_stream_write(
+                        stream as *mut VeilStreamFfi,
+                        bytes.as_ptr(),
+                        bytes.len(),
+                        &mut err,
+                    )
+                }
+            };
+            if !err.is_null() {
+                unsafe {
+                    veil_free_string(err);
+                }
+            }
+            done.send((label, rc)).unwrap();
+        }));
+        if label == 0 {
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+    }
+    drop(done);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while weak.strong_count() < 5 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let all_inflight = weak.strong_count() == 5;
+    // Foreign-thread close must interrupt I/O without waiting for peer data,
+    // source permits, or the read/write mutexes held by the first operations.
+    unsafe {
+        veil_stream_close(stream as *mut VeilStreamFfi);
+    }
+    let mut early = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_millis(250);
+    while early.len() < 4 {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            break;
+        };
+        match results.recv_timeout(remaining) {
+            Ok(result) => early.push(result),
+            Err(_) => break,
+        }
+    }
+    let released_before_network = weak.strong_count() == 0;
+    // Release the negative control too, so a failed regression strands no
+    // native thread, runtime, source permit or temporary IPC server.
+    source.permits.add_permits(100);
+    if let Some(tx) = bridge
+        .veil_stream_rx
+        .lock()
+        .unwrap()
+        .get(&(PEER, wire_id))
+        .cloned()
+    {
+        let _ = tx.try_send(vec![55, 66]);
+    }
+    while early.len() < 4 {
+        early.push(results.recv_timeout(Duration::from_secs(2)).unwrap());
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let other_untouched = !other_read.is_finished() && other_weak.strong_count() == 2;
+    bridge
+        .veil_stream_rx
+        .lock()
+        .unwrap()
+        .get(&(PEER, other_wire))
+        .unwrap()
+        .try_send(vec![77])
+        .unwrap();
+    let other_result = other_read.join().unwrap();
+    let mut closed = false;
+    let deadline = std::time::Instant::now() + Duration::from_millis(250);
+    while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+        let Ok((lane, frame)) = received.recv_timeout(remaining) else {
+            break;
+        };
+        let h = veil_proto::codec::decode_header(&frame).unwrap();
+        assert_eq!(h.priority(), veil_proto::priority::INTERACTIVE);
+        if h.msg_type == AppMsg::AppClose as u16 && h.stream_id == wire_id {
+            assert_eq!(lane, veil_proto::priority::BACKGROUND);
+            closed = true;
+            break;
+        }
+    }
+    let cleaned_peer = !bridge
+        .veil_stream_rx
+        .lock()
+        .unwrap()
+        .contains_key(&(PEER, wire_id));
+    unsafe {
+        veil_stream_close(other as *mut VeilStreamFfi);
+    }
+    unsafe {
+        veil_app_close(bound.1 as *mut VeilApp);
+        veil_close(bound.0 as *mut VeilHandle);
+    }
+    shutdown.send(true).unwrap();
+    rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    });
+    assert!(
+        all_inflight,
+        "fixture must have both I/O halves and mutex waiters in flight"
+    );
+    assert!(
+        released_before_network,
+        "close left FFI stream operations waiting for the network"
+    );
+    assert!(early.iter().all(|(_, rc)| *rc == VEIL_ERR_CLOSED));
+    assert!(
+        other_untouched && other_result == (1, 77),
+        "closing one stream interrupted another on the same client"
+    );
+    assert!(
+        closed && cleaned_peer,
+        "foreign-thread close left peer stream state behind"
+    );
+}
+
+#[test]
 fn dedicated_p2p_file_sender_keeps_chat_live_during_remote_open_wait() {
     let mut previous_open = None;
     for isolated in [false, true] {
