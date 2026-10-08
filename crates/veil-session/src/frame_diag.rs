@@ -42,6 +42,63 @@ type Selector = (u8, Option<u16>);
 
 static FILTER: OnceLock<Option<Vec<Selector>>> = OnceLock::new();
 static SEEN: AtomicU64 = AtomicU64::new(0);
+static CHUNKS: OnceLock<bool> = OnceLock::new();
+static CHUNKS_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// Private stand correlation of opaque Forward fragments, independently of
+/// the expensive backtrace hook. Off by default; no payloads, keys or source
+/// roles are recorded. This never changes routing or admission.
+pub fn note_chunk_body(stage: &str, node: Option<&[u8; 32]>, body: &[u8]) {
+    if !*CHUNKS.get_or_init(|| std::env::var("VEIL_DIAG_CHUNKS").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    // A legitimate chunk fits comfortably here; avoid cloning arbitrary huge
+    // envelopes merely because a diagnostic was enabled.
+    if body.len() > 8192 || CHUNKS_SEEN.load(Ordering::Relaxed) >= 100_000 {
+        return;
+    }
+    let Ok(forward) = veil_proto::delivery::ForwardPayload::decode(body) else {
+        return;
+    };
+    if forward.envelope.payload.first() != Some(&veil_proto::delivery::CHUNKED_ENVELOPE_MARKER) {
+        return;
+    }
+    let Ok(chunk) = veil_proto::delivery::ChunkedEnvelopePayload::decode(&forward.envelope.payload)
+    else {
+        return;
+    };
+    if CHUNKS_SEEN.fetch_add(1, Ordering::Relaxed) >= 100_000 {
+        return;
+    }
+    log::info!(
+        "delivery.chunk_trace stage={stage} node={} hop={} origin={} transfer={} content={} index={} count={} bytes={} age_secs={} ttl_secs={}",
+        node.map_or_else(|| "-".to_owned(), |n| hex_prefix(n, 4)),
+        hex_prefix(&forward.next_hop_node_id, 4),
+        hex_prefix(&forward.envelope.sender_node_id, 4),
+        hex_prefix(&chunk.transfer_id, 16),
+        hex_prefix(&chunk.orig_content_id, 8),
+        chunk.chunk_index,
+        chunk.chunk_count,
+        chunk.data.len(),
+        veil_util::unix_secs_now_u64().saturating_sub(forward.envelope.created_at),
+        forward.envelope.ttl_secs,
+    );
+}
+
+pub fn note_chunk_frame(stage: &str, frame: &[u8]) {
+    if !*CHUNKS.get_or_init(|| std::env::var("VEIL_DIAG_CHUNKS").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    if family_and_type(frame)
+        != Some((
+            veil_proto::family::FrameFamily::Delivery as u8,
+            veil_proto::family::DeliveryMsg::Forward as u16,
+        ))
+    {
+        return;
+    }
+    note_chunk_body(stage, None, &frame[veil_proto::header::HEADER_SIZE..]);
+}
 
 /// First `LOUD` matches get a full backtrace; after that one in `EVERY` does,
 /// so a busy node stays readable but the stream never goes fully silent.

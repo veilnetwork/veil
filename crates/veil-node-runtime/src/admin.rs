@@ -835,6 +835,25 @@ pub struct AdminMetricsSnapshot {
     // Application layer
     pub app_msg_channel_full_total: u64,
     pub app_msg_channel_closed_total: u64,
+    // Generic queue/relay/reassembly counters. Old daemons did not expose
+    // these through the local admin API; absence is compatible, not evidence
+    // that there were no drops.
+    #[serde(default)]
+    pub session_tx_drops_total: u64,
+    #[serde(default)]
+    pub priority_queue_drops_total: u64,
+    #[serde(default)]
+    pub session_outbox_drops_total: u64,
+    #[serde(default)]
+    pub ipc_delivery_drops_total: u64,
+    #[serde(default)]
+    pub send_to_failed_total: u64,
+    #[serde(default)]
+    pub dropped_relay_frames_total: u64,
+    #[serde(default)]
+    pub session_write_stalled_total: u64,
+    #[serde(default)]
+    pub chunks_reassembled_total: u64,
     // ML-KEM key age
     /// Seconds since the ML-KEM decapsulation-key seed was loaded at node start.
     /// Operators can use this to schedule periodic key rotation.
@@ -3627,6 +3646,14 @@ async fn collect_metrics_snapshot(runtime: &Arc<Mutex<NodeRuntime>>) -> Result<A
         rt_seq_gaps_total: snap.rt_seq_gaps_total,
         app_msg_channel_full_total: snap.app_msg_channel_full_total,
         app_msg_channel_closed_total: snap.app_msg_channel_closed_total,
+        session_tx_drops_total: snap.session_tx_drops_total,
+        priority_queue_drops_total: snap.priority_queue_drops_total,
+        session_outbox_drops_total: snap.session_outbox_drops_total,
+        ipc_delivery_drops_total: snap.ipc_delivery_drops_total,
+        send_to_failed_total: snap.send_to_failed_total,
+        dropped_relay_frames_total: snap.dropped_relay_frames_total,
+        session_write_stalled_total: snap.session_write_stalled_total,
+        chunks_reassembled_total: snap.chunks_reassembled_total,
         mlkem_key_age_secs,
     }))
 }
