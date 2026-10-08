@@ -35,10 +35,10 @@ struct Inner {
 pub struct QuicParallelHandle(Arc<Inner>);
 
 impl QuicParallelHandle {
-    /// Six generic connections plus one replacement per direction. All peers
+    /// Seven generic connections plus one replacement per direction. All peers
     /// receive the same bound, independent of producer or payload. Partitioning
     /// directions prevents incoming siblings from consuming every local slot.
-    pub const CONNECTIONS_PER_DIRECTION: usize = 7;
+    pub const CONNECTIONS_PER_DIRECTION: usize = 8;
     pub const CONNECTION_LIMIT: usize = 2 * Self::CONNECTIONS_PER_DIRECTION;
 
     pub(super) fn new(
@@ -100,6 +100,17 @@ impl QuicParallelHandle {
     /// original parallel capability covered exclusively owned punched pairs.
     pub fn requires_shared_dispatch(&self) -> bool {
         self.0.requires_shared_dispatch
+    }
+
+    /// Fixed canonical transport direction, not an application classification.
+    /// Duplex reliable children are opened only by the original dialer. An
+    /// ordinary client's ephemeral UDP endpoint need not accept reverse dials.
+    pub fn is_original_dialer(&self) -> bool {
+        self.0.parent.side().is_client()
+    }
+
+    pub async fn closed(&self) {
+        let _ = self.0.parent.closed().await;
     }
 
     /// Remaining local outgoing capacity, including pending handshakes. The

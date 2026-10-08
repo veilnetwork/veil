@@ -8,7 +8,7 @@ mod primary_recovery;
 #[path = "parallel_recovery_trace.rs"]
 mod recovery_trace;
 #[path = "parallel_registry.rs"]
-mod registry;
+pub(super) mod registry;
 pub use registry::{
     BoundOrderedChild, BoundReliableChild, ParallelPeekOutcome, ParallelRegistry,
     RegisteredOrderedChannel, RegisteredReliableChannel, Registration as ParallelRegistration,
@@ -22,7 +22,7 @@ const SOURCE_SLOTS: usize = crate::local_datagram_status::LOCAL_DATAGRAM_PRIORIT
 const TRANSIT_SLOTS: usize = 2;
 const TOTAL_SLOTS: usize = SOURCE_SLOTS + TRANSIT_SLOTS;
 // One bounded authenticated replacement can coexist with all local slots.
-const _: () = assert!(TOTAL_SLOTS < QuicParallelHandle::CONNECTIONS_PER_DIRECTION);
+const _: () = assert!(TOTAL_SLOTS + 1 < QuicParallelHandle::CONNECTIONS_PER_DIRECTION);
 
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -111,6 +111,7 @@ pub struct ParallelQuicOffer {
     diagnostics: Arc<ParallelDiagnostics>,
     registry: Option<Arc<ParallelRegistry>>,
     duplex: bool,
+    reliable: bool,
 }
 
 impl ParallelQuicOffer {
@@ -120,6 +121,7 @@ impl ParallelQuicOffer {
             diagnostics: Arc::default(),
             registry: None,
             duplex: false,
+            reliable: false,
         }
     }
     /// Use the runtime's single shared-listener dispatcher.
@@ -131,6 +133,12 @@ impl ParallelQuicOffer {
     /// Enable only after the peer explicitly negotiates duplex children.
     pub fn with_duplex(mut self) -> Self {
         self.duplex = true;
+        self
+    }
+
+    /// Enable only after the independent reliable-child capability is agreed.
+    pub fn with_reliable(mut self) -> Self {
+        self.reliable = true;
         self
     }
 
@@ -271,19 +279,30 @@ async fn receive_child(
     parent: ParallelParentHandle,
     context: RealtimeReceiverContext,
     duplex: bool,
+    reliable: Option<mpsc::Sender<BoundReliableChild>>,
 ) {
     let authenticated = tokio::time::timeout(BIND_TIMEOUT, async {
         let mut hello = [0; HELLO_BYTES];
         channel.stream.read_exact(&mut hello).await.ok()?;
         let exporter = channel.handle.channel_binding().ok()?;
+        if &hello[..8] == crate::parallel_binding::RELIABLE_PREFACE {
+            reliable.as_ref()?;
+            let (ack, keys) = parent.accept_reliable(&hello, exporter).ok()?;
+            return Some((keys, Some(ack)));
+        }
         let (ack, keys) = parent.accept(&hello, exporter).ok()?;
         channel.stream.write_all(&ack).await.ok()?;
-        Some(keys)
+        Some((keys, None))
     })
     .await;
-    let Ok(Some(keys)) = authenticated else {
+    let Ok(Some((keys, ack))) = authenticated else {
         return;
     };
+    if let Some(ack) = ack {
+        let child = BoundReliableChild::exclusive_quic(channel, keys, ack, parent);
+        let _ = reliable.expect("negotiated reliable inbox").try_send(child);
+        return;
+    }
     receive_authenticated(channel, keys, parent, context, duplex).await;
 }
 
@@ -432,6 +451,7 @@ fn spawn_acceptor(
     parent: ParallelParentHandle,
     context: RealtimeReceiverContext,
     mut incoming: tokio::sync::mpsc::Receiver<registry::BoundChild>,
+    reliable: Option<mpsc::Sender<BoundReliableChild>>,
 ) -> RealtimeReceiverTask {
     RealtimeReceiverTask(tokio::spawn(async move {
         let mut children = tokio::task::JoinSet::new();
@@ -473,7 +493,7 @@ fn spawn_acceptor(
                 Some(accepted) = accepts.join_next(), if !accepts.is_empty() => {
                     if let Ok(Ok(connection)) = accepted
                         && let Ok(channel) = Channel::new(connection, Arc::clone(&offer.diagnostics)) {
-                        children.spawn(receive_child(channel, parent.clone(), context.clone(), offer.duplex));
+                        children.spawn(receive_child(channel, parent.clone(), context.clone(), offer.duplex, reliable.clone()));
                     }
                 },
                 // A full registry or missing shared dispatcher leaves the
@@ -494,9 +514,21 @@ pub(super) struct ParallelSession {
     slots: [Slot; TOTAL_SLOTS],
     transit_salt: [u8; 32],
     primary_recovery: primary_recovery::PrimaryRecovery,
+    reliable: Option<super::reliable_session::ReliableSession>,
+}
+
+impl Drop for ParallelSession {
+    fn drop(&mut self) {
+        self.parent.retire();
+        self.reliable = None;
+        self._registration = None;
+    }
 }
 
 impl ParallelSession {
+    pub(super) fn reliable(&self) -> Option<&super::reliable_session::ReliableSession> {
+        self.reliable.as_ref()
+    }
     pub(super) fn new(
         offer: ParallelQuicOffer,
         tx: &[u8; 32],
@@ -514,7 +546,27 @@ impl ParallelSession {
             .registry
             .as_ref()
             .and_then(|registry| registry.register(sid, parent.handle(), &offer, incoming_tx));
-        let acceptor = spawn_acceptor(offer.clone(), parent.handle(), context.clone(), incoming_rx);
+        let (reliable_tx, reliable_rx) = mpsc::channel(1);
+        let reliable_enabled = offer.reliable
+            && (registration
+                .as_ref()
+                .is_some_and(|r| r.enable_reliable(reliable_tx.clone()))
+                || offer.handle.has_exclusive_accept());
+        let reliable = reliable_enabled.then(|| {
+            super::reliable_session::ReliableSession::new(
+                super::reliable_session::ReliableTransport::Quic(offer.handle.clone()),
+                parent.handle(),
+                offer.diagnostics.clone(),
+                reliable_rx,
+            )
+        });
+        let acceptor = spawn_acceptor(
+            offer.clone(),
+            parent.handle(),
+            context.clone(),
+            incoming_rx,
+            reliable_enabled.then_some(reliable_tx),
+        );
         Self {
             offer,
             context,
@@ -525,6 +577,7 @@ impl ParallelSession {
             slots: Default::default(),
             transit_salt: blake3::derive_key("veil/transit-shard/v1", &sid),
             primary_recovery: Default::default(),
+            reliable,
         }
     }
 

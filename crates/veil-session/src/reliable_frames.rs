@@ -191,6 +191,10 @@ impl ReliableFrameHandle {
     pub fn buffered_bytes(&self) -> usize {
         RECORD_BUFFER_BYTES - self.0.bytes.available_permits()
     }
+
+    pub fn record_progress(&self) -> veil_transport::reliable_records::RecordProgress {
+        self.0.transport.progress()
+    }
 }
 
 /// Owns child credentials, actual transport lifetime and the sole TX cipher.
