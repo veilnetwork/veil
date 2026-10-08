@@ -1900,6 +1900,12 @@ where
             .await
             .map_err(|e| HandshakeError(format!("write OVL1 frame body: {e}")))?;
     }
+    // The next flight waits on the peer. A buffered/framed transport must
+    // drain this flight first, even if no subsequent write ever arrives.
+    stream
+        .flush()
+        .await
+        .map_err(|e| HandshakeError(format!("flush OVL1 frame: {e}")))?;
     Ok(padded)
 }
 
@@ -1972,6 +1978,31 @@ fn reject_incompatible_major(remote_major: u16) -> Result<()> {
 mod tests {
     mod resume_compat_tests;
     use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn buffered_handshake_flight_is_flushed_before_waiting_for_peer() {
+        let (stream, mut peer) = duplex(16 * 1024);
+        let mut buffered = tokio::io::BufWriter::with_capacity(64 * 1024, stream);
+        let padded = super::write_frame(
+            &mut buffered,
+            FrameFamily::Session as u8,
+            SessionMsg::Hello as u16,
+            b"hello",
+        )
+        .await
+        .unwrap();
+        let mut header = [0; veil_proto::header::HEADER_SIZE];
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            peer.read_exact(&mut header),
+        )
+        .await
+        .expect("handshake response waits on its own buffered flight")
+        .unwrap();
+        let mut body = vec![0; padded.len()];
+        peer.read_exact(&mut body).await.unwrap();
+        assert_eq!(body, padded);
+    }
 
     use super::*;
     use veil_cfg::{NodeRole, SignatureAlgorithm};
