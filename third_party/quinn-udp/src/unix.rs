@@ -80,7 +80,7 @@ pub struct UdpSocketState {
     /// In particular, we do not use IP_TOS cmsg_type in this case,
     /// which is not supported on Linux <3.13 and results in not sending the UDP packet at all.
     sendmsg_einval: AtomicBool,
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", apple))]
     receive_timestamp_trace: AtomicBool,
 }
 
@@ -192,19 +192,20 @@ impl UdpSocketState {
             gro_segments: gro::gro_segments(),
             may_fragment,
             sendmsg_einval: AtomicBool::new(false),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            #[cfg(any(target_os = "linux", target_os = "android", apple))]
             receive_timestamp_trace: AtomicBool::new(false),
         })
     }
 
     /// Opt in to local kernel receive timestamps. Unsupported kernels continue
     /// without metadata. This never changes packet contents or network priority.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", apple))]
     pub fn set_receive_timestamp_trace(&self, socket: UdpSockRef<'_>, enabled: bool) {
         if self.receive_timestamp_trace.load(Ordering::Relaxed) == enabled {
             return;
         }
         let io = socket.0;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if enabled {
             if set_socket_option(&*io, libc::SOL_SOCKET, libc::SO_TIMESTAMPNS_NEW, OPTION_ON)
                 .is_err()
@@ -215,6 +216,13 @@ impl UdpSocketState {
             let _ = set_socket_option(&*io, libc::SOL_SOCKET, libc::SO_TIMESTAMPNS_NEW, 0);
             let _ = set_socket_option(&*io, libc::SOL_SOCKET, libc::SO_TIMESTAMPNS, 0);
         }
+        #[cfg(apple)]
+        let _ = set_socket_option(
+            &*io,
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMP,
+            if enabled { OPTION_ON } else { 0 },
+        );
         // Cache the requested setting even if unsupported; do not retry an
         // unsupported option on every read. Missing metadata stays None.
         self.receive_timestamp_trace
@@ -763,6 +771,20 @@ fn decode_recv(
                         valid_receive_timestamp(ts.tv_sec as i64, ts.tv_nsec as i64);
                 }
             }
+            #[cfg(apple)]
+            (libc::SOL_SOCKET, libc::SCM_TIMESTAMP) => {
+                if cmsg.cmsg_len as usize
+                    >= unsafe { libc::CMSG_LEN(mem::size_of::<libc::timeval>() as _) } as usize
+                {
+                    // Darwin reports Unix timeval microseconds, not timespec
+                    // nanoseconds. This stamp precedes user-space recv polling.
+                    let ts = unsafe {
+                        std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::timeval>())
+                    };
+                    kernel_recv_unix_ns =
+                        valid_receive_timestamp(ts.tv_sec as i64, i64::from(ts.tv_usec) * 1000);
+                }
+            }
 
             (libc::IPPROTO_IP, libc::IP_TOS) => unsafe {
                 ecn_bits = cmsg::decode::<u8, libc::cmsghdr>(cmsg);
@@ -1119,7 +1141,7 @@ mod gro {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", apple))]
 fn valid_receive_timestamp(sec: i64, ns: i64) -> Option<u64> {
     if sec < 0 || !(0..1_000_000_000).contains(&ns) {
         return None;
