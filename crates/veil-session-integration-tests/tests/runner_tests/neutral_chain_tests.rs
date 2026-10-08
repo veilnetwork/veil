@@ -1,4 +1,4 @@
-//! Actual UDP/QUIC A <-> R1 <-> R2 <-> C, with neutral relay FIFOs.
+//! Actual QUIC or obfs4/TCP A <-> R1 <-> R2 <-> C, with neutral relay FIFOs.
 use super::*;
 use veil_anonymity::{
     circuit_data::{CircuitCellBytes, Direction, apply_layer, wrap_payload},
@@ -9,19 +9,36 @@ use veil_anonymity::{
 };
 use veil_proto::family::RelayChainMsg;
 
-async fn chain(rotate: bool) {
-    let context = Arc::new(TransportContext::for_debug().unwrap());
+struct ChainTasks(Vec<tokio::task::JoinHandle<()>>);
+impl Drop for ChainTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+#[allow(clippy::await_holding_lock)]
+async fn chain(rotate: bool, ordered: bool) {
+    let _rotation = epic488_1_lock();
+    let mut context = TransportContext::for_debug().unwrap();
+    context.obfs4_psk = Some(Arc::new([0x42; 32]));
+    let context = Arc::new(context);
+    let transport: Box<dyn Transport> = if ordered {
+        Box::new(veil_transport::obfs4_tcp::Obfs4TcpTransport)
+    } else {
+        Box::new(QuicTransport)
+    };
     let mut listeners = Vec::new();
     let registries: Vec<_> = (0..4)
         .map(|_| Arc::new(ParallelRegistry::default()))
         .collect();
     for _ in 0..4 {
-        let uri: TransportUri = "quic://127.0.0.1:0".parse().unwrap();
+        let uri: TransportUri = format!("{}://127.0.0.1:0", transport.scheme())
+            .parse()
+            .unwrap();
         listeners.push(Arc::<dyn TransportListener>::from(
-            QuicTransport
-                .bind(&uri, Arc::clone(&context))
-                .await
-                .unwrap(),
+            transport.bind(&uri, Arc::clone(&context)).await.unwrap(),
         ));
     }
     let ids = [[1; 32], [2; 32], [3; 32], [4; 32]];
@@ -94,34 +111,43 @@ async fn chain(rotate: bool) {
         }
         dispatchers.push(Arc::new(dispatcher));
     }
-    let mut tasks = Vec::new();
+    let mut tasks = ChainTasks(Vec::new());
     let mut observations = Vec::new();
     let mut source_observations = Vec::new();
     let mut bridge_observations = Vec::new();
     for left in 0..3 {
         let right = left + 1;
         let listener = Arc::clone(&listeners[right]);
-        let uri: TransportUri = format!("quic://{}", listener.local_addr()).parse().unwrap();
-        let accepted = tokio::spawn(async move { listener.accept().await });
-        let connection = QuicTransport
-            .connect(&uri, Arc::clone(&context))
-            .await
+        let uri: TransportUri = format!("{}://{}", transport.scheme(), listener.local_addr())
+            .parse()
             .unwrap();
-        let datagrams = connection.quic_datagrams().unwrap();
-        let parallel = connection.parallel_quic().unwrap();
+        let accepted = tokio::spawn(async move { listener.accept().await });
+        let connection = transport.connect(&uri, Arc::clone(&context)).await.unwrap();
+        let datagrams = connection.quic_datagrams();
+        let parallel = connection.parallel_quic();
+        let ordered_offer = connection.parallel_stream();
         let mut stream = connection.into_stream().unwrap();
         stream.write_all(b"test").await.unwrap();
+        stream.flush().await.unwrap();
         let incoming = accepted.await.unwrap().unwrap();
-        let incoming_datagrams = incoming.quic_datagrams().unwrap();
-        let incoming_parallel = incoming.parallel_quic().unwrap();
+        let incoming_datagrams = incoming.quic_datagrams();
+        let incoming_parallel = incoming.parallel_quic();
+        let incoming_ordered = incoming.parallel_stream();
         let mut incoming_stream = incoming.into_stream().unwrap();
         incoming_stream.read_exact(&mut [0; 4]).await.unwrap();
         let left_key = [10 + left as u8; 32];
         let right_key = [20 + left as u8; 32];
         let sid = [30 + left as u8; 32];
-        for (node, peer, stream, datagrams, parallel, tx, rx) in [
+        for (node, peer, stream, datagrams, parallel, ordered_offer, tx, rx) in [
             (
-                left, right, stream, datagrams, parallel, left_key, right_key,
+                left,
+                right,
+                stream,
+                datagrams,
+                parallel,
+                ordered_offer,
+                left_key,
+                right_key,
             ),
             (
                 right,
@@ -129,14 +155,29 @@ async fn chain(rotate: bool) {
                 incoming_stream,
                 incoming_datagrams,
                 incoming_parallel,
+                incoming_ordered,
                 right_key,
                 left_key,
             ),
         ] {
-            let offer = ParallelQuicOffer::new(parallel)
-                .with_registry(Arc::clone(&registries[node]))
-                .with_duplex();
-            let diagnostic = offer.diagnostics();
+            let (realtime_transport, parallel, diagnostic) = if ordered {
+                let offer = ParallelOrderedOffer::new(
+                    ordered_offer.unwrap(),
+                    Arc::clone(&registries[node]),
+                );
+                let diagnostic = offer.diagnostics();
+                (RealtimeTransportOffer::Ordered(offer), None, diagnostic)
+            } else {
+                let offer = ParallelQuicOffer::new(parallel.unwrap())
+                    .with_registry(Arc::clone(&registries[node]))
+                    .with_duplex();
+                let diagnostic = offer.diagnostics();
+                (
+                    RealtimeTransportOffer::Quic(datagrams.unwrap()),
+                    Some(offer),
+                    diagnostic,
+                )
+            };
             observations.push((node, Arc::clone(&diagnostic)));
             if node == 0 || node == 3 {
                 source_observations.push(Arc::clone(&diagnostic));
@@ -156,12 +197,12 @@ async fn chain(rotate: bool) {
             };
             runner.quic_datagrams = Some(RealtimeLaneOffer {
                 peer_datagrams: true,
-                transport: veil_session::runner::RealtimeTransportOffer::Quic(datagrams),
+                transport: realtime_transport,
                 peer_rotates: true,
                 peer_flows: true,
                 peer_circuit_datagrams: true,
                 peer_neutral_forwards: true,
-                parallel: Some(offer),
+                parallel,
             });
             runner.local_node_id = ids[node];
             runner.peer_id = ids[peer];
@@ -182,17 +223,27 @@ async fn chain(rotate: bool) {
             runner.violation_tracker = Arc::clone(&dispatcher.abuse.violation_tracker);
             runner.logger = Arc::clone(&dispatcher.logger);
             runner.dispatcher = dispatcher;
-            tasks.push(tokio::spawn(async move { runner.run().await }));
+            tasks
+                .0
+                .push(tokio::spawn(async move { runner.run().await }));
         }
     }
     for (listener, registry) in listeners.into_iter().zip(registries) {
-        tasks.push(tokio::spawn(async move {
+        tasks.0.push(tokio::spawn(async move {
             loop {
                 let connection = listener.accept().await.unwrap();
                 let datagrams = connection.quic_datagrams();
+                let binding = connection.stream_channel_binding();
                 let stream = connection.into_stream().unwrap();
+                let outcome = if ordered {
+                    registry
+                        .peek_and_dispatch_with_binding(stream, datagrams, binding)
+                        .await
+                } else {
+                    registry.peek_and_dispatch(stream, datagrams).await
+                };
                 assert!(matches!(
-                    registry.peek_and_dispatch(stream, datagrams).await,
+                    outcome,
                     ParallelPeekOutcome::Bound | ParallelPeekOutcome::Drop(_)
                 ));
             }
@@ -201,6 +252,18 @@ async fn chain(rotate: bool) {
     let source_senders = [producers[&(0, 1)].clone(), producers[&(3, 2)].clone()];
     let result = tokio::time::timeout(Duration::from_secs(20), async {
         warm_receive_only_channels(&source_senders).await;
+        if ordered {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while observations
+                    .iter()
+                    .any(|(_, d)| d.active_connections() != 6)
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("relay ordered pools did not bind");
+        }
         let mut first_epoch_done = false;
         for seq in 1..=300u32 {
             for direction in 0..2 {
@@ -277,6 +340,18 @@ async fn chain(rotate: bool) {
                         .all(|d| d.transit_sent_this_generation() == 0)
                 );
                 warm_receive_only_channels(&source_senders).await;
+                if ordered {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while observations
+                            .iter()
+                            .any(|(_, d)| d.active_connections() != 6)
+                        {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .expect("relay ordered pools did not rebind");
+                }
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -297,6 +372,11 @@ async fn chain(rotate: bool) {
                 assert_eq!(d.sent(0), 0, "relay selected a source priority channel");
                 assert_eq!(d.sent(2), 0, "relay selected a source priority channel");
                 assert_eq!(d.sent(3), 0, "relay selected a source priority channel");
+                assert_eq!(
+                    d.sent(veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE),
+                    0,
+                    "relay selected a source priority channel"
+                );
             }
             if rotate {
                 assert!(d.rekeys() > 0);
@@ -311,7 +391,7 @@ async fn chain(rotate: bool) {
         );
     })
     .await;
-    for task in tasks {
+    for task in tasks.0.drain(..) {
         task.abort();
         let _ = task.await;
     }
@@ -340,10 +420,20 @@ async fn chain(rotate: bool) {
 
 #[tokio::test]
 async fn two_relays_use_bounded_neutral_quic_shards() {
-    chain(false).await;
+    chain(false, false).await;
 }
 
 #[tokio::test]
 async fn neutral_chain_rebinds_after_real_canonical_rekey() {
-    chain(true).await;
+    chain(true, false).await;
+}
+
+#[tokio::test]
+async fn two_relays_use_bounded_neutral_ordered_shards() {
+    chain(false, true).await;
+}
+
+#[tokio::test]
+async fn neutral_ordered_chain_rebinds_after_real_canonical_rekey() {
+    chain(true, true).await;
 }
