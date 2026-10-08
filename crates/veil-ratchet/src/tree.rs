@@ -52,12 +52,11 @@ pub const MAX_TREE_NODES_PER_CHAIN: usize = 2_048;
 
 /// How many subtree roots one conversation may hold across all its chains.
 ///
-/// The counterpart of [`MAX_SKIP_TOTAL`](crate::MAX_SKIP_TOTAL), and not a
-/// second knob: tree chains age by epoch to the current one and the one before
-/// it, so this is two chains at [`MAX_TREE_NODES_PER_CHAIN`] — enforced as a
-/// runtime check it could never fire. At 37 bytes a node in the stored state,
-/// about 150 kB, the same order as the 137 kB the chain's worst case costs. A
-/// stored state claiming more is refused on load.
+/// The counterpart of [`MAX_SKIP_TOTAL`](crate::MAX_SKIP_TOTAL). Closed
+/// epochs retain only unconsumed gaps, so this bound is checked explicitly
+/// across every retained receiving chain. At 37 bytes per node, the key
+/// material is about 150 kB at most (plus bounded chain identifiers). A stored
+/// state claiming more is refused on load.
 pub const MAX_TREE_NODES_TOTAL: usize = 2 * MAX_TREE_NODES_PER_CHAIN;
 
 /// One child of a node.
