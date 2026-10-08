@@ -3031,6 +3031,10 @@ async fn reader_task(
             LocalAppMsg::AppDeliver => {
                 use veilcore::proto::AppDeliverPayload;
                 if let Ok(p) = AppDeliverPayload::decode(&body) {
+                    veil_ipc::route_trace::observe_local_delivery(
+                        veil_ipc::route_trace::LocalDeliveryStage::SdkRead,
+                        &p.data,
+                    );
                     let d = dispatch.lock().await;
                     if let Some(tx) = d.endpoints.get(&p.endpoint_id) {
                         // try_send → drop on full. Matches the daemon's
