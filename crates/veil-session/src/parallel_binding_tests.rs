@@ -155,7 +155,128 @@ async fn ordered_child_proof_binds_the_actual_obfs4_connection() {
         assert_eq!(a_keys.session_id, b_keys.session_id);
         assert_eq!(a_keys.tx_key(), b_keys.rx_key());
         assert_eq!(a_keys.rx_key(), b_keys.tx_key());
+        // Exercise the actual existing opaque-flow codec on the authenticated
+        // ordered child in BOTH directions, including multi-record assembly.
+        let mut a_tx = crate::datagram_flows::SessionDatagramTx::new(
+            a_keys.tx_key(),
+            &a_keys.session_id,
+            true,
+        );
+        let mut b_tx = crate::datagram_flows::SessionDatagramTx::new(
+            b_keys.tx_key(),
+            &b_keys.session_id,
+            true,
+        );
+        let mut a_rx = crate::datagram_flows::SessionDatagramRx::new(
+            a_keys.rx_key(),
+            &a_keys.session_id,
+            true,
+        );
+        let mut b_rx = crate::datagram_flows::SessionDatagramRx::new(
+            b_keys.rx_key(),
+            &b_keys.session_id,
+            true,
+        );
+        let a_channel = a_keys.into_ordered(a_stream).unwrap();
+        let b_channel = b_keys.into_ordered(b_stream).unwrap();
+        let a_handle = a_channel.handle();
+        let b_handle = b_channel.handle();
+        for frame in [vec![0x42; 64], vec![0x73; 8200]] {
+            let ceiling = a_handle.max_size().unwrap();
+            let packets = a_tx.encode_frame(0, &frame, ceiling).unwrap();
+            let count = packets.len();
+            for packet in packets {
+                a_handle.send(&packet).unwrap();
+            }
+            let mut received = None;
+            for _ in 0..count {
+                let packet = timeout(Duration::from_secs(2), b_handle.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                received = b_rx
+                    .decode_datagram(&packet, std::time::Instant::now())
+                    .unwrap()
+                    .or(received);
+            }
+            assert_eq!(received.as_deref(), Some(frame.as_slice()));
+            for packet in b_tx
+                .encode_frame(2, b"authenticated return", ceiling)
+                .unwrap()
+            {
+                b_handle.send(&packet).unwrap();
+            }
+            let packet = timeout(Duration::from_secs(2), a_handle.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                a_rx.decode_datagram(&packet, std::time::Instant::now())
+                    .unwrap()
+                    .as_deref(),
+                Some(b"authenticated return".as_slice())
+            );
+        }
     }
+}
+
+#[tokio::test]
+async fn ordered_owner_retirement_revokes_admission_before_watcher_runs_and_wakes_idle_io() {
+    use veil_transport::ordered_records::RecordSendError;
+    let (a_parent, b_parent) = parents();
+    let (hello, pending) = a_parent.begin([4; 32]).unwrap();
+    let (ack, b_keys) = b_parent.accept(&hello, [4; 32]).unwrap();
+    let a_keys = pending.finish(&ack).unwrap();
+    let (a, b) = tokio::io::duplex(4096);
+    let a_channel = a_keys.into_ordered(Box::new(a)).unwrap();
+    let b_channel = b_keys.into_ordered(Box::new(b)).unwrap();
+    let a_handle = a_channel.handle();
+    let retained = a_handle.clone();
+    let b_handle = b_channel.handle();
+    b_handle.send(b"old queued frame").unwrap();
+    // This task does not yield between retirement and these checks: the
+    // spawned cleanup watcher cannot be responsible for synchronous rejection.
+    a_parent.retire();
+    assert_eq!(retained.send(b"new frame"), Err(RecordSendError::Closed));
+    assert_eq!(
+        retained.send_before(
+            b"new frame",
+            std::time::Instant::now() + Duration::from_secs(1)
+        ),
+        Err(RecordSendError::Closed)
+    );
+    assert_eq!(retained.max_size(), None);
+    assert_eq!(retained.send_buffer_space(), 0);
+    assert_eq!(
+        retained.recv().await.unwrap_err().kind(),
+        std::io::ErrorKind::ConnectionAborted
+    );
+    timeout(Duration::from_secs(1), retained.closed())
+        .await
+        .unwrap();
+    // No incoming data is needed to wake cleanup and close the remote half.
+    timeout(Duration::from_secs(1), b_handle.closed())
+        .await
+        .unwrap();
+    assert!(b_handle.recv().await.is_err());
+}
+
+#[tokio::test]
+async fn verified_ordered_keys_cannot_start_a_plane_after_canonical_owner_drop() {
+    let (a_parent, b_parent) = parents();
+    let (hello, pending) = a_parent.begin([4; 32]).unwrap();
+    let (ack, _) = b_parent.accept(&hello, [4; 32]).unwrap();
+    let keys = pending.finish(&ack).unwrap();
+    let retained = a_parent.handle();
+    drop(a_parent);
+    timeout(Duration::from_secs(1), retained.retired())
+        .await
+        .unwrap();
+    let (stream, _peer) = tokio::io::duplex(1024);
+    assert!(matches!(
+        keys.into_ordered(Box::new(stream)),
+        Err(BindingError::Retired)
+    ));
 }
 
 struct TestChild {

@@ -23,6 +23,8 @@ pub mod hint_registry;
 pub mod obfs4_tcp;
 /// On-demand listener controller (PoW-Gated Rendezvous epic, Slice 2).
 pub mod on_demand;
+/// Bounded generic record framing after auxiliary-session authentication.
+pub mod ordered_records;
 /// QUIC `Transport` built on `quinn`.
 pub mod quic;
 /// Scheme-keyed lookup of transport implementations.
