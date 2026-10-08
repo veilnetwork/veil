@@ -21,6 +21,7 @@ struct AudioSendSnapshot {
   int64_t queue_age_ms = -1;
   int64_t max_gap_ms = 0;
   int64_t max_admission_ms = 0;
+  uint64_t dropped = 0;
 };
 
 // Endpoint-only observations, before and after local Veil queue admission.
@@ -82,6 +83,10 @@ class AudioSendStats {
     if (queued) {
       last_queued_ns_.store(now_ns, std::memory_order_relaxed);
       queued_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      // Count completed primary RTP failures directly. attempts - queued can
+      // include a still-running admission; video and RTCP use other counters.
+      dropped_.fetch_add(1, std::memory_order_relaxed);
     }
   }
 
@@ -100,6 +105,7 @@ class AudioSendStats {
         age(last_queued_ns_.load(std::memory_order_relaxed), now_ns),
         max_gap_ns_.load(std::memory_order_relaxed) / 1'000'000,
         max_admission_ns_.load(std::memory_order_relaxed) / 1'000'000,
+        dropped_.load(std::memory_order_relaxed),
     };
   }
 
@@ -114,6 +120,7 @@ class AudioSendStats {
   }
   std::atomic<uint64_t> attempts_{0};
   std::atomic<uint64_t> queued_{0};
+  std::atomic<uint64_t> dropped_{0};
   std::atomic<uint64_t> payload_packets_{0}, padding_packets_{0};
   std::atomic<uint64_t> payload_bytes_{0}, padding_bytes_{0}, unclassified_packets_{0};
   std::atomic<int64_t> last_payload_ns_{0}, max_payload_gap_ns_{0};

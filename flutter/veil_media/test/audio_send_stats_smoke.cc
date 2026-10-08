@@ -15,6 +15,7 @@ int main() {
   stats.mark_result(1000 * ms, 1002 * ms, true);
   auto s = stats.snapshot(1010 * ms);
   assert(s.attempts == 1 && s.queued == 1 && s.age_ms == 10 && s.queue_age_ms == 8);
+  assert(s.dropped == 0);
 
   // Video, RTCP, another audio SSRC and malformed RTP must not make audio
   // look alive. These are the confusing traffic sources in a live AV call.
@@ -30,10 +31,12 @@ int main() {
 
   // Local admission failure is distinct from a source that stopped producing.
   assert(stats.mark_attempt(packet, ssrc, 2000 * ms));
+  assert(stats.snapshot(2000 * ms).dropped == 0); // pending is not failed
   stats.mark_result(2000 * ms, 2005 * ms, false);
   s = stats.snapshot(2010 * ms);
   assert(s.attempts == 2 && s.queued == 1 && s.age_ms == 10 && s.queue_age_ms == 1008);
   assert(s.max_gap_ms == 1000 && s.max_admission_ms == 5);
+  assert(s.dropped == 1);
   assert(stats.snapshot(100 * ms).age_ms == -1);  // no fresh-looking clock reversal
 
   // Padding probes must not renew the encoded-audio clock. Include a CSRC,

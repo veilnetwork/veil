@@ -3877,6 +3877,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
            sizeof(json), written);
     } else {
       std::string snapshot(json, static_cast<size_t>(written) - 1);
+      snapshot += ",\"audio_tx_rtp_drops\":" + std::to_string(tx_audio.dropped);
       snapshot += ",\"video_send_paused\":" + std::to_string(ws->video_send_paused.load() ? 1 : 0) + "}";
       return dup_cstr(snapshot.c_str());
     }
