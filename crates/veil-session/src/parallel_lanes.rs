@@ -9,7 +9,10 @@ mod primary_recovery;
 mod recovery_trace;
 #[path = "parallel_registry.rs"]
 mod registry;
-pub use registry::{ParallelPeekOutcome, ParallelRegistry};
+pub use registry::{
+    BoundOrderedChild, ParallelPeekOutcome, ParallelRegistry, RegisteredOrderedChannel,
+    Registration as ParallelRegistration,
+};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use veil_transport::QuicParallelHandle;

@@ -1,4 +1,4 @@
-//! One dispatcher for a shared QUIC listener. A child is never a new peer:
+//! One dispatcher for shared encrypted listeners. A child is never a new peer:
 //! it inherits the canonical runner's identity, budgets and shutdown.
 use super::*;
 use crate::parallel_binding::PREFACE;
@@ -12,9 +12,21 @@ const MAX_PARENTS: usize = 1024;
 #[derive(Clone)]
 struct Entry {
     parent: ParallelParentHandle,
-    transport: QuicParallelHandle,
     diagnostics: Arc<ParallelDiagnostics>,
-    incoming: mpsc::Sender<BoundChild>,
+    kind: EntryKind,
+    registration: Arc<()>,
+}
+
+#[derive(Clone)]
+enum EntryKind {
+    Quic {
+        transport: QuicParallelHandle,
+        incoming: mpsc::Sender<BoundChild>,
+    },
+    Ordered {
+        transport: veil_transport::stream_parallel::StreamParallelHandle,
+        incoming: mpsc::Sender<BoundOrderedChild>,
+    },
 }
 
 pub(super) struct BoundChild {
@@ -22,6 +34,67 @@ pub(super) struct BoundChild {
     pub(super) keys: ParallelKeys,
     pub(super) ack: [u8; 32],
     pub(super) parent: ParallelParentHandle,
+}
+
+struct OrderedDiagnosticsLease(Arc<ParallelDiagnostics>);
+
+impl Drop for OrderedDiagnosticsLease {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The canonical runner receives this ONLY after the incoming proof verifies
+/// and its existing incoming connection budget grants a lease. No ACK or data
+/// is sent from the shared listener; the session owner completes the binding.
+pub struct BoundOrderedChild {
+    stream: BoxIoStream,
+    keys: ParallelKeys,
+    ack: [u8; 32],
+    parent: ParallelParentHandle,
+    diagnostics: OrderedDiagnosticsLease,
+}
+
+/// Keeps the proof, record owner and connection accounting in one lifetime.
+pub struct RegisteredOrderedChannel {
+    channel: crate::parallel_binding::BoundOrderedChannel,
+    _diagnostics: OrderedDiagnosticsLease,
+}
+
+impl RegisteredOrderedChannel {
+    pub fn handle(&self) -> crate::parallel_binding::BoundOrderedHandle {
+        self.channel.handle()
+    }
+
+    pub fn keys(&self) -> &ParallelKeys {
+        &self.channel.keys
+    }
+}
+
+impl BoundOrderedChild {
+    pub async fn finish(mut self) -> Result<RegisteredOrderedChannel, &'static str> {
+        // A buffered TCP/obfs4 flight must flush before waiting for its peer.
+        let acknowledging = tokio::time::timeout(BIND_TIMEOUT, async {
+            self.stream.write_all(&self.ack).await?;
+            self.stream.flush().await
+        });
+        let result = tokio::select! {
+            biased;
+            _ = self.parent.retired() => return Err("parallel parent retired"),
+            result = acknowledging => result,
+        };
+        if !matches!(result, Ok(Ok(()))) {
+            return Err("parallel acknowledgement failed");
+        }
+        let channel = self
+            .keys
+            .into_ordered(self.stream)
+            .map_err(|_| "parallel parent retired")?;
+        Ok(RegisteredOrderedChannel {
+            channel,
+            _diagnostics: self.diagnostics,
+        })
+    }
 }
 
 /// Shared only within one runtime, with registrations owned by live runners.
@@ -36,6 +109,7 @@ pub struct ParallelRegistry {
 struct PendingStream {
     stream: Option<BoxIoStream>,
     datagrams: Option<QuicDatagramHandle>,
+    stream_binding: Option<[u8; 32]>,
 }
 
 impl Drop for PendingStream {
@@ -48,10 +122,10 @@ impl Drop for PendingStream {
     }
 }
 
-pub(super) struct Registration {
+pub struct Registration {
     registry: Arc<ParallelRegistry>,
     sid: [u8; 32],
-    incoming: mpsc::Sender<BoundChild>,
+    token: Arc<()>,
 }
 
 impl Drop for Registration {
@@ -63,7 +137,7 @@ impl Drop for Registration {
             .unwrap_or_else(|e| e.into_inner());
         if entries
             .get(&self.sid)
-            .is_some_and(|entry| entry.incoming.same_channel(&self.incoming))
+            .is_some_and(|entry| Arc::ptr_eq(&entry.registration, &self.token))
         {
             entries.remove(&self.sid);
         }
@@ -87,23 +161,67 @@ impl ParallelRegistry {
         offer: &ParallelQuicOffer,
         incoming: mpsc::Sender<BoundChild>,
     ) -> Option<Registration> {
+        self.insert(
+            sid,
+            parent,
+            Arc::clone(&offer.diagnostics),
+            EntryKind::Quic {
+                transport: offer.handle.clone(),
+                incoming,
+            },
+        )
+    }
+
+    /// The live canonical owner must retain this registration and negotiate
+    /// ordered-child support before offering it. Keys/SID come from its verified
+    /// OVL1 handshake, never from an incoming preface or transport encryption.
+    pub fn register_ordered(
+        self: &Arc<Self>,
+        sid: [u8; 32],
+        parent: ParallelParentHandle,
+        transport: veil_transport::stream_parallel::StreamParallelHandle,
+        diagnostics: Arc<ParallelDiagnostics>,
+        incoming: mpsc::Sender<BoundOrderedChild>,
+    ) -> Option<Registration> {
+        self.insert(
+            sid,
+            parent,
+            diagnostics,
+            EntryKind::Ordered {
+                transport,
+                incoming,
+            },
+        )
+    }
+
+    fn insert(
+        self: &Arc<Self>,
+        sid: [u8; 32],
+        parent: ParallelParentHandle,
+        diagnostics: Arc<ParallelDiagnostics>,
+        kind: EntryKind,
+    ) -> Option<Registration> {
+        if !parent.is_active() {
+            return None;
+        }
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if entries.len() >= MAX_PARENTS || entries.contains_key(&sid) {
             return None;
         }
+        let token = Arc::new(());
         entries.insert(
             sid,
             Entry {
                 parent,
-                transport: offer.handle.clone(),
-                diagnostics: Arc::clone(&offer.diagnostics),
-                incoming: incoming.clone(),
+                diagnostics,
+                kind,
+                registration: Arc::clone(&token),
             },
         );
         Some(Registration {
             registry: Arc::clone(self),
             sid,
-            incoming,
+            token,
         })
     }
 
@@ -115,9 +233,23 @@ impl ParallelRegistry {
         stream: BoxIoStream,
         datagrams: Option<QuicDatagramHandle>,
     ) -> ParallelPeekOutcome {
+        self.peek_and_dispatch_with_binding(stream, datagrams, None)
+            .await
+    }
+
+    /// The ordered exporter is extracted from the newly accepted transport,
+    /// never from a claimed parent or an incoming wire field. QUIC keeps its
+    /// own TLS exporter. Ordinary OVL1 bytes are preserved on both transports.
+    pub async fn peek_and_dispatch_with_binding(
+        &self,
+        stream: BoxIoStream,
+        datagrams: Option<QuicDatagramHandle>,
+        stream_binding: Option<[u8; 32]>,
+    ) -> ParallelPeekOutcome {
         let mut pending = PendingStream {
             stream: Some(stream),
             datagrams,
+            stream_binding,
         };
         match tokio::time::timeout(BIND_TIMEOUT, self.peek(&mut pending)).await {
             Ok(Ok(outcome)) => outcome,
@@ -143,10 +275,19 @@ impl ParallelRegistry {
                 ),
             )));
         }
-        let handle = pending
-            .datagrams
-            .take()
-            .ok_or("parallel proof requires QUIC")?;
+        let Some(handle) = pending.datagrams.take() else {
+            let exporter = pending
+                .stream_binding
+                .take()
+                .ok_or("parallel binding unavailable")?;
+            self.bind_ordered(
+                pending.stream.take().expect("child stream"),
+                exporter,
+                prefix,
+            )
+            .await?;
+            return Ok(ParallelPeekOutcome::Bound);
+        };
         // RAII closes a child on EVERY failure or cancellation, even if other
         // transport/DATAGRAM clones retain the raw Quinn connection.
         let channel = Channel {
@@ -174,6 +315,13 @@ impl ParallelRegistry {
             .get(&sid)
             .cloned()
             .ok_or("parallel parent unavailable")?;
+        let EntryKind::Quic {
+            transport,
+            incoming,
+        } = entry.kind
+        else {
+            return Err("parallel transport mismatch");
+        };
         let exporter = channel
             .handle
             .channel_binding()
@@ -182,14 +330,12 @@ impl ParallelRegistry {
             .parent
             .accept(&hello, exporter)
             .map_err(|_| "parallel proof rejected")?;
-        entry
-            .transport
+        transport
             .track_incoming(&channel.handle)
             .map_err(|_| "parallel connection budget exhausted")?;
         entry.diagnostics.active.fetch_add(1, Ordering::AcqRel);
         channel.diagnostics = Some(entry.diagnostics);
-        entry
-            .incoming
+        incoming
             .try_send(BoundChild {
                 channel,
                 keys,
@@ -198,8 +344,59 @@ impl ParallelRegistry {
             })
             .map_err(|_| "parallel owner unavailable")
     }
+
+    async fn bind_ordered(
+        &self,
+        mut stream: BoxIoStream,
+        exporter: [u8; 32],
+        prefix: [u8; 8],
+    ) -> Result<(), &'static str> {
+        let mut hello = [0; HELLO_BYTES];
+        hello[..8].copy_from_slice(&prefix);
+        stream
+            .read_exact(&mut hello[8..])
+            .await
+            .map_err(|_| "parallel hello incomplete")?;
+        let sid: [u8; 32] = hello[8..40].try_into().expect("fixed parent SID");
+        let entry = self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&sid)
+            .cloned()
+            .ok_or("parallel parent unavailable")?;
+        let EntryKind::Ordered {
+            transport,
+            incoming,
+        } = entry.kind
+        else {
+            return Err("parallel transport mismatch");
+        };
+        let (ack, keys) = entry
+            .parent
+            .accept(&hello, exporter)
+            .map_err(|_| "parallel proof rejected")?;
+        // Acquiring this lease never creates an OVL1 identity or per-peer row.
+        let stream = transport
+            .track_incoming(stream)
+            .map_err(|_| "parallel connection budget exhausted")?;
+        entry.diagnostics.active.fetch_add(1, Ordering::AcqRel);
+        incoming
+            .try_send(BoundOrderedChild {
+                stream,
+                keys,
+                ack,
+                parent: entry.parent,
+                diagnostics: OrderedDiagnosticsLease(entry.diagnostics),
+            })
+            .map_err(|_| "parallel owner unavailable")
+    }
 }
 
 #[cfg(test)]
 #[path = "parallel_registry_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "parallel_registry_ordered_tests.rs"]
+mod ordered_tests;
