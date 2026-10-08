@@ -230,6 +230,12 @@ enum ParallelChannels {
     Ordered(ordered_lanes::OrderedSession),
 }
 impl ParallelChannels {
+    fn reliable(&self) -> Option<&reliable_session::ReliableSession> {
+        match self {
+            Self::Quic(s) => s.reliable(),
+            Self::Ordered(s) => s.reliable(),
+        }
+    }
     fn rekey(&mut self, tx: &[u8; 32], rx: &[u8; 32], sid: [u8; 32]) {
         match self {
             Self::Quic(s) => s.rekey(tx, rx, sid),
@@ -265,6 +271,9 @@ use lossy_transport::{LossySendError, LossyTransportHandle};
 #[cfg(test)]
 #[path = "ordered_receiver_tests.rs"]
 mod ordered_receiver_tests;
+#[cfg(test)]
+#[path = "reliable_session_tests.rs"]
+mod reliable_session_tests;
 
 struct RealtimeSender {
     handle: LossyTransportHandle,
@@ -427,6 +436,8 @@ impl RealtimeDatagramLane {
 
 #[path = "parallel_lanes.rs"]
 mod parallel_lanes;
+#[path = "reliable_session.rs"]
+pub mod reliable_session;
 pub use parallel_lanes::{
     BoundOrderedChild, BoundReliableChild, ParallelDiagnostics, ParallelPeekOutcome,
     ParallelQuicOffer, ParallelRegistration, ParallelRegistry, RegisteredOrderedChannel,
@@ -4103,6 +4114,21 @@ impl SessionRunner {
             }
             _ => None,
         };
+
+        if realtime_lane
+            .as_ref()
+            .and_then(|lane| lane.parallel.as_ref())
+            .and_then(ParallelChannels::reliable)
+            .is_some()
+        {
+            self.logger.info(
+                "session.reliable_child.offered",
+                format!(
+                    "peer_id={} independent_available=true",
+                    hex_short(&self.peer_id)
+                ),
+            );
+        }
 
         // Publish this runner's generic readiness and separately its negotiated
         // neutral Forward support. QUIC alone cannot carry a newer neutral

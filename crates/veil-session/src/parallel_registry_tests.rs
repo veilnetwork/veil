@@ -256,13 +256,16 @@ async fn shared_registry_bounds_incoming_preserves_outgoing_capacity_and_ordinar
             assert!(matches!(outcome, ParallelPeekOutcome::Bound));
             children.push((handle, stream));
         }
-        assert_eq!(f.offer.diagnostics.active_connections(), 7);
+        assert_eq!(
+            f.offer.diagnostics.active_connections(),
+            veil_transport::QuicParallelHandle::CONNECTIONS_PER_DIRECTION
+        );
         let (outcome, rejected, _stream, _) = f.dispatch(None).await;
         assert!(matches!(outcome, ParallelPeekOutcome::Drop(_)));
         rejected.closed().await;
         assert_eq!(
             f.offer.handle.available_connection_slots(),
-            7,
+            veil_transport::QuicParallelHandle::CONNECTIONS_PER_DIRECTION,
             "unclassified incoming children consumed local outgoing capacity"
         );
         // Child saturation must not consume or authenticate an unrelated

@@ -115,6 +115,32 @@ async fn until(mut ready: impl FnMut() -> bool) {
     .unwrap();
 }
 
+pub(super) fn pool_fixture_context() -> RealtimeReceiverContext {
+    let logger = Arc::new(NodeLogger::new_noop());
+    let (accepted, _) = tokio::sync::mpsc::unbounded_channel();
+    RealtimeReceiverContext {
+        peer_id: [9; 32],
+        dispatcher: Arc::new(Capture {
+            logger: logger.clone(),
+            accepted,
+            allowed: AtomicBool::new(false),
+            attempts: AtomicUsize::new(0),
+        }),
+        logger,
+        metrics: None,
+        ban_list: Arc::new(Mutex::new(BanList::new())),
+        violation_tracker: Arc::new(Mutex::new(
+            ViolationTracker::with_fixed_duration(
+                10,
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+            )
+            .unwrap(),
+        )),
+        activity: Arc::new(crate::datagram_activity::AuthenticatedDatagramActivity::new()),
+    }
+}
+
 #[tokio::test]
 async fn ordered_records_use_normal_replay_eligibility_dispatch_and_abuse_budgets() {
     let (a_parent, b_parent, a, b) = ordered_pair(64 * 1024);
