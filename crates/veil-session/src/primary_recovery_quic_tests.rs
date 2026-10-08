@@ -203,7 +203,7 @@ async fn measure(
     .await
     .unwrap();
     let index = 0;
-    let original = a.sender(index).handle.clone();
+    let original = a.sender(index).handle.quic().unwrap().clone();
     let original_exporter = original.channel_binding().unwrap();
     let blackout_start = started.elapsed() + Duration::from_secs(6);
     let blackout_end = blackout_start + Duration::from_secs(4);
@@ -242,12 +242,12 @@ async fn measure(
             last_switch = switches;
         }
         let mut sender = a.sender(index);
-        if sender.handle.channel_binding().unwrap() != original_exporter {
+        if sender.handle.quic().unwrap().channel_binding().unwrap() != original_exporter {
             changed_exporter = true;
         }
         if now < blackout_end {
             retained_during_pending &=
-                sender.handle.channel_binding().unwrap() == original_exporter;
+                sender.handle.quic().unwrap().channel_binding().unwrap() == original_exporter;
         }
         let max_size = sender.max_datagram_size;
         let packets = sender
@@ -522,8 +522,8 @@ async fn recoverable_source_has_its_own_quic_connection_and_survives_screen_clos
             assert_eq!(header.priority(), INTERACTIVE);
             let index = a.prepare_frame(lane, body, kind).unwrap();
             let sender = a.sender(index);
-            assert!(bindings.insert(sender.handle.channel_binding().unwrap()));
-            handles.push(sender.handle.clone());
+            assert!(bindings.insert(sender.handle.quic().unwrap().channel_binding().unwrap()));
+            handles.push(sender.handle.quic().unwrap().clone());
         }
         // Retiring only the screen connection cannot retire the file source
         // or silently fall back to a shared canonical congestion controller.
@@ -540,7 +540,10 @@ async fn recoverable_source_has_its_own_quic_connection_and_survives_screen_clos
             let (_, body, kind) = super::super::decode_realtime_lane_frame(&frame).unwrap();
             let index = a.prepare_frame(lane, body, kind).unwrap();
             let mut sender = a.sender(index);
-            assert_ne!(sender.handle.channel_binding().unwrap(), screen_binding);
+            assert_ne!(
+                sender.handle.quic().unwrap().channel_binding().unwrap(),
+                screen_binding
+            );
             let max_size = sender.max_datagram_size;
             for packet in sender
                 .tx
