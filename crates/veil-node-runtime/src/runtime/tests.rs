@@ -3506,6 +3506,34 @@ async fn attempt_hole_punch_unknown_peer_is_idempotent() {
     let _ = fs::remove_file(path);
 }
 
+/// An open TX reservation is not a completed peer handshake. It can exist
+/// before session registration or after a partially abandoned setup.
+#[tokio::test(flavor = "current_thread")]
+async fn attempt_hole_punch_does_not_claim_a_reserved_sender_is_connected() {
+    let path = save_test_config("punch-reserved-sender", runtime_config_with_listen()).unwrap();
+    let mut rt = NodeRuntime::start(&path, true).await.expect("start");
+    let services = rt.access();
+    let unknown = [0xEE; 32];
+    let reserved = services
+        .session_tx_registry
+        .write()
+        .unwrap()
+        .register(unknown);
+    assert!(services.has_live_session(&unknown));
+    assert!(
+        !crate::pnet_status_provider::DaemonPnetStatus::new(
+            Arc::clone(&services.verified_peer_certs),
+            Arc::clone(&services.live_sessions),
+        )
+        .is_admitted(&unknown)
+    );
+    let outcome = services.attempt_p2p_hole_punch(unknown).await;
+    drop(reserved);
+    rt.stop().await.expect("stop");
+    let _ = fs::remove_file(path);
+    assert_eq!(outcome, veil_ipc::HolePunchOutcome::UnknownPeer);
+}
+
 /// With NAT enabled by default but no reflector known, a registered peer
 /// yields `NoReflector` — the attempt reaches the dial ladder (peer
 /// lookup + config load succeed) and stops at the first stage.
@@ -3625,6 +3653,12 @@ async fn punched_outbound_registration_lives_with_runner_and_cancellation() {
         if !cancel_before_poll {
             tokio::task::yield_now().await;
             assert!(services.has_live_session(&peer_node));
+            assert_eq!(
+                services.attempt_p2p_hole_punch(peer_node).await,
+                veil_ipc::HolePunchOutcome::Connected,
+                "a committed running session must remain an idempotent success"
+            );
+            assert_eq!(services.hole_punch_run_count(), 0);
             drop(remote);
             timeout(Duration::from_secs(2), async {
                 while services.has_live_session(&peer_node) {
