@@ -79,7 +79,7 @@ Future<void> main() async {
   }
   for (final anonymous in [false, true]) {
     mode();
-    failAfter(7800);
+    failAfter(4096);
     final direct =
         VeilStream.fromFfi(Pointer<ffi.VeilStreamFfi>.fromAddress(1));
     final anon =
@@ -96,7 +96,7 @@ Future<void> main() async {
         }
         throw StateError('native write failure hidden');
       } on VeilException {
-        if (total() != 7800 || observed.any((count) => count > 7800)) {
+        if (total() != 4096 || observed.any((count) => count > 4096)) {
           throw StateError('failed suffix sent or reported as admitted');
         }
       }
