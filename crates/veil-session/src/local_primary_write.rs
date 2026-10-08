@@ -63,17 +63,21 @@ impl Drop for PrimaryWriteLease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::local_source_activity::RELIABLE_SECONDARY_BYTES;
+    use crate::local_source_activity::NETWORK_CONTROL_BYTES;
 
-    fn assert_unrestricted(source: &LocalSourceActivity, now: Instant) {
+    fn assert_no_pressure(source: &LocalSourceActivity, now: Instant) {
+        // Reliable data has a budget even during healthy primary activity.
+        // Pressure additionally restrains lossy probes and recovery RPCs.
+        assert!(source.allow_secondary(now));
+        assert!(source.allow_secondary(now));
         assert!(
             source
-                .admit_reliable_secondary(RELIABLE_SECONDARY_BYTES, now)
+                .admit_network_control(NETWORK_CONTROL_BYTES, now)
                 .is_ok()
         );
         assert!(
             source
-                .admit_reliable_secondary(RELIABLE_SECONDARY_BYTES, now)
+                .admit_network_control(NETWORK_CONTROL_BYTES, now)
                 .is_ok()
         );
     }
@@ -87,7 +91,7 @@ mod tests {
         let now = Instant::now();
         activity.note(now);
         state.observe_stalled(now);
-        assert_unrestricted(&activity, now);
+        assert_no_pressure(&activity, now);
     }
 
     #[test]
@@ -98,7 +102,7 @@ mod tests {
         state.note_queued(Some(now));
         activity.note(now);
         state.observe_stalled(now);
-        assert_unrestricted(&activity, now);
+        assert_no_pressure(&activity, now);
     }
 
     #[test]
@@ -110,6 +114,6 @@ mod tests {
         let now = Instant::now();
         activity.note(now);
         replacement.observe_stalled(now);
-        assert_unrestricted(&activity, now);
+        assert_no_pressure(&activity, now);
     }
 }

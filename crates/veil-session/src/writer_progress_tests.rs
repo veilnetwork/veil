@@ -59,7 +59,7 @@ fn remote_priority_cannot_select_local_control_admission() {
 #[tokio::test]
 async fn stalled_stream_primary_holds_other_producers_without_losing_bytes() {
     use super::{WireBlob, writer_task};
-    use crate::local_source_activity::{LocalSourceActivity, RELIABLE_SECONDARY_BYTES};
+    use crate::local_source_activity::{LocalSourceActivity, NETWORK_CONTROL_BYTES};
     use std::sync::Arc;
     use tokio::io::{AsyncWriteExt, split};
     let activity = Arc::new(LocalSourceActivity::default());
@@ -85,6 +85,8 @@ async fn stalled_stream_primary_holds_other_producers_without_losing_bytes() {
     })
     .await
     .unwrap();
+    // Use the pressure-only recovery allowance: healthy primaries now always
+    // bound reliable DATA, so DATA admission alone cannot prove pressure.
     // No QUIC stats, incoming packets or producer events are available. A
     // pinned blocked partial write itself must publish endpoint pressure.
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -92,11 +94,11 @@ async fn stalled_stream_primary_holds_other_producers_without_losing_bytes() {
             let now = std::time::Instant::now();
             assert!(
                 activity
-                    .admit_reliable_secondary(RELIABLE_SECONDARY_BYTES, now)
+                    .admit_network_control(NETWORK_CONTROL_BYTES, now)
                     .is_ok()
             );
             if activity
-                .admit_reliable_secondary(RELIABLE_SECONDARY_BYTES, now)
+                .admit_network_control(NETWORK_CONTROL_BYTES, now)
                 .is_err()
             {
                 break;
@@ -125,12 +127,12 @@ async fn stalled_stream_primary_holds_other_producers_without_losing_bytes() {
     let now = std::time::Instant::now();
     assert!(
         activity
-            .admit_reliable_secondary(RELIABLE_SECONDARY_BYTES, now)
+            .admit_network_control(NETWORK_CONTROL_BYTES, now)
             .is_ok()
     );
     assert!(
         activity
-            .admit_reliable_secondary(RELIABLE_SECONDARY_BYTES, now)
+            .admit_network_control(NETWORK_CONTROL_BYTES, now)
             .is_ok()
     );
 }
@@ -138,7 +140,7 @@ async fn stalled_stream_primary_holds_other_producers_without_losing_bytes() {
 #[tokio::test]
 async fn stalled_neutral_writer_does_not_claim_primary_pressure() {
     use super::{WireBlob, writer_task};
-    use crate::local_source_activity::{LocalSourceActivity, RELIABLE_SECONDARY_BYTES};
+    use crate::local_source_activity::{LocalSourceActivity, NETWORK_CONTROL_BYTES};
     use std::sync::Arc;
     let activity = Arc::new(LocalSourceActivity::default());
     // Another local primary is active. Neutral wire bytes still cannot publish.
@@ -166,12 +168,12 @@ async fn stalled_neutral_writer_does_not_claim_primary_pressure() {
     let now = std::time::Instant::now();
     assert!(
         activity
-            .admit_reliable_secondary(RELIABLE_SECONDARY_BYTES, now)
+            .admit_network_control(NETWORK_CONTROL_BYTES, now)
             .is_ok()
     );
     assert!(
         activity
-            .admit_reliable_secondary(RELIABLE_SECONDARY_BYTES, now)
+            .admit_network_control(NETWORK_CONTROL_BYTES, now)
             .is_ok()
     );
     let mut received = [0; 7];
@@ -208,7 +210,7 @@ async fn pressure_ticks_preserve_the_idle_deadline_for_a_blocked_primary() {
 
 #[tokio::test]
 async fn slowly_progressing_primary_still_holds_other_producers() {
-    use crate::local_source_activity::{LocalSourceActivity, RELIABLE_SECONDARY_BYTES};
+    use crate::local_source_activity::{LocalSourceActivity, NETWORK_CONTROL_BYTES};
     use std::sync::Arc;
     let activity = Arc::new(LocalSourceActivity::default());
     activity.note(std::time::Instant::now());
@@ -241,12 +243,12 @@ async fn slowly_progressing_primary_still_holds_other_producers() {
     let now = std::time::Instant::now();
     assert!(
         activity
-            .admit_reliable_secondary(RELIABLE_SECONDARY_BYTES, now)
+            .admit_network_control(NETWORK_CONTROL_BYTES, now)
             .is_ok()
     );
     assert!(
         activity
-            .admit_reliable_secondary(RELIABLE_SECONDARY_BYTES, now)
+            .admit_network_control(NETWORK_CONTROL_BYTES, now)
             .is_err(),
         "small write progress concealed a delayed primary"
     );

@@ -130,6 +130,17 @@ impl SessionTxRegistry {
         Self::default()
     }
 
+    /// Publish fresh endpoint observations for this node's own sources. The
+    /// local IPC caller must validate capability, binding ownership and age.
+    /// A healthy report cannot erase another local source's pressure lease.
+    /// Nothing here changes neutral transit scheduling or network metadata.
+    pub fn note_local_source_feedback(&self, pressured: bool, now: std::time::Instant) {
+        self.source_activity.note(now);
+        if pressured {
+            self.source_activity.note_pressure(now);
+        }
+    }
+
     /// Create with a custom per-session channel capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -840,6 +851,59 @@ impl SessionTxRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_feedback_holds_own_producers_and_expires_without_global_clear() {
+        use crate::local_source_activity::{
+            NETWORK_CONTROL_BYTES, PRESSURE_GRACE, RELIABLE_SECONDARY_BYTES,
+        };
+        use std::time::{Duration, Instant};
+        let registry = SessionTxRegistry::new();
+        let now = Instant::now();
+        registry.note_local_source_feedback(true, now);
+        assert!(
+            registry
+                .source_activity
+                .admit_reliable_secondary(RELIABLE_SECONDARY_BYTES, now)
+                .is_ok()
+        );
+        assert!(
+            registry
+                .source_activity
+                .admit_reliable_secondary(1, now)
+                .is_err()
+        );
+        assert!(
+            registry
+                .source_activity
+                .admit_network_control(NETWORK_CONTROL_BYTES, now)
+                .is_ok()
+        );
+        assert!(
+            registry
+                .source_activity
+                .admit_network_control(1, now)
+                .is_err()
+        );
+        assert!(registry.source_activity.allow_secondary(now));
+        registry.note_local_source_feedback(false, now + Duration::from_millis(1));
+        assert!(
+            !registry
+                .source_activity
+                .allow_secondary(now + Duration::from_millis(1))
+        );
+        assert!(
+            registry
+                .source_activity
+                .admit_reliable_secondary(1, now + PRESSURE_GRACE)
+                .is_ok()
+        );
+        assert!(
+            registry
+                .source_activity
+                .allow_secondary(now + PRESSURE_GRACE)
+        );
+    }
 
     #[tokio::test]
     async fn full_bulk_ingress_still_accepts_a_local_latency_sensitive_frame() {

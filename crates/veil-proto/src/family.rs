@@ -928,6 +928,9 @@ pub enum LocalAppMsg {
     /// [`crate::ipc::AttemptHolePunchResultPayload`] (1-byte structured
     /// `hole_punch_status` + echoed 32-byte peer_node_id).
     AttemptHolePunchResult = 92,
+    /// App → daemon: fresh trusted source pressure, confined to local IPC.
+    /// Body: [`crate::ipc::LocalSourceFeedbackPayload`]. Never forwarded.
+    LocalSourceFeedback = 93,
 }
 
 impl TryFrom<u16> for LocalAppMsg {
@@ -1027,6 +1030,7 @@ impl TryFrom<u16> for LocalAppMsg {
             90 => Ok(LocalAppMsg::ListenTransportsResult),
             91 => Ok(LocalAppMsg::AttemptHolePunch),
             92 => Ok(LocalAppMsg::AttemptHolePunchResult),
+            93 => Ok(LocalAppMsg::LocalSourceFeedback),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::LocalApp as u8,
                 msg_type: v,

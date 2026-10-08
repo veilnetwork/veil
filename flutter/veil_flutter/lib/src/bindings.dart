@@ -485,6 +485,25 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 )? veilSendRelayRealtime = _lookupVeilSendRelayRealtime();
 
+/// Local source admission observations; never transmitted to remote peers.
+final int Function(Pointer<VeilApp>, int, int, Pointer<Pointer<Utf8>>)?
+    veilAppReportLocalSourcePressure = _lookupLocalSourcePressure();
+
+int Function(Pointer<VeilApp>, int, int, Pointer<Pointer<Utf8>>)?
+    _lookupLocalSourcePressure() {
+  try {
+    return nativeLib
+        .lookup<
+                NativeFunction<
+                    Int32 Function(Pointer<VeilApp>, Uint8, Uint64,
+                        Pointer<Pointer<Utf8>>)>>(
+            'veil_app_report_local_source_pressure')
+        .asFunction();
+  } on ArgumentError {
+    return null;
+  }
+}
+
 final int Function(
   Pointer<VeilApp>,
   Pointer<Uint8>,

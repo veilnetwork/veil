@@ -70,6 +70,35 @@ fn local_lane_send_rejects_invalid_hints_before_inputs() {
 }
 
 #[test]
+fn local_source_feedback_rejects_invalid_flags_and_unknown_handles() {
+    for pressure in [2, 255] {
+        let mut err = ptr::null_mut();
+        let rc = unsafe {
+            veil_app_report_local_source_pressure(1usize as *mut VeilApp, pressure, 0, &mut err)
+        };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert!(!err.is_null());
+        assert!(
+            unsafe { CStr::from_ptr(err) }
+                .to_str()
+                .unwrap()
+                .contains("pressured must be")
+        );
+        unsafe {
+            veil_free_string(err);
+        }
+    }
+    let mut err = ptr::null_mut();
+    let rc =
+        unsafe { veil_app_report_local_source_pressure(1usize as *mut VeilApp, 0, 0, &mut err) };
+    assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+    assert!(!err.is_null());
+    unsafe {
+        veil_free_string(err);
+    }
+}
+
+#[test]
 fn abi_contract_hash_is_the_hash_of_the_committed_header() {
     use sha2::{Digest, Sha256};
     let header = include_bytes!("../include/veil_ffi.h");

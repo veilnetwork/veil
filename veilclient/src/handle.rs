@@ -633,6 +633,39 @@ impl Drop for AppSender {
 pub const APP_UNBIND_DEADLINE: Duration = Duration::from_secs(2);
 
 impl AppSender {
+    /// Report this bound local source's measured pressure. No peer receives
+    /// the report and healthy observations never clear another source's lease.
+    /// Returns false for an older daemon or expired/admission-delayed sample.
+    pub async fn report_local_source_pressure(
+        &self,
+        pressured: bool,
+        sampled_at_unix_ms: u64,
+    ) -> Result<bool, ClientError> {
+        use veilcore::proto::ipc::LocalSourceFeedbackPayload;
+        if !self.writer.supports_local_source_feedback() {
+            return Ok(false);
+        }
+        let report = LocalSourceFeedbackPayload {
+            source_app_id: self.app_id,
+            pressured,
+            sampled_at_unix_ms,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if !report.is_fresh_at(now) {
+            return Ok(false);
+        }
+        self.writer
+            .write_frame_on_local_lane_with_deadline(
+                veilcore::proto::priority::REALTIME,
+                LocalAppMsg::LocalSourceFeedback as u16,
+                &report.encode(),
+                Some(tokio::time::Instant::now() + Duration::from_millis(250)),
+            )
+            .await
+    }
     /// Reliably release this endpoint and its local dispatch slots.
     ///
     /// Unlike Drop, this works when the caller originated outside Tokio (the
@@ -1321,6 +1354,70 @@ mod writer_freshness_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn source_feedback_requires_negotiation_and_retains_sampling_time() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut sender = AppSender {
+            app_id: [7; 32],
+            endpoint_id: 9,
+            writer: SharedWriter::new(tx),
+            dispatch: Arc::new(Mutex::new(DispatchTable::new())),
+            unbind_on_drop: false,
+        };
+        let sampled_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(
+            !sender
+                .report_local_source_pressure(true, sampled_at)
+                .await
+                .unwrap()
+        );
+        assert!(rx.try_recv().is_err());
+        sender.writer = sender.writer.clone().with_local_source_feedback(true);
+        assert!(
+            !sender
+                .report_local_source_pressure(true, sampled_at - 2000)
+                .await
+                .unwrap()
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(
+            sender
+                .report_local_source_pressure(true, sampled_at)
+                .await
+                .unwrap()
+        );
+        let frame = rx.recv().await.unwrap();
+        let report = veilcore::proto::ipc::LocalSourceFeedbackPayload::decode(
+            &frame[veilcore::proto::HEADER_SIZE..],
+        )
+        .unwrap();
+        assert_eq!(report.source_app_id, [7; 32]);
+        assert_eq!(report.sampled_at_unix_ms, sampled_at);
+        assert!(report.pressured);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_feedback_cannot_wait_indefinitely_in_a_full_writer() {
+        let (mut sender, _rx) = sender_on_a_wedged_writer();
+        sender.unbind_on_drop = false;
+        sender.writer = sender.writer.clone().with_local_source_feedback(true);
+        let sampled_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let started = tokio::time::Instant::now();
+        assert!(
+            !sender
+                .report_local_source_pressure(true, sampled_at)
+                .await
+                .unwrap()
+        );
+        assert_eq!(started.elapsed(), Duration::from_millis(250));
+    }
     use crate::client::{DispatchTable, SharedWriter};
 
     /// Build an `AppSender` whose IPC frame channel is ALREADY FULL and whose
