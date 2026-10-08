@@ -238,6 +238,10 @@ pub struct BoundReliableHandle {
 }
 
 impl BoundReliableHandle {
+    pub(crate) fn parent_active(&self) -> bool {
+        self.parent.is_active()
+    }
+
     pub async fn send(&self, payload: &[u8]) -> std::io::Result<()> {
         if !self.parent.is_active() {
             return Err(std::io::ErrorKind::ConnectionAborted.into());

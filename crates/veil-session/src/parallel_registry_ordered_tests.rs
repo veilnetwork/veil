@@ -26,6 +26,19 @@ struct Client {
 }
 
 impl Client {
+    async fn finish_reliable(mut self) -> crate::parallel_binding::BoundReliableChannel {
+        let mut ack = [0; 32];
+        timeout(Duration::from_secs(2), self.stream.read_exact(&mut ack))
+            .await
+            .unwrap()
+            .unwrap();
+        self.pending
+            .finish(&ack)
+            .unwrap()
+            .into_reliable(self.stream)
+            .unwrap()
+    }
+
     async fn finish(mut self) -> crate::parallel_binding::BoundOrderedChannel {
         let mut ack = [0; 32];
         timeout(Duration::from_secs(2), self.stream.read_exact(&mut ack))
@@ -120,6 +133,15 @@ impl Fixture {
         captured: Option<[u8; HELLO_BYTES]>,
         exporter: bool,
     ) -> (ParallelPeekOutcome, Client) {
+        self.dispatch_mode(captured, exporter, false).await
+    }
+
+    async fn dispatch_mode(
+        &self,
+        captured: Option<[u8; HELLO_BYTES]>,
+        exporter: bool,
+        reliable: bool,
+    ) -> (ParallelPeekOutcome, Client) {
         // Fresh independent dials deliberately bypass the sender partition:
         // enforce the authenticated receiver's aggregate budget against them.
         let (a, b) = tokio::join!(
@@ -128,10 +150,13 @@ impl Fixture {
         );
         let a = a.unwrap();
         let b = b.unwrap();
-        let (hello, pending) = self
-            .initiator
-            .begin(a.stream_channel_binding().unwrap())
-            .unwrap();
+        let binding_a = a.stream_channel_binding().unwrap();
+        let (hello, pending) = if reliable {
+            self.initiator.begin_reliable(binding_a)
+        } else {
+            self.initiator.begin(binding_a)
+        }
+        .unwrap();
         let hello = captured.unwrap_or(hello);
         let binding = exporter.then(|| b.stream_channel_binding().unwrap());
         let mut stream = a.into_stream().unwrap();
@@ -161,6 +186,194 @@ impl Fixture {
             .unwrap();
         assert_eq!(&bytes, b"canonical alive");
     }
+}
+
+#[tokio::test]
+async fn reliable_ordered_dispatch_requires_opt_in_and_never_enters_the_lossy_inbox() {
+    let mut f = Fixture::new(1).await;
+    let (outcome, denied) = f.dispatch_mode(None, true, true).await;
+    assert!(
+        matches!(outcome, ParallelPeekOutcome::Drop(ref e) if e == "parallel reliable support not negotiated")
+    );
+    denied.rejected().await;
+    assert_eq!(f.diagnostics.active_connections(), 0);
+    let (tx, mut rx) = mpsc::channel(1);
+    let registration = f.registration.as_ref().unwrap();
+    assert!(registration.enable_reliable(tx.clone()));
+    assert!(!registration.enable_reliable(tx));
+    let (outcome, client) = f.dispatch_mode(None, true, true).await;
+    assert!(matches!(outcome, ParallelPeekOutcome::Bound));
+    assert!(f.incoming.try_recv().is_err());
+    let bound = rx.recv().await.unwrap();
+    let (server, client) = tokio::join!(bound.finish(), client.finish_reliable());
+    let server = server.unwrap();
+    assert_eq!(server.keys().session_id, client.keys.session_id);
+    client.handle().send(b"lossless forward").await.unwrap();
+    assert_eq!(server.handle().recv().await.unwrap(), b"lossless forward");
+    server.handle().send(b"lossless return").await.unwrap();
+    assert_eq!(client.handle().recv().await.unwrap(), b"lossless return");
+    drop(server);
+    timeout(Duration::from_secs(1), client.handle().closed())
+        .await
+        .unwrap();
+    assert_eq!(f.diagnostics.active_connections(), 0);
+    f.main_survives().await;
+}
+
+#[tokio::test]
+async fn reliable_ordered_queue_failure_and_retirement_reclaim_transport_ownership() {
+    let mut f = Fixture::new(1).await;
+    let (tx, mut rx) = mpsc::channel(1);
+    assert!(f.registration.as_ref().unwrap().enable_reliable(tx));
+    let (outcome, first) = f.dispatch_mode(None, true, true).await;
+    assert!(matches!(outcome, ParallelPeekOutcome::Bound));
+    let hello = first.hello;
+    let (outcome, full) = f.dispatch_mode(None, true, true).await;
+    assert!(
+        matches!(outcome, ParallelPeekOutcome::Drop(ref e) if e == "parallel reliable owner unavailable")
+    );
+    full.rejected().await;
+    assert_eq!(f.diagnostics.active_connections(), 1);
+    let (outcome, replay) = f.dispatch_mode(Some(hello), true, true).await;
+    assert!(matches!(outcome, ParallelPeekOutcome::Drop(_)));
+    replay.rejected().await;
+    let child = rx.recv().await.unwrap();
+    f.responder.retire();
+    assert!(child.finish().await.is_err());
+    first.rejected().await;
+    assert_eq!(f.diagnostics.active_connections(), 0);
+    assert!(
+        !f.registration
+            .as_ref()
+            .unwrap()
+            .enable_reliable(mpsc::channel(1).0)
+    );
+    drop(f.registration.take());
+    let (outcome, unregistered) = f.dispatch_mode(None, true, true).await;
+    assert!(matches!(outcome, ParallelPeekOutcome::Drop(_)));
+    unregistered.rejected().await;
+    f.main_survives().await;
+}
+
+#[tokio::test]
+async fn reliable_frame_actor_preserves_actual_app_stream_on_shared_obfs4_listener() {
+    use crate::{
+        frame_outbox::FrameEnvelope,
+        reliable_frames::{FrameAdmissionError, ReliableFrameChannel},
+    };
+    use veil_proto::{
+        AppMsg, FrameFamily,
+        app::{AppClosePayload, AppDataPayload, AppOpenPayload},
+        header::{FrameHeader, HEADER_SIZE},
+    };
+    timeout(Duration::from_secs(8), async {
+        let mut f = Fixture::new(1).await;
+        let (tx, mut incoming) = mpsc::channel(1);
+        assert!(f.registration.as_ref().unwrap().enable_reliable(tx));
+        let (outcome, client) = f.dispatch_mode(None, true, true).await;
+        assert!(matches!(outcome, ParallelPeekOutcome::Bound));
+        let (server, client) = tokio::join!(
+            incoming.recv().await.unwrap().finish(),
+            client.finish_reliable()
+        );
+        let server = ReliableFrameChannel::from_registered(server.unwrap());
+        let client = ReliableFrameChannel::new(client);
+        let handle = client.handle();
+        let producer = tokio::spawn(async move {
+            let mut bodies = vec![(
+                AppMsg::AppOpen,
+                AppOpenPayload {
+                    app_id: [0x55; 32],
+                    endpoint_id: 17,
+                    flags: 0,
+                }
+                .encode()
+                .to_vec(),
+            )];
+            for n in 0..64u8 {
+                bodies.push((
+                    AppMsg::AppData,
+                    AppDataPayload {
+                        app_id: [0x55; 32],
+                        endpoint_id: 17,
+                        seq: 0,
+                        data: vec![n; 4096],
+                    }
+                    .encode(),
+                ));
+            }
+            bodies.push((
+                AppMsg::AppClose,
+                AppClosePayload {
+                    app_id: [0x55; 32],
+                    endpoint_id: 17,
+                    reason: 0,
+                }
+                .encode()
+                .to_vec(),
+            ));
+            for (msg, body) in bodies {
+                let mut h = FrameHeader::new(FrameFamily::App as u8, msg as u16);
+                h.stream_id = 19;
+                h.body_len = body.len() as u32;
+                let mut frame = FrameEnvelope::from((
+                    veil_proto::priority::INTERACTIVE,
+                    veil_bufpool::pooled_shared_from_vec(veil_proto::codec::encode_frame(
+                        &h, &body,
+                    )),
+                ));
+                let receipt = loop {
+                    match handle.try_send(frame) {
+                        Ok(receipt) => break receipt,
+                        Err(FrameAdmissionError::Full(retained)) => {
+                            frame = retained;
+                            tokio::task::yield_now().await;
+                        }
+                        Err(_) => panic!("lossless admission failed"),
+                    }
+                };
+                receipt.wait().await.unwrap();
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let handle = server.handle();
+        let plain = handle.recv().await.unwrap();
+        let h = veil_proto::codec::decode_header(&plain).unwrap();
+        assert_eq!(h.msg_type, AppMsg::AppOpen as u16);
+        assert_eq!(
+            AppOpenPayload::decode(&plain[HEADER_SIZE..])
+                .unwrap()
+                .endpoint_id,
+            17
+        );
+        for n in 0..64u8 {
+            let plain = handle.recv().await.unwrap();
+            let h = veil_proto::codec::decode_header(&plain).unwrap();
+            assert_eq!(h.msg_type, AppMsg::AppData as u16);
+            assert_eq!(h.stream_id, 19);
+            let data = AppDataPayload::decode(&plain[HEADER_SIZE..]).unwrap();
+            assert_eq!(data.seq, 0);
+            assert_eq!(data.data, vec![n; 4096]);
+        }
+        let plain = handle.recv().await.unwrap();
+        assert_eq!(
+            veil_proto::codec::decode_header(&plain).unwrap().msg_type,
+            AppMsg::AppClose as u16
+        );
+        assert_eq!(
+            AppClosePayload::decode(&plain[HEADER_SIZE..])
+                .unwrap()
+                .reason,
+            0
+        );
+        producer.await.unwrap();
+        drop(server);
+        client.handle().closed().await;
+        assert_eq!(f.diagnostics.active_connections(), 0);
+        f.main_survives().await;
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

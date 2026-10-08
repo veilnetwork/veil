@@ -41,6 +41,7 @@ pub mod parallel_binding;
 pub mod pending_response_table;
 pub mod priority_queue;
 pub mod realtime_datagram;
+pub mod reliable_frames;
 pub mod rekey_context;
 pub mod rekey_rx_grace_buffer;
 pub mod rendezvous;
