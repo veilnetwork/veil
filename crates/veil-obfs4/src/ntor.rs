@@ -65,7 +65,7 @@ use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::elligator2::{ElligatorKeypair, REPRESENTATIVE_LEN, decode_representative, ecdh};
 use super::{DirectionKey, HandshakeError};
@@ -238,6 +238,32 @@ pub struct ClientHandshake {
     variant: super::wire_variant::WireFormatVariant,
 }
 
+/// A per-connection exporter for binding auxiliary streams to an
+/// authenticated session. It is not an application identity or traffic key.
+/// Derivation has a separate HKDF domain and does not change wire bytes.
+pub struct ChannelBinding(Zeroizing<[u8; 32]>);
+
+impl ChannelBinding {
+    fn derive(shared: &[u8]) -> Self {
+        let mut binding = Zeroizing::new([0; 32]);
+        Hkdf::<Sha256>::new(None, shared)
+            .expand(b"veil/transport/obfs4/channel-binding/v1", binding.as_mut())
+            .expect("HKDF-SHA256 32-byte expand cannot fail");
+        Self(binding)
+    }
+
+    /// Copies the exporter for a session proof; never log this value.
+    pub fn bytes(&self) -> [u8; 32] {
+        *self.0
+    }
+}
+
+impl std::fmt::Debug for ChannelBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ChannelBinding(<redacted>)")
+    }
+}
+
 /// Result of a successful client-side handshake.
 #[derive(Debug)]
 pub struct ClientHandshakeOutput {
@@ -245,6 +271,8 @@ pub struct ClientHandshakeOutput {
     pub dk_c_to_s: DirectionKey,
     /// Direction key for incoming (server-to-client) framing.
     pub dk_s_to_c: DirectionKey,
+    /// Unique authenticated transport exporter, independent of framing keys.
+    pub channel_binding: ChannelBinding,
 }
 
 impl ClientHandshake {
@@ -364,10 +392,12 @@ impl ClientHandshake {
 
         let dk_c_to_s = DirectionKey::derive(&shared, b"c2s");
         let dk_s_to_c = DirectionKey::derive(&shared, b"s2c");
+        let channel_binding = ChannelBinding::derive(&shared);
         shared.zeroize();
         Ok(ClientHandshakeOutput {
             dk_c_to_s,
             dk_s_to_c,
+            channel_binding,
         })
     }
 }
@@ -386,6 +416,8 @@ pub struct ServerHandshakeOutput {
     pub dk_c_to_s: DirectionKey,
     /// Direction key for outgoing (server-to-client) framing.
     pub dk_s_to_c: DirectionKey,
+    /// Unique authenticated transport exporter, independent of framing keys.
+    pub channel_binding: ChannelBinding,
 }
 
 impl ServerHandshake {
@@ -519,12 +551,14 @@ impl ServerHandshake {
 
         let dk_c_to_s = DirectionKey::derive(&shared, b"c2s");
         let dk_s_to_c = DirectionKey::derive(&shared, b"s2c");
+        let channel_binding = ChannelBinding::derive(&shared);
         shared.zeroize();
 
         Ok((
             ServerHandshakeOutput {
                 dk_c_to_s,
                 dk_s_to_c,
+                channel_binding,
             },
             matched_variant,
             wire_resp,

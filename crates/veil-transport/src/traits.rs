@@ -214,6 +214,20 @@ pub trait TransportConnection: Send + Sync {
         None
     }
 
+    /// Per-connection exporter for binding an auxiliary ordered stream to a
+    /// canonical authenticated session. Transport security alone does not
+    /// authenticate a Veil identity; a session proof is still required.
+    fn stream_channel_binding(&self) -> Option<[u8; 32]> {
+        None
+    }
+
+    /// Independent ordered connections. No producer role or requested service
+    /// class is sent by this primitive. Activation requires peer negotiation
+    /// and a verified proof owned by the canonical session.
+    fn parallel_stream(&self) -> Option<super::stream_parallel::StreamParallelHandle> {
+        None
+    }
+
     /// Send a datagram (QUIC only). Default: `Unsupported`.
     fn send_datagram<'a>(&'a self, _payload: &'a [u8]) -> BoxFuture<'a, Result<()>> {
         Box::pin(ready(Err(TransportError::Unsupported(

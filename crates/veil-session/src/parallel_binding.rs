@@ -1,4 +1,4 @@
-//! Mutual binding of a generic auxiliary QUIC transport to a live session.
+//! Mutual binding of a generic auxiliary transport to a live session.
 //!
 //! SessionRunner authenticates exactly once per connection, bounds sibling
 //! slots, and retires the owner on close/rekey/replacement. It must not install
@@ -113,7 +113,7 @@ impl ParallelParent {
     }
 
     /// The session owner must call `retire` before replacing these credentials.
-    /// TLS alone does not establish an OVL1 identity; do not source these keys
+    /// Transport security alone does not establish an OVL1 identity; do not source these keys
     /// or the session ID from an unverified peer-supplied preface.
     pub fn new(session_id: [u8; 32], tx: [u8; 32], rx: [u8; 32]) -> Self {
         Self {

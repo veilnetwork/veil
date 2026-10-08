@@ -29,7 +29,7 @@ use veil_obfs4::{
 use super::{
     TransportContext,
     error::{Result, TransportError},
-    tcp::{boxed_stream_connection, configure_accepted_tcp, connect_tcp_stream, peer_meta},
+    tcp::{configure_accepted_tcp, connect_tcp_stream, peer_meta},
     traits::{
         BoxIoStream, RawInbound, Transport, TransportCapabilities, TransportConnection,
         TransportListener,
@@ -74,6 +74,41 @@ fn psk_from_context(ctx: &TransportContext) -> Result<NodeIdMacKey> {
     Ok(NodeIdMacKey(**raw))
 }
 
+pub(crate) async fn connect_obfs4_stream(
+    uri: &TransportUri,
+    ctx: Arc<TransportContext>,
+) -> Result<(super::traits::PeerMeta, Obfs4Stream<tokio::net::TcpStream>)> {
+    let (host, port) = obfs4_parts(uri)?;
+    let psk = psk_from_context(&ctx)?;
+    let tcp = connect_tcp_stream(host, port, &ctx).await?;
+    let local_addr = tcp.local_addr().ok();
+    let remote_addr = tcp.peer_addr().ok();
+
+    // Phase 2 kill-switch: client variant pulled from
+    // TransportContext.  Default V1 preserves pre-Phase-2
+    // behavior.  Operator sets `[transport] obfs4_client_variant
+    // = "v2"` only when all target servers' accept_variants
+    // includes V2 (otherwise outbound dials silent-drop).
+    //
+    // SECURITY (cycle-7): bound the client handshake with the same
+    // OBFS4_HANDSHAKE_TIMEOUT the server side uses. `connect_tcp_stream`
+    // above caps the TCP connect, but a peer that completes the TCP
+    // connect and then stalls the obfs4 handshake would otherwise wedge
+    // this outbound dial indefinitely — across many such dials that is a
+    // resource-exhaustion DoS. On timeout we drop the connection (Err).
+    let wrapped = tokio::time::timeout(
+        OBFS4_HANDSHAKE_TIMEOUT,
+        obfs4_client_connect_variant(tcp, &psk, ctx.obfs4_client_variant),
+    )
+    .await
+    .map_err(|_| TransportError::Tls("obfs4 client handshake timed out".to_string()))?
+    .map_err(|e| TransportError::Tls(format!("obfs4 client handshake: {e}")))?;
+
+    let peer = peer_meta("obfs4-tcp", uri.clone(), local_addr, remote_addr);
+
+    Ok((peer, wrapped))
+}
+
 impl Transport for Obfs4TcpTransport {
     fn scheme(&self) -> &'static str {
         "obfs4-tcp"
@@ -89,35 +124,9 @@ impl Transport for Obfs4TcpTransport {
         ctx: Arc<TransportContext>,
     ) -> BoxFuture<'a, Result<Box<dyn TransportConnection>>> {
         Box::pin(async move {
-            let (host, port) = obfs4_parts(uri)?;
-            let psk = psk_from_context(&ctx)?;
-            let tcp = connect_tcp_stream(host, port, &ctx).await?;
-            let local_addr = tcp.local_addr().ok();
-            let remote_addr = tcp.peer_addr().ok();
-
-            // Phase 2 kill-switch: client variant pulled from
-            // TransportContext.  Default V1 preserves pre-Phase-2
-            // behavior.  Operator sets `[transport] obfs4_client_variant
-            // = "v2"` only when all target servers' accept_variants
-            // includes V2 (otherwise outbound dials silent-drop).
-            //
-            // SECURITY (cycle-7): bound the client handshake with the same
-            // OBFS4_HANDSHAKE_TIMEOUT the server side uses. `connect_tcp_stream`
-            // above caps the TCP connect, but a peer that completes the TCP
-            // connect and then stalls the obfs4 handshake would otherwise wedge
-            // this outbound dial indefinitely — across many such dials that is a
-            // resource-exhaustion DoS. On timeout we drop the connection (Err).
-            let wrapped = tokio::time::timeout(
-                OBFS4_HANDSHAKE_TIMEOUT,
-                obfs4_client_connect_variant(tcp, &psk, ctx.obfs4_client_variant),
-            )
-            .await
-            .map_err(|_| TransportError::Tls("obfs4 client handshake timed out".to_string()))?
-            .map_err(|e| TransportError::Tls(format!("obfs4 client handshake: {e}")))?;
-
-            let peer = peer_meta("obfs4-tcp", uri.clone(), local_addr, remote_addr);
-            let boxed_stream: BoxIoStream = Box::new(Obfs4IoStream::new(wrapped));
-            Ok(boxed_stream_connection_obfs4(peer, boxed_stream))
+            let (peer, wrapped) = connect_obfs4_stream(uri, Arc::clone(&ctx)).await?;
+            let offer = super::stream_parallel::StreamParallelHandle::new(ctx, Some(uri.clone()));
+            Ok(boxed_stream_connection_obfs4(peer, wrapped, Some(offer)))
         })
     }
 
@@ -132,6 +141,7 @@ impl Transport for Obfs4TcpTransport {
             let listener = TcpListener::bind((host, port)).await?;
             Ok(Box::new(Obfs4TcpListener {
                 listener,
+                context: Arc::clone(&ctx),
                 bind_uri: uri.clone(),
                 psk,
                 keepalive_idle: ctx.tcp.keepalive_idle,
@@ -147,6 +157,7 @@ impl Transport for Obfs4TcpTransport {
 }
 
 struct Obfs4TcpListener {
+    context: Arc<TransportContext>,
     listener: TcpListener,
     bind_uri: TransportUri,
     psk: NodeIdMacKey,
@@ -190,8 +201,9 @@ impl TransportListener for Obfs4TcpListener {
                 local_addr,
                 Some(remote_addr),
             );
-            let boxed_stream: BoxIoStream = Box::new(Obfs4IoStream::new(wrapped));
-            Ok(boxed_stream_connection_obfs4(peer, boxed_stream))
+            let offer =
+                super::stream_parallel::StreamParallelHandle::new(Arc::clone(&self.context), None);
+            Ok(boxed_stream_connection_obfs4(peer, wrapped, Some(offer)))
         })
     }
 
@@ -207,6 +219,7 @@ impl TransportListener for Obfs4TcpListener {
             // Clone the config the handshake needs so `finish` is `'static`.
             let psk = self.psk.clone();
             let variants = self.accept_variants.clone();
+            let context = Arc::clone(&self.context);
             let bind_uri = self.bind_uri.clone();
             let finish: BoxFuture<'static, Result<Box<dyn TransportConnection>>> =
                 Box::pin(async move {
@@ -220,8 +233,8 @@ impl TransportListener for Obfs4TcpListener {
                     })?
                     .map_err(|e| TransportError::Tls(format!("obfs4 server handshake: {e}")))?;
                     let peer = peer_meta("obfs4-tcp", bind_uri, local_addr, Some(remote_addr));
-                    let boxed_stream: BoxIoStream = Box::new(Obfs4IoStream::new(wrapped));
-                    Ok(boxed_stream_connection_obfs4(peer, boxed_stream))
+                    let offer = super::stream_parallel::StreamParallelHandle::new(context, None);
+                    Ok(boxed_stream_connection_obfs4(peer, wrapped, Some(offer)))
                 });
             Ok(RawInbound {
                 remote_addr: Some(remote_addr),
@@ -301,14 +314,24 @@ impl tokio::io::AsyncWrite for Obfs4IoStream {
     }
 }
 
+pub(crate) fn boxed_obfs4_io(stream: Obfs4Stream<tokio::net::TcpStream>) -> BoxIoStream {
+    Box::new(Obfs4IoStream::new(stream))
+}
+
 fn boxed_stream_connection_obfs4(
     peer: super::traits::PeerMeta,
-    stream: BoxIoStream,
+    stream: Obfs4Stream<tokio::net::TcpStream>,
+    parallel: Option<super::stream_parallel::StreamParallelHandle>,
 ) -> Box<dyn TransportConnection> {
-    // Reuse the StreamConnection wrapper from the tcp module via a
-    // public constructor.  StreamConnection holds peer_meta + a
-    // ready-to-be-taken BoxIoStream.
-    boxed_stream_connection(peer, BoxIoStreamWrapper(stream))
+    let binding = stream.channel_binding();
+    let mut stream = boxed_obfs4_io(stream);
+    if let Some(offer) = &parallel {
+        stream = offer.parent_stream(stream);
+    }
+    Box::new(
+        super::tcp::StreamConnection::new(peer, BoxIoStreamWrapper(stream))
+            .with_auxiliary_stream(binding, parallel),
+    )
 }
 
 /// Wraps a BoxIoStream so it can be passed as `impl IoStream` to

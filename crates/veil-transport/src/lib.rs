@@ -31,6 +31,8 @@ pub mod registry;
 pub mod rotation;
 /// SOCKS5 proxy tunnelling (optional TLS on top).
 pub mod socks;
+/// Independent ordered auxiliary connections with canonical-parent lifetime.
+pub mod stream_parallel;
 /// Plain TCP transport.
 pub mod tcp;
 /// Opt-in local TCP write diagnostics; no protocol or scheduling changes.

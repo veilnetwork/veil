@@ -92,6 +92,72 @@ fn canonical_owner_drop_retires_clones_and_pending_authentication() {
     );
 }
 
+#[tokio::test]
+async fn ordered_child_proof_binds_the_actual_obfs4_connection() {
+    use veil_transport::{Transport, TransportUri, obfs4_tcp::Obfs4TcpTransport};
+    let mut context = TransportContext::for_debug().unwrap();
+    context.obfs4_psk = Some(std::sync::Arc::new([0x42; 32]));
+    let context = std::sync::Arc::new(context);
+    let transport = Obfs4TcpTransport;
+    let bind = TransportUri::Obfs4Tcp {
+        host: "127.0.0.1".into(),
+        port: 0,
+    };
+    let listener = transport.bind(&bind, context.clone()).await.unwrap();
+    let port = listener
+        .local_addr()
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let dial = TransportUri::Obfs4Tcp {
+        host: "127.0.0.1".into(),
+        port,
+    };
+    let (main_a, main_b) = tokio::join!(transport.connect(&dial, context), listener.accept());
+    let main_a = main_a.unwrap();
+    let main_b = main_b.unwrap();
+    let outgoing = main_a.parallel_stream().unwrap();
+    let incoming = main_b.parallel_stream().unwrap();
+    let (a_parent, b_parent) = parents();
+    let mut saved_hello = None;
+    for _ in 0..2 {
+        let (a, b) = tokio::join!(outgoing.connect(), listener.accept());
+        let a = a.unwrap();
+        let b = b.unwrap();
+        let a_binding = a.stream_channel_binding().unwrap();
+        let b_binding = b.stream_channel_binding().unwrap();
+        assert_eq!(a_binding, b_binding);
+        if let Some(hello) = saved_hello {
+            assert_eq!(
+                b_parent.accept(&hello, b_binding).unwrap_err(),
+                BindingError::InvalidProof
+            );
+        }
+        let (hello, pending) = a_parent.begin(a_binding).unwrap();
+        saved_hello = Some(hello);
+        let mut a_stream = a.into_stream().unwrap();
+        let mut b_stream = b.into_stream().unwrap();
+        a_stream.write_all(&hello).await.unwrap();
+        a_stream.flush().await.unwrap();
+        let mut received = [0; HELLO_BYTES];
+        b_stream.read_exact(&mut received).await.unwrap();
+        let (ack, b_keys) = b_parent.accept(&received, b_binding).unwrap();
+        // The canonical peer's bounded incoming lease is acquired only after
+        // the proof verifies. No new peer/identity registration is involved.
+        let mut b_stream = incoming.track_incoming(b_stream).unwrap();
+        b_stream.write_all(&ack).await.unwrap();
+        b_stream.flush().await.unwrap();
+        let mut received_ack = [0; 32];
+        a_stream.read_exact(&mut received_ack).await.unwrap();
+        let a_keys = pending.finish(&received_ack).unwrap();
+        assert_eq!(a_keys.session_id, b_keys.session_id);
+        assert_eq!(a_keys.tx_key(), b_keys.rx_key());
+        assert_eq!(a_keys.rx_key(), b_keys.tx_key());
+    }
+}
+
 struct TestChild {
     keys: ParallelKeys,
     a_stream: BoxIoStream,
