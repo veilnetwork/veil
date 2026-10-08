@@ -35,9 +35,12 @@ use super::{
 /// stays fixed without any firewall state.
 pub(crate) const DOWNLINK_MSS_CLAMP: u32 = 1200;
 
-/// Best-effort clamp of `TCP_MAXSEG` on an established socket so this node
-/// never emits full-MSS segments that a constrained downlink black-holes
-/// (see [`DOWNLINK_MSS_CLAMP`]). A failure here is a missed optimisation,
+/// Best-effort local clamp of `TCP_MAXSEG` on an established socket.
+/// It cannot change the MSS already announced in the SYN; on Linux it
+/// does not update the current negotiated send MSS either. Linux/Android
+/// outbound sockets must also set the limit BEFORE connect
+/// (see [`DOWNLINK_MSS_CLAMP`]).
+/// A failure here is a missed optimisation,
 /// never a correctness problem (the option is absent on a few exotic
 /// targets and the kernel bounds the value), so the `Err` is swallowed.
 pub(crate) fn clamp_downlink_mss(stream: &TcpStream) {
@@ -223,6 +226,14 @@ pub(crate) async fn connect_tcp_stream(
             last_err = Some(error);
             continue;
         }
+        // Negotiate the existing path-MTU safety limit in the SYN, not
+        // after the connection is established. A late TCP_MAXSEG leaves
+        // the peer free to send full-size segments and on Android leaves
+        // our current send MSS unchanged as well (physical kernel control).
+        // Darwin rejects this option before connect; keep its established
+        // socket clamp below instead of promising a negotiated limit there.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let _ = SockRef::from(&socket).set_tcp_mss(DOWNLINK_MSS_CLAMP);
         match timeout(timeout_duration, socket.connect(addr)).await {
             Ok(Ok(stream)) => {
                 stream.set_nodelay(ctx.tcp.nodelay)?;
@@ -416,6 +427,26 @@ fn build_reuseaddr_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn outbound_connect_announces_mss_before_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ctx = TransportContext::for_debug().unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (client, server) = tokio::join!(
+            connect_tcp_stream("127.0.0.1", port, &ctx),
+            listener.accept(),
+        );
+        let client = client.unwrap();
+        let server = server.unwrap().0;
+        // Check the peer too: applying TCP_MAXSEG after connect cannot
+        // retroactively change the MSS announced in the SYN.
+        for stream in [&client, &server] {
+            let mss = SockRef::from(stream).tcp_mss().unwrap();
+            assert!(mss > 0 && mss <= DOWNLINK_MSS_CLAMP, "negotiated MSS {mss}");
+        }
+    }
 
     #[tokio::test]
     async fn accepted_socket_honours_configured_nodelay() {
