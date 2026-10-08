@@ -3,13 +3,13 @@ use std::{
     io,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll, ready},
+    task::{ready, Context, Poll},
     time::Instant,
 };
 
 use tokio::{
     io::Interest,
-    time::{Sleep, sleep_until},
+    time::{sleep_until, Sleep},
 };
 
 use super::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPollHelper};
@@ -74,7 +74,14 @@ impl AsyncUdpSocket for UdpSocket {
         bufs: &mut [std::io::IoSliceMut<'_>],
         meta: &mut [udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "visionos"
+        ))]
         self.inner
             .set_receive_timestamp_trace((&self.io).into(), crate::udp_wire_trace::enabled());
         loop {

@@ -226,6 +226,8 @@ static void verify_silence() {
   origin = Clock::now();
   std::array<int16_t, 480> pcm{};
   uint64_t before_interruptions = 0, before_concealed = 0, max_age = 0;
+  uint64_t max_silence_delay = 0, max_silence_buffer = 0;
+  int first_resumed_tick = -1;
   size_t silent_start_packets = 0, silent_end_packets = 0, recovered_ticks = 0;
   double max_lateness = 0;
   for (int tick = 0; tick < 1600; ++tick) {
@@ -234,21 +236,34 @@ static void verify_silence() {
     assert(veil_media_test_audio_capture_tone(source.get(), tick < 200 ? 440 : tick < 1200 ? 0 : 1200) == 0);
     deliver();
     assert(veil_media_test_audio_playout_pcm(receiver.get(), pcm.data(), pcm.size()) == 480);
-    if (tick >= 1250) {
+    if (tick >= 1200) {
       double power = 0;
       for (const auto sample : pcm) power += static_cast<double>(sample) * sample;
-      if (power / pcm.size() > 500 * 500) ++recovered_ticks;
+      if (power / pcm.size() > 500 * 500) {
+        if (first_resumed_tick < 0) first_resumed_tick = tick;
+        if (tick >= 1250) ++recovered_ticks;
+      }
     }
     if (tick == 200) { before_interruptions = metric(receiver.get(), "audio_interruption_count"); before_concealed = metric(receiver.get(), "audio_concealed_samples"); silent_start_packets = sent_packets; }
     if (tick == 1200) silent_end_packets = sent_packets;
-    if (tick % 10 == 0 && tick >= 300 && tick < 1200) max_age = std::max(max_age, metric(receiver.get(), "audio_rx_native_age_ms"));
+    if (tick % 10 == 0 && tick >= 300 && tick < 1200) {
+      max_age = std::max(max_age, metric(receiver.get(), "audio_rx_native_age_ms"));
+      max_silence_delay = std::max(max_silence_delay, metric(receiver.get(), "audio_delay_ms"));
+      max_silence_buffer = std::max(max_silence_buffer, metric(receiver.get(), "audio_jb_ms"));
+    }
   }
   std::printf("{\"silence_rtp_packets\":%zu,\"max_silence_rx_age_ms\":%llu,\"interruption_delta\":%llu,\"concealed_delta\":%llu,\"max_tick_lateness_ms\":%.2f}\n", silent_end_packets - silent_start_packets, (unsigned long long)max_age, (unsigned long long)(metric(receiver.get(), "audio_interruption_count") - before_interruptions), (unsigned long long)(metric(receiver.get(), "audio_concealed_samples") - before_concealed), max_lateness);
+  std::printf("{\"max_silence_delay_ms\":%llu,\"max_silence_buffer_ms\":%llu,\"resumed_tone_delay_ms\":%d}\n", (unsigned long long)max_silence_delay, (unsigned long long)max_silence_buffer, first_resumed_tick < 0 ? -1 : (first_resumed_tick - 1200) * 10);
   std::fflush(stdout);
   assert(max_lateness < 30);
   assert(silent_end_packets - silent_start_packets > 20);
   assert(silent_end_packets - silent_start_packets < 150); // Opus DTX is exercised
   assert(max_age < 500); // intentional silence must not trigger receive repair
+  // Healthy DTX must also retain valid low-delay feedback for video recovery.
+  // Packet activity alone would pass with a falsely inflated delay/buffer
+  // gauge. Check real decoded PCM too, rather than trusting the gauges alone.
+  assert(max_silence_delay < 120 && max_silence_buffer < 120);
+  assert(first_resumed_tick >= 1200 && first_resumed_tick < 1216);
   assert(recovered_ticks > 250); // real decoded tone resumes after silence
   assert(metric(receiver.get(), "audio_concealed_samples") == before_concealed);
   assert(metric(receiver.get(), "audio_interruption_count") == before_interruptions);
