@@ -181,9 +181,25 @@ impl NodeRuntime {
                                 let Some(punch_token) = offer.request.punch_token else {
                                     return;
                                 };
-                                let Some(first_reflector) = reflectors.first().copied() else {
+                                // The initiator already owns its punch socket.
+                                // Our mapping must use a family that socket can
+                                // reach, rather than whichever reflector sorts
+                                // first locally. Otherwise an IPv4 offer can
+                                // get an IPv6-only answer and never converge.
+                                let mut peer_candidates = offer.request.candidates.iter()
+                                    .filter(|candidate| candidate.candidate_type
+                                        == veil_proto::control::candidate_type::SRFLX)
+                                    .filter_map(veil_nat::candidate_to_socket_addr)
+                                    .filter(|candidate| veil_nat::is_public_punch_addr(*candidate))
+                                    .collect::<Vec<_>>();
+                                let Some(first_reflector) = reflectors.iter().copied()
+                                    .find(|reflector| peer_candidates.iter()
+                                        .any(|candidate| candidate.is_ipv4() == reflector.is_ipv4()))
+                                else {
                                     return;
                                 };
+                                peer_candidates.retain(|candidate|
+                                    candidate.is_ipv4() == first_reflector.is_ipv4());
                                 let reflectors = reflectors
                                     .into_iter()
                                     .filter(|value| {
@@ -280,17 +296,6 @@ impl NodeRuntime {
                                 ) {
                                     return;
                                 }
-                                let peer_candidates = offer
-                                    .request
-                                    .candidates
-                                    .iter()
-                                    .filter(|candidate| {
-                                        candidate.candidate_type
-                                            == veil_proto::control::candidate_type::SRFLX
-                                    })
-                                    .filter_map(veil_nat::candidate_to_socket_addr)
-                                    .filter(|candidate| veil_nat::is_public_punch_addr(*candidate))
-                                    .collect::<Vec<_>>();
                                 let remaining = deadline
                                     .saturating_duration_since(tokio::time::Instant::now());
                                 let quic_reserve =

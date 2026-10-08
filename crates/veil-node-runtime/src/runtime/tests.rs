@@ -3558,6 +3558,105 @@ async fn attempt_hole_punch_registered_peer_without_reflector() {
     let _ = fs::remove_file(path);
 }
 
+/// Exercise the production socket-owning responder, not a selector mock.
+/// The first configured reflector is incompatible with the initiator; the
+/// compatible reflector must receive the actual UDP discovery request.
+#[tokio::test(flavor = "current_thread")]
+async fn udp_punch_responder_matches_initiator_family() {
+    for ipv4 in [true, false] {
+        let v4 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let v6 = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        let (compatible, incompatible) = if ipv4 { (&v4, &v6) } else { (&v6, &v4) };
+        let mut config = runtime_config_with_listen();
+        config.peers.clear();
+        config.nat.udp_reflectors = vec![
+            incompatible.local_addr().unwrap().to_string(),
+            compatible.local_addr().unwrap().to_string(),
+        ];
+        let path = save_test_config("punch-responder-family", config).unwrap();
+        let mut rt = NodeRuntime::start(&path, true).await.unwrap();
+        let tx = lock!(rt.dispatcher.nat_punch_offer_tx).clone().unwrap();
+        let address = if ipv4 {
+            "8.8.8.8:32000"
+        } else {
+            "[2001:4860:4860::8888]:32000"
+        };
+        let mut candidate = veil_nat::socket_addr_to_candidate(address.parse().unwrap());
+        candidate.candidate_type = veil_proto::control::candidate_type::SRFLX;
+        tx.send(veil_dispatcher::NatPunchOffer {
+            request: veil_proto::control::NatProbeRequestPayload {
+                initiator_node_id: [0xAA; 32],
+                target_node_id: rt.access().local_node_id,
+                session_token: 7,
+                punch_token: Some([0x42; 16]),
+                candidates: vec![candidate],
+            },
+            reply_via_node_id: [0xCC; 32],
+        })
+        .await
+        .unwrap();
+        // No reflector reply is sent: discovery cannot finish, so no packet
+        // is ever sent to the synthetic public punch candidate above.
+        let mut buffer = [0u8; 128];
+        let observed = timeout(
+            Duration::from_millis(700),
+            compatible.recv_from(&mut buffer),
+        )
+        .await;
+        let wrong_family = incompatible.try_recv_from(&mut buffer);
+        rt.stop().await.unwrap();
+        let _ = fs::remove_file(path);
+        let (bytes, source) = observed
+            .expect("compatible reflector must receive discovery")
+            .unwrap();
+        assert!(bytes > 0);
+        assert_eq!(source.is_ipv4(), ipv4);
+        assert!(
+            matches!(wrong_family, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "an incompatible reflector must not be probed"
+        );
+    }
+}
+
+/// An unusable offer cannot lead to a reachable punch. Reject it before
+/// opening a discovery path, even if a reflector of that family exists.
+#[tokio::test(flavor = "current_thread")]
+async fn udp_punch_responder_rejects_non_public_srflx_offers_before_discovery() {
+    let reflector = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut config = runtime_config_with_listen();
+    config.peers.clear();
+    config.nat.udp_reflectors = vec![reflector.local_addr().unwrap().to_string()];
+    let path = save_test_config("punch-responder-invalid", config).unwrap();
+    let mut rt = NodeRuntime::start(&path, true).await.unwrap();
+    let tx = lock!(rt.dispatcher.nat_punch_offer_tx).clone().unwrap();
+    let mut private = veil_nat::socket_addr_to_candidate("192.168.1.10:32000".parse().unwrap());
+    private.candidate_type = veil_proto::control::candidate_type::SRFLX;
+    let mut host = veil_nat::socket_addr_to_candidate("8.8.8.8:32000".parse().unwrap());
+    host.candidate_type = veil_proto::control::candidate_type::HOST;
+    for candidates in [vec![], vec![private], vec![host]] {
+        tx.send(veil_dispatcher::NatPunchOffer {
+            request: veil_proto::control::NatProbeRequestPayload {
+                initiator_node_id: [0xAA; 32],
+                target_node_id: rt.access().local_node_id,
+                session_token: 7,
+                punch_token: Some([0x42; 16]),
+                candidates,
+            },
+            reply_via_node_id: [0xCC; 32],
+        })
+        .await
+        .unwrap();
+    }
+    let mut buffer = [0u8; 128];
+    let observed = timeout(Duration::from_millis(200), reflector.recv_from(&mut buffer)).await;
+    rt.stop().await.unwrap();
+    let _ = fs::remove_file(path);
+    assert!(
+        observed.is_err(),
+        "unusable offers must produce no UDP discovery traffic"
+    );
+}
+
 /// Exercise the actual punched-runner spawn boundary, where precise async
 /// capture used to drop registration before the future's first poll.
 #[tokio::test(flavor = "current_thread")]
