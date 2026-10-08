@@ -1099,6 +1099,14 @@ constexpr int kGroupVp8PayloadType = 96;
 class LowLatencyFieldTrials final : public webrtc::FieldTrialsView {
  public:
   std::string Lookup(absl::string_view key) const override {
+    // Reordering history advances only on received packets. With Opus DTX,
+    // the default 0.9993 factor can preserve a short radio burst throughout
+    // a long silent interval and delay the next spoken syllable. Keep the
+    // underrun estimator and packet capacity unchanged, but let old reorder
+    // samples decay once delivery becomes orderly again. This is entirely
+    // receiver-local; no media role or priority is disclosed to the network.
+    if (key == "WebRTC-Audio-NetEqDelayManagerConfig")
+      return "reorder_forget_factor:0.95";
     if (key == "WebRTC-ForcePlayoutDelay") {
       // A small receiver-side floor lets WebRTC schedule through isolated
       // phone-radio bursts instead of presenting every arrival gap. Physical
