@@ -3639,6 +3639,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     uint64_t audio_tx_retransmitted_pkts = 0;
     uint32_t audio_delay_ms = 0;
     uint32_t audio_jb_ms = 0;
+    uint32_t audio_jb_target_ms = 0;
     int video_delay_ms = 0;
     int video_encoder_target_bps = 0;
     int video_jb_ms = 0;
@@ -3710,6 +3711,10 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         jitter_ms = r.jitter_ms;
         audio_delay_ms = r.delay_estimate_ms;
         audio_jb_ms = r.jitter_buffer_ms;
+        // Diagnostic only: distinguish the controller's chosen buffer from
+        // current packet accumulation and the filtered playout estimate.
+        // Existing worker freshness and receive-packet checks still apply.
+        audio_jb_target_ms = r.jitter_buffer_preferred_ms;
         // packets_lost is cumulative and may go negative on duplicates.
         if (r.packets_lost > 0) {
           const int64_t expected =
@@ -3794,7 +3799,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         "\"tx_jitter_ms\":%d,\"tx_loss_pct\":%d,\"audio_feedback_reports\":%d,"
         "\"video_feedback_reports\":%d,\"video_feedback_rtt_ms\":%lld,"
         "\"video_feedback_loss_pct\":%d,\"video_feedback_jitter_ms\":%d,"
-        "\"audio_delay_ms\":%u,\"audio_jb_ms\":%u,"
+        "\"audio_delay_ms\":%u,\"audio_jb_ms\":%u,\"audio_jb_target_ms\":%u,"
         "\"video_delay_ms\":%d,\"video_jb_ms\":%d,"
         "\"pacer_delay_ms\":%lld,\"worker_stalled\":%d,\"video_worker_stalled\":%d,"
         "\"video_tx_frames\":%llu,\"video_tx_fps\":%.1f,"
@@ -3854,7 +3859,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<long long>(video_feedback_available ? video_report.rtt_ms : 0),
         video_feedback_available ? video_report.loss_pct : 0,
         video_feedback_available ? video_report.jitter_ms : 0,
-        audio_delay_ms, audio_jb_ms, video_delay_ms, video_jb_ms,
+        audio_delay_ms, audio_jb_ms, audio_jb_target_ms, video_delay_ms, video_jb_ms,
         static_cast<long long>(pacer_delay_ms), sampled ? 0 : 1, video_sampled ? 0 : 1,
         static_cast<unsigned long long>(tx_video.frames),
         cadence_fps(tx_video),
