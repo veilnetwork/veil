@@ -46,8 +46,9 @@ impl LocalSourceActivity {
 
     /// Hold reliable local producers before encryption, never discard their
     /// bytes. All neighbors of this endpoint share the same bounded allowance.
-    /// Whole oversized compatibility frames may progress alone. The caller
-    /// must retain FIFO and admission credits while waiting for the deadline.
+    /// Whole oversized compatibility frames may progress alone, but spend
+    /// enough future windows to pay for their bytes. The caller must retain
+    /// FIFO and admission credits while waiting for the deadline.
     pub(crate) fn admit_reliable_secondary(
         &self,
         bytes: usize,
@@ -95,6 +96,14 @@ impl LocalSourceActivity {
             *used = 0;
         }
         if *used == 0 || used.checked_add(bytes).is_some_and(|n| n <= budget) {
+            if bytes > budget {
+                // A whole legacy frame must not deadlock on a smaller budget.
+                // Charge its size across future windows instead of granting
+                // another oversized frame every probe interval. Fresh audio
+                // observations extend pressure, never replenish this debt.
+                let windows = u32::try_from(bytes.div_ceil(budget)).unwrap_or(u32::MAX);
+                *deadline = now + SECONDARY_PROBE_INTERVAL * windows;
+            }
             *used = used.saturating_add(bytes);
             Ok(())
         } else {
@@ -134,6 +143,50 @@ impl LocalSourceActivity {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn oversized_reliable_frames_pay_their_byte_budget_across_refreshes() {
+        for network_control in [false, true] {
+            let activity = LocalSourceActivity::default();
+            let now = Instant::now();
+            let budget = if network_control {
+                NETWORK_CONTROL_BYTES
+            } else {
+                RELIABLE_SECONDARY_BYTES
+            };
+            let bytes = budget * 15 + 1;
+            activity.note(now);
+            activity.note_pressure(now);
+            assert!(activity.admit_reliable(bytes, now, network_control).is_ok());
+            // Different runners keep publishing fresh primary activity and
+            // pressure. They must not replenish a large frame's spent bytes
+            // every 200 ms, even though that frame had to stay whole.
+            let charged_until = now + SECONDARY_PROBE_INTERVAL * 16;
+            for tick in 1..16 {
+                let at = now + SECONDARY_PROBE_INTERVAL * tick;
+                activity.note(at);
+                activity.note_pressure(at);
+                let retry = activity
+                    .admit_reliable(1, at, network_control)
+                    .expect_err("oversized frame bypassed endpoint byte budget");
+                // The runner may wake earlier to recheck activity/pressure
+                // expiry. That wake must retain the unpaid bytes when fresh
+                // primary observations extend those lifetimes.
+                assert!(retry > at && retry <= charged_until);
+            }
+            activity.note(charged_until);
+            activity.note_pressure(charged_until);
+            assert!(
+                activity
+                    .admit_reliable(budget, charged_until, network_control)
+                    .is_ok()
+            );
+            assert_eq!(
+                activity.admit_reliable(1, charged_until, network_control),
+                Err(charged_until + SECONDARY_PROBE_INTERVAL)
+            );
+        }
+    }
 
     #[test]
     fn own_rpc_neighbors_share_a_separate_byte_allowance() {
@@ -177,7 +230,7 @@ mod tests {
         assert!(activity.admit_network_control(60000, next).is_ok());
         assert_eq!(
             activity.admit_network_control(1, next),
-            Err(next + SECONDARY_PROBE_INTERVAL)
+            Err(now + PRESSURE_GRACE)
         );
         assert!(
             activity
@@ -273,7 +326,7 @@ mod tests {
         assert!(activity.admit_reliable_secondary(60_000, next).is_ok());
         assert_eq!(
             activity.admit_reliable_secondary(1, next),
-            Err(next + SECONDARY_PROBE_INTERVAL)
+            Err(now + PRESSURE_GRACE)
         );
         assert!(
             activity
