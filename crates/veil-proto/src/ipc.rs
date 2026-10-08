@@ -33,12 +33,114 @@ pub const IPC_CAP_STREAM_WRITE_CREDIT: u32 = 1;
 /// APP_HELLO_OK header acknowledgment of the requested local capability.
 /// Other message headers do not use this flag.
 pub const IPC_HELLO_OK_STREAM_WRITE_CREDIT: u16 = 0x0080;
+/// Trusted endpoint observations for this node's own producer admission only.
+pub const IPC_CAP_LOCAL_SOURCE_FEEDBACK: u32 = 2;
+/// APP_HELLO_OK acknowledgment; never a network frame flag.
+pub const IPC_HELLO_OK_LOCAL_SOURCE_FEEDBACK: u16 = 0x0100;
 /// Source bytes an IPC stream may enqueue before the node admits them. This is
 /// separate from the receiver's network/local-pair read window.
 pub const IPC_STREAM_WRITE_WINDOW: u32 = 8 * 1024;
 /// Charge a minimum per-frame allocation cost as well as payload bytes, so a
 /// producer of tiny writes cannot turn a byte bound into millions of jobs.
 pub const IPC_STREAM_WRITE_OVERHEAD: u32 = 128;
+
+/// Local-only pressure lease. The source must be bound on the reporting IPC
+/// connection. No destination, content type or remote priority is present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSourceFeedbackPayload {
+    /// Application owned by the local reporting client.
+    pub source_app_id: [u8; 32],
+    /// Whether its latency-sensitive source currently observes pressure.
+    pub pressured: bool,
+    /// Sampling time on this host, so IPC backlog cannot renew stale pressure.
+    pub sampled_at_unix_ms: u64,
+}
+
+impl LocalSourceFeedbackPayload {
+    /// Exact payload length.
+    pub const WIRE_SIZE: usize = 41;
+    /// Feedback expires between one-second observations if the app stops.
+    pub const MAX_AGE_MS: u64 = 1500;
+    /// Small same-host wall-clock correction allowance.
+    pub const MAX_FUTURE_MS: u64 = 250;
+
+    /// Serialize only to app↔daemon IPC.
+    pub fn encode(&self) -> [u8; Self::WIRE_SIZE] {
+        let mut bytes = [0; Self::WIRE_SIZE];
+        bytes[..32].copy_from_slice(&self.source_app_id);
+        bytes[32] = u8::from(self.pressured);
+        bytes[33..].copy_from_slice(&self.sampled_at_unix_ms.to_be_bytes());
+        bytes
+    }
+
+    /// Reject unknown flags and extensions instead of interpreting them as QoS.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtoError> {
+        if bytes.len() < Self::WIRE_SIZE {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::WIRE_SIZE,
+                got: bytes.len(),
+            });
+        }
+        if bytes.len() > Self::WIRE_SIZE {
+            return Err(ProtoError::TrailingBytes {
+                trailing: bytes.len() - Self::WIRE_SIZE,
+            });
+        }
+        if bytes[32] > 1 {
+            return Err(ProtoError::ValueTooLarge {
+                field: "local_source_pressure",
+                value: bytes[32] as u64,
+                max: 1,
+            });
+        }
+        Ok(Self {
+            source_app_id: bytes[..32].try_into().expect("checked length"),
+            pressured: bytes[32] == 1,
+            sampled_at_unix_ms: u64::from_be_bytes(bytes[33..].try_into().expect("checked length")),
+        })
+    }
+
+    /// Both clocks are on the same host; peer clocks are never used here.
+    pub fn is_fresh_at(&self, now_unix_ms: u64) -> bool {
+        self.sampled_at_unix_ms != 0
+            && now_unix_ms != 0
+            && now_unix_ms.saturating_sub(self.sampled_at_unix_ms) <= Self::MAX_AGE_MS
+            && self.sampled_at_unix_ms.saturating_sub(now_unix_ms) <= Self::MAX_FUTURE_MS
+    }
+}
+
+#[cfg(test)]
+mod local_source_feedback_tests {
+    use super::*;
+
+    #[test]
+    fn exact_codec_and_sampling_freshness() {
+        let report = LocalSourceFeedbackPayload {
+            source_app_id: [7; 32],
+            pressured: true,
+            sampled_at_unix_ms: 10_000,
+        };
+        let bytes = report.encode();
+        assert_eq!(LocalSourceFeedbackPayload::decode(&bytes).unwrap(), report);
+        assert!(LocalSourceFeedbackPayload::decode(&bytes[..40]).is_err());
+        assert!(LocalSourceFeedbackPayload::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
+        let mut invalid = bytes;
+        invalid[32] = 2;
+        assert!(LocalSourceFeedbackPayload::decode(&invalid).is_err());
+        assert!(report.is_fresh_at(11_500));
+        assert!(!report.is_fresh_at(11_501));
+        assert!(report.is_fresh_at(9_750));
+        assert!(!report.is_fresh_at(9_749));
+        assert!(!report.is_fresh_at(0));
+        assert!(
+            !LocalSourceFeedbackPayload {
+                sampled_at_unix_ms: 0,
+                ..report
+            }
+            .is_fresh_at(1)
+        );
+    }
+}
 
 // ── AppIpcHelloPayload ──────────────────────────────────────────────────────
 
@@ -53,7 +155,8 @@ pub const IPC_STREAM_WRITE_OVERHEAD: u32 = 128;
 pub struct AppIpcHelloPayload {
     /// IPC protocol version the client supports.
     pub version: u16,
-    /// Capability flags; see `IPC_CAP_STREAM_WRITE_CREDIT`.
+    /// Capability flags; see `IPC_CAP_STREAM_WRITE_CREDIT` and
+    /// `IPC_CAP_LOCAL_SOURCE_FEEDBACK`.
     pub flags: u32,
 }
 

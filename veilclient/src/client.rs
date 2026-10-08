@@ -121,6 +121,7 @@ pub(crate) struct SharedWriter {
     /// legacy "no id" marker on the wire.
     next_request_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
     stream_credits: Option<SharedStreamCredits>,
+    local_source_feedback: bool,
 }
 
 type SharedStreamCredits =
@@ -168,6 +169,7 @@ impl SharedWriter {
             tx,
             next_request_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             stream_credits: None,
+            local_source_feedback: false,
         }
     }
 
@@ -178,6 +180,15 @@ impl SharedWriter {
             )));
         }
         self
+    }
+
+    pub(crate) fn with_local_source_feedback(mut self, enabled: bool) -> Self {
+        self.local_source_feedback = enabled;
+        self
+    }
+
+    pub(crate) fn supports_local_source_feedback(&self) -> bool {
+        self.local_source_feedback
     }
 
     pub(crate) fn register_stream_credit(
@@ -1043,7 +1054,8 @@ impl VeilClient {
         // ── Send APP_HELLO ────────────────────────────────────────────────
         let hello = AppIpcHelloPayload {
             version: IPC_PROTOCOL_VERSION,
-            flags: veilcore::proto::ipc::IPC_CAP_STREAM_WRITE_CREDIT,
+            flags: veilcore::proto::ipc::IPC_CAP_STREAM_WRITE_CREDIT
+                | veilcore::proto::ipc::IPC_CAP_LOCAL_SOURCE_FEEDBACK,
         };
         tokio::time::timeout(
             timeout,
@@ -1092,9 +1104,13 @@ impl VeilClient {
         let (rh, wh) = stream.into_split();
         let (frame_tx, frame_rx) = mpsc::channel::<IpcWriterFrame>(FRAME_TX_CAPACITY);
         tokio::spawn(run_writer_task(wh, frame_rx));
-        let writer = SharedWriter::new(frame_tx).with_stream_credit(
-            hdr.flags & veilcore::proto::ipc::IPC_HELLO_OK_STREAM_WRITE_CREDIT != 0,
-        );
+        let writer = SharedWriter::new(frame_tx)
+            .with_stream_credit(
+                hdr.flags & veilcore::proto::ipc::IPC_HELLO_OK_STREAM_WRITE_CREDIT != 0,
+            )
+            .with_local_source_feedback(
+                hdr.flags & veilcore::proto::ipc::IPC_HELLO_OK_LOCAL_SOURCE_FEEDBACK != 0,
+            );
         let dispatch = Arc::new(Mutex::new(DispatchTable::new()));
 
         // ── Spawn reader task ────────────────────────────────────────────

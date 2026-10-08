@@ -12,4 +12,5 @@ pub(crate) mod mobile;
 pub(crate) mod outbox;
 pub(crate) mod queries;
 pub(crate) mod send;
+pub(crate) mod source_feedback;
 pub(crate) mod stream;

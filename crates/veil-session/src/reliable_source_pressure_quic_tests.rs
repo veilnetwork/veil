@@ -760,8 +760,10 @@ async fn verify_stream_only_primary_backpressure(neutral_prefix: usize) {
     timeout(Duration::from_secs(1), async {
         loop {
             let now = std::time::Instant::now();
-            assert!(source.admit_reliable_secondary(4096, now).is_ok());
-            if source.admit_reliable_secondary(4096, now).is_err() {
+            // DATA has a budget even before congestion. The independent RPC
+            // allowance is pressure-only and proves the writer observation.
+            assert!(source.admit_network_control(1024, now).is_ok());
+            if source.admit_network_control(1024, now).is_err() {
                 break;
             }
             sleep(Duration::from_millis(10)).await;
