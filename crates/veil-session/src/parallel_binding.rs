@@ -14,7 +14,34 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 pub(crate) const PREFACE: &[u8; 8] = b"VPAUX001";
+pub(crate) const RELIABLE_PREFACE: &[u8; 8] = b"VPAUX002";
 pub const HELLO_BYTES: usize = 104;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordMode {
+    LossTolerant,
+    Reliable,
+}
+
+impl RecordMode {
+    fn preface(self) -> &'static [u8; 8] {
+        match self {
+            Self::LossTolerant => PREFACE,
+            Self::Reliable => RELIABLE_PREFACE,
+        }
+    }
+    fn domain(self, phase: &str) -> &'static [u8] {
+        match (self, phase) {
+            (Self::LossTolerant, "hello") => b"veil/parallel/hello/v1",
+            (Self::LossTolerant, "ack") => b"veil/parallel/ack/v1",
+            (Self::LossTolerant, "key") => b"veil/parallel/key/v1",
+            (Self::Reliable, "hello") => b"veil/parallel/reliable/hello/v1",
+            (Self::Reliable, "ack") => b"veil/parallel/reliable/ack/v1",
+            (Self::Reliable, "key") => b"veil/parallel/reliable/key/v1",
+            _ => unreachable!("fixed proof phase"),
+        }
+    }
+}
 
 struct Parent {
     session_id: [u8; 32],
@@ -65,6 +92,8 @@ pub struct ParallelKeys {
     tx: Zeroizing<[u8; 32]>,
     rx: Zeroizing<[u8; 32]>,
     parent: ParallelParentHandle,
+    mode: RecordMode,
+    exporter: Zeroizing<[u8; 32]>,
 }
 
 impl std::fmt::Debug for ParallelKeys {
@@ -91,6 +120,9 @@ impl ParallelKeys {
         stream: veil_transport::BoxIoStream,
     ) -> Result<BoundOrderedChannel, BindingError> {
         self.parent.check_active()?;
+        if self.mode != RecordMode::LossTolerant {
+            return Err(BindingError::InvalidProof);
+        }
         let plane = veil_transport::ordered_records::OrderedRecordPlane::new(stream);
         let handle = plane.handle();
         let parent = self.parent.clone();
@@ -106,6 +138,143 @@ impl ParallelKeys {
             plane,
             lifetime,
         })
+    }
+
+    /// Lossless framing is a separately authenticated protocol mode, not a
+    /// local reinterpretation of an existing expiring child. Use only after
+    /// explicit peer negotiation and the reliable-mode mutual proof.
+    pub fn into_reliable(
+        self,
+        stream: veil_transport::BoxIoStream,
+    ) -> Result<BoundReliableChannel, BindingError> {
+        self.into_reliable_inner(stream, ReliableTransportOwner(None))
+    }
+
+    /// A QUIC child owns the complete connection, including retained raw
+    /// clones and its quota watcher. Dropping only its byte stream is not
+    /// sufficient. The handle must belong to the proof's actual fresh child.
+    pub fn into_reliable_quic(
+        self,
+        stream: veil_transport::BoxIoStream,
+        transport: veil_transport::QuicDatagramHandle,
+    ) -> Result<BoundReliableChannel, BindingError> {
+        let exporter = transport
+            .channel_binding()
+            .map_err(|_| BindingError::InvalidProof)?;
+        if !bool::from(exporter.ct_eq(&*self.exporter)) {
+            // Do not retire an unrelated connection supplied by a bad caller.
+            return Err(BindingError::InvalidProof);
+        }
+        self.into_reliable_inner(stream, ReliableTransportOwner(Some(transport)))
+    }
+
+    fn into_reliable_inner(
+        self,
+        stream: veil_transport::BoxIoStream,
+        transport: ReliableTransportOwner,
+    ) -> Result<BoundReliableChannel, BindingError> {
+        self.parent.check_active()?;
+        if self.mode != RecordMode::Reliable {
+            return Err(BindingError::InvalidProof);
+        }
+        let plane = veil_transport::reliable_records::ReliableRecordPlane::new(stream);
+        let handle = plane.handle();
+        let parent = self.parent.clone();
+        let quic = transport.0.clone();
+        let lifetime = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = parent.retired() => handle.close(),
+                _ = handle.closed() => {},
+            }
+            if let Some(quic) = quic {
+                quic.close();
+            }
+        });
+        Ok(BoundReliableChannel {
+            keys: self,
+            plane,
+            lifetime,
+            transport,
+        })
+    }
+}
+
+/// Keeps reliable I/O, independent keys and parent authorization together.
+pub struct BoundReliableChannel {
+    pub keys: ParallelKeys,
+    plane: veil_transport::reliable_records::ReliableRecordPlane,
+    lifetime: tokio::task::JoinHandle<()>,
+    transport: ReliableTransportOwner,
+}
+
+struct ReliableTransportOwner(Option<veil_transport::QuicDatagramHandle>);
+impl ReliableTransportOwner {
+    fn close(&self) {
+        if let Some(handle) = &self.0 {
+            handle.close();
+        }
+    }
+}
+impl Drop for ReliableTransportOwner {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl BoundReliableChannel {
+    pub fn handle(&self) -> BoundReliableHandle {
+        BoundReliableHandle {
+            records: self.plane.handle(),
+            parent: self.keys.parent.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct BoundReliableHandle {
+    records: veil_transport::reliable_records::ReliableRecordHandle,
+    parent: ParallelParentHandle,
+}
+
+impl BoundReliableHandle {
+    pub async fn send(&self, payload: &[u8]) -> std::io::Result<()> {
+        if !self.parent.is_active() {
+            return Err(std::io::ErrorKind::ConnectionAborted.into());
+        }
+        tokio::select! {
+            biased;
+            _ = self.parent.retired() => Err(std::io::ErrorKind::ConnectionAborted.into()),
+            result = self.records.send(payload) => result,
+        }
+    }
+    pub async fn recv(&self) -> std::io::Result<Vec<u8>> {
+        let result = tokio::select! {
+            biased;
+            _ = self.parent.retired() => Err(std::io::ErrorKind::ConnectionAborted.into()),
+            result = self.records.recv() => result,
+        };
+        if !self.parent.is_active() {
+            return Err(std::io::ErrorKind::ConnectionAborted.into());
+        }
+        result
+    }
+    pub fn close(&self) {
+        self.records.close();
+    }
+    pub async fn closed(&self) {
+        tokio::select! { biased; _ = self.parent.retired() => {}, _ = self.records.closed() => {} }
+    }
+    pub fn progress(&self) -> veil_transport::reliable_records::RecordProgress {
+        self.records.progress()
+    }
+}
+
+impl Drop for BoundReliableChannel {
+    fn drop(&mut self) {
+        self.plane.handle().close();
+        self.transport.close();
+        self.lifetime.abort();
     }
 }
 
@@ -214,6 +383,7 @@ pub struct PendingParallelBinding {
     parent: ParallelParentHandle,
     nonce: [u8; 32],
     exporter: Zeroizing<[u8; 32]>,
+    mode: RecordMode,
 }
 
 fn proof(
@@ -289,17 +459,32 @@ impl ParallelParentHandle {
         &self,
         exporter: [u8; 32],
     ) -> Result<([u8; HELLO_BYTES], PendingParallelBinding), BindingError> {
+        self.begin_mode(exporter, RecordMode::LossTolerant)
+    }
+
+    pub fn begin_reliable(
+        &self,
+        exporter: [u8; 32],
+    ) -> Result<([u8; HELLO_BYTES], PendingParallelBinding), BindingError> {
+        self.begin_mode(exporter, RecordMode::Reliable)
+    }
+
+    fn begin_mode(
+        &self,
+        exporter: [u8; 32],
+        mode: RecordMode,
+    ) -> Result<([u8; HELLO_BYTES], PendingParallelBinding), BindingError> {
         let exporter = Zeroizing::new(exporter);
         self.check_active()?;
         let mut nonce = [0; 32];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         let mut hello = [0; HELLO_BYTES];
-        hello[..8].copy_from_slice(PREFACE);
+        hello[..8].copy_from_slice(mode.preface());
         hello[8..40].copy_from_slice(&self.0.session_id);
         hello[40..72].copy_from_slice(&nonce);
         hello[72..].copy_from_slice(&proof(
             &self.0.tx,
-            b"veil/parallel/hello/v1",
+            mode.domain("hello"),
             &self.0.session_id,
             &nonce,
             &exporter,
@@ -310,6 +495,7 @@ impl ParallelParentHandle {
                 parent: self.clone(),
                 nonce,
                 exporter,
+                mode,
             },
         ))
     }
@@ -322,15 +508,32 @@ impl ParallelParentHandle {
         hello: &[u8; HELLO_BYTES],
         exporter: [u8; 32],
     ) -> Result<([u8; 32], ParallelKeys), BindingError> {
+        self.accept_mode(hello, exporter, RecordMode::LossTolerant)
+    }
+
+    pub fn accept_reliable(
+        &self,
+        hello: &[u8; HELLO_BYTES],
+        exporter: [u8; 32],
+    ) -> Result<([u8; 32], ParallelKeys), BindingError> {
+        self.accept_mode(hello, exporter, RecordMode::Reliable)
+    }
+
+    fn accept_mode(
+        &self,
+        hello: &[u8; HELLO_BYTES],
+        exporter: [u8; 32],
+        mode: RecordMode,
+    ) -> Result<([u8; 32], ParallelKeys), BindingError> {
         let exporter = Zeroizing::new(exporter);
         self.check_active()?;
-        if &hello[..8] != PREFACE || hello[8..40] != self.0.session_id {
+        if &hello[..8] != mode.preface() || hello[8..40] != self.0.session_id {
             return Err(BindingError::InvalidProof);
         }
         let nonce: [u8; 32] = hello[40..72].try_into().expect("fixed preface");
         let expected = proof(
             &self.0.rx,
-            b"veil/parallel/hello/v1",
+            mode.domain("hello"),
             &self.0.session_id,
             &nonce,
             &exporter,
@@ -341,33 +544,38 @@ impl ParallelParentHandle {
         self.check_active()?;
         let ack = proof(
             &self.0.tx,
-            b"veil/parallel/ack/v1",
+            mode.domain("ack"),
             &self.0.session_id,
             &nonce,
             &exporter,
         );
-        Ok((ack, self.keys(&nonce, &exporter)))
+        Ok((ack, self.keys(&nonce, &exporter, mode)))
     }
 
-    fn keys(&self, nonce: &[u8; 32], exporter: &[u8; 32]) -> ParallelKeys {
+    fn keys(&self, nonce: &[u8; 32], exporter: &[u8; 32], mode: RecordMode) -> ParallelKeys {
         // Child identity is opaque; it carries no traffic class or priority.
-        let mut id = blake3::Hasher::new_derive_key("veil/parallel/session-id/v1");
+        let mut id = blake3::Hasher::new_derive_key(match mode {
+            RecordMode::LossTolerant => "veil/parallel/session-id/v1",
+            RecordMode::Reliable => "veil/parallel/reliable/session-id/v1",
+        });
         id.update(&self.0.session_id);
         id.update(nonce);
         id.update(exporter);
         ParallelKeys {
             session_id: *id.finalize().as_bytes(),
             parent: self.clone(),
+            mode,
+            exporter: Zeroizing::new(*exporter),
             tx: Zeroizing::new(proof(
                 &self.0.tx,
-                b"veil/parallel/key/v1",
+                mode.domain("key"),
                 &self.0.session_id,
                 nonce,
                 exporter,
             )),
             rx: Zeroizing::new(proof(
                 &self.0.rx,
-                b"veil/parallel/key/v1",
+                mode.domain("key"),
                 &self.0.session_id,
                 nonce,
                 exporter,
@@ -381,7 +589,7 @@ impl PendingParallelBinding {
         self.parent.check_active()?;
         let expected = proof(
             &self.parent.0.rx,
-            b"veil/parallel/ack/v1",
+            self.mode.domain("ack"),
             &self.parent.0.session_id,
             &self.nonce,
             &self.exporter,
@@ -390,10 +598,14 @@ impl PendingParallelBinding {
             return Err(BindingError::InvalidProof);
         }
         self.parent.check_active()?;
-        Ok(self.parent.keys(&self.nonce, &self.exporter))
+        Ok(self.parent.keys(&self.nonce, &self.exporter, self.mode))
     }
 }
 
 #[cfg(test)]
 #[path = "parallel_binding_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "reliable_binding_tests.rs"]
+mod reliable_tests;
