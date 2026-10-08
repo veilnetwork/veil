@@ -13,6 +13,26 @@
 //! that can move without the header noticing, and this checks that it did not.
 
 use super::*;
+
+#[tokio::test]
+async fn close_before_stream_io_subscription_does_not_admit_ready_bytes() {
+    let closed = tokio::sync::watch::Sender::new(false);
+    // An FFI call may clone its handle just before close and only enter its
+    // runtime afterwards. With no receiver yet, close must retain the signal.
+    closed.send_replace(true);
+    let entered = std::sync::atomic::AtomicBool::new(false);
+    let result = stream_io_until_closed(&closed, async {
+        entered.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(1)
+    })
+    .await;
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotConnected);
+    assert!(
+        !entered.load(std::sync::atomic::Ordering::SeqCst),
+        "a ready operation won after close before cancellation subscription"
+    );
+}
+
 #[cfg(unix)]
 #[path = "stream_sender_isolation_tests.rs"]
 mod stream_sender_isolation_tests;
