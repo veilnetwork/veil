@@ -414,6 +414,9 @@ pub mod cap_extra_flags {
     pub const SUPPORTS_NEUTRAL_FORWARD_DATAGRAMS: u8 = 1 << 4;
     /// Bounded reliable direct AppSendChunk frames. Independent of QUIC/media.
     pub const SUPPORTS_DIRECT_APP_CHUNKS: u8 = 1 << 5;
+    /// Parent-bound duplex ordered records, shared-listener dispatch and a
+    /// fixed generic child pool. Independent of QUIC; no producer role is sent.
+    pub const SUPPORTS_PARALLEL_ORDERED: u8 = 1 << 6;
 }
 
 // c: role_bits moved to veil-types alongside NodeRole.
@@ -531,6 +534,12 @@ impl CapabilitiesPayload {
     pub fn supports_duplex_parallel_quic(&self) -> bool {
         self.supports_parallel_quic()
             && self.extra_flags & cap_extra_flags::SUPPORTS_DUPLEX_PARALLEL_QUIC != 0
+    }
+
+    pub fn supports_parallel_ordered(&self) -> bool {
+        self.supports_datagram_flows()
+            && self.supports_realtime_rekey()
+            && self.extra_flags & cap_extra_flags::SUPPORTS_PARALLEL_ORDERED != 0
     }
 
     // ── Capability helpers ───────────────────────────────────────────────
@@ -2434,6 +2443,44 @@ mod tests {
         caps.extra_flags |= cap_extra_flags::SUPPORTS_PARALLEL_QUIC;
         caps.flags &= !cap_flags::SUPPORTS_REALTIME_REKEY;
         assert!(!caps.supports_shared_parallel_quic());
+    }
+
+    #[test]
+    fn ordered_children_require_their_own_marked_codec_and_rotation_support() {
+        let mut caps = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Leaf);
+        caps.flags = cap_flags::SUPPORTS_REALTIME_DATAGRAMS
+            | cap_flags::SUPPORTS_DATAGRAM_FLOWS
+            | cap_flags::SUPPORTS_REALTIME_REKEY;
+        caps.extra_flags = cap_extra_flags::SUPPORTS_PARALLEL_QUIC
+            | cap_extra_flags::SUPPORTS_SHARED_PARALLEL_QUIC
+            | cap_extra_flags::SUPPORTS_DUPLEX_PARALLEL_QUIC;
+        assert!(
+            !caps.supports_parallel_ordered(),
+            "QUIC flags do not authorize ordered children"
+        );
+        caps.extra_flags |= cap_extra_flags::SUPPORTS_PARALLEL_ORDERED;
+        assert!(
+            CapabilitiesPayload::decode(&caps.encode())
+                .unwrap()
+                .supports_parallel_ordered()
+        );
+        for flag in [
+            cap_flags::SUPPORTS_REALTIME_DATAGRAMS,
+            cap_flags::SUPPORTS_DATAGRAM_FLOWS,
+            cap_flags::SUPPORTS_REALTIME_REKEY,
+        ] {
+            let mut missing = caps.clone();
+            missing.flags &= !flag;
+            assert!(!missing.supports_parallel_ordered());
+        }
+        let mut legacy_padding = vec![caps.roles_supported, caps.flags, caps.discovery_mode];
+        legacy_padding.resize(20, 0);
+        legacy_padding[19] = cap_extra_flags::SUPPORTS_PARALLEL_ORDERED;
+        assert!(
+            !CapabilitiesPayload::decode(&legacy_padding)
+                .unwrap()
+                .supports_parallel_ordered()
+        );
     }
 
     #[test]

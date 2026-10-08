@@ -268,7 +268,7 @@ async fn runner_channels_with_partial_read(
         let caps = resumed_caps.as_ref().map(|caps| &caps[direction]);
         runner.quic_datagrams = Some(RealtimeLaneOffer {
             peer_datagrams: true,
-            handle: datagrams,
+            transport: veil_session::runner::RealtimeTransportOffer::Quic(datagrams),
             peer_rotates: caps.is_none_or(|caps| caps.supports_realtime_rekey()),
             peer_flows: caps.map_or(flows, |caps| caps.supports_datagram_flows()),
             peer_circuit_datagrams: caps.is_some_and(|caps| caps.supports_circuit_datagrams()),
@@ -616,7 +616,7 @@ async fn neutral_forward_datagrams_require_capability_and_keep_legacy_ordered_fa
             };
             runner.quic_datagrams = Some(RealtimeLaneOffer {
                 peer_datagrams: true,
-                handle: datagrams,
+                transport: veil_session::runner::RealtimeTransportOffer::Quic(datagrams),
                 peer_rotates: true,
                 peer_flows: true,
                 peer_circuit_datagrams: false,
@@ -843,7 +843,7 @@ async fn runner_circuit_datagrams_over_real_quic(
         };
         runner.quic_datagrams = offer_lane.then_some(RealtimeLaneOffer {
             peer_datagrams: true,
-            handle: datagrams,
+            transport: veil_session::runner::RealtimeTransportOffer::Quic(datagrams),
             peer_rotates: true,
             peer_flows: true,
             peer_circuit_datagrams: negotiated,
@@ -1092,7 +1092,7 @@ async fn duplex_children_through_neutral_relay(rotate: bool) {
             };
             runner.quic_datagrams = Some(RealtimeLaneOffer {
                 peer_datagrams: true,
-                handle: datagrams,
+                transport: veil_session::runner::RealtimeTransportOffer::Quic(datagrams),
                 peer_rotates: true,
                 peer_flows: true,
                 peer_circuit_datagrams: true,

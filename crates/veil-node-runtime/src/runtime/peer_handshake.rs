@@ -96,6 +96,7 @@ pub struct RemoteHandshakeInfo {
     pub supports_parallel_quic: bool,
     pub supports_shared_parallel_quic: bool,
     pub supports_duplex_parallel_quic: bool,
+    pub supports_parallel_ordered: bool,
     /// Bounded UDP reflector port advertised by this authenticated peer.
     /// The runtime combines it with transport metadata only after all session
     /// admission gates pass.
@@ -533,6 +534,7 @@ pub async fn register_connection_session(
     // the ordered-stream-only behavior exactly.
     let quic_datagrams = connection.quic_datagrams();
     let parallel_quic = connection.parallel_quic();
+    let parallel_ordered = connection.parallel_stream();
     let stream_binding = connection.stream_channel_binding();
     let mut stream = match connection.into_stream() {
         Ok(stream) => stream,
@@ -896,6 +898,9 @@ pub async fn register_connection_session(
                         supports_duplex_parallel_quic: r
                             .remote_capabilities
                             .supports_duplex_parallel_quic(),
+                        supports_parallel_ordered: r
+                            .remote_capabilities
+                            .supports_parallel_ordered(),
                         sovereign_node_id,
                         udp_reflector_port,
                         shared_udp_reflectors,
@@ -1462,29 +1467,48 @@ pub async fn register_connection_session(
         // both sides again, separately — a peer can understand the lane and
         // still keep the handshake-derived key for the session's life
         // (report12 V-M12).
-        quic_datagrams: quic_datagrams.map(|handle| veil_session::runner::RealtimeLaneOffer {
-            peer_datagrams: remote_identity.supports_realtime_datagrams,
-            handle,
-            peer_rotates: remote_identity.supports_realtime_rekey,
-            peer_flows: remote_identity.supports_datagram_flows,
-            peer_circuit_datagrams: remote_identity.supports_circuit_datagrams,
-            peer_neutral_forwards: remote_identity.supports_neutral_forward_datagrams,
-            parallel: parallel_quic
-                .filter(|handle| {
-                    remote_identity.supports_parallel_quic
-                        && (!handle.requires_shared_dispatch()
-                            || remote_identity.supports_shared_parallel_quic)
-                })
-                .map(|handle| {
-                    let offer = veil_session::runner::ParallelQuicOffer::new(handle)
-                        .with_registry(Arc::clone(&runtime.handoff.parallel));
-                    if remote_identity.supports_duplex_parallel_quic {
-                        offer.with_duplex()
-                    } else {
-                        offer
-                    }
-                }),
-        }),
+        quic_datagrams: quic_datagrams
+            .map(|handle| veil_session::runner::RealtimeLaneOffer {
+                peer_datagrams: remote_identity.supports_realtime_datagrams,
+                transport: veil_session::runner::RealtimeTransportOffer::Quic(handle),
+                peer_rotates: remote_identity.supports_realtime_rekey,
+                peer_flows: remote_identity.supports_datagram_flows,
+                peer_circuit_datagrams: remote_identity.supports_circuit_datagrams,
+                peer_neutral_forwards: remote_identity.supports_neutral_forward_datagrams,
+                parallel: parallel_quic
+                    .filter(|handle| {
+                        remote_identity.supports_parallel_quic
+                            && (!handle.requires_shared_dispatch()
+                                || remote_identity.supports_shared_parallel_quic)
+                    })
+                    .map(|handle| {
+                        let offer = veil_session::runner::ParallelQuicOffer::new(handle)
+                            .with_registry(Arc::clone(&runtime.handoff.parallel));
+                        if remote_identity.supports_duplex_parallel_quic {
+                            offer.with_duplex()
+                        } else {
+                            offer
+                        }
+                    }),
+            })
+            .or_else(|| {
+                parallel_ordered
+                    .filter(|_| remote_identity.supports_parallel_ordered)
+                    .map(|handle| veil_session::runner::RealtimeLaneOffer {
+                        peer_datagrams: true,
+                        transport: veil_session::runner::RealtimeTransportOffer::Ordered(
+                            veil_session::runner::ParallelOrderedOffer::new(
+                                handle,
+                                runtime.handoff.parallel.clone(),
+                            ),
+                        ),
+                        peer_rotates: remote_identity.supports_realtime_rekey,
+                        peer_flows: remote_identity.supports_datagram_flows,
+                        peer_circuit_datagrams: remote_identity.supports_circuit_datagrams,
+                        peer_neutral_forwards: remote_identity.supports_neutral_forward_datagrams,
+                        parallel: None,
+                    })
+            }),
         metrics: runtime.metrics.clone(),
         peer_id: remote_identity.node_id,
         peer_instance_id,

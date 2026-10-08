@@ -6671,6 +6671,9 @@ fn aad_for_ciphertext(
 #[path = "runner_tests/opaque_datagram_tests.rs"]
 mod opaque_datagram_tests;
 
+#[path = "runner_tests/ordered_datagram_tests.rs"]
+mod ordered_datagram_tests;
+
 #[path = "runner_tests/source_stream_budget_tests.rs"]
 mod source_stream_budget_tests;
 

@@ -1234,6 +1234,7 @@ fn local_capabilities(
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_PARALLEL_QUIC;
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_SHARED_PARALLEL_QUIC;
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_DUPLEX_PARALLEL_QUIC;
+    caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_PARALLEL_ORDERED;
     caps
 }
 
