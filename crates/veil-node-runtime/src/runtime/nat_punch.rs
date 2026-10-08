@@ -625,10 +625,15 @@ impl NodeServices {
             );
             return Outcome::RefusedAnonymous;
         }
-        // Idempotent short-circuit: a live direct session already exists
-        // (same registry signal `PnetStatusProvider` derives `admitted`
-        // from — sessions appear there only after a completed handshake).
-        if self.has_live_session(&peer_node_id) {
+        // A TX sender can be reserved before a handshake is committed and
+        // can outlive a partially abandoned setup. It is not the admission
+        // proof queried by callers. Use the same completed-session snapshot
+        // as PnetStatusProvider, including verified sovereign aliases.
+        let status = crate::pnet_status_provider::DaemonPnetStatus::new(
+            Arc::clone(&self.verified_peer_certs),
+            Arc::clone(&self.live_sessions),
+        );
+        if status.is_admitted(&peer_node_id) {
             return Outcome::Connected;
         }
         // Single-flight: either claim the peer's slot (initiator) or join
