@@ -97,6 +97,7 @@ pub struct RemoteHandshakeInfo {
     pub supports_shared_parallel_quic: bool,
     pub supports_duplex_parallel_quic: bool,
     pub supports_parallel_ordered: bool,
+    pub supports_reliable_parallel: bool,
     /// Bounded UDP reflector port advertised by this authenticated peer.
     /// The runtime combines it with transport metadata only after all session
     /// admission gates pass.
@@ -901,6 +902,9 @@ pub async fn register_connection_session(
                         supports_parallel_ordered: r
                             .remote_capabilities
                             .supports_parallel_ordered(),
+                        supports_reliable_parallel: r
+                            .remote_capabilities
+                            .supports_reliable_parallel(),
                         sovereign_node_id,
                         udp_reflector_port,
                         shared_udp_reflectors,
@@ -1484,6 +1488,13 @@ pub async fn register_connection_session(
                     .map(|handle| {
                         let offer = veil_session::runner::ParallelQuicOffer::new(handle)
                             .with_registry(Arc::clone(&runtime.handoff.parallel));
+                        let offer = if remote_identity.supports_reliable_parallel
+                            && remote_identity.supports_duplex_parallel_quic
+                        {
+                            offer.with_reliable()
+                        } else {
+                            offer
+                        };
                         if remote_identity.supports_duplex_parallel_quic {
                             offer.with_duplex()
                         } else {
@@ -1496,12 +1507,17 @@ pub async fn register_connection_session(
                     .filter(|_| remote_identity.supports_parallel_ordered)
                     .map(|handle| veil_session::runner::RealtimeLaneOffer {
                         peer_datagrams: true,
-                        transport: veil_session::runner::RealtimeTransportOffer::Ordered(
-                            veil_session::runner::ParallelOrderedOffer::new(
+                        transport: veil_session::runner::RealtimeTransportOffer::Ordered({
+                            let offer = veil_session::runner::ParallelOrderedOffer::new(
                                 handle,
                                 runtime.handoff.parallel.clone(),
-                            ),
-                        ),
+                            );
+                            if remote_identity.supports_reliable_parallel {
+                                offer.with_reliable()
+                            } else {
+                                offer
+                            }
+                        }),
                         peer_rotates: remote_identity.supports_realtime_rekey,
                         peer_flows: remote_identity.supports_datagram_flows,
                         peer_circuit_datagrams: remote_identity.supports_circuit_datagrams,

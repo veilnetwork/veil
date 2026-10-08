@@ -1235,6 +1235,7 @@ fn local_capabilities(
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_SHARED_PARALLEL_QUIC;
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_DUPLEX_PARALLEL_QUIC;
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_PARALLEL_ORDERED;
+    caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_RELIABLE_PARALLEL;
     caps
 }
 
@@ -2442,6 +2443,8 @@ mod tests {
         assert!(r2.remote_capabilities.supports_circuit_datagrams());
         assert!(r1.remote_capabilities.supports_direct_app_chunks());
         assert!(r2.remote_capabilities.supports_direct_app_chunks());
+        assert!(r1.remote_capabilities.supports_reliable_parallel());
+        assert!(r2.remote_capabilities.supports_reliable_parallel());
 
         // Node IDs are BLAKE3(verifying_key_bytes), not BLAKE3(seed).
         let id_a = test_identity(0xAA).node_id;
@@ -3176,6 +3179,8 @@ mod tests {
         // Fresh authenticated statements retain independent transports on
         // reconnect and reflect settings changed after the ticket was issued.
         assert!(srv2.remote_caps_stated && cli2.remote_caps_stated);
+        assert!(srv2.remote_capabilities.supports_reliable_parallel());
+        assert!(cli2.remote_capabilities.supports_reliable_parallel());
         for result in [&srv2, &cli2] {
             assert!(result.remote_capabilities.supports_circuit_datagrams());
             assert!(result.remote_capabilities.supports_shared_parallel_quic());

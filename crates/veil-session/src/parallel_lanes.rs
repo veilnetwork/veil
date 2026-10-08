@@ -49,12 +49,13 @@ impl ParallelDiagnostics {
     pub fn reliable_full_writer_bypasses(&self) -> u64 {
         self.reliable_full_writer_bypasses.load(Ordering::Relaxed)
     }
-    pub(crate) fn note_reliable_frame(&self, canonical_full: bool) {
-        self.reliable_frames.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn note_reliable_frame(&self, canonical_full: bool) -> bool {
+        let first = self.reliable_frames.fetch_add(1, Ordering::Relaxed) == 0;
         if canonical_full {
             self.reliable_full_writer_bypasses
                 .fetch_add(1, Ordering::Relaxed);
         }
+        first
     }
     pub(super) fn connection_opened(&self) {
         self.active.fetch_add(1, Ordering::AcqRel);
@@ -543,8 +544,8 @@ impl Drop for ParallelSession {
 }
 
 impl ParallelSession {
-    pub(super) fn note_reliable_frame(&self, canonical_full: bool) {
-        self.offer.diagnostics.note_reliable_frame(canonical_full);
+    pub(super) fn note_reliable_frame(&self, canonical_full: bool) -> bool {
+        self.offer.diagnostics.note_reliable_frame(canonical_full)
     }
     pub(super) fn reliable(&self) -> Option<&super::reliable_session::ReliableSession> {
         self.reliable.as_ref()
