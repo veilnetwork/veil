@@ -9,6 +9,7 @@ clang++ -std=c++20 -Wall -Wextra -Werror -Wl,-export_dynamic \
   -I"$ROOT/src" "$ROOT/test/audio_playout_smoke.cc" \
   "$STAND_DIR/libveil_media.dylib" -Wl,-rpath,"$STAND_DIR" -o "$STAND_DIR/smoke"
 "$STAND_DIR/smoke" --silence
+"$STAND_DIR/smoke" --silence-after-jitter
 "$STAND_DIR/smoke"
 "$STAND_DIR/smoke" --handover
 "$STAND_DIR/smoke" --asymmetric-handover
