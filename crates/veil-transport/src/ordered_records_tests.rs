@@ -54,29 +54,23 @@ async fn duplex_records_flush_the_last_buffered_record_and_preserve_boundaries()
 }
 
 #[tokio::test]
-async fn queued_expiry_preserves_in_flight_bytes_and_skips_only_unsent_records() {
-    let (a, mut peer) = tokio::io::duplex(1);
+async fn queued_expiry_skips_unsent_records_and_preserves_the_live_child() {
+    let (mut a, mut peer) = tokio::io::duplex(1);
+    // Hold every record before its first byte. Unlike a partial expired
+    // prefix, these can be skipped safely on this same connection.
+    a.write_all(b"x").await.unwrap();
     let plane = OrderedRecordPlane::new(Box::new(a));
     let h = plane.handle();
-    h.send_before(&[0x42; 64], Instant::now() + Duration::from_millis(30))
-        .unwrap();
-    // Prove a partial prefix was actually written before its deadline.
-    assert_eq!(peer.read_u8().await.unwrap(), 0);
     for _ in 0..5 {
         h.send_before(b"obsolete", Instant::now() + Duration::from_millis(30))
             .unwrap();
     }
     h.send(b"fresh").unwrap();
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    assert!(h.progress().active_record_age.unwrap() >= Duration::from_millis(30));
-    assert!(h.progress().reserved_bytes >= 66 + 6 * MIN_RECORD_CHARGE);
-    // Expiry must not abandon an already-started record or lose framing.
-    assert_eq!(peer.read_u8().await.unwrap(), 64);
-    let mut first = [0; 64];
-    peer.read_exact(&mut first).await.unwrap();
-    assert_eq!(first, [0x42; 64]);
+    until(|| h.progress().expired_records == 5).await;
+    assert!(h.max_size().is_some());
+    assert_eq!(peer.read_u8().await.unwrap(), b'x');
     assert_eq!(raw_record(&mut peer).await, b"fresh");
-    until(|| h.progress().completed_records == 2 && h.progress().expired_records == 5).await;
+    until(|| h.progress().completed_records == 1 && h.progress().expired_records == 5).await;
     assert_eq!(h.send_buffer_space(), RECORD_BUFFER_BYTES);
 }
 
@@ -188,6 +182,94 @@ async fn incomplete_write_timeout_closes_the_whole_plane_without_resuming_framin
     assert_eq!(h.send(b"next"), Err(RecordSendError::Closed));
     assert_eq!(h.progress().completed_records, 0);
     until(|| plane.tasks.iter().all(|task| task.is_finished())).await;
+    assert_eq!(h.0.capacity.available_permits(), RECORD_BUFFER_BYTES);
+}
+
+#[tokio::test]
+async fn partial_record_expiry_retires_only_its_child_and_a_fresh_child_can_deliver() {
+    let (a, mut peer) = tokio::io::duplex(1);
+    let plane = OrderedRecordPlane::new(Box::new(a));
+    let h = plane.handle();
+    h.send_before(&[0x42; 64], Instant::now() + Duration::from_millis(40))
+        .unwrap();
+    // A real prefix entered the transport, so skipping this record and using
+    // its old connection for another prefix would corrupt the framing.
+    assert_eq!(peer.read_u8().await.unwrap(), 0);
+    h.send(b"must not follow the partial record").unwrap();
+
+    let (left, right) = tokio::io::duplex(4096);
+    let survivor = OrderedRecordPlane::new(Box::new(left));
+    let survivor_peer = OrderedRecordPlane::new(Box::new(right));
+    survivor.handle().send(b"independent child").unwrap();
+    assert_eq!(
+        timeout(Duration::from_millis(100), survivor_peer.handle().recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        b"independent child"
+    );
+    timeout(Duration::from_millis(200), h.closed())
+        .await
+        .expect("partial expired record retained its child beyond its useful lifetime");
+    until(|| plane.tasks.iter().all(|task| task.is_finished())).await;
+    assert_eq!(h.progress().completed_records, 0);
+    assert_eq!(h.progress().expired_records, 1);
+    assert_eq!(h.0.capacity.available_permits(), RECORD_BUFFER_BYTES);
+    assert_eq!(h.send(b"old connection"), Err(RecordSendError::Closed));
+    let mut tail = Vec::new();
+    timeout(Duration::from_millis(100), peer.read_to_end(&mut tail))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tail.len() < 65,
+        "expired record completed or another prefix followed it"
+    );
+
+    let (left, right) = tokio::io::duplex(4096);
+    let replacement = OrderedRecordPlane::new(Box::new(left));
+    let replacement_peer = OrderedRecordPlane::new(Box::new(right));
+    replacement.handle().send(b"fresh replacement").unwrap();
+    assert_eq!(
+        replacement_peer.handle().recv().await.unwrap(),
+        b"fresh replacement"
+    );
+    survivor.handle().send(b"survivor still lives").unwrap();
+    assert_eq!(
+        survivor_peer.handle().recv().await.unwrap(),
+        b"survivor still lives"
+    );
+}
+
+#[tokio::test]
+async fn generic_partial_record_has_the_same_bounded_lifetime_without_a_role_or_deadline() {
+    let (a, mut peer) = tokio::io::duplex(1);
+    let plane = OrderedRecordPlane::new(Box::new(a));
+    let h = plane.handle();
+    h.send(&[0x33; 64]).unwrap();
+    assert_eq!(peer.read_u8().await.unwrap(), 0);
+    timeout(Duration::from_millis(350), h.closed())
+        .await
+        .expect("generic partial record held its child after the residence budget");
+    until(|| plane.tasks.iter().all(|task| task.is_finished())).await;
+    assert_eq!(h.0.capacity.available_permits(), RECORD_BUFFER_BYTES);
+}
+
+#[tokio::test]
+async fn buffered_plaintext_acceptance_does_not_extend_the_flush_deadline() {
+    let (a, mut peer) = tokio::io::duplex(1);
+    let plane = OrderedRecordPlane::new(Box::new(tokio::io::BufWriter::with_capacity(8192, a)));
+    let h = plane.handle();
+    h.send_before(&[0x44; 64], Instant::now() + Duration::from_millis(40))
+        .unwrap();
+    assert_eq!(peer.read_u8().await.unwrap(), 0);
+    assert!(h.progress().reserved_bytes >= 66);
+    timeout(Duration::from_millis(200), h.closed())
+        .await
+        .unwrap();
+    until(|| plane.tasks.iter().all(|task| task.is_finished())).await;
+    assert_eq!(h.progress().completed_records, 0);
+    assert_eq!(h.progress().expired_records, 1);
     assert_eq!(h.0.capacity.available_permits(), RECORD_BUFFER_BYTES);
 }
 
