@@ -54,6 +54,38 @@ async fn until(mut condition: impl FnMut() -> bool) {
 }
 
 #[tokio::test]
+async fn cancelled_uncommitted_reservation_releases_credits_without_consuming_nonce() {
+    let (_a, _b, a, b) = bound_pair(64);
+    let a = ReliableFrameChannel::new(a);
+    let b = ReliableFrameChannel::new(b);
+    let handle = a.handle();
+    let reserved = handle.try_reserve(&frame(3, 100).frame.1).unwrap();
+    assert!(handle.buffered_bytes() > 0);
+    drop(reserved);
+    assert_eq!(handle.buffered_bytes(), 0);
+    let receipt = admit(&handle, frame(4, 100));
+    assert_eq!(
+        &b.handle().recv().await.unwrap()[HEADER_SIZE..],
+        vec![4; 100]
+    );
+    receipt.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn parent_retirement_rejects_a_preexisting_reservation_synchronously() {
+    let (parent, _b, a, _peer) = bound_pair(64);
+    let a = ReliableFrameChannel::new(a);
+    let handle = a.handle();
+    let reserved = handle.try_reserve(&frame(3, 100).frame.1).unwrap();
+    parent.retire();
+    assert!(matches!(
+        reserved.commit(frame(3, 100)),
+        Err(FrameAdmissionError::Closed(_))
+    ));
+    assert_eq!(handle.buffered_bytes(), 0);
+}
+
+#[tokio::test]
 async fn cancelled_receipt_keeps_admitted_frame_and_following_cipher_nonces() {
     timeout(Duration::from_secs(3), async {
         let (_a, _b, a, b) = bound_pair(1);

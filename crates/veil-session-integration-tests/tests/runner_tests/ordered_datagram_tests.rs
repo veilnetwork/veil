@@ -227,7 +227,10 @@ async fn run(rotate: bool) {
     .expect("duplex pool did not become ready at both endpoints");
     assert_eq!(diagnostics[0].active_connections(), 6);
     assert_eq!(diagnostics[1].active_connections(), 6);
-    assert_eq!(a_offer.available_connection_slots(), 1);
+    assert_eq!(
+        a_offer.available_connection_slots(),
+        veil_transport::stream_parallel::StreamParallelHandle::CONNECTIONS_PER_DIRECTION - 6
+    );
     if !rotate {
         // Reliable writers really enter Pending before media is submitted.
         for direction in 0..2 {

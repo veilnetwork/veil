@@ -20,6 +20,31 @@ use veil_types::NodeIdBytes;
 use crate::FrameDispatcher;
 
 impl DispatcherSink for FrameDispatcher {
+    fn abort_app_stream(
+        &self,
+        peer: NodeIdBytes,
+        stream: u32,
+        app: [u8; 32],
+        endpoint: u32,
+        notify: bool,
+    ) {
+        if notify {
+            self.app_registry.route_stream_close(app, endpoint, stream);
+        }
+        self.stream_table.close(&peer, stream);
+        self.veil_stream_rx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(peer, stream));
+        if let Some(receipt) = self
+            .pending_stream_receipts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(peer, stream))
+        {
+            let _ = receipt.send(veil_proto::app::receipt_status::REJECTED);
+        }
+    }
     fn dispatch(&self, header: &FrameHeader, body: &[u8], peer_id: NodeIdBytes) -> DispatchResult {
         FrameDispatcher::dispatch(self, header, body, peer_id)
     }
