@@ -253,6 +253,21 @@ impl<S> Obfs4Stream<S> {
         }
     }
 
+    /// Borrow the underlying stream for read-only socket diagnostics.
+    /// Do not perform I/O through this reference: it would bypass framing.
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
+
+    /// Ciphertext bytes still waiting for the underlying writer. This is
+    /// local wrapper state, not bytes buffered by TCP or the remote peer.
+    pub fn pending_ciphertext_bytes(&self) -> usize {
+        match &self.write_state {
+            WriteState::Idle => 0,
+            WriteState::Writing { frame, offset } => frame.len() - offset,
+        }
+    }
+
     /// Consume the wrapper and return the underlying stream.  Useful
     /// for test cleanup; do NOT call mid-stream — any buffered
     /// plaintext or ciphertext is lost.
@@ -537,6 +552,37 @@ mod tests {
             server.read_exact(&mut buf).await.unwrap();
             assert_eq!(buf, payload);
         }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_observe_buffered_ciphertext_without_consuming_it() {
+        let (client_raw, server_raw) = duplex(64 * 1024);
+        let psk = test_psk();
+        let (client, server) = tokio::join!(
+            obfs4_client_connect(client_raw, &psk),
+            obfs4_server_accept(server_raw, &psk),
+        );
+        let mut client = client.unwrap();
+        let mut server = server.unwrap();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let payload = [0x31; 1024];
+        let mut committed = 0;
+        loop {
+            match Pin::new(&mut client).poll_write(&mut cx, &payload) {
+                Poll::Ready(Ok(n)) => committed += n,
+                Poll::Pending => break,
+                result => panic!("unexpected write result: {result:?}"),
+            }
+            assert!(committed <= 128 * 1024, "duplex buffer must exert pressure");
+        }
+        assert!(client.pending_ciphertext_bytes() > 0);
+        let _borrowed = client.get_ref();
+        let mut received = vec![0; committed];
+        let (flushed, read) = tokio::join!(client.flush(), server.read_exact(&mut received));
+        flushed.unwrap();
+        read.unwrap();
+        assert!(received.iter().all(|b| *b == 0x31));
+        assert_eq!(client.pending_ciphertext_bytes(), 0);
     }
 
     #[tokio::test]

@@ -33,6 +33,8 @@ pub mod rotation;
 pub mod socks;
 /// Plain TCP transport.
 pub mod tcp;
+/// Opt-in local TCP write diagnostics; no protocol or scheduling changes.
+pub mod tcp_trace;
 /// TLS transport (rustls by default).
 pub mod tls;
 /// BoringSSL-backed TLS transport used under `tls-boring`.
