@@ -6090,6 +6090,9 @@ impl SessionRunner {
             .dispatch(&h, &frame[veil_proto::header::HEADER_SIZE..], self.peer_id)
         {
             DispatchResult::Response(response) => {
+                // A slow IPC reader may make the dispatcher respond with Close.
+                // Keep that close abortable until the remote receipt arrives.
+                streams.admitted(&response, reliable_streams::Route::Child(child));
                 if let Err(reason) = replies.push(child, response) {
                     self.record_violation(reason);
                     return true;
