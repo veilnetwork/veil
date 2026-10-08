@@ -359,3 +359,128 @@ async fn authenticated_records_progress_while_the_canonical_tcp_write_is_blocked
     assert_eq!(server.handle().recv().await.unwrap(), b"sibling survives");
     assert_eq!(f.diagnostics.active_connections(), 2);
 }
+
+/// Preserve the real obfs4 connection and its exporter proof while holding its
+/// record write after one accepted plaintext byte. Read/close stay real I/O.
+struct HoldRecordWrite {
+    stream: BoxIoStream,
+    progressed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl tokio::io::AsyncRead for HoldRecordWrite {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for HoldRecordWrite {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use std::sync::atomic::Ordering;
+        if self.progressed.load(Ordering::Acquire) {
+            return std::task::Poll::Pending;
+        }
+        let result = std::pin::Pin::new(&mut self.stream).poll_write(cx, &buf[..buf.len().min(1)]);
+        if matches!(&result, std::task::Poll::Ready(Ok(n)) if *n > 0) {
+            self.progressed.store(true, Ordering::Release);
+        }
+        result
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test]
+async fn expired_ordered_child_closes_real_obfs4_io_reclaims_its_lease_and_keeps_parent_alive() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut f = Fixture::new(8).await;
+    let (outcome, mut client) = f.dispatch(None, true).await;
+    assert!(matches!(outcome, ParallelPeekOutcome::Bound));
+    let child = f.incoming.recv().await.unwrap();
+    let server = child.finish().await.unwrap();
+    let mut ack = [0; 32];
+    client.stream.read_exact(&mut ack).await.unwrap();
+    let keys = client.pending.finish(&ack).unwrap();
+    let progressed = Arc::new(AtomicBool::new(false));
+    let client = keys
+        .into_ordered(Box::new(HoldRecordWrite {
+            stream: client.stream,
+            progressed: progressed.clone(),
+        }))
+        .unwrap();
+    client
+        .handle()
+        .send_before(
+            b"expired partial record",
+            std::time::Instant::now() + Duration::from_millis(80),
+        )
+        .unwrap();
+    timeout(Duration::from_millis(200), async {
+        while !progressed.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let (outcome, sibling) = f.dispatch(None, true).await;
+    assert!(matches!(outcome, ParallelPeekOutcome::Bound));
+    let bound = f.incoming.recv().await.unwrap();
+    let (sibling_server, sibling) = tokio::join!(bound.finish(), sibling.finish());
+    let sibling_server = sibling_server.unwrap();
+    sibling.handle().send(b"sibling survives").unwrap();
+    assert_eq!(
+        sibling_server.handle().recv().await.unwrap(),
+        b"sibling survives"
+    );
+    timeout(Duration::from_millis(300), client.handle().closed())
+        .await
+        .unwrap();
+    timeout(Duration::from_millis(300), server.handle().closed())
+        .await
+        .unwrap();
+    // This is the same ownership cleanup the normal pool performs on finding
+    // a closed child. Its canonical credentials remain live throughout.
+    drop(server);
+    drop(client);
+    assert_eq!(f.diagnostics.active_connections(), 1);
+    f.main_survives().await;
+
+    let (outcome, replacement) = f.dispatch(None, true).await;
+    assert!(matches!(outcome, ParallelPeekOutcome::Bound));
+    let bound = f.incoming.recv().await.unwrap();
+    let (replacement_server, replacement) = tokio::join!(bound.finish(), replacement.finish());
+    let replacement_server = replacement_server.unwrap();
+    replacement.handle().send(b"fresh proof and keys").unwrap();
+    assert_eq!(
+        replacement_server.handle().recv().await.unwrap(),
+        b"fresh proof and keys"
+    );
+    sibling_server
+        .handle()
+        .send(b"return path still alive")
+        .unwrap();
+    assert_eq!(
+        sibling.handle().recv().await.unwrap(),
+        b"return path still alive"
+    );
+    assert_eq!(f.diagnostics.active_connections(), 2);
+    f.main_survives().await;
+}

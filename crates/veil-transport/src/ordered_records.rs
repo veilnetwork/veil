@@ -24,8 +24,12 @@ pub const RECORD_BUFFER_BYTES: usize = crate::REALTIME_DATAGRAM_BUFFER_BYTES;
 // Bound tiny-record metadata as well as payload bytes. At most 1638 admitted
 // records can exist, including the record currently being written.
 const MIN_RECORD_CHARGE: usize = 40;
-const WRITE_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
 pub const RECORD_RECEIVE_MAX_AGE: Duration = Duration::from_millis(200);
+// These connections carry loss-tolerant records only. A partially written
+// record cannot be skipped on TCP, but keeping its child for 30 seconds also
+// keeps its source slot unusable. Apply the same bounded lifetime to every
+// record; there is no producer-specific transport policy or wire deadline.
+const WRITE_COMPLETION_TIMEOUT: Duration = RECORD_RECEIVE_MAX_AGE;
 
 /// Exact local queue reservation, including the framing prefix and the tiny
 /// record metadata floor. Session admission must use this rather than payload
@@ -48,7 +52,7 @@ pub enum RecordSendError {
 
 struct Record {
     wire: Vec<u8>,
-    expires_at: Option<Instant>,
+    expires_at: Instant,
     // Retained through the final flush, not released on queue dequeue or on
     // plaintext acceptance by a buffered transport.
     _bytes: OwnedSemaphorePermit,
@@ -132,12 +136,14 @@ impl OrderedRecordHandle {
         }
     }
 
-    /// Admission only. In-flight TCP bytes cannot be retracted or expired.
+    /// Admission only. All records share a bounded local lifetime. A partial
+    /// write that exceeds it retires the child; TCP bytes cannot be retracted.
     pub fn send(&self, payload: &[u8]) -> Result<(), RecordSendError> {
         self.enqueue(payload, None)
     }
 
-    /// A local monotonic deadline, enforced before writing any record bytes.
+    /// A tighter local deadline. Before any bytes are written, expiry skips
+    /// only this record. After progress, expiry closes the entire child.
     pub fn send_before(&self, payload: &[u8], expires_at: Instant) -> Result<(), RecordSendError> {
         self.enqueue(payload, Some(expires_at))
     }
@@ -149,9 +155,15 @@ impl OrderedRecordHandle {
         if payload.is_empty() || payload.len() > MAX_RECORD_BYTES {
             return Err(RecordSendError::TooLarge);
         }
-        if expires_at.is_some_and(|at| at <= Instant::now()) {
+        let now = Instant::now();
+        if expires_at.is_some_and(|at| at <= now) {
             return Err(RecordSendError::Expired);
         }
+        // Bound queued residence as well as one active write. A backlog must
+        // not give each old record a fresh 200 ms budget when it is dequeued.
+        let expires_at = expires_at
+            .unwrap_or(now + RECORD_RECEIVE_MAX_AGE)
+            .min(now + RECORD_RECEIVE_MAX_AGE);
         let charge = record_queue_charge(payload.len()) as u32;
         let permit = Arc::clone(&self.0.capacity)
             .try_acquire_many_owned(charge)
@@ -365,7 +377,7 @@ async fn write_records<W: tokio::io::AsyncWrite + Unpin>(
     let _close = CloseOnExit(handle.clone());
     let writing = async {
         while let Some(record) = outgoing.recv().await {
-            if record.expires_at.is_some_and(|at| at <= Instant::now()) {
+            if record.expires_at <= Instant::now() {
                 let mut p = handle.0.progress.lock().unwrap_or_else(|e| e.into_inner());
                 p.expired = p.expired.saturating_add(1);
                 continue;
@@ -381,19 +393,29 @@ async fn write_records<W: tokio::io::AsyncWrite + Unpin>(
                 // successful write: Pending consumed no bytes. Once even one
                 // prefix byte is accepted, finish this record or close the
                 // entire child. Otherwise subsequent framing is corrupted.
-                let first = match record.expires_at {
-                    Some(at) => tokio::select! {
-                        biased;
-                        _ = tokio::time::sleep_until(at.into()) => return Ok(false),
-                        result = writer.write(&record.wire) => result?,
-                    },
-                    None => writer.write(&record.wire).await?,
+                let first = tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(record.expires_at.into()) => return Ok(false),
+                    result = writer.write(&record.wire) => result?,
                 };
                 if first == 0 {
                     return Err(io::ErrorKind::WriteZero.into());
                 }
-                writer.write_all(&record.wire[first..]).await?;
-                writer.flush().await?;
+                let finish = async {
+                    writer.write_all(&record.wire[first..]).await?;
+                    writer.flush().await
+                };
+                // Once the prefix has progressed, cancellation for a stale
+                // record must close this child, never enqueue another prefix.
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(record.expires_at.into()) => {
+                        let mut p = handle.0.progress.lock().unwrap_or_else(|e| e.into_inner());
+                        p.expired = p.expired.saturating_add(1);
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "partial record expired"));
+                    },
+                    result = finish => result?,
+                }
                 Ok::<_, io::Error>(true)
             };
             // Timeout/cancellation ends this entire connection; never resume
