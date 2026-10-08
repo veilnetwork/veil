@@ -1,0 +1,341 @@
+use super::*;
+use crate::frame_outbox::FrameEnvelope;
+use reliable_session::{ReliableEvent, ReliableReady};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::{Duration, timeout};
+use veil_transport::{
+    PunchedQuicRole, Transport, TransportContext, TransportListener, TransportUri,
+    obfs4_tcp::Obfs4TcpTransport, promote_punched_quic,
+};
+
+fn app_frame(byte: u8) -> FrameEnvelope {
+    let body = veil_proto::app::AppDataPayload {
+        app_id: [0x55; 32],
+        endpoint_id: 17,
+        seq: 0,
+        data: vec![byte; 2048],
+    }
+    .encode();
+    let mut h = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppData as u16);
+    h.stream_id = 19;
+    h.body_len = body.len() as u32;
+    FrameEnvelope::from((
+        veil_proto::priority::INTERACTIVE,
+        veil_bufpool::pooled_shared_from_vec(veil_proto::codec::encode_frame(&h, &body)),
+    ))
+}
+
+async fn until(mut condition: impl FnMut() -> bool) {
+    timeout(Duration::from_secs(5), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+fn send(ready: &ReliableReady, byte: u8) -> crate::reliable_frames::FrameReceipt {
+    match ready.handle().try_send(app_frame(byte)) {
+        Ok(receipt) => receipt,
+        Err(_) => panic!("reliable admission failed"),
+    }
+}
+
+async fn receive(pool: &reliable_session::ReliableSession, byte: u8) {
+    loop {
+        match pool.next().await {
+            ReliableEvent::Changed => {}
+            ReliableEvent::Stopped => panic!("pool stopped before expected frame"),
+            ReliableEvent::Frame { result, .. } => {
+                let frame = result.unwrap();
+                let data = veil_proto::app::AppDataPayload::decode(
+                    &frame[veil_proto::header::HEADER_SIZE..],
+                )
+                .unwrap();
+                assert_eq!(data.seq, 0);
+                assert_eq!(data.data, vec![byte; 2048]);
+                return;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn reliable_pool_worker_exit_retires_snapshot_and_returns_a_terminal_event() {
+    timeout(Duration::from_secs(10), async {
+        let mut f = OrderedFixture::new().await;
+        let ready = f.a.reliable().unwrap().ready().unwrap();
+        let peer = f.b.reliable().unwrap().ready().unwrap();
+        send(&peer, 9).wait().await.unwrap();
+        until(|| ready.handle().record_progress().received_records == 1).await;
+        // Drop the actual canonical TCP owner while the OVL1 fixture's parent
+        // object and retained reliable snapshot remain alive.
+        f.main[0] = broken_stream_sentinel();
+        until(|| f.a.reliable().unwrap().ready().is_none()).await;
+        assert!(ready.handle().recv().await.is_err());
+        loop {
+            match f.a.reliable().unwrap().next().await {
+                ReliableEvent::Changed => {}
+                ReliableEvent::Stopped => break,
+                _ => panic!("unexpected frame after parent transport stopped"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+struct OrderedFixture {
+    a: ordered_lanes::OrderedSession,
+    b: ordered_lanes::OrderedSession,
+    outgoing: veil_transport::stream_parallel::StreamParallelHandle,
+    diagnostics: [Arc<ParallelDiagnostics>; 2],
+    main: [BoxIoStream; 2],
+    accepts: tokio::task::JoinHandle<()>,
+}
+impl Drop for OrderedFixture {
+    fn drop(&mut self) {
+        self.accepts.abort();
+    }
+}
+
+impl OrderedFixture {
+    async fn new() -> Self {
+        let mut context = TransportContext::for_debug().unwrap();
+        context.obfs4_psk = Some(Arc::new([0x42; 32]));
+        let context = Arc::new(context);
+        let listener: Arc<dyn TransportListener> = Arc::from(
+            Obfs4TcpTransport
+                .bind(
+                    &TransportUri::Obfs4Tcp {
+                        host: "127.0.0.1".into(),
+                        port: 0,
+                    },
+                    context.clone(),
+                )
+                .await
+                .unwrap(),
+        );
+        let port = listener
+            .local_addr()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let uri = TransportUri::Obfs4Tcp {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let (a, b) = tokio::join!(Obfs4TcpTransport.connect(&uri, context), listener.accept());
+        let a = a.unwrap();
+        let b = b.unwrap();
+        let outgoing = a.parallel_stream().unwrap();
+        let incoming = b.parallel_stream().unwrap();
+        assert!(outgoing.can_connect());
+        assert!(!incoming.can_connect());
+        let registry = Arc::new(ParallelRegistry::default());
+        let a_offer =
+            ParallelOrderedOffer::new(outgoing.clone(), Arc::new(ParallelRegistry::default()))
+                .with_reliable();
+        let b_offer = ParallelOrderedOffer::new(incoming, registry.clone()).with_reliable();
+        let diagnostics = [a_offer.diagnostics(), b_offer.diagnostics()];
+        let ctx = ordered_receiver_tests::pool_fixture_context();
+        let a_session = ordered_lanes::OrderedSession::new(
+            a_offer,
+            &[2; 32],
+            &[3; 32],
+            [1; 32],
+            ctx.clone(),
+            None,
+        );
+        let b_session =
+            ordered_lanes::OrderedSession::new(b_offer, &[3; 32], &[2; 32], [1; 32], ctx, None);
+        let accepts = tokio::spawn(async move {
+            loop {
+                let child = listener.accept().await.unwrap();
+                let binding = child.stream_channel_binding();
+                assert!(matches!(
+                    registry
+                        .peek_and_dispatch_with_binding(child.into_stream().unwrap(), None, binding)
+                        .await,
+                    ParallelPeekOutcome::Bound
+                ));
+            }
+        });
+        let result = Self {
+            a: a_session,
+            b: b_session,
+            outgoing,
+            diagnostics,
+            main: [a.into_stream().unwrap(), b.into_stream().unwrap()],
+            accepts,
+        };
+        until(|| {
+            result.a.reliable().unwrap().ready().is_some()
+                && result.b.reliable().unwrap().ready().is_some()
+        })
+        .await;
+        result
+    }
+    async fn canonical_survives(&mut self) {
+        self.main[0].write_all(b"alive").await.unwrap();
+        self.main[0].flush().await.unwrap();
+        let mut bytes = [0; 5];
+        self.main[1].read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"alive");
+    }
+}
+
+#[tokio::test]
+async fn reliable_ordered_session_prewarms_one_duplex_child_and_preserves_replacement_capacity() {
+    timeout(Duration::from_secs(10), async {
+        let mut f = OrderedFixture::new().await;
+        until(|| f.diagnostics.iter().all(|d| d.active_connections() == 7)).await;
+        assert_eq!(
+            f.outgoing.available_connection_slots(),
+            1,
+            "six expiring + one reliable leave a replacement"
+        );
+        let a = f.a.reliable().unwrap().ready().unwrap();
+        let b = f.b.reliable().unwrap().ready().unwrap();
+        assert_eq!(a.id(), b.id());
+        let receipt = send(&a, 1);
+        receive(f.b.reliable().unwrap(), 1).await;
+        receipt.wait().await.unwrap();
+        let receipt = send(&b, 2);
+        receive(f.a.reliable().unwrap(), 2).await;
+        receipt.wait().await.unwrap();
+        f.canonical_survives().await;
+        let retained = a.handle();
+        f.a.rekey(&[4; 32], &[5; 32], [6; 32]);
+        f.b.rekey(&[5; 32], &[4; 32], [6; 32]);
+        assert!(retained.recv().await.is_err());
+        until(|| {
+            f.a.reliable().unwrap().ready().is_some() && f.b.reliable().unwrap().ready().is_some()
+        })
+        .await;
+        let fresh = f.a.reliable().unwrap().ready().unwrap();
+        assert_ne!(fresh.id(), a.id());
+        let receipt = send(&fresh, 3);
+        receive(f.b.reliable().unwrap(), 3).await;
+        receipt.wait().await.unwrap();
+        f.canonical_survives().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn reliable_worker_keeps_completed_receive_tail_until_reader_acknowledges_failure() {
+    timeout(Duration::from_secs(10), async {
+        let mut f = OrderedFixture::new().await;
+        let a = f.a.reliable().unwrap().ready().unwrap();
+        let b = f.b.reliable().unwrap().ready().unwrap();
+        send(&a, 4).wait().await.unwrap();
+        // Let the bounded record reader finish before transport retirement.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        a.handle().close();
+        b.handle().closed().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(f.b.reliable().unwrap().ready().unwrap().id(), b.id());
+        receive(f.b.reliable().unwrap(), 4).await;
+        match f.b.reliable().unwrap().next().await {
+            ReliableEvent::Frame { child, result } => {
+                assert_eq!(child, b.id());
+                assert!(result.is_err());
+            }
+            _ => panic!("expected terminal error after complete tail"),
+        }
+        f.a.reliable().unwrap().acknowledge_failure(a.id());
+        f.b.reliable().unwrap().acknowledge_failure(b.id());
+        until(|| {
+            f.a.reliable()
+                .unwrap()
+                .ready()
+                .is_some_and(|r| r.id() != a.id())
+                && f.b
+                    .reliable()
+                    .unwrap()
+                    .ready()
+                    .is_some_and(|r| r.id() != b.id())
+        })
+        .await;
+        let fresh = f.a.reliable().unwrap().ready().unwrap();
+        send(&fresh, 5).wait().await.unwrap();
+        receive(f.b.reliable().unwrap(), 5).await;
+        assert!(a.handle().recv().await.is_err());
+        f.canonical_survives().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn reliable_punched_quic_session_uses_exclusive_accept_and_retires_retained_snapshot() {
+    timeout(Duration::from_secs(10), async {
+        let left = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let right = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = left.local_addr().unwrap();
+        let b_addr = right.local_addr().unwrap();
+        let ctx = Arc::new(TransportContext::for_debug().unwrap());
+        let remote = tokio::spawn(promote_punched_quic(
+            right,
+            a_addr,
+            ctx.clone(),
+            PunchedQuicRole::Responder,
+        ));
+        let local = promote_punched_quic(left, b_addr, ctx, PunchedQuicRole::Initiator)
+            .await
+            .unwrap();
+        let a_handle = local.parallel_quic().unwrap();
+        assert!(a_handle.is_original_dialer());
+        let mut a_stream = local.into_stream().unwrap();
+        a_stream.write_all(b"main").await.unwrap();
+        let remote = remote.await.unwrap().unwrap();
+        let b_handle = remote.parallel_quic().unwrap();
+        assert!(!b_handle.is_original_dialer());
+        let mut b_stream = remote.into_stream().unwrap();
+        let mut bytes = [0; 4];
+        b_stream.read_exact(&mut bytes).await.unwrap();
+        let context = ordered_receiver_tests::pool_fixture_context();
+        let a = parallel_lanes::ParallelSession::new(
+            ParallelQuicOffer::new(a_handle.clone())
+                .with_duplex()
+                .with_reliable(),
+            &[2; 32],
+            &[3; 32],
+            [1; 32],
+            context.clone(),
+            None,
+        );
+        let b = parallel_lanes::ParallelSession::new(
+            ParallelQuicOffer::new(b_handle)
+                .with_duplex()
+                .with_reliable(),
+            &[3; 32],
+            &[2; 32],
+            [1; 32],
+            context,
+            None,
+        );
+        until(|| {
+            a.reliable().unwrap().ready().is_some() && b.reliable().unwrap().ready().is_some()
+        })
+        .await;
+        let ready = a.reliable().unwrap().ready().unwrap();
+        assert_eq!(a_handle.available_connection_slots(), 7);
+        send(&ready, 6).wait().await.unwrap();
+        receive(b.reliable().unwrap(), 6).await;
+        drop(a);
+        assert!(ready.handle().recv().await.is_err());
+        until(|| a_handle.available_connection_slots() == 8).await;
+        a_stream.write_all(b"alive").await.unwrap();
+        let mut bytes = [0; 5];
+        b_stream.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"alive");
+    })
+    .await
+    .unwrap();
+}

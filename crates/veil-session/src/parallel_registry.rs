@@ -51,7 +51,102 @@ impl RegisteredReliableChannel {
     }
 }
 
+/// Own a fresh dial through proof/ACK completion. Failure or cancellation
+/// drops the real transport and its accounting, including retained QUIC clones.
+pub(in crate::runner) struct ReliableDialedChild {
+    transport: ReliableIncomingTransport,
+    exporter: [u8; 32],
+}
+
+impl ReliableDialedChild {
+    pub(in crate::runner) fn new(
+        connection: Box<dyn veil_transport::TransportConnection>,
+        diagnostics: Arc<ParallelDiagnostics>,
+    ) -> Result<Self, &'static str> {
+        if connection.quic_datagrams().is_some() {
+            let channel =
+                Channel::new(connection, diagnostics).map_err(|_| "child transport failed")?;
+            let exporter = channel
+                .handle
+                .channel_binding()
+                .map_err(|_| "child exporter unavailable")?;
+            Ok(Self {
+                transport: ReliableIncomingTransport::Quic(channel),
+                exporter,
+            })
+        } else {
+            let exporter = connection
+                .stream_channel_binding()
+                .ok_or("child exporter unavailable")?;
+            let stream = connection
+                .into_stream()
+                .map_err(|_| "child transport failed")?;
+            diagnostics.connection_opened();
+            Ok(Self {
+                transport: ReliableIncomingTransport::Ordered(
+                    stream,
+                    OrderedDiagnosticsLease(diagnostics),
+                ),
+                exporter,
+            })
+        }
+    }
+    pub(in crate::runner) fn exporter(&self) -> [u8; 32] {
+        self.exporter
+    }
+    pub(in crate::runner) fn stream(&mut self) -> &mut BoxIoStream {
+        match &mut self.transport {
+            ReliableIncomingTransport::Quic(c) => &mut c.stream,
+            ReliableIncomingTransport::Ordered(stream, _) => stream,
+        }
+    }
+    pub(in crate::runner) fn finish(
+        self,
+        keys: ParallelKeys,
+    ) -> Result<RegisteredReliableChannel, &'static str> {
+        finish_reliable_transport(self.transport, keys)
+    }
+}
+
+fn finish_reliable_transport(
+    transport: ReliableIncomingTransport,
+    keys: ParallelKeys,
+) -> Result<RegisteredReliableChannel, &'static str> {
+    let (channel, retention) = match transport {
+        ReliableIncomingTransport::Quic(mut owner) => {
+            let stream = std::mem::replace(&mut owner.stream, broken_stream_sentinel());
+            let channel = keys
+                .into_reliable_quic(stream, owner.handle.clone())
+                .map_err(|_| "parallel parent retired")?;
+            (channel, ReliableRetention::Quic { _owner: owner })
+        }
+        ReliableIncomingTransport::Ordered(stream, lease) => {
+            let channel = keys
+                .into_reliable(stream)
+                .map_err(|_| "parallel parent retired")?;
+            (channel, ReliableRetention::Ordered { _lease: lease })
+        }
+    };
+    Ok(RegisteredReliableChannel {
+        channel,
+        _retention: retention,
+    })
+}
+
 impl BoundReliableChild {
+    pub(super) fn exclusive_quic(
+        channel: Channel,
+        keys: ParallelKeys,
+        ack: [u8; 32],
+        parent: ParallelParentHandle,
+    ) -> Self {
+        Self {
+            transport: ReliableIncomingTransport::Quic(channel),
+            keys,
+            ack,
+            parent,
+        }
+    }
     pub async fn finish(mut self) -> Result<RegisteredReliableChannel, &'static str> {
         let stream = match &mut self.transport {
             ReliableIncomingTransport::Quic(channel) => &mut channel.stream,
@@ -69,27 +164,7 @@ impl BoundReliableChild {
         if !matches!(result, Ok(Ok(()))) {
             return Err("parallel acknowledgement failed");
         }
-        let (channel, retention) = match self.transport {
-            ReliableIncomingTransport::Quic(mut owner) => {
-                let stream = std::mem::replace(&mut owner.stream, broken_stream_sentinel());
-                let channel = self
-                    .keys
-                    .into_reliable_quic(stream, owner.handle.clone())
-                    .map_err(|_| "parallel parent retired")?;
-                (channel, ReliableRetention::Quic { _owner: owner })
-            }
-            ReliableIncomingTransport::Ordered(stream, lease) => {
-                let channel = self
-                    .keys
-                    .into_reliable(stream)
-                    .map_err(|_| "parallel parent retired")?;
-                (channel, ReliableRetention::Ordered { _lease: lease })
-            }
-        };
-        Ok(RegisteredReliableChannel {
-            channel,
-            _retention: retention,
-        })
+        finish_reliable_transport(self.transport, self.keys)
     }
 }
 

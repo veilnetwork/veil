@@ -425,14 +425,23 @@ async fn ordered_incoming_budget_is_bounded_reclaimed_and_does_not_consume_outgo
         clients.push(client);
         children.push(f.incoming.recv().await.unwrap());
     }
-    assert_eq!(f.diagnostics.active_connections(), 7);
-    assert_eq!(f.transport.available_connection_slots(), 7);
+    assert_eq!(
+        f.diagnostics.active_connections(),
+        veil_transport::stream_parallel::StreamParallelHandle::CONNECTIONS_PER_DIRECTION
+    );
+    assert_eq!(
+        f.transport.available_connection_slots(),
+        veil_transport::stream_parallel::StreamParallelHandle::CONNECTIONS_PER_DIRECTION
+    );
     let (outcome, rejected) = f.dispatch(None, true).await;
     assert!(matches!(outcome, ParallelPeekOutcome::Drop(_)));
     rejected.rejected().await;
     drop(children.pop());
     clients.pop().unwrap().rejected().await;
-    assert_eq!(f.diagnostics.active_connections(), 6);
+    assert_eq!(
+        f.diagnostics.active_connections(),
+        veil_transport::stream_parallel::StreamParallelHandle::CONNECTIONS_PER_DIRECTION - 1
+    );
     let (outcome, replacement) = f.dispatch(None, true).await;
     assert!(matches!(outcome, ParallelPeekOutcome::Bound));
     let bound = f.incoming.recv().await.unwrap();

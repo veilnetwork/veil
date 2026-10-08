@@ -14,13 +14,14 @@ const TRANSIT_SLOTS: usize = 2;
 const TOTAL_SLOTS: usize = SOURCE_SLOTS + TRANSIT_SLOTS;
 const BIND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
-const _: () = assert!(TOTAL_SLOTS < StreamParallelHandle::CONNECTIONS_PER_DIRECTION);
+const _: () = assert!(TOTAL_SLOTS + 1 < StreamParallelHandle::CONNECTIONS_PER_DIRECTION);
 
 #[derive(Clone)]
 pub struct ParallelOrderedOffer {
     handle: StreamParallelHandle,
     registry: Arc<ParallelRegistry>,
     diagnostics: Arc<ParallelDiagnostics>,
+    reliable: bool,
 }
 
 impl ParallelOrderedOffer {
@@ -31,10 +32,16 @@ impl ParallelOrderedOffer {
             handle,
             registry,
             diagnostics: Arc::default(),
+            reliable: false,
         }
     }
     pub fn diagnostics(&self) -> Arc<ParallelDiagnostics> {
         self.diagnostics.clone()
+    }
+    /// Enable only after the independent reliable-child capability is agreed.
+    pub fn with_reliable(mut self) -> Self {
+        self.reliable = true;
+        self
     }
 }
 
@@ -110,7 +117,7 @@ impl Ready {
 
 struct Pool {
     slots: [Option<Ready>; TOTAL_SLOTS],
-    // Incoming proofs may consume only their existing seven directional
+    // Incoming proofs may consume only their bounded directional
     // leases. They cannot displace the dialer's outgoing source slots.
     incoming: Vec<Ready>,
 }
@@ -220,7 +227,7 @@ fn worker(
                             *slot = Some(ready);
                         } else {
                             // Real directional leases, not this vector, bound
-                            // these neutral receive/return owners to seven.
+                            // these neutral receive/return owners.
                             pool.incoming.push(ready);
                         }
                         mark(&pool, &readiness);
@@ -288,9 +295,13 @@ pub(super) struct OrderedSession {
     registration: Option<ParallelRegistration>,
     _worker: RealtimeReceiverTask,
     transit_salt: [u8; 32],
+    reliable: Option<super::reliable_session::ReliableSession>,
 }
 
 impl OrderedSession {
+    pub(super) fn reliable(&self) -> Option<&super::reliable_session::ReliableSession> {
+        self.reliable.as_ref()
+    }
     pub(super) fn new(
         offer: ParallelOrderedOffer,
         tx: &[u8; 32],
@@ -311,6 +322,19 @@ impl OrderedSession {
             offer.diagnostics.clone(),
             incoming,
         );
+        let (reliable_tx, reliable_rx) = mpsc::channel(1);
+        let reliable = (offer.reliable
+            && registration
+                .as_ref()
+                .is_some_and(|r| r.enable_reliable(reliable_tx)))
+        .then(|| {
+            super::reliable_session::ReliableSession::new(
+                super::reliable_session::ReliableTransport::Ordered(offer.handle.clone()),
+                parent.handle(),
+                offer.diagnostics.clone(),
+                reliable_rx,
+            )
+        });
         let readiness = status
             .filter(|_| registration.is_some())
             .map(|status| Arc::new(status.activate()));
@@ -336,6 +360,7 @@ impl OrderedSession {
             registration,
             _worker: worker,
             transit_salt: blake3::derive_key("veil/transit-shard/v1", &sid),
+            reliable,
         }
     }
 
@@ -379,6 +404,7 @@ impl OrderedSession {
 impl Drop for OrderedSession {
     fn drop(&mut self) {
         self.parent.retire();
+        self.reliable = None;
         self.registration = None;
         let mut pool = lock!(self.pool);
         pool.slots = Default::default();
