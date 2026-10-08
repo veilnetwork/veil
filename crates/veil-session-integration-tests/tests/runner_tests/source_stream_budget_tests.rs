@@ -385,7 +385,11 @@ async fn local_lossy_sources_keep_complete_bursts_on_an_encrypted_stream_hop() {
 /// must admit fresh primary traffic without committing a 64-KiB proxy write
 /// ahead of it, and must retain every byte and the final close in order.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn actual_proxy_bridge_yields_to_primary_on_encrypted_ordered_fallback() {
+    // The rotation test installs a process-wide 1–2 second lifetime. Keep
+    // this slow live transfer outside that fixture's global override.
+    let _rotation = epic488_1_lock();
     use std::sync::RwLock;
     use tokio::io::AsyncWriteExt;
     const SIZE: usize = 256 * 1024;
@@ -444,6 +448,15 @@ async fn actual_proxy_bridge_yields_to_primary_on_encrypted_ordered_fallback() {
                 .unwrap();
             if header.family == FrameFamily::Session as u8 {
                 assert_eq!(header.msg_type, SessionMsg::Padding as u16);
+            } else if header.family == FrameFamily::Control as u8 {
+                // This is a live slow receiver, not the black-hole fixture
+                // from which the runner defaults were borrowed. The source
+                // idle budget can make the transfer span a keepalive cadence.
+                assert_eq!(header.msg_type, ControlMsg::Keepalive as u16);
+                let mut ack =
+                    FrameHeader::new(FrameFamily::Control as u8, ControlMsg::KeepaliveAck as u16);
+                ack.request_id = header.request_id;
+                receiver.write_all(&encode_header(&ack)).await.unwrap();
             } else if header.msg_type == AppMsg::AppRtData as u16 {
                 assert_eq!(header.family, FrameFamily::App as u8);
                 assert_eq!(body, [0xEE; 48]);
