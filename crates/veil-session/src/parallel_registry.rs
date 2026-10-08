@@ -1,7 +1,7 @@
 //! One dispatcher for shared encrypted listeners. A child is never a new peer:
 //! it inherits the canonical runner's identity, budgets and shutdown.
 use super::*;
-use crate::parallel_binding::PREFACE;
+use crate::parallel_binding::{PREFACE, RELIABLE_PREFACE};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
@@ -15,6 +15,82 @@ struct Entry {
     diagnostics: Arc<ParallelDiagnostics>,
     kind: EntryKind,
     registration: Arc<()>,
+    reliable: Option<mpsc::Sender<BoundReliableChild>>,
+}
+
+enum ReliableIncomingTransport {
+    Quic(Channel),
+    Ordered(BoxIoStream, OrderedDiagnosticsLease),
+}
+
+/// A proof-verified lossless child waiting for its canonical owner's ACK.
+pub struct BoundReliableChild {
+    transport: ReliableIncomingTransport,
+    keys: ParallelKeys,
+    ack: [u8; 32],
+    parent: ParallelParentHandle,
+}
+
+enum ReliableRetention {
+    Quic { _owner: Channel },
+    Ordered { _lease: OrderedDiagnosticsLease },
+}
+
+/// Retains transport accounting as well as reliable I/O and parent authority.
+pub struct RegisteredReliableChannel {
+    channel: crate::parallel_binding::BoundReliableChannel,
+    _retention: ReliableRetention,
+}
+
+impl RegisteredReliableChannel {
+    pub fn handle(&self) -> crate::parallel_binding::BoundReliableHandle {
+        self.channel.handle()
+    }
+    pub fn keys(&self) -> &ParallelKeys {
+        &self.channel.keys
+    }
+}
+
+impl BoundReliableChild {
+    pub async fn finish(mut self) -> Result<RegisteredReliableChannel, &'static str> {
+        let stream = match &mut self.transport {
+            ReliableIncomingTransport::Quic(channel) => &mut channel.stream,
+            ReliableIncomingTransport::Ordered(stream, _) => stream,
+        };
+        let acknowledging = tokio::time::timeout(BIND_TIMEOUT, async {
+            stream.write_all(&self.ack).await?;
+            stream.flush().await
+        });
+        let result = tokio::select! {
+            biased;
+            _ = self.parent.retired() => return Err("parallel parent retired"),
+            result = acknowledging => result,
+        };
+        if !matches!(result, Ok(Ok(()))) {
+            return Err("parallel acknowledgement failed");
+        }
+        let (channel, retention) = match self.transport {
+            ReliableIncomingTransport::Quic(mut owner) => {
+                let stream = std::mem::replace(&mut owner.stream, broken_stream_sentinel());
+                let channel = self
+                    .keys
+                    .into_reliable_quic(stream, owner.handle.clone())
+                    .map_err(|_| "parallel parent retired")?;
+                (channel, ReliableRetention::Quic { _owner: owner })
+            }
+            ReliableIncomingTransport::Ordered(stream, lease) => {
+                let channel = self
+                    .keys
+                    .into_reliable(stream)
+                    .map_err(|_| "parallel parent retired")?;
+                (channel, ReliableRetention::Ordered { _lease: lease })
+            }
+        };
+        Ok(RegisteredReliableChannel {
+            channel,
+            _retention: retention,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -128,6 +204,30 @@ pub struct Registration {
     token: Arc<()>,
 }
 
+impl Registration {
+    /// Enable only after explicit peer capability negotiation. Registration
+    /// ownership, parent lifetime and the existing transport quota are shared
+    /// with other children; no second peer row or privilege is created.
+    pub fn enable_reliable(&self, incoming: mpsc::Sender<BoundReliableChild>) -> bool {
+        let mut entries = self
+            .registry
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = entries.get_mut(&self.sid) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&entry.registration, &self.token)
+            || !entry.parent.is_active()
+            || entry.reliable.is_some()
+        {
+            return false;
+        }
+        entry.reliable = Some(incoming);
+        true
+    }
+}
+
 impl Drop for Registration {
     fn drop(&mut self) {
         let mut entries = self
@@ -216,6 +316,7 @@ impl ParallelRegistry {
                 diagnostics,
                 kind,
                 registration: Arc::clone(&token),
+                reliable: None,
             },
         );
         Some(Registration {
@@ -267,7 +368,7 @@ impl ParallelRegistry {
             .read_exact(&mut prefix)
             .await
             .map_err(|_| "parallel prefix incomplete")?;
-        if &prefix != PREFACE {
+        if &prefix != PREFACE && &prefix != RELIABLE_PREFACE {
             return Ok(ParallelPeekOutcome::Handshake(Box::new(
                 crate::handoff::PrefixedStream::new(
                     prefix.to_vec(),
@@ -326,15 +427,37 @@ impl ParallelRegistry {
             .handle
             .channel_binding()
             .map_err(|_| "parallel binding unavailable")?;
-        let (ack, keys) = entry
-            .parent
-            .accept(&hello, exporter)
-            .map_err(|_| "parallel proof rejected")?;
+        let reliable = &prefix == RELIABLE_PREFACE;
+        let reliable_incoming = if reliable {
+            Some(
+                entry
+                    .reliable
+                    .ok_or("parallel reliable support not negotiated")?,
+            )
+        } else {
+            None
+        };
+        let (ack, keys) = if reliable {
+            entry.parent.accept_reliable(&hello, exporter)
+        } else {
+            entry.parent.accept(&hello, exporter)
+        }
+        .map_err(|_| "parallel proof rejected")?;
         transport
             .track_incoming(&channel.handle)
             .map_err(|_| "parallel connection budget exhausted")?;
         entry.diagnostics.active.fetch_add(1, Ordering::AcqRel);
         channel.diagnostics = Some(entry.diagnostics);
+        if let Some(incoming) = reliable_incoming {
+            return incoming
+                .try_send(BoundReliableChild {
+                    transport: ReliableIncomingTransport::Quic(channel),
+                    keys,
+                    ack,
+                    parent: entry.parent,
+                })
+                .map_err(|_| "parallel reliable owner unavailable");
+        }
         incoming
             .try_send(BoundChild {
                 channel,
@@ -372,15 +495,40 @@ impl ParallelRegistry {
         else {
             return Err("parallel transport mismatch");
         };
-        let (ack, keys) = entry
-            .parent
-            .accept(&hello, exporter)
-            .map_err(|_| "parallel proof rejected")?;
+        let reliable = &prefix == RELIABLE_PREFACE;
+        let reliable_incoming = if reliable {
+            Some(
+                entry
+                    .reliable
+                    .ok_or("parallel reliable support not negotiated")?,
+            )
+        } else {
+            None
+        };
+        let (ack, keys) = if reliable {
+            entry.parent.accept_reliable(&hello, exporter)
+        } else {
+            entry.parent.accept(&hello, exporter)
+        }
+        .map_err(|_| "parallel proof rejected")?;
         // Acquiring this lease never creates an OVL1 identity or per-peer row.
         let stream = transport
             .track_incoming(stream)
             .map_err(|_| "parallel connection budget exhausted")?;
         entry.diagnostics.active.fetch_add(1, Ordering::AcqRel);
+        if let Some(incoming) = reliable_incoming {
+            return incoming
+                .try_send(BoundReliableChild {
+                    transport: ReliableIncomingTransport::Ordered(
+                        stream,
+                        OrderedDiagnosticsLease(entry.diagnostics),
+                    ),
+                    keys,
+                    ack,
+                    parent: entry.parent,
+                })
+                .map_err(|_| "parallel reliable owner unavailable");
+        }
         incoming
             .try_send(BoundOrderedChild {
                 stream,

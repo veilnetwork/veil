@@ -10,8 +10,8 @@ mod recovery_trace;
 #[path = "parallel_registry.rs"]
 mod registry;
 pub use registry::{
-    BoundOrderedChild, ParallelPeekOutcome, ParallelRegistry, RegisteredOrderedChannel,
-    Registration as ParallelRegistration,
+    BoundOrderedChild, BoundReliableChild, ParallelPeekOutcome, ParallelRegistry,
+    RegisteredOrderedChannel, RegisteredReliableChannel, Registration as ParallelRegistration,
 };
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

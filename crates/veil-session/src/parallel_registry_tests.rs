@@ -123,6 +123,94 @@ impl Drop for Fixture {
     }
 }
 
+impl Fixture {
+    async fn dispatch_reliable(
+        &self,
+    ) -> (
+        ParallelPeekOutcome,
+        QuicDatagramHandle,
+        BoxIoStream,
+        crate::parallel_binding::PendingParallelBinding,
+    ) {
+        let accepted = self.start_accept();
+        let connection = QuicTransport
+            .connect(&self.uri, self.context.clone())
+            .await
+            .unwrap();
+        let handle = connection.quic_datagrams().unwrap();
+        let (hello, pending) = self
+            .initiator
+            .begin_reliable(handle.channel_binding().unwrap())
+            .unwrap();
+        let mut stream = connection.into_stream().unwrap();
+        stream.write_all(&hello).await.unwrap();
+        let inbound = accepted.await.unwrap().unwrap();
+        let raw = inbound.quic_datagrams();
+        let outcome = self
+            .registry
+            .peek_and_dispatch(inbound.into_stream().unwrap(), raw)
+            .await;
+        (outcome, handle, stream, pending)
+    }
+}
+
+#[tokio::test]
+async fn reliable_quic_dispatch_requires_opt_in_retains_accounting_and_closes_real_child() {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut f = Fixture::new().await;
+        let (outcome, raw, _stream, _) = f.dispatch_reliable().await;
+        assert!(matches!(outcome, ParallelPeekOutcome::Drop(ref e) if e == "parallel reliable support not negotiated"));
+        raw.closed().await;
+        let (tx, mut rx) = mpsc::channel(1);
+        assert!(f._registration.enable_reliable(tx));
+        let (outcome, raw, mut stream, pending) = f.dispatch_reliable().await;
+        assert!(matches!(outcome, ParallelPeekOutcome::Bound));
+        assert!(f.incoming.try_recv().is_err());
+        let bound = rx.recv().await.unwrap();
+        let (server, ack) = tokio::join!(bound.finish(), async {
+            let mut ack = [0; 32];
+            stream.read_exact(&mut ack).await.unwrap();
+            ack
+        });
+        let server = server.unwrap();
+        let client = pending.finish(&ack).unwrap().into_reliable_quic(stream, raw.clone()).unwrap();
+        assert_eq!(f.offer.diagnostics.active_connections(), 1);
+        client.handle().send(b"opaque reliable").await.unwrap();
+        assert_eq!(server.handle().recv().await.unwrap(), b"opaque reliable");
+        server.handle().send(b"return").await.unwrap();
+        assert_eq!(client.handle().recv().await.unwrap(), b"return");
+        drop(server);
+        raw.closed().await;
+        assert_eq!(f.offer.diagnostics.active_connections(), 0);
+        // This is the real canonical transport, kept separate from the child.
+        f.main_streams[0].write_all(b"alive").await.unwrap();
+        let mut bytes = [0; 5];
+        f.main_streams[1].read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"alive");
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn reliable_quic_queue_failure_closes_child_with_retained_raw_clones() {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let f = Fixture::new().await;
+        let (tx, mut rx) = mpsc::channel(1);
+        assert!(f._registration.enable_reliable(tx));
+        let (outcome, first, _stream, _) = f.dispatch_reliable().await;
+        assert!(matches!(outcome, ParallelPeekOutcome::Bound));
+        let (outcome, full, _stream, _) = f.dispatch_reliable().await;
+        assert!(matches!(outcome, ParallelPeekOutcome::Drop(ref e) if e == "parallel reliable owner unavailable"));
+        full.closed().await;
+        assert_eq!(f.offer.diagnostics.active_connections(), 1);
+        let child = rx.recv().await.unwrap();
+        f.responder.retire();
+        assert!(child.finish().await.is_err());
+        first.closed().await;
+        assert_eq!(f.offer.diagnostics.active_connections(), 0);
+        assert!(f.main_handles.iter().all(|h| h.max_size().is_some()));
+    }).await.unwrap();
+}
+
 #[tokio::test]
 async fn shared_registry_authenticates_once_and_rejects_cross_connection_replay_and_retirement() {
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
