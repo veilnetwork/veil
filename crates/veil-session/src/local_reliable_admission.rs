@@ -14,12 +14,37 @@ pub(super) const ACTIVE_RELIABLE_BYTES: u64 = 1024;
 pub(super) const INDEPENDENT_RELIABLE_BYTES: u64 = 16 * 1024;
 const PRIMARY_PRESSURE_RTT: Duration = Duration::from_millis(150);
 
+#[derive(Default)]
+struct PrimaryPathFeedback {
+    last_expired: u64,
+    last_lost: u64,
+    last_congestion_events: u64,
+}
+
+impl PrimaryPathFeedback {
+    fn observe(&mut self, rtt_us: u64, expired: u64, lost: u64, congestion_events: u64) -> bool {
+        // Loss can grow before the smoothed RTT crosses the delay threshold.
+        // Keep competing local producers restrained during that congestion,
+        // rather than waiting for the primary's packets to expire as well.
+        let degraded = rtt_us > PRIMARY_PRESSURE_RTT.as_micros() as u64
+            || expired > self.last_expired
+            || lost > self.last_lost
+            || congestion_events > self.last_congestion_events;
+        // Repeated historical loss must not pin the budget forever. A replaced
+        // child starts fresh counters, so retain the new snapshot, not maxima.
+        self.last_expired = expired;
+        self.last_lost = lost;
+        self.last_congestion_events = congestion_events;
+        degraded
+    }
+}
+
 pub(super) struct LocalReliableAdmission {
     writes: Arc<ReliableWriteAdmission>,
     source_activity: Arc<crate::local_source_activity::LocalSourceActivity>,
     active_until: Option<Instant>,
     pressure_until: Option<Instant>,
-    last_expired: u64,
+    feedback: PrimaryPathFeedback,
 }
 
 impl LocalReliableAdmission {
@@ -29,7 +54,7 @@ impl LocalReliableAdmission {
             source_activity: Arc::default(),
             active_until: None,
             pressure_until: None,
-            last_expired: 0,
+            feedback: PrimaryPathFeedback::default(),
         }
     }
 
@@ -85,6 +110,8 @@ impl LocalReliableAdmission {
         self.observe_pressure(
             stats.rtt_us,
             stats.expired_outgoing_datagrams,
+            stats.lost_packets,
+            stats.congestion_events,
             ack_blocked,
             now,
         )
@@ -103,22 +130,23 @@ impl LocalReliableAdmission {
         &mut self,
         rtt_us: u64,
         expired: u64,
+        lost: u64,
+        congestion_events: u64,
         ack_blocked: bool,
         now: Instant,
     ) -> bool {
         // Pressure limits bulk admission and competing local lossy production.
         // The writer grants a separate bounded budget only while actually
         // writing locally authored control; bulk and transit never acquire it.
-        let delayed =
-            rtt_us > PRIMARY_PRESSURE_RTT.as_micros() as u64 || expired > self.last_expired;
+        let delayed = self
+            .feedback
+            .observe(rtt_us, expired, lost, congestion_events);
         if ack_blocked || delayed {
             self.source_activity.note_pressure(now);
         }
         if delayed {
             self.pressure_until = Some(now + PRESSURE_GRACE);
         }
-        // A retired child can be replaced by a fresh connection with zero counters.
-        self.last_expired = expired;
         ack_blocked || delayed
     }
 
@@ -157,6 +185,45 @@ impl LocalReliableAdmission {
 impl Drop for LocalReliableAdmission {
     fn drop(&mut self) {
         self.restore();
+    }
+}
+
+#[cfg(test)]
+mod feedback_tests {
+    use super::*;
+
+    #[test]
+    fn new_primary_loss_and_congestion_are_pressure_even_with_low_rtt() {
+        let mut feedback = PrimaryPathFeedback::default();
+        assert!(!feedback.observe(10_000, 0, 0, 0));
+        assert!(feedback.observe(10_000, 0, 1, 0));
+        assert!(!feedback.observe(10_000, 0, 1, 0));
+        assert!(feedback.observe(10_000, 0, 1, 1));
+        assert!(!feedback.observe(10_000, 0, 1, 1));
+        // A retired connection's counters are not a high-water mark for the
+        // fresh path. Its first newly observed loss must still restrain video.
+        assert!(!feedback.observe(10_000, 0, 0, 0));
+        assert!(feedback.observe(10_000, 0, 1, 0));
+    }
+
+    #[test]
+    fn historical_loss_does_not_extend_shared_secondary_pressure() {
+        let mut feedback = PrimaryPathFeedback::default();
+        let activity = crate::local_source_activity::LocalSourceActivity::default();
+        let now = Instant::now();
+        activity.note(now);
+        if feedback.observe(10_000, 0, 1, 0) {
+            activity.note_pressure(now);
+        }
+        assert!(activity.allow_secondary(now)); // One sparse recovery probe.
+        assert!(!activity.allow_secondary(now + Duration::from_millis(1)));
+        let renewed = now + PRESSURE_GRACE;
+        activity.note(renewed);
+        if feedback.observe(10_000, 0, 1, 0) {
+            activity.note_pressure(renewed);
+        }
+        assert!(activity.allow_secondary(renewed));
+        assert!(activity.allow_secondary(renewed + Duration::from_millis(1)));
     }
 }
 
