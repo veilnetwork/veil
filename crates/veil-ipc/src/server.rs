@@ -769,6 +769,10 @@ async fn forward_endpoint(
                 data,
                 reply_id,
             } => {
+                crate::route_trace::observe_local_delivery(
+                    crate::route_trace::LocalDeliveryStage::DaemonEncode,
+                    &data,
+                );
                 let deliver = AppDeliverPayload {
                     src_node_id,
                     // Carried through verbatim from whichever delivery path
