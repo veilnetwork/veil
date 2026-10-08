@@ -33,6 +33,16 @@ void main() {
       });
       expect(probe.exitCode, 0, reason: '${probe.stdout}\n${probe.stderr}');
       expect(probe.stdout, contains('responsive event loop, FIFO bytes'));
+      final progress = await Process.run(dart, [
+        '--packages=.dart_tool/package_config.json',
+        'test/fixtures/stream_write_progress_probe.dart',
+      ], environment: {
+        'VEIL_FFI_DYLIB': library
+      });
+      expect(progress.exitCode, 0,
+          reason: '${progress.stdout}\n${progress.stderr}');
+      expect(progress.stdout,
+          contains('native progress, responsive UI, FIFO bytes and FIN'));
     } finally {
       await temp.delete(recursive: true);
     }
