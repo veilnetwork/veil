@@ -141,6 +141,15 @@ impl SessionTxRegistry {
         }
     }
 
+    /// Keep an owned source's ordinary pieces below one typical QUIC packet
+    /// while a primary is active, so a slow shared downstream FIFO need not
+    /// drain a multi-packet data burst before accepting fresh primary traffic.
+    pub fn local_source_segment_data_bytes(&self) -> Option<usize> {
+        self.source_activity
+            .active(std::time::Instant::now())
+            .then_some(768)
+    }
+
     /// Create with a custom per-session channel capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {

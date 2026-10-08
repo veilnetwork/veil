@@ -57,6 +57,13 @@ pub trait FrameBroadcaster: Send + Sync {
         false
     }
 
+    /// Origin packetization advice while this endpoint has an active primary.
+    /// Never applied to transit or carried on the wire. None keeps canonical
+    /// segmentation; callers retain the protocol's transfer/chunk bounds.
+    fn local_source_segment_data_bytes(&self) -> Option<usize> {
+        None
+    }
+
     /// Current endpoint-local generic datagram transport readiness. Legacy
     /// implementations retain ordered fallback. Never a remote service hint.
     fn has_datagram_transport(&self, _peer_id: &[u8; 32]) -> bool {
