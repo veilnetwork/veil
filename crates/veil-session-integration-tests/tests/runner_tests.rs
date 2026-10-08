@@ -6806,3 +6806,6 @@ async fn fresh_rx_with_unacked_keepalive_does_not_storm_failover_attempts() {
         "real runner called keepalive failover {triggers} times during one episode (ceiling 2)"
     );
 }
+
+#[path = "runner_tests/reliable_stream_tests.rs"]
+mod reliable_stream_tests;

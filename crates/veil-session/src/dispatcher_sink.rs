@@ -89,6 +89,33 @@ pub enum DispatchResult {
 /// Abstraction barrier between session and dispatcher concrete type.
 /// See module-doc.
 pub trait DispatcherSink: Send + Sync {
+    /// Trusted local carrier teardown. Concrete dispatchers override this to
+    /// bypass peer rate limits and retire endpoint/receipt/receive state.
+    fn abort_app_stream(
+        &self,
+        peer: NodeIdBytes,
+        stream: u32,
+        app: [u8; 32],
+        endpoint: u32,
+        notify: bool,
+    ) {
+        if !notify {
+            return;
+        }
+        let body = veil_proto::app::AppClosePayload {
+            app_id: app,
+            endpoint_id: endpoint,
+            reason: veil_proto::app::close_reason::ERROR,
+        }
+        .encode();
+        let mut h = FrameHeader::new(
+            veil_proto::FrameFamily::App as u8,
+            veil_proto::AppMsg::AppClose as u16,
+        );
+        h.stream_id = stream;
+        h.body_len = body.len() as u32;
+        let _ = self.dispatch(&h, &body, peer);
+    }
     // ── Hot path (called every frame) ─────────────────────────────
 
     /// Dispatch an incoming frame body to the dispatcher's routing

@@ -88,6 +88,49 @@ pub enum FrameAdmissionError {
     Invalid(FrameEnvelope),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameReservationError {
+    Full,
+    Closed,
+    Invalid,
+}
+
+/// Queue and byte admission before the canonical scheduler pops plaintext.
+/// Dropping an unused reservation publishes no data and advances no cipher.
+pub struct FrameReservation {
+    slot: mpsc::OwnedPermit<Pending>,
+    bytes: OwnedSemaphorePermit,
+    capacity: usize,
+    inner: Arc<Inner>,
+}
+
+impl FrameReservation {
+    pub fn commit(self, envelope: FrameEnvelope) -> Result<FrameReceipt, FrameAdmissionError> {
+        if !self.inner.transport.parent_active() || self.inner.bytes.is_closed() {
+            return Err(FrameAdmissionError::Closed(envelope));
+        }
+        let plain = &envelope.frame.1;
+        if !valid_plain(plain) || record_charge(plain.len()) > self.capacity {
+            return Err(FrameAdmissionError::Invalid(envelope));
+        }
+        let (completion, receipt) = oneshot::channel();
+        self.slot.send(Pending {
+            envelope,
+            completion,
+            _bytes: self.bytes,
+        });
+        Ok(FrameReceipt(receipt))
+    }
+}
+
+fn record_charge(bytes: usize) -> usize {
+    (bytes + AEAD_OVERHEAD + 2).max(MIN_CHARGE)
+}
+fn valid_plain(plain: &[u8]) -> bool {
+    plain.len() + AEAD_OVERHEAD <= MAX_RECORD_BYTES
+        && decode_header(plain).is_ok_and(|h| h.body_len as usize + HEADER_SIZE == plain.len())
+}
+
 /// Completion is the local transport's complete write and flush, not a peer
 /// acknowledgement. Dropping this receipt does not cancel admitted data.
 pub struct FrameReceipt(oneshot::Receiver<io::Result<()>>);
@@ -105,47 +148,57 @@ pub struct ReliableFrameHandle(Arc<Inner>);
 
 impl ReliableFrameHandle {
     pub fn try_send(&self, envelope: FrameEnvelope) -> Result<FrameReceipt, FrameAdmissionError> {
+        let reservation = match self.try_reserve(&envelope.frame.1) {
+            Ok(reservation) => reservation,
+            Err(FrameReservationError::Full) => return Err(FrameAdmissionError::Full(envelope)),
+            Err(FrameReservationError::Closed) => {
+                return Err(FrameAdmissionError::Closed(envelope));
+            }
+            Err(FrameReservationError::Invalid) => {
+                return Err(FrameAdmissionError::Invalid(envelope));
+            }
+        };
+        reservation.commit(envelope)
+    }
+
+    pub fn try_reserve(&self, plain: &[u8]) -> Result<FrameReservation, FrameReservationError> {
         // Authorization does not wait for a watcher task to observe rekey or
         // canonical-owner retirement. Retained handles cannot admit new work.
         if !self.0.transport.parent_active() {
             self.0.fail(io::ErrorKind::ConnectionAborted);
-            return Err(FrameAdmissionError::Closed(envelope));
+            return Err(FrameReservationError::Closed);
         }
-        let plain = &envelope.frame.1;
-        if plain.len() + AEAD_OVERHEAD > MAX_RECORD_BYTES
-            || !decode_header(plain).is_ok_and(|h| h.body_len as usize + HEADER_SIZE == plain.len())
-        {
-            return Err(FrameAdmissionError::Invalid(envelope));
+        if !valid_plain(plain) {
+            return Err(FrameReservationError::Invalid);
         }
         if self.0.bytes.is_closed() {
-            return Err(FrameAdmissionError::Closed(envelope));
+            return Err(FrameReservationError::Closed);
         }
-        let slot = match self.0.queue.try_reserve() {
+        let slot = match self.0.queue.clone().try_reserve_owned() {
             Ok(slot) => slot,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                return Err(FrameAdmissionError::Full(envelope));
+                return Err(FrameReservationError::Full);
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                return Err(FrameAdmissionError::Closed(envelope));
+                return Err(FrameReservationError::Closed);
             }
         };
-        let charge = (plain.len() + AEAD_OVERHEAD + 2).max(MIN_CHARGE) as u32;
-        let credit = match self.0.bytes.clone().try_acquire_many_owned(charge) {
+        let charge = record_charge(plain.len());
+        let credit = match self.0.bytes.clone().try_acquire_many_owned(charge as u32) {
             Ok(credit) => credit,
             Err(tokio::sync::TryAcquireError::Closed) => {
-                return Err(FrameAdmissionError::Closed(envelope));
+                return Err(FrameReservationError::Closed);
             }
             Err(tokio::sync::TryAcquireError::NoPermits) => {
-                return Err(FrameAdmissionError::Full(envelope));
+                return Err(FrameReservationError::Full);
             }
         };
-        let (completion, receipt) = oneshot::channel();
-        slot.send(Pending {
-            envelope,
-            completion,
-            _bytes: credit,
-        });
-        Ok(FrameReceipt(receipt))
+        Ok(FrameReservation {
+            slot,
+            bytes: credit,
+            capacity: charge,
+            inner: self.0.clone(),
+        })
     }
 
     /// Each receive keeps one RX cipher lock through cancellation-safe record
