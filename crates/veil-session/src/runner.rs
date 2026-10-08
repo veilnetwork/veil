@@ -219,8 +219,16 @@ struct RealtimeDatagramLane {
     parallel: Option<parallel_lanes::ParallelSession>,
 }
 
+#[path = "lossy_transport.rs"]
+mod lossy_transport;
+use lossy_transport::{LossySendError, LossyTransportHandle};
+
+#[cfg(test)]
+#[path = "ordered_receiver_tests.rs"]
+mod ordered_receiver_tests;
+
 struct RealtimeSender {
-    handle: veil_transport::QuicDatagramHandle,
+    handle: LossyTransportHandle,
     tx: crate::datagram_flows::SessionDatagramTx,
     max_datagram_size: usize,
     // A shared fallback can carry several source slots. Observe each slot
@@ -235,9 +243,10 @@ struct RealtimeSender {
 
 impl RealtimeSender {
     fn new(
-        handle: veil_transport::QuicDatagramHandle,
+        handle: impl Into<LossyTransportHandle>,
         tx: crate::datagram_flows::SessionDatagramTx,
     ) -> Self {
+        let handle = handle.into();
         Self {
             max_datagram_size: handle.max_size().unwrap_or(0),
             handle,
@@ -278,30 +287,13 @@ impl RealtimeSender {
         {
             return;
         }
-        let path = self.handle.path_stats();
         logger.info(
             "session.rt_trace.datagram_admission",
             format!(
-                "peer_id={} local_slot={priority} accepted={} buffer_drops={} bandwidth_drops={} queued_wire_bytes={} independent={independent} rtt_us={} cwnd_bytes={} in_flight_bytes={} pto_count={} lost_packets={} congestion_events={} udp_sent={} udp_received={} acks_received={} expired_outgoing_datagrams={} residual_window_transmits={} event_queue_last_us={} event_queue_max_us={} event_queue_stalls={} timer_late_last_us={} timer_late_max_us={} timer_stalls={} udp_send_wait_last_us={} udp_send_wait_max_us={} udp_send_stalls={} udp_send_pending_us={}",
+                "peer_id={} local_slot={priority} accepted={} buffer_drops={} bandwidth_drops={} queued_wire_bytes={} independent={independent} {}",
                 hex_short(peer), entry.0, entry.1, entry.2,
                 veil_transport::REALTIME_DATAGRAM_BUFFER_BYTES.saturating_sub(available),
-                path.rtt_us, path.congestion_window_bytes, path.in_flight_bytes,
-                path.pto_count, path.lost_packets,
-                path.congestion_events, path.udp_sent, path.udp_received,
-                path.acknowledgments_received,
-                path.expired_outgoing_datagrams,
-                path.residual_window_transmits,
-                path.event_queue_last_us,
-                path.event_queue_max_us,
-                path.event_queue_stalls,
-                path.timer_late_last_us,
-                path.timer_late_max_us,
-                path.timer_stalls,
-                path.udp_send_wait_last_us,
-                path.udp_send_wait_max_us,
-                path.udp_send_stalls,
-                path.udp_send_pending_us,
-
+                self.handle.path_trace(),
             ),
         );
         *entry = (0, 0, 0, Some(now));
@@ -351,9 +343,10 @@ impl RealtimeDatagramLane {
         let now = std::time::Instant::now();
         if let Some(index) = ready {
             let sender = self.parallel.as_ref().unwrap().sender(index);
-            if priority == veil_proto::priority::REALTIME {
-                self.local_reliable
-                    .observe_primary_path(&sender.handle, now);
+            if priority == veil_proto::priority::REALTIME
+                && let Some(quic) = sender.handle.quic()
+            {
+                self.local_reliable.observe_primary_path(quic, now);
             }
             self.local_reliable.observe(priority, frame, now, true);
             (sender, true)
@@ -655,12 +648,13 @@ fn apply_pending_rekey(
 }
 
 fn spawn_realtime_receiver(
-    handle: veil_transport::QuicDatagramHandle,
+    handle: impl Into<LossyTransportHandle>,
     mut rx: crate::datagram_flows::SessionDatagramRx,
     mut rekeys: tokio::sync::watch::Receiver<Option<RealtimeRekey>>,
     context: RealtimeReceiverContext,
     carrier: Option<Arc<dyn veil_anonymity::circuit_carrier::DatagramCarrier>>,
 ) -> RealtimeReceiverTask {
+    let handle = handle.into();
     RealtimeReceiverTask(tokio::spawn(async move {
         let RealtimeReceiverContext {
             peer_id,
@@ -696,18 +690,14 @@ fn spawn_realtime_receiver(
                 }
                 _ = trace_tick.tick(), if tracing => {
                     let w = trace.take();
-                    let path = handle.path_stats();
                     logger.info(
                         "session.rt_trace.datagram_receive",
                         format!(
-                            "peer_id={} receiver={} datagrams={} fragments_pending={} decode_rejected={} ineligible={} dispatched={} rate_limited={} violations={} unexpected={} max_dispatch_us={} udp_sent={} udp_received={} acks_received={} rtt_us={} cwnd_bytes={} in_flight_bytes={} pto_count={} lost_packets={} congestion_events={}",
+                            "peer_id={} receiver={} datagrams={} fragments_pending={} decode_rejected={} ineligible={} dispatched={} rate_limited={} violations={} unexpected={} max_dispatch_us={} {}",
                             hex_short(&peer_id), trace.id, w.datagrams,
                             w.fragments_pending, w.decode_rejected, w.ineligible,
                             w.dispatched, w.rate_limited, w.violations, w.unexpected,
-                            w.max_dispatch_us, path.udp_sent, path.udp_received,
-                            path.acknowledgments_received, path.rtt_us,
-                            path.congestion_window_bytes, path.in_flight_bytes, path.pto_count,
-                            path.lost_packets, path.congestion_events,
+                            w.max_dispatch_us, handle.path_trace(),
                         ),
                     );
                     continue;
@@ -4558,12 +4548,20 @@ impl SessionRunner {
                             }
                         };
                         let planned_wire_len = datagrams.iter().map(Vec::len).sum::<usize>();
+                        let planned_queue_charge = datagrams
+                            .iter()
+                            .map(|packet| lane.handle.queue_charge(packet.len()))
+                            .sum::<usize>();
                         let available = lane.handle.send_buffer_space();
                         let primary_fits = outgoing_priority != veil_proto::priority::REALTIME
                             || !using_parallel
-                            || local_primary_datagram_fits(planned_wire_len, available);
+                            || local_primary_datagram_fits(planned_queue_charge, available);
                         if !primary_fits
-                            || !local_datagram_fits(outgoing_priority, planned_wire_len, available)
+                            || !local_datagram_fits(
+                                outgoing_priority,
+                                planned_queue_charge,
+                                available,
+                            )
                         {
                             // Admit complete frames only. Local bulk bounds
                             // backlog and reserves a complete primary frame;
@@ -4608,7 +4606,9 @@ impl SessionRunner {
                         // Expiration never changes nonce/counter allocation.
                         let expires_at = local_primary_datagram_expiry(&envelope);
                         for datagram in &datagrams {
-                            if lane.handle.send_buffer_space() < datagram.len() {
+                            if lane.handle.send_buffer_space()
+                                < lane.handle.queue_charge(datagram.len())
+                            {
                                 lane.congestion_drops = lane.congestion_drops.saturating_add(1);
                                 if lane.last_congestion_log.elapsed()
                                     >= std::time::Duration::from_secs(1)
@@ -4647,7 +4647,15 @@ impl SessionRunner {
                             mlkem_rekey.record_bytes(sent);
                         }
                         if let Some(error) = send_error {
-                            if matches!(error, veil_transport::QuicDatagramSendError::TooLarge) {
+                            if error.is_temporary() {
+                                // Expiry or a full bounded ordered queue drops
+                                // this lossy frame, including unsent fragments.
+                                // Keep the child alive; never replay the frame
+                                // on the ordinary reliable stream.
+                                datagram_drained += 1;
+                                continue;
+                            }
+                            if matches!(error, LossySendError::TooLarge) {
                                 let previous = lane.max_datagram_size;
                                 if let Some(current) =
                                     lane.handle.max_size().filter(|size| *size > 40)

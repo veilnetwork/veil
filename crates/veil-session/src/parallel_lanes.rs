@@ -290,7 +290,14 @@ async fn receive_authenticated(
             crate::datagram_flows::SessionDatagramTx::new(keys.tx_key(), &keys.session_id, true),
         )))
     });
-    let carrier = sender.map(|sender| make_carrier(&channel, sender, parent, context.peer_id));
+    let carrier = sender.map(|sender| {
+        make_carrier(
+            channel.diagnostics.as_ref().expect("owned child"),
+            sender,
+            parent,
+            context.peer_id,
+        )
+    });
     let mut receiver =
         spawn_realtime_receiver(channel.handle.clone(), rx, rekey_rx, context, carrier);
     tokio::select! {
@@ -308,12 +315,17 @@ fn spawn_child_receiver(
 ) -> RealtimeReceiverTask {
     let rx = crate::datagram_flows::SessionDatagramRx::new(keys.rx_key(), &keys.session_id, true);
     let (_hold_tx, rekey_rx) = tokio::sync::watch::channel(None);
-    let carrier = make_carrier(channel, sender, parent, context.peer_id);
+    let carrier = make_carrier(
+        channel.diagnostics.as_ref().expect("owned child"),
+        sender,
+        parent,
+        context.peer_id,
+    );
     spawn_realtime_receiver(channel.handle.clone(), rx, rekey_rx, context, Some(carrier))
 }
 
-fn make_carrier(
-    channel: &Channel,
+pub(super) fn make_carrier(
+    diagnostics: &Arc<ParallelDiagnostics>,
     sender: Arc<Mutex<RealtimeSender>>,
     parent: ParallelParentHandle,
     peer: NodeIdBytes,
@@ -322,7 +334,7 @@ fn make_carrier(
         sender,
         parent,
         peer,
-        diagnostics: Arc::clone(channel.diagnostics.as_ref().expect("owned child")),
+        diagnostics: Arc::clone(diagnostics),
     })
 }
 
@@ -370,9 +382,13 @@ impl veil_anonymity::circuit_carrier::DatagramCarrier for ChildCarrier {
             Err(_) => return CarrierSend::Unavailable,
         };
         let planned = datagrams.iter().map(Vec::len).sum::<usize>();
+        let queue_charge = datagrams
+            .iter()
+            .map(|packet| sender.handle.queue_charge(packet.len()))
+            .sum::<usize>();
         if !local_datagram_fits(
             veil_proto::priority::INTERACTIVE,
-            planned,
+            queue_charge,
             sender.handle.send_buffer_space(),
         ) || !admit(planned)
         {
@@ -381,11 +397,11 @@ impl veil_anonymity::circuit_carrier::DatagramCarrier for ChildCarrier {
         let mut wire_bytes = 0;
         for datagram in &datagrams {
             if let Err(error) = sender.handle.send(datagram) {
-                if matches!(error, veil_transport::QuicDatagramSendError::TooLarge) {
+                if matches!(error, LossySendError::TooLarge) {
                     if let Some(size) = sender.handle.max_size().filter(|size| *size > 40) {
                         sender.max_datagram_size = size;
                     }
-                } else {
+                } else if !error.is_temporary() {
                     sender.broken = true;
                 }
                 // Admission already spent the shared budget, possibly sent a
@@ -667,7 +683,11 @@ impl ParallelSession {
             if sender.broken {
                 return;
             }
-            sender.handle.path_stats()
+            sender
+                .handle
+                .quic()
+                .expect("QUIC session child")
+                .path_stats()
         };
         match self.primary_recovery.observe(stats, now) {
             Action::Progress if slot.replacing => {

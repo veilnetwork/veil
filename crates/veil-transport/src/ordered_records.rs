@@ -27,6 +27,13 @@ const MIN_RECORD_CHARGE: usize = 40;
 const WRITE_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
 pub const RECORD_RECEIVE_MAX_AGE: Duration = Duration::from_millis(200);
 
+/// Exact local queue reservation, including the framing prefix and the tiny
+/// record metadata floor. Session admission must use this rather than payload
+/// length alone; it is not a wire bandwidth or delivery acknowledgement.
+pub fn record_queue_charge(payload_bytes: usize) -> usize {
+    payload_bytes.saturating_add(2).max(MIN_RECORD_CHARGE)
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RecordSendError {
     #[error("record length outside negotiated bounds")]
@@ -145,7 +152,7 @@ impl OrderedRecordHandle {
         if expires_at.is_some_and(|at| at <= Instant::now()) {
             return Err(RecordSendError::Expired);
         }
-        let charge = (payload.len() + 2).max(MIN_RECORD_CHARGE) as u32;
+        let charge = record_queue_charge(payload.len()) as u32;
         let permit = Arc::clone(&self.0.capacity)
             .try_acquire_many_owned(charge)
             .map_err(|_| RecordSendError::Full)?;
@@ -315,7 +322,7 @@ async fn read_records<R: tokio::io::AsyncRead + Unpin>(mut reader: R, handle: Or
                 }
                 let now = Instant::now();
                 let expired = q.expire(now, handle.0.receive_max_age);
-                let charge = (bytes.len() + 2).max(MIN_RECORD_CHARGE);
+                let charge = record_queue_charge(bytes.len());
                 let mut dropped = 0u64;
                 // Loss-tolerant input must stay fresh rather than stop reading
                 // TCP and retain obsolete records upstream. Every record is
