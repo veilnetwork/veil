@@ -27,7 +27,30 @@ impl Drop for Tasks {
     }
 }
 
+struct WriteGate(std::sync::Mutex<(bool, Option<std::task::Waker>)>);
+impl WriteGate {
+    fn blocked(&self, cx: &Context<'_>) -> bool {
+        let mut state = self.0.lock().unwrap();
+        if state.0 {
+            state.1 = Some(cx.waker().clone());
+            true
+        } else {
+            false
+        }
+    }
+    fn release(&self) {
+        let wake = {
+            let mut state = self.0.lock().unwrap();
+            state.0 = false;
+            state.1.take()
+        };
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+    }
+}
 struct BlockedMain {
+    gate: Arc<WriteGate>,
     stream: BoxIoStream,
     attempted: Arc<tokio::sync::Notify>,
 }
@@ -42,23 +65,35 @@ impl tokio::io::AsyncRead for BlockedMain {
 }
 impl tokio::io::AsyncWrite for BlockedMain {
     fn poll_write(
-        self: Pin<&mut Self>,
-        _: &mut Context<'_>,
-        _: &[u8],
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        self.attempted.notify_one();
-        Poll::Pending
+        if self.gate.blocked(cx) {
+            self.attempted.notify_one();
+            Poll::Pending
+        } else {
+            Pin::new(&mut self.stream).poll_write(cx, bytes)
+        }
     }
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Pending
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.gate.blocked(cx) {
+            Poll::Pending
+        } else {
+            Pin::new(&mut self.stream).poll_flush(cx)
+        }
     }
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Pending
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.gate.blocked(cx) {
+            Poll::Pending
+        } else {
+            Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
     }
 }
 
 #[allow(clippy::await_holding_lock)]
-async fn run_reliable(abort: bool) {
+async fn run_reliable(abort: bool, rotate: bool) {
     // Rekey changes session keys, not transport lifetime. Do not inherit the
     // concurrent rotation test's process-wide 1–2 second close deadline.
     let _rotation = epic488_1_lock();
@@ -124,6 +159,7 @@ async fn run_reliable(abort: bool) {
     let mut endpoints = Vec::new();
     let mut diagnostics = Vec::new();
     let mut attempted = Vec::new();
+    let mut gates = Vec::new();
     let mut dispatchers = Vec::new();
     let app_id = [0xa0; 32];
     for (direction, (stream, handle)) in [
@@ -143,7 +179,10 @@ async fn run_reliable(abort: bool) {
         senders.push(sender);
         let writing = Arc::new(tokio::sync::Notify::new());
         attempted.push(writing.clone());
+        let gate = Arc::new(WriteGate(std::sync::Mutex::new((true, None))));
+        gates.push(gate.clone());
         runner.stream = Box::new(BlockedMain {
+            gate,
             stream,
             attempted: writing,
         });
@@ -168,6 +207,10 @@ async fn run_reliable(abort: bool) {
         runner.peer_id = [2 - direction as u8; 32];
         runner.session_id = [3; 32];
         runner.raw_session_keys = Some((tx, rx, [3; 32]));
+        if rotate && direction == 0 {
+            runner.rekey.time_threshold_secs = 1;
+            runner.rekey.bytes_threshold = u64::MAX;
+        }
         {
             runner.crypto.tx_cipher =
                 Some(veil_crypto::session_cipher::SessionCipher::new(&tx, true));
@@ -188,7 +231,7 @@ async fn run_reliable(abort: bool) {
     // The wrapper witnesses a Pending actual write, not an inferred sleep.
     for direction in 0..2 {
         for _ in 0..400 {
-            let mut h = FrameHeader::new(FrameFamily::Session as u8, SessionMsg::Keepalive as u16);
+            let mut h = FrameHeader::new(FrameFamily::Session as u8, SessionMsg::Padding as u16);
             h.body_len = 16384;
             let mut wire = encode_header(&h).to_vec();
             wire.extend(vec![0; 16384]);
@@ -300,6 +343,135 @@ async fn run_reliable(abort: bool) {
             }
         }
     }
+    if rotate {
+        let mut waiters = Vec::new();
+        let mut readers = Vec::new();
+        for direction in 0..2 {
+            let peer = [2 - direction as u8; 32];
+            let id = streams[direction];
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            dispatchers[direction]
+                .pending_stream_receipts
+                .lock()
+                .unwrap()
+                .insert((peer, id), tx);
+            waiters.push(rx);
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            dispatchers[direction]
+                .veil_stream_rx
+                .lock()
+                .unwrap()
+                .insert((peer, id), tx);
+            readers.push(rx);
+        }
+        for gate in &gates {
+            gate.release();
+        }
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if diagnostics.iter().all(|d| d.rekeys() > 0) {
+                    break;
+                }
+                // Idle fixtures disable keepalive/idle timers; give the normal
+                // event loop real canonical traffic to evaluate its rekey age.
+                let h = FrameHeader::new(FrameFamily::Session as u8, SessionMsg::Padding as u16);
+                senders[0]
+                    .send((
+                        veil_proto::priority::INTERACTIVE,
+                        veil_bufpool::pooled_shared_from_vec(encode_header(&h).to_vec()),
+                    ))
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("normal canonical key rotation did not complete");
+        for waiter in waiters {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), waiter)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                receipt_status::REJECTED
+            );
+        }
+        for mut reader in readers {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), reader.recv())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        for receiver in &mut receivers {
+            let mut closed = std::collections::HashSet::new();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !closed.contains(&streams[0]) || !closed.contains(&streams[1]) {
+                    match receiver.recv().await.unwrap() {
+                        AppMessage::StreamClose { stream_id } => {
+                            assert!(closed.insert(stream_id));
+                        }
+                        other => panic!("unexpected rekey event {other:?}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        }
+        // Canonical traffic must remain healthy, old child streams must not
+        // replay there, and a fresh stream must use the new child's cipher.
+        for direction in 0..2 {
+            let peer = [2 - direction as u8; 32];
+            let new_id=tokio::time::timeout(Duration::from_secs(5),async {
+                for attempt in 0..100 {
+                    let id=3000+direction as u32*1000+attempt;
+                    let before=diagnostics[direction].reliable_frames_sent();
+                    let (tx,rx)=tokio::sync::oneshot::channel();
+                    dispatchers[direction].pending_stream_receipts.lock().unwrap().insert((peer,id),tx);
+                    send_app(&senders[direction],id,AppMsg::AppOpen,&AppOpenPayload{app_id,endpoint_id:1,flags:0}.encode()).await;
+                    assert_eq!(tokio::time::timeout(Duration::from_secs(1),rx).await.unwrap().unwrap(),receipt_status::ACCEPTED);
+                    assert!(matches!(receivers[1-direction].recv().await.unwrap(),AppMessage::StreamOpen {stream_id,..} if stream_id==id));
+                    if diagnostics[direction].reliable_frames_sent()>before { return id; }
+                    send_app(&senders[direction],id,AppMsg::AppClose,&AppClosePayload{app_id,endpoint_id:1,reason:0}.encode()).await;
+                    assert!(matches!(receivers[1-direction].recv().await.unwrap(),AppMessage::StreamClose {stream_id} if stream_id==id));
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                panic!("new reliable generation did not admit a stream");
+            }).await.unwrap();
+            for (id, data) in [
+                (streams[direction], vec![0xee; 2048]),
+                (new_id, vec![0x77; 2048]),
+            ] {
+                send_app(
+                    &senders[direction],
+                    id,
+                    AppMsg::AppData,
+                    &AppDataPayload {
+                        app_id,
+                        endpoint_id: 1,
+                        seq: 0,
+                        data,
+                    }
+                    .encode(),
+                )
+                .await;
+            }
+            match tokio::time::timeout(Duration::from_secs(2), receivers[1 - direction].recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                AppMessage::StreamData { stream_id, data } => {
+                    assert_eq!(stream_id, new_id);
+                    assert_eq!(data, vec![0x77; 2048]);
+                }
+                other => panic!("old stream replay or new stream failure {other:?}"),
+            }
+            assert!(receivers[1 - direction].try_recv().is_err());
+        }
+        return;
+    }
     if abort {
         let peer = [2; 32];
         let id = streams[0];
@@ -403,10 +575,15 @@ async fn send_app(
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reliable_app_streams_and_receipts_bypass_blocked_canonical_writers() {
-    run_reliable(false).await;
+    run_reliable(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reliable_runner_retirement_wakes_open_receipts_and_stream_readers() {
-    run_reliable(true).await;
+    run_reliable(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reliable_runner_rekey_aborts_old_streams_and_reopens_with_fresh_child_cipher() {
+    run_reliable(false, true).await;
 }
