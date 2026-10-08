@@ -116,7 +116,8 @@ pub struct RecvMeta {
     /// FreeBSD, OpenBSD, NetBSD, macOS, and iOS.
     pub dst_ip: Option<IpAddr>,
     /// Optional kernel receive time in Unix nanoseconds. Available only when
-    /// receive timestamp tracing is enabled on Linux/Android. A GRO buffer
+    /// receive timestamp tracing is enabled on Linux/Android or Apple systems
+    /// (Apple stamps have microsecond precision). A GRO buffer
     /// has one shared stamp, not a separate stamp per contained datagram.
     pub kernel_recv_unix_ns: Option<u64>,
 }

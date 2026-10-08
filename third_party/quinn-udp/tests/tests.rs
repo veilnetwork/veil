@@ -10,6 +10,60 @@ use quinn_udp::{EcnCodepoint, RecvMeta, Transmit, UdpSocketState};
 use socket2::Socket;
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "android", apple))]
+fn receive_timestamp_is_opt_in_and_precedes_a_delayed_reader() {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    fn unix_ns() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
+    for ip in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        let send = UdpSocket::bind((ip, 0)).unwrap();
+        let recv = UdpSocket::bind((ip, 0)).unwrap();
+        let state = UdpSocketState::new((&recv).into()).unwrap();
+        recv.set_nonblocking(false).unwrap();
+        recv.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        for enabled in [false, true, false] {
+            state.set_receive_timestamp_trace((&recv).into(), enabled);
+            let bytes = [u8::from(enabled); 8];
+            let before = unix_ns();
+            send.send_to(&bytes, recv.local_addr().unwrap()).unwrap();
+            let queued = unix_ns();
+            // Deliberately leave the packet in the kernel queue. A user-space
+            // poll timestamp cannot identify this delay as local reader wait.
+            std::thread::sleep(Duration::from_millis(40));
+            let read_start = unix_ns();
+            let mut buf = [0; 32];
+            let mut meta = RecvMeta::default();
+            assert_eq!(
+                state
+                    .recv(
+                        (&recv).into(),
+                        &mut [IoSliceMut::new(&mut buf)],
+                        slice::from_mut(&mut meta)
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(&buf[..meta.len], &bytes);
+            if enabled {
+                let stamp = meta.kernel_recv_unix_ns.expect("kernel receive timestamp");
+                assert!(stamp >= before.saturating_sub(1000));
+                assert!(stamp <= queued + 1_000_000);
+                assert!(read_start.saturating_sub(stamp) >= 30_000_000);
+            } else {
+                assert_eq!(meta.kernel_recv_unix_ns, None);
+            }
+        }
+    }
+}
+
+#[test]
 fn basic() {
     let send = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
         .or_else(|_| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)))
