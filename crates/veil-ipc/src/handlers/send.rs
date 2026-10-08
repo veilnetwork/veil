@@ -38,7 +38,9 @@ use crate::IpcMetrics;
 
 #[path = "source_envelope.rs"]
 mod source_envelope;
-use source_envelope::{DirectAdmission, EnvelopeChunks, admit_direct_plain, admit_direct_sealed};
+use source_envelope::{
+    DirectAdmission, EnvelopeChunks, admit_direct_plain, admit_direct_sealed, source_segment_bytes,
+};
 
 /// How long a discovery that found no route is believed.
 ///
@@ -1371,7 +1373,7 @@ pub(crate) async fn handle_ipc_send(
         let mut direct_admission_failed = false;
         let sent = if !relay_realtime
             && let Some((payload, _)) = &sealed
-            && payload.len() > veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES
+            && payload.len() > source_segment_bytes(reg, payload.len())
         {
             let devices = reg.devices_of(&send.dst_node_id);
             let selected = if devices.is_empty() {
@@ -1761,14 +1763,13 @@ pub(crate) async fn handle_ipc_send(
                 // losing epidemic broadcast.
                 //
                 if (!relay_realtime
-                    && envelope.payload.len()
-                        > veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES)
+                    && envelope.payload.len() > source_segment_bytes(reg, envelope.payload.len()))
                     || envelope.payload.len() > veil_proto::delivery::ENVELOPE_CHUNKING_THRESHOLD
                 {
                     let segment_size = if relay_realtime {
                         veil_proto::budget::MAX_CHUNK_PAYLOAD
                     } else {
-                        veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES
+                        source_segment_bytes(reg, envelope.payload.len())
                     };
                     let want_ack = send.require_ack;
                     let orig_content_id = envelope.content_id;
@@ -3455,6 +3456,7 @@ mod ratchet_send_tests {
             registry.clone(),
         )));
         assert!(rlock!(registry).send_to(&PEER, veil_proto::priority::BACKGROUND, vec![0]));
+        rlock!(registry).note_local_source_feedback(false, std::time::Instant::now());
         let data = vec![0x39; 12_000];
         let body = payload(false, &data);
         let mut wh = sink().await;
@@ -3498,6 +3500,8 @@ mod ratchet_send_tests {
         );
         let (dispatcher, _endpoint, mut receiver) = direct_receiver(&fx.peer, PEER, PEER_INSTANCE);
         for (lane, frame) in frames {
+            // The sealed transfer retains a packet-sized source piece plus hop AEAD.
+            assert!(frame.len() + 16 <= 1200);
             assert_eq!(lane, veil_proto::priority::BACKGROUND);
             feed_direct(&dispatcher, &frame);
         }
