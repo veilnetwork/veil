@@ -21,6 +21,7 @@ struct Parent {
     tx: Zeroizing<[u8; 32]>,
     rx: Zeroizing<[u8; 32]>,
     active: AtomicBool,
+    retired: tokio::sync::watch::Sender<bool>,
 }
 
 /// Owns credentials copied from an authenticated canonical session. Dropping
@@ -63,6 +64,7 @@ pub struct ParallelKeys {
     pub session_id: [u8; 32],
     tx: Zeroizing<[u8; 32]>,
     rx: Zeroizing<[u8; 32]>,
+    parent: ParallelParentHandle,
 }
 
 impl std::fmt::Debug for ParallelKeys {
@@ -79,6 +81,130 @@ impl ParallelKeys {
     }
     pub fn rx_key(&self) -> &[u8; 32] {
         &self.rx
+    }
+
+    /// Start the explicitly negotiated ordered record codec only after this
+    /// connection's mutual proof is finished. The caller transfers the SAME
+    /// child stream whose fresh exporter was used for that proof.
+    pub fn into_ordered(
+        self,
+        stream: veil_transport::BoxIoStream,
+    ) -> Result<BoundOrderedChannel, BindingError> {
+        self.parent.check_active()?;
+        let plane = veil_transport::ordered_records::OrderedRecordPlane::new(stream);
+        let handle = plane.handle();
+        let parent = self.parent.clone();
+        let lifetime = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = parent.retired() => handle.close(),
+                _ = handle.closed() => {},
+            }
+        });
+        Ok(BoundOrderedChannel {
+            keys: self,
+            plane,
+            lifetime,
+        })
+    }
+}
+
+/// Verified child credentials, framed stream and the canonical owner's
+/// lifetime kept together. Handles retain neither admission nor task ownership.
+pub struct BoundOrderedChannel {
+    pub keys: ParallelKeys,
+    plane: veil_transport::ordered_records::OrderedRecordPlane,
+    lifetime: tokio::task::JoinHandle<()>,
+}
+
+impl BoundOrderedChannel {
+    pub fn handle(&self) -> BoundOrderedHandle {
+        BoundOrderedHandle {
+            records: self.plane.handle(),
+            parent: self.keys.parent.clone(),
+        }
+    }
+}
+
+/// Admission remains tied to the canonical owner even before its asynchronous
+/// retirement task gets CPU time. No retained raw handle can enqueue new data
+/// after retirement or drain records to a retired session.
+#[derive(Clone)]
+pub struct BoundOrderedHandle {
+    records: veil_transport::ordered_records::OrderedRecordHandle,
+    parent: ParallelParentHandle,
+}
+
+impl BoundOrderedHandle {
+    pub fn max_size(&self) -> Option<usize> {
+        self.parent
+            .is_active()
+            .then(|| self.records.max_size())
+            .flatten()
+    }
+
+    pub fn send_buffer_space(&self) -> usize {
+        if self.parent.is_active() {
+            self.records.send_buffer_space()
+        } else {
+            0
+        }
+    }
+
+    pub fn send(
+        &self,
+        payload: &[u8],
+    ) -> Result<(), veil_transport::ordered_records::RecordSendError> {
+        if !self.parent.is_active() {
+            return Err(veil_transport::ordered_records::RecordSendError::Closed);
+        }
+        self.records.send(payload)
+    }
+
+    pub fn send_before(
+        &self,
+        payload: &[u8],
+        expires_at: std::time::Instant,
+    ) -> Result<(), veil_transport::ordered_records::RecordSendError> {
+        if !self.parent.is_active() {
+            return Err(veil_transport::ordered_records::RecordSendError::Closed);
+        }
+        self.records.send_before(payload, expires_at)
+    }
+
+    pub async fn recv(&self) -> std::io::Result<Vec<u8>> {
+        let result = tokio::select! {
+            biased;
+            _ = self.parent.retired() => Err(std::io::ErrorKind::ConnectionAborted.into()),
+            result = self.records.recv() => result,
+        };
+        if !self.parent.is_active() {
+            return Err(std::io::ErrorKind::ConnectionAborted.into());
+        }
+        result
+    }
+
+    pub fn close(&self) {
+        self.records.close();
+    }
+
+    pub async fn closed(&self) {
+        tokio::select! {
+            biased;
+            _ = self.parent.retired() => {},
+            _ = self.records.closed() => {},
+        }
+    }
+
+    pub fn progress(&self) -> veil_transport::ordered_records::RecordProgress {
+        self.records.progress()
+    }
+}
+
+impl Drop for BoundOrderedChannel {
+    fn drop(&mut self) {
+        self.plane.handle().close();
+        self.lifetime.abort();
     }
 }
 
@@ -122,6 +248,7 @@ impl ParallelParent {
                 tx: Zeroizing::new(tx),
                 rx: Zeroizing::new(rx),
                 active: AtomicBool::new(true),
+                retired: tokio::sync::watch::channel(false).0,
             })),
         }
     }
@@ -133,6 +260,20 @@ impl ParallelParentHandle {
     }
     pub fn retire(&self) {
         self.0.active.store(false, Ordering::Release);
+        self.0.retired.send_replace(true);
+    }
+
+    /// Wake idle auxiliary tasks on owner drop/rekey without polling timers.
+    pub async fn retired(&self) {
+        let mut retired = self.0.retired.subscribe();
+        loop {
+            if *retired.borrow_and_update() {
+                return;
+            }
+            if retired.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     fn check_active(&self) -> Result<(), BindingError> {
@@ -143,7 +284,7 @@ impl ParallelParentHandle {
         }
     }
 
-    /// Use the new QUIC connection's exporter, never the parent's exporter.
+    /// Use the new child connection's exporter, never the parent's exporter.
     pub fn begin(
         &self,
         exporter: [u8; 32],
@@ -174,8 +315,8 @@ impl ParallelParentHandle {
     }
 
     /// Verify before interpreting any child frames. Call once per newly
-    /// accepted QUIC connection, using its exporter. A captured preface cannot
-    /// authenticate a different TLS connection, even to the same UDP endpoint.
+    /// accepted connection, using its exporter. A captured preface cannot
+    /// authenticate a different encrypted connection to the same endpoint.
     pub fn accept(
         &self,
         hello: &[u8; HELLO_BYTES],
@@ -216,6 +357,7 @@ impl ParallelParentHandle {
         id.update(exporter);
         ParallelKeys {
             session_id: *id.finalize().as_bytes(),
+            parent: self.clone(),
             tx: Zeroizing::new(proof(
                 &self.0.tx,
                 b"veil/parallel/key/v1",

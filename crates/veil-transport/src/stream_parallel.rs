@@ -56,6 +56,16 @@ impl StreamParallelHandle {
         self.0.target.is_some() && !self.0.parent.is_cancelled()
     }
 
+    /// Local outgoing reservations, including handshakes. Incoming siblings
+    /// cannot consume this partition; this snapshot does not reserve a slot.
+    pub fn available_connection_slots(&self) -> usize {
+        if self.0.parent.is_cancelled() {
+            0
+        } else {
+            self.0.outgoing.available_permits()
+        }
+    }
+
     pub async fn closed(&self) {
         self.0.parent.cancelled().await;
     }

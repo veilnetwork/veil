@@ -533,6 +533,7 @@ pub async fn register_connection_session(
     // the ordered-stream-only behavior exactly.
     let quic_datagrams = connection.quic_datagrams();
     let parallel_quic = connection.parallel_quic();
+    let stream_binding = connection.stream_channel_binding();
     let mut stream = match connection.into_stream() {
         Ok(stream) => stream,
         Err(err) => {
@@ -580,14 +581,14 @@ pub async fn register_connection_session(
         }
     }
 
-    // Shared QUIC listeners dispatch generic siblings through a live parent.
+    // Shared encrypted listeners dispatch generic siblings through a live parent.
     // No new peer, OVL1 handshake or canonical IP slot is created for a child.
     if matches!(source, SessionSource::Inbound(_)) {
         use veil_session::runner::ParallelPeekOutcome;
         match runtime
             .handoff
             .parallel
-            .peek_and_dispatch(stream, quic_datagrams.clone())
+            .peek_and_dispatch_with_binding(stream, quic_datagrams.clone(), stream_binding)
             .await
         {
             ParallelPeekOutcome::Bound => return Ok(None),
