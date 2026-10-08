@@ -175,9 +175,9 @@ Future<void> _observeWriteProgress(int addr, Uint8List data,
 
 void _writeNativeChunks(int total, SendPort? progress,
     void Function(int offset, int length) write) {
-  // Two endpoint AppData segments, within the negotiated 8 KiB IPC window.
+  // One SDK STREAM_DATA chunk, within the negotiated 8 KiB IPC window.
   // Only an observation granularity; no receive limit or wire priority.
-  const progressChunkBytes = 7800;
+  const progressChunkBytes = 2048;
   var offset = 0;
   do {
     // A single worker and allocation for the entire application write. With
