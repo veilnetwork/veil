@@ -1437,6 +1437,28 @@ pub async fn register_connection_session(
             link_id, source, session_state, remote_identity.node_id
         ),
     );
+    // Local diagnosis of carrier availability versus authenticated peer
+    // permission. A connection handle alone does not prove that auxiliary
+    // channels can be opened; old peers must retain their ordered fallback.
+    // This records no application role, priority, address or wire metadata.
+    runtime.logger.info(
+        "session.channels_offered",
+        format!(
+            "link_id={} caps_stated={} quic_available={} ordered_available={} peer_datagrams={} peer_flows={} peer_rotates={} peer_parallel_quic={} peer_shared_quic={} peer_duplex_quic={} peer_parallel_ordered={} peer_reliable_parallel={}",
+            link_id,
+            remote_identity.remote_caps_stated,
+            quic_datagrams.is_some(),
+            parallel_ordered.is_some(),
+            remote_identity.supports_realtime_datagrams,
+            remote_identity.supports_datagram_flows,
+            remote_identity.supports_realtime_rekey,
+            remote_identity.supports_parallel_quic,
+            remote_identity.supports_shared_parallel_quic,
+            remote_identity.supports_duplex_parallel_quic,
+            remote_identity.supports_parallel_ordered,
+            remote_identity.supports_reliable_parallel,
+        ),
+    );
     // Notify reputation tracker of session open, keyed on sovereign node_id.
     // The session was just registered above, so `node_id_for_peer` returns
     // `Some(...)` for sovereign peers; legacy peers fall back to peer_id.
