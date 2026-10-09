@@ -210,14 +210,17 @@ async fn run(rotate: bool) {
     ];
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if diagnostics.iter().all(|d| d.active_connections() == 6)
-                && senders.iter().all(|sender| {
-                    sources.iter().all(|&p| {
-                        sender.local_datagram_channel_state(p)
-                            == veil_session::LocalDatagramChannelState::Ready
-                    })
-                })
-            {
+            // Request every producer before observing readiness. Short-circuit
+            // `all` would request just one per tick and can miss this fixture's
+            // deliberately short one-second credential generation.
+            let mut channels_ready = true;
+            for sender in &senders {
+                for &source in &sources {
+                    channels_ready &= sender.request_local_datagram_channel(source)
+                        == veil_session::LocalDatagramChannelState::Ready;
+                }
+            }
+            if diagnostics.iter().all(|d| d.active_connections() == 6) && channels_ready {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
