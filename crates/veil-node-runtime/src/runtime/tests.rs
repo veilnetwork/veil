@@ -3789,6 +3789,94 @@ async fn punched_outbound_registration_lives_with_runner_and_cancellation() {
     }
 }
 
+/// The real call-path attempt has one five-second budget, including its
+/// handshake reserve. Four silent coordinators must not each spend a full
+/// signaling timeout or leave waiters behind when the shared deadline ends.
+#[tokio::test(flavor = "current_thread")]
+async fn nat_signaling_respects_call_path_budget_and_releases_waiters() {
+    use veil_proto::{codec::decode_header, family::ControlMsg, header::HEADER_SIZE};
+
+    let reflector = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut config = runtime_config_with_listen();
+    config.identity.as_mut().unwrap().lazy_mining = false;
+    config.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+    config.nat.udp_reflectors = vec![reflector.local_addr().unwrap().to_string()];
+    let path = save_test_config("punch-signaling-deadline", config).unwrap();
+    let mut rt = NodeRuntime::start(&path, true).await.unwrap();
+    let services = rt.access();
+    let target = services.local_node_id;
+    let mut receivers = Vec::new();
+    for index in 1..=4 {
+        let mut coordinator = target;
+        coordinator[31] ^= index;
+        receivers.push(
+            services
+                .session_tx_registry
+                .write()
+                .unwrap()
+                .register(coordinator),
+        );
+    }
+    let discovery = tokio::spawn(async move {
+        let mut request = [0u8; 64];
+        let (bytes, sender) = timeout(Duration::from_secs(2), reflector.recv_from(&mut request))
+            .await
+            .expect("the call path must reach UDP discovery")
+            .unwrap();
+        assert_eq!(bytes, 64);
+        assert_eq!(&request[..8], b"VEILUDP1");
+        assert_eq!(request[8], 1);
+        // Return a valid non-hairpin mapping to enter actual coordinator
+        // signaling. No coordinator replies, so no Internet punch is sent.
+        request[8] = 2;
+        request[9] = 4;
+        request[26..30].copy_from_slice(&[8, 8, 8, 8]);
+        request[42..44].copy_from_slice(&32000u16.to_be_bytes());
+        reflector.send_to(&request, sender).await.unwrap();
+    });
+    let began = tokio::time::Instant::now();
+    let outcome = services.attempt_p2p_hole_punch(target).await;
+    let elapsed = began.elapsed();
+    let waiters = lock!(services.dispatcher.nat_probe_waiters).len();
+    let flights = lock!(services.hole_punch_inflight).len();
+    let consulted: usize = receivers
+        .iter_mut()
+        .map(|rx| {
+            let mut requests = 0;
+            while let Ok((_, frame)) = rx.try_recv() {
+                if frame.len() >= HEADER_SIZE
+                    && decode_header(&frame[..HEADER_SIZE])
+                        .is_ok_and(|header| header.msg_type == ControlMsg::NatProbeRequest as u16)
+                {
+                    requests += 1;
+                }
+            }
+            requests
+        })
+        .sum();
+    let discovery_result = discovery.await;
+    rt.stop().await.unwrap();
+    let _ = fs::remove_file(path);
+    discovery_result.unwrap();
+    eprintln!(
+        "NAT signaling: elapsed={elapsed:?} requests={consulted} waiters={waiters} flights={flights}"
+    );
+    assert_eq!(outcome, veil_ipc::HolePunchOutcome::SignalingTimeout);
+    assert!(
+        elapsed < Duration::from_millis(4750),
+        "shared call-path budget exceeded: {elapsed:?}"
+    );
+    assert!(
+        consulted < 4,
+        "the exhausted deadline must stop the coordinator ladder: {consulted} requests in {elapsed:?}"
+    );
+    assert_eq!(waiters, 0, "expired coordinator waiters must be removed");
+    assert_eq!(
+        flights, 0,
+        "the attempt must release its single-flight slot"
+    );
+}
+
 /// Mixed-version network: a coordinator built before the punch-token wire
 /// extension strips the token in flight, so the initiator's reply comes back
 /// without it. Such a reply must NOT terminate the coordinator ladder — the
