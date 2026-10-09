@@ -3,8 +3,8 @@
 use super::*;
 use crate::parallel_binding::{HELLO_BYTES, ParallelKeys, ParallelParent, ParallelParentHandle};
 
-#[path = "primary_recovery.rs"]
-mod primary_recovery;
+#[path = "datagram_recovery.rs"]
+mod datagram_recovery;
 #[path = "parallel_recovery_trace.rs"]
 mod recovery_trace;
 #[path = "parallel_registry.rs"]
@@ -229,6 +229,8 @@ struct Slot {
     )>,
     retry_after: Option<std::time::Instant>,
     replacing: bool,
+    recovery: datagram_recovery::ChannelRecovery,
+    last_selected: Option<std::time::Instant>,
 }
 
 async fn connect_sender(
@@ -545,7 +547,7 @@ pub(super) struct ParallelSession {
     slots: [Slot; TOTAL_SLOTS],
     transit_salt: [u8; 32],
     assignments: channel_assignments::ChannelAssignments<TOTAL_SLOTS>,
-    primary_recovery: primary_recovery::PrimaryRecovery,
+    recovery_schedule: datagram_recovery::RecoverySchedule,
     reliable: Option<super::reliable_session::ReliableSession>,
 }
 
@@ -612,7 +614,7 @@ impl ParallelSession {
             slots: Default::default(),
             assignments: Default::default(),
             transit_salt: blake3::derive_key("veil/transit-shard/v1", &sid),
-            primary_recovery: Default::default(),
+            recovery_schedule: Default::default(),
             reliable,
         }
     }
@@ -689,10 +691,10 @@ impl ParallelSession {
                 .flatten();
             self.assignments.transit(ingress, bucket)?
         };
+        let now = std::time::Instant::now();
+        self.slots[selected.physical].last_selected = Some(now);
         let prepared = self.prepare_index(selected.physical);
-        if priority == veil_proto::priority::REALTIME {
-            self.recover_primary(std::time::Instant::now());
-        }
+        self.recover_channels(now);
         prepared.then_some(selected)
     }
 
@@ -709,7 +711,8 @@ impl ParallelSession {
             .quic()
             .unwrap()
             .path_stats();
-        self.primary_recovery
+        self.slots[index]
+            .recovery
             .observe(old_stats, std::time::Instant::now());
         let ready = connect_sender(
             self.offer.clone(),
@@ -727,7 +730,7 @@ impl ParallelSession {
         self.slots[index].replacing = true;
     }
 
-    fn prepare_index(&mut self, index: usize) -> bool {
+    fn poll_index(&mut self, index: usize) {
         let slot = &mut self.slots[index];
         if slot
             .ready
@@ -750,13 +753,13 @@ impl ParallelSession {
                             .diagnostics
                             .recovery_switches
                             .fetch_add(1, Ordering::AcqRel);
-                        self.primary_recovery.reset();
+                        slot.recovery.reset();
                         self.context.logger.info(
                             "session.parallel.recovery_switched",
                             format!(
                                 "peer_id={} local_slot={}",
                                 hex_short(&self.context.peer_id),
-                                veil_proto::priority::REALTIME
+                                index
                             ),
                         );
                     }
@@ -779,6 +782,16 @@ impl ParallelSession {
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn prepare_without_recovery(&mut self, index: usize) -> bool {
+        self.prepare_index(index)
+    }
+
+    fn prepare_index(&mut self, index: usize) -> bool {
+        self.poll_index(index);
+        let slot = &self.slots[index];
         if slot.ready.is_some() {
             return true;
         }
@@ -799,7 +812,7 @@ impl ParallelSession {
         let status = self.readiness.as_ref().map(|lease| lease.status());
         let mut trace = self.slots[index]
             .replacing
-            .then(|| recovery_trace::Attempt::new(&context, offer.handle.clone()));
+            .then(|| recovery_trace::Attempt::new(&context, offer.handle.clone(), index));
         let (tx, rx) = tokio::sync::oneshot::channel();
         let task = RealtimeReceiverTask(tokio::spawn(async move {
             match tokio::time::timeout(
@@ -832,66 +845,76 @@ impl ParallelSession {
         self.slots[index].warm = Some((rx, task));
     }
 
-    fn recover_primary(&mut self, now: std::time::Instant) {
-        use primary_recovery::Action;
-        let Some(index) = self
-            .assignments
-            .source_physical(channel_index(veil_proto::priority::REALTIME).unwrap())
-        else {
+    fn recover_channels(&mut self, now: std::time::Instant) {
+        use datagram_recovery::Action;
+        let mut eligible = [false; TOTAL_SLOTS];
+        let mut snapshots = [None; TOTAL_SLOTS];
+        // Adopt verified candidates before looking at ACK progress, including
+        // a candidate for a channel other than the currently selected one.
+        for index in 0..TOTAL_SLOTS {
+            self.poll_index(index);
+            let slot = &mut self.slots[index];
+            let Some(ready) = &slot.ready else {
+                slot.recovery.reset();
+                continue;
+            };
+            let stats = {
+                let sender = lock!(ready.sender);
+                if sender.broken {
+                    continue;
+                }
+                sender
+                    .handle
+                    .quic()
+                    .expect("QUIC session child")
+                    .path_stats()
+            };
+            snapshots[index] = Some(stats);
+            match slot.recovery.observe(stats, now) {
+                Action::Progress if slot.replacing => {
+                    // The old channel recovered while proof was pending. Reap the
+                    // redundant task/channel instead of churning a healthy sender.
+                    slot.warm = None;
+                    slot.replacing = false;
+                    self.context.logger.info(
+                        "session.parallel.recovery_cancelled",
+                        format!(
+                            "peer_id={} local_slot={} reason=ack_progress",
+                            hex_short(&self.context.peer_id),
+                            index,
+                        ),
+                    );
+                }
+                Action::Probe if slot.warm.is_none() => {
+                    eligible[index] = slot.last_selected.is_some_and(|at| {
+                        now.saturating_duration_since(at) <= datagram_recovery::ACTIVE_FOR
+                    });
+                }
+                _ => {}
+            }
+        }
+        let replacing = self.slots.iter().any(|slot| slot.replacing);
+        let Some(index) = self.recovery_schedule.choose(eligible, replacing, now) else {
             return;
         };
         let slot = &mut self.slots[index];
-        let Some(ready) = &slot.ready else {
-            self.primary_recovery.reset();
-            return;
-        };
-        let stats = {
-            let sender = lock!(ready.sender);
-            if sender.broken {
-                return;
-            }
-            sender
-                .handle
-                .quic()
-                .expect("QUIC session child")
-                .path_stats()
-        };
-        match self.primary_recovery.observe(stats, now) {
-            Action::Progress if slot.replacing => {
-                // The old channel recovered while proof was pending. Reap the
-                // redundant task/channel instead of churning a healthy sender.
-                slot.warm = None;
-                slot.replacing = false;
-                self.context.logger.info(
-                    "session.parallel.recovery_cancelled",
-                    format!(
-                        "peer_id={} local_slot={} reason=ack_progress",
-                        hex_short(&self.context.peer_id),
-                        veil_proto::priority::REALTIME,
-                    ),
-                );
-            }
-            Action::Probe if slot.warm.is_none() => {
-                self.primary_recovery.attempted(now);
-                slot.replacing = true;
-                self.offer
-                    .diagnostics
-                    .recovery_attempts
-                    .fetch_add(1, Ordering::AcqRel);
-                self.context.logger.info(
-                    "session.parallel.recovery_started",
-                    format!(
-                        "peer_id={} local_slot={} pto_count={} expired={}",
-                        hex_short(&self.context.peer_id),
-                        veil_proto::priority::REALTIME,
-                        stats.pto_count,
-                        stats.expired_outgoing_datagrams
-                    ),
-                );
-                self.start_warm(index);
-            }
-            _ => {}
-        }
+        slot.recovery.attempted(now);
+        slot.replacing = true;
+        self.offer
+            .diagnostics
+            .recovery_attempts
+            .fetch_add(1, Ordering::AcqRel);
+        let stats = snapshots[index].expect("eligible channel snapshot");
+        self.context.logger.info(
+            "session.parallel.recovery_started",
+            format!(
+                "peer_id={} local_slot={index} pto_count={} expired={}",
+                hex_short(&self.context.peer_id),
+                stats.pto_count,
+                stats.expired_outgoing_datagrams,
+            ),
+        );
+        self.start_warm(index);
     }
 
     #[cfg(test)]

@@ -38,17 +38,23 @@ pub(super) struct Attempt {
     logger: Arc<veil_observability::NodeLogger>,
     peer: NodeIdBytes,
     handle: QuicParallelHandle,
+    index: usize,
     started: std::time::Instant,
     phase: AtomicU8,
     finished: bool,
 }
 
 impl Attempt {
-    pub(super) fn new(context: &RealtimeReceiverContext, handle: QuicParallelHandle) -> Self {
+    pub(super) fn new(
+        context: &RealtimeReceiverContext,
+        handle: QuicParallelHandle,
+        index: usize,
+    ) -> Self {
         Self {
             logger: Arc::clone(&context.logger),
             peer: context.peer_id,
             handle,
+            index,
             started: std::time::Instant::now(),
             phase: AtomicU8::new(Phase::Connect as u8),
             finished: false,
@@ -72,7 +78,7 @@ impl Attempt {
             format!(
                 "peer_id={} local_slot={} result={result} reason={reason} phase={} elapsed_ms={} available_slots={}",
                 hex_short(&self.peer),
-                veil_proto::priority::REALTIME,
+                self.index,
                 Phase::label(self.phase.load(Ordering::Relaxed)),
                 self.started.elapsed().as_millis(),
                 self.handle.available_connection_slots(),
