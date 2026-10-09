@@ -100,6 +100,12 @@ pub struct QuicDatagramPathStats {
 }
 
 impl QuicDatagramHandle {
+    /// Join opt-in local path counters to encrypted UDP send samples without
+    /// exposing socket addresses, pointer values or wire connection IDs.
+    pub fn local_trace_id(&self) -> u64 {
+        self.connection.local_trace_id()
+    }
+
     /// Snapshot actual transport progress, separately from queue admission.
     pub fn path_stats(&self) -> QuicDatagramPathStats {
         let stats = self.connection.stats();
