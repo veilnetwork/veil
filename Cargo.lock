@@ -5327,6 +5327,7 @@ dependencies = [
  "veil-observability",
  "veil-proto",
  "veil-proxy",
+ "veil-routing",
  "veil-session",
  "veil-transport",
  "veil-types",
