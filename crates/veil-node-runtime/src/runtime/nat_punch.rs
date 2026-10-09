@@ -79,6 +79,27 @@ impl NodeServices {
         per_coordinator_timeout: std::time::Duration,
         punch_token: Option<[u8; 16]>,
     ) -> Option<veil_proto::control::NatProbeReplyPayload> {
+        self.try_nat_traversal_with_punch_token_until(
+            target_node_id,
+            local_candidates,
+            per_coordinator_timeout,
+            punch_token,
+            None,
+        )
+        .await
+    }
+
+    /// A punch's shared deadline also bounds the coordinator ladder. Keep
+    /// each wait inside that deadline so normal timeout cleanup removes its
+    /// waiter; cancelling the entire ladder would leave a waiter behind.
+    async fn try_nat_traversal_with_punch_token_until(
+        &self,
+        target_node_id: [u8; 32],
+        local_candidates: Vec<veil_proto::control::NatCandidate>,
+        per_coordinator_timeout: std::time::Duration,
+        punch_token: Option<[u8; 16]>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Option<veil_proto::control::NatProbeReplyPayload> {
         let local_node_id = *self.identity.local_identity.node_id.as_bytes();
         let mut candidates: Vec<[u8; 32]> = rlock!(self.session_tx_registry)
             .peer_ids()
@@ -110,12 +131,21 @@ impl NodeServices {
         }
 
         for coordinator in candidates.into_iter().take(MAX_COORDINATOR_ATTEMPTS) {
+            let timeout = deadline
+                .map(|at| {
+                    at.saturating_duration_since(tokio::time::Instant::now())
+                        .min(per_coordinator_timeout)
+                })
+                .unwrap_or(per_coordinator_timeout);
+            if timeout.is_zero() {
+                break;
+            }
             if let Some(reply) = self
                 .attempt_nat_traversal_via_with_punch_token(
                     target_node_id,
                     coordinator,
                     local_candidates.clone(),
-                    per_coordinator_timeout,
+                    timeout,
                     punch_token,
                 )
                 .await
@@ -472,11 +502,12 @@ impl NodeServices {
         }
         let signaling_timeout = remaining.min(std::time::Duration::from_millis(1_500));
         let reply = self
-            .try_nat_traversal_with_punch_token(
+            .try_nat_traversal_with_punch_token_until(
                 target_node_id,
                 vec![candidate],
                 signaling_timeout,
                 Some(punch_token),
+                Some(deadline),
             )
             .await
             .ok_or(HolePunchDialFailure::SignalingTimeout)?;
