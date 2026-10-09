@@ -78,6 +78,15 @@ pub(crate) fn clamp_downlink_mss(stream: &TcpStream) {
 /// throughput is not gated by one socket's clamp.
 pub(crate) const UPLINK_SNDBUF_CLAMP: usize = 64 * 1024;
 
+/// Equal unsent readiness threshold for every TCP connection, including
+/// canonical, reliable and generic loss-tolerant children. SO_SNDBUF alone
+/// can hide a large unsent backlog from the userspace write deadline. Keep
+/// unacknowledged in-flight capacity while making new writes encounter
+/// backpressure sooner. This reveals no payload role and changes no priority.
+/// The kernel can overshoot by a segment/current write; this is not a hard cap.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const TCP_UNSENT_LOWAT: u32 = 4096;
+
 /// Best-effort `SO_SNDBUF` clamp (see [`UPLINK_SNDBUF_CLAMP`]). A failure is
 /// a missed optimisation, never a correctness problem, so the `Err` is
 /// swallowed — same stance as [`clamp_downlink_mss`].
@@ -90,6 +99,9 @@ pub(crate) fn clamp_uplink_sndbuf(stream: &TcpStream) {
         .filter(|v| *v >= 64 * 1024)
         .unwrap_or(UPLINK_SNDBUF_CLAMP);
     let _ = SockRef::from(stream).set_send_buffer_size(bytes);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // Unsupported older kernels retain the existing send-buffer clamp.
+    let _ = SockRef::from(stream).set_tcp_notsent_lowat(TCP_UNSENT_LOWAT);
 }
 
 /// Apply every TCP option that must be set on a newly accepted socket.
@@ -456,6 +468,70 @@ fn build_reuseaddr_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn stalled_reader_bounds_unsent_queue_and_reliable_bytes_resume() {
+        use std::{os::fd::AsRawFd, time::Duration};
+        use tokio::io::AsyncReadExt;
+
+        // Set a small receive window before SYN, then withhold application
+        // reads. This is real kernel backpressure, not a mocked slow writer.
+        let listener = bind_tcp_with_reuseaddr("127.0.0.1", 0).await.unwrap();
+        SockRef::from(&listener).set_recv_buffer_size(4096).unwrap();
+        let ctx = TransportContext::for_debug().unwrap();
+        let (client, server) = tokio::join!(
+            connect_tcp_stream("127.0.0.1", listener.local_addr().unwrap().port(), &ctx),
+            listener.accept(),
+        );
+        let client = client.unwrap();
+        let mut server = server.unwrap().0;
+        configure_accepted_tcp(&server, true, None).unwrap();
+        for stream in [&client, &server] {
+            assert_eq!(SockRef::from(stream).tcp_notsent_lowat().unwrap(), 4096);
+        }
+
+        let payload = [0x5a; 1200];
+        let mut written = 0;
+        let mut peak_unsent = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while tokio::time::Instant::now() < deadline {
+            if timeout(Duration::from_millis(10), client.writable())
+                .await
+                .is_ok()
+            {
+                match client.try_write(&payload) {
+                    Ok(n) => written += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("write failed: {e}"),
+                }
+            }
+            let mut unsent: libc::c_int = 0;
+            // SAFETY: this ioctl writes exactly one c_int to a live buffer;
+            // the borrowed stream keeps its descriptor open throughout.
+            let result =
+                unsafe { libc::ioctl(client.as_raw_fd(), libc::SIOCOUTQNSD as _, &mut unsent) };
+            assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+            peak_unsent = peak_unsent.max(unsent);
+        }
+        assert!(
+            written > 0 && peak_unsent > 0,
+            "must exercise a stalled queue"
+        );
+        // LOWAT is a readiness threshold, not a hard byte cap: one kernel
+        // segment/current write can overshoot. Leave room for both, but reject
+        // the tens of KiB accepted by the previous SO_SNDBUF-only policy.
+        assert!(peak_unsent <= 8192, "unsent queue reached {peak_unsent}");
+
+        drop(client);
+        let mut received = Vec::new();
+        timeout(Duration::from_secs(5), server.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.len(), written, "backpressure must not lose bytes");
+        assert!(received.iter().all(|byte| *byte == 0x5a));
+    }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
