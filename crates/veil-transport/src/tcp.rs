@@ -38,7 +38,8 @@ pub(crate) const DOWNLINK_MSS_CLAMP: u32 = 1200;
 /// Best-effort local clamp of `TCP_MAXSEG` on an established socket.
 /// It cannot change the MSS already announced in the SYN; on Linux it
 /// does not update the current negotiated send MSS either. Linux/Android
-/// outbound sockets must also set the limit BEFORE connect
+/// outbound sockets must also set the limit BEFORE connect, and listeners
+/// must set it BEFORE listen so accepted sockets inherit the negotiated limit
 /// (see [`DOWNLINK_MSS_CLAMP`]).
 /// A failure here is a missed optimisation,
 /// never a correctness problem (the option is absent on a few exotic
@@ -403,7 +404,7 @@ impl Transport for TcpTransport {
 /// Resolves `host:port` to one or more socket addresses (handles
 /// hostnames + dual-stack `0.0.0.0` / `::` via `tokio::net::lookup_host`)
 /// and tries each in order until one binds successfully.
-async fn bind_tcp_with_reuseaddr(host: &str, port: u16) -> Result<TcpListener> {
+pub(crate) async fn bind_tcp_with_reuseaddr(host: &str, port: u16) -> Result<TcpListener> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
     if addrs.is_empty() {
         // Fall back to tokio's bind for the empty-resolve edge case so
@@ -431,6 +432,12 @@ fn build_reuseaddr_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
+    // A late TCP_MAXSEG on an accepted Linux socket leaves the existing
+    // send MSS unchanged. Set the safety limit before the SYN/SYN-ACK so
+    // both directions are bounded even when the peer cannot clamp its SYN
+    // (Darwin). The accepted-socket best-effort clamp remains for other OSes.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let _ = socket.set_tcp_mss(DOWNLINK_MSS_CLAMP);
     // `set_only_v6(false)` lets a bound IPv6 socket accept v4-mapped
     // connections on dual-stack hosts; explicit so we don't inherit
     // platform default (Linux defaults to true on 0.0.0.0 listeners
@@ -449,6 +456,28 @@ fn build_reuseaddr_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn inbound_listener_negotiates_mss_before_accept() {
+        for host in ["127.0.0.1", "::1"] {
+            let listener = bind_tcp_with_reuseaddr(host, 0).await.unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            configure_accepted_tcp(&server, true, None).unwrap();
+            // An uncapped client models a peer that cannot set TCP_MAXSEG
+            // before connect. The listener must protect both directions.
+            for stream in [&client, &server] {
+                let mss = SockRef::from(stream).tcp_mss().unwrap();
+                assert!(
+                    mss > 0 && mss <= DOWNLINK_MSS_CLAMP,
+                    "{host}: negotiated MSS {mss}"
+                );
+            }
+        }
+    }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
