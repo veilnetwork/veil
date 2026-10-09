@@ -12,6 +12,7 @@ clang++ -std=c++20 -Wall -Wextra -Werror -Wl,-export_dynamic \
 "$STAND_DIR/smoke" --silence-after-jitter
 "$STAND_DIR/smoke"
 "$STAND_DIR/smoke" --recurring-jitter
+"$STAND_DIR/smoke" --mature-jitter
 "$STAND_DIR/smoke" --handover
 "$STAND_DIR/smoke" --asymmetric-handover
 "$STAND_DIR/smoke" --sender-restart

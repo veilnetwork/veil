@@ -1118,12 +1118,15 @@ class LowLatencyFieldTrials final : public webrtc::FieldTrialsView {
   std::string Lookup(absl::string_view key) const override {
     // Reordering history advances only on received packets. With Opus DTX,
     // the default 0.9993 factor can preserve a short radio burst throughout
-    // a long silent interval and delay the next spoken syllable. Keep the
-    // underrun estimator and packet capacity unchanged, but let old reorder
-    // samples decay once delivery becomes orderly again. This is entirely
+    // a long silent interval and delay the next spoken syllable. Ordered
+    // bursts need separate handling: after histogram startup, the default
+    // underrun factor 0.983 keeps a 10-second burst in the target long after
+    // delivery recovers. Forget that history faster while retaining its
+    // 95th-percentile/500-ms estimator and the 30-packet capacity. Neither
+    // estimator caps current delay or discards queued speech. This is entirely
     // receiver-local; no media role or priority is disclosed to the network.
     if (key == "WebRTC-Audio-NetEqDelayManagerConfig")
-      return "reorder_forget_factor:0.95";
+      return "forget_factor:0.90,reorder_forget_factor:0.95";
     if (key == "WebRTC-ForcePlayoutDelay") {
       // A small receiver-side floor lets WebRTC schedule through isolated
       // phone-radio bursts instead of presenting every arrival gap. Physical
