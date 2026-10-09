@@ -32,6 +32,7 @@ static size_t sent_packets = 0;
 static bool perfect_network = false;
 static bool handover_network = false;
 static bool delivery_stall = false;
+static bool recurring_jitter = false;
 static bool drop_during_stall = false;
 static size_t dropped_packets = 0;
 static size_t max_delivery_batch = 0;
@@ -55,8 +56,10 @@ extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t 
     handover_sequences.emplace_back(chan, uint16_t(p[2]) << 8 | p[3]);
   const auto now = Clock::now();
   const double at = milliseconds(now);
-  // Reproducible short jitter bursts, then ten seconds of a recovered path.
-  const int delay = !perfect_network && at >= 2000 && at < 4000
+  // Exercise both a short burst and repeated bursts across ten seconds.
+  // Each is followed by a healthy path; PCM must shed the old playout tail.
+  const int delay = !perfect_network && at >= 2000 &&
+      at < (recurring_jitter ? 12000 : 4000)
       ? (static_cast<int>(at) / 200 % 2 ? 300 : 40) : 40;
   ++sent_packets;
   auto due = now + std::chrono::milliseconds(delay);
@@ -425,6 +428,7 @@ static void verify_delivery_stall(bool drop) {
 }
 
 int main(int argc, char** argv) {
+  recurring_jitter = argc == 2 && std::strcmp(argv[1], "--recurring-jitter") == 0;
   if (argc == 2 && std::strcmp(argv[1], "--sender-restart") == 0) {
     verify_sender_restart();
     return 0;
@@ -478,7 +482,8 @@ int main(int argc, char** argv) {
     uint64_t max_delay = 0, max_buffer = 0;
     size_t nonsilent_ticks = 0;
     std::array<int16_t, 480> pcm{};
-    for (int tick = 0; tick < 1400; ++tick) {
+    const int ticks = recurring_jitter ? 3000 : 1400;
+    for (int tick = 0; tick < ticks; ++tick) {
       std::this_thread::sleep_until(origin + std::chrono::milliseconds(10 * tick));
       const double now = milliseconds(Clock::now());
       max_tick_lateness = std::max(max_tick_lateness, now - 10 * tick);
@@ -503,15 +508,18 @@ int main(int argc, char** argv) {
         max_buffer = std::max(max_buffer, metric(receiver.get(), "audio_jb_ms"));
       }
     }
+    if (max_tick_lateness >= 30)
+      std::fprintf(stderr, "invalid PCM timing: maximum tick lateness %.2f ms\n",
+          max_tick_lateness);
     assert(max_tick_lateness < 30); // overloaded host invalidates the experiment
     size_t packet_count;
     { std::lock_guard lock(mu); packet_count = sent_packets; }
-    assert(packet_count > 300 && nonsilent_ticks > 900);
+    assert(packet_count > 300 && nonsilent_ticks > size_t(ticks - 500));
     assert(metric(receiver.get(), "audio_rx_pkts") > 300);
-    std::printf("{\"buffer_packets_override\":%zu,\"rtp_packets\":%zu,\"nonsilent_ticks\":%zu,"
+    std::printf("{\"recurring_jitter\":%s,\"buffer_packets_override\":%zu,\"rtp_packets\":%zu,\"nonsilent_ticks\":%zu,"
                 "\"max_tick_lateness_ms\":%.2f,\"max_filtered_delay_ms\":%llu,"
                 "\"max_current_buffer_ms\":%llu,\"marker_latency_ms\":[",
-        capacity, packet_count, nonsilent_ticks, max_tick_lateness,
+        recurring_jitter ? "true" : "false", capacity, packet_count, nonsilent_ticks, max_tick_lateness,
         static_cast<unsigned long long>(max_delay), static_cast<unsigned long long>(max_buffer));
     bool recovered = true;
     for (size_t i = 0; i < source_edges.size(); ++i) {
@@ -523,11 +531,21 @@ int main(int argc, char** argv) {
       // A packet-capacity reduction must not masquerade as a latency win by
       // flushing audio. Keep PCM recovery within the measured control budget,
       // then check actual concealed samples as well as the rendered markers.
-      if (!capacity && (i == 2 || i == 3)) recovered &= latency < 400;
-      // The 9-second marker of the unchanged control ranged from 170 to
-      // 252 ms; its final 11/13-second markers returned below 180 ms.
-      if (!capacity && i == 4) recovered &= latency < 300;
-      if (!capacity && i >= 5) recovered &= latency < 180;
+      if (!capacity) {
+        if (recurring_jitter) {
+          // The healthy path resumes at 12 seconds. Measure spoken markers
+          // at 13/15/17 seconds and beyond, including the long recovery tail.
+          if (i == 6) recovered &= latency < 400;
+          if (i == 7) recovered &= latency < 300;
+          if (i >= 8) recovered &= latency < 180;
+        } else {
+          if (i == 2 || i == 3) recovered &= latency < 400;
+          // The 9-second marker of the unchanged control ranged from 170 to
+          // 252 ms; its final 11/13-second markers returned below 180 ms.
+          if (i == 4) recovered &= latency < 300;
+          if (i >= 5) recovered &= latency < 180;
+        }
+      }
       if (i) std::printf(",");
       std::printf("%.2f", latency);
     }
