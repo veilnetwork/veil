@@ -210,11 +210,11 @@ async fn negotiated_sources_never_spill_to_parent_while_children_warm_or_close()
         logger,
     });
     let child_receiver = super::super::parallel_lanes::ParallelSession::new(
-        remote_offer,
+        remote_offer.clone(),
         &[3; 32],
         &[2; 32],
         [1; 32],
-        context,
+        context.clone(),
         None,
     );
     let mut seen = HashSet::new();
@@ -258,6 +258,44 @@ async fn negotiated_sources_never_spill_to_parent_while_children_warm_or_close()
             .unwrap();
     }
     no_parent_payload(&remote_parent, &mut remote_stream).await;
+    let replacement_receiver = super::super::parallel_lanes::ParallelSession::new(
+        remote_offer,
+        &[3; 32],
+        &[2; 32],
+        [1; 32],
+        context,
+        None,
+    );
+    let mut recovered = HashSet::new();
+    timeout(Duration::from_secs(5), async {
+        for tick in 0u32.. {
+            for (index, lane) in [REALTIME, BULK, BACKGROUND].into_iter().enumerate() {
+                sender
+                    .try_send((
+                        lane,
+                        veil_bufpool::pooled_shared_from_vec(primary_test_frame(
+                            false,
+                            (index as u32 + 4) * 1000 + tick,
+                            0,
+                        )),
+                    ))
+                    .unwrap();
+            }
+            while let Ok((seq, _, _)) = packets.try_recv() {
+                if (4..=6).contains(&(seq / 1000)) {
+                    recovered.insert(seq / 1000);
+                }
+            }
+            if recovered.len() == 3 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all three sources must deliver again after child replacement");
+    no_parent_payload(&remote_parent, &mut remote_stream).await;
+    drop(replacement_receiver);
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
 }
