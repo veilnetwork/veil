@@ -1285,9 +1285,9 @@ async fn ipc_send_relay_via_route_cache() {
     assert_eq!(compact_fwd.envelope.ttl_secs, 30);
     assert!(!compact_fwd.envelope.require_ack);
 
-    // Call control must still force a REALTIME first-hop queue while keeping
-    // the legacy Forward wire shape. Public relays can lag the endpoint
-    // rollout and some old decoders reject optional trailing extensions.
+    // Call control retains the endpoint's signaling queue and the legacy
+    // Forward wire shape. Public relays can lag the endpoint rollout and some
+    // old decoders reject optional trailing extensions.
     let compat_payload = b"call-control".to_vec();
     let compat_send = AppIpcSendPayload {
         my_other_devices: false,
@@ -1313,7 +1313,7 @@ async fn ipc_send_relay_via_route_cache() {
         .await
         .expect("timeout waiting for compatible control frame")
         .expect("B outbox channel closed unexpectedly");
-    assert_eq!(prio, veil_proto::header::priority::REALTIME);
+    assert_eq!(prio, veil_proto::header::priority::INTERACTIVE);
     let compat_body = &frame_bytes[veil_proto::HEADER_SIZE..];
     assert!(!ForwardPayload::is_realtime_datagram_eligible(compat_body));
     let compat_fwd = ForwardPayload::decode(compat_body).unwrap();
