@@ -536,6 +536,9 @@ class VeilMediaEngine {
   /// peer is at most 15 seconds old; 0 means outbound quality is unknown.
   /// Older libraries omit this field. Call-level RTT alone is not proof of
   /// current outbound audio quality.
+  /// `audio_delay_ms` measures queued audio samples plus reported device delay.
+  /// `audio_filtered_delay_ms` preserves WebRTC's RTP-span filter for diagnosis;
+  /// that filter can be invalid after a peer sender's timestamp origin changes.
   Map<String, dynamic> getStats() {
     _ensure();
     final s = ffi.veilMediaEngineGetStats(_ptr);
@@ -690,6 +693,8 @@ class VeilGroupMediaEngine {
   /// `audio_receivers` holds accepted audio packet counts and native playout
   /// estimates per peer. A stalled audio worker keeps `audio_rx_supported: 1`
   /// but supplies no valid receiver samples.
+  /// Each receiver's `audio_delay_ms` uses queued samples plus device delay;
+  /// its `audio_filtered_delay_ms` is the diagnostic RTP-span estimate.
   /// Optional encrypted RTCP APP feedback supplies `audio_playout_peers`,
   /// `audio_playout_reports` and worst `audio_playout_ms` (-1 when unknown).
   Map<String, dynamic> getStats() {
