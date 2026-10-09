@@ -120,12 +120,14 @@ struct Pool {
     // Incoming proofs may consume only their bounded directional
     // leases. They cannot displace the dialer's outgoing source slots.
     incoming: Vec<Ready>,
+    assignments: channel_assignments::ChannelAssignments<TOTAL_SLOTS>,
 }
 impl Default for Pool {
     fn default() -> Self {
         Self {
             slots: Default::default(),
             incoming: Vec::new(),
+            assignments: Default::default(),
         }
     }
 }
@@ -176,7 +178,7 @@ async fn connect(
     ))
 }
 
-fn mark(pool: &Pool, readiness: &Weak<LocalDatagramLease>) {
+fn mark(pool: &mut Pool, readiness: &Weak<LocalDatagramLease>) {
     if let Some(lease) = readiness.upgrade() {
         let status = lease.status();
         let mut changed = false;
@@ -184,7 +186,13 @@ fn mark(pool: &Pool, readiness: &Weak<LocalDatagramLease>) {
             .iter()
             .enumerate()
         {
-            let ready = pool.slots[index].as_ref().is_some_and(Ready::alive);
+            if status.pending() & (1 << index) != 0 {
+                pool.assignments.source(index);
+            }
+            let ready = pool
+                .assignments
+                .source_physical(index)
+                .is_some_and(|physical| pool.slots[physical].as_ref().is_some_and(Ready::alive));
             changed |=
                 (status.state(*priority) == crate::LocalDatagramChannelState::Ready) != ready;
             lease.mark(*priority, ready);
@@ -230,7 +238,7 @@ fn worker(
                             // these neutral receive/return owners.
                             pool.incoming.push(ready);
                         }
-                        mark(&pool, &readiness);
+                        mark(&mut pool, &readiness);
                     }
                 },
                 Some(result) = attempts.join_next_with_id(), if !attempts.is_empty() => {
@@ -249,7 +257,7 @@ fn worker(
                         if let Ok(ready) = result {
                             let mut pool = lock!(pool);
                             pool.slots[index] = Some(ready);
-                            mark(&pool, &readiness);
+                            mark(&mut pool, &readiness);
                         }
                 },
                 _ = tick.tick() => {
@@ -279,7 +287,7 @@ fn worker(
                             }
                         }
                     }
-                    mark(&pool, &readiness);
+                    mark(&mut pool, &readiness);
                 },
             }
         }
@@ -382,25 +390,21 @@ impl OrderedSession {
         self.offer.diagnostics.rotate_generation();
     }
 
-    pub(super) fn sender(
+    pub(super) fn sender_with_carrier(
         &self,
         priority: u8,
         body: &[u8],
         kind: RealtimeLaneFrameKind,
+        ingress: Option<&veil_anonymity::circuit_carrier::Carrier>,
     ) -> Option<Arc<Mutex<RealtimeSender>>> {
-        let index = crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES
-            .iter()
-            .position(|&p| p == priority)
-            .or_else(|| {
-                (priority == veil_proto::priority::INTERACTIVE)
-                    .then(|| parallel_lanes::neutral_transit_index(&self.transit_salt, body, kind))
-                    .flatten()
-            })?;
-        let pool = lock!(self.pool);
-        let ready = pool.slots[index].as_ref().filter(|ready| ready.alive())?;
-        let mut sender = lock!(ready.sender);
-        sender.sent_counter = Some((self.offer.diagnostics.clone(), index));
-        Some(ready.sender.clone())
+        lock!(self.pool).selected_sender(
+            priority,
+            body,
+            kind,
+            ingress,
+            &self.transit_salt,
+            &self.offer.diagnostics,
+        )
     }
 }
 
@@ -414,3 +418,41 @@ impl Drop for OrderedSession {
         pool.incoming.clear();
     }
 }
+
+impl Pool {
+    fn selected_sender(
+        &mut self,
+        priority: u8,
+        body: &[u8],
+        kind: RealtimeLaneFrameKind,
+        ingress: Option<&veil_anonymity::circuit_carrier::Carrier>,
+        salt: &[u8; 32],
+        diagnostics: &Arc<ParallelDiagnostics>,
+    ) -> Option<Arc<Mutex<RealtimeSender>>> {
+        let selected = if let Some(source) = crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES
+            .iter()
+            .position(|&p| p == priority)
+        {
+            self.assignments.source(source)?
+        } else {
+            if priority != veil_proto::priority::INTERACTIVE {
+                return None;
+            }
+            let bucket = parallel_lanes::neutral_transit_index(salt, body, kind)?;
+            let ingress = (kind == RealtimeLaneFrameKind::RelayForward)
+                .then_some(ingress)
+                .flatten();
+            self.assignments.transit(ingress, bucket)?
+        };
+        let ready = self.slots[selected.physical]
+            .as_ref()
+            .filter(|ready| ready.alive())?;
+        let mut sender = lock!(ready.sender);
+        sender.sent_counter = Some((diagnostics.clone(), selected.counter));
+        Some(ready.sender.clone())
+    }
+}
+
+#[cfg(test)]
+#[path = "forward_channel_isolation_tests.rs"]
+mod forward_channel_isolation_tests;

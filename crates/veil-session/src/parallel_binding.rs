@@ -429,6 +429,12 @@ impl ParallelParent {
 }
 
 impl ParallelParentHandle {
+    /// Allocation identity for local ingress ownership. The handle keeps the
+    /// allocation alive; this value carries no key, role or wire authority.
+    pub(crate) fn local_generation(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
     pub(crate) fn is_active(&self) -> bool {
         self.0.active.load(Ordering::Acquire)
     }

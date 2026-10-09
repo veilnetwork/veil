@@ -226,6 +226,8 @@ struct RealtimeDatagramLane {
     parallel: Option<ParallelChannels>,
 }
 
+#[path = "channel_assignments.rs"]
+mod channel_assignments;
 #[path = "ordered_lanes.rs"]
 mod ordered_lanes;
 pub use ordered_lanes::ParallelOrderedOffer;
@@ -264,13 +266,16 @@ impl ParallelChannels {
         priority: u8,
         body: &[u8],
         kind: RealtimeLaneFrameKind,
+        ingress: Option<&veil_anonymity::circuit_carrier::Carrier>,
     ) -> Option<Arc<Mutex<RealtimeSender>>> {
         match self {
             Self::Quic(s) => {
-                let index = s.prepare_frame(priority, body, kind)?;
-                Some(s.sender_arc(index))
+                let selected = s.prepare_frame_with_carrier(priority, body, kind, ingress)?;
+                let sender = s.sender_arc(selected.physical);
+                lock!(sender).sent_counter = Some((s.offer_diagnostics(), selected.counter));
+                Some(sender)
             }
-            Self::Ordered(s) => s.sender(priority, body, kind),
+            Self::Ordered(s) => s.sender_with_carrier(priority, body, kind, ingress),
         }
     }
 }
@@ -406,11 +411,12 @@ impl RealtimeDatagramLane {
         frame: &[u8],
         body: &[u8],
         kind: RealtimeLaneFrameKind,
+        ingress: Option<&veil_anonymity::circuit_carrier::Carrier>,
     ) -> Option<(Arc<Mutex<RealtimeSender>>, bool)> {
         let ready = self
             .parallel
             .as_mut()
-            .and_then(|parallel| parallel.sender(priority, body, kind));
+            .and_then(|parallel| parallel.sender(priority, body, kind, ingress));
         let now = std::time::Instant::now();
         if let Some(sender) = ready {
             if priority == veil_proto::priority::REALTIME {
@@ -4711,9 +4717,13 @@ impl SessionRunner {
                         }
                         let (_, body, lane_kind) = decode_realtime_lane_frame(outgoing)
                             .expect("realtime queue predicate accepted this frame");
-                        let Some((sender, using_parallel)) =
-                            lane.select_sender(outgoing_priority, outgoing, body, lane_kind)
-                        else {
+                        let Some((sender, using_parallel)) = lane.select_sender(
+                            outgoing_priority,
+                            outgoing,
+                            body,
+                            lane_kind,
+                            envelope.carrier.as_ref(),
+                        ) else {
                             // Before the fixed pool is mutually authenticated,
                             // preserve ordinary ordered compatibility.
                             pq.restore_lossy_envelope(envelope);

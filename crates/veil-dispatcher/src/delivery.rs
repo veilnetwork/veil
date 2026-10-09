@@ -169,6 +169,24 @@ pub struct HopAttrs {
     pub relay_attempts: u32,
 }
 
+/// Preserve authenticated incoming connection ownership in the same ordinary
+/// queue. This changes no wire field, admission, FIFO position or service cost.
+fn send_forward_on_ingress(
+    registry: &veil_session::SessionTxRegistry,
+    peer: &[u8; 32],
+    priority: u8,
+    frame: Vec<u8>,
+    carrier: Option<&veil_anonymity::circuit_carrier::Carrier>,
+) -> bool {
+    if let Some(carrier) = carrier {
+        registry
+            .send_to_on_carrier_result(peer, frame, carrier.clone())
+            .is_ok()
+    } else {
+        registry.send_to(peer, priority, frame)
+    }
+}
+
 impl FrameDispatcher {
     fn is_local_delivery_recipient(&self, recipient: &veil_proto::recipient::Recipient) -> bool {
         use veil_proto::recipient::InstanceTag;
@@ -233,12 +251,30 @@ impl FrameDispatcher {
     /// helper is purely additive. It never changes the outcome of
     /// a frame that the legacy path would have handled; it only
     /// shortens delivery when a direct authenticated session exists.
+    #[cfg(test)]
     fn try_sovereign_direct_forward(
         &self,
         payload: &ForwardPayload,
         sender_peer_id: NodeId,
         traffic_class: u8,
         relay_hops_out: u8,
+    ) -> bool {
+        self.try_sovereign_direct_forward_with_carrier(
+            payload,
+            sender_peer_id,
+            traffic_class,
+            relay_hops_out,
+            None,
+        )
+    }
+
+    fn try_sovereign_direct_forward_with_carrier(
+        &self,
+        payload: &ForwardPayload,
+        sender_peer_id: NodeId,
+        traffic_class: u8,
+        relay_hops_out: u8,
+        carrier: Option<&veil_anonymity::circuit_carrier::Carrier>,
     ) -> bool {
         let Some(targets) = self.resolve_sovereign_delivery_targets(&payload.envelope.recipient)
         else {
@@ -278,7 +314,7 @@ impl FrameDispatcher {
             frame.extend_from_slice(&envelope_bytes);
             frame.extend_from_slice(&suffix);
 
-            if reg_guard.send_to(&target, traffic_class, frame) {
+            if send_forward_on_ingress(&reg_guard, &target, traffic_class, frame, carrier) {
                 // Direct-forward counter would land here on a future
                 // operator-dashboard milestone (was closed
                 // without the metric; not critical to session correctness).
@@ -294,6 +330,16 @@ impl FrameDispatcher {
         body: &[u8],
         peer_id: NodeId,
     ) -> DispatchResult {
+        self.dispatch_delivery_with_carrier(header, body, peer_id, None)
+    }
+
+    pub(crate) fn dispatch_delivery_with_carrier(
+        &self,
+        header: &FrameHeader,
+        body: &[u8],
+        peer_id: NodeId,
+        carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
+    ) -> DispatchResult {
         let msg = match DeliveryMsg::try_from(header.msg_type) {
             Ok(m) => m,
             Err(_) => {
@@ -305,7 +351,7 @@ impl FrameDispatcher {
         };
 
         match msg {
-            DeliveryMsg::Forward => self.handle_delivery_forward(header, body, peer_id),
+            DeliveryMsg::Forward => self.handle_delivery_forward(header, body, peer_id, carrier),
             DeliveryMsg::DeliveryStatus => self.handle_delivery_status(body),
             DeliveryMsg::ChunkManifest => self.handle_chunk_manifest(body),
             DeliveryMsg::Chunk => self.handle_chunk(body, peer_id),
@@ -924,6 +970,25 @@ impl FrameDispatcher {
         relay_hops_out: u8,
         traffic_class: u8,
     ) -> bool {
+        self.try_forward_via_gateway_with_carrier(
+            payload,
+            peer_id,
+            fwd_dst,
+            relay_hops_out,
+            traffic_class,
+            None,
+        )
+    }
+
+    fn try_forward_via_gateway_with_carrier(
+        &self,
+        payload: &ForwardPayload,
+        peer_id: NodeId,
+        fwd_dst: NodeIdBytes,
+        relay_hops_out: u8,
+        traffic_class: u8,
+        carrier: Option<&veil_anonymity::circuit_carrier::Carrier>,
+    ) -> bool {
         let (Some(gl), Some(reg)) = (&self.gateway_list, &self.session_tx_registry) else {
             return false;
         };
@@ -966,7 +1031,7 @@ impl FrameDispatcher {
         frame.extend_from_slice(&gw);
         frame.extend_from_slice(&envelope_bytes);
         frame.extend_from_slice(&gw_suffix);
-        rlock!(reg).send_to(&gw, traffic_class, frame)
+        send_forward_on_ingress(&rlock!(reg), &gw, traffic_class, frame, carrier)
     }
 
     /// DHT recursive-relay fallback: when neither route_cache nor a gateway
@@ -1094,6 +1159,16 @@ impl FrameDispatcher {
         peer_id: NodeId,
         traffic_class: u8,
     ) -> DispatchResult {
+        self.relay_forward_with_carrier(payload, peer_id, traffic_class, None)
+    }
+
+    fn relay_forward_with_carrier(
+        &self,
+        payload: ForwardPayload,
+        peer_id: NodeId,
+        traffic_class: u8,
+        carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
+    ) -> DispatchResult {
         let relay_hops_out = match self.check_relay_preconditions(&payload, peer_id) {
             Ok(hops) => hops,
             Err(result) => return result,
@@ -1106,7 +1181,13 @@ impl FrameDispatcher {
         // to the scored route_cache path when no sovereign session is
         // available (legacy peer, identity offline, or no registry
         // wired in this build).
-        if self.try_sovereign_direct_forward(&payload, peer_id, traffic_class, relay_hops_out) {
+        if self.try_sovereign_direct_forward_with_carrier(
+            &payload,
+            peer_id,
+            traffic_class,
+            relay_hops_out,
+            carrier.as_ref(),
+        ) {
             return DispatchResult::NoResponse;
         }
 
@@ -1175,7 +1256,8 @@ impl FrameDispatcher {
             // Forward to a directly connected recipient with the same neutral
             // scheduling class as any other relay hop.
             let fwd_frame = make_fwd_frame(dst);
-            if reg_guard.send_to(&dst, traffic_class, fwd_frame) {
+            if send_forward_on_ingress(&reg_guard, &dst, traffic_class, fwd_frame, carrier.as_ref())
+            {
                 return DispatchResult::NoResponse;
             }
 
@@ -1196,7 +1278,13 @@ impl FrameDispatcher {
                 let mut mp_sent: u64 = 0;
                 for &hop in candidates.iter().take(n) {
                     let fwd_frame = make_fwd_frame(hop);
-                    if reg_guard.send_to(&hop, traffic_class, fwd_frame) {
+                    if send_forward_on_ingress(
+                        &reg_guard,
+                        &hop,
+                        traffic_class,
+                        fwd_frame,
+                        carrier.as_ref(),
+                    ) {
                         any_sent = true;
                         mp_sent += 1;
                     } else {
@@ -1237,7 +1325,13 @@ impl FrameDispatcher {
                 let mut any_sent = false;
                 for &hop in candidates.iter().take(ecmp_group_len) {
                     let fwd_frame = make_fwd_frame(hop);
-                    match reg_guard.send_to(&hop, traffic_class, fwd_frame) {
+                    match send_forward_on_ingress(
+                        &reg_guard,
+                        &hop,
+                        traffic_class,
+                        fwd_frame,
+                        carrier.as_ref(),
+                    ) {
                         true => {
                             any_sent = true;
                         }
@@ -1267,7 +1361,13 @@ impl FrameDispatcher {
             for (idx, hop) in candidates.iter().enumerate() {
                 let hop = *hop;
                 let fwd_frame = make_fwd_frame(hop);
-                if reg_guard.send_to(&hop, traffic_class, fwd_frame) {
+                if send_forward_on_ingress(
+                    &reg_guard,
+                    &hop,
+                    traffic_class,
+                    fwd_frame,
+                    carrier.as_ref(),
+                ) {
                     // record RTT of the selected route (pre-snapshotted above).
                     let rtt_ms = hop_attrs[idx].rtt_ms;
                     if let Some(m) = &self.metrics
@@ -1336,7 +1436,14 @@ impl FrameDispatcher {
         // Gateway that has internet access. This handles the case where the
         // destination is a global-veil node that is not in the local route
         // cache but reachable through any connected gateway.
-        if self.try_forward_via_gateway(&payload, peer_id, fwd_dst, relay_hops_out, traffic_class) {
+        if self.try_forward_via_gateway_with_carrier(
+            &payload,
+            peer_id,
+            fwd_dst,
+            relay_hops_out,
+            traffic_class,
+            carrier.as_ref(),
+        ) {
             return DispatchResult::NoResponse;
         }
 
@@ -1422,6 +1529,7 @@ impl FrameDispatcher {
         header: &FrameHeader,
         body: &[u8],
         peer_id: NodeId,
+        carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
     ) -> DispatchResult {
         // cheap TTL pre-check before full decode — drops stale
         // envelopes without the 1 MiB envelope-payload clone that `decode`
@@ -1460,7 +1568,7 @@ impl FrameDispatcher {
         // loss-tolerant datagram eligibility is a separate transport decision.
         let _ = header;
         let traffic_class = payload.relay_traffic_class();
-        self.relay_forward(payload, peer_id, traffic_class)
+        self.relay_forward_with_carrier(payload, peer_id, traffic_class, carrier)
     }
 
     /// Peek the envelope's fixed-offset `created_at`+`ttl_secs` without
