@@ -215,6 +215,74 @@ static void verify_handover(bool asymmetric = false) {
   }
   { std::lock_guard lock(mu); assert(callbacks.empty()); }
 }
+static void verify_sender_restart() {
+  perfect_network = true;
+  const uint8_t local[32] = {1}, peer[32] = {2};
+  source_channel = 200; receiver_channel = 300;
+  using Engine = std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)>;
+  {
+    Engine receiver(veil_media_test_audio_playout_create(300, peer, local, 0, 0), veil_media_engine_destroy);
+    Engine source(veil_media_test_audio_playout_create(200, local, peer, 1, 0), veil_media_engine_destroy);
+    assert(source && receiver);
+    origin = Clock::now();
+    std::array<int16_t, 480> pcm{};
+    std::vector<double> source_edges, rendered_edges;
+    uint64_t max_delay = 0, max_buffer = 0;
+    size_t nonsilent_ticks = 0;
+    bool was_high = false;
+    for (int tick = 0; tick < 1200; ++tick) {
+      std::this_thread::sleep_until(origin + std::chrono::milliseconds(10 * tick));
+      if (tick == 300 || tick == 700) {
+        // The peer keeps receiving on the same authenticated channel/SSRC.
+        // Queued old RTP is deliberately retained across the sender rebuild.
+        source.reset();
+        source.reset(veil_media_test_audio_playout_create(200, local, peer, 1, 0));
+        assert(source);
+      }
+      const bool high = (tick / 100) % 2;
+      if (high && tick % 100 == 0) source_edges.push_back(milliseconds(Clock::now()));
+      assert(veil_media_test_audio_capture_tone(source.get(), high ? 1200 : 440) == 0);
+      deliver();
+      assert(veil_media_test_audio_playout_pcm(receiver.get(), pcm.data(), pcm.size()) == 480);
+      double power = 0; int crossings = 0;
+      for (size_t i = 0; i < pcm.size(); ++i) {
+        power += double(pcm[i]) * pcm[i];
+        if (i && ((pcm[i] > 0) != (pcm[i - 1] > 0))) ++crossings;
+      }
+      const bool nonsilent = power / pcm.size() > 500 * 500;
+      if (nonsilent) ++nonsilent_ticks;
+      const bool rendered_high = nonsilent && crossings >= 17;
+      if (rendered_high && !was_high) rendered_edges.push_back(milliseconds(Clock::now()));
+      was_high = rendered_high;
+      if (tick % 10 == 0) {
+        max_delay = std::max(max_delay, metric(receiver.get(), "audio_delay_ms"));
+        max_buffer = std::max(max_buffer, metric(receiver.get(), "audio_jb_ms"));
+      }
+    }
+    std::printf("sender rebuilds: nonsilent=%zu/1200 delay_max=%llu buffer_max=%llu marker_latency_ms=[",
+        nonsilent_ticks, static_cast<unsigned long long>(max_delay),
+        static_cast<unsigned long long>(max_buffer));
+    bool rendered_promptly = true;
+    for (size_t i = 0; i < source_edges.size(); ++i) {
+      const auto sent = source_edges[i];
+      const auto rendered = std::find_if(rendered_edges.begin(), rendered_edges.end(),
+          [&](double at) { return at >= sent && at < sent + 800; });
+      const double latency = rendered == rendered_edges.end() ? -1 : *rendered - sent;
+      if (i) std::printf(",");
+      std::printf("%.2f", latency);
+      rendered_promptly &= latency >= 0 && latency < 180;
+    }
+    std::printf("]\n");
+    std::fflush(stdout);
+    // Actual PCM and the exported control signal must both recover. A random
+    // RTP timestamp restart formerly produced up to ~174,780 ms here while
+    // the genuine decoded speech and buffered samples remained prompt.
+    assert(source_edges.size() == 6 && rendered_promptly && nonsilent_ticks > 1100);
+    assert(max_buffer < 180 && max_delay < 200);
+  }
+  { std::lock_guard lock(mu); assert(callbacks.empty()); }
+}
+
 static void verify_silence(bool after_jitter = false) {
   perfect_network = !after_jitter;
   // The ordinary injected burst ends at four seconds. Start silence after
@@ -294,6 +362,7 @@ static void verify_delivery_stall(bool drop) {
     double max_lateness = 0;
     size_t recovered_ticks = 0;
     uint64_t max_buffer = 0;
+    uint64_t max_delay = 0;
     for (int tick = 0; tick < 2000; ++tick) {
       std::this_thread::sleep_until(origin + std::chrono::milliseconds(10 * tick));
       const double now = milliseconds(Clock::now());
@@ -313,16 +382,20 @@ static void verify_delivery_stall(bool drop) {
       const bool rendered_high = nonsilent && crossings >= 17;
       if (rendered_high && !was_high) rendered_edges.push_back(milliseconds(Clock::now()));
       was_high = rendered_high;
-      if (tick % 10 == 0)
+      if (tick % 10 == 0) {
         max_buffer = std::max(max_buffer, metric(receiver.get(), "audio_jb_ms"));
+        max_delay = std::max(max_delay, metric(receiver.get(), "audio_delay_ms"));
+      }
     }
     size_t sent, dropped, batch;
     { std::lock_guard lock(mu); sent = sent_packets; dropped = dropped_packets; batch = max_delivery_batch; }
     std::printf("{\"delivery_stall_drop\":%s,\"sent_packets\":%zu,\"dropped_packets\":%zu,"
                 "\"max_delivery_batch\":%zu,\"max_tick_lateness_ms\":%.2f,"
-                "\"final_nonsilent_ticks\":%zu,\"max_buffer_ms\":%llu,\"post_stall_marker_latency_ms\":[",
+                "\"final_nonsilent_ticks\":%zu,\"max_buffer_ms\":%llu,"
+                "\"max_playout_delay_ms\":%llu,\"post_stall_marker_latency_ms\":[",
         drop ? "true" : "false", sent, dropped, batch,
-        max_lateness, recovered_ticks, static_cast<unsigned long long>(max_buffer));
+        max_lateness, recovered_ticks, static_cast<unsigned long long>(max_buffer),
+        static_cast<unsigned long long>(max_delay));
     bool recovered = true;
     size_t markers = 0;
     for (double sent : source_edges) {
@@ -344,11 +417,18 @@ static void verify_delivery_stall(bool drop) {
     assert(drop ? dropped > 150 && batch < 10
                 : dropped == 0 && batch > 100);
     assert(recovered && recovered_ticks > 290);
+    // A real backlog must still be visible to the adaptation loop; replacing
+    // the invalid RTP-span estimate must not hide delay with a fixed ceiling.
+    if (!drop) assert(max_buffer > 300 && max_delay > 300);
   }
   { std::lock_guard lock(mu); assert(callbacks.empty()); }
 }
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--sender-restart") == 0) {
+    verify_sender_restart();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--silence-after-jitter") == 0) {
     verify_silence(true);
     return 0;

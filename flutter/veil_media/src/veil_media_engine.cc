@@ -194,6 +194,23 @@ void configure_call_audio_receive(
   config.jitter_buffer_fast_accelerate = true;
 }
 
+// Sample on the audio worker, like ChannelReceive::UpdatePlayoutTimestamp.
+// NetEq's filtered level uses the span of RTP timestamps. Recreating a peer's
+// sender keeps its identity-derived SSRC but chooses a new timestamp origin;
+// overlapping old/new packets can saturate that filter (~174 seconds) even
+// while decoded PCM remains prompt. Count actual queued samples instead of
+// using that timestamp span as the endpoint's video-adaptation signal. This
+// does not change NetEq, discard audio, or cap a genuinely growing queue.
+uint32_t current_audio_playout_delay(uint32_t buffered_ms,
+                                     webrtc::AudioDeviceModule* adm) {
+  uint16_t device_ms = 0;
+  if (adm && adm->PlayoutDelay(&device_ms) == 0)
+    return buffered_ms + device_ms;
+  // An ADM without a delay reading also contributes zero to WebRTC's initial
+  // estimate. The queue measurement and worker/packet freshness remain real.
+  return buffered_ms;
+}
+
 constexpr int kVideoNackHistoryMs = 1000;
 // A 60-frame interval produced a full VP8 intra-frame burst every ~2 seconds
 // on the 30-fps physical cameras. Those bursts repeatedly filled the short
@@ -2345,8 +2362,10 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
           }
           const bool active = sample.packets_received > 0 &&
               native_age_ms >= 0 && native_age_ms <= 3000;
+          const uint32_t delay_ms = current_audio_playout_delay(
+              sample.jitter_buffer_ms, ws->adm.get());
           peer->shim->SetLocalAudioPlayout(peer->audio_ssrc, sample_sequence,
-              active ? static_cast<int>(sample.delay_estimate_ms) : -1, now_us);
+              active ? static_cast<int>(delay_ms) : -1, now_us);
           char id[65];
           for (size_t i = 0; i < 32; ++i) {
             id[2 * i] = hex[entry.second->id[i] >> 4];
@@ -2356,9 +2375,10 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
           char receiver[320];
           const int size = std::snprintf(receiver, sizeof(receiver),
               "\"%s\":{\"audio_rx_pkts\":%llu,\"audio_delay_ms\":%u,"
+              "\"audio_filtered_delay_ms\":%u,"
               "\"audio_rx_native_age_ms\":%lld,\"audio_interruption_count\":%d}", id,
               static_cast<unsigned long long>(sample.packets_received),
-              sample.delay_estimate_ms, static_cast<long long>(native_age_ms),
+              delay_ms, sample.delay_estimate_ms, static_cast<long long>(native_age_ms),
               sample.interruption_count);
           if (size <= 0 || static_cast<size_t>(size) >= sizeof(receiver)) continue;
           if (!audio_receivers.empty()) audio_receivers += ',';
@@ -3625,8 +3645,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     int tx_loss_pct = 0;
     // Perceived-latency creep instrumentation: RTCP rtt/jitter stay flat while
     // delay accumulates in the RECEIVE pipeline, so export the direct playout
-    // measurements — NetEq's total audio path estimate (jitter buffer + ADM
-    // playout) and the video render delay target.
+    // measurements — current queued audio samples + ADM playout delay and the
+    // video render delay target. Keep the RTP-span filter as a diagnostic.
     uint64_t audio_rx_pkts = 0;
     int64_t audio_rx_native_age_ms = -1;
     uint64_t audio_concealed_samples = 0;
@@ -3638,6 +3658,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     uint64_t audio_tx_pkts = 0;
     uint64_t audio_tx_retransmitted_pkts = 0;
     uint32_t audio_delay_ms = 0;
+    uint32_t audio_filtered_delay_ms = 0;
     uint32_t audio_jb_ms = 0;
     uint32_t audio_jb_target_ms = 0;
     int video_delay_ms = 0;
@@ -3709,7 +3730,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         audio_interruption_count = r.interruption_count;
         audio_interruption_duration_ms = r.total_interruption_duration_ms;
         jitter_ms = r.jitter_ms;
-        audio_delay_ms = r.delay_estimate_ms;
+        audio_filtered_delay_ms = r.delay_estimate_ms;
+        audio_delay_ms = current_audio_playout_delay(r.jitter_buffer_ms, ws->adm.get());
         audio_jb_ms = r.jitter_buffer_ms;
         // Diagnostic only: distinguish the controller's chosen buffer from
         // current packet accumulation and the filtered playout estimate.
@@ -3800,6 +3822,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         "\"video_feedback_reports\":%d,\"video_feedback_rtt_ms\":%lld,"
         "\"video_feedback_loss_pct\":%d,\"video_feedback_jitter_ms\":%d,"
         "\"audio_delay_ms\":%u,\"audio_jb_ms\":%u,\"audio_jb_target_ms\":%u,"
+        "\"audio_filtered_delay_ms\":%u,"
         "\"video_delay_ms\":%d,\"video_jb_ms\":%d,"
         "\"pacer_delay_ms\":%lld,\"worker_stalled\":%d,\"video_worker_stalled\":%d,"
         "\"video_tx_frames\":%llu,\"video_tx_fps\":%.1f,"
@@ -3859,7 +3882,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<long long>(video_feedback_available ? video_report.rtt_ms : 0),
         video_feedback_available ? video_report.loss_pct : 0,
         video_feedback_available ? video_report.jitter_ms : 0,
-        audio_delay_ms, audio_jb_ms, audio_jb_target_ms, video_delay_ms, video_jb_ms,
+        audio_delay_ms, audio_jb_ms, audio_jb_target_ms, audio_filtered_delay_ms,
+        video_delay_ms, video_jb_ms,
         static_cast<long long>(pacer_delay_ms), sampled ? 0 : 1, video_sampled ? 0 : 1,
         static_cast<unsigned long long>(tx_video.frames),
         cadence_fps(tx_video),
