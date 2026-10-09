@@ -123,7 +123,7 @@ fn frame(msg: AppMsg, body: &[u8]) -> veil_bufpool::PooledShared {
     veil_bufpool::pooled_shared_from_vec(wire)
 }
 
-fn make_runner(
+pub(super) fn make_runner(
     file_stream: veil_transport::BoxIoStream,
     outbox: crate::FrameOutbox,
     offer: Option<super::super::RealtimeLaneOffer>,

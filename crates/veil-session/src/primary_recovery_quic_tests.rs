@@ -12,6 +12,256 @@ use veil_proto::{
 use veil_transport::context::QuicCongestionControl;
 use veil_types::NodeIdBytes;
 
+#[tokio::test]
+async fn negotiated_ordered_sources_do_not_enter_parent_and_preserve_ordinary_cipher_order() {
+    use super::super::{
+        ParallelOrderedOffer, ParallelRegistry, RealtimeLaneOffer, RealtimeTransportOffer,
+    };
+    use veil_proto::{
+        family::{AppMsg, FrameFamily},
+        priority::{BACKGROUND, BULK},
+    };
+    use veil_transport::{
+        Transport, TransportListener, TransportUri, obfs4_tcp::Obfs4TcpTransport,
+    };
+    let mut context = TransportContext::for_debug().unwrap();
+    context.obfs4_psk = Some(Arc::new([0x42; 32]));
+    let context = Arc::new(context);
+    let listener: Arc<dyn TransportListener> = Arc::from(
+        Obfs4TcpTransport
+            .bind(
+                &TransportUri::Obfs4Tcp {
+                    host: "127.0.0.1".into(),
+                    port: 0,
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap(),
+    );
+    let port = listener
+        .local_addr()
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let uri = TransportUri::Obfs4Tcp {
+        host: "127.0.0.1".into(),
+        port,
+    };
+    let (local, remote) = tokio::join!(Obfs4TcpTransport.connect(&uri, context), listener.accept());
+    let local = local.unwrap();
+    let remote = remote.unwrap();
+    let offer = ParallelOrderedOffer::new(
+        local.parallel_stream().unwrap(),
+        Arc::new(ParallelRegistry::default()),
+    );
+    let mut remote_stream = remote.into_stream().unwrap();
+    let mut registry = crate::SessionTxRegistry::new();
+    let outbox = registry.register([0xB1; 32]);
+    let sender = registry.get_sender(&[0xB1; 32]).unwrap().clone();
+    let mut runner = super::reliable_source_pressure_quic_tests::make_runner(
+        local.into_stream().unwrap(),
+        outbox,
+        Some(RealtimeLaneOffer {
+            transport: RealtimeTransportOffer::Ordered(offer),
+            peer_datagrams: true,
+            peer_flows: true,
+            peer_rotates: true,
+            peer_circuit_datagrams: true,
+            peer_neutral_forwards: true,
+            parallel: None,
+        }),
+    );
+    runner.raw_session_keys = Some(([2; 32], [3; 32], [1; 32]));
+    let task = tokio::spawn(async move { runner.run().await });
+    for lane in [REALTIME, BULK, BACKGROUND] {
+        sender
+            .try_send((
+                lane,
+                veil_bufpool::pooled_shared_from_vec(primary_test_frame(false, 1, 0)),
+            ))
+            .unwrap();
+    }
+    // The listener has not accepted any child: do not mistake a missing
+    // separate connection for permission to serialize media into the parent.
+    assert!(
+        timeout(
+            Duration::from_millis(200),
+            remote_stream.read(&mut [0; 4096])
+        )
+        .await
+        .is_err(),
+        "negotiated source escaped onto the ordered parent"
+    );
+    // A working ordinary frame proves the parent was not just broken. Its
+    // successful decryption also detects a nonce burned by discarded media.
+    let body = b"ordinary-parent-still-works";
+    let mut header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppSend as u16);
+    header.body_len = body.len() as u32;
+    sender
+        .try_send((
+            INTERACTIVE,
+            veil_bufpool::pooled_shared_from_vec(veil_proto::codec::encode_frame(&header, body)),
+        ))
+        .unwrap();
+    let mut reader = super::super::ordered_reader::Reader::default();
+    let wire = timeout(
+        Duration::from_secs(1),
+        reader.read(&mut remote_stream, 65536),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(wire.header.msg_type, AppMsg::AppSend as u16);
+    let mut cipher = veil_crypto::session_cipher::SessionCipher::new(&[0x51; 32], true);
+    assert_eq!(
+        cipher
+            .open(&wire.body, &veil_proto::codec::frame_aad(&wire.header))
+            .unwrap(),
+        body
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn negotiated_sources_never_spill_to_parent_while_children_warm_or_close() {
+    use super::super::{ParallelQuicOffer, RealtimeLaneOffer, RealtimeTransportOffer};
+    use veil_proto::priority::{BACKGROUND, BULK};
+    let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let left_addr = left.local_addr().unwrap();
+    let right_addr = right.local_addr().unwrap();
+    let ctx = Arc::new(TransportContext::for_debug().unwrap());
+    let remote = tokio::spawn(promote_punched_quic(
+        right,
+        left_addr,
+        ctx.clone(),
+        PunchedQuicRole::Responder,
+    ));
+    let local = promote_punched_quic(left, right_addr, ctx, PunchedQuicRole::Initiator)
+        .await
+        .unwrap();
+    let parent = local.quic_datagrams().unwrap();
+    let offer = ParallelQuicOffer::new(local.parallel_quic().unwrap()).with_duplex();
+    let diagnostics = offer.diagnostics();
+    let mut stream = local.into_stream().unwrap();
+    stream.write_all(b"main").await.unwrap();
+    let remote = remote.await.unwrap().unwrap();
+    let remote_parent = remote.quic_datagrams().unwrap();
+    let remote_offer = ParallelQuicOffer::new(remote.parallel_quic().unwrap()).with_duplex();
+    let mut remote_stream = remote.into_stream().unwrap();
+    remote_stream.read_exact(&mut [0; 4]).await.unwrap();
+    let mut registry = crate::SessionTxRegistry::new();
+    let outbox = registry.register([0xB1; 32]);
+    let sender = registry.get_sender(&[0xB1; 32]).unwrap().clone();
+    let mut runner = super::reliable_source_pressure_quic_tests::make_runner(
+        stream,
+        outbox,
+        Some(RealtimeLaneOffer {
+            transport: RealtimeTransportOffer::Quic(parent),
+            peer_datagrams: true,
+            peer_flows: true,
+            peer_rotates: true,
+            peer_circuit_datagrams: true,
+            peer_neutral_forwards: true,
+            parallel: Some(offer),
+        }),
+    );
+    runner.raw_session_keys = Some(([2; 32], [3; 32], [1; 32]));
+    let task = tokio::spawn(async move { runner.run().await });
+    for lane in [REALTIME, BULK, BACKGROUND] {
+        sender
+            .try_send((
+                lane,
+                veil_bufpool::pooled_shared_from_vec(primary_test_frame(false, 1, 0)),
+            ))
+            .unwrap();
+    }
+    // No remote child registration yet: negotiation alone must not permit
+    // either shared parent DATAGRAMs or the encrypted reliable parent writer.
+    async fn no_parent_payload(
+        parent: &QuicDatagramHandle,
+        stream: &mut veil_transport::BoxIoStream,
+    ) {
+        let mut bytes = [0; 4096];
+        let result = timeout(Duration::from_millis(200), async {
+            tokio::select! {
+                p = parent.recv() => { assert!(p.is_ok()); },
+                n = stream.read(&mut bytes) => { assert!(n.unwrap() > 0); },
+            }
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "negotiated source escaped onto the shared parent"
+        );
+    }
+    no_parent_payload(&remote_parent, &mut remote_stream).await;
+    let started = Instant::now();
+    let (received, mut packets) = mpsc::unbounded_channel();
+    let logger = Arc::new(veil_observability::NodeLogger::new_noop());
+    let mut context = super::super::ordered_receiver_tests::pool_fixture_context();
+    context.dispatcher = Arc::new(Capture {
+        started,
+        received,
+        logger,
+    });
+    let child_receiver = super::super::parallel_lanes::ParallelSession::new(
+        remote_offer,
+        &[3; 32],
+        &[2; 32],
+        [1; 32],
+        context,
+        None,
+    );
+    let mut seen = HashSet::new();
+    timeout(Duration::from_secs(5), async {
+        for tick in 0u32.. {
+            for (index, lane) in [REALTIME, BULK, BACKGROUND].into_iter().enumerate() {
+                sender
+                    .try_send((
+                        lane,
+                        veil_bufpool::pooled_shared_from_vec(primary_test_frame(
+                            false,
+                            (index as u32 + 1) * 1000 + tick,
+                            0,
+                        )),
+                    ))
+                    .unwrap();
+            }
+            while let Ok((seq, _, _)) = packets.try_recv() {
+                seen.insert(seq / 1000);
+            }
+            if seen.len() == 3 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all three independent sources must actually deliver");
+    for lane in [REALTIME, BULK, BACKGROUND] {
+        assert!(diagnostics.sent(lane) > 0);
+    }
+    no_parent_payload(&remote_parent, &mut remote_stream).await;
+    drop(child_receiver);
+    sleep(Duration::from_millis(50)).await;
+    for lane in [REALTIME, BULK, BACKGROUND] {
+        sender
+            .try_send((
+                lane,
+                veil_bufpool::pooled_shared_from_vec(primary_test_frame(false, 9000, 0)),
+            ))
+            .unwrap();
+    }
+    no_parent_payload(&remote_parent, &mut remote_stream).await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}
+
 struct Capture {
     started: Instant,
     received: mpsc::UnboundedSender<(u32, u64, Duration)>,
