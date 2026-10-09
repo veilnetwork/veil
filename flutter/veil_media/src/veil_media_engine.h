@@ -139,7 +139,10 @@ int veil_media_group_engine_set_video_budget(VeilGroupMediaEngine *engine,
 int veil_media_group_engine_set_video_send_paused(VeilGroupMediaEngine *engine, int paused);
 /* Group audio quality: maxima over fresh RTCP audio report blocks (15 s).
  * `audio_receivers` maps peer-id hex to accepted `audio_rx_pkts` and the
- * native `audio_delay_ms` estimate. `audio_rx_supported` stays 1 even when
+ * native `audio_delay_ms` (current queued samples + reported ADM delay).
+ * `audio_filtered_delay_ms` retains WebRTC's RTP-span estimate for diagnostics;
+ * sender timestamp resets can invalidate it without delaying actual PCM.
+ * `audio_rx_supported` stays 1 even when
  * `worker_stalled` is 1 and the receiver map is empty (unknown, not healthy).
  * Audio and video telemetry have separate 20 ms scheduling waits.
  * `audio_playout_peers` counts active peers that advertised encrypted RTCP APP
