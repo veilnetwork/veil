@@ -1153,15 +1153,20 @@ pub(crate) async fn handle_ipc_send(
                 };
                 let bytes = envelope.encode();
                 for hop in hops.into_iter().take(3) {
+                    let datagram = reg.has_neutral_forward_datagram_transport(&hop);
                     let mut header =
                         FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
                     header.set_priority(veil_proto::priority::INTERACTIVE);
-                    header.body_len = (32 + bytes.len() + 8 + 1) as u32;
+                    header.body_len = (32 + bytes.len() + 8 + 1 + usize::from(datagram) * 2) as u32;
                     let mut frame = codec::encode_header(&header).to_vec();
                     frame.extend_from_slice(&hop);
                     frame.extend_from_slice(&bytes);
                     frame.extend_from_slice(&0u64.to_be_bytes());
                     frame.push(0);
+                    if datagram {
+                        frame.push(veil_proto::delivery::FORWARD_TRAFFIC_CLASS_MARKER);
+                        frame.push(veil_proto::priority::INTERACTIVE);
+                    }
                     // Keep the endpoint's signaling producer separate from its
                     // primary media producer. The relay header remains neutral.
                     any_sent |= reg.send_to(&hop, ctx.local_priority, frame);
@@ -1873,7 +1878,13 @@ pub(crate) async fn handle_ipc_send(
                     // Neutral loss-tolerant data never asks a relay for a
                     // faster queue. Older relays use their ordered ordinary
                     // transport; new peers explicitly negotiate datagram support.
-                    let class_suffix_len = if relay_wire_realtime { 2 } else { 0 };
+                    // An agreed generic datagram connection keeps control out
+                    // of a stalled reliable writer. Preserve the old suffix-
+                    // free format when the next hop did not negotiate it.
+                    let datagram = relay_wire_realtime
+                        || (relay_control_compat
+                            && reg.has_neutral_forward_datagram_transport(&next_hop));
+                    let class_suffix_len = if datagram { 2 } else { 0 };
                     let body_len =
                         32 + env_bytes.len() + 8 + 1 + attempt_suffix_len + class_suffix_len;
                     let mut hdr = FrameHeader::new(
@@ -1891,7 +1902,7 @@ pub(crate) async fn handle_ipc_send(
                         frame.push(veil_proto::delivery::FORWARD_DELIVERY_ATTEMPT_MARKER);
                         frame.push(1); // initial delivery attempt
                     }
-                    if relay_wire_realtime {
+                    if datagram {
                         frame.push(veil_proto::delivery::FORWARD_TRAFFIC_CLASS_MARKER);
                         frame.push(veil_proto::header::priority::INTERACTIVE);
                     }
@@ -4810,6 +4821,66 @@ mod ratchet_send_tests {
             .expect("the peer opens it");
         assert_eq!(opened.plaintext, b"through a relay");
         assert!(opened.authenticated);
+    }
+
+    #[tokio::test]
+    async fn relay_control_uses_negotiated_datagrams_and_preserves_legacy_fallback() {
+        const LEGACY: [u8; 32] = [0xb8; 32];
+        for device_fanout in [false, true] {
+            let mut fx = fixture(vec![RELAY, LEGACY]);
+            Arc::get_mut(&mut fx.outbox).unwrap().datagram = vec![RELAY];
+            if device_fanout {
+                let cert = fx.certs.resolve_cert_cached(PEER).unwrap();
+                fx.certs = Arc::new(FamilyCerts(vec![cert]));
+            }
+            let mut ctx = fx.ctx(true);
+            ctx.local_priority = veil_proto::priority::INTERACTIVE;
+            let mut body = payload(false, b"call answer");
+            body[100..104].copy_from_slice(
+                &veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT.to_be_bytes(),
+            );
+            let mut wh = sink().await;
+            handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+                .await
+                .unwrap();
+            let sent = fx.taken();
+            assert!(sent.iter().any(|(hop, _)| *hop == RELAY));
+            assert!(sent.iter().any(|(hop, _)| *hop == LEGACY));
+            let mut sealed = None;
+            for (hop, bytes) in sent {
+                assert_eq!(
+                    codec::decode_header(&bytes).unwrap().priority(),
+                    veil_proto::priority::INTERACTIVE
+                );
+                let body = &bytes[veil_proto::HEADER_SIZE..];
+                assert_eq!(
+                    veil_proto::delivery::ForwardPayload::is_realtime_datagram_eligible(body),
+                    hop == RELAY,
+                    "only negotiated peers may use independent datagrams"
+                );
+                let forward = veil_proto::delivery::ForwardPayload::decode(body).unwrap();
+                assert_eq!(
+                    forward.traffic_class,
+                    (hop == RELAY).then_some(veil_proto::priority::INTERACTIVE)
+                );
+                assert!(!forward.envelope.require_ack);
+                if let Some(first) = &sealed {
+                    assert_eq!(&forward.envelope.payload, first);
+                } else {
+                    let opened = fx
+                        .peer
+                        .open_payload(
+                            &ME,
+                            &forward.envelope.payload,
+                            veil_util::unix_secs_now_u64(),
+                        )
+                        .unwrap();
+                    assert!(opened.authenticated);
+                    assert_eq!(opened.plaintext, b"call answer");
+                    sealed = Some(forward.envelope.payload);
+                }
+            }
+        }
     }
 
     #[tokio::test]
