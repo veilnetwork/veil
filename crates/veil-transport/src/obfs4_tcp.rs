@@ -29,7 +29,7 @@ use veil_obfs4::{
 use super::{
     TransportContext,
     error::{Result, TransportError},
-    tcp::{configure_accepted_tcp, connect_tcp_stream, peer_meta},
+    tcp::{bind_tcp_with_reuseaddr, configure_accepted_tcp, connect_tcp_stream, peer_meta},
     traits::{
         BoxIoStream, RawInbound, Transport, TransportCapabilities, TransportConnection,
         TransportListener,
@@ -138,7 +138,7 @@ impl Transport for Obfs4TcpTransport {
         Box::pin(async move {
             let (host, port) = obfs4_parts(uri)?;
             let psk = psk_from_context(&ctx)?;
-            let listener = TcpListener::bind((host, port)).await?;
+            let listener = bind_tcp_with_reuseaddr(host, port).await?;
             Ok(Box::new(Obfs4TcpListener {
                 listener,
                 context: Arc::clone(&ctx),
@@ -381,6 +381,26 @@ mod tests {
         let mut ctx = TransportContext::for_debug().expect("debug ctx");
         ctx.obfs4_psk = Some(Arc::new(psk));
         Arc::new(ctx)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn obfs4_listener_negotiates_mss_before_handshake() {
+        for host in ["127.0.0.1", "[::1]"] {
+            let uri = TransportUri::parse(&format!("obfs4-tcp://{host}:0")).unwrap();
+            let listener = Obfs4TcpTransport
+                .bind(&uri, ctx_with_psk([0x42; 32]))
+                .await
+                .unwrap();
+            let client = tokio::net::TcpStream::connect(listener.local_addr())
+                .await
+                .unwrap();
+            let mss = socket2::SockRef::from(&client).tcp_mss().unwrap();
+            assert!(
+                mss > 0 && mss <= super::super::tcp::DOWNLINK_MSS_CLAMP,
+                "{host}: negotiated MSS {mss}"
+            );
+        }
     }
 
     /// End-to-end: bind, accept, connect, round-trip plaintext bytes
