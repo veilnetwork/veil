@@ -1,4 +1,4 @@
-//! Bounded endpoint-only replacement of a primary whose ACK progress stopped.
+//! Bounded replacement of an active opaque channel whose ACK progress stopped.
 //! This neither resets congestion state nor changes receiver authorization.
 use std::time::{Duration, Instant};
 use veil_transport::QuicDatagramPathStats;
@@ -7,9 +7,10 @@ use veil_transport::QuicDatagramPathStats;
 // including idle producers, cannot trigger connection churn.
 const STALLED_FOR: Duration = Duration::from_millis(500);
 const ATTEMPT_SPACING: Duration = Duration::from_secs(2);
+pub(super) const ACTIVE_FOR: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
-pub(super) struct PrimaryRecovery {
+pub(super) struct ChannelRecovery {
     last_ack: Option<u64>,
     last_expired: u64,
     observed_at: Option<Instant>,
@@ -24,7 +25,7 @@ pub(super) enum Action {
     Probe,
 }
 
-impl PrimaryRecovery {
+impl ChannelRecovery {
     pub(super) fn reset(&mut self) {
         // Keep attempt spacing even when a sender is replaced or fails.
         self.last_ack = None;
@@ -64,6 +65,32 @@ impl PrimaryRecovery {
     }
 }
 
+/// One spare connection, shared fairly without any application/queue hint.
+#[derive(Default)]
+pub(super) struct RecoverySchedule {
+    cursor: usize,
+    next_attempt: Option<Instant>,
+}
+
+impl RecoverySchedule {
+    pub(super) fn choose<const N: usize>(
+        &mut self,
+        eligible: [bool; N],
+        replacing: bool,
+        now: Instant,
+    ) -> Option<usize> {
+        if replacing || self.next_attempt.is_some_and(|at| now < at) {
+            return None;
+        }
+        let selected = (0..N)
+            .map(|offset| (self.cursor + offset) % N)
+            .find(|&index| eligible[index])?;
+        self.cursor = (selected + 1) % N;
+        self.next_attempt = Some(now + ATTEMPT_SPACING);
+        Some(selected)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,7 +122,7 @@ mod tests {
 
     #[test]
     fn requires_stalled_ack_and_actual_expiry_and_bounds_attempts() {
-        let mut p = PrimaryRecovery::default();
+        let mut p = ChannelRecovery::default();
         let t = Instant::now();
         let mut s = stats();
         assert!(matches!(p.observe(s, t), Action::None));
@@ -144,5 +171,28 @@ mod tests {
             p.observe(s, t + Duration::from_secs(5)),
             Action::Probe
         ));
+    }
+
+    #[test]
+    fn all_opaque_channels_share_one_spare_and_attempt_budget_fairly() {
+        let mut schedule = RecoverySchedule::default();
+        let start = Instant::now();
+        for turn in 0..18usize {
+            let now = start + ATTEMPT_SPACING * turn as u32;
+            assert_eq!(schedule.choose([true; 6], true, now), None);
+            assert_eq!(schedule.choose([true; 6], false, now), Some(turn % 6));
+            // A quick ACK cancellation cannot give another channel a fresh
+            // session-wide handshake budget in the same interval.
+            assert_eq!(
+                schedule.choose([true; 6], false, now + Duration::from_millis(1)),
+                None
+            );
+        }
+        let now = start + ATTEMPT_SPACING * 18;
+        assert_eq!(schedule.choose([false; 6], false, now), None);
+        assert_eq!(
+            schedule.choose([false, false, false, false, false, true], false, now),
+            Some(5)
+        );
     }
 }
