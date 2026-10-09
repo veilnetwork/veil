@@ -642,10 +642,9 @@ impl ParallelSession {
         kind: RealtimeLaneFrameKind,
     ) -> Option<usize> {
         let index = channel_index(priority).or_else(|| {
-            (self.offer.duplex
-                && priority == veil_proto::priority::INTERACTIVE
-                && kind == RealtimeLaneFrameKind::CircuitDatagram)
-                .then(|| transit_index(&self.transit_salt, body))
+            (self.offer.duplex && priority == veil_proto::priority::INTERACTIVE)
+                .then(|| neutral_transit_index(&self.transit_salt, body, kind))
+                .flatten()
         })?;
         // Adopt an already authenticated replacement before observing the old
         // sender. A late ACK on that sender must not discard a completed proof
@@ -871,6 +870,33 @@ pub(super) fn transit_index(salt: &[u8; 32], body: &[u8]) -> usize {
     SOURCE_SLOTS + usize::from(blake3::keyed_hash(salt, &body[..4]).as_bytes()[0]) % TRANSIT_SLOTS
 }
 
+// Both formats have passed the ordinary loss-tolerant decoder before selection.
+// A forwarded delivery uses only its already visible recipient and sender,
+// never app IDs, endpoints, payload, TTL or a sender's traffic-class hint.
+// This is the same bounded neutral pool and ordinary FIFO as circuit transit.
+pub(super) fn neutral_transit_index(
+    salt: &[u8; 32],
+    body: &[u8],
+    kind: RealtimeLaneFrameKind,
+) -> Option<usize> {
+    match kind {
+        RealtimeLaneFrameKind::CircuitDatagram => {
+            body.get(..4)?;
+            Some(transit_index(salt, body))
+        }
+        RealtimeLaneFrameKind::RelayForward => {
+            // Forward begins with next_hop (32); the envelope then begins
+            // with Recipient's fixed 49-byte routing value and sender (32).
+            let routing = body.get(32..32 + 49 + 32)?;
+            let mut hash = blake3::Hasher::new_keyed(salt);
+            hash.update(b"neutral-forward/v1");
+            hash.update(routing);
+            Some(SOURCE_SLOTS + usize::from(hash.finalize().as_bytes()[0]) % TRANSIT_SLOTS)
+        }
+        RealtimeLaneFrameKind::DirectApp => None,
+    }
+}
+
 #[cfg(test)]
 mod transit_tests {
     use super::*;
@@ -890,6 +916,32 @@ mod transit_tests {
         }
         assert!(seen.into_iter().all(|present| present));
         assert_eq!(channel_index(veil_proto::priority::INTERACTIVE), None);
+    }
+
+    #[test]
+    fn forwarded_delivery_shards_ignore_app_roles_payload_and_claimed_priority() {
+        let salt = blake3::derive_key("veil/transit-shard/v1", &[7; 32]);
+        let mut body = vec![0; 512];
+        let mut seen = [false; TRANSIT_SLOTS];
+        for sender in 0..256u16 {
+            // Existing routing sender only; never add a flow or role field.
+            body[32 + 49..32 + 49 + 2].copy_from_slice(&sender.to_be_bytes());
+            let selected =
+                neutral_transit_index(&salt, &body, RealtimeLaneFrameKind::RelayForward).unwrap();
+            assert!((SOURCE_SLOTS..TOTAL_SLOTS).contains(&selected));
+            seen[selected - SOURCE_SLOTS] = true;
+            body[..32].fill(12); // a different next-hop routing advertisement
+            body[32 + 49 + 32..].fill(255); // apps, timestamps, ciphertext, wire hint
+            assert_eq!(
+                neutral_transit_index(&salt, &body, RealtimeLaneFrameKind::RelayForward),
+                Some(selected)
+            );
+        }
+        assert!(seen.into_iter().all(|x| x));
+        assert_eq!(
+            neutral_transit_index(&salt, &body, RealtimeLaneFrameKind::DirectApp),
+            None
+        );
     }
 
     #[test]
