@@ -96,10 +96,12 @@ impl LossyTransportHandle {
     }
 
     pub(super) fn send(&self, payload: &[u8]) -> Result<(), LossySendError> {
-        match self {
-            Self::Quic(handle) => handle.send(payload).map_err(Into::into),
-            Self::Ordered(handle) => handle.send(payload).map_err(Into::into),
-        }
+        // The same local residence limit applies to every opaque datagram,
+        // including transit traffic. No producer/deadline is sent to a relay.
+        self.send_before(
+            payload,
+            Instant::now() + veil_transport::ordered_records::RECORD_RECEIVE_MAX_AGE,
+        )
     }
 
     pub(super) fn send_before(
@@ -107,6 +109,8 @@ impl LossyTransportHandle {
         payload: &[u8],
         expires_at: Instant,
     ) -> Result<(), LossySendError> {
+        let expires_at = expires_at
+            .min(Instant::now() + veil_transport::ordered_records::RECORD_RECEIVE_MAX_AGE);
         match self {
             Self::Quic(handle) => handle.send_before(payload, expires_at).map_err(Into::into),
             Self::Ordered(handle) => handle.send_before(payload, expires_at).map_err(Into::into),
