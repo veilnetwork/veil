@@ -309,6 +309,10 @@ pub struct BoundOrderedHandle {
 }
 
 impl BoundOrderedHandle {
+    pub fn is_closed(&self) -> bool {
+        !self.parent.is_active() || self.records.is_closed()
+    }
+
     pub fn max_size(&self) -> Option<usize> {
         self.parent
             .is_active()

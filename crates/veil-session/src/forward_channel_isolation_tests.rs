@@ -70,6 +70,62 @@ fn publish(sender: &Arc<Mutex<RealtimeSender>>, frame: &[u8]) {
 }
 
 #[tokio::test]
+async fn retained_closed_ordered_carrier_releases_ingress_and_refuses_before_admission() {
+    let parent = ParallelParent::new([1; 32], [2; 32], [3; 32]);
+    let remote = ParallelParent::new([1; 32], [3; 32], [2; 32]);
+    let diagnostics = Arc::new(ParallelDiagnostics::default());
+    let mut assignments = super::super::channel_assignments::ChannelAssignments::<1>::default();
+    let (old, _, _old_pipe) = raw_pair(&parent, &remote, 1024);
+    let make = |channel: &BoundOrderedChannel| {
+        parallel_lanes::make_carrier(
+            &diagnostics,
+            Arc::new(Mutex::new(RealtimeSender::new(
+                channel.handle(),
+                crate::datagram_flows::SessionDatagramTx::new(
+                    channel.keys.tx_key(),
+                    &channel.keys.session_id,
+                    true,
+                ),
+            ))),
+            parent.handle(),
+            [4; 32],
+        )
+    };
+    let retained = make(&old);
+    let old_flow = retained.local_ingress_flow().unwrap();
+    let witness = Arc::downgrade(&retained);
+    assert_eq!(assignments.transit(Some(&witness), 0).unwrap().physical, 0);
+    old.handle().close();
+    assert!(parent.handle().is_active());
+    assert!(retained.local_ingress_flow().is_none());
+    let mut admitted = false;
+    assert!(matches!(
+        retained.try_send(&[4; 32], &opaque_forward(21), &mut |_| {
+            admitted = true;
+            true
+        }),
+        veil_anonymity::circuit_carrier::CarrierSend::Unavailable,
+    ));
+    assert!(
+        !admitted,
+        "a closed child must not spend fallback admission"
+    );
+    let (new, _, _new_pipe) = raw_pair(&parent, &remote, 1024);
+    let replacement = make(&new);
+    let new_flow = replacement.local_ingress_flow().unwrap();
+    assert_eq!(old_flow.parent, new_flow.parent);
+    assert_ne!(old_flow.connection, new_flow.connection);
+    let replacement_witness = Arc::downgrade(&replacement);
+    assert_eq!(
+        assignments
+            .transit(Some(&replacement_witness), 0)
+            .unwrap()
+            .physical,
+        0
+    );
+}
+
+#[tokio::test]
 async fn distinct_forward_ingress_progresses_while_the_same_routes_other_pipe_is_blocked() {
     let parent = ParallelParent::new([1; 32], [2; 32], [3; 32]);
     let remote = ParallelParent::new([1; 32], [3; 32], [2; 32]);

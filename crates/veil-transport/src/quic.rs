@@ -143,6 +143,11 @@ impl QuicDatagramHandle {
         self.connection.close(0u32.into(), b"channel retired");
     }
 
+    /// Whether this connection has reached a terminal state.
+    pub fn is_closed(&self) -> bool {
+        self.connection.close_reason().is_some()
+    }
+
     /// Wait for this connection's terminal state without exposing Quinn types.
     pub async fn closed(&self) {
         let _ = self.connection.closed().await;
