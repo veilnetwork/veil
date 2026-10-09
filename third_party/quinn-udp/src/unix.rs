@@ -18,6 +18,18 @@ use super::{
     cmsg, log_sendmsg_error, EcnCodepoint, RecvMeta, Transmit, UdpSockRef, IO_ERROR_LOG_INTERVAL,
 };
 
+// Linux's time64 socket option is not exposed by every libc binding (notably
+// musl). Keep the kernel UAPI value, including SPARC's separate numbering,
+// rather than dropping time64 timestamps or assuming native timespec layout.
+// include/uapi/asm-generic/socket.h and arch/sparc/include/uapi/asm/socket.h.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SO_TIMESTAMPNS_TIME64: libc::c_int =
+    if cfg!(any(target_arch = "sparc", target_arch = "sparc64")) {
+        0x0042
+    } else {
+        64
+    };
+
 // Adapted from https://github.com/apple-oss-distributions/xnu/blob/8d741a5de7ff4191bf97d57b9f54c2f6d4a15585/bsd/sys/socket_private.h
 #[cfg(apple_fast)]
 #[repr(C)]
@@ -207,13 +219,12 @@ impl UdpSocketState {
         let io = socket.0;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if enabled {
-            if set_socket_option(&*io, libc::SOL_SOCKET, libc::SO_TIMESTAMPNS_NEW, OPTION_ON)
-                .is_err()
+            if set_socket_option(&*io, libc::SOL_SOCKET, SO_TIMESTAMPNS_TIME64, OPTION_ON).is_err()
             {
                 let _ = set_socket_option(&*io, libc::SOL_SOCKET, libc::SO_TIMESTAMPNS, OPTION_ON);
             }
         } else {
-            let _ = set_socket_option(&*io, libc::SOL_SOCKET, libc::SO_TIMESTAMPNS_NEW, 0);
+            let _ = set_socket_option(&*io, libc::SOL_SOCKET, SO_TIMESTAMPNS_TIME64, 0);
             let _ = set_socket_option(&*io, libc::SOL_SOCKET, libc::SO_TIMESTAMPNS, 0);
         }
         #[cfg(apple)]
@@ -749,7 +760,7 @@ fn decode_recv(
     for cmsg in cmsg_iter {
         match (cmsg.cmsg_level, cmsg.cmsg_type) {
             #[cfg(any(target_os = "linux", target_os = "android"))]
-            (libc::SOL_SOCKET, libc::SO_TIMESTAMPNS_NEW) => {
+            (libc::SOL_SOCKET, kind) if kind == SO_TIMESTAMPNS_TIME64 => {
                 if cmsg.cmsg_len as usize >= unsafe { libc::CMSG_LEN(16) } as usize {
                     // NEW uses two i64 fields even on 32-bit platforms. The
                     // ancillary pointer need not be i64-aligned there.
@@ -760,7 +771,7 @@ fn decode_recv(
                 }
             }
             #[cfg(any(target_os = "linux", target_os = "android"))]
-            (libc::SOL_SOCKET, libc::SO_TIMESTAMPNS) => {
+            (libc::SOL_SOCKET, kind) if kind == libc::SO_TIMESTAMPNS => {
                 if cmsg.cmsg_len as usize
                     >= unsafe { libc::CMSG_LEN(mem::size_of::<libc::timespec>() as _) } as usize
                 {
