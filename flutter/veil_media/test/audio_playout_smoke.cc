@@ -33,6 +33,8 @@ static bool perfect_network = false;
 static bool handover_network = false;
 static bool delivery_stall = false;
 static bool recurring_jitter = false;
+static bool mature_jitter = false;
+static Clock::time_point mature_last_due;
 static bool drop_during_stall = false;
 static size_t dropped_packets = 0;
 static size_t max_delivery_batch = 0;
@@ -58,11 +60,18 @@ extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t 
   const double at = milliseconds(now);
   // Exercise both a short burst and repeated bursts across ten seconds.
   // Each is followed by a healthy path; PCM must shed the old playout tail.
-  const int delay = !perfect_network && at >= 2000 &&
-      at < (recurring_jitter ? 12000 : 4000)
+  const int delay = !perfect_network && at >= (mature_jitter ? 70000 : 2000) &&
+      at < (mature_jitter ? 80000 : recurring_jitter ? 12000 : 4000)
       ? (static_cast<int>(at) / 200 % 2 ? 300 : 40) : 40;
   ++sent_packets;
   auto due = now + std::chrono::milliseconds(delay);
+  if (mature_jitter) {
+    // Captured ingress is overwhelmingly ordered: model a delivery pause
+    // holding later packets behind it. Delaying alternate packets lets them
+    // overtake each other and exercises the reorder estimator instead of underruns.
+    due = std::max(due, mature_last_due);
+    mature_last_due = due;
+  }
   if (delivery_stall) {
     // Stall before the receiver, matching the observed kernel-receipt boundary.
     // Release old packets together in send order, beside newly arriving audio.
@@ -429,6 +438,7 @@ static void verify_delivery_stall(bool drop) {
 
 int main(int argc, char** argv) {
   recurring_jitter = argc == 2 && std::strcmp(argv[1], "--recurring-jitter") == 0;
+  mature_jitter = argc == 2 && std::strcmp(argv[1], "--mature-jitter") == 0;
   if (argc == 2 && std::strcmp(argv[1], "--sender-restart") == 0) {
     verify_sender_restart();
     return 0;
@@ -461,6 +471,7 @@ int main(int argc, char** argv) {
   uint64_t baseline_concealed = 0;
   uint64_t baseline_flushes = 0;
   for (size_t capacity : {size_t{30}, size_t{0}}) {
+    if (mature_jitter && capacity) continue;
     {
       std::lock_guard lock(mu);
       pending.clear(); sent_packets = 0;
@@ -482,7 +493,10 @@ int main(int argc, char** argv) {
     uint64_t max_delay = 0, max_buffer = 0;
     size_t nonsilent_ticks = 0;
     std::array<int16_t, 480> pcm{};
-    const int ticks = recurring_jitter ? 3000 : 1400;
+    // Histogram startup gives recent arrivals extra weight. Warm the actual
+    // receiver for 70 seconds before the same radio bursts, then measure 30
+    // seconds of healthy PCM. A short startup test misses a mature tail.
+    const int ticks = mature_jitter ? 11000 : recurring_jitter ? 3000 : 1400;
     for (int tick = 0; tick < ticks; ++tick) {
       std::this_thread::sleep_until(origin + std::chrono::milliseconds(10 * tick));
       const double now = milliseconds(Clock::now());
@@ -516,10 +530,10 @@ int main(int argc, char** argv) {
     { std::lock_guard lock(mu); packet_count = sent_packets; }
     assert(packet_count > 300 && nonsilent_ticks > size_t(ticks - 500));
     assert(metric(receiver.get(), "audio_rx_pkts") > 300);
-    std::printf("{\"recurring_jitter\":%s,\"buffer_packets_override\":%zu,\"rtp_packets\":%zu,\"nonsilent_ticks\":%zu,"
+    std::printf("{\"mature_jitter\":%s,\"recurring_jitter\":%s,\"buffer_packets_override\":%zu,\"rtp_packets\":%zu,\"nonsilent_ticks\":%zu,"
                 "\"max_tick_lateness_ms\":%.2f,\"max_filtered_delay_ms\":%llu,"
                 "\"max_current_buffer_ms\":%llu,\"marker_latency_ms\":[",
-        recurring_jitter ? "true" : "false", capacity, packet_count, nonsilent_ticks, max_tick_lateness,
+        mature_jitter ? "true" : "false", recurring_jitter ? "true" : "false", capacity, packet_count, nonsilent_ticks, max_tick_lateness,
         static_cast<unsigned long long>(max_delay), static_cast<unsigned long long>(max_buffer));
     bool recovered = true;
     for (size_t i = 0; i < source_edges.size(); ++i) {
@@ -532,7 +546,13 @@ int main(int argc, char** argv) {
       // flushing audio. Keep PCM recovery within the measured control budget,
       // then check actual concealed samples as well as the rendered markers.
       if (!capacity) {
-        if (recurring_jitter) {
+        if (mature_jitter) {
+          // The healthy path resumes at 80 seconds. Bound the real PCM tail
+          // after 15/17/19 seconds; merely reporting a lower gauge is not enough.
+          if (source_edges[i] >= 95000) recovered &= latency < 300;
+          if (source_edges[i] >= 97000) recovered &= latency < 220;
+          if (source_edges[i] >= 99000) recovered &= latency < 180;
+        } else if (recurring_jitter) {
           // The healthy path resumes at 12 seconds. Measure spoken markers
           // at 13/15/17 seconds and beyond, including the long recovery tail.
           if (i == 6) recovered &= latency < 400;
@@ -558,7 +578,14 @@ int main(int argc, char** argv) {
     const auto concealed = metric(receiver.get(), "audio_concealed_samples");
     const auto flushes = metric(receiver.get(), "audio_jb_flushes");
     if (capacity) { baseline_concealed = concealed; baseline_flushes = flushes; }
-    else {
+    else if (mature_jitter) {
+      // The preceding policy concealed 11,336 samples in this ordered burst.
+      // Give real PCM a 300-ms concealment budget, independently of the delay
+      // gauge, and reject recovery by repeated buffer flushing/interruptions.
+      assert(concealed < 14400);
+      assert(flushes <= 1);
+      assert(metric(receiver.get(), "audio_interruption_count") <= 1);
+    } else {
       assert(concealed <= baseline_concealed + 2400); // <=50 ms extra at 48 kHz
       assert(flushes <= baseline_flushes);
     }
