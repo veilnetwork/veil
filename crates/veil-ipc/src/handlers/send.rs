@@ -1932,8 +1932,18 @@ pub(crate) async fn handle_ipc_send(
                     1
                 };
                 let mut accepted_copies = 0;
+                let mut accepted_datagram_copy = false;
                 for (compat_attempts, next_hop) in hops_to_try.into_iter().enumerate() {
                     if relay_control_compat && compat_attempts >= 3 {
+                        break;
+                    }
+                    // Datagram hops precede ordered hops. Once a primary copy
+                    // is admitted to a negotiated datagram hop, do not also feed
+                    // a legacy canonical writer: a stale duplicate there can
+                    // pressure the endpoint even when the other path progresses.
+                    // If every datagram admission fails, retain ordered fallback.
+                    let datagram_hop = reg.has_neutral_forward_datagram_transport(&next_hop);
+                    if diverse_primary && accepted_datagram_copy && !datagram_hop {
                         break;
                     }
                     let fwd_frame = make_fwd_frame(next_hop);
@@ -1982,6 +1992,7 @@ pub(crate) async fn handle_ipc_send(
                         // single-hop tracker semantics.
                         if fanout_limit > 1 && !send.require_ack {
                             accepted_copies += 1;
+                            accepted_datagram_copy |= datagram_hop;
                             if accepted_copies >= fanout_limit {
                                 return Ok(());
                             }
@@ -5153,6 +5164,76 @@ mod ratchet_send_tests {
                 codec::decode_header(&sent[0].1).unwrap().priority(),
                 veil_proto::priority::INTERACTIVE
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn primary_relay_diversity_does_not_add_ordered_copies_after_datagram_admission() {
+        const DATAGRAM: [u8; 32] = [0xB8; 32];
+        const SECOND_DATAGRAM: [u8; 32] = [0xBA; 32];
+        const ORDERED: [u8; 32] = [0xBB; 32];
+        struct RefuseHop(Arc<Outbox>, Option<[u8; 32]>);
+        impl FrameBroadcaster for RefuseHop {
+            fn has_neutral_forward_datagram_transport(&self, peer: &[u8; 32]) -> bool {
+                self.0.has_neutral_forward_datagram_transport(peer)
+            }
+            fn send_to(&self, peer: &[u8; 32], priority: u8, frame: Vec<u8>) -> bool {
+                Some(*peer) != self.1 && self.0.send_to(peer, priority, frame)
+            }
+            fn send_to_all_with_priority(&self, _priority: u8, _bytes: Arc<[u8]>) {}
+            fn active_node_ids(&self) -> Vec<[u8; 32]> {
+                self.0.active_node_ids()
+            }
+        }
+        for (datagrams, refused, expected) in [
+            (vec![DATAGRAM], None, vec![DATAGRAM]),
+            (
+                vec![DATAGRAM, SECOND_DATAGRAM],
+                None,
+                vec![DATAGRAM, SECOND_DATAGRAM],
+            ),
+            (
+                vec![DATAGRAM, SECOND_DATAGRAM],
+                Some(DATAGRAM),
+                vec![SECOND_DATAGRAM],
+            ),
+            (vec![DATAGRAM], Some(DATAGRAM), vec![RELAY, SECOND_DATAGRAM]),
+            (vec![], None, vec![RELAY, DATAGRAM]),
+        ] {
+            let mut fx = fixture(vec![RELAY, DATAGRAM, SECOND_DATAGRAM, ORDERED]);
+            Arc::get_mut(&mut fx.outbox).unwrap().datagram = datagrams;
+            let mut ctx = fx.ctx(false);
+            ctx.session_tx_registry = Some(Arc::new(RefuseHop(fx.outbox.clone(), refused)));
+            ctx.local_priority = veil_proto::priority::REALTIME;
+            let mut sealed = veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC.to_vec();
+            sealed.resize(128, 0xA5);
+            let mut body = payload_to(PEER, &sealed);
+            let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+                | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
+            body[100..104].copy_from_slice(&flags.to_be_bytes());
+            let mut wh = sink().await;
+            handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+                .await
+                .unwrap();
+            let sent = fx.taken();
+            assert_eq!(
+                sent.iter().map(|(hop, _)| *hop).collect::<Vec<_>>(),
+                expected
+            );
+            let mut replay_id = None;
+            for (_, frame) in sent {
+                let header = codec::decode_header(&frame).unwrap();
+                assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+                let forward =
+                    veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                        .unwrap();
+                assert_eq!(forward.envelope.payload, sealed);
+                if let Some(id) = replay_id {
+                    assert_eq!(forward.envelope.content_id, id);
+                } else {
+                    replay_id = Some(forward.envelope.content_id);
+                }
+            }
         }
     }
 
