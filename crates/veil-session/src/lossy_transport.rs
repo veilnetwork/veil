@@ -67,6 +67,13 @@ impl From<BoundOrderedHandle> for LossyTransportHandle {
 }
 
 impl LossyTransportHandle {
+    pub(super) fn is_closed(&self) -> bool {
+        match self {
+            Self::Quic(handle) => handle.is_closed(),
+            Self::Ordered(handle) => handle.is_closed(),
+        }
+    }
+
     pub(super) fn quic(&self) -> Option<&QuicDatagramHandle> {
         match self {
             Self::Quic(handle) => Some(handle),

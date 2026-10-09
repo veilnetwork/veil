@@ -226,6 +226,10 @@ impl OrderedRecordHandle {
         self.0.closed.cancelled().await;
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.0.closed.is_cancelled()
+    }
+
     pub fn progress(&self) -> RecordProgress {
         // Keep the same incoming→progress lock order as the receive worker.
         let q = self.0.incoming.lock().unwrap_or_else(|e| e.into_inner());

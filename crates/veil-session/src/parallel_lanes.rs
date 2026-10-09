@@ -401,7 +401,8 @@ struct ChildCarrier {
 
 impl veil_anonymity::circuit_carrier::DatagramCarrier for ChildCarrier {
     fn local_ingress_flow(&self) -> Option<veil_anonymity::circuit_carrier::LocalIngressFlow> {
-        if !self.parent.is_active() || lock!(self.sender).broken {
+        let sender = lock!(self.sender);
+        if !self.parent.is_active() || sender.broken || sender.handle.is_closed() {
             return None;
         }
         Some(veil_anonymity::circuit_carrier::LocalIngressFlow {
@@ -429,7 +430,7 @@ impl veil_anonymity::circuit_carrier::DatagramCarrier for ChildCarrier {
             return CarrierSend::Unavailable;
         }
         let mut sender = lock!(self.sender);
-        if sender.broken {
+        if sender.broken || sender.handle.is_closed() {
             return CarrierSend::Unavailable;
         }
         let max_size = sender.max_datagram_size;
@@ -696,6 +697,19 @@ impl ParallelSession {
         let prepared = self.prepare_index(selected.physical);
         self.recover_channels(now);
         prepared.then_some(selected)
+    }
+
+    #[cfg(test)]
+    pub(super) fn ingress_carrier_for_test(
+        &self,
+        index: usize,
+    ) -> Arc<dyn veil_anonymity::circuit_carrier::DatagramCarrier> {
+        make_carrier(
+            &self.offer.diagnostics,
+            self.sender_arc(index),
+            self.parent.handle(),
+            self.context.peer_id,
+        )
     }
 
     #[cfg(test)]
