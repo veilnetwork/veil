@@ -397,3 +397,251 @@ async fn ordered_children_dispatch_all_sources_with_blocked_parent_writer() {
 async fn ordered_children_rebind_after_normal_runner_rekey() {
     run(true).await;
 }
+
+#[allow(clippy::await_holding_lock)]
+async fn run_neutral_forward(negotiated: bool, blocked: bool) {
+    let _rotation = epic488_1_lock();
+    let mut context = TransportContext::for_debug().unwrap();
+    context.obfs4_psk = Some(Arc::new([0x42; 32]));
+    let context = Arc::new(context);
+    let listener: Arc<dyn TransportListener> = Arc::from(
+        Obfs4TcpTransport
+            .bind(
+                &TransportUri::Obfs4Tcp {
+                    host: "127.0.0.1".into(),
+                    port: 0,
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap(),
+    );
+    let port = listener
+        .local_addr()
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let uri = TransportUri::Obfs4Tcp {
+        host: "127.0.0.1".into(),
+        port,
+    };
+    let (a, b) = tokio::join!(Obfs4TcpTransport.connect(&uri, context), listener.accept());
+    let a = a.unwrap();
+    let b = b.unwrap();
+    let a_offer = a.parallel_stream().unwrap();
+    let b_offer = b.parallel_stream().unwrap();
+    assert!(a_offer.can_connect());
+    assert!(
+        !b_offer.can_connect(),
+        "accepted source port is not a listener"
+    );
+    let mut tasks = Tasks(Vec::new());
+    let registries = [
+        Arc::new(ParallelRegistry::default()),
+        Arc::new(ParallelRegistry::default()),
+    ];
+    let accepted_registry = registries[1].clone();
+    tasks.0.push(tokio::spawn(async move {
+        loop {
+            let connection = listener.accept().await.unwrap();
+            let binding = connection.stream_channel_binding();
+            match accepted_registry
+                .peek_and_dispatch_with_binding(connection.into_stream().unwrap(), None, binding)
+                .await
+            {
+                ParallelPeekOutcome::Bound | ParallelPeekOutcome::Drop(_) => {}
+                ParallelPeekOutcome::Handshake(_) => {
+                    panic!("auxiliary child created a canonical identity")
+                }
+            }
+        }
+    }));
+    let mut receivers = Vec::new();
+    let mut senders = Vec::new();
+    let mut endpoints = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut attempted = Vec::new();
+    let app_id = [0xa0; 32];
+    for (direction, (stream, handle)) in [
+        (a.into_stream().unwrap(), a_offer.clone()),
+        (b.into_stream().unwrap(), b_offer.clone()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (_, dummy) = tokio::io::duplex(64);
+        let (mut runner, _) = make_swap_runner(dummy);
+        let mut dispatcher = make_test_dispatcher(NodeRole::Core);
+        dispatcher.local_node_id = [direction as u8 + 1; 32];
+        let dispatcher = Arc::new(dispatcher);
+        let (endpoint, receiver) = dispatcher.app_registry.register(app_id, 1, 64);
+        endpoints.push(endpoint);
+        receivers.push(receiver);
+        let (sender, outbox) = veil_session::frame_outbox::frame_channel(64);
+        senders.push(sender);
+        let writing = Arc::new(tokio::sync::Notify::new());
+        attempted.push(writing.clone());
+        runner.stream = if !blocked {
+            stream
+        } else {
+            Box::new(BlockedMain {
+                stream,
+                attempted: writing,
+            })
+        };
+        let offer = ParallelOrderedOffer::new(handle, registries[direction].clone());
+        diagnostics.push(offer.diagnostics());
+        runner.quic_datagrams = Some(RealtimeLaneOffer {
+            peer_datagrams: true,
+            transport: RealtimeTransportOffer::Ordered(offer),
+            peer_rotates: true,
+            peer_flows: true,
+            peer_circuit_datagrams: true,
+            peer_neutral_forwards: negotiated,
+            parallel: None,
+        });
+        let (tx, rx) = if direction == 0 {
+            ([1; 32], [2; 32])
+        } else {
+            ([2; 32], [1; 32])
+        };
+        runner.local_node_id = [direction as u8 + 1; 32];
+        runner.peer_id = [2 - direction as u8; 32];
+        runner.session_id = [3; 32];
+        runner.raw_session_keys = Some((tx, rx, [3; 32]));
+        {
+            runner.crypto.tx_cipher =
+                Some(veil_crypto::session_cipher::SessionCipher::new(&tx, true));
+            runner.crypto.rx_cipher =
+                Some(veil_crypto::session_cipher::SessionCipher::new(&rx, true));
+        }
+        runner.outbox = Some(outbox);
+        runner.ban_list = dispatcher.abuse.ban_list.clone();
+        runner.violation_tracker = dispatcher.abuse.violation_tracker.clone();
+        runner.logger = dispatcher.logger.clone();
+        runner.dispatcher = dispatcher;
+        tasks.0.push(tokio::spawn(async move {
+            runner.run().await;
+        }));
+    }
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !senders.iter().all(|s| s.has_datagram_transport()) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ordered runner readiness");
+    for sender in &senders {
+        assert_eq!(sender.has_neutral_forward_datagram_transport(), negotiated);
+    }
+    // Generic readiness is advertised before child authentication. Wait for
+    // the existing bounded pool; this isolates selection from startup fallback.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !diagnostics.iter().all(|d| d.active_connections() == 6) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("ordered child pool did not authenticate");
+    // Enter the ORDINARY transit queue, with the neutral wire marker used by
+    // the production delivery dispatcher. Local primary hints must play no part.
+    for direction in 0..2usize {
+        let body = veil_proto::delivery::ForwardPayload {
+            next_hop_node_id: [2 - direction as u8; 32],
+            relay_hops: 1,
+            delivery_attempt: None,
+            traffic_class: Some(veil_proto::priority::INTERACTIVE),
+            envelope: veil_proto::delivery::DeliveryEnvelope {
+                recipient: veil_proto::recipient::Recipient::any([2 - direction as u8; 32]),
+                sender_node_id: [direction as u8 + 1; 32],
+                src_app_id: [0xb0; 32],
+                app_id,
+                endpoint_id: 1,
+                content_id: [direction as u8 + 9; 32],
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                ttl_secs: veil_proto::delivery::FORWARD_REALTIME_TTL_SECS,
+                payload: vec![direction as u8 + 42; 64],
+                trace_id: 0,
+                require_ack: false,
+            },
+        }
+        .encode();
+        let mut header = FrameHeader::new(
+            FrameFamily::Delivery as u8,
+            veil_proto::family::DeliveryMsg::Forward as u16,
+        );
+        header.set_priority(veil_proto::priority::INTERACTIVE);
+        header.body_len = body.len() as u32;
+        let mut frame = encode_header(&header).to_vec();
+        frame.extend(body);
+        senders[direction]
+            .try_send((
+                veil_proto::priority::INTERACTIVE,
+                veil_bufpool::pooled_shared_from_vec(frame),
+            ))
+            .unwrap();
+    }
+    for direction in 0..2usize {
+        let received =
+            tokio::time::timeout(Duration::from_secs(2), receivers[1 - direction].recv()).await;
+        if negotiated || !blocked {
+            match received
+                .expect("neutral Forward remained on the blocked canonical writer")
+                .unwrap()
+            {
+                AppMessage::Deliver {
+                    src_node_id, data, ..
+                } => {
+                    assert_eq!(src_node_id, [direction as u8 + 1; 32]);
+                    assert_eq!(&*data, &[direction as u8 + 42; 64]);
+                }
+                other => panic!("unexpected neutral delivery {other:?}"),
+            }
+        } else {
+            assert!(
+                received.is_err(),
+                "unsupported peer received an unnegotiated neutral child record"
+            );
+        }
+    }
+    for d in &diagnostics {
+        if negotiated {
+            assert!(d.transit_sent() > 0, "Forward did not use a neutral child");
+            assert!(d.transit_shards_used_this_generation() <= 2);
+        } else {
+            assert_eq!(d.transit_sent(), 0);
+        }
+        assert_eq!(
+            d.sent(veil_proto::priority::REALTIME),
+            0,
+            "transit acquired local source priority"
+        );
+        assert_eq!(d.sent(veil_proto::priority::BULK), 0);
+    }
+    for task in &tasks.0 {
+        task.abort();
+    }
+    for task in tasks.0.drain(..) {
+        let _ = task.await;
+    }
+    for sender in &senders {
+        assert!(!sender.has_datagram_transport());
+    }
+}
+
+#[tokio::test]
+async fn neutral_forward_uses_ordered_children_without_source_priority() {
+    run_neutral_forward(true, true).await;
+}
+
+#[tokio::test]
+async fn neutral_forward_keeps_unnegotiated_ordered_compatibility() {
+    run_neutral_forward(false, true).await;
+    run_neutral_forward(false, false).await;
+}

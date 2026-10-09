@@ -392,9 +392,9 @@ impl OrderedSession {
             .iter()
             .position(|&p| p == priority)
             .or_else(|| {
-                (priority == veil_proto::priority::INTERACTIVE
-                    && kind == RealtimeLaneFrameKind::CircuitDatagram)
-                    .then(|| parallel_lanes::transit_index(&self.transit_salt, body))
+                (priority == veil_proto::priority::INTERACTIVE)
+                    .then(|| parallel_lanes::neutral_transit_index(&self.transit_salt, body, kind))
+                    .flatten()
             })?;
         let pool = lock!(self.pool);
         let ready = pool.slots[index].as_ref().filter(|ready| ready.alive())?;
