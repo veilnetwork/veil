@@ -248,6 +248,17 @@ class VeilTransportShim : public webrtc::Transport {
   std::atomic<uint32_t> local_audio_ssrc_{0};
   std::atomic<uint32_t> local_video_ssrc_{0};
   AudioSendStats audio_send_stats_;
+  // Opt-in metadata only. Collect on the audio network queue, then write after
+  // Stop fences delivery; no per-packet file I/O can perturb a live call.
+  struct AudioIngressSample {
+    uint16_t sequence;
+    uint32_t timestamp;
+    int64_t arrived_us;
+    int64_t drained_us;
+    size_t payload_bytes;
+  };
+  const bool audio_ingress_diagnostics_;
+  std::vector<AudioIngressSample> audio_ingress_samples_;
   mutable std::mutex audio_feedback_mu_;
   RtcpFeedbackSnapshot audio_feedback_;
   RtcpFeedbackSnapshot video_feedback_;
