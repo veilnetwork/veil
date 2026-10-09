@@ -21,6 +21,9 @@ const BIND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const SOURCE_SLOTS: usize = crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES.len();
 const TRANSIT_SLOTS: usize = 2;
 const TOTAL_SLOTS: usize = SOURCE_SLOTS + TRANSIT_SLOTS;
+// Source counters retain logical ownership; transit counters observe physical
+// generic connections without attributing their traffic to a source role.
+const COUNTER_COUNT: usize = SOURCE_SLOTS + TOTAL_SLOTS;
 // One bounded authenticated replacement can coexist with all local slots.
 const _: () = assert!(TOTAL_SLOTS + 1 < QuicParallelHandle::CONNECTIONS_PER_DIRECTION);
 
@@ -31,8 +34,8 @@ const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 pub struct ParallelDiagnostics {
     reliable_frames: AtomicU64,
     reliable_full_writer_bypasses: AtomicU64,
-    sent: [AtomicU64; TOTAL_SLOTS],
-    epoch_sent: [AtomicU64; TOTAL_SLOTS],
+    sent: [AtomicU64; COUNTER_COUNT],
+    epoch_sent: [AtomicU64; COUNTER_COUNT],
     rekeys: AtomicU64,
     active: AtomicUsize,
     replies: AtomicU64,
@@ -395,6 +398,16 @@ struct ChildCarrier {
 }
 
 impl veil_anonymity::circuit_carrier::DatagramCarrier for ChildCarrier {
+    fn local_ingress_flow(&self) -> Option<veil_anonymity::circuit_carrier::LocalIngressFlow> {
+        if !self.parent.is_active() || lock!(self.sender).broken {
+            return None;
+        }
+        Some(veil_anonymity::circuit_carrier::LocalIngressFlow {
+            parent: self.parent.local_generation(),
+            connection: Arc::as_ptr(&self.sender) as usize,
+        })
+    }
+
     fn try_send(
         &self,
         peer: &NodeIdBytes,
@@ -531,6 +544,7 @@ pub(super) struct ParallelSession {
     _registration: Option<registry::Registration>,
     slots: [Slot; TOTAL_SLOTS],
     transit_salt: [u8; 32],
+    assignments: channel_assignments::ChannelAssignments<TOTAL_SLOTS>,
     primary_recovery: primary_recovery::PrimaryRecovery,
     reliable: Option<super::reliable_session::ReliableSession>,
 }
@@ -596,6 +610,7 @@ impl ParallelSession {
             _acceptor: acceptor,
             _registration: registration,
             slots: Default::default(),
+            assignments: Default::default(),
             transit_salt: blake3::derive_key("veil/transit-shard/v1", &sid),
             primary_recovery: Default::default(),
             reliable,
@@ -629,41 +644,67 @@ impl ParallelSession {
         let Some(index) = channel_index(priority) else {
             return false;
         };
-        self.prepare_index(index)
+        let Some(selected) = self.assignments.source(index) else {
+            return false;
+        };
+        self.prepare_index(selected.physical)
     }
 
     /// Called only after the ordinary FIFO selects this frame. Every transit
-    /// circuit receives the same admission and service cost; its opaque per-link
-    /// ID picks one bounded shard, never an application role or queue priority.
+    /// connection receives the same admission and service cost. Its local live
+    /// ingress witness preserves separation; legacy frames use neutral buckets.
+    #[cfg(test)]
     pub(super) fn prepare_frame(
         &mut self,
         priority: u8,
         body: &[u8],
         kind: RealtimeLaneFrameKind,
     ) -> Option<usize> {
-        let index = channel_index(priority).or_else(|| {
-            (self.offer.duplex && priority == veil_proto::priority::INTERACTIVE)
-                .then(|| neutral_transit_index(&self.transit_salt, body, kind))
-                .flatten()
-        })?;
-        // Adopt an already authenticated replacement before observing the old
-        // sender. A late ACK on that sender must not discard a completed proof
-        // sitting in the warm result channel. Pending candidates may still be
-        // cancelled when the old path recovers.
-        let prepared = self.prepare_index(index);
-        // Only a locally selected primary frame can request replacement.
-        // Neutral transit and the secondary/background producers cannot do so.
+        self.prepare_frame_with_carrier(priority, body, kind, None)
+            .map(|selection| selection.physical)
+    }
+
+    pub(super) fn offer_diagnostics(&self) -> Arc<ParallelDiagnostics> {
+        self.offer.diagnostics.clone()
+    }
+
+    pub(super) fn prepare_frame_with_carrier(
+        &mut self,
+        priority: u8,
+        body: &[u8],
+        kind: RealtimeLaneFrameKind,
+        ingress: Option<&veil_anonymity::circuit_carrier::Carrier>,
+    ) -> Option<channel_assignments::Selection> {
+        let selected = if let Some(source) = channel_index(priority) {
+            self.assignments.source(source)?
+        } else {
+            if !self.offer.duplex || priority != veil_proto::priority::INTERACTIVE {
+                return None;
+            }
+            let bucket = neutral_transit_index(&self.transit_salt, body, kind)?;
+            // Circuit continuity uses its existing authenticated per-link ID.
+            // Forward continuity uses the incoming connection, never app data.
+            let ingress = (kind == RealtimeLaneFrameKind::RelayForward)
+                .then_some(ingress)
+                .flatten();
+            self.assignments.transit(ingress, bucket)?
+        };
+        let prepared = self.prepare_index(selected.physical);
         if priority == veil_proto::priority::REALTIME {
             self.recover_primary(std::time::Instant::now());
         }
-        prepared.then_some(index)
+        prepared.then_some(selected)
     }
 
     #[cfg(test)]
     pub(super) async fn stage_verified_primary_replacement(&mut self) {
         // A real exporter-bound handshake completes before the runner's next
         // poll, matching a replacement result racing an ACK on the old path.
-        let old_stats = lock!(self.slots[0].ready.as_ref().unwrap().sender)
+        let index = self
+            .assignments
+            .source_physical(channel_index(veil_proto::priority::REALTIME).unwrap())
+            .expect("primary source allocation");
+        let old_stats = lock!(self.slots[index].ready.as_ref().unwrap().sender)
             .handle
             .quic()
             .unwrap()
@@ -673,7 +714,7 @@ impl ParallelSession {
         let ready = connect_sender(
             self.offer.clone(),
             self.parent.handle(),
-            0,
+            index,
             self.context.clone(),
             None,
         )
@@ -682,8 +723,8 @@ impl ParallelSession {
         let (tx, rx) = tokio::sync::oneshot::channel();
         assert!(tx.send(ready).is_ok());
         let task = RealtimeReceiverTask(tokio::spawn(std::future::pending()));
-        self.slots[0].warm = Some((rx, task));
-        self.slots[0].replacing = true;
+        self.slots[index].warm = Some((rx, task));
+        self.slots[index].replacing = true;
     }
 
     fn prepare_index(&mut self, index: usize) -> bool {
@@ -728,11 +769,15 @@ impl ParallelSession {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
         }
-        if let Some(lease) = &self.readiness
-            && index < SOURCE_SLOTS
-        {
-            let priority = crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES[index];
-            lease.mark(priority, slot.ready.is_some());
+        if let Some(lease) = &self.readiness {
+            for (source, priority) in crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES
+                .iter()
+                .enumerate()
+            {
+                if self.assignments.source_physical(source) == Some(index) {
+                    lease.mark(*priority, slot.ready.is_some());
+                }
+            }
         }
         if slot.ready.is_some() {
             return true;
@@ -789,7 +834,12 @@ impl ParallelSession {
 
     fn recover_primary(&mut self, now: std::time::Instant) {
         use primary_recovery::Action;
-        let index = channel_index(veil_proto::priority::REALTIME).unwrap();
+        let Some(index) = self
+            .assignments
+            .source_physical(channel_index(veil_proto::priority::REALTIME).unwrap())
+        else {
+            return;
+        };
         let slot = &mut self.slots[index];
         let Some(ready) = &slot.ready else {
             self.primary_recovery.reset();

@@ -1762,7 +1762,9 @@ impl FrameDispatcher {
         };
 
         match family {
-            FrameFamily::Delivery => self.dispatch_delivery(header, body, peer_id),
+            FrameFamily::Delivery => {
+                self.dispatch_delivery_with_carrier(header, body, peer_id, carrier)
+            }
             FrameFamily::Discovery => self.dispatch_discovery(header, body, peer_id),
             FrameFamily::App => self.dispatch_app(header, body, peer_id),
             FrameFamily::Session => self.dispatch_session_post_handshake(header, body, peer_id),
