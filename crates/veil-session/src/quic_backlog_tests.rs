@@ -851,6 +851,69 @@ struct BlackoutReport {
     first_fresh: Option<Duration>,
 }
 
+/// A stalled driver must discard old transit datagrams before it resumes.
+/// Real QUIC sockets and encrypted datagrams run on one runtime thread, so
+/// holding that thread after admission guarantees that the backlog is unsent.
+/// Restoring the former raw `handle.send` path delivers the stale payloads and
+/// fails the receiver-side assertion; there is no role or priority classifier.
+#[tokio::test(flavor = "current_thread")]
+async fn opaque_transit_quic_backlog_expires_before_driver_resumes() {
+    let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let left_addr = left.local_addr().unwrap();
+    let right_addr = right.local_addr().unwrap();
+    let context = Arc::new(TransportContext::for_debug().unwrap());
+    let remote_context = Arc::clone(&context);
+    let remote = tokio::spawn(async move {
+        promote_punched_quic(right, left_addr, remote_context, PunchedQuicRole::Responder)
+            .await
+            .unwrap()
+    });
+    let local = promote_punched_quic(left, right_addr, context, PunchedQuicRole::Initiator)
+        .await
+        .unwrap();
+    let tx = local.quic_datagrams().unwrap();
+    let mut local_stream = local.into_stream().unwrap();
+    local_stream.write_all(b"stand").await.unwrap();
+    let remote = remote.await.unwrap();
+    let rx = remote.quic_datagrams().unwrap();
+    let mut remote_stream = remote.into_stream().unwrap();
+    let mut prefix = [0; 5];
+    remote_stream.read_exact(&mut prefix).await.unwrap();
+    assert_eq!(&prefix, b"stand");
+    sleep(Duration::from_millis(30)).await;
+    let transport = super::LossyTransportHandle::from(tx.clone());
+    for _ in 0..20 {
+        transport.send(b"stale opaque transit payload").unwrap();
+    }
+    // A longer supplied deadline must obey the same neutral residence cap.
+    transport
+        .send_before(
+            b"stale long deadline",
+            std::time::Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    assert!(tx.send_buffer_space() < REALTIME_DATAGRAM_BUFFER_BYTES);
+    std::thread::sleep(Duration::from_millis(300));
+    transport.send(b"fresh opaque transit payload").unwrap();
+    let delivered = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("fresh datagram must recover on the same connection")
+        .unwrap();
+    assert_eq!(
+        delivered, b"fresh opaque transit payload",
+        "stale transit backlog was replayed"
+    );
+    assert!(tx.path_stats().expired_outgoing_datagrams >= 21);
+    assert!(
+        timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .is_err()
+    );
+    tx.close();
+    rx.close();
+}
+
 // Diagnose transport recovery independently of call control, ratchets, video,
 // files and route repair. A prepared source's production policy is used when
 // expiry is enabled; the neutral link never learns that local selection.
