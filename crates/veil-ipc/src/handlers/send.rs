@@ -1162,7 +1162,9 @@ pub(crate) async fn handle_ipc_send(
                     frame.extend_from_slice(&bytes);
                     frame.extend_from_slice(&0u64.to_be_bytes());
                     frame.push(0);
-                    any_sent |= reg.send_to(&hop, veil_proto::header::priority::REALTIME, frame);
+                    // Keep the endpoint's signaling producer separate from its
+                    // primary media producer. The relay header remains neutral.
+                    any_sent |= reg.send_to(&hop, ctx.local_priority, frame);
                 }
             }
         }
@@ -1926,11 +1928,12 @@ pub(crate) async fn handle_ipc_send(
                     let fwd_frame = make_fwd_frame(next_hop);
                     let relayed = reg.send_to(
                         &next_hop,
+                        // Only legacy media calls use the default primary slot.
+                        // Compatibility control retains its local signaling slot,
+                        // just like the per-device copies above.
                         if relay_wire_realtime
-                            && ctx.local_priority != veil_proto::priority::INTERACTIVE
+                            && ctx.local_priority == veil_proto::priority::INTERACTIVE
                         {
-                            ctx.local_priority
-                        } else if relay_realtime {
                             veil_proto::header::priority::REALTIME
                         } else {
                             ctx.local_priority
@@ -4802,6 +4805,80 @@ mod ratchet_send_tests {
             .expect("the peer opens it");
         assert_eq!(opened.plaintext, b"through a relay");
         assert!(opened.authenticated);
+    }
+
+    #[tokio::test]
+    async fn relay_call_control_uses_signaling_queue_when_primary_is_full() {
+        for device_fanout in [false, true] {
+            let mut fx = fixture(vec![RELAY]);
+            if device_fanout {
+                let cert = fx.certs.resolve_cert_cached(PEER).unwrap();
+                fx.certs = Arc::new(FamilyCerts(vec![cert]));
+            }
+            let registry = Arc::new(RwLock::new(veil_session::SessionTxRegistry::with_capacity(
+                2,
+            )));
+            let mut relay = wlock!(registry).register(RELAY);
+            let mut ctx = fx.ctx(true);
+            ctx.session_tx_registry = Some(Arc::new(
+                veil_session::glue::SessionTxBroadcaster::new(registry.clone()),
+            ));
+            // Leave the endpoint's primary producer full and undrained. Control
+            // must use its own source queue, even on the cached per-device path.
+            for byte in [7, 8] {
+                assert!(rlock!(registry).send_to(
+                    &RELAY,
+                    veil_proto::priority::REALTIME,
+                    vec![byte],
+                ));
+            }
+            let mut body = payload(false, b"call answer");
+            body[100..104].copy_from_slice(
+                &veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT.to_be_bytes(),
+            );
+            let mut wh = sink().await;
+            handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+                .await
+                .unwrap();
+            for byte in [7, 8] {
+                let (lane, bytes) = relay.try_recv().unwrap();
+                assert_eq!(lane, veil_proto::priority::REALTIME);
+                assert_eq!(&*bytes, [byte], "primary payloads remain untouched");
+            }
+            let copies = if device_fanout { 2 } else { 1 };
+            let mut first_payload = None;
+            for _ in 0..copies {
+                let (lane, bytes) = relay
+                    .try_recv()
+                    .expect("call control must survive a full primary queue");
+                assert_eq!(lane, veil_proto::priority::INTERACTIVE);
+                assert_eq!(
+                    codec::decode_header(&bytes).unwrap().priority(),
+                    veil_proto::priority::INTERACTIVE,
+                    "the local source channel must not become a relay priority",
+                );
+                let forward =
+                    veil_proto::delivery::ForwardPayload::decode(&bytes[veil_proto::HEADER_SIZE..])
+                        .unwrap();
+                assert_eq!(forward.traffic_class, None, "legacy neutral wire shape");
+                if let Some(first) = &first_payload {
+                    assert_eq!(&forward.envelope.payload, first);
+                } else {
+                    let opened = fx
+                        .peer
+                        .open_payload(
+                            &ME,
+                            &forward.envelope.payload,
+                            veil_util::unix_secs_now_u64(),
+                        )
+                        .unwrap();
+                    assert!(opened.authenticated);
+                    assert_eq!(opened.plaintext, b"call answer");
+                    first_payload = Some(forward.envelope.payload);
+                }
+            }
+            assert!(relay.try_recv().is_err());
+        }
     }
 
     #[tokio::test]

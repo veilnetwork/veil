@@ -1363,12 +1363,13 @@ pub const IPC_SEND_FLAG_RELAY_REALTIME: u32 = 0x0000_0020;
 /// call peers and every non-media application message.
 pub const IPC_SEND_FLAG_RELAY_MEDIA_SEALED: u32 = 0x0000_0040;
 
-/// Force the Delivery relay path and its local REALTIME queue without adding
-/// the optional traffic-class suffix to the inter-node `Forward` frame.
+/// Force the Delivery relay path while retaining the endpoint's local source
+/// queue (signaling by default), without adding the optional traffic-class
+/// suffix to the inter-node `Forward` frame.
 /// Call-control uses this compatibility mode while public relays may still run
 /// a decoder that rejects trailing `Forward` extensions. Media keeps using
-/// [`IPC_SEND_FLAG_RELAY_REALTIME`] so upgraded relays preserve its class on
-/// every hop.
+/// [`IPC_SEND_FLAG_RELAY_REALTIME`]. Both modes keep inter-node scheduling
+/// neutral; the source queue choice remains local to the endpoint.
 pub const IPC_SEND_FLAG_RELAY_CONTROL_COMPAT: u32 = 0x0000_0080;
 
 /// This send is for the sender's OTHER DEVICES, not for the sender.
