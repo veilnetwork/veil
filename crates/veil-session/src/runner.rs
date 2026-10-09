@@ -365,6 +365,20 @@ impl RealtimeSender {
 }
 
 impl RealtimeDatagramLane {
+    /// Trusted local sources with negotiated children must never collapse
+    /// back onto the parent's congestion budget or ordered writer. Forwarded
+    /// INTERACTIVE traffic keeps ordinary compatibility; no wire role grants
+    /// a remote producer this endpoint-only rule.
+    fn requires_independent_source(
+        &self,
+        priority: u8,
+        ingress: Option<&veil_anonymity::circuit_carrier::Carrier>,
+    ) -> bool {
+        self.parallel.is_some()
+            && ingress.is_none()
+            && crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES.contains(&priority)
+    }
+
     fn trace_source_pressure(
         &mut self,
         logger: &veil_observability::NodeLogger,
@@ -445,6 +459,9 @@ impl RealtimeDatagramLane {
         } else {
             if let Some(feedback) = self.local_reliable.as_mut() {
                 feedback.observe(priority, frame, now, false);
+            }
+            if self.requires_independent_source(priority, ingress) {
+                return None;
             }
             self.sender.as_ref().map(|sender| (sender.clone(), false))
         }
@@ -4718,6 +4735,10 @@ impl SessionRunner {
                         }
                         let (_, body, lane_kind) = decode_realtime_lane_frame(outgoing)
                             .expect("realtime queue predicate accepted this frame");
+                        let independent_source = lane.requires_independent_source(
+                            outgoing_priority,
+                            envelope.carrier.as_ref(),
+                        );
                         let Some((sender, using_parallel)) = lane.select_sender(
                             outgoing_priority,
                             outgoing,
@@ -4725,8 +4746,19 @@ impl SessionRunner {
                             lane_kind,
                             envelope.carrier.as_ref(),
                         ) else {
-                            // Before the fixed pool is mutually authenticated,
-                            // preserve ordinary ordered compatibility.
+                            if independent_source {
+                                // Discard while the agreed child is unavailable;
+                                // the next fresh packet may use a ready child.
+                                lane.trace_source_pressure(
+                                    &self.logger,
+                                    &self.peer_id,
+                                    outgoing_priority,
+                                );
+                                datagram_drained += 1;
+                                continue;
+                            }
+                            // Legacy and neutral compatibility traffic keeps
+                            // ordinary ordered delivery when no sender is ready.
                             pq.restore_lossy_envelope(envelope);
                             break;
                         };
@@ -4747,6 +4779,10 @@ impl SessionRunner {
                                         outgoing.len(),
                                     ),
                                 );
+                                if independent_source {
+                                    datagram_drained += 1;
+                                    continue;
+                                }
                                 pq.restore_lossy_envelope(envelope);
                                 break;
                             }
@@ -4891,7 +4927,6 @@ impl SessionRunner {
                                     sent_wire_len,
                                 ),
                             );
-                            pq.restore_lossy_envelope(envelope);
                             // Quinn's non-blocking send only errors for a lost
                             // connection, disabled/unsupported DATAGRAMs, or a
                             // path-MTU shrink. Stop retrying every media frame;
@@ -4902,6 +4937,11 @@ impl SessionRunner {
                             } else {
                                 disable_realtime_sender = true;
                             }
+                            if independent_source {
+                                datagram_drained += 1;
+                                continue;
+                            }
+                            pq.restore_lossy_envelope(envelope);
                             break;
                         }
                         if let Some(logged) = lane
