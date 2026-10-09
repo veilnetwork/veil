@@ -241,8 +241,9 @@ impl AppHandle {
     }
 
     /// Relay call-control on the local signaling source queue using the
-    /// legacy-compatible `Delivery::Forward` wire shape (no optional
-    /// traffic-class suffix). Relay scheduling remains neutral.
+    /// negotiated generic datagrams, or the legacy-compatible
+    /// `Delivery::Forward` wire shape when unavailable. Relay scheduling
+    /// remains neutral.
     pub async fn send_relay_control_owned(
         &self,
         dst_node_id: [u8; 32],
