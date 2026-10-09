@@ -829,6 +829,19 @@ async fn verified_primary_replacement_wins_over_old_ack_progress() {
         .unwrap();
         let old = a.sender(0).handle.quic().unwrap().clone();
         let old_binding = old.channel_binding().unwrap();
+        // An in-flight user can retain an old ingress carrier after its
+        // child closes. This must not pin a downstream slot on a live parent.
+        let retained_old_carrier = a.ingress_carrier_for_test(0);
+        let old_flow = retained_old_carrier.local_ingress_flow().unwrap();
+        let retained_old_witness = Arc::downgrade(&retained_old_carrier);
+        let mut downstream = super::super::channel_assignments::ChannelAssignments::<1>::default();
+        assert_eq!(
+            downstream
+                .transit(Some(&retained_old_witness), 0)
+                .unwrap()
+                .physical,
+            0,
+        );
         a.stage_verified_primary_replacement().await;
         // Supply a real datagram and wait for its ACK on the OLD child while
         // the authenticated candidate stays queued for the runner to adopt.
@@ -872,6 +885,23 @@ async fn verified_primary_replacement_wins_over_old_ack_progress() {
             diagnostics.recovery_switches(),
             1,
             "a completed replacement must be adopted before old ACK progress cancels it"
+        );
+        assert!(
+            retained_old_carrier.local_ingress_flow().is_none(),
+            "a retained retired child must stop claiming a live ingress flow",
+        );
+        let replacement_carrier = a.ingress_carrier_for_test(index);
+        let replacement_flow = replacement_carrier.local_ingress_flow().unwrap();
+        let replacement_witness = Arc::downgrade(&replacement_carrier);
+        assert_eq!(old_flow.parent, replacement_flow.parent);
+        assert_ne!(old_flow.connection, replacement_flow.connection);
+        assert_eq!(
+            downstream
+                .transit(Some(&replacement_witness), 0)
+                .unwrap()
+                .physical,
+            0,
+            "retirement must free the downstream slot without a canonical rekey",
         );
         {
             let mut sender = a.sender(index);
