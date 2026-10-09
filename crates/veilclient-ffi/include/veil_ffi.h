@@ -851,6 +851,18 @@ typedef struct {
 } VeilMediaChannelStats;
 #endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Trusted host configuration, never read from a network envelope.
+ */
+typedef struct {
+  VeilApp *app;
+  uint8_t peer_node_id[32];
+  uint8_t peer_app_id[32];
+  uint32_t peer_endpoint_id;
+} VeilMediaProbePath;
+#endif
+
 /**
  * Mailbox blob descriptor returned by [`veil_mailbox_fetch_into`].
  * `blob` is a borrow into a buffer the caller provided to the fetch
@@ -1126,7 +1138,8 @@ int veil_send_to_my_devices(VeilApp *app,
 
 /**
  * Send a loss-tolerant signaling datagram over an active direct peer session.
- * Its endpoint-local source channel is separate from native audio/video.
+ * Its endpoint-local signaling queue is separate from audio, camera video,
+ * screen sharing and recoverable payloads, matching relay call control.
  * The legacy REALTIME wire classifier is unchanged; no source lane is sent.
  *
  * Unlike [`veil_send`], this never performs route discovery and never falls
@@ -1145,9 +1158,9 @@ int veil_send_realtime(VeilApp *app,
 ;
 
 /**
- * Send a loss-tolerant datagram through the non-onion Delivery relay path at
- * REALTIME priority. Unlike [`veil_send_realtime`], this does not require a
- * direct session to the destination: the daemon selects an already-active
+ * Send a loss-tolerant datagram through the non-onion Delivery relay path on
+ * the endpoint-local signaling queue. Unlike [`veil_send_realtime`], this does
+ * not require a direct session: the daemon selects an already-active
  * overlay peer as the first relay hop. The call is fire-and-forget; callers
  * that need eventual delivery must retain their durable fallback.
  */
@@ -3744,6 +3757,37 @@ int veil_media_start_direct_receiver(VeilApp *app,
  * Returns 0 on a NULL pointer.
  */
  uint64_t veil_media_recv_count(const uint8_t *peer_node_id) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Enable delivery probes only on a non-anonymous channel. Reply paths must
+ * be pinned from the authenticated call, with the identity app for direct
+ * traffic and the physical-device app for relay traffic. Apps must remain
+ * open until the channel closes. Returns 0, or -1 without changing a channel.
+ */
+
+int veil_media_channel_configure_path_probes(uint64_t chan,
+                                             const VeilMediaProbePath *direct,
+                                             const VeilMediaProbePath *relay)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Start one candidate observation through its existing primary producer.
+ * No recv callback is replaced and no old sender is stopped. Budget must be
+ * 100..=1000 ms. Returns 0 queued, 1 busy/full, or -1 unsupported/closed.
+ */
+ int veil_media_channel_begin_path_probe(uint64_t chan, uint32_t budget_ms) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Poll a candidate without waiting for a network or changing RTP counters.
+ * 0=pending/busy, 1=qualified and fresh, 2=expired, -1=closed/cancelled.
+ */
+ int veil_media_channel_poll_path_probe(uint64_t chan) ;
 #endif
 
 /**

@@ -29,6 +29,9 @@
 use super::*;
 
 #[cfg(feature = "node-embedded")]
+pub mod path_probe_ffi;
+
+#[cfg(feature = "node-embedded")]
 fn media_is_vp8_rtp(payload: &[u8]) -> bool {
     if payload.len() < 2 || (payload[0] >> 6) != 2 {
         return false;
@@ -547,6 +550,7 @@ pub unsafe extern "C" fn veil_media_open_channel(
         .insert(
             id,
             MediaChannel {
+                path_probe: None,
                 ingress: MediaIngress::with_screen(
                     tx_hi,
                     MediaVideoIngress::Packets(tx_video),
@@ -832,6 +836,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
         .insert(
             id,
             MediaChannel {
+                path_probe: None,
                 ingress: MediaIngress::with_screen(
                     tx_hi,
                     MediaVideoIngress::Packets(tx_video),
@@ -1032,6 +1037,7 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
         .insert(
             id,
             MediaChannel {
+                path_probe: None,
                 ingress: MediaIngress::with_screen(
                     tx_hi,
                     MediaVideoIngress::relay_frames(tx_video_frames, Arc::clone(&relay_stats)),
@@ -1555,6 +1561,7 @@ pub unsafe extern "C" fn veil_media_recv_count(peer_node_id: *const u8) -> u64 {
 /// media must drop rather than buffer when it outpaces the circuit.
 #[cfg(feature = "node-embedded")]
 struct MediaChannel {
+    path_probe: Option<Arc<path_probe_ffi::PathProbeContext>>,
     ingress: Arc<MediaIngress>,
     /// Anonymous channels accept an out-of-band end-to-end repair request.
     /// The receiver of the media asks the sender to refresh its outbound
@@ -1593,6 +1600,9 @@ impl MediaChannel {
         self.ingress
             .closed
             .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(probe) = &self.path_probe {
+            probe.cancel();
+        }
         if let Some(routes) = &self.routes {
             routes.stop();
         }
