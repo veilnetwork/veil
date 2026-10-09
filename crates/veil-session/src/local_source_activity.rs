@@ -1,6 +1,7 @@
 //! Node-local producer activity and pressure shared across session runners.
 //! No remote priority, payload role or wire metadata enters this state.
-use std::sync::Mutex;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use veil_util::lock;
 
@@ -17,13 +18,55 @@ struct SourceState {
     pressure_until: Option<Instant>,
     secondary_next: Option<Instant>,
     reliable_next: Option<Instant>,
+    reliable_sequence: u64,
+    reliable_waiters: VecDeque<u64>,
     network_window: Option<(Instant, usize)>,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct LocalSourceActivity(Mutex<SourceState>);
 
+/// A runner's local reliable admission turn. Neither its identity nor its
+/// position is transmitted. Dropping a runner releases any outstanding turn.
+pub(crate) struct ReliableSource {
+    activity: Arc<LocalSourceActivity>,
+    id: u64,
+}
+
+impl ReliableSource {
+    pub(crate) fn admit(&self, bytes: usize, now: Instant) -> Result<(), Instant> {
+        self.activity
+            .admit_reliable(bytes, now, false, Some(self.id))
+    }
+
+    /// Release a turn when this runner has no eligible local write. Keep the
+    /// shared byte debt: cancellation must not refund already admitted bytes.
+    pub(crate) fn cancel(&self) {
+        lock!(self.activity.0)
+            .reliable_waiters
+            .retain(|id| *id != self.id);
+    }
+}
+
+impl Drop for ReliableSource {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 impl LocalSourceActivity {
+    pub(crate) fn reliable_source(self: &Arc<Self>) -> ReliableSource {
+        let mut state = lock!(self.0);
+        state.reliable_sequence = state
+            .reliable_sequence
+            .checked_add(1)
+            .expect("local reliable source counter exhausted");
+        ReliableSource {
+            activity: Arc::clone(self),
+            id: state.reliable_sequence,
+        }
+    }
+
     pub(crate) fn note(&self, now: Instant) {
         let mut state = lock!(self.0);
         // Runners can publish observations in a different order. An older
@@ -52,18 +95,19 @@ impl LocalSourceActivity {
     /// Whole oversized compatibility frames may progress alone, but spend
     /// proportional future time to pay for their bytes. The caller must retain
     /// FIFO and admission credits while waiting for the deadline.
+    #[cfg(test)]
     pub(crate) fn admit_reliable_secondary(
         &self,
         bytes: usize,
         now: Instant,
     ) -> Result<(), Instant> {
-        self.admit_reliable(bytes, now, false)
+        self.admit_reliable(bytes, now, false, None)
     }
 
     /// Own network queries have an independent small allowance, so a held
     /// file burst cannot prevent route/certificate recovery under pressure.
     pub(crate) fn admit_network_control(&self, bytes: usize, now: Instant) -> Result<(), Instant> {
-        self.admit_reliable(bytes, now, true)
+        self.admit_reliable(bytes, now, true, None)
     }
 
     fn admit_reliable(
@@ -71,6 +115,7 @@ impl LocalSourceActivity {
         bytes: usize,
         now: Instant,
         network_control: bool,
+        source: Option<u64>,
     ) -> Result<(), Instant> {
         let mut state = lock!(self.0);
         let active_until = state.last_primary.map(|at| at + IDLE_GRACE);
@@ -81,10 +126,29 @@ impl LocalSourceActivity {
         if !network_control {
             let Some(until) = active_until.filter(|until| now < *until) else {
                 state.reliable_next = None;
+                state.reliable_waiters.clear();
                 return Ok(());
             };
+            // Register before waiting for byte debt. The first runner to wake
+            // at every deadline must not consume every turn while another
+            // neighbor has an eligible local frame waiting. This affects only
+            // authored data; neutral transit and recovery RPCs never join.
+            if let Some(id) = source
+                && !state.reliable_waiters.contains(&id)
+            {
+                state.reliable_waiters.push_back(id);
+            }
             if let Some(next) = state.reliable_next.filter(|next| now < *next) {
                 return Err(next.min(until));
+            }
+            if let Some(id) = source {
+                if state.reliable_waiters.front() != Some(&id) {
+                    // A canceled/blocked head releases its turn separately.
+                    // Poll briefly without granting catch-up credit or changing
+                    // the node-wide rate; no per-application priority is used.
+                    return Err((now + Duration::from_millis(10)).min(until));
+                }
+                state.reliable_waiters.pop_front();
             }
             // Pressure must release bandwidth beyond the healthy-source
             // ceiling. Retain existing debt through feedback transitions;
@@ -267,7 +331,11 @@ mod tests {
             let bytes = budget * 15 + 1;
             activity.note(now);
             activity.note_pressure(now);
-            assert!(activity.admit_reliable(bytes, now, network_control).is_ok());
+            assert!(
+                activity
+                    .admit_reliable(bytes, now, network_control, None)
+                    .is_ok()
+            );
             // Different runners keep publishing fresh primary activity and
             // pressure. They must not replenish a large frame's spent bytes
             // every 200 ms, even though that frame had to stay whole.
@@ -281,7 +349,7 @@ mod tests {
                 activity.note(at);
                 activity.note_pressure(at);
                 let retry = activity
-                    .admit_reliable(1, at, network_control)
+                    .admit_reliable(1, at, network_control, None)
                     .expect_err("oversized frame bypassed endpoint byte budget");
                 // The runner may wake earlier to recheck activity/pressure
                 // expiry. That wake must retain the unpaid bytes when fresh
@@ -292,11 +360,11 @@ mod tests {
             activity.note_pressure(charged_until);
             assert!(
                 activity
-                    .admit_reliable(budget, charged_until, network_control)
+                    .admit_reliable(budget, charged_until, network_control, None)
                     .is_ok()
             );
             assert_eq!(
-                activity.admit_reliable(1, charged_until, network_control),
+                activity.admit_reliable(1, charged_until, network_control, None),
                 Err(charged_until + SECONDARY_PROBE_INTERVAL)
             );
         }
@@ -401,6 +469,95 @@ mod tests {
         assert!(!activity.allow_secondary(now + SECONDARY_PROBE_INTERVAL));
         assert!(activity.allow_secondary(now + PRESSURE_GRACE));
         assert!(activity.allow_secondary(now + PRESSURE_GRACE));
+    }
+
+    #[test]
+    fn reliable_waiting_neighbor_cannot_lose_every_deadline_to_a_hot_runner() {
+        let activity = Arc::new(LocalSourceActivity::default());
+        let hot = activity.reliable_source();
+        let cold = activity.reliable_source();
+        let now = Instant::now();
+        activity.note(now);
+        activity.note_pressure(now);
+        assert!(hot.admit(PRESSURED_RELIABLE_BYTES, now).is_ok());
+        assert!(cold.admit(PRESSURED_RELIABLE_BYTES, now).is_err());
+        assert!(hot.admit(PRESSURED_RELIABLE_BYTES, now).is_err());
+
+        // Deliberately wake the busy runner FIRST at every deadline. Both
+        // continue to have data; admission must alternate without multiplying
+        // the shared endpoint allowance or postponing the quieter runner.
+        for turn in 1..=16 {
+            let at = now + SECONDARY_PROBE_INTERVAL * turn;
+            activity.note(at);
+            activity.note_pressure(at);
+            if turn % 2 == 1 {
+                assert!(hot.admit(PRESSURED_RELIABLE_BYTES, at).is_err());
+                assert!(cold.admit(PRESSURED_RELIABLE_BYTES, at).is_ok());
+                assert!(cold.admit(PRESSURED_RELIABLE_BYTES, at).is_err());
+            } else {
+                assert!(hot.admit(PRESSURED_RELIABLE_BYTES, at).is_ok());
+                assert!(hot.admit(PRESSURED_RELIABLE_BYTES, at).is_err());
+                assert!(cold.admit(PRESSURED_RELIABLE_BYTES, at).is_err());
+            }
+            assert!(hot.admit(1, at).is_err());
+            assert!(cold.admit(1, at).is_err());
+        }
+    }
+
+    #[test]
+    fn abandoned_reliable_turn_releases_neighbor_without_refunding_bytes() {
+        let activity = Arc::new(LocalSourceActivity::default());
+        let first = activity.reliable_source();
+        let abandoned = activity.reliable_source();
+        let waiting = activity.reliable_source();
+        let now = Instant::now();
+        activity.note(now);
+        activity.note_pressure(now);
+        assert!(first.admit(PRESSURED_RELIABLE_BYTES, now).is_ok());
+        assert!(abandoned.admit(1, now).is_err());
+        assert!(waiting.admit(1, now).is_err());
+        abandoned.cancel();
+        assert_eq!(waiting.admit(1, now), Err(now + SECONDARY_PROBE_INTERVAL));
+        assert!(
+            waiting
+                .admit(PRESSURED_RELIABLE_BYTES, now + SECONDARY_PROBE_INTERVAL)
+                .is_ok()
+        );
+
+        let next = now + SECONDARY_PROBE_INTERVAL;
+        assert!(abandoned.admit(1, next).is_err());
+        assert!(waiting.admit(1, next).is_err());
+        // Session exit/cancellation drops its guard even on an early return.
+        drop(abandoned);
+        assert!(waiting.admit(1, next + SECONDARY_PROBE_INTERVAL).is_ok());
+    }
+
+    #[test]
+    fn reliable_turns_do_not_capture_recovery_or_survive_primary_idle() {
+        let activity = Arc::new(LocalSourceActivity::default());
+        let first = activity.reliable_source();
+        let waiting = activity.reliable_source();
+        let now = Instant::now();
+        activity.note(now);
+        activity.note_pressure(now);
+        assert!(first.admit(PRESSURED_RELIABLE_BYTES, now).is_ok());
+        assert!(waiting.admit(1, now).is_err());
+        assert!(
+            activity
+                .admit_network_control(NETWORK_CONTROL_BYTES, now)
+                .is_ok()
+        );
+        assert!(activity.admit_network_control(1, now).is_err());
+        let idle = now + IDLE_GRACE;
+        // A stale waiting turn cannot impose scheduling on unrelated traffic
+        // after the local primary stops. Unused credit is not accumulated.
+        assert!(first.admit(60_000, idle).is_ok());
+        assert!(first.admit(60_000, idle).is_ok());
+        assert!(waiting.admit(60_000, idle).is_ok());
+        activity.note(idle);
+        activity.note_pressure(idle);
+        assert!(first.admit(PRESSURED_RELIABLE_BYTES, idle).is_ok());
+        assert!(waiting.admit(1, idle).is_err());
     }
 
     #[test]
