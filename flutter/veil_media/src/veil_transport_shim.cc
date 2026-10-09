@@ -73,7 +73,8 @@ VeilTransportShim::VeilTransportShim(uint64_t veil_chan,
                                      webrtc::Call* video_call,
                                      webrtc::TaskQueueBase* video_network_queue)
     : veil_chan_(veil_chan), call_(call), network_queue_(network_queue),
-      video_call_(video_call), video_network_queue_(video_network_queue) {}
+      video_call_(video_call), video_network_queue_(video_network_queue),
+      audio_ingress_diagnostics_(diag::enabled()) {}
 
 VeilTransportShim::~VeilTransportShim() {
   Stop();
@@ -143,6 +144,7 @@ AudioSendSnapshot VeilTransportShim::audio_send_stats() const {
 void VeilTransportShim::Start() {
   bool expected = false;
   if (!started_.compare_exchange_strong(expected, true)) return;
+  if (audio_ingress_diagnostics_) audio_ingress_samples_.reserve(4096);
   const int rc = veil_media_set_recv_callback(
       veil_chan_, &VeilTransportShim::OnVeilDatagram, this);
   if (rc == 0) receive_channels_.push_back(veil_chan_.load());
@@ -163,6 +165,23 @@ void VeilTransportShim::Stop() {
   // wait on a busy WebRTC network queue.
   std::scoped_lock lock(task_guards_[0]->mu, task_guards_[1]->mu);
   inbound_queue_.Clear();
+  if (!audio_ingress_samples_.empty()) {
+    if (const char* path = diag::path()) {
+      if (FILE* file = std::fopen(path, "a")) {
+        std::fprintf(file, "audio.rtp.ingress.begin count=%zu\n",
+                     audio_ingress_samples_.size());
+        for (const auto& sample : audio_ingress_samples_) {
+          std::fprintf(file,
+              "audio.rtp.ingress seq=%u timestamp=%u arrived_us=%lld drained_us=%lld payload_bytes=%zu\n",
+              unsigned(sample.sequence), unsigned(sample.timestamp),
+              (long long)sample.arrived_us, (long long)sample.drained_us,
+              sample.payload_bytes);
+        }
+        std::fclose(file);
+      }
+    }
+    audio_ingress_samples_.clear();
+  }
 }
 
 bool VeilTransportShim::RebindChannel(uint64_t veil_chan, bool retain_previous_receiver) {
@@ -486,6 +505,11 @@ void VeilTransportShim::DeliverOnNetworkThread(
   const uint32_t vssrc = remote_video_ssrc_.load();
   const bool is_video = (vssrc != 0 && rtp.Ssrc() == vssrc);
   if (secondary != is_video) return;
+  if (!is_video && audio_ingress_diagnostics_ &&
+      audio_ingress_samples_.size() < 4096) {
+    audio_ingress_samples_.push_back({rtp.SequenceNumber(), rtp.Timestamp(),
+        arrived_us, webrtc::TimeMicros(), rtp.payload_size()});
+  }
   if (is_video) {
     // Video RTP uses the fixed 90 kHz clock. The audio path gets its clock from
     // the registered Opus codec, but nothing sets it for video on our custom

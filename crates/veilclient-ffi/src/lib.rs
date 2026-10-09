@@ -1849,7 +1849,8 @@ pub unsafe extern "C" fn veil_send_to_my_devices(
 }
 
 /// Send a loss-tolerant signaling datagram over an active direct peer session.
-/// Its endpoint-local source channel is separate from native audio/video.
+/// Its endpoint-local signaling queue is separate from audio, camera video,
+/// screen sharing and recoverable payloads, matching relay call control.
 /// The legacy REALTIME wire classifier is unchanged; no source lane is sent.
 ///
 /// Unlike [`veil_send`], this never performs route discovery and never falls
@@ -1922,7 +1923,7 @@ pub unsafe extern "C" fn veil_send_realtime(
         };
         sender
             .send_rt_data_on_local_lane(
-                veil_proto::priority::BACKGROUND,
+                veil_proto::priority::INTERACTIVE,
                 dst_node,
                 dst_app,
                 dst_endpoint_id,
@@ -1950,9 +1951,9 @@ pub unsafe extern "C" fn veil_send_realtime(
     }
 }
 
-/// Send a loss-tolerant datagram through the non-onion Delivery relay path at
-/// REALTIME priority. Unlike [`veil_send_realtime`], this does not require a
-/// direct session to the destination: the daemon selects an already-active
+/// Send a loss-tolerant datagram through the non-onion Delivery relay path on
+/// the endpoint-local signaling queue. Unlike [`veil_send_realtime`], this does
+/// not require a direct session: the daemon selects an already-active
 /// overlay peer as the first relay hop. The call is fire-and-forget; callers
 /// that need eventual delivery must retain their durable fallback.
 #[unsafe(no_mangle)]
