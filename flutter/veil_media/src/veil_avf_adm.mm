@@ -514,7 +514,12 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
           }
         }
 #endif
-        AVAudioFormat* tap_fmt = [input outputFormatForBus:0];
+        // A hardware configuration change preserves the graph's old output
+        // format. Input nodes cannot convert that stale format to the current
+        // device rate: both sink connection and tap installation then fail,
+        // leaving playout alive but capture permanently silent. Reconnect
+        // using the input scope, which reflects the actual hardware format.
+        AVAudioFormat* tap_fmt = [input inputFormatForBus:0];
         if (tap_fmt.sampleRate <= 0 || tap_fmt.channelCount <= 0) {
           alog("avf_adm: input format not ready (sr=%.0f ch=%u)",
                tap_fmt.sampleRate, (unsigned)tap_fmt.channelCount);
