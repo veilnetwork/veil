@@ -26,7 +26,17 @@ impl crate::dispatcher_sink::DispatcherSink for Capture {
         peer: NodeIdBytes,
     ) -> crate::dispatcher_sink::DispatchResult {
         assert_eq!(peer, [9; 32]);
-        let (seq, sent) = if h.family == veil_proto::family::FrameFamily::App as u8 {
+        let (seq, sent) = if h.family == veil_proto::family::FrameFamily::Delivery as u8 {
+            assert_eq!(h.priority(), INTERACTIVE);
+            let forward = veil_proto::delivery::ForwardPayload::decode(body).unwrap();
+            assert_eq!(forward.traffic_class, Some(INTERACTIVE));
+            let payload = forward.envelope.payload;
+            assert!(payload[12..].iter().all(|b| *b == 0x11));
+            (
+                u32::from_be_bytes(payload[..4].try_into().unwrap()),
+                u64::from_be_bytes(payload[4..12].try_into().unwrap()),
+            )
+        } else if h.family == veil_proto::family::FrameFamily::App as u8 {
             let p = veil_proto::app::AppRtDataPayload::decode(body).unwrap();
             assert_eq!(p.payload, vec![0x11; 128]);
             (p.seq, p.timestamp_us)
@@ -99,6 +109,71 @@ async fn measure(
     recover: bool,
     congestion: QuicCongestionControl,
     full_duplex: bool,
+) -> Report {
+    measure_channel(large, recover, congestion, full_duplex, REALTIME, false).await
+}
+
+fn channel_frame(large: bool, forward: bool, seq: u32, sent_us: u64) -> Vec<u8> {
+    if !forward {
+        return primary_test_frame(large, seq, sent_us);
+    }
+    let mut payload = seq.to_be_bytes().to_vec();
+    payload.extend_from_slice(&sent_us.to_be_bytes());
+    payload.extend_from_slice(&[0x11; 128]);
+    let mut content_id = [7; 32];
+    content_id[..4].copy_from_slice(&seq.to_be_bytes());
+    let body = veil_proto::delivery::ForwardPayload {
+        next_hop_node_id: [9; 32],
+        envelope: veil_proto::delivery::DeliveryEnvelope {
+            recipient: veil_proto::recipient::Recipient::any([8; 32]),
+            sender_node_id: [7; 32],
+            src_app_id: [6; 32],
+            app_id: [5; 32],
+            endpoint_id: 1,
+            content_id,
+            created_at: veil_util::unix_secs_now_u64(),
+            ttl_secs: veil_proto::delivery::FORWARD_REALTIME_TTL_SECS,
+            payload,
+            trace_id: 0,
+            require_ack: false,
+        },
+        relay_hops: 1,
+        delivery_attempt: None,
+        traffic_class: Some(INTERACTIVE),
+    }
+    .encode();
+    let mut header = FrameHeader::new(
+        veil_proto::family::FrameFamily::Delivery as u8,
+        veil_proto::family::DeliveryMsg::Forward as u16,
+    );
+    header.set_priority(INTERACTIVE);
+    header.body_len = body.len() as u32;
+    veil_proto::codec::encode_frame(&header, &body)
+}
+
+fn channel_admits(sender: &super::super::RealtimeSender, packets: &[Vec<u8>], lane: u8) -> bool {
+    let available = sender.handle.send_buffer_space();
+    if lane == REALTIME {
+        super::super::local_primary_datagram_fits(packets.iter().map(Vec::len).sum(), available)
+    } else {
+        super::super::local_datagram_fits(
+            lane,
+            packets
+                .iter()
+                .map(|packet| sender.handle.queue_charge(packet.len()))
+                .sum(),
+            available,
+        )
+    }
+}
+
+async fn measure_channel(
+    large: bool,
+    recover: bool,
+    congestion: QuicCongestionControl,
+    full_duplex: bool,
+    lane: u8,
+    forward: bool,
 ) -> Report {
     use super::super::parallel_lanes::{ParallelQuicOffer, ParallelSession};
     let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -195,14 +270,34 @@ async fn measure(
         assert_eq!(diagnostics.active_connections(), 12);
         assert_eq!(b_diagnostics.active_connections(), 12);
     }
-    timeout(Duration::from_secs(5), async {
-        while !a.prepare(REALTIME) {
+    let warm_frame = channel_frame(large, forward, 0, 0);
+    let (_, warm_body, warm_kind) = super::super::decode_realtime_lane_frame(&warm_frame).unwrap();
+    let index = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(index) = a.prepare_frame(lane, warm_body, warm_kind) {
+                break index;
+            }
             sleep(Duration::from_millis(5)).await;
         }
     })
     .await
     .unwrap();
-    let index = 0;
+    let reverse_index = if full_duplex {
+        Some(
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(index) = b.prepare_frame(lane, warm_body, warm_kind) {
+                        break index;
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap(),
+        )
+    } else {
+        None
+    };
     let original = a.sender(index).handle.quic().unwrap().clone();
     let original_exporter = original.channel_binding().unwrap();
     let blackout_start = started.elapsed() + Duration::from_secs(6);
@@ -221,13 +316,13 @@ async fn measure(
             (blackout_start..blackout_end).contains(&now),
             Ordering::Relaxed,
         );
-        let frame = primary_test_frame(large, seq, now.as_micros() as u64);
+        let frame = channel_frame(large, forward, seq, now.as_micros() as u64);
         let (_, body, kind) = super::super::decode_realtime_lane_frame(&frame).unwrap();
         // Baseline polls the same production slot but cannot request repair.
         let ready = if recover {
-            a.prepare_frame(REALTIME, body, kind).is_some()
+            a.prepare_frame(lane, body, kind) == Some(index)
         } else {
-            a.prepare(REALTIME)
+            a.prepare_without_recovery(index)
         };
         assert!(ready, "pending recovery displaced a usable sender");
         let attempt = diagnostics.recovery_attempts();
@@ -252,45 +347,62 @@ async fn measure(
         let max_size = sender.max_datagram_size;
         let packets = sender
             .tx
-            .encode_frame(u64::from(REALTIME), &frame, max_size)
-            .unwrap();
-        if super::super::local_primary_datagram_fits(
-            packets.iter().map(Vec::len).sum(),
-            sender.handle.send_buffer_space(),
-        ) {
-            let expiry = super::super::local_primary_datagram_expiry(
-                &crate::frame_outbox::FrameEnvelope::from((
-                    REALTIME,
-                    veil_bufpool::pooled_shared_from_vec(frame.clone()),
-                )),
+            .encode_frame(
+                super::super::local_datagram_flow(lane, body, kind),
+                &frame,
+                max_size,
             )
             .unwrap();
+        if channel_admits(&sender, &packets, lane) {
+            let expiry = super::super::local_primary_datagram_expiry(
+                &crate::frame_outbox::FrameEnvelope::from((
+                    lane,
+                    veil_bufpool::pooled_shared_from_vec(frame.clone()),
+                )),
+            );
             for packet in packets {
-                sender.handle.send_before(&packet, expiry).unwrap();
+                if let Some(expiry) = expiry {
+                    sender.handle.send_before(&packet, expiry).unwrap();
+                } else {
+                    sender.handle.send(&packet).unwrap();
+                }
             }
         }
         seq += 1;
         drop(sender);
         if full_duplex {
-            let frame = primary_test_frame(large, seq | (1 << 31), now.as_micros() as u64);
+            let frame = channel_frame(large, forward, seq | (1 << 31), now.as_micros() as u64);
             let (_, body, kind) = super::super::decode_realtime_lane_frame(&frame).unwrap();
-            let index = b.prepare_frame(REALTIME, body, kind).unwrap();
+            let index = reverse_index.unwrap();
+            let ready = if recover {
+                b.prepare_frame(lane, body, kind) == Some(index)
+            } else {
+                b.prepare_without_recovery(index)
+            };
+            assert!(ready, "pending reverse recovery displaced a usable sender");
             let mut sender = b.sender(index);
             let max_size = sender.max_datagram_size;
-            let packets = sender.tx.encode_frame(0, &frame, max_size).unwrap();
-            if super::super::local_primary_datagram_fits(
-                packets.iter().map(Vec::len).sum(),
-                sender.handle.send_buffer_space(),
-            ) {
-                let expiry = super::super::local_primary_datagram_expiry(
-                    &crate::frame_outbox::FrameEnvelope::from((
-                        REALTIME,
-                        veil_bufpool::pooled_shared_from_vec(frame),
-                    )),
+            let packets = sender
+                .tx
+                .encode_frame(
+                    super::super::local_datagram_flow(lane, body, kind),
+                    &frame,
+                    max_size,
                 )
                 .unwrap();
+            if channel_admits(&sender, &packets, lane) {
+                let expiry = super::super::local_primary_datagram_expiry(
+                    &crate::frame_outbox::FrameEnvelope::from((
+                        lane,
+                        veil_bufpool::pooled_shared_from_vec(frame),
+                    )),
+                );
                 for packet in packets {
-                    sender.handle.send_before(&packet, expiry).unwrap();
+                    if let Some(expiry) = expiry {
+                        sender.handle.send_before(&packet, expiry).unwrap();
+                    } else {
+                        sender.handle.send(&packet).unwrap();
+                    }
                 }
             }
         }
@@ -351,8 +463,77 @@ async fn measure(
         reverse_first_fresh,
         reverse_max_post_age,
     };
-    eprintln!("production primary recovery {report:?}");
+    eprintln!("production channel recovery {report:?}");
     report
+}
+
+#[tokio::test]
+async fn opaque_forward_channels_recover_without_a_source_role_in_both_directions() {
+    timeout(Duration::from_secs(45), async {
+        let baseline = measure_channel(
+            true,
+            false,
+            QuicCongestionControl::Cubic,
+            true,
+            INTERACTIVE,
+            true,
+        )
+        .await;
+        assert_eq!(baseline.switches, 0);
+        assert_eq!(baseline.reverse_switches, 0);
+        assert!(
+            baseline.first_fresh.unwrap() > Duration::from_millis(600),
+            "{baseline:?}"
+        );
+        assert!(
+            baseline.reverse_first_fresh.unwrap() > Duration::from_millis(600),
+            "{baseline:?}"
+        );
+        let report = measure_channel(
+            true,
+            true,
+            QuicCongestionControl::Cubic,
+            true,
+            INTERACTIVE,
+            true,
+        )
+        .await;
+        assert!(
+            report.switches > 0 && report.reverse_switches > 0,
+            "{report:?}"
+        );
+        assert!(
+            report.first_fresh.unwrap() < Duration::from_millis(600),
+            "{report:?}"
+        );
+        assert!(
+            report.reverse_first_fresh.unwrap() < Duration::from_millis(600),
+            "{report:?}"
+        );
+        assert!(
+            report.max_post_age < Duration::from_millis(400),
+            "{report:?}"
+        );
+        assert!(
+            report.reverse_max_post_age < Duration::from_millis(400),
+            "{report:?}"
+        );
+        assert!(
+            report.first_fresh < baseline.first_fresh,
+            "baseline={baseline:?} repaired={report:?}"
+        );
+        assert!(
+            report.reverse_first_fresh < baseline.reverse_first_fresh,
+            "baseline={baseline:?} repaired={report:?}"
+        );
+        assert_eq!(report.duplicates, 0);
+        assert!(
+            report.post_received >= 140 && report.reverse_post_received >= 140,
+            "{report:?}"
+        );
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
