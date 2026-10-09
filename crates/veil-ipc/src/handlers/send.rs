@@ -2835,7 +2835,12 @@ mod ratchet_send_tests {
         }
         .encode();
         let mut previous = None;
-        for lane in [veil_proto::priority::REALTIME, veil_proto::priority::BULK] {
+        for lane in [
+            veil_proto::priority::REALTIME,
+            veil_proto::priority::INTERACTIVE,
+            veil_proto::priority::BULK,
+            veil_proto::priority::BACKGROUND,
+        ] {
             handle_rt_send(&mut wh, &send, Some(&capture), None, &mut None, lane)
                 .await
                 .unwrap();
