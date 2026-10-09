@@ -668,6 +668,12 @@ impl Connection {
         self.0.stable_id()
     }
 
+    /// Process-local diagnostic ordinal, shared by clones for this connection's
+    /// lifetime. Not a wire connection ID, address or authorization token.
+    pub fn local_trace_id(&self) -> u64 {
+        self.0.state.lock("local_trace_id").local_trace_id
+    }
+
     /// Update traffic keys spontaneously
     ///
     /// This primarily exists for testing purposes.
@@ -973,6 +979,7 @@ impl ConnectionRef {
         Self(Arc::new(ConnectionInner {
             state: Mutex::new(State {
                 inner: conn,
+                local_trace_id: crate::udp_wire_trace::next_connection_trace_id(),
                 driver: None,
                 handle,
                 on_handshake_data: Some(on_handshake_data),
@@ -1053,6 +1060,7 @@ pub(crate) struct Shared {
 
 pub(crate) struct State {
     pub(crate) inner: proto::Connection,
+    local_trace_id: u64,
     driver: Option<Waker>,
     handle: ConnectionHandle,
     on_handshake_data: Option<oneshot::Sender<()>>,
@@ -1136,7 +1144,11 @@ impl State {
             }
 
             let wait_us = scheduling_delay_us(self.runtime.now(), prepared);
-            crate::udp_wire_trace::record("send", &self.send_buffer[..len], t.segment_size);
+            crate::udp_wire_trace::record_send(
+                &self.send_buffer[..len],
+                t.segment_size,
+                self.local_trace_id,
+            );
             self.driver_stats.udp_send_wait_last_us = wait_us;
             self.driver_stats.udp_send_wait_max_us =
                 self.driver_stats.udp_send_wait_max_us.max(wait_us);

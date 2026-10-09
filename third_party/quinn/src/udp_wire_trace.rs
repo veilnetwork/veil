@@ -1,17 +1,24 @@
 //! Endpoint-local, opt-in correlation of encrypted UDP datagrams.
-//! No addresses, connection IDs, contents, media roles or wire fields are emitted.
+//! No addresses, wire connection IDs, contents, media roles or wire fields are emitted.
+//! A process-local connection ordinal joins send samples to transport counters;
+//! it is neither a pointer nor a protocol identifier and never leaves the log.
 //! This measures socket handoff to peer socket read, including kernel/scheduling
 //! time; it does not on its own attribute that delay to the carrier.
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(wasm_browser))]
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(wasm_browser)]
 use web_time::{SystemTime, UNIX_EPOCH};
 
 static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
+static NEXT_CONNECTION_TRACE_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_connection_trace_id() -> u64 {
+    NEXT_CONNECTION_TRACE_ID.fetch_add(1, Ordering::Relaxed)
+}
 fn enabled_cell() -> &'static AtomicBool {
     ENABLED.get_or_init(|| {
         AtomicBool::new(std::env::var("VEIL_RT_TRACE").is_ok_and(|v| v.trim() == "1"))
@@ -36,12 +43,24 @@ pub(crate) fn enabled() -> bool {
     enabled_cell().load(Ordering::Relaxed)
 }
 
-pub(crate) fn record(stage: &'static str, bytes: &[u8], segment_size: Option<usize>) {
-    record_inner(stage, bytes, segment_size, None, false);
+#[cfg(test)]
+fn record(stage: &'static str, bytes: &[u8], segment_size: Option<usize>) {
+    record_inner(stage, bytes, segment_size, None, false, 0);
+}
+
+pub(crate) fn record_send(bytes: &[u8], segment_size: Option<usize>, connection_trace_id: u64) {
+    record_inner(
+        "send",
+        bytes,
+        segment_size,
+        None,
+        false,
+        connection_trace_id,
+    );
 }
 
 pub(crate) fn record_receive(bytes: &[u8], kernel_recv_unix_ns: Option<u64>, grouped: bool) {
-    record_inner("receive", bytes, None, kernel_recv_unix_ns, grouped);
+    record_inner("receive", bytes, None, kernel_recv_unix_ns, grouped, 0);
 }
 
 fn record_inner(
@@ -50,6 +69,7 @@ fn record_inner(
     segment_size: Option<usize>,
     kernel_recv_unix_ns: Option<u64>,
     grouped: bool,
+    connection_trace_id: u64,
 ) {
     if !enabled() || bytes.is_empty() {
         return;
@@ -66,7 +86,7 @@ fn record_inner(
             .unwrap_or_default()
             .as_millis();
         log::info!(
-            "quic.udp_wire.sample stage={stage} at_ms={at_ms} digest={digest:016x} bytes={} kernel_recv_ns={} kernel_grouped={grouped}",
+            "quic.udp_wire.sample stage={stage} at_ms={at_ms} digest={digest:016x} bytes={} kernel_recv_ns={} kernel_grouped={grouped} connection_trace_id={connection_trace_id}",
             datagram.len(),
             kernel_recv_unix_ns.unwrap_or(0)
         );
@@ -109,12 +129,15 @@ mod tests {
         record("send", &batch, Some(1200));
         record("receive", &a, None);
         record_receive(&a, Some(123456789), true);
+        record_send(&batch, Some(1200), 41);
+        record_send(&a, None, 42);
         set_udp_wire_trace(false);
         record("send", &batch, Some(1200));
+        record_send(&a, None, 41);
         let rows = LOGGER.0.lock().unwrap();
         assert_eq!(
             rows.len(),
-            4,
+            7,
             "SDK log bridge must receive sampled datagrams"
         );
         assert!(rows[0].contains("stage=send"));
@@ -131,6 +154,12 @@ mod tests {
         assert!(rows[0].contains("kernel_recv_ns=0"));
         assert!(rows[3].contains("kernel_recv_ns=123456789"));
         assert!(rows[3].contains("kernel_grouped=true"));
+        assert!(rows[2].contains("connection_trace_id=0"));
+        assert!(rows[4].contains("connection_trace_id=41"));
+        assert!(rows[5].contains("connection_trace_id=41"));
+        assert!(rows[6].contains("connection_trace_id=42"));
+        assert_eq!(digest(&rows[0]), digest(&rows[4]));
+        assert_eq!(digest(&rows[4]), digest(&rows[6]));
     }
 
     #[test]
