@@ -873,16 +873,28 @@ async fn opaque_transit_quic_backlog_expires_before_driver_resumes() {
         .await
         .unwrap();
     let tx = local.quic_datagrams().unwrap();
+    assert_ne!(tx.local_trace_id(), 0);
+    assert_eq!(tx.local_trace_id(), tx.clone().local_trace_id());
+    assert_eq!(
+        tx.local_trace_id(),
+        local.quic_datagrams().unwrap().local_trace_id()
+    );
     let mut local_stream = local.into_stream().unwrap();
     local_stream.write_all(b"stand").await.unwrap();
     let remote = remote.await.unwrap();
     let rx = remote.quic_datagrams().unwrap();
+    assert_ne!(tx.local_trace_id(), rx.local_trace_id());
     let mut remote_stream = remote.into_stream().unwrap();
     let mut prefix = [0; 5];
     remote_stream.read_exact(&mut prefix).await.unwrap();
     assert_eq!(&prefix, b"stand");
     sleep(Duration::from_millis(30)).await;
     let transport = super::LossyTransportHandle::from(tx.clone());
+    assert!(
+        transport
+            .path_trace()
+            .contains(&format!("connection_trace_id={}", tx.local_trace_id()))
+    );
     for _ in 0..20 {
         transport.send(b"stale opaque transit payload").unwrap();
     }

@@ -138,7 +138,8 @@ impl LossyTransportHandle {
             Self::Quic(handle) => {
                 let p = handle.path_stats();
                 format!(
-                    "transport=quic rtt_us={} cwnd_bytes={} in_flight_bytes={} pto_count={} lost_packets={} congestion_events={} udp_sent={} udp_received={} acks_received={} expired_outgoing_datagrams={} residual_window_transmits={} event_queue_last_us={} event_queue_max_us={} event_queue_stalls={} timer_late_last_us={} timer_late_max_us={} timer_stalls={} udp_send_wait_last_us={} udp_send_wait_max_us={} udp_send_stalls={} udp_send_pending_us={}",
+                    "transport=quic connection_trace_id={} rtt_us={} cwnd_bytes={} in_flight_bytes={} pto_count={} lost_packets={} congestion_events={} udp_sent={} udp_received={} acks_received={} expired_outgoing_datagrams={} residual_window_transmits={} event_queue_last_us={} event_queue_max_us={} event_queue_stalls={} timer_late_last_us={} timer_late_max_us={} timer_stalls={} udp_send_wait_last_us={} udp_send_wait_max_us={} udp_send_stalls={} udp_send_pending_us={}",
+                    handle.local_trace_id(),
                     p.rtt_us,
                     p.congestion_window_bytes,
                     p.in_flight_bytes,
