@@ -290,6 +290,7 @@ fn channel(me: [u8; 32], peer: [u8; 32], tx_key: [u8; 32], rx_key: [u8; 32]) -> 
     MEDIA_CHANNELS.lock().unwrap().insert(
         id,
         MediaChannel {
+            path_probe: None,
             ingress: MediaIngress::with_screen(
                 tx_hi,
                 MediaVideoIngress::Packets(tx_video),

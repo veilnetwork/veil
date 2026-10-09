@@ -2190,6 +2190,32 @@ final int Function(int, int) veilMediaChannelSetScreenSharing = nativeLib
         'veil_media_channel_set_screen_sharing')
     .asFunction();
 
+final class VeilMediaProbePathStruct extends Struct {
+  external Pointer<VeilApp> app;
+  @Array(32)
+  external Array<Uint8> peerNodeId;
+  @Array(32)
+  external Array<Uint8> peerAppId;
+  @Uint32()
+  external int peerEndpointId;
+}
+
+final int Function(int, Pointer<VeilMediaProbePathStruct>,
+        Pointer<VeilMediaProbePathStruct>) veilMediaChannelConfigurePathProbes =
+    nativeLib.lookupFunction<
+            Int32 Function(Uint64, Pointer<VeilMediaProbePathStruct>,
+                Pointer<VeilMediaProbePathStruct>),
+            int Function(int, Pointer<VeilMediaProbePathStruct>,
+                Pointer<VeilMediaProbePathStruct>)>(
+        'veil_media_channel_configure_path_probes');
+
+final int Function(int, int) veilMediaChannelBeginPathProbe = nativeLib
+    .lookupFunction<Int32 Function(Uint64, Uint32), int Function(int, int)>(
+        'veil_media_channel_begin_path_probe');
+final int Function(int) veilMediaChannelPollPathProbe =
+    nativeLib.lookupFunction<Int32 Function(Uint64), int Function(int)>(
+        'veil_media_channel_poll_path_probe');
+
 // start_direct_receiver(app, source_ns, ns_len, source_name, name_len, err)
 // -> VEIL_OK or error. Inbound RTP stays native and never crosses Dart.
 final int Function(

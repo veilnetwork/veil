@@ -471,6 +471,9 @@ impl SealedMediaCell {
 pub(crate) struct MediaCipher {
     tx: [Mutex<MediaCipherTx>; 3],
     rx: Mutex<MediaCipherRx>,
+    // Identity of the receive key for internal control dispatch across two
+    // overlapping channel generations. Never logged or placed on the wire.
+    rx_key_id: [u8; 32],
 }
 
 /// Other transport fixtures create their ciphers under the same cache gate as
@@ -530,6 +533,7 @@ impl MediaCipher {
                 Mutex::new(screen),
             ],
             rx: Mutex::new(MediaCipherRx::new(peer, rx_key)),
+            rx_key_id: *blake3::hash(rx_key).as_bytes(),
         })
     }
 
@@ -563,6 +567,11 @@ impl MediaCipher {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .open(sealed)
+    }
+
+    #[cfg(feature = "node-embedded")]
+    pub(crate) fn same_receive_key(&self, other: &Self) -> bool {
+        self.rx_key_id == other.rx_key_id
     }
 }
 
@@ -1169,6 +1178,8 @@ pub(crate) fn dispatch_inbound_auto(peer: [u8; 32], payload: &[u8]) {
     // (measured on the stand 2026-09-19: rx_pkts=0 with recv_count=0 on BOTH
     // sides of a live p2p call).
     let Some(lease) = lease else {
+        #[cfg(feature = "node-embedded")]
+        crate::media_ffi::path_probe_ffi::dispatch_without_lease(payload);
         media_drop_note("no-channel", peer, payload.len());
         return;
     };
@@ -1177,10 +1188,16 @@ pub(crate) fn dispatch_inbound_auto(peer: [u8; 32], payload: &[u8]) {
 
 fn dispatch_inbound_with_lease(peer: [u8; 32], payload: &[u8], lease: RecvLease) {
     let Some(plaintext) = lease.cipher.open(payload) else {
+        #[cfg(feature = "node-embedded")]
+        crate::media_ffi::path_probe_ffi::dispatch_without_lease(payload);
         media_drop_note("seal-open-failed", peer, payload.len());
         return;
     };
     trace_sealed_cell("received", &peer, payload);
+    #[cfg(feature = "node-embedded")]
+    if crate::media_ffi::path_probe_ffi::dispatch_control(&lease.cipher, &plaintext) {
+        return;
+    }
     #[cfg(feature = "node-embedded")]
     if plaintext.starts_with(anon_stream_control_magic()) {
         let map = RECV.lock().unwrap_or_else(|p| p.into_inner());

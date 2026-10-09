@@ -93,6 +93,8 @@ mod anon_stream;
 mod fs_beneath;
 #[cfg_attr(not(feature = "node-embedded"), allow(dead_code))]
 mod media;
+#[cfg_attr(not(feature = "node-embedded"), allow(dead_code))]
+mod media_path_probe;
 
 // Opt-in message-authorship signature FFI (needs veil-cfg to parse the caller's
 // identity TOML — enabled by node-embedded).

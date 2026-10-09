@@ -323,6 +323,37 @@ void _setScreenMediaSender(
   }
 }
 
+int _configureMediaProbesWorker(
+    int channel,
+    int directApp,
+    int relayApp,
+    Uint8List directPeer,
+    Uint8List directPeerApp,
+    Uint8List relayPeer,
+    Uint8List relayPeerApp,
+    int endpoint) {
+  final direct = calloc<ffi.VeilMediaProbePathStruct>();
+  final relay = calloc<ffi.VeilMediaProbePathStruct>();
+  try {
+    void fill(Pointer<ffi.VeilMediaProbePathStruct> path, int app,
+        Uint8List node, Uint8List peerApp) {
+      path.ref.app = Pointer<ffi.VeilApp>.fromAddress(app);
+      for (var i = 0; i < 32; i++) {
+        path.ref.peerNodeId[i] = node[i];
+        path.ref.peerAppId[i] = peerApp[i];
+      }
+      path.ref.peerEndpointId = endpoint;
+    }
+
+    fill(direct, directApp, directPeer, directPeerApp);
+    fill(relay, relayApp, relayPeer, relayPeerApp);
+    return ffi.veilMediaChannelConfigurePathProbes(channel, direct, relay);
+  } finally {
+    calloc.free(direct);
+    calloc.free(relay);
+  }
+}
+
 /// Off-isolate body of [VeilClient.nodeId] — the native call performs an IPC
 /// request via tokio block_on, so it must not run on Flutter's UI isolate.
 Uint8List _nodeIdWorker(int handleAddr) {
@@ -2920,6 +2951,64 @@ class AppHandle implements Finalizable {
   int setMediaScreenSharing(int chan, bool on) {
     _ensureOpen();
     return ffi.veilMediaChannelSetScreenSharing(chan, on ? 1 : 0);
+  }
+
+  /// Pin authenticated call destinations for sealed delivery observations.
+  /// This handle supplies the identity-scoped direct reply. [relaySender]
+  /// supplies the physical-device relay reply. Neither network source fields
+  /// nor a probe payload can change these destinations. Anonymous channels
+  /// reject this configuration.
+  Future<bool> configureMediaPathProbes(
+    int chan, {
+    required AppHandle relaySender,
+    required Uint8List directPeer,
+    required Uint8List directPeerApp,
+    required Uint8List relayPeer,
+    required Uint8List relayPeerApp,
+    required int peerEndpoint,
+  }) async {
+    _ensureOpen();
+    relaySender._ensureOpen();
+    for (final value in [directPeer, directPeerApp, relayPeer, relayPeerApp]) {
+      if (value.length != 32)
+        throw ArgumentError('probe addresses must be 32 bytes');
+    }
+    final directAddr = _app.address;
+    final relayAddr = relaySender._app.address;
+    return await Isolate.run(() => _configureMediaProbesWorker(
+            chan,
+            directAddr,
+            relayAddr,
+            directPeer,
+            directPeerApp,
+            relayPeer,
+            relayPeerApp,
+            peerEndpoint)) ==
+        0;
+  }
+
+  /// Prove delivery through a candidate without replacing any native RTP
+  /// receiver or sender. An unknown/old peer, a late answer or a closed
+  /// candidate returns false; local queue admission never returns true.
+  Future<bool> qualifyMediaPath(
+    int chan, {
+    Duration budget = const Duration(milliseconds: 600),
+  }) async {
+    _ensureOpen();
+    if (budget.inMilliseconds < 100 || budget.inMilliseconds > 1000) {
+      throw ArgumentError('probe budget must be 100..1000 ms');
+    }
+    if (ffi.veilMediaChannelBeginPathProbe(chan, budget.inMilliseconds) != 0) {
+      return false;
+    }
+    final deadline = Stopwatch()..start();
+    while (deadline.elapsed <= budget) {
+      final status = ffi.veilMediaChannelPollPathProbe(chan);
+      if (status == 1) return true;
+      if (status != 0) return false;
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
+    return false;
   }
 
   /// Select the batching wire format on a direct/relay media channel.
