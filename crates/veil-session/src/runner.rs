@@ -4008,6 +4008,7 @@ impl SessionRunner {
             .as_ref()
             .map(|outbox| outbox.shared_source_activity())
             .unwrap_or_default();
+        let reliable_source = source_activity.reliable_source();
         let offer = self.quic_datagrams.take();
         let mut ordered_feedback =
             offer
@@ -5020,6 +5021,7 @@ impl SessionRunner {
                         .is_some_and(|outbox| outbox.source_activity().active(now));
                 let mut source_bulk_waiting_for_writer = false;
                 let mut source_pressure_retry: Option<std::time::Instant> = None;
+                let mut source_reliable_waiting = false;
                 let reliable_ready = realtime_lane
                     .as_ref()
                     .and_then(|lane| lane.parallel.as_ref())
@@ -5136,10 +5138,11 @@ impl SessionRunner {
                         // cannot select this endpoint-only pressure policy.
                         if priority != crate::LOCAL_NETWORK_CONTROL_LANE
                             && (owned_reliable || priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE)
-                            && let Some(outbox) = outbox.as_ref()
+                            && outbox.is_some()
                         {
                             let wire_bytes = encrypted_wire_len(frame.len()).unwrap_or(usize::MAX);
-                            if let Err(retry) = outbox.source_activity().admit_reliable_secondary(wire_bytes, now) {
+                            if let Err(retry) = reliable_source.admit(wire_bytes, now) {
+                                source_reliable_waiting = true;
                                 source_pressure_retry = Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
                                 return HeadAdmission::DeferSource;
                             }
@@ -5153,7 +5156,7 @@ impl SessionRunner {
                                 source_reliable_admitted_logged = Some(now);
                                 self.logger.info(
                                     "session.rt_trace.source_reliable_admission",
-                                    format!("wire_bytes={wire_bytes} pending_blobs={pending_blobs} primary_active={local_primary_active}"),
+                                    format!("peer_id={} wire_bytes={wire_bytes} pending_blobs={pending_blobs} primary_active={local_primary_active}", hex_short(&self.peer_id)),
                                 );
                             }
                         }
@@ -5333,6 +5336,12 @@ impl SessionRunner {
                 // delay benefit because the deadline keeps getting pushed.
                 if drained_this_pass > 0 {
                     outbound_coalescer.record_drain(tokio::time::Instant::now());
+                }
+                // A failed route, full writer, empty queue or neutral-only
+                // pass cannot retain a local reliable turn and stall another
+                // runner. Successful admission already consumed its turn.
+                if !source_reliable_waiting {
+                    reliable_source.cancel();
                 }
                 // `compute_sleep_deadline` folds up to 7 independent
                 // timer sources (battery, idle, keepalive, cover, rx-
