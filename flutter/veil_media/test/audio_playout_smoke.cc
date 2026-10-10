@@ -21,8 +21,11 @@ extern "C" VeilMediaEngine* veil_media_test_audio_playout_create(
     uint64_t, const uint8_t[32], const uint8_t[32], int, size_t);
 extern "C" int veil_media_test_audio_capture_tone(VeilMediaEngine*, int);
 extern "C" int veil_media_test_audio_playout_pcm(VeilMediaEngine*, int16_t*, size_t);
+extern "C" VeilMediaEngine* veil_media_test_duplex_codec_create(
+    uint64_t, const uint8_t[32], const uint8_t[32]);
+extern "C" int veil_media_test_audio_transport_budget(VeilMediaEngine*, int);
 struct Callback { void (*fn)(void*, const uint8_t*, size_t); void* ctx; };
-struct Packet { Clock::time_point due; std::vector<uint8_t> bytes; };
+struct Packet { Clock::time_point due; std::vector<uint8_t> bytes; uint64_t destination = 0; };
 static std::mutex mu;
 static std::map<uint64_t, Callback> callbacks;
 static std::vector<Packet> pending;
@@ -30,6 +33,7 @@ static Clock::time_point origin;
 static uint64_t source_channel = 0, receiver_channel = 0;
 static size_t sent_packets = 0;
 static bool perfect_network = false;
+static bool duplex_feedback = false;
 static bool handover_network = false;
 static bool delivery_stall = false;
 static bool recurring_jitter = false;
@@ -54,6 +58,12 @@ extern "C" int veil_media_set_recv_callback(uint64_t chan,
 }
 extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t len) {
   std::lock_guard lock(mu);
+  if (duplex_feedback && len >= 4 && p[1] >= 192 && p[1] <= 223) {
+    pending.push_back({Clock::now() + std::chrono::milliseconds(40),
+                      std::vector<uint8_t>(p, p + len),
+                      chan == source_channel ? receiver_channel : source_channel});
+    return 0;
+  }
   if ((handover_network ? !handover_sources.contains(chan) : chan != source_channel) ||
       len < 12 || (p[1] & 0x7f) != 111) return 0;
   if (handover_network)
@@ -115,7 +125,12 @@ static void deliver() {
   });
   max_delivery_batch = std::max(max_delivery_batch, ready.size());
   for (const auto& p : ready) {
-    if (callback.fn) callback.fn(callback.ctx, p.bytes.data(), p.bytes.size());
+    auto target = callback;
+    if (p.destination) {
+      std::lock_guard lock(mu);
+      target = callbacks.at(p.destination);
+    }
+    if (target.fn) target.fn(target.ctx, p.bytes.data(), p.bytes.size());
   }
 }
 static uint64_t metric(VeilMediaEngine* e, const char* name) {
@@ -493,7 +508,66 @@ static void verify_delivery_stall(bool drop) {
   { std::lock_guard lock(mu); assert(callbacks.empty()); }
 }
 
+static void verify_adaptive_bitrate() {
+  perfect_network = true;
+  duplex_feedback = true;
+  const uint8_t local[32] = {1}, peer[32] = {2};
+  source_channel = 200; receiver_channel = 300;
+  using Engine = std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)>;
+  Engine receiver(veil_media_test_duplex_codec_create(300, peer, local), veil_media_engine_destroy);
+  Engine source(veil_media_test_duplex_codec_create(200, local, peer), veil_media_engine_destroy);
+  assert(source && receiver);
+  origin = Clock::now();
+  std::array<int16_t, 480> pcm{};
+  std::array<size_t, 3> voiced_ticks{};
+  uint64_t baseline_interruptions = 0, baseline_concealed = 0;
+  uint64_t max_delay = 0;
+  double max_lateness = 0;
+  for (int tick = 0; tick < 1200; ++tick) {
+    std::this_thread::sleep_until(origin + std::chrono::milliseconds(10 * tick));
+    max_lateness = std::max(max_lateness, milliseconds(Clock::now()) - 10 * tick);
+    const int phase = tick / 400;
+    if (tick % 400 == 0)
+      assert(veil_media_test_audio_transport_budget(source.get(), phase == 1 ? 12000 : 48000) == 0);
+    assert(veil_media_test_audio_capture_tone(source.get(), 440) == 0);
+    assert(veil_media_test_audio_capture_tone(receiver.get(), 0) == 0);
+    deliver();
+    assert(veil_media_test_audio_playout_pcm(receiver.get(), pcm.data(), pcm.size()) == 480);
+    if (tick == 100) {
+      baseline_interruptions = metric(receiver.get(), "audio_interruption_count");
+      baseline_concealed = metric(receiver.get(), "audio_concealed_samples");
+    }
+    if (tick % 400 >= 100) {
+      double power = 0;
+      for (const auto sample : pcm) power += double(sample) * sample;
+      if (power / pcm.size() > 500 * 500) ++voiced_ticks[phase];
+      if (tick % 10 == 0) {
+        const auto target_bps = metric(source.get(), "audio_encoder_target_bps");
+        // Real TWCC can trim the healthy estimate below its configured ceiling.
+        // Require recovery of codec bitrate, not an artificially fixed estimate.
+        const bool target_ok = phase == 1 ? target_bps == 12000
+                                         : target_bps >= 24000 && target_bps <= 32000;
+        if (!target_ok) std::fprintf(stderr, "adaptive PCM failed tick=%d phase=%d codec=%llu estimate=%llu\n",
+            tick, phase, (unsigned long long)target_bps,
+            (unsigned long long)metric(source.get(), "audio_send_bandwidth_bps"));
+        assert(target_ok);
+        max_delay = std::max(max_delay, metric(receiver.get(), "audio_delay_ms"));
+      }
+    }
+  }
+  std::printf("adaptive Opus PCM: voiced=%zu/%zu/%zu delay_max=%llu tick_lateness=%.2f\n",
+      voiced_ticks[0], voiced_ticks[1], voiced_ticks[2], (unsigned long long)max_delay, max_lateness);
+  assert(max_lateness < 30 && max_delay < 120);
+  for (const auto ticks : voiced_ticks) assert(ticks >= 290);
+  assert(metric(receiver.get(), "audio_interruption_count") == baseline_interruptions);
+  assert(metric(receiver.get(), "audio_concealed_samples") == baseline_concealed);
+}
+
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--adaptive-bitrate") == 0) {
+    verify_adaptive_bitrate();
+    return 0;
+  }
   recurring_jitter = argc == 2 && std::strcmp(argv[1], "--recurring-jitter") == 0;
   mature_jitter = argc == 2 && std::strcmp(argv[1], "--mature-jitter") == 0;
   if (argc == 2 && std::strcmp(argv[1], "--padding-liveness") == 0) {
