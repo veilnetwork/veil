@@ -591,7 +591,10 @@ async fn verify_ordered_primary_feedback(mode: OrderedPrimary) {
     timeout(Duration::from_secs(2), async {
         loop {
             if handle.path_stats().pto_count > 0
-                && !source.allow_secondary(std::time::Instant::now())
+                && !source.allow_secondary(
+                    crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+                    std::time::Instant::now(),
+                )
             {
                 break;
             }
@@ -890,7 +893,7 @@ async fn verify_stream_only_primary_backpressure(neutral_prefix: usize) {
         .await
         .unwrap();
     // Secondary lossy bytes use a different, healthy stream-only neighbor.
-    // They still share one endpoint probe budget and neutral work must pass.
+    // They still share one endpoint byte budget and neutral work must pass.
     let (secondary_stream, mut secondary_peer) = tokio::io::duplex(262144);
     for _ in 0..50 {
         secondary_sender
@@ -903,6 +906,7 @@ async fn verify_stream_only_primary_backpressure(neutral_prefix: usize) {
         .await
         .unwrap();
     let mut secondary_runner = make_runner(Box::new(secondary_stream), secondary_outbox, None);
+    let secondary_began = std::time::Instant::now();
     let secondary_job = tokio::spawn(async move {
         secondary_runner.run().await;
     });
@@ -945,9 +949,17 @@ async fn verify_stream_only_primary_backpressure(neutral_prefix: usize) {
         secondary_peer
     });
     sleep(Duration::from_millis(180)).await;
+    let admitted = secondary_received.load(Ordering::Relaxed);
+    let cost = super::super::encrypted_wire_len(bytes.len()).unwrap();
+    let windows = 1 + secondary_began.elapsed().as_millis() / 200;
     assert!(
-        secondary_received.load(Ordering::Relaxed) <= 1,
-        "ordered secondary bypassed endpoint pressure"
+        (admitted * cost) as u128
+            <= windows * crate::local_source_activity::LOSSY_SECONDARY_BYTES as u128,
+        "ordered secondary bypassed endpoint byte pressure: items={admitted} cost={cost} windows={windows}"
+    );
+    assert!(
+        admitted > 1,
+        "small packets still consume a whole pressure allowance"
     );
     assert!(
         neutral_received.load(Ordering::Relaxed),

@@ -155,8 +155,13 @@ impl LocalReliableAdmission {
     }
 
     /// Reduce this endpoint's secondary production on any neighbor under local
-    /// primary pressure. All runners share one sparse recovery-probe budget.
-    pub(super) fn allow_secondary(&mut self, local_priority: u8, now: Instant) -> bool {
+    /// primary pressure. All runners share one bounded recovery byte budget.
+    pub(super) fn allow_secondary(
+        &mut self,
+        local_priority: u8,
+        bytes: usize,
+        now: Instant,
+    ) -> bool {
         if !matches!(
             local_priority,
             veil_proto::priority::BULK
@@ -165,7 +170,7 @@ impl LocalReliableAdmission {
         ) {
             return true;
         }
-        self.source_activity.allow_secondary(now)
+        self.source_activity.allow_secondary(bytes, now)
     }
 
     pub(super) fn expire(&mut self, now: Instant) {
@@ -215,15 +220,23 @@ mod feedback_tests {
         if feedback.observe(10_000, 0, 1, 0) {
             activity.note_pressure(now);
         }
-        assert!(activity.allow_secondary(now)); // One sparse recovery probe.
-        assert!(!activity.allow_secondary(now + Duration::from_millis(1)));
+        assert!(activity.allow_secondary(crate::local_source_activity::LOSSY_SECONDARY_BYTES, now)); // One sparse recovery probe.
+        assert!(!activity.allow_secondary(
+            crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+            now + Duration::from_millis(1)
+        ));
         let renewed = now + PRESSURE_GRACE;
         activity.note(renewed);
         if feedback.observe(10_000, 0, 1, 0) {
             activity.note_pressure(renewed);
         }
-        assert!(activity.allow_secondary(renewed));
-        assert!(activity.allow_secondary(renewed + Duration::from_millis(1)));
+        assert!(
+            activity.allow_secondary(crate::local_source_activity::LOSSY_SECONDARY_BYTES, renewed)
+        );
+        assert!(activity.allow_secondary(
+            crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+            renewed + Duration::from_millis(1)
+        ));
     }
 }
 

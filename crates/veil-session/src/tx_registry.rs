@@ -895,24 +895,26 @@ mod tests {
                 .admit_network_control(1, now)
                 .is_err()
         );
-        assert!(registry.source_activity.allow_secondary(now));
-        registry.note_local_source_feedback(false, now + Duration::from_millis(1));
         assert!(
-            !registry
+            registry
                 .source_activity
-                .allow_secondary(now + Duration::from_millis(1))
+                .allow_secondary(crate::local_source_activity::LOSSY_SECONDARY_BYTES, now)
         );
+        registry.note_local_source_feedback(false, now + Duration::from_millis(1));
+        assert!(!registry.source_activity.allow_secondary(
+            crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+            now + Duration::from_millis(1)
+        ));
         assert!(
             registry
                 .source_activity
                 .admit_reliable_secondary(1, now + PRESSURE_GRACE)
                 .is_ok()
         );
-        assert!(
-            registry
-                .source_activity
-                .allow_secondary(now + PRESSURE_GRACE)
-        );
+        assert!(registry.source_activity.allow_secondary(
+            crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+            now + PRESSURE_GRACE
+        ));
     }
 
     #[tokio::test]
