@@ -24,6 +24,7 @@ extern "C" int veil_media_test_audio_playout_pcm(VeilMediaEngine*, int16_t*, siz
 extern "C" VeilMediaEngine* veil_media_test_duplex_codec_create(
     uint64_t, const uint8_t[32], const uint8_t[32]);
 extern "C" int veil_media_test_audio_transport_budget(VeilMediaEngine*, int);
+extern "C" int veil_media_test_audio_adaptation(VeilMediaEngine*, int);
 struct Callback { void (*fn)(void*, const uint8_t*, size_t); void* ctx; };
 struct Packet { Clock::time_point due; std::vector<uint8_t> bytes; uint64_t destination = 0; };
 static std::mutex mu;
@@ -32,6 +33,11 @@ static std::vector<Packet> pending;
 static Clock::time_point origin;
 static uint64_t source_channel = 0, receiver_channel = 0;
 static size_t sent_packets = 0;
+static bool charged_link=false,charged_duplex=false;
+static std::map<uint64_t,Clock::time_point> wire_free;
+static size_t wire_drops=0,wire_admissions=0;
+static std::vector<std::array<long long,5>> source_packets;
+static std::array<size_t,3> packets_by_phase{},drops_by_phase{},wire_bytes_by_phase{},control_drops{},control_admissions{};
 static bool perfect_network = false;
 static bool duplex_feedback = false;
 static bool handover_network = false;
@@ -58,6 +64,23 @@ extern "C" int veil_media_set_recv_callback(uint64_t chan,
 }
 extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t len) {
   std::lock_guard lock(mu);
+  if(charged_link) {
+    const auto now=Clock::now();
+    const int phase=std::clamp(int(milliseconds(now)/4000),0,2);
+    const bool control=len>=4 && p[1]>=192 && p[1]<=223;
+    if(!control && ((!charged_duplex && chan!=source_channel) || len<12 || (p[1]&0x7f)!=111)) return 0;
+    const int capacity=phase==1 ? 64000 : 160000;
+    const size_t cost=len+209;
+    const auto finish=std::max(now,wire_free[chan])+std::chrono::microseconds(cost*8000000/capacity);
+    // Bounded, lossy source queue; admission remains asynchronous to RTP.
+    if(finish-now>std::chrono::milliseconds(200)) {
+      ++wire_drops;if(!control)++drops_by_phase[phase];else ++control_drops[phase];return 0;
+    }
+    wire_free[chan]=finish;++wire_admissions;if(control)++control_admissions[phase];
+    if(!control){++packets_by_phase[phase];wire_bytes_by_phase[phase]+=cost;source_packets.push_back({(long long)(milliseconds(now)*1000),(long long)(uint16_t(p[2])<<8|p[3]),(long long)(uint32_t(p[4])<<24|uint32_t(p[5])<<16|uint32_t(p[6])<<8|p[7]),(long long)len,(long long)chan});}
+    pending.push_back({finish+std::chrono::milliseconds(40),std::vector<uint8_t>(p,p+len),chan==source_channel ? receiver_channel : source_channel});
+    return 0;
+  }
   if (duplex_feedback && len >= 4 && p[1] >= 192 && p[1] <= 223) {
     pending.push_back({Clock::now() + std::chrono::milliseconds(40),
                       std::vector<uint8_t>(p, p + len),
@@ -563,7 +586,115 @@ static void verify_adaptive_bitrate() {
   assert(metric(receiver.get(), "audio_concealed_samples") == baseline_concealed);
 }
 
+// Model direct-flow framing; IP/UDP/QUIC and packet packing are excluded.
+// Requires a private native library built with rtc_enable_protobuf=true.
+static void verify_adaptive_encapsulation(bool source_pause = false) {
+  perfect_network=true;duplex_feedback=true;charged_link=true;charged_duplex=true;
+  const uint8_t local[32]={1},peer[32]={2};source_channel=200;receiver_channel=300;
+  using Engine=std::unique_ptr<VeilMediaEngine,decltype(&veil_media_engine_destroy)>;
+  Engine receiver(veil_media_test_duplex_codec_create(300,peer,local),veil_media_engine_destroy);
+  Engine source(veil_media_test_duplex_codec_create(200,local,peer),veil_media_engine_destroy);
+  assert(source && receiver);
+  assert(veil_media_test_audio_adaptation(source.get(),209)==0);
+  assert(veil_media_test_audio_adaptation(receiver.get(),209)==0);
+  origin=Clock::now();
+  std::array<int16_t,480> pcm{},reverse_pcm{};std::array<size_t,3> voiced{},reverse_voiced{};std::array<uint64_t,3> reverse_delay{};
+  std::array<uint64_t,3> max_delay{},max_interruptions{};
+  double max_lateness=0, resume_delay=-1;
+  std::vector<double> sent_edges,rendered_edges,reverse_sent_edges,reverse_edges;
+  bool was_high=false,reverse_was_high=false;
+  for(int tick=0;tick<1200;++tick) {
+    std::this_thread::sleep_until(origin+std::chrono::milliseconds(10*tick));
+    max_lateness=std::max(max_lateness,milliseconds(Clock::now())-10*tick);
+    const int phase=tick/400;
+    if(tick%400==0) {
+      assert(veil_media_test_audio_transport_budget(source.get(),phase==1 ? 48000 : 160000)==0);
+      assert(veil_media_test_audio_transport_budget(receiver.get(),phase==1 ? 48000 : 160000)==0);
+    }
+    const bool high=(tick/100)%2;
+    const bool paused=source_pause && tick>=500 && tick<620;
+    if(high && tick%100==0) {
+      if(!paused)sent_edges.push_back(milliseconds(Clock::now()));
+      reverse_sent_edges.push_back(milliseconds(Clock::now()));
+    }
+    assert(veil_media_test_audio_capture_tone(source.get(),paused ? 0 : high ? 1200 : 440)==0);
+    assert(veil_media_test_audio_capture_tone(receiver.get(),charged_duplex ? (high ? 1500 : 660) : 0)==0);
+    deliver();assert(veil_media_test_audio_playout_pcm(receiver.get(),pcm.data(),pcm.size())==480);
+    double power=0;int crossings=0;
+    for(size_t i=0;i<pcm.size();++i){power+=double(pcm[i])*pcm[i];if(i && ((pcm[i]>0)!=(pcm[i-1]>0)))++crossings;}
+    const bool nonsilent=power/pcm.size()>500*500;
+    const bool rendered_high=nonsilent && crossings>=17;
+    if(rendered_high && !was_high)rendered_edges.push_back(milliseconds(Clock::now()));
+    was_high=rendered_high;
+    assert(veil_media_test_audio_playout_pcm(source.get(),reverse_pcm.data(),reverse_pcm.size())==480);
+    double reverse_power=0;
+    int reverse_crossings=0;
+    for(size_t i=0;i<reverse_pcm.size();++i) {
+      reverse_power+=double(reverse_pcm[i])*reverse_pcm[i];
+      if(i && ((reverse_pcm[i]>0)!=(reverse_pcm[i-1]>0)))++reverse_crossings;
+    }
+    const bool reverse_nonsilent=reverse_power/reverse_pcm.size()>500*500;
+    const bool reverse_high=reverse_nonsilent && reverse_crossings>=23;
+    if(reverse_high && !reverse_was_high)reverse_edges.push_back(milliseconds(Clock::now()));
+    reverse_was_high=reverse_high;
+    if(tick%400>=100) {
+      if(reverse_nonsilent)++reverse_voiced[phase];
+      if(tick%10==0)reverse_delay[phase]=std::max(reverse_delay[phase],metric(source.get(),"audio_delay_ms"));
+    }
+    if(source_pause && tick>=620 && nonsilent && resume_delay<0)
+      resume_delay=milliseconds(Clock::now())-6200;
+    if(tick%400>=100) {
+      if(nonsilent)++voiced[phase];
+      if(tick%100==0) std::printf("observe tick=%d codec=%llu estimate=%llu packets=%zu drops=%zu delay=%llu\n",tick,(unsigned long long)metric(source.get(),"audio_encoder_target_bps"),(unsigned long long)metric(source.get(),"audio_send_bandwidth_bps"),packets_by_phase[phase],drops_by_phase[phase],(unsigned long long)metric(receiver.get(),"audio_delay_ms"));
+      if(tick%10==0){max_delay[phase]=std::max(max_delay[phase],metric(receiver.get(),"audio_delay_ms"));max_interruptions[phase]=metric(receiver.get(),"audio_interruption_count");}
+    }
+  }
+  std::printf("adaptive encapsulation voiced=%zu/%zu/%zu delay_max=%llu/%llu/%llu interruptions=%llu/%llu/%llu packets=%zu/%zu/%zu drops=%zu/%zu/%zu wire_bytes=%zu/%zu/%zu lateness=%.2f markers=[",voiced[0],voiced[1],voiced[2],(unsigned long long)max_delay[0],(unsigned long long)max_delay[1],(unsigned long long)max_delay[2],(unsigned long long)max_interruptions[0],(unsigned long long)max_interruptions[1],(unsigned long long)max_interruptions[2],packets_by_phase[0],packets_by_phase[1],packets_by_phase[2],drops_by_phase[0],drops_by_phase[1],drops_by_phase[2],wire_bytes_by_phase[0],wire_bytes_by_phase[1],wire_bytes_by_phase[2],max_lateness);
+  for(size_t i=0;i<sent_edges.size();++i){auto it=std::find_if(rendered_edges.begin(),rendered_edges.end(),[&](double x){return x>=sent_edges[i] && x<sent_edges[i]+800;});if(i)std::printf(",");std::printf("%.2f",it==rendered_edges.end() ? -1 : *it-sent_edges[i]);}
+  std::puts("]");
+  if(charged_duplex)std::printf("reverse voiced=%zu/%zu/%zu delay=%llu/%llu/%llu\n",reverse_voiced[0],reverse_voiced[1],reverse_voiced[2],(unsigned long long)reverse_delay[0],(unsigned long long)reverse_delay[1],(unsigned long long)reverse_delay[2]);
+  std::printf("control admissions=%zu/%zu/%zu drops=%zu/%zu/%zu total_drops=%zu\n",control_admissions[0],control_admissions[1],control_admissions[2],control_drops[0],control_drops[1],control_drops[2],wire_drops);
+  for(const auto& p:source_packets)std::printf("rtp at_us=%lld seq=%lld ts=%lld len=%lld source=%lld\n",p[0],p[1],p[2],p[3],p[4]);
+  assert(max_lateness<30);
+  for (size_t phase=0; phase<3; ++phase) {
+    if(source_pause && phase==1)assert(voiced[phase]>=160 && voiced[phase]<=230);
+    else assert(voiced[phase]==300);
+    assert(reverse_voiced[phase]==300);
+    assert(drops_by_phase[phase]==0 && control_drops[phase]==0);
+    assert(max_delay[phase]<200 && reverse_delay[phase]<200);
+    assert(max_interruptions[phase]==0);
+  }
+  std::printf("reverse PCM markers_ms=[");
+  for(size_t i=0;i<reverse_sent_edges.size();++i) {
+    auto next=std::find_if(reverse_edges.begin(),reverse_edges.end(),
+                          [&](double rendered){return rendered>=reverse_sent_edges[i];});
+    assert(next!=reverse_edges.end());
+    double delay=*next-reverse_sent_edges[i];
+    std::printf("%s%.2f",i ? "," : "",delay);
+    assert(delay<300);
+  }
+  std::puts("]");
+  if(source_pause) {
+    std::printf("DTX resume_ms=%.2f\n",resume_delay);
+    assert(resume_delay>=0 && resume_delay<300);
+  }
+  assert(metric(source.get(),"audio_interruption_count")==0);
+  for (double edge:sent_edges) {
+    auto next=std::find_if(rendered_edges.begin(),rendered_edges.end(),
+                         [&](double rendered){return rendered>=edge;});
+    assert(next!=rendered_edges.end() && *next-edge<300);
+  }
+}
+
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--adaptive-encapsulation-silence") == 0) {
+    verify_adaptive_encapsulation(true);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--adaptive-encapsulation") == 0) {
+    verify_adaptive_encapsulation();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-bitrate") == 0) {
     verify_adaptive_bitrate();
     return 0;
