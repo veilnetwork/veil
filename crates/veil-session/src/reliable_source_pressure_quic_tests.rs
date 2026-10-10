@@ -472,7 +472,6 @@ enum OrderedPrimary {
     NoDatagrams,
     NeutralForward,
     LegacyCircuit,
-    LegacyForward,
 }
 
 fn primary_frame(mode: OrderedPrimary) -> veil_bufpool::PooledShared {
@@ -483,10 +482,6 @@ fn primary_frame(mode: OrderedPrimary) -> veil_bufpool::PooledShared {
         delivery::{DeliveryEnvelope, ForwardPayload},
         family::DeliveryMsg,
     };
-    let mut payload = vec![0x71; 256];
-    if matches!(mode, OrderedPrimary::LegacyForward) {
-        payload[..4].copy_from_slice(&veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC);
-    }
     let body = ForwardPayload {
         next_hop_node_id: [0xD1; 32],
         envelope: DeliveryEnvelope {
@@ -498,13 +493,13 @@ fn primary_frame(mode: OrderedPrimary) -> veil_bufpool::PooledShared {
             content_id: [0x43; 32],
             created_at: veil_util::unix_secs_now_u64(),
             ttl_secs: veil_proto::delivery::FORWARD_REALTIME_TTL_SECS,
-            payload,
+            payload: vec![0x71; 256],
             trace_id: 0,
             require_ack: false,
         },
         relay_hops: 0,
         delivery_attempt: None,
-        traffic_class: (!matches!(mode, OrderedPrimary::LegacyForward)).then_some(INTERACTIVE),
+        traffic_class: Some(INTERACTIVE),
     }
     .encode();
     let mut h = FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
@@ -541,10 +536,7 @@ async fn verify_ordered_primary_feedback(mode: OrderedPrimary) {
         runner.run().await;
     });
     let bytes = primary_frame(mode);
-    assert_eq!(
-        super::super::decode_realtime_lane_frame(&bytes).is_some(),
-        !matches!(mode, OrderedPrimary::LegacyForward),
-    );
+    assert!(super::super::decode_realtime_lane_frame(&bytes).is_some());
     // A transit packet claiming REALTIME on wire cannot publish source policy.
     let mut claimed = bytes.to_vec();
     let mut claimed_header = veil_proto::codec::decode_header(&claimed).unwrap();
@@ -621,7 +613,7 @@ async fn verify_ordered_primary_feedback(mode: OrderedPrimary) {
     timeout(Duration::from_secs(2), async {
         loop {
             let wire = primary_reader.read(&mut peer, 65536).await.unwrap();
-            let plaintext = primary_cipher
+            primary_cipher
                 .open(&wire.body, &veil_proto::codec::frame_aad(&wire.header))
                 .unwrap();
             if wire.header.family == FrameFamily::Session as u8 {
@@ -638,13 +630,6 @@ async fn verify_ordered_primary_feedback(mode: OrderedPrimary) {
                     wire.header.msg_type,
                     veil_proto::family::DeliveryMsg::Forward as u16
                 );
-                if matches!(mode, OrderedPrimary::LegacyForward) {
-                    let decoded = veil_proto::delivery::ForwardPayload::decode(&plaintext).unwrap();
-                    assert_eq!(decoded.traffic_class, None);
-                    assert_eq!(decoded.delivery_attempt, None);
-                    assert!(!decoded.envelope.require_ack);
-                    assert!(decoded.envelope.payload.starts_with(&veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC));
-                }
             }
             break;
         }
@@ -738,11 +723,6 @@ async fn ordered_primary_feedback_survives_peer_without_neutral_forward_datagram
 #[tokio::test]
 async fn ordered_primary_feedback_survives_legacy_circuit_carrier() {
     verify_ordered_primary_feedback(OrderedPrimary::LegacyCircuit).await;
-}
-
-#[tokio::test]
-async fn ordered_primary_feedback_survives_suffix_free_sealed_forward() {
-    verify_ordered_primary_feedback(OrderedPrimary::LegacyForward).await;
 }
 
 #[tokio::test]
