@@ -274,6 +274,13 @@ static void wait_playout(VeilGroupMediaEngine* e, uint64_t reports, uint64_t del
   if (reports) assert(group_stat(e, "audio_playout_ms") == delay);
 }
 int main(int argc, char** argv) {
+  const bool adaptive_audio = argc == 2 &&
+      std::strcmp(argv[1], "--adaptive-audio") == 0;
+  if (argc != 1 && !adaptive_audio &&
+      !(argc == 2 && std::strcmp(argv[1], "--audio-bandwidth") == 0)) {
+    std::fputs("unknown or multiple call plane smoke arguments\n", stderr);
+    return 2;
+  }
   const int allocation_result = veil_media_test_audio_bandwidth();
   if (allocation_result != 0) {
     std::fprintf(stderr, "Opus allocation failed: %d\n", allocation_result);
@@ -298,6 +305,11 @@ int main(int argc, char** argv) {
         veil_media_engine_create(chan + 100, local, peer), veil_media_engine_destroy);
     assert(e);
     assert(veil_media_engine_set_independent_transport_feedback(e.get(), enabled) == VEIL_MEDIA_OK);
+    if (adaptive_audio) {
+      assert(veil_media_engine_set_audio_packet_overhead(e.get(), 209) ==
+             (enabled ? VEIL_MEDIA_OK : VEIL_MEDIA_ERR_STATE));
+      assert(stat(e.get(), "audio_packet_adaptation") == unsigned(enabled));
+    }
     assert(veil_media_engine_set_mic_muted(e.get(), 1) == VEIL_MEDIA_OK);
     assert(veil_media_engine_start_audio(e.get(), 0, 1) == VEIL_MEDIA_OK);
     assert(veil_media_engine_set_video_send_paused(e.get(), 1) == VEIL_MEDIA_OK);
@@ -526,6 +538,10 @@ int main(int argc, char** argv) {
     std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(
         veil_media_engine_create(chan, local, peer), veil_media_engine_destroy);
     assert(e);
+    if (adaptive_audio) {
+      assert(veil_media_engine_set_independent_transport_feedback(e.get(), 1) == VEIL_MEDIA_OK);
+      assert(veil_media_engine_set_audio_packet_overhead(e.get(), 209) == VEIL_MEDIA_OK);
+    }
     assert(veil_media_engine_set_mic_muted(e.get(), 1) == VEIL_MEDIA_OK);
     assert(veil_media_engine_start_audio(e.get(), 1, 1) == VEIL_MEDIA_OK);
     assert(stat(e.get(), "audio_feedback_reports") == 0);
