@@ -653,13 +653,73 @@ fn decode_realtime_lane_frame(frame: &[u8]) -> Option<(FrameHeader, &[u8], Realt
     Some((header, body, kind))
 }
 
-/// Source-only classification also covers the old ordered circuit discriminant.
+/// Origin-only compatibility media with no datagram suffix. Its loss tolerance
+/// comes from the trusted local producer slot; transit INTERACTIVE/return
+/// carriers never use this classifier. Keep the old wire bytes unchanged.
+fn local_legacy_media_forward(priority: u8, frame: &[u8]) -> bool {
+    use veil_proto::delivery::{
+        DELIVERY_FLAG_REQUIRE_ACK, FORWARD_REALTIME_MAX_PAYLOAD, FORWARD_REALTIME_TTL_SECS,
+        OFFSET_PAYLOAD, OFFSET_PAYLOAD_LEN, OFFSET_TTL_SECS,
+    };
+    use veil_proto::header::HEADER_SIZE;
+    if !matches!(
+        priority,
+        veil_proto::priority::REALTIME
+            | veil_proto::priority::BULK
+            | veil_proto::priority::BACKGROUND
+    ) || frame.len() < HEADER_SIZE
+        || frame.len() > crate::realtime_datagram::MAX_REALTIME_FRAME
+    {
+        return false;
+    }
+    let Ok(header) = decode_header_with_limit(&frame[..HEADER_SIZE], u32::MAX) else {
+        return false;
+    };
+    if header.header_len as usize != HEADER_SIZE
+        || header.family != FrameFamily::Delivery as u8
+        || header.msg_type != DeliveryMsg::Forward as u16
+        || HEADER_SIZE.checked_add(header.body_len as usize) != Some(frame.len())
+    {
+        return false;
+    }
+    let body = &frame[HEADER_SIZE..];
+    let read_envelope_u32 = |offset: usize| {
+        body.get(32 + offset..32 + offset + 4)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map(u32::from_be_bytes)
+    };
+    let Some(ttl) = read_envelope_u32(OFFSET_TTL_SECS) else {
+        return false;
+    };
+    let Some(payload_len) = read_envelope_u32(OFFSET_PAYLOAD_LEN) else {
+        return false;
+    };
+    let payload_len = payload_len as usize;
+    // Fixed symmetric seal: magic, epoch, sequence, authentication tag.
+    if ttl & DELIVERY_FLAG_REQUIRE_ACK != 0
+        || ttl == 0
+        || ttl > FORWARD_REALTIME_TTL_SECS
+        || !(36..=FORWARD_REALTIME_MAX_PAYLOAD).contains(&payload_len)
+    {
+        return false;
+    }
+    let start = 32 + OFFSET_PAYLOAD;
+    let Some(end) = start.checked_add(payload_len) else {
+        return false;
+    };
+    // Exact legacy body: no attempt/class extension, no concatenated frame.
+    body.len() == end + 9
+        && body[end + 8] < veil_proto::budget::MAX_RELAY_HOPS
+        && body[start..end].starts_with(&veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC)
+}
+
+/// Source-only classification also covers legacy Forward and circuit forms.
 /// Remote forwarding is excluded by its trusted local slot and return carrier.
 fn local_primary_stream_frame(priority: u8, frame: &[u8]) -> bool {
     if priority != veil_proto::priority::REALTIME {
         return false;
     }
-    if decode_realtime_lane_frame(frame).is_some() {
+    if decode_realtime_lane_frame(frame).is_some() || local_legacy_media_forward(priority, frame) {
         return true;
     }
     let Some(header) = frame
@@ -724,7 +784,9 @@ fn enqueue_outbox_envelope(
     envelope: crate::frame_outbox::FrameEnvelope,
     source_activity: Option<&crate::local_source_activity::LocalSourceActivity>,
 ) -> bool {
-    let lossy = decode_realtime_lane_frame(&envelope.frame.1).is_some();
+    let lossy = decode_realtime_lane_frame(&envelope.frame.1).is_some()
+        || (envelope.carrier.is_none()
+            && local_legacy_media_forward(envelope.frame.0, &envelope.frame.1));
     // CircuitDatagram is downgraded before enqueueing for some legacy hops.
     // Its source-only local slot still identifies the low-latency producer;
     // forwarded CircuitData always arrives in the neutral INTERACTIVE slot.
@@ -1461,7 +1523,9 @@ impl From<veil_bufpool::PooledShared> for WireBlob {
 }
 
 fn local_control_write(priority: u8, frame: &[u8]) -> bool {
-    priority == veil_proto::priority::REALTIME && decode_realtime_lane_frame(frame).is_none()
+    priority == veil_proto::priority::REALTIME
+        && decode_realtime_lane_frame(frame).is_none()
+        && !local_legacy_media_forward(priority, frame)
 }
 
 /// writer task — owns the `WriteHalf<BoxIoStream>` and
@@ -5180,7 +5244,8 @@ impl SessionRunner {
                         // trusted INTERACTIVE slot and cannot enter this gate.
                         if !owned_reliable
                             && matches!(priority, veil_proto::priority::BULK | veil_proto::priority::BACKGROUND)
-                            && decode_realtime_lane_frame(frame).is_some()
+                            && (decode_realtime_lane_frame(frame).is_some()
+                                || local_legacy_media_forward(priority, frame))
                             && let Some(outbox) = outbox.as_ref()
                             && let Err(retry) = outbox.source_activity().admit_lossy_secondary(now)
                         {
@@ -6899,6 +6964,107 @@ mod realtime_lane_frame_tests {
             relay_hops: 0,
             delivery_attempt: None,
             traffic_class: Some(veil_proto::priority::REALTIME),
+        }
+    }
+
+    #[test]
+    fn suffix_free_local_media_expires_without_classifying_transit_or_reliable_data() {
+        use veil_proto::priority::{BACKGROUND, BULK, INTERACTIVE, REALTIME};
+        let mut forward = relay_forward();
+        forward.traffic_class = None;
+        forward.envelope.payload = vec![0x71; 256];
+        forward.envelope.payload[..4].copy_from_slice(&veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC);
+        let bytes = frame(
+            FrameFamily::Delivery,
+            DeliveryMsg::Forward as u16,
+            &forward.encode(),
+        );
+        assert!(
+            decode_realtime_lane_frame(&bytes).is_none(),
+            "legacy wire must remain non-datagram"
+        );
+        assert!(local_primary_stream_frame(REALTIME, &bytes));
+        assert!(!local_control_write(REALTIME, &bytes));
+        for priority in [REALTIME, BULK, BACKGROUND, INTERACTIVE] {
+            let mut registry = crate::SessionTxRegistry::new();
+            let source = registry.register([0xB1; 32]);
+            let mut pq = PriorityQueue::with_default_weights();
+            let mut envelope: crate::frame_outbox::FrameEnvelope = (
+                priority,
+                veil_bufpool::pooled_shared_from_vec(bytes.clone()),
+            )
+                .into();
+            envelope.queued_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+            let lossy = enqueue_outbox_envelope(&mut pq, envelope, Some(source.source_activity()));
+            assert_eq!(lossy, priority != INTERACTIVE);
+            assert_eq!(pq.len(), usize::from(priority == INTERACTIVE));
+            assert_eq!(
+                source.source_activity().active(std::time::Instant::now()),
+                priority == REALTIME
+            );
+        }
+        struct ReturnCarrier;
+        impl veil_anonymity::circuit_carrier::DatagramCarrier for ReturnCarrier {
+            fn try_send(
+                &self,
+                _: &[u8; 32],
+                _: &[u8],
+                _: &mut dyn FnMut(usize) -> bool,
+            ) -> veil_anonymity::circuit_carrier::CarrierSend {
+                veil_anonymity::circuit_carrier::CarrierSend::Unavailable
+            }
+        }
+        let mut envelope: crate::frame_outbox::FrameEnvelope = (
+            REALTIME,
+            veil_bufpool::pooled_shared_from_vec(bytes.clone()),
+        )
+            .into();
+        let carrier: veil_anonymity::circuit_carrier::Carrier =
+            std::sync::Weak::<ReturnCarrier>::new();
+        envelope.carrier = Some(carrier);
+        envelope.queued_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let mut pq = PriorityQueue::with_default_weights();
+        assert!(!enqueue_outbox_envelope(&mut pq, envelope, None));
+        assert_eq!(pq.len(), 1);
+
+        // A reliable ACK request, ordinary payload or malformed body must not
+        // gain local lossy semantics from a marker elsewhere in the frame.
+        forward.envelope.require_ack = true;
+        let reliable = frame(
+            FrameFamily::Delivery,
+            DeliveryMsg::Forward as u16,
+            &forward.encode(),
+        );
+        assert!(!local_legacy_media_forward(REALTIME, &reliable));
+        assert!(local_control_write(REALTIME, &reliable));
+        forward.envelope.require_ack = false;
+        forward.envelope.payload[0] ^= 1;
+        assert!(!local_legacy_media_forward(
+            REALTIME,
+            &frame(
+                FrameFamily::Delivery,
+                DeliveryMsg::Forward as u16,
+                &forward.encode()
+            )
+        ));
+        for end in 0..bytes.len() {
+            assert!(!local_legacy_media_forward(REALTIME, &bytes[..end]));
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(!local_legacy_media_forward(REALTIME, &trailing));
+        for ttl in [0, 31] {
+            forward.envelope.payload[..4]
+                .copy_from_slice(&veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC);
+            forward.envelope.ttl_secs = ttl;
+            assert!(!local_legacy_media_forward(
+                REALTIME,
+                &frame(
+                    FrameFamily::Delivery,
+                    DeliveryMsg::Forward as u16,
+                    &forward.encode()
+                )
+            ));
         }
     }
 
