@@ -10,13 +10,17 @@ pub(crate) const PRESSURE_GRACE: Duration = Duration::from_secs(2);
 pub(crate) const RELIABLE_SECONDARY_BYTES: usize = 4096;
 pub(crate) const PRESSURED_RELIABLE_BYTES: usize = 1024;
 pub(crate) const NETWORK_CONTROL_BYTES: usize = 1024;
+// One maximum-sized local datagram work item, shared by all neighbors. Small
+// control packets must not consume an entire allowance and corrupt a following
+// packetized frame. Reliable files retain their separate, smaller byte budget.
+pub(crate) const LOSSY_SECONDARY_BYTES: usize = 8192;
 const SECONDARY_PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Default)]
 struct SourceState {
     last_primary: Option<Instant>,
     pressure_until: Option<Instant>,
-    secondary_next: Option<Instant>,
+    secondary_window: Option<(Instant, usize)>,
     reliable_next: Option<Instant>,
     reliable_sequence: u64,
     reliable_waiters: VecDeque<u64>,
@@ -201,31 +205,51 @@ impl LocalSourceActivity {
         }
     }
 
-    /// One sparse probe across this endpoint, including different neighbors.
+    /// A bounded byte allowance across this endpoint, including all neighbors.
     /// Callers must exclude primary, control and neutral transit beforehand.
-    pub(crate) fn allow_secondary(&self, now: Instant) -> bool {
-        self.admit_lossy_secondary(now).is_ok()
+    pub(crate) fn allow_secondary(&self, bytes: usize, now: Instant) -> bool {
+        self.admit_lossy_secondary(bytes, now).is_ok()
     }
 
     /// Ordered compatibility needs the wake deadline while retaining its
-    /// plaintext frame. The sparse probe is shared with DATAGRAM senders.
-    pub(crate) fn admit_lossy_secondary(&self, now: Instant) -> Result<(), Instant> {
+    /// plaintext frame. Its byte allowance is shared with DATAGRAM senders.
+    pub(crate) fn admit_lossy_secondary(&self, bytes: usize, now: Instant) -> Result<(), Instant> {
         let mut state = lock!(self.0);
         let active = state
             .last_primary
             .is_some_and(|at| now.saturating_duration_since(at) < IDLE_GRACE);
         let pressured = state.pressure_until.is_some_and(|until| now < until);
         if !active || !pressured {
-            state.secondary_next = None;
+            state.secondary_window = None;
             return Ok(());
         }
-        if let Some(next) = state.secondary_next.filter(|next| now < *next) {
-            return Err(next
-                .min(state.last_primary.unwrap() + IDLE_GRACE)
-                .min(state.pressure_until.unwrap()));
+        let bytes = bytes.max(1);
+        let (deadline, used) = state
+            .secondary_window
+            .get_or_insert((now + SECONDARY_PROBE_INTERVAL, 0));
+        if now >= *deadline {
+            *deadline = now + SECONDARY_PROBE_INTERVAL;
+            *used = 0;
         }
-        state.secondary_next = Some(now + SECONDARY_PROBE_INTERVAL);
-        Ok(())
+        if *used == 0
+            || used
+                .checked_add(bytes)
+                .is_some_and(|n| n <= LOSSY_SECONDARY_BYTES)
+        {
+            // Admit an oversized compatibility item alone and charge its
+            // size across future windows. Fresh pressure never refunds debt.
+            if bytes > LOSSY_SECONDARY_BYTES {
+                let windows =
+                    u32::try_from(bytes.div_ceil(LOSSY_SECONDARY_BYTES)).unwrap_or(u32::MAX);
+                *deadline = now + SECONDARY_PROBE_INTERVAL * windows;
+            }
+            *used = used.saturating_add(bytes);
+            Ok(())
+        } else {
+            Err((*deadline)
+                .min(state.last_primary.unwrap() + IDLE_GRACE)
+                .min(state.pressure_until.unwrap()))
+        }
     }
 }
 
@@ -233,6 +257,72 @@ impl LocalSourceActivity {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn short_control_and_packetized_frame_fit_one_pressure_allowance() {
+        let activity = LocalSourceActivity::default();
+        let now = Instant::now();
+        activity.note(now);
+        activity.note_pressure(now);
+        // Representative encrypted work items from the physical camera call:
+        // a short RTCP item followed by four MTU-sized RTP items. Packet count
+        // throttling would admit only the first item, leaving this frame incomplete.
+        assert!(activity.allow_secondary(96, now));
+        for _ in 0..4 {
+            assert!(activity.allow_secondary(1200, now + Duration::from_millis(1)));
+        }
+        let remaining = LOSSY_SECONDARY_BYTES - 96 - 4 * 1200;
+        assert!(activity.allow_secondary(remaining, now));
+        assert!(!activity.allow_secondary(1, now));
+        // Reporting poor audio again cannot replenish the shared allowance.
+        activity.note_pressure(now + Duration::from_millis(100));
+        assert!(!activity.allow_secondary(1, now + Duration::from_millis(100)));
+        assert!(activity.allow_secondary(1200, now + SECONDARY_PROBE_INTERVAL));
+    }
+
+    #[test]
+    fn pressured_packet_bursts_share_a_byte_ceiling_across_neighbors() {
+        let activity = Arc::new(LocalSourceActivity::default());
+        let now = Instant::now();
+        activity.note(now);
+        activity.note_pressure(now);
+        let barrier = Arc::new(Barrier::new(16));
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let activity = Arc::clone(&activity);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    usize::from(activity.allow_secondary(1024, now))
+                })
+            })
+            .collect();
+        let admitted = threads
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .sum::<usize>();
+        assert_eq!(admitted * 1024, LOSSY_SECONDARY_BYTES);
+        assert!(!activity.allow_secondary(1024, now));
+    }
+
+    #[test]
+    fn oversized_lossy_work_is_charged_without_overflow_or_pressure_refund() {
+        let activity = LocalSourceActivity::default();
+        let now = Instant::now();
+        activity.note(now);
+        activity.note_pressure(now);
+        assert!(activity.allow_secondary(LOSSY_SECONDARY_BYTES + 1, now));
+        let one_window = now + SECONDARY_PROBE_INTERVAL;
+        activity.note_pressure(one_window);
+        assert_eq!(
+            activity.admit_lossy_secondary(1, one_window),
+            Err(now + SECONDARY_PROBE_INTERVAL * 2)
+        );
+        assert!(activity.allow_secondary(usize::MAX, now + SECONDARY_PROBE_INTERVAL * 2));
+        assert!(!activity.allow_secondary(1, now + SECONDARY_PROBE_INTERVAL * 2));
+        // Without active primary traffic no producer retains the pressure cap.
+        assert!(activity.allow_secondary(1, now + IDLE_GRACE));
+    }
 
     #[test]
     fn healthy_primary_already_bounds_file_bursts_but_not_recovery_rpcs() {
@@ -437,15 +527,15 @@ mod tests {
     }
 
     #[test]
-    fn simultaneous_neighbors_share_one_probe_and_grace_expires() {
+    fn simultaneous_neighbors_share_one_full_allowance_and_grace_expires() {
         let activity = Arc::new(LocalSourceActivity::default());
         let now = Instant::now();
         activity.note_pressure(now);
         assert!(
-            activity.allow_secondary(now),
+            activity.allow_secondary(LOSSY_SECONDARY_BYTES, now),
             "pressure without a local producer cannot change scheduling"
         );
-        assert!(activity.allow_secondary(now));
+        assert!(activity.allow_secondary(LOSSY_SECONDARY_BYTES, now));
         activity.note(now);
         let barrier = Arc::new(Barrier::new(16));
         let threads: Vec<_> = (0..16)
@@ -454,7 +544,7 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    usize::from(activity.allow_secondary(now))
+                    usize::from(activity.allow_secondary(LOSSY_SECONDARY_BYTES, now))
                 })
             })
             .collect();
@@ -465,10 +555,10 @@ mod tests {
                 .sum::<usize>(),
             1
         );
-        assert!(activity.allow_secondary(now + SECONDARY_PROBE_INTERVAL));
-        assert!(!activity.allow_secondary(now + SECONDARY_PROBE_INTERVAL));
-        assert!(activity.allow_secondary(now + PRESSURE_GRACE));
-        assert!(activity.allow_secondary(now + PRESSURE_GRACE));
+        assert!(activity.allow_secondary(LOSSY_SECONDARY_BYTES, now + SECONDARY_PROBE_INTERVAL));
+        assert!(!activity.allow_secondary(LOSSY_SECONDARY_BYTES, now + SECONDARY_PROBE_INTERVAL));
+        assert!(activity.allow_secondary(LOSSY_SECONDARY_BYTES, now + PRESSURE_GRACE));
+        assert!(activity.allow_secondary(LOSSY_SECONDARY_BYTES, now + PRESSURE_GRACE));
     }
 
     #[test]
@@ -633,13 +723,13 @@ mod tests {
         activity.note_pressure(old);
         assert!(activity.active(old + IDLE_GRACE));
         let later = old + PRESSURE_GRACE;
-        assert!(activity.allow_secondary(later));
-        assert!(!activity.allow_secondary(later));
+        assert!(activity.allow_secondary(LOSSY_SECONDARY_BYTES, later));
+        assert!(!activity.allow_secondary(LOSSY_SECONDARY_BYTES, later));
         // Even recently noted pressure cannot hold secondary traffic once the
         // actual primary has gone idle.
         activity.note_pressure(current + IDLE_GRACE);
         assert!(!activity.active(current + IDLE_GRACE));
-        assert!(activity.allow_secondary(current + IDLE_GRACE));
-        assert!(activity.allow_secondary(current + IDLE_GRACE));
+        assert!(activity.allow_secondary(LOSSY_SECONDARY_BYTES, current + IDLE_GRACE));
+        assert!(activity.allow_secondary(LOSSY_SECONDARY_BYTES, current + IDLE_GRACE));
     }
 }

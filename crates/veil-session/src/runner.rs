@@ -407,16 +407,16 @@ impl RealtimeDatagramLane {
         *last = Some(now);
     }
 
-    fn allow_secondary(&mut self, priority: u8, now: std::time::Instant) -> bool {
+    fn allow_secondary(&mut self, priority: u8, bytes: usize, now: std::time::Instant) -> bool {
         if let Some(feedback) = self.local_reliable.as_mut() {
-            return feedback.allow_secondary(priority, now);
+            return feedback.allow_secondary(priority, bytes, now);
         }
         !matches!(
             priority,
             veil_proto::priority::BULK
                 | veil_proto::priority::BACKGROUND
                 | veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
-        ) || self.source_activity.allow_secondary(now)
+        ) || self.source_activity.allow_secondary(bytes, now)
     }
 
     fn select_sender(
@@ -4745,7 +4745,11 @@ impl SessionRunner {
                                 CarrierSend::Unavailable => {}
                             }
                         }
-                        if !lane.allow_secondary(outgoing_priority, std::time::Instant::now()) {
+                        if !lane.allow_secondary(
+                            outgoing_priority,
+                            encrypted_wire_len(outgoing.len()).unwrap_or(usize::MAX),
+                            std::time::Instant::now(),
+                        ) {
                             // Source feedback only; neutral ChildCarrier traffic
                             // above and forwarded INTERACTIVE cells bypass this.
                             lane.trace_source_pressure(
@@ -5193,7 +5197,7 @@ impl SessionRunner {
                             && matches!(priority, veil_proto::priority::BULK | veil_proto::priority::BACKGROUND)
                             && decode_realtime_lane_frame(frame).is_some()
                             && let Some(outbox) = outbox.as_ref()
-                            && let Err(retry) = outbox.source_activity().admit_lossy_secondary(now)
+                            && let Err(retry) = outbox.source_activity().admit_lossy_secondary(encrypted_wire_len(frame.len()).unwrap_or(usize::MAX), now)
                         {
                             source_pressure_retry = Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
                             return HeadAdmission::DeferSource;

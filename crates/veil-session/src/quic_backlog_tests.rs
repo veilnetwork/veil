@@ -1521,7 +1521,11 @@ async fn measure_bound_independent_load(
         }
         // Interleaved neutral traffic cannot select or reset the local gate.
         for priority in [veil_proto::priority::INTERACTIVE, REALTIME] {
-            assert!(admission.allow_secondary(priority, std::time::Instant::now()));
+            assert!(admission.allow_secondary(
+                priority,
+                crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+                std::time::Instant::now()
+            ));
         }
         if loaded && tick >= 200 && tick % 2 == 0 {
             let frame = circuit_frame(2, 0x22);
@@ -1529,13 +1533,15 @@ async fn measure_bound_independent_load(
                 .tx_cipher
                 .encode_frame(u64::from(BULK), &frame, secondary.tx.max_size().unwrap())
                 .unwrap();
-            if admission.allow_secondary(BULK, std::time::Instant::now())
-                && super::local_datagram_fits(
-                    BULK,
-                    packets.iter().map(Vec::len).sum(),
-                    secondary.tx.send_buffer_space(),
-                )
-            {
+            if admission.allow_secondary(
+                BULK,
+                crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+                std::time::Instant::now(),
+            ) && super::local_datagram_fits(
+                BULK,
+                packets.iter().map(Vec::len).sum(),
+                secondary.tx.send_buffer_space(),
+            ) {
                 for packet in packets {
                     secondary.tx.send(&packet).unwrap();
                 }
@@ -1551,13 +1557,15 @@ async fn measure_bound_independent_load(
                 .tx_cipher
                 .encode_frame(u64::from(priority), &frame, screen.tx.max_size().unwrap())
                 .unwrap();
-            if admission.allow_secondary(priority, std::time::Instant::now())
-                && super::local_datagram_fits(
-                    priority,
-                    packets.iter().map(Vec::len).sum(),
-                    screen.tx.send_buffer_space(),
-                )
-            {
+            if admission.allow_secondary(
+                priority,
+                crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+                std::time::Instant::now(),
+            ) && super::local_datagram_fits(
+                priority,
+                packets.iter().map(Vec::len).sum(),
+                screen.tx.send_buffer_space(),
+            ) {
                 for packet in packets {
                     screen.tx.send(&packet).unwrap();
                 }
@@ -1763,11 +1771,20 @@ async fn primary_ack_blackout_limits_secondary_before_rtt_or_expiry_changes() {
     assert!(stalled.in_flight_bytes > 0 && link.dropped.load(Ordering::Relaxed) > 0);
     let now = std::time::Instant::now();
     admission.observe_primary_path(&handle, now);
-    let probe_allowed = admission.allow_secondary(BULK, now);
-    let burst_allowed = admission.allow_secondary(BULK, now + Duration::from_millis(1));
+    let probe_allowed = admission.allow_secondary(
+        BULK,
+        crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+        now,
+    );
+    let burst_allowed = admission.allow_secondary(
+        BULK,
+        crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+        now + Duration::from_millis(1),
+    );
     assert!(
         !admission.allow_secondary(
             veil_proto::priority::BACKGROUND,
+            crate::local_source_activity::LOSSY_SECONDARY_BYTES,
             now + Duration::from_millis(1)
         ),
         "screen must not bypass the local audio pressure budget"
@@ -1775,6 +1792,7 @@ async fn primary_ack_blackout_limits_secondary_before_rtt_or_expiry_changes() {
     assert!(
         !admission.allow_secondary(
             veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
+            crate::local_source_activity::LOSSY_SECONDARY_BYTES,
             now + Duration::from_millis(1)
         ),
         "recoverable DATA must not bypass the local audio pressure budget"
@@ -1790,7 +1808,11 @@ async fn primary_ack_blackout_limits_secondary_before_rtt_or_expiry_changes() {
     .await
     .is_ok_and(|result| result.is_ok());
     for priority in [REALTIME, INTERACTIVE] {
-        assert!(admission.allow_secondary(priority, now));
+        assert!(admission.allow_secondary(
+            priority,
+            crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+            now
+        ));
     }
     link.blackout.store(false, Ordering::Relaxed);
     handle.send(&[0x22; 200]).unwrap();
@@ -1807,7 +1829,11 @@ async fn primary_ack_blackout_limits_secondary_before_rtt_or_expiry_changes() {
     .unwrap();
     // ACK progress and the bounded grace permit full production again.
     admission.observe_primary_path(&handle, now + Duration::from_secs(2));
-    let recovered = admission.allow_secondary(BULK, now + Duration::from_secs(2));
+    let recovered = admission.allow_secondary(
+        BULK,
+        crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+        now + Duration::from_secs(2),
+    );
     close.close(0u32.into(), b"ack blackout gate complete");
     assert!(
         probe_allowed,
@@ -1906,8 +1932,16 @@ async fn independent_primary_expiry_keeps_parent_control_admission() {
     let now = std::time::Instant::now();
     admission.observe_primary_path(&primary.tx, now);
     admission.observe(REALTIME, &frame, now, true);
-    let probe = admission.allow_secondary(BULK, now);
-    let burst = admission.allow_secondary(BULK, now + Duration::from_millis(1));
+    let probe = admission.allow_secondary(
+        BULK,
+        crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+        now,
+    );
+    let burst = admission.allow_secondary(
+        BULK,
+        crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+        now + Duration::from_millis(1),
+    );
     // The production writer must hold its control lease across partial writes
     // and a simultaneous primary-pressure update in the runner.
     let (partial_tx, partial_rx) = tokio::sync::oneshot::channel();
@@ -2176,7 +2210,11 @@ async fn primary_blackout_limits_local_data_on_a_different_neighbor() {
     admission.observe(REALTIME, &frame, now, true);
     // One endpoint-wide sparse probe remains possible, on an otherwise healthy
     // connection. Neither TLS exporter nor RTT is shared between these paths.
-    assert!(bulk.allow_secondary(LOCAL_RECOVERABLE_DATA_LANE, now));
+    assert!(bulk.allow_secondary(
+        LOCAL_RECOVERABLE_DATA_LANE,
+        crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+        now
+    ));
     bulk_tx.send(&[0x33; 200]).unwrap();
     assert_eq!(
         timeout(Duration::from_secs(1), bulk_rx.recv())
@@ -2188,33 +2226,58 @@ async fn primary_blackout_limits_local_data_on_a_different_neighbor() {
     let later = now + Duration::from_millis(1);
     for priority in [BULK, BACKGROUND, LOCAL_RECOVERABLE_DATA_LANE] {
         assert!(
-            !bulk.allow_secondary(priority, later),
+            !bulk.allow_secondary(
+                priority,
+                crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+                later
+            ),
             "local secondary burst bypassed primary feedback on another neighbor"
         );
         assert!(
-            !admission.allow_secondary(priority, later),
+            !admission.allow_secondary(
+                priority,
+                crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+                later
+            ),
             "probes must share the endpoint budget"
         );
         assert!(
-            another_node.allow_secondary(priority, later),
+            another_node.allow_secondary(
+                priority,
+                crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+                later
+            ),
             "another node must not inherit source priority"
         );
     }
     for priority in [REALTIME, INTERACTIVE] {
         assert!(
-            bulk.allow_secondary(priority, later),
+            bulk.allow_secondary(
+                priority,
+                crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+                later
+            ),
             "primary/control/transit must keep normal admission"
         );
     }
     // A publishing runner's teardown must not reset the other neighbors' grace.
     drop(admission);
-    assert!(!bulk.allow_secondary(LOCAL_RECOVERABLE_DATA_LANE, later));
+    assert!(!bulk.allow_secondary(
+        LOCAL_RECOVERABLE_DATA_LANE,
+        crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+        later
+    ));
     assert!(bulk.allow_secondary(
         LOCAL_RECOVERABLE_DATA_LANE,
+        crate::local_source_activity::LOSSY_SECONDARY_BYTES,
         now + Duration::from_millis(200)
     ));
     assert!(
-        bulk.allow_secondary(LOCAL_RECOVERABLE_DATA_LANE, now + Duration::from_secs(2)),
+        bulk.allow_secondary(
+            LOCAL_RECOVERABLE_DATA_LANE,
+            crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+            now + Duration::from_secs(2)
+        ),
         "bounded pressure grace must expire"
     );
     primary_link.blackout.store(false, Ordering::Relaxed);
