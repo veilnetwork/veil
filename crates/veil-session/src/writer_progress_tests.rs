@@ -29,11 +29,22 @@ async fn partial_progress_preserves_blob_beyond_one_idle_timeout() {
 #[tokio::test]
 async fn blocked_partial_write_still_expires_without_progress() {
     let (mut writer, _reader) = tokio::io::duplex(1);
-    assert!(
-        write_with_progress_timeout(&mut writer, b"ab", Duration::from_millis(50))
-            .await
-            .is_err()
-    );
+    let timeout = write_with_progress_timeout(&mut writer, b"ab", Duration::from_millis(50))
+        .await
+        .expect_err("the undrained peer must exhaust the write window");
+    assert_eq!(timeout.phase, "write");
+    assert_eq!(timeout.written, 1);
+}
+
+#[tokio::test]
+async fn blocked_buffer_flush_reports_accepted_bytes_without_claiming_delivery() {
+    let (stream, _peer) = tokio::io::duplex(1);
+    let mut writer = tokio::io::BufWriter::with_capacity(1024, stream);
+    let timeout = write_with_progress_timeout(&mut writer, b"buffered", Duration::from_millis(50))
+        .await
+        .expect_err("flush cannot finish while the peer stops draining");
+    assert_eq!(timeout.phase, "flush");
+    assert_eq!(timeout.written, b"buffered".len());
 }
 
 #[tokio::test]
