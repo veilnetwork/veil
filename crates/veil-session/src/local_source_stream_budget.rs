@@ -16,7 +16,8 @@ pub(super) fn fits(
         return true;
     }
     // Only local bulk/background waits for the previous blob to drain.
-    // A primary/control frame is never held by this endpoint budget.
+    // Primary write-ahead is checked separately by the caller. This byte
+    // budget does not add a pending-blob restriction to primary/control.
     if local_priority >= BULK && pending_blobs != 0 {
         return false;
     }
