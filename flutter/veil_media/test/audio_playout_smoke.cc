@@ -34,6 +34,8 @@ static bool handover_network = false;
 static bool delivery_stall = false;
 static bool recurring_jitter = false;
 static bool mature_jitter = false;
+static bool padding_only = false;
+static bool foreign_audio_only = false;
 static Clock::time_point mature_last_due;
 static bool drop_during_stall = false;
 static size_t dropped_packets = 0;
@@ -81,7 +83,16 @@ extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t 
     due = release_at ? origin + std::chrono::milliseconds(release_at)
                      : now + std::chrono::milliseconds(40);
   }
-  pending.push_back({due, {p, p + len}});
+  std::vector<uint8_t> packet(p, p + len);
+  if (padding_only) {
+    // Valid RTP padding for the same audio SSRC, with no encoded audio.
+    packet.resize(13);
+    packet[0] = 0xa0;  // V=2, padding, no CSRCs or extensions.
+    packet[12] = 1;
+  } else if (foreign_audio_only) {
+    packet[8] ^= 0x80;  // Encoded audio for an unregistered SSRC.
+  }
+  pending.push_back({due, std::move(packet)});
   return 0;
 }
 extern "C" int veil_media_send_video_control_datagram(uint64_t,
@@ -357,6 +368,52 @@ static void verify_silence(bool after_jitter = false) {
   assert(metric(receiver.get(), "audio_interruption_count") == before_interruptions);
 }
 
+static void verify_padding_liveness() {
+  perfect_network = true;
+  const uint8_t local[32] = {1}, peer[32] = {2};
+  source_channel = 200; receiver_channel = 300;
+  using Engine = std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)>;
+  Engine receiver(veil_media_test_audio_playout_create(300, peer, local, 0, 0), veil_media_engine_destroy);
+  Engine source(veil_media_test_audio_playout_create(200, local, peer, 1, 0), veil_media_engine_destroy);
+  assert(source && receiver);
+  origin = Clock::now();
+  std::array<int16_t, 480> pcm{};
+  uint64_t before_padding = 0, after_padding = 0, padding_age = 0;
+  uint64_t initial_age = 0, foreign_age = 0;
+  for (int tick = 0; tick < 500; ++tick) {
+    std::this_thread::sleep_until(origin + std::chrono::milliseconds(10 * tick));
+    {
+      std::lock_guard lock(mu);
+      padding_only = tick < 80 || (tick >= 200 && tick < 350);
+      foreign_audio_only = tick >= 350 && tick < 400;
+    }
+    assert(veil_media_test_audio_capture_tone(source.get(), 1200) == 0);
+    deliver();
+    assert(veil_media_test_audio_playout_pcm(receiver.get(), pcm.data(), pcm.size()) == 480);
+    if (tick == 79) initial_age = metric(receiver.get(), "audio_rx_native_age_ms");
+    if (tick == 199) before_padding = metric(receiver.get(), "audio_rx_pkts");
+    if (tick == 349) {
+      after_padding = metric(receiver.get(), "audio_rx_pkts");
+      padding_age = metric(receiver.get(), "audio_rx_native_age_ms");
+    }
+    if (tick == 399) foreign_age = metric(receiver.get(), "audio_rx_native_age_ms");
+  }
+  const auto recovered_age = metric(receiver.get(), "audio_rx_native_age_ms");
+  std::printf("{\"padding_packets_received\":%llu,\"payload_age_after_padding_ms\":%llu,"
+              "\"payload_age_after_recovery_ms\":%llu}\n",
+      static_cast<unsigned long long>(after_padding - before_padding),
+      static_cast<unsigned long long>(padding_age),
+      static_cast<unsigned long long>(recovered_age));
+  std::fflush(stdout);
+  assert(before_padding > 20 && after_padding > before_padding + 50);
+  assert(initial_age == static_cast<uint64_t>(-1));
+  // Padding may advance RTP/RTCP statistics, never audio liveness or the
+  // evidence that allows video to compete with an interrupted audio source.
+  assert(padding_age >= 1400);
+  assert(foreign_age >= 1900);
+  assert(recovered_age < 100);
+}
+
 static void verify_delivery_stall(bool drop) {
   delivery_stall = true;
   drop_during_stall = drop;
@@ -439,6 +496,10 @@ static void verify_delivery_stall(bool drop) {
 int main(int argc, char** argv) {
   recurring_jitter = argc == 2 && std::strcmp(argv[1], "--recurring-jitter") == 0;
   mature_jitter = argc == 2 && std::strcmp(argv[1], "--mature-jitter") == 0;
+  if (argc == 2 && std::strcmp(argv[1], "--padding-liveness") == 0) {
+    verify_padding_liveness();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sender-restart") == 0) {
     verify_sender_restart();
     return 0;

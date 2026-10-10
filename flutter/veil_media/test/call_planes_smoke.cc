@@ -398,8 +398,14 @@ int main() {
     wait_playout(receiver.get(), 1, measured_delay);
     assert(group_stat(receiver.get(), "audio_playout_peers") == 1);
     inject_non_audio(22, group_ssrc(peer), group_ssrc(peer, 0x47564944u));
+    std::array<uint8_t, 13> padding{0xa0, 111, 0, 4, 0, 0, 15, 0};
+    const uint32_t padding_ssrc = group_ssrc(peer);
+    for (int i = 0; i < 4; ++i) padding[8+i] = padding_ssrc >> (24-i*8);
+    padding[12] = 1;
+    inject_raw(22, std::vector<uint8_t>(padding.begin(), padding.end()));
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    assert(group_audio_packets(e.get(), peer) == 4);
+    assert(group_audio_packets(e.get(), peer) == 5);
+    assert(group_audio_age(e.get(), peer) >= 1000);
     assert(veil_media_test_group_blocked_audio_stats(
         e.get(), check_group_blocked_audio_stats, e.get()) == 0);
     assert(veil_media_test_group_emit_rtcp(e.get()) == 0);
@@ -411,7 +417,7 @@ int main() {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     assert(group_stat(receiver.get(), "audio_playout_reports") == 0);
     assert(group_stat(receiver.get(), "audio_playout_peers") == 1);
-    assert(group_audio_packets(e.get(), peer) == 4);
+    assert(group_audio_packets(e.get(), peer) == 5);
     assert(veil_media_group_engine_remove_peer(e.get(), peer) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_add_peer(e.get(), 23, peer) == VEIL_MEDIA_OK);
     assert(group_audio_packets(e.get(), peer) == 0);
