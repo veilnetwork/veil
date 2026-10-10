@@ -1499,7 +1499,8 @@ async fn writer_task<B: Into<WireBlob>>(
         };
         let bytes = blob.bytes;
         let wire_len = bytes.len();
-        let trace_started = crate::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
+        let write_started = std::time::Instant::now();
+        let tracing = crate::rt_trace::rt_trace_enabled();
         let queued_behind = wire_rx.len();
         let pressure_before = source.as_ref().map_or(0, |s| s.observations());
         match write_with_source_feedback(
@@ -1511,8 +1512,8 @@ async fn writer_task<B: Into<WireBlob>>(
         .await
         {
             Ok(Ok(())) => {
-                if let Some(started) = trace_started {
-                    let elapsed = started.elapsed();
+                if tracing {
+                    let elapsed = write_started.elapsed();
                     if elapsed.as_millis() >= crate::rt_trace::SLOW_DISPATCH_MS {
                         logger.info(
                             "session.rt_trace.slow_wire_write",
@@ -1534,16 +1535,21 @@ async fn writer_task<B: Into<WireBlob>>(
                 );
                 break;
             }
-            Err(_) => {
+            Err(timeout) => {
                 if let Some(m) = &metrics {
                     m.inc_session_write_stalled();
                 }
                 logger.warn(
                     "session.writer.stalled",
                     format!(
-                        "peer_id={peer_id_short} partial-write idle or flush-completion budget expired after {:?} — closing writer; \
-                         main loop will see wire channel disconnect on next push",
-                        WRITE_PROGRESS_TIMEOUT,
+                        "peer_id={peer_id_short} phase={} len={wire_len} written={} remaining={} elapsed_ms={} queued_behind={queued_behind} control={} primary_source={} idle_budget_ms={} — closing writer; main loop will see wire channel disconnect on next push",
+                        timeout.phase,
+                        timeout.written,
+                        wire_len.saturating_sub(timeout.written),
+                        write_started.elapsed().as_millis(),
+                        blob.control,
+                        blob.primary_feedback.is_some(),
+                        WRITE_PROGRESS_TIMEOUT.as_millis(),
                     ),
                 );
                 break;
@@ -1556,6 +1562,14 @@ async fn writer_task<B: Into<WireBlob>>(
     let _ = write_half.shutdown().await;
 }
 
+/// Metadata for a local writer timeout. Accepted bytes are transport progress,
+/// not peer delivery; no payload bytes or key material are retained here.
+#[derive(Debug)]
+struct WriteProgressTimeout {
+    phase: &'static str,
+    written: usize,
+}
+
 /// Preserve the complete ordered blob even when a small admission window
 /// requires many RTTs. A progressing writer must not be treated as stalled.
 #[cfg(test)]
@@ -1563,7 +1577,7 @@ async fn write_with_progress_timeout<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     bytes: &[u8],
     idle: std::time::Duration,
-) -> Result<std::io::Result<()>, tokio::time::error::Elapsed> {
+) -> Result<std::io::Result<()>, WriteProgressTimeout> {
     write_with_source_feedback(writer, bytes, idle, None).await
 }
 
@@ -1576,7 +1590,7 @@ async fn write_with_source_feedback<W: tokio::io::AsyncWrite + Unpin>(
     bytes: &[u8],
     idle: std::time::Duration,
     source: Option<&local_primary_write::PrimaryWriteState>,
-) -> Result<std::io::Result<()>, tokio::time::error::Elapsed> {
+) -> Result<std::io::Result<()>, WriteProgressTimeout> {
     let mut written = 0;
     let interval = std::time::Duration::from_millis(150);
     // Partial progress renews the idle deadline, but cannot conceal the total
@@ -1589,7 +1603,12 @@ async fn write_with_source_feedback<W: tokio::io::AsyncWrite + Unpin>(
             &mut pressure_due,
             interval,
         );
-        match tokio::time::timeout(idle, progress).await? {
+        match tokio::time::timeout(idle, progress)
+            .await
+            .map_err(|_| WriteProgressTimeout {
+                phase: "write",
+                written,
+            })? {
             Ok(0) => return Ok(Err(std::io::ErrorKind::WriteZero.into())),
             Ok(len) => written += len,
             Err(error) => return Ok(Err(error)),
@@ -1605,6 +1624,10 @@ async fn write_with_source_feedback<W: tokio::io::AsyncWrite + Unpin>(
         with_write_source_feedback(writer.flush(), source, &mut pressure_due, interval),
     )
     .await
+    .map_err(|_| WriteProgressTimeout {
+        phase: "flush",
+        written,
+    })
 }
 
 async fn with_write_source_feedback<F: std::future::Future>(
