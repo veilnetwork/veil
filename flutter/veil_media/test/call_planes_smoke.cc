@@ -26,6 +26,7 @@ extern "C" int veil_media_test_group_blocked_audio_stats(VeilGroupMediaEngine*, 
 extern "C" int veil_media_test_group_emit_rtcp(VeilGroupMediaEngine*);
 extern "C" int veil_media_test_group_fanout_packet(VeilGroupMediaEngine*, int);
 extern "C" int veil_media_test_video_bandwidth(VeilMediaEngine*);
+extern "C" int veil_media_test_audio_bandwidth();
 extern "C" int veil_media_test_direct_packet(VeilMediaEngine*, int);
 extern "C" uint64_t veil_media_test_direct_encoded_frames(VeilMediaEngine*);
 extern "C" int veil_media_test_pause_with_held_video_worker(VeilMediaEngine*, VeilGroupMediaEngine*);
@@ -272,7 +273,13 @@ static void wait_playout(VeilGroupMediaEngine* e, uint64_t reports, uint64_t del
   assert(group_stat(e, "audio_playout_reports") == reports);
   if (reports) assert(group_stat(e, "audio_playout_ms") == delay);
 }
-int main() {
+int main(int argc, char** argv) {
+  const int allocation_result = veil_media_test_audio_bandwidth();
+  if (allocation_result != 0) {
+    std::fprintf(stderr, "Opus allocation failed: %d\n", allocation_result);
+    return 1;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--audio-bandwidth") == 0) return 0;
   const int budget_result = veil_media_test_audio_probe_budget();
   if (budget_result != 0) {
     std::fprintf(stderr, "audio probe budget failed: %d\n", budget_result);

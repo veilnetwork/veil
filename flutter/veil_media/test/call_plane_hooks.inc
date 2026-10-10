@@ -265,6 +265,52 @@ extern "C" int veil_media_test_video_bandwidth(VeilMediaEngine* e) {
   return bandwidth;
 }
 
+// Exercise the real Call allocator -> ChannelSend -> Opus path, not a copy
+// of its config. Legacy peers without negotiated TWCC retain their bitrate.
+extern "C" int veil_media_test_audio_bandwidth() {
+  struct ResetFactory {
+    ResetFactory() { g_call_plane_recording_adm = true; }
+    ~ResetFactory() { g_call_plane_recording_adm = false; }
+  } reset;
+  uint8_t local[32] = {0x81}, peer[32] = {0x82};
+  for (int feedback : {0, 1}) {
+    std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(
+        veil_media_engine_create(100 + feedback, local, peer),
+        veil_media_engine_destroy);
+    if (!e || veil_media_engine_set_independent_transport_feedback(e.get(), feedback) != VEIL_MEDIA_OK ||
+        veil_media_engine_start_audio(e.get(), 1, 1) != VEIL_MEDIA_OK) return 1;
+    auto* ws = e->ws.get();
+    const auto target = [&](int transport_bps) {
+      webrtc::BitrateSettings settings;
+      settings.min_bitrate_bps = 6000;
+      settings.start_bitrate_bps = transport_bps;
+      settings.max_bitrate_bps = transport_bps;
+      if (!run_on(ws->worker_tq.get(), [&] {
+            ws->call->SetClientBitratePreferences(settings);
+          })) return int64_t(-1);
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      int64_t bitrate = -1;
+      do {
+        static_cast<StandRecordingAdm*>(ws->adm.get())->CaptureTone(440);
+        if (!run_on(ws->worker_tq.get(), [&] {
+              bitrate = ws->send_stream->GetStats().target_bitrate_bps;
+            })) return int64_t(-1);
+        if ((!feedback && bitrate > 0) ||
+            (feedback && (transport_bps == 12000 ? bitrate == 12000 : bitrate == 32000))) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      } while (std::chrono::steady_clock::now() < deadline);
+      return bitrate;
+    };
+    const auto high = target(48000);
+    const auto low = target(12000);
+    const auto restored = target(48000);
+    std::fprintf(stderr, "Opus allocation feedback=%d: %lld -> %lld -> %lld\n",
+                 feedback, (long long)high, (long long)low, (long long)restored);
+    if (high != 32000 || low != (feedback ? 12000 : 32000) || restored != 32000) return 2;
+  }
+  return 0;
+}
+
 // Exercises the production fanout independently of codec pacing. The mocked
 // Veil callback can stall video while a second thread submits audio.
 extern "C" int veil_media_test_group_fanout_packet(VeilGroupMediaEngine* e,
@@ -370,6 +416,18 @@ extern "C" VeilMediaEngine* veil_media_test_duplex_codec_create(
     return nullptr;
   }
   return e;
+}
+
+extern "C" int veil_media_test_audio_transport_budget(VeilMediaEngine* e,
+                                                      int bitrate_bps) {
+  if (!e || !e->ws || bitrate_bps < 6000) return VEIL_MEDIA_ERR_ARG;
+  webrtc::BitrateSettings settings;
+  settings.min_bitrate_bps = 6000;
+  settings.start_bitrate_bps = bitrate_bps;
+  settings.max_bitrate_bps = bitrate_bps;
+  return run_on(e->ws->worker_tq.get(), [&] {
+    e->ws->call->SetClientBitratePreferences(settings);
+  }) ? VEIL_MEDIA_OK : VEIL_MEDIA_ERR_STATE;
 }
 
 extern "C" int veil_media_test_audio_playout_pcm(

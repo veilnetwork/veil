@@ -177,6 +177,18 @@ void configure_call_audio_transport(webrtc::CallConfig& config) {
   config.bitrate_config.max_bitrate_bps = 96'000;
 }
 
+// Call's bandwidth estimate does not reach Opus unless the stream joins its
+// allocator. Use negotiated TWCC only: legacy peers cannot supply this feedback.
+// Keep the existing mono ceiling, a voice floor and the 20-ms packet duration;
+// the allocator/encoder account for RTP overhead separately from codec bitrate.
+void configure_call_audio_send(webrtc::AudioSendStream::Config& config,
+                               bool transport_feedback) {
+  if (!transport_feedback) return;
+  config.min_bitrate_bps = 12'000;
+  config.max_bitrate_bps = 32'000;
+  config.include_in_congestion_control_allocation = true;
+}
+
 // Preserve room for 600-ms Opus bursts. A smaller 12-packet capacity reduced
 // decoded PCM latency but flushed useful audio and substantially increased
 // physical call interruptions. A target-delay cap alone also failed the PCM
@@ -2704,6 +2716,7 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
                                         webrtc::kNetworkUp);
     if (send && ws->send_stream == nullptr) {
       webrtc::AudioSendStream::Config sc(ws->shim.get());  // sets send_transport
+      configure_call_audio_send(sc, ws->shim->independent_transport_feedback());
       sc.rtp.ssrc = local_ssrc;
       // TWCC: the send-side bandwidth estimator needs this both ways.
       sc.rtp.extensions.emplace_back(
@@ -3670,6 +3683,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     int audio_interruption_duration_ms = 0;
     uint64_t audio_tx_pkts = 0;
     uint64_t audio_tx_retransmitted_pkts = 0;
+    int64_t audio_encoder_target_bps = 0;
+    int audio_send_bandwidth_bps = 0;
     uint32_t audio_delay_ms = 0;
     uint32_t audio_filtered_delay_ms = 0;
     uint32_t audio_jb_ms = 0;
@@ -3716,9 +3731,11 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         const auto sent = ws->send_stream->GetStats();
         audio_tx_pkts = sent.packets_sent;
         audio_tx_retransmitted_pkts = sent.retransmitted_packets_sent;
+        audio_encoder_target_bps = sent.target_bitrate_bps;
       }
       if (ws->call) {
         const auto cs = ws->call->GetStats();
+        audio_send_bandwidth_bps = cs.send_bandwidth_bps;
         if (cs.rtt_ms >= 0) rtt_ms = cs.rtt_ms;
         pacer_delay_ms = cs.pacer_delay_ms;
       }
@@ -3821,6 +3838,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         "\"audio_tx_payload_bytes\":%llu,\"audio_tx_padding_bytes\":%llu,"
         "\"audio_tx_unclassified_pkts\":%llu,\"audio_tx_payload_age_ms\":%lld,"
         "\"audio_tx_payload_max_gap_ms\":%lld,\"audio_tx_retransmitted_pkts\":%llu,"
+        "\"audio_encoder_target_bps\":%lld,\"audio_send_bandwidth_bps\":%d,"
         "\"rtcp_tx_pkts\":%llu,\"rtcp_tx_bytes\":%llu,"
         "\"video_rtcp_tx_pkts\":%llu,\"video_rtcp_tx_bytes\":%llu,"
         "\"audio_tx_rtp_age_ms\":%lld,\"audio_tx_rtp_queue_age_ms\":%lld,"
@@ -3879,6 +3897,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<long long>(tx_audio.payload_age_ms),
         static_cast<long long>(tx_audio.max_payload_gap_ms),
         static_cast<unsigned long long>(audio_tx_retransmitted_pkts),
+        static_cast<long long>(audio_encoder_target_bps), audio_send_bandwidth_bps,
         static_cast<unsigned long long>(ws->shim->outbound_rtcp_packet_count()),
         static_cast<unsigned long long>(ws->shim->outbound_rtcp_byte_count()),
         static_cast<unsigned long long>(ws->shim->outbound_video_rtcp_packet_count()),
