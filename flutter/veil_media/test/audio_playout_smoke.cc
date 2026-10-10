@@ -35,7 +35,9 @@ static Clock::time_point origin;
 static uint64_t source_channel = 0, receiver_channel = 0;
 static size_t sent_packets = 0;
 static bool charged_link=false,charged_duplex=false;
-static int charged_phase_ticks=400;
+static int charged_phase_ticks=400,charged_queue_ms=200;
+static std::array<double,3> charged_queue_max_ms{};
+static std::array<size_t,3> control_wire_bytes_by_phase{};
 static std::map<uint64_t,Clock::time_point> wire_free;
 static size_t wire_drops=0,wire_admissions=0;
 static std::vector<std::array<long long,5>> source_packets;
@@ -77,10 +79,12 @@ extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t 
     const size_t cost=len+209;
     const auto finish=std::max(now,wire_free[chan])+std::chrono::microseconds(cost*8000000/capacity);
     // Bounded, lossy source queue; admission remains asynchronous to RTP.
-    if(finish-now>std::chrono::milliseconds(200)) {
+    if(finish-now>std::chrono::milliseconds(charged_queue_ms)) {
       ++wire_drops;if(!control)++drops_by_phase[phase];else ++control_drops[phase];return 0;
     }
-    wire_free[chan]=finish;++wire_admissions;if(control)++control_admissions[phase];
+    wire_free[chan]=finish;++wire_admissions;
+    charged_queue_max_ms[phase]=std::max(charged_queue_max_ms[phase],std::chrono::duration<double,std::milli>(finish-now).count());
+    if(control){++control_admissions[phase];control_wire_bytes_by_phase[phase]+=cost;}
     if(!control){++packets_by_phase[phase];wire_bytes_by_phase[phase]+=cost;source_packets.push_back({(long long)(milliseconds(now)*1000),(long long)(uint16_t(p[2])<<8|p[3]),(long long)(uint32_t(p[4])<<24|uint32_t(p[5])<<16|uint32_t(p[6])<<8|p[7]),(long long)len,(long long)chan});}
     pending.push_back({finish+std::chrono::milliseconds(40),std::vector<uint8_t>(p,p+len),chan==source_channel ? receiver_channel : source_channel});
     return 0;
@@ -594,8 +598,8 @@ static void verify_adaptive_bitrate() {
 // Requires a private native library built with rtc_enable_protobuf=true.
 static void verify_adaptive_encapsulation(bool source_pause = false,
                                           bool automatic_budget = false,
-                                          int phase_ticks = 400) {
-  charged_phase_ticks=phase_ticks;
+                                          int phase_ticks = 400, int queue_ms = 200) {
+  charged_phase_ticks=phase_ticks;charged_queue_ms=queue_ms;
   perfect_network=true;duplex_feedback=true;charged_link=true;charged_duplex=true;
   const uint8_t local[32]={1},peer[32]={2};source_channel=200;receiver_channel=300;
   using Engine=std::unique_ptr<VeilMediaEngine,decltype(&veil_media_engine_destroy)>;
@@ -604,7 +608,8 @@ static void verify_adaptive_encapsulation(bool source_pause = false,
   assert(source && receiver);
   origin=Clock::now();
   std::array<int16_t,480> pcm{},reverse_pcm{};std::array<size_t,3> voiced{},reverse_voiced{};std::array<uint64_t,3> reverse_delay{};
-  std::array<uint64_t,3> max_delay{},max_interruptions{};
+  std::array<uint64_t,3> max_delay{},max_interruptions{},concealed{},reverse_concealed{};
+  uint64_t previous_concealed=0,previous_reverse_concealed=0;
   double max_lateness=0, resume_delay=-1;
   std::vector<double> sent_edges,rendered_edges,reverse_sent_edges,reverse_edges;
   bool was_high=false,reverse_was_high=false;
@@ -648,6 +653,12 @@ static void verify_adaptive_encapsulation(bool source_pause = false,
     }
     if(source_pause && tick>=620 && nonsilent && resume_delay<0)
       resume_delay=milliseconds(Clock::now())-6200;
+    if(tick%phase_ticks==phase_ticks-1) {
+      const auto current=metric(receiver.get(),"audio_concealed_samples");
+      const auto reverse_current=metric(source.get(),"audio_concealed_samples");
+      concealed[phase]=current-previous_concealed;reverse_concealed[phase]=reverse_current-previous_reverse_concealed;
+      previous_concealed=current;previous_reverse_concealed=reverse_current;
+    }
     if(tick%phase_ticks>=100) {
       if(nonsilent)++voiced[phase];
       assert(metric(source.get(),"audio_encoder_target_bps")>=16000);
@@ -663,6 +674,7 @@ static void verify_adaptive_encapsulation(bool source_pause = false,
   std::puts("]");
   if(charged_duplex)std::printf("reverse voiced=%zu/%zu/%zu delay=%llu/%llu/%llu\n",reverse_voiced[0],reverse_voiced[1],reverse_voiced[2],(unsigned long long)reverse_delay[0],(unsigned long long)reverse_delay[1],(unsigned long long)reverse_delay[2]);
   std::printf("control admissions=%zu/%zu/%zu drops=%zu/%zu/%zu total_drops=%zu\n",control_admissions[0],control_admissions[1],control_admissions[2],control_drops[0],control_drops[1],control_drops[2],wire_drops);
+  std::printf("link queue_limit_ms=%d queue_max_ms=[%.2f,%.2f,%.2f] control_wire_bytes=[%zu,%zu,%zu] concealed=[%llu,%llu,%llu] reverse_concealed=[%llu,%llu,%llu]\n",charged_queue_ms,charged_queue_max_ms[0],charged_queue_max_ms[1],charged_queue_max_ms[2],control_wire_bytes_by_phase[0],control_wire_bytes_by_phase[1],control_wire_bytes_by_phase[2],(unsigned long long)concealed[0],(unsigned long long)concealed[1],(unsigned long long)concealed[2],(unsigned long long)reverse_concealed[0],(unsigned long long)reverse_concealed[1],(unsigned long long)reverse_concealed[2]);
   for(size_t phase=0;phase<3;++phase) {
     for(const auto& [type,count]:submitted_rtp_types[phase])
       std::printf("submitted RTP phase=%zu type=%d count=%zu\n",phase,type,count);
@@ -700,6 +712,10 @@ static void verify_adaptive_encapsulation(bool source_pause = false,
 }
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--characterize-adaptive-encapsulation-queue100") == 0) {
+    verify_adaptive_encapsulation(false, true, 1200, 100);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--characterize-adaptive-encapsulation-recovery") == 0) {
     verify_adaptive_encapsulation(false, true, 1200);
     return 0;
@@ -753,6 +769,10 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--silence") == 0) {
     verify_silence();
     return 0;
+  }
+  if (argc != 1 && !recurring_jitter && !mature_jitter) {
+    std::fputs("unknown or multiple audio smoke arguments\n", stderr);
+    return 2;
   }
   const uint8_t local[32] = {1}, peer[32] = {2};
   uint64_t baseline_concealed = 0;
