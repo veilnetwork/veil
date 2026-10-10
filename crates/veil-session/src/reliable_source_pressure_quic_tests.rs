@@ -14,6 +14,7 @@ use veil_types::NodeIdBytes;
 
 struct Capture {
     logger: Arc<veil_observability::NodeLogger>,
+    captured_frames: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 impl crate::dispatcher_sink::DispatcherSink for Capture {
     fn dispatch(
@@ -25,7 +26,16 @@ impl crate::dispatcher_sink::DispatcherSink for Capture {
         let _ = (h, body, peer);
         crate::dispatcher_sink::DispatchResult::NoResponse
     }
-    fn capture_outbound(&self, _: NodeIdBytes, _: &[u8]) {}
+    fn capture_outbound(&self, _: NodeIdBytes, bytes: &[u8]) {
+        if let Some(count) = &self.captured_frames
+            && veil_proto::codec::decode_header(bytes).is_ok_and(|header| {
+                header.family == FrameFamily::Delivery as u8
+                    && header.msg_type == veil_proto::family::DeliveryMsg::Forward as u16
+            })
+        {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     fn allow_outbound_bandwidth(&self, _: usize) -> bool {
         true
     }
@@ -136,6 +146,7 @@ pub(super) fn make_runner(
         peer_id: [0xB1; 32],
         dispatcher: Arc::new(Capture {
             logger: Arc::clone(&logger),
+            captured_frames: None,
         }),
         logger,
         metrics: None,
@@ -731,6 +742,94 @@ async fn stream_only_primary_backpressure_holds_a_healthy_neighbor_file() {
 }
 
 #[tokio::test]
+async fn ordered_primary_keeps_freshness_before_immutable_ciphertext_queue() {
+    verify_primary_write_ahead(40, false).await;
+}
+
+#[tokio::test]
+async fn ordered_primary_burst_keeps_one_frame_per_ciphertext_blob() {
+    verify_primary_write_ahead(4, true).await;
+}
+
+async fn verify_primary_write_ahead(frame_count: u8, burst: bool) {
+    let (stream, mut peer) = tokio::io::duplex(64);
+    let mut registry = crate::SessionTxRegistry::new();
+    let outbox = registry.register([0xB1; 32]);
+    let sender = registry.get_sender(&[0xB1; 32]).unwrap().clone();
+    let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut runner = make_runner(Box::new(stream), outbox, None);
+    runner.dispatcher = Arc::new(Capture {
+        logger: Arc::clone(&runner.logger),
+        captured_frames: Some(Arc::clone(&captures)),
+    });
+    let job = tokio::spawn(async move {
+        runner.run().await;
+    });
+    // The real sender's suffix remains present on an ordered compatibility
+    // hop. Stop the reader while fresh source packets arrive at 50 per second.
+    for seq in 0..frame_count {
+        let mut bytes = primary_frame(OrderedPrimary::NeutralForward).to_vec();
+        bytes[veil_proto::header::HEADER_SIZE + 32 + veil_proto::delivery::OFFSET_PAYLOAD] = seq;
+        sender
+            .send((REALTIME, veil_bufpool::pooled_shared_from_vec(bytes)))
+            .await
+            .unwrap();
+        if !burst {
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+    if burst {
+        sleep(Duration::from_millis(50)).await;
+    }
+    let committed = captures.load(Ordering::Relaxed);
+    assert!(
+        committed <= 2,
+        "primary write-ahead escaped its freshness queue: {committed}"
+    );
+    let mut reader = super::super::ordered_reader::Reader::default();
+    let mut cipher = SessionCipher::new(&[0x51; 32], true);
+    let mut sequences = Vec::new();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let wire = reader.read(&mut peer, 65536).await.unwrap();
+            let plaintext = cipher
+                .open(&wire.body, &veil_proto::codec::frame_aad(&wire.header))
+                .unwrap();
+            if wire.header.family != FrameFamily::Delivery as u8 {
+                continue;
+            }
+            let decoded = veil_proto::delivery::ForwardPayload::decode(&plaintext).unwrap();
+            assert_eq!(decoded.traffic_class, Some(INTERACTIVE));
+            let seq = decoded.envelope.payload[0];
+            sequences.push(seq);
+            if seq == frame_count - 1 {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("fresh queued primary did not resume without new input");
+    assert_eq!(
+        sequences.len(),
+        sequences
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    );
+    assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(
+        sequences
+            .iter()
+            .skip(committed)
+            .all(|&seq| seq >= frame_count.saturating_sub(10)),
+        "stale source packets replayed: {sequences:?}"
+    );
+    drop(peer);
+    timeout(Duration::from_secs(2), job).await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn primary_queued_behind_neutral_ciphertext_holds_other_producers() {
     verify_stream_only_primary_backpressure(1).await;
 }
@@ -969,7 +1068,7 @@ async fn verify_stream_only_primary_backpressure(neutral_prefix: usize) {
         if neutral_prefix != 0 {
             assert_eq!(
                 received,
-                if neutral_prefix >= 128 { 0 } else { 2 },
+                if neutral_prefix >= 128 { 0 } else { 1 },
                 "old primary remained in the scheduler and must expire before encryption"
             );
         }

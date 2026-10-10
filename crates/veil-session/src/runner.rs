@@ -5082,7 +5082,7 @@ impl SessionRunner {
                     || outbox
                         .as_ref()
                         .is_some_and(|outbox| outbox.source_activity().active(now));
-                let mut source_bulk_waiting_for_writer = false;
+                let mut source_waiting_for_writer = false;
                 let mut source_pressure_retry: Option<std::time::Instant> = None;
                 let mut source_reliable_waiting = false;
                 let reliable_ready = realtime_lane
@@ -5154,9 +5154,20 @@ impl SessionRunner {
                             Route::Canonical => None,
                         };
                         let pending_blobs = wire_tx.max_capacity().saturating_sub(wire_tx.capacity());
-                        source_bulk_waiting_for_writer |= local_primary_active
+                        source_waiting_for_writer |= local_primary_active
                             && priority >= veil_proto::priority::BULK
                             && pending_blobs != 0;
+                        // Once encrypted, ordered bytes cannot expire without
+                        // breaking the cipher counter. Keep local primary in
+                        // its freshness queue while one blob awaits the writer.
+                        // Control and neutral transit retain ordinary admission.
+                        if reservation.is_none()
+                            && pending_blobs != 0
+                            && local_primary_stream_frame(priority, frame)
+                        {
+                            source_waiting_for_writer = true;
+                            return HeadAdmission::DeferSource;
+                        }
                         // Do not let a control lease admit a coalesced file or
                         // neutral transit frame. The immutable ciphertext batch
                         // keeps one local classification through partial writes.
@@ -5298,6 +5309,11 @@ impl SessionRunner {
                         };
                         encrypted_batch_wire_len = next_len;
                         encrypted_batch_frames.push(outgoing.clone());
+                        // Keep each local primary envelope independently fresh
+                        // until admission; an immutable batch cannot shed it.
+                        if local_primary {
+                            break;
+                        }
                     } else {
                         // No encryption: convert Arc-backed bytes to owned Vec
                         // for the wire channel. Padding is not applied
@@ -5463,7 +5479,7 @@ impl SessionRunner {
                         // a source pressure wait would spin until the deadline.
                         && (source_pressure_retry.is_none() || wire_tx.capacity() < wire_tx.max_capacity())
                     {
-                        Some(if source_bulk_waiting_for_writer || source_pressure_retry.is_some() {
+                        Some(if source_waiting_for_writer || source_pressure_retry.is_some() {
                             wire_tx.max_capacity()
                         } else {
                             1
