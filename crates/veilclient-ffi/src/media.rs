@@ -807,6 +807,7 @@ pub(crate) fn set_recv_callback(
 /// Drop the recv callback for `peer` — but only when `chan` still owns it. A
 /// newer channel to the same peer may have replaced the registration; its
 /// callback must survive the old channel's teardown.
+#[cfg(test)]
 pub(crate) fn clear_recv_callback(peer: [u8; 32], chan: u64) {
     let mut map = RECV.lock().unwrap_or_else(|p| p.into_inner());
     let owned = map.get(&peer).is_some_and(|c| c.chan == chan);

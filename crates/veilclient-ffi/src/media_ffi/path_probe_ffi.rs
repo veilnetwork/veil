@@ -34,6 +34,13 @@ pub(super) struct PathProbeContext {
 }
 
 impl PathProbeContext {
+    /// Both addresses are pinned by trusted host call state, never learned
+    /// from an incoming packet. The peer's sending route is independent of
+    /// this endpoint's outgoing candidate qualification.
+    pub(super) fn receive_peers(&self) -> [[u8; 32]; 2] {
+        [self.replies[0].peer, self.replies[1].peer]
+    }
+
     fn live(&self) -> bool {
         self.ingress
             .upgrade()

@@ -204,6 +204,104 @@ extern "C" fn count_media(ctx: *mut c_void, _: *const u8, _: usize) {
 }
 
 #[test]
+fn a_relay_receiver_accepts_authenticated_media_from_both_pinned_paths() {
+    let _lock = FIXTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut fixture = Fixture::new();
+    let (relay, _) = fixture.channel(ProbeRoute::Relay);
+    let deliveries = AtomicUsize::new(0);
+    assert_eq!(
+        unsafe {
+            veil_media_set_recv_callback(
+                relay,
+                Some(count_media),
+                (&deliveries as *const AtomicUsize).cast_mut().cast(),
+            )
+        },
+        0
+    );
+    // No callback was committed to the candidate; closing it must not steal
+    // either live receive address from the still-active relay engine.
+    let (candidate, _) = fixture.channel(ProbeRoute::Direct);
+    unsafe { veil_media_close_channel(candidate) };
+    let peer = media::cipher_for_test(&DEVICE, &RX, &TX).unwrap();
+    let direct_audio = peer.seal(&[0x80, 111, 1, 2]).unwrap().into_vec();
+    media::dispatch_inbound_auto(PEER, &direct_audio);
+    assert_eq!(
+        deliveries.load(Ordering::Relaxed),
+        1,
+        "peer can switch its sender before our outgoing candidate qualifies"
+    );
+    media::dispatch_inbound_auto(PEER_DEVICE, &direct_audio);
+    assert_eq!(
+        deliveries.load(Ordering::Relaxed),
+        1,
+        "aliases share replay protection"
+    );
+    let relay_audio = peer.seal(&[0x80, 111, 3, 4]).unwrap().into_vec();
+    media::dispatch_inbound_auto(PEER_DEVICE, &relay_audio);
+    assert_eq!(deliveries.load(Ordering::Relaxed), 2);
+    let stranger_audio = peer.seal(&[0x80, 111, 5, 6]).unwrap().into_vec();
+    media::dispatch_inbound_auto([0xc5; 32], &stranger_audio);
+    let mut corrupt = stranger_audio.clone();
+    *corrupt.last_mut().unwrap() ^= 1;
+    media::dispatch_inbound_auto(PEER, &corrupt);
+    assert_eq!(
+        deliveries.load(Ordering::Relaxed),
+        2,
+        "pin and seal still gate RTP"
+    );
+    unsafe { veil_media_set_recv_callback(relay, None, ptr::null_mut()) };
+    for address in [PEER, PEER_DEVICE] {
+        media::dispatch_inbound_auto(address, &stranger_audio);
+    }
+    assert_eq!(
+        deliveries.load(Ordering::Relaxed),
+        2,
+        "unregister clears both aliases"
+    );
+}
+
+#[test]
+fn closing_replaced_alias_owner_cannot_clear_the_new_receiver() {
+    let _lock = FIXTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut fixture = Fixture::new();
+    let (old, _) = fixture.channel(ProbeRoute::Relay);
+    let (new, _) = fixture.channel(ProbeRoute::Direct);
+    let old_deliveries = AtomicUsize::new(0);
+    let new_deliveries = AtomicUsize::new(0);
+    for (channel, counter) in [(old, &old_deliveries), (new, &new_deliveries)] {
+        assert_eq!(
+            unsafe {
+                veil_media_set_recv_callback(
+                    channel,
+                    Some(count_media),
+                    (counter as *const AtomicUsize).cast_mut().cast(),
+                )
+            },
+            0
+        );
+    }
+    unsafe { veil_media_close_channel(old) };
+    let peer = media::cipher_for_test(&DEVICE, &RX, &TX).unwrap();
+    for address in [PEER, PEER_DEVICE] {
+        let audio = peer.seal(&[0x80, 111, 7, 8]).unwrap().into_vec();
+        media::dispatch_inbound_auto(address, &audio);
+    }
+    assert_eq!(old_deliveries.load(Ordering::Relaxed), 0);
+    assert_eq!(new_deliveries.load(Ordering::Relaxed), 2);
+    unsafe { veil_media_close_channel(new) };
+    for address in [PEER, PEER_DEVICE] {
+        let audio = peer.seal(&[0x80, 111, 9, 10]).unwrap().into_vec();
+        media::dispatch_inbound_auto(address, &audio);
+    }
+    assert_eq!(
+        new_deliveries.load(Ordering::Relaxed),
+        2,
+        "close clears every owned alias"
+    );
+}
+
+#[test]
 fn candidate_alias_requires_its_sealed_reply_and_never_counts_as_audio() {
     let _lock = FIXTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut fixture = Fixture::new();
