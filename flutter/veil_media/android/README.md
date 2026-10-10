@@ -68,3 +68,26 @@ Same rig as macOS: place a call, then on the *desktop* measure
 `/media_recv_count?peer=<phone>` — the return leg should climb ~50/s once the
 phone captures + sends. Watch `logcat -s veil_media` for the `aaudio_adm:` lines
 (stream sr/ch, requestStart results).
+
+
+## Optional adaptive audio packets
+
+`VEIL_MEDIA_AUDIO_ADAPTATION=1 android/build_libwebrtc_android_linux.sh`
+enables WebRTC's protobuf-based Opus network adaptor in a from-source build.
+The default remains the argument list used by the published SDK bundles.
+Rebuild the media library against that same archive; do not mix an encoder
+compiled with protobuf enabled with a non-protobuf WebRTC archive.
+
+Before starting any media, enable independent transport feedback and call
+`veil_media_engine_set_audio_packet_overhead(engine, bytes_below_rtp)`. Positive
+hints require the protobuf-enabled archive and independent feedback; the API
+returns ERR_STATE otherwise. RTP headers are counted separately by WebRTC.
+Zero disables the option before start. Opus retains its state while choosing
+20–60-ms packets, with a 16–32-kbit/s codec target and an endpoint reserve for
+control traffic. The hint excludes QUIC/IP overhead and packing amortization.
+It does not reveal traffic roles or give relays a priority instruction.
+
+This path is still awaiting physical cellular validation. Successful strict
+synthetic tests supply an explicit client budget; automatic capacity-loss
+characterization still exceeds the latency gate. Do not treat the opt-in build
+as a verified cure for phone pauses or a reason to replace release engine pins.

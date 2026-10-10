@@ -55,6 +55,11 @@ if [[ ! -e "$LLVM_BIN/llvm-nm" ]]; then
 fi
 
 ARGS="target_os=\"ios\" target_environment=\"$TARGET_ENVIRONMENT\" target_cpu=\"arm64\" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true ios_enable_code_signing=false treat_warnings_as_errors=false"
+# Opt-in ANA requires protobuf; the system linker also handles host protoc
+# with recent Xcode SDKs whose TAPI files the bundled lld cannot read.
+if [[ "${VEIL_MEDIA_AUDIO_ADAPTATION:-0}" == "1" ]]; then
+  ARGS="${ARGS/rtc_enable_protobuf=false/rtc_enable_protobuf=true} use_lld=false"
+fi
 (
   cd "$WEBRTC_SRC"
   "$GN" gen "$WEBRTC_OUT" --export-compile-commands --args="$ARGS"
@@ -71,7 +76,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 compile_tu() {
-  python3 - "$CC_JSON" "$1" "$2" "$SRCDIR" <<'PY' > "$TMP/tu.sh"
+  python3 - "$CC_JSON" "$1" "$2" "$SRCDIR" "$WEBRTC_SRC" <<'PY' > "$TMP/tu.sh"
 import json,re,shlex,sys
 cc=json.load(open(sys.argv[1])); src,out,shimdir=sys.argv[2:5]
 entry=next(x for x in cc if x.get('file','').endswith('call/call.cc'))
@@ -82,7 +87,10 @@ source_index=next(i for i,a in enumerate(args) if a.endswith('call/call.cc'))
 args[source_index]=src
 out_index=args.index('-o') + 1
 args[out_index]=out
-args[1:1]=['-DVEIL_MEDIA_HAVE_WEBRTC=1', '-I'+shimdir]
+extra=['-DVEIL_MEDIA_HAVE_WEBRTC=1', '-I'+shimdir]
+if '-DWEBRTC_ENABLE_PROTOBUF=1' in args:
+    extra.append('-I'+sys.argv[5]+'/third_party/protobuf/src')
+args[1:1]=extra
 if src.endswith('.mm'):
     args.insert(1, '-fobjc-arc')
 print('cd '+shlex.quote(entry['directory']))
