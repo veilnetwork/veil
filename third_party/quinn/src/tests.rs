@@ -867,6 +867,7 @@ async fn driver_stats_detect_udp_socket_wait() {
     let pending = client.driver_stats();
     assert!(pending.udp_send_pending_us >= 100_000, "{pending:?}");
     assert_eq!(pending.udp_send_stalls, before.udp_send_stalls);
+    assert_eq!(pending.udp_socket_sent_bytes, before.udp_socket_sent_bytes);
     gate.release();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(2), server.read_datagram())
@@ -882,6 +883,7 @@ async fn driver_stats_detect_udp_socket_wait() {
         "{after:?}"
     );
     assert_eq!(after.udp_send_pending_us, 0);
+    assert!(after.udp_socket_sent_bytes > before.udp_socket_sent_bytes + b"held-udp".len() as u64);
     client_endpoint.close(0u32.into(), b"test complete");
     server_endpoint.close(0u32.into(), b"test complete");
 }

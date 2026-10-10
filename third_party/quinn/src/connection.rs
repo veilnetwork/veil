@@ -53,6 +53,9 @@ pub struct ConnectionDriverStats {
     pub udp_send_stalls: u64,
     /// Age of a prepared transmit still waiting for the UDP socket, at snapshot time.
     pub udp_send_pending_us: u64,
+    /// UDP payload bytes successfully handed to the socket. Excludes IP/UDP
+    /// headers and does not imply network delivery or remote acknowledgment.
+    pub udp_socket_sent_bytes: u64,
 }
 
 fn scheduling_delay_us(now: Instant, scheduled: Instant) -> u64 {
@@ -1144,6 +1147,10 @@ impl State {
             }
 
             let wait_us = scheduling_delay_us(self.runtime.now(), prepared);
+            self.driver_stats.udp_socket_sent_bytes = self
+                .driver_stats
+                .udp_socket_sent_bytes
+                .saturating_add(len as u64);
             crate::udp_wire_trace::record_send(
                 &self.send_buffer[..len],
                 t.segment_size,
