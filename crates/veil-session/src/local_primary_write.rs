@@ -68,8 +68,8 @@ mod tests {
     fn assert_no_pressure(source: &LocalSourceActivity, now: Instant) {
         // Reliable data has a budget even during healthy primary activity.
         // Pressure additionally restrains lossy probes and recovery RPCs.
-        assert!(source.allow_secondary(now));
-        assert!(source.allow_secondary(now));
+        assert!(source.allow_secondary(crate::local_source_activity::LOSSY_SECONDARY_BYTES, now));
+        assert!(source.allow_secondary(crate::local_source_activity::LOSSY_SECONDARY_BYTES, now));
         assert!(
             source
                 .admit_network_control(NETWORK_CONTROL_BYTES, now)
