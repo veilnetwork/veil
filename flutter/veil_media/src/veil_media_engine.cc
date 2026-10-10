@@ -1681,6 +1681,7 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
       veil_chan, ws->call.get(), ws->network_tq.get(),
       ws->video_call.get(), ws->video_network_tq.get());
   ws->shim->SetLocalAudioSsrc(ssrc_of(local_id));
+  ws->shim->SetRemoteAudioSsrc(ssrc_of(peer_id));
   ws->shim->SetLocalVideoSsrc(video_ssrc_of(local_id));
   ws->shim->Start();
 
@@ -1837,6 +1838,7 @@ int veil_media_group_engine_add_peer(VeilGroupMediaEngine* engine,
       veil_chan, ws->call.get(), ws->network_tq.get(),
       ws->video_call.get(), ws->video_network_tq.get());
   peer->shim->SetLocalAudioSsrc(local_audio_ssrc);
+  peer->shim->SetRemoteAudioSsrc(remote_ssrc);
   peer->shim->SetLocalVideoSsrc(local_video_ssrc);
   peer->shim->Start();
   peer->video_sink = std::make_unique<VeilVideoSink>();
@@ -2354,15 +2356,7 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
           if (!entry.second->recv_stream) continue;
           const auto sample = entry.second->recv_stream->GetStats(false);
           auto* peer = entry.second.get();
-          int64_t native_age_ms = -1;
-          if (sample.last_packet_received) {
-            // The accepted RTP timestamp is on the Unix epoch, not the
-            // monotonic host poll clock. Delayed polling cannot refresh it.
-            const int64_t unix_now_ms = ws->env.clock().CurrentNtpInMilliseconds()
-                                       - webrtc::kNtpJan1970Millisecs;
-            native_age_ms = std::max<int64_t>(
-                0, unix_now_ms - sample.last_packet_received->ms());
-          }
+          const int64_t native_age_ms = peer->shim->audio_payload_receive_age_ms();
           const bool active = sample.packets_received > 0 &&
               native_age_ms >= 0 && native_age_ms <= 3000;
           const uint32_t delay_ms = current_audio_playout_delay(
@@ -3716,16 +3710,9 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         const auto r =
             ws->recv_stream->GetStats(/*get_and_clear_legacy_stats=*/false);
         audio_rx_pkts = r.packets_received;
-        // WebRTC exports the accepted RTP time on the Unix epoch; convert
-        // the same native clock before comparing (CurrentTime is monotonic).
-        // A host timer sampling packet counts can lag while the UI is busy;
-        // that lag must not masquerade as a gap in the native audio stream.
-        if (r.last_packet_received) {
-          const int64_t unix_now_ms = ws->env.clock().CurrentNtpInMilliseconds()
-                                     - webrtc::kNtpJan1970Millisecs;
-          audio_rx_native_age_ms = std::max<int64_t>(
-              0, unix_now_ms - r.last_packet_received->ms());
-        }
+        // WebRTC's last packet includes padding probes. They still advance
+        // RTCP counters, but cannot prove that encoded audio is arriving.
+        audio_rx_native_age_ms = ws->shim->audio_payload_receive_age_ms();
         audio_concealed_samples = r.concealed_samples;
         audio_concealment_events = r.concealment_events;
         audio_jb_flushes = r.jitter_buffer_flushes;

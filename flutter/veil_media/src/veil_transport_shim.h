@@ -132,6 +132,10 @@ class VeilTransportShim : public webrtc::Transport {
   // with MediaType::VIDEO (the Call routes to the audio vs video demuxer BY the
   // media type — a wrong type black-holes the packet). 0 = no video (all audio).
   void SetRemoteVideoSsrc(uint32_t ssrc) { remote_video_ssrc_.store(ssrc); }
+  void SetRemoteAudioSsrc(uint32_t ssrc) { remote_audio_ssrc_.store(ssrc); }
+  // Encoded Opus/DTX arrival, excluding RTP padding and foreign SSRCs. Uses
+  // the original ingress time, so a delayed network worker cannot renew it.
+  int64_t audio_payload_receive_age_ms() const;
 
   // Group calls use one send SSRC for all peers. Keep their reports separate
   // before WebRTC's per-source cache overwrites one participant with another.
@@ -245,6 +249,8 @@ class VeilTransportShim : public webrtc::Transport {
   webrtc::Call* const video_call_;
   webrtc::TaskQueueBase* const video_network_queue_;
   std::atomic<uint32_t> remote_video_ssrc_{0};
+  std::atomic<uint32_t> remote_audio_ssrc_{0};
+  std::atomic<int64_t> audio_payload_arrived_us_{0};
   std::atomic<uint32_t> local_audio_ssrc_{0};
   std::atomic<uint32_t> local_video_ssrc_{0};
   AudioSendStats audio_send_stats_;
