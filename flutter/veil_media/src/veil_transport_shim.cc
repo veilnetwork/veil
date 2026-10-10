@@ -141,6 +141,12 @@ AudioSendSnapshot VeilTransportShim::audio_send_stats() const {
   return audio_send_stats_.snapshot(webrtc::TimeMicros() * 1000);
 }
 
+int64_t VeilTransportShim::audio_payload_receive_age_ms() const {
+  const auto arrived = audio_payload_arrived_us_.load(std::memory_order_relaxed);
+  const auto now = webrtc::TimeMicros();
+  return arrived > 0 && now >= arrived ? (now - arrived) / 1000 : -1;
+}
+
 void VeilTransportShim::Start() {
   bool expected = false;
   if (!started_.compare_exchange_strong(expected, true)) return;
@@ -505,6 +511,13 @@ void VeilTransportShim::DeliverOnNetworkThread(
   const uint32_t vssrc = remote_video_ssrc_.load();
   const bool is_video = (vssrc != 0 && rtp.Ssrc() == vssrc);
   if (secondary != is_video) return;
+  if (!is_video && rtp.PayloadType() == 111 && rtp.payload_size() > 0 &&
+      rtp.Ssrc() == remote_audio_ssrc_.load(std::memory_order_relaxed)) {
+    auto previous = audio_payload_arrived_us_.load(std::memory_order_relaxed);
+    while (previous < arrived_us &&
+           !audio_payload_arrived_us_.compare_exchange_weak(
+               previous, arrived_us, std::memory_order_relaxed)) {}
+  }
   if (!is_video && audio_ingress_diagnostics_ &&
       audio_ingress_samples_.size() < 4096) {
     audio_ingress_samples_.push_back({rtp.SequenceNumber(), rtp.Timestamp(),
