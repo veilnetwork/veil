@@ -8,6 +8,11 @@ VEIL_MEDIA_TEST_HOOKS=1 "$ROOT/macos/build_veil_media_dylib.sh" "$STAND_DIR"
 clang++ -std=c++20 -Wall -Wextra -Werror -Wl,-export_dynamic \
   -I"$ROOT/src" "$ROOT/test/audio_playout_smoke.cc" \
   "$STAND_DIR/libveil_media.dylib" -Wl,-rpath,"$STAND_DIR" -o "$STAND_DIR/smoke"
+if [ "$#" -gt 0 ]; then
+  "$STAND_DIR/smoke" "$@"
+  exit
+fi
+"$STAND_DIR/smoke" --adaptive-bitrate
 "$STAND_DIR/smoke" --silence
 "$STAND_DIR/smoke" --padding-liveness
 "$STAND_DIR/smoke" --silence-after-jitter
