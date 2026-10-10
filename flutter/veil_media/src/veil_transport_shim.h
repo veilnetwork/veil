@@ -39,6 +39,7 @@
 #include "api/call/transport.h"  // webrtc::Transport, webrtc::PacketOptions
 #include "veil_inbound_packet_queue.h"
 #include "veil_audio_send_stats.h"
+#include "veil_audio_redundancy.h"
 #include "veil_video_control_transport.h"
 
 namespace webrtc {
@@ -114,6 +115,22 @@ class VeilTransportShim : public webrtc::Transport {
   // Release a superseded inbound binding on the serialized control thread.
   // The active outbound channel cannot be released through this method.
   bool ReleaseReceiveChannel(uint64_t veil_chan);
+
+  // Borrow an already qualified same-call channel; zero disables. The caller
+  // owns its lifetime and clears it before close/handover. Only nonempty Opus
+  // RTP gets a second local admission, never video, padding or RTCP.
+  bool SetAudioMirrorChannel(uint64_t channel) {
+    if (!started_.load(std::memory_order_acquire)) return false;
+    if (channel && channel == veil_chan_.load(std::memory_order_acquire))
+      return false;
+    audio_mirror_chan_.store(channel, std::memory_order_release);
+    return true;
+  }
+  uint64_t audio_mirror_channel() const { return audio_mirror_chan_.load(); }
+  uint64_t audio_mirror_attempts() const { return audio_mirror_attempts_.load(); }
+  uint64_t audio_mirror_queued() const { return audio_mirror_queued_.load(); }
+  uint64_t audio_mirror_bytes() const { return audio_mirror_bytes_.load(); }
+  uint64_t audio_duplicate_packets() const { return audio_duplicate_packets_.load(); }
 
   // Endpoint-local shedding. Keep audio, RTCP and remote video live; do not
   // enqueue video already encoded or retransmitted by the pacer while paused.
@@ -240,6 +257,11 @@ class VeilTransportShim : public webrtc::Transport {
       std::make_shared<TaskGuard>(), std::make_shared<TaskGuard>()};
 
   std::atomic<uint64_t> veil_chan_;
+  std::atomic<uint64_t> audio_mirror_chan_{0};
+  std::atomic<uint64_t> audio_mirror_attempts_{0}, audio_mirror_queued_{0};
+  std::atomic<uint64_t> audio_mirror_bytes_{0};
+  std::atomic<uint64_t> audio_duplicate_packets_{0};
+  AudioPacketHistory audio_packet_history_;
   // Control-thread ownership only; SDK callbacks never access this vector.
   // The host retains one binding per physical peer and explicitly releases
   // superseded handles. Stop fences every remaining binding before teardown.

@@ -1723,6 +1723,18 @@ int veil_media_engine_rebind_channel_keep_receiver(VeilMediaEngine* engine, uint
 #endif
 }
 
+int veil_media_engine_set_audio_mirror_channel(VeilMediaEngine* engine, uint64_t veil_chan) {
+  if (!engine) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  auto* ws = engine->ws.get();
+  return ws && ws->shim && ws->shim->SetAudioMirrorChannel(veil_chan)
+      ? VEIL_MEDIA_OK : VEIL_MEDIA_ERR_STATE;
+#else
+  (void)veil_chan;
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
 int veil_media_engine_release_receive_channel(VeilMediaEngine* engine, uint64_t veil_chan) {
   if (!engine || !veil_chan) return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
@@ -2806,6 +2818,10 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
 
 int veil_media_engine_stop_audio(VeilMediaEngine* engine) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (engine->ws && engine->ws->shim)
+    engine->ws->shim->SetAudioMirrorChannel(0);
+#endif
   if (!engine->audio_running.exchange(false)) return VEIL_MEDIA_OK;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (engine->ws && engine->ws->call) {
@@ -3793,6 +3809,9 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         json, sizeof(json),
         "{\"tx_pkts\":%llu,\"rx_pkts\":%llu,\"audio_rx_pkts\":%llu,"
         "\"audio_rx_native_age_ms\":%lld,\"audio_concealed_samples\":%llu,"
+        "\"audio_mirror_enabled\":%d,\"audio_mirror_tx_attempts\":%llu,"
+        "\"audio_mirror_tx_queued\":%llu,\"audio_rx_duplicate_packets\":%llu,"
+        "\"audio_mirror_tx_bytes\":%llu,"
         "\"audio_concealment_events\":%llu,\"audio_interruption_count\":%d,"
         "\"audio_jb_flushes\":%llu,\"audio_discarded_packets\":%llu,"
         "\"audio_interruption_duration_ms\":%d,"
@@ -3838,6 +3857,11 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<unsigned long long>(audio_rx_pkts),
         static_cast<long long>(audio_rx_native_age_ms),
         static_cast<unsigned long long>(audio_concealed_samples),
+        ws->shim->audio_mirror_channel() != 0 ? 1 : 0,
+        static_cast<unsigned long long>(ws->shim->audio_mirror_attempts()),
+        static_cast<unsigned long long>(ws->shim->audio_mirror_queued()),
+        static_cast<unsigned long long>(ws->shim->audio_duplicate_packets()),
+        static_cast<unsigned long long>(ws->shim->audio_mirror_bytes()),
         static_cast<unsigned long long>(audio_concealment_events),
         audio_interruption_count,
         static_cast<unsigned long long>(audio_jb_flushes),

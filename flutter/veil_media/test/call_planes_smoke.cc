@@ -35,6 +35,7 @@ static std::atomic<bool> fanout_video_entered{false};
 static std::atomic<bool> fanout_audio_passed{false};
 static std::mutex callback_mu;
 static std::map<uint64_t, Callback> callbacks;
+static std::set<uint64_t> rejected_channels;
 static std::map<uint64_t, std::set<std::pair<uint32_t, uint16_t>>> feedback;
 static std::map<uint64_t, std::set<std::pair<uint32_t, uint16_t>>> primary_feedback, secondary_feedback;
 static std::map<uint64_t, std::pair<uint32_t, uint32_t>> expected_ssrcs;
@@ -64,7 +65,7 @@ static int record_send(uint64_t chan, const uint8_t* p, size_t len, bool video_c
       playout_wire[chan] = std::vector<uint8_t>(p, p + len);
     offset += size;
   }
-  return 0;
+  return rejected_channels.contains(chan) ? 1 : 0;
 }
 extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t len) {
   return record_send(chan, p, len, false);
@@ -318,12 +319,58 @@ int main() {
     std::this_thread::sleep_for(std::chrono::milliseconds(160));
     // RTCP arriving during the gap must not reset the audio RTP timestamp.
     report(chan, 2, 1, 0, 0);
+    // A delayed copy on a second encrypted route must neither enter NetEq
+    // nor renew freshness. Match the last Opus RTP packet injected above.
+    Callback duplicate_cb;
+    { std::lock_guard lock(callback_mu); duplicate_cb = callbacks.at(chan); }
+    std::array<uint8_t, 15> duplicate{0x80, 111, 0, 3};
+    for (int i = 0; i < 4; ++i) {
+      duplicate[4+i] = uint32_t(3 * 960) >> (24-i*8);
+      duplicate[8+i] = uint32_t(2 << 24) >> (24-i*8);
+    }
+    duplicate[12] = 0xf8; duplicate[13] = 0xff; duplicate[14] = 0xfe;
+    duplicate_cb.fn(duplicate_cb.ctx, duplicate.data(), duplicate.size());
+    const auto duplicate_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!stat(e.get(), "audio_rx_duplicate_packets") &&
+           std::chrono::steady_clock::now() < duplicate_deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    assert(stat(e.get(), "audio_rx_duplicate_packets") == 1);
     assert(stat(e.get(), "audio_rx_pkts") == 4);
     const auto age_after = stat(e.get(), "audio_rx_native_age_ms");
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - wait_started).count();
     assert(age_after >= age_before + 150);
     assert(age_after <= age_before + elapsed_ms + 100);
+    assert(veil_media_engine_set_audio_mirror_channel(e.get(), chan) == VEIL_MEDIA_ERR_STATE);
+    const auto mirror = chan + 200;
+    assert(veil_media_engine_set_audio_mirror_channel(e.get(), mirror) == VEIL_MEDIA_OK);
+    assert(stat(e.get(), "audio_mirror_enabled") == 1);
+    // Only pinned, nonempty audio is copied, never foreign audio, video,
+    // control or BWE padding. There is no receiver registration on mirror.
+    for (int kind : {0, 1, 2, 3, 4}) assert(veil_media_test_direct_packet(e.get(), kind) == 0);
+    assert(stat(e.get(), "audio_mirror_tx_attempts") == 1);
+    assert(stat(e.get(), "audio_mirror_tx_queued") == 1);
+    assert(stat(e.get(), "audio_mirror_tx_bytes") == 15);
+    { std::lock_guard lock(callback_mu); rejected_channels.insert(mirror); }
+    // Failed alternate admission cannot lose an accepted primary packet.
+    assert(veil_media_test_direct_packet(e.get(), 3) == 0);
+    assert(stat(e.get(), "audio_mirror_tx_attempts") == 2);
+    assert(stat(e.get(), "audio_mirror_tx_queued") == 1);
+    { std::lock_guard lock(callback_mu); rejected_channels.erase(mirror); rejected_channels.insert(chan); }
+    // A surviving alternate can carry a packet rejected by the primary.
+    assert(veil_media_test_direct_packet(e.get(), 3) == 0);
+    assert(stat(e.get(), "audio_mirror_tx_queued") == 2);
+    assert(stat(e.get(), "audio_tx_rtp_drops") == 1);
+    { std::lock_guard lock(callback_mu); rejected_channels.insert(mirror); }
+    assert(veil_media_test_direct_packet(e.get(), 3) == 1);
+    { std::lock_guard lock(callback_mu); rejected_channels.clear(); }
+    { std::lock_guard lock(callback_mu); assert(!callbacks.contains(mirror)); }
+    assert(veil_media_engine_rebind_channel_keep_receiver(e.get(), chan + 300) == VEIL_MEDIA_OK);
+    assert(stat(e.get(), "audio_mirror_enabled") == 0);
+    assert(veil_media_engine_rebind_channel_keep_receiver(e.get(), chan) == VEIL_MEDIA_OK);
+    assert(veil_media_engine_set_audio_mirror_channel(e.get(), mirror) == VEIL_MEDIA_OK);
+    assert(veil_media_engine_stop_audio(e.get()) == VEIL_MEDIA_OK);
+    assert(stat(e.get(), "audio_mirror_enabled") == 0);
     // The abandoned retune must not run after the held queue is released.
     // An explicit retry may then update both bitrate and source cadence.
     assert(stat(e.get(), "max_fps") == 15);
