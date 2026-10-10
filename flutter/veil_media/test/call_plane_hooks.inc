@@ -439,36 +439,21 @@ extern "C" int veil_media_test_audio_playout_pcm(
 
 #pragma GCC visibility pop
 
-// Opt-in synthetic fixture only. Set up ANA before feeding captured samples;
-// changing link capacity later must retain the same codec and stream.
+// Build the synthetic ADM around the same pre-start API used by the host.
 #pragma GCC visibility push(default)
-extern "C" int veil_media_test_audio_adaptation(VeilMediaEngine* e, int overhead) {
-#if WEBRTC_ENABLE_PROTOBUF
-  if (!e || !e->ws || !e->ws->send_stream || overhead <= 0 || overhead > 4096)
-    return VEIL_MEDIA_ERR_ARG;
-  auto* ws = e->ws.get();
-  return run_on(ws->worker_tq.get(), [&] {
-    webrtc::audio_network_adaptor::config::ControllerManager manager;
-    auto* frames = manager.add_controllers()->mutable_frame_length_controller_v2();
-    frames->set_min_payload_bitrate_bps(16'000);
-    frames->set_use_slow_adaptation(false);
-    manager.add_controllers()->mutable_bitrate_controller();
-    auto config = ws->send_stream->GetConfig();
-    config.min_bitrate_bps = 16'000;
-    config.max_bitrate_bps = 32'000;
-    config.send_codec_spec->format.parameters["minptime"] = "20";
-    config.send_codec_spec->format.parameters["maxptime"] = "60";
-    config.audio_network_adaptor_config = manager.SerializeAsString();
-    ws->send_stream->Reconfigure(config, nullptr);
-    webrtc::NetworkRoute route;
-    route.connected = true;
-    route.packet_overhead = overhead;
-    ws->call->GetTransportControllerSend()->OnNetworkRouteChanged("stand-opaque", route);
-  }) ? VEIL_MEDIA_OK : VEIL_MEDIA_ERR_STATE;
-#else
-  (void)e;
-  (void)overhead;
-  return VEIL_MEDIA_ERR_STATE;
-#endif
+extern "C" VeilMediaEngine* veil_media_test_adaptive_codec_create(
+    uint64_t chan, const uint8_t local[32], const uint8_t peer[32], int overhead) {
+  g_call_plane_recording_adm = true;
+  auto* e = veil_media_engine_create(chan, local, peer);
+  g_call_plane_recording_adm = false;
+  if (!e) return nullptr;
+  if (veil_media_engine_set_independent_transport_feedback(e, 1) != VEIL_MEDIA_OK ||
+      veil_media_engine_set_audio_packet_overhead(e, overhead) != VEIL_MEDIA_OK ||
+      veil_media_engine_set_max_rtp_packet_size(e, 1000) != VEIL_MEDIA_OK ||
+      veil_media_engine_start_audio(e, 1, 1) != VEIL_MEDIA_OK) {
+    veil_media_engine_destroy(e);
+    return nullptr;
+  }
+  return e;
 }
 #pragma GCC visibility pop

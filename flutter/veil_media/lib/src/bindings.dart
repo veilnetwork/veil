@@ -908,6 +908,24 @@ final int Function(Pointer<VeilMediaEngineHandle>, int)?
     veilMediaEngineSetIndependentTransportFeedback =
     _lookupIndependentTransportFeedback();
 
+int Function(Pointer<VeilMediaEngineHandle>, int)?
+    _lookupAudioPacketOverhead() {
+  try {
+    return nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<VeilMediaEngineHandle>, Int32)>>(
+          'veil_media_engine_set_audio_packet_overhead',
+        )
+        .asFunction();
+  } on ArgumentError {
+    return null;
+  }
+}
+
+final int Function(Pointer<VeilMediaEngineHandle>, int)?
+    veilMediaEngineSetAudioPacketOverhead = _lookupAudioPacketOverhead();
+
 // Additive group adaptation ABI: older bundled engines keep their fixed budget.
 int Function(Pointer<VeilGroupMediaEngineHandle>, int, int)?
     _lookupGroupVideoBitrate() {

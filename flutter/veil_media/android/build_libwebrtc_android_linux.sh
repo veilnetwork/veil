@@ -64,6 +64,11 @@ OUT="out/android-arm64"
 # wants libwebrtc.a — the native static library. We do not compile, ship or
 # link that Java.
 ARGS='target_os="android" target_cpu="arm64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false android_static_analysis="off"'
+# Opt-in while physical cellular validation is pending; published SDK bundles
+# retain their pinned default arguments. ANA needs the generated protobuf code.
+if [[ "${VEIL_MEDIA_AUDIO_ADAPTATION:-0}" == "1" ]]; then
+  ARGS="${ARGS/rtc_enable_protobuf=false/rtc_enable_protobuf=true}"
+fi
 # --export-compile-commands is load-bearing, exactly as on the other targets:
 # build_veil_media_so.sh reads call.cc's exact command out of
 # compile_commands.json rather than reinventing the two dozen flags WebRTC

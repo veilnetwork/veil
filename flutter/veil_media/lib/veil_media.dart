@@ -232,6 +232,16 @@ class VeilMediaEngine {
     return set == null ? !enabled : set(_ptr, enabled ? 1 : 0) == 0;
   }
 
+  /// Account for transport framing below RTP and enable adaptive Opus packet
+  /// duration before starting audio/video. RTP overhead is added by WebRTC.
+  /// Returns false for engines without the optional native adaptation support.
+  bool setAudioPacketOverhead(int bytes) {
+    _ensure();
+    if (bytes < 0 || bytes > 4096) throw ArgumentError.value(bytes, 'bytes');
+    final set = ffi.veilMediaEngineSetAudioPacketOverhead;
+    return set != null && set(_ptr, bytes) == 0;
+  }
+
   /// Set the route-specific RTP packet ceiling before [startVideo]. Passing
   /// zero restores libwebrtc's default. Returns false after video send starts.
   bool setMaxRtpPacketSize(int bytes) {
