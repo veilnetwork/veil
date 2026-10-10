@@ -282,6 +282,11 @@ extern "C" int veil_media_test_group_fanout_packet(VeilGroupMediaEngine* e,
 // Exercise queued/retransmitted RTP at the final plaintext send boundary.
 extern "C" int veil_media_test_direct_packet(VeilMediaEngine* e, int kind) {
   std::array<uint8_t, 15> packet{0x80, uint8_t(kind == 1 ? 96 : 111)};
+  if (kind == 3 || kind == 4) {
+    const auto ssrc = ssrc_of(e->local);
+    for (int i = 0; i < 4; ++i) packet[8+i] = ssrc >> (24-i*8);
+    if (kind == 4) { packet[0] |= 0x20; packet.back() = 3; }
+  }
   webrtc::PacketOptions options;
   if (kind == 2) {
     std::array<uint8_t, 8> rtcp{0x80, 201, 0, 1};

@@ -80,6 +80,13 @@ int veil_media_engine_rebind_channel_keep_receiver(VeilMediaEngine *engine, uint
  * channel; repeated release of an already-released binding is harmless. */
 int veil_media_engine_release_receive_channel(VeilMediaEngine *engine, uint64_t veil_chan);
 
+/* Optional endpoint-only audio redundancy. The caller must first qualify an
+ * alternate channel with the same peer/call keys and retain its ownership.
+ * Zero disables it. No receive registration, video, RTCP or padding is copied.
+ * Rebind/stop clears it; clear before closing the caller-owned alternate.
+ * Default off. Additional traffic must be measured before production use. */
+int veil_media_engine_set_audio_mirror_channel(VeilMediaEngine *engine, uint64_t veil_chan);
+
 /* ---- Audio ---------------------------------------------------------------
  * Start/stop a bidirectional (or one-way) Opus audio session. `send` mounts
  * mic capture -> Opus encode -> RTP -> Transport; `recv` mounts RTP ->

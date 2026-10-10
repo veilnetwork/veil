@@ -177,6 +177,16 @@ class VeilMediaEngine {
     return release != null && release(_ptr, channel) == 0;
   }
 
+  bool get supportsAudioMirror => ffi.veilMediaEngineSetAudioMirrorChannel != null;
+
+  /// Borrow a qualified same-call alternate. Zero disables. Caller clears it
+  /// before close; native handover/stop also clear it. Default off, audio only.
+  bool setAudioMirrorChannel(int channel) {
+    _ensure();
+    final set = ffi.veilMediaEngineSetAudioMirrorChannel;
+    return set != null && set(_ptr, channel) == 0;
+  }
+
   /// Start the VP8 video session over the same veil channel (distinct SSRC).
   /// With VEIL_MEDIA_TEST_VIDEO=1 the send stream is driven by a built-in
   /// synthetic frame generator (pipeline bring-up); otherwise feed it via a
