@@ -1480,8 +1480,12 @@ pub unsafe extern "C" fn veil_media_start_direct_receiver(
 }
 
 /// Install the C recv callback invoked (native↔native, from a tokio worker)
-/// once per inbound media datagram from `chan`'s peer, with the wire magic
-/// already stripped. Replaces any prior callback; `cb == NULL` clears it.
+/// once per authenticated inbound media datagram from `chan`'s peer, with the
+/// wire magic already stripped. Configured path probes pin the identity and
+/// physical-device addresses of this same call: register both before media
+/// starts so the peer may change its sender while ours still uses the old
+/// route. Both addresses use one cipher/replay window and callback owner.
+/// Replaces prior callbacks; `cb == NULL` clears every alias owned by `chan`.
 /// Returns 0, or -1 on an unknown `chan`.
 #[cfg(feature = "node-embedded")]
 #[unsafe(no_mangle)]
@@ -1492,18 +1496,28 @@ pub unsafe extern "C" fn veil_media_set_recv_callback(
 ) -> c_int {
     let channel = {
         let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
-        map.get(&chan).map(|ch| (ch.peer, Arc::clone(&ch.cipher)))
+        map.get(&chan).map(|ch| {
+            let peers = ch
+                .path_probe
+                .as_ref()
+                .map_or([ch.peer; 2], |path| path.receive_peers());
+            (peers, Arc::clone(&ch.cipher))
+        })
     };
     match (cb, channel) {
-        (Some(cb), Some((peer, cipher))) => media::set_recv_callback(peer, chan, cb, ctx, cipher),
+        (Some(cb), Some((peers, cipher))) => {
+            media::set_recv_callback(peers[0], chan, cb, ctx, Arc::clone(&cipher));
+            if peers[1] != peers[0] {
+                media::set_recv_callback(peers[1], chan, cb, ctx, cipher);
+            }
+        }
         // Registering on an unknown channel has nowhere to route — error out.
         (Some(_), None) => return -1,
-        (None, Some((peer, _))) => media::clear_recv_callback(peer, chan),
         // Clearing must ALWAYS land: when the host closed the channel before
         // the engine unregistered, the peer key can't be resolved anymore, yet
         // leaving the stale registration would keep swallowing the peer's
         // inbound media into a stopped receiver. Sweep by owner chan instead.
-        (None, None) => media::clear_recv_callback_by_chan(chan),
+        (None, _) => media::clear_recv_callback_by_chan(chan),
     }
     0
 }
@@ -1520,7 +1534,7 @@ pub unsafe extern "C" fn veil_media_close_channel(chan: u64) {
     if let Some(ch) = ch {
         // Stop outbound work before waiting for an in-flight recv callback.
         ch.abort_pumps();
-        media::clear_recv_callback(ch.peer, chan);
+        media::clear_recv_callback_by_chan(chan);
     }
 }
 
