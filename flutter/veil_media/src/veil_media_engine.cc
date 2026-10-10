@@ -4106,5 +4106,10 @@ Java_network_veil_xveil_NativeCallVideoRenderer_nativeRemoteVideoStats(
 #endif
 
 #if defined(VEIL_MEDIA_TEST_HOOKS) && defined(VEIL_MEDIA_HAVE_WEBRTC)
+#include "call/rtp_transport_controller_send_interface.h"
+#include "rtc_base/network_route.h"
+#if WEBRTC_ENABLE_PROTOBUF
+#include "modules/audio_coding/audio_network_adaptor/config.pb.h"
+#endif
 #include "../test/call_plane_hooks.inc"
 #endif

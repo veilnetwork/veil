@@ -41,7 +41,7 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # -std=c++20, -nostdinc++, the WebRTC defines) — swapping only the source. This
 # is the only reliable way to match WebRTC's compile environment.
 compile_tu() {  # $1=src  $2=out.o
-  python3 - "$CC_JSON" "$1" "$2" "$SRCDIR" <<'PY' > "$TMP/tu.sh"
+  python3 - "$CC_JSON" "$1" "$2" "$SRCDIR" "$WEBRTC_SRC" <<'PY' > "$TMP/tu.sh"
 import json,sys,re,os
 cc=json.load(open(sys.argv[1])); src,out,shimdir=sys.argv[2],sys.argv[3],sys.argv[4]
 e=next(x for x in cc if x.get('file','').endswith('call/call.cc'))
@@ -51,6 +51,8 @@ cmd=cmd.replace(s,src); cmd=re.sub(r'-o\s+\S+','-o '+out,cmd)
 extra='-DVEIL_MEDIA_HAVE_WEBRTC=1 -I'+shimdir
 if src.endswith(('veil_media_engine.cc', 'veil_avf_adm.mm')) and os.environ.get('VEIL_MEDIA_TEST_HOOKS') == '1':
     extra+=' -DVEIL_MEDIA_TEST_HOOKS=1'
+    if '-DWEBRTC_ENABLE_PROTOBUF=1' in cmd:
+        extra+=' -I'+sys.argv[5]+'/third_party/protobuf/src'
 if src.endswith('.mm'): extra+=' -fobjc-arc'  # Objective-C++ (AVAudioEngine ADM)
 p=cmd.split(' ',1); cmd=p[0]+' '+extra+' '+p[1]
 open('/dev/stdout','w').write('cd "'+e['directory']+'"\n'+cmd+'\n')
