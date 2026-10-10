@@ -24,7 +24,8 @@ extern "C" int veil_media_test_audio_playout_pcm(VeilMediaEngine*, int16_t*, siz
 extern "C" VeilMediaEngine* veil_media_test_duplex_codec_create(
     uint64_t, const uint8_t[32], const uint8_t[32]);
 extern "C" int veil_media_test_audio_transport_budget(VeilMediaEngine*, int);
-extern "C" int veil_media_test_audio_adaptation(VeilMediaEngine*, int);
+extern "C" VeilMediaEngine* veil_media_test_adaptive_codec_create(
+    uint64_t, const uint8_t[32], const uint8_t[32], int);
 struct Callback { void (*fn)(void*, const uint8_t*, size_t); void* ctx; };
 struct Packet { Clock::time_point due; std::vector<uint8_t> bytes; uint64_t destination = 0; };
 static std::mutex mu;
@@ -34,10 +35,12 @@ static Clock::time_point origin;
 static uint64_t source_channel = 0, receiver_channel = 0;
 static size_t sent_packets = 0;
 static bool charged_link=false,charged_duplex=false;
+static int charged_phase_ticks=400;
 static std::map<uint64_t,Clock::time_point> wire_free;
 static size_t wire_drops=0,wire_admissions=0;
 static std::vector<std::array<long long,5>> source_packets;
 static std::array<size_t,3> packets_by_phase{},drops_by_phase{},wire_bytes_by_phase{},control_drops{},control_admissions{};
+static std::array<std::map<int,size_t>,3> submitted_rtp_types;
 static bool perfect_network = false;
 static bool duplex_feedback = false;
 static bool handover_network = false;
@@ -66,9 +69,10 @@ extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t 
   std::lock_guard lock(mu);
   if(charged_link) {
     const auto now=Clock::now();
-    const int phase=std::clamp(int(milliseconds(now)/4000),0,2);
+    const int phase=std::clamp(int(milliseconds(now)/(charged_phase_ticks*10)),0,2);
     const bool control=len>=4 && p[1]>=192 && p[1]<=223;
-    if(!control && ((!charged_duplex && chan!=source_channel) || len<12 || (p[1]&0x7f)!=111)) return 0;
+    if(!control && (len<12 || p[0]>>6!=2)) return -1;
+    if(!control)++submitted_rtp_types[phase][p[1]&0x7f];
     const int capacity=phase==1 ? 64000 : 160000;
     const size_t cost=len+209;
     const auto finish=std::max(now,wire_free[chan])+std::chrono::microseconds(cost*8000000/capacity);
@@ -588,26 +592,27 @@ static void verify_adaptive_bitrate() {
 
 // Model direct-flow framing; IP/UDP/QUIC and packet packing are excluded.
 // Requires a private native library built with rtc_enable_protobuf=true.
-static void verify_adaptive_encapsulation(bool source_pause = false) {
+static void verify_adaptive_encapsulation(bool source_pause = false,
+                                          bool automatic_budget = false,
+                                          int phase_ticks = 400) {
+  charged_phase_ticks=phase_ticks;
   perfect_network=true;duplex_feedback=true;charged_link=true;charged_duplex=true;
   const uint8_t local[32]={1},peer[32]={2};source_channel=200;receiver_channel=300;
   using Engine=std::unique_ptr<VeilMediaEngine,decltype(&veil_media_engine_destroy)>;
-  Engine receiver(veil_media_test_duplex_codec_create(300,peer,local),veil_media_engine_destroy);
-  Engine source(veil_media_test_duplex_codec_create(200,local,peer),veil_media_engine_destroy);
+  Engine receiver(veil_media_test_adaptive_codec_create(300,peer,local,209),veil_media_engine_destroy);
+  Engine source(veil_media_test_adaptive_codec_create(200,local,peer,209),veil_media_engine_destroy);
   assert(source && receiver);
-  assert(veil_media_test_audio_adaptation(source.get(),209)==0);
-  assert(veil_media_test_audio_adaptation(receiver.get(),209)==0);
   origin=Clock::now();
   std::array<int16_t,480> pcm{},reverse_pcm{};std::array<size_t,3> voiced{},reverse_voiced{};std::array<uint64_t,3> reverse_delay{};
   std::array<uint64_t,3> max_delay{},max_interruptions{};
   double max_lateness=0, resume_delay=-1;
   std::vector<double> sent_edges,rendered_edges,reverse_sent_edges,reverse_edges;
   bool was_high=false,reverse_was_high=false;
-  for(int tick=0;tick<1200;++tick) {
+  for(int tick=0;tick<3*phase_ticks;++tick) {
     std::this_thread::sleep_until(origin+std::chrono::milliseconds(10*tick));
     max_lateness=std::max(max_lateness,milliseconds(Clock::now())-10*tick);
-    const int phase=tick/400;
-    if(tick%400==0) {
+    const int phase=tick/phase_ticks;
+    if(tick==0 || (!automatic_budget && tick%phase_ticks==0)) {
       assert(veil_media_test_audio_transport_budget(source.get(),phase==1 ? 48000 : 160000)==0);
       assert(veil_media_test_audio_transport_budget(receiver.get(),phase==1 ? 48000 : 160000)==0);
     }
@@ -637,14 +642,18 @@ static void verify_adaptive_encapsulation(bool source_pause = false) {
     const bool reverse_high=reverse_nonsilent && reverse_crossings>=23;
     if(reverse_high && !reverse_was_high)reverse_edges.push_back(milliseconds(Clock::now()));
     reverse_was_high=reverse_high;
-    if(tick%400>=100) {
+    if(tick%phase_ticks>=100) {
       if(reverse_nonsilent)++reverse_voiced[phase];
       if(tick%10==0)reverse_delay[phase]=std::max(reverse_delay[phase],metric(source.get(),"audio_delay_ms"));
     }
     if(source_pause && tick>=620 && nonsilent && resume_delay<0)
       resume_delay=milliseconds(Clock::now())-6200;
-    if(tick%400>=100) {
+    if(tick%phase_ticks>=100) {
       if(nonsilent)++voiced[phase];
+      assert(metric(source.get(),"audio_encoder_target_bps")>=16000);
+      assert(metric(source.get(),"audio_encoder_target_bps")<=32000);
+      assert(metric(receiver.get(),"audio_encoder_target_bps")>=16000);
+      assert(metric(receiver.get(),"audio_encoder_target_bps")<=32000);
       if(tick%100==0) std::printf("observe tick=%d codec=%llu estimate=%llu packets=%zu drops=%zu delay=%llu\n",tick,(unsigned long long)metric(source.get(),"audio_encoder_target_bps"),(unsigned long long)metric(source.get(),"audio_send_bandwidth_bps"),packets_by_phase[phase],drops_by_phase[phase],(unsigned long long)metric(receiver.get(),"audio_delay_ms"));
       if(tick%10==0){max_delay[phase]=std::max(max_delay[phase],metric(receiver.get(),"audio_delay_ms"));max_interruptions[phase]=metric(receiver.get(),"audio_interruption_count");}
     }
@@ -654,9 +663,13 @@ static void verify_adaptive_encapsulation(bool source_pause = false) {
   std::puts("]");
   if(charged_duplex)std::printf("reverse voiced=%zu/%zu/%zu delay=%llu/%llu/%llu\n",reverse_voiced[0],reverse_voiced[1],reverse_voiced[2],(unsigned long long)reverse_delay[0],(unsigned long long)reverse_delay[1],(unsigned long long)reverse_delay[2]);
   std::printf("control admissions=%zu/%zu/%zu drops=%zu/%zu/%zu total_drops=%zu\n",control_admissions[0],control_admissions[1],control_admissions[2],control_drops[0],control_drops[1],control_drops[2],wire_drops);
+  for(size_t phase=0;phase<3;++phase) {
+    for(const auto& [type,count]:submitted_rtp_types[phase])
+      std::printf("submitted RTP phase=%zu type=%d count=%zu\n",phase,type,count);
+  }
   for(const auto& p:source_packets)std::printf("rtp at_us=%lld seq=%lld ts=%lld len=%lld source=%lld\n",p[0],p[1],p[2],p[3],p[4]);
   assert(max_lateness<30);
-  for (size_t phase=0; phase<3; ++phase) {
+  if(!automatic_budget) for (size_t phase=0; phase<3; ++phase) {
     if(source_pause && phase==1)assert(voiced[phase]>=160 && voiced[phase]<=230);
     else assert(voiced[phase]==300);
     assert(reverse_voiced[phase]==300);
@@ -671,22 +684,30 @@ static void verify_adaptive_encapsulation(bool source_pause = false) {
     assert(next!=reverse_edges.end());
     double delay=*next-reverse_sent_edges[i];
     std::printf("%s%.2f",i ? "," : "",delay);
-    assert(delay<300);
+    if(!automatic_budget)assert(delay<300);
   }
   std::puts("]");
   if(source_pause) {
     std::printf("DTX resume_ms=%.2f\n",resume_delay);
     assert(resume_delay>=0 && resume_delay<300);
   }
-  assert(metric(source.get(),"audio_interruption_count")==0);
+  if(!automatic_budget)assert(metric(source.get(),"audio_interruption_count")==0);
   for (double edge:sent_edges) {
     auto next=std::find_if(rendered_edges.begin(),rendered_edges.end(),
                          [&](double rendered){return rendered>=edge;});
-    assert(next!=rendered_edges.end() && *next-edge<300);
+    if(!automatic_budget)assert(next!=rendered_edges.end() && *next-edge<300);
   }
 }
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--characterize-adaptive-encapsulation-recovery") == 0) {
+    verify_adaptive_encapsulation(false, true, 1200);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--characterize-adaptive-encapsulation-auto") == 0) {
+    verify_adaptive_encapsulation(false, true);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--adaptive-encapsulation-silence") == 0) {
     verify_adaptive_encapsulation(true);
     return 0;

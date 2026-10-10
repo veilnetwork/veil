@@ -35,7 +35,7 @@ OUT="${TMPDIR:-/tmp}/veil_media_typecheck.o"
   exit 1
 }
 
-python3 - "$CC_JSON" "$SRC" "$OUT" "$SRCDIR" <<'PY' > "${TMPDIR:-/tmp}/veil_media_typecheck.sh"
+python3 - "$CC_JSON" "$SRC" "$OUT" "$SRCDIR" "$WEBRTC_SRC" <<'PY' > "${TMPDIR:-/tmp}/veil_media_typecheck.sh"
 import json, re, sys
 cc = json.load(open(sys.argv[1]))
 src, out, shimdir = sys.argv[2], sys.argv[3], sys.argv[4]
@@ -52,7 +52,8 @@ print('cd ' + cc[0]['directory'])
 # ignored that result and destroyed a transport underneath the streams
 # configured with it. As an error, a new call site cannot get past this gate
 # without saying what it does when the worker queue never schedules.
-print(cmd + ' -DVEIL_MEDIA_HAVE_WEBRTC=1 -Werror=unused-result -I' + shimdir)
+extra=' -I'+sys.argv[5]+'/third_party/protobuf/src' if '-DWEBRTC_ENABLE_PROTOBUF=1' in cmd else ''
+print(cmd + ' -DVEIL_MEDIA_HAVE_WEBRTC=1 -Werror=unused-result -I' + shimdir + extra)
 PY
 
 bash "${TMPDIR:-/tmp}/veil_media_typecheck.sh"
