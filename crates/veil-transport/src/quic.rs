@@ -84,6 +84,13 @@ pub struct QuicDatagramPathStats {
     pub congestion_events: u64,
     pub udp_sent: u64,
     pub udp_received: u64,
+    /// Cumulative UDP payload bytes prepared by QUIC / observed on receive,
+    /// including framing, encryption, padding and control traffic. Excludes
+    /// IP/UDP headers; prepared sends can still be waiting for the socket.
+    pub udp_sent_bytes: u64,
+    pub udp_received_bytes: u64,
+    /// UDP payload bytes successfully handed to the socket, not remote ACKs.
+    pub udp_socket_sent_bytes: u64,
     pub acknowledgments_received: u64,
     pub stream_frames_sent: u64,
     pub stream_frames_received: u64,
@@ -125,6 +132,9 @@ impl QuicDatagramHandle {
             congestion_events: stats.path.congestion_events,
             udp_sent: stats.udp_tx.datagrams,
             udp_received: stats.udp_rx.datagrams,
+            udp_sent_bytes: stats.udp_tx.bytes,
+            udp_received_bytes: stats.udp_rx.bytes,
+            udp_socket_sent_bytes: driver.udp_socket_sent_bytes,
             acknowledgments_received: stats.frame_rx.acks,
             stream_frames_sent: stats.frame_tx.stream,
             stream_frames_received: stats.frame_rx.stream,
@@ -1128,6 +1138,7 @@ mod tests {
 
     #[tokio::test]
     async fn punched_socket_is_reused_for_quic_roundtrip() {
+        use std::time::Duration;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let initiator_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1170,8 +1181,32 @@ mod tests {
             initiator_datagrams.send_buffer_space(),
             REALTIME_DATAGRAM_BUFFER_BYTES,
         );
-        initiator_datagrams.send(b"rt-datagram").unwrap();
-        assert_eq!(responder_datagrams.recv().await.unwrap(), b"rt-datagram");
+        let sent_before = initiator_datagrams.path_stats().udp_sent_bytes;
+        let socket_sent_before = initiator_datagrams.path_stats().udp_socket_sent_bytes;
+        let received_before = responder_datagrams.path_stats().udp_received_bytes;
+        let payload = [0x5au8; 512];
+        initiator_datagrams.send(&payload).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), responder_datagrams.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            payload,
+        );
+        // Count the actual encrypted UDP payload, rather than application
+        // admission bytes. Handshake/control traffic can share this interval,
+        // so only require a lower bound, not a specific packetization.
+        assert!(
+            initiator_datagrams.path_stats().udp_sent_bytes > sent_before + payload.len() as u64
+        );
+        assert!(
+            initiator_datagrams.path_stats().udp_socket_sent_bytes
+                > socket_sent_before + payload.len() as u64
+        );
+        assert!(
+            responder_datagrams.path_stats().udp_received_bytes
+                > received_before + payload.len() as u64
+        );
         let mut responder_stream = responder.into_stream().unwrap();
         let (read_done_tx, read_done_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
