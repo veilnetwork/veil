@@ -51,6 +51,9 @@ final int Function(Pointer<VeilMediaEngineHandle>, int)?
 final int Function(Pointer<VeilMediaEngineHandle>, int)?
     veilMediaEngineReleaseReceiveChannel =
     _lookupChannelOperation('veil_media_engine_release_receive_channel');
+final int Function(Pointer<VeilMediaEngineHandle>, int)?
+    veilMediaEngineSetAudioMirrorChannel =
+    _lookupChannelOperation('veil_media_engine_set_audio_mirror_channel');
 
 // start_audio(engine*, send int, recv int) -> int
 final int Function(Pointer<VeilMediaEngineHandle>, int, int)

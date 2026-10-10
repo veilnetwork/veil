@@ -162,6 +162,7 @@ void VeilTransportShim::Start() {
 void VeilTransportShim::Stop() {
   bool expected = true;
   if (!started_.compare_exchange_strong(expected, false)) return;
+  audio_mirror_chan_.store(0, std::memory_order_release);
   for (const auto channel : receive_channels_)
     veil_media_set_recv_callback(channel, nullptr, nullptr);
   receive_channels_.clear();
@@ -200,6 +201,9 @@ bool VeilTransportShim::RebindChannel(uint64_t veil_chan, bool retain_previous_r
   // route, and a local outbound switch does not move the peer's outbound leg.
   if (veil_media_set_recv_callback(
           veil_chan, &VeilTransportShim::OnVeilDatagram, this) != 0) return false;
+  // An alternate belongs to the previous outbound generation. The host can
+  // qualify/reinstall it after committing this handover, never implicitly.
+  audio_mirror_chan_.store(0, std::memory_order_release);
   veil_chan_.store(veil_chan, std::memory_order_release);
   receive_channels_.push_back(veil_chan);
   if (!retain_previous_receiver) ReleaseReceiveChannel(previous);
@@ -227,6 +231,19 @@ bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
   if (audio) {
     audio_send_stats_.mark_result(started_ns, webrtc::TimeMicros() * 1000, rc == 0);
   }
+  bool mirrored = false;
+  const auto mirror = audio_mirror_chan_.load(std::memory_order_acquire);
+  if (mirror && mirror != veil_chan_.load(std::memory_order_acquire) &&
+      AudioPayloadKey(packet, local_audio_ssrc_.load(std::memory_order_relaxed))) {
+    // Both calls only try to enqueue onto independent, bounded native pumps.
+    // The secondary pump never waits for the primary's route/connection send.
+    audio_mirror_attempts_.fetch_add(1, std::memory_order_relaxed);
+    mirrored = veil_media_send_datagram(mirror, packet.data(), packet.size()) == 0;
+    if (mirrored) {
+      audio_mirror_queued_.fetch_add(1, std::memory_order_relaxed);
+      audio_mirror_bytes_.fetch_add(packet.size(), std::memory_order_relaxed);
+    }
+  }
   static const bool diagnostics_enabled = diag::enabled();
   if (diagnostics_enabled) {
     static std::atomic<uint64_t> n{0};
@@ -239,7 +256,7 @@ bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
   // rc: 0 queued, 1 dropped (queue full), -1 invalid. Queue-full means this
   // packet already lost its real-time slot; report it as unsent so WebRTC does
   // not treat local buffering as healthy delivery and build a stale tail.
-  const bool sent = rc == 0;
+  const bool sent = rc == 0 || mirrored;
   if (sent) {
     outbound_packet_count_.fetch_add(1, std::memory_order_relaxed);
     outbound_byte_count_.fetch_add(packet.size(), std::memory_order_relaxed);
@@ -513,6 +530,13 @@ void VeilTransportShim::DeliverOnNetworkThread(
   if (secondary != is_video) return;
   if (!is_video && rtp.PayloadType() == 111 && rtp.payload_size() > 0 &&
       rtp.Ssrc() == remote_audio_ssrc_.load(std::memory_order_relaxed)) {
+    const auto key = AudioPayloadKey(packet, rtp.Ssrc());
+    if (key && !audio_packet_history_.accept(*key)) {
+      // A delayed second copy must not reach NetEq/TWCC or renew payload
+      // freshness. Authentication has already happened in the Veil channel.
+      audio_duplicate_packets_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
     auto previous = audio_payload_arrived_us_.load(std::memory_order_relaxed);
     while (previous < arrived_us &&
            !audio_payload_arrived_us_.compare_exchange_weak(
