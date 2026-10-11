@@ -148,7 +148,7 @@ impl Fixture {
         let (tx, rx) = mpsc::channel(4);
         let (video, _) = mpsc::channel(4);
         let id = MEDIA_NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        MEDIA_CHANNELS.lock().unwrap().insert(
+        MEDIA_CHANNELS.write().unwrap().insert(
             id,
             MediaChannel {
                 path_probe: None,

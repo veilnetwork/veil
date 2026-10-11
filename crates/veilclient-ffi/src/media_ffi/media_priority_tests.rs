@@ -519,7 +519,7 @@ async fn anonymous_repair_fans_out_with_independent_backpressure() {
     let (repair_screen, mut repair_screen_rx) = mpsc::channel(1);
     let id = MEDIA_NEXT_ID.fetch_add(1, Ordering::Relaxed);
     MEDIA_CHANNELS
-        .lock()
+        .write()
         .unwrap_or_else(|p| p.into_inner())
         .insert(
             id,
@@ -585,7 +585,7 @@ async fn closing_channel_cancels_both_blocked_pumps() {
     let (tx_video, _video_rx) = mpsc::channel(1);
     let id = MEDIA_NEXT_ID.fetch_add(1, Ordering::Relaxed);
     MEDIA_CHANNELS
-        .lock()
+        .write()
         .unwrap_or_else(|p| p.into_inner())
         .insert(
             id,
@@ -645,7 +645,7 @@ async fn private_address_control_requires_call_aead_and_never_reaches_the_engine
     let before = crate::media::recv_count(peer);
     let (tx_hi, _rx) = mpsc::channel(1);
     let (tx_video, _video_rx) = mpsc::channel(1);
-    MEDIA_CHANNELS.lock().unwrap().insert(
+    MEDIA_CHANNELS.write().unwrap().insert(
         id,
         MediaChannel {
             path_probe: None,
@@ -917,7 +917,7 @@ fn register_test_ingress(
     let id = MEDIA_NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let cipher = Arc::new(cipher_for_test(&peer, &[1; 32], &[2; 32]).unwrap());
     let weak = Arc::downgrade(&cipher);
-    MEDIA_CHANNELS.lock().unwrap().insert(
+    MEDIA_CHANNELS.write().unwrap().insert(
         id,
         MediaChannel {
             path_probe: None,
@@ -948,6 +948,37 @@ fn send_when_registry_available(id: u64, packet: &[u8]) -> i32 {
         }
         std::thread::yield_now();
     }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn native_ingress_diagnostics_attribute_queue_failures_without_changing_admission() {
+    use super::ingress_diagnostics::{Reason, snapshot};
+    let (tx_hi, mut rx_hi) = mpsc::channel(1);
+    let (tx_video, rx_video) = mpsc::channel(1);
+    let ingress = MediaIngress::new(tx_hi, MediaVideoIngress::Packets(tx_video));
+    let before = snapshot();
+    assert_eq!(ingress.enqueue(video_packet(1, true, 1).into()), 0);
+    assert_eq!(ingress.enqueue(video_packet(2, true, 2).into()), 1);
+    // Saturated video still cannot occupy the audio source.
+    assert_eq!(ingress.enqueue(vec![0x80, 111, 1, 2].into()), 0);
+    assert_eq!(ingress.enqueue(vec![0x80, 111, 3, 4].into()), 1);
+    let full = snapshot();
+    assert!(
+        full[Reason::PacketQueueFull as usize * 2] > before[Reason::PacketQueueFull as usize * 2]
+    );
+    assert!(
+        full[Reason::PacketQueueFull as usize * 2 + 1]
+            > before[Reason::PacketQueueFull as usize * 2 + 1]
+    );
+    assert_eq!(rx_hi.try_recv().unwrap().payload, [0x80, 111, 1, 2]);
+    drop(rx_video);
+    assert_eq!(ingress.enqueue(video_packet(3, true, 3).into()), -1);
+    let closed = snapshot();
+    assert!(
+        closed[Reason::PacketQueueClosed as usize * 2 + 1]
+            > full[Reason::PacketQueueClosed as usize * 2 + 1]
+    );
 }
 
 #[tokio::test]
@@ -999,14 +1030,54 @@ async fn native_ingress_audio_control_and_other_channels_pass_held_video_assembl
 }
 
 #[tokio::test]
-async fn native_ingress_registry_contention_drops_without_waiting() {
+async fn native_ingress_registry_readers_do_not_discard_audio_or_video() {
+    let (tx_hi, mut rx_hi) = mpsc::channel(4);
+    let (video, mut rx_video) = mpsc::channel(4);
+    let (id, _) = register_test_ingress(
+        MediaIngress::new(tx_hi, MediaVideoIngress::Packets(video)),
+        [0xd5; 32],
+    );
+    let reader = MEDIA_CHANNELS.read().unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let audio = [0x80, 111, 1, 2];
+        let video = video_packet(1, true, 3);
+        let feedback = [0x80, 201, 0, 1, 0, 0, 0, 1];
+        done_tx
+            .send(unsafe {
+                (
+                    veil_media_send_datagram(id, audio.as_ptr(), audio.len()),
+                    veil_media_send_datagram(id, video.as_ptr(), video.len()),
+                    veil_media_send_video_control_datagram(id, feedback.as_ptr(), feedback.len()),
+                )
+            })
+            .unwrap();
+    });
+    let result = done_rx.recv_timeout(Duration::from_secs(1));
+    drop(reader); // Release before any assertion, including a regression.
+    worker.join().unwrap();
+    unsafe { veil_media_close_channel(id) };
+    assert_eq!(result.unwrap(), (0, 0, 0));
+    assert_eq!(rx_hi.try_recv().unwrap().payload, [0x80, 111, 1, 2]);
+    assert_eq!(
+        rx_video.try_recv().unwrap().payload,
+        video_packet(1, true, 3)
+    );
+    assert_eq!(
+        rx_video.try_recv().unwrap().payload,
+        [0x80, 201, 0, 1, 0, 0, 0, 1]
+    );
+}
+
+#[tokio::test]
+async fn native_ingress_registry_mutation_drops_without_waiting() {
     let (tx_hi, mut rx_hi) = mpsc::channel(4);
     let (video, _rx_video) = mpsc::channel(4);
     let (id, _) = register_test_ingress(
         MediaIngress::new(tx_hi, MediaVideoIngress::Packets(video)),
         [0xd3; 32],
     );
-    let registry_guard = MEDIA_CHANNELS.lock().unwrap();
+    let registry_guard = MEDIA_CHANNELS.write().unwrap();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         let packet = [0x80, 111, 1, 2];
