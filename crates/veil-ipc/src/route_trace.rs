@@ -87,7 +87,7 @@ fn delivery_digest(data: &[u8]) -> Option<[u8; 32]> {
     let seq = u64::from_be_bytes(data[12..20].try_into().ok()?);
     // Inspect only a fixed encrypted header for sparse sampling. Hash the
     // ENTIRE ciphertext so an unverified header cannot alias an authentic cell.
-    (seq != 0 && seq.is_multiple_of(50)).then(|| *blake3::hash(data).as_bytes())
+    (seq == 1 || (seq != 0 && seq.is_multiple_of(50))).then(|| *blake3::hash(data).as_bytes())
 }
 
 /// Record a bounded, silent observation on the locally terminating delivery
@@ -213,7 +213,11 @@ fn sealed_sample(body: &[u8], data: &[u8]) -> Option<SealedLocalSample> {
     }
     let epoch = u64::from_be_bytes(data[4..12].try_into().unwrap());
     let seq = u64::from_be_bytes(data[12..20].try_into().unwrap());
-    if seq == 0 || !seq.is_multiple_of(50) {
+    // A fresh candidate sends its delivery probe as sequence one. Sampling
+    // only later RTP packets hid exactly the first send needed to locate a
+    // failed handover. This remains opt-in endpoint metadata, never a wire
+    // feature or relay classification.
+    if seq == 0 || (seq != 1 && !seq.is_multiple_of(50)) {
         return None;
     }
     Some(SealedLocalSample {
@@ -383,7 +387,18 @@ mod tests {
             relay_sample(&relay(cell(50), flags)),
             rt_sample(&direct(cell(50)))
         );
-        for seq in [0, 1, 49, 51, u64::MAX] {
+        let first = SealedLocalSample {
+            destination: [0x11; 4],
+            epoch: 17,
+            seq: 1,
+            bytes: cell(1).len(),
+        };
+        assert_eq!(rt_sample(&direct(cell(1))), Some(first));
+        assert_eq!(
+            relay_sample(&relay(cell(1), flags)),
+            rt_sample(&direct(cell(1)))
+        );
+        for seq in [0, 2, 49, 51, u64::MAX] {
             assert_eq!(rt_sample(&direct(cell(seq))), None);
             assert_eq!(relay_sample(&relay(cell(seq), flags)), None);
         }
@@ -491,7 +506,8 @@ mod tests {
         );
         samples.record(forged_digest, LocalDeliveryStage::SdkRead, now);
         assert!(samples.take(&digest, now).is_none());
-        for seq in [0, 1, 49, 51] {
+        assert!(delivery_digest(&cell(1)).is_some());
+        for seq in [0, 2, 49, 51] {
             assert!(delivery_digest(&cell(seq)).is_none());
         }
         assert!(delivery_digest(&authentic[..35]).is_none());

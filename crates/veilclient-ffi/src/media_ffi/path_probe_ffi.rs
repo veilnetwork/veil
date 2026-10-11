@@ -370,6 +370,17 @@ pub(crate) fn dispatch_without_lease(payload: &[u8]) {
     }
     for context in contexts().into_iter().filter(|context| context.live()) {
         if let Some(plaintext) = context.cipher.open(payload) {
+            // The candidate may arrive through the other device/identity alias
+            // before it owns an RTP receive lease. Keep the same authenticated
+            // endpoint trace boundary on this path, using the host-pinned peer.
+            // Never log a header that failed AEAD or a malformed control.
+            if let Some(control) = ProbeControl::decode(&plaintext) {
+                media::trace_sealed_cell(
+                    "received",
+                    &context.replies[control.route.index()].peer,
+                    payload,
+                );
+            }
             dispatch_control(&context.cipher, &plaintext);
             return;
         }
