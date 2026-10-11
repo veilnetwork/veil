@@ -287,14 +287,29 @@ pub extern "C" fn veil_media_channel_begin_path_probe(chan: u64, budget_ms: u32)
         now,
         Duration::from_millis(u64::from(budget_ms)),
     );
-    let result = ingress.enqueue(QueuedMediaPacket::from(next.request_payload()));
+    let result = ingress.enqueue(queued_probe_request(
+        next.request_payload(),
+        next.deadline(),
+    ));
     if result == 0 {
         *attempt = Some(next);
     }
     result
 }
 
+fn queued_probe_request(payload: Vec<u8>, deadline: Instant) -> QueuedMediaPacket {
+    let mut packet = QueuedMediaPacket::from(payload);
+    // A late retry has less than the normal 200-ms source freshness budget.
+    // Do not retain it in ingress or the sealed sender after its observation.
+    packet.deadline = packet
+        .deadline
+        .min(tokio::time::Instant::from_std(deadline));
+    packet
+}
+
 /// Poll a candidate without waiting for a network or changing RTP counters.
+/// While pending, admit at most two spaced challenge retries to its existing
+/// nonblocking primary ingress; the original observation budget stays fixed.
 /// 0=pending/busy, 1=qualified and fresh, 2=expired, -1=closed/cancelled.
 #[unsafe(no_mangle)]
 pub extern "C" fn veil_media_channel_poll_path_probe(chan: u64) -> c_int {
@@ -313,10 +328,19 @@ pub extern "C" fn veil_media_channel_poll_path_probe(chan: u64) -> c_int {
         return -1;
     }
     let mut attempt = context.attempt.lock().unwrap_or_else(|p| p.into_inner());
-    match attempt
-        .as_mut()
-        .map(|attempt| attempt.status(Instant::now()))
+    let now = Instant::now();
+    if let Some((payload, deadline)) = attempt.as_mut().and_then(|attempt| {
+        attempt
+            .retry_payload(now)
+            .map(|payload| (payload, attempt.deadline()))
+    }) && let Some(ingress) = context.ingress.upgrade()
     {
+        // A full ingress consumes this bounded retry opportunity, never a
+        // busy loop or an extra lease. Closing/cancellation prevents retries
+        // on subsequent polls, just as it prevents qualification.
+        let _ = ingress.enqueue(queued_probe_request(payload, deadline));
+    }
+    match attempt.as_mut().map(|attempt| attempt.status(now)) {
         Some(ProbeStatus::Pending) => 0,
         Some(ProbeStatus::Qualified(_)) => 1,
         Some(ProbeStatus::Expired) => 2,
