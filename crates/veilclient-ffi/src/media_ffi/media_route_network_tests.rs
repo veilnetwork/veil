@@ -287,7 +287,7 @@ fn channel(me: [u8; 32], peer: [u8; 32], tx_key: [u8; 32], rx_key: [u8; 32]) -> 
     let task = spawn(rx_hi, repair_hi_rx, LocalMediaPlane::Primary);
     let video_task = spawn(rx_video, repair_video_rx, LocalMediaPlane::Secondary);
     let screen_task = spawn(rx_screen, repair_screen_rx, LocalMediaPlane::Screen);
-    MEDIA_CHANNELS.lock().unwrap().insert(
+    MEDIA_CHANNELS.write().unwrap().insert(
         id,
         MediaChannel {
             path_probe: None,
@@ -464,7 +464,7 @@ async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stall
         .unwrap()
         .insert(video_m.circuit_id_in, original);
     wait_until(|| {
-        let channels = MEDIA_CHANNELS.lock().unwrap();
+        let channels = MEDIA_CHANNELS.read().unwrap();
         let MediaVideoIngress::Packets(tx) = &channels.get(&ca.id).unwrap().ingress.video else {
             panic!("anonymous channel must have a packet ingress")
         };

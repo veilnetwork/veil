@@ -189,7 +189,7 @@ pub unsafe extern "C" fn veil_media_channel_configure_path_probes(
     let Some(relay) = read(unsafe { &*relay }) else {
         return -1;
     };
-    let mut map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
+    let mut map = MEDIA_CHANNELS.write().unwrap_or_else(|p| p.into_inner());
     let Some(channel) = map.get_mut(&chan) else {
         return -1;
     };
@@ -255,7 +255,7 @@ pub extern "C" fn veil_media_channel_begin_path_probe(chan: u64, budget_ms: u32)
         return -1;
     }
     let context = {
-        let map = match MEDIA_CHANNELS.try_lock() {
+        let map = match MEDIA_CHANNELS.try_read() {
             Ok(map) => map,
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return 1,
@@ -298,7 +298,7 @@ pub extern "C" fn veil_media_channel_begin_path_probe(chan: u64, budget_ms: u32)
 /// 0=pending/busy, 1=qualified and fresh, 2=expired, -1=closed/cancelled.
 #[unsafe(no_mangle)]
 pub extern "C" fn veil_media_channel_poll_path_probe(chan: u64) -> c_int {
-    let map = match MEDIA_CHANNELS.try_lock() {
+    let map = match MEDIA_CHANNELS.try_read() {
         Ok(map) => map,
         Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => return 0,
@@ -326,7 +326,7 @@ pub extern "C" fn veil_media_channel_poll_path_probe(chan: u64) -> c_int {
 
 fn contexts() -> Vec<Arc<PathProbeContext>> {
     MEDIA_CHANNELS
-        .lock()
+        .read()
         .unwrap_or_else(|p| p.into_inner())
         .values()
         .filter_map(|channel| channel.path_probe.as_ref())
