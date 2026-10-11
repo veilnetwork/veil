@@ -6,19 +6,23 @@
 #include "bounded_audio_encoder.h"
 #include "modules/audio_coding/audio_network_adaptor/config.pb.h"
 #include "system_wrappers/include/clock.h"
+#include "third_party/opus/src/include/opus.h"
 
 // Real Opus/ANA regression: a peer that permits only short packets must not
 // lower speech bitrate because allocation accounting assumes longer packets.
 int main() {
   webrtc::SimulatedClock clock(0);
   const auto env = webrtc::CreateEnvironment(&clock);
-  auto factory = webrtc::make_ref_counted<veil_media::BoundedAudioEncoderFactory>();
   for (int maximum_ms : std::array{20, 40, 60}) {
+    auto duration = std::make_shared<std::atomic<int>>(0);
+    auto factory =
+        webrtc::make_ref_counted<veil_media::BoundedAudioEncoderFactory>(duration);
     webrtc::SdpAudioFormat format("opus", 48000, 2,
         {{"minptime", "20"}, {"maxptime", std::to_string(maximum_ms)},
-         {"stereo", "0"}, {"useinbandfec", "1"}});
+         {"stereo", "0"}, {"useinbandfec", "1"}, {"usedtx", "1"}});
     auto encoder = factory->Create(env, format, {.payload_type = 111});
     if (!encoder) return 1;
+    if (duration->load() != 0) return 4;
     encoder->SetReceiverFrameLengthRange(20, maximum_ms);
     webrtc::audio_network_adaptor::config::ControllerManager manager;
     if (maximum_ms > 20) {
@@ -39,7 +43,14 @@ int main() {
       for (int i = 0; i < 120; ++i) {
         encoder->OnReceivedUplinkAllocation(update);
         webrtc::Buffer packet;
-        encoder->Encode(timestamp, pcm, &packet);
+        const int before = duration->load();
+        const auto info = encoder->Encode(timestamp, pcm, &packet);
+        // Check the actual Opus payload, independently of the wrapper's
+        // Num10MsFramesInNextPacket observation. Release builds use NDEBUG.
+        const int expected = info.encoded_bytes > 0
+            ? opus_packet_get_nb_samples(packet.data(), packet.size(), 48000) / 48
+            : before;
+        if (duration->load() != expected) return 5;
         timestamp += 480;
         clock.AdvanceTimeMilliseconds(10);
       }
@@ -51,6 +62,7 @@ int main() {
                      maximum_ms, allocation, bitrate, packet_ms);
         return 3;
       }
+      if (duration->load() < 20 || duration->load() > maximum_ms) return 6;
     }
     std::printf("ok: real Opus/ANA maxptime=%d, payload stays 16–32 kbit/s\n", maximum_ms);
   }

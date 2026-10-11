@@ -188,7 +188,8 @@ void configure_call_audio_transport(webrtc::CallConfig& config) {
 // Keep the existing mono ceiling and 20-ms duration by default. Opt-in ANA
 // accounts for framing separately and retains the codec while durations change.
 void configure_call_audio_send(webrtc::AudioSendStream::Config& config,
-                               bool transport_feedback, int packet_overhead = 0) {
+                               bool transport_feedback, int packet_overhead = 0,
+                               std::shared_ptr<std::atomic<int>> packet_duration = {}) {
   if (!transport_feedback) return;
   config.min_bitrate_bps = 12'000;
   config.max_bitrate_bps = 32'000;
@@ -201,7 +202,9 @@ void configure_call_audio_send(webrtc::AudioSendStream::Config& config,
     config.max_bitrate_bps = 80'000;
     config.send_codec_spec->format.parameters["minptime"] = "20";
     config.send_codec_spec->format.parameters["maxptime"] = "60";
-    config.encoder_factory = webrtc::make_ref_counted<veil_media::BoundedAudioEncoderFactory>();
+    config.encoder_factory =
+        webrtc::make_ref_counted<veil_media::BoundedAudioEncoderFactory>(
+            std::move(packet_duration));
     webrtc::audio_network_adaptor::config::ControllerManager manager;
     auto* frames = manager.add_controllers()->mutable_frame_length_controller_v2();
     frames->set_min_payload_bitrate_bps(16'000);
@@ -211,6 +214,7 @@ void configure_call_audio_send(webrtc::AudioSendStream::Config& config,
   }
 #else
   (void)packet_overhead;
+  (void)packet_duration;
 #endif
 }
 
@@ -1025,6 +1029,10 @@ struct WebrtcState {
   std::unique_ptr<veil_media::VeilTransportShim> shim;
   webrtc::AudioSendStream* send_stream = nullptr;             // owned by Call
   webrtc::AudioReceiveStreamInterface* recv_stream = nullptr;  // owned by Call
+  // Per-engine encoder observation; zero means no actual adaptive packet yet.
+  // Atomics bridge encoder and diagnostic threads without a worker round trip.
+  std::shared_ptr<std::atomic<int>> audio_packet_duration =
+      std::make_shared<std::atomic<int>>(0);
   // Video (Phase 4) — factories + source/sink outlive the streams.
   std::unique_ptr<webrtc::VideoEncoderFactory> video_encoder_factory;
   std::unique_ptr<webrtc::VideoDecoderFactory> video_decoder_factory;
@@ -2741,6 +2749,7 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
     ws->call->SignalChannelNetworkState(webrtc::MediaType::AUDIO,
                                         webrtc::kNetworkUp);
     if (send && ws->send_stream == nullptr) {
+      ws->audio_packet_duration->store(0, std::memory_order_relaxed);
       webrtc::AudioSendStream::Config sc(ws->shim.get());  // sets send_transport
       sc.rtp.ssrc = local_ssrc;
       // TWCC: the send-side bandwidth estimator needs this both ways.
@@ -2751,7 +2760,8 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
       sc.send_codec_spec = webrtc::AudioSendStream::Config::SendCodecSpec(
           kOpusPayloadType, VeilOpusSendFormat());
       configure_call_audio_send(sc, ws->shim->independent_transport_feedback(),
-                                engine->audio_packet_overhead.load());
+                                engine->audio_packet_overhead.load(),
+                                ws->audio_packet_duration);
 #if WEBRTC_ENABLE_PROTOBUF
       if (engine->audio_packet_overhead.load() > 0) {
         webrtc::BitrateConstraints limits;
@@ -3898,6 +3908,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         "\"audio_tx_payload_max_gap_ms\":%lld,\"audio_tx_retransmitted_pkts\":%llu,"
         "\"audio_encoder_target_bps\":%lld,\"audio_send_bandwidth_bps\":%d,"
         "\"audio_packet_adaptation\":%d,\"audio_packet_overhead_bytes\":%d,"
+        "\"audio_tx_packet_duration_ms\":%d,"
         "\"rtcp_tx_pkts\":%llu,\"rtcp_tx_bytes\":%llu,"
         "\"video_rtcp_tx_pkts\":%llu,\"video_rtcp_tx_bytes\":%llu,"
         "\"audio_tx_rtp_age_ms\":%lld,\"audio_tx_rtp_queue_age_ms\":%lld,"
@@ -3958,6 +3969,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<unsigned long long>(audio_tx_retransmitted_pkts),
         static_cast<long long>(audio_encoder_target_bps), audio_send_bandwidth_bps,
         engine->audio_packet_overhead.load() > 0 ? 1 : 0, engine->audio_packet_overhead.load(),
+        ws->audio_packet_duration->load(std::memory_order_relaxed),
         static_cast<unsigned long long>(ws->shim->outbound_rtcp_packet_count()),
         static_cast<unsigned long long>(ws->shim->outbound_rtcp_byte_count()),
         static_cast<unsigned long long>(ws->shim->outbound_video_rtcp_packet_count()),
