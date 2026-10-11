@@ -81,6 +81,18 @@ pub trait FrameBroadcaster: Send + Sync {
     /// `false` if the peer is not registered or its channel is closed/full.
     fn send_to(&self, peer_id: &[u8; 32], priority: u8, bytes: Vec<u8>) -> bool;
 
+    /// Admit a trusted endpoint source with ingress backpressure. The caller
+    /// bounds its wait; transit forwarding must keep the ordinary try-send.
+    /// The selector stays local and does not change the encoded wire header.
+    fn send_local_source_to<'a>(
+        &'a self,
+        peer_id: &'a [u8; 32],
+        local_lane: u8,
+        bytes: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move { self.send_to(peer_id, local_lane, bytes) })
+    }
+
     /// Admit an endpoint-owned reliable byte-stream frame with backpressure.
     /// Production implementations retain a bounded local credit until the
     /// scheduler consumes the frame; relay traffic must not use this API.
