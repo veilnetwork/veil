@@ -2068,6 +2068,10 @@ const COMPACT_RELAY_MEDIA_CELL_MAX: usize = 1000;
 #[derive(Default)]
 struct RelayVideoFrameAssembler {
     discard_until_marker: bool,
+    // The last original frame remains known after its marker/reset so a NACK
+    // retransmission can be sent independently of the current frame. RTP
+    // timestamps are serial numbers; ordinary wrap is not a backwards frame.
+    newest_timestamp: Option<u32>,
     timestamp: Option<u32>,
     packets: Vec<Vec<u8>>,
     bytes: usize,
@@ -2087,13 +2091,28 @@ impl RelayVideoFrameAssembler {
             self.reset();
             return RelayVideoFramePush::Dropped;
         }
+        let timestamp = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+        if self.newest_timestamp.is_some_and(|newest| {
+            (timestamp.wrapping_sub(newest) as i32) < 0
+                || (timestamp == newest && self.timestamp.is_none() && !self.discard_until_marker)
+        }) {
+            // NACK repairs contain individual old RTP fragments, often without
+            // the frame's marker. Waiting for the whole old frame swallows the
+            // repair; replacing the current prefix also corrupts a new frame.
+            // Keep the same bounded video queue/plane and send this work item
+            // immediately. A repair marker must not end contention discard.
+            if packet.len() > RELAY_VIDEO_FRAME_MAX_BYTES {
+                return RelayVideoFramePush::Dropped;
+            }
+            return RelayVideoFramePush::Complete(vec![packet]);
+        }
+        self.newest_timestamp = Some(timestamp);
         if self.discard_until_marker {
             if packet[1] & 0x80 != 0 {
                 self.discard_until_marker = false;
             }
             return RelayVideoFramePush::Dropped;
         }
-        let timestamp = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
         if self.timestamp.is_some_and(|current| current != timestamp) {
             // A new frame started before the previous marker arrived. Never
             // forward the orphan prefix: it cannot be decoded and only adds
