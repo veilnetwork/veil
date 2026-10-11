@@ -39,7 +39,8 @@ use crate::IpcMetrics;
 #[path = "source_envelope.rs"]
 mod source_envelope;
 use source_envelope::{
-    DirectAdmission, EnvelopeChunks, admit_direct_plain, admit_direct_sealed, source_segment_bytes,
+    DirectAdmission, EnvelopeChunks, admit_direct_plain, admit_direct_sealed,
+    send_packetized_control, source_segment_bytes,
 };
 
 /// How long a discovery that found no route is believed.
@@ -854,6 +855,9 @@ pub(crate) async fn handle_ipc_send(
     let relay_wire_realtime = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME != 0;
     let relay_control_compat = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT != 0;
     let relay_realtime = relay_wire_realtime || relay_control_compat;
+    // One bounded ingress wait for the entire control request, not another
+    // five seconds for every recipient/hop if ordinary source ingress stalls.
+    let control_source_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     // Only a locally parsed application request selects this source channel.
     // RelayForward's wire class remains neutral, and a peer cannot request it.
     let local_priority =
@@ -1161,6 +1165,18 @@ pub(crate) async fn handle_ipc_send(
                 };
                 let bytes = envelope.encode();
                 for hop in hops.into_iter().take(3) {
+                    if let Some(sent) = send_packetized_control(
+                        reg,
+                        &envelope,
+                        &hop,
+                        local_priority,
+                        control_source_deadline,
+                    )
+                    .await
+                    {
+                        any_sent |= sent;
+                        continue;
+                    }
                     let datagram = reg.has_neutral_forward_datagram_transport(&hop);
                     let mut header =
                         FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
@@ -1951,20 +1967,30 @@ pub(crate) async fn handle_ipc_send(
                         break;
                     }
                     let fwd_frame = make_fwd_frame(next_hop);
-                    let relayed = reg.send_to(
-                        &next_hop,
-                        // Only legacy media calls use the default primary slot.
-                        // Compatibility control retains its local signaling slot,
-                        // just like the per-device copies above.
-                        if relay_wire_realtime
-                            && local_priority == veil_proto::priority::INTERACTIVE
-                        {
-                            veil_proto::header::priority::REALTIME
-                        } else {
-                            local_priority
-                        },
-                        fwd_frame.clone(),
-                    );
+                    // Only legacy media calls use the default primary slot.
+                    // Compatibility control retains its local signaling slot,
+                    // just like the per-device copies above.
+                    let source_lane = if relay_wire_realtime
+                        && local_priority == veil_proto::priority::INTERACTIVE
+                    {
+                        veil_proto::header::priority::REALTIME
+                    } else {
+                        local_priority
+                    };
+                    let packetized = if relay_control_compat {
+                        send_packetized_control(
+                            reg,
+                            &envelope,
+                            &next_hop,
+                            source_lane,
+                            control_source_deadline,
+                        )
+                        .await
+                    } else {
+                        None
+                    };
+                    let relayed = packetized
+                        .unwrap_or_else(|| reg.send_to(&next_hop, source_lane, fwd_frame.clone()));
                     if relay_media_sealed {
                         if relayed {
                             crate::route_trace::sealed_relay_hop_sample(
@@ -2026,6 +2052,11 @@ pub(crate) async fn handle_ipc_send(
                             return sink.write_all(&codec::encode_header(&ok_hdr)).await;
                         }
                         return Ok(());
+                    }
+                    // A packetized source can time out on local backpressure.
+                    // That is not evidence that the cached route is dead.
+                    if packetized.is_some() {
+                        continue;
                     }
                     // send_to returned false: session is closed or full.
                     // Evict this dead hop from the cache so future lookups
@@ -4907,6 +4938,90 @@ mod ratchet_send_tests {
                     sealed = Some(forward.envelope.payload);
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn packetized_control_preserves_authenticated_reassembly_and_legacy_hops() {
+        struct ActiveControlSource(Arc<Outbox>);
+        impl FrameBroadcaster for ActiveControlSource {
+            fn local_source_segment_data_bytes(&self) -> Option<usize> {
+                Some(768)
+            }
+            fn has_neutral_forward_datagram_transport(&self, peer: &[u8; 32]) -> bool {
+                self.0.has_neutral_forward_datagram_transport(peer)
+            }
+            fn send_to(&self, peer: &[u8; 32], lane: u8, bytes: Vec<u8>) -> bool {
+                assert_eq!(lane, veil_proto::ipc::LOCAL_SIGNALING_LANE);
+                self.0.send_to(peer, lane, bytes)
+            }
+            fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+            fn active_node_ids(&self) -> Vec<[u8; 32]> {
+                self.0.active_node_ids()
+            }
+        }
+        const LEGACY: [u8; 32] = [0xb8; 32];
+        for device_fanout in [false, true] {
+            let mut fx = fixture(vec![RELAY, LEGACY]);
+            Arc::get_mut(&mut fx.outbox).unwrap().datagram = vec![RELAY];
+            if device_fanout {
+                fx.certs = Arc::new(FamilyCerts(vec![
+                    fx.certs.resolve_cert_cached(PEER).unwrap(),
+                ]));
+            }
+            let mut ctx = fx.ctx(true);
+            ctx.session_tx_registry = Some(Arc::new(ActiveControlSource(fx.outbox.clone())));
+            let data = vec![0xa6; 1024];
+            let mut body = payload(false, &data);
+            body[100..104].copy_from_slice(
+                &veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT.to_be_bytes(),
+            );
+            let mut wh = sink().await;
+            handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+                .await
+                .unwrap();
+            let sent = fx.taken();
+            let modern: Vec<_> = sent.iter().filter(|(hop, _)| *hop == RELAY).collect();
+            assert!(modern.len() > 2, "actual origin packetization required");
+            assert!(sent.iter().any(|(hop, _)| *hop == LEGACY));
+            let (dispatcher, _endpoint, mut receiver) =
+                direct_receiver(&fx.peer, PEER, PEER_INSTANCE);
+            for (hop, bytes) in sent.iter().rev() {
+                let header = codec::decode_header(bytes).unwrap();
+                assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+                let wire_body = &bytes[veil_proto::HEADER_SIZE..];
+                let forward = veil_proto::delivery::ForwardPayload::decode(wire_body).unwrap();
+                assert!(!forward.envelope.require_ack);
+                if *hop == LEGACY {
+                    assert_eq!(forward.traffic_class, None);
+                    assert_eq!(forward.envelope.payload[0], veil_proto::RATCHET_E2E_MARKER);
+                    continue;
+                }
+                assert!(bytes.len() + 40 + 16 <= 1200);
+                assert!(
+                    veil_proto::delivery::ForwardPayload::is_realtime_datagram_eligible(wire_body)
+                );
+                assert_eq!(
+                    forward.traffic_class,
+                    Some(veil_proto::priority::INTERACTIVE)
+                );
+                assert_eq!(
+                    forward.envelope.payload[0],
+                    veil_proto::delivery::CHUNKED_ENVELOPE_MARKER
+                );
+                // The device-addressed fanout has a different physical target.
+                // Deliver the identity-addressed path to this identity fixture.
+                if forward.envelope.recipient_node_id() == PEER {
+                    for _ in 0..2 {
+                        dispatcher.dispatch(&header, wire_body, veil_cfg::NodeId::from(ME));
+                    }
+                }
+            }
+            assert_eq!(take_direct(&mut receiver), data);
+            assert!(
+                receiver.try_recv().is_err(),
+                "one authenticated logical control"
+            );
         }
     }
 
