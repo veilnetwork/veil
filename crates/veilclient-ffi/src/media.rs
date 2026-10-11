@@ -1135,7 +1135,8 @@ pub(crate) fn trace_sealed_cell(stage: &str, peer: &[u8; 32], payload: &[u8]) {
     }
     let epoch = u64::from_be_bytes(payload[4..12].try_into().unwrap());
     let seq = u64::from_be_bytes(payload[12..20].try_into().unwrap());
-    if seq.is_multiple_of(50) {
+    // Include the first sealed candidate probe as well as periodic RTP.
+    if seq == 1 || seq.is_multiple_of(50) {
         #[cfg(feature = "node-embedded")]
         let delivery = (stage == "received")
             .then(|| veil_ipc::route_trace::authenticated_local_delivery_ages(payload))

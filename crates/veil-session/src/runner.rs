@@ -1496,6 +1496,7 @@ async fn writer_task<B: Into<WireBlob>>(
     logger: Arc<NodeLogger>,
     peer_id_short: String,
 ) {
+    let mut first_primary_written_logged = false;
     while let Some(blob) = wire_rx.recv().await {
         let blob = blob.into();
         let _control_write = if blob.control {
@@ -1520,6 +1521,20 @@ async fn writer_task<B: Into<WireBlob>>(
             Ok(Ok(())) => {
                 if tracing {
                     let elapsed = write_started.elapsed();
+                    // Endpoint-only receipt boundary: queue admission and a
+                    // completed ordered write are different observations. This
+                    // does not identify content to a remote peer or prove peer
+                    // delivery. Log once per writer to include a lone probe.
+                    if blob.primary_feedback.is_some() && !first_primary_written_logged {
+                        first_primary_written_logged = true;
+                        logger.info(
+                            "session.rt_trace.first_primary_written",
+                            format!(
+                                "peer_id={peer_id_short} len={wire_len} elapsed_us={} queued_behind={queued_behind} scope=endpoint",
+                                elapsed.as_micros(),
+                            ),
+                        );
+                    }
                     if elapsed.as_millis() >= crate::rt_trace::SLOW_DISPATCH_MS {
                         logger.info(
                             "session.rt_trace.slow_wire_write",
@@ -4418,6 +4433,7 @@ impl SessionRunner {
         let mut source_reliable_pressure_logged: Option<std::time::Instant> = None;
         let mut source_reliable_admitted_logged: Option<std::time::Instant> = None;
         let mut ordered_primary_pressure_logged: Option<std::time::Instant> = None;
+        let mut first_ordered_primary_admitted_logged = false;
 
         // connection-rotation deadline. Computed once
         // at session start from the global SESSION_MAX_AGE_SECS
@@ -5332,6 +5348,21 @@ impl SessionRunner {
                     let local_primary = envelope.carrier.is_none()
                         && local_primary_stream_frame(envelope.frame.0, &envelope.frame.1);
                     batch_has_local_primary |= local_primary;
+                    if local_primary
+                        && crate::rt_trace::rt_trace_enabled()
+                        && !first_ordered_primary_admitted_logged
+                    {
+                        first_ordered_primary_admitted_logged = true;
+                        self.logger.info(
+                            "session.rt_trace.first_ordered_primary_admitted",
+                            format!(
+                                "peer_id={} frame_bytes={} queued_us={} scope=endpoint",
+                                hex_short(&self.peer_id),
+                                envelope.frame.1.len(),
+                                now.saturating_duration_since(envelope.queued_at).as_micros(),
+                            ),
+                        );
+                    }
                     if local_primary
                         && let Some(feedback) = realtime_lane
                             .as_mut()
