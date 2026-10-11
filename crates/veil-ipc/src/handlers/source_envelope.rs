@@ -93,6 +93,14 @@ impl<'a> EnvelopeChunks<'a> {
     }
 
     pub(super) fn frames_for(&self, next_hop: [u8; 32]) -> impl Iterator<Item = Vec<u8>> + '_ {
+        self.frames_for_transport(next_hop, false)
+    }
+
+    fn frames_for_transport(
+        &self,
+        next_hop: [u8; 32],
+        neutral_datagram: bool,
+    ) -> impl Iterator<Item = Vec<u8>> + '_ {
         self.envelope
             .payload
             .chunks(self.segment_size)
@@ -118,7 +126,7 @@ impl<'a> EnvelopeChunks<'a> {
                     envelope,
                     relay_hops: 0,
                     delivery_attempt: None,
-                    traffic_class: None,
+                    traffic_class: neutral_datagram.then_some(veil_proto::priority::INTERACTIVE),
                 }
                 .encode();
                 let mut header =
@@ -130,6 +138,48 @@ impl<'a> EnvelopeChunks<'a> {
                 frame
             })
     }
+}
+
+/// During primary activity, a large authored control must not become one
+/// multi-packet burst on each hop. Existing envelope chunks let the source
+/// signaling pacer charge one packet at a time; the relay sees only the same
+/// negotiated neutral datagram format. Idle/legacy paths retain whole frames.
+/// Reassembly precedes E2E opening, preserving the original ciphertext/proof.
+pub(super) async fn send_packetized_control(
+    reg: &dyn veil_types::FrameBroadcaster,
+    envelope: &DeliveryEnvelope,
+    hop: &[u8; 32],
+    local_lane: u8,
+    deadline: tokio::time::Instant,
+) -> Option<bool> {
+    let segment = source_segment_bytes(reg, envelope.payload.len());
+    if envelope.require_ack
+        || !reg.has_neutral_forward_datagram_transport(hop)
+        || segment >= veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES
+        || envelope.payload.len() <= segment
+    {
+        return None;
+    }
+    let chunks = EnvelopeChunks::new(envelope, false, segment)?;
+    // Wait for ingress rather than dropping an unsent suffix on a full queue.
+    // All copies share the caller's deadline; no registry lock spans the wait.
+    Some(
+        tokio::time::timeout_at(deadline, async {
+            for frame in chunks.frames_for_transport(*hop, true) {
+                // timeout_at may poll an immediately-ready future even after
+                // expiry. A later fan-out hop must not enqueue stale copies.
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                if !reg.send_local_source_to(hop, local_lane, frame).await {
+                    return false;
+                }
+            }
+            true
+        })
+        .await
+        .unwrap_or(false),
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -276,6 +326,82 @@ pub(super) async fn admit_direct_plain(
 mod tests {
     use super::*;
     use std::sync::{Arc, RwLock};
+
+    #[tokio::test(start_paused = true)]
+    async fn packetized_control_has_a_bounded_ingress_wait_and_keeps_acked_delivery() {
+        struct HeldSource(std::sync::atomic::AtomicUsize);
+        impl veil_types::FrameBroadcaster for HeldSource {
+            fn local_source_segment_data_bytes(&self) -> Option<usize> {
+                Some(768)
+            }
+            fn has_neutral_forward_datagram_transport(&self, _: &[u8; 32]) -> bool {
+                true
+            }
+            fn send_to(&self, _: &[u8; 32], _: u8, _: Vec<u8>) -> bool {
+                panic!("no unbounded fallback")
+            }
+            fn send_local_source_to<'a>(
+                &'a self,
+                _: &'a [u8; 32],
+                _: u8,
+                _: Vec<u8>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
+            {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Box::pin(std::future::pending())
+            }
+            fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+            fn active_node_ids(&self) -> Vec<[u8; 32]> {
+                vec![]
+            }
+        }
+        let mut envelope = DeliveryEnvelope {
+            recipient: veil_proto::recipient::Recipient::any([1; 32]),
+            sender_node_id: [2; 32],
+            src_app_id: [3; 32],
+            app_id: [4; 32],
+            endpoint_id: 7,
+            content_id: [5; 32],
+            created_at: 123,
+            ttl_secs: 30,
+            payload: vec![0xa5; 3000],
+            trace_id: 0,
+            require_ack: true,
+        };
+        let lane = veil_proto::ipc::LOCAL_SIGNALING_LANE;
+        let source = HeldSource(std::sync::atomic::AtomicUsize::new(0));
+        assert_eq!(
+            send_packetized_control(
+                &source,
+                &envelope,
+                &[6; 32],
+                lane,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5)
+            )
+            .await,
+            None
+        );
+        envelope.require_ack = false;
+        let began = tokio::time::Instant::now();
+        assert_eq!(
+            send_packetized_control(
+                &source,
+                &envelope,
+                &[6; 32],
+                lane,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5)
+            )
+            .await,
+            Some(false)
+        );
+        assert_eq!(began.elapsed(), std::time::Duration::from_secs(5));
+        assert_eq!(source.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            send_packetized_control(&source, &envelope, &[6; 32], lane, began).await,
+            Some(false)
+        );
+        assert_eq!(source.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn smaller_origin_chunks_preserve_wire_budget_and_large_transfer_bounds() {

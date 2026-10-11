@@ -75,6 +75,24 @@ impl veil_types::FrameBroadcaster for SessionTxBroadcaster {
         rlock!(self.inner).send_to(peer_id, priority, bytes)
     }
 
+    fn send_local_source_to<'a>(
+        &'a self,
+        peer_id: &'a [u8; 32],
+        local_lane: u8,
+        bytes: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        let sender = rlock!(self.inner).get_sender(peer_id).cloned();
+        Box::pin(async move {
+            match sender {
+                Some(sender) => sender
+                    .send((local_lane, veil_bufpool::pooled_shared_from_vec(bytes)))
+                    .await
+                    .is_ok(),
+                None => false,
+            }
+        })
+    }
+
     fn send_reliable_to<'a>(
         &'a self,
         peer_id: &'a [u8; 32],
@@ -203,6 +221,39 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use veil_types::FrameBroadcaster;
+
+    #[tokio::test]
+    async fn signaling_source_wait_does_not_hold_registry_or_primary_ingress() {
+        let registry = Arc::new(RwLock::new(SessionTxRegistry::with_capacity(1)));
+        let adapter = SessionTxBroadcaster::new(registry.clone());
+        let mut outbox = registry.write().unwrap().register(DEVICE_A);
+        assert!(adapter.send_to(&DEVICE_A, veil_proto::priority::BACKGROUND, vec![0]));
+        let mut admission =
+            adapter.send_local_source_to(&DEVICE_A, crate::LOCAL_SIGNALING_LANE, vec![1]);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut admission)
+                .await
+                .is_err()
+        );
+        assert!(registry.try_write().is_ok());
+        assert!(adapter.send_to(&DEVICE_A, veil_proto::priority::REALTIME, vec![2]));
+        assert_eq!(&*outbox.recv().await.unwrap().1, [2]);
+        assert_eq!(&*outbox.recv().await.unwrap().1, [0]);
+        assert!(admission.await);
+        let frame = outbox.recv().await.unwrap();
+        assert_eq!(frame.0, crate::LOCAL_SIGNALING_LANE);
+        assert_eq!(&*frame.1, [1]);
+        assert!(adapter.send_to(&DEVICE_A, veil_proto::priority::BACKGROUND, vec![3]));
+        let mut held =
+            adapter.send_local_source_to(&DEVICE_A, crate::LOCAL_SIGNALING_LANE, vec![4]);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut held)
+                .await
+                .is_err()
+        );
+        drop(outbox);
+        assert!(!held.await, "closed ingress releases a waiting control");
+    }
 
     #[tokio::test]
     async fn direct_chunk_admission_binds_capability_and_sender_across_reconnect() {
