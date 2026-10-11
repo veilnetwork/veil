@@ -59,10 +59,18 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
     // Leave endpoint headroom for RTCP and transport control/framing not
     // represented by a payload-only audio allocation. No relay priority.
     const int64_t budget = update.target_bitrate.bps<int64_t>() / 4 * 3;
-    int duration_ms = 60;
+    const auto range = inner_->GetFrameLengthRange();
+    int duration_ms = range ? static_cast<int>(range->second.ms()) : 60;
     // Matches the configured fast FrameLengthControllerV2's strict comparison
     // and supported durations. Limits apply to payload, not the gross budget.
     for (int candidate : std::array{20, 40, 60}) {
+      // Receiver/codec constraints can narrow the range. Budgeting for a
+      // longer, unavailable packet undercounts overhead and breaks the
+      // payload floor when ANA subtracts the actual packet's overhead.
+      if (range && (candidate < range->first.ms() ||
+                    candidate > range->second.ms())) {
+        continue;
+      }
       if (budget - OverheadBps(candidate) > kMinPayloadBps) {
         duration_ms = candidate;
         break;
