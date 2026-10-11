@@ -150,7 +150,11 @@ int64_t VeilTransportShim::audio_payload_receive_age_ms() const {
 void VeilTransportShim::Start() {
   bool expected = false;
   if (!started_.compare_exchange_strong(expected, true)) return;
-  if (audio_ingress_diagnostics_) audio_ingress_samples_.reserve(4096);
+  if (audio_ingress_diagnostics_) {
+    audio_ingress_samples_.reserve(4096);
+    std::lock_guard<std::mutex> lock(audio_send_diagnostics_mu_);
+    audio_send_samples_.reserve(4096);
+  }
   const int rc = veil_media_set_recv_callback(
       veil_chan_, &VeilTransportShim::OnVeilDatagram, this);
   if (rc == 0) receive_channels_.push_back(veil_chan_.load());
@@ -188,6 +192,26 @@ void VeilTransportShim::Stop() {
       }
     }
     audio_ingress_samples_.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lock(audio_send_diagnostics_mu_);
+    if (!audio_send_samples_.empty()) {
+      if (const char* path = diag::path()) {
+        if (FILE* file = std::fopen(path, "a")) {
+          std::fprintf(file, "audio.rtp.send.begin count=%zu\n",
+                       audio_send_samples_.size());
+          for (const auto& sample : audio_send_samples_) {
+            std::fprintf(file,
+                "audio.rtp.send seq=%u timestamp=%u attempted_us=%lld admitted_us=%lld packet_bytes=%zu accepted=%d\n",
+                unsigned(sample.sequence), unsigned(sample.timestamp),
+                (long long)sample.attempted_us, (long long)sample.admitted_us,
+                sample.packet_bytes, sample.accepted ? 1 : 0);
+          }
+          std::fclose(file);
+        }
+      }
+      audio_send_samples_.clear();
+    }
   }
 }
 
@@ -229,7 +253,17 @@ bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
   const int rc =
       veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
   if (audio) {
-    audio_send_stats_.mark_result(started_ns, webrtc::TimeMicros() * 1000, rc == 0);
+    const int64_t admitted_us = webrtc::TimeMicros();
+    audio_send_stats_.mark_result(started_ns, admitted_us * 1000, rc == 0);
+    if (audio_ingress_diagnostics_ && packet.size() >= 12) {
+      std::lock_guard<std::mutex> lock(audio_send_diagnostics_mu_);
+      if (started_.load() && audio_send_samples_.size() < 4096) {
+        audio_send_samples_.push_back({
+            uint16_t(uint16_t(packet[2]) << 8 | uint16_t(packet[3])),
+            read_be32(packet.data() + 4), started_ns / 1000, admitted_us,
+            packet.size(), rc == 0});
+      }
+    }
   }
   bool mirrored = false;
   const auto mirror = audio_mirror_chan_.load(std::memory_order_acquire);

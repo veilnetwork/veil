@@ -287,6 +287,18 @@ class VeilTransportShim : public webrtc::Transport {
   };
   const bool audio_ingress_diagnostics_;
   std::vector<AudioIngressSample> audio_ingress_samples_;
+  // Admission is observed on the sender's network queue. A separate lock
+  // fences it against Stop; it never holds an SDK call or receive delivery.
+  struct AudioSendSample {
+    uint16_t sequence;
+    uint32_t timestamp;
+    int64_t attempted_us;
+    int64_t admitted_us;
+    size_t packet_bytes;
+    bool accepted;
+  };
+  std::mutex audio_send_diagnostics_mu_;
+  std::vector<AudioSendSample> audio_send_samples_;
   mutable std::mutex audio_feedback_mu_;
   RtcpFeedbackSnapshot audio_feedback_;
   RtcpFeedbackSnapshot video_feedback_;
