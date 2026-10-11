@@ -32,6 +32,11 @@ use super::*;
 pub mod path_probe_ffi;
 
 #[cfg(feature = "node-embedded")]
+mod ingress_diagnostics;
+#[cfg(feature = "node-embedded")]
+use ingress_diagnostics::{Reason as IngressRefusal, refuse as refuse_ingress};
+
+#[cfg(feature = "node-embedded")]
 fn media_is_vp8_rtp(payload: &[u8]) -> bool {
     if payload.len() < 2 || (payload[0] >> 6) != 2 {
         return false;
@@ -545,7 +550,7 @@ pub unsafe extern "C" fn veil_media_open_channel(
     let video_task = spawn_producer(rx_video, repair_video_rx, media::LocalMediaPlane::Secondary);
     let screen_task = spawn_producer(rx_screen, repair_screen_rx, media::LocalMediaPlane::Screen);
     MEDIA_CHANNELS
-        .lock()
+        .write()
         .unwrap_or_else(|p| p.into_inner())
         .insert(
             id,
@@ -831,7 +836,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
     ));
     let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     MEDIA_CHANNELS
-        .lock()
+        .write()
         .unwrap_or_else(|p| p.into_inner())
         .insert(
             id,
@@ -1032,7 +1037,7 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
     ));
     let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     MEDIA_CHANNELS
-        .lock()
+        .write()
         .unwrap_or_else(|p| p.into_inner())
         .insert(
             id,
@@ -1076,7 +1081,7 @@ pub unsafe extern "C" fn veil_media_channel_set_secondary_sender(
     }
     null_check_with_default!(err_out, -1, "app" => app);
     get_or_return!(app_ref, app_table(), app, err_out, -1, "VeilApp");
-    let channels = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
+    let channels = MEDIA_CHANNELS.read().unwrap_or_else(|p| p.into_inner());
     let Some(channel) = channels.get(&chan) else {
         unsafe { write_err(err_out, "unknown media channel") };
         return -1;
@@ -1109,7 +1114,7 @@ pub unsafe extern "C" fn veil_media_channel_set_screen_sender(
     }
     null_check_with_default!(err_out, -1, "app" => app);
     get_or_return!(app_ref, app_table(), app, err_out, -1, "VeilApp");
-    let channels = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
+    let channels = MEDIA_CHANNELS.read().unwrap_or_else(|p| p.into_inner());
     let Some(channel) = channels.get(&chan) else {
         unsafe { write_err(err_out, "unknown media channel") };
         return -1;
@@ -1135,7 +1140,7 @@ pub extern "C" fn veil_media_channel_set_screen_sharing(chan: u64, on: c_int) ->
     if on != 0 && on != 1 {
         return -1;
     }
-    let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
+    let map = MEDIA_CHANNELS.read().unwrap_or_else(|p| p.into_inner());
     let Some(channel) = map.get(&chan) else {
         return -1;
     };
@@ -1167,13 +1172,23 @@ pub unsafe extern "C" fn veil_media_send_datagram(chan: u64, ptr: *const u8, len
     // Clone only ingress, never the channel/keys/pump owner. No registry guard
     // can reach RTP classification, allocation or video frame assembly.
     let ingress = {
-        let map = match MEDIA_CHANNELS.try_lock() {
+        let map = match MEDIA_CHANNELS.try_read() {
             Ok(map) => map,
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return 1,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return refuse_ingress(
+                    IngressRefusal::RegistryBusy,
+                    media_is_vp8_rtp(unsafe { std::slice::from_raw_parts(ptr, len) }),
+                    1,
+                );
+            }
         };
         let Some(ch) = map.get(&chan) else {
-            return -1;
+            return refuse_ingress(
+                IngressRefusal::UnknownChannel,
+                media_is_vp8_rtp(unsafe { std::slice::from_raw_parts(ptr, len) }),
+                -1,
+            );
         };
         Arc::clone(&ch.ingress)
     };
@@ -1202,13 +1217,15 @@ pub unsafe extern "C" fn veil_media_send_video_control_datagram(
         return -1;
     }
     let ingress = {
-        let map = match MEDIA_CHANNELS.try_lock() {
+        let map = match MEDIA_CHANNELS.try_read() {
             Ok(map) => map,
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return 1,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return refuse_ingress(IngressRefusal::RegistryBusy, true, 1);
+            }
         };
         let Some(ch) = map.get(&chan) else {
-            return -1;
+            return refuse_ingress(IngressRefusal::UnknownChannel, true, -1);
         };
         Arc::clone(&ch.ingress)
     };
@@ -1226,7 +1243,7 @@ pub unsafe extern "C" fn veil_media_channel_get_stats(
     if chan == 0 || out.is_null() {
         return -1;
     }
-    let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
+    let map = MEDIA_CHANNELS.read().unwrap_or_else(|p| p.into_inner());
     let Some(ch) = map.get(&chan) else {
         return -1;
     };
@@ -1251,7 +1268,7 @@ pub unsafe extern "C" fn veil_media_repair_channel(chan: u64) -> c_int {
     if chan == 0 {
         return -1;
     }
-    let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
+    let map = MEDIA_CHANNELS.read().unwrap_or_else(|p| p.into_inner());
     let Some(repair_tx) = map.get(&chan).and_then(|ch| ch.repair_tx.as_ref()) else {
         return -1;
     };
@@ -1285,7 +1302,7 @@ pub unsafe extern "C" fn veil_media_repair_channel(chan: u64) -> c_int {
 #[cfg(feature = "node-embedded")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_media_channel_set_batching(chan: u64, mode: c_int) -> c_int {
-    let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
+    let map = MEDIA_CHANNELS.read().unwrap_or_else(|p| p.into_inner());
     let Some(ch) = map.get(&chan) else {
         return -1;
     };
@@ -1495,7 +1512,7 @@ pub unsafe extern "C" fn veil_media_set_recv_callback(
     ctx: *mut c_void,
 ) -> c_int {
     let channel = {
-        let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
+        let map = MEDIA_CHANNELS.read().unwrap_or_else(|p| p.into_inner());
         map.get(&chan).map(|ch| {
             let peers = ch
                 .path_probe
@@ -1528,7 +1545,7 @@ pub unsafe extern "C" fn veil_media_set_recv_callback(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_media_close_channel(chan: u64) {
     let ch = MEDIA_CHANNELS
-        .lock()
+        .write()
         .unwrap_or_else(|p| p.into_inner())
         .remove(&chan);
     if let Some(ch) = ch {
@@ -1696,6 +1713,7 @@ impl MediaIngress {
         video: MediaVideoIngress,
         screen: Option<MediaVideoIngress>,
     ) -> Arc<Self> {
+        ingress_diagnostics::start();
         Arc::new(Self {
             tx_hi,
             video,
@@ -1708,21 +1726,25 @@ impl MediaIngress {
     fn enqueue(&self, payload: QueuedMediaPacket) -> c_int {
         use std::sync::atomic::Ordering::{AcqRel, Acquire};
         if self.closed.load(Acquire) {
-            return -1;
+            return refuse_ingress(
+                IngressRefusal::IngressClosed,
+                media_is_vp8_rtp(&payload.payload),
+                -1,
+            );
         }
         if !media_is_vp8_rtp(&payload.payload) {
-            return Self::send_packet(&self.tx_hi, payload);
+            return Self::send_packet(&self.tx_hi, payload, false);
         }
         let source = if self.screen_sharing.load(Acquire) {
             match &self.screen {
                 Some(screen) => screen,
-                None => return -1,
+                None => return refuse_ingress(IngressRefusal::MissingScreen, true, -1),
             }
         } else {
             &self.video
         };
         match source {
-            MediaVideoIngress::Packets(tx) => Self::send_packet(tx, payload),
+            MediaVideoIngress::Packets(tx) => Self::send_packet(tx, payload, true),
             MediaVideoIngress::RelayFrames {
                 tx,
                 assembler,
@@ -1734,7 +1756,7 @@ impl MediaIngress {
                     Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
                     Err(std::sync::TryLockError::WouldBlock) => {
                         contended.store(true, std::sync::atomic::Ordering::Release);
-                        return 1;
+                        return refuse_ingress(IngressRefusal::AssemblerBusy, true, 1);
                     }
                 };
                 if contended.swap(false, AcqRel) {
@@ -1745,14 +1767,16 @@ impl MediaIngress {
                     // A concurrent callback dropped a fragment while this
                     // callback was building the frame. Discard its prefix/tail.
                     assembler.discard_after_contention();
-                    return 1;
+                    return refuse_ingress(IngressRefusal::AssemblerBusy, true, 1);
                 }
                 if self.closed.load(Acquire) {
-                    return -1;
+                    return refuse_ingress(IngressRefusal::IngressClosed, true, -1);
                 }
                 match result {
                     RelayVideoFramePush::Pending => 0,
-                    RelayVideoFramePush::Dropped => 1,
+                    RelayVideoFramePush::Dropped => {
+                        refuse_ingress(IngressRefusal::IncompleteFrame, true, 1)
+                    }
                     RelayVideoFramePush::Complete(packets) => {
                         stats.enqueue_frame();
                         let frame = RelayVideoFrame {
@@ -1763,11 +1787,11 @@ impl MediaIngress {
                             Ok(()) => 0,
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 stats.undo_enqueue_frame();
-                                1
+                                refuse_ingress(IngressRefusal::FrameQueueFull, true, 1)
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 stats.undo_enqueue_frame();
-                                -1
+                                refuse_ingress(IngressRefusal::FrameQueueClosed, true, -1)
                             }
                         }
                     }
@@ -1779,18 +1803,18 @@ impl MediaIngress {
     fn enqueue_video_control(&self, payload: QueuedMediaPacket) -> c_int {
         use std::sync::atomic::Ordering::Acquire;
         if self.closed.load(Acquire) {
-            return -1;
+            return refuse_ingress(IngressRefusal::IngressClosed, true, -1);
         }
         let source = if self.screen_sharing.load(Acquire) {
             match &self.screen {
                 Some(screen) => screen,
-                None => return -1,
+                None => return refuse_ingress(IngressRefusal::MissingScreen, true, -1),
             }
         } else {
             &self.video
         };
         match source {
-            MediaVideoIngress::Packets(tx) => Self::send_packet(tx, payload),
+            MediaVideoIngress::Packets(tx) => Self::send_packet(tx, payload, true),
             MediaVideoIngress::RelayFrames { tx, stats, .. } => {
                 // Control is an independently complete work item. It must not
                 // consume or discard a partially assembled VP8 frame.
@@ -1803,22 +1827,30 @@ impl MediaIngress {
                     Ok(()) => 0,
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         stats.undo_enqueue_frame();
-                        1
+                        refuse_ingress(IngressRefusal::FrameQueueFull, true, 1)
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         stats.undo_enqueue_frame();
-                        -1
+                        refuse_ingress(IngressRefusal::FrameQueueClosed, true, -1)
                     }
                 }
             }
         }
     }
 
-    fn send_packet(tx: &mpsc::Sender<QueuedMediaPacket>, payload: QueuedMediaPacket) -> c_int {
+    fn send_packet(
+        tx: &mpsc::Sender<QueuedMediaPacket>,
+        payload: QueuedMediaPacket,
+        secondary: bool,
+    ) -> c_int {
         match tx.try_send(payload) {
             Ok(()) => 0,
-            Err(mpsc::error::TrySendError::Full(_)) => 1,
-            Err(mpsc::error::TrySendError::Closed(_)) => -1,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                refuse_ingress(IngressRefusal::PacketQueueFull, secondary, 1)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                refuse_ingress(IngressRefusal::PacketQueueClosed, secondary, -1)
+            }
         }
     }
 }
@@ -1951,8 +1983,12 @@ impl RelayMediaStats {
 
 /// Open media channels keyed by the opaque id handed to the host.
 #[cfg(feature = "node-embedded")]
-static MEDIA_CHANNELS: std::sync::LazyLock<StdMutex<std::collections::HashMap<u64, MediaChannel>>> =
-    std::sync::LazyLock::new(|| StdMutex::new(std::collections::HashMap::new()));
+// Read-only stats, sender selection and RTP callbacks share the registry.
+// An exclusive mutex made a stats read discard concurrently encoded RTP.
+// Membership alone takes the write lock; RTP still uses a nonblocking read.
+static MEDIA_CHANNELS: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<u64, MediaChannel>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
 
 /// Monotonic channel-id source (never reuses 0, which the ABI reserves for
 /// "error / invalid").
@@ -2212,7 +2248,7 @@ pub(crate) fn dispatch_route_control(
     cipher: &Arc<media::MediaCipher>,
     body: &[u8],
 ) {
-    let map = MEDIA_CHANNELS.lock().unwrap_or_else(|p| p.into_inner());
+    let map = MEDIA_CHANNELS.read().unwrap_or_else(|p| p.into_inner());
     if let Some(ch) = map.get(&chan)
         && ch.peer == peer
         && Arc::ptr_eq(&ch.cipher, cipher)
