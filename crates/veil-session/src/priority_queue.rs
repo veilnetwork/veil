@@ -2,7 +2,7 @@
 //!
 //! Four original classes match the 2-bit priority
 //! field in `FrameHeader.flags`. Recoverable local DATA has a separate fifth
-//! queue with the background weight; own network RPC has a sixth queue with
+//! queue with the background weight; own network RPC and local signaling have separate queues with
 //! the interactive weight. Neither local selector enters this wire field:
 //!
 //! | Level | Class | Weight |
@@ -36,9 +36,15 @@ pub const DEFAULT_WEIGHTS: [u32; 4] = [8, 4, 2, 1];
 /// Trusted locally originated network maintenance/RPC. Not an IPC selector
 /// or a wire priority; received/forwarded frames cannot select this queue.
 pub const LOCAL_NETWORK_CONTROL_LANE: u8 = 5;
-const LOCAL_QUEUE_COUNT: usize = 6;
+/// Trusted locally authored application signaling, selected by the local IPC
+/// handler only. Opaque forwarded controls stay in the neutral INTERACTIVE
+/// queue; this selector is never serialized or accepted from a peer header.
+pub use veil_proto::ipc::LOCAL_SIGNALING_LANE;
+const LOCAL_QUEUE_COUNT: usize = 7;
 fn queue_index(priority: u8) -> usize {
-    if priority == LOCAL_NETWORK_CONTROL_LANE {
+    if priority == LOCAL_SIGNALING_LANE {
+        6
+    } else if priority == LOCAL_NETWORK_CONTROL_LANE {
         5
     } else if priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE {
         4
@@ -94,6 +100,11 @@ pub const LOCAL_PRIMARY_MAX_AGE: Duration = Duration::from_millis(200);
 pub(crate) fn lossy_realtime_max_age(priority: u8) -> Duration {
     if priority == REALTIME {
         LOCAL_PRIMARY_MAX_AGE
+    } else if priority == LOCAL_SIGNALING_LANE {
+        // Multi-device/group controls may wait behind their own paced copies.
+        // They are not video frames: retain a bounded lifecycle-control tail
+        // without changing any relay TTL, queue or scheduling privilege.
+        Duration::from_secs(5)
     } else {
         LOSSY_REALTIME_MAX_AGE
     }
@@ -164,7 +175,7 @@ impl PriorityQueue {
             "PriorityQueue: all weights are zero — pop() would always return None"
         );
         let weights = [
-            weights[0], weights[1], weights[2], weights[3], weights[3], weights[1],
+            weights[0], weights[1], weights[2], weights[3], weights[3], weights[1], weights[1],
         ];
         Self {
             queues: Default::default(),
@@ -408,6 +419,16 @@ impl PriorityQueue {
         (0..LOCAL_QUEUE_COUNT as u8).find(|&p| !self.queues[p as usize].is_empty())
     }
 
+    /// Local signaling retains interactive urgency on ordered compatibility
+    /// paths. Its private queue number must not engage battery batching.
+    pub(crate) fn coalescing_priority(&self) -> Option<u8> {
+        if !self.queues[LOCAL_SIGNALING_LANE as usize].is_empty() {
+            Some(self.peek_priority().unwrap_or(INTERACTIVE).min(INTERACTIVE))
+        } else {
+            self.peek_priority()
+        }
+    }
+
     pub(crate) fn note_local_primary(&mut self, now: Instant) {
         self.local_primary_seen = Some(now);
     }
@@ -515,9 +536,17 @@ impl PriorityQueue {
     /// taken from the wire: forwarded cells always enter INTERACTIVE and cannot
     /// use this path. Keep FIFO within each source and the existing age/cap/drop
     /// accounting; only the local round is independent of reliable writes.
+    #[cfg(test)]
     pub(crate) fn pop_local_datagram_envelope_if(
         &mut self,
         predicate: impl Fn(&[u8]) -> bool,
+    ) -> Option<crate::frame_outbox::FrameEnvelope> {
+        self.pop_local_datagram_lane_if(|_, frame| predicate(frame))
+    }
+
+    pub(crate) fn pop_local_datagram_lane_if(
+        &mut self,
+        predicate: impl Fn(u8, &[u8]) -> bool,
     ) -> Option<crate::frame_outbox::FrameEnvelope> {
         for attempt in 0..2 {
             for priority in crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES {
@@ -543,7 +572,7 @@ impl PriorityQueue {
                         self.drops_total.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    if !predicate(&head.frame) {
+                    if !predicate(priority, &head.frame) {
                         break;
                     }
                     let queued = self.queues[p].remove(index).expect("entry checked above");
@@ -638,6 +667,83 @@ impl PriorityQueue {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn paced_signaling_survives_the_video_deadline_and_remains_bounded() {
+        let mut pq = PriorityQueue::with_default_weights();
+        pq.push_lossy(BULK, arc(b"stale video"));
+        pq.push_lossy(LOCAL_SIGNALING_LANE, arc(b"paced call control"));
+        let admitted = Instant::now() - Duration::from_millis(750);
+        pq.queues[BULK as usize][0].enqueued_at = Some(admitted);
+        pq.queues[LOCAL_SIGNALING_LANE as usize][0].enqueued_at = Some(admitted);
+        let control = pq.pop_local_datagram_envelope_if(|_| true).unwrap();
+        assert_eq!(&*control.frame.1, b"paced call control");
+        assert_eq!(pq.drops_total(), 1);
+        pq.restore_lossy_envelope(control);
+        pq.queues[LOCAL_SIGNALING_LANE as usize][0].enqueued_at =
+            Some(Instant::now() - Duration::from_secs(6));
+        assert!(pq.pop_local_datagram_envelope_if(|_| true).is_none());
+        assert_eq!(pq.drops_total(), 2);
+    }
+
+    #[test]
+    fn signaling_does_not_inherit_the_mobile_background_batch_window() {
+        let now = tokio::time::Instant::now();
+        let coalescer = crate::outbound_batch_coalescer::OutboundBatchCoalescer::new(now);
+        let window = Some(Duration::from_secs(1));
+        let mut pq = PriorityQueue::with_default_weights();
+        pq.push(BULK, arc(b"bulk"));
+        assert!(coalescer.is_coalescing(now, window, pq.coalescing_priority()));
+        pq.push(LOCAL_SIGNALING_LANE, arc(b"call offer"));
+        assert!(!coalescer.is_coalescing(now, window, pq.coalescing_priority()));
+        assert_eq!(coalescer.coalesce_deadline(window, pq.coalescing_priority()), None);
+    }
+
+    #[test]
+    fn held_signaling_preserves_fifo_and_does_not_stop_primary_or_transit() {
+        let mut pq = PriorityQueue::with_default_weights();
+        pq.push_lossy(LOCAL_SIGNALING_LANE, arc(b"first control"));
+        pq.push_lossy(LOCAL_SIGNALING_LANE, arc(b"second control"));
+        pq.push_lossy(REALTIME, arc(b"primary"));
+        pq.push_lossy(INTERACTIVE, arc(b"neutral"));
+        let mut held = || {
+            pq.pop_admitted_envelope(|priority, _, _| {
+                if priority == LOCAL_SIGNALING_LANE {
+                    HeadAdmission::DeferSource
+                } else {
+                    HeadAdmission::Allow
+                }
+            })
+        };
+        assert_eq!(&*held().unwrap().frame.1, b"primary");
+        assert_eq!(&*held().unwrap().frame.1, b"neutral");
+        assert!(held().is_none());
+        assert_eq!(
+            &*pq.pop_datagram_envelope_if(|_| true).unwrap().frame.1,
+            b"first control"
+        );
+        assert_eq!(
+            &*pq.pop_local_datagram_envelope_if(|_| true).unwrap().frame.1,
+            b"second control"
+        );
+        assert_eq!(pq.drops_total(), 0);
+    }
+
+    #[test]
+    fn signaling_has_a_source_budget_without_overtaking_neutral_transit() {
+        let mut pq = PriorityQueue::with_default_weights();
+        pq.push_lossy(LOCAL_SIGNALING_LANE, arc(b"control"));
+        for _ in 0..LOSSY_REALTIME_MAX_DEPTH + 2 {
+            pq.push_lossy(INTERACTIVE, arc(b"transit"));
+        }
+        assert_eq!(pq.drops_total(), 2);
+        let control = pq.pop_local_datagram_envelope_if(|_| true).unwrap();
+        assert_eq!(control.frame.0, LOCAL_SIGNALING_LANE);
+        assert_eq!(&*control.frame.1, b"control");
+        assert!(pq.pop_local_datagram_envelope_if(|_| true).is_none());
+        let neutral = pq.pop_datagram_envelope_if(|_| true).unwrap();
+        assert_eq!(neutral.frame.0, INTERACTIVE);
+        assert_eq!(&*neutral.frame.1, b"transit");
+    }
     #[test]
     fn recoverable_source_does_not_evict_screen_and_retains_its_selector() {
         // These are trusted local choices; both encode the same ordinary
@@ -1037,13 +1143,13 @@ mod tests {
             pq.push_lossy(p, arc(b"second"));
         }
         let frame = pq.pop_realtime_if(|_| true).unwrap();
-        assert_eq!(pq.lossy_realtime_len, [1, 0, 2, 0, 0, 0]);
+        assert_eq!(pq.lossy_realtime_len, [1, 0, 2, 0, 0, 0, 0]);
         pq.push_realtime_front(frame);
-        assert_eq!(pq.lossy_realtime_len, [2, 0, 2, 0, 0, 0]);
+        assert_eq!(pq.lossy_realtime_len, [2, 0, 2, 0, 0, 0, 0]);
         pq.push_lossy(BACKGROUND, arc(b"must not evict higher classes"));
-        assert_eq!(pq.lossy_realtime_len, [2, 0, 2, 0, 0, 0]);
+        assert_eq!(pq.lossy_realtime_len, [2, 0, 2, 0, 0, 0, 0]);
         pq.push(INTERACTIVE, arc(b"reliable"));
-        assert_eq!(pq.lossy_realtime_len, [2, 0, 1, 0, 0, 0]);
+        assert_eq!(pq.lossy_realtime_len, [2, 0, 1, 0, 0, 0, 0]);
         for queued in &mut pq.queues[REALTIME as usize] {
             queued.enqueued_at =
                 Some(Instant::now() - LOSSY_REALTIME_MAX_AGE - Duration::from_millis(1));
@@ -1052,7 +1158,7 @@ mod tests {
             &*pq.pop_envelope_if(|_, _| true).unwrap().frame.1,
             b"reliable"
         );
-        assert_eq!(pq.lossy_realtime_len, [0, 0, 1, 0, 0, 0]);
+        assert_eq!(pq.lossy_realtime_len, [0, 0, 1, 0, 0, 0, 0]);
         assert_eq!(
             &*pq.pop_local_datagram_envelope_if(|_| true).unwrap().frame.1,
             b"second"

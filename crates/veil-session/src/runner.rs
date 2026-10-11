@@ -212,7 +212,7 @@ async fn await_next_input(
 
 /// Session-scoped state for the independently encrypted, loss-tolerant media
 /// lane. It exists only after capability AND transport negotiation succeed.
-const LOCAL_TRACE_SLOTS: usize = crate::LOCAL_NETWORK_CONTROL_LANE as usize + 1;
+const LOCAL_TRACE_SLOTS: usize = crate::LOCAL_SIGNALING_LANE as usize + 1;
 
 struct RealtimeDatagramLane {
     sender: Option<Arc<Mutex<RealtimeSender>>>,
@@ -376,6 +376,10 @@ impl RealtimeDatagramLane {
     ) -> bool {
         self.parallel.is_some()
             && ingress.is_none()
+            // Lifecycle controls retain canonical compatibility while their
+            // generic child warms. Dropping the first offer/answer here would
+            // delay call setup; subsequent controls use the ready child.
+            && priority != crate::LOCAL_SIGNALING_LANE
             && crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES.contains(&priority)
     }
 
@@ -1461,7 +1465,9 @@ impl From<veil_bufpool::PooledShared> for WireBlob {
 }
 
 fn local_control_write(priority: u8, frame: &[u8]) -> bool {
-    priority == veil_proto::priority::REALTIME && decode_realtime_lane_frame(frame).is_none()
+    priority == crate::LOCAL_SIGNALING_LANE
+        || (priority == veil_proto::priority::REALTIME
+            && decode_realtime_lane_frame(frame).is_none())
 }
 
 /// writer task — owns the `WriteHalf<BoxIoStream>` and
@@ -4686,6 +4692,7 @@ impl SessionRunner {
                 // Preserve ordinary WRR/FIFO first. If a reliable head blocks
                 // it, independently transported local sources may progress in
                 // their own round. Relayed cells never use that local bypass.
+                let mut source_pressure_retry: Option<std::time::Instant> = None;
                 let mut datagram_drained = 0usize;
                 let mut disable_realtime_sender = false;
                 if let Some(lane) = realtime_lane.as_mut() {
@@ -4702,9 +4709,32 @@ impl SessionRunner {
                                         || lane.peer_neutral_forwards)
                             })
                         };
+                        let signaling_wait = lane
+                            .source_activity
+                            .signaling_wait(std::time::Instant::now());
+                        if let Some(retry) = signaling_wait {
+                            source_pressure_retry =
+                                Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
+                        }
                         let Some(envelope) = pq
-                            .pop_datagram_envelope_if(supported)
-                            .or_else(|| pq.pop_local_datagram_envelope_if(supported))
+                            .pop_admitted_envelope(|priority, frame, _| {
+                                if priority == crate::LOCAL_SIGNALING_LANE
+                                    && signaling_wait.is_some()
+                                {
+                                    crate::priority_queue::HeadAdmission::DeferSource
+                                } else if supported(frame) {
+                                    crate::priority_queue::HeadAdmission::Allow
+                                } else {
+                                    crate::priority_queue::HeadAdmission::FlushBatch
+                                }
+                            })
+                            .or_else(|| {
+                                pq.pop_local_datagram_lane_if(|priority, frame| {
+                                    (priority != crate::LOCAL_SIGNALING_LANE
+                                        || signaling_wait.is_none())
+                                        && supported(frame)
+                                })
+                            })
                         else {
                             break;
                         };
@@ -4789,6 +4819,7 @@ impl SessionRunner {
                             pq.restore_lossy_envelope(envelope);
                             break;
                         };
+                        let signaling_source = lane.source_activity.clone();
                         let mut lane = lock!(sender);
                         let max_datagram_size = lane.max_datagram_size;
                         let datagrams = match lane.tx.encode_frame(
@@ -4844,6 +4875,18 @@ impl SessionRunner {
                                 available,
                             );
                             datagram_drained += 1;
+                            continue;
+                        }
+                        if outgoing_priority == crate::LOCAL_SIGNALING_LANE
+                            && envelope.carrier.is_none()
+                            && let Err(retry) = signaling_source
+                                .admit_signaling(planned_wire_len, std::time::Instant::now())
+                        {
+                            // Retain this FIFO head. Other source classes and
+                            // neutral transit continue through their own rounds.
+                            pq.restore_lossy_envelope(envelope);
+                            source_pressure_retry =
+                                Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
                             continue;
                         }
                         if !self.dispatcher.allow_outbound_bandwidth(planned_wire_len) {
@@ -5045,13 +5088,14 @@ impl SessionRunner {
                 // drain proceeds unconditionally as).
                 let coalesce_window = current_outbound_batch_window(battery_keepalive.last_level());
                 let now_for_drain = tokio::time::Instant::now();
+                let coalescing_priority = pq.coalescing_priority();
                 let coalesce_active = outbound_coalescer.is_coalescing(
                     now_for_drain,
                     coalesce_window,
-                    pq.peek_priority(),
+                    coalescing_priority,
                 );
                 let coalesce_until =
-                    outbound_coalescer.coalesce_deadline(coalesce_window, pq.peek_priority());
+                    outbound_coalescer.coalesce_deadline(coalesce_window, coalescing_priority);
                 let mut drained_this_pass = datagram_drained;
                 // Encrypt several already-queued OVL1 frames back-to-back and
                 // add ONE padding frame for the whole group. Small circuit-data
@@ -5087,7 +5131,6 @@ impl SessionRunner {
                         .as_ref()
                         .is_some_and(|outbox| outbox.source_activity().active(now));
                 let mut source_waiting_for_writer = false;
-                let mut source_pressure_retry: Option<std::time::Instant> = None;
                 let mut source_reliable_waiting = false;
                 let reliable_ready = realtime_lane
                     .as_ref()
@@ -5103,7 +5146,11 @@ impl SessionRunner {
                     &mut rekey,
                     &mut mlkem_rekey,
                 ) {
-                    Ok(retry) => source_pressure_retry = retry,
+                    Ok(Some(retry)) => {
+                        source_pressure_retry =
+                            Some(source_pressure_retry.map_or(retry, |old| old.min(retry)))
+                    }
+                    Ok(None) => {}
                     Err(child) => {
                         reliable_streams.fail_child(child);
                         if let Some(ready) =
@@ -5198,6 +5245,15 @@ impl SessionRunner {
                             && decode_realtime_lane_frame(frame).is_some()
                             && let Some(outbox) = outbox.as_ref()
                             && let Err(retry) = outbox.source_activity().admit_lossy_secondary(encrypted_wire_len(frame.len()).unwrap_or(usize::MAX), now)
+                        {
+                            source_pressure_retry = Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
+                            return HeadAdmission::DeferSource;
+                        }
+                        if priority == crate::LOCAL_SIGNALING_LANE
+                            && let Some(outbox) = outbox.as_ref()
+                            && let Err(retry) = outbox.source_activity().admit_signaling(
+                                encrypted_wire_len(frame.len()).unwrap_or(usize::MAX), now,
+                            )
                         {
                             source_pressure_retry = Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
                             return HeadAdmission::DeferSource;

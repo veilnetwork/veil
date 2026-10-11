@@ -854,6 +854,14 @@ pub(crate) async fn handle_ipc_send(
     let relay_wire_realtime = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME != 0;
     let relay_control_compat = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT != 0;
     let relay_realtime = relay_wire_realtime || relay_control_compat;
+    // Only a locally parsed application request selects this source channel.
+    // RelayForward's wire class remains neutral, and a peer cannot request it.
+    let local_priority =
+        if relay_control_compat && ctx.local_priority == veil_proto::priority::INTERACTIVE {
+            veil_proto::ipc::LOCAL_SIGNALING_LANE
+        } else {
+            ctx.local_priority
+        };
     let relay_media_sealed = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED != 0;
     let send = match AppIpcSendPayload::decode(body) {
         Ok(s) => s,
@@ -875,7 +883,7 @@ pub(crate) async fn handle_ipc_send(
         return Ok(());
     }
 
-    crate::route_trace::sealed_local_sample("handler_enter", ctx.local_priority, body);
+    crate::route_trace::sealed_local_sample("handler_enter", local_priority, body);
 
     // explicit application-payload size cap before
     // any E2E encryption / fragmentation work. Frame body is already
@@ -1169,7 +1177,7 @@ pub(crate) async fn handle_ipc_send(
                     }
                     // Keep the endpoint's signaling producer separate from its
                     // primary media producer. The relay header remains neutral.
-                    any_sent |= reg.send_to(&hop, ctx.local_priority, frame);
+                    any_sent |= reg.send_to(&hop, local_priority, frame);
                 }
             }
         }
@@ -1254,7 +1262,7 @@ pub(crate) async fn handle_ipc_send(
                     admit_direct_plain(ctx, request, *device, deadline).await
                 } else if reg.send_to(
                     device,
-                    ctx.local_priority,
+                    local_priority,
                     app_send_frame(request, sealed.as_ref().map(|(p, _)| p.as_slice())),
                 ) {
                     DirectAdmission::Accepted
@@ -1434,11 +1442,7 @@ pub(crate) async fn handle_ipc_send(
                         .is_some_and(|lookup| lookup.supports_direct_app_chunks(&device))
                     {
                         admit_direct_plain(ctx, request, device, deadline).await
-                    } else if reg.send_to(
-                        &device,
-                        ctx.local_priority,
-                        app_send_frame(request, None),
-                    ) {
+                    } else if reg.send_to(&device, local_priority, app_send_frame(request, None)) {
                         // Old decoders retain their existing typed whole-frame contract.
                         DirectAdmission::Accepted
                     } else {
@@ -1465,7 +1469,7 @@ pub(crate) async fn handle_ipc_send(
                     &send.dst_node_id,
                     sealed_for,
                     &|device| device_instance(ctx, device),
-                    ctx.local_priority,
+                    local_priority,
                     app_send_frame(&send, sealed.as_ref().map(|(p, _)| p.as_slice())),
                 )
         };
@@ -1808,7 +1812,7 @@ pub(crate) async fn handle_ipc_send(
                         let admitted = tokio::time::timeout_at(admission_deadline, async {
                             for frame in &frames {
                                 let accepted = if relay_realtime {
-                                    reg.send_to(next_hop, ctx.local_priority, frame.clone())
+                                    reg.send_to(next_hop, local_priority, frame.clone())
                                 } else {
                                     reg.send_reliable_to(next_hop, frame.clone()).await
                                 };
@@ -1922,7 +1926,7 @@ pub(crate) async fn handle_ipc_send(
                 // This is an origin decision, with no new wire metadata or
                 // relay scheduling policy. Secondary/bulk keeps one copy.
                 let diverse_primary = relay_media_sealed
-                    && ctx.local_priority == veil_proto::priority::REALTIME
+                    && local_priority == veil_proto::priority::REALTIME
                     && send.data.len() <= 512;
                 let fanout_limit = if relay_control_compat {
                     3
@@ -1953,11 +1957,11 @@ pub(crate) async fn handle_ipc_send(
                         // Compatibility control retains its local signaling slot,
                         // just like the per-device copies above.
                         if relay_wire_realtime
-                            && ctx.local_priority == veil_proto::priority::INTERACTIVE
+                            && local_priority == veil_proto::priority::INTERACTIVE
                         {
                             veil_proto::header::priority::REALTIME
                         } else {
-                            ctx.local_priority
+                            local_priority
                         },
                         fwd_frame.clone(),
                     );
@@ -1965,14 +1969,14 @@ pub(crate) async fn handle_ipc_send(
                         if relayed {
                             crate::route_trace::sealed_relay_hop_sample(
                                 "relay_queued",
-                                ctx.local_priority,
+                                local_priority,
                                 &next_hop,
                                 body,
                             );
                         } else {
                             crate::route_trace::sealed_relay_hop_sample(
                                 "relay_refused",
-                                ctx.local_priority,
+                                local_priority,
                                 &next_hop,
                                 body,
                             );
@@ -1980,7 +1984,7 @@ pub(crate) async fn handle_ipc_send(
                         crate::route_trace::observe(
                             *local_node_id,
                             send.dst_node_id,
-                            ctx.local_priority,
+                            local_priority,
                             next_hop,
                             relayed,
                             reg.has_neutral_forward_datagram_transport(&next_hop),
@@ -2187,7 +2191,12 @@ pub(crate) async fn handle_rt_send(
 
     // Same reason as the interactive path: the destination may name an
     // identity, and the session is registered under a device of it.
-    let sent = reg.send_to_peer_or_identity(&send.dst_node_id, local_priority.min(3), frame);
+    let source_lane = if local_priority == veil_proto::priority::INTERACTIVE {
+        veil_proto::ipc::LOCAL_SIGNALING_LANE
+    } else {
+        local_priority.min(3)
+    };
+    let sent = reg.send_to_peer_or_identity(&send.dst_node_id, source_lane, frame);
     crate::route_trace::sealed_rt_local_sample(
         if sent {
             "direct_queued"
@@ -2867,7 +2876,14 @@ mod ratchet_send_tests {
                 .await
                 .unwrap();
             let (priority, bytes) = lock!(capture.0).pop().unwrap();
-            assert_eq!(priority, lane);
+            assert_eq!(
+                priority,
+                if lane == veil_proto::priority::INTERACTIVE {
+                    veil_proto::ipc::LOCAL_SIGNALING_LANE
+                } else {
+                    lane
+                }
+            );
             assert_eq!(codec::decode_header(&bytes).unwrap().flags, 0);
             if let Some(previous) = previous {
                 assert_eq!(bytes, previous);
@@ -4938,7 +4954,7 @@ mod ratchet_send_tests {
                 let (lane, bytes) = relay
                     .try_recv()
                     .expect("call control must survive a full primary queue");
-                assert_eq!(lane, veil_proto::priority::INTERACTIVE);
+                assert_eq!(lane, veil_proto::ipc::LOCAL_SIGNALING_LANE);
                 assert_eq!(
                     codec::decode_header(&bytes).unwrap().priority(),
                     veil_proto::priority::INTERACTIVE,

@@ -41,9 +41,9 @@ pub mod parallel_binding;
 pub mod pending_response_table;
 pub mod priority_queue;
 pub mod realtime_datagram;
-pub mod reliable_frames;
 pub mod rekey_context;
 pub mod rekey_rx_grace_buffer;
+pub mod reliable_frames;
 pub mod rendezvous;
 mod resume_capabilities;
 pub mod rotation_deadline;
@@ -69,5 +69,7 @@ pub use frame_outbox::{FrameOutbox, FrameSender};
 pub use fsm::{SessionFsm, SessionHandshakeData, SessionPhase};
 pub use manager::{RemoteRole, SessionEntry, SessionId, SessionRegistry};
 pub use outbox::SessionOutbox;
-pub use priority_queue::{DEFAULT_WEIGHTS, LOCAL_NETWORK_CONTROL_LANE, PriorityQueue};
+pub use priority_queue::{
+    DEFAULT_WEIGHTS, LOCAL_NETWORK_CONTROL_LANE, LOCAL_SIGNALING_LANE, PriorityQueue,
+};
 pub use tx_registry::{PriorityFrame, SendToError, SessionTxRegistry};
