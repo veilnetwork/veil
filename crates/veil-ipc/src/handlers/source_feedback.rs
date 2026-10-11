@@ -1,5 +1,5 @@
 //! Trusted local observations only. This handler never sends network frames.
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use veil_proto::ipc::LocalSourceFeedbackPayload;
 use veil_types::FrameBroadcaster;
 
@@ -23,23 +23,32 @@ pub(crate) fn handle_local_source_feedback(
     let Some(registry) = registry else {
         return false;
     };
-    registry.note_local_source_feedback(report.pressured, now)
+    // Preserve the original sampling instant through IPC backlog. Starting a
+    // new lease at receipt would let delayed/replayed-but-still-fresh reports
+    // hold competing sources after their observation's lease already ended.
+    // Same-host future clock tolerance must never extend a lease into the future.
+    let age = Duration::from_millis(now_unix_ms.saturating_sub(report.sampled_at_unix_ms));
+    let Some(sampled_at) = now.checked_sub(age) else {
+        return false;
+    };
+    registry.note_local_source_feedback(report.pressured, sampled_at)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
     #[derive(Default)]
-    struct Observer(AtomicUsize);
+    struct Observer(AtomicUsize, Mutex<Vec<Instant>>);
     impl FrameBroadcaster for Observer {
-        fn note_local_source_feedback(&self, pressured: bool, _: Instant) -> bool {
+        fn note_local_source_feedback(&self, pressured: bool, sampled_at: Instant) -> bool {
             self.0
                 .fetch_add(if pressured { 1 } else { 100 }, Ordering::Relaxed);
+            self.1.lock().unwrap().push(sampled_at);
             true
         }
         fn send_to(&self, _: &[u8; 32], _: u8, _: Vec<u8>) -> bool {
@@ -51,6 +60,61 @@ mod tests {
         fn active_node_ids(&self) -> Vec<[u8; 32]> {
             vec![]
         }
+    }
+
+    #[test]
+    fn ipc_delay_and_replay_do_not_renew_the_original_observation() {
+        let registry = Observer::default();
+        let sampled_at = Instant::now();
+        let report = LocalSourceFeedbackPayload {
+            source_app_id: [7; 32],
+            pressured: true,
+            sampled_at_unix_ms: 10_000,
+        };
+        for elapsed_ms in [0, 1200, LocalSourceFeedbackPayload::MAX_AGE_MS] {
+            assert!(handle_local_source_feedback(
+                &report.encode(),
+                true,
+                |id| *id == report.source_app_id,
+                Some(&registry),
+                10_000 + elapsed_ms,
+                sampled_at + Duration::from_millis(elapsed_ms),
+            ));
+        }
+        assert_eq!(
+            *registry.1.lock().unwrap(),
+            vec![sampled_at; 3],
+            "IPC receipt and replay must preserve, not refresh, the source lease"
+        );
+        assert!(!handle_local_source_feedback(
+            &report.encode(),
+            true,
+            |_| true,
+            Some(&registry),
+            11_501,
+            sampled_at + Duration::from_millis(1501),
+        ));
+        assert_eq!(registry.0.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn tolerated_future_clock_correction_cannot_extend_the_lease() {
+        let registry = Observer::default();
+        let received_at = Instant::now();
+        let report = LocalSourceFeedbackPayload {
+            source_app_id: [7; 32],
+            pressured: false,
+            sampled_at_unix_ms: 10_000 + LocalSourceFeedbackPayload::MAX_FUTURE_MS,
+        };
+        assert!(handle_local_source_feedback(
+            &report.encode(),
+            true,
+            |_| true,
+            Some(&registry),
+            10_000,
+            received_at,
+        ));
+        assert_eq!(*registry.1.lock().unwrap(), vec![received_at]);
     }
 
     #[test]
