@@ -138,6 +138,131 @@ fn relay_video_assembler_discards_an_unterminated_old_frame() {
 }
 
 #[test]
+fn relay_video_repair_is_immediate_and_preserves_the_next_frame_prefix() {
+    let mut assembler = RelayVideoFrameAssembler::default();
+    let original = video_packet(7, true, 1);
+    assert!(matches!(
+        assembler.push(original),
+        RelayVideoFramePush::Complete(_)
+    ));
+    let prefix = video_packet(8, false, 2);
+    assert!(matches!(
+        assembler.push(prefix.clone()),
+        RelayVideoFramePush::Pending
+    ));
+
+    let mut oversized_repair = video_packet(7, false, 9);
+    oversized_repair.resize(RELAY_VIDEO_FRAME_MAX_BYTES + 1, 9);
+    assert!(matches!(
+        assembler.push(oversized_repair),
+        RelayVideoFramePush::Dropped
+    ));
+
+    // A NACK asks for a single old fragment, not its whole encoded frame.
+    // Neither its timestamp nor its missing marker may replace frame 8.
+    for marker in [false, true] {
+        let repair = video_packet(7, marker, 3);
+        let RelayVideoFramePush::Complete(packets) = assembler.push(repair.clone()) else {
+            panic!("a repair must not wait for the old frame's other packets");
+        };
+        assert_eq!(packets, vec![repair]);
+    }
+    let tail = video_packet(8, true, 4);
+    let RelayVideoFramePush::Complete(packets) = assembler.push(tail.clone()) else {
+        panic!("the next frame must still complete");
+    };
+    assert_eq!(packets, vec![prefix, tail]);
+}
+
+#[test]
+fn relay_video_repairs_remain_separate_after_completion_and_timestamp_wrap() {
+    let mut assembler = RelayVideoFrameAssembler::default();
+    let old = video_packet(u32::MAX - 3, true, 1);
+    assert!(matches!(
+        assembler.push(old.clone()),
+        RelayVideoFramePush::Complete(_)
+    ));
+    let duplicate = video_packet(u32::MAX - 3, false, 2);
+    let RelayVideoFramePush::Complete(packets) = assembler.push(duplicate.clone()) else {
+        panic!("a completed timestamp's repair must be sent immediately");
+    };
+    assert_eq!(packets, vec![duplicate]);
+    let prefix = video_packet(2, false, 3);
+    assert!(matches!(
+        assembler.push(prefix.clone()),
+        RelayVideoFramePush::Pending
+    ));
+    let RelayVideoFramePush::Complete(packets) = assembler.push(old.clone()) else {
+        panic!("a pre-wrap repair must not replace the post-wrap frame");
+    };
+    assert_eq!(packets, vec![old]);
+    let tail = video_packet(2, true, 4);
+    let RelayVideoFramePush::Complete(packets) = assembler.push(tail.clone()) else {
+        panic!("post-wrap frame must complete normally");
+    };
+    assert_eq!(packets, vec![prefix, tail]);
+}
+
+#[test]
+fn relay_video_repair_marker_cannot_clear_a_contended_frame_discard() {
+    let mut assembler = RelayVideoFrameAssembler::default();
+    assert!(matches!(
+        assembler.push(video_packet(7, true, 1)),
+        RelayVideoFramePush::Complete(_)
+    ));
+    assert!(matches!(
+        assembler.push(video_packet(8, false, 2)),
+        RelayVideoFramePush::Pending
+    ));
+    assembler.discard_after_contention();
+    assert!(matches!(
+        assembler.push(video_packet(7, true, 3)),
+        RelayVideoFramePush::Complete(_)
+    ));
+    assert!(matches!(
+        assembler.push(video_packet(8, false, 4)),
+        RelayVideoFramePush::Dropped
+    ));
+    assert!(matches!(
+        assembler.push(video_packet(8, true, 5)),
+        RelayVideoFramePush::Dropped
+    ));
+    let next = video_packet(9, true, 6);
+    let RelayVideoFramePush::Complete(packets) = assembler.push(next.clone()) else {
+        panic!("a new frame must recover after the discarded frame's marker");
+    };
+    assert_eq!(packets, vec![next]);
+}
+
+#[tokio::test]
+async fn relay_video_repairs_use_bounded_video_capacity_and_leave_audio_and_prefix_intact() {
+    let (audio, mut audio_rx) = mpsc::channel(1);
+    let (video, mut video_rx) = mpsc::channel(1);
+    let stats = Arc::new(RelayMediaStats::default());
+    let ingress = MediaIngress::new(audio, MediaVideoIngress::relay_frames(video, stats));
+    let voice = vec![0x80, 111, 1, 2];
+    assert_eq!(ingress.enqueue(voice.clone().into()), 0);
+    assert_eq!(ingress.enqueue(video_packet(7, true, 1).into()), 0);
+    video_rx.try_recv().unwrap();
+    let prefix = video_packet(8, false, 2);
+    assert_eq!(ingress.enqueue(prefix.clone().into()), 0);
+    let repair = video_packet(7, false, 3);
+    assert_eq!(ingress.enqueue(repair.clone().into()), 0);
+    // Full video capacity reports loss without spending the reserved audio
+    // capacity or discarding the next frame's already assembled prefix.
+    assert_eq!(ingress.enqueue(video_packet(7, true, 4).into()), 1);
+    assert_eq!(video_rx.try_recv().unwrap().packets, vec![repair]);
+    let tail = video_packet(8, true, 5);
+    assert_eq!(ingress.enqueue(tail.clone().into()), 0);
+    assert_eq!(video_rx.try_recv().unwrap().packets, vec![prefix, tail]);
+    assert_eq!(audio_rx.try_recv().unwrap().payload, voice);
+    assert!(video_rx.try_recv().is_err());
+    ingress.closed.store(true, Ordering::Release);
+    assert_eq!(ingress.enqueue(video_packet(7, false, 6).into()), -1);
+    assert!(video_rx.try_recv().is_err());
+}
+
+#[test]
 fn relay_video_assembler_bounds_pathological_frames_and_recovers() {
     let mut assembler = RelayVideoFrameAssembler::default();
     let mut first = video_packet(7, false, 1);
