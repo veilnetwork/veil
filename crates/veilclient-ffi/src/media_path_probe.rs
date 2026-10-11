@@ -8,6 +8,7 @@ use rand_core::{OsRng, RngCore};
 
 pub(crate) const MAGIC: &[u8; 4] = b"VMP1";
 pub(crate) const CONTROL_BYTES: usize = 24;
+const REQUEST_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProbeRoute {
@@ -100,6 +101,8 @@ pub(crate) enum ProbeStatus {
 pub(crate) struct RouteProbe {
     request: ProbeControl,
     sent_at: Instant,
+    last_request_at: Instant,
+    retries_remaining: u8,
     max_round_trip: Duration,
     status: ProbeStatus,
 }
@@ -117,6 +120,8 @@ impl RouteProbe {
                 token,
             },
             sent_at,
+            last_request_at: sent_at,
+            retries_remaining: 2,
             max_round_trip,
             status: ProbeStatus::Pending,
         }
@@ -124,6 +129,28 @@ impl RouteProbe {
 
     pub(crate) fn request_payload(&self) -> Vec<u8> {
         self.request.encode()
+    }
+
+    pub(crate) fn deadline(&self) -> Instant {
+        self.sent_at + self.max_round_trip
+    }
+
+    /// A newly negotiated independent sender may discard the first cell while
+    /// its connection warms. Retry the same authenticated challenge at most
+    /// twice, with fresh sealing by the normal producer. Neither a retry nor
+    /// a missed poll extends the original qualification deadline. The spacing
+    /// also leaves room for the peer's existing 200-ms echo throttle.
+    pub(crate) fn retry_payload(&mut self, now: Instant) -> Option<Vec<u8>> {
+        if self.status(now) != ProbeStatus::Pending
+            || self.retries_remaining == 0
+            || now.saturating_duration_since(self.sent_at) >= self.max_round_trip
+            || now.saturating_duration_since(self.last_request_at) < REQUEST_RETRY_INTERVAL
+        {
+            return None;
+        }
+        self.last_request_at = now;
+        self.retries_remaining -= 1;
+        Some(self.request_payload())
     }
 
     pub(crate) fn status(&mut self, now: Instant) -> ProbeStatus {
@@ -166,6 +193,89 @@ impl RouteProbe {
 mod tests {
     use super::*;
     use crate::media;
+
+    #[test]
+    fn retries_are_spaced_bounded_and_keep_the_original_deadline() {
+        let now = Instant::now();
+        let mut probe = RouteProbe::begin(ProbeRoute::Relay, now, Duration::from_millis(1000));
+        let request = probe.request_payload();
+        assert!(
+            probe
+                .retry_payload(now + Duration::from_millis(249))
+                .is_none()
+        );
+        assert_eq!(
+            probe.retry_payload(now + Duration::from_millis(250)),
+            Some(request.clone())
+        );
+        assert!(
+            probe
+                .retry_payload(now + Duration::from_millis(499))
+                .is_none()
+        );
+        assert_eq!(
+            probe.retry_payload(now + Duration::from_millis(500)),
+            Some(request.clone())
+        );
+        for ms in [501, 750, 999, 1000] {
+            assert!(
+                probe
+                    .retry_payload(now + Duration::from_millis(ms))
+                    .is_none()
+            );
+        }
+        let reply = ProbeControl::decode(&request).unwrap().reply().unwrap();
+        assert_eq!(
+            probe.observe(reply, now + Duration::from_millis(1001)),
+            ProbeStatus::Expired
+        );
+
+        // A delayed first poll cannot create a fresh observation window.
+        let mut missed = RouteProbe::begin(ProbeRoute::Relay, now, Duration::from_millis(600));
+        assert!(
+            missed
+                .retry_payload(now + Duration::from_millis(600))
+                .is_none()
+        );
+        assert!(
+            missed
+                .retry_payload(now + Duration::from_millis(601))
+                .is_none()
+        );
+        assert_eq!(
+            missed.status(now + Duration::from_millis(601)),
+            ProbeStatus::Expired
+        );
+    }
+
+    #[test]
+    fn short_qualified_and_cancelled_attempts_never_retry() {
+        let now = Instant::now();
+        let mut short = RouteProbe::begin(ProbeRoute::Direct, now, Duration::from_millis(100));
+        assert!(
+            short
+                .retry_payload(now + Duration::from_millis(250))
+                .is_none()
+        );
+        let mut qualified = RouteProbe::begin(ProbeRoute::Relay, now, Duration::from_millis(600));
+        let reply = ProbeControl::decode(&qualified.request_payload())
+            .unwrap()
+            .reply()
+            .unwrap();
+        qualified.observe(reply, now + Duration::from_millis(10));
+        assert!(
+            qualified
+                .retry_payload(now + Duration::from_millis(250))
+                .is_none()
+        );
+        let mut cancelled = RouteProbe::begin(ProbeRoute::Relay, now, Duration::from_millis(600));
+        cancelled.cancel();
+        assert!(
+            cancelled
+                .retry_payload(now + Duration::from_millis(250))
+                .is_none()
+        );
+    }
 
     #[test]
     fn only_a_matching_timely_reply_qualifies() {
