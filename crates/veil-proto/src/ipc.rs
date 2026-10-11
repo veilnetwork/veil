@@ -1281,6 +1281,11 @@ pub const IPC_HEADER_EXPLICIT_LOCAL_LANE: u16 = 0x0004;
 pub const LOCAL_RECOVERABLE_DATA_LANE: u8 = 4;
 const IPC_HEADER_RECOVERABLE_DATA_LANE: u16 = 0x0008;
 
+/// Daemon-local application signaling selector. The IPC handler derives it
+/// from an interactive realtime/control request; neither IPC header bits nor
+/// an inter-node priority encode this value. Five remains network maintenance.
+pub const LOCAL_SIGNALING_LANE: u8 = 6;
+
 pub fn set_ipc_local_source_lane(header: &mut crate::FrameHeader, lane: u8, explicit: bool) {
     header.flags &= !(IPC_HEADER_EXPLICIT_LOCAL_LANE | IPC_HEADER_RECOVERABLE_DATA_LANE);
     header.set_priority(lane.min(crate::priority::BACKGROUND));

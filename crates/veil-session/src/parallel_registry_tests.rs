@@ -53,7 +53,8 @@ impl Fixture {
         let initiator = ParallelParent::new([1; 32], [2; 32], [3; 32]);
         let responder = ParallelParent::new([1; 32], [3; 32], [2; 32]);
         let registry = Arc::new(ParallelRegistry::default());
-        let (tx, incoming) = mpsc::channel(8);
+        let (tx, incoming) =
+            mpsc::channel(veil_transport::QuicParallelHandle::CONNECTIONS_PER_DIRECTION);
         let registration = registry
             .register([1; 32], responder.handle(), &offer, tx)
             .unwrap();

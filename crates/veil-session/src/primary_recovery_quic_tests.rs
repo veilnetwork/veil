@@ -555,8 +555,14 @@ async fn measure_channel(
             .await
             .expect("full-duplex neutral connection budget");
         }
-        assert_eq!(diagnostics.active_connections(), 12);
-        assert_eq!(b_diagnostics.active_connections(), 12);
+        timeout(Duration::from_secs(3), async {
+            while diagnostics.active_connections() != 12 || b_diagnostics.active_connections() != 12
+            {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("optional signaling retired without consuming recovery capacity");
     }
     let warm_frame = channel_frame(large, forward, 0, 0);
     let (_, warm_body, warm_kind) = super::super::decode_realtime_lane_frame(&warm_frame).unwrap();
@@ -904,7 +910,7 @@ async fn bbr_recovers_fresh_datagrams_after_neutral_outage() {
 }
 
 #[tokio::test]
-async fn recoverable_source_has_its_own_quic_connection_and_survives_screen_close() {
+async fn local_signaling_and_data_have_distinct_quic_connections_and_survive_screen_close() {
     use veil_proto::{
         ipc::LOCAL_RECOVERABLE_DATA_LANE,
         priority::{BACKGROUND, BULK},
@@ -971,7 +977,13 @@ async fn recoverable_source_has_its_own_quic_connection_and_survives_screen_clos
         let mut a =
             ParallelSession::new(a_offer, &[2; 32], &[3; 32], [1; 32], context.clone(), None);
         let b = ParallelSession::new(b_offer, &[3; 32], &[2; 32], [1; 32], context, None);
-        let lanes = [REALTIME, BULK, BACKGROUND, LOCAL_RECOVERABLE_DATA_LANE];
+        let lanes = [
+            REALTIME,
+            BULK,
+            BACKGROUND,
+            LOCAL_RECOVERABLE_DATA_LANE,
+            crate::LOCAL_SIGNALING_LANE,
+        ];
         for lane in lanes {
             timeout(Duration::from_secs(5), async {
                 while !a.prepare(lane) {
@@ -981,7 +993,7 @@ async fn recoverable_source_has_its_own_quic_connection_and_survives_screen_clos
             .await
             .unwrap();
         }
-        assert_eq!(diagnostics.active_connections(), 4);
+        assert_eq!(diagnostics.active_connections(), 5);
         let mut bindings = HashSet::new();
         let mut handles = Vec::new();
         for (seq, lane) in lanes.into_iter().enumerate() {
@@ -1001,9 +1013,14 @@ async fn recoverable_source_has_its_own_quic_connection_and_survives_screen_clos
         timeout(Duration::from_secs(1), handles[2].closed())
             .await
             .unwrap();
-        for (seq, lane) in [REALTIME, BULK, LOCAL_RECOVERABLE_DATA_LANE]
-            .into_iter()
-            .enumerate()
+        for (seq, lane) in [
+            REALTIME,
+            BULK,
+            LOCAL_RECOVERABLE_DATA_LANE,
+            crate::LOCAL_SIGNALING_LANE,
+        ]
+        .into_iter()
+        .enumerate()
         {
             let frame = primary_test_frame(true, seq as u32, 0);
             let (_, body, kind) = super::super::decode_realtime_lane_frame(&frame).unwrap();
@@ -1024,7 +1041,7 @@ async fn recoverable_source_has_its_own_quic_connection_and_survives_screen_clos
         }
         let mut received = HashSet::new();
         timeout(Duration::from_secs(2), async {
-            while received.len() < 3 {
+            while received.len() < 4 {
                 let (seq, _, _) = rx.recv().await.unwrap();
                 assert!(received.insert(seq), "one source delivered a duplicate");
             }

@@ -10,6 +10,7 @@ pub(crate) const PRESSURE_GRACE: Duration = Duration::from_secs(2);
 pub(crate) const RELIABLE_SECONDARY_BYTES: usize = 4096;
 pub(crate) const PRESSURED_RELIABLE_BYTES: usize = 1024;
 pub(crate) const NETWORK_CONTROL_BYTES: usize = 1024;
+const SIGNALING_BYTES: usize = 4096;
 // One maximum-sized local datagram work item, shared by all neighbors. Small
 // control packets must not consume an entire allowance and corrupt a following
 // packetized frame. Reliable files retain their separate, smaller byte budget.
@@ -25,6 +26,7 @@ struct SourceState {
     reliable_sequence: u64,
     reliable_waiters: VecDeque<u64>,
     network_window: Option<(Instant, usize)>,
+    signaling_next: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -73,6 +75,14 @@ impl LocalSourceActivity {
 
     pub(crate) fn note(&self, now: Instant) {
         let mut state = lock!(self.0);
+        if state
+            .last_primary
+            .is_some_and(|last| now.saturating_duration_since(last) >= IDLE_GRACE)
+        {
+            // A new producer after inactivity must not inherit a previous
+            // call's oversized compatibility-control debt.
+            state.signaling_next = None;
+        }
         // Runners can publish observations in a different order. An older
         // observation must not retire a newer producer's activity.
         state.last_primary = Some(state.last_primary.map_or(now, |last| last.max(now)));
@@ -106,6 +116,49 @@ impl LocalSourceActivity {
         now: Instant,
     ) -> Result<(), Instant> {
         self.admit_reliable(bytes, now, false, None)
+    }
+
+    /// Locally authored signaling is independent of both reliable DATA debt
+    /// and network recovery. A periodic fan-out must not become a byte burst
+    /// on the common uplink while a primary producer is active. The first
+    /// frame is immediate; subsequent whole frames pay proportional time.
+    pub(crate) fn signaling_wait(&self, now: Instant) -> Option<Instant> {
+        let state = lock!(self.0);
+        let until = state.last_primary.map(|at| at + IDLE_GRACE)?;
+        if now >= until {
+            return None;
+        }
+        state
+            .signaling_next
+            .filter(|next| now < *next)
+            .map(|next| next.min(until))
+    }
+
+    pub(crate) fn admit_signaling(&self, bytes: usize, now: Instant) -> Result<(), Instant> {
+        let mut state = lock!(self.0);
+        let Some(until) = state
+            .last_primary
+            .map(|at| at + IDLE_GRACE)
+            .filter(|until| now < *until)
+        else {
+            state.signaling_next = None;
+            return Ok(());
+        };
+        if let Some(next) = state.signaling_next.filter(|next| now < *next) {
+            return Err(next.min(until));
+        }
+        let nanos = (bytes.max(1) as u128)
+            .saturating_mul(SECONDARY_PROBE_INTERVAL.as_nanos())
+            .div_ceil(SIGNALING_BYTES as u128)
+            .min(SECONDARY_PROBE_INTERVAL.as_nanos() * u32::MAX as u128);
+        let charge = Duration::new(
+            (nanos / 1_000_000_000) as u64,
+            (nanos % 1_000_000_000) as u32,
+        );
+        // Charge from the actual admission time. Idle time and fresh feedback
+        // neither accrue catch-up credit nor refund an already sent frame.
+        state.signaling_next = Some(now + charge);
+        Ok(())
     }
 
     /// Own network queries have an independent small allowance, so a held
@@ -257,6 +310,61 @@ impl LocalSourceActivity {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn signaling_fanout_is_paced_across_producers_without_idle_credit() {
+        let activity = Arc::new(LocalSourceActivity::default());
+        let peer = activity.clone();
+        let now = Instant::now();
+        activity.note(now);
+        assert_eq!(activity.admit_signaling(1024, now), Ok(()));
+        let next = now + Duration::from_millis(50);
+        assert_eq!(peer.admit_signaling(1024, now), Err(next));
+        activity.note(now + Duration::from_millis(10));
+        activity.note_pressure(now + Duration::from_millis(10));
+        assert_eq!(
+            activity.signaling_wait(now + Duration::from_millis(10)),
+            Some(next)
+        );
+        assert_eq!(peer.admit_signaling(2048, next), Ok(()));
+        assert_eq!(
+            activity.admit_signaling(1024, next),
+            Err(next + Duration::from_millis(100))
+        );
+        let later = now + Duration::from_secs(1);
+        assert_eq!(activity.admit_signaling(1024, later), Ok(()));
+        assert_eq!(
+            peer.admit_signaling(1024, later),
+            Err(later + Duration::from_millis(50))
+        );
+    }
+
+    #[test]
+    fn signaling_debt_does_not_block_data_recovery_or_idle_call_setup() {
+        let activity = LocalSourceActivity::default();
+        let now = Instant::now();
+        assert_eq!(activity.admit_signaling(usize::MAX, now), Ok(()));
+        assert_eq!(activity.admit_signaling(1024, now), Ok(()));
+        activity.note(now);
+        activity.note_pressure(now);
+        assert_eq!(activity.admit_signaling(8192, now), Ok(()));
+        assert_eq!(activity.admit_reliable_secondary(1024, now), Ok(()));
+        assert_eq!(activity.admit_network_control(1024, now), Ok(()));
+        assert_eq!(
+            activity.admit_signaling(1, now),
+            Err(now + Duration::from_millis(400))
+        );
+        assert_eq!(activity.signaling_wait(now + IDLE_GRACE), None);
+        assert_eq!(activity.admit_signaling(1024, now + IDLE_GRACE), Ok(()));
+        let resumed = now + IDLE_GRACE;
+        activity.note(resumed);
+        assert_eq!(
+            activity.admit_signaling(SIGNALING_BYTES * 100, resumed),
+            Ok(())
+        );
+        activity.note(resumed + IDLE_GRACE);
+        assert_eq!(activity.admit_signaling(1024, resumed + IDLE_GRACE), Ok(()));
+    }
 
     #[test]
     fn short_control_and_packetized_frame_fit_one_pressure_allowance() {

@@ -24,8 +24,9 @@ const TOTAL_SLOTS: usize = SOURCE_SLOTS + TRANSIT_SLOTS;
 // Source counters retain logical ownership; transit counters observe physical
 // generic connections without attributing their traffic to a source role.
 const COUNTER_COUNT: usize = SOURCE_SLOTS + TOTAL_SLOTS;
-// One bounded authenticated replacement can coexist with all local slots.
-const _: () = assert!(TOTAL_SLOTS + 1 < QuicParallelHandle::CONNECTIONS_PER_DIRECTION);
+// The optional signaling child retires before reliable/replacement capacity
+// would be consumed; the peer retains the original generic connection bound.
+const _: () = assert!(TOTAL_SLOTS < QuicParallelHandle::CONNECTIONS_PER_DIRECTION);
 
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -169,7 +170,8 @@ impl ParallelQuicOffer {
 }
 
 fn channel_index(priority: u8) -> Option<usize> {
-    // INTERACTIVE/transit has no source slot and never requests one.
+    // INTERACTIVE is always neutral transit; local IPC signaling has its own
+    // private selector and never exposes it to the receiving peer.
     crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES
         .iter()
         .position(|&lane| lane == priority)
@@ -803,7 +805,40 @@ impl ParallelSession {
         self.prepare_index(index)
     }
 
+    /// Signaling may use an extra local child only while the existing generic
+    /// budget leaves room for reliable data and a verified replacement. Keep
+    /// the old eight-connection limit, including when the peer is older.
+    fn retire_signaling_for_capacity(&mut self) {
+        let Some(index) = channel_index(crate::LOCAL_SIGNALING_LANE)
+            .and_then(|source| self.assignments.source_physical(source))
+        else {
+            return;
+        };
+        let slot = &mut self.slots[index];
+        slot.ready = None;
+        slot.warm = None;
+        slot.replacing = false;
+        slot.recovery.reset();
+        if let Some(lease) = &self.readiness {
+            lease.mark(crate::LOCAL_SIGNALING_LANE, false);
+        }
+    }
+
     fn prepare_index(&mut self, index: usize) -> bool {
+        let signaling = channel_index(crate::LOCAL_SIGNALING_LANE)
+            .and_then(|source| self.assignments.source_physical(source));
+        let available = self.offer.handle.available_connection_slots();
+        if available <= 1 || (signaling != Some(index) && available <= 2) {
+            self.retire_signaling_for_capacity();
+        }
+        // A live signaling child already owns its slot. Starting a new one
+        // must leave two slots: ordinary reliable delivery and replacement.
+        if signaling == Some(index)
+            && self.slots[index].ready.is_none()
+            && self.offer.handle.available_connection_slots() <= 2
+        {
+            return false;
+        }
         self.poll_index(index);
         let slot = &self.slots[index];
         if slot.ready.is_some() {
@@ -861,6 +896,9 @@ impl ParallelSession {
 
     fn recover_channels(&mut self, now: std::time::Instant) {
         use datagram_recovery::Action;
+        if self.offer.handle.available_connection_slots() <= 1 {
+            self.retire_signaling_for_capacity();
+        }
         let mut eligible = [false; TOTAL_SLOTS];
         let mut snapshots = [None; TOTAL_SLOTS];
         // Adopt verified candidates before looking at ACK progress, including

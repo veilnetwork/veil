@@ -18,7 +18,8 @@ pub(super) fn fits(
     // Only local bulk/background waits for the previous blob to drain.
     // Primary write-ahead is checked separately by the caller. This byte
     // budget does not add a pending-blob restriction to primary/control.
-    if local_priority >= BULK && pending_blobs != 0 {
+    if local_priority >= BULK && local_priority != crate::LOCAL_SIGNALING_LANE && pending_blobs != 0
+    {
         return false;
     }
     // Keep whole frames live even when a single frame exceeds the budget.

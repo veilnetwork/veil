@@ -325,12 +325,19 @@ async fn reliable_punched_quic_session_uses_exclusive_accept_and_retires_retaine
         })
         .await;
         let ready = a.reliable().unwrap().ready().unwrap();
-        assert_eq!(a_handle.available_connection_slots(), 7);
+        assert_eq!(
+            a_handle.available_connection_slots(),
+            veil_transport::QuicParallelHandle::CONNECTIONS_PER_DIRECTION - 1
+        );
         send(&ready, 6).wait().await.unwrap();
         receive(b.reliable().unwrap(), 6).await;
         drop(a);
         assert!(ready.handle().recv().await.is_err());
-        until(|| a_handle.available_connection_slots() == 8).await;
+        until(|| {
+            a_handle.available_connection_slots()
+                == veil_transport::QuicParallelHandle::CONNECTIONS_PER_DIRECTION
+        })
+        .await;
         a_stream.write_all(b"alive").await.unwrap();
         let mut bytes = [0; 5];
         b_stream.read_exact(&mut bytes).await.unwrap();
