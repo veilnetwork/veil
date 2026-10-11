@@ -1031,6 +1031,23 @@ async fn native_ingress_audio_control_and_other_channels_pass_held_video_assembl
 
 #[tokio::test]
 async fn native_ingress_registry_readers_do_not_discard_audio_or_video() {
+    // Other tests deliberately hold the global registry's write lock. A
+    // queued writer may make try_read refuse admission, so exercise this
+    // read-only regression in a child running this exact test alone.
+    const CHILD: &str = "VEIL_MEDIA_REGISTRY_READER_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "media_ffi::media_priority_tests::native_ingress_registry_readers_do_not_discard_audio_or_video",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
     let (tx_hi, mut rx_hi) = mpsc::channel(4);
     let (video, mut rx_video) = mpsc::channel(4);
     let (id, _) = register_test_ingress(
