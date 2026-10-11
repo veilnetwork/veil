@@ -359,6 +359,80 @@ fn candidate_alias_requires_its_sealed_reply_and_never_counts_as_audio() {
 }
 
 #[test]
+fn a_short_observation_also_bounds_the_queued_challenge() {
+    let _lock = FIXTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut fixture = Fixture::new();
+    let (candidate, mut rx) = fixture.channel(ProbeRoute::Relay);
+    let before = tokio::time::Instant::now();
+    assert_eq!(veil_media_channel_begin_path_probe(candidate, 100), 0);
+    let queued = rx.blocking_recv().unwrap();
+    assert!(queued.deadline <= before + Duration::from_millis(125));
+    assert!(ProbeControl::decode(&queued.payload).is_some());
+    unsafe { veil_media_close_channel(candidate) };
+    assert_eq!(veil_media_channel_poll_path_probe(candidate), -1);
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn a_lost_first_challenge_retries_without_stealing_the_live_audio_receiver() {
+    let _lock = FIXTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut fixture = Fixture::new();
+    let (old, _) = fixture.channel(ProbeRoute::Direct);
+    let (candidate, mut rx) = fixture.channel(ProbeRoute::Relay);
+    let deliveries = AtomicUsize::new(0);
+    assert_eq!(
+        unsafe {
+            veil_media_set_recv_callback(
+                old,
+                Some(count_media),
+                (&deliveries as *const AtomicUsize).cast_mut().cast(),
+            )
+        },
+        0
+    );
+    let peer = media::cipher_for_test(&DEVICE, &RX, &TX).unwrap();
+    let audio = peer.seal(&[0x80, 111, 1, 2]).unwrap().into_vec();
+    media::dispatch_inbound_auto(PEER, &audio);
+    assert_eq!(deliveries.load(Ordering::Relaxed), 1);
+
+    assert_eq!(veil_media_channel_begin_path_probe(candidate, 600), 0);
+    // Model the lossy independent sender's first warm-up packet being lost.
+    let first = rx.blocking_recv().unwrap().payload;
+    assert_eq!(veil_media_channel_poll_path_probe(candidate), 0);
+    assert!(rx.try_recv().is_err());
+    std::thread::sleep(Duration::from_millis(260));
+    assert_eq!(veil_media_channel_poll_path_probe(candidate), 0);
+    let retry = rx
+        .try_recv()
+        .expect("fresh challenge after the warm-up loss");
+    assert_eq!(retry.payload, first);
+    let request = ProbeControl::decode(&retry.payload).unwrap();
+    let reply = peer
+        .seal(&request.reply().unwrap().encode())
+        .unwrap()
+        .into_vec();
+    media::dispatch_inbound_auto(PEER_DEVICE, &reply);
+    assert_eq!(veil_media_channel_poll_path_probe(candidate), 1);
+    assert_eq!(
+        deliveries.load(Ordering::Relaxed),
+        1,
+        "control is never audio activity"
+    );
+    assert!(rx.try_recv().is_err());
+    media::dispatch_inbound_auto(PEER_DEVICE, &reply);
+    let audio = peer.seal(&[0x80, 111, 3, 4]).unwrap().into_vec();
+    media::dispatch_inbound_auto(PEER, &audio);
+    assert_eq!(
+        deliveries.load(Ordering::Relaxed),
+        2,
+        "old audio still owns its receiver"
+    );
+    unsafe { veil_media_close_channel(candidate) };
+    assert_eq!(veil_media_channel_poll_path_probe(candidate), -1);
+    unsafe { veil_media_set_recv_callback(old, None, ptr::null_mut()) };
+}
+
+#[test]
 fn a_relay_request_uses_a_neutral_relay_echo_even_while_direct_is_active() {
     let _lock = FIXTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut fixture = Fixture::new();
