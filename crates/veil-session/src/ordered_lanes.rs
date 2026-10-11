@@ -9,7 +9,15 @@ use std::sync::Weak;
 use tokio::io::AsyncReadExt;
 use veil_transport::stream_parallel::StreamParallelHandle;
 
-const SOURCE_SLOTS: usize = crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES.len();
+// Ordered parents already carry signaling separately from their independent
+// media/data children. Keep their original pool and replacement allowance.
+const ORDERED_PRIORITIES: &[u8] = &[
+    veil_proto::priority::REALTIME,
+    veil_proto::priority::BULK,
+    veil_proto::priority::BACKGROUND,
+    veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
+];
+const SOURCE_SLOTS: usize = ORDERED_PRIORITIES.len();
 const TRANSIT_SLOTS: usize = 2;
 const TOTAL_SLOTS: usize = SOURCE_SLOTS + TRANSIT_SLOTS;
 const BIND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -182,10 +190,7 @@ fn mark(pool: &mut Pool, readiness: &Weak<LocalDatagramLease>) {
     if let Some(lease) = readiness.upgrade() {
         let status = lease.status();
         let mut changed = false;
-        for (index, priority) in crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES
-            .iter()
-            .enumerate()
-        {
+        for (index, priority) in ORDERED_PRIORITIES.iter().enumerate() {
             if status.pending() & (1 << index) != 0 {
                 pool.assignments.source(index);
             }
@@ -348,7 +353,7 @@ impl OrderedSession {
         });
         let readiness = status
             .filter(|_| registration.is_some())
-            .map(|status| Arc::new(status.activate()));
+            .map(|status| Arc::new(status.activate_without_signaling()));
         let worker = if registration.is_some() {
             worker(
                 offer.clone(),
@@ -429,9 +434,7 @@ impl Pool {
         salt: &[u8; 32],
         diagnostics: &Arc<ParallelDiagnostics>,
     ) -> Option<Arc<Mutex<RealtimeSender>>> {
-        let selected = if let Some(source) = crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES
-            .iter()
-            .position(|&p| p == priority)
+        let selected = if let Some(source) = ORDERED_PRIORITIES.iter().position(|&p| p == priority)
         {
             self.assignments.source(source)?
         } else {

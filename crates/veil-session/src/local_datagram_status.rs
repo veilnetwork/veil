@@ -3,11 +3,12 @@
 use std::sync::{Arc, Mutex, Weak};
 use veil_util::lock;
 
-pub(crate) const LOCAL_DATAGRAM_PRIORITIES: [u8; 4] = [
+pub(crate) const LOCAL_DATAGRAM_PRIORITIES: [u8; 5] = [
     veil_proto::priority::REALTIME,
     veil_proto::priority::BULK,
     veil_proto::priority::BACKGROUND,
     veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
+    crate::LOCAL_SIGNALING_LANE,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,6 +29,7 @@ struct State {
     owner: Weak<()>,
     transport_owner: Weak<()>,
     neutral_forwards: bool,
+    supported: u8,
     ready: u8,
     requested: u8,
 }
@@ -65,7 +67,7 @@ impl LocalDatagramStatus {
             return LocalDatagramChannelState::Unsupported;
         };
         let state = lock!(self.state);
-        if state.owner.strong_count() == 0 {
+        if state.owner.strong_count() == 0 || state.supported & bit == 0 {
             LocalDatagramChannelState::Unsupported
         } else if state.ready & bit != 0 {
             LocalDatagramChannelState::Ready
@@ -96,9 +98,21 @@ impl LocalDatagramStatus {
     }
 
     pub(crate) fn activate(self: &Arc<Self>) -> LocalDatagramLease {
+        self.activate_supported(true)
+    }
+
+    pub(crate) fn activate_without_signaling(self: &Arc<Self>) -> LocalDatagramLease {
+        self.activate_supported(false)
+    }
+
+    fn activate_supported(self: &Arc<Self>, signaling: bool) -> LocalDatagramLease {
         let owner = Arc::new(());
         let mut state = lock!(self.state);
         state.owner = Arc::downgrade(&owner);
+        state.supported = (1 << LOCAL_DATAGRAM_PRIORITIES.len()) - 1;
+        if !signaling {
+            state.supported &= !bit(crate::LOCAL_SIGNALING_LANE).expect("source selector");
+        }
         state.ready = 0;
         state.requested = 0;
         LocalDatagramLease {
@@ -125,7 +139,7 @@ impl LocalDatagramLease {
             return;
         };
         let mut state = lock!(self.status.state);
-        if Weak::ptr_eq(&state.owner, &Arc::downgrade(&self.owner)) {
+        if Weak::ptr_eq(&state.owner, &Arc::downgrade(&self.owner)) && state.supported & bit != 0 {
             if ready {
                 state.ready |= bit;
                 state.requested &= !bit;
@@ -212,6 +226,11 @@ mod tests {
         lease.mark(data, true);
         assert_eq!(status.state(data), Ready);
         assert_eq!(status.state(3), Ready);
+        assert_eq!(status.request(crate::LOCAL_SIGNALING_LANE), Warming);
+        assert_eq!(status.pending(), 16);
+        lease.mark(crate::LOCAL_SIGNALING_LANE, true);
+        assert_eq!(status.state(crate::LOCAL_SIGNALING_LANE), Ready);
+        assert_eq!(status.state(data), Ready);
         assert_eq!(status.request(1), Unsupported);
         assert_eq!(status.pending(), 0);
         assert_eq!(status.request(0), Warming);
@@ -226,6 +245,17 @@ mod tests {
         assert_eq!(status.state(0), Warming);
         drop(lease);
         assert_eq!(status.state(0), Unsupported);
+    }
+
+    #[test]
+    fn ordered_parent_does_not_claim_an_additional_signaling_child() {
+        let status = Arc::new(LocalDatagramStatus::default());
+        let lease = status.activate_without_signaling();
+        assert_eq!(status.state(0), Warming);
+        assert_eq!(status.request(crate::LOCAL_SIGNALING_LANE), Unsupported);
+        lease.mark(crate::LOCAL_SIGNALING_LANE, true);
+        assert_eq!(status.state(crate::LOCAL_SIGNALING_LANE), Unsupported);
+        assert_eq!(status.pending(), 0);
     }
 
     #[test]

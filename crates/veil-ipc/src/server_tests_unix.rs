@@ -1313,7 +1313,14 @@ async fn ipc_send_relay_via_route_cache() {
         .await
         .expect("timeout waiting for compatible control frame")
         .expect("B outbox channel closed unexpectedly");
-    assert_eq!(prio, veil_proto::header::priority::INTERACTIVE);
+    assert_eq!(prio, veil_proto::ipc::LOCAL_SIGNALING_LANE);
+    assert_eq!(
+        veil_proto::codec::decode_header(&frame_bytes)
+            .unwrap()
+            .priority(),
+        veil_proto::header::priority::INTERACTIVE,
+        "the source selector is never serialized as a relay priority",
+    );
     let compat_body = &frame_bytes[veil_proto::HEADER_SIZE..];
     assert!(!ForwardPayload::is_realtime_datagram_eligible(compat_body));
     let compat_fwd = ForwardPayload::decode(compat_body).unwrap();
