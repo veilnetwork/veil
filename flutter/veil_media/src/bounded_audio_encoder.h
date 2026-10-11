@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <memory>
 #include <utility>
 
@@ -20,8 +21,10 @@ namespace veil_media {
 // Opus encoder, changing timestamps, or implementing another codec.
 class BoundedAudioEncoder final : public webrtc::AudioEncoder {
  public:
-  explicit BoundedAudioEncoder(std::unique_ptr<webrtc::AudioEncoder> inner)
-      : inner_(std::move(inner)) {}
+  explicit BoundedAudioEncoder(
+      std::unique_ptr<webrtc::AudioEncoder> inner,
+      std::shared_ptr<std::atomic<int>> packet_duration = {})
+      : inner_(std::move(inner)), packet_duration_(std::move(packet_duration)) {}
 
   int SampleRateHz() const override { return inner_->SampleRateHz(); }
   size_t NumChannels() const override { return inner_->NumChannels(); }
@@ -94,7 +97,16 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
  private:
   EncodedInfo EncodeImpl(uint32_t timestamp, std::span<const int16_t> audio,
                          webrtc::Buffer* encoded) override {
-    return inner_->Encode(timestamp, audio, encoded);
+    // Opus may select the next duration at this packet's boundary. Sample
+    // before Encode, and publish only when an encoded packet actually exists.
+    // A pending 10-ms input block or DTX suppression is not a new packet.
+    const size_t blocks = inner_->Num10MsFramesInNextPacket();
+    auto info = inner_->Encode(timestamp, audio, encoded);
+    if (packet_duration_ && info.encoded_bytes > 0 && blocks > 0 && blocks <= 12) {
+      packet_duration_->store(static_cast<int>(blocks * 10),
+                              std::memory_order_relaxed);
+    }
+    return info;
   }
   int64_t OverheadBps(int duration_ms) const {
     return static_cast<int64_t>(overhead_bytes_) * 8 * 1000 / duration_ms;
@@ -103,11 +115,15 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
   static constexpr int kMaxPayloadBps = 32'000;
   size_t overhead_bytes_ = 0;
   std::unique_ptr<webrtc::AudioEncoder> inner_;
+  std::shared_ptr<std::atomic<int>> packet_duration_;
 };
 
 class BoundedAudioEncoderFactory : public webrtc::AudioEncoderFactory {
  public:
-  BoundedAudioEncoderFactory() : inner_(webrtc::CreateBuiltinAudioEncoderFactory()) {}
+  explicit BoundedAudioEncoderFactory(
+      std::shared_ptr<std::atomic<int>> packet_duration = {})
+      : inner_(webrtc::CreateBuiltinAudioEncoderFactory()),
+        packet_duration_(std::move(packet_duration)) {}
   std::vector<webrtc::AudioCodecSpec> GetSupportedEncoders() override {
     return inner_->GetSupportedEncoders();
   }
@@ -119,10 +135,12 @@ class BoundedAudioEncoderFactory : public webrtc::AudioEncoderFactory {
       const webrtc::SdpAudioFormat& format, Options options) override {
     auto encoder = inner_->Create(env, format, options);
     if (!encoder || format.name != "opus") return encoder;
-    return std::make_unique<BoundedAudioEncoder>(std::move(encoder));
+    return std::make_unique<BoundedAudioEncoder>(std::move(encoder),
+                                                packet_duration_);
   }
  private:
   webrtc::scoped_refptr<webrtc::AudioEncoderFactory> inner_;
+  std::shared_ptr<std::atomic<int>> packet_duration_;
 };
 
 }  // namespace veil_media
