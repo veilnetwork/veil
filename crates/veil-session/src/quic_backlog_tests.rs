@@ -1798,15 +1798,24 @@ async fn primary_ack_blackout_limits_secondary_before_rtt_or_expiry_changes() {
         "recoverable DATA must not bypass the local audio pressure budget"
     );
     admission.observe(REALTIME, &frame, now, true);
-    // A stalled independent primary must not shrink the parent control path
-    // before RTT/expiry feedback arrives. A PQ rekey-sized control write
-    // must still fit the normal independent reliable admission window.
+    // A stale low RTT must not keep the parent's larger file window open.
+    // This raw bulk write has no trusted control lease and must wait for ACKs.
+    let bulk_held = timeout(
+        Duration::from_millis(50),
+        stream.write_all(&[0x44; 12 * 1024]),
+    )
+    .await
+    .is_err();
+    // The production writer obtains this lease for locally authored control.
+    // A PQ rekey-sized control write still fits while the child is stalled.
+    let control = admission.writer_admission().begin_control().unwrap();
     let control_admitted = timeout(
         Duration::from_millis(50),
         stream.write_all(&[0x33; 12 * 1024]),
     )
     .await
     .is_ok_and(|result| result.is_ok());
+    drop(control);
     for priority in [REALTIME, INTERACTIVE] {
         assert!(admission.allow_secondary(
             priority,
@@ -1835,6 +1844,10 @@ async fn primary_ack_blackout_limits_secondary_before_rtt_or_expiry_changes() {
         now + Duration::from_secs(2),
     );
     close.close(0u32.into(), b"ack blackout gate complete");
+    assert!(
+        bulk_held,
+        "blocked primary ACKs left the parent file window open"
+    );
     assert!(
         probe_allowed,
         "one sparse recovery probe must remain possible"
