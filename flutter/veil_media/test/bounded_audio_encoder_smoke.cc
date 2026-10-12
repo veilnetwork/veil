@@ -8,8 +8,9 @@
 #include "system_wrappers/include/clock.h"
 #include "third_party/opus/src/include/opus.h"
 
-// Real Opus/ANA regression: a peer that permits only short packets must not
-// lower speech bitrate because allocation accounting assumes longer packets.
+// Real Opus/ANA regression: check startup and every feedback transition, not
+// just the settled allocation. A future longer packet cannot justify lowering
+// the speech bitrate of the current short packet.
 int main() {
   webrtc::SimulatedClock clock(0);
   const auto env = webrtc::CreateEnvironment(&clock);
@@ -33,6 +34,11 @@ int main() {
     manager.add_controllers()->mutable_bitrate_controller();
     if (!encoder->EnableAudioNetworkAdaptor(manager.SerializeAsString())) return 2;
     encoder->OnReceivedOverhead(209);
+    const auto payload_in_bounds = [&] {
+      return encoder->GetTargetBitrate() >= 16000 &&
+             encoder->GetTargetBitrate() <= 32000;
+    };
+    if (!payload_in_bounds()) return 9;
     std::array<int16_t, 480> pcm{};
     uint32_t timestamp = 0;
     for (int allocation : std::array{6000, 16000, 30000, 64000, 96000, 160000}) {
@@ -42,9 +48,26 @@ int main() {
       // then take effect at a packet boundary, as in the real send stream.
       for (int i = 0; i < 120; ++i) {
         encoder->OnReceivedUplinkAllocation(update);
+        if (!payload_in_bounds()) {
+          std::fprintf(stderr,
+                       "allocation maxptime=%d allocation=%d block=%d: payload=%d\n",
+                       maximum_ms, allocation, i, encoder->GetTargetBitrate());
+          return 7;
+        }
+        if (i == 0) {
+          encoder->OnReceivedRtt(120);
+          if (!payload_in_bounds()) return 10;
+          encoder->OnReceivedUplinkPacketLossFraction(0.1f);
+          if (!payload_in_bounds()) return 11;
+          encoder->OnReceivedOverhead(211);
+          if (!payload_in_bounds()) return 12;
+          encoder->OnReceivedOverhead(209);
+          if (!payload_in_bounds()) return 13;
+        }
         webrtc::Buffer packet;
         const int before = duration->load();
         const auto info = encoder->Encode(timestamp, pcm, &packet);
+        if (!payload_in_bounds()) return 8;
         // Check the actual Opus payload, independently of the wrapper's
         // Num10MsFramesInNextPacket observation. Release builds use NDEBUG.
         const int expected = info.encoded_bytes > 0
