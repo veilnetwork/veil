@@ -233,7 +233,7 @@ fn log_sample(stage: &str, local_lane: u8, sample: SealedLocalSample, hop: Optio
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let hop = hop.map_or_else(|| "local".to_owned(), |id| veil_util::hex_short(id));
+    let hop = hop.map_or_else(|| "local".to_owned(), veil_util::hex_short);
     log::info!(
         "ipc.rt_trace.sealed_sample at={} at_ms={at_ms} stage={stage} dst={} local_slot={local_lane} epoch={:016x} seq={} bytes={} hop={hop}",
         at_ms / 1000,
