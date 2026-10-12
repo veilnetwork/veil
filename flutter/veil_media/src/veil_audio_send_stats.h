@@ -7,7 +7,7 @@
 
 namespace veil_media {
 
-struct AudioSendSnapshot {
+struct RtpSendSnapshot {
   uint64_t attempts = 0;
   uint64_t queued = 0;
   uint64_t payload_packets = 0;
@@ -27,22 +27,22 @@ struct AudioSendSnapshot {
 // Endpoint-only observations, before and after local Veil queue admission.
 // A gap can be DTX silence or a capture/encoder pause; it is not a loss claim.
 // No packet contents, SSRCs, timestamps or roles are sent on the network.
-class AudioSendStats {
+class RtpSendStats {
  public:
-  bool mark_attempt(std::span<const uint8_t> packet, uint32_t audio_ssrc,
-                    int64_t now_ns) {
-    if (audio_ssrc == 0 || now_ns <= 0 || packet.size() < 12 ||
-        (packet[0] >> 6) != 2 || (packet[1] & 0x7f) != 111) {
+  bool mark_attempt(std::span<const uint8_t> packet, uint32_t local_ssrc,
+                    int64_t now_ns, uint8_t payload_type = 111) {
+    if (local_ssrc == 0 || now_ns <= 0 || packet.size() < 12 ||
+        (packet[0] >> 6) != 2 || (packet[1] & 0x7f) != payload_type) {
       return false;
     }
     const uint32_t ssrc = uint32_t(packet[8]) << 24 | uint32_t(packet[9]) << 16 |
                           uint32_t(packet[10]) << 8 | uint32_t(packet[11]);
-    if (ssrc != audio_ssrc) return false;
+    if (ssrc != local_ssrc) return false;
     const int64_t previous = last_attempt_ns_.exchange(now_ns, std::memory_order_relaxed);
     if (previous > 0 && now_ns >= previous) raise(max_gap_ns_, now_ns - previous);
     attempts_.fetch_add(1, std::memory_order_relaxed);
-    // BWE padding shares the Opus payload type and SSRC, but contains no
-    // encoded audio. Count it separately so probes cannot make the encoder
+    // BWE padding shares the stream's payload type and SSRC, but contains no
+    // encoded media. Count it separately so probes cannot make the encoder
     // appear active or hide a real capture gap. No payload data is retained.
     size_t header = 12 + (packet[0] & 0x0f) * 4;
     bool valid = header <= packet.size();
@@ -84,13 +84,13 @@ class AudioSendStats {
       last_queued_ns_.store(now_ns, std::memory_order_relaxed);
       queued_.fetch_add(1, std::memory_order_relaxed);
     } else {
-      // Count completed primary RTP failures directly. attempts - queued can
-      // include a still-running admission; video and RTCP use other counters.
+      // Count completed RTP failures directly. attempts - queued can include
+      // a still-running admission; each stream uses its own counters.
       dropped_.fetch_add(1, std::memory_order_relaxed);
     }
   }
 
-  AudioSendSnapshot snapshot(int64_t now_ns) const {
+  RtpSendSnapshot snapshot(int64_t now_ns) const {
     return {
         attempts_.load(std::memory_order_relaxed),
         queued_.load(std::memory_order_relaxed),
@@ -129,6 +129,9 @@ class AudioSendStats {
   std::atomic<int64_t> max_gap_ns_{0};
   std::atomic<int64_t> max_admission_ns_{0};
 };
+
+using AudioSendSnapshot = RtpSendSnapshot;
+using AudioSendStats = RtpSendStats;
 
 }  // namespace veil_media
 #endif

@@ -44,8 +44,8 @@ class InboundPacketQueue {
     return PushToLane(packet, IsSecondaryInboundRtp(packet), arrived_us);
   }
 
-  // RTCP is copied to both local Calls, whose SSRC filters select their own
-  // reports. The secondary copy shares video's bound, not audio's reserve.
+  // RTCP copies have independent bounds; the shim filters REMB targets before
+  // delivery, while each Call selects its own ordinary report blocks/TWCC.
   Admission PushToLane(std::span<const uint8_t> packet, bool secondary,
                        int64_t arrived_us = 0) {
     std::lock_guard<std::mutex> lock(mu_);

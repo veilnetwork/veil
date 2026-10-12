@@ -73,4 +73,28 @@ int main() {
   s = diagnostic.snapshot(2410 * ms);
   assert(s.unclassified_packets == 4 && s.payload_packets == 2);
   assert(s.payload_age_ms == 410 && s.payload_bytes == 4);
+
+  // A video's padding probe must not count as an encoded frame or audio.
+  // Use the same SSRC deliberately: payload type also isolates the counters.
+  veil_media::RtpSendStats video;
+  packet[0] = 0x80; packet[1] = 96;
+  assert(!stats.mark_attempt(packet, ssrc, 3000 * ms));
+  assert(video.mark_attempt(packet, ssrc, 3000 * ms, 96));
+  video.mark_result(3000 * ms, 3001 * ms, true);
+  std::vector<uint8_t> probe(packet.begin(), packet.end());
+  probe[0] = 0xa0; probe.back() = 1;
+  assert(video.mark_attempt(probe, ssrc, 3100 * ms, 96));
+  video.mark_result(3100 * ms, 3102 * ms, false);
+  auto v = video.snapshot(3110 * ms);
+  assert(v.attempts == 2 && v.queued == 1 && v.dropped == 1);
+  assert(v.payload_packets == 1 && v.padding_packets == 1);
+  assert(v.payload_bytes == 1 && v.padding_bytes == 1);
+  assert(v.payload_age_ms == 110 && v.age_ms == 10);
+  assert(v.max_admission_ms == 2);
+  packet[1] = 111;
+  assert(!video.mark_attempt(packet, ssrc, 3200 * ms, 96));
+  packet[1] = 96;
+  assert(!video.mark_attempt(packet, ssrc + 1, 3200 * ms, 96));
+  assert(video.snapshot(3200 * ms).attempts == 2);
+  assert(stats.snapshot(3200 * ms).attempts == 2);
 }
