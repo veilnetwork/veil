@@ -136,9 +136,7 @@ impl SessionTxRegistry {
     /// Nothing here changes neutral transit scheduling or network metadata.
     pub fn note_local_source_feedback(&self, pressured: bool, now: std::time::Instant) {
         self.source_activity.note(now);
-        if pressured {
-            self.source_activity.note_pressure(now);
-        }
+        self.source_activity.note_feedback(pressured, now);
     }
 
     /// Keep an owned source's ordinary pieces below one typical QUIC packet
