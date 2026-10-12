@@ -7,6 +7,7 @@
  */
 
 #include "veil_transport_shim.h"
+#include "veil_rtcp_lane_filter.h"
 #include <algorithm>
 #include "veil_diag_log.h"
 
@@ -141,6 +142,10 @@ AudioSendSnapshot VeilTransportShim::audio_send_stats() const {
   return audio_send_stats_.snapshot(webrtc::TimeMicros() * 1000);
 }
 
+RtpSendSnapshot VeilTransportShim::video_send_stats() const {
+  return video_send_stats_.snapshot(webrtc::TimeMicros() * 1000);
+}
+
 int64_t VeilTransportShim::audio_payload_receive_age_ms() const {
   const auto arrived = audio_payload_arrived_us_.load(std::memory_order_relaxed);
   const auto now = webrtc::TimeMicros();
@@ -250,8 +255,12 @@ bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
   const int64_t started_ns = webrtc::TimeMicros() * 1000;
   const bool audio = audio_send_stats_.mark_attempt(
       packet, local_audio_ssrc_.load(std::memory_order_relaxed), started_ns);
+  const bool video = video_send_stats_.mark_attempt(
+      packet, local_video_ssrc_.load(std::memory_order_relaxed), started_ns, 96);
   const int rc =
       veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
+  if (video)
+    video_send_stats_.mark_result(started_ns, webrtc::TimeMicros() * 1000, rc == 0);
   if (audio) {
     const int64_t admitted_us = webrtc::TimeMicros();
     audio_send_stats_.mark_result(started_ns, admitted_us * 1000, rc == 0);
@@ -404,8 +413,8 @@ void VeilTransportShim::OnVeilDatagram(void* ctx, const uint8_t* ptr,
   };
   const bool rtcp = webrtc::IsRtcpPacket(std::span<const uint8_t>(ptr, len));
   const bool accepted = enqueue(IsSecondaryInboundRtp(std::span<const uint8_t>(ptr, len)));
-  // Each Call owns independent SSRC/TWCC state. The upstream RTCP receiver
-  // filters report blocks and transport feedback by its registered SSRCs.
+  // Each Call owns independent SSRC/TWCC state. Delivery additionally filters
+  // REMB: upstream does not check that message's target list before applying it.
   // A slow video network/worker queue cannot hold the audio copy.
   if (rtcp) enqueue(true);
   if (accepted) {
@@ -540,9 +549,16 @@ void VeilTransportShim::DeliverOnNetworkThread(
 
   // rtcp-mux demux (RFC 5761): route by packet type.
   if (webrtc::IsRtcpPacket(packet)) {
-    if (!secondary) ObserveReceiverFeedback(packet, arrived_us);
+    const auto filtered = FilterRtcpForSender(
+        packet, (secondary ? local_video_ssrc_ : local_audio_ssrc_).load(
+                    std::memory_order_relaxed));
+    if (!filtered.valid) return;
+    foreign_remb_blocks_[secondary ? 1 : 0].fetch_add(
+        filtered.foreign_remb_blocks, std::memory_order_relaxed);
+    if (filtered.bytes.empty()) return;
+    if (!secondary) ObserveReceiverFeedback(filtered.bytes, arrived_us);
     receiver->DeliverRtcpPacket(
-        webrtc::CopyOnWriteBuffer(packet.data(), packet.size()));
+        webrtc::CopyOnWriteBuffer(filtered.bytes.data(), filtered.bytes.size()));
     return;
   }
 
