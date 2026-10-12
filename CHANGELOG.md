@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Relayed ratchet messages name the sender identity used during sealing,
+  including the call-control fallback and per-device fanout. Previously a
+  transport device address could differ from the identity in authenticated
+  data, preventing a receiver with a cold key cache from decrypting the frame.
+  Sender authentication, anonymous envelopes and relay scheduling are unchanged.
+
 ## v0.11.39 — 2026-09-30
 
 ### Added
