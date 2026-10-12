@@ -4802,6 +4802,11 @@ impl SessionRunner {
                                     if !self.dispatcher.allow_outbound_bandwidth(wire_bytes) {
                                         return false;
                                     }
+                                    crate::frame_diag::note_chunk_frame_at(
+                                        "transport_selected",
+                                        Some(&self.local_node_id),
+                                        outgoing,
+                                    );
                                     self.dispatcher.capture_outbound(self.peer_id, outgoing);
                                     true
                                 });
@@ -4954,6 +4959,11 @@ impl SessionRunner {
                             0,
                             using_parallel,
                             (available, envelope.queued_at),
+                        );
+                        crate::frame_diag::note_chunk_frame_at(
+                            "transport_selected",
+                            Some(&self.local_node_id),
+                            outgoing,
                         );
                         self.dispatcher.capture_outbound(self.peer_id, outgoing);
                         let mut sent_wire_len = 0usize;
@@ -5417,6 +5427,11 @@ impl SessionRunner {
                             }
                             continue;
                         }
+                        crate::frame_diag::note_chunk_frame_at(
+                            "transport_selected",
+                            Some(&self.local_node_id),
+                            &plain,
+                        );
                         self.dispatcher.capture_outbound(self.peer_id, &plain);
                         if let Some(parallel) = realtime_lane.as_ref().and_then(|lane| lane.parallel.as_ref())
                             && parallel.note_reliable_frame(wire_tx.capacity() == 0) {
@@ -5498,6 +5513,11 @@ impl SessionRunner {
                     // CircuitData (files, probes, introductions) as lossy.
                     let outgoing = circuit_datagram_stream_fallback(outgoing);
                     // Capture the plaintext frame before any encryption.
+                    crate::frame_diag::note_chunk_frame_at(
+                        "transport_selected",
+                        Some(&self.local_node_id),
+                        &outgoing,
+                    );
                     self.dispatcher.capture_outbound(self.peer_id, &outgoing);
                     if self.crypto.tx_cipher.is_some() {
                         let Some(next_len) = encrypted_wire_len(outgoing.len())
@@ -6437,6 +6457,11 @@ impl SessionRunner {
                 }
                 Err(_) => return Err(child),
             };
+            crate::frame_diag::note_chunk_frame_at(
+                "transport_selected",
+                Some(&self.local_node_id),
+                &frame,
+            );
             self.dispatcher.capture_outbound(self.peer_id, &frame);
             if let Some(m) = &self.metrics {
                 m.add_transport_bytes_tx(bytes as u64);
@@ -6483,6 +6508,11 @@ impl SessionRunner {
                     h.family == FrameFamily::Session as u8 || h.family == FrameFamily::Control as u8
                 });
                 // Capture the plaintext response before any encryption.
+                crate::frame_diag::note_chunk_frame_at(
+                    "transport_selected",
+                    Some(&self.local_node_id),
+                    &resp_bytes,
+                );
                 self.dispatcher.capture_outbound(self.peer_id, &resp_bytes);
                 // Encrypt the response body if the session uses encryption.
                 let wire_bytes = if let Some(cipher) = self.crypto.tx_cipher.as_mut() {

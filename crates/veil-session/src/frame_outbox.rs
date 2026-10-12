@@ -169,6 +169,11 @@ impl FrameSender {
         &self,
         frame: PriorityFrame,
     ) -> Result<(), mpsc::error::SendError<PriorityFrame>> {
+        // This is the attempt before an awaited ingress admission, not receipt.
+        // Ordinary forwarding never selects this private local producer lane.
+        if frame.0 == crate::LOCAL_SIGNALING_LANE {
+            crate::frame_diag::note_chunk_frame("source_ingress_attempt", &frame.1);
+        }
         let control = frame.0 == crate::LOCAL_NETWORK_CONTROL_LANE;
         let lane = if control {
             &self.network_control
