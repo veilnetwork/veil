@@ -3679,7 +3679,9 @@ uint64_t veil_media_open_relay_channel(VeilApp *app,
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Select media batching for a direct or relay channel: 0 = off, 1 = legacy
- * audio+video batching, 2 = compact relay audio-only batching. Mode 2 is
+ * audio+video batching, 2 = compact relay batching. Video batches contain
+ * only packets from a frame already complete, within the compact cell limit.
+ * Mode 2 is
  * rejected for non-relay channels. This is a WIRE-FORMAT selector, not a
  * security one — every mode seals identically, and the batch envelope now
  * travels inside the seal, so a peer on the path cannot see or rewrite it.
