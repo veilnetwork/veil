@@ -2175,6 +2175,25 @@ final int Function(int, Pointer<VeilApp>, Pointer<Pointer<Utf8>>)
             'veil_media_channel_set_secondary_sender')
         .asFunction();
 
+const int veilCallControlMaxBytes = abi.veilCallControlMaxBytes;
+
+// Optional ephemeral call-state API. All three functions are required.
+final bool supportsCallControl =
+    nativeLib.providesSymbol('veil_media_channel_set_control_sender') &&
+        nativeLib.providesSymbol('veil_media_send_call_control') &&
+        nativeLib.providesSymbol('veil_media_poll_call_control');
+final int Function(int, Pointer<VeilApp>, Pointer<Pointer<Utf8>>)
+    veilMediaChannelSetControlSender = nativeLib.lookupFunction<
+        Int32 Function(Uint64, Pointer<VeilApp>, Pointer<Pointer<Utf8>>),
+        int Function(int, Pointer<VeilApp>,
+            Pointer<Pointer<Utf8>>)>('veil_media_channel_set_control_sender');
+final int Function(int, Pointer<Uint8>, int) veilMediaSendCallControl =
+    nativeLib.lookupFunction<Int32 Function(Uint64, Pointer<Uint8>, Size),
+        int Function(int, Pointer<Uint8>, int)>('veil_media_send_call_control');
+final int Function(int, Pointer<Uint8>, int) veilMediaPollCallControl =
+    nativeLib.lookupFunction<Int32 Function(Uint64, Pointer<Uint8>, Size),
+        int Function(int, Pointer<Uint8>, int)>('veil_media_poll_call_control');
+
 // Independent local screen writer; the app identity remains unchanged.
 final int Function(int, Pointer<VeilApp>, Pointer<Pointer<Utf8>>)
     veilMediaChannelSetScreenSender = nativeLib

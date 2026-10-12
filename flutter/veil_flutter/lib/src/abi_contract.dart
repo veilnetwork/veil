@@ -17,7 +17,7 @@
 /// Compare against `veil_abi_contract_hash()` from the loaded library
 /// BEFORE using it. See `native.dart`.
 const String veilAbiContractHash =
-    '72241207cf3f9340a2e3821d9e8ef9deab7e925cc7b38fff031659e4d48b7f37';
+    '187f31c6bb6ad225b3cd5314b7b30281280f9aa6de671aad891c0b965a3e8305';
 
 // -- Constants lifted from the generated header --------------------------
 
@@ -177,6 +177,8 @@ const int veilTunnelStarting = 1;
 const int veilTunnelRunning = 2;
 /// `VEIL_TUNNEL_ERROR`
 const int veilTunnelError = 3;
+/// `VEIL_CALL_CONTROL_MAX_BYTES`
+const int veilCallControlMaxBytes = 768;
 /// `VEIL_MAILBOX_PUT_STORED`
 const int veilMailboxPutStored = 0;
 /// `VEIL_MAILBOX_PUT_DUPLICATE`
