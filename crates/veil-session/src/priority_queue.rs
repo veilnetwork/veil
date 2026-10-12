@@ -661,12 +661,115 @@ impl PriorityQueue {
         }
         None
     }
+
+    /// Read-only tracing of a live independent ingress waiting behind an
+    /// ordinary stream head. The witness is transport metadata, not a wire
+    /// priority or application role. This must never select or reorder work.
+    pub(crate) fn independent_transit_behind_stream_head(
+        &self,
+        supported: impl Fn(&[u8]) -> bool,
+    ) -> Option<Duration> {
+        let queue = &self.queues[INTERACTIVE as usize];
+        let head = queue.front()?;
+        if supported(&head.frame) {
+            return None;
+        }
+        let now = Instant::now();
+        queue.iter().skip(1).find_map(|queued| {
+            let at = queued.enqueued_at?;
+            if now.saturating_duration_since(at) > lossy_realtime_max_age(INTERACTIVE)
+                || !supported(&queued.frame)
+                || queued
+                    .carrier
+                    .as_ref()?
+                    .upgrade()?
+                    .local_ingress_flow()
+                    .is_none()
+            {
+                return None;
+            }
+            Some(now.saturating_duration_since(at))
+        })
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn independent_fifo_observation_never_changes_admission_or_trusts_a_dead_channel() {
+        struct Channel;
+        impl veil_anonymity::circuit_carrier::DatagramCarrier for Channel {
+            fn local_ingress_flow(
+                &self,
+            ) -> Option<veil_anonymity::circuit_carrier::LocalIngressFlow> {
+                Some(veil_anonymity::circuit_carrier::LocalIngressFlow {
+                    parent: 1,
+                    connection: 2,
+                })
+            }
+            fn try_send(
+                &self,
+                _: &[u8; 32],
+                _: &[u8],
+                _: &mut dyn FnMut(usize) -> bool,
+            ) -> veil_anonymity::circuit_carrier::CarrierSend {
+                panic!("observing a queue must never send or spend a budget")
+            }
+        }
+        let carrier: Arc<dyn veil_anonymity::circuit_carrier::DatagramCarrier> = Arc::new(Channel);
+        let mut pq = PriorityQueue::with_default_weights();
+        pq.push(INTERACTIVE, arc(b"canonical"));
+        pq.push_lossy_with_carrier(
+            INTERACTIVE,
+            arc(b"independent"),
+            Some(Arc::downgrade(&carrier)),
+            Instant::now() - Duration::from_millis(60),
+        );
+        let before = (
+            pq.len(),
+            pq.slots,
+            pq.local_datagram_slots,
+            pq.lossy_realtime_len,
+            pq.drops_total(),
+        );
+        assert!(
+            pq.pop_datagram_envelope_if(|frame| frame == b"independent")
+                .is_none()
+        );
+        for _ in 0..3 {
+            assert!(
+                pq.independent_transit_behind_stream_head(|frame| frame == b"independent")
+                    .unwrap()
+                    >= Duration::from_millis(60)
+            );
+        }
+        assert_eq!(
+            before,
+            (
+                pq.len(),
+                pq.slots,
+                pq.local_datagram_slots,
+                pq.lossy_realtime_len,
+                pq.drops_total()
+            )
+        );
+        drop(carrier);
+        assert!(
+            pq.independent_transit_behind_stream_head(|frame| frame == b"independent")
+                .is_none()
+        );
+        assert_eq!(
+            &*pq.pop_datagram_envelope_if(|_| true).unwrap().frame.1,
+            b"canonical"
+        );
+        assert_eq!(
+            &*pq.pop_datagram_envelope_if(|_| true).unwrap().frame.1,
+            b"independent"
+        );
+    }
+
     #[test]
     fn paced_signaling_survives_the_video_deadline_and_remains_bounded() {
         let mut pq = PriorityQueue::with_default_weights();
