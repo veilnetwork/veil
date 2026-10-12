@@ -211,6 +211,10 @@ class VeilTransportShim : public webrtc::Transport {
   VideoCadenceSnapshot inbound_video_cadence() const;
   VideoCadenceSnapshot delivered_video_cadence() const;
   AudioSendSnapshot audio_send_stats() const;
+  RtpSendSnapshot video_send_stats() const;
+  uint64_t foreign_remb_blocks(bool video) const {
+    return foreign_remb_blocks_[video ? 1 : 0].load(std::memory_order_relaxed);
+  }
 
  private:
   VideoControlTransport<VeilTransportShim> video_transport_{*this};
@@ -276,6 +280,8 @@ class VeilTransportShim : public webrtc::Transport {
   std::atomic<uint32_t> local_audio_ssrc_{0};
   std::atomic<uint32_t> local_video_ssrc_{0};
   AudioSendStats audio_send_stats_;
+  RtpSendStats video_send_stats_;
+  std::array<std::atomic<uint64_t>, 2> foreign_remb_blocks_{};
   // Opt-in metadata only. Collect on the audio network queue, then write after
   // Stop fences delivery; no per-packet file I/O can perturb a live call.
   struct AudioIngressSample {

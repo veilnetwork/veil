@@ -1160,7 +1160,14 @@ constexpr int kGroupVp8PayloadType = 96;
 // RTP extension.
 class LowLatencyFieldTrials final : public webrtc::FieldTrialsView {
  public:
+  explicit LowLatencyFieldTrials(bool video = false) : video_(video) {}
   std::string Lookup(absl::string_view key) const override {
+    // Start video's estimator at the endpoint's selected budget. The default
+    // two 3x/6x bursts compete with already running Opus before any video TWCC
+    // arrives. Keep normal feedback and later probes; audio retains its own
+    // initial probing. This changes local production, not relay scheduling.
+    if (video_ && key == "WebRTC-Bwe-InitialProbing")
+      return "p1:1,p2:0";
     // Reordering history advances only on received packets. With Opus DTX,
     // the default 0.9993 factor can preserve a short radio burst throughout
     // a long silent interval and delay the next spoken syllable. Ordered
@@ -1219,18 +1226,21 @@ class LowLatencyFieldTrials final : public webrtc::FieldTrialsView {
   }
 
   std::unique_ptr<webrtc::FieldTrialsView> CreateCopy() const override {
-    return std::make_unique<LowLatencyFieldTrials>();
+    return std::make_unique<LowLatencyFieldTrials>(video_);
   }
+
+ private:
+  const bool video_;
 };
 
-webrtc::Environment create_low_latency_environment() {
+webrtc::Environment create_low_latency_environment(bool video = false) {
   // The trimmed libwebrtc archive does not contain the concrete FieldTrials
   // parser implementation. Supplying the tiny immutable view directly keeps
   // all Environment defaults (clock/task queues/event log) and avoids leaving
   // an unresolved constructor for permissive Apple dynamic linking to turn
   // into a null call at engine creation.
   return webrtc::CreateEnvironment(
-      std::make_unique<LowLatencyFieldTrials>());
+      std::make_unique<LowLatencyFieldTrials>(video));
 }
 
 void ensure_group_video_codecs(GroupWebrtcState* ws) {
@@ -1719,8 +1729,9 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
   call_cfg.audio_state = ws->audio_state;
   configure_call_audio_transport(call_cfg);
   ws->call = webrtc::Call::Create(std::move(call_cfg));
-  webrtc::CallConfig video_cfg(ws->env, ws->video_worker_tq.get(),
-                                ws->video_network_tq.get());
+  webrtc::CallConfig video_cfg(create_low_latency_environment(true),
+                              ws->video_worker_tq.get(),
+                              ws->video_network_tq.get());
   ws->video_call = webrtc::Call::Create(std::move(video_cfg));
 
   ws->shim = std::make_unique<veil_media::VeilTransportShim>(
@@ -1848,8 +1859,9 @@ VeilGroupMediaEngine* veil_media_group_engine_create(
   call_cfg.audio_state = ws->audio_state;
   configure_call_audio_transport(call_cfg);
   ws->call = webrtc::Call::Create(std::move(call_cfg));
-  webrtc::CallConfig video_cfg(ws->env, ws->video_worker_tq.get(),
-                                ws->video_network_tq.get());
+  webrtc::CallConfig video_cfg(create_low_latency_environment(true),
+                              ws->video_worker_tq.get(),
+                              ws->video_network_tq.get());
   ws->video_call = webrtc::Call::Create(std::move(video_cfg));
   ws->fanout = std::make_unique<GroupFanoutTransport>(ws->call.get(), ws->video_call.get());
   engine->ws = std::move(ws);
@@ -4020,6 +4032,18 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     } else {
       std::string snapshot(json, static_cast<size_t>(written) - 1);
       snapshot += ",\"audio_tx_rtp_drops\":" + std::to_string(tx_audio.dropped);
+      const auto video_send = ws->shim->video_send_stats();
+      snapshot += ",\"video_tx_rtp_attempts\":" + std::to_string(video_send.attempts);
+      snapshot += ",\"video_tx_rtp_queued\":" + std::to_string(video_send.queued);
+      snapshot += ",\"video_tx_payload_pkts\":" + std::to_string(video_send.payload_packets);
+      snapshot += ",\"video_tx_padding_pkts\":" + std::to_string(video_send.padding_packets);
+      snapshot += ",\"video_tx_payload_bytes\":" + std::to_string(video_send.payload_bytes);
+      snapshot += ",\"video_tx_padding_bytes\":" + std::to_string(video_send.padding_bytes);
+      snapshot += ",\"video_tx_unclassified_pkts\":" + std::to_string(video_send.unclassified_packets);
+      snapshot += ",\"video_tx_rtp_admission_max_ms\":" + std::to_string(video_send.max_admission_ms);
+      snapshot += ",\"video_tx_rtp_drops\":" + std::to_string(video_send.dropped);
+      snapshot += ",\"audio_rx_foreign_remb_blocks\":" + std::to_string(ws->shim->foreign_remb_blocks(false));
+      snapshot += ",\"video_rx_foreign_remb_blocks\":" + std::to_string(ws->shim->foreign_remb_blocks(true));
       snapshot += ",\"video_send_paused\":" + std::to_string(ws->video_send_paused.load() ? 1 : 0) + "}";
       return dup_cstr(snapshot.c_str());
     }
