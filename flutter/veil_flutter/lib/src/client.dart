@@ -2946,6 +2946,59 @@ class AppHandle implements Finalizable {
         screenAppAddr));
   }
 
+  /// Compact call state requires a separately bound IPC sender with this
+  /// channel's app identity. The sender must live until the channel closes.
+  static bool get supportsCallControl => ffi.supportsCallControl;
+
+  bool configureCallControl(int chan) {
+    _ensureOpen();
+    if (!supportsCallControl) return false;
+    final err = calloc<Pointer<Utf8>>();
+    try {
+      final rc = ffi.veilMediaChannelSetControlSender(chan, _app, err);
+      if (rc != 0) {
+        throw VeilException('call control sender: ${_readErrAndFree(err)}');
+      }
+      return true;
+    } finally {
+      calloc.free(err);
+    }
+  }
+
+  /// Nonblocking queue admission, not a delivery acknowledgment.
+  bool sendCallControl(int chan, Uint8List payload) {
+    _ensureOpen();
+    if (!supportsCallControl ||
+        payload.isEmpty ||
+        payload.length > ffi.veilCallControlMaxBytes) return false;
+    final buf = calloc<Uint8>(payload.length);
+    try {
+      buf.asTypedList(payload.length).setAll(0, payload);
+      return ffi.veilMediaSendCallControl(chan, buf, payload.length) == 0;
+    } finally {
+      calloc.free(buf);
+    }
+  }
+
+  /// Poll bounded authenticated state; no native callback enters Dart.
+  List<Uint8List> pollCallControl(int chan) {
+    _ensureOpen();
+    if (!supportsCallControl) return const [];
+    final buf = calloc<Uint8>(ffi.veilCallControlMaxBytes);
+    try {
+      final packets = <Uint8List>[];
+      for (var i = 0; i < 8; i++) {
+        final n = ffi.veilMediaPollCallControl(
+            chan, buf, ffi.veilCallControlMaxBytes);
+        if (n <= 0) break;
+        packets.add(Uint8List.fromList(buf.asTypedList(n)));
+      }
+      return packets;
+    } finally {
+      calloc.free(buf);
+    }
+  }
+
   /// Select the endpoint-local capture queue before starting screen capture.
   /// Clear it after capture stops. This never changes any network role label.
   int setMediaScreenSharing(int chan, bool on) {

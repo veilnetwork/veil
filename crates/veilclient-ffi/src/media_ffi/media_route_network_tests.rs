@@ -304,6 +304,7 @@ fn channel(me: [u8; 32], peer: [u8; 32], tx_key: [u8; 32], rx_key: [u8; 32]) -> 
             video_sender: None,
             screen_sender: None,
             sender_app_id: None,
+            control_destination: None,
             batching: None,
             cipher,
             relay_stats: None,

@@ -945,6 +945,34 @@ impl AppSender {
             .await
     }
 
+    /// A compact, already call-key-sealed endpoint state update. The control
+    /// selector exists only in local IPC; relays receive ordinary opaque cells.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_call_control_sealed_before_owned(
+        &self,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        data: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, ClientError> {
+        self.writer
+            .write_app_ipc_send_on_local_lane_before_owned(
+                veil_proto::priority::INTERACTIVE,
+                &dst_node_id,
+                &self.app_id,
+                &dst_app_id,
+                dst_endpoint_id,
+                veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+                    | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED
+                    | veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT,
+                &data,
+                deadline,
+                None,
+            )
+            .await
+    }
+
     /// Send one loss-tolerant media datagram at REALTIME session priority.
     ///
     /// Mirrors [`AppHandle::send_rt_data`] for split handles used by native
