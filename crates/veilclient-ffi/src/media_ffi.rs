@@ -931,7 +931,25 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                 let Some(sender) = guard.as_ref() else {
                     return false;
                 };
-                media::trace_sealed_cell("relay_send", &peer, cell.sealed.as_bytes());
+                let source_queue_max_us = veil_session::rt_trace::rt_trace_enabled().then(|| {
+                    let deadline = cell
+                        .sealed
+                        .local_deadline()
+                        .expect("native packet deadline");
+                    let age_us = tokio::time::Instant::now()
+                        .saturating_duration_since(deadline - MEDIA_LOCAL_QUEUE_AGE)
+                        .as_micros()
+                        .min(u64::MAX as u128) as u64;
+                    use std::sync::atomic::Ordering::Relaxed;
+                    stats.primary_queue_max_us.fetch_max(age_us, Relaxed);
+                    stats.primary_queue_max_us.load(Relaxed)
+                });
+                media::trace_sealed_cell_with_source_queue(
+                    "relay_send",
+                    &peer,
+                    cell.sealed.as_bytes(),
+                    source_queue_max_us,
+                );
                 let ipc_started = std::time::Instant::now();
                 let deadline = cell
                     .sealed
@@ -1886,6 +1904,8 @@ pub struct VeilMediaChannelStats {
 #[cfg(feature = "node-embedded")]
 #[derive(Default)]
 struct RelayMediaStats {
+    // Internal diagnostic only: the stable 13-u64 C ABI remains unchanged.
+    primary_queue_max_us: std::sync::atomic::AtomicU64,
     video_frames_enqueued: std::sync::atomic::AtomicU64,
     video_frames_started: std::sync::atomic::AtomicU64,
     video_queue_depth: std::sync::atomic::AtomicU64,

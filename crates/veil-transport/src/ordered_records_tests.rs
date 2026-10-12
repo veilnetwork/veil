@@ -338,3 +338,34 @@ async fn incoming_residence_expiry_does_not_return_old_data_after_a_consumer_pau
     assert_eq!(h.progress().expired_incoming_records, 1);
     assert_eq!(h.progress().incoming_buffered_bytes, 0);
 }
+
+#[tokio::test]
+async fn residence_maxima_survive_brief_stalls_without_changing_record_service() {
+    let (stream, mut peer) = tokio::io::duplex(8);
+    let plane = OrderedRecordPlane::new(Box::new(stream));
+    let handle = plane.handle();
+    let first = vec![0x31; 32];
+    let second = vec![0x72; 32];
+    handle.send(&first).unwrap();
+    handle.send(&second).unwrap();
+    until(|| handle.progress().active_record_age.is_some()).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(handle.progress().completed_records, 0);
+    assert!(handle.progress().max_write_duration >= Duration::from_millis(40));
+    assert_eq!(raw_record(&mut peer).await, first);
+    assert_eq!(raw_record(&mut peer).await, second);
+    until(|| handle.progress().completed_records == 2).await;
+    assert!(handle.progress().max_outgoing_wait >= Duration::from_millis(40));
+    assert!(handle.progress().max_write_duration >= Duration::from_millis(40));
+    assert_eq!(handle.send_buffer_space(), RECORD_BUFFER_BYTES);
+    peer.write_u16(4).await.unwrap();
+    peer.write_all(b"held").await.unwrap();
+    until(|| handle.progress().received_records == 1).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(handle.recv().await.unwrap(), b"held");
+    assert!(handle.progress().max_incoming_residence >= Duration::from_millis(40));
+    assert_eq!(handle.progress().incoming_buffered_bytes, 0);
+    assert_eq!(handle.progress().expired_records, 0);
+    assert_eq!(handle.progress().dropped_incoming_records, 0);
+    assert!(!handle.is_closed());
+}
