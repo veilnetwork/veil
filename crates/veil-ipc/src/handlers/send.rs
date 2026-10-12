@@ -657,9 +657,13 @@ pub(crate) struct IpcSendContext {
     pub(crate) session_instance_lookup: Option<Arc<dyn veil_types::SessionInstanceLookup>>,
 }
 
+// Payload, ACK key, and the identity snapshot that supplied AEAD context.
+type RatchetSeal = (Vec<u8>, [u8; 32], [u8; 32]);
+
 /// Seal `data` through the ratchet, if everything it needs is in hand.
 ///
-/// Returns the payload and its per-message delivery-ACK key, or `None` when
+/// Returns the payload, per-message delivery-ACK key and sealing identity,
+/// or `None` when
 /// this node has no device identity, no resolver, or the recipient publishes no
 /// certificate that verifies. `None` is not a downgrade of anything the ratchet
 /// was doing — it is the message taking the path it took before this existed,
@@ -676,10 +680,10 @@ async fn try_ratchet_seal(
     dst_node_id: &[u8; 32],
     data: &[u8],
     cached_only: bool,
-) -> Option<(Vec<u8>, [u8; 32])> {
+) -> Option<RatchetSeal> {
     let ratchet = ctx.ratchet.as_ref()?;
     // Cheap gate before anything expensive: no device identity, no ratchet.
-    ratchet.identity()?;
+    let me = ratchet.identity()?;
     let resolver = ctx.mlkem_ek_resolver.as_deref()?;
 
     // Which device of the recipient's family? Before defect №35 two answers
@@ -767,7 +771,9 @@ async fn try_ratchet_seal(
         );
     }
 
-    match ratchet.seal_for(
+    match veil_e2e::ratchet::seal(
+        &ratchet.store,
+        &me,
         veil_e2e::PeerRatchetKeys {
             node_id: &cert.node_id,
             instance_id: &cert.instance_id,
@@ -778,7 +784,7 @@ async fn try_ratchet_seal(
         data,
         veil_util::unix_secs_now_u64(),
     ) {
-        Ok(sealed) => Some(sealed),
+        Ok((payload, ack_key)) => Some((payload, ack_key, me.local_node_id)),
         Err(e) => {
             log::debug!(
                 "ratchet.seal_failed dst={} {e}",
@@ -1099,7 +1105,7 @@ pub(crate) async fn handle_ipc_send(
             ctx.mlkem_ek_resolver.as_deref(),
             session_tx_registry,
         )
-        && ratchet.identity().is_some()
+        && let Some(me) = ratchet.identity()
     {
         use veil_proto::delivery::DeliveryEnvelope;
         use veil_proto::family::DeliveryMsg;
@@ -1122,7 +1128,9 @@ pub(crate) async fn handle_ipc_send(
             if hops.is_empty() && identity_hops.is_empty() {
                 continue;
             }
-            let Ok((payload, _)) = ratchet.seal_for(
+            let Ok((payload, _)) = veil_e2e::ratchet::seal(
+                &ratchet.store,
+                &me,
                 veil_e2e::PeerRatchetKeys {
                     node_id: &cert.node_id,
                     instance_id: &cert.instance_id,
@@ -1152,7 +1160,7 @@ pub(crate) async fn handle_ipc_send(
                 rand_core::OsRng.fill_bytes(&mut nonce);
                 let envelope = DeliveryEnvelope {
                     recipient,
-                    sender_node_id: *local_node_id,
+                    sender_node_id: me.local_node_id,
                     src_app_id: send.src_app_id,
                     app_id: send.app_id,
                     endpoint_id: send.endpoint_id,
@@ -1254,7 +1262,7 @@ pub(crate) async fn handle_ipc_send(
                 }
                 let copy_for = sealed
                     .as_ref()
-                    .and_then(|(payload, _)| veil_e2e::payload_instances(payload))
+                    .and_then(|(payload, _, _)| veil_e2e::payload_instances(payload))
                     .map(|(_, to)| to);
                 if copy_for.is_some_and(|to| to != device_instance(ctx, device)) {
                     log::info!(
@@ -1264,7 +1272,7 @@ pub(crate) async fn handle_ipc_send(
                     );
                     return (*device, false, false, seal_ms);
                 }
-                let outcome = if let Some((payload, _)) = &sealed
+                let outcome = if let Some((payload, _, _)) = &sealed
                     && payload.len() > veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES
                 {
                     admit_direct_sealed(ctx, request, *device, payload, deadline).await
@@ -1279,7 +1287,7 @@ pub(crate) async fn handle_ipc_send(
                 } else if reg.send_to(
                     device,
                     local_priority,
-                    app_send_frame(request, sealed.as_ref().map(|(p, _)| p.as_slice())),
+                    app_send_frame(request, sealed.as_ref().map(|(p, _, _)| p.as_slice())),
                 ) {
                     DirectAdmission::Accepted
                 } else {
@@ -1324,6 +1332,10 @@ pub(crate) async fn handle_ipc_send(
     } else {
         None
     };
+    // Ratchet associated data names the stable identity, not this transport
+    // device. Carry the exact identity snapshot used by the seal: a cold peer
+    // cannot recover it from an unknown sending instance or physical address.
+    let sealed_sender = sealed.as_ref().map(|(_, _, sender)| *sender);
     timing.seal_ms.set(seal_started.elapsed().as_millis());
     timing.path.set(if planned.is_some() {
         "relay_planned"
@@ -1341,7 +1353,7 @@ pub(crate) async fn handle_ipc_send(
     // an identity, handed to the other.
     let sealed_for: Option<[u8; 16]> = sealed
         .as_ref()
-        .and_then(|(payload, _)| veil_e2e::payload_instances(payload))
+        .and_then(|(payload, _, _)| veil_e2e::payload_instances(payload))
         .map(|(_, to)| to);
     let own_instance = ctx
         .ratchet
@@ -1403,7 +1415,7 @@ pub(crate) async fn handle_ipc_send(
         // is the opposite of where the traffic is.
         let mut direct_admission_failed = false;
         let sent = if !relay_realtime
-            && let Some((payload, _)) = &sealed
+            && let Some((payload, _, _)) = &sealed
             && payload.len() > source_segment_bytes(reg, payload.len())
         {
             let devices = reg.devices_of(&send.dst_node_id);
@@ -1486,7 +1498,7 @@ pub(crate) async fn handle_ipc_send(
                     sealed_for,
                     &|device| device_instance(ctx, device),
                     local_priority,
-                    app_send_frame(&send, sealed.as_ref().map(|(p, _)| p.as_slice())),
+                    app_send_frame(&send, sealed.as_ref().map(|(p, _, _)| p.as_slice())),
                 )
         };
         if direct_admission_failed {
@@ -1576,7 +1588,7 @@ pub(crate) async fn handle_ipc_send(
                 // stored in the pending-ack entry so the originator can verify
                 // the recipient's DELIVERED MAC and a forged ACK earns nothing.
                 let mut ack_key = [0u8; 32];
-                let final_payload = if let Some((payload, key)) = sealed {
+                let final_payload = if let Some((payload, key, _)) = sealed {
                     // Already sealed above, marker byte and all, so nothing is
                     // prepended here. The ACK key came out of the same seal:
                     // it is 32 random bytes carried INSIDE the ciphertext
@@ -1753,7 +1765,7 @@ pub(crate) async fn handle_ipc_send(
                     sender_node_id: if send.anonymous {
                         [0u8; 32]
                     } else {
-                        *local_node_id
+                        sealed_sender.unwrap_or(*local_node_id)
                     },
                     src_app_id: if send.anonymous {
                         [0u8; 32]
@@ -4879,6 +4891,81 @@ mod ratchet_send_tests {
             .expect("the peer opens it");
         assert_eq!(opened.plaintext, b"through a relay");
         assert!(opened.authenticated);
+    }
+
+    #[tokio::test]
+    async fn relay_seal_names_the_sender_identity_when_transport_is_a_device() {
+        for (control, fanout, cold) in [(false, false), (true, false), (true, true)]
+            .into_iter()
+            .flat_map(|(control, fanout)| [(control, fanout, true), (control, fanout, false)])
+        {
+            let mut fx = fixture(vec![RELAY]);
+            if fanout {
+                let cert = fx.certs.resolve_cert_cached(PEER).unwrap();
+                fx.certs = Arc::new(FamilyCerts(vec![cert]));
+            }
+            let mut ctx = fx.ctx(true);
+            ctx.local_node_id = [0xD7; 32];
+            let mut body = payload(false, b"identity-bound relay control");
+            if control {
+                body[100..104].copy_from_slice(
+                    &veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT.to_be_bytes(),
+                );
+            }
+            let mut wh = sink().await;
+            handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+                .await
+                .unwrap();
+            if cold {
+                wlock!(fx.peer.peer_ratchet_keys).clear();
+            }
+            let (dispatcher, _endpoint, mut receiver) =
+                direct_receiver(&fx.peer, [0xE7; 32], PEER_INSTANCE);
+            let mut delivered = false;
+            for (hop, frame) in fx.taken() {
+                assert_eq!(hop, RELAY);
+                let header = codec::decode_header(&frame).unwrap();
+                let forward =
+                    veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                        .unwrap();
+                if forward.envelope.recipient.node_id != PEER {
+                    continue;
+                }
+                dispatcher.dispatch(
+                    &header,
+                    &frame[veil_proto::HEADER_SIZE..],
+                    veil_cfg::NodeId::from(RELAY),
+                );
+                match receiver
+                    .try_recv()
+                    .expect("cold relay seal reached the real dispatcher")
+                {
+                    veil_app::registry::AppMessage::Deliver {
+                        src_node_id,
+                        provenance,
+                        data,
+                        ..
+                    } => {
+                        assert_eq!(src_node_id, ME);
+                        assert_eq!(data.as_ref(), b"identity-bound relay control");
+                        assert_eq!(
+                            provenance,
+                            if cold {
+                                veil_app::registry::SenderProvenance::Claimed
+                            } else {
+                                veil_app::registry::SenderProvenance::Signed
+                            },
+                            "identity selection never manufactures sender authentication"
+                        );
+                    }
+                    other => panic!("unexpected app message: {other:?}"),
+                }
+                assert_eq!(forward.envelope.sender_node_id, ME);
+                assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+                delivered = true;
+            }
+            assert!(delivered);
+        }
     }
 
     #[tokio::test]
