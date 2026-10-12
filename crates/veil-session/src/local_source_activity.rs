@@ -1,7 +1,7 @@
 //! Node-local producer activity and pressure shared across session runners.
 //! No remote priority, payload role or wire metadata enters this state.
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use veil_util::lock;
 
@@ -32,10 +32,32 @@ struct SourceState {
     reliable_waiters: VecDeque<u64>,
     network_window: Option<(Instant, usize)>,
     signaling_next: Option<Instant>,
+    pending_signaling: Vec<Weak<SignalingDeadline>>,
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct LocalSourceActivity(Mutex<SourceState>);
+pub(crate) struct LocalSourceActivity {
+    state: Mutex<SourceState>,
+}
+
+/// Endpoint-only ownership through ingress, scheduling and restored attempts.
+/// Dropping canceled, shed or expired work releases DATA without refunding bytes.
+#[derive(Debug)]
+pub(crate) struct PendingSignaling {
+    // Ownership keeps the weak entry alive through scheduling and retries.
+    _deadline: Arc<SignalingDeadline>,
+}
+
+#[derive(Debug)]
+struct SignalingDeadline {
+    until: Instant,
+}
+
+fn retain_pending_signaling(state: &mut SourceState, now: Instant) {
+    state
+        .pending_signaling
+        .retain(|entry| entry.upgrade().is_some_and(|pending| now < pending.until));
+}
 
 /// A runner's local reliable admission turn. Neither its identity nor its
 /// position is transmitted. Dropping a runner releases any outstanding turn.
@@ -53,7 +75,7 @@ impl ReliableSource {
     /// Release a turn when this runner has no eligible local write. Keep the
     /// shared byte debt: cancellation must not refund already admitted bytes.
     pub(crate) fn cancel(&self) {
-        lock!(self.activity.0)
+        lock!(self.activity.state)
             .reliable_waiters
             .retain(|id| *id != self.id);
     }
@@ -66,8 +88,19 @@ impl Drop for ReliableSource {
 }
 
 impl LocalSourceActivity {
+    pub(crate) fn pending_signal(&self, now: Instant) -> PendingSignaling {
+        let deadline = Arc::new(SignalingDeadline {
+            until: now + crate::priority_queue::lossy_realtime_max_age(crate::LOCAL_SIGNALING_LANE),
+        });
+        let mut state = lock!(self.state);
+        retain_pending_signaling(&mut state, now);
+        state.pending_signaling.push(Arc::downgrade(&deadline));
+        PendingSignaling {
+            _deadline: deadline,
+        }
+    }
     pub(crate) fn reliable_source(self: &Arc<Self>) -> ReliableSource {
-        let mut state = lock!(self.0);
+        let mut state = lock!(self.state);
         state.reliable_sequence = state
             .reliable_sequence
             .checked_add(1)
@@ -79,7 +112,7 @@ impl LocalSourceActivity {
     }
 
     pub(crate) fn note(&self, now: Instant) {
-        let mut state = lock!(self.0);
+        let mut state = lock!(self.state);
         if state
             .last_primary
             .is_some_and(|last| now.saturating_duration_since(last) >= IDLE_GRACE)
@@ -98,7 +131,7 @@ impl LocalSourceActivity {
     }
 
     pub(crate) fn active(&self, now: Instant) -> bool {
-        lock!(self.0)
+        lock!(self.state)
             .last_primary
             .is_some_and(|at| now.saturating_duration_since(at) < IDLE_GRACE)
     }
@@ -106,7 +139,7 @@ impl LocalSourceActivity {
     /// Only a locally authored primary's authenticated path or trusted writer can publish this.
     /// Other runners consume it exclusively for their own secondary producers.
     pub(crate) fn note_pressure(&self, now: Instant) {
-        let mut state = lock!(self.0);
+        let mut state = lock!(self.state);
         let until = now + PRESSURE_GRACE;
         state.pressure_until = Some(state.pressure_until.map_or(until, |old| old.max(until)));
         state.reliable_ramp_since = None;
@@ -118,7 +151,7 @@ impl LocalSourceActivity {
         if pressured {
             self.note_pressure(now);
         }
-        let mut state = lock!(self.0);
+        let mut state = lock!(self.state);
         state.source_feedback_seen = true;
         if !pressured {
             state.last_healthy_feedback =
@@ -147,7 +180,7 @@ impl LocalSourceActivity {
     /// on the common uplink while a primary producer is active. The first
     /// frame is immediate; subsequent whole frames pay proportional time.
     pub(crate) fn signaling_wait(&self, now: Instant) -> Option<Instant> {
-        let state = lock!(self.0);
+        let state = lock!(self.state);
         let until = state.last_primary.map(|at| at + IDLE_GRACE)?;
         if now >= until {
             return None;
@@ -159,7 +192,7 @@ impl LocalSourceActivity {
     }
 
     pub(crate) fn admit_signaling(&self, bytes: usize, now: Instant) -> Result<(), Instant> {
-        let mut state = lock!(self.0);
+        let mut state = lock!(self.state);
         let Some(until) = state
             .last_primary
             .map(|at| at + IDLE_GRACE)
@@ -198,7 +231,7 @@ impl LocalSourceActivity {
         network_control: bool,
         source: Option<u64>,
     ) -> Result<(), Instant> {
-        let mut state = lock!(self.0);
+        let mut state = lock!(self.state);
         let active_until = state.last_primary.map(|at| at + IDLE_GRACE);
         // DATA is paced even during healthy primary activity. Charge exact
         // wire bytes, rather than rounding each frame up to a 200-ms bucket:
@@ -233,6 +266,13 @@ impl LocalSourceActivity {
                 .max()
             {
                 return Err(next.min(until));
+            }
+            // A file must not win the instant a signaling byte deadline
+            // expires while that producer still has queued work. Control
+            // release does not alter DATA's byte debt or fair neighbor turn.
+            retain_pending_signaling(&mut state, now);
+            if !state.pending_signaling.is_empty() {
+                return Err((now + Duration::from_millis(10)).min(until));
             }
             if let Some(id) = source {
                 if state.reliable_waiters.front() != Some(&id) {
@@ -327,7 +367,7 @@ impl LocalSourceActivity {
     /// Ordered compatibility needs the wake deadline while retaining its
     /// plaintext frame. Its byte allowance is shared with DATAGRAM senders.
     pub(crate) fn admit_lossy_secondary(&self, bytes: usize, now: Instant) -> Result<(), Instant> {
-        let mut state = lock!(self.0);
+        let mut state = lock!(self.state);
         let active = state
             .last_primary
             .is_some_and(|at| now.saturating_duration_since(at) < IDLE_GRACE);
@@ -540,6 +580,44 @@ mod tests {
             activity.admit_reliable_secondary(1024, now + Duration::from_millis(400)),
             Ok(())
         );
+    }
+
+    #[test]
+    fn pending_signal_keeps_data_out_at_the_expired_byte_deadline() {
+        let activity = LocalSourceActivity::default();
+        let now = Instant::now();
+        activity.note(now);
+        let first = activity.pending_signal(now);
+        let second = activity.pending_signal(now);
+        assert_eq!(activity.admit_signaling(1024, now), Ok(()));
+        let ready = now + Duration::from_millis(50);
+        assert_eq!(
+            activity.admit_reliable_secondary(1024, ready),
+            Err(ready + Duration::from_millis(10))
+        );
+        assert_eq!(activity.admit_network_control(1024, ready), Ok(()));
+        drop(first);
+        assert_eq!(
+            activity.admit_reliable_secondary(1024, ready),
+            Err(ready + Duration::from_millis(10))
+        );
+        drop(second);
+        assert_eq!(activity.admit_reliable_secondary(1024, ready), Ok(()));
+    }
+
+    #[test]
+    fn expired_signal_and_idle_primary_do_not_hold_other_sources() {
+        let activity = LocalSourceActivity::default();
+        let now = Instant::now();
+        activity.note(now);
+        let _pending = activity.pending_signal(now);
+        let idle = now + IDLE_GRACE;
+        assert_eq!(activity.admit_reliable_secondary(1024, idle), Ok(()));
+        let expired =
+            now + crate::priority_queue::lossy_realtime_max_age(crate::LOCAL_SIGNALING_LANE);
+        activity.note(expired);
+        assert_eq!(activity.admit_reliable_secondary(1024, expired), Ok(()));
+        assert!(lock!(activity.state).pending_signaling.is_empty());
     }
 
     #[test]
