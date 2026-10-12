@@ -519,7 +519,7 @@ fn ffi_signalling_datagrams_use_a_separate_source_lane_without_wire_hints() {
     rt.block_on(task).unwrap();
     assert_eq!(result, VEIL_OK, "{error_text:?}");
     let (local_lane, frame) = capture.unwrap();
-    assert_eq!(local_lane, veil_proto::priority::BACKGROUND);
+    assert_eq!(local_lane, veil_proto::ipc::LOCAL_SIGNALING_LANE);
     let header = veil_proto::codec::decode_header(&frame).unwrap();
     assert_eq!(header.msg_type, AppMsg::AppRtData as u16);
     assert_eq!(header.priority(), veil_proto::priority::REALTIME);

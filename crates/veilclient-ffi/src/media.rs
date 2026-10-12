@@ -85,8 +85,8 @@ const MEDIA_SEALED_TAG_LEN: usize = 16;
 /// Bytes a seal adds on top of the plaintext cell. Send paths subtract this
 /// from their cell budget.
 pub(crate) const MEDIA_SEAL_OVERHEAD: usize = MEDIA_SEALED_HEADER_LEN + MEDIA_SEALED_TAG_LEN;
-// Three local producers across two overlapping channel generations.
-const MEDIA_SEALED_MAX_EPOCHS: usize = 6;
+// Four local producers across two overlapping channel generations.
+const MEDIA_SEALED_MAX_EPOCHS: usize = 8;
 const MEDIA_SEALED_KDF_CONTEXT: &str = "xveil/call-media/channel-epoch/v1";
 /// How many receive-key replay windows survive channel teardown. A
 /// device holds one live call at a time and rebuilds its route a handful of
@@ -465,11 +465,11 @@ impl SealedMediaCell {
 /// fresh random epoch salt is mixed into the TX sub-key, so rebuilding a route
 /// during the same call can safely restart its sequence at one without nonce
 /// reuse. RX keeps a tiny bounded set of recent epochs for make-before-break
-/// overlap, shared per receive key (see [`REPLAY`]). The two local producers have
+/// overlap, shared per receive key (see [`REPLAY`]). The four local producers have
 /// independent epochs and counters, so a video burst cannot age delayed audio
 /// out of its replay window. Their wire salts are random and encode no role.
 pub(crate) struct MediaCipher {
-    tx: [Mutex<MediaCipherTx>; 3],
+    tx: [Mutex<MediaCipherTx>; 4],
     rx: Mutex<MediaCipherRx>,
     // Identity of the receive key for internal control dispatch across two
     // overlapping channel generations. Never logged or placed on the wire.
@@ -526,11 +526,19 @@ impl MediaCipher {
         while screen.salt == primary.salt || screen.salt == secondary.salt {
             screen = MediaCipherTx::new(tx_key);
         }
+        let mut control = MediaCipherTx::new(tx_key);
+        while control.salt == primary.salt
+            || control.salt == secondary.salt
+            || control.salt == screen.salt
+        {
+            control = MediaCipherTx::new(tx_key);
+        }
         Some(Self {
             tx: [
                 Mutex::new(primary),
                 Mutex::new(secondary),
                 Mutex::new(screen),
+                Mutex::new(control),
             ],
             rx: Mutex::new(MediaCipherRx::new(peer, rx_key)),
             rx_key_id: *blake3::hash(rx_key).as_bytes(),
@@ -552,6 +560,16 @@ impl MediaCipher {
             LocalMediaPlane::Secondary => 1,
             LocalMediaPlane::Screen => 2,
         };
+        self.seal_at(index, plaintext)
+    }
+
+    /// Control owns a separate epoch/lock without acquiring a media producer
+    /// route or implying that anonymous media already has a fourth pool.
+    pub(crate) fn seal_call_control(&self, plaintext: &[u8]) -> Option<SealedMediaCell> {
+        self.seal_at(3, plaintext)
+    }
+
+    fn seal_at(&self, index: usize, plaintext: &[u8]) -> Option<SealedMediaCell> {
         self.tx[index]
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1208,6 +1226,10 @@ fn dispatch_inbound_with_lease(peer: [u8; 32], payload: &[u8], lease: RecvLease)
         return;
     };
     trace_sealed_cell("received", &peer, payload);
+    #[cfg(feature = "node-embedded")]
+    if crate::media_ffi::call_control_ffi::dispatch_control(lease.chan, &lease.cipher, &plaintext) {
+        return;
+    }
     #[cfg(feature = "node-embedded")]
     if crate::media_ffi::path_probe_ffi::dispatch_control(&lease.cipher, &plaintext) {
         return;

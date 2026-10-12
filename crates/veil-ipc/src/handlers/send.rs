@@ -2612,6 +2612,27 @@ mod ratchet_send_tests {
             }
             previous = Some(forward);
         }
+        // Compact call state uses the local signaling source while retaining
+        // the same presealed payload and neutral inter-node representation.
+        body[100..104].copy_from_slice(
+            &(flags | veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT).to_be_bytes(),
+        );
+        ctx.local_priority = veil_proto::priority::INTERACTIVE;
+        handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+            .await
+            .unwrap();
+        let (priority, bytes) = lock!(capture.0).pop().expect("compact control queued");
+        assert_eq!(priority, veil_proto::ipc::LOCAL_SIGNALING_LANE);
+        assert_eq!(
+            codec::decode_header(&bytes).unwrap().priority(),
+            veil_proto::priority::INTERACTIVE
+        );
+        let mut forward =
+            veil_proto::delivery::ForwardPayload::decode(&bytes[veil_proto::HEADER_SIZE..])
+                .unwrap();
+        forward.envelope.content_id = [0; 32];
+        forward.envelope.created_at = 0;
+        assert_eq!(Some(forward), previous);
     }
 
     #[tokio::test]

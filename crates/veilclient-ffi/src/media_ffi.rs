@@ -32,6 +32,9 @@ use super::*;
 pub mod path_probe_ffi;
 
 #[cfg(feature = "node-embedded")]
+pub mod call_control_ffi;
+
+#[cfg(feature = "node-embedded")]
 mod ingress_diagnostics;
 #[cfg(feature = "node-embedded")]
 use ingress_diagnostics::{Reason as IngressRefusal, refuse as refuse_ingress};
@@ -569,6 +572,7 @@ pub unsafe extern "C" fn veil_media_open_channel(
                 video_sender: None,
                 screen_sender: None,
                 sender_app_id: None,
+                control_destination: None,
                 batching: None,
                 cipher,
                 relay_stats: None,
@@ -855,6 +859,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
                 video_sender: Some(video_sender),
                 screen_sender: Some(screen_sender),
                 sender_app_id: Some(app_ref.app_id),
+                control_destination: Some((peer_app, peer_endpoint_id)),
                 batching: Some(batching),
                 cipher,
                 relay_stats: None,
@@ -1074,6 +1079,7 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                 video_sender: Some(video_sender),
                 screen_sender: Some(screen_sender),
                 sender_app_id: Some(app_ref.app_id),
+                control_destination: Some((peer_app, peer_endpoint_id)),
                 batching: Some(batching),
                 cipher,
                 relay_stats: Some(relay_stats),
@@ -1569,6 +1575,7 @@ pub unsafe extern "C" fn veil_media_close_channel(chan: u64) {
     if let Some(ch) = ch {
         // Stop outbound work before waiting for an in-flight recv callback.
         ch.abort_pumps();
+        call_control_ffi::close(chan);
         media::clear_recv_callback_by_chan(chan);
     }
 }
@@ -1624,6 +1631,7 @@ struct MediaChannel {
     video_sender: Option<Arc<MediaSenderSlot<AppSender>>>,
     screen_sender: Option<Arc<MediaSenderSlot<AppSender>>>,
     sender_app_id: Option<[u8; 32]>,
+    control_destination: Option<([u8; 32], u32)>,
     /// Opt-in media batching on direct/RELAY send paths (see
     /// `veil_media_channel_set_batching`). Off by default: a batched cell is
     /// silent noise to a legacy receiver, so the host enables it only after

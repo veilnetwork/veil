@@ -422,6 +422,13 @@
 #define VEIL_TUNNEL_ERROR 3
 #endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Maximum opaque payload of an ephemeral call-state update, before sealing.
+ */
+#define VEIL_CALL_CONTROL_MAX_BYTES 768
+#endif
+
 /**
  * Status return codes [`veil_mailbox_put`]. Mirrors
  * `MailboxPutStatus` on the wire (0..8 byte).
@@ -3734,8 +3741,12 @@ int veil_media_start_direct_receiver(VeilApp *app,
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Install the C recv callback invoked (native↔native, from a tokio worker)
- * once per inbound media datagram from `chan`'s peer, with the wire magic
- * already stripped. Replaces any prior callback; `cb == NULL` clears it.
+ * once per authenticated inbound media datagram from `chan`'s peer, with the
+ * wire magic already stripped. Configured path probes pin the identity and
+ * physical-device addresses of this same call: register both before media
+ * starts so the peer may change its sender while ours still uses the old
+ * route. Both addresses use one cipher/replay window and callback owner.
+ * Replaces prior callbacks; `cb == NULL` clears every alias owned by `chan`.
  * Returns 0, or -1 on an unknown `chan`.
  */
  int veil_media_set_recv_callback(uint64_t chan, Option_MediaRecvFn cb, void *ctx) ;
@@ -3785,9 +3796,39 @@ int veil_media_channel_configure_path_probes(uint64_t chan,
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Poll a candidate without waiting for a network or changing RTP counters.
+ * While pending, admit at most two spaced challenge retries to its existing
+ * nonblocking primary ingress; the original observation budget stays fixed.
  * 0=pending/busy, 1=qualified and fresh, 2=expired, -1=closed/cancelled.
  */
  int veil_media_channel_poll_path_probe(uint64_t chan) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Install a separate control IPC sender on an existing direct/relay channel.
+ * Bind the same app identity on a separate connection, and negotiate peer
+ * support first. Anonymous channels retain their existing signaling path.
+ * A second configuration is rejected; close/reopen for a new sender.
+ */
+ int veil_media_channel_set_control_sender(uint64_t chan, VeilApp *app, char **err_out) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Queue one ephemeral state update, up to 768 bytes. Returns 0 queued,
+ * 1 full/busy, -1 invalid/closed. This is not a reliable command channel;
+ * repeat state periodically and keep setup/end commands on signaling.
+ */
+ int veil_media_send_call_control(uint64_t chan, const uint8_t *ptr, size_t len) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Poll authenticated peer state into caller memory. Positive = bytes copied,
+ * 0 = no fresh update, -1 = invalid/closed, -2 = output too small (not consumed).
+ * Receipt is bound to this channel's cipher. No native callback enters Dart.
+ */
+ int veil_media_poll_call_control(uint64_t chan, uint8_t *ptr, size_t capacity) ;
 #endif
 
 /**

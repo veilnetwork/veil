@@ -161,6 +161,7 @@ impl Fixture {
                 video_sender: None,
                 screen_sender: None,
                 sender_app_id: Some(app.app_id),
+                control_destination: None,
                 batching: None,
                 cipher,
                 relay_stats: (route == ProbeRoute::Relay)
