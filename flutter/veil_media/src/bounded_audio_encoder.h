@@ -36,23 +36,33 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
     return inner_->Max10MsFramesInAPacket();
   }
   int GetTargetBitrate() const override { return inner_->GetTargetBitrate(); }
-  void Reset() override { inner_->Reset(); }
+  void Reset() override {
+    inner_->Reset();
+    ClampPayloadTarget();
+  }
   bool SetFec(bool on) override { return inner_->SetFec(on); }
   bool SetDtx(bool on) override { return inner_->SetDtx(on); }
   bool GetDtx() const override { return inner_->GetDtx(); }
   bool SetApplication(Application app) override { return inner_->SetApplication(app); }
   void SetMaxPlaybackRate(int hz) override { inner_->SetMaxPlaybackRate(hz); }
   bool EnableAudioNetworkAdaptor(absl::string_view config) override {
-    return inner_->EnableAudioNetworkAdaptor(config);
+    const bool enabled = inner_->EnableAudioNetworkAdaptor(config);
+    ClampPayloadTarget();
+    return enabled;
   }
   void DisableAudioNetworkAdaptor() override { inner_->DisableAudioNetworkAdaptor(); }
   void OnReceivedUplinkPacketLossFraction(float fraction) override {
     inner_->OnReceivedUplinkPacketLossFraction(fraction);
+    ClampPayloadTarget();
   }
-  void OnReceivedRtt(int ms) override { inner_->OnReceivedRtt(ms); }
+  void OnReceivedRtt(int ms) override {
+    inner_->OnReceivedRtt(ms);
+    ClampPayloadTarget();
+  }
   void OnReceivedOverhead(size_t bytes) override {
     overhead_bytes_ = bytes;
     inner_->OnReceivedOverhead(bytes);
+    ClampPayloadTarget();
   }
   void OnReceivedTargetAudioBitrate(int bps) override {
     inner_->OnReceivedTargetAudioBitrate(std::clamp(bps, kMinPayloadBps, kMaxPayloadBps));
@@ -84,6 +94,7 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
         budget, overhead + kMinPayloadBps,
         overhead + kMaxPayloadBps));
     inner_->OnReceivedUplinkAllocation(update);
+    ClampPayloadTarget();
   }
   void SetReceiverFrameLengthRange(int min_ms, int max_ms) override {
     inner_->SetReceiverFrameLengthRange(min_ms, max_ms);
@@ -95,6 +106,16 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
   GetBitrateRange() const override { return inner_->GetBitrateRange(); }
 
  private:
+  void ClampPayloadTarget() {
+    // ANA can apply a bitrate before it has the uplink estimate required to
+    // select a longer packet. Its gross budget then buys less than the speech
+    // floor at the current duration. Loss/RTT/overhead updates also rerun ANA.
+    // Clamp the actual codec target after those decisions; do not change ANA's
+    // metrics, packet-duration choice, timestamps, or transport allocation.
+    const int target = inner_->GetTargetBitrate();
+    const int bounded = std::clamp(target, kMinPayloadBps, kMaxPayloadBps);
+    if (target != bounded) inner_->OnReceivedTargetAudioBitrate(bounded);
+  }
   EncodedInfo EncodeImpl(uint32_t timestamp, std::span<const int16_t> audio,
                          webrtc::Buffer* encoded) override {
     // Opus may select the next duration at this packet's boundary. Sample
