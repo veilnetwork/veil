@@ -389,7 +389,15 @@ async fn drain_relay_video_on_plane<F, Fut>(
     while let Some(frame) = rx.recv().await {
         stats.start_frame(frame.enqueued_at.elapsed());
         let started = std::time::Instant::now();
-        let legacy = batching.load(std::sync::atomic::Ordering::Relaxed) == MEDIA_BATCHING_LEGACY;
+        let mode = batching.load(std::sync::atomic::Ordering::Relaxed);
+        // The complete frame is already available. Compact peers can share
+        // the fixed seal/Forward overhead for small packets without waiting
+        // for another frame or creating a larger transport work item.
+        let max_body = if mode == MEDIA_BATCHING_COMPACT_RELAY {
+            COMPACT_RELAY_MEDIA_CELL_MAX - 1
+        } else {
+            RELAY_VIDEO_BATCH_BODY_MAX
+        };
         let deadline = tokio::time::Instant::from_std(frame.enqueued_at) + MEDIA_LOCAL_QUEUE_AGE;
         let packets = frame
             .packets
@@ -398,8 +406,8 @@ async fn drain_relay_video_on_plane<F, Fut>(
             .collect();
         for queued in timed_media_cells(
             packets,
-            legacy,
-            RELAY_VIDEO_BATCH_BODY_MAX,
+            mode != MEDIA_BATCHING_OFF,
+            max_body,
             RELAY_VIDEO_BATCH_MAX_PACKETS,
         ) {
             if queued.expired() {
@@ -1318,7 +1326,9 @@ pub unsafe extern "C" fn veil_media_repair_channel(chan: u64) -> c_int {
 }
 
 /// Select media batching for a direct or relay channel: 0 = off, 1 = legacy
-/// audio+video batching, 2 = compact relay audio-only batching. Mode 2 is
+/// audio+video batching, 2 = compact relay batching. Video batches contain
+/// only packets from a frame already complete, within the compact cell limit.
+/// Mode 2 is
 /// rejected for non-relay channels. This is a WIRE-FORMAT selector, not a
 /// security one — every mode seals identically, and the batch envelope now
 /// travels inside the seal, so a peer on the path cannot see or rewrite it.

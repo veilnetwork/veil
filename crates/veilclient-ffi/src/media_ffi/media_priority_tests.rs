@@ -13,12 +13,13 @@
 //! that can move without the header noticing, and this checks that it did not.
 
 use super::{
-    MEDIA_BATCHING_COMPACT_RELAY, MEDIA_BATCHING_OFF, MEDIA_CHANNELS, MEDIA_LOCAL_QUEUE_AGE,
-    MEDIA_NEXT_ID, MediaChannel, MediaIngress, MediaSenderSlot, MediaVideoIngress,
-    QueuedMediaPacket, RelayVideoFrame, drain_anonymous_media, drain_media_packets,
-    drain_media_packets_on_plane, drain_relay_video, media_batched_cells, media_is_rtcp,
-    media_ready_batch, timed_media_cells, veil_media_channel_set_screen_sharing,
-    veil_media_close_channel, veil_media_send_datagram, veil_media_send_video_control_datagram,
+    COMPACT_RELAY_MEDIA_CELL_MAX, MEDIA_BATCHING_COMPACT_RELAY, MEDIA_BATCHING_LEGACY,
+    MEDIA_BATCHING_OFF, MEDIA_CHANNELS, MEDIA_LOCAL_QUEUE_AGE, MEDIA_NEXT_ID, MediaChannel,
+    MediaIngress, MediaSenderSlot, MediaVideoIngress, QueuedMediaPacket, RelayVideoFrame,
+    drain_anonymous_media, drain_media_packets, drain_media_packets_on_plane, drain_relay_video,
+    drain_relay_video_on_plane, media_batched_cells, media_is_rtcp, media_ready_batch,
+    timed_media_cells, veil_media_channel_set_screen_sharing, veil_media_close_channel,
+    veil_media_send_datagram, veil_media_send_video_control_datagram,
 };
 use super::{
     RELAY_VIDEO_FRAME_MAX_BYTES, RelayMediaStats, RelayVideoFrameAssembler, RelayVideoFramePush,
@@ -72,6 +73,80 @@ fn batching_never_puts_video_into_an_audio_cell() {
     );
     assert_eq!(expand_wire_cells(&cells), packets);
     assert!(!media_cell_is_video(&[crate::media::MEDIA_BATCH_MAGIC]));
+}
+
+#[tokio::test]
+async fn compact_video_batches_ready_frames_without_crossing_cell_or_frame_boundaries() {
+    for plane in [LocalMediaPlane::Secondary, LocalMediaPlane::Screen] {
+        for (mode, expected_cells) in [
+            (MEDIA_BATCHING_OFF, 9),
+            (MEDIA_BATCHING_LEGACY, 5),
+            (MEDIA_BATCHING_COMPACT_RELAY, 6),
+        ] {
+            let sized = |timestamp, marker, size| {
+                let mut packet = video_packet(timestamp, marker, 3);
+                packet.resize(size, 3);
+                packet
+            };
+            let frames = vec![
+                vec![sized(7, false, 120), sized(7, true, 120)],
+                vec![sized(8, false, 120), sized(8, true, 120)],
+                // Including batch marker/count/lengths, exactly 1000 bytes.
+                vec![sized(9, false, 480), sized(9, true, 513)],
+                // One additional byte must force separate compact cells.
+                vec![sized(10, false, 480), sized(10, true, 514)],
+                vec![sized(11, true, 1000)],
+            ];
+            let expected: Vec<_> = frames.iter().flatten().cloned().collect();
+            let enqueued_at = Instant::now();
+            let deadline = tokio::time::Instant::from_std(enqueued_at) + MEDIA_LOCAL_QUEUE_AGE;
+            let (tx, rx) = mpsc::channel(frames.len());
+            for packets in frames {
+                tx.try_send(RelayVideoFrame {
+                    packets,
+                    enqueued_at,
+                })
+                .unwrap();
+            }
+            drop(tx);
+            let peer = [0xd6; 32];
+            let cipher = Arc::new(cipher_for_test(&peer, &[1; 32], &[2; 32]).unwrap());
+            let receiver = cipher_for_test(&peer, &[2; 32], &[1; 32]).unwrap();
+            let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                drain_relay_video_on_plane(
+                    rx,
+                    Arc::new(AtomicU8::new(mode)),
+                    cipher,
+                    Arc::new(RelayMediaStats::default()),
+                    plane,
+                    move |cell| {
+                        sent_tx.send(cell).unwrap();
+                        async { true }
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+            let mut cells = Vec::new();
+            while let Ok(sealed) = sent_rx.try_recv() {
+                assert_eq!(sealed.local_deadline(), Some(deadline));
+                let cell = receiver
+                    .open(sealed.as_bytes())
+                    .expect("authenticated video cell");
+                if mode == MEDIA_BATCHING_COMPACT_RELAY {
+                    assert!(cell.len() <= COMPACT_RELAY_MEDIA_CELL_MAX);
+                }
+                let packets = expand_wire_cells(&[cell.clone()]);
+                let timestamp = &packets[0][4..8];
+                assert!(packets.iter().all(|p| &p[4..8] == timestamp));
+                cells.push(cell);
+            }
+            assert_eq!(cells.len(), expected_cells);
+            assert_eq!(expand_wire_cells(&cells), expected);
+        }
+    }
 }
 
 #[test]
