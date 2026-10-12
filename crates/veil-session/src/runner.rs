@@ -2694,6 +2694,7 @@ impl SessionRunner {
                 carrier: None,
                 queued_at: std::time::Instant::now(),
                 reliable_credit: Some(req.source_credit),
+                signaling_pending: None,
             },
             false,
         );
