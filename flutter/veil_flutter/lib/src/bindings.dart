@@ -2282,7 +2282,7 @@ final void Function(int) veilDebugSetPublishPause = nativeLib
     .asFunction();
 
 // media_channel_set_batching(chan, mode) -> 0 ok / -1 unknown/unsupported.
-// Modes: 0 off, 1 legacy audio+video batch, 2 compact relay audio-only.
+// Modes: 0 off, 1 legacy audio+video batch, 2 compact relay cells.
 // A wire-format selector only: every mode seals identically.
 final int Function(int, int) veilMediaChannelSetBatching = nativeLib
     .lookup<NativeFunction<Int32 Function(Uint64, Int32)>>(

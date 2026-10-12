@@ -3065,7 +3065,8 @@ class AppHandle implements Finalizable {
   }
 
   /// Select the batching wire format on a direct/relay media channel.
-  /// [compact] uses audio-only batching and is valid on relay channels only.
+  /// [compact] keeps relay cells small; video batches only packets from an
+  /// already complete frame. It is valid on relay channels only.
   /// This is a wire-format choice, not a security one: every mode seals
   /// identically and the batch envelope travels inside the seal.
   int setRelayMediaBatching(int chan, bool on, {bool compact = false}) {
