@@ -16,6 +16,7 @@ const SIGNALING_BYTES: usize = 4096;
 // packetized frame. Reliable files retain their separate, smaller byte budget.
 pub(crate) const LOSSY_SECONDARY_BYTES: usize = 8192;
 const SECONDARY_PROBE_INTERVAL: Duration = Duration::from_millis(200);
+const RELIABLE_RAMP_STEP: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Default)]
 struct SourceState {
@@ -23,6 +24,10 @@ struct SourceState {
     pressure_until: Option<Instant>,
     secondary_window: Option<(Instant, usize)>,
     reliable_next: Option<Instant>,
+    source_feedback_seen: bool,
+    last_healthy_feedback: Option<Instant>,
+    reliable_ramp_since: Option<Instant>,
+    last_reliable_progress: Option<Instant>,
     reliable_sequence: u64,
     reliable_waiters: VecDeque<u64>,
     network_window: Option<(Instant, usize)>,
@@ -82,6 +87,10 @@ impl LocalSourceActivity {
             // A new producer after inactivity must not inherit a previous
             // call's oversized compatibility-control debt.
             state.signaling_next = None;
+            state.source_feedback_seen = false;
+            state.last_healthy_feedback = None;
+            state.reliable_ramp_since = None;
+            state.last_reliable_progress = None;
         }
         // Runners can publish observations in a different order. An older
         // observation must not retire a newer producer's activity.
@@ -100,6 +109,21 @@ impl LocalSourceActivity {
         let mut state = lock!(self.0);
         let until = now + PRESSURE_GRACE;
         state.pressure_until = Some(state.pressure_until.map_or(until, |old| old.max(until)));
+        state.reliable_ramp_since = None;
+    }
+
+    /// A validated local observation enables gradual admission of own DATA.
+    /// Reports do not grant byte credit or erase another source's pressure.
+    pub(crate) fn note_feedback(&self, pressured: bool, now: Instant) {
+        if pressured {
+            self.note_pressure(now);
+        }
+        let mut state = lock!(self.0);
+        state.source_feedback_seen = true;
+        if !pressured {
+            state.last_healthy_feedback =
+                Some(state.last_healthy_feedback.map_or(now, |old| old.max(now)));
+        }
     }
 
     /// Hold reliable local producers before encryption whenever a local
@@ -184,6 +208,8 @@ impl LocalSourceActivity {
             let Some(until) = active_until.filter(|until| now < *until) else {
                 state.reliable_next = None;
                 state.reliable_waiters.clear();
+                state.reliable_ramp_since = None;
+                state.last_reliable_progress = None;
                 return Ok(());
             };
             // Register before waiting for byte debt. The first runner to wake
@@ -211,8 +237,33 @@ impl LocalSourceActivity {
             // ceiling. Retain existing debt through feedback transitions;
             // only a newly admitted frame earns the current rate.
             let budget = if state.pressure_until.is_some_and(|until| now < until) {
+                state.reliable_ramp_since = None;
                 PRESSURED_RELIABLE_BYTES
+            } else if state.source_feedback_seen {
+                let fresh = state
+                    .last_healthy_feedback
+                    .is_some_and(|at| now.saturating_duration_since(at) < PRESSURE_GRACE);
+                if !fresh
+                    || state
+                        .last_reliable_progress
+                        .is_none_or(|at| now.saturating_duration_since(at) >= IDLE_GRACE)
+                {
+                    state.reliable_ramp_since = None;
+                }
+                let since = if fresh {
+                    *state.reliable_ramp_since.get_or_insert(now)
+                } else {
+                    now
+                };
+                let steps =
+                    now.saturating_duration_since(since).as_nanos() / RELIABLE_RAMP_STEP.as_nanos();
+                let max_steps = (RELIABLE_SECONDARY_BYTES / PRESSURED_RELIABLE_BYTES - 1) as u128;
+                PRESSURED_RELIABLE_BYTES.saturating_mul(
+                    1 + steps.min(max_steps) as usize,
+                )
             } else {
+                // Legacy callers without negotiated local feedback retain
+                // their existing allowance. No remote frame enables ramping.
                 RELIABLE_SECONDARY_BYTES
             };
             let nanos = (bytes as u128)
@@ -224,6 +275,7 @@ impl LocalSourceActivity {
                 (nanos % 1_000_000_000) as u32,
             );
             state.reliable_next = Some(now + charge);
+            state.last_reliable_progress = Some(now);
             return Ok(());
         }
         // Recovery RPCs keep a separate pressure-only allowance. DATA debt
@@ -310,6 +362,97 @@ impl LocalSourceActivity {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn negotiated_data_starts_small_and_recovers_only_after_actual_healthy_sending() {
+        let source = LocalSourceActivity::default();
+        let now = Instant::now();
+        source.note(now);
+        source.note_feedback(false, now);
+        // Good observations before DATA starts do not accrue startup credit.
+        for seconds in 1..=10 {
+            let at = now + Duration::from_secs(seconds);
+            source.note(at);
+            source.note_feedback(false, at);
+        }
+        let start = now + Duration::from_secs(10);
+        for (seconds, charge_ns) in [
+            (0, 200_000_000),
+            (2, 100_000_000),
+            (4, 66_666_667),
+            (6, 50_000_000),
+        ] {
+            let at = start + Duration::from_secs(seconds);
+            source.note(at);
+            source.note_feedback(false, at);
+            assert!(source.admit_reliable_secondary(1024, at).is_ok());
+            assert_eq!(
+                source.admit_reliable_secondary(1, at),
+                Err(at + Duration::from_nanos(charge_ns))
+            );
+        }
+    }
+
+    #[test]
+    fn stale_feedback_idle_sending_and_pressure_reset_ramp_without_refunding_debt() {
+        let source = LocalSourceActivity::default();
+        let now = Instant::now();
+        source.note(now);
+        source.note_feedback(false, now);
+        assert!(source.admit_reliable_secondary(1024, now).is_ok());
+        let stale = now + PRESSURE_GRACE;
+        source.note(stale);
+        assert!(source.admit_reliable_secondary(1024, stale).is_ok());
+        let deadline = stale + SECONDARY_PROBE_INTERVAL;
+        // A new healthy report cannot refund the previous DATA byte debt.
+        source.note_feedback(false, stale + Duration::from_millis(1));
+        assert_eq!(source.admit_reliable_secondary(1, stale), Err(deadline));
+        assert!(source.admit_reliable_secondary(1024, deadline).is_ok());
+        let recover = deadline + RELIABLE_RAMP_STEP;
+        source.note(recover);
+        source.note_feedback(false, recover);
+        assert!(source.admit_reliable_secondary(1024, recover).is_ok());
+        let next = recover + Duration::from_millis(100);
+        source.note_feedback(true, recover + Duration::from_millis(1));
+        assert_eq!(source.admit_reliable_secondary(1, recover), Err(next));
+        assert!(source.admit_reliable_secondary(1024, next).is_ok());
+        assert_eq!(
+            source.admit_reliable_secondary(1, next),
+            Err(next + SECONDARY_PROBE_INTERVAL)
+        );
+        // Keep primary activity alive while DATA itself is idle. Restart
+        // remains conservative even with a fresh healthy report.
+        for second in 1..=6 {
+            let at = next + Duration::from_secs(second);
+            source.note(at);
+            source.note_feedback(false, at);
+        }
+        let resumed = next + Duration::from_secs(6);
+        assert!(source.admit_reliable_secondary(1024, resumed).is_ok());
+        assert_eq!(
+            source.admit_reliable_secondary(1, resumed),
+            Err(resumed + SECONDARY_PROBE_INTERVAL)
+        );
+    }
+
+    #[test]
+    fn expired_pressure_feedback_cannot_jump_to_legacy_data_rate() {
+        let source = LocalSourceActivity::default();
+        let now = Instant::now();
+        source.note(now);
+        source.note_feedback(true, now);
+        let expired = now + PRESSURE_GRACE;
+        source.note(expired);
+        assert!(source.admit_reliable_secondary(1024, expired).is_ok());
+        assert_eq!(
+            source.admit_reliable_secondary(1, expired),
+            Err(expired + SECONDARY_PROBE_INTERVAL)
+        );
+        // Without an active primary, ordinary data remains unrestricted.
+        let idle = expired + IDLE_GRACE;
+        assert!(source.admit_reliable_secondary(60000, idle).is_ok());
+        assert!(source.admit_reliable_secondary(60000, idle).is_ok());
+    }
 
     #[test]
     fn signaling_fanout_is_paced_across_producers_without_idle_credit() {
