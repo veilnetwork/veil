@@ -124,6 +124,7 @@ struct QueuedFrame {
     lossy_realtime: bool,
     carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
     reliable_credit: Option<tokio::sync::OwnedSemaphorePermit>,
+    signaling_pending: Option<crate::local_source_activity::PendingSignaling>,
 }
 
 // ── PriorityQueue ─────────────────────────────────────────────────────────────
@@ -204,7 +205,7 @@ impl PriorityQueue {
     /// expense of BULK/BACKGROUND. Drops increment `drops_total` so the
     /// runner can forward them to Prometheus.
     pub fn push(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
-        self.push_entry(priority, frame, None, None, None);
+        self.push_entry(priority, frame, None, None, None, None);
     }
 
     /// Enqueue a canonical loss-tolerant realtime frame. When its dedicated
@@ -221,7 +222,7 @@ impl PriorityQueue {
     /// Loss tolerance is independent of queue priority. In particular relayed
     /// datagrams share INTERACTIVE FIFO order with other forwarded user data.
     pub fn push_lossy(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
-        self.push_lossy_with_carrier(priority, frame, None, Instant::now());
+        self.push_lossy_with_carrier(priority, frame, None, Instant::now(), None);
     }
 
     pub(crate) fn push_envelope(
@@ -231,7 +232,13 @@ impl PriorityQueue {
     ) {
         let (priority, frame) = envelope.frame;
         if lossy {
-            self.push_lossy_with_carrier(priority, frame, envelope.carrier, envelope.queued_at);
+            self.push_lossy_with_carrier(
+                priority,
+                frame,
+                envelope.carrier,
+                envelope.queued_at,
+                envelope.signaling_pending,
+            );
         } else {
             self.push_entry(
                 priority,
@@ -239,6 +246,7 @@ impl PriorityQueue {
                 None,
                 envelope.carrier,
                 envelope.reliable_credit,
+                envelope.signaling_pending,
             );
         }
     }
@@ -249,6 +257,7 @@ impl PriorityQueue {
         frame: veil_bufpool::PooledShared,
         carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
         queued_at: Instant,
+        signaling_pending: Option<crate::local_source_activity::PendingSignaling>,
     ) {
         // Expired ingress must not evict a fresh frame from a full class.
         if queued_at.elapsed() > lossy_realtime_max_age(priority) {
@@ -269,7 +278,14 @@ impl PriorityQueue {
             self.lossy_realtime_len[p] -= 1;
             self.drops_total.fetch_add(1, Ordering::Relaxed);
         }
-        self.push_entry(priority, frame, Some(queued_at), carrier, None);
+        self.push_entry(
+            priority,
+            frame,
+            Some(queued_at),
+            carrier,
+            None,
+            signaling_pending,
+        );
     }
 
     fn push_entry(
@@ -279,6 +295,7 @@ impl PriorityQueue {
         enqueued_at: Option<Instant>,
         carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
         reliable_credit: Option<tokio::sync::OwnedSemaphorePermit>,
+        signaling_pending: Option<crate::local_source_activity::PendingSignaling>,
     ) {
         let lossy_realtime = enqueued_at.is_some();
         let p = queue_index(priority);
@@ -334,6 +351,7 @@ impl PriorityQueue {
             lossy_realtime,
             carrier,
             reliable_credit,
+            signaling_pending,
         });
         if lossy_realtime {
             self.lossy_realtime_len[p] += 1;
@@ -515,6 +533,7 @@ impl PriorityQueue {
             lossy_realtime: true,
             carrier: envelope.carrier,
             reliable_credit: None,
+            signaling_pending: envelope.signaling_pending,
         });
         self.lossy_realtime_len[queue_index(priority)] += 1;
     }
@@ -583,6 +602,7 @@ impl PriorityQueue {
                         carrier: queued.carrier,
                         queued_at: queued.enqueued_at.unwrap_or_else(Instant::now),
                         reliable_credit: queued.reliable_credit,
+                        signaling_pending: queued.signaling_pending,
                     });
                 }
             }
@@ -652,6 +672,7 @@ impl PriorityQueue {
                         carrier: queued.carrier,
                         queued_at: queued.enqueued_at.unwrap_or_else(Instant::now),
                         reliable_credit: queued.reliable_credit,
+                        signaling_pending: queued.signaling_pending,
                     });
                 }
             }
@@ -726,6 +747,7 @@ mod tests {
             arc(b"independent"),
             Some(Arc::downgrade(&carrier)),
             Instant::now() - Duration::from_millis(60),
+            None,
         );
         let before = (
             pq.len(),
@@ -798,7 +820,10 @@ mod tests {
         assert!(coalescer.is_coalescing(now, window, pq.coalescing_priority()));
         pq.push(LOCAL_SIGNALING_LANE, arc(b"call offer"));
         assert!(!coalescer.is_coalescing(now, window, pq.coalescing_priority()));
-        assert_eq!(coalescer.coalesce_deadline(window, pq.coalescing_priority()), None);
+        assert_eq!(
+            coalescer.coalesce_deadline(window, pq.coalescing_priority()),
+            None
+        );
     }
 
     #[test]

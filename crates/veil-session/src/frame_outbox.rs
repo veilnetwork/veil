@@ -41,6 +41,7 @@ pub struct FrameEnvelope {
     /// Endpoint-only reliable admission. Held through the scheduler, never
     /// serialized or inferred from a remote frame's priority or contents.
     pub(crate) reliable_credit: Option<tokio::sync::OwnedSemaphorePermit>,
+    pub(crate) signaling_pending: Option<crate::local_source_activity::PendingSignaling>,
 }
 
 impl From<PriorityFrame> for FrameEnvelope {
@@ -50,6 +51,7 @@ impl From<PriorityFrame> for FrameEnvelope {
             carrier: None,
             queued_at: Instant::now(),
             reliable_credit: None,
+            signaling_pending: None,
         }
     }
 }
@@ -95,6 +97,7 @@ impl EnvelopeReceiver {
 
 #[derive(Clone, Debug)]
 pub struct FrameSender {
+    source_activity: std::sync::Arc<crate::local_source_activity::LocalSourceActivity>,
     ordinary: mpsc::Sender<FrameEnvelope>,
     network_control: mpsc::Sender<FrameEnvelope>,
     control_credits: std::sync::Arc<tokio::sync::Semaphore>,
@@ -154,6 +157,10 @@ impl FrameSender {
             None
         };
         let mut envelope = FrameEnvelope::from(frame);
+        if envelope.frame.0 == crate::LOCAL_SIGNALING_LANE {
+            envelope.signaling_pending =
+                Some(self.source_activity.pending_signal(envelope.queued_at));
+        }
         envelope.reliable_credit = credit;
         lane.try_send(envelope).map_err(|error| match error {
             mpsc::error::TrySendError::Full(envelope) => {
@@ -194,6 +201,10 @@ impl FrameSender {
             None
         };
         let mut envelope = FrameEnvelope::from(frame);
+        if envelope.frame.0 == crate::LOCAL_SIGNALING_LANE {
+            envelope.signaling_pending =
+                Some(self.source_activity.pending_signal(envelope.queued_at));
+        }
         envelope.reliable_credit = credit;
         lane.send(envelope)
             .await
@@ -217,6 +228,7 @@ impl FrameSender {
                 carrier: None,
                 queued_at: Instant::now(),
                 reliable_credit: Some(credit),
+                signaling_pending: None,
             })
             .await
             .is_ok()
@@ -234,6 +246,7 @@ impl FrameSender {
             carrier: Some(carrier),
             queued_at: Instant::now(),
             reliable_credit: None,
+            signaling_pending: None,
         })
     }
 
@@ -282,6 +295,7 @@ pub(crate) fn frame_channel_with_source_activity(
     let (reserved_tx, reserved) = mpsc::channel(capacity.min(RESERVED_QUEUE_DEPTH));
     (
         FrameSender {
+            source_activity: std::sync::Arc::clone(&source_activity),
             ordinary: ordinary_tx,
             network_control: control_tx,
             control_credits: std::sync::Arc::new(tokio::sync::Semaphore::new(
@@ -487,6 +501,84 @@ impl FrameOutbox {
 mod tests {
     use super::*;
     use veil_proto::priority::{INTERACTIVE, REALTIME};
+
+    #[tokio::test]
+    async fn signaling_ownership_survives_ingress_scheduler_and_restore() {
+        let activity =
+            std::sync::Arc::new(crate::local_source_activity::LocalSourceActivity::default());
+        let (sender, mut outbox) = frame_channel_with_source_activity(4, activity.clone());
+        let now = Instant::now();
+        activity.note(now);
+        sender
+            .try_send((
+                crate::LOCAL_SIGNALING_LANE,
+                veil_bufpool::pooled_shared_from_vec(b"control".to_vec()),
+            ))
+            .unwrap();
+        let mut pq = crate::PriorityQueue::with_default_weights();
+        pq.push_envelope(outbox.recv_envelope().await.unwrap(), true);
+        assert_eq!(activity.admit_signaling(1024, now), Ok(()));
+        let ready = now + std::time::Duration::from_millis(50);
+        let selected = pq.pop_local_datagram_envelope_if(|_| true).unwrap();
+        assert!(activity.admit_reliable_secondary(1024, ready).is_err());
+        pq.restore_lossy_envelope(selected);
+        assert!(activity.admit_reliable_secondary(1024, ready).is_err());
+        drop(pq);
+        assert_eq!(activity.admit_reliable_secondary(1024, ready), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn failed_and_canceled_signaling_admission_releases_data() {
+        let activity =
+            std::sync::Arc::new(crate::local_source_activity::LocalSourceActivity::default());
+        let (sender, _outbox) = frame_channel_with_source_activity(1, activity.clone());
+        let frame = |p| (p, veil_bufpool::pooled_shared_from_vec(b"frame".to_vec()));
+        let now = Instant::now();
+        activity.note(now);
+        sender.try_send(frame(INTERACTIVE)).unwrap();
+        assert!(sender.try_send(frame(crate::LOCAL_SIGNALING_LANE)).is_err());
+        assert_eq!(activity.admit_reliable_secondary(1, now), Ok(()));
+        let ready = now + std::time::Duration::from_millis(1);
+        let mut pending = Box::pin(sender.send(frame(crate::LOCAL_SIGNALING_LANE)));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), &mut pending)
+                .await
+                .is_err()
+        );
+        assert!(activity.admit_reliable_secondary(1, ready).is_err());
+        drop(pending);
+        assert_eq!(activity.admit_reliable_secondary(1, ready), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn shedding_or_expiring_signaling_releases_data() {
+        let activity =
+            std::sync::Arc::new(crate::local_source_activity::LocalSourceActivity::default());
+        let (sender, mut outbox) = frame_channel_with_source_activity(4, activity.clone());
+        let now = Instant::now();
+        activity.note(now);
+        let frame = |p| (p, veil_bufpool::pooled_shared_from_vec(b"frame".to_vec()));
+        sender
+            .send(frame(crate::LOCAL_SIGNALING_LANE))
+            .await
+            .unwrap();
+        let mut pq = crate::PriorityQueue::with_capacity(crate::DEFAULT_WEIGHTS, 1);
+        pq.push_envelope(outbox.recv_envelope().await.unwrap(), true);
+        assert!(activity.admit_reliable_secondary(1, now).is_err());
+        pq.push(REALTIME, frame(REALTIME).1);
+        assert_eq!(activity.admit_reliable_secondary(1, now), Ok(()));
+        sender
+            .send(frame(crate::LOCAL_SIGNALING_LANE))
+            .await
+            .unwrap();
+        let mut expired = outbox.recv_envelope().await.unwrap();
+        expired.queued_at = now - std::time::Duration::from_secs(6);
+        pq.push_envelope(expired, true);
+        assert_eq!(
+            activity.admit_reliable_secondary(1, now + std::time::Duration::from_millis(1)),
+            Ok(())
+        );
+    }
 
     #[tokio::test]
     async fn own_control_has_reserved_ingress_and_keeps_credit_through_scheduler() {
