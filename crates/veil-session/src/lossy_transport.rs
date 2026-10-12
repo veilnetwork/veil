@@ -178,9 +178,12 @@ impl LossyTransportHandle {
                     .active_record_age
                     .map_or_else(|| "none".to_owned(), |age| age.as_micros().to_string());
                 format!(
-                    "transport=ordered records_reserved_bytes={} record_write_active_us={} records_flushed={} records_expired_outgoing={} records_incoming_bytes={} records_received={} records_evicted_incoming={} records_expired_incoming={}",
+                    "transport=ordered records_reserved_bytes={} record_write_active_us={} record_queue_max_us={} record_write_max_us={} record_receive_queue_max_us={} records_flushed={} records_expired_outgoing={} records_incoming_bytes={} records_received={} records_evicted_incoming={} records_expired_incoming={}",
                     p.reserved_bytes,
                     active_us,
+                    p.max_outgoing_wait.as_micros(),
+                    p.max_write_duration.as_micros(),
+                    p.max_incoming_residence.as_micros(),
                     p.completed_records,
                     p.expired_records,
                     p.incoming_buffered_bytes,

@@ -1127,6 +1127,17 @@ fn media_drop_note(reason: &str, peer: [u8; 32], len: usize) {
 /// only AFTER authentication. Phone wall-clock offsets must be measured
 /// separately before comparing the log timestamps.
 pub(crate) fn trace_sealed_cell(stage: &str, peer: &[u8; 32], payload: &[u8]) {
+    trace_sealed_cell_with_source_queue(stage, peer, payload, None);
+}
+
+/// Source-local cumulative age up to the send pump. No wire field or relay
+/// metadata is added; None means this stage has no source-queue observation.
+pub(crate) fn trace_sealed_cell_with_source_queue(
+    stage: &str,
+    peer: &[u8; 32],
+    payload: &[u8],
+    source_queue_max_us: Option<u64>,
+) {
     if !veil_session::rt_trace::rt_trace_enabled()
         || payload.len() < MEDIA_SEALED_HEADER_LEN
         || !payload.starts_with(&MEDIA_SEALED_MAGIC)
@@ -1154,8 +1165,9 @@ pub(crate) fn trace_sealed_cell(stage: &str, peer: &[u8; 32], payload: &[u8]) {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
+        let source_queue_max_us = source_queue_max_us.map_or(-1i128, i128::from);
         log::info!(
-            "media.cell.sample at_ms={at_ms} stage={stage} peer={:02x}{:02x}{:02x}{:02x} epoch={epoch:016x} seq={seq} bytes={} delivery_daemon_age_us={daemon_age_us} delivery_sdk_age_us={sdk_age_us}",
+            "media.cell.sample at_ms={at_ms} stage={stage} peer={:02x}{:02x}{:02x}{:02x} epoch={epoch:016x} seq={seq} bytes={} delivery_daemon_age_us={daemon_age_us} delivery_sdk_age_us={sdk_age_us} source_queue_max_us={source_queue_max_us}",
             peer[0],
             peer[1],
             peer[2],

@@ -1,9 +1,11 @@
-//! Local, opt-in diagnostics for an obfs4 writer blocked on TCP.
+//! Local, opt-in diagnostics for TCP writer progress and kernel backlog.
 //!
 //! No peer addresses, application roles, payloads, wire flags or priorities.
 //! A process-local connection number correlates events. Kernel snapshots are
 //! sampled at the first Pending and on a slow completion/re-poll; elapsed
 //! time includes task scheduling and must not be called network latency.
+//! Successful flushes also sample cumulative kernel high-water marks; accepting
+//! bytes without Pending does not prove that they have reached the peer.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -161,9 +163,23 @@ struct Wait {
     kernel: std::io::Result<KernelSnapshot>,
 }
 
+/// Successful writes can enter a kernel backlog without ever returning
+/// Pending. This diagnostic is role-neutral and changes no socket option.
+#[derive(Default)]
+struct KernelProgress {
+    last_sample: Option<Instant>,
+    last_log: Option<Instant>,
+    samples: u64,
+    rtt_max_us: u64,
+    queued_max_bytes: Option<u32>,
+    notsent_max_bytes: Option<u32>,
+    retransmitted_max_bytes: Option<u64>,
+}
+
 #[derive(Default)]
 pub(crate) struct WriteTrace {
     connection: u64,
+    progress: KernelProgress,
     wait: Option<Wait>,
     last_log: Option<Instant>,
 }
@@ -179,9 +195,62 @@ impl WriteTrace {
     ) {
         if !enabled_cell().load(Ordering::Relaxed) {
             self.wait = None;
+            if self.progress.samples != 0 {
+                self.progress = KernelProgress::default();
+            }
             return;
         }
-        self.observe_enabled(stream, operation, pending, ciphertext_bytes, Instant::now());
+        let now = Instant::now();
+        if operation == "flush" {
+            self.observe_kernel_progress(stream, now);
+        }
+        self.observe_enabled(stream, operation, pending, ciphertext_bytes, now);
+    }
+
+    fn observe_kernel_progress(&mut self, stream: &TcpStream, now: Instant) {
+        // Sample even quick successful flushes, but at most 200 times/second
+        // per connection. All reads are opt-in; no I/O or option is changed.
+        if self
+            .progress
+            .last_sample
+            .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_millis(5))
+        {
+            return;
+        }
+        self.progress.last_sample = Some(now);
+        if self.connection == 0 {
+            self.connection = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
+        }
+        let snapshot = KernelSnapshot::read(stream);
+        if let Ok(kernel) = &snapshot {
+            let p = &mut self.progress;
+            p.samples = p.samples.saturating_add(1);
+            p.rtt_max_us = p.rtt_max_us.max(kernel.rtt_us);
+            if let Some(value) = kernel.queued_bytes {
+                p.queued_max_bytes = Some(p.queued_max_bytes.map_or(value, |old| old.max(value)));
+            }
+            if let Some(value) = kernel.notsent_bytes {
+                p.notsent_max_bytes = Some(p.notsent_max_bytes.map_or(value, |old| old.max(value)));
+            }
+            if let Some(value) = kernel.retransmitted_bytes {
+                p.retransmitted_max_bytes = Some(
+                    p.retransmitted_max_bytes
+                        .map_or(value, |old| old.max(value)),
+                );
+            }
+        }
+        if self
+            .progress
+            .last_log
+            .is_none_or(|last| now.saturating_duration_since(last) >= LOG_INTERVAL)
+        {
+            log::info!(target: "transport.tcp_trace.kernel_progress",
+                "connection={} samples={} rtt_max_us={} queued_max_bytes={:?} notsent_max_bytes={:?} retransmitted_max_bytes={:?} kernel_now={:?}",
+                self.connection, self.progress.samples, self.progress.rtt_max_us,
+                self.progress.queued_max_bytes, self.progress.notsent_max_bytes,
+                self.progress.retransmitted_max_bytes, snapshot);
+            self.progress.last_log = Some(now);
+        }
     }
 
     fn observe_enabled(
@@ -280,5 +349,43 @@ mod tests {
         trace.observe_enabled(&a, "write", true, 800, start + Duration::from_millis(1401));
         assert_eq!(trace.connection, id);
         assert_eq!(trace.wait.as_ref().unwrap().ciphertext_bytes, 800);
+    }
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )
+))]
+mod kernel_progress_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn successful_write_snapshot_preserves_socket_options_and_wire_bytes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, server) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let mut client = client.unwrap();
+        let (mut server, _) = server.unwrap();
+        client.set_nodelay(true).unwrap();
+        client.write_all(b"opaque record").await.unwrap();
+        client.flush().await.unwrap();
+        let mut trace = WriteTrace::default();
+        trace.observe_kernel_progress(&client, Instant::now());
+        assert_eq!(trace.progress.samples, 1);
+        assert!(trace.progress.queued_max_bytes.is_some());
+        assert!(client.nodelay().unwrap());
+        let mut received = [0; 13];
+        server.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"opaque record");
+        assert!(
+            trace.wait.is_none(),
+            "successful writes are not writer stalls"
+        );
     }
 }

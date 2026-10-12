@@ -300,6 +300,7 @@ struct RealtimeSender {
     logged_send_kinds: [u8; LOCAL_TRACE_SLOTS],
     congestion_drops: u64,
     admission_trace: [(u64, u64, u64, Option<std::time::Instant>); LOCAL_TRACE_SLOTS],
+    admission_queue_max_us: [u64; LOCAL_TRACE_SLOTS],
     last_congestion_log: std::time::Instant,
     broken: bool,
     sent_counter: Option<(Arc<parallel_lanes::ParallelDiagnostics>, usize)>,
@@ -318,6 +319,7 @@ impl RealtimeSender {
             logged_send_kinds: [0; LOCAL_TRACE_SLOTS],
             congestion_drops: 0,
             admission_trace: [(0, 0, 0, None); LOCAL_TRACE_SLOTS],
+            admission_queue_max_us: [0; LOCAL_TRACE_SLOTS],
             last_congestion_log: std::time::Instant::now(),
             broken: false,
             sent_counter: None,
@@ -331,7 +333,7 @@ impl RealtimeSender {
         priority: u8,
         outcome: u8,
         independent: bool,
-        available: usize,
+        queue: (usize, std::time::Instant),
     ) {
         if !crate::rt_trace::rt_trace_enabled() {
             return;
@@ -339,6 +341,9 @@ impl RealtimeSender {
         let Some(entry) = self.admission_trace.get_mut(usize::from(priority)) else {
             return;
         };
+        let (available, queued_at) = queue;
+        let max_age = &mut self.admission_queue_max_us[usize::from(priority)];
+        *max_age = (*max_age).max(queued_at.elapsed().as_micros().min(u64::MAX as u128) as u64);
         match outcome {
             0 => entry.0 = entry.0.saturating_add(1),
             1 => entry.1 = entry.1.saturating_add(1),
@@ -354,7 +359,7 @@ impl RealtimeSender {
         logger.info(
             "session.rt_trace.datagram_admission",
             format!(
-                "peer_id={} local_slot={priority} accepted={} buffer_drops={} bandwidth_drops={} queued_wire_bytes={} independent={independent} {}",
+                "peer_id={} local_slot={priority} accepted={} buffer_drops={} bandwidth_drops={} queued_wire_bytes={} outbox_to_transport_max_us={max_age} independent={independent} {}",
                 hex_short(peer), entry.0, entry.1, entry.2,
                 veil_transport::REALTIME_DATAGRAM_BUFFER_BYTES.saturating_sub(available),
                 self.handle.path_trace(),
@@ -4455,7 +4460,7 @@ impl SessionRunner {
         // scheduler boundary implicated by relay-video pauses.
         let mut realtime_writer_blocked_since: Option<std::time::Instant> = None;
         let mut independent_fifo_logged: Option<std::time::Instant> = None;
-        let mut datagram_canonical_trace = (0u64, 0u64, None::<std::time::Instant>);
+        let mut datagram_canonical_trace = (0u64, 0u64, 0u64, None::<std::time::Instant>);
         let mut datagram_boundary_trace = (0u64, None::<std::time::Instant>);
         let mut source_reliable_pressure_logged: Option<std::time::Instant> = None;
         let mut source_reliable_admitted_logged: Option<std::time::Instant> = None;
@@ -4913,7 +4918,7 @@ impl SessionRunner {
                                 outgoing_priority,
                                 1,
                                 using_parallel,
-                                available,
+                                (available, envelope.queued_at),
                             );
                             datagram_drained += 1;
                             continue;
@@ -4937,7 +4942,7 @@ impl SessionRunner {
                                 outgoing_priority,
                                 2,
                                 using_parallel,
-                                available,
+                                (available, envelope.queued_at),
                             );
                             datagram_drained += 1;
                             continue;
@@ -4948,7 +4953,7 @@ impl SessionRunner {
                             outgoing_priority,
                             0,
                             using_parallel,
-                            available,
+                            (available, envelope.queued_at),
                         );
                         self.dispatcher.capture_outbound(self.peer_id, outgoing);
                         let mut sent_wire_len = 0usize;
@@ -5094,7 +5099,11 @@ impl SessionRunner {
                         .is_some_and(|lane| lane.parallel.is_some())
                         && let Some(age) = pq.independent_transit_behind_stream_head(|frame| {
                             realtime_lane.as_ref().is_some_and(|lane| {
-                                datagram_lane_supports_frame(frame, lane.peer_circuit_datagrams, lane.peer_neutral_forwards)
+                                datagram_lane_supports_frame(
+                                    frame,
+                                    lane.peer_circuit_datagrams,
+                                    lane.peer_neutral_forwards,
+                                )
                             })
                         })
                         && age.as_millis() >= crate::rt_trace::SLOW_DISPATCH_MS
@@ -5427,13 +5436,20 @@ impl SessionRunner {
                         if drained_this_pass > datagram_drained + 1 {
                             datagram_canonical_trace.1 = datagram_canonical_trace.1.saturating_add(1);
                         }
-                        if datagram_canonical_trace.2.is_none_or(|last| {
+                        let independent_ingress = envelope.carrier.as_ref()
+                            .and_then(|carrier| carrier.upgrade())
+                            .is_some_and(|carrier| carrier.local_ingress_flow().is_some());
+                        let first_independent = independent_ingress && datagram_canonical_trace.2 == 0;
+                        if independent_ingress {
+                            datagram_canonical_trace.2 = datagram_canonical_trace.2.saturating_add(1);
+                        }
+                        if first_independent || datagram_canonical_trace.3.is_none_or(|last| {
                             now.saturating_duration_since(last) >= std::time::Duration::from_secs(1)
                         }) {
-                            datagram_canonical_trace.2 = Some(now);
+                            datagram_canonical_trace.3 = Some(now);
                             self.logger.info(
                                 "session.rt_trace.datagram_canonical_selection",
-                                format!("eligible={} after_stream={}", datagram_canonical_trace.0, datagram_canonical_trace.1),
+                                format!("eligible={} after_stream={} independent_ingress={}", datagram_canonical_trace.0, datagram_canonical_trace.1, datagram_canonical_trace.2),
                             );
                         }
                     }

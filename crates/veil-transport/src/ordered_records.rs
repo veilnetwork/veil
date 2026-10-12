@@ -52,6 +52,7 @@ pub enum RecordSendError {
 
 struct Record {
     wire: Vec<u8>,
+    queued_at: Instant,
     expires_at: Instant,
     // Retained through the final flush, not released on queue dequeue or on
     // plaintext acceptance by a buffered transport.
@@ -61,6 +62,8 @@ struct Record {
 #[derive(Default)]
 struct Progress {
     active_since: Option<Instant>,
+    max_outgoing_wait: Duration,
+    max_write_duration: Duration,
     completed: u64,
     expired: u64,
     received: u64,
@@ -78,6 +81,7 @@ struct ReceivedRecord {
 struct Incoming {
     records: VecDeque<ReceivedRecord>,
     reserved_bytes: usize,
+    max_residence: Duration,
 }
 
 impl Incoming {
@@ -89,6 +93,9 @@ impl Incoming {
             .is_some_and(|r| now.saturating_duration_since(r.queued_at) >= max_age)
         {
             let record = self.records.pop_front().unwrap();
+            self.max_residence = self
+                .max_residence
+                .max(now.saturating_duration_since(record.queued_at));
             self.reserved_bytes -= record.charge;
             expired += 1;
         }
@@ -111,6 +118,12 @@ struct Inner {
 pub struct RecordProgress {
     pub reserved_bytes: usize,
     pub active_record_age: Option<Duration>,
+    /// Cumulative residence before the writer starts, including expired work.
+    pub max_outgoing_wait: Duration,
+    /// Cumulative write/flush attempt duration, including closed attempts.
+    pub max_write_duration: Duration,
+    /// Cumulative receive residence, including eviction, expiry and closure.
+    pub max_incoming_residence: Duration,
     pub completed_records: u64,
     pub expired_records: u64,
     pub incoming_buffered_bytes: usize,
@@ -177,6 +190,7 @@ impl OrderedRecordHandle {
             .outgoing
             .send(Record {
                 wire,
+                queued_at: now,
                 expires_at,
                 _bytes: permit,
             })
@@ -203,6 +217,7 @@ impl OrderedRecordHandle {
                     p.expired_incoming = p.expired_incoming.saturating_add(expired);
                 }
                 if let Some(record) = q.records.pop_front() {
+                    q.max_residence = q.max_residence.max(record.queued_at.elapsed());
                     q.reserved_bytes -= record.charge;
                     return Ok(record.bytes);
                 }
@@ -218,6 +233,9 @@ impl OrderedRecordHandle {
     pub fn close(&self) {
         self.0.closed.cancel();
         let mut q = self.0.incoming.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(oldest) = q.records.front() {
+            q.max_residence = q.max_residence.max(oldest.queued_at.elapsed());
+        }
         q.records.clear();
         q.reserved_bytes = 0;
     }
@@ -237,6 +255,15 @@ impl OrderedRecordHandle {
         RecordProgress {
             reserved_bytes: RECORD_BUFFER_BYTES - self.0.capacity.available_permits(),
             active_record_age: p.active_since.map(|at| at.elapsed()),
+            max_outgoing_wait: p.max_outgoing_wait,
+            max_write_duration: p
+                .max_write_duration
+                .max(p.active_since.map_or(Duration::ZERO, |at| at.elapsed())),
+            max_incoming_residence: q.max_residence.max(
+                q.records
+                    .front()
+                    .map_or(Duration::ZERO, |record| record.queued_at.elapsed()),
+            ),
             completed_records: p.completed,
             expired_records: p.expired,
             incoming_buffered_bytes: q.reserved_bytes,
@@ -308,12 +335,10 @@ struct CloseOnExit(OrderedRecordHandle);
 impl Drop for CloseOnExit {
     fn drop(&mut self) {
         self.0.close();
-        self.0
-            .0
-            .progress
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .active_since = None;
+        let mut p = self.0.0.progress.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = p.active_since.take() {
+            p.max_write_duration = p.max_write_duration.max(at.elapsed());
+        }
     }
 }
 
@@ -348,6 +373,9 @@ async fn read_records<R: tokio::io::AsyncRead + Unpin>(mut reader: R, handle: Or
                         .records
                         .pop_front()
                         .expect("bounded record fits empty queue");
+                    q.max_residence = q
+                        .max_residence
+                        .max(now.saturating_duration_since(oldest.queued_at));
                     q.reserved_bytes -= oldest.charge;
                     dropped += 1;
                 }
@@ -381,17 +409,18 @@ async fn write_records<W: tokio::io::AsyncWrite + Unpin>(
     let _close = CloseOnExit(handle.clone());
     let writing = async {
         while let Some(record) = outgoing.recv().await {
-            if record.expires_at <= Instant::now() {
+            let now = Instant::now();
+            {
                 let mut p = handle.0.progress.lock().unwrap_or_else(|e| e.into_inner());
-                p.expired = p.expired.saturating_add(1);
-                continue;
+                p.max_outgoing_wait = p
+                    .max_outgoing_wait
+                    .max(now.saturating_duration_since(record.queued_at));
+                if record.expires_at <= now {
+                    p.expired = p.expired.saturating_add(1);
+                    continue;
+                }
+                p.active_since = Some(now);
             }
-            handle
-                .0
-                .progress
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .active_since = Some(Instant::now());
             let write = async {
                 // Cancellation for expiry is safe ONLY before the first
                 // successful write: Pending consumed no bytes. Once even one
@@ -429,7 +458,9 @@ async fn write_records<W: tokio::io::AsyncWrite + Unpin>(
                 _ => return,
             };
             let mut p = handle.0.progress.lock().unwrap_or_else(|e| e.into_inner());
-            p.active_since = None;
+            if let Some(at) = p.active_since.take() {
+                p.max_write_duration = p.max_write_duration.max(at.elapsed());
+            }
             if complete {
                 p.completed = p.completed.saturating_add(1);
             } else {
