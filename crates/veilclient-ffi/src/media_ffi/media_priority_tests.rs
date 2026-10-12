@@ -123,6 +123,148 @@ fn relay_video_assembler_admits_a_complete_frame_atomically() {
     assert_eq!(frame[2][8], 3);
 }
 
+#[tokio::test]
+async fn relay_frame_repair_and_control_cannot_renew_original_fragment_age() {
+    let (audio, _audio_rx) = mpsc::channel(1);
+    let (video, mut video_rx) = mpsc::channel(3);
+    let ingress = MediaIngress::new(
+        audio,
+        MediaVideoIngress::relay_frames(video, Arc::default()),
+    );
+    let now = tokio::time::Instant::now();
+    let original_deadline = now + Duration::from_millis(50);
+    let repair_deadline = now + Duration::from_millis(180);
+    let control_deadline = now + Duration::from_millis(190);
+    let prefix = video_packet(8, false, 1);
+    let repair = video_packet(7, false, 2);
+    let tail = video_packet(8, true, 3);
+    let control = vec![0x80, 201, 0, 1, 1, 2, 3, 4];
+    assert_eq!(
+        ingress.enqueue(QueuedMediaPacket {
+            payload: prefix.clone(),
+            deadline: original_deadline,
+        }),
+        0
+    );
+    assert_eq!(
+        ingress.enqueue(QueuedMediaPacket {
+            payload: repair.clone(),
+            deadline: repair_deadline,
+        }),
+        0
+    );
+    assert_eq!(
+        ingress.enqueue_video_control(QueuedMediaPacket {
+            payload: control.clone(),
+            deadline: control_deadline,
+        }),
+        0
+    );
+    assert_eq!(
+        ingress.enqueue(QueuedMediaPacket {
+            payload: tail.clone(),
+            deadline: now + MEDIA_LOCAL_QUEUE_AGE,
+        }),
+        0
+    );
+    for (expected, deadline) in [
+        (vec![repair], repair_deadline),
+        (vec![control], control_deadline),
+        (vec![prefix, tail], original_deadline),
+    ] {
+        let frame = video_rx.try_recv().unwrap();
+        assert_eq!(frame.packets, expected);
+        assert_eq!(
+            tokio::time::Instant::from_std(frame.enqueued_at + MEDIA_LOCAL_QUEUE_AGE),
+            deadline
+        );
+    }
+}
+
+#[tokio::test]
+async fn relay_marker_with_older_admission_must_set_the_whole_frame_deadline() {
+    let (audio, _audio_rx) = mpsc::channel(1);
+    let (video, mut video_rx) = mpsc::channel(1);
+    let ingress = MediaIngress::new(
+        audio,
+        MediaVideoIngress::relay_frames(video, Arc::default()),
+    );
+    let now = tokio::time::Instant::now();
+    let deadline = now + Duration::from_millis(30);
+    assert_eq!(
+        ingress.enqueue(QueuedMediaPacket {
+            payload: video_packet(7, false, 1),
+            deadline: now + Duration::from_millis(150),
+        }),
+        0
+    );
+    assert_eq!(
+        ingress.enqueue(QueuedMediaPacket {
+            payload: video_packet(7, true, 2),
+            deadline,
+        }),
+        0
+    );
+    let frame = video_rx.try_recv().unwrap();
+    assert_eq!(frame.packets.len(), 2);
+    assert_eq!(
+        tokio::time::Instant::from_std(frame.enqueued_at + MEDIA_LOCAL_QUEUE_AGE),
+        deadline
+    );
+}
+
+#[tokio::test]
+async fn stale_assembled_video_never_seals_or_precedes_a_fresh_frame() {
+    let (audio, _audio_rx) = mpsc::channel(1);
+    let (video, video_rx) = mpsc::channel(2);
+    let stats = Arc::new(RelayMediaStats::default());
+    let ingress = MediaIngress::new(
+        audio,
+        MediaVideoIngress::relay_frames(video, Arc::clone(&stats)),
+    );
+    assert_eq!(
+        ingress.enqueue(QueuedMediaPacket {
+            payload: video_packet(7, false, 1),
+            deadline: tokio::time::Instant::now() - Duration::from_millis(1),
+        }),
+        0
+    );
+    assert_eq!(ingress.enqueue(video_packet(7, true, 2).into()), 0);
+    let fresh = video_packet(8, true, 3);
+    assert_eq!(ingress.enqueue(fresh.clone().into()), 0);
+    drop(ingress);
+    let peer = [0xd5; 32];
+    let cipher = Arc::new(cipher_for_test(&peer, &[1; 32], &[2; 32]).unwrap());
+    let receiver = cipher_for_test(&peer, &[2; 32], &[1; 32]).unwrap();
+    let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        drain_relay_video(
+            video_rx,
+            Arc::new(AtomicU8::new(MEDIA_BATCHING_OFF)),
+            cipher,
+            stats,
+            move |cell| {
+                sent_tx.send(cell).unwrap();
+                async { true }
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    let cell = sent_rx.try_recv().expect("fresh frame is sent");
+    assert_eq!(receiver.open(cell.as_bytes()), Some(fresh));
+    assert_eq!(
+        u64::from_be_bytes(cell.as_bytes()[12..20].try_into().unwrap()),
+        1,
+        "stale frame must not consume media nonces"
+    );
+    assert!(
+        sent_rx.try_recv().is_err(),
+        "stale frame must not reach transport"
+    );
+}
+
 #[test]
 fn relay_video_assembler_discards_an_unterminated_old_frame() {
     let mut assembler = RelayVideoFrameAssembler::default();
