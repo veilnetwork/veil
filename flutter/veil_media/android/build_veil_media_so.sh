@@ -55,6 +55,9 @@ e=next(x for x in cc if x.get('file','').endswith('call/call.cc'))
 cmd=(e['command'] if e.get('command') else ' '.join(e['arguments'])).strip()
 s=re.search(r'(\S*call/call\.cc)',cmd).group(1)
 cmd=cmd.replace(s,src); cmd=re.sub(r'-o\s+\S+','-o '+out,cmd)
+# Each veil TU owns its temporary dependency file. Reusing call.cc's -MF
+# overwrites WebRTC's cached dependency graph and rejects a read-only cache.
+cmd=re.sub(r'-MF\s+\S+', '-MF '+out+'.d', cmd)
 # Retarget the veil TUs to android API 26: the AAudio ADM uses AAudio APIs
 # introduced in 26, and libwebrtc is built at a lower min API (23) which makes
 # those calls -Werror,-Wunguarded-availability. veil's AAudio path is API 26+
