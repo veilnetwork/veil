@@ -1780,7 +1780,7 @@ impl MediaIngress {
                 if contended.swap(false, AcqRel) {
                     assembler.discard_after_contention();
                 }
-                let result = assembler.push(payload.payload);
+                let result = assembler.push_before(payload.payload, payload.deadline);
                 if contended.swap(false, AcqRel) {
                     // A concurrent callback dropped a fragment while this
                     // callback was building the frame. Discard its prefix/tail.
@@ -1797,9 +1797,13 @@ impl MediaIngress {
                     }
                     RelayVideoFramePush::Complete(packets) => {
                         stats.enqueue_frame();
+                        let deadline = assembler
+                            .completed_deadline
+                            .take()
+                            .expect("complete frame retains its original deadline");
                         let frame = RelayVideoFrame {
                             packets,
-                            enqueued_at: std::time::Instant::now(),
+                            enqueued_at: deadline.into_std() - MEDIA_LOCAL_QUEUE_AGE,
                         };
                         match tx.try_send(frame) {
                             Ok(()) => 0,
@@ -2093,6 +2097,8 @@ struct RelayVideoFrameAssembler {
     // timestamps are serial numbers; ordinary wrap is not a backwards frame.
     newest_timestamp: Option<u32>,
     timestamp: Option<u32>,
+    frame_deadline: Option<tokio::time::Instant>,
+    completed_deadline: Option<tokio::time::Instant>,
     packets: Vec<Vec<u8>>,
     bytes: usize,
 }
@@ -2106,7 +2112,17 @@ enum RelayVideoFramePush {
 
 #[cfg(feature = "node-embedded")]
 impl RelayVideoFrameAssembler {
+    #[cfg(test)]
     fn push(&mut self, packet: Vec<u8>) -> RelayVideoFramePush {
+        self.push_before(packet, tokio::time::Instant::now() + MEDIA_LOCAL_QUEUE_AGE)
+    }
+
+    fn push_before(
+        &mut self,
+        packet: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> RelayVideoFramePush {
+        self.completed_deadline = None;
         if packet.len() < 8 || (packet[0] >> 6) != 2 {
             self.reset();
             return RelayVideoFramePush::Dropped;
@@ -2124,6 +2140,9 @@ impl RelayVideoFrameAssembler {
             if packet.len() > RELAY_VIDEO_FRAME_MAX_BYTES {
                 return RelayVideoFramePush::Dropped;
             }
+            // Repairs have their own admission lifetime and must not renew or
+            // consume the current original frame's oldest fragment deadline.
+            self.completed_deadline = Some(deadline);
             return RelayVideoFramePush::Complete(vec![packet]);
         }
         self.newest_timestamp = Some(timestamp);
@@ -2140,6 +2159,10 @@ impl RelayVideoFrameAssembler {
             self.reset();
         }
         self.timestamp = Some(timestamp);
+        self.frame_deadline = Some(
+            self.frame_deadline
+                .map_or(deadline, |old| old.min(deadline)),
+        );
         let next_bytes = self.bytes.saturating_add(packet.len());
         if self.packets.len() >= RELAY_VIDEO_FRAME_MAX_PACKETS
             || next_bytes > RELAY_VIDEO_FRAME_MAX_BYTES
@@ -2155,6 +2178,7 @@ impl RelayVideoFrameAssembler {
         }
         self.timestamp = None;
         self.bytes = 0;
+        self.completed_deadline = self.frame_deadline.take();
         RelayVideoFramePush::Complete(std::mem::take(&mut self.packets))
     }
 
@@ -2165,6 +2189,8 @@ impl RelayVideoFrameAssembler {
 
     fn reset(&mut self) {
         self.timestamp = None;
+        self.frame_deadline = None;
+        self.completed_deadline = None;
         self.packets.clear();
         self.bytes = 0;
     }
