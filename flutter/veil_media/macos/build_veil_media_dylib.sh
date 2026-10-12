@@ -48,6 +48,9 @@ e=next(x for x in cc if x.get('file','').endswith('call/call.cc'))
 cmd=e['command'] if e.get('command') else ' '.join(e['arguments'])
 s=re.search(r'(\S*call/call\.cc)',cmd).group(1)
 cmd=cmd.replace(s,src); cmd=re.sub(r'-o\s+\S+','-o '+out,cmd)
+# Keep veil's dependency files beside its temporary objects, leaving the
+# WebRTC cache's original call.cc dependency graph intact.
+cmd=re.sub(r'-MF\s+\S+', '-MF '+out+'.d', cmd)
 extra='-DVEIL_MEDIA_HAVE_WEBRTC=1 -I'+shimdir
 if src.endswith(('veil_media_engine.cc', 'veil_avf_adm.mm')) and os.environ.get('VEIL_MEDIA_TEST_HOOKS') == '1':
     extra+=' -DVEIL_MEDIA_TEST_HOOKS=1'
