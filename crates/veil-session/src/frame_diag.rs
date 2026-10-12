@@ -70,8 +70,15 @@ pub fn note_chunk_body(stage: &str, node: Option<&[u8; 32]>, body: &[u8]) {
     if CHUNKS_SEEN.fetch_add(1, Ordering::Relaxed) >= 100_000 {
         return;
     }
+    // Host wall clock, for correlation inside an owned same-host fixture only.
+    // Never a cross-device one-way latency measurement or a wire timestamp.
+    let at_unix_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .min(u64::MAX as u128) as u64;
     log::info!(
-        "delivery.chunk_trace stage={stage} node={} hop={} origin={} transfer={} content={} index={} count={} bytes={} age_secs={} ttl_secs={}",
+        "delivery.chunk_trace stage={stage} at_unix_us={at_unix_us} node={} hop={} origin={} transfer={} content={} index={} count={} bytes={} age_secs={} ttl_secs={}",
         node.map_or_else(|| "-".to_owned(), |n| hex_prefix(n, 4)),
         hex_prefix(&forward.next_hop_node_id, 4),
         hex_prefix(&forward.envelope.sender_node_id, 4),
@@ -80,12 +87,17 @@ pub fn note_chunk_body(stage: &str, node: Option<&[u8; 32]>, body: &[u8]) {
         chunk.chunk_index,
         chunk.chunk_count,
         chunk.data.len(),
-        veil_util::unix_secs_now_u64().saturating_sub(forward.envelope.created_at),
+        (at_unix_us / 1_000_000).saturating_sub(forward.envelope.created_at),
         forward.envelope.ttl_secs,
     );
 }
 
 pub fn note_chunk_frame(stage: &str, frame: &[u8]) {
+    note_chunk_frame_at(stage, None, frame);
+}
+
+/// Record the selecting session's local node without attributing a source role.
+pub fn note_chunk_frame_at(stage: &str, node: Option<&[u8; 32]>, frame: &[u8]) {
     if !*CHUNKS.get_or_init(|| std::env::var("VEIL_DIAG_CHUNKS").is_ok_and(|v| v == "1")) {
         return;
     }
@@ -97,7 +109,7 @@ pub fn note_chunk_frame(stage: &str, frame: &[u8]) {
     {
         return;
     }
-    note_chunk_body(stage, None, &frame[veil_proto::header::HEADER_SIZE..]);
+    note_chunk_body(stage, node, &frame[veil_proto::header::HEADER_SIZE..]);
 }
 
 /// First `LOUD` matches get a full backtrace; after that one in `EVERY` does,

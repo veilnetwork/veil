@@ -221,7 +221,17 @@ impl LocalSourceActivity {
             {
                 state.reliable_waiters.push_back(id);
             }
-            if let Some(next) = state.reliable_next.filter(|next| now < *next) {
+            // Both producers spend the same endpoint uplink. A periodic
+            // control must not add its allowance on top of a file burst.
+            // Retain DATA's existing byte debt and FIFO turn while it yields;
+            // signaling and route recovery never wait behind DATA here.
+            if let Some(next) = state
+                .reliable_next
+                .into_iter()
+                .chain(state.signaling_next)
+                .filter(|next| now < *next)
+                .max()
+            {
                 return Err(next.min(until));
             }
             if let Some(id) = source {
@@ -258,9 +268,7 @@ impl LocalSourceActivity {
                 let steps =
                     now.saturating_duration_since(since).as_nanos() / RELIABLE_RAMP_STEP.as_nanos();
                 let max_steps = (RELIABLE_SECONDARY_BYTES / PRESSURED_RELIABLE_BYTES - 1) as u128;
-                PRESSURED_RELIABLE_BYTES.saturating_mul(
-                    1 + steps.min(max_steps) as usize,
-                )
+                PRESSURED_RELIABLE_BYTES.saturating_mul(1 + steps.min(max_steps) as usize)
             } else {
                 // Legacy callers without negotiated local feedback retain
                 // their existing allowance. No remote frame enables ramping.
@@ -483,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn signaling_debt_does_not_block_data_recovery_or_idle_call_setup() {
+    fn signaling_yields_data_but_keeps_recovery_and_idle_call_setup() {
         let activity = LocalSourceActivity::default();
         let now = Instant::now();
         assert_eq!(activity.admit_signaling(usize::MAX, now), Ok(()));
@@ -491,13 +499,20 @@ mod tests {
         activity.note(now);
         activity.note_pressure(now);
         assert_eq!(activity.admit_signaling(8192, now), Ok(()));
-        assert_eq!(activity.admit_reliable_secondary(1024, now), Ok(()));
+        assert_eq!(
+            activity.admit_reliable_secondary(1024, now),
+            Err(now + Duration::from_millis(400))
+        );
         assert_eq!(activity.admit_network_control(1024, now), Ok(()));
         assert_eq!(
             activity.admit_signaling(1, now),
             Err(now + Duration::from_millis(400))
         );
         assert_eq!(activity.signaling_wait(now + IDLE_GRACE), None);
+        assert_eq!(
+            activity.admit_reliable_secondary(1024, now + IDLE_GRACE),
+            Ok(())
+        );
         assert_eq!(activity.admit_signaling(1024, now + IDLE_GRACE), Ok(()));
         let resumed = now + IDLE_GRACE;
         activity.note(resumed);
@@ -507,6 +522,46 @@ mod tests {
         );
         activity.note(resumed + IDLE_GRACE);
         assert_eq!(activity.admit_signaling(1024, resumed + IDLE_GRACE), Ok(()));
+    }
+
+    #[test]
+    fn signaling_yield_retains_longer_data_debt() {
+        let activity = LocalSourceActivity::default();
+        let now = Instant::now();
+        activity.note(now);
+        assert_eq!(activity.admit_reliable_secondary(8192, now), Ok(()));
+        let control_at = now + Duration::from_millis(100);
+        assert_eq!(activity.admit_signaling(4096, control_at), Ok(()));
+        assert_eq!(
+            activity.admit_reliable_secondary(1024, control_at),
+            Err(now + Duration::from_millis(400))
+        );
+        assert_eq!(
+            activity.admit_reliable_secondary(1024, now + Duration::from_millis(400)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn data_waiting_for_signaling_keeps_fair_turns_across_neighbors() {
+        let activity = Arc::new(LocalSourceActivity::default());
+        let first = activity.reliable_source();
+        let second = activity.reliable_source();
+        let now = Instant::now();
+        activity.note(now);
+        assert_eq!(activity.admit_signaling(1024, now), Ok(()));
+        let ready = now + Duration::from_millis(50);
+        assert_eq!(first.admit(1024, now), Err(ready));
+        assert_eq!(second.admit(1024, now), Err(ready));
+        assert_eq!(
+            second.admit(1024, ready),
+            Err(ready + Duration::from_millis(10))
+        );
+        assert_eq!(first.admit(1024, ready), Ok(()));
+        assert_eq!(
+            second.admit(1024, ready + Duration::from_millis(50)),
+            Ok(())
+        );
     }
 
     #[test]
