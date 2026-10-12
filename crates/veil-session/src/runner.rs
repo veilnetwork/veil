@@ -657,6 +657,30 @@ fn decode_realtime_lane_frame(frame: &[u8]) -> Option<(FrameHeader, &[u8], Realt
     Some((header, body, kind))
 }
 
+/// Transport capability only; no application role is inspected here.
+fn datagram_lane_supports_frame(frame: &[u8], circuit: bool, neutral: bool) -> bool {
+    decode_realtime_lane_frame(frame).is_some_and(|(_, body, kind)| {
+        (kind != RealtimeLaneFrameKind::CircuitDatagram || circuit)
+            && (kind != RealtimeLaneFrameKind::RelayForward
+                || body.last() != Some(&veil_proto::priority::INTERACTIVE)
+                || neutral)
+    })
+}
+
+/// Once the ordinary pass exposes a new FIFO head, retry its negotiated
+/// datagram transport before placing it on the canonical ordered carrier.
+/// No head is skipped. With no ordinary progress, preserve the fallback for
+/// a head already attempted by the preceding datagram pass.
+fn retry_datagram_head(
+    frame: &[u8],
+    capabilities: Option<(bool, bool)>,
+    ordinary_progress: bool,
+) -> bool {
+    ordinary_progress
+        && capabilities
+            .is_some_and(|(circuit, neutral)| datagram_lane_supports_frame(frame, circuit, neutral))
+}
+
 /// Source-only classification also covers the old ordered circuit discriminant.
 /// Remote forwarding is excluded by its trusted local slot and return carrier.
 fn local_primary_stream_frame(priority: u8, frame: &[u8]) -> bool {
@@ -4430,6 +4454,9 @@ impl SessionRunner {
         // preserves the protocol and payload privacy while measuring the exact
         // scheduler boundary implicated by relay-video pauses.
         let mut realtime_writer_blocked_since: Option<std::time::Instant> = None;
+        let mut independent_fifo_logged: Option<std::time::Instant> = None;
+        let mut datagram_canonical_trace = (0u64, 0u64, None::<std::time::Instant>);
+        let mut datagram_boundary_trace = (0u64, None::<std::time::Instant>);
         let mut source_reliable_pressure_logged: Option<std::time::Instant> = None;
         let mut source_reliable_admitted_logged: Option<std::time::Instant> = None;
         let mut ordered_primary_pressure_logged: Option<std::time::Instant> = None;
@@ -4717,13 +4744,11 @@ impl SessionRunner {
                     }
                     for _ in 0..PQ_DRAIN_FRAMES_PER_PASS {
                         let supported = |frame: &[u8]| {
-                            decode_realtime_lane_frame(frame).is_some_and(|(_, body, kind)| {
-                                (kind != RealtimeLaneFrameKind::CircuitDatagram
-                                    || lane.peer_circuit_datagrams)
-                                    && (kind != RealtimeLaneFrameKind::RelayForward
-                                        || body.last() != Some(&veil_proto::priority::INTERACTIVE)
-                                        || lane.peer_neutral_forwards)
-                            })
+                            datagram_lane_supports_frame(
+                                frame,
+                                lane.peer_circuit_datagrams,
+                                lane.peer_neutral_forwards,
+                            )
                         };
                         let signaling_wait = lane
                             .source_activity
@@ -5064,6 +5089,36 @@ impl SessionRunner {
                     );
                 }
                 if crate::rt_trace::rt_trace_enabled() {
+                    if realtime_lane
+                        .as_ref()
+                        .is_some_and(|lane| lane.parallel.is_some())
+                        && let Some(age) = pq.independent_transit_behind_stream_head(|frame| {
+                            realtime_lane.as_ref().is_some_and(|lane| {
+                                datagram_lane_supports_frame(frame, lane.peer_circuit_datagrams, lane.peer_neutral_forwards)
+                            })
+                        })
+                        && age.as_millis() >= crate::rt_trace::SLOW_DISPATCH_MS
+                    {
+                        let now = std::time::Instant::now();
+                        if independent_fifo_logged.is_none_or(|last| {
+                            now.saturating_duration_since(last) >= std::time::Duration::from_secs(1)
+                        }) {
+                            independent_fifo_logged = Some(now);
+                            let at_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis();
+                            self.logger.info(
+                                "session.rt_trace.independent_fifo_wait",
+                                format!(
+                                    "at_ms={at_ms} oldest_wait_ms={} pq_depth={} canonical_writer_capacity={}",
+                                    age.as_millis(),
+                                    pq.len(),
+                                    wire_tx.capacity()
+                                ),
+                            );
+                        }
+                    }
                     let realtime_blocked = pq.peek_priority()
                         == Some(veil_proto::priority::REALTIME)
                         && wire_tx.capacity() == 0;
@@ -5200,6 +5255,25 @@ impl SessionRunner {
                         use crate::priority_queue::HeadAdmission;
                         use crate::reliable_frames::FrameReservationError;
                         use reliable_streams::Route;
+                        if retry_datagram_head(
+                            frame,
+                            realtime_lane.as_ref().map(|lane| (lane.peer_circuit_datagrams, lane.peer_neutral_forwards)),
+                            drained_this_pass > datagram_drained,
+                        ) {
+                            if crate::rt_trace::rt_trace_enabled() {
+                                datagram_boundary_trace.0 = datagram_boundary_trace.0.saturating_add(1);
+                                if datagram_boundary_trace.1.is_none_or(|last| {
+                                    now.saturating_duration_since(last) >= std::time::Duration::from_secs(1)
+                                }) {
+                                    datagram_boundary_trace.1 = Some(now);
+                                    self.logger.info(
+                                        "session.rt_trace.datagram_batch_boundary",
+                                        format!("retries={}", datagram_boundary_trace.0),
+                                    );
+                                }
+                            }
+                            return HeadAdmission::FlushBatch;
+                        }
                         let route = reliable_streams.route(frame, reliable_id);
                         let reservation = match route {
                             Route::Failed => { selected_route = route; return HeadAdmission::Allow; },
@@ -5343,6 +5417,25 @@ impl SessionRunner {
                         rekey.record_bytes(bytes as u64);
                         mlkem_rekey.record_bytes(bytes as u64);
                         continue;
+                    }
+                    if crate::rt_trace::rt_trace_enabled()
+                        && realtime_lane.as_ref().is_some_and(|lane| {
+                            datagram_lane_supports_frame(&envelope.frame.1, lane.peer_circuit_datagrams, lane.peer_neutral_forwards)
+                        })
+                    {
+                        datagram_canonical_trace.0 = datagram_canonical_trace.0.saturating_add(1);
+                        if drained_this_pass > datagram_drained + 1 {
+                            datagram_canonical_trace.1 = datagram_canonical_trace.1.saturating_add(1);
+                        }
+                        if datagram_canonical_trace.2.is_none_or(|last| {
+                            now.saturating_duration_since(last) >= std::time::Duration::from_secs(1)
+                        }) {
+                            datagram_canonical_trace.2 = Some(now);
+                            self.logger.info(
+                                "session.rt_trace.datagram_canonical_selection",
+                                format!("eligible={} after_stream={}", datagram_canonical_trace.0, datagram_canonical_trace.1),
+                            );
+                        }
                     }
                     reliable_streams.admitted(&envelope.frame.1, reliable_streams::Route::Canonical);
                     let local_primary = envelope.carrier.is_none()
@@ -7034,6 +7127,84 @@ mod realtime_lane_frame_tests {
                     .is_some()
             );
         }
+    }
+
+    #[test]
+    fn newly_exposed_neutral_fifo_head_retries_its_datagram_transport() {
+        use crate::priority_queue::HeadAdmission;
+        use veil_proto::priority::INTERACTIVE;
+        let ordinary = frame(
+            FrameFamily::Delivery,
+            DeliveryMsg::Forward as u16,
+            &ForwardPayload {
+                traffic_class: None,
+                ..relay_forward()
+            }
+            .encode(),
+        );
+        let transit = frame(
+            FrameFamily::Delivery,
+            DeliveryMsg::Forward as u16,
+            &ForwardPayload {
+                traffic_class: Some(INTERACTIVE),
+                ..relay_forward()
+            }
+            .encode(),
+        );
+        assert!(!datagram_lane_supports_frame(&ordinary, true, true));
+        assert!(datagram_lane_supports_frame(&transit, true, true));
+        for capabilities in [None, Some((true, false)), Some((true, true))] {
+            let mut pq = PriorityQueue::with_default_weights();
+            for bytes in [&ordinary, &transit, &ordinary] {
+                enqueue_outbox_frame(
+                    &mut pq,
+                    INTERACTIVE,
+                    veil_bufpool::pooled_shared_from_vec(bytes.clone()),
+                );
+            }
+            // The first datagram pass cannot skip the ordinary FIFO head.
+            assert!(
+                pq.pop_datagram_if(|bytes| datagram_lane_supports_frame(bytes, true, true))
+                    .is_none()
+            );
+            let mut ordinary_count = 0;
+            while let Some(envelope) = pq.pop_admitted_envelope(|_, bytes, _| {
+                if retry_datagram_head(bytes, capabilities, ordinary_count > 0) {
+                    HeadAdmission::FlushBatch
+                } else {
+                    HeadAdmission::Allow
+                }
+            }) {
+                assert_eq!(
+                    &envelope.frame.1[..],
+                    if ordinary_count == 1 {
+                        &transit[..]
+                    } else {
+                        &ordinary[..]
+                    }
+                );
+                ordinary_count += 1;
+            }
+            if capabilities == Some((true, true)) {
+                assert_eq!(ordinary_count, 1);
+                assert_eq!(pq.len(), 2);
+                assert_eq!(
+                    &pq.pop_datagram_if(|bytes| datagram_lane_supports_frame(bytes, true, true))
+                        .unwrap()
+                        .1[..],
+                    &transit[..]
+                );
+                assert_eq!(&pq.pop().unwrap()[..], &ordinary[..]);
+            } else {
+                // Legacy/unsupported transports keep the ordered compatibility
+                // path and cannot spin forever on an unsupported FIFO head.
+                assert_eq!(ordinary_count, 3);
+            }
+            assert!(pq.is_empty());
+        }
+        // If the preceding datagram attempt failed at this same head, retain
+        // canonical compatibility instead of endlessly retrying the child.
+        assert!(!retry_datagram_head(&transit, Some((true, true)), false));
     }
 
     #[test]
