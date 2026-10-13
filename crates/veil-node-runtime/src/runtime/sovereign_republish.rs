@@ -45,6 +45,36 @@ pub fn adaptive_republish_interval(
     Duration::from_secs(scaled_secs)
 }
 
+/// `route_updated` also wakes lookup waiters for ordinary responses. Compare
+/// actual routing changes and live session registrations before interpreting
+/// that wake-up as a reason to publish a complete identity bundle again.
+/// Session registrations catch same-peer reconnects even if the routing table
+/// never removes the peer; the DHT revision catches remote membership changes.
+#[derive(Debug, PartialEq, Eq)]
+struct ReplicationTopology {
+    routing_revision: u64,
+    sessions: Vec<([u8; 32], u64)>,
+}
+
+impl ReplicationTopology {
+    fn snapshot(
+        dht: &veil_dht::KademliaService,
+        registry: &std::sync::RwLock<veil_session::tx_registry::SessionTxRegistry>,
+    ) -> Self {
+        Self {
+            routing_revision: dht.routing_topology_revision(),
+            sessions: registry
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .live_registration_snapshot(),
+        }
+    }
+
+    fn needs_publish(&self, published: Option<&Self>) -> bool {
+        !self.sessions.is_empty() && published != Some(self)
+    }
+}
+
 impl NodeRuntime {
     /// runtime: periodic re-publish of the node's sovereign
     /// `IdentityDocument` to the DHT. Keeps the record fresh against
@@ -321,14 +351,11 @@ impl NodeRuntime {
                 // map within a tick.
                 let mut registry = super::identity_publish::full_registry(&sov);
 
-                // debounce window for topology-driven republish.
-                // Without it, every PEX walk / route announce / handshake
-                // ack would fire `route_updated.notified` and trigger
-                // a re-fan of K-closest STORE messages. At 60 s minimum
-                // between topology-driven republishes we get O(1)
-                // republishes per minute even on heavy churn — bandwidth
-                // cap is K × value_size × 1/min ≈ 100-500 B/min for a
-                // single identity record. Production-safe on cellular.
+                // Bound complete-bundle republishes under real topology churn.
+                // Lookup responses also wake route_updated; the topology witness
+                // below rejects those without changing waiter notifications.
+                // A changed topology inside the debounce is retried at its end,
+                // even if the new peer sends no further routing frames.
                 #[cfg(any(test, feature = "test-low-difficulty"))]
                 const TOPOLOGY_REPUBLISH_DEBOUNCE: std::time::Duration =
                     std::time::Duration::from_secs(2);
@@ -336,6 +363,9 @@ impl NodeRuntime {
                 const TOPOLOGY_REPUBLISH_DEBOUNCE: std::time::Duration =
                     std::time::Duration::from_secs(60);
                 let mut last_topology_publish_at: Option<tokio::time::Instant> = None;
+                let mut published_topology: Option<ReplicationTopology> = None;
+                let mut pending_topology_at: Option<tokio::time::Instant> = None;
+                let mut next_publish_reason = "warmup";
 
                 loop {
                     tokio::select! {
@@ -350,12 +380,14 @@ impl NodeRuntime {
                         // holds. Until it does, the node is advertising an EK it
                         // has already replaced.
                         _ = mlkem_republish_now.notified() => {
+                            next_publish_reason = "key_rotation";
                             interval.reset_immediately();
                         }
                         _ = first_network_tick.tick(), if first_network_publish_pending => {
                             if sessions_for_first_publish.read().is_ok_and(|reg| !reg.is_empty()) {
                                 first_network_publish_pending = false;
                                 last_topology_publish_at = Some(tokio::time::Instant::now());
+                                next_publish_reason = "first_session";
                                 interval.reset_immediately();
                             }
                         }
@@ -367,6 +399,12 @@ impl NodeRuntime {
                         // waiting for the next 6 h tick.
                         _ = route_updated.notified() => {
                             let now = tokio::time::Instant::now();
+                            let topology = ReplicationTopology::snapshot(
+                                &dht_for_density, &sessions_for_first_publish,
+                            );
+                            if !topology.needs_publish(published_topology.as_ref()) {
+                                continue;
+                            }
                             if first_network_publish_pending {
                                 if !sessions_for_first_publish.read().is_ok_and(|reg| !reg.is_empty()) {
                                     continue;
@@ -375,9 +413,12 @@ impl NodeRuntime {
                             } else if last_topology_publish_at.is_some_and(|last|
                                 now.duration_since(last) < TOPOLOGY_REPUBLISH_DEBOUNCE
                             ) {
+                                pending_topology_at = last_topology_publish_at
+                                    .map(|last| last + TOPOLOGY_REPUBLISH_DEBOUNCE);
                                 continue;
                             }
                             last_topology_publish_at = Some(now);
+                            next_publish_reason = "topology";
                             // THE WHOLE BUNDLE, not the document alone.
                             //
                             // This arm used to re-fan the `IdentityDocument`
@@ -409,6 +450,21 @@ impl NodeRuntime {
                             // to cover every record. The debounce above still
                             // bounds the cost under churn.
                             interval.reset_immediately();
+                        }
+                        _ = async {
+                            if let Some(at) = pending_topology_at {
+                                tokio::time::sleep_until(at).await;
+                            }
+                        }, if pending_topology_at.is_some() => {
+                            pending_topology_at = None;
+                            let topology = ReplicationTopology::snapshot(
+                                &dht_for_density, &sessions_for_first_publish,
+                            );
+                            if topology.needs_publish(published_topology.as_ref()) {
+                                next_publish_reason = "topology";
+                                last_topology_publish_at = Some(tokio::time::Instant::now());
+                                interval.reset_immediately();
+                            }
                         }
                         _ = on_change_tick.tick() => {
                             if let Some(m) = &drop_metrics {
@@ -507,6 +563,19 @@ impl NodeRuntime {
                             }
                         }
                         _ = interval.tick() => {
+                            // Capture BEFORE enqueueing records: a session that
+                            // appears during publication still needs another
+                            // complete bundle. Do not consume a changed witness
+                            // when its notification was merely debounced.
+                            pending_topology_at = None;
+                            published_topology = Some(ReplicationTopology::snapshot(
+                                &dht_for_density, &sessions_for_first_publish,
+                            ));
+                            last_topology_publish_at = Some(tokio::time::Instant::now());
+                            logger.info(
+                                "node.sovereign_identity.replication",
+                                format!("reason={next_publish_reason}"),
+                            );
                             if sessions_for_first_publish.read().is_ok_and(|reg| !reg.is_empty()) {
                                 first_network_publish_pending = false;
                             }
@@ -710,6 +779,11 @@ impl NodeRuntime {
                                     TARGET_ROUTING_TABLE_DENSITY,
                                 )
                             };
+                            next_publish_reason = if next_period == WARMUP_REPUBLISH_PERIOD {
+                                "warmup"
+                            } else {
+                                "scheduled"
+                            };
                             next_republish_at = tokio::time::Instant::now() + next_period;
                             interval = tokio::time::interval_at(
                                 next_republish_at,
@@ -731,6 +805,47 @@ impl NodeRuntime {
 mod tests {
     use super::adaptive_republish_interval;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn topology_gate_ignores_responses_but_retains_first_session_and_reconnect() {
+        use super::ReplicationTopology;
+        use std::sync::RwLock;
+        use veil_dht::{KademliaService, routing::Contact};
+        use veil_session::tx_registry::SessionTxRegistry;
+        let dht = KademliaService::new([0; 32]);
+        let registry = RwLock::new(SessionTxRegistry::new());
+        let offline = ReplicationTopology::snapshot(&dht, &registry);
+        assert!(!offline.needs_publish(None));
+        // First seed works even before the DHT learns its contact.
+        let first = registry.write().unwrap().register([1; 32]);
+        let published = ReplicationTopology::snapshot(&dht, &registry);
+        assert!(published.needs_publish(Some(&offline)));
+        for _ in 0..100 {
+            // Lookup/STORE responses and queue activity do not change topology.
+            dht.store_local([99; 32], vec![1]);
+            registry
+                .read()
+                .unwrap()
+                .send_to(&[1; 32], veil_proto::priority::BACKGROUND, vec![1]);
+            assert!(
+                !ReplicationTopology::snapshot(&dht, &registry).needs_publish(Some(&published))
+            );
+        }
+        let replacement = registry.write().unwrap().register([1; 32]);
+        let reconnect = ReplicationTopology::snapshot(&dht, &registry);
+        assert!(reconnect.needs_publish(Some(&published)));
+        // A debounce must not consume the change before the bundle is sent.
+        assert!(ReplicationTopology::snapshot(&dht, &registry).needs_publish(Some(&published)));
+        assert!(!reconnect.needs_publish(Some(&reconnect)));
+        dht.add_contact_trusted(Contact::new([2; 32], "tcp://remote:9000"));
+        let changed = ReplicationTopology::snapshot(&dht, &registry);
+        assert!(changed.needs_publish(Some(&reconnect)));
+        dht.add_contact_trusted(Contact::new([2; 32], ""));
+        assert!(!ReplicationTopology::snapshot(&dht, &registry).needs_publish(Some(&changed)));
+        drop(replacement);
+        assert!(!ReplicationTopology::snapshot(&dht, &registry).needs_publish(Some(&changed)));
+        drop(first);
+    }
 
     const BASE: Duration = Duration::from_secs(6 * 3600); // 6 hours
 
