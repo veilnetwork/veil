@@ -399,24 +399,37 @@ async fn drain_relay_video_on_plane<F, Fut>(
             RELAY_VIDEO_BATCH_BODY_MAX
         };
         let deadline = tokio::time::Instant::from_std(frame.enqueued_at) + MEDIA_LOCAL_QUEUE_AGE;
+        let packet_count = frame.packets.len();
+        let raw_bytes = frame.packets.iter().map(Vec::len).sum();
         let packets = frame
             .packets
             .into_iter()
             .map(|payload| QueuedMediaPacket { payload, deadline })
             .collect();
-        for queued in timed_media_cells(
+        let cells = timed_media_cells(
             packets,
             mode != MEDIA_BATCHING_OFF,
             max_body,
             RELAY_VIDEO_BATCH_MAX_PACKETS,
-        ) {
+        );
+        let local_priority = match plane {
+            media::LocalMediaPlane::Primary => veil_proto::priority::REALTIME,
+            media::LocalMediaPlane::Secondary => veil_proto::priority::BULK,
+            media::LocalMediaPlane::Screen => veil_proto::priority::BACKGROUND,
+        };
+        let mut trace = veil_session::local_lossy_trace::SourceFrameTrace::new(
+            local_priority, packet_count, raw_bytes, cells.len(),
+        );
+        for queued in cells {
             if queued.expired() {
+                if let Some(trace) = trace.as_mut() { trace.expired(); }
                 continue;
             }
             let cell = queued.payload;
             let Some(sealed) = cipher.seal_on_plane(plane, &cell) else {
                 continue;
             };
+            if let Some(trace) = trace.as_mut() { trace.observe(sealed.as_bytes()); }
             let sealed = sealed.with_local_deadline(queued.deadline);
             drop(cell);
             if !send(sealed).await {

@@ -164,6 +164,7 @@ impl FrameSender {
         envelope.reliable_credit = credit;
         lane.try_send(envelope).map_err(|error| match error {
             mpsc::error::TrySendError::Full(envelope) => {
+                crate::local_lossy_trace::cell("ingress_full", envelope.frame.0, &envelope.frame.1);
                 mpsc::error::TrySendError::Full(envelope.frame)
             }
             mpsc::error::TrySendError::Closed(envelope) => {
