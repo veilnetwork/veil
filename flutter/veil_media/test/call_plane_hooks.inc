@@ -137,14 +137,23 @@ extern "C" int veil_media_test_audio_probe_budget() {
   struct ResetFactory {
     const char* prior = std::getenv("VEIL_MEDIA_TEST_VIDEO");
     std::string saved = prior ? prior : "";
+    const bool had_video_budget = std::getenv("VEIL_MEDIA_VIDEO_KBPS") != nullptr;
+    std::string saved_video_budget = had_video_budget
+        ? std::getenv("VEIL_MEDIA_VIDEO_KBPS") : "";
     ResetFactory() {
       g_call_plane_recording_adm = true;
       setenv("VEIL_MEDIA_TEST_VIDEO", "1", 1);
+      // Explicitly request a large STARTUP video budget. A subsequent ceiling
+      // increase must not reset GCC's live estimate, so retuning a cold room
+      // alone cannot establish the distinct estimates this test compares.
+      setenv("VEIL_MEDIA_VIDEO_KBPS", "900", 1);
     }
     ~ResetFactory() {
       g_call_plane_recording_adm = false;
       if (prior) setenv("VEIL_MEDIA_TEST_VIDEO", saved.c_str(), 1);
       else unsetenv("VEIL_MEDIA_TEST_VIDEO");
+      if (had_video_budget) setenv("VEIL_MEDIA_VIDEO_KBPS", saved_video_budget.c_str(), 1);
+      else unsetenv("VEIL_MEDIA_VIDEO_KBPS");
     }
   } reset;
   uint8_t local[32] = {0x71}, peer[32] = {0x72};

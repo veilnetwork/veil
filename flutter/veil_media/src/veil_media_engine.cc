@@ -90,6 +90,7 @@
 #include "call/audio_state.h"
 #include "call/call.h"
 #include "call/call_config.h"
+#include "video_bitrate_settings.h"
 #include "modules/audio_mixer/audio_mixer_impl.h"
 // --- Video (Phase 4): VP8 send/recv over the same veil channel ---
 #include "call/video_send_stream.h"
@@ -2217,6 +2218,8 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
       }
       kbps = std::clamp(kbps, 30, 2500);
       const int bps = kbps * 1000;
+      ws->video_call->SetClientBitratePreferences(
+          veil_media::video_bitrate_settings(bps, true, true));
       webrtc::VideoEncoderConfig ec;
       ec.codec_type = webrtc::kVideoCodecVP8;
       ec.video_format = webrtc::SdpVideoFormat::VP8();
@@ -2324,10 +2327,8 @@ static int veil_media_group_engine_apply_video_budget(VeilGroupMediaEngine* engi
       layer.max_qp = 63;
       ec.simulcast_layers.push_back(layer);
       ws->video_send_stream->ReconfigureVideoEncoder(std::move(ec));
-      webrtc::BitrateSettings bs;
-      bs.min_bitrate_bps = std::min(30000, bps);
-      bs.max_bitrate_bps = bps + 128000;
-      ws->video_call->SetClientBitratePreferences(bs);
+      ws->video_call->SetClientBitratePreferences(
+          veil_media::video_bitrate_settings(bps, true, false));
       ws->video_target_bitrate_bps = bps;
       ws->video_max_fps.store(fps, std::memory_order_relaxed);
       ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
@@ -3057,14 +3058,12 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
       // estimate; older peers still need the profile floor to keep the encoder
       // and pacer budgets aligned without usable transport feedback.
       {
-        webrtc::BitrateSettings bs;
         // Negotiated feedback lets GCC lower video below the profile under
         // congestion. Older peers supply no usable split transport feedback;
         // retain their profile floor and app-level adaptation.
-        bs.min_bitrate_bps = ws->shim->independent_transport_feedback() ? 30'000 : bps;
-        bs.start_bitrate_bps = bps;
-        bs.max_bitrate_bps = bps + 128'000;  // video retransmission/RTCP headroom
-        ws->video_call->SetClientBitratePreferences(bs);
+        ws->video_call->SetClientBitratePreferences(
+            veil_media::video_bitrate_settings(
+                bps, ws->shim->independent_transport_feedback(), true));
       }
       webrtc::VideoEncoderConfig ec;
       ec.codec_type = webrtc::kVideoCodecVP8;
@@ -3200,11 +3199,10 @@ static int veil_media_engine_apply_video_budget(VeilMediaEngine* engine,
     // Update bounds without resetting GCC's current estimate on a profile
     // change. The legacy no-feedback mode still tracks the whole profile.
     {
-      webrtc::BitrateSettings bs;
-      bs.min_bitrate_bps = ws->shim->independent_transport_feedback() ? std::min(30'000, bps) : bps;
-      if (!ws->shim->independent_transport_feedback()) bs.start_bitrate_bps = bps;
-      bs.max_bitrate_bps = bps + 128'000;
-      ws->video_call->SetClientBitratePreferences(bs);
+      const bool independent_feedback = ws->shim->independent_transport_feedback();
+      ws->video_call->SetClientBitratePreferences(
+          veil_media::video_bitrate_settings(bps, independent_feedback,
+                                            !independent_feedback));
     }
     ws->video_target_bitrate_bps = bps;
     ws->video_max_fps.store(fps, std::memory_order_relaxed);
