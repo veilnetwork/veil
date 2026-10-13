@@ -4,6 +4,8 @@
 //! and `node` need, clock sources, atomic-write retry). Layer-specific
 //! helpers belong in that layer's own `util.rs`.
 
+pub mod diagnostic_clock;
+
 /// Cross-platform mlocked-bytes primitive for secret-key allocations.
 /// See [`mlock::MlockedBytes`].
 pub mod mlock;
