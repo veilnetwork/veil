@@ -348,6 +348,9 @@ pub struct RoutingTable {
     /// peer that restates the default drops out of it. `STATED_CAPS_MAX` caps
     /// it regardless.
     stated_caps: std::collections::HashMap<[u8; 32], (u8, bool)>,
+    /// Changes only when routing membership, transport or eligibility changes.
+    /// Ordinary observations and LRU refreshes must not trigger record fan-out.
+    topology_revision: u64,
     /// Disable rate limit for tests.
     #[cfg(test)]
     pub rate_limit_disabled: bool,
@@ -446,6 +449,7 @@ impl RoutingTable {
             sketch_threshold: 0,
             bucket_rate,
             stated_caps: std::collections::HashMap::new(),
+            topology_revision: 0,
             #[cfg(test)]
             rate_limit_disabled: true, // tests run without rate limit by default
         }
@@ -530,6 +534,11 @@ impl RoutingTable {
         }
     }
 
+    /// Process-local topology witness; not a wire field or persisted version.
+    pub fn topology_revision(&self) -> u64 {
+        self.topology_revision
+    }
+
     /// Insert or update a contact.
     ///
     /// If the contact already exists (matched by `node_id`), it is moved to
@@ -605,8 +614,14 @@ impl RoutingTable {
             // Same rule for the transport: post-handshake bookkeeping inserts
             // an empty one, and an empty string is not news about where a peer
             // can be reached.
+            let changed = next.discovery_mode != held.discovery_mode
+                || next.no_dht_service != held.no_dht_service
+                || (!next.transport.is_empty() && next.transport != held.transport);
             if next.transport.is_empty() {
                 next.transport = held.transport;
+            }
+            if changed {
+                self.topology_revision = self.topology_revision.wrapping_add(1);
             }
             bucket.push_back(next);
             return;
@@ -650,10 +665,12 @@ impl RoutingTable {
                     return; // /16 AS quota exceeded — drop this contact
                 }
             }
+            self.topology_revision = self.topology_revision.wrapping_add(1);
             bucket.push_back(contact);
         } else if cap == 1 {
             // Sketch bucket: replace the single entry with the newer contact.
             bucket.pop_front();
+            self.topology_revision = self.topology_revision.wrapping_add(1);
             bucket.push_back(contact);
         } else {
             // Full bucket is full.
@@ -702,6 +719,7 @@ impl RoutingTable {
                 // Incoming contact has no parseable IP — LRU eviction.
                 bucket.pop_front();
             }
+            self.topology_revision = self.topology_revision.wrapping_add(1);
             bucket.push_back(contact);
         }
     }
@@ -713,6 +731,7 @@ impl RoutingTable {
         let bucket = &mut self.buckets[idx];
         if let Some(pos) = bucket.iter().position(|c| &c.node_id == node_id) {
             bucket.remove(pos);
+            self.topology_revision = self.topology_revision.wrapping_add(1);
         }
     }
 
@@ -855,6 +874,52 @@ impl RoutingTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn topology_revision_ignores_lru_and_tracks_accepted_routing_changes() {
+        let mut table = RoutingTable::new([0; 32]);
+        table.insert_trusted(make_contact(1));
+        table.insert_trusted(make_contact(2));
+        let published = table.topology_revision();
+        for _ in 0..100 {
+            table.insert(make_contact(1));
+            table.insert_trusted(Contact::new([2; 32], ""));
+            table.insert_trusted(make_contact(0)); // self is rejected
+            table.remove(&[99; 32]); // absent removal
+        }
+        assert_eq!(table.topology_revision(), published);
+        table.insert_trusted(Contact::new([1; 32], "tcp://new-host:9000"));
+        assert_ne!(table.topology_revision(), published);
+        let moved = table.topology_revision();
+        let mut stated = Contact::new([2; 32], "");
+        stated.no_dht_service = true;
+        stated.caps_known = true;
+        table.insert_trusted(stated);
+        assert_ne!(table.topology_revision(), moved);
+        let changed = table.topology_revision();
+        table.insert_trusted(make_contact(2)); // unstated defaults retain capabilities
+        assert_eq!(table.topology_revision(), changed);
+        table.remove(&[1; 32]);
+        assert_ne!(table.topology_revision(), changed);
+    }
+
+    #[test]
+    fn topology_revision_tracks_eviction_but_not_rejected_diversity_admission() {
+        let mut table = RoutingTable::with_k([0; 32], 1);
+        table.insert_trusted(make_contact(1));
+        let initial = table.topology_revision();
+        let mut replacement = make_contact(1);
+        replacement.node_id[31] = 2;
+        table.insert_trusted(replacement); // same bucket, actual replacement
+        assert_ne!(table.topology_revision(), initial);
+        let mut table = RoutingTable::new([0; 32]);
+        for seed in 128..128 + MAX_NODES_PER_SUBNET_PER_BUCKET as u8 {
+            table.insert(Contact::new([seed; 32], "tcp://10.20.30.1:9000"));
+        }
+        let full_subnet = table.topology_revision();
+        table.insert(Contact::new([255; 32], "tcp://10.20.30.2:9000"));
+        assert_eq!(table.topology_revision(), full_subnet);
+    }
 
     fn make_contact(seed: u8) -> Contact {
         Contact::new([seed; 32], format!("tcp://node-{seed}:9000"))
