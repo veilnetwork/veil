@@ -574,7 +574,10 @@ impl NodeRuntime {
                             last_topology_publish_at = Some(tokio::time::Instant::now());
                             logger.info(
                                 "node.sovereign_identity.replication",
-                                format!("reason={next_publish_reason}"),
+                                format!(
+                                    "reason={next_publish_reason} wall_unix_ms={}",
+                                    veil_session::tx_registry::now_ms(),
+                                ),
                             );
                             if sessions_for_first_publish.read().is_ok_and(|reg| !reg.is_empty()) {
                                 first_network_publish_pending = false;
