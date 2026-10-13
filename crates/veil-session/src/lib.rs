@@ -24,6 +24,7 @@ pub mod frame_diag;
 pub mod frame_outbox;
 mod local_datagram_status;
 mod local_source_activity;
+pub mod local_lossy_trace;
 pub use local_datagram_status::DatagramTransportLease;
 pub use local_datagram_status::LocalDatagramChannelState;
 pub mod fsm;

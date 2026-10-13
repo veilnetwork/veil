@@ -4834,6 +4834,7 @@ impl SessionRunner {
                         ) {
                             // Source feedback only; neutral ChildCarrier traffic
                             // above and forwarded INTERACTIVE cells bypass this.
+                            crate::local_lossy_trace::cell("budget_drop", outgoing_priority, outgoing);
                             lane.trace_source_pressure(
                                 &self.logger,
                                 &self.peer_id,
@@ -4842,6 +4843,7 @@ impl SessionRunner {
                             datagram_drained += 1;
                             continue;
                         }
+                        crate::local_lossy_trace::cell("budget_admit", outgoing_priority, outgoing);
                         let (_, body, lane_kind) = decode_realtime_lane_frame(outgoing)
                             .expect("realtime queue predicate accepted this frame");
                         let independent_source = lane.requires_independent_source(
@@ -5358,6 +5360,12 @@ impl SessionRunner {
                         {
                             source_pressure_retry = Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
                             return HeadAdmission::DeferSource;
+                        }
+                        if !owned_reliable
+                            && matches!(priority, veil_proto::priority::BULK | veil_proto::priority::BACKGROUND)
+                            && decode_realtime_lane_frame(frame).is_some()
+                        {
+                            crate::local_lossy_trace::cell("budget_admit", priority, frame);
                         }
                         if priority == crate::LOCAL_SIGNALING_LANE
                             && let Some(outbox) = outbox.as_ref()

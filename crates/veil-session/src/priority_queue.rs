@@ -127,6 +127,14 @@ struct QueuedFrame {
     signaling_pending: Option<crate::local_source_activity::PendingSignaling>,
 }
 
+impl QueuedFrame {
+    fn trace_lossy_drop(&self, priority: u8, stage: &'static str) {
+        if self.lossy_realtime && self.carrier.is_none() {
+            crate::local_lossy_trace::cell(stage, priority, &self.frame);
+        }
+    }
+}
+
 // ── PriorityQueue ─────────────────────────────────────────────────────────────
 
 /// In-process WRR priority queue for outgoing OVL1 frames.
@@ -261,6 +269,9 @@ impl PriorityQueue {
     ) {
         // Expired ingress must not evict a fresh frame from a full class.
         if queued_at.elapsed() > lossy_realtime_max_age(priority) {
+            if carrier.is_none() {
+                crate::local_lossy_trace::cell("queue_expired", priority, &frame);
+            }
             self.drops_total.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -274,7 +285,9 @@ impl PriorityQueue {
                 .iter()
                 .position(|queued| queued.lossy_realtime)
                 .expect("lossy class counter requires an entry");
-            self.queues[p].remove(index);
+            if let Some(queued) = self.queues[p].remove(index) {
+                queued.trace_lossy_drop(priority, "queue_overflow");
+            }
             self.lossy_realtime_len[p] -= 1;
             self.drops_total.fetch_add(1, Ordering::Relaxed);
         }
@@ -328,11 +341,11 @@ impl PriorityQueue {
                     .iter()
                     .position(|q| q.reliable_credit.is_none())
                 {
-                    if self.queues[shed_p]
-                        .remove(index)
-                        .is_some_and(|queued| queued.lossy_realtime)
-                    {
-                        self.lossy_realtime_len[shed_p] -= 1;
+                    if let Some(queued) = self.queues[shed_p].remove(index) {
+                        queued.trace_lossy_drop(shed_p as u8, "queue_overflow");
+                        if queued.lossy_realtime {
+                            self.lossy_realtime_len[shed_p] -= 1;
+                        }
                     }
                     self.drops_total.fetch_add(1, Ordering::Relaxed);
                     shed = true;
@@ -341,6 +354,9 @@ impl PriorityQueue {
             }
             if !shed {
                 // Nothing at-or-below incoming priority to evict — drop it.
+                if lossy_realtime && carrier.is_none() {
+                    crate::local_lossy_trace::cell("queue_overflow", priority, &frame);
+                }
                 self.drops_total.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -394,7 +410,9 @@ impl PriorityQueue {
                         .enqueued_at
                         .is_some_and(|at| at.elapsed() > lossy_realtime_max_age(p as u8))
             }) {
-                self.queues[p].pop_front();
+                if let Some(queued) = self.queues[p].pop_front() {
+                    queued.trace_lossy_drop(p as u8, "queue_expired");
+                }
                 self.lossy_realtime_len[p] -= 1;
                 self.drops_total.fetch_add(1, Ordering::Relaxed);
             }
@@ -523,6 +541,9 @@ impl PriorityQueue {
     /// losing its return carrier. No producer runs between pop and restore.
     pub(crate) fn restore_lossy_envelope(&mut self, envelope: crate::frame_outbox::FrameEnvelope) {
         if envelope.queued_at.elapsed() > lossy_realtime_max_age(envelope.frame.0) {
+            if envelope.carrier.is_none() {
+                crate::local_lossy_trace::cell("queue_expired", envelope.frame.0, &envelope.frame.1);
+            }
             self.drops_total.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -586,7 +607,9 @@ impl PriorityQueue {
                         .enqueued_at
                         .is_some_and(|at| at.elapsed() > lossy_realtime_max_age(priority))
                     {
-                        self.queues[p].remove(index);
+                        if let Some(queued) = self.queues[p].remove(index) {
+                            queued.trace_lossy_drop(priority, "queue_expired");
+                        }
                         self.lossy_realtime_len[p] -= 1;
                         self.drops_total.fetch_add(1, Ordering::Relaxed);
                         continue;
@@ -651,7 +674,9 @@ impl PriorityQueue {
                             .enqueued_at
                             .is_some_and(|at| at.elapsed() > lossy_realtime_max_age(p as u8))
                 }) {
-                    self.queues[p].pop_front();
+                    if let Some(queued) = self.queues[p].pop_front() {
+                        queued.trace_lossy_drop(p as u8, "queue_expired");
+                    }
                     self.lossy_realtime_len[p] -= 1;
                     self.drops_total.fetch_add(1, Ordering::Relaxed);
                 }
