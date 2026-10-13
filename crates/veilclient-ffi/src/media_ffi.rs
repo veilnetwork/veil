@@ -352,7 +352,7 @@ async fn drain_media_packets_on_plane<F, Fut>(
     }
 }
 
-#[cfg(feature = "node-embedded")]
+#[cfg(all(feature = "node-embedded", test))]
 async fn drain_relay_video<F, Fut>(
     rx: mpsc::Receiver<RelayVideoFrame>,
     batching: Arc<std::sync::atomic::AtomicU8>,
@@ -374,9 +374,9 @@ async fn drain_relay_video<F, Fut>(
     .await;
 }
 
-#[cfg(feature = "node-embedded")]
+#[cfg(all(feature = "node-embedded", test))]
 async fn drain_relay_video_on_plane<F, Fut>(
-    mut rx: mpsc::Receiver<RelayVideoFrame>,
+    rx: mpsc::Receiver<RelayVideoFrame>,
     batching: Arc<std::sync::atomic::AtomicU8>,
     cipher: Arc<media::MediaCipher>,
     stats: Arc<RelayMediaStats>,
@@ -384,6 +384,32 @@ async fn drain_relay_video_on_plane<F, Fut>(
     mut send: F,
 ) where
     F: FnMut(media::SealedMediaCell) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    drain_relay_video_batches_on_plane(rx, batching, cipher, stats, plane, move |cells| {
+        let futures: Vec<_> = cells.into_iter().map(&mut send).collect();
+        async move {
+            for future in futures {
+                if !future.await {
+                    return false;
+                }
+            }
+            true
+        }
+    })
+    .await;
+}
+
+#[cfg(feature = "node-embedded")]
+async fn drain_relay_video_batches_on_plane<F, Fut>(
+    mut rx: mpsc::Receiver<RelayVideoFrame>,
+    batching: Arc<std::sync::atomic::AtomicU8>,
+    cipher: Arc<media::MediaCipher>,
+    stats: Arc<RelayMediaStats>,
+    plane: media::LocalMediaPlane,
+    mut send: F,
+) where
+    F: FnMut(Vec<media::SealedMediaCell>) -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
     while let Some(frame) = rx.recv().await {
@@ -418,23 +444,36 @@ async fn drain_relay_video_on_plane<F, Fut>(
             media::LocalMediaPlane::Screen => veil_proto::priority::BACKGROUND,
         };
         let mut trace = veil_session::local_lossy_trace::SourceFrameTrace::new(
-            local_priority, packet_count, raw_bytes, cells.len(),
+            local_priority,
+            packet_count,
+            raw_bytes,
+            cells.len(),
         );
+        let mut sealed_cells = Vec::with_capacity(cells.len());
+        let mut incomplete = false;
         for queued in cells {
             if queued.expired() {
-                if let Some(trace) = trace.as_mut() { trace.expired(); }
+                if let Some(trace) = trace.as_mut() {
+                    trace.expired();
+                }
+                incomplete = true;
                 continue;
             }
             let cell = queued.payload;
             let Some(sealed) = cipher.seal_on_plane(plane, &cell) else {
+                incomplete = true;
                 continue;
             };
-            if let Some(trace) = trace.as_mut() { trace.observe(sealed.as_bytes()); }
+            if let Some(trace) = trace.as_mut() {
+                trace.observe(sealed.as_bytes());
+            }
             let sealed = sealed.with_local_deadline(queued.deadline);
             drop(cell);
-            if !send(sealed).await {
-                return;
-            }
+            sealed_cells.push(sealed);
+        }
+        // The entire native frame must still be fresh when published on IPC.
+        if !incomplete && !sealed_cells.is_empty() && !send(sealed_cells).await {
+            return;
         }
         stats.observe_frame_ipc(started.elapsed());
     }
@@ -1000,85 +1039,98 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
     ));
     let video_source = Arc::clone(&video_sender);
     let video_stats = Arc::clone(&relay_stats);
-    let video_task = app_ref.bundle.runtime.spawn(drain_relay_video(
-        rx_video_frames,
-        Arc::clone(&batching),
-        Arc::clone(&cipher),
-        Arc::clone(&relay_stats),
-        move |sealed| {
-            let sender = video_source.current();
-            let stats = Arc::clone(&video_stats);
-            async move {
-                let lock_started = std::time::Instant::now();
-                let guard = sealed.lock_while_fresh(&sender).await;
-                stats.observe_sender_lock(lock_started.elapsed());
-                let Some(guard) = guard else {
-                    return true;
-                };
-                let Some(sender) = guard.as_ref() else {
-                    return false;
-                };
-                let ipc_started = std::time::Instant::now();
-                let deadline = sealed
-                    .local_deadline()
-                    .expect("native pump retains packet deadline");
-                let result = sender
-                    .send_relay_media_sealed_on_local_lane_before_tracked_owned(
-                        veil_proto::priority::BULK,
-                        peer,
-                        peer_app,
-                        peer_endpoint_id,
-                        sealed.into_vec(),
-                        deadline,
-                        Some(Arc::clone(&stats.ipc_send_failures)),
-                    )
-                    .await;
-                stats.observe_ipc_cell(ipc_started.elapsed(), !matches!(result, Ok(true)));
-                true
-            }
-        },
-    ));
+    let video_task = app_ref
+        .bundle
+        .runtime
+        .spawn(drain_relay_video_batches_on_plane(
+            rx_video_frames,
+            Arc::clone(&batching),
+            Arc::clone(&cipher),
+            Arc::clone(&relay_stats),
+            media::LocalMediaPlane::Secondary,
+            move |sealed| {
+                let sender = video_source.current();
+                let stats = Arc::clone(&video_stats);
+                async move {
+                    let lock_started = std::time::Instant::now();
+                    let guard = sealed[0].lock_while_fresh(&sender).await;
+                    stats.observe_sender_lock(lock_started.elapsed());
+                    let Some(guard) = guard else {
+                        return true;
+                    };
+                    let Some(sender) = guard.as_ref() else {
+                        return false;
+                    };
+                    let ipc_started = std::time::Instant::now();
+                    let deadline = sealed[0]
+                        .local_deadline()
+                        .expect("native pump retains packet deadline");
+                    let result = sender
+                        .send_relay_media_batch_before_owned(
+                            veil_proto::priority::BULK,
+                            peer,
+                            peer_app,
+                            peer_endpoint_id,
+                            sealed
+                                .into_iter()
+                                .map(media::SealedMediaCell::into_vec)
+                                .collect(),
+                            deadline,
+                            Some(Arc::clone(&stats.ipc_send_failures)),
+                        )
+                        .await;
+                    stats.observe_ipc_cell(ipc_started.elapsed(), !matches!(result, Ok(true)));
+                    true
+                }
+            },
+        ));
     let screen_source = Arc::clone(&screen_sender);
     let screen_stats = Arc::clone(&relay_stats);
-    let screen_task = app_ref.bundle.runtime.spawn(drain_relay_video_on_plane(
-        rx_screen_frames,
-        Arc::clone(&batching),
-        Arc::clone(&cipher),
-        Arc::clone(&relay_stats),
-        media::LocalMediaPlane::Screen,
-        move |sealed| {
-            let sender = screen_source.current();
-            let stats = Arc::clone(&screen_stats);
-            async move {
-                let lock_started = std::time::Instant::now();
-                let guard = sealed.lock_while_fresh(&sender).await;
-                stats.observe_sender_lock(lock_started.elapsed());
-                let Some(guard) = guard else {
-                    return true;
-                };
-                let Some(sender) = guard.as_ref() else {
-                    return false;
-                };
-                let ipc_started = std::time::Instant::now();
-                let deadline = sealed
-                    .local_deadline()
-                    .expect("native pump retains packet deadline");
-                let result = sender
-                    .send_relay_media_sealed_on_local_lane_before_tracked_owned(
-                        veil_proto::priority::BACKGROUND,
-                        peer,
-                        peer_app,
-                        peer_endpoint_id,
-                        sealed.into_vec(),
-                        deadline,
-                        Some(Arc::clone(&stats.ipc_send_failures)),
-                    )
-                    .await;
-                stats.observe_ipc_cell(ipc_started.elapsed(), !matches!(result, Ok(true)));
-                true
-            }
-        },
-    ));
+    let screen_task = app_ref
+        .bundle
+        .runtime
+        .spawn(drain_relay_video_batches_on_plane(
+            rx_screen_frames,
+            Arc::clone(&batching),
+            Arc::clone(&cipher),
+            Arc::clone(&relay_stats),
+            media::LocalMediaPlane::Screen,
+            move |sealed| {
+                let sender = screen_source.current();
+                let stats = Arc::clone(&screen_stats);
+                async move {
+                    let lock_started = std::time::Instant::now();
+                    let guard = sealed[0].lock_while_fresh(&sender).await;
+                    stats.observe_sender_lock(lock_started.elapsed());
+                    let Some(guard) = guard else {
+                        return true;
+                    };
+                    let Some(sender) = guard.as_ref() else {
+                        return false;
+                    };
+                    let ipc_started = std::time::Instant::now();
+                    let deadline = sealed[0]
+                        .local_deadline()
+                        .expect("native pump retains packet deadline");
+                    let result = sender
+                        .send_relay_media_batch_before_owned(
+                            veil_proto::priority::BACKGROUND,
+                            peer,
+                            peer_app,
+                            peer_endpoint_id,
+                            sealed
+                                .into_iter()
+                                .map(media::SealedMediaCell::into_vec)
+                                .collect(),
+                            deadline,
+                            Some(Arc::clone(&stats.ipc_send_failures)),
+                        )
+                        .await;
+                    stats.observe_ipc_cell(ipc_started.elapsed(), !matches!(result, Ok(true)));
+                    true
+                }
+            },
+        ));
     let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     MEDIA_CHANNELS
         .write()

@@ -225,6 +225,23 @@ impl RoutedFrameBroadcaster {
 }
 
 impl FrameBroadcaster for RoutedFrameBroadcaster {
+    fn supports_local_lossy_work(&self) -> bool {
+        self.direct.supports_local_lossy_work()
+    }
+
+    fn send_local_lossy_work(
+        &self,
+        peer_id: &[u8; 32],
+        priority: u8,
+        bytes: Vec<u8>,
+        cell: veil_types::local_lossy_work::LocalLossyCell,
+    ) -> bool {
+        // The IPC origin already selected a physical first hop. Do not wrap
+        // these cells in another envelope or lose their local admission token.
+        self.direct
+            .send_local_lossy_work(peer_id, priority, bytes, cell)
+    }
+
     fn has_datagram_transport(&self, peer_id: &[u8; 32]) -> bool {
         self.direct.has_datagram_transport(peer_id)
     }

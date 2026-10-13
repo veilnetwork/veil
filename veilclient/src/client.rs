@@ -122,6 +122,7 @@ pub(crate) struct SharedWriter {
     next_request_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
     stream_credits: Option<SharedStreamCredits>,
     local_source_feedback: bool,
+    local_lossy_work: bool,
 }
 
 type SharedStreamCredits =
@@ -170,6 +171,7 @@ impl SharedWriter {
             next_request_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             stream_credits: None,
             local_source_feedback: false,
+            local_lossy_work: false,
         }
     }
 
@@ -180,6 +182,35 @@ impl SharedWriter {
             )));
         }
         self
+    }
+
+    pub(crate) fn with_local_lossy_work(mut self, enabled: bool) -> Self {
+        self.local_lossy_work = enabled;
+        self
+    }
+    pub(crate) fn supports_local_lossy_work(&self) -> bool {
+        self.local_lossy_work
+    }
+
+    pub(crate) async fn write_local_lossy_batch(
+        &self,
+        lane: u8,
+        batch: veil_proto::ipc_lossy_batch::LocalLossyBatchPayload,
+        deadline: tokio::time::Instant,
+        expirations: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Result<bool, ClientError> {
+        let body = batch
+            .encode()
+            .ok_or_else(|| ClientError::Protocol("invalid local source work bounds".to_owned()))?;
+        let mut header = FrameHeader::new(
+            FrameFamily::LocalApp as u8,
+            LocalAppMsg::AppIpcLossyBatch as u16,
+        );
+        veil_proto::ipc::set_ipc_local_source_lane(&mut header, lane, true);
+        header.body_len = body.len() as u32;
+        let mut bytes = codec::encode_header(&header).to_vec();
+        bytes.extend_from_slice(&body);
+        self.enqueue(bytes, Some(deadline), expirations).await
     }
 
     pub(crate) fn with_local_source_feedback(mut self, enabled: bool) -> Self {
@@ -1055,7 +1086,8 @@ impl VeilClient {
         let hello = AppIpcHelloPayload {
             version: IPC_PROTOCOL_VERSION,
             flags: veilcore::proto::ipc::IPC_CAP_STREAM_WRITE_CREDIT
-                | veilcore::proto::ipc::IPC_CAP_LOCAL_SOURCE_FEEDBACK,
+                | veilcore::proto::ipc::IPC_CAP_LOCAL_SOURCE_FEEDBACK
+                | veilcore::proto::ipc::IPC_CAP_LOCAL_LOSSY_WORK,
         };
         tokio::time::timeout(
             timeout,
@@ -1110,6 +1142,9 @@ impl VeilClient {
             )
             .with_local_source_feedback(
                 hdr.flags & veilcore::proto::ipc::IPC_HELLO_OK_LOCAL_SOURCE_FEEDBACK != 0,
+            )
+            .with_local_lossy_work(
+                hdr.flags & veilcore::proto::ipc::IPC_HELLO_OK_LOCAL_LOSSY_WORK != 0,
             );
         let dispatch = Arc::new(Mutex::new(DispatchTable::new()));
 
