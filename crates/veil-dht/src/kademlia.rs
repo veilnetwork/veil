@@ -1401,6 +1401,12 @@ impl KademliaService {
         lock!(self.inner).routing.total_contacts()
     }
 
+    /// Cheap witness for actual membership/transport/eligibility changes.
+    /// Receiving query responses or refreshing LRU order leaves it unchanged.
+    pub fn routing_topology_revision(&self) -> u64 {
+        lock!(self.inner).routing.topology_revision()
+    }
+
     /// Return all contacts currently in the routing table (cloned).
     pub fn routing_table_contacts(&self) -> Vec<super::routing::Contact> {
         lock!(self.inner).routing.all_contacts()

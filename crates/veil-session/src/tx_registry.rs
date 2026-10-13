@@ -76,6 +76,8 @@ struct SessionTxEntry {
     tx: FrameSender,
     owner: Option<SessionTxOwner>,
     direct_app_chunks: bool,
+    /// Local registration witness, including replacements under the same peer.
+    registration: u64,
 }
 
 /// Registry of outbound send channels, one per active session.
@@ -89,6 +91,7 @@ pub struct SessionTxRegistry {
     /// tick runs at second granularity, not millis.
     last_active: HashMap<NodeIdBytes, AtomicU64>,
     capacity: usize,
+    next_registration: u64,
     /// Cumulative count of frames dropped because a session channel was full.
     drops_total: Arc<AtomicU64>,
 }
@@ -113,6 +116,7 @@ impl Default for SessionTxRegistry {
             senders: HashMap::new(),
             last_active: HashMap::new(),
             capacity: DEFAULT_TX_QUEUE_DEPTH,
+            next_registration: 0,
             drops_total: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -155,6 +159,7 @@ impl SessionTxRegistry {
             senders: HashMap::new(),
             last_active: HashMap::new(),
             capacity,
+            next_registration: 0,
             drops_total: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -169,6 +174,7 @@ impl SessionTxRegistry {
             senders: HashMap::new(),
             last_active: HashMap::new(),
             capacity,
+            next_registration: 0,
             drops_total,
         }
     }
@@ -223,12 +229,14 @@ impl SessionTxRegistry {
         self.prune_closed();
         let (tx, rx) =
             frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
+        self.next_registration = self.next_registration.wrapping_add(1);
         self.senders.insert(
             peer_id,
             SessionTxEntry {
                 tx,
                 owner: None,
                 direct_app_chunks: false,
+                registration: self.next_registration,
             },
         );
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
@@ -246,12 +254,14 @@ impl SessionTxRegistry {
         self.prune_closed();
         let (tx, rx) =
             frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
+        self.next_registration = self.next_registration.wrapping_add(1);
         self.senders.insert(
             peer_id,
             SessionTxEntry {
                 tx,
                 owner: Some(owner),
                 direct_app_chunks: false,
+                registration: self.next_registration,
             },
         );
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
@@ -276,12 +286,14 @@ impl SessionTxRegistry {
         }
         let (tx, rx) =
             frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
+        self.next_registration = self.next_registration.wrapping_add(1);
         self.senders.insert(
             peer_id,
             SessionTxEntry {
                 tx,
                 owner: None,
                 direct_app_chunks: false,
+                registration: self.next_registration,
             },
         );
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
@@ -374,12 +386,14 @@ impl SessionTxRegistry {
 
         let (tx, rx) =
             frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
+        self.next_registration = self.next_registration.wrapping_add(1);
         self.senders.insert(
             peer_id,
             SessionTxEntry {
                 tx,
                 owner: Some(owner),
                 direct_app_chunks: false,
+                registration: self.next_registration,
             },
         );
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
@@ -793,6 +807,21 @@ impl SessionTxRegistry {
             .collect()
     }
 
+    /// Sorted live registrations for maintenance replication. Reconnects to
+    /// the same peer change this witness; queue traffic and rejected duplicate
+    /// admission do not. It neither holds sender handles nor includes stale
+    /// closed entries, and carries no protocol metadata.
+    pub fn live_registration_snapshot(&self) -> Vec<(NodeIdBytes, u64)> {
+        let mut entries: Vec<_> = self
+            .senders
+            .iter()
+            .filter(|(_, entry)| !entry.tx.is_closed())
+            .map(|(peer, entry)| (*peer, entry.registration))
+            .collect();
+        entries.sort_unstable();
+        entries
+    }
+
     pub fn len(&self) -> usize {
         self.senders.len()
     }
@@ -859,6 +888,57 @@ impl SessionTxRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn live_registration_snapshot_tracks_reconnect_and_closed_outboxes() {
+        let mut registry = SessionTxRegistry::new();
+        let first = registry.register([2; 32]);
+        let second = registry.register_owned([1; 32], [10; 32]);
+        let baseline = registry.live_registration_snapshot();
+        assert_eq!(
+            baseline.iter().map(|v| v.0).collect::<Vec<_>>(),
+            vec![[1; 32], [2; 32]]
+        );
+        assert!(registry.try_register_unique([2; 32]).is_none());
+        assert!(!registry.unregister_owned(&[1; 32], &[11; 32]));
+        registry.send_to(&[2; 32], veil_proto::priority::BACKGROUND, vec![1]);
+        registry.set_direct_app_chunks_owned(&[1; 32], &[10; 32], true);
+        assert_eq!(registry.live_registration_snapshot(), baseline);
+        let replacement = registry.register_owned([1; 32], [12; 32]);
+        assert_ne!(registry.live_registration_snapshot(), baseline);
+        drop(first);
+        assert_eq!(registry.live_registration_snapshot().len(), 1);
+        drop(replacement);
+        assert!(registry.live_registration_snapshot().is_empty());
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn directional_registration_snapshot_changes_only_on_accepted_replacement() {
+        let mut registry = SessionTxRegistry::new();
+        let first = registry
+            .try_register_directional([2; 32], &[1; 32], true, false, false, [10; 32])
+            .unwrap();
+        let baseline = registry.live_registration_snapshot();
+        assert!(
+            registry
+                .try_register_directional([2; 32], &[1; 32], false, false, true, [11; 32])
+                .is_none()
+        );
+        assert!(
+            registry
+                .try_register_directional([2; 32], &[1; 32], true, false, false, [12; 32])
+                .is_none()
+        );
+        assert_eq!(registry.live_registration_snapshot(), baseline);
+        let second = registry
+            .try_register_directional([2; 32], &[1; 32], true, false, true, [13; 32])
+            .unwrap();
+        assert_ne!(registry.live_registration_snapshot(), baseline);
+        assert!(!registry.unregister_owned(&[2; 32], &[10; 32]));
+        assert_eq!(registry.live_registration_snapshot().len(), 1);
+        drop((first, second));
+    }
 
     #[test]
     fn endpoint_feedback_holds_own_producers_and_expires_without_global_clear() {
