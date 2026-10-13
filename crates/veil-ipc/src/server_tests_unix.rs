@@ -38,6 +38,24 @@ struct CapturingPeerBroadcaster {
 }
 
 impl veil_types::FrameBroadcaster for CapturingPeerBroadcaster {
+    fn supports_local_lossy_work(&self) -> bool {
+        true
+    }
+    fn send_local_lossy_work(
+        &self,
+        peer_id: &[u8; 32],
+        priority: u8,
+        bytes: Vec<u8>,
+        cell: veil_types::local_lossy_work::LocalLossyCell,
+    ) -> bool {
+        assert!(matches!(priority, 2 | 3));
+        assert_eq!(
+            cell.admit(7, bytes.len() + 20, |_| Ok(())),
+            veil_types::local_lossy_work::WorkAdmission::Admitted
+        );
+        self.send_to(peer_id, priority, bytes)
+    }
+
     fn send_to(&self, peer_id: &[u8; 32], priority: u8, bytes: Vec<u8>) -> bool {
         peer_id == &self.peer_id && self.tx.send((priority, bytes)).is_ok()
     }
@@ -76,6 +94,10 @@ async fn connect_with_flags(sock: &PathBuf, flags: u32) -> UnixStream {
             0
         }) | (if flags & veil_proto::ipc::IPC_CAP_LOCAL_SOURCE_FEEDBACK != 0 {
             veil_proto::ipc::IPC_HELLO_OK_LOCAL_SOURCE_FEEDBACK
+        } else {
+            0
+        }) | (if flags & veil_proto::ipc::IPC_CAP_LOCAL_LOSSY_WORK != 0 {
+            veil_proto::ipc::IPC_HELLO_OK_LOCAL_LOSSY_WORK
         } else {
             0
         })
@@ -1173,7 +1195,7 @@ async fn ipc_send_relay_via_route_cache() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Connect IPC client and complete handshake.
-    let mut client = connect_and_hello(&sock).await;
+    let mut client = connect_with_flags(&sock, veil_proto::ipc::IPC_CAP_LOCAL_LOSSY_WORK).await;
 
     // Bind to get a valid src_app_id.
     let bind = AppBindPayload {
@@ -1327,6 +1349,60 @@ async fn ipc_send_relay_via_route_cache() {
     assert_eq!(compat_fwd.envelope.payload, compat_payload);
     assert_eq!(compat_fwd.traffic_class, None);
     assert_eq!(compat_fwd.envelope.ttl_secs, 30);
+
+    // Whole local work has the same opaque neutral Forward wire shape.
+    let batch = veil_proto::ipc_lossy_batch::LocalLossyBatchPayload {
+        destination: c_id,
+        source_app: src_app_id,
+        destination_app: app_id,
+        endpoint: 1,
+        cells: vec![sealed.clone(); 3],
+    };
+    let bytes = batch.encode().unwrap();
+    let mut header = FrameHeader::new(
+        FrameFamily::LocalApp as u8,
+        LocalAppMsg::AppIpcLossyBatch as u16,
+    );
+    veil_proto::ipc::set_ipc_local_source_lane(&mut header, 2, true);
+    header.body_len = bytes.len() as u32;
+    let mut spoofed = bytes.clone();
+    spoofed[32..64].copy_from_slice(&[0xab; 32]);
+    client
+        .write_all(&codec::encode_header(&header))
+        .await
+        .unwrap();
+    client.write_all(&spoofed).await.unwrap();
+    let (failed, body) = recv_ipc_frame(&mut client).await;
+    assert_eq!(failed.msg_type, LocalAppMsg::AppSendFailed as u16);
+    assert_eq!(
+        body,
+        veil_proto::ipc::ipc_send_err::SPOOFED_SRC.to_be_bytes()
+    );
+    assert!(
+        b_rx.try_recv().is_err(),
+        "unbound app cannot submit grouped work"
+    );
+    client
+        .write_all(&codec::encode_header(&header))
+        .await
+        .unwrap();
+    client.write_all(&bytes).await.unwrap();
+    for _ in 0..3 {
+        let (priority, bytes) = tokio::time::timeout(Duration::from_millis(500), b_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(priority, 2);
+        let header = codec::decode_header(&bytes).unwrap();
+        assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+        assert_eq!(header.stream_id, 0);
+        assert_eq!(header.request_id, 0);
+        let fwd = ForwardPayload::decode(&bytes[veil_proto::HEADER_SIZE..]).unwrap();
+        assert_eq!(fwd.envelope.payload, sealed);
+        assert_eq!(fwd.traffic_class, Some(veil_proto::priority::INTERACTIVE));
+        assert!(!fwd.envelope.require_ack);
+    }
+    assert!(b_rx.try_recv().is_err(), "each member sent once");
 
     drop(client);
     let _ = shutdown_tx.send(true);

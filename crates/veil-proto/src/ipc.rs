@@ -37,6 +37,9 @@ pub const IPC_HELLO_OK_STREAM_WRITE_CREDIT: u16 = 0x0080;
 pub const IPC_CAP_LOCAL_SOURCE_FEEDBACK: u32 = 2;
 /// APP_HELLO_OK acknowledgment; never a network frame flag.
 pub const IPC_HELLO_OK_LOCAL_SOURCE_FEEDBACK: u16 = 0x0100;
+/// Whole local lossy work admission, stripped before network encoding.
+pub const IPC_CAP_LOCAL_LOSSY_WORK: u32 = 4;
+pub const IPC_HELLO_OK_LOCAL_LOSSY_WORK: u16 = 0x0200;
 /// Source bytes an IPC stream may enqueue before the node admits them. This is
 /// separate from the receiver's network/local-pair read window.
 pub const IPC_STREAM_WRITE_WINDOW: u32 = 8 * 1024;

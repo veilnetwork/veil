@@ -66,6 +66,7 @@ mod golden_tests;
 pub mod header;
 /// Local-IPC (application-side) message payloads.
 pub mod ipc;
+pub mod ipc_lossy_batch;
 /// Inter-node mesh payloads (beacon, ack, realm-scoped broadcast).
 pub mod mesh;
 /// Peer Exchange (PEX) wire format — random-walk transport discovery.

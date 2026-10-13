@@ -621,6 +621,7 @@ pub(crate) async fn rate_limited(
 pub(crate) struct IpcSendContext {
     /// Sender scheduling only; never copied into a network header or payload.
     pub local_priority: u8,
+    pub(crate) local_work: Option<veil_types::local_lossy_work::LocalLossyCell>,
     pub(crate) app_registry: Arc<AppEndpointRegistry>,
     pub(crate) local_node_id: [u8; 32],
     pub(crate) session_tx_registry: Option<Arc<dyn FrameBroadcaster>>,
@@ -2001,8 +2002,15 @@ pub(crate) async fn handle_ipc_send(
                     } else {
                         None
                     };
-                    let relayed = packetized
-                        .unwrap_or_else(|| reg.send_to(&next_hop, source_lane, fwd_frame.clone()));
+                    let relayed = packetized.unwrap_or_else(|| match ctx.local_work.as_ref() {
+                        Some(cell) => reg.send_local_lossy_work(
+                            &next_hop,
+                            source_lane,
+                            fwd_frame.clone(),
+                            cell.clone(),
+                        ),
+                        None => reg.send_to(&next_hop, source_lane, fwd_frame.clone()),
+                    });
                     if relay_media_sealed {
                         if relayed {
                             crate::route_trace::sealed_relay_hop_sample(
@@ -4114,6 +4122,7 @@ mod ratchet_send_tests {
     impl Fixture {
         fn ctx(&self, with_ratchet: bool) -> IpcSendContext {
             IpcSendContext {
+                local_work: None,
                 local_priority: veil_proto::priority::INTERACTIVE,
                 app_registry: Arc::clone(&self.registry),
                 local_node_id: ME,

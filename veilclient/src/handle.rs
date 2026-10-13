@@ -945,6 +945,63 @@ impl AppSender {
             .await
     }
 
+    /// Publish one complete source work item. Only upgraded local daemons
+    /// receive the boundary; legacy peers retain individual-cell IPC.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_relay_media_batch_before_owned(
+        &self,
+        local_priority: u8,
+        destination: [u8; 32],
+        destination_app: [u8; 32],
+        endpoint: u32,
+        cells: Vec<Vec<u8>>,
+        deadline: tokio::time::Instant,
+        expirations: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Result<bool, ClientError> {
+        if !matches!(
+            local_priority,
+            veil_proto::priority::BULK | veil_proto::priority::BACKGROUND
+        ) {
+            return Err(ClientError::Protocol(
+                "local lossy work requires a secondary source lane".to_owned(),
+            ));
+        }
+        if self.writer.supports_local_lossy_work() {
+            return self
+                .writer
+                .write_local_lossy_batch(
+                    local_priority,
+                    veil_proto::ipc_lossy_batch::LocalLossyBatchPayload {
+                        destination,
+                        source_app: self.app_id,
+                        destination_app,
+                        endpoint,
+                        cells,
+                    },
+                    deadline,
+                    expirations,
+                )
+                .await;
+        }
+        for cell in cells {
+            if !self
+                .send_relay_media_sealed_on_local_lane_before_tracked_owned(
+                    local_priority,
+                    destination,
+                    destination_app,
+                    endpoint,
+                    cell,
+                    deadline,
+                    expirations.clone(),
+                )
+                .await?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// A compact, already call-key-sealed endpoint state update. The control
     /// selector exists only in local IPC; relays receive ordinary opaque cells.
     #[allow(clippy::too_many_arguments)]

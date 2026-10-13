@@ -931,6 +931,8 @@ pub enum LocalAppMsg {
     /// App → daemon: fresh trusted source pressure, confined to local IPC.
     /// Body: [`crate::ipc::LocalSourceFeedbackPayload`]. Never forwarded.
     LocalSourceFeedback = 93,
+    /// Bounded complete source work item on local IPC only.
+    AppIpcLossyBatch = 94,
 }
 
 impl TryFrom<u16> for LocalAppMsg {
@@ -1031,6 +1033,7 @@ impl TryFrom<u16> for LocalAppMsg {
             91 => Ok(LocalAppMsg::AttemptHolePunch),
             92 => Ok(LocalAppMsg::AttemptHolePunchResult),
             93 => Ok(LocalAppMsg::LocalSourceFeedback),
+            94 => Ok(LocalAppMsg::AppIpcLossyBatch),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::LocalApp as u8,
                 msg_type: v,

@@ -3,6 +3,7 @@ use crate::client::{DispatchTable, IpcWriterFrame, SharedWriter, run_writer_task
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use veil_proto::{codec::decode_header, header::HEADER_SIZE};
+use veil_proto::ipc::AppIpcSendPayload;
 
 fn sender(writer: SharedWriter) -> AppSender {
     AppSender {
@@ -11,6 +12,84 @@ fn sender(writer: SharedWriter) -> AppSender {
         writer,
         dispatch: Arc::new(Mutex::new(DispatchTable::new())),
         unbind_on_drop: false,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn whole_source_work_has_one_ipc_deadline_and_legacy_fallback() {
+    use veil_proto::ipc_lossy_batch::LocalLossyBatchPayload;
+    let cell = [
+        veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC.as_slice(),
+        &[7; 100],
+    ]
+    .concat();
+    for upgraded in [false, true] {
+        let (tx, mut rx) = mpsc::channel::<IpcWriterFrame>(4);
+        let writer = SharedWriter::new(tx).with_local_lossy_work(upgraded);
+        let sender = sender(writer.clone());
+        assert!(
+            sender
+                .send_relay_media_batch_before_owned(
+                    2,
+                    [8; 32],
+                    [9; 32],
+                    10,
+                    vec![cell.clone(); 3],
+                    tokio::time::Instant::now() + Duration::from_millis(200),
+                    None
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(rx.len(), if upgraded { 1 } else { 3 });
+        let bytes = rx.recv().await.unwrap();
+        let header = decode_header(&bytes).unwrap();
+        assert_eq!(veil_proto::ipc::ipc_local_source_lane(&header), 2);
+        if upgraded {
+            assert_eq!(header.msg_type, LocalAppMsg::AppIpcLossyBatch as u16);
+            let batch = LocalLossyBatchPayload::decode(&bytes[HEADER_SIZE..]).unwrap();
+            assert_eq!(batch.cells, vec![cell.clone(); 3]);
+            assert_eq!(batch.source_app, [7; 32]);
+            writer
+                .write_frame(LocalAppMsg::StreamClose as u16, &[])
+                .await
+                .unwrap();
+            writer
+                .write_frame(LocalAppMsg::StreamClose as u16, &[])
+                .await
+                .unwrap();
+            writer
+                .write_frame(LocalAppMsg::StreamClose as u16, &[])
+                .await
+                .unwrap();
+            writer
+                .write_frame(LocalAppMsg::StreamClose as u16, &[])
+                .await
+                .unwrap();
+            assert!(
+                !sender
+                    .send_relay_media_batch_before_owned(
+                        2,
+                        [8; 32],
+                        [9; 32],
+                        10,
+                        vec![cell.clone(); 3],
+                        tokio::time::Instant::now() + Duration::from_millis(200),
+                        None
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(rx.len(), 4, "expired whole work cannot publish a prefix");
+        } else {
+            assert_eq!(header.msg_type, LocalAppMsg::AppIpcSend as u16);
+            assert_eq!(
+                &*AppIpcSendPayload::decode(&bytes[HEADER_SIZE..])
+                    .unwrap()
+                    .data,
+                &cell
+            );
+        }
     }
 }
 
