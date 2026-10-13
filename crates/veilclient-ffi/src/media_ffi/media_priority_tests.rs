@@ -17,9 +17,9 @@ use super::{
     MEDIA_BATCHING_OFF, MEDIA_CHANNELS, MEDIA_LOCAL_QUEUE_AGE, MEDIA_NEXT_ID, MediaChannel,
     MediaIngress, MediaSenderSlot, MediaVideoIngress, QueuedMediaPacket, RelayVideoFrame,
     drain_anonymous_media, drain_media_packets, drain_media_packets_on_plane, drain_relay_video,
-    drain_relay_video_on_plane, media_batched_cells, media_is_rtcp, media_ready_batch,
-    timed_media_cells, veil_media_channel_set_screen_sharing, veil_media_close_channel,
-    veil_media_send_datagram, veil_media_send_video_control_datagram,
+    drain_relay_video_batches_on_plane, drain_relay_video_on_plane, media_batched_cells,
+    media_is_rtcp, media_ready_batch, timed_media_cells, veil_media_channel_set_screen_sharing,
+    veil_media_close_channel, veil_media_send_datagram, veil_media_send_video_control_datagram,
 };
 use super::{
     RELAY_VIDEO_FRAME_MAX_BYTES, RelayMediaStats, RelayVideoFrameAssembler, RelayVideoFramePush,
@@ -1741,4 +1741,52 @@ async fn relay_video_control_cannot_consume_partial_frame_or_audio_capacity() {
     assert_eq!(audio_rx.try_recv().unwrap().payload, [0x80, 111, 1, 2]);
     assert!(audio_rx.try_recv().is_err());
     assert_eq!(stats.snapshot().video_frames_enqueued, 2);
+}
+
+#[tokio::test]
+async fn complete_relay_frames_reach_the_batch_sink_as_independent_work_items() {
+    let peer = [0x71; 32];
+    let cipher = Arc::new(cipher_for_test(&peer, &[1; 32], &[2; 32]).unwrap());
+    let receiver = cipher_for_test(&peer, &[2; 32], &[1; 32]).unwrap();
+    let enqueued_at = Instant::now();
+    let (tx, rx) = mpsc::channel(2);
+    let first = vec![
+        video_packet(7, false, 1),
+        video_packet(7, false, 2),
+        video_packet(7, true, 3),
+    ];
+    let second = vec![video_packet(8, true, 4)];
+    for packets in [&first, &second] {
+        tx.try_send(RelayVideoFrame {
+            packets: packets.clone(),
+            enqueued_at,
+        })
+        .unwrap();
+    }
+    drop(tx);
+    let (sink, mut groups) = mpsc::unbounded_channel();
+    drain_relay_video_batches_on_plane(
+        rx,
+        Arc::new(AtomicU8::new(MEDIA_BATCHING_OFF)),
+        cipher,
+        Arc::new(RelayMediaStats::default()),
+        LocalMediaPlane::Secondary,
+        move |cells| {
+            sink.send(cells).unwrap();
+            async { true }
+        },
+    )
+    .await;
+    for expected in [first, second] {
+        let actual = groups.try_recv().unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (sealed, packet) in actual.into_iter().zip(expected) {
+            assert_eq!(
+                sealed.local_deadline(),
+                Some(tokio::time::Instant::from_std(enqueued_at) + MEDIA_LOCAL_QUEUE_AGE)
+            );
+            assert_eq!(receiver.open(sealed.as_bytes()), Some(packet));
+        }
+    }
+    assert!(groups.try_recv().is_err());
 }

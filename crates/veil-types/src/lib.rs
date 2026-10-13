@@ -25,6 +25,8 @@
 //! `serde` (for derive on shared enums); even `std` is the only
 //! Rust runtime used.
 
+pub mod local_lossy_work;
+
 use serde::{Deserialize, Serialize};
 
 // ── Cross-crate session broadcast surface ────────────────────────────────────
@@ -46,6 +48,21 @@ use std::sync::Arc;
 /// `Arc<Mutex<node::session::tx_registry::SessionTxRegistry>>` via a small
 /// adapter newtype in `node::session_glue`.
 pub trait FrameBroadcaster: Send + Sync {
+    /// Local IPC capability only; relays never receive the work boundary.
+    fn supports_local_lossy_work(&self) -> bool {
+        false
+    }
+
+    fn send_local_lossy_work(
+        &self,
+        _peer_id: &[u8; 32],
+        _priority: u8,
+        _bytes: Vec<u8>,
+        _cell: local_lossy_work::LocalLossyCell,
+    ) -> bool {
+        false
+    }
+
     /// Whether fresh local source observations can reach admission state.
     fn supports_local_source_feedback(&self) -> bool {
         false

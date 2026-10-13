@@ -119,6 +119,7 @@ pub(crate) enum HeadAdmission {
 }
 
 struct QueuedFrame {
+    local_work: Option<veil_types::local_lossy_work::LocalLossyCell>,
     frame: veil_bufpool::PooledShared,
     enqueued_at: Option<Instant>,
     lossy_realtime: bool,
@@ -129,9 +130,71 @@ struct QueuedFrame {
 
 impl QueuedFrame {
     fn trace_lossy_drop(&self, priority: u8, stage: &'static str) {
+        if let Some(work) = &self.local_work {
+            work.reject();
+        }
         if self.lossy_realtime && self.carrier.is_none() {
             crate::local_lossy_trace::cell(stage, priority, &self.frame);
         }
+    }
+}
+
+#[cfg(test)]
+mod local_work_tests {
+    use super::*;
+    use veil_types::local_lossy_work::{LocalLossyWork, WorkAdmission};
+
+    fn envelope(
+        work: &std::sync::Arc<LocalLossyWork>,
+        index: usize,
+    ) -> crate::frame_outbox::FrameEnvelope {
+        let mut envelope = crate::frame_outbox::FrameEnvelope::from((
+            BULK,
+            veil_bufpool::pooled_shared_from_vec(vec![0; 100]),
+        ));
+        envelope.local_work = work.cell(index);
+        envelope
+    }
+
+    #[test]
+    fn work_reservation_survives_ingress_queue_and_datagram_restore() {
+        let work = LocalLossyWork::new(vec![100; 2]).unwrap();
+        let mut queue = PriorityQueue::with_default_weights();
+        queue.push_envelope(envelope(&work, 0), true);
+        queue.push_envelope(envelope(&work, 1), true);
+        let first = queue
+            .pop_admitted_envelope(|_, _, _, _| HeadAdmission::Allow)
+            .unwrap();
+        assert_eq!(
+            first.local_work.as_ref().unwrap().admit(1, 416, |total| {
+                assert_eq!(total, 832);
+                Ok(())
+            }),
+            WorkAdmission::Admitted
+        );
+        queue.restore_lossy_envelope(first);
+        for _ in 0..2 {
+            let cell = queue.pop_local_datagram_lane_if(|_, _| true).unwrap();
+            assert_eq!(
+                cell.local_work
+                    .as_ref()
+                    .unwrap()
+                    .admit(1, 416, |_| panic!("whole work already reserved")),
+                WorkAdmission::Admitted
+            );
+        }
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn shedding_one_member_cancels_unsent_siblings() {
+        let work = LocalLossyWork::new(vec![100; 2]).unwrap();
+        let mut queue = PriorityQueue::with_default_weights();
+        queue.push_envelope(envelope(&work, 0), true);
+        for _ in 0..LOSSY_REALTIME_MAX_DEPTH {
+            queue.push_lossy(BULK, veil_bufpool::pooled_shared_from_vec(vec![0; 100]));
+        }
+        assert!(work.cell(1).unwrap().rejected());
     }
 }
 
@@ -213,7 +276,7 @@ impl PriorityQueue {
     /// expense of BULK/BACKGROUND. Drops increment `drops_total` so the
     /// runner can forward them to Prometheus.
     pub fn push(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
-        self.push_entry(priority, frame, None, None, None, None);
+        self.push_entry(priority, frame, None, None, None, None, None);
     }
 
     /// Enqueue a canonical loss-tolerant realtime frame. When its dedicated
@@ -230,7 +293,7 @@ impl PriorityQueue {
     /// Loss tolerance is independent of queue priority. In particular relayed
     /// datagrams share INTERACTIVE FIFO order with other forwarded user data.
     pub fn push_lossy(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
-        self.push_lossy_with_carrier(priority, frame, None, Instant::now(), None);
+        self.push_lossy_with_carrier(priority, frame, None, Instant::now(), None, None);
     }
 
     pub(crate) fn push_envelope(
@@ -246,6 +309,7 @@ impl PriorityQueue {
                 envelope.carrier,
                 envelope.queued_at,
                 envelope.signaling_pending,
+                envelope.local_work,
             );
         } else {
             self.push_entry(
@@ -255,6 +319,7 @@ impl PriorityQueue {
                 envelope.carrier,
                 envelope.reliable_credit,
                 envelope.signaling_pending,
+                envelope.local_work,
             );
         }
     }
@@ -266,9 +331,13 @@ impl PriorityQueue {
         carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
         queued_at: Instant,
         signaling_pending: Option<crate::local_source_activity::PendingSignaling>,
+        local_work: Option<veil_types::local_lossy_work::LocalLossyCell>,
     ) {
         // Expired ingress must not evict a fresh frame from a full class.
         if queued_at.elapsed() > lossy_realtime_max_age(priority) {
+            if let Some(work) = &local_work {
+                work.reject();
+            }
             if carrier.is_none() {
                 crate::local_lossy_trace::cell("queue_expired", priority, &frame);
             }
@@ -298,6 +367,7 @@ impl PriorityQueue {
             carrier,
             None,
             signaling_pending,
+            local_work,
         );
     }
 
@@ -309,6 +379,7 @@ impl PriorityQueue {
         carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
         reliable_credit: Option<tokio::sync::OwnedSemaphorePermit>,
         signaling_pending: Option<crate::local_source_activity::PendingSignaling>,
+        local_work: Option<veil_types::local_lossy_work::LocalLossyCell>,
     ) {
         let lossy_realtime = enqueued_at.is_some();
         let p = queue_index(priority);
@@ -354,6 +425,9 @@ impl PriorityQueue {
             }
             if !shed {
                 // Nothing at-or-below incoming priority to evict — drop it.
+                if let Some(work) = &local_work {
+                    work.reject();
+                }
                 if lossy_realtime && carrier.is_none() {
                     crate::local_lossy_trace::cell("queue_overflow", priority, &frame);
                 }
@@ -368,6 +442,7 @@ impl PriorityQueue {
             carrier,
             reliable_credit,
             signaling_pending,
+            local_work,
         });
         if lossy_realtime {
             self.lossy_realtime_len[p] += 1;
@@ -541,8 +616,15 @@ impl PriorityQueue {
     /// losing its return carrier. No producer runs between pop and restore.
     pub(crate) fn restore_lossy_envelope(&mut self, envelope: crate::frame_outbox::FrameEnvelope) {
         if envelope.queued_at.elapsed() > lossy_realtime_max_age(envelope.frame.0) {
+            if let Some(work) = &envelope.local_work {
+                work.reject();
+            }
             if envelope.carrier.is_none() {
-                crate::local_lossy_trace::cell("queue_expired", envelope.frame.0, &envelope.frame.1);
+                crate::local_lossy_trace::cell(
+                    "queue_expired",
+                    envelope.frame.0,
+                    &envelope.frame.1,
+                );
             }
             self.drops_total.fetch_add(1, Ordering::Relaxed);
             return;
@@ -555,6 +637,7 @@ impl PriorityQueue {
             carrier: envelope.carrier,
             reliable_credit: None,
             signaling_pending: envelope.signaling_pending,
+            local_work: envelope.local_work,
         });
         self.lossy_realtime_len[queue_index(priority)] += 1;
     }
@@ -626,6 +709,7 @@ impl PriorityQueue {
                         queued_at: queued.enqueued_at.unwrap_or_else(Instant::now),
                         reliable_credit: queued.reliable_credit,
                         signaling_pending: queued.signaling_pending,
+                        local_work: queued.local_work,
                     });
                 }
             }
@@ -650,7 +734,7 @@ impl PriorityQueue {
         predicate: impl FnOnce(u8, &[u8]) -> bool,
     ) -> Option<crate::frame_outbox::FrameEnvelope> {
         let mut predicate = Some(predicate);
-        self.pop_admitted_envelope(|priority, frame, _owned_reliable| {
+        self.pop_admitted_envelope(|priority, frame, _owned_reliable, _| {
             if predicate.take().expect("selected FIFO head evaluated once")(priority, frame) {
                 HeadAdmission::Allow
             } else {
@@ -661,7 +745,12 @@ impl PriorityQueue {
 
     pub(crate) fn pop_admitted_envelope(
         &mut self,
-        mut predicate: impl FnMut(u8, &[u8], bool) -> HeadAdmission,
+        mut predicate: impl FnMut(
+            u8,
+            &[u8],
+            bool,
+            Option<&veil_types::local_lossy_work::LocalLossyCell>,
+        ) -> HeadAdmission,
     ) -> Option<crate::frame_outbox::FrameEnvelope> {
         for attempt in 0..2 {
             for p in 0..LOCAL_QUEUE_COUNT {
@@ -682,7 +771,12 @@ impl PriorityQueue {
                 }
                 if let Some(head) = self.queues[p].front() {
                     let owned_reliable = head.reliable_credit.is_some() && head.carrier.is_none();
-                    match predicate(p as u8, &head.frame, owned_reliable) {
+                    match predicate(
+                        p as u8,
+                        &head.frame,
+                        owned_reliable,
+                        head.local_work.as_ref(),
+                    ) {
                         HeadAdmission::Allow => {}
                         HeadAdmission::DeferSource => continue,
                         HeadAdmission::FlushBatch => return None,
@@ -698,6 +792,7 @@ impl PriorityQueue {
                         queued_at: queued.enqueued_at.unwrap_or_else(Instant::now),
                         reliable_credit: queued.reliable_credit,
                         signaling_pending: queued.signaling_pending,
+                        local_work: queued.local_work,
                     });
                 }
             }
@@ -772,6 +867,7 @@ mod tests {
             arc(b"independent"),
             Some(Arc::downgrade(&carrier)),
             Instant::now() - Duration::from_millis(60),
+            None,
             None,
         );
         let before = (
@@ -859,7 +955,7 @@ mod tests {
         pq.push_lossy(REALTIME, arc(b"primary"));
         pq.push_lossy(INTERACTIVE, arc(b"neutral"));
         let mut held = || {
-            pq.pop_admitted_envelope(|priority, _, _| {
+            pq.pop_admitted_envelope(|priority, _, _, _| {
                 if priority == LOCAL_SIGNALING_LANE {
                     HeadAdmission::DeferSource
                 } else {

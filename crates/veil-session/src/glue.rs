@@ -50,6 +50,26 @@ impl SessionTxBroadcaster {
 }
 
 impl veil_types::FrameBroadcaster for SessionTxBroadcaster {
+    fn supports_local_lossy_work(&self) -> bool {
+        true
+    }
+
+    fn send_local_lossy_work(
+        &self,
+        peer_id: &[u8; 32],
+        priority: u8,
+        bytes: Vec<u8>,
+        cell: veil_types::local_lossy_work::LocalLossyCell,
+    ) -> bool {
+        let sender = rlock!(self.inner).get_sender(peer_id).cloned();
+        sender.is_some_and(|sender| {
+            sender.try_send_local_work(
+                (priority, veil_bufpool::pooled_shared_from_vec(bytes)),
+                cell,
+            )
+        })
+    }
+
     fn supports_local_source_feedback(&self) -> bool {
         true
     }

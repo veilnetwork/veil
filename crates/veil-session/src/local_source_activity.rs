@@ -35,9 +35,22 @@ struct SourceState {
     pending_signaling: Vec<Weak<SignalingDeadline>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct LocalSourceActivity {
+    work_owner: u64,
     state: Mutex<SourceState>,
+}
+
+impl Default for LocalSourceActivity {
+    fn default() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let owner = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert_ne!(owner, 0, "local source owner exhausted");
+        Self {
+            work_owner: owner,
+            state: Mutex::default(),
+        }
+    }
 }
 
 /// Endpoint-only ownership through ingress, scheduling and restored attempts.
@@ -88,6 +101,35 @@ impl Drop for ReliableSource {
 }
 
 impl LocalSourceActivity {
+    pub(crate) fn admit_lossy_work(
+        &self,
+        cell: &veil_types::local_lossy_work::LocalLossyCell,
+        bytes: usize,
+        now: Instant,
+    ) -> veil_types::local_lossy_work::WorkAdmission {
+        let mut oversized_under_pressure = false;
+        let decision = cell.admit(self.work_owner, bytes, |total| {
+            if total > LOSSY_SECONDARY_BYTES {
+                let state = lock!(self.state);
+                if state
+                    .last_primary
+                    .is_some_and(|at| now.saturating_duration_since(at) < IDLE_GRACE)
+                    && state.pressure_until.is_some_and(|until| now < until)
+                {
+                    oversized_under_pressure = true;
+                    return Err(now);
+                }
+            }
+            self.admit_lossy_secondary(total, now)
+        });
+        if oversized_under_pressure {
+            cell.reject();
+            veil_types::local_lossy_work::WorkAdmission::Rejected
+        } else {
+            decision
+        }
+    }
+
     pub(crate) fn pending_signal(&self, now: Instant) -> PendingSignaling {
         let deadline = Arc::new(SignalingDeadline {
             until: now + crate::priority_queue::lossy_realtime_max_age(crate::LOCAL_SIGNALING_LANE),
@@ -410,6 +452,87 @@ impl LocalSourceActivity {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn source_work_does_not_spend_a_partial_remaining_allowance() {
+        use veil_types::local_lossy_work::{LocalLossyWork, WorkAdmission};
+        let source = LocalSourceActivity::default();
+        let now = Instant::now();
+        source.note(now);
+        source.note_pressure(now);
+        assert!(source.allow_secondary(6000, now));
+        let work = LocalLossyWork::new(vec![1000; 3]).unwrap();
+        let first = work.cell(0).unwrap();
+        assert!(matches!(
+            source.admit_lossy_work(&first, 1316, now),
+            WorkAdmission::Wait(_)
+        ));
+        // A rejected datagram work item cannot sneak its tail into a later window.
+        first.reject();
+        assert_eq!(
+            source.admit_lossy_work(&work.cell(2).unwrap(), 1316, now + SECONDARY_PROBE_INTERVAL),
+            WorkAdmission::Rejected
+        );
+        // The failed reservation spent nothing; another complete small item fits.
+        assert!(source.allow_secondary(2192, now));
+        assert!(!source.allow_secondary(1, now));
+    }
+
+    #[test]
+    fn camera_screen_and_ordered_sources_share_exact_whole_work_cost() {
+        use veil_types::local_lossy_work::{LocalLossyWork, WorkAdmission};
+        let source = LocalSourceActivity::default();
+        let now = Instant::now();
+        source.note(now);
+        source.note_pressure(now);
+        let camera = LocalLossyWork::new(vec![1000; 3]).unwrap();
+        let screen = LocalLossyWork::new(vec![1000; 3]).unwrap();
+        assert_eq!(
+            source.admit_lossy_work(&camera.cell(0).unwrap(), 1316, now),
+            WorkAdmission::Admitted
+        );
+        assert_eq!(
+            source.admit_lossy_work(&screen.cell(0).unwrap(), 1316, now),
+            WorkAdmission::Admitted
+        );
+        assert!(source.allow_secondary(296, now));
+        assert!(!source.allow_secondary(1, now));
+        // Retries and tails remain paid, including after a pressure refresh.
+        source.note_pressure(now);
+        for work in [&camera, &screen] {
+            for index in 0..3 {
+                assert_eq!(
+                    source.admit_lossy_work(&work.cell(index).unwrap(), 1316, now),
+                    WorkAdmission::Admitted
+                );
+            }
+        }
+        assert!(!source.allow_secondary(1, now));
+    }
+
+    #[test]
+    fn large_source_work_is_healthy_only_and_cannot_burst_under_pressure() {
+        use veil_types::local_lossy_work::{LocalLossyWork, WorkAdmission};
+        let now = Instant::now();
+        let source = LocalSourceActivity::default();
+        let healthy = LocalLossyWork::new(vec![1060; 512]).unwrap();
+        assert_eq!(
+            source.admit_lossy_work(&healthy.cell(0).unwrap(), 1376, now),
+            WorkAdmission::Admitted
+        );
+        source.note(now);
+        source.note_pressure(now);
+        let pressured = LocalLossyWork::new(vec![1060; 512]).unwrap();
+        assert_eq!(
+            source.admit_lossy_work(&pressured.cell(0).unwrap(), 1376, now),
+            WorkAdmission::Rejected
+        );
+        assert_eq!(
+            source.admit_lossy_work(&pressured.cell(511).unwrap(), 1376, now),
+            WorkAdmission::Rejected
+        );
+        assert!(source.allow_secondary(LOSSY_SECONDARY_BYTES, now));
+    }
 
     #[test]
     fn negotiated_data_starts_small_and_recovers_only_after_actual_healthy_sending() {

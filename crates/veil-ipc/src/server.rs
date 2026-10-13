@@ -2238,6 +2238,14 @@ async fn handle_ipc_client(
     if local_source_feedback {
         hello_header.flags |= veil_proto::ipc::IPC_HELLO_OK_LOCAL_SOURCE_FEEDBACK;
     }
+    let local_lossy_work = hello.flags & veil_proto::ipc::IPC_CAP_LOCAL_LOSSY_WORK != 0
+        && session_tx_registry
+            .as_ref()
+            .is_some_and(|reg| reg.supports_local_lossy_work());
+    if local_lossy_work {
+        hello_header.flags |= veil_proto::ipc::IPC_HELLO_OK_LOCAL_LOSSY_WORK;
+    }
+
     stream
         .write_all(&codec::encode_header(&hello_header))
         .await?;
@@ -2491,10 +2499,19 @@ async fn handle_ipc_client(
                             client_state.remove_endpoint(&u.app_id, u.endpoint_id);
                         }
                     }
-                    Ok(LocalAppMsg::AppIpcSend) => {
-                        crate::route_trace::sealed_local_sample(
-                            "daemon_read", veil_proto::ipc::ipc_local_source_lane(&hdr), &body,
-                        );
+                    Ok(LocalAppMsg::AppIpcSend | LocalAppMsg::AppIpcLossyBatch) => {
+                        let batch = if hdr.msg_type == LocalAppMsg::AppIpcLossyBatch as u16 {
+                            if !local_lossy_work || !matches!(veil_proto::ipc::ipc_local_source_lane(&hdr), veil_proto::priority::BULK | veil_proto::priority::BACKGROUND) { continue; }
+                            let Some(batch) = veil_proto::ipc_lossy_batch::LocalLossyBatchPayload::decode(&body) else { continue; };
+                            let Some(work) = veil_types::local_lossy_work::LocalLossyWork::new(batch.cells.iter().map(Vec::len).collect()) else { continue; };
+                            Some((batch.into_sends(), work))
+                        } else { None };
+
+                        if let Some((bodies, _)) = &batch {
+                            for body in bodies { crate::route_trace::sealed_local_sample("daemon_read", veil_proto::ipc::ipc_local_source_lane(&hdr), body); }
+                        } else {
+                            crate::route_trace::sealed_local_sample("daemon_read", veil_proto::ipc::ipc_local_source_lane(&hdr), &body);
+                        }
                         // validate src_app_id belongs to this client.
                         // src_app_id is at bytes [32..64] of the wire payload.
                         let src_app_id_valid = if body.len() >= 64 {
@@ -2522,7 +2539,8 @@ async fn handle_ipc_client(
                             // of refcount bumps — and it is what lets the send
                             // leave this loop instead of holding it for the
                             // length of a DHT key resolve.
-                            let ctx = IpcSendContext {
+                            let mut ctx = IpcSendContext {
+                                local_work: None,
                                 local_priority: veil_proto::ipc::ipc_local_source_lane(&hdr),
                                 app_registry:        Arc::clone(&app_registry),
                                 local_node_id:       node_id,
@@ -2541,12 +2559,17 @@ async fn handle_ipc_client(
                             };
                             // The rate check stays ON the loop — it is a
                             // counter, and refusing has to be immediate.
-                            if !crate::handlers::send::rate_limited(
-                                &mut wh,
-                                &mut rate_limiter,
-                            )
-                            .await?
-                            {
+                            let send_count = batch.as_ref().map_or(1, |(bodies, _)| bodies.len());
+                            let mut limited = false;
+                            // A grouped request must not multiply the local
+                            // client's existing per-cell send quota.
+                            for _ in 0..send_count {
+                                if crate::handlers::send::rate_limited(&mut wh, &mut rate_limiter).await? {
+                                    limited = true;
+                                    break;
+                                }
+                            }
+                            if !limited {
                                 // Everything after it goes OFF the loop. A send
                                 // waits on a key resolve that walks the DHT
                                 // (measured: 3.5 s per send, 43 times in one
@@ -2562,6 +2585,7 @@ async fn handle_ipc_client(
                                 // Moved, not copied: the loop is done with
                                 // this buffer once the send owns it.
                                 let body_owned = body;
+                                let batch_owned = batch;
                                 let reply_tx = reply_tx.clone();
                                 let sem = Arc::clone(&spawn_sem);
                                 let gates = Arc::clone(&destination_gates);
@@ -2570,9 +2594,13 @@ async fn handle_ipc_client(
                                     // no pool slot while it waits. A body that
                                     // does not decode takes no turn: the handler
                                     // drops it without sending anything.
+                                    let (bodies, work) = match batch_owned {
+                                        Some((bodies, work)) => (bodies.into_iter().map(veil_bufpool::pooled_shared_from_vec).collect::<Vec<_>>(), Some(work)),
+                                        None => (vec![body_owned.into_shared()], None),
+                                    };
                                     let turn_waited = std::time::Instant::now();
                                     let _turn = match veil_proto::AppIpcSendPayload::decode(
-                                        &body_owned,
+                                        &bodies[0],
                                     ) {
                                         Ok(send) => Some(gates.enter(send.dst_node_id).await),
                                         Err(_) => None,
@@ -2597,13 +2625,13 @@ async fn handle_ipc_client(
                                     }
                                     let mut sink =
                                         crate::handlers::send::SendReply::Offloop(reply_tx);
-                                    if let Err(e) =
-                                        crate::handlers::send::handle_ipc_send(
-                                            &mut sink, &body_owned, &ctx,
-                                        )
-                                        .await
-                                    {
-                                        log::warn!("ipc send job ended: {e}");
+                                    for (index, body) in bodies.iter().enumerate() {
+                                        ctx.local_work = work.as_ref().and_then(|work| work.cell(index));
+                                        if let Err(e) = crate::handlers::send::handle_ipc_send(&mut sink, body, &ctx).await {
+                                            if let Some(cell) = &ctx.local_work { cell.reject(); }
+                                            log::warn!("ipc send job ended: {e}");
+                                            break;
+                                        }
                                     }
                                 });
                             } else {

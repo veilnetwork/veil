@@ -32,6 +32,7 @@ pub(crate) const NETWORK_CONTROL_QUEUE_DEPTH: usize = 64;
 /// never changes the wire header, priority, FIFO position or queue budget.
 #[derive(Debug)]
 pub struct FrameEnvelope {
+    pub(crate) local_work: Option<veil_types::local_lossy_work::LocalLossyCell>,
     pub frame: PriorityFrame,
     pub carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
     /// Process-local admission time. Loss tolerance is classified by the
@@ -52,6 +53,7 @@ impl From<PriorityFrame> for FrameEnvelope {
             queued_at: Instant::now(),
             reliable_credit: None,
             signaling_pending: None,
+            local_work: None,
         }
     }
 }
@@ -133,6 +135,22 @@ impl FrameSender {
         } else {
             &self.ordinary
         }
+    }
+
+    pub(crate) fn try_send_local_work(
+        &self,
+        frame: PriorityFrame,
+        cell: veil_types::local_lossy_work::LocalLossyCell,
+    ) -> bool {
+        if !matches!(
+            frame.0,
+            veil_proto::priority::BULK | veil_proto::priority::BACKGROUND
+        ) {
+            return false;
+        }
+        let mut envelope = FrameEnvelope::from(frame);
+        envelope.local_work = Some(cell);
+        self.ordinary.try_send(envelope).is_ok()
     }
 
     pub fn try_send(
@@ -230,6 +248,7 @@ impl FrameSender {
                 queued_at: Instant::now(),
                 reliable_credit: Some(credit),
                 signaling_pending: None,
+                local_work: None,
             })
             .await
             .is_ok()
@@ -248,6 +267,7 @@ impl FrameSender {
             queued_at: Instant::now(),
             reliable_credit: None,
             signaling_pending: None,
+            local_work: None,
         })
     }
 

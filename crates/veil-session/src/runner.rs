@@ -757,7 +757,7 @@ fn enqueue_outbox_envelope(
     envelope: crate::frame_outbox::FrameEnvelope,
     source_activity: Option<&crate::local_source_activity::LocalSourceActivity>,
 ) -> bool {
-    let lossy = decode_realtime_lane_frame(&envelope.frame.1).is_some();
+    let lossy = envelope.local_work.is_some() || decode_realtime_lane_frame(&envelope.frame.1).is_some();
     // CircuitDatagram is downgraded before enqueueing for some legacy hops.
     // Its source-only local slot still identifies the low-latency producer;
     // forwarded CircuitData always arrives in the neutral INTERACTIVE slot.
@@ -2695,6 +2695,7 @@ impl SessionRunner {
                 queued_at: std::time::Instant::now(),
                 reliable_credit: Some(req.source_credit),
                 signaling_pending: None,
+                local_work: None,
             },
             false,
         );
@@ -4764,7 +4765,7 @@ impl SessionRunner {
                                 Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
                         }
                         let Some(envelope) = pq
-                            .pop_admitted_envelope(|priority, frame, _| {
+                            .pop_admitted_envelope(|priority, frame, _, _| {
                                 if priority == crate::LOCAL_SIGNALING_LANE
                                     && signaling_wait.is_some()
                                 {
@@ -4827,14 +4828,32 @@ impl SessionRunner {
                                 CarrierSend::Unavailable => {}
                             }
                         }
-                        if !lane.allow_secondary(
-                            outgoing_priority,
-                            encrypted_wire_len(outgoing.len()).unwrap_or(usize::MAX),
-                            std::time::Instant::now(),
-                        ) {
+                        if !match envelope.local_work.as_ref() {
+                            Some(work) => {
+                                let admitted = lane.source_activity.admit_lossy_work(
+                                    work,
+                                    encrypted_wire_len(outgoing.len()).unwrap_or(usize::MAX),
+                                    std::time::Instant::now(),
+                                );
+                                if admitted != veil_types::local_lossy_work::WorkAdmission::Admitted
+                                {
+                                    work.reject();
+                                }
+                                admitted == veil_types::local_lossy_work::WorkAdmission::Admitted
+                            }
+                            None => lane.allow_secondary(
+                                outgoing_priority,
+                                encrypted_wire_len(outgoing.len()).unwrap_or(usize::MAX),
+                                std::time::Instant::now(),
+                            ),
+                        } {
                             // Source feedback only; neutral ChildCarrier traffic
                             // above and forwarded INTERACTIVE cells bypass this.
-                            crate::local_lossy_trace::cell("budget_drop", outgoing_priority, outgoing);
+                            crate::local_lossy_trace::cell(
+                                "budget_drop",
+                                outgoing_priority,
+                                outgoing,
+                            );
                             lane.trace_source_pressure(
                                 &self.logger,
                                 &self.peer_id,
@@ -5273,7 +5292,7 @@ impl SessionRunner {
                     // it. Previously a full (but healthy) channel was treated as
                     // a write failure below and tore down the whole obfs4/TCP
                     // session during a short bulk burst.
-                    && let Some(envelope) = pq.pop_admitted_envelope(|priority, frame, owned_reliable| {
+                    && let Some(envelope) = pq.pop_admitted_envelope(|priority, frame, owned_reliable, local_work| {
                         use crate::priority_queue::HeadAdmission;
                         use crate::reliable_frames::FrameReservationError;
                         use reliable_streams::Route;
@@ -5354,16 +5373,29 @@ impl SessionRunner {
                         // trusted INTERACTIVE slot and cannot enter this gate.
                         if !owned_reliable
                             && matches!(priority, veil_proto::priority::BULK | veil_proto::priority::BACKGROUND)
-                            && decode_realtime_lane_frame(frame).is_some()
+                            && (local_work.is_some() || decode_realtime_lane_frame(frame).is_some())
                             && let Some(outbox) = outbox.as_ref()
-                            && let Err(retry) = outbox.source_activity().admit_lossy_secondary(encrypted_wire_len(frame.len()).unwrap_or(usize::MAX), now)
-                        {
-                            source_pressure_retry = Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
-                            return HeadAdmission::DeferSource;
+                            {
+                            let bytes = encrypted_wire_len(frame.len()).unwrap_or(usize::MAX);
+                            let admission = match local_work {
+                                Some(work) => outbox.source_activity().admit_lossy_work(work, bytes, now),
+                                None => match outbox.source_activity().admit_lossy_secondary(bytes, now) {
+                                    Ok(()) => veil_types::local_lossy_work::WorkAdmission::Admitted,
+                                    Err(until) => veil_types::local_lossy_work::WorkAdmission::Wait(until),
+                                },
+                            };
+                            match admission {
+                                veil_types::local_lossy_work::WorkAdmission::Wait(retry) => {
+                                    source_pressure_retry = Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
+                                    return HeadAdmission::DeferSource;
+                                }
+                                veil_types::local_lossy_work::WorkAdmission::Rejected => return HeadAdmission::Allow,
+                                veil_types::local_lossy_work::WorkAdmission::Admitted => {}
+                            }
                         }
                         if !owned_reliable
                             && matches!(priority, veil_proto::priority::BULK | veil_proto::priority::BACKGROUND)
-                            && decode_realtime_lane_frame(frame).is_some()
+                            && (local_work.is_some() || decode_realtime_lane_frame(frame).is_some())
                         {
                             crate::local_lossy_trace::cell("budget_admit", priority, frame);
                         }
@@ -5418,6 +5450,10 @@ impl SessionRunner {
                     })
                 {
                     drained_this_pass += 1;
+                    if envelope.local_work.as_ref().is_some_and(|work| work.rejected()) {
+                        crate::local_lossy_trace::cell("budget_drop", envelope.frame.0, &envelope.frame.1);
+                        continue;
+                    }
                     if selected_route == reliable_streams::Route::Failed {
                         if let Some(child) = failed_child.take() {
                             reliable_streams.fail_child(child);
@@ -7223,7 +7259,7 @@ mod realtime_lane_frame_tests {
                     .is_none()
             );
             let mut ordinary_count = 0;
-            while let Some(envelope) = pq.pop_admitted_envelope(|_, bytes, _| {
+            while let Some(envelope) = pq.pop_admitted_envelope(|_, bytes, _, _| {
                 if retry_datagram_head(bytes, capabilities, ordinary_count > 0) {
                     HeadAdmission::FlushBatch
                 } else {
