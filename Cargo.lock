@@ -4923,6 +4923,7 @@ dependencies = [
  "veil-dispatcher-state",
  "veil-e2e",
  "veil-error",
+ "veil-identity",
  "veil-local-transport",
  "veil-pending-ack",
  "veil-proto",

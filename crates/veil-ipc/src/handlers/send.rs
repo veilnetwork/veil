@@ -3367,6 +3367,65 @@ mod ratchet_send_tests {
         (dispatcher, endpoint, receiver)
     }
 
+    fn identity_first_relay(
+        sender_device: [u8; 32],
+        receiver_device: [u8; 32],
+    ) -> (veil_dispatcher::FrameDispatcher, veil_session::FrameOutbox) {
+        use veil_identity::verify::ValidatedIdentity;
+        use veil_proto::session::{AttachPayload, CapabilitiesPayload, IdentityPayload, role_bits};
+        use veil_session::{RemoteRole, SessionEntry, SessionRegistry, SessionTxRegistry};
+
+        let mut relay = veil_dispatcher::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        relay.local_node_id = RELAY;
+        let mut sessions = SessionRegistry::new();
+        for (device, identity, instance) in [
+            (sender_device, ME, MY_INSTANCE),
+            (receiver_device, PEER, PEER_INSTANCE),
+        ] {
+            sessions.insert(SessionEntry {
+                session_id: device,
+                remote_node_id: device,
+                remote_identity: IdentityPayload {
+                    algo: 0,
+                    public_key: vec![0; 32],
+                    nonce: vec![],
+                    node_id: device,
+                    mlkem_pubkey: None,
+                },
+                remote_capabilities: CapabilitiesPayload {
+                    roles_supported: role_bits::CORE,
+                    flags: 0,
+                    extra_flags: 0,
+                    discovery_mode: 0,
+                },
+                remote_attach: AttachPayload {
+                    role: 1,
+                    realm_id: 0,
+                    attach_epoch: 0,
+                    mailbox_preference_count: 0,
+                    gateway_preference_count: 0,
+                    flags: 0,
+                },
+                remote_role: RemoteRole::Core,
+                validated_sovereign_identity: Some(ValidatedIdentity {
+                    node_id: identity,
+                    master_algo: 0,
+                    master_pubkey: vec![0; 32],
+                    active_identity_pubkey: vec![0; 32],
+                    active_identity_algo: 0,
+                    active_key_idx: 0,
+                    active_device_id: device,
+                    active_instance_id: instance,
+                }),
+            });
+        }
+        relay.session_registry = Some(Arc::new(Mutex::new(sessions)));
+        let mut tx = SessionTxRegistry::new();
+        let receiver = tx.register(receiver_device);
+        relay.session_tx_registry = Some(Arc::new(RwLock::new(tx)));
+        (relay, receiver)
+    }
+
     fn feed_direct(dispatcher: &veil_dispatcher::FrameDispatcher, frame: &[u8]) {
         let header = codec::decode_header(frame).unwrap();
         assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
@@ -4951,6 +5010,8 @@ mod ratchet_send_tests {
             }
             let (dispatcher, _endpoint, mut receiver) =
                 direct_receiver(&fx.peer, [0xE7; 32], PEER_INSTANCE);
+            let (first_relay, mut relay_receiver) =
+                identity_first_relay(ctx.local_node_id, [0xE7; 32]);
             let mut delivered = false;
             for (hop, frame) in fx.taken() {
                 assert_eq!(hop, RELAY);
@@ -4961,6 +5022,26 @@ mod ratchet_send_tests {
                 if forward.envelope.recipient.node_id != PEER {
                     continue;
                 }
+                assert_eq!(forward.relay_hops, 0);
+                let result = first_relay.dispatch(
+                    &header,
+                    &frame[veil_proto::HEADER_SIZE..],
+                    veil_cfg::NodeId::from(ctx.local_node_id),
+                );
+                assert!(
+                    matches!(result, veil_dispatcher::DispatchResult::NoResponse),
+                    "a proved sender identity must pass the first relay: {result:?}"
+                );
+                let (lane, frame) = relay_receiver
+                    .try_recv()
+                    .expect("first relay must forward to the receiver's live device");
+                assert_eq!(lane, veil_proto::priority::INTERACTIVE);
+                let header = codec::decode_header(&frame).unwrap();
+                let forwarded =
+                    veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                        .unwrap();
+                assert_eq!(forwarded.relay_hops, 1);
+                assert_eq!(forwarded.envelope.sender_node_id, ME);
                 dispatcher.dispatch(
                     &header,
                     &frame[veil_proto::HEADER_SIZE..],
@@ -4996,6 +5077,80 @@ mod ratchet_send_tests {
             }
             assert!(delivered);
         }
+    }
+
+    #[tokio::test]
+    async fn first_relay_requires_the_origin_devices_verified_identity_binding() {
+        let fx = fixture(vec![RELAY]);
+        let mut ctx = fx.ctx(true);
+        ctx.local_node_id = [0xD7; 32];
+        let mut wh = sink().await;
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload(false, b"identity-bound relay control"),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let (_, frame) = fx.taken().pop().unwrap();
+        let header = codec::decode_header(&frame).unwrap();
+        let original =
+            veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                .unwrap();
+        assert_eq!(original.relay_hops, 0);
+        assert_eq!(original.envelope.sender_node_id, ME);
+
+        for case in [
+            "no registry",
+            "no origin proof",
+            "another identity",
+            "another device",
+        ] {
+            let (mut relay, mut rx) = identity_first_relay(ctx.local_node_id, [0xE7; 32]);
+            let mut forward = original.clone();
+            let mut arrived_from = ctx.local_node_id;
+            match case {
+                "no registry" => relay.session_registry = None,
+                "no origin proof" => {
+                    let mut sessions = relay.session_registry.as_ref().unwrap().lock().unwrap();
+                    let mut entry = sessions.remove(&ctx.local_node_id).unwrap();
+                    entry.validated_sovereign_identity = None;
+                    sessions.insert(entry);
+                }
+                "another identity" => forward.envelope.sender_node_id = [0xD8; 32],
+                "another device" => arrived_from = [0xD8; 32],
+                _ => unreachable!(),
+            }
+            let result = relay.dispatch(&header, &forward.encode(), arrived_from);
+            assert!(
+                matches!(result, veil_dispatcher::DispatchResult::Violation(_)),
+                "{case}: {result:?}"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "{case} must not forward a claimed identity"
+            );
+        }
+
+        // A legacy origin still has its transport address without a
+        // sovereign entry for it. This does not authenticate the ciphertext
+        // at the recipient or rename its sender.
+        let (relay, mut rx) = identity_first_relay(ctx.local_node_id, [0xE7; 32]);
+        let mut legacy = original;
+        legacy.envelope.sender_node_id = ctx.local_node_id;
+        relay
+            .session_registry
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(&ctx.local_node_id);
+        let result = relay.dispatch(&header, &legacy.encode(), ctx.local_node_id);
+        assert!(
+            matches!(result, veil_dispatcher::DispatchResult::NoResponse),
+            "legacy: {result:?}"
+        );
+        assert!(rx.try_recv().is_ok());
     }
 
     #[tokio::test]
