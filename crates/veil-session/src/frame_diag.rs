@@ -214,7 +214,7 @@ pub fn note_outbound(dest: &[u8; 32], frame: &[u8], via: &str) {
 /// short to carry a header. Pinned to the protocol's own encoder by
 /// `the_header_offsets_match_the_protocol_encoder`, so a layout change reddens
 /// a test instead of silently pointing the filter at the wrong bytes.
-fn family_and_type(frame: &[u8]) -> Option<(u8, u16)> {
+pub(crate) fn family_and_type(frame: &[u8]) -> Option<(u8, u16)> {
     if frame.len() < veil_proto::header::HEADER_SIZE {
         return None;
     }
