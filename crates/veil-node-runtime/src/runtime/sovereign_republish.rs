@@ -572,10 +572,14 @@ impl NodeRuntime {
                                 &dht_for_density, &sessions_for_first_publish,
                             ));
                             last_topology_publish_at = Some(tokio::time::Instant::now());
+                            let monotonic_marker = if veil_session::rt_trace::rt_trace_enabled() {
+                                veil_util::diagnostic_clock::monotonic_us()
+                                    .map_or_else(String::new, |us| format!(" monotonic_us={us}"))
+                            } else { String::new() };
                             logger.info(
                                 "node.sovereign_identity.replication",
                                 format!(
-                                    "reason={next_publish_reason} wall_unix_ms={}",
+                                    "reason={next_publish_reason} wall_unix_ms={}{monotonic_marker}",
                                     veil_session::tx_registry::now_ms(),
                                 ),
                             );
