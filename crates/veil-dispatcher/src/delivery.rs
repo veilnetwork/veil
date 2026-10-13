@@ -559,9 +559,11 @@ impl FrameDispatcher {
         // catches only a careless liar, and it is NOT what protects the
         // recipient — that is `terminal_sender_provenance`, on the terminal
         // path, where the claim actually turns into an identity (X/V-01). Kept
-        // as cheap defence-in-depth: a peer that says "I am the originator"
-        // and then names someone else is provably misbehaving, and a relay is
-        // the right place to say so.
+        // as cheap defence-in-depth: an origin may name its transport device
+        // or the identity proved by that device's current session handshake.
+        // Ratchet sealing binds the latter into its authenticated data. A
+        // contact row, DHT claim or another device's proof grants no authority
+        // here; without a verified session binding only the device is allowed.
         let is_meta_e2e = payload.envelope.payload.first() == Some(&veil_proto::META_E2E_MARKER);
         if payload.relay_hops == 0 {
             if is_meta_e2e {
@@ -575,7 +577,10 @@ impl FrameDispatcher {
                         veil_util::hex_short(peer_id.as_bytes()),
                     )));
                 }
-            } else if &payload.envelope.sender_node_id != peer_id.as_bytes() {
+            } else if &payload.envelope.sender_node_id != peer_id.as_bytes()
+                && payload.envelope.sender_node_id
+                    != crate::app::sovereign_sender_of(self.session_registry.as_deref(), &peer_id)
+            {
                 return Err(DispatchResult::Violation(format!(
                     "DELIVERY_FORWARD: sender_node_id {} does not match authenticated peer {} (relay_hops=0)",
                     veil_util::hex_short(&payload.envelope.sender_node_id),
