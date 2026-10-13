@@ -245,8 +245,10 @@ impl WriteTrace {
             .is_none_or(|last| now.saturating_duration_since(last) >= LOG_INTERVAL)
         {
             log::info!(target: "transport.tcp_trace.kernel_progress",
-                "connection={} samples={} rtt_max_us={} queued_max_bytes={:?} notsent_max_bytes={:?} retransmitted_max_bytes={:?} kernel_now={:?}",
-                self.connection, self.progress.samples, self.progress.rtt_max_us,
+                "connection={} monotonic_us={} samples={} rtt_max_us={} queued_max_bytes={:?} notsent_max_bytes={:?} retransmitted_max_bytes={:?} kernel_now={:?}",
+                self.connection,
+                veil_util::diagnostic_clock::monotonic_us().map_or_else(|| "unknown".to_owned(), |us| us.to_string()),
+                self.progress.samples, self.progress.rtt_max_us,
                 self.progress.queued_max_bytes, self.progress.notsent_max_bytes,
                 self.progress.retransmitted_max_bytes, snapshot);
             self.progress.last_log = Some(now);
