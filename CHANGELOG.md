@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- A first relay accepts a sender identity only when the originating device's
+  live session has cryptographically proved that identity. Identity-addressed
+  ratchet envelopes were otherwise rejected as a device-address mismatch before
+  reaching their recipient. The sender-to-relay-to-recipient regression now
+  covers ordinary sends, call-control fallback and fanout with cold/warm key
+  caches. Unproved identities, another device's identity and unrelated claims
+  remain rejected; relay scheduling and terminal authentication are unchanged.
+
 - Relayed ratchet messages name the sender identity used during sealing,
   including the call-control fallback and per-device fanout. Previously a
   transport device address could differ from the identity in authenticated

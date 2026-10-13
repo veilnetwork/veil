@@ -50,6 +50,7 @@ veil-dht = { path = "../veil-dht" }
 veil-session = { path = "../veil-session" }
 veil-dispatcher = { path = "../veil-dispatcher" }
 veil-cfg = { path = "../veil-cfg" }
+veil-identity = { path = "../veil-identity" }
 
 [lints]
 workspace = true
