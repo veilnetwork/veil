@@ -95,6 +95,23 @@ impl veil_types::FrameBroadcaster for SessionTxBroadcaster {
         rlock!(self.inner).send_to(peer_id, priority, bytes)
     }
 
+    fn send_to_before(
+        &self,
+        peer_id: &[u8; 32],
+        priority: u8,
+        bytes: Vec<u8>,
+        expires_at: std::time::Instant,
+    ) -> bool {
+        rlock!(self.inner)
+            .get_sender(peer_id)
+            .is_some_and(|sender| {
+                sender.try_send_before(
+                    (priority, veil_bufpool::pooled_shared_from_vec(bytes)),
+                    expires_at,
+                )
+            })
+    }
+
     fn send_local_source_to<'a>(
         &'a self,
         peer_id: &'a [u8; 32],

@@ -158,10 +158,12 @@ impl Fixture {
                 task: self.runtime.spawn(std::future::pending()),
                 video_task: None,
                 screen_task: None,
+                feedback_task: None,
                 video_sender: None,
                 screen_sender: None,
                 sender_app_id: Some(app.app_id),
                 control_destination: None,
+                direct_seq: None,
                 batching: None,
                 cipher,
                 relay_stats: (route == ProbeRoute::Relay)

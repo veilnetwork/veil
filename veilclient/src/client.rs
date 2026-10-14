@@ -325,8 +325,27 @@ impl SharedWriter {
         body: &[u8],
         deadline: Option<tokio::time::Instant>,
     ) -> Result<bool, ClientError> {
+        self.write_frame_on_local_lane_with_deadline_flags(
+            local_priority,
+            msg_type,
+            body,
+            deadline,
+            0,
+        )
+        .await
+    }
+
+    pub(crate) async fn write_frame_on_local_lane_with_deadline_flags(
+        &self,
+        local_priority: u8,
+        msg_type: u16,
+        body: &[u8],
+        deadline: Option<tokio::time::Instant>,
+        local_flags: u16,
+    ) -> Result<bool, ClientError> {
         let mut hdr = FrameHeader::new(FrameFamily::LocalApp as u8, msg_type);
         hdr.body_len = body.len() as u32;
+        hdr.flags |= local_flags;
         hdr.set_priority(local_priority.min(3));
         let mut frame = codec::encode_header(&hdr).to_vec();
         frame.extend_from_slice(body);

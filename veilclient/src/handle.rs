@@ -1030,6 +1030,65 @@ impl AppSender {
             .await
     }
 
+    /// Short-lived already-sealed feedback on the local signaling source.
+    /// The daemon preserves expiration through scheduling and QUIC admission.
+    pub async fn send_short_control_sealed_before_owned(
+        &self,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        data: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, ClientError> {
+        self.writer
+            .write_app_ipc_send_on_local_lane_before_owned(
+                veil_proto::priority::INTERACTIVE,
+                &dst_node_id,
+                &self.app_id,
+                &dst_app_id,
+                dst_endpoint_id,
+                veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+                    | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED
+                    | veil_proto::ipc::IPC_SEND_FLAG_LOCAL_SHORT_CONTROL,
+                &data,
+                deadline,
+                None,
+            )
+            .await
+    }
+
+    /// Direct short-lived opaque control. Local hints disappear at IPC encoding.
+    pub async fn send_short_control_datagram_before(
+        &self,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        seq: u32,
+        data: &[u8],
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, ClientError> {
+        let payload = AppIpcRtSendPayload {
+            dst_node_id,
+            src_app_id: self.app_id,
+            dst_app_id,
+            endpoint_id: dst_endpoint_id,
+            seq,
+            timestamp_us: 0,
+            marker: 0,
+            payload_type: 0,
+            data: data.to_vec(),
+        };
+        self.writer
+            .write_frame_on_local_lane_with_deadline_flags(
+                veil_proto::priority::INTERACTIVE,
+                LocalAppMsg::AppRtSend as u16,
+                &payload.encode(),
+                Some(deadline),
+                veil_proto::ipc::IPC_HEADER_SHORT_DATAGRAM,
+            )
+            .await
+    }
+
     /// Send one loss-tolerant media datagram at REALTIME session priority.
     ///
     /// Mirrors [`AppHandle::send_rt_data`] for split handles used by native

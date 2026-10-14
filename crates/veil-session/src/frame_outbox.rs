@@ -39,6 +39,8 @@ pub struct FrameEnvelope {
     /// runner, but residence in this upstream queue must count toward its age.
     /// Never serialized, and never derived from a peer's clock or wire hint.
     pub(crate) queued_at: Instant,
+    /// Trusted local producer deadline; never serialized or accepted from peers.
+    pub(crate) expires_at: Option<Instant>,
     /// Endpoint-only reliable admission. Held through the scheduler, never
     /// serialized or inferred from a remote frame's priority or contents.
     pub(crate) reliable_credit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -51,6 +53,7 @@ impl From<PriorityFrame> for FrameEnvelope {
             frame,
             carrier: None,
             queued_at: Instant::now(),
+            expires_at: None,
             reliable_credit: None,
             signaling_pending: None,
             local_work: None,
@@ -153,6 +156,22 @@ impl FrameSender {
         self.ordinary.try_send(envelope).is_ok()
     }
 
+    pub fn try_send_before(&self, frame: PriorityFrame, expires_at: Instant) -> bool {
+        if Instant::now() >= expires_at {
+            return false;
+        }
+        let lane = self.lane(&frame);
+        let mut envelope = FrameEnvelope::from(frame);
+        envelope.expires_at = Some(expires_at);
+        if envelope.frame.0 == crate::LOCAL_SIGNALING_LANE {
+            envelope.signaling_pending = Some(
+                self.source_activity
+                    .pending_signal_before(envelope.queued_at, expires_at),
+            );
+        }
+        lane.try_send(envelope).is_ok()
+    }
+
     pub fn try_send(
         &self,
         frame: PriorityFrame,
@@ -246,6 +265,7 @@ impl FrameSender {
                 frame: (veil_proto::priority::BACKGROUND, bytes),
                 carrier: None,
                 queued_at: Instant::now(),
+                expires_at: None,
                 reliable_credit: Some(credit),
                 signaling_pending: None,
                 local_work: None,
@@ -265,6 +285,7 @@ impl FrameSender {
             frame: (veil_proto::priority::INTERACTIVE, bytes),
             carrier: Some(carrier),
             queued_at: Instant::now(),
+            expires_at: None,
             reliable_credit: None,
             signaling_pending: None,
             local_work: None,
