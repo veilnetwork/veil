@@ -4799,10 +4799,31 @@ impl SessionRunner {
                             datagram_drained += 1;
                             continue;
                         }
-                        if let Some(carrier) = envelope
+                        // An installed circuit owns a local flow independently
+                        // of its learned reverse transport. Prefer its ready
+                        // child before reusing that return pipe, which may have
+                        // been shared by several legacy/cold circuits.
+                        let preferred_sender = envelope
                             .carrier
                             .as_ref()
-                            .and_then(|carrier| carrier.upgrade())
+                            .and_then(|w| w.upgrade())
+                            .filter(|carrier| carrier.local_circuit_flow().is_some())
+                            .and_then(|_| {
+                                let (_, body, kind) = decode_realtime_lane_frame(outgoing)?;
+                                lane.select_sender(
+                                    outgoing_priority,
+                                    outgoing,
+                                    body,
+                                    kind,
+                                    envelope.carrier.as_ref(),
+                                )
+                                .filter(|(_, independent)| *independent)
+                            });
+                        if preferred_sender.is_none()
+                            && let Some(carrier) = envelope
+                                .carrier
+                                .as_ref()
+                                .and_then(|carrier| carrier.upgrade())
                         {
                             use veil_anonymity::circuit_carrier::CarrierSend;
                             let result =
@@ -4875,13 +4896,15 @@ impl SessionRunner {
                             outgoing_priority,
                             envelope.carrier.as_ref(),
                         );
-                        let Some((sender, using_parallel)) = lane.select_sender(
-                            outgoing_priority,
-                            outgoing,
-                            body,
-                            lane_kind,
-                            envelope.carrier.as_ref(),
-                        ) else {
+                        let Some((sender, using_parallel)) = preferred_sender.or_else(|| {
+                            lane.select_sender(
+                                outgoing_priority,
+                                outgoing,
+                                body,
+                                lane_kind,
+                                envelope.carrier.as_ref(),
+                            )
+                        }) else {
                             if independent_source {
                                 // Discard while the agreed child is unavailable;
                                 // the next fresh packet may use a ready child.

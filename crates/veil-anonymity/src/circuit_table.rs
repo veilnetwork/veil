@@ -24,8 +24,8 @@
 //! maintenance tick hasn't come round yet.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::circuit_data::{CircuitCellBytes, ReplayWindow};
 use crate::circuit_setup::{CIRCUIT_KEY_LEN, CircuitInstall};
@@ -70,8 +70,8 @@ type Link = [u8; 32];
 pub struct CircuitState {
     /// Weak transport observations belong to this circuit incarnation. They
     /// cannot keep a session alive or leak into a reused circuit id.
-    forward_carrier: Mutex<ObservedCarrier>,
-    backward_carrier: Mutex<ObservedCarrier>,
+    forward_carrier: Arc<crate::circuit_flow::CircuitFlow>,
+    backward_carrier: Arc<crate::circuit_flow::CircuitFlow>,
     /// Cached symmetric key for this hop's data-cell layer (b3).
     pub circuit_key: [u8; CIRCUIT_KEY_LEN],
     /// Neighbour the FORWARD cell arrived from / RETURN cell is sent to.
@@ -111,14 +111,9 @@ pub struct CircuitState {
     last_served_unix: AtomicU64,
 }
 
-#[derive(Debug, Default)]
-struct ObservedCarrier {
-    sequence: u32,
-    carrier: Option<crate::circuit_carrier::Carrier>,
-}
-
 impl Drop for CircuitState {
     fn drop(&mut self) {
+        self.retire();
         // diff-audit Δ2-j: scrub the per-circuit symmetric key on drop so it does
         // not linger in freed memory for the circuit's whole lifetime.
         use zeroize::Zeroize;
@@ -127,6 +122,11 @@ impl Drop for CircuitState {
 }
 
 impl CircuitState {
+    fn retire(&self) {
+        self.forward_carrier.retire();
+        self.backward_carrier.retire();
+    }
+
     /// Call only after exact cell-size and replay admission. Out-of-order
     /// packets cannot overwrite a newer route, and reliable control cells do
     /// not reset this datagram observation.
@@ -141,11 +141,7 @@ impl CircuitState {
         } else {
             &self.backward_carrier
         };
-        let mut observed = slot.lock().unwrap_or_else(|e| e.into_inner());
-        if sequence > observed.sequence {
-            observed.sequence = sequence;
-            observed.carrier = carrier.cloned();
-        }
+        slot.observe(sequence, carrier);
     }
 
     /// FORWARD destinations use the last admitted BACKWARD carrier and vice
@@ -156,10 +152,20 @@ impl CircuitState {
         } else {
             &self.forward_carrier
         };
-        slot.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .carrier
-            .clone()
+        slot.observed_carrier()
+    }
+
+    /// A stable local flow witness exists even before any reverse observation.
+    /// Session selection prefers its own independent ready connection; the
+    /// observed reverse transport remains available as a compatibility fallback.
+    pub fn outbound_carrier(&self, forward: bool) -> crate::circuit_carrier::Carrier {
+        let slot = if forward {
+            &self.backward_carrier
+        } else {
+            &self.forward_carrier
+        };
+        let carrier: Arc<dyn crate::circuit_carrier::DatagramCarrier> = slot.clone();
+        Arc::downgrade(&carrier)
     }
     fn from_install(
         install: &CircuitInstall,
@@ -168,8 +174,8 @@ impl CircuitState {
         now: u64,
     ) -> Self {
         Self {
-            forward_carrier: Mutex::default(),
-            backward_carrier: Mutex::default(),
+            forward_carrier: Arc::new(crate::circuit_flow::CircuitFlow::new(Some(prev_link))),
+            backward_carrier: Arc::new(crate::circuit_flow::CircuitFlow::new(next_link)),
             circuit_key: install.circuit_key,
             prev_link,
             circuit_id_in: install.circuit_id_in,
@@ -307,6 +313,9 @@ impl Inner {
         cid_in: CircuitId,
     ) -> Option<std::sync::Arc<CircuitState>> {
         let state = self.fwd.remove(&(*prev_link, cid_in))?;
+        // In-flight Arc<CircuitState> users must not extend scheduling ownership
+        // after teardown/GC or let it alias a reused wire circuit id.
+        state.retire();
         if let Some(nl) = state.next_link {
             self.bwd.remove(&(nl, state.circuit_id_out));
         }
@@ -319,6 +328,14 @@ impl Inner {
             }
         }
         Some(state)
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        for state in self.fwd.values() {
+            state.retire();
+        }
     }
 }
 
@@ -578,6 +595,10 @@ impl Default for CircuitTable {
         Self::new()
     }
 }
+
+#[cfg(test)]
+#[path = "circuit_flow_tests.rs"]
+mod circuit_flow_tests;
 
 #[cfg(test)]
 mod tests {

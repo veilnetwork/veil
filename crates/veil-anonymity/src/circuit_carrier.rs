@@ -1,4 +1,4 @@
-//! Process-local return transport for a circuit, never a wire role or priority.
+//! Process-local flow ownership and return transport, never a wire role or priority.
 //! The session invokes it ONLY after the ordinary peer queue selects the cell.
 
 /// Exact result of one loss-tolerant frame admission. A partial send must not
@@ -22,6 +22,18 @@ pub trait DatagramCarrier: Send + Sync {
     /// Retired parents must return None. Legacy carriers have no observation.
     fn local_ingress_flow(&self) -> Option<LocalIngressFlow> {
         None
+    }
+
+    /// Circuit-lifetime ownership, independent of the observed return pipe.
+    /// It is deliberately a different identity namespace from ingress handles.
+    fn local_circuit_flow(&self) -> Option<LocalCircuitFlow> {
+        None
+    }
+
+    fn local_transit_flow(&self) -> Option<LocalTransitFlow> {
+        self.local_circuit_flow()
+            .map(LocalTransitFlow::Circuit)
+            .or_else(|| self.local_ingress_flow().map(LocalTransitFlow::Ingress))
     }
 
     fn try_send(
@@ -48,3 +60,18 @@ impl std::fmt::Debug for LocalIngressFlow {
 }
 
 pub type Carrier = std::sync::Weak<dyn DatagramCarrier>;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct LocalCircuitFlow(pub(crate) usize);
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum LocalTransitFlow {
+    Ingress(LocalIngressFlow),
+    Circuit(LocalCircuitFlow),
+}
+
+impl std::fmt::Debug for LocalTransitFlow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LocalTransitFlow(<local ownership>)")
+    }
+}
