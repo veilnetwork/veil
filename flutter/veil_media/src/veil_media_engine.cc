@@ -3754,6 +3754,9 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     uint64_t audio_rx_pkts = 0;
     int64_t audio_rx_native_age_ms = -1;
     uint64_t audio_concealed_samples = 0;
+    uint64_t audio_output_emitted_samples = 0;
+    uint64_t audio_total_samples_received = 0;
+    uint64_t audio_output_duration_ms = 0;
     uint64_t audio_concealment_events = 0;
     uint64_t audio_jb_flushes = 0;
     uint64_t audio_discarded_packets = 0;
@@ -3825,6 +3828,11 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         // RTCP counters, but cannot prove that encoded audio is arriving.
         audio_rx_native_age_ms = ws->shim->audio_payload_receive_age_ms();
         audio_concealed_samples = r.concealed_samples;
+        // Lifetime sample counters distinguish delivery jitter from a slow
+        // playout clock. They are endpoint diagnostics, never wire metadata.
+        audio_output_emitted_samples = r.jitter_buffer_emitted_count;
+        audio_total_samples_received = r.total_samples_received;
+        audio_output_duration_ms = static_cast<uint64_t>(r.total_output_duration * 1000);
         audio_concealment_events = r.concealment_events;
         audio_jb_flushes = r.jitter_buffer_flushes;
         audio_discarded_packets = r.packets_discarded;
@@ -4029,6 +4037,9 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
            sizeof(json), written);
     } else {
       std::string snapshot(json, static_cast<size_t>(written) - 1);
+      snapshot += ",\"audio_output_emitted_samples\":" + std::to_string(audio_output_emitted_samples);
+      snapshot += ",\"audio_total_samples_received\":" + std::to_string(audio_total_samples_received);
+      snapshot += ",\"audio_output_duration_ms\":" + std::to_string(audio_output_duration_ms);
       snapshot += ",\"audio_tx_rtp_drops\":" + std::to_string(tx_audio.dropped);
       const auto video_send = ws->shim->video_send_stats();
       snapshot += ",\"video_tx_rtp_attempts\":" + std::to_string(video_send.attempts);
