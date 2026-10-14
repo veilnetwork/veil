@@ -24,6 +24,11 @@ pub const RELIABLE_SOURCE_QUEUE_DEPTH: usize = 4;
 // and an oversized frame owns the whole lookahead rather than sitting behind
 // three other huge envelopes. Capping its cost permits eventual admission.
 const RELIABLE_SOURCE_CREDIT_BYTES: usize = 1536;
+fn reliable_source_cost(bytes: usize) -> u32 {
+    bytes
+        .div_ceil(RELIABLE_SOURCE_CREDIT_BYTES)
+        .clamp(1, RELIABLE_SOURCE_QUEUE_DEPTH) as u32
+}
 const MAX_RESERVED_BURST: usize = 8;
 const MAX_CONTROL_BURST: usize = 4;
 pub(crate) const NETWORK_CONTROL_QUEUE_DEPTH: usize = 64;
@@ -182,11 +187,20 @@ impl FrameSender {
         } else {
             self.lane(&frame)
         };
-        let credit = if control {
+        let recoverable = frame.0 == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE;
+        let credit = if control || recoverable {
             if lane.is_closed() {
                 return Err(mpsc::error::TrySendError::Closed(frame));
             }
-            match self.control_credits.clone().try_acquire_owned() {
+            let (credits, cost) = if recoverable {
+                (
+                    self.reliable_credits.clone(),
+                    reliable_source_cost(frame.1.len()),
+                )
+            } else {
+                (self.control_credits.clone(), 1)
+            };
+            match credits.try_acquire_many_owned(cost) {
                 Ok(credit) => Some(credit),
                 Err(_) => return Err(mpsc::error::TrySendError::Full(frame)),
             }
@@ -225,12 +239,20 @@ impl FrameSender {
         } else {
             self.lane(&frame)
         };
-        let credit = if control {
-            let credits = self.control_credits.clone();
+        let recoverable = frame.0 == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE;
+        let credit = if control || recoverable {
+            let (credits, cost) = if recoverable {
+                (
+                    self.reliable_credits.clone(),
+                    reliable_source_cost(frame.1.len()),
+                )
+            } else {
+                (self.control_credits.clone(), 1)
+            };
             tokio::select! {
                 biased;
                 _ = lane.closed() => return Err(mpsc::error::SendError(frame)),
-                permit = credits.acquire_owned() => match permit {
+                permit = credits.acquire_many_owned(cost) => match permit {
                     Ok(credit) => Some(credit),
                     Err(_) => return Err(mpsc::error::SendError(frame)),
                 },
@@ -252,10 +274,7 @@ impl FrameSender {
     /// A bounded reliable source keeps its admission credit while waiting in
     /// ingress AND the scheduler, so draining ingress cannot erase pressure.
     pub(crate) async fn send_reliable(&self, bytes: veil_bufpool::PooledShared) -> bool {
-        let cost = bytes
-            .len()
-            .div_ceil(RELIABLE_SOURCE_CREDIT_BYTES)
-            .clamp(1, RELIABLE_SOURCE_QUEUE_DEPTH) as u32;
+        let cost = reliable_source_cost(bytes.len());
         let Ok(credit) = self.reliable_credits.clone().acquire_many_owned(cost).await else {
             return false;
         };
@@ -543,6 +562,86 @@ impl FrameOutbox {
 mod tests {
     use super::*;
     use veil_proto::priority::{INTERACTIVE, REALTIME};
+
+    #[tokio::test]
+    async fn recoverable_data_credit_survives_scheduler_and_datagram_restore() {
+        let lane = veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE;
+        let (tx, mut rx) = frame_channel(64);
+        let packet = || (lane, veil_bufpool::pooled_shared_from_vec(vec![42; 2048]));
+        tx.try_send(packet()).unwrap();
+        tx.try_send(packet()).unwrap();
+        assert!(matches!(
+            tx.try_send(packet()),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        let admitted = rx.recv_envelope().await.unwrap();
+        let original_time = admitted.queued_at;
+        let mut pq = crate::priority_queue::PriorityQueue::with_default_weights();
+        pq.push_envelope(admitted, true);
+        // Moving a frame out of ingress does not manufacture source capacity.
+        assert!(matches!(
+            tx.try_send(packet()),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        let queued = pq.pop_datagram_envelope_if(|_| true).unwrap();
+        assert!(queued.reliable_credit.is_some());
+        pq.restore_lossy_envelope(queued);
+        assert!(matches!(
+            tx.try_send(packet()),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        let queued = pq.pop_datagram_envelope_if(|_| true).unwrap();
+        assert_eq!(queued.queued_at, original_time);
+        assert!(queued.reliable_credit.is_some());
+        drop(queued);
+        tx.try_send(packet()).unwrap();
+        // Primary media owns its independent ingress budget.
+        tx.try_send((
+            veil_proto::priority::REALTIME,
+            veil_bufpool::pooled_shared_from_vec(vec![1]),
+        ))
+        .unwrap();
+        assert_eq!(pq.drops_total(), 0);
+    }
+
+    #[tokio::test]
+    async fn recoverable_credit_wait_is_released_by_admission_and_wakes_on_shutdown() {
+        let lane = veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE;
+        let (tx, mut rx) = frame_channel(64);
+        let packet = || (lane, veil_bufpool::pooled_shared_from_vec(vec![42; 2048]));
+        tx.try_send(packet()).unwrap();
+        tx.try_send(packet()).unwrap();
+        let mut pq = crate::priority_queue::PriorityQueue::with_default_weights();
+        pq.push_envelope(rx.recv_envelope().await.unwrap(), true);
+        let sender = tx.clone();
+        let waiting = sender.send(packet());
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(pq.pop_datagram_envelope_if(|_| true));
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        let sender = tx.clone();
+        let waiting = sender.send(packet());
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(rx);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn signaling_ownership_survives_ingress_scheduler_and_restore() {

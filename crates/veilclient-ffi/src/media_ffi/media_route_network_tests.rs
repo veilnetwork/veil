@@ -1,6 +1,7 @@
 //! Real node runtimes, builders, relay dispatchers and native media pumps.
-//! Session outboxes are joined in memory, exercising encrypted onion splicing
-//! and call negotiation. This does not measure QUIC congestion or acoustics.
+//! Most fixtures join session outboxes in memory. The real-obfs4 variant uses
+//! actual authenticated sessions, independent children and encrypted splicing.
+//! Neither variant measures codec PCM or physical acoustic quality.
 use super::*;
 use crate::anon_stream::MediaRoutes;
 use crate::media::{LocalMediaPlane, cipher_for_test};
@@ -34,6 +35,9 @@ impl Stand {
         Self::with_middle_count(1).await
     }
     async fn with_middle_count(middle_count: usize) -> Self {
+        Self::with_links(middle_count, false).await
+    }
+    async fn with_links(middle_count: usize, real_obfs4: bool) -> Self {
         assert!(middle_count >= 1);
         let mut s = Self {
             _dirs: Vec::new(),
@@ -45,6 +49,7 @@ impl Stand {
             file_dropped: Arc::default(),
             file_cells: Arc::default(),
         };
+        let mut configs = Vec::new();
         for _ in 0..middle_count + 3 {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("config.toml");
@@ -89,19 +94,103 @@ impl Stand {
             // Equal relay allowance, above the burst on every node. This
             // test stalls an endpoint sink, not the shared service quota.
             cfg.dht.service_budget_bytes_per_hour = Some(u64::MAX);
-            veil_cfg::save_config(&path, &cfg).unwrap();
-            let node = NodeRuntime::start(&path, true).await.unwrap();
-            s.services.push(node.access());
-            s.nodes.push(node);
+            configs.push((path, cfg));
             s._dirs.push(dir);
         }
         // A(0) and C(1) -> middle(2) -> rendezvous(3). Relays use ordinary
         // priority for every cell; producer lanes are endpoint-local.
         let middles: Vec<_> = std::iter::once(2).chain(4..middle_count + 3).collect();
-        for &middle in &middles {
-            for (a, b) in [(0, middle), (1, middle), (middle, 3)] {
-                s.connect(a, b);
-                s.connect(b, a);
+        let mut uris = Vec::new();
+        let mut reserved_ports = Vec::new();
+        if real_obfs4 {
+            let psk = s._dirs[0].path().join("fixture-obfs4.psk");
+            std::fs::write(
+                &psk,
+                base64::engine::general_purpose::STANDARD.encode([0x42; 32]),
+            )
+            .unwrap();
+            let rendezvous = configs[3]
+                .1
+                .identity
+                .as_ref()
+                .unwrap()
+                .node_id
+                .unwrap()
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            for (index, (_, cfg)) in configs.iter_mut().enumerate() {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let uri = format!("obfs4-tcp://{}", listener.local_addr().unwrap());
+                cfg.listen = vec![veil_cfg::ListenConfig {
+                    id: "0x00000001".parse().unwrap(),
+                    transport: uri.clone(),
+                    ..Default::default()
+                }];
+                cfg.transport.obfs4_psk_file = Some(psk.clone());
+                cfg.global.builtin_seed_policy = veil_cfg::BuiltinSeedPolicy::Never;
+                cfg.pex.enabled = false;
+                cfg.anonymity.receive_anonymous = index < 2;
+                cfg.anonymity.relay_capable = index >= 2;
+                cfg.anonymity.rendezvous_relays = vec![rendezvous.clone()];
+                cfg.peers.clear();
+                uris.push(uri);
+                reserved_ports.push(listener);
+            }
+            for &middle in &middles {
+                for (a, b) in [(0, middle), (1, middle), (middle, 3)] {
+                    for (from, to) in [(a, b), (b, a)] {
+                        let identity = configs[to].1.identity.as_ref().unwrap().clone();
+                        configs[from].1.peers.push(veil_cfg::PeerConfig {
+                            peer_id: format!("0x{:08x}", to + 1).parse().unwrap(),
+                            public_key: identity.public_key,
+                            nonce: identity.nonce,
+                            algo: identity.algo,
+                            transport: uris[to].clone(),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+        drop(reserved_ports);
+        for (path, cfg) in configs {
+            veil_cfg::save_config(&path, &cfg).unwrap();
+            let node = NodeRuntime::start(&path, true).await.unwrap();
+            s.services.push(node.access());
+            s.nodes.push(node);
+        }
+        if real_obfs4 {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let ready = middles.iter().all(|&middle| {
+                        [(0, middle), (1, middle), (middle, 3)]
+                            .iter()
+                            .all(|&(a, b)| {
+                                s.services[a].has_live_session(&s.services[b].local_node_id())
+                                    && s.services[b]
+                                        .has_live_session(&s.services[a].local_node_id())
+                            })
+                    });
+                    if ready {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("real loopback obfs4 topology must become active");
+            assert!(
+                s.pipes.is_empty(),
+                "real sessions must not use in-memory delivery"
+            );
+        } else {
+            for &middle in &middles {
+                for (a, b) in [(0, middle), (1, middle), (middle, 3)] {
+                    s.connect(a, b);
+                    s.connect(b, a);
+                }
             }
         }
         let now = std::time::SystemTime::now()
@@ -134,7 +223,11 @@ impl Stand {
             for &middle in &middles {
                 svc.dht.add_contact(veil_dht::routing::Contact::new(
                     s.services[middle].local_node_id(),
-                    "tcp://127.0.0.1:1",
+                    if real_obfs4 {
+                        uris[middle].as_str()
+                    } else {
+                        "tcp://127.0.0.1:1"
+                    },
                 ));
             }
             svc.publish_stream_rendezvous_ad(
@@ -241,7 +334,7 @@ struct Channel {
     routes: Arc<MediaRoutes>,
     _callback: Box<mpsc::Sender<Received>>,
     rx: mpsc::Receiver<Received>,
-    _files: mpsc::Receiver<(veil_onion_stream::Addr, Vec<u8>)>,
+    files: Arc<crate::anon_stream::CircuitStreamMuxForTest>,
 }
 impl Drop for Channel {
     fn drop(&mut self) {
@@ -335,7 +428,7 @@ fn channel(me: [u8; 32], peer: [u8; 32], tx_key: [u8; 32], rx_key: [u8; 32]) -> 
         routes,
         _callback: context,
         rx,
-        _files: files,
+        files: Arc::new(files),
     }
 }
 fn packet(pt: u8, seq: u16) -> Vec<u8> {
@@ -582,6 +675,188 @@ async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stall
     stand.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn private_media_routes_deliver_over_real_multihop_obfs4_sessions() {
+    let stand = Stand::with_links(1, true).await;
+    let a = &stand.services[0];
+    let c = &stand.services[1];
+    let mut ca = channel(a.local_node_id(), c.local_node_id(), [0xa1; 32], [0xc1; 32]);
+    let mut cc = channel(c.local_node_id(), a.local_node_id(), [0xc1; 32], [0xa1; 32]);
+    let registry = stand.services[3]
+        .dispatcher
+        .circuit_rendezvous
+        .as_ref()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if registry.lookup(&a.onion_stream_local_cookie()).is_some()
+                && registry.lookup(&c.onion_stream_local_cookie()).is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("both real receive registrations must reach rendezvous");
+    stand.copy_ads(0, 1);
+    stand.copy_ads(1, 0);
+    ca.routes.start(&tokio::runtime::Handle::current());
+    cc.routes.start(&tokio::runtime::Handle::current());
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if ca.routes.outgoing_for_test().await.len() == 3
+                && cc.routes.outgoing_for_test().await.len() == 3
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("audio, camera and control must negotiate real private routes");
+    for routes in [&ca.routes, &cc.routes] {
+        for route in routes.outgoing_for_test().await {
+            assert_eq!(route.first_hop, stand.services[2].local_node_id());
+            let source = if Arc::ptr_eq(routes, &ca.routes) {
+                a
+            } else {
+                c
+            };
+            let middle = stand.services[2]
+                .dispatcher
+                .circuit_table
+                .as_ref()
+                .unwrap()
+                .lookup_forward(&source.local_node_id(), route.origin)
+                .unwrap();
+            assert_eq!(middle.next_link, Some(stand.services[3].local_node_id()));
+            let terminus = stand.services[3]
+                .dispatcher
+                .circuit_table
+                .as_ref()
+                .unwrap()
+                .lookup_forward(&stand.services[2].local_node_id(), middle.circuit_id_out)
+                .unwrap();
+            assert!(terminus.next_link.is_none());
+        }
+    }
+    for seq in 1..=20 {
+        for payload_type in [111, 96] {
+            let forward = packet(payload_type, seq);
+            let reverse = packet(payload_type, seq + 100);
+            assert_eq!(send(ca.id, &forward), 0);
+            assert_eq!(send(cc.id, &reverse), 0);
+            expect_packet(&mut cc.rx, &forward).await;
+            expect_packet(&mut ca.rx, &reverse).await;
+        }
+    }
+    let feedback = vec![0x80, 201, 0, 1, 0, 0, 0, 7];
+    assert_eq!(send(ca.id, &feedback), 0);
+    expect_packet(&mut cc.rx, &feedback).await;
+
+    // Actual recoverable file traffic shares these node sessions. Wait for its
+    // first bytes before measuring media; circuit construction alone is not load.
+    let mux_a = Arc::clone(&ca.files);
+    let mux_c = Arc::clone(&cc.files);
+    let destination = c.local_node_id();
+    let (first_bytes, file_started) = tokio::sync::oneshot::channel();
+    let file_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = Arc::clone(&file_done);
+    let file = tokio::spawn(async move {
+        let expected: Vec<_> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let outgoing = mux_a.open(veil_onion_stream::Addr {
+            node: destination,
+            app: [0; 32],
+        });
+        let send = async {
+            outgoing.write_all(&expected).await.unwrap();
+            outgoing.finish().await.unwrap();
+        };
+        let receive = async {
+            let (mut incoming, _) = mux_c.accept().await.unwrap();
+            let mut first_bytes = Some(first_bytes);
+            let mut bytes = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let count = incoming.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(first_bytes) = first_bytes.take() {
+                    let _ = first_bytes.send(());
+                }
+            }
+            assert_eq!(
+                bytes, expected,
+                "real multihop file must preserve every byte"
+            );
+        };
+        tokio::join!(send, receive);
+        done.store(true, std::sync::atomic::Ordering::Release);
+    });
+    tokio::time::timeout(Duration::from_secs(30), file_started)
+        .await
+        .unwrap()
+        .unwrap();
+    let id = ca.id;
+    let video = tokio::spawn(async move {
+        for seq in 2000..2512 {
+            let _ = send(id, &packet(96, seq));
+            if seq % 4 == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    });
+    let mut worst = Duration::ZERO;
+    let mut overlap = 0;
+    let mut video_received = 0;
+    for seq in 1000..1050 {
+        let forward = packet(111, seq);
+        let started = Instant::now();
+        if !file_done.load(std::sync::atomic::Ordering::Acquire) {
+            overlap += 1;
+        }
+        assert_eq!(send(ca.id, &forward), 0);
+        let arrival = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let received = cc.rx.recv().await.unwrap();
+                if received.packet.get(1).is_some_and(|pt| pt & 0x7f == 96) {
+                    video_received += 1;
+                }
+                if received.packet == forward {
+                    break received.at;
+                }
+            }
+        })
+        .await
+        .expect("audio must keep arriving during file/video load");
+        worst = worst.max(arrival.duration_since(started));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    video.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(60), file)
+        .await
+        .unwrap()
+        .unwrap();
+    drop((ca, cc));
+    stand.stop().await;
+    assert!(overlap > 0, "media must overlap actual file delivery");
+    assert!(
+        video_received > 0,
+        "competing video must actually reach the endpoint"
+    );
+    eprintln!(
+        "real_multihop_media: audio_packets=50 file_overlap={overlap} video_packets={video_received} packet_delay_peak_ms={:.3}",
+        worst.as_secs_f64() * 1000.0
+    );
+    assert!(
+        worst < Duration::from_millis(200),
+        "network packet delay exceeded 200 ms under local video/file load: {worst:?}"
+    );
+}
+
 /// Distinct local producers select different real first-hop sessions when
 /// three middles exist. The same relay-header/queue assertions as the scarce
 /// four-node stand apply to every forwarded build, probe and media cell.
@@ -674,14 +949,29 @@ async fn private_media_paths_use_distinct_first_hops_when_alternatives_exist() {
 
 #[tokio::test]
 async fn recoverable_file_data_uses_its_own_local_lane_through_neutral_relays() {
+    verify_recoverable_file(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recoverable_file_crosses_real_obfs4_without_media_load() {
+    verify_recoverable_file(true).await;
+}
+
+async fn verify_recoverable_file(real_obfs4: bool) {
     use std::sync::atomic::Ordering;
-    let stand = Stand::new().await;
+    let stand = Stand::with_links(1, real_obfs4).await;
     let a = stand.services[0].local_node_id();
     let c = stand.services[1].local_node_id();
     let mux_a = crate::anon_stream::circuit_stream_mux_for_test(a);
     let mux_c = crate::anon_stream::circuit_stream_mux_for_test(c);
-    stand.file_loss_budget.store(4, Ordering::Release);
-    let expected: Vec<u8> = (0..64 * 1024).map(|index| (index % 251) as u8).collect();
+    let loss = if real_obfs4 { 0 } else { 4 };
+    stand.file_loss_budget.store(loss, Ordering::Release);
+    let size = if real_obfs4 {
+        4 * 1024 * 1024
+    } else {
+        64 * 1024
+    };
+    let expected: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
     let result = tokio::time::timeout(Duration::from_secs(30), async {
         let outgoing = mux_a.open(veil_onion_stream::Addr {
             node: c,
@@ -715,6 +1005,8 @@ async fn recoverable_file_data_uses_its_own_local_lane_through_neutral_relays() 
     drop((mux_a, mux_c));
     stand.stop().await;
     result.expect("recoverable file must complete through both neutral relays");
-    assert_eq!(dropped, 4);
-    assert!(cells > 4);
+    assert_eq!(dropped, loss);
+    if !real_obfs4 {
+        assert!(cells > 4);
+    }
 }
