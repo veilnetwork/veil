@@ -1,17 +1,17 @@
 //! Bounded process-local ownership of generic connections. An authenticated
-//! ingress connection stays separate without exposing its application role.
+//! ingress connection or installed circuit stays separate without exposing its application role.
 //! Allocation is first come, within the existing connection quota. It never
 //! changes relay admission, FIFO order, bandwidth or scheduling priority.
 
 use std::time::{Duration, Instant};
-use veil_anonymity::circuit_carrier::{Carrier, LocalIngressFlow};
+use veil_anonymity::circuit_carrier::{Carrier, LocalTransitFlow};
 
 const SOURCE_COUNT: usize = crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES.len();
 const LEGACY_IDLE: Duration = Duration::from_secs(30);
 
 enum Owner {
     Source(usize),
-    Ingress(LocalIngressFlow, Carrier),
+    Transit(LocalTransitFlow, Carrier),
     Legacy { bucket: usize, used: Instant },
 }
 
@@ -39,9 +39,9 @@ impl<const N: usize> ChannelAssignments<N> {
         // cannot alias a newly allocated connection at a reused address.
         for owner in &mut self.owners {
             let expired = match owner {
-                Some(Owner::Ingress(key, witness)) => witness
+                Some(Owner::Transit(key, witness)) => witness
                     .upgrade()
-                    .is_none_or(|carrier| carrier.local_ingress_flow() != Some(*key)),
+                    .is_none_or(|carrier| carrier.local_transit_flow() != Some(*key)),
                 Some(Owner::Legacy { used, .. }) => {
                     now.saturating_duration_since(*used) >= LEGACY_IDLE
                 }
@@ -72,8 +72,8 @@ impl<const N: usize> ChannelAssignments<N> {
         })
     }
 
-    /// The opaque authenticated ingress witness, never frame contents, chooses
-    /// a distinct live connection. Legacy ingress retains neutral buckets.
+    /// Opaque authenticated ingress/circuit ownership, never frame contents,
+    /// chooses a distinct live connection. Legacy ingress retains neutral buckets.
     /// Saturation returns None instead of merging two live known connections.
     pub fn transit(&mut self, witness: Option<&Carrier>, bucket: usize) -> Option<Selection> {
         self.transit_at(witness, bucket, Instant::now())
@@ -88,17 +88,17 @@ impl<const N: usize> ChannelAssignments<N> {
         self.reap(now);
         let flow = witness
             .and_then(|w| w.upgrade())
-            .and_then(|w| w.local_ingress_flow());
+            .and_then(|w| w.local_transit_flow());
         let physical = if let (Some(key), Some(witness)) = (flow, witness) {
             if let Some(index) = self
                 .owners
                 .iter()
-                .position(|o| matches!(o, Some(Owner::Ingress(existing, _)) if *existing == key))
+                .position(|o| matches!(o, Some(Owner::Transit(existing, _)) if *existing == key))
             {
                 index
             } else {
                 let index = self.free(bucket)?;
-                self.owners[index] = Some(Owner::Ingress(key, witness.clone()));
+                self.owners[index] = Some(Owner::Transit(key, witness.clone()));
                 index
             }
         } else if let Some(index) = self.owners.iter().position(
@@ -133,7 +133,7 @@ mod tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
-    use veil_anonymity::circuit_carrier::{CarrierSend, DatagramCarrier};
+    use veil_anonymity::circuit_carrier::{CarrierSend, DatagramCarrier, LocalIngressFlow};
 
     struct Ingress {
         key: LocalIngressFlow,

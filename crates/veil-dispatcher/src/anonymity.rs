@@ -1273,7 +1273,7 @@ impl FrameDispatcher {
                                 &NodeId::from(nl),
                                 transport,
                                 &b,
-                                state.destination_carrier(true),
+                                Some(state.outbound_carrier(true)),
                             );
                             circuit_data_diag(|d| {
                                 if sent {
@@ -1428,7 +1428,7 @@ impl FrameDispatcher {
                         &NodeId::from(state.prev_link),
                         transport,
                         &b,
-                        state.destination_carrier(false),
+                        Some(state.outbound_carrier(false)),
                     );
                     circuit_data_diag(|d| {
                         if sent {
@@ -1906,7 +1906,7 @@ impl FrameDispatcher {
                 &NodeId::from(circuit.prev_link),
                 transport,
                 &body,
-                circuit.destination_carrier(false),
+                Some(circuit.outbound_carrier(false)),
             );
             circuit_data_diag(|d| {
                 if sent {

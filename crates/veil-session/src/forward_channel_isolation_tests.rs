@@ -6,7 +6,7 @@ use crate::parallel_binding::{ParallelKeys, ParallelParent};
 use tokio::time::{Duration, timeout};
 use veil_anonymity::circuit_carrier::{Carrier, DatagramCarrier};
 
-fn raw_pair(
+pub(super) fn raw_pair(
     left: &ParallelParent,
     right: &ParallelParent,
     capacity: usize,
@@ -52,7 +52,7 @@ fn opaque_forward(fill: u8) -> Vec<u8> {
     veil_proto::codec::encode_frame(&header, &body)
 }
 
-fn publish(sender: &Arc<Mutex<RealtimeSender>>, frame: &[u8]) {
+pub(super) fn publish(sender: &Arc<Mutex<RealtimeSender>>, frame: &[u8]) {
     let (_, body, kind) = decode_realtime_lane_frame(frame).unwrap();
     let mut sender = lock!(sender);
     let size = sender.handle.max_size().unwrap();

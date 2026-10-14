@@ -442,9 +442,7 @@ impl Pool {
                 return None;
             }
             let bucket = parallel_lanes::neutral_transit_index(salt, body, kind)?;
-            let ingress = (kind == RealtimeLaneFrameKind::RelayForward)
-                .then_some(ingress)
-                .flatten();
+            let ingress = parallel_lanes::transit_witness(kind, ingress);
             self.assignments.transit(ingress, bucket)?
         };
         let ready = self.slots[selected.physical]
@@ -459,3 +457,7 @@ impl Pool {
 #[cfg(test)]
 #[path = "forward_channel_isolation_tests.rs"]
 mod forward_channel_isolation_tests;
+
+#[cfg(test)]
+#[path = "circuit_channel_isolation_tests.rs"]
+mod circuit_channel_isolation_tests;

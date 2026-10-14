@@ -687,11 +687,7 @@ impl ParallelSession {
                 return None;
             }
             let bucket = neutral_transit_index(&self.transit_salt, body, kind)?;
-            // Circuit continuity uses its existing authenticated per-link ID.
-            // Forward continuity uses the incoming connection, never app data.
-            let ingress = (kind == RealtimeLaneFrameKind::RelayForward)
-                .then_some(ingress)
-                .flatten();
+            let ingress = transit_witness(kind, ingress);
             self.assignments.transit(ingress, bucket)?
         };
         let now = std::time::Instant::now();
@@ -989,8 +985,26 @@ impl ParallelSession {
     }
 }
 
-// The caller has validated the CircuitDataPayload. Only its existing per-link
-// ID participates; ciphertext, sender hints and claimed priority never do.
+/// Circuit witnesses describe an installed circuit incarnation, not a raw
+/// return connection. Forward witnesses retain authenticated ingress ownership.
+/// Never interpret the legacy reverse ChildCarrier as a circuit flow identity.
+pub(super) fn transit_witness<'a>(
+    kind: RealtimeLaneFrameKind,
+    witness: Option<&'a veil_anonymity::circuit_carrier::Carrier>,
+) -> Option<&'a veil_anonymity::circuit_carrier::Carrier> {
+    match kind {
+        RealtimeLaneFrameKind::RelayForward => witness,
+        RealtimeLaneFrameKind::CircuitDatagram => witness.filter(|w| {
+            w.upgrade()
+                .is_some_and(|carrier| carrier.local_circuit_flow().is_some())
+        }),
+        RealtimeLaneFrameKind::DirectApp => None,
+    }
+}
+
+// Legacy fallback only. The caller has validated the CircuitDataPayload. Only
+// its existing per-link ID participates; ciphertext, sender hints and claimed
+// priority never do.
 pub(super) fn transit_index(salt: &[u8; 32], body: &[u8]) -> usize {
     SOURCE_SLOTS + usize::from(blake3::keyed_hash(salt, &body[..4]).as_bytes()[0]) % TRANSIT_SLOTS
 }

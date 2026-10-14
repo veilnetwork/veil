@@ -2184,6 +2184,9 @@ impl tokio::io::AsyncWrite for ObservedControlStream {
 #[path = "primary_recovery_quic_tests.rs"]
 mod primary_recovery_quic_tests;
 
+#[path = "circuit_runner_tests.rs"]
+mod circuit_runner_tests;
+
 /// Local primary feedback must protect local producers using a DIFFERENT
 /// neighbor connection. Neutral forwarding and another node keep their policy.
 #[tokio::test]
