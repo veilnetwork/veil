@@ -589,6 +589,42 @@ impl SessionTxRegistry {
         )
     }
 
+    /// Enqueue bounded-lifetime local work while preserving activity/accounting.
+    /// An expired best-effort cell is discarded without declaring route failure.
+    pub fn send_to_before_result(
+        &self,
+        peer_id: &NodeIdBytes,
+        priority: u8,
+        bytes: Vec<u8>,
+        expires_at: std::time::Instant,
+    ) -> Result<(), SendToError> {
+        if std::time::Instant::now() >= expires_at {
+            return Ok(());
+        }
+        let sender = self.get_sender(peer_id).ok_or(SendToError::Missing)?;
+        if sender.is_closed() {
+            return Err(SendToError::Closed);
+        }
+        crate::frame_diag::note_outbound(peer_id, &bytes, "tx_registry");
+        crate::frame_diag::note_chunk_frame("relay_enqueue", &bytes);
+        if sender.try_send_before(
+            (priority, veil_bufpool::pooled_shared_from_vec(bytes)),
+            expires_at,
+        ) {
+            if let Some(ts) = self.last_active.get(peer_id) {
+                ts.store(now_ms(), Ordering::Relaxed);
+            }
+            Ok(())
+        } else if std::time::Instant::now() >= expires_at {
+            Ok(())
+        } else if sender.is_closed() {
+            Err(SendToError::Closed)
+        } else {
+            self.drops_total.fetch_add(1, Ordering::Relaxed);
+            Err(SendToError::Full)
+        }
+    }
+
     /// `PooledShared`-shaped sibling [`send_to`] for fan-out call
     /// sites that already hold a shared frame buffer (gossip, mailbox
     /// replica fan-out, dispatcher relay). Avoids the `to_vec + Vec →
@@ -1122,25 +1158,59 @@ mod tests {
         assert_eq!(reg.len(), 0);
     }
 
+    #[tokio::test]
+    async fn timed_send_retains_original_expiry_in_the_session_envelope() {
+        use veil_proto::priority::REALTIME;
+        let peer = [0x51; 32];
+        let mut reg = SessionTxRegistry::with_capacity(1);
+        let mut rx = reg.register(peer);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        reg.send_to_before_result(&peer, REALTIME, b"fresh".to_vec(), deadline)
+            .unwrap();
+        let envelope = rx.try_recv_envelope().unwrap();
+        assert_eq!(envelope.expires_at, Some(deadline));
+        assert_eq!(&*envelope.frame.1, b"fresh");
+        reg.send_to_before_result(
+            &peer,
+            REALTIME,
+            b"expired".to_vec(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert!(rx.try_recv_envelope().is_err());
+    }
+
     /// `send_to` under `&self` updates `last_active` via atomic store;
     /// `evict_lru` (`&mut self`) observes the latest timestamp.
     #[tokio::test]
     async fn last_active_updated_by_send_under_shared_self() {
-        let mut reg = SessionTxRegistry::new();
-        let peer_a = [10u8; 32];
-        let peer_b = [11u8; 32];
-        let _rx_a = reg.register(peer_a);
-        let _rx_b = reg.register(peer_b);
-        // Both peers registered at ~same Instant. Send only to B —
-        // its last_active bumps; A stays at register-time value.
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        let bytes = veil_bufpool::pooled_shared_from_vec(b"x".to_vec());
-        assert!(reg.send_to_arc(&peer_b, INTERACTIVE, bytes));
-        // evict_lru(1) should drop A (older last_active) not B.
-        let evicted = reg.evict_lru(1);
-        assert_eq!(evicted, 1);
-        assert!(!reg.has_session(&peer_a), "older peer A evicted");
-        assert!(reg.has_session(&peer_b), "recently-active peer B retained");
+        for timed in [false, true] {
+            let mut reg = SessionTxRegistry::new();
+            let peer_a = [10u8; 32];
+            let peer_b = [11u8; 32];
+            let _rx_a = reg.register(peer_a);
+            let _rx_b = reg.register(peer_b);
+            // Both peers registered at ~same Instant. Send only to B —
+            // its last_active bumps; A stays at register-time value.
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            let bytes = veil_bufpool::pooled_shared_from_vec(b"x".to_vec());
+            if timed {
+                reg.send_to_before_result(
+                    &peer_b,
+                    INTERACTIVE,
+                    bytes.to_vec(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+                .unwrap();
+            } else {
+                assert!(reg.send_to_arc(&peer_b, INTERACTIVE, bytes));
+            }
+            // evict_lru(1) should drop A (older last_active) not B.
+            let evicted = reg.evict_lru(1);
+            assert_eq!(evicted, 1);
+            assert!(!reg.has_session(&peer_a), "older peer A evicted");
+            assert!(reg.has_session(&peer_b), "recently-active peer B retained");
+        }
     }
 
     #[tokio::test]

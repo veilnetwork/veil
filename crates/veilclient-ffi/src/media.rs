@@ -495,6 +495,7 @@ pub(crate) enum LocalMediaPlane {
     Primary,
     Secondary,
     Screen,
+    Control,
 }
 
 impl MediaCipher {
@@ -559,12 +560,12 @@ impl MediaCipher {
             LocalMediaPlane::Primary => 0,
             LocalMediaPlane::Secondary => 1,
             LocalMediaPlane::Screen => 2,
+            LocalMediaPlane::Control => 3,
         };
         self.seal_at(index, plaintext)
     }
 
-    /// Control owns a separate epoch/lock without acquiring a media producer
-    /// route or implying that anonymous media already has a fourth pool.
+    /// Control owns a separate epoch/lock, compatible with the existing receiver.
     pub(crate) fn seal_call_control(&self, plaintext: &[u8]) -> Option<SealedMediaCell> {
         self.seal_at(3, plaintext)
     }
@@ -1779,6 +1780,7 @@ mod tests {
             LocalMediaPlane::Primary,
             LocalMediaPlane::Secondary,
             LocalMediaPlane::Screen,
+            LocalMediaPlane::Control,
         ]
         .map(|plane| {
             let sender = Arc::clone(&sender);
@@ -1788,11 +1790,13 @@ mod tests {
                     .collect::<Vec<_>>()
             })
         });
-        let [primary, secondary, screen] = workers.map(|worker| worker.join().unwrap());
-        assert_ne!(&primary[0][4..12], &secondary[0][4..12]);
-        assert_ne!(&primary[0][4..12], &screen[0][4..12]);
-        assert_ne!(&secondary[0][4..12], &screen[0][4..12]);
-        for cells in [primary, secondary, screen] {
+        let streams = workers.map(|worker| worker.join().unwrap());
+        for (i, cells) in streams.iter().enumerate() {
+            for other in &streams[..i] {
+                assert_ne!(&cells[0][4..12], &other[0][4..12]);
+            }
+        }
+        for cells in streams {
             for (index, cell) in cells.iter().enumerate() {
                 assert_eq!(&cell[4..12], &cells[0][4..12]);
                 assert_eq!(
