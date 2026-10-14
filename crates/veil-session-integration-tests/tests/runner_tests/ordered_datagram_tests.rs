@@ -21,6 +21,7 @@ fn record_media(message: AppMessage, direction: usize, seen: &mut std::collectio
         AppMessage::RtData {
             src_node_id,
             payload,
+            ..
         } => {
             assert_eq!(src_node_id, [direction as u8 + 1; 32]);
             assert!(payload.seq < 160, "unexpected sequence");
@@ -304,6 +305,7 @@ async fn run(rotate: bool) {
                     AppMessage::RtData {
                         src_node_id,
                         payload,
+                        ..
                     } => {
                         assert_eq!(src_node_id, [direction as u8 + 1; 32]);
                         assert_eq!(payload.seq, seq);

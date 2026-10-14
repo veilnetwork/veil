@@ -23,12 +23,14 @@ static SAMPLES: LazyLock<Mutex<HashMap<Key, Sample>>> = LazyLock::new(Default::d
 /// the network; a separate-process SDK simply has no daemon observation.
 #[derive(Clone, Copy)]
 pub enum LocalDeliveryStage {
+    DaemonQueued,
     DaemonEncode,
     SdkRead,
 }
 
 #[derive(Default)]
 struct LocalDeliveryTimes {
+    daemon_queued: Option<Instant>,
     daemon: Option<Instant>,
     sdk: Option<Instant>,
 }
@@ -40,10 +42,25 @@ impl LocalDeliveries {
     const CAP: usize = 256;
     const TTL: Duration = Duration::from_secs(30);
 
+    #[cfg(test)]
     fn record(&mut self, digest: [u8; 32], stage: LocalDeliveryStage, now: Instant) {
+        self.record_at(digest, stage, now, now);
+    }
+
+    fn record_at(
+        &mut self,
+        digest: [u8; 32],
+        stage: LocalDeliveryStage,
+        observed_at: Instant,
+        now: Instant,
+    ) {
+        if now.saturating_duration_since(observed_at) >= Self::TTL {
+            return;
+        }
         self.0.retain(|_, times| {
             times
-                .daemon
+                .daemon_queued
+                .or(times.daemon)
                 .or(times.sdk)
                 .is_some_and(|first| now.saturating_duration_since(first) < Self::TTL)
         });
@@ -52,8 +69,9 @@ impl LocalDeliveries {
         }
         let times = self.0.entry(digest).or_default();
         match stage {
-            LocalDeliveryStage::DaemonEncode => times.daemon.get_or_insert(now),
-            LocalDeliveryStage::SdkRead => times.sdk.get_or_insert(now),
+            LocalDeliveryStage::DaemonQueued => times.daemon_queued.get_or_insert(observed_at),
+            LocalDeliveryStage::DaemonEncode => times.daemon.get_or_insert(observed_at),
+            LocalDeliveryStage::SdkRead => times.sdk.get_or_insert(observed_at),
         };
     }
 
@@ -66,6 +84,7 @@ impl LocalDeliveries {
             })
         };
         Some(LocalDeliveryAges {
+            daemon_queue_age_us: age(times.daemon_queued),
             daemon_age_us: age(times.daemon),
             sdk_age_us: age(times.sdk),
         })
@@ -76,6 +95,7 @@ static LOCAL_DELIVERIES: LazyLock<Mutex<LocalDeliveries>> = LazyLock::new(Defaul
 
 /// Ages measured on this process's monotonic clock, not a remote clock.
 pub struct LocalDeliveryAges {
+    pub daemon_queue_age_us: Option<i64>,
     pub daemon_age_us: Option<i64>,
     pub sdk_age_us: Option<i64>,
 }
@@ -93,6 +113,12 @@ fn delivery_digest(data: &[u8]) -> Option<[u8; 32]> {
 /// Record a bounded, silent observation on the locally terminating delivery
 /// path. This never authorizes, classifies or schedules a network packet.
 pub fn observe_local_delivery(stage: LocalDeliveryStage, data: &[u8]) {
+    observe_local_delivery_at(stage, data, Instant::now());
+}
+
+/// Record a timestamp already established by this terminal's local queue.
+/// The caller cannot supply a remote timestamp through a protocol frame.
+pub fn observe_local_delivery_at(stage: LocalDeliveryStage, data: &[u8], observed_at: Instant) {
     if !enabled().load(Ordering::Relaxed) {
         return;
     }
@@ -101,7 +127,7 @@ pub fn observe_local_delivery(stage: LocalDeliveryStage, data: &[u8]) {
     };
     let mut samples = LOCAL_DELIVERIES.lock().unwrap_or_else(|p| p.into_inner());
     if enabled().load(Ordering::Relaxed) {
-        samples.record(digest, stage, Instant::now());
+        samples.record_at(digest, stage, observed_at, Instant::now());
     }
 }
 
@@ -425,6 +451,48 @@ mod tests {
         assert_eq!(rt_sample(&direct(foreign_magic)), None);
         assert_eq!(rt_sample(&direct(cell(50)[..35].to_vec())), None);
         assert_eq!(rt_sample(&direct(vec![0xa5; 1200])), None);
+    }
+
+    #[test]
+    fn terminal_queue_wait_is_distinct_from_encode_and_sdk_waits() {
+        let queued_at = Instant::now();
+        let digest = delivery_digest(&cell(50)).unwrap();
+        let mut samples = LocalDeliveries::default();
+        let encoded_at = queued_at + Duration::from_millis(80);
+        samples.record_at(
+            digest,
+            LocalDeliveryStage::DaemonQueued,
+            queued_at,
+            encoded_at,
+        );
+        samples.record(digest, LocalDeliveryStage::DaemonEncode, encoded_at);
+        samples.record(
+            digest,
+            LocalDeliveryStage::SdkRead,
+            queued_at + Duration::from_millis(100),
+        );
+        // Duplicate local receipts retain the original terminal queue entry.
+        samples.record_at(
+            digest,
+            LocalDeliveryStage::DaemonQueued,
+            queued_at + Duration::from_millis(60),
+            encoded_at,
+        );
+        let ages = samples
+            .take(&digest, queued_at + Duration::from_millis(120))
+            .unwrap();
+        assert_eq!(ages.daemon_queue_age_us, Some(120_000));
+        assert_eq!(ages.daemon_age_us, Some(40_000));
+        assert_eq!(ages.sdk_age_us, Some(20_000));
+
+        let too_late = queued_at + LocalDeliveries::TTL;
+        samples.record_at(
+            digest,
+            LocalDeliveryStage::DaemonQueued,
+            queued_at,
+            too_late,
+        );
+        assert!(samples.take(&digest, too_late).is_none());
     }
 
     #[test]

@@ -890,7 +890,17 @@ async fn forward_endpoint(
             AppMessage::RtData {
                 src_node_id,
                 payload,
+                queued_at,
             } => {
+                crate::route_trace::observe_local_delivery_at(
+                    crate::route_trace::LocalDeliveryStage::DaemonQueued,
+                    &payload.payload,
+                    queued_at,
+                );
+                crate::route_trace::observe_local_delivery(
+                    crate::route_trace::LocalDeliveryStage::DaemonEncode,
+                    &payload.payload,
+                );
                 // Deliver through the existing SDK datagram event so clients
                 // receive the authenticated session source. RTP already owns
                 // its sequence/timestamp metadata; the app needs the raw RTP
