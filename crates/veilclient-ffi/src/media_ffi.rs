@@ -294,8 +294,21 @@ async fn drain_media_packets_on_plane<F, Fut>(
     F: FnMut(MediaOutboundCell) -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
+    let mut expired_packets = 0u64;
+    let mut note_expired = || {
+        expired_packets += 1;
+        if veil_session::rt_trace::rt_trace_enabled()
+            && (expired_packets <= 3 || expired_packets.is_multiple_of(50))
+        {
+            log::info!(
+                "media.source_queue.expired plane={:?} relay={relay} count={expired_packets}",
+                local_plane.unwrap_or(media::LocalMediaPlane::Primary),
+            );
+        }
+    };
     while let Some(first) = rx.recv().await {
         if first.expired() {
+            note_expired();
             continue;
         }
         let mut burst = vec![first];
@@ -305,6 +318,8 @@ async fn drain_media_packets_on_plane<F, Fut>(
             };
             if !packet.expired() {
                 burst.push(packet);
+            } else {
+                note_expired();
             }
         }
         let mode = batching.load(std::sync::atomic::Ordering::Relaxed);
@@ -323,6 +338,7 @@ async fn drain_media_packets_on_plane<F, Fut>(
         let cells = timed_media_cells(burst, mode != MEDIA_BATCHING_OFF, max_body, max_packets);
         for queued in cells {
             if queued.expired() {
+                note_expired();
                 continue;
             }
             let packet = queued.payload;
@@ -784,6 +800,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
     let started = std::time::Instant::now();
     let transport_seq = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let seq_high = Arc::clone(&transport_seq);
+    let source_queue_max_us = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let task = app_ref.bundle.runtime.spawn(drain_media_packets(
         rx_hi,
         Arc::clone(&batching),
@@ -792,14 +809,40 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
         move |cell| {
             let sender = Arc::clone(&sender);
             let seq = Arc::clone(&seq_high);
+            let queue_max = Arc::clone(&source_queue_max_us);
             async move {
-                let Some(guard) = cell.sealed.lock_while_fresh(&sender).await else {
+                let guard = cell.sealed.lock_while_fresh(&sender).await;
+                let queue_age = veil_session::rt_trace::rt_trace_enabled().then(|| {
+                    let deadline = cell
+                        .sealed
+                        .local_deadline()
+                        .expect("native packet deadline");
+                    let age_us = tokio::time::Instant::now()
+                        .saturating_duration_since(deadline - MEDIA_LOCAL_QUEUE_AGE)
+                        .as_micros()
+                        .min(u64::MAX as u128) as u64;
+                    use std::sync::atomic::Ordering::Relaxed;
+                    queue_max.fetch_max(age_us, Relaxed);
+                    queue_max.load(Relaxed)
+                });
+                let Some(guard) = guard else {
+                    media::trace_sealed_cell_with_source_queue(
+                        "direct_expired",
+                        &peer,
+                        cell.sealed.as_bytes(),
+                        queue_age,
+                    );
                     return true;
                 };
                 let Some(sender) = guard.as_ref() else {
                     return false;
                 };
-                media::trace_sealed_cell("direct_send", &peer, cell.sealed.as_bytes());
+                media::trace_sealed_cell_with_source_queue(
+                    "direct_send",
+                    &peer,
+                    cell.sealed.as_bytes(),
+                    queue_age,
+                );
                 let timestamp_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                 let _ = sender
                     .send_rt_data_on_local_lane_before(

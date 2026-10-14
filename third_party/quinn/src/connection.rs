@@ -503,7 +503,7 @@ impl Connection {
         match conn
             .inner
             .datagrams()
-            .send_with_expiry(data, true, expires_at)
+            .send_with_expiry_at(data, true, expires_at, now)
         {
             Ok(()) => {
                 conn.wake();
@@ -575,6 +575,17 @@ impl Connection {
             .inner
             .datagrams()
             .expired_outgoing()
+    }
+
+    /// Longest enqueue-to-packet wait of a timed, transmitted datagram.
+    /// This is connection-local telemetry, never peer-visible metadata.
+    pub fn outgoing_datagram_queue_age_max(&self) -> Duration {
+        self.0
+            .state
+            .lock("outgoing_datagram_queue_age_max")
+            .inner
+            .datagrams()
+            .outgoing_queue_age_max()
     }
 
     /// The side of the connection (client or server)
