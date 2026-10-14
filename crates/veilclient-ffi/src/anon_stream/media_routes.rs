@@ -624,8 +624,8 @@ impl MediaRoutes {
         peer: [u8; 32],
         channel: u64,
         cipher: Arc<crate::media::MediaCipher>,
-    ) -> (Arc<Self>, mpsc::Receiver<(Addr, Vec<u8>)>) {
-        let (tx, rx) = mpsc::channel(1);
+    ) -> (Arc<Self>, super::CircuitStreamMuxForTest) {
+        let (tx, rx) = mpsc::channel(256);
         let core = super::try_open_circuit(me, tx, CircuitMode::PublishedRendezvous).unwrap();
         let cores = [
             core.isolated_producer(LocalMediaPlane::Primary),
@@ -633,7 +633,21 @@ impl MediaRoutes {
             core.isolated_producer(LocalMediaPlane::Screen),
             core.isolated_producer(LocalMediaPlane::Control),
         ];
-        (Self::new(peer, channel, cores, cipher), rx)
+        // Match AnonStreamHub: one base registration/feed owns file streams;
+        // its isolated producers own this call's media circuits. A second base
+        // core would race this one for the node's published receive cookie.
+        let aliases = Arc::clone(&core.peer_aliases);
+        let cells = HubCells::Circuit(Box::new(core));
+        let mss = circuit_mss_for(veil_anonymity::circuit_origin::choose_cell_bytes());
+        let cfg = stream_config(me, &cells, mss);
+        let mux = super::CircuitStreamMuxForTest(StreamMux::new_with_aliases(
+            me,
+            Arc::new(cells),
+            rx,
+            cfg,
+            aliases,
+        ));
+        (Self::new(peer, channel, cores, cipher), mux)
     }
 
     pub(crate) fn receive_addresses_for_test(&self) -> Vec<(u8, [u8; 16])> {

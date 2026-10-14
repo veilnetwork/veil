@@ -534,6 +534,20 @@ fn local_primary_datagram_fits(wire_len: usize, available: usize) -> bool {
     wire_len <= available && local_datagram_backlog_fits(wire_len, available)
 }
 
+/// Keep already admitted ARQ DATA at the endpoint while its own child queue
+/// drains. The credit remains owned; media and neutral transit never opt in.
+fn defer_recoverable_datagram(
+    pq: &mut PriorityQueue,
+    envelope: crate::frame_outbox::FrameEnvelope,
+    waiting: &mut bool,
+    retry_at: &mut Option<std::time::Instant>,
+) {
+    pq.restore_lossy_envelope(envelope);
+    *waiting = true;
+    let retry = std::time::Instant::now() + std::time::Duration::from_millis(2);
+    *retry_at = Some(retry_at.map_or(retry, |old| old.min(retry)));
+}
+
 fn local_datagram_backlog_fits(wire_len: usize, available: usize) -> bool {
     let queued = veil_transport::REALTIME_DATAGRAM_BUFFER_BYTES.saturating_sub(available);
     queued
@@ -4749,6 +4763,7 @@ impl SessionRunner {
                 // it, independently transported local sources may progress in
                 // their own round. Relayed cells never use that local bypass.
                 let mut source_pressure_retry: Option<std::time::Instant> = None;
+                let mut recoverable_datagram_waiting = false;
                 let mut datagram_drained = 0usize;
                 let mut disable_realtime_sender = false;
                 if let Some(lane) = realtime_lane.as_mut() {
@@ -4772,7 +4787,11 @@ impl SessionRunner {
                         }
                         let Some(envelope) = pq
                             .pop_admitted_envelope(|priority, frame, _, _| {
-                                if priority == crate::LOCAL_SIGNALING_LANE
+                                if priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
+                                    && recoverable_datagram_waiting
+                                {
+                                    crate::priority_queue::HeadAdmission::DeferSource
+                                } else if priority == crate::LOCAL_SIGNALING_LANE
                                     && signaling_wait.is_some()
                                 {
                                     crate::priority_queue::HeadAdmission::DeferSource
@@ -4784,8 +4803,10 @@ impl SessionRunner {
                             })
                             .or_else(|| {
                                 pq.pop_local_datagram_lane_if(|priority, frame| {
-                                    (priority != crate::LOCAL_SIGNALING_LANE
-                                        || signaling_wait.is_none())
+                                    (priority != veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
+                                        || !recoverable_datagram_waiting)
+                                        && (priority != crate::LOCAL_SIGNALING_LANE
+                                            || signaling_wait.is_none())
                                         && supported(frame)
                                 })
                             })
@@ -4793,6 +4814,10 @@ impl SessionRunner {
                             break;
                         };
                         let (outgoing_priority, ref outgoing) = envelope.frame;
+                        let recoverable_data = outgoing_priority
+                            == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
+                            && envelope.carrier.is_none()
+                            && envelope.reliable_credit.is_some();
                         if local_datagram_expiry(&envelope)
                             .is_some_and(|deadline| deadline <= std::time::Instant::now())
                         {
@@ -4874,6 +4899,15 @@ impl SessionRunner {
                                 std::time::Instant::now(),
                             ),
                         } {
+                            if recoverable_data {
+                                defer_recoverable_datagram(
+                                    &mut pq,
+                                    envelope,
+                                    &mut recoverable_datagram_waiting,
+                                    &mut source_pressure_retry,
+                                );
+                                continue;
+                            }
                             // Source feedback only; neutral ChildCarrier traffic
                             // above and forwarded INTERACTIVE cells bypass this.
                             crate::local_lossy_trace::cell(
@@ -4906,6 +4940,15 @@ impl SessionRunner {
                             )
                         }) else {
                             if independent_source {
+                                if recoverable_data {
+                                    defer_recoverable_datagram(
+                                        &mut pq,
+                                        envelope,
+                                        &mut recoverable_datagram_waiting,
+                                        &mut source_pressure_retry,
+                                    );
+                                    continue;
+                                }
                                 // Discard while the agreed child is unavailable;
                                 // the next fresh packet may use a ready child.
                                 lane.trace_source_pressure(
@@ -4963,6 +5006,15 @@ impl SessionRunner {
                                 available,
                             )
                         {
+                            if recoverable_data {
+                                defer_recoverable_datagram(
+                                    &mut pq,
+                                    envelope,
+                                    &mut recoverable_datagram_waiting,
+                                    &mut source_pressure_retry,
+                                );
+                                continue;
+                            }
                             // Admit complete frames only. Local bulk bounds
                             // backlog and reserves a complete primary frame;
                             // independent primary also bounds its own backlog.
@@ -5325,6 +5377,11 @@ impl SessionRunner {
                         use crate::priority_queue::HeadAdmission;
                         use crate::reliable_frames::FrameReservationError;
                         use reliable_streams::Route;
+                        if priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
+                            && recoverable_datagram_waiting
+                        {
+                            return HeadAdmission::DeferSource;
+                        }
                         if retry_datagram_head(
                             frame,
                             realtime_lane.as_ref().map(|lane| (lane.peer_circuit_datagrams, lane.peer_neutral_forwards)),

@@ -406,15 +406,22 @@ async fn pressured_small_authored_messages_preserve_transit_and_all_bytes() {
     admission.observe(REALTIME, &circuit_frame(1, 0x11), pressured, true);
     let mut runner = make_runner(data_stream, data_outbox, None);
     let expected: Vec<Vec<u8>> = (0..32u8).map(|n| vec![n; 400]).collect();
-    for body in &expected {
-        sender
-            .send((
-                veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
-                frame(AppMsg::AppSend, body),
-            ))
-            .await
-            .unwrap();
-    }
+    // The local source credit spans ingress and scheduling. Run its consumer
+    // concurrently instead of deadlocking setup by filling a bounded source
+    // before the scheduler starts. All original pressure/delivery gates remain.
+    let source = sender.clone();
+    let outgoing = expected.clone();
+    let producer = tokio::spawn(async move {
+        for body in outgoing {
+            source
+                .send((
+                    veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
+                    frame(AppMsg::AppSend, &body),
+                ))
+                .await
+                .unwrap();
+        }
+    });
     let job = tokio::spawn(async move {
         runner.run().await;
     });
@@ -473,6 +480,10 @@ async fn pressured_small_authored_messages_preserve_transit_and_all_bytes() {
         received, expected,
         "lost, duplicated or reordered authored message"
     );
+    timeout(Duration::from_secs(1), producer)
+        .await
+        .unwrap()
+        .unwrap();
     data_handle.close();
     primary.close();
     timeout(Duration::from_secs(2), job).await.unwrap().unwrap();

@@ -302,7 +302,16 @@ impl PriorityQueue {
     /// Loss tolerance is independent of queue priority. In particular relayed
     /// datagrams share INTERACTIVE FIFO order with other forwarded user data.
     pub fn push_lossy(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
-        self.push_lossy_with_carrier(priority, frame, None, Instant::now(), None, None, None);
+        self.push_lossy_with_carrier(
+            priority,
+            frame,
+            None,
+            Instant::now(),
+            None,
+            None,
+            None,
+            None,
+        );
     }
 
     pub(crate) fn push_envelope(
@@ -320,6 +329,7 @@ impl PriorityQueue {
                 envelope.signaling_pending,
                 envelope.local_work,
                 envelope.expires_at,
+                envelope.reliable_credit,
             );
         } else {
             self.push_entry(
@@ -344,6 +354,7 @@ impl PriorityQueue {
         signaling_pending: Option<crate::local_source_activity::PendingSignaling>,
         local_work: Option<veil_types::local_lossy_work::LocalLossyCell>,
         expires_at: Option<Instant>,
+        reliable_credit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
         // Expired ingress must not evict a fresh frame from a full class.
         if expires_at.is_some_and(|at| Instant::now() >= at)
@@ -379,7 +390,7 @@ impl PriorityQueue {
             frame,
             Some(queued_at),
             carrier,
-            None,
+            reliable_credit,
             signaling_pending,
             local_work,
             expires_at,
@@ -655,7 +666,7 @@ impl PriorityQueue {
             expires_at: envelope.expires_at,
             lossy_realtime: true,
             carrier: envelope.carrier,
-            reliable_credit: None,
+            reliable_credit: envelope.reliable_credit,
             signaling_pending: envelope.signaling_pending,
             local_work: envelope.local_work,
         });
@@ -886,6 +897,7 @@ mod tests {
             arc(b"independent"),
             Some(Arc::downgrade(&carrier)),
             Instant::now() - Duration::from_millis(60),
+            None,
             None,
             None,
             None,
