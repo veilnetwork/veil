@@ -3386,7 +3386,7 @@ impl Connection {
         // DATAGRAM
         let mut sent_datagrams = false;
         while buf.len() + Datagram::SIZE_BOUND < max_size && space_id == SpaceId::Data {
-            match self.datagrams.write(buf, max_size) {
+            match self.datagrams.write(now, buf, max_size) {
                 true => {
                     sent_datagrams = true;
                     sent.non_retransmits = true;
