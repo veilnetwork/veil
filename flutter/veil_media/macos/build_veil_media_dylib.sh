@@ -35,6 +35,20 @@ CC_JSON="$WEBRTC_SRC/$WEBRTC_OUT/compile_commands.json"
 [ -x "$CLANGXX" ] || { echo "no bundled clang at $CLANGXX — build WebRTC first" >&2; exit 1; }
 [ -f "$CC_JSON" ] || { echo "no $CC_JSON — run gn gen" >&2; exit 1; }
 
+# The packet-overhead controller needs WebRTC's protobuf-backed audio network
+# adaptor. Without it the ABI still links, but the running engine declines
+# setAudioPacketOverhead and sends fixed-duration audio on the relay path.
+python3 - "$CC_JSON" <<'PY'
+import json, shlex, sys
+
+entries = json.load(open(sys.argv[1]))
+entry = next((e for e in entries if e.get('file', '').endswith('call/call.cc')), None)
+args = (entry.get('arguments') or shlex.split(entry.get('command', ''))) if entry else []
+if '-DWEBRTC_ENABLE_PROTOBUF=1' not in args:
+    sys.exit('WebRTC cache lacks audio packet adaptation: set rtc_enable_protobuf = true, '
+             'rebuild webrtc and export compile_commands.json before building macOS media.')
+PY
+
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
 # Compile one TU with call.cc's EXACT flags (bundled clang, __Cr libc++,
