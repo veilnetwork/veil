@@ -1354,6 +1354,23 @@ async fn measure_bound_independent_load(
     large_primary: bool,
     loaded: bool,
 ) -> IndependentLoadReport {
+    measure_bound_independent_loss(
+        large_primary,
+        loaded,
+        veil_transport::context::QuicCongestionControl::Cubic,
+        Duration::from_millis(20),
+        0,
+    )
+    .await
+}
+
+async fn measure_bound_independent_loss(
+    large_primary: bool,
+    loaded: bool,
+    congestion: veil_transport::context::QuicCongestionControl,
+    link_delay: Duration,
+    loss_every: u64,
+) -> IndependentLoadReport {
     use crate::parallel_binding::ParallelParent;
     use std::collections::HashSet;
     use veil_proto::{
@@ -1367,11 +1384,13 @@ async fn measure_bound_independent_load(
         left.local_addr().unwrap(),
         right.local_addr().unwrap(),
         1_000_000,
-        Duration::from_millis(20),
+        link_delay,
     )
     .await;
     link.enabled.store(true, Ordering::Relaxed);
-    let context = Arc::new(TransportContext::for_debug().unwrap());
+    let mut context = TransportContext::for_debug().unwrap();
+    context.quic.congestion_control = congestion;
+    let context = Arc::new(context);
     let remote_context = Arc::clone(&context);
     let remote_addr = link.right_addr;
     let remote = tokio::spawn(promote_punched_quic(
@@ -1412,6 +1431,7 @@ async fn measure_bound_independent_load(
     let fixture = primary_test_frame(large_primary, 0, 0);
     admission.observe(REALTIME, &fixture, std::time::Instant::now(), true);
     sleep(Duration::from_millis(100)).await;
+    link.loss_every.store(loss_every, Ordering::Relaxed);
     let started = Instant::now();
     let file_bytes = Arc::new(AtomicU64::new(0));
     let file_accepted = Arc::new(AtomicU64::new(0));
@@ -2349,6 +2369,32 @@ async fn characterize_primary_small_packet_loss_with_congestion_controllers() {
             )
             .await;
             assert!(report.first_fresh.is_some());
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "Manual lossy-link comparison with separate source and competing traffic"]
+async fn characterize_controllers_under_independent_media_and_file_load() {
+    use veil_transport::context::QuicCongestionControl::{Bbr, Cubic};
+    for controller in [Cubic, Bbr] {
+        for loaded in [false, true] {
+            eprintln!(
+                "controlled_independent_loss controller={controller:?} loaded={loaded} one_way_ms=120 drop_every=50"
+            );
+            let report = measure_bound_independent_loss(
+                false,
+                loaded,
+                controller,
+                Duration::from_millis(120),
+                50,
+            )
+            .await;
+            assert_eq!(report.primary_duplicates, 0);
+            assert!(report.primary_received > 0);
+            if loaded {
+                assert!(report.secondary_received > 0 && report.file_bytes > 0);
+            }
         }
     }
 }
