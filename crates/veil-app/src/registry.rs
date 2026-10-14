@@ -92,6 +92,8 @@ pub enum AppMessage {
         /// Authenticated node id from the session that carried the frame.
         src_node_id: [u8; 32],
         payload: AppRtDataPayload,
+        /// Local terminal queue entry time; never encoded into IPC or network bytes.
+        queued_at: std::time::Instant,
     },
     /// Epidemic flood broadcast received from the veil.
     EpidemicBroadcast {
@@ -386,6 +388,7 @@ impl AppEndpointRegistry {
             AppMessage::RtData {
                 src_node_id,
                 payload,
+                queued_at: std::time::Instant::now(),
             },
         )
     }

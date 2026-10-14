@@ -65,13 +65,45 @@ fn owned_cell(priority: u8, frame: &[u8]) -> Option<(u64, u64)> {
     header(&forward.envelope.payload).filter(|(_, seq)| *seq <= SEQUENCE_LIMIT)
 }
 
-pub(crate) fn cell(stage: &'static str, priority: u8, frame: &[u8]) {
-    if !enabled() {
-        return;
+fn owned_primary_cell(priority: u8, frame: &[u8]) -> Option<(u64, u64)> {
+    // Selection comes from our private source slot, never a remote wire hint.
+    if priority != veil_proto::priority::REALTIME
+        || frame.len() > 8192
+        || crate::frame_diag::family_and_type(frame)
+            != Some((
+                veil_proto::family::FrameFamily::App as u8,
+                veil_proto::family::AppMsg::AppRtData as u16,
+            ))
+    {
+        return None;
     }
-    let Some((epoch, sequence)) = owned_cell(priority, frame) else {
+    let wire_header = veil_proto::codec::decode_header(frame).ok()?;
+    if usize::from(wire_header.header_len) != veil_proto::header::HEADER_SIZE
+        || veil_proto::header::HEADER_SIZE.checked_add(wire_header.body_len as usize)
+            != Some(frame.len())
+    {
+        return None;
+    }
+    let body = frame.get(veil_proto::header::HEADER_SIZE..)?;
+    let data = veil_proto::app::AppRtDataPayload::decode(body).ok()?;
+    header(&data.payload).filter(|(_, seq)| *seq <= SEQUENCE_LIMIT)
+}
+
+pub(crate) fn cell(stage: &'static str, priority: u8, frame: &[u8]) {
+    let primary = priority == veil_proto::priority::REALTIME && crate::rt_trace::rt_trace_enabled();
+    let sample = if primary {
+        owned_primary_cell(priority, frame)
+    } else if enabled() {
+        owned_cell(priority, frame)
+    } else {
+        None
+    };
+    let Some((epoch, sequence)) = sample else {
         return;
     };
+    if primary && sequence != 1 && !sequence.is_multiple_of(50) {
+        return;
+    }
     if row_available() {
         log::info!(
             "media.source_cell_trace at_unix_us={} stage={stage} local_slot={priority} epoch={epoch:016x} seq={sequence} wire_bytes={}",
@@ -211,6 +243,53 @@ mod tests {
         let mut frame = veil_proto::codec::encode_header(&header).to_vec();
         frame.extend(body);
         frame
+    }
+
+    #[test]
+    fn primary_samples_require_a_local_slot_and_complete_sealed_direct_body() {
+        let payload = veil_proto::app::AppRtDataPayload {
+            src_app_id: [1; 32],
+            app_id: [2; 32],
+            endpoint_id: 3,
+            seq: 4,
+            timestamp_us: 5,
+            marker: 0,
+            payload_type: 0,
+            payload: seal(50),
+        };
+        let body = payload.encode();
+        let mut header = veil_proto::header::FrameHeader::new(
+            veil_proto::family::FrameFamily::App as u8,
+            veil_proto::family::AppMsg::AppRtData as u16,
+        );
+        header.body_len = body.len() as u32;
+        header.set_priority(veil_proto::priority::REALTIME);
+        let mut frame = veil_proto::codec::encode_header(&header).to_vec();
+        frame.extend(body);
+        assert_eq!(
+            owned_primary_cell(veil_proto::priority::REALTIME, &frame),
+            Some((7, 50))
+        );
+        // A remote wire REALTIME hint cannot opt neutral relay traffic in.
+        assert_eq!(
+            owned_primary_cell(veil_proto::priority::INTERACTIVE, &frame),
+            None
+        );
+        assert_eq!(owned_primary_cell(veil_proto::priority::BULK, &frame), None);
+        for size in 0..frame.len() {
+            assert_eq!(
+                owned_primary_cell(veil_proto::priority::REALTIME, &frame[..size]),
+                None
+            );
+        }
+        let mut unsealed = payload;
+        unsealed.payload[0] = 0;
+        let mut malformed = veil_proto::codec::encode_header(&header).to_vec();
+        malformed.extend(unsealed.encode());
+        assert_eq!(
+            owned_primary_cell(veil_proto::priority::REALTIME, &malformed),
+            None
+        );
     }
 
     #[test]

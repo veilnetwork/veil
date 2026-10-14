@@ -2748,6 +2748,7 @@ mod tests {
             veil_app::registry::AppMessage::RtData {
                 src_node_id,
                 payload,
+                ..
             } => {
                 assert_eq!(src_node_id, peer, "source must come from session");
                 assert_eq!(payload.src_app_id, [0xB0u8; 32]);

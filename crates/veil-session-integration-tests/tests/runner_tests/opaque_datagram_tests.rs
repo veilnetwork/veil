@@ -377,6 +377,7 @@ async fn runner_channels_with_partial_read(
                     AppMessage::RtData {
                         src_node_id,
                         payload,
+                        ..
                     } => {
                         assert_eq!(
                             src_node_id,
