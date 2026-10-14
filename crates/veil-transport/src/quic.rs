@@ -99,6 +99,7 @@ pub struct QuicDatagramPathStats {
     pub data_blocked_sent: u64,
     pub stream_data_blocked_sent: u64,
     pub expired_outgoing_datagrams: u64,
+    pub datagram_queue_max_us: u64,
     pub residual_window_transmits: u64,
     pub event_queue_last_us: u64,
     pub event_queue_max_us: u64,
@@ -143,6 +144,11 @@ impl QuicDatagramHandle {
             data_blocked_sent: stats.frame_tx.data_blocked,
             stream_data_blocked_sent: stats.frame_tx.stream_data_blocked,
             expired_outgoing_datagrams: self.connection.expired_outgoing_datagrams(),
+            datagram_queue_max_us: self
+                .connection
+                .outgoing_datagram_queue_age_max()
+                .as_micros()
+                .min(u64::MAX as u128) as u64,
             residual_window_transmits: stats.path.residual_window_transmits,
             event_queue_last_us: driver.event_queue_last_us,
             event_queue_max_us: driver.event_queue_max_us,

@@ -6,8 +6,8 @@ use tracing::{debug, trace};
 
 use super::{Connection, Event};
 use crate::{
-    TransportError, Instant,
     frame::{Datagram, FrameStruct},
+    Duration, Instant, TransportError,
 };
 
 /// API to control datagram traffic
@@ -26,7 +26,7 @@ impl Datagrams<'_> {
     ///
     /// Returns `Err` iff a `len`-byte datagram cannot currently be sent.
     pub fn send(&mut self, data: Bytes, drop: bool) -> Result<(), SendDatagramError> {
-        self.send_inner(data, drop, None)
+        self.send_inner(data, drop, None, None)
     }
 
     /// Queue a datagram that may not be put into a packet at or after `expires_at`.
@@ -37,7 +37,19 @@ impl Datagrams<'_> {
         drop: bool,
         expires_at: Instant,
     ) -> Result<(), SendDatagramError> {
-        self.send_inner(data, drop, Some(expires_at))
+        self.send_inner(data, drop, Some(expires_at), None)
+    }
+
+    /// Like `send_with_expiry`, with a caller-supplied monotonic enqueue time
+    /// for local queue diagnostics. Neither timestamp is sent to the peer.
+    pub fn send_with_expiry_at(
+        &mut self,
+        data: Bytes,
+        drop: bool,
+        expires_at: Instant,
+        queued_at: Instant,
+    ) -> Result<(), SendDatagramError> {
+        self.send_inner(data, drop, Some(expires_at), Some(queued_at))
     }
 
     /// Remove expired outgoing datagrams, releasing capacity for fresh data.
@@ -56,6 +68,7 @@ impl Datagrams<'_> {
         data: Bytes,
         drop: bool,
         expires_at: Option<Instant>,
+        queued_at: Option<Instant>,
     ) -> Result<(), SendDatagramError> {
         if self.conn.config.datagram_receive_buffer_size.is_none() {
             return Err(SendDatagramError::Disabled);
@@ -87,6 +100,7 @@ impl Datagrams<'_> {
         self.conn.datagrams.outgoing.push_back(QueuedDatagram {
             datagram: Datagram { data },
             expires_at,
+            queued_at,
         });
         if let Some(deadline) = expires_at {
             self.conn.datagrams.next_expiry = Some(
@@ -102,6 +116,12 @@ impl Datagrams<'_> {
     /// Total unsent outgoing datagrams removed by local expiry, not wire loss.
     pub fn expired_outgoing(&self) -> u64 {
         self.conn.datagrams.expired_outgoing
+    }
+
+    /// Longest local wait of a timed datagram actually placed into a packet.
+    /// Expired datagrams and datagrams without an enqueue observation are excluded.
+    pub fn outgoing_queue_age_max(&self) -> Duration {
+        self.conn.datagrams.outgoing_queue_age_max
     }
 
     /// Compute the maximum size of datagrams that may passed to `send_datagram`
@@ -155,6 +175,7 @@ pub(super) struct DatagramState {
     pub(super) outgoing: VecDeque<QueuedDatagram>,
     next_expiry: Option<Instant>,
     expired_outgoing: u64,
+    outgoing_queue_age_max: Duration,
     pub(super) outgoing_total: usize,
     pub(super) send_blocked: bool,
 }
@@ -162,6 +183,7 @@ pub(super) struct DatagramState {
 pub(super) struct QueuedDatagram {
     datagram: Datagram,
     expires_at: Option<Instant>,
+    queued_at: Option<Instant>,
 }
 
 impl std::ops::Deref for QueuedDatagram {
@@ -246,7 +268,7 @@ impl DatagramState {
     ///
     /// Returns whether a frame was written. At most `max_size` bytes will be written, including
     /// framing.
-    pub(super) fn write(&mut self, buf: &mut Vec<u8>, max_size: usize) -> bool {
+    pub(super) fn write(&mut self, now: Instant, buf: &mut Vec<u8>, max_size: usize) -> bool {
         let datagram = match self.outgoing.pop_front() {
             Some(x) => x,
             None => return false,
@@ -262,6 +284,11 @@ impl DatagramState {
         trace!(len = datagram.data.len(), "DATAGRAM");
 
         self.outgoing_total -= datagram.data.len();
+        if let Some(queued_at) = datagram.queued_at {
+            self.outgoing_queue_age_max = self
+                .outgoing_queue_age_max
+                .max(now.saturating_duration_since(queued_at));
+        }
         datagram.encode(true, buf);
         true
     }

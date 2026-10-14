@@ -490,7 +490,7 @@ pub(crate) fn cipher_for_test(
 }
 
 /// Process-local selection only. Never serialized into a media cell.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum LocalMediaPlane {
     Primary,
     Secondary,

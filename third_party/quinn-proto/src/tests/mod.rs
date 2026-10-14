@@ -2073,6 +2073,59 @@ fn reliable_stream_uses_residual_window_without_exceeding_it() {
 }
 
 #[test]
+fn timed_datagram_queue_age_counts_transmitted_waits_only() {
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    let queued_at = pair.time;
+    for (data, life_ms) in [(b"expired".as_slice(), 20), (b"fresh".as_slice(), 200)] {
+        pair.client_datagrams(client_ch)
+            .send_with_expiry_at(
+                data.into(),
+                true,
+                queued_at + Duration::from_millis(life_ms),
+                queued_at,
+            )
+            .unwrap();
+    }
+    pair.time += Duration::from_millis(50);
+    pair.drive();
+    assert_eq!(
+        pair.server_datagrams(server_ch).recv().unwrap(),
+        b"fresh".as_slice()
+    );
+    assert_eq!(pair.server_datagrams(server_ch).recv(), None);
+    assert_eq!(pair.client_datagrams(client_ch).expired_outgoing(), 1);
+    let observed = pair.client_datagrams(client_ch).outgoing_queue_age_max();
+    assert_eq!(observed, Duration::from_millis(50));
+
+    let queued_at = pair.time;
+    pair.client_datagrams(client_ch)
+        .send_with_expiry_at(
+            b"expired-again".as_slice().into(),
+            true,
+            queued_at + Duration::from_millis(50),
+            queued_at,
+        )
+        .unwrap();
+    // Untimed compatibility traffic must not invent a queue observation.
+    pair.client_datagrams(client_ch)
+        .send(b"ordinary".as_slice().into(), true)
+        .unwrap();
+    pair.time += Duration::from_millis(300);
+    pair.drive();
+    assert_eq!(
+        pair.server_datagrams(server_ch).recv().unwrap(),
+        b"ordinary".as_slice()
+    );
+    assert_eq!(pair.server_datagrams(server_ch).recv(), None);
+    assert_eq!(pair.client_datagrams(client_ch).expired_outgoing(), 2);
+    assert_eq!(
+        pair.client_datagrams(client_ch).outgoing_queue_age_max(),
+        observed
+    );
+}
+
+#[test]
 fn datagram_expiry_discards_only_expired_unsent_packets() {
     let mut pair = Pair::default();
     let (client_ch, server_ch) = pair.connect();

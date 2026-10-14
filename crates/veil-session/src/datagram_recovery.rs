@@ -115,6 +115,7 @@ mod tests {
             data_blocked_sent: 0,
             stream_data_blocked_sent: 0,
             expired_outgoing_datagrams: 0,
+            datagram_queue_max_us: 0,
             residual_window_transmits: 0,
             event_queue_last_us: 0,
             event_queue_max_us: 0,
