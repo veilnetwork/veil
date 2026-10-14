@@ -263,6 +263,8 @@ fn channel(me: [u8; 32], peer: [u8; 32], tx_key: [u8; 32], rx_key: [u8; 32]) -> 
     let (tx_hi, rx_hi) = mpsc::channel(MEDIA_TX_HI_QUEUE);
     let (tx_video, rx_video) = mpsc::channel(MEDIA_TX_VIDEO_QUEUE);
     let (tx_screen, rx_screen) = mpsc::channel(MEDIA_TX_VIDEO_QUEUE);
+    let (tx_feedback, rx_feedback) = mpsc::channel(16);
+    let (repair_feedback, repair_feedback_rx) = mpsc::channel(1);
     let (repair_screen, repair_screen_rx) = mpsc::channel(1);
     let (repair_hi, repair_hi_rx) = mpsc::channel(1);
     let (repair_video, repair_video_rx) = mpsc::channel(1);
@@ -287,20 +289,25 @@ fn channel(me: [u8; 32], peer: [u8; 32], tx_key: [u8; 32], rx_key: [u8; 32]) -> 
     let task = spawn(rx_hi, repair_hi_rx, LocalMediaPlane::Primary);
     let video_task = spawn(rx_video, repair_video_rx, LocalMediaPlane::Secondary);
     let screen_task = spawn(rx_screen, repair_screen_rx, LocalMediaPlane::Screen);
+    let feedback_task = spawn(rx_feedback, repair_feedback_rx, LocalMediaPlane::Control);
+    let ingress = MediaIngress::with_screen(
+        tx_hi,
+        MediaVideoIngress::Packets(tx_video),
+        MediaVideoIngress::Packets(tx_screen),
+    );
+    *ingress.feedback_tx.write().unwrap() = Some(tx_feedback);
     MEDIA_CHANNELS.write().unwrap().insert(
         id,
         MediaChannel {
             path_probe: None,
-            ingress: MediaIngress::with_screen(
-                tx_hi,
-                MediaVideoIngress::Packets(tx_video),
-                MediaVideoIngress::Packets(tx_screen),
-            ),
-            repair_tx: Some([repair_hi, repair_video, repair_screen]),
+            ingress,
+            repair_tx: Some([repair_hi, repair_video, repair_screen, repair_feedback]),
             peer,
             task,
             video_task: Some(video_task),
             screen_task: Some(screen_task),
+            feedback_task: Some(feedback_task),
+            direct_seq: None,
             video_sender: None,
             screen_sender: None,
             sender_app_id: None,
@@ -398,8 +405,8 @@ async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stall
     cc.routes.start(&tokio::runtime::Handle::current());
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            if ca.routes.outgoing_for_test().await.len() == 2
-                && cc.routes.outgoing_for_test().await.len() == 2
+            if ca.routes.outgoing_for_test().await.len() == 3
+                && cc.routes.outgoing_for_test().await.len() == 3
             {
                 break;
             }
@@ -412,7 +419,15 @@ async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stall
     let outgoing = ca.routes.outgoing_for_test().await;
     assert_eq!(incoming.len(), 2);
     for route in &outgoing {
-        assert_eq!(route.destination_cookie, incoming[route.plane as usize].1);
+        assert_eq!(
+            route.destination_cookie,
+            incoming[if route.plane == 3 {
+                0
+            } else {
+                route.plane as usize
+            }]
+            .1
+        );
     }
     assert_ne!(incoming[0].1, incoming[1].1);
     assert!(
@@ -420,6 +435,13 @@ async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stall
             .iter()
             .all(|(_, cookie)| *cookie != c.onion_stream_local_cookie())
     );
+    let control = outgoing.iter().find(|r| r.plane == 3).unwrap();
+    let audio_route = outgoing.iter().find(|r| r.plane == 0).unwrap();
+    assert_ne!(control.origin, audio_route.origin);
+    assert_ne!(control.return_cookie, audio_route.return_cookie);
+    let feedback = vec![0x80, 201, 0, 1, 0, 0, 0, 7];
+    assert_eq!(send(ca.id, &feedback), 0);
+    expect_packet(&mut cc.rx, &feedback).await;
     let video_r = registry.lookup(&incoming[1].1).unwrap();
     let primary_r = registry.lookup(&incoming[0].1).unwrap();
     assert_ne!(video_r.circuit_id_in, primary_r.circuit_id_in);
@@ -482,10 +504,15 @@ async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stall
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let new = ca.routes.outgoing_for_test().await;
-            if new.len() == 2
-                && new
-                    .iter()
-                    .all(|r| r.origin != outgoing[r.plane as usize].origin)
+            if new.len() == 3
+                && new.iter().all(|r| {
+                    r.origin
+                        != outgoing
+                            .iter()
+                            .find(|old| old.plane == r.plane)
+                            .unwrap()
+                            .origin
+                })
             {
                 break;
             }
@@ -511,18 +538,18 @@ async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stall
     let screen = packet(96, 0x75);
     assert_eq!(send(ca.id, &screen), 0);
     tokio::time::timeout(Duration::from_secs(15), async {
-        while ca.routes.outgoing_for_test().await.len() != 3 {
+        while ca.routes.outgoing_for_test().await.len() != 4 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .unwrap();
-    let outgoing_three = ca.routes.outgoing_for_test().await;
+    let outgoing_all = ca.routes.outgoing_for_test().await;
     assert_eq!(cc.routes.receive_addresses_for_test().len(), 2);
-    assert_eq!(outgoing_three[2].destination_cookie, incoming[1].1);
-    for other in &outgoing_three[..2] {
-        assert_ne!(outgoing_three[2].origin, other.origin);
-        assert_ne!(outgoing_three[2].return_cookie, other.return_cookie);
+    assert_eq!(outgoing_all[2].destination_cookie, incoming[1].1);
+    for other in outgoing_all.iter().filter(|r| r.plane != 2) {
+        assert_ne!(outgoing_all[2].origin, other.origin);
+        assert_ne!(outgoing_all[2].return_cookie, other.return_cookie);
     }
     // The first cell may expire during route construction. Fresh cells must
     // decrypt at the other endpoint, not merely enter a source queue.
@@ -578,8 +605,8 @@ async fn private_media_paths_use_distinct_first_hops_when_alternatives_exist() {
     cc.routes.start(&tokio::runtime::Handle::current());
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            if ca.routes.outgoing_for_test().await.len() == 2
-                && cc.routes.outgoing_for_test().await.len() == 2
+            if ca.routes.outgoing_for_test().await.len() == 3
+                && cc.routes.outgoing_for_test().await.len() == 3
             {
                 break;
             }
@@ -616,10 +643,15 @@ async fn private_media_paths_use_distinct_first_hops_when_alternatives_exist() {
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let after = ca.routes.outgoing_for_test().await;
-            if after.len() == 2
-                && after
-                    .iter()
-                    .all(|r| r.origin != before[r.plane as usize].origin)
+            if after.len() == 3
+                && after.iter().all(|r| {
+                    r.origin
+                        != before
+                            .iter()
+                            .find(|old| old.plane == r.plane)
+                            .unwrap()
+                            .origin
+                })
             {
                 assert_ne!(after[0].first_hop, after[1].first_hop);
                 break;

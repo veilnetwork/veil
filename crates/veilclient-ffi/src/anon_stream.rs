@@ -1523,6 +1523,7 @@ impl CircuitCells {
                 LocalMediaPlane::Primary => veil_proto::priority::REALTIME,
                 LocalMediaPlane::Secondary => veil_proto::priority::BULK,
                 LocalMediaPlane::Screen => veil_proto::priority::BACKGROUND,
+                LocalMediaPlane::Control => veil_session::LOCAL_SIGNALING_LANE,
             },
             outbound_circuits: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             stream_routes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -1672,11 +1673,20 @@ impl CircuitCells {
             // Oversized (payload > one cell) — drop; callers batch to fit.
             Err(_) => return false,
         };
-        match self.services.send_circuit_datagram_on_local_lane_detailed(
-            &route.circuit,
-            &env,
-            self.local_datagram_lane,
-        ) {
+        let result = match deadline {
+            Some(deadline) => self.services.send_circuit_datagram_on_local_lane_before(
+                &route.circuit,
+                &env,
+                self.local_datagram_lane,
+                deadline.into_std(),
+            ),
+            None => self.services.send_circuit_datagram_on_local_lane_detailed(
+                &route.circuit,
+                &env,
+                self.local_datagram_lane,
+            ),
+        };
+        match result {
             Ok(()) => {
                 mark_circuit_activity(&self.activity);
                 self.mark_outbound_non_handshake(dst_node, &route).await;
@@ -3215,7 +3225,7 @@ pub struct AnonStreamHub {
     cells: Arc<HubCells>,
     /// Local producers have separate pools, repair and route-selection state.
     /// They reuse the hub's registration and authenticated receive demux.
-    media_cells: Option<[CircuitCells; 3]>,
+    media_cells: Option<[CircuitCells; 4]>,
     _sender: Arc<AppSender>,
 }
 
@@ -3490,6 +3500,7 @@ impl AnonStreamHub {
                 c.isolated_producer(LocalMediaPlane::Primary),
                 c.isolated_producer(LocalMediaPlane::Secondary),
                 c.isolated_producer(LocalMediaPlane::Screen),
+                c.isolated_producer(LocalMediaPlane::Control),
             ]),
             HubCells::Anon(_) => None,
         };
@@ -3543,6 +3554,7 @@ impl AnonStreamHub {
             LocalMediaPlane::Primary => 0,
             LocalMediaPlane::Secondary => 1,
             LocalMediaPlane::Screen => 2,
+            LocalMediaPlane::Control => 3,
         };
         self.media_cells.as_ref().map(|cells| &cells[index])
     }

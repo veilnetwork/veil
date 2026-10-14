@@ -681,8 +681,13 @@ async fn audio_continues_while_video_writer_is_blocked(relay: bool) {
 }
 
 #[tokio::test]
-async fn anonymous_audio_continues_during_blocked_video_send_or_warm() {
-    for block_warm in [false, true] {
+async fn anonymous_audio_continues_during_blocked_video_or_control_send_and_warm() {
+    for (blocked_plane, block_warm) in [
+        (LocalMediaPlane::Secondary, false),
+        (LocalMediaPlane::Secondary, true),
+        (LocalMediaPlane::Control, false),
+        (LocalMediaPlane::Control, true),
+    ] {
         let cipher = Arc::new(cipher_for_test(&[0x87; 32], &[1; 32], &[2; 32]).unwrap());
         let receiver = cipher_for_test(&[0x88; 32], &[2; 32], &[1; 32]).unwrap();
         let (audio_tx, audio_rx) = mpsc::channel(2);
@@ -710,7 +715,7 @@ async fn anonymous_audio_continues_during_blocked_video_send_or_warm() {
             video_rx,
             video_repair_rx,
             cipher,
-            LocalMediaPlane::Secondary,
+            blocked_plane,
             move |cell| {
                 let tx = received_tx.clone();
                 let entered = Arc::clone(&send_entered);
@@ -738,16 +743,25 @@ async fn anonymous_audio_continues_during_blocked_video_send_or_warm() {
                 }
             },
         ));
-        let video = video_packet(7, true, 1);
-        video_tx.send(video.clone().into()).await.unwrap();
+        let video = if matches!(blocked_plane, LocalMediaPlane::Control) {
+            vec![0x80, 201, 0, 1, 0, 0, 0, 7]
+        } else {
+            video_packet(7, true, 1)
+        };
+        let ingress = MediaIngress::new(
+            audio_tx.clone(),
+            MediaVideoIngress::Packets(video_tx.clone()),
+        );
+        *ingress.feedback_tx.write().unwrap() = Some(video_tx.clone());
+        assert_eq!(ingress.enqueue(video.clone().into()), 0);
         tokio::time::timeout(Duration::from_secs(1), entered.notified())
             .await
             .unwrap();
         let audio = vec![0x80, 111, 1, 2, 3, 4];
-        audio_tx.send(audio.clone().into()).await.unwrap();
+        assert_eq!(ingress.enqueue(audio.clone().into()), 0);
         let cell = tokio::time::timeout(Duration::from_millis(100), received_rx.recv())
             .await
-            .expect("anonymous audio must not wait for video")
+            .expect("anonymous audio must not wait for another source")
             .unwrap();
         assert_eq!(receiver.open(&cell), Some(audio));
         release.notify_one();
@@ -756,7 +770,13 @@ async fn anonymous_audio_continues_during_blocked_video_send_or_warm() {
             .unwrap()
             .unwrap();
         assert_eq!(receiver.open(&cell), Some(video));
-        drop((audio_tx, video_tx, audio_repair_tx, video_repair_tx));
+        drop((
+            ingress,
+            audio_tx,
+            video_tx,
+            audio_repair_tx,
+            video_repair_tx,
+        ));
         for task in [audio_task, video_task] {
             tokio::time::timeout(Duration::from_secs(1), task)
                 .await
@@ -772,6 +792,7 @@ async fn anonymous_active_producers_rewarm_on_repair_and_stop_with_closed_ingres
         LocalMediaPlane::Primary,
         LocalMediaPlane::Secondary,
         LocalMediaPlane::Screen,
+        LocalMediaPlane::Control,
     ] {
         let cipher = Arc::new(cipher_for_test(&[0x8e; 32], &[1; 32], &[2; 32]).unwrap());
         let receiver = cipher_for_test(&[0x8f; 32], &[2; 32], &[1; 32]).unwrap();
@@ -859,6 +880,7 @@ async fn anonymous_repair_fans_out_with_independent_backpressure() {
     let (repair_hi, mut repair_hi_rx) = mpsc::channel(1);
     let (repair_video, mut repair_video_rx) = mpsc::channel(1);
     let (repair_screen, mut repair_screen_rx) = mpsc::channel(1);
+    let (repair_feedback, mut repair_feedback_rx) = mpsc::channel(1);
     let id = MEDIA_NEXT_ID.fetch_add(1, Ordering::Relaxed);
     MEDIA_CHANNELS
         .write()
@@ -868,7 +890,7 @@ async fn anonymous_repair_fans_out_with_independent_backpressure() {
             MediaChannel {
                 path_probe: None,
                 ingress: MediaIngress::new(tx_hi, MediaVideoIngress::Packets(tx_video)),
-                repair_tx: Some([repair_hi, repair_video, repair_screen]),
+                repair_tx: Some([repair_hi, repair_video, repair_screen, repair_feedback]),
                 peer: [0x8a; 32],
                 task: tokio::spawn(std::future::pending()),
                 video_task: Some(tokio::spawn(std::future::pending())),
@@ -894,6 +916,8 @@ async fn anonymous_repair_fans_out_with_independent_backpressure() {
     assert!(repair_video_rx.try_recv().is_err());
     repair_screen_rx.try_recv().unwrap();
     assert!(repair_screen_rx.try_recv().is_err());
+    repair_feedback_rx.try_recv().unwrap();
+    assert!(repair_feedback_rx.try_recv().is_err());
     unsafe { veil_media_close_channel(id) };
 }
 

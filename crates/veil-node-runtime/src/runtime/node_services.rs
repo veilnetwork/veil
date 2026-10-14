@@ -2207,6 +2207,7 @@ impl NodeServices {
             payload,
             local_lane,
             veil_proto::family::RelayChainMsg::CircuitData,
+            None,
         )
     }
 
@@ -2248,6 +2249,25 @@ impl NodeServices {
             payload,
             local_lane,
             veil_proto::family::RelayChainMsg::CircuitDatagram,
+            None,
+        )
+    }
+
+    /// Preserve an originator's local freshness bound through session queueing.
+    /// The deadline and source selector are never encoded in a circuit header.
+    pub fn send_circuit_datagram_on_local_lane_before(
+        &self,
+        circ: &DataCircuit,
+        payload: &[u8],
+        local_lane: u8,
+        expires_at: std::time::Instant,
+    ) -> std::result::Result<(), DataCircuitSendError> {
+        self.send_circuit_cell_with_transport(
+            circ,
+            payload,
+            local_lane,
+            veil_proto::family::RelayChainMsg::CircuitDatagram,
+            Some(expires_at),
         )
     }
 
@@ -2257,6 +2277,7 @@ impl NodeServices {
         payload: &[u8],
         local_lane: u8,
         transport: veil_proto::family::RelayChainMsg,
+        expires_at: Option<std::time::Instant>,
     ) -> std::result::Result<(), DataCircuitSendError> {
         use veil_anonymity::circuit_data::{Direction, apply_layers, wrap_payload};
         use veil_anonymity::circuit_wire::CircuitDataPayload;
@@ -2274,13 +2295,27 @@ impl NodeServices {
         let enc = cell
             .encode(circ.cell_bytes)
             .map_err(|_| DataCircuitSendError::NoRelays)?;
-        self.send_relay_chain_frame_on_local_lane(&circ.first_hop, transport, &enc, local_lane)
-            .map_err(|err| match err {
-                veil_session::SendToError::Full => DataCircuitSendError::QueueFull,
-                veil_session::SendToError::Missing | veil_session::SendToError::Closed => {
-                    DataCircuitSendError::NoRelays
-                }
-            })?;
+        let result = match expires_at {
+            Some(expires_at) => self.send_relay_chain_frame_on_local_lane_before(
+                &circ.first_hop,
+                transport,
+                &enc,
+                local_lane,
+                expires_at,
+            ),
+            None => self.send_relay_chain_frame_on_local_lane(
+                &circ.first_hop,
+                transport,
+                &enc,
+                local_lane,
+            ),
+        };
+        result.map_err(|err| match err {
+            veil_session::SendToError::Full => DataCircuitSendError::QueueFull,
+            veil_session::SendToError::Missing | veil_session::SendToError::Closed => {
+                DataCircuitSendError::NoRelays
+            }
+        })?;
         Ok(())
     }
 

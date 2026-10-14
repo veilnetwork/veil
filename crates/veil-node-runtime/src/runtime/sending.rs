@@ -49,6 +49,17 @@ fn enqueue_relay_chain_frame(
     registry.send_to_result(peer, local_lane, relay_chain_frame(msg, body))
 }
 
+fn enqueue_relay_chain_frame_before(
+    registry: &veil_session::SessionTxRegistry,
+    peer: &[u8; 32],
+    msg: veil_proto::family::RelayChainMsg,
+    body: &[u8],
+    local_lane: u8,
+    expires_at: std::time::Instant,
+) -> std::result::Result<(), veil_session::SendToError> {
+    registry.send_to_before_result(peer, local_lane, relay_chain_frame(msg, body), expires_at)
+}
+
 impl NodeServices {
     /// Build + enqueue one `RelayChain::<msg>` control frame to `peer`'s session.
     pub(crate) fn send_relay_chain_frame(
@@ -74,6 +85,18 @@ impl NodeServices {
     ) -> std::result::Result<(), veil_session::SendToError> {
         let guard = wlock!(self.session_tx_registry);
         enqueue_relay_chain_frame(&guard, peer, msg, body, local_lane)
+    }
+
+    pub(crate) fn send_relay_chain_frame_on_local_lane_before(
+        &self,
+        peer: &[u8; 32],
+        msg: veil_proto::family::RelayChainMsg,
+        body: &[u8],
+        local_lane: u8,
+        expires_at: std::time::Instant,
+    ) -> std::result::Result<(), veil_session::SendToError> {
+        let guard = rlock!(self.session_tx_registry);
+        enqueue_relay_chain_frame_before(&guard, peer, msg, body, local_lane, expires_at)
     }
 
     /// Authenticated rendezvous send (Epic 482 v1, "any recipient"): like
@@ -2033,6 +2056,41 @@ impl NodeServices {
 
 #[cfg(test)]
 mod local_circuit_lanes_tests {
+    #[tokio::test]
+    async fn short_circuit_control_keeps_local_expiry_and_neutral_wire_header() {
+        use veil_proto::{
+            codec::decode_header_with_limit, family::RelayChainMsg, header::HEADER_SIZE, priority,
+        };
+        let peer = [0x8d; 32];
+        let mut registry = veil_session::SessionTxRegistry::default();
+        let mut rx = registry.register(peer);
+        super::enqueue_relay_chain_frame_before(
+            &registry,
+            &peer,
+            RelayChainMsg::CircuitDatagram,
+            b"expired",
+            veil_session::LOCAL_SIGNALING_LANE,
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+        super::enqueue_relay_chain_frame_before(
+            &registry,
+            &peer,
+            RelayChainMsg::CircuitDatagram,
+            b"opaque",
+            veil_session::LOCAL_SIGNALING_LANE,
+            std::time::Instant::now() + std::time::Duration::from_millis(200),
+        )
+        .unwrap();
+        let (lane, frame) = rx.recv().await.unwrap();
+        assert_eq!(lane, veil_session::LOCAL_SIGNALING_LANE);
+        let header = decode_header_with_limit(&frame[..HEADER_SIZE], 1024).unwrap();
+        assert_eq!(header.priority(), priority::INTERACTIVE);
+        assert_eq!(header.flags, u16::from(priority::INTERACTIVE));
+        assert_eq!(&frame[HEADER_SIZE..], b"opaque");
+    }
+
     #[tokio::test]
     async fn originating_circuit_lanes_are_local_and_relay_headers_stay_equal() {
         use veil_proto::{
