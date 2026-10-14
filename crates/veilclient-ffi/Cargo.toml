@@ -38,6 +38,7 @@ packet-tunnel = ["dep:tun2proxy", "dep:tun", "dep:serde", "dep:serde_json"]
 # C++ RocksDB cold store off mobile. Add `node-embedded-rocksdb` for a
 # persistent DHT on desktop/server.
 node-embedded = [
+    "dep:serde_json",
     "dep:veil-node-runtime",
     "dep:veil-ipc",
     "dep:veil-cfg",
