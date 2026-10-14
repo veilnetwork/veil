@@ -1277,6 +1277,9 @@ impl AuthDeliverFragment {
 /// explicit choice and ordinary sends retain the interactive source queue.
 /// This bit and the lane are never copied to an inter-node header.
 pub const IPC_HEADER_EXPLICIT_LOCAL_LANE: u16 = 0x0004;
+/// Short-lived local datagrams; consumed by IPC, never copied to a wire header.
+pub const IPC_HEADER_SHORT_DATAGRAM: u16 = 0x0010;
+pub const LOCAL_SHORT_DATAGRAM_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Process-local source selector for recoverable DATA, separate from the
 /// background media producer. It is not a fifth wire priority. Old local
@@ -1391,6 +1394,9 @@ pub const IPC_SEND_FLAG_RELAY_CONTROL_COMPAT: u32 = 0x0000_0080;
 /// Set it and the local short-circuit is skipped, so the frame takes the path
 /// that reaches a sibling: sealed per instance, our own left out.
 pub const IPC_SEND_FLAG_MY_OTHER_DEVICES: u32 = 0x0000_0100;
+/// Endpoint-local short control on the generic signaling source. Only valid
+/// with already-sealed, ACK-free relay datagrams; not encoded in Delivery.
+pub const IPC_SEND_FLAG_LOCAL_SHORT_CONTROL: u32 = 0x0000_0200;
 
 /// Versioned prefix of a symmetrically sealed relay-media cell. Shared by the
 /// local IPC gate and the media endpoint codec; relays never interpret it.

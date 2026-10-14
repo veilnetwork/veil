@@ -131,9 +131,18 @@ impl LocalSourceActivity {
     }
 
     pub(crate) fn pending_signal(&self, now: Instant) -> PendingSignaling {
-        let deadline = Arc::new(SignalingDeadline {
-            until: now + crate::priority_queue::lossy_realtime_max_age(crate::LOCAL_SIGNALING_LANE),
-        });
+        self.pending_signal_before(
+            now,
+            now + crate::priority_queue::lossy_realtime_max_age(crate::LOCAL_SIGNALING_LANE),
+        )
+    }
+
+    pub(crate) fn pending_signal_before(
+        &self,
+        now: Instant,
+        expires_at: Instant,
+    ) -> PendingSignaling {
+        let deadline = Arc::new(SignalingDeadline { until: expires_at });
         let mut state = lock!(self.state);
         retain_pending_signaling(&mut state, now);
         state.pending_signaling.push(Arc::downgrade(&deadline));
@@ -703,6 +712,18 @@ mod tests {
             activity.admit_reliable_secondary(1024, now + Duration::from_millis(400)),
             Ok(())
         );
+    }
+
+    #[test]
+    fn expired_short_signal_does_not_hold_reliable_data_for_the_lifecycle_window() {
+        let activity = LocalSourceActivity::default();
+        let now = Instant::now();
+        let _held = activity.pending_signal_before(now, now + Duration::from_millis(200));
+        let mut state = lock!(activity.state);
+        retain_pending_signaling(&mut state, now + Duration::from_millis(199));
+        assert_eq!(state.pending_signaling.len(), 1);
+        retain_pending_signaling(&mut state, now + Duration::from_millis(200));
+        assert!(state.pending_signaling.is_empty());
     }
 
     #[test]

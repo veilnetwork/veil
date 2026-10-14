@@ -2,8 +2,8 @@ use super::*;
 use crate::client::{DispatchTable, IpcWriterFrame, SharedWriter, run_writer_task};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use veil_proto::{codec::decode_header, header::HEADER_SIZE};
 use veil_proto::ipc::AppIpcSendPayload;
+use veil_proto::{codec::decode_header, header::HEADER_SIZE};
 
 fn sender(writer: SharedWriter) -> AppSender {
     AppSender {
@@ -287,4 +287,52 @@ async fn ipc_recovery_finishes_partial_frames_and_sheds_only_unstarted_expired_m
         frames[3].0.flags,
         veil_proto::ipc::IPC_HEADER_EXPLICIT_LOCAL_LANE | 2
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn short_control_flags_and_deadlines_stay_in_local_ipc() {
+    let (tx, mut rx) = mpsc::channel::<IpcWriterFrame>(2);
+    let source = sender(SharedWriter::new(tx));
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+    let body = [
+        veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC.as_slice(),
+        &[7; 32],
+    ]
+    .concat();
+    source
+        .send_short_control_datagram_before([8; 32], [9; 32], 13, 7, &body, deadline)
+        .await
+        .unwrap();
+    let frame = rx.recv().await.unwrap();
+    let header = decode_header(&frame).unwrap();
+    assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+    assert_ne!(header.flags & veil_proto::ipc::IPC_HEADER_SHORT_DATAGRAM, 0);
+    let payload = veil_proto::AppIpcRtSendPayload::decode(&frame[HEADER_SIZE..]).unwrap();
+    assert_eq!(payload.data, body);
+    source
+        .send_short_control_sealed_before_owned([8; 32], [9; 32], 13, body.clone(), deadline)
+        .await
+        .unwrap();
+    let frame = rx.recv().await.unwrap();
+    let flags = u32::from_be_bytes(
+        frame[HEADER_SIZE + 100..HEADER_SIZE + 104]
+            .try_into()
+            .unwrap(),
+    );
+    assert_ne!(
+        flags & veil_proto::ipc::IPC_SEND_FLAG_LOCAL_SHORT_CONTROL,
+        0
+    );
+    assert_eq!(
+        flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT,
+        0
+    );
+    tokio::time::advance(Duration::from_millis(201)).await;
+    assert!(
+        !source
+            .send_short_control_datagram_before([8; 32], [9; 32], 13, 7, &body, deadline)
+            .await
+            .unwrap()
+    );
+    assert!(rx.try_recv().is_err());
 }

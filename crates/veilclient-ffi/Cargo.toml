@@ -139,6 +139,7 @@ windows-sys = { version = "0.59", features = [
 android_logger = "0.13"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 # Snapshot capacity covers the actual primitive bank and tree limits.
 veil-ratchet = { path = "../veil-ratchet" }
 veil-dht = { path = "../veil-dht" }

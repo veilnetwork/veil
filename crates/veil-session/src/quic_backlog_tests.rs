@@ -1063,7 +1063,7 @@ async fn measure_primary_blackout(
             tx.send_buffer_space(),
         ) {
             let deadline = expiry.then(|| {
-                super::local_primary_datagram_expiry(&crate::frame_outbox::FrameEnvelope::from((
+                super::local_datagram_expiry(&crate::frame_outbox::FrameEnvelope::from((
                     REALTIME,
                     veil_bufpool::pooled_shared_from_vec(frame.clone()),
                 )))
@@ -1504,13 +1504,12 @@ async fn measure_bound_independent_load(
                 packets.iter().map(Vec::len).sum(),
                 primary.tx.send_buffer_space(),
             ) {
-                let deadline = super::local_primary_datagram_expiry(
-                    &crate::frame_outbox::FrameEnvelope::from((
+                let deadline =
+                    super::local_datagram_expiry(&crate::frame_outbox::FrameEnvelope::from((
                         REALTIME,
                         veil_bufpool::pooled_shared_from_vec(frame.clone()),
-                    )),
-                )
-                .unwrap();
+                    )))
+                    .unwrap();
                 for packet in packets {
                     primary.tx.send_before(&packet, deadline).unwrap();
                 }
@@ -1921,13 +1920,12 @@ async fn independent_primary_expiry_keeps_parent_control_admission() {
                 packets.iter().map(Vec::len).sum(),
                 primary.tx.send_buffer_space(),
             ) {
-                let expiry = super::local_primary_datagram_expiry(
-                    &crate::frame_outbox::FrameEnvelope::from((
+                let expiry =
+                    super::local_datagram_expiry(&crate::frame_outbox::FrameEnvelope::from((
                         REALTIME,
                         veil_bufpool::pooled_shared_from_vec(frame.clone()),
-                    )),
-                )
-                .unwrap();
+                    )))
+                    .unwrap();
                 for packet in packets {
                     primary.tx.send_before(&packet, expiry).unwrap();
                 }

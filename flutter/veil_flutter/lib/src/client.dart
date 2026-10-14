@@ -2946,6 +2946,24 @@ class AppHandle implements Finalizable {
         screenAppAddr));
   }
 
+  static bool get supportsMediaFeedbackSender =>
+      ffi.supportsMediaFeedbackSender;
+
+  /// Same media app on its own IPC connection; retained until channel close.
+  bool configureMediaFeedbackSender(int chan) {
+    _ensureOpen();
+    if (!supportsMediaFeedbackSender) return false;
+    final err = calloc<Pointer<Utf8>>();
+    try {
+      if (ffi.veilMediaChannelSetFeedbackSender(chan, _app, err) != 0) {
+        throw VeilException('media feedback sender: ${_readErrAndFree(err)}');
+      }
+      return true;
+    } finally {
+      calloc.free(err);
+    }
+  }
+
   /// Compact call state requires a separately bound IPC sender with this
   /// channel's app identity. The sender must live until the channel closes.
   static bool get supportsCallControl => ffi.supportsCallControl;

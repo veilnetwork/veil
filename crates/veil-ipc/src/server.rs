@@ -2550,6 +2550,7 @@ async fn handle_ipc_client(
                             // leave this loop instead of holding it for the
                             // length of a DHT key resolve.
                             let mut ctx = IpcSendContext {
+                                source_received_at: std::time::Instant::now(),
                                 local_work: None,
                                 local_priority: veil_proto::ipc::ipc_local_source_lane(&hdr),
                                 app_registry:        Arc::clone(&app_registry),
@@ -2954,6 +2955,7 @@ async fn handle_ipc_client(
                                 client_state.metrics.as_deref(),
                                 &mut rate_limiter,
                                 hdr.priority(),
+                                hdr.flags & veil_proto::ipc::IPC_HEADER_SHORT_DATAGRAM != 0,
                             ).await?;
                         }
                     }

@@ -2175,6 +2175,14 @@ final int Function(int, Pointer<VeilApp>, Pointer<Pointer<Utf8>>)
             'veil_media_channel_set_secondary_sender')
         .asFunction();
 
+final bool supportsMediaFeedbackSender =
+    nativeLib.providesSymbol('veil_media_channel_set_feedback_sender');
+final int Function(int, Pointer<VeilApp>, Pointer<Pointer<Utf8>>)
+    veilMediaChannelSetFeedbackSender = nativeLib.lookupFunction<
+        Int32 Function(Uint64, Pointer<VeilApp>, Pointer<Pointer<Utf8>>),
+        int Function(int, Pointer<VeilApp>,
+            Pointer<Pointer<Utf8>>)>('veil_media_channel_set_feedback_sender');
+
 const int veilCallControlMaxBytes = abi.veilCallControlMaxBytes;
 
 // Optional ephemeral call-state API. All three functions are required.

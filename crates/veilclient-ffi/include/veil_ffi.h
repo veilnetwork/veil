@@ -3833,6 +3833,17 @@ int veil_media_channel_configure_path_probes(uint64_t chan,
  int veil_media_poll_call_control(uint64_t chan, uint8_t *ptr, size_t capacity) ;
 #endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Install a sender-only binding of the same media app on a separate IPC
+ * connection. RTP never waits for this queue or sender lock. No peer feature
+ * negotiation is needed: the ciphertext and RTCP body format are unchanged.
+ * Anonymous channels retain their existing circuit path; close/reopen to
+ * replace a sender. The caller owns the binding until channel close.
+ */
+ int veil_media_channel_set_feedback_sender(uint64_t chan, VeilApp *app, char **err_out) ;
+#endif
+
 /**
  * Register this node as a LOCATION-anonymous (onion) service: the daemon picks
  * relays, builds an onion circuit to a rendezvous relay (which never learns

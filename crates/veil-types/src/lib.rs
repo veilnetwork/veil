@@ -98,6 +98,36 @@ pub trait FrameBroadcaster: Send + Sync {
     /// `false` if the peer is not registered or its channel is closed/full.
     fn send_to(&self, peer_id: &[u8; 32], priority: u8, bytes: Vec<u8>) -> bool;
 
+    /// Endpoint-local expiration only. Implementations without preservation
+    /// decline rather than silently enqueue stale work. No wire TTL changes.
+    fn send_to_before(
+        &self,
+        _peer_id: &[u8; 32],
+        _priority: u8,
+        _bytes: Vec<u8>,
+        _expires_at: std::time::Instant,
+    ) -> bool {
+        false
+    }
+
+    fn send_to_peer_or_identity_before(
+        &self,
+        dst: &[u8; 32],
+        priority: u8,
+        bytes: Vec<u8>,
+        expires_at: std::time::Instant,
+    ) -> bool {
+        let devices = self.devices_of(dst);
+        let Some((last, rest)) = devices.split_last() else {
+            return self.send_to_before(dst, priority, bytes, expires_at);
+        };
+        let mut sent = false;
+        for device in rest {
+            sent |= self.send_to_before(device, priority, bytes.clone(), expires_at);
+        }
+        sent | self.send_to_before(last, priority, bytes, expires_at)
+    }
+
     /// Admit a trusted endpoint source with ingress backpressure. The caller
     /// bounds its wait; transit forwarding must keep the ordinary try-send.
     /// The selector stays local and does not change the encoded wire header.
