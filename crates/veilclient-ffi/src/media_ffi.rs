@@ -461,6 +461,7 @@ async fn drain_relay_video_batches_on_plane<F, Fut>(
             media::LocalMediaPlane::Primary => veil_proto::priority::REALTIME,
             media::LocalMediaPlane::Secondary => veil_proto::priority::BULK,
             media::LocalMediaPlane::Screen => veil_proto::priority::BACKGROUND,
+            media::LocalMediaPlane::Control => veil_session::LOCAL_SIGNALING_LANE,
         };
         let mut trace = veil_session::local_lossy_trace::SourceFrameTrace::new(
             local_priority,
@@ -591,9 +592,11 @@ pub unsafe extern "C" fn veil_media_open_channel(
     let (tx_hi, rx_hi) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_HI_QUEUE);
     let (tx_video, rx_video) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_VIDEO_QUEUE);
     let (tx_screen, rx_screen) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_VIDEO_QUEUE);
+    let (tx_feedback, rx_feedback) = mpsc::channel::<QueuedMediaPacket>(16);
     let (repair_hi_tx, repair_hi_rx) = mpsc::channel::<()>(1);
     let (repair_video_tx, repair_video_rx) = mpsc::channel::<()>(1);
     let (repair_screen_tx, repair_screen_rx) = mpsc::channel::<()>(1);
+    let (repair_feedback_tx, repair_feedback_rx) = mpsc::channel::<()>(1);
     let spawn_producer = |rx, repair_rx, plane| {
         let send_hub = Arc::clone(&hub);
         let warm_hub = Arc::clone(&hub);
@@ -631,6 +634,20 @@ pub unsafe extern "C" fn veil_media_open_channel(
     let task = spawn_producer(rx_hi, repair_hi_rx, media::LocalMediaPlane::Primary);
     let video_task = spawn_producer(rx_video, repair_video_rx, media::LocalMediaPlane::Secondary);
     let screen_task = spawn_producer(rx_screen, repair_screen_rx, media::LocalMediaPlane::Screen);
+    let feedback_task = spawn_producer(
+        rx_feedback,
+        repair_feedback_rx,
+        media::LocalMediaPlane::Control,
+    );
+    let ingress = MediaIngress::with_screen(
+        tx_hi,
+        MediaVideoIngress::Packets(tx_video),
+        MediaVideoIngress::Packets(tx_screen),
+    );
+    *ingress
+        .feedback_tx
+        .write()
+        .unwrap_or_else(|p| p.into_inner()) = Some(tx_feedback);
     MEDIA_CHANNELS
         .write()
         .unwrap_or_else(|p| p.into_inner())
@@ -638,17 +655,18 @@ pub unsafe extern "C" fn veil_media_open_channel(
             id,
             MediaChannel {
                 path_probe: None,
-                ingress: MediaIngress::with_screen(
-                    tx_hi,
-                    MediaVideoIngress::Packets(tx_video),
-                    MediaVideoIngress::Packets(tx_screen),
-                ),
-                repair_tx: Some([repair_hi_tx, repair_video_tx, repair_screen_tx]),
+                ingress,
+                repair_tx: Some([
+                    repair_hi_tx,
+                    repair_video_tx,
+                    repair_screen_tx,
+                    repair_feedback_tx,
+                ]),
                 peer,
                 task,
                 video_task: Some(video_task),
                 screen_task: Some(screen_task),
-                feedback_task: None,
+                feedback_task: Some(feedback_task),
                 video_sender: None,
                 screen_sender: None,
                 sender_app_id: None,
@@ -1751,7 +1769,7 @@ struct MediaChannel {
     /// The receiver of the media asks the sender to refresh its outbound
     /// rendezvous pool when RTP/RTCP has gone dark even though signaling is
     /// still alive. Direct channels leave this `None`.
-    repair_tx: Option<[mpsc::Sender<()>; 3]>,
+    repair_tx: Option<[mpsc::Sender<()>; 4]>,
     peer: [u8; 32],
     task: tokio::task::JoinHandle<()>,
     video_task: Option<tokio::task::JoinHandle<()>>,

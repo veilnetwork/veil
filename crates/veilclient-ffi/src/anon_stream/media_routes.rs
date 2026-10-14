@@ -235,13 +235,14 @@ async fn open_private_route(
 pub(crate) struct MediaRoutes {
     peer: [u8; 32],
     channel: u64,
-    cores: [CircuitCells; 3],
+    cores: [CircuitCells; 4],
     cipher: Arc<crate::media::MediaCipher>,
-    outgoing: [tokio::sync::Mutex<Option<(ReceiveAddress, PinnedRoute, u64)>>; 3],
-    repair_generation: [AtomicU64; 3],
+    outgoing: [tokio::sync::Mutex<Option<(ReceiveAddress, PinnedRoute, u64)>>; 4],
+    repair_generation: [AtomicU64; 4],
     offers: Mutex<OfferInbox>,
     closed: AtomicBool,
     screen_active: AtomicBool,
+    control_active: AtomicBool,
     incoming: Mutex<([Option<ReceiveAddress>; 2], u64)>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -250,7 +251,7 @@ impl MediaRoutes {
     pub(super) fn new(
         peer: [u8; 32],
         channel: u64,
-        cores: [CircuitCells; 3],
+        cores: [CircuitCells; 4],
         cipher: Arc<crate::media::MediaCipher>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -263,6 +264,7 @@ impl MediaRoutes {
             offers: Mutex::new(OfferInbox::default()),
             closed: AtomicBool::new(false),
             screen_active: AtomicBool::new(false),
+            control_active: AtomicBool::new(false),
             incoming: Mutex::new(([None, None], 0)),
             tasks: Mutex::new(Vec::new()),
         })
@@ -278,7 +280,9 @@ impl MediaRoutes {
             tasks.push(runtime.spawn(routes.run_plane(plane)));
         }
         let routes = Arc::clone(self);
-        tasks.push(runtime.spawn(routes.run_screen_sender()));
+        tasks.push(runtime.spawn(routes.run_auxiliary_sender(2)));
+        let routes = Arc::clone(self);
+        tasks.push(runtime.spawn(routes.run_auxiliary_sender(3)));
         let routes = Arc::clone(self);
         tasks.push(runtime.spawn(routes.advertise()));
     }
@@ -317,6 +321,8 @@ impl MediaRoutes {
         let i = plane_index(plane);
         if i == 2 {
             self.screen_active.store(true, Ordering::Release);
+        } else if i == 3 {
+            self.control_active.store(true, Ordering::Release);
         }
         self.cores[i]
             .ensure_outbound_opening(self.peer, RouteClass::Bulk)
@@ -324,7 +330,7 @@ impl MediaRoutes {
     }
 
     pub(crate) fn repair(&self) {
-        for i in 0..3 {
+        for i in 0..self.cores.len() {
             self.repair_generation[i].fetch_add(1, Ordering::AcqRel);
             if let Ok(mut route) = self.outgoing[i].try_lock() {
                 route.take();
@@ -364,11 +370,20 @@ impl MediaRoutes {
             let Ok(env) = core.stream_envelope(&route, &cell, true) else {
                 return false;
             };
-            match core.services.send_circuit_datagram_on_local_lane_detailed(
-                &route.circuit,
-                &env,
-                core.local_datagram_lane,
-            ) {
+            let result = match sealed.local_deadline() {
+                Some(deadline) => core.services.send_circuit_datagram_on_local_lane_before(
+                    &route.circuit,
+                    &env,
+                    core.local_datagram_lane,
+                    deadline.into_std(),
+                ),
+                None => core.services.send_circuit_datagram_on_local_lane_detailed(
+                    &route.circuit,
+                    &env,
+                    core.local_datagram_lane,
+                ),
+            };
+            match result {
                 Ok(()) => return true,
                 Err(
                     veil_node_runtime::DataCircuitSendError::QueueFull
@@ -396,7 +411,10 @@ impl MediaRoutes {
             .highest
             .clone();
         if let Some(offer) = offer
-            && let Some(address) = offer.routes.iter().find(|r| r.plane as usize == i.min(1))
+            && let Some(address) = offer
+                .routes
+                .iter()
+                .find(|r| r.plane as usize == receive_plane_index(i))
         {
             let repair_generation = self.repair_generation[i].load(Ordering::Acquire);
             let ready =
@@ -423,7 +441,7 @@ impl MediaRoutes {
         }
     }
 
-    async fn run_screen_sender(self: Arc<Self>) {
+    async fn run_auxiliary_sender(self: Arc<Self>, i: usize) {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -431,8 +449,13 @@ impl MediaRoutes {
             if self.closed.load(Ordering::Acquire) {
                 break;
             }
-            if self.screen_active.load(Ordering::Acquire) {
-                self.refresh_outgoing(2).await;
+            let active = if i == 2 {
+                &self.screen_active
+            } else {
+                &self.control_active
+            };
+            if active.load(Ordering::Acquire) {
+                self.refresh_outgoing(i).await;
             }
         }
     }
@@ -489,6 +512,7 @@ impl MediaRoutes {
     /// marker, media role or relay privilege. Repetition also reaches old routes
     /// during migration and retries a lost offer without using a mailbox.
     async fn advertise(self: Arc<Self>) {
+        self.warm(LocalMediaPlane::Control).await;
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -509,9 +533,12 @@ impl MediaRoutes {
             };
             if let Some(sealed) = self
                 .cipher
-                .seal_on_plane(LocalMediaPlane::Primary, &offer.encode())
+                .seal_on_plane(LocalMediaPlane::Control, &offer.encode())
             {
-                let _ = self.send(LocalMediaPlane::Primary, &sealed).await;
+                let sealed = sealed.with_local_deadline(
+                    tokio::time::Instant::now() + veil_proto::ipc::LOCAL_SHORT_DATAGRAM_MAX_AGE,
+                );
+                let _ = self.send(LocalMediaPlane::Control, &sealed).await;
             }
         }
     }
@@ -522,6 +549,18 @@ fn plane_index(plane: LocalMediaPlane) -> usize {
         LocalMediaPlane::Primary => 0,
         LocalMediaPlane::Secondary => 1,
         LocalMediaPlane::Screen => 2,
+        LocalMediaPlane::Control => 3,
+    }
+}
+
+// Existing peers publish two opaque receive addresses. Screen uses the
+// secondary address; feedback/control uses the primary address, through its
+// own outgoing circuit and lock. This adds no public address or role marker.
+fn receive_plane_index(source: usize) -> usize {
+    match source {
+        0 | 3 => 0,
+        1 | 2 => 1,
+        _ => unreachable!("unknown local producer"),
     }
 }
 
@@ -550,6 +589,7 @@ pub(crate) async fn fixture(
             core.isolated_producer(LocalMediaPlane::Primary),
             core.isolated_producer(LocalMediaPlane::Secondary),
             core.isolated_producer(LocalMediaPlane::Screen),
+            core.isolated_producer(LocalMediaPlane::Control),
         ],
         cipher,
     );
@@ -591,6 +631,7 @@ impl MediaRoutes {
             core.isolated_producer(LocalMediaPlane::Primary),
             core.isolated_producer(LocalMediaPlane::Secondary),
             core.isolated_producer(LocalMediaPlane::Screen),
+            core.isolated_producer(LocalMediaPlane::Control),
         ];
         (Self::new(peer, channel, cores, cipher), rx)
     }
@@ -608,7 +649,7 @@ impl MediaRoutes {
 
     pub(crate) async fn outgoing_for_test(&self) -> Vec<RouteSnapshot> {
         let mut routes = Vec::new();
-        for i in 0..3 {
+        for i in 0..self.cores.len() {
             if let Some((address, route, _)) = self.outgoing[i].lock().await.as_ref() {
                 routes.push(RouteSnapshot {
                     plane: i as u8,
@@ -626,6 +667,34 @@ impl MediaRoutes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn blocked_control_route_cannot_hold_audio_or_retarget_its_receive_address() {
+        let cipher =
+            Arc::new(crate::media::cipher_for_test(&[0xc1; 32], &[1; 32], &[2; 32]).unwrap());
+        let (_dir, mut runtime, routes) = fixture([0xc1; 32], 1, Arc::clone(&cipher)).await;
+        assert_eq!(receive_plane_index(3), 0);
+        assert_eq!(
+            routes.cores[3].local_datagram_lane,
+            veil_session::LOCAL_SIGNALING_LANE
+        );
+        let held_route = routes.outgoing[3].lock().await;
+        let held_pool = routes.cores[3].outbound_circuits.lock().await;
+        let held_opening = routes.cores[3].outbound_opening.lock().await;
+        let cell = cipher
+            .seal(b"audio")
+            .unwrap()
+            .with_local_deadline(tokio::time::Instant::now() + Duration::from_millis(200));
+        let result = tokio::time::timeout(Duration::from_millis(100), async {
+            routes.warm(LocalMediaPlane::Primary).await;
+            routes.send(LocalMediaPlane::Primary, &cell).await
+        })
+        .await;
+        drop((held_route, held_pool, held_opening));
+        routes.stop();
+        runtime.stop().await.unwrap();
+        assert!(!result.expect("audio must not await any control-route lock"));
+    }
 
     fn offer(channel: u64, revision: u64) -> Offer {
         Offer {
@@ -716,7 +785,7 @@ mod tests {
             .iter()
             .map(|t| t.abort_handle())
             .collect();
-        assert_eq!(aborts.len(), 4);
+        assert_eq!(aborts.len(), 5);
         assert!(!routes.screen_active.load(Ordering::Acquire));
         routes.stop();
         routes.accept_control(&offer(1, 1).encode());
