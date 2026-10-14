@@ -35,6 +35,9 @@ pub mod path_probe_ffi;
 pub mod call_control_ffi;
 
 #[cfg(feature = "node-embedded")]
+pub mod feedback_ffi;
+
+#[cfg(feature = "node-embedded")]
 mod ingress_diagnostics;
 #[cfg(feature = "node-embedded")]
 use ingress_diagnostics::{Reason as IngressRefusal, refuse as refuse_ingress};
@@ -645,10 +648,12 @@ pub unsafe extern "C" fn veil_media_open_channel(
                 task,
                 video_task: Some(video_task),
                 screen_task: Some(screen_task),
+                feedback_task: None,
                 video_sender: None,
                 screen_sender: None,
                 sender_app_id: None,
                 control_destination: None,
+                direct_seq: None,
                 batching: None,
                 cipher,
                 relay_stats: None,
@@ -904,6 +909,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
         },
     ));
     let screen_source = Arc::clone(&screen_sender);
+    let seq_screen = Arc::clone(&transport_seq);
     let screen_task = app_ref.bundle.runtime.spawn(drain_media_packets_on_plane(
         rx_screen,
         Arc::clone(&batching),
@@ -912,7 +918,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
         Some(media::LocalMediaPlane::Screen),
         move |cell| {
             let sender = screen_source.current();
-            let seq = Arc::clone(&transport_seq);
+            let seq = Arc::clone(&seq_screen);
             async move {
                 let Some(guard) = cell.sealed.lock_while_fresh(&sender).await else {
                     return true;
@@ -959,10 +965,12 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
                 task,
                 video_task: Some(video_task),
                 screen_task: Some(screen_task),
+                feedback_task: None,
                 video_sender: Some(video_sender),
                 screen_sender: Some(screen_sender),
                 sender_app_id: Some(app_ref.app_id),
                 control_destination: Some((peer_app, peer_endpoint_id)),
+                direct_seq: Some(transport_seq),
                 batching: Some(batching),
                 cipher,
                 relay_stats: None,
@@ -1192,10 +1200,12 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                 task,
                 video_task: Some(video_task),
                 screen_task: Some(screen_task),
+                feedback_task: None,
                 video_sender: Some(video_sender),
                 screen_sender: Some(screen_sender),
                 sender_app_id: Some(app_ref.app_id),
                 control_destination: Some((peer_app, peer_endpoint_id)),
+                direct_seq: None,
                 batching: Some(batching),
                 cipher,
                 relay_stats: Some(relay_stats),
@@ -1746,10 +1756,12 @@ struct MediaChannel {
     task: tokio::task::JoinHandle<()>,
     video_task: Option<tokio::task::JoinHandle<()>>,
     screen_task: Option<tokio::task::JoinHandle<()>>,
+    feedback_task: Option<tokio::task::JoinHandle<()>>,
     video_sender: Option<Arc<MediaSenderSlot<AppSender>>>,
     screen_sender: Option<Arc<MediaSenderSlot<AppSender>>>,
     sender_app_id: Option<[u8; 32]>,
     control_destination: Option<([u8; 32], u32)>,
+    direct_seq: Option<Arc<std::sync::atomic::AtomicU32>>,
     /// Opt-in media batching on direct/RELAY send paths (see
     /// `veil_media_channel_set_batching`). Off by default: a batched cell is
     /// silent noise to a legacy receiver, so the host enables it only after
@@ -1782,6 +1794,9 @@ impl MediaChannel {
             routes.stop();
         }
         self.task.abort();
+        if let Some(task) = &self.feedback_task {
+            task.abort();
+        }
         if let Some(video_task) = self.video_task.as_ref() {
             video_task.abort();
         }
@@ -1819,6 +1834,7 @@ enum MediaVideoIngress {
 #[cfg(feature = "node-embedded")]
 struct MediaIngress {
     tx_hi: mpsc::Sender<QueuedMediaPacket>,
+    feedback_tx: std::sync::RwLock<Option<mpsc::Sender<QueuedMediaPacket>>>,
     video: MediaVideoIngress,
     screen: Option<MediaVideoIngress>,
     screen_sharing: std::sync::atomic::AtomicBool,
@@ -1860,6 +1876,7 @@ impl MediaIngress {
         ingress_diagnostics::start();
         Arc::new(Self {
             tx_hi,
+            feedback_tx: std::sync::RwLock::new(None),
             video,
             screen,
             screen_sharing: std::sync::atomic::AtomicBool::new(false),
@@ -1875,6 +1892,17 @@ impl MediaIngress {
                 media_is_vp8_rtp(&payload.payload),
                 -1,
             );
+        }
+        if media_is_rtcp(&payload.payload) {
+            let sender = match self.feedback_tx.try_read() {
+                Ok(sender) => sender,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return 1,
+            };
+            if let Some(tx) = sender.as_ref() {
+                // A full feedback source never spills back into the audio queue.
+                return Self::send_packet(tx, payload, false);
+            }
         }
         if !media_is_vp8_rtp(&payload.payload) {
             return Self::send_packet(&self.tx_hi, payload, false);

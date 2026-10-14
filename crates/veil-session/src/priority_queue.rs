@@ -122,6 +122,7 @@ struct QueuedFrame {
     local_work: Option<veil_types::local_lossy_work::LocalLossyCell>,
     frame: veil_bufpool::PooledShared,
     enqueued_at: Option<Instant>,
+    expires_at: Option<Instant>,
     lossy_realtime: bool,
     carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
     reliable_credit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -129,6 +130,14 @@ struct QueuedFrame {
 }
 
 impl QueuedFrame {
+    fn expired(&self, priority: u8) -> bool {
+        self.expires_at.is_some_and(|at| Instant::now() >= at)
+            || (self.lossy_realtime
+                && self
+                    .enqueued_at
+                    .is_some_and(|at| at.elapsed() > lossy_realtime_max_age(priority)))
+    }
+
     fn trace_lossy_drop(&self, priority: u8, stage: &'static str) {
         if let Some(work) = &self.local_work {
             work.reject();
@@ -276,7 +285,7 @@ impl PriorityQueue {
     /// expense of BULK/BACKGROUND. Drops increment `drops_total` so the
     /// runner can forward them to Prometheus.
     pub fn push(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
-        self.push_entry(priority, frame, None, None, None, None, None);
+        self.push_entry(priority, frame, None, None, None, None, None, None);
     }
 
     /// Enqueue a canonical loss-tolerant realtime frame. When its dedicated
@@ -293,7 +302,7 @@ impl PriorityQueue {
     /// Loss tolerance is independent of queue priority. In particular relayed
     /// datagrams share INTERACTIVE FIFO order with other forwarded user data.
     pub fn push_lossy(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
-        self.push_lossy_with_carrier(priority, frame, None, Instant::now(), None, None);
+        self.push_lossy_with_carrier(priority, frame, None, Instant::now(), None, None, None);
     }
 
     pub(crate) fn push_envelope(
@@ -310,6 +319,7 @@ impl PriorityQueue {
                 envelope.queued_at,
                 envelope.signaling_pending,
                 envelope.local_work,
+                envelope.expires_at,
             );
         } else {
             self.push_entry(
@@ -320,6 +330,7 @@ impl PriorityQueue {
                 envelope.reliable_credit,
                 envelope.signaling_pending,
                 envelope.local_work,
+                envelope.expires_at,
             );
         }
     }
@@ -332,9 +343,12 @@ impl PriorityQueue {
         queued_at: Instant,
         signaling_pending: Option<crate::local_source_activity::PendingSignaling>,
         local_work: Option<veil_types::local_lossy_work::LocalLossyCell>,
+        expires_at: Option<Instant>,
     ) {
         // Expired ingress must not evict a fresh frame from a full class.
-        if queued_at.elapsed() > lossy_realtime_max_age(priority) {
+        if expires_at.is_some_and(|at| Instant::now() >= at)
+            || queued_at.elapsed() > lossy_realtime_max_age(priority)
+        {
             if let Some(work) = &local_work {
                 work.reject();
             }
@@ -368,6 +382,7 @@ impl PriorityQueue {
             None,
             signaling_pending,
             local_work,
+            expires_at,
         );
     }
 
@@ -380,6 +395,7 @@ impl PriorityQueue {
         reliable_credit: Option<tokio::sync::OwnedSemaphorePermit>,
         signaling_pending: Option<crate::local_source_activity::PendingSignaling>,
         local_work: Option<veil_types::local_lossy_work::LocalLossyCell>,
+        expires_at: Option<Instant>,
     ) {
         let lossy_realtime = enqueued_at.is_some();
         let p = queue_index(priority);
@@ -438,6 +454,7 @@ impl PriorityQueue {
         self.queues[p].push_back(QueuedFrame {
             frame,
             enqueued_at,
+            expires_at,
             lossy_realtime,
             carrier,
             reliable_credit,
@@ -479,16 +496,16 @@ impl PriorityQueue {
             if self.slots[p] == 0 {
                 continue;
             }
-            while self.queues[p].front().is_some_and(|queued| {
-                queued.lossy_realtime
-                    && queued
-                        .enqueued_at
-                        .is_some_and(|at| at.elapsed() > lossy_realtime_max_age(p as u8))
-            }) {
+            while self.queues[p]
+                .front()
+                .is_some_and(|queued| queued.expired(p as u8))
+            {
                 if let Some(queued) = self.queues[p].pop_front() {
                     queued.trace_lossy_drop(p as u8, "queue_expired");
+                    if queued.lossy_realtime {
+                        self.lossy_realtime_len[p] -= 1;
+                    }
                 }
-                self.lossy_realtime_len[p] -= 1;
                 self.drops_total.fetch_add(1, Ordering::Relaxed);
             }
             if let Some(queued) = self.queues[p].pop_front() {
@@ -615,7 +632,9 @@ impl PriorityQueue {
     /// Restore the exact popped datagram without renewing its lifetime or
     /// losing its return carrier. No producer runs between pop and restore.
     pub(crate) fn restore_lossy_envelope(&mut self, envelope: crate::frame_outbox::FrameEnvelope) {
-        if envelope.queued_at.elapsed() > lossy_realtime_max_age(envelope.frame.0) {
+        if envelope.expires_at.is_some_and(|at| Instant::now() >= at)
+            || envelope.queued_at.elapsed() > lossy_realtime_max_age(envelope.frame.0)
+        {
             if let Some(work) = &envelope.local_work {
                 work.reject();
             }
@@ -633,6 +652,7 @@ impl PriorityQueue {
         self.queues[queue_index(priority)].push_front(QueuedFrame {
             frame,
             enqueued_at: Some(envelope.queued_at),
+            expires_at: envelope.expires_at,
             lossy_realtime: true,
             carrier: envelope.carrier,
             reliable_credit: None,
@@ -686,10 +706,7 @@ impl PriorityQueue {
                     .position(|queued| queued.lossy_realtime && queued.carrier.is_none())
                 {
                     let head = &self.queues[p][index];
-                    if head
-                        .enqueued_at
-                        .is_some_and(|at| at.elapsed() > lossy_realtime_max_age(priority))
-                    {
+                    if head.expired(priority) {
                         if let Some(queued) = self.queues[p].remove(index) {
                             queued.trace_lossy_drop(priority, "queue_expired");
                         }
@@ -707,6 +724,7 @@ impl PriorityQueue {
                         frame: (priority, queued.frame),
                         carrier: queued.carrier,
                         queued_at: queued.enqueued_at.unwrap_or_else(Instant::now),
+                        expires_at: queued.expires_at,
                         reliable_credit: queued.reliable_credit,
                         signaling_pending: queued.signaling_pending,
                         local_work: queued.local_work,
@@ -757,16 +775,16 @@ impl PriorityQueue {
                 if self.slots[p] == 0 {
                     continue;
                 }
-                while self.queues[p].front().is_some_and(|queued| {
-                    queued.lossy_realtime
-                        && queued
-                            .enqueued_at
-                            .is_some_and(|at| at.elapsed() > lossy_realtime_max_age(p as u8))
-                }) {
+                while self.queues[p]
+                    .front()
+                    .is_some_and(|queued| queued.expired(p as u8))
+                {
                     if let Some(queued) = self.queues[p].pop_front() {
                         queued.trace_lossy_drop(p as u8, "queue_expired");
+                        if queued.lossy_realtime {
+                            self.lossy_realtime_len[p] -= 1;
+                        }
                     }
-                    self.lossy_realtime_len[p] -= 1;
                     self.drops_total.fetch_add(1, Ordering::Relaxed);
                 }
                 if let Some(head) = self.queues[p].front() {
@@ -790,6 +808,7 @@ impl PriorityQueue {
                         frame: (p as u8, queued.frame),
                         carrier: queued.carrier,
                         queued_at: queued.enqueued_at.unwrap_or_else(Instant::now),
+                        expires_at: queued.expires_at,
                         reliable_credit: queued.reliable_credit,
                         signaling_pending: queued.signaling_pending,
                         local_work: queued.local_work,
@@ -867,6 +886,7 @@ mod tests {
             arc(b"independent"),
             Some(Arc::downgrade(&carrier)),
             Instant::now() - Duration::from_millis(60),
+            None,
             None,
             None,
         );
@@ -1603,5 +1623,51 @@ mod tests {
         );
         let _ = pq.pop().unwrap();
         assert_eq!(pq.peek_priority(), None);
+    }
+}
+
+#[cfg(test)]
+mod explicit_expiration_tests {
+    use super::*;
+    use crate::frame_outbox::FrameEnvelope;
+
+    #[test]
+    fn short_control_deadline_survives_pop_restore_and_does_not_age_lifecycle_control() {
+        let now = Instant::now();
+        let make = |byte| {
+            FrameEnvelope::from((
+                LOCAL_SIGNALING_LANE,
+                veil_bufpool::pooled_shared_from_vec(vec![byte]),
+            ))
+        };
+        let mut expired = make(1);
+        expired.expires_at = Some(now - Duration::from_millis(1));
+        let mut fresh = make(2);
+        fresh.expires_at = Some(now + Duration::from_millis(200));
+        let expected = fresh.expires_at;
+        let mut pq = PriorityQueue::with_default_weights();
+        pq.push_envelope(expired, true);
+        pq.push_envelope(fresh, true);
+        let popped = pq
+            .pop_admitted_envelope(|_, _, _, _| HeadAdmission::Allow)
+            .unwrap();
+        assert_eq!(&*popped.frame.1, &[2]);
+        assert_eq!(popped.expires_at, expected);
+        pq.restore_lossy_envelope(popped);
+        let mut popped = pq
+            .pop_admitted_envelope(|_, _, _, _| HeadAdmission::Allow)
+            .unwrap();
+        assert_eq!(popped.expires_at, expected);
+        popped.expires_at = Some(now - Duration::from_millis(1));
+        pq.restore_lossy_envelope(popped);
+        let mut lifecycle = make(3);
+        lifecycle.queued_at = now - Duration::from_secs(1);
+        pq.push_envelope(lifecycle, true);
+        let popped = pq
+            .pop_admitted_envelope(|_, _, _, _| HeadAdmission::Allow)
+            .unwrap();
+        assert_eq!(&*popped.frame.1, &[3]);
+        assert!(popped.expires_at.is_none());
+        assert_eq!(pq.drops_total(), 2);
     }
 }

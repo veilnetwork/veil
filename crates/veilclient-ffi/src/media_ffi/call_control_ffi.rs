@@ -102,7 +102,10 @@ pub unsafe extern "C" fn veil_media_channel_set_control_sender(
         return -1;
     };
     let relay = channel.relay_stats.is_some();
-    let seq = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let seq = channel
+        .direct_seq
+        .clone()
+        .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicU32::new(0)));
     let task =
         app_ref
             .bundle
@@ -317,10 +320,12 @@ mod tests {
                 task: tokio::spawn(std::future::pending()),
                 video_task: None,
                 screen_task: None,
+                feedback_task: None,
                 video_sender: None,
                 screen_sender: None,
                 sender_app_id: None,
                 control_destination: None,
+                direct_seq: None,
                 batching: None,
                 cipher: Arc::clone(&cipher),
                 relay_stats: None,

@@ -648,12 +648,11 @@ async fn measure_channel(
             )
             .unwrap();
         if channel_admits(&sender, &packets, lane) {
-            let expiry = super::super::local_primary_datagram_expiry(
-                &crate::frame_outbox::FrameEnvelope::from((
+            let expiry =
+                super::super::local_datagram_expiry(&crate::frame_outbox::FrameEnvelope::from((
                     lane,
                     veil_bufpool::pooled_shared_from_vec(frame.clone()),
-                )),
-            );
+                )));
             for packet in packets {
                 if let Some(expiry) = expiry {
                     sender.handle.send_before(&packet, expiry).unwrap();
@@ -685,12 +684,10 @@ async fn measure_channel(
                 )
                 .unwrap();
             if channel_admits(&sender, &packets, lane) {
-                let expiry = super::super::local_primary_datagram_expiry(
-                    &crate::frame_outbox::FrameEnvelope::from((
-                        lane,
-                        veil_bufpool::pooled_shared_from_vec(frame),
-                    )),
-                );
+                let expiry =
+                    super::super::local_datagram_expiry(&crate::frame_outbox::FrameEnvelope::from(
+                        (lane, veil_bufpool::pooled_shared_from_vec(frame)),
+                    ));
                 for packet in packets {
                     if let Some(expiry) = expiry {
                         sender.handle.send_before(&packet, expiry).unwrap();

@@ -619,6 +619,7 @@ pub(crate) async fn rate_limited(
 /// Every field was ALREADY an `Arc` where the server keeps it, so this costs
 /// a refcount bump per send, not a copy of anything.
 pub(crate) struct IpcSendContext {
+    pub(crate) source_received_at: std::time::Instant,
     /// Sender scheduling only; never copied into a network header or payload.
     pub local_priority: u8,
     pub(crate) local_work: Option<veil_types::local_lossy_work::LocalLossyCell>,
@@ -861,23 +862,38 @@ pub(crate) async fn handle_ipc_send(
         .unwrap_or(0);
     let relay_wire_realtime = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME != 0;
     let relay_control_compat = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT != 0;
+    let short_control = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_LOCAL_SHORT_CONTROL != 0;
+    let short_deadline = ctx.source_received_at + veil_proto::ipc::LOCAL_SHORT_DATAGRAM_MAX_AGE;
     let relay_realtime = relay_wire_realtime || relay_control_compat;
     // One bounded ingress wait for the entire control request, not another
     // five seconds for every recipient/hop if ordinary source ingress stalls.
     let control_source_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     // Only a locally parsed application request selects this source channel.
     // RelayForward's wire class remains neutral, and a peer cannot request it.
-    let local_priority =
-        if relay_control_compat && ctx.local_priority == veil_proto::priority::INTERACTIVE {
-            veil_proto::ipc::LOCAL_SIGNALING_LANE
-        } else {
-            ctx.local_priority
-        };
+    let local_priority = if (relay_control_compat || short_control)
+        && ctx.local_priority == veil_proto::priority::INTERACTIVE
+    {
+        veil_proto::ipc::LOCAL_SIGNALING_LANE
+    } else {
+        ctx.local_priority
+    };
     let relay_media_sealed = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED != 0;
     let send = match AppIpcSendPayload::decode(body) {
         Ok(s) => s,
         Err(_) => return Ok(()), // drop malformed
     };
+
+    if short_control
+        && (!relay_media_sealed
+            || !relay_wire_realtime
+            || send.require_ack
+            || ctx.local_priority != veil_proto::priority::INTERACTIVE)
+    {
+        return Ok(());
+    }
+    if short_control && std::time::Instant::now() >= short_deadline {
+        return app_send_ok(sink, false).await;
+    }
 
     // PRESEALED is deliberately a narrow call-media optimization, not a
     // general "skip E2E" switch. Requiring the realtime relay flag, no ACK,
@@ -2009,6 +2025,12 @@ pub(crate) async fn handle_ipc_send(
                             fwd_frame.clone(),
                             cell.clone(),
                         ),
+                        None if short_control => reg.send_to_before(
+                            &next_hop,
+                            source_lane,
+                            fwd_frame.clone(),
+                            short_deadline,
+                        ),
                         None => reg.send_to(&next_hop, source_lane, fwd_frame.clone()),
                     });
                     if relay_media_sealed {
@@ -2193,6 +2215,7 @@ pub(crate) async fn handle_rt_send(
     metrics: Option<&dyn IpcMetrics>,
     rate_limiter: &mut Option<TokenBucket>,
     local_priority: u8,
+    short_control: bool,
 ) -> std::io::Result<()> {
     // Rate check — shared bucket with APP_SEND to prevent RT flooding.
     if rate_limited(wh, rate_limiter).await? {
@@ -2247,7 +2270,19 @@ pub(crate) async fn handle_rt_send(
     } else {
         local_priority.min(3)
     };
-    let sent = reg.send_to_peer_or_identity(&send.dst_node_id, source_lane, frame);
+    let sent = if short_control {
+        if local_priority != veil_proto::priority::INTERACTIVE {
+            return Ok(());
+        }
+        reg.send_to_peer_or_identity_before(
+            &send.dst_node_id,
+            source_lane,
+            frame,
+            std::time::Instant::now() + veil_proto::ipc::LOCAL_SHORT_DATAGRAM_MAX_AGE,
+        )
+    } else {
+        reg.send_to_peer_or_identity(&send.dst_node_id, source_lane, frame)
+    };
     crate::route_trace::sealed_rt_local_sample(
         if sent {
             "direct_queued"
@@ -2564,6 +2599,107 @@ mod ratchet_send_tests {
         fn active_node_ids(&self) -> Vec<[u8; 32]> {
             self.1.clone()
         }
+    }
+
+    struct ExpiringCapture(LaneCapture, Mutex<Vec<std::time::Instant>>);
+    impl FrameBroadcaster for ExpiringCapture {
+        fn send_to(&self, _: &[u8; 32], _: u8, _: Vec<u8>) -> bool {
+            panic!("short control must preserve its expiry")
+        }
+        fn send_to_before(
+            &self,
+            peer: &[u8; 32],
+            lane: u8,
+            bytes: Vec<u8>,
+            expires_at: std::time::Instant,
+        ) -> bool {
+            if std::time::Instant::now() >= expires_at {
+                return false;
+            }
+            lock!(self.1).push(expires_at);
+            self.0.send_to(peer, lane, bytes)
+        }
+        fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+        fn active_node_ids(&self) -> Vec<[u8; 32]> {
+            self.0.active_node_ids()
+        }
+    }
+
+    #[tokio::test]
+    async fn short_control_deadlines_are_local_on_direct_and_relay_and_expire_before_routing() {
+        let capture = Arc::new(ExpiringCapture(
+            LaneCapture(Mutex::new(Vec::new()), vec![PEER, RELAY]),
+            Mutex::new(Vec::new()),
+        ));
+        let mut wh = sink().await;
+        let direct = AppIpcRtSendPayload {
+            dst_node_id: PEER,
+            src_app_id: [1; 32],
+            dst_app_id: [2; 32],
+            endpoint_id: 13,
+            seq: 0,
+            timestamp_us: 0,
+            marker: 0,
+            payload_type: 0,
+            data: vec![9; 32],
+        }
+        .encode();
+        handle_rt_send(
+            &mut wh,
+            &direct,
+            Some(&*capture),
+            None,
+            &mut None,
+            veil_proto::priority::INTERACTIVE,
+            true,
+        )
+        .await
+        .unwrap();
+        let (lane, frame) = lock!(capture.0.0).pop().unwrap();
+        assert_eq!(lane, veil_proto::ipc::LOCAL_SIGNALING_LANE);
+        assert_eq!(codec::decode_header(&frame).unwrap().flags, 0);
+        let direct_deadline = lock!(capture.1).pop().unwrap();
+        assert!(
+            direct_deadline.duration_since(std::time::Instant::now())
+                <= veil_proto::ipc::LOCAL_SHORT_DATAGRAM_MAX_AGE
+        );
+
+        let fx = fixture(vec![RELAY]);
+        let mut ctx = fx.ctx(false);
+        ctx.session_tx_registry = Some(capture.clone());
+        let sealed = [
+            veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC.as_slice(),
+            &[7; 48],
+        ]
+        .concat();
+        let mut body = payload(false, &sealed);
+        let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+            | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED
+            | veil_proto::ipc::IPC_SEND_FLAG_LOCAL_SHORT_CONTROL;
+        body[100..104].copy_from_slice(&flags.to_be_bytes());
+        handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+            .await
+            .unwrap();
+        let (lane, frame) = lock!(capture.0.0).pop().unwrap();
+        assert_eq!(lane, veil_proto::ipc::LOCAL_SIGNALING_LANE);
+        assert_eq!(
+            codec::decode_header(&frame).unwrap().priority(),
+            veil_proto::priority::INTERACTIVE
+        );
+        let forward =
+            veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                .unwrap();
+        assert_eq!(forward.envelope.payload, sealed);
+        assert_eq!(
+            lock!(capture.1).pop().unwrap(),
+            ctx.source_received_at + veil_proto::ipc::LOCAL_SHORT_DATAGRAM_MAX_AGE
+        );
+        ctx.source_received_at -= std::time::Duration::from_millis(201);
+        handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+            .await
+            .unwrap();
+        assert!(lock!(capture.0.0).is_empty());
+        assert!(lock!(capture.1).is_empty());
     }
 
     #[tokio::test]
@@ -2944,7 +3080,7 @@ mod ratchet_send_tests {
             veil_proto::priority::BULK,
             veil_proto::priority::BACKGROUND,
         ] {
-            handle_rt_send(&mut wh, &send, Some(&capture), None, &mut None, lane)
+            handle_rt_send(&mut wh, &send, Some(&capture), None, &mut None, lane, false)
                 .await
                 .unwrap();
             let (priority, bytes) = lock!(capture.0).pop().unwrap();
@@ -4181,6 +4317,7 @@ mod ratchet_send_tests {
     impl Fixture {
         fn ctx(&self, with_ratchet: bool) -> IpcSendContext {
             IpcSendContext {
+                source_received_at: std::time::Instant::now(),
                 local_work: None,
                 local_priority: veil_proto::priority::INTERACTIVE,
                 app_registry: Arc::clone(&self.registry),

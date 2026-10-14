@@ -516,11 +516,15 @@ fn local_datagram_fits(priority: u8, wire_len: usize, available: usize) -> bool 
 /// The primary source deadline is based on original local ingress, including
 /// on the shared fallback. Forwarded cells have INTERACTIVE local class and
 /// do not opt in; no deadline or role is transmitted.
-fn local_primary_datagram_expiry(
+fn local_datagram_expiry(
     envelope: &crate::frame_outbox::FrameEnvelope,
 ) -> Option<std::time::Instant> {
-    (envelope.frame.0 == veil_proto::priority::REALTIME)
-        .then_some(envelope.queued_at + crate::priority_queue::LOCAL_PRIMARY_MAX_AGE)
+    let primary = (envelope.frame.0 == veil_proto::priority::REALTIME)
+        .then_some(envelope.queued_at + crate::priority_queue::LOCAL_PRIMARY_MAX_AGE);
+    match (primary, envelope.expires_at) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// A prepared primary sibling carries only this endpoint source, so it need
@@ -757,7 +761,8 @@ fn enqueue_outbox_envelope(
     envelope: crate::frame_outbox::FrameEnvelope,
     source_activity: Option<&crate::local_source_activity::LocalSourceActivity>,
 ) -> bool {
-    let lossy = envelope.local_work.is_some() || decode_realtime_lane_frame(&envelope.frame.1).is_some();
+    let lossy =
+        envelope.local_work.is_some() || decode_realtime_lane_frame(&envelope.frame.1).is_some();
     // CircuitDatagram is downgraded before enqueueing for some legacy hops.
     // Its source-only local slot still identifies the low-latency producer;
     // forwarded CircuitData always arrives in the neutral INTERACTIVE slot.
@@ -2693,6 +2698,7 @@ impl SessionRunner {
                 ),
                 carrier: None,
                 queued_at: std::time::Instant::now(),
+                expires_at: None,
                 reliable_credit: Some(req.source_credit),
                 signaling_pending: None,
                 local_work: None,
@@ -4787,7 +4793,7 @@ impl SessionRunner {
                             break;
                         };
                         let (outgoing_priority, ref outgoing) = envelope.frame;
-                        if local_primary_datagram_expiry(&envelope)
+                        if local_datagram_expiry(&envelope)
                             .is_some_and(|deadline| deadline <= std::time::Instant::now())
                         {
                             datagram_drained += 1;
@@ -4992,7 +4998,7 @@ impl SessionRunner {
                         let mut send_error = None;
                         // A complete frame's fragments share one deadline.
                         // Expiration never changes nonce/counter allocation.
-                        let expires_at = local_primary_datagram_expiry(&envelope);
+                        let expires_at = local_datagram_expiry(&envelope);
                         for datagram in &datagrams {
                             if lane.handle.send_buffer_space()
                                 < lane.handle.queue_charge(datagram.len())
@@ -6984,7 +6990,7 @@ mod realtime_lane_frame_tests {
             veil_bufpool::pooled_shared_from_vec(vec![1]),
         ));
         envelope.queued_at = std::time::Instant::now() - std::time::Duration::from_millis(150);
-        let deadline = super::local_primary_datagram_expiry(&envelope).unwrap();
+        let deadline = super::local_datagram_expiry(&envelope).unwrap();
         assert_eq!(
             deadline,
             envelope.queued_at + crate::priority_queue::LOCAL_PRIMARY_MAX_AGE
@@ -7001,8 +7007,27 @@ mod realtime_lane_frame_tests {
             veil_proto::priority::BACKGROUND,
         ] {
             envelope.frame.0 = priority;
-            assert!(super::local_primary_datagram_expiry(&envelope).is_none());
+            assert!(super::local_datagram_expiry(&envelope).is_none());
         }
+    }
+
+    #[test]
+    fn short_control_quic_expiry_keeps_admission_deadline_and_primary_cannot_extend_it() {
+        use crate::frame_outbox::FrameEnvelope;
+        let mut envelope = FrameEnvelope::from((
+            crate::LOCAL_SIGNALING_LANE,
+            veil_bufpool::pooled_shared_from_vec(vec![1]),
+        ));
+        let at = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        envelope.expires_at = Some(at);
+        assert_eq!(super::local_datagram_expiry(&envelope), Some(at));
+        envelope.frame.0 = veil_proto::priority::REALTIME;
+        assert_eq!(super::local_datagram_expiry(&envelope), Some(at));
+        envelope.expires_at = Some(at + std::time::Duration::from_secs(1));
+        assert_eq!(
+            super::local_datagram_expiry(&envelope),
+            Some(envelope.queued_at + crate::priority_queue::LOCAL_PRIMARY_MAX_AGE)
+        );
     }
 
     #[test]

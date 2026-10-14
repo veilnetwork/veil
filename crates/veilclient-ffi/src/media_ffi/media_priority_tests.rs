@@ -873,10 +873,12 @@ async fn anonymous_repair_fans_out_with_independent_backpressure() {
                 task: tokio::spawn(std::future::pending()),
                 video_task: Some(tokio::spawn(std::future::pending())),
                 screen_task: None,
+                feedback_task: None,
                 video_sender: None,
                 screen_sender: None,
                 sender_app_id: None,
                 control_destination: None,
+                direct_seq: None,
                 batching: None,
                 cipher: Arc::new(cipher_for_test(&[0x8a; 32], &[1; 32], &[2; 32]).unwrap()),
                 relay_stats: None,
@@ -921,6 +923,8 @@ async fn closing_channel_cancels_both_blocked_pumps() {
     let task = tokio::spawn(std::future::pending::<()>());
     let video_task = tokio::spawn(std::future::pending::<()>());
     let screen_task = tokio::spawn(std::future::pending::<()>());
+    let feedback_task = tokio::spawn(std::future::pending::<()>());
+    let abort_feedback = feedback_task.abort_handle();
     let abort_screen = screen_task.abort_handle();
     let abort_audio = task.abort_handle();
     let abort_video = video_task.abort_handle();
@@ -940,10 +944,12 @@ async fn closing_channel_cancels_both_blocked_pumps() {
                 task,
                 video_task: Some(video_task),
                 screen_task: Some(screen_task),
+                feedback_task: Some(feedback_task),
                 video_sender: None,
                 screen_sender: None,
                 sender_app_id: None,
                 control_destination: None,
+                direct_seq: None,
                 batching: None,
                 cipher: Arc::new(cipher_for_test(&[0xf3; 32], &[1; 32], &[2; 32]).unwrap()),
                 relay_stats: None,
@@ -955,12 +961,13 @@ async fn closing_channel_cancels_both_blocked_pumps() {
         while !abort_audio.is_finished()
             || !abort_video.is_finished()
             || !abort_screen.is_finished()
+            || !abort_feedback.is_finished()
         {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("close must cancel both pending tasks");
+    .expect("close must cancel all media and feedback tasks");
     let packet = [0x80, 111, 1, 2];
     // Other parallel fixtures deliberately hold the registry. Busy ingress
     // returns 1 before lookup; once available, this closed handle must be gone.
@@ -999,10 +1006,12 @@ async fn private_address_control_requires_call_aead_and_never_reaches_the_engine
             task: tokio::spawn(std::future::pending()),
             video_task: None,
             screen_task: None,
+            feedback_task: None,
             video_sender: None,
             screen_sender: None,
             sender_app_id: None,
             control_destination: None,
+            direct_seq: None,
             batching: None,
             cipher: Arc::clone(&cipher),
             relay_stats: None,
@@ -1272,10 +1281,12 @@ fn register_test_ingress(
             task: tokio::spawn(std::future::pending()),
             video_task: Some(tokio::spawn(std::future::pending())),
             screen_task: None,
+            feedback_task: None,
             video_sender: None,
             screen_sender: None,
             sender_app_id: None,
             control_destination: None,
+            direct_seq: None,
             batching: None,
             cipher,
             relay_stats: None,
@@ -1789,4 +1800,75 @@ async fn complete_relay_frames_reach_the_batch_sink_as_independent_work_items() 
         }
     }
     assert!(groups.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn audio_feedback_overflow_and_writer_stall_never_enter_audio_or_video() {
+    let (audio_tx, mut audio_rx) = mpsc::channel(1);
+    let (video_tx, mut video_rx) = mpsc::channel(1);
+    let (feedback_tx, mut feedback_rx) = mpsc::channel(1);
+    let ingress = MediaIngress::new(audio_tx, MediaVideoIngress::Packets(video_tx));
+    *ingress.feedback_tx.write().unwrap() = Some(feedback_tx);
+    let feedback = vec![0x80, 201, 0, 1, 0, 0, 0, 7];
+    assert_eq!(ingress.enqueue(feedback.clone().into()), 0);
+    assert_eq!(ingress.enqueue(feedback.clone().into()), 1);
+    assert!(audio_rx.try_recv().is_err());
+    assert!(video_rx.try_recv().is_err());
+    let audio = vec![0x80, 111, 0, 1];
+    assert_eq!(ingress.enqueue(audio.clone().into()), 0);
+    assert_eq!(audio_rx.recv().await.unwrap().payload, audio);
+    assert_eq!(feedback_rx.recv().await.unwrap().payload, feedback);
+    let guard = ingress.feedback_tx.write().unwrap();
+    assert_eq!(ingress.enqueue(vec![0x80, 201, 0, 1, 0, 0, 0, 7].into()), 1);
+    assert_eq!(ingress.enqueue(vec![0x80, 111, 0, 2].into()), 0);
+    drop(guard);
+    ingress.closed.store(true, Ordering::Release);
+    assert_eq!(
+        ingress.enqueue(vec![0x80, 201, 0, 1, 0, 0, 0, 7].into()),
+        -1
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn feedback_pump_preserves_rtcp_and_original_deadline_without_audio_wait() {
+    let peer = [0xe7; 32];
+    let cipher = Arc::new(cipher_for_test(&peer, &[0x41; 32], &[0x42; 32]).unwrap());
+    let remote = cipher_for_test(&peer, &[0x42; 32], &[0x41; 32]).unwrap();
+    let (tx, rx) = mpsc::channel(2);
+    let (sent_tx, mut sent_rx) = mpsc::channel(2);
+    let deadline = tokio::time::Instant::now() + MEDIA_LOCAL_QUEUE_AGE;
+    let packet = vec![0x80, 201, 0, 1, 0, 0, 0, 7];
+    tx.send(QueuedMediaPacket {
+        payload: packet.clone(),
+        deadline,
+    })
+    .await
+    .unwrap();
+    let task = tokio::spawn(drain_media_packets_on_plane(
+        rx,
+        Arc::new(AtomicU8::new(MEDIA_BATCHING_OFF)),
+        cipher,
+        false,
+        Some(LocalMediaPlane::Primary),
+        move |cell| {
+            let sent_tx = sent_tx.clone();
+            async move {
+                sent_tx.send(cell).await.unwrap();
+                true
+            }
+        },
+    ));
+    let sealed = sent_rx.recv().await.unwrap().sealed;
+    assert_eq!(sealed.local_deadline(), Some(deadline));
+    assert_eq!(remote.open(sealed.as_bytes()).unwrap(), packet);
+    tokio::time::advance(Duration::from_millis(201)).await;
+    tx.send(QueuedMediaPacket {
+        payload: vec![0x80, 201, 0, 1, 0, 0, 0, 8],
+        deadline,
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    task.await.unwrap();
+    assert!(sent_rx.try_recv().is_err());
 }
