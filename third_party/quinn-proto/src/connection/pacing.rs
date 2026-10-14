@@ -102,14 +102,30 @@ impl Pacer {
             return None;
         }
 
-        let unscaled_delay = smoothed_rtt
-            .checked_mul((bytes_to_send.max(self.capacity) - self.tokens) as _)
-            .unwrap_or(Duration::MAX)
-            / window;
-
-        // divisions come before multiplications to prevent overflow
-        // this is the time at which the pacing window becomes empty
-        Some(self.prev + (unscaled_delay / 5) * 4)
+        // The ten-MTU capacity is useful for retaining earned burst credit,
+        // but it must not become a compulsory refill target. With a 4-KiB
+        // congestion window and 120-ms RTT that target sleeps for 283 ms,
+        // even though one MTU earns enough credit after 29 ms. Wake for one
+        // packet or the normal two-ms batching interval, whichever is larger.
+        // Keep the same 5/4 refill rate and debit actual transmitted bytes;
+        // this neither bypasses congestion control nor reads an application role.
+        let interval_credit = ((u128::from(window) * BURST_INTERVAL_NANOS)
+            / smoothed_rtt.as_nanos())
+        .min(u128::from(self.capacity)) as u64;
+        let refill_target = bytes_to_send.max(interval_credit);
+        // Round upward to the first instant with enough byte credit. Rounding
+        // down can repeatedly wake one byte short and discard fractional
+        // refill credit when `prev` advances, starving a small-window source.
+        let delay_nanos = smoothed_rtt
+            .as_nanos()
+            .saturating_mul(u128::from(refill_target - self.tokens))
+            .saturating_mul(4)
+            .div_ceil(u128::from(window) * 5);
+        let delay = Duration::new(
+            (delay_nanos / 1_000_000_000).min(u128::from(u64::MAX)) as u64,
+            (delay_nanos % 1_000_000_000) as u32,
+        );
+        Some(self.prev + delay)
     }
 }
 
@@ -160,21 +176,15 @@ mod tests {
         let new_instant = old_instant + Duration::from_micros(15);
         let rtt = Duration::from_micros(400);
 
-        assert!(
-            Pacer::new(rtt, 30000, 1500, new_instant)
-                .delay(Duration::from_micros(0), 0, 1500, 1, old_instant)
-                .is_none()
-        );
-        assert!(
-            Pacer::new(rtt, 30000, 1500, new_instant)
-                .delay(Duration::from_micros(0), 1600, 1500, 1, old_instant)
-                .is_none()
-        );
-        assert!(
-            Pacer::new(rtt, 30000, 1500, new_instant)
-                .delay(Duration::from_micros(0), 1500, 1500, 3000, old_instant)
-                .is_none()
-        );
+        assert!(Pacer::new(rtt, 30000, 1500, new_instant)
+            .delay(Duration::from_micros(0), 0, 1500, 1, old_instant)
+            .is_none());
+        assert!(Pacer::new(rtt, 30000, 1500, new_instant)
+            .delay(Duration::from_micros(0), 1600, 1500, 1, old_instant)
+            .is_none());
+        assert!(Pacer::new(rtt, 30000, 1500, new_instant)
+            .delay(Duration::from_micros(0), 1500, 1500, 3000, old_instant)
+            .is_none());
     }
 
     #[test]
@@ -237,6 +247,60 @@ mod tests {
 
         pacer.delay(rtt, mtu as u64, 20_000, window, now);
         assert_eq!(pacer.capacity, 20_000_u64 * MIN_BURST_SIZE);
+    }
+
+    #[test]
+    fn a_small_window_does_not_wait_for_ten_mtus_of_credit() {
+        let now = Instant::now();
+        let rtt = Duration::from_millis(120);
+        let window = 4065;
+        let mtu = 1200;
+        let mut pacer = Pacer::new(rtt, window, mtu, now);
+        // Exhaust previously earned credit. The connection's congestion
+        // controller still separately limits outstanding bytes.
+        pacer.on_transmit(pacer.capacity as u16);
+        let wake = pacer.delay(rtt, mtu as u64, mtu, window, now).unwrap();
+        assert!(
+            wake - now <= Duration::from_millis(30),
+            "one packet has enough credit in 29 ms, but wake was {:?}",
+            wake - now
+        );
+        let sent_at = now + Duration::from_millis(30);
+        assert!(pacer.delay(rtt, mtu as u64, mtu, window, sent_at).is_none());
+        pacer.on_transmit(mtu);
+        let next = pacer.delay(rtt, mtu as u64, mtu, window, sent_at).unwrap();
+        assert!(next - sent_at <= Duration::from_millis(30));
+        assert!(
+            next > sent_at,
+            "early wake must not grant excess byte credit"
+        );
+    }
+
+    #[test]
+    fn earlier_small_window_wakes_preserve_the_byte_rate() {
+        let start = Instant::now();
+        let rtt = Duration::from_millis(120);
+        let window = 4065;
+        let mtu = 1200;
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+        pacer.on_transmit(pacer.capacity as u16);
+        let mut now = start;
+        let mut sent = 0u64;
+        while now - start < Duration::from_secs(1) {
+            if let Some(wake) = pacer.delay(rtt, mtu as u64, mtu, window, now) {
+                assert!(wake > now);
+                now = wake;
+            } else {
+                pacer.on_transmit(mtu);
+                sent += mtu as u64;
+            }
+        }
+        let budget = window as f64 * 1.25 / rtt.as_secs_f64();
+        assert!(
+            sent as f64 <= budget,
+            "early wake must not grant byte credit"
+        );
+        assert!(sent as f64 > budget - 2.0 * mtu as f64);
     }
 
     #[test]
