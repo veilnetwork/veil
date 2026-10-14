@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstdarg>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 
@@ -21,6 +22,23 @@ inline const char* path() {
 }
 
 inline bool enabled() { return path() != nullptr; }
+
+inline constexpr size_t kDefaultRtpTraceCapacity = 4096;
+inline constexpr size_t kMaxRtpTraceCapacity = 32768;
+
+inline size_t rtp_trace_capacity() {
+  if (!enabled()) return kDefaultRtpTraceCapacity;
+  const char* value = std::getenv("VEIL_MEDIA_RTP_TRACE_LIMIT");
+  if (value == nullptr || *value == '\0') return kDefaultRtpTraceCapacity;
+  size_t count = 0;
+  for (; *value != '\0'; ++value) {
+    if (*value < '0' || *value > '9' || count > kMaxRtpTraceCapacity / 10)
+      return kDefaultRtpTraceCapacity;
+    count = count * 10 + static_cast<size_t>(*value - '0');
+    if (count > kMaxRtpTraceCapacity) return kDefaultRtpTraceCapacity;
+  }
+  return count > 0 ? count : kDefaultRtpTraceCapacity;
+}
 
 inline void vlog(const char* fmt, va_list ap) {
   const char* output_path = path();

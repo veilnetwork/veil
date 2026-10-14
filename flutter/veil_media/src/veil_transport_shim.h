@@ -292,6 +292,7 @@ class VeilTransportShim : public webrtc::Transport {
     size_t payload_bytes;
   };
   const bool audio_ingress_diagnostics_;
+  const size_t audio_trace_capacity_;
   std::vector<AudioIngressSample> audio_ingress_samples_;
   // Admission is observed on the sender's network queue. A separate lock
   // fences it against Stop; it never holds an SDK call or receive delivery.

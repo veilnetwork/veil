@@ -205,7 +205,7 @@ void configure_call_audio_send(webrtc::AudioSendStream::Config& config,
     config.send_codec_spec->format.parameters["maxptime"] = "60";
     config.encoder_factory =
         webrtc::make_ref_counted<veil_media::BoundedAudioEncoderFactory>(
-            std::move(packet_duration));
+            std::move(packet_duration), config.rtp.ssrc);
     webrtc::audio_network_adaptor::config::ControllerManager manager;
     auto* frames = manager.add_controllers()->mutable_frame_length_controller_v2();
     frames->set_min_payload_bitrate_bps(16'000);
@@ -4211,6 +4211,7 @@ Java_network_veil_xveil_NativeCallVideoRenderer_nativeRemoteVideoStats(
 #endif
 
 #if defined(VEIL_MEDIA_TEST_HOOKS) && defined(VEIL_MEDIA_HAVE_WEBRTC)
+#include "audio/audio_send_stream.h"
 #include "call/rtp_transport_controller_send_interface.h"
 #include "rtc_base/network_route.h"
 #include "../test/call_plane_hooks.inc"

@@ -1,4 +1,24 @@
 // Compiled only into the stand dylib, never the production engine ABI.
+// The actual sender offset supplies an exact encoder/RTP join, not a guessed
+// alignment between two regular packet sequences. This hook never sends data.
+#pragma GCC visibility push(default)
+extern "C" int veil_media_test_audio_timing_anchor(VeilMediaEngine* e, int source) {
+  if (!e || !e->ws || source < 0 || source > 1 || !veil_media::diag::enabled())
+    return VEIL_MEDIA_ERR_ARG;
+  bool found = false;
+  const bool ran = run_on(e->ws->worker_tq.get(), [&] {
+    if (!e->ws->send_stream) return;
+    const auto* stream = static_cast<const webrtc::internal::AudioSendStream*>(
+        e->ws->send_stream);
+    const auto state = stream->GetRtpState();
+    veil_media::diag::log("audio.rtp.anchor source=%d ssrc=%u offset=%u",
+                          source, ssrc_of(e->local), state.start_timestamp);
+    found = true;
+  });
+  return ran && found ? VEIL_MEDIA_OK : VEIL_MEDIA_ERR_STATE;
+}
+#pragma GCC visibility pop
+
 namespace {
 using PlaneInjector = int (*)(void*, uint64_t, uint32_t, uint32_t);
 uint64_t sent_audio_packets(WebrtcState* ws) {

@@ -75,7 +75,8 @@ VeilTransportShim::VeilTransportShim(uint64_t veil_chan,
                                      webrtc::TaskQueueBase* video_network_queue)
     : veil_chan_(veil_chan), call_(call), network_queue_(network_queue),
       video_call_(video_call), video_network_queue_(video_network_queue),
-      audio_ingress_diagnostics_(diag::enabled()) {}
+      audio_ingress_diagnostics_(diag::enabled()),
+      audio_trace_capacity_(diag::rtp_trace_capacity()) {}
 
 VeilTransportShim::~VeilTransportShim() {
   Stop();
@@ -156,9 +157,9 @@ void VeilTransportShim::Start() {
   bool expected = false;
   if (!started_.compare_exchange_strong(expected, true)) return;
   if (audio_ingress_diagnostics_) {
-    audio_ingress_samples_.reserve(4096);
+    audio_ingress_samples_.reserve(audio_trace_capacity_);
     std::lock_guard<std::mutex> lock(audio_send_diagnostics_mu_);
-    audio_send_samples_.reserve(4096);
+    audio_send_samples_.reserve(audio_trace_capacity_);
   }
   const int rc = veil_media_set_recv_callback(
       veil_chan_, &VeilTransportShim::OnVeilDatagram, this);
@@ -184,8 +185,9 @@ void VeilTransportShim::Stop() {
   if (!audio_ingress_samples_.empty()) {
     if (const char* path = diag::path()) {
       if (FILE* file = std::fopen(path, "a")) {
-        std::fprintf(file, "audio.rtp.ingress.begin count=%zu\n",
-                     audio_ingress_samples_.size());
+        std::fprintf(file, "audio.rtp.ingress.begin count=%zu limit=%zu ssrc=%u\n",
+                     audio_ingress_samples_.size(), audio_trace_capacity_,
+                     remote_audio_ssrc_.load(std::memory_order_relaxed));
         for (const auto& sample : audio_ingress_samples_) {
           std::fprintf(file,
               "audio.rtp.ingress seq=%u timestamp=%u arrived_us=%lld drained_us=%lld payload_bytes=%zu\n",
@@ -203,8 +205,9 @@ void VeilTransportShim::Stop() {
     if (!audio_send_samples_.empty()) {
       if (const char* path = diag::path()) {
         if (FILE* file = std::fopen(path, "a")) {
-          std::fprintf(file, "audio.rtp.send.begin count=%zu\n",
-                       audio_send_samples_.size());
+          std::fprintf(file, "audio.rtp.send.begin count=%zu limit=%zu ssrc=%u\n",
+                       audio_send_samples_.size(), audio_trace_capacity_,
+                       local_audio_ssrc_.load(std::memory_order_relaxed));
           for (const auto& sample : audio_send_samples_) {
             std::fprintf(file,
                 "audio.rtp.send seq=%u timestamp=%u attempted_us=%lld admitted_us=%lld packet_bytes=%zu accepted=%d\n",
@@ -266,7 +269,7 @@ bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
     audio_send_stats_.mark_result(started_ns, admitted_us * 1000, rc == 0);
     if (audio_ingress_diagnostics_ && packet.size() >= 12) {
       std::lock_guard<std::mutex> lock(audio_send_diagnostics_mu_);
-      if (started_.load() && audio_send_samples_.size() < 4096) {
+      if (started_.load() && audio_send_samples_.size() < audio_trace_capacity_) {
         audio_send_samples_.push_back({
             uint16_t(uint16_t(packet[2]) << 8 | uint16_t(packet[3])),
             read_be32(packet.data() + 4), started_ns / 1000, admitted_us,
@@ -593,7 +596,7 @@ void VeilTransportShim::DeliverOnNetworkThread(
                previous, arrived_us, std::memory_order_relaxed)) {}
   }
   if (!is_video && audio_ingress_diagnostics_ &&
-      audio_ingress_samples_.size() < 4096) {
+      audio_ingress_samples_.size() < audio_trace_capacity_) {
     audio_ingress_samples_.push_back({rtp.SequenceNumber(), rtp.Timestamp(),
         arrived_us, webrtc::TimeMicros(), rtp.payload_size()});
   }
