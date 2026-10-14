@@ -127,6 +127,20 @@ async fn retained_closed_ordered_carrier_releases_ingress_and_refuses_before_adm
 
 #[tokio::test]
 async fn distinct_forward_ingress_progresses_while_the_same_routes_other_pipe_is_blocked() {
+    forward_ingress_progress_with_blocked_pipe(2).await;
+}
+
+#[tokio::test]
+async fn four_same_route_ingress_connections_remain_independent_without_remote_roles() {
+    forward_ingress_progress_with_blocked_pipe(4).await;
+}
+
+#[tokio::test]
+async fn full_neutral_connection_pool_preserves_progress_and_refuses_aliasing_another_ingress() {
+    forward_ingress_progress_with_blocked_pipe(TOTAL_SLOTS).await;
+}
+
+async fn forward_ingress_progress_with_blocked_pipe(flow_count: usize) {
     let parent = ParallelParent::new([1; 32], [2; 32], [3; 32]);
     let remote = ParallelParent::new([1; 32], [3; 32], [2; 32]);
     let diagnostics = Arc::new(ParallelDiagnostics::default());
@@ -150,7 +164,7 @@ async fn distinct_forward_ingress_progresses_while_the_same_routes_other_pipe_is
     let ingress_remote = ParallelParent::new([11; 32], [13; 32], [12; 32]);
     let mut owners = Vec::new();
     let mut carriers: Vec<Arc<dyn DatagramCarrier>> = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..flow_count {
         let (channel, keys, raw) = raw_pair(&ingress_parent, &ingress_remote, 32);
         let sender = Arc::new(Mutex::new(RealtimeSender::new(
             channel.handle(),
@@ -170,56 +184,92 @@ async fn distinct_forward_ingress_progresses_while_the_same_routes_other_pipe_is
     }
     let witnesses: Vec<Carrier> = carriers.iter().map(Arc::downgrade).collect();
     let salt = [17; 32];
-    let frames = [opaque_forward(21), opaque_forward(22)];
+    let frames: Vec<_> = (0..flow_count)
+        .map(|i| opaque_forward(21 + i as u8))
+        .collect();
     let (_, body, kind) = decode_realtime_lane_frame(&frames[0]).unwrap();
-    let first = pool
-        .selected_sender(
-            veil_proto::priority::INTERACTIVE,
-            body,
-            kind,
-            Some(&witnesses[0]),
-            &salt,
-            &diagnostics,
-        )
-        .unwrap();
-    let second = pool
-        .selected_sender(
-            veil_proto::priority::INTERACTIVE,
-            body,
-            kind,
-            Some(&witnesses[1]),
-            &salt,
-            &diagnostics,
-        )
-        .unwrap();
-    assert!(
-        !Arc::ptr_eq(&first, &second),
-        "same-route Forward connections were merged"
-    );
-    for sender in [&first, &second] {
+    let senders: Vec<_> = witnesses
+        .iter()
+        .map(|witness| {
+            pool.selected_sender(
+                veil_proto::priority::INTERACTIVE,
+                body,
+                kind,
+                Some(witness),
+                &salt,
+                &diagnostics,
+            )
+            .unwrap()
+        })
+        .collect();
+    for (i, sender) in senders.iter().enumerate() {
+        for other in &senders[..i] {
+            assert!(
+                !Arc::ptr_eq(sender, other),
+                "same-route Forward connections were merged"
+            );
+        }
         let guard = lock!(sender);
         let (_, counter) = guard.sent_counter.as_ref().unwrap();
         assert!(*counter >= crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES.len());
     }
-    let first_physical = pool
-        .slots
+    let physical: Vec<_> = senders
         .iter()
-        .position(|ready| {
-            ready
-                .as_ref()
-                .is_some_and(|ready| Arc::ptr_eq(&ready.sender, &first))
+        .map(|sender| {
+            pool.slots
+                .iter()
+                .position(|ready| {
+                    ready
+                        .as_ref()
+                        .is_some_and(|r| Arc::ptr_eq(&r.sender, sender))
+                })
+                .unwrap()
         })
-        .unwrap();
-    let second_physical = pool
-        .slots
-        .iter()
-        .position(|ready| {
-            ready
-                .as_ref()
-                .is_some_and(|ready| Arc::ptr_eq(&ready.sender, &second))
-        })
-        .unwrap();
-
+        .collect();
+    if flow_count == TOTAL_SLOTS {
+        let (channel, keys, raw) = raw_pair(&ingress_parent, &ingress_remote, 32);
+        let extra = parallel_lanes::make_carrier(
+            &diagnostics,
+            Arc::new(Mutex::new(RealtimeSender::new(
+                channel.handle(),
+                crate::datagram_flows::SessionDatagramTx::new(
+                    channel.keys.tx_key(),
+                    &channel.keys.session_id,
+                    true,
+                ),
+            ))),
+            ingress_parent.handle(),
+            [4; 32],
+        );
+        assert!(
+            pool.selected_sender(
+                veil_proto::priority::INTERACTIVE,
+                body,
+                kind,
+                Some(&Arc::downgrade(&extra)),
+                &salt,
+                &diagnostics
+            )
+            .is_none(),
+            "saturation must not alias an existing live connection"
+        );
+        owners.push((channel, keys, raw));
+        carriers.push(extra);
+        for (i, witness) in witnesses.iter().enumerate() {
+            let retained = pool
+                .selected_sender(
+                    veil_proto::priority::INTERACTIVE,
+                    body,
+                    kind,
+                    Some(witness),
+                    &salt,
+                    &diagnostics,
+                )
+                .unwrap();
+            assert!(Arc::ptr_eq(&retained, &senders[i]));
+        }
+    }
+    let first = senders[0].clone();
     publish(&first, &frames[0]);
     timeout(Duration::from_secs(1), async {
         loop {
@@ -238,27 +288,28 @@ async fn distinct_forward_ingress_progresses_while_the_same_routes_other_pipe_is
     })
     .await
     .unwrap();
-    // Starting the second receiver cannot consume the first unread raw pipe.
-    let (keys, raw) = destinations[second_physical].take().unwrap();
-    let mut decoder =
-        crate::datagram_flows::SessionDatagramRx::new(keys.rx_key(), &keys.session_id, true);
-    let channel = keys.into_ordered(Box::new(raw)).unwrap();
-    publish(&second, &frames[1]);
-    let packet = timeout(Duration::from_millis(250), channel.handle().recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let decoded = decoder
-        .decode_datagram(&packet, std::time::Instant::now())
-        .unwrap()
-        .unwrap();
-    assert_eq!(decoded, frames[1]);
-    assert!(destinations[first_physical].is_some());
-    // A selection cannot spend another flow's admission or change wire class.
-    assert_eq!(
-        decode_realtime_lane_frame(&decoded).unwrap().0.priority(),
-        veil_proto::priority::INTERACTIVE
-    );
+    // Every other receiver progresses without consuming the unread pipe.
+    for i in 1..flow_count {
+        let (keys, raw) = destinations[physical[i]].take().unwrap();
+        let mut decoder =
+            crate::datagram_flows::SessionDatagramRx::new(keys.rx_key(), &keys.session_id, true);
+        let channel = keys.into_ordered(Box::new(raw)).unwrap();
+        publish(&senders[i], &frames[i]);
+        let packet = timeout(Duration::from_millis(250), channel.handle().recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let decoded = decoder
+            .decode_datagram(&packet, std::time::Instant::now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, frames[i]);
+        assert_eq!(
+            decode_realtime_lane_frame(&decoded).unwrap().0.priority(),
+            veil_proto::priority::INTERACTIVE
+        );
+        assert!(destinations[physical[0]].is_some());
+    }
     ingress_parent.handle().retire();
     assert!(
         carriers
