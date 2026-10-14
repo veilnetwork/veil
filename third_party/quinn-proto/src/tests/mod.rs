@@ -18,19 +18,19 @@ use rustls::crypto::aws_lc_rs::default_provider;
 #[cfg(feature = "rustls-ring")]
 use rustls::crypto::ring::default_provider;
 use rustls::{
-    AlertDescription, RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     server::WebPkiClientVerifier,
+    AlertDescription, RootCertStore,
 };
 use tracing::info;
 
 use super::*;
 use crate::{
-    Duration, Instant,
     cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
     crypto::rustls::QuicServerConfig,
     frame::FrameStruct,
     transport_parameters::TransportParameters,
+    Duration, Instant,
 };
 mod util;
 use util::*;
@@ -1558,8 +1558,8 @@ fn cid_rotation() {
     let mut stop = pair.time;
     let end = pair.time + 5 * CID_TIMEOUT;
 
-    use crate::LOC_CID_COUNT;
     use crate::cid_queue::CidQueue;
+    use crate::LOC_CID_COUNT;
     let mut active_cid_num = CidQueue::LEN as u64 + 1;
     active_cid_num = active_cid_num.min(LOC_CID_COUNT);
     let mut left_bound = 0;
@@ -1606,8 +1606,8 @@ fn cid_retirement() {
     assert!(!pair.server_conn_mut(server_ch).is_closed());
     assert_matches!(pair.client_conn_mut(client_ch).active_rem_cid_seq(), 1);
 
-    use crate::LOC_CID_COUNT;
     use crate::cid_queue::CidQueue;
+    use crate::LOC_CID_COUNT;
     let mut active_cid_num = CidQueue::LEN as u64;
     active_cid_num = active_cid_num.min(LOC_CID_COUNT);
 
@@ -1983,11 +1983,10 @@ fn small_datagram_uses_residual_congestion_window_before_expiry() {
         pair.client_datagrams(client_ch)
             .send(vec![4; 1_000].into(), false)
             .unwrap();
-        assert!(
-            pair.client_conn_mut(client_ch)
-                .poll_transmit(now, max_datagrams, &mut Vec::new())
-                .is_none()
-        );
+        assert!(pair
+            .client_conn_mut(client_ch)
+            .poll_transmit(now, max_datagrams, &mut Vec::new())
+            .is_none());
         pair.drive();
         for fill in [1u8, 2] {
             assert_eq!(
@@ -2012,11 +2011,10 @@ fn residual_window_keeps_requested_mtu_padding() {
     pair.client_datagrams(client_ch)
         .send(vec![3; 64].into(), false)
         .unwrap();
-    assert!(
-        pair.client_conn_mut(client_ch)
-            .poll_transmit(now, 16, &mut Vec::new())
-            .is_none()
-    );
+    assert!(pair
+        .client_conn_mut(client_ch)
+        .poll_transmit(now, 16, &mut Vec::new())
+        .is_none());
     assert_eq!(
         pair.client_conn_mut(client_ch)
             .stats()
@@ -2070,6 +2068,62 @@ fn reliable_stream_uses_residual_window_without_exceeding_it() {
     }
     chunks.finalize();
     assert_eq!(delivered, data);
+}
+
+#[test]
+fn timed_datagram_block_observation_tracks_actual_window_and_excludes_expired_work() {
+    let (mut pair, client_ch, _) = residual_window_pair(false);
+    let queued_at = pair.time;
+    pair.client_datagrams(client_ch)
+        .send_with_expiry_at(
+            vec![3; 1_100].into(),
+            false,
+            queued_at + Duration::from_millis(200),
+            queued_at,
+        )
+        .unwrap();
+    let observed_at = queued_at + Duration::from_millis(120);
+    let mut buf = Vec::new();
+    assert!(pair
+        .client_conn_mut(client_ch)
+        .poll_transmit(observed_at, 1, &mut buf)
+        .is_none());
+    let before = pair.client_conn_mut(client_ch).stats().path;
+    assert_eq!(
+        before.datagram_cwnd_blocked_max_age,
+        Duration::from_millis(120)
+    );
+    assert!(before.datagram_cwnd_blocked_inflight < before.datagram_cwnd_blocked_window);
+    assert!(before.datagram_cwnd_blocked_inflight + 1_100 > before.datagram_cwnd_blocked_window);
+    assert_eq!(before.datagram_cwnd_blocked_payload_bytes, 1_100);
+    assert_eq!(before.datagram_cwnd_blocked_untracked, 0);
+    assert_eq!(before.datagram_pacing_blocked_max_age, Duration::ZERO);
+    assert_eq!(
+        before.datagram_amplification_blocked_max_age,
+        Duration::ZERO
+    );
+    let _ = pair.client_conn_mut(client_ch).poll_transmit(
+        queued_at + Duration::from_millis(201),
+        1,
+        &mut buf,
+    );
+    assert_eq!(pair.client_datagrams(client_ch).expired_outgoing(), 1);
+    // An untimed compatibility cell must not invent a local queue timestamp.
+    pair.client_datagrams(client_ch)
+        .send(vec![4; 1_100].into(), false)
+        .unwrap();
+    let _ = pair.client_conn_mut(client_ch).poll_transmit(
+        queued_at + Duration::from_millis(250),
+        1,
+        &mut buf,
+    );
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .path
+            .datagram_cwnd_blocked_max_age,
+        before.datagram_cwnd_blocked_max_age
+    );
 }
 
 #[test]

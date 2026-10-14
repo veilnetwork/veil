@@ -1,6 +1,6 @@
 //! Connection statistics
 
-use crate::{Dir, Duration, frame::Frame};
+use crate::{frame::Frame, Dir, Duration};
 
 /// Statistics about UDP datagrams transmitted or received on a connection
 ///
@@ -143,6 +143,26 @@ pub struct PathStats {
     /// Transmits containing an ordinary packet built with less than an MTU of
     /// remaining congestion-window capacity. No application role is inspected.
     pub residual_window_transmits: u64,
+    /// Largest observed local timed-datagram age while congestion blocked it.
+    pub datagram_cwnd_blocked_max_age: Duration,
+    /// Congestion window at that age observation, not a lifetime maximum.
+    pub datagram_cwnd_blocked_window: u64,
+    /// Outstanding bytes at that same observation.
+    pub datagram_cwnd_blocked_inflight: u64,
+    /// Reserved packet-builder bytes at the same observation.
+    pub datagram_cwnd_blocked_untracked: u64,
+    /// Pending timed datagram's opaque payload length at the same observation.
+    pub datagram_cwnd_blocked_payload_bytes: u64,
+    /// Probe timeout count at that same observation.
+    pub datagram_cwnd_blocked_pto: u32,
+    /// Smoothed RTT at that same observation.
+    pub datagram_cwnd_blocked_rtt: Duration,
+    /// Largest timed-datagram age observed while the byte pacer blocked it.
+    pub datagram_pacing_blocked_max_age: Duration,
+    /// Longest scheduled byte-pacing wait with a timed datagram pending.
+    pub datagram_pacing_max_delay: Duration,
+    /// Largest timed-datagram age while path anti-amplification blocked it.
+    pub datagram_amplification_blocked_max_age: Duration,
     /// Consecutive probe timeout count, before acknowledgment progress resets it.
     pub pto_count: u32,
     /// Congestion events on the connection

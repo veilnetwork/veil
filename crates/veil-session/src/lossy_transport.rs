@@ -138,7 +138,7 @@ impl LossyTransportHandle {
             Self::Quic(handle) => {
                 let p = handle.path_stats();
                 format!(
-                    "transport=quic connection_trace_id={} rtt_us={} cwnd_bytes={} in_flight_bytes={} pto_count={} lost_packets={} congestion_events={} udp_sent={} udp_received={} udp_sent_bytes={} udp_received_bytes={} udp_socket_sent_bytes={} acks_received={} stream_frames_sent={} stream_frames_received={} max_data_received={} max_stream_data_received={} data_blocked_sent={} stream_data_blocked_sent={} expired_outgoing_datagrams={} datagram_queue_max_us={} residual_window_transmits={} event_queue_last_us={} event_queue_max_us={} event_queue_stalls={} timer_late_last_us={} timer_late_max_us={} timer_stalls={} udp_send_wait_last_us={} udp_send_wait_max_us={} udp_send_stalls={} udp_send_pending_us={}",
+                    "transport=quic connection_trace_id={} rtt_us={} cwnd_bytes={} in_flight_bytes={} pto_count={} lost_packets={} congestion_events={} udp_sent={} udp_received={} udp_sent_bytes={} udp_received_bytes={} udp_socket_sent_bytes={} acks_received={} stream_frames_sent={} stream_frames_received={} max_data_received={} max_stream_data_received={} data_blocked_sent={} stream_data_blocked_sent={} expired_outgoing_datagrams={} datagram_queue_max_us={} datagram_cwnd_blocked_max_age_us={} datagram_cwnd_blocked_window={} datagram_cwnd_blocked_inflight={} datagram_cwnd_blocked_untracked={} datagram_cwnd_blocked_payload_bytes={} datagram_cwnd_blocked_pto={} datagram_cwnd_blocked_rtt_us={} datagram_pacing_blocked_max_age_us={} datagram_pacing_max_delay_us={} datagram_amplification_blocked_max_age_us={} residual_window_transmits={} event_queue_last_us={} event_queue_max_us={} event_queue_stalls={} timer_late_last_us={} timer_late_max_us={} timer_stalls={} udp_send_wait_last_us={} udp_send_wait_max_us={} udp_send_stalls={} udp_send_pending_us={}",
                     handle.local_trace_id(),
                     p.rtt_us,
                     p.congestion_window_bytes,
@@ -160,6 +160,16 @@ impl LossyTransportHandle {
                     p.stream_data_blocked_sent,
                     p.expired_outgoing_datagrams,
                     p.datagram_queue_max_us,
+                    p.datagram_cwnd_blocked_max_age_us,
+                    p.datagram_cwnd_blocked_window,
+                    p.datagram_cwnd_blocked_inflight,
+                    p.datagram_cwnd_blocked_untracked,
+                    p.datagram_cwnd_blocked_payload_bytes,
+                    p.datagram_cwnd_blocked_pto,
+                    p.datagram_cwnd_blocked_rtt_us,
+                    p.datagram_pacing_blocked_max_age_us,
+                    p.datagram_pacing_max_delay_us,
+                    p.datagram_amplification_blocked_max_age_us,
                     p.residual_window_transmits,
                     p.event_queue_last_us,
                     p.event_queue_max_us,
