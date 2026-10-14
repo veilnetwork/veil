@@ -26,6 +26,7 @@ use veil_transport::{
 struct NeutralLink {
     enabled: Arc<AtomicBool>,
     blackout: Arc<AtomicBool>,
+    loss_every: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
     tasks: Vec<JoinHandle<()>>,
     left_addr: SocketAddr,
@@ -47,6 +48,7 @@ impl NeutralLink {
         let enabled = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicU64::new(0));
         let blackout = Arc::new(AtomicBool::new(false));
+        let loss_every = Arc::new(AtomicU64::new(0));
         let mut tasks = Vec::new();
         for (input, expected, output, destination) in [
             (
@@ -67,7 +69,9 @@ impl NeutralLink {
             let (tx, mut rx) = mpsc::channel::<(Vec<u8>, Instant)>(32);
             let drops = Arc::clone(&dropped);
             let unavailable = Arc::clone(&blackout);
+            let loss_interval = Arc::clone(&loss_every);
             tasks.push(tokio::spawn(async move {
+                let mut seen = 0u64;
                 let mut buffer = vec![0; 65536];
                 loop {
                     let Ok((len, source)) = input.recv_from(&mut buffer).await else {
@@ -76,7 +80,10 @@ impl NeutralLink {
                     if source != expected {
                         continue;
                     }
+                    seen = seen.wrapping_add(1);
+                    let every = loss_interval.load(Ordering::Relaxed);
                     if unavailable.load(Ordering::Relaxed)
+                        || (every != 0 && seen.is_multiple_of(every))
                         || tx
                             .try_send((buffer[..len].to_vec(), Instant::now()))
                             .is_err()
@@ -115,6 +122,7 @@ impl NeutralLink {
         Self {
             enabled,
             blackout,
+            loss_every,
             dropped,
             tasks,
             left_addr: left_socket.local_addr().unwrap(),
@@ -935,6 +943,25 @@ async fn measure_primary_blackout(
     expiry: bool,
     blackout_duration: Duration,
 ) -> BlackoutReport {
+    measure_primary_loss(
+        large_cells,
+        link_delay,
+        expiry,
+        blackout_duration,
+        veil_transport::context::QuicCongestionControl::Cubic,
+        0,
+    )
+    .await
+}
+
+async fn measure_primary_loss(
+    large_cells: bool,
+    link_delay: Duration,
+    expiry: bool,
+    blackout_duration: Duration,
+    congestion: veil_transport::context::QuicCongestionControl,
+    loss_every: u64,
+) -> BlackoutReport {
     use crate::datagram_flows::{SessionDatagramRx, SessionDatagramTx};
     use std::collections::HashSet;
     use veil_proto::{
@@ -958,7 +985,9 @@ async fn measure_primary_blackout(
     )
     .await;
     link.enabled.store(true, Ordering::Relaxed);
-    let context = Arc::new(TransportContext::for_debug().unwrap());
+    let mut context = TransportContext::for_debug().unwrap();
+    context.quic.congestion_control = congestion;
+    let context = Arc::new(context);
     let remote_context = Arc::clone(&context);
     let remote_addr = link.right_addr;
     let remote = tokio::spawn(async move {
@@ -986,6 +1015,7 @@ async fn measure_primary_blackout(
     assert_eq!(&prefix, b"stand");
     sleep(Duration::from_millis(100)).await;
 
+    link.loss_every.store(loss_every, Ordering::Relaxed);
     let started = Instant::now();
     let (received_tx, mut received_rx) = mpsc::unbounded_channel();
     let reader = tokio::spawn(async move {
@@ -2298,3 +2328,27 @@ async fn primary_blackout_limits_local_data_on_a_different_neighbor() {
 
 #[path = "reliable_source_pressure_quic_tests.rs"]
 mod reliable_source_pressure_quic_tests;
+
+#[tokio::test]
+#[ignore = "Manual controlled Cubic/BBR comparison under neutral packet loss"]
+async fn characterize_primary_small_packet_loss_with_congestion_controllers() {
+    use veil_transport::context::QuicCongestionControl::{Bbr, Cubic};
+    for delay in [Duration::from_millis(20), Duration::from_millis(120)] {
+        for controller in [Cubic, Bbr] {
+            eprintln!(
+                "controlled_small_loss controller={controller:?} one_way_ms={} drop_every=50",
+                delay.as_millis()
+            );
+            let report = measure_primary_loss(
+                false,
+                delay,
+                true,
+                Duration::from_millis(150),
+                controller,
+                50,
+            )
+            .await;
+            assert!(report.first_fresh.is_some());
+        }
+    }
+}

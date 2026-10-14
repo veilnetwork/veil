@@ -10,14 +10,11 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use frame::StreamMetaVec;
 
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::{
-    Dir, Duration, EndpointConfig, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
-    MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit, TransportError,
-    TransportErrorCode, VarInt,
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
@@ -35,6 +32,9 @@ use crate::{
     },
     token::{ResetToken, Token, TokenPayload},
     transport_parameters::TransportParameters,
+    Dir, Duration, EndpointConfig, Frame, Instant, Side, StreamId, TokenStore, Transmit,
+    TransportError, TransportErrorCode, VarInt, INITIAL_MTU, MAX_CID_SIZE, MAX_STREAM_COUNT,
+    MIN_INITIAL_SIZE, TIMER_GRANULARITY,
 };
 
 mod ack_frequency;
@@ -240,7 +240,50 @@ pub struct Connection {
     version: u32,
 }
 
+enum DatagramBlockReason {
+    Congestion(u64),
+    Pacing(Instant),
+    Amplification,
+}
+
 impl Connection {
+    /// Endpoint diagnostic only. No payload, peer clock or media role is read.
+    fn record_datagram_block(&mut self, now: Instant, reason: DatagramBlockReason) {
+        let Some(age) = self.datagrams.oldest_timed_age(now) else {
+            return;
+        };
+        match reason {
+            DatagramBlockReason::Congestion(untracked) => {
+                if age >= self.stats.path.datagram_cwnd_blocked_max_age {
+                    self.stats.path.datagram_cwnd_blocked_max_age = age;
+                    self.stats.path.datagram_cwnd_blocked_window = self.path.congestion.window();
+                    self.stats.path.datagram_cwnd_blocked_inflight = self.path.in_flight.bytes;
+                    self.stats.path.datagram_cwnd_blocked_untracked = untracked;
+                    self.stats.path.datagram_cwnd_blocked_payload_bytes =
+                        self.datagrams.outgoing.front().unwrap().data.len() as u64;
+                    self.stats.path.datagram_cwnd_blocked_pto = self.pto_count;
+                    self.stats.path.datagram_cwnd_blocked_rtt = self.path.rtt.get();
+                }
+            }
+            DatagramBlockReason::Pacing(until) => {
+                self.stats.path.datagram_pacing_blocked_max_age =
+                    self.stats.path.datagram_pacing_blocked_max_age.max(age);
+                self.stats.path.datagram_pacing_max_delay = self
+                    .stats
+                    .path
+                    .datagram_pacing_max_delay
+                    .max(until.saturating_duration_since(now));
+            }
+            DatagramBlockReason::Amplification => {
+                self.stats.path.datagram_amplification_blocked_max_age = self
+                    .stats
+                    .path
+                    .datagram_amplification_blocked_max_age
+                    .max(age);
+            }
+        }
+    }
+
     pub(crate) fn new(
         endpoint_config: Arc<EndpointConfig>,
         config: Arc<TransportConfig>,
@@ -591,6 +634,7 @@ impl Connection {
                     .path
                     .anti_amplification_blocked(segment_size as u64 * (num_datagrams as u64) + 1)
                 {
+                    self.record_datagram_block(now, DatagramBlockReason::Amplification);
                     trace!("blocked by anti-amplification");
                     break;
                 }
@@ -637,6 +681,10 @@ impl Connection {
                             // A whole DATAGRAM must fit. Retain an oversized
                             // one for ACK progress, keeping congestion state.
                             if can_send.is_empty() {
+                                self.record_datagram_block(
+                                    now,
+                                    DatagramBlockReason::Congestion(untracked_bytes),
+                                );
                                 congestion_blocked = true;
                                 space_idx += 1;
                                 continue;
@@ -654,6 +702,12 @@ impl Connection {
                         congestion_blocked = true;
                         // We continue instead of breaking here in order to avoid
                         // blocking loss probes queued for higher spaces.
+                        if space_id == SpaceId::Data {
+                            self.record_datagram_block(
+                                now,
+                                DatagramBlockReason::Congestion(untracked_bytes),
+                            );
+                        }
                         trace!("blocked by congestion control");
                         continue;
                     }
@@ -668,6 +722,9 @@ impl Connection {
                         now,
                     ) {
                         self.timers.set(Timer::Pacing, delay);
+                        if space_id == SpaceId::Data {
+                            self.record_datagram_block(now, DatagramBlockReason::Pacing(delay));
+                        }
                         congestion_blocked = true;
                         // Loss probes should be subject to pacing, even though
                         // they are not congestion controlled.
@@ -1793,7 +1850,8 @@ impl Connection {
             self.stats.path.lost_bytes += size_of_lost_packets;
             trace!(
                 "packets lost: {:?}, bytes lost: {}",
-                lost_packets, size_of_lost_packets
+                lost_packets,
+                size_of_lost_packets
             );
 
             for &packet in &lost_packets {

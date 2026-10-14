@@ -194,6 +194,10 @@ impl std::ops::Deref for QueuedDatagram {
 }
 
 impl DatagramState {
+    pub(super) fn oldest_timed_age(&self, now: Instant) -> Option<Duration> {
+        now.checked_duration_since(self.outgoing.front()?.queued_at?)
+    }
+
     fn expire(&mut self, now: Instant) -> usize {
         if self.next_expiry.map_or(true, |deadline| deadline > now) {
             return 0;

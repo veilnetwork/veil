@@ -100,6 +100,17 @@ pub struct QuicDatagramPathStats {
     pub stream_data_blocked_sent: u64,
     pub expired_outgoing_datagrams: u64,
     pub datagram_queue_max_us: u64,
+    pub datagram_cwnd_blocked_max_age_us: u64,
+    pub datagram_cwnd_blocked_window: u64,
+    pub datagram_cwnd_blocked_inflight: u64,
+    pub datagram_cwnd_blocked_untracked: u64,
+    pub datagram_cwnd_blocked_payload_bytes: u64,
+    pub datagram_cwnd_blocked_pto: u64,
+    pub datagram_cwnd_blocked_rtt_us: u64,
+    pub datagram_pacing_blocked_max_age_us: u64,
+    pub datagram_pacing_max_delay_us: u64,
+    pub datagram_amplification_blocked_max_age_us: u64,
+
     pub residual_window_transmits: u64,
     pub event_queue_last_us: u64,
     pub event_queue_max_us: u64,
@@ -150,6 +161,38 @@ impl QuicDatagramHandle {
                 .as_micros()
                 .min(u64::MAX as u128) as u64,
             residual_window_transmits: stats.path.residual_window_transmits,
+            datagram_cwnd_blocked_max_age_us: stats
+                .path
+                .datagram_cwnd_blocked_max_age
+                .as_micros()
+                .min(u64::MAX as u128) as u64,
+            datagram_cwnd_blocked_window: stats.path.datagram_cwnd_blocked_window,
+            datagram_cwnd_blocked_inflight: stats.path.datagram_cwnd_blocked_inflight,
+            datagram_cwnd_blocked_untracked: stats.path.datagram_cwnd_blocked_untracked,
+            datagram_cwnd_blocked_payload_bytes: stats.path.datagram_cwnd_blocked_payload_bytes,
+            datagram_cwnd_blocked_pto: u64::from(stats.path.datagram_cwnd_blocked_pto),
+            datagram_cwnd_blocked_rtt_us: stats
+                .path
+                .datagram_cwnd_blocked_rtt
+                .as_micros()
+                .min(u64::MAX as u128) as u64,
+            datagram_pacing_blocked_max_age_us: stats
+                .path
+                .datagram_pacing_blocked_max_age
+                .as_micros()
+                .min(u64::MAX as u128) as u64,
+            datagram_pacing_max_delay_us: stats
+                .path
+                .datagram_pacing_max_delay
+                .as_micros()
+                .min(u64::MAX as u128) as u64,
+            datagram_amplification_blocked_max_age_us: stats
+                .path
+                .datagram_amplification_blocked_max_age
+                .as_micros()
+                .min(u64::MAX as u128)
+                as u64,
+
             event_queue_last_us: driver.event_queue_last_us,
             event_queue_max_us: driver.event_queue_max_us,
             event_queue_stalls: driver.event_queue_stalls,
