@@ -25,11 +25,11 @@ pub mod obfs4_tcp;
 pub mod on_demand;
 /// Bounded generic record framing after auxiliary-session authentication.
 pub mod ordered_records;
-pub mod reliable_records;
 /// QUIC `Transport` built on `quinn`.
 pub mod quic;
 /// Scheme-keyed lookup of transport implementations.
 pub mod registry;
+pub mod reliable_records;
 /// Ephemeral-port rotation scheduler primitives (Phase 5f).
 pub mod rotation;
 /// SOCKS5 proxy tunnelling (optional TLS on top).
@@ -40,6 +40,7 @@ pub mod stream_parallel;
 pub mod tcp;
 /// Opt-in local TCP write diagnostics; no protocol or scheduling changes.
 pub mod tcp_trace;
+mod tcp_write_gate;
 /// TLS transport (rustls by default).
 pub mod tls;
 /// BoringSSL-backed TLS transport used under `tls-boring`.
@@ -81,6 +82,9 @@ pub use uri::{TransportStack, TransportUri, Wrapper, rewrite_wildcard_host};
 // variant type so veilcore's config-glue layer can parse operator
 // config strings without adding a direct veil-obfs4 dep.
 pub use veil_obfs4::WireFormatVariant;
+
+/// Enable endpoint-local encrypted UDP correlation; never changes wire data.
+pub use ::quinn::set_udp_wire_trace;
 
 #[cfg(test)]
 mod tests {
@@ -405,6 +409,3 @@ mod tests {
         std::env::temp_dir().join(format!("veil-transport-{seed}.sock"))
     }
 }
-
-/// Enable endpoint-local encrypted UDP correlation; never changes wire data.
-pub use ::quinn::set_udp_wire_trace;

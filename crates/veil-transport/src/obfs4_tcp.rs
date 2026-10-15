@@ -315,7 +315,10 @@ impl tokio::io::AsyncWrite for Obfs4IoStream {
 }
 
 pub(crate) fn boxed_obfs4_io(stream: Obfs4Stream<tokio::net::TcpStream>) -> BoxIoStream {
-    Box::new(Obfs4IoStream::new(stream))
+    let stream = Obfs4IoStream::new(stream);
+    Box::new(crate::tcp_write_gate::gate(stream, |io| {
+        io.stream.get_ref()
+    }))
 }
 
 fn boxed_stream_connection_obfs4(

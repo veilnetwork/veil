@@ -90,7 +90,9 @@ pub async fn connect_tls_client_stream(
     let stream = connect_tcp_stream(host, port, ctx).await?;
     let tls_stream: ClientTlsStream<TcpStream> =
         connect_tls_stream(stream, host, sni, alpn, ctx).await?;
-    Ok(Box::new(tls_stream))
+    Ok(Box::new(crate::tcp_write_gate::gate(tls_stream, |tls| {
+        tls.get_ref().0
+    })))
 }
 
 /// TLS handshake against
@@ -170,7 +172,9 @@ pub async fn connect_pki_verified_https_stream(
     .map_err(|_| handshake_timeout(ctx.tcp.connect_timeout))?
     .map_err(|err| tls_error(err.to_string()))?;
 
-    Ok(Box::new(tls_stream))
+    Ok(Box::new(crate::tcp_write_gate::gate(tls_stream, |tls| {
+        tls.get_ref().0
+    })))
 }
 
 /// Resolve real ECH config from DNS HTTPS RR (Stage 10 slice 3).  Returns
@@ -291,8 +295,9 @@ fn native_tls_peer(
 
 fn boxed_tls_connection(
     peer: crate::PeerMeta,
-    stream: impl super::traits::IoStream + 'static,
+    stream: impl Into<BoxTlsStream>,
 ) -> Box<dyn TransportConnection> {
+    let stream = crate::tcp_write_gate::gate(stream.into(), |tls| tls.get_ref().0);
     Box::new(StreamConnection::new(peer, stream)) as Box<dyn TransportConnection>
 }
 
