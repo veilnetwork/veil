@@ -2255,8 +2255,12 @@ const MEDIA_BATCHING_LEGACY: u8 = 1;
 #[cfg(feature = "node-embedded")]
 const MEDIA_BATCHING_COMPACT_RELAY: u8 = 2;
 /// Maximum plaintext media cell in compact relay mode. After the 36-byte
-/// symmetric seal and fixed Delivery/session framing this remains below the
-/// negotiated 1382-byte QUIC DATAGRAM ceiling, with margin for extensions.
+/// symmetric seal and fixed Delivery/session framing this fits the negotiated
+/// 1382-byte QUIC DATAGRAM ceiling. Independent ordered records permit only
+/// 1200 bytes: the seal (36), neutral Forward (240), OVL header (24) and opaque
+/// datagram codec (60) leave 840 for one unfragmented cell on that route.
+/// Larger cells still use the session codec's fragmentation. This batching
+/// limit does not truncate legacy raw RTP packets that exceed it.
 #[cfg(feature = "node-embedded")]
 const COMPACT_RELAY_MEDIA_CELL_MAX: usize = 1000;
 
