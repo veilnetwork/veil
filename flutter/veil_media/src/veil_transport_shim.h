@@ -55,10 +55,19 @@ struct RtcpFeedbackSnapshot {
   int64_t rtt_ms = 0;
   int loss_pct = 0;
   int jitter_ms = 0;
+  // Local arrival time of the last nonzero fractional-loss report. Healthy
+  // reports must not renew it, including reports from another room peer.
+  int64_t loss_report_us = 0;
 
   bool fresh_at(int64_t now_us) const {
     return arrived_us > 0 && arrived_us <= now_us &&
            now_us - arrived_us <= 15'000'000;
+  }
+
+  int64_t fresh_loss_report_us(int64_t now_us) const {
+    return loss_report_us > 0 && loss_report_us <= now_us &&
+                   now_us - loss_report_us <= 15'000'000
+               ? loss_report_us : 0;
   }
 };
 
