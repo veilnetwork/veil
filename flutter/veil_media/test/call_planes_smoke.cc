@@ -238,14 +238,23 @@ static uint32_t group_ssrc(const uint8_t id[32], uint32_t domain = 0x47415544u) 
   hash ^= domain;
   return hash == 0 ? 1 : hash;
 }
-static void report(uint64_t chan, uint32_t reporter, uint32_t source,
-                   uint8_t lost, uint32_t jitter) {
-  std::array<uint8_t, 32> packet{0x81, 201, 0, 7};
+static std::vector<uint8_t> report_packet(uint32_t reporter, uint32_t source,
+                                        uint8_t lost, uint32_t jitter,
+                                        bool sender_report = false) {
+  std::vector<uint8_t> packet(sender_report ? 52 : 32);
+  packet[0] = 0x81; packet[1] = sender_report ? 200 : 201;
+  packet[3] = sender_report ? 12 : 7;
   const auto word = [&](size_t at, uint32_t value) {
     for (int i = 0; i < 4; ++i) packet[at+i] = value >> (24-i*8);
   };
-  word(4, reporter); word(8, source); packet[12] = lost;
-  word(16, 100); word(20, jitter);
+  const size_t block = sender_report ? 28 : 8;
+  word(4, reporter); word(block, source); packet[block + 4] = lost;
+  word(block + 8, 100); word(block + 12, jitter);
+  return packet;
+}
+static void report(uint64_t chan, uint32_t reporter, uint32_t source,
+                   uint8_t lost, uint32_t jitter) {
+  const auto packet = report_packet(reporter, source, lost, jitter);
   Callback callback;
   { std::lock_guard lock(callback_mu); callback = callbacks.at(chan); }
   callback.fn(callback.ctx, packet.data(), packet.size());
@@ -278,6 +287,80 @@ static void wait_playout(VeilGroupMediaEngine* e, uint64_t reports, uint64_t del
   if (reports) assert(group_stat(e, "audio_playout_ms") == delay);
 }
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--rtcp-loss") == 0) {
+    uint8_t local[32] = {1}, peer[32] = {2}, other[32] = {3};
+    constexpr uint32_t audio = 0x01000000u;
+    constexpr uint32_t video = audio ^ 0x000000FFu ^ 0x56440000u;
+    std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(
+        veil_media_engine_create(160, local, peer), veil_media_engine_destroy);
+    assert(e);
+    assert(veil_media_engine_set_mic_muted(e.get(), 1) == VEIL_MEDIA_OK);
+    assert(veil_media_engine_start_audio(e.get(), 1, 1) == VEIL_MEDIA_OK);
+    const auto wait_stat = [&](const char* key, uint64_t previous) {
+      const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (stat(e.get(), key) <= previous && std::chrono::steady_clock::now() < until)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      assert(stat(e.get(), key) > previous);
+      return stat(e.get(), key);
+    };
+    assert(stat(e.get(), "audio_loss_report_us") == 0);
+    report(160, 2, audio ^ 0x100, 255, 0);  // foreign SSRC
+    auto bad = report_packet(2, audio, 1, 0);
+    bad.push_back(0);  // invalid final compound block cannot partially publish
+    inject_raw(160, bad);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    assert(stat(e.get(), "audio_loss_report_us") == 0);
+    report(160, 2, audio, 1, 0);  // 1/256 rounds below one percent
+    const auto first = wait_stat("audio_loss_report_us", 0);
+    assert(stat(e.get(), "tx_loss_pct") == 0);
+    assert(stat(e.get(), "video_loss_report_us") == 0);
+    for (int i = 0; i < 4; ++i) assert(stat(e.get(), "audio_loss_report_us") == first);
+    report(160, 2, audio, 0, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    assert(stat(e.get(), "audio_loss_report_us") == first);
+    // SR report blocks carry the same loss evidence as standalone RR.
+    inject_raw(160, report_packet(2, video, 1, 0, true));
+    const auto video_loss = wait_stat("video_loss_report_us", 0);
+    assert(stat(e.get(), "audio_loss_report_us") == first);
+    assert(stat(e.get(), "video_feedback_loss_pct") == 0);
+    inject_raw(160, report_packet(2, audio, 1, 0, true));
+    const auto second = wait_stat("audio_loss_report_us", first);
+    assert(stat(e.get(), "video_loss_report_us") == video_loss);
+
+    std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> room(
+        veil_media_group_engine_create(local), veil_media_group_engine_destroy);
+    assert(room);
+    assert(veil_media_group_engine_set_mic_muted(room.get(), 1) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_add_peer(room.get(), 180, peer) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_add_peer(room.get(), 181, other) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_start_audio(room.get()) == VEIL_MEDIA_OK);
+    report(180, group_ssrc(peer), group_ssrc(local), 1, 0);
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (group_stat(room.get(), "audio_loss_report_us") == 0 &&
+           std::chrono::steady_clock::now() < until)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const auto room_loss = group_stat(room.get(), "audio_loss_report_us");
+    assert(room_loss > 0);
+    const auto expiry = std::chrono::steady_clock::now() + std::chrono::milliseconds(15500);
+    report(181, group_ssrc(other), group_ssrc(local), 0, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    assert(group_stat(room.get(), "audio_loss_report_us") == room_loss);
+    assert(group_stat(room.get(), "tx_loss_pct") == 0);
+    // Healthy reports near expiry must not renew either peer's loss witness.
+    std::this_thread::sleep_until(expiry - std::chrono::seconds(1));
+    report(160, 2, audio, 0, 0);
+    report(180, group_ssrc(peer), group_ssrc(local), 0, 0);
+    report(181, group_ssrc(other), group_ssrc(local), 0, 0);
+    std::this_thread::sleep_until(expiry);
+    assert(stat(e.get(), "audio_loss_report_us") == 0);
+    assert(stat(e.get(), "video_loss_report_us") == 0);
+    assert(group_stat(room.get(), "audio_loss_report_us") == 0);
+    assert(stat(e.get(), "audio_feedback_reports") == 1);
+    assert(group_stat(room.get(), "audio_feedback_reports") == 2);
+    assert(second > first);
+    std::puts("RTCP loss: RR/SR, sub-percent, stream binding, cache, compound and room expiry verified");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--dual-framing") == 0) {
     uint8_t local[32] = {0x75}, peer[32] = {0x76};
     setenv("VEIL_MEDIA_TEST_VIDEO", "1", 1);

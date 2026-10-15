@@ -490,6 +490,9 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
       auto& sample = audio ? candidate : video_candidate;
       sample.arrived_us = arrived_us;
       sample.loss_pct = (int(block.fraction_lost()) * 100 + 128) / 256;
+      // Preserve sub-one-percent loss and a lossy block followed by a healthy
+      // block in the same valid compound packet.
+      if (block.fraction_lost() != 0) sample.loss_report_us = arrived_us;
       const uint32_t clock_rate = audio ? 48000 : 90000;
       sample.jitter_ms = static_cast<int>(uint64_t(block.jitter()) * 1000 / clock_rate);
       if (block.last_sr() != 0) {
@@ -534,10 +537,16 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
   }
   if (candidate.arrived_us > 0 || video_candidate.arrived_us > 0 || playout.supported) {
     std::lock_guard lock(audio_feedback_mu_);
-    if (candidate.arrived_us > 0 && candidate.arrived_us >= audio_feedback_.arrived_us)
+    if (candidate.arrived_us > 0 && candidate.arrived_us >= audio_feedback_.arrived_us) {
+      candidate.loss_report_us = std::max(candidate.loss_report_us,
+                                          audio_feedback_.loss_report_us);
       audio_feedback_ = candidate;
-    if (video_candidate.arrived_us > 0 && video_candidate.arrived_us >= video_feedback_.arrived_us)
+    }
+    if (video_candidate.arrived_us > 0 && video_candidate.arrived_us >= video_feedback_.arrived_us) {
+      video_candidate.loss_report_us = std::max(video_candidate.loss_report_us,
+                                                video_feedback_.loss_report_us);
       video_feedback_ = video_candidate;
+    }
     if (playout.supported && (!audio_playout_feedback_.supported ||
         playout.sequence > audio_playout_feedback_.sequence))
       audio_playout_feedback_ = playout;

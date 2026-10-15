@@ -10,3 +10,6 @@ clang++ -std=c++20 -Wall -Wextra -Werror -Wl,-export_dynamic \
   -I"$ROOT/src" "$ROOT/test/call_planes_smoke.cc" \
   "$STAND_DIR/libveil_media.dylib" -Wl,-rpath,"$STAND_DIR" -o "$STAND_DIR/smoke"
 "$STAND_DIR/smoke" "$@"
+if [ "$#" -eq 0 ]; then
+  "$STAND_DIR/smoke" --rtcp-loss
+fi
