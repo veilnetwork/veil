@@ -22,6 +22,11 @@ class AudioEncodeTiming {
   ~AudioEncodeTiming() { Flush(); }
   bool enabled() const { return enabled_; }
 
+  void Allocation(int64_t now_us, int64_t raw_bps, int64_t ana_bps,
+                  size_t overhead_bytes) {
+    if (enabled_) allocation_ = {now_us, raw_bps, ana_bps, overhead_bytes};
+  }
+
   void Input(uint32_t timestamp, int64_t now_us) {
     if (!enabled_) return;
     inputs_[input_count_ % inputs_.size()] = {timestamp, now_us, input_count_};
@@ -41,7 +46,8 @@ class AudioEncodeTiming {
         break;
       }
     }
-    packets_.push_back({timestamp, first_us, first_index, now_us, blocks, bytes});
+    packets_.push_back({timestamp, first_us, first_index, now_us, blocks, bytes,
+                        allocation_});
   }
 
  private:
@@ -57,19 +63,26 @@ class AudioEncodeTiming {
         (unsigned long long)packets_seen_, rtp_hz_);
     for (const auto& packet : packets_) {
       std::fprintf(file,
-          "audio.encode ssrc=%u timestamp=%u first_us=%lld first_index=%lld encoded_us=%lld blocks=%zu bytes=%zu\n",
+          "audio.encode ssrc=%u timestamp=%u first_us=%lld first_index=%lld encoded_us=%lld blocks=%zu bytes=%zu allocation_us=%lld allocation_raw_bps=%lld allocation_ana_bps=%lld allocation_overhead_bytes=%zu\n",
           ssrc_, packet.timestamp, (long long)packet.first_us,
           (long long)packet.first_index, (long long)packet.encoded_us,
-          packet.blocks, packet.bytes);
+          packet.blocks, packet.bytes, (long long)packet.allocation.at_us,
+          (long long)packet.allocation.raw_bps,
+          (long long)packet.allocation.ana_bps, packet.allocation.overhead_bytes);
     }
     std::fclose(file);
   }
 
   struct InputSample { uint32_t timestamp; int64_t at_us; uint64_t index; };
+  struct AllocationSample {
+    int64_t at_us = -1, raw_bps = 0, ana_bps = 0;
+    size_t overhead_bytes = 0;
+  };
   struct Packet {
     uint32_t timestamp;
     int64_t first_us, first_index, encoded_us;
     size_t blocks, bytes;
+    AllocationSample allocation;
   };
   const bool enabled_;
   const size_t capacity_;
@@ -78,6 +91,7 @@ class AudioEncodeTiming {
   uint64_t input_count_ = 0, packets_seen_ = 0;
   std::array<InputSample, 32> inputs_{};
   std::vector<Packet> packets_;
+  AllocationSample allocation_;
 };
 
 }  // namespace veil_media

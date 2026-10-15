@@ -72,6 +72,7 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
   }
   void SetTargetBitrate(int bps) override { OnReceivedTargetAudioBitrate(bps); }
   void OnReceivedUplinkAllocation(webrtc::BitrateAllocationUpdate update) override {
+    const int64_t raw_allocation_bps = update.target_bitrate.bps<int64_t>();
     // Leave endpoint headroom for RTCP and transport control/framing not
     // represented by a payload-only audio allocation. No relay priority.
     const int64_t budget = update.target_bitrate.bps<int64_t>() / 4 * 3;
@@ -96,6 +97,9 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
     update.target_bitrate = webrtc::DataRate::BitsPerSec(std::clamp<int64_t>(
         budget, overhead + kMinPayloadBps,
         overhead + kMaxPayloadBps));
+    if (timing_.enabled())
+      timing_.Allocation(webrtc::TimeMicros(), raw_allocation_bps,
+                         update.target_bitrate.bps<int64_t>(), overhead_bytes_);
     inner_->OnReceivedUplinkAllocation(update);
     ClampPayloadTarget();
   }
