@@ -29,7 +29,7 @@ pub fn set_enabled(on: bool) {
     enabled_cell().store(on, Ordering::Relaxed);
 }
 
-// The snapshots are consumed through field-labelled Debug output.
+/// The snapshots are consumed through field-labelled Debug output.
 #[allow(dead_code)]
 #[derive(Debug)]
 struct KernelSnapshot {
