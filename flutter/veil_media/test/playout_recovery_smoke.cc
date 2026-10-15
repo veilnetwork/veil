@@ -3,6 +3,9 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <string>
+#include <unistd.h>
 
 class Decoder final : public webrtc::NetEq {
  public:
@@ -72,5 +75,45 @@ int main() {
         webrtc::NetEq::Operation::kNormal) == (mode == 3 ? webrtc::NetEq::kFail : 0));
     assert(observed_clock->ticks() == 2);
   }
+  // Diagnostic capture must require both switches, remain bounded and defer
+  // every file operation until the renderer has stopped and the owner dies.
+  std::string path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR")
+                                                     : "/tmp/") +
+                     "/veil-playout-trace-XXXXXX";
+  const int fd = mkstemp(path.data());
+  assert(fd >= 0);
+  close(fd);
+  unlink(path.c_str());
+  setenv("VEIL_MEDIA_PLAYOUT_TRACE", "1", 1);
+  unsetenv("VEIL_MEDIA_DIAG_PATH");
+  { veil_media::PlayoutTrace off; assert(!off.enabled()); }
+  setenv("VEIL_MEDIA_DIAG_PATH", path.c_str(), 1);
+  unsetenv("VEIL_MEDIA_PLAYOUT_TRACE");
+  { veil_media::PlayoutTrace off; assert(!off.enabled()); }
+  setenv("VEIL_MEDIA_PLAYOUT_TRACE", "1", 1);
+  {
+    veil_media::PlayoutTrace trace;
+    assert(trace.enabled());
+    for (size_t i = 0; i < veil_media::PlayoutTrace::kLimit + 3; ++i)
+      trace.Record(1000, 200, 100, 40, 10, false);
+    assert(access(path.c_str(), F_OK) != 0);
+    // Teardown uses the explicitly selected original file, not later env.
+    unsetenv("VEIL_MEDIA_DIAG_PATH");
+  }
+  std::ifstream file(path);
+  std::string line;
+  assert(std::getline(file, line));
+  assert(line == "audio.playout.begin count=65536 observed=65539 limit=65536");
+  size_t rows = 0;
+  while (std::getline(file, line)) {
+    assert(line.find("before_ms=200 after_ms=100 target_ms=40 skipped=10 fallback=0")
+           != std::string::npos);
+    ++rows;
+  }
+  assert(rows == veil_media::PlayoutTrace::kLimit);
+  file.close();
+  unlink(path.c_str());
+  unsetenv("VEIL_MEDIA_PLAYOUT_TRACE");
   std::puts("catch-up preserves usable speech on PLC/mute/error; work bounded to 16 pulls");
+  std::puts("playout timing trace is opt-in, bounded, and writes only at teardown");
 }

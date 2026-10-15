@@ -10,6 +10,7 @@
 #include "api/neteq/neteq_factory.h"
 #include "api/neteq/tick_timer.h"
 #include "modules/audio_coding/neteq/neteq_impl.h"
+#include "veil_playout_trace.h"
 
 namespace veil_media {
 struct PlayoutRecoveryStats {
@@ -26,6 +27,9 @@ class RecoveringNetEq final : public webrtc::NetEq {
         stats_(std::move(stats)) {}
   int GetAudio(webrtc::AudioFrame* frame, bool* muted, int* rate,
                std::optional<Operation> action) override {
+    const auto entered_us = trace_.enabled() ? webrtc::TimeMicros() : 0;
+    const auto before_ms = trace_.enabled()
+        ? inner_->GetOperationsAndState().current_buffer_size_ms : 0;
     bool silent = false;
     int sample_rate = 0;
     // Packet arrival estimation measures real render callbacks, not the extra
@@ -69,6 +73,11 @@ class RecoveringNetEq final : public webrtc::NetEq {
     }
     if (muted) *muted = silent;
     if (rate) *rate = sample_rate;
+    if (trace_.enabled()) {
+      trace_.Record(entered_us, before_ms,
+          inner_->GetOperationsAndState().current_buffer_size_ms,
+          inner_->TargetDelayMs(), skipped, fallback);
+    }
     return result;
   }
   int InsertPacket(const webrtc::RTPHeader& h, std::span<const uint8_t> p,
@@ -104,6 +113,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
   std::unique_ptr<webrtc::NetEq> inner_;
   std::shared_ptr<PlayoutRecoveryStats> stats_;
   webrtc::AudioFrame scratch_;
+  PlayoutTrace trace_;
 };
 class ArrivalClockControllerFactory final : public webrtc::NetEqControllerFactory {
  public:
