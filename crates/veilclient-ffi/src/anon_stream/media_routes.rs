@@ -41,12 +41,38 @@ impl Offer {
         body
     }
 
+    fn separate_auxiliary(&self) -> bool {
+        self.routes.iter().any(|route| route.plane >= 2)
+    }
+
+    fn legacy(&self) -> Self {
+        Self {
+            channel: self.channel,
+            revision: self.revision,
+            routes: self
+                .routes
+                .iter()
+                .filter(|r| r.plane < 2)
+                .cloned()
+                .collect(),
+        }
+    }
+
+    fn receive_address(&self, source: usize) -> Option<&ReceiveAddress> {
+        let index = if self.separate_auxiliary() {
+            source
+        } else {
+            receive_plane_index(source)
+        };
+        self.routes.iter().find(|r| r.plane as usize == index)
+    }
+
     fn decode(body: &[u8]) -> Option<Self> {
         if body.len() < 21 || !body.starts_with(CONTROL_MAGIC) {
             return None;
         }
         let count = body[20] as usize;
-        if !(1..=2).contains(&count) || body.len() != 21 + ROUTE_BYTES * count {
+        if !(1..=4).contains(&count) || body.len() != 21 + ROUTE_BYTES * count {
             return None;
         }
         let channel = u64::from_be_bytes(body[4..12].try_into().ok()?);
@@ -58,7 +84,7 @@ impl Offer {
         let mut seen = 0u8;
         for entry in body[21..].chunks_exact(ROUTE_BYTES) {
             let plane = entry[0];
-            if plane > 1 || seen & (1 << plane) != 0 {
+            if plane > 3 || seen & (1 << plane) != 0 {
                 return None;
             }
             seen |= 1 << plane;
@@ -96,8 +122,27 @@ impl OfferInbox {
         if let Some(highest) = &self.highest {
             let generation = (offer.channel, offer.revision);
             let current = (highest.channel, highest.revision);
-            if generation < current || (generation == current && offer != *highest) {
+            if generation < current {
                 return;
+            }
+            // Once this channel proves the extended decoder, its compatibility
+            // copy must not collapse auxiliary receive paths, even if reordered
+            // from a newer publication. A new channel may be a legacy peer.
+            if offer.channel == highest.channel
+                && highest.separate_auxiliary()
+                && !offer.separate_auxiliary()
+            {
+                return;
+            }
+            if generation == current && offer != *highest {
+                // A lost full offer can arrive after its compatibility copy.
+                // Only adding addresses is allowed at the same generation;
+                // changing any already accepted address still requires a revision.
+                let extension = offer.routes.len() > highest.routes.len()
+                    && highest.routes.iter().all(|old| offer.routes.contains(old));
+                if !extension {
+                    return;
+                }
             }
         }
         // Identical offers retry a failed/expired route. A conflicting address
@@ -148,12 +193,35 @@ impl PinnedRoute {
         {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        // The first probe after readiness teaches the return route before this
-        // address is advertised. Older peers retain their ordinary fallback.
-        self.probe();
+        // Teach old relays the exact return child once, before publication.
+        // Wait for its echo (with bounded retry) so immediate media does not
+        // collide with these padded bootstrap cells in the short source queue.
+        self.probe_echo.store(false, Ordering::Release);
+        self.probe_datagram();
+        let mut next_probe = tokio::time::Instant::now() + Duration::from_millis(250);
+        while !self.probe_echo.load(Ordering::Acquire) && tokio::time::Instant::now() < deadline {
+            if tokio::time::Instant::now() >= next_probe {
+                self.probe_datagram();
+                next_probe += Duration::from_millis(250);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     fn probe(&self) {
+        // Steady-state keepalive is call control, not a media datagram. Reliable
+        // cells preserve the learned return carrier without occupying the
+        // audio/video/screen child or labelling any role on a relay's wire.
+        let mut body = self.cookie.to_vec();
+        body.extend_from_slice(veil_anonymity::circuit_data::CIRCUIT_PROBE_MAGIC);
+        let _ = self.services.send_circuit_cell_on_local_lane_detailed(
+            &self.circuit,
+            &body,
+            veil_session::LOCAL_SIGNALING_LANE,
+        );
+    }
+
+    fn probe_datagram(&self) {
         let _ = self
             .services
             .request_local_circuit_datagram(&self.circuit, self.local_datagram_lane);
@@ -243,8 +311,10 @@ pub(crate) struct MediaRoutes {
     closed: AtomicBool,
     screen_active: AtomicBool,
     control_active: AtomicBool,
-    incoming: Mutex<([Option<ReceiveAddress>; 2], u64)>,
+    incoming: Mutex<([Option<ReceiveAddress>; 4], u64)>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    #[cfg(test)]
+    legacy_peer: AtomicBool,
 }
 
 impl MediaRoutes {
@@ -265,8 +335,10 @@ impl MediaRoutes {
             closed: AtomicBool::new(false),
             screen_active: AtomicBool::new(false),
             control_active: AtomicBool::new(false),
-            incoming: Mutex::new(([None, None], 0)),
+            incoming: Mutex::new((std::array::from_fn(|_| None), 0)),
             tasks: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            legacy_peer: AtomicBool::new(false),
         })
     }
 
@@ -275,16 +347,55 @@ impl MediaRoutes {
         if !tasks.is_empty() || self.closed.load(Ordering::Acquire) {
             return;
         }
-        for plane in 0..2 {
+        let receive_planes = self.receive_plane_count();
+        for plane in 0..receive_planes {
             let routes = Arc::clone(self);
             tasks.push(runtime.spawn(routes.run_plane(plane)));
         }
-        let routes = Arc::clone(self);
-        tasks.push(runtime.spawn(routes.run_auxiliary_sender(2)));
-        let routes = Arc::clone(self);
-        tasks.push(runtime.spawn(routes.run_auxiliary_sender(3)));
+        for plane in receive_planes..4 {
+            let routes = Arc::clone(self);
+            tasks.push(runtime.spawn(routes.run_auxiliary_sender(plane)));
+        }
         let routes = Arc::clone(self);
         tasks.push(runtime.spawn(routes.advertise()));
+    }
+
+    fn receive_plane_count(&self) -> usize {
+        #[cfg(test)]
+        if self.legacy_peer.load(Ordering::Acquire) {
+            return 2;
+        }
+        4
+    }
+
+    fn outgoing_active(&self, i: usize) -> bool {
+        match i {
+            0 | 1 => true,
+            2 => self.screen_active.load(Ordering::Acquire),
+            3 => self.control_active.load(Ordering::Acquire),
+            _ => unreachable!("unknown local producer"),
+        }
+    }
+
+    fn advertisement_offers(&self, offer: Offer) -> Vec<Offer> {
+        if self.receive_plane_count() == 2 {
+            return vec![offer.legacy()];
+        }
+        let peer_extended = self
+            .offers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .highest
+            .as_ref()
+            .is_some_and(Offer::separate_auxiliary);
+        if offer.separate_auxiliary() && !peer_extended {
+            // Existing peers reject extra route IDs but swallow VMR1 control
+            // before media decoding. The companion has their exact old shape.
+            let legacy = offer.legacy();
+            vec![offer, legacy]
+        } else {
+            vec![offer]
+        }
     }
 
     pub(crate) fn accept_control(&self, body: &[u8]) {
@@ -294,6 +405,10 @@ impl MediaRoutes {
         let Some(offer) = Offer::decode(body) else {
             return;
         };
+        #[cfg(test)]
+        if self.legacy_peer.load(Ordering::Acquire) && offer.separate_auxiliary() {
+            return;
+        }
         let mut offers = self.offers.lock().unwrap_or_else(|p| p.into_inner());
         if !self.closed.load(Ordering::Acquire) {
             offers.accept(offer);
@@ -411,10 +526,7 @@ impl MediaRoutes {
             .highest
             .clone();
         if let Some(offer) = offer
-            && let Some(address) = offer
-                .routes
-                .iter()
-                .find(|r| r.plane as usize == receive_plane_index(i))
+            && let Some(address) = offer.receive_address(i)
         {
             let repair_generation = self.repair_generation[i].load(Ordering::Acquire);
             let ready =
@@ -476,7 +588,9 @@ impl MediaRoutes {
             if self.closed.load(Ordering::Acquire) {
                 break;
             }
-            self.refresh_outgoing(i).await;
+            if self.outgoing_active(i) {
+                self.refresh_outgoing(i).await;
+            }
             retired.retain(|(since, _)| since.elapsed() < PRIVATE_RETIRE_GRACE);
             if !incoming.as_ref().is_some_and(PinnedRoute::is_live) {
                 for relay in core.services.local_published_rendezvous_relays() {
@@ -531,14 +645,16 @@ impl MediaRoutes {
                     routes: published.0.iter().flatten().cloned().collect(),
                 }
             };
-            if let Some(sealed) = self
-                .cipher
-                .seal_on_plane(LocalMediaPlane::Control, &offer.encode())
-            {
-                let sealed = sealed.with_local_deadline(
-                    tokio::time::Instant::now() + veil_proto::ipc::LOCAL_SHORT_DATAGRAM_MAX_AGE,
-                );
-                let _ = self.send(LocalMediaPlane::Control, &sealed).await;
+            for offer in self.advertisement_offers(offer) {
+                if let Some(sealed) = self
+                    .cipher
+                    .seal_on_plane(LocalMediaPlane::Control, &offer.encode())
+                {
+                    let sealed = sealed.with_local_deadline(
+                        tokio::time::Instant::now() + veil_proto::ipc::LOCAL_SHORT_DATAGRAM_MAX_AGE,
+                    );
+                    let _ = self.send(LocalMediaPlane::Control, &sealed).await;
+                }
             }
         }
     }
@@ -553,9 +669,9 @@ fn plane_index(plane: LocalMediaPlane) -> usize {
     }
 }
 
-// Existing peers publish two opaque receive addresses. Screen uses the
-// secondary address; feedback/control uses the primary address, through its
-// own outgoing circuit and lock. This adds no public address or role marker.
+// Compatibility with peers publishing only the original two opaque receive
+// addresses. Upgraded peers use the exact source's private address instead.
+// Every address/plane remains inside the call AEAD, never a public role marker.
 fn receive_plane_index(source: usize) -> usize {
     match source {
         0 | 3 => 0,
@@ -619,6 +735,11 @@ pub(crate) struct RouteSnapshot {
 
 #[cfg(all(test, feature = "test-low-difficulty"))]
 impl MediaRoutes {
+    pub(crate) fn emulate_legacy_peer_for_test(&self) {
+        assert!(self.tasks.lock().unwrap().is_empty());
+        self.legacy_peer.store(true, Ordering::Release);
+    }
+
     pub(crate) fn on_node_for_test(
         me: [u8; 32],
         peer: [u8; 32],
@@ -723,6 +844,86 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn extended_offer(channel: u64, revision: u64) -> Offer {
+        let mut result = offer(channel, revision);
+        for plane in 2..4 {
+            let mut route = result.routes[0].clone();
+            route.plane = plane;
+            route.cookie = [plane + 1; 16];
+            result.routes.push(route);
+        }
+        result
+    }
+
+    #[test]
+    fn extended_offers_bind_four_distinct_receive_planes_and_keep_legacy_bytes() {
+        let full = extended_offer(1, 1);
+        assert_eq!(full.encode().len(), 345);
+        assert_eq!(Offer::decode(&full.encode()), Some(full.clone()));
+        assert_eq!(full.legacy().encode(), offer(1, 1).encode());
+        for i in 0..4 {
+            assert_eq!(full.receive_address(i).unwrap().plane as usize, i);
+        }
+        assert_eq!(full.legacy().receive_address(3).unwrap().plane, 0);
+        assert_eq!(full.legacy().receive_address(2).unwrap().plane, 1);
+        let mut partial = full.clone();
+        partial.routes.remove(2); // screen address is not ready yet
+        assert_eq!(Offer::decode(&partial.encode()), Some(partial.clone()));
+        assert!(partial.receive_address(2).is_none());
+        assert_eq!(partial.receive_address(3).unwrap().plane, 3);
+        let mut invalid = full.clone();
+        invalid.routes[3].plane = 4;
+        assert!(Offer::decode(&invalid.encode()).is_none());
+        invalid.routes[3].plane = 2;
+        assert!(Offer::decode(&invalid.encode()).is_none());
+        let mut primary_missing = full;
+        primary_missing.routes.remove(0);
+        assert!(Offer::decode(&primary_missing.encode()).is_none());
+    }
+
+    #[test]
+    fn compatibility_reordering_cannot_collapse_extended_routes_or_change_addresses() {
+        let mut inbox = OfferInbox::default();
+        let full = extended_offer(1, 1);
+        inbox.accept(full.legacy());
+        inbox.accept(full.clone());
+        assert!(inbox.is_current(&full));
+        inbox.accept(full.legacy());
+        inbox.accept(offer(1, 100)); // compatibility does not undo negotiated isolation
+        assert!(inbox.is_current(&full));
+        let next = extended_offer(1, 2);
+        inbox.accept(next.clone());
+        inbox.accept(full);
+        assert!(inbox.is_current(&next));
+        let mut conflict = next.clone();
+        conflict.routes[3].cookie = [99; 16];
+        inbox.accept(conflict);
+        assert!(inbox.is_current(&next));
+        let legacy_restart = offer(2, 1);
+        inbox.accept(legacy_restart.clone());
+        assert!(inbox.is_current(&legacy_restart));
+        let mut conflict_extension = extended_offer(2, 1);
+        conflict_extension.routes[0].cookie = [99; 16];
+        inbox.accept(conflict_extension);
+        assert!(inbox.is_current(&legacy_restart));
+    }
+
+    #[tokio::test]
+    async fn compatibility_advertisement_stops_after_peer_proves_extended_decoder() {
+        let peer = [0xc1; 32];
+        let cipher = Arc::new(crate::media::cipher_for_test(&peer, &[1; 32], &[2; 32]).unwrap());
+        let (_dir, mut runtime, routes) = fixture(peer, 1, cipher).await;
+        let full = extended_offer(1, 1);
+        assert_eq!(
+            routes.advertisement_offers(full.clone()),
+            vec![full.clone(), full.legacy()]
+        );
+        routes.accept_control(&full.encode());
+        assert_eq!(routes.advertisement_offers(full.clone()), vec![full]);
+        routes.stop();
+        runtime.stop().await.unwrap();
     }
 
     #[test]
