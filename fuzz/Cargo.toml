@@ -57,3 +57,10 @@ name = "fuzz_proto_decode"
 path = "fuzz_targets/fuzz_proto_decode.rs"
 test = false
 doc = false
+
+# This is a separate workspace: it must use the same extended transport API
+# as veilcore, rather than silently resolving registry-only implementations.
+[patch.crates-io]
+quinn = { path = "../third_party/quinn" }
+quinn-proto = { path = "../third_party/quinn-proto" }
+quinn-udp = { path = "../third_party/quinn-udp" }
