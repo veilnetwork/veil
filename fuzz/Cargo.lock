@@ -2742,6 +2742,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",
@@ -3003,7 +3004,7 @@ dependencies = [
 
 [[package]]
 name = "veil-abuse"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "blake3",
  "log",
@@ -3016,11 +3017,11 @@ dependencies = [
 
 [[package]]
 name = "veil-adaptive"
-version = "0.11.39"
+version = "0.11.40"
 
 [[package]]
 name = "veil-anonymity"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "base64",
  "blake3",
@@ -3038,7 +3039,7 @@ dependencies = [
 
 [[package]]
 name = "veil-anycast"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "base64",
  "blake3",
@@ -3052,7 +3053,7 @@ dependencies = [
 
 [[package]]
 name = "veil-app"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "base64",
  "blake3",
@@ -3070,7 +3071,7 @@ dependencies = [
 
 [[package]]
 name = "veil-bloom"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "blake3",
  "thiserror 2.0.19",
@@ -3078,7 +3079,7 @@ dependencies = [
 
 [[package]]
 name = "veil-bootstrap"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "argon2",
  "base64",
@@ -3104,11 +3105,11 @@ dependencies = [
 
 [[package]]
 name = "veil-bufpool"
-version = "0.11.39"
+version = "0.11.40"
 
 [[package]]
 name = "veil-cfg"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "base64",
  "blake3",
@@ -3133,7 +3134,7 @@ dependencies = [
 
 [[package]]
 name = "veil-congestion"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "tokio",
  "veil-cfg",
@@ -3141,7 +3142,7 @@ dependencies = [
 
 [[package]]
 name = "veil-crypto"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "base64",
  "blake3",
@@ -3166,7 +3167,7 @@ dependencies = [
 
 [[package]]
 name = "veil-dht"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "base64",
  "blake3",
@@ -3189,7 +3190,7 @@ dependencies = [
 
 [[package]]
 name = "veil-discovery"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "base64",
  "blake3",
@@ -3210,7 +3211,7 @@ dependencies = [
 
 [[package]]
 name = "veil-dispatcher"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "base64",
  "blake3",
@@ -3255,14 +3256,14 @@ dependencies = [
 
 [[package]]
 name = "veil-dispatcher-state"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "veil-e2e"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "argon2",
  "base64",
@@ -3283,7 +3284,7 @@ dependencies = [
 
 [[package]]
 name = "veil-error"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "base64",
  "serde_json",
@@ -3293,7 +3294,7 @@ dependencies = [
 
 [[package]]
 name = "veil-gateway"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "log",
  "rand_core 0.6.4",
@@ -3306,7 +3307,7 @@ dependencies = [
 
 [[package]]
 name = "veil-identity"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "argon2",
  "async-trait",
@@ -3335,7 +3336,7 @@ dependencies = [
 
 [[package]]
 name = "veil-invite"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "blake3",
  "ciborium",
@@ -3348,9 +3349,10 @@ dependencies = [
 
 [[package]]
 name = "veil-ipc"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "blake3",
+ "futures",
  "log",
  "rand_core 0.6.4",
  "thiserror 2.0.19",
@@ -3373,7 +3375,7 @@ dependencies = [
 
 [[package]]
 name = "veil-local-transport"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "libc",
  "rand_core 0.6.4",
@@ -3385,7 +3387,7 @@ dependencies = [
 
 [[package]]
 name = "veil-mailbox"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -3399,7 +3401,7 @@ dependencies = [
 
 [[package]]
 name = "veil-mainline"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "blake3",
  "log",
@@ -3409,11 +3411,11 @@ dependencies = [
 
 [[package]]
 name = "veil-memory"
-version = "0.11.39"
+version = "0.11.40"
 
 [[package]]
 name = "veil-mesh"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "base64",
  "blake3",
@@ -3434,7 +3436,7 @@ dependencies = [
 
 [[package]]
 name = "veil-nat"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "blake3",
  "quinn",
@@ -3445,7 +3447,7 @@ dependencies = [
 
 [[package]]
 name = "veil-node-runtime"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "argon2",
  "async-trait",
@@ -3529,7 +3531,7 @@ dependencies = [
 
 [[package]]
 name = "veil-nostr"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "blake3",
  "futures",
@@ -3546,7 +3548,7 @@ dependencies = [
 
 [[package]]
 name = "veil-obfs4"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "chacha20poly1305",
  "curve25519-elligator2",
@@ -3563,7 +3565,7 @@ dependencies = [
 
 [[package]]
 name = "veil-observability"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "log",
  "veil-abuse",
@@ -3582,14 +3584,14 @@ dependencies = [
 
 [[package]]
 name = "veil-pending-ack"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "veil-proto",
 ]
 
 [[package]]
 name = "veil-pex"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "base64",
  "blake3",
@@ -3604,7 +3606,7 @@ dependencies = [
 
 [[package]]
 name = "veil-proto"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "base64",
  "blake3",
@@ -3623,7 +3625,7 @@ dependencies = [
 
 [[package]]
 name = "veil-proxy"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "async-trait",
  "log",
@@ -3635,7 +3637,7 @@ dependencies = [
 
 [[package]]
 name = "veil-push"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "async-trait",
  "base64",
@@ -3650,7 +3652,7 @@ dependencies = [
 
 [[package]]
 name = "veil-ratchet"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "chacha20poly1305",
  "hkdf",
@@ -3665,7 +3667,7 @@ dependencies = [
 
 [[package]]
 name = "veil-reputation"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "veil-cfg",
  "veil-types",
@@ -3673,7 +3675,7 @@ dependencies = [
 
 [[package]]
 name = "veil-routing"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -3689,7 +3691,7 @@ dependencies = [
 
 [[package]]
 name = "veil-session"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "base64",
  "blake3",
@@ -3700,10 +3702,12 @@ dependencies = [
  "rand 0.8.7",
  "rand_core 0.6.4",
  "serde",
+ "sha2",
  "subtle",
  "thiserror 2.0.19",
  "tokio",
  "veil-abuse",
+ "veil-anonymity",
  "veil-bufpool",
  "veil-cfg",
  "veil-crypto",
@@ -3722,10 +3726,11 @@ dependencies = [
 
 [[package]]
 name = "veil-transport"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "futures",
  "hickory-resolver",
+ "libc",
  "log",
  "quinn",
  "rand 0.9.5",
@@ -3749,7 +3754,7 @@ dependencies = [
 
 [[package]]
 name = "veil-types"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "base64",
  "serde",
@@ -3757,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "veil-udp-obfs"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "chacha20poly1305",
  "hkdf",
@@ -3770,7 +3775,7 @@ dependencies = [
 
 [[package]]
 name = "veil-update"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "base64",
  "blake3",
@@ -3793,7 +3798,7 @@ dependencies = [
 
 [[package]]
 name = "veil-util"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "getrandom 0.2.17",
  "libc",
@@ -3805,7 +3810,7 @@ dependencies = [
 
 [[package]]
 name = "veil-webtunnel"
-version = "0.11.39"
+version = "0.11.40"
 dependencies = [
  "async-trait",
  "base64",
