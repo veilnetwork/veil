@@ -46,8 +46,12 @@ async fn chain(rotate: bool, ordered: bool, forwards: bool) {
     let keys = [[0x44; 32], [0x66; 32]];
     let receiver_key = [0x55; 32];
     let cell_bytes = CircuitCellBytes::new(4096).unwrap();
-    // Independent opaque IDs sample both bounded shards. They carry no roles.
-    let circuits: Vec<u32> = (100..116).collect();
+    // Two installed circuits need distinct live generic connections, without
+    // exceeding the fixed per-neighbor quota. The previous bucket allocator
+    // needed sixteen IDs to sample its two hashes; ownership no longer hashes
+    // distinct installed circuits together. Capacity rejection is covered by
+    // the channel-assignment saturation tests.
+    let circuits: Vec<u32> = (100..102).collect();
     let mut dispatchers = Vec::new();
     let mut probes = Vec::new();
     let mut outboxes = std::collections::HashMap::new();

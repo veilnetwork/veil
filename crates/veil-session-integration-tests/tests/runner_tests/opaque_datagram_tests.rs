@@ -376,6 +376,9 @@ async fn runner_channels_with_partial_read(
     }
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         let probe_started = tokio::time::Instant::now();
+        let mut last_received = [None; 2];
+        let mut rekey_boundary = [None; 2];
+        let mut received_after_rekey = [0usize; 2];
         // Exercise BOTH queue selections and both directions through actual
         // SessionRunners, QUIC DATAGRAM I/O, frame parsing and app dispatch.
         for direction in 0..2 {
@@ -394,6 +397,9 @@ async fn runner_channels_with_partial_read(
             } else {
                 16
             } {
+                if rotate && diagnostics[direction].rekeys() > 0 {
+                    rekey_boundary[direction].get_or_insert(seq + 1);
+                }
                 let data = vec![seq as u8; if seq % 2 == 0 { 160 } else { 1500 }];
                 let payload = AppRtDataPayload {
                     src_app_id: [0xb0; 32],
@@ -443,15 +449,52 @@ async fn runner_channels_with_partial_read(
                         other => panic!("unexpected reverse dispatch {other:?}"),
                     }
                 }
-                match receive_after_warmup(&mut receivers[1 - direction]).await {
+                // A credential transition may drop an unreliable datagram.
+                // Keep the producer alive, then require fresh delivery after
+                // the new generation instead of waiting forever for a lost cell.
+                let received = if rotate {
+                    match tokio::time::timeout(
+                        Duration::from_millis(100),
+                        receive_after_warmup(&mut receivers[1 - direction]),
+                    )
+                    .await
+                    {
+                        Ok(message) => message,
+                        Err(_) => continue,
+                    }
+                } else {
+                    receive_after_warmup(&mut receivers[1 - direction]).await
+                };
+                match received {
                     AppMessage::RtData {
                         src_node_id,
                         payload,
                         ..
                     } => {
                         assert_eq!(src_node_id, node_ids[direction]);
-                        assert_eq!(payload.seq, seq);
-                        assert_eq!(payload.payload, data);
+                        if rotate {
+                            assert!(payload.seq <= seq, "unproduced sequence");
+                            assert!(
+                                last_received[direction].is_none_or(|last| payload.seq > last),
+                                "duplicate or reordered cell"
+                            );
+                            last_received[direction] = Some(payload.seq);
+                            assert_eq!(
+                                payload.payload,
+                                vec![
+                                    payload.seq as u8;
+                                    if payload.seq % 2 == 0 { 160 } else { 1500 }
+                                ]
+                            );
+                            if rekey_boundary[direction]
+                                .is_some_and(|boundary| payload.seq >= boundary)
+                            {
+                                received_after_rekey[direction] += 1;
+                            }
+                        } else {
+                            assert_eq!(payload.seq, seq);
+                            assert_eq!(payload.payload, data);
+                        }
                     }
                     other => panic!("unexpected dispatched message {other:?}"),
                 }
@@ -463,7 +506,9 @@ async fn runner_channels_with_partial_read(
                         && diagnostics[direction].sent_this_generation(0) >= 8
                         && diagnostics[direction].sent_this_generation(2) >= 8
                         && diagnostics[direction].sent_this_generation(3) >= 8
-                        && (!rotate || diagnostics[direction].rekeys() >= 1)
+                        && (!rotate
+                            || (diagnostics[direction].rekeys() >= 1
+                                && received_after_rekey[direction] >= 8))
                     {
                         if idle_probe.is_some() && probe_started.elapsed() < Duration::from_secs(2)
                         {
@@ -514,6 +559,14 @@ async fn runner_channels_with_partial_read(
                     }
                 }
             }
+        }
+        if rotate {
+            assert!(
+                received_after_rekey
+                    .into_iter()
+                    .all(|received| received >= 8),
+                "new credentials did not restore bidirectional delivery"
+            );
         }
     })
     .await;
