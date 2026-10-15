@@ -23,6 +23,93 @@ use veil_transport::{
     promote_punched_quic,
 };
 
+#[test]
+fn independent_secondary_retry_preserves_deadline_and_other_sources_progress() {
+    use crate::frame_outbox::FrameEnvelope;
+    use crate::priority_queue::{HeadAdmission, PriorityQueue};
+    use veil_proto::priority::{BACKGROUND, BULK, INTERACTIVE, REALTIME};
+    let mut pq = PriorityQueue::with_default_weights();
+    let mut envelope = FrameEnvelope::from((
+        BULK,
+        veil_bufpool::pooled_shared_from_vec(b"video".to_vec()),
+    ));
+    envelope.queued_at -= Duration::from_millis(20);
+    envelope.expires_at = Some(std::time::Instant::now() + Duration::from_millis(40));
+    let age = envelope.queued_at;
+    let deadline = envelope.expires_at;
+    assert!(super::independent_secondary_retry(&envelope, true));
+    assert!(!super::independent_secondary_retry(&envelope, false));
+    struct Transit;
+    impl veil_anonymity::circuit_carrier::DatagramCarrier for Transit {
+        fn try_send(
+            &self,
+            _: &[u8; 32],
+            _: &[u8],
+            _: &mut dyn FnMut(usize) -> bool,
+        ) -> veil_anonymity::circuit_carrier::CarrierSend {
+            panic!("retry eligibility cannot send transit packets")
+        }
+    }
+    envelope.carrier = Some(std::sync::Weak::<Transit>::new());
+    assert!(!super::independent_secondary_retry(&envelope, true));
+    envelope.carrier = None;
+    for priority in [
+        REALTIME,
+        INTERACTIVE,
+        veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
+    ] {
+        envelope.frame.0 = priority;
+        assert!(!super::independent_secondary_retry(&envelope, true));
+    }
+    envelope.frame.0 = BACKGROUND;
+    assert!(super::independent_secondary_retry(&envelope, true));
+    envelope.expires_at = None;
+    assert!(!super::independent_secondary_retry(&envelope, true));
+    envelope.frame.0 = BULK;
+    envelope.expires_at = deadline;
+    let mut waiting = false;
+    let mut retry = None;
+    super::defer_local_datagram(&mut pq, envelope, &mut waiting, &mut retry);
+    assert!(waiting && retry.is_some());
+    assert!(retry.unwrap() <= deadline.unwrap());
+    for (priority, name) in [
+        (REALTIME, "audio"),
+        (INTERACTIVE, "transit"),
+        (BACKGROUND, "screen"),
+    ] {
+        pq.push_lossy(
+            priority,
+            veil_bufpool::pooled_shared_from_vec(name.as_bytes().to_vec()),
+        );
+    }
+    let mut progressed = Vec::new();
+    while let Some(frame) = pq.pop_admitted_envelope(|priority, _, _, _| {
+        if priority == BULK {
+            HeadAdmission::DeferSource
+        } else {
+            HeadAdmission::Allow
+        }
+    }) {
+        progressed.push(frame.frame.0);
+    }
+    progressed.sort_unstable();
+    assert_eq!(progressed, [REALTIME, INTERACTIVE, BACKGROUND]);
+    let mut restored = pq
+        .pop_admitted_envelope(|_, _, _, _| HeadAdmission::Allow)
+        .unwrap();
+    assert_eq!(&*restored.frame.1, b"video");
+    assert_eq!(restored.queued_at, age);
+    assert_eq!(restored.expires_at, deadline);
+    // Retry never grants another lifetime; stale video is still discarded.
+    restored.expires_at = Some(std::time::Instant::now() - Duration::from_millis(1));
+    super::defer_local_datagram(&mut pq, restored, &mut waiting, &mut retry);
+    assert!(
+        pq.pop_admitted_envelope(|_, _, _, _| HeadAdmission::Allow)
+            .is_none()
+    );
+    assert_eq!(pq.drops_total(), 1);
+}
+
 struct NeutralLink {
     enabled: Arc<AtomicBool>,
     blackout: Arc<AtomicBool>,
