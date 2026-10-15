@@ -495,4 +495,46 @@ extern "C" VeilMediaEngine* veil_media_test_adaptive_codec_create(
   }
   return e;
 }
+
+// Optional framing experiment for the owned relay fixture. This changes only
+// the stand's video controller/pacer; it sends no role or priority to Veil.
+extern "C" VeilMediaEngine* veil_media_test_dual_overhead_codec_create(
+    uint64_t chan, const uint8_t local[32], const uint8_t peer[32],
+    int audio_overhead, int video_overhead) {
+  if (video_overhead < 1 || video_overhead > 4096) return nullptr;
+  auto* e = veil_media_test_adaptive_codec_create(chan, local, peer, audio_overhead);
+  if (!e) return nullptr;
+  if (!run_on(e->ws->video_worker_tq.get(), [&] {
+        auto* controller = e->ws->video_call->GetTransportControllerSend();
+        webrtc::NetworkRoute route;
+        route.connected = true;
+        route.packet_overhead = video_overhead;
+        controller->OnNetworkRouteChanged("opaque", route);
+        controller->IncludeOverheadInPacedSender();
+      })) {
+    veil_media_engine_destroy(e);
+    return nullptr;
+  }
+  return e;
+}
+
+extern "C" int veil_media_test_video_transport_overhead(VeilMediaEngine* e) {
+  if (!e || !e->ws || !e->ws->video_call) return -1;
+  int bytes = -1;
+  if (!run_on(e->ws->video_worker_tq.get(), [&] {
+        bytes = e->ws->video_call->GetTransportControllerSend()
+                    ->GetTransportOverhead().bytes<int>();
+      })) return -1;
+  return bytes;
+}
+
+extern "C" int veil_media_test_audio_transport_overhead(VeilMediaEngine* e) {
+  if (!e || !e->ws || !e->ws->call) return -1;
+  int bytes = -1;
+  if (!run_on(e->ws->worker_tq.get(), [&] {
+        bytes = e->ws->call->GetTransportControllerSend()
+                    ->GetTransportOverhead().bytes<int>();
+      })) return -1;
+  return bytes;
+}
 #pragma GCC visibility pop
