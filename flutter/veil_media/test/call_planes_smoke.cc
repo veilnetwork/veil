@@ -27,6 +27,10 @@ extern "C" int veil_media_test_group_emit_rtcp(VeilGroupMediaEngine*);
 extern "C" int veil_media_test_group_fanout_packet(VeilGroupMediaEngine*, int);
 extern "C" int veil_media_test_video_bandwidth(VeilMediaEngine*);
 extern "C" int veil_media_test_audio_bandwidth();
+extern "C" VeilMediaEngine* veil_media_test_dual_overhead_codec_create(
+    uint64_t, const uint8_t*, const uint8_t*, int, int);
+extern "C" int veil_media_test_video_transport_overhead(VeilMediaEngine*);
+extern "C" int veil_media_test_audio_transport_overhead(VeilMediaEngine*);
 extern "C" int veil_media_test_direct_packet(VeilMediaEngine*, int);
 extern "C" uint64_t veil_media_test_direct_encoded_frames(VeilMediaEngine*);
 extern "C" int veil_media_test_pause_with_held_video_worker(VeilMediaEngine*, VeilGroupMediaEngine*);
@@ -274,6 +278,22 @@ static void wait_playout(VeilGroupMediaEngine* e, uint64_t reports, uint64_t del
   if (reports) assert(group_stat(e, "audio_playout_ms") == delay);
 }
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--dual-framing") == 0) {
+    uint8_t local[32] = {0x75}, peer[32] = {0x76};
+    setenv("VEIL_MEDIA_TEST_VIDEO", "1", 1);
+    std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(
+        veil_media_test_dual_overhead_codec_create(99, local, peer, 509, 536),
+        veil_media_engine_destroy);
+    assert(e);
+    assert(veil_media_test_audio_transport_overhead(e.get()) == 509);
+    assert(veil_media_test_video_transport_overhead(e.get()) == 536);
+    assert(veil_media_engine_start_video(e.get(), 1, 1, 150, 15) == VEIL_MEDIA_OK);
+    // Stream creation/configuration must retain both independent route models.
+    assert(veil_media_test_audio_transport_overhead(e.get()) == 509);
+    assert(veil_media_test_video_transport_overhead(e.get()) == 536);
+    std::fputs("independent controllers retain audio=509 video=536 framing\n", stderr);
+    return 0;
+  }
   const bool adaptive_audio = argc == 2 &&
       std::strcmp(argv[1], "--adaptive-audio") == 0;
   if (argc != 1 && !adaptive_audio &&

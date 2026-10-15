@@ -5,8 +5,80 @@
 #include "api/environment/environment_factory.h"
 #include "bounded_audio_encoder.h"
 #include "modules/audio_coding/audio_network_adaptor/config.pb.h"
+#include "modules/rtp_rtcp/include/rtp_header_extension_map.h"
+#include "modules/rtp_rtcp/source/rtp_header_extensions.h"
+#include "modules/rtp_rtcp/source/rtp_packet.h"
 #include "system_wrappers/include/clock.h"
 #include "third_party/opus/src/include/opus.h"
+
+static int check_framing_budget() {
+  webrtc::RtpHeaderExtensionMap extensions;
+  if (!extensions.Register<webrtc::TransportSequenceNumber>(
+          webrtc::RtpHeaderExtensionId(1))) return 20;
+  webrtc::RtpPacket rtp(&extensions);
+  if (!rtp.SetExtension<webrtc::TransportSequenceNumber>(0)) return 21;
+  // Characterize actual allocation/duration behavior, not a production
+  // controller policy. Raising its ceiling alone failed mixed-call quality.
+  for (const auto& profile : std::array<std::array<int, 3>, 4>{{
+           {209, 160000, 20}, {360, 160000, 40},
+           {509, 160000, 60}, {509, 183736, 40}}}) {
+    const int route_overhead = profile[0];
+    webrtc::SimulatedClock clock(0);
+    const auto env = webrtc::CreateEnvironment(&clock);
+    auto factory = webrtc::make_ref_counted<veil_media::BoundedAudioEncoderFactory>();
+    auto encoder = factory->Create(env,
+        webrtc::SdpAudioFormat("opus", 48000, 2,
+            {{"minptime", "20"}, {"maxptime", "60"}, {"stereo", "0"},
+             {"useinbandfec", "1"}, {"usedtx", "1"}}), {.payload_type = 111});
+    if (!encoder) return 22;
+    encoder->SetReceiverFrameLengthRange(20, 60);
+    webrtc::audio_network_adaptor::config::ControllerManager manager;
+    auto* frames = manager.add_controllers()->mutable_frame_length_controller_v2();
+    frames->set_min_payload_bitrate_bps(16000);
+    frames->set_use_slow_adaptation(false);
+    manager.add_controllers()->mutable_bitrate_controller();
+    if (!encoder->EnableAudioNetworkAdaptor(manager.SerializeAsString())) return 23;
+    const size_t overhead = route_overhead + rtp.headers_size();
+    encoder->OnReceivedOverhead(overhead);
+    const int ceiling = profile[1];
+    const int healthy_duration = profile[2];
+    std::array<int16_t, 480> pcm{};
+    uint32_t timestamp = 0;
+    int phase = 0;
+    for (int budget : std::array{ceiling, 64000, ceiling}) {
+      const int expected = phase == 1 ? 60 : healthy_duration;
+      int verified_packets = 0;
+      for (int block = 0; block < 600; ++block) {
+        webrtc::BitrateAllocationUpdate update;
+        update.target_bitrate = webrtc::DataRate::BitsPerSec(budget);
+        encoder->OnReceivedUplinkAllocation(update);
+        webrtc::Buffer packet;
+        const auto info = encoder->Encode(timestamp, pcm, &packet);
+        if (encoder->GetTargetBitrate() < 16000 ||
+            encoder->GetTargetBitrate() > 32000) return 24;
+        if (block >= 400 && phase != 1 && route_overhead != 209 &&
+            encoder->GetTargetBitrate() != 32000) return 27;
+        if (block >= 400 && info.encoded_bytes > 0) {
+          const int actual = opus_packet_get_nb_samples(packet.data(), packet.size(), 48000) / 48;
+          if (actual != expected) {
+            std::fprintf(stderr,
+                "framing=%d RTP=%zu ceiling=%d phase=%d: Opus packet=%d expected=%d ms\n",
+                route_overhead, rtp.headers_size(), ceiling, phase, actual, expected);
+            return 25;
+          }
+          ++verified_packets;
+        }
+        timestamp += 480;
+        clock.AdvanceTimeMilliseconds(10);
+      }
+      if (verified_packets < 2) return 26;
+      ++phase;
+    }
+    std::printf("ok: framing=%d RTP=%zu ceiling=%d, actual Opus %d/60/%d ms\n",
+        route_overhead, rtp.headers_size(), ceiling, healthy_duration, healthy_duration);
+  }
+  return 0;
+}
 
 // Real Opus/ANA regression: check startup and every feedback transition, not
 // just the settled allocation. A future longer packet cannot justify lowering
@@ -89,4 +161,5 @@ int main() {
     }
     std::printf("ok: real Opus/ANA maxptime=%d, payload stays 16–32 kbit/s\n", maximum_ms);
   }
+  return check_framing_budget();
 }
