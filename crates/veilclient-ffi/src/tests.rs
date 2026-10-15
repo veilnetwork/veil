@@ -94,7 +94,12 @@ fn local_source_feedback_rejects_invalid_flags_and_unknown_handles() {
     for pressure in [2, 255] {
         let mut err = ptr::null_mut();
         let rc = unsafe {
-            veil_app_report_local_source_pressure(1usize as *mut VeilApp, pressure, 0, &mut err)
+            veil_app_report_local_source_pressure(
+                ptr::dangling_mut::<VeilApp>(),
+                pressure,
+                0,
+                &mut err,
+            )
         };
         assert_eq!(rc, VEIL_ERR_INVALID_ARG);
         assert!(!err.is_null());
@@ -109,8 +114,9 @@ fn local_source_feedback_rejects_invalid_flags_and_unknown_handles() {
         }
     }
     let mut err = ptr::null_mut();
-    let rc =
-        unsafe { veil_app_report_local_source_pressure(1usize as *mut VeilApp, 0, 0, &mut err) };
+    let rc = unsafe {
+        veil_app_report_local_source_pressure(ptr::dangling_mut::<VeilApp>(), 0, 0, &mut err)
+    };
     assert_eq!(rc, VEIL_ERR_INVALID_ARG);
     assert!(!err.is_null());
     unsafe {
