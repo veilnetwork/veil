@@ -91,9 +91,12 @@ pub struct CaptureEvent {
     pub family: u8,
     pub msg_type: u16,
     pub body_len: u32,
+    /// Actual full observed body length before clipping the preview. The
+    /// header length can still include the session AEAD tag on receive.
+    pub observed_body_len: usize,
     /// at most `CAPTURE_BODY_PREVIEW_LEN`
     /// bytes of the original frame body. When `body_truncated == true`
-    /// `body.len < body_len` — the full payload is NOT recoverable
+    /// `body.len < observed_body_len` — the full payload is NOT recoverable
     /// from the capture stream. This is intentional: debug-capture
     /// runs at hot-path frame dispatch and full-body cloning was
     /// 10 MB/s @ 10K pkt/s → ~600 MB/s broadcast amplification under
@@ -133,7 +136,7 @@ pub const CAPTURE_RATE_MAP_CAP: usize = 8_192;
 /// simple per-peer rate limiter for
 /// capture-event emission. One-second tumbling window. Returns
 /// `false` (drop the event) when a peer has hit
-/// [`CAPTURE_PER_PEER_EVENTS_PER_SEC`] in the current window;
+/// its configured budget (default [`CAPTURE_PER_PEER_EVENTS_PER_SEC`]) in the current window;
 /// otherwise increments the counter and returns `true`.
 ///
 /// **Why tumbling, not sliding window:** the limiter is a DoS
@@ -148,9 +151,15 @@ pub const CAPTURE_RATE_MAP_CAP: usize = 8_192;
 /// runs on the dispatcher's async hot path BUT only when capture
 /// is active (gated by `capture_active` atomic upstream); blocking
 /// for a HashMap update is sub-microsecond.
-#[derive(Default)]
 pub struct CaptureRateLimiter {
     inner: std::sync::Mutex<std::collections::HashMap<[u8; 32], CaptureRateState>>,
+    events_per_sec: u32,
+}
+
+impl Default for CaptureRateLimiter {
+    fn default() -> Self {
+        Self::with_limit(CAPTURE_PER_PEER_EVENTS_PER_SEC)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -162,6 +171,15 @@ struct CaptureRateState {
 impl CaptureRateLimiter {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Explicit diagnostic budget, clamped to 1–1,000 events/sec/peer.
+    /// Changes capture sampling only, never packet service or relay priority.
+    pub fn with_limit(events_per_sec: u32) -> Self {
+        Self {
+            inner: Default::default(),
+            events_per_sec: events_per_sec.clamp(1, 1000),
+        }
     }
 
     /// Check + increment. Returns `true` if caller may proceed
@@ -193,7 +211,7 @@ impl CaptureRateLimiter {
             entry.window_start = now;
             entry.count = 0;
         }
-        if entry.count >= CAPTURE_PER_PEER_EVENTS_PER_SEC {
+        if entry.count >= self.events_per_sec {
             return false;
         }
         entry.count += 1;
@@ -243,6 +261,7 @@ impl CaptureEvent {
             family,
             msg_type,
             body_len,
+            observed_body_len: full_body.len(),
             body,
             body_truncated: truncated,
             e2e_plaintext,
@@ -253,6 +272,24 @@ impl CaptureEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_observed_body_length_is_separate_from_session_wire_tag() {
+        let body = vec![0; 300];
+        let event = CaptureEvent::new_truncated(0, true, [0; 32], [0; 32], 3, 3, 316, &body, false);
+        assert_eq!(event.body_len, 316);
+        assert_eq!(event.observed_body_len, 300);
+        assert_eq!(event.body.len(), CAPTURE_BODY_PREVIEW_LEN);
+    }
+
+    #[test]
+    fn explicit_capture_budget_is_bounded_and_keeps_peer_windows_separate() {
+        let limiter = CaptureRateLimiter::with_limit(250);
+        assert_eq!((0..300).filter(|_| limiter.allow([1; 32])).count(), 250);
+        assert_eq!((0..300).filter(|_| limiter.allow([2; 32])).count(), 250);
+        let high = CaptureRateLimiter::with_limit(u32::MAX);
+        assert_eq!((0..1100).filter(|_| high.allow([1; 32])).count(), 1000);
+    }
 
     /// small body fits in the preview without
     /// truncation; `body_truncated` reflects this honestly.

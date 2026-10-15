@@ -369,6 +369,7 @@ fn handle_debug_capture(
                     body_len,
                     body_hex,
                     e2e_plaintext,
+                    ..
                 }) => {
                     let ts_secs = ts_us / 1_000_000;
                     let ts_us_part = ts_us % 1_000_000;
