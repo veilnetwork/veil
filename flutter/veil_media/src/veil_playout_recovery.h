@@ -6,7 +6,10 @@
 #include <atomic>
 #include <memory>
 #include "api/audio/audio_frame.h"
-#include "api/neteq/default_neteq_factory.h"
+#include "api/neteq/default_neteq_controller_factory.h"
+#include "api/neteq/neteq_factory.h"
+#include "api/neteq/tick_timer.h"
+#include "modules/audio_coding/neteq/neteq_impl.h"
 
 namespace veil_media {
 struct PlayoutRecoveryStats {
@@ -17,12 +20,19 @@ struct PlayoutRecoveryStats {
 class RecoveringNetEq final : public webrtc::NetEq {
  public:
   RecoveringNetEq(std::unique_ptr<webrtc::NetEq> inner,
-                 std::shared_ptr<PlayoutRecoveryStats> stats)
-      : inner_(std::move(inner)), stats_(std::move(stats)) {}
+                 std::shared_ptr<PlayoutRecoveryStats> stats,
+                 std::unique_ptr<webrtc::TickTimer> arrival_clock = nullptr)
+      : arrival_clock_(std::move(arrival_clock)), inner_(std::move(inner)),
+        stats_(std::move(stats)) {}
   int GetAudio(webrtc::AudioFrame* frame, bool* muted, int* rate,
                std::optional<Operation> action) override {
     bool silent = false;
     int sample_rate = 0;
+    // Packet arrival estimation measures real render callbacks, not the extra
+    // decoded blocks intentionally discarded within one callback. Otherwise
+    // catch-up invents network jitter and the estimator repeatedly rebuilds
+    // the backlog we just removed, including across an Opus DTX interval.
+    if (arrival_clock_) arrival_clock_->Increment();
     const int result = inner_->GetAudio(frame, &silent, &sample_rate, action);
     unsigned skipped = 0;
     bool fallback = false;
@@ -88,9 +98,25 @@ class RecoveringNetEq final : public webrtc::NetEq {
   void FlushBuffers() override { inner_->FlushBuffers(); }
   int SyncBufferSizeMs() const override { return inner_->SyncBufferSizeMs(); }
  private:
+  // Outlives the controller inside inner_. Its other NetEq dependencies keep
+  // their original timer for decoding/packet bookkeeping.
+  std::unique_ptr<webrtc::TickTimer> arrival_clock_;
   std::unique_ptr<webrtc::NetEq> inner_;
   std::shared_ptr<PlayoutRecoveryStats> stats_;
   webrtc::AudioFrame scratch_;
+};
+class ArrivalClockControllerFactory final : public webrtc::NetEqControllerFactory {
+ public:
+  explicit ArrivalClockControllerFactory(webrtc::TickTimer* clock) : clock_(clock) {}
+  std::unique_ptr<webrtc::NetEqController> Create(const webrtc::Environment& env,
+      const webrtc::NetEqController::Config& config) const override {
+    auto timed_config = config;
+    timed_config.tick_timer = clock_;
+    return base_.Create(env, timed_config);
+  }
+ private:
+  webrtc::TickTimer* clock_;
+  webrtc::DefaultNetEqControllerFactory base_;
 };
 class RecoveringNetEqFactory final : public webrtc::NetEqFactory {
  public:
@@ -99,11 +125,13 @@ class RecoveringNetEqFactory final : public webrtc::NetEqFactory {
   std::unique_ptr<webrtc::NetEq> Create(const webrtc::Environment& env,
       const webrtc::NetEq::Config& config,
       webrtc::scoped_refptr<webrtc::AudioDecoderFactory> decoder) const override {
-    return std::make_unique<RecoveringNetEq>(
-        base_.Create(env, config, std::move(decoder)), stats_);
+    auto clock = std::make_unique<webrtc::TickTimer>();
+    ArrivalClockControllerFactory controller(clock.get());
+    auto inner = std::make_unique<webrtc::NetEqImpl>(config,
+        webrtc::NetEqImpl::Dependencies(env, config, std::move(decoder), controller));
+    return std::make_unique<RecoveringNetEq>(std::move(inner), stats_, std::move(clock));
   }
  private:
-  webrtc::DefaultNetEqFactory base_;
   std::shared_ptr<PlayoutRecoveryStats> stats_;
 };
 }  // namespace veil_media

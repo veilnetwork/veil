@@ -354,9 +354,10 @@ static void verify_sender_restart() {
 
 static void verify_silence(bool after_jitter = false) {
   perfect_network = !after_jitter;
-  // The ordinary injected burst ends at four seconds. Start silence after
-  // that burst and require actual PCM recovery after ten healthy DTX seconds.
-  const int silent_tick = after_jitter ? 400 : 200;
+  // The burst ends at four seconds, and its final delayed packets arrive
+  // another 300 ms later. Start silence only after that tail has arrived:
+  // concealment in the injected burst is not a healthy-DTX regression.
+  const int silent_tick = after_jitter ? 500 : 200;
   const int resume_tick = silent_tick + 1000;
   const uint8_t local[32] = {1}, peer[32] = {2};
   source_channel = 200; receiver_channel = 300;
@@ -369,6 +370,7 @@ static void verify_silence(bool after_jitter = false) {
   uint64_t before_interruptions = 0, before_concealed = 0, max_age = 0;
   uint64_t max_silence_delay = 0, max_silence_buffer = 0;
   uint64_t max_recovered_delay = 0;
+  uint64_t dtx_start_discarded = 0, dtx_end_discarded = 0;
   int first_resumed_tick = -1;
   size_t silent_start_packets = 0, silent_end_packets = 0, recovered_ticks = 0;
   double max_lateness = 0;
@@ -388,12 +390,23 @@ static void verify_silence(bool after_jitter = false) {
     }
     if (tick == silent_tick) { before_interruptions = metric(receiver.get(), "audio_interruption_count"); before_concealed = metric(receiver.get(), "audio_concealed_samples"); silent_start_packets = sent_packets; }
     if (tick == resume_tick) silent_end_packets = sent_packets;
+    if (tick == silent_tick + 100)
+      dtx_start_discarded = metric(receiver.get(), "audio_latency_discarded_ms");
+    if (tick == resume_tick - 1)
+      dtx_end_discarded = metric(receiver.get(), "audio_latency_discarded_ms");
     if (tick % 10 == 0 && tick >= silent_tick + 100 && tick < resume_tick) {
       max_age = std::max(max_age, metric(receiver.get(), "audio_rx_native_age_ms"));
       max_silence_delay = std::max(max_silence_delay, metric(receiver.get(), "audio_delay_ms"));
       max_silence_buffer = std::max(max_silence_buffer, metric(receiver.get(), "audio_jb_ms"));
       if (tick >= resume_tick - 200)
         max_recovered_delay = std::max(max_recovered_delay, metric(receiver.get(), "audio_delay_ms"));
+    }
+    if (tick % 10 == 0 && std::getenv("VEIL_MEDIA_TEST_TRACE_SILENCE")) {
+      std::printf("{\"tick\":%d,\"buffer_ms\":%llu,\"recovery_count\":%llu,\"discarded_ms\":%llu,\"concealed_samples\":%llu}\n", tick,
+          (unsigned long long)metric(receiver.get(), "audio_jb_ms"),
+          (unsigned long long)metric(receiver.get(), "audio_latency_recovery_count"),
+          (unsigned long long)metric(receiver.get(), "audio_latency_discarded_ms"),
+          (unsigned long long)metric(receiver.get(), "audio_concealed_samples"));
     }
   }
   std::printf("{\"silence_rtp_packets\":%zu,\"max_silence_rx_age_ms\":%llu,\"interruption_delta\":%llu,\"concealed_delta\":%llu,\"max_tick_lateness_ms\":%.2f}\n", silent_end_packets - silent_start_packets, (unsigned long long)max_age, (unsigned long long)(metric(receiver.get(), "audio_interruption_count") - before_interruptions), (unsigned long long)(metric(receiver.get(), "audio_concealed_samples") - before_concealed), max_lateness);
@@ -408,6 +421,7 @@ static void verify_silence(bool after_jitter = false) {
   // gauge. Check real decoded PCM too, rather than trusting the gauges alone.
   if (!after_jitter) assert(max_silence_delay < 120);
   assert(max_recovered_delay < 120 && max_silence_buffer < 120);
+  assert(dtx_end_discarded == dtx_start_discarded); // no catch-up of healthy comfort noise
   assert(first_resumed_tick >= resume_tick && first_resumed_tick < resume_tick + 16);
   assert(recovered_ticks > 250); // real decoded tone resumes after silence
   assert(metric(receiver.get(), "audio_concealed_samples") == before_concealed);
