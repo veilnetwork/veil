@@ -301,7 +301,7 @@ struct RealtimeSender {
     // independently so its first send cannot hide a later producer's path.
     logged_send_kinds: [u8; LOCAL_TRACE_SLOTS],
     congestion_drops: u64,
-    admission_trace: [(u64, u64, u64, Option<std::time::Instant>); LOCAL_TRACE_SLOTS],
+    admission_trace: [(u64, u64, u64, u64, Option<std::time::Instant>); LOCAL_TRACE_SLOTS],
     admission_queue_max_us: [u64; LOCAL_TRACE_SLOTS],
     last_congestion_log: std::time::Instant,
     broken: bool,
@@ -320,7 +320,7 @@ impl RealtimeSender {
             tx,
             logged_send_kinds: [0; LOCAL_TRACE_SLOTS],
             congestion_drops: 0,
-            admission_trace: [(0, 0, 0, None); LOCAL_TRACE_SLOTS],
+            admission_trace: [(0, 0, 0, 0, None); LOCAL_TRACE_SLOTS],
             admission_queue_max_us: [0; LOCAL_TRACE_SLOTS],
             last_congestion_log: std::time::Instant::now(),
             broken: false,
@@ -349,11 +349,12 @@ impl RealtimeSender {
         match outcome {
             0 => entry.0 = entry.0.saturating_add(1),
             1 => entry.1 = entry.1.saturating_add(1),
-            _ => entry.2 = entry.2.saturating_add(1),
+            2 => entry.2 = entry.2.saturating_add(1),
+            _ => entry.3 = entry.3.saturating_add(1),
         }
         let now = std::time::Instant::now();
         if entry
-            .3
+            .4
             .is_some_and(|last| now.duration_since(last).as_secs() < 1)
         {
             return;
@@ -361,13 +362,13 @@ impl RealtimeSender {
         logger.info(
             "session.rt_trace.datagram_admission",
             format!(
-                "peer_id={} local_slot={priority} accepted={} buffer_drops={} bandwidth_drops={} queued_wire_bytes={} outbox_to_transport_max_us={max_age} independent={independent} {}",
-                hex_short(peer), entry.0, entry.1, entry.2,
+                "peer_id={} local_slot={priority} accepted={} buffer_drops={} bandwidth_drops={} capacity_deferrals={} queued_wire_bytes={} outbox_to_transport_max_us={max_age} independent={independent} {}",
+                hex_short(peer), entry.0, entry.1, entry.2, entry.3,
                 veil_transport::REALTIME_DATAGRAM_BUFFER_BYTES.saturating_sub(available),
                 self.handle.path_trace(),
             ),
         );
-        *entry = (0, 0, 0, Some(now));
+        *entry = (0, 0, 0, 0, Some(now));
     }
 }
 
@@ -536,9 +537,23 @@ fn local_primary_datagram_fits(wire_len: usize, available: usize) -> bool {
     wire_len <= available && local_datagram_backlog_fits(wire_len, available)
 }
 
-/// Keep already admitted ARQ DATA at the endpoint while its own child queue
-/// drains. The credit remains owned; media and neutral transit never opt in.
-fn defer_recoverable_datagram(
+fn independent_secondary_retry(
+    envelope: &crate::frame_outbox::FrameEnvelope,
+    independent: bool,
+) -> bool {
+    independent
+        && envelope.carrier.is_none()
+        && envelope.expires_at.is_some()
+        && matches!(
+            envelope.frame.0,
+            veil_proto::priority::BULK | veil_proto::priority::BACKGROUND
+        )
+}
+
+/// Retain the exact bounded local envelope while its own child queue drains.
+/// It keeps its original age/deadline and any owned credit. Other sources can
+/// run in this pass; retry on a timer without increasing the transport backlog.
+fn defer_local_datagram(
     pq: &mut PriorityQueue,
     envelope: crate::frame_outbox::FrameEnvelope,
     waiting: &mut bool,
@@ -4767,7 +4782,7 @@ impl SessionRunner {
                 // it, independently transported local sources may progress in
                 // their own round. Relayed cells never use that local bypass.
                 let mut source_pressure_retry: Option<std::time::Instant> = None;
-                let mut recoverable_datagram_waiting = false;
+                let mut datagram_waiting = [false; LOCAL_TRACE_SLOTS];
                 let mut datagram_drained = 0usize;
                 let mut disable_realtime_sender = false;
                 if let Some(lane) = realtime_lane.as_mut() {
@@ -4791,8 +4806,11 @@ impl SessionRunner {
                         }
                         let Some(envelope) = pq
                             .pop_admitted_envelope(|priority, frame, _, _| {
-                                if (priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
-                                    && recoverable_datagram_waiting)
+                                if (datagram_waiting
+                                    .get(priority as usize)
+                                    .copied()
+                                    .unwrap_or(false)
+                                    && supported(frame))
                                     || (priority == crate::LOCAL_SIGNALING_LANE
                                         && signaling_wait.is_some())
                                 {
@@ -4805,8 +4823,10 @@ impl SessionRunner {
                             })
                             .or_else(|| {
                                 pq.pop_local_datagram_lane_if(|priority, frame| {
-                                    (priority != veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
-                                        || !recoverable_datagram_waiting)
+                                    !datagram_waiting
+                                        .get(priority as usize)
+                                        .copied()
+                                        .unwrap_or(false)
                                         && (priority != crate::LOCAL_SIGNALING_LANE
                                             || signaling_wait.is_none())
                                         && supported(frame)
@@ -4882,50 +4902,6 @@ impl SessionRunner {
                                 CarrierSend::Unavailable => {}
                             }
                         }
-                        if !match envelope.local_work.as_ref() {
-                            Some(work) => {
-                                let admitted = lane.source_activity.admit_lossy_work(
-                                    work,
-                                    encrypted_wire_len(outgoing.len()).unwrap_or(usize::MAX),
-                                    std::time::Instant::now(),
-                                );
-                                if admitted != veil_types::local_lossy_work::WorkAdmission::Admitted
-                                {
-                                    work.reject();
-                                }
-                                admitted == veil_types::local_lossy_work::WorkAdmission::Admitted
-                            }
-                            None => lane.allow_secondary(
-                                outgoing_priority,
-                                encrypted_wire_len(outgoing.len()).unwrap_or(usize::MAX),
-                                std::time::Instant::now(),
-                            ),
-                        } {
-                            if recoverable_data {
-                                defer_recoverable_datagram(
-                                    &mut pq,
-                                    envelope,
-                                    &mut recoverable_datagram_waiting,
-                                    &mut source_pressure_retry,
-                                );
-                                continue;
-                            }
-                            // Source feedback only; neutral ChildCarrier traffic
-                            // above and forwarded INTERACTIVE cells bypass this.
-                            crate::local_lossy_trace::cell(
-                                "budget_drop",
-                                outgoing_priority,
-                                outgoing,
-                            );
-                            lane.trace_source_pressure(
-                                &self.logger,
-                                &self.peer_id,
-                                outgoing_priority,
-                            );
-                            datagram_drained += 1;
-                            continue;
-                        }
-                        crate::local_lossy_trace::cell("budget_admit", outgoing_priority, outgoing);
                         let (_, body, lane_kind) = decode_realtime_lane_frame(outgoing)
                             .expect("realtime queue predicate accepted this frame");
                         let independent_source = lane.requires_independent_source(
@@ -4943,10 +4919,11 @@ impl SessionRunner {
                         }) else {
                             if independent_source {
                                 if recoverable_data {
-                                    defer_recoverable_datagram(
+                                    defer_local_datagram(
                                         &mut pq,
                                         envelope,
-                                        &mut recoverable_datagram_waiting,
+                                        &mut datagram_waiting
+                                            [veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE as usize],
                                         &mut source_pressure_retry,
                                     );
                                     continue;
@@ -4967,9 +4944,9 @@ impl SessionRunner {
                             break;
                         };
                         let signaling_source = lane.source_activity.clone();
-                        let mut lane = lock!(sender);
-                        let max_datagram_size = lane.max_datagram_size;
-                        let datagrams = match lane.tx.encode_frame(
+                        let mut sender_state = lock!(sender);
+                        let max_datagram_size = sender_state.max_datagram_size;
+                        let datagrams = match sender_state.tx.encode_frame(
                             local_datagram_flow(outgoing_priority, body, lane_kind),
                             outgoing,
                             max_datagram_size,
@@ -4995,9 +4972,9 @@ impl SessionRunner {
                         let planned_wire_len = datagrams.iter().map(Vec::len).sum::<usize>();
                         let planned_queue_charge = datagrams
                             .iter()
-                            .map(|packet| lane.handle.queue_charge(packet.len()))
+                            .map(|packet| sender_state.handle.queue_charge(packet.len()))
                             .sum::<usize>();
-                        let available = lane.handle.send_buffer_space();
+                        let available = sender_state.handle.send_buffer_space();
                         let primary_fits = outgoing_priority != veil_proto::priority::REALTIME
                             || !using_parallel
                             || local_primary_datagram_fits(planned_queue_charge, available);
@@ -5008,11 +4985,32 @@ impl SessionRunner {
                                 available,
                             )
                         {
-                            if recoverable_data {
-                                defer_recoverable_datagram(
+                            if independent_secondary_retry(
+                                &envelope,
+                                using_parallel && independent_source,
+                            ) {
+                                sender_state.trace_admission(
+                                    &self.logger,
+                                    &self.peer_id,
+                                    outgoing_priority,
+                                    3,
+                                    using_parallel,
+                                    (available, envelope.queued_at),
+                                );
+                                defer_local_datagram(
                                     &mut pq,
                                     envelope,
-                                    &mut recoverable_datagram_waiting,
+                                    &mut datagram_waiting[outgoing_priority as usize],
+                                    &mut source_pressure_retry,
+                                );
+                                continue;
+                            }
+                            if recoverable_data {
+                                defer_local_datagram(
+                                    &mut pq,
+                                    envelope,
+                                    &mut datagram_waiting
+                                        [veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE as usize],
                                     &mut source_pressure_retry,
                                 );
                                 continue;
@@ -5022,7 +5020,7 @@ impl SessionRunner {
                             // independent primary also bounds its own backlog.
                             // Relayed cells use neutral capacity admission. Drop this
                             // loss-tolerant cell before sending any fragments.
-                            lane.trace_admission(
+                            sender_state.trace_admission(
                                 &self.logger,
                                 &self.peer_id,
                                 outgoing_priority,
@@ -5033,6 +5031,53 @@ impl SessionRunner {
                             datagram_drained += 1;
                             continue;
                         }
+                        // Charge endpoint producer credit only after transport
+                        // capacity is ready. A capacity retry must not pay twice.
+                        if !match envelope.local_work.as_ref() {
+                            Some(work) => {
+                                let admitted = lane.source_activity.admit_lossy_work(
+                                    work,
+                                    encrypted_wire_len(outgoing.len()).unwrap_or(usize::MAX),
+                                    std::time::Instant::now(),
+                                );
+                                if admitted != veil_types::local_lossy_work::WorkAdmission::Admitted
+                                {
+                                    work.reject();
+                                }
+                                admitted == veil_types::local_lossy_work::WorkAdmission::Admitted
+                            }
+                            None => lane.allow_secondary(
+                                outgoing_priority,
+                                encrypted_wire_len(outgoing.len()).unwrap_or(usize::MAX),
+                                std::time::Instant::now(),
+                            ),
+                        } {
+                            if recoverable_data {
+                                defer_local_datagram(
+                                    &mut pq,
+                                    envelope,
+                                    &mut datagram_waiting
+                                        [veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE as usize],
+                                    &mut source_pressure_retry,
+                                );
+                                continue;
+                            }
+                            // Source feedback only; neutral ChildCarrier traffic
+                            // above and forwarded INTERACTIVE cells bypass this.
+                            crate::local_lossy_trace::cell(
+                                "budget_drop",
+                                outgoing_priority,
+                                outgoing,
+                            );
+                            lane.trace_source_pressure(
+                                &self.logger,
+                                &self.peer_id,
+                                outgoing_priority,
+                            );
+                            datagram_drained += 1;
+                            continue;
+                        }
+                        crate::local_lossy_trace::cell("budget_admit", outgoing_priority, outgoing);
                         if outgoing_priority == crate::LOCAL_SIGNALING_LANE
                             && envelope.carrier.is_none()
                             && let Err(retry) = signaling_source
@@ -5046,7 +5091,7 @@ impl SessionRunner {
                             continue;
                         }
                         if !self.dispatcher.allow_outbound_bandwidth(planned_wire_len) {
-                            lane.trace_admission(
+                            sender_state.trace_admission(
                                 &self.logger,
                                 &self.peer_id,
                                 outgoing_priority,
@@ -5057,7 +5102,7 @@ impl SessionRunner {
                             datagram_drained += 1;
                             continue;
                         }
-                        lane.trace_admission(
+                        sender_state.trace_admission(
                             &self.logger,
                             &self.peer_id,
                             outgoing_priority,
@@ -5077,11 +5122,12 @@ impl SessionRunner {
                         // Expiration never changes nonce/counter allocation.
                         let expires_at = local_datagram_expiry(&envelope);
                         for datagram in &datagrams {
-                            if lane.handle.send_buffer_space()
-                                < lane.handle.queue_charge(datagram.len())
+                            if sender_state.handle.send_buffer_space()
+                                < sender_state.handle.queue_charge(datagram.len())
                             {
-                                lane.congestion_drops = lane.congestion_drops.saturating_add(1);
-                                if lane.last_congestion_log.elapsed()
+                                sender_state.congestion_drops =
+                                    sender_state.congestion_drops.saturating_add(1);
+                                if sender_state.last_congestion_log.elapsed()
                                     >= std::time::Duration::from_secs(1)
                                 {
                                     self.logger.debug(
@@ -5089,17 +5135,19 @@ impl SessionRunner {
                                         format!(
                                             "peer_id={} drops={} queue_cap_bytes={}",
                                             hex_short(&self.peer_id),
-                                            lane.congestion_drops,
+                                            sender_state.congestion_drops,
                                             veil_transport::REALTIME_DATAGRAM_BUFFER_BYTES,
                                         ),
                                     );
-                                    lane.congestion_drops = 0;
-                                    lane.last_congestion_log = std::time::Instant::now();
+                                    sender_state.congestion_drops = 0;
+                                    sender_state.last_congestion_log = std::time::Instant::now();
                                 }
                             }
                             let sent = match expires_at {
-                                Some(deadline) => lane.handle.send_before(datagram, deadline),
-                                None => lane.handle.send(datagram),
+                                Some(deadline) => {
+                                    sender_state.handle.send_before(datagram, deadline)
+                                }
+                                None => sender_state.handle.send(datagram),
                             };
                             match sent {
                                 Ok(()) => sent_wire_len += datagram.len(),
@@ -5127,11 +5175,11 @@ impl SessionRunner {
                                 continue;
                             }
                             if matches!(error, LossySendError::TooLarge) {
-                                let previous = lane.max_datagram_size;
+                                let previous = sender_state.max_datagram_size;
                                 if let Some(current) =
-                                    lane.handle.max_size().filter(|size| *size > 40)
+                                    sender_state.handle.max_size().filter(|size| *size > 40)
                                 {
-                                    lane.max_datagram_size = current;
+                                    sender_state.max_datagram_size = current;
                                     self.logger.debug(
                                         "session.realtime_datagram.mtu_refresh_drop",
                                         format!(
@@ -5164,7 +5212,7 @@ impl SessionRunner {
                             // the independent receiver stays alive so the peer's
                             // opposite direction is not black-holed.
                             if using_parallel {
-                                lane.broken = true;
+                                sender_state.broken = true;
                             } else {
                                 disable_realtime_sender = true;
                             }
@@ -5175,7 +5223,7 @@ impl SessionRunner {
                             pq.restore_lossy_envelope(envelope);
                             break;
                         }
-                        if let Some(logged) = lane
+                        if let Some(logged) = sender_state
                             .logged_send_kinds
                             .get_mut(usize::from(outgoing_priority))
                             && *logged & lane_kind.bit() == 0
@@ -5191,7 +5239,7 @@ impl SessionRunner {
                                 ),
                             );
                         }
-                        if let Some((counter, channel)) = lane.sent_counter.as_ref() {
+                        if let Some((counter, channel)) = sender_state.sent_counter.as_ref() {
                             counter.note_sent(*channel);
                         }
                         datagram_drained += 1;
@@ -5379,8 +5427,8 @@ impl SessionRunner {
                         use crate::priority_queue::HeadAdmission;
                         use crate::reliable_frames::FrameReservationError;
                         use reliable_streams::Route;
-                        if priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
-                            && recoverable_datagram_waiting
+                        if datagram_waiting.get(priority as usize).copied().unwrap_or(false)
+                            && realtime_lane.as_ref().is_some_and(|lane| datagram_lane_supports_frame(frame, lane.peer_circuit_datagrams, lane.peer_neutral_forwards))
                         {
                             return HeadAdmission::DeferSource;
                         }
