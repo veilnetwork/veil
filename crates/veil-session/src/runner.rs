@@ -516,15 +516,24 @@ fn local_datagram_fits(priority: u8, wire_len: usize, available: usize) -> bool 
     local_datagram_backlog_fits(wire_len, available)
 }
 
-/// The primary source deadline is based on original local ingress, including
-/// on the shared fallback. Forwarded cells have INTERACTIVE local class and
-/// do not opt in; no deadline or role is transmitted.
+/// Endpoint source deadlines include original local session ingress. The SDK's
+/// pre-IPC deadline is not serialized by AppRtSend, so retain the queue's own
+/// existing age limit for local secondary sources as well. Forwarded cells
+/// have INTERACTIVE local class and do not opt in; no role goes on the wire.
 fn local_datagram_expiry(
     envelope: &crate::frame_outbox::FrameEnvelope,
 ) -> Option<std::time::Instant> {
-    let primary = (envelope.frame.0 == veil_proto::priority::REALTIME)
-        .then_some(envelope.queued_at + crate::priority_queue::LOCAL_PRIMARY_MAX_AGE);
-    match (primary, envelope.expires_at) {
+    let local_age = match envelope.frame.0 {
+        veil_proto::priority::REALTIME => Some(crate::priority_queue::LOCAL_PRIMARY_MAX_AGE),
+        veil_proto::priority::BULK | veil_proto::priority::BACKGROUND
+            if envelope.carrier.is_none() =>
+        {
+            Some(crate::priority_queue::LOSSY_REALTIME_MAX_AGE)
+        }
+        _ => None,
+    };
+    let queued = local_age.map(|age| envelope.queued_at + age);
+    match (queued, envelope.expires_at) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     }
@@ -543,7 +552,6 @@ fn independent_secondary_retry(
 ) -> bool {
     independent
         && envelope.carrier.is_none()
-        && envelope.expires_at.is_some()
         && matches!(
             envelope.frame.0,
             veil_proto::priority::BULK | veil_proto::priority::BACKGROUND
@@ -7131,13 +7139,24 @@ mod realtime_lane_frame_tests {
         );
         // A relay sanitizes every user's local class to INTERACTIVE, even if
         // the claimed wire priority is REALTIME. Their common age is unchanged.
-        for priority in [
-            veil_proto::priority::INTERACTIVE,
-            veil_proto::priority::BULK,
-            veil_proto::priority::BACKGROUND,
-        ] {
-            envelope.frame.0 = priority;
-            assert!(super::local_datagram_expiry(&envelope).is_none());
+        envelope.frame.0 = veil_proto::priority::INTERACTIVE;
+        assert!(super::local_datagram_expiry(&envelope).is_none());
+    }
+
+    #[test]
+    fn outgoing_secondary_expiry_keeps_original_queue_age_without_sdk_deadline() {
+        use crate::frame_outbox::FrameEnvelope;
+        for priority in [veil_proto::priority::BULK, veil_proto::priority::BACKGROUND] {
+            let mut envelope =
+                FrameEnvelope::from((priority, veil_bufpool::pooled_shared_from_vec(vec![1])));
+            envelope.queued_at -= std::time::Duration::from_millis(450);
+            let deadline = envelope.queued_at + crate::priority_queue::LOSSY_REALTIME_MAX_AGE;
+            assert_eq!(super::local_datagram_expiry(&envelope), Some(deadline));
+            let earlier = std::time::Instant::now() + std::time::Duration::from_millis(10);
+            envelope.expires_at = Some(earlier);
+            assert_eq!(super::local_datagram_expiry(&envelope), Some(earlier));
+            envelope.expires_at = Some(deadline + std::time::Duration::from_secs(1));
+            assert_eq!(super::local_datagram_expiry(&envelope), Some(deadline));
         }
     }
 
