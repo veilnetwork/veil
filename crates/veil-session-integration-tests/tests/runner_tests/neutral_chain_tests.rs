@@ -356,12 +356,13 @@ async fn chain(rotate: bool, ordered: bool, forwards: bool) {
                 .all(|d| d.sent_this_generation(0) >= 8 && d.sent_this_generation(2) >= 8)
                 && bridge_observations.iter().any(|d| {
                     d.transit_sent_this_generation() >= 16
-                        && d.transit_shards_used_this_generation() == 2
+                        && (2..veil_transport::QuicParallelHandle::CONNECTIONS_PER_DIRECTION)
+                            .contains(&d.transit_shards_used_this_generation())
                 })
                 && observations
                     .iter()
                     .filter(|(n, _)| *n == 1 || *n == 2)
-                    .all(|(_, d)| d.replies() >= 16);
+                    .all(|(_, d)| d.replies() + d.transit_sent() >= 16);
             if ready {
                 if !rotate || first_epoch_done {
                     break;
@@ -411,8 +412,9 @@ async fn chain(rotate: bool, ordered: bool, forwards: bool) {
             bridge_observations
                 .iter()
                 .any(|d| d.transit_sent_this_generation() >= 16
-                    && d.transit_shards_used_this_generation() == 2),
-            "bridge never used both neutral shards"
+                    && (2..veil_transport::QuicParallelHandle::CONNECTIONS_PER_DIRECTION)
+                        .contains(&d.transit_shards_used_this_generation())),
+            "bridge did not use multiple connections within its neutral quota"
         );
         for (node, d) in &observations {
             if *node == 1 || *node == 2 {

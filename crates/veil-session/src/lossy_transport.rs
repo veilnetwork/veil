@@ -97,7 +97,7 @@ impl LossyTransportHandle {
 
     pub(super) fn queue_charge(&self, payload_bytes: usize) -> usize {
         match self {
-            Self::Quic(_) => payload_bytes,
+            Self::Quic(_) => veil_transport::quic::QuicDatagramHandle::queue_charge(payload_bytes),
             Self::Ordered(_) => veil_transport::ordered_records::record_queue_charge(payload_bytes),
         }
     }
