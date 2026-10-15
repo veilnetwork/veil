@@ -52,7 +52,10 @@ fn independent_secondary_retry_preserves_deadline_and_other_sources_progress() {
     }
     envelope.carrier = Some(std::sync::Weak::<Transit>::new());
     assert!(!super::independent_secondary_retry(&envelope, true));
+    envelope.expires_at = None;
+    assert!(super::local_datagram_expiry(&envelope).is_none());
     envelope.carrier = None;
+    envelope.expires_at = deadline;
     for priority in [
         REALTIME,
         INTERACTIVE,
@@ -64,7 +67,11 @@ fn independent_secondary_retry_preserves_deadline_and_other_sources_progress() {
     envelope.frame.0 = BACKGROUND;
     assert!(super::independent_secondary_retry(&envelope, true));
     envelope.expires_at = None;
-    assert!(!super::independent_secondary_retry(&envelope, true));
+    assert!(super::independent_secondary_retry(&envelope, true));
+    assert_eq!(
+        super::local_datagram_expiry(&envelope),
+        Some(age + crate::priority_queue::LOSSY_REALTIME_MAX_AGE)
+    );
     envelope.frame.0 = BULK;
     envelope.expires_at = deadline;
     let mut waiting = false;
