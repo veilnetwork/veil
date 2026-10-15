@@ -112,7 +112,15 @@ async fn connect_socks_stream(
     )
     .await
     {
-        Ok(result) => Ok(result?.into_inner()),
+        Ok(result) => {
+            let stream = result?.into_inner();
+            // The socket belongs to our proxy connection. Apply the same
+            // payload-blind backlog bounds as a direct TCP connection; the
+            // proxy still resolves the destination and schedules its own link.
+            super::tcp::clamp_downlink_mss(&stream);
+            super::tcp::clamp_uplink_sndbuf(&stream);
+            Ok(stream)
+        }
         Err(_) => Err(connect_timeout(connect_timeout_duration)),
     }
 }
@@ -222,10 +230,14 @@ impl Transport for SocksTransport {
                         ctx.tcp.connect_timeout,
                     )
                     .await?;
+                    stream.set_nodelay(ctx.tcp.nodelay)?;
                     let local_addr = stream.local_addr().ok();
                     let remote_addr = stream.peer_addr().ok();
                     let peer = peer_meta("socks", uri.clone(), local_addr, remote_addr);
-                    Ok(boxed_stream_connection(peer, stream))
+                    Ok(boxed_stream_connection(
+                        peer,
+                        crate::tcp_write_gate::gate(stream, |tcp| tcp),
+                    ))
                 }
                 SocksConnectParts::Tls {
                     proxy_host,
@@ -243,10 +255,23 @@ impl Transport for SocksTransport {
                         ctx.tcp.connect_timeout,
                     )
                     .await?;
+                    stream.set_nodelay(ctx.tcp.nodelay)?;
                     let tls_stream =
                         connect_tls_over_socks(stream, target_host, sni, alpn, &ctx).await?;
                     let peer = peer_meta("sockstls", uri.clone(), None, None);
-                    Ok(boxed_stream_connection(peer, tls_stream))
+                    Ok(boxed_stream_connection(
+                        peer,
+                        crate::tcp_write_gate::gate(tls_stream, |tls| {
+                            #[cfg(feature = "tls-boring")]
+                            {
+                                tls.get_ref()
+                            }
+                            #[cfg(not(feature = "tls-boring"))]
+                            {
+                                tls.get_ref().0
+                            }
+                        }),
+                    ))
                 }
             }
         })
@@ -290,6 +315,131 @@ impl Transport for SocksTlsTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // A real loopback proxy endpoint holds application reads after completing
+    // SOCKS (and optionally TLS). Exercise the public transport, not a gate
+    // constructed by the test: neither proxied path may bypass write admission.
+    async fn verify_proxied_backpressure(tls: bool) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        socket2::SockRef::from(&listener)
+            .set_recv_buffer_size(4096)
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let ctx = Arc::new(TransportContext::for_debug().unwrap());
+        let server_tls = ctx.tls.server_config.clone();
+        let (release, wait_for_reads) = tokio::sync::oneshot::channel();
+        let proxy = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            socket.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            socket.write_all(&[5, 0]).await.unwrap();
+            let mut header = [0; 5];
+            socket.read_exact(&mut header).await.unwrap();
+            assert_eq!(&header[..4], &[5, 1, 0, 3]);
+            let mut destination = vec![0; header[4] as usize];
+            socket.read_exact(&mut destination).await.unwrap();
+            assert_eq!(destination, b"peer.invalid");
+            let mut port = [0; 2];
+            socket.read_exact(&mut port).await.unwrap();
+            assert_eq!(u16::from_be_bytes(port), 443);
+            socket
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+                .await
+                .unwrap();
+            let mut stream: crate::BoxIoStream = if tls {
+                Box::new(
+                    tokio_rustls::TlsAcceptor::from(server_tls)
+                        .accept(socket)
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                Box::new(socket)
+            };
+            // Backpressure in the sending direction must not wedge reads in
+            // the other direction, including TLS's independent read wakeup.
+            stream.write_all(b"receive-alive").await.unwrap();
+            stream.flush().await.unwrap();
+            wait_for_reads.await.unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            stream.shutdown().await.unwrap();
+            received
+        });
+        let uri = if tls {
+            TransportUri::SocksTls {
+                proxy_host: address.ip().to_string(),
+                proxy_port: address.port(),
+                target_host: "peer.invalid".to_owned(),
+                target_port: 443,
+                sni: Some("localhost".to_owned()),
+                alpn: Vec::new(),
+            }
+        } else {
+            TransportUri::Socks {
+                proxy_host: address.ip().to_string(),
+                proxy_port: address.port(),
+                target_host: "peer.invalid".to_owned(),
+                target_port: 443,
+            }
+        };
+        let mut stream = timeout(Duration::from_secs(5), SocksTransport.connect(&uri, ctx))
+            .await
+            .unwrap()
+            .unwrap()
+            .into_stream()
+            .unwrap();
+        let payload: Vec<u8> = (0..512 * 1024).map(|n| (n % 251) as u8).collect();
+        let first = stream.write(&payload).await.unwrap();
+        #[cfg(target_vendor = "apple")]
+        assert!(
+            first > 0 && first <= 4096,
+            "proxied write bypassed admission: {first}"
+        );
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let remainder = payload[first..].to_vec();
+        let mut writing = tokio::spawn(async move {
+            writer.write_all(&remainder).await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+        let mut ping = [0; 13];
+        timeout(Duration::from_secs(2), reader.read_exact(&mut ping))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&ping, b"receive-alive");
+        let stalled = timeout(Duration::from_millis(100), &mut writing)
+            .await
+            .is_err();
+        release.send(()).unwrap();
+        if stalled {
+            timeout(Duration::from_secs(10), writing)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let received = timeout(Duration::from_secs(10), proxy)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            received, payload,
+            "backpressure must preserve reliable bytes and EOF"
+        );
+        assert!(stalled, "fixture did not exercise a blocked proxy reader");
+    }
+
+    #[tokio::test]
+    async fn socks_write_admission_preserves_data_and_duplex_progress() {
+        verify_proxied_backpressure(false).await;
+    }
+
+    #[tokio::test]
+    async fn socks_tls_write_admission_preserves_data_and_duplex_progress() {
+        verify_proxied_backpressure(true).await;
+    }
 
     #[test]
     fn parse_socks_proxy_url_accepts_schemes_and_bare() {
