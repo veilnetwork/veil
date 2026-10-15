@@ -38,3 +38,6 @@ zeroize = "1"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

@@ -95,7 +95,7 @@ mod tests {
     use veil_proto::{FrameHeader, HEADER_SIZE};
 
     #[tokio::test]
-    async fn single_retry_burst_leaves_primary_and_transit_ahead_without_changing_e2e_bytes() {
+    async fn bounded_retry_burst_leaves_primary_and_transit_ahead_without_changing_e2e_bytes() {
         let data = b"acknowledged source message";
         let (ek, dk) = veil_e2e::generate_keypair();
         let mut payload = vec![veil_proto::E2E_MARKER];
@@ -108,6 +108,8 @@ mod tests {
         let mut registry = veil_session::SessionTxRegistry::with_capacity(64);
         let mut outbox = registry.register(hop);
         let mut originals = Vec::new();
+        let mut queue = veil_session::priority_queue::PriorityQueue::with_default_weights();
+        let mut saw_backpressure = false;
         for n in 0..32u8 {
             let body = ForwardPayload {
                 next_hop_node_id: [8; 32],
@@ -135,12 +137,23 @@ mod tests {
             header.body_len = body.len() as u32;
             let mut frame = veil_proto::codec::encode_header(&header).to_vec();
             frame.extend(body);
-            assert!(try_admit_single_retry(&registry, hop, &frame, 2));
+            if !try_admit_single_retry(&registry, hop, &frame, 2) {
+                saw_backpressure = true;
+                // Consume ingress before offering the retry again. This
+                // fixture checks scheduling markers and E2E bytes; the real
+                // scheduler's retained credit is covered in veil-session.
+                let (lane, admitted) = outbox.try_recv().unwrap();
+                queue.push(lane, admitted);
+                assert!(try_admit_single_retry(&registry, hop, &frame, 2));
+            }
             originals.push(frame);
         }
+        assert!(
+            saw_backpressure,
+            "authored retries must retain bounded ingress"
+        );
         // The runner's WRR queue sees the real retry producer's local marker.
         // A burst of authored retries must not acquire the neutral FIFO's turn.
-        let mut queue = veil_session::priority_queue::PriorityQueue::with_default_weights();
         while let Ok((lane, frame)) = outbox.try_recv() {
             queue.push(lane, frame);
         }
