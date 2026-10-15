@@ -84,7 +84,7 @@ pub(crate) const UPLINK_SNDBUF_CLAMP: usize = 64 * 1024;
 /// unacknowledged in-flight capacity while making new writes encounter
 /// backpressure sooner. This reveals no payload role and changes no priority.
 /// The kernel can overshoot by a segment/current write; this is not a hard cap.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 const TCP_UNSENT_LOWAT: u32 = 4096;
 
 /// Best-effort `SO_SNDBUF` clamp (see [`UPLINK_SNDBUF_CLAMP`]). A failure is
@@ -102,6 +102,24 @@ pub(crate) fn clamp_uplink_sndbuf(stream: &TcpStream) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     // Unsupported older kernels retain the existing send-buffer clamp.
     let _ = SockRef::from(stream).set_tcp_notsent_lowat(TCP_UNSENT_LOWAT);
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        let value = TCP_UNSENT_LOWAT as libc::c_int;
+        // Darwin exposes this public option in netinet/tcp.h; libc/socket2
+        // currently do not expose the constant/setter for Apple targets.
+        // SAFETY: the borrowed stream keeps the descriptor live, and the
+        // option reads one correctly sized native integer from `value`.
+        let _ = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                0x201,
+                (&value as *const libc::c_int).cast(),
+                std::mem::size_of_val(&value) as libc::socklen_t,
+            )
+        };
+    }
 }
 
 /// Apply every TCP option that must be set on a newly accepted socket.
@@ -343,7 +361,10 @@ impl TransportListener for TcpTransportListener {
             configure_accepted_tcp(&stream, self.nodelay, self.keepalive_idle)?;
             let local_addr = stream.local_addr().ok();
             let peer = peer_meta("tcp", self.bind_uri.clone(), local_addr, Some(remote_addr));
-            Ok(boxed_stream_connection(peer, stream))
+            Ok(boxed_stream_connection(
+                peer,
+                crate::tcp_write_gate::gate(stream, |tcp| tcp),
+            ))
         })
     }
 
@@ -375,7 +396,10 @@ impl Transport for TcpTransport {
             let local_addr = stream.local_addr().ok();
             let remote_addr = stream.peer_addr().ok();
             let peer = peer_meta("tcp", uri.clone(), local_addr, remote_addr);
-            Ok(boxed_stream_connection(peer, stream))
+            Ok(boxed_stream_connection(
+                peer,
+                crate::tcp_write_gate::gate(stream, |tcp| tcp),
+            ))
         })
     }
 
@@ -589,3 +613,7 @@ mod tests {
         assert!(!server.nodelay().unwrap());
     }
 }
+
+#[cfg(all(test, target_vendor = "apple"))]
+#[path = "tcp_darwin_tests.rs"]
+mod darwin_tests;
