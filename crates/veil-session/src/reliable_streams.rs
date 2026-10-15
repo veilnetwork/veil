@@ -91,14 +91,15 @@ impl ReliableStreams {
         if !self.enabled {
             return Route::Canonical;
         }
-        if let Ok(h) = decode_header(frame) {
-            if h.family == FrameFamily::App as u8 && h.msg_type == AppMsg::AppWindowUpdate as u16 {
-                return window_stream(&h, &frame[HEADER_SIZE..]).map_or(Route::Failed, |stream| {
-                    self.pins
-                        .get(&stream)
-                        .map_or(Route::Canonical, |pin| pin.route)
-                });
-            }
+        if let Ok(h) = decode_header(frame)
+            && h.family == FrameFamily::App as u8
+            && h.msg_type == AppMsg::AppWindowUpdate as u16
+        {
+            return window_stream(&h, &frame[HEADER_SIZE..]).map_or(Route::Failed, |stream| {
+                self.pins
+                    .get(&stream)
+                    .map_or(Route::Canonical, |pin| pin.route)
+            });
         }
         let Some((h, identity)) = scope(frame) else {
             return Route::Canonical;
@@ -196,13 +197,11 @@ impl ReliableStreams {
         }
         if h.msg_type == AppMsg::AppReceipt as u16
             && let Some(pin) = self.pins.get_mut(&h.stream_id)
+            && pin.closing
+            && AppReceiptPayload::decode(body)
+                .is_ok_and(|p| p.status == veil_proto::app::receipt_status::ACCEPTED)
         {
-            if pin.closing
-                && AppReceiptPayload::decode(body)
-                    .is_ok_and(|p| p.status == veil_proto::app::receipt_status::ACCEPTED)
-            {
-                pin.active = false;
-            }
+            pin.active = false;
         }
         Ok(())
     }

@@ -123,21 +123,13 @@ impl Ready {
     }
 }
 
+#[derive(Default)]
 struct Pool {
     slots: [Option<Ready>; TOTAL_SLOTS],
     // Incoming proofs may consume only their bounded directional
     // leases. They cannot displace the dialer's outgoing source slots.
     incoming: Vec<Ready>,
     assignments: channel_assignments::ChannelAssignments<TOTAL_SLOTS>,
-}
-impl Default for Pool {
-    fn default() -> Self {
-        Self {
-            slots: Default::default(),
-            incoming: Vec::new(),
-            assignments: Default::default(),
-        }
-    }
 }
 
 async fn connect(
