@@ -1112,6 +1112,9 @@ struct GroupPeerState {
   uint8_t id[32] = {0};
   uint32_t audio_ssrc = 0;
   uint32_t video_ssrc = 0;
+  uint64_t observed_playout_sequence = 0;
+  bool observed_playout_supported = false;
+  bool observed_playout_fresh = false;
   std::unique_ptr<veil_media::VeilTransportShim> shim;
   webrtc::AudioReceiveStreamInterface* recv_stream = nullptr;  // owned by Call
   std::unique_ptr<VeilVideoSink> video_sink;
@@ -1149,6 +1152,8 @@ struct GroupWebrtcState {
   std::unique_ptr<veil_media::ScreenCapturer> screen;
   std::map<std::string, std::unique_ptr<GroupPeerState>> peers;
   uint64_t audio_sample_sequence = 0;
+  uint64_t audio_playout_revision = 0;
+  size_t observed_playout_peer_count = 0;
 };
 
 constexpr int kGroupVp8PayloadType = 96;
@@ -2394,10 +2399,20 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   double fps = 0;
   int kbps = 0, encoder_target_bps = 0;
   const int64_t now_us = webrtc::TimeMicros();
+  bool playout_changed = ws->observed_playout_peer_count != ws->peers.size();
+  ws->observed_playout_peer_count = ws->peers.size();
   for (const auto& entry : ws->peers) {
     const auto playout = entry.second->shim->audio_playout_feedback();
+    auto* peer = entry.second.get();
+    const bool fresh = playout.fresh_at(now_us);
+    playout_changed |= peer->observed_playout_sequence != playout.sequence ||
+        peer->observed_playout_supported != playout.supported ||
+        peer->observed_playout_fresh != fresh;
+    peer->observed_playout_sequence = playout.sequence;
+    peer->observed_playout_supported = playout.supported;
+    peer->observed_playout_fresh = fresh;
     if (playout.supported) ++playout_peers;
-    if (playout.fresh_at(now_us)) {
+    if (fresh) {
       ++playout_reports;
       playout_ms = std::max(playout_ms, playout.delay_ms);
     }
@@ -2415,6 +2430,9 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
     jitter = std::max(jitter, report.jitter_ms);
     rtt = std::max(rtt, report.rtt_ms);
   }
+  // Local snapshot revision, not another wire counter. Repeated stats reads
+  // cannot turn cached RTCP into fresh buffer-trend observations.
+  if (playout_changed) ++ws->audio_playout_revision;
   // Count packets accepted by each real audio receive stream. Shim ingress
   // also includes video, RTCP and packets rejected by the audio demuxer; it
   // must not keep a silent participant's audio watchdog alive.
@@ -2484,6 +2502,7 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   // falls back to video ingress. These fields are endpoint-local JSON only.
   std::string snapshot(json, static_cast<size_t>(written) - 1);
   snapshot += ",\"audio_playout_peers\":" + std::to_string(playout_peers) +
+              ",\"audio_playout_sequence\":" + std::to_string(ws->audio_playout_revision) +
               ",\"audio_playout_reports\":" + std::to_string(playout_reports) +
               ",\"audio_playout_ms\":" + std::to_string(playout_ms);
   snapshot += ",\"video_send_paused\":" + std::to_string(ws->video_send_paused.load() ? 1 : 0);
