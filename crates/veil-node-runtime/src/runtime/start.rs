@@ -973,7 +973,15 @@ impl NodeRuntime {
             pending_diag: Arc::clone(&shared_pending_diag),
             capture_tx: Arc::new(Mutex::new(None)),
             capture_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            capture_rate_limit: Arc::new(veil_dispatcher_state::CaptureRateLimiter::new()),
+            capture_rate_limit: Arc::new(veil_dispatcher_state::CaptureRateLimiter::with_limit(
+                // Trusted operator/fixture diagnostic override. Packet
+                // admission, forwarding and capture's default stay unchanged.
+                std::env::var("VEIL_DIAG_CAPTURE_EVENTS_PER_SEC")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .filter(|v| (1..=1000).contains(v))
+                    .unwrap_or(veil_dispatcher_state::CAPTURE_PER_PEER_EVENTS_PER_SEC),
+            )),
             route_miss_tx: Arc::new(Mutex::new(None)),
             // Wired post-construction by `spawn_auth_deliver_handler`.
             auth_deliver_tx: Arc::new(Mutex::new(None)),

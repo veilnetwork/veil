@@ -712,7 +712,11 @@ pub enum AdminResult {
         family: u8,
         msg_type: u16,
         body_len: u32,
-        /// Full frame body encoded as lowercase hex.
+        /// Actual observed body length before preview clipping; older nodes
+        /// omit this. Header body_len can include the receive-side AEAD tag.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_body_len: Option<usize>,
+        /// Bounded frame body preview encoded as lowercase hex.
         body_hex: String,
         /// `true` when the capture happened on the IPC-side of an
         /// E2E path (pre-encryption plaintext visible to the node itself).
@@ -4084,6 +4088,7 @@ async fn run_debug_capture(
             family: ev.family,
             msg_type: ev.msg_type,
             body_len: ev.body_len,
+            observed_body_len: Some(ev.observed_body_len),
             body_hex,
             e2e_plaintext: ev.e2e_plaintext,
         };
@@ -4096,6 +4101,36 @@ async fn run_debug_capture(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capture_length_extension_reads_legacy_events_and_preserves_wire_length() {
+        let legacy = serde_json::json!({
+            "type": "capture_frame", "ts_us": 1, "direction": "rx",
+            "src_id": "01", "dst_id": "02", "family": 3, "msg_type": 3,
+            "body_len": 316, "body_hex": "abcd", "e2e_plaintext": false
+        });
+        let old: super::AdminResult = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            old,
+            super::AdminResult::CaptureFrame {
+                body_len: 316,
+                observed_body_len: None,
+                ..
+            }
+        ));
+        let mut extended = legacy;
+        extended["observed_body_len"] = serde_json::json!(300);
+        let new: super::AdminResult = serde_json::from_value(extended.clone()).unwrap();
+        assert!(matches!(
+            new,
+            super::AdminResult::CaptureFrame {
+                body_len: 316,
+                observed_body_len: Some(300),
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(new).unwrap(), extended);
+    }
+
     /// report15 V15-M2: an authenticated connection that says nothing.
     ///
     /// The pre-auth pool bounds the handshake and used to be released the

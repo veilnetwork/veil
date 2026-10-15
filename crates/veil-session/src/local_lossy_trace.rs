@@ -1,6 +1,7 @@
 //! Opt-in endpoint diagnostics for complete source work items and their cells.
 //! These observations never travel on IPC or the network and never classify
 //! forwarded traffic. No plaintext, keys, node ids or peer ids are recorded.
+use sha2::{Digest, Sha256};
 use std::sync::{
     OnceLock,
     atomic::{AtomicU64, Ordering},
@@ -67,14 +68,7 @@ fn owned_cell(priority: u8, frame: &[u8]) -> Option<(u64, u64)> {
 
 fn owned_primary_cell(priority: u8, frame: &[u8]) -> Option<(u64, u64)> {
     // Selection comes from our private source slot, never a remote wire hint.
-    if priority != veil_proto::priority::REALTIME
-        || frame.len() > 8192
-        || crate::frame_diag::family_and_type(frame)
-            != Some((
-                veil_proto::family::FrameFamily::App as u8,
-                veil_proto::family::AppMsg::AppRtData as u16,
-            ))
-    {
+    if priority != veil_proto::priority::REALTIME || frame.len() > 8192 {
         return None;
     }
     let wire_header = veil_proto::codec::decode_header(frame).ok()?;
@@ -85,12 +79,35 @@ fn owned_primary_cell(priority: u8, frame: &[u8]) -> Option<(u64, u64)> {
         return None;
     }
     let body = frame.get(veil_proto::header::HEADER_SIZE..)?;
-    let data = veil_proto::app::AppRtDataPayload::decode(body).ok()?;
-    header(&data.payload).filter(|(_, seq)| *seq <= SEQUENCE_LIMIT)
+    match crate::frame_diag::family_and_type(frame)? {
+        (family, kind)
+            if family == veil_proto::family::FrameFamily::App as u8
+                && kind == veil_proto::family::AppMsg::AppRtData as u16 =>
+        {
+            header(
+                &veil_proto::app::AppRtDataPayload::decode(body)
+                    .ok()?
+                    .payload,
+            )
+        }
+        (family, kind)
+            if family == veil_proto::family::FrameFamily::Delivery as u8
+                && kind == veil_proto::family::DeliveryMsg::Forward as u16 =>
+        {
+            header(
+                &veil_proto::delivery::ForwardPayload::decode(body)
+                    .ok()?
+                    .envelope
+                    .payload,
+            )
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn cell(stage: &'static str, priority: u8, frame: &[u8]) {
-    let primary = priority == veil_proto::priority::REALTIME && crate::rt_trace::rt_trace_enabled();
+    let primary = priority == veil_proto::priority::REALTIME
+        && (crate::rt_trace::rt_trace_enabled() || enabled());
     let sample = if primary {
         owned_primary_cell(priority, frame)
     } else if enabled() {
@@ -101,16 +118,29 @@ pub(crate) fn cell(stage: &'static str, priority: u8, frame: &[u8]) {
     let Some((epoch, sequence)) = sample else {
         return;
     };
-    if primary && sequence != 1 && !sequence.is_multiple_of(50) {
+    // Explicit, bounded fixture tracing covers late primary cells too. The
+    // ordinary RT trace retains its original sparse/short observation budget.
+    if primary
+        && !enabled()
+        && (sequence > SEQUENCE_LIMIT || (sequence != 1 && !sequence.is_multiple_of(50)))
+    {
         return;
     }
     if row_available() {
+        let Some((family, kind)) = crate::frame_diag::family_and_type(frame) else {
+            return;
+        };
+        let body = &frame[veil_proto::header::HEADER_SIZE..];
+        // Same bounded encrypted preview as the admin observer. It lets the
+        // owned endpoint establish the source; no role is inferred at a relay.
+        let digest = veil_util::hex_str(&Sha256::digest(&body[..body.len().min(256)]));
         log::info!(
-            "media.source_cell_trace at_unix_us={} stage={stage} local_slot={priority} epoch={epoch:016x} seq={sequence} wire_bytes={}",
+            "media.source_cell_trace at_unix_us={} stage={stage} local_slot={priority} epoch={epoch:016x} seq={sequence} wire_bytes={} family={family} msg_type={kind} body_len={} body_preview_sha256={digest}",
             unix_us(),
             frame
                 .len()
-                .saturating_add(veil_crypto::session_cipher::AEAD_OVERHEAD)
+                .saturating_add(veil_crypto::session_cipher::AEAD_OVERHEAD),
+            body.len(),
         );
     }
 }
@@ -288,6 +318,34 @@ mod tests {
         malformed.extend(unsealed.encode());
         assert_eq!(
             owned_primary_cell(veil_proto::priority::REALTIME, &malformed),
+            None
+        );
+    }
+
+    #[test]
+    fn relayed_primary_ownership_ignores_wire_hints_and_covers_late_cells() {
+        let frame = forward(SEQUENCE_LIMIT + 1);
+        assert_eq!(
+            owned_primary_cell(veil_proto::priority::REALTIME, &frame),
+            Some((7, SEQUENCE_LIMIT + 1))
+        );
+        for priority in [
+            veil_proto::priority::INTERACTIVE,
+            veil_proto::priority::BULK,
+            veil_proto::priority::BACKGROUND,
+        ] {
+            assert_eq!(owned_primary_cell(priority, &frame), None);
+        }
+        for end in 0..frame.len() {
+            assert_eq!(
+                owned_primary_cell(veil_proto::priority::REALTIME, &frame[..end]),
+                None
+            );
+        }
+        let mut extra = frame;
+        extra.push(0);
+        assert_eq!(
+            owned_primary_cell(veil_proto::priority::REALTIME, &extra),
             None
         );
     }
