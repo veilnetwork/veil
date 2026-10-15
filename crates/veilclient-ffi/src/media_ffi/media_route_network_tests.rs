@@ -1,7 +1,8 @@
 //! Real node runtimes, builders, relay dispatchers and native media pumps.
 //! Most fixtures join session outboxes in memory. The real-obfs4 variant uses
 //! actual authenticated sessions, independent children and encrypted splicing.
-//! Neither variant measures codec PCM or physical acoustic quality.
+//! The optional codecs module adds synthetic PCM/decoded-video observations;
+//! none of these fixtures establishes physical acoustic quality.
 use super::*;
 use crate::anon_stream::MediaRoutes;
 use crate::media::{LocalMediaPlane, cipher_for_test};
@@ -13,6 +14,12 @@ use tokio::sync::mpsc;
 use veil_node_runtime::{NodeRuntime, NodeServices};
 use veil_proto::{HEADER_SIZE, family::FrameFamily};
 
+#[cfg(unix)]
+mod codecs {
+    use super::*;
+    include!("media_route_codec_tests.rs");
+}
+
 struct Stand {
     _dirs: Vec<tempfile::TempDir>,
     nodes: Vec<NodeRuntime>,
@@ -22,7 +29,7 @@ struct Stand {
     file_loss_budget: Arc<std::sync::atomic::AtomicUsize>,
     file_dropped: Arc<std::sync::atomic::AtomicUsize>,
     file_cells: Arc<std::sync::atomic::AtomicUsize>,
-    reliable_call_probes: Arc<std::sync::atomic::AtomicUsize>,
+    reliable_route_probes: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl Drop for Stand {
     fn drop(&mut self) {
@@ -49,7 +56,7 @@ impl Stand {
             file_loss_budget: Arc::default(),
             file_dropped: Arc::default(),
             file_cells: Arc::default(),
-            reliable_call_probes: Arc::default(),
+            reliable_route_probes: Arc::default(),
         };
         let mut configs = Vec::new();
         for _ in 0..middle_count + 3 {
@@ -132,6 +139,9 @@ impl Stand {
                 }];
                 cfg.transport.obfs4_psk_file = Some(psk.clone());
                 cfg.global.builtin_seed_policy = veil_cfg::BuiltinSeedPolicy::Never;
+                if std::env::var("VEIL_MEDIA_CODEC_TRACE").as_deref() == Ok("1") {
+                    cfg.global.log_level = veil_cfg::LogLevel::Debug;
+                }
                 cfg.pex.enabled = false;
                 cfg.anonymity.receive_anonymous = index < 2;
                 cfg.anonymity.relay_capable = index >= 2;
@@ -248,7 +258,7 @@ impl Stand {
         let file_loss_budget = Arc::clone(&self.file_loss_budget);
         let file_dropped = Arc::clone(&self.file_dropped);
         let file_cells = Arc::clone(&self.file_cells);
-        let reliable_call_probes = Arc::clone(&self.reliable_call_probes);
+        let reliable_route_probes = Arc::clone(&self.reliable_route_probes);
         let mut rx = self.services[from]
             .session_tx_registry
             .write()
@@ -267,10 +277,10 @@ impl Stand {
                     assert_eq!(priority, veil_proto::priority::INTERACTIVE);
                 }
                 if from < 2
-                    && priority == veil_session::LOCAL_SIGNALING_LANE
+                    && priority == veil_session::LOCAL_NETWORK_CONTROL_LANE
                     && header.msg_type == veil_proto::family::RelayChainMsg::CircuitData as u16
                 {
-                    reliable_call_probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    reliable_route_probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 if from < 2 && priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE {
                     use std::sync::atomic::Ordering;
@@ -696,10 +706,10 @@ async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stall
     let outgoing_all = ca.routes.outgoing_for_test().await;
     assert!(
         stand
-            .reliable_call_probes
+            .reliable_route_probes
             .load(std::sync::atomic::Ordering::Acquire)
             > 0,
-        "periodic probes must use reliable call control, not the audio child"
+        "periodic probes must use reliable network maintenance outside media/signaling"
     );
     assert_eq!(cc.routes.receive_addresses_for_test().len(), 4);
     assert_eq!(outgoing_all[2].destination_cookie, incoming[2].1);

@@ -209,15 +209,16 @@ impl PinnedRoute {
     }
 
     fn probe(&self) {
-        // Steady-state keepalive is call control, not a media datagram. Reliable
-        // cells preserve the learned return carrier without occupying the
-        // audio/video/screen child or labelling any role on a relay's wire.
+        // Route liveness is endpoint network maintenance. Periodic application
+        // feedback can continuously spend the signaling allowance; a probe in
+        // that queue then expires a healthy route. Use the existing recovery
+        // queue/budget without occupying a media child or changing relay headers.
         let mut body = self.cookie.to_vec();
         body.extend_from_slice(veil_anonymity::circuit_data::CIRCUIT_PROBE_MAGIC);
         let _ = self.services.send_circuit_cell_on_local_lane_detailed(
             &self.circuit,
             &body,
-            veil_session::LOCAL_SIGNALING_LANE,
+            veil_session::LOCAL_NETWORK_CONTROL_LANE,
         );
     }
 
@@ -276,6 +277,14 @@ async fn open_private_route(
             channel: owner.channel,
             cipher: Arc::clone(&owner.cipher),
             probe_echo: Arc::clone(&probe_echo),
+            #[cfg(test)]
+            received_cells: Some(Arc::clone(
+                &owner.received_cells[owner
+                    .cores
+                    .iter()
+                    .position(|owned| std::ptr::eq(owned, core))
+                    .unwrap()],
+            )),
         },
     ));
     let close_generation = core.services.session_close_generation(&circuit.first_hop());
@@ -315,6 +324,12 @@ pub(crate) struct MediaRoutes {
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     #[cfg(test)]
     legacy_peer: AtomicBool,
+    #[cfg(test)]
+    received_cells: [Arc<AtomicU64>; 4],
+    #[cfg(test)]
+    private_sent: [AtomicU64; 4],
+    #[cfg(test)]
+    fallback_attempts: [AtomicU64; 4],
 }
 
 impl MediaRoutes {
@@ -339,6 +354,12 @@ impl MediaRoutes {
             tasks: Mutex::new(Vec::new()),
             #[cfg(test)]
             legacy_peer: AtomicBool::new(false),
+            #[cfg(test)]
+            received_cells: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
+            #[cfg(test)]
+            private_sent: std::array::from_fn(|_| AtomicU64::new(0)),
+            #[cfg(test)]
+            fallback_attempts: std::array::from_fn(|_| AtomicU64::new(0)),
         })
     }
 
@@ -499,7 +520,11 @@ impl MediaRoutes {
                 ),
             };
             match result {
-                Ok(()) => return true,
+                Ok(()) => {
+                    #[cfg(test)]
+                    self.private_sent[i].fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
                 Err(
                     veil_node_runtime::DataCircuitSendError::QueueFull
                     | veil_node_runtime::DataCircuitSendError::PayloadTooLarge,
@@ -514,6 +539,8 @@ impl MediaRoutes {
             outgoing.take();
         }
         drop(outgoing);
+        #[cfg(test)]
+        self.fallback_attempts[i].fetch_add(1, Ordering::Relaxed);
         core.send_datagram(self.peer, sealed).await
     }
 
@@ -780,6 +807,17 @@ impl MediaRoutes {
             .flatten()
             .map(|r| (r.plane, r.cookie))
             .collect()
+    }
+
+    pub(crate) fn received_media_cells_for_test(&self) -> [u64; 4] {
+        std::array::from_fn(|i| self.received_cells[i].load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn send_paths_for_test(&self) -> ([u64; 4], [u64; 4]) {
+        (
+            std::array::from_fn(|i| self.private_sent[i].load(Ordering::Relaxed)),
+            std::array::from_fn(|i| self.fallback_attempts[i].load(Ordering::Relaxed)),
+        )
     }
 
     pub(crate) async fn outgoing_for_test(&self) -> Vec<RouteSnapshot> {

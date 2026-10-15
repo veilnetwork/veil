@@ -4699,6 +4699,8 @@ enum CircuitFeedMode {
         channel: u64,
         cipher: Arc<crate::media::MediaCipher>,
         probe_echo: Arc<std::sync::atomic::AtomicBool>,
+        #[cfg(test)]
+        received_cells: Option<Arc<AtomicU64>>,
     },
 }
 
@@ -4811,6 +4813,17 @@ async fn run_circuit_feed(
                 // This unadvertised receive address belongs to one call. It
                 // never bridges files or another group's peer into the hub.
                 if node == *peer || services.identity_of_device_local(&node) == Some(*peer) {
+                    // Endpoint-only test evidence, before media AEAD admission.
+                    // Circuit probes do not count as encoded media traffic.
+                    #[cfg(test)]
+                    if framed[cell_offset] == crate::media::MEDIA_MAGIC
+                        && let CircuitFeedMode::Media {
+                            received_cells: Some(count),
+                            ..
+                        } = &mode
+                    {
+                        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     crate::media::dispatch_private_onion_cell(
                         *peer,
                         *channel,
@@ -5217,6 +5230,7 @@ mod tests {
                 channel: registration.chan,
                 cipher: Arc::clone(&registration.cipher),
                 probe_echo: Arc::default(),
+                received_cells: None,
             },
         )
         .await;
