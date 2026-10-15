@@ -128,9 +128,7 @@
 #include "veil_diag_log.h"
 #include "veil_screen.h"
 #include "veil_transport_shim.h"
-#if defined(VEIL_MEDIA_TEST_HOOKS)
 #include "veil_playout_recovery.h"
-#endif
 #endif
 
 extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* ptr,
@@ -1016,11 +1014,9 @@ struct WebrtcState {
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm;
   webrtc::scoped_refptr<webrtc::AudioProcessing> apm;
   webrtc::scoped_refptr<webrtc::AudioState> audio_state;
-#if defined(VEIL_MEDIA_TEST_HOOKS)
   std::shared_ptr<veil_media::PlayoutRecoveryStats> recovery_stats =
       std::make_shared<veil_media::PlayoutRecoveryStats>();
   std::unique_ptr<webrtc::NetEqFactory> recovery_factory;
-#endif
   std::unique_ptr<webrtc::Call> call;  // audio only
   std::unique_ptr<webrtc::Call> video_call;
   std::unique_ptr<veil_media::VeilTransportShim> shim;
@@ -1729,13 +1725,15 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
   webrtc::CallConfig call_cfg(ws->env, ws->worker_tq.get(),
                               ws->network_tq.get());
   call_cfg.audio_state = ws->audio_state;
+  bool recover_playout = true;
 #if defined(VEIL_MEDIA_TEST_HOOKS)
-  if (std::getenv("VEIL_MEDIA_TEST_AUDIO_DRAIN")) {
+  recover_playout = std::getenv("VEIL_MEDIA_TEST_DISABLE_AUDIO_DRAIN") == nullptr;
+#endif
+  if (recover_playout) {
     ws->recovery_factory = std::make_unique<veil_media::RecoveringNetEqFactory>(
         ws->recovery_stats);
     call_cfg.neteq_factory = ws->recovery_factory.get();
   }
-#endif
   configure_call_audio_transport(call_cfg);
   ws->call = webrtc::Call::Create(std::move(call_cfg));
   webrtc::CallConfig video_cfg(create_low_latency_environment(true),
@@ -4064,14 +4062,12 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
            sizeof(json), written);
     } else {
       std::string snapshot(json, static_cast<size_t>(written) - 1);
-#if defined(VEIL_MEDIA_TEST_HOOKS)
       snapshot += ",\"audio_latency_recovery_count\":" +
           std::to_string(ws->recovery_stats->count.load(std::memory_order_acquire));
       snapshot += ",\"audio_latency_discarded_ms\":" +
           std::to_string(ws->recovery_stats->discarded_ms.load(std::memory_order_relaxed));
       snapshot += ",\"audio_latency_fallback_frames\":" +
           std::to_string(ws->recovery_stats->fallback_frames.load(std::memory_order_relaxed));
-#endif
       const int64_t loss_now_us = webrtc::TimeMicros();
       snapshot += ",\"audio_loss_report_us\":" +
           std::to_string(audio_report.fresh_loss_report_us(loss_now_us));
