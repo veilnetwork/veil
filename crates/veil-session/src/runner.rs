@@ -233,8 +233,10 @@ mod ordered_lanes;
 pub use ordered_lanes::ParallelOrderedOffer;
 
 enum ParallelChannels {
-    Quic(parallel_lanes::ParallelSession),
-    Ordered(ordered_lanes::OrderedSession),
+    // Keep the runner's async state small regardless of transport. Each
+    // session still owns exactly one bounded pool with the same drop lifetime.
+    Quic(Box<parallel_lanes::ParallelSession>),
+    Ordered(Box<ordered_lanes::OrderedSession>),
 }
 impl ParallelChannels {
     fn note_reliable_frame(&self, canonical_full: bool) -> bool {
@@ -4203,13 +4205,15 @@ impl SessionRunner {
                                 .parallel
                                 .filter(|_| offer.peer_flows && offer.peer_rotates)
                                 .map(|parallel| {
-                                    ParallelChannels::Quic(parallel_lanes::ParallelSession::new(
-                                        parallel,
-                                        raw_tx_key,
-                                        raw_rx_key,
-                                        *session_id,
-                                        context,
-                                        status,
+                                    ParallelChannels::Quic(Box::new(
+                                        parallel_lanes::ParallelSession::new(
+                                            parallel,
+                                            raw_tx_key,
+                                            raw_rx_key,
+                                            *session_id,
+                                            context,
+                                            status,
+                                        ),
                                     ))
                                 }),
                         })
@@ -4229,7 +4233,7 @@ impl SessionRunner {
                             peer_rotates: true,
                             peer_circuit_datagrams: offer.peer_circuit_datagrams,
                             peer_neutral_forwards: offer.peer_neutral_forwards,
-                            parallel: Some(ParallelChannels::Ordered(
+                            parallel: Some(ParallelChannels::Ordered(Box::new(
                                 ordered_lanes::OrderedSession::new(
                                     parallel,
                                     raw_tx_key,
@@ -4238,7 +4242,7 @@ impl SessionRunner {
                                     context,
                                     status,
                                 ),
-                            )),
+                            ))),
                         })
                     }
                     _ => None,
@@ -4787,12 +4791,10 @@ impl SessionRunner {
                         }
                         let Some(envelope) = pq
                             .pop_admitted_envelope(|priority, frame, _, _| {
-                                if priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
-                                    && recoverable_datagram_waiting
-                                {
-                                    crate::priority_queue::HeadAdmission::DeferSource
-                                } else if priority == crate::LOCAL_SIGNALING_LANE
-                                    && signaling_wait.is_some()
+                                if (priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
+                                    && recoverable_datagram_waiting)
+                                    || (priority == crate::LOCAL_SIGNALING_LANE
+                                        && signaling_wait.is_some())
                                 {
                                     crate::priority_queue::HeadAdmission::DeferSource
                                 } else if supported(frame) {

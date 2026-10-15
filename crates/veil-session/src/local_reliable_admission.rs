@@ -194,53 +194,6 @@ impl Drop for LocalReliableAdmission {
     }
 }
 
-#[cfg(test)]
-mod feedback_tests {
-    use super::*;
-
-    #[test]
-    fn new_primary_loss_and_congestion_are_pressure_even_with_low_rtt() {
-        let mut feedback = PrimaryPathFeedback::default();
-        assert!(!feedback.observe(10_000, 0, 0, 0));
-        assert!(feedback.observe(10_000, 0, 1, 0));
-        assert!(!feedback.observe(10_000, 0, 1, 0));
-        assert!(feedback.observe(10_000, 0, 1, 1));
-        assert!(!feedback.observe(10_000, 0, 1, 1));
-        // A retired connection's counters are not a high-water mark for the
-        // fresh path. Its first newly observed loss must still restrain video.
-        assert!(!feedback.observe(10_000, 0, 0, 0));
-        assert!(feedback.observe(10_000, 0, 1, 0));
-    }
-
-    #[test]
-    fn historical_loss_does_not_extend_shared_secondary_pressure() {
-        let mut feedback = PrimaryPathFeedback::default();
-        let activity = crate::local_source_activity::LocalSourceActivity::default();
-        let now = Instant::now();
-        activity.note(now);
-        if feedback.observe(10_000, 0, 1, 0) {
-            activity.note_pressure(now);
-        }
-        assert!(activity.allow_secondary(crate::local_source_activity::LOSSY_SECONDARY_BYTES, now)); // One sparse recovery probe.
-        assert!(!activity.allow_secondary(
-            crate::local_source_activity::LOSSY_SECONDARY_BYTES,
-            now + Duration::from_millis(1)
-        ));
-        let renewed = now + PRESSURE_GRACE;
-        activity.note(renewed);
-        if feedback.observe(10_000, 0, 1, 0) {
-            activity.note_pressure(renewed);
-        }
-        assert!(
-            activity.allow_secondary(crate::local_source_activity::LOSSY_SECONDARY_BYTES, renewed)
-        );
-        assert!(activity.allow_secondary(
-            crate::local_source_activity::LOSSY_SECONDARY_BYTES,
-            renewed + Duration::from_millis(1)
-        ));
-    }
-}
-
 /// Endpoint-local write metadata never changes a frame or travels over QUIC.
 /// Holding a control lease through every partial write prevents concurrent
 /// primary observations from shrinking its window before the blob is admitted.
@@ -309,5 +262,52 @@ impl Drop for ControlWrite {
         let mut state = lock!(&self.0.state);
         state.control_writes -= 1;
         self.0.apply(&mut state);
+    }
+}
+
+#[cfg(test)]
+mod feedback_tests {
+    use super::*;
+
+    #[test]
+    fn new_primary_loss_and_congestion_are_pressure_even_with_low_rtt() {
+        let mut feedback = PrimaryPathFeedback::default();
+        assert!(!feedback.observe(10_000, 0, 0, 0));
+        assert!(feedback.observe(10_000, 0, 1, 0));
+        assert!(!feedback.observe(10_000, 0, 1, 0));
+        assert!(feedback.observe(10_000, 0, 1, 1));
+        assert!(!feedback.observe(10_000, 0, 1, 1));
+        // A retired connection's counters are not a high-water mark for the
+        // fresh path. Its first newly observed loss must still restrain video.
+        assert!(!feedback.observe(10_000, 0, 0, 0));
+        assert!(feedback.observe(10_000, 0, 1, 0));
+    }
+
+    #[test]
+    fn historical_loss_does_not_extend_shared_secondary_pressure() {
+        let mut feedback = PrimaryPathFeedback::default();
+        let activity = crate::local_source_activity::LocalSourceActivity::default();
+        let now = Instant::now();
+        activity.note(now);
+        if feedback.observe(10_000, 0, 1, 0) {
+            activity.note_pressure(now);
+        }
+        assert!(activity.allow_secondary(crate::local_source_activity::LOSSY_SECONDARY_BYTES, now)); // One sparse recovery probe.
+        assert!(!activity.allow_secondary(
+            crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+            now + Duration::from_millis(1)
+        ));
+        let renewed = now + PRESSURE_GRACE;
+        activity.note(renewed);
+        if feedback.observe(10_000, 0, 1, 0) {
+            activity.note_pressure(renewed);
+        }
+        assert!(
+            activity.allow_secondary(crate::local_source_activity::LOSSY_SECONDARY_BYTES, renewed)
+        );
+        assert!(activity.allow_secondary(
+            crate::local_source_activity::LOSSY_SECONDARY_BYTES,
+            renewed + Duration::from_millis(1)
+        ));
     }
 }
