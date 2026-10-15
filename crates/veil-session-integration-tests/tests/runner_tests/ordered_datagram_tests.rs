@@ -553,7 +553,7 @@ async fn run_neutral_forward(negotiated: bool, blocked: bool) {
     .expect("ordered child pool did not authenticate");
     // Enter the ORDINARY transit queue, with the neutral wire marker used by
     // the production delivery dispatcher. Local primary hints must play no part.
-    for direction in 0..2usize {
+    for (direction, sender) in senders.iter().enumerate() {
         let body = veil_proto::delivery::ForwardPayload {
             next_hop_node_id: [2 - direction as u8; 32],
             relay_hops: 1,
@@ -585,7 +585,7 @@ async fn run_neutral_forward(negotiated: bool, blocked: bool) {
         header.body_len = body.len() as u32;
         let mut frame = encode_header(&header).to_vec();
         frame.extend(body);
-        senders[direction]
+        sender
             .try_send((
                 veil_proto::priority::INTERACTIVE,
                 veil_bufpool::pooled_shared_from_vec(frame),

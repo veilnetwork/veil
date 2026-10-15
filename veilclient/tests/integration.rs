@@ -1798,23 +1798,25 @@ async fn blocked_remote_file_keeps_sdk_ipc_media_and_control_live() {
     })
     .await
     .unwrap();
-    let frames = gate.frames.lock().unwrap();
-    let mut actual = Vec::new();
-    for f in frames.iter().take(frames.len() - 1) {
-        let h = codec::decode_header(f).unwrap();
-        assert_eq!(h.msg_type, AppMsg::AppData as u16);
-        assert_eq!(
-            h.flags,
-            veil_proto::priority::INTERACTIVE as u16,
-            "local credit leaked to network header"
-        );
-        actual.extend(AppDataPayload::decode(&f[HEADER_SIZE..]).unwrap().data);
-    }
+    let actual = {
+        let frames = gate.frames.lock().unwrap();
+        let mut actual = Vec::new();
+        for f in frames.iter().take(frames.len() - 1) {
+            let h = codec::decode_header(f).unwrap();
+            assert_eq!(h.msg_type, AppMsg::AppData as u16);
+            assert_eq!(
+                h.flags,
+                veil_proto::priority::INTERACTIVE as u16,
+                "local credit leaked to network header"
+            );
+            actual.extend(AppDataPayload::decode(&f[HEADER_SIZE..]).unwrap().data);
+        }
+        actual
+    };
     assert_eq!(
         actual, expected,
         "loss/duplication/reordering across many source windows"
     );
-    drop(frames);
     drop(sender);
     drop(receiver);
     drop(client);

@@ -34,11 +34,20 @@ async fn runner_channels_with_backlog(
         rotate,
         shared,
         resumed,
-        reliable_priority,
-        idle_probe,
-        None,
+        RunnerProbe {
+            reliable_priority,
+            idle_probe,
+            ..RunnerProbe::default()
+        },
     )
     .await;
+}
+
+#[derive(Default)]
+struct RunnerProbe {
+    reliable_priority: Option<u8>,
+    idle_probe: Option<Duration>,
+    partial: Option<usize>,
 }
 
 async fn runner_channels_with_partial_read(
@@ -47,10 +56,13 @@ async fn runner_channels_with_partial_read(
     rotate: bool,
     shared: bool,
     resumed: bool,
-    reliable_priority: Option<u8>,
-    idle_probe: Option<Duration>,
-    partial: Option<usize>,
+    probe: RunnerProbe,
 ) {
+    let RunnerProbe {
+        reliable_priority,
+        idle_probe,
+        partial,
+    } = probe;
     let blocked_reliable = reliable_priority.is_some();
     let context = Arc::new(TransportContext::for_debug().unwrap());
     let registry = Arc::new(ParallelRegistry::default());
@@ -1350,7 +1362,18 @@ async fn authenticated_independent_datagrams_keep_parent_alive_then_silence_reap
 
 #[tokio::test]
 async fn independent_sources_continue_while_ordered_frame_header_is_incomplete() {
-    runner_channels_with_partial_read(true, true, false, false, false, None, None, Some(3)).await;
+    runner_channels_with_partial_read(
+        true,
+        true,
+        false,
+        false,
+        false,
+        RunnerProbe {
+            partial: Some(3),
+            ..RunnerProbe::default()
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1361,9 +1384,10 @@ async fn independent_sources_continue_while_ordered_frame_body_is_incomplete() {
         false,
         false,
         false,
-        None,
-        None,
-        Some(veil_proto::header::HEADER_SIZE + 16),
+        RunnerProbe {
+            partial: Some(veil_proto::header::HEADER_SIZE + 16),
+            ..RunnerProbe::default()
+        },
     )
     .await;
 }
