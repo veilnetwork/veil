@@ -771,7 +771,7 @@ impl MediaRoutes {
     pub(crate) fn received_offer_for_test(&self) -> Option<Vec<u8>> {
         self.offers
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .highest
             .as_ref()
             .map(Offer::encode)
@@ -790,7 +790,7 @@ pub(crate) struct RouteSnapshot {
 #[cfg(all(test, feature = "test-low-difficulty"))]
 impl MediaRoutes {
     pub(crate) fn emulate_legacy_peer_for_test(&self) {
-        assert!(self.tasks.lock().unwrap().is_empty());
+        assert!(self.tasks.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
         self.legacy_peer.store(true, Ordering::Release);
     }
 
@@ -828,7 +828,7 @@ impl MediaRoutes {
     pub(crate) fn receive_addresses_for_test(&self) -> Vec<(u8, [u8; 16])> {
         self.incoming
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .0
             .iter()
             .flatten()
