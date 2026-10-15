@@ -403,6 +403,7 @@ async fn accept_ws_connection(
     remote_addr: std::net::SocketAddr,
 ) -> Result<Box<dyn TransportConnection>> {
     let local_addr = stream.local_addr().ok();
+    let stream = crate::tcp_write_gate::gate(stream, |tcp| tcp);
     let path = listen_path(&bind_uri);
     // SECURITY (audit 2026-05-29): bound the WS upgrade handshake.
     let ws_stream = tokio::time::timeout(
@@ -440,6 +441,7 @@ async fn accept_wss_connection(
             .await
             .map_err(|_| handshake_timeout(WS_HANDSHAKE_TIMEOUT))?
             .map_err(|err| tls_error(err.to_string()))?;
+    let tls_stream = crate::tcp_write_gate::gate(tls_stream, |tls| tls.get_ref().0);
     let path = listen_path(&bind_uri);
     let ws_stream = tokio::time::timeout(
         WS_HANDSHAKE_TIMEOUT,
@@ -591,7 +593,7 @@ impl Transport for WebSocketTransport {
                     local_addr,
                     remote_addr,
                 },
-                stream,
+                crate::tcp_write_gate::gate(stream, |tcp| tcp),
             )
             .await
         })

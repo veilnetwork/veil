@@ -330,7 +330,9 @@ pub async fn connect_tls_client_stream(
     ctx: &TransportContext,
 ) -> Result<BoxIoStream> {
     let (tls_stream, _local, _remote) = connect_tls_rotating(host, port, sni, alpn, ctx).await?;
-    Ok(Box::new(tls_stream))
+    Ok(Box::new(crate::tcp_write_gate::gate(tls_stream, |tls| {
+        tls.get_ref()
+    })))
 }
 
 /// PKI-verified HTTPS handshake
@@ -396,7 +398,9 @@ pub async fn connect_pki_verified_https_stream(
         .map_err(|_| handshake_timeout(ctx.tcp.connect_timeout))?
         .map_err(|err| tls_error(format!("btls handshake (pki): {err}")))?;
 
-    Ok(Box::new(tls_stream))
+    Ok(Box::new(crate::tcp_write_gate::gate(tls_stream, |tls| {
+        tls.get_ref()
+    })))
 }
 
 struct TlsBoringListener {
@@ -417,8 +421,9 @@ fn native_tls_peer(
 
 fn boxed_tls_connection(
     peer: crate::PeerMeta,
-    stream: impl super::traits::IoStream + 'static,
+    stream: SslStream<TcpStream>,
 ) -> Box<dyn TransportConnection> {
+    let stream = crate::tcp_write_gate::gate(stream, |tls| tls.get_ref());
     Box::new(StreamConnection::new(peer, stream)) as Box<dyn TransportConnection>
 }
 

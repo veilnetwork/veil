@@ -9,7 +9,7 @@ async fn pair() -> (
     Box<dyn TransportListener>,
 ) {
     let mut context = TransportContext::for_debug().unwrap();
-    context.obfs4_psk = Some(Arc::new([0x42; 32].into()));
+    context.obfs4_psk = Some(Arc::new([0x42; 32]));
     let context = Arc::new(context);
     let transport = crate::obfs4_tcp::Obfs4TcpTransport;
     let bind = TransportUri::Obfs4Tcp {
