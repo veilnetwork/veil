@@ -2381,6 +2381,7 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   int reports = 0, loss = 0, jitter = 0;
   int video_reports = 0, video_loss = 0, video_jitter = 0;
   int64_t video_rtt = 0;
+  int64_t audio_loss_report_us = 0, video_loss_report_us = 0;
   int playout_peers = 0, playout_reports = 0, playout_ms = -1;
   int64_t rtt = 0;
   uint64_t video_frames = 0;
@@ -2405,6 +2406,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
       playout_ms = std::max(playout_ms, playout.delay_ms);
     }
     const auto video_report = entry.second->shim->video_feedback();
+    video_loss_report_us = std::max(video_loss_report_us,
+        video_report.fresh_loss_report_us(now_us));
     if (video_report.fresh_at(now_us)) {
       ++video_reports;
       video_loss = std::max(video_loss, video_report.loss_pct);
@@ -2412,6 +2415,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
       video_rtt = std::max(video_rtt, video_report.rtt_ms);
     }
     const auto report = entry.second->shim->audio_feedback();
+    audio_loss_report_us = std::max(audio_loss_report_us,
+        report.fresh_loss_report_us(now_us));
     if (!report.fresh_at(now_us)) continue;
     ++reports;
     loss = std::max(loss, report.loss_pct);
@@ -2489,6 +2494,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   // Capability remains explicit on a stalled worker: unknown audio never
   // falls back to video ingress. These fields are endpoint-local JSON only.
   std::string snapshot(json, static_cast<size_t>(written) - 1);
+  snapshot += ",\"audio_loss_report_us\":" + std::to_string(audio_loss_report_us) +
+              ",\"video_loss_report_us\":" + std::to_string(video_loss_report_us);
   snapshot += ",\"audio_playout_peers\":" + std::to_string(playout_peers) +
               ",\"audio_playout_sequence\":" + std::to_string(ws->audio_playout_revision) +
               ",\"audio_playout_reports\":" + std::to_string(playout_reports) +
@@ -4042,6 +4049,11 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
            sizeof(json), written);
     } else {
       std::string snapshot(json, static_cast<size_t>(written) - 1);
+      const int64_t loss_now_us = webrtc::TimeMicros();
+      snapshot += ",\"audio_loss_report_us\":" +
+          std::to_string(audio_report.fresh_loss_report_us(loss_now_us));
+      snapshot += ",\"video_loss_report_us\":" +
+          std::to_string(video_report.fresh_loss_report_us(loss_now_us));
       snapshot += ",\"audio_output_emitted_samples\":" + std::to_string(audio_output_emitted_samples);
       snapshot += ",\"audio_total_samples_received\":" + std::to_string(audio_total_samples_received);
       snapshot += ",\"audio_output_duration_ms\":" + std::to_string(audio_output_duration_ms);
