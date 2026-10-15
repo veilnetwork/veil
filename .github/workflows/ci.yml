@@ -366,11 +366,15 @@ jobs:
         # the test run reuses these artifacts instead of doing a second
         # incremental rebuild with different features (would invalidate
         # most of the dependency graph).
+        # Match nextest's debug level too: a different level rebuilds the same
+        # dependency graph before any test can run.
         env:
+          CARGO_PROFILE_DEV_DEBUG: '1'
           RUSTFLAGS: '-C link-arg=-fuse-ld=mold'
         run: cargo build --workspace --features veilcore/test-low-difficulty,veilcore/allow-empty-seeds
 
       - name: Run unit tests (nextest)
+        # Keep every failure from this expensive build in one report.
         # Phase Q.5 CI fix: cargo-nextest run lib + bins + tests in parallel
         # processes — 1.5-3x faster than `cargo test` for our suite (~600
         # individual tests across 60+ crates) because the per-test process
@@ -392,6 +396,7 @@ jobs:
             --workspace \
             --features veilcore/test-low-difficulty,veilcore/allow-empty-seeds \
             --lib --bins --tests \
+            --no-fail-fast \
             --test-threads=2
 
       - name: Run feature-gated tests
