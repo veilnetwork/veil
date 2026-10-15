@@ -429,6 +429,16 @@ extern "C" int veil_media_test_audio_capture_tone(
   return VEIL_MEDIA_OK;
 }
 
+// The host chooses its own pre-start route controls. Anonymous routes must
+// not inherit the non-onion helper's packet-overhead/1000-byte RTP overrides.
+extern "C" VeilMediaEngine* veil_media_test_codec_create_unstarted(
+    uint64_t chan, const uint8_t local[32], const uint8_t peer[32]) {
+  g_call_plane_recording_adm = true;
+  auto* e = veil_media_engine_create(chan, local, peer);
+  g_call_plane_recording_adm = false;
+  return e;
+}
+
 // Production codec/Call wiring with a deterministic duplex ADM and the
 // negotiated v4 transport settings. These controls must precede StartAudio,
 // which freezes transport feedback; the older playout helper starts at once.
