@@ -144,6 +144,10 @@ try {
     # VEIL_MEDIA_HAVE_WEBRTC switches the engine from the ABI-only stub to the
     # real implementation; -I<src> finds veil_camera.h and friends.
     $cmd = $cmd -replace '^(\S+)', ('$1 -DVEIL_MEDIA_HAVE_WEBRTC=1 -I"' + $srcDirFwd + '"')
+    if ($templateCmd -match 'WEBRTC_ENABLE_PROTOBUF=1') {
+      $protobufDir = (Join-Path $WebrtcSrc 'third_party/protobuf/src') -replace '\\', '/'
+      $cmd += ' -I"' + $protobufDir + '"'
+    }
 
     # WebRTC compiles with /showIncludes so ninja can track header
     # dependencies. We are not ninja, and it buries the one line that matters
@@ -188,6 +192,7 @@ try {
   # uses. Leaving them out builds a DLL that links and loads and has no voice
   # messages in it.
   $tus = @(
+    'webrtc_ana/controller_manager.cc',
     'veil_media_engine.cc',
     'veil_transport_shim.cc',
     'veil_audio_record.cc',

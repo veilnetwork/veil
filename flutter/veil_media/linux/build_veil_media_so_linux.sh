@@ -32,20 +32,23 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # Compile one TU with call.cc's EXACT flags (bundled clang, __Cr libc++,
 # -std=c++20, linux sysroot), swapping only the source.
 compile_tu() {  # $1=src  $2=out.o
-  python3 - "$CC_JSON" "$1" "$2" "$SRCDIR" <<'PY' > "$TMP/tu.sh"
+  python3 - "$CC_JSON" "$1" "$2" "$SRCDIR" "$WEBRTC_SRC" <<'PY' > "$TMP/tu.sh"
 import json,sys,re
 cc=json.load(open(sys.argv[1])); src,out,shimdir=sys.argv[2],sys.argv[3],sys.argv[4]
 e=next(x for x in cc if x.get('file','').endswith('call/call.cc'))
 cmd=(e['command'] if e.get('command') else ' '.join(e['arguments'])).strip()
 s=re.search(r'(\S*call/call\.cc)',cmd).group(1)
 cmd=cmd.replace(s,src); cmd=re.sub(r'-o\s+\S+','-o '+out,cmd)
-p=cmd.split(' ',1); cmd=p[0]+' -DVEIL_MEDIA_HAVE_WEBRTC=1 -I'+shimdir+' '+p[1]
+cmd=re.sub(r'-MF\s+\S+', '-MF '+out+'.d', cmd)
+extra=' -I'+sys.argv[5]+'/third_party/protobuf/src' if '-DWEBRTC_ENABLE_PROTOBUF=1' in cmd else ''
+p=cmd.split(' ',1); cmd=p[0]+' -DVEIL_MEDIA_HAVE_WEBRTC=1 -I'+shimdir+extra+' '+p[1]
 open('/dev/stdout','w').write('cd "'+e['directory']+'"\n'+cmd+'\n')
 PY
   bash "$TMP/tu.sh"
 }
 
 echo "==> compiling engine + shim + v4l2_camera (linux toolchain)"
+compile_tu "$SRCDIR/webrtc_ana/controller_manager.cc" "$TMP/ana.o"
 compile_tu "$SRCDIR/veil_media_engine.cc" "$TMP/engine.o"
 compile_tu "$SRCDIR/veil_transport_shim.cc" "$TMP/shim.o"
 compile_tu "$SRCDIR/veil_v4l2_camera.cc" "$TMP/v4l2.o"
@@ -86,7 +89,7 @@ echo "==> linking libveil_media.so ($TGT, lld, sysroot libgcc unwinder)"
 # shellcheck disable=SC2086
 "$CLANGXX" -shared -o "$DEST/libveil_media.so" \
   $TGT --sysroot="$SYSROOT" -fuse-ld=lld -nostdlib++ -rtlib=libgcc -unwindlib=libgcc \
-  "$TMP/engine.o" "$TMP/shim.o" "$TMP/v4l2.o" "$TMP/record.o" "$TMP/play.o" "$TMP/vnote.o" obj/libwebrtc.a $CXX_OBJS \
+  "$TMP/ana.o" "$TMP/engine.o" "$TMP/shim.o" "$TMP/v4l2.o" "$TMP/record.o" "$TMP/play.o" "$TMP/vnote.o" obj/libwebrtc.a $CXX_OBJS \
   -Wl,--gc-sections -Wl,--version-script,"$TMP/exports.map" \
   -Wl,-soname,libveil_media.so -Wl,-rpath,'$ORIGIN' \
   -lpthread -ldl -lrt -lm -lX11
