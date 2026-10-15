@@ -43,6 +43,55 @@ fn video_packet(timestamp: u32, marker: bool, fill: u8) -> Vec<u8> {
 }
 
 #[test]
+fn sealed_relay_media_size_accounts_for_ordered_record_framing() {
+    use veil_proto::delivery::{DeliveryEnvelope, ForwardPayload};
+    use veil_proto::{FrameHeader, codec};
+    use veil_session::realtime_datagram::RealtimeDatagramTx;
+
+    // The channel's opaque prefix consumes 20 bytes of the negotiated
+    // 1200-byte record. Exercise the real seal, Forward and fragment codecs;
+    // checking the RTP size alone missed the extra record on ordered routes.
+    let cipher = cipher_for_test(&[0xd7; 32], &[1; 32], &[2; 32]).unwrap();
+    let mut tx = RealtimeDatagramTx::new(&[3; 32], &[4; 32]);
+    for (size, fragments) in [(840, 1), (841, 2), (1000, 2)] {
+        let mut packet = video_packet(7, true, 3);
+        packet.resize(size, 3);
+        let sealed = cipher.seal(&packet).unwrap();
+        let forward = ForwardPayload {
+            next_hop_node_id: [5; 32],
+            envelope: DeliveryEnvelope {
+                recipient: veil_proto::recipient::Recipient::any([6; 32]),
+                sender_node_id: [7; 32],
+                src_app_id: [8; 32],
+                app_id: [9; 32],
+                endpoint_id: 0,
+                content_id: [10; 32],
+                created_at: 0,
+                ttl_secs: veil_proto::delivery::FORWARD_REALTIME_TTL_SECS,
+                payload: sealed.as_bytes().to_vec(),
+                trace_id: 0,
+                require_ack: false,
+            },
+            relay_hops: 0,
+            delivery_attempt: None,
+            traffic_class: Some(veil_proto::priority::INTERACTIVE),
+        };
+        let body = forward.encode();
+        let mut header = FrameHeader::new(
+            veil_proto::family::FrameFamily::Delivery as u8,
+            veil_proto::family::DeliveryMsg::Forward as u16,
+        );
+        header.flags = u16::from(veil_proto::priority::INTERACTIVE);
+        header.body_len = body.len() as u32;
+        let mut frame = codec::encode_header(&header).to_vec();
+        frame.extend_from_slice(&body);
+        let encoded = tx.encode_frame(&frame, 1200 - 20).unwrap();
+        assert_eq!(encoded.len(), fragments, "RTP size {size}");
+        assert!(encoded.iter().all(|packet| packet.len() + 20 <= 1200));
+    }
+}
+
+#[test]
 fn media_priority_classifies_only_vp8_rtp_as_video() {
     assert!(media_is_vp8_rtp(&[0x80, 96, 0, 1]));
     assert!(media_is_vp8_rtp(&[0x80, 0x80 | 96, 0, 1]));
