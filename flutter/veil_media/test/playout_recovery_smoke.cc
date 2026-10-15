@@ -52,7 +52,9 @@ int main() {
     auto* observed = decoder.get();
     observed->mode = mode;
     auto stats = std::make_shared<veil_media::PlayoutRecoveryStats>();
-    veil_media::RecoveringNetEq recovering(std::move(decoder), stats);
+    auto clock = std::make_unique<webrtc::TickTimer>();
+    auto* observed_clock = clock.get();
+    veil_media::RecoveringNetEq recovering(std::move(decoder), stats, std::move(clock));
     webrtc::AudioFrame frame;
     bool muted = false;
     int rate = 0;
@@ -65,6 +67,10 @@ int main() {
     assert(observed->pulls == (mode >= 5 ? 1 : mode == 4 ? 17 : 2));
     assert(stats->discarded_ms == (mode == 4 ? 160u : mode == 0 ? 10u : 0u));
     assert(stats->fallback_frames == (mode == 1 || mode == 2 ? 1u : 0u));
+    assert(observed_clock->ticks() == 1); // up to 17 decoder pulls, one render tick
+    assert(recovering.GetAudio(&frame, &muted, &rate,
+        webrtc::NetEq::Operation::kNormal) == (mode == 3 ? webrtc::NetEq::kFail : 0));
+    assert(observed_clock->ticks() == 2);
   }
   std::puts("catch-up preserves usable speech on PLC/mute/error; work bounded to 16 pulls");
 }
