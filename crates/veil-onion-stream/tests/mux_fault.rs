@@ -254,13 +254,14 @@ async fn faster_control_lane_fin_waits_for_background_data_before_eof() {
         "FIN discarded, duplicated or reordered pending bytes"
     );
     assert_eq!(receiver.end_reason(), veil_onion_stream::End::Eof);
-    let faults = bus.faults.lock().unwrap();
-    assert_eq!(
-        faults.fin_before_data, 1,
-        "test did not deliver FIN before DATA"
-    );
-    assert!(faults.deferred_a_data.is_empty());
-    drop(faults);
+    {
+        let faults = bus.faults.lock().unwrap();
+        assert_eq!(
+            faults.fin_before_data, 1,
+            "test did not deliver FIN before DATA"
+        );
+        assert!(faults.deferred_a_data.is_empty());
+    }
     sender.reset(reset_reason::APP).await;
 }
 
