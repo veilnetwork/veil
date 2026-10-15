@@ -235,8 +235,8 @@ async fn source_lane_survives_sdk_ipc_but_is_absent_from_network_frame() {
         .unwrap();
     assert_eq!(
         lane,
-        veil_proto::priority::INTERACTIVE,
-        "ordinary SDK send keeps its old queue"
+        veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
+        "ordinary SDK DATA participates in local recoverable-traffic admission"
     );
     assert_eq!(
         veil_proto::codec::decode_header(&original).unwrap().flags,
