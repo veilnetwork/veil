@@ -83,6 +83,7 @@ struct SessionTxEntry {
 /// Registry of outbound send channels, one per active session.
 #[derive(Debug)]
 pub struct SessionTxRegistry {
+    replication: crate::local_replication::LocalReplication,
     source_activity: Arc<crate::local_source_activity::LocalSourceActivity>,
     senders: HashMap<NodeIdBytes, SessionTxEntry>,
     /// Last send time per peer (Unix milliseconds). `AtomicU64` so the
@@ -112,6 +113,7 @@ pub enum SendToError {
 impl Default for SessionTxRegistry {
     fn default() -> Self {
         Self {
+            replication: Default::default(),
             source_activity: Arc::default(),
             senders: HashMap::new(),
             last_active: HashMap::new(),
@@ -155,6 +157,7 @@ impl SessionTxRegistry {
     /// Create with a custom per-session channel capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
+            replication: Default::default(),
             source_activity: Arc::default(),
             senders: HashMap::new(),
             last_active: HashMap::new(),
@@ -170,6 +173,7 @@ impl SessionTxRegistry {
     /// visible in Prometheus metrics.
     pub fn with_capacity_and_drop_counter(capacity: usize, drops_total: Arc<AtomicU64>) -> Self {
         Self {
+            replication: Default::default(),
             source_activity: Arc::default(),
             senders: HashMap::new(),
             last_active: HashMap::new(),
@@ -544,6 +548,31 @@ impl SessionTxRegistry {
         // copy but bypasses pool reuse on drop. Prefer `send_to_arc`
         // when the caller already holds a `PooledShared`.
         self.send_to_result(peer_id, priority, bytes).is_ok()
+    }
+
+    /// Queue this node's OWN best-effort background publication. Uniformly
+    /// paced across neighbors, with bounded memory/age and weak task ownership.
+    /// Returns local queue admission, not remote delivery. Ordinary routing,
+    /// responses and transit use their existing send APIs.
+    pub fn send_local_replication(
+        registry: &Arc<std::sync::RwLock<Self>>,
+        peer_id: NodeIdBytes,
+        bytes: Vec<u8>,
+    ) -> bool {
+        let guard = registry.read().unwrap_or_else(|p| p.into_inner());
+        if !guard.has_session(&peer_id) {
+            return false;
+        }
+        let accepted = guard.replication.enqueue(
+            Arc::downgrade(registry),
+            peer_id,
+            bytes,
+            Arc::clone(&guard.drops_total),
+        );
+        if !accepted {
+            guard.drops_total.fetch_add(1, Ordering::Relaxed);
+        }
+        accepted
     }
 
     /// Send only while `owner` still holds this peer's slot.

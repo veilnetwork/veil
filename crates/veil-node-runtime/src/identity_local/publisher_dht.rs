@@ -128,9 +128,8 @@ impl IdentityPublisher for DhtBackedPublisher {
 
 /// Fire-and-forget K-closest replication of `(dht_key, value)`: find the
 /// `DHT_REPLICATION_K` closest peers in keyspace and send each a
-/// `RecursiveQuery(STORE)`. SYNCHRONOUS — `send_to` only queues frames (no
-/// await) — so a caller in a sync context (the rendezvous-ad maintenance
-/// publish) can replicate without an async hop. Used by
+/// `RecursiveQuery(STORE)`. Synchronous queue admission, with paced background
+/// emission in the node's runtime; callers never wait for the network. Used by
 /// [`DhtBackedPublisher::put`] and `NodeRuntime::tick_publish_rendezvous_ads`.
 pub(crate) fn replicate_dht_value(
     dht: &Arc<KademliaService>,
@@ -165,15 +164,23 @@ pub(crate) fn replicate_dht_value(
         );
     }
 
-    let mut candidates: Vec<[u8; 32]> = candidates_with_uri.into_iter().map(|(n, _)| n).collect();
-    {
+    let candidates = {
         let guard = tx_reg.read().unwrap_or_else(|p| p.into_inner());
+        let mut candidates: Vec<[u8; 32]> = candidates_with_uri
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| guard.has_session(n))
+            .collect();
         for peer in guard.peer_ids() {
+            if candidates.len() >= veil_proto::budget::DHT_REPLICATION_K {
+                break;
+            }
             if peer != local_node_id && !candidates.contains(&peer) {
                 candidates.push(peer);
             }
         }
-    }
+        candidates
+    };
     // A phone can connect to its first seed before its DHT routing table has
     // learned that peer. The active session is already a valid STORE path;
     // returning on an empty closest-set above left all startup identity and
@@ -210,7 +217,7 @@ pub(crate) fn replicate_dht_value(
     // Fan-out — fire-and-forget. Peers without a direct session are silently
     // skipped; the STORE forwards greedily on receivers we DO have sessions to.
     //
-    // BACKGROUND, not INTERACTIVE. Nothing waits on this: it republishes a
+    // Paced local BACKGROUND publications. Nothing waits on this: it republishes a
     // record we already hold, on a half-life cadence with hours of slack, and
     // the call does not even read the outcome. INTERACTIVE bought it nothing
     // and cost something — the outbound coalescer only packs when the queue
@@ -226,13 +233,8 @@ pub(crate) fn replicate_dht_value(
     //
     // Send-path DHT lookups keep INTERACTIVE: a resolve in service of an
     // actual send IS latency-sensitive. This one is not.
-    let guard = tx_reg.read().unwrap_or_else(|p| p.into_inner());
     for peer in candidates {
-        let _ = guard.send_to(
-            &peer,
-            veil_proto::header::priority::BACKGROUND,
-            frame.clone(),
-        );
+        let _ = SessionTxRegistry::send_local_replication(tx_reg, peer, frame.clone());
     }
 }
 
@@ -353,7 +355,9 @@ mod tests {
             .unwrap();
 
         assert!(
-            received.try_recv().is_ok(),
+            tokio::time::timeout(std::time::Duration::from_secs(1), received.recv())
+                .await
+                .is_ok_and(|frame| frame.is_some()),
             "the first live seed got no STORE"
         );
     }
@@ -399,5 +403,30 @@ mod tests {
         let bytes = dht.get_local(&key).expect("doc stored at canonical slot");
         let decoded = IdentityDocument::decode(&bytes).unwrap();
         assert_eq!(decoded.node_id, out.node_id);
+    }
+
+    #[tokio::test]
+    async fn cold_routing_table_uses_live_fallback_without_exceeding_replica_count() {
+        let dht = fresh_kademlia().await;
+        let mut registry = SessionTxRegistry::new();
+        let receivers: Vec<_> = (2..(veil_proto::budget::DHT_REPLICATION_K + 5) as u8)
+            .map(|n| registry.register([n; 32]))
+            .collect();
+        let publisher =
+            DhtBackedPublisher::with_replication(dht, Arc::new(RwLock::new(registry)), [1; 32]);
+        publisher.put([0xAA; 32], vec![0x42; 100]).await.unwrap();
+        let mut waits = tokio::task::JoinSet::new();
+        for mut receiver in receivers {
+            waits.spawn(async move {
+                tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                    .await
+                    .is_ok_and(|frame| frame.is_some())
+            });
+        }
+        let mut received = 0;
+        while let Some(result) = waits.join_next().await {
+            received += usize::from(result.unwrap());
+        }
+        assert_eq!(received, veil_proto::budget::DHT_REPLICATION_K);
     }
 }
