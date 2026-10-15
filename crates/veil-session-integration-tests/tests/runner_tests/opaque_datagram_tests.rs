@@ -43,6 +43,15 @@ async fn runner_channels_with_backlog(
     .await;
 }
 
+async fn receive_after_warmup(receiver: &mut mpsc::Receiver<AppMessage>) -> AppMessage {
+    loop {
+        let message = receiver.recv().await.expect("runner receiver closed");
+        if !matches!(&message, AppMessage::RtData { payload, .. } if payload.seq == u32::MAX) {
+            return message;
+        }
+    }
+}
+
 #[derive(Default)]
 struct RunnerProbe {
     reliable_priority: Option<u8>,
@@ -291,9 +300,9 @@ async fn runner_channels_with_partial_read(
         });
         runner.session_id = [3; 32];
         runner.raw_session_keys = Some((tx_key, rx_key, [3; 32]));
+        runner.local_node_id = node_ids[direction];
+        runner.peer_id = node_ids[1 - direction];
         if rotate || resumed {
-            runner.local_node_id = node_ids[direction];
-            runner.peer_id = node_ids[1 - direction];
             runner.crypto.tx_cipher = Some(veil_crypto::session_cipher::SessionCipher::new(
                 &tx_key, true,
             ));
@@ -320,6 +329,41 @@ async fn runner_channels_with_partial_read(
         tasks.push(tokio::spawn(async move { runner.run().await }));
         receivers.push(receiver);
         senders.push(out_tx);
+    }
+    if parallel {
+        // These legacy, one-way children predate readiness requests. Keep a
+        // paced producer alive while they authenticate; startup loss is allowed.
+        // The partial canonical frame remains in place throughout preparation.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                for sender in &senders {
+                    for lane in [0, 2, 3] {
+                        let body = AppRtDataPayload {
+                            src_app_id: [0xb0; 32],
+                            app_id,
+                            endpoint_id: 1,
+                            seq: u32::MAX,
+                            timestamp_us: 0,
+                            marker: 0,
+                            payload_type: 0,
+                            payload: vec![0x57; 32],
+                        }.encode();
+                        let mut header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppRtData as u16);
+                        header.body_len = body.len() as u32;
+                        let mut frame = encode_header(&header).to_vec();
+                        frame.extend(body);
+                        sender.send((lane, veil_bufpool::pooled_shared_from_vec(frame))).await.unwrap();
+                    }
+                }
+                for receiver in &mut receivers {
+                    while let Ok(message) = receiver.try_recv() {
+                        assert!(matches!(message, AppMessage::RtData { payload, .. } if payload.seq == u32::MAX));
+                    }
+                }
+                if diagnostics.iter().all(|d| [0, 2, 3].iter().all(|&lane| d.sent(lane) > 0)) { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("independent source children did not authenticate");
     }
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         let probe_started = tokio::time::Instant::now();
@@ -377,7 +421,7 @@ async fn runner_channels_with_partial_read(
                         .send((local_priority, frame))
                         .await
                         .unwrap();
-                    match receivers[direction].recv().await.unwrap() {
+                    match receive_after_warmup(&mut receivers[direction]).await {
                         AppMessage::RtData { payload, .. } => {
                             assert_eq!(payload.seq, seq);
                             assert_eq!(payload.payload, data);
@@ -385,20 +429,13 @@ async fn runner_channels_with_partial_read(
                         other => panic!("unexpected reverse dispatch {other:?}"),
                     }
                 }
-                match receivers[1 - direction].recv().await.unwrap() {
+                match receive_after_warmup(&mut receivers[1 - direction]).await {
                     AppMessage::RtData {
                         src_node_id,
                         payload,
                         ..
                     } => {
-                        assert_eq!(
-                            src_node_id,
-                            if resumed {
-                                node_ids[direction]
-                            } else {
-                                [if rotate { direction as u8 + 1 } else { 1 }; 32]
-                            }
-                        );
+                        assert_eq!(src_node_id, node_ids[direction]);
                         assert_eq!(payload.seq, seq);
                         assert_eq!(payload.payload, data);
                     }

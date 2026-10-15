@@ -187,7 +187,7 @@ async fn compact_video_batches_ready_frames_without_crossing_cell_or_frame_bound
                 if mode == MEDIA_BATCHING_COMPACT_RELAY {
                     assert!(cell.len() <= COMPACT_RELAY_MEDIA_CELL_MAX);
                 }
-                let packets = expand_wire_cells(&[cell.clone()]);
+                let packets = expand_wire_cells(std::slice::from_ref(&cell));
                 let timestamp = &packets[0][4..8];
                 assert!(packets.iter().all(|p| &p[4..8] == timestamp));
                 cells.push(cell);
