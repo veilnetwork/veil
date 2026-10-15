@@ -1,13 +1,13 @@
 use bytes::Bytes;
-use rand::Rng;
+use rand::RngExt;
 use tracing::{debug, trace, trace_span};
 
-use super::{Connection, SentFrames, spaces::SentPacket};
+use super::{spaces::SentPacket, Connection, SentFrames};
 use crate::{
-    ConnectionId, Instant, TransportError, TransportErrorCode,
     connection::ConnectionSide,
     frame::{self, Close},
-    packet::{FIXED_BIT, Header, InitialHeader, LongType, PacketNumber, PartialEncode, SpaceId},
+    packet::{Header, InitialHeader, LongType, PacketNumber, PartialEncode, SpaceId, FIXED_BIT},
+    ConnectionId, Instant, TransportError, TransportErrorCode,
 };
 
 pub(super) struct PacketBuilder {

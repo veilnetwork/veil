@@ -23,6 +23,11 @@
 
 ### Fixed
 
+- Update rustls to 0.23.46 and the locally patched quinn-proto to 0.11.18.
+  Include upstream fixes for empty datagram queue exhaustion, stream reassembly
+  limits, connection-ID retirement bounds, empty unordered reads and ACK-delay
+  validation. Preserve local datagram deadlines and timing diagnostics, and
+  charge datagram metadata when admitting complete frames.
 - Preserve fresh video bursts across temporary independent-transport capacity
   pressure without extending their original deadline or blocking audio.
 - Recover excessive unicast decoded audio backlog with bounded catch-up while

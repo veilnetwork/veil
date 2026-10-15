@@ -6,27 +6,26 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll, Waker, ready},
+    task::{ready, Context, Poll, Waker},
 };
 
 use bytes::Bytes;
 use pin_project_lite::pin_project;
 use rustc_hash::FxHashMap;
 use thiserror::Error;
-use tokio::sync::{Notify, futures::Notified, mpsc, oneshot};
-use tracing::{Instrument, Span, debug_span};
+use tokio::sync::{futures::Notified, mpsc, oneshot, Notify};
+use tracing::{debug_span, Instrument, Span};
 
 use crate::{
-    ConnectionEvent, Duration, Instant, VarInt,
     mutex::Mutex,
     recv_stream::RecvStream,
     runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller},
     send_stream::SendStream,
-    udp_transmit,
+    udp_transmit, ConnectionEvent, Duration, Instant, VarInt,
 };
 use proto::{
-    ConnectionError, ConnectionHandle, ConnectionStats, Dir, EndpointEvent, Side, StreamEvent,
-    StreamId, congestion::Controller,
+    congestion::Controller, ConnectionError, ConnectionHandle, ConnectionStats, Dir, EndpointEvent,
+    Side, StreamEvent, StreamId,
 };
 
 /// Local scheduling delays, independent of protocol or application contents.
@@ -554,6 +553,11 @@ impl Connection {
             .max_size()
     }
 
+    /// Queue bytes charged for one datagram, including its local timing metadata.
+    pub fn datagram_send_queue_charge(payload_bytes: usize) -> usize {
+        proto::Datagrams::send_queue_charge(payload_bytes)
+    }
+
     /// Bytes available in the outgoing datagram buffer
     ///
     /// When greater than zero, calling [`send_datagram()`](Self::send_datagram) with a datagram of
@@ -565,6 +569,16 @@ impl Connection {
             conn.wake();
         }
         conn.inner.datagrams().send_buffer_space()
+    }
+
+    /// Free queue memory for callers admitting complete batches with `datagram_send_queue_charge`.
+    pub fn datagram_send_queue_space(&self) -> usize {
+        let conn = &mut *self.0.state.lock("datagram_send_queue_space");
+        let now = conn.runtime.now();
+        if conn.inner.datagrams().expire(now) > 0 {
+            conn.wake();
+        }
+        conn.inner.datagrams().send_queue_space()
     }
 
     /// Total unsent datagrams discarded by local deadlines on this connection.

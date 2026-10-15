@@ -279,11 +279,16 @@ impl QuicDatagramHandle {
             })
     }
 
+    /// Queue bytes charged for the payload and its local datagram metadata.
+    pub fn queue_charge(payload_bytes: usize) -> usize {
+        quinn::Connection::datagram_send_queue_charge(payload_bytes)
+    }
+
     /// Remaining bytes in Quinn's outgoing DATAGRAM queue. A value smaller
     /// than the next datagram means `send_datagram` will discard older queued
     /// media to preserve recency.
     pub fn send_buffer_space(&self) -> usize {
-        self.connection.datagram_send_buffer_space()
+        self.connection.datagram_send_queue_space()
     }
 
     /// Receive the next unreliable datagram for this connection.
