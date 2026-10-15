@@ -4964,20 +4964,18 @@ mod tests {
         net.stop().await;
     }
 
-    /// Bridge the two Stage-B regression layers through real runtimes:
-    /// A sends a token-bearing request through coordinator C, target B hands
-    /// it to its asynchronous UDP responder, B discovers a mapping through a
-    /// real fixed-size reflector, and the resulting srflx candidate plus the
-    /// exact one-time token travel B → C → A.
+    /// A token-bearing request crosses A -> coordinator C -> target B, but
+    /// a loopback srflx offer must stop before B starts UDP discovery. A
+    /// subsequent public offer must reach that same discovery socket. The
+    /// production responder now validates candidates before opening a socket;
+    /// expecting a reply here would contradict that SSRF boundary.
     ///
-    /// Loopback candidates are intentionally rejected by the subsequent
-    /// public-address punch guard, so this hermetic scenario stops at the
-    /// signaling boundary. `veil-node-runtime` separately proves that two
-    /// accepted mappings converge through punch and promote the same sockets
-    /// into QUIC. Together the tests cover the production seam without ever
-    /// weakening the SSRF/public-range guard for test traffic.
+    /// The preceding legacy coordinator round-trip covers the reply route.
+    /// `udp_punch_responder_matches_initiator_family` covers discovery for a
+    /// usable public offer, and veil-nat covers reflector fallback separately.
+    /// The canary never replies, so neither offer sends public punch traffic.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn stage_b_token_bearing_udp_responder_round_trips_srflx_via_coordinator() {
+    async fn stage_b_token_bearing_udp_responder_gates_discovery_via_coordinator() {
         use crate::proto::control::candidate_type;
         use tokio::{net::UdpSocket, sync::oneshot};
 
@@ -4990,45 +4988,13 @@ mod tests {
             reflector_socket,
             reflector_stop_rx,
         ));
-        // The first reflector intentionally reports its own loopback IP — the
-        // same shape as a VPN exiting on the reflector host. A second scripted
-        // endpoint returns a distinct observation so the production
-        // punch-discovery policy must skip the first and continue within the
-        // same deadline.
-        let independent_socket = UdpSocket::bind("127.0.0.1:0")
+        let discovery_canary = UdpSocket::bind("127.0.0.1:0")
             .await
-            .expect("bind independent scripted reflector");
-        let independent_addr = independent_socket
-            .local_addr()
-            .expect("independent reflector addr");
-        let independent_mapping_ip = [203, 0, 113, 42];
-        let independent_reflector = tokio::spawn(async move {
-            let mut request = [0u8; veil_nat::UDP_PUNCH_PACKET_LEN];
-            let (len, source) = independent_socket
-                .recv_from(&mut request)
-                .await
-                .expect("scripted reflector receive");
-            assert_eq!(len, veil_nat::UDP_PUNCH_PACKET_LEN);
-            let mut reply = [0u8; veil_nat::UDP_PUNCH_PACKET_LEN];
-            reply[..8].copy_from_slice(b"VEILUDP1");
-            reply[8] = 2; // KIND_DISCOVER_REPLY
-            reply[9] = 4;
-            reply[10..26].copy_from_slice(&request[10..26]);
-            reply[26..30].copy_from_slice(&independent_mapping_ip);
-            reply[42..44].copy_from_slice(&source.port().to_be_bytes());
-            independent_socket
-                .send_to(&reply, source)
-                .await
-                .expect("scripted reflector reply");
-        });
-
+            .expect("bind discovery canary");
         let mut net = SimNetwork::builder()
             .nodes(3)
             .role(NodeRole::Core)
-            .udp_reflectors(vec![
-                reflector_addr.to_string(),
-                independent_addr.to_string(),
-            ])
+            .udp_reflectors(vec![discovery_canary.local_addr().unwrap().to_string()])
             .build()
             .await;
         net.wire_star().await;
@@ -5043,7 +5009,6 @@ mod tests {
         }
 
         let coordinator_id = net.node(0).node_id();
-        let a_id = net.node(1).node_id();
         let b_id = net.node(2).node_id();
         let initiator_socket = UdpSocket::bind("127.0.0.1:0")
             .await
@@ -5057,10 +5022,10 @@ mod tests {
         .await
         .expect("initiator discovery io")
         .expect("initiator mapping");
+        assert!(initiator_mapping.ip().is_loopback());
         let mut initiator_candidate = veil_nat::socket_addr_to_candidate(initiator_mapping);
         initiator_candidate.candidate_type = candidate_type::SRFLX;
         initiator_candidate.priority = 1_694_498_815;
-        let punch_token = [0xA7; 16];
 
         let reply = net
             .node(1)
@@ -5069,35 +5034,66 @@ mod tests {
                 b_id,
                 coordinator_id,
                 vec![initiator_candidate],
-                Duration::from_secs(5),
-                punch_token,
+                Duration::from_millis(500),
+                [0xA7; 16],
             )
-            .await
-            .expect("async UDP responder must reply through the coordinator");
-
-        assert_eq!(reply.responder_node_id, b_id);
-        assert_eq!(reply.final_target_node_id, a_id);
-        assert_eq!(reply.punch_token, Some(punch_token));
-        assert_eq!(reply.candidates.len(), 1);
-        assert_eq!(
-            reply.candidates[0].candidate_type,
-            candidate_type::SRFLX,
-            "token-bearing responder must advertise its discovered UDP mapping, not a stale listener",
+            .await;
+        assert!(
+            reply.is_none(),
+            "a loopback offer must not produce a usable reply"
         );
-        let responder_mapping = veil_nat::candidate_to_socket_addr(&reply.candidates[0])
-            .expect("valid responder srflx candidate");
-        assert_eq!(responder_mapping.ip().to_string(), "203.0.113.42");
-        assert_ne!(responder_mapping.port(), 0);
+        assert_eq!(
+            net.node(1).runtime.debug_nat_probe_waiters_count(),
+            0,
+            "a rejected offer must not leak a probe waiter"
+        );
+        let mut buffer = [0; veil_nat::UDP_PUNCH_PACKET_LEN];
+        assert!(
+            matches!(discovery_canary.try_recv_from(&mut buffer),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "an unusable offer must be rejected before UDP discovery",
+        );
 
+        let mut public = veil_nat::socket_addr_to_candidate("8.8.8.8:32000".parse().unwrap());
+        public.candidate_type = candidate_type::SRFLX;
+        let attempt = net
+            .node(1)
+            .runtime
+            .debug_attempt_nat_traversal_via_with_punch_token(
+                b_id,
+                coordinator_id,
+                vec![public],
+                Duration::from_secs(1),
+                [0xA8; 16],
+            );
+        let observed = tokio::time::timeout(
+            Duration::from_secs(1),
+            discovery_canary.recv_from(&mut buffer),
+        );
+        let (reply, observed) = tokio::join!(attempt, observed);
+        let waiters = net.node(1).runtime.debug_nat_probe_waiters_count();
         net.stop().await;
         let _ = reflector_stop_tx.send(());
         reflector
             .await
             .expect("reflector task")
             .expect("reflector io");
-        independent_reflector
-            .await
-            .expect("independent reflector task");
+
+        let (len, source) = observed
+            .expect("public offer must start UDP discovery")
+            .unwrap();
+        assert_eq!(len, veil_nat::UDP_PUNCH_PACKET_LEN);
+        assert!(source.ip().is_loopback());
+        assert_eq!(&buffer[..8], b"VEILUDP1");
+        assert_eq!(buffer[8], 1, "the responder must send a discovery request");
+        assert!(
+            reply.is_none(),
+            "an unanswered discovery must not fabricate a reply"
+        );
+        assert_eq!(
+            waiters, 0,
+            "an unanswered discovery must not leak a probe waiter"
+        );
     }
 
     /// prove that the client-side `SESSION_TICKET` cache
