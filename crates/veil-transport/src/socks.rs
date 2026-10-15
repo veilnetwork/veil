@@ -392,11 +392,21 @@ mod tests {
             .into_stream()
             .unwrap();
         let payload: Vec<u8> = (0..512 * 1024).map(|n| (n % 251) as u8).collect();
-        let first = stream.write(&payload).await.unwrap();
+        // Darwin's gate must cap an oversized application write itself. On
+        // other hosts there is no such gate: BoringSSL may wait for the whole
+        // supplied write, so asking it for 512 KiB before releasing this fake
+        // proxy's reader would deadlock the fixture rather than test duplex I/O.
         #[cfg(target_vendor = "apple")]
+        let initial = payload.as_slice();
+        #[cfg(not(target_vendor = "apple"))]
+        let initial = &payload[..4096];
+        let first = timeout(Duration::from_secs(2), stream.write(initial))
+            .await
+            .expect("initial proxied write stalled before reader release")
+            .unwrap();
         assert!(
             first > 0 && first <= 4096,
-            "proxied write bypassed admission: {first}"
+            "invalid initial proxied write size: {first}"
         );
         let (mut reader, mut writer) = tokio::io::split(stream);
         let remainder = payload[first..].to_vec();
