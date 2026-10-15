@@ -80,6 +80,7 @@ PY
 }
 
 echo "==> compiling engine + shim + aaudio_adm (android NDK toolchain)"
+compile_tu "$SRCDIR/webrtc_ana/controller_manager.cc" "$TMP/ana.o"
 compile_tu "$SRCDIR/veil_media_engine.cc" "$TMP/engine.o"
 compile_tu "$SRCDIR/veil_transport_shim.cc" "$TMP/shim.o"
 compile_tu "$SRCDIR/veil_aaudio_adm.cc"   "$TMP/aaudio_adm.o"
@@ -188,7 +189,7 @@ fi
 # shellcheck disable=SC2086
 "$CLANGXX" -shared -o "$DEST/libveil_media.so" \
   $TGT --sysroot="$LINK_SYSROOT" -nostdlib++ -unwindlib=none \
-  "$TMP/engine.o" "$TMP/shim.o" "$TMP/aaudio_adm.o" "$TMP/record.o" "$TMP/play.o" "$TMP/vnote.o" obj/libwebrtc.a $CXX_OBJS $UNWIND_OBJS \
+  "$TMP/ana.o" "$TMP/engine.o" "$TMP/shim.o" "$TMP/aaudio_adm.o" "$TMP/record.o" "$TMP/play.o" "$TMP/vnote.o" obj/libwebrtc.a $CXX_OBJS $UNWIND_OBJS \
   -L"$AAUDIO_L" \
   -Wl,--gc-sections -Wl,--version-script,"$TMP/exports.map" \
   -Wl,-soname,libveil_media.so \

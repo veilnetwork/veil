@@ -4,7 +4,7 @@
 #include "api/call/bitrate_allocation.h"
 #include "api/environment/environment_factory.h"
 #include "bounded_audio_encoder.h"
-#include "modules/audio_coding/audio_network_adaptor/config.pb.h"
+#include "veil_audio_adaptor_config.h"
 #include "modules/rtp_rtcp/include/rtp_header_extension_map.h"
 #include "modules/rtp_rtcp/source/rtp_header_extensions.h"
 #include "modules/rtp_rtcp/source/rtp_packet.h"
@@ -32,12 +32,7 @@ static int check_framing_budget() {
              {"useinbandfec", "1"}, {"usedtx", "1"}}), {.payload_type = 111});
     if (!encoder) return 22;
     encoder->SetReceiverFrameLengthRange(20, 60);
-    webrtc::audio_network_adaptor::config::ControllerManager manager;
-    auto* frames = manager.add_controllers()->mutable_frame_length_controller_v2();
-    frames->set_min_payload_bitrate_bps(16000);
-    frames->set_use_slow_adaptation(false);
-    manager.add_controllers()->mutable_bitrate_controller();
-    if (!encoder->EnableAudioNetworkAdaptor(manager.SerializeAsString())) return 23;
+    if (!encoder->EnableAudioNetworkAdaptor(veil_media::kFramingAudioAdaptorConfig)) return 23;
     const size_t overhead = route_overhead + rtp.headers_size();
     encoder->OnReceivedOverhead(overhead);
     const int ceiling = profile[1];
@@ -97,14 +92,7 @@ int main() {
     if (!encoder) return 1;
     if (duration->load() != 0) return 4;
     encoder->SetReceiverFrameLengthRange(20, maximum_ms);
-    webrtc::audio_network_adaptor::config::ControllerManager manager;
-    if (maximum_ms > 20) {
-      auto* frames = manager.add_controllers()->mutable_frame_length_controller_v2();
-      frames->set_min_payload_bitrate_bps(16000);
-      frames->set_use_slow_adaptation(false);
-    }
-    manager.add_controllers()->mutable_bitrate_controller();
-    if (!encoder->EnableAudioNetworkAdaptor(manager.SerializeAsString())) return 2;
+    if (!encoder->EnableAudioNetworkAdaptor(veil_media::kFramingAudioAdaptorConfig)) return 2;
     encoder->OnReceivedOverhead(209);
     const auto payload_in_bounds = [&] {
       return encoder->GetTargetBitrate() >= 16000 &&
