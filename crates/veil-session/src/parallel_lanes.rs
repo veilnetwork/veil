@@ -988,10 +988,10 @@ impl ParallelSession {
 /// Circuit witnesses describe an installed circuit incarnation, not a raw
 /// return connection. Forward witnesses retain authenticated ingress ownership.
 /// Never interpret the legacy reverse ChildCarrier as a circuit flow identity.
-pub(super) fn transit_witness<'a>(
+pub(super) fn transit_witness(
     kind: RealtimeLaneFrameKind,
-    witness: Option<&'a veil_anonymity::circuit_carrier::Carrier>,
-) -> Option<&'a veil_anonymity::circuit_carrier::Carrier> {
+    witness: Option<&veil_anonymity::circuit_carrier::Carrier>,
+) -> Option<&veil_anonymity::circuit_carrier::Carrier> {
     match kind {
         RealtimeLaneFrameKind::RelayForward => witness,
         RealtimeLaneFrameKind::CircuitDatagram => witness.filter(|w| {

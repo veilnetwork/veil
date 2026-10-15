@@ -285,7 +285,7 @@ impl PriorityQueue {
     /// expense of BULK/BACKGROUND. Drops increment `drops_total` so the
     /// runner can forward them to Prometheus.
     pub fn push(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
-        self.push_entry(priority, frame, None, None, None, None, None, None);
+        self.push_envelope((priority, frame).into(), false);
     }
 
     /// Enqueue a canonical loss-tolerant realtime frame. When its dedicated
@@ -302,16 +302,7 @@ impl PriorityQueue {
     /// Loss tolerance is independent of queue priority. In particular relayed
     /// datagrams share INTERACTIVE FIFO order with other forwarded user data.
     pub fn push_lossy(&mut self, priority: u8, frame: veil_bufpool::PooledShared) {
-        self.push_lossy_with_carrier(
-            priority,
-            frame,
-            None,
-            Instant::now(),
-            None,
-            None,
-            None,
-            None,
-        );
+        self.push_envelope((priority, frame).into(), true);
     }
 
     pub(crate) fn push_envelope(
@@ -319,52 +310,26 @@ impl PriorityQueue {
         envelope: crate::frame_outbox::FrameEnvelope,
         lossy: bool,
     ) {
-        let (priority, frame) = envelope.frame;
         if lossy {
-            self.push_lossy_with_carrier(
-                priority,
-                frame,
-                envelope.carrier,
-                envelope.queued_at,
-                envelope.signaling_pending,
-                envelope.local_work,
-                envelope.expires_at,
-                envelope.reliable_credit,
-            );
+            self.push_lossy_with_carrier(envelope);
         } else {
-            self.push_entry(
-                priority,
-                frame,
-                None,
-                envelope.carrier,
-                envelope.reliable_credit,
-                envelope.signaling_pending,
-                envelope.local_work,
-                envelope.expires_at,
-            );
+            self.push_entry(envelope, None);
         }
     }
 
-    fn push_lossy_with_carrier(
-        &mut self,
-        priority: u8,
-        frame: veil_bufpool::PooledShared,
-        carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
-        queued_at: Instant,
-        signaling_pending: Option<crate::local_source_activity::PendingSignaling>,
-        local_work: Option<veil_types::local_lossy_work::LocalLossyCell>,
-        expires_at: Option<Instant>,
-        reliable_credit: Option<tokio::sync::OwnedSemaphorePermit>,
-    ) {
+    fn push_lossy_with_carrier(&mut self, envelope: crate::frame_outbox::FrameEnvelope) {
+        let (priority, ref frame) = envelope.frame;
+        // Carry the complete envelope through admission so reservations,
+        // ownership and original deadlines cannot drift between helpers.
         // Expired ingress must not evict a fresh frame from a full class.
-        if expires_at.is_some_and(|at| Instant::now() >= at)
-            || queued_at.elapsed() > lossy_realtime_max_age(priority)
+        if envelope.expires_at.is_some_and(|at| Instant::now() >= at)
+            || envelope.queued_at.elapsed() > lossy_realtime_max_age(priority)
         {
-            if let Some(work) = &local_work {
+            if let Some(work) = &envelope.local_work {
                 work.reject();
             }
-            if carrier.is_none() {
-                crate::local_lossy_trace::cell("queue_expired", priority, &frame);
+            if envelope.carrier.is_none() {
+                crate::local_lossy_trace::cell("queue_expired", priority, frame);
             }
             self.drops_total.fetch_add(1, Ordering::Relaxed);
             return;
@@ -385,29 +350,24 @@ impl PriorityQueue {
             self.lossy_realtime_len[p] -= 1;
             self.drops_total.fetch_add(1, Ordering::Relaxed);
         }
-        self.push_entry(
-            priority,
-            frame,
-            Some(queued_at),
+        let queued_at = envelope.queued_at;
+        self.push_entry(envelope, Some(queued_at));
+    }
+
+    fn push_entry(
+        &mut self,
+        envelope: crate::frame_outbox::FrameEnvelope,
+        enqueued_at: Option<Instant>,
+    ) {
+        let crate::frame_outbox::FrameEnvelope {
+            frame: (priority, frame),
             carrier,
             reliable_credit,
             signaling_pending,
             local_work,
             expires_at,
-        );
-    }
-
-    fn push_entry(
-        &mut self,
-        priority: u8,
-        frame: veil_bufpool::PooledShared,
-        enqueued_at: Option<Instant>,
-        carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
-        reliable_credit: Option<tokio::sync::OwnedSemaphorePermit>,
-        signaling_pending: Option<crate::local_source_activity::PendingSignaling>,
-        local_work: Option<veil_types::local_lossy_work::LocalLossyCell>,
-        expires_at: Option<Instant>,
-    ) {
+            ..
+        } = envelope;
         let lossy_realtime = enqueued_at.is_some();
         let p = queue_index(priority);
         // Endpoint-owned reliable entries retain bounded source credits. They
@@ -892,16 +852,11 @@ mod tests {
         let carrier: Arc<dyn veil_anonymity::circuit_carrier::DatagramCarrier> = Arc::new(Channel);
         let mut pq = PriorityQueue::with_default_weights();
         pq.push(INTERACTIVE, arc(b"canonical"));
-        pq.push_lossy_with_carrier(
-            INTERACTIVE,
-            arc(b"independent"),
-            Some(Arc::downgrade(&carrier)),
-            Instant::now() - Duration::from_millis(60),
-            None,
-            None,
-            None,
-            None,
-        );
+        let mut envelope =
+            crate::frame_outbox::FrameEnvelope::from((INTERACTIVE, arc(b"independent")));
+        envelope.carrier = Some(Arc::downgrade(&carrier));
+        envelope.queued_at = Instant::now() - Duration::from_millis(60);
+        pq.push_envelope(envelope, true);
         let before = (
             pq.len(),
             pq.slots,
