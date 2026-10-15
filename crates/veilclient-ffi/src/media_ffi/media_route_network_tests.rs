@@ -22,6 +22,7 @@ struct Stand {
     file_loss_budget: Arc<std::sync::atomic::AtomicUsize>,
     file_dropped: Arc<std::sync::atomic::AtomicUsize>,
     file_cells: Arc<std::sync::atomic::AtomicUsize>,
+    reliable_call_probes: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl Drop for Stand {
     fn drop(&mut self) {
@@ -48,6 +49,7 @@ impl Stand {
             file_loss_budget: Arc::default(),
             file_dropped: Arc::default(),
             file_cells: Arc::default(),
+            reliable_call_probes: Arc::default(),
         };
         let mut configs = Vec::new();
         for _ in 0..middle_count + 3 {
@@ -246,6 +248,7 @@ impl Stand {
         let file_loss_budget = Arc::clone(&self.file_loss_budget);
         let file_dropped = Arc::clone(&self.file_dropped);
         let file_cells = Arc::clone(&self.file_cells);
+        let reliable_call_probes = Arc::clone(&self.reliable_call_probes);
         let mut rx = self.services[from]
             .session_tx_registry
             .write()
@@ -262,6 +265,12 @@ impl Stand {
                 assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
                 if from >= 2 {
                     assert_eq!(priority, veil_proto::priority::INTERACTIVE);
+                }
+                if from < 2
+                    && priority == veil_session::LOCAL_SIGNALING_LANE
+                    && header.msg_type == veil_proto::family::RelayChainMsg::CircuitData as u16
+                {
+                    reliable_call_probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 if from < 2 && priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE {
                     use std::sync::atomic::Ordering;
@@ -460,7 +469,16 @@ async fn expect_packet(rx: &mut mpsc::Receiver<Received>, wanted: &[u8]) -> Inst
         }
     })
     .await
-    .unwrap()
+    .unwrap_or_else(|_| {
+        panic!(
+            "media packet did not arrive: type={} seq={}",
+            wanted.get(1).copied().unwrap_or(0),
+            wanted
+                .get(2..4)
+                .map(|bytes| u16::from_be_bytes(bytes.try_into().unwrap()))
+                .unwrap_or(0)
+        )
+    })
 }
 async fn expect_packets(rx: &mut mpsc::Receiver<Received>, wanted: &[Vec<u8>]) {
     let mut received = vec![false; wanted.len()];
@@ -510,19 +528,22 @@ async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stall
     .unwrap();
     let incoming = cc.routes.receive_addresses_for_test();
     let outgoing = ca.routes.outgoing_for_test().await;
-    assert_eq!(incoming.len(), 2);
+    assert_eq!(
+        incoming.len(),
+        4,
+        "all four producers need independent receive circuits"
+    );
     for route in &outgoing {
-        assert_eq!(
-            route.destination_cookie,
-            incoming[if route.plane == 3 {
-                0
-            } else {
-                route.plane as usize
-            }]
-            .1
-        );
+        assert_eq!(route.destination_cookie, incoming[route.plane as usize].1);
     }
-    assert_ne!(incoming[0].1, incoming[1].1);
+    assert_eq!(
+        incoming
+            .iter()
+            .map(|(_, cookie)| *cookie)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        4
+    );
     assert!(
         incoming
             .iter()
@@ -535,6 +556,42 @@ async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stall
     let feedback = vec![0x80, 201, 0, 1, 0, 0, 0, 7];
     assert_eq!(send(ca.id, &feedback), 0);
     expect_packet(&mut cc.rx, &feedback).await;
+    // Holding the control receive sink must not hold the primary receive sink.
+    let control_r = registry.lookup(&incoming[3].1).unwrap();
+    let control_m = middle
+        .dispatcher
+        .circuit_table
+        .as_ref()
+        .unwrap()
+        .lookup_backward(&rendezvous.local_node_id(), control_r.circuit_id_in)
+        .unwrap();
+    assert_ne!(
+        control_r.circuit_id_in,
+        registry.lookup(&incoming[0].1).unwrap().circuit_id_in
+    );
+    let (held_control, mut control_buffer) = mpsc::channel(1);
+    held_control.try_send(vec![0xff]).unwrap();
+    let original_control = c
+        .dispatcher
+        .stream_recv
+        .lock()
+        .unwrap()
+        .insert(control_m.circuit_id_in, held_control)
+        .unwrap();
+    let control_before = stand.delivered(1, control_m.circuit_id_in);
+    for _ in 0..20 {
+        let _ = send(ca.id, &feedback);
+    }
+    wait_until(|| stand.delivered(1, control_m.circuit_id_in) > control_before).await;
+    let audio_while_control_blocked = packet(111, 0x70);
+    assert_eq!(send(ca.id, &audio_while_control_blocked), 0);
+    expect_packet(&mut cc.rx, &audio_while_control_blocked).await;
+    assert_eq!(control_buffer.try_recv().unwrap(), vec![0xff]);
+    c.dispatcher
+        .stream_recv
+        .lock()
+        .unwrap()
+        .insert(control_m.circuit_id_in, original_control);
     let video_r = registry.lookup(&incoming[1].1).unwrap();
     let primary_r = registry.lookup(&incoming[0].1).unwrap();
     assert_ne!(video_r.circuit_id_in, primary_r.circuit_id_in);
@@ -625,8 +682,7 @@ async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stall
     let after = packet(111, 0x74);
     assert_eq!(send(ca.id, &after), 0);
     expect_packet(&mut cc.rx, &after).await;
-    // Keep the two-address VMR1 offer for old peers; the third producer
-    // opens its own circuit and return registration to the secondary address.
+    // Screen has its own receive circuit as well as its own outgoing circuit.
     assert_eq!(super::veil_media_channel_set_screen_sharing(ca.id, 1), 0);
     let screen = packet(96, 0x75);
     assert_eq!(send(ca.id, &screen), 0);
@@ -638,16 +694,43 @@ async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stall
     .await
     .unwrap();
     let outgoing_all = ca.routes.outgoing_for_test().await;
-    assert_eq!(cc.routes.receive_addresses_for_test().len(), 2);
-    assert_eq!(outgoing_all[2].destination_cookie, incoming[1].1);
+    assert!(
+        stand
+            .reliable_call_probes
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0,
+        "periodic probes must use reliable call control, not the audio child"
+    );
+    assert_eq!(cc.routes.receive_addresses_for_test().len(), 4);
+    assert_eq!(outgoing_all[2].destination_cookie, incoming[2].1);
     for other in outgoing_all.iter().filter(|r| r.plane != 2) {
         assert_ne!(outgoing_all[2].origin, other.origin);
         assert_ne!(outgoing_all[2].return_cookie, other.return_cookie);
     }
     // The first cell may expire during route construction. Fresh cells must
-    // decrypt at the other endpoint, not merely enter a source queue.
+    // decrypt while the camera's distinct receive sink is blocked.
+    let (held_camera, mut camera_buffer) = mpsc::channel(1);
+    held_camera.try_send(vec![0xff]).unwrap();
+    let original_camera = c
+        .dispatcher
+        .stream_recv
+        .lock()
+        .unwrap()
+        .insert(video_m.circuit_id_in, held_camera)
+        .unwrap();
+    let camera_before = stand.delivered(1, video_m.circuit_id_in);
+    assert_eq!(super::veil_media_channel_set_screen_sharing(ca.id, 0), 0);
+    assert_eq!(send(ca.id, &packet(96, 0x77)), 0);
+    wait_until(|| stand.delivered(1, video_m.circuit_id_in) > camera_before).await;
+    assert_eq!(super::veil_media_channel_set_screen_sharing(ca.id, 1), 0);
     assert_eq!(send(ca.id, &screen), 0);
     expect_packet(&mut cc.rx, &screen).await;
+    assert_eq!(camera_buffer.try_recv().unwrap(), vec![0xff]);
+    c.dispatcher
+        .stream_recv
+        .lock()
+        .unwrap()
+        .insert(video_m.circuit_id_in, original_camera);
     assert_eq!(super::veil_media_channel_set_screen_sharing(ca.id, 0), 0);
     let camera_after_screen = packet(96, 0x76);
     assert_eq!(send(ca.id, &camera_after_screen), 0);
@@ -715,8 +798,32 @@ async fn private_media_routes_deliver_over_real_multihop_obfs4_sessions() {
     })
     .await
     .expect("audio, camera and control must negotiate real private routes");
+    ca.routes.warm(LocalMediaPlane::Screen).await;
+    cc.routes.warm(LocalMediaPlane::Screen).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if ca.routes.outgoing_for_test().await.len() == 4
+                && cc.routes.outgoing_for_test().await.len() == 4
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("all four producers must negotiate independent receive addresses");
     for routes in [&ca.routes, &cc.routes] {
+        let peer_incoming = if Arc::ptr_eq(routes, &ca.routes) {
+            cc.routes.receive_addresses_for_test()
+        } else {
+            ca.routes.receive_addresses_for_test()
+        };
+        assert_eq!(peer_incoming.len(), 4);
         for route in routes.outgoing_for_test().await {
+            assert_eq!(
+                route.destination_cookie,
+                peer_incoming[route.plane as usize].1
+            );
             assert_eq!(route.first_hop, stand.services[2].local_node_id());
             let source = if Arc::ptr_eq(routes, &ca.routes) {
                 a
@@ -802,16 +909,21 @@ async fn private_media_routes_deliver_over_real_multihop_obfs4_sessions() {
         .unwrap();
     let id = ca.id;
     let video = tokio::spawn(async move {
-        for seq in 2000..2512 {
+        for seq in 2000..2256 {
+            assert_eq!(super::veil_media_channel_set_screen_sharing(id, 0), 0);
             let _ = send(id, &packet(96, seq));
+            assert_eq!(super::veil_media_channel_set_screen_sharing(id, 1), 0);
+            let _ = send(id, &packet(96, seq + 1000));
             if seq % 4 == 0 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }
+        assert_eq!(super::veil_media_channel_set_screen_sharing(id, 0), 0);
     });
     let mut worst = Duration::ZERO;
     let mut overlap = 0;
     let mut video_received = 0;
+    let mut screen_received = 0;
     for seq in 1000..1050 {
         let forward = packet(111, seq);
         let started = Instant::now();
@@ -823,7 +935,12 @@ async fn private_media_routes_deliver_over_real_multihop_obfs4_sessions() {
             loop {
                 let received = cc.rx.recv().await.unwrap();
                 if received.packet.get(1).is_some_and(|pt| pt & 0x7f == 96) {
-                    video_received += 1;
+                    let seq = u16::from_be_bytes(received.packet[2..4].try_into().unwrap());
+                    if (3000..3256).contains(&seq) {
+                        screen_received += 1;
+                    } else if (2000..2256).contains(&seq) {
+                        video_received += 1;
+                    }
                 }
                 if received.packet == forward {
                     break received.at;
@@ -847,14 +964,95 @@ async fn private_media_routes_deliver_over_real_multihop_obfs4_sessions() {
         video_received > 0,
         "competing video must actually reach the endpoint"
     );
+    assert!(
+        screen_received > 0,
+        "competing screen packets must actually reach their independent receive circuit"
+    );
     eprintln!(
-        "real_multihop_media: audio_packets=50 file_overlap={overlap} video_packets={video_received} packet_delay_peak_ms={:.3}",
+        "real_multihop_media: audio_packets=50 file_overlap={overlap} video_packets={video_received} screen_packets={screen_received} packet_delay_peak_ms={:.3}",
         worst.as_secs_f64() * 1000.0
     );
     assert!(
         worst < Duration::from_millis(200),
         "network packet delay exceeded 200 ms under local video/file load: {worst:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extended_receive_routes_interoperate_with_legacy_peer_over_real_obfs4() {
+    let stand = Stand::with_links(1, true).await;
+    let a = &stand.services[0];
+    let c = &stand.services[1];
+    let mut ca = channel(a.local_node_id(), c.local_node_id(), [0xa1; 32], [0xc1; 32]);
+    let mut cc = channel(c.local_node_id(), a.local_node_id(), [0xc1; 32], [0xa1; 32]);
+    cc.routes.emulate_legacy_peer_for_test();
+    let registry = stand.services[3]
+        .dispatcher
+        .circuit_rendezvous
+        .as_ref()
+        .unwrap();
+    wait_until(|| {
+        registry.lookup(&a.onion_stream_local_cookie()).is_some()
+            && registry.lookup(&c.onion_stream_local_cookie()).is_some()
+    })
+    .await;
+    stand.copy_ads(0, 1);
+    stand.copy_ads(1, 0);
+    ca.routes.start(&tokio::runtime::Handle::current());
+    cc.routes.start(&tokio::runtime::Handle::current());
+    ca.routes.warm(LocalMediaPlane::Screen).await;
+    cc.routes.warm(LocalMediaPlane::Screen).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if ca.routes.outgoing_for_test().await.len() == 4
+                && cc.routes.outgoing_for_test().await.len() == 4
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("both versions must negotiate usable routes");
+    let incoming_a = ca.routes.receive_addresses_for_test();
+    let incoming_c = cc.routes.receive_addresses_for_test();
+    assert_eq!(incoming_a.len(), 4);
+    assert_eq!(incoming_c.len(), 2);
+    // The old decoder sees only the unchanged two-address companion. Neither
+    // direction claims that legacy screen/control paths are independent.
+    assert_eq!(ca.routes.received_offer_for_test().unwrap()[20], 2);
+    assert_eq!(cc.routes.received_offer_for_test().unwrap()[20], 2);
+    for (routes, incoming) in [(&ca.routes, &incoming_c), (&cc.routes, &incoming_a)] {
+        for route in routes.outgoing_for_test().await {
+            assert_eq!(
+                route.destination_cookie,
+                incoming[[0, 1, 1, 0][route.plane as usize]].1
+            );
+        }
+    }
+    for pt in [111, 96] {
+        let forward = packet(pt, 500);
+        let reverse = packet(pt, 501);
+        assert_eq!(send(ca.id, &forward), 0);
+        assert_eq!(send(cc.id, &reverse), 0);
+        expect_packet(&mut cc.rx, &forward).await;
+        expect_packet(&mut ca.rx, &reverse).await;
+    }
+    let feedback = vec![0x80, 201, 0, 1, 0, 0, 0, 7];
+    assert_eq!(send(ca.id, &feedback), 0);
+    expect_packet(&mut cc.rx, &feedback).await;
+    assert_eq!(send(cc.id, &feedback), 0);
+    expect_packet(&mut ca.rx, &feedback).await;
+    assert_eq!(super::veil_media_channel_set_screen_sharing(ca.id, 1), 0);
+    assert_eq!(super::veil_media_channel_set_screen_sharing(cc.id, 1), 0);
+    let forward = packet(96, 502);
+    let reverse = packet(96, 503);
+    assert_eq!(send(ca.id, &forward), 0);
+    assert_eq!(send(cc.id, &reverse), 0);
+    expect_packet(&mut cc.rx, &forward).await;
+    expect_packet(&mut ca.rx, &reverse).await;
+    drop((ca, cc));
+    stand.stop().await;
 }
 
 /// Distinct local producers select different real first-hop sessions when

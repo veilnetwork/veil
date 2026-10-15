@@ -1065,6 +1065,27 @@ async fn private_address_control_requires_call_aead_and_never_reaches_the_engine
     assert!(routes.received_offer_for_test().is_none());
     crate::media::dispatch_inbound_auto(peer, &sealed);
     assert_eq!(routes.received_offer_for_test(), Some(body));
+    // Extending the receive map never makes its capability/addresses public
+    // control input: the complete four-address offer still needs this call AEAD.
+    let mut extended = crate::anon_stream::MEDIA_ROUTE_CONTROL_MAGIC.to_vec();
+    extended.extend_from_slice(&1u64.to_be_bytes());
+    extended.extend_from_slice(&2u64.to_be_bytes());
+    extended.push(4);
+    for plane in 0..4u8 {
+        extended.push(plane);
+        extended.extend_from_slice(&[0x73; 32]);
+        extended.extend_from_slice(&[0x74 + plane; 16]);
+        extended.extend_from_slice(&[0x75; 32]);
+    }
+    let extended_sealed = sender.seal(&extended).unwrap().into_vec();
+    let mut extended_forged = extended_sealed.clone();
+    *extended_forged.last_mut().unwrap() ^= 1;
+    let previous = routes.received_offer_for_test();
+    crate::media::dispatch_inbound_auto(peer, &extended);
+    crate::media::dispatch_inbound_auto(peer, &extended_forged);
+    assert_eq!(routes.received_offer_for_test(), previous);
+    crate::media::dispatch_inbound_auto(peer, &extended_sealed);
+    assert_eq!(routes.received_offer_for_test(), Some(extended));
     assert_eq!(count_context.load(Ordering::SeqCst), 0);
     assert_eq!(
         crate::media::recv_count(peer),

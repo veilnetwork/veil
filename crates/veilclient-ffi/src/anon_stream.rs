@@ -1517,7 +1517,12 @@ impl CircuitCells {
     /// the role of the producer is never added to a circuit frame.
     fn isolated_producer(&self, plane: LocalMediaPlane) -> Self {
         Self {
-            path_group: self.path_group.isolated(),
+            path_group: match plane {
+                LocalMediaPlane::Primary | LocalMediaPlane::Secondary => self.path_group.isolated(),
+                LocalMediaPlane::Screen | LocalMediaPlane::Control => {
+                    self.path_group.isolated_auxiliary()
+                }
+            },
             private_outbound_registration: true,
             local_datagram_lane: match plane {
                 LocalMediaPlane::Primary => veil_proto::priority::REALTIME,
