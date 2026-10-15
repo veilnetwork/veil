@@ -8,6 +8,8 @@ const ROUTE_BYTES: usize = 81;
 const REFRESH_AFTER: Duration = Duration::from_secs(240);
 const PRIVATE_RETIRE_GRACE: Duration = Duration::from_secs(30);
 const PROBE_STALE_AFTER: Duration = Duration::from_secs(12);
+const PROBE_IDLE_AFTER: Duration = Duration::from_secs(2);
+const PROBE_RETRY_AFTER: Duration = Duration::from_secs(6);
 const DATAGRAM_WARM_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,6 +166,7 @@ struct PinnedRoute {
     created: Instant,
     close_generation: u64,
     last_echo: Mutex<Instant>,
+    last_probe: Mutex<Option<Instant>>,
     probe_echo: Arc<AtomicBool>,
     local_datagram_lane: u8,
 }
@@ -209,17 +212,40 @@ impl PinnedRoute {
     }
 
     fn probe(&self) {
+        // Eight private send/receive circuits share one endpoint's bounded
+        // recovery allowance. Do not enqueue another padded check while the
+        // previous echo is fresh. An admitted probe also needs time to pass
+        // that shared allowance before another worker tick queues a duplicate.
+        if self
+            .last_echo
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .elapsed()
+            < PROBE_IDLE_AFTER
+        {
+            return;
+        }
+        let mut last_probe = self.last_probe.lock().unwrap_or_else(|p| p.into_inner());
+        if last_probe.is_some_and(|sent| sent.elapsed() < PROBE_RETRY_AFTER) {
+            return;
+        }
         // Route liveness is endpoint network maintenance. Periodic application
         // feedback can continuously spend the signaling allowance; a probe in
         // that queue then expires a healthy route. Use the existing recovery
         // queue/budget without occupying a media child or changing relay headers.
         let mut body = self.cookie.to_vec();
         body.extend_from_slice(veil_anonymity::circuit_data::CIRCUIT_PROBE_MAGIC);
-        let _ = self.services.send_circuit_cell_on_local_lane_detailed(
-            &self.circuit,
-            &body,
-            veil_session::LOCAL_NETWORK_CONTROL_LANE,
-        );
+        if self
+            .services
+            .send_circuit_cell_on_local_lane_detailed(
+                &self.circuit,
+                &body,
+                veil_session::LOCAL_NETWORK_CONTROL_LANE,
+            )
+            .is_ok()
+        {
+            *last_probe = Some(Instant::now());
+        }
     }
 
     fn probe_datagram(&self) {
@@ -297,6 +323,7 @@ async fn open_private_route(
         created: Instant::now(),
         close_generation,
         last_echo: Mutex::new(Instant::now()),
+        last_probe: Mutex::new(None),
         probe_echo,
         local_datagram_lane: core.local_datagram_lane,
     };
