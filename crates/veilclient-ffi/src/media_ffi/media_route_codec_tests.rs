@@ -364,22 +364,28 @@ async fn codec_routes_ready(stand: &Stand, channels: &[&Channel; 2]) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real obfs4 route keepalive stand"]
 async fn private_codec_routes_survive_idle_keepalive() {
-    check_private_route_keepalive(false, false).await;
+    check_private_route_keepalive(false, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real obfs4 route keepalive stand"]
 async fn private_codec_routes_survive_active_primary_keepalive() {
-    check_private_route_keepalive(true, false).await;
+    check_private_route_keepalive(true, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real obfs4 route keepalive stand"]
 async fn private_codec_routes_survive_primary_and_feedback_keepalive() {
-    check_private_route_keepalive(true, true).await;
+    check_private_route_keepalive(true, true, false).await;
 }
 
-async fn check_private_route_keepalive(primary: bool, feedback: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real obfs4 route liveness under sustained endpoint pressure"]
+async fn private_codec_routes_survive_sustained_source_pressure() {
+    check_private_route_keepalive(true, true, true).await;
+}
+
+async fn check_private_route_keepalive(primary: bool, feedback: bool, pressure: bool) {
     let stand = Stand::with_links(1, true).await;
     let a = stand.services[0].local_node_id();
     let c = stand.services[1].local_node_id();
@@ -393,8 +399,18 @@ async fn check_private_route_keepalive(primary: bool, feedback: bool) {
     if primary {
         let mut tick = tokio::time::interval(Duration::from_millis(20));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        for seq in 1..=900 {
+        let packets = if pressure { 3600 } else { 900 };
+        for seq in 1..=packets {
             tick.tick().await;
+            if pressure && seq % 50 == 1 {
+                for service in &stand.services[..2] {
+                    service
+                        .session_tx_registry
+                        .read()
+                        .unwrap()
+                        .note_local_source_feedback(true, Instant::now());
+                }
+            }
             let forward = packet(111, seq);
             let reverse = packet(111, seq + 1000);
             assert_eq!(send(ca.id, &forward), 0);
@@ -427,13 +443,13 @@ async fn check_private_route_keepalive(primary: bool, feedback: bool) {
         cc.routes.send_paths_for_test(),
     ];
     eprintln!(
-        "private routes primary={primary} feedback={feedback} unchanged={unchanged} paths={paths:?}"
+        "private routes primary={primary} feedback={feedback} pressure={pressure} unchanged={unchanged} paths={paths:?}"
     );
     drop((ca, cc));
     stand.stop().await;
     assert!(
         unchanged,
-        "healthy idle private circuits must retain their identities past the probe timeout"
+        "healthy private circuits must retain their identities past the probe timeout"
     );
 }
 
@@ -443,9 +459,10 @@ fn codec_file(
     destination: [u8; 32],
     pattern: usize,
     received: Arc<std::sync::atomic::AtomicUsize>,
+    timeout: Duration,
 ) -> tokio::task::JoinHandle<Result<usize, String>> {
     tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        tokio::time::timeout(timeout, async {
             let expected: Vec<_> = (0..512 * 1024)
                 .map(|i| ((i + pattern) % 251) as u8)
                 .collect();
@@ -493,6 +510,83 @@ fn codec_file(
         .await
         .map_err(|_| "file timed out".to_owned())?
     })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real obfs4 delayed bidirectional file diagnostic"]
+async fn private_routes_allow_bidirectional_files_after_idle() {
+    check_bidirectional_files(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real obfs4 file opens while primary and feedback are active"]
+async fn private_routes_allow_bidirectional_files_during_primary() {
+    check_bidirectional_files(true, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "in-memory control for active-primary file regression"]
+async fn private_routes_allow_bidirectional_files_during_primary_in_memory() {
+    check_bidirectional_files(true, false).await;
+}
+
+async fn check_bidirectional_files(primary: bool, real_obfs4: bool) {
+    let stand = Stand::with_links(1, real_obfs4).await;
+    let a = stand.services[0].local_node_id();
+    let c = stand.services[1].local_node_id();
+    let ca = channel(a, c, [0xa1; 32], [0xc1; 32]);
+    let cc = channel(c, a, [0xc1; 32], [0xa1; 32]);
+    codec_routes_ready(&stand, &[&ca, &cc]).await;
+    let media = if primary {
+        let ids = [ca.id, cc.id];
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(20));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            for seq in 1..=1500 {
+                tick.tick().await;
+                for id in ids {
+                    assert_eq!(send(id, &packet(111, seq)), 0);
+                    if seq % 5 == 0 {
+                        assert_eq!(send(id, &[0x80, 201, 0, 1, 1, 2, 3, 4]), 0);
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let bytes: [Arc<std::sync::atomic::AtomicUsize>; 2] = std::array::from_fn(|_| Arc::default());
+    let forward = codec_file(
+        Arc::clone(&ca.files),
+        Arc::clone(&cc.files),
+        c,
+        7,
+        Arc::clone(&bytes[0]),
+        Duration::from_secs(30),
+    );
+    let reverse = codec_file(
+        Arc::clone(&cc.files),
+        Arc::clone(&ca.files),
+        a,
+        19,
+        Arc::clone(&bytes[1]),
+        Duration::from_secs(30),
+    );
+    let results = tokio::join!(forward, reverse);
+    if let Some(media) = media {
+        media.await.unwrap();
+    }
+    eprintln!(
+        "bidirectional files primary={primary}: results={results:?} received={:?}",
+        bytes
+            .each_ref()
+            .map(|n| n.load(std::sync::atomic::Ordering::Relaxed))
+    );
+    drop((ca, cc));
+    stand.stop().await;
+    assert_eq!(results.0.unwrap(), Ok(512 * 1024));
+    assert_eq!(results.1.unwrap(), Ok(512 * 1024));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -568,6 +662,7 @@ async fn real_anonymous_codecs_share_obfs4_with_files_on_four_private_planes() {
                 nodes[1],
                 7,
                 Arc::clone(&file_bytes[0]),
+                Duration::from_secs(90),
             ));
             files.push(codec_file(
                 Arc::clone(&c.files),
@@ -575,6 +670,7 @@ async fn real_anonymous_codecs_share_obfs4_with_files_on_four_private_planes() {
                 nodes[0],
                 19,
                 Arc::clone(&file_bytes[1]),
+                Duration::from_secs(90),
             ));
             video_started = true;
         }
@@ -649,10 +745,9 @@ async fn real_anonymous_codecs_share_obfs4_with_files_on_four_private_planes() {
         .each_ref()
         .map(|n| n.load(std::sync::atomic::Ordering::Relaxed));
     drop(engines); // Joins native queues and flushes bounded RTP/encoder evidence.
-    // Two 512-KiB files cannot finish in the forty-second competing phase under
-    // the endpoint's shared 20-KiB/s DATA/control allowance, even without RTCP.
-    // Record their actual progress during media, then require complete and
-    // identical files after the native producers release the uplink.
+    // Require actual competing traffic during media. Byte-exact completion may
+    // extend beyond that phase when endpoint pressure constrains reliable DATA;
+    // allow the native producers to release the uplink before the final wait.
     let mut file_results = Vec::new();
     for file in files {
         file_results.push(file.await.map_err(|e| e.to_string()).and_then(|r| r));
@@ -703,6 +798,7 @@ async fn real_anonymous_codecs_share_obfs4_with_files_on_four_private_planes() {
             })
     });
     let files_ok = file_results.len() == 2 && file_results.iter().all(|r| *r == Ok(512 * 1024));
+    let file_contention_verified = file_bytes_during_media.iter().all(|n| *n > 0);
     let rows: Vec<_> = clock
         .rows
         .iter()
@@ -726,11 +822,12 @@ async fn real_anonymous_codecs_share_obfs4_with_files_on_four_private_planes() {
         "private_cells_before_camera":camera_counts,"private_cells_before_screen":screen_counts,
         "files_complete_during_media":files_done_at_end,"files_ok":files_ok,
         "file_bytes_received_during_media":file_bytes_during_media,
+        "file_contention_verified":file_contention_verified,
         "private_fallback_before":fallback_before,"private_fallback_after":fallback_after,
         "file_results":file_results.iter().map(|r|format!("{r:?}")).collect::<Vec<_>>(),
         "video_decoding_verified":video_ok,"paths_verified":paths_ok,
         "native_audio_rtcp_verified":feedback_ok,
-        "codec_isolation_ok":clock_ok && video_ok && paths_ok && files_ok && feedback_ok});
+        "codec_isolation_ok":clock_ok && video_ok && paths_ok && files_ok && feedback_ok && file_contention_verified});
     for (name, value) in [
         ("pcm-samples.json", serde_json::json!(rows)),
         ("codec-samples.json", serde_json::json!(codec_rows)),

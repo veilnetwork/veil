@@ -14,6 +14,8 @@ use tokio::sync::mpsc;
 use veil_node_runtime::{NodeRuntime, NodeServices};
 use veil_proto::{HEADER_SIZE, family::FrameFamily};
 
+const STAND_SERVICE_ALLOWANCE: u64 = 1 << 40;
+
 #[cfg(unix)]
 mod codecs {
     use super::*;
@@ -102,7 +104,7 @@ impl Stand {
             cfg.anonymity.relay_capable = true;
             // Equal relay allowance, above the burst on every node. This
             // test stalls an endpoint sink, not the shared service quota.
-            cfg.dht.service_budget_bytes_per_hour = Some(u64::MAX);
+            cfg.dht.service_budget_bytes_per_hour = Some(STAND_SERVICE_ALLOWANCE);
             configs.push((path, cfg));
             s._dirs.push(dir);
         }
@@ -170,6 +172,15 @@ impl Stand {
         for (path, cfg) in configs {
             veil_cfg::save_config(&path, &cfg).unwrap();
             let node = NodeRuntime::start(&path, true).await.unwrap();
+            assert_eq!(
+                node.access()
+                    .dispatcher
+                    .abuse
+                    .service_budget
+                    .bytes_per_hour(),
+                STAND_SERVICE_ALLOWANCE,
+                "fixture relay allowance must survive config serialization and runtime startup"
+            );
             s.services.push(node.access());
             s.nodes.push(node);
         }

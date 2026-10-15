@@ -263,6 +263,8 @@ pub fn read_payload(buf: &[u8]) -> Option<Vec<u8>> {
     Some(buf[LEN_PREFIX..LEN_PREFIX + len].to_vec())
 }
 
+const CIRCUIT_REPLAY_WINDOW_CELLS: u32 = 8192;
+
 /// Sliding-window anti-replay over a circuit's per-direction `seq` (Epic 482.7's
 /// named requirement, §4.3). Accepts strictly-fresh seqs within a window of the
 /// highest seen; rejects duplicates and too-old seqs. Relay-side state (wired in
@@ -271,8 +273,8 @@ pub fn read_payload(buf: &[u8]) -> Option<Vec<u8>> {
 pub struct ReplayWindow {
     /// Highest accepted seq so far (0 = nothing seen; seq numbering starts at 1).
     highest: u32,
-    /// Bitmask of the `WINDOW` seqs at or below `highest` (bit 0 = `highest`).
-    seen: u64,
+    /// Circular sequence slots; advancing clears only the newly entered range.
+    seen: [u64; CIRCUIT_REPLAY_WINDOW_CELLS as usize / 64],
 }
 
 impl Default for ReplayWindow {
@@ -282,13 +284,15 @@ impl Default for ReplayWindow {
 }
 
 impl ReplayWindow {
-    /// Window width in cells.
-    pub const WINDOW: u32 = 64;
+    /// Independently paced reliable and datagram carriers can differ by many
+    /// more than 64 cells. Keep one bounded duplicate namespace across them.
+    /// The bitmap costs 1 KiB per direction, independent of traffic volume.
+    pub const WINDOW: u32 = CIRCUIT_REPLAY_WINDOW_CELLS;
 
     pub fn new() -> Self {
         Self {
             highest: 0,
-            seen: 0,
+            seen: [0; CIRCUIT_REPLAY_WINDOW_CELLS as usize / 64],
         }
     }
 
@@ -301,24 +305,36 @@ impl ReplayWindow {
         }
         if seq > self.highest {
             let shift = seq - self.highest;
-            self.seen = if shift >= Self::WINDOW {
-                0
+            if shift >= Self::WINDOW {
+                self.seen.fill(0);
             } else {
-                self.seen << shift
-            };
-            self.seen |= 1;
+                // Circular bitmap rather than shifting every word for every
+                // in-order packet. Clear expired slots in whole/partial words.
+                let mut position = (self.highest as usize + 1) % Self::WINDOW as usize;
+                let mut remaining = shift as usize;
+                while remaining != 0 {
+                    let offset = position % 64;
+                    let count = remaining.min(64 - offset);
+                    let mask = if count == 64 {
+                        u64::MAX
+                    } else {
+                        ((1u64 << count) - 1) << offset
+                    };
+                    self.seen[position / 64] &= !mask;
+                    remaining -= count;
+                    position = (position + count) % Self::WINDOW as usize;
+                }
+            }
             self.highest = seq;
-            return true;
-        }
-        let behind = self.highest - seq;
-        if behind >= Self::WINDOW {
+        } else if self.highest - seq >= Self::WINDOW {
             return false;
         }
-        let bit = 1u64 << behind;
-        if self.seen & bit != 0 {
+        let position = seq as usize % Self::WINDOW as usize;
+        let bit = 1u64 << (position % 64);
+        if self.seen[position / 64] & bit != 0 {
             return false;
         }
-        self.seen |= bit;
+        self.seen[position / 64] |= bit;
         true
     }
 }
@@ -475,6 +491,21 @@ mod tests {
     }
 
     #[test]
+    fn reliable_cell_can_follow_a_burst_on_an_independent_carrier() {
+        let mut replay = ReplayWindow::new();
+        assert!(replay.accept(1));
+        for seq in 3..=130 {
+            assert!(replay.accept(seq));
+        }
+        assert!(replay.accept(2), "late unseen cell is not a replay");
+        assert!(
+            !replay.accept(2),
+            "the same cell must still be rejected twice"
+        );
+        assert!(!replay.accept(100));
+    }
+
+    #[test]
     fn replay_window_basic_and_too_old() {
         let mut w = ReplayWindow::new();
         assert!(!w.accept(0));
@@ -484,9 +515,46 @@ mod tests {
         assert!(w.accept(3));
         assert!(!w.accept(3));
         let mut w2 = ReplayWindow::new();
-        assert!(w2.accept(1000));
-        assert!(!w2.accept(1000 - ReplayWindow::WINDOW));
-        assert!(w2.accept(1000 - ReplayWindow::WINDOW + 1));
+        let high = ReplayWindow::WINDOW + 1000;
+        assert!(w2.accept(high));
+        assert!(!w2.accept(high - ReplayWindow::WINDOW));
+        assert!(w2.accept(high - ReplayWindow::WINDOW + 1));
         assert!(!w2.accept(1));
+    }
+
+    #[test]
+    fn replay_ring_matches_a_reference_set_across_wraps_and_jumps() {
+        let mut replay = ReplayWindow::new();
+        let mut accepted = std::collections::BTreeSet::new();
+        let mut high = 0u32;
+        for index in 0..3000 {
+            let offset = [0, 1, 63, 64, 65, 127, 8191, 8192, 8193][index % 9];
+            let seq = if index % 3 == 0 {
+                high + offset + 1
+            } else {
+                high.saturating_sub(offset)
+            };
+            let expected = seq != 0
+                && (seq > high || high - seq < ReplayWindow::WINDOW)
+                && !accepted.contains(&seq);
+            assert_eq!(replay.accept(seq), expected, "seq={seq} highest={high}");
+            if expected {
+                high = high.max(seq);
+                accepted.insert(seq);
+            }
+        }
+        assert!(high > ReplayWindow::WINDOW * 10);
+    }
+
+    #[test]
+    fn replay_ring_handles_the_last_sequence_without_wrapping() {
+        let mut replay = ReplayWindow::new();
+        assert!(replay.accept(u32::MAX - 5));
+        assert!(replay.accept(u32::MAX));
+        assert!(replay.accept(u32::MAX - 4));
+        assert!(!replay.accept(u32::MAX - 4));
+        assert!(!replay.accept(u32::MAX));
+        assert!(!replay.accept(u32::MAX - ReplayWindow::WINDOW));
+        assert!(!replay.accept(0));
     }
 }
