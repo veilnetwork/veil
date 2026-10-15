@@ -790,7 +790,12 @@ pub(crate) struct RouteSnapshot {
 #[cfg(all(test, feature = "test-low-difficulty"))]
 impl MediaRoutes {
     pub(crate) fn emulate_legacy_peer_for_test(&self) {
-        assert!(self.tasks.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+        assert!(
+            self.tasks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty()
+        );
         self.legacy_peer.store(true, Ordering::Release);
     }
 
