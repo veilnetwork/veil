@@ -202,7 +202,7 @@ int veil_media_engine_set_independent_transport_feedback(VeilMediaEngine *engine
 
 /* Before the first audio/video start, account for bytes below RTP and enable
  * state-preserving Opus packet-duration adaptation (20..60 ms). Requires
- * independent feedback and a protobuf-enabled WebRTC build. Zero disables
+ * independent feedback and the bundled local ANA factory. Zero disables
  * this option; unsupported builds return ERR_STATE for a positive hint.
  * RTP overhead is added separately by WebRTC. A hint does not measure actual
  * wire delivery or give relays any scheduling information. */

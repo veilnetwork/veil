@@ -87,6 +87,8 @@ source_index=next(i for i,a in enumerate(args) if a.endswith('call/call.cc'))
 args[source_index]=src
 out_index=args.index('-o') + 1
 args[out_index]=out
+if '-MF' in args:
+    args[args.index('-MF') + 1] = out + '.d'
 extra=['-DVEIL_MEDIA_HAVE_WEBRTC=1', '-I'+shimdir]
 if '-DWEBRTC_ENABLE_PROTOBUF=1' in args:
     extra.append('-I'+sys.argv[5]+'/third_party/protobuf/src')
@@ -100,6 +102,7 @@ PY
 }
 
 echo "==> compiling iOS veil media objects"
+compile_tu "$SRCDIR/webrtc_ana/controller_manager.cc" "$TMP/ana.o"
 compile_tu "$SRCDIR/veil_media_engine.cc" "$TMP/engine.o"
 compile_tu "$SRCDIR/veil_transport_shim.cc" "$TMP/shim.o"
 compile_tu "$SRCDIR/veil_avf_adm.mm" "$TMP/avf_adm.o"
@@ -111,7 +114,7 @@ compile_tu "$SRCDIR/veil_video_note.cc" "$TMP/vnote.o"
 
 mkdir -p "$DEST"
 xcrun libtool -static -o "$DEST/libveil_media.a" \
-  "$TMP/engine.o" "$TMP/shim.o" "$TMP/avf_adm.o" \
+  "$TMP/ana.o" "$TMP/engine.o" "$TMP/shim.o" "$TMP/avf_adm.o" \
   "$TMP/avf_camera.o" "$TMP/screen_stub.o" "$TMP/record.o" \
   "$TMP/play.o" "$TMP/vnote.o"
 cp -f "$WEBRTC_A" "$DEST/libwebrtc.a"

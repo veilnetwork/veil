@@ -127,3 +127,21 @@ writable file before launching the process, for example
 `VEIL_MEDIA_DIAG_PATH=/tmp/veil_media_diag.log`. The transport's periodic RTP
 sampling is also inactive when the variable is unset, so ordinary calls do not
 pay its counter or file-I/O cost.
+
+## Audio adaptation without protobuf
+
+All five platform media builders compile `src/webrtc_ana/controller_manager.cc`
+before the normal WebRTC archive. This pinned source adds a local versioned
+configuration that constructs the same FrameLengthControllerV2 and
+BitrateController used by the earlier protobuf configuration. It supports the
+standard Android/iOS `rtc_enable_protobuf=false` bundles; enabling protobuf is
+no longer necessary for audio packet adaptation. Independent authenticated
+transport feedback is still required. No controller, payload cap, buffer limit
+or relay scheduling policy changes.
+
+Do not omit that object or force-load the WebRTC archive: the former leaves
+the stock factory unable to parse the local configuration, and the latter
+introduces duplicate controller-manager definitions. See the vendored source's
+README for its exact pin and license. Keep that source aligned with SDK updates.
+The real Opus regression runs against either macOS archive with
+`test/run_bounded_audio_encoder_smoke.py`; select `WEBRTC_OUT` explicitly.
