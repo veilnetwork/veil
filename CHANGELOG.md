@@ -1,8 +1,39 @@
 # Changelog
 
-## Unreleased
+## v0.11.40 — 2026-10-15
+
+### Changed
+
+- Separate endpoint-owned audio, video, screen, feedback, signaling and data
+  traffic into independent transport resources where negotiated, including
+  QUIC connections and ordered relay paths. Relays continue to forward opaque
+  traffic without knowing media roles or granting media priority.
+- Bound local source admission and packet lifetimes. Competing file transfers,
+  replication and route maintenance yield when endpoint audio measurements
+  show pressure; reliable data retains backpressure instead of being discarded.
+- Isolate native audio processing from video capture, encoding, rendering and
+  group fanout work. Adaptive Opus accounts for transport framing with the
+  same codec path on protobuf-enabled and protobuf-free WebRTC bundles.
+
+### Added
+
+- Endpoint-local diagnostics and regression fixtures for transport queueing,
+  RTCP loss, decoded audio timing, source admission and complete encrypted file
+  delivery under media load. Native timing capture is opt-in and bounded.
 
 ### Fixed
+
+- Preserve fresh video bursts across temporary independent-transport capacity
+  pressure without extending their original deadline or blocking audio.
+- Recover excessive unicast decoded audio backlog with bounded catch-up while
+  preserving usable speech on decoder failures. Extra discarded decoder pulls
+  no longer advance the packet-arrival estimator's clock.
+- Preserve framing limits and partial-write admission on proxied TCP/TLS and
+  Darwin sockets, and tolerate reordered circuit carriers without changing
+  relay limits or collapsing independent source connections.
+- Keep audio and video RTCP feedback separate, retain sub-percent loss
+  witnesses, and report current group playout revisions without counting
+  repeated stats reads as fresh receiver observations.
 
 - A first relay accepts a sender identity only when the originating device's
   live session has cryptographically proved that identity. Identity-addressed
@@ -17,6 +48,10 @@
   transport device address could differ from the identity in authenticated
   data, preventing a receiver with a cold key cache from decrypting the frame.
   Sender authentication, anonymous envelopes and relay scheduling are unchanged.
+
+Applications must rebuild their FFI bindings and native media libraries from
+the matching sources. Physical call latency spikes are still under
+investigation; this release does not claim uninterrupted calls on every path.
 
 ## v0.11.39 — 2026-09-30
 
