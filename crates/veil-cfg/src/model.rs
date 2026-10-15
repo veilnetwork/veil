@@ -2406,6 +2406,7 @@ impl DhtConfig {
         self.republish_interval_secs == Self::default_republish_interval_secs()
             && self.cleanup_interval_secs == Self::default_cleanup_interval_secs()
             && self.participate == Self::default_participate()
+            && self.service_budget_bytes_per_hour.is_none()
             && self.k == Self::default_k()
             && self.alpha == Self::default_alpha()
             && self.max_rounds == Self::default_max_rounds()
@@ -6313,6 +6314,37 @@ mod epic_117_defaults {
         );
         // a default DhtConfig must still round-trip as "default".
         assert!(DhtConfig::default().is_default());
+    }
+
+    #[test]
+    fn explicit_service_allowance_survives_whole_config_serialization() {
+        let directory = tempfile::tempdir().unwrap();
+        for allowance in [0, 1_048_576, i64::MAX as u64] {
+            let mut config = Config::default();
+            config.dht.service_budget_bytes_per_hour = Some(allowance);
+            let encoded = toml::to_string_pretty(&config).unwrap();
+            let decoded: Config = toml::from_str(&encoded).unwrap();
+            assert_eq!(decoded.dht.service_budget_bytes_per_hour, Some(allowance));
+            let path = directory.path().join(format!("budget-{allowance}.toml"));
+            crate::save_config(&path, &config).unwrap();
+            assert_eq!(
+                crate::load_config(&path)
+                    .unwrap()
+                    .dht
+                    .service_budget_bytes_per_hour,
+                Some(allowance)
+            );
+            let changed = if allowance == 0 { 1_048_576 } else { 0 };
+            config.dht.service_budget_bytes_per_hour = Some(changed);
+            crate::save_config(&path, &config).unwrap();
+            assert_eq!(
+                crate::load_config(&path)
+                    .unwrap()
+                    .dht
+                    .service_budget_bytes_per_hour,
+                Some(changed)
+            );
+        }
     }
 
     #[test]
