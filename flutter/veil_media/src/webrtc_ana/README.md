@@ -7,9 +7,12 @@ Unmodified source SHA-256: `8ed469936ff3abdd5318b9aa483c90c55a1f5cef9f6d1c107df3
 
 The only changes are the Veil config header include and a versioned-config
 branch before the upstream protobuf parser. It constructs the existing
-FrameLengthControllerV2 (16 kbit/s minimum, fast adaptation), followed by the
-existing BitrateController (zero overhead offsets), just like Veil's previous
-protobuf message. Supported durations and initial values come from Opus.
+FrameLengthControllerV2 (24 kbit/s payload minimum, fast adaptation), followed by the
+existing BitrateController (zero overhead offsets). The protected payload floor
+also applies to the encoder after ANA callbacks: gross allocations for another
+packet duration must not lower the current packet's useful signal. Fixed group
+budgets keep their 16..32-kbit API; the group application policy already uses a
+24-kbit floor. Supported durations and initial values come from Opus.
 There is no new codec, allocation rule, packet format or relay metadata.
 
 Compile this whole translation unit with the pinned SDK's flags and link it

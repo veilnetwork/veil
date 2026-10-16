@@ -246,7 +246,7 @@ std::unique_ptr<ControllerManager> ControllerManagerImpl::Create(
   if (config_string == veil_media::kFramingAudioAdaptorConfig) {
     std::vector<std::unique_ptr<Controller>> controllers;
     controllers.push_back(std::make_unique<FrameLengthControllerV2>(
-        encoder_frame_lengths_ms, 16000, false));
+        encoder_frame_lengths_ms, veil_media::kFramingAudioMinPayloadBps, false));
     controllers.push_back(
         std::make_unique<audio_network_adaptor::BitrateController>(
             audio_network_adaptor::BitrateController::Config(

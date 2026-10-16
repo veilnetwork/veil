@@ -354,7 +354,7 @@ extern "C" int veil_media_test_audio_bandwidth() {
               bitrate = ws->send_stream->GetStats().target_bitrate_bps;
             })) return int64_t(-1);
         if ((!feedback && bitrate > 0) ||
-            (feedback && (transport_bps == 12000 ? bitrate == 12000 : bitrate == 32000))) break;
+            (feedback && (transport_bps == 12000 ? bitrate == 24000 : bitrate == 32000))) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
       } while (std::chrono::steady_clock::now() < deadline);
       return bitrate;
@@ -364,7 +364,9 @@ extern "C" int veil_media_test_audio_bandwidth() {
     const auto restored = target(48000);
     std::fprintf(stderr, "Opus allocation feedback=%d: %lld -> %lld -> %lld\n",
                  feedback, (long long)high, (long long)low, (long long)restored);
-    if (high != 32000 || low != (feedback ? 12000 : 32000) || restored != 32000) return 2;
+    // The same low transport estimate must now preserve the protected speech
+    // floor, then recover the original ceiling. No-feedback peers stay fixed.
+    if (high != 32000 || low != (feedback ? 24000 : 32000) || restored != 32000) return 2;
   }
   return 0;
 }
