@@ -113,6 +113,7 @@
 #include "api/video/video_source_interface.h"
 #include "api/video/video_sink_interface.h"
 #include "veil_adaptive_video_source.h"
+#include "veil_vp8_settings.h"
 #include "third_party/libyuv/include/libyuv/convert_argb.h"  // I420ToABGR
 #include "third_party/libyuv/include/libyuv/rotate.h"  // Android420ToI420Rotate
 #include "rtc_base/time_utils.h"  // webrtc::TimeMicros
@@ -243,32 +244,6 @@ uint32_t current_audio_playout_delay(uint32_t buffered_ms,
 }
 
 constexpr int kVideoNackHistoryMs = 1000;
-// A 60-frame interval produced a full VP8 intra-frame burst every ~2 seconds
-// on the 30-fps physical cameras. Those bursts repeatedly filled the short
-// realtime QUIC window and showed up as 0.6--1.0 s freezes despite a steady
-// average frame rate. NACK keeps ordinary packet loss recoverable, so request
-// a periodic keyframe every 240 frames (~8 s at 30 fps) instead. This is still
-// dramatically faster recovery than libwebrtc's 3000-frame default.
-constexpr int kVp8KeyFrameIntervalFrames = 240;
-
-webrtc::scoped_refptr<
-    webrtc::VideoEncoderConfig::EncoderSpecificSettings>
-resilient_vp8_settings() {
-  webrtc::VideoCodecVP8 vp8 = webrtc::VideoEncoder::GetDefaultVp8Settings();
-#if defined(__ANDROID__)
-  // Camera2's TEMPLATE_RECORD pipeline already applies the sensor/ISP noise
-  // reduction selected by the device. Running libvpx's temporal denoiser over
-  // that 640x360 frame repeats the work in software and was a measurable part
-  // of the phone's sustained call heat, without a visible benefit on the
-  // physical front camera.
-  vp8.denoisingOn = false;
-#endif
-  // The default is 3000 frames (50-100 seconds at call rates). A single lost
-  // inter-frame then left the receiver frozen until that very distant keyframe.
-  vp8.keyFrameInterval = kVp8KeyFrameIntervalFrames;
-  return webrtc::make_ref_counted<
-      webrtc::VideoEncoderConfig::Vp8EncoderSpecificSettings>(vp8);
-}
 #endif
 
 // Best-effort diagnostic log. File I/O is fail-closed unless the operator
@@ -1250,6 +1225,8 @@ class LowLatencyFieldTrials final : public webrtc::FieldTrialsView {
     // budgets still set their own minima; allow the endpoint policy to go
     // down to 1 kbit/s without altering audio or any transport/relay metadata.
     if (key == "WebRTC-Video-MinVideoBitrate") return "Enabled,br:1kbps";
+    if (video_ && key == "WebRTC-VideoRateControl")
+      return veil_media::vp8_rate_control_trial();
     // libwebrtc's send-side feedback profile paces at only 1.1x and permits a
     // two-second queue by default. That is appropriate for a UDP transport
     // whose congestion controller receives TWCC, but our authenticated veil
@@ -2338,12 +2315,7 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
       const int bps = kbps * 1000;
       ws->video_call->SetClientBitratePreferences(
           veil_media::video_bitrate_settings(bps, true, true));
-      webrtc::VideoEncoderConfig ec;
-      ec.codec_type = webrtc::kVideoCodecVP8;
-      ec.video_format = webrtc::SdpVideoFormat::VP8();
-      ec.encoder_specific_settings = resilient_vp8_settings();
-      ec.content_type = webrtc::VideoEncoderConfig::ContentType::kRealtimeVideo;
-      ec.number_of_streams = 1;
+      auto ec = veil_media::vp8_encoder_config();
       ec.max_bitrate_bps = bps;
       webrtc::VideoStream layer;
       layer.active = true;
@@ -2437,12 +2409,7 @@ static int veil_media_group_engine_apply_video_budget(VeilGroupMediaEngine* engi
       return;
     }
     if (ws->video_target_bitrate_bps != bps || ws->video_max_fps.load() != fps) {
-      webrtc::VideoEncoderConfig ec;
-      ec.codec_type = webrtc::kVideoCodecVP8;
-      ec.video_format = webrtc::SdpVideoFormat::VP8();
-      ec.encoder_specific_settings = resilient_vp8_settings();
-      ec.content_type = webrtc::VideoEncoderConfig::ContentType::kRealtimeVideo;
-      ec.number_of_streams = 1;
+      auto ec = veil_media::vp8_encoder_config();
       ec.max_bitrate_bps = bps;
       webrtc::VideoStream layer;
       layer.active = true;
@@ -3259,12 +3226,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
             veil_media::video_bitrate_settings(
                 bps, ws->shim->independent_transport_feedback(), true));
       }
-      webrtc::VideoEncoderConfig ec;
-      ec.codec_type = webrtc::kVideoCodecVP8;
-      ec.video_format = webrtc::SdpVideoFormat::VP8();
-      ec.encoder_specific_settings = resilient_vp8_settings();
-      ec.content_type = webrtc::VideoEncoderConfig::ContentType::kRealtimeVideo;
-      ec.number_of_streams = 1;
+      auto ec = veil_media::vp8_encoder_config();
       ec.max_bitrate_bps = bps;
       webrtc::VideoStream layer;  // ≥1 layer REQUIRED (default factory DCHECK)
       layer.active = true;
@@ -3374,12 +3336,7 @@ static int veil_media_engine_apply_video_budget(VeilMediaEngine* engine,
       rc = VEIL_MEDIA_OK;
       return;
     }
-    webrtc::VideoEncoderConfig ec;
-    ec.codec_type = webrtc::kVideoCodecVP8;
-    ec.video_format = webrtc::SdpVideoFormat::VP8();
-    ec.encoder_specific_settings = resilient_vp8_settings();
-    ec.content_type = webrtc::VideoEncoderConfig::ContentType::kRealtimeVideo;
-    ec.number_of_streams = 1;
+    auto ec = veil_media::vp8_encoder_config();
     ec.max_bitrate_bps = bps;
     webrtc::VideoStream layer;
     layer.active = true;
