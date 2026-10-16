@@ -11,6 +11,9 @@ class Decoder final : public webrtc::NetEq {
  public:
   int pulls = 0;
   int mode = 0;
+  int frame_ms = 0;
+  int maximum_delay = 0;
+  int maximum_delay_calls = 0;
   int GetAudio(webrtc::AudioFrame* f, bool* muted, int* rate,
                std::optional<Operation>) override {
     ++pulls;
@@ -30,7 +33,12 @@ class Decoder final : public webrtc::NetEq {
   void SetFastAccelerate(bool) override {}
   void RemoveAllPayloadTypes() override {}
   bool SetMinimumDelay(int) override { return true; }
-  bool SetMaximumDelay(int) override { return true; }
+  bool SetMaximumDelay(int n) override {
+    ++maximum_delay_calls;
+    if (n < 0) return false;
+    maximum_delay = n;
+    return true;
+  }
   bool SetBaseMinimumDelayMs(int) override { return true; }
   int GetBaseMinimumDelayMs() const override { return 0; }
   int TargetDelayMs() const override { return 0; }
@@ -42,6 +50,7 @@ class Decoder final : public webrtc::NetEq {
     webrtc::NetEqOperationsAndState s;
     s.current_buffer_size_ms = mode == 5 ? 100 : mode == 4 ? 500 : pulls < 2 ? 200 : 100;
     s.next_packet_available = mode != 6;
+    s.current_frame_size_ms = frame_ms;
     return s;
   }
   std::optional<uint32_t> GetPlayoutTimestamp() const override { return std::nullopt; }
@@ -74,6 +83,68 @@ int main() {
     assert(recovering.GetAudio(&frame, &muted, &rate,
         webrtc::NetEq::Operation::kNormal) == (mode == 3 ? webrtc::NetEq::kFail : 0));
     assert(observed_clock->ticks() == 2);
+  }
+  // The decoder must not refill toward a target above the catch-up budget.
+  // Reserve one decoded packet's headroom for ordinary packet-sized arrivals.
+  {
+    auto decoder = std::make_unique<Decoder>();
+    auto* observed = decoder.get();
+    observed->mode = 5; // quiet, no catch-up needed
+    observed->frame_ms = 40;
+    auto stats = std::make_shared<veil_media::PlayoutRecoveryStats>();
+    veil_media::RecoveringNetEq recovering(std::move(decoder), stats);
+    assert(observed->maximum_delay == 100); // unknown initial packet: 20 ms
+    webrtc::AudioFrame frame;
+    bool muted = false;
+    int rate = 0;
+    recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
+    assert(observed->maximum_delay == 80); // 120 - actual 40-ms packet
+    const int calls = observed->maximum_delay_calls;
+    recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
+    assert(observed->maximum_delay_calls == calls);
+    assert(recovering.SetMaximumDelay(50));
+    assert(observed->maximum_delay == 50);
+    observed->frame_ms = 60;
+    recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
+    assert(observed->maximum_delay == 50); // retain a stricter caller bound
+    observed->frame_ms = 20;
+    recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
+    assert(observed->maximum_delay == 50);
+    assert(recovering.SetMaximumDelay(0));
+    assert(observed->maximum_delay == 100);
+    assert(recovering.SetMaximumDelay(500));
+    assert(observed->maximum_delay == 100);
+    assert(!recovering.SetMaximumDelay(-1));
+    observed->frame_ms = 40;
+    recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
+    assert(observed->maximum_delay == 80);
+    observed->frame_ms = 0; // silence/unknown must not invent a smaller packet
+    recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
+    assert(observed->maximum_delay == 80);
+    observed->mode = 1; // PLC is generated output, not a new packet duration
+    observed->frame_ms = 20;
+    recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
+    assert(observed->maximum_delay == 80);
+    observed->mode = 2; // muted output cannot change the known duration either
+    recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
+    assert(observed->maximum_delay == 80);
+    observed->mode = 5;
+    recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
+    assert(observed->maximum_delay == 100); // a real shorter decoded packet
+    assert(stats->count == 0 && stats->discarded_ms == 0);
+  }
+  // A bound supplied by the real NetEq factory config predates the wrapper.
+  {
+    auto decoder = std::make_unique<Decoder>();
+    auto* observed = decoder.get();
+    observed->mode = 5;
+    observed->frame_ms = 40;
+    auto stats = std::make_shared<veil_media::PlayoutRecoveryStats>();
+    veil_media::RecoveringNetEq recovering(std::move(decoder), stats, nullptr, 40);
+    assert(observed->maximum_delay == 40);
+    webrtc::AudioFrame frame;
+    recovering.GetAudio(&frame, nullptr, nullptr, std::nullopt);
+    assert(observed->maximum_delay == 40);
   }
   // Diagnostic capture must require both switches, remain bounded and defer
   // every file operation until the renderer has stopped and the owner dies.
