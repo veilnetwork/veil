@@ -908,11 +908,20 @@ async fn bbr_recovers_fresh_datagrams_after_neutral_outage() {
 
 #[tokio::test]
 async fn local_signaling_and_data_have_distinct_quic_connections_and_survive_screen_close() {
+    verify_distinct_sources(false).await;
+}
+
+#[tokio::test]
+async fn late_camera_and_screen_reopen_after_real_idle_without_retiring_audio() {
+    verify_distinct_sources(true).await;
+}
+
+async fn verify_distinct_sources(late_idle: bool) {
     use veil_proto::{
         ipc::LOCAL_RECOVERABLE_DATA_LANE,
         priority::{BACKGROUND, BULK},
     };
-    timeout(Duration::from_secs(20), async {
+    timeout(Duration::from_secs(if late_idle { 65 } else { 20 }), async {
         use super::super::parallel_lanes::{ParallelQuicOffer, ParallelSession};
         let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1002,6 +1011,97 @@ async fn local_signaling_and_data_have_distinct_quic_connections_and_survive_scr
             let sender = a.sender(index);
             assert!(bindings.insert(sender.handle.quic().unwrap().channel_binding().unwrap()));
             handles.push(sender.handle.quic().unwrap().clone());
+        }
+        if late_idle {
+            // Real QUIC idle expiry, no shortened transport config or advanced
+            // test clock. Keep the parent alive as normal session probes do;
+            // only the primary child carries continuous application data.
+            let audio_binding = handles[0].channel_binding().unwrap();
+            let idle_started = Instant::now();
+            let mut seq = 100u32;
+            let mut heartbeat_at = Duration::ZERO;
+            let mut late_sent = [false; 2];
+            let mut late_received = [false; 2];
+            let mut idle_observed = false;
+            let mut primary_peak = Duration::ZERO;
+            let mut reopened_handles = Vec::new();
+            while idle_started.elapsed() < Duration::from_secs(35)
+                || !late_received.iter().all(|received| *received)
+            {
+                let round = Instant::now();
+                let elapsed = idle_started.elapsed();
+                assert!(elapsed < Duration::from_secs(40), "late sources must reopen within the existing five-second preparation budget");
+                if elapsed >= heartbeat_at {
+                    a_stream.write_all(b"ping").await.unwrap();
+                    let mut ping = [0; 4];
+                    b_stream.read_exact(&mut ping).await.unwrap();
+                    assert_eq!(&ping, b"ping");
+                    heartbeat_at = elapsed + Duration::from_secs(5);
+                }
+                if elapsed >= Duration::from_secs(35) {
+                    if !idle_observed {
+                        for index in [1, 2] {
+                            timeout(Duration::from_millis(100), handles[index].closed()).await
+                                .expect("unused child must really expire before reopening");
+                        }
+                        idle_observed = true;
+                    }
+                    for (index, lane) in [BULK, BACKGROUND].into_iter().enumerate() {
+                        if late_sent[index] { continue; }
+                        let frame = primary_test_frame(true, 1_000_000 + index as u32, 0);
+                        let (_, body, kind) = super::super::decode_realtime_lane_frame(&frame).unwrap();
+                        if let Some(slot) = a.prepare_frame(lane, body, kind) {
+                            let mut sender = a.sender(slot);
+                            let handle = sender.handle.quic().unwrap().clone();
+                            let binding = handle.channel_binding().unwrap();
+                            assert_ne!(binding, handles[index + 1].channel_binding().unwrap());
+                            assert_ne!(binding, audio_binding, "late source cannot share primary congestion state");
+                            let max_size = sender.max_datagram_size;
+                            for packet in sender.tx.encode_frame(u64::from(lane), &frame, max_size).unwrap() {
+                                sender.handle.send(&packet).unwrap();
+                            }
+                            reopened_handles.push(handle);
+                            late_sent[index] = true;
+                        }
+                    }
+                }
+                let frame = primary_test_frame(true, seq, 0);
+                let (_, body, kind) = super::super::decode_realtime_lane_frame(&frame).unwrap();
+                let slot = a.prepare_frame(REALTIME, body, kind).expect("primary stays ready while other sources expire/warm");
+                let primary_sent = Instant::now();
+                {
+                    let mut sender = a.sender(slot);
+                    assert_eq!(sender.handle.quic().unwrap().channel_binding().unwrap(), audio_binding);
+                    let max_size = sender.max_datagram_size;
+                    for packet in sender.tx.encode_frame(u64::from(REALTIME), &frame, max_size).unwrap() {
+                        sender.handle.send(&packet).unwrap();
+                    }
+                }
+                timeout(Duration::from_millis(200), async {
+                    loop {
+                        let (observed, _, _) = rx.recv().await.unwrap();
+                        if observed == seq { break; }
+                        assert!((1_000_000..1_000_002).contains(&observed), "primary loss/duplicate/reordering");
+                        let index = (observed - 1_000_000) as usize;
+                        assert!(!late_received[index], "late source duplicate");
+                        late_received[index] = true;
+                    }
+                }).await.expect("primary packet held by late source preparation");
+                primary_peak = primary_peak.max(primary_sent.elapsed());
+                seq += 1;
+                sleep_until(round + Duration::from_millis(20)).await;
+            }
+            assert!(idle_observed && late_sent.iter().all(|sent| *sent));
+            assert!(late_received.iter().all(|received| *received));
+            eprintln!("late sources: primary_packets={} primary_packet_peak_ms={:.3} real_idle_seconds=35 camera_and_screen_received=true", seq - 100, primary_peak.as_secs_f64() * 1000.0);
+            drop((a, b));
+            close.close(0u32.into(), b"late local source separation complete");
+            handles.extend(reopened_handles);
+            for handle in handles {
+                timeout(Duration::from_secs(1), handle.closed()).await.unwrap();
+            }
+            assert_eq!(diagnostics.active_connections(), 0);
+            return;
         }
         // Retiring only the screen connection cannot retire the file source
         // or silently fall back to a shared canonical congestion controller.
