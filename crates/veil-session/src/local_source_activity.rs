@@ -22,6 +22,7 @@ const RELIABLE_RAMP_STEP: Duration = Duration::from_secs(2);
 struct SourceState {
     last_primary: Option<Instant>,
     pressure_until: Option<Instant>,
+    reliable_transport_pressure_until: Option<Instant>,
     secondary_window: Option<(Instant, usize)>,
     reliable_next: Option<Instant>,
     source_feedback_seen: bool,
@@ -171,6 +172,7 @@ impl LocalSourceActivity {
             // A new producer after inactivity must not inherit a previous
             // call's oversized compatibility-control debt.
             state.signaling_next = None;
+            state.reliable_transport_pressure_until = None;
             state.source_feedback_seen = false;
             state.last_healthy_feedback = None;
             state.reliable_ramp_since = None;
@@ -193,6 +195,20 @@ impl LocalSourceActivity {
         let mut state = lock!(self.state);
         let until = now + PRESSURE_GRACE;
         state.pressure_until = Some(state.pressure_until.map_or(until, |old| old.max(until)));
+        state.reliable_ramp_since = None;
+    }
+
+    /// Sustained delay growth on this endpoint's authenticated primary path
+    /// restrains only its ordered DATA. It does not select a video quality or
+    /// spend the network-recovery/neutral-transit allowance.
+    pub(crate) fn note_reliable_transport_pressure(&self, now: Instant) {
+        let mut state = lock!(self.state);
+        let until = now + PRESSURE_GRACE;
+        state.reliable_transport_pressure_until = Some(
+            state
+                .reliable_transport_pressure_until
+                .map_or(until, |old| old.max(until)),
+        );
         state.reliable_ramp_since = None;
     }
 
@@ -337,7 +353,11 @@ impl LocalSourceActivity {
             // Pressure must release bandwidth beyond the healthy-source
             // ceiling. Retain existing debt through feedback transitions;
             // only a newly admitted frame earns the current rate.
-            let budget = if state.pressure_until.is_some_and(|until| now < until) {
+            let budget = if state.pressure_until.is_some_and(|until| now < until)
+                || state
+                    .reliable_transport_pressure_until
+                    .is_some_and(|until| now < until)
+            {
                 state.reliable_ramp_since = None;
                 PRESSURED_RELIABLE_BYTES
             } else if state.source_feedback_seen {
@@ -461,6 +481,36 @@ impl LocalSourceActivity {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn early_transport_pressure_restrains_only_data_and_preserves_its_debt() {
+        let source = LocalSourceActivity::default();
+        let now = Instant::now();
+        source.note(now);
+        // Legacy callers have the healthy allowance before transport pressure.
+        assert!(source.admit_reliable_secondary(4096, now).is_ok());
+        source.note_reliable_transport_pressure(now + Duration::from_millis(10));
+        assert_eq!(
+            source.admit_reliable_secondary(1, now + Duration::from_millis(10)),
+            Err(now + SECONDARY_PROBE_INTERVAL)
+        );
+        let ready = now + SECONDARY_PROBE_INTERVAL;
+        assert!(source.admit_reliable_secondary(1024, ready).is_ok());
+        assert_eq!(
+            source.admit_reliable_secondary(1, ready),
+            Err(ready + SECONDARY_PROBE_INTERVAL)
+        );
+        // Video's measured-buffer policy and route recovery are independent.
+        assert!(source.allow_secondary(60000, ready));
+        assert!(source.allow_secondary(60000, ready));
+        assert!(source.admit_network_control(60000, ready).is_ok());
+        assert!(source.admit_network_control(60000, ready).is_ok());
+        assert!(source.admit_signaling(4096, ready).is_ok());
+        // The expiring observation cannot pin DATA after this call is idle.
+        let idle = now + IDLE_GRACE;
+        assert!(source.admit_reliable_secondary(60000, idle).is_ok());
+        assert!(source.admit_reliable_secondary(60000, idle).is_ok());
+    }
 
     #[test]
     fn source_work_does_not_spend_a_partial_remaining_allowance() {
