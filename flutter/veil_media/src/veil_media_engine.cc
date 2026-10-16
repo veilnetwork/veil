@@ -377,8 +377,9 @@ std::string node_key(const uint8_t id[32]) {
 // its pacer/BWE clock cannot be inflated by room size.
 class GroupFanoutTransport : public webrtc::Transport {
  public:
-  GroupFanoutTransport(webrtc::Call* call, webrtc::Call* video_call)
-      : call_(call), video_call_(video_call) {}
+  GroupFanoutTransport(webrtc::Call* call, webrtc::Call* video_call,
+                       uint32_t video_ssrc)
+      : video_ssrc_(video_ssrc), call_(call), video_call_(video_call) {}
 
   void Add(uint64_t chan) {
     std::lock_guard<std::mutex> lock(mu_);
@@ -404,7 +405,11 @@ class GroupFanoutTransport : public webrtc::Transport {
     const auto channels = Snapshot();
     bool any = false;
     for (const uint64_t chan : channels) {
+      const int64_t began_ns = webrtc::TimeMicros() * 1000;
+      const bool video = video_stats_.mark_attempt(packet, video_ssrc_, began_ns, 96);
       const bool sent = veil_media_send_datagram(chan, packet.data(), packet.size()) == 0;
+      if (video)
+        video_stats_.mark_result(began_ns, webrtc::TimeMicros() * 1000, sent);
       if (!sent && !veil_media::IsSecondaryInboundRtp(packet))
         audio_drops_.fetch_add(1, std::memory_order_relaxed);
       any = sent || any;
@@ -448,6 +453,9 @@ class GroupFanoutTransport : public webrtc::Transport {
 
  public:
   uint64_t audio_drops() const { return audio_drops_.load(std::memory_order_relaxed); }
+  veil_media::RtpSendSnapshot video_send_stats() const {
+    return video_stats_.snapshot(webrtc::TimeMicros() * 1000);
+  }
 
  private:
   veil_media::VideoControlTransport<GroupFanoutTransport> video_transport_{*this};
@@ -456,6 +464,8 @@ class GroupFanoutTransport : public webrtc::Transport {
     return channels_;
   }
   std::atomic<uint64_t> audio_drops_{0};
+  const uint32_t video_ssrc_;
+  veil_media::RtpSendStats video_stats_;
   std::atomic<bool> video_send_paused_{false};
   webrtc::Call* const call_;
   webrtc::Call* const video_call_;
@@ -1152,6 +1162,8 @@ struct GroupWebrtcState {
   std::unique_ptr<veil_media::CameraCapturer> camera;
   std::unique_ptr<veil_media::ScreenCapturer> screen;
   std::map<std::string, std::unique_ptr<GroupPeerState>> peers;
+  int prepared_video_bps = 0;  // Video-worker owned, consumed by next start.
+  double prepared_video_fps = 1;
   uint64_t audio_sample_sequence = 0;
   uint64_t audio_playout_revision = 0;
   size_t observed_playout_peer_count = 0;
@@ -1931,7 +1943,8 @@ VeilGroupMediaEngine* veil_media_group_engine_create(
                               ws->video_worker_tq.get(),
                               ws->video_network_tq.get());
   ws->video_call = webrtc::Call::Create(std::move(video_cfg));
-  ws->fanout = std::make_unique<GroupFanoutTransport>(ws->call.get(), ws->video_call.get());
+  ws->fanout = std::make_unique<GroupFanoutTransport>(
+      ws->call.get(), ws->video_call.get(), group_video_ssrc_of(engine->local));
   engine->ws = std::move(ws);
 #endif
   return engine.release();
@@ -2321,12 +2334,14 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
 
       // A new room has no measured audio feedback yet. Keep its initial video
       // load small; endpoint adaptation earns more only after healthy audio.
-      int kbps = 30;
+      const bool prepared = ws->prepared_video_bps > 0;
+      const double initial_fps = prepared ? ws->prepared_video_fps : 1;
+      int kbps = prepared ? ws->prepared_video_bps / 1000 : 30;
       if (const char* value = std::getenv("VEIL_MEDIA_VIDEO_KBPS")) {
         const int configured = std::atoi(value);
         if (configured > 0) kbps = configured;
       }
-      kbps = std::clamp(kbps, 30, 2500);
+      kbps = std::clamp(kbps, prepared ? 1 : 30, 2500);
       const int bps = kbps * 1000;
       ws->video_call->SetClientBitratePreferences(
           veil_media::video_bitrate_settings(bps, true, true));
@@ -2339,10 +2354,10 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
       ec.max_bitrate_bps = bps;
       webrtc::VideoStream layer;
       layer.active = true;
-      layer.min_bitrate_bps = 30000;
-      layer.target_bitrate_bps = bps * 2 / 3;
+      layer.min_bitrate_bps = std::min(30000, bps);
+      layer.target_bitrate_bps = std::max(layer.min_bitrate_bps, bps * 2 / 3);
       layer.max_bitrate_bps = bps;
-      layer.max_framerate = 1;
+      layer.max_framerate = static_cast<int>(std::ceil(initial_fps));
       layer.max_qp = 63;
       ec.simulcast_layers.push_back(layer);
       ws->video_send_stream =
@@ -2353,7 +2368,8 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
             webrtc::DegradationPreference::MAINTAIN_FRAMERATE);
         ws->video_send_stream->Start();
         ws->video_target_bitrate_bps = bps;
-        ws->video_max_fps.store(1, std::memory_order_relaxed);
+        ws->video_max_fps.store(initial_fps, std::memory_order_relaxed);
+        ws->prepared_video_bps = 0;
         ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
       }
     }
@@ -2407,11 +2423,10 @@ static int veil_media_group_engine_apply_video_budget(VeilGroupMediaEngine* engi
   if (max_bitrate_kbps <= 0 || !std::isfinite(max_fps) || max_fps <= 0)
     return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
-  if (!engine->ws || !engine->video_running.load()) return VEIL_MEDIA_ERR_STATE;
+  if (!engine->ws) return VEIL_MEDIA_ERR_STATE;
   GroupWebrtcState* ws = engine->ws.get();
   int rc = VEIL_MEDIA_ERR_STATE;
   const bool scheduled = veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&] {
-    if (!ws->video_send_stream) return;
     int kbps = max_bitrate_kbps > 0 ? max_bitrate_kbps : 150;
     if (const char* value = std::getenv("VEIL_MEDIA_VIDEO_KBPS")) {
       const int configured = std::atoi(value);
@@ -2420,6 +2435,14 @@ static int veil_media_group_engine_apply_video_budget(VeilGroupMediaEngine* engi
     kbps = std::clamp(kbps, minimum_kbps, 2500);
     const double fps = std::clamp(max_fps, 0.02, 60.0);
     const int bps = kbps * 1000;
+    if (!ws->video_send_stream) {
+      if (!engine->video_running.load()) {
+        ws->prepared_video_bps = bps;
+        ws->prepared_video_fps = fps;
+        rc = VEIL_MEDIA_OK;
+      }
+      return;
+    }
     if (ws->video_target_bitrate_bps != bps || ws->video_max_fps.load() != fps) {
       webrtc::VideoEncoderConfig ec;
       ec.codec_type = webrtc::kVideoCodecVP8;
@@ -2485,6 +2508,8 @@ int veil_media_group_engine_set_video_budget(VeilGroupMediaEngine* engine,
 int veil_media_group_engine_set_video_bitrate(VeilGroupMediaEngine* engine,
                                         int max_bitrate_kbps, int max_fps) {
   // Preserve integer ABI defaults for older callers.
+  if (!engine) return VEIL_MEDIA_ERR_ARG;
+  if (!engine->video_running.load()) return VEIL_MEDIA_ERR_STATE;
   return veil_media_group_engine_apply_video_budget(engine,
       std::clamp(max_bitrate_kbps > 0 ? max_bitrate_kbps : 150, 30, 2500),
       std::clamp(max_fps > 0 ? max_fps : 15, 1, 60), 30);
@@ -2641,6 +2666,14 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               ",\"audio_playout_reports\":" + std::to_string(playout_reports) +
               ",\"audio_playout_ms\":" + std::to_string(playout_ms);
   snapshot += ",\"video_send_paused\":" + std::to_string(ws->video_send_paused.load() ? 1 : 0);
+  const auto video_send = ws->fanout->video_send_stats();
+  // Per-peer attempted copies, unlike video_tx_frames (one logical encoder).
+  // Includes payload, padding and rejected copies; no media role leaves host.
+  snapshot += ",\"video_tx_rtp_attempts\":" + std::to_string(video_send.attempts) +
+              ",\"video_tx_rtp_queued\":" + std::to_string(video_send.queued) +
+              ",\"video_tx_payload_bytes\":" + std::to_string(video_send.payload_bytes) +
+              ",\"video_tx_padding_bytes\":" + std::to_string(video_send.padding_bytes) +
+              ",\"video_tx_rtp_drops\":" + std::to_string(video_send.dropped);
   snapshot += ",\"audio_latency_recovery_count\":" +
       std::to_string(ws->recovery_stats->count.load(std::memory_order_acquire));
   snapshot += ",\"audio_latency_discarded_ms\":" +

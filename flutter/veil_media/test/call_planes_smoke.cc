@@ -994,9 +994,44 @@ int main(int argc, char** argv) {
       video.join(); audio.join();
       assert(video_held && audio_while_held && video_result == 0 && audio_result == 0);
     }
+    assert(group_stat(e.get(), "video_tx_rtp_attempts") == 1);
+    assert(group_stat(e.get(), "video_tx_rtp_queued") == 1);
+    assert(group_stat(e.get(), "video_tx_payload_bytes") == 3);
+    assert(group_stat(e.get(), "video_tx_padding_bytes") == 0);
+    uint8_t other_peer[32] = {99};
+    assert(veil_media_group_engine_add_peer(e.get(), 91, other_peer) == VEIL_MEDIA_OK);
+    { std::lock_guard lock(callback_mu); rejected_channels.insert(91); }
+    assert(veil_media_test_group_fanout_packet(e.get(), 1) == 0);
+    { std::lock_guard lock(callback_mu); rejected_channels.erase(91); }
+    assert(group_stat(e.get(), "video_tx_rtp_attempts") == 3);
+    assert(group_stat(e.get(), "video_tx_rtp_queued") == 2);
+    assert(group_stat(e.get(), "video_tx_payload_bytes") == 9);
+    assert(group_stat(e.get(), "video_tx_rtp_drops") == 1);
+    assert(veil_media_group_engine_remove_peer(e.get(), other_peer) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_remove_peer(e.get(), peer) == VEIL_MEDIA_OK);
     assert(veil_media_test_group_fanout_packet(e.get(), 0) != 0);
     std::puts("group fanout: audio passed while video RTP/RTCP send was held; removed peer excluded");
+  }
+  {
+    std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> e(
+        veil_media_group_engine_create(local), veil_media_group_engine_destroy);
+    assert(e);
+    assert(veil_media_group_engine_set_video_budget(e.get(), 8, 0.3) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_start_video(e.get()) == VEIL_MEDIA_OK);
+    assert(group_stat(e.get(), "video_kbps") == 8);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (group_stat(e.get(), "video_tx_frames") == 0 &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    assert(group_stat(e.get(), "video_tx_frames") > 0);
+    const auto target = group_stat(e.get(), "video_encoder_target_bps");
+    assert(target > 0 && target <= 8000);
+    assert(veil_media_group_engine_stop_video(e.get()) == VEIL_MEDIA_OK);
+    // A consumed cold budget cannot silently become a later legacy default.
+    assert(veil_media_group_engine_start_video(e.get()) == VEIL_MEDIA_OK);
+    assert(group_stat(e.get(), "video_kbps") == 30);
+    assert(group_stat(e.get(), "max_fps") == 1);
+    std::puts("group video: cold codec budget applied before first encoded frame; consumed once");
   }
   unsetenv("VEIL_MEDIA_TEST_VIDEO");
   assert(callbacks.empty());

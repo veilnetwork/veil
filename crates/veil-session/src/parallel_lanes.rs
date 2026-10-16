@@ -243,6 +243,14 @@ async fn connect_sender(
     trace: Option<&recovery_trace::Attempt>,
 ) -> Result<ReadySender, &'static str> {
     use recovery_trace::{Attempt, Phase};
+    let started = std::time::Instant::now();
+    let trace_startup = crate::rt_trace::rt_trace_enabled();
+    if trace_startup {
+        context.logger.info(
+            "session.rt_trace.parallel_connect_start",
+            format!("peer_id={} local_slot={index}", hex_short(&context.peer_id)),
+        );
+    }
     let connection = offer
         .handle
         .connect()
@@ -251,6 +259,21 @@ async fn connect_sender(
     Attempt::phase(trace, Phase::Channel);
     let mut channel =
         Channel::new(connection, Arc::clone(&offer.diagnostics)).map_err(|_| "channel_error")?;
+    if trace_startup {
+        let stats = channel.handle.path_stats();
+        context.logger.info(
+            "session.rt_trace.parallel_connect_ready",
+            format!(
+                "peer_id={} local_slot={index} elapsed_ms={} udp_sent_bytes={} udp_received_bytes={} pto_count={} lost_packets={}",
+                hex_short(&context.peer_id),
+                started.elapsed().as_millis(),
+                stats.udp_sent_bytes,
+                stats.udp_received_bytes,
+                stats.pto_count,
+                stats.lost_packets,
+            ),
+        );
+    }
     Attempt::phase(trace, Phase::Exporter);
     let exporter = channel
         .handle
@@ -288,10 +311,25 @@ async fn connect_sender(
     let mut sender = RealtimeSender::new(channel.handle.clone(), tx);
     sender.sent_counter = Some((Arc::clone(&offer.diagnostics), index));
     let sender = Arc::new(Mutex::new(sender));
+    Attempt::phase(trace, Phase::Ready);
+    if trace_startup {
+        let stats = channel.handle.path_stats();
+        context.logger.info(
+            "session.rt_trace.parallel_binding_ready",
+            format!(
+                "peer_id={} local_slot={index} elapsed_ms={} udp_sent_bytes={} udp_received_bytes={} pto_count={} lost_packets={}",
+                hex_short(&context.peer_id),
+                started.elapsed().as_millis(),
+                stats.udp_sent_bytes,
+                stats.udp_received_bytes,
+                stats.pto_count,
+                stats.lost_packets,
+            ),
+        );
+    }
     let receiver = offer
         .duplex
         .then(|| spawn_child_receiver(&channel, &keys, parent, context, Arc::clone(&sender)));
-    Attempt::phase(trace, Phase::Ready);
     Ok(ReadySender {
         sender,
         _receiver: receiver,
