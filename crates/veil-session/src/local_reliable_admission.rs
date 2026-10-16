@@ -39,12 +39,64 @@ impl PrimaryPathFeedback {
     }
 }
 
+// One authenticated local path, bounded memory and no remote hint. Compare
+// relative RTT growth; a stable 120-ms route is not an accumulating queue.
+#[derive(Default)]
+struct ReliableDelayFeedback {
+    path: Option<u64>,
+    acked: u64,
+    baseline_us: u64,
+    last_at: Option<Instant>,
+    rising_since: Option<Instant>,
+    rising_samples: u32,
+    logged_at: Option<Instant>,
+}
+
+impl ReliableDelayFeedback {
+    fn observe(&mut self, path: u64, acked: u64, rtt_us: u64, now: Instant) -> bool {
+        if acked == 0 || rtt_us == 0 {
+            return false;
+        }
+        let reset = self.path != Some(path)
+            || acked < self.acked
+            || self
+                .last_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= IDLE_GRACE);
+        if reset {
+            self.path = Some(path);
+            self.acked = acked;
+            self.baseline_us = rtt_us;
+            self.last_at = Some(now);
+            self.rising_since = None;
+            self.rising_samples = 0;
+            return false;
+        }
+        if acked <= self.acked {
+            return false;
+        }
+        self.acked = acked;
+        self.last_at = Some(now);
+        self.baseline_us = self.baseline_us.min(rtt_us);
+        let margin = 20_000.max(self.baseline_us / 4);
+        if rtt_us <= self.baseline_us.saturating_add(margin) {
+            self.rising_since = None;
+            self.rising_samples = 0;
+            return false;
+        }
+        self.rising_samples = self.rising_samples.saturating_add(1);
+        let since = *self.rising_since.get_or_insert(now);
+        self.rising_samples >= 3
+            && now.saturating_duration_since(since) >= Duration::from_millis(100)
+    }
+}
+
 pub(super) struct LocalReliableAdmission {
     writes: Arc<ReliableWriteAdmission>,
     source_activity: Arc<crate::local_source_activity::LocalSourceActivity>,
     active_until: Option<Instant>,
     pressure_until: Option<Instant>,
     feedback: PrimaryPathFeedback,
+    reliable_delay: ReliableDelayFeedback,
 }
 
 impl LocalReliableAdmission {
@@ -55,6 +107,7 @@ impl LocalReliableAdmission {
             active_until: None,
             pressure_until: None,
             feedback: PrimaryPathFeedback::default(),
+            reliable_delay: ReliableDelayFeedback::default(),
         }
     }
 
@@ -102,6 +155,28 @@ impl LocalReliableAdmission {
         now: Instant,
     ) -> bool {
         let stats = handle.path_stats();
+        let path = handle.local_trace_id();
+        if self
+            .reliable_delay
+            .observe(path, stats.acknowledgments_received, stats.rtt_us, now)
+        {
+            self.source_activity.note_reliable_transport_pressure(now);
+            if crate::rt_trace::rt_trace_enabled()
+                && self
+                    .reliable_delay
+                    .logged_at
+                    .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(1))
+            {
+                let at_unix_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros();
+                log::info!(target: "veil::source_data_delay",
+                    "at_unix_us={at_unix_us} path={} rtt_us={} baseline_us={} scope=endpoint",
+                    path, stats.rtt_us, self.reliable_delay.baseline_us);
+                self.reliable_delay.logged_at = Some(now);
+            }
+        }
         // RTT remains the last successful sample while ACKs stop arriving.
         // Pause competing local producers before queued primary cells expire.
         let ack_blocked = stats.pto_count > 0
@@ -268,6 +343,53 @@ impl Drop for ControlWrite {
 #[cfg(test)]
 mod feedback_tests {
     use super::*;
+
+    #[test]
+    fn reliable_delay_requires_fresh_sustained_growth_and_allows_stable_high_rtt() {
+        let mut feedback = ReliableDelayFeedback::default();
+        let now = Instant::now();
+        for n in 0..20 {
+            assert!(!feedback.observe(1, n + 1, 120_000, now + Duration::from_millis(n * 40)));
+        }
+        let start = now + Duration::from_secs(1);
+        assert!(!feedback.observe(1, 21, 160_000, start));
+        // Reading the same ACK snapshot cannot fill a sustained window.
+        assert!(!feedback.observe(1, 21, 160_000, start + Duration::from_millis(100)));
+        assert!(!feedback.observe(1, 22, 160_000, start + Duration::from_millis(110)));
+        assert!(feedback.observe(1, 23, 160_000, start + Duration::from_millis(150)));
+        assert!(!feedback.observe(1, 24, 120_000, start + Duration::from_millis(190)));
+        assert!(!feedback.observe(1, 25, 160_000, start + Duration::from_millis(230)));
+    }
+
+    #[test]
+    fn reliable_delay_rebases_on_path_counter_reset_or_idle() {
+        let mut feedback = ReliableDelayFeedback::default();
+        let now = Instant::now();
+        assert!(!feedback.observe(1, 10, 40_000, now));
+        assert!(!feedback.observe(1, 11, 80_000, now + Duration::from_millis(40)));
+        assert!(!feedback.observe(2, 12, 120_000, now + Duration::from_millis(80)));
+        assert!(!feedback.observe(2, 13, 120_000, now + Duration::from_millis(120)));
+        assert!(!feedback.observe(2, 1, 200_000, now + Duration::from_millis(160)));
+        assert!(!feedback.observe(2, 2, 200_000, now + Duration::from_millis(200)));
+        assert!(!feedback.observe(2, 3, 300_000, now + IDLE_GRACE + Duration::from_secs(1)));
+        assert!(!feedback.observe(
+            2,
+            4,
+            300_000,
+            now + IDLE_GRACE + Duration::from_millis(1100)
+        ));
+    }
+
+    #[test]
+    fn a_single_delay_spike_or_unknown_ack_cannot_restrain_data() {
+        let mut feedback = ReliableDelayFeedback::default();
+        let now = Instant::now();
+        assert!(!feedback.observe(1, 0, 0, now));
+        assert!(!feedback.observe(1, 1, 40_000, now));
+        assert!(!feedback.observe(1, 2, 200_000, now + Duration::from_millis(40)));
+        assert!(!feedback.observe(1, 3, 40_000, now + Duration::from_millis(160)));
+        assert!(!feedback.observe(1, 4, 40_000, now + Duration::from_millis(200)));
+    }
 
     #[test]
     fn new_primary_loss_and_congestion_are_pressure_even_with_low_rtt() {
