@@ -192,11 +192,11 @@ void configure_call_audio_send(webrtc::AudioSendStream::Config& config,
                                bool transport_feedback, int packet_overhead = 0,
                                std::shared_ptr<std::atomic<int>> packet_duration = {}) {
   if (!transport_feedback) return;
-  config.min_bitrate_bps = 12'000;
+  config.min_bitrate_bps = veil_media::kFramingAudioMinPayloadBps;
   config.max_bitrate_bps = 32'000;
   config.include_in_congestion_control_allocation = true;
   if (packet_overhead > 0) {
-    config.min_bitrate_bps = 16'000;
+    config.min_bitrate_bps = veil_media::kFramingAudioMinPayloadBps;
     // Gross allocation ceiling, not the codec ceiling. The bounded encoder
     // retains a 32-kbit payload cap and leaves room for control traffic.
     config.max_bitrate_bps = 80'000;
