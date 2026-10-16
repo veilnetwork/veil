@@ -156,6 +156,10 @@ int veil_media_group_engine_set_video_send_paused(VeilGroupMediaEngine *engine, 
  * playout feedback; `audio_playout_reports` counts fresh measured estimates
  * (12 s), and `audio_playout_ms` is their maximum or -1 when unknown. Receiver
  * samples are appended to existing RTCP only, with no relay-visible role.
+ * `audio_latency_recovery_count`, `audio_latency_discarded_ms` and
+ * `audio_latency_fallback_frames` aggregate local decoded-audio catch-up over
+ * all receivers in this engine. Consume fresh counter deltas, not cached
+ * totals; a new engine establishes a new baseline. These fields stay local.
  * Free this JSON with veil_media_free_string. */
 char *veil_media_group_engine_get_stats(VeilGroupMediaEngine *engine);
 int veil_media_group_engine_start_camera(VeilGroupMediaEngine *engine,

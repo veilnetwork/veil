@@ -1123,6 +1123,9 @@ struct GroupWebrtcState {
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm;
   webrtc::scoped_refptr<webrtc::AudioProcessing> apm;
   webrtc::scoped_refptr<webrtc::AudioState> audio_state;
+  std::shared_ptr<veil_media::PlayoutRecoveryStats> recovery_stats =
+      std::make_shared<veil_media::PlayoutRecoveryStats>();
+  std::unique_ptr<webrtc::NetEqFactory> recovery_factory;
   std::unique_ptr<webrtc::Call> call;  // audio only
   std::unique_ptr<webrtc::Call> video_call;
   std::unique_ptr<GroupFanoutTransport> fanout;
@@ -1864,6 +1867,19 @@ VeilGroupMediaEngine* veil_media_group_engine_create(
   webrtc::CallConfig call_cfg(ws->env, ws->worker_tq.get(),
                               ws->network_tq.get());
   call_cfg.audio_state = ws->audio_state;
+  // Each remote source has its own NetEq, and every source in the mixer must
+  // discard stale decoded speech using the same bounded callback work as 1:1.
+  // The shared counters account for recovery anywhere in this room. Keep the
+  // factory alive through Call teardown and all receive-stream destruction.
+  bool recover_playout = true;
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+  recover_playout = std::getenv("VEIL_MEDIA_TEST_DISABLE_AUDIO_DRAIN") == nullptr;
+#endif
+  if (recover_playout) {
+    ws->recovery_factory = std::make_unique<veil_media::RecoveringNetEqFactory>(
+        ws->recovery_stats);
+    call_cfg.neteq_factory = ws->recovery_factory.get();
+  }
   configure_call_audio_transport(call_cfg);
   ws->call = webrtc::Call::Create(std::move(call_cfg));
   webrtc::CallConfig video_cfg(create_low_latency_environment(true),
@@ -2514,6 +2530,12 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               ",\"audio_playout_reports\":" + std::to_string(playout_reports) +
               ",\"audio_playout_ms\":" + std::to_string(playout_ms);
   snapshot += ",\"video_send_paused\":" + std::to_string(ws->video_send_paused.load() ? 1 : 0);
+  snapshot += ",\"audio_latency_recovery_count\":" +
+      std::to_string(ws->recovery_stats->count.load(std::memory_order_acquire));
+  snapshot += ",\"audio_latency_discarded_ms\":" +
+      std::to_string(ws->recovery_stats->discarded_ms.load(std::memory_order_relaxed));
+  snapshot += ",\"audio_latency_fallback_frames\":" +
+      std::to_string(ws->recovery_stats->fallback_frames.load(std::memory_order_relaxed));
   snapshot += ",\"audio_rx_supported\":1,\"audio_rx_native_age_supported\":1,\"audio_receivers\":{";
   if (audio_sampled) snapshot += audio_receivers;
   snapshot += "}}";
