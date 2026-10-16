@@ -664,6 +664,22 @@ class VeilGroupMediaEngine {
     return ffi.veilMediaGroupEngineStartAudio(_ptr) == 0;
   }
 
+  /// Local payload/framing control; does not restart the RTP sender or ADM.
+  bool get supportsAudioBudget =>
+      ffi.veilMediaGroupEngineSetAudioBudget != null;
+
+  bool setAudioBudget({required int packetMs, required int payloadBps}) {
+    _ensure();
+    if (!const {20, 40, 60}.contains(packetMs) ||
+        payloadBps < 16000 ||
+        payloadBps > 32000) {
+      throw ArgumentError(
+          'Group audio needs 20/40/60 ms and 16000..32000 bit/s');
+    }
+    final set = ffi.veilMediaGroupEngineSetAudioBudget;
+    return set != null && set(_ptr, packetMs, payloadBps) == 0;
+  }
+
   bool stopAudio() {
     _ensure();
     return ffi.veilMediaGroupEngineStopAudio(_ptr) == 0;

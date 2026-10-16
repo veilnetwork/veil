@@ -5,20 +5,29 @@
 extern "C" char* veil_media_test_group_audio_send_stats(VeilGroupMediaEngine* e) {
   if (!e || !e->ws) return nullptr;
   webrtc::AudioSendStream::Stats sample;
+  uint32_t origin = 0, timestamp = 0;
+  uint16_t sequence = 0;
   bool found = false;
   const bool ran = run_on(e->ws->worker_tq.get(), [&] {
     if (!e->ws->send_stream) return;
     sample = e->ws->send_stream->GetStats();
+    const auto state = static_cast<const webrtc::internal::AudioSendStream*>(
+        e->ws->send_stream)->GetRtpState();
+    origin = state.start_timestamp;
+    timestamp = state.timestamp;
+    sequence = state.sequence_number;
     found = true;
   });
   if (!ran || !found) return nullptr;
-  char json[256];
+  char json[512];
   const int size = std::snprintf(json, sizeof(json),
       "{\"packets\":%d,\"payload_bytes\":%lld,\"header_padding_bytes\":%lld,"
-      "\"target_bps\":%lld}", sample.packets_sent,
+      "\"target_bps\":%lld,\"rtp_origin\":%u,\"rtp_timestamp\":%u,"
+      "\"rtp_sequence\":%u}", sample.packets_sent,
       static_cast<long long>(sample.payload_bytes_sent),
       static_cast<long long>(sample.header_and_padding_bytes_sent),
-      static_cast<long long>(sample.target_bitrate_bps));
+      static_cast<long long>(sample.target_bitrate_bps), origin, timestamp,
+      static_cast<unsigned>(sequence));
   if (size <= 0 || static_cast<size_t>(size) >= sizeof(json)) return nullptr;
   return dup_cstr(json);
 }
@@ -533,6 +542,18 @@ extern "C" int veil_media_test_group_with_held_video(
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   // RAII releases both queues on every callback result before engine teardown.
+  return drive(ctx);
+}
+
+extern "C" int veil_media_test_group_with_held_audio(
+    VeilGroupMediaEngine* e, int (*drive)(void*), void* ctx) {
+  if (!e || !e->ws || !drive) return VEIL_MEDIA_ERR_ARG;
+  HeldQueues held(e->ws->network_tq.get(), e->ws->worker_tq.get());
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!held.first->entered.load() || !held.second->entered.load()) {
+    if (std::chrono::steady_clock::now() >= deadline) return VEIL_MEDIA_ERR_STATE;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
   return drive(ctx);
 }
 
