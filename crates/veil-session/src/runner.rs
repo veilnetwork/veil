@@ -5119,6 +5119,26 @@ impl SessionRunner {
                             datagram_drained += 1;
                             continue;
                         }
+                        // Whole-work credit was paid once above. Release owned
+                        // cells over their producer cadence without holding the
+                        // IPC handler or blocking another source's queue.
+                        if let Some(work) = envelope.local_work.as_ref() {
+                            match work.release_at(std::time::Instant::now()) {
+                                veil_types::local_lossy_work::WorkAdmission::Wait(until) => {
+                                    pq.restore_lossy_envelope(envelope);
+                                    datagram_waiting[outgoing_priority as usize] = true;
+                                    source_pressure_retry = Some(
+                                        source_pressure_retry.map_or(until, |old| old.min(until)),
+                                    );
+                                    continue;
+                                }
+                                veil_types::local_lossy_work::WorkAdmission::Rejected => {
+                                    datagram_drained += 1;
+                                    continue;
+                                }
+                                veil_types::local_lossy_work::WorkAdmission::Admitted => {}
+                            }
+                        }
                         crate::local_lossy_trace::cell("budget_admit", outgoing_priority, outgoing);
                         if outgoing_priority == crate::LOCAL_SIGNALING_LANE
                             && envelope.carrier.is_none()
@@ -5563,6 +5583,10 @@ impl SessionRunner {
                                     Ok(()) => veil_types::local_lossy_work::WorkAdmission::Admitted,
                                     Err(until) => veil_types::local_lossy_work::WorkAdmission::Wait(until),
                                 },
+                            };
+                            let admission = match (admission, local_work) {
+                                (veil_types::local_lossy_work::WorkAdmission::Admitted, Some(work)) => work.release_at(now),
+                                (other, _) => other,
                             };
                             match admission {
                                 veil_types::local_lossy_work::WorkAdmission::Wait(retry) => {

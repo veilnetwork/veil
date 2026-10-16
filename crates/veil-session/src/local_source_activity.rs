@@ -109,7 +109,7 @@ impl LocalSourceActivity {
         now: Instant,
     ) -> veil_types::local_lossy_work::WorkAdmission {
         let mut oversized_under_pressure = false;
-        let decision = cell.admit(self.work_owner, bytes, |total| {
+        let decision = cell.admit_at(self.work_owner, bytes, now, |total| {
             if total > LOSSY_SECONDARY_BYTES {
                 let state = lock!(self.state);
                 if state

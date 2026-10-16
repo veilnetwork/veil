@@ -1,9 +1,11 @@
 //! A bounded, locally authored lossy work item. Never serialized on the network.
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub const MAX_CELLS: usize = 512;
 pub const MAX_SEALED_BYTES: usize = 512 * 1024 + MAX_CELLS * 64;
+pub const MAX_PACING_SPAN: Duration = Duration::from_millis(100);
+pub const SOURCE_WORK_MAX_AGE: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Default)]
 enum Decision {
@@ -12,6 +14,8 @@ enum Decision {
     Admitted {
         owner: u64,
         overhead: usize,
+        admitted_at: Instant,
+        wire_bytes: usize,
     },
     Rejected,
 }
@@ -20,7 +24,15 @@ enum Decision {
 pub struct LocalLossyWork {
     sizes: Vec<usize>,
     sealed_bytes: usize,
+    prefix_bytes: Vec<usize>,
+    pacing: Option<Pacing>,
     decision: Mutex<Decision>,
+}
+
+#[derive(Debug)]
+struct Pacing {
+    span: Duration,
+    expires_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -47,11 +59,38 @@ impl LocalLossyWork {
         if sealed_bytes > MAX_SEALED_BYTES {
             return None;
         }
+        let mut prefix = 0;
+        let prefix_bytes = sizes
+            .iter()
+            .map(|size| {
+                let before = prefix;
+                prefix += size;
+                before
+            })
+            .collect();
         Some(Arc::new(Self {
             sizes,
             sealed_bytes,
+            prefix_bytes,
+            pacing: None,
             decision: Mutex::new(Decision::Pending),
         }))
+    }
+
+    /// An origin-only schedule. No cadence/deadline is sent to another node.
+    /// Existing callers without this explicit ownership retain their behavior.
+    pub fn new_paced(sizes: Vec<usize>, span: Duration, expires_at: Instant) -> Option<Arc<Self>> {
+        let mut work = Self::new(sizes)?;
+        let value = Arc::get_mut(&mut work).expect("unpublished work is unique");
+        value.pacing = Some(Pacing {
+            span: if value.sizes.len() == 1 {
+                Duration::ZERO
+            } else {
+                span.min(MAX_PACING_SPAN)
+            },
+            expires_at,
+        });
+        Some(work)
     }
 
     pub fn cell(self: &Arc<Self>, index: usize) -> Option<LocalLossyCell> {
@@ -70,9 +109,28 @@ impl LocalLossyCell {
         &self,
         owner: u64,
         wire_bytes: usize,
+        reserve: impl FnMut(usize) -> Result<(), Instant>,
+    ) -> WorkAdmission {
+        self.admit_at(owner, wire_bytes, Instant::now(), reserve)
+    }
+
+    pub fn admit_at(
+        &self,
+        owner: u64,
+        wire_bytes: usize,
+        now: Instant,
         mut reserve: impl FnMut(usize) -> Result<(), Instant>,
     ) -> WorkAdmission {
         let mut state = self.work.decision.lock().unwrap_or_else(|p| p.into_inner());
+        if self
+            .work
+            .pacing
+            .as_ref()
+            .is_some_and(|p| now >= p.expires_at)
+        {
+            *state = Decision::Rejected;
+            return WorkAdmission::Rejected;
+        }
         let Some(overhead) = wire_bytes.checked_sub(self.work.sizes[self.index]) else {
             *state = Decision::Rejected;
             return WorkAdmission::Rejected;
@@ -82,12 +140,20 @@ impl LocalLossyCell {
             Decision::Admitted {
                 owner: bound,
                 overhead: bound_overhead,
+                ..
             } if owner == bound && overhead == bound_overhead => WorkAdmission::Admitted,
             Decision::Admitted { .. } => {
                 *state = Decision::Rejected;
                 WorkAdmission::Rejected
             }
             Decision::Pending => {
+                if self.work.pacing.as_ref().is_some_and(|p| {
+                    now.checked_add(p.span)
+                        .is_none_or(|end| end >= p.expires_at)
+                }) {
+                    *state = Decision::Rejected;
+                    return WorkAdmission::Rejected;
+                }
                 let Some(total) = overhead
                     .checked_mul(self.work.sizes.len())
                     .and_then(|n| n.checked_add(self.work.sealed_bytes))
@@ -97,7 +163,12 @@ impl LocalLossyCell {
                 };
                 match reserve(total) {
                     Ok(()) => {
-                        *state = Decision::Admitted { owner, overhead };
+                        *state = Decision::Admitted {
+                            owner,
+                            overhead,
+                            admitted_at: now,
+                            wire_bytes: total,
+                        };
                         WorkAdmission::Admitted
                     }
                     Err(until) => WorkAdmission::Wait(until),
@@ -106,21 +177,153 @@ impl LocalLossyCell {
         }
     }
 
+    /// Query release only AFTER whole-work admission. Waiting here never
+    /// refunds/repeats the reservation and never changes the original expiry.
+    pub fn release_at(&self, now: Instant) -> WorkAdmission {
+        let Some(pacing) = &self.work.pacing else {
+            return if self.rejected() {
+                WorkAdmission::Rejected
+            } else {
+                WorkAdmission::Admitted
+            };
+        };
+        let mut state = self.work.decision.lock().unwrap_or_else(|p| p.into_inner());
+        if now >= pacing.expires_at {
+            *state = Decision::Rejected;
+            return WorkAdmission::Rejected;
+        }
+        match *state {
+            Decision::Admitted {
+                overhead,
+                admitted_at,
+                wire_bytes,
+                ..
+            } => {
+                // Admission checked that the complete cost fits usize; every
+                // prefix is smaller. Exact integer time arithmetic avoids
+                // rounding a large frame's final members back to the first.
+                let prefix = self.work.prefix_bytes[self.index] + self.index * overhead;
+                let nanos = pacing.span.as_nanos() * prefix as u128 / wire_bytes as u128;
+                let due = admitted_at + Duration::from_nanos(nanos as u64);
+                if now < due {
+                    WorkAdmission::Wait(due)
+                } else {
+                    WorkAdmission::Admitted
+                }
+            }
+            _ => WorkAdmission::Rejected,
+        }
+    }
+
+    /// Original daemon receipt deadline, shared by every member and retry.
+    pub fn expires_at(&self) -> Option<Instant> {
+        self.work.pacing.as_ref().map(|p| p.expires_at)
+    }
+
     pub fn reject(&self) {
         *self.work.decision.lock().unwrap_or_else(|p| p.into_inner()) = Decision::Rejected;
     }
 
     pub fn rejected(&self) -> bool {
-        matches!(
-            *self.work.decision.lock().unwrap_or_else(|p| p.into_inner()),
-            Decision::Rejected
-        )
+        self.work
+            .pacing
+            .as_ref()
+            .is_some_and(|p| Instant::now() >= p.expires_at)
+            || matches!(
+                *self.work.decision.lock().unwrap_or_else(|p| p.into_inner()),
+                Decision::Rejected
+            )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paced_members_reserve_the_whole_wire_cost_once_and_keep_release_times() {
+        let now = Instant::now();
+        let span = Duration::from_millis(90);
+        let work = LocalLossyWork::new_paced(vec![1000, 800, 400], span, now + SOURCE_WORK_MAX_AGE)
+            .unwrap();
+        let first = work.cell(0).unwrap();
+        assert_eq!(
+            first.admit_at(7, 1316, now, |n| {
+                assert_eq!(n, 3148);
+                Ok(())
+            }),
+            WorkAdmission::Admitted
+        );
+        assert_eq!(first.release_at(now), WorkAdmission::Admitted);
+        let second = work.cell(1).unwrap();
+        let due = now + Duration::from_nanos((span.as_nanos() * 1316 / 3148) as u64);
+        assert_eq!(
+            second.admit_at(7, 1116, now, |_| panic!("already reserved")),
+            WorkAdmission::Admitted
+        );
+        assert_eq!(second.release_at(now), WorkAdmission::Wait(due));
+        assert_eq!(
+            second.release_at(due - Duration::from_nanos(1)),
+            WorkAdmission::Wait(due)
+        );
+        assert_eq!(second.release_at(due), WorkAdmission::Admitted);
+        assert_eq!(
+            second.admit_at(7, 1116, due, |_| panic!("retry cannot renew credit")),
+            WorkAdmission::Admitted
+        );
+        let last = work.cell(2).unwrap();
+        let last_due = now + Duration::from_nanos((span.as_nanos() * 2432 / 3148) as u64);
+        assert_eq!(last.release_at(due), WorkAdmission::Wait(last_due));
+        assert_eq!(last.release_at(last_due), WorkAdmission::Admitted);
+    }
+
+    #[test]
+    fn a_schedule_that_cannot_finish_is_rejected_before_spending_credit() {
+        let now = Instant::now();
+        let work =
+            LocalLossyWork::new_paced(vec![1000; 3], MAX_PACING_SPAN, now + SOURCE_WORK_MAX_AGE)
+                .unwrap();
+        assert_eq!(
+            work.cell(0)
+                .unwrap()
+                .admit_at(1, 1316, now + Duration::from_millis(150), |_| panic!(
+                    "expired schedule"
+                )),
+            WorkAdmission::Rejected
+        );
+        assert!(work.cell(2).unwrap().rejected());
+    }
+
+    #[test]
+    fn paced_expiry_and_rejection_cannot_be_revived_by_later_members() {
+        let now = Instant::now();
+        let end = now + SOURCE_WORK_MAX_AGE;
+        let work = LocalLossyWork::new_paced(vec![1000; 3], MAX_PACING_SPAN, end).unwrap();
+        assert_eq!(
+            work.cell(0).unwrap().admit_at(1, 1316, now, |_| Ok(())),
+            WorkAdmission::Admitted
+        );
+        assert_eq!(
+            work.cell(2).unwrap().release_at(end),
+            WorkAdmission::Rejected
+        );
+        assert_eq!(
+            work.cell(1)
+                .unwrap()
+                .admit_at(1, 1316, now, |_| panic!("rejected work")),
+            WorkAdmission::Rejected
+        );
+        let single = LocalLossyWork::new_paced(vec![1000], MAX_PACING_SPAN, end).unwrap();
+        let at = end - Duration::from_millis(1);
+        assert_eq!(
+            single.cell(0).unwrap().admit_at(1, 1316, at, |_| Ok(())),
+            WorkAdmission::Admitted
+        );
+        assert_eq!(
+            single.cell(0).unwrap().release_at(at),
+            WorkAdmission::Admitted
+        );
+    }
 
     #[test]
     fn all_cells_reserve_once_including_envelope_overhead_and_retries() {
