@@ -1130,6 +1130,12 @@ struct GroupWebrtcState {
   std::unique_ptr<webrtc::Call> video_call;
   std::unique_ptr<GroupFanoutTransport> fanout;
   webrtc::AudioSendStream* send_stream = nullptr;  // owned by Call
+  webrtc::scoped_refptr<webrtc::AudioEncoderFactory> audio_encoder_factory;
+  std::shared_ptr<std::atomic<int>> audio_packet_duration =
+      std::make_shared<std::atomic<int>>(0);
+  int audio_packet_ms = 20;  // Audio-worker owned requested configuration.
+  int audio_payload_bps = 32'000;
+  bool audio_config_valid = true;
   std::unique_ptr<webrtc::VideoEncoderFactory> video_encoder_factory;
   std::unique_ptr<webrtc::VideoDecoderFactory> video_decoder_factory;
   std::unique_ptr<webrtc::VideoBitrateAllocatorFactory>
@@ -1152,6 +1158,45 @@ struct GroupWebrtcState {
 };
 
 constexpr int kGroupVp8PayloadType = 96;
+
+webrtc::AudioSendStream::Config group_audio_send_config(
+    GroupWebrtcState* ws, uint32_t ssrc, int packet_ms, int payload_bps) {
+  webrtc::AudioSendStream::Config config(ws->fanout.get());
+  config.rtp.ssrc = ssrc;
+  config.rtp.extensions.emplace_back(
+      webrtc::RtpExtension::kTransportSequenceNumberUri,
+      webrtc::RtpHeaderExtensionId(1));
+  if (!ws->audio_encoder_factory)
+    ws->audio_encoder_factory =
+        webrtc::make_ref_counted<veil_media::BoundedAudioEncoderFactory>(
+            ws->audio_packet_duration, ssrc);
+  config.encoder_factory = ws->audio_encoder_factory;
+  auto format = VeilOpusSendFormat();
+  format.parameters["ptime"] = std::to_string(packet_ms);
+  config.send_codec_spec = webrtc::AudioSendStream::Config::SendCodecSpec(
+      kOpusPayloadType, format);
+  config.send_codec_spec->target_bitrate_bps = payload_bps;
+  // Each listener has its own feedback domain. Do not feed multiple listeners'
+  // TWCC into a shared sender allocator or pretend a local policy is BWE.
+  return config;
+}
+
+bool reconfigure_group_audio(GroupWebrtcState* ws,
+                             const webrtc::AudioSendStream::Config& config) {
+  // The pinned WebRTC invokes this on the worker before Reconfigure returns.
+  // Shared storage also keeps a deferred error callback safe, and a subsequent
+  // OK callback cannot overwrite an earlier codec-creation error.
+  auto outcome = std::make_shared<std::atomic<int>>(0);
+  ws->send_stream->Reconfigure(config, [outcome](webrtc::RTCError error) {
+    if (!error.ok()) {
+      outcome->store(-1, std::memory_order_release);
+    } else {
+      int pending = 0;
+      outcome->compare_exchange_strong(pending, 1, std::memory_order_acq_rel);
+    }
+  });
+  return outcome->load(std::memory_order_acquire) == 1;
+}
 
 // Real-time conversation should recover from a network spike by dropping late
 // video, not by retaining an ever-growing playout tail. The app already pulls
@@ -2070,20 +2115,11 @@ int veil_media_group_engine_start_audio(VeilGroupMediaEngine* engine) {
     ws->call->SignalChannelNetworkState(webrtc::MediaType::AUDIO,
                                         webrtc::kNetworkUp);
     if (ws->send_stream == nullptr) {
-      webrtc::AudioSendStream::Config sc(ws->fanout.get());
-      sc.rtp.ssrc = local_ssrc;
-      sc.rtp.extensions.emplace_back(
-          webrtc::RtpExtension::kTransportSequenceNumberUri,
-          webrtc::RtpHeaderExtensionId(1));
-      sc.encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
-      auto send_format = VeilOpusSendFormat();
 #if defined(VEIL_MEDIA_TEST_HOOKS)
-      // Controlled stand experiment only. Production keeps its default until
-      // a real adaptive group policy has been implemented and qualified.
-      if (test_ptime) send_format.parameters["ptime"] = test_ptime;
+      if (test_ptime) ws->audio_packet_ms = std::atoi(test_ptime);
 #endif
-      sc.send_codec_spec = webrtc::AudioSendStream::Config::SendCodecSpec(
-          kOpusPayloadType, std::move(send_format));
+      auto sc = group_audio_send_config(ws, local_ssrc,
+          ws->audio_packet_ms, ws->audio_payload_bps);
       ws->send_stream = ws->call->CreateAudioSendStream(sc);
       if (ws->send_stream) {
         ws->send_stream->SetMuted(engine->mic_muted);
@@ -2128,6 +2164,44 @@ int veil_media_group_engine_start_audio(VeilGroupMediaEngine* engine) {
 #endif
 }
 
+int veil_media_group_engine_set_audio_budget(VeilGroupMediaEngine* engine,
+                                             int packet_ms, int payload_bps) {
+  if (!engine || (packet_ms != 20 && packet_ms != 40 && packet_ms != 60) ||
+      payload_bps < 16'000 || payload_bps > 32'000) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws || !engine->ws->call) return VEIL_MEDIA_ERR_STATE;
+  auto* ws = engine->ws.get();
+  int result = VEIL_MEDIA_ERR_STATE;
+  const bool ran = veil_media::run_on_with_timeout(ws->worker_tq.get(), [&] {
+    if (!ws->audio_config_valid) return;
+    if (ws->audio_packet_ms == packet_ms && ws->audio_payload_bps == payload_bps) {
+      result = VEIL_MEDIA_OK;
+      return;
+    }
+    if (ws->send_stream) {
+      auto config = group_audio_send_config(ws, group_audio_ssrc_of(engine->local),
+                                            packet_ms, payload_bps);
+      if (!reconfigure_group_audio(ws, config)) {
+        // WebRTC may have stored the failed config while retaining the old
+        // encoder. Restore the previous known config before allowing retries.
+        auto previous = group_audio_send_config(ws, group_audio_ssrc_of(engine->local),
+            ws->audio_packet_ms, ws->audio_payload_bps);
+        ws->audio_config_valid = reconfigure_group_audio(ws, previous);
+        return;
+      }
+    }
+    ws->audio_packet_ms = packet_ms;
+    ws->audio_payload_bps = payload_bps;
+    result = VEIL_MEDIA_OK;
+  }, std::chrono::milliseconds(20));
+  return ran ? result : VEIL_MEDIA_ERR_STATE;
+#else
+  (void)packet_ms;
+  (void)payload_bps;
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
 int veil_media_group_engine_stop_audio(VeilGroupMediaEngine* engine) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
   if (!engine->audio_running.exchange(false)) return VEIL_MEDIA_OK;
@@ -2154,6 +2228,8 @@ int veil_media_group_engine_stop_audio(VeilGroupMediaEngine* engine) {
               peer->recv_stream = nullptr;
             }
           }
+          ws->audio_config_valid = true;
+          ws->audio_packet_duration->store(0, std::memory_order_relaxed);
         })) {
       // The streams are still in the Call. The flag says stopped, which is
       // what the caller asked for and what the capture devices above already
@@ -2471,9 +2547,22 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   // also includes video, RTCP and packets rejected by the audio demuxer; it
   // must not keep a silent participant's audio watchdog alive.
   std::string audio_receivers;
+  int requested_packet_ms = -1, requested_payload_bps = -1, audio_config_valid = -1;
+  int64_t audio_packets = -1, audio_payload_bytes = -1, audio_header_padding_bytes = -1;
+  int64_t audio_target_bps = -1;
   const uint64_t sample_sequence = ++ws->audio_sample_sequence;
   const bool audio_sampled = veil_media::run_on_with_timeout(
       ws->worker_tq.get(), [&] {
+        requested_packet_ms = ws->audio_packet_ms;
+        requested_payload_bps = ws->audio_payload_bps;
+        audio_config_valid = ws->audio_config_valid ? 1 : 0;
+        if (ws->send_stream) {
+          const auto sender = ws->send_stream->GetStats();
+          audio_packets = sender.packets_sent;
+          audio_payload_bytes = sender.payload_bytes_sent;
+          audio_header_padding_bytes = sender.header_and_padding_bytes_sent;
+          audio_target_bps = sender.target_bitrate_bps;
+        }
         constexpr char hex[] = "0123456789abcdef";
         for (const auto& entry : ws->peers) {
           if (!entry.second->recv_stream) continue;
@@ -2535,6 +2624,16 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   // Capability remains explicit on a stalled worker: unknown audio never
   // falls back to video ingress. These fields are endpoint-local JSON only.
   std::string snapshot(json, static_cast<size_t>(written) - 1);
+  snapshot += ",\"audio_requested_packet_ms\":" + std::to_string(requested_packet_ms) +
+              ",\"audio_requested_payload_bps\":" + std::to_string(requested_payload_bps) +
+              ",\"audio_config_valid\":" + std::to_string(audio_config_valid) +
+              ",\"audio_tx_packet_duration_ms\":" + std::to_string(
+                  ws->audio_packet_duration->load(std::memory_order_relaxed)) +
+              ",\"audio_tx_payload_pkts\":" + std::to_string(audio_packets) +
+              ",\"audio_tx_payload_bytes\":" + std::to_string(audio_payload_bytes) +
+              ",\"audio_tx_header_padding_bytes\":" + std::to_string(audio_header_padding_bytes) +
+              ",\"audio_tx_target_bps\":" + std::to_string(audio_target_bps) +
+              ",\"audio_tx_rtp_drops\":" + std::to_string(ws->fanout->audio_drops());
   snapshot += ",\"audio_loss_report_us\":" + std::to_string(audio_loss_report_us) +
               ",\"video_loss_report_us\":" + std::to_string(video_loss_report_us);
   snapshot += ",\"audio_playout_peers\":" + std::to_string(playout_peers) +
