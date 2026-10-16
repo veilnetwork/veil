@@ -45,6 +45,7 @@ static std::map<uint64_t, std::set<std::pair<uint32_t, uint16_t>>> feedback;
 static std::map<uint64_t, std::set<std::pair<uint32_t, uint16_t>>> primary_feedback, secondary_feedback;
 static std::map<uint64_t, std::pair<uint32_t, uint32_t>> expected_ssrcs;
 static std::map<uint64_t, std::vector<uint8_t>> playout_wire;
+static std::map<uint64_t, uint32_t> playout_wire_delay;
 static int record_send(uint64_t chan, const uint8_t* p, size_t len, bool video_control) {
   if (chan == 90 && len >= 2) {
     if ((video_control || (p[1] & 0x7f) == 96) && hold_fanout_video.load()) {
@@ -66,8 +67,13 @@ static int record_send(uint64_t chan, const uint8_t* p, size_t len, bool video_c
       feedback[chan].insert({ssrc, base});
       (video_control ? secondary_feedback : primary_feedback)[chan].insert({ssrc, base});
     }
-    if (b[1] == 204 && size == 28 && std::memcmp(b + 8, "VAP1", 4) == 0)
+    if (b[1] == 204 && size == 28 && std::memcmp(b + 8, "VAP1", 4) == 0) {
       playout_wire[chan] = std::vector<uint8_t>(p, p + len);
+      // VAP1 need not be the final RTCP block: VAP2 follows it now. Capture
+      // the named block's delay with the same compound under the same lock.
+      playout_wire_delay[chan] = uint32_t(b[24]) << 24 |
+          uint32_t(b[25]) << 16 | uint32_t(b[26]) << 8 | b[27];
+    }
     offset += size;
   }
   return rejected_channels.contains(chan) ? 1 : 0;
@@ -564,12 +570,13 @@ int main(int argc, char** argv) {
     assert(group_stat(receiver.get(), "audio_playout_peers") == 0); // legacy starts unknown
     assert(veil_media_test_group_emit_rtcp(e.get()) == 0);
     std::vector<uint8_t> measured;
-    { std::lock_guard lock(callback_mu); measured = playout_wire.at(22); }
+    uint32_t measured_delay = 0;
+    {
+      std::lock_guard lock(callback_mu);
+      measured = playout_wire.at(22);
+      measured_delay = playout_wire_delay.at(22);
+    }
     assert(measured.size() >= 28);
-    const size_t delay_at = measured.size() - 4;
-    const uint32_t measured_delay = uint32_t(measured[delay_at]) << 24 |
-        uint32_t(measured[delay_at + 1]) << 16 | uint32_t(measured[delay_at + 2]) << 8 |
-        measured[delay_at + 3];
     assert(measured_delay <= 60000); // measured from real accepted Opus
     inject_raw(24, measured);
     wait_playout(receiver.get(), 1, measured_delay);
