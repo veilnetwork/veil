@@ -2323,6 +2323,7 @@ async fn handle_ipc_client(
     // Entered before `spawn_sem`, so one slow destination cannot hold the
     // whole pool (see `send_gates`).
     let destination_gates = Arc::new(crate::send_gates::DestinationGates::default());
+    let mut lossy_cadence = crate::lossy_source_cadence::SourceCadence::default();
 
     // Push-event subscription. Subscribe once per IPC
     // client; broadcast::Receiver::recv is cancel-safe so it composes
@@ -2521,11 +2522,18 @@ async fn handle_ipc_client(
                         let batch = if hdr.msg_type == LocalAppMsg::AppIpcLossyBatch as u16 {
                             if !local_lossy_work || !matches!(veil_proto::ipc::ipc_local_source_lane(&hdr), veil_proto::priority::BULK | veil_proto::priority::BACKGROUND) { continue; }
                             let Some(batch) = veil_proto::ipc_lossy_batch::LocalLossyBatchPayload::decode(&body) else { continue; };
-                            let Some(work) = veil_types::local_lossy_work::LocalLossyWork::new(batch.cells.iter().map(Vec::len).collect()) else { continue; };
-                            Some((batch.into_sends(), work))
+                            let sizes = batch.cells.iter().map(Vec::len).collect::<Vec<_>>();
+                            let key = crate::lossy_source_cadence::Key {
+                                destination: batch.destination,
+                                source_app: batch.source_app,
+                                destination_app: batch.destination_app,
+                                endpoint: batch.endpoint,
+                                lane: veil_proto::ipc::ipc_local_source_lane(&hdr),
+                            };
+                            Some((batch.into_sends(), sizes, key))
                         } else { None };
 
-                        if let Some((bodies, _)) = &batch {
+                        if let Some((bodies, _, _)) = &batch {
                             for body in bodies { crate::route_trace::sealed_local_sample("daemon_read", veil_proto::ipc::ipc_local_source_lane(&hdr), body); }
                         } else {
                             crate::route_trace::sealed_local_sample("daemon_read", veil_proto::ipc::ipc_local_source_lane(&hdr), &body);
@@ -2578,7 +2586,7 @@ async fn handle_ipc_client(
                             };
                             // The rate check stays ON the loop — it is a
                             // counter, and refusing has to be immediate.
-                            let send_count = batch.as_ref().map_or(1, |(bodies, _)| bodies.len());
+                            let send_count = batch.as_ref().map_or(1, |(bodies, _, _)| bodies.len());
                             let mut limited = false;
                             // A grouped request must not multiply the local
                             // client's existing per-cell send quota.
@@ -2604,7 +2612,17 @@ async fn handle_ipc_client(
                                 // Moved, not copied: the loop is done with
                                 // this buffer once the send owns it.
                                 let body_owned = body;
-                                let batch_owned = batch;
+                                // Only an authenticated, rate-accepted local source may
+                                // influence cadence. Expiry begins before any destination
+                                // or global handler wait and is never renewed by retries.
+                                let batch_owned = batch.map(|(bodies, sizes, key)| {
+                                    let span = lossy_cadence.observe(key, ctx.source_received_at);
+                                    let work = veil_types::local_lossy_work::LocalLossyWork::new_paced(
+                                        sizes, span,
+                                        ctx.source_received_at + veil_types::local_lossy_work::SOURCE_WORK_MAX_AGE,
+                                    ).expect("decoded local work bounds");
+                                    (bodies, work)
+                                });
                                 let reply_tx = reply_tx.clone();
                                 let sem = Arc::clone(&spawn_sem);
                                 let gates = Arc::clone(&destination_gates);
