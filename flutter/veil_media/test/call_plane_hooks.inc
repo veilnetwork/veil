@@ -2,6 +2,26 @@
 // The actual sender offset supplies an exact encoder/RTP join, not a guessed
 // alignment between two regular packet sequences. This hook never sends data.
 #pragma GCC visibility push(default)
+extern "C" char* veil_media_test_group_audio_send_stats(VeilGroupMediaEngine* e) {
+  if (!e || !e->ws) return nullptr;
+  webrtc::AudioSendStream::Stats sample;
+  bool found = false;
+  const bool ran = run_on(e->ws->worker_tq.get(), [&] {
+    if (!e->ws->send_stream) return;
+    sample = e->ws->send_stream->GetStats();
+    found = true;
+  });
+  if (!ran || !found) return nullptr;
+  char json[256];
+  const int size = std::snprintf(json, sizeof(json),
+      "{\"packets\":%d,\"payload_bytes\":%lld,\"header_padding_bytes\":%lld,"
+      "\"target_bps\":%lld}", sample.packets_sent,
+      static_cast<long long>(sample.payload_bytes_sent),
+      static_cast<long long>(sample.header_and_padding_bytes_sent),
+      static_cast<long long>(sample.target_bitrate_bps));
+  if (size <= 0 || static_cast<size_t>(size) >= sizeof(json)) return nullptr;
+  return dup_cstr(json);
+}
 extern "C" int veil_media_test_audio_timing_anchor(VeilMediaEngine* e, int source) {
   if (!e || !e->ws || source < 0 || source > 1 || !veil_media::diag::enabled())
     return VEIL_MEDIA_ERR_ARG;
