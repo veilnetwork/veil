@@ -12,9 +12,11 @@
 #include "api/neteq/tick_timer.h"
 #include "modules/audio_coding/neteq/neteq_impl.h"
 #include "veil_playout_trace.h"
+#include "veil_audio_recovery.h"
 
 namespace veil_media {
 struct PlayoutRecoveryStats {
+  AudioRecoveryRegistry receivers;
   std::atomic<uint64_t> count{0};
   std::atomic<uint64_t> discarded_ms{0};
   std::atomic<uint64_t> fallback_frames{0};
@@ -27,7 +29,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
                  int requested_maximum_delay_ms = 0)
       : requested_maximum_delay_ms_(std::max(0, requested_maximum_delay_ms)),
         arrival_clock_(std::move(arrival_clock)), inner_(std::move(inner)),
-        stats_(std::move(stats)) {
+        stats_(std::move(stats)), receiver_recovery_(stats_->receivers.NewStream()) {
     ApplyTargetCeiling();
   }
   int GetAudio(webrtc::AudioFrame* frame, bool* muted, int* rate,
@@ -80,6 +82,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
         ++skipped;
       }
     }
+    if (skipped) receiver_recovery_->Record(skipped * 10, webrtc::TimeMicros());
     if (skipped || fallback) {
       stats_->discarded_ms.fetch_add(skipped * 10, std::memory_order_relaxed);
       if (fallback) stats_->fallback_frames.fetch_add(1, std::memory_order_relaxed);
@@ -97,7 +100,12 @@ class RecoveringNetEq final : public webrtc::NetEq {
   }
   int InsertPacket(const webrtc::RTPHeader& h, std::span<const uint8_t> p,
                    const webrtc::RtpPacketInfo& info) override {
-    return inner_->InsertPacket(h, p, info);
+    const int result = inner_->InsertPacket(h, p, info);
+    if (result == kOK && h.ssrc && !registered_ssrc_) {
+      stats_->receivers.Attach(h.ssrc, receiver_recovery_);
+      registered_ssrc_ = h.ssrc;
+    }
+    return result;
   }
   void SetCodecs(const std::map<int, webrtc::SdpAudioFormat>& c) override { inner_->SetCodecs(c); }
   bool RegisterPayloadType(int p, const webrtc::SdpAudioFormat& f) override { return inner_->RegisterPayloadType(p, f); }
@@ -151,6 +159,8 @@ class RecoveringNetEq final : public webrtc::NetEq {
   std::unique_ptr<webrtc::TickTimer> arrival_clock_;
   std::unique_ptr<webrtc::NetEq> inner_;
   std::shared_ptr<PlayoutRecoveryStats> stats_;
+  std::shared_ptr<StreamAudioRecovery> receiver_recovery_;
+  uint32_t registered_ssrc_ = 0;
   webrtc::AudioFrame scratch_;
   PlayoutTrace trace_;
 };
