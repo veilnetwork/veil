@@ -135,6 +135,8 @@ int veil_media_group_engine_set_video_bitrate(VeilGroupMediaEngine *engine,
 /* Low-rate adaptation: 1..2500 kbit/s and 0.02..60 fps. Encoder handoff
  * uses the fractional cadence; local preview/capture remain live. Zero,
  * negative and non-finite budgets are errors, never legacy defaults.
+ * May be prepared before start, so encoder/estimator begin at that budget.
+ * A prepared budget is consumed by one start; legacy defaults remain 30/1.
  * Existing 20 ms video-worker scheduling wait and debug pin apply. */
 int veil_media_group_engine_set_video_budget(VeilGroupMediaEngine *engine,
                                         int max_bitrate_kbps, double max_fps);
