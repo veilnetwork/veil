@@ -2050,6 +2050,12 @@ int veil_media_group_engine_remove_peer(VeilGroupMediaEngine* engine,
 int veil_media_group_engine_start_audio(VeilGroupMediaEngine* engine) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
   if (engine->audio_running.load()) return VEIL_MEDIA_OK;
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+  const char* test_ptime = std::getenv("VEIL_MEDIA_TEST_GROUP_PTIME");
+  if (test_ptime && std::strcmp(test_ptime, "20") != 0 &&
+      std::strcmp(test_ptime, "40") != 0 && std::strcmp(test_ptime, "60") != 0)
+    return VEIL_MEDIA_ERR_ARG;
+#endif
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!engine->ws || !engine->ws->call) return VEIL_MEDIA_ERR_STATE;
   GroupWebrtcState* ws = engine->ws.get();
@@ -2070,8 +2076,14 @@ int veil_media_group_engine_start_audio(VeilGroupMediaEngine* engine) {
           webrtc::RtpExtension::kTransportSequenceNumberUri,
           webrtc::RtpHeaderExtensionId(1));
       sc.encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
+      auto send_format = VeilOpusSendFormat();
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+      // Controlled stand experiment only. Production keeps its default until
+      // a real adaptive group policy has been implemented and qualified.
+      if (test_ptime) send_format.parameters["ptime"] = test_ptime;
+#endif
       sc.send_codec_spec = webrtc::AudioSendStream::Config::SendCodecSpec(
-          kOpusPayloadType, VeilOpusSendFormat());
+          kOpusPayloadType, std::move(send_format));
       ws->send_stream = ws->call->CreateAudioSendStream(sc);
       if (ws->send_stream) {
         ws->send_stream->SetMuted(engine->mic_muted);
