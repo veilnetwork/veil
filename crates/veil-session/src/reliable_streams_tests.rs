@@ -380,3 +380,119 @@ fn loss_tolerant_forward_fallback_never_enters_the_reliable_delivery_child() {
         );
     }
 }
+
+fn direct_app_record(msg: AppMsg, data_len: usize) -> Vec<u8> {
+    let body = if msg == AppMsg::AppSendUnopenable {
+        Vec::new()
+    } else {
+        veil_proto::app::AppSendPayload {
+            src_app_id: [1; 32],
+            app_id: [2; 32],
+            endpoint_id: 17,
+            data: veil_bufpool::pooled_shared_from_vec(vec![0x55; data_len]),
+        }
+        .encode()
+    };
+    let mut h = FrameHeader::new(FrameFamily::App as u8, msg as u16);
+    h.body_len = body.len() as u32;
+    veil_proto::codec::encode_frame(&h, &body)
+}
+
+#[test]
+fn direct_app_records_require_their_own_permission_and_keep_network_control_on_parent() {
+    let mut modern = state().with_direct_app(true);
+    let mut delivery_only = state().with_delivery(true);
+    for msg in [
+        AppMsg::AppSend,
+        AppMsg::AppSendSealed,
+        AppMsg::AppSendChunk,
+        AppMsg::AppSendUnopenable,
+    ] {
+        let frame = direct_app_record(msg, 2048);
+        let child = Route::Child([7; 32]);
+        assert_eq!(
+            delivery_only.route_with_local_class(&frame, Some([7; 32]), 3),
+            Route::Canonical
+        );
+        assert!(delivery_only.incoming(&frame, child).is_err());
+        assert_eq!(
+            modern.route_with_local_class(&frame, Some([7; 32]), 3),
+            child
+        );
+        modern.incoming(&frame, child).unwrap();
+        modern.admitted(&frame, child);
+        assert!(modern.pins.is_empty());
+        assert_eq!(
+            modern.route_with_local_class(&frame, None, 3),
+            Route::Canonical
+        );
+        assert_eq!(
+            modern.route_with_local_class(&frame, Some([7; 32]), crate::LOCAL_NETWORK_CONTROL_LANE),
+            Route::Canonical
+        );
+        modern.fail_child([7; 32]);
+        assert_eq!(
+            modern.route_with_local_class(&frame, Some([8; 32]), 3),
+            Route::Child([8; 32])
+        );
+    }
+}
+
+#[test]
+fn direct_permission_excludes_rtp_streams_malformed_bodies_and_nonzero_stream_ids() {
+    let mut modern = state().with_direct_app(true);
+    let child = Route::Child([7; 32]);
+    let mut variants = vec![
+        direct_app_record(AppMsg::AppRtData, 10),
+        frame(AppMsg::AppData, 19, 1),
+    ];
+    let base = direct_app_record(AppMsg::AppSendSealed, 10);
+    let mut nonzero = base.clone();
+    let mut h = decode_header(&nonzero).unwrap();
+    h.stream_id = 19;
+    nonzero[..HEADER_SIZE].copy_from_slice(&veil_proto::codec::encode_header(&h));
+    variants.push(nonzero);
+    let mut missing_data = base.clone();
+    missing_data[HEADER_SIZE + 68..HEADER_SIZE + 72].copy_from_slice(&1000u32.to_be_bytes());
+    variants.push(missing_data);
+    let mut truncated = base;
+    truncated.pop();
+    variants.push(truncated);
+    let mut nonempty_hint = direct_app_record(AppMsg::AppSendUnopenable, 0);
+    let mut h = decode_header(&nonempty_hint).unwrap();
+    h.body_len = 1;
+    nonempty_hint[..HEADER_SIZE].copy_from_slice(&veil_proto::codec::encode_header(&h));
+    nonempty_hint.push(1);
+    variants.push(nonempty_hint);
+    for bytes in variants {
+        assert_eq!(
+            modern.route_with_local_class(&bytes, Some([7; 32]), 3),
+            Route::Canonical
+        );
+        assert!(modern.incoming(&bytes, child).is_err());
+    }
+    // The direct permission alone cannot accept Delivery on the child.
+    assert!(
+        modern
+            .incoming(
+                &delivery_record(veil_proto::family::DeliveryMsg::Forward as u16),
+                child
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn oversized_direct_records_keep_the_legacy_parent_without_retiring_a_healthy_child() {
+    use veil_crypto::session_cipher::AEAD_OVERHEAD;
+    use veil_transport::reliable_records::MAX_RECORD_BYTES;
+    let modern = state().with_direct_app(true);
+    let data_limit = MAX_RECORD_BYTES - AEAD_OVERHEAD - HEADER_SIZE - 72;
+    for (extra, expected) in [(0, Route::Child([7; 32])), (1, Route::Canonical)] {
+        let bytes = direct_app_record(AppMsg::AppSend, data_limit + extra);
+        assert_eq!(
+            modern.route_with_local_class(&bytes, Some([7; 32]), 3),
+            expected
+        );
+    }
+}

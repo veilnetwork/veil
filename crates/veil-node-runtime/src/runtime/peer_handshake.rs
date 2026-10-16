@@ -99,6 +99,7 @@ pub struct RemoteHandshakeInfo {
     pub supports_parallel_ordered: bool,
     pub supports_reliable_parallel: bool,
     pub supports_reliable_delivery: bool,
+    pub supports_reliable_direct_app: bool,
     /// Bounded UDP reflector port advertised by this authenticated peer.
     /// The runtime combines it with transport metadata only after all session
     /// admission gates pass.
@@ -909,6 +910,9 @@ pub async fn register_connection_session(
                         supports_reliable_delivery: r
                             .remote_capabilities
                             .supports_reliable_delivery(),
+                        supports_reliable_direct_app: r
+                            .remote_capabilities
+                            .supports_reliable_direct_app(),
                         sovereign_node_id,
                         udp_reflector_port,
                         shared_udp_reflectors,
@@ -1526,6 +1530,11 @@ pub async fn register_connection_session(
                         } else {
                             offer
                         };
+                        let offer = if remote_identity.supports_reliable_direct_app {
+                            offer.with_reliable_direct_app()
+                        } else {
+                            offer
+                        };
                         if remote_identity.supports_duplex_parallel_quic {
                             offer.with_duplex()
                         } else {
@@ -1548,8 +1557,13 @@ pub async fn register_connection_session(
                             } else {
                                 offer
                             };
-                            if remote_identity.supports_reliable_delivery {
+                            let offer = if remote_identity.supports_reliable_delivery {
                                 offer.with_reliable_delivery()
+                            } else {
+                                offer
+                            };
+                            if remote_identity.supports_reliable_direct_app {
+                                offer.with_reliable_direct_app()
                             } else {
                                 offer
                             }

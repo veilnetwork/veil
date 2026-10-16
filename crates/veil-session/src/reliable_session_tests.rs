@@ -124,6 +124,107 @@ async fn reliable_delivery_ordered_child_transfers_complete_records_both_ways_ac
     .unwrap();
 }
 
+async fn direct_record_round_trip(
+    from: &reliable_session::ReliableSession,
+    to: &reliable_session::ReliableSession,
+    msg: AppMsg,
+    byte: u8,
+) {
+    let ctx = ordered_receiver_tests::pool_fixture_context();
+    let mut routing = reliable_streams::ReliableStreams::new(true, ctx.dispatcher, ctx.peer_id)
+        .with_direct_app(true);
+    let payload = vec![byte; 4096];
+    let body = if msg == AppMsg::AppSendUnopenable {
+        Vec::new()
+    } else {
+        veil_proto::app::AppSendPayload {
+            src_app_id: [1; 32],
+            app_id: [2; 32],
+            endpoint_id: 17,
+            data: veil_bufpool::pooled_shared_from_vec(payload.clone()),
+        }
+        .encode()
+    };
+    let mut h = FrameHeader::new(FrameFamily::App as u8, msg as u16);
+    h.body_len = body.len() as u32;
+    let bytes = veil_proto::codec::encode_frame(&h, &body);
+    let ready = from.ready().unwrap();
+    assert_eq!(
+        routing.route_with_local_class(&bytes, Some(ready.id()), 3),
+        reliable_streams::Route::Child(ready.id())
+    );
+    let receipt = ready
+        .handle()
+        .try_send(FrameEnvelope::from((
+            3,
+            veil_bufpool::pooled_shared_from_vec(bytes.clone()),
+        )))
+        .ok()
+        .expect("direct record admission");
+    loop {
+        match to.next().await {
+            ReliableEvent::Changed => {}
+            ReliableEvent::Frame { child, result } => {
+                let received = result.unwrap();
+                routing
+                    .incoming(&received, reliable_streams::Route::Child(child))
+                    .unwrap();
+                assert_eq!(&received[..], &bytes);
+                if msg != AppMsg::AppSendUnopenable {
+                    let decoded = veil_proto::app::AppSendPayload::decode(
+                        &received[veil_proto::header::HEADER_SIZE..],
+                    )
+                    .unwrap();
+                    assert_eq!(&decoded.data[..], &payload);
+                    assert_eq!(decoded.src_app_id, [1; 32]);
+                    assert_eq!(decoded.app_id, [2; 32]);
+                }
+                break;
+            }
+            ReliableEvent::Stopped => panic!("direct record child stopped"),
+        }
+    }
+    receipt.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn direct_app_ordered_child_preserves_records_both_ways_and_rekey_ownership() {
+    timeout(Duration::from_secs(10), async {
+        let mut f = OrderedFixture::with_direct_app(true).await;
+        assert!(f.a.reliable_direct_app() && f.b.reliable_direct_app());
+        for msg in [
+            AppMsg::AppSend,
+            AppMsg::AppSendSealed,
+            AppMsg::AppSendChunk,
+            AppMsg::AppSendUnopenable,
+        ] {
+            direct_record_round_trip(f.a.reliable().unwrap(), f.b.reliable().unwrap(), msg, 31)
+                .await;
+            direct_record_round_trip(f.b.reliable().unwrap(), f.a.reliable().unwrap(), msg, 32)
+                .await;
+        }
+        f.canonical_survives().await;
+        let old = f.a.reliable().unwrap().ready().unwrap();
+        f.a.rekey(&[4; 32], &[5; 32], [6; 32]);
+        f.b.rekey(&[5; 32], &[4; 32], [6; 32]);
+        assert!(old.handle().recv().await.is_err());
+        until(|| {
+            f.a.reliable().unwrap().ready().is_some() && f.b.reliable().unwrap().ready().is_some()
+        })
+        .await;
+        direct_record_round_trip(
+            f.b.reliable().unwrap(),
+            f.a.reliable().unwrap(),
+            AppMsg::AppSendSealed,
+            33,
+        )
+        .await;
+        f.canonical_survives().await;
+    })
+    .await
+    .unwrap();
+}
+
 async fn until(mut condition: impl FnMut() -> bool) {
     timeout(Duration::from_secs(5), async {
         while !condition() {
@@ -201,6 +302,9 @@ impl Drop for OrderedFixture {
 
 impl OrderedFixture {
     async fn new() -> Self {
+        Self::with_direct_app(false).await
+    }
+    async fn with_direct_app(direct: bool) -> Self {
         let mut context = TransportContext::for_debug().unwrap();
         context.obfs4_psk = Some(Arc::new([0x42; 32]));
         let context = Arc::new(context);
@@ -242,6 +346,16 @@ impl OrderedFixture {
         let b_offer = ParallelOrderedOffer::new(incoming, registry.clone())
             .with_reliable()
             .with_reliable_delivery();
+        let a_offer = if direct {
+            a_offer.with_reliable_direct_app()
+        } else {
+            a_offer
+        };
+        let b_offer = if direct {
+            b_offer.with_reliable_direct_app()
+        } else {
+            b_offer
+        };
         let diagnostics = [a_offer.diagnostics(), b_offer.diagnostics()];
         let ctx = ordered_receiver_tests::pool_fixture_context();
         let a_session = ordered_lanes::OrderedSession::new(
@@ -406,7 +520,8 @@ async fn reliable_punched_quic_session_uses_exclusive_accept_and_retires_retaine
             ParallelQuicOffer::new(a_handle.clone())
                 .with_duplex()
                 .with_reliable()
-                .with_reliable_delivery(),
+                .with_reliable_delivery()
+                .with_reliable_direct_app(),
             &[2; 32],
             &[3; 32],
             [1; 32],
@@ -417,7 +532,8 @@ async fn reliable_punched_quic_session_uses_exclusive_accept_and_retires_retaine
             ParallelQuicOffer::new(b_handle)
                 .with_duplex()
                 .with_reliable()
-                .with_reliable_delivery(),
+                .with_reliable_delivery()
+                .with_reliable_direct_app(),
             &[3; 32],
             &[2; 32],
             [1; 32],
@@ -491,6 +607,16 @@ async fn reliable_punched_quic_session_uses_exclusive_accept_and_retires_retaine
         assert!(a.reliable_delivery() && b.reliable_delivery());
         delivery_round_trip(a.reliable().unwrap(), b.reliable().unwrap(), 13).await;
         delivery_round_trip(b.reliable().unwrap(), a.reliable().unwrap(), 14).await;
+        assert!(a.reliable_direct_app() && b.reliable_direct_app());
+        for msg in [
+            AppMsg::AppSend,
+            AppMsg::AppSendSealed,
+            AppMsg::AppSendChunk,
+            AppMsg::AppSendUnopenable,
+        ] {
+            direct_record_round_trip(a.reliable().unwrap(), b.reliable().unwrap(), msg, 41).await;
+            direct_record_round_trip(b.reliable().unwrap(), a.reliable().unwrap(), msg, 42).await;
+        }
         send(&ready, 6).wait().await.unwrap();
         receive(b.reliable().unwrap(), 6).await;
         drop(a);
