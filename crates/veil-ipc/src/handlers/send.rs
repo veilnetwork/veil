@@ -551,7 +551,7 @@ fn without_other_devices(
         .collect()
 }
 
-fn ordinary_relay_hops(
+pub(super) fn ordinary_relay_hops(
     discovered: Option<[u8; 32]>,
     dst: &[u8; 32],
     route_cache: Option<&RwLock<veil_routing::RouteCache>>,

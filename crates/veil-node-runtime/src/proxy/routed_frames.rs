@@ -225,6 +225,21 @@ impl RoutedFrameBroadcaster {
 }
 
 impl FrameBroadcaster for RoutedFrameBroadcaster {
+    fn supports_local_datagram_preparation(&self) -> bool {
+        self.direct.supports_local_datagram_preparation()
+    }
+
+    fn prepare_local_datagram_channel(
+        &self,
+        peer_id: &[u8; 32],
+        local_lane: u8,
+        refresh: bool,
+    ) -> veil_types::LocalDatagramChannelState {
+        // Preparation never discovers a new route or forwards a packet.
+        self.direct
+            .prepare_local_datagram_channel(peer_id, local_lane, refresh)
+    }
+
     fn supports_local_lossy_work(&self) -> bool {
         self.direct.supports_local_lossy_work()
     }

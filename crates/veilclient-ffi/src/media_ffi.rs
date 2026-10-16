@@ -40,6 +40,8 @@ pub mod feedback_ffi;
 #[cfg(feature = "node-embedded")]
 mod ingress_diagnostics;
 #[cfg(feature = "node-embedded")]
+mod source_preparation;
+#[cfg(feature = "node-embedded")]
 use ingress_diagnostics::{Reason as IngressRefusal, refuse as refuse_ingress};
 
 #[cfg(feature = "node-embedded")]
@@ -813,6 +815,8 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
         }
     }
 
+    source_preparation::prepare_app_sources(&app_ref, peer, false);
+
     let (tx_hi, rx_hi) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_HI_QUEUE);
     let (tx_video, rx_video) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_VIDEO_QUEUE);
     let (tx_screen, rx_screen) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_VIDEO_QUEUE);
@@ -1034,6 +1038,8 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
     let Some(cipher) = (unsafe { media_cipher_from_keys(&peer, tx_key, rx_key, err_out) }) else {
         return 0;
     };
+
+    source_preparation::prepare_app_sources(&app_ref, peer, true);
 
     let (tx_hi, rx_hi) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_HI_QUEUE);
     let (tx_video_frames, rx_video_frames) =

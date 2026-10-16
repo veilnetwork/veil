@@ -50,6 +50,23 @@ impl SessionTxBroadcaster {
 }
 
 impl veil_types::FrameBroadcaster for SessionTxBroadcaster {
+    fn supports_local_datagram_preparation(&self) -> bool {
+        true
+    }
+
+    fn prepare_local_datagram_channel(
+        &self,
+        peer_id: &[u8; 32],
+        local_lane: u8,
+        refresh: bool,
+    ) -> veil_types::LocalDatagramChannelState {
+        if refresh {
+            rlock!(self.inner).refresh_local_datagram_channel(peer_id, local_lane)
+        } else {
+            rlock!(self.inner).request_local_datagram_channel(peer_id, local_lane)
+        }
+    }
+
     fn supports_local_lossy_work(&self) -> bool {
         true
     }

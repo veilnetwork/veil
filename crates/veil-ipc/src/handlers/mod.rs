@@ -13,4 +13,5 @@ pub(crate) mod outbox;
 pub(crate) mod queries;
 pub(crate) mod send;
 pub(crate) mod source_feedback;
+pub(crate) mod source_preparation;
 pub(crate) mod stream;

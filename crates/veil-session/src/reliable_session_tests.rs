@@ -300,7 +300,7 @@ async fn reliable_punched_quic_session_uses_exclusive_accept_and_retires_retaine
         let mut bytes = [0; 4];
         b_stream.read_exact(&mut bytes).await.unwrap();
         let context = ordered_receiver_tests::pool_fixture_context();
-        let a = parallel_lanes::ParallelSession::new(
+        let mut a = parallel_lanes::ParallelSession::new(
             ParallelQuicOffer::new(a_handle.clone())
                 .with_duplex()
                 .with_reliable(),
@@ -329,6 +329,61 @@ async fn reliable_punched_quic_session_uses_exclusive_accept_and_retires_retaine
             a_handle.available_connection_slots(),
             veil_transport::QuicParallelHandle::CONNECTIONS_PER_DIRECTION - 1
         );
+        // A prepared-but-unused child can expire without a send setting its
+        // broken flag. Preparing again must rebuild it before claiming Ready.
+        until(|| a.prepare(veil_proto::priority::REALTIME)).await;
+        let index = a
+            .prepare_frame(
+                veil_proto::priority::REALTIME,
+                &[],
+                RealtimeLaneFrameKind::DirectApp,
+            )
+            .unwrap();
+        let old = {
+            let sender = a.sender_arc(index);
+            let sender = sender.lock().unwrap();
+            sender.handle.quic().unwrap().clone()
+        };
+        old.close();
+        assert!(old.is_closed());
+        assert!(
+            !a.prepare(veil_proto::priority::REALTIME),
+            "a closed unused child must not remain Ready"
+        );
+        until(|| a.prepare(veil_proto::priority::REALTIME)).await;
+        let sender = a.sender_arc(index);
+        assert_ne!(
+            sender
+                .lock()
+                .unwrap()
+                .handle
+                .quic()
+                .unwrap()
+                .local_trace_id(),
+            old.local_trace_id()
+        );
+        until(|| a.prepare(crate::LOCAL_SIGNALING_LANE)).await;
+        let mut reserved = Vec::new();
+        while a_handle.available_connection_slots() > 2 {
+            let child = a_handle.connect().await.unwrap();
+            let close = child.quic_datagrams().unwrap();
+            let mut stream = child.into_stream().unwrap();
+            // Let the peer accept this stream; with no preface bytes its
+            // two TLS accept tasks would wait for the first stream forever.
+            stream.write_all(b"hold").await.unwrap();
+            reserved.push((close, stream));
+        }
+        assert_eq!(a_handle.available_connection_slots(), 2);
+        for _ in 0..20 {
+            assert!(a.prepare(veil_proto::priority::REALTIME));
+            assert!(
+                a.prepare(crate::LOCAL_SIGNALING_LANE),
+                "using a ready channel must not retire and restart the signaling child"
+            );
+        }
+        for (close, _) in reserved {
+            close.close();
+        }
         send(&ready, 6).wait().await.unwrap();
         receive(b.reliable().unwrap(), 6).await;
         drop(a);
