@@ -13,6 +13,7 @@
 #include "api/make_ref_counted.h"
 #include "rtc_base/time_utils.h"
 #include "veil_audio_encode_timing.h"
+#include "veil_audio_adaptor_config.h"
 
 namespace veil_media {
 
@@ -50,6 +51,8 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
   void SetMaxPlaybackRate(int hz) override { inner_->SetMaxPlaybackRate(hz); }
   bool EnableAudioNetworkAdaptor(absl::string_view config) override {
     const bool enabled = inner_->EnableAudioNetworkAdaptor(config);
+    if (enabled && config == kFramingAudioAdaptorConfig)
+      min_payload_bps_ = kFramingAudioMinPayloadBps;
     ClampPayloadTarget();
     return enabled;
   }
@@ -68,7 +71,7 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
     ClampPayloadTarget();
   }
   void OnReceivedTargetAudioBitrate(int bps) override {
-    inner_->OnReceivedTargetAudioBitrate(std::clamp(bps, kMinPayloadBps, kMaxPayloadBps));
+    inner_->OnReceivedTargetAudioBitrate(std::clamp(bps, min_payload_bps_, kMaxPayloadBps));
   }
   void SetTargetBitrate(int bps) override { OnReceivedTargetAudioBitrate(bps); }
   void OnReceivedUplinkAllocation(webrtc::BitrateAllocationUpdate update) override {
@@ -88,14 +91,14 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
                     candidate > range->second.ms())) {
         continue;
       }
-      if (budget - OverheadBps(candidate) > kMinPayloadBps) {
+      if (budget - OverheadBps(candidate) > min_payload_bps_) {
         duration_ms = candidate;
         break;
       }
     }
     const int64_t overhead = OverheadBps(duration_ms);
     update.target_bitrate = webrtc::DataRate::BitsPerSec(std::clamp<int64_t>(
-        budget, overhead + kMinPayloadBps,
+        budget, overhead + min_payload_bps_,
         overhead + kMaxPayloadBps));
     if (timing_.enabled())
       timing_.Allocation(webrtc::TimeMicros(), raw_allocation_bps,
@@ -120,7 +123,7 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
     // Clamp the actual codec target after those decisions; do not change ANA's
     // metrics, packet-duration choice, timestamps, or transport allocation.
     const int target = inner_->GetTargetBitrate();
-    const int bounded = std::clamp(target, kMinPayloadBps, kMaxPayloadBps);
+    const int bounded = std::clamp(target, min_payload_bps_, kMaxPayloadBps);
     if (target != bounded) inner_->OnReceivedTargetAudioBitrate(bounded);
   }
   EncodedInfo EncodeImpl(uint32_t timestamp, std::span<const int16_t> audio,
@@ -143,7 +146,9 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
   int64_t OverheadBps(int duration_ms) const {
     return static_cast<int64_t>(overhead_bytes_) * 8 * 1000 / duration_ms;
   }
-  static constexpr int kMinPayloadBps = 16'000;
+  // Fixed group budgets retain the established 16..32-kbit API. The
+  // unicast framing adaptor raises its floor before accepting PCM/feedback.
+  int min_payload_bps_ = 16'000;
   static constexpr int kMaxPayloadBps = 32'000;
   size_t overhead_bytes_ = 0;
   std::unique_ptr<webrtc::AudioEncoder> inner_;

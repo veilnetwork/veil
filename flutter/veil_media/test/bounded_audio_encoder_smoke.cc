@@ -49,7 +49,7 @@ static int check_framing_budget() {
         encoder->OnReceivedUplinkAllocation(update);
         webrtc::Buffer packet;
         const auto info = encoder->Encode(timestamp, pcm, &packet);
-        if (encoder->GetTargetBitrate() < 16000 ||
+        if (encoder->GetTargetBitrate() < 24000 ||
             encoder->GetTargetBitrate() > 32000) return 24;
         if (block >= 400 && phase != 1 && route_overhead != 209 &&
             encoder->GetTargetBitrate() != 32000) return 27;
@@ -95,7 +95,7 @@ int main() {
     if (!encoder->EnableAudioNetworkAdaptor(veil_media::kFramingAudioAdaptorConfig)) return 2;
     encoder->OnReceivedOverhead(209);
     const auto payload_in_bounds = [&] {
-      return encoder->GetTargetBitrate() >= 16000 &&
+      return encoder->GetTargetBitrate() >= 24000 &&
              encoder->GetTargetBitrate() <= 32000;
     };
     if (!payload_in_bounds()) return 9;
@@ -139,7 +139,7 @@ int main() {
       }
       const int bitrate = encoder->GetTargetBitrate();
       const size_t packet_ms = encoder->Num10MsFramesInNextPacket() * 10;
-      if (bitrate < 16000 || bitrate > 32000 ||
+      if (bitrate < 24000 || bitrate > 32000 ||
           packet_ms < 20 || packet_ms > static_cast<size_t>(maximum_ms)) {
         std::fprintf(stderr, "maxptime=%d allocation=%d: payload=%d packet=%zu ms\n",
                      maximum_ms, allocation, bitrate, packet_ms);
@@ -147,7 +147,7 @@ int main() {
       }
       if (duration->load() < 20 || duration->load() > maximum_ms) return 6;
     }
-    std::printf("ok: real Opus/ANA maxptime=%d, payload stays 16–32 kbit/s\n", maximum_ms);
+    std::printf("ok: real Opus/ANA maxptime=%d, payload stays 24–32 kbit/s\n", maximum_ms);
   }
   return check_framing_budget();
 }
