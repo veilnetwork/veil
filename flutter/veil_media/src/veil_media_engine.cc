@@ -2633,7 +2633,7 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   // Capability remains explicit on a stalled worker: unknown audio never
   // falls back to video ingress. These fields are endpoint-local JSON only.
   std::string snapshot(json, static_cast<size_t>(written) - 1);
-  snapshot += ",\"audio_requested_packet_ms\":" + std::to_string(requested_packet_ms) +
+  snapshot += ",\"audio_max_packet_ms\":60,\"audio_requested_packet_ms\":" + std::to_string(requested_packet_ms) +
               ",\"audio_requested_payload_bps\":" + std::to_string(requested_payload_bps) +
               ",\"audio_config_valid\":" + std::to_string(audio_config_valid) +
               ",\"audio_tx_packet_duration_ms\":" + std::to_string(
