@@ -476,6 +476,46 @@ extern "C" int veil_media_test_audio_playout_pcm(
       static_cast<StandRecordingAdm*>(e->ws->adm.get())->Playout(pcm, capacity));
 }
 
+// Exercise the production group mixer and its per-peer Opus receivers without
+// opening host input/output devices. Membership and start remain public ABI.
+extern "C" VeilGroupMediaEngine* veil_media_test_group_codec_create(
+    const uint8_t local[32]) {
+  if (!local) return nullptr;
+  const bool previous = g_call_plane_recording_adm;
+  g_call_plane_recording_adm = true;
+  auto* e = veil_media_group_engine_create(local);
+  g_call_plane_recording_adm = previous;
+  return e;
+}
+
+extern "C" int veil_media_test_group_capture_tone(
+    VeilGroupMediaEngine* e, int frequency_hz) {
+  if (!e || !e->ws || frequency_hz < 0 || frequency_hz > 8000)
+    return VEIL_MEDIA_ERR_ARG;
+  static_cast<StandRecordingAdm*>(e->ws->adm.get())->CaptureTone(frequency_hz);
+  return VEIL_MEDIA_OK;
+}
+
+extern "C" int veil_media_test_group_playout_pcm(
+    VeilGroupMediaEngine* e, int16_t* pcm, size_t capacity) {
+  if (!e || !e->ws || !pcm || capacity < 480) return VEIL_MEDIA_ERR_ARG;
+  return static_cast<int>(
+      static_cast<StandRecordingAdm*>(e->ws->adm.get())->Playout(pcm, capacity));
+}
+
+extern "C" int veil_media_test_group_with_held_video(
+    VeilGroupMediaEngine* e, int (*drive)(void*), void* ctx) {
+  if (!e || !e->ws || !drive) return VEIL_MEDIA_ERR_ARG;
+  HeldQueues held(e->ws->video_network_tq.get(), e->ws->video_worker_tq.get());
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!held.first->entered.load() || !held.second->entered.load()) {
+    if (std::chrono::steady_clock::now() >= deadline) return VEIL_MEDIA_ERR_STATE;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  // RAII releases both queues on every callback result before engine teardown.
+  return drive(ctx);
+}
+
 #pragma GCC visibility pop
 
 // Build the synthetic ADM around the same pre-start API used by the host.
