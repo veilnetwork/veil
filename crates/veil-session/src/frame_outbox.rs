@@ -137,6 +137,13 @@ impl FrameSender {
         self.status.state(local_lane)
     }
 
+    pub fn refresh_local_datagram_channel(
+        &self,
+        local_lane: u8,
+    ) -> crate::LocalDatagramChannelState {
+        self.status.request_fresh(local_lane)
+    }
+
     fn lane(&self, frame: &PriorityFrame) -> &mpsc::Sender<FrameEnvelope> {
         if frame.0 == veil_proto::priority::REALTIME {
             &self.reserved

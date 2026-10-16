@@ -782,11 +782,14 @@ impl ParallelSession {
 
     fn poll_index(&mut self, index: usize) {
         let slot = &mut self.slots[index];
-        if slot
-            .ready
-            .as_ref()
-            .is_some_and(|ready| lock!(ready.sender).broken)
-        {
+        if slot.ready.as_ref().is_some_and(|ready| {
+            let sender = lock!(ready.sender);
+            sender.broken
+                || sender
+                    .handle
+                    .quic()
+                    .is_some_and(|handle| handle.is_closed())
+        }) {
             slot.ready = None;
             slot.retry_after = Some(std::time::Instant::now() + RETRY_DELAY);
         }
@@ -849,8 +852,14 @@ impl ParallelSession {
             return;
         };
         let slot = &mut self.slots[index];
+        if slot.ready.is_none() && slot.warm.is_none() {
+            return;
+        }
         slot.ready = None;
         slot.warm = None;
+        // A capacity cancellation must observe the same backoff as failure.
+        // Otherwise a pending local preparation can reopen it every tick.
+        slot.retry_after = Some(std::time::Instant::now() + RETRY_DELAY);
         slot.replacing = false;
         slot.recovery.reset();
         if let Some(lease) = &self.readiness {
@@ -859,10 +868,27 @@ impl ParallelSession {
     }
 
     fn prepare_index(&mut self, index: usize) -> bool {
+        self.poll_index(index);
         let signaling = channel_index(crate::LOCAL_SIGNALING_LANE)
             .and_then(|source| self.assignments.source_physical(source));
         let available = self.offer.handle.available_connection_slots();
-        if available <= 1 || (signaling != Some(index) && available <= 2) {
+        if available <= 1 {
+            self.retire_signaling_for_capacity();
+        }
+        let slot = &self.slots[index];
+        if slot.ready.is_some() {
+            // Reusing an authenticated child allocates no connection. At the
+            // two-slot reserve, do not retire a healthy signaling sibling.
+            return true;
+        }
+        if slot.warm.is_some()
+            || slot
+                .retry_after
+                .is_some_and(|deadline| std::time::Instant::now() < deadline)
+        {
+            return false;
+        }
+        if signaling != Some(index) && available <= 2 {
             self.retire_signaling_for_capacity();
         }
         // A live signaling child already owns its slot. Starting a new one
@@ -873,18 +899,7 @@ impl ParallelSession {
         {
             return false;
         }
-        self.poll_index(index);
-        let slot = &self.slots[index];
-        if slot.ready.is_some() {
-            return true;
-        }
-        if slot.warm.is_none()
-            && slot
-                .retry_after
-                .is_none_or(|deadline| std::time::Instant::now() >= deadline)
-        {
-            self.start_warm(index);
-        }
+        self.start_warm(index);
         false
     }
 

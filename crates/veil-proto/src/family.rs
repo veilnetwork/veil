@@ -933,6 +933,11 @@ pub enum LocalAppMsg {
     LocalSourceFeedback = 93,
     /// Bounded complete source work item on local IPC only.
     AppIpcLossyBatch = 94,
+    /// Owned local source channel preparation, with no user packet.
+    PrepareLocalDatagram = 95,
+    /// Correlated one-byte reply: 0 unsupported, 1 warming, 2 ready,
+    /// 3 retry after the local query quota refills.
+    PrepareLocalDatagramResult = 96,
 }
 
 impl TryFrom<u16> for LocalAppMsg {
@@ -1034,6 +1039,8 @@ impl TryFrom<u16> for LocalAppMsg {
             92 => Ok(LocalAppMsg::AttemptHolePunchResult),
             93 => Ok(LocalAppMsg::LocalSourceFeedback),
             94 => Ok(LocalAppMsg::AppIpcLossyBatch),
+            95 => Ok(LocalAppMsg::PrepareLocalDatagram),
+            96 => Ok(LocalAppMsg::PrepareLocalDatagramResult),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::LocalApp as u8,
                 msg_type: v,

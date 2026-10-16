@@ -27,6 +27,16 @@
 
 pub mod local_lossy_work;
 
+/// Readiness of an endpoint's authenticated sibling channel. Never a remote
+/// traffic class, scheduling request or proof of end-to-end delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LocalDatagramChannelState {
+    Unsupported = 0,
+    Warming = 1,
+    Ready = 2,
+}
+
 use serde::{Deserialize, Serialize};
 
 // ── Cross-crate session broadcast surface ────────────────────────────────────
@@ -48,6 +58,20 @@ use std::sync::Arc;
 /// `Arc<Mutex<node::session::tx_registry::SessionTxRegistry>>` via a small
 /// adapter newtype in `node::session_glue`.
 pub trait FrameBroadcaster: Send + Sync {
+    /// Local IPC may request preparation without submitting user packets.
+    fn supports_local_datagram_preparation(&self) -> bool {
+        false
+    }
+
+    fn prepare_local_datagram_channel(
+        &self,
+        _peer_id: &[u8; 32],
+        _local_lane: u8,
+        _refresh: bool,
+    ) -> LocalDatagramChannelState {
+        LocalDatagramChannelState::Unsupported
+    }
+
     /// Local IPC capability only; relays never receive the work boundary.
     fn supports_local_lossy_work(&self) -> bool {
         false
