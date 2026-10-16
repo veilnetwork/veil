@@ -30,6 +30,7 @@ pub struct ParallelOrderedOffer {
     registry: Arc<ParallelRegistry>,
     diagnostics: Arc<ParallelDiagnostics>,
     reliable: bool,
+    reliable_delivery: bool,
 }
 
 impl ParallelOrderedOffer {
@@ -41,6 +42,7 @@ impl ParallelOrderedOffer {
             registry,
             diagnostics: Arc::default(),
             reliable: false,
+            reliable_delivery: false,
         }
     }
     pub fn diagnostics(&self) -> Arc<ParallelDiagnostics> {
@@ -49,6 +51,11 @@ impl ParallelOrderedOffer {
     /// Enable only after the independent reliable-child capability is agreed.
     pub fn with_reliable(mut self) -> Self {
         self.reliable = true;
+        self
+    }
+    /// Enable only after the authenticated reliable-Delivery capability.
+    pub fn with_reliable_delivery(mut self) -> Self {
+        self.reliable_delivery = true;
         self
     }
 }
@@ -306,6 +313,9 @@ pub(super) struct OrderedSession {
 impl OrderedSession {
     pub(super) fn note_reliable_frame(&self, canonical_full: bool) -> bool {
         self.offer.diagnostics.note_reliable_frame(canonical_full)
+    }
+    pub(super) fn reliable_delivery(&self) -> bool {
+        self.offer.reliable && self.offer.reliable_delivery
     }
     pub(super) fn reliable(&self) -> Option<&super::reliable_session::ReliableSession> {
         self.reliable.as_ref()

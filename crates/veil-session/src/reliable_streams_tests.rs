@@ -3,6 +3,73 @@ fn state() -> ReliableStreams {
     let ctx = super::super::ordered_receiver_tests::pool_fixture_context();
     ReliableStreams::new(true, ctx.dispatcher, ctx.peer_id)
 }
+
+fn delivery_record(msg: u16) -> Vec<u8> {
+    let mut h = FrameHeader::new(FrameFamily::Delivery as u8, msg);
+    let body = b"self-contained delivery record";
+    h.body_len = body.len() as u32;
+    veil_proto::codec::encode_frame(&h, body)
+}
+
+#[test]
+fn reliable_delivery_requires_negotiation_and_leaves_network_control_on_parent() {
+    use veil_proto::family::DeliveryMsg;
+    let frame = delivery_record(DeliveryMsg::Forward as u16);
+    let child = Some([7; 32]);
+    let legacy = state();
+    assert_eq!(
+        legacy.route_with_local_class(&frame, child, 1),
+        Route::Canonical
+    );
+    assert!(state().incoming(&frame, Route::Child([7; 32])).is_err());
+    let mut modern = state().with_delivery(true);
+    assert_eq!(
+        modern.route_with_local_class(&frame, child, 1),
+        Route::Child([7; 32])
+    );
+    assert!(modern.incoming(&frame, Route::Child([7; 32])).is_ok());
+    assert_eq!(
+        modern.route_with_local_class(&frame, None, 1),
+        Route::Canonical
+    );
+    assert_eq!(
+        modern.route_with_local_class(&frame, child, crate::LOCAL_NETWORK_CONTROL_LANE),
+        Route::Canonical
+    );
+}
+
+#[test]
+fn reliable_delivery_permission_cannot_inject_parent_control_or_unopened_app_streams() {
+    let mut modern = state().with_delivery(true);
+    let child = Route::Child([7; 32]);
+    let mut h = FrameHeader::new(FrameFamily::Session as u8, 0);
+    h.body_len = 1;
+    let control = veil_proto::codec::encode_frame(&h, &[0]);
+    assert!(modern.incoming(&control, child).is_err());
+    assert!(modern.incoming(&delivery_record(u16::MAX), child).is_err());
+    for msg in [
+        veil_proto::family::DeliveryMsg::Chunk,
+        veil_proto::family::DeliveryMsg::ChunkManifest,
+    ] {
+        assert!(
+            modern
+                .incoming(&delivery_record(msg as u16), child)
+                .is_err()
+        );
+    }
+    let mut truncated = delivery_record(veil_proto::family::DeliveryMsg::Forward as u16);
+    truncated.pop();
+    assert!(modern.incoming(&truncated, child).is_err());
+    assert_eq!(
+        modern.route_with_local_class(&truncated, Some([7; 32]), 1),
+        Route::Canonical
+    );
+    assert!(
+        modern
+            .incoming(&frame(AppMsg::AppData, 19, 1), child)
+            .is_err()
+    );
+}
 fn frame(msg: AppMsg, stream: u32, app: u8) -> Vec<u8> {
     let body = match msg {
         AppMsg::AppOpen => AppOpenPayload {
@@ -236,4 +303,80 @@ async fn reliable_reply_waits_for_credit_without_popping_or_advancing_cipher() {
         "first RX nonce must match first committed reply"
     );
     assert!(queue.front().is_none());
+}
+
+#[test]
+fn delivery_records_have_no_stream_pin_and_survive_child_replacement() {
+    use veil_proto::family::DeliveryMsg;
+    let mut modern = state().with_delivery(true);
+    for msg in [
+        DeliveryMsg::Forward,
+        DeliveryMsg::DeliveryStatus,
+        DeliveryMsg::Transit,
+        DeliveryMsg::RecursiveRelay,
+        DeliveryMsg::RelayPath,
+    ] {
+        let bytes = delivery_record(msg as u16);
+        let first = Route::Child([7; 32]);
+        assert_eq!(
+            modern.route_with_local_class(&bytes, Some([7; 32]), 1),
+            first
+        );
+        modern.admitted(&bytes, first);
+        modern.incoming(&bytes, first).unwrap();
+        modern.fail_child([7; 32]);
+        assert!(modern.pins.is_empty());
+        assert_eq!(
+            modern.route_with_local_class(&bytes, Some([8; 32]), 1),
+            Route::Child([8; 32])
+        );
+        modern.incoming(&bytes, Route::Child([8; 32])).unwrap();
+    }
+}
+
+#[test]
+fn delivery_at_child_record_limit_is_routed_and_larger_records_keep_parent() {
+    use veil_crypto::session_cipher::AEAD_OVERHEAD;
+    use veil_transport::reliable_records::MAX_RECORD_BYTES;
+    let modern = state().with_delivery(true);
+    let body_limit = MAX_RECORD_BYTES - AEAD_OVERHEAD - HEADER_SIZE;
+    for (length, expected) in [
+        (body_limit, Route::Child([7; 32])),
+        (body_limit + 1, Route::Canonical),
+    ] {
+        let mut h = FrameHeader::new(
+            FrameFamily::Delivery as u8,
+            veil_proto::family::DeliveryMsg::Forward as u16,
+        );
+        h.body_len = length as u32;
+        let bytes = veil_proto::codec::encode_frame(&h, &vec![0; length]);
+        assert_eq!(
+            modern.route_with_local_class(&bytes, Some([7; 32]), 1),
+            expected
+        );
+    }
+}
+
+#[test]
+fn loss_tolerant_forward_fallback_never_enters_the_reliable_delivery_child() {
+    use veil_proto::delivery::ForwardPayload;
+    let seed = crate::runner::reliable_session_tests::forward_record(19);
+    let mut forward = ForwardPayload::decode(&seed[HEADER_SIZE..]).unwrap();
+    forward.envelope.payload.truncate(64);
+    forward.envelope.ttl_secs = 1;
+    forward.envelope.require_ack = false;
+    forward.delivery_attempt = None;
+    forward.traffic_class = Some(veil_proto::priority::INTERACTIVE);
+    let body = forward.encode();
+    assert!(ForwardPayload::is_realtime_datagram_eligible(&body));
+    let mut h = decode_header(&seed).unwrap();
+    h.body_len = body.len() as u32;
+    let bytes = veil_proto::codec::encode_frame(&h, &body);
+    let modern = state().with_delivery(true);
+    for local_class in [0, 1, 2, 3, 4, 6] {
+        assert_eq!(
+            modern.route_with_local_class(&bytes, Some([7; 32]), local_class),
+            Route::Canonical
+        );
+    }
 }

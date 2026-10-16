@@ -7,8 +7,11 @@ use veil_proto::session::{AttachPayload, CapabilitiesPayload, RESUME_CAPABILITIE
 
 const MARKER: &[u8; 16] = b"VEIL-RES-CAPS-01";
 const DOMAIN: &[u8] = b"veil/resume-capabilities/v1";
+const MARKER2: &[u8; 16] = b"VEIL-RES-CAPS-02";
+const DOMAIN2: &[u8] = b"veil/resume-capabilities/v2";
 const CAPS_LEN: usize = 5; // version, roles, flags, discovery mode, extra flags
 const VALUE_LEN: usize = MARKER.len() + CAPS_LEN + 32;
+const VALUE_LEN2: usize = MARKER2.len() + 2 + 32;
 
 fn mac(
     key: &[u8; 32],
@@ -16,13 +19,14 @@ fn mac(
     receiver: &[u8; 32],
     attach_prefix: &[u8],
     caps: &[u8],
+    version: u8,
 ) -> [u8; 32] {
     let mut hash = blake3::Hasher::new_keyed(key);
-    hash.update(DOMAIN);
+    hash.update(if version == 2 { DOMAIN2 } else { DOMAIN });
     hash.update(sender);
     hash.update(receiver);
     hash.update(attach_prefix);
-    hash.update(MARKER);
+    hash.update(if version == 2 { MARKER2 } else { MARKER });
     hash.update(caps);
     *hash.finalize().as_bytes()
 }
@@ -41,12 +45,24 @@ pub(crate) fn append(
         caps.discovery_mode,
         caps.extra_flags,
     ];
-    let proof = mac(tx_key, sender, receiver, attach, &data);
+    let proof = mac(tx_key, sender, receiver, attach, &data, 1);
     attach.extend_from_slice(&RESUME_CAPABILITIES_TLV_TAG.to_be_bytes());
     attach.extend_from_slice(&(VALUE_LEN as u16).to_be_bytes());
     attach.extend_from_slice(MARKER);
     attach.extend_from_slice(&data);
     attach.extend_from_slice(&proof);
+    if caps.extra_flags2 != 0 {
+        // Keep the original recognized TLV byte-for-byte compatible. Old
+        // verifiers skip this separately marked extension; new ones bind it
+        // to the entire authenticated prefix, including the original proof.
+        let data = [1, caps.extra_flags2];
+        let proof = mac(tx_key, sender, receiver, attach, &data, 2);
+        attach.extend_from_slice(&RESUME_CAPABILITIES_TLV_TAG.to_be_bytes());
+        attach.extend_from_slice(&(VALUE_LEN2 as u16).to_be_bytes());
+        attach.extend_from_slice(MARKER2);
+        attach.extend_from_slice(&data);
+        attach.extend_from_slice(&proof);
+    }
 }
 
 /// Missing metadata keeps legacy fallback. A recognized malformed, duplicated
@@ -59,6 +75,7 @@ pub(crate) fn verify(
     receiver: &[u8; 32],
 ) -> Result<Option<CapabilitiesPayload>, &'static str> {
     let mut found = None;
+    let mut extended = false;
     let mut pos = AttachPayload::WIRE_SIZE;
     while pos + 4 <= attach.len() {
         let tag = u16::from_be_bytes([attach[pos], attach[pos + 1]]);
@@ -74,16 +91,33 @@ pub(crate) fn verify(
             if data[0] != 1 {
                 return Err("unsupported resumed capability version");
             }
-            let expected = mac(rx_key, sender, receiver, &attach[..pos], data);
+            let expected = mac(rx_key, sender, receiver, &attach[..pos], data, 1);
             if !bool::from(expected.ct_eq(&attach[start + len - 32..start + len])) {
                 return Err("invalid resumed capability proof");
             }
             found = Some(CapabilitiesPayload {
+                extra_flags2: 0,
                 roles_supported: data[1],
                 flags: data[2],
                 discovery_mode: data[3],
                 extra_flags: data[4],
             });
+        } else if tag == RESUME_CAPABILITIES_TLV_TAG
+            && attach.get(start..start + MARKER2.len()) == Some(MARKER2.as_slice())
+        {
+            if extended || found.is_none() || len != VALUE_LEN2 || start + len > attach.len() {
+                return Err("invalid second resumed capability metadata");
+            }
+            let data = &attach[start + MARKER2.len()..start + MARKER2.len() + 2];
+            if data[0] != 1 {
+                return Err("unsupported second resumed capability version");
+            }
+            let expected = mac(rx_key, sender, receiver, &attach[..pos], data, 2);
+            if !bool::from(expected.ct_eq(&attach[start + len - 32..start + len])) {
+                return Err("invalid second resumed capability proof");
+            }
+            found.as_mut().expect("base verified above").extra_flags2 = data[1];
+            extended = true;
         }
         if start + len > attach.len() {
             break; // Random padding or an unknown truncated optional trailer.
@@ -102,6 +136,7 @@ mod tests {
         let mut attach = vec![0; AttachPayload::WIRE_SIZE];
         append_resume_nonce_to_attach(&mut attach, &[8; 32]);
         let caps = CapabilitiesPayload {
+            extra_flags2: 0,
             roles_supported: 1,
             flags: cap_flags::NO_DHT_SERVICE | cap_flags::SUPPORTS_REALTIME_DATAGRAMS,
             discovery_mode: 2,
@@ -128,6 +163,7 @@ mod tests {
         use veil_proto::session::cap_extra_flags;
         let mut attach = vec![0; AttachPayload::WIRE_SIZE];
         let caps = CapabilitiesPayload {
+            extra_flags2: 0,
             roles_supported: 1,
             flags: cap_flags::SUPPORTS_REALTIME_DATAGRAMS
                 | cap_flags::SUPPORTS_DATAGRAM_FLOWS
@@ -149,6 +185,37 @@ mod tests {
             verify(&attach, &[3; 32], &[1; 32], &[2; 32]).is_err(),
             "capability downgrade/upgrade must invalidate authentication"
         );
+    }
+
+    #[test]
+    fn delivery_permission_is_bound_to_the_original_resume_proof_and_is_optional_for_legacy() {
+        let mut caps = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Core);
+        caps.flags = u8::MAX;
+        caps.extra_flags = u8::MAX;
+        caps.extra_flags2 = veil_proto::session::cap_extra_flags2::SUPPORTS_RELIABLE_DELIVERY;
+        let mut attach = vec![0; AttachPayload::WIRE_SIZE];
+        append(&mut attach, &caps, &[3; 32], &[1; 32], &[2; 32]);
+        assert!(
+            verify(&attach, &[3; 32], &[1; 32], &[2; 32])
+                .unwrap()
+                .unwrap()
+                .supports_reliable_delivery()
+        );
+        let second = AttachPayload::WIRE_SIZE + 4 + VALUE_LEN;
+        let legacy = verify(&attach[..second], &[3; 32], &[1; 32], &[2; 32])
+            .unwrap()
+            .unwrap();
+        assert!(legacy.supports_reliable_parallel());
+        assert!(!legacy.supports_reliable_delivery());
+        let mut forged = attach.clone();
+        forged[second + 4 + MARKER2.len() + 1] ^= 1;
+        assert!(verify(&forged, &[3; 32], &[1; 32], &[2; 32]).is_err());
+        let mut duplicate = attach.clone();
+        duplicate.extend_from_slice(&attach[second..]);
+        assert!(verify(&duplicate, &[3; 32], &[1; 32], &[2; 32]).is_err());
+        let mut orphan = vec![0; AttachPayload::WIRE_SIZE];
+        orphan.extend_from_slice(&attach[second..]);
+        assert!(verify(&orphan, &[3; 32], &[1; 32], &[2; 32]).is_err());
     }
 
     #[test]
