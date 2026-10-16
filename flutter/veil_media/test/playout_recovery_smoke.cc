@@ -84,6 +84,31 @@ int main() {
         webrtc::NetEq::Operation::kNormal) == (mode == 3 ? webrtc::NetEq::kFail : 0));
     assert(observed_clock->ticks() == 2);
   }
+  // The same call has two real NetEq wrappers, but only one is catching up.
+  // Its event must be attributed to the actual accepted RTP source.
+  {
+    auto totals = std::make_shared<veil_media::PlayoutRecoveryStats>();
+    auto first = std::make_unique<Decoder>();
+    auto second = std::make_unique<Decoder>();
+    second->mode = 5; // 100 ms, no decoded speech is dropped
+    veil_media::RecoveringNetEq a(std::move(first), totals);
+    veil_media::RecoveringNetEq b(std::move(second), totals);
+    webrtc::RTPHeader header;
+    const webrtc::RtpPacketInfo info;
+    header.ssrc = 11;
+    a.InsertPacket(header, {}, info);
+    header.ssrc = 22;
+    b.InsertPacket(header, {}, info);
+    webrtc::AudioFrame frame;
+    a.GetAudio(&frame, nullptr, nullptr, std::nullopt);
+    b.GetAudio(&frame, nullptr, nullptr, std::nullopt);
+    const auto one = totals->receivers.Snapshot(11);
+    const auto two = totals->receivers.Snapshot(22);
+    assert(one.known && two.known && one.origin != two.origin);
+    assert(one.discarded_ms == 10 && one.last_discard_us > 0);
+    assert(two.discarded_ms == 0 && two.last_discard_us == 0);
+    assert(!totals->receivers.Snapshot(33).known);
+  }
   // The decoder must not refill toward a target above the catch-up budget.
   // Reserve one decoded packet's headroom for ordinary packet-sized arrivals.
   {

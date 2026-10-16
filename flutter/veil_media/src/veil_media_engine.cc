@@ -994,6 +994,7 @@ struct WebrtcState {
   webrtc::scoped_refptr<webrtc::AudioState> audio_state;
   std::shared_ptr<veil_media::PlayoutRecoveryStats> recovery_stats =
       std::make_shared<veil_media::PlayoutRecoveryStats>();
+  std::atomic<uint64_t> recovery_sample_sequence{0};
   std::unique_ptr<webrtc::NetEqFactory> recovery_factory;
   std::unique_ptr<webrtc::Call> call;  // audio only
   std::unique_ptr<webrtc::Call> video_call;
@@ -2484,6 +2485,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   int video_reports = 0, video_loss = 0, video_jitter = 0;
   int64_t video_rtt = 0;
   int64_t audio_loss_report_us = 0, video_loss_report_us = 0;
+  int64_t peer_audio_recovery_report_us = 0;
+  int peer_audio_recovery_peers = 0;
   int playout_peers = 0, playout_reports = 0, playout_ms = -1;
   int64_t rtt = 0;
   uint64_t video_frames = 0;
@@ -2493,6 +2496,9 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   bool playout_changed = ws->observed_playout_peer_count != ws->peers.size();
   ws->observed_playout_peer_count = ws->peers.size();
   for (const auto& entry : ws->peers) {
+    if (entry.second->shim->peer_audio_recovery_supported()) ++peer_audio_recovery_peers;
+    peer_audio_recovery_report_us = std::max(peer_audio_recovery_report_us,
+        entry.second->shim->peer_audio_recovery_report_us(now_us));
     const auto playout = entry.second->shim->audio_playout_feedback();
     auto* peer = entry.second.get();
     const bool fresh = playout.fresh_at(now_us);
@@ -2560,6 +2566,9 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               sample.jitter_buffer_ms, ws->adm.get());
           peer->shim->SetLocalAudioPlayout(peer->audio_ssrc, sample_sequence,
               active ? static_cast<int>(delay_ms) : -1, now_us);
+          const auto recovery = ws->recovery_stats->receivers.Snapshot(peer->audio_ssrc);
+          peer->shim->SetLocalAudioRecovery(peer->audio_ssrc, sample_sequence,
+              active ? recovery : veil_media::AudioRecoverySample{}, now_us);
           char id[65];
           for (size_t i = 0; i < 32; ++i) {
             id[2 * i] = hex[entry.second->id[i] >> 4];
@@ -2574,7 +2583,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               "\"audio_interruption_duration_ms\":%d,"
               "\"audio_concealed_samples\":%llu,\"audio_concealment_events\":%llu,"
               "\"audio_output_emitted_samples\":%llu,\"audio_total_samples_received\":%llu,"
-              "\"audio_discarded_packets\":%llu,\"audio_jb_target_ms\":%u}", id,
+              "\"audio_discarded_packets\":%llu,\"audio_jb_target_ms\":%u,"
+              "\"audio_recovery_known\":%d,\"audio_latency_discarded_ms\":%llu}", id,
               static_cast<unsigned long long>(sample.packets_received),
               delay_ms, sample.delay_estimate_ms, static_cast<long long>(native_age_ms),
               sample.interruption_count, sample.total_interruption_duration_ms,
@@ -2583,16 +2593,20 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               static_cast<unsigned long long>(sample.jitter_buffer_emitted_count),
               static_cast<unsigned long long>(sample.total_samples_received),
               static_cast<unsigned long long>(sample.packets_discarded),
-              sample.jitter_buffer_preferred_ms);
+              sample.jitter_buffer_preferred_ms, recovery.known ? 1 : 0,
+              static_cast<unsigned long long>(recovery.discarded_ms));
           if (size <= 0 || static_cast<size_t>(size) >= sizeof(receiver)) continue;
           if (!audio_receivers.empty()) audio_receivers += ',';
           audio_receivers.append(receiver, static_cast<size_t>(size));
         }
       }, std::chrono::milliseconds(20));
   if (!audio_sampled) {
-    for (const auto& entry : ws->peers)
+    for (const auto& entry : ws->peers) {
       entry.second->shim->SetLocalAudioPlayout(
           entry.second->audio_ssrc, sample_sequence, -1, now_us);
+      entry.second->shim->SetLocalAudioRecovery(
+          entry.second->audio_ssrc, sample_sequence, {}, now_us);
+    }
   }
   const bool video_sampled = veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&] {
     if (ws->video_send_stream) {
@@ -2644,6 +2658,9 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               ",\"video_tx_payload_bytes\":" + std::to_string(video_send.payload_bytes) +
               ",\"video_tx_padding_bytes\":" + std::to_string(video_send.padding_bytes) +
               ",\"video_tx_rtp_drops\":" + std::to_string(video_send.dropped);
+  snapshot += ",\"audio_peer_recovery_report_us\":" +
+      std::to_string(peer_audio_recovery_report_us);
+  snapshot += ",\"audio_peer_recovery_peers\":" + std::to_string(peer_audio_recovery_peers);
   snapshot += ",\"audio_latency_recovery_count\":" +
       std::to_string(ws->recovery_stats->count.load(std::memory_order_acquire));
   snapshot += ",\"audio_latency_discarded_ms\":" +
@@ -3958,6 +3975,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     android420_replaced =
         ws->android420_stats.replaced.load(std::memory_order_relaxed);
 #endif
+    const uint64_t recovery_sequence = ws->recovery_sample_sequence.fetch_add(1) + 1;
+    const int64_t recovery_sampled_us = webrtc::TimeMicros();
     const bool sampled = veil_media::run_on_with_timeout(ws->worker_tq.get(), [&] {
       if (ws->send_stream) {
         const auto sent = ws->send_stream->GetStats();
@@ -3978,6 +3997,11 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         // WebRTC's last packet includes padding probes. They still advance
         // RTCP counters, but cannot prove that encoded audio is arriving.
         audio_rx_native_age_ms = ws->shim->audio_payload_receive_age_ms();
+        const uint32_t remote_ssrc = ssrc_of(engine->peer);
+        ws->shim->SetLocalAudioRecovery(remote_ssrc, recovery_sequence,
+            r.packets_received > 0 && audio_rx_native_age_ms >= 0 && audio_rx_native_age_ms <= 3000
+                ? ws->recovery_stats->receivers.Snapshot(remote_ssrc)
+                : veil_media::AudioRecoverySample{}, recovery_sampled_us);
         audio_concealed_samples = r.concealed_samples;
         // Lifetime sample counters distinguish delivery jitter from a slow
         // playout clock. They are endpoint diagnostics, never wire metadata.
@@ -4008,6 +4032,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         }
       }
     }, std::chrono::milliseconds(20));
+    if (!sampled)
+      ws->shim->SetLocalAudioRecovery(ssrc_of(engine->peer), recovery_sequence, {}, recovery_sampled_us);
     // A stalled video worker must not block audio telemetry or the UI's
     // control loop for the ten-second stream-operation timeout.
     const bool video_sampled = veil_media::run_on_with_timeout(
@@ -4195,6 +4221,10 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
       snapshot += ",\"audio_latency_fallback_frames\":" +
           std::to_string(ws->recovery_stats->fallback_frames.load(std::memory_order_relaxed));
       const int64_t loss_now_us = webrtc::TimeMicros();
+      snapshot += ",\"audio_peer_recovery_report_us\":" +
+          std::to_string(ws->shim->peer_audio_recovery_report_us(loss_now_us));
+      snapshot += ",\"audio_peer_recovery_peers\":" +
+          std::to_string(ws->shim->peer_audio_recovery_supported() ? 1 : 0);
       snapshot += ",\"audio_loss_report_us\":" +
           std::to_string(audio_report.fresh_loss_report_us(loss_now_us));
       snapshot += ",\"video_loss_report_us\":" +
