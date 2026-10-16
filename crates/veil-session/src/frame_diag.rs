@@ -220,35 +220,81 @@ pub fn note_outbound(dest: &[u8; 32], frame: &[u8], via: &str) {
 }
 
 /// Optional bounded frame-size correlation without payloads or backtraces.
-/// `VEIL_DIAG_FRAME_METADATA` uses the same selectors as `VEIL_DIAG_FRAME`.
-/// This records enqueue/selection observations, not confirmed wire delivery.
+/// These generic observations are attempts, not confirmed queue admission.
 pub(crate) fn note_metadata(dest: &[u8; 32], frame: &[u8], via: &str) {
-    let Some(selectors) = METADATA_FILTER.get_or_init(|| {
-        std::env::var("VEIL_DIAG_FRAME_METADATA")
-            .ok()
-            .as_deref()
-            .and_then(parse_filter)
-    }) else {
-        return;
-    };
-    let Some((family, msg_type)) = family_and_type(frame) else {
-        return;
-    };
-    if !selected(selectors, family, msg_type)
-        || METADATA_SEEN.fetch_add(1, Ordering::Relaxed) >= 20_000
-    {
-        return;
+    if let Some(observation) = prepare_metadata(None, dest, frame, via) {
+        observation.emit();
     }
-    let request = u32::from_be_bytes(frame[20..24].try_into().expect("checked header"));
-    let at_unix_us = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros();
-    log::info!(
-        target: "veil::frame_metadata",
-        "at_unix_us={at_unix_us} via={via} dst={} family={family} type={msg_type} request={request} len={}",
-        hex_prefix(dest, 4), frame.len(),
-    );
+}
+
+pub(crate) fn note_metadata_at(node: &[u8; 32], dest: &[u8; 32], frame: &[u8], via: &str) {
+    if let Some(observation) = prepare_metadata(Some(node), dest, frame, via) {
+        observation.emit();
+    }
+}
+
+/// Capture small owned metadata before a frame is consumed, but emit only
+/// after successful handoff. Disabled diagnostics neither clone nor hash it.
+pub(crate) fn prepare_metadata(
+    node: Option<&[u8; 32]>,
+    dest: &[u8; 32],
+    frame: &[u8],
+    via: &str,
+) -> Option<FrameMetadata> {
+    let selectors = METADATA_FILTER
+        .get_or_init(|| {
+            std::env::var("VEIL_DIAG_FRAME_METADATA")
+                .ok()
+                .as_deref()
+                .and_then(parse_filter)
+        })
+        .as_ref()?;
+    let (family, msg_type) = family_and_type(frame)?;
+    if !selected(selectors, family, msg_type) || METADATA_SEEN.load(Ordering::Relaxed) >= 20_000 {
+        return None;
+    }
+    Some(FrameMetadata {
+        node: node.map(|id| id[..4].try_into().expect("node prefix")),
+        dest: dest[..4].try_into().expect("destination prefix"),
+        via: via.to_owned(),
+        family,
+        msg_type,
+        request: u32::from_be_bytes(frame[20..24].try_into().expect("checked header")),
+        bytes: frame.len(),
+        fingerprint: blake3::hash(frame).as_bytes()[..8]
+            .try_into()
+            .expect("hash prefix"),
+    })
+}
+
+pub(crate) struct FrameMetadata {
+    node: Option<[u8; 4]>,
+    dest: [u8; 4],
+    via: String,
+    family: u8,
+    msg_type: u16,
+    request: u32,
+    bytes: usize,
+    fingerprint: [u8; 8],
+}
+
+impl FrameMetadata {
+    pub(crate) fn emit(self) {
+        if METADATA_SEEN.fetch_add(1, Ordering::Relaxed) >= 20_000 {
+            return;
+        }
+        let at_unix_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros();
+        log::info!(
+            target: "veil::frame_metadata",
+            "at_unix_us={at_unix_us} via={} node={} dst={} family={} type={} request={} len={} frame={}",
+            self.via, self.node.map_or_else(|| "-".to_owned(), |id| hex_prefix(&id, 4)),
+            hex_prefix(&self.dest, 4), self.family, self.msg_type, self.request,
+            self.bytes, hex_prefix(&self.fingerprint, 8),
+        );
+    }
 }
 
 /// Family at byte 5, message type big-endian at 6..8. `None` for anything too

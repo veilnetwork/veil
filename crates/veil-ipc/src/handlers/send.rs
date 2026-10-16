@@ -66,6 +66,30 @@ type RouteMisses =
 static ROUTE_MISSES: std::sync::LazyLock<std::sync::Mutex<RouteMisses>> =
     std::sync::LazyLock::new(Default::default);
 
+// Concurrent local sends share a lookup, then recheck its cache/miss result.
+// The key includes the local node and policy: neither another identity nor a
+// direct-only result may settle a relay-only caller. No state reaches a peer.
+type DiscoveryGateKey = ([u8; 32], [u8; 32], RouteDiscoveryKind);
+type DiscoveryGates =
+    std::collections::HashMap<DiscoveryGateKey, std::sync::Weak<tokio::sync::Mutex<()>>>;
+static ROUTE_DISCOVERY_GATES: std::sync::LazyLock<Mutex<DiscoveryGates>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn discovery_gate(key: DiscoveryGateKey) -> Option<Arc<tokio::sync::Mutex<()>>> {
+    let mut gates = lock!(ROUTE_DISCOVERY_GATES);
+    if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) {
+        return Some(gate);
+    }
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    // Preserve route recovery if every slot serves a different live lookup.
+    if gates.len() >= 128 {
+        return None;
+    }
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    gates.insert(key, Arc::downgrade(&gate));
+    Some(gate)
+}
+
 // A missing media route is probed in the background, once per node/destination.
 // Never hold RTP/RTCP for the 500 ms discovery deadline, nor launch a walk for
 // each packet in the 50 Hz audio stream. Bound outstanding probes globally.
@@ -202,6 +226,13 @@ async fn discover_route(
         header::FrameHeader,
     };
 
+    let gate = discovery_gate((*local_node_id, *dst, kind));
+    let _lookup = match gate.as_ref() {
+        Some(gate) => Some(gate.lock().await),
+        None => None,
+    };
+    // Cancellation releases the gate; waiters retry the ordinary verified
+    // cache path and can perform discovery if the first caller never finished.
     // Fast path: route already cached AND (no E2E infrastructure OR ML-KEM key cached).
     // If the route is known but the ML-KEM key is absent (e.g. route came from a
     // RouteAnnounce gossip that carries no ML-KEM key), fall through to reactive
@@ -4920,6 +4951,82 @@ mod ratchet_send_tests {
             fx.taken().is_empty(),
             "a live cached relay needs no new discovery"
         );
+    }
+
+    #[tokio::test]
+    async fn simultaneous_local_sends_share_one_route_discovery() {
+        const LOCAL: [u8; 32] = [0xA1; 32];
+        const DST: [u8; 32] = [0xA2; 32];
+        let fx = fixture(vec![RELAY]);
+        let notify = tokio::sync::Notify::new();
+        let ask = || {
+            try_lookup_or_discover(
+                &DST,
+                &LOCAL,
+                Some(&fx.route_cache),
+                Some(fx.outbox.as_ref()),
+                Some(&notify),
+                None,
+                None,
+            )
+        };
+        let answer = async {
+            tokio::task::yield_now().await;
+            assert_eq!(
+                fx.taken().len(),
+                1,
+                "concurrent sends must not multiply route/key proofs"
+            );
+            wlock!(fx.route_cache).insert(DST, RELAY, 10, 2);
+            notify.notify_waiters();
+        };
+        let (a, b, c, ()) = tokio::join!(ask(), ask(), ask(), answer);
+        assert_eq!([a, b, c], [Some(RELAY); 3]);
+        assert!(fx.taken().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_discovery_allows_a_waiter_to_recover_the_route() {
+        const LOCAL: [u8; 32] = [0xA3; 32];
+        const DST: [u8; 32] = [0xA4; 32];
+        let fx = fixture(vec![RELAY]);
+        let notify = tokio::sync::Notify::new();
+        let ask = || {
+            try_lookup_or_discover(
+                &DST,
+                &LOCAL,
+                Some(&fx.route_cache),
+                Some(fx.outbox.as_ref()),
+                Some(&notify),
+                None,
+                None,
+            )
+        };
+        let mut first = Box::pin(ask());
+        tokio::select! {
+            result = &mut first => panic!("lookup finished before an answer: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert_eq!(fx.taken().len(), 1);
+        let mut waiter = Box::pin(ask());
+        tokio::select! {
+            result = &mut waiter => panic!("waiter finished before an answer: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        // A queued caller survives cancellation of the one that sent the query.
+        drop(first);
+        let answer = async {
+            tokio::task::yield_now().await;
+            assert_eq!(
+                fx.taken().len(),
+                1,
+                "waiter performs its own recovery query"
+            );
+            wlock!(fx.route_cache).insert(DST, RELAY, 10, 2);
+            notify.notify_waiters();
+        };
+        let (result, ()) = tokio::join!(waiter, answer);
+        assert_eq!(result, Some(RELAY));
     }
 
     /// A discovery that found no route is not repeated at once: the next send

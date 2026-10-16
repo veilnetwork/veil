@@ -5622,6 +5622,7 @@ impl SessionRunner {
                             &plain,
                         );
                         self.dispatcher.capture_outbound(self.peer_id, &plain);
+                        crate::frame_diag::note_metadata_at(&self.local_node_id, &self.peer_id, &plain, "child_admitted");
                         if let Some(parallel) = realtime_lane.as_ref().and_then(|lane| lane.parallel.as_ref())
                             && parallel.note_reliable_frame(wire_tx.capacity() == 0) {
                             self.logger.info("session.reliable_child.first_send",format!("peer_id={} wire_bytes={bytes}",hex_short(&self.peer_id)));
@@ -5730,6 +5731,7 @@ impl SessionRunner {
                         // is an encrypted session frame.
                         let tx_len = outgoing.len() as u64;
                         // outgoing is already a PooledShared — pass through.
+                        let metadata = crate::frame_diag::prepare_metadata(Some(&self.local_node_id), &self.peer_id, &outgoing, "writer_admitted");
                         match Self::push_wire_classified(
                             &wire_tx,
                             outgoing.clone(),
@@ -5747,6 +5749,7 @@ impl SessionRunner {
                                 return;
                             }
                         }
+                        if let Some(metadata) = metadata { metadata.emit(); }
                         if let Some(m) = &self.metrics {
                             m.add_transport_bytes_tx(tx_len);
                         }
@@ -5775,8 +5778,8 @@ impl SessionRunner {
                         .as_mut()
                         .expect("encrypted pass must retain its TX cipher");
                     let mut encrypted_batch = Vec::with_capacity(encrypted_batch_wire_len);
-                    for frame in encrypted_batch_frames {
-                        let enc = match apply_tx_cipher(&frame, cipher) {
+                    for frame in &encrypted_batch_frames {
+                        let enc = match apply_tx_cipher(frame, cipher) {
                             Some(enc) => enc,
                             None => {
                                 // cipher/header error — close session
@@ -5810,6 +5813,14 @@ impl SessionRunner {
                         self.on_primary_write_error(&mut write_error_count);
                         Self::stop_writer(wire_tx, &mut writer_handle).await;
                         return;
+                    }
+                    for frame in &encrypted_batch_frames {
+                        crate::frame_diag::note_metadata_at(
+                            &self.local_node_id,
+                            &self.peer_id,
+                            frame,
+                            "writer_admitted",
+                        );
                     }
                     if let Some(m) = &self.metrics {
                         m.add_transport_bytes_tx(tx_len);
@@ -6652,6 +6663,12 @@ impl SessionRunner {
                 Some(&self.local_node_id),
                 &frame,
             );
+            crate::frame_diag::note_metadata_at(
+                &self.local_node_id,
+                &self.peer_id,
+                &frame,
+                "child_admitted",
+            );
             self.dispatcher.capture_outbound(self.peer_id, &frame);
             if let Some(m) = &self.metrics {
                 m.add_transport_bytes_tx(bytes as u64);
@@ -6705,6 +6722,12 @@ impl SessionRunner {
                     &resp_bytes,
                 );
                 self.dispatcher.capture_outbound(self.peer_id, &resp_bytes);
+                let metadata = crate::frame_diag::prepare_metadata(
+                    Some(&self.local_node_id),
+                    &self.peer_id,
+                    &resp_bytes,
+                    "response_admitted",
+                );
                 // Encrypt the response body if the session uses encryption.
                 let wire_bytes = if let Some(cipher) = self.crypto.tx_cipher.as_mut() {
                     match apply_tx_cipher(&resp_bytes, cipher) {
@@ -6726,6 +6749,9 @@ impl SessionRunner {
                 {
                     self.on_primary_write_error(write_error_count);
                     return true;
+                }
+                if let Some(metadata) = metadata {
+                    metadata.emit();
                 }
             }
             DispatchResult::NoResponse => {}
