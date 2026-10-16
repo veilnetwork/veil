@@ -503,6 +503,28 @@ impl PriorityQueue {
         self.queues.iter().map(|q| q.len()).sum()
     }
 
+    /// Debug-only metadata of at most one head per local queue. No payload or
+    /// carrier identifier is exposed; this does not select or move a frame.
+    pub(crate) fn trace_heads(&self) -> String {
+        self.queues
+            .iter()
+            .enumerate()
+            .filter_map(|(index, queue)| {
+                let head = queue.front()?;
+                let header = veil_proto::codec::decode_header(&head.frame).ok();
+                Some(format!(
+                    "{index}:family={},msg={},bytes={},lossy={},carrier={}",
+                    header.as_ref().map_or(255, |h| h.family),
+                    header.as_ref().map_or(u16::MAX, |h| h.msg_type),
+                    head.frame.len(),
+                    head.lossy_realtime,
+                    head.carrier.is_some()
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
     /// Highest priority level (lowest index = highest priority) that
     /// currently has at least one queued frame. Returns `None` when
     /// the queue is empty. Used by deferred
