@@ -152,6 +152,7 @@ impl Fixture {
             id,
             MediaChannel {
                 path_probe: None,
+                source_preflight: None,
                 ingress: MediaIngress::new(tx, MediaVideoIngress::Packets(video)),
                 repair_tx: None,
                 peer,
@@ -204,6 +205,138 @@ impl Drop for Fixture {
 
 extern "C" fn count_media(ctx: *mut c_void, _: *const u8, _: usize) {
     unsafe { &*(ctx as *const AtomicUsize) }.fetch_add(1, Ordering::Relaxed);
+}
+
+#[test]
+fn source_preflight_qualifies_before_rtp_callback_and_preserves_old_key_owner() {
+    let _lock = FIXTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let deliveries = AtomicUsize::new(0);
+    let mut fixture = Fixture::new();
+    let (old, _) = fixture.channel(ProbeRoute::Direct);
+    let (candidate, _) = fixture.channel(ProbeRoute::Direct);
+    let [path, _] = fixture.paths();
+    let app = HandleTable::get(app_table(), path.app as usize).unwrap();
+    for id in [old, candidate] {
+        MEDIA_CHANNELS
+            .write()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .control_destination = Some((path.peer_app_id, path.peer_endpoint_id));
+    }
+    let old_context = source_preflight::install(old, Arc::clone(&app)).unwrap();
+    let context = source_preflight::install(candidate, app).unwrap();
+    let before = media::recv_count(PEER);
+    let mut peer = media::cipher_for_test(&DEVICE, &RX, &TX).unwrap();
+    for old_owns_callback in [false, true] {
+        if old_owns_callback {
+            assert_eq!(
+                unsafe {
+                    veil_media_set_recv_callback(
+                        old,
+                        Some(count_media),
+                        (&deliveries as *const AtomicUsize).cast_mut().cast(),
+                    )
+                },
+                0
+            );
+        }
+        let (_, unused) = std::sync::mpsc::channel();
+        let captured = std::mem::replace(&mut fixture.captured, unused);
+        let responder = std::thread::spawn(move || {
+            let mut planes = std::collections::HashSet::new();
+            for _ in 0..9 {
+                let (destination, lane, bytes) =
+                    captured.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert_eq!(destination, PEER);
+                let rt = AppRtDataPayload::decode(&bytes[HEADER_SIZE..]).unwrap();
+                assert_eq!(rt.app_id, path.peer_app_id);
+                assert_eq!(rt.endpoint_id, path.peer_endpoint_id);
+                let mut body = peer.open(&rt.payload).unwrap();
+                assert_eq!(body[6], 1);
+                let plane = body[7];
+                assert_eq!(
+                    lane,
+                    [
+                        veil_proto::priority::REALTIME,
+                        veil_proto::priority::BULK,
+                        veil_proto::priority::BACKGROUND
+                    ][usize::from(plane)]
+                );
+                body[6..8].fill(0);
+                let mut reply = ProbeControl::decode(&body)
+                    .unwrap()
+                    .reply()
+                    .unwrap()
+                    .encode();
+                reply[6] = 1;
+                reply[7] = plane;
+                let local_plane = [
+                    media::LocalMediaPlane::Primary,
+                    media::LocalMediaPlane::Secondary,
+                    media::LocalMediaPlane::Screen,
+                ][usize::from(plane)];
+                let sealed = peer.seal_on_plane(local_plane, &reply).unwrap();
+                media::dispatch_inbound_auto(PEER, sealed.as_bytes());
+                planes.insert(plane);
+                if planes.len() == 3 {
+                    break;
+                }
+            }
+            assert_eq!(planes.len(), 3);
+            (captured, peer)
+        });
+        let ready = fixture.runtime.block_on(context.run());
+        let (captured, returned_peer) = responder.join().unwrap();
+        fixture.captured = captured;
+        peer = returned_peer;
+        assert!(
+            ready,
+            "all independent replies must qualify their challenge owner"
+        );
+        assert_eq!(deliveries.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            media::recv_count(PEER),
+            before,
+            "controls must not count as RTP"
+        );
+    }
+    // A forged envelope source cannot choose the reflection destination. The
+    // authenticated request is answered only to the call's pinned direct peer.
+    let probe = RouteProbe::begin(
+        ProbeRoute::Relay,
+        Instant::now(),
+        Duration::from_millis(600),
+    );
+    let mut request = probe.request_payload();
+    request[6] = 1;
+    request[7] = 1;
+    let sealed = peer.seal(&request).unwrap();
+    media::dispatch_inbound_auto([0xff; 32], sealed.as_bytes());
+    let (destination, lane, bytes) = fixture
+        .captured
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(destination, PEER);
+    assert_eq!(lane, veil_proto::priority::BULK);
+    let rt = AppRtDataPayload::decode(&bytes[HEADER_SIZE..]).unwrap();
+    let mut reply = peer.open(&rt.payload).unwrap();
+    assert_eq!(reply[6..8], [1, 1]);
+    reply[6..8].fill(0);
+    assert!(ProbeControl::decode(&reply).unwrap().reply().is_none());
+    for id in [old, candidate] {
+        unsafe { veil_media_close_channel(id) };
+    }
+    media::dispatch_inbound_auto([0xff; 32], peer.seal(&request).unwrap().as_bytes());
+    assert!(
+        fixture
+            .captured
+            .recv_timeout(Duration::from_millis(50))
+            .is_err()
+    );
+    assert!(!fixture.runtime.block_on(context.run()));
+    assert!(!fixture.runtime.block_on(old_context.run()));
+    assert_eq!(deliveries.load(Ordering::Relaxed), 0);
 }
 
 #[test]

@@ -40,6 +40,8 @@ pub mod feedback_ffi;
 #[cfg(feature = "node-embedded")]
 mod ingress_diagnostics;
 #[cfg(feature = "node-embedded")]
+pub(crate) mod source_preflight;
+#[cfg(feature = "node-embedded")]
 mod source_preparation;
 #[cfg(feature = "node-embedded")]
 use ingress_diagnostics::{Reason as IngressRefusal, refuse as refuse_ingress};
@@ -657,6 +659,7 @@ pub unsafe extern "C" fn veil_media_open_channel(
             id,
             MediaChannel {
                 path_probe: None,
+                source_preflight: None,
                 ingress,
                 repair_tx: Some([
                     repair_hi_tx,
@@ -815,7 +818,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
         }
     }
 
-    source_preparation::prepare_app_sources(&app_ref, peer, false);
+    let independent_ready = source_preparation::prepare_app_sources(&app_ref, peer, false);
 
     let (tx_hi, rx_hi) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_HI_QUEUE);
     let (tx_video, rx_video) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_VIDEO_QUEUE);
@@ -977,6 +980,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
             id,
             MediaChannel {
                 path_probe: None,
+                source_preflight: None,
                 ingress: MediaIngress::with_screen(
                     tx_hi,
                     MediaVideoIngress::Packets(tx_video),
@@ -999,6 +1003,9 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
                 routes: None,
             },
         );
+    if independent_ready {
+        source_preflight::install_and_prepare(id, Arc::clone(&app_ref));
+    }
     id
 }
 
@@ -1039,7 +1046,7 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
         return 0;
     };
 
-    source_preparation::prepare_app_sources(&app_ref, peer, true);
+    let independent_ready = source_preparation::prepare_app_sources(&app_ref, peer, true);
 
     let (tx_hi, rx_hi) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_HI_QUEUE);
     let (tx_video_frames, rx_video_frames) =
@@ -1214,6 +1221,7 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
             id,
             MediaChannel {
                 path_probe: None,
+                source_preflight: None,
                 ingress: MediaIngress::with_screen(
                     tx_hi,
                     MediaVideoIngress::relay_frames(tx_video_frames, Arc::clone(&relay_stats)),
@@ -1236,6 +1244,9 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                 routes: None,
             },
         );
+    if independent_ready {
+        source_preflight::install_and_prepare(id, Arc::clone(&app_ref));
+    }
     id
 }
 
@@ -1770,6 +1781,7 @@ pub unsafe extern "C" fn veil_media_recv_count(peer_node_id: *const u8) -> u64 {
 #[cfg(feature = "node-embedded")]
 struct MediaChannel {
     path_probe: Option<Arc<path_probe_ffi::PathProbeContext>>,
+    source_preflight: Option<Arc<source_preflight::Context>>,
     ingress: Arc<MediaIngress>,
     /// Anonymous channels accept an out-of-band end-to-end repair request.
     /// The receiver of the media asks the sender to refresh its outbound
@@ -1811,6 +1823,9 @@ impl MediaChannel {
         self.ingress
             .closed
             .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(preflight) = &self.source_preflight {
+            preflight.cancel();
+        }
         if let Some(probe) = &self.path_probe {
             probe.cancel();
         }

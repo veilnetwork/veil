@@ -423,6 +423,7 @@ fn channel(me: [u8; 32], peer: [u8; 32], tx_key: [u8; 32], rx_key: [u8; 32]) -> 
         id,
         MediaChannel {
             path_probe: None,
+            source_preflight: None,
             ingress,
             repair_tx: Some([repair_hi, repair_video, repair_screen, repair_feedback]),
             peer,

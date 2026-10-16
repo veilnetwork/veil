@@ -1214,6 +1214,10 @@ pub(crate) fn dispatch_inbound_auto(peer: [u8; 32], payload: &[u8]) {
     // sides of a live p2p call).
     let Some(lease) = lease else {
         #[cfg(feature = "node-embedded")]
+        if crate::media_ffi::source_preflight::dispatch_without_lease(payload) {
+            return;
+        }
+        #[cfg(feature = "node-embedded")]
         crate::media_ffi::path_probe_ffi::dispatch_without_lease(payload);
         media_drop_note("no-channel", peer, payload.len());
         return;
@@ -1224,6 +1228,10 @@ pub(crate) fn dispatch_inbound_auto(peer: [u8; 32], payload: &[u8]) {
 fn dispatch_inbound_with_lease(peer: [u8; 32], payload: &[u8], lease: RecvLease) {
     let Some(plaintext) = lease.cipher.open(payload) else {
         #[cfg(feature = "node-embedded")]
+        if crate::media_ffi::source_preflight::dispatch_without_lease(payload) {
+            return;
+        }
+        #[cfg(feature = "node-embedded")]
         crate::media_ffi::path_probe_ffi::dispatch_without_lease(payload);
         media_drop_note("seal-open-failed", peer, payload.len());
         return;
@@ -1231,6 +1239,10 @@ fn dispatch_inbound_with_lease(peer: [u8; 32], payload: &[u8], lease: RecvLease)
     trace_sealed_cell("received", &peer, payload);
     #[cfg(feature = "node-embedded")]
     if crate::media_ffi::call_control_ffi::dispatch_control(lease.chan, &lease.cipher, &plaintext) {
+        return;
+    }
+    #[cfg(feature = "node-embedded")]
+    if crate::media_ffi::source_preflight::dispatch_control(lease.chan, &lease.cipher, &plaintext) {
         return;
     }
     #[cfg(feature = "node-embedded")]
