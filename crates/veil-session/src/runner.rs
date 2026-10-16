@@ -251,6 +251,12 @@ impl ParallelChannels {
             Self::Ordered(s) => s.reliable_delivery(),
         }
     }
+    fn reliable_direct_app(&self) -> bool {
+        match self {
+            Self::Quic(s) => s.reliable_direct_app(),
+            Self::Ordered(s) => s.reliable_direct_app(),
+        }
+    }
     fn reliable(&self) -> Option<&reliable_session::ReliableSession> {
         match self {
             Self::Quic(s) => s.reliable(),
@@ -4314,6 +4320,12 @@ impl SessionRunner {
                 .as_ref()
                 .and_then(|lane| lane.parallel.as_ref())
                 .is_some_and(ParallelChannels::reliable_delivery),
+        )
+        .with_direct_app(
+            realtime_lane
+                .as_ref()
+                .and_then(|lane| lane.parallel.as_ref())
+                .is_some_and(ParallelChannels::reliable_direct_app),
         );
         let mut reliable_replies = reliable_streams::Replies::new();
 

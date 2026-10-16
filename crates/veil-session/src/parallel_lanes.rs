@@ -135,6 +135,7 @@ pub struct ParallelQuicOffer {
     duplex: bool,
     reliable: bool,
     reliable_delivery: bool,
+    reliable_direct_app: bool,
 }
 
 impl ParallelQuicOffer {
@@ -146,6 +147,7 @@ impl ParallelQuicOffer {
             duplex: false,
             reliable: false,
             reliable_delivery: false,
+            reliable_direct_app: false,
         }
     }
     /// Use the runtime's single shared-listener dispatcher.
@@ -168,6 +170,11 @@ impl ParallelQuicOffer {
     /// Enable only after the authenticated reliable-Delivery capability.
     pub fn with_reliable_delivery(mut self) -> Self {
         self.reliable_delivery = true;
+        self
+    }
+    /// Enable only after the authenticated direct-App-record capability.
+    pub fn with_reliable_direct_app(mut self) -> Self {
+        self.reliable_direct_app = true;
         self
     }
 
@@ -613,6 +620,9 @@ impl ParallelSession {
     }
     pub(super) fn reliable_delivery(&self) -> bool {
         self.offer.reliable && self.offer.reliable_delivery
+    }
+    pub(super) fn reliable_direct_app(&self) -> bool {
+        self.offer.reliable && self.offer.reliable_direct_app
     }
     pub(super) fn reliable(&self) -> Option<&super::reliable_session::ReliableSession> {
         self.reliable.as_ref()
