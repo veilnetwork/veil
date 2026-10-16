@@ -3,6 +3,7 @@
 // when actual queued samples exceed the live-call latency budget.
 #ifndef VEIL_PLAYOUT_RECOVERY_H_
 #define VEIL_PLAYOUT_RECOVERY_H_
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include "api/audio/audio_frame.h"
@@ -22,9 +23,13 @@ class RecoveringNetEq final : public webrtc::NetEq {
  public:
   RecoveringNetEq(std::unique_ptr<webrtc::NetEq> inner,
                  std::shared_ptr<PlayoutRecoveryStats> stats,
-                 std::unique_ptr<webrtc::TickTimer> arrival_clock = nullptr)
-      : arrival_clock_(std::move(arrival_clock)), inner_(std::move(inner)),
-        stats_(std::move(stats)) {}
+                 std::unique_ptr<webrtc::TickTimer> arrival_clock = nullptr,
+                 int requested_maximum_delay_ms = 0)
+      : requested_maximum_delay_ms_(std::max(0, requested_maximum_delay_ms)),
+        arrival_clock_(std::move(arrival_clock)), inner_(std::move(inner)),
+        stats_(std::move(stats)) {
+    ApplyTargetCeiling();
+  }
   int GetAudio(webrtc::AudioFrame* frame, bool* muted, int* rate,
                std::optional<Operation> action) override {
     const auto entered_us = trace_.enabled() ? webrtc::TimeMicros() : 0;
@@ -38,6 +43,15 @@ class RecoveringNetEq final : public webrtc::NetEq {
     // the backlog we just removed, including across an Opus DTX interval.
     if (arrival_clock_) arrival_clock_->Increment();
     const int result = inner_->GetAudio(frame, &silent, &sample_rate, action);
+    if (result == kOK && !silent &&
+        frame->speech_type_ == webrtc::AudioFrame::kNormalSpeech) {
+      // PLC/CNG/muted output does not establish a new encoded packet size.
+      const int frame_ms = inner_->GetOperationsAndState().current_frame_size_ms;
+      if (frame_ms > 0) {
+        frame_headroom_ms_ = std::clamp(frame_ms, 10, 100);
+        ApplyTargetCeiling();
+      }
+    }
     unsigned skipped = 0;
     bool fallback = false;
     if (result == kOK && !silent &&
@@ -47,7 +61,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
       // subsequent decoder call fails.
       for (; skipped < 16;) {
         const auto state = inner_->GetOperationsAndState();
-        if (state.current_buffer_size_ms <= 120 ||
+        if (state.current_buffer_size_ms <= kRecoveryBudgetMs ||
             (inner_->SyncBufferSizeMs() < 20 && !state.next_packet_available))
           break;
         bool next_muted = false;
@@ -76,7 +90,8 @@ class RecoveringNetEq final : public webrtc::NetEq {
     if (trace_.enabled()) {
       trace_.Record(entered_us, before_ms,
           inner_->GetOperationsAndState().current_buffer_size_ms,
-          inner_->TargetDelayMs(), skipped, fallback);
+          inner_->TargetDelayMs(), skipped, fallback,
+          frame_headroom_ms_, applied_target_ceiling_ms_);
     }
     return result;
   }
@@ -92,7 +107,14 @@ class RecoveringNetEq final : public webrtc::NetEq {
   void SetFastAccelerate(bool v) override { inner_->SetFastAccelerate(v); }
   void RemoveAllPayloadTypes() override { inner_->RemoveAllPayloadTypes(); }
   bool SetMinimumDelay(int n) override { return inner_->SetMinimumDelay(n); }
-  bool SetMaximumDelay(int n) override { return inner_->SetMaximumDelay(n); }
+  bool SetMaximumDelay(int n) override {
+    if (n < 0) return inner_->SetMaximumDelay(n);
+    const int previous = requested_maximum_delay_ms_;
+    requested_maximum_delay_ms_ = n;
+    if (ApplyTargetCeiling()) return true;
+    requested_maximum_delay_ms_ = previous;
+    return false;
+  }
   bool SetBaseMinimumDelayMs(int n) override { return inner_->SetBaseMinimumDelayMs(n); }
   int GetBaseMinimumDelayMs() const override { return inner_->GetBaseMinimumDelayMs(); }
   int TargetDelayMs() const override { return inner_->TargetDelayMs(); }
@@ -107,6 +129,23 @@ class RecoveringNetEq final : public webrtc::NetEq {
   void FlushBuffers() override { inner_->FlushBuffers(); }
   int SyncBufferSizeMs() const override { return inner_->SyncBufferSizeMs(); }
  private:
+  // NetEq's target and the hard catch-up must have compatible budgets.
+  // Leave room for one ordinary decoded packet arrival; otherwise NetEq
+  // refills toward a level that this wrapper discards on every render tick.
+  // This caps the desired level, not actual storage, FEC or usable catch-up.
+  static constexpr int kRecoveryBudgetMs = 120;
+  bool ApplyTargetCeiling() {
+    int ceiling = kRecoveryBudgetMs - frame_headroom_ms_;
+    if (requested_maximum_delay_ms_ > 0)
+      ceiling = std::min(ceiling, requested_maximum_delay_ms_);
+    if (ceiling == applied_target_ceiling_ms_) return true;
+    if (!inner_->SetMaximumDelay(ceiling)) return false;
+    applied_target_ceiling_ms_ = ceiling;
+    return true;
+  }
+  int frame_headroom_ms_ = 20;
+  int requested_maximum_delay_ms_ = 0;
+  int applied_target_ceiling_ms_ = -1;
   // Outlives the controller inside inner_. Its other NetEq dependencies keep
   // their original timer for decoding/packet bookkeeping.
   std::unique_ptr<webrtc::TickTimer> arrival_clock_;
@@ -139,7 +178,8 @@ class RecoveringNetEqFactory final : public webrtc::NetEqFactory {
     ArrivalClockControllerFactory controller(clock.get());
     auto inner = std::make_unique<webrtc::NetEqImpl>(config,
         webrtc::NetEqImpl::Dependencies(env, config, std::move(decoder), controller));
-    return std::make_unique<RecoveringNetEq>(std::move(inner), stats_, std::move(clock));
+    return std::make_unique<RecoveringNetEq>(
+        std::move(inner), stats_, std::move(clock), config.max_delay_ms);
   }
  private:
   std::shared_ptr<PlayoutRecoveryStats> stats_;
