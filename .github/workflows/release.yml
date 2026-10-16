@@ -79,280 +79,54 @@ env:
   # that is already there rather than making another.
   RELEASE_DRAFT: false
 
+# Recovery only: publish verified artifacts built from immutable v0.11.41.
+# This branch must not be merged as the default release workflow.
 jobs:
-  build:
-    name: build-${{ matrix.triple }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - triple: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-          # Static-musl build: same x86_64 platform but linked against
-          # musl libc.  Produced specifically for older Linux distros
-          # whose glibc lacks symbols GitHub's ubuntu-latest images bring
-          # (the runner pins a very recent glibc — binaries built there
-          # otherwise fail on old hosts with "GLIBC_2.39 not found").
-          # musl artifact runs on any Linux kernel ≥ 3.2 regardless of
-          # the host's libc version.
-          - triple: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
-            install_musl: true
-          # aarch64 static-musl: same no-glibc portability for ARM Linux
-          # (servers, SBCs). Cross-compiled by zig via cargo-zigbuild.
-          - triple: aarch64-unknown-linux-musl
-            runner: ubuntu-latest
-            install_musl: true
-          - triple: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
-            cross_linker: aarch64-linux-gnu-gcc
-          - triple: aarch64-apple-darwin
-            runner: macos-14
-          - triple: x86_64-pc-windows-msvc
-            runner: windows-latest
-            is_windows: true
-          # Native Windows on ARM64. Cross-compiled from the x64 runner with
-          # clang-cl --target=aarch64-pc-windows-msvc.
-          - triple: aarch64-pc-windows-msvc
-            runner: windows-latest
-            is_windows: true
-
-    runs-on: ${{ matrix.runner }}
-    # A hang here used to cost the runner's six-hour default. Every leg of
-    # this matrix has finished in well under fifteen minutes.
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          fetch-depth: 0
-
-      - name: Compute SOURCE_DATE_EPOCH from HEAD
-        id: epoch
-        shell: bash
-        run: echo "value=$(git log -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with:
-          toolchain: stable
-          targets: ${{ matrix.triple }}
-
-      # rust-toolchain.toml pins the channel, and the action above installs the
-      # target for whatever IT installed — not for the pinned toolchain cargo
-      # actually runs. Add it explicitly, which resolves through the pin. This
-      # is the same step mobile-build.yml already carries, and it was missing
-      # here: this is the workflow a TAG starts, so the omission could only
-      # ever surface as a broken release. Four of the seven legs are cross
-      # targets (both musl triples, aarch64-gnu, aarch64-windows) and each
-      # would have failed on `error[E0463]: can't find crate for 'core'` —
-      # the pinned toolchain brings only the host plus what rust-toolchain.toml
-      # names, and it names one gnu-windows target for the gates.
-      - name: Add the cross target to the PINNED toolchain
-        run: rustup target add ${{ matrix.triple }}
-
-      # BOUNDED, because the unbounded form hung a v0.6.0 release leg for two
-      # and a half hours with no output at all — six of the seven targets were
-      # built and waiting on this one. Two things make apt wait forever here:
-      # the runner image runs unattended-upgrades, whose dpkg lock apt waits on
-      # silently under `-qq`, and a package that wants to ask something gets no
-      # terminal to ask it on. `DPkg::Lock::Timeout` turns the first into an
-      # error, `DEBIAN_FRONTEND` answers the second, and the retry covers the
-      # ordinary case of losing the lock race once.
-      # Twenty-five minutes, not ten, and recommends left on. Both are paid for.
-      #
-      # The ceiling is a backstop, not the defence: `DPkg::Lock::Timeout` turns
-      # the hang this step exists to bound into an error in three minutes
-      # whatever the ceiling says. What the ceiling has to outlast is an
-      # ordinary slow day on the mirror -- a sibling repository measured
-      # 15m53s for a comparable package set on this same runner host, having
-      # been killed at ten the attempt before.
-      #
-      # And `--no-install-recommends` is gone. The target libc headers reach
-      # `gcc-aarch64-linux-gnu` through Recommends, not Depends; this step only
-      # survived the flag because `g++-aarch64-linux-gnu` sits beside it and
-      # pulls them as a hard dependency. That is luck, not a contract, and the
-      # same flag cost a sibling repository a red tag on
-      # `bits/libc-header-start.h`. `libc6-dev-arm64-cross` is named outright.
-      - name: Install ARM64 Linux cross-linker
-        if: matrix.cross_linker == 'aarch64-linux-gnu-gcc'
-        timeout-minutes: 25
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          set -euo pipefail
-          apt_get() {
-            sudo apt-get -o DPkg::Lock::Timeout=180 -o Acquire::Retries=3 "$@"
-          }
-          for attempt in 1 2 3; do
-            if apt_get update -qq && \
-               apt_get install -y \
-                 gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-                 libc6-dev-arm64-cross; then
-              exit 0
-            fi
-            echo "apt attempt $attempt failed; retrying" >&2
-            sleep 15
-          done
-          echo "::error::could not install the aarch64 cross-linker in three attempts"
-          exit 1
-
-      - name: Install cargo-zigbuild (musl C/C++ cross via zig)
-        if: matrix.install_musl == true
-        run: |
-          # The release binaries default to rocksdb-cold + tls-boring, so the
-          # musl target must cross-compile RocksDB and BoringSSL (C++). The
-          # musl.cc gcc cross-toolchain host is unreliable, so use zig instead:
-          # it ships a complete clang + musl libc + libc++ and cross-compiles
-          # C/C++ deps without an external toolchain download. zig and
-          # cargo-zigbuild both install from PyPI (reliable). build-release.sh
-          # then runs `cargo zigbuild` for this target via VEIL_CARGO_CMD.
-          # Pinned for reproducibility — bump deliberately (supply-chain).
-          pip3 install --user "cargo-zigbuild==0.22.3" "ziglang==0.16.0"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          echo "VEIL_CARGO_CMD=zigbuild" >> "$GITHUB_ENV"
-
-      - name: Build release binaries (Unix)
-        if: matrix.is_windows != true
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cross_linker }}
-          # blake3 (NEON C) + rocksdb (C++) build via cc-rs; without a target
-          # CC/CXX they fall back to host clang and miss the aarch64 multiarch
-          # headers (bits/wordsize.h not found). Point them at the cross gcc.
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
-          # musl cross env (CC/CXX/AR/LINKER/BINDGEN/CMAKE_TOOLCHAIN_FILE) is set
-          # by the "Install musl cross toolchain" step via $GITHUB_ENV.
-        run: |
-          ./scripts/build-release.sh \
-            --target ${{ matrix.triple }} \
-            --source-date-epoch ${{ steps.epoch.outputs.value }}
-
-      - name: Build release binaries (Windows)
-        if: matrix.is_windows == true
-        shell: bash
-        env:
-          SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.value }}
-          # The updater's anti-downgrade floor is baked in from this at COMPILE
-          # time. The Unix leg gets it from scripts/build-release.sh, which
-          # exports it; this leg calls cargo directly and had no equivalent, so
-          # every published Windows binary carried a floor of 0 — no floor —
-          # and an old but still validly signed manifest could roll one back to
-          # whatever release it fixed. Same value as the Unix leg: the tagged
-          # commit's author date, which is what the manifest is signed with.
-          VEIL_RELEASE_UNIX: ${{ steps.epoch.outputs.value }}
-          CARGO_INCREMENTAL: 0
-          RUSTFLAGS: '--remap-path-prefix=${{ github.workspace }}=. --remap-path-prefix=C:\=/'
-          # The repo-global [env] CC=clang/CXX=clang++ (.cargo/config.toml, a
-          # rocksdb header workaround) is a gnu-driver clang and chokes on the
-          # MSVC-style flags crates add for *-windows-msvc (e.g. pqcrypto's
-          # /arch:AVX2). Use clang-cl (the MSVC driver) for this target.
-          CC_x86_64_pc_windows_msvc: clang-cl
-          CXX_x86_64_pc_windows_msvc: clang-cl
-          CC_aarch64_pc_windows_msvc: clang-cl
-          CXX_aarch64_pc_windows_msvc: clang-cl
-          # Drop the global gnu force-include (-include cstdint, .cargo/config.toml)
-          # on this target: cl rejects the gnu form, and the MSVC /FI form gets
-          # mangled by git-bash MSYS path conversion (/FI -> C:/.../FI). MSVC's STL
-          # pulls <cstdint> in transitively, so rocksdb's headers compile without it.
-          CXXFLAGS: ''
-        run: |
-          # A MISSING VEIL_RELEASE_UNIX compiles to 0 in silence — the const
-          # parser only rejects a malformed one — so the failure this whole
-          # constant exists to prevent is invisible until someone tries the
-          # downgrade. Refuse to build instead.
-          : "${VEIL_RELEASE_UNIX:?a release build must carry its release timestamp}"
-          if [ "$VEIL_RELEASE_UNIX" -le 0 ] 2>/dev/null; then
-            echo "VEIL_RELEASE_UNIX=$VEIL_RELEASE_UNIX gives no anti-downgrade floor" >&2
-            exit 1
-          fi
-          # Phase 6.50.b audit fix: switched from allow-empty-seeds to
-          # production-seeds.  Pre-fix a CI release artifact for Windows
-          # would be built without builtin seeds, producing a binary that
-          # won't bootstrap without manual peer config.  Now matches the
-          # Unix path through scripts/build-release.sh (which also
-          # defaults to production-seeds).  For testnet artifacts use
-          # a separate workflow that explicitly opts in.
-          cargo build --release --target ${{ matrix.triple }} --locked \
-            --bin veil-cli --bin ogate --bin oproxy-client --bin oproxy-server \
-            --features veil-bootstrap/production-seeds
-          stage="target/release-artifacts/${{ matrix.triple }}"
-          mkdir -p "$stage"
-          : > "$stage/sha256.txt"
-          for b in veil-cli ogate oproxy-client oproxy-server; do
-            src="target/${{ matrix.triple }}/release/${b}.exe"
-            cp "$src" "$stage/"
-            sha256sum "$stage/${b}.exe" | awk -v n="${b}.exe" '{print $1"  "n}' >> "$stage/sha256.txt"
-          done
-
-      # WRITTEN AFTER THE BUILD (audit V-02). The update-signing identity used
-      # to land on disk BEFORE `cargo build`, and cargo runs every dependency's
-      # `build.rs` with full filesystem access — so any package in the tree, at
-      # any depth, could read the key that signs updates for every user. The
-      # secret was already step-scoped; the FILE was not, and the file is what a
-      # build script reads. Nothing between the build and the signature needs
-      # it, so it now exists only for the step that uses it.
-      - name: Write release-signing identity (Linux host job only)
-        id: identity
-        if: matrix.runner == 'ubuntu-latest' && matrix.triple == 'x86_64-unknown-linux-gnu'
-        env:
-          IDENTITY_TOML: ${{ secrets.VEIL_RELEASE_IDENTITY_TOML }}
-        run: |
-          mkdir -p $RUNNER_TEMP/release-key
-          umask 077
-          printf '%s' "$IDENTITY_TOML" > $RUNNER_TEMP/release-key/identity.toml
-          echo "path=$RUNNER_TEMP/release-key/identity.toml" >> "$GITHUB_OUTPUT"
-
-      - name: Sign manifest (host build only — has signing key)
-        if: steps.identity.outputs.path != ''
-        run: |
-          set -euo pipefail
-          # A tag push hands us 'v0.4.1'; build-release.sh wants bare semver.
-          VERSION="${VERSION#v}"
-          # No automatic value for min-compatible is defensible in general, so
-          # fall back to the .0 of this minor line: 0.4.1 accepts updates from
-          # 0.4.0 up. Override with a dispatch when a release needs different
-          # reach.
-          if [ -z "$MIN_COMPAT" ]; then
-            MIN_COMPAT="${VERSION%.*}.0"
-          fi
-          echo "version=$VERSION min-compatible=$MIN_COMPAT"
-          ./scripts/build-release.sh \
-            --target ${{ matrix.triple }} \
-            --source-date-epoch ${{ steps.epoch.outputs.value }} \
-            --sign \
-            --identity ${{ steps.identity.outputs.path }} \
-            --version "$VERSION" \
-            --min-compatible-version "$MIN_COMPAT" \
-            --binary-url "https://github.com/${{ github.repository }}/releases/download/$RELEASE_TAG/veil-cli-${{ matrix.triple }}"
-        env:
-          # `min_compatible_version` has no sane automatic value, so a tag push
-          # defaults to the .0 of its own minor line: 0.4.1 accepts updates
-          # from 0.4.0 and up. Widen or narrow it with a dispatch when a
-          # release needs different reach.
-          VERSION: ${{ inputs.version || github.ref_name }}
-          MIN_COMPAT: ${{ inputs.min_compatible_version }}
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
-        with:
-          name: release-${{ matrix.triple }}
-          path: target/release-artifacts/${{ matrix.triple }}/
-          if-no-files-found: error
-
   publish:
-    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # The ONE job that writes: it attaches the artifacts to the release.
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: v0.11.41
+          fetch-depth: 0
+
+      - name: Verify immutable product tag and original successful builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          expected=2d7d3ed6624d7b0c65b28e9afe1108c73bea8c32
+          [ "$RELEASE_TAG" = v0.11.41 ]
+          [ "$(git rev-parse HEAD)" = "$expected" ]
+          [ "$(gh api repos/$GITHUB_REPOSITORY/actions/runs/38838142562 --jq .head_sha)" = "$expected" ]
+          gh run view 38838142562 --repo "$GITHUB_REPOSITORY" --json jobs \
+            --jq '[.jobs[] | select(.name | startswith("build-"))] | length == 7 and all(.[]; .conclusion == "success")' \
+            | grep -qx true
+
 
       - name: Download all artifacts
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           path: artifacts/
+          pattern: release-*
+          run-id: 38838142562
+          github-token: ${{ github.token }}
+
+      - name: Verify the original artifacts against their checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          artifacts=(artifacts/release-*)
+          [ "${#artifacts[@]}" -eq 7 ]
+          for directory in "${artifacts[@]}"; do
+            (cd "$directory" && sha256sum --check sha256.txt)
+          done
 
       - name: Rename per-triple for release upload
         shell: bash
@@ -444,7 +218,7 @@ jobs:
           # and as a pattern v0.1.0 would match the heading of v0.10.0. The
           # em-dash that follows the version is part of the needle for the
           # same reason -- v0.6.0 must not match v0.6.0-rc1.
-          awk -v v="$RELEASE_TAG" 'index($0, "## " v " —") == 1 {f=1; print; next}
+          awk -v v="$RELEASE_TAG" '(index($0, "## " v " —") == 1 || index($0, "## [" substr(v,2) "] -") == 1) {f=1; print; next}
                                    f && /^## / {exit}
                                    f {print}' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
           if [ ! -s "$RUNNER_TEMP/notes.md" ]; then
