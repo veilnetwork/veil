@@ -2606,14 +2606,24 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
             id[2 * i + 1] = hex[entry.second->id[i] & 15];
           }
           id[64] = '\0';
-          char receiver[320];
+          char receiver[1024];
           const int size = std::snprintf(receiver, sizeof(receiver),
               "\"%s\":{\"audio_rx_pkts\":%llu,\"audio_delay_ms\":%u,"
               "\"audio_filtered_delay_ms\":%u,"
-              "\"audio_rx_native_age_ms\":%lld,\"audio_interruption_count\":%d}", id,
+              "\"audio_rx_native_age_ms\":%lld,\"audio_interruption_count\":%d,"
+              "\"audio_interruption_duration_ms\":%d,"
+              "\"audio_concealed_samples\":%llu,\"audio_concealment_events\":%llu,"
+              "\"audio_output_emitted_samples\":%llu,\"audio_total_samples_received\":%llu,"
+              "\"audio_discarded_packets\":%llu,\"audio_jb_target_ms\":%u}", id,
               static_cast<unsigned long long>(sample.packets_received),
               delay_ms, sample.delay_estimate_ms, static_cast<long long>(native_age_ms),
-              sample.interruption_count);
+              sample.interruption_count, sample.total_interruption_duration_ms,
+              static_cast<unsigned long long>(sample.concealed_samples),
+              static_cast<unsigned long long>(sample.concealment_events),
+              static_cast<unsigned long long>(sample.jitter_buffer_emitted_count),
+              static_cast<unsigned long long>(sample.total_samples_received),
+              static_cast<unsigned long long>(sample.packets_discarded),
+              sample.jitter_buffer_preferred_ms);
           if (size <= 0 || static_cast<size_t>(size) >= sizeof(receiver)) continue;
           if (!audio_receivers.empty()) audio_receivers += ',';
           audio_receivers.append(receiver, static_cast<size_t>(size));

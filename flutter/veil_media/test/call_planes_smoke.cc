@@ -210,6 +210,14 @@ static int64_t group_audio_age(VeilGroupMediaEngine* engine, const uint8_t peer[
   const char* receiver = std::strstr(json, prefix.c_str());
   assert(receiver);
   assert(std::strstr(receiver, "\"audio_interruption_count\":"));
+  // Group diagnostics must retain loss/concealment, not only the number of
+  // deliberate catch-up pulls. A smaller buffer can trade one for the other.
+  for (const char* metric : {"audio_interruption_duration_ms", "audio_concealed_samples",
+      "audio_concealment_events", "audio_output_emitted_samples",
+      "audio_total_samples_received", "audio_discarded_packets", "audio_jb_target_ms"}) {
+    const std::string key = std::string("\"") + metric + "\":";
+    assert(std::strstr(receiver, key.c_str()));
+  }
   const char* at = std::strstr(receiver, "\"audio_rx_native_age_ms\":");
   assert(at);
   const auto age = std::strtoll(at + std::strlen("\"audio_rx_native_age_ms\":"), nullptr, 10);
