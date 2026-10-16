@@ -123,6 +123,7 @@ pub(crate) struct SharedWriter {
     stream_credits: Option<SharedStreamCredits>,
     local_source_feedback: bool,
     local_lossy_work: bool,
+    local_datagram_preparation: bool,
 }
 
 type SharedStreamCredits =
@@ -172,6 +173,7 @@ impl SharedWriter {
             stream_credits: None,
             local_source_feedback: false,
             local_lossy_work: false,
+            local_datagram_preparation: false,
         }
     }
 
@@ -186,6 +188,11 @@ impl SharedWriter {
 
     pub(crate) fn with_local_lossy_work(mut self, enabled: bool) -> Self {
         self.local_lossy_work = enabled;
+        self
+    }
+
+    fn with_local_datagram_preparation(mut self, enabled: bool) -> Self {
+        self.local_datagram_preparation = enabled;
         self
     }
     pub(crate) fn supports_local_lossy_work(&self) -> bool {
@@ -845,6 +852,10 @@ pub(crate) struct DispatchTable {
     /// S2.A: pending oneshot replies for `PnetStatusQuery`.
     pub pending_pnet_status:
         std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<PnetStatus>)>,
+    pub pending_local_preparation: std::collections::VecDeque<(
+        u32,
+        tokio::sync::oneshot::Sender<Option<veil_proto::ipc::LocalDatagramChannelState>>,
+    )>,
     /// pending oneshot replies for `ListenTransportsQuery` (real-P2P
     /// epic, Stage B: external-address candidates for endpoint exchange).
     pub pending_listen_transports:
@@ -1035,6 +1046,7 @@ impl DispatchTable {
             pending_node_identity: std::collections::VecDeque::new(),
             pending_peers_list: std::collections::VecDeque::new(),
             pending_pnet_status: std::collections::VecDeque::new(),
+            pending_local_preparation: std::collections::VecDeque::new(),
             pending_listen_transports: std::collections::VecDeque::new(),
             pending_attempt_hole_punch: std::collections::VecDeque::new(),
             pending_bootstrap_join: std::collections::VecDeque::new(),
@@ -1106,7 +1118,8 @@ impl VeilClient {
             version: IPC_PROTOCOL_VERSION,
             flags: veilcore::proto::ipc::IPC_CAP_STREAM_WRITE_CREDIT
                 | veilcore::proto::ipc::IPC_CAP_LOCAL_SOURCE_FEEDBACK
-                | veilcore::proto::ipc::IPC_CAP_LOCAL_LOSSY_WORK,
+                | veilcore::proto::ipc::IPC_CAP_LOCAL_LOSSY_WORK
+                | veilcore::proto::ipc::IPC_CAP_LOCAL_DATAGRAM_PREPARATION,
         };
         tokio::time::timeout(
             timeout,
@@ -1164,6 +1177,9 @@ impl VeilClient {
             )
             .with_local_lossy_work(
                 hdr.flags & veilcore::proto::ipc::IPC_HELLO_OK_LOCAL_LOSSY_WORK != 0,
+            )
+            .with_local_datagram_preparation(
+                hdr.flags & veilcore::proto::ipc::IPC_HELLO_OK_LOCAL_DATAGRAM_PREPARATION != 0,
             );
         let dispatch = Arc::new(Mutex::new(DispatchTable::new()));
 
@@ -2295,6 +2311,74 @@ impl VeilClient {
         await_rpc_reply(rx, "pnet_status reply").await
     }
 
+    /// Prepare an owned local producer without sending application data.
+    /// None means the node's local query quota asks the caller to retry.
+    /// Unsupported also covers legacy nodes/links; it must not imply readiness.
+    pub async fn prepare_local_datagram_channel(
+        &self,
+        source_app_id: [u8; 32],
+        peer_node_id: [u8; 32],
+        local_lane: u8,
+        relayed: bool,
+    ) -> Result<Option<veil_proto::ipc::LocalDatagramChannelState>, ClientError> {
+        self.local_datagram_preparation(source_app_id, peer_node_id, local_lane, relayed, true)
+            .await
+    }
+
+    /// Poll a prior preparation without invalidating its readiness again.
+    pub async fn local_datagram_channel_state(
+        &self,
+        source_app_id: [u8; 32],
+        peer_node_id: [u8; 32],
+        local_lane: u8,
+        relayed: bool,
+    ) -> Result<Option<veil_proto::ipc::LocalDatagramChannelState>, ClientError> {
+        self.local_datagram_preparation(source_app_id, peer_node_id, local_lane, relayed, false)
+            .await
+    }
+
+    async fn local_datagram_preparation(
+        &self,
+        source_app_id: [u8; 32],
+        peer_node_id: [u8; 32],
+        local_lane: u8,
+        relayed: bool,
+        refresh: bool,
+    ) -> Result<Option<veil_proto::ipc::LocalDatagramChannelState>, ClientError> {
+        if !self.writer.local_datagram_preparation {
+            return Ok(Some(
+                veil_proto::ipc::LocalDatagramChannelState::Unsupported,
+            ));
+        }
+        let payload = veilcore::proto::ipc::PrepareLocalDatagramPayload {
+            source_app_id,
+            peer_node_id,
+            local_lane,
+            relayed,
+            refresh,
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
+        {
+            let mut d = self.dispatch.lock().await;
+            prune_closed(&mut d.pending_local_preparation);
+            if d.pending_local_preparation.len() >= MAX_PENDING_OPS {
+                return Err(ClientError::Protocol(
+                    "local preparation queue at cap".into(),
+                ));
+            }
+            d.pending_local_preparation.push_back((request_id, tx));
+        }
+        self.writer
+            .write_request_frame(
+                LocalAppMsg::PrepareLocalDatagram as u16,
+                request_id,
+                &payload.encode(),
+            )
+            .await?;
+        await_rpc_reply(rx, "local datagram preparation reply").await
+    }
+
     /// Snapshot the daemon's current listener URIs.
     ///
     /// After a server-reflexive NAT probe the daemon rewrites wildcard
@@ -3324,6 +3408,23 @@ async fn reader_task(
                     let mut d = dispatch.lock().await;
                     if let Some(tx) = take_pending(&mut d.pending_peers_list, hdr.request_id) {
                         let _ = tx.send(entries);
+                    }
+                }
+            }
+            LocalAppMsg::PrepareLocalDatagramResult => {
+                use veil_proto::ipc::LocalDatagramChannelState as State;
+                let reply = match body.as_slice() {
+                    [0] => Some(Some(State::Unsupported)),
+                    [1] => Some(Some(State::Warming)),
+                    [2] => Some(Some(State::Ready)),
+                    [3] => Some(None), // bounded local query quota
+                    _ => None,
+                };
+                if let Some(reply) = reply {
+                    let mut d = dispatch.lock().await;
+                    if let Some(tx) = take_pending(&mut d.pending_local_preparation, hdr.request_id)
+                    {
+                        let _ = tx.send(reply);
                     }
                 }
             }

@@ -2255,6 +2255,14 @@ async fn handle_ipc_client(
     if local_lossy_work {
         hello_header.flags |= veil_proto::ipc::IPC_HELLO_OK_LOCAL_LOSSY_WORK;
     }
+    let local_datagram_preparation =
+        hello.flags & veil_proto::ipc::IPC_CAP_LOCAL_DATAGRAM_PREPARATION != 0
+            && session_tx_registry
+                .as_ref()
+                .is_some_and(|reg| reg.supports_local_datagram_preparation());
+    if local_datagram_preparation {
+        hello_header.flags |= veil_proto::ipc::IPC_HELLO_OK_LOCAL_DATAGRAM_PREPARATION;
+    }
 
     stream
         .write_all(&codec::encode_header(&hello_header))
@@ -2958,6 +2966,17 @@ async fn handle_ipc_client(
                                 hdr.flags & veil_proto::ipc::IPC_HEADER_SHORT_DATAGRAM != 0,
                             ).await?;
                         }
+                    }
+                    Ok(LocalAppMsg::PrepareLocalDatagram) => {
+                        let allowed = client_state.allow_query();
+                        let state = crate::handlers::source_preparation::prepare(
+                            &body, local_datagram_preparation && allowed,
+                            |id| client_state.has_app_id(id),
+                            session_tx_registry.as_deref(), route_cache.as_deref(),
+                        );
+                        let reply = if allowed { state as u8 } else { 3 };
+                        write_frame_wh(&mut wh, FrameFamily::LocalApp as u8,
+                            LocalAppMsg::PrepareLocalDatagramResult as u16, &[reply]).await?;
                     }
                     Ok(LocalAppMsg::LocalSourceFeedback) => {
                         crate::handlers::source_feedback::handle_local_source_feedback(

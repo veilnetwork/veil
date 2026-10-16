@@ -11,12 +11,7 @@ pub(crate) const LOCAL_DATAGRAM_PRIORITIES: [u8; 5] = [
     crate::LOCAL_SIGNALING_LANE,
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LocalDatagramChannelState {
-    Unsupported,
-    Warming,
-    Ready,
-}
+pub use veil_types::LocalDatagramChannelState;
 
 #[derive(Debug, Default)]
 pub(crate) struct LocalDatagramStatus {
@@ -85,6 +80,23 @@ impl LocalDatagramStatus {
             self.notify.notify_one();
         }
         current
+    }
+
+    /// A new caller must not reuse a Ready snapshot left by an idle/closed
+    /// child. Require a runner check before subsequent polling can see Ready.
+    pub(crate) fn request_fresh(&self, local_lane: u8) -> LocalDatagramChannelState {
+        let Some(bit) = bit(local_lane) else {
+            return LocalDatagramChannelState::Unsupported;
+        };
+        let mut state = lock!(self.state);
+        if state.owner.strong_count() == 0 || state.supported & bit == 0 {
+            return LocalDatagramChannelState::Unsupported;
+        }
+        state.ready &= !bit;
+        state.requested |= bit;
+        drop(state);
+        self.notify.notify_one();
+        LocalDatagramChannelState::Warming
     }
 
     pub(crate) fn pending(&self) -> u8 {
@@ -168,6 +180,31 @@ impl Drop for LocalDatagramLease {
 mod tests {
     use super::*;
     use LocalDatagramChannelState::*;
+
+    #[test]
+    fn a_new_preparation_requires_a_runner_check_before_reusing_ready() {
+        let status = Arc::new(LocalDatagramStatus::default());
+        let lease = status.activate();
+        lease.mark(veil_proto::priority::REALTIME, true);
+        assert_eq!(status.state(veil_proto::priority::REALTIME), Ready);
+        assert_eq!(
+            status.request_fresh(veil_proto::priority::REALTIME),
+            Warming
+        );
+        assert_eq!(status.state(veil_proto::priority::REALTIME), Warming);
+        assert_ne!(status.pending(), 0);
+        lease.mark(veil_proto::priority::REALTIME, true);
+        assert_eq!(status.request(veil_proto::priority::REALTIME), Ready);
+        assert_eq!(
+            status.request_fresh(veil_proto::priority::REALTIME),
+            Warming
+        );
+        drop(lease);
+        assert_eq!(
+            status.request_fresh(veil_proto::priority::REALTIME),
+            Unsupported
+        );
+    }
 
     #[test]
     fn generic_transport_readiness_expires_and_does_not_claim_independent_support() {

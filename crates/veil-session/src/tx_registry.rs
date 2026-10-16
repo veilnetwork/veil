@@ -695,6 +695,19 @@ impl SessionTxRegistry {
     }
 
     /// Local endpoint readiness only; never a relay role or service request.
+    pub fn refresh_local_datagram_channel(
+        &self,
+        peer_id: &NodeIdBytes,
+        local_lane: u8,
+    ) -> crate::LocalDatagramChannelState {
+        self.senders
+            .get(peer_id)
+            .map_or(crate::LocalDatagramChannelState::Unsupported, |entry| {
+                entry.tx.refresh_local_datagram_channel(local_lane)
+            })
+    }
+
+    /// Local endpoint readiness only; never a relay role or service request.
     pub fn local_datagram_channel_state(
         &self,
         peer_id: &NodeIdBytes,

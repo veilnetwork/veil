@@ -11,6 +11,7 @@
 //! | `AppIpcHelloErrPayload`| `AppHelloErr` | node → client |
 
 use super::ProtoError;
+pub use veil_types::LocalDatagramChannelState;
 
 /// Current IPC protocol version spoken by this build. // STABLE v1
 pub const IPC_PROTOCOL_VERSION: u16 = 1;
@@ -40,6 +41,110 @@ pub const IPC_HELLO_OK_LOCAL_SOURCE_FEEDBACK: u16 = 0x0100;
 /// Whole local lossy work admission, stripped before network encoding.
 pub const IPC_CAP_LOCAL_LOSSY_WORK: u32 = 4;
 pub const IPC_HELLO_OK_LOCAL_LOSSY_WORK: u16 = 0x0200;
+/// Prepare authenticated source channels through owned local IPC only.
+pub const IPC_CAP_LOCAL_DATAGRAM_PREPARATION: u32 = 8;
+pub const IPC_HELLO_OK_LOCAL_DATAGRAM_PREPARATION: u16 = 0x0400;
+
+/// No content or media role is sent over the network by this local request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrepareLocalDatagramPayload {
+    pub source_app_id: [u8; 32],
+    pub peer_node_id: [u8; 32],
+    pub local_lane: u8,
+    /// Select the same existing first-hop candidates as an ordinary relay
+    /// media send. False prepares only an admitted direct session/alias.
+    pub relayed: bool,
+    /// Start a fresh readiness check; false polls the existing request.
+    pub refresh: bool,
+}
+
+impl PrepareLocalDatagramPayload {
+    pub const WIRE_SIZE: usize = 66;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::WIRE_SIZE);
+        out.extend_from_slice(&self.source_app_id);
+        out.extend_from_slice(&self.peer_node_id);
+        out.push(self.local_lane);
+        out.push(u8::from(self.relayed) | (u8::from(self.refresh) << 1));
+        out
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self, ProtoError> {
+        if body.len() != Self::WIRE_SIZE
+            || body[65] > 3
+            || !matches!(
+                body[64],
+                crate::priority::REALTIME
+                    | crate::priority::BULK
+                    | crate::priority::BACKGROUND
+                    | LOCAL_RECOVERABLE_DATA_LANE
+                    | LOCAL_SIGNALING_LANE
+            )
+        {
+            return Err(ProtoError::Malformed(
+                "invalid local datagram preparation".into(),
+            ));
+        }
+        Ok(Self {
+            source_app_id: body[..32].try_into().unwrap(),
+            peer_node_id: body[32..64].try_into().unwrap(),
+            local_lane: body[64],
+            relayed: body[65] & 1 != 0,
+            refresh: body[65] & 2 != 0,
+        })
+    }
+}
+
+#[cfg(test)]
+mod local_preparation_tests {
+    use super::*;
+
+    #[test]
+    fn preparation_rejects_unknown_lanes_flags_and_nonexact_lengths() {
+        for lane in [
+            crate::priority::REALTIME,
+            crate::priority::BULK,
+            crate::priority::BACKGROUND,
+            LOCAL_RECOVERABLE_DATA_LANE,
+            LOCAL_SIGNALING_LANE,
+        ] {
+            for (relayed, refresh) in [(false, false), (false, true), (true, false), (true, true)] {
+                let request = PrepareLocalDatagramPayload {
+                    source_app_id: [1; 32],
+                    peer_node_id: [2; 32],
+                    local_lane: lane,
+                    relayed,
+                    refresh,
+                };
+                let encoded = request.encode();
+                assert_eq!(
+                    PrepareLocalDatagramPayload::decode(&encoded).unwrap(),
+                    request
+                );
+                for size in 0..encoded.len() {
+                    assert!(PrepareLocalDatagramPayload::decode(&encoded[..size]).is_err());
+                }
+                let mut trailing = encoded.clone();
+                trailing.push(0);
+                assert!(PrepareLocalDatagramPayload::decode(&trailing).is_err());
+                let mut unknown = encoded.clone();
+                unknown[65] = 4;
+                assert!(PrepareLocalDatagramPayload::decode(&unknown).is_err());
+            }
+        }
+        for lane in [crate::priority::INTERACTIVE, 5, 7, 255] {
+            let request = PrepareLocalDatagramPayload {
+                source_app_id: [1; 32],
+                peer_node_id: [2; 32],
+                local_lane: lane,
+                relayed: false,
+                refresh: false,
+            };
+            assert!(PrepareLocalDatagramPayload::decode(&request.encode()).is_err());
+        }
+    }
+}
 /// Source bytes an IPC stream may enqueue before the node admits them. This is
 /// separate from the receiver's network/local-pair read window.
 pub const IPC_STREAM_WRITE_WINDOW: u32 = 8 * 1024;
