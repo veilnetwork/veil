@@ -138,6 +138,13 @@ int veil_media_group_engine_set_video_bitrate(VeilGroupMediaEngine *engine,
  * Existing 20 ms video-worker scheduling wait and debug pin apply. */
 int veil_media_group_engine_set_video_budget(VeilGroupMediaEngine *engine,
                                         int max_bitrate_kbps, double max_fps);
+/* Endpoint-local Opus control, before or during audio: 20/40/60 ms packets
+ * and 16000..32000 bit/s payload. Reconfigures the existing sender, preserving
+ * RTP state, microphone and receive streams. Only waits on the audio worker
+ * (20 ms scheduling bound); ERR_STATE means the requested budget was not
+ * confirmed. No network role, priority or synthetic bandwidth report is sent. */
+int veil_media_group_engine_set_audio_budget(VeilGroupMediaEngine *engine,
+                                            int packet_ms, int payload_bps);
 /* Optional endpoint-local send pause (0/1). Camera/screen capture, preview,
  * audio, RTCP and receiving video remain live. Already queued Veil packets
  * cannot be recalled. Pausing never waits on the video worker; resuming

@@ -997,6 +997,22 @@ int Function(Pointer<VeilGroupMediaEngineHandle>, int, double)?
 final veilMediaGroupEngineSetVideoBudget =
     _lookupveilMediaGroupEngineSetVideoBudget();
 
+// Optional measured group audio control; older engines retain their codec.
+int Function(Pointer<VeilGroupMediaEngineHandle>, int, int)?
+    _lookupGroupAudioBudget() {
+  try {
+    return nativeLib.lookupFunction<
+        Int32 Function(Pointer<VeilGroupMediaEngineHandle>, Int32, Int32),
+        int Function(Pointer<VeilGroupMediaEngineHandle>, int, int)>(
+      'veil_media_group_engine_set_audio_budget',
+    );
+  } on ArgumentError {
+    return null;
+  }
+}
+
+final veilMediaGroupEngineSetAudioBudget = _lookupGroupAudioBudget();
+
 // Optional endpoint-local video pause; old native libraries keep low-rate fallback.
 int Function(Pointer<VeilMediaEngineHandle>, int)?
     _lookupveilMediaEngineSetVideoSendPaused() {
