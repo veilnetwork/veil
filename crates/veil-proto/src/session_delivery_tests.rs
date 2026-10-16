@@ -76,3 +76,31 @@ fn zero_extensions_retain_the_original_three_byte_encoding() {
         vec![caps.roles_supported, caps.flags, caps.discovery_mode]
     );
 }
+
+#[test]
+fn direct_app_permission_is_independent_and_needs_the_authenticated_parent_capability() {
+    let mut caps = modern();
+    assert!(!caps.supports_reliable_direct_app());
+    caps.extra_flags2 = cap_extra_flags2::SUPPORTS_RELIABLE_DIRECT_APP;
+    let wire = caps.encode();
+    assert_eq!(wire.len(), 37);
+    let direct = CapabilitiesPayload::decode(&wire).unwrap();
+    assert!(direct.supports_reliable_direct_app());
+    assert!(!direct.supports_reliable_delivery());
+    for len in 20..37 {
+        assert!(
+            !CapabilitiesPayload::decode(&wire[..len])
+                .unwrap()
+                .supports_reliable_direct_app()
+        );
+    }
+    let mut legacy = caps.clone();
+    legacy.extra_flags2 = 0;
+    assert_eq!(&wire[..20], legacy.encode());
+    caps.extra_flags &= !cap_extra_flags::SUPPORTS_RELIABLE_PARALLEL;
+    assert!(
+        !CapabilitiesPayload::decode(&caps.encode())
+            .unwrap()
+            .supports_reliable_direct_app()
+    );
+}

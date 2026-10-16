@@ -1239,6 +1239,7 @@ fn local_capabilities(
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_PARALLEL_ORDERED;
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_RELIABLE_PARALLEL;
     caps.extra_flags2 |= veil_proto::session::cap_extra_flags2::SUPPORTS_RELIABLE_DELIVERY;
+    caps.extra_flags2 |= veil_proto::session::cap_extra_flags2::SUPPORTS_RELIABLE_DIRECT_APP;
     caps
 }
 
@@ -2448,8 +2449,10 @@ mod tests {
         assert!(r2.remote_capabilities.supports_direct_app_chunks());
         assert!(r1.remote_capabilities.supports_reliable_parallel());
         assert!(r1.remote_capabilities.supports_reliable_delivery());
+        assert!(r1.remote_capabilities.supports_reliable_direct_app());
         assert!(r2.remote_capabilities.supports_reliable_parallel());
         assert!(r2.remote_capabilities.supports_reliable_delivery());
+        assert!(r2.remote_capabilities.supports_reliable_direct_app());
 
         // Node IDs are BLAKE3(verifying_key_bytes), not BLAKE3(seed).
         let id_a = test_identity(0xAA).node_id;
@@ -3186,8 +3189,10 @@ mod tests {
         assert!(srv2.remote_caps_stated && cli2.remote_caps_stated);
         assert!(srv2.remote_capabilities.supports_reliable_parallel());
         assert!(srv2.remote_capabilities.supports_reliable_delivery());
+        assert!(srv2.remote_capabilities.supports_reliable_direct_app());
         assert!(cli2.remote_capabilities.supports_reliable_parallel());
         assert!(cli2.remote_capabilities.supports_reliable_delivery());
+        assert!(cli2.remote_capabilities.supports_reliable_direct_app());
         for result in [&srv2, &cli2] {
             assert!(result.remote_capabilities.supports_circuit_datagrams());
             assert!(result.remote_capabilities.supports_shared_parallel_quic());

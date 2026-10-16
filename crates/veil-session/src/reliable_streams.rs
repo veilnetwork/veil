@@ -1,4 +1,4 @@
-//! Whole App streams and negotiated self-contained Delivery records.
+//! Whole App streams and negotiated self-contained Delivery/direct App records.
 //! No stream striping, midstream fallback or remote scheduling class.
 use super::*;
 use std::collections::HashMap;
@@ -18,6 +18,24 @@ fn delivery_record(h: &FrameHeader) -> bool {
                 | DeliveryMsg::RecursiveRelay
                 | DeliveryMsg::RelayPath)
         )
+}
+
+// These messages own no App stream sequence space. The application/ratchet/
+// chunk reassembler still validates their bytes through the canonical peer.
+fn direct_app_record(h: &FrameHeader, body: &[u8]) -> bool {
+    if h.family != FrameFamily::App as u8 || h.stream_id != 0 || h.body_len as usize != body.len() {
+        return false;
+    }
+    match AppMsg::try_from(h.msg_type) {
+        Ok(AppMsg::AppSendUnopenable) => body.is_empty(),
+        Ok(AppMsg::AppSend | AppMsg::AppSendSealed | AppMsg::AppSendChunk) => {
+            // Match AppSendPayload's framing without copying its data or
+            // interpreting an application's bytes to choose a transport.
+            body.len() >= 72
+                && u32::from_be_bytes(body[68..72].try_into().unwrap()) as usize <= body.len() - 72
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +60,7 @@ struct Pin {
 pub(super) struct ReliableStreams {
     enabled: bool,
     delivery: bool,
+    direct_app: bool,
     pins: HashMap<u32, Pin>,
     sink: Arc<dyn crate::dispatcher_sink::DispatcherSink>,
     peer: NodeIdBytes,
@@ -98,6 +117,7 @@ impl ReliableStreams {
         Self {
             enabled,
             delivery: false,
+            direct_app: false,
             pins: HashMap::new(),
             sink,
             peer,
@@ -109,6 +129,11 @@ impl ReliableStreams {
         self
     }
 
+    pub(super) fn with_direct_app(mut self, negotiated: bool) -> Self {
+        self.direct_app = self.enabled && negotiated;
+        self
+    }
+
     pub(super) fn route_with_local_class(
         &self,
         frame: &[u8],
@@ -117,10 +142,10 @@ impl ReliableStreams {
     ) -> Route {
         // Only the originating local outbox classification can retain network
         // control on the parent. No incoming priority or media role is trusted.
-        if self.delivery
-            && local_priority != crate::LOCAL_NETWORK_CONTROL_LANE
+        if local_priority != crate::LOCAL_NETWORK_CONTROL_LANE
             && let Ok(h) = decode_header(frame)
-            && delivery_record(&h)
+            && ((self.delivery && delivery_record(&h))
+                || (self.direct_app && direct_app_record(&h, &frame[HEADER_SIZE..])))
             // Older peers may send Delivery bodies larger than this child's
             // fixed record limit. Keep their existing parent carrier rather
             // than retiring a healthy child and dropping the envelope.
@@ -203,7 +228,8 @@ impl ReliableStreams {
         // These records carry their own message/chunk identities; they do not
         // own App stream pins. The dispatcher still validates the full payload,
         // signatures, replay state and peer budgets using the canonical peer.
-        if self.delivery && delivery_record(h) {
+        if (self.delivery && delivery_record(h)) || (self.direct_app && direct_app_record(h, body))
+        {
             return Ok(());
         }
         if h.family == FrameFamily::App as u8 && h.msg_type == AppMsg::AppWindowUpdate as u16 {

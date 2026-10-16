@@ -219,6 +219,30 @@ mod tests {
     }
 
     #[test]
+    fn direct_app_permission_is_current_authenticated_resume_metadata() {
+        let mut caps = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Core);
+        caps.flags = u8::MAX;
+        caps.extra_flags = u8::MAX;
+        caps.extra_flags2 = veil_proto::session::cap_extra_flags2::SUPPORTS_RELIABLE_DIRECT_APP;
+        let mut attach = vec![0; AttachPayload::WIRE_SIZE];
+        append(&mut attach, &caps, &[3; 32], &[1; 32], &[2; 32]);
+        let decoded = verify(&attach, &[3; 32], &[1; 32], &[2; 32])
+            .unwrap()
+            .unwrap();
+        assert!(decoded.supports_reliable_direct_app());
+        assert!(!decoded.supports_reliable_delivery());
+        let second = AttachPayload::WIRE_SIZE + 4 + VALUE_LEN;
+        let legacy = verify(&attach[..second], &[3; 32], &[1; 32], &[2; 32])
+            .unwrap()
+            .unwrap();
+        assert!(!legacy.supports_reliable_direct_app());
+        let mut forged = attach.clone();
+        forged[second + 4 + MARKER2.len() + 1] ^=
+            veil_proto::session::cap_extra_flags2::SUPPORTS_RELIABLE_DIRECT_APP;
+        assert!(verify(&forged, &[3; 32], &[1; 32], &[2; 32]).is_err());
+    }
+
+    #[test]
     fn legacy_attach_and_unknown_trailers_do_not_enable_capabilities() {
         let mut attach = vec![0; AttachPayload::WIRE_SIZE];
         append_resume_nonce_to_attach(&mut attach, &[8; 32]);

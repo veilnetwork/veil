@@ -31,6 +31,7 @@ pub struct ParallelOrderedOffer {
     diagnostics: Arc<ParallelDiagnostics>,
     reliable: bool,
     reliable_delivery: bool,
+    reliable_direct_app: bool,
 }
 
 impl ParallelOrderedOffer {
@@ -43,6 +44,7 @@ impl ParallelOrderedOffer {
             diagnostics: Arc::default(),
             reliable: false,
             reliable_delivery: false,
+            reliable_direct_app: false,
         }
     }
     pub fn diagnostics(&self) -> Arc<ParallelDiagnostics> {
@@ -56,6 +58,11 @@ impl ParallelOrderedOffer {
     /// Enable only after the authenticated reliable-Delivery capability.
     pub fn with_reliable_delivery(mut self) -> Self {
         self.reliable_delivery = true;
+        self
+    }
+    /// Enable only after the authenticated direct-App-record capability.
+    pub fn with_reliable_direct_app(mut self) -> Self {
+        self.reliable_direct_app = true;
         self
     }
 }
@@ -316,6 +323,9 @@ impl OrderedSession {
     }
     pub(super) fn reliable_delivery(&self) -> bool {
         self.offer.reliable && self.offer.reliable_delivery
+    }
+    pub(super) fn reliable_direct_app(&self) -> bool {
+        self.offer.reliable && self.offer.reliable_direct_app
     }
     pub(super) fn reliable(&self) -> Option<&super::reliable_session::ReliableSession> {
         self.reliable.as_ref()

@@ -406,6 +406,9 @@ pub mod cap_extra_flags2 {
     /// Self-contained Delivery records on the existing authenticated reliable
     /// child. Never a traffic role, priority or change to relay admission.
     pub const SUPPORTS_RELIABLE_DELIVERY: u8 = 1;
+    /// Streamless AppSend/Sealed/Chunk records and their re-key reply on the
+    /// existing reliable child. Older Delivery-only children reject these.
+    pub const SUPPORTS_RELIABLE_DIRECT_APP: u8 = 1 << 1;
 }
 
 #[cfg(test)]
@@ -581,6 +584,12 @@ impl CapabilitiesPayload {
     pub fn supports_reliable_delivery(&self) -> bool {
         self.supports_reliable_parallel()
             && self.extra_flags2 & cap_extra_flags2::SUPPORTS_RELIABLE_DELIVERY != 0
+    }
+
+    /// Direct application records need a separate permission from Delivery.
+    pub fn supports_reliable_direct_app(&self) -> bool {
+        self.supports_reliable_parallel()
+            && self.extra_flags2 & cap_extra_flags2::SUPPORTS_RELIABLE_DIRECT_APP != 0
     }
 
     // ── Capability helpers ───────────────────────────────────────────────
