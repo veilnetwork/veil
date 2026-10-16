@@ -146,6 +146,7 @@ mod integration_tests {
         fsm.on_identity_received(remote_identity);
 
         let caps = CapabilitiesPayload {
+            extra_flags2: 0,
             roles_supported: role_bits::LEAF,
             flags: cap_flags::CAN_RELAY,
             extra_flags: 0,

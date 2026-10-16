@@ -245,6 +245,12 @@ impl ParallelChannels {
             Self::Ordered(s) => s.note_reliable_frame(canonical_full),
         }
     }
+    fn reliable_delivery(&self) -> bool {
+        match self {
+            Self::Quic(s) => s.reliable_delivery(),
+            Self::Ordered(s) => s.reliable_delivery(),
+        }
+    }
     fn reliable(&self) -> Option<&reliable_session::ReliableSession> {
         match self {
             Self::Quic(s) => s.reliable(),
@@ -4298,6 +4304,12 @@ impl SessionRunner {
             reliable_enabled,
             self.dispatcher.clone(),
             self.peer_id,
+        )
+        .with_delivery(
+            realtime_lane
+                .as_ref()
+                .and_then(|lane| lane.parallel.as_ref())
+                .is_some_and(ParallelChannels::reliable_delivery),
         );
         let mut reliable_replies = reliable_streams::Replies::new();
 
@@ -5459,7 +5471,7 @@ impl SessionRunner {
                             }
                             return HeadAdmission::FlushBatch;
                         }
-                        let route = reliable_streams.route(frame, reliable_id);
+                        let route = reliable_streams.route_with_local_class(frame, reliable_id, priority);
                         let reservation = match route {
                             Route::Failed => { selected_route = route; return HeadAdmission::Allow; },
                             Route::Child(id) => {

@@ -309,6 +309,8 @@ pub struct CapabilitiesPayload {
     pub flags: u8,
     /// Optional authenticated capability extension; absent on legacy peers.
     pub extra_flags: u8,
+    /// Second explicitly marked extension; legacy peers leave this zero.
+    pub extra_flags2: u8,
     /// peer's preferred DHT-discoverability — controls
     /// whether `handle_find_node_v2` includes the peer in responses.
     /// Values: 0 = Public (default), 1 = ContactsOnly, 2 = IntroductionOnly.
@@ -398,6 +400,17 @@ pub mod cap_flags {
 /// extension from legacy handshake random padding. Old decoders consume only
 /// the three-byte prefix; the entire padded body remains transcript-bound.
 const CAPABILITIES_EXTENSION: &[u8; 16] = b"VEIL-CAPS-EXT-01";
+const CAPABILITIES_EXTENSION2: &[u8; 16] = b"VEIL-CAPS-EXT-02";
+
+pub mod cap_extra_flags2 {
+    /// Self-contained Delivery records on the existing authenticated reliable
+    /// child. Never a traffic role, priority or change to relay admission.
+    pub const SUPPORTS_RELIABLE_DELIVERY: u8 = 1;
+}
+
+#[cfg(test)]
+#[path = "session_delivery_tests.rs"]
+mod reliable_delivery_tests;
 
 pub mod cap_extra_flags {
     /// Generic loss-tolerant circuit cells, with no application-role label or
@@ -448,6 +461,7 @@ impl CapabilitiesPayload {
             roles_supported: role.to_role_bits(),
             flags,
             extra_flags: 0,
+            extra_flags2: 0,
             discovery_mode: 0, // Public
         }
     }
@@ -477,9 +491,13 @@ impl CapabilitiesPayload {
     /// Preserve the legacy prefix. Emit an extension only when needed.
     pub fn encode(&self) -> Vec<u8> {
         let mut bytes = vec![self.roles_supported, self.flags, self.discovery_mode];
-        if self.extra_flags != 0 {
+        if self.extra_flags != 0 || self.extra_flags2 != 0 {
             bytes.extend_from_slice(CAPABILITIES_EXTENSION);
             bytes.push(self.extra_flags);
+        }
+        if self.extra_flags2 != 0 {
+            bytes.extend_from_slice(CAPABILITIES_EXTENSION2);
+            bytes.push(self.extra_flags2);
         }
         bytes
     }
@@ -497,6 +515,13 @@ impl CapabilitiesPayload {
             flags: buf[1],
             extra_flags: if buf.get(3..19) == Some(CAPABILITIES_EXTENSION.as_slice()) {
                 buf.get(19).copied().unwrap_or(0)
+            } else {
+                0
+            },
+            extra_flags2: if buf.get(3..19) == Some(CAPABILITIES_EXTENSION.as_slice())
+                && buf.get(20..36) == Some(CAPABILITIES_EXTENSION2.as_slice())
+            {
+                buf.get(36).copied().unwrap_or(0)
             } else {
                 0
             },
@@ -550,6 +575,12 @@ impl CapabilitiesPayload {
     pub fn supports_reliable_parallel(&self) -> bool {
         self.extra_flags & cap_extra_flags::SUPPORTS_RELIABLE_PARALLEL != 0
             && (self.supports_parallel_ordered() || self.supports_duplex_parallel_quic())
+    }
+
+    /// Never send Delivery on a child to a peer advertising only App streams.
+    pub fn supports_reliable_delivery(&self) -> bool {
+        self.supports_reliable_parallel()
+            && self.extra_flags2 & cap_extra_flags2::SUPPORTS_RELIABLE_DELIVERY != 0
     }
 
     // ── Capability helpers ───────────────────────────────────────────────
@@ -2348,6 +2379,7 @@ mod tests {
     #[test]
     fn capabilities_roundtrip() {
         let p = CapabilitiesPayload {
+            extra_flags2: 0,
             roles_supported: role_bits::LEAF | role_bits::CORE,
             flags: cap_flags::CAN_RELAY | cap_flags::SUPPORTS_SOVEREIGN_IDENTITY,
             extra_flags: 0,
@@ -2364,6 +2396,7 @@ mod tests {
     #[test]
     fn a_peer_that_says_nothing_still_serves() {
         let silent = CapabilitiesPayload {
+            extra_flags2: 0,
             roles_supported: role_bits::CORE,
             flags: 0,
             extra_flags: 0,
@@ -2380,6 +2413,7 @@ mod tests {
     #[test]
     fn the_no_service_bit_round_trips_and_reads_back() {
         let quiet = CapabilitiesPayload {
+            extra_flags2: 0,
             roles_supported: role_bits::LEAF,
             flags: cap_flags::CAN_RELAY | cap_flags::NO_DHT_SERVICE,
             extra_flags: 0,
@@ -2732,6 +2766,7 @@ mod tests {
     #[test]
     fn capabilities_unknown_discovery_mode_maps_to_introduction_only() {
         let p = CapabilitiesPayload {
+            extra_flags2: 0,
             roles_supported: role_bits::CORE,
             flags: 0,
             extra_flags: 0,

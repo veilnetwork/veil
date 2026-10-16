@@ -484,6 +484,7 @@ mod tests {
                 mlkem_pubkey: None,
             },
             remote_capabilities: veil_proto::session::CapabilitiesPayload {
+                extra_flags2: 0,
                 roles_supported: veil_proto::session::role_bits::CORE,
                 flags: veil_proto::session::cap_flags::CAN_RELAY,
                 extra_flags: 0,

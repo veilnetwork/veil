@@ -1,10 +1,24 @@
-//! Whole App stream routing. No striping, midstream fallback or remote class.
+//! Whole App streams and negotiated self-contained Delivery records.
+//! No stream striping, midstream fallback or remote scheduling class.
 use super::*;
 use std::collections::HashMap;
 use veil_proto::app::{AppClosePayload, AppOpenPayload, AppReceiptPayload, AppWindowUpdatePayload};
 use veil_proto::header::HEADER_SIZE;
 
 const MAX_PINS: usize = 1024;
+
+fn delivery_record(h: &FrameHeader) -> bool {
+    use veil_proto::family::DeliveryMsg;
+    h.family == FrameFamily::Delivery as u8
+        && matches!(
+            DeliveryMsg::try_from(h.msg_type),
+            Ok(DeliveryMsg::Forward
+                | DeliveryMsg::DeliveryStatus
+                | DeliveryMsg::Transit
+                | DeliveryMsg::RecursiveRelay
+                | DeliveryMsg::RelayPath)
+        )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Route {
@@ -27,6 +41,7 @@ struct Pin {
 
 pub(super) struct ReliableStreams {
     enabled: bool,
+    delivery: bool,
     pins: HashMap<u32, Pin>,
     sink: Arc<dyn crate::dispatcher_sink::DispatcherSink>,
     peer: NodeIdBytes,
@@ -82,10 +97,41 @@ impl ReliableStreams {
     ) -> Self {
         Self {
             enabled,
+            delivery: false,
             pins: HashMap::new(),
             sink,
             peer,
         }
+    }
+
+    pub(super) fn with_delivery(mut self, negotiated: bool) -> Self {
+        self.delivery = self.enabled && negotiated;
+        self
+    }
+
+    pub(super) fn route_with_local_class(
+        &self,
+        frame: &[u8],
+        ready: Option<[u8; 32]>,
+        local_priority: u8,
+    ) -> Route {
+        // Only the originating local outbox classification can retain network
+        // control on the parent. No incoming priority or media role is trusted.
+        if self.delivery
+            && local_priority != crate::LOCAL_NETWORK_CONTROL_LANE
+            && let Ok(h) = decode_header(frame)
+            && delivery_record(&h)
+            // Older peers may send Delivery bodies larger than this child's
+            // fixed record limit. Keep their existing parent carrier rather
+            // than retiring a healthy child and dropping the envelope.
+            && crate::reliable_frames::valid_plain(frame)
+            // Expiring loss-tolerant forwards retain their existing datagram
+            // or canonical fallback lifecycle; never queue them as reliable data.
+            && decode_realtime_lane_frame(frame).is_none()
+        {
+            return ready.map_or(Route::Canonical, Route::Child);
+        }
+        self.route(frame, ready)
     }
     pub(super) fn route(&self, frame: &[u8], ready: Option<[u8; 32]>) -> Route {
         if !self.enabled {
@@ -152,6 +198,12 @@ impl ReliableStreams {
         route: Route,
     ) -> Result<(), &'static str> {
         if !self.enabled && route == Route::Canonical {
+            return Ok(());
+        }
+        // These records carry their own message/chunk identities; they do not
+        // own App stream pins. The dispatcher still validates the full payload,
+        // signatures, replay state and peer budgets using the canonical peer.
+        if self.delivery && delivery_record(h) {
             return Ok(());
         }
         if h.family == FrameFamily::App as u8 && h.msg_type == AppMsg::AppWindowUpdate as u16 {

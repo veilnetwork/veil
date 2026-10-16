@@ -3767,6 +3767,7 @@ mod tests {
                 mlkem_pubkey: None,
             },
             remote_capabilities: veil_proto::session::CapabilitiesPayload {
+                extra_flags2: 0,
                 roles_supported: role_bits::CORE,
                 flags: cap_flags::SUPPORTS_SOVEREIGN_IDENTITY,
                 extra_flags: 0,
@@ -3867,6 +3868,7 @@ mod tests {
                 mlkem_pubkey: None,
             },
             remote_capabilities: veil_proto::session::CapabilitiesPayload {
+                extra_flags2: 0,
                 roles_supported: role_bits::CORE,
                 flags: cap_flags::SUPPORTS_SOVEREIGN_IDENTITY,
                 extra_flags: 0,
@@ -4011,6 +4013,7 @@ mod tests {
                 mlkem_pubkey: None,
             },
             remote_capabilities: veil_proto::session::CapabilitiesPayload {
+                extra_flags2: 0,
                 roles_supported: role_bits::CORE,
                 flags: cap_flags::SUPPORTS_SOVEREIGN_IDENTITY,
                 extra_flags: 0,

@@ -25,6 +25,105 @@ fn app_frame(byte: u8) -> FrameEnvelope {
     ))
 }
 
+pub(super) fn forward_record(byte: u8) -> Vec<u8> {
+    use veil_proto::delivery::{DeliveryEnvelope, ForwardPayload};
+    let body = ForwardPayload {
+        next_hop_node_id: [2; 32],
+        envelope: DeliveryEnvelope {
+            recipient: veil_proto::recipient::Recipient::any([2; 32]),
+            sender_node_id: [1; 32],
+            src_app_id: [0x55; 32],
+            app_id: [0x55; 32],
+            endpoint_id: 17,
+            content_id: [byte; 32],
+            created_at: 1,
+            ttl_secs: 60,
+            payload: vec![byte; 4542],
+            trace_id: 0,
+            require_ack: true,
+        },
+        relay_hops: 0,
+        delivery_attempt: Some(0),
+        traffic_class: None,
+    }
+    .encode();
+    let mut h = FrameHeader::new(
+        FrameFamily::Delivery as u8,
+        veil_proto::family::DeliveryMsg::Forward as u16,
+    );
+    h.body_len = body.len() as u32;
+    veil_proto::codec::encode_frame(&h, &body)
+}
+
+async fn delivery_round_trip(
+    from: &reliable_session::ReliableSession,
+    to: &reliable_session::ReliableSession,
+    byte: u8,
+) {
+    let ctx = ordered_receiver_tests::pool_fixture_context();
+    let mut route = reliable_streams::ReliableStreams::new(true, ctx.dispatcher, ctx.peer_id)
+        .with_delivery(true);
+    let ready = from.ready().unwrap();
+    let frame = forward_record(byte);
+    assert_eq!(
+        route.route_with_local_class(&frame, Some(ready.id()), 1),
+        reliable_streams::Route::Child(ready.id())
+    );
+    let receipt = ready
+        .handle()
+        .try_send(FrameEnvelope::from((
+            veil_proto::priority::INTERACTIVE,
+            veil_bufpool::pooled_shared_from_vec(frame.clone()),
+        )))
+        .ok()
+        .expect("delivery admission");
+    loop {
+        match to.next().await {
+            ReliableEvent::Changed => {}
+            ReliableEvent::Frame { child, result } => {
+                let received = result.unwrap();
+                route
+                    .incoming(&received, reliable_streams::Route::Child(child))
+                    .unwrap();
+                assert_eq!(&received[..], &frame);
+                let payload = veil_proto::delivery::ForwardPayload::decode(
+                    &received[veil_proto::header::HEADER_SIZE..],
+                )
+                .unwrap();
+                assert_eq!(payload.envelope.content_id, [byte; 32]);
+                assert_eq!(payload.envelope.payload, vec![byte; 4542]);
+                assert!(payload.envelope.require_ack);
+                break;
+            }
+            ReliableEvent::Stopped => panic!("delivery child stopped"),
+        }
+    }
+    receipt.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn reliable_delivery_ordered_child_transfers_complete_records_both_ways_across_rekey() {
+    timeout(Duration::from_secs(10), async {
+        let mut f = OrderedFixture::new().await;
+        assert!(f.a.reliable_delivery() && f.b.reliable_delivery());
+        delivery_round_trip(f.a.reliable().unwrap(), f.b.reliable().unwrap(), 10).await;
+        delivery_round_trip(f.b.reliable().unwrap(), f.a.reliable().unwrap(), 11).await;
+        f.canonical_survives().await;
+        let old = f.a.reliable().unwrap().ready().unwrap();
+        f.a.rekey(&[4; 32], &[5; 32], [6; 32]);
+        f.b.rekey(&[5; 32], &[4; 32], [6; 32]);
+        assert!(old.handle().recv().await.is_err());
+        until(|| {
+            f.a.reliable().unwrap().ready().is_some() && f.b.reliable().unwrap().ready().is_some()
+        })
+        .await;
+        delivery_round_trip(f.a.reliable().unwrap(), f.b.reliable().unwrap(), 12).await;
+        f.canonical_survives().await;
+    })
+    .await
+    .unwrap();
+}
+
 async fn until(mut condition: impl FnMut() -> bool) {
     timeout(Duration::from_secs(5), async {
         while !condition() {
@@ -138,8 +237,11 @@ impl OrderedFixture {
         let registry = Arc::new(ParallelRegistry::default());
         let a_offer =
             ParallelOrderedOffer::new(outgoing.clone(), Arc::new(ParallelRegistry::default()))
-                .with_reliable();
-        let b_offer = ParallelOrderedOffer::new(incoming, registry.clone()).with_reliable();
+                .with_reliable()
+                .with_reliable_delivery();
+        let b_offer = ParallelOrderedOffer::new(incoming, registry.clone())
+            .with_reliable()
+            .with_reliable_delivery();
         let diagnostics = [a_offer.diagnostics(), b_offer.diagnostics()];
         let ctx = ordered_receiver_tests::pool_fixture_context();
         let a_session = ordered_lanes::OrderedSession::new(
@@ -303,7 +405,8 @@ async fn reliable_punched_quic_session_uses_exclusive_accept_and_retires_retaine
         let mut a = parallel_lanes::ParallelSession::new(
             ParallelQuicOffer::new(a_handle.clone())
                 .with_duplex()
-                .with_reliable(),
+                .with_reliable()
+                .with_reliable_delivery(),
             &[2; 32],
             &[3; 32],
             [1; 32],
@@ -313,7 +416,8 @@ async fn reliable_punched_quic_session_uses_exclusive_accept_and_retires_retaine
         let b = parallel_lanes::ParallelSession::new(
             ParallelQuicOffer::new(b_handle)
                 .with_duplex()
-                .with_reliable(),
+                .with_reliable()
+                .with_reliable_delivery(),
             &[3; 32],
             &[2; 32],
             [1; 32],
@@ -384,6 +488,9 @@ async fn reliable_punched_quic_session_uses_exclusive_accept_and_retires_retaine
         for (close, _) in reserved {
             close.close();
         }
+        assert!(a.reliable_delivery() && b.reliable_delivery());
+        delivery_round_trip(a.reliable().unwrap(), b.reliable().unwrap(), 13).await;
+        delivery_round_trip(b.reliable().unwrap(), a.reliable().unwrap(), 14).await;
         send(&ready, 6).wait().await.unwrap();
         receive(b.reliable().unwrap(), 6).await;
         drop(a);

@@ -678,6 +678,7 @@ where
                     );
                     let remote_caps_stated = stated_caps.is_some();
                     let remote_capabilities = stated_caps.unwrap_or(CapabilitiesPayload {
+                        extra_flags2: 0,
                         roles_supported: 0,
                         flags: 0,
                         extra_flags: 0,
@@ -840,6 +841,7 @@ where
                     mlkem_pubkey: None,
                 };
                 let remote_capabilities = stated_caps.unwrap_or(CapabilitiesPayload {
+                    extra_flags2: 0,
                     roles_supported: 0,
                     flags: 0,
                     extra_flags: 0,
@@ -1236,6 +1238,7 @@ fn local_capabilities(
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_DUPLEX_PARALLEL_QUIC;
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_PARALLEL_ORDERED;
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_RELIABLE_PARALLEL;
+    caps.extra_flags2 |= veil_proto::session::cap_extra_flags2::SUPPORTS_RELIABLE_DELIVERY;
     caps
 }
 
@@ -2444,7 +2447,9 @@ mod tests {
         assert!(r1.remote_capabilities.supports_direct_app_chunks());
         assert!(r2.remote_capabilities.supports_direct_app_chunks());
         assert!(r1.remote_capabilities.supports_reliable_parallel());
+        assert!(r1.remote_capabilities.supports_reliable_delivery());
         assert!(r2.remote_capabilities.supports_reliable_parallel());
+        assert!(r2.remote_capabilities.supports_reliable_delivery());
 
         // Node IDs are BLAKE3(verifying_key_bytes), not BLAKE3(seed).
         let id_a = test_identity(0xAA).node_id;
@@ -3180,7 +3185,9 @@ mod tests {
         // reconnect and reflect settings changed after the ticket was issued.
         assert!(srv2.remote_caps_stated && cli2.remote_caps_stated);
         assert!(srv2.remote_capabilities.supports_reliable_parallel());
+        assert!(srv2.remote_capabilities.supports_reliable_delivery());
         assert!(cli2.remote_capabilities.supports_reliable_parallel());
+        assert!(cli2.remote_capabilities.supports_reliable_delivery());
         for result in [&srv2, &cli2] {
             assert!(result.remote_capabilities.supports_circuit_datagrams());
             assert!(result.remote_capabilities.supports_shared_parallel_quic());
