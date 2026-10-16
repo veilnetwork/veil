@@ -335,11 +335,14 @@ bool VeilTransportShim::SendRtcpOnSource(std::span<const uint8_t> packet,
   (void)options;  // RTCP carries no packet_id to feed back.
   std::vector<uint8_t> compound;
   LocalAudioPlayout sample;
+  LocalAudioRecovery recovery;
   if (!video) {
     std::lock_guard lock(audio_feedback_mu_);
     sample = local_audio_playout_;
+    recovery = local_audio_recovery_;
   }
-  bool append = !video && sample.enabled && started_.load(std::memory_order_acquire);
+  bool append = !video && (sample.enabled || recovery.enabled) &&
+                started_.load(std::memory_order_acquire);
   // Keep RTCP's original report/SDES framing and do not append after BYE or
   // padding. Old endpoints can ignore the optional APP name (RFC 3550 §6.7).
   for (size_t offset = 0; append && offset < packet.size();) {
@@ -353,21 +356,33 @@ bool VeilTransportShim::SendRtcpOnSource(std::span<const uint8_t> packet,
   }
   if (append && !packet.empty()) {
     compound.assign(packet.begin(), packet.end());
-    const size_t at = compound.size();
-    compound.resize(at + 28);
-    auto* app = compound.data() + at;
-    app[0] = 0x80; app[1] = 204; app[2] = 0; app[3] = 6;
-    write_be32(app + 4, local_audio_ssrc_.load(std::memory_order_relaxed));
-    write_be32(app + 8, kAudioPlayoutAppName);
-    write_be32(app + 12, sample.remote_ssrc);
-    write_be32(app + 16, static_cast<uint32_t>(sample.sequence >> 32));
-    write_be32(app + 20, static_cast<uint32_t>(sample.sequence));
-    const int64_t now_us = webrtc::TimeMicros();
-    const bool fresh = sample.sampled_us > 0 && sample.sampled_us <= now_us &&
-                       now_us - sample.sampled_us <= 3'000'000;
-    write_be32(app + 24, fresh && sample.delay_ms >= 0
-                            ? static_cast<uint32_t>(sample.delay_ms)
-                            : kUnknownPlayout);
+    if (sample.enabled) {
+      const size_t at = compound.size();
+      compound.resize(at + 28);
+      auto* app = compound.data() + at;
+      app[0] = 0x80;
+      app[1] = 204;
+      app[2] = 0;
+      app[3] = 6;
+      write_be32(app + 4, local_audio_ssrc_.load(std::memory_order_relaxed));
+      write_be32(app + 8, kAudioPlayoutAppName);
+      write_be32(app + 12, sample.remote_ssrc);
+      write_be32(app + 16, static_cast<uint32_t>(sample.sequence >> 32));
+      write_be32(app + 20, static_cast<uint32_t>(sample.sequence));
+      const int64_t now_us = webrtc::TimeMicros();
+      const bool fresh = sample.sampled_us > 0 && sample.sampled_us <= now_us &&
+                         now_us - sample.sampled_us <= 3'000'000;
+      write_be32(app + 24, fresh && sample.delay_ms >= 0
+                               ? static_cast<uint32_t>(sample.delay_ms)
+                               : kUnknownPlayout);
+    }
+    if (recovery.enabled) {
+      const auto app = EncodeAudioRecovery(
+          local_audio_ssrc_.load(std::memory_order_relaxed),
+          recovery.remote_ssrc, recovery.sequence, recovery.sample,
+          recovery.sampled_us, webrtc::TimeMicros());
+      compound.insert(compound.end(), app.begin(), app.end());
+    }
     packet = std::span<const uint8_t>(compound);
   }
   const int rc = video
@@ -467,6 +482,23 @@ AudioPlayoutSnapshot VeilTransportShim::audio_playout_feedback() const {
   return audio_playout_feedback_;
 }
 
+void VeilTransportShim::SetLocalAudioRecovery(uint32_t remote_audio_ssrc,
+                                              uint64_t sequence,
+                                              AudioRecoverySample sample,
+                                              int64_t sampled_us) {
+  std::lock_guard lock(audio_feedback_mu_);
+  local_audio_recovery_ = {true, remote_audio_ssrc, sequence, sample,
+                           sampled_us};
+}
+bool VeilTransportShim::peer_audio_recovery_supported() const {
+  std::lock_guard lock(audio_feedback_mu_);
+  return peer_audio_recovery_.supported();
+}
+int64_t VeilTransportShim::peer_audio_recovery_report_us(int64_t now_us) const {
+  std::lock_guard lock(audio_feedback_mu_);
+  return peer_audio_recovery_.FreshReportUs(now_us);
+}
+
 void VeilTransportShim::SetLocalAudioPlayout(uint32_t remote_audio_ssrc,
                                             uint64_t sequence, int delay_ms,
                                             int64_t sampled_us) {
@@ -483,6 +515,7 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
   if (local == 0 && video == 0) return;
   RtcpFeedbackSnapshot candidate, video_candidate;
   AudioPlayoutSnapshot playout;
+  std::optional<AudioRecoveryReport> recovery;
   const auto observe = [&](const auto& blocks) {
     for (const auto& block : blocks) {
       const bool audio = local != 0 && block.source_ssrc() == local;
@@ -518,6 +551,13 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
       if (!report.Parse(header)) return;
       observe(report.report_blocks());
     } else if (header.type() == 204 && header.payload_size_bytes() >= 8 &&
+               read_be32(header.payload() + 4) == kAudioRecoveryAppName) {
+      if (recovery)
+        return;  // ambiguous compound reports cannot partially apply
+      recovery = DecodeAudioRecovery(
+          {header.payload(), header.payload_size_bytes()}, header.count());
+      if (!recovery) return;
+    } else if (header.type() == 204 && header.payload_size_bytes() >= 8 &&
                read_be32(header.payload() + 4) == kAudioPlayoutAppName) {
       if (header.count() != 0 || header.payload_size_bytes() != 24) return;
       const auto* app = header.payload();
@@ -535,8 +575,10 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
     }
     offset += header.packet_size();
   }
-  if (candidate.arrived_us > 0 || video_candidate.arrived_us > 0 || playout.supported) {
+  if (candidate.arrived_us > 0 || video_candidate.arrived_us > 0 ||
+      playout.supported || recovery) {
     std::lock_guard lock(audio_feedback_mu_);
+    if (recovery) peer_audio_recovery_.Observe(*recovery, local, arrived_us);
     if (candidate.arrived_us > 0 && candidate.arrived_us >= audio_feedback_.arrived_us) {
       candidate.loss_report_us = std::max(candidate.loss_report_us,
                                           audio_feedback_.loss_report_us);

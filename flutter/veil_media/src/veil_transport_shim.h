@@ -40,6 +40,7 @@
 #include "veil_inbound_packet_queue.h"
 #include "veil_audio_send_stats.h"
 #include "veil_audio_redundancy.h"
+#include "veil_audio_recovery_feedback.h"
 #include "veil_video_control_transport.h"
 
 namespace webrtc {
@@ -174,6 +175,10 @@ class VeilTransportShim : public webrtc::Transport {
   // advertises support; unicast uses its negotiated call-health feedback.
   void SetLocalAudioPlayout(uint32_t remote_audio_ssrc, uint64_t sequence,
                            int delay_ms, int64_t sampled_us);
+  void SetLocalAudioRecovery(uint32_t remote_audio_ssrc, uint64_t sequence,
+                            AudioRecoverySample sample, int64_t sampled_us);
+  int64_t peer_audio_recovery_report_us(int64_t now_us) const;
+  bool peer_audio_recovery_supported() const;
 
   // Enable only when both endpoints have independent audio/video counters.
   // Older engines used one sequence space and cannot consume split feedback.
@@ -226,6 +231,7 @@ class VeilTransportShim : public webrtc::Transport {
   }
 
  private:
+  friend class AudioRecoveryFeedbackTest;
   VideoControlTransport<VeilTransportShim> video_transport_{*this};
   bool SendRtcpOnSource(std::span<const uint8_t> packet,
                         const webrtc::PacketOptions& options, bool video);
@@ -327,6 +333,15 @@ class VeilTransportShim : public webrtc::Transport {
     int64_t sampled_us = 0;
   };
   LocalAudioPlayout local_audio_playout_;
+  struct LocalAudioRecovery {
+    bool enabled = false;
+    uint32_t remote_ssrc = 0;
+    uint64_t sequence = 0;
+    AudioRecoverySample sample;
+    int64_t sampled_us = 0;
+  };
+  LocalAudioRecovery local_audio_recovery_;
+  AudioRecoveryCursor peer_audio_recovery_;
   std::atomic<bool> independent_transport_feedback_{false};
   std::atomic<bool> started_{false};
   InboundPacketQueue inbound_queue_;
