@@ -314,6 +314,7 @@ mod tests {
             id,
             MediaChannel {
                 path_probe: None,
+                source_preflight: None,
                 ingress: MediaIngress::new(audio_tx, MediaVideoIngress::Packets(video_tx)),
                 repair_tx: None,
                 peer,

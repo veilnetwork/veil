@@ -61,7 +61,7 @@ where
     .unwrap_or(false)
 }
 
-pub(super) fn prepare_app_sources(app: &VeilApp, peer: [u8; 32], relayed: bool) {
+pub(super) fn prepare_app_sources(app: &VeilApp, peer: [u8; 32], relayed: bool) -> bool {
     // ffi_prelude has already rejected Tokio-worker reentry. Hosts execute
     // these existing blocking open functions on their SDK worker.
     let started = std::time::Instant::now();
@@ -84,6 +84,7 @@ pub(super) fn prepare_app_sources(app: &VeilApp, peer: [u8; 32], relayed: bool) 
         "source preparation relayed={relayed} ready={ready} elapsed_ms={}",
         started.elapsed().as_millis()
     ));
+    ready
 }
 
 #[cfg(test)]
