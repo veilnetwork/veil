@@ -75,3 +75,77 @@ pub fn publish_pause_enabled() -> bool {
 pub fn set_publish_pause(on: bool) {
     publish_pause_cell().store(on, Ordering::Relaxed);
 }
+
+/// Wall time of a synchronous runner stage, excluding its asynchronous input
+/// wait. This names a local scheduling/handler stall, not a network diagnosis.
+pub(crate) fn stage_start() -> Option<std::time::Instant> {
+    rt_trace_enabled().then(std::time::Instant::now)
+}
+
+pub(crate) fn finish_stage(
+    started: Option<std::time::Instant>,
+    logger: &veil_observability::NodeLogger,
+    peer: &[u8; 32],
+    stage: &str,
+    pq_depth: usize,
+) {
+    let Some(started) = started else { return };
+    let elapsed_us = started.elapsed().as_micros();
+    if elapsed_us >= SLOW_DISPATCH_MS * 1000 {
+        logger.warn(
+            "session.rt_trace.slow_stage",
+            format!(
+                "peer_id={} stage={stage} elapsed_us={elapsed_us} pq_depth={pq_depth}",
+                veil_util::bytes_to_hex(&peer[..4])
+            ),
+        );
+    }
+}
+
+/// Bounded per-runner ingress observations. No queue/lifetime/scheduling change:
+/// only locally measured age before a frame reaches the priority queue.
+#[derive(Default)]
+pub(crate) struct IngressTrace {
+    counts: [u64; 7],
+    max_age_us: [u64; 7],
+    last_report: Option<std::time::Instant>,
+}
+impl IngressTrace {
+    pub(crate) fn observe(&mut self, priority: u8, queued_at: std::time::Instant) {
+        let index = usize::from(priority.min(6));
+        let age = queued_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        if age >= SLOW_DISPATCH_MS as u64 * 1000 {
+            self.counts[index] = self.counts[index].saturating_add(1);
+            self.max_age_us[index] = self.max_age_us[index].max(age);
+        }
+    }
+    pub(crate) fn report(
+        &mut self,
+        logger: &veil_observability::NodeLogger,
+        peer: &[u8; 32],
+        pq_depth: usize,
+    ) {
+        if self.counts.iter().all(|n| *n == 0) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .last_report
+            .is_some_and(|last| now.saturating_duration_since(last).as_secs() < 1)
+        {
+            return;
+        }
+        logger.info(
+            "session.rt_trace.aged_ingress",
+            format!(
+                "peer_id={} aged_frames={:?} max_age_us={:?} pq_depth={pq_depth}",
+                veil_util::bytes_to_hex(&peer[..4]),
+                self.counts,
+                self.max_age_us
+            ),
+        );
+        self.counts = [0; 7];
+        self.max_age_us = [0; 7];
+        self.last_report = Some(now);
+    }
+}
