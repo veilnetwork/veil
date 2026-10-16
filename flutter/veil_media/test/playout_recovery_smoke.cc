@@ -14,10 +14,11 @@ class Decoder final : public webrtc::NetEq {
   int frame_ms = 0;
   int maximum_delay = 0;
   int maximum_delay_calls = 0;
+  int insert_result = 0;
   int GetAudio(webrtc::AudioFrame* f, bool* muted, int* rate,
                std::optional<Operation>) override {
     ++pulls;
-    f->UpdateFrame(0, nullptr, 480, 48000,
+    f->UpdateFrame(10000 + pulls * 480, nullptr, 480, 48000,
         pulls > 1 && mode == 1 ? webrtc::AudioFrame::kPLC : webrtc::AudioFrame::kNormalSpeech,
         webrtc::AudioFrame::kVadActive, 1);
     f->mutable_data()[0] = pulls == 1 ? 1000 : 2000;
@@ -25,7 +26,7 @@ class Decoder final : public webrtc::NetEq {
     if (rate) *rate = 48000;
     return pulls > 1 && mode == 3 ? kFail : kOK;
   }
-  int InsertPacket(const webrtc::RTPHeader&, std::span<const uint8_t>, const webrtc::RtpPacketInfo&) override { return 0; }
+  int InsertPacket(const webrtc::RTPHeader&, std::span<const uint8_t>, const webrtc::RtpPacketInfo&) override { return insert_result; }
   void SetCodecs(const std::map<int, webrtc::SdpAudioFormat>&) override {}
   bool RegisterPayloadType(int, const webrtc::SdpAudioFormat&) override { return true; }
   int RemovePayloadType(uint8_t) override { return 0; }
@@ -190,8 +191,10 @@ int main() {
   {
     veil_media::PlayoutTrace trace;
     assert(trace.enabled());
-    for (size_t i = 0; i < veil_media::PlayoutTrace::kLimit + 3; ++i)
-      trace.Record(1000, 200, 100, 40, 10, false);
+    for (size_t i = 0; i < veil_media::PlayoutTrace::kLimit + 3; ++i) {
+      trace.Record(1000, 200, 100, 40, 10, false, 40, 80, 9000, 0, false);
+      trace.RecordPacket(900, 11, 65535, 8500);
+    }
     assert(access(path.c_str(), F_OK) != 0);
     // Teardown uses the explicitly selected original file, not later env.
     unsetenv("VEIL_MEDIA_DIAG_PATH");
@@ -201,14 +204,55 @@ int main() {
   assert(std::getline(file, line));
   assert(line == "audio.playout.begin count=65536 observed=65539 limit=65536");
   size_t rows = 0;
-  while (std::getline(file, line)) {
+  while (rows < veil_media::PlayoutTrace::kLimit && std::getline(file, line)) {
     assert(line.find("before_ms=200 after_ms=100 target_ms=40 skipped=10 fallback=0")
            != std::string::npos);
+    assert(line.find("rtp_timestamp=9000 speech_type=0 muted=0")
+           != std::string::npos);
+    ++rows;
+  }
+  assert(rows == veil_media::PlayoutTrace::kLimit);
+  assert(std::getline(file, line));
+  assert(line == "audio.rtp.begin count=65536 observed=65539 limit=65536");
+  rows = 0;
+  while (std::getline(file, line)) {
+    assert(line == "audio.rtp received_us=900 ssrc=11 sequence=65535 rtp_timestamp=8500");
     ++rows;
   }
   assert(rows == veil_media::PlayoutTrace::kLimit);
   file.close();
   unlink(path.c_str());
+  // Real wrapper wiring: retain the actual decoded RTP timestamp, and only
+  // record accepted packets. No packet body is passed to the trace.
+  setenv("VEIL_MEDIA_DIAG_PATH", path.c_str(), 1);
+  {
+    auto decoder = std::make_unique<Decoder>();
+    auto* observed = decoder.get();
+    observed->mode = 5;
+    auto stats = std::make_shared<veil_media::PlayoutRecoveryStats>();
+    veil_media::RecoveringNetEq recovering(std::move(decoder), stats);
+    webrtc::RTPHeader header;
+    header.ssrc = 11;
+    header.sequenceNumber = 42;
+    header.timestamp = 8500;
+    assert(recovering.InsertPacket(header, {}, webrtc::RtpPacketInfo{}) == 0);
+    observed->insert_result = webrtc::NetEq::kFail;
+    header.sequenceNumber = 43;
+    assert(recovering.InsertPacket(header, {}, webrtc::RtpPacketInfo{}) != 0);
+    webrtc::AudioFrame frame;
+    recovering.GetAudio(&frame, nullptr, nullptr, std::nullopt);
+    assert(frame.timestamp_ == 10480);
+    assert(access(path.c_str(), F_OK) != 0);
+  }
+  file.open(path);
+  const std::string traced((std::istreambuf_iterator<char>(file)), {});
+  assert(traced.find("rtp_timestamp=10480 speech_type=0 muted=0") != std::string::npos);
+  assert(traced.find("audio.rtp.begin count=1 observed=1 limit=65536") != std::string::npos);
+  assert(traced.find("ssrc=11 sequence=42 rtp_timestamp=8500") != std::string::npos);
+  assert(traced.find("sequence=43") == std::string::npos);
+  file.close();
+  unlink(path.c_str());
+  unsetenv("VEIL_MEDIA_DIAG_PATH");
   unsetenv("VEIL_MEDIA_PLAYOUT_TRACE");
   std::puts("catch-up preserves usable speech on PLC/mute/error; work bounded to 16 pulls");
   std::puts("playout timing trace is opt-in, bounded, and writes only at teardown");
