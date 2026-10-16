@@ -501,6 +501,13 @@ impl NodeRuntime {
                 build_standalone_sovereign_identity(&self.identity_dir, &config, &self.logger)
                     .or(Some(sov))
             }
+            // A marked deferred boot deliberately has NO placeholder document.
+            // When its real Ed25519 key arrives, apply the same standalone
+            // bootstrap as a normal start. Keep its existing address/keypair;
+            // never replace a provisioned document that failed to load.
+            (None, None) if !config.ephemeral_identity && !doc_path.exists() => {
+                build_standalone_sovereign_identity(&self.identity_dir, &config, &self.logger)
+            }
             (None, other) => other,
         };
         // Reuse the SAME shared cell across the reload (only refresh its
