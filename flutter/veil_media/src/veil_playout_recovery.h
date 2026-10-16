@@ -94,13 +94,19 @@ class RecoveringNetEq final : public webrtc::NetEq {
       trace_.Record(entered_us, before_ms,
           inner_->GetOperationsAndState().current_buffer_size_ms,
           inner_->TargetDelayMs(), skipped, fallback,
-          frame_headroom_ms_, applied_target_ceiling_ms_);
+          frame_headroom_ms_, applied_target_ceiling_ms_,
+          result == kOK ? frame->timestamp_ : 0,
+          result == kOK ? static_cast<int>(frame->speech_type_) : -1,
+          silent);
     }
     return result;
   }
   int InsertPacket(const webrtc::RTPHeader& h, std::span<const uint8_t> p,
                    const webrtc::RtpPacketInfo& info) override {
+    const auto received_us = trace_.enabled() ? webrtc::TimeMicros() : 0;
     const int result = inner_->InsertPacket(h, p, info);
+    if (result == kOK && trace_.enabled())
+      trace_.RecordPacket(received_us, h.ssrc, h.sequenceNumber, h.timestamp);
     if (result == kOK && h.ssrc && !registered_ssrc_) {
       stats_->receivers.Attach(h.ssrc, receiver_recovery_);
       registered_ssrc_ = h.ssrc;
