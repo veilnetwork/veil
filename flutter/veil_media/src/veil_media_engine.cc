@@ -112,7 +112,7 @@
 #include "api/video/video_rotation.h"
 #include "api/video/video_source_interface.h"
 #include "api/video/video_sink_interface.h"
-#include "api/video/video_broadcaster.h"
+#include "veil_adaptive_video_source.h"
 #include "third_party/libyuv/include/libyuv/convert_argb.h"  // I420ToABGR
 #include "third_party/libyuv/include/libyuv/rotate.h"  // Android420ToI420Rotate
 #include "rtc_base/time_utils.h"  // webrtc::TimeMicros
@@ -786,21 +786,14 @@ class VeilVideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
 #endif
 };
 
-void broadcast_i420(webrtc::VideoBroadcaster* source,
+void broadcast_i420(veil_media::AdaptiveVideoSource* source,
                     webrtc::scoped_refptr<webrtc::I420Buffer> buf,
                     int64_t ts_us) {
-  if (source == nullptr || !buf) return;
-  webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
-                                 .set_video_frame_buffer(buf)
-                                 .set_timestamp_us(ts_us ? ts_us
-                                                         : webrtc::TimeMicros())
-                                 .set_rotation(webrtc::kVideoRotation_0)
-                                 .build();
-  source->OnFrame(frame);
+  if (source != nullptr) source->PushI420(std::move(buf), ts_us);
 }
 
 // Copy a (possibly strided) I420 frame into the broadcaster (encoder source).
-void push_i420(webrtc::VideoBroadcaster* source, const uint8_t* y,
+void push_i420(veil_media::AdaptiveVideoSource* source, const uint8_t* y,
                const uint8_t* u, const uint8_t* v, int width, int height,
                int stride_y, int stride_u, int stride_v, int64_t ts_us) {
   if (source == nullptr || width <= 0 || height <= 0) return;
@@ -843,7 +836,7 @@ class Android420FrameDispatcher {
 
   ~Android420FrameDispatcher() { Stop(); }
 
-  bool Submit(webrtc::VideoBroadcaster* source, const uint8_t* y,
+  bool Submit(veil_media::AdaptiveVideoSource* source, const uint8_t* y,
               const uint8_t* u, const uint8_t* v, int width, int height,
               int stride_y, int stride_u, int stride_v, int pixel_stride_uv,
               int rotation, int64_t ts_us) {
@@ -922,7 +915,7 @@ class Android420FrameDispatcher {
 
  private:
   struct Job {
-    webrtc::VideoBroadcaster* source = nullptr;
+    veil_media::AdaptiveVideoSource* source = nullptr;
     std::vector<uint8_t> y;
     std::vector<uint8_t> u;
     std::vector<uint8_t> v;
@@ -1040,7 +1033,7 @@ struct WebrtcState {
   std::unique_ptr<webrtc::VideoEncoderFactory> video_encoder_factory;
   std::unique_ptr<webrtc::VideoDecoderFactory> video_decoder_factory;
   std::unique_ptr<webrtc::VideoBitrateAllocatorFactory> video_bitrate_alloc_factory;
-  std::unique_ptr<webrtc::VideoBroadcaster> video_source;  // pushable
+  std::unique_ptr<veil_media::AdaptiveVideoSource> video_source;  // pushable
   std::unique_ptr<VeilVideoSink> video_sink;               // renderer
   std::unique_ptr<VeilVideoSink> local_video_sink;         // self-preview
   webrtc::VideoSendStream* video_send_stream = nullptr;              // owned by Call
@@ -1150,7 +1143,7 @@ struct GroupWebrtcState {
   std::unique_ptr<webrtc::VideoDecoderFactory> video_decoder_factory;
   std::unique_ptr<webrtc::VideoBitrateAllocatorFactory>
       video_bitrate_alloc_factory;
-  std::unique_ptr<webrtc::VideoBroadcaster> video_source;
+  std::unique_ptr<veil_media::AdaptiveVideoSource> video_source;
   std::unique_ptr<VeilVideoSink> local_video_sink;
   webrtc::VideoSendStream* video_send_stream = nullptr;
   std::thread test_video_thread;
@@ -1319,7 +1312,7 @@ void ensure_group_video_codecs(GroupWebrtcState* ws) {
     ws->video_bitrate_alloc_factory =
         webrtc::CreateBuiltinVideoBitrateAllocatorFactory();
   if (!ws->video_source)
-    ws->video_source = std::make_unique<webrtc::VideoBroadcaster>();
+    ws->video_source = std::make_unique<veil_media::AdaptiveVideoSource>();
   if (!ws->local_video_sink)
     ws->local_video_sink = std::make_unique<VeilVideoSink>();
 }
@@ -2761,7 +2754,7 @@ int veil_media_group_engine_start_camera(VeilGroupMediaEngine* engine,
   if (width <= 0) width = 352;
   if (height <= 0) height = 198;
   if (fps <= 0) fps = 15;
-  webrtc::VideoBroadcaster* source = ws->video_source.get();
+  veil_media::AdaptiveVideoSource* source = ws->video_source.get();
   VeilVideoSink* local_sink = ws->local_video_sink.get();
   ws->camera.reset(veil_media::CreatePlatformCamera(
       [ws, source, local_sink](const uint8_t* y, const uint8_t* u,
@@ -2816,7 +2809,7 @@ int veil_media_group_engine_start_screen_source(VeilGroupMediaEngine* engine,
     ws->camera->Stop();
     ws->camera.reset();
   }
-  webrtc::VideoBroadcaster* source = ws->video_source.get();
+  veil_media::AdaptiveVideoSource* source = ws->video_source.get();
   VeilVideoSink* local_sink = ws->local_video_sink.get();
   ws->screen.reset(veil_media::CreatePlatformScreen(
       [ws, source, local_sink](const uint8_t* y, const uint8_t* u,
@@ -3224,7 +3217,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
       ws->video_bitrate_alloc_factory =
           webrtc::CreateBuiltinVideoBitrateAllocatorFactory();
     if (!ws->video_source)
-      ws->video_source = std::make_unique<webrtc::VideoBroadcaster>();
+      ws->video_source = std::make_unique<veil_media::AdaptiveVideoSource>();
 
     if (send && ws->video_send_stream == nullptr) {
       webrtc::VideoSendStream::Config sc(ws->shim->video_transport());  // sets send_transport
@@ -3532,7 +3525,7 @@ int veil_media_engine_start_camera_device(VeilMediaEngine* engine,
   if (fps <= 0) fps = 15;
   // Feed each captured I420 frame straight into the VP8 send source. The
   // callback runs on the capture queue; push_i420 copies synchronously.
-  webrtc::VideoBroadcaster* src = ws->video_source.get();
+  veil_media::AdaptiveVideoSource* src = ws->video_source.get();
   VeilVideoSink* local_sink = ws->local_video_sink.get();
   ws->camera.reset(veil_media::CreatePlatformCamera(
       [ws, src, local_sink](const uint8_t* y, const uint8_t* u,
@@ -3587,7 +3580,7 @@ int veil_media_engine_start_screen_source(VeilMediaEngine* engine,
     ws->camera->Stop();
     ws->camera.reset();
   }
-  webrtc::VideoBroadcaster* src = ws->video_source.get();
+  veil_media::AdaptiveVideoSource* src = ws->video_source.get();
   VeilVideoSink* local_sink = ws->local_video_sink.get();
   ws->screen.reset(veil_media::CreatePlatformScreen(
       [ws, src, local_sink](const uint8_t* y, const uint8_t* u,
