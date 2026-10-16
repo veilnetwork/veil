@@ -1336,3 +1336,156 @@ async fn pressured_rpc_queries_preserve_transit_and_resume_without_input() {
 async fn pressured_own_fanout_preserves_transit_and_resumes_without_input() {
     verify_own_network_pressure(false).await;
 }
+
+// Real encrypted scheduler coverage: a waiting local work item must release
+// from its timer without another producer event, while audio and opaque
+// transit can pass between its cells. Exercise DATAGRAM and ordered fallback.
+async fn verify_paced_work(datagrams: bool) {
+    use veil_proto::priority::BULK;
+    use veil_types::local_lossy_work::{LocalLossyWork, SOURCE_WORK_MAX_AGE};
+    let (_link, handle, remote_handle, stream, mut peer) = pair_full().await;
+    let (sender, outbox) = crate::frame_outbox::frame_channel(32);
+    let offer = datagrams.then(|| super::super::RealtimeLaneOffer {
+        peer_datagrams: true,
+        transport: super::super::RealtimeTransportOffer::Quic(handle.clone()),
+        peer_rotates: false,
+        peer_flows: false,
+        peer_circuit_datagrams: false,
+        peer_neutral_forwards: true,
+        parallel: None,
+    });
+    let mut runner = make_runner(stream, outbox, offer);
+    runner.raw_session_keys = Some(([0x51; 32], [0x52; 32], [0; 32]));
+    let template = primary_frame(OrderedPrimary::NeutralForward);
+    let make = |marker| {
+        let mut payload =
+            veil_proto::delivery::ForwardPayload::decode(&template[veil_proto::HEADER_SIZE..])
+                .unwrap();
+        payload.envelope.payload[0] = marker;
+        let mut bytes = template[..veil_proto::HEADER_SIZE].to_vec();
+        bytes.extend_from_slice(&payload.encode());
+        veil_bufpool::pooled_shared_from_vec(bytes)
+    };
+    let now = std::time::Instant::now();
+    // Opaque sealed payload length, not the envelope sent below.
+    let work = LocalLossyWork::new_paced(
+        vec![256; 3],
+        Duration::from_millis(100),
+        now + SOURCE_WORK_MAX_AGE,
+    )
+    .unwrap();
+    for index in 0..3 {
+        assert!(sender.try_send_local_work((BULK, make(index as u8)), work.cell(index).unwrap()));
+    }
+    // Missing the ORIGINAL receipt deadline must not grant a fresh 200 ms.
+    let expired = LocalLossyWork::new_paced(
+        vec![256; 2],
+        Duration::from_millis(100),
+        now - Duration::from_millis(1),
+    )
+    .unwrap();
+    assert!(!sender.try_send_local_work((BULK, make(99)), expired.cell(0).unwrap()));
+    assert!(expired.cell(1).unwrap().rejected());
+    let job = tokio::spawn(async move {
+        runner.run().await;
+    });
+    let mut ordered_reader = super::super::ordered_reader::Reader::default();
+    let mut ordered_cipher = SessionCipher::new(&[0x51; 32], true);
+    let mut datagram_cipher =
+        crate::datagram_flows::SessionDatagramRx::new(&[0x51; 32], &[0; 32], false);
+    let mut work_arrivals = Vec::new();
+    let mut controls = Vec::new();
+    timeout(Duration::from_secs(2), async {
+        while work_arrivals.len() < 3 || controls.len() < 2 {
+            let decoded = if datagrams {
+                loop {
+                    let packet = remote_handle.recv().await.unwrap();
+                    if let Some(frame) = datagram_cipher
+                        .decode_datagram(&packet, std::time::Instant::now())
+                        .unwrap()
+                    {
+                        break frame;
+                    }
+                }
+            } else {
+                loop {
+                    let wire = ordered_reader.read(&mut peer, 65536).await.unwrap();
+                    let body = ordered_cipher
+                        .open(&wire.body, &veil_proto::codec::frame_aad(&wire.header))
+                        .unwrap();
+                    if wire.header.family == FrameFamily::Session as u8 {
+                        continue;
+                    }
+                    let mut header = wire.header;
+                    header.body_len = body.len() as u32;
+                    let mut frame = veil_proto::codec::encode_header(&header).to_vec();
+                    frame.extend_from_slice(&body);
+                    break frame;
+                }
+            };
+            let header = veil_proto::codec::decode_header(&decoded).unwrap();
+            assert_eq!(
+                header.priority(),
+                INTERACTIVE,
+                "source scheduling is never advertised on wire"
+            );
+            let payload =
+                veil_proto::delivery::ForwardPayload::decode(&decoded[veil_proto::HEADER_SIZE..])
+                    .unwrap();
+            let marker = payload.envelope.payload[0];
+            assert_eq!(
+                decoded.as_slice(),
+                make(marker).as_ref(),
+                "opaque bytes unchanged"
+            );
+            match marker {
+                0 => {
+                    assert!(work_arrivals.is_empty());
+                    work_arrivals.push(std::time::Instant::now());
+                    // No producer input after these two independent sources.
+                    // Remaining work must wake from its release timers.
+                    sender.send((REALTIME, make(9))).await.unwrap();
+                    sender.send((INTERACTIVE, make(10))).await.unwrap();
+                }
+                1 | 2 => {
+                    assert_eq!(
+                        controls.len(),
+                        2,
+                        "audio and transit must pass the held video"
+                    );
+                    assert_eq!(
+                        marker as usize,
+                        work_arrivals.len(),
+                        "no duplicates/reordering"
+                    );
+                    work_arrivals.push(std::time::Instant::now());
+                }
+                9 | 10 => controls.push(marker),
+                other => panic!("unexpected payload {other}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    controls.sort_unstable();
+    assert_eq!(controls, [9, 10]);
+    assert!(work_arrivals[1].duration_since(work_arrivals[0]) >= Duration::from_millis(20));
+    assert!(work_arrivals[2].duration_since(work_arrivals[0]) >= Duration::from_millis(50));
+    assert!(
+        !work.cell(2).unwrap().rejected(),
+        "a pacing wait must not reject admitted work"
+    );
+    handle.close();
+    remote_handle.close();
+    timeout(Duration::from_secs(2), job).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn paced_local_work_wakes_on_datagrams_and_preserves_other_sources() {
+    verify_paced_work(true).await;
+}
+
+#[tokio::test]
+async fn paced_local_work_wakes_on_ordered_fallback_and_preserves_other_sources() {
+    verify_paced_work(false).await;
+}

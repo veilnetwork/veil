@@ -28,6 +28,7 @@
 pub mod bridge;
 mod frame_io;
 mod handlers;
+mod lossy_source_cadence;
 pub mod path;
 mod remote_stream_writer;
 pub mod route_trace;

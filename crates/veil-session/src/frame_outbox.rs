@@ -164,6 +164,14 @@ impl FrameSender {
             return false;
         }
         let mut envelope = FrameEnvelope::from(frame);
+        envelope.expires_at = cell.expires_at();
+        if envelope
+            .expires_at
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            cell.reject();
+            return false;
+        }
         envelope.local_work = Some(cell);
         self.ordinary.try_send(envelope).is_ok()
     }
