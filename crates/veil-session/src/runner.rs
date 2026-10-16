@@ -2676,13 +2676,16 @@ impl SessionRunner {
         outbox: &mut crate::FrameOutbox,
         pq: &mut crate::priority_queue::PriorityQueue,
         timers: &mut crate::timers::SessionTimers,
+        ingress_trace: &mut crate::rt_trace::IngressTrace,
     ) -> std::ops::ControlFlow<()> {
         use std::ops::ControlFlow;
         use tokio::sync::mpsc::error::TryRecvError;
         let mut any_realtime = false;
+        let tracing = crate::rt_trace::rt_trace_enabled();
         loop {
             match outbox.try_recv_envelope() {
                 Ok(envelope) => {
+                    if tracing { ingress_trace.observe(envelope.frame.0, envelope.queued_at); }
                     // chunking is always supported (single protocol version),
                     // so no CHUNK-flag gating is needed here.
                     any_realtime |=
@@ -2698,6 +2701,7 @@ impl SessionRunner {
                 }
             }
         }
+        if tracing { ingress_trace.report(&self.logger, &self.peer_id, pq.len()); }
         if any_realtime {
             // Outbound media in flight — arm/refresh the accelerated
             // liveness cadence (P2P mobility slice).
@@ -4524,6 +4528,7 @@ impl SessionRunner {
         let mut datagram_canonical_trace = (0u64, 0u64, 0u64, None::<std::time::Instant>);
         let mut datagram_boundary_trace = (0u64, None::<std::time::Instant>);
         let mut source_reliable_pressure_logged: Option<std::time::Instant> = None;
+        let mut ingress_trace = crate::rt_trace::IngressTrace::default();
         let mut source_reliable_admitted_logged: Option<std::time::Instant> = None;
         let mut ordered_primary_pressure_logged: Option<std::time::Instant> = None;
         let mut first_ordered_primary_admitted_logged = false;
@@ -4566,11 +4571,12 @@ impl SessionRunner {
                         }
                     }
                 }
+                let ingress_started = crate::rt_trace::stage_start();
                 // Outbox drain returns `ControlFlow::Break` if the Sender
                 // was dropped — that means run must exit.
                 if let Some(ref mut outbox) = outbox
                     && let std::ops::ControlFlow::Break(()) =
-                        self.drain_outbox_into_pq(outbox, &mut pq, &mut timers)
+                        self.drain_outbox_into_pq(outbox, &mut pq, &mut timers, &mut ingress_trace)
                 {
                     Self::stop_writer(wire_tx, &mut writer_handle).await;
                     return;
@@ -4579,6 +4585,8 @@ impl SessionRunner {
                     self.drain_rpc_outbox_into_pq(rpc_outbox, &mut pq, &mut pending_responses);
                 }
                 datagram_activity.apply(&mut timers);
+                crate::rt_trace::finish_stage(ingress_started, &self.logger, &self.peer_id, "ingress_drain", pq.len());
+                let maintenance_started = crate::rt_trace::stage_start();
                 // ── keepalive / idle timeout checks ──────────────────
                 if timer_enabled {
                     let now = tokio::time::Instant::now();
@@ -4797,6 +4805,8 @@ impl SessionRunner {
                 // nonce-watermark, PQ E2E key rotation respectively).
                 self.maybe_initiate_x25519_rekey(&mut rekey, &mut pq);
                 self.maybe_initiate_mlkem_rekey(&mut mlkem_rekey, &mut pq);
+                crate::rt_trace::finish_stage(maintenance_started, &self.logger, &self.peer_id, "maintenance", pq.len());
+                let datagram_started = crate::rt_trace::stage_start();
                 // ── Step 2: flush priority queue to the wire ─────────────────
                 // Preserve ordinary WRR/FIFO first. If a reliable head blocks
                 // it, independently transported local sources may progress in
@@ -5349,6 +5359,8 @@ impl SessionRunner {
                 // ⇒ `current_outbound_batch_window` returns None ⇒
                 // `coalesce_until` is None ⇒ `coalesce_active` is false ⇒
                 // drain proceeds unconditionally as).
+                crate::rt_trace::finish_stage(datagram_started, &self.logger, &self.peer_id, "datagram_drain", pq.len());
+                let ordered_started = crate::rt_trace::stage_start();
                 let coalesce_window = current_outbound_batch_window(battery_keepalive.last_level());
                 let now_for_drain = tokio::time::Instant::now();
                 let coalescing_priority = pq.coalescing_priority();
@@ -5840,6 +5852,7 @@ impl SessionRunner {
                     rekey.record_bytes(tx_len);
                     mlkem_rekey.record_bytes(tx_len);
                 }
+                crate::rt_trace::finish_stage(ordered_started, &self.logger, &self.peer_id, "ordered_drain", pq.len());
                 // deferred : stamp the coalescer's last-drain time after a
                 // successful drain pass (any frames emitted). Doing it
                 // unconditionally would let the deadline creep forward
@@ -5885,10 +5898,11 @@ impl SessionRunner {
                     self.logger.info(
                         "session.rt_trace.local_reliable_pressure",
                         format!(
-                            "peer_id={} pq_depth={} retry_ms={}",
+                            "peer_id={} pq_depth={} retry_ms={} heads=[{}]",
                             hex_short(&self.peer_id),
                             pq.len(),
-                            retry.saturating_duration_since(now).as_millis()
+                            retry.saturating_duration_since(now).as_millis(),
+                            pq.trace_heads()
                         ),
                     );
                 }
@@ -6615,10 +6629,17 @@ impl SessionRunner {
             m.add_transport_bytes_rx(bytes);
             m.add_transport_bytes_rx_family(h.family, h.msg_type, bytes);
         }
-        match self
-            .dispatcher
-            .dispatch(&h, &frame[veil_proto::header::HEADER_SIZE..], self.peer_id)
-        {
+        let dispatch_started = crate::rt_trace::stage_start();
+        let result = self.dispatcher.dispatch(&h, &frame[veil_proto::header::HEADER_SIZE..], self.peer_id);
+        if let Some(started) = dispatch_started {
+            let elapsed_ms = started.elapsed().as_millis();
+            if elapsed_ms >= crate::rt_trace::SLOW_DISPATCH_MS {
+                self.logger.warn("session.rt_trace.slow_dispatch", format!(
+                    "peer_id={} carrier=reliable family={} msg={} len={} elapsed_ms={elapsed_ms}",
+                    hex_short(&self.peer_id), h.family, h.msg_type, h.body_len));
+            }
+        }
+        match result {
             DispatchResult::Response(response) => {
                 crate::frame_diag::note_metadata(&self.peer_id, &response, "child_response");
                 // A slow IPC reader may make the dispatcher respond with Close.
