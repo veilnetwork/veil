@@ -242,15 +242,17 @@ async fn discover_route(
     // taking the cached route and sealing to a certificate its owner had
     // stopped standing behind (report20 V18-M12). Not ready means the
     // reactive discovery below, which fetches a current one.
-    let now_unix = veil_util::unix_secs_now_u64();
-    let mlkem_ready = peer_mlkem_keys
-        .map(|k| {
-            rlock!(k)
-                .get(dst)
-                .is_some_and(|(key, _)| key.usable_at(now_unix).is_some())
-        })
-        .unwrap_or(true); // if no E2E infrastructure, route alone is sufficient
-    if mlkem_ready
+    let mlkem_ready = || {
+        let now_unix = veil_util::unix_secs_now_u64();
+        peer_mlkem_keys
+            .map(|k| {
+                rlock!(k)
+                    .get(dst)
+                    .is_some_and(|(key, _)| key.usable_at(now_unix).is_some())
+            })
+            .unwrap_or(true) // if no E2E infrastructure, route alone is sufficient
+    };
+    if mlkem_ready()
         && let Some(cache) = route_cache
         && let Some(hop) = cached_discovery_hop(&rlock!(cache), dst, session_tx_registry, kind)
     {
@@ -359,18 +361,32 @@ async fn discover_route(
         }
     }
 
-    // Wait for the first of: parsed RecursiveResponse (populates cache), any
-    // route_updated notification (RouteResponse or gossip), or the 500 ms cap.
-    let deadline = std::time::Duration::from_millis(500);
+    // The small RecursiveResponse can precede its larger signed key proof.
+    // Keep the shared lookup until BOTH are ready, so a waiter cannot launch
+    // another proof while the first one is still in flight. Unrelated route
+    // notifications are only wakeups, never evidence for this destination.
+    // Keep one fixed deadline and the legacy route-only fallback on expiry.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut rq_rx = rq_rx;
     tokio::pin!(notified);
-    if let Some(rx) = rq_rx {
-        tokio::select! {
-            _ = rx => {}
-            _ = &mut notified => {}
-            _ = tokio::time::sleep(deadline) => {}
+    loop {
+        // Register before checking the caches, including after each wakeup.
+        notified.as_mut().enable();
+        if mlkem_ready()
+            && cached_discovery_hop(&rlock!(cache), dst, session_tx_registry, kind).is_some()
+        {
+            break;
         }
-    } else {
-        let _ = tokio::time::timeout(deadline, &mut notified).await;
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::select! {
+            _ = &mut notified => {}
+            _ = async { let _ = rq_rx.as_mut().expect("guarded receiver").await; },
+                if rq_rx.is_some() => { rq_rx = None; }
+            _ = tokio::time::sleep_until(deadline) => { break; }
+        }
+        notified.set(notify.notified());
     }
 
     // Retry the cache lookup.
@@ -4983,6 +4999,128 @@ mod ratchet_send_tests {
         let (a, b, c, ()) = tokio::join!(ask(), ask(), ask(), answer);
         assert_eq!([a, b, c], [Some(RELAY); 3]);
         assert!(fx.taken().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_discovery_waits_for_the_key_after_the_route_reply() {
+        const LOCAL: [u8; 32] = [0xA7; 32];
+        const DST: [u8; 32] = [0xA8; 32];
+        let fx = fixture(vec![RELAY]);
+        let notify = tokio::sync::Notify::new();
+        let pending = Mutex::new(std::collections::HashMap::new());
+        let ask = || {
+            try_lookup_or_discover(
+                &DST,
+                &LOCAL,
+                Some(&fx.route_cache),
+                Some(fx.outbox.as_ref()),
+                Some(&notify),
+                Some(&fx.peer_mlkem),
+                Some(&pending),
+            )
+        };
+        let answer = async {
+            tokio::task::yield_now().await;
+            let sent = fx.taken();
+            assert_eq!(sent.len(), 1);
+            let query = veil_proto::routing::RecursiveQueryPayload::decode(
+                &sent[0].1[veil_proto::HEADER_SIZE..],
+            )
+            .unwrap();
+            // The small route answer precedes its larger signed key proof.
+            wlock!(fx.route_cache).insert(DST, RELAY, 10, 2);
+            lock!(pending)
+                .remove(&query.query_id)
+                .unwrap()
+                .tx
+                .send(vec![])
+                .unwrap();
+            notify.notify_waiters();
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            assert!(
+                fx.taken().is_empty(),
+                "a split reply must not launch another key proof"
+            );
+            wlock!(fx.peer_mlkem).insert(
+                DST,
+                (
+                    veil_e2e::PeerMlKemKey::unattested(ring(0xC5).current_ek().to_vec()),
+                    std::time::Instant::now(),
+                ),
+            );
+            notify.notify_waiters();
+        };
+        let start = tokio::time::Instant::now();
+        let (a, b, ()) = tokio::join!(ask(), ask(), answer);
+        assert_eq!([a, b], [Some(RELAY); 2]);
+        assert!(start.elapsed() >= std::time::Duration::from_millis(80));
+        assert!(fx.taken().is_empty());
+        assert!(lock!(pending).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unrelated_route_notifications_do_not_finish_discovery() {
+        const LOCAL: [u8; 32] = [0xA9; 32];
+        const DST: [u8; 32] = [0xAA; 32];
+        let fx = fixture(vec![RELAY]);
+        let notify = tokio::sync::Notify::new();
+        let answer = async {
+            tokio::task::yield_now().await;
+            assert_eq!(fx.taken().len(), 1);
+            // An answer for a different target is not this caller's result.
+            wlock!(fx.route_cache).insert([0xAB; 32], RELAY, 10, 2);
+            notify.notify_waiters();
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            wlock!(fx.route_cache).insert(DST, RELAY, 10, 2);
+            notify.notify_waiters();
+        };
+        let (result, ()) = tokio::join!(
+            try_lookup_or_discover(
+                &DST,
+                &LOCAL,
+                Some(&fx.route_cache),
+                Some(fx.outbox.as_ref()),
+                Some(&notify),
+                None,
+                None,
+            ),
+            answer
+        );
+        assert_eq!(result, Some(RELAY));
+        assert!(fx.taken().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn route_notifications_cannot_extend_the_key_wait_deadline() {
+        const LOCAL: [u8; 32] = [0xAC; 32];
+        const DST: [u8; 32] = [0xAD; 32];
+        let fx = fixture(vec![RELAY]);
+        let notify = tokio::sync::Notify::new();
+        wlock!(fx.route_cache).insert(DST, RELAY, 10, 2);
+        let start = tokio::time::Instant::now();
+        let lookup = async {
+            let route = try_lookup_or_discover(
+                &DST,
+                &LOCAL,
+                Some(&fx.route_cache),
+                Some(fx.outbox.as_ref()),
+                Some(&notify),
+                Some(&fx.peer_mlkem),
+                None,
+            )
+            .await;
+            // Legacy recovery can still use the route at the fixed deadline.
+            assert_eq!(route, Some(RELAY));
+            assert_eq!(start.elapsed(), std::time::Duration::from_millis(500));
+        };
+        let noise = async {
+            for _ in 0..10 {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                notify.notify_waiters();
+            }
+        };
+        tokio::join!(lookup, noise);
+        assert_eq!(fx.taken().len(), 1);
     }
 
     #[tokio::test]
