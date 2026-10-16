@@ -3576,6 +3576,7 @@ mod ratchet_send_tests {
                     mlkem_pubkey: None,
                 },
                 remote_capabilities: CapabilitiesPayload {
+                    extra_flags2: 0,
                     roles_supported: role_bits::CORE,
                     flags: 0,
                     extra_flags: 0,

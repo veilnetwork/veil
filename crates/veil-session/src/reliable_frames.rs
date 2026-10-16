@@ -126,7 +126,7 @@ impl FrameReservation {
 fn record_charge(bytes: usize) -> usize {
     (bytes + AEAD_OVERHEAD + 2).max(MIN_CHARGE)
 }
-fn valid_plain(plain: &[u8]) -> bool {
+pub(crate) fn valid_plain(plain: &[u8]) -> bool {
     plain.len() + AEAD_OVERHEAD <= MAX_RECORD_BYTES
         && decode_header(plain).is_ok_and(|h| h.body_len as usize + HEADER_SIZE == plain.len())
 }

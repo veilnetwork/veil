@@ -280,6 +280,7 @@ mod tests {
 
     fn make_capabilities() -> CapabilitiesPayload {
         CapabilitiesPayload {
+            extra_flags2: 0,
             roles_supported: role_bits::LEAF,
             flags: cap_flags::CAN_RELAY,
             extra_flags: 0,
