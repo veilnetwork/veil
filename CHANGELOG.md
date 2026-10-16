@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.11.41] - 2026-10-16
+
+### Fixed
+
+- Group calls now use the bounded decoded-audio catch-up factory already used
+  for one-to-one calls. A delayed render callback discards stale decoded audio
+  instead of continuing to play an old backlog.
+- Group media statistics expose additive room-local recovery, discarded-audio
+  and fallback counters so endpoints can reduce competing video after recovery.
+
+### Tests
+
+- Add a three-engine Opus/mixer regression with two remote voices per receiver,
+  a paused render callback, and held video queues. The fixed engine recovers
+  fresh mixed audio; disabling catch-up reproduces the stale-audio failure.
+
 ## v0.11.40 — 2026-10-15
 
 ### Changed
