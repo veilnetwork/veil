@@ -6597,6 +6597,7 @@ impl SessionRunner {
             .dispatch(&h, &frame[veil_proto::header::HEADER_SIZE..], self.peer_id)
         {
             DispatchResult::Response(response) => {
+                crate::frame_diag::note_metadata(&self.peer_id, &response, "child_response");
                 // A slow IPC reader may make the dispatcher respond with Close.
                 // Keep that close abortable until the remote receipt arrives.
                 streams.admitted(&response, reliable_streams::Route::Child(child));
@@ -6697,6 +6698,7 @@ impl SessionRunner {
                     h.family == FrameFamily::Session as u8 || h.family == FrameFamily::Control as u8
                 });
                 // Capture the plaintext response before any encryption.
+                crate::frame_diag::note_metadata(&self.peer_id, &resp_bytes, "response_selected");
                 crate::frame_diag::note_chunk_frame_at(
                     "transport_selected",
                     Some(&self.local_node_id),

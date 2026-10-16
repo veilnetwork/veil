@@ -9,6 +9,12 @@
 //! that could be read either filtered its candidates or never fired. The hook
 //! named the caller in one run.
 //!
+//! `VEIL_DIAG_FRAME_METADATA` accepts the same selectors and records at most
+//! 20,000 enqueue/response observations per process: destination prefix, frame
+//! family/type, request id and length only. It has no payload head or backtrace
+//! and is useful for size/timing correlation in an owned performance stand.
+//! It is separate from the caller/backtrace diagnostic below and off by default.
+//!
 //! # Using it
 //!
 //! Set `VEIL_DIAG_FRAME` to a comma-separated list of `family[/type]`
@@ -42,6 +48,8 @@ type Selector = (u8, Option<u16>);
 
 static FILTER: OnceLock<Option<Vec<Selector>>> = OnceLock::new();
 static SEEN: AtomicU64 = AtomicU64::new(0);
+static METADATA_FILTER: OnceLock<Option<Vec<Selector>>> = OnceLock::new();
+static METADATA_SEEN: AtomicU64 = AtomicU64::new(0);
 static CHUNKS: OnceLock<bool> = OnceLock::new();
 static CHUNKS_SEEN: AtomicU64 = AtomicU64::new(0);
 
@@ -172,6 +180,7 @@ fn selected(selectors: &[Selector], family: u8, msg_type: u16) -> bool {
 /// placement is the point — a probe whose work happens before its own gate
 /// slows the node down whether or not anybody asked for it.
 pub fn note_outbound(dest: &[u8; 32], frame: &[u8], via: &str) {
+    note_metadata(dest, frame, via);
     let Some(selectors) = filter() else {
         return;
     };
@@ -208,6 +217,38 @@ pub fn note_outbound(dest: &[u8; 32], frame: &[u8], via: &str) {
             frame.len()
         );
     }
+}
+
+/// Optional bounded frame-size correlation without payloads or backtraces.
+/// `VEIL_DIAG_FRAME_METADATA` uses the same selectors as `VEIL_DIAG_FRAME`.
+/// This records enqueue/selection observations, not confirmed wire delivery.
+pub(crate) fn note_metadata(dest: &[u8; 32], frame: &[u8], via: &str) {
+    let Some(selectors) = METADATA_FILTER.get_or_init(|| {
+        std::env::var("VEIL_DIAG_FRAME_METADATA")
+            .ok()
+            .as_deref()
+            .and_then(parse_filter)
+    }) else {
+        return;
+    };
+    let Some((family, msg_type)) = family_and_type(frame) else {
+        return;
+    };
+    if !selected(selectors, family, msg_type)
+        || METADATA_SEEN.fetch_add(1, Ordering::Relaxed) >= 20_000
+    {
+        return;
+    }
+    let request = u32::from_be_bytes(frame[20..24].try_into().expect("checked header"));
+    let at_unix_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    log::info!(
+        target: "veil::frame_metadata",
+        "at_unix_us={at_unix_us} via={via} dst={} family={family} type={msg_type} request={request} len={}",
+        hex_prefix(dest, 4), frame.len(),
+    );
 }
 
 /// Family at byte 5, message type big-endian at 6..8. `None` for anything too
