@@ -297,6 +297,11 @@ pub struct CryptoContext {
 /// resolver's crate.
 pub type PeerCertInvalidateFn = Arc<dyn Fn(&[u8; 32]) + Send + Sync>;
 
+/// Request a bounded background verification of one sending device's cert.
+/// This never grants provenance: only the verified key cache can do that on
+/// a subsequent successful authenticated open.
+pub type PeerCertWarmFn = Arc<dyn Fn([u8; 32], [u8; 16]) + Send + Sync>;
+
 /// Signs a relayed "cannot open" reply to the peer named by the argument, or
 /// `None` when this node has no identity to sign with (or its own limit says
 /// not now). Installed by the runtime into
@@ -911,6 +916,7 @@ pub struct FrameDispatcher {
     /// dispatcher has been cloned into running sessions by then — all clones
     /// share this slot, so an in-place set reaches every one.
     pub peer_cert_invalidate: Arc<Mutex<Option<PeerCertInvalidateFn>>>,
+    pub peer_cert_warm: Arc<Mutex<Option<PeerCertWarmFn>>>,
 
     /// When each peer was last told `AppSendUnopenable`. One reply per peer
     /// per [`UNOPENABLE_REPLY_INTERVAL`]: the frames a sender had in flight
@@ -2052,6 +2058,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         rendezvous_weak: Arc::new(std::sync::Mutex::new(None)),
         session_registry: None,
         peer_cert_invalidate: Arc::new(Mutex::new(None)),
+        peer_cert_warm: Arc::new(Mutex::new(None)),
         unopenable_replied: Arc::new(Mutex::new(std::collections::HashMap::new())),
         decrypt_failure_log: Arc::new(Mutex::new(std::collections::HashMap::new())),
         sender_identity_lookup: Arc::default(),
@@ -2924,6 +2931,7 @@ mod tests {
             rendezvous_weak: Arc::new(std::sync::Mutex::new(None)),
             session_registry: None, // test dispatcher — sovereign routing bypassed
             peer_cert_invalidate: Arc::new(Mutex::new(None)),
+            peer_cert_warm: Arc::new(Mutex::new(None)),
             unopenable_replied: Arc::new(Mutex::new(std::collections::HashMap::new())),
             decrypt_failure_log: Arc::new(Mutex::new(std::collections::HashMap::new())),
             sender_identity_lookup: Arc::default(),

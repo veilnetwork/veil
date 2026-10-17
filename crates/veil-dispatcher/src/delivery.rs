@@ -2000,6 +2000,24 @@ impl FrameDispatcher {
             let now_unix = veil_util::unix_secs_now_u64();
             match ratchet.open_payload(&ratchet_peer, &envelope.payload, now_unix) {
                 Ok(opened) => {
+                    // A newly linked sending device is not necessarily in our
+                    // verified-key cache. Previously only an outbound send to
+                    // that exact instance populated it; ordinary retries then
+                    // decrypted forever as Claimed and the app correctly
+                    // refused them. Ask for the signed device certificate,
+                    // without trusting this ciphertext's claimed identity.
+                    if !opened.authenticated
+                        && let Some((instance, _)) = veil_e2e::payload_instances(&envelope.payload)
+                    {
+                        let warmer = self
+                            .peer_cert_warm
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .clone();
+                        if let Some(warm) = warmer {
+                            warm(ratchet_peer, instance);
+                        }
+                    }
                     return Some(DecryptedForward {
                         payload: opened.plaintext,
                         ack_key: opened.ack_key,
@@ -4649,16 +4667,41 @@ mod ratchet_terminal_tests {
     #[test]
     fn an_unresolved_sender_certificate_downgrades_the_verdict_not_the_delivery() {
         let (alice, bob) = (party(ALICE, 0xA3), party(BOB, 0xB3));
-        // Deliberately no `learn(&bob, &alice)`.
+        // Deliberately no learn: the ciphertext opens, but the sender's key
+        // has not yet been verified. A lookup request grants nothing itself.
         let payload = seal(&alice, &bob, b"who am i");
-
         let (disp, _h, mut rx) = dispatcher_for(&bob);
+        let warmed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests = Arc::clone(&warmed);
+        *disp.peer_cert_warm.lock().unwrap() = Some(Arc::new(move |peer, instance| {
+            requests.lock().unwrap().push((peer, instance));
+        }));
         let (hdr, body) = forward_frame([0x03u8; 32], payload);
         disp.dispatch(&hdr, &body, NodeId::from(RELAY));
-
         let (_src, provenance, data) = take(&mut rx).expect("delivered anyway");
         assert_eq!(data, b"who am i");
         assert_eq!(provenance, SenderProvenance::Claimed);
+        assert_eq!(*warmed.lock().unwrap(), vec![(ALICE, alice.instance_id)]);
+
+        // Model completion of the existing certificate verifier. Only after
+        // it publishes the exact device key can a fresh retry become Signed.
+        learn(&bob, &alice);
+        let retry = seal(&alice, &bob, b"verified retry");
+        let (hdr, body) = forward_frame([0x04u8; 32], retry);
+        disp.dispatch(&hdr, &body, NodeId::from(RELAY));
+        let (_src, provenance, data) = take(&mut rx).expect("verified retry delivered");
+        assert_eq!(data, b"verified retry");
+        assert_eq!(provenance, SenderProvenance::Signed);
+        assert_eq!(
+            warmed.lock().unwrap().len(),
+            1,
+            "verified traffic does no lookup"
+        );
+        assert_eq!(
+            rlock!(disp.route_cache).lookup(&ALICE),
+            None,
+            "certificate verification does not bless the relay as a route"
+        );
     }
 
     /// A frame that dropped its post-quantum leg is not delivered at all.
