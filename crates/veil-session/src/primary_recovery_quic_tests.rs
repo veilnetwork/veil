@@ -1103,6 +1103,82 @@ async fn verify_distinct_sources(late_idle: bool) {
             assert_eq!(diagnostics.active_connections(), 0);
             return;
         }
+        // Channel maintenance may retire a previously prepared signaling
+        // child. Repeated real transport closes must report unavailability,
+        // then reopen with new keys, while the audio child keeps working.
+        // The physical call-start failure exercises the narrower close /
+        // capacity race between the old two readiness polls.
+        let frame = primary_test_frame(true, 80, 0);
+        let (_, body, kind) = super::super::decode_realtime_lane_frame(&frame).unwrap();
+        for seq in 80..83 {
+            let retired_binding = handles[4].channel_binding().unwrap();
+            handles[4].close();
+            timeout(Duration::from_secs(1), handles[4].closed())
+                .await
+                .unwrap();
+            assert!(
+                a.prepare_frame(crate::LOCAL_SIGNALING_LANE, body, kind)
+                    .is_none()
+            );
+            let primary = a.prepare_frame(REALTIME, body, kind).unwrap();
+            assert_eq!(
+                a.sender(primary)
+                    .handle
+                    .quic()
+                    .unwrap()
+                    .channel_binding()
+                    .unwrap(),
+                handles[0].channel_binding().unwrap()
+            );
+            {
+                let primary_frame = primary_test_frame(true, seq + 1000, 0);
+                let mut sender = a.sender(primary);
+                let max_size = sender.max_datagram_size;
+                for packet in sender
+                    .tx
+                    .encode_frame(100, &primary_frame, max_size)
+                    .unwrap()
+                {
+                    sender.handle.send(&packet).unwrap();
+                }
+            }
+            assert_eq!(
+                timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .0,
+                seq + 1000
+            );
+            let index = timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(index) = a.prepare_frame(crate::LOCAL_SIGNALING_LANE, body, kind) {
+                        break index;
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let frame = primary_test_frame(true, seq, 0);
+            let mut sender = a.sender(index);
+            let new_handle = sender.handle.quic().unwrap().clone();
+            assert_ne!(new_handle.channel_binding().unwrap(), retired_binding);
+            let max_size = sender.max_datagram_size;
+            for packet in sender.tx.encode_frame(99, &frame, max_size).unwrap() {
+                sender.handle.send(&packet).unwrap();
+            }
+            drop(sender);
+            assert_eq!(
+                timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .0,
+                seq
+            );
+            handles[4] = new_handle;
+        }
         // Retiring only the screen connection cannot retire the file source
         // or silently fall back to a shared canonical congestion controller.
         let screen_binding = handles[2].channel_binding().unwrap();
