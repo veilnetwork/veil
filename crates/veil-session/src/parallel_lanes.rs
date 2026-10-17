@@ -236,6 +236,17 @@ struct ReadySender {
     _channel: Channel,
 }
 
+impl ReadySender {
+    fn unavailable(&self) -> bool {
+        let sender = lock!(self.sender);
+        sender.broken
+            || sender
+                .handle
+                .quic()
+                .is_some_and(|handle| handle.is_closed())
+    }
+}
+
 #[derive(Default)]
 struct Slot {
     ready: Option<ReadySender>,
@@ -772,7 +783,9 @@ impl ParallelSession {
     }
 
     #[cfg(test)]
-    pub(super) async fn stage_verified_primary_replacement(&mut self) {
+    pub(super) async fn stage_verified_primary_replacement(
+        &mut self,
+    ) -> veil_transport::QuicDatagramHandle {
         // A real exporter-bound handshake completes before the runner's next
         // poll, matching a replacement result racing an ACK on the old path.
         let index = self
@@ -796,32 +809,27 @@ impl ParallelSession {
         )
         .await
         .expect("replacement proof");
+        let handle = lock!(ready.sender).handle.quic().unwrap().clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         assert!(tx.send(ready).is_ok());
         let task = RealtimeReceiverTask(tokio::spawn(std::future::pending()));
         self.slots[index].warm = Some((rx, task));
         self.slots[index].replacing = true;
+        handle
     }
 
     fn poll_index(&mut self, index: usize) {
         let slot = &mut self.slots[index];
-        if slot.ready.as_ref().is_some_and(|ready| {
-            let sender = lock!(ready.sender);
-            sender.broken
-                || sender
-                    .handle
-                    .quic()
-                    .is_some_and(|handle| handle.is_closed())
-        }) {
+        if slot.ready.as_ref().is_some_and(ReadySender::unavailable) {
             slot.ready = None;
             slot.retry_after = Some(std::time::Instant::now() + RETRY_DELAY);
         }
         if let Some((rx, _)) = slot.warm.as_mut() {
             match rx.try_recv() {
-                Ok(ready) => {
-                    // connect_sender verified the live parent's exporter-bound
-                    // ACK before returning ReadySender. Drop the old channel
-                    // only now; a failed candidate never displaces it.
+                Ok(ready) if !ready.unavailable() => {
+                    // Authentication succeeded before publishing the result,
+                    // but the child can close while waiting in this oneshot.
+                    // Only a still-usable candidate may displace the old path.
                     slot.ready = Some(ready);
                     slot.warm = None;
                     if std::mem::take(&mut slot.replacing) {
@@ -840,7 +848,7 @@ impl ParallelSession {
                         );
                     }
                 }
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                     slot.warm = None;
                     slot.replacing = false;
                     slot.retry_after = Some(std::time::Instant::now() + RETRY_DELAY);
