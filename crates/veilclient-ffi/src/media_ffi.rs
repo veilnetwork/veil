@@ -619,11 +619,27 @@ pub unsafe extern "C" fn veil_media_open_channel(
                 let hub = Arc::clone(&send_hub);
                 let routes = send_routes.clone();
                 async move {
-                    if let Some(routes) = routes {
+                    // Endpoint-only correlation with the authenticated receive
+                    // sample. Native RTP admission does not prove the sealed
+                    // cell ever entered its anonymous route's first hop.
+                    media::trace_sealed_cell("onion_send_begin", &peer, sealed.as_bytes());
+                    let result = if let Some(routes) = routes {
                         routes.send(plane, &sealed).await
                     } else {
                         hub.media_send_datagram(peer, plane, &sealed).await
-                    }
+                    };
+                    media::trace_sealed_cell(
+                        if sealed.locally_expired() {
+                            "onion_send_expired_at_return"
+                        } else if result {
+                            "onion_send_local_ok"
+                        } else {
+                            "onion_send_failed"
+                        },
+                        &peer,
+                        sealed.as_bytes(),
+                    );
+                    result
                 }
             },
             move || {
