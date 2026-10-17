@@ -136,8 +136,7 @@ pub(crate) fn ffi_diag(msg: &str) {
     log::warn!("{msg}");
     #[cfg(not(target_os = "android"))]
     {
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr(), "{msg}");
+        let _ = veil_observability::enqueue_console_record(format!("{msg}\n"));
     }
 }
 
@@ -741,6 +740,26 @@ pub extern "C" fn veil_debug_set_rt_trace(on: c_int) {
     veil_ipc::route_trace::set_enabled(on != 0);
     #[cfg(feature = "node-embedded")]
     veil_node_runtime::set_terminal_auth_trace(on != 0);
+}
+
+/// Diagnostic/shutdown barrier for prior accepted console records. Never call
+/// from a realtime callback. 0 = flushed, 1 = deadline/I/O failure. Rejection
+/// and I/O counters below must also be checked before qualifying a capture.
+#[unsafe(no_mangle)]
+pub extern "C" fn veil_debug_flush_console_logs(timeout_ms: u64) -> c_int {
+    i32::from(!veil_observability::flush_console_logs(
+        std::time::Duration::from_millis(timeout_ms.min(5_000)),
+    ))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn veil_debug_console_log_dropped() -> u64 {
+    veil_observability::console_log_stats().dropped_records
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn veil_debug_console_log_write_errors() -> u64 {
+    veil_observability::console_log_stats().write_errors
 }
 
 /// EXPERIMENT SWITCH (call-RTT-spike investigation): pause/resume the
