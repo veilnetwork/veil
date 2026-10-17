@@ -983,6 +983,40 @@ impl AppSender {
                 )
                 .await;
         }
+        self.send_relay_media_cells_before_owned(
+            local_priority,
+            destination,
+            destination_app,
+            endpoint,
+            cells,
+            deadline,
+            expirations,
+        )
+        .await
+    }
+
+    /// Independent sealed cells with the existing lane/deadline, without a
+    /// producer-frame boundary. Controls must not update frame cadence even
+    /// when the local daemon supports complete source work.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_relay_media_cells_before_owned(
+        &self,
+        local_priority: u8,
+        destination: [u8; 32],
+        destination_app: [u8; 32],
+        endpoint: u32,
+        cells: Vec<Vec<u8>>,
+        deadline: tokio::time::Instant,
+        expirations: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Result<bool, ClientError> {
+        if !matches!(
+            local_priority,
+            veil_proto::priority::BULK | veil_proto::priority::BACKGROUND
+        ) {
+            return Err(ClientError::Protocol(
+                "local media cells require a secondary source lane".to_owned(),
+            ));
+        }
         for cell in cells {
             if !self
                 .send_relay_media_sealed_on_local_lane_before_tracked_owned(

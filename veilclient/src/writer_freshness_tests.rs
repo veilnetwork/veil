@@ -93,6 +93,75 @@ async fn whole_source_work_has_one_ipc_deadline_and_legacy_fallback() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn independent_media_cells_never_publish_frame_cadence_on_new_or_old_daemons() {
+    let cell = [
+        veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC.as_slice(),
+        &[7; 100],
+    ]
+    .concat();
+    for upgraded in [false, true] {
+        let (tx, mut rx) = mpsc::channel::<IpcWriterFrame>(4);
+        let writer = SharedWriter::new(tx).with_local_lossy_work(upgraded);
+        let sender = sender(writer.clone());
+        for lane in [veil_proto::priority::BULK, veil_proto::priority::BACKGROUND] {
+            assert!(
+                sender
+                    .send_relay_media_cells_before_owned(
+                        lane,
+                        [8; 32],
+                        [9; 32],
+                        10,
+                        vec![cell.clone(); 2],
+                        tokio::time::Instant::now() + Duration::from_millis(200),
+                        None,
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(rx.len(), 2, "complete controls keep individual-cell IPC");
+            for _ in 0..2 {
+                let bytes = rx.recv().await.unwrap();
+                let header = decode_header(&bytes).unwrap();
+                assert_eq!(header.msg_type, LocalAppMsg::AppIpcSend as u16);
+                assert_eq!(veil_proto::ipc::ipc_local_source_lane(&header), lane);
+                let payload = AppIpcSendPayload::decode(&bytes[HEADER_SIZE..]).unwrap();
+                assert_eq!(payload.dst_node_id, [8; 32]);
+                assert_eq!(payload.src_app_id, [7; 32]);
+                assert_eq!(payload.app_id, [9; 32]);
+                assert_eq!(payload.endpoint_id, 10);
+                assert_eq!(&*payload.data, &cell);
+                assert!(!payload.require_ack);
+            }
+        }
+        for _ in 0..4 {
+            writer
+                .write_frame(LocalAppMsg::StreamClose as u16, &[])
+                .await
+                .unwrap();
+        }
+        assert!(
+            !sender
+                .send_relay_media_cells_before_owned(
+                    veil_proto::priority::BULK,
+                    [8; 32],
+                    [9; 32],
+                    10,
+                    vec![cell.clone(); 2],
+                    tokio::time::Instant::now() + Duration::from_millis(200),
+                    None,
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            rx.len(),
+            4,
+            "expired controls cannot renew their original deadline"
+        );
+    }
+}
+
 async fn direct(sender: &AppSender, seq: u32, deadline: tokio::time::Instant) -> bool {
     sender
         .send_rt_data_on_local_lane_before(
