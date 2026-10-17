@@ -12,6 +12,7 @@ clang++ -std=c++20 -Wall -Wextra -Werror -Wl,-export_dynamic \
 "$STAND_DIR/smoke" "$@"
 if [ "$#" -eq 0 ]; then
   "$STAND_DIR/smoke" --rtcp-loss
+  "$STAND_DIR/smoke" --group-rtcp-accounting
   python3 "$ROOT/test/run_playout_recovery_smoke.py"
   "$ROOT/test/run_group_playout_recovery_smoke.sh" "$STAND_DIR/libveil_media.dylib"
 fi

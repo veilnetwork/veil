@@ -353,8 +353,10 @@ std::string node_key(const uint8_t id[32]) {
 class GroupFanoutTransport : public webrtc::Transport {
  public:
   GroupFanoutTransport(webrtc::Call* call, webrtc::Call* video_call,
-                       uint32_t video_ssrc)
-      : video_ssrc_(video_ssrc), call_(call), video_call_(video_call) {}
+                       uint32_t video_ssrc,
+                       std::shared_ptr<veil_media::RtcpSendStats> rtcp_stats)
+      : rtcp_stats_(std::move(rtcp_stats)), video_ssrc_(video_ssrc),
+        call_(call), video_call_(video_call) {}
 
   void Add(uint64_t chan) {
     std::lock_guard<std::mutex> lock(mu_);
@@ -421,6 +423,7 @@ class GroupFanoutTransport : public webrtc::Transport {
       const int rc = video
           ? veil_media_send_video_control_datagram(chan, packet.data(), packet.size())
           : veil_media_send_datagram(chan, packet.data(), packet.size());
+      if (rc == 0) rtcp_stats_->Record(packet.size(), video);
       any = rc == 0 || any;
     }
     return any;
@@ -434,6 +437,7 @@ class GroupFanoutTransport : public webrtc::Transport {
 
  private:
   veil_media::VideoControlTransport<GroupFanoutTransport> video_transport_{*this};
+  std::shared_ptr<veil_media::RtcpSendStats> rtcp_stats_;
   std::vector<uint64_t> Snapshot() {
     std::lock_guard<std::mutex> lock(mu_);
     return channels_;
@@ -1107,6 +1111,10 @@ struct GroupWebrtcState {
   std::unique_ptr<webrtc::NetEqFactory> recovery_factory;
   std::unique_ptr<webrtc::Call> call;  // audio only
   std::unique_ptr<webrtc::Call> video_call;
+  // Includes both sender fanout and receiver-shim RTCP; peer removal cannot
+  // erase previously admitted copies from these call-wide diagnostics.
+  std::shared_ptr<veil_media::RtcpSendStats> rtcp_send_stats =
+      std::make_shared<veil_media::RtcpSendStats>();
   std::unique_ptr<GroupFanoutTransport> fanout;
   webrtc::AudioSendStream* send_stream = nullptr;  // owned by Call
   webrtc::scoped_refptr<webrtc::AudioEncoderFactory> audio_encoder_factory;
@@ -1915,7 +1923,8 @@ VeilGroupMediaEngine* veil_media_group_engine_create(
                               ws->video_network_tq.get());
   ws->video_call = webrtc::Call::Create(std::move(video_cfg));
   ws->fanout = std::make_unique<GroupFanoutTransport>(
-      ws->call.get(), ws->video_call.get(), group_video_ssrc_of(engine->local));
+      ws->call.get(), ws->video_call.get(), group_video_ssrc_of(engine->local),
+      ws->rtcp_send_stats);
   engine->ws = std::move(ws);
 #endif
   return engine.release();
@@ -1958,7 +1967,7 @@ int veil_media_group_engine_add_peer(VeilGroupMediaEngine* engine,
   std::memcpy(peer->id, peer_id, 32);
   peer->shim = std::make_unique<veil_media::VeilTransportShim>(
       veil_chan, ws->call.get(), ws->network_tq.get(),
-      ws->video_call.get(), ws->video_network_tq.get());
+      ws->video_call.get(), ws->video_network_tq.get(), ws->rtcp_send_stats);
   peer->shim->SetLocalAudioSsrc(local_audio_ssrc);
   peer->shim->SetRemoteAudioSsrc(remote_ssrc);
   peer->shim->SetLocalVideoSsrc(local_video_ssrc);
@@ -2643,6 +2652,13 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               ",\"audio_tx_header_padding_bytes\":" + std::to_string(audio_header_padding_bytes) +
               ",\"audio_tx_target_bps\":" + std::to_string(audio_target_bps) +
               ",\"audio_tx_rtp_drops\":" + std::to_string(ws->fanout->audio_drops());
+  const auto rtcp_send = ws->rtcp_send_stats->Snapshot();
+  // Successful per-peer copies, before encryption/padding. Unlike encoder
+  // RTP stats these already include fanout, including peers since removed.
+  snapshot += ",\"audio_rtcp_tx_pkts\":" + std::to_string(rtcp_send.audio_packets) +
+              ",\"audio_rtcp_tx_bytes\":" + std::to_string(rtcp_send.audio_bytes) +
+              ",\"video_rtcp_tx_pkts\":" + std::to_string(rtcp_send.video_packets) +
+              ",\"video_rtcp_tx_bytes\":" + std::to_string(rtcp_send.video_bytes);
   snapshot += ",\"audio_loss_report_us\":" + std::to_string(audio_loss_report_us) +
               ",\"video_loss_report_us\":" + std::to_string(video_loss_report_us);
   snapshot += ",\"audio_playout_peers\":" + std::to_string(playout_peers) +
