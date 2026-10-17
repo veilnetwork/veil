@@ -498,6 +498,10 @@ int64_t VeilTransportShim::peer_audio_recovery_report_us(int64_t now_us) const {
   std::lock_guard lock(audio_feedback_mu_);
   return peer_audio_recovery_.FreshReportUs(now_us);
 }
+AudioRecoveryCursor VeilTransportShim::peer_audio_recovery_snapshot() const {
+  std::lock_guard lock(audio_feedback_mu_);
+  return peer_audio_recovery_;
+}
 
 void VeilTransportShim::SetLocalAudioPlayout(uint32_t remote_audio_ssrc,
                                             uint64_t sequence, int delay_ms,

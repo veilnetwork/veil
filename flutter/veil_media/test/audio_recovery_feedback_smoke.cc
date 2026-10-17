@@ -12,6 +12,11 @@ static void require(bool ok, const char* message) {
 }
 int main() {
   using namespace veil_media;
+  AudioRecoveryRegistry registry_a, registry_b;
+  const auto decoder_a = registry_a.NewStream();
+  const auto decoder_b = registry_b.NewStream();
+  require(decoder_b->Snapshot().origin > decoder_a->Snapshot().origin,
+          "recreated engine registry reused a decoder identity");
   AudioRecoveryCursor cursor;
   auto packet = EncodeAudioRecovery(7, 11, 1, {true, 1, 20, 1'000'000},
                                     1'000'000, 1'100'000);
@@ -42,12 +47,15 @@ int main() {
   cursor.Observe(*report, 11, 6'000'000);
   require(cursor.FreshReportUs(6'000'000) == 2'000'000,
           "stale counter became fresh later");
-  report->sequence = 5;
+  report->sequence = 1;  // Recreated engine restarts its report sequence too.
   report->origin = 2;
   report->discarded_ms = 10;
   cursor.Observe(*report, 11, 7'000'000);
   require(cursor.FreshReportUs(7'000'000) == 7'000'000,
           "new receiver inherited an older counter");
+  require(cursor.Sample().known && cursor.Sample().origin == 2 &&
+          cursor.Sample().discarded_ms == 10,
+          "canonical peer event identity differs from the RTCP report");
   report->sequence = 6;
   report->origin = 1;
   report->discarded_ms = 100;

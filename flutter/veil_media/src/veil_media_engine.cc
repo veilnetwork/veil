@@ -3928,6 +3928,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     uint64_t audio_concealment_events = 0;
     uint64_t audio_jb_flushes = 0;
     uint64_t audio_discarded_packets = 0;
+    veil_media::AudioRecoverySample receiver_recovery;
     int audio_interruption_count = 0;
     int audio_interruption_duration_ms = 0;
     uint64_t audio_tx_pkts = 0;
@@ -3998,10 +3999,11 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         // RTCP counters, but cannot prove that encoded audio is arriving.
         audio_rx_native_age_ms = ws->shim->audio_payload_receive_age_ms();
         const uint32_t remote_ssrc = ssrc_of(engine->peer);
-        ws->shim->SetLocalAudioRecovery(remote_ssrc, recovery_sequence,
-            r.packets_received > 0 && audio_rx_native_age_ms >= 0 && audio_rx_native_age_ms <= 3000
+        receiver_recovery = r.packets_received > 0 && audio_rx_native_age_ms >= 0 && audio_rx_native_age_ms <= 3000
                 ? ws->recovery_stats->receivers.Snapshot(remote_ssrc)
-                : veil_media::AudioRecoverySample{}, recovery_sampled_us);
+                : veil_media::AudioRecoverySample{};
+        ws->shim->SetLocalAudioRecovery(remote_ssrc, recovery_sequence,
+                                       receiver_recovery, recovery_sampled_us);
         audio_concealed_samples = r.concealed_samples;
         // Lifetime sample counters distinguish delivery jitter from a slow
         // playout clock. They are endpoint diagnostics, never wire metadata.
@@ -4220,11 +4222,26 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
           std::to_string(ws->recovery_stats->discarded_ms.load(std::memory_order_relaxed));
       snapshot += ",\"audio_latency_fallback_frames\":" +
           std::to_string(ws->recovery_stats->fallback_frames.load(std::memory_order_relaxed));
+      // Counter identity and witness time must describe ONE cursor snapshot:
+      // a report arriving between separate reads must not consume unseen loss
+      // under the preceding report's already-consumed timestamp.
+      const auto peer_recovery_snapshot = ws->shim->peer_audio_recovery_snapshot();
       const int64_t loss_now_us = webrtc::TimeMicros();
       snapshot += ",\"audio_peer_recovery_report_us\":" +
-          std::to_string(ws->shim->peer_audio_recovery_report_us(loss_now_us));
+          std::to_string(peer_recovery_snapshot.FreshReportUs(loss_now_us));
       snapshot += ",\"audio_peer_recovery_peers\":" +
-          std::to_string(ws->shim->peer_audio_recovery_supported() ? 1 : 0);
+          std::to_string(peer_recovery_snapshot.supported() ? 1 : 0);
+      // Event identity shared by native RTCP and encrypted call-health feedback.
+      // These are local JSON stats, not additional RTCP or relay header fields.
+      const auto peer_recovery = peer_recovery_snapshot.Sample();
+      if (peer_recovery.known) {
+        snapshot += ",\"audio_peer_recovery_origin\":" + std::to_string(peer_recovery.origin);
+        snapshot += ",\"audio_peer_recovery_discarded_ms\":" + std::to_string(peer_recovery.discarded_ms);
+      }
+      if (sampled && receiver_recovery.known) {
+        snapshot += ",\"audio_receiver_recovery_origin\":" + std::to_string(receiver_recovery.origin);
+        snapshot += ",\"audio_receiver_recovery_discarded_ms\":" + std::to_string(receiver_recovery.discarded_ms);
+      }
       snapshot += ",\"audio_loss_report_us\":" +
           std::to_string(audio_report.fresh_loss_report_us(loss_now_us));
       snapshot += ",\"video_loss_report_us\":" +
