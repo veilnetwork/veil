@@ -4698,7 +4698,7 @@ enum CircuitFeedMode {
         peer: [u8; 32],
         channel: u64,
         cipher: Arc<crate::media::MediaCipher>,
-        probe_echo: Arc<std::sync::atomic::AtomicBool>,
+        receive_activity: Arc<std::sync::atomic::AtomicU64>,
         #[cfg(test)]
         received_cells: Option<Arc<AtomicU64>>,
     },
@@ -4747,8 +4747,11 @@ async fn run_circuit_feed(
                 if let Some(flag) = confirmed.as_ref() {
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-                if let CircuitFeedMode::Media { probe_echo, .. } = &mode {
-                    probe_echo.store(true, std::sync::atomic::Ordering::Release);
+                if let CircuitFeedMode::Media {
+                    receive_activity, ..
+                } = &mode
+                {
+                    receive_activity.fetch_add(1, std::sync::atomic::Ordering::Release);
                 }
                 continue;
             }
@@ -4807,6 +4810,7 @@ async fn run_circuit_feed(
                 peer,
                 channel,
                 cipher,
+                receive_activity,
                 ..
             } = &mode
             {
@@ -4824,12 +4828,19 @@ async fn run_circuit_feed(
                     {
                         count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    crate::media::dispatch_private_onion_cell(
+                    if crate::media::dispatch_private_onion_cell(
                         *peer,
                         *channel,
                         cipher,
                         &framed[cell_offset..],
-                    );
+                    ) {
+                        // Fresh AEAD-admitted data proves this exact receive
+                        // circuit's return path. Its independent outbound probe
+                        // can lag while the path continues to carry the call.
+                        // Never refresh on the clear envelope, failed seals,
+                        // replays, file data or local sends.
+                        receive_activity.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    }
                 }
                 continue;
             }
@@ -5229,7 +5240,7 @@ mod tests {
                 peer,
                 channel: registration.chan,
                 cipher: Arc::clone(&registration.cipher),
-                probe_echo: Arc::default(),
+                receive_activity: Arc::default(),
                 received_cells: None,
             },
         )
@@ -5243,6 +5254,64 @@ mod tests {
             stream_rx.try_recv().is_err(),
             "private addresses never route files"
         );
+        drop(registration);
+        node.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn private_feed_liveness_requires_fresh_authenticated_data() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+        let (_dir, mut node, services) = offline_feed_fixture().await;
+        let peer = [0xbd; 32];
+        let (registration, mut media_rx, sender) = feed_media_receiver(peer, 0xbd01);
+        let packet = feed_audio_packet();
+        let mut valid = vec![crate::media::MEDIA_MAGIC];
+        valid.extend_from_slice(sender.seal(&packet).unwrap().as_bytes());
+        let mut fresh = vec![crate::media::MEDIA_MAGIC];
+        fresh.extend_from_slice(sender.seal(&packet).unwrap().as_bytes());
+        let mut corrupt = valid.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let activity = Arc::new(AtomicU64::new(0));
+        let cases = [
+            (peer, b"file cell".to_vec(), false),
+            ([0xbe; 32], valid.clone(), false),
+            (peer, corrupt, false),
+            (peer, valid.clone(), true),
+            (peer, valid, false), // Authenticated replay is not fresh receipt.
+            (peer, fresh, true),
+        ];
+        for (source, bytes, expected) in cases {
+            let before = activity.load(Ordering::Acquire);
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(feed_envelope(source, &bytes)).unwrap();
+            drop(tx);
+            super::run_circuit_feed(
+                services.clone(),
+                rx,
+                stream_tx,
+                None,
+                None,
+                Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                None,
+                super::CircuitFeedMode::Media {
+                    peer,
+                    channel: registration.chan,
+                    cipher: Arc::clone(&registration.cipher),
+                    receive_activity: Arc::clone(&activity),
+                    received_cells: None,
+                },
+            )
+            .await;
+            assert_eq!(activity.load(Ordering::Acquire) != before, expected);
+            assert!(stream_rx.try_recv().is_err());
+        }
+        assert_eq!(media_rx.try_recv().unwrap(), packet);
+        assert_eq!(media_rx.try_recv().unwrap(), packet);
+        assert!(media_rx.try_recv().is_err());
         drop(registration);
         node.stop().await.unwrap();
     }

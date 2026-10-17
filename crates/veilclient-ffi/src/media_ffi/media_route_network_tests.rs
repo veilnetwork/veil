@@ -32,6 +32,9 @@ struct Stand {
     file_dropped: Arc<std::sync::atomic::AtomicUsize>,
     file_cells: Arc<std::sync::atomic::AtomicUsize>,
     reliable_route_probes: Arc<std::sync::atomic::AtomicUsize>,
+    hold_reliable_route_probes: Arc<std::sync::atomic::AtomicBool>,
+    held_route_probes: Arc<std::sync::atomic::AtomicUsize>,
+    hold_primary_datagrams: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Drop for Stand {
     fn drop(&mut self) {
@@ -59,6 +62,9 @@ impl Stand {
             file_dropped: Arc::default(),
             file_cells: Arc::default(),
             reliable_route_probes: Arc::default(),
+            hold_reliable_route_probes: Arc::default(),
+            held_route_probes: Arc::default(),
+            hold_primary_datagrams: Arc::default(),
         };
         let mut configs = Vec::new();
         for _ in 0..middle_count + 3 {
@@ -270,6 +276,9 @@ impl Stand {
         let file_dropped = Arc::clone(&self.file_dropped);
         let file_cells = Arc::clone(&self.file_cells);
         let reliable_route_probes = Arc::clone(&self.reliable_route_probes);
+        let hold_reliable_route_probes = Arc::clone(&self.hold_reliable_route_probes);
+        let held_route_probes = Arc::clone(&self.held_route_probes);
+        let hold_primary_datagrams = Arc::clone(&self.hold_primary_datagrams);
         let mut rx = self.services[from]
             .session_tx_registry
             .write()
@@ -292,6 +301,17 @@ impl Stand {
                     && header.msg_type == veil_proto::family::RelayChainMsg::CircuitData as u16
                 {
                     reliable_route_probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if hold_reliable_route_probes.load(std::sync::atomic::Ordering::Acquire) {
+                        held_route_probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                }
+                if from < 2
+                    && priority == veil_proto::priority::REALTIME
+                    && header.msg_type == veil_proto::family::RelayChainMsg::CircuitDatagram as u16
+                    && hold_primary_datagrams.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    continue;
                 }
                 if from < 2 && priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE {
                     use std::sync::atomic::Ordering;
@@ -517,6 +537,110 @@ async fn expect_packets(rx: &mut mpsc::Receiver<Received>, wanted: &[Vec<u8>]) {
     .unwrap();
 }
 
+// Separate endpoint carriers deliberately have independent progress. Delaying
+// reliable recovery traffic must not retire a working datagram circuit; losing
+// that circuit's own datagrams MUST still expire it at the original 12-s gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn private_route_liveness_follows_its_datagram_carrier_not_reliable_maintenance() {
+    use std::sync::atomic::Ordering;
+    let stand = Stand::new().await;
+    let a = &stand.services[0];
+    let c = &stand.services[1];
+    let mut ca = channel(a.local_node_id(), c.local_node_id(), [0xa1; 32], [0xc1; 32]);
+    let mut cc = channel(c.local_node_id(), a.local_node_id(), [0xc1; 32], [0xa1; 32]);
+    let registry = stand.services[3]
+        .dispatcher
+        .circuit_rendezvous
+        .as_ref()
+        .unwrap();
+    wait_until(|| {
+        registry.lookup(&a.onion_stream_local_cookie()).is_some()
+            && registry.lookup(&c.onion_stream_local_cookie()).is_some()
+    })
+    .await;
+    stand.copy_ads(0, 1);
+    stand.copy_ads(1, 0);
+    ca.routes.start(&tokio::runtime::Handle::current());
+    cc.routes.start(&tokio::runtime::Handle::current());
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while ca.routes.outgoing_for_test().await.len() < 3
+            || cc.routes.outgoing_for_test().await.len() < 3
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let initial_a = ca.routes.outgoing_for_test().await;
+    let initial_c = cc.routes.outgoing_for_test().await;
+
+    let before_a = ca.routes.send_paths_for_test().1[0];
+    let before_c = cc.routes.send_paths_for_test().1[0];
+    stand
+        .hold_reliable_route_probes
+        .store(true, Ordering::Release);
+    let started = Instant::now();
+    let mut seq = 0;
+    let mut received = [0usize; 2];
+    while started.elapsed() < Duration::from_secs(16) {
+        assert_eq!(send(ca.id, &packet(111, seq)), 0);
+        assert_eq!(send(cc.id, &packet(111, seq)), 0);
+        for (i, rx) in [&mut ca.rx, &mut cc.rx].into_iter().enumerate() {
+            while let Ok(r) = rx.try_recv() {
+                if r.packet.get(1) == Some(&111) {
+                    received[i] += 1;
+                }
+            }
+        }
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let healthy_a = ca.routes.outgoing_for_test().await;
+    let healthy_c = cc.routes.outgoing_for_test().await;
+    let fallback_a = ca.routes.send_paths_for_test().1[0] - before_a;
+    let fallback_c = cc.routes.send_paths_for_test().1[0] - before_c;
+    let held = stand.held_route_probes.load(Ordering::Acquire);
+    // Negative control: same carrier now really fails. Do not mask that with
+    // reliable-path echoes, a longer timeout or an application receive stamp.
+    stand
+        .hold_reliable_route_probes
+        .store(false, Ordering::Release);
+    stand.hold_primary_datagrams.store(true, Ordering::Release);
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    let failed_a = ca.routes.outgoing_for_test().await;
+    let failed_c = cc.routes.outgoing_for_test().await;
+    let stable = healthy_a.iter().find(|r| r.plane == 0).map(|r| r.origin)
+        == initial_a.iter().find(|r| r.plane == 0).map(|r| r.origin)
+        && healthy_c.iter().find(|r| r.plane == 0).map(|r| r.origin)
+            == initial_c.iter().find(|r| r.plane == 0).map(|r| r.origin);
+    let expired = failed_a.iter().find(|r| r.plane == 0).map(|r| r.origin)
+        != healthy_a.iter().find(|r| r.plane == 0).map(|r| r.origin)
+        && failed_c.iter().find(|r| r.plane == 0).map(|r| r.origin)
+            != healthy_c.iter().find(|r| r.plane == 0).map(|r| r.origin);
+    drop((ca, cc));
+    stand.stop().await;
+    eprintln!(
+        "independent liveness: stable={stable} expired={expired} received={received:?} fallback={fallback_a}/{fallback_c} held_reliable={held}"
+    );
+    assert!(
+        received.into_iter().all(|n| n > 500),
+        "actual authenticated media must flow"
+    );
+    assert!(
+        stable,
+        "working datagram routes expired because reliable maintenance stalled"
+    );
+    assert_eq!(
+        (fallback_a, fallback_c),
+        (0, 0),
+        "no fallback while the actual carrier works"
+    );
+    assert!(
+        expired,
+        "failed datagram routes must expire despite a working reliable carrier"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stalled() {
     let stand = Stand::new().await;
@@ -716,12 +840,12 @@ async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stall
     .await
     .unwrap();
     let outgoing_all = ca.routes.outgoing_for_test().await;
-    assert!(
+    assert_eq!(
         stand
             .reliable_route_probes
-            .load(std::sync::atomic::Ordering::Acquire)
-            > 0,
-        "periodic probes must use reliable network maintenance outside media/signaling"
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "route checks must follow their actual datagram carriers"
     );
     assert_eq!(cc.routes.receive_addresses_for_test().len(), 4);
     assert_eq!(outgoing_all[2].destination_cookie, incoming[2].1);

@@ -37,8 +37,16 @@ fn independent_secondary_retry_preserves_deadline_and_other_sources_progress() {
     envelope.expires_at = Some(std::time::Instant::now() + Duration::from_millis(40));
     let age = envelope.queued_at;
     let deadline = envelope.expires_at;
-    assert!(super::independent_secondary_retry(&envelope, true));
-    assert!(!super::independent_secondary_retry(&envelope, false));
+    assert!(super::independent_source_capacity_retry(
+        &envelope,
+        true,
+        std::time::Instant::now()
+    ));
+    assert!(!super::independent_source_capacity_retry(
+        &envelope,
+        false,
+        std::time::Instant::now()
+    ));
     struct Transit;
     impl veil_anonymity::circuit_carrier::DatagramCarrier for Transit {
         fn try_send(
@@ -51,7 +59,11 @@ fn independent_secondary_retry_preserves_deadline_and_other_sources_progress() {
         }
     }
     envelope.carrier = Some(std::sync::Weak::<Transit>::new());
-    assert!(!super::independent_secondary_retry(&envelope, true));
+    assert!(!super::independent_source_capacity_retry(
+        &envelope,
+        true,
+        std::time::Instant::now()
+    ));
     envelope.expires_at = None;
     assert!(super::local_datagram_expiry(&envelope).is_none());
     envelope.carrier = None;
@@ -62,12 +74,24 @@ fn independent_secondary_retry_preserves_deadline_and_other_sources_progress() {
         veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
     ] {
         envelope.frame.0 = priority;
-        assert!(!super::independent_secondary_retry(&envelope, true));
+        assert!(!super::independent_source_capacity_retry(
+            &envelope,
+            true,
+            std::time::Instant::now()
+        ));
     }
     envelope.frame.0 = BACKGROUND;
-    assert!(super::independent_secondary_retry(&envelope, true));
+    assert!(super::independent_source_capacity_retry(
+        &envelope,
+        true,
+        std::time::Instant::now()
+    ));
     envelope.expires_at = None;
-    assert!(super::independent_secondary_retry(&envelope, true));
+    assert!(super::independent_source_capacity_retry(
+        &envelope,
+        true,
+        std::time::Instant::now()
+    ));
     assert_eq!(
         super::local_datagram_expiry(&envelope),
         Some(age + crate::priority_queue::LOSSY_REALTIME_MAX_AGE)
@@ -115,6 +139,67 @@ fn independent_secondary_retry_preserves_deadline_and_other_sources_progress() {
             .is_none()
     );
     assert_eq!(pq.drops_total(), 1);
+}
+
+#[test]
+fn fresh_primary_capacity_wait_keeps_its_age_deadline_and_single_retry_turn() {
+    use crate::frame_outbox::FrameEnvelope;
+    use crate::priority_queue::{HeadAdmission, PriorityQueue};
+    use veil_proto::priority::{INTERACTIVE, REALTIME};
+    let now = std::time::Instant::now();
+    let mut frame = FrameEnvelope::from((
+        REALTIME,
+        veil_bufpool::pooled_shared_from_vec(b"audio".to_vec()),
+    ));
+    frame.queued_at = now;
+    frame.expires_at = Some(now + Duration::from_millis(100));
+    let deadline = frame.expires_at;
+    assert!(super::independent_source_capacity_retry(&frame, true, now));
+    assert!(!super::independent_source_capacity_retry(
+        &frame, false, now
+    ));
+    assert!(!super::independent_source_capacity_retry(
+        &frame,
+        true,
+        now + Duration::from_millis(2)
+    ));
+    let capacity = REALTIME_DATAGRAM_BUFFER_BYTES;
+    assert!(!super::local_primary_datagram_fits(2202, capacity - 2202));
+    let mut queue = PriorityQueue::with_default_weights();
+    let mut waiting = false;
+    let mut retry = None;
+    super::defer_local_datagram(&mut queue, frame, &mut waiting, &mut retry);
+    assert_eq!(retry, Some(now + Duration::from_millis(2)));
+    queue.push_lossy(
+        INTERACTIVE,
+        veil_bufpool::pooled_shared_from_vec(b"neutral".to_vec()),
+    );
+    let other = queue
+        .pop_admitted_envelope(|p, _, _, _| {
+            if p == REALTIME {
+                HeadAdmission::DeferSource
+            } else {
+                HeadAdmission::Allow
+            }
+        })
+        .unwrap();
+    assert_eq!(&*other.frame.1, b"neutral");
+    // The child drains before the retry. The same complete primary proceeds;
+    // no timestamp is reset and no larger committed backlog is admitted.
+    assert!(super::local_primary_datagram_fits(2202, capacity));
+    let mut restored = queue
+        .pop_admitted_envelope(|_, _, _, _| HeadAdmission::Allow)
+        .unwrap();
+    assert_eq!(&*restored.frame.1, b"audio");
+    assert_eq!(restored.queued_at, now);
+    assert_eq!(restored.expires_at, deadline);
+    restored.expires_at = Some(now - Duration::from_millis(1));
+    super::defer_local_datagram(&mut queue, restored, &mut waiting, &mut retry);
+    assert!(
+        queue
+            .pop_admitted_envelope(|_, _, _, _| HeadAdmission::Allow)
+            .is_none()
+    );
 }
 
 struct NeutralLink {
