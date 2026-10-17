@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <vector>
 #include "api/environment/environment_factory.h"
 #include "bounded_audio_encoder.h"
 #include "system_wrappers/include/clock.h"
@@ -21,6 +22,16 @@ double band(const int16_t* pcm, int frequency) {
   return std::sqrt(2 * (real * real + imag * imag) / (480.0 * 480.0));
 }
 
+// Keep transition ordinals from the first input block, including startup and
+// the encoder replacement. A periodic nearest-phase match could hide an
+// entire missing tone. These are sample positions and synchronous codec emit
+// ticks, not network/acoustic latency or a substitute for the full PCM gate.
+struct ToneTransition {
+  int frequency;
+  int sample_tick;
+  int emitted_tick;
+};
+
 int main() {
   for (int bitrate : {16000, 24000, 32000}) for (bool dtx : {true, false}) {
     webrtc::SimulatedClock clock(0);
@@ -33,6 +44,8 @@ int main() {
     std::array<int16_t, 480> input;
     std::array<int16_t, 5760> output;
     int quiet_blocks = 0, first_quiet = -1, longest = 0;
+    std::vector<ToneTransition> transitions;
+    int previous = 0, pending = 0, pending_tick = 0, pending_emit = 0, run = 0;
     for (int tick = 0; tick <= 36000; ++tick) {
       if (tick == 0 || tick == 2101) {
         webrtc::SdpAudioFormat format("opus", 48000, 2,
@@ -65,13 +78,57 @@ int main() {
           if (first_quiet < 0) first_quiet = at;
           longest = std::max(longest, ++quiet_blocks);
         } else quiet_blocks = 0;
+        const int decoded_frequency = std::max(low, high) >= 500
+            ? (high > low ? 1700 : 1300) : 0;
+        if (!decoded_frequency || decoded_frequency == previous) {
+          pending = run = 0;
+        } else {
+          if (decoded_frequency != pending) {
+            pending = decoded_frequency;
+            pending_tick = at;
+            pending_emit = tick;
+            run = 1;
+          } else {
+            ++run;
+          }
+          if (run >= 2) {
+            transitions.push_back({pending, pending_tick, pending_emit});
+            previous = pending;
+            pending = run = 0;
+          }
+        }
       }
     }
     // The old 16-kbit profile remains diagnostic evidence, never a required
     // failure of a future codec. Only the protected payload profiles gate.
     if (bitrate >= 24000) assert(longest == 0);
+    const int expected_transitions = 36000 / 101 + 1;
+    int matched = 0, missing = 0, max_sample_lag_ms = 0, max_emit_lag_ms = 0;
+    for (int ordinal = 0; ordinal < expected_transitions; ++ordinal) {
+      const int source_tick = ordinal * 101;
+      const int expected_frequency = ordinal % 2 ? 1700 : 1300;
+      if (ordinal >= static_cast<int>(transitions.size()) ||
+          transitions[ordinal].frequency != expected_frequency ||
+          transitions[ordinal].sample_tick < source_tick ||
+          transitions[ordinal].emitted_tick < source_tick) {
+        ++missing;
+        continue;
+      }
+      ++matched;
+      max_sample_lag_ms = std::max(max_sample_lag_ms,
+          (transitions[ordinal].sample_tick - source_tick) * 10);
+      max_emit_lag_ms = std::max(max_emit_lag_ms,
+          (transitions[ordinal].emitted_tick - source_tick) * 10);
+    }
+    // The diagnostic 16-kbit profile can lose signal; the protected profiles
+    // must preserve every original transition, without trimming startup.
+    if (bitrate >= 24000) {
+      assert(missing == 0);
+      assert(static_cast<int>(transitions.size()) == expected_transitions);
+    }
     opus_decoder_destroy(decoder);
-    std::printf("summary requested_bitrate=%d actual_bitrate=%d dtx=%d first_quiet_tick=%d longest_quiet_blocks=%d\n",
-                bitrate, encoder->GetTargetBitrate(), dtx, first_quiet, longest);
+    std::printf("summary requested_bitrate=%d actual_bitrate=%d dtx=%d first_quiet_tick=%d longest_quiet_blocks=%d transition_matched=%d transition_missing=%d transition_decoded=%zu max_sample_lag_ms=%d max_emit_lag_ms=%d\n",
+                bitrate, encoder->GetTargetBitrate(), dtx, first_quiet, longest,
+                matched, missing, transitions.size(), max_sample_lag_ms, max_emit_lag_ms);
   }
 }
