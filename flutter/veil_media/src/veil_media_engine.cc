@@ -2501,6 +2501,12 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   uint64_t video_frames = 0;
   double fps = 0;
   int kbps = 0, encoder_target_bps = 0;
+  // Sender-stream counters are logical RTP work, BEFORE peer fanout and the
+  // encrypted transport. Unknown is distinct from an observed zero.
+  int64_t video_retransmitted_packets = -1, video_retransmitted_bytes = -1;
+  int64_t video_nack_packets = -1, video_nack_requests = -1;
+  int64_t video_unique_nack_requests = -1, video_pli_packets = -1;
+  int64_t video_fir_packets = -1, video_key_frames = -1;
   const int64_t now_us = webrtc::TimeMicros();
   bool playout_changed = ws->observed_playout_peer_count != ws->peers.size();
   ws->observed_playout_peer_count = ws->peers.size();
@@ -2622,6 +2628,20 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
       const auto video = ws->video_send_stream->GetStats();
       video_frames = video.frames_encoded;
       encoder_target_bps = video.target_media_bitrate_bps;
+      video_retransmitted_packets = video_retransmitted_bytes = 0;
+      video_nack_packets = video_nack_requests = video_unique_nack_requests = 0;
+      video_pli_packets = video_fir_packets = video_key_frames = 0;
+      for (const auto& entry : video.substreams) {
+        const auto& stream = entry.second;
+        video_retransmitted_packets += stream.rtp_stats.retransmitted.packets;
+        video_retransmitted_bytes += stream.rtp_stats.retransmitted.TotalBytes();
+        video_nack_packets += stream.rtcp_packet_type_counts.nack_packets;
+        video_nack_requests += stream.rtcp_packet_type_counts.nack_requests;
+        video_unique_nack_requests += stream.rtcp_packet_type_counts.unique_nack_requests;
+        video_pli_packets += stream.rtcp_packet_type_counts.pli_packets;
+        video_fir_packets += stream.rtcp_packet_type_counts.fir_packets;
+        video_key_frames += stream.frame_counts.key_frames;
+      }
     }
     fps = ws->video_max_fps.load(std::memory_order_relaxed);
     kbps = ws->video_target_bitrate_bps / 1000;
@@ -2642,6 +2662,14 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   // Capability remains explicit on a stalled worker: unknown audio never
   // falls back to video ingress. These fields are endpoint-local JSON only.
   std::string snapshot(json, static_cast<size_t>(written) - 1);
+  snapshot += ",\"video_tx_retransmitted_pkts\":" + std::to_string(video_retransmitted_packets) +
+              ",\"video_tx_retransmitted_bytes\":" + std::to_string(video_retransmitted_bytes) +
+              ",\"video_rx_nack_packets\":" + std::to_string(video_nack_packets) +
+              ",\"video_rx_nack_requests\":" + std::to_string(video_nack_requests) +
+              ",\"video_rx_unique_nack_requests\":" + std::to_string(video_unique_nack_requests) +
+              ",\"video_rx_pli_packets\":" + std::to_string(video_pli_packets) +
+              ",\"video_rx_fir_packets\":" + std::to_string(video_fir_packets) +
+              ",\"video_tx_key_frames\":" + std::to_string(video_key_frames);
   snapshot += ",\"audio_max_packet_ms\":60,\"audio_requested_packet_ms\":" + std::to_string(requested_packet_ms) +
               ",\"audio_requested_payload_bps\":" + std::to_string(requested_payload_bps) +
               ",\"audio_config_valid\":" + std::to_string(audio_config_valid) +
