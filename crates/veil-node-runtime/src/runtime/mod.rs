@@ -49,6 +49,7 @@ mod rendezvous_resolver;
 mod resumption_state;
 mod routing_health;
 mod routing_state;
+mod sender_cert_refresh;
 mod sending;
 mod service_tasks;
 pub mod services;
