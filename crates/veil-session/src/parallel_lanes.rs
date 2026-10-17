@@ -750,9 +750,12 @@ impl ParallelSession {
         };
         let now = std::time::Instant::now();
         self.slots[selected.physical].last_selected = Some(now);
-        let prepared = self.prepare_index(selected.physical);
+        // Maintenance can retire signaling for connection capacity, or reap a
+        // child that closed since the previous poll. Select readiness LAST:
+        // a cached true from before maintenance can leave sender_arc with an
+        // empty slot and abort the host process when a call starts.
         self.recover_channels(now);
-        prepared.then_some(selected)
+        self.prepare_index(selected.physical).then_some(selected)
     }
 
     #[cfg(test)]
