@@ -386,6 +386,24 @@ async fn private_codec_routes_survive_sustained_source_pressure() {
 }
 
 async fn check_private_route_keepalive(primary: bool, feedback: bool, pressure: bool) {
+    if veil_session::rt_trace::rt_trace_enabled() {
+        struct RouteTrace;
+        impl log::Log for RouteTrace {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.target() == "veilclient_ffi::anon_stream::media_routes"
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                if self.enabled(record.metadata()) {
+                    eprintln!("{}", record.args());
+                }
+            }
+            fn flush(&self) {}
+        }
+        static TRACE: RouteTrace = RouteTrace;
+        if log::set_logger(&TRACE).is_ok() {
+            log::set_max_level(log::LevelFilter::Info);
+        }
+    }
     let stand = Stand::with_links(1, true).await;
     let a = stand.services[0].local_node_id();
     let c = stand.services[1].local_node_id();
@@ -430,6 +448,18 @@ async fn check_private_route_keepalive(primary: bool, feedback: bool, pressure: 
         ca.routes.outgoing_for_test().await,
         cc.routes.outgoing_for_test().await,
     ];
+    for (side, (old, new)) in before.iter().zip(&after).enumerate() {
+        for previous in old {
+            let current = new.iter().find(|route| route.plane == previous.plane);
+            eprintln!(
+                "private route identity side={side} plane={} origin={}/{} destination_same={}",
+                previous.plane,
+                previous.origin,
+                current.map_or(0, |r| r.origin),
+                current.is_some_and(|r| r.destination_cookie == previous.destination_cookie),
+            );
+        }
+    }
     let unchanged = before.iter().zip(&after).all(|(old, new)| {
         old.len() == 4
             && new.len() == 4

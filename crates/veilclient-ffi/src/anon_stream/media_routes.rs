@@ -165,20 +165,22 @@ struct PinnedRoute {
     relay: [u8; 32],
     created: Instant,
     close_generation: u64,
-    last_echo: Mutex<Instant>,
+    last_activity: Mutex<(u64, Instant)>,
     last_probe: Mutex<Option<Instant>>,
-    probe_echo: Arc<AtomicBool>,
+    receive_activity: Arc<AtomicU64>,
+    probe_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     local_datagram_lane: u8,
 }
 
 impl PinnedRoute {
     fn is_live(&self) -> bool {
-        let mut last_echo = self.last_echo.lock().unwrap_or_else(|p| p.into_inner());
-        if self.probe_echo.swap(false, Ordering::AcqRel) {
-            *last_echo = Instant::now();
+        let mut last_activity = self.last_activity.lock().unwrap_or_else(|p| p.into_inner());
+        let generation = self.receive_activity.load(Ordering::Acquire);
+        if generation != last_activity.0 {
+            *last_activity = (generation, Instant::now());
         }
         self.created.elapsed() < REFRESH_AFTER
-            && last_echo.elapsed() < PROBE_STALE_AFTER
+            && last_activity.1.elapsed() < PROBE_STALE_AFTER
             && self.services.has_live_session(&self.circuit.first_hop())
             && self
                 .services
@@ -199,10 +201,12 @@ impl PinnedRoute {
         // Teach old relays the exact return child once, before publication.
         // Wait for its echo (with bounded retry) so immediate media does not
         // collide with these padded bootstrap cells in the short source queue.
-        self.probe_echo.store(false, Ordering::Release);
+        let baseline = self.receive_activity.load(Ordering::Acquire);
         self.probe_datagram();
         let mut next_probe = tokio::time::Instant::now() + Duration::from_millis(250);
-        while !self.probe_echo.load(Ordering::Acquire) && tokio::time::Instant::now() < deadline {
+        while self.receive_activity.load(Ordering::Acquire) == baseline
+            && tokio::time::Instant::now() < deadline
+        {
             if tokio::time::Instant::now() >= next_probe {
                 self.probe_datagram();
                 next_probe += Duration::from_millis(250);
@@ -212,14 +216,14 @@ impl PinnedRoute {
     }
 
     fn probe(&self) {
-        // Eight private send/receive circuits share one endpoint's bounded
-        // recovery allowance. Do not enqueue another padded check while the
-        // previous echo is fresh. An admitted probe also needs time to pass
-        // that shared allowance before another worker tick queues a duplicate.
+        // Each private circuit uses its producer's bounded endpoint queue.
+        // Do not enqueue another padded check while the previous echo is
+        // fresh, or duplicate an admitted probe before its next retry turn.
         if self
-            .last_echo
+            .last_activity
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .1
             .elapsed()
             < PROBE_IDLE_AFTER
         {
@@ -229,42 +233,81 @@ impl PinnedRoute {
         if last_probe.is_some_and(|sent| sent.elapsed() < PROBE_RETRY_AFTER) {
             return;
         }
-        // Route liveness is endpoint network maintenance. Periodic application
-        // feedback can continuously spend the signaling allowance; a probe in
-        // that queue then expires a healthy route. Use the existing recovery
-        // queue/budget without occupying a media child or changing relay headers.
-        let mut body = self.cookie.to_vec();
-        body.extend_from_slice(veil_anonymity::circuit_data::CIRCUIT_PROBE_MAGIC);
-        if self
-            .services
-            .send_circuit_cell_on_local_lane_detailed(
-                &self.circuit,
-                &body,
-                veil_session::LOCAL_NETWORK_CONTROL_LANE,
-            )
-            .is_ok()
-        {
-            *last_probe = Some(Instant::now());
+        // Check the same loss-tolerant child used by this route. Progress on
+        // the independent reliable recovery queue says nothing about this
+        // carrier, and recovery backlog must not expire a healthy media path.
+        // The cookie/probe body, cadence, stale gate and relay-neutral headers
+        // stay unchanged; loss on this child still expires the route normally.
+        let baseline = self.receive_activity.load(Ordering::Acquire);
+        if !self.probe_datagram() {
+            return;
         }
+        *last_probe = Some(Instant::now());
+        let services = self.services.clone();
+        let circuit = Arc::clone(&self.circuit);
+        let cookie = self.cookie;
+        let lane = self.local_datagram_lane;
+        let generation = self.close_generation;
+        let activity = Arc::clone(&self.receive_activity);
+        let deadline = tokio::time::Instant::now() + DATAGRAM_WARM_TIMEOUT;
+        let mut pending = self.probe_task.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(old) = pending.take() {
+            old.abort();
+        }
+        // The carrier is loss-tolerant: queue admission is not an echo. A
+        // synchronized set of padded checks can exceed the unchanged shared
+        // source window. Retry at most twice in the existing 3-s confirmation
+        // window, off the media worker/route lock, and only without new receipt.
+        *pending = Some(tokio::spawn(async move {
+            for _ in 0..2 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if tokio::time::Instant::now() >= deadline
+                    || activity.load(Ordering::Acquire) != baseline
+                    || !services.has_live_session(&circuit.first_hop())
+                    || services.session_close_generation(&circuit.first_hop()) != generation
+                {
+                    break;
+                }
+                Self::send_probe_datagram(&services, &circuit, &cookie, lane);
+            }
+        }));
     }
 
-    fn probe_datagram(&self) {
-        let _ = self
-            .services
-            .request_local_circuit_datagram(&self.circuit, self.local_datagram_lane);
-        let mut body = self.cookie.to_vec();
-        body.extend_from_slice(veil_anonymity::circuit_data::CIRCUIT_PROBE_MAGIC);
-        let _ = self.services.send_circuit_datagram_on_local_lane_detailed(
+    fn probe_datagram(&self) -> bool {
+        Self::send_probe_datagram(
+            &self.services,
             &self.circuit,
-            &body,
+            &self.cookie,
             self.local_datagram_lane,
-        );
+        )
+    }
+
+    fn send_probe_datagram(
+        services: &veil_node_runtime::NodeServices,
+        circuit: &veil_node_runtime::DataCircuit,
+        cookie: &[u8; 16],
+        lane: u8,
+    ) -> bool {
+        let _ = services.request_local_circuit_datagram(circuit, lane);
+        let mut body = cookie.to_vec();
+        body.extend_from_slice(veil_anonymity::circuit_data::CIRCUIT_PROBE_MAGIC);
+        services
+            .send_circuit_datagram_on_local_lane_detailed(circuit, &body, lane)
+            .is_ok()
     }
 }
 
 impl Drop for PinnedRoute {
     fn drop(&mut self) {
         self.feed.abort();
+        if let Some(task) = self
+            .probe_task
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            task.abort();
+        }
         self.services.retire_data_circuit(&self.circuit);
     }
 }
@@ -289,7 +332,7 @@ async fn open_private_route(
         .await
         .ok()?;
     let circuit = Arc::new(circuit);
-    let probe_echo = Arc::new(AtomicBool::new(false));
+    let receive_activity = Arc::new(AtomicU64::new(0));
     let feed = tokio::spawn(run_circuit_feed(
         core.services.clone(),
         rx,
@@ -302,7 +345,7 @@ async fn open_private_route(
             peer: owner.peer,
             channel: owner.channel,
             cipher: Arc::clone(&owner.cipher),
-            probe_echo: Arc::clone(&probe_echo),
+            receive_activity: Arc::clone(&receive_activity),
             #[cfg(test)]
             received_cells: Some(Arc::clone(
                 &owner.received_cells[owner
@@ -322,9 +365,10 @@ async fn open_private_route(
         relay,
         created: Instant::now(),
         close_generation,
-        last_echo: Mutex::new(Instant::now()),
+        last_activity: Mutex::new((0, Instant::now())),
         last_probe: Mutex::new(None),
-        probe_echo,
+        receive_activity,
+        probe_task: Mutex::new(None),
         local_datagram_lane: core.local_datagram_lane,
     };
     if !confirm_circuit_with_probe(&core.services, &owned.circuit, &owned.cookie).await {
@@ -527,9 +571,10 @@ impl MediaRoutes {
                     veil_util::hex_short(&address.relay),
                     route.created.elapsed().as_millis(),
                     route
-                        .last_echo
+                        .last_activity
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
+                        .1
                         .elapsed()
                         .as_millis(),
                     self.repair_generation[i].load(Ordering::Acquire),

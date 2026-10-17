@@ -1225,29 +1225,31 @@ pub(crate) fn dispatch_inbound_auto(peer: [u8; 32], payload: &[u8]) {
     dispatch_inbound_with_lease(peer, payload, lease);
 }
 
-fn dispatch_inbound_with_lease(peer: [u8; 32], payload: &[u8], lease: RecvLease) {
+// Returns authenticated fresh receipt, independent of engine delivery. A private
+// receive circuit can use that proof without trusting its clear sender envelope.
+fn dispatch_inbound_with_lease(peer: [u8; 32], payload: &[u8], lease: RecvLease) -> bool {
     let Some(plaintext) = lease.cipher.open(payload) else {
         #[cfg(feature = "node-embedded")]
         if crate::media_ffi::source_preflight::dispatch_without_lease(payload) {
-            return;
+            return false;
         }
         #[cfg(feature = "node-embedded")]
         crate::media_ffi::path_probe_ffi::dispatch_without_lease(payload);
         media_drop_note("seal-open-failed", peer, payload.len());
-        return;
+        return false;
     };
     trace_sealed_cell("received", &peer, payload);
     #[cfg(feature = "node-embedded")]
     if crate::media_ffi::call_control_ffi::dispatch_control(lease.chan, &lease.cipher, &plaintext) {
-        return;
+        return true;
     }
     #[cfg(feature = "node-embedded")]
     if crate::media_ffi::source_preflight::dispatch_control(lease.chan, &lease.cipher, &plaintext) {
-        return;
+        return true;
     }
     #[cfg(feature = "node-embedded")]
     if crate::media_ffi::path_probe_ffi::dispatch_control(&lease.cipher, &plaintext) {
-        return;
+        return true;
     }
     #[cfg(feature = "node-embedded")]
     if plaintext.starts_with(anon_stream_control_magic()) {
@@ -1258,13 +1260,14 @@ fn dispatch_inbound_with_lease(peer: [u8; 32], payload: &[u8], lease: RecvLease)
         {
             crate::media_ffi::dispatch_route_control(peer, lease.chan, &lease.cipher, &plaintext);
         }
-        return;
+        return true;
     }
     if plaintext.first() == Some(&MEDIA_BATCH_MAGIC) {
         dispatch_inbound_batch(peer, &plaintext[1..], &lease);
     } else {
         dispatch_inbound(peer, &plaintext, &lease);
     }
+    true
 }
 
 /// Onion ingress: peel [`MEDIA_MAGIC`] off a circuit cell and hand the rest to
@@ -1284,9 +1287,9 @@ pub(crate) fn dispatch_private_onion_cell(
     channel: u64,
     cipher: &Arc<MediaCipher>,
     cell: &[u8],
-) {
+) -> bool {
     if cell.first() == Some(&MEDIA_MAGIC) {
-        dispatch_inbound_with_lease(
+        return dispatch_inbound_with_lease(
             peer,
             &cell[1..],
             RecvLease {
@@ -1295,6 +1298,7 @@ pub(crate) fn dispatch_private_onion_cell(
             },
         );
     }
+    false
 }
 
 /// Number of inbound media datagrams from `peer` that opened against the
