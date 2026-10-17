@@ -313,6 +313,13 @@ async fn reliable_quic_owner_closes_actual_child_and_reclaims_quota_with_raw_clo
             .unwrap();
         a.handle().send(b"reliable").await.unwrap();
         assert_eq!(b.handle().recv().await.unwrap(), b"reliable");
+        a_datagrams.set_reliable_send_window(4096);
+        let (trace_id, sample) = a.quic_snapshot().unwrap();
+        assert_eq!(trace_id, a_datagrams.local_trace_id());
+        assert_eq!(sample.stream_send_window_bytes, 4096);
+        assert_ne!(trace_id, a_parent_datagrams.local_trace_id());
+        b_parent.retire();
+        assert!(b.quic_snapshot().is_none());
         drop(a);
         // Raw transport clones and the quota watcher must not prolong a dead child.
         timeout(Duration::from_millis(500), a_datagrams.closed())

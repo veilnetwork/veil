@@ -4559,6 +4559,7 @@ impl SessionRunner {
         let mut source_reliable_pressure_logged: Option<std::time::Instant> = None;
         let mut ingress_trace = crate::rt_trace::IngressTrace::default();
         let mut source_reliable_admitted_logged: Option<std::time::Instant> = None;
+        let mut reliable_snapshot_logged: Option<std::time::Instant> = None;
         let mut ordered_primary_pressure_logged: Option<std::time::Instant> = None;
         let mut first_ordered_primary_admitted_logged = false;
 
@@ -5493,6 +5494,31 @@ impl SessionRunner {
                     .and_then(ParallelChannels::reliable)
                     .and_then(|pool| pool.ready());
                 let reliable_id = reliable_ready.as_ref().map(|ready| ready.id());
+                if crate::rt_trace::rt_trace_enabled()
+                    && reliable_snapshot_logged.is_none_or(|at| {
+                        now.saturating_duration_since(at) >= std::time::Duration::from_millis(100)
+                    })
+                    && let Some(ready) = reliable_ready.as_ref()
+                    && let Some((path, stats)) = ready.quic_snapshot()
+                {
+                    reliable_snapshot_logged = Some(now);
+                    let handle = ready.handle();
+                    let progress = handle.record_progress();
+                    let at_unix_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros();
+                    // The same opt-in local transport counters are available on
+                    // transit nodes. No payload class is inferred or put on wire.
+                    self.logger.info("session.rt_trace.reliable_state", format!(
+                        "at_unix_us={at_unix_us} node_id={} peer_id={} connection_trace_id={path} actor_buffered_bytes={} record_buffered_bytes={} completed_records={} stream_retained_bytes={} stream_send_window_bytes={} in_flight_bytes={} rtt_us={} udp_socket_sent_bytes={} scope=local_transport",
+                        hex_short(&self.local_node_id), hex_short(&self.peer_id),
+                        handle.buffered_bytes(), progress.outgoing_buffered_bytes,
+                        progress.completed_records, stats.stream_retained_bytes,
+                        stats.stream_send_window_bytes, stats.in_flight_bytes,
+                        stats.rtt_us, stats.udp_socket_sent_bytes,
+                    ));
+                }
                 reliable_streams.reconcile(reliable_id);
                 reliable_replies.reconcile(reliable_id);
                 match self.flush_reliable_replies(

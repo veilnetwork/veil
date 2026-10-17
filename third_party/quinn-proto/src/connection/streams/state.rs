@@ -925,6 +925,10 @@ impl StreamsState {
         self.send_window = send_window;
     }
 
+    pub(crate) fn send_buffer_usage(&self) -> (u64, u64) {
+        (self.buffered_data, self.send_window)
+    }
+
     /// Set the receive_window and returns whether the receive_window has been
     /// expanded or shrunk: true if expanded, false if shrunk.
     pub(crate) fn set_receive_window(&mut self, receive_window: VarInt) -> bool {
@@ -1103,6 +1107,7 @@ mod tests {
             0,
             "acknowledged suffix still occupies storage"
         );
+        assert_eq!(server.send_buffer_usage(), (24, 24));
         server.received_ack_of(frame::StreamMeta {
             id,
             offsets: 0..16,
@@ -1119,6 +1124,7 @@ mod tests {
             fin: false,
         });
         assert_eq!(server.write_limit(), 24);
+        assert_eq!(server.send_buffer_usage(), (0, 24));
         SendStream {
             id,
             state: &mut server,
