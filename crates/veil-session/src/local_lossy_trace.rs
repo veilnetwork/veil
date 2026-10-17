@@ -11,6 +11,8 @@ const SEQUENCE_LIMIT: u64 = 4096;
 const ROW_LIMIT: u64 = 65_536;
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static ROWS: AtomicU64 = AtomicU64::new(0);
+const WORK_ROW_LIMIT: u64 = 16_384;
+static WORK_ROWS: AtomicU64 = AtomicU64::new(0);
 
 fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("VEIL_DIAG_SOURCE_CELLS").is_ok_and(|v| v == "1"))
@@ -47,7 +49,7 @@ fn unix_us() -> u128 {
         .as_micros()
 }
 
-fn owned_cell(priority: u8, frame: &[u8]) -> Option<(u64, u64)> {
+fn owned_secondary_header(priority: u8, frame: &[u8]) -> Option<(u64, u64)> {
     // A wire traffic-class hint never selects this diagnostic. The private
     // local queue must already establish that this is our own producer.
     if !owned_secondary(priority)
@@ -63,7 +65,47 @@ fn owned_cell(priority: u8, frame: &[u8]) -> Option<(u64, u64)> {
     let forward =
         veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::header::HEADER_SIZE..])
             .ok()?;
-    header(&forward.envelope.payload).filter(|(_, seq)| *seq <= SEQUENCE_LIMIT)
+    header(&forward.envelope.payload)
+}
+
+fn owned_cell(priority: u8, frame: &[u8]) -> Option<(u64, u64)> {
+    owned_secondary_header(priority, frame).filter(|(_, seq)| *seq <= SEQUENCE_LIMIT)
+}
+
+/// First/last owned members accepted by the local DATAGRAM transport. This is
+/// not a NIC-send timestamp: the existing opaque UDP trace observes that later.
+/// A separate bounded budget keeps late work visible without changing the
+/// existing per-cell trace budget. Remote transit has no LocalLossyCell handle.
+pub(crate) fn work_release(
+    work: &veil_types::local_lossy_work::LocalLossyCell,
+    priority: u8,
+    frame: &[u8],
+    datagram_bytes: usize,
+    connection_trace_id: u64,
+) {
+    if !crate::rt_trace::rt_trace_enabled() {
+        return;
+    }
+    let Some(snapshot) = work.boundary_snapshot_at(std::time::Instant::now()) else {
+        return;
+    };
+    let Some((epoch, seq)) = owned_secondary_header(priority, frame) else {
+        return;
+    };
+    let row = WORK_ROWS.fetch_add(1, Ordering::Relaxed);
+    if row == WORK_ROW_LIMIT {
+        log::info!("media.source_work_trace_limit rows={WORK_ROW_LIMIT}");
+    }
+    if row >= WORK_ROW_LIMIT {
+        return;
+    }
+    log::info!(target: "veil::source_work_release",
+        "at_unix_us={} connection_trace_id={connection_trace_id} local_slot={priority} epoch={epoch:016x} seq={seq} cell={} cells={} sealed_bytes={} envelope_work_bytes={} envelope_cell_bytes={} span_us={} admission_age_us={} remaining_us={} datagram_cell_bytes={datagram_bytes}",
+        unix_us(), snapshot.index, snapshot.cells, snapshot.sealed_bytes,
+        snapshot.envelope_wire_bytes,
+        frame.len().saturating_add(veil_crypto::session_cipher::AEAD_OVERHEAD),
+        snapshot.span.as_micros(),
+        snapshot.since_admission.as_micros(), snapshot.until_expiry.as_micros());
 }
 
 fn owned_primary_cell(priority: u8, frame: &[u8]) -> Option<(u64, u64)> {
@@ -238,6 +280,18 @@ mod tests {
         data[4..12].copy_from_slice(&7u64.to_be_bytes());
         data[12..20].copy_from_slice(&sequence.to_be_bytes());
         data
+    }
+
+    #[test]
+    fn late_work_boundary_keeps_legacy_cell_limits_and_rejects_transit() {
+        let bytes = forward(SEQUENCE_LIMIT + 1);
+        assert!(owned_cell(veil_proto::priority::BULK, &bytes).is_none());
+        assert_eq!(
+            owned_secondary_header(veil_proto::priority::BULK, &bytes),
+            Some((7, SEQUENCE_LIMIT + 1))
+        );
+        assert!(owned_secondary_header(veil_proto::priority::INTERACTIVE, &bytes).is_none());
+        assert!(owned_secondary_header(veil_proto::priority::REALTIME, &bytes).is_none());
     }
 
     fn forward(sequence: u64) -> Vec<u8> {
