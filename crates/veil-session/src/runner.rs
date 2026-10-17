@@ -5301,6 +5301,12 @@ impl SessionRunner {
                                 ),
                             );
                         }
+                        if let Some(work) = envelope.local_work.as_ref() {
+                            crate::local_lossy_trace::work_release(
+                                work, outgoing_priority, outgoing, sent_wire_len,
+                                sender_state.handle.quic().map_or(0, |handle| handle.local_trace_id()),
+                            );
+                        }
                         if let Some((counter, channel)) = sender_state.sent_counter.as_ref() {
                             counter.note_sent(*channel);
                         }

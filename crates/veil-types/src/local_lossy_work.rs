@@ -48,6 +48,18 @@ pub enum WorkAdmission {
     Rejected,
 }
 
+/// Process-local observation of an admitted work boundary. Reading it cannot
+/// reserve credit, release a member, renew expiry or change a decision.
+pub struct WorkScheduleSnapshot {
+    pub index: usize,
+    pub cells: usize,
+    pub sealed_bytes: usize,
+    pub envelope_wire_bytes: usize,
+    pub span: Duration,
+    pub since_admission: Duration,
+    pub until_expiry: Duration,
+}
+
 impl LocalLossyWork {
     pub fn new(sizes: Vec<usize>) -> Option<Arc<Self>> {
         if sizes.is_empty() || sizes.len() > MAX_CELLS || sizes.iter().any(|n| *n < 36) {
@@ -102,6 +114,31 @@ impl LocalLossyWork {
 }
 
 impl LocalLossyCell {
+    pub fn boundary_snapshot_at(&self, now: Instant) -> Option<WorkScheduleSnapshot> {
+        if self.index != 0 && self.index + 1 != self.work.sizes.len() {
+            return None;
+        }
+        let pacing = self.work.pacing.as_ref()?;
+        let state = self.work.decision.lock().unwrap_or_else(|p| p.into_inner());
+        let Decision::Admitted {
+            admitted_at,
+            wire_bytes,
+            ..
+        } = *state
+        else {
+            return None;
+        };
+        Some(WorkScheduleSnapshot {
+            index: self.index,
+            cells: self.work.sizes.len(),
+            sealed_bytes: self.work.sealed_bytes,
+            envelope_wire_bytes: wire_bytes,
+            span: pacing.span,
+            since_admission: now.saturating_duration_since(admitted_at),
+            until_expiry: pacing.expires_at.saturating_duration_since(now),
+        })
+    }
+
     /// The daemon constructs every member with the same fixed envelope shape.
     /// Charge the actual first envelope overhead for EVERY cell before sending
     /// any member. A changed shape or endpoint fails closed, never earns credit.
@@ -254,8 +291,35 @@ mod tests {
             }),
             WorkAdmission::Admitted
         );
+        let snapshot = first.boundary_snapshot_at(now).unwrap();
+        assert_eq!(
+            (
+                snapshot.index,
+                snapshot.cells,
+                snapshot.sealed_bytes,
+                snapshot.envelope_wire_bytes
+            ),
+            (0, 3, 2200, 3148)
+        );
+        assert_eq!(
+            (
+                snapshot.span,
+                snapshot.since_admission,
+                snapshot.until_expiry
+            ),
+            (span, Duration::ZERO, SOURCE_WORK_MAX_AGE)
+        );
+        // Even a future/expired observation cannot alter credit or expiry.
+        assert_eq!(
+            first
+                .boundary_snapshot_at(now + SOURCE_WORK_MAX_AGE)
+                .unwrap()
+                .until_expiry,
+            Duration::ZERO
+        );
         assert_eq!(first.release_at(now), WorkAdmission::Admitted);
         let second = work.cell(1).unwrap();
+        assert!(second.boundary_snapshot_at(now).is_none());
         let due = now + Duration::from_nanos((span.as_nanos() * 1316 / 3148) as u64);
         assert_eq!(
             second.admit_at(7, 1116, now, |_| panic!("already reserved")),
