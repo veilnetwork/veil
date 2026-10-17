@@ -514,6 +514,27 @@ impl MediaRoutes {
         if outgoing.as_ref().is_some_and(|(_, route, generation)| {
             !route.is_live() || *generation != self.repair_generation[i].load(Ordering::Acquire)
         }) {
+            if veil_session::rt_trace::rt_trace_enabled()
+                && let Some((address, route, generation)) = outgoing.as_ref()
+            {
+                log::info!(
+                    "media.private_route.retired at_ms={} peer={} plane={i} relay={} age_ms={} echo_age_ms={} repair_generation={generation}/{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis(),
+                    veil_util::hex_short(&self.peer),
+                    veil_util::hex_short(&address.relay),
+                    route.created.elapsed().as_millis(),
+                    route
+                        .last_echo
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .elapsed()
+                        .as_millis(),
+                    self.repair_generation[i].load(Ordering::Acquire),
+                );
+            }
             outgoing.take();
         }
         if let Some((address, owned, _)) = outgoing.as_ref() {
@@ -546,6 +567,20 @@ impl MediaRoutes {
                     core.local_datagram_lane,
                 ),
             };
+            crate::media::trace_sealed_cell(
+                match &result {
+                    Ok(()) => "onion_private_local_ok",
+                    Err(veil_node_runtime::DataCircuitSendError::QueueFull) => "onion_private_full",
+                    Err(veil_node_runtime::DataCircuitSendError::PayloadTooLarge) => {
+                        "onion_private_oversize"
+                    }
+                    Err(veil_node_runtime::DataCircuitSendError::NoRelays) => {
+                        "onion_private_no_route"
+                    }
+                },
+                &self.peer,
+                sealed.as_bytes(),
+            );
             match result {
                 Ok(()) => {
                     #[cfg(test)]
@@ -568,6 +603,7 @@ impl MediaRoutes {
         drop(outgoing);
         #[cfg(test)]
         self.fallback_attempts[i].fetch_add(1, Ordering::Relaxed);
+        crate::media::trace_sealed_cell("onion_fallback_begin", &self.peer, sealed.as_bytes());
         core.send_datagram(self.peer, sealed).await
     }
 
@@ -601,6 +637,18 @@ impl MediaRoutes {
                     && !self.closed.load(Ordering::Acquire)
                     && self.repair_generation[i].load(Ordering::Acquire) == repair_generation
                 {
+                    if veil_session::rt_trace::rt_trace_enabled() {
+                        log::info!(
+                            "media.private_route.ready at_ms={} peer={} plane={i} relay={} revision={} repair_generation={repair_generation}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis(),
+                            veil_util::hex_short(&self.peer),
+                            veil_util::hex_short(&address.relay),
+                            offer.revision,
+                        );
+                    }
                     *outgoing = Some((address.clone(), route, repair_generation));
                 }
             }
