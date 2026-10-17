@@ -85,9 +85,10 @@ class AudioRecoveryCursor {
   void Observe(const AudioRecoveryReport& report, uint32_t local_ssrc,
                int64_t arrived_us) {
     if (!local_ssrc || report.target_ssrc != local_ssrc || arrived_us <= 0 ||
-        report.sequence <= sequence_ ||
         (report.known && report.origin < origin_))
       return;
+    const bool new_origin = report.known && report.origin > origin_;
+    if (!new_origin && report.sequence <= sequence_) return;
     sequence_ = report.sequence;
     supported_ = true;
     if (!report.known) return;
@@ -105,6 +106,9 @@ class AudioRecoveryCursor {
       reported_us_ = std::max(reported_us_, arrived_us);
   }
   bool supported() const { return supported_; }
+  AudioRecoverySample Sample() const {
+    return {origin_ != 0, origin_, discarded_ms_, 0};
+  }
   int64_t FreshReportUs(int64_t now_us) const {
     return reported_us_ > 0 && reported_us_ <= now_us &&
                    now_us - reported_us_ <= 15'000'000

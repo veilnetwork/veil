@@ -44,7 +44,10 @@ class StreamAudioRecovery {
 class AudioRecoveryRegistry {
  public:
   std::shared_ptr<StreamAudioRecovery> NewStream() {
-    return std::make_shared<StreamAudioRecovery>(next_origin_.fetch_add(1));
+    // A call may recreate its engine/registry without restarting the process.
+    // Reusing origin=1 would alias the previous decoder's discarded counter.
+    static std::atomic<uint64_t> next_origin{1};
+    return std::make_shared<StreamAudioRecovery>(next_origin.fetch_add(1));
   }
   void Attach(uint32_t ssrc,
               const std::shared_ptr<StreamAudioRecovery>& stream) {
@@ -71,7 +74,6 @@ class AudioRecoveryRegistry {
  private:
   mutable std::mutex mutex_;
   std::unordered_map<uint32_t, std::weak_ptr<StreamAudioRecovery>> streams_;
-  std::atomic<uint64_t> next_origin_{1};
 };
 }  // namespace veil_media
 #endif

@@ -75,6 +75,16 @@ int main() {
   AudioRecoveryFeedbackTest::Observe(sender, sent, now + 3000);
   require(sender.peer_audio_recovery_report_us(now + 3000) == now + 1000,
           "cached event in fresh report renewed loss");
+  const auto snapshot = sender.peer_audio_recovery_snapshot();
+  receiver.SetLocalAudioRecovery(11, 3, {true, 1, 40, now}, now);
+  receiver.SendRtcp(original, {});
+  AudioRecoveryFeedbackTest::Observe(sender, sent, now + 4000);
+  const auto next_snapshot = sender.peer_audio_recovery_snapshot();
+  require(snapshot.Sample().origin == 1 && snapshot.Sample().discarded_ms == 20 &&
+              snapshot.FreshReportUs(now + 4000) == now + 1000 &&
+              next_snapshot.Sample().discarded_ms == 40 &&
+              next_snapshot.FreshReportUs(now + 4000) == now + 4000,
+          "event counter and witness timestamp are not one stable snapshot");
   VeilTransportShim untouched(3, nullptr, nullptr, nullptr, nullptr);
   untouched.SetLocalAudioSsrc(11);
   untouched.Start();
