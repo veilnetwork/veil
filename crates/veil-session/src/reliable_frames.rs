@@ -31,6 +31,12 @@ enum Owner {
 }
 
 impl Owner {
+    fn quic_snapshot(&self) -> Option<(u64, veil_transport::QuicDatagramPathStats)> {
+        match self {
+            Self::Outgoing(c) => c.quic_snapshot(),
+            Self::Incoming(c) => c.quic_snapshot(),
+        }
+    }
     fn keys(&self) -> &crate::parallel_binding::ParallelKeys {
         match self {
             Self::Outgoing(c) => &c.keys,
@@ -259,6 +265,9 @@ pub struct ReliableFrameChannel {
 }
 
 impl ReliableFrameChannel {
+    pub(crate) fn quic_snapshot(&self) -> Option<(u64, veil_transport::QuicDatagramPathStats)> {
+        self._owner.quic_snapshot()
+    }
     pub fn new(channel: BoundReliableChannel) -> Self {
         Self::from_owner(Owner::Outgoing(channel))
     }
