@@ -17,6 +17,7 @@
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
 #include <aaudio/AAudio.h>
 #include <android/log.h>
+#include <dlfcn.h>
 
 #include <atomic>
 #include <cstdint>
@@ -40,6 +41,17 @@ constexpr int kRecordDelayMs = 10;
 constexpr int kPlayoutDelayMs = 40;
 
 #define ALOG(...) __android_log_print(ANDROID_LOG_INFO, "veil_media", __VA_ARGS__)
+
+// These setters were added in API 28. Resolve them at runtime so loading this
+// ADM still works on API 26/27 (no new undefined API-28 symbols in the ELF).
+// AAudio otherwise defaults to MEDIA/MUSIC and VOICE_RECOGNITION: call routing
+// and the volume controlled by the phone's buttons can disagree with playback.
+void SetVoiceAttribute(AAudioStreamBuilder* builder, const char* symbol,
+                       int32_t value) {
+  using Setter = void (*)(AAudioStreamBuilder*, int32_t);
+  const auto setter = reinterpret_cast<Setter>(dlsym(RTLD_DEFAULT, symbol));
+  if (setter) setter(builder, value);
+}
 
 class VeilAAudioAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
                           webrtc::AudioDeviceModule> {
@@ -173,6 +185,8 @@ class VeilAAudioAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     AAudioStreamBuilder* b = nullptr;
     if (AAudio_createStreamBuilder(&b) != AAUDIO_OK) return false;
     AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_INPUT);
+    SetVoiceAttribute(b, "AAudioStreamBuilder_setInputPreset",
+                      AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);
     AAudioStreamBuilder_setSampleRate(b, kSampleRate);
     AAudioStreamBuilder_setChannelCount(b, kChannels);
     AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
@@ -209,6 +223,10 @@ class VeilAAudioAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     AAudioStreamBuilder* b = nullptr;
     if (AAudio_createStreamBuilder(&b) != AAUDIO_OK) return false;
     AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_OUTPUT);
+    SetVoiceAttribute(b, "AAudioStreamBuilder_setUsage",
+                      AAUDIO_USAGE_VOICE_COMMUNICATION);
+    SetVoiceAttribute(b, "AAudioStreamBuilder_setContentType",
+                      AAUDIO_CONTENT_TYPE_SPEECH);
     AAudioStreamBuilder_setSampleRate(b, kSampleRate);
     AAudioStreamBuilder_setChannelCount(b, kChannels);
     AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
