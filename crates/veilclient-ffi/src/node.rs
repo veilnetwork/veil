@@ -19,12 +19,13 @@ use std::time::{Duration, Instant};
 use libc::size_t;
 use tokio::sync::watch;
 
-/// Minimal `log` -> stderr bridge for non-Android hosts. The embedded node's
+/// Minimal `log` -> queued console bridge for non-Android hosts. The embedded node's
 /// runtime emits some diagnostics through the `log` crate (e.g. the onion-stream
 /// `relay-pick` line), but on desktop nothing consumes `log`, so those vanish
 /// (only the node's own tracing logger reaches stderr). Bridge them — non-
-/// panicking: a failed stderr write is swallowed, never aborts (see the FFI
-/// `diag` crash). Android already routes `log` to logcat via `android_logger`.
+/// panicking: enqueue never waits for stderr, and failed writes are counted
+/// instead of aborting (see the FFI `diag` crash). Android already routes
+/// `log` to logcat via `android_logger`.
 #[cfg(not(target_os = "android"))]
 struct StderrLogBridge;
 
@@ -35,17 +36,17 @@ impl log::Log for StderrLogBridge {
     }
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
-            use std::io::Write as _;
-            let _ = writeln!(
-                std::io::stderr(),
-                "[{} {}] {}",
+            let _ = veil_observability::enqueue_console_record(format!(
+                "[{} {}] {}\n",
                 record.level(),
                 record.target(),
                 record.args()
-            );
+            ));
         }
     }
-    fn flush(&self) {}
+    fn flush(&self) {
+        let _ = veil_observability::flush_console_logs(Duration::from_millis(200));
+    }
 }
 
 /// Opaque handle to a running embedded node.
@@ -1268,6 +1269,8 @@ pub unsafe extern "C" fn veil_node_stop_timeout(node: *mut VeilNode, timeout_ms:
     if let Some(thread) = veil_util::lock!(node.thread).take() {
         let _ = thread.join();
     }
+    let _ =
+        veil_observability::flush_console_logs(deadline.saturating_duration_since(Instant::now()));
     0
 }
 
@@ -1296,6 +1299,7 @@ pub unsafe extern "C" fn veil_node_stop(node: *mut VeilNode) {
     if let Some(thread) = veil_util::lock!(node.thread).take() {
         let _ = thread.join();
     }
+    let _ = veil_observability::flush_console_logs(Duration::from_millis(200));
 }
 
 #[cfg(test)]

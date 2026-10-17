@@ -61,6 +61,7 @@ veil-types = { path = "../veil-types" }
 # Runtime toggle for the slow-inbound-dispatch trace (rt_trace) on embedded
 # nodes — the session crate is already in-tree via the node runtime.
 veil-session = { path = "../veil-session" }
+veil-observability = { path = "../veil-observability" }
 # Embedded node runtime — optional, NO default features (see `node-embedded`).
 veil-node-runtime = { path = "../veil-node-runtime", default-features = false, optional = true }
 # Origin admission tracing shares the embedded node's existing stand toggle.

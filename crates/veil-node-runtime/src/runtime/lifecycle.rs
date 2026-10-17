@@ -281,6 +281,7 @@ impl NodeRuntime {
         Self::do_stop_flushes(flush_ctx).await;
         Self::do_stop_tasks(stop_ctx).await;
         self.finalize_stop_state();
+        Self::flush_console_at_stop().await;
         Ok(())
     }
 
@@ -297,7 +298,18 @@ impl NodeRuntime {
         Self::do_stop_flushes(flush_ctx).await;
         Self::do_stop_tasks(stop_ctx).await;
         rt.lock().await.finalize_stop_state();
+        Self::flush_console_at_stop().await;
         Ok(())
+    }
+
+    // Console I/O has its own writer. Drain it during graceful shutdown,
+    // outside session tasks and the outer runtime lock. A broken/blocked
+    // console must not turn node shutdown into an unbounded sink wait.
+    async fn flush_console_at_stop() {
+        let flush = tokio::task::spawn_blocking(|| {
+            veil_observability::flush_console_logs(std::time::Duration::from_millis(200))
+        });
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(250), flush).await;
     }
 
     /// Dry-run the fallible reconstruction that `apply_reload_after_stop`

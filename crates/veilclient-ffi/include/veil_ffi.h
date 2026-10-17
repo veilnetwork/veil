@@ -927,6 +927,13 @@ extern "C" {
  */
  void veil_debug_set_rt_trace(int on) ;
 
+ /* Console-log barrier/counters for diagnostic consumers. The flush waits at
+  * most 5000 ms; 0 means flushed, 1 means timeout or output error. Also require
+  * both cumulative counters to be zero before qualifying a complete trace. */
+ int veil_debug_flush_console_logs(uint64_t timeout_ms) ;
+ uint64_t veil_debug_console_log_dropped(void) ;
+ uint64_t veil_debug_console_log_write_errors(void) ;
+
 /**
  * EXPERIMENT SWITCH (call-RTT-spike investigation): pause/resume the
  * embedded node's periodic publish machinery (rendezvous-ad refresh, DHT
