@@ -1161,14 +1161,16 @@ async fn verify_distinct_sources(late_idle: bool) {
             .await
             .unwrap();
             let frame = primary_test_frame(true, seq, 0);
-            let mut sender = a.sender(index);
-            let new_handle = sender.handle.quic().unwrap().clone();
-            assert_ne!(new_handle.channel_binding().unwrap(), retired_binding);
-            let max_size = sender.max_datagram_size;
-            for packet in sender.tx.encode_frame(99, &frame, max_size).unwrap() {
-                sender.handle.send(&packet).unwrap();
-            }
-            drop(sender);
+            let new_handle = {
+                let mut sender = a.sender(index);
+                let new_handle = sender.handle.quic().unwrap().clone();
+                assert_ne!(new_handle.channel_binding().unwrap(), retired_binding);
+                let max_size = sender.max_datagram_size;
+                for packet in sender.tx.encode_frame(99, &frame, max_size).unwrap() {
+                    sender.handle.send(&packet).unwrap();
+                }
+                new_handle
+            };
             assert_eq!(
                 timeout(Duration::from_secs(2), rx.recv())
                     .await
