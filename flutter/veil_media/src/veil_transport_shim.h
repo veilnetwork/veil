@@ -179,6 +179,7 @@ class VeilTransportShim : public webrtc::Transport {
                             AudioRecoverySample sample, int64_t sampled_us);
   int64_t peer_audio_recovery_report_us(int64_t now_us) const;
   bool peer_audio_recovery_supported() const;
+  AudioRecoveryCursor peer_audio_recovery_snapshot() const;
 
   // Enable only when both endpoints have independent audio/video counters.
   // Older engines used one sequence space and cannot consume split feedback.
