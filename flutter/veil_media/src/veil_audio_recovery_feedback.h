@@ -84,14 +84,15 @@ class AudioRecoveryCursor {
  public:
   void Observe(const AudioRecoveryReport& report, uint32_t local_ssrc,
                int64_t arrived_us) {
-    if (!local_ssrc || report.target_ssrc != local_ssrc || arrived_us <= 0 ||
-        (report.known && report.origin < origin_))
+    if (!local_ssrc || report.target_ssrc != local_ssrc || arrived_us <= 0)
       return;
+    supported_ = true;
+    // Unknown reports carry no decoder origin. A delayed unknown report from
+    // a retired engine must not move the new decoder's sequence high water.
+    if (!report.known || report.origin < origin_) return;
     const bool new_origin = report.known && report.origin > origin_;
     if (!new_origin && report.sequence <= sequence_) return;
     sequence_ = report.sequence;
-    supported_ = true;
-    if (!report.known) return;
     if (report.origin > origin_) {
       origin_ = report.origin;
       discarded_ms_ = 0;

@@ -56,11 +56,24 @@ int main() {
   require(cursor.Sample().known && cursor.Sample().origin == 2 &&
           cursor.Sample().discarded_ms == 10,
           "canonical peer event identity differs from the RTCP report");
+  auto old_unknown = *report;
+  old_unknown.known = false;
+  old_unknown.origin = 0;
+  old_unknown.discarded_ms = 0;
+  old_unknown.age_ms = kUnknownRecoveryAge;
+  old_unknown.sequence = 1000;
+  cursor.Observe(old_unknown, 11, 7'100'000);
+  report->sequence = 2;
+  report->discarded_ms = 20;
+  cursor.Observe(*report, 11, 7'200'000);
+  require(cursor.Sample().discarded_ms == 20 &&
+          cursor.FreshReportUs(7'200'000) == 7'200'000,
+          "old unknown sample poisoned the recreated decoder's sequence");
   report->sequence = 6;
   report->origin = 1;
   report->discarded_ms = 100;
   cursor.Observe(*report, 11, 8'000'000);
-  require(cursor.FreshReportUs(8'000'000) == 7'000'000,
+  require(cursor.FreshReportUs(8'000'000) == 7'200'000,
           "retired receiver renewed loss");
   require(cursor.FreshReportUs(23'000'001) == 0, "old witness did not expire");
   for (int index : {3, 8, 44}) {
