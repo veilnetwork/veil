@@ -59,8 +59,12 @@ on an Apple-silicon (aarch64) Linux VM natively. Options:
    AAudio input stream is silent until RECORD_AUDIO is granted. Mirror the macOS
    `MacMediaPermissions` flow (non-blocking, bounded) on Android.
 
-6. **minSdk:** AAudio needs API 26+. `veil_aaudio_adm.cc` sticks to API-26 AAudio
-   calls (no `setUsage`/`setInputPreset`, which are API 28) for broad support.
+6. **minSdk:** AAudio needs API 26+. `veil_aaudio_adm.cc` resolves the API-28
+   usage/content/input-preset setters at runtime. On API 28+ calls use
+   VOICE_COMMUNICATION/SPEECH and the voice-call volume; on API 26/27 it keeps
+   the AAudio defaults and media-volume buttons. No API-28 symbol is required
+   to load the library on older phones. The host needs MODIFY_AUDIO_SETTINGS
+   and must preserve connected headsets when choosing the default call route.
 
 ## Verify
 

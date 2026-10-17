@@ -69,6 +69,7 @@
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
 #include "bounded_audio_encoder.h"
 #include "veil_audio_adaptor_config.h"
+#include "veil_call_audio_processing.h"
 #include "call/rtp_transport_controller_send_interface.h"
 #include "rtc_base/network_route.h"
 #include "api/environment/environment.h"
@@ -1746,7 +1747,8 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
       }
     });
   }
-  ws->apm = webrtc::BuiltinAudioProcessingBuilder().Build(ws->env);
+  ws->apm = webrtc::BuiltinAudioProcessingBuilder(
+      veil_media::CallAudioProcessingConfig()).Build(ws->env);
 
   webrtc::AudioState::Config asc;
   asc.audio_mixer = webrtc::AudioMixerImpl::Create();
@@ -1892,7 +1894,8 @@ VeilGroupMediaEngine* veil_media_group_engine_create(
       "veil-group-video-net", webrtc::TaskQueueFactory::Priority::kNormal);
   ws->adm = create_audio_device(ws->env);
   if (ws->adm) run_on_adm_thread([&] { ws->adm->Init(); });
-  ws->apm = webrtc::BuiltinAudioProcessingBuilder().Build(ws->env);
+  ws->apm = webrtc::BuiltinAudioProcessingBuilder(
+      veil_media::CallAudioProcessingConfig()).Build(ws->env);
   webrtc::AudioState::Config asc;
   asc.audio_mixer = webrtc::AudioMixerImpl::Create();
   asc.audio_processing = ws->apm;

@@ -193,7 +193,7 @@ fi
   -L"$AAUDIO_L" \
   -Wl,--gc-sections -Wl,--version-script,"$TMP/exports.map" \
   -Wl,-soname,libveil_media.so \
-  -llog -laaudio -lOpenSLES -landroid
+  -llog -laaudio -lOpenSLES -landroid -ldl
 
 # Strip debug info (the ELF ships with debug_info otherwise → ~5MB smaller).
 # VEIL_MEDIA_NO_STRIP=1 keeps symbols for crash symbolication.
