@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.11.42 — 2026-10-17
+
+### Fixed
+
+- Restore nickname ownership after deferred startup of an existing standalone
+  Ed25519 identity, retaining its key and address. Corrupt documents remain
+  errors instead of silently replacing an identity.
+- Resolve cold identity delegation before admitting call rendezvous routes.
+- Keep private media paths alive through their datagram carrier and reject
+  closed prepared channels before replacing a healthy transport.
+- Pace complete authored video work after frame assembly and retain original
+  packet deadlines through bounded capacity retries. Relays remain opaque and
+  do not assign media priority.
+- Preserve stable decoded-audio loss identities across engine recreation and
+  reject feedback for retired decoders without poisoning the active sequence.
+
+### Diagnostics
+
+- Add local group RTCP, retransmission, keyframe and source-scheduling counters
+  with regression coverage. Timing capture remains explicit and bounded.
+
+### Known limitations
+
+- Intermittent audio latency under simultaneous group video and file transfer
+  remains under investigation: retained complete runs include both a 180-ms
+  pass and a 220-ms failure against the unchanged strict 200-ms audio gate.
+- Group video repairs still fan out to participants that did not request them.
+
 ## v0.11.41 — 2026-10-16
 
 ### Fixed
