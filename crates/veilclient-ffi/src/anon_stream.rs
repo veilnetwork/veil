@@ -40,16 +40,10 @@ use crate::media::{LocalMediaPlane, SealedMediaCell};
 /// underlying stderr write fails — and under `flutter run` the desktop app's
 /// stderr is a pipe that can break, so an `eprintln!` mid-stream panicked and,
 /// unwinding across the `extern "C"` FFI boundary, aborted the whole process
-/// (the observed silent desktop crash). Write directly and swallow any error;
-/// mirror to logcat on Android (the node's tracing logger doesn't reach it).
+/// (the observed silent desktop crash). Share the non-panicking FFI diagnostic
+/// path: queued console output on desktop, logcat on Android.
 fn diag(msg: &str) {
-    #[cfg(target_os = "android")]
-    log::warn!("{msg}");
-    #[cfg(not(target_os = "android"))]
-    {
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr(), "{msg}");
-    }
+    crate::ffi_diag(msg);
 }
 
 fn diag_node(node: &[u8; 32], msg: &str) {

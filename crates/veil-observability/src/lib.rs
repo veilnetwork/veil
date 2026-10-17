@@ -108,9 +108,18 @@ use veil_types::{LogFormat, LogLevel, LogsConfig};
 
 use std::fmt;
 
+mod console;
+pub use console::{ConsoleLogStats, console_log_stats, enqueue_console_record, flush_console_logs};
+
+#[derive(Clone)]
+enum LoggerSink {
+    Console,
+    Direct(Arc<Mutex<Box<dyn Write + Send>>>),
+}
+
 #[derive(Clone)]
 pub struct NodeLogger {
-    sink: Arc<Mutex<Box<dyn Write + Send>>>,
+    sink: LoggerSink,
     level: LogLevel,
     format: LogFormat,
 }
@@ -553,7 +562,7 @@ impl NodeLogger {
     /// `#[cfg(test)]` gate that previously hid it across crate boundaries).
     pub fn new_noop() -> Self {
         Self {
-            sink: Arc::new(Mutex::new(Box::new(io::sink()))),
+            sink: LoggerSink::Direct(Arc::new(Mutex::new(Box::new(io::sink())))),
             level: LogLevel::Error,
             format: LogFormat::Text,
         }
@@ -564,15 +573,21 @@ impl NodeLogger {
     /// `veilcore::cfg::observability_glue` so this crate stays free of
     /// the cfg layer. Pass `LogsConfig::Stderr` to get the stderr sink;
     /// pass `LogsConfig::File` with `log_file = Some(path)` for a
-    /// per-file sink.
+    /// per-file sink. Console records use a process-wide bounded FIFO and
+    /// dedicated writer. Check `console_log_stats` for rejected/error output
+    /// and `flush_console_logs` at diagnostic/shutdown boundaries. Explicit
+    /// file sinks retain their synchronous write/flush semantics.
     pub fn from_parts(
         logs: LogsConfig,
         log_file: Option<&std::path::Path>,
         level: LogLevel,
         format: LogFormat,
     ) -> std::io::Result<Self> {
-        let sink: Box<dyn Write + Send> = match logs {
-            LogsConfig::Stderr => default_console_sink(),
+        let sink = match logs {
+            LogsConfig::Stderr => {
+                console::ensure_console_logger()?;
+                LoggerSink::Console
+            }
             LogsConfig::File => {
                 let path = log_file.ok_or_else(|| {
                     io::Error::new(
@@ -580,11 +595,13 @@ impl NodeLogger {
                         "global.log_file must be configured when global.logs=file",
                     )
                 })?;
-                Box::new(OpenOptions::new().create(true).append(true).open(path)?)
+                LoggerSink::Direct(Arc::new(Mutex::new(Box::new(
+                    OpenOptions::new().create(true).append(true).open(path)?,
+                ))))
             }
         };
         Ok(Self {
-            sink: Arc::new(Mutex::new(sink)),
+            sink,
             level,
             format,
         })
@@ -610,14 +627,21 @@ impl NodeLogger {
         if level < self.level {
             return;
         }
-        let line = match self.format {
+        let mut line = match self.format {
             LogFormat::Text => format_log_line(level.as_str(), event, message),
             LogFormat::Json => format_log_json(level.as_str(), event, message),
         };
-        if let Ok(mut sink) = self.sink.lock() {
-            let _ = sink.write_all(line.as_bytes());
-            let _ = sink.write_all(b"\n");
-            let _ = sink.flush();
+        line.push('\n');
+        match &self.sink {
+            LoggerSink::Console => {
+                let _ = enqueue_console_record(line);
+            }
+            LoggerSink::Direct(sink) => {
+                if let Ok(mut sink) = sink.lock() {
+                    let _ = sink.write_all(line.as_bytes());
+                    let _ = sink.flush();
+                }
+            }
         }
     }
 }
