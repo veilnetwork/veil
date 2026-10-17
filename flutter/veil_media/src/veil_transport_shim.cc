@@ -72,11 +72,13 @@ VeilTransportShim::VeilTransportShim(uint64_t veil_chan,
                                      webrtc::Call* call,
                                      webrtc::TaskQueueBase* network_queue,
                                      webrtc::Call* video_call,
-                                     webrtc::TaskQueueBase* video_network_queue)
+                                     webrtc::TaskQueueBase* video_network_queue,
+                                     std::shared_ptr<RtcpSendStats> group_rtcp_stats)
     : veil_chan_(veil_chan), call_(call), network_queue_(network_queue),
       video_call_(video_call), video_network_queue_(video_network_queue),
       audio_ingress_diagnostics_(diag::enabled()),
-      audio_trace_capacity_(diag::rtp_trace_capacity()) {}
+      audio_trace_capacity_(diag::rtp_trace_capacity()),
+      group_rtcp_stats_(std::move(group_rtcp_stats)) {}
 
 VeilTransportShim::~VeilTransportShim() {
   Stop();
@@ -389,6 +391,7 @@ bool VeilTransportShim::SendRtcpOnSource(std::span<const uint8_t> packet,
       ? veil_media_send_video_control_datagram(veil_chan_, packet.data(), packet.size())
       : veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
   if (rc == 0) {
+    if (group_rtcp_stats_) group_rtcp_stats_->Record(packet.size(), video);
     if (video) {
       outbound_video_rtcp_packet_count_.fetch_add(1, std::memory_order_relaxed);
       outbound_video_rtcp_byte_count_.fetch_add(packet.size(), std::memory_order_relaxed);
