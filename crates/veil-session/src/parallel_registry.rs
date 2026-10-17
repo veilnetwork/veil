@@ -43,6 +43,10 @@ pub struct RegisteredReliableChannel {
 }
 
 impl RegisteredReliableChannel {
+    pub(crate) fn quic_snapshot(&self) -> Option<(u64, veil_transport::QuicDatagramPathStats)> {
+        self.channel.quic_snapshot()
+    }
+
     pub fn handle(&self) -> crate::parallel_binding::BoundReliableHandle {
         self.channel.handle()
     }

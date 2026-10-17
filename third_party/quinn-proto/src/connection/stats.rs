@@ -142,6 +142,11 @@ pub struct PathStats {
     pub cwnd: u64,
     /// Bytes currently awaiting acknowledgment on this path (local snapshot).
     pub in_flight_bytes: u64,
+    /// Local stream storage still retained, including selectively ACKed
+    /// suffixes whose backing allocation cannot yet be released.
+    pub stream_retained_bytes: u64,
+    /// Current local stream admission window; not a remote flow-control limit.
+    pub stream_send_window_bytes: u64,
     /// Transmits containing an ordinary packet built with less than an MTU of
     /// remaining congestion-window capacity. No application role is inspected.
     pub residual_window_transmits: u64,

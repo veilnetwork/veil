@@ -99,6 +99,8 @@ mod tests {
             rtt_us: 60_000,
             congestion_window_bytes: 12000,
             in_flight_bytes: 12000,
+            stream_retained_bytes: 0,
+            stream_send_window_bytes: 0,
             pto_count: 1,
             lost_packets: 0,
             congestion_events: 0,

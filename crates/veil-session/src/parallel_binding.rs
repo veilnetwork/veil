@@ -223,6 +223,18 @@ impl Drop for ReliableTransportOwner {
 }
 
 impl BoundReliableChannel {
+    /// Read the actual owned child's local counters without retaining another
+    /// transport handle or changing parent authorization/lifetime.
+    pub(crate) fn quic_snapshot(&self) -> Option<(u64, veil_transport::QuicDatagramPathStats)> {
+        if !self.keys.parent.is_active() {
+            return None;
+        }
+        self.transport
+            .0
+            .as_ref()
+            .map(|handle| (handle.local_trace_id(), handle.path_stats()))
+    }
+
     pub fn handle(&self) -> BoundReliableHandle {
         BoundReliableHandle {
             records: self.plane.handle(),

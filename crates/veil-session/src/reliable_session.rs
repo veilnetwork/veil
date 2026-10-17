@@ -45,6 +45,9 @@ pub struct ReliableReady {
 }
 
 impl ReliableReady {
+    pub(super) fn quic_snapshot(&self) -> Option<(u64, veil_transport::QuicDatagramPathStats)> {
+        self.channel.quic_snapshot()
+    }
     pub fn id(&self) -> [u8; 32] {
         self.id
     }

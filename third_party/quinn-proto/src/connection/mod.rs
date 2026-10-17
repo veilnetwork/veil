@@ -1406,6 +1406,10 @@ impl Connection {
         stats.path.min_rtt = self.path.rtt.min();
         stats.path.cwnd = self.path.congestion.window();
         stats.path.in_flight_bytes = self.path.in_flight.bytes;
+        (
+            stats.path.stream_retained_bytes,
+            stats.path.stream_send_window_bytes,
+        ) = self.streams.send_buffer_usage();
         stats.path.pto_count = self.pto_count;
         stats.path.current_mtu = self.path.mtud.current_mtu();
 
