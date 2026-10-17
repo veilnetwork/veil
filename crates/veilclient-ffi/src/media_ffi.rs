@@ -409,17 +409,24 @@ async fn drain_relay_video_on_plane<F, Fut>(
     F: FnMut(media::SealedMediaCell) -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    drain_relay_video_batches_on_plane(rx, batching, cipher, stats, plane, move |cells, _is_frame| {
-        let futures: Vec<_> = cells.into_iter().map(&mut send).collect();
-        async move {
-            for future in futures {
-                if !future.await {
-                    return false;
+    drain_relay_video_batches_on_plane(
+        rx,
+        batching,
+        cipher,
+        stats,
+        plane,
+        move |cells, _is_frame| {
+            let futures: Vec<_> = cells.into_iter().map(&mut send).collect();
+            async move {
+                for future in futures {
+                    if !future.await {
+                        return false;
+                    }
                 }
+                true
             }
-            true
-        }
-    })
+        },
+    )
     .await;
 }
 
@@ -1167,17 +1174,34 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                     let deadline = sealed[0]
                         .local_deadline()
                         .expect("native pump retains packet deadline");
-                    let cells = sealed.into_iter().map(media::SealedMediaCell::into_vec).collect();
+                    let cells = sealed
+                        .into_iter()
+                        .map(media::SealedMediaCell::into_vec)
+                        .collect();
                     let result = if is_frame {
-                        sender.send_relay_media_batch_before_owned(
-                            veil_proto::priority::BULK, peer, peer_app, peer_endpoint_id,
-                            cells, deadline, Some(Arc::clone(&stats.ipc_send_failures)),
-                        ).await
+                        sender
+                            .send_relay_media_batch_before_owned(
+                                veil_proto::priority::BULK,
+                                peer,
+                                peer_app,
+                                peer_endpoint_id,
+                                cells,
+                                deadline,
+                                Some(Arc::clone(&stats.ipc_send_failures)),
+                            )
+                            .await
                     } else {
-                        sender.send_relay_media_cells_before_owned(
-                            veil_proto::priority::BULK, peer, peer_app, peer_endpoint_id,
-                            cells, deadline, Some(Arc::clone(&stats.ipc_send_failures)),
-                        ).await
+                        sender
+                            .send_relay_media_cells_before_owned(
+                                veil_proto::priority::BULK,
+                                peer,
+                                peer_app,
+                                peer_endpoint_id,
+                                cells,
+                                deadline,
+                                Some(Arc::clone(&stats.ipc_send_failures)),
+                            )
+                            .await
                     };
                     stats.observe_ipc_cell(ipc_started.elapsed(), !matches!(result, Ok(true)));
                     true
@@ -1212,17 +1236,34 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
                     let deadline = sealed[0]
                         .local_deadline()
                         .expect("native pump retains packet deadline");
-                    let cells = sealed.into_iter().map(media::SealedMediaCell::into_vec).collect();
+                    let cells = sealed
+                        .into_iter()
+                        .map(media::SealedMediaCell::into_vec)
+                        .collect();
                     let result = if is_frame {
-                        sender.send_relay_media_batch_before_owned(
-                            veil_proto::priority::BACKGROUND, peer, peer_app, peer_endpoint_id,
-                            cells, deadline, Some(Arc::clone(&stats.ipc_send_failures)),
-                        ).await
+                        sender
+                            .send_relay_media_batch_before_owned(
+                                veil_proto::priority::BACKGROUND,
+                                peer,
+                                peer_app,
+                                peer_endpoint_id,
+                                cells,
+                                deadline,
+                                Some(Arc::clone(&stats.ipc_send_failures)),
+                            )
+                            .await
                     } else {
-                        sender.send_relay_media_cells_before_owned(
-                            veil_proto::priority::BACKGROUND, peer, peer_app, peer_endpoint_id,
-                            cells, deadline, Some(Arc::clone(&stats.ipc_send_failures)),
-                        ).await
+                        sender
+                            .send_relay_media_cells_before_owned(
+                                veil_proto::priority::BACKGROUND,
+                                peer,
+                                peer_app,
+                                peer_endpoint_id,
+                                cells,
+                                deadline,
+                                Some(Arc::clone(&stats.ipc_send_failures)),
+                            )
+                            .await
                     };
                     stats.observe_ipc_cell(ipc_started.elapsed(), !matches!(result, Ok(true)));
                     true
