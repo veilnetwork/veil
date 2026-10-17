@@ -1858,7 +1858,7 @@ async fn complete_relay_frames_reach_the_batch_sink_as_independent_work_items() 
     let cipher = Arc::new(cipher_for_test(&peer, &[1; 32], &[2; 32]).unwrap());
     let receiver = cipher_for_test(&peer, &[2; 32], &[1; 32]).unwrap();
     let enqueued_at = Instant::now();
-    let (tx, rx) = mpsc::channel(2);
+    let (tx, rx) = mpsc::channel(3);
     let first = vec![
         video_packet(7, false, 1),
         video_packet(7, false, 2),
@@ -1872,6 +1872,12 @@ async fn complete_relay_frames_reach_the_batch_sink_as_independent_work_items() 
         })
         .unwrap();
     }
+    let control = vec![0x80, 201, 0, 1, 0, 0, 0, 7];
+    tx.try_send(RelayVideoFrame {
+        packets: vec![control.clone()],
+        enqueued_at,
+    })
+    .unwrap();
     drop(tx);
     let (sink, mut groups) = mpsc::unbounded_channel();
     drain_relay_video_batches_on_plane(
@@ -1880,14 +1886,18 @@ async fn complete_relay_frames_reach_the_batch_sink_as_independent_work_items() 
         cipher,
         Arc::new(RelayMediaStats::default()),
         LocalMediaPlane::Secondary,
-        move |cells| {
-            sink.send(cells).unwrap();
+        move |cells, is_frame| {
+            sink.send((cells, is_frame)).unwrap();
             async { true }
         },
     )
     .await;
     for expected in [first, second] {
-        let actual = groups.try_recv().unwrap();
+        let (actual, is_frame) = groups.try_recv().unwrap();
+        assert!(
+            is_frame,
+            "complete RTP, including a one-cell frame, publishes cadence"
+        );
         assert_eq!(actual.len(), expected.len());
         for (sealed, packet) in actual.into_iter().zip(expected) {
             assert_eq!(
@@ -1897,6 +1907,17 @@ async fn complete_relay_frames_reach_the_batch_sink_as_independent_work_items() 
             assert_eq!(receiver.open(sealed.as_bytes()), Some(packet));
         }
     }
+    let (cells, is_frame) = groups.try_recv().unwrap();
+    assert!(
+        !is_frame,
+        "RTCP must not publish a video-frame cadence sample"
+    );
+    assert_eq!(cells.len(), 1);
+    assert_eq!(receiver.open(cells[0].as_bytes()), Some(control));
+    assert_eq!(
+        cells[0].local_deadline(),
+        Some(tokio::time::Instant::from_std(enqueued_at) + MEDIA_LOCAL_QUEUE_AGE)
+    );
     assert!(groups.try_recv().is_err());
 }
 
