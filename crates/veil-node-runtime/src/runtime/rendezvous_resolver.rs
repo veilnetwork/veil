@@ -30,6 +30,10 @@ use super::service_tasks::{
     warm_connected_relay_directory,
 };
 
+#[cfg(test)]
+#[path = "rendezvous_resolver_cold_document_tests.rs"]
+mod cold_document_tests;
+
 // ── T1.4 P5c: rendezvous-replica resolver ──────────────────────
 //
 // Replica-aware lookup for the receiver's RendezvousAd. Apps call
@@ -224,7 +228,6 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
                     decode_rendezvous_ad(bytes)
                         .ok()
                         .filter(|ad| ad.receiver_node_id == receiver_id)
-                        .filter(|ad| ad_binding_ok(dht, ad))
                         .filter(|ad| is_currently_valid(ad, now).is_ok())
                         .is_some()
                 },
@@ -234,14 +237,75 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
         }
     });
 
-    for (_idx, key, candidates) in if ads.is_empty() {
+    // Collect only bounded, decodable, currently valid candidates here. A
+    // device-signed ad cannot establish its binding until the identity document
+    // has been resolved; filtering by the local shard above discarded that ad
+    // forever on a cold sender. NOTHING below enters a route cache or the DHT
+    // mirror until the complete signature/delegation check succeeds.
+    let slots = if ads.is_empty() {
         futures::future::join_all(walks).await
     } else {
         Vec::new()
-    } {
+    };
+    let needs_delegation = slots.iter().any(|(_, _, candidates)| {
+        candidates
+            .iter()
+            .any(|bytes| decode_rendezvous_ad(bytes).is_ok_and(|ad| !ad_binding_ok(dht, &ad)))
+    });
+    if needs_delegation {
+        use veil_proto::identity_document::IdentityDocument;
+
+        let key = IdentityDocument::dht_key(&receiver_id);
+        // One additional bounded walk per receiver refresh, shared by all ad
+        // slots. Strictly self-bound ads require no document and keep their
+        // existing fast path. Compare all normal replica holders, including a
+        // valid local copy, so a stale remote document cannot overwrite a newer
+        // verified delegation already held here.
+        let documents = crate::mlkem_resolver::recursive_dht_get_candidates(
+            dht,
+            session_tx_registry,
+            pending_recursive,
+            local_node_id,
+            key,
+            timeout,
+            veil_proto::budget::DHT_REPLICATION_K,
+            |bytes| {
+                IdentityDocument::decode(bytes).is_ok_and(|doc| {
+                    doc.node_id == receiver_id
+                        && veil_identity::verify::verify_identity_document(
+                            &doc,
+                            veil_util::unix_secs_now_u64(),
+                        )
+                        .is_ok()
+                })
+            },
+        )
+        .await;
+        if let Some((_, bytes)) = documents
+            .into_iter()
+            .filter_map(|bytes| {
+                IdentityDocument::decode(&bytes)
+                    .ok()
+                    .map(|doc| (doc.issued_at_unix, bytes))
+            })
+            .max_by_key(|(issued_at, _)| *issued_at)
+        {
+            dht.store_local(key, bytes);
+            logger.info(
+                "anonymity.rendezvous.delegation.resolved",
+                format!("receiver={}", veil_util::hex_short(&receiver_id)),
+            );
+        }
+    }
+
+    for (_idx, key, candidates) in slots {
         let mut decoded: Vec<_> = candidates
             .into_iter()
             .filter_map(|bytes| decode_rendezvous_ad(&bytes).ok().map(|ad| (ad, bytes)))
+            .filter(|(ad, _)| {
+                ad_binding_ok(dht, ad)
+                    && is_currently_valid(ad, veil_util::unix_secs_now_u64()).is_ok()
+            })
             .collect();
         // Repair the ordinary local DHT mirror with this slot's newest
         // publication. The short resolve cache still controls when the next
