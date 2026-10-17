@@ -1307,6 +1307,43 @@ async fn verified_primary_replacement_wins_over_old_ack_progress() {
         .unwrap();
         let old = a.sender(0).handle.quic().unwrap().clone();
         let old_binding = old.channel_binding().unwrap();
+        // A real authenticated candidate can close while its successful
+        // preparation result waits for this session to poll it. It must not
+        // replace a still-working primary or increment successful switches.
+        let stale = a.stage_verified_primary_replacement().await;
+        stale.close();
+        timeout(Duration::from_secs(1), stale.closed())
+            .await
+            .unwrap();
+        let probe = primary_test_frame(true, 35, started.elapsed().as_micros() as u64);
+        let (_, body, kind) = super::super::decode_realtime_lane_frame(&probe).unwrap();
+        let index = a
+            .prepare_frame(REALTIME, body, kind)
+            .expect("a closed prepared candidate must not displace the live primary");
+        assert_eq!(diagnostics.recovery_switches(), 0);
+        {
+            let mut sender = a.sender(index);
+            assert_eq!(
+                sender.handle.quic().unwrap().channel_binding().unwrap(),
+                old_binding
+            );
+            let max_size = sender.max_datagram_size;
+            for packet in sender
+                .tx
+                .encode_frame(u64::from(REALTIME), &probe, max_size)
+                .unwrap()
+            {
+                sender.handle.send(&packet).unwrap();
+            }
+        }
+        assert_eq!(
+            timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            35
+        );
         // An in-flight user can retain an old ingress carrier after its
         // child closes. This must not pin a downstream slot on a live parent.
         let retained_old_carrier = a.ingress_carrier_for_test(0);
