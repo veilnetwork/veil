@@ -301,6 +301,47 @@ static void wait_playout(VeilGroupMediaEngine* e, uint64_t reports, uint64_t del
   if (reports) assert(group_stat(e, "audio_playout_ms") == delay);
 }
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--group-rtcp-accounting") == 0) {
+    uint8_t local[32] = {91}, alice[32] = {92}, bob[32] = {93};
+    std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> e(
+        veil_media_group_engine_create(local), veil_media_group_engine_destroy);
+    assert(e);
+    assert(veil_media_group_engine_add_peer(e.get(), 190, alice) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_add_peer(e.get(), 191, bob) == VEIL_MEDIA_OK);
+    const auto check = [&](uint64_t audio, uint64_t video) {
+      assert(group_stat(e.get(), "audio_rtcp_tx_pkts") == audio);
+      assert(group_stat(e.get(), "audio_rtcp_tx_bytes") == audio * 8);
+      assert(group_stat(e.get(), "video_rtcp_tx_pkts") == video);
+      assert(group_stat(e.get(), "video_rtcp_tx_bytes") == video * 8);
+    };
+    check(0, 0);
+    // Receiver feedback uses a peer shim, sender reports use the fanout.
+    // Count every accepted copy, excluding RTP and failed local admissions.
+    assert(veil_media_test_group_emit_rtcp(e.get()) == 0);
+    assert(veil_media_test_group_fanout_packet(e.get(), 3) == 0);
+    assert(veil_media_test_group_fanout_packet(e.get(), 2) == 0);
+    assert(veil_media_test_group_fanout_packet(e.get(), 0) == 0);
+    assert(veil_media_test_group_fanout_packet(e.get(), 1) == 0);
+    check(3, 2);
+    {
+      std::lock_guard lock(callback_mu);
+      rejected_channels.insert(190);
+    }
+    assert(veil_media_test_group_emit_rtcp(e.get()) == 1);
+    assert(veil_media_test_group_fanout_packet(e.get(), 3) == 0);
+    assert(veil_media_test_group_fanout_packet(e.get(), 2) == 0);
+    check(4, 3);
+    assert(veil_media_group_engine_remove_peer(e.get(), alice) == VEIL_MEDIA_OK);
+    check(4, 3);
+    assert(veil_media_group_engine_add_peer(e.get(), 192, alice) == VEIL_MEDIA_OK);
+    assert(veil_media_test_group_emit_rtcp(e.get()) == 0);
+    assert(veil_media_test_group_fanout_packet(e.get(), 2) == 0);
+    check(5, 5);
+    e.reset();
+    assert(callbacks.empty());
+    std::puts("group RTCP accounting: peer + fanout, rejection, RTP exclusion, peer removal/re-add OK");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--rtcp-loss") == 0) {
     uint8_t local[32] = {1}, peer[32] = {2}, other[32] = {3};
     constexpr uint32_t audio = 0x01000000u;

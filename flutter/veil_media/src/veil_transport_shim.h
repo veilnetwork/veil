@@ -39,6 +39,7 @@
 #include "api/call/transport.h"  // webrtc::Transport, webrtc::PacketOptions
 #include "veil_inbound_packet_queue.h"
 #include "veil_audio_send_stats.h"
+#include "veil_rtcp_send_stats.h"
 #include "veil_audio_redundancy.h"
 #include "veil_audio_recovery_feedback.h"
 #include "veil_video_control_transport.h"
@@ -106,7 +107,8 @@ class VeilTransportShim : public webrtc::Transport {
                     webrtc::Call* call,
                     webrtc::TaskQueueBase* network_queue,
                     webrtc::Call* video_call,
-                    webrtc::TaskQueueBase* video_network_queue);
+                    webrtc::TaskQueueBase* video_network_queue,
+                    std::shared_ptr<RtcpSendStats> group_rtcp_stats = nullptr);
   ~VeilTransportShim() override;
 
   VeilTransportShim(const VeilTransportShim&) = delete;
@@ -349,6 +351,7 @@ class VeilTransportShim : public webrtc::Transport {
   std::atomic<uint64_t> inbound_dropped_overload_{0};
   std::atomic<uint64_t> inbound_packet_count_{0};
   std::atomic<uint64_t> inbound_byte_count_{0};
+  std::shared_ptr<RtcpSendStats> group_rtcp_stats_;
   std::atomic<uint64_t> outbound_packet_count_{0};
   std::atomic<uint64_t> outbound_rtcp_packet_count_{0}, outbound_rtcp_byte_count_{0};
   std::atomic<uint64_t> outbound_video_rtcp_packet_count_{0}, outbound_video_rtcp_byte_count_{0};

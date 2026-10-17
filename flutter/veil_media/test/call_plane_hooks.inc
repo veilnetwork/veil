@@ -375,10 +375,12 @@ extern "C" int veil_media_test_audio_bandwidth() {
 // Veil callback can stall video while a second thread submits audio.
 extern "C" int veil_media_test_group_fanout_packet(VeilGroupMediaEngine* e,
                                                    int secondary) {
-  if (secondary == 2) {
+  if (secondary == 2 || secondary == 3) {
     std::array<uint8_t, 8> rr{0x80, 201, 0, 1};
     webrtc::PacketOptions options;
-    return e->ws->fanout->video_transport()->SendRtcp(rr, options) ? 0 : 1;
+    auto* transport = secondary == 2 ? e->ws->fanout->video_transport()
+                                     : e->ws->fanout.get();
+    return transport->SendRtcp(rr, options) ? 0 : 1;
   }
   std::array<uint8_t, 15> packet{0x80, uint8_t(secondary ? 96 : 111)};
   const uint32_t ssrc = secondary ? group_video_ssrc_of(e->local)
