@@ -1816,8 +1816,7 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
                               ws->video_worker_tq.get(),
                               ws->video_network_tq.get());
 #if defined(VEIL_MEDIA_CC_TRACE)
-  const char* trace_cc = std::getenv("VEIL_MEDIA_TRACE_VIDEO_CC");
-  if (veil_media::diag::enabled() && trace_cc && std::strcmp(trace_cc, "1") == 0)
+  if (veil_media::video_cc_trace_enabled())
     video_cfg.per_call_network_controller_factory =
         std::make_unique<veil_media::VideoCcTraceFactory>(
             std::make_unique<webrtc::GoogCcNetworkControllerFactory>());
@@ -1967,8 +1966,7 @@ VeilGroupMediaEngine* veil_media_group_engine_create(
                               ws->video_worker_tq.get(),
                               ws->video_network_tq.get());
 #if defined(VEIL_MEDIA_CC_TRACE)
-  const char* trace_cc = std::getenv("VEIL_MEDIA_TRACE_VIDEO_CC");
-  if (veil_media::diag::enabled() && trace_cc && std::strcmp(trace_cc, "1") == 0)
+  if (veil_media::video_cc_trace_enabled())
     video_cfg.per_call_network_controller_factory =
         std::make_unique<veil_media::VideoCcTraceFactory>(
             std::make_unique<webrtc::GoogCcNetworkControllerFactory>());
@@ -4064,6 +4062,9 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     // exact signature of the live "2-3 s stable lag, all metrics clean"
     // report. Export it so the creep is attributable.
     int64_t pacer_delay_ms = 0;
+#if defined(VEIL_MEDIA_CC_TRACE)
+    int64_t video_cc_stats_at_us = -1;
+#endif
     int64_t android420_convert_max_ns = 0;
     int64_t android420_broadcast_max_ns = 0;
     uint64_t android420_convert_holds_16ms = 0;
@@ -4157,6 +4158,9 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     // control loop for the ten-second stream-operation timeout.
     const bool video_sampled = veil_media::run_on_with_timeout(
         ws->video_worker_tq.get(), [&] {
+#if defined(VEIL_MEDIA_CC_TRACE)
+          video_cc_stats_at_us = webrtc::TimeMicros();
+#endif
           if (ws->video_call)
             pacer_delay_ms = ws->video_call->GetStats().pacer_delay_ms;
           if (ws->video_send_stream)
@@ -4333,6 +4337,11 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
            sizeof(json), written);
     } else {
       std::string snapshot(json, static_cast<size_t>(written) - 1);
+#if defined(VEIL_MEDIA_CC_TRACE)
+      if (veil_media::video_cc_trace_enabled())
+        snapshot += ",\"video_cc_stats_at_us\":" +
+            std::to_string(video_cc_stats_at_us);
+#endif
       const auto frame_budget = ws->video_frame_budget->snapshot();
       snapshot += ",\"video_frame_budget_bytes\":" + std::to_string(frame_budget.bytes) +
                   ",\"video_frame_pixel_cap\":" + std::to_string(frame_budget.max_pixels) +
