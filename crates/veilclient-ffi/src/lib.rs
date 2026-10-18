@@ -732,9 +732,14 @@ pub mod media_ffi;
 /// `VEIL_RT_TRACE=1` environment gate on CLI deployments. Driven by the
 /// xVeil debug hook during live call-RTT investigations; slow dispatches
 /// surface in the node log as `session.rt_trace.slow_dispatch`. Free when
-/// off; always succeeds.
+/// off; always succeeds. Explicit enabling also installs the existing console
+/// bridge for a client-only process without replacing a host-owned logger.
 #[unsafe(no_mangle)]
 pub extern "C" fn veil_debug_set_rt_trace(on: c_int) {
+    #[cfg(feature = "node-embedded")]
+    if on != 0 {
+        node::initialize_logging();
+    }
     veil_session::rt_trace::set_rt_trace(on != 0);
     #[cfg(feature = "node-embedded")]
     veil_ipc::route_trace::set_enabled(on != 0);
@@ -7669,6 +7674,9 @@ pub mod pairing;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "node-embedded", not(target_os = "android")))]
+mod trace_logging_tests;
 
 pub mod ratchet;
 

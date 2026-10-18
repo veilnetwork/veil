@@ -923,7 +923,8 @@ extern "C" {
  * `VEIL_RT_TRACE=1` environment gate on CLI deployments. Driven by the
  * xVeil debug hook during live call-RTT investigations; slow dispatches
  * surface in the node log as `session.rt_trace.slow_dispatch`. Free when
- * off; always succeeds.
+ * off; always succeeds. Explicit enabling also installs the existing console
+ * bridge for a client-only process without replacing a host-owned logger.
  */
  void veil_debug_set_rt_trace(int on) ;
 
