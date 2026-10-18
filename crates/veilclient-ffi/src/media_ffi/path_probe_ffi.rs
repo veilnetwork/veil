@@ -16,11 +16,12 @@ pub struct VeilMediaProbePath {
     pub peer_endpoint_id: u32,
 }
 
-struct ReplyPath {
-    app: Arc<VeilApp>,
-    peer: [u8; 32],
-    peer_app: [u8; 32],
-    endpoint: u32,
+#[derive(Clone)]
+pub(super) struct ReplyPath {
+    pub(super) app: Arc<VeilApp>,
+    pub(super) peer: [u8; 32],
+    pub(super) peer_app: [u8; 32],
+    pub(super) endpoint: u32,
 }
 
 pub(super) struct PathProbeContext {
@@ -357,6 +358,24 @@ fn contexts() -> Vec<Arc<PathProbeContext>> {
         .take(16)
         .cloned()
         .collect()
+}
+
+/// Reverse preparation may use an alternate route only when the host already
+/// pinned it for this authenticated, non-anonymous call. The incoming envelope
+/// cannot choose a destination or authorize a new route.
+pub(super) fn preparation_reply_path(
+    cipher: &media::MediaCipher,
+    ingress: &Weak<MediaIngress>,
+    route: ProbeRoute,
+) -> Option<ReplyPath> {
+    contexts()
+        .into_iter()
+        .find(|context| {
+            context.live()
+                && Weak::ptr_eq(&context.ingress, ingress)
+                && context.cipher.same_receive_key(cipher)
+        })
+        .map(|context| context.replies[route.index()].clone())
 }
 
 /// Called only after the existing seal opened. Controls never reach the

@@ -115,9 +115,29 @@ impl Context {
     }
 
     async fn send(&self, plane: usize, body: Vec<u8>, deadline: tokio::time::Instant) {
+        self.send_on_reply_path(plane, body, deadline, None).await;
+    }
+
+    async fn send_on_reply_path(
+        &self,
+        plane: usize,
+        body: Vec<u8>,
+        deadline: tokio::time::Instant,
+        reply_route: Option<ProbeRoute>,
+    ) {
         if !self.live() || deadline <= tokio::time::Instant::now() {
             return;
         }
+        let pinned = reply_route.and_then(|route| {
+            super::path_probe_ffi::preparation_reply_path(&self.cipher, &self.ingress, route)
+        });
+        let app = pinned.as_ref().map_or(&self.app, |path| &path.app);
+        let peer = pinned.as_ref().map_or(self.peer, |path| path.peer);
+        let peer_app = pinned.as_ref().map_or(self.peer_app, |path| path.peer_app);
+        let endpoint = pinned.as_ref().map_or(self.endpoint, |path| path.endpoint);
+        let route = reply_route
+            .filter(|_| pinned.is_some())
+            .unwrap_or(self.route);
         let (local_plane, lane) = match plane {
             0 => (
                 media::LocalMediaPlane::Primary,
@@ -138,7 +158,7 @@ impl Context {
         };
         let deadline = deadline.min(tokio::time::Instant::now() + MEDIA_LOCAL_QUEUE_AGE);
         let sealed = sealed.with_local_deadline(deadline);
-        let Some(guard) = sealed.lock_while_fresh(&self.app.sender).await else {
+        let Some(guard) = sealed.lock_while_fresh(&app.sender).await else {
             return;
         };
         if !self.live() {
@@ -147,13 +167,13 @@ impl Context {
         let Some(sender) = guard.as_ref() else {
             return;
         };
-        if self.route == ProbeRoute::Relay {
+        if route == ProbeRoute::Relay {
             let _ = sender
                 .send_relay_media_sealed_on_local_lane_before_tracked_owned(
                     lane,
-                    self.peer,
-                    self.peer_app,
-                    self.endpoint,
+                    peer,
+                    peer_app,
+                    endpoint,
                     sealed.into_vec(),
                     deadline,
                     None,
@@ -163,10 +183,15 @@ impl Context {
             let _ = sender
                 .send_rt_data_on_local_lane_before(
                     lane,
-                    self.peer,
-                    self.peer_app,
-                    self.endpoint,
-                    self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    peer,
+                    peer_app,
+                    endpoint,
+                    (if pinned.is_some() {
+                        &app.rt_seq
+                    } else {
+                        self.seq.as_ref()
+                    })
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     0,
                     0,
                     0,
@@ -243,16 +268,19 @@ impl Context {
             }
             last[plane] = Some(now);
         }
-        // The response uses this authenticated call's pinned destination and
-        // outgoing posture, never an address/route supplied by a packet.
+        // Warm the reverse candidate too when the host has already authorized
+        // and pinned that route. Echoing a relay preparation on the current
+        // direct sender leaves reverse relay setup to the short qualification
+        // window. Without a pinned alternate, retain the current posture.
         let context = Arc::clone(self);
         self.app.bundle.runtime.spawn(async move {
             let _permit = permit;
             context
-                .send(
+                .send_on_reply_path(
                     plane,
                     encode(plane, reply.encode()),
                     tokio::time::Instant::now() + MEDIA_LOCAL_QUEUE_AGE,
+                    Some(control.route),
                 )
                 .await;
         });
