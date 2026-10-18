@@ -5319,10 +5319,12 @@ impl SessionRunner {
                         crate::local_lossy_trace::datagram_accepted(
                             outgoing_priority,
                             outgoing,
-                            sender_state
-                                .handle
-                                .quic()
-                                .map_or(0, |handle| handle.local_trace_id()),
+                            || {
+                                sender_state
+                                    .handle
+                                    .quic()
+                                    .map_or(0, |handle| handle.local_trace_id())
+                            },
                         );
                         if let Some(logged) = sender_state
                             .logged_send_kinds
