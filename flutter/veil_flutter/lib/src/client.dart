@@ -31,6 +31,16 @@ import 'secure_wipe.dart';
 import 'stream.dart';
 import 'types.dart';
 
+/// Endpoint-local source selection; never encoded as a relay traffic role.
+enum MediaPacketSource {
+  audio(0),
+  video(2),
+  screen(3);
+
+  const MediaPacketSource(this.localLane);
+  final int localLane;
+}
+
 String _readErrAndFree(Pointer<Pointer<Utf8>> errOut) {
   final errPtr = errOut.value;
   if (errPtr == nullptr) return '<no detail>';
@@ -3122,12 +3132,19 @@ class AppHandle implements Finalizable {
 
   /// Local per-path framing and aggregate replication model. No network query
   /// is sent; null denotes unavailable/unprepared native source metadata.
-  Map<String, Object?>? mediaPacketCost(int chan, {required int packetBytes}) {
+  Map<String, Object?>? mediaPacketCost(int chan,
+      {required int packetBytes,
+      MediaPacketSource source = MediaPacketSource.audio}) {
     _ensureOpen();
     if (packetBytes < 12 || packetBytes > 1000) return null;
-    final query = ffi.veilMediaChannelPacketCost;
-    if (query == null) return null;
-    final value = query(chan, packetBytes);
+    final querySource = ffi.veilMediaChannelSourcePacketCost;
+    final queryAudio = ffi.veilMediaChannelPacketCost;
+    // An old SDK's audio snapshot cannot describe another prepared child.
+    if (querySource == null &&
+        (source != MediaPacketSource.audio || queryAudio == null)) return null;
+    final value = querySource != null
+        ? querySource(chan, source.localLane, packetBytes)
+        : queryAudio!(chan, packetBytes);
     if (value == nullptr) return null;
     try {
       final decoded = jsonDecode(value.toDartString());

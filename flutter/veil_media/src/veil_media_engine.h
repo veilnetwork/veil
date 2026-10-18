@@ -228,6 +228,13 @@ int veil_media_engine_set_independent_transport_feedback(VeilMediaEngine *engine
  * wire delivery or give relays any scheduling information. */
 int veil_media_engine_set_audio_packet_overhead(VeilMediaEngine *engine, int bytes);
 
+/* Per-path framing below video RTP, independently of the audio allocator.
+ * 0..1024 bytes; requires independent feedback. May be set before or during
+ * video. Corrects the existing allocator/pacer without replacing streams or
+ * inventing a route change. A blocked video worker returns ERR_STATE promptly;
+ * the prior hint remains valid and the caller can retry. No wire role hint. */
+int veil_media_engine_set_video_packet_overhead(VeilMediaEngine *engine, int bytes);
+
 /* Set a route-specific RTP packet ceiling before starting video send. Zero
  * restores libwebrtc's default; nonzero values are clamped to 576..1460.
  * Compact relay mode uses 1000 so one sealed Delivery frame fits one QUIC

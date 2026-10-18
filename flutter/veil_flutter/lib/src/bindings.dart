@@ -2309,6 +2309,19 @@ Pointer<Utf8> Function(int, int)? _lookupMediaPacketCost() {
 
 final veilMediaChannelPacketCost = _lookupMediaPacketCost();
 
+Pointer<Utf8> Function(int, int, int)? _lookupMediaSourcePacketCost() {
+  try {
+    return nativeLib.lookupFunction<
+        Pointer<Utf8> Function(Uint64, Uint8, IntPtr),
+        Pointer<Utf8> Function(
+            int, int, int)>('veil_media_channel_source_packet_cost');
+  } on ArgumentError {
+    return null;
+  }
+}
+
+final veilMediaChannelSourcePacketCost = _lookupMediaSourcePacketCost();
+
 // media_channel_get_stats(chan, out) -> 0 ok / -1 invalid. Direct/onion
 // channels return a zeroed relay snapshot.
 final int Function(int, Pointer<VeilMediaChannelStatsStruct>)

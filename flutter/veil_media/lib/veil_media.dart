@@ -177,7 +177,8 @@ class VeilMediaEngine {
     return release != null && release(_ptr, channel) == 0;
   }
 
-  bool get supportsAudioMirror => ffi.veilMediaEngineSetAudioMirrorChannel != null;
+  bool get supportsAudioMirror =>
+      ffi.veilMediaEngineSetAudioMirrorChannel != null;
 
   /// Borrow a qualified same-call alternate. Zero disables. Caller clears it
   /// before close; native handover/stop also clear it. Default off, audio only.
@@ -241,6 +242,16 @@ class VeilMediaEngine {
     _ensure();
     if (bytes < 0 || bytes > 4096) throw ArgumentError.value(bytes, 'bytes');
     final set = ffi.veilMediaEngineSetAudioPacketOverhead;
+    return set != null && set(_ptr, bytes) == 0;
+  }
+
+  /// Per-path framing below video RTP. Updates only the video allocator/pacer,
+  /// before or during video, without restarting streams or the audio controller.
+  /// Returns false on old native engines or when its worker is busy; retry later.
+  bool setVideoPacketOverhead(int bytes) {
+    _ensure();
+    if (bytes < 0 || bytes > 1024) throw ArgumentError.value(bytes, 'bytes');
+    final set = ffi.veilMediaEngineSetVideoPacketOverhead;
     return set != null && set(_ptr, bytes) == 0;
   }
 

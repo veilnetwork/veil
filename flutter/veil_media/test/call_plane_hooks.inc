@@ -645,17 +645,10 @@ extern "C" VeilMediaEngine* veil_media_test_adaptive_codec_create(
 extern "C" VeilMediaEngine* veil_media_test_dual_overhead_codec_create(
     uint64_t chan, const uint8_t local[32], const uint8_t peer[32],
     int audio_overhead, int video_overhead) {
-  if (video_overhead < 1 || video_overhead > 4096) return nullptr;
+  if (video_overhead < 1 || video_overhead > 1024) return nullptr;
   auto* e = veil_media_test_adaptive_codec_create(chan, local, peer, audio_overhead);
   if (!e) return nullptr;
-  if (!run_on(e->ws->video_worker_tq.get(), [&] {
-        auto* controller = e->ws->video_call->GetTransportControllerSend();
-        webrtc::NetworkRoute route;
-        route.connected = true;
-        route.packet_overhead = video_overhead;
-        controller->OnNetworkRouteChanged("opaque", route);
-        controller->IncludeOverheadInPacedSender();
-      })) {
+  if (veil_media_engine_set_video_packet_overhead(e, video_overhead) != VEIL_MEDIA_OK) {
     veil_media_engine_destroy(e);
     return nullptr;
   }
