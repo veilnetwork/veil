@@ -46,9 +46,15 @@ compile_tu() {  # $1=src  $2=out.o
   python3 - "$CC_JSON" "$1" "$2" "$SRCDIR" "$WEBRTC_SRC" <<'PY' > "$TMP/tu.sh"
 import json,sys,re,os
 cc=json.load(open(sys.argv[1])); src,out,shimdir=sys.argv[2],sys.argv[3],sys.argv[4]
-e=next(x for x in cc if x.get('file','').endswith('call/call.cc'))
+suffix='modules/pacing/pacing_controller.cc' if src.endswith('/webrtc_pacing/pacing_controller.cc') else 'call/call.cc'
+e=next((x for x in cc if x.get('file','').endswith(suffix)), None)
+if e is None:
+    # Reduced SDK bundles retain only the common call compile metadata.
+    # Private ABI headers have already been verified before compiling.
+    suffix='call/call.cc'
+    e=next(x for x in cc if x.get('file','').endswith(suffix))
 cmd=e['command'] if e.get('command') else ' '.join(e['arguments'])
-s=re.search(r'(\S*call/call\.cc)',cmd).group(1)
+s=re.search(r'(\S*'+re.escape(suffix)+')',cmd).group(1)
 cmd=cmd.replace(s,src); cmd=re.sub(r'-o\s+\S+','-o '+out,cmd)
 # Keep veil's dependency files beside its temporary objects, leaving the
 # WebRTC cache's original call.cc dependency graph intact.
@@ -69,6 +75,8 @@ PY
 }
 
 echo "==> compiling engine + shim + avf_adm + avf_camera with the WebRTC toolchain"
+python3 "$SRCDIR/webrtc_pacing/verify_headers.py" "$WEBRTC_SRC"
+compile_tu "$SRCDIR/webrtc_pacing/pacing_controller.cc" "$TMP/pacing.o"
 compile_tu "$SRCDIR/webrtc_ana/controller_manager.cc" "$TMP/ana.o"
 compile_tu "$SRCDIR/veil_media_engine.cc" "$TMP/engine.o"
 compile_tu "$SRCDIR/veil_transport_shim.cc" "$TMP/shim.o"
@@ -120,7 +128,7 @@ link_dylib() {
   local out="$1"; shift
   # shellcheck disable=SC2086
   "$CLANGXX" -dynamiclib -o "$out" \
-    "$TMP/ana.o" "$TMP/engine.o" "$TMP/shim.o" "$TMP/avf_adm.o" "$TMP/avf_camera.o" "$TMP/avf_screen.o" "$TMP/record.o" "$TMP/play.o" "$TMP/vnote.o" obj/libwebrtc.a $CXX_OBJS \
+    "$TMP/pacing.o" "$TMP/ana.o" "$TMP/engine.o" "$TMP/shim.o" "$TMP/avf_adm.o" "$TMP/avf_camera.o" "$TMP/avf_screen.o" "$TMP/record.o" "$TMP/play.o" "$TMP/vnote.o" obj/libwebrtc.a $CXX_OBJS \
     $DEADSTRIP -Wl,-undefined,dynamic_lookup \
     "$@" \
     -install_name @rpath/libveil_media.dylib \

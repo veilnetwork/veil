@@ -76,12 +76,19 @@ $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("veil_media_" + [guid]::NewG
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
 try {
+  $pacingManifest = Get-Content -Raw (Join-Path $srcDir 'webrtc_pacing/abi.json') | ConvertFrom-Json
+  foreach ($header in $pacingManifest.headers.PSObject.Properties) {
+    $headerPath = Join-Path $WebrtcSrc $header.Name
+    if (-not (Test-Path -LiteralPath $headerPath) -or
+        (Get-FileHash -LiteralPath $headerPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $header.Value) {
+      throw "Unsupported WebRTC pacing ABI: $($header.Name). Use the pinned SDK or update and qualify the pacing override."
+    }
+  }
   # call.cc's command is the template every veil TU is compiled with.
   $entries = Get-Content -Raw $ccJson | ConvertFrom-Json
   $template = $entries | Where-Object { $_.file -replace '\\', '/' -like '*call/call.cc' } | Select-Object -First 1
   if (-not $template) { throw 'call/call.cc is not in compile_commands.json' }
   $templateCmd = if ($template.command) { $template.command } else { $template.arguments -join ' ' }
-  $templateFile = $template.file
 
   # Report the form the toolchain currently writes the output flag in. This is
   # the one thing about the template that has silently changed under us, and
@@ -125,11 +132,18 @@ try {
   function Compile-Tu {
     param([string]$Source, [string]$Object)
     $objFwd = $Object -replace '\\', '/'
-    $cmd = $templateCmd
+    $tuTemplate = $template
+    if (($Source -replace '\\', '/') -like '*webrtc_pacing/pacing_controller.cc') {
+      $tuTemplate = $entries | Where-Object { ($_.file -replace '\\', '/') -like '*modules/pacing/pacing_controller.cc' } | Select-Object -First 1
+      # Reduced SDK bundles export only the common call compile metadata.
+      if (-not $tuTemplate) { $tuTemplate = $template }
+    }
+    $tuCmd = if ($tuTemplate.command) { $tuTemplate.command } else { $tuTemplate.arguments -join ' ' }
+    $cmd = $tuCmd
     # Swap the source. Both the bare path and any /Fo output are rewritten;
     # everything else - defines, includes, sysroot, warning flags - is kept
     # exactly as WebRTC compiled its own translation unit.
-    $cmd = $cmd -replace [regex]::Escape($templateFile), ($Source -replace '\\', '/')
+    $cmd = $cmd -replace [regex]::Escape($tuTemplate.file), ($Source -replace '\\', '/')
 
     # Strip EVERY form of the output flag and append ours, rather than matching
     # the form that happens to be current. Run 30493115568 compiled all eight
@@ -144,7 +158,7 @@ try {
     # VEIL_MEDIA_HAVE_WEBRTC switches the engine from the ABI-only stub to the
     # real implementation; -I<src> finds veil_camera.h and friends.
     $cmd = $cmd -replace '^(\S+)', ('$1 -DVEIL_MEDIA_HAVE_WEBRTC=1 -I"' + $srcDirFwd + '"')
-    if ($templateCmd -match 'WEBRTC_ENABLE_PROTOBUF=1') {
+    if ($tuCmd -match 'WEBRTC_ENABLE_PROTOBUF=1') {
       $protobufDir = (Join-Path $WebrtcSrc 'third_party/protobuf/src') -replace '\\', '/'
       $cmd += ' -I"' + $protobufDir + '"'
     }
@@ -160,14 +174,14 @@ try {
     # file, which is what ninja itself falls back to for long commands.
     $parts = $cmd -split '\s+', 2
     $exe = $parts[0]
-    $exePath = if ([System.IO.Path]::IsPathRooted($exe)) { $exe } else { Join-Path $template.directory $exe }
+    $exePath = if ([System.IO.Path]::IsPathRooted($exe)) { $exe } else { Join-Path $tuTemplate.directory $exe }
     $rsp = Join-Path $tmp ([System.IO.Path]::GetFileNameWithoutExtension($Source) + '.rsp')
     # No BOM: clang reads a response file as bytes and a BOM becomes an
     # unrecognised argument.
     [System.IO.File]::WriteAllText($rsp, $parts[1], (New-Object System.Text.UTF8Encoding $false))
 
     Write-Host "==> compiling $(Split-Path -Leaf $Source)"
-    Push-Location $template.directory
+    Push-Location $tuTemplate.directory
     try {
       & $exePath "@$rsp"
       if ($LASTEXITCODE -ne 0) { throw "compile failed: $Source" }
@@ -192,6 +206,7 @@ try {
   # uses. Leaving them out builds a DLL that links and loads and has no voice
   # messages in it.
   $tus = @(
+    'webrtc_pacing/pacing_controller.cc',
     'webrtc_ana/controller_manager.cc',
     'veil_media_engine.cc',
     'veil_transport_shim.cc',
