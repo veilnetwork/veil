@@ -866,7 +866,13 @@ impl ParallelSession {
                 .enumerate()
             {
                 if self.assignments.source_physical(source) == Some(index) {
-                    lease.mark(*priority, slot.ready.is_some());
+                    let framing = slot
+                        .ready
+                        .as_ref()
+                        .filter(|ready| !ready.unavailable())
+                        .and_then(|ready| lock!(ready.sender).handle.max_size())
+                        .map(|ceiling| crate::LocalPacketFraming::QuicDatagram { ceiling });
+                    lease.mark_framing(*priority, framing);
                 }
             }
         }

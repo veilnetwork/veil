@@ -19,7 +19,7 @@ use crate::realtime_datagram::{
 };
 
 const MAGIC: [u8; 4] = *b"VDF1";
-const PREFIX_LEN: usize = 20;
+pub(crate) const PREFIX_LEN: usize = 20;
 const MAX_FLOWS: usize = 16;
 // Endpoint-only lanes. Circuit handles occupy a disjoint namespace, so every
 // transit circuit gets the same bounded LRU treatment, without a media role.
@@ -33,6 +33,24 @@ pub(crate) const MAX_FRAME_WIRE_BYTES: usize = MAX_REALTIME_FRAME
         * (PREFIX_LEN + crate::realtime_datagram::FRAGMENT_OVERHEAD);
 
 type FlowId = [u8; 16];
+
+pub(crate) fn flow_fragment_count(
+    frame_len: usize,
+    ceiling: usize,
+) -> Result<usize, RealtimeDatagramError> {
+    if frame_len == 0 || frame_len > MAX_REALTIME_FRAME {
+        return Err(RealtimeDatagramError::FrameSize(frame_len));
+    }
+    let payload = ceiling
+        .checked_sub(PREFIX_LEN + crate::realtime_datagram::FRAGMENT_OVERHEAD)
+        .filter(|size| *size > 0)
+        .ok_or(RealtimeDatagramError::DatagramTooSmall(ceiling))?;
+    let count = frame_len.div_ceil(payload);
+    if count > crate::realtime_datagram::MAX_FRAGMENTS {
+        return Err(RealtimeDatagramError::TooManyFragments(count));
+    }
+    Ok(count)
+}
 
 fn flow_key(raw: &[u8; 32], session: &[u8; 32], id: &FlowId) -> Zeroizing<[u8; 32]> {
     let mut material = Zeroizing::new([0u8; 80]);
@@ -77,12 +95,7 @@ impl FlowDatagramTx {
             .checked_sub(PREFIX_LEN)
             .filter(|size| *size >= 41)
             .ok_or(RealtimeDatagramError::DatagramTooSmall(ceiling))?;
-        let fragment_count = frame
-            .len()
-            .div_ceil(inner_ceiling - crate::realtime_datagram::FRAGMENT_OVERHEAD);
-        if fragment_count > crate::realtime_datagram::MAX_FRAGMENTS {
-            return Err(RealtimeDatagramError::TooManyFragments(fragment_count));
-        }
+        flow_fragment_count(frame.len(), ceiling)?;
         if !self.flows.contains_key(&local_flow) {
             let absent_lanes = LOCAL_LANES
                 .iter()

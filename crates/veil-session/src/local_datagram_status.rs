@@ -27,6 +27,7 @@ struct State {
     supported: u8,
     ready: u8,
     requested: u8,
+    framing: [Option<crate::LocalPacketFraming>; LOCAL_DATAGRAM_PRIORITIES.len()],
 }
 
 fn bit(local_lane: u8) -> Option<u8> {
@@ -37,6 +38,15 @@ fn bit(local_lane: u8) -> Option<u8> {
 }
 
 impl LocalDatagramStatus {
+    pub(crate) fn framing(&self, local_lane: u8) -> Option<crate::LocalPacketFraming> {
+        let index = LOCAL_DATAGRAM_PRIORITIES
+            .iter()
+            .position(|&lane| lane == local_lane)?;
+        let state = lock!(self.state);
+        (state.owner.strong_count() != 0 && state.ready & (1 << index) != 0)
+            .then_some(state.framing[index])
+            .flatten()
+    }
     pub(crate) fn has_datagram_transport(&self) -> bool {
         lock!(self.state).transport_owner.strong_count() != 0
     }
@@ -93,6 +103,7 @@ impl LocalDatagramStatus {
             return LocalDatagramChannelState::Unsupported;
         }
         state.ready &= !bit;
+        state.framing[bit.trailing_zeros() as usize] = None;
         state.requested |= bit;
         drop(state);
         self.notify.notify_one();
@@ -126,6 +137,7 @@ impl LocalDatagramStatus {
             state.supported &= !bit(crate::LOCAL_SIGNALING_LANE).expect("source selector");
         }
         state.ready = 0;
+        state.framing.fill(None);
         state.requested = 0;
         LocalDatagramLease {
             status: Arc::clone(self),
@@ -146,17 +158,25 @@ pub(crate) struct LocalDatagramLease {
 }
 
 impl LocalDatagramLease {
+    pub(crate) fn mark_framing(&self, local_lane: u8, framing: Option<crate::LocalPacketFraming>) {
+        self.mark_state(local_lane, framing.is_some(), framing);
+    }
     pub(crate) fn mark(&self, local_lane: u8, ready: bool) {
+        self.mark_state(local_lane, ready, None);
+    }
+    fn mark_state(&self, local_lane: u8, ready: bool, framing: Option<crate::LocalPacketFraming>) {
         let Some(bit) = bit(local_lane) else {
             return;
         };
         let mut state = lock!(self.status.state);
         if Weak::ptr_eq(&state.owner, &Arc::downgrade(&self.owner)) && state.supported & bit != 0 {
+            state.framing[bit.trailing_zeros() as usize] = framing;
             if ready {
                 state.ready |= bit;
                 state.requested &= !bit;
             } else {
                 state.ready &= !bit;
+                state.framing[bit.trailing_zeros() as usize] = None;
             }
         }
     }
@@ -171,6 +191,7 @@ impl Drop for LocalDatagramLease {
         if Weak::ptr_eq(&state.owner, &Arc::downgrade(&self.owner)) {
             state.owner = Weak::new();
             state.ready = 0;
+            state.framing.fill(None);
             state.requested = 0;
         }
     }
@@ -180,6 +201,33 @@ impl Drop for LocalDatagramLease {
 mod tests {
     use super::*;
     use LocalDatagramChannelState::*;
+
+    #[test]
+    fn framing_follows_live_child_owner_and_expires_on_refresh() {
+        use crate::LocalPacketFraming::{Obfs4Record, QuicDatagram};
+        let status = Arc::new(LocalDatagramStatus::default());
+        let old = status.activate();
+        old.mark_framing(0, Some(QuicDatagram { ceiling: 1382 }));
+        assert_eq!(status.framing(0), Some(QuicDatagram { ceiling: 1382 }));
+        assert_eq!(status.framing(2), None);
+        assert_eq!(status.request_fresh(0), Warming);
+        assert_eq!(status.framing(0), None);
+        old.mark_framing(0, Some(QuicDatagram { ceiling: 1200 }));
+        assert_eq!(status.framing(0), Some(QuicDatagram { ceiling: 1200 }));
+        let new = status.activate_without_signaling();
+        new.mark_framing(0, Some(Obfs4Record));
+        old.mark_framing(0, None);
+        drop(old);
+        assert_eq!(status.framing(0), Some(Obfs4Record));
+        new.mark_framing(crate::LOCAL_SIGNALING_LANE, Some(Obfs4Record));
+        assert_eq!(status.framing(crate::LOCAL_SIGNALING_LANE), None);
+        new.mark_framing(0, None);
+        assert_eq!(status.state(0), Warming);
+        assert_eq!(status.framing(0), None);
+        new.mark_framing(0, Some(Obfs4Record));
+        drop(new);
+        assert_eq!(status.framing(0), None);
+    }
 
     #[test]
     fn a_new_preparation_requires_a_runner_check_before_reusing_ready() {

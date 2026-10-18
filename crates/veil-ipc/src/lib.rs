@@ -34,6 +34,7 @@ mod remote_stream_writer;
 pub mod route_trace;
 mod send_gates;
 pub mod server;
+pub mod source_paths;
 pub mod streams;
 pub mod transport;
 

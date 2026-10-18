@@ -3120,6 +3120,23 @@ class AppHandle implements Finalizable {
     }
   }
 
+  /// Local per-path framing and aggregate replication model. No network query
+  /// is sent; null denotes unavailable/unprepared native source metadata.
+  Map<String, Object?>? mediaPacketCost(int chan, {required int packetBytes}) {
+    _ensureOpen();
+    if (packetBytes < 12 || packetBytes > 1000) return null;
+    final query = ffi.veilMediaChannelPacketCost;
+    if (query == null) return null;
+    final value = query(chan, packetBytes);
+    if (value == nullptr) return null;
+    try {
+      final decoded = jsonDecode(value.toDartString());
+      return decoded is Map<String, dynamic> ? decoded : null;
+    } finally {
+      ffi.veilFreeString(value);
+    }
+  }
+
   /// Install the native direct-media receive pump on this endpoint. Incoming
   /// RTP/RTCP is source-app verified and dispatched native-to-native, avoiding
   /// a copy and scheduling hop through the Dart UI isolate for every packet.

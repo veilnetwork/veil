@@ -4129,6 +4129,13 @@ pub unsafe extern "C" fn veil_get_node_id(
     });
     match res {
         Ok(id) => {
+            #[cfg(feature = "node-embedded")]
+            {
+                *bundle
+                    .cached_node_id
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(id.node_id);
+            }
             unsafe {
                 ptr::copy_nonoverlapping(id.node_id.as_ptr(), out_node_id_32, 32);
             }

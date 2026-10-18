@@ -928,11 +928,15 @@ extern "C" {
  */
  void veil_debug_set_rt_trace(int on) ;
 
- /* Console-log barrier/counters for diagnostic consumers. The flush waits at
-  * most 5000 ms; 0 means flushed, 1 means timeout or output error. Also require
-  * both cumulative counters to be zero before qualifying a complete trace. */
+/**
+ * Diagnostic/shutdown barrier for prior accepted console records. Never call
+ * from a realtime callback. 0 = flushed, 1 = deadline/I/O failure. Rejection
+ * and I/O counters below must also be checked before qualifying a capture.
+ */
  int veil_debug_flush_console_logs(uint64_t timeout_ms) ;
+
  uint64_t veil_debug_console_log_dropped(void) ;
+
  uint64_t veil_debug_console_log_write_errors(void) ;
 
 /**
@@ -3850,6 +3854,18 @@ int veil_media_channel_configure_path_probes(uint64_t chan,
  * replace a sender. The caller owns the binding until channel close.
  */
  int veil_media_channel_set_feedback_sender(uint64_t chan, VeilApp *app, char **err_out) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Snapshot per-path framing and aggregate replication cost for one RTP packet.
+ * Unbatched cost bounds compact batching in expectation, without claiming
+ * measured savings or a bound on an individual random padding sample.
+ * Obfs4 padding is an expectation; QUIC/TCP/IP are excluded. No packets/RPCs
+ * are sent. Null means closed/onion/unprepared/unknown embedded node state.
+ * Free a non-null string with veil_free_string. This is not delivery proof.
+ */
+ char *veil_media_channel_packet_cost(uint64_t chan, size_t packet_bytes) ;
 #endif
 
 /**

@@ -551,7 +551,7 @@ fn without_other_devices(
         .collect()
 }
 
-pub(super) fn ordinary_relay_hops(
+pub(crate) fn ordinary_relay_hops(
     discovered: Option<[u8; 32]>,
     dst: &[u8; 32],
     route_cache: Option<&RwLock<veil_routing::RouteCache>>,
@@ -1624,8 +1624,7 @@ pub(crate) async fn handle_ipc_send(
             // within each transport group and all existing fallback hops.
             // This does not change relay policy or independent-flow consent.
             if relay_media_sealed {
-                forced_relay_hops
-                    .sort_by_key(|hop| !reg.has_neutral_forward_datagram_transport(hop));
+                crate::source_paths::prefer_datagrams(&mut forced_relay_hops, reg);
             }
             if !forced_relay_hops.is_empty() {
                 use veil_proto::delivery::DeliveryEnvelope;

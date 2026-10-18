@@ -937,6 +937,7 @@ async fn anonymous_repair_fans_out_with_independent_backpressure() {
         .insert(
             id,
             MediaChannel {
+                cost_context: None,
                 path_probe: None,
                 source_preflight: None,
                 ingress: MediaIngress::new(tx_hi, MediaVideoIngress::Packets(tx_video)),
@@ -1011,6 +1012,7 @@ async fn closing_channel_cancels_both_blocked_pumps() {
         .insert(
             id,
             MediaChannel {
+                cost_context: None,
                 path_probe: None,
                 source_preflight: None,
                 ingress: MediaIngress::new(tx_hi, MediaVideoIngress::Packets(tx_video)),
@@ -1074,6 +1076,7 @@ async fn private_address_control_requires_call_aead_and_never_reaches_the_engine
     MEDIA_CHANNELS.write().unwrap().insert(
         id,
         MediaChannel {
+            cost_context: None,
             path_probe: None,
             source_preflight: None,
             ingress: MediaIngress::new(tx_hi, MediaVideoIngress::Packets(tx_video)),
@@ -1371,6 +1374,7 @@ fn register_test_ingress(
     MEDIA_CHANNELS.write().unwrap().insert(
         id,
         MediaChannel {
+            cost_context: None,
             path_probe: None,
             source_preflight: None,
             ingress,
