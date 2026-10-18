@@ -168,16 +168,30 @@ pub(crate) fn cell(stage: &'static str, priority: u8, frame: &[u8]) {
 /// A complete owned primary frame was accepted by the local DATAGRAM handle.
 /// This remains a queue observation, not a NIC-send or peer-delivery promise.
 /// Ordinary sparse RT tracing does not enable this additional observation.
-pub(crate) fn datagram_accepted(priority: u8, frame: &[u8], connection_trace_id: u64) {
-    if accepted_cell(enabled(), priority, frame).is_some() {
+pub(crate) fn datagram_accepted(
+    priority: u8,
+    frame: &[u8],
+    connection_trace_id: impl FnOnce() -> u64,
+) {
+    if let Some(connection_trace_id) =
+        accepted_connection(enabled(), priority, frame, connection_trace_id)
+    {
         record_cell("datagram_accepted", priority, frame, connection_trace_id);
     }
 }
 
-fn accepted_cell(detailed: bool, priority: u8, frame: &[u8]) -> Option<(u64, u64)> {
-    detailed
-        .then(|| owned_primary_cell(priority, frame))
-        .flatten()
+fn accepted_connection(
+    detailed: bool,
+    priority: u8,
+    frame: &[u8],
+    connection_trace_id: impl FnOnce() -> u64,
+) -> Option<u64> {
+    if !detailed || owned_primary_cell(priority, frame).is_none() {
+        return None;
+    }
+    // Looking up an ordinal locks the transport connection. Keep that work
+    // behind both opt-in and ownership checks, including at the caller.
+    Some(connection_trace_id())
 }
 
 fn record_cell(stage: &'static str, priority: u8, frame: &[u8], connection_trace_id: u64) {
@@ -442,12 +456,14 @@ mod tests {
     fn transport_acceptance_requires_explicit_trace_and_local_primary_ownership() {
         let frame = forward(SEQUENCE_LIMIT + 50);
         assert_eq!(
-            accepted_cell(false, veil_proto::priority::REALTIME, &frame),
+            accepted_connection(false, veil_proto::priority::REALTIME, &frame, || {
+                panic!("disabled diagnostics must not lock QUIC")
+            }),
             None
         );
         assert_eq!(
-            accepted_cell(true, veil_proto::priority::REALTIME, &frame),
-            Some((7, SEQUENCE_LIMIT + 50))
+            accepted_connection(true, veil_proto::priority::REALTIME, &frame, || 17),
+            Some(17)
         );
         for priority in [
             veil_proto::priority::INTERACTIVE,
@@ -455,10 +471,17 @@ mod tests {
             veil_proto::priority::BACKGROUND,
             veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
         ] {
-            assert_eq!(accepted_cell(true, priority, &frame), None);
+            assert_eq!(
+                accepted_connection(true, priority, &frame, || {
+                    panic!("transit and secondary diagnostics must not lock QUIC")
+                }),
+                None
+            );
         }
         assert_eq!(
-            accepted_cell(true, veil_proto::priority::REALTIME, &frame[..35]),
+            accepted_connection(true, veil_proto::priority::REALTIME, &frame[..35], || {
+                panic!("invalid frames must not lock QUIC")
+            }),
             None
         );
     }
