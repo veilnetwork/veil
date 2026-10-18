@@ -109,9 +109,11 @@ pub enum NextInput {
     /// A trusted local producer requested source-channel preparation.
     LocalDatagramWarm,
     /// a replacement `BoxIoStream` arrived on `swap_rx`. The
-    /// main loop swaps `self.stream` and loops back, keeping all AEAD
-    /// state intact.
+    /// main loop swaps `self.stream` and loops back, keeping ordered AEAD
+    /// state and usable independently owned children intact.
     SwapStream(BoxIoStream),
+    /// The retained independent transport factory closed after a byte-only swap.
+    IndependentTransportClosed,
     /// The stream read side returned EOF or an I/O error while waiting for
     /// the first byte of the next frame.
     ReadClosed(String),
@@ -146,9 +148,16 @@ async fn await_next_input(
     local_datagram_status: Option<&crate::local_datagram_status::LocalDatagramStatus>,
     wire_capacity_needed: Option<usize>,
     reliable: Option<&reliable_session::ReliableSession>,
+    retained_children: Option<&ParallelChannels>,
 ) -> NextInput {
     use std::future::pending;
     tokio::select! {
+        _ = async {
+            match retained_children {
+                Some(children) => children.transport_closed().await,
+                None => pending().await,
+            }
+        } => NextInput::IndependentTransportClosed,
         event = async {
             match reliable { Some(pool) => pool.next().await, None => pending().await }
         } => NextInput::Reliable(event),
@@ -239,6 +248,12 @@ enum ParallelChannels {
     Ordered(Box<ordered_lanes::OrderedSession>),
 }
 impl ParallelChannels {
+    async fn transport_closed(&self) {
+        match self {
+            Self::Quic(session) => session.transport_closed().await,
+            Self::Ordered(session) => session.transport_closed().await,
+        }
+    }
     fn note_reliable_frame(&self, canonical_full: bool) -> bool {
         match self {
             Self::Quic(s) => s.note_reliable_frame(canonical_full),
@@ -617,9 +632,10 @@ mod local_reliable_admission;
 #[path = "local_source_stream_budget.rs"]
 mod local_source_stream_budget;
 
-/// Tokio join handles detach when dropped; realtime receivers must instead be
-/// cancelled with their owning session so they cannot retain a QUIC connection
-/// or key material after stream close/hot-swap.
+/// Tokio join handles detach when dropped; receivers must instead be cancelled
+/// with their owning carrier. Canonical receivers retire on a stream swap;
+/// independently owned children survive it only within their parent authority
+/// and the original session's configured transport lifetime.
 struct RealtimeReceiverTask(tokio::task::JoinHandle<()>);
 
 /// A session cancellation must also cancel its writer. A bare JoinHandle
@@ -4327,6 +4343,7 @@ impl SessionRunner {
             .and_then(|lane| lane.parallel.as_ref())
             .and_then(ParallelChannels::reliable)
             .is_some();
+        let mut retained_children_after_swap = false;
         let mut reliable_streams = reliable_streams::ReliableStreams::new(
             reliable_enabled,
             self.dispatcher.clone(),
@@ -5120,7 +5137,11 @@ impl SessionRunner {
                                     attempted_at,
                                 );
                                 crate::local_lossy_trace::work_admission(
-                                    work, outgoing_priority, outgoing, &admitted, attempted_at,
+                                    work,
+                                    outgoing_priority,
+                                    outgoing,
+                                    &admitted,
+                                    attempted_at,
                                 );
                                 if admitted != veil_types::local_lossy_work::WorkAdmission::Admitted
                                 {
@@ -6072,6 +6093,8 @@ impl SessionRunner {
                         None
                     },
                     realtime_lane.as_ref().and_then(|lane| lane.parallel.as_ref()).and_then(ParallelChannels::reliable).filter(|pool| pool.running()),
+                    retained_children_after_swap.then(|| realtime_lane.as_ref()
+                        .and_then(|lane| lane.parallel.as_ref())).flatten(),
                 )
                 .await
                 {
@@ -6130,6 +6153,21 @@ impl SessionRunner {
                         }
                         continue;
                     }
+                    NextInput::IndependentTransportClosed => {
+                        // A byte-only handoff cannot supply a new independent
+                        // factory. Reconnect with a fresh normal handshake,
+                        // rather than black-holing sources or coupling them
+                        // onto the replacement's ordered writer indefinitely.
+                        self.logger.info("session.independent_transport_closed",
+                            format!("peer_id={} reconnect required after canonical swap", hex_short(&self.peer_id)));
+                        // This session needs fresh authentication. Waiting up
+                        // to five seconds for a blocked canonical body to drain
+                        // would also postpone recovery of independent audio.
+                        drop(wire_tx);
+                        writer_handle.0.abort();
+                        let _ = (&mut writer_handle).await;
+                        return;
+                    }
                     NextInput::SwapStream(new_stream) => {
                         if frame_reader.has_partial_frame() {
                             // A partial encrypted frame cannot be discarded while
@@ -6138,15 +6176,27 @@ impl SessionRunner {
                             Self::stop_writer(wire_tx, &mut writer_handle).await;
                             return;
                         }
-                        // The replacement API carries only a byte stream, not
-                        // a handle to its QUIC connection. Stop using the old
-                        // connection's datagram plane immediately; queued media
-                        // continues through the ordered fallback.
-                        realtime_lane = None;
-                        // The new stream has no QUIC metadata. Feedback from
-                        // the retired connection must not affect its producer.
+                        // Only the canonical byte stream is being replaced.
+                        // Retire its shared DATAGRAM sender/receiver and path
+                        // feedback, but keep separately authenticated children.
+                        // They own independent transports, nonce/replay state
+                        // and reliable progress under this unchanged session.
+                        // Reconstructing the pool here would both destroy that
+                        // isolation and risk resetting state under existing keys.
+                        let keep_children = realtime_lane.as_mut().is_some_and(|lane| {
+                            lane.sender = None;
+                            lane.local_reliable = None;
+                            lane.parallel.is_some()
+                        });
+                        retained_children_after_swap = keep_children;
+                        if !keep_children {
+                            realtime_lane = None;
+                            _datagram_transport_lease = None;
+                        }
+                        // No metadata for the replacement's shared carrier is
+                        // available. Never reuse the old one or infer new rights.
                         ordered_feedback = None;
-                        _datagram_transport_lease = None;
+                        realtime_rekey_tx = None;
                         drop(realtime_receiver_task.take());
                         // Tear-down + re-spawn lifecycle is mechanical;
                         // rebind locals from the tuple result, reset
@@ -6214,7 +6264,16 @@ impl SessionRunner {
                         // goodbye" frame is sent — that would itself be
                         // a fingerprint.
                         if session_rotation.is_due(now) {
-                            if self.fire_hot_standby_trigger("rotation_deadline") {
+                            // Independent children can keep their original
+                            // transport factory alive across a canonical-only
+                            // swap. A privacy rotation must retire those old
+                            // transports too. Until handoff carries a fresh
+                            // typed factory, use the existing full reconnect
+                            // path for sessions with children; never re-arm
+                            // their original lifetime indefinitely.
+                            let has_children = realtime_lane.as_ref()
+                                .is_some_and(|lane| lane.parallel.is_some());
+                            if !has_children && self.fire_hot_standby_trigger("rotation_deadline") {
                                 // Make-before-break is now in flight in
                                 // the background warm-probe task.  Re-
                                 // arm the deadline so we don't re-fire

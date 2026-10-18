@@ -5861,6 +5861,112 @@ async fn q7_rotation_deadline_fires_and_runner_returns_when_no_controller() {
     );
 }
 
+/// Independent transports may outlive a non-rotation canonical swap, but
+/// may not extend the configured privacy lifetime. Exercise the actual runner
+/// with a live ordered-child offer AND an otherwise eligible controller.
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn q7_rotation_reconnects_independent_children_without_rearming_their_lifetime() {
+    use veil_session::handoff::{HandoffAckWaiters, SessionSwapRegistry};
+    use veil_session::hot_standby::HotStandbyController;
+    use veil_session::runner::{
+        ParallelOrderedOffer, ParallelRegistry, RealtimeLaneOffer, RealtimeTransportOffer,
+    };
+    use veil_transport::{
+        Transport, TransportContext, TransportListener, TransportRegistry, TransportUri,
+        obfs4_tcp::Obfs4TcpTransport,
+    };
+    let _lock = epic488_1_lock();
+    let _restore = Epic488Restore;
+    let mut context = TransportContext::for_debug().unwrap();
+    context.obfs4_psk = Some(Arc::new([0x42; 32]));
+    let context = Arc::new(context);
+    let listener: Arc<dyn TransportListener> = Arc::from(
+        Obfs4TcpTransport
+            .bind(
+                &TransportUri::Obfs4Tcp {
+                    host: "127.0.0.1".into(),
+                    port: 0,
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap(),
+    );
+    let port = listener
+        .local_addr()
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let uri = TransportUri::Obfs4Tcp {
+        host: "127.0.0.1".into(),
+        port,
+    };
+    let (local, remote) = tokio::join!(
+        Obfs4TcpTransport.connect(&uri, context.clone()),
+        listener.accept()
+    );
+    let local = local.unwrap();
+    let _remote = remote.unwrap().into_stream().unwrap();
+    let offer = ParallelOrderedOffer::new(
+        local.parallel_stream().unwrap(),
+        Arc::new(ParallelRegistry::default()),
+    );
+    let (_unused, dummy) = tokio::io::duplex(1024);
+    let (mut runner, _swaps) = make_swap_runner(dummy);
+    runner.stream = local.into_stream().unwrap();
+    runner.session_id = [1; 32];
+    runner.raw_session_keys = Some(([2; 32], [3; 32], [1; 32]));
+    runner.quic_datagrams = Some(RealtimeLaneOffer {
+        peer_datagrams: true,
+        transport: RealtimeTransportOffer::Ordered(offer),
+        peer_rotates: true,
+        peer_flows: true,
+        peer_circuit_datagrams: true,
+        peer_neutral_forwards: true,
+        parallel: None,
+    });
+    let controller = Arc::new(HotStandbyController::new(
+        Arc::new(TransportRegistry::with_defaults()),
+        context,
+        Arc::new(std::sync::RwLock::new(
+            veil_session::SessionTxRegistry::new(),
+        )),
+        Arc::new(HandoffAckWaiters::new()),
+        Arc::new(SessionSwapRegistry::new()),
+        veil_cfg::HotStandbyConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        runner.logger.clone(),
+    ));
+    controller.set_alt_uri(runner.peer_id.into(), "tcp://127.0.0.1:1".into());
+    runner.hot_standby.controller = Some(controller.clone());
+    let peer = runner.peer_id.into();
+    // Use a normal long lifetime and advance only this test's clock. Other
+    // integration fixtures cannot accidentally get a one-second deadline.
+    runner::set_session_rotation_range(600, 600);
+    tokio::time::pause();
+    let task = tokio::spawn(async move { runner.run().await });
+    tokio::task::yield_now().await;
+    assert!(!task.is_finished());
+    tokio::time::advance(std::time::Duration::from_secs(601)).await;
+    // Bound the negative control by wall time too: a broken runner can keep
+    // a network task active and prevent paused time from advancing itself.
+    tokio::time::resume();
+    tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await
+        .expect("independent session must close at its original rotation deadline")
+        .expect("runner must not panic");
+    assert_eq!(
+        controller.swap_attempts_in_window(&peer),
+        0,
+        "byte-only handoff must not keep the old independent transport factory alive"
+    );
+}
+
 // ── deferred : outbound-batch global signals ────
 
 /// Serialises every test that depends on the process-global padding flag, and
