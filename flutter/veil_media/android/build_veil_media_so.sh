@@ -51,9 +51,15 @@ compile_tu() {  # $1=src  $2=out.o
   python3 - "$CC_JSON" "$1" "$2" "$SRCDIR" "$WEBRTC_SRC" <<'PY' > "$TMP/tu.sh"
 import json,sys,re
 cc=json.load(open(sys.argv[1])); src,out,shimdir=sys.argv[2],sys.argv[3],sys.argv[4]
-e=next(x for x in cc if x.get('file','').endswith('call/call.cc'))
+suffix='modules/pacing/pacing_controller.cc' if src.endswith('/webrtc_pacing/pacing_controller.cc') else 'call/call.cc'
+e=next((x for x in cc if x.get('file','').endswith(suffix)), None)
+if e is None:
+    # Reduced SDK bundles retain only the common call compile metadata.
+    # Private ABI headers have already been verified before compiling.
+    suffix='call/call.cc'
+    e=next(x for x in cc if x.get('file','').endswith(suffix))
 cmd=(e['command'] if e.get('command') else ' '.join(e['arguments'])).strip()
-s=re.search(r'(\S*call/call\.cc)',cmd).group(1)
+s=re.search(r'(\S*'+re.escape(suffix)+')',cmd).group(1)
 cmd=cmd.replace(s,src); cmd=re.sub(r'-o\s+\S+','-o '+out,cmd)
 # Each veil TU owns its temporary dependency file. Reusing call.cc's -MF
 # overwrites WebRTC's cached dependency graph and rejects a read-only cache.
@@ -80,6 +86,8 @@ PY
 }
 
 echo "==> compiling engine + shim + aaudio_adm (android NDK toolchain)"
+python3 "$SRCDIR/webrtc_pacing/verify_headers.py" "$WEBRTC_SRC"
+compile_tu "$SRCDIR/webrtc_pacing/pacing_controller.cc" "$TMP/pacing.o"
 compile_tu "$SRCDIR/webrtc_ana/controller_manager.cc" "$TMP/ana.o"
 compile_tu "$SRCDIR/veil_media_engine.cc" "$TMP/engine.o"
 compile_tu "$SRCDIR/veil_transport_shim.cc" "$TMP/shim.o"
@@ -189,7 +197,7 @@ fi
 # shellcheck disable=SC2086
 "$CLANGXX" -shared -o "$DEST/libveil_media.so" \
   $TGT --sysroot="$LINK_SYSROOT" -nostdlib++ -unwindlib=none \
-  "$TMP/ana.o" "$TMP/engine.o" "$TMP/shim.o" "$TMP/aaudio_adm.o" "$TMP/record.o" "$TMP/play.o" "$TMP/vnote.o" obj/libwebrtc.a $CXX_OBJS $UNWIND_OBJS \
+  "$TMP/pacing.o" "$TMP/ana.o" "$TMP/engine.o" "$TMP/shim.o" "$TMP/aaudio_adm.o" "$TMP/record.o" "$TMP/play.o" "$TMP/vnote.o" obj/libwebrtc.a $CXX_OBJS $UNWIND_OBJS \
   -L"$AAUDIO_L" \
   -Wl,--gc-sections -Wl,--version-script,"$TMP/exports.map" \
   -Wl,-soname,libveil_media.so \

@@ -15,6 +15,7 @@ if [ "$#" -eq 0 ]; then
   "$STAND_DIR/smoke" --group-rtcp-accounting
   "$STAND_DIR/smoke" --group-remb-cadence
   "$STAND_DIR/smoke" --frame-sizing
+  python3 "$ROOT/test/run_video_pacing_debt_smoke.py"
   bash "$ROOT/test/run_video_frame_budget_smoke.sh"
   "$ROOT/test/run_remb_cadence_smoke.sh"
   "$ROOT/test/run_rtcp_send_stats_smoke.sh"
