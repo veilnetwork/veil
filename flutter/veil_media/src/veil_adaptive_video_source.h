@@ -5,6 +5,8 @@
 #include <limits>
 #include <mutex>
 #include <utility>
+#include <memory>
+#include "veil_video_frame_budget.h"
 #include "api/video/i420_buffer.h"
 #include "api/video/video_adapter.h"
 #include "api/video/video_broadcaster.h"
@@ -15,6 +17,8 @@ namespace veil_media {
 // Pushable camera/screen source. Preview owns the original capture separately.
 class AdaptiveVideoSource final : public webrtc::VideoBroadcaster {
  public:
+  explicit AdaptiveVideoSource(std::shared_ptr<VideoFrameBudget> budget = {})
+      : budget_(std::move(budget)) {}
   void PushI420(webrtc::scoped_refptr<webrtc::I420Buffer> buffer, int64_t time_us) {
     if (!buffer || !frame_wanted()) return;
     time_us = time_us ? time_us : webrtc::TimeMicros();
@@ -26,7 +30,15 @@ class AdaptiveVideoSource final : public webrtc::VideoBroadcaster {
       // combined request on capture, and serialize only the adapter decision;
       // never hold this lock while scaling pixels or calling an encoder sink.
       std::lock_guard<std::mutex> lock(adapter_mutex_);
-      adapter_.OnSinkWants(wants());
+      auto request = wants();
+      const int cap = budget_ ? budget_->snapshot().max_pixels : 0;
+      if (cap) {
+        request.max_pixel_count = std::min(request.max_pixel_count, cap);
+        if (request.target_pixel_count) {
+          request.target_pixel_count = std::min(*request.target_pixel_count, cap);
+        }
+      }
+      adapter_.OnSinkWants(request);
       wanted = adapter_.AdaptFrameResolution(buffer->width(), buffer->height(),
           time_us * 1000, &cropped_width, &cropped_height, &width, &height);
     }
@@ -50,6 +62,7 @@ class AdaptiveVideoSource final : public webrtc::VideoBroadcaster {
   }
 
  private:
+  const std::shared_ptr<VideoFrameBudget> budget_;
   std::mutex adapter_mutex_;
   webrtc::VideoAdapter adapter_{2};  // I420 chroma alignment, plus sink alignment.
 };

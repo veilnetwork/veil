@@ -14,6 +14,8 @@ if [ "$#" -eq 0 ]; then
   "$STAND_DIR/smoke" --rtcp-loss
   "$STAND_DIR/smoke" --group-rtcp-accounting
   "$STAND_DIR/smoke" --group-remb-cadence
+  "$STAND_DIR/smoke" --frame-sizing
+  bash "$ROOT/test/run_video_frame_budget_smoke.sh"
   "$ROOT/test/run_remb_cadence_smoke.sh"
   "$ROOT/test/run_rtcp_send_stats_smoke.sh"
   "$ROOT/test/run_video_loss_trace_smoke.sh"

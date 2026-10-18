@@ -301,6 +301,74 @@ static void wait_playout(VeilGroupMediaEngine* e, uint64_t reports, uint64_t del
   if (reports) assert(group_stat(e, "audio_playout_ms") == delay);
 }
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--frame-sizing") == 0) {
+    unsetenv("VEIL_MEDIA_TEST_VIDEO");
+    const int width = 320, height = 240;
+    std::vector<uint8_t> y(width * height), uv(width * height / 4, 128);
+    uint32_t noise = 1;
+    for (auto& pixel : y) {
+      noise = noise * 1664525u + 1013904223u;
+      pixel = static_cast<uint8_t>(noise >> 24);
+    }
+    for (bool room : {false, true}) {
+      uint8_t local[32] = {91}, peer[32] = {92};
+      std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> one(
+          room ? nullptr : veil_media_engine_create(71, local, peer), veil_media_engine_destroy);
+      std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> group(
+          room ? veil_media_group_engine_create(local) : nullptr, veil_media_group_engine_destroy);
+      if (room) {
+        assert(group);
+        assert(veil_media_group_engine_add_peer(group.get(), 82, peer) == VEIL_MEDIA_OK);
+        assert(veil_media_group_engine_set_mic_muted(group.get(), 1) == VEIL_MEDIA_OK);
+        assert(veil_media_group_engine_start_audio(group.get()) == VEIL_MEDIA_OK);
+        assert(veil_media_group_engine_start_video(group.get()) == VEIL_MEDIA_OK);
+      } else {
+        assert(one);
+        assert(veil_media_engine_start_audio(one.get(), 0, 1) == VEIL_MEDIA_OK);
+        assert(veil_media_engine_set_max_rtp_packet_size(one.get(), 1000) == VEIL_MEDIA_OK);
+        assert(veil_media_engine_start_video(one.get(), 1, 1, 30, 1) == VEIL_MEDIA_OK);
+      }
+      const auto metric = [&](const char* name) {
+        return room ? group_stat(group.get(), name) : stat(one.get(), name);
+      };
+      const auto budget = [&](int kbps, double fps) {
+        return room ? veil_media_group_engine_set_video_budget(group.get(), kbps, fps)
+                    : veil_media_engine_set_video_budget(one.get(), kbps, fps);
+      };
+      assert(budget(8, 1) == VEIL_MEDIA_OK);
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(7);
+      while (std::chrono::steady_clock::now() < deadline) {
+        assert((room ? veil_media_group_engine_push_video_frame(group.get(), y.data(), uv.data(), uv.data(),
+                    width, height, width, width / 2, width / 2, 0)
+                     : veil_media_engine_push_video_frame(one.get(), y.data(), uv.data(), uv.data(),
+                    width, height, width, width / 2, width / 2, 0)) == VEIL_MEDIA_OK);
+        if (metric("video_frame_oversize_count") &&
+            metric("video_frame_encoded_pixels") <= metric("video_frame_pixel_cap")) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(35));
+      }
+      assert(metric("video_frame_oversize_count") > 0);
+      assert(metric("video_frame_pixel_cap") >= 6144);
+      assert(metric("video_frame_pixel_cap") < width * height);
+      assert(metric("video_frame_encoded_pixels") > 0);
+      assert(metric("video_frame_encoded_pixels") <= metric("video_frame_pixel_cap"));
+      // Local preview retains the original capture rather than the source's
+      // smaller encoder input. Every encoded image still reaches packetization.
+      assert(metric("video_tx_frames") > 0);
+      std::vector<uint8_t> rgba(width * height * 4);
+      int w = 0, h = 0;
+      const int preview = room
+          ? veil_media_group_engine_get_local_video_frame(group.get(), rgba.data(), rgba.size(), &w, &h)
+          : veil_media_engine_get_local_video_frame(one.get(), rgba.data(), rgba.size(), &w, &h);
+      assert(preview > 0 && w == width && h == height);
+      assert(budget(150, 6) == VEIL_MEDIA_OK);
+      assert(metric("video_frame_pixel_cap") == 0);
+      assert(metric("video_frame_budget_bytes") == 0);
+      std::printf("%s low-rate VP8 frame sizing, packetization, preview and recovery OK\n",
+                  room ? "group" : "direct");
+    }
+    assert(callbacks.empty());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--group-remb-cadence") == 0) {
     uint8_t local[32]={91}, alice[32]={92}, bob[32]={93};
     std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> e(
