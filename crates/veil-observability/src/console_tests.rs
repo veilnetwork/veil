@@ -168,3 +168,117 @@ fn sink_errors_are_visible_and_do_not_panic_or_retain_credit() {
     drop(queue);
     worker.join().unwrap();
 }
+
+#[test]
+fn ready_records_share_bounded_writes_without_waiting_to_collect_more() {
+    struct CountingSink {
+        output: Arc<Mutex<Vec<u8>>>,
+        writes: Arc<AtomicU64>,
+        block: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+    }
+    impl Write for CountingSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            if let Some((entered, release)) = self.block.take() {
+                entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
+            self.output.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writes = Arc::new(AtomicU64::new(0));
+    let (entered, blocked) = mpsc::channel();
+    let (release, resume) = mpsc::channel();
+    let (queue, worker) = ConsoleQueue::start(
+        Box::new(CountingSink {
+            output: output.clone(),
+            writes: writes.clone(),
+            block: Some((entered, resume)),
+        }),
+        RECORDS,
+        BYTES,
+        MAX_RECORD_BYTES,
+    )
+    .unwrap();
+    assert!(queue.enqueue("first\n".into()));
+    // One record is written promptly; batching must not wait for a second.
+    blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+    for n in 0..100 {
+        assert!(queue.enqueue(format!("record-{n}\n")));
+    }
+    release.send(()).unwrap();
+    assert!(queue.flush(Duration::from_secs(2)));
+    assert_eq!(writes.load(Ordering::Relaxed), 3); // 1 + 64 + 36 records.
+    assert_eq!(queue.counters.snapshot().queued_bytes, 0);
+    assert_eq!(queue.counters.snapshot().dropped_records, 0);
+    drop(queue);
+    worker.join().unwrap();
+    let expected = "first\n".to_owned()
+        + &(0..100)
+            .map(|n| format!("record-{n}\n"))
+            .collect::<String>();
+    assert_eq!(*output.lock().unwrap(), expected.as_bytes());
+}
+
+#[test]
+fn batches_do_not_cross_flush_and_keep_byte_credit_during_partial_writes() {
+    struct PartialSink {
+        output: Arc<Mutex<Vec<u8>>>,
+        flushes: Arc<Mutex<Vec<Vec<u8>>>>,
+        block: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+    }
+    impl Write for PartialSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if let Some((entered, release)) = self.block.take() {
+                entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
+            let length = bytes.len().min(3);
+            self.output
+                .lock()
+                .unwrap()
+                .extend_from_slice(&bytes[..length]);
+            Ok(length)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes
+                .lock()
+                .unwrap()
+                .push(self.output.lock().unwrap().clone());
+            Ok(())
+        }
+    }
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let flushes = Arc::new(Mutex::new(Vec::new()));
+    let (entered, blocked) = mpsc::channel();
+    let (release, resume) = mpsc::channel();
+    let (queue, worker) = ConsoleQueue::start(
+        Box::new(PartialSink {
+            output: output.clone(),
+            flushes: flushes.clone(),
+            block: Some((entered, resume)),
+        }),
+        16,
+        1024,
+        100,
+    )
+    .unwrap();
+    assert!(queue.enqueue("first\n".into()));
+    blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(queue.enqueue("before\n".into()));
+    let (reply, result) = mpsc::channel();
+    queue.sender.try_send(Command::Flush(reply)).ok().unwrap();
+    assert!(queue.enqueue("after\n".into()));
+    assert_eq!(queue.counters.snapshot().queued_bytes, 19);
+    release.send(()).unwrap();
+    assert!(result.recv_timeout(Duration::from_secs(2)).unwrap());
+    drop(queue);
+    worker.join().unwrap();
+    assert_eq!(flushes.lock().unwrap()[0], b"first\nbefore\n");
+    assert_eq!(*output.lock().unwrap(), b"first\nbefore\nafter\n");
+}

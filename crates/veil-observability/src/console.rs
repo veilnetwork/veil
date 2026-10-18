@@ -15,6 +15,8 @@ use std::{
 const RECORDS: usize = 512;
 const BYTES: u64 = 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 64 * 1024;
+const WRITE_BATCH_RECORDS: usize = 64;
+const WRITE_BATCH_BYTES: usize = 64 * 1024;
 
 /// Local diagnostic counters. Queued bytes include a writer blocked in I/O.
 #[derive(Clone, Copy, Debug, Default)]
@@ -89,7 +91,14 @@ impl ConsoleQueue {
             .spawn(move || {
                 let mut reported_drops = 0;
                 let mut failed = false;
-                while let Ok(command) = receiver.recv() {
+                let mut pending = None;
+                let mut records = Vec::with_capacity(WRITE_BATCH_RECORDS);
+                let mut output = Vec::with_capacity(WRITE_BATCH_BYTES);
+                loop {
+                    let command = match pending.take().or_else(|| receiver.recv().ok()) {
+                        Some(command) => command,
+                        None => break,
+                    };
                     let snapshot = writer_counters.snapshot();
                     if snapshot.dropped_records > reported_drops {
                         // Keep the overload notice a complete JSON record even
@@ -111,11 +120,44 @@ impl ConsoleQueue {
                     }
                     match command {
                         Command::Record(record) => {
-                            if sink.write_all(&record.bytes).is_err() {
+                            let mut bytes = record.bytes.len();
+                            records.push(record);
+                            // Drain only records already ready. There is no
+                            // collection timer and Flush remains a FIFO fence.
+                            while records.len() < WRITE_BATCH_RECORDS && bytes < WRITE_BATCH_BYTES {
+                                match receiver.try_recv() {
+                                    Ok(Command::Record(next))
+                                        if next.bytes.len() <= WRITE_BATCH_BYTES - bytes =>
+                                    {
+                                        bytes += next.bytes.len();
+                                        records.push(next);
+                                    }
+                                    Ok(next) => {
+                                        pending = Some(next);
+                                        break;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            output.clear();
+                            // A custom queue may allow a record above the
+                            // batch bound. Write that record directly instead
+                            // of growing the worker's fixed scratch buffer.
+                            let data = if records.len() == 1 {
+                                &records[0].bytes[..]
+                            } else {
+                                for record in &records {
+                                    output.extend_from_slice(&record.bytes);
+                                }
+                                &output[..]
+                            };
+                            if sink.write_all(data).is_err() {
                                 writer_counters.errors.fetch_add(1, Ordering::Relaxed);
                                 failed = true;
                             }
-                            // Drop the byte lease only after the I/O completes.
+                            // Keep every byte lease until the whole write
+                            // completes, including partial/blocked sink writes.
+                            records.clear();
                         }
                         Command::Flush(reply) => {
                             if sink.flush().is_err() {
