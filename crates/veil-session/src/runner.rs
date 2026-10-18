@@ -5002,6 +5002,11 @@ impl SessionRunner {
                                 }
                                 // Discard while the agreed child is unavailable;
                                 // the next fresh packet may use a ready child.
+                                crate::local_lossy_trace::cell(
+                                    "child_unavailable",
+                                    outgoing_priority,
+                                    outgoing,
+                                );
                                 lane.trace_source_pressure(
                                     &self.logger,
                                     &self.peer_id,

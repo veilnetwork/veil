@@ -66,24 +66,10 @@ fn unix_us() -> u128 {
 fn owned_secondary_header(priority: u8, frame: &[u8]) -> Option<(u64, u64)> {
     // A wire traffic-class hint never selects this diagnostic. The private
     // local queue must already establish that this is our own producer.
-    if !owned_secondary(priority)
-        || frame.len() > 8192
-        || crate::frame_diag::family_and_type(frame)
-            != Some((
-                veil_proto::family::FrameFamily::Delivery as u8,
-                veil_proto::family::DeliveryMsg::Forward as u16,
-            ))
-    {
+    if !owned_secondary(priority) {
         return None;
     }
-    let forward =
-        veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::header::HEADER_SIZE..])
-            .ok()?;
-    header(&forward.envelope.payload)
-}
-
-fn owned_cell(priority: u8, frame: &[u8]) -> Option<(u64, u64)> {
-    owned_secondary_header(priority, frame).filter(|(_, seq)| *seq <= SEQUENCE_LIMIT)
+    owned_frame_header(frame)
 }
 
 /// First/last owned members accepted by the local DATAGRAM transport. This is
@@ -124,7 +110,14 @@ pub(crate) fn work_release(
 
 fn owned_primary_cell(priority: u8, frame: &[u8]) -> Option<(u64, u64)> {
     // Selection comes from our private source slot, never a remote wire hint.
-    if priority != veil_proto::priority::REALTIME || frame.len() > 8192 {
+    if priority != veil_proto::priority::REALTIME {
+        return None;
+    }
+    owned_frame_header(frame)
+}
+
+fn owned_frame_header(frame: &[u8]) -> Option<(u64, u64)> {
+    if frame.len() > 8192 {
         return None;
     }
     let wire_header = veil_proto::codec::decode_header(frame).ok()?;
@@ -165,7 +158,7 @@ pub(crate) fn cell(stage: &'static str, priority: u8, frame: &[u8]) {
     record_cell(stage, priority, frame, 0);
 }
 
-/// A complete owned primary frame was accepted by the local DATAGRAM handle.
+/// A complete owned primary/secondary frame reached the local DATAGRAM handle.
 /// This remains a queue observation, not a NIC-send or peer-delivery promise.
 /// Ordinary sparse RT tracing does not enable this additional observation.
 pub(crate) fn datagram_accepted(
@@ -186,7 +179,11 @@ fn accepted_connection(
     frame: &[u8],
     connection_trace_id: impl FnOnce() -> u64,
 ) -> Option<u64> {
-    if !detailed || owned_primary_cell(priority, frame).is_none() {
+    if !detailed
+        || owned_primary_cell(priority, frame)
+            .or_else(|| owned_secondary_header(priority, frame))
+            .is_none()
+    {
         return None;
     }
     // Looking up an ordinal locks the transport connection. Keep that work
@@ -200,7 +197,9 @@ fn record_cell(stage: &'static str, priority: u8, frame: &[u8], connection_trace
     let sample = if primary {
         owned_primary_cell(priority, frame)
     } else if enabled() {
-        owned_cell(priority, frame)
+        // Detailed secondary capture uses the same explicit row bound as
+        // primary capture; a high nonce must not silently hide a late fault.
+        owned_secondary_header(priority, frame)
     } else {
         None
     };
@@ -331,9 +330,8 @@ mod tests {
     }
 
     #[test]
-    fn late_work_boundary_keeps_legacy_cell_limits_and_rejects_transit() {
+    fn late_secondary_cells_are_visible_and_reject_transit() {
         let bytes = forward(SEQUENCE_LIMIT + 1);
-        assert!(owned_cell(veil_proto::priority::BULK, &bytes).is_none());
         assert_eq!(
             owned_secondary_header(veil_proto::priority::BULK, &bytes),
             Some((7, SEQUENCE_LIMIT + 1))
@@ -408,9 +406,21 @@ mod tests {
             None
         );
         assert_eq!(owned_primary_cell(veil_proto::priority::BULK, &frame), None);
+        for priority in [veil_proto::priority::BULK, veil_proto::priority::BACKGROUND] {
+            assert_eq!(owned_secondary_header(priority, &frame), Some((7, 50)));
+            assert_eq!(accepted_connection(true, priority, &frame, || 31), Some(31));
+        }
+        assert_eq!(
+            owned_secondary_header(veil_proto::priority::INTERACTIVE, &frame),
+            None
+        );
         for size in 0..frame.len() {
             assert_eq!(
                 owned_primary_cell(veil_proto::priority::REALTIME, &frame[..size]),
+                None
+            );
+            assert_eq!(
+                owned_secondary_header(veil_proto::priority::BULK, &frame[..size]),
                 None
             );
         }
@@ -420,6 +430,16 @@ mod tests {
         malformed.extend(unsealed.encode());
         assert_eq!(
             owned_primary_cell(veil_proto::priority::REALTIME, &malformed),
+            None
+        );
+        assert_eq!(
+            owned_secondary_header(veil_proto::priority::BULK, &malformed),
+            None
+        );
+        assert_eq!(
+            accepted_connection(true, veil_proto::priority::BULK, &malformed, || {
+                panic!("invalid direct secondary must not lock QUIC")
+            }),
             None
         );
     }
@@ -453,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_acceptance_requires_explicit_trace_and_local_primary_ownership() {
+    fn transport_acceptance_requires_explicit_trace_and_local_ownership() {
         let frame = forward(SEQUENCE_LIMIT + 50);
         assert_eq!(
             accepted_connection(false, veil_proto::priority::REALTIME, &frame, || {
@@ -465,15 +485,22 @@ mod tests {
             accepted_connection(true, veil_proto::priority::REALTIME, &frame, || 17),
             Some(17)
         );
+        for priority in [veil_proto::priority::BULK, veil_proto::priority::BACKGROUND] {
+            assert_eq!(accepted_connection(true, priority, &frame, || 23), Some(23));
+            assert_eq!(
+                accepted_connection(false, priority, &frame, || {
+                    panic!("disabled diagnostics must not lock QUIC")
+                }),
+                None
+            );
+        }
         for priority in [
             veil_proto::priority::INTERACTIVE,
-            veil_proto::priority::BULK,
-            veil_proto::priority::BACKGROUND,
             veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
         ] {
             assert_eq!(
                 accepted_connection(true, priority, &frame, || {
-                    panic!("transit and secondary diagnostics must not lock QUIC")
+                    panic!("transit diagnostics must not lock QUIC")
                 }),
                 None
             );
@@ -499,9 +526,12 @@ mod tests {
     #[test]
     fn remote_and_primary_slots_cannot_select_source_cell_diagnostics() {
         let frame = forward(1);
-        assert_eq!(owned_cell(veil_proto::priority::BULK, &frame), Some((7, 1)));
         assert_eq!(
-            owned_cell(veil_proto::priority::BACKGROUND, &frame),
+            owned_secondary_header(veil_proto::priority::BULK, &frame),
+            Some((7, 1))
+        );
+        assert_eq!(
+            owned_secondary_header(veil_proto::priority::BACKGROUND, &frame),
             Some((7, 1))
         );
         for priority in [
@@ -510,23 +540,26 @@ mod tests {
             veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
         ] {
             assert!(!owned_secondary(priority));
-            assert_eq!(owned_cell(priority, &frame), None);
+            assert_eq!(owned_secondary_header(priority, &frame), None);
         }
     }
 
     #[test]
-    fn sampled_cells_enforce_both_size_and_sequence_bounds() {
+    fn detailed_secondary_cells_retain_size_bound_without_a_silent_nonce_cutoff() {
         assert_eq!(
-            owned_cell(veil_proto::priority::BULK, &forward(SEQUENCE_LIMIT)),
+            owned_secondary_header(veil_proto::priority::BULK, &forward(SEQUENCE_LIMIT)),
             Some((7, SEQUENCE_LIMIT))
         );
         assert_eq!(
-            owned_cell(veil_proto::priority::BULK, &forward(SEQUENCE_LIMIT + 1)),
-            None
+            owned_secondary_header(veil_proto::priority::BULK, &forward(SEQUENCE_LIMIT + 1)),
+            Some((7, SEQUENCE_LIMIT + 1))
         );
         let mut oversized = forward(1);
         oversized.resize(8193, 0);
-        assert_eq!(owned_cell(veil_proto::priority::BULK, &oversized), None);
+        assert_eq!(
+            owned_secondary_header(veil_proto::priority::BULK, &oversized),
+            None
+        );
     }
 
     #[test]
