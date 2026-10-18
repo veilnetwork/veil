@@ -318,6 +318,10 @@ pub(super) struct OrderedSession {
 }
 
 impl OrderedSession {
+    pub(super) async fn transport_closed(&self) {
+        self.offer.handle.closed().await;
+    }
+
     pub(super) fn note_reliable_frame(&self, canonical_full: bool) -> bool {
         self.offer.diagnostics.note_reliable_frame(canonical_full)
     }
