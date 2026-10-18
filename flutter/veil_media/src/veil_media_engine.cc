@@ -73,6 +73,9 @@
 #include "veil_group_audio_send_trace.h"
 #include "call/rtp_transport_controller_send_interface.h"
 #include "rtc_base/network_route.h"
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+#include "../test/route_controller_observer.h"
+#endif
 #include "api/environment/environment.h"
 #include "api/environment/environment_factory.h"
 #if defined(VEIL_MEDIA_CC_TRACE)
@@ -1033,6 +1036,15 @@ struct WebrtcState {
   std::unique_ptr<webrtc::NetEqFactory> recovery_factory;
   std::unique_ptr<webrtc::Call> call;  // audio only
   std::unique_ptr<webrtc::Call> video_call;
+  // Local opaque path generation; never transmitted or used as a relay role.
+  // Each controller consumes it on its own worker. A busy video worker cannot
+  // delay the audio route update, and cancelled work retries at the next poll.
+  std::atomic<uint64_t> route_generation{0};
+  std::atomic<uint64_t> audio_route_applied{0}, video_route_applied{0};
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+  std::shared_ptr<std::atomic<int>> audio_route_restarts = std::make_shared<std::atomic<int>>(0);
+  std::shared_ptr<std::atomic<int>> video_route_restarts = std::make_shared<std::atomic<int>>(0);
+#endif
   std::unique_ptr<veil_media::VeilTransportShim> shim;
   webrtc::AudioSendStream* send_stream = nullptr;             // owned by Call
   webrtc::AudioReceiveStreamInterface* recv_stream = nullptr;  // owned by Call
@@ -1232,11 +1244,12 @@ class LowLatencyFieldTrials final : public webrtc::FieldTrialsView {
  public:
   explicit LowLatencyFieldTrials(bool video = false) : video_(video) {}
   std::string Lookup(absl::string_view key) const override {
-    // Start video's estimator at the endpoint's selected budget. The default
-    // two 3x/6x bursts compete with already running Opus before any video TWCC
-    // arrives. Keep normal feedback and later probes; audio retains its own
-    // initial probing. This changes local production, not relay scheduling.
-    if (video_ && key == "WebRTC-Bwe-InitialProbing")
+    // Start each estimator at its selected budget, including after handover.
+    // The default 3x/6x bursts can queue audio's own padded probes on a newly
+    // selected narrow path. Keep feedback and subsequent probes; neither Call
+    // needs to overrun its initial allocation to announce the new route.
+    // This is local production control, not relay-visible prioritization.
+    if (key == "WebRTC-Bwe-InitialProbing")
       return "p1:1,p2:0";
     // Reordering history advances only on received packets. With Opus DTX,
     // the default 0.9993 factor can preserve a short radio burst throughout
@@ -1393,6 +1406,54 @@ struct VeilGroupMediaEngine {
 };
 
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
+
+namespace {
+webrtc::NetworkRoute opaque_route(uint64_t generation, int overhead) {
+  webrtc::NetworkRoute route;
+  route.connected = true;
+  // Set both ids: pinned WebRTC may select adapter or network identity. Split
+  // the local generation over two endpoints so the 16-bit id rollover does
+  // not make a still-recent path look identical. No interface/address leaks.
+  const uint16_t low = static_cast<uint16_t>(generation);
+  const uint16_t high = static_cast<uint16_t>(generation >> 16);
+  route.local = webrtc::RouteEndpoint(webrtc::ADAPTER_TYPE_UNKNOWN, low, low, false);
+  route.remote = webrtc::RouteEndpoint(webrtc::ADAPTER_TYPE_UNKNOWN, high, high, false);
+  route.packet_overhead = overhead;
+  return route;
+}
+// Caller is the relevant Call's worker queue. Initial registration uses zero;
+// subsequent genuine channel commits reset that Call's path estimates, without
+// replacing streams, RTP sequence spaces, the ADM or the receive jitter buffer.
+void apply_audio_route(VeilMediaEngine* engine, bool force = false) {
+  auto* ws = engine->ws.get();
+  const auto generation = ws->route_generation.load();
+  if (!force && ws->audio_route_applied.load() == generation) return;
+  ws->call->GetTransportControllerSend()->OnNetworkRouteChanged(
+      "opaque", opaque_route(generation, engine->audio_packet_overhead.load()));
+  ws->audio_route_applied.store(generation);
+}
+void apply_video_route(WebrtcState* ws, bool force = false) {
+  const auto generation = ws->route_generation.load();
+  if (!force && ws->video_route_applied.load() == generation) return;
+  auto* controller = ws->video_call->GetTransportControllerSend();
+  controller->OnNetworkRouteChanged(
+      "opaque", opaque_route(generation, controller->GetTransportOverhead().bytes<int>()));
+  ws->video_route_applied.store(generation);
+}
+void update_committed_route(VeilMediaEngine* engine) {
+  auto* ws = engine->ws.get();
+  ws->route_generation.fetch_add(1);
+  // Commit already succeeded in the SDK. A stalled queue may postpone its
+  // estimator update, not undo that binding or hold another Call's queue.
+  // The cancellation handshake prevents late stack captures; get_stats retries.
+  (void)veil_media::run_on_with_timeout(ws->worker_tq.get(), [&] {
+    apply_audio_route(engine);
+  }, std::chrono::milliseconds(50));
+  (void)veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&] {
+    apply_video_route(ws);
+  }, std::chrono::milliseconds(20));
+}
+}  // namespace
 
 #if defined(_WIN32)
 // The Windows audio device module is built on a thread THIS FILE created.
@@ -1811,6 +1872,11 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
     call_cfg.neteq_factory = ws->recovery_factory.get();
   }
   configure_call_audio_transport(call_cfg);
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+  if (std::getenv("VEIL_MEDIA_TEST_ROUTE_OBSERVER"))
+    call_cfg.per_call_network_controller_factory =
+        std::make_unique<veil_media::test::RouteObserverFactory>(ws->audio_route_restarts);
+#endif
   ws->call = webrtc::Call::Create(std::move(call_cfg));
   webrtc::CallConfig video_cfg(create_low_latency_environment(true),
                               ws->video_worker_tq.get(),
@@ -1820,6 +1886,11 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
     video_cfg.per_call_network_controller_factory =
         std::make_unique<veil_media::VideoCcTraceFactory>(
             std::make_unique<webrtc::GoogCcNetworkControllerFactory>());
+#endif
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+  if (std::getenv("VEIL_MEDIA_TEST_ROUTE_OBSERVER"))
+    video_cfg.per_call_network_controller_factory =
+        std::make_unique<veil_media::test::RouteObserverFactory>(ws->video_route_restarts);
 #endif
   ws->video_call = webrtc::Call::Create(std::move(video_cfg));
 
@@ -1839,17 +1910,25 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
 #endif
 
   engine->ws = std::move(ws);
+  if (!run_on(engine->ws->worker_tq.get(), [&] { apply_audio_route(engine.get(), true); }) ||
+      !run_on(engine->ws->video_worker_tq.get(), [&] { apply_video_route(engine->ws.get(), true); })) {
+    veil_media_engine_destroy(engine.release());
+    return nullptr;
+  }
 #endif
   return engine.release();
 }
 
 int veil_media_engine_rebind_channel(VeilMediaEngine* engine, uint64_t veil_chan) {
   if (!engine || !veil_chan) return VEIL_MEDIA_ERR_ARG;
+  std::lock_guard<std::mutex> lock(engine->config_mu);
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   auto* ws = engine->ws.get();
   if (!ws || !ws->shim) return VEIL_MEDIA_ERR_STATE;
+  const bool changed = engine->veil_chan != veil_chan;
   if (!ws->shim->RebindChannel(veil_chan)) return VEIL_MEDIA_ERR_STATE;
   engine->veil_chan = veil_chan;
+  if (changed) update_committed_route(engine);
   return VEIL_MEDIA_OK;
 #else
   return VEIL_MEDIA_ERR_STATE;
@@ -1858,11 +1937,14 @@ int veil_media_engine_rebind_channel(VeilMediaEngine* engine, uint64_t veil_chan
 
 int veil_media_engine_rebind_channel_keep_receiver(VeilMediaEngine* engine, uint64_t veil_chan) {
   if (!engine || !veil_chan) return VEIL_MEDIA_ERR_ARG;
+  std::lock_guard<std::mutex> lock(engine->config_mu);
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   auto* ws = engine->ws.get();
-  if (!ws || !ws->shim || !ws->shim->RebindChannel(veil_chan, true))
-    return VEIL_MEDIA_ERR_STATE;
+  if (!ws || !ws->shim) return VEIL_MEDIA_ERR_STATE;
+  const bool changed = engine->veil_chan != veil_chan;
+  if (!ws->shim->RebindChannel(veil_chan, true)) return VEIL_MEDIA_ERR_STATE;
   engine->veil_chan = veil_chan;
+  if (changed) update_committed_route(engine);
   return VEIL_MEDIA_OK;
 #else
   return VEIL_MEDIA_ERR_STATE;
@@ -3072,10 +3154,7 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
         limits.start_bitrate_bps = 48'000;
         limits.max_bitrate_bps = 160'000;
         ws->call->GetTransportControllerSend()->SetSdpBitrateParameters(limits);
-        webrtc::NetworkRoute route;
-        route.connected = true;
-        route.packet_overhead = engine->audio_packet_overhead.load();
-        ws->call->GetTransportControllerSend()->OnNetworkRouteChanged("opaque", route);
+        apply_audio_route(engine, true);
       }
       ws->send_stream = ws->call->CreateAudioSendStream(sc);
       if (ws->send_stream) {
@@ -3261,10 +3340,10 @@ int veil_media_engine_set_audio_packet_overhead(VeilMediaEngine* engine, int byt
     // The cancellation handshake fences this reference on timeout. A blocked
     // audio worker must not hold up host route control for the usual 10 s.
     const bool applied = veil_media::run_on_with_timeout(ws->worker_tq.get(), [&] {
-      webrtc::NetworkRoute route;
-      route.connected = true;
-      route.packet_overhead = bytes;
-      ws->call->GetTransportControllerSend()->OnNetworkRouteChanged("opaque", route);
+      const auto generation = ws->route_generation.load();
+      ws->call->GetTransportControllerSend()->OnNetworkRouteChanged(
+          "opaque", opaque_route(generation, bytes));
+      ws->audio_route_applied.store(generation);
       engine->audio_packet_overhead.store(bytes);
     }, std::chrono::milliseconds(50));
     return applied ? VEIL_MEDIA_OK : VEIL_MEDIA_ERR_STATE;
@@ -4120,6 +4199,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     const uint64_t recovery_sequence = ws->recovery_sample_sequence.fetch_add(1) + 1;
     const int64_t recovery_sampled_us = webrtc::TimeMicros();
     const bool sampled = veil_media::run_on_with_timeout(ws->worker_tq.get(), [&] {
+      apply_audio_route(engine);
       if (ws->send_stream) {
         const auto sent = ws->send_stream->GetStats();
         audio_tx_pkts = sent.packets_sent;
@@ -4181,6 +4261,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     // control loop for the ten-second stream-operation timeout.
     const bool video_sampled = veil_media::run_on_with_timeout(
         ws->video_worker_tq.get(), [&] {
+          apply_video_route(ws);
 #if defined(VEIL_MEDIA_CC_TRACE)
           video_cc_stats_at_us = webrtc::TimeMicros();
 #endif
@@ -4360,6 +4441,10 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
            sizeof(json), written);
     } else {
       std::string snapshot(json, static_cast<size_t>(written) - 1);
+      snapshot += ",\"media_route_generation\":" + std::to_string(ws->route_generation.load()) +
+                  ",\"audio_bwe_route_generation\":" + std::to_string(ws->audio_route_applied.load()) +
+                  ",\"video_bwe_route_generation\":" + std::to_string(ws->video_route_applied.load());
+
 #if defined(VEIL_MEDIA_CC_TRACE)
       if (veil_media::video_cc_trace_enabled())
         snapshot += ",\"video_cc_stats_at_us\":" +

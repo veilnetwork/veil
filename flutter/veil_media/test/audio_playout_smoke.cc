@@ -182,7 +182,7 @@ static uint64_t metric(VeilMediaEngine* e, const char* name) {
   veil_media_free_string(json); return value;
 }
 
-static void verify_live_framing() {
+static void verify_live_framing(bool handover = false) {
   charged_link = true;
   live_framing = true;
   charged_phase_ticks = 1200;
@@ -235,6 +235,12 @@ static void verify_live_framing() {
     if (tick == 1200 || tick == 2400) {
       // Keep the exact same engine/SSRC and use the public ABI after start.
       // A stats-only implementation cannot pass the packet-duration/PCM gates.
+      if (handover) {
+        const uint64_t next = 200 + phase;
+        assert(veil_media_engine_rebind_channel_keep_receiver(source.get(), next) == VEIL_MEDIA_OK);
+        std::lock_guard lock(mu);
+        source_channel = next;
+      }
       assert(veil_media_engine_set_audio_packet_overhead(source.get(), overhead) == VEIL_MEDIA_OK);
       assert(veil_media_test_audio_transport_overhead(source.get()) == overhead);
       assert(veil_media_test_video_transport_overhead(source.get()) == video_overhead);
@@ -283,6 +289,7 @@ static void verify_live_framing() {
                                    [&](double at) { return at >= sent; });
     assert(found != rendered_edges.end());
     max_marker_ms = std::max(max_marker_ms, *found - sent);
+    std::printf("framing marker handover=%d sent_ms=%.3f latency_ms=%.3f\n", handover, sent, *found - sent);
   }
   std::printf("live framing: voiced=%zu/%zu/%zu settled_duration_matches=%zu/%zu/%zu "
               "observations=%zu/%zu/%zu marker_max_ms=%.3f lateness=%.3f "
@@ -291,6 +298,8 @@ static void verify_live_framing() {
       duration_matches[2], observations[0], observations[1], observations[2],
       max_marker_ms, max_lateness, drops_by_phase[0], drops_by_phase[1],
       drops_by_phase[2], settled_drops[0], settled_drops[1], settled_drops[2]);
+  std::fflush(stdout);
+  std::printf("framing queues max_ms=%.3f/%.3f/%.3f\n", charged_queue_max_ms[0], charged_queue_max_ms[1], charged_queue_max_ms[2]);
   std::fflush(stdout);
   assert(max_lateness < 30 && max_marker_ms < 200);
   for (size_t phase = 0; phase < 3; ++phase) {
@@ -303,7 +312,7 @@ static void verify_live_framing() {
   bool seen = false;
   uint16_t last = 0;
   for (const auto& packet : source_packets) {
-    if (packet[4] != 200) continue;
+    if (!handover_sources.contains(static_cast<uint64_t>(packet[4]))) continue;
     const auto sequence = static_cast<uint16_t>(packet[1]);
     if (seen) assert(sequence == static_cast<uint16_t>(last + 1));
     last = sequence;
@@ -999,6 +1008,9 @@ static void verify_long_packets(bool jitter) {
 }
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--live-framing-handover") == 0) {
+    verify_live_framing(true); return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--live-framing") == 0) {
     verify_live_framing(); return 0;
   }

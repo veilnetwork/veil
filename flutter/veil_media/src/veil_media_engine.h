@@ -69,6 +69,11 @@ void veil_media_engine_destroy(VeilMediaEngine *engine);
  * for the SAME logical call/peer/key material. The old channel stays caller-
  * owned. On failure it remains active; on success its callback is unregistered.
  * Does not recreate audio/video streams, reset RTP or stop capture/playout. */
+/* A committed new channel also advances each local congestion controller's
+ * opaque path identity, preserving streams/SSRCs and receive buffers. Failed
+ * and idempotent candidates do not. Estimator work has independent audio/video
+ * scheduling bounds (50/20 ms); a busy worker retries on get_stats. Stats expose
+ * media_route_generation and audio/video_bwe_route_generation locally only. */
 int veil_media_engine_rebind_channel(VeilMediaEngine *engine, uint64_t veil_chan);
 
 /* Same call/key contract as rebind_channel, retaining the previous inbound
