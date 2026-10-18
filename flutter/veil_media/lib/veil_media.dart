@@ -234,6 +234,8 @@ class VeilMediaEngine {
 
   /// Account for transport framing below RTP and enable adaptive Opus packet
   /// duration before starting audio/video. RTP overhead is added by WebRTC.
+  /// Once enabled, a positive hint can be updated during a route change while
+  /// preserving the streams. Older native builds reject updates after start.
   /// Returns false for engines without the optional native adaptation support.
   bool setAudioPacketOverhead(int bytes) {
     _ensure();

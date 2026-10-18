@@ -72,6 +72,40 @@ static int check_framing_budget() {
     std::printf("ok: framing=%d RTP=%zu ceiling=%d, actual Opus %d/60/%d ms\n",
         route_overhead, rtp.headers_size(), ceiling, healthy_duration, healthy_duration);
   }
+  // Live framing changes on ONE encoder. Decode the actual Opus packet's
+  // duration: a changed atomic hint or requested next duration cannot pass.
+  webrtc::SimulatedClock clock(0);
+  const auto env = webrtc::CreateEnvironment(&clock);
+  auto factory = webrtc::make_ref_counted<veil_media::BoundedAudioEncoderFactory>();
+  auto encoder = factory->Create(env, webrtc::SdpAudioFormat("opus", 48000, 2,
+      {{"minptime", "20"}, {"maxptime", "60"}, {"stereo", "0"},
+       {"useinbandfec", "1"}, {"usedtx", "1"}}), {.payload_type = 111});
+  if (!encoder) return 28;
+  encoder->SetReceiverFrameLengthRange(20, 60);
+  if (!encoder->EnableAudioNetworkAdaptor(veil_media::kFramingAudioAdaptorConfig)) return 29;
+  uint32_t timestamp = 0;
+  std::array<int16_t, 480> pcm{};
+  for (const auto& profile : std::array<std::array<int, 2>, 3>{{
+           {209, 20}, {360, 40}, {209, 20}}}) {
+    encoder->OnReceivedOverhead(profile[0] + rtp.headers_size());
+    int verified = 0;
+    for (int block = 0; block < 600; ++block) {
+      webrtc::BitrateAllocationUpdate update;
+      update.target_bitrate = webrtc::DataRate::BitsPerSec(160000);
+      encoder->OnReceivedUplinkAllocation(update);
+      webrtc::Buffer packet;
+      const auto info = encoder->Encode(timestamp, pcm, &packet);
+      if (encoder->GetTargetBitrate() < 24000 || encoder->GetTargetBitrate() > 32000) return 30;
+      if (block >= 400 && info.encoded_bytes) {
+        if (opus_packet_get_nb_samples(packet.data(), packet.size(), 48000) / 48 != profile[1]) return 31;
+        ++verified;
+      }
+      timestamp += 480;
+      clock.AdvanceTimeMilliseconds(10);
+    }
+    if (verified < 2) return 32;
+  }
+  std::puts("ok: one live Opus encoder, framing 209/360/209, actual packets 20/40/20 ms, payload 24..32 kbit/s");
   return 0;
 }
 

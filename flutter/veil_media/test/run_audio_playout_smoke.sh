@@ -13,6 +13,7 @@ if [ "$#" -gt 0 ]; then
   exit
 fi
 "$STAND_DIR/smoke" --adaptive-bitrate
+"$STAND_DIR/smoke" --live-framing
 "$STAND_DIR/smoke" --silence
 "$STAND_DIR/smoke" --padding-liveness
 "$STAND_DIR/smoke" --silence-after-jitter
