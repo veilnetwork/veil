@@ -270,6 +270,90 @@ mod local_work_tests {
         assert_eq!(queue.drops_total(), 2);
         assert!(queue.is_empty());
     }
+
+    #[test]
+    fn cancelled_ingress_does_not_evict_live_work_from_a_full_class() {
+        let work = LocalLossyWork::new(vec![100]).unwrap();
+        let mut queue = PriorityQueue::with_default_weights();
+        for _ in 0..LOSSY_REALTIME_MAX_DEPTH {
+            queue.push_lossy(BULK, veil_bufpool::pooled_shared_from_vec(vec![42; 100]));
+        }
+        work.cell(0).unwrap().reject();
+        queue.push_envelope(envelope(&work, 0), true);
+        assert_eq!(queue.drops_total(), 1);
+        assert_eq!(queue.len(), LOSSY_REALTIME_MAX_DEPTH);
+        while let Some(frame) = queue.pop() {
+            assert_eq!(frame[0], 42);
+        }
+        assert_eq!(
+            queue.drops_total(),
+            1,
+            "only cancelled ingress is discarded"
+        );
+    }
+
+    #[test]
+    fn cancelled_tail_releases_capacity_before_a_live_head_is_shed() {
+        for aggregate in [false, true] {
+            let cap = if aggregate {
+                2
+            } else {
+                LOSSY_REALTIME_MAX_DEPTH
+            };
+            let mut queue = PriorityQueue::with_capacity(DEFAULT_WEIGHTS, cap);
+            let work = LocalLossyWork::new(vec![100]).unwrap();
+            for _ in 0..cap - 1 {
+                queue.push_lossy(BULK, veil_bufpool::pooled_shared_from_vec(vec![42; 100]));
+            }
+            queue.push_envelope(envelope(&work, 0), true);
+            work.cell(0).unwrap().reject();
+            queue.push_lossy(BULK, veil_bufpool::pooled_shared_from_vec(vec![43; 100]));
+            assert_eq!(queue.len(), cap);
+            assert_eq!(queue.drops_total(), 1);
+            for _ in 0..cap - 1 {
+                assert_eq!(queue.pop().unwrap()[0], 42, "live FIFO head must survive");
+            }
+            assert_eq!(queue.pop().unwrap()[0], 43);
+            assert!(queue.is_empty());
+            assert_eq!(queue.drops_total(), 1);
+        }
+    }
+
+    #[test]
+    fn cancelled_restore_does_not_reoccupy_a_queue_slot() {
+        let work = LocalLossyWork::new(vec![100]).unwrap();
+        let mut queue = PriorityQueue::with_default_weights();
+        queue.push_envelope(envelope(&work, 0), true);
+        let popped = queue.pop_local_datagram_lane_if(|_, _| true).unwrap();
+        work.cell(0).unwrap().reject();
+        queue.restore_lossy_envelope(popped);
+        assert!(queue.is_empty());
+        assert_eq!(queue.drops_total(), 1);
+    }
+
+    #[test]
+    fn shedding_a_sibling_does_not_enqueue_its_now_cancelled_member() {
+        for aggregate in [false, true] {
+            let work = LocalLossyWork::new(vec![100; 2]).unwrap();
+            let mut queue = PriorityQueue::with_capacity(
+                DEFAULT_WEIGHTS,
+                if aggregate { 1 } else { DEFAULT_MAX_DEPTH },
+            );
+            queue.push_envelope(envelope(&work, 0), true);
+            if !aggregate {
+                for _ in 1..LOSSY_REALTIME_MAX_DEPTH {
+                    queue.push_lossy(BULK, veil_bufpool::pooled_shared_from_vec(vec![42; 100]));
+                }
+            }
+            queue.push_envelope(envelope(&work, 1), true);
+            assert!(work.cell(0).unwrap().rejected());
+            assert_eq!(queue.drops_total(), 2);
+            while let Some(frame) = queue.pop() {
+                assert_eq!(frame[0], 42);
+            }
+            assert_eq!(queue.drops_total(), 2);
+        }
+    }
 }
 
 // ── PriorityQueue ─────────────────────────────────────────────────────────────
@@ -382,7 +466,64 @@ impl PriorityQueue {
         }
     }
 
+    /// Rejected local work cannot evict a useful frame or retain queue credit.
+    /// Transit has no local work handle; this does not change its admission.
+    fn discard_rejected_envelope(
+        &self,
+        envelope: &crate::frame_outbox::FrameEnvelope,
+        lossy: bool,
+    ) -> bool {
+        if !envelope
+            .local_work
+            .as_ref()
+            .is_some_and(|work| work.rejected())
+        {
+            return false;
+        }
+        if lossy && envelope.carrier.is_none() {
+            crate::local_lossy_trace::cell(
+                "queue_work_rejected",
+                envelope.frame.0,
+                &envelope.frame.1,
+            );
+        }
+        self.drops_total.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Only scan when capacity is exhausted. Preserve every live entry's FIFO
+    /// position, including reliable entries ahead of a cancelled local tail.
+    fn prune_rejected_work(&mut self, p: usize) {
+        let priority = match p {
+            4 => veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
+            5 => LOCAL_NETWORK_CONTROL_LANE,
+            6 => LOCAL_SIGNALING_LANE,
+            _ => p as u8,
+        };
+        let mut removed = 0;
+        let mut removed_lossy = 0;
+        self.queues[p].retain(|queued| {
+            if queued
+                .local_work
+                .as_ref()
+                .is_some_and(|work| work.rejected())
+            {
+                queued.trace_lossy_drop(priority, "queue_expired");
+                removed += 1;
+                removed_lossy += usize::from(queued.lossy_realtime);
+                false
+            } else {
+                true
+            }
+        });
+        self.lossy_realtime_len[p] -= removed_lossy;
+        self.drops_total.fetch_add(removed, Ordering::Relaxed);
+    }
+
     fn push_lossy_with_carrier(&mut self, envelope: crate::frame_outbox::FrameEnvelope) {
+        if self.discard_rejected_envelope(&envelope, true) {
+            return;
+        }
         let (priority, ref frame) = envelope.frame;
         // Carry the complete envelope through admission so reservations,
         // ownership and original deadlines cannot drift between helpers.
@@ -405,6 +546,9 @@ impl PriorityQueue {
         // At capacity drop the oldest lossy entry of THIS class, preserving
         // its reliable FIFO entries and every other producer's pending work.
         if self.lossy_realtime_len[p] >= LOSSY_REALTIME_MAX_DEPTH {
+            self.prune_rejected_work(p);
+        }
+        if self.lossy_realtime_len[p] >= LOSSY_REALTIME_MAX_DEPTH {
             let index = self.queues[p]
                 .iter()
                 .position(|queued| queued.lossy_realtime)
@@ -424,6 +568,16 @@ impl PriorityQueue {
         envelope: crate::frame_outbox::FrameEnvelope,
         enqueued_at: Option<Instant>,
     ) {
+        let lossy_realtime = enqueued_at.is_some();
+        // Class-cap shedding may itself cancel another member of this work.
+        if self.discard_rejected_envelope(&envelope, lossy_realtime) {
+            return;
+        }
+        if self.len() >= self.max_depth {
+            for p in 0..LOCAL_QUEUE_COUNT {
+                self.prune_rejected_work(p);
+            }
+        }
         let crate::frame_outbox::FrameEnvelope {
             frame: (priority, frame),
             carrier,
@@ -433,7 +587,6 @@ impl PriorityQueue {
             expires_at,
             ..
         } = envelope;
-        let lossy_realtime = enqueued_at.is_some();
         let p = queue_index(priority);
         // Endpoint-owned reliable entries retain bounded source credits. They
         // cannot be shed after successful admission. Their independent budget
@@ -486,6 +639,14 @@ impl PriorityQueue {
                 self.drops_total.fetch_add(1, Ordering::Relaxed);
                 return;
             }
+        }
+        // Aggregate-cap shedding can reject a sibling after the ingress check.
+        if local_work.as_ref().is_some_and(|work| work.rejected()) {
+            if lossy_realtime && carrier.is_none() {
+                crate::local_lossy_trace::cell("queue_work_rejected", priority, &frame);
+            }
+            self.drops_total.fetch_add(1, Ordering::Relaxed);
+            return;
         }
         self.queues[p].push_back(QueuedFrame {
             frame,
@@ -690,6 +851,9 @@ impl PriorityQueue {
     /// Restore the exact popped datagram without renewing its lifetime or
     /// losing its return carrier. No producer runs between pop and restore.
     pub(crate) fn restore_lossy_envelope(&mut self, envelope: crate::frame_outbox::FrameEnvelope) {
+        if self.discard_rejected_envelope(&envelope, true) {
+            return;
+        }
         if envelope.expires_at.is_some_and(|at| Instant::now() >= at)
             || envelope.queued_at.elapsed() > lossy_realtime_max_age(envelope.frame.0)
         {
