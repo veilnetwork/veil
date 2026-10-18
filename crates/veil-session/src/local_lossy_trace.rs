@@ -100,8 +100,8 @@ pub(crate) fn work_release(
         return;
     }
     log::info!(target: "veil::source_work_release",
-        "at_unix_us={} connection_trace_id={connection_trace_id} local_slot={priority} epoch={epoch:016x} seq={seq} cell={} cells={} sealed_bytes={} envelope_work_bytes={} envelope_cell_bytes={} span_us={} admission_age_us={} remaining_us={} datagram_cell_bytes={datagram_bytes}",
-        unix_us(), snapshot.index, snapshot.cells, snapshot.sealed_bytes,
+        "at_unix_us={} monotonic_us={} connection_trace_id={connection_trace_id} local_slot={priority} epoch={epoch:016x} seq={seq} cell={} cells={} sealed_bytes={} envelope_work_bytes={} envelope_cell_bytes={} span_us={} admission_age_us={} remaining_us={} datagram_cell_bytes={datagram_bytes}",
+        unix_us(), veil_util::diagnostic_clock::monotonic_us().map_or(-1, i128::from), snapshot.index, snapshot.cells, snapshot.sealed_bytes,
         snapshot.envelope_wire_bytes,
         frame.len().saturating_add(veil_crypto::session_cipher::AEAD_OVERHEAD),
         snapshot.span.as_micros(),
@@ -148,6 +148,25 @@ fn owned_primary_cell(priority: u8, frame: &[u8]) -> Option<(u64, u64)> {
 }
 
 pub(crate) fn cell(stage: &'static str, priority: u8, frame: &[u8]) {
+    record_cell(stage, priority, frame, 0);
+}
+
+/// A complete owned primary frame was accepted by the local DATAGRAM handle.
+/// This remains a queue observation, not a NIC-send or peer-delivery promise.
+/// Ordinary sparse RT tracing does not enable this additional observation.
+pub(crate) fn datagram_accepted(priority: u8, frame: &[u8], connection_trace_id: u64) {
+    if accepted_cell(enabled(), priority, frame).is_some() {
+        record_cell("datagram_accepted", priority, frame, connection_trace_id);
+    }
+}
+
+fn accepted_cell(detailed: bool, priority: u8, frame: &[u8]) -> Option<(u64, u64)> {
+    detailed
+        .then(|| owned_primary_cell(priority, frame))
+        .flatten()
+}
+
+fn record_cell(stage: &'static str, priority: u8, frame: &[u8], connection_trace_id: u64) {
     let primary = priority == veil_proto::priority::REALTIME
         && (crate::rt_trace::rt_trace_enabled() || enabled());
     let sample = if primary {
@@ -177,8 +196,9 @@ pub(crate) fn cell(stage: &'static str, priority: u8, frame: &[u8]) {
         // owned endpoint establish the source; no role is inferred at a relay.
         let digest = veil_util::hex_str(&Sha256::digest(&body[..body.len().min(256)]));
         log::info!(
-            "media.source_cell_trace at_unix_us={} stage={stage} local_slot={priority} epoch={epoch:016x} seq={sequence} wire_bytes={} family={family} msg_type={kind} body_len={} body_preview_sha256={digest}",
+            "media.source_cell_trace at_unix_us={} monotonic_us={} stage={stage} connection_trace_id={connection_trace_id} local_slot={priority} epoch={epoch:016x} seq={sequence} wire_bytes={} family={family} msg_type={kind} body_len={} body_preview_sha256={digest}",
             unix_us(),
+            veil_util::diagnostic_clock::monotonic_us().map_or(-1, i128::from),
             frame
                 .len()
                 .saturating_add(veil_crypto::session_cipher::AEAD_OVERHEAD),
@@ -400,6 +420,31 @@ mod tests {
         extra.push(0);
         assert_eq!(
             owned_primary_cell(veil_proto::priority::REALTIME, &extra),
+            None
+        );
+    }
+
+    #[test]
+    fn transport_acceptance_requires_explicit_trace_and_local_primary_ownership() {
+        let frame = forward(SEQUENCE_LIMIT + 50);
+        assert_eq!(
+            accepted_cell(false, veil_proto::priority::REALTIME, &frame),
+            None
+        );
+        assert_eq!(
+            accepted_cell(true, veil_proto::priority::REALTIME, &frame),
+            Some((7, SEQUENCE_LIMIT + 50))
+        );
+        for priority in [
+            veil_proto::priority::INTERACTIVE,
+            veil_proto::priority::BULK,
+            veil_proto::priority::BACKGROUND,
+            veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
+        ] {
+            assert_eq!(accepted_cell(true, priority, &frame), None);
+        }
+        assert_eq!(
+            accepted_cell(true, veil_proto::priority::REALTIME, &frame[..35]),
             None
         );
     }
