@@ -11,6 +11,7 @@ clang++ -std=c++20 -Wall -Wextra -Werror -Wl,-export_dynamic \
   "$STAND_DIR/libveil_media.dylib" -Wl,-rpath,"$STAND_DIR" -o "$STAND_DIR/smoke"
 "$STAND_DIR/smoke" "$@"
 if [ "$#" -eq 0 ]; then
+  "$STAND_DIR/smoke" --bwe-handover
   "$STAND_DIR/smoke" --rtcp-loss
   "$STAND_DIR/smoke" --group-rtcp-accounting
   "$STAND_DIR/smoke" --group-remb-cadence

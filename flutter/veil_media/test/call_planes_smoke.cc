@@ -17,6 +17,8 @@
 #include <vector>
 
 using Injector = int (*)(void*, uint64_t, uint32_t, uint32_t);
+extern "C" int veil_media_test_route_restarts(VeilMediaEngine*, int);
+extern "C" int veil_media_test_with_held_video_worker(VeilMediaEngine*, int (*)(void*), void*);
 extern "C" int veil_media_test_direct_call_planes(VeilMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_blocked_audio_stats(VeilMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_muted_capture_lifecycle();
@@ -87,6 +89,7 @@ extern "C" int veil_media_send_video_control_datagram(uint64_t chan, const uint8
 extern "C" int veil_media_set_recv_callback(
     uint64_t chan, void (*cb)(void*, const uint8_t*, size_t), void* ctx) {
   std::lock_guard lock(callback_mu);
+  if (cb && rejected_channels.contains(chan)) return -1;
   if (cb) callbacks[chan] = {cb, ctx};
   else callbacks.erase(chan);
   return 0;
@@ -509,6 +512,64 @@ int main(int argc, char** argv) {
     assert(group_stat(room.get(), "audio_feedback_reports") == 2);
     assert(second > first);
     std::puts("RTCP loss: RR/SR, sub-percent, stream binding, cache, compound and room expiry verified");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bwe-handover") == 0) {
+    setenv("VEIL_MEDIA_TEST_ROUTE_OBSERVER", "1", 1);
+    uint8_t local[32] = {0x75}, peer[32] = {0x76};
+    setenv("VEIL_MEDIA_TEST_VIDEO", "1", 1);
+    std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(
+        veil_media_test_dual_overhead_codec_create(99, local, peer, 509, 536),
+        veil_media_engine_destroy);
+    assert(e);
+    assert(veil_media_engine_start_video(e.get(), 1, 1, 150, 15) == VEIL_MEDIA_OK);
+    auto check = [&](int audio, int video) {
+      char* stats = veil_media_engine_get_stats(e.get());
+      assert(stats); veil_media_free_string(stats);
+      const int a = veil_media_test_route_restarts(e.get(), 0);
+      const int v = veil_media_test_route_restarts(e.get(), 1);
+      std::fprintf(stderr, "BWE route callbacks audio=%d video=%d expected=%d/%d\n", a, v, audio, video);
+      assert(a == audio && v == video);
+    };
+    check(0, 0);
+    assert(veil_media_engine_set_audio_packet_overhead(e.get(), 360) == VEIL_MEDIA_OK);
+    check(0, 0);  // Framing correction does not invent another network path.
+    assert(veil_media_engine_rebind_channel(e.get(), 99) == VEIL_MEDIA_OK);
+    { std::lock_guard lock(callback_mu); rejected_channels.insert(999); }
+    assert(veil_media_engine_rebind_channel(e.get(), 999) != VEIL_MEDIA_OK);
+    check(0, 0);
+    assert(veil_media_engine_rebind_channel(e.get(), 100) == VEIL_MEDIA_OK);
+    check(1, 1);  // Real controller notifications, not echoed host generations.
+    assert(veil_media_engine_set_audio_packet_overhead(e.get(), 209) == VEIL_MEDIA_OK);
+    assert(veil_media_engine_set_video_bitrate(e.get(), 90, 6) == VEIL_MEDIA_OK);
+    check(1, 1);
+    assert(veil_media_test_video_transport_overhead(e.get()) == 536);
+    assert(veil_media_test_audio_transport_overhead(e.get()) == 209);
+    const auto blocked_video = [](void* context) {
+      auto* engine = static_cast<VeilMediaEngine*>(context);
+      const auto start = std::chrono::steady_clock::now();
+      assert(veil_media_engine_rebind_channel_keep_receiver(engine, 101) == VEIL_MEDIA_OK);
+      assert(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(200));
+      assert(veil_media_test_route_restarts(engine, 0) == 2);
+      assert(veil_media_test_route_restarts(engine, 1) == 1);
+      return 0;
+    };
+    assert(veil_media_test_with_held_video_worker(e.get(), blocked_video, e.get()) == 0);
+    check(2, 2);  // A pending video update retries once its own queue recovers.
+    const auto blocked_both = [](void* context, uint64_t, uint32_t, uint32_t) {
+      auto* engine = static_cast<VeilMediaEngine*>(context);
+      const auto start = std::chrono::steady_clock::now();
+      assert(veil_media_engine_rebind_channel(engine, 102) == VEIL_MEDIA_OK);
+      assert(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(200));
+      assert(veil_media_test_route_restarts(engine, 0) == 2);
+      assert(veil_media_test_route_restarts(engine, 1) == 2);
+      return 0;
+    };
+    assert(veil_media_test_blocked_audio_stats(e.get(), blocked_both, e.get()) == 0);
+    check(3, 3); check(3, 3);
+    assert(veil_media_engine_rebind_channel(e.get(), 102) == VEIL_MEDIA_OK);
+    check(3, 3);
+    std::fputs("BWE handover: independent real controllers reset once per committed path; framing and failed/idempotent candidates do not reset; blocked video cannot stall audio\n", stderr);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--dual-framing") == 0) {
