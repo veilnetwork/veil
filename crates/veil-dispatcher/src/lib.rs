@@ -1608,6 +1608,23 @@ impl FrameDispatcher {
     /// `frame` must be a complete OVL1 frame (header + body). If no capture
     /// subscriber is active this is a no-op.
     pub fn capture_outbound(&self, peer_id: impl Into<NodeId>, frame: &[u8]) {
+        let peer_id = if veil_session::opaque_forward_trace::enabled() {
+            let peer_id: NodeId = peer_id.into();
+            veil_session::opaque_forward_trace::selected(
+                &self.local_node_id,
+                peer_id.as_bytes(),
+                frame,
+            );
+            peer_id
+        } else {
+            if !self
+                .capture_active
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return;
+            }
+            peer_id.into()
+        };
         if !self
             .capture_active
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1615,7 +1632,6 @@ impl FrameDispatcher {
             return;
         }
         // H9 ergonomic accept: see `dispatch()` for rationale.
-        let peer_id: NodeId = peer_id.into();
         // per-peer rate limit on capture
         // emission. Drops events past 100/s/peer; the cap protects
         // the broadcast channel under chat-node load (10K pkt/s ×
@@ -1697,6 +1713,12 @@ impl FrameDispatcher {
         // call site. The conversion happens once here at the top
         // of the body; the rest of the fn works with the typed `NodeId`.
         let peer_id: NodeId = peer_id.into();
+        let _opaque_trace = veil_session::opaque_forward_trace::receive(
+            &self.local_node_id,
+            peer_id.as_bytes(),
+            header,
+            body,
+        );
         // ── Live capture ──────────────────────────────────────────
         // Fast-path: skip the mutex entirely when no capture subscriber is active.
         // rate-limited per peer (100/s) and body

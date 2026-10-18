@@ -37,6 +37,7 @@ pub mod keepalive_emit;
 pub mod manager;
 pub mod mlkem_rekey_context;
 pub mod once_trigger;
+pub mod opaque_forward_trace;
 pub mod outbound_batch_coalescer;
 pub mod outbox;
 pub mod parallel_binding;
