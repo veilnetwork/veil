@@ -16,6 +16,7 @@ static ROWS: AtomicU64 = AtomicU64::new(0);
 static ACCEPTED_ROWS: AtomicU64 = AtomicU64::new(0);
 const WORK_ROW_LIMIT: u64 = 16_384;
 static WORK_ROWS: AtomicU64 = AtomicU64::new(0);
+static ADMISSION_ROWS: AtomicU64 = AtomicU64::new(0);
 
 fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("VEIL_DIAG_SOURCE_CELLS").is_ok_and(|v| v == "1"))
@@ -70,6 +71,50 @@ fn owned_secondary_header(priority: u8, frame: &[u8]) -> Option<(u64, u64)> {
         return None;
     }
     owned_frame_header(frame)
+}
+
+/// Preserve the actual admission result before the caller cancels a denied
+/// DATAGRAM work item. Wait (credit unavailable) and Rejected (including a
+/// release span that no longer fits) must not collapse into one guessed cause.
+pub(crate) fn work_admission(
+    work: &veil_types::local_lossy_work::LocalLossyCell,
+    priority: u8,
+    frame: &[u8],
+    decision: &veil_types::local_lossy_work::WorkAdmission,
+    attempted_at: std::time::Instant,
+) {
+    use veil_types::local_lossy_work::WorkAdmission;
+    if matches!(decision, WorkAdmission::Admitted) || !enabled() {
+        return;
+    }
+    let Some((epoch, sequence)) = owned_secondary_header(priority, frame) else {
+        return;
+    };
+    let row = ADMISSION_ROWS.fetch_add(1, Ordering::Relaxed);
+    if row == ROW_LIMIT {
+        log::info!("media.source_admission_trace_limit rows={ROW_LIMIT}");
+    }
+    if row >= ROW_LIMIT {
+        return;
+    }
+    let (result, retry_us) = match decision {
+        WorkAdmission::Admitted => unreachable!(),
+        WorkAdmission::Wait(until) => (
+            "wait",
+            until.saturating_duration_since(attempted_at).as_micros() as i128,
+        ),
+        WorkAdmission::Rejected => ("rejected", -1),
+    };
+    let span_us = work.pacing_span().map_or(-1, |d| d.as_micros() as i128);
+    let remaining_us = work.expires_at().map_or(-1, |until| {
+        until.saturating_duration_since(attempted_at).as_micros() as i128
+    });
+    log::info!(
+        "media.source_admission_trace at_unix_us={} monotonic_us={} local_slot={priority} epoch={epoch:016x} seq={sequence} result={result} retry_us={retry_us} span_us={span_us} remaining_us={remaining_us} attempt_elapsed_us={}",
+        unix_us(),
+        veil_util::diagnostic_clock::monotonic_us().map_or(-1, i128::from),
+        attempted_at.elapsed().as_micros(),
+    );
 }
 
 /// First/last owned members accepted by the local DATAGRAM transport. This is

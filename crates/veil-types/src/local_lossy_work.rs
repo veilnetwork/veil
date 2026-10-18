@@ -257,6 +257,12 @@ impl LocalLossyCell {
         self.work.pacing.as_ref().map(|p| p.expires_at)
     }
 
+    /// Immutable local release span, including zero for a single-cell work.
+    /// Reading it never reserves credit, rejects work or renews its deadline.
+    pub fn pacing_span(&self) -> Option<Duration> {
+        self.work.pacing.as_ref().map(|p| p.span)
+    }
+
     pub fn reject(&self) {
         *self.work.decision.lock().unwrap_or_else(|p| p.into_inner()) = Decision::Rejected;
     }
