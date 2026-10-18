@@ -524,6 +524,21 @@ extern "C" int veil_media_test_audio_transport_budget(VeilMediaEngine* e,
   }) ? VEIL_MEDIA_OK : VEIL_MEDIA_ERR_STATE;
 }
 
+// Keep the network allocation fixed while testing framing changes. This is
+// separate from the upper-bound hook above: real GCC is otherwise allowed to
+// lower the estimate, making a 40-ms packet on a recovered route legitimate.
+extern "C" int veil_media_test_audio_fixed_transport_budget(VeilMediaEngine* e,
+                                                            int bitrate_bps) {
+  if (!e || !e->ws || bitrate_bps < 6000) return VEIL_MEDIA_ERR_ARG;
+  webrtc::BitrateSettings settings;
+  settings.min_bitrate_bps = bitrate_bps;
+  settings.start_bitrate_bps = bitrate_bps;
+  settings.max_bitrate_bps = bitrate_bps;
+  return run_on(e->ws->worker_tq.get(), [&] {
+    e->ws->call->SetClientBitratePreferences(settings);
+  }) ? VEIL_MEDIA_OK : VEIL_MEDIA_ERR_STATE;
+}
+
 extern "C" int veil_media_test_audio_playout_pcm(
     VeilMediaEngine* e, int16_t* pcm, size_t capacity) {
   if (!e || !e->ws || !pcm || capacity < 480) return VEIL_MEDIA_ERR_ARG;
