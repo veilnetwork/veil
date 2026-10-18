@@ -2,6 +2,28 @@
 // The actual sender offset supplies an exact encoder/RTP join, not a guessed
 // alignment between two regular packet sequences. This hook never sends data.
 #pragma GCC visibility push(default)
+extern "C" int veil_media_test_route_restarts(VeilMediaEngine* e, int video) {
+  if (!e || !e->ws) return -1;
+  return (video ? e->ws->video_route_restarts : e->ws->audio_route_restarts)->load();
+}
+extern "C" int veil_media_test_with_held_video_worker(
+    VeilMediaEngine* e, int (*check)(void*), void* context) {
+  struct Hold { std::atomic<bool> entered{false}, release{false}; };
+  auto hold = std::make_shared<Hold>();
+  e->ws->video_worker_tq->PostTask([hold] {
+    hold->entered.store(true);
+    while (!hold->release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!hold->entered.load()) {
+    if (std::chrono::steady_clock::now() >= deadline) { hold->release.store(true); return -1; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const int result = check(context);
+  hold->release.store(true);
+  return result;
+}
+
 extern "C" char* veil_media_test_group_audio_send_stats(VeilGroupMediaEngine* e) {
   if (!e || !e->ws) return nullptr;
   webrtc::AudioSendStream::Stats sample;
