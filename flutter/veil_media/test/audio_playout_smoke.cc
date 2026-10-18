@@ -44,6 +44,7 @@ static std::vector<std::array<long long,5>> source_packets;
 static std::array<size_t,3> packets_by_phase{},drops_by_phase{},wire_bytes_by_phase{},control_drops{},control_admissions{};
 static std::array<std::map<int,size_t>,3> submitted_rtp_types;
 static bool perfect_network = false;
+static bool packetization_jitter = false;
 static bool duplex_feedback = false;
 static bool handover_network = false;
 static bool delivery_stall = false;
@@ -103,7 +104,10 @@ extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t 
   const double at = milliseconds(now);
   // Exercise both a short burst and repeated bursts across ten seconds.
   // Each is followed by a healthy path; PCM must shed the old playout tail.
-  const int delay = !perfect_network && at >= (mature_jitter ? 70000 : 2000) &&
+  // Lossless bounded reordering for long Opus packets, distinct from stalls.
+  const int delay = packetization_jitter
+      ? (static_cast<int>(at) / 200 % 2 ? 140 : 40)
+      : !perfect_network && at >= (mature_jitter ? 70000 : 2000) &&
       at < (mature_jitter ? 80000 : recurring_jitter ? 12000 : 4000)
       ? (static_cast<int>(at) / 200 % 2 ? 300 : 40) : 40;
   ++sent_packets;
@@ -546,9 +550,15 @@ static void verify_delivery_stall(bool drop) {
     assert(drop ? dropped > 150 && batch < 10
                 : dropped == 0 && batch > 100);
     assert(recovered && recovered_ticks > 290);
-    // A real backlog must still be visible to the adaptation loop; replacing
-    // the invalid RTP-span estimate must not hide delay with a fixed ceiling.
-    if (!drop) assert(max_buffer > 300 && max_delay > 300);
+    // Catch-up runs before these post-render gauges are sampled. A >2-s
+    // released batch need not survive as a >300-ms playout buffer. Require
+    // actual discarded decoded audio as well as the PCM recovery above;
+    // clamping only a gauge cannot satisfy these checks.
+    if (!drop) {
+      assert(metric(receiver.get(), "audio_latency_recovery_count") > 0);
+      assert(metric(receiver.get(), "audio_latency_discarded_ms") > 200);
+      assert(max_buffer < 300 && max_delay < 300);
+    }
   }
   { std::lock_guard lock(mu); assert(callbacks.empty()); }
 }
@@ -725,7 +735,141 @@ static void verify_adaptive_encapsulation(bool source_pause = false,
   }
 }
 
+static void verify_long_packets(bool jitter) {
+  perfect_network = true;
+  packetization_jitter = jitter;
+  duplex_feedback = true;
+  // Production ANA/framing selects 60-ms Opus at this budget. No bandwidth
+  // queue or packet loss is injected: only 40/140-ms alternating delivery.
+  // Exercise 40 s speech, 40 s DTX, then 40 s resumed speech. A mere zero
+  // interruption counter misses the previous recurring trim/PLC failure.
+  const uint8_t local[32] = {1}, peer[32] = {2};
+  source_channel = 200;
+  receiver_channel = 300;
+  using Engine =
+      std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)>;
+  Engine receiver(veil_media_test_adaptive_codec_create(300, peer, local, 209),
+                  veil_media_engine_destroy);
+  Engine source(veil_media_test_adaptive_codec_create(200, local, peer, 209),
+                veil_media_engine_destroy);
+  assert(source && receiver);
+  assert(veil_media_test_audio_transport_budget(source.get(), 48000) == 0);
+  assert(veil_media_test_audio_transport_budget(receiver.get(), 48000) == 0);
+  origin = Clock::now();
+  std::array<int16_t, 480> pcm{};
+  std::array<size_t, 3> voiced{}, duration60{}, observations{};
+  std::array<uint64_t, 2> settled_discarded{}, settled_concealed{};
+  double max_lateness = 0;
+  std::vector<double> sent_edges, rendered_edges;
+  bool previous_high = false;
+  for (int tick = 0; tick < 12000; ++tick) {
+    std::this_thread::sleep_until(origin +
+                                  std::chrono::milliseconds(10 * tick));
+    max_lateness =
+        std::max(max_lateness, milliseconds(Clock::now()) - 10 * tick);
+    const int phase = tick / 4000;
+    const bool high = (tick / 100) % 2;
+    const int tone = phase == 1 ? 0 : high ? 1200 : 440;
+    if (phase != 1 && high && tick % 100 == 0)
+      sent_edges.push_back(milliseconds(Clock::now()));
+    assert(veil_media_test_audio_capture_tone(source.get(), tone) == 0);
+    assert(veil_media_test_audio_capture_tone(receiver.get(), 0) == 0);
+    deliver();
+    assert(veil_media_test_audio_playout_pcm(receiver.get(), pcm.data(),
+                                             pcm.size()) == 480);
+    double power = 0;
+    for (auto sample : pcm)
+      power += double(sample) * sample;
+    if (power / pcm.size() > 500 * 500)
+      ++voiced[phase];
+    int crossings = 0;
+    for (size_t i = 1; i < pcm.size(); ++i)
+      if ((pcm[i] > 0) != (pcm[i - 1] > 0))
+        ++crossings;
+    const bool rendered_high =
+        power / pcm.size() > 500 * 500 && crossings >= 17;
+    if (rendered_high && !previous_high)
+      rendered_edges.push_back(milliseconds(Clock::now()));
+    previous_high = rendered_high;
+    // Startup and DTX resumption may trim a short transient. Once each speech
+    // phase has settled, lossless bounded jitter must cause NO ongoing trim
+    // or PLC. Aggregate interruption counters alone missed the old failure.
+    if (tick == 500 || tick == 8500) {
+      const size_t phase_index = tick == 500 ? 0 : 1;
+      settled_discarded[phase_index] = metric(receiver.get(), "audio_latency_discarded_ms");
+      settled_concealed[phase_index] = metric(receiver.get(), "audio_concealed_samples");
+    }
+    if (tick == 3999 || tick == 11999) {
+      const size_t phase_index = tick == 3999 ? 0 : 1;
+      assert(metric(receiver.get(), "audio_latency_discarded_ms") == settled_discarded[phase_index]);
+      assert(metric(receiver.get(), "audio_concealed_samples") == settled_concealed[phase_index]);
+    }
+    if (tick % 100 == 0) {
+      ++observations[phase];
+      if (metric(source.get(), "audio_tx_packet_duration_ms") == 60)
+        ++duration60[phase];
+      std::printf(
+          "{\"tick\":%d,\"phase\":%d,\"packet_ms\":%llu,\"payload_bps\":%llu,"
+          "\"estimate_bps\":%llu,\"jb_ms\":%llu,\"target_ms\":%llu,"
+          "\"interruptions\":%llu,\"trim_ms\":%llu,\"concealed\":%llu,\"rtp_"
+          "tx\":%llu,\"rms\":%.1f}\n",
+          tick, phase,
+          (unsigned long long)metric(source.get(),
+                                     "audio_tx_packet_duration_ms"),
+          (unsigned long long)metric(source.get(), "audio_encoder_target_bps"),
+          (unsigned long long)metric(source.get(), "audio_send_bandwidth_bps"),
+          (unsigned long long)metric(receiver.get(), "audio_jb_ms"),
+          (unsigned long long)metric(receiver.get(), "audio_jb_target_ms"),
+          (unsigned long long)metric(receiver.get(),
+                                     "audio_interruption_count"),
+          (unsigned long long)metric(receiver.get(),
+                                     "audio_latency_discarded_ms"),
+          (unsigned long long)metric(receiver.get(), "audio_concealed_samples"),
+          (unsigned long long)metric(source.get(), "audio_tx_rtp_attempts"),
+          std::sqrt(power / pcm.size()));
+      std::fflush(stdout);
+    }
+  }
+  std::printf(
+      "long-packets result: voiced=%zu/%zu/%zu duration60=%zu/%zu/%zu "
+      "observations=%zu/%zu/%zu lateness=%.3f trim_ms=%llu "
+      "interruptions=%llu\n",
+      voiced[0], voiced[1], voiced[2], duration60[0], duration60[1],
+      duration60[2], observations[0], observations[1], observations[2],
+      max_lateness,
+      (unsigned long long)metric(receiver.get(), "audio_latency_discarded_ms"),
+      (unsigned long long)metric(receiver.get(), "audio_interruption_count"));
+  std::fflush(stdout);
+  std::printf("long-packets markers_ms=[");
+  for (size_t i = 0; i < sent_edges.size(); ++i) {
+    auto hit = std::find_if(
+        rendered_edges.begin(), rendered_edges.end(), [&](double value) {
+          return value >= sent_edges[i] && value < sent_edges[i] + 1500;
+        });
+    assert(hit != rendered_edges.end());
+    const double latency_ms = *hit - sent_edges[i];
+    std::printf("%s%.3f", i ? "," : "", latency_ms);
+    assert(latency_ms < 300);
+  }
+  std::puts("]");
+  std::fflush(stdout);
+  assert(max_lateness < 30);
+  assert(sent_edges.size() == 40);
+  assert(voiced[0] > 3900 && voiced[2] > 3900 && voiced[1] < 100);
+  assert(metric(receiver.get(), "audio_latency_discarded_ms") <= 400);
+  assert(metric(receiver.get(), "audio_concealed_samples") < 24000);
+  assert(metric(receiver.get(), "audio_interruption_count") == 0);
+  assert(duration60[0] >= 35 && duration60[1] >= 35 && duration60[2] >= 35);
+}
+
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--long-packets") == 0) {
+    verify_long_packets(false);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--long-packets-jitter") == 0) {
+    verify_long_packets(true); return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--characterize-adaptive-encapsulation-queue100") == 0) {
     verify_adaptive_encapsulation(false, true, 1200, 100);
     return 0;
