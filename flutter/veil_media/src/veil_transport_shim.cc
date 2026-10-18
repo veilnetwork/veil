@@ -402,7 +402,7 @@ bool VeilTransportShim::SendRtcpOnSource(std::span<const uint8_t> packet,
       ? veil_media_send_video_control_datagram(veil_chan_, packet.data(), packet.size())
       : veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
   if (rc == 0) {
-    if (group_rtcp_stats_) group_rtcp_stats_->Record(packet.size(), video);
+    if (group_rtcp_stats_) group_rtcp_stats_->Record(packet, video);
     if (video) {
       outbound_video_rtcp_packet_count_.fetch_add(1, std::memory_order_relaxed);
       outbound_video_rtcp_byte_count_.fetch_add(packet.size(), std::memory_order_relaxed);

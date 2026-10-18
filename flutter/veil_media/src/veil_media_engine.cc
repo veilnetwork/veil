@@ -429,7 +429,7 @@ class GroupFanoutTransport : public webrtc::Transport {
       const int rc = video
           ? veil_media_send_video_control_datagram(chan, packet.data(), packet.size())
           : veil_media_send_datagram(chan, packet.data(), packet.size());
-      if (rc == 0) rtcp_stats_->Record(packet.size(), video);
+      if (rc == 0) rtcp_stats_->Record(packet, video);
       any = rc == 0 || any;
     }
     return any;
@@ -2697,6 +2697,13 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               ",\"audio_rtcp_tx_bytes\":" + std::to_string(rtcp_send.audio_bytes) +
               ",\"video_rtcp_tx_pkts\":" + std::to_string(rtcp_send.video_packets) +
               ",\"video_rtcp_tx_bytes\":" + std::to_string(rtcp_send.video_bytes);
+  for (size_t plane = 0; plane < 2; ++plane) {
+    const std::string prefix = plane ? "video_rtcp_" : "audio_rtcp_";
+    for (size_t kind = 0; kind < veil_media::kRtcpKinds; ++kind)
+      snapshot += ",\"" + prefix + veil_media::kRtcpKindNames[kind] +
+                  "_blocks\":" + std::to_string(rtcp_send.blocks[plane][kind]);
+    snapshot += ",\"" + prefix + "malformed\":" + std::to_string(rtcp_send.malformed[plane]);
+  }
   snapshot += ",\"audio_loss_report_us\":" + std::to_string(audio_loss_report_us) +
               ",\"video_loss_report_us\":" + std::to_string(video_loss_report_us);
   snapshot += ",\"audio_playout_peers\":" + std::to_string(playout_peers) +
