@@ -63,6 +63,9 @@ use chacha20poly1305::{
 use rand_core::{OsRng, RngCore};
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(feature = "node-embedded")]
+mod rtp_trace;
+
 /// First byte of every media cell on the onion transport. Distinct from
 /// `veil_onion_stream::wire::PROTO_VER` (= 1), so a media cell is already an
 /// invalid stream frame (`Frame::decode` → `None`) and the reliable demux would
@@ -571,14 +574,16 @@ impl MediaCipher {
     }
 
     fn seal_at(&self, index: usize, plaintext: &[u8]) -> Option<SealedMediaCell> {
-        self.tx[index]
+        let bytes = self.tx[index]
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .seal(plaintext)
-            .map(|bytes| SealedMediaCell {
-                bytes,
-                local_deadline: None,
-            })
+            .seal(plaintext)?;
+        #[cfg(feature = "node-embedded")]
+        rtp_trace::record("sealed", &bytes, plaintext);
+        Some(SealedMediaCell {
+            bytes,
+            local_deadline: None,
+        })
     }
 
     pub(crate) fn open(&self, sealed: &[u8]) -> Option<Vec<u8>> {
@@ -1166,7 +1171,11 @@ pub(crate) fn trace_sealed_cell_with_source_queue(
     let epoch = u64::from_be_bytes(payload[4..12].try_into().unwrap());
     let seq = u64::from_be_bytes(payload[12..20].try_into().unwrap());
     // Include the first sealed candidate probe as well as periodic RTP.
-    if seq == 1 || seq.is_multiple_of(50) {
+    #[cfg(feature = "node-embedded")]
+    let sampled = veil_util::sealed_trace::sample(seq);
+    #[cfg(not(feature = "node-embedded"))]
+    let sampled = seq == 1 || (seq != 0 && seq.is_multiple_of(50));
+    if sampled {
         #[cfg(feature = "node-embedded")]
         let delivery = (stage == "received")
             .then(|| veil_ipc::route_trace::authenticated_local_delivery_ages(payload))
@@ -1187,8 +1196,12 @@ pub(crate) fn trace_sealed_cell_with_source_queue(
             .unwrap_or_default()
             .as_millis();
         let source_queue_max_us = source_queue_max_us.map_or(-1i128, i128::from);
+        #[cfg(feature = "node-embedded")]
+        let monotonic_us = veil_util::diagnostic_clock::monotonic_us().map_or(-1i128, i128::from);
+        #[cfg(not(feature = "node-embedded"))]
+        let monotonic_us = -1i128;
         log::info!(
-            "media.cell.sample at_ms={at_ms} stage={stage} peer={:02x}{:02x}{:02x}{:02x} epoch={epoch:016x} seq={seq} bytes={} delivery_daemon_age_us={daemon_age_us} delivery_sdk_age_us={sdk_age_us} source_queue_max_us={source_queue_max_us} delivery_daemon_queue_age_us={daemon_queue_age_us}",
+            "media.cell.sample at_ms={at_ms} monotonic_us={monotonic_us} stage={stage} peer={:02x}{:02x}{:02x}{:02x} epoch={epoch:016x} seq={seq} bytes={} delivery_daemon_age_us={daemon_age_us} delivery_sdk_age_us={sdk_age_us} source_queue_max_us={source_queue_max_us} delivery_daemon_queue_age_us={daemon_queue_age_us}",
             peer[0],
             peer[1],
             peer[2],
@@ -1239,6 +1252,8 @@ fn dispatch_inbound_with_lease(peer: [u8; 32], payload: &[u8], lease: RecvLease)
         return false;
     };
     trace_sealed_cell("received", &peer, payload);
+    #[cfg(feature = "node-embedded")]
+    rtp_trace::record("received", payload, &plaintext);
     #[cfg(feature = "node-embedded")]
     if crate::media_ffi::call_control_ffi::dispatch_control(lease.chan, &lease.cipher, &plaintext) {
         return true;
