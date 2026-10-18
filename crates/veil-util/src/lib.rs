@@ -5,6 +5,7 @@
 //! helpers belong in that layer's own `util.rs`.
 
 pub mod diagnostic_clock;
+pub mod sealed_trace;
 
 /// Cross-platform mlocked-bytes primitive for secret-key allocations.
 /// See [`mlock::MlockedBytes`].

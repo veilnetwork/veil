@@ -243,7 +243,7 @@ fn sealed_sample(body: &[u8], data: &[u8]) -> Option<SealedLocalSample> {
     // only later RTP packets hid exactly the first send needed to locate a
     // failed handover. This remains opt-in endpoint metadata, never a wire
     // feature or relay classification.
-    if seq == 0 || (seq != 1 && !seq.is_multiple_of(50)) {
+    if !veil_util::sealed_trace::sample(seq) {
         return None;
     }
     Some(SealedLocalSample {
@@ -260,8 +260,9 @@ fn log_sample(stage: &str, local_lane: u8, sample: SealedLocalSample, hop: Optio
         .unwrap_or_default()
         .as_millis();
     let hop = hop.map_or_else(|| "local".to_owned(), veil_util::hex_short);
+    let monotonic_us = veil_util::diagnostic_clock::monotonic_us().map_or(-1i128, i128::from);
     log::info!(
-        "ipc.rt_trace.sealed_sample at={} at_ms={at_ms} stage={stage} dst={} local_slot={local_lane} epoch={:016x} seq={} bytes={} hop={hop}",
+        "ipc.rt_trace.sealed_sample at={} at_ms={at_ms} monotonic_us={monotonic_us} stage={stage} dst={} local_slot={local_lane} epoch={:016x} seq={} bytes={} hop={hop}",
         at_ms / 1000,
         veil_util::bytes_to_hex(&sample.destination),
         sample.epoch,
