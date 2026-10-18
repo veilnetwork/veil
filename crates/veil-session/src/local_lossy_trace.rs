@@ -11,6 +11,9 @@ const SEQUENCE_LIMIT: u64 = 4096;
 const ROW_LIMIT: u64 = 65_536;
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static ROWS: AtomicU64 = AtomicU64::new(0);
+// Extra transport observations must not consume the pre-existing budget/work
+// rows. Both independently bounded streams cover a full owned stress capture.
+static ACCEPTED_ROWS: AtomicU64 = AtomicU64::new(0);
 const WORK_ROW_LIMIT: u64 = 16_384;
 static WORK_ROWS: AtomicU64 = AtomicU64::new(0);
 
@@ -38,6 +41,17 @@ fn row_available() -> bool {
     let n = ROWS.fetch_add(1, Ordering::Relaxed);
     if n == ROW_LIMIT {
         log::info!("media.source_trace_limit rows={ROW_LIMIT}");
+    }
+    n < ROW_LIMIT
+}
+
+fn cell_row_available(stage: &str) -> bool {
+    if stage != "datagram_accepted" {
+        return row_available();
+    }
+    let n = ACCEPTED_ROWS.fetch_add(1, Ordering::Relaxed);
+    if n == ROW_LIMIT {
+        log::info!("media.source_accepted_trace_limit rows={ROW_LIMIT}");
     }
     n < ROW_LIMIT
 }
@@ -187,7 +201,7 @@ fn record_cell(stage: &'static str, priority: u8, frame: &[u8], connection_trace
     {
         return;
     }
-    if row_available() {
+    if cell_row_available(stage) {
         let Some((family, kind)) = crate::frame_diag::family_and_type(frame) else {
             return;
         };
