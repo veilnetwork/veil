@@ -298,9 +298,12 @@ impl Drop for SourceFrameTrace {
         let Some(epoch) = self.epoch else {
             return;
         };
-        if self.first <= SEQUENCE_LIMIT && row_available() {
+        // Explicit full-call capture already has a finite shared row bound.
+        // A fresh video seal can have a high nonce; hiding that boundary would
+        // make late RTP-to-work attribution impossible despite complete cells.
+        if row_available() {
             log::info!(
-                "media.source_frame_trace at_unix_us={} local_slot={} epoch={epoch:016x} first_seq={} last_seq={} cells={} planned_cells={} expired_cells={} packets={} raw_bytes={} sealed_bytes={} contiguous={} sequence_limit={SEQUENCE_LIMIT}",
+                "media.source_frame_trace at_unix_us={} local_slot={} epoch={epoch:016x} first_seq={} last_seq={} cells={} planned_cells={} expired_cells={} packets={} raw_bytes={} sealed_bytes={} contiguous={}",
                 unix_us(),
                 self.priority,
                 self.first,
