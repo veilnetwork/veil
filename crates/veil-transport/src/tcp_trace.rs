@@ -1,7 +1,9 @@
 //! Local, opt-in diagnostics for TCP writer progress and kernel backlog.
 //!
 //! No peer addresses, application roles, payloads, wire flags or priorities.
-//! A process-local connection number correlates events. Kernel snapshots are
+//! A process-local connection number and TCP port pair correlate events with
+//! an independently captured, local socket inventory. Ports identify no
+//! application role; no IP addresses are recorded. Kernel snapshots are
 //! sampled at the first Pending and on a slow completion/re-poll; elapsed
 //! time includes task scheduling and must not be called network latency.
 //! Successful flushes also sample cumulative kernel high-water marks; accepting
@@ -43,6 +45,23 @@ struct KernelSnapshot {
     unacked_packets: Option<u32>,
     retransmitted_packets: Option<u32>,
     retransmitted_bytes: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SocketMetadata {
+    local_port: u16,
+    peer_port: u16,
+    tcp_nodelay: bool,
+}
+
+impl SocketMetadata {
+    fn read(stream: &TcpStream) -> std::io::Result<Self> {
+        Ok(Self {
+            local_port: stream.local_addr()?.port(),
+            peer_port: stream.peer_addr()?.port(),
+            tcp_nodelay: stream.nodelay()?,
+        })
+    }
 }
 
 // Debug is deliberately field-labelled: Linux retransmissions are packets,
@@ -179,6 +198,7 @@ struct KernelProgress {
 #[derive(Default)]
 pub(crate) struct WriteTrace {
     connection: u64,
+    socket_metadata_reported: bool,
     progress: KernelProgress,
     wait: Option<Wait>,
     last_log: Option<Instant>,
@@ -195,6 +215,7 @@ impl WriteTrace {
     ) {
         if !enabled_cell().load(Ordering::Relaxed) {
             self.wait = None;
+            self.socket_metadata_reported = false;
             if self.progress.samples != 0 {
                 self.progress = KernelProgress::default();
             }
@@ -205,6 +226,20 @@ impl WriteTrace {
             self.observe_kernel_progress(stream, now);
         }
         self.observe_enabled(stream, operation, pending, ciphertext_bytes, now);
+    }
+
+    fn identify_socket(&mut self, stream: &TcpStream) {
+        if self.connection == 0 {
+            self.connection = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
+        }
+        if !self.socket_metadata_reported {
+            log::info!(target: "transport.tcp_trace.socket",
+                "connection={} monotonic_us={} socket={:?}",
+                self.connection,
+                veil_util::diagnostic_clock::monotonic_us().map_or_else(|| "unknown".to_owned(), |us| us.to_string()),
+                SocketMetadata::read(stream));
+            self.socket_metadata_reported = true;
+        }
     }
 
     fn observe_kernel_progress(&mut self, stream: &TcpStream, now: Instant) {
@@ -218,9 +253,7 @@ impl WriteTrace {
             return;
         }
         self.progress.last_sample = Some(now);
-        if self.connection == 0 {
-            self.connection = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
-        }
+        self.identify_socket(stream);
         let snapshot = KernelSnapshot::read(stream);
         if let Ok(kernel) = &snapshot {
             let p = &mut self.progress;
@@ -284,9 +317,7 @@ impl WriteTrace {
                 self.wait = None;
             }
         } else if pending {
-            if self.connection == 0 {
-                self.connection = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
-            }
+            self.identify_socket(stream);
             self.wait = Some(Wait {
                 start: now,
                 last_poll: now,
@@ -389,5 +420,39 @@ mod kernel_progress_tests {
             trace.wait.is_none(),
             "successful writes are not writer stalls"
         );
+    }
+
+    #[tokio::test]
+    async fn socket_metadata_distinguishes_parallel_sockets_without_changing_them() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut clients = Vec::new();
+        let mut ports = std::collections::HashSet::new();
+        for nodelay in [true, false] {
+            let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+            let mut client = client.unwrap();
+            let (mut server, observed_peer) = accepted.unwrap();
+            client.set_nodelay(nodelay).unwrap();
+            let metadata = SocketMetadata::read(&client).unwrap();
+            assert_eq!(metadata.local_port, observed_peer.port());
+            assert_eq!(metadata.peer_port, address.port());
+            assert_eq!(metadata.tcp_nodelay, nodelay);
+            assert!(ports.insert(metadata.local_port));
+            let mut trace = WriteTrace::default();
+            trace.observe_kernel_progress(&client, Instant::now());
+            let id = trace.connection;
+            // Re-enabling diagnostics must identify the same connection in
+            // the new capture, without assigning it another socket or id.
+            trace.socket_metadata_reported = false;
+            trace.identify_socket(&client);
+            assert_eq!(trace.connection, id);
+            assert_eq!(SocketMetadata::read(&client).unwrap(), metadata);
+            client.write_all(b"opaque").await.unwrap();
+            let mut received = [0; 6];
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"opaque");
+            assert_eq!(client.nodelay().unwrap(), nodelay);
+            clients.push((client, server));
+        }
     }
 }
