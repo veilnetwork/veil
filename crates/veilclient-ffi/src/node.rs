@@ -49,6 +49,28 @@ impl log::Log for StderrLogBridge {
     }
 }
 
+/// Share the existing bounded console/logcat bridge with explicitly traced
+/// SDK clients that connect to a node hosted in another process. Do not
+/// replace a host-owned logger or alter its chosen maximum level.
+pub(crate) fn initialize_logging() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        #[cfg(target_os = "android")]
+        android_logger::init_once(
+            android_logger::Config::default()
+                .with_max_level(log::LevelFilter::Info)
+                .with_tag("veilnode"),
+        );
+        #[cfg(not(target_os = "android"))]
+        {
+            static BRIDGE: StderrLogBridge = StderrLogBridge;
+            if log::set_logger(&BRIDGE).is_ok() {
+                log::set_max_level(log::LevelFilter::Info);
+            }
+        }
+    });
+}
+
 /// Opaque handle to a running embedded node.
 pub struct VeilNode {
     shutdown: Mutex<Option<watch::Sender<bool>>>,
@@ -580,34 +602,7 @@ fn start_thread(
     let spawn = std::thread::Builder::new()
         .name("veil-node".into())
         .spawn(move || {
-            // Android: bridge the node's `log` output to logcat (tag `veilnode`)
-            // once — Rust stderr is invisible there, so without this the embedded
-            // node is undebuggable on-device. No-op on other platforms.
-            #[cfg(target_os = "android")]
-            {
-                use std::sync::Once;
-                static INIT: Once = Once::new();
-                INIT.call_once(|| {
-                    android_logger::init_once(
-                        android_logger::Config::default()
-                            .with_max_level(log::LevelFilter::Info)
-                            .with_tag("veilnode"),
-                    );
-                });
-            }
-            // Desktop/iOS: bridge `log` -> stderr once so the runtime's `log`
-            // diagnostics (onion-stream relay-pick &c.) are visible here too.
-            #[cfg(not(target_os = "android"))]
-            {
-                use std::sync::Once;
-                static INIT: Once = Once::new();
-                static BRIDGE: StderrLogBridge = StderrLogBridge;
-                INIT.call_once(|| {
-                    if log::set_logger(&BRIDGE).is_ok() {
-                        log::set_max_level(log::LevelFilter::Info);
-                    }
-                });
-            }
+            initialize_logging();
             // Same size as the FFI runtime next door, and for the same reason.
             //
             // Left uncapped, tokio takes one worker per core — which is a
