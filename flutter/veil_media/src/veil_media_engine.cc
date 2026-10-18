@@ -70,6 +70,7 @@
 #include "bounded_audio_encoder.h"
 #include "veil_audio_adaptor_config.h"
 #include "veil_call_audio_processing.h"
+#include "veil_group_audio_send_trace.h"
 #include "call/rtp_transport_controller_send_interface.h"
 #include "rtc_base/network_route.h"
 #include "api/environment/environment.h"
@@ -354,9 +355,10 @@ std::string node_key(const uint8_t id[32]) {
 class GroupFanoutTransport : public webrtc::Transport {
  public:
   GroupFanoutTransport(webrtc::Call* call, webrtc::Call* video_call,
-                       uint32_t video_ssrc,
+                       uint32_t audio_ssrc, uint32_t video_ssrc,
                        std::shared_ptr<veil_media::RtcpSendStats> rtcp_stats)
       : rtcp_stats_(std::move(rtcp_stats)), video_ssrc_(video_ssrc),
+        audio_send_trace_(audio_ssrc),
         call_(call), video_call_(video_call) {}
 
   void Add(uint64_t chan) {
@@ -388,6 +390,9 @@ class GroupFanoutTransport : public webrtc::Transport {
       const bool sent = veil_media_send_datagram(chan, packet.data(), packet.size()) == 0;
       if (video)
         video_stats_.mark_result(began_ns, webrtc::TimeMicros() * 1000, sent);
+      if (audio_send_trace_.enabled())
+        audio_send_trace_.Record(chan, packet, began_ns / 1000,
+                                 webrtc::TimeMicros(), sent);
       if (!sent && !veil_media::IsSecondaryInboundRtp(packet))
         audio_drops_.fetch_add(1, std::memory_order_relaxed);
       any = sent || any;
@@ -446,6 +451,7 @@ class GroupFanoutTransport : public webrtc::Transport {
   std::atomic<uint64_t> audio_drops_{0};
   const uint32_t video_ssrc_;
   veil_media::RtpSendStats video_stats_;
+  veil_media::GroupAudioSendTrace audio_send_trace_;
   std::atomic<bool> video_send_paused_{false};
   webrtc::Call* const call_;
   webrtc::Call* const video_call_;
@@ -1926,7 +1932,8 @@ VeilGroupMediaEngine* veil_media_group_engine_create(
                               ws->video_network_tq.get());
   ws->video_call = webrtc::Call::Create(std::move(video_cfg));
   ws->fanout = std::make_unique<GroupFanoutTransport>(
-      ws->call.get(), ws->video_call.get(), group_video_ssrc_of(engine->local),
+      ws->call.get(), ws->video_call.get(), ssrc_of(engine->local),
+      group_video_ssrc_of(engine->local),
       ws->rtcp_send_stats);
   engine->ws = std::move(ws);
 #endif
