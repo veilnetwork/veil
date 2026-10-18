@@ -23,6 +23,8 @@ pub mod dispatcher_sink;
 pub mod frame_diag;
 pub mod frame_outbox;
 mod local_datagram_status;
+mod local_packet_framing;
+pub use local_packet_framing::LocalPacketFraming;
 pub mod local_lossy_trace;
 mod local_replication;
 mod local_source_activity;

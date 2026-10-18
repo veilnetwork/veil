@@ -19,6 +19,13 @@
 
 use std::sync::Arc;
 
+/// Expected framing/padding bytes, multiplied by two, for one obfs4 write.
+/// This excludes TCP/IP and does not change the uniform wire padding policy.
+pub fn mean_frame_overhead_x2() -> usize {
+    2 * (veil_obfs4::LEN_PREFIX_BYTES + 1 + veil_obfs4::AEAD_TAG_LEN)
+        + veil_obfs4::WIRE_MAX_PADDING_BYTES
+}
+
 use futures::future::BoxFuture;
 use tokio::net::TcpListener;
 use veil_obfs4::{

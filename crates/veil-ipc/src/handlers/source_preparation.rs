@@ -25,7 +25,7 @@ pub(crate) fn prepare(
     let peers = if request.relayed {
         // Same existing candidates as relay sends. No discovery, mailbox,
         // direct-path promotion or invented application packet is involved.
-        super::send::ordinary_relay_hops(None, &request.peer_node_id, route_cache, registry, true)
+        crate::source_paths::sealed_relay_hops(&request.peer_node_id, route_cache, registry)
             .into_iter()
             .take(2)
             .collect::<Vec<_>>()
@@ -62,8 +62,12 @@ mod tests {
     struct Registry {
         calls: Mutex<Vec<([u8; 32], u8)>>,
         state: State,
+        datagram_hop: Option<[u8; 32]>,
     }
     impl FrameBroadcaster for Registry {
+        fn has_neutral_forward_datagram_transport(&self, peer: &[u8; 32]) -> bool {
+            self.datagram_hop.as_ref() == Some(peer)
+        }
         fn supports_local_datagram_preparation(&self) -> bool {
             true
         }
@@ -101,7 +105,25 @@ mod tests {
         Registry {
             calls: Mutex::new(vec![]),
             state,
+            datagram_hop: None,
         }
+    }
+
+    #[test]
+    fn relay_preparation_uses_the_senders_preferred_datagram_hops() {
+        let mut r = registry(State::Ready);
+        r.datagram_hop = Some([4; 32]);
+        assert_eq!(
+            prepare(&request(true).encode(), true, |_| true, Some(&r), None),
+            State::Ready
+        );
+        assert_eq!(
+            *r.calls.lock().unwrap(),
+            vec![
+                ([4; 32], veil_proto::priority::BULK),
+                ([2; 32], veil_proto::priority::BULK),
+            ]
+        );
     }
 
     #[test]

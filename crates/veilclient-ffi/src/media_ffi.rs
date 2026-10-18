@@ -40,6 +40,8 @@ pub mod feedback_ffi;
 #[cfg(feature = "node-embedded")]
 mod ingress_diagnostics;
 #[cfg(feature = "node-embedded")]
+mod packet_cost;
+#[cfg(feature = "node-embedded")]
 pub(crate) mod source_preflight;
 #[cfg(feature = "node-embedded")]
 mod source_preparation;
@@ -685,6 +687,7 @@ pub unsafe extern "C" fn veil_media_open_channel(
         .insert(
             id,
             MediaChannel {
+                cost_context: None,
                 path_probe: None,
                 source_preflight: None,
                 ingress,
@@ -1006,6 +1009,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
         .insert(
             id,
             MediaChannel {
+                cost_context: Some(Arc::clone(&app_ref.bundle)),
                 path_probe: None,
                 source_preflight: None,
                 ingress: MediaIngress::with_screen(
@@ -1277,6 +1281,7 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
         .insert(
             id,
             MediaChannel {
+                cost_context: Some(Arc::clone(&app_ref.bundle)),
                 path_probe: None,
                 source_preflight: None,
                 ingress: MediaIngress::with_screen(
@@ -1837,6 +1842,7 @@ pub unsafe extern "C" fn veil_media_recv_count(peer_node_id: *const u8) -> u64 {
 /// media must drop rather than buffer when it outpaces the circuit.
 #[cfg(feature = "node-embedded")]
 struct MediaChannel {
+    cost_context: Option<Arc<RuntimeBundle>>,
     path_probe: Option<Arc<path_probe_ffi::PathProbeContext>>,
     source_preflight: Option<Arc<source_preflight::Context>>,
     ingress: Arc<MediaIngress>,
