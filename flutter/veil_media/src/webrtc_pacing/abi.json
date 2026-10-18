@@ -1,0 +1,9 @@
+{
+  "original_source_sha256": "30c6ff92be5477549f6b332042b1dd071df771a62dcad63f2d2f88787d118ded",
+  "patched_source_sha256": "bf14f32b8f4ff5c7a9eaaa3ea3cd2e7580579017991e58c7318c3bf17865fe69",
+  "headers": {
+    "modules/pacing/pacing_controller.h": "259c84d6e02c9da87bb903d68029ebd295079b3ec6f2f408a28c9d5b256510c2",
+    "modules/pacing/prioritized_packet_queue.h": "c5d91b608f614b4812b46d513e98bc5f2b7e451a36fb3cea8c0d870fc2606a56",
+    "modules/pacing/bitrate_prober.h": "0bd8ce7c8d1d832494b9c6e095a8a16771e7a15c1796f613b8a5600e63f0e6c6"
+  }
+}
