@@ -75,6 +75,7 @@ async fn negotiated_ordered_sources_do_not_enter_parent_and_preserve_ordinary_ci
         }),
     );
     runner.raw_session_keys = Some(([2; 32], [3; 32], [1; 32]));
+    let swap_tx = runner.with_swap_inbox();
     let task = tokio::spawn(async move { runner.run().await });
     for lane in [REALTIME, BULK, BACKGROUND] {
         sender
@@ -122,12 +123,53 @@ async fn negotiated_ordered_sources_do_not_enter_parent_and_preserve_ordinary_ci
             .unwrap(),
         body
     );
-    task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
+    let (replacement, mut replacement_peer) = tokio::io::duplex(1024);
+    swap_tx.send(Box::new(replacement)).await.unwrap();
+    let closed = timeout(Duration::from_secs(2), remote_stream.read(&mut [0; 1]))
+        .await
+        .expect("old obfs4 stream must retire");
+    assert!(matches!(closed, Ok(0) | Err(_)));
+    // This ordered factory is bound to the original TCP owner. It closes
+    // with that owner: the session must request fresh authentication, not
+    // remain alive forever with unready children or spill media into the parent.
+    timeout(Duration::from_secs(2), task)
+        .await
+        .expect("closed ordered factory must end the swapped session")
+        .expect("runner must not panic");
+    assert_eq!(
+        timeout(Duration::from_secs(1), replacement_peer.read(&mut [0; 1]))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
 async fn negotiated_sources_never_spill_to_parent_while_children_warm_or_close() {
+    verify_sources_across_canonical_transport(false, false, false).await;
+}
+
+#[tokio::test]
+async fn independent_sources_survive_canonical_stream_swap_without_reset_or_parent_spill() {
+    verify_sources_across_canonical_transport(true, false, false).await;
+}
+
+#[tokio::test]
+async fn independent_sources_can_warm_after_canonical_swap_and_survive_another_swap() {
+    verify_sources_across_canonical_transport(true, true, false).await;
+}
+
+#[tokio::test]
+async fn independent_sources_reauthenticate_when_retained_quic_factory_closes_after_swap() {
+    verify_sources_across_canonical_transport(true, false, true).await;
+}
+
+async fn verify_sources_across_canonical_transport(
+    swap_canonical: bool,
+    swap_before_warm: bool,
+    close_factory: bool,
+) {
     use super::super::{ParallelQuicOffer, RealtimeLaneOffer, RealtimeTransportOffer};
     use veil_proto::priority::{BACKGROUND, BULK};
     let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -171,6 +213,7 @@ async fn negotiated_sources_never_spill_to_parent_while_children_warm_or_close()
         }),
     );
     runner.raw_session_keys = Some(([2; 32], [3; 32], [1; 32]));
+    let swap_tx = runner.with_swap_inbox();
     let task = tokio::spawn(async move { runner.run().await });
     for lane in [REALTIME, BULK, BACKGROUND] {
         sender
@@ -200,11 +243,25 @@ async fn negotiated_sources_never_spill_to_parent_while_children_warm_or_close()
         );
     }
     no_parent_payload(&remote_parent, &mut remote_stream).await;
+    if swap_before_warm {
+        let (replacement, replacement_peer) = tokio::io::duplex(1024);
+        swap_tx.send(Box::new(replacement)).await.unwrap();
+        let closed = timeout(Duration::from_secs(2), remote_stream.read(&mut [0; 1]))
+            .await
+            .expect("cold canonical stream must retire");
+        assert!(matches!(closed, Ok(0) | Err(_)));
+        remote_stream = Box::new(replacement_peer);
+        // The remote child acceptor still does not exist. A byte-only swap
+        // cannot authorize source traffic to spill onto the replacement.
+        no_parent_payload(&remote_parent, &mut remote_stream).await;
+    }
     let started = Instant::now();
     let (received, mut packets) = mpsc::unbounded_channel();
     let logger = Arc::new(veil_observability::NodeLogger::new_noop());
     let mut context = super::super::ordered_receiver_tests::pool_fixture_context();
+    let ingress = Arc::new(Mutex::new(std::collections::HashMap::new()));
     context.dispatcher = Arc::new(Capture {
+        ingress: Some(ingress.clone()),
         started,
         received,
         logger,
@@ -247,6 +304,165 @@ async fn negotiated_sources_never_spill_to_parent_while_children_warm_or_close()
         assert!(diagnostics.sent(lane) > 0);
     }
     no_parent_payload(&remote_parent, &mut remote_stream).await;
+    if swap_canonical {
+        use veil_proto::family::{AppMsg, FrameFamily};
+        // A transport-only swap retains the existing ordered cipher too.
+        // Decrypt a marker on each side of the swap with ONE receiver cipher;
+        // spending a nonce on leaked media or resetting it must fail here.
+        let mut cipher = veil_crypto::session_cipher::SessionCipher::new(&[0x51; 32], true);
+        async fn ordinary_marker(
+            sender: &crate::frame_outbox::FrameSender,
+            stream: &mut veil_transport::BoxIoStream,
+            cipher: &mut veil_crypto::session_cipher::SessionCipher,
+            body: &[u8],
+        ) {
+            let mut h = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppSend as u16);
+            h.body_len = body.len() as u32;
+            sender
+                .try_send((
+                    INTERACTIVE,
+                    veil_bufpool::pooled_shared_from_vec(veil_proto::codec::encode_frame(&h, body)),
+                ))
+                .unwrap();
+            let mut reader = super::super::ordered_reader::Reader::default();
+            let wire = timeout(Duration::from_secs(2), reader.read(stream, 65536))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(wire.header.family, FrameFamily::App as u8);
+            assert_eq!(wire.header.msg_type, AppMsg::AppSend as u16);
+            assert_eq!(
+                cipher
+                    .open(&wire.body, &veil_proto::codec::frame_aad(&wire.header))
+                    .unwrap(),
+                body
+            );
+        }
+        ordinary_marker(&sender, &mut remote_stream, &mut cipher, b"before-swap").await;
+        let active = diagnostics.active_connections();
+        assert!(
+            active >= 3,
+            "each independent source must be authenticated first"
+        );
+        let before = [REALTIME, BULK, BACKGROUND].map(|lane| diagnostics.sent(lane));
+        let old_ingress = ingress.lock().unwrap().clone();
+        let (replacement, replacement_peer) = tokio::io::duplex(1024);
+        swap_tx.send(Box::new(replacement)).await.unwrap();
+        // Completion of the old ordered writer is an actual swap witness,
+        // not a sleep that assumes the command has been processed.
+        let closed = timeout(Duration::from_secs(2), remote_stream.read(&mut [0; 1]))
+            .await
+            .expect("old canonical stream must retire");
+        assert!(matches!(closed, Ok(0) | Err(_)));
+        remote_stream = Box::new(replacement_peer);
+        ordinary_marker(&sender, &mut remote_stream, &mut cipher, b"after-swap").await;
+        assert_eq!(
+            diagnostics.active_connections(),
+            active,
+            "replacing the canonical stream must not retire independent connections"
+        );
+        assert_eq!(diagnostics.rekeys(), 0, "transport swap is not a key epoch");
+        // Make the NEW canonical writer genuinely block on an ordinary
+        // encrypted body. All three independent sources must still deliver.
+        let large_body = vec![0x63; 16 * 1024];
+        let mut large_header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppSend as u16);
+        large_header.body_len = large_body.len() as u32;
+        sender
+            .try_send((
+                INTERACTIVE,
+                veil_bufpool::pooled_shared_from_vec(veil_proto::codec::encode_frame(
+                    &large_header,
+                    &large_body,
+                )),
+            ))
+            .unwrap();
+        let mut large_header_wire = [0; veil_proto::header::HEADER_SIZE];
+        timeout(
+            Duration::from_secs(2),
+            remote_stream.read_exact(&mut large_header_wire),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let large_wire_header = veil_proto::codec::decode_header(&large_header_wire).unwrap();
+        assert!(large_wire_header.body_len > 1024);
+        let mut delivered = HashSet::new();
+        timeout(Duration::from_secs(3), async {
+            for tick in 0u32.. {
+                for (index, lane) in [REALTIME, BULK, BACKGROUND].into_iter().enumerate() {
+                    sender
+                        .try_send((
+                            lane,
+                            veil_bufpool::pooled_shared_from_vec(primary_test_frame(
+                                false,
+                                (index as u32 + 7) * 1000 + tick,
+                                0,
+                            )),
+                        ))
+                        .unwrap();
+                }
+                while let Ok((seq, _, _)) = packets.try_recv() {
+                    if (7..=9).contains(&(seq / 1000)) {
+                        delivered.insert(seq / 1000);
+                    }
+                }
+                if delivered.len() == 3 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("all existing remote decryptors must accept post-swap source traffic");
+        for (index, lane) in [REALTIME, BULK, BACKGROUND].into_iter().enumerate() {
+            assert!(diagnostics.sent(lane) > before[index]);
+            assert_eq!(
+                ingress.lock().unwrap().get(&(index as u32 + 7)),
+                old_ingress.get(&(index as u32 + 1)),
+                "source must keep the same authenticated parent and child, not recreate its codec"
+            );
+        }
+        if close_factory {
+            // The new canonical body is still blocked. Fresh authentication
+            // must not wait for its ordinary five-second graceful drain.
+            remote_parent.close();
+            timeout(Duration::from_secs(2), task)
+                .await
+                .expect("lost independent factory must abort the blocked writer promptly")
+                .expect("runner must not panic");
+            let mut tail = Vec::new();
+            timeout(Duration::from_secs(1), remote_stream.read_to_end(&mut tail))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                tail.len() < large_wire_header.body_len as usize,
+                "fixture must leave an actual incomplete ordered body"
+            );
+            drop(child_receiver);
+            return;
+        }
+        // Drain exactly that ordinary body with the same ordered cipher.
+        // Interleaved media or any reset/consumption of its nonce breaks this.
+        let mut large_wire_body = vec![0; large_wire_header.body_len as usize];
+        timeout(
+            Duration::from_secs(2),
+            remote_stream.read_exact(&mut large_wire_body),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            cipher
+                .open(
+                    &large_wire_body,
+                    &veil_proto::codec::frame_aad(&large_wire_header)
+                )
+                .unwrap(),
+            large_body
+        );
+        no_parent_payload(&remote_parent, &mut remote_stream).await;
+    }
     drop(child_receiver);
     sleep(Duration::from_millis(50)).await;
     for lane in [REALTIME, BULK, BACKGROUND] {
@@ -300,13 +516,34 @@ async fn negotiated_sources_never_spill_to_parent_while_children_warm_or_close()
     assert!(task.await.unwrap_err().is_cancelled());
 }
 
+type IngressCapture =
+    Arc<Mutex<std::collections::HashMap<u32, veil_anonymity::circuit_carrier::LocalIngressFlow>>>;
+
 struct Capture {
+    ingress: Option<IngressCapture>,
     started: Instant,
     received: mpsc::UnboundedSender<(u32, u64, Duration)>,
     logger: Arc<veil_observability::NodeLogger>,
 }
 
 impl crate::dispatcher_sink::DispatcherSink for Capture {
+    fn dispatch_with_carrier(
+        &self,
+        header: &FrameHeader,
+        body: &[u8],
+        peer: NodeIdBytes,
+        carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
+    ) -> crate::dispatcher_sink::DispatchResult {
+        if let Some(ingress) = &self.ingress {
+            let flow = carrier
+                .and_then(|c| c.upgrade())
+                .and_then(|c| c.local_ingress_flow())
+                .expect("independent source must retain an authenticated ingress witness");
+            let seq = veil_proto::app::AppRtDataPayload::decode(body).unwrap().seq;
+            ingress.lock().unwrap().insert(seq / 1000, flow);
+        }
+        self.dispatch(header, body, peer)
+    }
     fn dispatch(
         &self,
         h: &FrameHeader,
@@ -502,6 +739,7 @@ async fn measure_channel(
     let (tx, mut rx) = mpsc::unbounded_channel();
     let logger = Arc::new(veil_observability::NodeLogger::new_noop());
     let sink: Arc<dyn crate::dispatcher_sink::DispatcherSink> = Arc::new(Capture {
+        ingress: None,
         started,
         received: tx,
         logger: Arc::clone(&logger),
@@ -960,6 +1198,7 @@ async fn verify_distinct_sources(late_idle: bool) {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let logger = Arc::new(veil_observability::NodeLogger::new_noop());
         let sink: Arc<dyn crate::dispatcher_sink::DispatcherSink> = Arc::new(Capture {
+            ingress: None,
             started,
             received: tx,
             logger: Arc::clone(&logger),
@@ -1277,6 +1516,7 @@ async fn verified_primary_replacement_wins_over_old_ack_progress() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let logger = Arc::new(veil_observability::NodeLogger::new_noop());
         let sink: Arc<dyn crate::dispatcher_sink::DispatcherSink> = Arc::new(Capture {
+            ingress: None,
             started,
             received: tx,
             logger: Arc::clone(&logger),
