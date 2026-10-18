@@ -49,7 +49,7 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # -std=c++20, android sysroot), swapping only the source.
 compile_tu() {  # $1=src  $2=out.o
   python3 - "$CC_JSON" "$1" "$2" "$SRCDIR" "$WEBRTC_SRC" <<'PY' > "$TMP/tu.sh"
-import json,sys,re
+import json,sys,re,os
 cc=json.load(open(sys.argv[1])); src,out,shimdir=sys.argv[2],sys.argv[3],sys.argv[4]
 suffix='modules/pacing/pacing_controller.cc' if src.endswith('/webrtc_pacing/pacing_controller.cc') else 'call/call.cc'
 e=next((x for x in cc if x.get('file','').endswith(suffix)), None)
@@ -79,6 +79,8 @@ cmd=re.sub(r'-D__ANDROID_API__=\d+', '-D__ANDROID_API__=26', cmd)
 # Keep deprecation warnings non-fatal when the Android WebRTC checkout exposes
 # a legacy API that the macOS checkout still accepts.
 extra=' -I'+sys.argv[5]+'/third_party/protobuf/src' if '-DWEBRTC_ENABLE_PROTOBUF=1' in cmd else ''
+if src.endswith('veil_media_engine.cc') and os.environ.get('VEIL_MEDIA_CC_TRACE_BUILD') == '1':
+    extra+=' -DVEIL_MEDIA_CC_TRACE=1'
 p=cmd.split(' ',1); cmd=p[0]+' -DVEIL_MEDIA_HAVE_WEBRTC=1 -Wno-error=deprecated-declarations -I'+shimdir+extra+' '+p[1]
 open('/dev/stdout','w').write('cd "'+e['directory']+'"\n'+cmd+'\n')
 PY
