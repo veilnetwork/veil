@@ -115,6 +115,7 @@
 #include "api/video/video_source_interface.h"
 #include "api/video/video_sink_interface.h"
 #include "veil_adaptive_video_source.h"
+#include "veil_frame_sizing_vp8.h"
 #include "veil_vp8_settings.h"
 #include "third_party/libyuv/include/libyuv/convert_argb.h"  // I420ToABGR
 #include "third_party/libyuv/include/libyuv/rotate.h"  // Android420ToI420Rotate
@@ -1036,6 +1037,8 @@ struct WebrtcState {
   std::shared_ptr<std::atomic<int>> audio_packet_duration =
       std::make_shared<std::atomic<int>>(0);
   // Video (Phase 4) — factories + source/sink outlive the streams.
+  std::shared_ptr<veil_media::VideoFrameBudget> video_frame_budget =
+      std::make_shared<veil_media::VideoFrameBudget>();
   std::unique_ptr<webrtc::VideoEncoderFactory> video_encoder_factory;
   std::unique_ptr<webrtc::VideoDecoderFactory> video_decoder_factory;
   std::unique_ptr<webrtc::VideoBitrateAllocatorFactory> video_bitrate_alloc_factory;
@@ -1149,6 +1152,8 @@ struct GroupWebrtcState {
   int audio_packet_ms = 20;  // Audio-worker owned requested configuration.
   int audio_payload_bps = 32'000;
   bool audio_config_valid = true;
+  std::shared_ptr<veil_media::VideoFrameBudget> video_frame_budget =
+      std::make_shared<veil_media::VideoFrameBudget>();
   std::unique_ptr<webrtc::VideoEncoderFactory> video_encoder_factory;
   std::unique_ptr<webrtc::VideoDecoderFactory> video_decoder_factory;
   std::unique_ptr<webrtc::VideoBitrateAllocatorFactory>
@@ -1309,8 +1314,9 @@ webrtc::Environment create_low_latency_environment(bool video = false) {
 void ensure_group_video_codecs(GroupWebrtcState* ws) {
   if (!ws->video_encoder_factory)
     ws->video_encoder_factory =
-        std::make_unique<webrtc::VideoEncoderFactoryTemplate<
-            webrtc::LibvpxVp8EncoderTemplateAdapter>>();
+        std::make_unique<veil_media::FrameSizingVp8EncoderFactory>(
+            std::make_unique<webrtc::VideoEncoderFactoryTemplate<
+                webrtc::LibvpxVp8EncoderTemplateAdapter>>(), ws->video_frame_budget);
   if (!ws->video_decoder_factory)
     ws->video_decoder_factory =
         // BOUNDED. `VeilVideoSink` refuses an oversized frame where it
@@ -1324,7 +1330,7 @@ void ensure_group_video_codecs(GroupWebrtcState* ws) {
     ws->video_bitrate_alloc_factory =
         webrtc::CreateBuiltinVideoBitrateAllocatorFactory();
   if (!ws->video_source)
-    ws->video_source = std::make_unique<veil_media::AdaptiveVideoSource>();
+    ws->video_source = std::make_unique<veil_media::AdaptiveVideoSource>(ws->video_frame_budget);
   if (!ws->local_video_sink)
     ws->local_video_sink = std::make_unique<VeilVideoSink>();
 }
@@ -2352,6 +2358,7 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
       }
       kbps = std::clamp(kbps, prepared ? 1 : 30, 2500);
       const int bps = kbps * 1000;
+      ws->video_frame_budget->SetProfile(bps);
       ws->video_call->SetClientBitratePreferences(
           veil_media::video_bitrate_settings(bps, true, true));
       auto ec = veil_media::vp8_encoder_config();
@@ -2439,6 +2446,7 @@ static int veil_media_group_engine_apply_video_budget(VeilGroupMediaEngine* engi
     kbps = std::clamp(kbps, minimum_kbps, 2500);
     const double fps = std::clamp(max_fps, 0.02, 60.0);
     const int bps = kbps * 1000;
+    ws->video_frame_budget->SetProfile(bps);
     if (!ws->video_send_stream) {
       if (!engine->video_running.load()) {
         ws->prepared_video_bps = bps;
@@ -2691,6 +2699,12 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   // Capability remains explicit on a stalled worker: unknown audio never
   // falls back to video ingress. These fields are endpoint-local JSON only.
   std::string snapshot(json, static_cast<size_t>(written) - 1);
+  const auto frame_budget = ws->video_frame_budget->snapshot();
+  snapshot += ",\"video_frame_budget_bytes\":" + std::to_string(frame_budget.bytes) +
+              ",\"video_frame_pixel_cap\":" + std::to_string(frame_budget.max_pixels) +
+              ",\"video_frame_oversize_count\":" + std::to_string(frame_budget.oversize_frames) +
+              ",\"video_frame_encoded_pixels\":" + std::to_string(frame_budget.last_pixels) +
+              ",\"video_frame_encoded_bytes\":" + std::to_string(frame_budget.last_bytes);
   snapshot += ",\"video_tx_retransmitted_pkts\":" + std::to_string(video_retransmitted_packets) +
               ",\"video_tx_retransmitted_bytes\":" + std::to_string(video_retransmitted_bytes) +
               ",\"video_rx_nack_packets\":" + std::to_string(video_nack_packets) +
@@ -3268,8 +3282,9 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
                                         webrtc::kNetworkUp);
     if (!ws->video_encoder_factory)
       ws->video_encoder_factory =
-          std::make_unique<webrtc::VideoEncoderFactoryTemplate<
-              webrtc::LibvpxVp8EncoderTemplateAdapter>>();
+          std::make_unique<veil_media::FrameSizingVp8EncoderFactory>(
+              std::make_unique<webrtc::VideoEncoderFactoryTemplate<
+                  webrtc::LibvpxVp8EncoderTemplateAdapter>>(), ws->video_frame_budget);
     if (!ws->video_decoder_factory)
       ws->video_decoder_factory =
           // BOUNDED. `VeilVideoSink` refuses an oversized frame where it
@@ -3283,7 +3298,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
       ws->video_bitrate_alloc_factory =
           webrtc::CreateBuiltinVideoBitrateAllocatorFactory();
     if (!ws->video_source)
-      ws->video_source = std::make_unique<veil_media::AdaptiveVideoSource>();
+      ws->video_source = std::make_unique<veil_media::AdaptiveVideoSource>(ws->video_frame_budget);
 
     if (send && ws->video_send_stream == nullptr) {
       webrtc::VideoSendStream::Config sc(ws->shim->video_transport());  // sets send_transport
@@ -3311,6 +3326,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
       kbps = std::clamp(kbps, 30, 2500);
       const int fps = std::clamp(max_fps > 0 ? max_fps : 15, 1, 60);
       const int bps = kbps * 1000;
+      ws->video_frame_budget->SetProfile(bps);
       ws->video_target_bitrate_bps = bps;
       ws->video_max_fps.store(fps, std::memory_order_relaxed);
       ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
@@ -3430,6 +3446,7 @@ static int veil_media_engine_apply_video_budget(VeilMediaEngine* engine,
     kbps = std::clamp(kbps, minimum_kbps, 2500);
     const double fps = std::clamp(max_fps, 0.02, 60.0);
     const int bps = kbps * 1000;
+    ws->video_frame_budget->SetProfile(bps);
     if (bps == ws->video_target_bitrate_bps &&
         fps == ws->video_max_fps.load(std::memory_order_relaxed)) {
       rc = VEIL_MEDIA_OK;
@@ -4298,6 +4315,12 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
            sizeof(json), written);
     } else {
       std::string snapshot(json, static_cast<size_t>(written) - 1);
+      const auto frame_budget = ws->video_frame_budget->snapshot();
+      snapshot += ",\"video_frame_budget_bytes\":" + std::to_string(frame_budget.bytes) +
+                  ",\"video_frame_pixel_cap\":" + std::to_string(frame_budget.max_pixels) +
+                  ",\"video_frame_oversize_count\":" + std::to_string(frame_budget.oversize_frames) +
+                  ",\"video_frame_encoded_pixels\":" + std::to_string(frame_budget.last_pixels) +
+                  ",\"video_frame_encoded_bytes\":" + std::to_string(frame_budget.last_bytes);
       snapshot += ",\"audio_latency_recovery_count\":" +
           std::to_string(ws->recovery_stats->count.load(std::memory_order_acquire));
       snapshot += ",\"audio_latency_discarded_ms\":" +
