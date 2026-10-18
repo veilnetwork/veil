@@ -24,3 +24,4 @@ fi
 "$STAND_DIR/smoke" --sender-restart
 "$STAND_DIR/smoke" --delivery-stall
 "$STAND_DIR/smoke" --delivery-loss
+"$STAND_DIR/smoke" --long-packets-jitter
