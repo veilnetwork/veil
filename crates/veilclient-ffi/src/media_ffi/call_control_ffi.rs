@@ -313,6 +313,7 @@ mod tests {
         MEDIA_CHANNELS.write().unwrap().insert(
             id,
             MediaChannel {
+                cost_context: None,
                 path_probe: None,
                 source_preflight: None,
                 ingress: MediaIngress::new(audio_tx, MediaVideoIngress::Packets(video_tx)),

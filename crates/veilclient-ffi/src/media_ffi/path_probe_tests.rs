@@ -151,6 +151,7 @@ impl Fixture {
         MEDIA_CHANNELS.write().unwrap().insert(
             id,
             MediaChannel {
+                cost_context: None,
                 path_probe: None,
                 source_preflight: None,
                 ingress: MediaIngress::new(tx, MediaVideoIngress::Packets(video)),

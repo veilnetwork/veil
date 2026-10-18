@@ -137,6 +137,10 @@ impl FrameSender {
         self.status.state(local_lane)
     }
 
+    pub fn local_packet_framing(&self, local_lane: u8) -> Option<crate::LocalPacketFraming> {
+        self.status.framing(local_lane)
+    }
+
     pub fn refresh_local_datagram_channel(
         &self,
         local_lane: u8,

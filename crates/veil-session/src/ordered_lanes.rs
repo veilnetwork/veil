@@ -206,7 +206,10 @@ fn mark(pool: &mut Pool, readiness: &Weak<LocalDatagramLease>) {
                 .is_some_and(|physical| pool.slots[physical].as_ref().is_some_and(Ready::alive));
             changed |=
                 (status.state(*priority) == crate::LocalDatagramChannelState::Ready) != ready;
-            lease.mark(*priority, ready);
+            lease.mark_framing(
+                *priority,
+                ready.then_some(crate::LocalPacketFraming::Obfs4Record),
+            );
         }
         if changed {
             status.wake();

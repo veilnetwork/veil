@@ -55,6 +55,7 @@ mod service_tasks;
 pub mod services;
 mod session_defaults;
 pub(crate) mod session_guard;
+mod source_framing;
 mod sovereign_republish;
 mod space_discovery;
 mod start;

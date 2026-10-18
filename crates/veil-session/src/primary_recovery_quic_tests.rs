@@ -78,6 +78,7 @@ async fn negotiated_ordered_sources_do_not_enter_parent_and_preserve_ordinary_ci
     let swap_tx = runner.with_swap_inbox();
     let task = tokio::spawn(async move { runner.run().await });
     for lane in [REALTIME, BULK, BACKGROUND] {
+        assert_eq!(sender.local_packet_framing(lane), None);
         sender
             .try_send((
                 lane,
@@ -300,8 +301,21 @@ async fn verify_sources_across_canonical_transport(
     })
     .await
     .expect("all three independent sources must actually deliver");
+    timeout(Duration::from_secs(1), async {
+        while [REALTIME, BULK, BACKGROUND]
+            .iter()
+            .any(|lane| sender.local_packet_framing(*lane).is_none())
+        {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("authenticated child must publish its actual framing");
     for lane in [REALTIME, BULK, BACKGROUND] {
         assert!(diagnostics.sent(lane) > 0);
+        assert!(
+            matches!(sender.local_packet_framing(lane), Some(crate::LocalPacketFraming::QuicDatagram { ceiling }) if ceiling > 60)
+        );
     }
     no_parent_payload(&remote_parent, &mut remote_stream).await;
     if swap_canonical {
@@ -514,6 +528,9 @@ async fn verify_sources_across_canonical_transport(
     drop(replacement_receiver);
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
+    for lane in [REALTIME, BULK, BACKGROUND] {
+        assert_eq!(sender.local_packet_framing(lane), None);
+    }
 }
 
 type IngressCapture =

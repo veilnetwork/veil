@@ -442,6 +442,7 @@ fn channel(me: [u8; 32], peer: [u8; 32], tx_key: [u8; 32], rx_key: [u8; 32]) -> 
     MEDIA_CHANNELS.write().unwrap().insert(
         id,
         MediaChannel {
+            cost_context: None,
             path_probe: None,
             source_preflight: None,
             ingress,
