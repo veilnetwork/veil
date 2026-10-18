@@ -136,9 +136,17 @@ impl QueuedFrame {
                 && self
                     .enqueued_at
                     .is_some_and(|at| at.elapsed() > lossy_realtime_max_age(priority)))
+            || self.local_work.as_ref().is_some_and(|work| work.rejected())
     }
 
     fn trace_lossy_drop(&self, priority: u8, stage: &'static str) {
+        let stage = if stage == "queue_expired"
+            && self.local_work.as_ref().is_some_and(|work| work.rejected())
+        {
+            "queue_work_rejected"
+        } else {
+            stage
+        };
         if let Some(work) = &self.local_work {
             work.reject();
         }
@@ -204,6 +212,63 @@ mod local_work_tests {
             queue.push_lossy(BULK, veil_bufpool::pooled_shared_from_vec(vec![0; 100]));
         }
         assert!(work.cell(1).unwrap().rejected());
+    }
+
+    #[test]
+    fn cancelled_work_cannot_block_fresh_datagrams_behind_an_unready_source() {
+        let work = LocalLossyWork::new(vec![100; 2]).unwrap();
+        let mut queue = PriorityQueue::with_default_weights();
+        queue.push_envelope(envelope(&work, 0), true);
+        queue.push_envelope(envelope(&work, 1), true);
+        queue.push_lossy(BULK, veil_bufpool::pooled_shared_from_vec(vec![42; 100]));
+        // A live work item must retain its FIFO position while its child is
+        // unready. Cancelling it must release that position immediately.
+        assert!(
+            queue
+                .pop_local_datagram_lane_if(|_, frame| frame[0] == 42)
+                .is_none()
+        );
+        work.cell(0).unwrap().reject();
+        let calls = std::cell::Cell::new(0);
+        let fresh = queue
+            .pop_local_datagram_lane_if(|_, frame| {
+                calls.set(calls.get() + 1);
+                frame[0] == 42
+            })
+            .expect("cancelled siblings must not wait for transport readiness");
+        assert_eq!(fresh.frame.1[0], 42);
+        assert_eq!(
+            calls.get(),
+            1,
+            "only a live source should reach readiness checks"
+        );
+        assert_eq!(queue.drops_total(), 2);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn cancelled_work_cannot_block_ordinary_ordered_data_in_its_class() {
+        let work = LocalLossyWork::new(vec![100; 2]).unwrap();
+        let mut queue = PriorityQueue::with_default_weights();
+        queue.push_envelope(envelope(&work, 0), true);
+        queue.push_envelope(envelope(&work, 1), true);
+        queue.push(BULK, veil_bufpool::pooled_shared_from_vec(vec![42; 100]));
+        work.cell(0).unwrap().reject();
+        let mut calls = 0;
+        let fresh = queue
+            .pop_admitted_envelope(|_, _, _, work| {
+                calls += 1;
+                if work.is_some() {
+                    HeadAdmission::DeferSource
+                } else {
+                    HeadAdmission::Allow
+                }
+            })
+            .expect("cancelled work must not hold an ordered source's turn");
+        assert_eq!(fresh.frame.1[0], 42);
+        assert_eq!(calls, 1);
+        assert_eq!(queue.drops_total(), 2);
+        assert!(queue.is_empty());
     }
 }
 

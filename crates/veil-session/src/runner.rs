@@ -5113,10 +5113,14 @@ impl SessionRunner {
                         // capacity is ready. A capacity retry must not pay twice.
                         if !match envelope.local_work.as_ref() {
                             Some(work) => {
+                                let attempted_at = std::time::Instant::now();
                                 let admitted = lane.source_activity.admit_lossy_work(
                                     work,
                                     encrypted_wire_len(outgoing.len()).unwrap_or(usize::MAX),
-                                    std::time::Instant::now(),
+                                    attempted_at,
+                                );
+                                crate::local_lossy_trace::work_admission(
+                                    work, outgoing_priority, outgoing, &admitted, attempted_at,
                                 );
                                 if admitted != veil_types::local_lossy_work::WorkAdmission::Admitted
                                 {
@@ -5673,6 +5677,9 @@ impl SessionRunner {
                                     Err(until) => veil_types::local_lossy_work::WorkAdmission::Wait(until),
                                 },
                             };
+                            if let Some(work) = local_work {
+                                crate::local_lossy_trace::work_admission(work, priority, frame, &admission, now);
+                            }
                             let admission = match (admission, local_work) {
                                 (veil_types::local_lossy_work::WorkAdmission::Admitted, Some(work)) => work.release_at(now),
                                 (other, _) => other,
