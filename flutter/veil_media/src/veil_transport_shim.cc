@@ -277,6 +277,8 @@ bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
       packet, local_video_ssrc_.load(std::memory_order_relaxed), started_ns, 96);
   const int rc =
       veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
+  if (audio_ingress_diagnostics_ && video)
+    video_loss_trace_.Rtp(packet, local_video_ssrc_.load(), 's', started_ns/1000, rc);
   if (video)
     video_send_stats_.mark_result(started_ns, webrtc::TimeMicros() * 1000, rc == 0);
   if (audio) {
@@ -409,6 +411,8 @@ bool VeilTransportShim::SendRtcpOnSource(std::span<const uint8_t> packet,
   const int rc = video
       ? veil_media_send_video_control_datagram(veil_chan_, packet.data(), packet.size())
       : veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
+  if (audio_ingress_diagnostics_)
+    video_loss_trace_.Rtcp(packet, 's', sent_us, rc);
   if (rc == 0) {
     if (video) video_remb_cadence_.Accepted(packet, sent_us, scope);
     if (group_rtcp_stats_) group_rtcp_stats_->Record(packet, video);
@@ -454,6 +458,12 @@ void VeilTransportShim::OnVeilDatagram(void* ctx, const uint8_t* ptr,
   };
   const bool rtcp = webrtc::IsRtcpPacket(std::span<const uint8_t>(ptr, len));
   const bool accepted = enqueue(IsSecondaryInboundRtp(std::span<const uint8_t>(ptr, len)));
+  if (self->audio_ingress_diagnostics_) {
+    const std::span<const uint8_t> packet(ptr, len);
+    if (rtcp) self->video_loss_trace_.Rtcp(packet, 'r', arrived_us, accepted ? 0 : 1);
+    else self->video_loss_trace_.Rtp(packet, self->remote_video_ssrc_.load(),
+                                    'r', arrived_us, accepted ? 0 : 1);
+  }
   // Each Call owns independent SSRC/TWCC state. Delivery additionally filters
   // REMB: upstream does not check that message's target list before applying it.
   // A slow video network/worker queue cannot hold the audio copy.
@@ -684,6 +694,8 @@ void VeilTransportShim::DeliverOnNetworkThread(
         arrived_us, webrtc::TimeMicros(), rtp.payload_size()});
   }
   if (is_video) {
+    if (audio_ingress_diagnostics_)
+      video_loss_trace_.Rtp(packet, vssrc, 'd', webrtc::TimeMicros(), 0);
     // Video RTP uses the fixed 90 kHz clock. The audio path gets its clock from
     // the registered Opus codec, but nothing sets it for video on our custom
     // DeliverRtpPacket route, so the receive-statistics RTC_CHECK_GT(frequency,
