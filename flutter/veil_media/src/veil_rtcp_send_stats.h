@@ -18,10 +18,14 @@ struct RtcpSendSnapshot {
   uint64_t audio_packets, audio_bytes, video_packets, video_bytes;
   std::array<std::array<uint64_t, kRtcpKinds>, 2> blocks{};
   std::array<uint64_t, 2> malformed{};
+  uint64_t video_remb_coalesced_copies = 0;
 };
 
 class RtcpSendStats {
  public:
+  void Coalesced(size_t copies) {
+    coalesced_.fetch_add(copies, std::memory_order_relaxed);
+  }
   void Record(size_t bytes, bool video) {
     auto& plane = planes_[video ? 1 : 0];
     plane.bytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -83,6 +87,7 @@ class RtcpSendStats {
         out.blocks[p][k] = planes_[p].blocks[k].load(std::memory_order_relaxed);
       out.malformed[p] = planes_[p].malformed.load(std::memory_order_relaxed);
     }
+    out.video_remb_coalesced_copies = coalesced_.load(std::memory_order_relaxed);
     return out;
   }
 
@@ -93,6 +98,7 @@ class RtcpSendStats {
     std::atomic<uint64_t> malformed{0};
   };
   std::array<Plane, 2> planes_;
+  std::atomic<uint64_t> coalesced_{0};
 };
 }  // namespace veil_media
 #endif

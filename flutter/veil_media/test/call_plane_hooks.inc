@@ -375,6 +375,25 @@ extern "C" int veil_media_test_audio_bandwidth() {
 // Veil callback can stall video while a second thread submits audio.
 extern "C" int veil_media_test_group_fanout_packet(VeilGroupMediaEngine* e,
                                                    int secondary) {
+  if (secondary >= 4 && secondary <= 8) {
+    std::vector<uint8_t> packet(64);
+    const auto word = [&](size_t at, uint32_t value) {
+      for (int i=0;i<4;++i) packet[at+i]=value>>(24-i*8);
+    };
+    packet[0]=0x80;packet[1]=200;packet[3]=6;word(4,9);
+    packet[28]=0x81;packet[29]=202;packet[31]=2;word(32,9);packet[36]=1;
+    packet[40]=0x8f;packet[41]=206;packet[43]=5;word(44,9);
+    packet[52]='R';packet[53]='E';packet[54]='M';packet[55]='B';packet[56]=1;
+    const uint32_t rate=secondary==6?16000:secondary==8?8000:32000;
+    packet[57]=(rate>>16)&3;packet[58]=rate>>8;packet[59]=rate;word(60,10);
+    if (secondary == 7) {
+      const size_t at=packet.size();packet.resize(at+16);
+      packet[at]=0x81;packet[at+1]=205;packet[at+3]=3;word(at+4,9);word(at+8,10);
+    }
+    webrtc::PacketOptions options;
+    auto* transport=secondary==5?e->ws->fanout.get():e->ws->fanout->video_transport();
+    return transport->SendRtcp(packet,options)?0:1;
+  }
   if (secondary == 2 || secondary == 3) {
     std::array<uint8_t, 8> rr{0x80, 201, 0, 1};
     webrtc::PacketOptions options;

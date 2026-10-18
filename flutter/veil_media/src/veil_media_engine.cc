@@ -363,17 +363,24 @@ class GroupFanoutTransport : public webrtc::Transport {
 
   void Add(uint64_t chan) {
     std::lock_guard<std::mutex> lock(mu_);
-    if (std::find(channels_.begin(), channels_.end(), chan) == channels_.end())
+    if (std::find(channels_.begin(), channels_.end(), chan) == channels_.end()) {
       channels_.push_back(chan);
+      ++membership_epoch_;
+    }
   }
 
   void Remove(uint64_t chan) {
     std::lock_guard<std::mutex> lock(mu_);
+    const auto before = channels_.size();
     channels_.erase(std::remove(channels_.begin(), channels_.end(), chan),
                     channels_.end());
+    if (channels_.size() != before) ++membership_epoch_;
   }
 
-  void SetVideoSendPaused(bool paused) { video_send_paused_.store(paused); }
+  void SetVideoSendPaused(bool paused) {
+    if (!paused) video_remb_cadence_.Reset();
+    video_send_paused_.store(paused);
+  }
 
   bool SendRtp(std::span<const uint8_t> packet,
                const webrtc::PacketOptions& options) override {
@@ -423,15 +430,24 @@ class GroupFanoutTransport : public webrtc::Transport {
     // Membership is caller-owned opaque handles, not raw engine pointers.
     // Snapshot under a short lock; video/RTCP sends must not hold audio here.
     // A removed/closed handle rejects a late already-selected send in Veil.
-    const auto channels = Snapshot();
+    uint64_t epoch = 0;
+    const auto channels = Snapshot(&epoch);
+    const auto sent_us = video ? webrtc::TimeMicros() : 0;
+    if (video && !channels.empty() && !video_remb_cadence_.Allow(packet, sent_us, epoch)) {
+      rtcp_stats_->Coalesced(channels.size());
+      return true;
+    }
     bool any = false;
+    bool all = !channels.empty();
     for (const uint64_t chan : channels) {
       const int rc = video
           ? veil_media_send_video_control_datagram(chan, packet.data(), packet.size())
           : veil_media_send_datagram(chan, packet.data(), packet.size());
       if (rc == 0) rtcp_stats_->Record(packet, video);
+      all = rc == 0 && all;
       any = rc == 0 || any;
     }
+    if (video && all) video_remb_cadence_.Accepted(packet, sent_us, epoch);
     return any;
   }
 
@@ -444,8 +460,9 @@ class GroupFanoutTransport : public webrtc::Transport {
  private:
   veil_media::VideoControlTransport<GroupFanoutTransport> video_transport_{*this};
   std::shared_ptr<veil_media::RtcpSendStats> rtcp_stats_;
-  std::vector<uint64_t> Snapshot() {
+  std::vector<uint64_t> Snapshot(uint64_t* epoch = nullptr) {
     std::lock_guard<std::mutex> lock(mu_);
+    if (epoch) *epoch = membership_epoch_;
     return channels_;
   }
   std::atomic<uint64_t> audio_drops_{0};
@@ -457,6 +474,8 @@ class GroupFanoutTransport : public webrtc::Transport {
   webrtc::Call* const video_call_;
   std::mutex mu_;
   std::vector<uint64_t> channels_;
+  uint64_t membership_epoch_ = 0;
+  veil_media::RembCadence video_remb_cadence_;
 };
 
 // The largest frame this engine will hold, per side.
@@ -2704,6 +2723,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
                   "_blocks\":" + std::to_string(rtcp_send.blocks[plane][kind]);
     snapshot += ",\"" + prefix + "malformed\":" + std::to_string(rtcp_send.malformed[plane]);
   }
+  snapshot += ",\"video_rtcp_remb_coalesced_copies\":" +
+              std::to_string(rtcp_send.video_remb_coalesced_copies);
   snapshot += ",\"audio_loss_report_us\":" + std::to_string(audio_loss_report_us) +
               ",\"video_loss_report_us\":" + std::to_string(video_loss_report_us);
   snapshot += ",\"audio_playout_peers\":" + std::to_string(playout_peers) +
