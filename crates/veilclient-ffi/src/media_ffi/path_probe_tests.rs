@@ -304,7 +304,7 @@ fn source_preflight_qualifies_before_rtp_callback_and_preserves_old_key_owner() 
     // A forged envelope source cannot choose the reflection destination. The
     // authenticated request is answered only to the call's pinned direct peer.
     let probe = RouteProbe::begin(
-        ProbeRoute::Relay,
+        ProbeRoute::Direct,
         Instant::now(),
         Duration::from_millis(600),
     );
@@ -566,6 +566,122 @@ fn a_lost_first_challenge_retries_without_stealing_the_live_audio_receiver() {
     unsafe { veil_media_close_channel(candidate) };
     assert_eq!(veil_media_channel_poll_path_probe(candidate), -1);
     unsafe { veil_media_set_recv_callback(old, None, ptr::null_mut()) };
+}
+
+#[test]
+fn relay_preparation_warms_the_host_pinned_reverse_route_while_direct_is_active() {
+    let _lock = FIXTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut fixture = Fixture::new();
+    let (old, _) = fixture.channel(ProbeRoute::Direct);
+    let [direct, relay] = fixture.paths();
+    MEDIA_CHANNELS
+        .write()
+        .unwrap()
+        .get_mut(&old)
+        .unwrap()
+        .control_destination = Some((direct.peer_app_id, direct.peer_endpoint_id));
+    let app = HandleTable::get(app_table(), direct.app as usize).unwrap();
+    let _context = source_preflight::install(old, app).unwrap();
+    let peer = media::cipher_for_test(&DEVICE, &RX, &TX).unwrap();
+    for plane in 0..3 {
+        let mut probe = RouteProbe::begin(
+            ProbeRoute::Relay,
+            Instant::now(),
+            Duration::from_millis(600),
+        );
+        let mut body = probe.request_payload();
+        body[6] = 1;
+        body[7] = plane;
+        let sealed = peer.seal(&body).unwrap().into_vec();
+        // Device aliases and the envelope's claimed source do not authorize
+        // a destination; the active call's configured paths do.
+        media::dispatch_inbound_auto([0xff; 32], &sealed);
+        // The SDK can fan the same sealed cell out through two neutral
+        // first hops. Ignore replay copies when checking the next plane.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (target, lane, header, forward, mut reply) = loop {
+            let (target, lane, bytes) = fixture
+                .captured
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            let header = codec::decode_header(&bytes).unwrap();
+            assert_eq!(
+                header.family,
+                FrameFamily::Delivery as u8,
+                "relay preparation must warm the reverse relay, not the current direct sender"
+            );
+            let forward =
+                veil_proto::delivery::ForwardPayload::decode(&bytes[HEADER_SIZE..]).unwrap();
+            if let Some(reply) = peer.open(&forward.envelope.payload) {
+                break (target, lane, header, forward, reply);
+            }
+        };
+        assert_eq!(
+            header.family,
+            FrameFamily::Delivery as u8,
+            "relay preparation must warm the reverse relay, not the current direct sender"
+        );
+        assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+        assert_eq!(
+            lane,
+            [
+                veil_proto::priority::REALTIME,
+                veil_proto::priority::BULK,
+                veil_proto::priority::BACKGROUND
+            ][usize::from(plane)]
+        );
+        assert_ne!(target, [0xff; 32]);
+        assert_eq!(forward.envelope.sender_node_id, DEVICE);
+        assert_eq!(forward.envelope.src_app_id, relay.app_id_for_test());
+        assert_eq!(forward.envelope.recipient.node_id, PEER_DEVICE);
+        assert_eq!(&reply[6..8], &[1, plane]);
+        reply[6..8].fill(0);
+        assert!(matches!(
+            probe.observe(ProbeControl::decode(&reply).unwrap(), Instant::now()),
+            ProbeStatus::Qualified(_)
+        ));
+    }
+}
+
+#[test]
+fn preparation_cannot_borrow_another_channels_pinned_paths() {
+    let _lock = FIXTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut fixture = Fixture::new();
+    let (old, _) = fixture.channel(ProbeRoute::Direct);
+    let (_other, _) = fixture.channel(ProbeRoute::Relay);
+    let [direct, _] = fixture.paths();
+    {
+        let mut channels = MEDIA_CHANNELS.write().unwrap();
+        let channel = channels.get_mut(&old).unwrap();
+        channel.path_probe = None;
+        channel.control_destination = Some((direct.peer_app_id, direct.peer_endpoint_id));
+    }
+    let app = HandleTable::get(app_table(), direct.app as usize).unwrap();
+    let _context = source_preflight::install(old, app).unwrap();
+    let peer = media::cipher_for_test(&DEVICE, &RX, &TX).unwrap();
+    let probe = RouteProbe::begin(
+        ProbeRoute::Relay,
+        Instant::now(),
+        Duration::from_millis(600),
+    );
+    let mut body = probe.request_payload();
+    body[6] = 1;
+    body[7] = 0;
+    media::dispatch_inbound_auto([0xff; 32], peer.seal(&body).unwrap().as_bytes());
+    let (target, _, bytes) = fixture
+        .captured
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(
+        target, PEER,
+        "unconfigured alternate cannot redirect the reply"
+    );
+    let header = codec::decode_header(&bytes).unwrap();
+    assert_eq!(header.family, FrameFamily::App as u8);
+    let rt = AppRtDataPayload::decode(&bytes[HEADER_SIZE..]).unwrap();
+    assert_eq!(rt.app_id, direct.peer_app_id);
+    let reply = peer.open(&rt.payload).unwrap();
+    assert_eq!(&reply[6..8], &[1, 0]);
 }
 
 #[test]

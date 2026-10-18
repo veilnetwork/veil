@@ -5,6 +5,9 @@
 use std::time::{Duration, Instant};
 
 use rand_core::{OsRng, RngCore};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) const MAGIC: &[u8; 4] = b"VMP1";
 pub(crate) const CONTROL_BYTES: usize = 24;
@@ -99,6 +102,7 @@ pub(crate) enum ProbeStatus {
 /// committing. Replies must pass the candidate's receive key before entering
 /// `observe`; possession of a token without a valid seal is insufficient.
 pub(crate) struct RouteProbe {
+    trace_id: u64,
     request: ProbeControl,
     sent_at: Instant,
     last_request_at: Instant,
@@ -113,7 +117,15 @@ impl RouteProbe {
         while token == [0; 16] {
             OsRng.fill_bytes(&mut token);
         }
+        let trace_id = NEXT_TRACE_ID.fetch_add(1, Ordering::Relaxed);
+        if veil_session::rt_trace::rt_trace_enabled() {
+            log::info!(
+                "media.path_probe begin id={trace_id} route={route:?} budget_us={}",
+                max_round_trip.as_micros()
+            );
+        }
         Self {
+            trace_id,
             request: ProbeControl {
                 kind: Kind::Request,
                 route,
@@ -167,13 +179,27 @@ impl RouteProbe {
     }
 
     pub(crate) fn observe(&mut self, reply: ProbeControl, now: Instant) -> ProbeStatus {
-        if self.status(now) != ProbeStatus::Pending {
+        let status = self.status(now);
+        let matches = reply.kind == Kind::Reply
+            && reply.route == self.request.route
+            && reply.token == self.request.token;
+        // Endpoint-only diagnostics: identify an authenticated matching reply
+        // even when it arrives after expiry. No token, payload or key is logged,
+        // and observing a late reply still cannot qualify or extend the route.
+        if veil_session::rt_trace::rt_trace_enabled() {
+            log::info!(
+                "media.path_probe reply id={} route={:?} matches={} status={status:?} age_us={} budget_us={}",
+                self.trace_id,
+                self.request.route,
+                matches,
+                now.saturating_duration_since(self.sent_at).as_micros(),
+                self.max_round_trip.as_micros(),
+            );
+        }
+        if status != ProbeStatus::Pending {
             return self.status;
         }
-        if reply.kind != Kind::Reply
-            || reply.route != self.request.route
-            || reply.token != self.request.token
-        {
+        if !matches {
             return self.status;
         }
         if let Some(age) = now.checked_duration_since(self.sent_at) {
