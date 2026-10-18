@@ -1932,7 +1932,7 @@ VeilGroupMediaEngine* veil_media_group_engine_create(
                               ws->video_network_tq.get());
   ws->video_call = webrtc::Call::Create(std::move(video_cfg));
   ws->fanout = std::make_unique<GroupFanoutTransport>(
-      ws->call.get(), ws->video_call.get(), ssrc_of(engine->local),
+      ws->call.get(), ws->video_call.get(), group_audio_ssrc_of(engine->local),
       group_video_ssrc_of(engine->local),
       ws->rtcp_send_stats);
   engine->ws = std::move(ws);
@@ -4298,6 +4298,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
       }
       snapshot += ",\"audio_loss_report_us\":" +
           std::to_string(audio_report.fresh_loss_report_us(loss_now_us));
+      snapshot += ",\"audio_rtt_route_epoch\":" + std::to_string(audio_report.route_epoch);
+      snapshot += ",\"video_rtt_route_epoch\":" + std::to_string(video_report.route_epoch);
       snapshot += ",\"video_loss_report_us\":" +
           std::to_string(video_report.fresh_loss_report_us(loss_now_us));
       snapshot += ",\"audio_output_emitted_samples\":" + std::to_string(audio_output_emitted_samples);

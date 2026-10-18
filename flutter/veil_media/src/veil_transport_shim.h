@@ -43,6 +43,7 @@
 #include "veil_audio_redundancy.h"
 #include "veil_audio_recovery_feedback.h"
 #include "veil_video_control_transport.h"
+#include "veil_rtcp_route_clock.h"
 
 namespace webrtc {
 class Call;
@@ -60,6 +61,8 @@ struct RtcpFeedbackSnapshot {
   // Local arrival time of the last nonzero fractional-loss report. Healthy
   // reports must not renew it, including reports from another room peer.
   int64_t loss_report_us = 0;
+  uint32_t last_sender_report = 0;
+  uint64_t route_epoch = 0;
 
   bool fresh_at(int64_t now_us) const {
     return arrived_us > 0 && arrived_us <= now_us &&
@@ -325,6 +328,7 @@ class VeilTransportShim : public webrtc::Transport {
   std::mutex audio_send_diagnostics_mu_;
   std::vector<AudioSendSample> audio_send_samples_;
   mutable std::mutex audio_feedback_mu_;
+  RtcpRouteClock rtcp_route_clock_;
   RtcpFeedbackSnapshot audio_feedback_;
   RtcpFeedbackSnapshot video_feedback_;
   AudioPlayoutSnapshot audio_playout_feedback_;

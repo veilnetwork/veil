@@ -239,6 +239,17 @@ bool VeilTransportShim::RebindChannel(uint64_t veil_chan, bool retain_previous_r
   // qualify/reinstall it after committing this handover, never implicitly.
   audio_mirror_chan_.store(0, std::memory_order_release);
   veil_chan_.store(veil_chan, std::memory_order_release);
+  {
+    std::lock_guard lock(audio_feedback_mu_);
+    auto* clock = webrtc::Clock::GetRealTimeClock();
+    rtcp_route_clock_.Reset(webrtc::CompactNtp(clock->CurrentNtpTime()));
+    // Retain loss/playout evidence and the engine's live counters. Cached
+    // RTT about the previous sender path is unknown for the new path.
+    for (auto* feedback : {&audio_feedback_, &video_feedback_}) {
+      feedback->rtt_ms = 0;
+      feedback->route_epoch = rtcp_route_clock_.epoch();
+    }
+  }
   receive_channels_.push_back(veil_chan);
   if (!retain_previous_receiver) ReleaseReceiveChannel(previous);
   return true;
@@ -535,6 +546,7 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
       if (block.fraction_lost() != 0) sample.loss_report_us = arrived_us;
       const uint32_t clock_rate = audio ? 48000 : 90000;
       sample.jitter_ms = static_cast<int>(uint64_t(block.jitter()) * 1000 / clock_rate);
+      sample.last_sender_report = block.last_sr();
       if (block.last_sr() != 0) {
         auto* clock = webrtc::Clock::GetRealTimeClock();
         const uint32_t now = webrtc::CompactNtp(clock->ConvertTimestampToNtpTime(
@@ -587,11 +599,15 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
     std::lock_guard lock(audio_feedback_mu_);
     if (recovery) peer_audio_recovery_.Observe(*recovery, local, arrived_us);
     if (candidate.arrived_us > 0 && candidate.arrived_us >= audio_feedback_.arrived_us) {
+      candidate.route_epoch = rtcp_route_clock_.epoch();
+      if (!rtcp_route_clock_.Accepts(candidate.last_sender_report)) candidate.rtt_ms = 0;
       candidate.loss_report_us = std::max(candidate.loss_report_us,
                                           audio_feedback_.loss_report_us);
       audio_feedback_ = candidate;
     }
     if (video_candidate.arrived_us > 0 && video_candidate.arrived_us >= video_feedback_.arrived_us) {
+      video_candidate.route_epoch = rtcp_route_clock_.epoch();
+      if (!rtcp_route_clock_.Accepts(video_candidate.last_sender_report)) video_candidate.rtt_ms = 0;
       video_candidate.loss_report_us = std::max(video_candidate.loss_report_us,
                                                 video_feedback_.loss_report_us);
       video_feedback_ = video_candidate;
