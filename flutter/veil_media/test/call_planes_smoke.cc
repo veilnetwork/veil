@@ -301,6 +301,33 @@ static void wait_playout(VeilGroupMediaEngine* e, uint64_t reports, uint64_t del
   if (reports) assert(group_stat(e, "audio_playout_ms") == delay);
 }
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--group-remb-cadence") == 0) {
+    uint8_t local[32]={91}, alice[32]={92}, bob[32]={93};
+    std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> e(
+        veil_media_group_engine_create(local),veil_media_group_engine_destroy);
+    assert(e);
+    assert(veil_media_group_engine_add_peer(e.get(),190,alice)==VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_add_peer(e.get(),191,bob)==VEIL_MEDIA_OK);
+    const auto send=[&](int kind){assert(veil_media_test_group_fanout_packet(e.get(),kind)==0);};
+    const auto video=[&](uint64_t n){assert(group_stat(e.get(),"video_rtcp_tx_pkts")==n);};
+    send(4); video(2); send(4); video(2);
+    assert(group_stat(e.get(),"video_rtcp_remb_coalesced_copies")==2);
+    // Audio never enters the video cadence, even for the same compound.
+    send(5); video(2); assert(group_stat(e.get(),"audio_rtcp_tx_pkts")==2);
+    send(6); video(4);  // A lower rate passes immediately.
+    {std::lock_guard lock(callback_mu);rejected_channels.insert(190);}
+    send(8); video(5); send(8); video(6);  // Partial fanout does not commit.
+    {std::lock_guard lock(callback_mu);rejected_channels.erase(190);}
+    send(8); video(8);
+    send(7); video(10); send(7); video(12);  // NACK compound never coalesces.
+    assert(veil_media_group_engine_remove_peer(e.get(),alice)==VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_add_peer(e.get(),192,alice)==VEIL_MEDIA_OK);
+    send(4); video(14); send(4); video(14);  // New membership gets fresh feedback.
+    assert(group_stat(e.get(),"video_rtcp_remb_coalesced_copies")==4);
+    e.reset(); assert(callbacks.empty());
+    std::puts("REMB cadence: video-only, immediate cuts/repair, partial fanout and membership OK");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--group-rtcp-accounting") == 0) {
     uint8_t local[32] = {91}, alice[32] = {92}, bob[32] = {93};
     std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> e(

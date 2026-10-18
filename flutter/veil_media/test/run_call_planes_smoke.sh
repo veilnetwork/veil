@@ -13,6 +13,9 @@ clang++ -std=c++20 -Wall -Wextra -Werror -Wl,-export_dynamic \
 if [ "$#" -eq 0 ]; then
   "$STAND_DIR/smoke" --rtcp-loss
   "$STAND_DIR/smoke" --group-rtcp-accounting
+  "$STAND_DIR/smoke" --group-remb-cadence
+  "$ROOT/test/run_remb_cadence_smoke.sh"
+  "$ROOT/test/run_rtcp_send_stats_smoke.sh"
   clang++ -std=c++20 -Wall -Wextra -Werror -Wl,-export_dynamic \
     -I"$ROOT/src" "$ROOT/test/group_video_repair_stats_smoke.cc" \
     "$STAND_DIR/libveil_media.dylib" -Wl,-rpath,"$STAND_DIR" -o "$STAND_DIR/repair-stats"

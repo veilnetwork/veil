@@ -44,6 +44,7 @@
 #include "veil_audio_recovery_feedback.h"
 #include "veil_video_control_transport.h"
 #include "veil_rtcp_route_clock.h"
+#include "veil_remb_cadence.h"
 
 namespace webrtc {
 class Call;
@@ -356,6 +357,7 @@ class VeilTransportShim : public webrtc::Transport {
   std::atomic<uint64_t> inbound_packet_count_{0};
   std::atomic<uint64_t> inbound_byte_count_{0};
   std::shared_ptr<RtcpSendStats> group_rtcp_stats_;
+  RembCadence video_remb_cadence_;
   std::atomic<uint64_t> outbound_packet_count_{0};
   std::atomic<uint64_t> outbound_rtcp_packet_count_{0}, outbound_rtcp_byte_count_{0};
   std::atomic<uint64_t> outbound_video_rtcp_packet_count_{0}, outbound_video_rtcp_byte_count_{0};
