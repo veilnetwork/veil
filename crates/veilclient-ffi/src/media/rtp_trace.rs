@@ -83,15 +83,17 @@ pub(super) fn record(stage: &str, sealed: &[u8], plaintext: &[u8]) {
     if !veil_util::sealed_trace::sample(sequence) {
         return;
     }
+    let digest = veil_session::opaque_forward_trace::payload_digest(sealed);
     let _ = packets(plaintext, |index, packet| {
         let Some(rtp) = rtp(packet) else { return };
         let monotonic_us = veil_util::diagnostic_clock::monotonic_us().map_or(-1i128, i128::from);
         log::info!(
-            "media.rtp.cell stage={stage} monotonic_us={monotonic_us} epoch={epoch:016x} seq={sequence} index={index} ssrc={} rtp_seq={} timestamp={} payload_bytes={}",
+            "media.rtp.cell stage={stage} monotonic_us={monotonic_us} epoch={epoch:016x} seq={sequence} index={index} ssrc={} rtp_seq={} timestamp={} payload_bytes={} sealed_sha256={}",
             rtp.ssrc,
             rtp.sequence,
             rtp.timestamp,
             rtp.payload_bytes,
+            digest.as_deref().unwrap_or("-"),
         );
     });
 }
