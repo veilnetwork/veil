@@ -29,7 +29,7 @@ export 'src/background.dart' show VeilBackground;
 // trace (call-RTT-spike investigation) — driven by the xVeil debug hook.
 export 'src/bindings.dart' show veilDebugSetPublishPause, veilDebugSetRtTrace;
 export 'src/client.dart'
-    show VeilClient, AppHandle, veilSealBytes, veilUnsealBytes;
+    show VeilClient, AppHandle, MediaPacketSource, veilSealBytes, veilUnsealBytes;
 export 'src/identity.dart'
     show
         generateMasterPhrase,

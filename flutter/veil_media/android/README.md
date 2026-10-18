@@ -95,3 +95,31 @@ This path is still awaiting physical cellular validation. Successful strict
 synthetic tests supply an explicit client budget; automatic capacity-loss
 characterization still exceeds the latency gate. Do not treat the opt-in build
 as a verified cure for phone pauses or a reason to replace release engine pins.
+
+## Independent video framing
+
+`veil_media_engine_set_video_packet_overhead(engine, bytes_below_rtp)` updates
+the video allocator and pacer independently of audio. It accepts 0–1024 bytes,
+requires independent transport feedback and can run before or during video.
+It retains the sender, receiver and path generation. A busy video worker returns
+ERR_STATE after a bounded wait; retry rather than claiming an unapplied hint.
+The video allocator also accounts for frame cadence when estimating packet
+overhead, so many small frames are not treated as a few full-MTU packets.
+
+Obtain the hint from the SDK's optional
+`veil_media_channel_source_packet_cost(chan, local_lane, packet_bytes)`:
+0 selects audio, 2 video, 3 screen. An unprepared child returns null. Do not use
+an audio snapshot as a substitute for another source's carrier, or turn aggregate
+replication bytes into one larger packet header. Unknown paths retain their
+previous hint. The older audio-only query remains available.
+
+This is endpoint accounting only. The model excludes QUIC/TCP/IP overhead,
+models unbatched framing and expected obfs4 padding, and proves neither delivery
+nor end-to-end quality. No relay receives a media role or priority instruction.
+
+The shared VP8 frame sizer also protects actual allocations at or below
+30 kbit/s, even if the host selected a higher profile. A paused encoder retains
+its last positive sizing budget. Resolution protection is released once the
+effective allocation reaches 60 kbit/s, so a call already at its maximum host
+profile can recover resolution without a new profile selection. This does not
+discard encoded reference frames or increase the host's bitrate/fps ceiling.

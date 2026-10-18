@@ -7,7 +7,7 @@
 library;
 
 export 'src/client.dart'
-    show VeilClient, AppHandle, veilSealBytes, veilUnsealBytes;
+    show VeilClient, AppHandle, MediaPacketSource, veilSealBytes, veilUnsealBytes;
 export 'src/crypto.dart' show VeilCrypto;
 export 'src/identity.dart'
     show

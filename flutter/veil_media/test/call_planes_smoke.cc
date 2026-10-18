@@ -573,6 +573,7 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--dual-framing") == 0) {
+    setenv("VEIL_MEDIA_TEST_ROUTE_OBSERVER", "1", 1);
     uint8_t local[32] = {0x75}, peer[32] = {0x76};
     setenv("VEIL_MEDIA_TEST_VIDEO", "1", 1);
     std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(
@@ -585,7 +586,31 @@ int main(int argc, char** argv) {
     // Stream creation/configuration must retain both independent route models.
     assert(veil_media_test_audio_transport_overhead(e.get()) == 509);
     assert(veil_media_test_video_transport_overhead(e.get()) == 536);
-    std::fputs("independent controllers retain audio=509 video=536 framing\n", stderr);
+    assert(veil_media_engine_set_video_packet_overhead(e.get(), 360) == VEIL_MEDIA_OK);
+    assert(veil_media_test_video_transport_overhead(e.get()) == 360);
+    assert(veil_media_test_audio_transport_overhead(e.get()) == 509);
+    assert(veil_media_test_route_restarts(e.get(), 0) == 0);
+    assert(veil_media_test_route_restarts(e.get(), 1) == 0);
+    const auto blocked = [](void* context) {
+      auto* engine = static_cast<VeilMediaEngine*>(context);
+      const auto start = std::chrono::steady_clock::now();
+      assert(veil_media_engine_set_video_packet_overhead(engine, 209) == VEIL_MEDIA_ERR_STATE);
+      assert(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(150));
+      return 0;
+    };
+    assert(veil_media_test_with_held_video_worker(e.get(), blocked, e.get()) == 0);
+    assert(veil_media_test_video_transport_overhead(e.get()) == 360);
+    assert(stat(e.get(), "video_packet_overhead_bytes") == 360);
+    assert(veil_media_engine_set_video_packet_overhead(e.get(), 209) == VEIL_MEDIA_OK);
+    assert(veil_media_engine_rebind_channel(e.get(), 100) == VEIL_MEDIA_OK);
+    assert(veil_media_test_video_transport_overhead(e.get()) == 209);
+    assert(veil_media_test_audio_transport_overhead(e.get()) == 509);
+    assert(veil_media_test_route_restarts(e.get(), 0) == 1);
+    assert(veil_media_test_route_restarts(e.get(), 1) == 1);
+    for (int invalid : {-1, 1025, 4096})
+      assert(veil_media_engine_set_video_packet_overhead(e.get(), invalid) == VEIL_MEDIA_ERR_ARG);
+    assert(veil_media_test_video_transport_overhead(e.get()) == 209);
+    std::fputs("independent framing: live video hints, cancelled busy worker, real handover and separate audio retained\n", stderr);
     return 0;
   }
   const bool adaptive_audio = argc == 2 &&

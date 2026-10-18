@@ -3868,6 +3868,11 @@ int veil_media_channel_configure_path_probes(uint64_t chan,
  char *veil_media_channel_packet_cost(uint64_t chan, size_t packet_bytes) ;
 #endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/** Same local model on source 0 audio, 2 video, 3 screen. No wire role hint. */
+ char *veil_media_channel_source_packet_cost(uint64_t chan, uint8_t local_lane, size_t packet_bytes) ;
+#endif
+
 /**
  * Register this node as a LOCATION-anonymous (onion) service: the daemon picks
  * relays, builds an onion circuit to a rendezvous relay (which never learns
