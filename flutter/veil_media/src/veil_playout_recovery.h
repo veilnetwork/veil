@@ -63,7 +63,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
       // subsequent decoder call fails.
       for (; skipped < 16;) {
         const auto state = inner_->GetOperationsAndState();
-        if (state.current_buffer_size_ms <= kRecoveryBudgetMs ||
+        if (state.current_buffer_size_ms <= static_cast<uint64_t>(RecoveryBudgetMs()) ||
             (inner_->SyncBufferSizeMs() < 20 && !state.next_packet_available))
           break;
         bool next_muted = false;
@@ -147,9 +147,17 @@ class RecoveringNetEq final : public webrtc::NetEq {
   // Leave room for one ordinary decoded packet arrival; otherwise NetEq
   // refills toward a level that this wrapper discards on every render tick.
   // This caps the desired level, not actual storage, FEC or usable catch-up.
-  static constexpr int kRecoveryBudgetMs = 120;
+  // Long Opus packets need additional reorder headroom: cutting 60-ms
+  // packets at 120 ms repeatedly discards usable speech on a lossless path
+  // with 100-ms arrival variation. Short packets retain the original 120-ms
+  // recovery bound; applying 200 ms to them delays group-mixer recovery.
+  // Never exceed the endpoint's 200-ms video-pressure ceiling. These are
+  // maximum queue budgets, not a fixed playout delay or network RTT.
+  int RecoveryBudgetMs() const {
+    return std::clamp(80 + 2 * frame_headroom_ms_, 120, 200);
+  }
   bool ApplyTargetCeiling() {
-    int ceiling = kRecoveryBudgetMs - frame_headroom_ms_;
+    int ceiling = RecoveryBudgetMs() - frame_headroom_ms_;
     if (requested_maximum_delay_ms_ > 0)
       ceiling = std::min(ceiling, requested_maximum_delay_ms_);
     if (ceiling == applied_target_ceiling_ms_) return true;
