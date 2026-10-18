@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -11,7 +13,28 @@
 #include "api/transport/network_control.h"
 #include "veil_diag_log.h"
 
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
+
 namespace veil_media {
+
+// This header is included by the engine only in the separate CC-trace build.
+// Android app processes cannot inherit an operator's shell environment; the
+// explicit debug property is its equivalent runtime opt-in. A diagnostic path
+// is still required, and an explicit environment value takes precedence.
+inline bool video_cc_trace_enabled() {
+  if (!diag::enabled()) return false;
+  if (const char* value = std::getenv("VEIL_MEDIA_TRACE_VIDEO_CC"))
+    return std::strcmp(value, "1") == 0;
+#if defined(__ANDROID__)
+  char value[PROP_VALUE_MAX] = {};
+  return __system_property_get("debug.veil_media.video_cc", value) > 0 &&
+         std::strcmp(value, "1") == 0;
+#else
+  return false;
+#endif
+}
 
 // Stand-only observation of the real controller. No packet/feedback contents
 // are retained and no file I/O occurs on a network-controller callback.
@@ -32,13 +55,15 @@ class VideoCcTrace final : public webrtc::NetworkControllerInterface {
     std::fprintf(file, "video.cc.begin id=%llu rows=%zu seen=%llu\n",
                  (unsigned long long)id_, rows_.size(), (unsigned long long)seen_);
     for (const auto& r : rows_)
-      std::fprintf(file, "video.cc.sample id=%llu at_us=%lld available=%d route=%llu cwnd_bytes=%lld inflight_bytes=%lld pacer_queue_bytes=%lld target_bps=%lld pacing_bps=%lld feedback_at_us=%lld feedback_packets=%llu sent_packets=%llu\n",
+      std::fprintf(file, "video.cc.sample id=%llu at_us=%lld available=%d route=%llu cwnd_bytes=%lld inflight_bytes=%lld pacer_queue_bytes=%lld target_bps=%lld pacing_bps=%lld feedback_at_us=%lld feedback_packets=%llu sent_packets=%llu constraints_at_us=%lld constraints_min_bps=%lld constraints_max_bps=%lld\n",
                    (unsigned long long)id_, (long long)r.at, r.available,
                    (unsigned long long)r.route, (long long)r.cwnd,
                    (long long)r.inflight, (long long)r.queue, (long long)r.target,
                    (long long)r.pacing, (long long)r.feedback_at,
                    (unsigned long long)r.feedback_packets,
-                   (unsigned long long)r.sent_packets);
+                   (unsigned long long)r.sent_packets,
+                   (long long)r.constraints_at, (long long)r.constraints_min,
+                   (long long)r.constraints_max);
     const bool ok = std::fflush(file) == 0 && !std::ferror(file);
     std::fprintf(file, "video.cc.end id=%llu write_ok=%d\n",
                  (unsigned long long)id_, int(ok));
@@ -78,6 +103,12 @@ class VideoCcTrace final : public webrtc::NetworkControllerInterface {
     state_.feedback_packets += m.packet_feedbacks.size();
     return Apply(inner_->OnTransportPacketsFeedback(std::move(m)));
   }
+  webrtc::NetworkControlUpdate OnTargetRateConstraints(webrtc::TargetRateConstraints m) override {
+    state_.constraints_at = m.at_time.us_or(int64_t{-1});
+    state_.constraints_min = m.min_data_rate ? m.min_data_rate->bps_or(int64_t{-1}) : -1;
+    state_.constraints_max = m.max_data_rate ? m.max_data_rate->bps_or(int64_t{-1}) : -1;
+    return Apply(inner_->OnTargetRateConstraints(std::move(m)));
+  }
 #define VEIL_CC_FORWARD(Method, Type) \
   webrtc::NetworkControlUpdate Method(webrtc::Type m) override { \
     return Apply(inner_->Method(std::move(m))); \
@@ -86,7 +117,6 @@ class VideoCcTrace final : public webrtc::NetworkControllerInterface {
   VEIL_CC_FORWARD(OnRoundTripTimeUpdate, RoundTripTimeUpdate)
   VEIL_CC_FORWARD(OnReceivedPacket, ReceivedPacket)
   VEIL_CC_FORWARD(OnStreamsConfig, StreamsConfig)
-  VEIL_CC_FORWARD(OnTargetRateConstraints, TargetRateConstraints)
   VEIL_CC_FORWARD(OnTransportLossReport, TransportLossReport)
   VEIL_CC_FORWARD(OnNetworkStateEstimate, NetworkStateEstimate)
 #undef VEIL_CC_FORWARD
@@ -102,6 +132,7 @@ class VideoCcTrace final : public webrtc::NetworkControllerInterface {
   struct Row {
     int64_t at = -1, cwnd = -1, inflight = -1, queue = -1;
     int64_t target = -1, pacing = -1, feedback_at = -1;
+    int64_t constraints_at = -1, constraints_min = -1, constraints_max = -1;
     uint64_t route = 0, feedback_packets = 0, sent_packets = 0;
     int available = -1;
   } state_;

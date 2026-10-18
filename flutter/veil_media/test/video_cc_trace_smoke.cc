@@ -32,10 +32,16 @@ struct Spy final : webrtc::NetworkControllerInterface {
   SPY_METHOD(OnRoundTripTimeUpdate, RoundTripTimeUpdate)
   SPY_METHOD(OnReceivedPacket, ReceivedPacket)
   SPY_METHOD(OnStreamsConfig, StreamsConfig)
-  SPY_METHOD(OnTargetRateConstraints, TargetRateConstraints)
   SPY_METHOD(OnTransportLossReport, TransportLossReport)
   SPY_METHOD(OnNetworkStateEstimate, NetworkStateEstimate)
 #undef SPY_METHOD
+  webrtc::NetworkControlUpdate OnTargetRateConstraints(webrtc::TargetRateConstraints m) override {
+    Require(m.at_time.us() == 166214345000LL);
+    Require(m.min_data_rate && m.min_data_rate->bps() == 1000);
+    Require(m.max_data_rate && m.max_data_rate->bps() == 15000);
+    Require(!m.starting_rate);
+    return Result();
+  }
   webrtc::NetworkControlUpdate OnSentPacket(webrtc::SentPacket m) override {
     Require(m.sequence_number == 7 && m.data_in_flight.bytes() == 5000);
     return Result();
@@ -58,7 +64,17 @@ void Same(const webrtc::NetworkControlUpdate& u) {
 
 int main(int argc, char** argv) {
   Require(argc == 2);
+  unsetenv("VEIL_MEDIA_DIAG_PATH");
+  setenv("VEIL_MEDIA_TRACE_VIDEO_CC", "1", 1);
+  Require(!veil_media::video_cc_trace_enabled());
   setenv("VEIL_MEDIA_DIAG_PATH", argv[1], 1);
+  Require(veil_media::video_cc_trace_enabled());
+  for (const char* value : {"", "0", "true", "11"}) {
+    setenv("VEIL_MEDIA_TRACE_VIDEO_CC", value, 1);
+    Require(!veil_media::video_cc_trace_enabled());
+  }
+  unsetenv("VEIL_MEDIA_TRACE_VIDEO_CC");
+  Require(!veil_media::video_cc_trace_enabled());
   std::remove(argv[1]);
   {
     auto spy = std::make_unique<Spy>();
@@ -70,7 +86,11 @@ int main(int argc, char** argv) {
     Same(trace.OnRoundTripTimeUpdate({}));
     Same(trace.OnReceivedPacket({}));
     Same(trace.OnStreamsConfig({}));
-    Same(trace.OnTargetRateConstraints({}));
+    webrtc::TargetRateConstraints constraints;
+    constraints.at_time = webrtc::Timestamp::Micros(166214345000LL);
+    constraints.min_data_rate = webrtc::DataRate::BitsPerSec(1000);
+    constraints.max_data_rate = webrtc::DataRate::BitsPerSec(15000);
+    Same(trace.OnTargetRateConstraints(constraints));
     Same(trace.OnTransportLossReport({}));
     Same(trace.OnNetworkStateEstimate({}));
     webrtc::SentPacket sent;
@@ -102,6 +122,7 @@ int main(int argc, char** argv) {
   Require(text.find("inflight_bytes=5000") != std::string::npos);
   Require(text.find("inflight_bytes=900") != std::string::npos);
   Require(text.find("feedback_at_us=166214355949") != std::string::npos);
+  Require(text.find("constraints_at_us=166214345000 constraints_min_bps=1000 constraints_max_bps=15000") != std::string::npos);
   Require(text.find("write_ok=1") != std::string::npos);
   std::remove(argv[1]);
 }
