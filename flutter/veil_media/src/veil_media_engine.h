@@ -217,6 +217,8 @@ int veil_media_engine_set_independent_transport_feedback(VeilMediaEngine *engine
  * state-preserving Opus packet-duration adaptation (20..60 ms). Requires
  * independent feedback and the bundled local ANA factory. Zero disables
  * this option; unsupported builds return ERR_STATE for a positive hint.
+ * After starting, an already enabled positive hint can be updated for route
+ * framing changes without recreating streams. Enabling/disabling stays frozen.
  * RTP overhead is added separately by WebRTC. A hint does not measure actual
  * wire delivery or give relays any scheduling information. */
 int veil_media_engine_set_audio_packet_overhead(VeilMediaEngine *engine, int bytes);

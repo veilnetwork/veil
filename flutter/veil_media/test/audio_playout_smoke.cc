@@ -24,8 +24,13 @@ extern "C" int veil_media_test_audio_playout_pcm(VeilMediaEngine*, int16_t*, siz
 extern "C" VeilMediaEngine* veil_media_test_duplex_codec_create(
     uint64_t, const uint8_t[32], const uint8_t[32]);
 extern "C" int veil_media_test_audio_transport_budget(VeilMediaEngine*, int);
+extern "C" int veil_media_test_audio_fixed_transport_budget(VeilMediaEngine*, int);
 extern "C" VeilMediaEngine* veil_media_test_adaptive_codec_create(
     uint64_t, const uint8_t[32], const uint8_t[32], int);
+extern "C" int veil_media_test_audio_transport_overhead(VeilMediaEngine*);
+extern "C" int veil_media_test_video_transport_overhead(VeilMediaEngine*);
+extern "C" int veil_media_test_blocked_audio_stats(
+    VeilMediaEngine*, int (*)(void*, uint64_t, uint32_t, uint32_t), void*);
 struct Callback { void (*fn)(void*, const uint8_t*, size_t); void* ctx; };
 struct Packet { Clock::time_point due; std::vector<uint8_t> bytes; uint64_t destination = 0; };
 static std::mutex mu;
@@ -35,6 +40,7 @@ static Clock::time_point origin;
 static uint64_t source_channel = 0, receiver_channel = 0;
 static size_t sent_packets = 0;
 static bool charged_link=false,charged_duplex=false;
+static bool live_framing = false;
 static int charged_phase_ticks=400,charged_queue_ms=200;
 static std::array<double,3> charged_queue_max_ms{};
 static std::array<size_t,3> control_wire_bytes_by_phase{};
@@ -76,8 +82,8 @@ extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t 
     const bool control=len>=4 && p[1]>=192 && p[1]<=223;
     if(!control && (len<12 || p[0]>>6!=2)) return -1;
     if(!control)++submitted_rtp_types[phase][p[1]&0x7f];
-    const int capacity=phase==1 ? 64000 : 160000;
-    const size_t cost=len+209;
+    const int capacity=live_framing ? 160000 : phase==1 ? 64000 : 160000;
+    const size_t cost=len+(live_framing && phase==1 ? 360 : 209);
     const auto finish=std::max(now,wire_free[chan])+std::chrono::microseconds(cost*8000000/capacity);
     // Bounded, lossy source queue; admission remains asynchronous to RTP.
     if(finish-now>std::chrono::milliseconds(charged_queue_ms)) {
@@ -174,6 +180,136 @@ static uint64_t metric(VeilMediaEngine* e, const char* name) {
   const auto* at = std::strstr(json, key.c_str()); assert(at);
   const auto value = std::strtoull(at + key.size(), nullptr, 10);
   veil_media_free_string(json); return value;
+}
+
+static void verify_live_framing() {
+  charged_link = true;
+  live_framing = true;
+  charged_phase_ticks = 1200;
+  source_channel = 200;
+  receiver_channel = 300;
+  const uint8_t local[32] = {1}, peer[32] = {2};
+  using Engine = std::unique_ptr<VeilMediaEngine,
+                                 decltype(&veil_media_engine_destroy)>;
+  Engine source(veil_media_test_adaptive_codec_create(200, local, peer, 209),
+                veil_media_engine_destroy);
+  Engine receiver(veil_media_test_adaptive_codec_create(300, peer, local, 209),
+                  veil_media_engine_destroy);
+  assert(source && receiver);
+  {
+    Engine disabled(veil_media_test_audio_playout_create(400, local, peer, 0, 0),
+                    veil_media_engine_destroy);
+    assert(disabled);
+    assert(veil_media_engine_set_audio_packet_overhead(disabled.get(), 360) == VEIL_MEDIA_ERR_STATE);
+  }
+  const auto update_while_blocked = [](void* ctx, uint64_t, uint32_t, uint32_t) {
+    const auto began = Clock::now();
+    assert(veil_media_engine_set_audio_packet_overhead(
+               static_cast<VeilMediaEngine*>(ctx), 360) == VEIL_MEDIA_ERR_STATE);
+    assert(Clock::now() - began < std::chrono::milliseconds(200));
+    return 0;
+  };
+  assert(veil_media_test_blocked_audio_stats(source.get(), update_while_blocked,
+                                             source.get()) == 0);
+  // Draining after the abandoned task must not apply a stale hint later.
+  assert(veil_media_test_audio_transport_overhead(source.get()) == 209);
+  assert(metric(source.get(), "audio_packet_overhead_bytes") == 209);
+  assert(veil_media_engine_set_audio_packet_overhead(source.get(), 0) == VEIL_MEDIA_ERR_STATE);
+  assert(veil_media_engine_set_audio_packet_overhead(source.get(), -1) == VEIL_MEDIA_ERR_ARG);
+  assert(veil_media_engine_set_audio_packet_overhead(source.get(), 4097) == VEIL_MEDIA_ERR_ARG);
+  const int video_overhead = veil_media_test_video_transport_overhead(source.get());
+  assert(video_overhead >= 0);
+  assert(veil_media_test_audio_fixed_transport_budget(source.get(), 160000) == 0);
+  assert(veil_media_test_audio_fixed_transport_budget(receiver.get(), 160000) == 0);
+  origin = Clock::now();
+  std::array<int16_t, 480> pcm{}, reverse_pcm{};
+  std::array<size_t, 3> voiced{}, duration_matches{}, observations{}, settled_drops{};
+  std::vector<double> sent_edges, rendered_edges;
+  bool was_high = false;
+  double max_lateness = 0;
+  for (int tick = 0; tick < 3600; ++tick) {
+    std::this_thread::sleep_until(origin + std::chrono::milliseconds(10 * tick));
+    max_lateness = std::max(max_lateness, milliseconds(Clock::now()) - 10 * tick);
+    const int phase = tick / charged_phase_ticks;
+    const int overhead = phase == 1 ? 360 : 209;
+    if (tick == 1200 || tick == 2400) {
+      // Keep the exact same engine/SSRC and use the public ABI after start.
+      // A stats-only implementation cannot pass the packet-duration/PCM gates.
+      assert(veil_media_engine_set_audio_packet_overhead(source.get(), overhead) == VEIL_MEDIA_OK);
+      assert(veil_media_test_audio_transport_overhead(source.get()) == overhead);
+      assert(veil_media_test_video_transport_overhead(source.get()) == video_overhead);
+    }
+    const bool high = (tick / 100) % 2;
+    if (high && tick % 100 == 0) sent_edges.push_back(milliseconds(Clock::now()));
+    assert(veil_media_test_audio_capture_tone(source.get(), high ? 1200 : 440) == 0);
+    assert(veil_media_test_audio_capture_tone(receiver.get(), 0) == 0);
+    deliver();
+    assert(veil_media_test_audio_playout_pcm(receiver.get(), pcm.data(), pcm.size()) == 480);
+    assert(veil_media_test_audio_playout_pcm(source.get(), reverse_pcm.data(), reverse_pcm.size()) == 480);
+    double power = 0;
+    int crossings = 0;
+    for (size_t i = 0; i < pcm.size(); ++i) {
+      power += double(pcm[i]) * pcm[i];
+      if (i && ((pcm[i] > 0) != (pcm[i - 1] > 0))) ++crossings;
+    }
+    const bool nonsilent = power / pcm.size() > 500 * 500;
+    const bool rendered_high = nonsilent && crossings >= 17;
+    if (rendered_high && !was_high) rendered_edges.push_back(milliseconds(Clock::now()));
+    was_high = rendered_high;
+    if (tick % charged_phase_ticks >= 600) {
+      if (nonsilent) ++voiced[phase];
+      if (tick % 100 == 0) {
+        ++observations[phase];
+        std::printf("live framing sample: tick=%d overhead=%llu packet_ms=%llu estimate_bps=%llu payload_bps=%llu\n",
+            tick, (unsigned long long)metric(source.get(), "audio_packet_overhead_bytes"),
+            (unsigned long long)metric(source.get(), "audio_tx_packet_duration_ms"),
+            (unsigned long long)metric(source.get(), "audio_send_bandwidth_bps"),
+            (unsigned long long)metric(source.get(), "audio_encoder_target_bps"));
+        std::fflush(stdout);
+        if (metric(source.get(), "audio_tx_packet_duration_ms") == (phase == 1 ? 40u : 20u))
+          ++duration_matches[phase];
+        assert(metric(source.get(), "audio_encoder_target_bps") >= 24000);
+        assert(metric(source.get(), "audio_encoder_target_bps") <= 32000);
+      }
+    }
+    if (tick % charged_phase_ticks == 600) {
+      std::lock_guard lock(mu);
+      settled_drops[phase] = drops_by_phase[phase];
+    }
+  }
+  double max_marker_ms = 0;
+  for (double sent : sent_edges) {
+    const auto found = std::find_if(rendered_edges.begin(), rendered_edges.end(),
+                                   [&](double at) { return at >= sent; });
+    assert(found != rendered_edges.end());
+    max_marker_ms = std::max(max_marker_ms, *found - sent);
+  }
+  std::printf("live framing: voiced=%zu/%zu/%zu settled_duration_matches=%zu/%zu/%zu "
+              "observations=%zu/%zu/%zu marker_max_ms=%.3f lateness=%.3f "
+              "drops=%zu/%zu/%zu settled_drops=%zu/%zu/%zu\n",
+      voiced[0], voiced[1], voiced[2], duration_matches[0], duration_matches[1],
+      duration_matches[2], observations[0], observations[1], observations[2],
+      max_marker_ms, max_lateness, drops_by_phase[0], drops_by_phase[1],
+      drops_by_phase[2], settled_drops[0], settled_drops[1], settled_drops[2]);
+  std::fflush(stdout);
+  assert(max_lateness < 30 && max_marker_ms < 200);
+  for (size_t phase = 0; phase < 3; ++phase) {
+    assert(voiced[phase] == 600);
+    assert(duration_matches[phase] == observations[phase] && observations[phase] == 6);
+    assert(drops_by_phase[phase] == settled_drops[phase]);
+  }
+  // No restart of the outgoing RTP sequence space, including any padding.
+  std::lock_guard lock(mu);
+  bool seen = false;
+  uint16_t last = 0;
+  for (const auto& packet : source_packets) {
+    if (packet[4] != 200) continue;
+    const auto sequence = static_cast<uint16_t>(packet[1]);
+    if (seen) assert(sequence == static_cast<uint16_t>(last + 1));
+    last = sequence;
+    seen = true;
+  }
+  assert(seen);
 }
 
 static void verify_handover(bool asymmetric = false) {
@@ -863,6 +999,9 @@ static void verify_long_packets(bool jitter) {
 }
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--live-framing") == 0) {
+    verify_live_framing(); return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--long-packets") == 0) {
     verify_long_packets(false);
     return 0;

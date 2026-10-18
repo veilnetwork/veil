@@ -3238,7 +3238,13 @@ int veil_media_engine_set_independent_transport_feedback(VeilMediaEngine* engine
 int veil_media_engine_set_audio_packet_overhead(VeilMediaEngine* engine, int bytes) {
   if (!engine || bytes < 0 || bytes > 4096) return VEIL_MEDIA_ERR_ARG;
   std::lock_guard<std::mutex> lock(engine->config_mu);
-  if (engine->config_frozen) return VEIL_MEDIA_ERR_STATE;
+  // Selecting the encoder factory remains a pre-start decision. Once enabled,
+  // route framing can change without replacing the encoder, RTP sender or
+  // receive buffer. Do not enable/disable ANA underneath a live stream.
+  if (engine->config_frozen &&
+      (bytes == 0 || engine->audio_packet_overhead.load() == 0)) {
+    return VEIL_MEDIA_ERR_STATE;
+  }
   if (bytes == 0) {
     engine->audio_packet_overhead.store(0);
     return VEIL_MEDIA_OK;
@@ -3246,6 +3252,23 @@ int veil_media_engine_set_audio_packet_overhead(VeilMediaEngine* engine, int byt
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!engine->ws || !engine->ws->shim ||
       !engine->ws->shim->independent_transport_feedback()) return VEIL_MEDIA_ERR_STATE;
+  if (engine->config_frozen) {
+    auto* ws = engine->ws.get();
+    if (!ws->call) return VEIL_MEDIA_ERR_STATE;
+    // OnNetworkRouteChanged updates the audio allocator and pacer; its next
+    // allocation delivers the new overhead to the existing Opus/ANA encoder.
+    // Keep the same route identity: this corrects framing, not connectivity.
+    // The cancellation handshake fences this reference on timeout. A blocked
+    // audio worker must not hold up host route control for the usual 10 s.
+    const bool applied = veil_media::run_on_with_timeout(ws->worker_tq.get(), [&] {
+      webrtc::NetworkRoute route;
+      route.connected = true;
+      route.packet_overhead = bytes;
+      ws->call->GetTransportControllerSend()->OnNetworkRouteChanged("opaque", route);
+      engine->audio_packet_overhead.store(bytes);
+    }, std::chrono::milliseconds(50));
+    return applied ? VEIL_MEDIA_OK : VEIL_MEDIA_ERR_STATE;
+  }
   engine->audio_packet_overhead.store(bytes);
   return VEIL_MEDIA_OK;
 #else
