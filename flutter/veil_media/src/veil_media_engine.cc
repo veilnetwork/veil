@@ -75,6 +75,10 @@
 #include "rtc_base/network_route.h"
 #include "api/environment/environment.h"
 #include "api/environment/environment_factory.h"
+#if defined(VEIL_MEDIA_CC_TRACE)
+#include "api/transport/goog_cc_factory.h"
+#include "veil_video_cc_trace.h"
+#endif
 #include "api/field_trials_view.h"
 #include "api/media_types.h"
 #include "api/make_ref_counted.h"
@@ -1811,6 +1815,13 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
   webrtc::CallConfig video_cfg(create_low_latency_environment(true),
                               ws->video_worker_tq.get(),
                               ws->video_network_tq.get());
+#if defined(VEIL_MEDIA_CC_TRACE)
+  const char* trace_cc = std::getenv("VEIL_MEDIA_TRACE_VIDEO_CC");
+  if (veil_media::diag::enabled() && trace_cc && std::strcmp(trace_cc, "1") == 0)
+    video_cfg.per_call_network_controller_factory =
+        std::make_unique<veil_media::VideoCcTraceFactory>(
+            std::make_unique<webrtc::GoogCcNetworkControllerFactory>());
+#endif
   ws->video_call = webrtc::Call::Create(std::move(video_cfg));
 
   ws->shim = std::make_unique<veil_media::VeilTransportShim>(
@@ -1955,6 +1966,13 @@ VeilGroupMediaEngine* veil_media_group_engine_create(
   webrtc::CallConfig video_cfg(create_low_latency_environment(true),
                               ws->video_worker_tq.get(),
                               ws->video_network_tq.get());
+#if defined(VEIL_MEDIA_CC_TRACE)
+  const char* trace_cc = std::getenv("VEIL_MEDIA_TRACE_VIDEO_CC");
+  if (veil_media::diag::enabled() && trace_cc && std::strcmp(trace_cc, "1") == 0)
+    video_cfg.per_call_network_controller_factory =
+        std::make_unique<veil_media::VideoCcTraceFactory>(
+            std::make_unique<webrtc::GoogCcNetworkControllerFactory>());
+#endif
   ws->video_call = webrtc::Call::Create(std::move(video_cfg));
   ws->fanout = std::make_unique<GroupFanoutTransport>(
       ws->call.get(), ws->video_call.get(), group_audio_ssrc_of(engine->local),

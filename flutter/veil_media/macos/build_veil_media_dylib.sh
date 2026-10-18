@@ -56,6 +56,9 @@ cmd=re.sub(r'-MF\s+\S+', '-MF '+out+'.d', cmd)
 extra='-DVEIL_MEDIA_HAVE_WEBRTC=1 -I'+shimdir
 if src.endswith(('veil_media_engine.cc', 'veil_avf_adm.mm')) and os.environ.get('VEIL_MEDIA_TEST_HOOKS') == '1':
     extra+=' -DVEIL_MEDIA_TEST_HOOKS=1'
+# Independent stand observer: do not enable unrelated codec/ADM test hooks.
+if src.endswith('veil_media_engine.cc') and os.environ.get('VEIL_MEDIA_CC_TRACE_BUILD') == '1':
+    extra+=' -DVEIL_MEDIA_CC_TRACE=1'
 if '-DWEBRTC_ENABLE_PROTOBUF=1' in cmd:
     extra+=' -I'+sys.argv[5]+'/third_party/protobuf/src'
 if src.endswith('.mm'): extra+=' -fobjc-arc'  # Objective-C++ (AVAudioEngine ADM)
