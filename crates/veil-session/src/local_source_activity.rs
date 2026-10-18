@@ -570,6 +570,64 @@ mod tests {
     }
 
     #[test]
+    fn captured_seven_cell_frame_exceeds_pressure_cap_before_any_credit_is_spent() {
+        use veil_types::local_lossy_work::{LocalLossyWork, WorkAdmission};
+        let source = LocalSourceActivity::default();
+        let now = Instant::now();
+        source.note(now);
+        source.note_pressure(now);
+        // Physical Mac -> Android capture: raw RTP 6514, media seals 252,
+        // Forward/session envelopes 280 per cell. wire_bytes already includes
+        // the session AEAD tag; charging another tag would be incorrect.
+        let sizes = vec![966, 966, 966, 967, 967, 967, 967];
+        assert_eq!(sizes.iter().sum::<usize>(), 6766);
+        assert_eq!(sizes.iter().sum::<usize>() + sizes.len() * 280, 8726);
+        let work = LocalLossyWork::new(sizes).unwrap();
+        let first = work.cell(0).unwrap();
+        assert_eq!(
+            source.admit_lossy_work(&first, 1246, now),
+            WorkAdmission::Rejected
+        );
+        // Whole-frame rejection persists across later probe windows. Neither
+        // waiting nor replaying the tail makes the same oversized frame fit.
+        assert_eq!(
+            source.admit_lossy_work(
+                &work.cell(6).unwrap(),
+                1247,
+                now + SECONDARY_PROBE_INTERVAL
+            ),
+            WorkAdmission::Rejected
+        );
+        assert!(source.allow_secondary(LOSSY_SECONDARY_BYTES, now));
+        assert!(!source.allow_secondary(1, now));
+    }
+
+    #[test]
+    fn six_cell_frame_can_use_the_exact_pressure_boundary() {
+        use veil_types::local_lossy_work::{LocalLossyWork, WorkAdmission};
+        let source = LocalSourceActivity::default();
+        let now = Instant::now();
+        source.note(now);
+        source.note_pressure(now);
+        // Same route overhead, payload sized to leave exactly one byte of
+        // shared source credit. The next byte fits, the following one cannot.
+        let work = LocalLossyWork::new(vec![1085, 1085, 1085, 1085, 1085, 1086]).unwrap();
+        assert_eq!(
+            source.admit_lossy_work(&work.cell(0).unwrap(), 1365, now),
+            WorkAdmission::Admitted
+        );
+        assert!(source.allow_secondary(1, now));
+        assert!(!source.allow_secondary(1, now));
+        for index in 0..6 {
+            let wire = if index == 5 { 1366 } else { 1365 };
+            assert_eq!(
+                source.admit_lossy_work(&work.cell(index).unwrap(), wire, now),
+                WorkAdmission::Admitted
+            );
+        }
+    }
+
+    #[test]
     fn large_source_work_is_healthy_only_and_cannot_burst_under_pressure() {
         use veil_types::local_lossy_work::{LocalLossyWork, WorkAdmission};
         let now = Instant::now();
