@@ -174,6 +174,7 @@ void VeilTransportShim::Start() {
 void VeilTransportShim::Stop() {
   bool expected = true;
   if (!started_.compare_exchange_strong(expected, false)) return;
+  video_remb_cadence_.Reset();
   audio_mirror_chan_.store(0, std::memory_order_release);
   for (const auto channel : receive_channels_)
     veil_media_set_recv_callback(channel, nullptr, nullptr);
@@ -239,6 +240,7 @@ bool VeilTransportShim::RebindChannel(uint64_t veil_chan, bool retain_previous_r
   // qualify/reinstall it after committing this handover, never implicitly.
   audio_mirror_chan_.store(0, std::memory_order_release);
   veil_chan_.store(veil_chan, std::memory_order_release);
+  video_remb_cadence_.Reset();
   {
     std::lock_guard lock(audio_feedback_mu_);
     auto* clock = webrtc::Clock::GetRealTimeClock();
@@ -346,6 +348,12 @@ bool VeilTransportShim::SendRtcpOnSource(std::span<const uint8_t> packet,
                                          const webrtc::PacketOptions& options,
                                          bool video) {
   (void)options;  // RTCP carries no packet_id to feed back.
+  const auto scope = veil_chan_.load(std::memory_order_acquire);
+  const auto sent_us = webrtc::TimeMicros();
+  if (video && !video_remb_cadence_.Allow(packet, sent_us, scope)) {
+    if (group_rtcp_stats_) group_rtcp_stats_->Coalesced(1);
+    return true;
+  }
   std::vector<uint8_t> compound;
   LocalAudioPlayout sample;
   LocalAudioRecovery recovery;
@@ -402,6 +410,7 @@ bool VeilTransportShim::SendRtcpOnSource(std::span<const uint8_t> packet,
       ? veil_media_send_video_control_datagram(veil_chan_, packet.data(), packet.size())
       : veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
   if (rc == 0) {
+    if (video) video_remb_cadence_.Accepted(packet, sent_us, scope);
     if (group_rtcp_stats_) group_rtcp_stats_->Record(packet, video);
     if (video) {
       outbound_video_rtcp_packet_count_.fetch_add(1, std::memory_order_relaxed);
