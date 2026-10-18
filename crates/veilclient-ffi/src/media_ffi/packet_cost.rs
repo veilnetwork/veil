@@ -71,6 +71,21 @@ fn estimate(
 /// Free a non-null string with veil_free_string. This is not delivery proof.
 #[unsafe(no_mangle)]
 pub extern "C" fn veil_media_channel_packet_cost(chan: u64, packet_bytes: size_t) -> *mut c_char {
+    veil_media_channel_source_packet_cost(chan, veil_proto::priority::REALTIME, packet_bytes)
+}
+
+/// Same local framing model on the selected prepared source: 0 audio, 2 video,
+/// 3 screen. These selectors are local only; no media role is sent to relays.
+/// Video/screen never inherit audio's small-packet replication policy.
+#[unsafe(no_mangle)]
+pub extern "C" fn veil_media_channel_source_packet_cost(
+    chan: u64,
+    local_lane: u8,
+    packet_bytes: size_t,
+) -> *mut c_char {
+    if !matches!(local_lane, 0 | 2 | 3) {
+        return ptr::null_mut();
+    }
     if !(12..=1000).contains(&packet_bytes) {
         return ptr::null_mut();
     }
@@ -95,9 +110,9 @@ pub extern "C" fn veil_media_channel_packet_cost(chan: u64, packet_bytes: size_t
         return ptr::null_mut();
     };
     let sealed_bytes = packet_bytes + media::MEDIA_SEAL_OVERHEAD;
-    let copies_limit = if relay && sealed_bytes <= 512 { 2 } else { 1 };
+    let copies_limit = source_copies_limit(local_lane, relay, sealed_bytes);
     let Some(paths) =
-        services.local_source_framing(&peer, veil_proto::priority::REALTIME, relay, copies_limit)
+        services.local_source_framing(&peer, local_lane, relay, copies_limit)
     else {
         return ptr::null_mut();
     };
@@ -107,6 +122,14 @@ pub extern "C" fn veil_media_channel_packet_cost(chan: u64, packet_bytes: size_t
     CString::new(cost.to_string())
         .map(CString::into_raw)
         .unwrap_or(ptr::null_mut())
+}
+
+fn source_copies_limit(local_lane: u8, relayed: bool, sealed_bytes: usize) -> usize {
+    if local_lane == veil_proto::priority::REALTIME && relayed && sealed_bytes <= 512 {
+        2
+    } else {
+        1
+    }
 }
 
 #[cfg(test)]
@@ -139,5 +162,19 @@ mod tests {
         assert!(estimate(200, true, &[]).is_none());
         assert!(veil_media_channel_packet_cost(0, 200).is_null());
         assert!(veil_media_channel_packet_cost(0, usize::MAX).is_null());
+    }
+
+    #[test]
+    fn source_selection_does_not_charge_video_for_audio_replication() {
+        assert_eq!(source_copies_limit(0, true, 512), 2);
+        assert_eq!(source_copies_limit(0, true, 513), 1);
+        assert_eq!(source_copies_limit(0, false, 200), 1);
+        for lane in [2, 3] {
+            assert_eq!(source_copies_limit(lane, true, 200), 1);
+            assert_eq!(source_copies_limit(lane, false, 200), 1);
+        }
+        for lane in [1, 4, 255] {
+            assert!(veil_media_channel_source_packet_cost(0, lane, 200).is_null());
+        }
     }
 }

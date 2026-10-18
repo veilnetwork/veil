@@ -27,8 +27,9 @@ class VideoFrameBudget {
   void SetProfile(int selected_bps) {
     std::lock_guard lock(mu_);
     selected_bps_ = selected_bps;
-    // Only the already-degraded low-rate profiles opt into this feedback.
-    // The host owns recovery to a larger profile; no parallel growth timer.
+    // Either the selected profile or an actual low encoder allocation needs
+    // bounded frames. A large requested profile is not proof that the video
+    // controller can fund its keyframes. The host still owns bitrate and fps.
     if (!enabled()) {
       max_pixels_ = 0;
       bytes_ = 0;
@@ -39,7 +40,9 @@ class VideoFrameBudget {
 
   void SetRate(uint32_t payload_bps) {
     std::lock_guard lock(mu_);
-    payload_bps_ = payload_bps;
+    // A suspended encoder emits no frames. Preserve its last positive budget
+    // rather than reopening a large keyframe window when capture resumes.
+    if (payload_bps) payload_bps_ = payload_bps;
     UpdateBytes();
   }
 
@@ -75,11 +78,22 @@ class VideoFrameBudget {
   }
 
  private:
-  bool enabled() const { return selected_bps_ > 0 && selected_bps_ <= 30000; }
+  uint32_t effective_rate() const {
+    if (selected_bps_ <= 0) return 0;
+    return payload_bps_ ? std::min<uint32_t>(payload_bps_, selected_bps_)
+                        : static_cast<uint32_t>(selected_bps_);
+  }
+  bool enabled() const { return effective_rate() > 0 && effective_rate() <= 30000; }
   void UpdateBytes() {
-    if (!enabled()) return;
-    const uint32_t rate = payload_bps_ ? std::min<uint32_t>(payload_bps_, selected_bps_)
-                                      : static_cast<uint32_t>(selected_bps_);
+    if (!enabled()) {
+      bytes_ = 0;
+      // Recover source resolution even if the host is already at its maximum
+      // profile and cannot select a larger one. Require twice the low-rate
+      // threshold to avoid resizing on every small allocation fluctuation.
+      if (effective_rate() >= 60000) max_pixels_ = 0;
+      return;
+    }
+    const uint32_t rate = effective_rate();
     // Existing video pacing factor 4 x 100 ms leaves half the SDK's lifetime
     // for scheduling, IPC and admission. This is an encoder sizing hint, not a
     // new admission cap or a guarantee that a codec can always meet it.

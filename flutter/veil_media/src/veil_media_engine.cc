@@ -1041,6 +1041,7 @@ struct WebrtcState {
   // delay the audio route update, and cancelled work retries at the next poll.
   std::atomic<uint64_t> route_generation{0};
   std::atomic<uint64_t> audio_route_applied{0}, video_route_applied{0};
+  std::atomic<int> video_packet_overhead{0};
 #if defined(VEIL_MEDIA_TEST_HOOKS)
   std::shared_ptr<std::atomic<int>> audio_route_restarts = std::make_shared<std::atomic<int>>(0);
   std::shared_ptr<std::atomic<int>> video_route_restarts = std::make_shared<std::atomic<int>>(0);
@@ -1284,6 +1285,10 @@ class LowLatencyFieldTrials final : public webrtc::FieldTrialsView {
     if (key == "WebRTC-Video-MinVideoBitrate") return "Enabled,br:1kbps";
     if (video_ && key == "WebRTC-VideoRateControl")
       return veil_media::vp8_rate_control_trial();
+    // Small frames still need at least one RTP packet each. A payload/MTU
+    // ratio alone undercounts framing as capture cadence increases. Let the
+    // video allocator charge at least the observed encoder frame rate.
+    if (video_ && key == "WebRTC-Video-UseFrameRateForOverhead") return "Enabled";
     // libwebrtc's send-side feedback profile paces at only 1.1x and permits a
     // two-second queue by default. That is appropriate for a UDP transport
     // whose congestion controller receives TWCC, but our authenticated veil
@@ -1437,7 +1442,7 @@ void apply_video_route(WebrtcState* ws, bool force = false) {
   if (!force && ws->video_route_applied.load() == generation) return;
   auto* controller = ws->video_call->GetTransportControllerSend();
   controller->OnNetworkRouteChanged(
-      "opaque", opaque_route(generation, controller->GetTransportOverhead().bytes<int>()));
+      "opaque", opaque_route(generation, ws->video_packet_overhead.load()));
   ws->video_route_applied.store(generation);
 }
 void update_committed_route(VeilMediaEngine* engine) {
@@ -3355,6 +3360,29 @@ int veil_media_engine_set_audio_packet_overhead(VeilMediaEngine* engine, int byt
 #endif
 }
 
+int veil_media_engine_set_video_packet_overhead(VeilMediaEngine* engine, int bytes) {
+  // The pinned video RTP sender subtracts this from its 1500-byte path MTU.
+  // Bound the hint before that subtraction, leaving room for RTP headers.
+  if (!engine || bytes < 0 || bytes > 1024) return VEIL_MEDIA_ERR_ARG;
+  std::lock_guard<std::mutex> lock(engine->config_mu);
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  auto* ws = engine->ws.get();
+  if (!ws || !ws->video_call || !ws->shim ||
+      !ws->shim->independent_transport_feedback()) return VEIL_MEDIA_ERR_STATE;
+  const bool applied = veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&] {
+    auto* controller = ws->video_call->GetTransportControllerSend();
+    controller->IncludeOverheadInPacedSender();
+    controller->OnNetworkRouteChanged(
+        "opaque", opaque_route(ws->route_generation.load(), bytes));
+    ws->video_packet_overhead.store(bytes);
+    ws->video_route_applied.store(ws->route_generation.load());
+  }, std::chrono::milliseconds(20));
+  return applied ? VEIL_MEDIA_OK : VEIL_MEDIA_ERR_STATE;
+#else
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
 int veil_media_engine_set_max_rtp_packet_size(VeilMediaEngine* engine,
                                               int max_packet_size) {
   if (engine == nullptr || max_packet_size < 0) return VEIL_MEDIA_ERR_ARG;
@@ -4493,6 +4521,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
       snapshot += ",\"audio_output_duration_ms\":" + std::to_string(audio_output_duration_ms);
       snapshot += ",\"audio_tx_rtp_drops\":" + std::to_string(tx_audio.dropped);
       const auto video_send = ws->shim->video_send_stats();
+      snapshot += ",\"video_packet_overhead_bytes\":" +
+          std::to_string(ws->video_packet_overhead.load());
       snapshot += ",\"video_tx_rtp_attempts\":" + std::to_string(video_send.attempts);
       snapshot += ",\"video_tx_rtp_queued\":" + std::to_string(video_send.queued);
       snapshot += ",\"video_tx_payload_pkts\":" + std::to_string(video_send.payload_packets);
