@@ -108,8 +108,30 @@ impl LocalSourceActivity {
         bytes: usize,
         now: Instant,
     ) -> veil_types::local_lossy_work::WorkAdmission {
+        self.admit_lossy_work_cost(cell, bytes, None, now, Some)
+    }
+
+    pub(crate) fn admit_lossy_work_planned(
+        &self,
+        cell: &veil_types::local_lossy_work::LocalLossyCell,
+        bytes: usize,
+        key: veil_types::local_lossy_work::WorkCostKey,
+        now: Instant,
+        wire_cost: impl Fn(usize) -> Option<usize>,
+    ) -> veil_types::local_lossy_work::WorkAdmission {
+        self.admit_lossy_work_cost(cell, bytes, Some(key), now, wire_cost)
+    }
+
+    fn admit_lossy_work_cost(
+        &self,
+        cell: &veil_types::local_lossy_work::LocalLossyCell,
+        bytes: usize,
+        key: Option<veil_types::local_lossy_work::WorkCostKey>,
+        now: Instant,
+        wire_cost: impl Fn(usize) -> Option<usize>,
+    ) -> veil_types::local_lossy_work::WorkAdmission {
         let mut oversized_under_pressure = false;
-        let decision = cell.admit_at(self.work_owner, bytes, now, |total| {
+        let reserve = |total| {
             if total > LOSSY_SECONDARY_BYTES {
                 let state = lock!(self.state);
                 if state
@@ -122,7 +144,13 @@ impl LocalSourceActivity {
                 }
             }
             self.admit_lossy_secondary(total, now)
-        });
+        };
+        let decision = match key {
+            Some(key) => {
+                cell.admit_planned_at(self.work_owner, bytes, key, now, wire_cost, reserve)
+            }
+            None => cell.admit_at(self.work_owner, bytes, now, reserve),
+        };
         if oversized_under_pressure {
             cell.reject();
             veil_types::local_lossy_work::WorkAdmission::Rejected
@@ -591,11 +619,7 @@ mod tests {
         // Whole-frame rejection persists across later probe windows. Neither
         // waiting nor replaying the tail makes the same oversized frame fit.
         assert_eq!(
-            source.admit_lossy_work(
-                &work.cell(6).unwrap(),
-                1247,
-                now + SECONDARY_PROBE_INTERVAL
-            ),
+            source.admit_lossy_work(&work.cell(6).unwrap(), 1247, now + SECONDARY_PROBE_INTERVAL),
             WorkAdmission::Rejected
         );
         assert!(source.allow_secondary(LOSSY_SECONDARY_BYTES, now));
