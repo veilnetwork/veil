@@ -5040,12 +5040,11 @@ impl SessionRunner {
                         let signaling_source = lane.source_activity.clone();
                         let mut sender_state = lock!(sender);
                         let max_datagram_size = sender_state.max_datagram_size;
-                        let datagrams = match sender_state.tx.encode_frame(
-                            local_datagram_flow(outgoing_priority, body, lane_kind),
-                            outgoing,
+                        let datagram_sizes = match sender_state.tx.frame_wire_sizes(
+                            outgoing.len(),
                             max_datagram_size,
                         ) {
-                            Ok(datagrams) => datagrams,
+                            Ok(sizes) => sizes,
                             Err(error) => {
                                 self.logger.debug(
                                     "session.realtime_datagram.encode_fallback",
@@ -5063,10 +5062,10 @@ impl SessionRunner {
                                 break;
                             }
                         };
-                        let planned_wire_len = datagrams.iter().map(Vec::len).sum::<usize>();
-                        let planned_queue_charge = datagrams
+                        let planned_wire_len = datagram_sizes.iter().sum::<usize>();
+                        let planned_queue_charge = datagram_sizes
                             .iter()
-                            .map(|packet| sender_state.handle.queue_charge(packet.len()))
+                            .map(|bytes| sender_state.handle.queue_charge(*bytes))
                             .sum::<usize>();
                         let available = sender_state.handle.send_buffer_space();
                         let primary_fits = outgoing_priority != veil_proto::priority::REALTIME
@@ -5213,6 +5212,24 @@ impl SessionRunner {
                                 Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
                             continue;
                         }
+                        // Only now commit session counters/nonces. A source pacing
+                        // wait above restores plaintext, never a half-sent frame.
+                        let datagrams = match sender_state.tx.encode_frame(
+                            local_datagram_flow(outgoing_priority, body, lane_kind),
+                            outgoing, max_datagram_size,
+                        ) {
+                            Ok(datagrams) => datagrams,
+                            Err(error) => {
+                                self.logger.debug("session.realtime_datagram.encode_drop",
+                                    format!("peer_id={} error={error}", hex_short(&self.peer_id)));
+                                if independent_source {
+                                    datagram_drained += 1;
+                                    continue;
+                                }
+                                pq.restore_lossy_envelope(envelope);
+                                break;
+                            }
+                        };
                         if !self.dispatcher.allow_outbound_bandwidth(planned_wire_len) {
                             sender_state.trace_admission(
                                 &self.logger,
