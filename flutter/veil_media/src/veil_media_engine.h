@@ -161,6 +161,10 @@ int veil_media_group_engine_set_video_send_paused(VeilGroupMediaEngine *engine, 
 /* Group audio quality: maxima over fresh RTCP audio report blocks (15 s).
  * `audio_receivers` maps peer-id hex to accepted `audio_rx_pkts` and the
  * native `audio_delay_ms` (current queued samples + reported ADM delay).
+ * `audio_rtp_lag_ms` is recent relative RTP-clock age (-1 when unknown),
+ * including upstream excess delay without assuming synchronized sender time.
+ * `audio_pressure_delay_ms` includes the larger of that age and queue plus
+ * ADM delay. It drives endpoint playout feedback; it is not absolute latency.
  * `audio_filtered_delay_ms` retains WebRTC's RTP-span estimate for diagnostics;
  * sender timestamp resets can invalidate it without delaying actual PCM.
  * `audio_rx_supported` stays 1 even when
