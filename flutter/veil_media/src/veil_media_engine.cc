@@ -2635,6 +2635,7 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   int64_t video_rtt = 0;
   int64_t audio_loss_report_us = 0, video_loss_report_us = 0;
   int64_t peer_audio_recovery_report_us = 0;
+  int64_t peer_audio_concealment_report_us = 0;
   int peer_audio_recovery_peers = 0;
   int playout_peers = 0, playout_reports = 0, playout_ms = -1;
   int64_t rtt = 0;
@@ -2654,6 +2655,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
     if (entry.second->shim->peer_audio_recovery_supported()) ++peer_audio_recovery_peers;
     peer_audio_recovery_report_us = std::max(peer_audio_recovery_report_us,
         entry.second->shim->peer_audio_recovery_report_us(now_us));
+    peer_audio_concealment_report_us = std::max(peer_audio_concealment_report_us,
+        entry.second->shim->peer_audio_concealment_report_us(now_us));
     const auto playout = entry.second->shim->audio_playout_feedback();
     auto* peer = entry.second.get();
     const bool fresh = playout.fresh_at(now_us);
@@ -2729,6 +2732,9 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
           const auto recovery = ws->recovery_stats->receivers.Snapshot(peer->audio_ssrc);
           peer->shim->SetLocalAudioRecovery(peer->audio_ssrc, sample_sequence,
               active ? recovery : veil_media::AudioRecoverySample{}, now_us);
+          peer->shim->SetLocalAudioConcealment(peer->audio_ssrc, sample_sequence,
+              active && recovery.known ? recovery.origin : 0,
+              sample.concealed_samples, sample.silent_concealed_samples, now_us);
           char id[65];
           for (size_t i = 0; i < 32; ++i) {
             id[2 * i] = hex[entry.second->id[i] >> 4];
@@ -2768,6 +2774,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
           entry.second->audio_ssrc, sample_sequence, -1, now_us);
       entry.second->shim->SetLocalAudioRecovery(
           entry.second->audio_ssrc, sample_sequence, {}, now_us);
+      entry.second->shim->SetLocalAudioConcealment(
+          entry.second->audio_ssrc, sample_sequence, 0, 0, 0, now_us);
     }
   }
   const bool video_sampled = veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&] {
@@ -2870,6 +2878,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   snapshot += ",\"audio_peer_recovery_report_us\":" +
       std::to_string(peer_audio_recovery_report_us);
   snapshot += ",\"audio_peer_recovery_peers\":" + std::to_string(peer_audio_recovery_peers);
+  snapshot += ",\"audio_peer_concealment_report_us\":" +
+      std::to_string(peer_audio_concealment_report_us);
   snapshot += ",\"audio_latency_recovery_count\":" +
       std::to_string(ws->recovery_stats->count.load(std::memory_order_acquire));
   snapshot += ",\"audio_latency_discarded_ms\":" +
@@ -4264,6 +4274,9 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
                 : veil_media::AudioRecoverySample{};
         ws->shim->SetLocalAudioRecovery(remote_ssrc, recovery_sequence,
                                        receiver_recovery, recovery_sampled_us);
+        ws->shim->SetLocalAudioConcealment(remote_ssrc, recovery_sequence,
+            receiver_recovery.known ? receiver_recovery.origin : 0,
+            r.concealed_samples, r.silent_concealed_samples, recovery_sampled_us);
         audio_concealed_samples = r.concealed_samples;
         // Lifetime sample counters distinguish delivery jitter from a slow
         // playout clock. They are endpoint diagnostics, never wire metadata.
@@ -4299,8 +4312,11 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         }
       }
     }, std::chrono::milliseconds(20));
-    if (!sampled)
+    if (!sampled) {
       ws->shim->SetLocalAudioRecovery(ssrc_of(engine->peer), recovery_sequence, {}, recovery_sampled_us);
+      ws->shim->SetLocalAudioConcealment(ssrc_of(engine->peer), recovery_sequence,
+                                       0, 0, 0, recovery_sampled_us);
+    }
     // A stalled video worker must not block audio telemetry or the UI's
     // control loop for the ten-second stream-operation timeout.
     const bool video_sampled = veil_media::run_on_with_timeout(
@@ -4517,6 +4533,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
           std::to_string(peer_recovery_snapshot.FreshReportUs(loss_now_us));
       snapshot += ",\"audio_peer_recovery_peers\":" +
           std::to_string(peer_recovery_snapshot.supported() ? 1 : 0);
+      snapshot += ",\"audio_peer_concealment_report_us\":" +
+          std::to_string(ws->shim->peer_audio_concealment_report_us(loss_now_us));
       // Event identity shared by native RTCP and encrypted call-health feedback.
       // These are local JSON stats, not additional RTCP or relay header fields.
       const auto peer_recovery = peer_recovery_snapshot.Sample();
