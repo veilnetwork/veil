@@ -591,6 +591,10 @@ int64_t VeilTransportShim::peer_audio_concealment_report_us(int64_t now_us) cons
   std::lock_guard lock(audio_feedback_mu_);
   return peer_audio_concealment_.FreshReportUs(now_us);
 }
+int64_t VeilTransportShim::local_audio_concealment_report_us(int64_t now_us) const {
+  std::lock_guard lock(audio_feedback_mu_);
+  return local_audio_concealment_.FreshReportUs(now_us);
+}
 
 void VeilTransportShim::SetLocalAudioPlayout(uint32_t remote_audio_ssrc,
                                             uint64_t sequence, int delay_ms,

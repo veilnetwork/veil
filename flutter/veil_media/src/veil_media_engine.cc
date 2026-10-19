@@ -2645,6 +2645,7 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   int64_t video_persistent_loss_report_us = 0;
   int64_t peer_audio_recovery_report_us = 0;
   int64_t peer_audio_concealment_report_us = 0;
+  int64_t local_audio_concealment_report_us = 0;
   int peer_audio_recovery_peers = 0;
   int playout_peers = 0, playout_reports = 0, playout_ms = -1;
   int64_t rtt = 0;
@@ -2759,7 +2760,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               "\"audio_filtered_delay_ms\":%u,"
               "\"audio_rx_native_age_ms\":%lld,\"audio_interruption_count\":%d,"
               "\"audio_interruption_duration_ms\":%d,"
-              "\"audio_concealed_samples\":%llu,\"audio_concealment_events\":%llu,"
+              "\"audio_concealed_samples\":%llu,\"audio_silent_concealed_samples\":%llu,"
+              "\"audio_local_concealment_report_us\":%lld,\"audio_concealment_events\":%llu,"
               "\"audio_output_emitted_samples\":%llu,\"audio_total_samples_received\":%llu,"
               "\"audio_discarded_packets\":%llu,\"audio_jb_target_ms\":%u,"
               "\"audio_recovery_known\":%d,\"audio_latency_discarded_ms\":%llu}", id,
@@ -2768,6 +2770,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               sample.delay_estimate_ms, static_cast<long long>(native_age_ms),
               sample.interruption_count, sample.total_interruption_duration_ms,
               static_cast<unsigned long long>(sample.concealed_samples),
+              static_cast<unsigned long long>(sample.silent_concealed_samples),
+              static_cast<long long>(peer->shim->local_audio_concealment_report_us(now_us)),
               static_cast<unsigned long long>(sample.concealment_events),
               static_cast<unsigned long long>(sample.jitter_buffer_emitted_count),
               static_cast<unsigned long long>(sample.total_samples_received),
@@ -2787,6 +2791,12 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
           entry.second->audio_ssrc, sample_sequence, {}, now_us);
       entry.second->shim->SetLocalAudioConcealment(
           entry.second->audio_ssrc, sample_sequence, 0, 0, 0, now_us);
+    }
+  }
+  if (audio_sampled) {
+    for (const auto& entry : ws->peers) {
+      local_audio_concealment_report_us = std::max(local_audio_concealment_report_us,
+          entry.second->shim->local_audio_concealment_report_us(now_us));
     }
   }
   const bool video_sampled = veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&] {
@@ -2870,6 +2880,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               std::to_string(rtcp_send.video_remb_coalesced_copies);
   snapshot += ",\"audio_loss_report_us\":" + std::to_string(audio_loss_report_us) +
               ",\"video_loss_report_us\":" + std::to_string(video_loss_report_us);
+  snapshot += ",\"audio_local_concealment_report_us\":" +
+              std::to_string(local_audio_concealment_report_us);
   snapshot += ",\"video_persistent_loss_report_us\":" +
               std::to_string(video_persistent_loss_report_us);
   snapshot += ",\"audio_playout_peers\":" + std::to_string(playout_peers) +
@@ -4203,6 +4215,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     uint64_t audio_rx_pkts = 0;
     int64_t audio_rx_native_age_ms = -1;
     uint64_t audio_concealed_samples = 0;
+    uint64_t audio_silent_concealed_samples = 0;
     uint64_t audio_output_emitted_samples = 0;
     uint64_t audio_total_samples_received = 0;
     uint64_t audio_output_duration_ms = 0;
@@ -4294,6 +4307,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
             receiver_recovery.known ? receiver_recovery.origin : 0,
             r.concealed_samples, r.silent_concealed_samples, recovery_sampled_us);
         audio_concealed_samples = r.concealed_samples;
+        audio_silent_concealed_samples = r.silent_concealed_samples;
         // Lifetime sample counters distinguish delivery jitter from a slow
         // playout clock. They are endpoint diagnostics, never wire metadata.
         audio_output_emitted_samples = r.jitter_buffer_emitted_count;
@@ -4551,6 +4565,10 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
           std::to_string(peer_recovery_snapshot.supported() ? 1 : 0);
       snapshot += ",\"audio_peer_concealment_report_us\":" +
           std::to_string(ws->shim->peer_audio_concealment_report_us(loss_now_us));
+      snapshot += ",\"audio_local_concealment_report_us\":" +
+          std::to_string(sampled ? ws->shim->local_audio_concealment_report_us(loss_now_us) : 0);
+      snapshot += ",\"audio_silent_concealed_samples\":" +
+          std::to_string(audio_silent_concealed_samples);
       // Event identity shared by native RTCP and encrypted call-health feedback.
       // These are local JSON stats, not additional RTCP or relay header fields.
       const auto peer_recovery = peer_recovery_snapshot.Sample();
