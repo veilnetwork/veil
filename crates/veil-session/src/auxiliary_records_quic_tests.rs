@@ -316,3 +316,74 @@ async fn auxiliary_control_remains_usable_at_the_generic_connection_limit() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn owned_source_warm_is_accounted_before_remote_tls_accept() {
+    timeout(Duration::from_secs(6), async {
+        let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let la = left.local_addr().unwrap();
+        let ra = right.local_addr().unwrap();
+        let ctx = Arc::new(TransportContext::for_debug().unwrap());
+        let other = tokio::spawn(promote_punched_quic(
+            right,
+            la,
+            ctx.clone(),
+            PunchedQuicRole::Responder,
+        ));
+        let local = promote_punched_quic(left, ra, ctx, PunchedQuicRole::Initiator)
+            .await
+            .unwrap();
+        let raw = local.quic_datagrams().unwrap();
+        let offer = ParallelQuicOffer::new(local.parallel_quic().unwrap()).with_duplex();
+        let mut stream = local.into_stream().unwrap();
+        stream.write_all(b"warm").await.unwrap();
+        let remote = other.await.unwrap().unwrap();
+        let remote_raw = remote.quic_datagrams().unwrap();
+        let mut remote_stream = remote.into_stream().unwrap();
+        remote_stream.read_exact(&mut [0; 4]).await.unwrap();
+        let mut registry = crate::SessionTxRegistry::new();
+        let outbox = registry.register([0xB1; 32]);
+        let activity = outbox.shared_source_activity();
+        let sender = registry.get_sender(&[0xB1; 32]).unwrap().clone();
+        let mut runner = super::reliable_source_pressure_quic_tests::make_runner(
+            stream,
+            outbox,
+            Some(RealtimeLaneOffer {
+                transport: RealtimeTransportOffer::Quic(raw.clone()),
+                peer_datagrams: true,
+                peer_flows: true,
+                peer_rotates: true,
+                peer_circuit_datagrams: true,
+                peer_neutral_forwards: true,
+                parallel: Some(offer),
+            }),
+        );
+        runner.raw_session_keys = Some(([2; 32], [3; 32], [1; 32]));
+        let task = tokio::spawn(async move { runner.run().await });
+        sender
+            .try_send((
+                veil_proto::priority::REALTIME,
+                veil_bufpool::pooled_shared_from_vec(super::primary_test_frame(false, 1, 0)),
+            ))
+            .unwrap();
+        // The remote still owns only its canonical stream: no child TLS accept
+        // or proof reader is running. Late attachment cannot pass this check.
+        timeout(Duration::from_secs(2), async {
+            while activity.transport_members() == 0 {
+                sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("own warm must enter the node ledger before the peer accepts TLS");
+        assert_eq!(activity.transport_members(), 1);
+        raw.close();
+        remote_raw.close();
+        timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    })
+    .await
+    .unwrap();
+}

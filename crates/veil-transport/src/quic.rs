@@ -1318,3 +1318,7 @@ mod tests {
         server.await.unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "quic/source_budget_tests.rs"]
+mod source_budget_tests;
