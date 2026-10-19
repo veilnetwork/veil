@@ -269,6 +269,33 @@ mod tests {
     }
 
     #[test]
+    fn auxiliary_app_streams_permission_cannot_survive_a_stripped_or_forged_resume() {
+        use veil_proto::session::cap_extra_flags2;
+        let mut caps = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Core);
+        caps.flags = u8::MAX;
+        caps.extra_flags = u8::MAX;
+        caps.extra_flags2 = cap_extra_flags2::SUPPORTS_AUXILIARY_RECORDS
+            | cap_extra_flags2::SUPPORTS_AUXILIARY_APP_STREAMS;
+        let mut attach = vec![0; AttachPayload::WIRE_SIZE];
+        append(&mut attach, &caps, &[3; 32], &[1; 32], &[2; 32]);
+        assert!(
+            verify(&attach, &[3; 32], &[1; 32], &[2; 32])
+                .unwrap()
+                .unwrap()
+                .supports_auxiliary_app_streams()
+        );
+        let second = AttachPayload::WIRE_SIZE + 4 + VALUE_LEN;
+        assert!(
+            !verify(&attach[..second], &[3; 32], &[1; 32], &[2; 32])
+                .unwrap()
+                .unwrap()
+                .supports_auxiliary_app_streams()
+        );
+        attach[second + 4 + MARKER2.len() + 1] ^= cap_extra_flags2::SUPPORTS_AUXILIARY_APP_STREAMS;
+        assert!(verify(&attach, &[3; 32], &[1; 32], &[2; 32]).is_err());
+    }
+
+    #[test]
     fn legacy_attach_and_unknown_trailers_do_not_enable_capabilities() {
         let mut attach = vec![0; AttachPayload::WIRE_SIZE];
         append_resume_nonce_to_attach(&mut attach, &[8; 32]);

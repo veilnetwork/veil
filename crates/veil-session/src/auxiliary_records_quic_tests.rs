@@ -35,10 +35,15 @@ struct Stand {
     remote_stream: veil_transport::BoxIoStream,
     handles: [QuicDatagramHandle; 2],
     diagnostics: Arc<super::super::parallel_lanes::ParallelDiagnostics>,
+    activity: Arc<crate::local_source_activity::LocalSourceActivity>,
 }
 
 impl Stand {
     async fn new(records: bool) -> Self {
+        Self::modes(records, false).await
+    }
+
+    async fn modes(records: bool, streams: bool) -> Self {
         let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let la = left.local_addr().unwrap();
@@ -58,6 +63,9 @@ impl Stand {
         if records {
             offer = offer.with_auxiliary_records().with_reliable();
         }
+        if streams {
+            offer = offer.with_auxiliary_app_streams();
+        }
         let diagnostics = offer.diagnostics();
         let mut stream = local.into_stream().unwrap();
         stream.write_all(b"main").await.unwrap();
@@ -68,10 +76,14 @@ impl Stand {
         if records {
             remote_offer = remote_offer.with_auxiliary_records().with_reliable();
         }
+        if streams {
+            remote_offer = remote_offer.with_auxiliary_app_streams();
+        }
         let mut remote_stream = other.into_stream().unwrap();
         remote_stream.read_exact(&mut [0; 4]).await.unwrap();
         let mut registry = crate::SessionTxRegistry::new();
         let outbox = registry.register([0xB1; 32]);
+        let activity = outbox.shared_source_activity();
         let sender = registry.get_sender(&[0xB1; 32]).unwrap().clone();
         let mut runner = super::reliable_source_pressure_quic_tests::make_runner(
             stream,
@@ -111,13 +123,21 @@ impl Stand {
             remote_stream,
             handles: [handle, remote_handle],
             diagnostics,
+            activity,
         }
     }
 
     async fn next(&self) -> auxiliary_records::Received {
-        timeout(Duration::from_secs(5), self.remote.next_auxiliary())
-            .await
-            .expect("source record delivered")
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let event = self.remote.next_auxiliary().await;
+                if !event.ended {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("source record delivered")
     }
 
     async fn stop(mut self) {
@@ -383,6 +403,292 @@ async fn owned_source_warm_is_accounted_before_remote_tls_accept() {
             .await
             .unwrap()
             .unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+fn stream_record(msg: AppMsg, stream: u32, n: u64) -> veil_bufpool::PooledShared {
+    use veil_proto::app::{AppClosePayload, AppDataPayload, AppOpenPayload, AppReceiptPayload};
+    let body = match msg {
+        AppMsg::AppOpen => AppOpenPayload {
+            app_id: [0x56; 32],
+            endpoint_id: 17,
+            flags: 0,
+        }
+        .encode()
+        .to_vec(),
+        AppMsg::AppData => AppDataPayload {
+            app_id: [0x56; 32],
+            endpoint_id: 17,
+            seq: n,
+            data: vec![n as u8; 1024],
+        }
+        .encode(),
+        AppMsg::AppClose => AppClosePayload {
+            app_id: [0x56; 32],
+            endpoint_id: 17,
+            reason: 0,
+        }
+        .encode()
+        .to_vec(),
+        AppMsg::AppReceipt => AppReceiptPayload {
+            app_id: [0x56; 32],
+            endpoint_id: 17,
+            seq: n,
+            status: veil_proto::app::receipt_status::ACCEPTED,
+        }
+        .encode()
+        .to_vec(),
+        _ => unreachable!(),
+    };
+    let mut h = FrameHeader::new(FrameFamily::App as u8, msg as u16);
+    h.stream_id = stream;
+    h.body_len = body.len() as u32;
+    veil_bufpool::pooled_shared_from_vec(encode_frame(&h, &body))
+}
+
+#[tokio::test]
+async fn auxiliary_app_stream_stays_on_one_source_channel_and_receives_replies() {
+    timeout(Duration::from_secs(20), async {
+        let mut stand = Stand::modes(true, true).await;
+        let stream = 317;
+        assert!(
+            stand
+                .sender
+                .send_reliable(stream_record(AppMsg::AppOpen, stream, 0))
+                .await
+        );
+        let opened = stand.next().await;
+        assert_eq!(opened.frame, stream_record(AppMsg::AppOpen, stream, 0));
+        let child = opened.handle.id();
+        assert!(
+            opened
+                .handle
+                .try_send(
+                    (
+                        veil_proto::priority::INTERACTIVE,
+                        stream_record(AppMsg::AppReceipt, stream, 0)
+                    )
+                        .into()
+                )
+                .is_ok()
+        );
+        for n in 0..48 {
+            assert!(
+                stand
+                    .sender
+                    .send_reliable(stream_record(AppMsg::AppData, stream, n))
+                    .await
+            );
+        }
+        assert!(
+            stand
+                .sender
+                .send_reliable(stream_record(AppMsg::AppClose, stream, 0))
+                .await
+        );
+        for n in 0..48 {
+            let received = stand.next().await;
+            assert_eq!(received.handle.id(), child, "App stream changed child");
+            assert_eq!(received.frame, stream_record(AppMsg::AppData, stream, n));
+        }
+        let closed = stand.next().await;
+        assert_eq!(closed.handle.id(), child);
+        assert_eq!(closed.frame, stream_record(AppMsg::AppClose, stream, 0));
+        assert_eq!(
+            stand
+                .sender
+                .local_datagram_channel_state(veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE),
+            crate::LocalDatagramChannelState::Ready
+        );
+        // No App byte entered the mixed parent even though the stream owns
+        // real sequence state and its receipt travels on the same child.
+        assert!(
+            timeout(Duration::from_millis(50), stand.remote_stream.read_u8())
+                .await
+                .is_err()
+        );
+        assert!(!stand.task.is_finished());
+        stand.stop().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn auxiliary_app_stream_yields_to_primary_and_rpc_while_preserving_bytes() {
+    timeout(Duration::from_secs(15), async {
+        let mut stand = Stand::modes(true, true).await;
+        assert!(
+            stand
+                .sender
+                .send_reliable(stream_record(AppMsg::AppOpen, 518, 0))
+                .await
+        );
+        let opened = stand.next().await;
+        let child = opened.handle.id();
+        stand.activity.note(std::time::Instant::now());
+        stand.activity.note_pressure(std::time::Instant::now());
+        let producer = stand.sender.clone();
+        let producer = tokio::spawn(async move {
+            for n in 0..64 {
+                assert!(
+                    producer
+                        .send_reliable(stream_record(AppMsg::AppData, 518, n))
+                        .await
+                );
+            }
+            assert!(
+                producer
+                    .send_reliable(stream_record(AppMsg::AppClose, 518, 0))
+                    .await
+            );
+        });
+        let request = record(
+            FrameFamily::Discovery,
+            veil_proto::DiscoveryMsg::FindValue as u16,
+            711,
+            b"query",
+        );
+        let pending = stand
+            .rpc
+            .send_request([0xB1; 32], 711, request.to_vec())
+            .unwrap();
+        let mut parts = 0;
+        let mut rpc_at_parts = None;
+        loop {
+            let event = stand.next().await;
+            let h = veil_proto::codec::decode_header(&event.frame).unwrap();
+            if h.family == FrameFamily::Discovery as u8 {
+                assert!(rpc_at_parts.is_none());
+                rpc_at_parts = Some(parts);
+                assert_ne!(event.handle.id(), child, "RPC inherited the App writer");
+                let response = record(
+                    FrameFamily::Discovery,
+                    veil_proto::DiscoveryMsg::FindValueResponse as u16,
+                    711,
+                    b"answer",
+                );
+                event
+                    .handle
+                    .try_send((veil_proto::priority::INTERACTIVE, response).into())
+                    .ok()
+                    .unwrap()
+                    .wait()
+                    .await
+                    .unwrap();
+            } else if h.msg_type == AppMsg::AppClose as u16 {
+                assert_eq!(event.handle.id(), child);
+                break;
+            } else {
+                assert_eq!(event.frame, stream_record(AppMsg::AppData, 518, parts));
+                assert_eq!(event.handle.id(), child);
+                parts += 1;
+            }
+        }
+        assert_eq!(parts, 64);
+        assert!(
+            rpc_at_parts.unwrap() < 64,
+            "control waited for the whole file"
+        );
+        assert_eq!(pending.await.unwrap(), Some(b"answer".to_vec()));
+        producer.await.unwrap();
+        assert!(stand.diagnostics.active_connections() <= 8);
+        assert!(
+            timeout(Duration::from_millis(30), stand.remote_stream.read_u8())
+                .await
+                .is_err()
+        );
+        stand.stop().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn auxiliary_app_stream_failure_does_not_move_old_stream_to_a_replacement() {
+    timeout(Duration::from_secs(12), async {
+        let stand = Stand::modes(true, true).await;
+        assert!(
+            stand
+                .sender
+                .send_reliable(stream_record(AppMsg::AppOpen, 619, 0))
+                .await
+        );
+        let opened = stand.next().await;
+        let old = opened.handle.id();
+        opened.handle.close();
+        sleep(Duration::from_millis(50)).await;
+        assert!(
+            stand
+                .sender
+                .send_reliable(stream_record(AppMsg::AppData, 619, 0))
+                .await
+        );
+        assert!(
+            stand
+                .sender
+                .send_reliable(stream_record(AppMsg::AppOpen, 620, 0))
+                .await
+        );
+        let replacement = stand.next().await;
+        assert_eq!(replacement.frame, stream_record(AppMsg::AppOpen, 620, 0));
+        assert_ne!(replacement.handle.id(), old);
+        assert!(
+            stand
+                .sender
+                .send_reliable(stream_record(AppMsg::AppData, 620, 1))
+                .await
+        );
+        assert_eq!(
+            stand.next().await.frame,
+            stream_record(AppMsg::AppData, 620, 1)
+        );
+        assert!(!stand.task.is_finished());
+        stand.stop().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn auxiliary_app_stream_legacy_record_peer_keeps_its_original_carrier() {
+    timeout(Duration::from_secs(8), async {
+        let stand = Stand::modes(true, false).await;
+        loop {
+            if stand.remote.reliable().unwrap().ready().is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            stand
+                .sender
+                .send_reliable(stream_record(AppMsg::AppOpen, 721, 0))
+                .await
+        );
+        let frame = loop {
+            use super::super::reliable_session::ReliableEvent;
+            if let ReliableEvent::Frame { result, .. } =
+                stand.remote.reliable().unwrap().next().await
+            {
+                break result.unwrap();
+            }
+        };
+        assert_eq!(frame, stream_record(AppMsg::AppOpen, 721, 0));
+        assert_ne!(
+            stand
+                .sender
+                .local_datagram_channel_state(veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE),
+            crate::LocalDatagramChannelState::Ready
+        );
+        assert!(
+            timeout(Duration::from_millis(30), stand.remote.next_auxiliary())
+                .await
+                .is_err()
+        );
+        stand.stop().await;
     })
     .await
     .unwrap();
