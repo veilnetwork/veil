@@ -105,6 +105,39 @@ impl std::fmt::Debug for ParallelKeys {
 }
 
 impl ParallelKeys {
+    /// A second, independently keyed codec on this SAME verified proof stream.
+    /// The caller must have negotiated auxiliary records in the parent.
+    pub(crate) fn into_auxiliary_records(
+        mut self,
+        stream: veil_transport::BoxIoStream,
+        transport: veil_transport::QuicDatagramHandle,
+    ) -> Result<BoundReliableChannel, BindingError> {
+        self.parent.check_active()?;
+        if self.mode != RecordMode::LossTolerant {
+            return Err(BindingError::InvalidProof);
+        }
+        let exporter = transport
+            .channel_binding()
+            .map_err(|_| BindingError::InvalidProof)?;
+        if !bool::from(exporter.ct_eq(&*self.exporter)) {
+            return Err(BindingError::InvalidProof);
+        }
+        self.tx = Zeroizing::new(blake3::derive_key(
+            "veil/parallel/auxiliary-record-key/v1",
+            &*self.tx,
+        ));
+        self.rx = Zeroizing::new(blake3::derive_key(
+            "veil/parallel/auxiliary-record-key/v1",
+            &*self.rx,
+        ));
+        self.session_id = blake3::derive_key(
+            "veil/parallel/auxiliary-record-session/v1",
+            &self.session_id,
+        );
+        self.mode = RecordMode::Reliable;
+        self.into_reliable_inner(stream, ReliableTransportOwner(Some(transport)))
+    }
+
     pub fn tx_key(&self) -> &[u8; 32] {
         &self.tx
     }

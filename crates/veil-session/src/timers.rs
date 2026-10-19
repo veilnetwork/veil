@@ -235,7 +235,7 @@ impl SessionTimers {
     /// the module doc). Caller resets the per-stall `stall_trigger_fired`
     /// flag since "peer is responsive again".
     pub fn note_rx_activity(&mut self, now: Instant) {
-        self.last_rx = now;
+        self.last_rx = self.last_rx.max(now);
     }
 
     /// Mark a GENUINE DATA-frame event (never a keepalive / cover frame).
@@ -374,6 +374,17 @@ mod tests {
         );
         // Even with `now` far in the future, keepalive-due returns false.
         assert!(!timers.keepalive_due_and_reschedule(Instant::now() + Duration::from_secs(3600)));
+    }
+
+    #[tokio::test]
+    async fn delayed_child_activity_does_not_rewind_liveness() {
+        let mut timers = SessionTimers::new(Duration::from_secs(10), Duration::from_secs(60));
+        let initial = timers.last_rx();
+        let later = initial + Duration::from_secs(5);
+        timers.note_frame_received(later);
+        timers.note_rx_activity(initial);
+        assert_eq!(timers.last_rx(), later);
+        assert_eq!(timers.last_genuine_rx(), later);
     }
 
     #[tokio::test]

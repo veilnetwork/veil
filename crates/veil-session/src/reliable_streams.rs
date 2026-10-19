@@ -22,7 +22,7 @@ fn delivery_record(h: &FrameHeader) -> bool {
 
 // These messages own no App stream sequence space. The application/ratchet/
 // chunk reassembler still validates their bytes through the canonical peer.
-fn direct_app_record(h: &FrameHeader, body: &[u8]) -> bool {
+pub(in crate::runner) fn direct_app_record(h: &FrameHeader, body: &[u8]) -> bool {
     if h.family != FrameFamily::App as u8 || h.stream_id != 0 || h.body_len as usize != body.len() {
         return false;
     }

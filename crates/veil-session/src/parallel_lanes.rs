@@ -136,6 +136,8 @@ pub struct ParallelQuicOffer {
     reliable: bool,
     reliable_delivery: bool,
     reliable_direct_app: bool,
+    auxiliary_records: bool,
+    record_events: Option<mpsc::Sender<super::auxiliary_records::Received>>,
 }
 
 impl ParallelQuicOffer {
@@ -148,6 +150,8 @@ impl ParallelQuicOffer {
             reliable: false,
             reliable_delivery: false,
             reliable_direct_app: false,
+            auxiliary_records: false,
+            record_events: None,
         }
     }
     /// Use the runtime's single shared-listener dispatcher.
@@ -173,6 +177,12 @@ impl ParallelQuicOffer {
         self
     }
     /// Enable only after the authenticated direct-App-record capability.
+    /// Extra stateless record codec; enabled only by explicit parent negotiation.
+    pub fn with_auxiliary_records(mut self) -> Self {
+        self.auxiliary_records = true;
+        self
+    }
+
     pub fn with_reliable_direct_app(mut self) -> Self {
         self.reliable_direct_app = true;
         self
@@ -233,13 +243,29 @@ impl Drop for Channel {
 struct ReadySender {
     sender: Arc<Mutex<RealtimeSender>>,
     _receiver: Option<RealtimeReceiverTask>,
+    _records: Option<Arc<crate::reliable_frames::ReliableFrameChannel>>,
+    _records_rx: Option<tokio::task::JoinHandle<()>>,
     _channel: Channel,
+}
+
+impl Drop for ReadySender {
+    fn drop(&mut self) {
+        if let Some(records) = &self._records {
+            records.handle().retire_tx();
+        }
+        // The raw child closes below. The detached record reader retains its
+        // codec until completed RX frames drain, or the parent retires.
+    }
 }
 
 impl ReadySender {
     fn unavailable(&self) -> bool {
         let sender = lock!(self.sender);
         sender.broken
+            || self
+                ._records
+                .as_ref()
+                .is_some_and(|records| records.handle().failed())
             || sender
                 .handle
                 .quic()
@@ -352,12 +378,38 @@ async fn connect_sender(
             ),
         );
     }
-    let receiver = offer
-        .duplex
-        .then(|| spawn_child_receiver(&channel, &keys, parent, context, Arc::clone(&sender)));
+    let receiver = offer.duplex.then(|| {
+        spawn_child_receiver(
+            &channel,
+            &keys,
+            parent.clone(),
+            context.clone(),
+            Arc::clone(&sender),
+        )
+    });
+    let (records, records_rx) = if offer.auxiliary_records {
+        let stream = std::mem::replace(&mut channel.stream, broken_stream_sentinel());
+        let bound = keys
+            .into_auxiliary_records(stream, channel.handle.clone())
+            .map_err(|_| "record_binding_error")?;
+        let records = Arc::new(crate::reliable_frames::ReliableFrameChannel::new(bound));
+        let task = super::auxiliary_records::spawn(
+            records.clone(),
+            parent,
+            offer
+                .record_events
+                .clone()
+                .expect("negotiated record outlet"),
+        );
+        (Some(records), Some(task))
+    } else {
+        (None, None)
+    };
     Ok(ReadySender {
         sender,
         _receiver: receiver,
+        _records: records,
+        _records_rx: records_rx,
         _channel: channel,
     })
 }
@@ -367,6 +419,7 @@ async fn receive_child(
     parent: ParallelParentHandle,
     context: RealtimeReceiverContext,
     duplex: bool,
+    auxiliary_records: Option<mpsc::Sender<super::auxiliary_records::Received>>,
     reliable: Option<mpsc::Sender<BoundReliableChild>>,
 ) {
     let authenticated = tokio::time::timeout(BIND_TIMEOUT, async {
@@ -391,15 +444,16 @@ async fn receive_child(
         let _ = reliable.expect("negotiated reliable inbox").try_send(child);
         return;
     }
-    receive_authenticated(channel, keys, parent, context, duplex).await;
+    receive_authenticated(channel, keys, parent, context, duplex, auxiliary_records).await;
 }
 
 async fn receive_authenticated(
-    channel: Channel,
+    mut channel: Channel,
     keys: ParallelKeys,
     parent: ParallelParentHandle,
     context: RealtimeReceiverContext,
     duplex: bool,
+    auxiliary_records: Option<mpsc::Sender<super::auxiliary_records::Received>>,
 ) {
     let rx = crate::datagram_flows::SessionDatagramRx::new(keys.rx_key(), &keys.session_id, true);
     let (_hold_tx, rekey_rx) = tokio::sync::watch::channel(None);
@@ -413,12 +467,23 @@ async fn receive_authenticated(
         make_carrier(
             channel.diagnostics.as_ref().expect("owned child"),
             sender,
-            parent,
+            parent.clone(),
             context.peer_id,
         )
     });
     let mut receiver =
         spawn_realtime_receiver(channel.handle.clone(), rx, rekey_rx, context, carrier);
+    let _records = if let Some(records_tx) = auxiliary_records {
+        let stream = std::mem::replace(&mut channel.stream, broken_stream_sentinel());
+        let Ok(bound) = keys.into_auxiliary_records(stream, channel.handle.clone()) else {
+            return;
+        };
+        let records = Arc::new(crate::reliable_frames::ReliableFrameChannel::new(bound));
+        let task = super::auxiliary_records::spawn(records.clone(), parent, records_tx);
+        Some((records, task))
+    } else {
+        None
+    };
     tokio::select! {
         _ = channel.handle.closed() => {},
         _ = &mut receiver.0 => {},
@@ -576,6 +641,7 @@ fn spawn_acceptor(
                 Some(mut child) = incoming.recv() => {
                     let context = context.clone();
                     let duplex = offer.duplex;
+                    let offer_records = offer.auxiliary_records.then(|| offer.record_events.clone().expect("record outlet"));
                     children.spawn(async move {
                         if !child.parent.is_active() {
                             return;
@@ -586,13 +652,13 @@ fn spawn_acceptor(
                         if !child.parent.is_active() {
                             return;
                         }
-                        receive_authenticated(child.channel, child.keys, child.parent, context, duplex).await;
+                        receive_authenticated(child.channel, child.keys, child.parent, context, duplex, offer_records).await;
                     });
                 },
                 Some(accepted) = accepts.join_next(), if !accepts.is_empty() => {
                     if let Ok(Ok(connection)) = accepted
                         && let Ok(channel) = Channel::new(connection, Arc::clone(&offer.diagnostics)) {
-                        children.spawn(receive_child(channel, parent.clone(), context.clone(), offer.duplex, reliable.clone()));
+                        children.spawn(receive_child(channel, parent.clone(), context.clone(), offer.duplex, offer.auxiliary_records.then(|| offer.record_events.clone().expect("record outlet")), reliable.clone()));
                     }
                 },
                 // A full registry or missing shared dispatcher leaves the
@@ -615,6 +681,7 @@ pub(super) struct ParallelSession {
     assignments: channel_assignments::ChannelAssignments<TOTAL_SLOTS>,
     recovery_schedule: datagram_recovery::RecoverySchedule,
     reliable: Option<super::reliable_session::ReliableSession>,
+    record_incoming: tokio::sync::Mutex<mpsc::Receiver<super::auxiliary_records::Received>>,
 }
 
 impl Drop for ParallelSession {
@@ -628,6 +695,38 @@ impl Drop for ParallelSession {
 impl ParallelSession {
     pub(super) async fn transport_closed(&self) {
         self.offer.handle.closed().await;
+    }
+
+    pub(super) fn has_auxiliary(&self) -> bool {
+        self.offer.auxiliary_records
+    }
+    pub(super) async fn next_auxiliary(&self) -> super::auxiliary_records::Received {
+        if !self.offer.auxiliary_records {
+            return std::future::pending().await;
+        }
+        match self.record_incoming.lock().await.recv().await {
+            Some(event) => event,
+            None => std::future::pending().await,
+        }
+    }
+
+    pub(super) fn auxiliary_sender(
+        &mut self,
+        priority: u8,
+        activity: &crate::local_source_activity::LocalSourceActivity,
+    ) -> Option<crate::reliable_frames::ReliableFrameHandle> {
+        if !self.offer.auxiliary_records || !self.prepare(priority) {
+            return None;
+        }
+        let index = self.assignments.source_physical(channel_index(priority)?)?;
+        let now = std::time::Instant::now();
+        self.slots[index].last_selected = Some(now);
+        self.recover_channels(now);
+        let ready = self.slots[index].ready.as_ref()?;
+        if !activity.couple_source(&ready._channel.handle, priority, std::time::Instant::now()) {
+            return None;
+        }
+        ready._records.as_ref().map(|records| records.handle())
     }
 
     pub(super) fn note_reliable_frame(&self, canonical_full: bool) -> bool {
@@ -654,6 +753,9 @@ impl ParallelSession {
             .filter(|_| offer.duplex)
             .map(|status| status.activate());
         let parent = ParallelParent::new(sid, *tx, *rx);
+        let (record_events, record_incoming) = mpsc::channel(8);
+        let mut offer = offer;
+        offer.record_events = Some(record_events);
         let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(8);
         let registration = offer
             .registry
@@ -692,6 +794,7 @@ impl ParallelSession {
             transit_salt: blake3::derive_key("veil/transit-shard/v1", &sid),
             recovery_schedule: Default::default(),
             reliable,
+            record_incoming: tokio::sync::Mutex::new(record_incoming),
         }
     }
 
@@ -887,6 +990,11 @@ impl ParallelSession {
     /// budget leaves room for reliable data and a verified replacement. Keep
     /// the old eight-connection limit, including when the peer is older.
     fn retire_signaling_for_capacity(&mut self) {
+        // Negotiated record controls cannot fall back to a mixed writer. They
+        // own a required source child, within the same eight-connection quota.
+        if self.offer.auxiliary_records {
+            return;
+        }
         let Some(index) = channel_index(crate::LOCAL_SIGNALING_LANE)
             .and_then(|source| self.assignments.source_physical(source))
         else {
@@ -936,6 +1044,7 @@ impl ParallelSession {
         // must leave two slots: ordinary reliable delivery and replacement.
         if signaling == Some(index)
             && self.slots[index].ready.is_none()
+            && !self.offer.auxiliary_records
             && self.offer.handle.available_connection_slots() <= 2
         {
             return false;
@@ -1056,6 +1165,11 @@ impl ParallelSession {
                 stats.expired_outgoing_datagrams,
             ),
         );
+        // At the unchanged generic quota, replace the stalled child itself.
+        // Do not evict a healthy control source to make room for a probe.
+        if self.offer.auxiliary_records && self.offer.handle.available_connection_slots() == 0 {
+            self.slots[index].ready = None;
+        }
         self.start_warm(index);
     }
 

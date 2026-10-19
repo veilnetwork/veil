@@ -153,6 +153,14 @@ impl FrameReceipt {
 pub struct ReliableFrameHandle(Arc<Inner>);
 
 impl ReliableFrameHandle {
+    /// Stop new TX admissions while a retired auxiliary transport drains its
+    /// already completed authenticated RX records.
+    pub(crate) fn retire_tx(&self) {
+        self.0.mark_failed(io::ErrorKind::ConnectionAborted);
+    }
+    pub(crate) fn failed(&self) -> bool {
+        self.0.bytes.is_closed()
+    }
     pub fn try_send(&self, envelope: FrameEnvelope) -> Result<FrameReceipt, FrameAdmissionError> {
         let reservation = match self.try_reserve(&envelope.frame.1) {
             Ok(reservation) => reservation,

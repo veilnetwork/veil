@@ -375,3 +375,25 @@ async fn altered_authenticated_header_fails_the_child_without_exposing_plaintext
         Err(FrameAdmissionError::Closed(_))
     ));
 }
+
+#[tokio::test]
+async fn retired_tx_rejects_old_reservations_but_drains_completed_rx() {
+    let (_pa, _pb, a, b) = bound_pair(4096);
+    let a = ReliableFrameChannel::new(a);
+    let b = ReliableFrameChannel::new(b);
+    let tx = a.handle();
+    let rx = b.handle();
+    let reserved = rx.try_reserve(&frame(8, 100).frame.1).unwrap();
+    admit(&tx, frame(7, 100)).wait().await.unwrap();
+    until(|| rx.record_progress().received_records == 1).await;
+    rx.retire_tx();
+    assert!(matches!(
+        reserved.commit(frame(8, 100)),
+        Err(FrameAdmissionError::Closed(_))
+    ));
+    assert!(matches!(
+        rx.try_reserve(&frame(9, 100).frame.1),
+        Err(FrameReservationError::Closed)
+    ));
+    assert_eq!(&rx.recv().await.unwrap()[HEADER_SIZE..], vec![7; 100]);
+}

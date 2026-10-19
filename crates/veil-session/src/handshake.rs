@@ -1240,6 +1240,7 @@ fn local_capabilities(
     caps.extra_flags |= veil_proto::session::cap_extra_flags::SUPPORTS_RELIABLE_PARALLEL;
     caps.extra_flags2 |= veil_proto::session::cap_extra_flags2::SUPPORTS_RELIABLE_DELIVERY;
     caps.extra_flags2 |= veil_proto::session::cap_extra_flags2::SUPPORTS_RELIABLE_DIRECT_APP;
+    caps.extra_flags2 |= veil_proto::session::cap_extra_flags2::SUPPORTS_AUXILIARY_RECORDS;
     caps
 }
 

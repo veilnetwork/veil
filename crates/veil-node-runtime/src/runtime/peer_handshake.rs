@@ -100,6 +100,7 @@ pub struct RemoteHandshakeInfo {
     pub supports_reliable_parallel: bool,
     pub supports_reliable_delivery: bool,
     pub supports_reliable_direct_app: bool,
+    pub supports_auxiliary_records: bool,
     /// Bounded UDP reflector port advertised by this authenticated peer.
     /// The runtime combines it with transport metadata only after all session
     /// admission gates pass.
@@ -913,6 +914,9 @@ pub async fn register_connection_session(
                         supports_reliable_direct_app: r
                             .remote_capabilities
                             .supports_reliable_direct_app(),
+                        supports_auxiliary_records: r
+                            .remote_capabilities
+                            .supports_auxiliary_records(),
                         sovereign_node_id,
                         udp_reflector_port,
                         shared_udp_reflectors,
@@ -1532,6 +1536,11 @@ pub async fn register_connection_session(
                         };
                         let offer = if remote_identity.supports_reliable_direct_app {
                             offer.with_reliable_direct_app()
+                        } else {
+                            offer
+                        };
+                        let offer = if remote_identity.supports_auxiliary_records {
+                            offer.with_auxiliary_records()
                         } else {
                             offer
                         };
