@@ -304,6 +304,61 @@ static void wait_playout(VeilGroupMediaEngine* e, uint64_t reports, uint64_t del
   if (reports) assert(group_stat(e, "audio_playout_ms") == delay);
 }
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--video-loss-persistence") == 0) {
+    uint8_t local[32] = {1}, peer[32] = {2}, other[32] = {3};
+    constexpr uint32_t audio = 0x01000000u;
+    constexpr uint32_t video = audio ^ 0x000000FFu ^ 0x56440000u;
+    const uint32_t room_video = group_ssrc(local, 0x47564944u);
+    std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> one(
+        veil_media_engine_create(190, local, peer), veil_media_engine_destroy);
+    std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> room(
+        veil_media_group_engine_create(local), veil_media_group_engine_destroy);
+    assert(one && room);
+    assert(veil_media_engine_set_mic_muted(one.get(), 1) == VEIL_MEDIA_OK);
+    assert(veil_media_engine_start_audio(one.get(), 1, 1) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_set_mic_muted(room.get(), 1) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_add_peer(room.get(), 191, peer) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_add_peer(room.get(), 192, other) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_start_audio(room.get()) == VEIL_MEDIA_OK);
+    const auto loss = [&](uint64_t channel, uint32_t source, int cumulative,
+                          uint32_t highest, uint8_t fraction, bool bad = false) {
+      auto packet = report_packet(2, source, fraction, 0);
+      for (int i = 0; i < 3; ++i) packet[13+i] = cumulative >> (16-i*8);
+      for (int i = 0; i < 4; ++i) packet[16+i] = highest >> (24-i*8);
+      if (bad) packet.push_back(0);
+      inject_raw(channel, packet);
+      std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    };
+    loss(190, video, 0, 100, 0);
+    loss(191, room_video, 0, 100, 0);
+    loss(192, room_video, 0, 100, 0);
+    loss(190, video, 4, 110, 204);
+    loss(191, room_video, 4, 110, 204);
+    assert(stat(one.get(), "video_loss_report_us") > 0);
+    assert(stat(one.get(), "video_persistent_loss_report_us") == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1700));
+    loss(190, video, 0, 110, 0); // delayed packets fill the temporary gap
+    loss(191, room_video, 4, 111, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    loss(190, video, 0, 120, 0);
+    loss(191, room_video, 4, 112, 0);
+    assert(stat(one.get(), "video_persistent_loss_report_us") == 0);
+    const auto group_loss = group_stat(room.get(), "video_persistent_loss_report_us");
+    assert(group_loss > 0);
+    loss(192, room_video, 0, 120, 0); // healthy peer cannot hide the other gap
+    assert(group_stat(room.get(), "video_persistent_loss_report_us") == group_loss);
+    loss(190, video, 2, 121, 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(3100));
+    loss(190, video, 2, 122, 0);
+    const auto direct_loss = stat(one.get(), "video_persistent_loss_report_us");
+    assert(direct_loss > 0);
+    loss(190, video, 3, 123, 255, true); // invalid compound must not start a trial
+    std::this_thread::sleep_for(std::chrono::milliseconds(3100));
+    loss(190, video, 3, 124, 0);
+    assert(stat(one.get(), "video_persistent_loss_report_us") == direct_loss);
+    std::puts("video loss: real RR parsing, late fill, unicast/group persistence and compound integrity PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--frame-sizing") == 0) {
     unsetenv("VEIL_MEDIA_TEST_VIDEO");
     const int width = 320, height = 240;

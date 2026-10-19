@@ -2484,6 +2484,7 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
       ws->video_send_stream =
           ws->video_call->CreateVideoSendStream(std::move(sc), std::move(ec));
       if (ws->video_send_stream) {
+        for (const auto& entry : ws->peers) entry.second->shim->ResetVideoLossEvidence();
         ws->video_send_stream->SetSource(
             ws->video_source.get(),
             webrtc::DegradationPreference::MAINTAIN_FRAMERATE);
@@ -2641,6 +2642,7 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   int video_reports = 0, video_loss = 0, video_jitter = 0;
   int64_t video_rtt = 0;
   int64_t audio_loss_report_us = 0, video_loss_report_us = 0;
+  int64_t video_persistent_loss_report_us = 0;
   int64_t peer_audio_recovery_report_us = 0;
   int64_t peer_audio_concealment_report_us = 0;
   int peer_audio_recovery_peers = 0;
@@ -2681,6 +2683,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
     const auto video_report = entry.second->shim->video_feedback();
     video_loss_report_us = std::max(video_loss_report_us,
         video_report.fresh_loss_report_us(now_us));
+    video_persistent_loss_report_us = std::max(video_persistent_loss_report_us,
+        video_report.fresh_persistent_loss_report_us(now_us));
     if (video_report.fresh_at(now_us)) {
       ++video_reports;
       video_loss = std::max(video_loss, video_report.loss_pct);
@@ -2866,6 +2870,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               std::to_string(rtcp_send.video_remb_coalesced_copies);
   snapshot += ",\"audio_loss_report_us\":" + std::to_string(audio_loss_report_us) +
               ",\"video_loss_report_us\":" + std::to_string(video_loss_report_us);
+  snapshot += ",\"video_persistent_loss_report_us\":" +
+              std::to_string(video_persistent_loss_report_us);
   snapshot += ",\"audio_playout_peers\":" + std::to_string(playout_peers) +
               ",\"audio_playout_sequence\":" + std::to_string(ws->audio_playout_revision) +
               ",\"audio_playout_reports\":" + std::to_string(playout_reports) +
@@ -3529,6 +3535,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
           ws->video_call->CreateVideoSendStream(std::move(sc), std::move(ec));
       vlog("video: send stream=%p", (void*)ws->video_send_stream);
       if (ws->video_send_stream) {
+        ws->shim->ResetVideoLossEvidence();
         ws->audio_packet_priority->ExpectVideo(true, webrtc::TimeMicros());
         ws->video_send_stream->SetSource(
             ws->video_source.get(),
@@ -4561,6 +4568,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
       snapshot += ",\"video_rtt_route_epoch\":" + std::to_string(video_report.route_epoch);
       snapshot += ",\"video_loss_report_us\":" +
           std::to_string(video_report.fresh_loss_report_us(loss_now_us));
+      snapshot += ",\"video_persistent_loss_report_us\":" +
+          std::to_string(video_report.fresh_persistent_loss_report_us(loss_now_us));
       snapshot += ",\"audio_output_emitted_samples\":" + std::to_string(audio_output_emitted_samples);
       snapshot += ",\"audio_total_samples_received\":" + std::to_string(audio_total_samples_received);
       snapshot += ",\"audio_output_duration_ms\":" + std::to_string(audio_output_duration_ms);

@@ -252,6 +252,7 @@ bool VeilTransportShim::RebindChannel(uint64_t veil_chan, bool retain_previous_r
     std::lock_guard lock(audio_feedback_mu_);
     auto* clock = webrtc::Clock::GetRealTimeClock();
     rtcp_route_clock_.Reset(webrtc::CompactNtp(clock->CurrentNtpTime()));
+    video_loss_persistence_.RouteChanged();
     // Retain loss/playout evidence and the engine's live counters. Cached
     // RTT about the previous sender path is unknown for the new path.
     for (auto* feedback : {&audio_feedback_, &video_feedback_}) {
@@ -527,6 +528,12 @@ RtcpFeedbackSnapshot VeilTransportShim::video_feedback() const {
   return video_feedback_;
 }
 
+void VeilTransportShim::ResetVideoLossEvidence() {
+  std::lock_guard lock(audio_feedback_mu_);
+  video_loss_persistence_.Reset();
+  video_feedback_.persistent_loss_report_us = 0;
+}
+
 AudioPlayoutSnapshot VeilTransportShim::audio_playout_feedback() const {
   if (!started_.load(std::memory_order_acquire)) return {};
   std::lock_guard lock(audio_feedback_mu_);
@@ -610,6 +617,8 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
       auto& sample = audio ? candidate : video_candidate;
       sample.arrived_us = arrived_us;
       sample.loss_pct = (int(block.fraction_lost()) * 100 + 128) / 256;
+      sample.cumulative_lost = block.cumulative_lost();
+      sample.highest_sequence = block.extended_high_seq_num();
       // Preserve sub-one-percent loss and a lossy block followed by a healthy
       // block in the same valid compound packet.
       if (block.fraction_lost() != 0) sample.loss_report_us = arrived_us;
@@ -686,6 +695,10 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
       if (!rtcp_route_clock_.Accepts(video_candidate.last_sender_report)) video_candidate.rtt_ms = 0;
       video_candidate.loss_report_us = std::max(video_candidate.loss_report_us,
                                                 video_feedback_.loss_report_us);
+      video_candidate.persistent_loss_report_us = std::max(
+          video_feedback_.persistent_loss_report_us,
+          video_loss_persistence_.Observe(video_candidate.cumulative_lost,
+              video_candidate.highest_sequence, arrived_us));
       video_feedback_ = video_candidate;
     }
     if (playout.supported && (!audio_playout_feedback_.supported ||
