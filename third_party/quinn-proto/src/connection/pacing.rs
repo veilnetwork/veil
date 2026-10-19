@@ -16,7 +16,11 @@ pub(super) struct Pacer {
     capacity: u64,
     last_window: u64,
     last_mtu: u16,
+    last_rtt: Duration,
+    explicit_rate_bps: Option<u64>,
     tokens: u64,
+    // Retain sub-byte credit across unrelated driver polls.
+    fraction: f64,
     prev: Instant,
 }
 
@@ -28,7 +32,10 @@ impl Pacer {
             capacity,
             last_window: window,
             last_mtu: mtu,
+            last_rtt: smoothed_rtt,
+            explicit_rate_bps: None,
             tokens: capacity,
+            fraction: 0.0,
             prev: now,
         }
     }
@@ -58,46 +65,12 @@ impl Pacer {
             "zero-sized congestion control window is nonsense"
         );
 
-        if window != self.last_window || mtu != self.last_mtu {
-            self.capacity = optimal_capacity(smoothed_rtt, window, mtu);
-
-            // Clamp the tokens
-            self.tokens = self.capacity.min(self.tokens);
-            self.last_window = window;
-            self.last_mtu = mtu;
-        }
-
-        // if we can already send a packet, there is no need for delay
-        if self.tokens >= bytes_to_send {
+        self.settle(now);
+        self.configure(smoothed_rtt, window, mtu, None);
+        if window > u64::from(u32::MAX) || smoothed_rtt.as_nanos() == 0 {
             return None;
         }
-
-        // we disable pacing for extremely large windows
-        if window > u64::from(u32::MAX) {
-            return None;
-        }
-
         let window = window as u32;
-
-        let time_elapsed = now.checked_duration_since(self.prev).unwrap_or_else(|| {
-            warn!("received a timestamp early than a previous recorded time, ignoring");
-            Default::default()
-        });
-
-        if smoothed_rtt.as_nanos() == 0 {
-            return None;
-        }
-
-        let elapsed_rtts = time_elapsed.as_secs_f64() / smoothed_rtt.as_secs_f64();
-        let new_tokens = window as f64 * 1.25 * elapsed_rtts;
-        self.tokens = self
-            .tokens
-            .saturating_add(new_tokens as _)
-            .min(self.capacity);
-
-        self.prev = now;
-
-        // if we can already send a packet, there is no need for delay
         if self.tokens >= bytes_to_send {
             return None;
         }
@@ -113,9 +86,9 @@ impl Pacer {
             / smoothed_rtt.as_nanos())
         .min(u128::from(self.capacity)) as u64;
         let refill_target = bytes_to_send.max(interval_credit);
-        // Round upward to the first instant with enough byte credit. Rounding
-        // down can repeatedly wake one byte short and discard fractional
-        // refill credit when `prev` advances, starving a small-window source.
+        // Round upward using the remaining whole-byte deficit. The sub-byte
+        // carry remains available on refill; conservatively ignoring it here
+        // costs less than one byte of pacing time and cannot overspend credit.
         let delay_nanos = smoothed_rtt
             .as_nanos()
             .saturating_mul(u128::from(refill_target - self.tokens))
@@ -126,6 +99,93 @@ impl Pacer {
             (delay_nanos % 1_000_000_000) as u32,
         );
         Some(self.prev + delay)
+    }
+    /// A controller-specified rate already includes its own pacing gain.
+    /// It is a local transport instruction, never an application role.
+    pub(super) fn delay_with_rate(
+        &mut self,
+        smoothed_rtt: Duration,
+        bytes_to_send: u64,
+        mtu: u16,
+        window: u64,
+        rate_bps: Option<u64>,
+        now: Instant,
+    ) -> Option<Instant> {
+        let Some(rate) = rate_bps.filter(|rate| *rate > 0) else {
+            return self.delay(smoothed_rtt, bytes_to_send, mtu, window, now);
+        };
+        self.settle(now);
+        self.configure(smoothed_rtt, window, mtu, Some(rate));
+        if self.tokens >= bytes_to_send {
+            return None;
+        }
+        let interval_credit = ((u128::from(rate) * BURST_INTERVAL_NANOS) / 8_000_000_000)
+            .min(u128::from(self.capacity)) as u64;
+        let target = bytes_to_send.max(interval_credit);
+        let deficit = (target - self.tokens) as f64 - self.fraction;
+        let nanos = (deficit * 8_000_000_000.0 / rate as f64).ceil() as u128;
+        Some(
+            self.prev
+                + Duration::new(
+                    (nanos / 1_000_000_000).min(u128::from(u64::MAX)) as u64,
+                    (nanos % 1_000_000_000) as u32,
+                ),
+        )
+    }
+
+    fn configure(&mut self, rtt: Duration, window: u64, mtu: u16, rate: Option<u64>) {
+        if self.last_window == window
+            && self.last_mtu == mtu
+            && self.last_rtt == rtt
+            && self.explicit_rate_bps == rate
+        {
+            return;
+        }
+        self.capacity = match rate {
+            // Keep the existing two-ms timer quantum, but derive burst size
+            // from the requested rate rather than an unrelated large cwnd.
+            // A two-packet floor supports GSO. The BBR send-quantum discussion
+            // permits a local batching choice for CPU/timer constraints:
+            // https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#section-4.6.3
+            Some(bits) => ((u128::from(bits) * BURST_INTERVAL_NANOS) / 8_000_000_000)
+                .clamp(u128::from(mtu) * 2, (64 * 1024).max(u128::from(mtu) * 2))
+                as u64,
+            None => optimal_capacity(rtt, window, mtu),
+        };
+        if self.tokens >= self.capacity {
+            self.fraction = 0.0;
+        }
+        self.tokens = self.tokens.min(self.capacity);
+        self.last_window = window;
+        self.last_mtu = mtu;
+        self.last_rtt = rtt;
+        self.explicit_rate_bps = rate;
+    }
+
+    fn settle(&mut self, now: Instant) {
+        let elapsed = now.checked_duration_since(self.prev).unwrap_or_else(|| {
+            warn!("received a timestamp earlier than the settled pacing clock, ignoring");
+            Default::default()
+        });
+        self.prev = self.prev.max(now);
+        // Settle the OLD rate and capacity before installing a new model.
+        // Idle time and an increased rate cannot mint a larger new burst.
+        let rate = match self.explicit_rate_bps {
+            Some(bits) => bits as f64 / 8.0,
+            None if self.last_window <= u64::from(u32::MAX) && !self.last_rtt.is_zero() => {
+                self.last_window as f64 * 1.25 / self.last_rtt.as_secs_f64()
+            }
+            None => 0.0,
+        };
+        let earned = rate * elapsed.as_secs_f64() + self.fraction;
+        let filled = self.tokens.saturating_add(earned as u64);
+        if filled >= self.capacity {
+            self.tokens = self.capacity;
+            self.fraction = 0.0;
+        } else {
+            self.tokens = filled;
+            self.fraction = earned.fract();
+        }
     }
 }
 
@@ -169,6 +229,113 @@ const MAX_BURST_SIZE: u64 = 256;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_controller_rate_limits_a_large_window_without_extra_gain() {
+        let now = Instant::now();
+        let rtt = Duration::from_millis(1);
+        let mut p = Pacer::new(rtt, 1_000_000, 1200, now);
+        for _ in 0..2 {
+            assert_eq!(
+                p.delay_with_rate(rtt, 1200, 1200, 1_000_000, Some(96_000), now),
+                None
+            );
+            p.on_transmit(1200);
+        }
+        assert_eq!(
+            p.delay_with_rate(rtt, 1200, 1200, 1_000_000, Some(96_000), now),
+            Some(now + Duration::from_millis(100))
+        );
+    }
+
+    #[test]
+    fn a_rate_increase_cannot_reprice_old_time_as_new_credit() {
+        let now = Instant::now();
+        let rtt = Duration::from_millis(1);
+        let mut p = Pacer::new(rtt, 1_000_000, 1200, now);
+        p.delay_with_rate(rtt, 1200, 1200, 1_000_000, Some(96_000), now);
+        p.on_transmit(2400);
+        let later = now + Duration::from_millis(10);
+        let wake = p
+            .delay_with_rate(rtt, 1200, 1200, 1_000_000, Some(80_000_000), later)
+            .unwrap();
+        assert_eq!(p.tokens, 120);
+        assert!(wake > later && wake <= later + Duration::from_millis(2));
+    }
+
+    #[test]
+    fn an_unknown_controller_rate_uses_the_normal_pacer() {
+        let now = Instant::now();
+        let rtt = Duration::from_millis(120);
+        let mut plain = Pacer::new(rtt, 4065, 1200, now);
+        let mut unknown = Pacer::new(rtt, 4065, 1200, now);
+        plain.on_transmit(12000);
+        unknown.on_transmit(12000);
+        for at in [
+            now,
+            now + Duration::from_millis(10),
+            now + Duration::from_millis(30),
+        ] {
+            assert_eq!(
+                plain.delay(rtt, 1200, 1200, 4065, at),
+                unknown.delay_with_rate(rtt, 1200, 1200, 4065, Some(0), at)
+            );
+        }
+    }
+
+    #[test]
+    fn idle_time_cannot_fund_two_bursts_at_the_same_instant() {
+        let start = Instant::now();
+        let rtt = Duration::from_millis(120);
+        let window = 4065;
+        let mtu = 1200;
+        for already_sent in [0, 3] {
+            let mut pacer = Pacer::new(rtt, window, mtu, start);
+            for _ in 0..already_sent {
+                pacer.on_transmit(mtu);
+            }
+            let resumed = start + Duration::from_secs(10);
+            let mut packets = 0;
+            while pacer.delay(rtt, mtu as u64, mtu, window, resumed).is_none() {
+                pacer.on_transmit(mtu);
+                packets += 1;
+                assert!(packets <= 10, "the same idle time funded extra packets");
+            }
+            assert_eq!(packets, 10);
+        }
+    }
+
+    #[test]
+    fn frequent_driver_polls_preserve_sub_byte_credit() {
+        let start = Instant::now();
+        let rtt = Duration::from_secs(1);
+        let mut pacer = Pacer::new(rtt, 8, 1, start);
+        pacer.on_transmit(10);
+        let mut sent = 0;
+        // Ten bytes/s, sampled more frequently than one byte can be earned.
+        for n in 1..=1200 {
+            let now = start + Duration::from_micros(n * 100);
+            if pacer.delay(rtt, 1, 1, 8, now).is_none() {
+                pacer.on_transmit(1);
+                sent += 1;
+            }
+        }
+        assert_eq!(sent, 1, "poll frequency cannot erase all delivery credit");
+    }
+
+    #[test]
+    fn old_timestamps_cannot_replay_a_settled_refill_interval() {
+        let start = Instant::now();
+        let rtt = Duration::from_millis(120);
+        let mut pacer = Pacer::new(rtt, 4065, 1200, start);
+        pacer.on_transmit(12000);
+        let later = start + Duration::from_millis(10);
+        assert!(pacer.delay(rtt, 1200, 1200, 4065, later).is_some());
+        let settled = pacer.tokens;
+        assert!(pacer.delay(rtt, 1200, 1200, 4065, start).is_some());
+        assert!(pacer.delay(rtt, 1200, 1200, 4065, later).is_some());
+        assert_eq!(pacer.tokens, settled);
+    }
 
     #[test]
     fn does_not_panic_on_bad_instant() {
