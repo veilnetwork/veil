@@ -5,6 +5,7 @@
 #include "modules/rtp_rtcp/source/rtcp_packet/common_header.h"
 #include "veil_audio_recovery_feedback.h"
 #include "veil_audio_concealment_feedback.h"
+#include "veil_audio_soft_loss.h"
 static void require(bool ok, const char* message) {
   if (!ok) {
     std::fprintf(stderr, "%s\n", message);
@@ -13,6 +14,44 @@ static void require(bool ok, const char* message) {
 }
 int main() {
   using namespace veil_media;
+  {
+    using Kind = AudioSoftLossWindow::Kind;
+    AudioSoftLossWindow damage;
+    damage.Observe(Kind::Concealment, 1, 1, 100000, true, true, 1'000'000);
+    require(damage.Samples(1'000'000) == 0, "startup damage became current");
+    damage.Observe(Kind::Concealment, 1, 2, 100000 + 11*48, true, true, 2'000'000);
+    damage.Observe(Kind::Concealment, 1, 3, 100000 + 38*48, true, true, 3'000'000);
+    require(damage.Samples(3'000'000) == 38*48 && damage.FreshReportUs(3'000'000) == 0,
+            "two short events became significant damage");
+    damage.Observe(Kind::Catchup, 1, 1, 0, true, false, 3'000'000);
+    damage.Observe(Kind::Catchup, 1, 2, 85*48, true, true, 4'000'000);
+    require(damage.Samples(4'000'000) == 123*48 &&
+                damage.FreshReportUs(4'000'321) == 4'000'000,
+            "combined discarded speech and concealment did not qualify");
+    damage.Observe(Kind::Catchup, 1, 2, 5000*48, true, true, 4'100'000);
+    damage.Observe(Kind::Catchup, 1, 3, 1, true, true, 4'200'000);
+    damage.Observe(Kind::Catchup, 1, 4, 85*48, true, true, 4'300'000);
+    require(damage.Samples(4'300'000) == 123*48 &&
+                damage.FreshReportUs(4'300'000) == 4'000'000,
+            "replay/rollback/cached counters renewed damage");
+    require(damage.Samples(8'000'000) == 112*48 && damage.FreshReportUs(8'000'000) == 0,
+            "expired contributions kept qualifying pressure");
+    damage.Observe(Kind::Concealment, 2, 1, 900000, true, true, 8'100'000);
+    require(damage.Samples(8'100'000) == 0, "new origin inherited damage history");
+    damage.Observe(Kind::Concealment, 1, 999, 990000, true, true, 8'200'000);
+    damage.Observe(Kind::Concealment, 2, 999, 0, false, true, 8'300'000);
+    damage.Observe(Kind::Concealment, 2, 2, 900000 + 119*48, true, true, 8'400'000);
+    require(damage.FreshReportUs(8'400'000) == 0, "old/unknown report poisoned a new origin");
+    damage.Observe(Kind::Concealment, 2, 3, 900000 + 120*48, true, true, 8'500'000);
+    require(damage.FreshReportUs(8'500'000) == 8'500'000, "120ms boundary missed");
+    damage.Observe(Kind::Concealment, 2, 4, 9999999, true, true, 15'000'000);
+    require(damage.Samples(15'000'000) == 0, "observation gap became fresh damage");
+    damage.Observe(Kind::Concealment, 2, 5, 10000099, true, false, 16'000'000);
+    require(damage.Samples(16'000'000) == 0, "stale newly observed counter became damage");
+    require(!damage.FreshAt(22'000'000), "cached duration counters stayed fresh forever");
+    require(AudioSoftLossWindow::CatchupSamples(7000) == 7000*48,
+            "cumulative catchup saturated at the rolling window");
+  }
   AudioRecoveryRegistry registry_a, registry_b;
   const auto decoder_a = registry_a.NewStream();
   const auto decoder_b = registry_b.NewStream();

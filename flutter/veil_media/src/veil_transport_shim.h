@@ -28,6 +28,7 @@
 #pragma once
 
 #include <atomic>
+#include "veil_audio_soft_loss.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -206,6 +207,8 @@ class VeilTransportShim : public webrtc::Transport {
                                int64_t sampled_us);
   int64_t peer_audio_concealment_report_us(int64_t now_us) const;
   int64_t local_audio_concealment_report_us(int64_t now_us) const;
+  AudioSoftLossSnapshot local_audio_soft_loss(int64_t now_us) const;
+  AudioSoftLossSnapshot peer_audio_soft_loss(int64_t now_us) const;
 
   // Enable only when both endpoints have independent audio/video counters.
   // Older engines used one sequence space and cannot consume split feedback.
@@ -374,6 +377,7 @@ class VeilTransportShim : public webrtc::Transport {
   AudioRecoveryCursor peer_audio_recovery_;
   LocalAudioConcealment local_audio_concealment_;
   AudioConcealmentCursor peer_audio_concealment_;
+  AudioSoftLossWindow local_audio_soft_loss_, peer_audio_soft_loss_;
   int64_t concealment_sent_us_ = 0;
   std::atomic<bool> independent_transport_feedback_{false};
   std::atomic<bool> started_{false};
