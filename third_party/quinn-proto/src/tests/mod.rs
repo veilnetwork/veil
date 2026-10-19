@@ -35,6 +35,188 @@ use crate::{
 mod util;
 use util::*;
 
+#[test]
+fn confirmed_delivery_counts_only_new_explicit_data_acks() {
+    let _guard = subscribe();
+    let mut pair = Pair::default_with_deterministic_pns();
+    let (client, server) = pair.connect();
+    pair.drive();
+    let before = pair.client_conn_mut(client).stats().path.confirmed_delivery;
+    pair.client_conn_mut(client)
+        .datagrams()
+        .send(Bytes::from(vec![7; 512]), false)
+        .unwrap();
+    pair.drive_client();
+    assert_eq!(pair.server.inbound.len(), 1);
+    let first_wire_bytes = pair.server.inbound[0].2.len() as u64;
+    let unconfirmed = pair.client_conn_mut(client).stats().path.confirmed_delivery;
+    assert_eq!(
+        unconfirmed.bytes, before.bytes,
+        "send admission is not delivery"
+    );
+    pair.server_conn_mut(server).ping();
+    pair.drive_server();
+    assert!(!pair.client.inbound.is_empty());
+    let duplicate = pair.client.inbound.clone();
+    pair.drive_client();
+    let first = pair.client_conn_mut(client).stats().path.confirmed_delivery;
+    assert_eq!(first.packets - before.packets, 1);
+    assert_eq!(first.bytes - before.bytes, first_wire_bytes);
+    assert!(first.first_sent.is_some() && first.last_sent.is_some() && first.last_ack.is_some());
+    assert!(first.first_sent <= first.last_sent && first.last_sent <= first.last_ack);
+
+    // Keep the server's old ACK range by discarding the client's ACK of its
+    // ping. Its next fresh encrypted ACK then repeats that old range too.
+    pair.server.inbound.clear();
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    assert_eq!(pair.server.inbound.len(), 1);
+    let second_wire_bytes = pair.server.inbound[0].2.len() as u64;
+    pair.server_conn_mut(server).ping();
+    pair.drive_server();
+    pair.drive_client();
+    let second = pair.client_conn_mut(client).stats().path.confirmed_delivery;
+    assert_eq!(second.packets - first.packets, 1);
+    assert_eq!(second.bytes - first.bytes, second_wire_bytes);
+    pair.client.inbound.extend(duplicate);
+    pair.drive_client();
+    let replayed = pair.client_conn_mut(client).stats().path.confirmed_delivery;
+    assert_eq!(replayed.bytes, second.bytes);
+    assert_eq!(replayed.packets, second.packets);
+}
+
+#[test]
+fn confirmed_delivery_does_not_count_inferred_handshake_progress() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let client = pair.begin_connect(client_config());
+    pair.drive_client();
+    pair.drive_server();
+    pair.drive_client();
+    // Receipt of the server's handshake retires Initial packets implicitly.
+    // No explicitly acknowledged application-space packet exists yet.
+    let stats = pair.client_conn_mut(client).stats();
+    assert!(stats.udp_tx.bytes > 0 && stats.udp_rx.bytes > 0);
+    assert_eq!(stats.path.confirmed_delivery.bytes, 0);
+    assert_eq!(stats.path.confirmed_delivery.packets, 0);
+    assert!(stats.path.confirmed_delivery.last_ack.is_none());
+    pair.drive();
+}
+
+#[test]
+fn confirmed_delivery_preserves_send_span_when_acknowledgments_are_batched() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client, server) = pair.connect();
+    pair.drive();
+    let before = pair.client_conn_mut(client).stats().path.confirmed_delivery;
+    pair.client_conn_mut(client).datagrams().send(Bytes::from(vec![1; 300]), false).unwrap();
+    pair.drive_client();
+    pair.time += Duration::from_millis(5);
+    pair.client_conn_mut(client).datagrams().send(Bytes::from(vec![2; 300]), false).unwrap();
+    pair.drive_client();
+    let last_sent = pair.time;
+    assert_eq!(pair.server.inbound.len(), 2);
+    let wire_bytes: u64 = pair.server.inbound.iter().map(|x| x.2.len() as u64).sum();
+    // Both packets now reach the receiver together and share one ACK clock.
+    pair.time += Duration::from_millis(5);
+    pair.server_conn_mut(server).ping();
+    pair.drive_server();
+    pair.drive_client();
+    let after = pair.client_conn_mut(client).stats().path.confirmed_delivery;
+    assert_eq!(after.bytes - before.bytes, wire_bytes);
+    assert_eq!(after.packets - before.packets, 2);
+    assert_eq!(after.last_sent, Some(last_sent));
+    assert_eq!(after.last_ack, Some(pair.time));
+    assert!(after.last_sent.unwrap().duration_since(after.first_sent.unwrap()) >= Duration::from_millis(5));
+}
+
+#[test]
+fn confirmed_delivery_local_rebind_excludes_old_pending_acks() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client, server) = pair.connect();
+    pair.drive();
+    pair.client_conn_mut(client)
+        .datagrams()
+        .send(Bytes::from(vec![9; 512]), false)
+        .unwrap();
+    pair.drive_client();
+    pair.server_conn_mut(server).ping();
+    pair.drive_server();
+    assert!(!pair.client.inbound.is_empty());
+    let previous = pair
+        .client_conn_mut(client)
+        .stats()
+        .path
+        .confirmed_delivery
+        .epoch;
+    pair.client_conn_mut(client).local_address_changed();
+    let reset = pair.client_conn_mut(client).stats().path.confirmed_delivery;
+    assert!(reset.epoch > previous);
+    assert_eq!(reset.bytes, 0);
+    assert!(reset.last_ack.is_none());
+    // Deliver the genuine ACK created before rebinding, after the reset.
+    pair.drive_client();
+    let stale = pair.client_conn_mut(client).stats().path.confirmed_delivery;
+    assert_eq!(stale.bytes, 0);
+    assert_eq!(stale.packets, 0);
+    assert!(stale.last_ack.is_none());
+    pair.drive();
+    assert!(
+        pair.client_conn_mut(client)
+            .stats()
+            .path
+            .confirmed_delivery
+            .bytes
+            > 0
+    );
+}
+
+#[test]
+fn confirmed_delivery_validation_rollback_starts_another_epoch() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client, server) = pair.connect();
+    pair.drive();
+    let old_remote = pair.client.addr;
+    let first = pair
+        .server_conn_mut(server)
+        .stats()
+        .path
+        .confirmed_delivery
+        .epoch;
+    pair.client.addr.set_port(old_remote.port().wrapping_add(1));
+    pair.client_conn_mut(client).ping();
+    pair.drive_client();
+    pair.drive_server();
+    let second = pair
+        .server_conn_mut(server)
+        .stats()
+        .path
+        .confirmed_delivery
+        .epoch;
+    assert!(second > first);
+    assert_ne!(pair.server_conn_mut(server).remote_address(), old_remote);
+    assert!(pair.server_conn_mut(server).stats().path.confirmed_delivery.validation_pending);
+    // No peer responses: exercise the actual path validation timeout, rather
+    // than initiating a fresh migration back to the original address.
+    for _ in 0..100 {
+        let at = pair.server_conn_mut(server).poll_timeout().unwrap();
+        pair.server_conn_mut(server).handle_timeout(at);
+        if pair.server_conn_mut(server).remote_address() == old_remote {
+            break;
+        }
+    }
+    assert_eq!(pair.server_conn_mut(server).remote_address(), old_remote);
+    let final_stats = pair.server_conn_mut(server).stats().path.confirmed_delivery;
+    assert!(final_stats.epoch > second);
+    assert_eq!(final_stats.bytes, 0);
+    assert_eq!(final_stats.packets, 0);
+    assert!(final_stats.last_ack.is_none());
+    assert!(!final_stats.validation_pending);
+}
+
 mod token;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]

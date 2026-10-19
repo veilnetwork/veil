@@ -96,6 +96,7 @@ mod tests {
     use super::*;
     fn stats() -> QuicDatagramPathStats {
         QuicDatagramPathStats {
+            confirmed_delivery: None,
             rtt_us: 60_000,
             congestion_window_bytes: 12000,
             in_flight_bytes: 12000,

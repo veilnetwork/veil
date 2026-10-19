@@ -44,6 +44,7 @@ impl PrimaryPathFeedback {
 #[derive(Default)]
 struct ReliableDelayFeedback {
     path: Option<u64>,
+    delivery_epoch: Option<u64>,
     acked: u64,
     baseline_us: u64,
     last_at: Option<Instant>,
@@ -53,6 +54,41 @@ struct ReliableDelayFeedback {
 }
 
 impl ReliableDelayFeedback {
+    fn observe_confirmed(
+        &mut self,
+        path: u64,
+        delivery: Option<veil_transport::quic::QuicConfirmedDelivery>,
+        rtt_us: u64,
+        now: Instant,
+    ) -> bool {
+        let Some(delivery) = delivery else {
+            return false;
+        };
+        let (Some(first), Some(last), Some(ack)) =
+            (delivery.first_sent, delivery.last_sent, delivery.last_ack)
+        else {
+            return false;
+        };
+        if delivery.validation_pending
+            || delivery.bytes == 0
+            || delivery.packets == 0
+            || first > last
+            || last > ack
+            || ack > delivery.observed_at
+            || delivery.observed_at > now
+            || now.saturating_duration_since(ack) >= IDLE_GRACE
+        {
+            return false;
+        }
+        if self.path != Some(path) || self.delivery_epoch != Some(delivery.epoch) {
+            // Rebinding can retain the connection id and cumulative ACK-frame
+            // count. Its old RTT floor must not manufacture a rising new path.
+            self.path = None;
+            self.delivery_epoch = Some(delivery.epoch);
+        }
+        self.observe(path, delivery.packets, rtt_us, now)
+    }
+
     fn observe(&mut self, path: u64, acked: u64, rtt_us: u64, now: Instant) -> bool {
         if acked == 0 || rtt_us == 0 {
             return false;
@@ -155,10 +191,11 @@ impl LocalReliableAdmission {
         now: Instant,
     ) -> bool {
         let stats = handle.path_stats();
+        let now = now.max(Instant::now());
         let path = handle.local_trace_id();
         if self
             .reliable_delay
-            .observe(path, stats.acknowledgments_received, stats.rtt_us, now)
+            .observe_confirmed(path, stats.confirmed_delivery, stats.rtt_us, now)
         {
             self.source_activity.note_reliable_transport_pressure(now);
             if crate::rt_trace::rt_trace_enabled()
@@ -343,6 +380,70 @@ impl Drop for ControlWrite {
 #[cfg(test)]
 mod feedback_tests {
     use super::*;
+
+    fn confirmed(
+        epoch: u64,
+        packets: u64,
+        now: Instant,
+    ) -> veil_transport::quic::QuicConfirmedDelivery {
+        veil_transport::quic::QuicConfirmedDelivery {
+            epoch,
+            validation_pending: false,
+            bytes: packets * 100,
+            packets,
+            first_sent: Some(now - Duration::from_millis(20)),
+            last_sent: Some(now - Duration::from_millis(10)),
+            last_ack: Some(now),
+            observed_at: now,
+        }
+    }
+
+    #[test]
+    fn confirmed_delivery_epoch_rebases_a_rebound_connection_rtt() {
+        let now = Instant::now();
+        let mut feedback = ReliableDelayFeedback::default();
+        assert!(!feedback.observe_confirmed(7, Some(confirmed(0, 10, now)), 40_000, now));
+        for (at, packets) in [(40, 11), (80, 12)] {
+            let at = now + Duration::from_millis(at);
+            assert!(!feedback.observe_confirmed(7, Some(confirmed(0, packets, at)), 100_000, at));
+        }
+        let at = now + Duration::from_millis(160);
+        assert!(feedback.observe_confirmed(7, Some(confirmed(0, 13, at)), 100_000, at));
+        for n in 0..8 {
+            let at = now + Duration::from_millis(200 + n * 40);
+            assert!(!feedback.observe_confirmed(7, Some(confirmed(1, n + 100, at)), 120_000, at));
+        }
+    }
+
+    #[test]
+    fn cached_or_unusable_confirmed_delivery_cannot_fill_a_growth_window() {
+        let now = Instant::now();
+        let mut feedback = ReliableDelayFeedback::default();
+        assert!(!feedback.observe_confirmed(7, Some(confirmed(0, 10, now)), 40_000, now));
+        let first = now + Duration::from_millis(40);
+        let report = confirmed(0, 11, first);
+        assert!(!feedback.observe_confirmed(7, Some(report), 80_000, first));
+        for ms in [80, 120, 160, 200] {
+            let at = now + Duration::from_millis(ms);
+            let mut cached = report;
+            cached.observed_at = at;
+            assert!(!feedback.observe_confirmed(7, Some(cached), 80_000, at));
+        }
+        for kind in 0..5 {
+            let at = now + Duration::from_millis(250);
+            let mut invalid = confirmed(0, 12, at);
+            match kind {
+                0 => invalid.validation_pending = true,
+                1 => invalid.last_ack = None,
+                2 => invalid.last_ack = Some(at - IDLE_GRACE),
+                3 => invalid.last_sent = Some(at + Duration::from_millis(1)),
+                _ => invalid.observed_at = at + Duration::from_millis(1),
+            }
+            assert!(!feedback.observe_confirmed(7, Some(invalid), 80_000, at));
+        }
+        assert_eq!(feedback.rising_samples, 1);
+        assert!(!feedback.observe_confirmed(7, None, 80_000, now + Duration::from_millis(260)));
+    }
 
     #[test]
     fn reliable_delay_requires_fresh_sustained_growth_and_allows_stable_high_rtt() {
