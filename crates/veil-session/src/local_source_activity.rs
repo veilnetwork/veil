@@ -39,6 +39,7 @@ struct SourceState {
 #[derive(Debug)]
 pub(crate) struct LocalSourceActivity {
     work_owner: u64,
+    flight: Arc<crate::local_source_flight::SourceFlightPool>,
     state: Mutex<SourceState>,
 }
 
@@ -49,6 +50,7 @@ impl Default for LocalSourceActivity {
         assert_ne!(owner, 0, "local source owner exhausted");
         Self {
             work_owner: owner,
+            flight: Arc::default(),
             state: Mutex::default(),
         }
     }
@@ -191,7 +193,23 @@ impl LocalSourceActivity {
         }
     }
 
+    pub(crate) fn couple_source(
+        &self,
+        handle: &veil_transport::QuicDatagramHandle,
+        priority: u8,
+        now: Instant,
+    ) -> bool {
+        use crate::local_source_flight::Role;
+        let role = match priority {
+            veil_proto::priority::REALTIME => Role::Primary,
+            crate::LOCAL_SIGNALING_LANE => Role::Control,
+            _ => Role::Secondary,
+        };
+        self.flight.bind(handle, role, now)
+    }
+
     pub(crate) fn note(&self, now: Instant) {
+        self.flight.note_primary(now);
         let mut state = lock!(self.state);
         if state
             .last_primary
@@ -220,6 +238,7 @@ impl LocalSourceActivity {
     /// Only a locally authored primary's authenticated path or trusted writer can publish this.
     /// Other runners consume it exclusively for their own secondary producers.
     pub(crate) fn note_pressure(&self, now: Instant) {
+        self.flight.feedback(true, now);
         let mut state = lock!(self.state);
         let until = now + PRESSURE_GRACE;
         state.pressure_until = Some(state.pressure_until.map_or(until, |old| old.max(until)));
@@ -230,6 +249,7 @@ impl LocalSourceActivity {
     /// restrains only its ordered DATA. It does not select a video quality or
     /// spend the network-recovery/neutral-transit allowance.
     pub(crate) fn note_reliable_transport_pressure(&self, now: Instant) {
+        self.flight.feedback(true, now);
         let mut state = lock!(self.state);
         let until = now + PRESSURE_GRACE;
         state.reliable_transport_pressure_until = Some(
@@ -243,6 +263,7 @@ impl LocalSourceActivity {
     /// A validated local observation enables gradual admission of own DATA.
     /// Reports do not grant byte credit or erase another source's pressure.
     pub(crate) fn note_feedback(&self, pressured: bool, now: Instant) {
+        self.flight.feedback(pressured, now);
         if pressured {
             self.note_pressure(now);
         }

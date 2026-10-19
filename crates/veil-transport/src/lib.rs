@@ -27,6 +27,7 @@ pub mod on_demand;
 pub mod ordered_records;
 /// QUIC `Transport` built on `quinn`.
 pub mod quic;
+pub use quinn::local_send_budget::LocalSendBudget;
 /// Scheme-keyed lookup of transport implementations.
 pub mod registry;
 pub mod reliable_records;

@@ -28,6 +28,7 @@ pub use local_packet_framing::LocalPacketFraming;
 pub mod local_lossy_trace;
 mod local_replication;
 mod local_source_activity;
+mod local_source_flight;
 pub use local_datagram_status::DatagramTransportLease;
 pub use local_datagram_status::LocalDatagramChannelState;
 pub mod fsm;

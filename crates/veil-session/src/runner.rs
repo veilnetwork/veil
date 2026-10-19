@@ -5051,6 +5051,22 @@ impl SessionRunner {
                         };
                         let signaling_source = lane.source_activity.clone();
                         let mut sender_state = lock!(sender);
+                        if using_parallel
+                            && envelope.carrier.is_none()
+                            && crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES
+                                .contains(&outgoing_priority)
+                            && let Some(quic) = sender_state.handle.quic()
+                            && !lane.source_activity.couple_source(
+                                quic,
+                                outgoing_priority,
+                                std::time::Instant::now(),
+                            )
+                        {
+                            quic.close();
+                            sender_state.broken = true;
+                            datagram_drained += 1;
+                            continue;
+                        }
                         let max_datagram_size = sender_state.max_datagram_size;
                         let datagram_sizes = match sender_state.tx.frame_wire_sizes(
                             outgoing.len(),

@@ -143,6 +143,8 @@ pub struct Connection {
     /// This is only populated for the server case, and if known
     local_ip: Option<IpAddr>,
     path: PathData,
+    local_send_budget: Option<crate::local_send_budget::Attachment>,
+    local_budget_flight: u64,
     /// Incremented every time we see a new path
     ///
     /// Stored separately from `path.generation` to account for aborted migrations
@@ -266,7 +268,8 @@ impl Connection {
             DatagramBlockReason::Congestion(untracked) => {
                 if age >= self.stats.path.datagram_cwnd_blocked_max_age {
                     self.stats.path.datagram_cwnd_blocked_max_age = age;
-                    self.stats.path.datagram_cwnd_blocked_window = self.path.congestion.window();
+                    self.stats.path.datagram_cwnd_blocked_window =
+                        self.local_congestion_window(now);
                     self.stats.path.datagram_cwnd_blocked_inflight = self.path.in_flight.bytes;
                     self.stats.path.datagram_cwnd_blocked_untracked = untracked;
                     self.stats.path.datagram_cwnd_blocked_payload_bytes =
@@ -337,6 +340,8 @@ impl Connection {
             ),
             path: PathData::new(remote, allow_mtud, None, 0, now, &config),
             path_counter: 0,
+            local_send_budget: None,
+            local_budget_flight: 0,
             allow_mtud,
             local_ip,
             prev_path: None,
@@ -513,6 +518,10 @@ impl Connection {
         // Local deadlines are checked before forming any encrypted packet,
         // including a GSO batch, and before congestion/closed-state exits.
         self.datagrams().expire(now);
+        let _local_turn = match &self.local_send_budget {
+            Some(budget) => Some(budget.0.acquire_transmit(now)?),
+            None => None,
+        };
         assert!(max_datagrams != 0);
         let max_datagrams = match self.config.enable_segmentation_offload {
             false => 1,
@@ -677,9 +686,7 @@ impl Connection {
                         && self.path_responses.is_empty()
                     {
                         let remaining = self
-                            .path
-                            .congestion
-                            .window()
+                            .local_congestion_window(now)
                             .saturating_sub(self.path.in_flight.bytes)
                             .saturating_sub(untracked_bytes)
                             .saturating_sub(1);
@@ -693,6 +700,7 @@ impl Connection {
                             // A whole DATAGRAM must fit. Retain an oversized
                             // one for ACK progress, keeping congestion state.
                             if can_send.is_empty() {
+                                self.block_local_budget(now);
                                 self.record_datagram_block(
                                     now,
                                     DatagramBlockReason::Congestion(untracked_bytes),
@@ -709,7 +717,10 @@ impl Connection {
                     }
 
                     let bytes_to_send = next_datagram_limit as u64 + untracked_bytes;
-                    if self.path.in_flight.bytes + bytes_to_send >= self.path.congestion.window() {
+                    if self.path.in_flight.bytes + bytes_to_send
+                        >= self.local_congestion_window(now)
+                    {
+                        self.block_local_budget(now);
                         space_idx += 1;
                         congestion_blocked = true;
                         // We continue instead of breaking here in order to avoid
@@ -1060,6 +1071,11 @@ impl Connection {
         }
 
         self.app_limited = buf.is_empty() && !congestion_blocked;
+        if self.app_limited {
+            if let Some(budget) = &self.local_send_budget {
+                budget.0.app_limited(now);
+            }
+        }
         if residual_window_packet && !buf.is_empty() {
             self.stats.path.residual_window_transmits =
                 self.stats.path.residual_window_transmits.saturating_add(1);
@@ -1068,10 +1084,30 @@ impl Connection {
         // Send MTU probe if necessary
         if buf.is_empty() && self.state.is_established() {
             let space_id = SpaceId::Data;
+            // MTU probes consume real flight too. Preserve the unsent probe's
+            // search state when the local pool cannot fund it; loss probes and
+            // path-validation liveness keep their protocol exceptions.
+            let mtu_before = self
+                .local_send_budget
+                .as_ref()
+                .map(|_| self.path.mtud.clone());
             let probe_size = self
                 .path
                 .mtud
                 .poll_transmit(now, self.packet_number_filter.peek(&self.spaces[space_id]))?;
+            if let Some(previous) = mtu_before {
+                if self
+                    .path
+                    .in_flight
+                    .bytes
+                    .saturating_add(u64::from(probe_size))
+                    >= self.local_congestion_window(now)
+                {
+                    self.path.mtud = previous;
+                    self.block_local_budget(now);
+                    return None;
+                }
+            }
 
             let buf_capacity = probe_size as usize;
             buf.reserve(buf_capacity);
@@ -1552,6 +1588,7 @@ impl Connection {
     /// faster or reduce loss to settle on optimal values by restarting from the initial
     /// configuration in the [`TransportConfig`].
     pub fn path_changed(&mut self, now: Instant) {
+        self.reset_confirmed_delivery();
         self.path.reset(now, &self.config);
         self.datagrams().drop_oversized();
     }
@@ -1651,6 +1688,16 @@ impl Connection {
                     && info.size > 0
                     && info.time_sent <= now
                 {
+                    if self.path.challenge.is_none() {
+                        if let Some(budget) = &self.local_send_budget {
+                            budget.0.delivered(
+                                now,
+                                info.time_sent,
+                                u64::from(info.size),
+                                self.path.rtt.get(),
+                            );
+                        }
+                    }
                     let delivery = &mut self.stats.path.confirmed_delivery;
                     delivery.bytes = delivery.bytes.saturating_add(u64::from(info.size));
                     delivery.packets = delivery.packets.saturating_add(1);
@@ -3266,6 +3313,9 @@ impl Connection {
     }
 
     fn reset_confirmed_delivery(&mut self) {
+        if let Some(budget) = &self.local_send_budget {
+            budget.0.route_changed();
+        }
         self.stats.path.confirmed_delivery = ConfirmedDeliveryStats {
             epoch: self.stats.path.confirmed_delivery.epoch.saturating_add(1),
             ..ConfirmedDeliveryStats::default()
@@ -3877,6 +3927,60 @@ impl Connection {
         self.path.current_mtu()
     }
 
+    #[cfg(test)]
+    pub(crate) fn retained_packet_bytes(&self) -> u64 {
+        SpaceId::iter()
+            .flat_map(|id| self.spaces[id].sent_packets.values())
+            .map(|p| u64::from(p.size))
+            .sum()
+    }
+
+    /// Install a local-only budget once; replacement cannot reclassify a live connection.
+    pub fn set_local_send_budget(
+        &mut self,
+        budget: Arc<dyn crate::local_send_budget::LocalSendBudget>,
+    ) -> bool {
+        if let Some(current) = &self.local_send_budget {
+            return Arc::ptr_eq(&current.0, &budget);
+        }
+        budget.update_flight(self.local_budget_flight);
+        self.local_send_budget = Some(crate::local_send_budget::Attachment(budget));
+        true
+    }
+
+    /// Register the generic local budget driver wakeup.
+    pub fn register_local_send_waker(&self, waker: &std::task::Waker) {
+        if let Some(budget) = &self.local_send_budget {
+            budget.0.register_waker(waker);
+        }
+    }
+
+    fn sync_local_flight(&self) {
+        if let Some(budget) = &self.local_send_budget {
+            budget.0.update_flight(self.local_budget_flight);
+        }
+    }
+
+    fn block_local_budget(&mut self, now: Instant) {
+        if let Some(budget) = &self.local_send_budget {
+            if self.local_congestion_window(now) < self.path.congestion.window() {
+                budget.0.blocked(now);
+            }
+            if let Some(wake) = budget.0.next_wakeup(now) {
+                self.timers.set(Timer::Pacing, wake);
+            }
+        }
+    }
+
+    fn local_congestion_window(&self, now: Instant) -> u64 {
+        let normal = self.path.congestion.window();
+        self.local_send_budget.as_ref().map_or(normal, |b| {
+            normal
+                .min(b.0.window(now, self.path.in_flight.bytes, self.path.current_mtu()))
+                .max(1)
+        })
+    }
+
     /// Whether we have 1-RTT data to send
     ///
     /// See also `self.space(SpaceId::Data).can_send()`
@@ -3893,6 +3997,10 @@ impl Connection {
 
     /// Update counters to account for a packet becoming acknowledged, lost, or abandoned
     fn remove_in_flight(&mut self, packet: &SentPacket) {
+        self.local_budget_flight = self
+            .local_budget_flight
+            .saturating_sub(u64::from(packet.size));
+        self.sync_local_flight();
         // Visit known paths from newest to oldest to find the one `packet` was sent on
         for path in [&mut self.path]
             .into_iter()
