@@ -6,6 +6,61 @@ const KEY: [u8; 32] = [1; 32];
 const SESSION: [u8; 32] = [2; 32];
 
 #[test]
+fn ciphertext_size_plans_match_both_codecs_across_fragment_boundaries() {
+    for flows in [false, true] {
+        for ceiling in [10, 40, 41, 60, 61, 100, 1200, 1382] {
+            for len in [
+                0,
+                1,
+                40,
+                1022,
+                1023,
+                1382,
+                1460,
+                16000,
+                MAX_REALTIME_FRAME,
+                MAX_REALTIME_FRAME + 1,
+            ] {
+                let mut tx = SessionDatagramTx::new(&KEY, &SESSION, flows);
+                let plan = tx.frame_wire_sizes(len, ceiling);
+                let actual = tx.encode_frame(0, &vec![7; len], ceiling);
+                assert_eq!(
+                    plan.is_ok(),
+                    actual.is_ok(),
+                    "flows={flows} ceiling={ceiling} len={len}"
+                );
+                if let (Ok(sizes), Ok(packets)) = (plan, actual) {
+                    assert_eq!(sizes, packets.iter().map(Vec::len).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn repeated_scheduler_plans_do_not_create_flows_or_burn_nonces() {
+    for flows in [false, true] {
+        let mut tx = SessionDatagramTx::new(&KEY, &SESSION, flows);
+        for _ in 0..1000 {
+            tx.frame_wire_sizes(1460, 1382).unwrap();
+        }
+        if let SessionDatagramTx::Flows(ref codec) = tx {
+            assert!(codec.flows.is_empty());
+        }
+        let packets = tx.encode_frame(2, &[7; 1460], 1382).unwrap();
+        let offset = if flows { PREFIX_LEN } else { 0 };
+        assert_eq!(
+            u64::from_be_bytes(packets[0][offset + 16..offset + 24].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u64::from_be_bytes(packets[1][offset + 16..offset + 24].try_into().unwrap()),
+            2
+        );
+    }
+}
+
+#[test]
 fn delayed_channel_survives_another_channels_replay_and_fragment_flood() {
     let now = Instant::now();
     let mut tx = FlowDatagramTx::new(&KEY, &SESSION);

@@ -258,6 +258,36 @@ pub(crate) enum SessionDatagramTx {
 }
 
 impl SessionDatagramTx {
+    /// Exact ciphertext lengths without allocating a flow, counter or nonce.
+    /// Scheduling waits must happen before encode_frame commits those values.
+    pub(crate) fn frame_wire_sizes(
+        &self,
+        frame_len: usize,
+        ceiling: usize,
+    ) -> Result<Vec<usize>, RealtimeDatagramError> {
+        use crate::realtime_datagram::{FRAGMENT_OVERHEAD, MAX_FRAGMENTS};
+        if frame_len == 0 || frame_len > MAX_REALTIME_FRAME {
+            return Err(RealtimeDatagramError::FrameSize(frame_len));
+        }
+        let prefix = if matches!(self, Self::Flows(_)) {
+            PREFIX_LEN
+        } else {
+            0
+        };
+        let overhead = prefix + FRAGMENT_OVERHEAD;
+        let capacity = ceiling
+            .checked_sub(overhead)
+            .filter(|n| *n > 0)
+            .ok_or(RealtimeDatagramError::DatagramTooSmall(ceiling))?;
+        let fragments = frame_len.div_ceil(capacity);
+        if fragments > MAX_FRAGMENTS {
+            return Err(RealtimeDatagramError::TooManyFragments(fragments));
+        }
+        Ok((0..fragments)
+            .map(|i| (frame_len - i * capacity).min(capacity) + overhead)
+            .collect())
+    }
+
     pub(crate) fn new(key: &[u8; 32], session: &[u8; 32], flows: bool) -> Self {
         if flows {
             Self::Flows(FlowDatagramTx::new(key, session))
