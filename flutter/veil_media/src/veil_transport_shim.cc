@@ -547,6 +547,11 @@ void VeilTransportShim::SetLocalAudioRecovery(uint32_t remote_audio_ssrc,
   std::lock_guard lock(audio_feedback_mu_);
   local_audio_recovery_ = {true, remote_audio_ssrc, sequence, sample,
                            sampled_us};
+  local_audio_soft_loss_.Observe(AudioSoftLossWindow::Kind::Catchup,
+      sample.origin, sequence, AudioSoftLossWindow::CatchupSamples(sample.discarded_ms),
+      sample.known && remote_audio_ssrc != 0,
+      sample.last_discard_us > 0 && sample.last_discard_us <= sampled_us &&
+          sampled_us - sample.last_discard_us <= 3'000'000, sampled_us);
 }
 bool VeilTransportShim::peer_audio_recovery_supported() const {
   std::lock_guard lock(audio_feedback_mu_);
@@ -572,6 +577,10 @@ void VeilTransportShim::SetLocalAudioConcealment(
     const bool event = local_audio_concealment_.Observe(
         remote_audio_ssrc, sequence, origin, concealed_samples,
         silent_concealed_samples, sampled_us);
+    const auto counters = local_audio_concealment_.Report(sampled_us);
+    local_audio_soft_loss_.Observe(AudioSoftLossWindow::Kind::Concealment,
+        counters.origin, counters.sequence, counters.concealed_samples,
+        counters.known, event, sampled_us);
     // Normal RTCP can be several seconds apart. A fresh event gets a bounded
     // supplemental empty RR + APP compound instead of waiting for that timer.
     // It contains no invented loss/RTT/report block and uses the same encrypted
@@ -594,6 +603,16 @@ int64_t VeilTransportShim::peer_audio_concealment_report_us(int64_t now_us) cons
 int64_t VeilTransportShim::local_audio_concealment_report_us(int64_t now_us) const {
   std::lock_guard lock(audio_feedback_mu_);
   return local_audio_concealment_.FreshReportUs(now_us);
+}
+AudioSoftLossSnapshot VeilTransportShim::local_audio_soft_loss(int64_t now_us) const {
+  std::lock_guard lock(audio_feedback_mu_);
+  return {local_audio_soft_loss_.FreshAt(now_us), local_audio_soft_loss_.Samples(now_us),
+          local_audio_soft_loss_.FreshReportUs(now_us)};
+}
+AudioSoftLossSnapshot VeilTransportShim::peer_audio_soft_loss(int64_t now_us) const {
+  std::lock_guard lock(audio_feedback_mu_);
+  return {peer_audio_soft_loss_.FreshAt(now_us), peer_audio_soft_loss_.Samples(now_us),
+          peer_audio_soft_loss_.FreshReportUs(now_us)};
 }
 
 void VeilTransportShim::SetLocalAudioPlayout(uint32_t remote_audio_ssrc,
@@ -687,6 +706,17 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
     std::lock_guard lock(audio_feedback_mu_);
     if (recovery) peer_audio_recovery_.Observe(*recovery, local, arrived_us);
     if (concealment) peer_audio_concealment_.Observe(*concealment, local, arrived_us);
+    if (recovery && recovery->target_ssrc == local && local != 0) {
+      peer_audio_soft_loss_.Observe(AudioSoftLossWindow::Kind::Catchup,
+          recovery->origin, recovery->sequence,
+          AudioSoftLossWindow::CatchupSamples(recovery->discarded_ms), recovery->known,
+          recovery->age_ms != kUnknownRecoveryAge, arrived_us);
+    }
+    if (concealment && concealment->target_ssrc == local && local != 0) {
+      peer_audio_soft_loss_.Observe(AudioSoftLossWindow::Kind::Concealment,
+          concealment->origin, concealment->sequence, concealment->concealed_samples,
+          concealment->known, concealment->age_ms != kUnknownRecoveryAge, arrived_us);
+    }
     if (candidate.arrived_us > 0 && candidate.arrived_us >= audio_feedback_.arrived_us) {
       candidate.route_epoch = rtcp_route_clock_.epoch();
       if (!rtcp_route_clock_.Accepts(candidate.last_sender_report)) candidate.rtt_ms = 0;

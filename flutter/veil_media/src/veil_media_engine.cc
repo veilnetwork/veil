@@ -2646,6 +2646,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   int64_t peer_audio_recovery_report_us = 0;
   int64_t peer_audio_concealment_report_us = 0;
   int64_t local_audio_concealment_report_us = 0;
+  veil_media::AudioSoftLossSnapshot local_soft_loss;
+  veil_media::AudioSoftLossSnapshot peer_soft_loss{!ws->peers.empty(), 0, 0};
   int peer_audio_recovery_peers = 0;
   int playout_peers = 0, playout_reports = 0, playout_ms = -1;
   int64_t rtt = 0;
@@ -2662,6 +2664,10 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   bool playout_changed = ws->observed_playout_peer_count != ws->peers.size();
   ws->observed_playout_peer_count = ws->peers.size();
   for (const auto& entry : ws->peers) {
+    const auto soft = entry.second->shim->peer_audio_soft_loss(now_us);
+    peer_soft_loss.supported = peer_soft_loss.supported && soft.supported;
+    peer_soft_loss.samples = std::max(peer_soft_loss.samples, soft.samples);
+    peer_soft_loss.report_us = std::max(peer_soft_loss.report_us, soft.report_us);
     if (entry.second->shim->peer_audio_recovery_supported()) ++peer_audio_recovery_peers;
     peer_audio_recovery_report_us = std::max(peer_audio_recovery_report_us,
         entry.second->shim->peer_audio_recovery_report_us(now_us));
@@ -2795,6 +2801,9 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   }
   if (audio_sampled) {
     for (const auto& entry : ws->peers) {
+      const auto soft = entry.second->shim->local_audio_soft_loss(now_us);
+      local_soft_loss.samples = std::max(local_soft_loss.samples, soft.samples);
+      local_soft_loss.report_us = std::max(local_soft_loss.report_us, soft.report_us);
       local_audio_concealment_report_us = std::max(local_audio_concealment_report_us,
           entry.second->shim->local_audio_concealment_report_us(now_us));
     }
@@ -2882,6 +2891,12 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               ",\"video_loss_report_us\":" + std::to_string(video_loss_report_us);
   snapshot += ",\"audio_local_concealment_report_us\":" +
               std::to_string(local_audio_concealment_report_us);
+  snapshot += ",\"audio_soft_loss_duration_supported\":1,\"audio_peer_soft_loss_duration_supported\":" +
+      std::to_string(peer_soft_loss.supported ? 1 : 0) +
+      ",\"audio_local_soft_loss_report_us\":" + std::to_string(local_soft_loss.report_us) +
+      ",\"audio_peer_soft_loss_report_us\":" + std::to_string(peer_soft_loss.report_us) +
+      ",\"audio_local_soft_loss_window_ms\":" + std::to_string(local_soft_loss.samples / 48.0) +
+      ",\"audio_peer_soft_loss_window_ms\":" + std::to_string(peer_soft_loss.samples / 48.0);
   snapshot += ",\"video_persistent_loss_report_us\":" +
               std::to_string(video_persistent_loss_report_us);
   snapshot += ",\"audio_playout_peers\":" + std::to_string(playout_peers) +
@@ -4569,6 +4584,15 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
           std::to_string(sampled ? ws->shim->local_audio_concealment_report_us(loss_now_us) : 0);
       snapshot += ",\"audio_silent_concealed_samples\":" +
           std::to_string(audio_silent_concealed_samples);
+      const auto local_soft_loss = sampled ? ws->shim->local_audio_soft_loss(loss_now_us)
+          : veil_media::AudioSoftLossSnapshot{};
+      const auto peer_soft_loss = ws->shim->peer_audio_soft_loss(loss_now_us);
+      snapshot += ",\"audio_soft_loss_duration_supported\":1,\"audio_peer_soft_loss_duration_supported\":" +
+          std::to_string(peer_soft_loss.supported ? 1 : 0) +
+          ",\"audio_local_soft_loss_report_us\":" + std::to_string(local_soft_loss.report_us) +
+          ",\"audio_peer_soft_loss_report_us\":" + std::to_string(peer_soft_loss.report_us) +
+          ",\"audio_local_soft_loss_window_ms\":" + std::to_string(local_soft_loss.samples / 48.0) +
+          ",\"audio_peer_soft_loss_window_ms\":" + std::to_string(peer_soft_loss.samples / 48.0);
       // Event identity shared by native RTCP and encrypted call-health feedback.
       // These are local JSON stats, not additional RTCP or relay header fields.
       const auto peer_recovery = peer_recovery_snapshot.Sample();
