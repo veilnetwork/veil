@@ -18,8 +18,9 @@ use super::{
     MediaIngress, MediaSenderSlot, MediaVideoIngress, QueuedMediaPacket, RelayVideoFrame,
     drain_anonymous_media, drain_media_packets, drain_media_packets_on_plane, drain_relay_video,
     drain_relay_video_batches_on_plane, drain_relay_video_on_plane, media_batched_cells,
-    media_is_rtcp, media_ready_batch, timed_media_cells, veil_media_channel_set_screen_sharing,
-    veil_media_close_channel, veil_media_send_datagram, veil_media_send_video_control_datagram,
+    media_is_padding_only, media_is_rtcp, media_ready_batch, timed_media_cells,
+    veil_media_channel_set_screen_sharing, veil_media_close_channel, veil_media_send_datagram,
+    veil_media_send_video_control_datagram,
 };
 use super::{
     RELAY_VIDEO_FRAME_MAX_BYTES, RelayMediaStats, RelayVideoFrameAssembler, RelayVideoFramePush,
@@ -40,6 +41,106 @@ fn video_packet(timestamp: u32, marker: bool, fill: u8) -> Vec<u8> {
     packet[4..8].copy_from_slice(&timestamp.to_be_bytes());
     packet[8..].fill(fill);
     packet
+}
+
+#[test]
+fn padding_classification_validates_csrc_extensions_and_padding_bounds() {
+    let mut packet = video_packet(7, true, 3);
+    packet[0] = 0xb1; // Padding, one CSRC and an RTP extension.
+    packet[16..20].copy_from_slice(&[0xbe, 0xde, 0, 1]);
+    *packet.last_mut().unwrap() = 96; // 24 header bytes, no payload.
+    assert!(media_is_padding_only(&packet));
+    for end in 0..24 {
+        assert!(!media_is_padding_only(&packet[..end]));
+    }
+    for padding in [0, 95, 97, 255] {
+        *packet.last_mut().unwrap() = padding;
+        assert!(!media_is_padding_only(&packet));
+    }
+    *packet.last_mut().unwrap() = 96;
+    packet[1] = 111; // Audio stays on its own source.
+    assert!(!media_is_padding_only(&packet));
+    packet[1] = 201;
+    assert!(!media_is_padding_only(&packet));
+}
+
+#[tokio::test]
+async fn padding_is_independent_of_an_incomplete_video_frame_and_its_cadence() {
+    let (audio, _audio_rx) = mpsc::channel(2);
+    let (video, frames) = mpsc::channel(4);
+    let stats = Arc::new(RelayMediaStats::default());
+    let ingress = MediaIngress::new(audio, MediaVideoIngress::relay_frames(video, stats));
+    let prefix = video_packet(7, false, 1);
+    let tail = video_packet(7, true, 2);
+    let mut padding = video_packet(7, false, 3);
+    padding[0] |= 0x20;
+    *padding.last_mut().unwrap() = (padding.len() - 12) as u8;
+    for packet in [&prefix, &padding, &tail] {
+        assert_eq!(ingress.enqueue(packet.clone().into()), 0);
+    }
+    drop(ingress);
+    let actual = collect_relay_cadence(frames).await;
+    assert_eq!(
+        actual,
+        vec![(vec![padding], false), (vec![prefix, tail], true)]
+    );
+}
+
+#[tokio::test]
+async fn old_video_repair_does_not_retime_the_next_original_frame() {
+    let (audio, _audio_rx) = mpsc::channel(2);
+    let (video, frames) = mpsc::channel(4);
+    let stats = Arc::new(RelayMediaStats::default());
+    let ingress = MediaIngress::new(audio, MediaVideoIngress::relay_frames(video, stats));
+    let original = video_packet(7, true, 1);
+    let prefix = video_packet(8, false, 2);
+    let repair = video_packet(7, false, 3);
+    let tail = video_packet(8, true, 4);
+    for packet in [&original, &prefix, &repair, &tail] {
+        assert_eq!(ingress.enqueue(packet.clone().into()), 0);
+    }
+    drop(ingress);
+    let actual = collect_relay_cadence(frames).await;
+    assert_eq!(
+        actual,
+        vec![
+            (vec![original], true),
+            (vec![repair], false),
+            (vec![prefix, tail], true),
+        ]
+    );
+}
+
+async fn collect_relay_cadence(
+    frames: mpsc::Receiver<RelayVideoFrame>,
+) -> Vec<(Vec<Vec<u8>>, bool)> {
+    let peer = [0x72; 32];
+    let cipher = Arc::new(cipher_for_test(&peer, &[1; 32], &[2; 32]).unwrap());
+    let receiver = cipher_for_test(&peer, &[2; 32], &[1; 32]).unwrap();
+    let (sink, mut observed) = mpsc::unbounded_channel();
+    drain_relay_video_batches_on_plane(
+        frames,
+        Arc::new(AtomicU8::new(MEDIA_BATCHING_OFF)),
+        cipher,
+        Arc::new(RelayMediaStats::default()),
+        LocalMediaPlane::Secondary,
+        move |cells, is_frame| {
+            sink.send((cells, is_frame)).unwrap();
+            async { true }
+        },
+    )
+    .await;
+    let mut result = Vec::new();
+    while let Ok((cells, cadence)) = observed.try_recv() {
+        result.push((
+            cells
+                .into_iter()
+                .map(|c| receiver.open(c.as_bytes()).unwrap())
+                .collect(),
+            cadence,
+        ));
+    }
+    result
 }
 
 #[test]
@@ -152,6 +253,7 @@ async fn compact_video_batches_ready_frames_without_crossing_cell_or_frame_bound
             let (tx, rx) = mpsc::channel(frames.len());
             for packets in frames {
                 tx.try_send(RelayVideoFrame {
+                    cadence_sample: true,
                     packets,
                     enqueued_at,
                 })
@@ -662,6 +764,7 @@ async fn audio_continues_while_video_writer_is_blocked(relay: bool) {
     let video_task = if relay {
         let (tx, rx) = mpsc::channel(1);
         tx.send(RelayVideoFrame {
+            cadence_sample: true,
             packets: vec![video.clone()],
             enqueued_at: Instant::now(),
         })
@@ -1871,6 +1974,7 @@ async fn complete_relay_frames_reach_the_batch_sink_as_independent_work_items() 
     let second = vec![video_packet(8, true, 4)];
     for packets in [&first, &second] {
         tx.try_send(RelayVideoFrame {
+            cadence_sample: true,
             packets: packets.clone(),
             enqueued_at,
         })
@@ -1878,6 +1982,7 @@ async fn complete_relay_frames_reach_the_batch_sink_as_independent_work_items() 
     }
     let control = vec![0x80, 201, 0, 1, 0, 0, 0, 7];
     tx.try_send(RelayVideoFrame {
+        cadence_sample: false,
         packets: vec![control.clone()],
         enqueued_at,
     })

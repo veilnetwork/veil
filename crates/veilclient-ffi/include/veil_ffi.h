@@ -3869,20 +3869,38 @@ int veil_media_channel_configure_path_probes(uint64_t chan,
 #endif
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
-/** Same local model on source 0 audio, 2 video, 3 screen. No wire role hint. */
- char *veil_media_channel_source_packet_cost(uint64_t chan, uint8_t local_lane, size_t packet_bytes) ;
+/**
+ * Same local framing model on the selected prepared source: 0 audio, 2 video,
+ * 3 screen. These selectors are local only; no media role is sent to relays.
+ * Video/screen never inherit audio's small-packet replication policy.
+ */
+
+char *veil_media_channel_source_packet_cost(uint64_t chan,
+                                            uint8_t local_lane,
+                                            size_t packet_bytes)
+;
 #endif
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
- * Owned stand snapshot on the embedded node process when codec clients are
- * separate processes. Same prepared source model as the channel getter;
- * requires local rt_trace opt-in. No preparation, probes, RPCs or packets.
- * Id pointers each reference 32 readable bytes; lane is 0/2/3, relayed 0/1,
- * packet_bytes 12..1460. Null means invalid/unknown/unprepared source.
- * Free with veil_free_string. QUIC/TCP/IP/ACK bytes and capacity are excluded.
+ * Owned stand diagnostics when codecs and embedded nodes are in different
+ * processes. Call on the NODE's process, using its authenticated local id and
+ * the actual destination. Reads the same prepared children as the channel
+ * getter; it never prepares a source, probes, sends an RPC or a network frame.
+ * Requires local rt_trace opt-in. Returns null for invalid/unknown/unprepared
+ * sources. Free a non-null string with veil_free_string. The model excludes
+ * QUIC/TCP/IP/ACK bytes and does not prove delivery or available bandwidth.
+ *
+ * # Safety
+ * Non-null node-id pointers must each reference at least 32 readable bytes.
  */
- char *veil_debug_media_source_packet_cost(const uint8_t *local_node_id, const uint8_t *peer_node_id, uint8_t local_lane, uint8_t relayed, size_t packet_bytes) ;
+
+char *veil_debug_media_source_packet_cost(const uint8_t *local_node_id,
+                                          const uint8_t *peer_node_id,
+                                          uint8_t local_lane,
+                                          uint8_t relayed,
+                                          size_t packet_bytes)
+;
 #endif
 
 /**
