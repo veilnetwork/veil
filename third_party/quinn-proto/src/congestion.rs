@@ -93,6 +93,7 @@ pub struct ControllerMetrics {
     /// Slow start threshold (bytes)
     pub ssthresh: Option<u64>,
     /// Pacing rate (bits/s)
+    /// Desired bits per second, including the controller's pacing gain.
     pub pacing_rate: Option<u64>,
 }
 
