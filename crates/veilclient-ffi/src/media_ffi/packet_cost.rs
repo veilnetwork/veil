@@ -1,6 +1,11 @@
 //! Endpoint-local source framing, never a relay scheduling instruction.
 use super::*;
 
+// Native RTP senders may produce a full 1460-byte packet. The compact media
+// batching threshold is smaller, but larger raw packets are sealed intact and
+// fragmented by the existing session codec, whose cost is modeled below.
+const MAX_PACKET_BYTES: usize = 1460;
+
 fn frame_size(sealed_bytes: usize, relayed: bool) -> usize {
     let body = if relayed {
         use veil_proto::delivery::{DeliveryEnvelope, ForwardPayload};
@@ -86,7 +91,7 @@ pub extern "C" fn veil_media_channel_source_packet_cost(
     if !matches!(local_lane, 0 | 2 | 3) {
         return ptr::null_mut();
     }
-    if !(12..=1000).contains(&packet_bytes) {
+    if !(12..=MAX_PACKET_BYTES).contains(&packet_bytes) {
         return ptr::null_mut();
     }
     let (bundle, peer, relay) = {
@@ -106,14 +111,58 @@ pub extern "C" fn veil_media_channel_source_packet_cost(
     let Some(me) = bundle.cached_node_id.try_lock().ok().and_then(|id| *id) else {
         return ptr::null_mut();
     };
+    source_cost_string(me, peer, local_lane, relay, packet_bytes)
+}
+
+/// Owned stand diagnostics when codecs and embedded nodes are in different
+/// processes. Call on the NODE's process, using its authenticated local id and
+/// the actual destination. Reads the same prepared children as the channel
+/// getter; it never prepares a source, probes, sends an RPC or a network frame.
+/// Requires local rt_trace opt-in. Returns null for invalid/unknown/unprepared
+/// sources. Free a non-null string with veil_free_string. The model excludes
+/// QUIC/TCP/IP/ACK bytes and does not prove delivery or available bandwidth.
+///
+/// # Safety
+/// Non-null node-id pointers must each reference at least 32 readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_debug_media_source_packet_cost(
+    local_node_id: *const u8,
+    peer_node_id: *const u8,
+    local_lane: u8,
+    relayed: u8,
+    packet_bytes: size_t,
+) -> *mut c_char {
+    if !veil_session::rt_trace::rt_trace_enabled()
+        || local_node_id.is_null()
+        || peer_node_id.is_null()
+        || relayed > 1
+        || !matches!(local_lane, 0 | 2 | 3)
+        || !(12..=MAX_PACKET_BYTES).contains(&packet_bytes)
+    {
+        return ptr::null_mut();
+    }
+    let mut me = [0u8; 32];
+    let mut peer = [0u8; 32];
+    unsafe {
+        ptr::copy_nonoverlapping(local_node_id, me.as_mut_ptr(), me.len());
+        ptr::copy_nonoverlapping(peer_node_id, peer.as_mut_ptr(), peer.len());
+    }
+    source_cost_string(me, peer, local_lane, relayed != 0, packet_bytes)
+}
+
+fn source_cost_string(
+    me: [u8; 32],
+    peer: [u8; 32],
+    local_lane: u8,
+    relay: bool,
+    packet_bytes: usize,
+) -> *mut c_char {
     let Some(services) = veil_node_runtime::embedded_services_for(&me) else {
         return ptr::null_mut();
     };
     let sealed_bytes = packet_bytes + media::MEDIA_SEAL_OVERHEAD;
     let copies_limit = source_copies_limit(local_lane, relay, sealed_bytes);
-    let Some(paths) =
-        services.local_source_framing(&peer, local_lane, relay, copies_limit)
-    else {
+    let Some(paths) = services.local_source_framing(&peer, local_lane, relay, copies_limit) else {
         return ptr::null_mut();
     };
     let Some(cost) = estimate(packet_bytes, relay, &paths) else {
@@ -136,6 +185,18 @@ fn source_copies_limit(local_lane: u8, relayed: bool, sealed_bytes: usize) -> us
 mod tests {
     use super::*;
     use veil_session::LocalPacketFraming::{Obfs4Record, QuicDatagram};
+    #[test]
+    fn stand_snapshot_rejects_null_identity_pointers() {
+        let identity = [7u8; 32];
+        for (me, peer) in [
+            (ptr::null(), identity.as_ptr()),
+            (identity.as_ptr(), ptr::null()),
+            (ptr::null(), ptr::null()),
+        ] {
+            assert!(unsafe { veil_debug_media_source_packet_cost(me, peer, 2, 1, 200) }.is_null());
+        }
+    }
+
     #[test]
     fn serialized_routes_carriers_and_replication_are_distinct() {
         let quic = QuicDatagram { ceiling: 1382 };
@@ -175,6 +236,24 @@ mod tests {
         }
         for lane in [1, 4, 255] {
             assert!(veil_media_channel_source_packet_cost(0, lane, 200).is_null());
+        }
+    }
+
+    #[test]
+    fn full_rtp_sizes_include_each_actual_session_fragment() {
+        let quic = QuicDatagram { ceiling: 1382 };
+        for (packet, relayed, overhead) in [
+            (1022, true, 360),
+            (1023, true, 420),
+            (1460, true, 420),
+            (1173, false, 209),
+            (1174, false, 269),
+            (1460, false, 269),
+        ] {
+            let cost = estimate(packet, relayed, &[quic]).unwrap();
+            assert_eq!(cost["packet_bytes"], packet);
+            assert_eq!(cost["per_path_overhead_bytes"], overhead);
+            assert_eq!(cost["source_wire_bytes_x2"], 2 * (packet + overhead));
         }
     }
 }

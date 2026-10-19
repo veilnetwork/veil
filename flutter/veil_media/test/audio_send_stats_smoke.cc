@@ -51,12 +51,14 @@ int main() {
   s = diagnostic.snapshot(1010 * ms);
   assert(s.payload_packets == 1 && s.padding_packets == 0);
   assert(s.payload_bytes == 2 && s.padding_bytes == 2);
+  assert(s.payload_rtp_bytes == 28);  // Full CSRC, extension, payload and padding.
   assert(s.payload_age_ms == 10 && s.max_payload_gap_ms == 0);
   extended[27] = 4;  // All bytes after the RTP/extension header are padding.
   assert(diagnostic.mark_attempt(extended, ssrc, 1100 * ms));
   s = diagnostic.snapshot(1110 * ms);
   assert(s.attempts == 2 && s.age_ms == 10 && s.payload_age_ms == 110);
   assert(s.payload_packets == 1 && s.padding_packets == 1 && s.padding_bytes == 6);
+  assert(s.payload_rtp_bytes == 28);  // A padding-only probe adds no media bytes.
   extended[27] = 2;
   assert(diagnostic.mark_attempt(extended, ssrc, 2000 * ms));
   assert(diagnostic.snapshot(2010 * ms).max_payload_gap_ms == 1000);
@@ -73,6 +75,7 @@ int main() {
   s = diagnostic.snapshot(2410 * ms);
   assert(s.unclassified_packets == 4 && s.payload_packets == 2);
   assert(s.payload_age_ms == 410 && s.payload_bytes == 4);
+  assert(s.payload_rtp_bytes == 56);  // Malformed attempts cannot inflate it.
 
   // A video's padding probe must not count as an encoded frame or audio.
   // Use the same SSRC deliberately: payload type also isolates the counters.
@@ -89,6 +92,7 @@ int main() {
   assert(v.attempts == 2 && v.queued == 1 && v.dropped == 1);
   assert(v.payload_packets == 1 && v.padding_packets == 1);
   assert(v.payload_bytes == 1 && v.padding_bytes == 1);
+  assert(v.payload_rtp_bytes == packet.size());
   assert(v.payload_age_ms == 110 && v.age_ms == 10);
   assert(v.max_admission_ms == 2);
   packet[1] = 111;
@@ -97,4 +101,16 @@ int main() {
   assert(!video.mark_attempt(packet, ssrc + 1, 3200 * ms, 96));
   assert(video.snapshot(3200 * ms).attempts == 2);
   assert(stats.snapshot(3200 * ms).attempts == 2);
+
+  // A shared group encoder's identical RTP is attempted once per recipient.
+  // Derive packet size from two counters in that same scope; dividing by
+  // logical frames would incorrectly multiply the packet size by fanout.
+  veil_media::RtpSendStats fanout;
+  extended.resize(28); extended[0] = 0xb1; extended[1] = 96;
+  extended[18] = 0; extended[19] = 1; extended[27] = 2;
+  for (int peer = 0; peer < 3; ++peer)
+    assert(fanout.mark_attempt(extended, ssrc, (3300 + peer) * ms, 96));
+  const auto copies = fanout.snapshot(3310 * ms);
+  assert(copies.payload_packets == 3 && copies.payload_rtp_bytes == 84);
+  assert(copies.payload_rtp_bytes / copies.payload_packets == extended.size());
 }

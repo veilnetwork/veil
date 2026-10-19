@@ -22,6 +22,10 @@ struct RtpSendSnapshot {
   int64_t max_gap_ms = 0;
   int64_t max_admission_ms = 0;
   uint64_t dropped = 0;
+  // Complete RTP bytes for payload-carrying attempts, including their actual
+  // CSRC/extensions/padding. Excludes padding-only and malformed packets.
+  // Group fanout counts one attempt per peer; this is not an encoder total.
+  uint64_t payload_rtp_bytes = 0;
 };
 
 // Endpoint-only observations, before and after local Veil queue admission.
@@ -68,6 +72,7 @@ class RtpSendStats {
       } else {
         payload_packets_.fetch_add(1, std::memory_order_relaxed);
         payload_bytes_.fetch_add(payload, std::memory_order_relaxed);
+        payload_rtp_bytes_.fetch_add(packet.size(), std::memory_order_relaxed);
         const int64_t previous_payload =
             last_payload_ns_.exchange(now_ns, std::memory_order_relaxed);
         if (previous_payload > 0 && now_ns >= previous_payload)
@@ -106,6 +111,7 @@ class RtpSendStats {
         max_gap_ns_.load(std::memory_order_relaxed) / 1'000'000,
         max_admission_ns_.load(std::memory_order_relaxed) / 1'000'000,
         dropped_.load(std::memory_order_relaxed),
+        payload_rtp_bytes_.load(std::memory_order_relaxed),
     };
   }
 
@@ -123,6 +129,7 @@ class RtpSendStats {
   std::atomic<uint64_t> dropped_{0};
   std::atomic<uint64_t> payload_packets_{0}, padding_packets_{0};
   std::atomic<uint64_t> payload_bytes_{0}, padding_bytes_{0}, unclassified_packets_{0};
+  std::atomic<uint64_t> payload_rtp_bytes_{0};
   std::atomic<int64_t> last_payload_ns_{0}, max_payload_gap_ns_{0};
   std::atomic<int64_t> last_attempt_ns_{0};
   std::atomic<int64_t> last_queued_ns_{0};
