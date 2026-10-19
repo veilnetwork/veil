@@ -1167,7 +1167,7 @@ async fn local_signaling_and_data_have_distinct_quic_connections_and_survive_scr
 }
 
 #[tokio::test]
-async fn late_camera_and_screen_reopen_after_real_idle_without_retiring_audio() {
+async fn late_camera_and_screen_survive_idle_and_reopen_after_close_without_retiring_audio() {
     verify_distinct_sources(true).await;
 }
 
@@ -1269,9 +1269,10 @@ async fn verify_distinct_sources(late_idle: bool) {
             handles.push(sender.handle.quic().unwrap().clone());
         }
         if late_idle {
-            // Real QUIC idle expiry, no shortened transport config or advanced
-            // test clock. Keep the parent alive as normal session probes do;
-            // only the primary child carries continuous application data.
+            // Exceed the real QUIC idle timeout without shortening config or
+            // advancing a test clock. Retained generic siblings must survive
+            // without application data. Then force an actual transport close
+            // and verify the existing replacement/primary-isolation behavior.
             let audio_binding = handles[0].channel_binding().unwrap();
             let idle_started = Instant::now();
             let mut seq = 100u32;
@@ -1297,8 +1298,11 @@ async fn verify_distinct_sources(late_idle: bool) {
                 if elapsed >= Duration::from_secs(35) {
                     if !idle_observed {
                         for index in [1, 2] {
+                            assert!(!handles[index].is_closed(),
+                                "retained idle child must not force recurring TLS dials");
+                            handles[index].close();
                             timeout(Duration::from_millis(100), handles[index].closed()).await
-                                .expect("unused child must really expire before reopening");
+                                .expect("explicitly retired child must close before reopening");
                         }
                         idle_observed = true;
                     }
@@ -1323,7 +1327,7 @@ async fn verify_distinct_sources(late_idle: bool) {
                 }
                 let frame = primary_test_frame(true, seq, 0);
                 let (_, body, kind) = super::super::decode_realtime_lane_frame(&frame).unwrap();
-                let slot = a.prepare_frame(REALTIME, body, kind).expect("primary stays ready while other sources expire/warm");
+                let slot = a.prepare_frame(REALTIME, body, kind).expect("primary stays ready while other sources close/warm");
                 let primary_sent = Instant::now();
                 {
                     let mut sender = a.sender(slot);
