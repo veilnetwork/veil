@@ -39,6 +39,7 @@
 #include "api/call/transport.h"  // webrtc::Transport, webrtc::PacketOptions
 #include "veil_inbound_packet_queue.h"
 #include "veil_audio_send_stats.h"
+#include "veil_audio_packet_priority.h"
 #include "veil_rtcp_send_stats.h"
 #include "veil_audio_redundancy.h"
 #include "veil_audio_recovery_feedback.h"
@@ -114,7 +115,8 @@ class VeilTransportShim : public webrtc::Transport {
                     webrtc::TaskQueueBase* network_queue,
                     webrtc::Call* video_call,
                     webrtc::TaskQueueBase* video_network_queue,
-                    std::shared_ptr<RtcpSendStats> group_rtcp_stats = nullptr);
+                    std::shared_ptr<RtcpSendStats> group_rtcp_stats = nullptr,
+                    std::shared_ptr<AudioPacketPriority> audio_priority = nullptr);
   ~VeilTransportShim() override;
 
   VeilTransportShim(const VeilTransportShim&) = delete;
@@ -152,7 +154,7 @@ class VeilTransportShim : public webrtc::Transport {
 
   // Endpoint-local shedding. Keep audio, RTCP and remote video live; do not
   // enqueue video already encoded or retransmitted by the pacer while paused.
-  void SetVideoSendPaused(bool paused) { video_send_paused_.store(paused); }
+  void SetVideoSendPaused(bool paused);
 
   // webrtc::Transport.
   bool SendRtp(std::span<const uint8_t> packet,
@@ -250,6 +252,7 @@ class VeilTransportShim : public webrtc::Transport {
   bool SendRtcpOnSource(std::span<const uint8_t> packet,
                         const webrtc::PacketOptions& options, bool video);
   std::atomic<bool> video_send_paused_{false};
+  const std::shared_ptr<AudioPacketPriority> audio_priority_;
   struct AtomicVideoCadence {
     std::atomic<uint64_t> frames{0};
     std::atomic<int64_t> first_ns{0};

@@ -36,6 +36,8 @@
 #include "modules/audio_coding/audio_network_adaptor/util/threshold_curve.h"
 #include "rtc_base/checks.h"
 #include "veil_audio_adaptor_config.h"
+#include "veil_audio_packet_priority.h"
+#include "system_wrappers/include/clock.h"
 
 #if WEBRTC_ENABLE_PROTOBUF
 #ifdef WEBRTC_ANDROID_PLATFORM_BUILD
@@ -49,6 +51,38 @@
 namespace webrtc {
 
 namespace {
+
+// Run before BitrateController so its real overhead subtraction uses the
+// duration actually permitted by this endpoint's source policy.
+class SourceOrderedFrameLength final : public Controller {
+ public:
+  SourceOrderedFrameLength(const Environment& env, std::span<const int> lengths,
+      int initial_ms, std::shared_ptr<veil_media::AudioPacketPriority> priority)
+      : clock_(env.clock()), inner_(lengths, veil_media::kFramingAudioMinPayloadBps, false),
+        priority_(std::move(priority)), previous_ms_(initial_ms) {
+    for (int ms : lengths) if (ms <= 40) short_ms_ = std::max(short_ms_, ms);
+  }
+  void UpdateNetworkMetrics(const NetworkMetrics& metrics) override {
+    inner_.UpdateNetworkMetrics(metrics);
+  }
+  void MakeDecision(AudioEncoderRuntimeConfig* config) override {
+    inner_.MakeDecision(config);
+    if (!config->frame_length_ms) return;
+    const bool wants_long = *config->frame_length_ms > 40;
+    priority_->WantLongPackets(wants_long, clock_.TimeInMicroseconds());
+    if (wants_long && !priority_->TryGrantLongPackets(clock_.TimeInMicroseconds())) {
+      if (previous_ms_ <= 40) config->frame_length_ms = previous_ms_;
+      else if (short_ms_) config->frame_length_ms = short_ms_;
+      else config->frame_length_ms = previous_ms_;  // No shorter codec mode exists.
+    }
+    previous_ms_ = *config->frame_length_ms;
+  }
+ private:
+  Clock& clock_;
+  FrameLengthControllerV2 inner_;
+  std::shared_ptr<veil_media::AudioPacketPriority> priority_;
+  int previous_ms_, short_ms_ = 0;
+};
 
 #if WEBRTC_ENABLE_PROTOBUF
 
@@ -245,8 +279,14 @@ std::unique_ptr<ControllerManager> ControllerManagerImpl::Create(
   // Keep all other callers on the unmodified upstream configuration path.
   if (config_string == veil_media::kFramingAudioAdaptorConfig) {
     std::vector<std::unique_ptr<Controller>> controllers;
-    controllers.push_back(std::make_unique<FrameLengthControllerV2>(
-        encoder_frame_lengths_ms, veil_media::kFramingAudioMinPayloadBps, false));
+    const auto context = veil_media::current_audio_packet_priority;
+    if (context && *context) {
+      controllers.push_back(std::make_unique<SourceOrderedFrameLength>(
+          env, encoder_frame_lengths_ms, initial_frame_length_ms, *context));
+    } else {
+      controllers.push_back(std::make_unique<FrameLengthControllerV2>(
+          encoder_frame_lengths_ms, veil_media::kFramingAudioMinPayloadBps, false));
+    }
     controllers.push_back(
         std::make_unique<audio_network_adaptor::BitrateController>(
             audio_network_adaptor::BitrateController::Config(
