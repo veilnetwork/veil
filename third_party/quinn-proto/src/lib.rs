@@ -42,6 +42,7 @@ mod bloom_token_log;
 #[cfg(feature = "bloom")]
 pub use bloom_token_log::BloomTokenLog;
 
+pub mod local_send_budget;
 mod connection;
 pub use crate::connection::{
     Chunk, Chunks, ClosedStream, ConfirmedDeliveryStats, Connection, ConnectionError,

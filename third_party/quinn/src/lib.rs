@@ -61,6 +61,7 @@ pub(crate) use web_time::{Duration, Instant};
 
 #[cfg(feature = "bloom")]
 pub use proto::BloomTokenLog;
+pub use proto::local_send_budget;
 pub use proto::{
     AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosedStream, ConfigError,
     ConnectError, ConnectionClose, ConnectionError, ConnectionId, ConnectionIdGenerator,

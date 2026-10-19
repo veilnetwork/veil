@@ -152,6 +152,14 @@ impl QuicDatagramHandle {
         self.connection.local_trace_id()
     }
 
+    /// Couple only a caller-authenticated local source; no role goes on wire.
+    pub fn set_local_send_budget(
+        &self,
+        budget: Arc<dyn quinn::local_send_budget::LocalSendBudget>,
+    ) -> bool {
+        self.connection.set_local_send_budget(budget)
+    }
+
     /// Snapshot actual transport progress, separately from queue admission.
     pub fn path_stats(&self) -> QuicDatagramPathStats {
         let stats = self.connection.stats();

@@ -283,6 +283,7 @@ impl Future for ConnectionDriver {
             conn.terminate(e, &self.0.shared);
             return Poll::Ready(Ok(()));
         }
+        conn.inner.register_local_send_waker(cx.waker());
         let mut keep_going = conn.drive_transmit(cx)?;
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
@@ -646,6 +647,19 @@ impl Connection {
             scheduling_delay_us(state.runtime.now(), *prepared)
         });
         stats
+    }
+
+    /// Attach a generic process-local send budget after application authentication.
+    pub fn set_local_send_budget(
+        &self,
+        budget: Arc<dyn proto::local_send_budget::LocalSendBudget>,
+    ) -> bool {
+        let mut state = self.0.state.lock("set_local_send_budget");
+        let installed = state.inner.set_local_send_budget(budget);
+        if installed {
+            state.wake();
+        }
+        installed
     }
 
     /// Current state of the congestion control algorithm, for debugging purposes
