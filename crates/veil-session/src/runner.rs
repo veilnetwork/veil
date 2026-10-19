@@ -321,6 +321,7 @@ mod ordered_receiver_tests;
 mod reliable_session_tests;
 
 struct RealtimeSender {
+    source_cost_id: u64,
     handle: LossyTransportHandle,
     tx: crate::datagram_flows::SessionDatagramTx,
     max_datagram_size: usize,
@@ -341,7 +342,16 @@ impl RealtimeSender {
         tx: crate::datagram_flows::SessionDatagramTx,
     ) -> Self {
         let handle = handle.into();
+        static NEXT_SOURCE_COST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let source_cost_id = NEXT_SOURCE_COST_ID
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |id| id.checked_add(1),
+            )
+            .expect("source carrier id exhausted");
         Self {
+            source_cost_id,
             max_datagram_size: handle.max_size().unwrap_or(0),
             handle,
             tx,
@@ -507,6 +517,8 @@ impl RealtimeDatagramLane {
     }
 }
 
+#[path = "source_work_cost.rs"]
+mod source_work_cost;
 #[path = "parallel_lanes.rs"]
 mod parallel_lanes;
 #[path = "reliable_session.rs"]
@@ -5130,10 +5142,27 @@ impl SessionRunner {
                         if !match envelope.local_work.as_ref() {
                             Some(work) => {
                                 let attempted_at = std::time::Instant::now();
-                                let admitted = lane.source_activity.admit_lossy_work(
+                                let ordered =
+                                    matches!(sender_state.handle, LossyTransportHandle::Ordered(_));
+                                let key = source_work_cost::key(
+                                    &sender_state.tx,
+                                    sender_state.source_cost_id,
+                                    max_datagram_size,
+                                    ordered,
+                                );
+                                let admitted = lane.source_activity.admit_lossy_work_planned(
                                     work,
                                     encrypted_wire_len(outgoing.len()).unwrap_or(usize::MAX),
+                                    key,
                                     attempted_at,
+                                    |envelope_bytes| {
+                                        source_work_cost::cost(
+                                            &sender_state.tx,
+                                            envelope_bytes,
+                                            max_datagram_size,
+                                            ordered,
+                                        )
+                                    },
                                 );
                                 crate::local_lossy_trace::work_admission(
                                     work,
@@ -5150,7 +5179,16 @@ impl SessionRunner {
                             }
                             None => lane.allow_secondary(
                                 outgoing_priority,
-                                encrypted_wire_len(outgoing.len()).unwrap_or(usize::MAX),
+                                planned_wire_len.saturating_add(
+                                    if matches!(
+                                        sender_state.handle,
+                                        LossyTransportHandle::Ordered(_)
+                                    ) {
+                                        2 * datagram_sizes.len()
+                                    } else {
+                                        0
+                                    },
+                                ),
                                 std::time::Instant::now(),
                             ),
                         } {

@@ -7,6 +7,15 @@ pub const MAX_SEALED_BYTES: usize = 512 * 1024 + MAX_CELLS * 64;
 pub const MAX_PACING_SPAN: Duration = Duration::from_millis(100);
 pub const SOURCE_WORK_MAX_AGE: Duration = Duration::from_millis(200);
 
+/// Local carrier/codec geometry, never serialized. A reservation cannot move
+/// to a replacement child or a different fragment ceiling after any cell starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkCostKey {
+    pub carrier: u64,
+    pub ceiling: usize,
+    pub format: u8,
+}
+
 #[derive(Debug, Default)]
 enum Decision {
     #[default]
@@ -14,6 +23,8 @@ enum Decision {
     Admitted {
         owner: u64,
         overhead: usize,
+        cost_key: Option<WorkCostKey>,
+        admission_prefix: Vec<usize>,
         admitted_at: Instant,
         wire_bytes: usize,
     },
@@ -24,7 +35,6 @@ enum Decision {
 pub struct LocalLossyWork {
     sizes: Vec<usize>,
     sealed_bytes: usize,
-    prefix_bytes: Vec<usize>,
     pacing: Option<Pacing>,
     decision: Mutex<Decision>,
 }
@@ -55,6 +65,8 @@ pub struct WorkScheduleSnapshot {
     pub cells: usize,
     pub sealed_bytes: usize,
     pub envelope_wire_bytes: usize,
+    /// Exact bytes charged by the selected codec plan, before transport headers.
+    pub admission_wire_bytes: usize,
     pub span: Duration,
     pub since_admission: Duration,
     pub until_expiry: Duration,
@@ -71,19 +83,9 @@ impl LocalLossyWork {
         if sealed_bytes > MAX_SEALED_BYTES {
             return None;
         }
-        let mut prefix = 0;
-        let prefix_bytes = sizes
-            .iter()
-            .map(|size| {
-                let before = prefix;
-                prefix += size;
-                before
-            })
-            .collect();
         Some(Arc::new(Self {
             sizes,
             sealed_bytes,
-            prefix_bytes,
             pacing: None,
             decision: Mutex::new(Decision::Pending),
         }))
@@ -123,8 +125,9 @@ impl LocalLossyCell {
         let Decision::Admitted {
             admitted_at,
             wire_bytes,
+            admission_prefix,
             ..
-        } = *state
+        } = &*state
         else {
             return None;
         };
@@ -132,9 +135,10 @@ impl LocalLossyCell {
             index: self.index,
             cells: self.work.sizes.len(),
             sealed_bytes: self.work.sealed_bytes,
-            envelope_wire_bytes: wire_bytes,
+            envelope_wire_bytes: *wire_bytes,
+            admission_wire_bytes: *admission_prefix.last()?,
             span: pacing.span,
-            since_admission: now.saturating_duration_since(admitted_at),
+            since_admission: now.saturating_duration_since(*admitted_at),
             until_expiry: pacing.expires_at.saturating_duration_since(now),
         })
     }
@@ -156,6 +160,40 @@ impl LocalLossyCell {
         owner: u64,
         wire_bytes: usize,
         now: Instant,
+        reserve: impl FnMut(usize) -> Result<(), Instant>,
+    ) -> WorkAdmission {
+        self.admit_cost_at(owner, wire_bytes, None, now, Some, reserve)
+    }
+
+    /// Plan every cell before reserving anything. `wire_cost` receives each
+    /// complete ordered-envelope size and returns the selected codec's cost.
+    /// The caller uses the real fragment planner, without allocating nonces.
+    pub fn admit_planned_at(
+        &self,
+        owner: u64,
+        envelope_wire_bytes: usize,
+        key: WorkCostKey,
+        now: Instant,
+        wire_cost: impl Fn(usize) -> Option<usize>,
+        reserve: impl FnMut(usize) -> Result<(), Instant>,
+    ) -> WorkAdmission {
+        self.admit_cost_at(
+            owner,
+            envelope_wire_bytes,
+            Some(key),
+            now,
+            wire_cost,
+            reserve,
+        )
+    }
+
+    fn admit_cost_at(
+        &self,
+        owner: u64,
+        wire_bytes: usize,
+        cost_key: Option<WorkCostKey>,
+        now: Instant,
+        wire_cost: impl Fn(usize) -> Option<usize>,
         mut reserve: impl FnMut(usize) -> Result<(), Instant>,
     ) -> WorkAdmission {
         let mut state = self.work.decision.lock().unwrap_or_else(|p| p.into_inner());
@@ -172,13 +210,23 @@ impl LocalLossyCell {
             *state = Decision::Rejected;
             return WorkAdmission::Rejected;
         };
-        match *state {
+        match &*state {
             Decision::Rejected => WorkAdmission::Rejected,
             Decision::Admitted {
                 owner: bound,
                 overhead: bound_overhead,
+                cost_key: bound_key,
+                admission_prefix,
                 ..
-            } if owner == bound && overhead == bound_overhead => WorkAdmission::Admitted,
+            } if owner == *bound
+                && overhead == *bound_overhead
+                && cost_key == *bound_key
+                && wire_cost(wire_bytes).is_some_and(|cost| {
+                    cost == admission_prefix[self.index + 1] - admission_prefix[self.index]
+                }) =>
+            {
+                WorkAdmission::Admitted
+            }
             Decision::Admitted { .. } => {
                 *state = Decision::Rejected;
                 WorkAdmission::Rejected
@@ -191,20 +239,37 @@ impl LocalLossyCell {
                     *state = Decision::Rejected;
                     return WorkAdmission::Rejected;
                 }
-                let Some(total) = overhead
+                let Some(envelope_total) = overhead
                     .checked_mul(self.work.sizes.len())
                     .and_then(|n| n.checked_add(self.work.sealed_bytes))
                 else {
                     *state = Decision::Rejected;
                     return WorkAdmission::Rejected;
                 };
+                let mut prefix = Vec::with_capacity(self.work.sizes.len() + 1);
+                prefix.push(0usize);
+                for size in &self.work.sizes {
+                    let Some(next) = size
+                        .checked_add(overhead)
+                        .and_then(&wire_cost)
+                        .filter(|cost| *cost > 0)
+                        .and_then(|cost| prefix.last().unwrap().checked_add(cost))
+                    else {
+                        *state = Decision::Rejected;
+                        return WorkAdmission::Rejected;
+                    };
+                    prefix.push(next);
+                }
+                let total = *prefix.last().unwrap();
                 match reserve(total) {
                     Ok(()) => {
                         *state = Decision::Admitted {
                             owner,
                             overhead,
+                            cost_key,
+                            admission_prefix: prefix,
                             admitted_at: now,
-                            wire_bytes: total,
+                            wire_bytes: envelope_total,
                         };
                         WorkAdmission::Admitted
                     }
@@ -214,8 +279,8 @@ impl LocalLossyCell {
         }
     }
 
-    /// Query release only AFTER whole-work admission. Waiting here never
-    /// refunds/repeats the reservation and never changes the original expiry.
+    /// Release using the actual reserved byte prefixes, so a short final cell
+    /// or an extra encrypted fragment cannot reuse the first cell's geometry.
     pub fn release_at(&self, now: Instant) -> WorkAdmission {
         let Some(pacing) = &self.work.pacing else {
             return if self.rejected() {
@@ -229,19 +294,16 @@ impl LocalLossyCell {
             *state = Decision::Rejected;
             return WorkAdmission::Rejected;
         }
-        match *state {
+        match &*state {
             Decision::Admitted {
-                overhead,
                 admitted_at,
-                wire_bytes,
+                admission_prefix,
                 ..
             } => {
-                // Admission checked that the complete cost fits usize; every
-                // prefix is smaller. Exact integer time arithmetic avoids
-                // rounding a large frame's final members back to the first.
-                let prefix = self.work.prefix_bytes[self.index] + self.index * overhead;
-                let nanos = pacing.span.as_nanos() * prefix as u128 / wire_bytes as u128;
-                let due = admitted_at + Duration::from_nanos(nanos as u64);
+                let total = *admission_prefix.last().unwrap();
+                let nanos =
+                    pacing.span.as_nanos() * admission_prefix[self.index] as u128 / total as u128;
+                let due = *admitted_at + Duration::from_nanos(nanos as u64);
                 if now < due {
                     WorkAdmission::Wait(due)
                 } else {
@@ -282,6 +344,132 @@ impl LocalLossyCell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cost_key() -> WorkCostKey {
+        WorkCostKey {
+            carrier: 11,
+            ceiling: 1000,
+            format: 1,
+        }
+    }
+
+    #[test]
+    fn planned_variable_fragments_pay_once_and_release_by_reserved_prefix() {
+        let now = Instant::now();
+        let span = Duration::from_millis(90);
+        let work = LocalLossyWork::new_paced(vec![1000, 400, 700], span, now + SOURCE_WORK_MAX_AGE)
+            .unwrap();
+        // The small middle cell has one fragment; the other two have two.
+        let cost = |n: usize| n.checked_add(n.div_ceil(1000).checked_mul(61)?);
+        let mut charges = Vec::new();
+        let first = work.cell(0).unwrap();
+        assert_eq!(
+            first.admit_planned_at(7, 1316, cost_key(), now, cost, |n| {
+                charges.push(n);
+                Ok(())
+            }),
+            WorkAdmission::Admitted
+        );
+        assert_eq!(charges, [3353]);
+        let snapshot = first.boundary_snapshot_at(now).unwrap();
+        assert_eq!(snapshot.envelope_wire_bytes, 3048);
+        assert_eq!(snapshot.admission_wire_bytes, 3353);
+        let second = work.cell(1).unwrap();
+        assert_eq!(
+            second.admit_planned_at(7, 716, cost_key(), now, cost, |_| panic!(
+                "no second charge"
+            )),
+            WorkAdmission::Admitted
+        );
+        let due = now + Duration::from_nanos((span.as_nanos() * 1438 / 3353) as u64);
+        assert_eq!(second.release_at(now), WorkAdmission::Wait(due));
+        assert_eq!(second.release_at(due), WorkAdmission::Admitted);
+        let last = work.cell(2).unwrap();
+        assert_eq!(
+            last.admit_planned_at(7, 1016, cost_key(), due, cost, |_| panic!(
+                "retry cannot renew"
+            )),
+            WorkAdmission::Admitted
+        );
+        let last_due = now + Duration::from_nanos((span.as_nanos() * (1438 + 777) / 3353) as u64);
+        assert_eq!(last.release_at(due), WorkAdmission::Wait(last_due));
+        assert_eq!(last.release_at(last_due), WorkAdmission::Admitted);
+    }
+
+    #[test]
+    fn planned_work_cannot_reuse_credit_on_another_geometry_or_legacy_carrier() {
+        let now = Instant::now();
+        for changed in [
+            WorkCostKey {
+                carrier: 12,
+                ..cost_key()
+            },
+            WorkCostKey {
+                ceiling: 900,
+                ..cost_key()
+            },
+            WorkCostKey {
+                format: 0,
+                ..cost_key()
+            },
+        ] {
+            let work = LocalLossyWork::new(vec![1000; 2]).unwrap();
+            assert_eq!(
+                work.cell(0)
+                    .unwrap()
+                    .admit_planned_at(7, 1316, cost_key(), now, Some, |_| Ok(())),
+                WorkAdmission::Admitted
+            );
+            assert_eq!(
+                work.cell(1)
+                    .unwrap()
+                    .admit_planned_at(7, 1316, changed, now, Some, |_| panic!("no transfer")),
+                WorkAdmission::Rejected
+            );
+        }
+        let work = LocalLossyWork::new(vec![1000; 2]).unwrap();
+        assert_eq!(
+            work.cell(0)
+                .unwrap()
+                .admit_planned_at(7, 1316, cost_key(), now, Some, |_| Ok(())),
+            WorkAdmission::Admitted
+        );
+        assert_eq!(
+            work.cell(1)
+                .unwrap()
+                .admit_at(7, 1316, now, |_| panic!("no fallback transfer")),
+            WorkAdmission::Rejected
+        );
+    }
+
+    #[test]
+    fn planned_work_checks_all_members_before_spending_any_credit() {
+        let now = Instant::now();
+        let work = LocalLossyWork::new(vec![1000, 400]).unwrap();
+        assert_eq!(
+            work.cell(0).unwrap().admit_planned_at(
+                7,
+                1316,
+                cost_key(),
+                now,
+                |n| (n != 716).then_some(n),
+                |_| panic!("invalid tail cannot spend credit")
+            ),
+            WorkAdmission::Rejected
+        );
+        let work = LocalLossyWork::new(vec![1000; 2]).unwrap();
+        assert_eq!(
+            work.cell(0).unwrap().admit_planned_at(
+                7,
+                1316,
+                cost_key(),
+                now,
+                |_| Some(usize::MAX),
+                |_| panic!("overflow cannot spend credit")
+            ),
+            WorkAdmission::Rejected
+        );
+    }
 
     #[test]
     fn paced_members_reserve_the_whole_wire_cost_once_and_keep_release_times() {

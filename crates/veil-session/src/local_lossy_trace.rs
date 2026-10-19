@@ -145,12 +145,12 @@ pub(crate) fn work_release(
         return;
     }
     log::info!(target: "veil::source_work_release",
-        "at_unix_us={} monotonic_us={} connection_trace_id={connection_trace_id} local_slot={priority} epoch={epoch:016x} seq={seq} cell={} cells={} sealed_bytes={} envelope_work_bytes={} envelope_cell_bytes={} span_us={} admission_age_us={} remaining_us={} datagram_cell_bytes={datagram_bytes}",
+        "at_unix_us={} monotonic_us={} connection_trace_id={connection_trace_id} local_slot={priority} epoch={epoch:016x} seq={seq} cell={} cells={} sealed_bytes={} envelope_work_bytes={} envelope_cell_bytes={} span_us={} admission_age_us={} remaining_us={} datagram_cell_bytes={datagram_bytes} admitted_work_bytes={}",
         unix_us(), veil_util::diagnostic_clock::monotonic_us().map_or(-1, i128::from), snapshot.index, snapshot.cells, snapshot.sealed_bytes,
         snapshot.envelope_wire_bytes,
         frame.len().saturating_add(veil_crypto::session_cipher::AEAD_OVERHEAD),
         snapshot.span.as_micros(),
-        snapshot.since_admission.as_micros(), snapshot.until_expiry.as_micros());
+        snapshot.since_admission.as_micros(), snapshot.until_expiry.as_micros(), snapshot.admission_wire_bytes);
 }
 
 fn owned_primary_cell(priority: u8, frame: &[u8]) -> Option<(u64, u64)> {
