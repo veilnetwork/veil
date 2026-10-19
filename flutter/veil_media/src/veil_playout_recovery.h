@@ -13,6 +13,7 @@
 #include "modules/audio_coding/neteq/neteq_impl.h"
 #include "veil_playout_trace.h"
 #include "veil_audio_recovery.h"
+#include "veil_audio_rtp_lag.h"
 
 namespace veil_media {
 struct PlayoutRecoveryStats {
@@ -45,6 +46,11 @@ class RecoveringNetEq final : public webrtc::NetEq {
     // the backlog we just removed, including across an Opus DTX interval.
     if (arrival_clock_) arrival_clock_->Increment();
     const int result = inner_->GetAudio(frame, &silent, &sample_rate, action);
+    const auto flushes = inner_->GetOperationsAndState().packet_buffer_flushes;
+    if (flushes != packet_buffer_flushes_) {
+      ResetLag();
+      packet_buffer_flushes_ = flushes;
+    }
     if (result == kOK && !silent &&
         frame->speech_type_ == webrtc::AudioFrame::kNormalSpeech) {
       // PLC/CNG/muted output does not establish a new encoded packet size.
@@ -88,6 +94,28 @@ class RecoveringNetEq final : public webrtc::NetEq {
       if (fallback) stats_->fallback_frames.fetch_add(1, std::memory_order_relaxed);
       stats_->count.fetch_add(1, std::memory_order_release);
     }
+    // NetEq can keep an old output RTP origin across a sender rebuild even
+    // while PCM is prompt. Require an actual decoded-packet clock witness;
+    // never infer a timestamp offset from packet order or tone phase.
+    if (!frame->packet_infos_.empty()) {
+      decoded_stamp_.reset();
+      for (const auto& info : frame->packet_infos_) {
+        if (rtp_lag_.MatchesPacket(info.ssrc(), info.rtp_timestamp(), info.sequence_number()) &&
+            std::llabs(static_cast<int32_t>(frame->timestamp_ - info.rtp_timestamp())) <=
+                (frame_headroom_ms_ + 20) * 48) {
+          decoded_stamp_ = info.rtp_timestamp();
+          break;
+        }
+      }
+    }
+    const bool aligned = decoded_stamp_ &&
+        std::llabs(static_cast<int32_t>(frame->timestamp_ - *decoded_stamp_)) <=
+            (frame_headroom_ms_ + 20) * 48;
+    receiver_recovery_->SetLag(
+        result == kOK && !silent &&
+        frame->speech_type_ == webrtc::AudioFrame::kNormalSpeech && aligned
+            ? rtp_lag_.Output(frame->timestamp_, webrtc::TimeMicros()) : std::nullopt,
+        webrtc::TimeMicros());
     if (muted) *muted = silent;
     if (rate) *rate = sample_rate;
     if (trace_.enabled()) {
@@ -103,7 +131,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
   }
   int InsertPacket(const webrtc::RTPHeader& h, std::span<const uint8_t> p,
                    const webrtc::RtpPacketInfo& info) override {
-    const auto received_us = trace_.enabled() ? webrtc::TimeMicros() : 0;
+    const auto received_us = webrtc::TimeMicros();
     const int result = inner_->InsertPacket(h, p, info);
     if (result == kOK && trace_.enabled())
       trace_.RecordPacket(received_us, h.ssrc, h.sequenceNumber, h.timestamp);
@@ -111,15 +139,45 @@ class RecoveringNetEq final : public webrtc::NetEq {
       stats_->receivers.Attach(h.ssrc, receiver_recovery_);
       registered_ssrc_ = h.ssrc;
     }
+    if (result == kOK && !p.empty()) {
+      if (h.ssrc == registered_ssrc_ && h.payloadType < opus_payloads_.size() &&
+          opus_payloads_[h.payloadType]) {
+        if (rtp_lag_.Packet(h.ssrc, h.timestamp, received_us, h.sequenceNumber)) {
+          decoded_stamp_.reset();
+          receiver_recovery_->SetLag(std::nullopt, 0);
+        }
+      } else {
+        ResetLag();
+      }
+    }
     return result;
   }
-  void SetCodecs(const std::map<int, webrtc::SdpAudioFormat>& c) override { inner_->SetCodecs(c); }
-  bool RegisterPayloadType(int p, const webrtc::SdpAudioFormat& f) override { return inner_->RegisterPayloadType(p, f); }
+  void SetCodecs(const std::map<int, webrtc::SdpAudioFormat>& c) override {
+    inner_->SetCodecs(c);
+    opus_payloads_.fill(false);
+    for (const auto& [p, f] : c) TrackCodec(p, f);
+    ResetLag();
+  }
+  bool RegisterPayloadType(int p, const webrtc::SdpAudioFormat& f) override {
+    if (!inner_->RegisterPayloadType(p, f)) return false;
+    TrackCodec(p, f);
+    ResetLag();
+    return true;
+  }
   bool CreateDecoder(int p) override { return inner_->CreateDecoder(p); }
-  int RemovePayloadType(uint8_t p) override { return inner_->RemovePayloadType(p); }
+  int RemovePayloadType(uint8_t p) override {
+    const int result = inner_->RemovePayloadType(p);
+    if (result == kOK) {
+      if (p < opus_payloads_.size()) opus_payloads_[p] = false;
+      ResetLag();
+    }
+    return result;
+  }
   void SetMaximumBufferPackets(size_t n) override { inner_->SetMaximumBufferPackets(n); }
   void SetFastAccelerate(bool v) override { inner_->SetFastAccelerate(v); }
-  void RemoveAllPayloadTypes() override { inner_->RemoveAllPayloadTypes(); }
+  void RemoveAllPayloadTypes() override {
+    inner_->RemoveAllPayloadTypes(); opus_payloads_.fill(false); ResetLag();
+  }
   bool SetMinimumDelay(int n) override { return inner_->SetMinimumDelay(n); }
   bool SetMaximumDelay(int n) override {
     if (n < 0) return inner_->SetMaximumDelay(n);
@@ -140,9 +198,19 @@ class RecoveringNetEq final : public webrtc::NetEq {
   std::optional<uint32_t> GetPlayoutTimestamp() const override { return inner_->GetPlayoutTimestamp(); }
   int last_output_sample_rate_hz() const override { return inner_->last_output_sample_rate_hz(); }
   std::optional<DecoderFormat> GetCurrentDecoderFormat() const override { return inner_->GetCurrentDecoderFormat(); }
-  void FlushBuffers() override { inner_->FlushBuffers(); }
+  void FlushBuffers() override { inner_->FlushBuffers(); ResetLag(); }
   int SyncBufferSizeMs() const override { return inner_->SyncBufferSizeMs(); }
  private:
+  void ResetLag() {
+    rtp_lag_.Reset();
+    decoded_stamp_.reset();
+    receiver_recovery_->SetLag(std::nullopt, 0);
+  }
+  void TrackCodec(int payload, const webrtc::SdpAudioFormat& f) {
+    if (payload >= 0 && static_cast<size_t>(payload) < opus_payloads_.size())
+      opus_payloads_[payload] = f.clockrate_hz == 48000 &&
+          (f.name == "opus" || f.name == "OPUS" || f.name == "Opus");
+  }
   // NetEq's target and the hard catch-up must have compatible budgets.
   // Leave room for one ordinary decoded packet arrival; otherwise NetEq
   // refills toward a level that this wrapper discards on every render tick.
@@ -177,6 +245,10 @@ class RecoveringNetEq final : public webrtc::NetEq {
   uint32_t registered_ssrc_ = 0;
   webrtc::AudioFrame scratch_;
   PlayoutTrace trace_;
+  AudioRtpLag rtp_lag_;
+  std::array<bool, 128> opus_payloads_{};
+  uint64_t packet_buffer_flushes_ = 0;
+  std::optional<uint32_t> decoded_stamp_;
 };
 class ArrivalClockControllerFactory final : public webrtc::NetEqControllerFactory {
  public:

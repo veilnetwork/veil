@@ -2719,8 +2719,13 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               native_age_ms >= 0 && native_age_ms <= 3000;
           const uint32_t delay_ms = current_audio_playout_delay(
               sample.jitter_buffer_ms, ws->adm.get());
+          const int rtp_lag_ms = active ? ws->recovery_stats->receivers.LagMs(
+              peer->audio_ssrc, webrtc::TimeMicros()) : -1;
+          const uint32_t pressure_delay_ms = current_audio_playout_delay(
+              std::max(sample.jitter_buffer_ms, static_cast<uint32_t>(std::max(0, rtp_lag_ms))),
+              ws->adm.get());
           peer->shim->SetLocalAudioPlayout(peer->audio_ssrc, sample_sequence,
-              active ? static_cast<int>(delay_ms) : -1, now_us);
+              active ? static_cast<int>(pressure_delay_ms) : -1, now_us);
           const auto recovery = ws->recovery_stats->receivers.Snapshot(peer->audio_ssrc);
           peer->shim->SetLocalAudioRecovery(peer->audio_ssrc, sample_sequence,
               active ? recovery : veil_media::AudioRecoverySample{}, now_us);
@@ -2733,6 +2738,7 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
           char receiver[1024];
           const int size = std::snprintf(receiver, sizeof(receiver),
               "\"%s\":{\"audio_rx_pkts\":%llu,\"audio_delay_ms\":%u,"
+              "\"audio_rtp_lag_ms\":%d,\"audio_pressure_delay_ms\":%u,"
               "\"audio_filtered_delay_ms\":%u,"
               "\"audio_rx_native_age_ms\":%lld,\"audio_interruption_count\":%d,"
               "\"audio_interruption_duration_ms\":%d,"
@@ -2741,7 +2747,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               "\"audio_discarded_packets\":%llu,\"audio_jb_target_ms\":%u,"
               "\"audio_recovery_known\":%d,\"audio_latency_discarded_ms\":%llu}", id,
               static_cast<unsigned long long>(sample.packets_received),
-              delay_ms, sample.delay_estimate_ms, static_cast<long long>(native_age_ms),
+              delay_ms, rtp_lag_ms, pressure_delay_ms,
+              sample.delay_estimate_ms, static_cast<long long>(native_age_ms),
               sample.interruption_count, sample.total_interruption_duration_ms,
               static_cast<unsigned long long>(sample.concealed_samples),
               static_cast<unsigned long long>(sample.concealment_events),
@@ -4184,6 +4191,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     int64_t audio_encoder_target_bps = 0;
     int audio_send_bandwidth_bps = 0;
     uint32_t audio_delay_ms = 0;
+    int audio_rtp_lag_ms = -1, audio_pressure_delay_ms = -1;
     uint32_t audio_filtered_delay_ms = 0;
     uint32_t audio_jb_ms = 0;
     uint32_t audio_jb_target_ms = 0;
@@ -4270,6 +4278,11 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         jitter_ms = r.jitter_ms;
         audio_filtered_delay_ms = r.delay_estimate_ms;
         audio_delay_ms = current_audio_playout_delay(r.jitter_buffer_ms, ws->adm.get());
+        audio_rtp_lag_ms = audio_rx_native_age_ms >= 0 && audio_rx_native_age_ms <= 3000
+            ? ws->recovery_stats->receivers.LagMs(remote_ssrc, webrtc::TimeMicros()) : -1;
+        audio_pressure_delay_ms = static_cast<int>(current_audio_playout_delay(
+            std::max(r.jitter_buffer_ms, static_cast<uint32_t>(std::max(0, audio_rtp_lag_ms))),
+            ws->adm.get()));
         audio_jb_ms = r.jitter_buffer_ms;
         // Diagnostic only: distinguish the controller's chosen buffer from
         // current packet accumulation and the filtered playout estimate.
@@ -4372,6 +4385,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         "\"video_feedback_reports\":%d,\"video_feedback_rtt_ms\":%lld,"
         "\"video_feedback_loss_pct\":%d,\"video_feedback_jitter_ms\":%d,"
         "\"audio_delay_ms\":%u,\"audio_jb_ms\":%u,\"audio_jb_target_ms\":%u,"
+        "\"audio_rtp_lag_ms\":%d,\"audio_pressure_delay_ms\":%d,"
         "\"audio_filtered_delay_ms\":%u,"
         "\"video_delay_ms\":%d,\"video_jb_ms\":%d,"
         "\"pacer_delay_ms\":%lld,\"worker_stalled\":%d,\"video_worker_stalled\":%d,"
@@ -4440,7 +4454,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<long long>(video_feedback_available ? video_report.rtt_ms : 0),
         video_feedback_available ? video_report.loss_pct : 0,
         video_feedback_available ? video_report.jitter_ms : 0,
-        audio_delay_ms, audio_jb_ms, audio_jb_target_ms, audio_filtered_delay_ms,
+        audio_delay_ms, audio_jb_ms, audio_jb_target_ms,
+        audio_rtp_lag_ms, audio_pressure_delay_ms, audio_filtered_delay_ms,
         video_delay_ms, video_jb_ms,
         static_cast<long long>(pacer_delay_ms), sampled ? 0 : 1, video_sampled ? 0 : 1,
         static_cast<unsigned long long>(tx_video.frames),

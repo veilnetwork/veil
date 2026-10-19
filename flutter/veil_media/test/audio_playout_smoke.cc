@@ -445,7 +445,8 @@ static void verify_sender_restart() {
     origin = Clock::now();
     std::array<int16_t, 480> pcm{};
     std::vector<double> source_edges, rendered_edges;
-    uint64_t max_delay = 0, max_buffer = 0;
+    uint64_t max_delay = 0, max_buffer = 0, max_rtp_lag = 0;
+    size_t known_rtp_lag = 0;
     size_t nonsilent_ticks = 0;
     bool was_high = false;
     for (int tick = 0; tick < 1200; ++tick) {
@@ -475,8 +476,26 @@ static void verify_sender_restart() {
       if (tick % 10 == 0) {
         max_delay = std::max(max_delay, metric(receiver.get(), "audio_delay_ms"));
         max_buffer = std::max(max_buffer, metric(receiver.get(), "audio_jb_ms"));
+        const auto lag = metric(receiver.get(), "audio_rtp_lag_ms");
+        if (tick == 100 || tick == 400 || tick == 800)
+          std::printf("sender lag sample tick=%d lag=%lld native_age=%lld pressure=%lld origin=%llu\n",
+              tick, static_cast<long long>(lag),
+              static_cast<long long>(metric(receiver.get(), "audio_rx_native_age_ms")),
+              static_cast<long long>(metric(receiver.get(), "audio_pressure_delay_ms")),
+              static_cast<unsigned long long>(metric(receiver.get(), "audio_receiver_recovery_origin")));
+        if (lag != static_cast<uint64_t>(-1)) {
+          ++known_rtp_lag;
+          max_rtp_lag = std::max(max_rtp_lag, lag);
+          assert(lag < 400);
+        }
       }
     }
+    // After a sender rebuild NetEq may retain its old output RTP origin.
+    // Unknown is required then; prompt PCM cannot license a guessed offset.
+    // Before any rebuild this same real Opus path must supply measurements.
+    assert(known_rtp_lag > 20);
+    std::printf("sender RTP lag: known=%zu max_ms=%llu\n", known_rtp_lag,
+                static_cast<unsigned long long>(max_rtp_lag));
     std::printf("sender rebuilds: nonsilent=%zu/1200 delay_max=%llu buffer_max=%llu marker_latency_ms=[",
         nonsilent_ticks, static_cast<unsigned long long>(max_delay),
         static_cast<unsigned long long>(max_buffer));
@@ -902,7 +921,7 @@ static void verify_long_packets(bool jitter) {
   assert(veil_media_test_audio_transport_budget(receiver.get(), 48000) == 0);
   origin = Clock::now();
   std::array<int16_t, 480> pcm{};
-  std::array<size_t, 3> voiced{}, duration60{}, observations{};
+  std::array<size_t, 3> voiced{}, duration60{}, observations{}, known_lag{};
   std::array<uint64_t, 2> settled_discarded{}, settled_concealed{};
   double max_lateness = 0;
   std::vector<double> sent_edges, rendered_edges;
@@ -951,6 +970,11 @@ static void verify_long_packets(bool jitter) {
     }
     if (tick % 100 == 0) {
       ++observations[phase];
+      const auto lag = metric(receiver.get(), "audio_rtp_lag_ms");
+      if (lag != static_cast<uint64_t>(-1)) {
+        ++known_lag[phase];
+        assert(lag < 400);
+      }
       if (metric(source.get(), "audio_tx_packet_duration_ms") == 60)
         ++duration60[phase];
       std::printf(
@@ -975,6 +999,9 @@ static void verify_long_packets(bool jitter) {
       std::fflush(stdout);
     }
   }
+  assert(known_lag[0] >= 30 && known_lag[2] >= 30);
+  std::printf("long-packets RTP lag known=%zu/%zu/%zu\n",
+              known_lag[0], known_lag[1], known_lag[2]);
   std::printf(
       "long-packets result: voiced=%zu/%zu/%zu duration60=%zu/%zu/%zu "
       "observations=%zu/%zu/%zu lateness=%.3f trim_ms=%llu "
