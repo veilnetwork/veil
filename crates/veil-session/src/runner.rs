@@ -6243,7 +6243,7 @@ impl SessionRunner {
                         }
                         match self.dispatcher.dispatch(&header, body, self.peer_id) {
                             DispatchResult::Response(response) => { enqueue_outbox_envelope(&mut pq,
-                                (crate::LOCAL_NETWORK_CONTROL_LANE, veil_bufpool::pooled_shared_from_vec(response)).into(), outbox.as_ref().map(|o|o.source_activity())); },
+                                auxiliary_records::response(response), outbox.as_ref().map(|o|o.source_activity())); },
                             DispatchResult::NoResponse => {},
                             DispatchResult::Violation(reason) => { self.record_violation(&reason); event.handle.close(); },
                             result => {

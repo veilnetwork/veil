@@ -34,6 +34,21 @@ pub(crate) fn eligible(frame: &[u8]) -> bool {
             .is_ok_and(|family| !matches!(family, FrameFamily::LocalApp))
 }
 
+/// Preserve the canonical response policy. Peer-triggered application,
+/// discovery and delivery replies carry no trusted own-source credit/class.
+/// Only existing session/control responses use the bounded local control lane.
+pub(super) fn response(frame: Vec<u8>) -> crate::frame_outbox::FrameEnvelope {
+    let control = decode_header(&frame).is_ok_and(|header| {
+        header.family == FrameFamily::Session as u8 || header.family == FrameFamily::Control as u8
+    });
+    let priority = if control {
+        crate::LOCAL_NETWORK_CONTROL_LANE
+    } else {
+        veil_proto::priority::INTERACTIVE
+    };
+    (priority, veil_bufpool::pooled_shared_from_vec(frame)).into()
+}
+
 pub(in crate::runner) fn spawn(
     owner: Arc<crate::reliable_frames::ReliableFrameChannel>,
     parent: ParallelParentHandle,
@@ -71,6 +86,49 @@ mod tests {
     use super::*;
     use crate::{parallel_binding::ParallelParent, reliable_frames::ReliableFrameChannel};
     use tokio::time::{Duration, timeout};
+
+    #[test]
+    fn peer_triggered_data_replies_keep_neutral_local_admission() {
+        use crate::priority_queue::{HeadAdmission, PriorityQueue};
+        for (family, msg, priority) in [
+            (
+                FrameFamily::Discovery,
+                DiscoveryMsg::FindValueResponse as u16,
+                veil_proto::priority::INTERACTIVE,
+            ),
+            (
+                FrameFamily::Delivery,
+                veil_proto::DeliveryMsg::DeliveryStatus as u16,
+                veil_proto::priority::INTERACTIVE,
+            ),
+            (
+                FrameFamily::App,
+                AppMsg::AppSendUnopenable as u16,
+                veil_proto::priority::INTERACTIVE,
+            ),
+            (
+                FrameFamily::Control,
+                ControlMsg::KeepaliveAck as u16,
+                crate::LOCAL_NETWORK_CONTROL_LANE,
+            ),
+        ] {
+            let header = FrameHeader::new(family as u8, msg); // default wire flags even claim REALTIME
+            let reply = response(veil_proto::codec::encode_header(&header).to_vec());
+            assert_eq!(reply.frame.0, priority);
+            assert!(reply.reliable_credit.is_none());
+            let mut queue = PriorityQueue::with_default_weights();
+            queue.push_envelope(reply, false);
+            assert!(
+                queue
+                    .pop_admitted_envelope(|actual, _, own, _| {
+                        assert_eq!(actual, priority);
+                        assert!(!own, "a response to a peer is not an own file source");
+                        HeadAdmission::Allow
+                    })
+                    .is_some()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn auxiliary_reader_drains_completed_records_after_transport_eof() {
