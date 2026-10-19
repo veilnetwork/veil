@@ -228,6 +228,12 @@ static int64_t group_audio_age(VeilGroupMediaEngine* engine, const uint8_t peer[
     const std::string key = std::string("\"") + metric + "\":";
     assert(std::strstr(receiver, key.c_str()));
   }
+  for (const char* metric : {"audio_soft_loss_duration_supported", "audio_peer_soft_loss_duration_supported",
+      "audio_local_soft_loss_report_us", "audio_peer_soft_loss_report_us",
+      "audio_local_soft_loss_window_ms", "audio_peer_soft_loss_window_ms"}) {
+    const std::string key = std::string("\"") + metric + "\":";
+    assert(std::strstr(json, key.c_str()));
+  }
   const char* at = std::strstr(receiver, "\"audio_rx_native_age_ms\":");
   assert(at);
   const auto age = std::strtoll(at + std::strlen("\"audio_rx_native_age_ms\":"), nullptr, 10);

@@ -54,6 +54,38 @@ int main() {
   receiver.SetLocalAudioSsrc(22);
   receiver.Start();
   const int64_t now = webrtc::TimeMicros();
+  {
+    VeilTransportShim measured(99, nullptr, nullptr, nullptr, nullptr);
+    measured.SetLocalAudioSsrc(11);
+    measured.Start();
+    auto conceal = [&](uint64_t seq, uint64_t samples, uint32_t age, int64_t at) {
+      const auto app = EncodeAudioConcealment(22, {11, seq, 19, samples, age, true});
+      auto packet = original;
+      packet.insert(packet.end(), app.begin(), app.end());
+      AudioRecoveryFeedbackTest::Observe(measured, packet, at);
+    };
+    conceal(1, 10000, kUnknownRecoveryAge, now);
+    conceal(2, 10000 + 11*48, 0, now + 1000);
+    conceal(3, 10000 + 38*48, 0, now + 2000);
+    require(measured.peer_audio_soft_loss(now + 2000).samples == 38*48 &&
+                measured.peer_audio_soft_loss(now + 2000).report_us == 0,
+            "real shim promoted small concealment to significant loss");
+    auto recovery = [&](uint64_t seq, uint64_t ms, int64_t at) {
+      const auto app = EncodeAudioRecovery(22, 11, seq, {true, 19, ms, at}, at, at);
+      auto packet = original;
+      packet.insert(packet.end(), app.begin(), app.end());
+      AudioRecoveryFeedbackTest::Observe(measured, packet, at);
+    };
+    recovery(1, 0, now + 3000);
+    recovery(2, 85, now + 4000);
+    const auto damage = measured.peer_audio_soft_loss(now + 4000);
+    require(damage.supported && damage.samples == 123*48 && damage.report_us == now + 4000,
+            "real shim did not combine authenticated damage counters");
+    recovery(2, 85, now + 5000);
+    require(measured.peer_audio_soft_loss(now + 5000).report_us == damage.report_us,
+            "real shim replay renewed significant loss");
+    measured.Stop();
+  }
   receiver.SetLocalAudioPlayout(11, 1, 80, now);
   receiver.SetLocalAudioRecovery(11, 1, {true, 1, 20, now}, now);
   require(receiver.SendRtcp(original, {}), "source RTCP refused");
