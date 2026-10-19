@@ -51,6 +51,12 @@ class LocalAudioConcealment {
     return event;
   }
   bool enabled() const { return enabled_; }
+  // Exact local detection identity. Reconstructing this from millisecond age
+  // would make an unchanged event look new on a later stats poll.
+  int64_t FreshReportUs(int64_t now_us) const {
+    const auto report = Report(now_us);
+    return report.known && report.age_ms != kUnknownRecoveryAge ? event_us_ : 0;
+  }
   AudioConcealmentReport Report(int64_t now_us) const {
     auto report = report_;
     if (sampled_us_ <= 0 || sampled_us_ > now_us ||

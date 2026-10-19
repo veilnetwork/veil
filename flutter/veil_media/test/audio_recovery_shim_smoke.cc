@@ -113,9 +113,15 @@ int main() {
   // Concealment has its own APP and witness; it never changes VAP2 counters.
   const auto before_baseline = sends;
   receiver.SetLocalAudioConcealment(11, 1, 9, 1000, 100, webrtc::TimeMicros());
+  require(receiver.local_audio_concealment_report_us(webrtc::TimeMicros()) == 0,
+          "local native history appeared as fresh damage");
   require(sends == before_baseline, "historical concealment sent an impulse");
   std::this_thread::sleep_for(std::chrono::milliseconds(1));
   receiver.SetLocalAudioConcealment(11, 2, 9, 1480, 100, webrtc::TimeMicros());
+  const auto local_event = receiver.local_audio_concealment_report_us(webrtc::TimeMicros());
+  require(local_event > 0 &&
+              receiver.local_audio_concealment_report_us(webrtc::TimeMicros()) == local_event,
+          "local incoming event missing or renewed by a read");
   require(sends == before_baseline + 1, "fresh concealment waited for periodic RTCP");
   const auto concealed = sent;
   require(concealed.size() == 8 + 28 + 48 + 48,

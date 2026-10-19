@@ -205,6 +205,7 @@ class VeilTransportShim : public webrtc::Transport {
                                uint64_t silent_concealed_samples,
                                int64_t sampled_us);
   int64_t peer_audio_concealment_report_us(int64_t now_us) const;
+  int64_t local_audio_concealment_report_us(int64_t now_us) const;
 
   // Enable only when both endpoints have independent audio/video counters.
   // Older engines used one sequence space and cannot consume split feedback.
