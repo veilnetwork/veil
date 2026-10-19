@@ -75,7 +75,26 @@ pub struct QuicDatagramHandle {
 /// Local counters for a generic encrypted connection. No source role,
 /// endpoint address, identity material, or decrypted application data.
 #[derive(Clone, Copy, Debug)]
+pub struct QuicConfirmedDelivery {
+    /// Connection-local route epoch; connection_trace_id scopes its lifetime.
+    pub epoch: u64,
+    pub validation_pending: bool,
+    /// Explicitly ACKed current-route congestion-counted Data packet bytes.
+    /// Includes QUIC framing/padding, excludes UDP/IP; not available capacity.
+    pub bytes: u64,
+    pub packets: u64,
+    pub first_sent: Option<std::time::Instant>,
+    pub last_sent: Option<std::time::Instant>,
+    pub last_ack: Option<std::time::Instant>,
+    /// Snapshot time after reading the coherent transport counters.
+    pub observed_at: std::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct QuicDatagramPathStats {
+    /// None means no confirmed-delivery implementation, never a zero-delay
+    /// or zero-cost transport. Ordered fallback does not manufacture QUIC ACKs.
+    pub confirmed_delivery: Option<QuicConfirmedDelivery>,
     pub rtt_us: u64,
     pub congestion_window_bytes: u64,
     pub in_flight_bytes: u64,
@@ -138,6 +157,16 @@ impl QuicDatagramHandle {
         let stats = self.connection.stats();
         let driver = self.connection.driver_stats();
         QuicDatagramPathStats {
+            confirmed_delivery: Some(QuicConfirmedDelivery {
+                epoch: stats.path.confirmed_delivery.epoch,
+                validation_pending: stats.path.confirmed_delivery.validation_pending,
+                bytes: stats.path.confirmed_delivery.bytes,
+                packets: stats.path.confirmed_delivery.packets,
+                first_sent: stats.path.confirmed_delivery.first_sent,
+                last_sent: stats.path.confirmed_delivery.last_sent,
+                last_ack: stats.path.confirmed_delivery.last_ack,
+                observed_at: std::time::Instant::now(),
+            }),
             rtt_us: stats.path.rtt.as_micros().min(u64::MAX as u128) as u64,
             congestion_window_bytes: stats.path.cwnd,
             in_flight_bytes: stats.path.in_flight_bytes,
