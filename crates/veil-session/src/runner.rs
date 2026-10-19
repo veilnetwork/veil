@@ -4322,7 +4322,8 @@ impl SessionRunner {
                                             *session_id,
                                             context,
                                             status,
-                                        ),
+                                        )
+                                        .with_source_activity(source_activity.clone()),
                                     ))
                                 }),
                         })
