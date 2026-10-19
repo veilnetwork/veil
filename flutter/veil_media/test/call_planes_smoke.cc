@@ -421,6 +421,9 @@ int main(int argc, char** argv) {
     assert(veil_media_test_group_fanout_packet(e.get(), 0) == 0);
     assert(veil_media_test_group_fanout_packet(e.get(), 1) == 0);
     check(3, 2);
+    // One 15-byte logical video RTP packet was attempted for each peer.
+    assert(group_stat(e.get(), "video_tx_payload_pkts") == 2);
+    assert(group_stat(e.get(), "video_tx_payload_rtp_bytes") == 30);
     {
       std::lock_guard lock(callback_mu);
       rejected_channels.insert(190);
@@ -428,8 +431,13 @@ int main(int argc, char** argv) {
     assert(veil_media_test_group_emit_rtcp(e.get()) == 1);
     assert(veil_media_test_group_fanout_packet(e.get(), 3) == 0);
     assert(veil_media_test_group_fanout_packet(e.get(), 2) == 0);
+    assert(veil_media_test_group_fanout_packet(e.get(), 1) == 0);
+    // Failed local copies are still attempts, not actual wire/delivery proof.
+    assert(group_stat(e.get(), "video_tx_payload_pkts") == 4);
+    assert(group_stat(e.get(), "video_tx_payload_rtp_bytes") == 60);
     check(4, 3);
     assert(veil_media_group_engine_remove_peer(e.get(), alice) == VEIL_MEDIA_OK);
+    assert(group_stat(e.get(), "video_tx_payload_rtp_bytes") == 60);
     check(4, 3);
     assert(veil_media_group_engine_add_peer(e.get(), 192, alice) == VEIL_MEDIA_OK);
     assert(veil_media_test_group_emit_rtcp(e.get()) == 0);
