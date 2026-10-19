@@ -6,6 +6,9 @@ use crate::reliable_frames::ReliableFrameHandle;
 
 /// A complete authenticated record, retaining the parent authorization witness.
 pub struct Received {
+    /// Local FIFO retirement marker, after every completed authenticated frame.
+    /// Never serialized on the wire.
+    pub(crate) ended: bool,
     pub(crate) frame: veil_bufpool::PooledShared,
     pub(crate) parent: ParallelParentHandle,
     pub(crate) handle: ReliableFrameHandle,
@@ -63,18 +66,32 @@ pub(in crate::runner) fn spawn(
                 frame = handle.recv() => match frame { Ok(frame) => frame, Err(_) => break },
             };
             let event = Received {
+                ended: false,
                 frame,
                 parent: parent.clone(),
                 handle: handle.clone(),
                 received_at: tokio::time::Instant::now(),
             };
-            if tokio::select! {
+            if !tokio::select! {
                 biased;
                 _ = parent.retired() => false,
                 result = outgoing.send(event) => result.is_ok(),
-            } == false
-            {
+            } {
                 break;
+            }
+        }
+        if parent.is_active() {
+            let event = Received {
+                ended: true,
+                frame: veil_bufpool::pooled_shared_from_vec(Vec::new()),
+                parent: parent.clone(),
+                handle: handle.clone(),
+                received_at: tokio::time::Instant::now(),
+            };
+            tokio::select! {
+                biased;
+                _ = parent.retired() => {},
+                _ = outgoing.send(event) => {},
             }
         }
         handle.close();
@@ -178,6 +195,8 @@ mod tests {
                 assert!(event.parent.is_active());
                 assert_eq!(&event.frame[veil_proto::header::HEADER_SIZE..], &[n]);
             }
+            let ended = recv.recv().await.unwrap();
+            assert!(ended.ended && ended.frame.is_empty() && ended.parent.is_active());
             task.await.unwrap();
             assert!(weak.upgrade().is_none());
             assert!(recv.recv().await.is_none());

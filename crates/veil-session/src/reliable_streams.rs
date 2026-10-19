@@ -108,7 +108,21 @@ fn window_stream(h: &FrameHeader, b: &[u8]) -> Option<u32> {
     Some(payload.stream_id)
 }
 
+pub(super) fn stream_record(frame: &[u8]) -> bool {
+    crate::reliable_frames::valid_plain(frame)
+        && (scope(frame).is_some()
+            || decode_header(frame)
+                .is_ok_and(|h| window_stream(&h, &frame[HEADER_SIZE..]).is_some()))
+}
+
 impl ReliableStreams {
+    pub(super) fn unpinned_open(&self, frame: &[u8]) -> bool {
+        self.enabled
+            && self.pins.len() < MAX_PINS
+            && scope(frame).is_some_and(|(h, _)| {
+                h.msg_type == AppMsg::AppOpen as u16 && !self.pins.contains_key(&h.stream_id)
+            })
+    }
     pub(super) fn new(
         enabled: bool,
         sink: Arc<dyn crate::dispatcher_sink::DispatcherSink>,
@@ -308,11 +322,15 @@ impl ReliableStreams {
         }
     }
     pub(super) fn reconcile(&mut self, ready: Option<[u8; 32]>) {
+        self.reconcile_with(|child| Some(child) == ready);
+    }
+
+    pub(super) fn reconcile_with(&mut self, ready: impl Fn([u8; 32]) -> bool) {
         let retired: Vec<_> = self
             .pins
             .values()
             .filter_map(|pin| match pin.route {
-                Route::Child(child) if Some(child) != ready => Some(child),
+                Route::Child(child) if !ready(child) => Some(child),
                 _ => None,
             })
             .collect();

@@ -278,6 +278,9 @@ impl ParallelChannels {
     fn has_auxiliary(&self) -> bool {
         matches!(self, Self::Quic(s) if s.has_auxiliary())
     }
+    fn has_auxiliary_app_streams(&self) -> bool {
+        matches!(self, Self::Quic(s) if s.has_auxiliary_app_streams())
+    }
     fn auxiliary_sender(
         &mut self,
         priority: u8,
@@ -540,6 +543,8 @@ impl RealtimeDatagramLane {
     }
 }
 
+#[path = "auxiliary_app_streams.rs"]
+mod auxiliary_app_streams;
 #[path = "auxiliary_records.rs"]
 pub(super) mod auxiliary_records;
 #[path = "parallel_lanes.rs"]
@@ -4400,6 +4405,7 @@ impl SessionRunner {
                 .is_some_and(ParallelChannels::reliable_direct_app),
         );
         let mut reliable_replies = reliable_streams::Replies::new();
+        let mut auxiliary_apps = auxiliary_app_streams::AuxiliaryAppStreams::default();
 
         // Publish this runner's generic readiness and separately its negotiated
         // neutral Forward support. QUIC alone cannot carry a newer neutral
@@ -5660,7 +5666,32 @@ impl SessionRunner {
                         stats.rtt_us, stats.udp_socket_sent_bytes,
                     ));
                 }
-                reliable_streams.reconcile(reliable_id);
+                for id in auxiliary_apps.retired() {
+                    reliable_streams.fail_child(id);
+                }
+                let (replies, pending) =
+                    auxiliary_apps.flush(|bytes| self.dispatcher.allow_outbound_bandwidth(bytes));
+                for (frame, bytes) in replies {
+                    crate::frame_diag::note_chunk_frame_at(
+                        "transport_selected",
+                        Some(&self.local_node_id),
+                        &frame,
+                    );
+                    self.dispatcher.capture_outbound(self.peer_id, &frame);
+                    if let Some(metrics) = &self.metrics {
+                        metrics.add_transport_bytes_tx(bytes as u64);
+                    }
+                    rekey.record_bytes(bytes as u64);
+                    mlkem_rekey.record_bytes(bytes as u64);
+                }
+                if pending {
+                    let retry = now + std::time::Duration::from_millis(10);
+                    source_pressure_retry =
+                        Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
+                }
+                reliable_streams.reconcile_with(|id| {
+                    Some(id) == reliable_id || auxiliary_apps.handle(id).is_some()
+                });
                 reliable_replies.reconcile(reliable_id);
                 match self.flush_reliable_replies(
                     reliable_ready.as_deref(),
@@ -5731,11 +5762,28 @@ impl SessionRunner {
                             }
                             return HeadAdmission::FlushBatch;
                         }
+                        let source_stream = owned_reliable && reliable_streams.unpinned_open(frame)
+                            && realtime_lane.as_ref().and_then(|lane| lane.parallel.as_ref())
+                                .is_some_and(ParallelChannels::has_auxiliary_app_streams);
                         let auxiliary = if (owned_reliable || priority == crate::LOCAL_NETWORK_CONTROL_LANE)
                             && auxiliary_records::eligible(frame)
                             && realtime_lane.as_ref().and_then(|lane|lane.parallel.as_ref()).is_some_and(ParallelChannels::has_auxiliary)
                         { Some(if priority == crate::LOCAL_NETWORK_CONTROL_LANE { crate::LOCAL_SIGNALING_LANE } else { veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE }) } else { None };
-                        let route = if auxiliary.is_some() { Route::Canonical } else { reliable_streams.route_with_local_class(frame, reliable_id, priority) };
+                        let stream_child = if source_stream {
+                            let handle = realtime_lane.as_mut().and_then(|lane|lane.parallel.as_mut())
+                                .and_then(|parallel| parallel.auxiliary_sender(veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE, &source_activity));
+                            match handle.and_then(|handle| auxiliary_apps.attach(handle).ok()) {
+                                Some(id) => Some(id),
+                                None => {
+                                    let retry = now + std::time::Duration::from_millis(10);
+                                    source_pressure_retry = Some(source_pressure_retry.map_or(retry, |old|old.min(retry)));
+                                    return HeadAdmission::DeferSource;
+                                }
+                            }
+                        } else { None };
+                        let route = if let Some(id) = stream_child { Route::Child(id) }
+                            else if auxiliary.is_some() { Route::Canonical }
+                            else { reliable_streams.route_with_local_class(frame, reliable_id, priority) };
                         let reservation = if let Some(source) = auxiliary {
                             let handle = realtime_lane.as_mut().and_then(|lane|lane.parallel.as_mut()).and_then(|parallel|parallel.auxiliary_sender(source, &source_activity));
                             let reserve = handle.as_ref().map(|handle|handle.try_reserve(frame));
@@ -5750,15 +5798,21 @@ impl SessionRunner {
                         } else { match route {
                             Route::Failed => { selected_route = route; return HeadAdmission::Allow; },
                             Route::Child(id) => {
-                                let Some(ready) = reliable_ready.as_ref().filter(|ready| ready.id() == id) else {
+                                let Some(handle) = auxiliary_apps.handle(id).or_else(|| reliable_ready.as_ref().filter(|ready| ready.id() == id).map(|ready|ready.handle())) else {
                                     failed_child = Some(id); selected_route = Route::Failed; return HeadAdmission::Allow;
                                 };
-                                match ready.handle().try_reserve(frame) {
+                                match handle.try_reserve(frame) {
                                     Ok(reservation) => Some(reservation),
                                     Err(FrameReservationError::Full) => {
                                         let retry = now + std::time::Duration::from_millis(10);
                                         source_pressure_retry = Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
                                         return HeadAdmission::DeferSource;
+                                    },
+                                    Err(FrameReservationError::Closed) if auxiliary_apps.handle(id).is_some() => {
+                                        // Retire this stream only after the reader's End marker;
+                                        // completed RX records may still be ahead of it in FIFO.
+                                        selected_route = Route::Failed;
+                                        return HeadAdmission::Allow;
                                     },
                                     Err(_) => { failed_child = Some(id); selected_route = Route::Failed; return HeadAdmission::Allow; },
                                 }
@@ -5896,6 +5950,7 @@ impl SessionRunner {
                     if selected_route == reliable_streams::Route::Failed {
                         if let Some(child) = failed_child.take() {
                             reliable_streams.fail_child(child);
+                            auxiliary_apps.close(child);
                             if let Some(ready) = reliable_ready.as_ref().filter(|ready| ready.id() == child) { ready.handle().close(); }
                         }
                         continue;
@@ -5904,10 +5959,15 @@ impl SessionRunner {
                         let plain = envelope.frame.1.clone();
                         reliable_streams.admitted(&plain, selected_route);
                         let bytes = plain.len() + veil_crypto::session_cipher::AEAD_OVERHEAD + 2;
-                        if !self.dispatcher.allow_outbound_bandwidth(bytes) || reservation.commit(envelope).is_err() {
-                            if let reliable_streams::Route::Child(child) = selected_route {
+                        let admitted = self.dispatcher.allow_outbound_bandwidth(bytes)
+                            .then(|| reservation.commit(envelope));
+                        let preserve_rx = matches!(admitted.as_ref(), Some(Err(crate::reliable_frames::FrameAdmissionError::Closed(_))))
+                            && matches!(selected_route, reliable_streams::Route::Child(id) if auxiliary_apps.handle(id).is_some());
+                        if !matches!(admitted, Some(Ok(_))) {
+                            if !preserve_rx && let reliable_streams::Route::Child(child) = selected_route {
                                 reliable_streams.fail_child(child);
-                                if let Some(ready) = &reliable_ready { ready.handle().close(); }
+                                auxiliary_apps.close(child);
+                                if let Some(ready) = reliable_ready.as_ref().filter(|ready|ready.id()==child) { ready.handle().close(); }
                             }
                             continue;
                         }
@@ -6226,6 +6286,31 @@ impl SessionRunner {
                 {
                     NextInput::Auxiliary(event) => {
                         if !event.parent.is_active() { continue; }
+                        if event.ended {
+                            let id = event.handle.id();
+                            auxiliary_apps.close(id);
+                            reliable_streams.fail_child(id);
+                            continue;
+                        }
+                        if reliable_streams::stream_record(&event.frame)
+                            && realtime_lane.as_ref().and_then(|lane|lane.parallel.as_ref())
+                                .is_some_and(ParallelChannels::has_auxiliary_app_streams)
+                        {
+                            let id = match auxiliary_apps.attach_received(event.handle.clone()) {
+                                Ok(id) => id,
+                                Err(reason) => { self.record_violation(reason); event.handle.close(); continue; }
+                            };
+                            let bytes = event.frame.len() + veil_crypto::session_cipher::AEAD_OVERHEAD + 2;
+                            rekey.record_bytes(bytes as u64); mlkem_rekey.record_bytes(bytes as u64);
+                            if self.dispatch_reliable_frame(id, &event.frame,
+                                auxiliary_apps.replies(id).expect("attached channel"),
+                                &mut reliable_streams, &mut timers)
+                            {
+                                auxiliary_apps.close(id);
+                                reliable_streams.fail_child(id);
+                            }
+                            continue;
+                        }
                         let valid = auxiliary_records::eligible(&event.frame)
                             && decode_header(&event.frame).is_ok_and(|h| h.body_len.saturating_add(veil_crypto::session_cipher::AEAD_OVERHEAD as u32) <= self.max_frame_body);
                         if !valid { self.record_violation("invalid auxiliary record"); event.handle.close(); continue; }
@@ -6258,7 +6343,7 @@ impl SessionRunner {
                     NextInput::Reliable(event) => {
                         match event {
                             reliable_session::ReliableEvent::Changed => {},
-                            reliable_session::ReliableEvent::Stopped => reliable_streams.reconcile(None),
+                            reliable_session::ReliableEvent::Stopped => reliable_streams.reconcile_with(|id| auxiliary_apps.handle(id).is_some()),
                             reliable_session::ReliableEvent::Frame { child, result } => {
                                 let ready = realtime_lane.as_ref().and_then(|lane| lane.parallel.as_ref()).and_then(ParallelChannels::reliable).and_then(|pool| pool.ready());
                                 let failed = match result {

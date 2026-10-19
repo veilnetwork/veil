@@ -398,10 +398,10 @@ impl LocalSendBudget for Binding {
             .min()
     }
     fn register_waker(&self, waker: &Waker) {
-        if let Some(row) = lock!(self.pool.0).rows.get_mut(&self.id) {
-            if row.waker.as_ref().is_none_or(|old| !old.will_wake(waker)) {
-                row.waker = Some(waker.clone());
-            }
+        if let Some(row) = lock!(self.pool.0).rows.get_mut(&self.id)
+            && row.waker.as_ref().is_none_or(|old| !old.will_wake(waker))
+        {
+            row.waker = Some(waker.clone());
         }
     }
     fn closed(&self) {

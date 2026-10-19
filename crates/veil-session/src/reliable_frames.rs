@@ -58,6 +58,7 @@ struct Pending {
 }
 
 struct Inner {
+    id: [u8; 32],
     transport: BoundReliableHandle,
     queue: mpsc::Sender<Pending>,
     bytes: Arc<Semaphore>,
@@ -159,7 +160,13 @@ impl ReliableFrameHandle {
         self.0.mark_failed(io::ErrorKind::ConnectionAborted);
     }
     pub(crate) fn failed(&self) -> bool {
-        self.0.bytes.is_closed()
+        self.0.bytes.is_closed() || !self.0.transport.parent_active()
+    }
+    pub(crate) fn id(&self) -> [u8; 32] {
+        self.0.id
+    }
+    pub(crate) fn parent_active(&self) -> bool {
+        self.0.transport.parent_active()
     }
     pub fn try_send(&self, envelope: FrameEnvelope) -> Result<FrameReceipt, FrameAdmissionError> {
         let reservation = match self.try_reserve(&envelope.frame.1) {
@@ -287,6 +294,7 @@ impl ReliableFrameChannel {
         let rx = SessionCipher::new(owner.keys().rx_key(), true);
         let (queue, incoming) = mpsc::channel(QUEUE_DEPTH);
         let inner = Arc::new(Inner {
+            id: owner.keys().session_id,
             transport: owner.handle(),
             queue,
             rx: Mutex::new(rx),

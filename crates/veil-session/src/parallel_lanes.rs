@@ -137,6 +137,7 @@ pub struct ParallelQuicOffer {
     reliable_delivery: bool,
     reliable_direct_app: bool,
     auxiliary_records: bool,
+    auxiliary_app_streams: bool,
     record_events: Option<mpsc::Sender<super::auxiliary_records::Received>>,
 }
 
@@ -151,6 +152,7 @@ impl ParallelQuicOffer {
             reliable_delivery: false,
             reliable_direct_app: false,
             auxiliary_records: false,
+            auxiliary_app_streams: false,
             record_events: None,
         }
     }
@@ -180,6 +182,11 @@ impl ParallelQuicOffer {
     /// Extra stateless record codec; enabled only by explicit parent negotiation.
     pub fn with_auxiliary_records(mut self) -> Self {
         self.auxiliary_records = true;
+        self
+    }
+
+    pub fn with_auxiliary_app_streams(mut self) -> Self {
+        self.auxiliary_app_streams = true;
         self
     }
 
@@ -726,6 +733,10 @@ impl ParallelSession {
 
     pub(super) fn has_auxiliary(&self) -> bool {
         self.offer.auxiliary_records
+    }
+
+    pub(super) fn has_auxiliary_app_streams(&self) -> bool {
+        self.offer.auxiliary_records && self.offer.reliable && self.offer.auxiliary_app_streams
     }
     pub(super) async fn next_auxiliary(&self) -> super::auxiliary_records::Received {
         if !self.offer.auxiliary_records {
