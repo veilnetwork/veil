@@ -32,7 +32,8 @@ with tempfile.TemporaryDirectory(prefix='veil-playout-recovery-', dir=os.environ
                       'AudioUnit', 'CoreServices', 'IOKit', 'SystemConfiguration',
                       'Security', 'CoreMedia', 'CoreVideo', 'AVFoundation']:
         link += ['-framework', framework]
-    for case in ['playout_recovery_smoke.cc', 'audio_rtp_lag_smoke.cc']:
+    for case in ['playout_recovery_smoke.cc', 'audio_rtp_lag_smoke.cc',
+                 'conversation_neteq_controller_smoke.cc']:
         test_command = [str(root / 'test' / case)
                         if token == str(root / 'test/playout_recovery_smoke.cc')
                         else token for token in command]

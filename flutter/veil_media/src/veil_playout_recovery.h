@@ -14,6 +14,7 @@
 #include "veil_playout_trace.h"
 #include "veil_audio_recovery.h"
 #include "veil_audio_rtp_lag.h"
+#include "veil_conversation_neteq_controller.h"
 
 namespace veil_media {
 struct PlayoutRecoveryStats {
@@ -257,11 +258,10 @@ class ArrivalClockControllerFactory final : public webrtc::NetEqControllerFactor
       const webrtc::NetEqController::Config& config) const override {
     auto timed_config = config;
     timed_config.tick_timer = clock_;
-    return base_.Create(env, timed_config);
+    return MakeConversationNetEqController(env, timed_config);
   }
  private:
   webrtc::TickTimer* clock_;
-  webrtc::DefaultNetEqControllerFactory base_;
 };
 class RecoveringNetEqFactory final : public webrtc::NetEqFactory {
  public:
