@@ -1,6 +1,30 @@
 //! Connection statistics
 
-use crate::{frame::Frame, Dir, Duration};
+use crate::{Dir, Duration, Instant, frame::Frame};
+
+/// Confirmed congestion-counted Data-space packet delivery on one route epoch.
+/// Only explicit wire ACKs contribute, once per retained sent packet. This
+/// excludes inferred handshake ACKs, ACK-only packets and late old-route ACKs.
+/// Sizes include QUIC framing/padding but exclude UDP/IP. Packets already
+/// retired as lost cannot contribute: this is observed progress, not capacity.
+#[derive(Debug, Default, Copy, Clone)]
+#[non_exhaustive]
+pub struct ConfirmedDeliveryStats {
+    /// Changes on remote migration, local rebinding and validation rollback.
+    pub epoch: u64,
+    /// A new route is still being validated; not a capacity observation.
+    pub validation_pending: bool,
+    /// Newly confirmed eligible packet bytes in this epoch.
+    pub bytes: u64,
+    /// Newly confirmed eligible packets in this epoch.
+    pub packets: u64,
+    /// Earliest original send time among the observed confirmations.
+    pub first_sent: Option<Instant>,
+    /// Latest original send time, not the arrival time of a compressed ACK.
+    pub last_sent: Option<Instant>,
+    /// Time the latest contributing wire ACK was processed.
+    pub last_ack: Option<Instant>,
+}
 
 /// Statistics about UDP datagrams transmitted or received on a connection
 ///
@@ -134,6 +158,8 @@ impl std::fmt::Debug for FrameStats {
 #[derive(Debug, Default, Copy, Clone)]
 #[non_exhaustive]
 pub struct PathStats {
+    /// Causal delivery observations, independent of queue/window estimates.
+    pub confirmed_delivery: ConfirmedDeliveryStats,
     /// Current best estimate of this connection's latency (round-trip-time)
     pub rtt: Duration,
     /// Minimum RTT seen on this path, ignoring ack delay

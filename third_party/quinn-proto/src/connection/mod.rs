@@ -75,7 +75,7 @@ use spaces::Retransmits;
 use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
 
 mod stats;
-pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
+pub use stats::{ConfirmedDeliveryStats, ConnectionStats, FrameStats, PathStats, UdpStats};
 
 mod streams;
 #[cfg(fuzzing)]
@@ -243,6 +243,9 @@ pub struct Connection {
     datagrams: DatagramState,
     /// Connection level statistics
     stats: ConnectionStats,
+    /// First Data packet number eligible for this delivery epoch. Local
+    /// rebinding may retain path generation, so generation alone is insufficient.
+    confirmed_delivery_min_packet: u64,
     /// QUIC version used for the connection.
     version: u32,
 }
@@ -405,6 +408,7 @@ impl Connection {
             rem_cids: CidQueue::new(rem_cid),
             rng,
             stats: ConnectionStats::default(),
+            confirmed_delivery_min_packet: 0,
             version,
         };
         if path_validated {
@@ -1338,6 +1342,7 @@ impl Connection {
                     debug!("path validation failed");
                     if let Some((_, prev)) = self.prev_path.take() {
                         self.path = prev;
+                        self.reset_confirmed_delivery();
                     }
                     self.path.challenge = None;
                     self.path.challenge_pending = false;
@@ -1412,6 +1417,7 @@ impl Connection {
         ) = self.streams.send_buffer_usage();
         stats.path.pto_count = self.pto_count;
         stats.path.current_mtu = self.path.mtud.current_mtu();
+        stats.path.confirmed_delivery.validation_pending = self.path.challenge.is_some();
 
         stats
     }
@@ -1632,6 +1638,33 @@ impl Connection {
                     self.spaces[space].pending_acks.subtract_below(acked);
                 }
                 ack_eliciting_acked |= info.ack_eliciting;
+
+                // Observe only actual new wire acknowledgments. The shared
+                // on_packet_acked helper also processes inferred handshake ACKs.
+                // Do not fund a new route with delayed confirmations from its
+                // predecessor, including local rebinds with the same generation.
+                if space == SpaceId::Data
+                    && packet >= self.confirmed_delivery_min_packet
+                    && info.path_generation == self.path.generation()
+                    && info.ack_eliciting
+                    && info.size > 0
+                    && info.time_sent <= now
+                {
+                    let delivery = &mut self.stats.path.confirmed_delivery;
+                    delivery.bytes = delivery.bytes.saturating_add(u64::from(info.size));
+                    delivery.packets = delivery.packets.saturating_add(1);
+                    delivery.first_sent = Some(
+                        delivery
+                            .first_sent
+                            .map_or(info.time_sent, |at| at.min(info.time_sent)),
+                    );
+                    delivery.last_sent = Some(
+                        delivery
+                            .last_sent
+                            .map_or(info.time_sent, |at| at.max(info.time_sent)),
+                    );
+                    delivery.last_ack = Some(delivery.last_ack.map_or(now, |at| at.max(now)));
+                }
 
                 // Notify MTU discovery that a packet was acked, because it might be an MTU probe
                 let mtu_updated = self.path.mtud.on_acked(space, packet, info.size);
@@ -3183,6 +3216,7 @@ impl Connection {
 
     fn migrate(&mut self, now: Instant, remote: SocketAddr) {
         trace!(%remote, "migration initiated");
+        self.reset_confirmed_delivery();
         self.path_counter = self.path_counter.wrapping_add(1);
         // Reset rtt/congestion state for new path unless it looks like a NAT rebinding.
         // Note that the congestion window will not grow until validation terminates. Helps mitigate
@@ -3225,8 +3259,17 @@ impl Connection {
 
     /// Handle a change in the local address, i.e. an active migration
     pub fn local_address_changed(&mut self) {
+        self.reset_confirmed_delivery();
         self.update_rem_cid();
         self.ping();
+    }
+
+    fn reset_confirmed_delivery(&mut self) {
+        self.stats.path.confirmed_delivery = ConfirmedDeliveryStats {
+            epoch: self.stats.path.confirmed_delivery.epoch.saturating_add(1),
+            ..ConfirmedDeliveryStats::default()
+        };
+        self.confirmed_delivery_min_packet = self.spaces[SpaceId::Data].next_packet_number;
     }
 
     /// Switch to a previously unused remote connection ID, if possible
