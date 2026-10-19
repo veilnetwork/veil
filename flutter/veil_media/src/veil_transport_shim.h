@@ -42,6 +42,7 @@
 #include "veil_rtcp_send_stats.h"
 #include "veil_audio_redundancy.h"
 #include "veil_audio_recovery_feedback.h"
+#include "veil_audio_concealment_feedback.h"
 #include "veil_video_control_transport.h"
 #include "veil_rtcp_route_clock.h"
 #include "veil_remb_cadence.h"
@@ -187,6 +188,11 @@ class VeilTransportShim : public webrtc::Transport {
   int64_t peer_audio_recovery_report_us(int64_t now_us) const;
   bool peer_audio_recovery_supported() const;
   AudioRecoveryCursor peer_audio_recovery_snapshot() const;
+  void SetLocalAudioConcealment(uint32_t remote_audio_ssrc, uint64_t sequence,
+                               uint64_t origin, uint64_t concealed_samples,
+                               uint64_t silent_concealed_samples,
+                               int64_t sampled_us);
+  int64_t peer_audio_concealment_report_us(int64_t now_us) const;
 
   // Enable only when both endpoints have independent audio/video counters.
   // Older engines used one sequence space and cannot consume split feedback.
@@ -351,6 +357,9 @@ class VeilTransportShim : public webrtc::Transport {
   };
   LocalAudioRecovery local_audio_recovery_;
   AudioRecoveryCursor peer_audio_recovery_;
+  LocalAudioConcealment local_audio_concealment_;
+  AudioConcealmentCursor peer_audio_concealment_;
+  int64_t concealment_sent_us_ = 0;
   std::atomic<bool> independent_transport_feedback_{false};
   std::atomic<bool> started_{false};
   InboundPacketQueue inbound_queue_;

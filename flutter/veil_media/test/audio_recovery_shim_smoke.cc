@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
+#include <thread>
 #include <vector>
 
 #include "modules/rtp_rtcp/source/rtcp_packet/receiver_report.h"
@@ -8,8 +10,10 @@
 #include "veil_transport_shim.h"
 
 static std::vector<uint8_t> sent;
+static unsigned sends = 0;
 extern "C" int veil_media_send_datagram(uint64_t, const uint8_t* p, size_t n) {
   sent.assign(p, p + n);
+  ++sends;
   return 0;
 }
 extern "C" int veil_media_send_video_control_datagram(uint64_t,
@@ -106,6 +110,49 @@ int main() {
           "legacy report enabled decoded-loss feedback");
   receiver.SendVideoRtcp(original, {});
   require(sent == original, "recovery was appended to video RTCP");
+  // Concealment has its own APP and witness; it never changes VAP2 counters.
+  const auto before_baseline = sends;
+  receiver.SetLocalAudioConcealment(11, 1, 9, 1000, 100, webrtc::TimeMicros());
+  require(sends == before_baseline, "historical concealment sent an impulse");
+  std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  receiver.SetLocalAudioConcealment(11, 2, 9, 1480, 100, webrtc::TimeMicros());
+  require(sends == before_baseline + 1, "fresh concealment waited for periodic RTCP");
+  const auto concealed = sent;
+  require(concealed.size() == 8 + 28 + 48 + 48,
+          "supplemental concealment compound framing changed");
+  AudioRecoveryFeedbackTest::Observe(sender, concealed, now + 5000);
+  require(sender.peer_audio_concealment_report_us(now + 5000) == now + 5000 &&
+              sender.peer_audio_recovery_snapshot().Sample().discarded_ms == 40,
+          "concealment was lost or mislabeled as discarded speech");
+  AudioRecoveryFeedbackTest::Observe(sender, concealed, now + 6000);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  receiver.SetLocalAudioConcealment(11, 3, 9, 1960, 100, webrtc::TimeMicros());
+  require(sends == before_baseline + 1, "supplemental reports are not rate bounded");
+  receiver.SendRtcp(original, {});
+  const auto next_concealed = sent;
+  AudioRecoveryFeedbackTest::Observe(sender, next_concealed, now + 7000);
+  require(sender.peer_audio_concealment_report_us(now + 7000) == now + 7000,
+          "rate-limited event was absent from regular RTCP");
+  receiver.SendRtcp(original, {});
+  AudioRecoveryFeedbackTest::Observe(sender, sent, now + 8000);
+  require(sender.peer_audio_concealment_report_us(now + 8000) == now + 7000,
+          "cached concealment renewed its witness");
+  for (bool duplicate : {false, true}) {
+    VeilTransportShim clean(4, nullptr, nullptr, nullptr, nullptr);
+    clean.SetLocalAudioSsrc(11);
+    clean.Start();
+    auto bad = next_concealed;
+    if (duplicate) bad.insert(bad.end(), next_concealed.end() - 48, next_concealed.end());
+    else bad[bad.size() - 1] = 2;  // invalid VAP3 flags, after valid VAP1/VAP2
+    AudioRecoveryFeedbackTest::Observe(clean, bad, now + 9000);
+    require(!clean.audio_playout_feedback().supported &&
+                !clean.peer_audio_recovery_supported() &&
+                clean.peer_audio_concealment_report_us(now + 9000) == 0,
+            "malformed/duplicate concealment partially published compound");
+    clean.Stop();
+  }
+  receiver.SendVideoRtcp(original, {});
+  require(sent == original, "concealment was appended to video RTCP");
   receiver.Stop();
   receiver.SendRtcp(original, {});
   require(sent == original, "stopped source appended recovery");

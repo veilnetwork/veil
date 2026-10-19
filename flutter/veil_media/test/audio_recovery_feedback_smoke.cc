@@ -4,6 +4,7 @@
 
 #include "modules/rtp_rtcp/source/rtcp_packet/common_header.h"
 #include "veil_audio_recovery_feedback.h"
+#include "veil_audio_concealment_feedback.h"
 static void require(bool ok, const char* message) {
   if (!ok) {
     std::fprintf(stderr, "%s\n", message);
@@ -94,6 +95,65 @@ int main() {
   auto decoded = DecodeAudioRecovery(
       {header.payload(), header.payload_size_bytes()}, header.count());
   require(decoded && !decoded->known, "stale sampling claimed healthy source");
+  LocalAudioConcealment local;
+  AudioConcealmentCursor concealment;
+  auto observe = [&](int64_t at) {
+    const auto wire = EncodeAudioConcealment(7, local.Report(at));
+    require(header.Parse(wire.data(), wire.size()), "VAP3 RTCP framing");
+    const auto r = DecodeAudioConcealment(
+        {header.payload(), header.payload_size_bytes()}, header.count());
+    require(r.has_value(), "VAP3 roundtrip");
+    const auto before_foreign = concealment.FreshReportUs(at);
+    concealment.Observe(*r, 22, at);
+    require(concealment.FreshReportUs(at) == before_foreign, "foreign concealment SSRC");
+    concealment.Observe(*r, 11, at);
+    return *r;
+  };
+  require(!local.Observe(11, 1, 3, 1000, 100, 1'000'000), "startup event");
+  auto r = observe(1'100'000);
+  require(concealment.FreshReportUs(1'100'000) == 0 && r.concealed_samples == 900,
+          "historical concealment became fresh");
+  require(!local.Observe(11, 2, 3, 1480, 580, 2'000'000), "silent concealment event");
+  observe(2'100'000);
+  require(concealment.FreshReportUs(2'100'000) == 0, "DTX yielded false pressure");
+  require(local.Observe(11, 3, 3, 1960, 580, 3'000'000), "speech event missed");
+  r = observe(3'100'000);
+  require(r.age_ms == 100 && concealment.FreshReportUs(3'100'000) == 3'100'000,
+          "fresh concealment missing");
+  concealment.Observe(r, 11, 3'200'000);
+  require(!local.Observe(11, 3, 3, 2440, 580, 3'300'000), "cached sequence event");
+  require(!local.Observe(11, 4, 3, 2440, 580, 2'900'000), "clock rollback event");
+  require(!local.Observe(11, 4, 3, 1960, 580, 4'000'000), "cached count event");
+  observe(4'100'000);
+  require(concealment.FreshReportUs(4'100'000) == 3'100'000,
+          "cached concealment renewed event");
+  require(!local.Observe(11, 5, 0, 0, 0, 5'000'000), "unknown produced event");
+  observe(5'100'000);
+  require(!local.Observe(11, 6, 2, 99999, 0, 5'200'000), "retired decoder event");
+  require(!local.Observe(11, 6, 3, 2440, 580, 6'000'000), "resume replayed gap");
+  observe(6'100'000);
+  require(!local.Observe(11, 7, 3, 2920, 580, 10'000'000), "sampling gap event");
+  observe(10'100'000);
+  require(!local.Observe(11, 8, 3, 100, 0, 11'000'000), "counter rollback event");
+  require(!local.Observe(11, 1, 4, 9999, 0, 12'000'000), "new decoder history event");
+  observe(12'100'000);
+  require(local.Observe(11, 2, 4, 10479, 0, 13'000'000), "new decoder event missed");
+  const auto stale = local.Report(17'000'000);
+  require(!stale.known && stale.age_ms == kUnknownRecoveryAge,
+          "stale native sample remained known");
+  observe(13'100'000);
+  auto old = r;
+  old.sequence = 999;
+  old.concealed_samples = 99999;
+  concealment.Observe(old, 11, 14'000'000);
+  require(concealment.FreshReportUs(14'000'000) == 13'100'000 &&
+              concealment.FreshReportUs(29'000'000) == 0,
+          "retired decoder/expiry refreshed concealment");
+  auto malformed_concealment = EncodeAudioConcealment(7, r);
+  malformed_concealment[47] = 2;
+  require(!DecodeAudioConcealment({malformed_concealment.data() + 4, 44}, 0) &&
+              !DecodeAudioConcealment({malformed_concealment.data() + 4, 43}, 0),
+          "malformed concealment accepted");
   std::puts(
       "ok real RTCP recovery framing, SSRC binding, replay, freshness, "
       "retirement and expiry");

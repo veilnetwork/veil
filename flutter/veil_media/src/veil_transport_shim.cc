@@ -359,12 +359,15 @@ bool VeilTransportShim::SendRtcpOnSource(std::span<const uint8_t> packet,
   std::vector<uint8_t> compound;
   LocalAudioPlayout sample;
   LocalAudioRecovery recovery;
+  std::optional<AudioConcealmentReport> concealment;
   if (!video) {
     std::lock_guard lock(audio_feedback_mu_);
     sample = local_audio_playout_;
     recovery = local_audio_recovery_;
+    if (local_audio_concealment_.enabled())
+      concealment = local_audio_concealment_.Report(sent_us);
   }
-  bool append = !video && (sample.enabled || recovery.enabled) &&
+  bool append = !video && (sample.enabled || recovery.enabled || concealment) &&
                 started_.load(std::memory_order_acquire);
   // Keep RTCP's original report/SDES framing and do not append after BYE or
   // padding. Old endpoints can ignore the optional APP name (RFC 3550 §6.7).
@@ -404,6 +407,11 @@ bool VeilTransportShim::SendRtcpOnSource(std::span<const uint8_t> packet,
           local_audio_ssrc_.load(std::memory_order_relaxed),
           recovery.remote_ssrc, recovery.sequence, recovery.sample,
           recovery.sampled_us, webrtc::TimeMicros());
+      compound.insert(compound.end(), app.begin(), app.end());
+    }
+    if (concealment) {
+      const auto app = EncodeAudioConcealment(
+          local_audio_ssrc_.load(std::memory_order_relaxed), *concealment);
       compound.insert(compound.end(), app.begin(), app.end());
     }
     packet = std::span<const uint8_t>(compound);
@@ -536,6 +544,37 @@ AudioRecoveryCursor VeilTransportShim::peer_audio_recovery_snapshot() const {
   return peer_audio_recovery_;
 }
 
+void VeilTransportShim::SetLocalAudioConcealment(
+    uint32_t remote_audio_ssrc, uint64_t sequence, uint64_t origin,
+    uint64_t concealed_samples, uint64_t silent_concealed_samples,
+    int64_t sampled_us) {
+  const auto now_us = webrtc::TimeMicros();
+  bool notify = false;
+  {
+    std::lock_guard lock(audio_feedback_mu_);
+    const bool event = local_audio_concealment_.Observe(
+        remote_audio_ssrc, sequence, origin, concealed_samples,
+        silent_concealed_samples, sampled_us);
+    // Normal RTCP can be several seconds apart. A fresh event gets a bounded
+    // supplemental empty RR + APP compound instead of waiting for that timer.
+    // It contains no invented loss/RTT/report block and uses the same encrypted
+    // endpoint channel. Regular reports also carry the latest cursor.
+    notify = event && started_.load(std::memory_order_acquire) &&
+        sampled_us <= now_us && now_us - sampled_us <= 3'000'000 &&
+        (concealment_sent_us_ == 0 || now_us - concealment_sent_us_ >= 1'000'000);
+    if (notify) concealment_sent_us_ = now_us;
+  }
+  if (notify) {
+    std::array<uint8_t, 8> rr{0x80, 201, 0, 1, 0, 0, 0, 0};
+    write_be32(rr.data() + 4, local_audio_ssrc_.load(std::memory_order_relaxed));
+    SendRtcp(rr, {});
+  }
+}
+int64_t VeilTransportShim::peer_audio_concealment_report_us(int64_t now_us) const {
+  std::lock_guard lock(audio_feedback_mu_);
+  return peer_audio_concealment_.FreshReportUs(now_us);
+}
+
 void VeilTransportShim::SetLocalAudioPlayout(uint32_t remote_audio_ssrc,
                                             uint64_t sequence, int delay_ms,
                                             int64_t sampled_us) {
@@ -553,6 +592,7 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
   RtcpFeedbackSnapshot candidate, video_candidate;
   AudioPlayoutSnapshot playout;
   std::optional<AudioRecoveryReport> recovery;
+  std::optional<AudioConcealmentReport> concealment;
   const auto observe = [&](const auto& blocks) {
     for (const auto& block : blocks) {
       const bool audio = local != 0 && block.source_ssrc() == local;
@@ -589,6 +629,12 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
       if (!report.Parse(header)) return;
       observe(report.report_blocks());
     } else if (header.type() == 204 && header.payload_size_bytes() >= 8 &&
+               read_be32(header.payload() + 4) == kAudioConcealmentAppName) {
+      if (concealment) return;
+      concealment = DecodeAudioConcealment(
+          {header.payload(), header.payload_size_bytes()}, header.count());
+      if (!concealment) return;
+    } else if (header.type() == 204 && header.payload_size_bytes() >= 8 &&
                read_be32(header.payload() + 4) == kAudioRecoveryAppName) {
       if (recovery)
         return;  // ambiguous compound reports cannot partially apply
@@ -614,9 +660,10 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
     offset += header.packet_size();
   }
   if (candidate.arrived_us > 0 || video_candidate.arrived_us > 0 ||
-      playout.supported || recovery) {
+      playout.supported || recovery || concealment) {
     std::lock_guard lock(audio_feedback_mu_);
     if (recovery) peer_audio_recovery_.Observe(*recovery, local, arrived_us);
+    if (concealment) peer_audio_concealment_.Observe(*concealment, local, arrived_us);
     if (candidate.arrived_us > 0 && candidate.arrived_us >= audio_feedback_.arrived_us) {
       candidate.route_epoch = rtcp_route_clock_.epoch();
       if (!rtcp_route_clock_.Accepts(candidate.last_sender_report)) candidate.rtt_ms = 0;
