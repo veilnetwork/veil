@@ -212,8 +212,14 @@ impl PacketBuilder {
             stream_frames: sent.stream_frames,
         };
 
-        conn.path
+        let forgotten = conn
+            .path
             .sent(exact_number, packet, &mut conn.spaces[space_id]);
+        conn.local_budget_flight = conn
+            .local_budget_flight
+            .saturating_add(u64::from(size))
+            .saturating_sub(forgotten);
+        conn.sync_local_flight();
         conn.stats.path.sent_packets += 1;
         conn.reset_keep_alive(now);
         if size != 0 {
