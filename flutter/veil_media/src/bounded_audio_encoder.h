@@ -76,9 +76,12 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
   void SetTargetBitrate(int bps) override { OnReceivedTargetAudioBitrate(bps); }
   void OnReceivedUplinkAllocation(webrtc::BitrateAllocationUpdate update) override {
     const int64_t raw_allocation_bps = update.target_bitrate.bps<int64_t>();
-    // Leave endpoint headroom for RTCP and transport control/framing not
-    // represented by a payload-only audio allocation. No relay priority.
-    const int64_t budget = update.target_bitrate.bps<int64_t>() / 4 * 3;
+    // Target 25% headroom by reducing payload, but let minimum speech fund a
+    // shorter packet while preserving at least 20% for transport/RTCP outside
+    // this framing model. Removing that reserve entirely increases queueing.
+    // This adds no BWE budget or relay priority.
+    const int64_t budget = raw_allocation_bps / 4 * 3;
+    const int64_t duration_budget = raw_allocation_bps / 5 * 4;
     const auto range = inner_->GetFrameLengthRange();
     int duration_ms = range ? static_cast<int>(range->second.ms()) : 60;
     // Matches the configured fast FrameLengthControllerV2's strict comparison
@@ -91,14 +94,18 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
                     candidate > range->second.ms())) {
         continue;
       }
-      if (budget - OverheadBps(candidate) > min_payload_bps_) {
+      if (duration_budget - OverheadBps(candidate) > min_payload_bps_) {
         duration_ms = candidate;
         break;
       }
     }
     const int64_t overhead = OverheadBps(duration_ms);
+    // ANA's shortest-duration comparison is strict. At the minimum payload,
+    // one bit/s distinguishes a funded short packet from an unfunded one.
+    const int maximum_ms = range ? static_cast<int>(range->second.ms()) : 60;
+    const int64_t minimum = overhead + min_payload_bps_ + (duration_ms < maximum_ms);
     update.target_bitrate = webrtc::DataRate::BitsPerSec(std::clamp<int64_t>(
-        budget, overhead + min_payload_bps_,
+        budget, minimum,
         overhead + kMaxPayloadBps));
     if (timing_.enabled())
       timing_.Allocation(webrtc::TimeMicros(), raw_allocation_bps,
