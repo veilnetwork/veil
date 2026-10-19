@@ -412,6 +412,9 @@ pub mod cap_extra_flags2 {
     /// Domain-separated stateless records on the proof stream of a generic
     /// QUIC child. No purpose, source role or scheduling preference is sent.
     pub const SUPPORTS_AUXILIARY_RECORDS: u8 = 1 << 2;
+    /// Whole App streams pinned to a generic auxiliary record channel. This
+    /// extends the stateless codec and must be negotiated independently.
+    pub const SUPPORTS_AUXILIARY_APP_STREAMS: u8 = 1 << 3;
 }
 
 #[cfg(test)]
@@ -599,6 +602,12 @@ impl CapabilitiesPayload {
     pub fn supports_auxiliary_records(&self) -> bool {
         self.supports_duplex_parallel_quic()
             && self.extra_flags2 & cap_extra_flags2::SUPPORTS_AUXILIARY_RECORDS != 0
+    }
+
+    pub fn supports_auxiliary_app_streams(&self) -> bool {
+        self.supports_auxiliary_records()
+            && self.supports_reliable_parallel()
+            && self.extra_flags2 & cap_extra_flags2::SUPPORTS_AUXILIARY_APP_STREAMS != 0
     }
 
     // ── Capability helpers ───────────────────────────────────────────────
@@ -2734,6 +2743,32 @@ mod tests {
         );
         caps.extra_flags2 = 0;
         assert!(!caps.supports_auxiliary_records());
+    }
+
+    #[test]
+    fn auxiliary_app_streams_need_their_own_authenticated_codec_permission() {
+        let mut caps = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Core);
+        caps.flags = u8::MAX;
+        caps.extra_flags = u8::MAX;
+        caps.extra_flags2 = cap_extra_flags2::SUPPORTS_AUXILIARY_APP_STREAMS;
+        assert!(!caps.supports_auxiliary_app_streams());
+        caps.extra_flags2 = cap_extra_flags2::SUPPORTS_AUXILIARY_RECORDS;
+        assert!(caps.supports_auxiliary_records());
+        assert!(!caps.supports_auxiliary_app_streams());
+        caps.extra_flags2 |= cap_extra_flags2::SUPPORTS_AUXILIARY_APP_STREAMS;
+        let wire = caps.encode();
+        assert!(
+            CapabilitiesPayload::decode(&wire)
+                .unwrap()
+                .supports_auxiliary_app_streams()
+        );
+        assert!(
+            !CapabilitiesPayload::decode(&wire[..3])
+                .unwrap()
+                .supports_auxiliary_app_streams()
+        );
+        caps.extra_flags &= !cap_extra_flags::SUPPORTS_RELIABLE_PARALLEL;
+        assert!(!caps.supports_auxiliary_app_streams());
     }
 
     #[test]

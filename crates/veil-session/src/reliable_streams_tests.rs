@@ -496,3 +496,44 @@ fn oversized_direct_records_keep_the_legacy_parent_without_retiring_a_healthy_ch
         );
     }
 }
+
+#[test]
+fn auxiliary_app_streams_reconcile_multiple_carriers_without_migration() {
+    let mut streams = state();
+    let open = frame(AppMsg::AppOpen, 700, 1);
+    assert!(streams.unpinned_open(&open));
+    assert!(stream_record(&open));
+    streams.admitted(&open, Route::Child([11; 32]));
+    assert!(!streams.unpinned_open(&open));
+    streams.admitted(&frame(AppMsg::AppOpen, 701, 2), Route::Child([12; 32]));
+    streams.reconcile_with(|id| id == [11; 32] || id == [12; 32]);
+    assert_eq!(
+        streams.route(&frame(AppMsg::AppData, 700, 1), Some([99; 32])),
+        Route::Child([11; 32])
+    );
+    assert_eq!(
+        streams.route(&frame(AppMsg::AppData, 701, 2), Some([99; 32])),
+        Route::Child([12; 32])
+    );
+    streams.reconcile_with(|id| id == [12; 32]);
+    assert_eq!(
+        streams.route(&frame(AppMsg::AppData, 700, 1), Some([99; 32])),
+        Route::Failed
+    );
+    assert_eq!(
+        streams.route(&frame(AppMsg::AppData, 701, 2), Some([99; 32])),
+        Route::Child([12; 32])
+    );
+    assert!(
+        streams
+            .incoming(&frame(AppMsg::AppData, 701, 2), Route::Child([99; 32]))
+            .is_err()
+    );
+    assert!(
+        streams
+            .incoming(&frame(AppMsg::AppData, 702, 2), Route::Child([12; 32]))
+            .is_err()
+    );
+    assert!(!stream_record(&delivery_record(0)));
+    assert!(!stream_record(&frame(AppMsg::AppOpen, 700, 1)[..10]));
+}
