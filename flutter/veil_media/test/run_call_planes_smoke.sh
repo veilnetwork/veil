@@ -13,6 +13,8 @@ clang++ -std=c++20 -Wall -Wextra -Werror -Wl,-export_dynamic \
 if [ "$#" -eq 0 ]; then
   "$STAND_DIR/smoke" --bwe-handover
   "$STAND_DIR/smoke" --rtcp-loss
+  "$STAND_DIR/smoke" --video-loss-persistence
+  bash "$ROOT/test/run_video_loss_persistence_smoke.sh"
   "$STAND_DIR/smoke" --group-rtcp-accounting
   "$STAND_DIR/smoke" --group-remb-cadence
   "$STAND_DIR/smoke" --frame-sizing

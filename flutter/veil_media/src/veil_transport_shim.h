@@ -40,6 +40,7 @@
 #include "veil_inbound_packet_queue.h"
 #include "veil_audio_send_stats.h"
 #include "veil_audio_packet_priority.h"
+#include "veil_video_loss_persistence.h"
 #include "veil_rtcp_send_stats.h"
 #include "veil_audio_redundancy.h"
 #include "veil_audio_recovery_feedback.h"
@@ -65,6 +66,9 @@ struct RtcpFeedbackSnapshot {
   // Local arrival time of the last nonzero fractional-loss report. Healthy
   // reports must not renew it, including reports from another room peer.
   int64_t loss_report_us = 0;
+  int32_t cumulative_lost = 0;
+  uint32_t highest_sequence = 0;
+  int64_t persistent_loss_report_us = 0;
   uint32_t last_sender_report = 0;
   uint64_t route_epoch = 0;
 
@@ -77,6 +81,11 @@ struct RtcpFeedbackSnapshot {
     return loss_report_us > 0 && loss_report_us <= now_us &&
                    now_us - loss_report_us <= 15'000'000
                ? loss_report_us : 0;
+  }
+  int64_t fresh_persistent_loss_report_us(int64_t now_us) const {
+    return persistent_loss_report_us > 0 && persistent_loss_report_us <= now_us &&
+                   now_us - persistent_loss_report_us <= 15'000'000
+               ? persistent_loss_report_us : 0;
   }
 };
 
@@ -180,6 +189,7 @@ class VeilTransportShim : public webrtc::Transport {
   RtcpFeedbackSnapshot audio_feedback() const;
   void SetLocalVideoSsrc(uint32_t ssrc) { local_video_ssrc_.store(ssrc); }
   RtcpFeedbackSnapshot video_feedback() const;
+  void ResetVideoLossEvidence();
   AudioPlayoutSnapshot audio_playout_feedback() const;
   // Group receive-worker samples only. Setting an unknown sample still
   // advertises support; unicast uses its negotiated call-health feedback.
@@ -342,6 +352,7 @@ class VeilTransportShim : public webrtc::Transport {
   RtcpRouteClock rtcp_route_clock_;
   RtcpFeedbackSnapshot audio_feedback_;
   RtcpFeedbackSnapshot video_feedback_;
+  VideoLossPersistence video_loss_persistence_;
   AudioPlayoutSnapshot audio_playout_feedback_;
   struct LocalAudioPlayout {
     bool enabled = false;
