@@ -19,9 +19,15 @@ static int check_framing_budget() {
   if (!rtp.SetExtension<webrtc::TransportSequenceNumber>(0)) return 21;
   // Characterize actual allocation/duration behavior, not a production
   // controller policy. Raising its ceiling alone failed mixed-call quality.
-  for (const auto& profile : std::array<std::array<int, 3>, 4>{{
+  for (const auto& profile : std::array<std::array<int, 3>, 9>{{
            {209, 160000, 20}, {360, 160000, 40},
-           {509, 160000, 60}, {509, 183736, 40}}}) {
+           {509, 160000, 60}, {509, 183736, 40},
+           // The observed allocation funds 24-kbit speech plus 40-ms
+           // framing. A second 25% discount must not force 60-ms packets.
+           {360, 131840, 40}, {360, 96000, 60},
+           {509, 165000, 40},
+           // The short packet must still leave transport/RTCP headroom.
+           {360, 120000, 60}, {209, 120000, 40}}}) {
     const int route_overhead = profile[0];
     webrtc::SimulatedClock clock(0);
     const auto env = webrtc::CreateEnvironment(&clock);
@@ -51,7 +57,9 @@ static int check_framing_budget() {
         const auto info = encoder->Encode(timestamp, pcm, &packet);
         if (encoder->GetTargetBitrate() < 24000 ||
             encoder->GetTargetBitrate() > 32000) return 24;
-        if (block >= 400 && phase != 1 && route_overhead != 209 &&
+        const int64_t maximum_gross = static_cast<int64_t>(overhead) * 8 * 1000 /
+            healthy_duration + 32000;
+        if (block >= 400 && phase != 1 && ceiling / 4 * 3 >= maximum_gross &&
             encoder->GetTargetBitrate() != 32000) return 27;
         if (block >= 400 && info.encoded_bytes > 0) {
           const int actual = opus_packet_get_nb_samples(packet.data(), packet.size(), 48000) / 48;
