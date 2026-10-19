@@ -59,6 +59,22 @@ fn media_is_vp8_rtp(payload: &[u8]) -> bool {
 }
 
 #[cfg(feature = "node-embedded")]
+fn media_is_padding_only(packet: &[u8]) -> bool {
+    if !media_is_vp8_rtp(packet) || packet.len() < 12 || packet[0] & 0x20 == 0 {
+        return false;
+    }
+    let mut header = 12 + usize::from(packet[0] & 15) * 4;
+    if packet[0] & 0x10 != 0 {
+        let Some(extension) = packet.get(header..header + 4) else {
+            return false;
+        };
+        header += 4 + usize::from(u16::from_be_bytes([extension[2], extension[3]])) * 4;
+    }
+    let padding = usize::from(*packet.last().unwrap());
+    padding != 0 && header.checked_add(padding) == Some(packet.len())
+}
+
+#[cfg(feature = "node-embedded")]
 fn media_is_rtcp(mut packet: &[u8]) -> bool {
     if packet.is_empty() {
         return false;
@@ -457,10 +473,10 @@ async fn drain_relay_video_batches_on_plane<F, Fut>(
             RELAY_VIDEO_BATCH_BODY_MAX
         };
         let deadline = tokio::time::Instant::from_std(frame.enqueued_at) + MEDIA_LOCAL_QUEUE_AGE;
-        // RTCP is complete control work on this video/screen source, not an
-        // observation of the producer's video frame cadence. Decide before
-        // sealing; neither the daemon nor a relay inspects media contents.
-        let is_frame = !frame.packets.iter().all(|packet| media_is_rtcp(packet));
+        // Only an original completed frame supplies cadence. Repairs, padding
+        // and RTCP retain the same source/byte limits but cannot retime the
+        // next frame's local pacing. Relays never inspect these distinctions.
+        let is_frame = frame.cadence_sample;
         let packet_count = frame.packets.len();
         let raw_bytes = frame.packets.iter().map(Vec::len).sum();
         let packets = frame
@@ -2009,6 +2025,11 @@ impl MediaIngress {
         if !media_is_vp8_rtp(&payload.payload) {
             return Self::send_packet(&self.tx_hi, payload, false);
         }
+        if media_is_padding_only(&payload.payload) {
+            // Probes have no image-frame boundary. Keep them out of the VP8
+            // assembler and its contention/discard state, just like RTCP.
+            return self.enqueue_video_control(payload);
+        }
         let source = if self.screen_sharing.load(Acquire) {
             match &self.screen {
                 Some(screen) => screen,
@@ -2060,6 +2081,7 @@ impl MediaIngress {
                         let frame = RelayVideoFrame {
                             packets,
                             enqueued_at: deadline.into_std() - MEDIA_LOCAL_QUEUE_AGE,
+                            cadence_sample: assembler.completed_cadence,
                         };
                         match tx.try_send(frame) {
                             Ok(()) => 0,
@@ -2094,11 +2116,12 @@ impl MediaIngress {
         match source {
             MediaVideoIngress::Packets(tx) => Self::send_packet(tx, payload, true),
             MediaVideoIngress::RelayFrames { tx, stats, .. } => {
-                // Control is an independently complete work item. It must not
-                // consume or discard a partially assembled VP8 frame.
+                // RTCP and padding are independently complete work. Neither
+                // may consume or discard a partially assembled VP8 frame.
                 let frame = RelayVideoFrame {
                     enqueued_at: payload.deadline.into_std() - MEDIA_LOCAL_QUEUE_AGE,
                     packets: vec![payload.payload],
+                    cadence_sample: false,
                 };
                 stats.enqueue_frame();
                 match tx.try_send(frame) {
@@ -2137,6 +2160,7 @@ impl MediaIngress {
 struct RelayVideoFrame {
     packets: Vec<Vec<u8>>,
     enqueued_at: std::time::Instant,
+    cadence_sample: bool,
 }
 
 /// Stable C snapshot returned by `veil_media_channel_get_stats`. All fields
@@ -2359,6 +2383,7 @@ struct RelayVideoFrameAssembler {
     timestamp: Option<u32>,
     frame_deadline: Option<tokio::time::Instant>,
     completed_deadline: Option<tokio::time::Instant>,
+    completed_cadence: bool,
     packets: Vec<Vec<u8>>,
     bytes: usize,
 }
@@ -2383,6 +2408,7 @@ impl RelayVideoFrameAssembler {
         deadline: tokio::time::Instant,
     ) -> RelayVideoFramePush {
         self.completed_deadline = None;
+        self.completed_cadence = false;
         if packet.len() < 8 || (packet[0] >> 6) != 2 {
             self.reset();
             return RelayVideoFramePush::Dropped;
@@ -2439,6 +2465,7 @@ impl RelayVideoFrameAssembler {
         self.timestamp = None;
         self.bytes = 0;
         self.completed_deadline = self.frame_deadline.take();
+        self.completed_cadence = true;
         RelayVideoFramePush::Complete(std::mem::take(&mut self.packets))
     }
 
@@ -2451,6 +2478,7 @@ impl RelayVideoFrameAssembler {
         self.timestamp = None;
         self.frame_deadline = None;
         self.completed_deadline = None;
+        self.completed_cadence = false;
         self.packets.clear();
         self.bytes = 0;
     }

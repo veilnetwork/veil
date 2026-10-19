@@ -27,7 +27,10 @@ fn rtp(packet: &[u8]) -> Option<Rtp> {
         }
         payload_bytes = payload_bytes.checked_sub(padding)?;
     }
-    if payload_bytes == 0 {
+    // Padding consumes RTP sequence numbers too. Omitting its witnesses makes
+    // real RR gaps impossible to attribute to the local source scheduler.
+    // Empty, unpadded RTP is still not a valid media/probe witness.
+    if payload_bytes == 0 && packet[0] & 32 == 0 {
         return None;
     }
     Some(Rtp {
@@ -125,7 +128,7 @@ mod tests {
     }
 
     #[test]
-    fn rtcp_padding_and_malformed_headers_do_not_become_rtp_witnesses() {
+    fn rtcp_and_malformed_headers_do_not_become_rtp_witnesses() {
         for end in 0..=12 {
             assert!(rtp(&audio()[..end]).is_none());
         }
@@ -136,7 +139,7 @@ mod tests {
         }
         let mut packet = audio();
         packet[0] = 0xa0;
-        assert!(rtp(&packet).is_none()); // Entire payload is padding.
+        assert_eq!(rtp(&packet).unwrap().payload_bytes, 0);
         packet[13] = 0;
         assert!(rtp(&packet).is_none());
         packet[13] = 3;
@@ -145,6 +148,27 @@ mod tests {
         assert!(rtp(&packet).is_none());
         packet[0] = 0x90; // Missing extension body.
         assert!(rtp(&packet).is_none());
+    }
+
+    #[test]
+    fn padding_only_probe_keeps_identity_without_becoming_image_payload() {
+        let mut packet = audio();
+        packet[0] = 0xa0;
+        packet[1] = 96;
+        packet[13] = 2;
+        assert_eq!(
+            rtp(&packet),
+            Some(Rtp {
+                ssrc: 7,
+                sequence: 65534,
+                timestamp: 4294967292,
+                payload_bytes: 0,
+            })
+        );
+        packet[0] = 0x80;
+        assert!(rtp(&packet[..12]).is_none());
+        packet[0] = 0xa0;
+        assert!(rtp(&packet[..12]).is_none());
     }
 
     #[test]
