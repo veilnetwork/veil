@@ -8,6 +8,9 @@ import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
+smoke_name = os.environ.get('VEIL_BOUNDED_AUDIO_SMOKE_SOURCE', 'bounded_audio_encoder_smoke.cc')
+assert smoke_name in ('bounded_audio_encoder_smoke.cc', 'audio_packet_priority_opus_smoke.cc')
+smoke_source = str(root / 'test' / smoke_name)
 source = Path(os.environ.get('WEBRTC_SRC', Path.home() / 'Projects/veilnetwork/webrtc-checkout/src'))
 out = source / os.environ.get('WEBRTC_OUT', 'out/mac-arm64')
 commands = json.loads((out / 'compile_commands.json').read_text())
@@ -18,12 +21,12 @@ with tempfile.TemporaryDirectory(prefix='veil-bounded-opus-', dir=os.environ.get
     command[command.index('-o') + 1] = str(temp / 'smoke.o')
     if '-MF' in command:
         command[command.index('-MF') + 1] = str(temp / 'smoke.d')
-    command = [str(root / 'test/bounded_audio_encoder_smoke.cc')
+    command = [smoke_source
                if token.endswith('call/call.cc') else token for token in command]
     command += ['-I' + str(root / 'src'), '-I' + str(source / 'third_party/protobuf/src')]
     subprocess.run(command, cwd=entry['directory'], check=True)
     adaptor_command = command[:]
-    adaptor_command[adaptor_command.index(str(root / 'test/bounded_audio_encoder_smoke.cc'))] = str(root / 'src/webrtc_ana/controller_manager.cc')
+    adaptor_command[adaptor_command.index(smoke_source)] = str(root / 'src/webrtc_ana/controller_manager.cc')
     adaptor_command[adaptor_command.index('-o') + 1] = str(temp / 'ana.o')
     if '-MF' in adaptor_command:
         adaptor_command[adaptor_command.index('-MF') + 1] = str(temp / 'ana.d')

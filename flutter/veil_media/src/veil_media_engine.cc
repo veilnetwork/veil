@@ -200,7 +200,8 @@ void configure_call_audio_transport(webrtc::CallConfig& config) {
 // accounts for framing separately and retains the codec while durations change.
 void configure_call_audio_send(webrtc::AudioSendStream::Config& config,
                                bool transport_feedback, int packet_overhead = 0,
-                               std::shared_ptr<std::atomic<int>> packet_duration = {}) {
+                               std::shared_ptr<std::atomic<int>> packet_duration = {},
+                               std::shared_ptr<veil_media::AudioPacketPriority> priority = {}) {
   if (!transport_feedback) return;
   config.min_bitrate_bps = veil_media::kFramingAudioMinPayloadBps;
   config.max_bitrate_bps = 32'000;
@@ -214,7 +215,7 @@ void configure_call_audio_send(webrtc::AudioSendStream::Config& config,
     config.send_codec_spec->format.parameters["maxptime"] = "60";
     config.encoder_factory =
         webrtc::make_ref_counted<veil_media::BoundedAudioEncoderFactory>(
-            std::move(packet_duration), config.rtp.ssrc);
+            std::move(packet_duration), config.rtp.ssrc, std::move(priority));
     config.audio_network_adaptor_config = veil_media::kFramingAudioAdaptorConfig;
   }
 }
@@ -1053,6 +1054,8 @@ struct WebrtcState {
   // Atomics bridge encoder and diagnostic threads without a worker round trip.
   std::shared_ptr<std::atomic<int>> audio_packet_duration =
       std::make_shared<std::atomic<int>>(0);
+  std::shared_ptr<veil_media::AudioPacketPriority> audio_packet_priority =
+      std::make_shared<veil_media::AudioPacketPriority>();
   // Video (Phase 4) — factories + source/sink outlive the streams.
   std::shared_ptr<veil_media::VideoFrameBudget> video_frame_budget =
       std::make_shared<veil_media::VideoFrameBudget>();
@@ -1096,6 +1099,7 @@ template <typename VideoState>
 bool should_encode_video_frame(VideoState* ws) {
   if (ws == nullptr) return false;
   if (ws->video_send_paused.load()) return false;
+  if (ws->audio_packet_priority && ws->audio_packet_priority->VideoBlocked()) return false;
   const double fps = ws->video_max_fps.load(std::memory_order_relaxed);
   if (fps <= 0) return true;
   const int64_t now_us = webrtc::TimeMicros();
@@ -1167,6 +1171,8 @@ struct GroupWebrtcState {
   std::shared_ptr<std::atomic<int>> audio_packet_duration =
       std::make_shared<std::atomic<int>>(0);
   int audio_packet_ms = 20;  // Audio-worker owned requested configuration.
+  // Group packet lengths are explicitly coordinated by the room controller.
+  std::shared_ptr<veil_media::AudioPacketPriority> audio_packet_priority;
   int audio_payload_bps = 32'000;
   bool audio_config_valid = true;
   std::shared_ptr<veil_media::VideoFrameBudget> video_frame_budget =
@@ -1901,7 +1907,8 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
 
   ws->shim = std::make_unique<veil_media::VeilTransportShim>(
       veil_chan, ws->call.get(), ws->network_tq.get(),
-      ws->video_call.get(), ws->video_network_tq.get());
+      ws->video_call.get(), ws->video_network_tq.get(), nullptr,
+      ws->audio_packet_priority);
   ws->shim->SetLocalAudioSsrc(ssrc_of(local_id));
   ws->shim->SetRemoteAudioSsrc(ssrc_of(peer_id));
   ws->shim->SetLocalVideoSsrc(video_ssrc_of(local_id));
@@ -3173,7 +3180,7 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
           kOpusPayloadType, VeilOpusSendFormat());
       configure_call_audio_send(sc, ws->shim->independent_transport_feedback(),
                                 engine->audio_packet_overhead.load(),
-                                ws->audio_packet_duration);
+                                ws->audio_packet_duration, ws->audio_packet_priority);
       if (engine->audio_packet_overhead.load() > 0) {
         webrtc::BitrateConstraints limits;
         limits.start_bitrate_bps = 48'000;
@@ -3522,6 +3529,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
           ws->video_call->CreateVideoSendStream(std::move(sc), std::move(ec));
       vlog("video: send stream=%p", (void*)ws->video_send_stream);
       if (ws->video_send_stream) {
+        ws->audio_packet_priority->ExpectVideo(true, webrtc::TimeMicros());
         ws->video_send_stream->SetSource(
             ws->video_source.get(),
             kbps > 150 ? webrtc::DegradationPreference::BALANCED
@@ -3726,6 +3734,7 @@ int veil_media_engine_stop_video(VeilMediaEngine* engine) {
     }
   }
   if (ws->shim) ws->shim->SetRemoteVideoSsrc(0);
+  ws->audio_packet_priority->ExpectVideo(false, webrtc::TimeMicros());
 #endif
   return VEIL_MEDIA_OK;
 }
@@ -4570,7 +4579,13 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
       snapshot += ",\"video_tx_rtp_drops\":" + std::to_string(video_send.dropped);
       snapshot += ",\"audio_rx_foreign_remb_blocks\":" + std::to_string(ws->shim->foreign_remb_blocks(false));
       snapshot += ",\"video_rx_foreign_remb_blocks\":" + std::to_string(ws->shim->foreign_remb_blocks(true));
-      snapshot += ",\"video_send_paused\":" + std::to_string(ws->video_send_paused.load() ? 1 : 0) + "}";
+      snapshot += ",\"audio_packetization_video_hold\":" +
+          std::to_string(ws->audio_packet_priority->VideoHeldForAudio() ? 1 : 0);
+      snapshot += ",\"audio_packetization_long_requested\":" +
+          std::to_string(ws->audio_packet_priority->WantsLongPackets() ? 1 : 0);
+      snapshot += ",\"video_send_paused\":" +
+          std::to_string(ws->video_send_paused.load() ||
+                         ws->audio_packet_priority->VideoBlocked() ? 1 : 0) + "}";
       return dup_cstr(snapshot.c_str());
     }
   }

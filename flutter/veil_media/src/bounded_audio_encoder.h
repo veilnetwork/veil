@@ -14,6 +14,8 @@
 #include "rtc_base/time_utils.h"
 #include "veil_audio_encode_timing.h"
 #include "veil_audio_adaptor_config.h"
+#include "veil_audio_packet_priority.h"
+#include "system_wrappers/include/clock.h"
 
 namespace veil_media {
 
@@ -26,9 +28,11 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
  public:
   explicit BoundedAudioEncoder(
       std::unique_ptr<webrtc::AudioEncoder> inner,
-      std::shared_ptr<std::atomic<int>> packet_duration = {}, uint32_t trace_ssrc = 0)
+      std::shared_ptr<std::atomic<int>> packet_duration = {}, uint32_t trace_ssrc = 0,
+      std::shared_ptr<AudioPacketPriority> priority = {}, webrtc::Clock* clock = nullptr)
       : inner_(std::move(inner)), packet_duration_(std::move(packet_duration)),
-        timing_(trace_ssrc, inner_->RtpTimestampRateHz()) {}
+        timing_(trace_ssrc, inner_->RtpTimestampRateHz()),
+        priority_(std::move(priority)), clock_(clock) {}
 
   int SampleRateHz() const override { return inner_->SampleRateHz(); }
   size_t NumChannels() const override { return inner_->NumChannels(); }
@@ -41,6 +45,7 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
   }
   int GetTargetBitrate() const override { return inner_->GetTargetBitrate(); }
   void Reset() override {
+    if (priority_) priority_->ResetAudio();
     inner_->Reset();
     ClampPayloadTarget();
   }
@@ -50,13 +55,25 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
   bool SetApplication(Application app) override { return inner_->SetApplication(app); }
   void SetMaxPlaybackRate(int hz) override { inner_->SetMaxPlaybackRate(hz); }
   bool EnableAudioNetworkAdaptor(absl::string_view config) override {
+    const auto context = config == kFramingAudioAdaptorConfig ? priority_ : nullptr;
+    AudioPacketPriorityScope scope(context);
     const bool enabled = inner_->EnableAudioNetworkAdaptor(config);
+    priority_enabled_ = enabled && context != nullptr;
     if (enabled && config == kFramingAudioAdaptorConfig)
       min_payload_bps_ = kFramingAudioMinPayloadBps;
+    if (priority_) {
+      if (priority_enabled_) priority_->Enable();
+      else priority_->Disable();
+    }
+    last_long_allowed_.reset();
     ClampPayloadTarget();
     return enabled;
   }
-  void DisableAudioNetworkAdaptor() override { inner_->DisableAudioNetworkAdaptor(); }
+  void DisableAudioNetworkAdaptor() override {
+    priority_enabled_ = false;
+    if (priority_) priority_->Disable();
+    inner_->DisableAudioNetworkAdaptor();
+  }
   void OnReceivedUplinkPacketLossFraction(float fraction) override {
     inner_->OnReceivedUplinkPacketLossFraction(fraction);
     ClampPayloadTarget();
@@ -135,6 +152,17 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
   }
   EncodedInfo EncodeImpl(uint32_t timestamp, std::span<const int16_t> audio,
                          webrtc::Buffer* encoded) override {
+    if (priority_enabled_) {
+      const auto now = clock_ ? clock_->TimeInMicroseconds() : webrtc::TimeMicros();
+      const bool allowed = priority_->LongPacketsAllowed(now);
+      if (last_long_allowed_ && *last_long_allowed_ != allowed) {
+        // Reevaluate the cached real ANA metrics when source permission
+        // changes. This is not a new bandwidth estimate or allocation grant.
+        inner_->OnReceivedOverhead(overhead_bytes_);
+        ClampPayloadTarget();
+      }
+      last_long_allowed_ = allowed;
+    }
     if (timing_.enabled()) timing_.Input(timestamp, webrtc::TimeMicros());
     // Opus may select the next duration at this packet's boundary. Sample
     // before Encode, and publish only when an encoded packet actually exists.
@@ -148,6 +176,8 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
       packet_duration_->store(static_cast<int>(blocks * 10),
                               std::memory_order_relaxed);
     }
+    if (priority_enabled_ && info.encoded_bytes > 0 && blocks > 0 && blocks <= 12)
+      priority_->Encoded(static_cast<int>(blocks * 10));
     return info;
   }
   int64_t OverheadBps(int duration_ms) const {
@@ -161,14 +191,20 @@ class BoundedAudioEncoder final : public webrtc::AudioEncoder {
   std::unique_ptr<webrtc::AudioEncoder> inner_;
   std::shared_ptr<std::atomic<int>> packet_duration_;
   AudioEncodeTiming timing_;
+  std::shared_ptr<AudioPacketPriority> priority_;
+  webrtc::Clock* clock_;
+  bool priority_enabled_ = false;
+  std::optional<bool> last_long_allowed_;
 };
 
 class BoundedAudioEncoderFactory : public webrtc::AudioEncoderFactory {
  public:
   explicit BoundedAudioEncoderFactory(
-      std::shared_ptr<std::atomic<int>> packet_duration = {}, uint32_t trace_ssrc = 0)
+      std::shared_ptr<std::atomic<int>> packet_duration = {}, uint32_t trace_ssrc = 0,
+      std::shared_ptr<AudioPacketPriority> priority = {})
       : inner_(webrtc::CreateBuiltinAudioEncoderFactory()),
-        packet_duration_(std::move(packet_duration)), trace_ssrc_(trace_ssrc) {}
+        packet_duration_(std::move(packet_duration)), trace_ssrc_(trace_ssrc),
+        priority_(std::move(priority)) {}
   std::vector<webrtc::AudioCodecSpec> GetSupportedEncoders() override {
     return inner_->GetSupportedEncoders();
   }
@@ -181,12 +217,13 @@ class BoundedAudioEncoderFactory : public webrtc::AudioEncoderFactory {
     auto encoder = inner_->Create(env, format, options);
     if (!encoder || format.name != "opus") return encoder;
     return std::make_unique<BoundedAudioEncoder>(std::move(encoder),
-                                                packet_duration_, trace_ssrc_);
+                                                packet_duration_, trace_ssrc_, priority_, &env.clock());
   }
  private:
   webrtc::scoped_refptr<webrtc::AudioEncoderFactory> inner_;
   std::shared_ptr<std::atomic<int>> packet_duration_;
   const uint32_t trace_ssrc_;
+  std::shared_ptr<AudioPacketPriority> priority_;
 };
 
 }  // namespace veil_media
