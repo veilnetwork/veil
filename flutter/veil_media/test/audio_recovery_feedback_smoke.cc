@@ -110,13 +110,18 @@ int main() {
     return *r;
   };
   require(!local.Observe(11, 1, 3, 1000, 100, 1'000'000), "startup event");
+  require(local.FreshReportUs(1'100'000) == 0, "local history became pressure");
   auto r = observe(1'100'000);
   require(concealment.FreshReportUs(1'100'000) == 0 && r.concealed_samples == 900,
           "historical concealment became fresh");
   require(!local.Observe(11, 2, 3, 1480, 580, 2'000'000), "silent concealment event");
+  require(local.FreshReportUs(2'100'000) == 0, "local DTX became pressure");
   observe(2'100'000);
   require(concealment.FreshReportUs(2'100'000) == 0, "DTX yielded false pressure");
   require(local.Observe(11, 3, 3, 1960, 580, 3'000'000), "speech event missed");
+  require(local.FreshReportUs(3'000'789) == 3'000'000 &&
+              local.FreshReportUs(3'100'321) == 3'000'000,
+          "rounded age manufactured another local identity");
   r = observe(3'100'000);
   require(r.age_ms == 100 && concealment.FreshReportUs(3'100'000) == 3'100'000,
           "fresh concealment missing");
@@ -124,10 +129,14 @@ int main() {
   require(!local.Observe(11, 3, 3, 2440, 580, 3'300'000), "cached sequence event");
   require(!local.Observe(11, 4, 3, 2440, 580, 2'900'000), "clock rollback event");
   require(!local.Observe(11, 4, 3, 1960, 580, 4'000'000), "cached count event");
+  require(local.FreshReportUs(4'100'000) == 3'000'000 &&
+              local.FreshReportUs(6'000'001) == 0,
+          "local poll extended event lifetime");
   observe(4'100'000);
   require(concealment.FreshReportUs(4'100'000) == 3'100'000,
           "cached concealment renewed event");
   require(!local.Observe(11, 5, 0, 0, 0, 5'000'000), "unknown produced event");
+  require(local.FreshReportUs(5'000'001) == 0, "unknown local sample retained pressure");
   observe(5'100'000);
   require(!local.Observe(11, 6, 2, 99999, 0, 5'200'000), "retired decoder event");
   require(!local.Observe(11, 6, 3, 2440, 580, 6'000'000), "resume replayed gap");
