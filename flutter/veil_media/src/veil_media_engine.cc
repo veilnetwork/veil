@@ -2854,6 +2854,9 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   // Includes payload, padding and rejected copies; no media role leaves host.
   snapshot += ",\"video_tx_rtp_attempts\":" + std::to_string(video_send.attempts) +
               ",\"video_tx_rtp_queued\":" + std::to_string(video_send.queued) +
+              ",\"video_tx_payload_pkts\":" + std::to_string(video_send.payload_packets) +
+              ",\"video_tx_payload_rtp_bytes\":" + std::to_string(video_send.payload_rtp_bytes) +
+              ",\"video_tx_payload_counter_scope\":\"fanout_attempts\"" +
               ",\"video_tx_payload_bytes\":" + std::to_string(video_send.payload_bytes) +
               ",\"video_tx_padding_bytes\":" + std::to_string(video_send.padding_bytes) +
               ",\"video_tx_rtp_drops\":" + std::to_string(video_send.dropped);

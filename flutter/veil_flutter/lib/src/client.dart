@@ -3136,7 +3136,7 @@ class AppHandle implements Finalizable {
       {required int packetBytes,
       MediaPacketSource source = MediaPacketSource.audio}) {
     _ensureOpen();
-    if (packetBytes < 12 || packetBytes > 1000) return null;
+    if (packetBytes < 12 || packetBytes > 1460) return null;
     final querySource = ffi.veilMediaChannelSourcePacketCost;
     final queryAudio = ffi.veilMediaChannelPacketCost;
     // An old SDK's audio snapshot cannot describe another prepared child.

@@ -3873,6 +3873,18 @@ int veil_media_channel_configure_path_probes(uint64_t chan,
  char *veil_media_channel_source_packet_cost(uint64_t chan, uint8_t local_lane, size_t packet_bytes) ;
 #endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Owned stand snapshot on the embedded node process when codec clients are
+ * separate processes. Same prepared source model as the channel getter;
+ * requires local rt_trace opt-in. No preparation, probes, RPCs or packets.
+ * Id pointers each reference 32 readable bytes; lane is 0/2/3, relayed 0/1,
+ * packet_bytes 12..1460. Null means invalid/unknown/unprepared source.
+ * Free with veil_free_string. QUIC/TCP/IP/ACK bytes and capacity are excluded.
+ */
+ char *veil_debug_media_source_packet_cost(const uint8_t *local_node_id, const uint8_t *peer_node_id, uint8_t local_lane, uint8_t relayed, size_t packet_bytes) ;
+#endif
+
 /**
  * Register this node as a LOCATION-anonymous (onion) service: the daemon picks
  * relays, builds an onion circuit to a rendezvous relay (which never learns
