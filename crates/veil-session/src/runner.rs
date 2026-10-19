@@ -281,6 +281,12 @@ impl ParallelChannels {
     fn has_auxiliary_app_streams(&self) -> bool {
         matches!(self, Self::Quic(s) if s.has_auxiliary_app_streams())
     }
+    fn network_control_source(&self) -> u8 {
+        match self {
+            Self::Quic(s) => s.network_control_source(),
+            Self::Ordered(_) => crate::LOCAL_SIGNALING_LANE,
+        }
+    }
     fn auxiliary_sender(
         &mut self,
         priority: u8,
@@ -4384,8 +4390,9 @@ impl SessionRunner {
         let reliable_enabled = realtime_lane
             .as_ref()
             .and_then(|lane| lane.parallel.as_ref())
-            .and_then(ParallelChannels::reliable)
-            .is_some();
+            .is_some_and(|parallel| {
+                parallel.reliable().is_some() || parallel.has_auxiliary_app_streams()
+            });
         let mut retained_children_after_swap = false;
         let mut reliable_streams = reliable_streams::ReliableStreams::new(
             reliable_enabled,
@@ -4620,7 +4627,7 @@ impl SessionRunner {
         let mut source_reliable_pressure_logged: Option<std::time::Instant> = None;
         let mut ingress_trace = crate::rt_trace::IngressTrace::default();
         let mut source_reliable_admitted_logged: Option<std::time::Instant> = None;
-        let mut auxiliary_logged = [false; 2];
+        let mut auxiliary_logged = [false; 3];
         let mut reliable_snapshot_logged: Option<std::time::Instant> = None;
         let mut ordered_primary_pressure_logged: Option<std::time::Instant> = None;
         let mut first_ordered_primary_admitted_logged = false;
@@ -4888,7 +4895,7 @@ impl SessionRunner {
                         .and_then(|lane| lane.parallel.as_mut())
                 {
                     let pending = status.pending();
-                    for (index, lane) in crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES
+                    for (index, lane) in crate::local_datagram_status::LOCAL_SOURCE_PRIORITIES
                         .into_iter()
                         .enumerate()
                     {
@@ -5768,7 +5775,10 @@ impl SessionRunner {
                         let auxiliary = if (owned_reliable || priority == crate::LOCAL_NETWORK_CONTROL_LANE)
                             && auxiliary_records::eligible(frame)
                             && realtime_lane.as_ref().and_then(|lane|lane.parallel.as_ref()).is_some_and(ParallelChannels::has_auxiliary)
-                        { Some(if priority == crate::LOCAL_NETWORK_CONTROL_LANE { crate::LOCAL_SIGNALING_LANE } else { veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE }) } else { None };
+                        { Some(if priority == crate::LOCAL_NETWORK_CONTROL_LANE {
+                            realtime_lane.as_ref().and_then(|lane| lane.parallel.as_ref())
+                                .expect("negotiated auxiliary channel").network_control_source()
+                        } else { veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE }) } else { None };
                         let stream_child = if source_stream {
                             let handle = realtime_lane.as_mut().and_then(|lane|lane.parallel.as_mut())
                                 .and_then(|parallel| parallel.auxiliary_sender(veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE, &source_activity));
@@ -5972,7 +5982,11 @@ impl SessionRunner {
                             continue;
                         }
                         if let Some(source) = selected_auxiliary {
-                            let index = usize::from(source == crate::LOCAL_SIGNALING_LANE);
+                            let index = match source {
+                                crate::LOCAL_NETWORK_CONTROL_LANE => 2,
+                                crate::LOCAL_SIGNALING_LANE => 1,
+                                _ => 0,
+                            };
                             if !auxiliary_logged[index] {
                                 auxiliary_logged[index] = true;
                                 self.logger.info("session.source_record.first_send", format!("peer_id={} local_priority={source} scope=endpoint",hex_short(&self.peer_id)));

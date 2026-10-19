@@ -11,6 +11,17 @@ pub(crate) const LOCAL_DATAGRAM_PRIORITIES: [u8; 5] = [
     crate::LOCAL_SIGNALING_LANE,
 ];
 
+// Includes the record-only control source, which must never enter the lossy
+// datagram scheduler merely because it owns an independent QUIC connection.
+pub(crate) const LOCAL_SOURCE_PRIORITIES: [u8; 6] = [
+    veil_proto::priority::REALTIME,
+    veil_proto::priority::BULK,
+    veil_proto::priority::BACKGROUND,
+    veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
+    crate::LOCAL_SIGNALING_LANE,
+    crate::LOCAL_NETWORK_CONTROL_LANE,
+];
+
 pub use veil_types::LocalDatagramChannelState;
 
 #[derive(Debug, Default)]
@@ -27,11 +38,11 @@ struct State {
     supported: u8,
     ready: u8,
     requested: u8,
-    framing: [Option<crate::LocalPacketFraming>; LOCAL_DATAGRAM_PRIORITIES.len()],
+    framing: [Option<crate::LocalPacketFraming>; LOCAL_SOURCE_PRIORITIES.len()],
 }
 
 fn bit(local_lane: u8) -> Option<u8> {
-    LOCAL_DATAGRAM_PRIORITIES
+    LOCAL_SOURCE_PRIORITIES
         .iter()
         .position(|&lane| lane == local_lane)
         .map(|index| 1 << index)
@@ -39,7 +50,7 @@ fn bit(local_lane: u8) -> Option<u8> {
 
 impl LocalDatagramStatus {
     pub(crate) fn framing(&self, local_lane: u8) -> Option<crate::LocalPacketFraming> {
-        let index = LOCAL_DATAGRAM_PRIORITIES
+        let index = LOCAL_SOURCE_PRIORITIES
             .iter()
             .position(|&lane| lane == local_lane)?;
         let state = lock!(self.state);
@@ -121,20 +132,31 @@ impl LocalDatagramStatus {
     }
 
     pub(crate) fn activate(self: &Arc<Self>) -> LocalDatagramLease {
-        self.activate_supported(true)
+        self.activate_supported(true, false)
+    }
+
+    pub(crate) fn activate_with_network_control(self: &Arc<Self>) -> LocalDatagramLease {
+        self.activate_supported(true, true)
     }
 
     pub(crate) fn activate_without_signaling(self: &Arc<Self>) -> LocalDatagramLease {
-        self.activate_supported(false)
+        self.activate_supported(false, false)
     }
 
-    fn activate_supported(self: &Arc<Self>, signaling: bool) -> LocalDatagramLease {
+    fn activate_supported(
+        self: &Arc<Self>,
+        signaling: bool,
+        network_control: bool,
+    ) -> LocalDatagramLease {
         let owner = Arc::new(());
         let mut state = lock!(self.state);
         state.owner = Arc::downgrade(&owner);
-        state.supported = (1 << LOCAL_DATAGRAM_PRIORITIES.len()) - 1;
+        state.supported = (1 << LOCAL_SOURCE_PRIORITIES.len()) - 1;
         if !signaling {
             state.supported &= !bit(crate::LOCAL_SIGNALING_LANE).expect("source selector");
+        }
+        if !network_control {
+            state.supported &= !bit(crate::LOCAL_NETWORK_CONTROL_LANE).expect("source selector");
         }
         state.ready = 0;
         state.framing.fill(None);
@@ -200,6 +222,32 @@ impl Drop for LocalDatagramLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_network_control_requires_the_negotiated_lease() {
+        let status = Arc::new(LocalDatagramStatus::default());
+        let legacy = status.activate();
+        assert_eq!(
+            status.request(crate::LOCAL_NETWORK_CONTROL_LANE),
+            LocalDatagramChannelState::Unsupported
+        );
+        let modern = status.activate_with_network_control();
+        assert_eq!(
+            status.request(crate::LOCAL_NETWORK_CONTROL_LANE),
+            LocalDatagramChannelState::Warming
+        );
+        modern.mark(crate::LOCAL_NETWORK_CONTROL_LANE, true);
+        drop(legacy);
+        assert_eq!(
+            status.state(crate::LOCAL_NETWORK_CONTROL_LANE),
+            LocalDatagramChannelState::Ready
+        );
+        drop(modern);
+        assert_eq!(
+            status.state(crate::LOCAL_NETWORK_CONTROL_LANE),
+            LocalDatagramChannelState::Unsupported
+        );
+    }
     use LocalDatagramChannelState::*;
 
     #[test]

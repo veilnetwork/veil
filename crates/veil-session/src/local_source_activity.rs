@@ -202,13 +202,13 @@ impl LocalSourceActivity {
         &self,
         priority: u8,
     ) -> Option<veil_transport::LocalSendBudgetFactory> {
-        if !crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES.contains(&priority) {
+        if !crate::local_datagram_status::LOCAL_SOURCE_PRIORITIES.contains(&priority) {
             return None;
         }
         use crate::local_source_flight::Role;
         let role = match priority {
             veil_proto::priority::REALTIME => Role::Primary,
-            crate::LOCAL_SIGNALING_LANE => Role::Control,
+            crate::LOCAL_SIGNALING_LANE | crate::LOCAL_NETWORK_CONTROL_LANE => Role::Control,
             _ => Role::Secondary,
         };
         Some(self.flight.factory(role))
@@ -223,7 +223,7 @@ impl LocalSourceActivity {
         use crate::local_source_flight::Role;
         let role = match priority {
             veil_proto::priority::REALTIME => Role::Primary,
-            crate::LOCAL_SIGNALING_LANE => Role::Control,
+            crate::LOCAL_SIGNALING_LANE | crate::LOCAL_NETWORK_CONTROL_LANE => Role::Control,
             _ => Role::Secondary,
         };
         self.flight.bind(handle, role, now)
@@ -563,7 +563,7 @@ mod tests {
         assert!(
             source
                 .source_budget_factory(crate::LOCAL_NETWORK_CONTROL_LANE)
-                .is_none()
+                .is_some()
         );
         let factory = source
             .source_budget_factory(veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE)

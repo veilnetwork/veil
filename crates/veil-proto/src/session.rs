@@ -415,6 +415,9 @@ pub mod cap_extra_flags2 {
     /// Whole App streams pinned to a generic auxiliary record channel. This
     /// extends the stateless codec and must be negotiated independently.
     pub const SUPPORTS_AUXILIARY_APP_STREAMS: u8 = 1 << 3;
+    /// All auxiliary record types are available without a mixed reliable
+    /// child. Allows each endpoint to spend that connection slot locally.
+    pub const SUPPORTS_AUXILIARY_ONLY: u8 = 1 << 4;
 }
 
 #[cfg(test)]
@@ -608,6 +611,11 @@ impl CapabilitiesPayload {
         self.supports_auxiliary_records()
             && self.supports_reliable_parallel()
             && self.extra_flags2 & cap_extra_flags2::SUPPORTS_AUXILIARY_APP_STREAMS != 0
+    }
+
+    pub fn supports_auxiliary_only(&self) -> bool {
+        self.supports_auxiliary_app_streams()
+            && self.extra_flags2 & cap_extra_flags2::SUPPORTS_AUXILIARY_ONLY != 0
     }
 
     // ── Capability helpers ───────────────────────────────────────────────
@@ -2743,6 +2751,30 @@ mod tests {
         );
         caps.extra_flags2 = 0;
         assert!(!caps.supports_auxiliary_records());
+    }
+
+    #[test]
+    fn auxiliary_only_requires_the_complete_negotiated_record_codec() {
+        let mut caps = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Core);
+        caps.flags = u8::MAX;
+        caps.extra_flags = u8::MAX;
+        let complete = cap_extra_flags2::SUPPORTS_AUXILIARY_RECORDS
+            | cap_extra_flags2::SUPPORTS_AUXILIARY_APP_STREAMS
+            | cap_extra_flags2::SUPPORTS_AUXILIARY_ONLY;
+        caps.extra_flags2 = complete;
+        assert!(
+            CapabilitiesPayload::decode(&caps.encode())
+                .unwrap()
+                .supports_auxiliary_only()
+        );
+        for permission in [
+            cap_extra_flags2::SUPPORTS_AUXILIARY_RECORDS,
+            cap_extra_flags2::SUPPORTS_AUXILIARY_APP_STREAMS,
+            cap_extra_flags2::SUPPORTS_AUXILIARY_ONLY,
+        ] {
+            caps.extra_flags2 = complete & !permission;
+            assert!(!caps.supports_auxiliary_only());
+        }
     }
 
     #[test]
