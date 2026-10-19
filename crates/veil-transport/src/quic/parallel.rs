@@ -172,6 +172,17 @@ impl QuicParallelHandle {
                 std::time::Duration::from_millis(50),
                 std::time::Duration::from_secs(1),
             ));
+            // The live canonical owner deliberately retains these bounded
+            // generic siblings. An unused reliable child otherwise expires
+            // every 30 s and is immediately redialed, creating recurring TLS
+            // bursts even in an audio-only call. A small transport PING keeps
+            // the existing authenticated path; it carries no producer role
+            // and grants no scheduling preference. Only the initiator needs
+            // this timer: its peer's ACK also refreshes the idle timeout.
+            // Parent retirement still closes every child through watch_child.
+            transport.keep_alive_interval(Some(std::time::Duration::from_millis(
+                CHROME_MAX_IDLE_TIMEOUT_MS / 3,
+            )));
             config.transport_config(Arc::new(transport));
             let connection = self
                 .0

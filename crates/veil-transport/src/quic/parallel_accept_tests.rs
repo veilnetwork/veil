@@ -4,6 +4,84 @@ use tokio::{
     net::UdpSocket,
 };
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_generic_sibling_survives_idle_timeout_and_retires_with_parent() {
+    let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (a_addr, b_addr) = (left.local_addr().unwrap(), right.local_addr().unwrap());
+    let ctx = Arc::new(TransportContext::for_debug().unwrap());
+    let remote = tokio::spawn(promote_punched_quic(
+        right,
+        a_addr,
+        Arc::clone(&ctx),
+        PunchedQuicRole::Responder,
+    ));
+    let a = promote_punched_quic(left, b_addr, ctx, PunchedQuicRole::Initiator)
+        .await
+        .unwrap();
+    let parent = a.quic_connection().unwrap();
+    let client = a.parallel_quic().unwrap();
+    let mut a_stream = a.into_stream().unwrap();
+    a_stream.write_all(b"main").await.unwrap();
+    let b = remote.await.unwrap().unwrap();
+    let server = b.parallel_quic().unwrap();
+    let mut b_stream = b.into_stream().unwrap();
+    b_stream.read_exact(&mut [0; 4]).await.unwrap();
+    let accept = tokio::spawn(async move { server.accept().await });
+    let child = client.connect().await.unwrap();
+    let child_connection = child.quic_connection().unwrap();
+    let id = child_connection.local_trace_id();
+    let mut sender = child.into_stream().unwrap();
+    sender.write_all(b"open").await.unwrap();
+    let child = accept.await.unwrap().unwrap();
+    let mut receiver = child.into_stream().unwrap();
+    receiver.read_exact(&mut [0; 4]).await.unwrap();
+    let before = child_connection.stats().frame_tx.ping;
+    // Real clocks are intentional: advancing Tokio's virtual clock does not
+    // advance Quinn's std::time::Instant. Keep only the canonical path busy;
+    // neither application writes nor reads on this child refresh its timer.
+    for _ in 0..7 {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        a_stream.write_all(b"main").await.unwrap();
+        timeout(
+            std::time::Duration::from_secs(1),
+            b_stream.read_exact(&mut [0; 4]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    let survived = child_connection.close_reason().is_none();
+    let pings = child_connection
+        .stats()
+        .frame_tx
+        .ping
+        .saturating_sub(before);
+    let result = async {
+        sender.write_all(b"late").await?;
+        let mut bytes = [0; 4];
+        receiver.read_exact(&mut bytes).await?;
+        receiver.write_all(&bytes).await?;
+        sender.read_exact(&mut bytes).await?;
+        Ok::<_, std::io::Error>(bytes)
+    };
+    let delivered = timeout(std::time::Duration::from_secs(1), result).await;
+    parent.close(0u32.into(), b"retained sibling idle test complete");
+    timeout(std::time::Duration::from_secs(1), child_connection.closed())
+        .await
+        .unwrap();
+    assert!(
+        survived,
+        "retained sibling expired and would require a fresh TLS dial"
+    );
+    assert!(
+        pings > 0,
+        "idle child was not kept alive by transport PINGs"
+    );
+    assert_eq!(delivered.unwrap().unwrap(), *b"late");
+    assert_eq!(child_connection.local_trace_id(), id);
+}
+
 #[tokio::test]
 async fn a_pending_first_stream_does_not_block_another_generic_sibling() {
     let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
