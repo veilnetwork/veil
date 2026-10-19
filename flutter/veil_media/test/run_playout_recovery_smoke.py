@@ -21,7 +21,6 @@ with tempfile.TemporaryDirectory(prefix='veil-playout-recovery-', dir=os.environ
     command = [str(root / 'test/playout_recovery_smoke.cc')
                if token.endswith('call/call.cc') else token for token in command]
     command += ['-I' + str(root / 'src'), '-I' + str(source / 'third_party/protobuf/src')]
-    subprocess.run(command, cwd=entry['directory'], check=True)
     clang = command[0]
     target = next(token for token in command if token.startswith('--target='))
     sdk = next((out / 'sdk/xcode_links').glob('MacOSX*.sdk'))
@@ -33,5 +32,10 @@ with tempfile.TemporaryDirectory(prefix='veil-playout-recovery-', dir=os.environ
                       'AudioUnit', 'CoreServices', 'IOKit', 'SystemConfiguration',
                       'Security', 'CoreMedia', 'CoreVideo', 'AVFoundation']:
         link += ['-framework', framework]
-    subprocess.run(link, cwd=entry['directory'], check=True)
-    subprocess.run([str(temp / 'smoke')], check=True)
+    for case in ['playout_recovery_smoke.cc', 'audio_rtp_lag_smoke.cc']:
+        test_command = [str(root / 'test' / case)
+                        if token == str(root / 'test/playout_recovery_smoke.cc')
+                        else token for token in command]
+        subprocess.run(test_command, cwd=entry['directory'], check=True)
+        subprocess.run(link, cwd=entry['directory'], check=True)
+        subprocess.run([str(temp / 'smoke')], check=True)
