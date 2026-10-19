@@ -73,8 +73,10 @@ VeilTransportShim::VeilTransportShim(uint64_t veil_chan,
                                      webrtc::TaskQueueBase* network_queue,
                                      webrtc::Call* video_call,
                                      webrtc::TaskQueueBase* video_network_queue,
-                                     std::shared_ptr<RtcpSendStats> group_rtcp_stats)
-    : veil_chan_(veil_chan), call_(call), network_queue_(network_queue),
+                                     std::shared_ptr<RtcpSendStats> group_rtcp_stats,
+                                     std::shared_ptr<AudioPacketPriority> audio_priority)
+    : audio_priority_(std::move(audio_priority)),
+      veil_chan_(veil_chan), call_(call), network_queue_(network_queue),
       video_call_(video_call), video_network_queue_(video_network_queue),
       audio_ingress_diagnostics_(diag::enabled()),
       audio_trace_capacity_(diag::rtp_trace_capacity()),
@@ -143,6 +145,11 @@ VideoCadenceSnapshot VeilTransportShim::delivered_video_cadence() const {
 
 AudioSendSnapshot VeilTransportShim::audio_send_stats() const {
   return audio_send_stats_.snapshot(webrtc::TimeMicros() * 1000);
+}
+
+void VeilTransportShim::SetVideoSendPaused(bool paused) {
+  video_send_paused_.store(paused);
+  if (audio_priority_) audio_priority_->PauseVideo(paused, webrtc::TimeMicros());
 }
 
 RtpSendSnapshot VeilTransportShim::video_send_stats() const {
@@ -269,6 +276,8 @@ bool VeilTransportShim::ReleaseReceiveChannel(uint64_t veil_chan) {
 bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
                                 const webrtc::PacketOptions& options) {
   if (video_send_paused_.load() && IsSecondaryInboundRtp(packet)) return false;
+  const bool guarded_video = audio_priority_ && IsSecondaryInboundRtp(packet);
+  if (guarded_video && !audio_priority_->BeginVideo()) return false;
   MarkVideoFrame(packet, &outbound_video_cadence_);
   const int64_t started_ns = webrtc::TimeMicros() * 1000;
   const bool audio = audio_send_stats_.mark_attempt(
@@ -277,6 +286,7 @@ bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
       packet, local_video_ssrc_.load(std::memory_order_relaxed), started_ns, 96);
   const int rc =
       veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
+  if (guarded_video) audio_priority_->EndVideo(rc == 0, webrtc::TimeMicros());
   if (audio_ingress_diagnostics_ && video)
     video_loss_trace_.Rtp(packet, local_video_ssrc_.load(), 's', started_ns/1000, rc);
   if (video)
