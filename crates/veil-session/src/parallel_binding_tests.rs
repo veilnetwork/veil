@@ -281,6 +281,7 @@ async fn verified_ordered_keys_cannot_start_a_plane_after_canonical_owner_drop()
 
 struct TestChild {
     keys: ParallelKeys,
+    b_keys: ParallelKeys,
     a_stream: BoxIoStream,
     b_stream: BoxIoStream,
     a_datagrams: veil_transport::QuicDatagramHandle,
@@ -344,6 +345,7 @@ async fn child_roundtrip(
     assert_eq!(datagrams.recv().await.unwrap(), b"independent-datagram");
     TestChild {
         keys: a_keys,
+        b_keys,
         a_stream: stream,
         b_stream,
         a_datagrams: datagrams,
@@ -467,4 +469,88 @@ async fn actual_parallel_quic_has_fresh_keys_independent_queues_and_parent_lifet
     })
     .await
     .expect("parallel QUIC stand timed out");
+}
+
+#[tokio::test]
+async fn auxiliary_records_use_distinct_keys_and_exact_exporter_and_retire_with_parent() {
+    timeout(Duration::from_secs(10), async {
+        let left = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let right = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let la = left.local_addr().unwrap();
+        let ra = right.local_addr().unwrap();
+        let ctx = Arc::new(TransportContext::for_debug().unwrap());
+        let task = tokio::spawn(promote_punched_quic(
+            right,
+            la,
+            ctx.clone(),
+            PunchedQuicRole::Responder,
+        ));
+        let a = promote_punched_quic(left, ra, ctx, PunchedQuicRole::Initiator)
+            .await
+            .unwrap();
+        let parent_raw = a.quic_datagrams().unwrap();
+        let ah = a.parallel_quic().unwrap();
+        let mut main = a.into_stream().unwrap();
+        main.write_all(b"warm").await.unwrap();
+        let b = task.await.unwrap().unwrap();
+        let b_parent_raw = b.quic_datagrams().unwrap();
+        let bh = b.parallel_quic().unwrap();
+        let mut other = b.into_stream().unwrap();
+        other.read_exact(&mut [0; 4]).await.unwrap();
+        let (pa, pb) = parents();
+        let child = child_roundtrip(&ah, &bh, &pa, &pb).await;
+        let exporter = child.a_datagrams.channel_binding().unwrap();
+        let (hello, pending) = pa.begin(exporter).unwrap();
+        let (ack, _) = pb.accept(&hello, exporter).unwrap();
+        let (dummy, _) = tokio::io::duplex(64);
+        assert!(matches!(
+            pending
+                .finish(&ack)
+                .unwrap()
+                .into_auxiliary_records(Box::new(dummy), parent_raw.clone()),
+            Err(BindingError::InvalidProof)
+        ));
+        let (hello, pending) = pa.begin_reliable(exporter).unwrap();
+        let (ack, _) = pb.accept_reliable(&hello, exporter).unwrap();
+        let (dummy, _) = tokio::io::duplex(64);
+        assert!(matches!(
+            pending
+                .finish(&ack)
+                .unwrap()
+                .into_auxiliary_records(Box::new(dummy), child.a_datagrams.clone()),
+            Err(BindingError::InvalidProof)
+        ));
+        let original_tx = *child.keys.tx_key();
+        let original_sid = child.keys.session_id;
+        let a = child
+            .keys
+            .into_auxiliary_records(child.a_stream, child.a_datagrams)
+            .unwrap();
+        let b = child
+            .b_keys
+            .into_auxiliary_records(child.b_stream, child.b_datagrams)
+            .unwrap();
+        assert_ne!(a.keys.tx_key(), &original_tx);
+        assert_ne!(a.keys.session_id, original_sid);
+        assert_eq!(a.keys.tx_key(), b.keys.rx_key());
+        assert_eq!(a.keys.rx_key(), b.keys.tx_key());
+        assert_eq!(a.keys.session_id, b.keys.session_id);
+        let tx = a.handle();
+        let rx = b.handle();
+        tx.send(b"independently keyed record").await.unwrap();
+        assert_eq!(rx.recv().await.unwrap(), b"independently keyed record");
+        let (hello, pending) = pa.begin(exporter).unwrap();
+        let (ack, _) = pb.accept(&hello, exporter).unwrap();
+        pa.retire();
+        let (dummy, _) = tokio::io::duplex(64);
+        assert!(matches!(pending.finish(&ack), Err(BindingError::Retired)));
+        drop(dummy);
+        assert!(tx.send(b"stale handle").await.is_err());
+        drop(pb);
+        assert!(rx.recv().await.is_err());
+        parent_raw.close();
+        b_parent_raw.close();
+    })
+    .await
+    .unwrap();
 }

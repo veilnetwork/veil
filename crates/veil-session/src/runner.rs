@@ -123,6 +123,7 @@ pub enum NextInput {
     /// The writer freed the slots required by the pending ordered batch.
     WriterReady,
     Reliable(reliable_session::ReliableEvent),
+    Auxiliary(auxiliary_records::Received),
 }
 
 /// Wait for the next interesting event:
@@ -149,9 +150,11 @@ async fn await_next_input(
     wire_capacity_needed: Option<usize>,
     reliable: Option<&reliable_session::ReliableSession>,
     retained_children: Option<&ParallelChannels>,
+    auxiliary: Option<&ParallelChannels>,
 ) -> NextInput {
     use std::future::pending;
     tokio::select! {
+        event = async { match auxiliary { Some(channels) => channels.next_auxiliary().await, None => pending().await } } => NextInput::Auxiliary(event),
         _ = async {
             match retained_children {
                 Some(children) => children.transport_closed().await,
@@ -266,6 +269,25 @@ impl ParallelChannels {
             Self::Ordered(s) => s.reliable_delivery(),
         }
     }
+    async fn next_auxiliary(&self) -> auxiliary_records::Received {
+        match self {
+            Self::Quic(s) => s.next_auxiliary().await,
+            Self::Ordered(_) => std::future::pending().await,
+        }
+    }
+    fn has_auxiliary(&self) -> bool {
+        matches!(self, Self::Quic(s) if s.has_auxiliary())
+    }
+    fn auxiliary_sender(
+        &mut self,
+        priority: u8,
+        activity: &crate::local_source_activity::LocalSourceActivity,
+    ) -> Option<crate::reliable_frames::ReliableFrameHandle> {
+        match self {
+            Self::Quic(s) => s.auxiliary_sender(priority, activity),
+            Self::Ordered(_) => None,
+        }
+    }
     fn reliable_direct_app(&self) -> bool {
         match self {
             Self::Quic(s) => s.reliable_direct_app(),
@@ -342,7 +364,8 @@ impl RealtimeSender {
         tx: crate::datagram_flows::SessionDatagramTx,
     ) -> Self {
         let handle = handle.into();
-        static NEXT_SOURCE_COST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        static NEXT_SOURCE_COST_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
         let source_cost_id = NEXT_SOURCE_COST_ID
             .fetch_update(
                 std::sync::atomic::Ordering::Relaxed,
@@ -517,14 +540,16 @@ impl RealtimeDatagramLane {
     }
 }
 
-#[path = "source_work_cost.rs"]
-mod source_work_cost;
+#[path = "auxiliary_records.rs"]
+pub(super) mod auxiliary_records;
 #[path = "parallel_lanes.rs"]
 mod parallel_lanes;
 #[path = "reliable_session.rs"]
 pub mod reliable_session;
 #[path = "reliable_streams.rs"]
 mod reliable_streams;
+#[path = "source_work_cost.rs"]
+mod source_work_cost;
 pub use parallel_lanes::{
     BoundOrderedChild, BoundReliableChild, ParallelDiagnostics, ParallelPeekOutcome,
     ParallelQuicOffer, ParallelRegistration, ParallelRegistry, RegisteredOrderedChannel,
@@ -4588,6 +4613,7 @@ impl SessionRunner {
         let mut source_reliable_pressure_logged: Option<std::time::Instant> = None;
         let mut ingress_trace = crate::rt_trace::IngressTrace::default();
         let mut source_reliable_admitted_logged: Option<std::time::Instant> = None;
+        let mut auxiliary_logged = [false; 2];
         let mut reliable_snapshot_logged: Option<std::time::Instant> = None;
         let mut ordered_primary_pressure_logged: Option<std::time::Instant> = None;
         let mut first_ordered_primary_admitted_logged = false;
@@ -5068,10 +5094,10 @@ impl SessionRunner {
                             continue;
                         }
                         let max_datagram_size = sender_state.max_datagram_size;
-                        let datagram_sizes = match sender_state.tx.frame_wire_sizes(
-                            outgoing.len(),
-                            max_datagram_size,
-                        ) {
+                        let datagram_sizes = match sender_state
+                            .tx
+                            .frame_wire_sizes(outgoing.len(), max_datagram_size)
+                        {
                             Ok(sizes) => sizes,
                             Err(error) => {
                                 self.logger.debug(
@@ -5270,12 +5296,15 @@ impl SessionRunner {
                         // wait above restores plaintext, never a half-sent frame.
                         let datagrams = match sender_state.tx.encode_frame(
                             local_datagram_flow(outgoing_priority, body, lane_kind),
-                            outgoing, max_datagram_size,
+                            outgoing,
+                            max_datagram_size,
                         ) {
                             Ok(datagrams) => datagrams,
                             Err(error) => {
-                                self.logger.debug("session.realtime_datagram.encode_drop",
-                                    format!("peer_id={} error={error}", hex_short(&self.peer_id)));
+                                self.logger.debug(
+                                    "session.realtime_datagram.encode_drop",
+                                    format!("peer_id={} error={error}", hex_short(&self.peer_id)),
+                                );
                                 if independent_source {
                                     datagram_drained += 1;
                                     continue;
@@ -5654,6 +5683,7 @@ impl SessionRunner {
                     }
                 }
                 let mut child_reservation = None;
+                let mut selected_auxiliary = None;
                 let mut selected_route = reliable_streams::Route::Canonical;
                 let mut failed_child = None;
                 while !coalesce_active
@@ -5700,8 +5730,23 @@ impl SessionRunner {
                             }
                             return HeadAdmission::FlushBatch;
                         }
-                        let route = reliable_streams.route_with_local_class(frame, reliable_id, priority);
-                        let reservation = match route {
+                        let auxiliary = if (owned_reliable || priority == crate::LOCAL_NETWORK_CONTROL_LANE)
+                            && auxiliary_records::eligible(frame)
+                            && realtime_lane.as_ref().and_then(|lane|lane.parallel.as_ref()).is_some_and(ParallelChannels::has_auxiliary)
+                        { Some(if priority == crate::LOCAL_NETWORK_CONTROL_LANE { crate::LOCAL_SIGNALING_LANE } else { veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE }) } else { None };
+                        let route = if auxiliary.is_some() { Route::Canonical } else { reliable_streams.route_with_local_class(frame, reliable_id, priority) };
+                        let reservation = if let Some(source) = auxiliary {
+                            let handle = realtime_lane.as_mut().and_then(|lane|lane.parallel.as_mut()).and_then(|parallel|parallel.auxiliary_sender(source, &source_activity));
+                            let reserve = handle.as_ref().map(|handle|handle.try_reserve(frame));
+                            match reserve {
+                                Some(Ok(reservation)) => Some(reservation),
+                                _ => {
+                                    let retry = now + std::time::Duration::from_millis(10);
+                                    source_pressure_retry = Some(source_pressure_retry.map_or(retry, |old|old.min(retry)));
+                                    return HeadAdmission::DeferSource;
+                                }
+                            }
+                        } else { match route {
                             Route::Failed => { selected_route = route; return HeadAdmission::Allow; },
                             Route::Child(id) => {
                                 let Some(ready) = reliable_ready.as_ref().filter(|ready| ready.id() == id) else {
@@ -5719,9 +5764,9 @@ impl SessionRunner {
                             },
                             Route::Canonical if wire_tx.capacity() == 0 => return HeadAdmission::DeferSource,
                             Route::Canonical => None,
-                        };
+                        }};
                         let pending_blobs = wire_tx.max_capacity().saturating_sub(wire_tx.capacity());
-                        source_waiting_for_writer |= local_primary_active
+                        source_waiting_for_writer |= reservation.is_none() && local_primary_active
                             && priority >= veil_proto::priority::BULK
                             && pending_blobs != 0;
                         // Once encrypted, ordered bytes cannot expire without
@@ -5837,6 +5882,7 @@ impl SessionRunner {
                             }
                         }
                         selected_route = route;
+                        selected_auxiliary = auxiliary;
                         child_reservation = reservation;
                         HeadAdmission::Allow
                     })
@@ -5863,6 +5909,13 @@ impl SessionRunner {
                                 if let Some(ready) = &reliable_ready { ready.handle().close(); }
                             }
                             continue;
+                        }
+                        if let Some(source) = selected_auxiliary {
+                            let index = usize::from(source == crate::LOCAL_SIGNALING_LANE);
+                            if !auxiliary_logged[index] {
+                                auxiliary_logged[index] = true;
+                                self.logger.info("session.source_record.first_send", format!("peer_id={} local_priority={source} scope=endpoint",hex_short(&self.peer_id)));
+                            }
                         }
                         crate::frame_diag::note_chunk_frame_at(
                             "transport_selected",
@@ -6166,9 +6219,41 @@ impl SessionRunner {
                     realtime_lane.as_ref().and_then(|lane| lane.parallel.as_ref()).and_then(ParallelChannels::reliable).filter(|pool| pool.running()),
                     retained_children_after_swap.then(|| realtime_lane.as_ref()
                         .and_then(|lane| lane.parallel.as_ref())).flatten(),
+                    realtime_lane.as_ref().and_then(|lane| lane.parallel.as_ref()),
                 )
                 .await
                 {
+                    NextInput::Auxiliary(event) => {
+                        if !event.parent.is_active() { continue; }
+                        let valid = auxiliary_records::eligible(&event.frame)
+                            && decode_header(&event.frame).is_ok_and(|h| h.body_len.saturating_add(veil_crypto::session_cipher::AEAD_OVERHEAD as u32) <= self.max_frame_body);
+                        if !valid { self.record_violation("invalid auxiliary record"); event.handle.close(); continue; }
+                        let header = decode_header(&event.frame).expect("validated record header");
+                        timers.note_rx_activity(event.received_at);
+                        if !is_liveness_frame(header.family, header.msg_type) { timers.note_frame_received(event.received_at); }
+                        stall_trigger.clear();
+                        let bytes = event.frame.len() + veil_crypto::session_cipher::AEAD_OVERHEAD + 2;
+                        if let Some(metrics) = &self.metrics { metrics.add_transport_bytes_rx(bytes as u64); metrics.add_transport_bytes_rx_family(header.family, header.msg_type, bytes as u64); }
+                        rekey.record_bytes(bytes as u64); mlkem_rekey.record_bytes(bytes as u64);
+                        let body = &event.frame[veil_proto::header::HEADER_SIZE..];
+                        if Self::consume_rpc_response(&header, body, &mut pending_responses) { continue; }
+                        if header.family == FrameFamily::Control as u8 && header.msg_type == ControlMsg::KeepaliveAck as u16 {
+                            pending_keepalive_probe.clear(); keepalive_probe_trigger.clear();
+                            keepalive_swap_attempts = 0; keepalive_last_probe_spawned = false;
+                        }
+                        match self.dispatcher.dispatch(&header, body, self.peer_id) {
+                            DispatchResult::Response(response) => { enqueue_outbox_envelope(&mut pq,
+                                (crate::LOCAL_NETWORK_CONTROL_LANE, veil_bufpool::pooled_shared_from_vec(response)).into(), outbox.as_ref().map(|o|o.source_activity())); },
+                            DispatchResult::NoResponse => {},
+                            DispatchResult::Violation(reason) => { self.record_violation(&reason); event.handle.close(); },
+                            result => {
+                                if self.process_dispatch_result(result, &wire_tx, &mut rekey, &mut mlkem_rekey, &mut bp_signal, &mut write_error_count) {
+                                    Self::stop_writer(wire_tx, &mut writer_handle).await; return;
+                                }
+                            },
+                        }
+                        continue;
+                    },
                     NextInput::Reliable(event) => {
                         match event {
                             reliable_session::ReliableEvent::Changed => {},
@@ -6704,20 +6789,8 @@ impl SessionRunner {
             // (475.6): V1 `FindNodeResponse` removed —
             // the discovery walker uses `FindNodeV2Response` and
             // `ResolveTransportResponse` +.
-            if header.family == FrameFamily::Discovery as u8
-                && matches!(
-                    DiscoveryMsg::try_from(header.msg_type),
-                    Ok(DiscoveryMsg::FindValueResponse)
-                        | Ok(DiscoveryMsg::FindNodeV2Response)
-                        | Ok(DiscoveryMsg::ResolveTransportResponse)
-                )
-                && let Some(tx) = pending_responses.take(header.request_id)
-            {
-                // Copy plaintext into an owned Vec for the oneshot receiver.
-                // `body` is a slice borrowed from raw_body (which returns to
-                // pool soon); the receiver needs an owned copy.
-                let _ = tx.send(Some(body.to_vec()));
-                continue; // consumed — do not dispatch
+            if Self::consume_rpc_response(&header, body, &mut pending_responses) {
+                continue;
             }
 
             // ── Dispatch ─────────────────────────────────────────────────────
@@ -6980,6 +7053,29 @@ impl SessionRunner {
             mlkem_rekey.record_bytes(bytes as u64);
         }
         Ok(None)
+    }
+
+    /// Child records and the canonical stream share the same peer-scoped RPC
+    /// table. Consuming a response must not depend on its physical carrier.
+    fn consume_rpc_response(
+        header: &FrameHeader,
+        body: &[u8],
+        pending: &mut crate::pending_response_table::PendingResponseTable,
+    ) -> bool {
+        if header.family == FrameFamily::Discovery as u8
+            && matches!(
+                DiscoveryMsg::try_from(header.msg_type),
+                Ok(DiscoveryMsg::FindValueResponse
+                    | DiscoveryMsg::FindNodeV2Response
+                    | DiscoveryMsg::ResolveTransportResponse)
+            )
+            && let Some(tx) = pending.take(header.request_id)
+        {
+            let _ = tx.send(Some(body.to_vec()));
+            true
+        } else {
+            false
+        }
     }
 
     fn process_dispatch_result(

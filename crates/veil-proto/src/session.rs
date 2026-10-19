@@ -409,6 +409,9 @@ pub mod cap_extra_flags2 {
     /// Streamless AppSend/Sealed/Chunk records and their re-key reply on the
     /// existing reliable child. Older Delivery-only children reject these.
     pub const SUPPORTS_RELIABLE_DIRECT_APP: u8 = 1 << 1;
+    /// Domain-separated stateless records on the proof stream of a generic
+    /// QUIC child. No purpose, source role or scheduling preference is sent.
+    pub const SUPPORTS_AUXILIARY_RECORDS: u8 = 1 << 2;
 }
 
 #[cfg(test)]
@@ -590,6 +593,12 @@ impl CapabilitiesPayload {
     pub fn supports_reliable_direct_app(&self) -> bool {
         self.supports_reliable_parallel()
             && self.extra_flags2 & cap_extra_flags2::SUPPORTS_RELIABLE_DIRECT_APP != 0
+    }
+
+    /// Both endpoints must explicitly negotiate the additional record codec.
+    pub fn supports_auxiliary_records(&self) -> bool {
+        self.supports_duplex_parallel_quic()
+            && self.extra_flags2 & cap_extra_flags2::SUPPORTS_AUXILIARY_RECORDS != 0
     }
 
     // ── Capability helpers ───────────────────────────────────────────────
@@ -2703,6 +2712,28 @@ mod tests {
                 .unwrap()
                 .supports_direct_app_chunks()
         );
+    }
+
+    #[test]
+    fn auxiliary_records_require_explicit_duplex_capability_and_extension() {
+        let mut caps = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Core);
+        caps.extra_flags2 = cap_extra_flags2::SUPPORTS_AUXILIARY_RECORDS;
+        assert!(!caps.supports_auxiliary_records());
+        caps.flags = u8::MAX;
+        caps.extra_flags = u8::MAX;
+        assert!(caps.supports_auxiliary_records());
+        assert!(
+            CapabilitiesPayload::decode(&caps.encode())
+                .unwrap()
+                .supports_auxiliary_records()
+        );
+        assert!(
+            !CapabilitiesPayload::decode(&caps.encode()[..3])
+                .unwrap()
+                .supports_auxiliary_records()
+        );
+        caps.extra_flags2 = 0;
+        assert!(!caps.supports_auxiliary_records());
     }
 
     #[test]

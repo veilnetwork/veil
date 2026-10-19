@@ -2580,3 +2580,6 @@ async fn characterize_controllers_under_independent_media_and_file_load() {
         }
     }
 }
+
+#[path = "auxiliary_records_quic_tests.rs"]
+mod auxiliary_records_quic_tests;
