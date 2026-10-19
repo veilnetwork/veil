@@ -44,6 +44,10 @@ impl Stand {
     }
 
     async fn modes(records: bool, streams: bool) -> Self {
+        Self::transport_modes(records, streams, false).await
+    }
+
+    async fn transport_modes(records: bool, streams: bool, auxiliary_only: bool) -> Self {
         let left = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let right = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let la = left.local_addr().unwrap();
@@ -66,6 +70,9 @@ impl Stand {
         if streams {
             offer = offer.with_auxiliary_app_streams();
         }
+        if auxiliary_only {
+            offer = offer.with_auxiliary_only();
+        }
         let diagnostics = offer.diagnostics();
         let mut stream = local.into_stream().unwrap();
         stream.write_all(b"main").await.unwrap();
@@ -78,6 +85,9 @@ impl Stand {
         }
         if streams {
             remote_offer = remote_offer.with_auxiliary_app_streams();
+        }
+        if auxiliary_only {
+            remote_offer = remote_offer.with_auxiliary_only();
         }
         let mut remote_stream = other.into_stream().unwrap();
         remote_stream.read_exact(&mut [0; 4]).await.unwrap();
@@ -162,7 +172,16 @@ impl Drop for Stand {
 
 #[tokio::test]
 async fn auxiliary_files_and_rpc_use_separate_children_while_transit_stays_canonical() {
-    let mut stand = Stand::new(true).await;
+    verify_files_and_rpc(false).await;
+}
+
+#[tokio::test]
+async fn auxiliary_only_rpc_uses_control_connection_and_preserves_file_isolation() {
+    verify_files_and_rpc(true).await;
+}
+
+async fn verify_files_and_rpc(auxiliary_only: bool) {
+    let mut stand = Stand::transport_modes(true, auxiliary_only, auxiliary_only).await;
     let payload = data(7);
     assert!(stand.sender.send_reliable(payload.clone()).await);
     let file = stand.next().await;
@@ -182,6 +201,25 @@ async fn auxiliary_files_and_rpc_use_separate_children_while_transit_stays_canon
         .unwrap();
     let query = stand.next().await;
     assert_eq!(&*query.frame, &*request);
+    assert_ne!(query.handle.id(), file.handle.id());
+    assert_eq!(
+        stand
+            .sender
+            .local_datagram_channel_state(if auxiliary_only {
+                crate::LOCAL_NETWORK_CONTROL_LANE
+            } else {
+                crate::LOCAL_SIGNALING_LANE
+            }),
+        crate::LocalDatagramChannelState::Ready
+    );
+    assert_eq!(
+        stand.remote.network_control_source(),
+        if auxiliary_only {
+            crate::LOCAL_NETWORK_CONTROL_LANE
+        } else {
+            crate::LOCAL_SIGNALING_LANE
+        }
+    );
     // Independent child TX/RX state: a file-side failure cannot close control.
     file.handle.close();
     let response = record(
@@ -450,8 +488,18 @@ fn stream_record(msg: AppMsg, stream: u32, n: u64) -> veil_bufpool::PooledShared
 
 #[tokio::test]
 async fn auxiliary_app_stream_stays_on_one_source_channel_and_receives_replies() {
+    verify_whole_app_stream(false).await;
+}
+
+#[tokio::test]
+async fn auxiliary_only_app_stream_works_without_a_mixed_reliable_pool() {
+    verify_whole_app_stream(true).await;
+}
+
+async fn verify_whole_app_stream(auxiliary_only: bool) {
     timeout(Duration::from_secs(20), async {
-        let mut stand = Stand::modes(true, true).await;
+        let mut stand = Stand::transport_modes(true, true, auxiliary_only).await;
+        assert_eq!(stand.remote.reliable().is_none(), auxiliary_only);
         let stream = 317;
         assert!(
             stand
