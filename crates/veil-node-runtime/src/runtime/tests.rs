@@ -3384,10 +3384,14 @@ async fn punched_inbound_accepts_noncanonical_direction_without_evicting_a_live_
                 None,
                 None,
             )
-            .await
-            .unwrap();
-            assert_eq!(authenticated.node_id, local);
-            stream
+            .await;
+            match authenticated {
+                Ok(authenticated) => {
+                    assert_eq!(authenticated.node_id, local);
+                    Ok(stream)
+                }
+                Err(error) => Err(error.to_string()),
+            }
         });
         let responder = responder.await.unwrap();
         if punched {
@@ -3403,14 +3407,28 @@ async fn punched_inbound_accepts_noncanonical_direction_without_evicting_a_live_
             );
             push_session_handle(&services.tasks, handle);
         }
-        let mut stream = remote.await.unwrap();
+        let result = remote.await.unwrap();
         if !punched {
+            // Directional/dedup admission follows the responder's handshake.
+            // Closing a rejected QUIC connection may win over delivery of its
+            // final handshake flight; a rejected client need not finish it.
+            if let Err(error) = &result {
+                assert!(
+                    matches!(
+                        error.as_str(),
+                        "node handshake error: read OVL1 frame header: connection lost"
+                            | "node handshake error: read OVL1 frame body: connection lost"
+                    ),
+                    "unexpected rejection: {error}"
+                );
+            }
             sleep(Duration::from_millis(100)).await;
             assert!(
                 !services.has_live_session(peer.node_id.as_bytes()),
                 "ordinary inbound must keep configured mesh direction selection"
             );
         } else if held_stream.is_none() {
+            let stream = result.expect("the first accepted punched peer must authenticate");
             timeout(Duration::from_secs(2), async {
                 while !services.has_live_session(peer.node_id.as_bytes()) {
                     sleep(Duration::from_millis(10)).await;
@@ -3431,13 +3449,23 @@ async fn punched_inbound_accepts_noncanonical_direction_without_evicting_a_live_
                     .count(),
                 1
             );
-            assert!(
-                timeout(Duration::from_secs(1), stream.read_u8())
-                    .await
-                    .unwrap()
-                    .is_err(),
-                "duplicate punched session must be closed"
-            );
+            match result {
+                Ok(mut stream) => assert!(
+                    timeout(Duration::from_secs(1), stream.read_u8())
+                        .await
+                        .unwrap()
+                        .is_err(),
+                    "duplicate punched session must be closed"
+                ),
+                Err(error) => assert!(
+                    matches!(
+                        error.as_str(),
+                        "node handshake error: read OVL1 frame header: connection lost"
+                            | "node handshake error: read OVL1 frame body: connection lost"
+                    ),
+                    "unexpected rejection: {error}"
+                ),
+            }
         }
     }
     drop(held_stream);
