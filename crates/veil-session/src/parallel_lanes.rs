@@ -18,7 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use veil_transport::QuicParallelHandle;
 
 const BIND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-const SOURCE_SLOTS: usize = crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES.len();
+const SOURCE_SLOTS: usize = crate::local_datagram_status::LOCAL_SOURCE_PRIORITIES.len();
 const TRANSIT_SLOTS: usize = 2;
 const TOTAL_SLOTS: usize = SOURCE_SLOTS + TRANSIT_SLOTS;
 // Source counters retain logical ownership; transit counters observe physical
@@ -26,7 +26,7 @@ const TOTAL_SLOTS: usize = SOURCE_SLOTS + TRANSIT_SLOTS;
 const COUNTER_COUNT: usize = SOURCE_SLOTS + TOTAL_SLOTS;
 // The optional signaling child retires before reliable/replacement capacity
 // would be consumed; the peer retains the original generic connection bound.
-const _: () = assert!(TOTAL_SLOTS < QuicParallelHandle::CONNECTIONS_PER_DIRECTION);
+const _: () = assert!(TOTAL_SLOTS <= QuicParallelHandle::CONNECTIONS_PER_DIRECTION);
 
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -138,6 +138,7 @@ pub struct ParallelQuicOffer {
     reliable_direct_app: bool,
     auxiliary_records: bool,
     auxiliary_app_streams: bool,
+    auxiliary_only: bool,
     record_events: Option<mpsc::Sender<super::auxiliary_records::Received>>,
 }
 
@@ -153,6 +154,7 @@ impl ParallelQuicOffer {
             reliable_direct_app: false,
             auxiliary_records: false,
             auxiliary_app_streams: false,
+            auxiliary_only: false,
             record_events: None,
         }
     }
@@ -190,6 +192,20 @@ impl ParallelQuicOffer {
         self
     }
 
+    /// Requires authenticated agreement to omit the mixed reliable child.
+    pub fn with_auxiliary_only(mut self) -> Self {
+        self.auxiliary_only = true;
+        self
+    }
+
+    fn auxiliary_only(&self) -> bool {
+        self.duplex
+            && self.reliable
+            && self.auxiliary_records
+            && self.auxiliary_app_streams
+            && self.auxiliary_only
+    }
+
     pub fn with_reliable_direct_app(mut self) -> Self {
         self.reliable_direct_app = true;
         self
@@ -203,7 +219,7 @@ impl ParallelQuicOffer {
 fn channel_index(priority: u8) -> Option<usize> {
     // INTERACTIVE is always neutral transit; local IPC signaling has its own
     // private selector and never exposes it to the receiving peer.
-    crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES
+    crate::local_datagram_status::LOCAL_SOURCE_PRIORITIES
         .iter()
         .position(|&lane| lane == priority)
 }
@@ -718,7 +734,7 @@ impl ParallelSession {
         index: usize,
     ) -> Option<veil_transport::LocalSendBudgetFactory> {
         let activity = self.source_activity.as_ref()?;
-        let priority = crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES
+        let priority = crate::local_datagram_status::LOCAL_SOURCE_PRIORITIES
             .iter()
             .enumerate()
             .find_map(|(logical, priority)| {
@@ -737,6 +753,13 @@ impl ParallelSession {
 
     pub(super) fn has_auxiliary_app_streams(&self) -> bool {
         self.offer.auxiliary_records && self.offer.reliable && self.offer.auxiliary_app_streams
+    }
+    pub(super) fn network_control_source(&self) -> u8 {
+        if self.offer.auxiliary_only() {
+            crate::LOCAL_NETWORK_CONTROL_LANE
+        } else {
+            crate::LOCAL_SIGNALING_LANE
+        }
     }
     pub(super) async fn next_auxiliary(&self) -> super::auxiliary_records::Received {
         if !self.offer.auxiliary_records {
@@ -787,9 +810,16 @@ impl ParallelSession {
         context: RealtimeReceiverContext,
         status: Option<Arc<crate::local_datagram_status::LocalDatagramStatus>>,
     ) -> Self {
-        let readiness = status
-            .filter(|_| offer.duplex)
-            .map(|status| status.activate());
+        let readiness = status.filter(|_| offer.duplex).map(|status| {
+            if offer.auxiliary_only() {
+                status.activate_with_network_control()
+            } else {
+                status.activate()
+            }
+        });
+        // Legacy peers retain seven generic slots plus their mixed reliable
+        // child. New peers use that eighth slot locally, with no extra quota.
+        let capacity = TOTAL_SLOTS - usize::from(!offer.auxiliary_only());
         let parent = ParallelParent::new(sid, *tx, *rx);
         let (record_events, record_incoming) = mpsc::channel(8);
         let mut offer = offer;
@@ -801,6 +831,7 @@ impl ParallelSession {
             .and_then(|registry| registry.register(sid, parent.handle(), &offer, incoming_tx));
         let (reliable_tx, reliable_rx) = mpsc::channel(1);
         let reliable_enabled = offer.reliable
+            && !offer.auxiliary_only()
             && (registration
                 .as_ref()
                 .is_some_and(|r| r.enable_reliable(reliable_tx.clone()))
@@ -828,7 +859,7 @@ impl ParallelSession {
             _acceptor: acceptor,
             _registration: registration,
             slots: Default::default(),
-            assignments: Default::default(),
+            assignments: channel_assignments::ChannelAssignments::with_capacity(capacity),
             transit_salt: blake3::derive_key("veil/transit-shard/v1", &sid),
             recovery_schedule: Default::default(),
             reliable,
@@ -863,6 +894,9 @@ impl ParallelSession {
     /// Poll readiness and initiate warming without awaiting on the main
     /// session. Until authentication succeeds, frames use the current lane.
     pub(super) fn prepare(&mut self, priority: u8) -> bool {
+        if priority == crate::LOCAL_NETWORK_CONTROL_LANE && !self.offer.auxiliary_only() {
+            return false;
+        }
         let Some(index) = channel_index(priority) else {
             return false;
         };
@@ -897,6 +931,9 @@ impl ParallelSession {
         kind: RealtimeLaneFrameKind,
         ingress: Option<&veil_anonymity::circuit_carrier::Carrier>,
     ) -> Option<channel_assignments::Selection> {
+        if priority == crate::LOCAL_NETWORK_CONTROL_LANE && !self.offer.auxiliary_only() {
+            return None;
+        }
         let selected = if let Some(source) = channel_index(priority) {
             self.assignments.source(source)?
         } else {
@@ -1006,7 +1043,7 @@ impl ParallelSession {
             }
         }
         if let Some(lease) = &self.readiness {
-            for (source, priority) in crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES
+            for (source, priority) in crate::local_datagram_status::LOCAL_SOURCE_PRIORITIES
                 .iter()
                 .enumerate()
             {

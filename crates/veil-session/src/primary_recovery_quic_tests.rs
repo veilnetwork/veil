@@ -1163,15 +1163,20 @@ async fn bbr_recovers_fresh_datagrams_after_neutral_outage() {
 
 #[tokio::test]
 async fn local_signaling_and_data_have_distinct_quic_connections_and_survive_screen_close() {
-    verify_distinct_sources(false).await;
+    verify_distinct_sources(false, false).await;
 }
 
 #[tokio::test]
 async fn late_camera_and_screen_survive_idle_and_reopen_after_close_without_retiring_audio() {
-    verify_distinct_sources(true).await;
+    verify_distinct_sources(true, false).await;
 }
 
-async fn verify_distinct_sources(late_idle: bool) {
+#[tokio::test]
+async fn auxiliary_only_control_and_signaling_have_distinct_connections() {
+    verify_distinct_sources(false, true).await;
+}
+
+async fn verify_distinct_sources(late_idle: bool, auxiliary_only: bool) {
     use veil_proto::{
         ipc::LOCAL_RECOVERABLE_DATA_LANE,
         priority::{BACKGROUND, BULK},
@@ -1201,12 +1206,21 @@ async fn verify_distinct_sources(late_idle: bool) {
             .await
             .unwrap();
         let close = local.quic_connection().unwrap();
-        let a_offer = ParallelQuicOffer::new(local.parallel_quic().unwrap()).with_duplex();
+        let factory = local.parallel_quic().unwrap();
+        let mut a_offer = ParallelQuicOffer::new(factory.clone()).with_duplex();
+        if auxiliary_only {
+            a_offer = a_offer.with_reliable().with_auxiliary_records()
+                .with_auxiliary_app_streams().with_auxiliary_only();
+        }
         let diagnostics = a_offer.diagnostics();
         let mut a_stream = local.into_stream().unwrap();
         a_stream.write_all(b"main").await.unwrap();
         let remote = remote.await.unwrap().unwrap();
-        let b_offer = ParallelQuicOffer::new(remote.parallel_quic().unwrap()).with_duplex();
+        let mut b_offer = ParallelQuicOffer::new(remote.parallel_quic().unwrap()).with_duplex();
+        if auxiliary_only {
+            b_offer = b_offer.with_reliable().with_auxiliary_records()
+                .with_auxiliary_app_streams().with_auxiliary_only();
+        }
         let mut b_stream = remote.into_stream().unwrap();
         let mut prefix = [0; 4];
         b_stream.read_exact(&mut prefix).await.unwrap();
@@ -1239,14 +1253,16 @@ async fn verify_distinct_sources(late_idle: bool) {
         let mut a =
             ParallelSession::new(a_offer, &[2; 32], &[3; 32], [1; 32], context.clone(), None);
         let b = ParallelSession::new(b_offer, &[3; 32], &[2; 32], [1; 32], context, None);
-        let lanes = [
+        assert!(a.reliable().is_none());
+        let mut lanes = vec![
             REALTIME,
             BULK,
             BACKGROUND,
             LOCAL_RECOVERABLE_DATA_LANE,
             crate::LOCAL_SIGNALING_LANE,
         ];
-        for lane in lanes {
+        if auxiliary_only { lanes.push(crate::LOCAL_NETWORK_CONTROL_LANE); }
+        for &lane in &lanes {
             timeout(Duration::from_secs(5), async {
                 while !a.prepare(lane) {
                     sleep(Duration::from_millis(5)).await;
@@ -1255,7 +1271,7 @@ async fn verify_distinct_sources(late_idle: bool) {
             .await
             .unwrap();
         }
-        assert_eq!(diagnostics.active_connections(), 5);
+        assert_eq!(diagnostics.active_connections(), lanes.len());
         let mut bindings = HashSet::new();
         let mut handles = Vec::new();
         for (seq, lane) in lanes.into_iter().enumerate() {
@@ -1267,6 +1283,20 @@ async fn verify_distinct_sources(late_idle: bool) {
             let sender = a.sender(index);
             assert!(bindings.insert(sender.handle.quic().unwrap().channel_binding().unwrap()));
             handles.push(sender.handle.quic().unwrap().clone());
+        }
+        if auxiliary_only {
+            assert_eq!(factory.available_connection_slots(), 2);
+            // Fill both remaining generic slots. Closing/replacing signaling
+            // at the original eight-child quota must retain every other owner.
+            for index in [6, 7] {
+                timeout(Duration::from_secs(3), async {
+                    while !a.prepare_without_recovery(index) {
+                        sleep(Duration::from_millis(5)).await;
+                    }
+                }).await.unwrap();
+            }
+            assert_eq!(factory.available_connection_slots(), 0);
+            assert_eq!(diagnostics.active_connections(), 8);
         }
         if late_idle {
             // Exceed the real QUIC idle timeout without shortening config or

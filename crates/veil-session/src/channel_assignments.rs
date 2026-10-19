@@ -6,7 +6,7 @@
 use std::time::{Duration, Instant};
 use veil_anonymity::circuit_carrier::{Carrier, LocalTransitFlow};
 
-const SOURCE_COUNT: usize = crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES.len();
+const SOURCE_COUNT: usize = crate::local_datagram_status::LOCAL_SOURCE_PRIORITIES.len();
 const LEGACY_IDLE: Duration = Duration::from_secs(30);
 
 enum Owner {
@@ -23,17 +23,26 @@ pub(super) struct Selection {
 
 pub(super) struct ChannelAssignments<const N: usize> {
     owners: [Option<Owner>; N],
+    capacity: usize,
 }
 
 impl<const N: usize> Default for ChannelAssignments<N> {
     fn default() -> Self {
         Self {
             owners: std::array::from_fn(|_| None),
+            capacity: N,
         }
     }
 }
 
 impl<const N: usize> ChannelAssignments<N> {
+    pub fn with_capacity(capacity: usize) -> Self {
+        assert!(capacity <= N);
+        Self {
+            capacity,
+            ..Self::default()
+        }
+    }
     fn reap(&mut self, now: Instant) {
         // Reap BEFORE comparing allocation identities: an expired weak witness
         // cannot alias a newly allocated connection at a reused address.
@@ -120,9 +129,13 @@ impl<const N: usize> ChannelAssignments<N> {
     fn free(&self, preferred: usize) -> Option<usize> {
         self.owners
             .get(preferred)
-            .filter(|owner| owner.is_none())
+            .filter(|owner| preferred < self.capacity && owner.is_none())
             .map(|_| preferred)
-            .or_else(|| self.owners.iter().position(Option::is_none))
+            .or_else(|| {
+                self.owners[..self.capacity]
+                    .iter()
+                    .position(Option::is_none)
+            })
     }
 }
 
@@ -160,6 +173,27 @@ mod tests {
     }
     fn witness(value: &Arc<Ingress>) -> Carrier {
         Arc::downgrade(&(value.clone() as Arc<dyn DatagramCarrier>))
+    }
+
+    #[test]
+    fn legacy_capacity_reserves_a_slot_without_reclassifying_live_connections() {
+        let mut pool = ChannelAssignments::<8>::with_capacity(7);
+        let flows: Vec<_> = (0..7).map(|i| ingress(1, i)).collect();
+        for flow in &flows {
+            assert!(pool.transit(Some(&witness(flow)), 7).unwrap().physical < 7);
+        }
+        assert!(pool.transit(Some(&witness(&ingress(1, 8))), 0).is_none());
+        assert!(pool.source(0).is_none());
+        let mut modern = ChannelAssignments::<8>::with_capacity(8);
+        let mut selected = std::collections::HashSet::new();
+        for source in 0..SOURCE_COUNT {
+            assert!(selected.insert(modern.source(source).unwrap().physical));
+        }
+        for flow in flows.iter().take(2) {
+            assert!(selected.insert(modern.transit(Some(&witness(flow)), 0).unwrap().physical));
+        }
+        assert_eq!(selected.len(), 8);
+        assert!(modern.transit(Some(&witness(&flows[2])), 0).is_none());
     }
 
     #[test]

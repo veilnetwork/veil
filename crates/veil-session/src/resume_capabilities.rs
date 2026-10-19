@@ -269,6 +269,34 @@ mod tests {
     }
 
     #[test]
+    fn auxiliary_only_permission_is_authenticated_across_resume() {
+        use veil_proto::session::cap_extra_flags2;
+        let mut caps = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Core);
+        caps.flags = u8::MAX;
+        caps.extra_flags = u8::MAX;
+        caps.extra_flags2 = cap_extra_flags2::SUPPORTS_AUXILIARY_RECORDS
+            | cap_extra_flags2::SUPPORTS_AUXILIARY_APP_STREAMS
+            | cap_extra_flags2::SUPPORTS_AUXILIARY_ONLY;
+        let mut attach = vec![0; AttachPayload::WIRE_SIZE];
+        append(&mut attach, &caps, &[3; 32], &[1; 32], &[2; 32]);
+        assert!(
+            verify(&attach, &[3; 32], &[1; 32], &[2; 32])
+                .unwrap()
+                .unwrap()
+                .supports_auxiliary_only()
+        );
+        let second = AttachPayload::WIRE_SIZE + 4 + VALUE_LEN;
+        assert!(
+            !verify(&attach[..second], &[3; 32], &[1; 32], &[2; 32])
+                .unwrap()
+                .unwrap()
+                .supports_auxiliary_only()
+        );
+        attach[second + 4 + MARKER2.len() + 1] ^= cap_extra_flags2::SUPPORTS_AUXILIARY_ONLY;
+        assert!(verify(&attach, &[3; 32], &[1; 32], &[2; 32]).is_err());
+    }
+
+    #[test]
     fn auxiliary_app_streams_permission_cannot_survive_a_stripped_or_forged_resume() {
         use veil_proto::session::cap_extra_flags2;
         let mut caps = CapabilitiesPayload::from_node_role(veil_types::NodeRole::Core);
