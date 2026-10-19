@@ -1,4 +1,4 @@
-//! One node-local flight pool for authenticated outgoing source children.
+//! One node-local flight pool for trusted outgoing source transports.
 //! The ordinary per-connection CC still applies. No role is sent to a peer.
 //! Primary flight is charged before competing work; the primary itself keeps
 //! its normal controller, without an additional pause behind secondary debt.
@@ -102,6 +102,11 @@ fn wake(wakers: Vec<Waker>) {
 }
 
 impl SourceFlightPool {
+    #[cfg(test)]
+    pub(crate) fn transport_members(&self) -> usize {
+        lock!(self.0).rows.len()
+    }
+
     pub(crate) fn note_primary(&self, now: Instant) {
         let wakers = {
             let mut s = lock!(self.0);
@@ -183,6 +188,14 @@ impl SourceFlightPool {
         }
         installed
     }
+    pub(crate) fn factory(self: &Arc<Self>, role: Role) -> veil_transport::LocalSendBudgetFactory {
+        let pool = self.clone();
+        Arc::new(move |id| -> Arc<dyn LocalSendBudget> {
+            pool.binding(id, role, Instant::now())
+                .expect("fresh local connection ordinal")
+        })
+    }
+
     fn binding(self: &Arc<Self>, id: u64, role: Role, now: Instant) -> Option<Arc<Binding>> {
         let mut s = lock!(self.0);
         s.prune(now);

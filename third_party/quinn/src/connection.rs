@@ -6,26 +6,27 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::Arc,
-    task::{ready, Context, Poll, Waker},
+    task::{Context, Poll, Waker, ready},
 };
 
 use bytes::Bytes;
 use pin_project_lite::pin_project;
 use rustc_hash::FxHashMap;
 use thiserror::Error;
-use tokio::sync::{futures::Notified, mpsc, oneshot, Notify};
-use tracing::{debug_span, Instrument, Span};
+use tokio::sync::{Notify, futures::Notified, mpsc, oneshot};
+use tracing::{Instrument, Span, debug_span};
 
 use crate::{
+    ConnectionEvent, Duration, Instant, VarInt,
     mutex::Mutex,
     recv_stream::RecvStream,
     runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller},
     send_stream::SendStream,
-    udp_transmit, ConnectionEvent, Duration, Instant, VarInt,
+    udp_transmit,
 };
 use proto::{
-    congestion::Controller, ConnectionError, ConnectionHandle, ConnectionStats, Dir, EndpointEvent,
-    Side, StreamEvent, StreamId,
+    ConnectionError, ConnectionHandle, ConnectionStats, Dir, EndpointEvent, Side, StreamEvent,
+    StreamId, congestion::Controller,
 };
 
 /// Local scheduling delays, independent of protocol or application contents.
@@ -79,6 +80,7 @@ impl Connecting {
         conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
+        budget: Option<crate::LocalSendBudgetFactory>,
     ) -> Self {
         let (on_handshake_data_send, on_handshake_data_recv) = oneshot::channel();
         let (on_connected_send, on_connected_recv) = oneshot::channel();
@@ -93,6 +95,13 @@ impl Connecting {
             runtime.clone(),
         );
 
+        // Install before spawning: setting a budget on Connecting afterwards
+        // races the first Initial on a multi-threaded runtime.
+        if let Some(factory) = budget {
+            let mut state = conn.state.lock("initial_local_budget");
+            let policy = factory(state.local_trace_id);
+            assert!(state.inner.set_local_send_budget(policy));
+        }
         let driver = ConnectionDriver(conn.clone());
         runtime.spawn(Box::pin(
             async {

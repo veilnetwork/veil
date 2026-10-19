@@ -292,6 +292,7 @@ async fn connect_sender(
     index: usize,
     context: RealtimeReceiverContext,
     trace: Option<&recovery_trace::Attempt>,
+    budget: Option<veil_transport::LocalSendBudgetFactory>,
 ) -> Result<ReadySender, &'static str> {
     use recovery_trace::{Attempt, Phase};
     let started = std::time::Instant::now();
@@ -302,9 +303,12 @@ async fn connect_sender(
             format!("peer_id={} local_slot={index}", hex_short(&context.peer_id)),
         );
     }
+    if !parent.is_active() {
+        return Err("parent_retired");
+    }
     let connection = offer
         .handle
-        .connect()
+        .connect_with_local_send_budget(budget)
         .await
         .map_err(recovery_trace::connect_failure)?;
     Attempt::phase(trace, Phase::Channel);
@@ -682,6 +686,7 @@ pub(super) struct ParallelSession {
     recovery_schedule: datagram_recovery::RecoverySchedule,
     reliable: Option<super::reliable_session::ReliableSession>,
     record_incoming: tokio::sync::Mutex<mpsc::Receiver<super::auxiliary_records::Received>>,
+    source_activity: Option<Arc<crate::local_source_activity::LocalSourceActivity>>,
 }
 
 impl Drop for ParallelSession {
@@ -693,6 +698,28 @@ impl Drop for ParallelSession {
 }
 
 impl ParallelSession {
+    pub(super) fn with_source_activity(
+        mut self,
+        activity: Arc<crate::local_source_activity::LocalSourceActivity>,
+    ) -> Self {
+        self.source_activity = Some(activity);
+        self
+    }
+
+    fn source_budget_factory(
+        &self,
+        index: usize,
+    ) -> Option<veil_transport::LocalSendBudgetFactory> {
+        let activity = self.source_activity.as_ref()?;
+        let priority = crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES
+            .iter()
+            .enumerate()
+            .find_map(|(logical, priority)| {
+                (self.assignments.source_physical(logical) == Some(index)).then_some(*priority)
+            })?;
+        activity.source_budget_factory(priority)
+    }
+
     pub(super) async fn transport_closed(&self) {
         self.offer.handle.closed().await;
     }
@@ -795,6 +822,7 @@ impl ParallelSession {
             recovery_schedule: Default::default(),
             reliable,
             record_incoming: tokio::sync::Mutex::new(record_incoming),
+            source_activity: None,
         }
     }
 
@@ -809,6 +837,7 @@ impl ParallelSession {
         self.parent.retire();
         self._registration = None;
         let status = self.readiness.as_ref().map(|lease| lease.status());
+        let activity = self.source_activity.clone();
         *self = Self::new(
             self.offer.clone(),
             tx,
@@ -817,6 +846,7 @@ impl ParallelSession {
             self.context.clone(),
             status,
         );
+        self.source_activity = activity;
     }
 
     /// Poll readiness and initiate warming without awaiting on the main
@@ -913,6 +943,7 @@ impl ParallelSession {
             index,
             self.context.clone(),
             None,
+            self.source_budget_factory(index),
         )
         .await
         .expect("replacement proof");
@@ -1061,11 +1092,12 @@ impl ParallelSession {
         let mut trace = self.slots[index]
             .replacing
             .then(|| recovery_trace::Attempt::new(&context, offer.handle.clone(), index));
+        let budget = self.source_budget_factory(index);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let task = RealtimeReceiverTask(tokio::spawn(async move {
             match tokio::time::timeout(
                 BIND_TIMEOUT,
-                connect_sender(offer, parent, index, context, trace.as_ref()),
+                connect_sender(offer, parent, index, context, trace.as_ref(), budget),
             )
             .await
             {

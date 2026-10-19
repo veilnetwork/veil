@@ -50,8 +50,8 @@ mod mutex;
 mod recv_stream;
 mod runtime;
 mod send_stream;
-mod work_limiter;
 mod udp_wire_trace;
+mod work_limiter;
 pub use udp_wire_trace::set_udp_wire_trace;
 
 #[cfg(not(wasm_browser))]
@@ -62,6 +62,11 @@ pub(crate) use web_time::{Duration, Instant};
 #[cfg(feature = "bloom")]
 pub use proto::BloomTokenLog;
 pub use proto::local_send_budget;
+/// Process-local policy construction before the first connection driver poll.
+/// The ordinal is diagnostic/local, never a wire identity or service request.
+pub type LocalSendBudgetFactory = std::sync::Arc<
+    dyn Fn(u64) -> std::sync::Arc<dyn local_send_budget::LocalSendBudget> + Send + Sync,
+>;
 pub use proto::{
     AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosedStream, ConfigError,
     ConnectError, ConnectionClose, ConnectionError, ConnectionId, ConnectionIdGenerator,

@@ -149,6 +149,15 @@ impl QuicParallelHandle {
     /// discovery or a new local socket. The first stream is advertised lazily;
     /// send the authentication preface before awaiting the remote accept.
     pub async fn connect(&self) -> Result<Box<dyn TransportConnection>> {
+        self.connect_with_local_send_budget(None).await
+    }
+
+    /// A trusted local initiator can account for TLS and proof startup as well
+    /// as application traffic. The peer sees the same generic QUIC connection.
+    pub async fn connect_with_local_send_budget(
+        &self,
+        budget: Option<crate::LocalSendBudgetFactory>,
+    ) -> Result<Box<dyn TransportConnection>> {
         let ctx = Arc::clone(&self.0.context);
         let permit = self.reserve(&self.0.outgoing_slots)?;
         let operation = async {
@@ -167,10 +176,11 @@ impl QuicParallelHandle {
             let connection = self
                 .0
                 .endpoint
-                .connect_with(
+                .connect_with_local_send_budget_factory(
                     config,
                     self.0.parent.remote_address(),
                     ctx.effective_sni(sni, host),
+                    budget,
                 )?
                 .await?;
             let streams = connection.open_bi().await;

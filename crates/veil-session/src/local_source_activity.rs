@@ -104,6 +104,11 @@ impl Drop for ReliableSource {
 }
 
 impl LocalSourceActivity {
+    #[cfg(test)]
+    pub(crate) fn transport_members(&self) -> usize {
+        self.flight.transport_members()
+    }
+
     pub(crate) fn admit_lossy_work(
         &self,
         cell: &veil_types::local_lossy_work::LocalLossyCell,
@@ -191,6 +196,22 @@ impl LocalSourceActivity {
             activity: Arc::clone(self),
             id: state.reliable_sequence,
         }
+    }
+
+    pub(crate) fn source_budget_factory(
+        &self,
+        priority: u8,
+    ) -> Option<veil_transport::LocalSendBudgetFactory> {
+        if !crate::local_datagram_status::LOCAL_DATAGRAM_PRIORITIES.contains(&priority) {
+            return None;
+        }
+        use crate::local_source_flight::Role;
+        let role = match priority {
+            veil_proto::priority::REALTIME => Role::Primary,
+            crate::LOCAL_SIGNALING_LANE => Role::Control,
+            _ => Role::Secondary,
+        };
+        Some(self.flight.factory(role))
     }
 
     pub(crate) fn couple_source(
@@ -530,6 +551,34 @@ impl LocalSourceActivity {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn warm_budget_factories_reject_neutral_lanes_and_reuse_actual_flight() {
+        let source = LocalSourceActivity::default();
+        assert!(
+            source
+                .source_budget_factory(veil_proto::priority::INTERACTIVE)
+                .is_none()
+        );
+        assert!(
+            source
+                .source_budget_factory(crate::LOCAL_NETWORK_CONTROL_LANE)
+                .is_none()
+        );
+        let factory = source
+            .source_budget_factory(veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE)
+            .unwrap();
+        let policy = factory(77);
+        let now = Instant::now();
+        source.note(now);
+        policy.update_flight(2400);
+        assert_eq!(
+            policy.window(now, 2400, 1200),
+            2401,
+            "the warm's real bytes already consume the competing window"
+        );
+        policy.closed();
+    }
 
     #[test]
     fn early_transport_pressure_restrains_only_data_and_preserves_its_debt() {

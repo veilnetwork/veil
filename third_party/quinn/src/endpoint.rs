@@ -208,6 +208,18 @@ impl Endpoint {
         addr: SocketAddr,
         server_name: &str,
     ) -> Result<Connecting, ConnectError> {
+        self.connect_with_local_send_budget_factory(config, addr, server_name, None)
+    }
+
+    /// Connect with an optional process-local policy installed before any I/O.
+    /// Incoming accepts and ordinary connects retain their normal service.
+    pub fn connect_with_local_send_budget_factory(
+        &self,
+        config: ClientConfig,
+        addr: SocketAddr,
+        server_name: &str,
+        budget: Option<crate::LocalSendBudgetFactory>,
+    ) -> Result<Connecting, ConnectError> {
         let mut endpoint = self.inner.state.lock().unwrap();
         if endpoint.driver_lost || endpoint.recv_state.connections.close.is_some() {
             return Err(ConnectError::EndpointStopping);
@@ -230,7 +242,7 @@ impl Endpoint {
         Ok(endpoint
             .recv_state
             .connections
-            .insert(ch, conn, socket, self.runtime.clone()))
+            .insert(ch, conn, socket, self.runtime.clone(), budget))
     }
 
     /// Switch to a new UDP socket
@@ -430,7 +442,7 @@ impl EndpointInner {
                 Ok(state
                     .recv_state
                     .connections
-                    .insert(handle, conn, socket, runtime))
+                    .insert(handle, conn, socket, runtime, None))
             }
             Err(error) => {
                 if let Some(transmit) = error.response {
@@ -608,6 +620,7 @@ impl ConnectionSet {
         conn: proto::Connection,
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
+        budget: Option<crate::LocalSendBudgetFactory>,
     ) -> Connecting {
         let (send, recv) = mpsc::unbounded_channel();
         if let Some((error_code, ref reason)) = self.close {
@@ -618,7 +631,15 @@ impl ConnectionSet {
             .unwrap();
         }
         self.senders.insert(handle, send);
-        Connecting::new(handle, conn, self.sender.clone(), recv, socket, runtime)
+        Connecting::new(
+            handle,
+            conn,
+            self.sender.clone(),
+            recv,
+            socket,
+            runtime,
+            budget,
+        )
     }
 
     fn is_empty(&self) -> bool {
