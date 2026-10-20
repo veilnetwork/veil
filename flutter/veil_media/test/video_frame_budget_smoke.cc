@@ -3,6 +3,7 @@
 #include <thread>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <string>
 
 int main(int argc, char** argv) {
@@ -139,6 +140,64 @@ int main(int argc, char** argv) {
   stale.Observe(500, 80, 60, 13, 13'000'000);
   stale.SetAudioPressure(0, 13'000'000);
   assert(stale.snapshot().max_pixels > stale_cap);
+  // A transport-sized image can still spend multiple low-cadence frames'
+  // codec allocation. Reproduce the observed 1477-byte image at 5833 bit/s
+  // and 1 fps: healthy audio cannot make the missing next frame affordable.
+  veil_media::VideoFrameBudget cadence;
+  cadence.SetPacketPayload(1440);
+  cadence.SetProfile(8000);
+  cadence.SetRate(5833, 1.0);
+  cadence.SetAudioPressure(0, 1'000'000);
+  cadence.Observe(1477, 320, 240, 1, 1'100'000);
+  const int cadence_cap = cadence.snapshot().max_pixels;
+  assert(cadence_cap > 6144 && cadence_cap < 320 * 240);
+  for (int i = 2; i <= 10; ++i) {
+    cadence.Observe(500, 160, 120, i, i * 1'000'000);
+    cadence.SetAudioPressure(0, i * 1'000'000);
+  }
+  assert(cadence.snapshot().max_pixels == cadence_cap);
+  cadence.SetAudioPressure(1, 11'000'000);
+  assert(cadence.snapshot().max_pixels < cadence_cap);
+  for (int i = 12; i <= 40; ++i) {
+    cadence.Observe(500, 160, 120, i, i * 1'000'000);
+    cadence.SetAudioPressure(0, i * 1'000'000);
+    assert(cadence.snapshot().max_pixels <= cadence_cap);
+  }
+  assert(cadence.snapshot().max_pixels == cadence_cap);
+  // Rate jitter and encoder suspension cannot refund a source-size limit.
+  cadence.SetRate(6000, 1.0);
+  cadence.SetRate(0, 15.0);
+  for (int i = 41; i <= 45; ++i) {
+    cadence.Observe(500, 160, 120, i, i * 1'000'000);
+    cadence.SetAudioPressure(0, i * 1'000'000);
+  }
+  assert(cadence.snapshot().max_pixels == cadence_cap);
+  // Actual per-frame funding growth permits gradual recovery again.
+  cadence.SetProfile(16000);
+  cadence.SetRate(12000, 1.0);
+  for (int i = 46; i <= 50; ++i) {
+    cadence.Observe(500, 160, 120, i, i * 1'000'000);
+    cadence.SetAudioPressure(0, i * 1'000'000);
+  }
+  assert(cadence.snapshot().max_pixels > cadence_cap);
+  // Unknown/nonfinite FPS and the usual fast-camera cadence keep the existing
+  // healthy overshoot behavior. No fabricated frame rate is supplied.
+  for (double fps : {0.0, std::numeric_limits<double>::quiet_NaN(), 15.0}) {
+    veil_media::VideoFrameBudget ordinary;
+    ordinary.SetPacketPayload(1440);
+    ordinary.SetProfile(8000);
+    ordinary.SetRate(5833, fps);
+    ordinary.SetAudioPressure(0, 1'000'000);
+    ordinary.Observe(1477, 320, 240, 1, 1'100'000);
+    assert(ordinary.snapshot().max_pixels == 0);
+  }
+  veil_media::VideoFrameBudget fractional;
+  fractional.SetPacketPayload(1440);
+  fractional.SetProfile(15000);
+  fractional.SetRate(12000, 1.5);
+  fractional.SetAudioPressure(0, 1'000'000);
+  fractional.Observe(1900, 320, 240, 1, 1'100'000);
+  assert(fractional.snapshot().max_pixels > 0);
   // Packetizer setup, codec output and source requests have different queues.
   // A growth hold preserves the current cap and earned active recovery,
   // without banking time or frames from the hold itself.

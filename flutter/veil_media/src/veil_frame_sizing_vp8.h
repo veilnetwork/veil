@@ -44,7 +44,7 @@ class FrameSizingVp8Encoder final : public webrtc::VideoEncoder,
     return inner_->Encode(frame, types);
   }
   void SetRates(const RateControlParameters& rates) override {
-    budget_->SetRate(rates.bitrate.get_sum_bps());
+    budget_->SetRate(rates.bitrate.get_sum_bps(), rates.framerate_fps);
     inner_->SetRates(rates);
   }
   void OnPacketLossRateUpdate(float rate) override { inner_->OnPacketLossRateUpdate(rate); }
