@@ -33,6 +33,21 @@ struct Row {
     blocked_window: Option<(Instant, u64, u64)>,
     queue_drained: bool,
 }
+#[derive(Clone, Copy, Debug, Default)]
+struct DeliveryDiagnostics {
+    calls: u64,
+    stale: u64,
+    inactive: u64,
+    unhealthy: u64,
+    pressured: u64,
+    no_demand: u64,
+    funded_bytes: u64,
+    credit_wait: u64,
+    rtt_wait: u64,
+    grows: u64,
+    blocked: u64,
+    drained: u64,
+}
 #[derive(Debug, Default)]
 struct State {
     rows: HashMap<u64, Row>,
@@ -46,6 +61,7 @@ struct State {
     preparing: bool,
     turn_waiters: HashMap<u64, Waker>,
     last_trace: Option<Instant>,
+    delivery_diagnostics: DeliveryDiagnostics,
 }
 #[derive(Debug, Default)]
 pub(crate) struct SourceFlightPool(Mutex<State>);
@@ -177,14 +193,22 @@ impl SourceFlightPool {
                         state.total(),
                         state.window.max(state.floor(now)),
                         state.reserve(now),
+                        state.healthy_until.is_some_and(|t| now < t),
+                        state.pressure_until.is_some_and(|t| now < t),
+                        state.delivered_credit,
+                        state.delivery_diagnostics,
                     ))
                 } else {
                     None
                 }
             };
-            if let Some((members, flight, window, reserve)) = snapshot {
+            if let Some((members, flight, window, reserve, healthy, pressured, credit, d)) =
+                snapshot
+            {
                 log::info!(target: "veil::source_flight",
-                    "connection_trace_id={id} members={members} in_flight_bytes={flight} window_bytes={window} primary_control_reserve_bytes={reserve} scope=endpoint");
+                    "connection_trace_id={id} members={members} in_flight_bytes={flight} window_bytes={window} primary_control_reserve_bytes={reserve} scope=endpoint healthy={healthy} pressured={pressured} credit_bytes={credit} ack_calls={} ack_stale={} ack_inactive={} ack_unhealthy={} ack_pressured={} ack_no_demand={} ack_funded_bytes={} ack_credit_wait={} ack_rtt_wait={} window_grows={} blocked_calls={} drained_witnesses={}",
+                    d.calls, d.stale, d.inactive, d.unhealthy, d.pressured, d.no_demand,
+                    d.funded_bytes, d.credit_wait, d.rtt_wait, d.grows, d.blocked, d.drained);
             }
         }
         installed
@@ -313,7 +337,11 @@ impl LocalSendBudget for Binding {
             if bytes == 0 && row.queue_drained {
                 // ACK delivery is accounted before releasing this flight.
                 // With no queued or outstanding work, its demand is finished.
-                row.blocked_window = None;
+                let cleared = row.blocked_window.take().is_some();
+                if cleared {
+                    s.delivery_diagnostics.drained =
+                        s.delivery_diagnostics.drained.saturating_add(1);
+                }
             }
             if reduced { s.wakers() } else { Vec::new() }
         };
@@ -330,6 +358,7 @@ impl LocalSendBudget for Binding {
             .is_some_and(|r| r.role == Role::Secondary)
         {
             let reserve = s.reserve(now);
+            s.delivery_diagnostics.blocked = s.delivery_diagnostics.blocked.saturating_add(1);
             let row = s.rows.get_mut(&self.id).unwrap();
             row.queue_drained = false;
             row.blocked_window = Some((now, window, reserve));
@@ -342,7 +371,11 @@ impl LocalSendBudget for Binding {
             // Draining the producer queue does not finish a blocked send:
             // its real unacknowledged bytes still have to pay for the window.
             if row.flight == 0 {
-                row.blocked_window = None;
+                let cleared = row.blocked_window.take().is_some();
+                if cleared {
+                    s.delivery_diagnostics.drained =
+                        s.delivery_diagnostics.drained.saturating_add(1);
+                }
             }
         }
         if !s.demanded(now, s.window.max(s.floor(now))) {
@@ -352,30 +385,49 @@ impl LocalSendBudget for Binding {
     fn delivered(&self, now: Instant, sent: Instant, bytes: u64, rtt: Duration) {
         let wakers = {
             let mut s = lock!(self.pool.0);
-            if sent > now
-                || now.saturating_duration_since(sent) >= IDLE_GRACE
-                || rtt.is_zero()
-                || !s.active(now)
-                || !s.healthy_until.is_some_and(|t| now < t)
-                || s.pressure_until.is_some_and(|t| now < t)
-            {
+            s.delivery_diagnostics.calls = s.delivery_diagnostics.calls.saturating_add(1);
+            if sent > now || now.saturating_duration_since(sent) >= IDLE_GRACE || rtt.is_zero() {
+                s.delivery_diagnostics.stale = s.delivery_diagnostics.stale.saturating_add(1);
+                return;
+            }
+            if !s.active(now) {
+                s.delivery_diagnostics.inactive = s.delivery_diagnostics.inactive.saturating_add(1);
+                return;
+            }
+            if !s.healthy_until.is_some_and(|t| now < t) {
+                s.delivery_diagnostics.unhealthy =
+                    s.delivery_diagnostics.unhealthy.saturating_add(1);
+                return;
+            }
+            if s.pressure_until.is_some_and(|t| now < t) {
+                s.delivery_diagnostics.pressured =
+                    s.delivery_diagnostics.pressured.saturating_add(1);
                 return;
             }
             let floor = s.floor(now);
             let limit = s.window.max(floor);
             if !s.demanded(now, limit) {
+                s.delivery_diagnostics.no_demand =
+                    s.delivery_diagnostics.no_demand.saturating_add(1);
                 s.delivered_credit = 0;
                 return;
             }
             s.delivered_credit = s.delivered_credit.saturating_add(bytes);
+            s.delivery_diagnostics.funded_bytes =
+                s.delivery_diagnostics.funded_bytes.saturating_add(bytes);
             // A full usable secondary flight, excluding the unsent primary
             // reserve. Requiring delivery of the reserve would prevent a
             // backlogged secondary from ever probing a larger window.
             let usable = limit.saturating_sub(s.reserve(now)).max(1);
-            if s.delivered_credit < usable
-                || s.last_growth
-                    .is_some_and(|at| now <= at || now.saturating_duration_since(at) < rtt)
+            if s.delivered_credit < usable {
+                s.delivery_diagnostics.credit_wait =
+                    s.delivery_diagnostics.credit_wait.saturating_add(1);
+                return;
+            }
+            if s.last_growth
+                .is_some_and(|at| now <= at || now.saturating_duration_since(at) < rtt)
             {
+                s.delivery_diagnostics.rtt_wait = s.delivery_diagnostics.rtt_wait.saturating_add(1);
                 return;
             }
             // One packet per delivered usable window, at most once per RTT.
@@ -383,6 +435,7 @@ impl LocalSendBudget for Binding {
             // neither old demand nor compressed ACKs can spend unfilled windows.
             let mtu = u64::from(s.rows.get(&self.id).map_or(1200, |r| r.mtu));
             s.window = limit.saturating_add(mtu).min(u64::from(u32::MAX));
+            s.delivery_diagnostics.grows = s.delivery_diagnostics.grows.saturating_add(1);
             s.delivered_credit = 0;
             s.last_growth = Some(now);
             s.wakers()
