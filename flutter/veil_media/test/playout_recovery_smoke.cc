@@ -1,5 +1,6 @@
 #undef NDEBUG  // The WebRTC release flags must not disable this regression.
 #include "veil_playout_recovery.h"
+#include "rtc_base/time_utils.h"
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -16,16 +17,25 @@ class Decoder final : public webrtc::NetEq {
   int maximum_delay = 0;
   int maximum_delay_calls = 0;
   int insert_result = 0;
+  int fault_after = 1;
+  bool clocked_output = false;
+  bool packet_witness = false;
+  webrtc::RTPHeader clock_header{};
+  uint32_t clock_origin = 0;
   int GetAudio(webrtc::AudioFrame* f, bool* muted, int* rate,
                std::optional<Operation>) override {
     ++pulls;
-    f->UpdateFrame(10000 + pulls * 480, nullptr, 480, 48000,
-        pulls > 1 && mode == 1 ? webrtc::AudioFrame::kPLC : webrtc::AudioFrame::kNormalSpeech,
+    f->UpdateFrame((clocked_output ? clock_origin : 10000) + pulls * 480, nullptr, 480, 48000,
+        pulls > fault_after && mode == 1 ? webrtc::AudioFrame::kPLC : webrtc::AudioFrame::kNormalSpeech,
         webrtc::AudioFrame::kVadActive, 1);
-    f->mutable_data()[0] = pulls == 1 ? 1000 : 2000;
-    if (muted) *muted = pulls > 1 && mode == 2;
+    f->packet_infos_ = webrtc::RtpPacketInfos();
+    if (clocked_output && packet_witness && pulls == 1)
+      f->packet_infos_ = webrtc::RtpPacketInfos(webrtc::RtpPacketInfos::vector_type{
+          webrtc::RtpPacketInfo(clock_header, webrtc::Timestamp::Micros(1000000))});
+    f->mutable_data()[0] = clocked_output ? pulls * 1000 : pulls == 1 ? 1000 : 2000;
+    if (muted) *muted = pulls > fault_after && mode == 2;
     if (rate) *rate = 48000;
-    return pulls > 1 && mode == 3 ? kFail : kOK;
+    return pulls > fault_after && mode == 3 ? kFail : kOK;
   }
   int InsertPacket(const webrtc::RTPHeader&, std::span<const uint8_t>, const webrtc::RtpPacketInfo&) override { return insert_result; }
   void SetCodecs(const std::map<int, webrtc::SdpAudioFormat>&) override {}
@@ -61,7 +71,74 @@ class Decoder final : public webrtc::NetEq {
   void FlushBuffers() override { std::abort(); }
   int SyncBufferSizeMs() const override { return mode == 6 ? 10 : 40; }
 };
+
+class RenderClock : public webrtc::ClockInterface {
+ public:
+  int64_t us = 1000000;
+  int64_t TimeNanos() const override { return us * 1000; }
+};
+
+void DecodedAgeRegression(int mode = 0, int queued_ms = 90,
+                          bool witness = true, bool aligned = true,
+                          bool explicit_action = false) {
+  RenderClock wall;
+  auto* previous = webrtc::SetClockForTesting(&wall);
+  {
+    auto decoder = std::make_unique<Decoder>();
+    auto* observed = decoder.get();
+    observed->mode = mode;
+    observed->fault_after = 2;
+    observed->frame_ms = 40;
+    observed->buffer_ms_override = queued_ms;
+    observed->clocked_output = true;
+    observed->packet_witness = witness;
+    auto stats = std::make_shared<veil_media::PlayoutRecoveryStats>();
+    veil_media::RecoveringNetEq recovering(std::move(decoder), stats);
+    assert(recovering.RegisterPayloadType(111, webrtc::SdpAudioFormat("opus", 48000, 2)));
+    webrtc::RTPHeader header{};
+    header.ssrc = 11;
+    header.payloadType = 111;
+    const uint8_t payload[] = {1}; // The fake decoder accepts every payload.
+    for (int i = 0; i < 4; ++i) {
+      wall.us = 1000000 + i * 40000;
+      header.timestamp = i * 1920;
+      header.sequenceNumber = 20 + i;
+      assert(recovering.InsertPacket(header, payload,
+          webrtc::RtpPacketInfo(header, webrtc::Timestamp::Micros(wall.us))) == 0);
+    }
+    observed->clock_header = header;
+    observed->clock_origin = header.timestamp - 480 + (aligned ? 0 : 9600);
+    webrtc::AudioFrame frame;
+    wall.us = 1250000;
+    // Establish an actual decoded-packet witness without trimming. The next
+    // 10-ms block has no packet metadata of its own, as real NetEq can emit.
+    assert(recovering.GetAudio(&frame, nullptr, nullptr,
+        webrtc::NetEq::Operation::kNormal) == 0);
+    assert(observed->pulls == 1 && stats->discarded_ms == 0);
+    wall.us = 1280000;
+    auto action = explicit_action ? std::optional<webrtc::NetEq::Operation>(
+        webrtc::NetEq::Operation::kNormal) : std::nullopt;
+    assert(recovering.GetAudio(&frame, nullptr, nullptr, action) == 0);
+    const bool attempt = queued_ms >= 70 && witness && aligned &&
+        !explicit_action && mode != 6;
+    const bool skipped = attempt && mode == 0;
+    assert(observed->pulls == (attempt ? 3 : 2));
+    assert(stats->discarded_ms == (skipped ? 10u : 0u));
+    assert(frame.data()[0] == (skipped ? 3000 : 2000));
+    assert(frame.speech_type_ == webrtc::AudioFrame::kNormalSpeech);
+    assert(frame.packet_infos_.empty());
+    assert(stats->fallback_frames == (attempt && (mode == 1 || mode == 2) ? 1u : 0u));
+  }
+  webrtc::SetClockForTesting(previous);
+}
+
 int main() {
+  DecodedAgeRegression();
+  DecodedAgeRegression(0, 60); // Leave a complete packet plus 20 ms.
+  DecodedAgeRegression(0, 90, false); // Never infer an output clock.
+  DecodedAgeRegression(0, 90, true, false); // A stale decoder origin.
+  DecodedAgeRegression(0, 90, true, true, true); // Caller-directed operation.
+  for (int mode : {1, 2, 3, 6}) DecodedAgeRegression(mode);
   for (int mode = 0; mode <= 9; ++mode) {
     auto decoder = std::make_unique<Decoder>();
     auto* observed = decoder.get();
