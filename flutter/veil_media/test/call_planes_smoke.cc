@@ -19,6 +19,7 @@
 using Injector = int (*)(void*, uint64_t, uint32_t, uint32_t);
 extern "C" int veil_media_test_route_restarts(VeilMediaEngine*, int);
 extern "C" int veil_media_test_with_held_video_worker(VeilMediaEngine*, int (*)(void*), void*);
+extern "C" int veil_media_test_group_with_held_video(VeilGroupMediaEngine*, int (*)(void*), void*);
 extern "C" int veil_media_test_direct_call_planes(VeilMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_blocked_audio_stats(VeilMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_muted_capture_lifecycle();
@@ -364,6 +365,86 @@ int main(int argc, char** argv) {
     loss(190, video, 3, 124, 0);
     assert(stat(one.get(), "video_persistent_loss_report_us") == direct_loss);
     std::puts("video loss: real RR parsing, late fill, unicast/group persistence and compound integrity PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--audio-source-pixels") == 0) {
+    unsetenv("VEIL_MEDIA_TEST_VIDEO");
+    for (bool room : {false, true}) {
+      uint8_t local[32] = {91}, peer[32] = {92};
+      std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> one(
+          room ? nullptr : veil_media_engine_create(71, local, peer), veil_media_engine_destroy);
+      std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> group(
+          room ? veil_media_group_engine_create(local) : nullptr, veil_media_group_engine_destroy);
+      if (room) {
+        assert(group);
+        assert(veil_media_group_engine_add_peer(group.get(), 82, peer) == 0);
+        assert(veil_media_group_engine_set_mic_muted(group.get(), 1) == 0);
+        assert(veil_media_group_engine_start_audio(group.get()) == 0);
+      } else {
+        assert(one);
+        assert(veil_media_engine_start_audio(one.get(), 0, 1) == 0);
+      }
+      const auto hint = [&](int pressure) {
+        return room ? veil_media_group_engine_set_audio_source_pressure(group.get(), pressure)
+                    : veil_media_engine_set_audio_source_pressure(one.get(), pressure);
+      };
+      const auto metric = [&](const char* name) {
+        return room ? group_stat(group.get(), name) : stat(one.get(), name);
+      };
+      assert(hint(2) == VEIL_MEDIA_ERR_ARG);
+      assert(hint(0) == 0);
+      assert((room ? veil_media_group_engine_start_video(group.get())
+                   : veil_media_engine_start_video(one.get(), 1, 1, 15, 6)) == 0);
+      assert((room ? veil_media_group_engine_set_video_budget(group.get(), 15, 6)
+                   : veil_media_engine_set_video_budget(one.get(), 15, 6)) == 0);
+      std::vector<uint8_t> y(320 * 240, 128), uv(320 * 240 / 4, 128);
+      int tick = 0;
+      const auto push = [&] {
+        std::fill(y.begin(), y.end(), uint8_t(128 + (++tick % 5)));
+        assert((room ? veil_media_group_engine_push_video_frame(group.get(),
+                    y.data(), uv.data(), uv.data(), 320, 240, 320, 160, 160, 0)
+                     : veil_media_engine_push_video_frame(one.get(),
+                    y.data(), uv.data(), uv.data(), 320, 240, 320, 160, 160, 0)) == 0);
+      };
+      const auto initial_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+      while (!metric("video_frame_encoded_pixels") &&
+             std::chrono::steady_clock::now() < initial_deadline) {
+        push();
+        std::this_thread::sleep_for(std::chrono::milliseconds(35));
+      }
+      assert(metric("video_frame_encoded_pixels") > 0);
+      assert(metric("video_frame_oversize_count") == 0);
+      struct Context { VeilMediaEngine* one; VeilGroupMediaEngine* group; } context{one.get(), group.get()};
+      const auto blocked_hint = [](void* value) {
+        const auto* ctx = static_cast<Context*>(value);
+        const auto start = std::chrono::steady_clock::now();
+        assert((ctx->group ? veil_media_group_engine_set_audio_source_pressure(ctx->group, 1)
+                           : veil_media_engine_set_audio_source_pressure(ctx->one, 1)) == 0);
+        assert(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(50));
+        return 0;
+      };
+      assert((room ? veil_media_test_group_with_held_video(group.get(), blocked_hint, &context)
+                   : veil_media_test_with_held_video_worker(one.get(), blocked_hint, &context)) == 0);
+      assert(metric("video_audio_pixel_cuts") > 0);
+      assert(metric("video_frame_pixel_cap") > 0);
+      auto next_hint = std::chrono::steady_clock::now();
+      const auto recovery_deadline = next_hint + std::chrono::seconds(6);
+      while (!metric("video_audio_pixel_recoveries") &&
+             std::chrono::steady_clock::now() < recovery_deadline) {
+        push();
+        if (std::chrono::steady_clock::now() >= next_hint) {
+          assert(hint(0) == 0);
+          next_hint += std::chrono::seconds(1);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(35));
+      }
+      assert(metric("video_audio_pixel_recoveries") > 0);
+      assert(metric(room ? "video_kbps" : "target_bitrate_bps") == (room ? 15 : 15000));
+      assert(hint(-1) == 0);
+      assert(metric("video_audio_feedback_state") == static_cast<uint64_t>(-1));
+      std::printf("%s measured audio pixels: floor, blocked video, recovery PASS\n", room ? "group" : "direct");
+    }
+    assert(callbacks.empty());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--frame-sizing") == 0) {
