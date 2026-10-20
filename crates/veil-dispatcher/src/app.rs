@@ -224,12 +224,35 @@ impl FrameDispatcher {
                 // Remotely-opened (APP_OPEN-tracked) stream: enforce the receive
                 // window before delivering to the local endpoint.
                 let byte_count = payload.data.len() as u32;
-                if !self.stream_table.record_data_received(
+                match self.stream_table.receive_data(
                     node_id.as_bytes(),
                     header.stream_id,
                     byte_count,
                 ) {
-                    return DispatchResult::Violation("APP_DATA exceeds receive window".to_owned());
+                    veil_app::streams::DataReceiveResult::Accepted => {}
+                    veil_app::streams::DataReceiveResult::WindowExceeded => {
+                        return DispatchResult::Violation(
+                            "APP_DATA exceeds receive window".to_owned(),
+                        );
+                    }
+                    veil_app::streams::DataReceiveResult::UnknownStream => {
+                        // A local close/backpressure teardown can remove the
+                        // bridge before already-admitted peer data arrives.
+                        // Reject those bytes on this stream, without retiring
+                        // its carrier and escalating into a peer-wide ban that
+                        // also silences independent live datagrams.
+                        let close = AppClosePayload {
+                            app_id: payload.app_id,
+                            endpoint_id: payload.endpoint_id,
+                            reason: veil_proto::app::close_reason::NORMAL,
+                        };
+                        return DispatchResult::Response(encode_response(
+                            header,
+                            FrameFamily::App as u8,
+                            AppMsg::AppClose as u16,
+                            &close.encode(),
+                        ));
+                    }
                 }
                 // If this stream_id is tracked in the stream_table (opened via APP_OPEN)
                 // route as StreamData so the endpoint can correlate data to the correct stream.
