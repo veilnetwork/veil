@@ -18,9 +18,12 @@ class AudioSoftLossWindow {
  public:
   enum class Kind { Concealment, Catchup };
   static constexpr int64_t kWindowUs = 6'000'000;
-  // Initial client policy: 2% of six seconds (120ms). Shorter impairments
-  // still hold growth; actual RTP loss/interruption/buffer guards are separate.
+  // Moderate damage needs fresh losses spanning three seconds. A shorter
+  // burst holds growth unless it reaches 4% of this six-second window.
+  // RTP loss, interruption and sustained buffer guards remain independent.
   static constexpr uint64_t kThresholdSamples = 120 * 48;
+  static constexpr uint64_t kBurstThresholdSamples = 240 * 48;
+  static constexpr int64_t kSustainedUs = 3'000'000;
   static constexpr uint64_t kMaximumSamples = 6000 * 48;
 
   void Observe(Kind kind, uint64_t origin, uint64_t sequence,
@@ -51,7 +54,12 @@ class AudioSoftLossWindow {
     if (!fresh || !delta) return;
     events_.push_back({at_us, std::min(delta, kMaximumSamples)});
     if (events_.size() > 4096) events_.pop_front();
-    if (Samples(at_us) >= kThresholdSamples) qualified_at_us_ = at_us;
+    const auto damage = Samples(at_us);
+    if (damage >= kBurstThresholdSamples ||
+        (damage >= kThresholdSamples &&
+         at_us - events_.front().at_us >= kSustainedUs)) {
+      qualified_at_us_ = at_us;
+    }
   }
   bool supported() const { return supported_; }
   bool FreshAt(int64_t now_us) const {

@@ -24,15 +24,15 @@ int main() {
     require(damage.Samples(3'000'000) == 38*48 && damage.FreshReportUs(3'000'000) == 0,
             "two short events became significant damage");
     damage.Observe(Kind::Catchup, 1, 1, 0, true, false, 3'000'000);
-    damage.Observe(Kind::Catchup, 1, 2, 85*48, true, true, 4'000'000);
-    require(damage.Samples(4'000'000) == 123*48 &&
-                damage.FreshReportUs(4'000'321) == 4'000'000,
+    damage.Observe(Kind::Catchup, 1, 2, 85*48, true, true, 5'000'000);
+    require(damage.Samples(5'000'000) == 123*48 &&
+                damage.FreshReportUs(5'000'321) == 5'000'000,
             "combined discarded speech and concealment did not qualify");
-    damage.Observe(Kind::Catchup, 1, 2, 5000*48, true, true, 4'100'000);
-    damage.Observe(Kind::Catchup, 1, 3, 1, true, true, 4'200'000);
-    damage.Observe(Kind::Catchup, 1, 4, 85*48, true, true, 4'300'000);
-    require(damage.Samples(4'300'000) == 123*48 &&
-                damage.FreshReportUs(4'300'000) == 4'000'000,
+    damage.Observe(Kind::Catchup, 1, 2, 5000*48, true, true, 5'100'000);
+    damage.Observe(Kind::Catchup, 1, 3, 1, true, true, 5'200'000);
+    damage.Observe(Kind::Catchup, 1, 4, 85*48, true, true, 5'300'000);
+    require(damage.Samples(5'300'000) == 123*48 &&
+                damage.FreshReportUs(5'300'000) == 5'000'000,
             "replay/rollback/cached counters renewed damage");
     require(damage.Samples(8'000'000) == 112*48 && damage.FreshReportUs(8'000'000) == 0,
             "expired contributions kept qualifying pressure");
@@ -43,14 +43,40 @@ int main() {
     damage.Observe(Kind::Concealment, 2, 2, 900000 + 119*48, true, true, 8'400'000);
     require(damage.FreshReportUs(8'400'000) == 0, "old/unknown report poisoned a new origin");
     damage.Observe(Kind::Concealment, 2, 3, 900000 + 120*48, true, true, 8'500'000);
-    require(damage.FreshReportUs(8'500'000) == 8'500'000, "120ms boundary missed");
-    damage.Observe(Kind::Concealment, 2, 4, 9999999, true, true, 15'000'000);
-    require(damage.Samples(15'000'000) == 0, "observation gap became fresh damage");
-    damage.Observe(Kind::Concealment, 2, 5, 10000099, true, false, 16'000'000);
-    require(damage.Samples(16'000'000) == 0, "stale newly observed counter became damage");
-    require(!damage.FreshAt(22'000'000), "cached duration counters stayed fresh forever");
+    require(damage.FreshReportUs(8'500'000) == 0, "short 120ms burst cut video");
+    damage.Observe(Kind::Concealment, 2, 4, 900000 + 121*48, true, true, 11'400'000);
+    require(damage.FreshReportUs(11'400'000) == 11'400'000,
+            "sustained moderate damage did not qualify");
+    damage.Observe(Kind::Concealment, 2, 5, 9999999, true, true, 18'000'000);
+    require(damage.Samples(18'000'000) == 0, "observation gap became fresh damage");
+    damage.Observe(Kind::Concealment, 2, 6, 10000099, true, false, 19'000'000);
+    require(damage.Samples(19'000'000) == 0, "stale newly observed counter became damage");
+    require(!damage.FreshAt(25'000'000), "cached duration counters stayed fresh forever");
     require(AudioSoftLossWindow::CatchupSamples(7000) == 7000*48,
             "cumulative catchup saturated at the rolling window");
+  }
+  {
+    using Kind = AudioSoftLossWindow::Kind;
+    AudioSoftLossWindow burst;
+    burst.Observe(Kind::Concealment, 3, 1, 0, true, true, 1'000'000);
+    burst.Observe(Kind::Concealment, 3, 2, 28*48, true, true, 2'000'000);
+    burst.Observe(Kind::Concealment, 3, 3, 142*48, true, true, 3'000'000);
+    require(burst.Samples(3'000'000) == 142*48 && burst.FreshReportUs(3'000'000) == 0,
+            "captured 28ms then 114ms burst immediately cut video");
+    burst.Observe(Kind::Concealment, 3, 4, 142*48, true, true, 6'000'000);
+    require(burst.FreshReportUs(6'000'000) == 0,
+            "time or a cached counter manufactured sustained loss");
+    burst.Observe(Kind::Concealment, 3, 5, 143*48, true, true, 6'000'001);
+    require(burst.FreshReportUs(6'000'001) == 6'000'001,
+            "new moderate loss across three seconds failed to protect audio");
+    AudioSoftLossWindow severe;
+    severe.Observe(Kind::Concealment, 4, 1, 0, true, true, 1'000'000);
+    severe.Observe(Kind::Concealment, 4, 2, 239*48, true, true, 1'000'001);
+    require(severe.FreshReportUs(1'000'001) == 0, "sub-limit burst cut video");
+    severe.Observe(Kind::Concealment, 4, 3, 240*48, true, true, 1'000'002);
+    require(severe.FreshReportUs(1'000'002) == 1'000'002,
+            "large burst did not protect audio immediately");
+    require(severe.FreshReportUs(7'000'002) == 0, "large burst never expired");
   }
   AudioRecoveryRegistry registry_a, registry_b;
   const auto decoder_a = registry_a.NewStream();
