@@ -31,6 +31,7 @@ struct Row {
     closed_until: Option<Instant>,
     waker: Option<Waker>,
     blocked_window: Option<(Instant, u64, u64)>,
+    queue_drained: bool,
 }
 #[derive(Debug, Default)]
 struct State {
@@ -222,6 +223,7 @@ impl SourceFlightPool {
                 closed_until: None,
                 waker: None,
                 blocked_window: None,
+                queue_drained: false,
             },
         );
         Some(binding)
@@ -308,6 +310,11 @@ impl LocalSendBudget for Binding {
             };
             let reduced = bytes < row.flight;
             row.flight = bytes;
+            if bytes == 0 && row.queue_drained {
+                // ACK delivery is accounted before releasing this flight.
+                // With no queued or outstanding work, its demand is finished.
+                row.blocked_window = None;
+            }
             if reduced { s.wakers() } else { Vec::new() }
         };
         wake(wakers);
@@ -323,13 +330,20 @@ impl LocalSendBudget for Binding {
             .is_some_and(|r| r.role == Role::Secondary)
         {
             let reserve = s.reserve(now);
-            s.rows.get_mut(&self.id).unwrap().blocked_window = Some((now, window, reserve));
+            let row = s.rows.get_mut(&self.id).unwrap();
+            row.queue_drained = false;
+            row.blocked_window = Some((now, window, reserve));
         }
     }
     fn app_limited(&self, now: Instant) {
         let mut s = lock!(self.pool.0);
         if let Some(row) = s.rows.get_mut(&self.id) {
-            row.blocked_window = None;
+            row.queue_drained = true;
+            // Draining the producer queue does not finish a blocked send:
+            // its real unacknowledged bytes still have to pay for the window.
+            if row.flight == 0 {
+                row.blocked_window = None;
+            }
         }
         if !s.demanded(now, s.window.max(s.floor(now))) {
             s.delivered_credit = 0;
@@ -429,6 +443,61 @@ mod tests {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn a_drained_queue_still_funds_its_outstanding_blocked_flight() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let primary = pool.binding(1, Role::Primary, now).unwrap();
+        let video = pool.binding(2, Role::Secondary, now).unwrap();
+        pool.note_primary(now);
+        pool.feedback(false, now);
+        video.blocked(now);
+        video.update_flight(1200);
+        video.app_limited(now); // Queue empty, but this packet is not ACKed.
+        let ack = now + Duration::from_millis(120);
+        primary.delivered(ack, now, 1200, Duration::from_millis(120));
+        // QUIC reports real delivery before releasing this packet's flight.
+        video.delivered(ack, now, 1200, Duration::from_millis(120));
+        assert_eq!(
+            video.window(ack, 1200, 1200),
+            3601,
+            "an empty producer queue must not erase demand for unacknowledged work"
+        );
+        video.update_flight(0);
+        let later = ack + Duration::from_millis(120);
+        primary.delivered(later, now, 20_000, Duration::from_millis(120));
+        assert_eq!(
+            video.window(later, 0, 1200),
+            3601,
+            "once the queued work and its flight drain, new ACKs cannot buy another window"
+        );
+    }
+
+    #[test]
+    fn a_finished_partial_flight_cannot_fund_a_later_blocked_send() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let primary = pool.binding(1, Role::Primary, now).unwrap();
+        let video = pool.binding(2, Role::Secondary, now).unwrap();
+        pool.note_primary(now);
+        pool.feedback(false, now);
+        video.blocked(now);
+        video.update_flight(1200);
+        video.app_limited(now);
+        let ack = now + Duration::from_millis(120);
+        primary.delivered(ack, now, 600, Duration::from_millis(120));
+        video.delivered(ack, now, 1200, Duration::from_millis(120));
+        video.update_flight(0); // 1800 paid bytes did not fill the usable 2400.
+        let later = ack + Duration::from_millis(120);
+        video.blocked(later);
+        primary.delivered(later, later, 600, Duration::from_millis(120));
+        assert_eq!(
+            video.window(later, 0, 1200),
+            2401,
+            "a new send must not reuse an already finished flight's partial credit"
+        );
     }
 
     #[test]
