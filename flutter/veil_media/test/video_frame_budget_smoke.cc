@@ -67,6 +67,78 @@ int main(int argc, char** argv) {
   assert(allocated.snapshot().max_pixels == 0);
   allocated.SetProfile(225000);
   assert(allocated.snapshot().max_pixels == 0);
+  // Explicit audio feedback must control pixels even when encoded frames
+  // fit and the host bitrate stays at its floor.
+  veil_media::VideoFrameBudget audio;
+  audio.SetPacketPayload(1440);
+  audio.SetProfile(15000);
+  audio.SetRate(12000);
+  audio.SetAudioPressure(0, 1'000'000);
+  audio.Observe(1513, 320, 240, 1, 1'100'000);
+  assert(audio.snapshot().max_pixels == 0); // One healthy overshoot.
+  audio.Observe(500, 320, 240, 2, 1'200'000);
+  audio.SetAudioPressure(1, 2'000'000);
+  const int protected_pixels = audio.snapshot().max_pixels;
+  assert(protected_pixels > 0 && protected_pixels < 320 * 240);
+  audio.SetAudioPressure(1, 2'500'000);
+  assert(audio.snapshot().max_pixels == protected_pixels);
+  audio.Observe(500, 160, 120, 3, 2'600'000);
+  audio.SetAudioPressure(1, 5'000'000);
+  const int second_cut = audio.snapshot().max_pixels;
+  assert(second_cut < protected_pixels);
+  audio.SetRate(90000);
+  audio.SetProfile(150000);
+  assert(audio.snapshot().max_pixels == second_cut); // No allocation bypass.
+  for (int i = 6; i <= 9; ++i) {
+    audio.Observe(500, 160, 120, i, i * 1'000'000);
+    audio.SetAudioPressure(0, i * 1'000'000);
+  }
+  assert(audio.snapshot().max_pixels > second_cut);
+  const int recovered_step = audio.snapshot().max_pixels;
+  audio.SetAudioPressure(-1, 9'500'000);
+  audio.Observe(500, 80, 60, 10, 10'000'000);
+  audio.SetAudioPressure(0, 10'000'000);
+  for (int i = 0; i < 20; ++i) audio.SetAudioPressure(0, 10'000'000);
+  audio.Observe(500, 80, 60, 11, 11'000'000);
+  audio.SetAudioPressure(0, 11'000'000);
+  audio.Observe(500, 80, 60, 12, 12'000'000);
+  audio.SetAudioPressure(0, 12'000'000);
+  assert(audio.snapshot().max_pixels == recovered_step);
+  audio.Observe(500, 80, 60, 13, 13'000'000);
+  audio.SetAudioPressure(0, 13'000'000);
+  assert(audio.snapshot().max_pixels > recovered_step);
+  // Feedback can precede the first encode. A small encoded frame is no
+  // exemption from the caller's measured audio pressure.
+  veil_media::VideoFrameBudget before_encode;
+  before_encode.SetProfile(15000);
+  before_encode.SetPacketPayload(1440);
+  before_encode.SetAudioPressure(1, 1'000'000);
+  before_encode.Observe(500, 320, 240, 1, 1'100'000);
+  assert(before_encode.snapshot().max_pixels > 0);
+  assert(before_encode.snapshot().oversize_frames == 0);
+  const int paused_cap = before_encode.snapshot().max_pixels;
+  for (int i = 2; i <= 8; ++i)
+    before_encode.SetAudioPressure(0, i * 1'000'000);
+  assert(before_encode.snapshot().max_pixels == paused_cap);
+  assert(before_encode.snapshot().audio_recoveries == 0);
+  // A stale healthy hint cannot exempt a later overshoot or grant recovery.
+  veil_media::VideoFrameBudget stale;
+  stale.SetProfile(15000);
+  stale.SetPacketPayload(1440);
+  stale.SetAudioPressure(0, 1'000'000);
+  stale.Observe(1513, 320, 240, 1, 5'000'000);
+  const int stale_cap = stale.snapshot().max_pixels;
+  assert(stale_cap > 0);
+  stale.Observe(500, 80, 60, 10, 10'000'000);
+  stale.SetAudioPressure(0, 10'000'000);
+  stale.Observe(500, 80, 60, 11, 11'000'000);
+  stale.SetAudioPressure(0, 11'000'000);
+  stale.Observe(500, 80, 60, 12, 12'000'000);
+  stale.SetAudioPressure(0, 12'000'000);
+  assert(stale.snapshot().max_pixels == stale_cap);
+  stale.Observe(500, 80, 60, 13, 13'000'000);
+  stale.SetAudioPressure(0, 13'000'000);
+  assert(stale.snapshot().max_pixels > stale_cap);
   // Packetizer setup, codec output and source requests have different queues.
   std::thread encoder([&] {
     for (int i = 0; i < 1000; ++i) {

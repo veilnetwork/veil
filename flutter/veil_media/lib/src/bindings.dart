@@ -1061,3 +1061,35 @@ int Function(Pointer<VeilGroupMediaEngineHandle>, int)?
 
 final veilMediaGroupEngineSetVideoSendPaused =
     _lookupveilMediaGroupEngineSetVideoSendPaused();
+
+// Optional local audio feedback; old bundled engines retain source sizing.
+int Function(Pointer<VeilMediaEngineHandle>, int)?
+    _lookupveilMediaEngineSetAudioSourcePressure() {
+  try {
+    return nativeLib
+        .lookup<NativeFunction<Int32 Function(Pointer<VeilMediaEngineHandle>, Int32)>>(
+            'veil_media_engine_set_audio_source_pressure')
+        .asFunction();
+  } on ArgumentError {
+    return null;
+  }
+}
+
+final veilMediaEngineSetAudioSourcePressure =
+    _lookupveilMediaEngineSetAudioSourcePressure();
+
+// Optional local audio feedback; old bundled engines retain source sizing.
+int Function(Pointer<VeilGroupMediaEngineHandle>, int)?
+    _lookupveilMediaGroupEngineSetAudioSourcePressure() {
+  try {
+    return nativeLib
+        .lookup<NativeFunction<Int32 Function(Pointer<VeilGroupMediaEngineHandle>, Int32)>>(
+            'veil_media_group_engine_set_audio_source_pressure')
+        .asFunction();
+  } on ArgumentError {
+    return null;
+  }
+}
+
+final veilMediaGroupEngineSetAudioSourcePressure =
+    _lookupveilMediaGroupEngineSetAudioSourcePressure();

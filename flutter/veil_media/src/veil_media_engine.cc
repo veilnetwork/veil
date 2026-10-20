@@ -2605,6 +2605,17 @@ static int veil_media_group_engine_apply_video_budget(VeilGroupMediaEngine* engi
 #endif
 }
 
+int veil_media_group_engine_set_audio_source_pressure(VeilGroupMediaEngine* engine, int pressure) {
+  if (!engine || pressure < -1 || pressure > 1) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws) return VEIL_MEDIA_ERR_STATE;
+  engine->ws->video_frame_budget->SetAudioPressure(pressure, webrtc::TimeMicros());
+  return VEIL_MEDIA_OK;
+#else
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
 int veil_media_group_engine_set_video_send_paused(VeilGroupMediaEngine* engine, int paused) {
   if (!engine || (paused != 0 && paused != 1)) return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
@@ -2863,6 +2874,9 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               ",\"video_frame_oversize_count\":" + std::to_string(frame_budget.oversize_frames) +
               ",\"video_frame_encoded_pixels\":" + std::to_string(frame_budget.last_pixels) +
               ",\"video_frame_encoded_bytes\":" + std::to_string(frame_budget.last_bytes);
+  snapshot += ",\"video_audio_feedback_state\":" + std::to_string(frame_budget.audio_state) +
+      ",\"video_audio_pixel_cuts\":" + std::to_string(frame_budget.audio_cuts) +
+      ",\"video_audio_pixel_recoveries\":" + std::to_string(frame_budget.audio_recoveries);
   snapshot += ",\"video_tx_retransmitted_pkts\":" + std::to_string(video_retransmitted_packets) +
               ",\"video_tx_retransmitted_bytes\":" + std::to_string(video_retransmitted_bytes) +
               ",\"video_rx_nack_packets\":" + std::to_string(video_nack_packets) +
@@ -3700,6 +3714,17 @@ static int veil_media_engine_apply_video_budget(VeilMediaEngine* engine,
   (void)max_bitrate_kbps;
   (void)max_fps;
   (void)minimum_kbps;
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
+int veil_media_engine_set_audio_source_pressure(VeilMediaEngine* engine, int pressure) {
+  if (!engine || pressure < -1 || pressure > 1) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws) return VEIL_MEDIA_ERR_STATE;
+  engine->ws->video_frame_budget->SetAudioPressure(pressure, webrtc::TimeMicros());
+  return VEIL_MEDIA_OK;
+#else
   return VEIL_MEDIA_ERR_STATE;
 #endif
 }
@@ -4573,6 +4598,9 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
                   ",\"video_frame_oversize_count\":" + std::to_string(frame_budget.oversize_frames) +
                   ",\"video_frame_encoded_pixels\":" + std::to_string(frame_budget.last_pixels) +
                   ",\"video_frame_encoded_bytes\":" + std::to_string(frame_budget.last_bytes);
+  snapshot += ",\"video_audio_feedback_state\":" + std::to_string(frame_budget.audio_state) +
+      ",\"video_audio_pixel_cuts\":" + std::to_string(frame_budget.audio_cuts) +
+      ",\"video_audio_pixel_recoveries\":" + std::to_string(frame_budget.audio_recoveries);
       snapshot += ",\"audio_latency_recovery_count\":" +
           std::to_string(ws->recovery_stats->count.load(std::memory_order_acquire));
       snapshot += ",\"audio_latency_discarded_ms\":" +
