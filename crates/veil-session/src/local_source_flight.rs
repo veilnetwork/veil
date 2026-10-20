@@ -58,6 +58,9 @@ struct State {
     pressure_until: Option<Instant>,
     growth_hold_until: Option<Instant>,
     window: u64,
+    // Reserve included in the last funded/reduced window. Retiring control
+    // headroom must not turn it into another competing data packet.
+    window_reserve: u64,
     delivered_credit: u64,
     last_growth: Option<Instant>,
     last_reduction: Option<Instant>,
@@ -111,6 +114,11 @@ impl State {
         self.reserve(now)
             .saturating_add(2 * u64::from(self.rows.values().map(|r| r.mtu).max().unwrap_or(1200)))
     }
+    fn limit(&self, now: Instant) -> u64 {
+        self.window
+            .saturating_sub(self.window_reserve.saturating_sub(self.reserve(now)))
+            .max(self.floor(now))
+    }
     fn wakers(&self) -> Vec<Waker> {
         self.rows.values().filter_map(|r| r.waker.clone()).collect()
     }
@@ -160,7 +168,8 @@ impl SourceFlightPool {
                 if s.last_reduction
                     .is_none_or(|at| now.saturating_duration_since(at) >= PRESSURE_GRACE)
                 {
-                    s.window = (s.window / 2).max(s.floor(now));
+                    s.window = (s.limit(now) / 2).max(s.floor(now));
+                    s.window_reserve = s.reserve(now);
                     s.last_reduction = Some(now);
                 }
             } else {
@@ -208,22 +217,34 @@ impl SourceFlightPool {
                     Some((
                         state.rows.len(),
                         state.total(),
-                        state.window.max(state.floor(now)),
+                        state.limit(now),
                         state.reserve(now),
                         state.healthy_until.is_some_and(|t| now < t),
                         state.pressure_until.is_some_and(|t| now < t),
                         state.delivered_credit,
                         state.delivery_diagnostics,
+                        state.window,
+                        state.window_reserve,
                     ))
                 } else {
                     None
                 }
             };
-            if let Some((members, flight, window, reserve, healthy, pressured, credit, d)) =
-                snapshot
+            if let Some((
+                members,
+                flight,
+                window,
+                reserve,
+                healthy,
+                pressured,
+                credit,
+                d,
+                stored_window,
+                stored_reserve,
+            )) = snapshot
             {
                 log::info!(target: "veil::source_flight",
-                    "connection_trace_id={id} members={members} in_flight_bytes={flight} window_bytes={window} primary_control_reserve_bytes={reserve} scope=endpoint hold_observations={} ack_held={} healthy={healthy} pressured={pressured} credit_bytes={credit} ack_calls={} ack_stale={} ack_inactive={} ack_unhealthy={} ack_pressured={} ack_no_demand={} ack_funded_bytes={} ack_credit_wait={} ack_rtt_wait={} window_grows={} blocked_calls={} drained_witnesses={}",
+                    "connection_trace_id={id} members={members} in_flight_bytes={flight} window_bytes={window} primary_control_reserve_bytes={reserve} stored_window_bytes={stored_window} stored_reserve_bytes={stored_reserve} scope=endpoint hold_observations={} ack_held={} healthy={healthy} pressured={pressured} credit_bytes={credit} ack_calls={} ack_stale={} ack_inactive={} ack_unhealthy={} ack_pressured={} ack_no_demand={} ack_funded_bytes={} ack_credit_wait={} ack_rtt_wait={} window_grows={} blocked_calls={} drained_witnesses={}",
                     d.hold_observations, d.held, d.calls, d.stale, d.inactive, d.unhealthy, d.pressured, d.no_demand,
                     d.funded_bytes, d.credit_wait, d.rtt_wait, d.grows, d.blocked, d.drained);
             }
@@ -322,7 +343,7 @@ impl LocalSendBudget for Binding {
         if role == Role::Primary {
             return u64::MAX;
         }
-        let limit = s.window.max(s.floor(now));
+        let limit = s.limit(now);
         let mut available = limit.saturating_sub(s.total());
         if role == Role::Secondary {
             available = available.saturating_sub(s.reserve(now));
@@ -366,7 +387,7 @@ impl LocalSendBudget for Binding {
     }
     fn blocked(&self, now: Instant) {
         let mut s = lock!(self.pool.0);
-        let window = s.window.max(s.floor(now));
+        let window = s.limit(now);
         if !s.demanded(now, window) {
             s.delivered_credit = 0;
         }
@@ -395,7 +416,7 @@ impl LocalSendBudget for Binding {
                 }
             }
         }
-        if !s.demanded(now, s.window.max(s.floor(now))) {
+        if !s.demanded(now, s.limit(now)) {
             s.delivered_credit = 0;
         }
     }
@@ -425,8 +446,7 @@ impl LocalSendBudget for Binding {
                     s.delivery_diagnostics.pressured.saturating_add(1);
                 return;
             }
-            let floor = s.floor(now);
-            let limit = s.window.max(floor);
+            let limit = s.limit(now);
             if !s.demanded(now, limit) {
                 s.delivery_diagnostics.no_demand =
                     s.delivery_diagnostics.no_demand.saturating_add(1);
@@ -456,6 +476,7 @@ impl LocalSendBudget for Binding {
             // neither old demand nor compressed ACKs can spend unfilled windows.
             let mtu = u64::from(s.rows.get(&self.id).map_or(1200, |r| r.mtu));
             s.window = limit.saturating_add(mtu).min(u64::from(u32::MAX));
+            s.window_reserve = s.reserve(now);
             s.delivery_diagnostics.grows = s.delivery_diagnostics.grows.saturating_add(1);
             s.delivered_credit = 0;
             s.last_growth = Some(now);
@@ -831,5 +852,72 @@ mod tests {
         primary.update_flight(0);
         assert!(new.window(later, 0, 1200) > 1);
         assert!(!lock!(pool.0).rows.contains_key(&2));
+    }
+    #[test]
+    fn expired_control_reserve_does_not_become_unfunded_secondary_flight() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let primary = pool.binding(1, Role::Primary, now).unwrap();
+        let _control = pool.binding(2, Role::Control, now).unwrap();
+        let video = pool.binding(3, Role::Secondary, now).unwrap();
+        pool.note_primary(now);
+        pool.feedback(true, now);
+        let before = now + IDLE_GRACE - Duration::from_millis(1);
+        pool.note_primary(before);
+        let _ = pool.binding(1, Role::Primary, before).unwrap();
+        pool.feedback(true, before);
+        let after = now + IDLE_GRACE + Duration::from_millis(1);
+        pool.note_primary(after);
+        let _ = pool.binding(1, Role::Primary, after).unwrap();
+        assert_eq!(
+            video.window(after, 0, 1200),
+            2401,
+            "an expired control reserve is not an ACK-funded extra packet"
+        );
+        assert_eq!(primary.window(after, 0, 1200), u64::MAX);
+    }
+
+    #[test]
+    fn expired_control_reserve_preserves_only_the_paid_secondary_growth() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let primary = pool.binding(1, Role::Primary, now).unwrap();
+        let _control = pool.binding(2, Role::Control, now).unwrap();
+        let video = pool.binding(3, Role::Secondary, now).unwrap();
+        pool.note_primary(now);
+        pool.feedback(false, now);
+        video.blocked(now);
+        primary.delivered(now, now, 2400, Duration::from_millis(100));
+        assert_eq!(video.window(now, 0, 1200), 3601);
+        let before = now + IDLE_GRACE - Duration::from_millis(1);
+        pool.note_primary(before);
+        let _ = pool.binding(1, Role::Primary, before).unwrap();
+        let after = now + IDLE_GRACE + Duration::from_millis(1);
+        pool.note_primary(after);
+        let _ = pool.binding(1, Role::Primary, after).unwrap();
+        assert_eq!(
+            video.window(after, 0, 1200),
+            3601,
+            "retain the real paid packet without spending retired control headroom"
+        );
+    }
+
+    #[test]
+    fn closed_control_reserve_does_not_refund_its_outstanding_wire_debt() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let primary = pool.binding(1, Role::Primary, now).unwrap();
+        let control = pool.binding(2, Role::Control, now).unwrap();
+        let video = pool.binding(3, Role::Secondary, now).unwrap();
+        pool.note_primary(now);
+        pool.feedback(true, now);
+        control.update_flight(1200);
+        control.closed();
+        assert_eq!(
+            video.window(now, 0, 1200),
+            1201,
+            "closed control bytes still debit the correctly scoped window"
+        );
+        assert_eq!(primary.window(now, 0, 1200), u64::MAX);
     }
 }
