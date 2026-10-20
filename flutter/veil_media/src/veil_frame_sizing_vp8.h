@@ -7,6 +7,7 @@
 #include <utility>
 #include "api/video_codecs/video_encoder.h"
 #include "api/video_codecs/video_encoder_factory.h"
+#include "rtc_base/time_utils.h"
 #include "veil_video_frame_budget.h"
 
 namespace veil_media {
@@ -56,7 +57,8 @@ class FrameSizingVp8Encoder final : public webrtc::VideoEncoder,
  private:
   Result OnEncodedImage(const webrtc::EncodedImage& image,
                         const webrtc::CodecSpecificInfo* info) override {
-    budget_->Observe(image.size(), image._encodedWidth, image._encodedHeight);
+    budget_->Observe(image.size(), image._encodedWidth, image._encodedHeight,
+                     image.RtpTimestamp(), webrtc::TimeMicros());
     auto* callback = callback_.load(std::memory_order_acquire);
     return callback ? callback->OnEncodedImage(image, info) : Result(Result::ERROR_SEND_FAILED);
   }
