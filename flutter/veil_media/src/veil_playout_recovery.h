@@ -1,6 +1,6 @@
 // Endpoint-only bounded catch-up. NetEq remains responsible for decoding,
 // FEC, PLC and ordinary time stretching; this discards decoded old audio only
-// when actual queued samples exceed the live-call latency budget.
+// when actual storage or a validated decoded RTP age exceeds its budget.
 #ifndef VEIL_PLAYOUT_RECOVERY_H_
 #define VEIL_PLAYOUT_RECOVERY_H_
 #include <algorithm>
@@ -70,7 +70,14 @@ class RecoveringNetEq final : public webrtc::NetEq {
       // subsequent decoder call fails.
       for (; skipped < 16;) {
         const auto state = inner_->GetOperationsAndState();
-        if (state.current_buffer_size_ms <= static_cast<uint64_t>(RecoveryBudgetMs()) ||
+        // Storage alone misses time already spent upstream. Use only an
+        // aligned decoded-packet clock, and require a complete packet plus
+        // 30 ms before an extra 10-ms pull. PLC/error guards remain below.
+        const auto lag = UpdateDecodedClock(*frame)
+            ? rtp_lag_.Output(frame->timestamp_, webrtc::TimeMicros()) : std::nullopt;
+        const bool age_excess = lag && *lag > RecoveryBudgetMs() - 20 &&
+            state.current_buffer_size_ms >= static_cast<uint64_t>(frame_headroom_ms_ + 30);
+        if ((!age_excess && state.current_buffer_size_ms <= static_cast<uint64_t>(RecoveryBudgetMs())) ||
             (inner_->SyncBufferSizeMs() < 20 && !state.next_packet_available))
           break;
         bool next_muted = false;
@@ -98,20 +105,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
     // NetEq can keep an old output RTP origin across a sender rebuild even
     // while PCM is prompt. Require an actual decoded-packet clock witness;
     // never infer a timestamp offset from packet order or tone phase.
-    if (!frame->packet_infos_.empty()) {
-      decoded_stamp_.reset();
-      for (const auto& info : frame->packet_infos_) {
-        if (rtp_lag_.MatchesPacket(info.ssrc(), info.rtp_timestamp(), info.sequence_number()) &&
-            std::llabs(static_cast<int32_t>(frame->timestamp_ - info.rtp_timestamp())) <=
-                (frame_headroom_ms_ + 20) * 48) {
-          decoded_stamp_ = info.rtp_timestamp();
-          break;
-        }
-      }
-    }
-    const bool aligned = decoded_stamp_ &&
-        std::llabs(static_cast<int32_t>(frame->timestamp_ - *decoded_stamp_)) <=
-            (frame_headroom_ms_ + 20) * 48;
+    const bool aligned = UpdateDecodedClock(*frame);
     receiver_recovery_->SetLag(
         result == kOK && !silent &&
         frame->speech_type_ == webrtc::AudioFrame::kNormalSpeech && aligned
@@ -211,6 +205,25 @@ class RecoveringNetEq final : public webrtc::NetEq {
     if (payload >= 0 && static_cast<size_t>(payload) < opus_payloads_.size())
       opus_payloads_[payload] = f.clockrate_hz == 48000 &&
           (f.name == "opus" || f.name == "OPUS" || f.name == "Opus");
+  }
+  // NetEq may attach packet metadata only to its first 10-ms block. Carry
+  // that real witness across subsequent blocks, bounded to the packet span;
+  // never infer an output clock from arrival order or a periodic tone.
+  bool UpdateDecodedClock(const webrtc::AudioFrame& frame) {
+    if (!frame.packet_infos_.empty()) {
+      decoded_stamp_.reset();
+      for (const auto& info : frame.packet_infos_) {
+        if (rtp_lag_.MatchesPacket(info.ssrc(), info.rtp_timestamp(), info.sequence_number()) &&
+            std::llabs(static_cast<int32_t>(frame.timestamp_ - info.rtp_timestamp())) <=
+                (frame_headroom_ms_ + 20) * 48) {
+          decoded_stamp_ = info.rtp_timestamp();
+          break;
+        }
+      }
+    }
+    return decoded_stamp_ &&
+        std::llabs(static_cast<int32_t>(frame.timestamp_ - *decoded_stamp_)) <=
+            (frame_headroom_ms_ + 20) * 48;
   }
   // NetEq's target and the hard catch-up must have compatible budgets.
   // Leave room for one ordinary decoded packet arrival; otherwise NetEq
