@@ -1,8 +1,11 @@
 #include "veil_video_frame_budget.h"
 #include <cassert>
 #include <thread>
+#include <fstream>
+#include <iterator>
+#include <string>
 
-int main() {
+int main(int argc, char** argv) {
   veil_media::VideoFrameBudget budget;
   budget.SetPacketPayload(964);
   budget.SetProfile(15000);
@@ -80,4 +83,24 @@ int main() {
   });
   encoder.join();
   source.join();
+  if (argc == 2) {
+    { std::ofstream empty(argv[1]); assert(empty.good()); }
+    setenv("VEIL_MEDIA_DIAG_PATH", argv[1], 1);
+    {
+      veil_media::VideoFrameBudget traced;
+      traced.SetPacketPayload(964);
+      traced.SetProfile(15000);
+      traced.SetRate(7200);
+      traced.Observe(2296, 320, 240, 17, 19000);
+      traced.Observe(500, 160, 120, 18, 20000);
+    }
+    std::ifstream input(argv[1]);
+    const std::string text((std::istreambuf_iterator<char>(input)), {});
+    assert(text.find("count=2 seen=2") != std::string::npos);
+    assert(text.find("timestamp=17 at_us=19000 bytes=2296 width=320 height=240 budget=900 cap_before=0 cap_after=") != std::string::npos);
+    assert(text.find("timestamp=18 at_us=20000 bytes=500 width=160 height=120") != std::string::npos);
+    assert(text.find("write_ok=1") != std::string::npos);
+    unsetenv("VEIL_MEDIA_DIAG_PATH");
+    std::remove(argv[1]);
+  }
 }

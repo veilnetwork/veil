@@ -23,7 +23,7 @@ int main(int argc, char** argv) {
     trace.Rtp(rtp,8,'s',1,0); // foreign SSRC is not video evidence
     auto broken=rtp; broken.back()=0; trace.Rtp(broken,7,'s',1,0);
     broken=rtp; broken[19]=100; trace.Rtp(broken,7,'s',1,0);
-    trace.Rtp(rtp,7,'s',10,1); trace.Rtp(rtp,7,'r',20,0); trace.Rtp(rtp,7,'d',21,0);
+    trace.Rtp(rtp,7,'s',10,1,190); trace.Rtp(rtp,7,'r',20,0); trace.Rtp(rtp,7,'d',21,0);
     trace.Rtcp(rr,'s',11,0); trace.Rtcp(rr,'r',30,0);
     // Valid report followed by a truncated block must publish no prefix.
     std::array<uint8_t,36> compound{}; std::copy(rr.begin(),rr.end(),compound.begin());
@@ -35,6 +35,7 @@ int main(int argc, char** argv) {
   std::ifstream input(path); std::string text((std::istreambuf_iterator<char>(input)),{});
   assert(text.find("packets=2 packet_seen=3 reports=1 report_seen=2 malformed=2")!=std::string::npos);
   assert(text.find("seq=65535 timestamp=9 bytes=26 payload=1 marker=1 result=1")!=std::string::npos);
+  assert(text.find("result=1 channel=190")!=std::string::npos);
   assert(text.find("reporter=8 ssrc=7 fraction=5 lost=-1 highest=65540 jitter=6 lsr=2 dlsr=3")!=std::string::npos);
   assert(text.find("write_ok=1")!=std::string::npos);
   {

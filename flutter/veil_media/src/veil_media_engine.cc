@@ -139,6 +139,8 @@
 #include "veil_diag_log.h"
 #include "veil_screen.h"
 #include "veil_transport_shim.h"
+#include "veil_video_loss_trace.h"
+#include "veil_video_decode_trace.h"
 #include "veil_playout_recovery.h"
 #endif
 
@@ -403,9 +405,12 @@ class GroupFanoutTransport : public webrtc::Transport {
     for (const uint64_t chan : channels) {
       const int64_t began_ns = webrtc::TimeMicros() * 1000;
       const bool video = video_stats_.mark_attempt(packet, video_ssrc_, began_ns, 96);
-      const bool sent = veil_media_send_datagram(chan, packet.data(), packet.size()) == 0;
+      const int rc = veil_media_send_datagram(chan, packet.data(), packet.size());
+      const bool sent = rc == 0;
       if (video)
         video_stats_.mark_result(began_ns, webrtc::TimeMicros() * 1000, sent);
+      if (video)
+        video_send_trace_.Rtp(packet, video_ssrc_, 's', began_ns / 1000, rc, chan);
       if (audio_send_trace_.enabled())
         audio_send_trace_.Record(chan, packet, began_ns / 1000,
                                  webrtc::TimeMicros(), sent);
@@ -477,6 +482,7 @@ class GroupFanoutTransport : public webrtc::Transport {
   std::atomic<uint64_t> audio_drops_{0};
   const uint32_t video_ssrc_;
   veil_media::RtpSendStats video_stats_;
+  veil_media::VideoLossTrace video_send_trace_;
   veil_media::GroupAudioSendTrace audio_send_trace_;
   std::atomic<bool> video_send_paused_{false};
   webrtc::Call* const call_;
@@ -505,6 +511,7 @@ constexpr int kMaxVideoSide = 4096;
 // one on-demand conversion. OnFrame runs on a WebRTC decode thread.
 class VeilVideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
  public:
+  explicit VeilVideoSink(uint32_t ssrc = 0) : decode_trace_(ssrc) {}
   ~VeilVideoSink() override {
 #if defined(__ANDROID__)
     set_native_window(nullptr);
@@ -525,6 +532,8 @@ class VeilVideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
         buf->width() > kMaxVideoSide || buf->height() > kMaxVideoSide) {
       return;
     }
+    decode_trace_.Record(frame.rtp_timestamp(), webrtc::TimeMicros(),
+                         buf->width(), buf->height());
     std::lock_guard<std::mutex> l(m_);
 #if defined(__ANDROID__)
     if (native_window_ != nullptr) {
@@ -768,6 +777,7 @@ class VeilVideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
   }
 
  private:
+  veil_media::VideoDecodeTrace decode_trace_;
   std::mutex m_;
   std::vector<uint8_t> rgba_;  // latest frame, RGBA (guarded by m_)
   webrtc::scoped_refptr<webrtc::I420BufferInterface> latest_i420_;
@@ -1914,7 +1924,7 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
   ws->shim->SetLocalVideoSsrc(video_ssrc_of(local_id));
   ws->shim->Start();
 
-  ws->video_sink = std::make_unique<VeilVideoSink>();
+  ws->video_sink = std::make_unique<VeilVideoSink>(video_ssrc_of(peer_id));
   ws->local_video_sink = std::make_unique<VeilVideoSink>();
 #if defined(__ANDROID__)
   ws->android420_dispatcher =
@@ -2117,7 +2127,7 @@ int veil_media_group_engine_add_peer(VeilGroupMediaEngine* engine,
   peer->shim->SetRemoteAudioSsrc(remote_ssrc);
   peer->shim->SetLocalVideoSsrc(local_video_ssrc);
   peer->shim->Start();
-  peer->video_sink = std::make_unique<VeilVideoSink>();
+  peer->video_sink = std::make_unique<VeilVideoSink>(remote_video_ssrc);
   ws->fanout->Add(veil_chan);
   if (engine->audio_running.load()) {
     // Discarded because the next line checks the OUTCOME, which is stricter: a

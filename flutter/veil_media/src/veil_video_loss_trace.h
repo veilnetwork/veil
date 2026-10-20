@@ -26,7 +26,7 @@ class VideoLossTrace {
   ~VideoLossTrace() { Flush(); }
 
   void Rtp(std::span<const uint8_t> p, uint32_t expected_ssrc,
-           char stage, int64_t at_us, int result) {
+           char stage, int64_t at_us, int result, uint64_t channel = 0) {
     if (!enabled_ || expected_ssrc == 0 || p.size() < 12 || p[0] >> 6 != 2 ||
         (p[1] & 127) != 96 || Word(p.data()+8) != expected_ssrc) return;
     size_t header = 12 + (p[0] & 15)*4;
@@ -45,7 +45,7 @@ class VideoLossTrace {
     if (packets_.size() < packet_limit_)
       packets_.push_back({at_us, Word(p.data()+8), Word(p.data()+4),
                          uint32_t(p.size()), uint32_t(p.size()-header-padding),
-                         Half(p.data()+2), stage, bool(p[1]&128), result});
+                         Half(p.data()+2), stage, bool(p[1]&128), result, channel});
   }
 
   void Rtcp(std::span<const uint8_t> p, char stage, int64_t at_us, int result) {
@@ -101,9 +101,10 @@ class VideoLossTrace {
                  id, packets_.size(), (unsigned long long)packet_seen_, reports_.size(),
                  (unsigned long long)report_seen_, (unsigned long long)malformed_);
     for (const auto& p : packets_)
-      std::fprintf(file, "video.loss.rtp id=%llu stage=%c at_us=%lld ssrc=%u seq=%u timestamp=%u bytes=%u payload=%u marker=%d result=%d\n",
+      std::fprintf(file, "video.loss.rtp id=%llu stage=%c at_us=%lld ssrc=%u seq=%u timestamp=%u bytes=%u payload=%u marker=%d result=%d channel=%llu\n",
                    id, p.stage, (long long)p.at_us, p.ssrc, unsigned(p.sequence),
-                   p.timestamp, p.bytes, p.payload, int(p.marker), p.result);
+                   p.timestamp, p.bytes, p.payload, int(p.marker), p.result,
+                   (unsigned long long)p.channel);
     for (const auto& r : reports_)
       std::fprintf(file, "video.loss.rr id=%llu stage=%c at_us=%lld reporter=%u ssrc=%u fraction=%u lost=%d highest=%u jitter=%u lsr=%u dlsr=%u result=%d\n",
                    id, r.stage, (long long)r.at_us, r.reporter, r.ssrc,
@@ -135,6 +136,7 @@ class VideoLossTrace {
     char stage;
     bool marker;
     int result;
+    uint64_t channel;
   };
   struct Report {
     int64_t at_us;
