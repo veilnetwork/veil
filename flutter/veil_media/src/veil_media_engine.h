@@ -163,6 +163,10 @@ int veil_media_group_engine_set_video_send_paused(VeilGroupMediaEngine *engine, 
  * encoded frames, or send network hints. Fresh healthy reports earn bounded
  * source recovery; unknown/stale feedback earns none. */
 int veil_media_group_engine_set_audio_source_pressure(VeilGroupMediaEngine *engine, int pressure);
+/* Current known health and original bounded hold, in host epoch milliseconds.
+ * Returns 1 if expired/stale. Never waits on media workers. */
+int veil_media_group_engine_hold_source_growth(VeilGroupMediaEngine *engine, uint64_t sampled_at_unix_ms,
+                              uint64_t hold_started_at_unix_ms);
 /* Group audio quality: maxima over fresh RTCP audio report blocks (15 s).
  * `audio_receivers` maps peer-id hex to accepted `audio_rx_pkts` and the
  * native `audio_delay_ms` (current queued samples + reported ADM delay).
@@ -272,6 +276,10 @@ int veil_media_engine_set_video_budget(VeilMediaEngine *engine,
 int veil_media_engine_set_video_send_paused(VeilMediaEngine *engine, int paused);
 /* Same endpoint-local measured audio policy as the group entrypoint above. */
 int veil_media_engine_set_audio_source_pressure(VeilMediaEngine *engine, int pressure);
+/* Current known health and original bounded hold, in host epoch milliseconds.
+ * Returns 1 if expired/stale. Never waits on media workers. */
+int veil_media_engine_hold_source_growth(VeilMediaEngine *engine, uint64_t sampled_at_unix_ms,
+                              uint64_t hold_started_at_unix_ms);
 
 /* Open the platform camera and drive the video send stream from it (near
  * width x height at fps; the camera picks the closest supported format). Video

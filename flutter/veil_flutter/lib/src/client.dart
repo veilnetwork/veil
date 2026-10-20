@@ -1066,11 +1066,27 @@ void _sendRealtimeWorker(int appAddr, Uint8List dstNodeId, Uint8List dstAppId,
 }
 
 bool _reportLocalSourcePressureWorker(
-    int appAddr, bool pressured, int sampledAtMs) {
+    int appAddr, bool pressured, int sampledAtMs, int? growthHoldStartedAtMs) {
   final report = ffi.veilAppReportLocalSourcePressure;
   if (report == null) return false;
   final errOut = calloc<Pointer<Utf8>>();
   try {
+    final hold = ffi.veilAppHoldLocalSourceGrowth;
+    if (!pressured && growthHoldStartedAtMs != null && hold != null) {
+      final rc = hold(Pointer<ffi.VeilApp>.fromAddress(appAddr), sampledAtMs,
+          growthHoldStartedAtMs, errOut);
+      if (rc < 0) {
+        throw VeilException(
+            'local source growth hold failed: ${_readErrAndFree(errOut)}',
+            code: rc);
+      }
+      if (rc == ffi.veilOk) return true;
+      // Stale/expired reports never become fresh healthy permissions. Only an
+      // explicitly unsupported daemon permits the compatibility fallback.
+      if (rc != 1) return false;
+      // Older daemons retain the existing healthy admission. Unknown would
+      // expire the DATA lease; it is not a compatible growth-hold fallback.
+    }
     final rc = report(Pointer<ffi.VeilApp>.fromAddress(appAddr),
         pressured ? 1 : 0, sampledAtMs, errOut);
     if (rc < 0) {
@@ -2655,12 +2671,14 @@ class AppHandle implements Finalizable {
   Future<bool> reportLocalSourcePressure({
     required bool pressured,
     required DateTime sampledAt,
+    DateTime? growthHoldStartedAt,
   }) async {
     _ensureOpen();
     final appAddr = _app.address;
     final sampledAtMs = sampledAt.millisecondsSinceEpoch;
-    return Isolate.run(() =>
-        _reportLocalSourcePressureWorker(appAddr, pressured, sampledAtMs));
+    final heldAtMs = growthHoldStartedAt?.millisecondsSinceEpoch;
+    return Isolate.run(() => _reportLocalSourcePressureWorker(
+        appAddr, pressured, sampledAtMs, heldAtMs));
   }
 
   /// Send a datagram to a remote peer.

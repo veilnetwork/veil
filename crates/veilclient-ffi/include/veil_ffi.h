@@ -1091,7 +1091,9 @@ VeilApp *veil_bind_device_scoped(VeilHandle *handle,
  * Publish measured pressure to this host's own source admission only.
  * `pressured` must be 0/1; `sampled_at_unix_ms` is the original host sampling
  * time, not the time a delayed FFI worker started. Nothing is sent to peers.
- * Returns 0 if queued, 1 if unsupported/expired; negative on error. Queued
+ * Returns 0 if queued, 1 if unsupported, 2 if expired/stale or the local
+ * reporting deadline elapsed; negative on error. Only 1 permits a legacy
+ * healthy-report fallback. Queued
  * does not mean the daemon has already applied the observation.
  */
 
@@ -1099,6 +1101,21 @@ int veil_app_report_local_source_pressure(VeilApp *app,
                                           uint8_t pressured,
                                           uint64_t sampled_at_unix_ms,
                                           char **err_out)
+;
+
+/**
+ * Keep current local DATA admission while pausing source growth. The current
+ * measurement and original hold event are separate host timestamps. Repeated
+ * observations cannot extend the original three-second hold. Never forwarded.
+ * Returns 0 if queued, 1 if unsupported, 2 if expired/stale or the local
+ * reporting deadline elapsed; negative on error. Only 1 permits a legacy
+ * healthy-report fallback.
+ */
+
+int veil_app_hold_local_source_growth(VeilApp *app,
+                                      uint64_t sampled_at_unix_ms,
+                                      uint64_t hold_started_at_unix_ms,
+                                      char **err_out)
 ;
 
 /**

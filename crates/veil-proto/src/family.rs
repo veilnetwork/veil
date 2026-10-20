@@ -938,6 +938,9 @@ pub enum LocalAppMsg {
     /// Correlated one-byte reply: 0 unsupported, 1 warming, 2 ready,
     /// 3 retry after the local query quota refills.
     PrepareLocalDatagramResult = 96,
+    /// Current local health with a bounded growth hold. Never forwarded.
+    /// Body: [`crate::ipc::LocalSourceGrowthHoldPayload`].
+    LocalSourceGrowthHold = 97,
 }
 
 impl TryFrom<u16> for LocalAppMsg {
@@ -1041,6 +1044,7 @@ impl TryFrom<u16> for LocalAppMsg {
             94 => Ok(LocalAppMsg::AppIpcLossyBatch),
             95 => Ok(LocalAppMsg::PrepareLocalDatagram),
             96 => Ok(LocalAppMsg::PrepareLocalDatagramResult),
+            97 => Ok(LocalAppMsg::LocalSourceGrowthHold),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::LocalApp as u8,
                 msg_type: v,

@@ -98,6 +98,22 @@ pub trait FrameBroadcaster: Send + Sync {
         false
     }
 
+    /// Whether negotiated local growth holds reach this endpoint's admission.
+    fn supports_local_source_growth_hold(&self) -> bool {
+        false
+    }
+
+    /// Current local health with an original bounded hold deadline. Receipt
+    /// freezes the achieved ramp; sampling time bounds freshness. Never forwarded.
+    fn note_local_source_growth_hold(
+        &self,
+        _sampled_at: std::time::Instant,
+        _until: std::time::Instant,
+        _received_at: std::time::Instant,
+    ) -> bool {
+        false
+    }
+
     /// Origin packetization advice while this endpoint has an active primary.
     /// Never applied to transit or carried on the wire. None keeps canonical
     /// segmentation; callers retain the protocol's transfer/chunk bounds.
