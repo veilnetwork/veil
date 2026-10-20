@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -36,9 +37,10 @@ class VideoFrameBudget {
         (unsigned long long)trace_id_, images_.size(), (unsigned long long)images_seen_);
     for (const auto& r : images_)
       std::fprintf(file,
-          "video.frame_budget.image id=%llu timestamp=%u at_us=%lld bytes=%zu width=%u height=%u budget=%zu cap_before=%d cap_after=%d rate_bps=%u\n",
+          "video.frame_budget.image id=%llu timestamp=%u at_us=%lld bytes=%zu width=%u height=%u budget=%zu cap_before=%d cap_after=%d rate_bps=%u cadence_budget=%zu cadence_fps_milli=%u\n",
           (unsigned long long)trace_id_, r.timestamp, (long long)r.at_us, r.bytes,
-          r.width, r.height, r.budget, r.before, r.after, r.rate);
+          r.width, r.height, r.budget, r.before, r.after, r.rate,
+          r.cadence_budget, r.fps_milli);
     const bool ok = std::fflush(file) == 0 && !std::ferror(file);
     std::fprintf(file, "video.frame_budget.end id=%llu write_ok=%d\n",
         (unsigned long long)trace_id_, int(ok));
@@ -92,12 +94,23 @@ class VideoFrameBudget {
     }
   }
 
-  void SetRate(uint32_t payload_bps) {
+  void SetRate(uint32_t payload_bps, double framerate_fps = 0) {
     std::lock_guard lock(mu_);
     // A suspended encoder emits no frames. Preserve its last positive budget
     // rather than reopening a large keyframe window when capture resumes.
     if (payload_bps) payload_bps_ = payload_bps;
+    if (payload_bps && std::isfinite(framerate_fps) && framerate_fps > 0)
+      framerate_fps_ = std::clamp(framerate_fps, 0.02, 240.0);
     UpdateBytes();
+    const auto cadence = CadenceBudget();
+    // Only a material increase in funded bytes per frame can release this
+    // bound. Small GCC fluctuations and healthy audio cannot pay for pixels.
+    if (cadence_pixels_ && cadence_basis_ && cadence >= cadence_basis_ + cadence_basis_ / 4) {
+      cadence_pixels_ = static_cast<int>(std::min<uint64_t>(largest_pixels_,
+          uint64_t(cadence_pixels_) * cadence / cadence_basis_));
+      cadence_basis_ = cadence;
+      if (cadence_pixels_ >= largest_pixels_) cadence_pixels_ = 0;
+    }
   }
 
   void SetPacketPayload(size_t max_payload) {
@@ -122,13 +135,25 @@ class VideoFrameBudget {
     const int before = max_pixels_;
     if (audio_state_ == 1 && FreshAudio(at_us)) CutForAudio(at_us);
     if (enabled() && bytes > bytes_) ++oversize_frames_;
-    if (ShouldContract(bytes, at_us)) {
+    const auto cadence = CadenceBudget();
+    // At low cadence, a frame spending more than 1.5 frames' allocation can
+    // make the encoder skip the next capture to repay its debt. This is not
+    // evidence of audio trouble: resize future source images, not references.
+    const bool cadence_overshoot = cadence && bytes > cadence + cadence / 2;
+    const bool contract = ShouldContract(bytes, at_us);
+    if (cadence_overshoot || contract) {
       const uint64_t pixels = uint64_t(width) * height;
       // Scale pixel area from the actual encoded result, retaining margin for
       // the keyframe caused by resizing. In-flight frames at the old resolution
       // recompute the same bound, rather than multiplying it down repeatedly.
+      const size_t resize_budget = cadence_overshoot ? std::min(bytes_, cadence) : bytes_;
       const int desired = static_cast<int>(std::max<uint64_t>(
-          6144, pixels * bytes_ / bytes * 3 / 4));
+          6144, pixels * resize_budget / bytes * 3 / 4));
+      if (cadence_overshoot && desired < static_cast<int>(pixels) &&
+          (!cadence_pixels_ || desired < cadence_pixels_)) {
+        cadence_pixels_ = desired;
+        cadence_basis_ = cadence;
+      }
       if (desired < static_cast<int>(pixels) &&
           (!max_pixels_ || desired < max_pixels_)) max_pixels_ = desired;
     }
@@ -136,7 +161,8 @@ class VideoFrameBudget {
       ++images_seen_;
       if (images_.size() < kImageLimit)
         images_.push_back({timestamp, at_us, bytes, width, height, bytes_,
-                           before, max_pixels_, effective_rate()});
+                           before, max_pixels_, effective_rate(), cadence,
+                           static_cast<uint32_t>(framerate_fps_ * 1000)});
     }
   }
 
@@ -182,8 +208,10 @@ class VideoFrameBudget {
       if (!healthy_since_us_) healthy_since_us_ = at_us;
       ++healthy_samples_;
       if (healthy_samples_ >= 4 && at_us - healthy_since_us_ >= 3'000'000) {
-        if (max_pixels_ > 0 && largest_pixels_ > max_pixels_) {
-          max_pixels_ = std::min(largest_pixels_, max_pixels_ + max_pixels_ / 4);
+        const int ceiling = cadence_pixels_ ? std::min(cadence_pixels_, largest_pixels_)
+                                           : largest_pixels_;
+        if (max_pixels_ > 0 && ceiling > max_pixels_) {
+          max_pixels_ = std::min(ceiling, max_pixels_ + max_pixels_ / 4);
           if (max_pixels_ == largest_pixels_) max_pixels_ = 0;
           ++audio_recoveries_;
         }
@@ -198,6 +226,12 @@ class VideoFrameBudget {
                         : static_cast<uint32_t>(selected_bps_);
   }
   bool enabled() const { return effective_rate() > 0 && effective_rate() <= 30000; }
+  size_t CadenceBudget() const {
+    // Faster sources can amortize an occasional large image over short
+    // intervals. Do not impose this low-cadence rule without a real FPS rate.
+    return enabled() && framerate_fps_ > 0 && framerate_fps_ <= 5
+        ? std::max<size_t>(1, static_cast<size_t>(effective_rate() / (8 * framerate_fps_))) : 0;
+  }
   bool FreshAudio(int64_t at_us) const {
     return audio_feedback_enabled_ && at_us >= audio_feedback_us_ &&
         at_us - audio_feedback_us_ < kFeedbackLifetimeUs;
@@ -243,6 +277,7 @@ class VideoFrameBudget {
       // profile and cannot select a larger one. Require twice the low-rate
       // threshold to avoid resizing on every small allocation fluctuation.
       if (!audio_feedback_enabled_ && effective_rate() >= 60000) max_pixels_ = 0;
+      if (effective_rate() >= 60000) { cadence_pixels_ = 0; cadence_basis_ = 0; }
       return;
     }
     const uint32_t rate = effective_rate();
@@ -255,6 +290,9 @@ class VideoFrameBudget {
   mutable std::mutex mu_;
   int selected_bps_ = 0;
   uint32_t payload_bps_ = 0;
+  double framerate_fps_ = 0;
+  int cadence_pixels_ = 0;
+  size_t cadence_basis_ = 0;
   size_t single_packet_bytes_ = 1;
   size_t bytes_ = 0;
   int max_pixels_ = 0;
@@ -284,6 +322,8 @@ class VideoFrameBudget {
     size_t budget;
     int before, after;
     uint32_t rate;
+    size_t cadence_budget;
+    uint32_t fps_milli;
   };
   static constexpr size_t kImageLimit = 8192;
   inline static std::atomic<uint64_t> next_trace_id_{0};
