@@ -79,10 +79,17 @@ int main() {
     recovery(1, 0, now + 3000);
     recovery(2, 85, now + 4000);
     const auto damage = measured.peer_audio_soft_loss(now + 4000);
-    require(damage.supported && damage.samples == 123*48 && damage.report_us == now + 4000,
-            "real shim did not combine authenticated damage counters");
-    recovery(2, 85, now + 5000);
-    require(measured.peer_audio_soft_loss(now + 5000).report_us == damage.report_us,
+    require(damage.supported && damage.samples == 123*48 && damage.report_us == 0,
+            "real shim promoted a short moderate burst to a video cut");
+    recovery(2, 85, now + 3'001'000);
+    require(measured.peer_audio_soft_loss(now + 3'001'000).report_us == 0,
+            "real shim replay manufactured sustained loss");
+    recovery(3, 86, now + 3'002'000);
+    const auto sustained = measured.peer_audio_soft_loss(now + 3'002'000);
+    require(sustained.samples == 124*48 && sustained.report_us == now + 3'002'000,
+            "real shim lost sustained authenticated damage");
+    recovery(3, 86, now + 3'003'000);
+    require(measured.peer_audio_soft_loss(now + 3'003'000).report_us == sustained.report_us,
             "real shim replay renewed significant loss");
     measured.Stop();
   }
