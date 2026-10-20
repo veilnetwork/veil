@@ -268,6 +268,15 @@ class VeilMediaEngine {
   bool get supportsVideoSendPause =>
       ffi.veilMediaEngineSetVideoSendPaused != null;
 
+  /// Local measured audio state: null is unknown and earns no source growth.
+  /// Returns false when the bundled native engine predates this control.
+  bool setAudioSourcePressure(bool? pressured) {
+    _ensure();
+    final set = ffi.veilMediaEngineSetAudioSourcePressure;
+    final state = pressured == null ? -1 : (pressured ? 1 : 0);
+    return set != null && set(_ptr, state) == 0;
+  }
+
   bool setVideoSendPaused(bool paused) {
     _ensure();
     final set = ffi.veilMediaEngineSetVideoSendPaused;
@@ -716,6 +725,15 @@ class VeilGroupMediaEngine {
   /// Pause outbound video only; capture, preview and remote media stay live.
   bool get supportsVideoSendPause =>
       ffi.veilMediaGroupEngineSetVideoSendPaused != null;
+
+  /// Local measured audio state: null is unknown and earns no source growth.
+  /// Returns false when the bundled native engine predates this control.
+  bool setAudioSourcePressure(bool? pressured) {
+    _ensure();
+    final set = ffi.veilMediaGroupEngineSetAudioSourcePressure;
+    final state = pressured == null ? -1 : (pressured ? 1 : 0);
+    return set != null && set(_ptr, state) == 0;
+  }
 
   bool setVideoSendPaused(bool paused) {
     _ensure();
