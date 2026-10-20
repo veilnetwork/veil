@@ -1925,6 +1925,9 @@ pub fn encode_response_with_class(
     out
 }
 
+#[cfg(test)]
+mod app_stream_lifecycle_tests;
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
