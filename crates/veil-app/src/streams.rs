@@ -43,6 +43,15 @@ use veil_proto::budget::{
 /// Default initial receive window: 256 KiB.
 pub const APP_STREAM_INITIAL_WINDOW: u32 = 256 * 1024;
 
+/// An absent stream may have been closed locally while peer bytes were in
+/// flight. It is distinct from overrunning an open stream's advertised credit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataReceiveResult {
+    Accepted,
+    UnknownStream,
+    WindowExceeded,
+}
+
 // ── AppStreamState ────────────────────────────────────────────────────────────
 
 /// State of an open application stream.
@@ -243,6 +252,19 @@ impl AppStreamTable {
         stream_id: u32,
         byte_count: u32,
     ) -> bool {
+        self.receive_data(peer_id, stream_id, byte_count) == DataReceiveResult::Accepted
+    }
+
+    /// Debit receive credit atomically, retaining the reason for a refusal.
+    /// Unknown streams must not be delivered or implicitly reopened; their
+    /// late bytes can be answered with a stream close, without accusing the
+    /// entire peer of a flow-control violation after a local cancellation.
+    pub fn receive_data(
+        &self,
+        peer_id: &[u8; 32],
+        stream_id: u32,
+        byte_count: u32,
+    ) -> DataReceiveResult {
         let key = StreamKey {
             peer_id: *peer_id,
             stream_id,
@@ -250,12 +272,12 @@ impl AppStreamTable {
         let mut inner = lock!(self.inner);
         if let Some(state) = inner.streams.get_mut(&key) {
             if state.recv_window < byte_count {
-                return false; // window exhausted — violation
+                return DataReceiveResult::WindowExceeded;
             }
             state.recv_window -= byte_count;
-            true
+            DataReceiveResult::Accepted
         } else {
-            false // unknown stream
+            DataReceiveResult::UnknownStream
         }
     }
 
