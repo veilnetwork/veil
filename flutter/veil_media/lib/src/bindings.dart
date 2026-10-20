@@ -1067,8 +1067,10 @@ int Function(Pointer<VeilMediaEngineHandle>, int)?
     _lookupveilMediaEngineSetAudioSourcePressure() {
   try {
     return nativeLib
-        .lookup<NativeFunction<Int32 Function(Pointer<VeilMediaEngineHandle>, Int32)>>(
-            'veil_media_engine_set_audio_source_pressure')
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<VeilMediaEngineHandle>,
+                    Int32)>>('veil_media_engine_set_audio_source_pressure')
         .asFunction();
   } on ArgumentError {
     return null;
@@ -1083,7 +1085,10 @@ int Function(Pointer<VeilGroupMediaEngineHandle>, int)?
     _lookupveilMediaGroupEngineSetAudioSourcePressure() {
   try {
     return nativeLib
-        .lookup<NativeFunction<Int32 Function(Pointer<VeilGroupMediaEngineHandle>, Int32)>>(
+        .lookup<
+                NativeFunction<
+                    Int32 Function(
+                        Pointer<VeilGroupMediaEngineHandle>, Int32)>>(
             'veil_media_group_engine_set_audio_source_pressure')
         .asFunction();
   } on ArgumentError {
@@ -1093,3 +1098,39 @@ int Function(Pointer<VeilGroupMediaEngineHandle>, int)?
 
 final veilMediaGroupEngineSetAudioSourcePressure =
     _lookupveilMediaGroupEngineSetAudioSourcePressure();
+
+// Optional local growth hold, independent of unknown/pressured feedback.
+int Function(Pointer<VeilMediaEngineHandle>, int, int)?
+    _lookupveilMediaEngineHoldSourceGrowth() {
+  try {
+    return nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<VeilMediaEngineHandle>, Uint64,
+                    Uint64)>>('veil_media_engine_hold_source_growth')
+        .asFunction();
+  } on ArgumentError {
+    return null;
+  }
+}
+
+final veilMediaEngineHoldSourceGrowth =
+    _lookupveilMediaEngineHoldSourceGrowth();
+
+// Optional local growth hold, independent of unknown/pressured feedback.
+int Function(Pointer<VeilGroupMediaEngineHandle>, int, int)?
+    _lookupveilMediaGroupEngineHoldSourceGrowth() {
+  try {
+    return nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(Pointer<VeilGroupMediaEngineHandle>, Uint64,
+                    Uint64)>>('veil_media_group_engine_hold_source_growth')
+        .asFunction();
+  } on ArgumentError {
+    return null;
+  }
+}
+
+final veilMediaGroupEngineHoldSourceGrowth =
+    _lookupveilMediaGroupEngineHoldSourceGrowth();

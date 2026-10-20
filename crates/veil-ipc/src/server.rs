@@ -2239,6 +2239,11 @@ async fn handle_ipc_client(
         && session_tx_registry
             .as_ref()
             .is_some_and(|r| r.supports_local_source_feedback());
+    let local_source_growth_hold = local_source_feedback
+        && hello.flags & veil_proto::ipc::IPC_CAP_LOCAL_SOURCE_GROWTH_HOLD != 0
+        && session_tx_registry
+            .as_ref()
+            .is_some_and(|r| r.supports_local_source_growth_hold());
     let mut hello_header =
         FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppHelloOk as u16);
     hello_header.body_len = AppIpcHelloOkPayload::WIRE_SIZE as u32;
@@ -2247,6 +2252,9 @@ async fn handle_ipc_client(
     }
     if local_source_feedback {
         hello_header.flags |= veil_proto::ipc::IPC_HELLO_OK_LOCAL_SOURCE_FEEDBACK;
+    }
+    if local_source_growth_hold {
+        hello_header.flags |= veil_proto::ipc::IPC_HELLO_OK_LOCAL_SOURCE_GROWTH_HOLD;
     }
     let local_lossy_work = hello.flags & veil_proto::ipc::IPC_CAP_LOCAL_LOSSY_WORK != 0
         && session_tx_registry
@@ -2995,6 +3003,15 @@ async fn handle_ipc_client(
                         let reply = if allowed { state as u8 } else { 3 };
                         write_frame_wh(&mut wh, FrameFamily::LocalApp as u8,
                             LocalAppMsg::PrepareLocalDatagramResult as u16, &[reply]).await?;
+                    }
+                    Ok(LocalAppMsg::LocalSourceGrowthHold) => {
+                        crate::handlers::source_feedback::handle_local_source_growth_hold(
+                            &body, local_source_growth_hold,
+                            |id| client_state.has_app_id(id), session_tx_registry.as_deref(),
+                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64).unwrap_or(0),
+                            std::time::Instant::now(),
+                        );
                     }
                     Ok(LocalAppMsg::LocalSourceFeedback) => {
                         crate::handlers::source_feedback::handle_local_source_feedback(

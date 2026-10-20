@@ -634,40 +634,105 @@ impl Drop for AppSender {
 /// hang.
 pub const APP_UNBIND_DEADLINE: Duration = Duration::from_secs(2);
 
+/// Outcome of a local source-growth hold report. Expiration is distinct from
+/// unsupported negotiation: callers must never turn an expired hold into a
+/// positive healthy observation through a compatibility fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalSourceGrowthHoldResult {
+    Queued,
+    Unsupported,
+    Expired,
+}
+
 impl AppSender {
     /// Report this bound local source's measured pressure. No peer receives
     /// the report and healthy observations never clear another source's lease.
     /// Returns false for an older daemon or expired/admission-delayed sample.
-    pub async fn report_local_source_pressure(
+    pub fn report_local_source_pressure(
         &self,
         pressured: bool,
         sampled_at_unix_ms: u64,
-    ) -> Result<bool, ClientError> {
-        use veilcore::proto::ipc::LocalSourceFeedbackPayload;
-        if !self.writer.supports_local_source_feedback() {
-            return Ok(false);
+    ) -> impl std::future::Future<Output = Result<bool, ClientError>> + Send + 'static + use<> {
+        // Own only the writer/app id. An FFI caller can release its primary
+        // AppSender lock before a full local queue makes this future wait.
+        let writer = self.writer.clone();
+        let app_id = self.app_id;
+        async move {
+            use veilcore::proto::ipc::LocalSourceFeedbackPayload;
+            if !writer.supports_local_source_feedback() {
+                return Ok(false);
+            }
+            let report = LocalSourceFeedbackPayload {
+                source_app_id: app_id,
+                pressured,
+                sampled_at_unix_ms,
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if !report.is_fresh_at(now) {
+                return Ok(false);
+            }
+            writer
+                .write_frame_on_local_lane_with_deadline(
+                    veilcore::proto::priority::REALTIME,
+                    LocalAppMsg::LocalSourceFeedback as u16,
+                    &report.encode(),
+                    Some(tokio::time::Instant::now() + Duration::from_millis(250)),
+                )
+                .await
         }
-        let report = LocalSourceFeedbackPayload {
-            source_app_id: self.app_id,
-            pressured,
-            sampled_at_unix_ms,
-        };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        if !report.is_fresh_at(now) {
-            return Ok(false);
-        }
-        self.writer
-            .write_frame_on_local_lane_with_deadline(
-                veilcore::proto::priority::REALTIME,
-                LocalAppMsg::LocalSourceFeedback as u16,
-                &report.encode(),
-                Some(tokio::time::Instant::now() + Duration::from_millis(250)),
-            )
-            .await
     }
+    /// Keep currently earned local admission while pausing growth until the
+    /// original event expires. Older daemons are explicitly unsupported.
+    pub fn report_local_source_growth_hold(
+        &self,
+        sampled_at_unix_ms: u64,
+        hold_started_at_unix_ms: u64,
+    ) -> impl std::future::Future<Output = Result<LocalSourceGrowthHoldResult, ClientError>>
+    + Send
+    + 'static
+    + use<> {
+        // Own only the writer/app id. An FFI caller can release its primary
+        // AppSender lock before a full local queue makes this future wait.
+        let writer = self.writer.clone();
+        let app_id = self.app_id;
+        async move {
+            use veilcore::proto::ipc::LocalSourceGrowthHoldPayload;
+            if !writer.supports_local_source_feedback()
+                || !writer.supports_local_source_growth_hold()
+            {
+                return Ok(LocalSourceGrowthHoldResult::Unsupported);
+            }
+            let report = LocalSourceGrowthHoldPayload {
+                source_app_id: app_id,
+                sampled_at_unix_ms,
+                hold_started_at_unix_ms,
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if !report.is_fresh_at(now) {
+                return Ok(LocalSourceGrowthHoldResult::Expired);
+            }
+            let queued = writer
+                .write_frame_on_local_lane_with_deadline(
+                    veilcore::proto::priority::REALTIME,
+                    LocalAppMsg::LocalSourceGrowthHold as u16,
+                    &report.encode(),
+                    Some(tokio::time::Instant::now() + Duration::from_millis(250)),
+                )
+                .await?;
+            Ok(if queued {
+                LocalSourceGrowthHoldResult::Queued
+            } else {
+                LocalSourceGrowthHoldResult::Expired
+            })
+        }
+    }
+
     /// Reliably release this endpoint and its local dispatch slots.
     ///
     /// Unlike Drop, this works when the caller originated outside Tokio (the
@@ -1580,6 +1645,64 @@ mod tests {
         assert!(report.pressured);
     }
 
+    #[tokio::test]
+    async fn source_growth_hold_requires_negotiation_and_preserves_both_times() {
+        let (tx, mut rx) = mpsc::channel::<crate::client::IpcWriterFrame>(4);
+        let mut sender = AppSender {
+            app_id: [7; 32],
+            endpoint_id: 9,
+            writer: SharedWriter::new(tx).with_local_source_feedback(true),
+            dispatch: Arc::new(Mutex::new(DispatchTable::new())),
+            unbind_on_drop: false,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert_eq!(
+            sender
+                .report_local_source_growth_hold(now, now - 1000)
+                .await
+                .unwrap(),
+            LocalSourceGrowthHoldResult::Unsupported
+        );
+        assert!(rx.try_recv().is_err());
+        sender.writer = sender.writer.clone().with_local_source_growth_hold(true);
+        assert_eq!(
+            sender
+                .report_local_source_growth_hold(now, now - 3000)
+                .await
+                .unwrap(),
+            LocalSourceGrowthHoldResult::Expired
+        );
+        assert!(rx.try_recv().is_err());
+        // Fresh sample and a syntactically valid span, but the original event
+        // has expired by receipt. This must not request a healthy fallback.
+        assert_eq!(
+            sender
+                .report_local_source_growth_hold(now - 200, now - 3100)
+                .await
+                .unwrap(),
+            LocalSourceGrowthHoldResult::Expired
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            sender
+                .report_local_source_growth_hold(now, now - 1000)
+                .await
+                .unwrap(),
+            LocalSourceGrowthHoldResult::Queued
+        );
+        let frame = rx.recv().await.unwrap();
+        let report = veilcore::proto::ipc::LocalSourceGrowthHoldPayload::decode(
+            &frame[veilcore::proto::HEADER_SIZE..],
+        )
+        .unwrap();
+        assert_eq!(report.source_app_id, [7; 32]);
+        assert_eq!(report.sampled_at_unix_ms, now);
+        assert_eq!(report.hold_started_at_unix_ms, now - 1000);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn source_feedback_cannot_wait_indefinitely_in_a_full_writer() {
         let (mut sender, _rx) = sender_on_a_wedged_writer();
@@ -1597,6 +1720,69 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(started.elapsed(), Duration::from_millis(250));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn source_growth_hold_cannot_wait_indefinitely_in_a_full_writer() {
+        let (mut sender, _rx) = sender_on_a_wedged_writer();
+        sender.unbind_on_drop = false;
+        sender.writer = sender
+            .writer
+            .clone()
+            .with_local_source_feedback(true)
+            .with_local_source_growth_hold(true);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            sender
+                .report_local_source_growth_hold(now, now)
+                .await
+                .unwrap(),
+            LocalSourceGrowthHoldResult::Expired
+        );
+        assert_eq!(started.elapsed(), Duration::from_millis(250));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn source_reports_wait_without_borrowing_the_primary_sender() {
+        let (mut sender, _rx) = sender_on_a_wedged_writer();
+        sender.unbind_on_drop = false;
+        sender.writer = sender
+            .writer
+            .clone()
+            .with_local_source_feedback(true)
+            .with_local_source_growth_hold(true);
+        let owner = Mutex::new(sender);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let pressure = {
+            let guard = owner.lock().await;
+            guard.report_local_source_pressure(true, now)
+        };
+        let hold = {
+            let guard = owner.lock().await;
+            guard.report_local_source_growth_hold(now, now)
+        };
+        let pressure_task = tokio::spawn(pressure);
+        let hold_task = tokio::spawn(hold);
+        tokio::task::yield_now().await;
+        assert!(
+            !pressure_task.is_finished() && !hold_task.is_finished(),
+            "both reports are waiting on the full writer"
+        );
+        assert!(
+            owner.try_lock().is_ok(),
+            "primary media must retain access to its sender while reports wait"
+        );
+        tokio::time::advance(Duration::from_millis(250)).await;
+        assert!(!pressure_task.await.unwrap().unwrap());
+        assert_eq!(
+            hold_task.await.unwrap().unwrap(),
+            LocalSourceGrowthHoldResult::Expired
+        );
     }
     use crate::client::{DispatchTable, SharedWriter};
 

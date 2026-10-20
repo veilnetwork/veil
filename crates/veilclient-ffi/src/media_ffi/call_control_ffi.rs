@@ -513,9 +513,15 @@ mod tests {
     #[test]
     fn four_producers_keep_replay_windows_across_two_generations() {
         let peer = [0xc9; 32];
-        let first = media::cipher_for_test(&peer, &[1; 32], &[2; 32]).unwrap();
-        let second = media::cipher_for_test(&peer, &[1; 32], &[2; 32]).unwrap();
-        let receiver = media::cipher_for_test(&peer, &[2; 32], &[1; 32]).unwrap();
+        // Replay history is intentionally scoped to the key, not peer id.
+        // Other parallel fixtures use [1;32]/[2;32] and would add their own
+        // epochs to this exact eight-epoch boundary test. Keep the same key
+        // across both generations here, with a scope unique to this test.
+        let forward = blake3::derive_key("xveil/test/call-control/two-generations", b"forward");
+        let reverse = blake3::derive_key("xveil/test/call-control/two-generations", b"reverse");
+        let first = media::cipher_for_test(&peer, &forward, &reverse).unwrap();
+        let second = media::cipher_for_test(&peer, &forward, &reverse).unwrap();
+        let receiver = media::cipher_for_test(&peer, &reverse, &forward).unwrap();
         let seal = |cipher: &media::MediaCipher, producer, bytes: &[u8]| match producer {
             0 => cipher.seal_on_plane(media::LocalMediaPlane::Primary, bytes),
             1 => cipher.seal_on_plane(media::LocalMediaPlane::Secondary, bytes),

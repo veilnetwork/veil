@@ -45,6 +45,11 @@ pub const IPC_HELLO_OK_LOCAL_LOSSY_WORK: u16 = 0x0200;
 pub const IPC_CAP_LOCAL_DATAGRAM_PREPARATION: u32 = 8;
 pub const IPC_HELLO_OK_LOCAL_DATAGRAM_PREPARATION: u16 = 0x0400;
 
+/// Keep current local producer admission while withholding growth.
+pub const IPC_CAP_LOCAL_SOURCE_GROWTH_HOLD: u32 = 16;
+/// Local APP_HELLO_OK acknowledgment; never a peer priority flag.
+pub const IPC_HELLO_OK_LOCAL_SOURCE_GROWTH_HOLD: u16 = 0x0800;
+
 /// No content or media role is sent over the network by this local request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrepareLocalDatagramPayload {
@@ -214,6 +219,100 @@ impl LocalSourceFeedbackPayload {
             && now_unix_ms != 0
             && now_unix_ms.saturating_sub(self.sampled_at_unix_ms) <= Self::MAX_AGE_MS
             && self.sampled_at_unix_ms.saturating_sub(now_unix_ms) <= Self::MAX_FUTURE_MS
+    }
+}
+
+/// A current healthy measurement with a bounded hold from an earlier event.
+/// Separate clocks prevent healthy DATA leases from expiring during a hold,
+/// and prevent repeated reports from extending the original hold deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSourceGrowthHoldPayload {
+    /// Bound application owned by the reporting local client.
+    pub source_app_id: [u8; 32],
+    /// Current trusted sampling time on this host.
+    pub sampled_at_unix_ms: u64,
+    /// Original event starting this hold, never refreshed by polling/replay.
+    pub hold_started_at_unix_ms: u64,
+}
+impl LocalSourceGrowthHoldPayload {
+    /// Exact local payload size; no content/role or peer address is present.
+    pub const WIRE_SIZE: usize = 48;
+    /// Same short growth hold used by the endpoint loss tracker.
+    pub const HOLD_MS: u64 = 3000;
+    /// Serialize only to app-node IPC.
+    pub fn encode(&self) -> [u8; Self::WIRE_SIZE] {
+        let mut bytes = [0; Self::WIRE_SIZE];
+        bytes[..32].copy_from_slice(&self.source_app_id);
+        bytes[32..40].copy_from_slice(&self.sampled_at_unix_ms.to_be_bytes());
+        bytes[40..].copy_from_slice(&self.hold_started_at_unix_ms.to_be_bytes());
+        bytes
+    }
+    /// Reject truncated and extended local payloads.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtoError> {
+        if bytes.len() < Self::WIRE_SIZE {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::WIRE_SIZE,
+                got: bytes.len(),
+            });
+        }
+        if bytes.len() > Self::WIRE_SIZE {
+            return Err(ProtoError::TrailingBytes {
+                trailing: bytes.len() - Self::WIRE_SIZE,
+            });
+        }
+        Ok(Self {
+            source_app_id: bytes[..32].try_into().expect("checked length"),
+            sampled_at_unix_ms: u64::from_be_bytes(
+                bytes[32..40].try_into().expect("checked length"),
+            ),
+            hold_started_at_unix_ms: u64::from_be_bytes(
+                bytes[40..].try_into().expect("checked length"),
+            ),
+        })
+    }
+    /// Fresh measurement and unexpired original hold, both on this host.
+    pub fn is_fresh_at(&self, now: u64) -> bool {
+        LocalSourceFeedbackPayload {
+            source_app_id: self.source_app_id,
+            pressured: false,
+            sampled_at_unix_ms: self.sampled_at_unix_ms,
+        }
+        .is_fresh_at(now)
+            && self.hold_started_at_unix_ms != 0
+            && self.hold_started_at_unix_ms <= self.sampled_at_unix_ms
+            && self.sampled_at_unix_ms - self.hold_started_at_unix_ms < Self::HOLD_MS
+            && now.saturating_sub(self.hold_started_at_unix_ms) < Self::HOLD_MS
+    }
+}
+
+#[cfg(test)]
+mod local_source_growth_hold_tests {
+    use super::*;
+    #[test]
+    fn current_health_does_not_renew_the_original_hold_event() {
+        let mut report = LocalSourceGrowthHoldPayload {
+            source_app_id: [7; 32],
+            sampled_at_unix_ms: 10_000,
+            hold_started_at_unix_ms: 10_000,
+        };
+        for sample in [10_000, 11_000, 12_000] {
+            report.sampled_at_unix_ms = sample;
+            assert_eq!(
+                LocalSourceGrowthHoldPayload::decode(&report.encode()).unwrap(),
+                report
+            );
+            assert!(report.is_fresh_at(sample));
+        }
+        assert!(!report.is_fresh_at(13_000));
+        report.sampled_at_unix_ms = 13_000;
+        assert!(!report.is_fresh_at(13_000));
+        report.hold_started_at_unix_ms = 13_001;
+        assert!(!report.is_fresh_at(13_000));
+        report.hold_started_at_unix_ms = 13_000;
+        assert!(!report.is_fresh_at(14_501));
+        let bytes = report.encode();
+        assert!(LocalSourceGrowthHoldPayload::decode(&bytes[..47]).is_err());
+        assert!(LocalSourceGrowthHoldPayload::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
     }
 }
 

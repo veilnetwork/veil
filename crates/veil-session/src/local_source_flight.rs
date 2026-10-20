@@ -40,6 +40,8 @@ struct DeliveryDiagnostics {
     inactive: u64,
     unhealthy: u64,
     pressured: u64,
+    held: u64,
+    hold_observations: u64,
     no_demand: u64,
     funded_bytes: u64,
     credit_wait: u64,
@@ -54,6 +56,7 @@ struct State {
     active_until: Option<Instant>,
     healthy_until: Option<Instant>,
     pressure_until: Option<Instant>,
+    growth_hold_until: Option<Instant>,
     window: u64,
     delivered_credit: u64,
     last_growth: Option<Instant>,
@@ -131,6 +134,7 @@ impl SourceFlightPool {
                 s.window = 0;
                 s.delivered_credit = 0;
                 s.healthy_until = None;
+                s.growth_hold_until = None;
                 for row in s.rows.values_mut() {
                     row.blocked_window = None;
                 }
@@ -165,6 +169,19 @@ impl SourceFlightPool {
             s.wakers()
         };
         wake(wakers);
+    }
+    /// Preserve the paid window, but do not earn growth from held feedback.
+    /// The deadline belongs to the original event, not IPC receipt or replay.
+    pub(crate) fn hold_growth(&self, until: Instant, received_at: Instant) {
+        if until <= received_at {
+            return;
+        }
+        let mut s = lock!(self.0);
+        s.growth_hold_until = Some(s.growth_hold_until.map_or(until, |old| old.max(until)));
+        s.healthy_until = None;
+        s.delivered_credit = 0;
+        s.delivery_diagnostics.hold_observations =
+            s.delivery_diagnostics.hold_observations.saturating_add(1);
     }
     pub(crate) fn bind(
         self: &Arc<Self>,
@@ -206,8 +223,8 @@ impl SourceFlightPool {
                 snapshot
             {
                 log::info!(target: "veil::source_flight",
-                    "connection_trace_id={id} members={members} in_flight_bytes={flight} window_bytes={window} primary_control_reserve_bytes={reserve} scope=endpoint healthy={healthy} pressured={pressured} credit_bytes={credit} ack_calls={} ack_stale={} ack_inactive={} ack_unhealthy={} ack_pressured={} ack_no_demand={} ack_funded_bytes={} ack_credit_wait={} ack_rtt_wait={} window_grows={} blocked_calls={} drained_witnesses={}",
-                    d.calls, d.stale, d.inactive, d.unhealthy, d.pressured, d.no_demand,
+                    "connection_trace_id={id} members={members} in_flight_bytes={flight} window_bytes={window} primary_control_reserve_bytes={reserve} scope=endpoint hold_observations={} ack_held={} healthy={healthy} pressured={pressured} credit_bytes={credit} ack_calls={} ack_stale={} ack_inactive={} ack_unhealthy={} ack_pressured={} ack_no_demand={} ack_funded_bytes={} ack_credit_wait={} ack_rtt_wait={} window_grows={} blocked_calls={} drained_witnesses={}",
+                    d.hold_observations, d.held, d.calls, d.stale, d.inactive, d.unhealthy, d.pressured, d.no_demand,
                     d.funded_bytes, d.credit_wait, d.rtt_wait, d.grows, d.blocked, d.drained);
             }
         }
@@ -394,6 +411,10 @@ impl LocalSendBudget for Binding {
                 s.delivery_diagnostics.inactive = s.delivery_diagnostics.inactive.saturating_add(1);
                 return;
             }
+            if s.growth_hold_until.is_some_and(|until| now < until) {
+                s.delivery_diagnostics.held = s.delivery_diagnostics.held.saturating_add(1);
+                return;
+            }
             if !s.healthy_until.is_some_and(|t| now < t) {
                 s.delivery_diagnostics.unhealthy =
                     s.delivery_diagnostics.unhealthy.saturating_add(1);
@@ -448,6 +469,7 @@ impl LocalSendBudget for Binding {
             s.window = 0;
             s.delivered_credit = 0;
             s.healthy_until = None;
+            s.growth_hold_until = None;
             s.last_growth = None;
             for row in s.rows.values_mut() {
                 row.blocked_window = None;
@@ -496,6 +518,53 @@ mod tests {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn growth_hold_keeps_paid_flight_and_cannot_bank_delivery_or_renew_on_replay() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let primary = pool.binding(1, Role::Primary, now).unwrap();
+        let video = pool.binding(2, Role::Secondary, now).unwrap();
+        pool.note_primary(now);
+        pool.feedback(false, now);
+        video.blocked(now);
+        primary.delivered(now, now, 2400, Duration::from_millis(100));
+        assert_eq!(video.window(now, 0, 1200), 3601);
+        let until = now + Duration::from_secs(3);
+        for milliseconds in [1000, 2000, 2999] {
+            let at = now + Duration::from_millis(milliseconds);
+            pool.note_primary(at);
+            let _ = pool.binding(1, Role::Primary, at).unwrap();
+            pool.hold_growth(until, at);
+            video.blocked(at);
+            primary.delivered(at, at, 100_000, Duration::from_millis(100));
+            assert_eq!(video.window(at, 0, 1200), 3601);
+        }
+        pool.note_primary(until);
+        let _ = pool.binding(1, Role::Primary, until).unwrap();
+        pool.hold_growth(until, until); // An expired replay cannot renew it.
+        primary.delivered(until, until, 100_000, Duration::from_millis(100));
+        assert_eq!(
+            video.window(until, 0, 1200),
+            3601,
+            "a hold is not a positive quality observation after expiration"
+        );
+        pool.feedback(false, until);
+        primary.delivered(until, until, 1200, Duration::from_millis(100));
+        assert_eq!(
+            video.window(until, 0, 1200),
+            3601,
+            "ACKs received during the hold cannot fund later growth"
+        );
+        primary.delivered(until, until, 2400, Duration::from_millis(100));
+        assert_eq!(video.window(until, 0, 1200), 4801);
+        pool.feedback(true, until);
+        pool.hold_growth(until + Duration::from_secs(1), until);
+        assert!(
+            video.window(until, 0, 1200) < 3601,
+            "hold cannot undo genuine primary protection"
+        );
     }
 
     #[test]

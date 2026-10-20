@@ -28,6 +28,8 @@ struct SourceState {
     source_feedback_seen: bool,
     last_healthy_feedback: Option<Instant>,
     reliable_ramp_since: Option<Instant>,
+    growth_held_since: Option<Instant>,
+    growth_hold_until: Option<Instant>,
     last_reliable_progress: Option<Instant>,
     reliable_sequence: u64,
     reliable_waiters: VecDeque<u64>,
@@ -241,6 +243,8 @@ impl LocalSourceActivity {
             state.signaling_next = None;
             state.reliable_transport_pressure_until = None;
             state.source_feedback_seen = false;
+            state.growth_held_since = None;
+            state.growth_hold_until = None;
             state.last_healthy_feedback = None;
             state.reliable_ramp_since = None;
             state.last_reliable_progress = None;
@@ -291,9 +295,42 @@ impl LocalSourceActivity {
         let mut state = lock!(self.state);
         state.source_feedback_seen = true;
         if !pressured {
+            if state.growth_hold_until.is_some_and(|until| now >= until) {
+                if let (Some(since), Some(held)) =
+                    (state.reliable_ramp_since, state.growth_held_since)
+                {
+                    state.reliable_ramp_since =
+                        since.checked_add(now.saturating_duration_since(held.max(since)));
+                }
+                state.growth_held_since = None;
+                state.growth_hold_until = None;
+            }
             state.last_healthy_feedback =
                 Some(state.last_healthy_feedback.map_or(now, |old| old.max(now)));
         }
+    }
+
+    /// Known current audio health with a bounded pause in source growth.
+    /// Receipt freezes the achieved DATA ramp; sampling time bounds freshness.
+    pub(crate) fn note_growth_hold(
+        &self,
+        sampled_at: Instant,
+        until: Instant,
+        received_at: Instant,
+    ) {
+        if sampled_at > received_at || until <= received_at {
+            return;
+        }
+        self.flight.hold_growth(until, received_at);
+        let mut state = lock!(self.state);
+        state.source_feedback_seen = true;
+        state.last_healthy_feedback = Some(
+            state
+                .last_healthy_feedback
+                .map_or(sampled_at, |old| old.max(sampled_at)),
+        );
+        state.growth_held_since.get_or_insert(received_at);
+        state.growth_hold_until = Some(state.growth_hold_until.map_or(until, |old| old.max(until)));
     }
 
     /// Hold reliable local producers before encryption whenever a local
@@ -446,8 +483,9 @@ impl LocalSourceActivity {
                 } else {
                     now
                 };
-                let steps =
-                    now.saturating_duration_since(since).as_nanos() / RELIABLE_RAMP_STEP.as_nanos();
+                let ramp_at = state.growth_held_since.unwrap_or(now);
+                let steps = ramp_at.saturating_duration_since(since).as_nanos()
+                    / RELIABLE_RAMP_STEP.as_nanos();
                 let max_steps = (RELIABLE_SECONDARY_BYTES / PRESSURED_RELIABLE_BYTES - 1) as u128;
                 PRESSURED_RELIABLE_BYTES.saturating_mul(1 + steps.min(max_steps) as usize)
             } else {
@@ -743,6 +781,59 @@ mod tests {
             WorkAdmission::Rejected
         );
         assert!(source.allow_secondary(LOSSY_SECONDARY_BYTES, now));
+    }
+
+    #[test]
+    fn growth_hold_keeps_earned_data_rate_and_debt_without_banking_pause_time() {
+        let source = LocalSourceActivity::default();
+        let now = Instant::now();
+        for second in 0..=2 {
+            let at = now + Duration::from_secs(second);
+            source.note(at);
+            source.note_feedback(false, at);
+            assert!(source.admit_reliable_secondary(1024, at).is_ok());
+        }
+        let start = now + Duration::from_secs(3);
+        let until = start + IDLE_GRACE;
+        for second in 0..3 {
+            let at = start + Duration::from_secs(second);
+            source.note(at);
+            source.note_growth_hold(at, until, at);
+            assert!(source.admit_reliable_secondary(1024, at).is_ok());
+            assert_eq!(
+                source.admit_reliable_secondary(1, at),
+                Err(at + Duration::from_millis(100)),
+                "hold retains 2 KiB per 200 ms, without falling to the floor or climbing"
+            );
+        }
+        source.note(until);
+        source.note_feedback(false, until);
+        assert!(source.admit_reliable_secondary(1024, until).is_ok());
+        assert_eq!(
+            source.admit_reliable_secondary(1, until),
+            Err(until + Duration::from_millis(100))
+        );
+        let growth = until + Duration::from_secs(1);
+        source.note(growth);
+        source.note_feedback(false, growth);
+        assert!(source.admit_reliable_secondary(1024, growth).is_ok());
+        assert_eq!(
+            source.admit_reliable_secondary(1, growth),
+            Err(growth + Duration::from_nanos(66_666_667))
+        );
+        source.note_pressure(growth);
+        source.note_growth_hold(growth, growth + IDLE_GRACE, growth);
+        assert_eq!(
+            source.admit_reliable_secondary(1, growth),
+            Err(growth + Duration::from_nanos(66_666_667)),
+            "new feedback cannot refund already admitted DATA debt"
+        );
+        let after = growth + Duration::from_nanos(66_666_667);
+        assert!(source.admit_reliable_secondary(1024, after).is_ok());
+        assert_eq!(
+            source.admit_reliable_secondary(1, after),
+            Err(after + SECONDARY_PROBE_INTERVAL)
+        );
     }
 
     #[test]
