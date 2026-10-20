@@ -34,6 +34,42 @@ pub(crate) fn handle_local_source_feedback(
     registry.note_local_source_feedback(report.pressured, sampled_at)
 }
 
+/// Explicit hold is negotiated separately so old daemons retain old semantics.
+/// Current health and the original hold event are validated independently.
+pub(crate) fn handle_local_source_growth_hold(
+    body: &[u8],
+    negotiated: bool,
+    owns_app: impl FnOnce(&[u8; 32]) -> bool,
+    registry: Option<&dyn FrameBroadcaster>,
+    now_unix_ms: u64,
+    now: Instant,
+) -> bool {
+    use veil_proto::ipc::LocalSourceGrowthHoldPayload;
+    if !negotiated {
+        return false;
+    }
+    let Ok(report) = LocalSourceGrowthHoldPayload::decode(body) else {
+        return false;
+    };
+    if !report.is_fresh_at(now_unix_ms) || !owns_app(&report.source_app_id) {
+        return false;
+    }
+    let Some(registry) = registry else {
+        return false;
+    };
+    let Some(sampled_at) = now.checked_sub(Duration::from_millis(
+        now_unix_ms.saturating_sub(report.sampled_at_unix_ms),
+    )) else {
+        return false;
+    };
+    let remaining = LocalSourceGrowthHoldPayload::HOLD_MS
+        - now_unix_ms.saturating_sub(report.hold_started_at_unix_ms);
+    let Some(until) = now.checked_add(Duration::from_millis(remaining)) else {
+        return false;
+    };
+    registry.note_local_source_growth_hold(sampled_at, until, now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,12 +79,28 @@ mod tests {
     };
 
     #[derive(Default)]
-    struct Observer(AtomicUsize, Mutex<Vec<Instant>>);
+    struct Observer(
+        AtomicUsize,
+        Mutex<Vec<Instant>>,
+        Mutex<Vec<(Instant, Instant, Instant)>>,
+    );
     impl FrameBroadcaster for Observer {
         fn note_local_source_feedback(&self, pressured: bool, sampled_at: Instant) -> bool {
             self.0
                 .fetch_add(if pressured { 1 } else { 100 }, Ordering::Relaxed);
             self.1.lock().unwrap().push(sampled_at);
+            true
+        }
+        fn note_local_source_growth_hold(
+            &self,
+            sampled_at: Instant,
+            until: Instant,
+            received_at: Instant,
+        ) -> bool {
+            self.2
+                .lock()
+                .unwrap()
+                .push((sampled_at, until, received_at));
             true
         }
         fn send_to(&self, _: &[u8; 32], _: u8, _: Vec<u8>) -> bool {
@@ -60,6 +112,69 @@ mod tests {
         fn active_node_ids(&self) -> Vec<[u8; 32]> {
             vec![]
         }
+    }
+
+    #[test]
+    fn held_health_is_owned_fresh_negotiated_and_has_one_original_deadline() {
+        use veil_proto::ipc::LocalSourceGrowthHoldPayload;
+        let registry = Observer::default();
+        let origin = Instant::now();
+        let mut report = LocalSourceGrowthHoldPayload {
+            source_app_id: [7; 32],
+            sampled_at_unix_ms: 10_000,
+            hold_started_at_unix_ms: 10_000,
+        };
+        for (sample_ms, receipt_ms) in [(0, 0), (1000, 1200), (1000, 1400), (2000, 2400)] {
+            report.sampled_at_unix_ms = 10_000 + sample_ms;
+            assert!(handle_local_source_growth_hold(
+                &report.encode(),
+                true,
+                |id| *id == [7; 32],
+                Some(&registry),
+                10_000 + receipt_ms,
+                origin + Duration::from_millis(receipt_ms)
+            ));
+        }
+        let seen = registry.2.lock().unwrap();
+        for (sampled, until, received) in seen.iter() {
+            assert_eq!(*until, origin + Duration::from_secs(3));
+            assert!(*sampled <= *received);
+        }
+        assert_eq!(
+            seen[2].0,
+            origin + Duration::from_secs(1),
+            "replay cannot renew health freshness"
+        );
+        drop(seen);
+        for (negotiated, owned, clock) in [
+            (false, true, 12_000),
+            (true, false, 12_000),
+            (true, true, 13_000),
+            (true, true, 14_000),
+        ] {
+            assert!(!handle_local_source_growth_hold(
+                &report.encode(),
+                negotiated,
+                |_| owned,
+                Some(&registry),
+                clock,
+                origin + Duration::from_millis(clock - 10_000)
+            ));
+        }
+        assert!(!handle_local_source_growth_hold(
+            &report.encode()[..47],
+            true,
+            |_| true,
+            Some(&registry),
+            12_000,
+            origin + Duration::from_secs(2)
+        ));
+        assert_eq!(registry.2.lock().unwrap().len(), 4);
+        assert_eq!(
+            registry.0.load(Ordering::Relaxed),
+            0,
+            "hold is not the legacy pressure signal"
+        );
     }
 
     #[test]

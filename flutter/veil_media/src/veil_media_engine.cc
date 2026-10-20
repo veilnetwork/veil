@@ -2605,6 +2605,41 @@ static int veil_media_group_engine_apply_video_budget(VeilGroupMediaEngine* engi
 #endif
 }
 
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+// Host-only timestamps: replay never renews the original hold deadline.
+static bool source_growth_hold_times(uint64_t sampled_ms, uint64_t started_ms,
+    int64_t* sampled_us, int64_t* until_us, int64_t* received_us) {
+  const int64_t wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+  if (!sampled_ms || !started_ms || wall_ms <= 0 || started_ms > sampled_ms ||
+      sampled_ms - started_ms >= 3000) return false;
+  const uint64_t now_ms = static_cast<uint64_t>(wall_ms);
+  if ((sampled_ms > now_ms && sampled_ms - now_ms > 250) ||
+      (now_ms > sampled_ms && now_ms - sampled_ms > 1500)) return false;
+  const uint64_t hold_age = now_ms > started_ms ? now_ms - started_ms : 0;
+  if (hold_age >= 3000) return false;
+  const uint64_t age = now_ms > sampled_ms ? now_ms - sampled_ms : 0;
+  *received_us = webrtc::TimeMicros();
+  *sampled_us = *received_us - static_cast<int64_t>(age * 1000);
+  *until_us = *received_us + static_cast<int64_t>((3000 - hold_age) * 1000);
+  return true;
+}
+#endif
+
+int veil_media_group_engine_hold_source_growth(VeilGroupMediaEngine* engine, uint64_t sampled_ms, uint64_t started_ms) {
+  if (!engine) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws) return VEIL_MEDIA_ERR_STATE;
+  int64_t sampled_us, until_us, received_us;
+  if (!source_growth_hold_times(sampled_ms, started_ms, &sampled_us, &until_us, &received_us)) return 1;
+  engine->ws->video_frame_budget->HoldGrowth(sampled_us, until_us, received_us);
+  return VEIL_MEDIA_OK;
+#else
+  (void)sampled_ms; (void)started_ms;
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
 int veil_media_group_engine_set_audio_source_pressure(VeilGroupMediaEngine* engine, int pressure) {
   if (!engine || pressure < -1 || pressure > 1) return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
@@ -2876,7 +2911,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               ",\"video_frame_encoded_bytes\":" + std::to_string(frame_budget.last_bytes);
   snapshot += ",\"video_audio_feedback_state\":" + std::to_string(frame_budget.audio_state) +
       ",\"video_audio_pixel_cuts\":" + std::to_string(frame_budget.audio_cuts) +
-      ",\"video_audio_pixel_recoveries\":" + std::to_string(frame_budget.audio_recoveries);
+      ",\"video_audio_pixel_recoveries\":" + std::to_string(frame_budget.audio_recoveries) +
+      ",\"video_audio_growth_holds\":" + std::to_string(frame_budget.growth_holds);
   snapshot += ",\"video_tx_retransmitted_pkts\":" + std::to_string(video_retransmitted_packets) +
               ",\"video_tx_retransmitted_bytes\":" + std::to_string(video_retransmitted_bytes) +
               ",\"video_rx_nack_packets\":" + std::to_string(video_nack_packets) +
@@ -3714,6 +3750,20 @@ static int veil_media_engine_apply_video_budget(VeilMediaEngine* engine,
   (void)max_bitrate_kbps;
   (void)max_fps;
   (void)minimum_kbps;
+  return VEIL_MEDIA_ERR_STATE;
+#endif
+}
+
+int veil_media_engine_hold_source_growth(VeilMediaEngine* engine, uint64_t sampled_ms, uint64_t started_ms) {
+  if (!engine) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (!engine->ws) return VEIL_MEDIA_ERR_STATE;
+  int64_t sampled_us, until_us, received_us;
+  if (!source_growth_hold_times(sampled_ms, started_ms, &sampled_us, &until_us, &received_us)) return 1;
+  engine->ws->video_frame_budget->HoldGrowth(sampled_us, until_us, received_us);
+  return VEIL_MEDIA_OK;
+#else
+  (void)sampled_ms; (void)started_ms;
   return VEIL_MEDIA_ERR_STATE;
 #endif
 }
@@ -4600,7 +4650,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
                   ",\"video_frame_encoded_bytes\":" + std::to_string(frame_budget.last_bytes);
   snapshot += ",\"video_audio_feedback_state\":" + std::to_string(frame_budget.audio_state) +
       ",\"video_audio_pixel_cuts\":" + std::to_string(frame_budget.audio_cuts) +
-      ",\"video_audio_pixel_recoveries\":" + std::to_string(frame_budget.audio_recoveries);
+      ",\"video_audio_pixel_recoveries\":" + std::to_string(frame_budget.audio_recoveries) +
+      ",\"video_audio_growth_holds\":" + std::to_string(frame_budget.growth_holds);
       snapshot += ",\"audio_latency_recovery_count\":" +
           std::to_string(ws->recovery_stats->count.load(std::memory_order_acquire));
       snapshot += ",\"audio_latency_discarded_ms\":" +

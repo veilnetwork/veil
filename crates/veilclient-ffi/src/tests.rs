@@ -125,6 +125,32 @@ fn local_source_feedback_rejects_invalid_flags_and_unknown_handles() {
 }
 
 #[test]
+fn local_growth_hold_rejects_bad_times_and_unknown_handles() {
+    for (sample, event) in [
+        (0, 0),
+        (10_000, 0),
+        (10_000, 10_001),
+        (10_000, 7_000),
+        (10_000, 9_000),
+    ] {
+        let mut err = ptr::null_mut();
+        let rc = unsafe {
+            veil_app_hold_local_source_growth(
+                ptr::dangling_mut::<VeilApp>(),
+                sample,
+                event,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+        assert!(!err.is_null());
+        unsafe {
+            veil_free_string(err);
+        }
+    }
+}
+
+#[test]
 fn abi_contract_hash_is_the_hash_of_the_committed_header() {
     use sha2::{Digest, Sha256};
     let header = include_bytes!("../include/veil_ffi.h");

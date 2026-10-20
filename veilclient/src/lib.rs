@@ -94,7 +94,9 @@ pub use client::{
     VeilEvent,
 };
 pub use error::ClientError;
-pub use handle::{AppHandle, AppReceiver, AppSender, IncomingMessage, IncomingStream};
+pub use handle::{
+    AppHandle, AppReceiver, AppSender, IncomingMessage, IncomingStream, LocalSourceGrowthHoldResult,
+};
 pub use stream::VeilStream;
 
 // ── Network contract constants (stable) ──────────────────────────────────────

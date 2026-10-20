@@ -485,6 +485,25 @@ final int Function(
   Pointer<Pointer<Utf8>>,
 )? veilSendRelayRealtime = _lookupVeilSendRelayRealtime();
 
+/// Optional explicit local growth hold; current health and event time differ.
+final int Function(Pointer<VeilApp>, int, int, Pointer<Pointer<Utf8>>)?
+    veilAppHoldLocalSourceGrowth = _lookupLocalSourceGrowthHold();
+
+int Function(Pointer<VeilApp>, int, int, Pointer<Pointer<Utf8>>)?
+    _lookupLocalSourceGrowthHold() {
+  try {
+    return nativeLib
+        .lookup<
+                NativeFunction<
+                    Int32 Function(Pointer<VeilApp>, Uint64, Uint64,
+                        Pointer<Pointer<Utf8>>)>>(
+            'veil_app_hold_local_source_growth')
+        .asFunction();
+  } on ArgumentError {
+    return null;
+  }
+}
+
 /// Local source admission observations; never transmitted to remote peers.
 final int Function(Pointer<VeilApp>, int, int, Pointer<Pointer<Utf8>>)?
     veilAppReportLocalSourcePressure = _lookupLocalSourcePressure();

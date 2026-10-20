@@ -270,8 +270,18 @@ class VeilMediaEngine {
 
   /// Local measured audio state: null is unknown and earns no source growth.
   /// Returns false when the bundled native engine predates this control.
-  bool setAudioSourcePressure(bool? pressured) {
+  bool setAudioSourcePressure(bool? pressured,
+      {DateTime? sampledAt, DateTime? growthHoldStartedAt}) {
     _ensure();
+    final hold = ffi.veilMediaEngineHoldSourceGrowth;
+    if (pressured == false && growthHoldStartedAt != null && hold != null) {
+      final rc = hold(
+          _ptr,
+          (sampledAt ?? DateTime.now()).millisecondsSinceEpoch,
+          growthHoldStartedAt.millisecondsSinceEpoch);
+      // A rejected hold must expire naturally, not become a new healthy hint.
+      return rc == 0;
+    }
     final set = ffi.veilMediaEngineSetAudioSourcePressure;
     final state = pressured == null ? -1 : (pressured ? 1 : 0);
     return set != null && set(_ptr, state) == 0;
@@ -728,8 +738,18 @@ class VeilGroupMediaEngine {
 
   /// Local measured audio state: null is unknown and earns no source growth.
   /// Returns false when the bundled native engine predates this control.
-  bool setAudioSourcePressure(bool? pressured) {
+  bool setAudioSourcePressure(bool? pressured,
+      {DateTime? sampledAt, DateTime? growthHoldStartedAt}) {
     _ensure();
+    final hold = ffi.veilMediaGroupEngineHoldSourceGrowth;
+    if (pressured == false && growthHoldStartedAt != null && hold != null) {
+      final rc = hold(
+          _ptr,
+          (sampledAt ?? DateTime.now()).millisecondsSinceEpoch,
+          growthHoldStartedAt.millisecondsSinceEpoch);
+      // A rejected hold must expire naturally, not become a new healthy hint.
+      return rc == 0;
+    }
     final set = ffi.veilMediaGroupEngineSetAudioSourcePressure;
     final state = pressured == null ? -1 : (pressured ? 1 : 0);
     return set != null && set(_ptr, state) == 0;

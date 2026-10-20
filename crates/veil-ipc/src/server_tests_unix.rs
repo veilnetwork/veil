@@ -96,6 +96,15 @@ async fn connect_with_flags(sock: &PathBuf, flags: u32) -> UnixStream {
             veil_proto::ipc::IPC_HELLO_OK_LOCAL_SOURCE_FEEDBACK
         } else {
             0
+        }) | (if flags
+            & (veil_proto::ipc::IPC_CAP_LOCAL_SOURCE_FEEDBACK
+                | veil_proto::ipc::IPC_CAP_LOCAL_SOURCE_GROWTH_HOLD)
+            == veil_proto::ipc::IPC_CAP_LOCAL_SOURCE_FEEDBACK
+                | veil_proto::ipc::IPC_CAP_LOCAL_SOURCE_GROWTH_HOLD
+        {
+            veil_proto::ipc::IPC_HELLO_OK_LOCAL_SOURCE_GROWTH_HOLD
+        } else {
+            0
         }) | (if flags & veil_proto::ipc::IPC_CAP_LOCAL_LOSSY_WORK != 0 {
             veil_proto::ipc::IPC_HELLO_OK_LOCAL_LOSSY_WORK
         } else {
@@ -122,7 +131,7 @@ async fn send_ipc_frame(client: &mut UnixStream, msg_type: u16, body: &[u8]) {
 async fn local_source_feedback_is_bound_fresh_negotiated_and_never_forwarded() {
     use veil_proto::ipc::{IPC_CAP_LOCAL_SOURCE_FEEDBACK, LocalSourceFeedbackPayload};
     #[derive(Default)]
-    struct Observer(AtomicUsize);
+    struct Observer(AtomicUsize, AtomicUsize);
     impl FrameBroadcaster for Observer {
         fn supports_local_source_feedback(&self) -> bool {
             true
@@ -130,6 +139,19 @@ async fn local_source_feedback_is_bound_fresh_negotiated_and_never_forwarded() {
         fn note_local_source_feedback(&self, pressured: bool, _: std::time::Instant) -> bool {
             self.0
                 .fetch_add(if pressured { 1 } else { 100 }, Ordering::SeqCst);
+            true
+        }
+        fn supports_local_source_growth_hold(&self) -> bool {
+            true
+        }
+        fn note_local_source_growth_hold(
+            &self,
+            sampled_at: std::time::Instant,
+            until: std::time::Instant,
+            received: std::time::Instant,
+        ) -> bool {
+            assert!(sampled_at <= received && received < until);
+            self.1.fetch_add(1, Ordering::SeqCst);
             true
         }
         fn send_to(&self, _: &[u8; 32], _: u8, _: Vec<u8>) -> bool {
@@ -153,7 +175,11 @@ async fn local_source_feedback_is_bound_fresh_negotiated_and_never_forwarded() {
     let mut server = server.with_session_tx_registry(observer.clone());
     let task = tokio::spawn(async move { server.run().await });
     tokio::time::sleep(Duration::from_millis(30)).await;
-    let mut client = connect_with_flags(&sock, IPC_CAP_LOCAL_SOURCE_FEEDBACK).await;
+    let mut client = connect_with_flags(
+        &sock,
+        IPC_CAP_LOCAL_SOURCE_FEEDBACK | veil_proto::ipc::IPC_CAP_LOCAL_SOURCE_GROWTH_HOLD,
+    )
+    .await;
     let bind = AppBindPayload {
         endpoint_id: 9,
         flags: 0,
@@ -182,7 +208,11 @@ async fn local_source_feedback_is_bound_fresh_negotiated_and_never_forwarded() {
     .await;
     barrier(&mut client).await;
     assert_eq!(observer.0.load(Ordering::SeqCst), 1);
-    let mut stranger = connect_with_flags(&sock, IPC_CAP_LOCAL_SOURCE_FEEDBACK).await;
+    let mut stranger = connect_with_flags(
+        &sock,
+        IPC_CAP_LOCAL_SOURCE_FEEDBACK | veil_proto::ipc::IPC_CAP_LOCAL_SOURCE_GROWTH_HOLD,
+    )
+    .await;
     send_ipc_frame(
         &mut stranger,
         LocalAppMsg::LocalSourceFeedback as u16,
@@ -240,6 +270,56 @@ async fn local_source_feedback_is_bound_fresh_negotiated_and_never_forwarded() {
     .await;
     barrier(&mut client).await;
     assert_eq!(observer.0.load(Ordering::SeqCst), 101);
+    let hold = veil_proto::ipc::LocalSourceGrowthHoldPayload {
+        source_app_id: app_id,
+        sampled_at_unix_ms: now_ms(),
+        hold_started_at_unix_ms: now_ms() - 1000,
+    };
+    for other in [&mut stranger, &mut legacy] {
+        send_ipc_frame(
+            other,
+            LocalAppMsg::LocalSourceGrowthHold as u16,
+            &hold.encode(),
+        )
+        .await;
+        barrier(other).await;
+    }
+    assert_eq!(
+        observer.1.load(Ordering::SeqCst),
+        0,
+        "ownership and negotiation independently required"
+    );
+    send_ipc_frame(
+        &mut client,
+        LocalAppMsg::LocalSourceGrowthHold as u16,
+        &hold.encode(),
+    )
+    .await;
+    barrier(&mut client).await;
+    assert_eq!(observer.1.load(Ordering::SeqCst), 1);
+    send_ipc_frame(
+        &mut client,
+        LocalAppMsg::LocalSourceGrowthHold as u16,
+        &hold.encode()[..47],
+    )
+    .await;
+    let expired = veil_proto::ipc::LocalSourceGrowthHoldPayload {
+        sampled_at_unix_ms: now_ms(),
+        hold_started_at_unix_ms: now_ms() - 3001,
+        ..hold
+    };
+    send_ipc_frame(
+        &mut client,
+        LocalAppMsg::LocalSourceGrowthHold as u16,
+        &expired.encode(),
+    )
+    .await;
+    barrier(&mut client).await;
+    assert_eq!(
+        observer.1.load(Ordering::SeqCst),
+        1,
+        "malformed/expired holds cannot reach the sink"
+    );
     drop((client, stranger, legacy));
     shutdown.send(true).unwrap();
     task.await.unwrap().unwrap();

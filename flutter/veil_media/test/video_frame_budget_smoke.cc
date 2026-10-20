@@ -140,6 +140,39 @@ int main(int argc, char** argv) {
   stale.SetAudioPressure(0, 13'000'000);
   assert(stale.snapshot().max_pixels > stale_cap);
   // Packetizer setup, codec output and source requests have different queues.
+  // A growth hold preserves the current cap and earned active recovery,
+  // without banking time or frames from the hold itself.
+  veil_media::VideoFrameBudget held;
+  held.SetPacketPayload(1440);
+  held.SetProfile(15000);
+  held.SetRate(12000);
+  held.Observe(500, 320, 240, 1, 1'000'000);
+  held.SetAudioPressure(1, 1'100'000);
+  const int held_cap = held.snapshot().max_pixels;
+  for (int i = 2; i <= 3; ++i) {
+    held.Observe(500, 160, 120, i, i * 1'000'000);
+    held.SetAudioPressure(0, i * 1'000'000);
+  }
+  for (int i = 4; i <= 6; ++i) {
+    held.Observe(500, 160, 120, i, i * 1'000'000);
+    held.HoldGrowth(i * 1'000'000, 7'000'000, i * 1'000'000);
+    assert(held.snapshot().max_pixels == held_cap);
+    assert(held.snapshot().audio_recoveries == 0);
+  }
+  held.HoldGrowth(6'000'000, 7'000'000, 6'500'000); // Replay: same deadline.
+  held.Observe(500, 160, 120, 7, 7'000'000);
+  held.SetAudioPressure(0, 7'000'000);
+  assert(held.snapshot().max_pixels == held_cap); // No time bank from the hold.
+  held.Observe(500, 160, 120, 8, 8'000'000);
+  held.SetAudioPressure(0, 8'000'000);
+  assert(held.snapshot().max_pixels > held_cap); // Earned recovery was preserved.
+  assert(held.snapshot().audio_recoveries == 1);
+  assert(held.snapshot().growth_holds == 1);
+  held.SetAudioPressure(1, 8'500'000);
+  const int genuine_cut = held.snapshot().max_pixels;
+  held.HoldGrowth(8'000'000, 10'000'000, 9'000'000);
+  assert(held.snapshot().audio_state == 1); // Cannot erase a newer pressure report.
+  assert(held.snapshot().max_pixels == genuine_cut);
   std::thread encoder([&] {
     for (int i = 0; i < 1000; ++i) {
       budget.SetRate(8000);

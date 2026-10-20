@@ -96,6 +96,20 @@ impl veil_types::FrameBroadcaster for SessionTxBroadcaster {
         true
     }
 
+    fn supports_local_source_growth_hold(&self) -> bool {
+        true
+    }
+
+    fn note_local_source_growth_hold(
+        &self,
+        sampled_at: std::time::Instant,
+        until: std::time::Instant,
+        received_at: std::time::Instant,
+    ) -> bool {
+        rlock!(self.inner).note_local_source_growth_hold(sampled_at, until, received_at);
+        true
+    }
+
     fn local_source_segment_data_bytes(&self) -> Option<usize> {
         rlock!(self.inner).local_source_segment_data_bytes()
     }

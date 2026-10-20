@@ -420,6 +420,10 @@ int main(int argc, char** argv) {
         const auto start = std::chrono::steady_clock::now();
         assert((ctx->group ? veil_media_group_engine_set_audio_source_pressure(ctx->group, 1)
                            : veil_media_engine_set_audio_source_pressure(ctx->one, 1)) == 0);
+        const auto now_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+        assert((ctx->group ? veil_media_group_engine_hold_source_growth(ctx->group, now_ms, now_ms)
+                           : veil_media_engine_hold_source_growth(ctx->one, now_ms, now_ms)) == 0);
         assert(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(50));
         return 0;
       };
@@ -427,6 +431,36 @@ int main(int argc, char** argv) {
                    : veil_media_test_with_held_video_worker(one.get(), blocked_hint, &context)) == 0);
       assert(metric("video_audio_pixel_cuts") > 0);
       assert(metric("video_frame_pixel_cap") > 0);
+      const auto epoch_ms = [] {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+      };
+      const auto hold = [&](uint64_t sample, uint64_t event) {
+        return room ? veil_media_group_engine_hold_source_growth(group.get(), sample, event)
+                    : veil_media_engine_hold_source_growth(one.get(), sample, event);
+      };
+      const auto held_cap = metric("video_frame_pixel_cap");
+      const uint64_t event = epoch_ms();
+      const auto hold_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3050);
+      auto next_hold = std::chrono::steady_clock::now();
+      while (std::chrono::steady_clock::now() < hold_deadline) {
+        push();
+        if (std::chrono::steady_clock::now() >= next_hold) {
+          const auto at = epoch_ms();
+          if (at - event < 2900) {
+            const auto started = std::chrono::steady_clock::now();
+            assert(hold(at, event) == 0);
+            assert(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(50));
+          }
+          next_hold += std::chrono::seconds(1);
+        }
+        assert(metric("video_frame_pixel_cap") == held_cap);
+        assert(metric("video_audio_pixel_recoveries") == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(35));
+      }
+      assert(metric("video_audio_growth_holds") > 0);
+      assert(hold(epoch_ms(), event) == 1); // Original event expired despite new health.
+      assert(hold(epoch_ms()-2000, epoch_ms()-2000) == 1); // Stale sampling.
       auto next_hint = std::chrono::steady_clock::now();
       const auto recovery_deadline = next_hint + std::chrono::seconds(6);
       while (!metric("video_audio_pixel_recoveries") &&

@@ -53,6 +53,7 @@ class VideoFrameBudget {
     int audio_state;
     uint64_t audio_cuts;
     uint64_t audio_recoveries;
+    uint64_t growth_holds;
   };
 
   // Local measured audio feedback: -1 unknown, 0 healthy, 1 pressured.
@@ -60,39 +61,21 @@ class VideoFrameBudget {
   void SetAudioPressure(int state, int64_t at_us) {
     if (state < -1 || state > 1 || at_us <= 0) return;
     std::lock_guard lock(mu_);
-    audio_feedback_enabled_ = true;
-    if (at_us <= audio_feedback_us_) return;
-    if (at_us - audio_feedback_us_ >= kFeedbackLifetimeUs || state != 0 ||
-        audio_state_ != 0) {
-      healthy_since_us_ = 0;
-      healthy_samples_ = 0;
-    }
-    audio_state_ = state;
-    audio_feedback_us_ = at_us;
-    if (state == 1) {
-      CutForAudio(at_us);
-    } else if (state == 0) {
-      // Healthy audio alone must not bank pixel probes while video is paused.
-      if (!last_encoded_us_ || at_us < last_encoded_us_ ||
-          at_us - last_encoded_us_ >= kFeedbackLifetimeUs) {
-        healthy_since_us_ = 0;
-        healthy_samples_ = 0;
-        return;
-      }
-      if (encoded_frames_ == last_healthy_frame_) return;
-      last_healthy_frame_ = encoded_frames_;
-      if (!healthy_since_us_) healthy_since_us_ = at_us;
-      ++healthy_samples_;
-      if (healthy_samples_ >= 4 && at_us - healthy_since_us_ >= 3'000'000) {
-        if (max_pixels_ > 0 && largest_pixels_ > max_pixels_) {
-          max_pixels_ = std::min(largest_pixels_, max_pixels_ + max_pixels_ / 4);
-          if (max_pixels_ == largest_pixels_) max_pixels_ = 0;
-          ++audio_recoveries_;
-        }
-        healthy_since_us_ = at_us;
-        healthy_samples_ = 0;
-      }
-    }
+    FinishGrowthHold(at_us);
+    ApplyAudioPressure(state, at_us);
+  }
+
+  // Known current health with a separate original hold deadline. Receipt
+  // freezes achieved recovery; neither samples nor frames bank growth here.
+  void HoldGrowth(int64_t sampled_us, int64_t until_us, int64_t received_us) {
+    if (sampled_us <= 0 || sampled_us > received_us || until_us <= received_us ||
+        until_us - received_us > kFeedbackLifetimeUs) return;
+    std::lock_guard lock(mu_);
+    FinishGrowthHold(received_us);
+    if (!growth_held_since_us_) growth_held_since_us_ = received_us;
+    if (until_us > growth_hold_until_us_) ++growth_holds_;
+    growth_hold_until_us_ = std::max(growth_hold_until_us_, until_us);
+    ApplyAudioPressure(0, sampled_us);
   }
 
   void SetProfile(int selected_bps) {
@@ -135,6 +118,7 @@ class VideoFrameBudget {
     ++encoded_frames_;
     last_encoded_us_ = std::max(last_encoded_us_, at_us);
     last_bytes_ = bytes;
+    FinishGrowthHold(at_us);
     const int before = max_pixels_;
     if (audio_state_ == 1 && FreshAudio(at_us)) CutForAudio(at_us);
     if (enabled() && bytes > bytes_) ++oversize_frames_;
@@ -159,10 +143,55 @@ class VideoFrameBudget {
   Snapshot snapshot() const {
     std::lock_guard lock(mu_);
     return {bytes_, max_pixels_, oversize_frames_, last_pixels_, last_bytes_,
-            audio_state_, audio_cuts_, audio_recoveries_};
+            audio_state_, audio_cuts_, audio_recoveries_, growth_holds_};
   }
 
  private:
+  void FinishGrowthHold(int64_t at_us) {
+    if (!growth_held_since_us_ || at_us < growth_hold_until_us_) return;
+    if (healthy_since_us_) {
+      healthy_since_us_ += std::max<int64_t>(0,
+          growth_hold_until_us_ - std::max(growth_held_since_us_, healthy_since_us_));
+    }
+    growth_held_since_us_ = 0;
+    growth_hold_until_us_ = 0;
+  }
+  void ApplyAudioPressure(int state, int64_t at_us) {
+    audio_feedback_enabled_ = true;
+    if (at_us <= audio_feedback_us_) return;
+    if (at_us - audio_feedback_us_ >= kFeedbackLifetimeUs || state != 0 ||
+        audio_state_ != 0) {
+      healthy_since_us_ = 0;
+      healthy_samples_ = 0;
+    }
+    audio_state_ = state;
+    audio_feedback_us_ = at_us;
+    if (state == 1) {
+      CutForAudio(at_us);
+    } else if (state == 0) {
+      // Healthy audio alone must not bank pixel probes while video is paused.
+      if (!last_encoded_us_ || at_us < last_encoded_us_ ||
+          at_us - last_encoded_us_ >= kFeedbackLifetimeUs) {
+        healthy_since_us_ = 0;
+        healthy_samples_ = 0;
+        return;
+      }
+      if (growth_held_since_us_) return;
+      if (encoded_frames_ == last_healthy_frame_) return;
+      last_healthy_frame_ = encoded_frames_;
+      if (!healthy_since_us_) healthy_since_us_ = at_us;
+      ++healthy_samples_;
+      if (healthy_samples_ >= 4 && at_us - healthy_since_us_ >= 3'000'000) {
+        if (max_pixels_ > 0 && largest_pixels_ > max_pixels_) {
+          max_pixels_ = std::min(largest_pixels_, max_pixels_ + max_pixels_ / 4);
+          if (max_pixels_ == largest_pixels_) max_pixels_ = 0;
+          ++audio_recoveries_;
+        }
+        healthy_since_us_ = at_us;
+        healthy_samples_ = 0;
+      }
+    }
+  }
   uint32_t effective_rate() const {
     if (selected_bps_ <= 0) return 0;
     return payload_bps_ ? std::min<uint32_t>(payload_bps_, selected_bps_)
@@ -240,6 +269,8 @@ class VideoFrameBudget {
   int64_t healthy_since_us_ = 0;
   unsigned healthy_samples_ = 0;
   uint64_t audio_cuts_ = 0, audio_recoveries_ = 0;
+  int64_t growth_held_since_us_ = 0, growth_hold_until_us_ = 0;
+  uint64_t growth_holds_ = 0;
   int64_t last_encoded_us_ = 0;
   uint64_t encoded_frames_ = 0, last_healthy_frame_ = 0;
   int64_t last_observed_us_ = 0, oversize_since_us_ = 0;

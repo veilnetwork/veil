@@ -145,6 +145,19 @@ impl SessionTxRegistry {
         self.source_activity.note_feedback(pressured, now);
     }
 
+    /// Freeze achieved source growth without contracting paid admission.
+    /// The IPC caller validates ownership, original deadline and fresh health.
+    pub fn note_local_source_growth_hold(
+        &self,
+        sampled_at: std::time::Instant,
+        until: std::time::Instant,
+        received_at: std::time::Instant,
+    ) {
+        self.source_activity.note(sampled_at);
+        self.source_activity
+            .note_growth_hold(sampled_at, until, received_at);
+    }
+
     /// Keep an owned source's ordinary pieces below one typical QUIC packet
     /// while a primary is active, so a slow shared downstream FIFO need not
     /// drain a multi-packet data burst before accepting fresh primary traffic.
