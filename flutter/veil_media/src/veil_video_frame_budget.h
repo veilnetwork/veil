@@ -3,9 +3,12 @@
 #define VEIL_VIDEO_FRAME_BUDGET_H_
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <vector>
+#include "veil_diag_log.h"
 
 namespace veil_media {
 
@@ -16,6 +19,31 @@ namespace veil_media {
 // reference frame here, extend its lifetime, or alter audio/transport budgets.
 class VideoFrameBudget {
  public:
+  VideoFrameBudget() : trace_enabled_(diag::enabled()),
+      trace_id_(trace_enabled_ ? ++next_trace_id_ : 0) {
+    if (trace_enabled_) images_.reserve(kImageLimit);
+  }
+  // The owner stops its encoder/source before releasing their shared budget.
+  // Only teardown writes these opt-in metadata rows; Encode never does I/O.
+  ~VideoFrameBudget() {
+    if (!trace_enabled_) return;
+    const auto* path = diag::path();
+    if (!path) return;
+    std::lock_guard lock(mu_);
+    FILE* file = std::fopen(path, "a");
+    if (!file) return;
+    std::fprintf(file, "video.frame_budget.begin id=%llu count=%zu seen=%llu\n",
+        (unsigned long long)trace_id_, images_.size(), (unsigned long long)images_seen_);
+    for (const auto& r : images_)
+      std::fprintf(file,
+          "video.frame_budget.image id=%llu timestamp=%u at_us=%lld bytes=%zu width=%u height=%u budget=%zu cap_before=%d cap_after=%d rate_bps=%u\n",
+          (unsigned long long)trace_id_, r.timestamp, (long long)r.at_us, r.bytes,
+          r.width, r.height, r.budget, r.before, r.after, r.rate);
+    const bool ok = std::fflush(file) == 0 && !std::ferror(file);
+    std::fprintf(file, "video.frame_budget.end id=%llu write_ok=%d\n",
+        (unsigned long long)trace_id_, int(ok));
+    std::fclose(file);
+  }
   struct Snapshot {
     size_t bytes;
     int max_pixels;
@@ -55,21 +83,30 @@ class VideoFrameBudget {
     UpdateBytes();
   }
 
-  void Observe(size_t bytes, uint32_t width, uint32_t height) {
+  void Observe(size_t bytes, uint32_t width, uint32_t height,
+               uint32_t timestamp = 0, int64_t at_us = 0) {
     if (!bytes || !width || !height || width > 4096 || height > 4096) return;
     std::lock_guard lock(mu_);
     last_pixels_ = static_cast<int>(uint64_t(width) * height);
     last_bytes_ = bytes;
-    if (!enabled() || bytes <= bytes_) return;
-    ++oversize_frames_;
-    const uint64_t pixels = uint64_t(width) * height;
-    // Scale pixel area from the actual encoded result, retaining margin for
-    // the keyframe caused by resizing. In-flight frames at the old resolution
-    // recompute the same bound, rather than multiplying it down repeatedly.
-    const int desired = static_cast<int>(std::max<uint64_t>(
-        6144, pixels * bytes_ / bytes * 3 / 4));
-    if (desired < static_cast<int>(pixels) &&
-        (!max_pixels_ || desired < max_pixels_)) max_pixels_ = desired;
+    const int before = max_pixels_;
+    if (enabled() && bytes > bytes_) {
+      ++oversize_frames_;
+      const uint64_t pixels = uint64_t(width) * height;
+      // Scale pixel area from the actual encoded result, retaining margin for
+      // the keyframe caused by resizing. In-flight frames at the old resolution
+      // recompute the same bound, rather than multiplying it down repeatedly.
+      const int desired = static_cast<int>(std::max<uint64_t>(
+          6144, pixels * bytes_ / bytes * 3 / 4));
+      if (desired < static_cast<int>(pixels) &&
+          (!max_pixels_ || desired < max_pixels_)) max_pixels_ = desired;
+    }
+    if (trace_enabled_) {
+      ++images_seen_;
+      if (images_.size() < kImageLimit)
+        images_.push_back({timestamp, at_us, bytes, width, height, bytes_,
+                           before, max_pixels_, effective_rate()});
+    }
   }
 
   Snapshot snapshot() const {
@@ -109,6 +146,21 @@ class VideoFrameBudget {
   uint64_t oversize_frames_ = 0;
   int last_pixels_ = 0;
   size_t last_bytes_ = 0;
+  struct Image {
+    uint32_t timestamp;
+    int64_t at_us;
+    size_t bytes;
+    uint32_t width, height;
+    size_t budget;
+    int before, after;
+    uint32_t rate;
+  };
+  static constexpr size_t kImageLimit = 8192;
+  inline static std::atomic<uint64_t> next_trace_id_{0};
+  const bool trace_enabled_;
+  const uint64_t trace_id_;
+  uint64_t images_seen_ = 0;
+  std::vector<Image> images_;
 };
 
 }  // namespace veil_media
