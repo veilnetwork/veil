@@ -247,6 +247,40 @@ fn reliable_reply_backlog_is_fifo_bounded_and_scoped_to_one_generation() {
     assert!(queue.front().is_none());
 }
 
+#[test]
+fn late_data_close_replies_coalesce_without_merging_other_streams_or_generations() {
+    let mut queue = Replies::new();
+    let close = frame(AppMsg::AppClose, 19, 1);
+    // Thousands of already-admitted file segments can follow a local close.
+    // One pending close answers all of them while its writer awaits credit.
+    for _ in 0..4096 {
+        queue.push([2; 32], close.clone()).unwrap();
+    }
+    assert_eq!(queue.queue.len(), 1);
+    assert_eq!(queue.bytes, close.len());
+    queue.push([3; 32], close.clone()).unwrap();
+    queue.push([2; 32], frame(AppMsg::AppClose, 20, 1)).unwrap();
+    queue.push([2; 32], frame(AppMsg::AppClose, 19, 2)).unwrap();
+    // Receipts retain their own FIFO multiplicity.
+    let receipt = frame(AppMsg::AppReceipt, 19, 1);
+    queue.push([2; 32], receipt.clone()).unwrap();
+    queue.push([2; 32], receipt.clone()).unwrap();
+    assert_eq!(queue.queue.len(), 6);
+    for _ in 6..512 {
+        queue.push([2; 32], vec![5]).unwrap();
+    }
+    // Deduplication must work even when the queue is otherwise full, but a
+    // genuinely new response still obeys the existing count/byte limits.
+    queue.push([2; 32], close.clone()).unwrap();
+    assert!(queue.push([4; 32], close.clone()).is_err());
+    assert_eq!(queue.pop().unwrap(), close);
+    assert_eq!(queue.pop().unwrap(), frame(AppMsg::AppClose, 19, 1));
+    assert_eq!(queue.pop().unwrap(), frame(AppMsg::AppClose, 20, 1));
+    assert_eq!(queue.pop().unwrap(), frame(AppMsg::AppClose, 19, 2));
+    assert_eq!(queue.pop().unwrap(), receipt);
+    assert_eq!(queue.pop().unwrap(), receipt);
+}
+
 #[tokio::test]
 async fn reliable_reply_waits_for_credit_without_popping_or_advancing_cipher() {
     use crate::{

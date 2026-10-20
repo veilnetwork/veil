@@ -366,6 +366,21 @@ impl Replies {
         }
     }
     pub(super) fn push(&mut self, child: [u8; 32], frame: Vec<u8>) -> Result<(), &'static str> {
+        // A local cancellation can leave a whole admitted file burst in
+        // flight. Each late segment earns the same Close; one pending reply
+        // suffices. Charging thousands of identical closes against this queue
+        // retired a healthy carrier and could ban the peer's live datagrams.
+        // Match the complete frame and child generation, retaining FIFO and
+        // capacity accounting for every distinct response (including receipts).
+        let is_close = scope(&frame).is_some_and(|(h, _)| h.msg_type == AppMsg::AppClose as u16);
+        if is_close
+            && self
+                .queue
+                .iter()
+                .any(|(id, pending)| *id == child && *pending == frame)
+        {
+            return Ok(());
+        }
         if self.queue.len() >= 512 || frame.len() > 65536usize.saturating_sub(self.bytes) {
             return Err("reliable response capacity exceeded");
         }
