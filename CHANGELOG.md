@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.11.43 — 2026-10-21
+
+### Fixed
+
+- Retire warm authorization for revoked devices when a newer signed identity
+  document arrives; notify connected verifiers when the local identity changes.
+- Seal relay delivery for the intended device instance and resolve complete
+  recipient families, including newly linked devices and offline siblings.
+- Restore own-identity group sealing before the first sibling is linked.
+- Improve source flight accounting, cancelled-work reclamation, audio playout
+  recovery and measured audio/video adaptation without media hints or priority
+  at relays. Bound low-cadence frame costs and retain independent QUIC sources.
+- Harden IPC queued-work admission, FFI lengths and secret cleanup, routing
+  cache resizing, and Linux VPN helper requests verified before privileged use.
+- Verify the bootstrap installer and destructive-operation inputs; correct
+  Quinn provenance and strengthen workflow pin and parser checks.
+
+### Compatibility and verification
+
+- Linux managed VPN uses the new digest-checked helper v2 entry point; rebuild
+  the host and FFI together. The legacy unsigned helper entry point refuses.
+- No container format change and no call/own-device mailbox fallback added.
+- Targeted multi-device, native media and FFI regressions pass. This is not a
+  guarantee of instantaneous revocation across disconnected network partitions
+  or a subjective acoustic-quality certification.
+
 ## v0.11.42 — 2026-10-17
 
 ### Fixed
