@@ -726,10 +726,9 @@ impl SessionTxRegistry {
         peer_id: &NodeIdBytes,
         local_lane: u8,
     ) -> crate::LocalDatagramChannelState {
-        self.senders
-            .get(peer_id)
-            .map_or(crate::LocalDatagramChannelState::Unsupported, |entry| {
-                entry.tx.local_datagram_channel_state(local_lane)
+        self.get_sender(peer_id)
+            .map_or(crate::LocalDatagramChannelState::Unsupported, |sender| {
+                sender.local_datagram_channel_state(local_lane)
             })
     }
 

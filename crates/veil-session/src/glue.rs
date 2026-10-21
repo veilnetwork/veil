@@ -50,6 +50,14 @@ impl SessionTxBroadcaster {
 }
 
 impl veil_types::FrameBroadcaster for SessionTxBroadcaster {
+    fn local_datagram_channel_state(
+        &self,
+        peer_id: &[u8; 32],
+        local_lane: u8,
+    ) -> veil_types::LocalDatagramChannelState {
+        rlock!(self.inner).local_datagram_channel_state(peer_id, local_lane)
+    }
+
     fn supports_local_datagram_preparation(&self) -> bool {
         true
     }
@@ -289,6 +297,44 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use veil_types::FrameBroadcaster;
+
+    #[test]
+    fn local_source_readiness_is_read_only_and_bound_to_live_runner_generation() {
+        use veil_types::LocalDatagramChannelState as State;
+        let registry = Arc::new(RwLock::new(SessionTxRegistry::with_capacity(4)));
+        let adapter = SessionTxBroadcaster::new(registry.clone());
+        let old = registry.write().unwrap().register_owned(DEVICE_A, [1; 32]);
+        let old_status = old.local_datagram_status().unwrap();
+        let old_lease = old_status.activate();
+        old_lease.mark(veil_proto::priority::REALTIME, true);
+        assert_eq!(
+            adapter.local_datagram_channel_state(&DEVICE_A, veil_proto::priority::REALTIME),
+            State::Ready
+        );
+        assert_eq!(
+            adapter.local_datagram_channel_state(&DEVICE_A, veil_proto::priority::BULK),
+            State::Warming
+        );
+        assert_eq!(
+            old_status.pending(),
+            0,
+            "a snapshot must not request warming"
+        );
+        let replacement = registry.write().unwrap().register_owned(DEVICE_A, [2; 32]);
+        let status = replacement.local_datagram_status().unwrap();
+        let _lease = status.activate();
+        old_lease.mark(veil_proto::priority::REALTIME, true);
+        assert_eq!(
+            adapter.local_datagram_channel_state(&DEVICE_A, veil_proto::priority::REALTIME),
+            State::Warming
+        );
+        assert_eq!(status.pending(), 0);
+        drop(replacement);
+        assert_eq!(
+            adapter.local_datagram_channel_state(&DEVICE_A, veil_proto::priority::REALTIME),
+            State::Unsupported
+        );
+    }
 
     #[tokio::test]
     async fn signaling_source_wait_does_not_hold_registry_or_primary_ingress() {

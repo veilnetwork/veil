@@ -25,10 +25,15 @@ pub(crate) fn prepare(
     let peers = if request.relayed {
         // Same existing candidates as relay sends. No discovery, mailbox,
         // direct-path promotion or invented application packet is involved.
-        crate::source_paths::sealed_relay_hops(&request.peer_node_id, route_cache, registry)
-            .into_iter()
-            .take(2)
-            .collect::<Vec<_>>()
+        crate::source_paths::sealed_relay_hops_for_source(
+            &request.peer_node_id,
+            route_cache,
+            registry,
+            request.local_lane,
+        )
+        .into_iter()
+        .take(2)
+        .collect::<Vec<_>>()
     } else {
         let devices = registry.devices_of(&request.peer_node_id);
         if devices.is_empty() {
