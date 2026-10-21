@@ -123,6 +123,39 @@ async fn pair() -> (
     (link, handle, tx, rx)
 }
 
+#[tokio::test]
+async fn local_reliable_delay_keeps_healthy_lossy_probe_but_real_pressure_stops_it() {
+    let (_link, handle, _tx, _rx) = pair().await;
+    let source = crate::local_source_activity::LocalSourceActivity::default();
+    let now = std::time::Instant::now();
+    let primary = source.source_budget_factory(REALTIME).unwrap()(u64::MAX);
+    let secondary = source
+        .source_budget_factory(veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE)
+        .unwrap()(handle.local_trace_id());
+    assert!(source.couple_source(&handle, veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE, now));
+    source.note(now);
+    assert!(source.admit_reliable_secondary(4096, now).is_ok());
+    source.note_feedback(false, now);
+    primary.update_flight(120_000);
+    assert_eq!(secondary.window(now, 0, 1200), 2401);
+    let warning = now + Duration::from_millis(10);
+    source.note_reliable_transport_pressure(warning);
+    assert!(source.admit_reliable_secondary(1, warning).is_err());
+    assert_eq!(
+        secondary.window(warning, 0, 1200),
+        2401,
+        "early DATA delay must not erase the measured healthy source trial",
+    );
+    source.note_pressure(warning);
+    assert_eq!(secondary.window(warning, 0, 1200), 1);
+    source.note_feedback(false, warning);
+    assert_eq!(
+        secondary.window(warning, 0, 1200),
+        1,
+        "a healthy report cannot erase a real pressure lease",
+    );
+}
+
 fn frame(msg: AppMsg, body: &[u8]) -> veil_bufpool::PooledShared {
     let mut h = FrameHeader::new(FrameFamily::App as u8, msg as u16);
     h.set_priority(INTERACTIVE);
