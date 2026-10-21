@@ -23,17 +23,13 @@ pub(crate) fn prepare(
         return State::Unsupported;
     };
     let peers = if request.relayed {
-        // Same existing candidates as relay sends. No discovery, mailbox,
-        // direct-path promotion or invented application packet is involved.
-        crate::source_paths::sealed_relay_hops_for_source(
-            &request.peer_node_id,
-            route_cache,
-            registry,
-            request.local_lane,
-        )
-        .into_iter()
-        .take(2)
-        .collect::<Vec<_>>()
+        // Prepare preferred routes, even while sends use a ready fallback.
+        // Otherwise that fallback can prevent a better cached hop from ever
+        // warming. No discovery, mailbox, direct promotion or data packet.
+        crate::source_paths::sealed_relay_hops(&request.peer_node_id, route_cache, registry)
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>()
     } else {
         let devices = registry.devices_of(&request.peer_node_id);
         if devices.is_empty() {
