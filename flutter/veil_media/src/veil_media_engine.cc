@@ -2984,13 +2984,15 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               ",\"audio_playout_ms\":" + std::to_string(playout_ms);
   snapshot += ",\"video_delivery_peers\":{";
   bool first_delivery = true;
+  const auto delivery_source = ws->fanout->video_send_stats();
   for (const auto& entry : ws->peers) {
     if (!first_delivery) snapshot += ',';
     first_delivery = false;
     snapshot += "\"" + entry.first + "\":" +
         entry.second->shim->video_delivery_json(webrtc::TimeMicros(),
-            ws->fanout->video_send_stats().payload_timestamp,
-            ws->fanout->video_send_stats().payload_bytes / ws->peers.size());
+            delivery_source.payload_timestamp,
+            delivery_source.payload_bytes / ws->peers.size(),
+            delivery_source.payload_timestamp_valid);
   }
   snapshot += "}";
   snapshot += ",\"video_send_paused\":" + std::to_string(ws->video_send_paused.load() ? 1 : 0);

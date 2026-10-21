@@ -116,6 +116,7 @@ int main() {
   // Only real payload advances the causal probe watermark. Retransmissions
   // cannot move it backwards; clock wrap and a new encoder are distinct.
   veil_media::RtpSendStats clock;
+  assert(!clock.snapshot(4000 * ms).payload_timestamp_valid);
   packet = {0x80, 96, 0, 1, 0xff, 0xff, 0xff, 0xf0, 1, 2, 3, 4, 7};
   assert(clock.mark_attempt(packet, ssrc, 4000 * ms, 96));
   assert(clock.snapshot(4000 * ms).payload_timestamp == 0xfffffff0u);
@@ -126,7 +127,15 @@ int main() {
   assert(clock.mark_attempt(packet, ssrc, 4200 * ms, 96));
   assert(clock.snapshot(4200 * ms).payload_timestamp == 50);
   clock.reset_payload_clock();
+  assert(clock.snapshot(4250 * ms).payload_bytes > 0);
+  assert(!clock.snapshot(4250 * ms).payload_timestamp_valid);
   assert(clock.mark_attempt(packet, ssrc, 4300 * ms, 96));
   assert(clock.snapshot(4300 * ms).payload_timestamp == 0xfffffff0u);
+  assert(clock.snapshot(4300 * ms).payload_timestamp_valid);
+  clock.reset_payload_clock();
+  packet[4] = packet[5] = packet[6] = packet[7] = 0;
+  assert(clock.mark_attempt(packet, ssrc, 4400 * ms, 96));
+  assert(clock.snapshot(4400 * ms).payload_timestamp == 0);
+  assert(clock.snapshot(4400 * ms).payload_timestamp_valid);
 
 }
