@@ -26,11 +26,12 @@ struct RtpSendSnapshot {
   // CSRC/extensions/padding. Excludes padding-only and malformed packets.
   // Group fanout counts one attempt per peer; this is not an encoder total.
   uint64_t payload_rtp_bytes = 0;
+  uint32_t payload_timestamp = 0;
 };
 
 // Endpoint-only observations, before and after local Veil queue admission.
 // A gap can be DTX silence or a capture/encoder pause; it is not a loss claim.
-// No packet contents, SSRCs, timestamps or roles are sent on the network.
+// No packet contents or roles are exposed to the underlying network transport.
 class RtpSendStats {
  public:
   bool mark_attempt(std::span<const uint8_t> packet, uint32_t local_ssrc,
@@ -70,6 +71,13 @@ class RtpSendStats {
       if (payload == 0) {
         padding_packets_.fetch_add(1, std::memory_order_relaxed);
       } else {
+        const uint32_t timestamp = uint32_t(packet[4]) << 24 | uint32_t(packet[5]) << 16 |
+                                   uint32_t(packet[6]) << 8 | packet[7];
+        uint64_t clock = payload_timestamp_.load(std::memory_order_relaxed);
+        while ((!clock || (timestamp != uint32_t(clock) &&
+                    uint32_t(timestamp - uint32_t(clock)) < 0x80000000u)) &&
+               !payload_timestamp_.compare_exchange_weak(clock, (uint64_t(1) << 32) | timestamp,
+                    std::memory_order_relaxed)) {}
         payload_packets_.fetch_add(1, std::memory_order_relaxed);
         payload_bytes_.fetch_add(payload, std::memory_order_relaxed);
         payload_rtp_bytes_.fetch_add(packet.size(), std::memory_order_relaxed);
@@ -81,6 +89,8 @@ class RtpSendStats {
     }
     return true;
   }
+
+  void reset_payload_clock() { payload_timestamp_.store(0, std::memory_order_relaxed); }
 
   void mark_result(int64_t started_ns, int64_t now_ns, bool queued) {
     if (started_ns <= 0 || now_ns < started_ns) return;
@@ -112,6 +122,7 @@ class RtpSendStats {
         max_admission_ns_.load(std::memory_order_relaxed) / 1'000'000,
         dropped_.load(std::memory_order_relaxed),
         payload_rtp_bytes_.load(std::memory_order_relaxed),
+        uint32_t(payload_timestamp_.load(std::memory_order_relaxed)),
     };
   }
 
@@ -130,6 +141,7 @@ class RtpSendStats {
   std::atomic<uint64_t> payload_packets_{0}, padding_packets_{0};
   std::atomic<uint64_t> payload_bytes_{0}, padding_bytes_{0}, unclassified_packets_{0};
   std::atomic<uint64_t> payload_rtp_bytes_{0};
+  std::atomic<uint64_t> payload_timestamp_{0};
   std::atomic<int64_t> last_payload_ns_{0}, max_payload_gap_ns_{0};
   std::atomic<int64_t> last_attempt_ns_{0};
   std::atomic<int64_t> last_queued_ns_{0};

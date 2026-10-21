@@ -198,6 +198,43 @@ int main() {
   }
   receiver.SendVideoRtcp(original, {});
   require(sent == original, "concealment was appended to video RTCP");
+  // Video source probes require remote decoded frames, not padding or an
+  // audio report. Verify the real send and compound parser together.
+  receiver.SetLocalVideoSsrc(44);
+  sender.SetLocalVideoSsrc(33);
+  const auto video_now = webrtc::TimeMicros();
+  receiver.SetLocalVideoDelivery(33, 1200, 1, 0xfffffff0u, 70, video_now);
+  const auto video_compound = sent;
+  require(video_compound.size() == 8 + 64, "video delivery compound missing");
+  AudioRecoveryFeedbackTest::Observe(sender, video_compound, video_now + 10);
+  const auto delivery = sender.video_delivery_json(video_now + 10);
+  require(delivery.find("\"frames\":1") != std::string::npos,
+          "decoded video delivery report missing");
+  AudioRecoveryFeedbackTest::Observe(sender, video_compound, video_now + 20);
+  require(sender.video_delivery_json(video_now + 20) == delivery,
+          "replayed delivery renewed freshness");
+  require(sender.video_delivery_json(video_now + 3'000'011) == "{}",
+          "stale video ACK earned source capacity");
+  for (bool duplicate : {false, true}) {
+    VeilTransportShim clean(88, nullptr, nullptr, nullptr, nullptr);
+    clean.SetLocalVideoSsrc(33);
+    clean.Start();
+    auto bad = video_compound;
+    if (duplicate) bad.insert(bad.end(), video_compound.end()-64, video_compound.end());
+    else bad.insert(bad.end(), {0x80, 204, 0, 1});
+    AudioRecoveryFeedbackTest::Observe(clean, bad, video_now + 30);
+    require(clean.video_delivery_json(video_now + 30) == "{}",
+            "bad compound partially published video ACK");
+    clean.SetLocalVideoSsrc(55);
+    AudioRecoveryFeedbackTest::Observe(clean, video_compound, video_now + 40);
+    require(clean.video_delivery_json(video_now + 40) == "{}", "foreign video ACK applied");
+    clean.Stop();
+  }
+  auto bad_video = video_compound;
+  bad_video.back() = 1;
+  AudioRecoveryFeedbackTest::Observe(sender, bad_video, video_now + 50);
+  require(sender.video_delivery_json(video_now + 50) == delivery,
+          "reserved video fields were accepted");
   receiver.Stop();
   receiver.SendRtcp(original, {});
   require(sent == original, "stopped source appended recovery");

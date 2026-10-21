@@ -370,6 +370,14 @@ bool VeilTransportShim::SendRtcpOnSource(std::span<const uint8_t> packet,
   std::vector<uint8_t> compound;
   LocalAudioPlayout sample;
   LocalAudioRecovery recovery;
+  VideoDeliveryReport delivery;
+  {
+    std::lock_guard lock(audio_feedback_mu_);
+    if (video && local_video_delivery_.origin &&
+        sent_us >= static_cast<int64_t>(local_video_delivery_.sampled_us) &&
+        sent_us - local_video_delivery_.sampled_us <= 3'000'000)
+      delivery = local_video_delivery_;
+  }
   std::optional<AudioConcealmentReport> concealment;
   if (!video) {
     std::lock_guard lock(audio_feedback_mu_);
@@ -378,7 +386,7 @@ bool VeilTransportShim::SendRtcpOnSource(std::span<const uint8_t> packet,
     if (local_audio_concealment_.enabled())
       concealment = local_audio_concealment_.Report(sent_us);
   }
-  bool append = !video && (sample.enabled || recovery.enabled || concealment) &&
+  bool append = (delivery.origin || (!video && (sample.enabled || recovery.enabled || concealment))) &&
                 started_.load(std::memory_order_acquire);
   // Keep RTCP's original report/SDES framing and do not append after BYE or
   // padding. Old endpoints can ignore the optional APP name (RFC 3550 §6.7).
@@ -393,6 +401,10 @@ bool VeilTransportShim::SendRtcpOnSource(std::span<const uint8_t> packet,
   }
   if (append && !packet.empty()) {
     compound.assign(packet.begin(), packet.end());
+    if (delivery.origin) {
+      const auto app = EncodeVideoDelivery(local_video_ssrc_.load(), delivery);
+      compound.insert(compound.end(), app.begin(), app.end());
+    }
     if (sample.enabled) {
       const size_t at = compound.size();
       compound.resize(at + 28);
@@ -528,8 +540,51 @@ RtcpFeedbackSnapshot VeilTransportShim::video_feedback() const {
   return video_feedback_;
 }
 
+void VeilTransportShim::SetLocalVideoDelivery(uint32_t remote, uint64_t bytes,
+    uint64_t frames, uint32_t timestamp, int delay, int64_t sampled) {
+  if (!remote || delay < 0 || delay > 60000 || sampled <= 0) return;
+  bool send = false;
+  {
+    std::lock_guard lock(audio_feedback_mu_);
+    const auto& old = local_video_delivery_;
+    const uint64_t origin = !old.origin || old.target_ssrc != remote ||
+        bytes < old.bytes || frames < old.frames ? sampled : old.origin;
+    local_video_delivery_ = {remote, origin, uint64_t(sampled), bytes, frames,
+                              timestamp, uint32_t(delay)};
+    // A bounded receiver report avoids waiting several seconds for the
+    // ordinary RTCP timer at the one-fps startup floor. No padding/probe data.
+    if (frames && sampled - video_delivery_sent_us_ >= 950'000 &&
+        started_.load(std::memory_order_acquire)) {
+      video_delivery_sent_us_ = sampled;
+      send = true;
+    }
+  }
+  if (send) {
+    std::array<uint8_t, 8> rr{0x80, 201, 0, 1};
+    RecoveryWrite32(rr.data()+4, local_video_ssrc_.load());
+    SendVideoRtcp(rr, {});
+  }
+}
+std::string VeilTransportShim::video_delivery_json(int64_t now,
+    uint32_t source_timestamp, uint64_t source_bytes) const {
+  if (!started_.load(std::memory_order_acquire)) return "{}";
+  const auto sent = video_send_stats();
+  std::lock_guard lock(audio_feedback_mu_);
+  auto json = peer_video_delivery_.Json(now,
+      source_bytes ? source_timestamp : sent.payload_timestamp,
+      source_bytes ? source_bytes : sent.payload_bytes);
+  if (json != "{}") {
+    json.pop_back();
+    json += ",\"route_epoch\":" + std::to_string(rtcp_route_clock_.epoch()) +
+        ",\"source_epoch\":" + std::to_string(video_source_epoch_) + "}";
+  }
+  return json;
+}
+
 void VeilTransportShim::ResetVideoLossEvidence() {
   std::lock_guard lock(audio_feedback_mu_);
+  ++video_source_epoch_;
+  video_send_stats_.reset_payload_clock();
   video_loss_persistence_.Reset();
   video_feedback_.persistent_loss_report_us = 0;
 }
@@ -631,6 +686,7 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
   if (local == 0 && video == 0) return;
   RtcpFeedbackSnapshot candidate, video_candidate;
   AudioPlayoutSnapshot playout;
+  std::optional<VideoDeliveryReport> delivery;
   std::optional<AudioRecoveryReport> recovery;
   std::optional<AudioConcealmentReport> concealment;
   const auto observe = [&](const auto& blocks) {
@@ -671,6 +727,12 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
       if (!report.Parse(header)) return;
       observe(report.report_blocks());
     } else if (header.type() == 204 && header.payload_size_bytes() >= 8 &&
+               read_be32(header.payload() + 4) == kVideoDeliveryAppName) {
+      if (delivery) return;
+      delivery = DecodeVideoDelivery(
+          {header.payload(), header.payload_size_bytes()}, header.count());
+      if (!delivery) return;
+    } else if (header.type() == 204 && header.payload_size_bytes() >= 8 &&
                read_be32(header.payload() + 4) == kAudioConcealmentAppName) {
       if (concealment) return;
       concealment = DecodeAudioConcealment(
@@ -702,8 +764,9 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
     offset += header.packet_size();
   }
   if (candidate.arrived_us > 0 || video_candidate.arrived_us > 0 ||
-      playout.supported || recovery || concealment) {
+      playout.supported || recovery || concealment || delivery) {
     std::lock_guard lock(audio_feedback_mu_);
+    if (delivery) peer_video_delivery_.Observe(*delivery, video, arrived_us);
     if (recovery) peer_audio_recovery_.Observe(*recovery, local, arrived_us);
     if (concealment) peer_audio_concealment_.Observe(*concealment, local, arrived_us);
     if (recovery && recovery->target_ssrc == local && local != 0) {
