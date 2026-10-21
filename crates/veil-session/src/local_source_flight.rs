@@ -60,8 +60,9 @@ struct State {
     healthy_until: Option<Instant>,
     pressure_until: Option<Instant>,
     growth_hold_until: Option<Instant>,
-    // A validated growth hold may retain, never enlarge, a trial already
-    // permitted by fresh healthy feedback. Its original deadline is binding.
+    // Retain, never enlarge, an already-permitted allowance through the
+    // validated health sample's TTL, independently of the growth hold's end.
+    // Retained health cannot fund growth without new positive feedback.
     held_secondary_trial: Option<(Instant, u64)>,
     window: u64,
     // Reserve included in the last funded/reduced window. Retiring control
@@ -154,15 +155,20 @@ impl State {
                 .filter(|(until, _)| now < *until)
                 .map(|(_, limit)| limit);
         }
-        if !self.healthy_until.is_some_and(|until| now < until) {
-            return None;
+        if self.healthy_until.is_some_and(|until| now < until) {
+            let mtu = u64::from(self.rows.values().map(|r| r.mtu).max().unwrap_or(1200));
+            return Some(
+                self.limit(now)
+                    .saturating_sub(self.reserve(now))
+                    .max(2 * mtu),
+            );
         }
-        let mtu = u64::from(self.rows.values().map(|r| r.mtu).max().unwrap_or(1200));
-        Some(
-            self.limit(now)
-                .saturating_sub(self.reserve(now))
-                .max(2 * mtu),
-        )
+        // An event can expire between frontend polls while its most recent
+        // known-health sample remains fresh. Withdrawing admission here would
+        // discard part of a frame until the next positive report arrives.
+        self.held_secondary_trial
+            .filter(|(until, _)| now < *until)
+            .map(|(_, limit)| limit)
     }
 
     fn healthy_secondary_probe(&self, now: Instant) -> Option<u64> {
@@ -240,11 +246,18 @@ impl SourceFlightPool {
     }
     /// Preserve paid flight and any already-permitted shared trial, but earn
     /// no growth from held feedback and never create a new trial under a hold.
-    /// The deadline belongs to the original event, not IPC receipt or replay.
-    pub(crate) fn hold_growth(&self, until: Instant, received_at: Instant) {
-        if until <= received_at {
+    /// Growth uses the original event deadline. Admission retention uses the
+    /// current-health sample's original TTL, never IPC receipt or replay time.
+    pub(crate) fn hold_growth(&self, sampled_at: Instant, until: Instant, received_at: Instant) {
+        if sampled_at > received_at || until <= received_at {
             return;
         }
+        let Some(health_until) = sampled_at
+            .checked_add(IDLE_GRACE)
+            .filter(|until| received_at < *until)
+        else {
+            return;
+        };
         let mut s = lock!(self.0);
         // A hold means known current health with no permission to grow.
         // Removing the existing trial here can stop all video behind unrelated
@@ -255,7 +268,7 @@ impl SourceFlightPool {
             let deadline = s
                 .held_secondary_trial
                 .filter(|(old, _)| received_at < *old)
-                .map_or(until, |(old, _)| old.max(until));
+                .map_or(health_until, |(old, _)| old.max(health_until));
             (deadline, limit)
         });
         s.growth_hold_until = Some(s.growth_hold_until.map_or(until, |old| old.max(until)));
@@ -700,14 +713,14 @@ mod tests {
             let at = now + Duration::from_millis(milliseconds);
             pool.note_primary(at);
             let _ = pool.binding(1, Role::Primary, at).unwrap();
-            pool.hold_growth(until, at);
+            pool.hold_growth(at, until, at);
             video.blocked(at);
             primary.delivered(at, at, 100_000, Duration::from_millis(100));
             assert_eq!(video.window(at, 0, 1200), 3601);
         }
         pool.note_primary(until);
         let _ = pool.binding(1, Role::Primary, until).unwrap();
-        pool.hold_growth(until, until); // An expired replay cannot renew it.
+        pool.hold_growth(until, until, until); // An expired replay cannot renew it.
         primary.delivered(until, until, 100_000, Duration::from_millis(100));
         assert_eq!(
             video.window(until, 0, 1200),
@@ -724,7 +737,7 @@ mod tests {
         primary.delivered(until, until, 2400, Duration::from_millis(100));
         assert_eq!(video.window(until, 0, 1200), 4801);
         pool.feedback(true, until);
-        pool.hold_growth(until + Duration::from_secs(1), until);
+        pool.hold_growth(until, until + Duration::from_secs(1), until);
         assert!(
             video.window(until, 0, 1200) < 3601,
             "hold cannot undo genuine primary protection"
@@ -745,7 +758,7 @@ mod tests {
         assert_eq!(video.window(now, 0, 1200), 2401);
         let at = now + Duration::from_secs(1);
         let until = now + Duration::from_secs(3);
-        pool.hold_growth(until, at);
+        pool.hold_growth(at, until, at);
         assert_eq!(
             video.window(at, 0, 1200),
             2401,
@@ -757,7 +770,7 @@ mod tests {
         let paid = lock!(pool.0).window;
         primary.delivered(at, now, 100_000, Duration::from_millis(100));
         assert_eq!(lock!(pool.0).window, paid, "held ACKs earn no growth");
-        pool.hold_growth(until, at + Duration::from_secs(1));
+        pool.hold_growth(at, until, at + Duration::from_secs(1));
         assert_eq!(
             screen.window(at + Duration::from_secs(1), 0, 1500),
             1201,
@@ -765,7 +778,7 @@ mod tests {
         );
         video.update_flight(0);
         pool.note_primary(until);
-        pool.hold_growth(until, until);
+        pool.hold_growth(until, until, until);
         assert_eq!(
             video.window(until, 0, 1200),
             1,
@@ -773,7 +786,7 @@ mod tests {
         );
         pool.feedback(false, until);
         assert_eq!(video.window(until, 0, 1200), 3001);
-        pool.hold_growth(until + Duration::from_secs(1), until);
+        pool.hold_growth(until, until + Duration::from_secs(1), until);
         pool.feedback(true, until);
         assert_eq!(
             video.window(until, 0, 1200),
@@ -791,13 +804,13 @@ mod tests {
         control.update_flight(100_000);
         pool.note_primary(now);
         let until = now + Duration::from_secs(1);
-        pool.hold_growth(until, now);
+        pool.hold_growth(now, until, now);
         assert_eq!(video.window(now, 0, 1200), 1);
-        pool.hold_growth(until, until);
+        pool.hold_growth(until, until, until);
         assert_eq!(video.window(until, 0, 1200), 1);
         pool.feedback(false, until);
         assert_eq!(video.window(until, 0, 1200), 2401);
-        pool.hold_growth(until + Duration::from_secs(1), until);
+        pool.hold_growth(until, until + Duration::from_secs(1), until);
         assert_eq!(video.window(until, 0, 1200), 2401);
         video.route_changed();
         assert_eq!(video.window(until, 0, 1200), 1);
@@ -1136,6 +1149,67 @@ mod tests {
         assert_eq!(primary.window(now, 0, 1200), u64::MAX);
     }
     #[test]
+    fn expired_hold_preserves_its_fresh_health_without_authorizing_growth() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let _primary = pool.binding(1, Role::Primary, now).unwrap();
+        let control = pool.binding(2, Role::Control, now).unwrap();
+        let video = pool.binding(3, Role::Secondary, now).unwrap();
+        control.update_flight(100_000);
+        pool.note_primary(now);
+        pool.feedback(false, now);
+        let until = now + Duration::from_secs(3);
+        let sampled = now + Duration::from_millis(2750);
+        pool.note_primary(sampled);
+        pool.hold_growth(sampled, until, sampled);
+        let after_hold = until + Duration::from_millis(100);
+        assert_eq!(
+            video.window(after_hold, 0, 1200),
+            2401,
+            "a fresh known-health report must not become a one-byte window between polls"
+        );
+        video.blocked(after_hold);
+        video.delivered(after_hold, after_hold, 100_000, Duration::from_millis(100));
+        assert_eq!(lock!(pool.0).window, 0, "held health is not growth credit");
+        pool.hold_growth(sampled, until, after_hold); // Expired replay cannot extend health.
+        let expires = sampled + IDLE_GRACE;
+        pool.note_primary(expires - Duration::from_millis(1));
+        assert_eq!(
+            video.window(expires, 0, 1200),
+            1,
+            "sampling TTL remains binding"
+        );
+    }
+
+    #[test]
+    fn delayed_or_replayed_hold_cannot_rebase_health_at_receipt() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let _primary = pool.binding(1, Role::Primary, now).unwrap();
+        let control = pool.binding(2, Role::Control, now).unwrap();
+        let video = pool.binding(3, Role::Secondary, now).unwrap();
+        control.update_flight(100_000);
+        pool.note_primary(now);
+        pool.feedback(false, now);
+        let sampled = now + Duration::from_millis(500);
+        let received = now + Duration::from_millis(2500);
+        let until = now + Duration::from_secs(3);
+        pool.note_primary(received);
+        pool.hold_growth(sampled, until, received);
+        pool.hold_growth(sampled, until, received + Duration::from_millis(300));
+        pool.hold_growth(received + Duration::from_millis(1), until, received);
+        let after_hold = until + Duration::from_millis(100);
+        assert_eq!(video.window(after_hold, 0, 1200), 2401);
+        pool.hold_growth(until - Duration::from_millis(1), until, after_hold);
+        let stale = sampled + IDLE_GRACE;
+        assert_eq!(
+            video.window(stale, 0, 1200),
+            1,
+            "delay, replay, future samples and expired events cannot extend the original health TTL"
+        );
+    }
+
+    #[test]
     fn healthy_paid_growth_is_usable_behind_unrelated_control_flight() {
         let now = Instant::now();
         let pool = Arc::new(SourceFlightPool::default());
@@ -1187,7 +1261,7 @@ mod tests {
         assert_eq!(video.window(now, 0, 1200), 3601);
         let held = now + Duration::from_secs(1);
         let until = now + Duration::from_secs(2);
-        pool.hold_growth(until, held);
+        pool.hold_growth(held, until, held);
         assert_eq!(video.window(held, 0, 1200), 3601);
         video.blocked(held);
         video.delivered(held, held, 100_000, Duration::from_millis(100));
@@ -1196,7 +1270,7 @@ mod tests {
             3601,
             "hold cannot earn growth or reprice its MTU"
         );
-        pool.hold_growth(until, held + Duration::from_millis(1));
+        pool.hold_growth(held, until, held + Duration::from_millis(1));
         assert_eq!(
             video.window(held, 0, 1500),
             3601,
@@ -1204,8 +1278,14 @@ mod tests {
         );
         assert_eq!(
             video.window(until, 0, 1500),
-            1,
-            "expired hold is not positive feedback"
+            3601,
+            "fresh frozen allowance survives between polls"
+        );
+        video.delivered(until, until, 100_000, Duration::from_millis(100));
+        assert_eq!(
+            video.window(until, 0, 1500),
+            3601,
+            "retention is not positive growth feedback"
         );
         pool.feedback(false, until);
         assert_eq!(video.window(until, 0, 1500), 3601);
@@ -1291,7 +1371,7 @@ mod tests {
         pool.note_primary(now);
         pool.feedback(false, now);
         assert_eq!(video.window(now, 0, 1200), 1201);
-        pool.hold_growth(now + Duration::from_millis(500), now);
+        pool.hold_growth(now, now + Duration::from_millis(500), now);
         assert_eq!(
             video.window(now, 0, 1200),
             1201,
