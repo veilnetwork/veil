@@ -232,6 +232,70 @@ int main(int argc, char** argv) {
   held.HoldGrowth(8'000'000, 10'000'000, 9'000'000);
   assert(held.snapshot().audio_state == 1); // Cannot erase a newer pressure report.
   assert(held.snapshot().max_pixels == genuine_cut);
+  // The low-rate startup sizing cap follows actual allocated rate, not just
+  // a larger request. One fresh healthy sample permits one bounded area probe.
+  auto low_rate_start = [](veil_media::VideoFrameBudget& b) {
+    b.SetPacketPayload(1000);
+    b.SetProfile(900000);
+    b.SetRate(15000, 1);
+    b.SetAudioPressure(0, 1'000'000);
+    b.Observe(5000, 640, 480, 1, 1'100'000);
+    assert(b.snapshot().max_pixels > 0 && b.snapshot().max_pixels < 640 * 480);
+  };
+  veil_media::VideoFrameBudget funded;
+  low_rate_start(funded);
+  const int funded_cap = funded.snapshot().max_pixels;
+  funded.SetProfile(2500000); // Request alone earns nothing.
+  funded.Observe(300, 160, 120, 2, 1'200'000);
+  assert(funded.snapshot().max_pixels == funded_cap);
+  funded.SetRate(60000, 8);
+  funded.Observe(300, 160, 120, 3, 1'300'000);
+  const int funded_probe = funded.snapshot().max_pixels;
+  assert(funded_probe > funded_cap && funded_probe <= funded_cap * 4);
+  funded.SetRate(240000, 16);
+  funded.Observe(300, 160, 120, 4, 1'400'000);
+  assert(funded.snapshot().max_pixels == funded_probe); // Same audio sample.
+  funded.SetAudioPressure(0, 2'000'000);
+  funded.Observe(1000, 320, 240, 5, 2'100'000);
+  assert(funded.snapshot().max_pixels == 0); // Original source ceiling, not beyond.
+  assert(funded.snapshot().audio_cuts == 0);
+  for (int state : {-1, 1}) {
+    veil_media::VideoFrameBudget blocked;
+    low_rate_start(blocked);
+    const int cap = blocked.snapshot().max_pixels;
+    blocked.SetAudioPressure(state, 1'200'000);
+    blocked.SetRate(240000, 16);
+    blocked.Observe(300, 160, 120, 2, 1'300'000);
+    const int protected_cap = blocked.snapshot().max_pixels;
+    assert(protected_cap > 0 && protected_cap <= cap);
+    blocked.SetAudioPressure(0, 1'400'000);
+    blocked.Observe(300, 160, 120, 3, 1'500'000);
+    assert(blocked.snapshot().max_pixels == protected_cap); // No banked unknown/pressure credit.
+  }
+  for (bool pause : {false, true}) {
+    veil_media::VideoFrameBudget stopped_growth;
+    low_rate_start(stopped_growth);
+    const int cap = stopped_growth.snapshot().max_pixels;
+    stopped_growth.SetRate(240000, 16);
+    if (pause) {
+      stopped_growth.SetAudioPressure(0, 5'000'000); // No recent encoded work.
+    } else {
+      stopped_growth.HoldGrowth(1'000'000, 3'000'000, 1'200'000);
+      stopped_growth.Observe(300, 160, 120, 2, 2'000'000);
+      stopped_growth.SetAudioPressure(0, 2'100'000);
+    }
+    const int64_t resume = pause ? 5'100'000 : 3'100'000;
+    stopped_growth.Observe(300, 160, 120, 3, resume);
+    assert(stopped_growth.snapshot().max_pixels == cap);
+  }
+  veil_media::VideoFrameBudget stale_funding;
+  low_rate_start(stale_funding);
+  const int stale_funding_cap = stale_funding.snapshot().max_pixels;
+  stale_funding.SetRate(240000, 16);
+  stale_funding.Observe(300, 160, 120, 2, 5'000'000);
+  stale_funding.SetAudioPressure(0, 5'100'000);
+  stale_funding.Observe(300, 160, 120, 3, 5'200'000);
+  assert(stale_funding.snapshot().max_pixels == stale_funding_cap);
   std::thread encoder([&] {
     for (int i = 0; i < 1000; ++i) {
       budget.SetRate(8000);

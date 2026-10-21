@@ -133,6 +133,7 @@ class VideoFrameBudget {
     last_bytes_ = bytes;
     FinishGrowthHold(at_us);
     const int before = max_pixels_;
+    RecoverFundedRateBound(at_us);
     if (audio_state_ == 1 && FreshAudio(at_us)) CutForAudio(at_us);
     if (enabled() && bytes > bytes_) ++oversize_frames_;
     const auto cadence = CadenceBudget();
@@ -155,7 +156,10 @@ class VideoFrameBudget {
         cadence_basis_ = cadence;
       }
       if (desired < static_cast<int>(pixels) &&
-          (!max_pixels_ || desired < max_pixels_)) max_pixels_ = desired;
+          (!max_pixels_ || desired < max_pixels_)) {
+        max_pixels_ = desired;
+        resize_rate_basis_ = effective_rate();
+      }
     }
     if (trace_enabled_) {
       ++images_seen_;
@@ -173,6 +177,30 @@ class VideoFrameBudget {
   }
 
  private:
+  // A startup low-rate sizing bound must follow a genuinely larger encoder
+  // allocation. Audio cuts keep their original slow recovery. Each fresh
+  // healthy audio observation permits at most one bounded area probe; rate
+  // jitter, pauses and holds cannot manufacture or bank probe credit.
+  void RecoverFundedRateBound(int64_t at_us) {
+    if (!max_pixels_ || !resize_rate_basis_ || audio_cuts_) return;
+    const uint32_t rate = effective_rate();
+    if (audio_state_ != 0 || !FreshAudio(at_us) || growth_held_since_us_) {
+      resize_rate_basis_ = std::max(resize_rate_basis_, rate);
+      return;
+    }
+    if (rate < 60000 || rate < resize_rate_basis_ + resize_rate_basis_ / 4 ||
+        last_rate_probe_feedback_us_ == audio_feedback_us_) return;
+    const int ceiling = cadence_pixels_ ? std::min(cadence_pixels_, largest_pixels_)
+                                       : largest_pixels_;
+    const int next = static_cast<int>(std::min<uint64_t>(ceiling,
+        uint64_t(max_pixels_) * std::min<uint64_t>(rate, uint64_t(resize_rate_basis_) * 4)
+            / resize_rate_basis_));
+    if (next <= max_pixels_) return;
+    resize_rate_basis_ = static_cast<uint32_t>(std::min<uint64_t>(rate,
+        uint64_t(resize_rate_basis_) * 4));
+    last_rate_probe_feedback_us_ = audio_feedback_us_;
+    max_pixels_ = next >= largest_pixels_ ? 0 : next;
+  }
   void FinishGrowthHold(int64_t at_us) {
     if (!growth_held_since_us_ || at_us < growth_hold_until_us_) return;
     if (healthy_since_us_) {
@@ -200,6 +228,7 @@ class VideoFrameBudget {
           at_us - last_encoded_us_ >= kFeedbackLifetimeUs) {
         healthy_since_us_ = 0;
         healthy_samples_ = 0;
+        if (resize_rate_basis_) resize_rate_basis_ = std::max(resize_rate_basis_, effective_rate());
         return;
       }
       if (growth_held_since_us_) return;
@@ -296,6 +325,8 @@ class VideoFrameBudget {
   size_t single_packet_bytes_ = 1;
   size_t bytes_ = 0;
   int max_pixels_ = 0;
+  uint32_t resize_rate_basis_ = 0;
+  int64_t last_rate_probe_feedback_us_ = 0;
   uint64_t oversize_frames_ = 0;
   int last_pixels_ = 0;
   int largest_pixels_ = 0;

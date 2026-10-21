@@ -27,6 +27,7 @@ struct RtpSendSnapshot {
   // Group fanout counts one attempt per peer; this is not an encoder total.
   uint64_t payload_rtp_bytes = 0;
   uint32_t payload_timestamp = 0;
+  bool payload_timestamp_valid = false;
 };
 
 // Endpoint-only observations, before and after local Veil queue admission.
@@ -106,6 +107,7 @@ class RtpSendStats {
   }
 
   RtpSendSnapshot snapshot(int64_t now_ns) const {
+    const uint64_t payload_clock = payload_timestamp_.load(std::memory_order_relaxed);
     return {
         attempts_.load(std::memory_order_relaxed),
         queued_.load(std::memory_order_relaxed),
@@ -122,7 +124,8 @@ class RtpSendStats {
         max_admission_ns_.load(std::memory_order_relaxed) / 1'000'000,
         dropped_.load(std::memory_order_relaxed),
         payload_rtp_bytes_.load(std::memory_order_relaxed),
-        uint32_t(payload_timestamp_.load(std::memory_order_relaxed)),
+        uint32_t(payload_clock),
+        (payload_clock >> 32) != 0,
     };
   }
 
