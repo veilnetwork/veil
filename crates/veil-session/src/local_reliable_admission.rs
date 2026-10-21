@@ -254,7 +254,7 @@ impl LocalReliableAdmission {
             .feedback
             .observe(rtt_us, expired, lost, congestion_events);
         if ack_blocked || delayed {
-            self.source_activity.note_pressure(now);
+            self.source_activity.note_primary_transport_pressure(now);
             // The parent writer must consume the same pressure observation as
             // other local producers. A low/stale RTT during blocked ACKs must
             // not leave a larger file window open while video alone is held.

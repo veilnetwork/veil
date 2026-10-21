@@ -46,7 +46,7 @@ impl PrimaryWriteState {
         if self.pending.load(Ordering::Acquire) > 0
             || lock!(self.queued_until).is_some_and(|until| now < until)
         {
-            self.source.note_pressure(now);
+            self.source.note_primary_transport_pressure(now);
             self.observations.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -80,6 +80,24 @@ mod tests {
                 .admit_network_control(NETWORK_CONTROL_BYTES, now)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn stalled_mirror_cannot_override_fresh_consumer_health_but_still_restrains_data() {
+        let activity = Arc::new(LocalSourceActivity::default());
+        let state = PrimaryWriteState::new(Arc::clone(&activity));
+        let _lease = state.retain();
+        let now = Instant::now();
+        activity.note(now);
+        activity.note_feedback(false, now);
+        state.observe_stalled(now);
+        assert_no_pressure(&activity, now);
+        assert!(activity.admit_reliable_secondary(1024, now).is_ok());
+        assert!(activity.admit_reliable_secondary(1, now).is_err());
+        activity.note_feedback(true, now);
+        state.observe_stalled(now);
+        assert!(activity.allow_secondary(8192, now)); // One bounded recovery probe.
+        assert!(!activity.allow_secondary(8192, now));
     }
 
     #[test]

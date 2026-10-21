@@ -528,7 +528,7 @@ impl RealtimeDatagramLane {
                             .active_record_age
                             .is_some_and(|age| age >= std::time::Duration::from_millis(150))
                     {
-                        self.source_activity.note_pressure(now);
+                        self.source_activity.note_primary_transport_pressure(now);
                     }
                     self.primary_record_expired = progress.expired_records;
                 }
