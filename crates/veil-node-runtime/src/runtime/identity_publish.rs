@@ -85,6 +85,22 @@ impl crate::runtime::NodeRuntime {
             &self.logger,
         )
         .await;
+        // The new document is locally installed before old evidence is dropped,
+        // so a concurrent verifier cannot immediately re-cache the old binding.
+        let invalidate = self
+            .dispatcher
+            .peer_cert_invalidate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(invalidate) = invalidate {
+            invalidate(&identity);
+        }
+        self.identity
+            .peer_ratchet_keys
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&identity);
         self.logger.info(
             "node.sovereign_identity.reloaded",
             format!(
