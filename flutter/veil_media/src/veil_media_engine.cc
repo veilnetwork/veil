@@ -466,6 +466,7 @@ class GroupFanoutTransport : public webrtc::Transport {
   }
 
  public:
+  void ResetVideoClock() { video_stats_.reset_payload_clock(); }
   uint64_t audio_drops() const { return audio_drops_.load(std::memory_order_relaxed); }
   veil_media::RtpSendSnapshot video_send_stats() const {
     return video_stats_.snapshot(webrtc::TimeMicros() * 1000);
@@ -535,6 +536,7 @@ class VeilVideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
     decode_trace_.Record(frame.rtp_timestamp(), webrtc::TimeMicros(),
                          buf->width(), buf->height());
     std::lock_guard<std::mutex> l(m_);
+    decoded_timestamp_ = frame.rtp_timestamp();
 #if defined(__ANDROID__)
     if (native_window_ != nullptr) {
       latest_i420_ = buf;
@@ -634,7 +636,13 @@ class VeilVideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
   }
 #endif
 
+  std::pair<uint64_t, uint32_t> delivery_frame() {
+    std::lock_guard<std::mutex> l(m_);
+    return {seq_, decoded_timestamp_};
+  }
+
  private:
+  uint32_t decoded_timestamp_ = 0;
   void store_i420_locked(const uint8_t* y, const uint8_t* u,
                          const uint8_t* v, int w, int h, int stride_y,
                          int stride_u, int stride_v) {
@@ -2494,6 +2502,7 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
       ws->video_send_stream =
           ws->video_call->CreateVideoSendStream(std::move(sc), std::move(ec));
       if (ws->video_send_stream) {
+        ws->fanout->ResetVideoClock();
         for (const auto& entry : ws->peers) entry.second->shim->ResetVideoLossEvidence();
         ws->video_send_stream->SetSource(
             ws->video_source.get(),
@@ -2865,6 +2874,16 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
     }
   }
   const bool video_sampled = veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&] {
+    for (auto& entry : ws->peers) {
+      auto* peer = entry.second.get();
+      if (peer->video_recv_stream && peer->video_sink) {
+        const auto v = peer->video_recv_stream->GetStats();
+        const auto frame = peer->video_sink->delivery_frame();
+        peer->shim->SetLocalVideoDelivery(peer->video_ssrc,
+            v.rtp_stats.packet_counter.payload_bytes, frame.first,
+            frame.second, v.current_delay_ms, webrtc::TimeMicros());
+      }
+    }
     if (ws->video_send_stream) {
       const auto video = ws->video_send_stream->GetStats();
       video_frames = video.frames_encoded;
@@ -2963,6 +2982,17 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               ",\"audio_playout_sequence\":" + std::to_string(ws->audio_playout_revision) +
               ",\"audio_playout_reports\":" + std::to_string(playout_reports) +
               ",\"audio_playout_ms\":" + std::to_string(playout_ms);
+  snapshot += ",\"video_delivery_peers\":{";
+  bool first_delivery = true;
+  for (const auto& entry : ws->peers) {
+    if (!first_delivery) snapshot += ',';
+    first_delivery = false;
+    snapshot += "\"" + entry.first + "\":" +
+        entry.second->shim->video_delivery_json(webrtc::TimeMicros(),
+            ws->fanout->video_send_stats().payload_timestamp,
+            ws->fanout->video_send_stats().payload_bytes / ws->peers.size());
+  }
+  snapshot += "}";
   snapshot += ",\"video_send_paused\":" + std::to_string(ws->video_send_paused.load() ? 1 : 0);
   const auto video_send = ws->fanout->video_send_stats();
   // Per-peer attempted copies, unlike video_tx_frames (one logical encoder).
@@ -4463,6 +4493,12 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
             const auto v = ws->video_recv_stream->GetStats();
             video_delay_ms = v.current_delay_ms;
             video_jb_ms = v.jitter_buffer_ms;
+            if (ws->video_sink) {
+              const auto frame = ws->video_sink->delivery_frame();
+              ws->shim->SetLocalVideoDelivery(video_ssrc_of(engine->peer),
+                  v.rtp_stats.packet_counter.payload_bytes, frame.first,
+                  frame.second, v.current_delay_ms, webrtc::TimeMicros());
+            }
           }
         }, std::chrono::milliseconds(20));
     // Cached WebRTC stats have no report age. Only an authenticated peer's
@@ -4697,6 +4733,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
           std::to_string(audio_report.fresh_loss_report_us(loss_now_us));
       snapshot += ",\"audio_rtt_route_epoch\":" + std::to_string(audio_report.route_epoch);
       snapshot += ",\"video_rtt_route_epoch\":" + std::to_string(video_report.route_epoch);
+      snapshot += ",\"video_delivery_peers\":{\"peer\":" +
+          ws->shim->video_delivery_json(webrtc::TimeMicros()) + "}";
       snapshot += ",\"video_loss_report_us\":" +
           std::to_string(video_report.fresh_loss_report_us(loss_now_us));
       snapshot += ",\"video_persistent_loss_report_us\":" +

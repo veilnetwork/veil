@@ -113,4 +113,20 @@ int main() {
   const auto copies = fanout.snapshot(3310 * ms);
   assert(copies.payload_packets == 3 && copies.payload_rtp_bytes == 84);
   assert(copies.payload_rtp_bytes / copies.payload_packets == extended.size());
+  // Only real payload advances the causal probe watermark. Retransmissions
+  // cannot move it backwards; clock wrap and a new encoder are distinct.
+  veil_media::RtpSendStats clock;
+  packet = {0x80, 96, 0, 1, 0xff, 0xff, 0xff, 0xf0, 1, 2, 3, 4, 7};
+  assert(clock.mark_attempt(packet, ssrc, 4000 * ms, 96));
+  assert(clock.snapshot(4000 * ms).payload_timestamp == 0xfffffff0u);
+  packet[4] = packet[5] = packet[6] = 0; packet[7] = 50;
+  assert(clock.mark_attempt(packet, ssrc, 4100 * ms, 96));
+  assert(clock.snapshot(4100 * ms).payload_timestamp == 50);
+  packet[4] = packet[5] = packet[6] = 0xff; packet[7] = 0xf0;
+  assert(clock.mark_attempt(packet, ssrc, 4200 * ms, 96));
+  assert(clock.snapshot(4200 * ms).payload_timestamp == 50);
+  clock.reset_payload_clock();
+  assert(clock.mark_attempt(packet, ssrc, 4300 * ms, 96));
+  assert(clock.snapshot(4300 * ms).payload_timestamp == 0xfffffff0u);
+
 }
