@@ -207,7 +207,7 @@ struct SealedLocalSample {
 
 fn relay_sample(body: &[u8]) -> Option<SealedLocalSample> {
     let flags = body
-        .get(100..104)
+        .get(veil_proto::AppIpcSendPayload::FLAGS_RANGE)
         .and_then(|b| <[u8; 4]>::try_from(b).ok())
         .map(u32::from_be_bytes)
         .unwrap_or(0);
@@ -395,7 +395,7 @@ mod tests {
             data: veil_bufpool::pooled_shared_from_vec(data),
         }
         .encode();
-        body[100..104].copy_from_slice(&flags.to_be_bytes());
+        body[veil_proto::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(&flags.to_be_bytes());
         body
     }
 

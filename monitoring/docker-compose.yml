@@ -12,7 +12,7 @@ services:
       - '--storage.tsdb.retention.time=7d'
       - '--web.enable-lifecycle'
     ports:
-      - "192.168.1.105:9090:9090"
+      - "${MONITORING_BIND:-127.0.0.1}:9090:9090"
 
   grafana:
     image: grafana/grafana-oss:11.4.0
@@ -43,7 +43,7 @@ services:
       - ./grafana-dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     ports:
-      - "192.168.1.105:3001:3000"
+      - "${MONITORING_BIND:-127.0.0.1}:3001:3000"
 
 volumes:
   prom-data:

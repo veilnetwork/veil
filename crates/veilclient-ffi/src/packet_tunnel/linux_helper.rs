@@ -305,7 +305,7 @@ fn invoked_uid() -> Result<u32, String> {
         .map_err(|_| "PKEXEC_UID is invalid".to_owned())
 }
 
-fn load_config(path: &Path) -> Result<HelperConfig, String> {
+fn load_config(path: &Path, expected_sha256: &str) -> Result<HelperConfig, String> {
     let uid = invoked_uid()?;
     // Validate the OPEN FILE, not the path. This helper runs as root via
     // pkexec while `path` sits in a directory the invoking (unprivileged) user
@@ -338,6 +338,7 @@ fn load_config(path: &Path) -> Result<HelperConfig, String> {
     if bytes.len() as u64 > MAX_CONFIG_BYTES {
         return Err("unsafe helper config ownership, type, size, or mode".to_owned());
     }
+    super::verify_helper_request_digest(&bytes, expected_sha256)?;
     let _ = fs::remove_file(path);
     serde_json::from_slice(&bytes).map_err(|error| format!("parse helper config: {error}"))
 }
@@ -650,7 +651,7 @@ fn emit_status(phase: &str, detail: Option<&str>) {
     let _ = io::stdout().flush();
 }
 
-fn run_inner(config_path: &str) -> Result<(), String> {
+fn run_inner(config_path: &str, digest: &str) -> Result<(), String> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("Linux VPN helper requires root".to_owned());
     }
@@ -658,7 +659,7 @@ fn run_inner(config_path: &str) -> Result<(), String> {
         .map_err(|_| "required Linux VPN tool is missing: ip".to_owned())?;
     checked_command("nft", ["--version"])
         .map_err(|_| "required Linux VPN tool is missing: nft".to_owned())?;
-    let config = load_config(Path::new(config_path))?;
+    let config = load_config(Path::new(config_path), digest)?;
     let policy = config.validate()?;
     if policy.route_dns {
         checked_command("resolvectl", ["--version"])
@@ -726,8 +727,8 @@ fn run_inner(config_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn run(config_path: &str) -> libc::c_int {
-    match run_inner(config_path) {
+pub(super) fn run(config_path: &str, digest: &str) -> libc::c_int {
+    match run_inner(config_path, digest) {
         Ok(()) => crate::VEIL_OK,
         Err(error) => {
             emit_status("error", Some(&error));
@@ -821,7 +822,10 @@ mod tests {
             }
             Ok("helper") => {
                 let config_path = std::env::var("XVEIL_VPN_SMOKE_CONFIG").unwrap();
-                assert_eq!(run(&config_path), crate::VEIL_OK);
+                let bytes = fs::read(&config_path).unwrap();
+                use sha2::{Digest, Sha256};
+                let digest = format!("{:x}", Sha256::digest(&bytes));
+                assert_eq!(run(&config_path, &digest), crate::VEIL_OK);
                 return;
             }
             _ => {}

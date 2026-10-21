@@ -768,15 +768,22 @@ async fn try_ratchet_seal(
     // burst wait too — a slow seal is logged so a stall has a name.
     let resolve_started = std::time::Instant::now();
     let pairing = ctx.session_instance_lookup.as_deref().and_then(|lookup| {
+        // Linking preserves the physical key while replacing the temporary
+        // identity. A still-live pre-link session can retain that old identity
+        // until its next handshake. Our current master-authorized document is
+        // authoritative for our siblings, before any stale session snapshot.
         lookup
-            .session_pairing(dst_node_id)
-            .or_else(|| lookup.own_device_pairing(dst_node_id))
+            .own_device_pairing(dst_node_id)
+            .or_else(|| lookup.session_pairing(dst_node_id))
     });
-    let session_instance = pairing.map(|p| p.instance).or_else(|| {
-        ctx.session_instance_lookup
-            .as_deref()
-            .and_then(|lookup| lookup.session_instance(dst_node_id))
-    });
+    let session_instance = pairing
+        .map(|p| p.instance)
+        .or_else(|| {
+            ctx.session_instance_lookup
+                .as_deref()
+                .and_then(|lookup| lookup.session_instance(dst_node_id))
+        })
+        .or_else(|| ratchet.reply_instance(dst_node_id, veil_util::unix_secs_now_u64()));
     // What a CERTIFICATE is looked up under. The destination remains what the
     // frame is routed to; only the key changes, and only when a session has
     // proved an identity to change it to.
@@ -798,11 +805,9 @@ async fn try_ratchet_seal(
     // ordinary send path; the 30-minute verified-cert cache above it means a
     // peer costs that walk once, not once per message.
     //
-    // Also the fallback when the SESSION named a device but its cert did not
-    // resolve — fail-open to the singular row rather than refusing to seal:
-    // a wrong-device seal now earns an `AppSendUnopenable` reply that drops
-    // the cached row and re-keys, where an unsealed message would silently
-    // lose its sender proof.
+    // Prefer the named endpoint. The compatibility fallback stays sealed;
+    // direct fan-out verifies the resulting target before handing it to a
+    // session. Returning no seal here would instead lose sender proof.
     let cert = match paired {
         Some(c) => c,
         None => match resolver.resolve_cert_cached(cert_key) {
@@ -903,7 +908,7 @@ pub(crate) async fn handle_ipc_send(
     // AppIpcSendPayload ignores unknown bits, so old clients/servers remain
     // compatible without growing its public struct and every literal user.
     let raw_flags = body
-        .get(100..104)
+        .get(veil_proto::AppIpcSendPayload::FLAGS_RANGE)
         .and_then(|v| <[u8; 4]>::try_from(v).ok())
         .map(u32::from_be_bytes)
         .unwrap_or(0);
@@ -1154,27 +1159,55 @@ pub(crate) async fn handle_ipc_send(
         planned = Some((discovered, hops));
     }
 
-    // A relayed call must reach each device with that device's key. The
-    // singular certificate cache can pick an offline sibling after a restart;
-    // relaying that ciphertext to the online device never makes it readable.
-    // Use verified local records only, route each copy to its physical device,
-    // and keep the destination app addressed to the contact identity.
-    if relay_control_compat
-        && ratchet_ok
+    // A relay cannot turn ciphertext for an offline sibling into ciphertext
+    // for the online endpoint. Resolve and seal each recipient separately.
+    // Ordinary sends keep their direct-session path when one exists; control
+    // retains its existing fan-out. ACK-tracked legacy requests keep their
+    // existing single-envelope tracker contract below.
+    if ratchet_ok
         && remote
         && !send.require_ack
-        && send.data.len() <= 4096
         && let (Some(ratchet), Some(resolver), Some(reg)) = (
             ctx.ratchet.as_ref(),
             ctx.mlkem_ek_resolver.as_deref(),
             session_tx_registry,
         )
+        && (relay_control_compat && send.data.len() <= 4096
+            || !relay_control_compat
+                && !send.my_other_devices
+                && ctx
+                    .session_instance_lookup
+                    .as_deref()
+                    .and_then(|lookup| lookup.own_device_pairing(&send.dst_node_id))
+                    .is_none()
+                && {
+                    let active = reg.active_node_ids();
+                    !active.contains(&send.dst_node_id)
+                        && !reg
+                            .devices_of(&send.dst_node_id)
+                            .iter()
+                            .any(|device| active.contains(device))
+                })
         && let Some(me) = ratchet.identity()
     {
         use veil_proto::delivery::DeliveryEnvelope;
         use veil_proto::family::DeliveryMsg;
         let mut any_sent = false;
         let now = veil_util::unix_secs_now_u64();
+        let family_deadline = if relay_control_compat {
+            control_source_deadline
+        } else {
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30)
+        };
+        // A newly linked endpoint may know only the caller's offline sibling.
+        // Cached-only fan-out then repeatedly seals every answer for the wrong
+        // machine. Warm the complete verified family within this request's
+        // existing control deadline, retaining partial cached results on timeout.
+        let _ = tokio::time::timeout_at(
+            family_deadline,
+            resolver.resolve_device_certs(send.dst_node_id),
+        )
+        .await;
         for (device, cert) in resolver.resolve_device_certs_cached(send.dst_node_id) {
             if device == *local_node_id || cert.node_id != send.dst_node_id {
                 continue;
@@ -1208,6 +1241,75 @@ pub(crate) async fn handle_ipc_send(
                 continue;
             };
             use veil_proto::recipient::Recipient;
+            if !relay_control_compat {
+                let envelope = DeliveryEnvelope {
+                    recipient: Recipient::specific(send.dst_node_id, cert.instance_id),
+                    sender_node_id: me.local_node_id,
+                    src_app_id: send.src_app_id,
+                    app_id: send.app_id,
+                    endpoint_id: send.endpoint_id,
+                    content_id: {
+                        let mut id = [0u8; 32];
+                        use rand_core::RngCore;
+                        rand_core::OsRng.fill_bytes(&mut id);
+                        id
+                    },
+                    created_at: now,
+                    ttl_secs: 30,
+                    payload,
+                    trace_id: 0,
+                    require_ack: false,
+                };
+                // Use the normal reliable source and shared deadline for all
+                // chunks, never the call-control datagram lane. The encrypted
+                // envelope has no media/application priority visible to relays.
+                let generic_hops = if identity_hops.is_empty() {
+                    hops
+                } else {
+                    identity_hops
+                };
+                for hop in generic_hops.into_iter().take(3) {
+                    let segment = source_segment_bytes(reg, envelope.payload.len());
+                    let frames = if envelope.payload.len() > segment
+                        || envelope.payload.len()
+                            > veil_proto::delivery::ENVELOPE_CHUNKING_THRESHOLD
+                    {
+                        let Some(chunks) = EnvelopeChunks::new(&envelope, false, segment) else {
+                            continue;
+                        };
+                        chunks.frames_for(hop).collect::<Vec<_>>()
+                    } else {
+                        let bytes = envelope.encode();
+                        let mut header = FrameHeader::new(
+                            FrameFamily::Delivery as u8,
+                            DeliveryMsg::Forward as u16,
+                        );
+                        header.set_priority(veil_proto::priority::INTERACTIVE);
+                        header.body_len = (32 + bytes.len() + 9) as u32;
+                        let mut frame = codec::encode_header(&header).to_vec();
+                        frame.extend_from_slice(&hop);
+                        frame.extend_from_slice(&bytes);
+                        frame.extend_from_slice(&0u64.to_be_bytes());
+                        frame.push(0);
+                        vec![frame]
+                    };
+                    let admitted = tokio::time::timeout_at(family_deadline, async {
+                        for frame in frames {
+                            if !reg.send_reliable_to(&hop, frame).await {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if admitted {
+                        any_sent = true;
+                        break;
+                    }
+                }
+                continue;
+            }
             for (recipient, hops) in [
                 (Recipient::any(device), hops),
                 (
@@ -1270,7 +1372,11 @@ pub(crate) async fn handle_ipc_send(
             }
         }
         if any_sent {
-            timing.path.set("call_device_fanout");
+            timing.path.set(if relay_control_compat {
+                "call_device_fanout"
+            } else {
+                "relay_device_fanout"
+            });
             return app_send_ok(sink, false).await;
         }
     }
@@ -1824,7 +1930,15 @@ pub(crate) async fn handle_ipc_send(
                 // the meta-E2E ciphertext; zero-out outer envelope fields so that
                 // relays cannot learn who originated the message.
                 let envelope = DeliveryEnvelope {
-                    recipient: veil_proto::recipient::Recipient::any(send.dst_node_id),
+                    // Ratchet ciphertext belongs to one exact endpoint. Do
+                    // not hand it to an arbitrary sibling, which cannot open
+                    // it and would request a needless reset of healthy chains.
+                    recipient: sealed_for.map_or_else(
+                        || veil_proto::recipient::Recipient::any(send.dst_node_id),
+                        |instance| {
+                            veil_proto::recipient::Recipient::specific(send.dst_node_id, instance)
+                        },
+                    ),
                     sender_node_id: if send.anonymous {
                         [0u8; 32]
                     } else {
@@ -2722,7 +2836,7 @@ mod ratchet_send_tests {
         let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
             | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED
             | veil_proto::ipc::IPC_SEND_FLAG_LOCAL_SHORT_CONTROL;
-        body[100..104].copy_from_slice(&flags.to_be_bytes());
+        body[veil_proto::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(&flags.to_be_bytes());
         handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
             .await
             .unwrap();
@@ -2762,7 +2876,7 @@ mod ratchet_send_tests {
         let mut body = payload_to(PEER, &sealed);
         let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
             | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
-        body[100..104].copy_from_slice(&flags.to_be_bytes());
+        body[veil_proto::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(&flags.to_be_bytes());
         let mut wh = sink().await;
         let mut previous = None;
         for lane in [
@@ -2804,7 +2918,7 @@ mod ratchet_send_tests {
         }
         // Compact call state uses the local signaling source while retaining
         // the same presealed payload and neutral inter-node representation.
-        body[100..104].copy_from_slice(
+        body[veil_proto::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(
             &(flags | veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT).to_be_bytes(),
         );
         ctx.local_priority = veil_proto::priority::INTERACTIVE;
@@ -2841,7 +2955,7 @@ mod ratchet_send_tests {
             let mut body = payload(false, &sealed);
             let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
                 | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
-            body[100..104].copy_from_slice(&flags.to_be_bytes());
+            body[veil_proto::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(&flags.to_be_bytes());
             let mut wh = sink().await;
             handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
                 .await
@@ -3223,6 +3337,62 @@ mod ratchet_send_tests {
         }
     }
 
+    struct AdoptedSiblingSession {
+        device: [u8; 32],
+        current: veil_types::SessionPairing,
+    }
+    impl veil_types::SessionInstanceLookup for AdoptedSiblingSession {
+        fn session_instance(&self, peer: &[u8; 32]) -> Option<[u8; 16]> {
+            (*peer == self.device).then_some(self.current.instance)
+        }
+        fn session_pairing(&self, peer: &[u8; 32]) -> Option<veil_types::SessionPairing> {
+            (*peer == self.device).then_some(veil_types::SessionPairing {
+                identity: [0xEE; 32],
+                instance: self.current.instance,
+            })
+        }
+        fn own_device_pairing(&self, peer: &[u8; 32]) -> Option<veil_types::SessionPairing> {
+            (*peer == self.device).then_some(self.current)
+        }
+    }
+
+    #[tokio::test]
+    async fn current_own_device_document_overrides_a_pre_link_session_identity() {
+        let mut fx = fixture(vec![RELAY]);
+        // The same physical device and instance have just adopted our identity;
+        // a still-open session describes its discarded temporary identity.
+        let physical = [0xD9; 32];
+        let peer_ring = fx.peer.seed_ring.read().unwrap().clone();
+        fx.peer.adopt_identity(ME, peer_ring.clone());
+        fx.certs = Arc::new(Certs(veil_types::VerifiedPeerCert {
+            node_id: ME,
+            instance_id: PEER_INSTANCE,
+            mlkem_ek: peer_ring.current_ek().to_vec(),
+            ratchet_x25519_pk: peer_ring.current_ratchet_pk(),
+            cert_version: 1,
+            valid_until_unix: u64::MAX,
+        }));
+        let mut ctx = fx.ctx(true);
+        ctx.session_instance_lookup = Some(Arc::new(AdoptedSiblingSession {
+            device: physical,
+            current: veil_types::SessionPairing {
+                identity: ME,
+                instance: PEER_INSTANCE,
+            },
+        }));
+        let sealed = try_ratchet_seal(&ctx, &physical, b"first linked-device history", false).await;
+        let (payload, _, sender) =
+            sealed.expect("seal under the current identity, not its old name");
+        assert_eq!(sender, ME);
+        assert_eq!(
+            fx.peer
+                .open_payload(&ME, &payload, veil_util::unix_secs_now_u64())
+                .unwrap()
+                .plaintext,
+            b"first linked-device history"
+        );
+    }
+
     /// Several live sessions, each to a device whose handshake proved it
     /// belongs to `PEER` — what a person with two devices online looks like
     /// from a contact's node.
@@ -3282,6 +3452,43 @@ mod ratchet_send_tests {
                 .iter()
                 .find(|c| c.node_id == target && c.instance_id == instance)
                 .cloned()
+        }
+    }
+
+    /// A linked device has learned only the offline sibling's certificate.
+    /// The bounded family lookup must fill the missing endpoint before sealing.
+    struct WarmingFamilyCerts {
+        rows: FamilyCerts,
+        ready: std::sync::atomic::AtomicBool,
+    }
+    impl veil_types::MlKemEkResolver for WarmingFamilyCerts {
+        fn resolve_device_certs_cached(
+            &self,
+            target: [u8; 32],
+        ) -> Vec<([u8; 32], veil_types::VerifiedPeerCert)> {
+            let rows = self.rows.resolve_device_certs_cached(target);
+            if self.ready.load(std::sync::atomic::Ordering::Relaxed) {
+                rows
+            } else {
+                rows.into_iter().rev().take(1).collect()
+            }
+        }
+        fn resolve_device_certs(&self, target: [u8; 32]) -> veil_types::DeviceCertsFuture<'_> {
+            Box::pin(async move {
+                self.ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.resolve_device_certs_cached(target)
+            })
+        }
+        fn resolve_cert_cached(&self, target: [u8; 32]) -> Option<veil_types::VerifiedPeerCert> {
+            self.rows.resolve_cert_cached(target)
+        }
+        fn resolve_cert(
+            &self,
+            target: [u8; 32],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<veil_types::VerifiedPeerCert>> + Send + '_>,
+        > {
+            Box::pin(async move { self.resolve_cert_cached(target) })
         }
     }
 
@@ -3406,6 +3613,65 @@ mod ratchet_send_tests {
         // the session's device must differ for the test to say anything.
         fx.certs = Arc::new(FamilyCerts(vec![session_row, sibling_row]));
         (fx, sibling_rt)
+    }
+
+    #[tokio::test]
+    async fn a_relayed_reply_uses_the_authenticated_speaker_not_an_offline_sibling() {
+        let (fx, sibling) = family_fixture();
+        let now = veil_util::unix_secs_now_u64();
+        for endpoint in [&fx.peer, &sibling] {
+            let ring = endpoint.seed_ring.read().unwrap();
+            wlock!(fx.me.peer_ratchet_keys)
+                .entry(PEER)
+                .or_default()
+                .remember(
+                    endpoint.identity().unwrap().local_instance_id,
+                    ring.current_ratchet_pk(),
+                    u64::MAX,
+                );
+        }
+        let my_ring = fx.me.seed_ring.read().unwrap().clone();
+        let incoming = veil_e2e::ratchet::seal(
+            &fx.peer.store,
+            &fx.peer.identity().unwrap(),
+            veil_e2e::PeerRatchetKeys {
+                node_id: &ME,
+                instance_id: &MY_INSTANCE,
+                mlkem_ek: &my_ring.current_ek(),
+                ratchet_pk: &my_ring.current_ratchet_pk(),
+                authorized_until_unix: u64::MAX,
+            },
+            b"online A to D",
+            now,
+        )
+        .unwrap()
+        .0;
+        assert!(
+            fx.me
+                .open_payload(&PEER, &incoming, now)
+                .unwrap()
+                .authenticated
+        );
+        assert_eq!(fx.me.reply_instance(&PEER, now), Some(PEER_INSTANCE));
+        assert_eq!(fx.session_instance, None); // No direct path names an endpoint.
+        let (reply, _, _) = try_ratchet_seal(&fx.ctx(true), &PEER, b"D replies to A", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            veil_e2e::payload_instances(&reply).unwrap().1,
+            PEER_INSTANCE
+        );
+        assert_eq!(
+            fx.peer.open_payload(&ME, &reply, now).unwrap().plaintext,
+            b"D replies to A"
+        );
+        assert!(sibling.open_payload(&ME, &reply, now).is_err());
+        wlock!(fx.me.peer_ratchet_keys).remove(&PEER);
+        assert_eq!(
+            fx.me.reply_instance(&PEER, now),
+            None,
+            "old held authorization cannot choose a revoked endpoint"
+        );
     }
 
     struct PlainChunkPeers(Vec<[u8; 32]>);
@@ -4304,8 +4570,7 @@ mod ratchet_send_tests {
     }
 
     #[tokio::test]
-    async fn relay_call_control_is_readable_on_each_devices_own_route() {
-        use veil_proto::delivery::DeliveryEnvelope;
+    async fn ordinary_relay_send_seals_each_device_even_without_a_direct_session() {
         let (mut fx, sibling) = family_fixture();
         fx.outbox = Arc::new(Outbox {
             live: vec![RELAY],
@@ -4313,8 +4578,69 @@ mod ratchet_send_tests {
             sent: Mutex::new(Vec::new()),
             family: Vec::new(),
         });
+        let mut wh = sink().await;
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload(false, b"ordinary message to the online sibling"),
+            &fx.ctx(true),
+        )
+        .await
+        .unwrap();
+        let sent = fx.taken();
+        assert_eq!(
+            sent.len(),
+            2,
+            "one normal reliable copy per verified instance"
+        );
+        let mut instances = std::collections::HashSet::new();
+        for (hop, bytes) in sent {
+            assert_eq!(hop, RELAY);
+            let f = veil_proto::delivery::ForwardPayload::decode(&bytes[veil_proto::HEADER_SIZE..])
+                .unwrap();
+            let (_, instance) = veil_e2e::payload_instances(&f.envelope.payload).unwrap();
+            assert!(instances.insert(instance));
+            assert_eq!(
+                f.envelope.recipient,
+                veil_proto::recipient::Recipient::specific(PEER, instance)
+            );
+            let endpoint = if instance == PEER_INSTANCE {
+                &fx.peer
+            } else {
+                &sibling
+            };
+            assert_eq!(
+                endpoint
+                    .open_payload(&ME, &f.envelope.payload, veil_util::unix_secs_now_u64())
+                    .unwrap()
+                    .plaintext,
+                b"ordinary message to the online sibling"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_call_control_warms_missing_device_certificates_before_fanout() {
+        use veil_proto::delivery::DeliveryEnvelope;
+        let (mut fx, sibling) = family_fixture();
+        let rows = fx
+            .certs
+            .resolve_device_certs_cached(PEER)
+            .into_iter()
+            .map(|(_, cert)| cert)
+            .collect();
+        fx.certs = Arc::new(WarmingFamilyCerts {
+            rows: FamilyCerts(rows),
+            ready: std::sync::atomic::AtomicBool::new(false),
+        });
+        assert_eq!(fx.certs.resolve_device_certs_cached(PEER).len(), 1);
+        fx.outbox = Arc::new(Outbox {
+            live: vec![RELAY],
+            datagram: Vec::new(),
+            sent: Mutex::new(Vec::new()),
+            family: Vec::new(),
+        });
         let mut body = payload(false, b"answer from the online phone");
-        body[100..104]
+        body[veil_proto::AppIpcSendPayload::FLAGS_RANGE]
             .copy_from_slice(&veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT.to_be_bytes());
         let mut wh = sink().await;
         handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &fx.ctx(true))
@@ -5356,6 +5682,11 @@ mod ratchet_send_tests {
             Some(veil_proto::RATCHET_E2E_MARKER),
             "not the 0xE2 encapsulation-to-a-published-key envelope"
         );
+        assert_eq!(
+            fwd.envelope.recipient,
+            veil_proto::recipient::Recipient::specific(PEER, PEER_INSTANCE),
+            "routing must name the same instance as the ciphertext"
+        );
         let opened = fx
             .peer
             .open_payload(&ME, &fwd.envelope.payload, veil_util::unix_secs_now_u64())
@@ -5379,7 +5710,7 @@ mod ratchet_send_tests {
             ctx.local_node_id = [0xD7; 32];
             let mut body = payload(false, b"identity-bound relay control");
             if control {
-                body[100..104].copy_from_slice(
+                body[veil_proto::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(
                     &veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT.to_be_bytes(),
                 );
             }
@@ -5548,7 +5879,7 @@ mod ratchet_send_tests {
             let mut ctx = fx.ctx(true);
             ctx.local_priority = veil_proto::priority::INTERACTIVE;
             let mut body = payload(false, b"call answer");
-            body[100..104].copy_from_slice(
+            body[veil_proto::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(
                 &veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT.to_be_bytes(),
             );
             let mut wh = sink().await;
@@ -5627,7 +5958,7 @@ mod ratchet_send_tests {
             ctx.session_tx_registry = Some(Arc::new(ActiveControlSource(fx.outbox.clone())));
             let data = vec![0xa6; 1024];
             let mut body = payload(false, &data);
-            body[100..104].copy_from_slice(
+            body[veil_proto::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(
                 &veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT.to_be_bytes(),
             );
             let mut wh = sink().await;
@@ -5705,7 +6036,7 @@ mod ratchet_send_tests {
                 ));
             }
             let mut body = payload(false, b"call answer");
-            body[100..104].copy_from_slice(
+            body[veil_proto::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(
                 &veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT.to_be_bytes(),
             );
             let mut wh = sink().await;
@@ -5758,9 +6089,12 @@ mod ratchet_send_tests {
         let fx = fixture(vec![RELAY]);
         wlock!(fx.route_cache).invalidate(&PEER);
         let mut body = payload(false, b"call offer");
-        let flags = u32::from_be_bytes(body[100..104].try_into().unwrap())
-            | veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT;
-        body[100..104].copy_from_slice(&flags.to_be_bytes());
+        let flags = u32::from_be_bytes(
+            body[veil_proto::AppIpcSendPayload::FLAGS_RANGE]
+                .try_into()
+                .unwrap(),
+        ) | veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT;
+        body[veil_proto::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(&flags.to_be_bytes());
         let mut wh = sink().await;
         handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &fx.ctx(true))
             .await
@@ -5800,9 +6134,12 @@ mod ratchet_send_tests {
         // identity route. Admission to that queue cannot prove delivery.
         wlock!(fx.route_cache).insert(device, RELAY, 10_000, 2);
         let mut body = payload(false, b"call answer");
-        let flags = u32::from_be_bytes(body[100..104].try_into().unwrap())
-            | veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT;
-        body[100..104].copy_from_slice(&flags.to_be_bytes());
+        let flags = u32::from_be_bytes(
+            body[veil_proto::AppIpcSendPayload::FLAGS_RANGE]
+                .try_into()
+                .unwrap(),
+        ) | veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT;
+        body[veil_proto::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(&flags.to_be_bytes());
         let mut wh = sink().await;
         handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &fx.ctx(true))
             .await
@@ -5894,7 +6231,7 @@ mod ratchet_send_tests {
         let mut body = payload_to(DEVICE, &sealed);
         let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
             | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
-        body[100..104].copy_from_slice(&flags.to_be_bytes());
+        body[veil_proto::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(&flags.to_be_bytes());
         let mut wh = sink().await;
         handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
             .await
@@ -5937,7 +6274,7 @@ mod ratchet_send_tests {
             let mut body = payload_to(PEER, &sealed);
             let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
                 | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
-            body[100..104].copy_from_slice(&flags.to_be_bytes());
+            body[veil_proto::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(&flags.to_be_bytes());
             let mut wh = sink().await;
             handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
                 .await
@@ -5995,7 +6332,7 @@ mod ratchet_send_tests {
             let mut body = payload_to(PEER, &sealed);
             let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
                 | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
-            body[100..104].copy_from_slice(&flags.to_be_bytes());
+            body[veil_proto::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(&flags.to_be_bytes());
             let mut wh = sink().await;
             handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
                 .await
@@ -6044,7 +6381,7 @@ mod ratchet_send_tests {
             let mut body = payload_to(PEER, &sealed);
             let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
                 | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
-            body[100..104].copy_from_slice(&flags.to_be_bytes());
+            body[veil_proto::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(&flags.to_be_bytes());
             let mut wh = sink().await;
             handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
                 .await
@@ -6087,7 +6424,7 @@ mod ratchet_send_tests {
         let mut body = payload_to(DEVICE, &sealed);
         let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
             | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
-        body[100..104].copy_from_slice(&flags.to_be_bytes());
+        body[veil_proto::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(&flags.to_be_bytes());
         let mut wh = sink().await;
         tokio::time::timeout(Duration::from_millis(100), async {
             for _ in 0..25 {

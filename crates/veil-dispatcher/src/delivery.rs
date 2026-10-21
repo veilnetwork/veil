@@ -2003,6 +2003,7 @@ impl FrameDispatcher {
                 }
             }
             let now_unix = veil_util::unix_secs_now_u64();
+            self.revalidate_peer_certificate(&ratchet_peer);
             match ratchet.open_payload(&ratchet_peer, &envelope.payload, now_unix) {
                 Ok(opened) => {
                     // A newly linked sending device is not necessarily in our

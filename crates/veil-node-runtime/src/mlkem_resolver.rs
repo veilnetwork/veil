@@ -253,6 +253,9 @@ pub struct DhtMlKemEkResolver {
     /// Verified-cert cache TTL. Defaults to [`CERT_CACHE_TTL`]; overridable
     /// via [`with_cert_ttl`](Self::with_cert_ttl) for tests.
     cert_ttl: Duration,
+    /// Documents already checked by this resolver. A certificate TTL is not
+    /// permission to ignore a newer signed revocation in the local DHT.
+    checked_documents: Mutex<std::collections::HashMap<NodeIdBytes, CheckedDocument>>,
     /// One walk per device at a time: callers asking for the same device while
     /// a walk is running wait for it and read what it found.
     instance_walk_gates: Arc<Mutex<InstanceWalkGates>>,
@@ -268,6 +271,12 @@ pub struct DhtMlKemEkResolver {
     /// that concurrent callers really do overlap a walk, which an empty DHT —
     /// answering at once — would otherwise never let them do.
     instance_walk_delay: Duration,
+}
+
+struct CheckedDocument {
+    digest: [u8; 32],
+    issued_at: u64,
+    revoked: std::collections::HashSet<NodeIdBytes>,
 }
 
 /// What one certificate walk is for: a node, and the device of it when a
@@ -309,6 +318,122 @@ fn miss_window(base: Duration, streak: u32) -> Duration {
 }
 
 impl DhtMlKemEkResolver {
+    /// Invalidate authorization from removed devices before a cached cert can
+    /// republish it into the synchronous ratchet receive path. Public keys
+    /// remain usable only while the same device is endorsed by the current
+    /// master-signed document. No network work is performed here.
+    fn observe_document(&self, doc: &IdentityDocument) -> bool {
+        if doc.valid_until_unix < unix_now() {
+            return false;
+        }
+        let digest = *blake3::hash(&doc.encode()).as_bytes();
+        let mut checked = lock!(self.checked_documents);
+        if let Some(previous) = checked.get(&doc.node_id) {
+            if previous.digest == digest {
+                return true;
+            }
+            if doc.issued_at_unix < previous.issued_at
+                || doc.identity_keys.iter().any(|key| {
+                    previous.revoked.contains(&key.device_id)
+                        && !doc
+                            .revoked_devices
+                            .iter()
+                            .any(|revoked| revoked.device_id == key.device_id)
+                })
+            {
+                return false;
+            }
+        }
+        let now = unix_now();
+        if verify_identity_document(doc, now).is_err() {
+            return false;
+        }
+        let allowed: std::collections::HashMap<_, _> = doc
+            .identity_keys
+            .iter()
+            .filter(|key| {
+                key.valid_from_unix <= now
+                    && now <= key.valid_until_unix
+                    && !doc
+                        .revoked_devices
+                        .iter()
+                        .any(|revoked| revoked.device_id == key.device_id)
+            })
+            .map(|key| {
+                (
+                    key.device_id,
+                    key.valid_until_unix.min(doc.valid_until_unix),
+                )
+            })
+            .collect();
+        let valid = |cert: &mut VerifiedMlkemCert| {
+            let Some(until) = cert
+                .device_id
+                .and_then(|device| allowed.get(&device))
+                .copied()
+            else {
+                return false;
+            };
+            cert.valid_until_unix = cert.valid_until_unix.min(until);
+            now <= cert.valid_until_unix
+        };
+        let mut survivors = Vec::new();
+        {
+            let mut certs = wlock!(self.cert_cache);
+            if let Some((cert, _)) = certs.get_mut(&doc.node_id) {
+                if valid(cert) {
+                    survivors.push(cert.clone());
+                } else {
+                    certs.remove(&doc.node_id);
+                }
+            }
+        }
+        wlock!(self.instance_cert_cache).retain(|(peer, _), (cert, _)| {
+            if *peer != doc.node_id {
+                return true;
+            }
+            if !valid(cert) {
+                return false;
+            }
+            survivors.push(cert.clone());
+            true
+        });
+        wlock!(self.peer_mlkem_keys).remove(&doc.node_id);
+        wlock!(self.peer_ratchet_keys).remove(&doc.node_id);
+        for cert in survivors {
+            self.publish_ratchet_key(doc.node_id, &cert);
+        }
+        let mut revoked = checked
+            .remove(&doc.node_id)
+            .map_or_else(std::collections::HashSet::new, |old| old.revoked);
+        revoked.extend(doc.revoked_devices.iter().map(|key| key.device_id));
+        if checked.len() >= veil_proto::budget::MAX_PEER_MLKEM_CACHE
+            && let Some(victim) = checked.keys().next().copied()
+        {
+            checked.remove(&victim);
+        }
+        checked.insert(
+            doc.node_id,
+            CheckedDocument {
+                digest,
+                issued_at: doc.issued_at_unix,
+                revoked,
+            },
+        );
+        true
+    }
+
+    pub(crate) fn refresh_local_document(&self, peer: NodeIdBytes) {
+        if let Some(doc) = self
+            .dht
+            .get_local(&IdentityDocument::dht_key(&peer))
+            .and_then(|bytes| IdentityDocument::decode(&bytes).ok())
+            .filter(|doc| doc.node_id == peer)
+        {
+            self.observe_document(&doc);
+        }
+    }
+
     /// New resolver bound to a node's runtime components.  `step_timeout`
     /// applies to each of the three DHT walks individually — total budget
     /// is at most `3 × step_timeout`.
@@ -338,6 +463,7 @@ impl DhtMlKemEkResolver {
             logger,
             step_timeout: DEFAULT_STEP_TIMEOUT,
             cert_ttl: CERT_CACHE_TTL,
+            checked_documents: Mutex::new(std::collections::HashMap::new()),
             instance_walk_gates: Arc::new(Mutex::new(std::collections::HashMap::new())),
             instance_walk_misses: Arc::new(RwLock::new(std::collections::HashMap::new())),
             instance_miss_ttl: INSTANCE_MISS_TTL,
@@ -506,7 +632,7 @@ impl DhtMlKemEkResolver {
             if doc.is_none() {
                 self.log_dbg("mlkem_resolver.doc.dht_miss", &target_node_id, "");
             }
-            return doc;
+            return doc.filter(|doc| self.observe_document(doc));
         }
         let doc_bytes = match self
             .dht_recursive_get(doc_key, self.step_timeout, direct_peer, |b| {
@@ -548,7 +674,7 @@ impl DhtMlKemEkResolver {
             );
             return None;
         }
-        Some(doc)
+        self.observe_document(&doc).then_some(doc)
     }
 
     /// Resolve + verify the recipient's current ML-KEM cert — the full
@@ -559,6 +685,7 @@ impl DhtMlKemEkResolver {
     /// cert_version, which the EK-only [`resolve_ek`](MlKemEkResolver::resolve_ek)
     /// surface discards).
     pub async fn fetch_verified_cert(&self, target_node_id: [u8; 32]) -> Option<VerifiedMlkemCert> {
+        self.refresh_local_document(target_node_id);
         self.log_dbg("mlkem_resolver.start", &target_node_id, "");
         // ── Step 0: verified-cert fast path ─────────────────────────
         // A recently-verified cert for this recipient short-circuits the
@@ -832,6 +959,7 @@ impl DhtMlKemEkResolver {
         target_node_id: [u8; 32],
         instance_id: [u8; 16],
     ) -> Option<VerifiedMlkemCert> {
+        self.refresh_local_document(target_node_id);
         let now_for_cache = unix_now();
         if let Some((cert, ts)) =
             rlock!(self.instance_cert_cache).get(&(target_node_id, instance_id))
@@ -1665,6 +1793,7 @@ impl DhtMlKemEkResolver {
     /// The whole verified certificate from local records only — the sync
     /// counterpart of [`fetch_verified_cert`](Self::fetch_verified_cert).
     fn cached_cert(&self, target_node_id: [u8; 32]) -> Option<VerifiedMlkemCert> {
+        self.refresh_local_document(target_node_id);
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
@@ -1687,7 +1816,7 @@ impl DhtMlKemEkResolver {
                 .get_local(&IdentityDocument::dht_key(&target_node_id))?,
         )
         .ok()?;
-        if doc.node_id != target_node_id || verify_identity_document(&doc, now_unix).is_err() {
+        if doc.node_id != target_node_id || !self.observe_document(&doc) {
             return None;
         }
 
@@ -1724,6 +1853,7 @@ impl DhtMlKemEkResolver {
         target_node_id: [u8; 32],
         instance_id: [u8; 16],
     ) -> Option<VerifiedMlkemCert> {
+        self.refresh_local_document(target_node_id);
         // Both clocks, as in the async twin above.
         let now_for_cache = unix_now();
         if let Some((cert, ts)) =
@@ -1755,7 +1885,7 @@ impl DhtMlKemEkResolver {
                 .get_local(&IdentityDocument::dht_key(&target_node_id))?,
         )
         .ok()?;
-        if doc.node_id != target_node_id || verify_identity_document(&doc, now_unix).is_err() {
+        if doc.node_id != target_node_id || !self.observe_document(&doc) {
             return None;
         }
         // Straight to the named device's cert slot — no registry read, same
@@ -1810,7 +1940,7 @@ impl MlKemEkResolver for DhtMlKemEkResolver {
         else {
             return Vec::new();
         };
-        if doc.node_id != target || verify_identity_document(&doc, unix_now()).is_err() {
+        if doc.node_id != target || !self.observe_document(&doc) {
             return Vec::new();
         }
         let Some(reg) = self
@@ -1842,6 +1972,35 @@ impl MlKemEkResolver for DhtMlKemEkResolver {
                 Some((key.device_id, to_peer_cert(cert)))
             })
             .collect()
+    }
+
+    fn resolve_device_certs(&self, target: NodeIdBytes) -> veil_types::DeviceCertsFuture<'_> {
+        Box::pin(async move {
+            let cached = self.resolve_device_certs_cached(target);
+            let expected = self
+                .dht
+                .get_local(&InstanceRegistry::dht_key(&target))
+                .and_then(|bytes| InstanceRegistry::decode(&bytes).ok())
+                .map_or(0, |reg| reg.instances.len());
+            if expected > 0 && cached.len() == expected {
+                return cached;
+            }
+            let resolved = self.fetch_verified_certs(target).await;
+            let mut out = Vec::new();
+            for cert in resolved.certs {
+                let Some(device) = cert.device_id else {
+                    continue;
+                };
+                self.cache_verified(target, &cert);
+                lru_insert(
+                    &self.instance_cert_cache,
+                    (target, cert.instance_id),
+                    (cert.clone(), std::time::Instant::now()),
+                );
+                out.push((device, to_peer_cert(cert)));
+            }
+            out
+        })
     }
 
     fn resolve_cert_cached(
@@ -2208,6 +2367,141 @@ mod tests {
             Arc::new(crate::mlkem_cert_store::MlKemCertStore::ephemeral()),
             Arc::new(NodeLogger::new_noop()),
         )
+    }
+
+    #[test]
+    fn a_new_document_retires_warm_sender_keys_without_waiting_for_certificate_ttl() {
+        use crate::mlkem_cert_store::fixture::signer;
+        use ed25519_dalek::{Signer as _, SigningKey};
+        use veil_crypto::identity::{certify_message, compute_node_id};
+        use veil_proto::identity_document::{
+            ALGO_ED25519, DOC_SIG_CONTEXT, IdentityKey, RevokedDevice,
+        };
+        let now = unix_now();
+        let seed = 0x63;
+        let a = signer(seed);
+        let master = SigningKey::from_bytes(&[seed; 32]);
+        let a_sk = SigningKey::from_bytes(&[seed ^ 0xff; 32]);
+        let b_sk = SigningKey::from_bytes(&[0x25; 32]);
+        let b_pk = b_sk.verifying_key();
+        let b_id = compute_node_id(b_pk.as_bytes());
+        let mut old = a.doc.clone();
+        old.issued_at_unix = now - 10;
+        old.valid_until_unix = now + 3600;
+        old.identity_keys.push(IdentityKey {
+            algo: ALGO_ED25519,
+            pubkey: b_pk.as_bytes().to_vec(),
+            device_id: b_id,
+            valid_from_unix: now - 60,
+            valid_until_unix: now + 3600,
+            master_sig: master
+                .sign(&certify_message(
+                    &old.node_id,
+                    ALGO_ED25519,
+                    b_pk.as_bytes(),
+                    &b_id,
+                    now - 60,
+                    now + 3600,
+                ))
+                .to_bytes()
+                .to_vec(),
+        });
+        let sign_doc = |doc: &mut IdentityDocument, key: &SigningKey| {
+            let mut bytes = DOC_SIG_CONTEXT.to_vec();
+            bytes.extend_from_slice(&doc.canonical_signing_bytes());
+            doc.document_sig = key.sign(&bytes).to_bytes().to_vec();
+        };
+        sign_doc(&mut old, &a_sk);
+        assert!(verify_identity_document(&old, now).is_ok());
+        let target = old.node_id;
+        let dht = Arc::new(KademliaService::new([1; 32]));
+        dht.store_local(IdentityDocument::dht_key(&target), old.encode());
+        let a_instance = [0xa1; 16];
+        let b_instance = [0xb1; 16];
+        let a_cert = a.cert(a_instance, now - 60, now + 3600, 1);
+        let mut b_cert = a.cert(b_instance, now - 60, now + 3600, 1);
+        b_cert.signing_identity_key_idx = 1;
+        b_cert.sig = b_sk.sign(&b_cert.signing_message()).to_bytes().to_vec();
+        verify_mlkem_cert(&a_cert, &old, now).expect("valid A fixture");
+        verify_mlkem_cert(&b_cert, &old, now).expect("valid B fixture");
+        for cert in [a_cert, b_cert] {
+            dht.store_local(
+                MlKemKeyCert::dht_key(&target, &cert.instance_id),
+                cert.encode(),
+            );
+        }
+        let resolver = make_test_resolver(Arc::clone(&dht));
+        let stored_doc = IdentityDocument::decode(
+            &dht.get_local(&IdentityDocument::dht_key(&target))
+                .expect("stored document"),
+        )
+        .expect("decoded document");
+        verify_identity_document(&stored_doc, now).expect("stored document verifies");
+        assert!(resolver.observe_document(&stored_doc));
+        for instance in [a_instance, b_instance] {
+            let stored_cert = MlKemKeyCert::decode(
+                &dht.get_local(&MlKemKeyCert::dht_key(&target, &instance))
+                    .expect("stored certificate"),
+            )
+            .expect("decoded certificate");
+            verify_mlkem_cert(&stored_cert, &stored_doc, now).expect("stored certificate verifies");
+        }
+        for instance in [a_instance, b_instance] {
+            assert!(
+                resolver
+                    .resolve_cert_for_instance_cached(target, instance)
+                    .is_some(),
+                "initial instance {:02x}",
+                instance[0]
+            );
+        }
+        assert!(rlock!(resolver.peer_ratchet_keys)[&target].names_instance(&b_instance, now));
+        let mut current = old.clone();
+        current.issued_at_unix = now;
+        current.identity_keys.pop(); // canonical documents remove revoked live rows
+        current.revoked_devices.push(RevokedDevice {
+            device_id: b_id,
+            master_sig: master
+                .sign(&RevokedDevice::signing_message(&target, &b_id))
+                .to_bytes()
+                .to_vec(),
+        });
+        sign_doc(&mut current, &a_sk);
+        assert!(verify_identity_document(&current, now).is_ok());
+        dht.store_local(IdentityDocument::dht_key(&target), current.encode());
+        assert!(
+            resolver
+                .resolve_cert_for_instance_cached(target, b_instance)
+                .is_none()
+        );
+        assert!(!rlock!(resolver.peer_ratchet_keys)[&target].names_instance(&b_instance, now));
+        assert!(
+            resolver
+                .resolve_cert_for_instance_cached(target, a_instance)
+                .is_some()
+        );
+        // An old replica and a still-valid revoked signing key must not restore
+        // an authorization this receiver has already learned to retire.
+        dht.store_local(IdentityDocument::dht_key(&target), old.encode());
+        assert!(
+            resolver
+                .resolve_cert_for_instance_cached(target, b_instance)
+                .is_none()
+        );
+        old.issued_at_unix = now + 1;
+        old.sig_key_idx = 1;
+        sign_doc(&mut old, &b_sk);
+        dht.store_local(IdentityDocument::dht_key(&target), old.encode());
+        assert!(
+            resolver
+                .resolve_cert_for_instance_cached(target, b_instance)
+                .is_none()
+        );
+        assert!(
+            resolver
+                .resolve_cert_for_instance_cached(target, a_instance)
+                .is_some()
+        );
     }
 
     /// Resolver whose verified-cert cache we hold a handle to, so a test can

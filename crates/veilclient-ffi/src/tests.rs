@@ -14,6 +14,143 @@
 
 use super::*;
 
+#[test]
+fn aead_rejects_oversized_input_before_reading_it_and_resets_outputs() {
+    let key = [0u8; 32];
+    let nonce = [0u8; 24];
+    let input = [0u8; 1]; // Deliberately shorter than the rejected length.
+    for unseal in [false, true] {
+        for len in [VEIL_MAX_DATA_LEN + if unseal { 17 } else { 1 }, usize::MAX] {
+            let mut out = std::ptr::dangling_mut::<u8>();
+            let mut size = 123;
+            let mut error = ptr::null_mut();
+            let rc = unsafe {
+                if unseal {
+                    veil_unseal(
+                        key.as_ptr(),
+                        nonce.as_ptr(),
+                        input.as_ptr(),
+                        len,
+                        &mut out,
+                        &mut size,
+                        &mut error,
+                    )
+                } else {
+                    veil_seal(
+                        key.as_ptr(),
+                        nonce.as_ptr(),
+                        input.as_ptr(),
+                        len,
+                        &mut out,
+                        &mut size,
+                        &mut error,
+                    )
+                }
+            };
+            assert_eq!(rc, VEIL_ERR_INVALID_ARG);
+            assert!(out.is_null());
+            assert_eq!(size, 0);
+            assert!(!error.is_null());
+            unsafe {
+                veil_free_string(error);
+            }
+        }
+    }
+}
+
+#[test]
+fn aead_roundtrip_at_the_plaintext_limit_accepts_the_ciphertext_tag() {
+    let key = [9u8; 32];
+    let nonce = [7u8; 24];
+    let plain = vec![42u8; VEIL_MAX_DATA_LEN];
+    let mut cipher = ptr::null_mut();
+    let mut cipher_len = 0;
+    let mut error = ptr::null_mut();
+    unsafe {
+        assert_eq!(
+            veil_seal(
+                key.as_ptr(),
+                nonce.as_ptr(),
+                plain.as_ptr(),
+                plain.len(),
+                &mut cipher,
+                &mut cipher_len,
+                &mut error
+            ),
+            VEIL_OK
+        );
+        assert_eq!(cipher_len, plain.len() + 16);
+        let mut opened = ptr::null_mut();
+        let mut opened_len = 0;
+        let result = veil_unseal(
+            key.as_ptr(),
+            nonce.as_ptr(),
+            cipher,
+            cipher_len,
+            &mut opened,
+            &mut opened_len,
+            &mut error,
+        );
+        veil_free_buf(cipher, cipher_len);
+        assert_eq!(result, VEIL_OK);
+        assert_eq!(std::slice::from_raw_parts(opened, opened_len), plain);
+        veil_free_buf(opened, opened_len);
+    }
+}
+
+#[cfg(feature = "node-embedded")]
+#[test]
+fn media_datagrams_reject_oversized_input_before_dereference() {
+    let one = [0u8; 1];
+    unsafe {
+        assert_eq!(
+            crate::media_ffi::veil_media_send_datagram(1, one.as_ptr(), usize::MAX),
+            -1
+        );
+        assert_eq!(
+            crate::media_ffi::veil_media_send_video_control_datagram(1, one.as_ptr(), usize::MAX),
+            -1
+        );
+        assert_eq!(
+            crate::media_ffi::veil_media_dispatch_direct_datagram(
+                one.as_ptr(),
+                one.as_ptr(),
+                usize::MAX
+            ),
+            -1
+        );
+    }
+}
+
+#[cfg(feature = "node-embedded")]
+#[test]
+fn media_direct_ingress_reserves_the_sealed_cell_overhead() {
+    let peer = [0x93; 32];
+    let sealed_len = 65_535 + crate::media::MEDIA_SEAL_OVERHEAD;
+    let bytes = vec![0; sealed_len];
+    unsafe {
+        // Ingress admits the wire-sized buffer; an unregistered/unsealed cell
+        // is still dropped by the authenticated media dispatcher.
+        assert_eq!(
+            crate::media_ffi::veil_media_dispatch_direct_datagram(
+                peer.as_ptr(),
+                bytes.as_ptr(),
+                bytes.len()
+            ),
+            0
+        );
+        // Length rejection must precede any payload dereference.
+        assert_eq!(
+            crate::media_ffi::veil_media_dispatch_direct_datagram(
+                peer.as_ptr(),
+                bytes.as_ptr(),
+                sealed_len + 1
+            ),
+            -1
+        );
+    }
+}
+
 #[tokio::test]
 async fn close_before_stream_io_subscription_does_not_admit_ready_bytes() {
     let closed = tokio::sync::watch::Sender::new(false);

@@ -2331,6 +2331,13 @@ async fn handle_ipc_client(
     // Entered before `spawn_sem`, so one slow destination cannot hold the
     // whole pool (see `send_gates`).
     let destination_gates = Arc::new(crate::send_gates::DestinationGates::default());
+    // Includes jobs waiting at destination gates. The execution semaphore
+    // alone cannot bound bodies retained by tasks that have not entered it.
+    let queued_sends = Arc::new(tokio::sync::Semaphore::new(128));
+    static SEND_BYTES: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let send_bytes =
+        SEND_BYTES.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(64 * 1024 * 1024)));
     let mut lossy_cadence = crate::lossy_source_cadence::SourceCadence::default();
 
     // Push-event subscription. Subscribe once per IPC
@@ -2619,6 +2626,18 @@ async fn handle_ipc_client(
                                 // queue behind a send under any load.
                                 // Moved, not copied: the loop is done with
                                 // this buffer once the send owns it.
+                                let retained = body.len().saturating_add(batch.as_ref()
+                                    .map_or(0, |(bodies, _, _)| bodies.iter().map(Vec::len).sum()));
+                                let admission = crate::send_gates::admit_queued_send(
+                                    &queued_sends, send_bytes, retained);
+                                let Some(admission) = admission else {
+                                    crate::frame_io::write_frame_wh_id(
+                                        &mut wh, FrameFamily::LocalApp as u8,
+                                        LocalAppMsg::AppSendFailed as u16, 0,
+                                        &veil_proto::ipc::ipc_send_err::NO_ROUTE.to_be_bytes(),
+                                    ).await?;
+                                    continue;
+                                };
                                 let body_owned = body;
                                 // Only an authenticated, rate-accepted local source may
                                 // influence cadence. Expiry begins before any destination
@@ -2635,6 +2654,7 @@ async fn handle_ipc_client(
                                 let sem = Arc::clone(&spawn_sem);
                                 let gates = Arc::clone(&destination_gates);
                                 tokio::spawn(async move {
+                                    let _admission = admission;
                                     // The destination's own turn first, holding
                                     // no pool slot while it waits. A body that
                                     // does not decode takes no turn: the handler

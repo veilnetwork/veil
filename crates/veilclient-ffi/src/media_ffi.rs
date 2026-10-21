@@ -26,6 +26,9 @@
 // lesson `ratchet.rs` taught: a glob names whatever happens to be there, so
 // the default-feature build never has to agree with the all-features one.
 #[cfg(feature = "node-embedded")]
+const MAX_MEDIA_DATAGRAM_BYTES: usize = 65_535;
+
+#[cfg(feature = "node-embedded")]
 use super::*;
 
 #[cfg(feature = "node-embedded")]
@@ -1429,7 +1432,7 @@ pub extern "C" fn veil_media_channel_set_screen_sharing(chan: u64, on: c_int) ->
 #[cfg(feature = "node-embedded")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn veil_media_send_datagram(chan: u64, ptr: *const u8, len: size_t) -> c_int {
-    if chan == 0 || ptr.is_null() || len == 0 {
+    if chan == 0 || ptr.is_null() || len == 0 || len > MAX_MEDIA_DATAGRAM_BYTES {
         return -1;
     }
     // Clone only ingress, never the channel/keys/pump owner. No registry guard
@@ -1472,7 +1475,7 @@ pub unsafe extern "C" fn veil_media_send_video_control_datagram(
     ptr: *const u8,
     len: size_t,
 ) -> c_int {
-    if chan == 0 || ptr.is_null() || len == 0 {
+    if chan == 0 || ptr.is_null() || len == 0 || len > MAX_MEDIA_DATAGRAM_BYTES {
         return -1;
     }
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
@@ -1601,7 +1604,13 @@ pub unsafe extern "C" fn veil_media_dispatch_direct_datagram(
     ptr: *const u8,
     len: size_t,
 ) -> c_int {
-    if peer_node_id.is_null() || ptr.is_null() || len == 0 {
+    // Ingress carries a sealed cell, unlike the plaintext send API above.
+    // Reserve its header/tag so a maximum-sized admitted datagram can return.
+    if peer_node_id.is_null()
+        || ptr.is_null()
+        || len == 0
+        || len > MAX_MEDIA_DATAGRAM_BYTES + media::MEDIA_SEAL_OVERHEAD
+    {
         return -1;
     }
     let mut peer = [0u8; 32];

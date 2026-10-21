@@ -34,6 +34,10 @@ UNIT_PATH="/etc/systemd/system/veil-bootstrap.service"
 say()  { printf '\033[1;36m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
 fail() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# shellcheck source=bootstrap-paths.sh
+source "$(dirname "${BASH_SOURCE[0]}")/bootstrap-paths.sh"
+bootstrap_validate_targets "$DATA_DIR" "$VEIL_USER" || exit 1
+
 [[ "${EUID}" -eq 0 ]] || fail "run as root (needs systemd + /usr/local/bin + useradd)"
 [[ -n "${PUBLIC_IP}" ]] || fail "set PUBLIC_IP=<your advertised IP> before running"
 case "${ROLE}" in core|leaf) ;; *) fail "ROLE must be core or leaf";; esac
@@ -61,7 +65,7 @@ ensure_toolchain() {
         say "cargo present: $(cargo --version)"
         return
     fi
-    say "installing rustup + stable toolchain"
+    say "installing pinned rustup + repository toolchain"
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -y
         apt-get install -y build-essential pkg-config libssl-dev curl
@@ -72,12 +76,31 @@ ensure_toolchain() {
     else
         fail "unsupported distro — install build-essential + pkg-config + openssl-dev manually"
     fi
-    # Supply-chain note (audit U15): this bootstraps the Rust toolchain via the
-    # upstream rustup installer, pinned to HTTPS + TLS>=1.2. For high-assurance
-    # / production builds, prefer a pre-provisioned toolchain (or verify the
-    # rustup installer against a known SHA-256) rather than piping curl→sh — a
-    # compromised install transport could otherwise substitute the toolchain.
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+    # Official archived installer + checked-in digest; never execute a mutable
+    # download. Source: https://rust-lang.github.io/rustup/installation/other.html
+    local rustup_target rustup_sha installer rust_channel
+    case "$(uname -m)" in
+        x86_64) rustup_target=x86_64-unknown-linux-gnu
+            rustup_sha=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c ;;
+        aarch64|arm64) rustup_target=aarch64-unknown-linux-gnu
+            rustup_sha=e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c ;;
+        *) fail "unsupported bootstrap architecture; provision the repository toolchain manually" ;;
+    esac
+    rust_channel=$(sed -n 's/^channel = "\([0-9.]*\)"/\1/p' "${SRC_DIR}/rust-toolchain.toml")
+    [[ "$rust_channel" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "invalid repository toolchain pin"
+    installer=$(mktemp)
+    if ! curl --proto '=https' --tlsv1.2 -sSfL \
+        "https://static.rust-lang.org/rustup/archive/1.28.2/${rustup_target}/rustup-init" -o "$installer"; then
+        rm -f -- "$installer"; fail "rustup download failed"
+    fi
+    if ! printf '%s  %s\n' "$rustup_sha" "$installer" | sha256sum -c -; then
+        rm -f -- "$installer"; fail "rustup checksum mismatch"
+    fi
+    chmod 0700 "$installer"
+    if ! "$installer" -y --no-self-update --profile minimal --default-toolchain "$rust_channel"; then
+        rm -f -- "$installer"; fail "rustup installation failed"
+    fi
+    rm -f -- "$installer"
     # shellcheck disable=SC1091
     source "${HOME}/.cargo/env"
 }
@@ -105,6 +128,8 @@ ensure_system_user() {
             --home-dir "${DATA_DIR}" "${VEIL_USER}"
     fi
     install -d -m 0700 -o "${VEIL_USER}" -g "${VEIL_USER}" "${DATA_DIR}"
+    touch "${DATA_DIR}/.veil-bootstrap-managed"
+    chmod 0600 "${DATA_DIR}/.veil-bootstrap-managed"
 }
 
 # ── 4. Config ────────────────────────────────────────────────────────────────

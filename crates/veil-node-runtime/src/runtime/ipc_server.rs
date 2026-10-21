@@ -361,6 +361,15 @@ impl NodeRuntime {
             Arc::clone(&mlkem_ek_resolver),
             tokio::runtime::Handle::current(),
         ));
+        {
+            let resolver = Arc::clone(&dht_key_resolver);
+            *self
+                .dispatcher
+                .peer_cert_revalidate
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) =
+                Some(Arc::new(move |peer| resolver.refresh_local_document(*peer)));
+        }
         // The dispatcher already holds this; the send path needs the same one.
         let Some(ratchet_runtime) = self.dispatcher.crypto.ratchet.clone() else {
             unreachable!("the dispatcher is always built with a ratchet runtime")

@@ -1040,7 +1040,9 @@ pub unsafe extern "C" fn veil_free_string(s: *mut c_char) {
         return;
     }
     unsafe {
-        drop(CString::from_raw(s));
+        let owned = CString::from_raw(s);
+        let mut bytes = owned.into_bytes_with_nul();
+        zeroize::Zeroize::zeroize(&mut bytes);
     }
 }
 
@@ -3079,6 +3081,10 @@ pub unsafe extern "C" fn veil_seal(
         *out_buf = ptr::null_mut();
         *out_len = 0;
     }
+    if plaintext_len > VEIL_MAX_DATA_LEN {
+        unsafe { write_err(err_out, "AEAD input exceeds VEIL_MAX_DATA_LEN") };
+        return VEIL_ERR_INVALID_ARG;
+    }
     let pt: &[u8] = if plaintext_len == 0 {
         &[]
     } else {
@@ -3109,6 +3115,15 @@ pub unsafe extern "C" fn veil_unseal(
         *out_buf = ptr::null_mut();
         *out_len = 0;
     }
+    if ciphertext_len > VEIL_MAX_DATA_LEN + 16 {
+        unsafe {
+            write_err(
+                err_out,
+                "AEAD ciphertext exceeds plaintext limit plus authentication tag",
+            )
+        };
+        return VEIL_ERR_INVALID_ARG;
+    }
     let ct = unsafe { std::slice::from_raw_parts(ciphertext, ciphertext_len) };
     unsafe { aead_run(false, key, nonce, ct, out_buf, out_len, err_out) }
 }
@@ -3126,14 +3141,14 @@ unsafe fn aead_run(
 ) -> c_int {
     use chacha20poly1305::aead::{Aead, KeyInit};
     use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-    let mut key_arr = [0u8; 32];
-    let mut nonce_arr = [0u8; 24];
+    let mut key_arr = Zeroizing::new([0u8; 32]);
+    let mut nonce_arr = Zeroizing::new([0u8; 24]);
     unsafe {
         ptr::copy_nonoverlapping(key, key_arr.as_mut_ptr(), 32);
         ptr::copy_nonoverlapping(nonce, nonce_arr.as_mut_ptr(), 24);
     }
-    let cipher = XChaCha20Poly1305::new((&key_arr).into());
-    let xn = XNonce::from_slice(&nonce_arr);
+    let cipher = XChaCha20Poly1305::new((&*key_arr).into());
+    let xn = XNonce::from_slice(&*nonce_arr);
     let res = if seal {
         cipher.encrypt(xn, input)
     } else {
@@ -6548,6 +6563,10 @@ pub unsafe extern "C" fn veil_reissue_device_delegation_zeroize(
         }
     };
 
+    if !device_pubkey.is_null() && device_pubkey_len != 32 {
+        unsafe { write_err(err_out, "device public key must be exactly 32 bytes") };
+        return VEIL_ERR_INVALID_ARG;
+    }
     let device = if device_pubkey.is_null() || device_pubkey_len == 0 {
         None
     } else {
@@ -6698,6 +6717,10 @@ pub unsafe extern "C" fn veil_delegate_device_zeroize(
 
     // NULL means "my own key". Resolved here rather than left to the caller so
     // an application never has to load, carry or pass a signing key.
+    if !device_pubkey.is_null() && device_pubkey_len != 32 {
+        unsafe { write_err(err_out, "device public key must be exactly 32 bytes") };
+        return VEIL_ERR_INVALID_ARG;
+    }
     let pubkey: Vec<u8> = if device_pubkey.is_null() {
         match veil_identity::sovereign_flow::load_identity_sk(&dir) {
             Ok(seed) => ed25519_dalek::SigningKey::from_bytes(seed.as_array())
@@ -6884,6 +6907,10 @@ pub unsafe extern "C" fn veil_delegate_device_from_config_zeroize(
         Err(rc) => return rc,
     };
 
+    if !device_pubkey.is_null() && device_pubkey_len != 32 {
+        unsafe { write_err(err_out, "device public key must be exactly 32 bytes") };
+        return VEIL_ERR_INVALID_ARG;
+    }
     let pubkey: Vec<u8> = if device_pubkey.is_null() {
         match veil_identity::sovereign_flow::load_identity_sk(&dir) {
             Ok(seed) => ed25519_dalek::SigningKey::from_bytes(seed.as_array())

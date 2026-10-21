@@ -555,14 +555,23 @@ impl RuntimeMailboxCrypto {
                     .certs_for_instances(identity, &sovereign.document, &others, now)
                     .await
             }
-        } else if recipient_node_id == self.local_node_id {
-            ResolvedCerts::just(local_verified_cert(
+        } else if recipient_node_id == self.local_node_id || recipient_node_id == identity {
+            let others = other_instances(
+                sovereign.all_instance_entries(),
+                sovereign.active_instance_id(),
+            );
+            let mut family = self
+                .mlkem_resolver()
+                .certs_for_instances(identity, &sovereign.document, &others, now)
+                .await;
+            family.certs.push(local_verified_cert(
                 // Under the identity, like the published copy: the fan-out
                 // refuses any cert whose node id is not the recipient binding.
                 identity,
                 sovereign.active_instance_id(),
                 &self.mlkem_keys.current_seed(),
-            )?)
+            )?);
+            family
         } else if addressed_to_us {
             // The recipient is OUR OWN DEVICE, addressed by its transport id.
             // Everything it publishes — instance registry and per-instance
@@ -601,7 +610,7 @@ impl RuntimeMailboxCrypto {
                     );
                     self.mlkem_resolver()
                         .certs_for_instances(
-                            self.local_node_id,
+                            identity,
                             &sovereign.document,
                             std::slice::from_ref(&instance),
                             now,
@@ -833,23 +842,11 @@ impl veil_ipc::MailboxCryptoSink for RuntimeMailboxCrypto {
     ) -> Pin<Box<dyn Future<Output = veil_ipc::MailboxSealOutcome> + Send + 'a>> {
         Box::pin(async move {
             use veil_ipc::MailboxSealOutcome as O;
-            // A mailbox blob exists to reach ANOTHER MACHINE. Depositing one on
-            // a relay for ourselves would be a round trip to a copy we already
-            // hold -- the sender wrote it locally before asking for this. So at
-            // this boundary "seal to my own identity" can only mean the rest of
-            // my devices, and needs no flag from the caller to say so.
-            //
-            // The internal `seal` keeps addressing us alone; that path is the
-            // first-document operation, which is genuinely about this device.
-            // ANY device of ours, not just this one: the device-group
-            // broadcast addresses a sibling by its device id, and answering
-            // "is that us?" with a comparison against `local_node_id` alone
-            // sent every such deposit down the stranger path.
-            let audience = if self.addresses_our_identity(recipient_node_id) {
-                MailboxAudience::MyOtherDevices
-            } else {
-                MailboxAudience::Recipient
-            };
+            // This API seals bytes; it does not deposit them. Group epoch
+            // envelopes also address the local identity, including a device
+            // with no siblings yet. Excluding ourselves is a separate audience
+            // decision, never implied by the stable identity address.
+            let audience = MailboxAudience::Recipient;
             match self
                 .seal_for(audience, recipient_node_id, app_id, endpoint_id, &data)
                 .await
@@ -1312,21 +1309,20 @@ mod tests {
 
         let app_id = [0x42u8; 32];
         let payload = b"a sibling wrote this";
-        let blob = crypto
-            .seal(crypto.local_node_id, app_id, 3, payload)
-            .await
-            .expect("self-seal needs no DHT");
-
-        let auth = crypto
-            .open(&blob, LOCAL_MLKEM_CERT_VERSION)
-            .await
-            .expect("the recipient must verify the sender by its embedded document");
-        assert_eq!(auth.data, payload);
-        // And the author the app sees is the IDENTITY — the value the group
-        // layer keys everything by — never the transport key.
-        let doc_node_id = crypto.sovereign.get().unwrap().document.node_id;
-        assert_eq!(auth.sender_node_id, doc_node_id);
-        assert_ne!(auth.sender_node_id, crypto.local_node_id);
+        let identity = crypto.sovereign.get().unwrap().document.node_id;
+        for recipient in [crypto.local_node_id, identity] {
+            let blob = crypto
+                .seal(recipient, app_id, 3, payload)
+                .await
+                .expect("both local addresses self-seal without DHT");
+            let auth = crypto
+                .open(&blob, LOCAL_MLKEM_CERT_VERSION)
+                .await
+                .expect("embedded document verifies the sender");
+            assert_eq!(auth.data, payload);
+            assert_eq!(auth.sender_node_id, identity);
+            assert_ne!(auth.sender_node_id, crypto.local_node_id);
+        }
     }
 
     /// Past the overlap the retired seed is gone, and the blob fails CLOSED —

@@ -6,7 +6,12 @@
   },
   {
     "name": "quinn-proto",
-    "version": "0.11.15",
-    "registry_archive_sha256": "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
+    "version": "0.11.18",
+    "registry_archive_sha256": "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc"
+  },
+  {
+    "name": "quinn-udp",
+    "version": "0.5.14",
+    "registry_archive_sha256": "addec6a0dcad8a8d96a771f815f0eaf55f9d1805756410b39f5fa81332574cbd"
   }
 ]

@@ -1669,6 +1669,9 @@ pub struct AppIpcSendPayload {
 }
 
 impl AppIpcSendPayload {
+    /// Flags word in the stable local IPC wire layout.
+    pub const FLAGS_OFFSET: usize = 32 + 32 + 32 + 4;
+    pub const FLAGS_RANGE: std::ops::Range<usize> = Self::FLAGS_OFFSET..Self::FLAGS_OFFSET + 4;
     const FIXED_SIZE: usize = 32 + 32 + 32 + 4 + 4 + 4; // 108
 
     /// Encode to wire bytes.
@@ -1716,7 +1719,7 @@ impl AppIpcSendPayload {
         let src_app_id = super::read_array::<32>(buf, 32)?;
         let app_id = super::read_array::<32>(buf, 64)?;
         let endpoint_id = super::read_u32_be(buf, 96)?;
-        let flags = super::read_u32_be(buf, 100)?;
+        let flags = super::read_u32_be(buf, Self::FLAGS_OFFSET)?;
         let require_ack = flags & IPC_SEND_FLAG_REQUIRE_ACK != 0;
         let anonymous = flags & IPC_SEND_FLAG_ANONYMOUS != 0;
         let anonymous_authenticated = flags & IPC_SEND_FLAG_ANONYMOUS_AUTHENTICATED != 0;
