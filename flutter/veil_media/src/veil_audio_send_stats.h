@@ -28,6 +28,9 @@ struct RtpSendSnapshot {
   uint64_t payload_rtp_bytes = 0;
   uint32_t payload_timestamp = 0;
   bool payload_timestamp_valid = false;
+  // Admission failures of original media, excluding retransmission/padding.
+  // The WebRTC transport's local is_media flag supplies this distinction.
+  uint64_t source_dropped = 0;
 };
 
 // Endpoint-only observations, before and after local Veil queue admission.
@@ -93,7 +96,8 @@ class RtpSendStats {
 
   void reset_payload_clock() { payload_timestamp_.store(0, std::memory_order_relaxed); }
 
-  void mark_result(int64_t started_ns, int64_t now_ns, bool queued) {
+  void mark_result(int64_t started_ns, int64_t now_ns, bool queued,
+                   bool original_media = true) {
     if (started_ns <= 0 || now_ns < started_ns) return;
     raise(max_admission_ns_, now_ns - started_ns);
     if (queued) {
@@ -103,6 +107,7 @@ class RtpSendStats {
       // Count completed RTP failures directly. attempts - queued can include
       // a still-running admission; each stream uses its own counters.
       dropped_.fetch_add(1, std::memory_order_relaxed);
+      if (original_media) source_dropped_.fetch_add(1, std::memory_order_relaxed);
     }
   }
 
@@ -126,6 +131,7 @@ class RtpSendStats {
         payload_rtp_bytes_.load(std::memory_order_relaxed),
         uint32_t(payload_clock),
         (payload_clock >> 32) != 0,
+        source_dropped_.load(std::memory_order_relaxed),
     };
   }
 
@@ -141,6 +147,7 @@ class RtpSendStats {
   std::atomic<uint64_t> attempts_{0};
   std::atomic<uint64_t> queued_{0};
   std::atomic<uint64_t> dropped_{0};
+  std::atomic<uint64_t> source_dropped_{0};
   std::atomic<uint64_t> payload_packets_{0}, padding_packets_{0};
   std::atomic<uint64_t> payload_bytes_{0}, padding_bytes_{0}, unclassified_packets_{0};
   std::atomic<uint64_t> payload_rtp_bytes_{0};

@@ -11,10 +11,11 @@
 
 static std::vector<uint8_t> sent;
 static unsigned sends = 0;
+static int send_result = 0;
 extern "C" int veil_media_send_datagram(uint64_t, const uint8_t* p, size_t n) {
   sent.assign(p, p + n);
   ++sends;
-  return 0;
+  return send_result;
 }
 extern "C" int veil_media_send_video_control_datagram(uint64_t,
                                                       const uint8_t* p,
@@ -45,6 +46,29 @@ class AudioRecoveryFeedbackTest {
 }  // namespace veil_media
 int main() {
   using namespace veil_media;
+  {
+    VeilTransportShim source(199, nullptr, nullptr, nullptr, nullptr);
+    source.SetLocalVideoSsrc(33);
+    source.Start();
+    std::vector<uint8_t> rtp{0x80, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, 33, 7};
+    webrtc::PacketOptions options;
+    options.is_media = true;
+    require(source.SendRtp(rtp, options), "original RTP not admitted");
+    send_result = 1;
+    options.is_media = false;  // Real WebRTC excludes NACK repair and padding.
+    require(!source.SendRtp(rtp, options), "repair admission failure hidden");
+    auto snapshot = source.video_send_stats();
+    require(snapshot.dropped == 1 && snapshot.source_dropped == 0,
+            "repair failure counted as new original loss");
+    options.is_media = true;
+    rtp[3] = 2;
+    require(!source.SendRtp(rtp, options), "original admission failure hidden");
+    snapshot = source.video_send_stats();
+    require(snapshot.dropped == 2 && snapshot.source_dropped == 1,
+            "original admission failure not distinguished");
+    send_result = 0;
+    source.Stop();
+  }
   webrtc::rtcp::ReceiverReport rr;
   rr.SetSenderSsrc(22);
   const auto bytes = rr.Build();
