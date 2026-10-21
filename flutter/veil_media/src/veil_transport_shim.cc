@@ -291,7 +291,8 @@ bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
   if (audio_ingress_diagnostics_ && video)
     video_loss_trace_.Rtp(packet, local_video_ssrc_.load(), 's', started_ns/1000, rc);
   if (video)
-    video_send_stats_.mark_result(started_ns, webrtc::TimeMicros() * 1000, rc == 0);
+    video_send_stats_.mark_result(started_ns, webrtc::TimeMicros() * 1000,
+                                  rc == 0, options.is_media);
   if (audio) {
     const int64_t admitted_us = webrtc::TimeMicros();
     audio_send_stats_.mark_result(started_ns, admitted_us * 1000, rc == 0);

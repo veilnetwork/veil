@@ -36,7 +36,7 @@ int main() {
   s = stats.snapshot(2010 * ms);
   assert(s.attempts == 2 && s.queued == 1 && s.age_ms == 10 && s.queue_age_ms == 1008);
   assert(s.max_gap_ms == 1000 && s.max_admission_ms == 5);
-  assert(s.dropped == 1);
+  assert(s.dropped == 1 && s.source_dropped == 1);
   assert(stats.snapshot(100 * ms).age_ms == -1);  // no fresh-looking clock reversal
 
   // Padding probes must not renew the encoded-audio clock. Include a CSRC,
@@ -87,9 +87,10 @@ int main() {
   std::vector<uint8_t> probe(packet.begin(), packet.end());
   probe[0] = 0xa0; probe.back() = 1;
   assert(video.mark_attempt(probe, ssrc, 3100 * ms, 96));
-  video.mark_result(3100 * ms, 3102 * ms, false);
+  video.mark_result(3100 * ms, 3102 * ms, false, false);
   auto v = video.snapshot(3110 * ms);
   assert(v.attempts == 2 && v.queued == 1 && v.dropped == 1);
+  assert(v.source_dropped == 0);
   assert(v.payload_packets == 1 && v.padding_packets == 1);
   assert(v.payload_bytes == 1 && v.padding_bytes == 1);
   assert(v.payload_rtp_bytes == packet.size());
