@@ -1086,8 +1086,10 @@ struct WebrtcState {
   std::unique_ptr<VeilVideoSink> local_video_sink;         // self-preview
   webrtc::VideoSendStream* video_send_stream = nullptr;              // owned by Call
   webrtc::VideoReceiveStreamInterface* video_recv_stream = nullptr;  // owned by Call
+#if defined(VEIL_MEDIA_TEST_HOOKS)
   std::thread test_video_thread;         // synthetic source (VEIL_MEDIA_TEST_VIDEO)
   std::atomic<bool> test_video_run{false};
+#endif
   std::unique_ptr<veil_media::CameraCapturer> camera;  // real capture source
   std::unique_ptr<veil_media::ScreenCapturer> screen;  // screen-share source
   int video_target_bitrate_bps = 0;
@@ -1203,8 +1205,10 @@ struct GroupWebrtcState {
   std::unique_ptr<veil_media::AdaptiveVideoSource> video_source;
   std::unique_ptr<VeilVideoSink> local_video_sink;
   webrtc::VideoSendStream* video_send_stream = nullptr;
+#if defined(VEIL_MEDIA_TEST_HOOKS)
   std::thread test_video_thread;
   std::atomic<bool> test_video_run{false};
+#endif
   int video_target_bitrate_bps = 0;
   std::atomic<double> video_max_fps{0};
   std::atomic<bool> video_send_paused{false};
@@ -2481,10 +2485,12 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
       const bool prepared = ws->prepared_video_bps > 0;
       const double initial_fps = prepared ? ws->prepared_video_fps : 1;
       int kbps = prepared ? ws->prepared_video_bps / 1000 : 30;
+#if defined(VEIL_MEDIA_TEST_HOOKS)
       if (const char* value = std::getenv("VEIL_MEDIA_VIDEO_KBPS")) {
         const int configured = std::atoi(value);
         if (configured > 0) kbps = configured;
       }
+#endif
       kbps = std::clamp(kbps, prepared ? 1 : 30, 2500);
       const int bps = kbps * 1000;
       ws->video_frame_budget->SetProfile(bps);
@@ -2526,6 +2532,7 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
   }
   engine->video_running.store(true);
 
+#if defined(VEIL_MEDIA_TEST_HOOKS)
   if (std::getenv("VEIL_MEDIA_TEST_VIDEO") != nullptr &&
       !ws->test_video_run.load()) {
     ws->test_video_run.store(true);
@@ -2551,6 +2558,7 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
       }
     });
   }
+#endif
   vlog("group video: started peers=%zu ssrc=%u", ws->peers.size(),
        local_ssrc);
   return VEIL_MEDIA_OK;
@@ -2570,10 +2578,12 @@ static int veil_media_group_engine_apply_video_budget(VeilGroupMediaEngine* engi
   int rc = VEIL_MEDIA_ERR_STATE;
   const bool scheduled = veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&] {
     int kbps = max_bitrate_kbps > 0 ? max_bitrate_kbps : 150;
+#if defined(VEIL_MEDIA_TEST_HOOKS)
     if (const char* value = std::getenv("VEIL_MEDIA_VIDEO_KBPS")) {
       const int configured = std::atoi(value);
       if (configured > 0) kbps = configured;
     }
+#endif
     kbps = std::clamp(kbps, minimum_kbps, 2500);
     const double fps = std::clamp(max_fps, 0.02, 60.0);
     const int bps = kbps * 1000;
@@ -3043,8 +3053,10 @@ int veil_media_group_engine_stop_video(VeilGroupMediaEngine* engine) {
     ws->screen->Stop();
     ws->screen.reset();
   }
+#if defined(VEIL_MEDIA_TEST_HOOKS)
   if (ws->test_video_run.exchange(false) && ws->test_video_thread.joinable())
     ws->test_video_thread.join();
+#endif
   if (ws->video_call) {
     if (!run_on(ws->video_worker_tq.get(), [&]() {
           if (ws->video_send_stream) {
@@ -3617,12 +3629,14 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
 
       // The caller selects a route-aware budget: direct P2P can spend more,
       // while the onion fallback stays conservative even though several RTP
-      // packets now share each padded cell. (VEIL_MEDIA_VIDEO_KBPS overrides.)
+      // packets now share each padded cell.
       int kbps = max_bitrate_kbps > 0 ? max_bitrate_kbps : 150;
+#if defined(VEIL_MEDIA_TEST_HOOKS)
       if (const char* e = std::getenv("VEIL_MEDIA_VIDEO_KBPS")) {
         int v = std::atoi(e);
         if (v > 0) kbps = v;
       }
+#endif
       kbps = std::clamp(kbps, 30, 2500);
       const int fps = std::clamp(max_fps > 0 ? max_fps : 15, 1, 60);
       const int bps = kbps * 1000;
@@ -3687,6 +3701,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
   vlog("video: start send=%d recv=%d ssrc(local=%u remote=%u)", send, recv,
        local_v, remote_v);
 
+#if defined(VEIL_MEDIA_TEST_HOOKS)
   // Built-in synthetic source (VEIL_MEDIA_TEST_VIDEO) — a moving gradient at
   // ~30fps into the broadcaster, so video RTP flows without a real capturer.
   if (send && std::getenv("VEIL_MEDIA_TEST_VIDEO") != nullptr &&
@@ -3712,6 +3727,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
       }
     });
   }
+#endif
   return VEIL_MEDIA_OK;
 #else
   (void)send;
@@ -3738,13 +3754,15 @@ static int veil_media_engine_apply_video_budget(VeilMediaEngine* engine,
   // host retries the latest budget. Work that already started is waited out.
   (void)veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&]() {
     if (ws->video_send_stream == nullptr) return;
-    // The explicit debug pin wins. Low rates are a sender policy; capture
+    // Low rates are a sender policy; capture
     // remains live and every route/relay sees the same opaque media bytes.
     int kbps = max_bitrate_kbps > 0 ? max_bitrate_kbps : 150;
+#if defined(VEIL_MEDIA_TEST_HOOKS)
     if (const char* e = std::getenv("VEIL_MEDIA_VIDEO_KBPS")) {
       int v = std::atoi(e);
       if (v > 0) kbps = v;
     }
+#endif
     kbps = std::clamp(kbps, minimum_kbps, 2500);
     const double fps = std::clamp(max_fps, 0.02, 60.0);
     const int bps = kbps * 1000;
@@ -3863,8 +3881,10 @@ int veil_media_engine_stop_video(VeilMediaEngine* engine) {
     ws->screen->Stop();
     ws->screen.reset();
   }
+#if defined(VEIL_MEDIA_TEST_HOOKS)
   if (ws->test_video_run.exchange(false) && ws->test_video_thread.joinable())
     ws->test_video_thread.join();
+#endif
   if (ws->video_call) {
     if (!run_on(ws->video_worker_tq.get(), [&]() {
           if (ws->video_send_stream) {
