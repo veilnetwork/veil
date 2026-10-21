@@ -408,7 +408,8 @@ class GroupFanoutTransport : public webrtc::Transport {
       const int rc = veil_media_send_datagram(chan, packet.data(), packet.size());
       const bool sent = rc == 0;
       if (video)
-        video_stats_.mark_result(began_ns, webrtc::TimeMicros() * 1000, sent);
+        video_stats_.mark_result(began_ns, webrtc::TimeMicros() * 1000,
+                                 sent, options.is_media);
       if (video)
         video_send_trace_.Rtp(packet, video_ssrc_, 's', began_ns / 1000, rc, chan);
       if (audio_send_trace_.enabled())
@@ -3006,7 +3007,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               ",\"video_tx_payload_counter_scope\":\"fanout_attempts\"" +
               ",\"video_tx_payload_bytes\":" + std::to_string(video_send.payload_bytes) +
               ",\"video_tx_padding_bytes\":" + std::to_string(video_send.padding_bytes) +
-              ",\"video_tx_rtp_drops\":" + std::to_string(video_send.dropped);
+              ",\"video_tx_rtp_drops\":" + std::to_string(video_send.dropped) +
+              ",\"video_tx_source_rtp_drops\":" + std::to_string(video_send.source_dropped);
   snapshot += ",\"audio_peer_recovery_report_us\":" +
       std::to_string(peer_audio_recovery_report_us);
   snapshot += ",\"audio_peer_recovery_peers\":" + std::to_string(peer_audio_recovery_peers);
@@ -4757,6 +4759,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
       snapshot += ",\"video_tx_unclassified_pkts\":" + std::to_string(video_send.unclassified_packets);
       snapshot += ",\"video_tx_rtp_admission_max_ms\":" + std::to_string(video_send.max_admission_ms);
       snapshot += ",\"video_tx_rtp_drops\":" + std::to_string(video_send.dropped);
+      snapshot += ",\"video_tx_source_rtp_drops\":" + std::to_string(video_send.source_dropped);
       snapshot += ",\"audio_rx_foreign_remb_blocks\":" + std::to_string(ws->shim->foreign_remb_blocks(false));
       snapshot += ",\"video_rx_foreign_remb_blocks\":" + std::to_string(ws->shim->foreign_remb_blocks(true));
       snapshot += ",\"audio_packetization_video_hold\":" +
