@@ -16,10 +16,11 @@ impl NodeServices {
             veil_session::glue::SessionTxBroadcaster::new(self.session_tx_registry.clone())
                 .with_sessions(self.session_registry.clone());
         let mut peers = if relayed {
-            veil_ipc::source_paths::sealed_relay_hops(
+            veil_ipc::source_paths::sealed_relay_hops_for_source(
                 peer,
                 Some(&self.dispatcher.route_cache),
                 &registry,
+                local_lane,
             )
         } else {
             let devices = registry.devices_of(peer);

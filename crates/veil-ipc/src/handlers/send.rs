@@ -1718,6 +1718,12 @@ pub(crate) async fn handle_ipc_send(
                 .await;
                 ordinary_relay_hops(discovered, &send.dst_node_id, route_cache, reg, will_seal)
             };
+            let source_lane =
+                if relay_wire_realtime && local_priority == veil_proto::priority::INTERACTIVE {
+                    veil_proto::header::priority::REALTIME
+                } else {
+                    local_priority
+                };
             let mut forced_relay_hops = without_other_devices(
                 forced_relay_hops,
                 reg,
@@ -1725,12 +1731,13 @@ pub(crate) async fn handle_ipc_send(
                 sealed_for,
                 &|device| device_instance(ctx, device),
             );
-            // An origin may choose a generic datagram link over an ordered
-            // stream that stalls behind reliable writes. Preserve route order
-            // within each transport group and all existing fallback hops.
+            // Preserve working source channels when discovery changes cached
+            // hop order. Negotiated generic datagrams alone do not prove an
+            // independent source child is ready. Keep all fallback hops and
+            // route order within equal readiness/transport groups.
             // This does not change relay policy or independent-flow consent.
             if relay_media_sealed {
-                crate::source_paths::prefer_datagrams(&mut forced_relay_hops, reg);
+                crate::source_paths::prefer_ready_sources(&mut forced_relay_hops, reg, source_lane);
             }
             if !forced_relay_hops.is_empty() {
                 use veil_proto::delivery::DeliveryEnvelope;
@@ -2159,13 +2166,6 @@ pub(crate) async fn handle_ipc_send(
                     // Only legacy media calls use the default primary slot.
                     // Compatibility control retains its local signaling slot,
                     // just like the per-device copies above.
-                    let source_lane = if relay_wire_realtime
-                        && local_priority == veil_proto::priority::INTERACTIVE
-                    {
-                        veil_proto::header::priority::REALTIME
-                    } else {
-                        local_priority
-                    };
                     let packetized = if relay_control_compat {
                         send_packetized_control(
                             reg,
@@ -6286,6 +6286,91 @@ mod ratchet_send_tests {
                 codec::decode_header(&sent[0].1).unwrap().priority(),
                 veil_proto::priority::INTERACTIVE
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_source_keeps_ready_alternatives_when_cached_hops_are_warming() {
+        use veil_types::LocalDatagramChannelState as State;
+        const WARM: [u8; 32] = [0xB8; 32];
+        const READY_A: [u8; 32] = [0xBA; 32];
+        const READY_B: [u8; 32] = [0xBB; 32];
+        struct Sources(Arc<Outbox>, u8);
+        impl FrameBroadcaster for Sources {
+            fn local_datagram_channel_state(&self, peer: &[u8; 32], lane: u8) -> State {
+                assert_eq!(lane, self.1, "readiness must match the actual local source");
+                if *peer == READY_A || *peer == READY_B {
+                    State::Ready
+                } else {
+                    State::Warming
+                }
+            }
+            fn has_neutral_forward_datagram_transport(&self, _: &[u8; 32]) -> bool {
+                true
+            }
+            fn send_to(&self, peer: &[u8; 32], priority: u8, frame: Vec<u8>) -> bool {
+                assert_eq!(priority, self.1);
+                // Mirrors ingress which accepts a frame even when its
+                // independent child is not ready to send it yet.
+                self.0.send_to(peer, priority, frame)
+            }
+            fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {
+                panic!("no broadcast")
+            }
+            fn active_node_ids(&self) -> Vec<[u8; 32]> {
+                self.0.active_node_ids()
+            }
+        }
+        for (lane, expected) in [
+            (veil_proto::priority::REALTIME, vec![READY_A, READY_B]),
+            (veil_proto::priority::BULK, vec![READY_A]),
+            (veil_proto::priority::INTERACTIVE, vec![READY_A]),
+        ] {
+            let fx = fixture(vec![RELAY, WARM, READY_A, READY_B]);
+            {
+                let mut cache = wlock!(fx.route_cache);
+                cache.insert(PEER, RELAY, 10000, 1);
+                cache.insert(PEER, WARM, 10000, 2);
+                cache.insert(PEER, READY_A, 10000, 3);
+                cache.insert(PEER, READY_B, 10000, 4);
+            }
+            let mut ctx = fx.ctx(false);
+            ctx.local_priority = lane;
+            let source_lane = if lane == veil_proto::priority::INTERACTIVE {
+                veil_proto::priority::REALTIME
+            } else {
+                lane
+            };
+            ctx.session_tx_registry = Some(Arc::new(Sources(fx.outbox.clone(), source_lane)));
+            let mut sealed = veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC.to_vec();
+            sealed.resize(128, 0xA5);
+            let mut body = payload_to(PEER, &sealed);
+            let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+                | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
+            body[veil_proto::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(&flags.to_be_bytes());
+            let mut wh = sink().await;
+            handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+                .await
+                .unwrap();
+            let sent = fx.taken();
+            assert_eq!(
+                sent.iter().map(|(hop, _)| *hop).collect::<Vec<_>>(),
+                expected
+            );
+            let mut replay_id = None;
+            for (_, frame) in sent {
+                let header = codec::decode_header(&frame).unwrap();
+                assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+                let fwd =
+                    veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                        .unwrap();
+                assert_eq!(fwd.envelope.payload, sealed);
+                assert!(!fwd.envelope.require_ack);
+                if let Some(id) = replay_id {
+                    assert_eq!(fwd.envelope.content_id, id);
+                }
+                replay_id = Some(fwd.envelope.content_id);
+            }
         }
     }
 
