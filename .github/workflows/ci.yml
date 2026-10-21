@@ -48,6 +48,10 @@ jobs:
     # checks are fast (<2 min combined on cached cargo).
     name: Hygiene (fmt + clippy)
     runs-on: ubuntu-latest
+    # Match the check step's warning policy during clippy too. Otherwise Cargo
+    # rebuilds the entire native dependency graph for the second flag set.
+    env:
+      RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
