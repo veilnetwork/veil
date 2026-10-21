@@ -104,3 +104,25 @@ fn a_local_budget_limits_real_packets_and_survives_a_route_reset() {
         "retained inspection handles do not prolong the participant"
     );
 }
+
+#[test]
+fn a_budget_installed_before_handshake_retires_crypto_flight() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let client = pair.begin_connect(client_config());
+    let budget = Arc::new(Budget::default());
+    assert!(
+        pair.client_conn_mut(client)
+            .set_local_send_budget(budget.clone())
+    );
+    pair.drive();
+    let _server = pair.server.assert_accept();
+    assert!(!pair.client_conn_mut(client).is_handshaking());
+    assert!(budget.peak.load(Ordering::SeqCst) > 0);
+    assert_eq!(pair.client_conn_mut(client).bytes_in_flight(), 0);
+    assert_eq!(
+        budget.flight.load(Ordering::SeqCst),
+        0,
+        "retired Initial/Handshake packets cannot leave phantom source debt"
+    );
+}

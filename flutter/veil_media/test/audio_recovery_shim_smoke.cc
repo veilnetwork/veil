@@ -210,6 +210,12 @@ int main() {
   const auto delivery = sender.video_delivery_json(video_now + 10);
   require(delivery.find("\"frames\":1") != std::string::npos,
           "decoded video delivery report missing");
+  require(delivery.find("\"sent_timestamp_valid\":false") != std::string::npos,
+          "an unstarted source invented a timestamp watermark");
+  const auto zero_clock = sender.video_delivery_json(video_now + 10, 0, 1200, true);
+  require(zero_clock.find("\"sent_timestamp_valid\":true") != std::string::npos &&
+          zero_clock.find("\"sent_timestamp\":0") != std::string::npos,
+          "a valid zero RTP clock was confused with an unstarted source");
   AudioRecoveryFeedbackTest::Observe(sender, video_compound, video_now + 20);
   require(sender.video_delivery_json(video_now + 20) == delivery,
           "replayed delivery renewed freshness");

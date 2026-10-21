@@ -566,17 +566,20 @@ void VeilTransportShim::SetLocalVideoDelivery(uint32_t remote, uint64_t bytes,
   }
 }
 std::string VeilTransportShim::video_delivery_json(int64_t now,
-    uint32_t source_timestamp, uint64_t source_bytes) const {
+    uint32_t source_timestamp, uint64_t source_bytes, bool source_timestamp_valid) const {
   if (!started_.load(std::memory_order_acquire)) return "{}";
   const auto sent = video_send_stats();
   std::lock_guard lock(audio_feedback_mu_);
+  const bool supplied = source_bytes || source_timestamp_valid;
+  const bool clock_valid = supplied ? source_timestamp_valid : sent.payload_timestamp_valid;
   auto json = peer_video_delivery_.Json(now,
-      source_bytes ? source_timestamp : sent.payload_timestamp,
-      source_bytes ? source_bytes : sent.payload_bytes);
+      supplied ? source_timestamp : sent.payload_timestamp,
+      supplied ? source_bytes : sent.payload_bytes);
   if (json != "{}") {
     json.pop_back();
     json += ",\"route_epoch\":" + std::to_string(rtcp_route_clock_.epoch()) +
-        ",\"source_epoch\":" + std::to_string(video_source_epoch_) + "}";
+        ",\"source_epoch\":" + std::to_string(video_source_epoch_) +
+        ",\"sent_timestamp_valid\":" + (clock_valid ? "true" : "false") + "}";
   }
   return json;
 }

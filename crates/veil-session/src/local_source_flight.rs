@@ -24,6 +24,9 @@ pub(crate) enum Role {
 struct Row {
     binding: Weak<Binding>,
     role: Role,
+    // Factories bind before the handshake; this becomes true only when a
+    // trusted local producer selects the connection for actual source work.
+    source_coupled: bool,
     flight: u64,
     mtu: u16,
     used: Instant,
@@ -67,6 +70,7 @@ struct State {
     preparing: bool,
     turn_waiters: HashMap<u64, Waker>,
     last_trace: Option<Instant>,
+    last_secondary_trace: Option<Instant>,
     delivery_diagnostics: DeliveryDiagnostics,
 }
 #[derive(Debug, Default)]
@@ -77,6 +81,7 @@ impl State {
         let reserve = self.reserve(now);
         self.rows.values().any(|r| {
             r.role == Role::Secondary
+                && r.source_coupled
                 && r.closed_until.is_none()
                 && r.blocked_window.is_some_and(|(at, used, reserved)| {
                     used == window
@@ -119,6 +124,36 @@ impl State {
             .saturating_sub(self.window_reserve.saturating_sub(self.reserve(now)))
             .max(self.floor(now))
     }
+    // A node-wide control ledger is not a measurement of a short media path.
+    // DHT/keepalive connections on other RTTs can keep more control bytes in
+    // flight than the paid source window, indefinitely preventing even a
+    // secondary probe. Fresh healthy primary feedback permits ONLY the same
+    // shared two-MTU trial already present in the floor. Coupled secondary
+    // debt still debits it, including abandoned source work. Primary flight
+    // remains charged in the ordinary ledger, but healthy primary BDP must
+    // not consume this finite additional trial on a longer-RTT path.
+    // Prewarmed secondary handshakes have not carried a local producer yet;
+    // they stay in the ordinary ledger, rather than starving a real probe.
+    // Control debt remains in the ordinary ledger; it cannot consume this
+    // finite trial, whether its connection is live or has just closed.
+    // This allowance is not stored/ACK-banked as a larger paid window.
+    fn healthy_secondary_probe(&self, now: Instant) -> Option<u64> {
+        if !self.healthy_until.is_some_and(|until| now < until)
+            || self.pressure_until.is_some_and(|until| now < until)
+            || self.growth_hold_until.is_some_and(|until| now < until)
+        {
+            return None;
+        }
+        let mtu = u64::from(self.rows.values().map(|r| r.mtu).max().unwrap_or(1200));
+        let charged = self
+            .rows
+            .values()
+            .filter(|r| r.role == Role::Secondary && r.source_coupled)
+            .map(|r| r.flight)
+            .fold(0, u64::saturating_add);
+        Some((2 * mtu).saturating_sub(charged))
+    }
+
     fn wakers(&self) -> Vec<Waker> {
         self.rows.values().filter_map(|r| r.waker.clone()).collect()
     }
@@ -225,6 +260,24 @@ impl SourceFlightPool {
                         state.delivery_diagnostics,
                         state.window,
                         state.window_reserve,
+                        state
+                            .rows
+                            .values()
+                            .filter(|r| r.role == Role::Primary)
+                            .map(|r| r.flight)
+                            .sum::<u64>(),
+                        state
+                            .rows
+                            .values()
+                            .filter(|r| r.role == Role::Control)
+                            .map(|r| r.flight)
+                            .sum::<u64>(),
+                        state
+                            .rows
+                            .values()
+                            .filter(|r| r.role == Role::Secondary)
+                            .map(|r| r.flight)
+                            .sum::<u64>(),
                     ))
                 } else {
                     None
@@ -241,10 +294,13 @@ impl SourceFlightPool {
                 d,
                 stored_window,
                 stored_reserve,
+                primary_flight,
+                control_flight,
+                secondary_flight,
             )) = snapshot
             {
                 log::info!(target: "veil::source_flight",
-                    "connection_trace_id={id} members={members} in_flight_bytes={flight} window_bytes={window} primary_control_reserve_bytes={reserve} stored_window_bytes={stored_window} stored_reserve_bytes={stored_reserve} scope=endpoint hold_observations={} ack_held={} healthy={healthy} pressured={pressured} credit_bytes={credit} ack_calls={} ack_stale={} ack_inactive={} ack_unhealthy={} ack_pressured={} ack_no_demand={} ack_funded_bytes={} ack_credit_wait={} ack_rtt_wait={} window_grows={} blocked_calls={} drained_witnesses={}",
+                    "connection_trace_id={id} members={members} in_flight_bytes={flight} primary_flight_bytes={primary_flight} control_flight_bytes={control_flight} secondary_flight_bytes={secondary_flight} window_bytes={window} primary_control_reserve_bytes={reserve} stored_window_bytes={stored_window} stored_reserve_bytes={stored_reserve} scope=endpoint hold_observations={} ack_held={} healthy={healthy} pressured={pressured} credit_bytes={credit} ack_calls={} ack_stale={} ack_inactive={} ack_unhealthy={} ack_pressured={} ack_no_demand={} ack_funded_bytes={} ack_credit_wait={} ack_rtt_wait={} window_grows={} blocked_calls={} drained_witnesses={}",
                     d.hold_observations, d.held, d.calls, d.stale, d.inactive, d.unhealthy, d.pressured, d.no_demand,
                     d.funded_bytes, d.credit_wait, d.rtt_wait, d.grows, d.blocked, d.drained);
             }
@@ -254,12 +310,22 @@ impl SourceFlightPool {
     pub(crate) fn factory(self: &Arc<Self>, role: Role) -> veil_transport::LocalSendBudgetFactory {
         let pool = self.clone();
         Arc::new(move |id| -> Arc<dyn LocalSendBudget> {
-            pool.binding(id, role, Instant::now())
+            pool.binding_for_source(id, role, Instant::now(), false)
                 .expect("fresh local connection ordinal")
         })
     }
 
     fn binding(self: &Arc<Self>, id: u64, role: Role, now: Instant) -> Option<Arc<Binding>> {
+        self.binding_for_source(id, role, now, true)
+    }
+
+    fn binding_for_source(
+        self: &Arc<Self>,
+        id: u64,
+        role: Role,
+        now: Instant,
+        source_coupled: bool,
+    ) -> Option<Arc<Binding>> {
         let mut s = lock!(self.0);
         s.prune(now);
         if let Some(row) = s.rows.get_mut(&id) {
@@ -267,6 +333,7 @@ impl SourceFlightPool {
                 return None;
             }
             row.used = row.used.max(now);
+            row.source_coupled |= source_coupled;
             return row.binding.upgrade();
         }
         let binding = Arc::new(Binding {
@@ -278,6 +345,7 @@ impl SourceFlightPool {
             Row {
                 binding: Arc::downgrade(&binding),
                 role,
+                source_coupled,
                 flight: 0,
                 mtu: 1200,
                 used: now,
@@ -335,7 +403,16 @@ impl LocalSendBudget for Binding {
         };
         row.mtu = mtu;
         row.observed = row.observed.max(now);
-        let (role, flight) = (row.role, row.flight);
+        // An unselected secondary still needs its bounded control handshake;
+        // it neither earns nor spends the shared live-source trial.
+        let secondary = row.role == Role::Secondary;
+        let source_coupled = row.source_coupled;
+        let role = if secondary && !source_coupled {
+            Role::Control
+        } else {
+            row.role
+        };
+        let flight = row.flight;
         // The pool regulates competing work. The primary keeps its ordinary
         // QUIC controller: older secondary debt (or a former route's primary
         // flight) must not impose an additional pause on fresh audio. Its REAL
@@ -347,6 +424,9 @@ impl LocalSendBudget for Binding {
         let mut available = limit.saturating_sub(s.total());
         if role == Role::Secondary {
             available = available.saturating_sub(s.reserve(now));
+            if let Some(probe) = s.healthy_secondary_probe(now) {
+                available = available.max(probe);
+            }
         } else if role == Role::Control {
             let primary_reserve = s
                 .rows
@@ -362,7 +442,32 @@ impl LocalSendBudget for Binding {
                 .saturating_sub(primary_reserve)
                 .max(u64::from(mtu).saturating_sub(flight));
         }
-        path_flight.saturating_add(available).saturating_add(1)
+        let window = path_flight.saturating_add(available).saturating_add(1);
+        let trace = if secondary
+            && available < u64::from(mtu)
+            && crate::rt_trace::rt_trace_enabled()
+            && s.last_secondary_trace
+                .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(1))
+        {
+            s.last_secondary_trace = Some(now);
+            Some(format!(
+                "connection_trace_id={} effective_role={role:?} source_coupled={source_coupled} path_flight_bytes={path_flight} ledger_flight_bytes={flight} available_bytes={available} window_bytes={window} ordinary_limit_bytes={limit} total_flight_bytes={} reserve_bytes={} probe_bytes={} healthy={} pressured={} held={} scope=endpoint",
+                self.id,
+                s.total(),
+                s.reserve(now),
+                s.healthy_secondary_probe(now).unwrap_or(0),
+                s.healthy_until.is_some_and(|t| now < t),
+                s.pressure_until.is_some_and(|t| now < t),
+                s.growth_hold_until.is_some_and(|t| now < t)
+            ))
+        } else {
+            None
+        };
+        drop(s);
+        if let Some(trace) = trace {
+            log::info!(target: "veil::source_flight", "secondary_blocked {trace}");
+        }
+        window
     }
     fn update_flight(&self, bytes: u64) {
         let wakers = {
@@ -393,7 +498,7 @@ impl LocalSendBudget for Binding {
         }
         if s.rows
             .get(&self.id)
-            .is_some_and(|r| r.role == Role::Secondary)
+            .is_some_and(|r| r.role == Role::Secondary && r.source_coupled)
         {
             let reserve = s.reserve(now);
             s.delivery_diagnostics.blocked = s.delivery_diagnostics.blocked.saturating_add(1);
@@ -919,5 +1024,129 @@ mod tests {
             "closed control bytes still debit the correctly scoped window"
         );
         assert_eq!(primary.window(now, 0, 1200), u64::MAX);
+    }
+    #[test]
+    fn healthy_probe_survives_live_background_control_flight_but_not_pressure() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let primary = pool.binding(1, Role::Primary, now).unwrap();
+        let video = pool.binding(2, Role::Secondary, now).unwrap();
+        let screen = pool.binding(3, Role::Secondary, now).unwrap();
+        let controls: Vec<_> = (4..18)
+            .map(|id| {
+                let row = pool.binding(id, Role::Control, now).unwrap();
+                row.update_flight(2400);
+                row
+            })
+            .collect();
+        pool.note_primary(now);
+        primary.update_flight(200);
+        assert_eq!(
+            video.window(now, 0, 1200),
+            1,
+            "unknown primary cannot earn a probe"
+        );
+        pool.feedback(false, now);
+        assert_eq!(video.window(now, 0, 1200), 2401);
+        video.update_flight(1200);
+        assert_eq!(
+            screen.window(now, 0, 1200),
+            1201,
+            "the trial is shared, not per connection"
+        );
+        video.update_flight(2400);
+        assert_eq!(screen.window(now, 0, 1200), 1);
+        assert_eq!(primary.window(now, 200, 1200), u64::MAX);
+        video.update_flight(0);
+        primary.update_flight(120000);
+        assert_eq!(
+            video.window(now, 0, 1200),
+            2401,
+            "healthy audio BDP cannot erase or enlarge the fixed video trial"
+        );
+        let paid = lock!(pool.0).window;
+        assert_eq!(paid, 0, "temporary trial did not manufacture paid growth");
+        pool.feedback(true, now);
+        assert_eq!(
+            video.window(now, 0, 1200),
+            1,
+            "measured pressure stops the exception"
+        );
+        pool.feedback(false, now);
+        assert_eq!(
+            video.window(now, 0, 1200),
+            1,
+            "healthy feedback cannot erase a pressure lease"
+        );
+        drop(controls);
+    }
+
+    #[test]
+    fn healthy_probe_charges_abandoned_secondary_and_cannot_outlive_its_feedback() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let primary = pool.binding(1, Role::Primary, now).unwrap();
+        let video = pool.binding(2, Role::Secondary, now).unwrap();
+        let retired_video = pool.binding(3, Role::Secondary, now).unwrap();
+        let background = pool.binding(4, Role::Control, now).unwrap();
+        let retired_control = pool.binding(5, Role::Control, now).unwrap();
+        background.update_flight(24000);
+        retired_control.update_flight(24000);
+        retired_control.closed();
+        retired_video.update_flight(1200);
+        retired_video.closed();
+        primary.update_flight(200);
+        pool.note_primary(now);
+        pool.feedback(false, now);
+        assert_eq!(video.window(now, 0, 1200), 1201);
+        pool.hold_growth(now + Duration::from_millis(500), now);
+        assert_eq!(video.window(now, 0, 1200), 1);
+        let later = now + IDLE_GRACE;
+        pool.note_primary(later);
+        assert_eq!(
+            video.window(later, 0, 1200),
+            1,
+            "expiry is not a new healthy observation"
+        );
+    }
+    #[test]
+    fn prewarmed_secondary_handshakes_cannot_consume_the_live_source_trial() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let primary = pool.binding(1, Role::Primary, now).unwrap();
+        let video = pool.binding(2, Role::Secondary, now).unwrap();
+        let prewarm = pool.factory(Role::Secondary)(3);
+        prewarm.update_flight(24000);
+        primary.update_flight(200);
+        pool.note_primary(now);
+        pool.feedback(false, now);
+        assert_eq!(video.window(now, 0, 1200), 2401);
+        assert_eq!(
+            prewarm.window(now, 24000, 1200),
+            24001,
+            "a handshake cannot spend the shared source trial"
+        );
+        prewarm.blocked(now);
+        {
+            let state = lock!(pool.0);
+            assert!(!state.demanded(now, state.limit(now)));
+        }
+        let source = pool.binding(3, Role::Secondary, now).unwrap();
+        assert_eq!(
+            video.window(now, 0, 1200),
+            1,
+            "selecting a real source charges its existing flight immediately"
+        );
+        source.closed();
+        assert_eq!(
+            video.window(now, 0, 1200),
+            1,
+            "closing/reconnecting cannot erase actual source debt"
+        );
+        assert_eq!(
+            lock!(pool.0).window,
+            0,
+            "handshakes did not manufacture paid video growth"
+        );
     }
 }
