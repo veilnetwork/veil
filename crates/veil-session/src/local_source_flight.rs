@@ -130,15 +130,18 @@ impl State {
     // A node-wide control ledger is not a measurement of a short media path.
     // DHT/keepalive connections on other RTTs can keep more control bytes in
     // flight than the paid source window, indefinitely preventing even a
-    // secondary probe. Fresh healthy primary feedback permits ONLY the same
-    // shared two-MTU trial already present in the floor. Coupled secondary
-    // debt still debits it, including abandoned source work. Primary flight
-    // remains charged in the ordinary ledger, but healthy primary BDP must
-    // not consume this finite additional trial on a longer-RTT path.
+    // secondary probe. Fresh healthy primary feedback permits the shared
+    // usable source window: the initial two-MTU trial plus growth already
+    // paid for by real demand and delivery. Keeping this exception fixed at
+    // two MTUs would make that earned growth unusable behind control debt.
+    // Retired control reserve cannot become paid source capacity (limit()
+    // removes it). Coupled secondary debt still debits the allowance, including
+    // abandoned source work. Primary flight remains charged in the ordinary
+    // ledger, but healthy primary BDP must not erase this finite source window.
     // Prewarmed secondary handshakes have not carried a local producer yet;
     // they stay in the ordinary ledger, rather than starving a real probe.
     // Control debt remains in the ordinary ledger; it cannot consume this
-    // finite trial, whether its connection is live or has just closed.
+    // allowance, whether its connection is live or has just closed.
     // A growth hold may retain the previously permitted limit until its
     // original deadline, without increasing it or banking a paid window.
     fn secondary_trial_limit(&self, now: Instant) -> Option<u64> {
@@ -155,7 +158,11 @@ impl State {
             return None;
         }
         let mtu = u64::from(self.rows.values().map(|r| r.mtu).max().unwrap_or(1200));
-        Some(2 * mtu)
+        Some(
+            self.limit(now)
+                .saturating_sub(self.reserve(now))
+                .max(2 * mtu),
+        )
     }
 
     fn healthy_secondary_probe(&self, now: Instant) -> Option<u64> {
@@ -1128,6 +1135,88 @@ mod tests {
         );
         assert_eq!(primary.window(now, 0, 1200), u64::MAX);
     }
+    #[test]
+    fn healthy_paid_growth_is_usable_behind_unrelated_control_flight() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let _primary = pool.binding(1, Role::Primary, now).unwrap();
+        let control = pool.binding(2, Role::Control, now).unwrap();
+        let video = pool.binding(3, Role::Secondary, now).unwrap();
+        let screen = pool.binding(4, Role::Secondary, now).unwrap();
+        control.update_flight(100_000);
+        pool.note_primary(now);
+        pool.feedback(false, now);
+        assert_eq!(video.window(now, 0, 1200), 2401);
+        video.blocked(now);
+        video.delivered(now, now, 2400, Duration::from_millis(100));
+        assert_eq!(
+            video.window(now, 0, 1200),
+            3601,
+            "ACK-funded growth must not remain an unusable two-packet trial"
+        );
+        video.update_flight(2400);
+        assert_eq!(screen.window(now, 0, 1200), 1201, "one shared paid limit");
+        video.closed();
+        assert_eq!(
+            screen.window(now, 0, 1200),
+            1201,
+            "closed source debt remains"
+        );
+        pool.feedback(true, now);
+        assert_eq!(
+            screen.window(now, 0, 1200),
+            1,
+            "actual pressure overrides growth"
+        );
+    }
+
+    #[test]
+    fn paid_source_allowance_cannot_bank_control_ack_or_grow_during_hold() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let _primary = pool.binding(1, Role::Primary, now).unwrap();
+        let control = pool.binding(2, Role::Control, now).unwrap();
+        let video = pool.binding(3, Role::Secondary, now).unwrap();
+        control.update_flight(100_000);
+        pool.note_primary(now);
+        pool.feedback(false, now);
+        control.delivered(now, now, 100_000, Duration::from_millis(100));
+        assert_eq!(video.window(now, 0, 1200), 2401, "no demand, no growth");
+        video.blocked(now);
+        video.delivered(now, now, 2400, Duration::from_millis(100));
+        assert_eq!(video.window(now, 0, 1200), 3601);
+        let held = now + Duration::from_secs(1);
+        let until = now + Duration::from_secs(2);
+        pool.hold_growth(until, held);
+        assert_eq!(video.window(held, 0, 1200), 3601);
+        video.blocked(held);
+        video.delivered(held, held, 100_000, Duration::from_millis(100));
+        assert_eq!(
+            video.window(held, 0, 1500),
+            3601,
+            "hold cannot earn growth or reprice its MTU"
+        );
+        pool.hold_growth(until, held + Duration::from_millis(1));
+        assert_eq!(
+            video.window(held, 0, 1500),
+            3601,
+            "replay cannot enlarge the cap"
+        );
+        assert_eq!(
+            video.window(until, 0, 1500),
+            1,
+            "expired hold is not positive feedback"
+        );
+        pool.feedback(false, until);
+        assert_eq!(video.window(until, 0, 1500), 3601);
+        video.route_changed();
+        assert_eq!(
+            video.window(until, 0, 1500),
+            1,
+            "new route earns its own window"
+        );
+    }
+
     #[test]
     fn healthy_probe_survives_live_background_control_flight_but_not_pressure() {
         let now = Instant::now();
