@@ -1737,6 +1737,8 @@ pub(crate) async fn handle_ipc_send(
             // route order within equal readiness/transport groups.
             // This does not change relay policy or independent-flow consent.
             if relay_media_sealed {
+                crate::source_paths::prefer_datagrams(&mut forced_relay_hops, reg);
+                crate::source_paths::warm_preferred_sources(&forced_relay_hops, reg, source_lane);
                 crate::source_paths::prefer_ready_sources(&mut forced_relay_hops, reg, source_lane);
             }
             if !forced_relay_hops.is_empty() {
@@ -6295,30 +6297,59 @@ mod ratchet_send_tests {
         const WARM: [u8; 32] = [0xB8; 32];
         const READY_A: [u8; 32] = [0xBA; 32];
         const READY_B: [u8; 32] = [0xBB; 32];
-        struct Sources(Arc<Outbox>, u8);
+        struct Sources {
+            outbox: Arc<Outbox>,
+            lane: u8,
+            preferred_ready: std::sync::atomic::AtomicBool,
+            requests: Mutex<Vec<[u8; 32]>>,
+        }
         impl FrameBroadcaster for Sources {
             fn local_datagram_channel_state(&self, peer: &[u8; 32], lane: u8) -> State {
-                assert_eq!(lane, self.1, "readiness must match the actual local source");
-                if *peer == READY_A || *peer == READY_B {
+                assert_eq!(
+                    lane, self.lane,
+                    "readiness must match the actual local source"
+                );
+                if *peer == READY_A
+                    || *peer == READY_B
+                    || self
+                        .preferred_ready
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     State::Ready
                 } else {
                     State::Warming
                 }
             }
+            fn supports_local_datagram_preparation(&self) -> bool {
+                true
+            }
+            fn prepare_local_datagram_channel(
+                &self,
+                peer: &[u8; 32],
+                lane: u8,
+                refresh: bool,
+            ) -> State {
+                assert!(
+                    !refresh,
+                    "make-before-break cannot clear an existing ready lease"
+                );
+                self.requests.lock().unwrap().push(*peer);
+                self.local_datagram_channel_state(peer, lane)
+            }
             fn has_neutral_forward_datagram_transport(&self, _: &[u8; 32]) -> bool {
                 true
             }
             fn send_to(&self, peer: &[u8; 32], priority: u8, frame: Vec<u8>) -> bool {
-                assert_eq!(priority, self.1);
+                assert_eq!(priority, self.lane);
                 // Mirrors ingress which accepts a frame even when its
                 // independent child is not ready to send it yet.
-                self.0.send_to(peer, priority, frame)
+                self.outbox.send_to(peer, priority, frame)
             }
             fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {
                 panic!("no broadcast")
             }
             fn active_node_ids(&self) -> Vec<[u8; 32]> {
-                self.0.active_node_ids()
+                self.outbox.active_node_ids()
             }
         }
         for (lane, expected) in [
@@ -6341,7 +6372,13 @@ mod ratchet_send_tests {
             } else {
                 lane
             };
-            ctx.session_tx_registry = Some(Arc::new(Sources(fx.outbox.clone(), source_lane)));
+            let sources = Arc::new(Sources {
+                outbox: fx.outbox.clone(),
+                lane: source_lane,
+                preferred_ready: std::sync::atomic::AtomicBool::new(false),
+                requests: Mutex::new(vec![]),
+            });
+            ctx.session_tx_registry = Some(sources.clone());
             let mut sealed = veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC.to_vec();
             sealed.resize(128, 0xA5);
             let mut body = payload_to(PEER, &sealed);
@@ -6371,6 +6408,28 @@ mod ratchet_send_tests {
                 }
                 replay_id = Some(fwd.envelope.content_id);
             }
+            assert_eq!(
+                *sources.requests.lock().unwrap(),
+                vec![RELAY, WARM],
+                "warm preferred cached routes, not only the already-ready fallback"
+            );
+            sources
+                .preferred_ready
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+                .await
+                .unwrap();
+            let next = fx.taken();
+            let preferred = if lane == veil_proto::priority::REALTIME {
+                vec![RELAY, WARM]
+            } else {
+                vec![RELAY]
+            };
+            assert_eq!(
+                next.iter().map(|(hop, _)| *hop).collect::<Vec<_>>(),
+                preferred,
+                "promote the preferred routes only after they become ready"
+            );
         }
     }
 
