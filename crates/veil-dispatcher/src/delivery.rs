@@ -1745,6 +1745,11 @@ impl FrameDispatcher {
             terminal_sender_provenance(&deliver_sender_node_id, peer_id, is_meta_e2e);
         let provenance = if decrypted.sender_proven {
             SenderProvenance::Signed
+        } else if decrypted_app_sender.is_some_and(|identity| identity != deliver_sender_node_id) {
+            // A live session proves its physical peer, not that a historical
+            // ratchet context still delegates that device to this identity.
+            // Never upgrade an unproven identity rebind via SessionPeer.
+            SenderProvenance::Claimed
         } else {
             transport_provenance
         };
@@ -2006,17 +2011,8 @@ impl FrameDispatcher {
                     // decrypted forever as Claimed and the app correctly
                     // refused them. Ask for the signed device certificate,
                     // without trusting this ciphertext's claimed identity.
-                    if !opened.authenticated
-                        && let Some((instance, _)) = veil_e2e::payload_instances(&envelope.payload)
-                    {
-                        let warmer = self
-                            .peer_cert_warm
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .clone();
-                        if let Some(warm) = warmer {
-                            warm(ratchet_peer, instance);
-                        }
+                    if !opened.authenticated {
+                        self.warm_ratchet_sender(ratchet_peer, &envelope.payload);
                     }
                     return Some(DecryptedForward {
                         payload: opened.plaintext,
@@ -2028,6 +2024,9 @@ impl FrameDispatcher {
                     });
                 }
                 Err(e) => {
+                    if matches!(&e, veil_e2e::RatchetSpliceError::PrologueRefused(_)) {
+                        self.warm_ratchet_sender(ratchet_peer, &envelope.payload);
+                    }
                     // Not a peer protocol violation: a conversation whose state
                     // the host has not restored yet, or a device of ours the
                     // frame was not addressed to, look exactly like this.
@@ -4451,6 +4450,47 @@ mod ratchet_terminal_tests {
         assert!(provenance.is_authenticated());
     }
 
+    #[test]
+    fn a_direct_device_session_cannot_authorize_an_unproven_identity_rebind() {
+        const DEVICE: [u8; 32] = [0xAD; 32];
+        struct HistoricalBinding;
+        impl veil_types::SessionInstanceLookup for HistoricalBinding {
+            fn session_instance(&self, _: &[u8; 32]) -> Option<[u8; 16]> {
+                None
+            }
+            fn own_device_pairing(&self, device: &[u8; 32]) -> Option<veil_types::SessionPairing> {
+                (*device == DEVICE).then_some(veil_types::SessionPairing {
+                    identity: ALICE,
+                    instance: [0xA3; 16],
+                })
+            }
+        }
+        let (alice, bob) = (party(ALICE, 0xA3), party(BOB, 0xB3));
+        let (disp, _h, mut rx) = dispatcher_for(&bob);
+        *disp.sender_identity_lookup.write().unwrap() = Some(Arc::new(HistoricalBinding));
+        for verified in [false, true] {
+            if verified {
+                learn(&bob, &alice);
+            }
+            let payload = seal(&alice, &bob, b"device claim");
+            let (hdr, mut body) = forward_frame([if verified { 2 } else { 1 }; 32], payload);
+            let at = body.windows(32).position(|w| w == ALICE).unwrap();
+            body[at..at + 32].copy_from_slice(&DEVICE);
+            disp.dispatch(&hdr, &body, NodeId::from(DEVICE));
+            let (src, provenance, data) = take(&mut rx).expect("readable payload");
+            assert_eq!(src, ALICE);
+            assert_eq!(data, b"device claim");
+            assert_eq!(
+                provenance,
+                if verified {
+                    SenderProvenance::Signed
+                } else {
+                    SenderProvenance::Claimed
+                }
+            );
+        }
+    }
+
     /// A relayed envelope names the sending DEVICE; the ratchet was sealed
     /// under its IDENTITY. For a device that does not boot on its master key
     /// the two differ, and opening under the device failed every frame — a
@@ -4702,6 +4742,59 @@ mod ratchet_terminal_tests {
             None,
             "certificate verification does not bless the relay as a route"
         );
+    }
+
+    #[test]
+    fn a_refused_unproven_prologue_requests_certificate_without_resetting_the_chain() {
+        fn deliver(disp: &FrameDispatcher, direct: bool, id: u8, payload: Vec<u8>) {
+            if direct {
+                let body = veil_proto::app::AppSendPayload {
+                    src_app_id: [0xA1; 32],
+                    app_id: APP,
+                    endpoint_id: ENDPOINT,
+                    data: veil_bufpool::pooled_shared_from_vec(payload),
+                }
+                .encode();
+                let mut hdr = veil_proto::header::FrameHeader::new(
+                    veil_proto::family::FrameFamily::App as u8,
+                    veil_proto::family::AppMsg::AppSendSealed as u16,
+                );
+                hdr.body_len = body.len() as u32;
+                disp.dispatch(&hdr, &body, NodeId::from(ALICE));
+            } else {
+                let (hdr, body) = forward_frame([id; 32], payload);
+                disp.dispatch(&hdr, &body, NodeId::from(RELAY));
+            }
+        }
+        for direct in [false, true] {
+            let (alice, bob) = (party(ALICE, 0xA3), party(BOB, 0xB3));
+            let (disp, _handle, mut rx) = dispatcher_for(&bob);
+            deliver(&disp, direct, 0x31, seal(&alice, &bob, b"old context"));
+            assert_eq!(take(&mut rx).unwrap().2, b"old context");
+            let restarted = party(ALICE, 0xA3);
+            let payload = seal(&restarted, &bob, b"after restart");
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = Arc::clone(&requests);
+            *disp.peer_cert_warm.lock().unwrap() = Some(Arc::new(move |peer, instance| {
+                captured.lock().unwrap().push((peer, instance));
+            }));
+            deliver(&disp, direct, 0x32, payload.clone());
+            assert!(
+                take(&mut rx).is_none(),
+                "unknown authorship cannot replace a held chain"
+            );
+            assert_eq!(
+                *requests.lock().unwrap(),
+                vec![(ALICE, restarted.instance_id)]
+            );
+            assert_eq!(bob.runtime.peer_entry_authenticated(&ALICE), Some(false));
+            learn(&bob, &restarted);
+            deliver(&disp, direct, 0x33, payload);
+            let (_, provenance, body) = take(&mut rx).expect("verified retry can recover");
+            assert_eq!(provenance, SenderProvenance::Signed);
+            assert_eq!(body, b"after restart");
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
     }
 
     /// A frame that dropped its post-quantum leg is not delivered at all.
@@ -4976,9 +5069,9 @@ mod ratchet_terminal_tests {
             };
             assert_eq!(src_node_id, ALICE);
             assert_eq!(data.as_ref(), b"after restart");
-            // Bob's outbound answer resolved Alice's certificate through seal_for
-            // even when no receive-side certificate was cached beforehand.
-            assert_eq!(provenance, SenderProvenance::Signed);
+            // A stored conversation preserves decryption, not current authority.
+            // The runtime verifier must resolve the sender after this restart.
+            assert_eq!(provenance, SenderProvenance::Claimed);
             assert_eq!(
                 origin_device, None,
                 "neither the outer claim nor the context proves a device"
@@ -5047,7 +5140,7 @@ mod ratchet_terminal_tests {
             panic!("expected Deliver")
         };
         assert_eq!(src_node_id, ALICE);
-        assert_eq!(provenance, SenderProvenance::Signed);
+        assert_eq!(provenance, SenderProvenance::Claimed);
         assert_eq!(data.as_ref(), b"pending prologue after restart");
         assert_eq!(
             origin_device, None,

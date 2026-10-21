@@ -639,7 +639,12 @@ impl Entry {
         {
             self.authenticated_until = self.authenticated_until.max(until);
         }
-        let authenticated = self.is_authenticated(now_unix);
+        // A persisted authorization deadline is historical evidence. A device
+        // may have been revoked while this receiver was offline. Require the
+        // current verified certificate cache as well; missing/evicted evidence
+        // decrypts as unproven until the bounded runtime verifier replenishes it.
+        let authenticated = self.is_authenticated(now_unix)
+            && peer_devices.is_some_and(|d| d.contains(sender_instance, &self.peer_ik, now_unix));
         let device = if authenticated {
             peer_devices.and_then(|d| d.device_for_key(sender_instance, &self.peer_ik, now_unix))
         } else {
@@ -2378,6 +2383,22 @@ impl PeerDeviceKeys {
             .and_then(|entry| entry.device)
     }
 
+    /// A verified certificate for this exact instance AND physical device.
+    /// A session's old delegation alone must not authorize an identity alias.
+    #[must_use]
+    pub fn proves_instance_device(
+        &self,
+        instance: &[u8; 16],
+        device: &[u8; 32],
+        now_unix: u64,
+    ) -> bool {
+        self.keys.iter().any(|entry| {
+            &entry.instance == instance
+                && entry.device.as_ref() == Some(device)
+                && now_unix <= entry.valid_until
+        })
+    }
+
     /// Whether an unexpired verified certificate names this instance.
     #[must_use]
     pub fn names_instance(&self, instance: &[u8; 16], now_unix: u64) -> bool {
@@ -2675,6 +2696,10 @@ mod tests {
         let a_pk = a.ratchet_pk();
         let mut published = PeerDeviceKeys::default();
         published.remember_with_device(a.instance_id, a_pk, NOW + 5, Some(transport));
+        assert!(published.proves_instance_device(&a.instance_id, &transport, NOW));
+        assert!(!published.proves_instance_device(&[0; 16], &transport, NOW));
+        assert!(!published.proves_instance_device(&a.instance_id, &[0; 32], NOW));
+        assert!(!published.proves_instance_device(&a.instance_id, &transport, NOW + 6));
         let (ek, pk) = (b.ek(), b.ratchet_pk());
         let payload = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"proof", NOW)
             .unwrap()
@@ -2721,7 +2746,10 @@ mod tests {
             NOW,
         )
         .unwrap();
-        assert!(opened.authenticated);
+        assert!(
+            !opened.authenticated,
+            "a held deadline cannot authorize a key absent from current verified evidence"
+        );
         assert_eq!(opened.sender_device_id, None);
     }
 
@@ -2929,8 +2957,15 @@ mod tests {
         let outside = reply(NOW + 1);
 
         // Inside: proven, as it always was.
-        let opened =
-            open(&a.store, &a.me(), &b.node_id, &inside, None, expires - 1).expect("A opens");
+        let opened = open(
+            &a.store,
+            &a.me(),
+            &b.node_id,
+            &inside,
+            Some(&dev(b.instance_id, &b.ratchet_pk())),
+            expires - 1,
+        )
+        .expect("A opens");
         assert!(
             opened.authenticated,
             "premise: a live certificate proves the peer"
@@ -2944,6 +2979,44 @@ mod tests {
             !opened.authenticated,
             "a device kept its proven standing after its certificate expired"
         );
+    }
+
+    #[test]
+    fn a_held_authorization_cannot_replace_current_sender_certificate_evidence() {
+        let a = device(1);
+        let b = device(2);
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        let initial = seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"initial", NOW)
+            .expect("A seals from a verified B cert")
+            .0;
+        open(
+            &b.store,
+            &b.me(),
+            &a.node_id,
+            &initial,
+            Some(&dev(a.instance_id, &a.ratchet_pk())),
+            NOW,
+        )
+        .unwrap();
+        let evidence = dev(b.instance_id, &b.ratchet_pk());
+        let empty = PeerDeviceKeys::default();
+        for (index, current, expected) in [
+            (0, None, false),
+            (1, Some(&empty), false),
+            (2, Some(&evidence), true),
+        ] {
+            let (ek, pk) = (a.ek(), a.ratchet_pk());
+            let reply = seal(&b.store, &b.me(), keys(&a, &ek, &pk), &[index], NOW + 1)
+                .unwrap()
+                .0;
+            let opened = open(&a.store, &a.me(), &b.node_id, &reply, current, NOW + 1)
+                .expect("ciphertext remains readable");
+            assert_eq!(opened.plaintext, vec![index]);
+            assert_eq!(
+                opened.authenticated, expected,
+                "historical proof must not override missing current device evidence"
+            );
+        }
     }
 
     /// And it survives a restart the same way, because the stamp is what is

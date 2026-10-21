@@ -130,6 +130,21 @@ impl FrameDispatcher {
         );
     }
 
+    /// Request bounded certificate verification, never authorize from a claim.
+    pub(crate) fn warm_ratchet_sender(&self, sender: [u8; 32], payload: &[u8]) {
+        let Some((instance, _)) = veil_e2e::payload_instances(payload) else {
+            return;
+        };
+        let warm = self
+            .peer_cert_warm
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(warm) = warm {
+            warm(sender, instance);
+        }
+    }
+
     pub fn dispatch_app(
         &self,
         header: &FrameHeader,
@@ -169,6 +184,48 @@ impl FrameDispatcher {
             }
         };
 
+        if sender != *node_id.as_bytes()
+            && matches!(
+                msg,
+                AppMsg::AppSend | AppMsg::AppSendChunk | AppMsg::AppRtData | AppMsg::AppOpen
+            )
+        {
+            let instance = self.session_registry.as_deref().and_then(|reg| {
+                lock!(reg)
+                    .get_by_peer_id(&node_id)
+                    .and_then(|entry| entry.validated_sovereign_identity.as_ref())
+                    .map(|identity| identity.active_instance_id)
+            });
+            let authorized = instance.is_some_and(|instance| {
+                self.crypto
+                    .ratchet
+                    .as_ref()
+                    .and_then(|ratchet| ratchet.peer_devices(&sender))
+                    .is_some_and(|keys| {
+                        keys.proves_instance_device(
+                            &instance,
+                            node_id.as_bytes(),
+                            veil_util::unix_secs_now_u64(),
+                        )
+                    })
+            });
+            if !authorized {
+                if let Some(instance) = instance {
+                    let warm = self
+                        .peer_cert_warm
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
+                    if let Some(warm) = warm {
+                        warm(sender, instance);
+                    }
+                }
+                // These ingress forms expose only session evidence. Do not
+                // turn a stale handshake delegation into application identity
+                // authority. Reliable logical sends retry after verification.
+                return DispatchResult::NoResponse;
+            }
+        }
         match msg {
             AppMsg::AppData => {
                 let payload = match AppDataPayload::decode(body) {
@@ -381,15 +438,18 @@ impl FrameDispatcher {
                 let now_unix = veil_util::unix_secs_now_u64();
                 match ratchet.open_payload(&sender, &payload.data, now_unix) {
                     Ok(opened) => {
-                        // `SessionPeer` is the floor, not the answer: the frame
-                        // did arrive on an authenticated session with this
-                        // peer, so even an unmatched device key leaves us
-                        // knowing that much. Opening under a session keyed to
-                        // the key that peer published is strictly more.
+                        // The session identifies its physical peer. A cached
+                        // delegation from its handshake cannot authorize an
+                        // identity rebind after a receiver restart/revocation.
+                        if !opened.authenticated {
+                            self.warm_ratchet_sender(sender, &payload.data);
+                        }
                         let provenance = if opened.authenticated {
                             veil_app::registry::SenderProvenance::Signed
-                        } else {
+                        } else if sender == *node_id.as_bytes() {
                             veil_app::registry::SenderProvenance::SessionPeer
+                        } else {
+                            veil_app::registry::SenderProvenance::Claimed
                         };
                         // The session peer is the device that sealed it and
                         // is waiting for the answer (see `origin_device`).
@@ -404,6 +464,13 @@ impl FrameDispatcher {
                         );
                     }
                     Err(e) => {
+                        // A retained unproven chain cannot accept a replacement
+                        // prologue until the sender's current key is verified.
+                        // Waiting for a successful open to warm that key would
+                        // leave both sides retrying this refusal indefinitely.
+                        if matches!(&e, veil_e2e::RatchetSpliceError::PrologueRefused(_)) {
+                            self.warm_ratchet_sender(sender, &payload.data);
+                        }
                         // Not a violation: a conversation the host has not
                         // restored yet looks exactly like this, and so does a
                         // frame for another of our devices.
@@ -848,7 +915,10 @@ mod tests {
         );
     }
 
-    fn ratchet_runtime(node_id: [u8; 32], instance: [u8; 16]) -> veil_e2e::RatchetRuntime {
+    pub(super) fn ratchet_runtime(
+        node_id: [u8; 32],
+        instance: [u8; 16],
+    ) -> veil_e2e::RatchetRuntime {
         let (ek, dk) = veil_e2e::generate_keypair();
         veil_e2e::RatchetRuntime {
             store: Arc::new(veil_e2e::RatchetStore::new()),
@@ -1211,10 +1281,135 @@ mod sender_identity_tests {
     }
 
     #[test]
+    fn sealed_identity_rebind_requires_current_device_evidence_and_requests_it() {
+        use std::sync::Arc;
+        let us = [0xBB; 32];
+        let instance = [0xCC; 16];
+        let sender = super::tests::ratchet_runtime(IDENTITY, instance);
+        let receiver = super::tests::ratchet_runtime(us, [0x0B; 16]);
+        let ring = Arc::clone(&receiver.seed_ring.read().unwrap());
+        let keys = Arc::clone(&receiver.peer_ratchet_keys);
+        let mut disp = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        disp.crypto = Arc::new(crate::CryptoContext {
+            ratchet: Some(receiver),
+            ..(*disp.crypto).clone()
+        });
+        disp.session_registry = Some(Arc::new(Mutex::new(registry_with(Some(IDENTITY)))));
+        let (app, endpoint) = ([0xBC; 32], 9);
+        let (_handle, mut rx) = disp.app_registry.register(app, endpoint, 16);
+        let warmed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&warmed);
+        *disp.peer_cert_warm.lock().unwrap() = Some(Arc::new(move |peer, instance| {
+            captured.lock().unwrap().push((peer, instance));
+        }));
+        for verified in [false, true] {
+            if verified {
+                let pk = sender.seed_ring.read().unwrap().current_ratchet_pk();
+                keys.write()
+                    .unwrap()
+                    .entry(IDENTITY)
+                    .or_default()
+                    .remember_with_device(instance, pk, u64::MAX, Some(DEVICE));
+            }
+            let ek = ring.current_ek();
+            let pk = ring.current_ratchet_pk();
+            let sealed = sender
+                .seal_for(
+                    veil_e2e::PeerRatchetKeys {
+                        node_id: &us,
+                        instance_id: &[0x0B; 16],
+                        mlkem_ek: &ek,
+                        ratchet_pk: &pk,
+                        authorized_until_unix: u64::MAX,
+                    },
+                    b"sealed device claim",
+                    veil_util::unix_secs_now_u64(),
+                )
+                .unwrap()
+                .0;
+            let body = AppSendPayload {
+                src_app_id: app,
+                app_id: app,
+                endpoint_id: endpoint,
+                data: veil_bufpool::pooled_shared_from_vec(sealed),
+            }
+            .encode();
+            let mut header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppSendSealed as u16);
+            header.body_len = body.len() as u32;
+            disp.dispatch(&header, &body, DEVICE);
+            match rx.try_recv().expect("ciphertext remains readable") {
+                veil_app::registry::AppMessage::Deliver {
+                    src_node_id,
+                    provenance,
+                    data,
+                    ..
+                } => {
+                    assert_eq!(src_node_id, IDENTITY);
+                    assert_eq!(data.as_ref(), b"sealed device claim");
+                    assert_eq!(
+                        provenance,
+                        if verified {
+                            veil_proto::SenderProvenance::Signed
+                        } else {
+                            veil_proto::SenderProvenance::Claimed
+                        }
+                    );
+                }
+                other => panic!("expected delivery, got {other:?}"),
+            }
+        }
+        assert_eq!(*warmed.lock().unwrap(), vec![(IDENTITY, instance)]);
+    }
+
+    #[test]
+    fn an_old_session_delegation_cannot_open_an_identity_stream_without_current_evidence() {
+        let mut disp = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        disp.session_registry = Some(std::sync::Arc::new(Mutex::new(registry_with(Some(
+            IDENTITY,
+        )))));
+        let app_id = [0xCC; 32];
+        let (_handle, mut rx) = disp.app_registry.register(app_id, 9, 16);
+        let warmed = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let captured = std::sync::Arc::clone(&warmed);
+        *disp.peer_cert_warm.lock().unwrap() = Some(std::sync::Arc::new(move |peer, instance| {
+            captured.lock().unwrap().push((peer, instance));
+        }));
+        let body = AppOpenPayload {
+            app_id,
+            endpoint_id: 9,
+            flags: 0,
+        }
+        .encode();
+        let mut header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppOpen as u16);
+        header.body_len = body.len() as u32;
+        header.stream_id = 41;
+        disp.dispatch(&header, &body, DEVICE);
+        assert!(
+            rx.try_recv().is_err(),
+            "the endpoint must not see an unconfirmed identity"
+        );
+        assert_eq!(*warmed.lock().unwrap(), vec![(IDENTITY, [0xCC; 16])]);
+    }
+
+    #[test]
     fn stream_open_keeps_device_route_and_proved_identity_separate() {
         for identity in [Some(IDENTITY), None] {
             let mut disp = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
             disp.session_registry = Some(std::sync::Arc::new(Mutex::new(registry_with(identity))));
+            if identity.is_some() {
+                let runtime = super::tests::ratchet_runtime([0xBB; 32], [0x0B; 16]);
+                runtime
+                    .peer_ratchet_keys
+                    .write()
+                    .unwrap()
+                    .entry(IDENTITY)
+                    .or_default()
+                    .remember_with_device([0xCC; 16], [0x11; 32], u64::MAX, Some(DEVICE));
+                disp.crypto = std::sync::Arc::new(crate::CryptoContext {
+                    ratchet: Some(runtime),
+                    ..(*disp.crypto).clone()
+                });
+            }
             let app_id = [0xCC; 32];
             let (_handle, mut rx) = disp.app_registry.register(app_id, 9, 16);
             let body = AppOpenPayload {
