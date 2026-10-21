@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Update rustls-webpki to 0.103.16 and webpki-roots to 1.0.10 in application
+  and fuzz lockfiles, addressing RUSTSEC-2026-0382 and RUSTSEC-2026-0381
+  certificate-verification and trust-store advisories.
 - Retire warm authorization for revoked devices when a newer signed identity
   document arrives; notify connected verifiers when the local identity changes.
 - Seal relay delivery for the intended device instance and resolve complete
