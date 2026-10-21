@@ -260,7 +260,7 @@ impl LocalSourceActivity {
             .is_some_and(|at| now.saturating_duration_since(at) < IDLE_GRACE)
     }
 
-    /// Only a locally authored primary's authenticated path or trusted writer can publish this.
+    /// Only trusted local consumer feedback can publish measured pressure.
     /// Other runners consume it exclusively for their own secondary producers.
     pub(crate) fn note_pressure(&self, now: Instant) {
         self.flight.feedback(true, now);
@@ -270,6 +270,19 @@ impl LocalSourceActivity {
         state.reliable_ramp_since = None;
     }
 
+    /// A trusted local primary's transport warning always restrains DATA.
+    /// With fresh consumer health, its per-path CC handles loss independently
+    /// of the shared lossy source allowance. Without it, protect the primary
+    /// conservatively. Actual negative feedback invalidates that health first.
+    pub(crate) fn note_primary_transport_pressure(&self, now: Instant) {
+        self.note_reliable_transport_pressure(now);
+        if self.flight.transport_pressure(now) {
+            let mut state = lock!(self.state);
+            let until = now + PRESSURE_GRACE;
+            state.pressure_until = Some(state.pressure_until.map_or(until, |old| old.max(until)));
+        }
+    }
+
     /// Sustained delay growth on this endpoint's authenticated primary path
     /// restrains only its ordered DATA. It does not select a video quality or
     /// spend the network-recovery/neutral-transit allowance.
@@ -277,8 +290,8 @@ impl LocalSourceActivity {
         // This early RTT-growth warning governs ordered DATA only. Publishing
         // it as measured primary failure also shrinks the shared lossy flight
         // window and cancels healthy video probes, even with fresh healthy
-        // audio and no video-path loss. Actual loss/expiry/blocked ACKs still
-        // use note_pressure, and measured audio feedback governs this pool.
+        // audio and no video-path loss. Loss/expiry/blocked ACKs additionally
+        // use the consumer-health-aware transport warning above.
         let mut state = lock!(self.state);
         let until = now + PRESSURE_GRACE;
         state.reliable_transport_pressure_until = Some(

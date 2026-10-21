@@ -146,7 +146,11 @@ async fn local_reliable_delay_keeps_healthy_lossy_probe_but_real_pressure_stops_
         2401,
         "early DATA delay must not erase the measured healthy source trial",
     );
-    source.note_pressure(warning);
+    // A failed mirrored first hop is not a failed consumer: another path can
+    // still deliver every primary packet. Do not erase its paid media trial.
+    source.note_primary_transport_pressure(warning);
+    assert_eq!(secondary.window(warning, 0, 1200), 2401);
+    source.note_feedback(true, warning);
     assert_eq!(secondary.window(warning, 0, 1200), 1);
     source.note_feedback(false, warning);
     assert_eq!(

@@ -52,6 +52,8 @@ struct DeliveryDiagnostics {
     grows: u64,
     blocked: u64,
     drained: u64,
+    transport_pressure_applied: u64,
+    transport_pressure_deferred: u64,
 }
 #[derive(Debug, Default)]
 struct State {
@@ -81,6 +83,24 @@ struct State {
 pub(crate) struct SourceFlightPool(Mutex<State>);
 
 impl State {
+    fn pressure(&mut self, now: Instant) {
+        self.pressure_until = Some(
+            self.pressure_until
+                .map_or(now + PRESSURE_GRACE, |at| at.max(now + PRESSURE_GRACE)),
+        );
+        self.healthy_until = None;
+        self.held_secondary_trial = None;
+        self.delivered_credit = 0;
+        if self
+            .last_reduction
+            .is_none_or(|at| now.saturating_duration_since(at) >= PRESSURE_GRACE)
+        {
+            self.window = (self.limit(now) / 2).max(self.floor(now));
+            self.window_reserve = self.reserve(now);
+            self.last_reduction = Some(now);
+        }
+    }
+
     fn demanded(&self, now: Instant, window: u64) -> bool {
         let reserve = self.reserve(now);
         self.rows.values().any(|r| {
@@ -223,26 +243,42 @@ impl SourceFlightPool {
         let wakers = {
             let mut s = lock!(self.0);
             if pressured {
-                s.pressure_until = Some(
-                    s.pressure_until
-                        .map_or(now + PRESSURE_GRACE, |at| at.max(now + PRESSURE_GRACE)),
-                );
-                s.healthy_until = None;
-                s.held_secondary_trial = None;
-                s.delivered_credit = 0;
-                if s.last_reduction
-                    .is_none_or(|at| now.saturating_duration_since(at) >= PRESSURE_GRACE)
-                {
-                    s.window = (s.limit(now) / 2).max(s.floor(now));
-                    s.window_reserve = s.reserve(now);
-                    s.last_reduction = Some(now);
-                }
+                s.pressure(now);
             } else {
                 s.healthy_until = Some(now + IDLE_GRACE);
             }
             s.wakers()
         };
         wake(wakers);
+    }
+
+    /// A first-hop warning cannot contradict fresh trusted consumer health:
+    /// redundant primary paths may deliver it despite this connection's loss.
+    /// The path's own CC still applies. No warning creates or renews health,
+    /// grants flight, clears an existing pressure lease or funds source growth.
+    /// Unknown/expired health retains the conservative node-wide fallback.
+    pub(crate) fn transport_pressure(&self, now: Instant) -> bool {
+        let wakers = {
+            let mut s = lock!(self.0);
+            if s.active(now)
+                && (s.healthy_until.is_some_and(|until| now < until)
+                    || s.held_secondary_trial.is_some_and(|(until, _)| now < until))
+            {
+                s.delivery_diagnostics.transport_pressure_deferred = s
+                    .delivery_diagnostics
+                    .transport_pressure_deferred
+                    .saturating_add(1);
+                return false;
+            }
+            s.delivery_diagnostics.transport_pressure_applied = s
+                .delivery_diagnostics
+                .transport_pressure_applied
+                .saturating_add(1);
+            s.pressure(now);
+            s.wakers()
+        };
+        wake(wakers);
+        true
     }
     /// Preserve paid flight and any already-permitted shared trial, but earn
     /// no growth from held feedback and never create a new trial under a hold.
@@ -350,9 +386,10 @@ impl SourceFlightPool {
             )) = snapshot
             {
                 log::info!(target: "veil::source_flight",
-                    "connection_trace_id={id} members={members} in_flight_bytes={flight} primary_flight_bytes={primary_flight} control_flight_bytes={control_flight} secondary_flight_bytes={secondary_flight} window_bytes={window} primary_control_reserve_bytes={reserve} stored_window_bytes={stored_window} stored_reserve_bytes={stored_reserve} scope=endpoint hold_observations={} ack_held={} healthy={healthy} pressured={pressured} credit_bytes={credit} ack_calls={} ack_stale={} ack_inactive={} ack_unhealthy={} ack_pressured={} ack_no_demand={} ack_funded_bytes={} ack_credit_wait={} ack_rtt_wait={} window_grows={} blocked_calls={} drained_witnesses={}",
+                    "connection_trace_id={id} members={members} in_flight_bytes={flight} primary_flight_bytes={primary_flight} control_flight_bytes={control_flight} secondary_flight_bytes={secondary_flight} window_bytes={window} primary_control_reserve_bytes={reserve} stored_window_bytes={stored_window} stored_reserve_bytes={stored_reserve} scope=endpoint hold_observations={} ack_held={} healthy={healthy} pressured={pressured} credit_bytes={credit} ack_calls={} ack_stale={} ack_inactive={} ack_unhealthy={} ack_pressured={} ack_no_demand={} ack_funded_bytes={} ack_credit_wait={} ack_rtt_wait={} window_grows={} blocked_calls={} drained_witnesses={} transport_pressure_applied={} transport_pressure_deferred={}",
                     d.hold_observations, d.held, d.calls, d.stale, d.inactive, d.unhealthy, d.pressured, d.no_demand,
-                    d.funded_bytes, d.credit_wait, d.rtt_wait, d.grows, d.blocked, d.drained);
+                    d.funded_bytes, d.credit_wait, d.rtt_wait, d.grows, d.blocked, d.drained,
+                    d.transport_pressure_applied, d.transport_pressure_deferred);
             }
         }
         installed
@@ -695,6 +732,67 @@ mod tests {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn path_warnings_preserve_paid_flight_only_until_consumer_health_expires() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let control = pool.binding(1, Role::Control, now).unwrap();
+        let primary = pool.binding(2, Role::Primary, now).unwrap();
+        let video = pool.binding(3, Role::Secondary, now).unwrap();
+        control.update_flight(100_000);
+        pool.note_primary(now);
+        // Unknown health must still protect the primary.
+        assert!(pool.transport_pressure(now));
+        assert_eq!(video.window(now, 0, 1200), 1);
+        let fresh = now + PRESSURE_GRACE;
+        pool.note_primary(fresh);
+        pool.feedback(false, fresh);
+        video.blocked(fresh);
+        primary.delivered(fresh, fresh, 2400, Duration::from_millis(100));
+        assert_eq!(video.window(fresh, 0, 1200), 3601);
+        for offset in [100, 1000, 2999] {
+            let at = fresh + Duration::from_millis(offset);
+            pool.note_primary(at);
+            assert!(!pool.transport_pressure(at));
+            assert_eq!(video.window(at, 0, 1200), 3601);
+        }
+        // Transport warnings must not restamp or manufacture consumer health.
+        let expired = fresh + IDLE_GRACE;
+        pool.note_primary(expired);
+        assert!(pool.transport_pressure(expired));
+        assert_eq!(video.window(expired, 0, 1200), 1);
+        // A later positive sample cannot cancel the existing pressure lease.
+        pool.feedback(false, expired);
+        assert!(!pool.transport_pressure(expired));
+        assert_eq!(video.window(expired, 0, 1200), 1);
+    }
+
+    #[test]
+    fn held_health_survives_path_warning_but_negative_feedback_and_route_reset_win() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let control = pool.binding(1, Role::Control, now).unwrap();
+        let video = pool.binding(2, Role::Secondary, now).unwrap();
+        control.update_flight(100_000);
+        pool.note_primary(now);
+        pool.feedback(false, now);
+        pool.hold_growth(now, now + Duration::from_secs(1), now);
+        let warning = now + Duration::from_millis(1500);
+        assert!(!pool.transport_pressure(warning));
+        assert_eq!(video.window(warning, 0, 1200), 2401);
+        pool.feedback(true, warning);
+        assert!(pool.transport_pressure(warning));
+        assert_eq!(video.window(warning, 0, 1200), 1);
+        let recovered = warning + PRESSURE_GRACE;
+        pool.note_primary(recovered);
+        pool.feedback(false, recovered);
+        assert!(!pool.transport_pressure(recovered));
+        assert_eq!(video.window(recovered, 0, 1200), 2401);
+        video.route_changed();
+        assert!(pool.transport_pressure(recovered));
+        assert_eq!(video.window(recovered, 0, 1200), 1);
     }
 
     #[test]
