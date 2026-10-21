@@ -274,7 +274,11 @@ impl LocalSourceActivity {
     /// restrains only its ordered DATA. It does not select a video quality or
     /// spend the network-recovery/neutral-transit allowance.
     pub(crate) fn note_reliable_transport_pressure(&self, now: Instant) {
-        self.flight.feedback(true, now);
+        // This early RTT-growth warning governs ordered DATA only. Publishing
+        // it as measured primary failure also shrinks the shared lossy flight
+        // window and cancels healthy video probes, even with fresh healthy
+        // audio and no video-path loss. Actual loss/expiry/blocked ACKs still
+        // use note_pressure, and measured audio feedback governs this pool.
         let mut state = lock!(self.state);
         let until = now + PRESSURE_GRACE;
         state.reliable_transport_pressure_until = Some(
