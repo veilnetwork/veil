@@ -917,6 +917,8 @@ pub struct FrameDispatcher {
     /// share this slot, so an in-place set reaches every one.
     pub peer_cert_invalidate: Arc<Mutex<Option<PeerCertInvalidateFn>>>,
     pub peer_cert_warm: Arc<Mutex<Option<PeerCertWarmFn>>>,
+    /// Refresh learned local document changes before trusting cached sender evidence.
+    pub peer_cert_revalidate: Arc<Mutex<Option<PeerCertInvalidateFn>>>,
 
     /// When each peer was last told `AppSendUnopenable`. One reply per peer
     /// per [`UNOPENABLE_REPLY_INTERVAL`]: the frames a sender had in flight
@@ -2084,6 +2086,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         session_registry: None,
         peer_cert_invalidate: Arc::new(Mutex::new(None)),
         peer_cert_warm: Arc::new(Mutex::new(None)),
+        peer_cert_revalidate: Arc::new(Mutex::new(None)),
         unopenable_replied: Arc::new(Mutex::new(std::collections::HashMap::new())),
         decrypt_failure_log: Arc::new(Mutex::new(std::collections::HashMap::new())),
         sender_identity_lookup: Arc::default(),
@@ -2957,6 +2960,7 @@ mod tests {
             session_registry: None, // test dispatcher — sovereign routing bypassed
             peer_cert_invalidate: Arc::new(Mutex::new(None)),
             peer_cert_warm: Arc::new(Mutex::new(None)),
+            peer_cert_revalidate: Arc::new(Mutex::new(None)),
             unopenable_replied: Arc::new(Mutex::new(std::collections::HashMap::new())),
             decrypt_failure_log: Arc::new(Mutex::new(std::collections::HashMap::new())),
             sender_identity_lookup: Arc::default(),

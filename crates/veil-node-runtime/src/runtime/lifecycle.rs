@@ -1200,6 +1200,7 @@ impl NodeRuntime {
             // (peer says "unopenable" → nothing invalidates the cert cache).
             peer_cert_invalidate: Arc::clone(&self.dispatcher.peer_cert_invalidate),
             peer_cert_warm: Arc::clone(&self.dispatcher.peer_cert_warm),
+            peer_cert_revalidate: Arc::clone(&self.dispatcher.peer_cert_revalidate),
             // Carried over so a reload cannot reopen the per-peer reply window.
             unopenable_replied: Arc::clone(&self.dispatcher.unopenable_replied),
             decrypt_failure_log: Arc::clone(&self.dispatcher.decrypt_failure_log),

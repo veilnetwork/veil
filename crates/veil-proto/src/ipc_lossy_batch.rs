@@ -97,7 +97,7 @@ impl LocalLossyBatchPayload {
                     data: veil_bufpool::pooled_shared_from_vec(data),
                 }
                 .encode();
-                body[100..104].copy_from_slice(
+                body[crate::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(
                     &(crate::ipc::IPC_SEND_FLAG_RELAY_REALTIME
                         | crate::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED)
                         .to_be_bytes(),
@@ -127,6 +127,13 @@ mod tests {
         let sends = decoded.into_sends();
         assert_eq!(sends.len(), 3);
         for body in sends {
+            let flags =
+                u32::from_be_bytes(body[AppIpcSendPayload::FLAGS_RANGE].try_into().unwrap());
+            assert_eq!(
+                flags,
+                crate::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+                    | crate::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED
+            );
             let send = AppIpcSendPayload::decode(&body).unwrap();
             assert_eq!(send.src_app_id, [2; 32]);
             assert_eq!(&*send.data, &cell);

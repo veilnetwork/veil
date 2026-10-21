@@ -955,6 +955,7 @@ impl NodeRuntime {
             // runtime resolver exists (defect №35 sender-side feedback).
             peer_cert_invalidate: Arc::new(Mutex::new(None)),
             peer_cert_warm: Arc::new(Mutex::new(None)),
+            peer_cert_revalidate: Arc::new(Mutex::new(None)),
             unopenable_replied: Arc::new(Mutex::new(std::collections::HashMap::new())),
             decrypt_failure_log: Arc::new(Mutex::new(std::collections::HashMap::new())),
             sender_identity_lookup: Arc::default(),

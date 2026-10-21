@@ -2588,6 +2588,28 @@ impl RatchetRuntime {
             .cloned()
     }
 
+    /// Prefer an endpoint that has actually answered us over an arbitrary
+    /// registry row. This is a routing hint only: sealing still resolves a
+    /// current certificate for the exact instance. Never select an unproven,
+    /// expired or send-only conversation, nor compare different peers' clocks.
+    pub fn reply_instance(&self, peer: &[u8; 32], now_unix: u64) -> Option<[u8; 16]> {
+        let identity = self.identity()?;
+        let devices = self.peer_devices(peer)?;
+        let store = self.store.lock();
+        store
+            .entries
+            .iter()
+            .filter(|(key, entry)| {
+                key.local_instance_id == identity.local_instance_id
+                    && &key.peer_node_id == peer
+                    && entry.peer_sent_at != 0
+                    && entry.authenticated_until >= now_unix
+                    && devices.contains(&key.peer_instance_id, &entry.peer_ik, now_unix)
+            })
+            .max_by_key(|(key, entry)| (entry.last_used_at, key.peer_instance_id))
+            .map(|(key, _)| key.peer_instance_id)
+    }
+
     /// Find the identity whose verified certificates name the payload's sending
     /// instance, or an existing conversation after restart, including a retained
     /// prologue whose sender has not yet received an answer.

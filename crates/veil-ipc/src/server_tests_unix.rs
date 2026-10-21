@@ -1372,7 +1372,8 @@ async fn ipc_send_relay_via_route_cache() {
     let mut compact_body = compact_send.encode();
     let compact_flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
         | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
-    compact_body[100..104].copy_from_slice(&compact_flags.to_be_bytes());
+    compact_body[veil_proto::AppIpcSendPayload::FLAGS_RANGE]
+        .copy_from_slice(&compact_flags.to_be_bytes());
     send_ipc_frame(&mut client, LocalAppMsg::AppIpcSend as u16, &compact_body).await;
 
     let (prio, frame_bytes) = tokio::time::timeout(Duration::from_millis(500), b_rx.recv())
@@ -1407,7 +1408,7 @@ async fn ipc_send_relay_via_route_cache() {
         reply_endpoint_id: 0,
     };
     let mut compat_body = compat_send.encode();
-    compat_body[100..104]
+    compat_body[veil_proto::AppIpcSendPayload::FLAGS_RANGE]
         .copy_from_slice(&veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT.to_be_bytes());
     send_ipc_frame(&mut client, LocalAppMsg::AppIpcSend as u16, &compat_body).await;
 

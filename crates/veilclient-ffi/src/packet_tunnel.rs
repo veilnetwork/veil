@@ -888,17 +888,39 @@ pub extern "C" fn veil_packet_tunnel_last_error() -> *mut c_char {
 ///
 /// On non-Linux targets this always returns `VEIL_ERR_INVALID_ARG`.
 ///
+/// Deprecated request contract: always returns `VEIL_ERR_INVALID_ARG`.
+/// Use [`veil_packet_tunnel_run_linux_helper_v2`] with the approved byte digest.
+///
 /// # Safety
 /// `config_path` must be a live NUL-terminated UTF-8 string for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn veil_packet_tunnel_run_linux_helper(config_path: *const c_char) -> c_int {
+pub unsafe extern "C" fn veil_packet_tunnel_run_linux_helper(_config_path: *const c_char) -> c_int {
+    // Keep the ABI symbol, but refuse the old unsigned request contract.
+    crate::VEIL_ERR_INVALID_ARG
+}
+
+/// Run a Linux helper request bound to the exact bytes approved by the host.
+/// Both arguments must be live NUL-terminated UTF-8 strings for this call;
+/// `config_sha256` is the 64-character lowercase SHA-256 of the written JSON.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_packet_tunnel_run_linux_helper_v2(
+    config_path: *const c_char,
+    config_sha256: *const c_char,
+) -> c_int {
     let config_path = match unsafe { required_str(config_path, "config_path") } {
         Ok(value) => value,
         Err(_) => return crate::VEIL_ERR_INVALID_ARG,
     };
+    let digest = match unsafe { required_str(config_sha256, "config_sha256") } {
+        Ok(value) => value,
+        Err(_) => return crate::VEIL_ERR_INVALID_ARG,
+    };
+    if digest.len() != 64 || !digest.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return crate::VEIL_ERR_INVALID_ARG;
+    }
     #[cfg(target_os = "linux")]
     {
-        linux_helper::run(config_path)
+        linux_helper::run(config_path, digest)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -907,10 +929,32 @@ pub unsafe extern "C" fn veil_packet_tunnel_run_linux_helper(config_path: *const
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn verify_helper_request_digest(bytes: &[u8], expected: &str) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if expected.len() != 64 || !actual.eq_ignore_ascii_case(expected) {
+        return Err("helper config changed after authorization".to_owned());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod write_sink_tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn authorization_digest_detects_same_length_in_place_request_edit() {
+        use sha2::{Digest, Sha256};
+        let original = br#"{"hostPid":123}"#;
+        let changed = br#"{"hostPid":456}"#;
+        assert_eq!(original.len(), changed.len());
+        let digest = format!("{:x}", Sha256::digest(original));
+        assert!(verify_helper_request_digest(original, &digest).is_ok());
+        assert!(verify_helper_request_digest(changed, &digest).is_err());
+        assert!(verify_helper_request_digest(original, "").is_err());
+    }
 
     // Statics rather than captures: the host callback is an `extern "C" fn`
     // and cannot close over anything. One set per test, because the suite

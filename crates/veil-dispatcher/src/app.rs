@@ -130,6 +130,17 @@ impl FrameDispatcher {
         );
     }
 
+    pub(crate) fn revalidate_peer_certificate(&self, sender: &[u8; 32]) {
+        let check = self
+            .peer_cert_revalidate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(check) = check {
+            check(sender);
+        }
+    }
+
     /// Request bounded certificate verification, never authorize from a claim.
     pub(crate) fn warm_ratchet_sender(&self, sender: [u8; 32], payload: &[u8]) {
         let Some((instance, _)) = veil_e2e::payload_instances(payload) else {
@@ -196,6 +207,7 @@ impl FrameDispatcher {
                     .and_then(|entry| entry.validated_sovereign_identity.as_ref())
                     .map(|identity| identity.active_instance_id)
             });
+            self.revalidate_peer_certificate(&sender);
             let authorized = instance.is_some_and(|instance| {
                 self.crypto
                     .ratchet
@@ -436,6 +448,7 @@ impl FrameDispatcher {
                     return DispatchResult::NoResponse;
                 };
                 let now_unix = veil_util::unix_secs_now_u64();
+                self.revalidate_peer_certificate(&sender);
                 match ratchet.open_payload(&sender, &payload.data, now_unix) {
                     Ok(opened) => {
                         // The session identifies its physical peer. A cached

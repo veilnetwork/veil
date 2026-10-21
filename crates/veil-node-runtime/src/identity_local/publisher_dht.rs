@@ -238,6 +238,41 @@ pub(crate) fn replicate_dht_value(
     }
 }
 
+/// Notify connected verifiers of a document change, independently of which
+/// nodes are closest to its DHT slot. A recursive STORE may forward elsewhere
+/// without updating a leaf's local mirror; that leaves its warm certificate
+/// cache accepting a device the owner has just revoked. Use the existing
+/// direct STORE format and ordinary paced local replication, with no new
+/// relay class or application hint. The receiver still verifies the signed
+/// document before granting any sender authority.
+pub(crate) fn notify_live_identity_verifiers(
+    registry: &Arc<RwLock<SessionTxRegistry>>,
+    local_device: [u8; 32],
+    document: &veil_proto::identity_document::IdentityDocument,
+) -> usize {
+    let body = veil_proto::discovery::StorePayload::unsigned(
+        veil_proto::identity_document::IdentityDocument::dht_key(&document.node_id),
+        document.encode(),
+    )
+    .encode();
+    let mut header = veil_proto::header::FrameHeader::new(
+        veil_proto::family::FrameFamily::Discovery as u8,
+        veil_proto::family::DiscoveryMsg::Store as u16,
+    );
+    header.body_len = body.len() as u32;
+    let mut frame = veil_proto::codec::encode_header(&header).to_vec();
+    frame.extend_from_slice(&body);
+    let peers = registry
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .peer_ids();
+    peers
+        .into_iter()
+        .filter(|peer| *peer != local_device)
+        .filter(|peer| SessionTxRegistry::send_local_replication(registry, *peer, frame.clone()))
+        .count()
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 /// Pull the first 3 octets out of a transport URI's host part. Returns
@@ -323,6 +358,45 @@ mod tests {
         let c = extract_ipv4_prefix24("tcp://10.0.1.1:9202").unwrap();
         assert_eq!(a, b, "same /24 → same prefix");
         assert_ne!(a, c, "different /24 → different prefix");
+    }
+
+    #[tokio::test]
+    async fn document_update_reaches_connected_verifiers_beyond_the_closest_replica_set() {
+        let document = crate::mlkem_cert_store::fixture::signer(0x31).doc;
+        let mut registry = SessionTxRegistry::new();
+        let mut receivers: Vec<_> = (2..(veil_proto::budget::DHT_REPLICATION_K + 4) as u8)
+            .map(|id| registry.register([id; 32]))
+            .collect();
+        let registry = Arc::new(RwLock::new(registry));
+        assert_eq!(
+            notify_live_identity_verifiers(&registry, [1; 32], &document),
+            receivers.len()
+        );
+        for receiver in &mut receivers {
+            let (_, bytes) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let header = veil_proto::codec::decode_header(&bytes).unwrap();
+            assert_eq!(
+                header.family,
+                veil_proto::family::FrameFamily::Discovery as u8
+            );
+            assert_eq!(
+                header.msg_type,
+                veil_proto::family::DiscoveryMsg::Store as u16,
+                "a recursive STORE could forward away without updating the verifier itself"
+            );
+            let stored =
+                veil_proto::discovery::StorePayload::decode(&bytes[veil_proto::HEADER_SIZE..])
+                    .unwrap();
+            assert_eq!(
+                stored.key,
+                veil_proto::identity_document::IdentityDocument::dht_key(&document.node_id)
+            );
+            assert_eq!(stored.value, document.encode());
+        }
     }
 
     #[tokio::test]

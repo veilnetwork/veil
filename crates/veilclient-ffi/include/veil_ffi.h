@@ -3398,10 +3398,22 @@ int veil_packet_tunnel_start_packets(const char *proxy_url,
  *
  * On non-Linux targets this always returns `VEIL_ERR_INVALID_ARG`.
  *
+ * Deprecated request contract: always returns `VEIL_ERR_INVALID_ARG`.
+ * Use [`veil_packet_tunnel_run_linux_helper_v2`] with the approved byte digest.
+ *
  * # Safety
  * `config_path` must be a live NUL-terminated UTF-8 string for this call.
  */
- int veil_packet_tunnel_run_linux_helper(const char *config_path) ;
+ int veil_packet_tunnel_run_linux_helper(const char *_config_path) ;
+#endif
+
+#if defined(VEIL_FFI_PACKET_TUNNEL)
+/**
+ * Run a Linux helper request bound to the exact bytes approved by the host.
+ * Both arguments must be live NUL-terminated UTF-8 strings for this call;
+ * `config_sha256` is the 64-character lowercase SHA-256 of the written JSON.
+ */
+ int veil_packet_tunnel_run_linux_helper_v2(const char *config_path, const char *config_sha256) ;
 #endif
 
 /**
