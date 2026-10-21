@@ -9,8 +9,12 @@ pub fn sealed_relay_hops(
 ) -> Vec<[u8; 32]> {
     let mut hops =
         crate::handlers::send::ordinary_relay_hops(None, destination, cache, registry, true);
-    hops.sort_by_cached_key(|hop| !registry.has_neutral_forward_datagram_transport(hop));
+    prefer_datagrams(&mut hops, registry);
     hops
+}
+
+pub(crate) fn prefer_datagrams(hops: &mut [[u8; 32]], registry: &dyn FrameBroadcaster) {
+    hops.sort_by_cached_key(|hop| !registry.has_neutral_forward_datagram_transport(hop));
 }
 
 /// Source-specific sibling retaining the generic public snapshot for callers
@@ -50,4 +54,20 @@ pub(crate) fn prefer_ready_sources(
             !registry.has_neutral_forward_datagram_transport(hop),
         )
     });
+}
+
+/// Prepare only the existing preferred pair, without clearing a usable child
+/// or admitting a data packet. Sending can meanwhile keep its ready fallback.
+/// Framing/readiness snapshots deliberately do not call this side-effecting
+/// sibling: merely observing costs must never initiate a connection.
+pub(crate) fn warm_preferred_sources(
+    hops: &[[u8; 32]],
+    registry: &dyn FrameBroadcaster,
+    local_lane: u8,
+) {
+    if registry.supports_local_datagram_preparation() {
+        for hop in hops.iter().take(2) {
+            registry.prepare_local_datagram_channel(hop, local_lane, false);
+        }
+    }
 }
