@@ -607,7 +607,19 @@ async fn private_route_liveness_follows_its_datagram_carrier_not_reliable_mainte
         .hold_reliable_route_probes
         .store(false, Ordering::Release);
     stand.hold_primary_datagrams.store(true, Ordering::Release);
-    tokio::time::sleep(Duration::from_secs(16)).await;
+    // Keep exercising the production send path under loss. A silent call may
+    // retain a stale route object while replacement construction retries;
+    // its presence in a raw snapshot does not mean it can still carry media.
+    let failed_started = Instant::now();
+    while failed_started.elapsed() < Duration::from_secs(16) {
+        let _ = send(ca.id, &packet(111, seq));
+        let _ = send(cc.id, &packet(111, seq));
+        for rx in [&mut ca.rx, &mut cc.rx] {
+            while rx.try_recv().is_ok() {}
+        }
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let failed_a = ca.routes.outgoing_for_test().await;
     let failed_c = cc.routes.outgoing_for_test().await;
     let stable = healthy_a.iter().find(|r| r.plane == 0).map(|r| r.origin)

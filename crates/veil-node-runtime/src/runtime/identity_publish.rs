@@ -68,6 +68,11 @@ impl crate::runtime::NodeRuntime {
             )));
         }
         let devices = sov.document.identity_keys.len();
+        let notified = crate::identity_local::publisher_dht::notify_live_identity_verifiers(
+            &self.session_tx_registry,
+            *self.identity.local_identity.node_id.as_bytes(),
+            &sov.document,
+        );
         let identity = *sov.node_id();
         let sov = Arc::new(sov);
         self.identity.sovereign_identity.set(Arc::clone(&sov));
@@ -104,7 +109,7 @@ impl crate::runtime::NodeRuntime {
         self.logger.info(
             "node.sovereign_identity.reloaded",
             format!(
-                "identity={} devices={} — re-read from {} without a runtime reload",
+                "identity={} devices={} notified_live_peers={notified} — re-read from {} without a runtime reload",
                 veil_util::bytes_to_hex(&identity),
                 devices,
                 dir.display(),

@@ -19,10 +19,9 @@
 //! ## AAD binding
 //!
 //! Every `seal`/`open` call accepts an `aad: &[u8]` slice that is mixed into
-//! the Poly1305 tag. Callers **must** pass the 3-byte frame-type prefix
-//! `[family, msg_type_hi, msg_type_lo]` so that the frame type is
-//! cryptographically bound to its ciphertext. Substituting a ciphertext into
-//! a different frame-type slot will fail authentication.
+//! the Poly1305 tag. Frame codecs **must** pass the complete 24-byte encoded
+//! `FrameHeader`, including flags, lengths and sequence. The slice API also
+//! accepts empty AAD; callers, not the type system, enforce this binding.
 
 use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit, Nonce,
@@ -108,9 +107,8 @@ impl SessionCipher {
 
     /// Encrypt `plaintext` with `aad` mixed into the authentication tag.
     ///
-    /// `aad` **must** be the 3-byte frame-type prefix `[family, msg_hi, msg_lo]`
-    /// derived from the `FrameHeader`. Passing `b""` is rejected at compile time
-    /// by the type signature — use `frame_aad(family, msg_type)` to build it.
+    /// Frame callers must use the complete encoded 24-byte `FrameHeader`.
+    /// An empty or partial slice compiles but loses the omitted header binding.
     ///
     /// Returns `ciphertext ‖ tag` (16-byte Poly1305 tag appended).
     pub fn seal(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, CipherError> {

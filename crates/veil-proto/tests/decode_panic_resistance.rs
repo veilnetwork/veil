@@ -64,6 +64,58 @@ macro_rules! decoder {
 /// shrinking will surface (decoder_name, byte_pattern).
 fn decoders() -> Vec<(&'static str, DecoderFn)> {
     vec![
+        // Session negotiation is reachable before peer authentication.
+        ("HelloPayload", decoder!(p::session::HelloPayload)),
+        ("IdentityPayload", decoder!(p::session::IdentityPayload)),
+        (
+            "CapabilitiesPayload",
+            decoder!(p::session::CapabilitiesPayload),
+        ),
+        (
+            "KeyAgreementPayload",
+            decoder!(p::session::KeyAgreementPayload),
+        ),
+        (
+            "SessionConfirmPayload",
+            decoder!(p::session::SessionConfirmPayload),
+        ),
+        ("AttachPayload", decoder!(p::session::AttachPayload)),
+        ("DetachPayload", decoder!(p::session::DetachPayload)),
+        (
+            "SleepAdvertisementPayload",
+            decoder!(p::session::SleepAdvertisementPayload),
+        ),
+        (
+            "TransportMigrationNotifyPayload",
+            decoder!(p::session::TransportMigrationNotifyPayload),
+        ),
+        ("KeepalivePayload", decoder!(p::session::KeepalivePayload)),
+        ("RekeyPayload", decoder!(p::session::RekeyPayload)),
+        (
+            "MlKemRekeyEkPayload",
+            decoder!(p::session::MlKemRekeyEkPayload),
+        ),
+        (
+            "HybridKexCtPayload",
+            decoder!(p::session::HybridKexCtPayload),
+        ),
+        (
+            "HandoffInitPayload",
+            decoder!(p::session::HandoffInitPayload),
+        ),
+        ("HandoffAckPayload", decoder!(p::session::HandoffAckPayload)),
+        (
+            "HandoffAttachPayload",
+            decoder!(p::session::HandoffAttachPayload),
+        ),
+        (
+            "HandoffChallengePayload",
+            decoder!(p::session::HandoffChallengePayload),
+        ),
+        (
+            "HandoffResponsePayload",
+            decoder!(p::session::HandoffResponsePayload),
+        ),
         // ── anycast ────────────────────────────────────────────────────
         ("AnycastRecord", decoder!(p::anycast::AnycastRecord)),
         ("AnycastList", decoder!(p::anycast::AnycastList)),

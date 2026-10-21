@@ -29,6 +29,20 @@ const _: () = assert!(
     "four stuck destinations would fill the connection's send pool"
 );
 
+/// Admission happens before spawning, and both guards live until the body
+/// and any per-destination wait are gone. Busy senders receive NO_ROUTE and
+/// retry from their existing host outbox; the IPC loop stays responsive.
+pub(crate) fn admit_queued_send(
+    jobs: &Arc<Semaphore>,
+    bytes: &Arc<Semaphore>,
+    retained: usize,
+) -> Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+    let count = Arc::clone(jobs).try_acquire_owned().ok()?;
+    let cost = u32::try_from(retained.max(1)).ok()?;
+    let memory = Arc::clone(bytes).try_acquire_many_owned(cost).ok()?;
+    Some((count, memory))
+}
+
 /// The gates of one IPC connection, created with it.
 #[derive(Default)]
 pub(crate) struct DestinationGates {
@@ -93,6 +107,21 @@ impl Drop for DestinationTurn {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn queued_send_admission_bounds_both_waiters_and_bytes_and_releases_on_drop() {
+        let jobs = Arc::new(Semaphore::new(2));
+        let bytes = Arc::new(Semaphore::new(100));
+        let one = admit_queued_send(&jobs, &bytes, 60).unwrap();
+        assert!(admit_queued_send(&jobs, &bytes, 41).is_none());
+        assert_eq!(jobs.available_permits(), 1); // failed byte admission rolls back
+        let two = admit_queued_send(&jobs, &bytes, 1).unwrap();
+        assert!(admit_queued_send(&jobs, &bytes, 1).is_none());
+        drop((one, two));
+        assert_eq!(jobs.available_permits(), 2);
+        assert_eq!(bytes.available_permits(), 100);
+        assert!(admit_queued_send(&jobs, &bytes, usize::MAX).is_none());
+    }
 
     const SLOW: [u8; 32] = [0x41; 32];
     const LIVE: [u8; 32] = [0x13; 32];

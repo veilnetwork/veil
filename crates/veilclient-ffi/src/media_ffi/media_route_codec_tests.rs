@@ -724,7 +724,7 @@ async fn real_anonymous_codecs_share_obfs4_with_files_on_four_private_planes() {
                     "file_bytes_received": file_bytes[side].load(std::sync::atomic::Ordering::Relaxed),
                     "send_paths_private_fallback": channels[side].routes.send_paths_for_test(),
                     "private_media_cells_before_aead":channels[side].routes.received_media_cells_for_test()}));
-                if sample % 10 == 0 {
+                if sample.is_multiple_of(10) {
                     eprintln!(
                         "codec_phase t={at:.1} side={side} private_fallback={:?} received={:?} audio_rx={}",
                         channels[side].routes.send_paths_for_test(),

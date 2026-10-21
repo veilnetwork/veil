@@ -92,7 +92,7 @@ services:
 
   # ── Bootstrap node ─────────────────────────────────────────────────────
   veil-bootstrap:
-    image: ${VEIL_IMAGE:-veil-bootstrap:latest}
+    image: ${VEIL_IMAGE:-veil-bootstrap:local}
     container_name: veil-bootstrap
     restart: unless-stopped
     depends_on:

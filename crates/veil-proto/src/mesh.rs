@@ -169,6 +169,11 @@ impl MeshFrame {
                 got: buf.len(),
             });
         }
+        if buf.len() > total {
+            return Err(ProtoError::TrailingBytes {
+                trailing: buf.len() - total,
+            });
+        }
         let payload: Arc<[u8]> = Arc::from(&buf[MESH_HEADER_SIZE..total]);
         Ok(Self {
             realm_id,
@@ -481,6 +486,16 @@ mod tests {
         let enc = f.encode();
         let dec = MeshFrame::decode(&enc).unwrap();
         assert_eq!(dec, f);
+    }
+
+    #[test]
+    fn mesh_frame_refuses_trailing_bytes() {
+        let mut bytes = sample_frame().encode();
+        bytes.push(0);
+        assert!(matches!(
+            MeshFrame::decode(&bytes),
+            Err(ProtoError::TrailingBytes { trailing: 1 })
+        ));
     }
 
     #[test]

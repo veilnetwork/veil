@@ -50,6 +50,14 @@ pub(super) fn warmer(
     let budget = Arc::new(Mutex::new(Budget::default()));
     let slots = Arc::new(tokio::sync::Semaphore::new(4));
     Arc::new(move |peer, instance| {
+        // The cached lookup also revalidates learned document changes and
+        // removes retired sender keys. It is synchronous and never walks DHT.
+        if resolver
+            .resolve_cert_for_instance_cached(peer, instance)
+            .is_some()
+        {
+            return;
+        }
         let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
             return;
         };

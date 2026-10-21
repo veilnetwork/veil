@@ -252,7 +252,15 @@ impl RouteCache {
             via_counts: HashMap::new(),
             via_to_dsts: HashMap::new(),
             ttl,
-            max_destinations: 0, // unlimited
+            max_destinations: 0, // no adaptive limit; the hard safety cap still applies
+        }
+    }
+
+    fn destination_limit(&self) -> usize {
+        if self.max_destinations == 0 {
+            MAX_ROUTE_CACHE_SIZE
+        } else {
+            self.max_destinations.min(MAX_ROUTE_CACHE_SIZE)
         }
     }
 
@@ -264,7 +272,7 @@ impl RouteCache {
         self.max_destinations = new_cap;
         if new_cap == 0 {
             return;
-        } // unlimited
+        } // use the hard safety cap
         // M5: was O(N²) — full-table scan inside `while
         // entries.len > new_cap` loop. At N=10K and 10% shrink that's
         // ~10M comparisons during a single memory-pressure event. Replace
@@ -453,7 +461,7 @@ impl RouteCache {
             // Evict LRU bucket if at capacity; collect (dst, hops) before
             // mutating via_counts / via_to_dsts.
             let lru_evicted: Option<([u8; 32], Vec<[u8; 32]>)> =
-                if self.entries.len() >= MAX_ROUTE_CACHE_SIZE {
+                if self.entries.len() >= self.destination_limit() {
                     // True LRU: find the bucket whose most-recent access is oldest.
                     // `last_used` is a u64 access-counter; higher
                     // value = more recently used. Find the bucket whose
@@ -796,7 +804,7 @@ impl RouteCache {
             }
             // Don't evict live entries to make room for stale ones.
             if !self.entries.contains_key(&snap.dst_node_id)
-                && self.entries.len() >= MAX_ROUTE_CACHE_SIZE
+                && self.entries.len() >= self.destination_limit()
             {
                 continue;
             }
@@ -952,6 +960,29 @@ mod tests {
     ///
     /// Break-check: report `used: true` unconditionally and the first
     /// assertion fails; report it as `last_used == 0` and the second does.
+    #[test]
+    fn resize_limit_survives_inserts_and_restore_and_can_grow() {
+        let mut cache = RouteCache::new(Duration::from_secs(60));
+        for id in 1..=6u8 {
+            cache.insert([id; 32], [id + 50; 32], 10_000, 1);
+        }
+        let snapshot = cache.snapshot(&std::collections::HashMap::new());
+        cache.resize(2);
+        assert_eq!(cache.len(), 2);
+        cache.insert([90; 32], [91; 32], 10_000, 1);
+        assert_eq!(cache.len(), 2);
+        cache.restore(snapshot.clone());
+        assert_eq!(cache.len(), 2);
+        cache.resize(4);
+        cache.restore(snapshot);
+        assert_eq!(cache.len(), 4);
+        cache.resize(0);
+        cache.insert([92; 32], [93; 32], 10_000, 1);
+        assert_eq!(cache.len(), 5);
+        cache.resize(usize::MAX);
+        assert_eq!(cache.destination_limit(), MAX_ROUTE_CACHE_SIZE);
+    }
+
     #[test]
     fn a_path_is_marked_used_only_after_it_is_chosen() {
         let mut cache = RouteCache::new(Duration::from_secs(60));

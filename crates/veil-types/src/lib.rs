@@ -312,6 +312,11 @@ pub trait FrameBroadcaster: Send + Sync {
 // `async-trait` macro crate would invert the layering.  This shape
 // matches the existing `BroadcastFn` trait in `veil-transport::rotation`
 // (also for the same reason) and keeps the trait object-safe.
+/// A bounded caller may await the verified certificates of one identity's devices.
+pub type DeviceCertsFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Vec<([u8; 32], VerifiedPeerCert)>> + Send + 'a>,
+>;
+
 pub trait MlKemEkResolver: Send + Sync {
     /// Resolve from already-local, cryptographically verified records only.
     ///
@@ -352,6 +357,12 @@ pub trait MlKemEkResolver: Send + Sync {
         _target_node_id: [u8; 32],
     ) -> Vec<([u8; 32], VerifiedPeerCert)> {
         Vec::new()
+    }
+
+    /// Fill missing device certificates for an identity. The caller must bound
+    /// network work; implementations without a directory retain cached behavior.
+    fn resolve_device_certs(&self, target: [u8; 32]) -> DeviceCertsFuture<'_> {
+        Box::pin(async move { self.resolve_device_certs_cached(target) })
     }
 
     /// The certificate of ONE NAMED DEVICE of the recipient, local records

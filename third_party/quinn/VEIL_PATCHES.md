@@ -1,13 +1,21 @@
 # Local Quinn extension
 
 This copy retains the locked upstream release and its license files.
-The adjacent quinn-proto copy has the same provenance.
+The adjacent quinn-proto and quinn-udp copies have the provenance recorded in
+`UPSTREAM.json`. The manifest includes their registry archive SHA-256 digests.
 
-The only extension is an opt-in outgoing DATAGRAM expiration deadline.
-No wire fields, advertised transport parameters, TLS policy, reliable stream
-behavior or congestion-controller settings change. Existing send_datagram
-calls have no deadline. The endpoint uses the extension only for its own
-primary source on a prepared independent connection. Transit has no deadline.
+The local patch set includes:
+
+- opt-in outgoing DATAGRAM expiration deadlines;
+- pacing fixes for small congestion windows, fractional credit and a
+  controller's explicit pacing rate;
+- local queue/expiry/receive diagnostics and opt-in kernel receive timestamps;
+- opt-in Apple socket batching (`fast-apple-datapath`).
+
+The wire format and TLS policy are unchanged. Pacing behavior is intentionally
+patched; this is not a byte-identical upstream tree. Existing `send_datagram`
+calls have no expiry deadline. Transit forwarding does not receive the
+endpoint's expiration policy or an application/media priority label.
 
 Expired packets are removed on send-buffer queries and before packet creation.
 They release outgoing capacity and unblock waiting producers. All fragments
@@ -31,7 +39,7 @@ patch applies to production builds, not to an excluded crate's own workspace):
 cargo test --manifest-path third_party/quinn-proto/Cargo.toml --lib
 cargo update --manifest-path third_party/quinn/Cargo.toml \
   --config 'patch.crates-io.quinn-proto.path="ABSOLUTE_PATH_TO/quinn-proto"' \
-  -p quinn-proto --precise 0.11.15
+  -p quinn-proto --precise 0.11.18
 cargo test --manifest-path third_party/quinn/Cargo.toml \
   --config 'patch.crates-io.quinn-proto.path="ABSOLUTE_PATH_TO/quinn-proto"' \
   --no-default-features --features runtime-tokio,rustls-aws-lc-rs --lib
@@ -39,3 +47,6 @@ cargo test --manifest-path third_party/quinn/Cargo.toml \
 
 Restore Quinn's upstream Cargo.lock after standalone checks; production uses
 the root Cargo.lock with both path patches already selected.
+
+Verify versions with `scripts/check-quinn-provenance.py`
+before updating the manifest; compare the listed archive bytes before bumping a pin.
