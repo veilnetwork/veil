@@ -12,7 +12,6 @@ use veil_util::lock;
 pub(super) const ACTIVE_RELIABLE_BYTES: u64 = 1024;
 // Small bounded control writes on the parent must not inherit child pressure.
 pub(super) const INDEPENDENT_RELIABLE_BYTES: u64 = 16 * 1024;
-const PRIMARY_PRESSURE_RTT: Duration = Duration::from_millis(150);
 
 #[derive(Default)]
 struct PrimaryPathFeedback {
@@ -22,12 +21,13 @@ struct PrimaryPathFeedback {
 }
 
 impl PrimaryPathFeedback {
-    fn observe(&mut self, rtt_us: u64, expired: u64, lost: u64, congestion_events: u64) -> bool {
-        // Loss can grow before the smoothed RTT crosses the delay threshold.
-        // Keep competing local producers restrained during that congestion,
-        // rather than waiting for the primary's packets to expire as well.
-        let degraded = rtt_us > PRIMARY_PRESSURE_RTT.as_micros() as u64
-            || expired > self.last_expired
+    fn observe(&mut self, _rtt_us: u64, expired: u64, lost: u64, congestion_events: u64) -> bool {
+        // Absolute RTT includes propagation; alone it cannot prove queue growth. A
+        // stable distant relay must not permanently stop video even while
+        // authenticated audio feedback is healthy. Relative delay still
+        // restrains ordered DATA below; loss, expiry and blocked ACKs protect
+        // all competing sources, alongside the caller's measured audio buffer.
+        let degraded = expired > self.last_expired
             || lost > self.last_lost
             || congestion_events > self.last_congestion_events;
         // Repeated historical loss must not pin the budget forever. A replaced
@@ -490,6 +490,18 @@ mod feedback_tests {
         assert!(!feedback.observe(1, 2, 200_000, now + Duration::from_millis(40)));
         assert!(!feedback.observe(1, 3, 40_000, now + Duration::from_millis(160)));
         assert!(!feedback.observe(1, 4, 40_000, now + Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn propagation_rtt_alone_cannot_latch_secondary_pressure() {
+        let mut feedback = PrimaryPathFeedback::default();
+        for rtt in [175_000, 240_000, 250_000, 900_000, 200_000] {
+            assert!(!feedback.observe(rtt, 0, 0, 0));
+        }
+        assert!(feedback.observe(240_000, 0, 1, 0));
+        assert!(!feedback.observe(240_000, 0, 1, 0));
+        assert!(feedback.observe(240_000, 1, 1, 0));
+        assert!(feedback.observe(240_000, 1, 1, 1));
     }
 
     #[test]
