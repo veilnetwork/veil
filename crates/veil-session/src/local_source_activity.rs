@@ -325,7 +325,7 @@ impl LocalSourceActivity {
         if sampled_at > received_at || until <= received_at {
             return;
         }
-        self.flight.hold_growth(until, received_at);
+        self.flight.hold_growth(sampled_at, until, received_at);
         let mut state = lock!(self.state);
         state.source_feedback_seen = true;
         state.last_healthy_feedback = Some(
