@@ -60,6 +60,9 @@ struct State {
     healthy_until: Option<Instant>,
     pressure_until: Option<Instant>,
     growth_hold_until: Option<Instant>,
+    // A validated growth hold may retain, never enlarge, a trial already
+    // permitted by fresh healthy feedback. Its original deadline is binding.
+    held_secondary_trial: Option<(Instant, u64)>,
     window: u64,
     // Reserve included in the last funded/reduced window. Retiring control
     // headroom must not turn it into another competing data packet.
@@ -136,22 +139,34 @@ impl State {
     // they stay in the ordinary ledger, rather than starving a real probe.
     // Control debt remains in the ordinary ledger; it cannot consume this
     // finite trial, whether its connection is live or has just closed.
-    // This allowance is not stored/ACK-banked as a larger paid window.
-    fn healthy_secondary_probe(&self, now: Instant) -> Option<u64> {
-        if !self.healthy_until.is_some_and(|until| now < until)
-            || self.pressure_until.is_some_and(|until| now < until)
-            || self.growth_hold_until.is_some_and(|until| now < until)
-        {
+    // A growth hold may retain the previously permitted limit until its
+    // original deadline, without increasing it or banking a paid window.
+    fn secondary_trial_limit(&self, now: Instant) -> Option<u64> {
+        if self.pressure_until.is_some_and(|until| now < until) {
+            return None;
+        }
+        if self.growth_hold_until.is_some_and(|until| now < until) {
+            return self
+                .held_secondary_trial
+                .filter(|(until, _)| now < *until)
+                .map(|(_, limit)| limit);
+        }
+        if !self.healthy_until.is_some_and(|until| now < until) {
             return None;
         }
         let mtu = u64::from(self.rows.values().map(|r| r.mtu).max().unwrap_or(1200));
+        Some(2 * mtu)
+    }
+
+    fn healthy_secondary_probe(&self, now: Instant) -> Option<u64> {
+        let limit = self.secondary_trial_limit(now)?;
         let charged = self
             .rows
             .values()
             .filter(|r| r.role == Role::Secondary && r.source_coupled)
             .map(|r| r.flight)
             .fold(0, u64::saturating_add);
-        Some((2 * mtu).saturating_sub(charged))
+        Some(limit.saturating_sub(charged))
     }
 
     fn wakers(&self) -> Vec<Waker> {
@@ -178,6 +193,7 @@ impl SourceFlightPool {
                 s.delivered_credit = 0;
                 s.healthy_until = None;
                 s.growth_hold_until = None;
+                s.held_secondary_trial = None;
                 for row in s.rows.values_mut() {
                     row.blocked_window = None;
                 }
@@ -199,6 +215,7 @@ impl SourceFlightPool {
                         .map_or(now + PRESSURE_GRACE, |at| at.max(now + PRESSURE_GRACE)),
                 );
                 s.healthy_until = None;
+                s.held_secondary_trial = None;
                 s.delivered_credit = 0;
                 if s.last_reduction
                     .is_none_or(|at| now.saturating_duration_since(at) >= PRESSURE_GRACE)
@@ -214,13 +231,26 @@ impl SourceFlightPool {
         };
         wake(wakers);
     }
-    /// Preserve the paid window, but do not earn growth from held feedback.
+    /// Preserve paid flight and any already-permitted shared trial, but earn
+    /// no growth from held feedback and never create a new trial under a hold.
     /// The deadline belongs to the original event, not IPC receipt or replay.
     pub(crate) fn hold_growth(&self, until: Instant, received_at: Instant) {
         if until <= received_at {
             return;
         }
         let mut s = lock!(self.0);
+        // A hold means known current health with no permission to grow.
+        // Removing the existing trial here can stop all video behind unrelated
+        // control debt, even though the achieved window was meant to survive.
+        // Freeze its total allowance before retiring positive growth credit.
+        // Replayed deadlines cannot extend it; a new MTU cannot enlarge it.
+        s.held_secondary_trial = s.secondary_trial_limit(received_at).map(|limit| {
+            let deadline = s
+                .held_secondary_trial
+                .filter(|(old, _)| received_at < *old)
+                .map_or(until, |(old, _)| old.max(until));
+            (deadline, limit)
+        });
         s.growth_hold_until = Some(s.growth_hold_until.map_or(until, |old| old.max(until)));
         s.healthy_until = None;
         s.delivered_credit = 0;
@@ -596,6 +626,7 @@ impl LocalSendBudget for Binding {
             s.delivered_credit = 0;
             s.healthy_until = None;
             s.growth_hold_until = None;
+            s.held_secondary_trial = None;
             s.last_growth = None;
             for row in s.rows.values_mut() {
                 row.blocked_window = None;
@@ -691,6 +722,78 @@ mod tests {
             video.window(until, 0, 1200) < 3601,
             "hold cannot undo genuine primary protection"
         );
+    }
+
+    #[test]
+    fn healthy_growth_hold_preserves_shared_trial_through_background_debt() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let primary = pool.binding(1, Role::Primary, now).unwrap();
+        let control = pool.binding(2, Role::Control, now).unwrap();
+        let video = pool.binding(3, Role::Secondary, now).unwrap();
+        let screen = pool.binding(4, Role::Secondary, now).unwrap();
+        control.update_flight(100_000);
+        pool.note_primary(now);
+        pool.feedback(false, now);
+        assert_eq!(video.window(now, 0, 1200), 2401);
+        let at = now + Duration::from_secs(1);
+        let until = now + Duration::from_secs(3);
+        pool.hold_growth(until, at);
+        assert_eq!(
+            video.window(at, 0, 1200),
+            2401,
+            "holding growth cannot withdraw the already-permitted healthy trial"
+        );
+        video.update_flight(1200);
+        assert_eq!(screen.window(at, 0, 1200), 1201, "one shared allowance");
+        video.blocked(at);
+        let paid = lock!(pool.0).window;
+        primary.delivered(at, now, 100_000, Duration::from_millis(100));
+        assert_eq!(lock!(pool.0).window, paid, "held ACKs earn no growth");
+        pool.hold_growth(until, at + Duration::from_secs(1));
+        assert_eq!(
+            screen.window(at + Duration::from_secs(1), 0, 1500),
+            1201,
+            "replay or a larger MTU cannot inflate the inherited allowance"
+        );
+        video.update_flight(0);
+        pool.note_primary(until);
+        pool.hold_growth(until, until);
+        assert_eq!(
+            video.window(until, 0, 1200),
+            1,
+            "expired hold is not fresh positive health"
+        );
+        pool.feedback(false, until);
+        assert_eq!(video.window(until, 0, 1200), 3001);
+        pool.hold_growth(until + Duration::from_secs(1), until);
+        pool.feedback(true, until);
+        assert_eq!(
+            video.window(until, 0, 1200),
+            1,
+            "actual pressure cancels the trial"
+        );
+    }
+
+    #[test]
+    fn held_trial_cannot_start_from_unknown_health_or_survive_a_route_change() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let control = pool.binding(1, Role::Control, now).unwrap();
+        let video = pool.binding(2, Role::Secondary, now).unwrap();
+        control.update_flight(100_000);
+        pool.note_primary(now);
+        let until = now + Duration::from_secs(1);
+        pool.hold_growth(until, now);
+        assert_eq!(video.window(now, 0, 1200), 1);
+        pool.hold_growth(until, until);
+        assert_eq!(video.window(until, 0, 1200), 1);
+        pool.feedback(false, until);
+        assert_eq!(video.window(until, 0, 1200), 2401);
+        pool.hold_growth(until + Duration::from_secs(1), until);
+        assert_eq!(video.window(until, 0, 1200), 2401);
+        video.route_changed();
+        assert_eq!(video.window(until, 0, 1200), 1);
     }
 
     #[test]
@@ -1100,7 +1203,11 @@ mod tests {
         pool.feedback(false, now);
         assert_eq!(video.window(now, 0, 1200), 1201);
         pool.hold_growth(now + Duration::from_millis(500), now);
-        assert_eq!(video.window(now, 0, 1200), 1);
+        assert_eq!(
+            video.window(now, 0, 1200),
+            1201,
+            "a hold retains the trial while still charging abandoned secondary debt"
+        );
         let later = now + IDLE_GRACE;
         pool.note_primary(later);
         assert_eq!(
