@@ -189,9 +189,9 @@ class VeilMediaEngine {
   }
 
   /// Start the VP8 video session over the same veil channel (distinct SSRC).
-  /// With VEIL_MEDIA_TEST_VIDEO=1 the send stream is driven by a built-in
-  /// synthetic frame generator (pipeline bring-up); otherwise feed it via a
-  /// platform capturer (native). Idempotent per direction.
+  /// Feed frames via a platform capturer (native). Idempotent per direction.
+  /// Stand builds compiled with VEIL_MEDIA_TEST_HOOKS can instead select the
+  /// synthetic source with VEIL_MEDIA_TEST_VIDEO=1.
   bool startVideo({
     bool send = true,
     bool recv = true,

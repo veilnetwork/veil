@@ -216,8 +216,8 @@ int veil_media_group_engine_get_local_video_frame(
  * A VP8 video session over the SAME veil media channel as audio, on a distinct
  * SSRC. `send` mounts a video source -> VP8 encode -> RTP -> Transport; `recv`
  * mounts RTP -> VP8 decode -> the frame callback. Idempotent per direction.
- * Frames are I420. Set VEIL_MEDIA_TEST_VIDEO=1 in the environment to drive the
- * send stream from a built-in synthetic frame generator (pipeline bring-up)
+ * Frames are I420. Builds with VEIL_MEDIA_TEST_HOOKS can set
+ * VEIL_MEDIA_TEST_VIDEO=1 to use the stand's synthetic frame generator
  * instead of pushed frames. `max_bitrate_kbps` and `max_fps` are explicit so
  * direct P2P can use a quality profile while padded onion media stays
  * conservative. Values <= 0 select the 150 kbps / 15 fps privacy-path defaults. */
@@ -257,8 +257,8 @@ int veil_media_engine_set_max_rtp_packet_size(VeilMediaEngine *engine,
 
 /* Retune the running video send stream to a new bitrate/fps budget without
  * restarting it (encoder reconfigure; the route stays untouched). Used by the
- * app-side link-quality adaptation. Same clamps and VEIL_MEDIA_VIDEO_KBPS
- * override as veil_media_engine_start_video. Returns VEIL_MEDIA_ERR_STATE if
+ * app-side link-quality adaptation. Same clamps as start_video; the
+ * VEIL_MEDIA_VIDEO_KBPS override exists only in VEIL_MEDIA_TEST_HOOKS builds. Returns VEIL_MEDIA_ERR_STATE if
  * video send isn't running. */
 int veil_media_engine_set_video_bitrate(VeilMediaEngine *engine,
                                         int max_bitrate_kbps, int max_fps);
