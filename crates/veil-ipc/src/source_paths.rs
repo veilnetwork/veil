@@ -9,10 +9,45 @@ pub fn sealed_relay_hops(
 ) -> Vec<[u8; 32]> {
     let mut hops =
         crate::handlers::send::ordinary_relay_hops(None, destination, cache, registry, true);
-    prefer_datagrams(&mut hops, registry);
+    hops.sort_by_cached_key(|hop| !registry.has_neutral_forward_datagram_transport(hop));
     hops
 }
 
-pub(crate) fn prefer_datagrams(hops: &mut [[u8; 32]], registry: &dyn FrameBroadcaster) {
-    hops.sort_by_key(|hop| !registry.has_neutral_forward_datagram_transport(hop));
+/// Source-specific sibling retaining the generic public snapshot for callers
+/// which do not own an independent local producer.
+pub fn sealed_relay_hops_for_source(
+    destination: &[u8; 32],
+    cache: Option<&RwLock<veil_routing::RouteCache>>,
+    registry: &dyn FrameBroadcaster,
+    local_lane: u8,
+) -> Vec<[u8; 32]> {
+    let mut hops = sealed_relay_hops(destination, cache, registry);
+    prefer_ready_sources(&mut hops, registry, local_lane);
+    hops
+}
+
+pub(crate) fn prefer_ready_sources(
+    hops: &mut [[u8; 32]],
+    registry: &dyn FrameBroadcaster,
+    local_lane: u8,
+) {
+    use veil_types::LocalDatagramChannelState as State;
+    // Queue admission does not prove the negotiated child can send. Keep
+    // existing ready alternatives ahead of cached hops whose independent
+    // source is still warming; the runner otherwise discards their packets.
+    // Unsupported retains the old transport fallback. Nothing opens a new
+    // connection, promotes a direct peer, or changes a relay's wire policy.
+    // Cache one snapshot per hop: readiness can change concurrently, so the
+    // comparator must not query live state repeatedly during the sort.
+    hops.sort_by_cached_key(|hop| {
+        let readiness = match registry.local_datagram_channel_state(hop, local_lane) {
+            State::Ready => 0,
+            State::Unsupported => 1,
+            State::Warming => 2,
+        };
+        (
+            readiness,
+            !registry.has_neutral_forward_datagram_transport(hop),
+        )
+    });
 }

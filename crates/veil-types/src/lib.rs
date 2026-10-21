@@ -58,6 +58,16 @@ use std::sync::Arc;
 /// `Arc<Mutex<node::session::tx_registry::SessionTxRegistry>>` via a small
 /// adapter newtype in `node::session_glue`.
 pub trait FrameBroadcaster: Send + Sync {
+    /// Read-only endpoint readiness; never opens a connection or changes a
+    /// remote service policy. Unsupported retains legacy route compatibility.
+    fn local_datagram_channel_state(
+        &self,
+        _peer_id: &[u8; 32],
+        _local_lane: u8,
+    ) -> LocalDatagramChannelState {
+        LocalDatagramChannelState::Unsupported
+    }
+
     /// Local IPC may request preparation without submitting user packets.
     fn supports_local_datagram_preparation(&self) -> bool {
         false

@@ -225,6 +225,15 @@ impl RoutedFrameBroadcaster {
 }
 
 impl FrameBroadcaster for RoutedFrameBroadcaster {
+    fn local_datagram_channel_state(
+        &self,
+        peer_id: &[u8; 32],
+        local_lane: u8,
+    ) -> veil_types::LocalDatagramChannelState {
+        self.direct
+            .local_datagram_channel_state(peer_id, local_lane)
+    }
+
     fn supports_local_datagram_preparation(&self) -> bool {
         self.direct.supports_local_datagram_preparation()
     }
