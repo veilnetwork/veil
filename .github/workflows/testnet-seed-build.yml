@@ -1,0 +1,59 @@
+name: testnet seed binary
+on:
+  push:
+    branches: [ops/testnet-seeds-0.11.43]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '4'
+      VEIL_RELEASE_UNIX: '1792584783'
+      SOURCE_DATE_EPOCH: '1792584783'
+      RUSTFLAGS: '--remap-path-prefix=${{ github.workspace }}=. --remap-path-prefix=/home/runner=/HOME'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 2
+      - name: Verify source and network feature selection
+        run: |
+          test "$(git rev-parse HEAD^)" = f46d21ae5c240e9e40bb6c7977386a7fdab466ea
+          test "$(git diff --name-only HEAD^ HEAD)" = .github/workflows/testnet-seed-build.yml
+          cargo metadata --locked --format-version 1 --filter-platform x86_64-unknown-linux-musl \
+            --no-default-features --features veil-cli/rocksdb-cold,veil-cli/tls-boring,veil-cli/testnet-seeds,veil-node-runtime/testnet-seeds > /tmp/testnet-metadata.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/testnet-metadata.json')); names={p['id']:p['name'] for p in d['packages']}
+          for n in d['resolve']['nodes']:
+              if names[n['id']] in ['veil-cli','veil-bootstrap','veil-node-runtime']:
+                  assert 'testnet-seeds' in n['features'], n
+                  assert 'production-seeds' not in n['features'], n
+                  print(names[n['id']], n['features'])
+          PY
+      - name: Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev cmake build-essential pkg-config golang ninja-build
+          pip3 install --user --break-system-packages 'cargo-zigbuild==0.22.3' 'ziglang==0.16.0'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          rustup target add x86_64-unknown-linux-musl
+      - name: Build isolated testnet binary
+        run: |
+          cargo zigbuild --release --locked -p veil-cli --no-default-features \
+            --features rocksdb-cold,tls-boring,testnet-seeds,veil-node-runtime/testnet-seeds \
+            --target x86_64-unknown-linux-musl
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/veil-cli dist/veil-cli-testnet
+          dist/veil-cli-testnet --version | grep -Fx 'veil-cli 0.11.43'
+          sha256sum dist/veil-cli-testnet > dist/SHA256SUMS
+          printf '%s\n' f46d21ae5c240e9e40bb6c7977386a7fdab466ea > dist/SOURCE_COMMIT
+          printf '%s\n' 'rocksdb-cold,tls-boring,testnet-seeds,veil-node-runtime/testnet-seeds' > dist/FEATURES
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        with:
+          name: veil-testnet-v0.11.43-x86_64-linux-musl
+          path: dist/
+          retention-days: 14
