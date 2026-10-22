@@ -47,6 +47,9 @@ pub struct Addr {
 /// drop downstream is fine, the stream's ARQ repairs it). The receive side is
 /// fed to the [`StreamMux`] separately (it owns inbound demux).
 pub trait CellSender: Send + Sync + 'static {
+    /// `WouldBlock` means no local handoff occurred: retain this cell for retry.
+    /// A cold route may use [`crate::send_backpressure`] to suggest a slower
+    /// cadence without sleeping inside the driver's send operation.
     fn send(&self, dst: Addr, cell: Vec<u8>) -> impl Future<Output = io::Result<()>> + Send;
     /// Send an ordered burst of cells to one peer. Accepted cells are popped
     /// from the front of `cells`; on `Err` the failing cell and everything
