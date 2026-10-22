@@ -1235,6 +1235,10 @@ int main(int argc, char** argv) {
         static_cast<unsigned long long>(metric(receiver.get(), "audio_concealed_samples")),
         static_cast<unsigned long long>(metric(receiver.get(), "audio_interruption_count")),
         static_cast<unsigned long long>(metric(receiver.get(), "audio_jb_flushes")));
+    std::printf("{\"inserted_samples\":%llu,\"accelerated_samples\":%llu,\"forced_trim_ms\":%llu}\n",
+        static_cast<unsigned long long>(metric(receiver.get(), "audio_inserted_samples_for_deceleration")),
+        static_cast<unsigned long long>(metric(receiver.get(), "audio_removed_samples_for_acceleration")),
+        static_cast<unsigned long long>(metric(receiver.get(), "audio_latency_discarded_ms")));
     std::fflush(stdout);
     assert(recovered); // Print the complete PCM trace before rejecting a policy.
     const auto concealed = metric(receiver.get(), "audio_concealed_samples");

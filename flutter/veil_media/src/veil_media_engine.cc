@@ -3008,7 +3008,15 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   for (const auto& entry : ws->peers) {
     if (!first_delivery) snapshot += ',';
     first_delivery = false;
-    snapshot += "\"" + entry.first + "\":" +
+    // peers is keyed by binary 32-byte ids. JSON keys must be printable hex;
+    // embedded NUL/control bytes otherwise truncate or invalidate all stats.
+    constexpr char digits[] = "0123456789abcdef";
+    std::string id(64, '0');
+    for (size_t i = 0; i < 32; ++i) {
+      id[2 * i] = digits[entry.second->id[i] >> 4];
+      id[2 * i + 1] = digits[entry.second->id[i] & 15];
+    }
+    snapshot += "\"" + id + "\":" +
         entry.second->shim->video_delivery_json(webrtc::TimeMicros(),
             delivery_source.payload_timestamp,
             delivery_source.payload_bytes / ws->peers.size(),
@@ -4385,6 +4393,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     uint64_t audio_silent_concealed_samples = 0;
     uint64_t audio_output_emitted_samples = 0;
     uint64_t audio_total_samples_received = 0;
+    uint64_t audio_inserted_samples_for_deceleration = 0;
+    uint64_t audio_removed_samples_for_acceleration = 0;
     uint64_t audio_output_duration_ms = 0;
     uint64_t audio_concealment_events = 0;
     uint64_t audio_jb_flushes = 0;
@@ -4479,6 +4489,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         // playout clock. They are endpoint diagnostics, never wire metadata.
         audio_output_emitted_samples = r.jitter_buffer_emitted_count;
         audio_total_samples_received = r.total_samples_received;
+        audio_inserted_samples_for_deceleration = r.inserted_samples_for_deceleration;
+        audio_removed_samples_for_acceleration = r.removed_samples_for_acceleration;
         audio_output_duration_ms = static_cast<uint64_t>(r.total_output_duration * 1000);
         audio_concealment_events = r.concealment_events;
         audio_jb_flushes = r.jitter_buffer_flushes;
@@ -4778,6 +4790,10 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
           std::to_string(video_report.fresh_persistent_loss_report_us(loss_now_us));
       snapshot += ",\"audio_output_emitted_samples\":" + std::to_string(audio_output_emitted_samples);
       snapshot += ",\"audio_total_samples_received\":" + std::to_string(audio_total_samples_received);
+      snapshot += ",\"audio_inserted_samples_for_deceleration\":" +
+          std::to_string(audio_inserted_samples_for_deceleration);
+      snapshot += ",\"audio_removed_samples_for_acceleration\":" +
+          std::to_string(audio_removed_samples_for_acceleration);
       snapshot += ",\"audio_output_duration_ms\":" + std::to_string(audio_output_duration_ms);
       snapshot += ",\"audio_tx_rtp_drops\":" + std::to_string(tx_audio.dropped);
       const auto video_send = ws->shim->video_send_stats();

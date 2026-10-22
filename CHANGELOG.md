@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Export numeric receive time-stretch sample counters in endpoint JSON to
+  distinguish preemptive expansion, acceleration and forced catch-up.
+- Encode group video-delivery peer keys as hex in native JSON. Binary map keys
+  previously introduced NUL/non-UTF-8 bytes and truncated group statistics.
+  Require metric presence and printable JSON in the real group recovery gate.
 - Recover Android AAudio capture and playout after the OS disconnects a
   stream during speaker, headset or other device changes. Serialize reopen
   on an owned worker, reject retired generations and join it at teardown.
