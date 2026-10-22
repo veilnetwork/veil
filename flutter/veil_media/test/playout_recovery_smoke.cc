@@ -1,11 +1,14 @@
 #undef NDEBUG  // The WebRTC release flags must not disable this regression.
 #include "veil_playout_recovery.h"
 #include "rtc_base/time_utils.h"
+#include "api/audio_codecs/builtin_audio_decoder_factory.h"
+#include "api/environment/environment_factory.h"
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <string>
+#include <vector>
 #include <unistd.h>
 
 class Decoder final : public webrtc::NetEq {
@@ -135,6 +138,40 @@ void DecodedAgeRegression(int mode = 0, int queued_ms = 90,
 }
 
 int main() {
+  // Exercise the production factory with real NetEq/PCMU. Draining stale
+  // audio within one render callback must not age packets by those discarded
+  // blocks: no additional wall/render time has elapsed.
+  {
+    auto stats = std::make_shared<veil_media::PlayoutRecoveryStats>();
+    veil_media::RecoveringNetEqFactory factory(stats);
+    webrtc::NetEq::Config config;
+    config.sample_rate_hz = 8000;
+    auto neteq = factory.Create(webrtc::CreateEnvironment(), config,
+                                webrtc::CreateBuiltinAudioDecoderFactory());
+    assert(neteq->RegisterPayloadType(0, webrtc::SdpAudioFormat("PCMU", 8000, 1)));
+    webrtc::RTPHeader header{};
+    header.ssrc = 99;
+    header.payloadType = 0;
+    const std::vector<uint8_t> payload(160, 0x7f); // 20-ms G.711 packet.
+    for (int i = 0; i < 25; ++i) {
+      header.sequenceNumber = i;
+      header.timestamp = i * 160;
+      assert(neteq->InsertPacket(header, payload,
+          webrtc::RtpPacketInfo(header, webrtc::Timestamp::Micros(1000000))) == 0);
+    }
+    webrtc::AudioFrame frame;
+    assert(neteq->GetAudio(&frame) == 0);
+    const auto state = neteq->GetOperationsAndState();
+    std::printf("one render: discarded=%llu ms, packet waited=%llu ms\n",
+        static_cast<unsigned long long>(stats->discarded_ms.load()),
+        static_cast<unsigned long long>(state.last_waiting_time_ms));
+    assert(stats->discarded_ms > 0); // Ensure this actually exercises catch-up.
+    assert(state.last_waiting_time_ms == 10);
+    for (int renders = 2; renders <= 3; ++renders) {
+      assert(neteq->GetAudio(&frame) == 0);
+      assert(neteq->GetOperationsAndState().last_waiting_time_ms == renders * 10);
+    }
+  }
   DecodedAgeRegression();
   // Physical render trace: RTP age initiated a trim with only 84 ms stored,
   // below the adaptive 120-ms target. The decoder then refilled that target,
