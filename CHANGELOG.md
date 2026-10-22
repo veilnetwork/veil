@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.11.44 — 2026-10-22
+
+### Changed
+
+- Add optional encrypted decoder feedback for delivery-driven video source
+  probes, including replay, freshness and receiver-generation checks.
+- Keep ready source channels during relay route churn and warm preferred
+  paths without withdrawing a working fallback.
+- Preserve ACK-funded source flight through bounded growth holds and exclude
+  unrelated background control debt from the measured healthy allowance.
+- Distinguish original video admission failures from rejected repairs.
+- Keep individual first-hop warnings from overriding fresh consumer health;
+  retain conservative overload protection when consumer feedback is absent.
+- Compile synthetic camera sources and test bitrate overrides only into
+  explicitly enabled media test builds.
+
+### Compatibility
+
+- Older call engines retain the existing adaptation path. Rebuild the media
+  wrapper to enable decoder-driven probes; no required C ABI export is added.
+- Relays still forward opaque traffic with no media classification or priority.
+  No mailbox fallback or storage-format change is introduced.
+
 ## v0.11.43 — 2026-10-21
 
 ### Fixed
