@@ -1359,12 +1359,22 @@ impl CellSender for CircuitCells {
             .circuit_for(dst.node, stream_id, route_class, is_handshake)
             .await?
         else {
-            // Circuit not up yet — drop this cell; the ARQ/handshake RTO resends.
-            if ack_copies > 0 {
-                self.send_ack_copies(dst.node, None, &cell, ack_copies)
-                    .await;
+            // No local handoff happened. Keep the exact encoded cell in the
+            // driver's bounded queue while the circuit opens, rather than
+            // inventing a network loss and waiting for the six-second SYN RTO.
+            if ack_copies > 0
+                && self
+                    .send_ack_copies(dst.node, None, &cell, ack_copies)
+                    .await
+                    > 0
+            {
+                // An alternate actually accepted this cumulative ACK. It need
+                // not stay pending and emit duplicate ACKs on every local retry.
+                return Ok(());
             }
-            return Ok(());
+            return Err(veil_onion_stream::send_backpressure(Duration::from_millis(
+                25,
+            )));
         };
         if self.route_session_stale(&route) {
             self.mark_route_stale(dst.node, &route).await;
@@ -1380,12 +1390,17 @@ impl CellSender for CircuitCells {
         if is_data {
             self.data_pacer.wait(dst.node).await;
         }
-        if ack_copies > 0 {
+        let accepted_ack_copies = if ack_copies > 0 {
             self.send_ack_copies(dst.node, route.rendezvous_node, &cell, ack_copies)
-                .await;
-        }
+                .await
+        } else {
+            0
+        };
         if let Err(e) = self.send_stream_envelope(&route.circuit, &env, is_data) {
             if e == veil_node_runtime::DataCircuitSendError::QueueFull {
+                if accepted_ack_copies > 0 {
+                    return Ok(());
+                }
                 // Local first-hop session TX queue is full. The encoded stream
                 // cell has not entered the transport, so surface backpressure to
                 // the stream driver and let it retry the same cell instead of
@@ -1716,16 +1731,18 @@ impl CircuitCells {
     /// signal anywhere. Copies are cumulative/idempotent, ~100 B each, and ride
     /// relays the stream already uses. Never blocks the driver (`try_lock`,
     /// like [`Self::stripe_alternates`]) and never surfaces errors: the primary
-    /// send path owns route-health bookkeeping.
+    /// send path owns route-health bookkeeping. Returns the number of local
+    /// handoffs, not peer receipts, so a successful ACK copy can release the
+    /// driver's pending cell even while its primary route is unavailable.
     async fn send_ack_copies(
         &self,
         dst_node: [u8; 32],
         primary_relay: Option<[u8; 32]>,
         cell: &[u8],
         max_extra: usize,
-    ) {
+    ) -> usize {
         if max_extra == 0 {
-            return;
+            return 0;
         }
         let cooldown_now = Instant::now();
         let cooled_relays = {
@@ -1744,10 +1761,10 @@ impl CircuitCells {
         };
         let copies = {
             let Ok(circuits) = self.outbound_circuits.try_lock() else {
-                return;
+                return 0;
             };
             let Some(entries) = circuits.get(&dst_node) else {
-                return;
+                return 0;
             };
             let mut used_relays: Vec<[u8; 32]> = primary_relay.into_iter().collect();
             let mut copies = Vec::new();
@@ -1780,6 +1797,7 @@ impl CircuitCells {
             }
             copies
         };
+        let mut accepted = 0;
         for alt in copies {
             let Ok(env) = self.stream_envelope(&alt, cell, false) else {
                 continue;
@@ -1789,6 +1807,7 @@ impl CircuitCells {
                 .send_circuit_cell_detailed(&alt.circuit, &env)
                 .is_ok()
             {
+                accepted += 1;
                 if let Some(stats) = alt.stats.as_ref() {
                     let _ = stats.record_send(false, 0);
                 }
@@ -1808,6 +1827,7 @@ impl CircuitCells {
                 }
             }
         }
+        accepted
     }
 
     /// Send a contiguous run of DATA cells for one stream over one resolved
@@ -1826,9 +1846,11 @@ impl CircuitCells {
             .circuit_for(dst.node, Some(stream_id), RouteClass::Bulk, false)
             .await?
         else {
-            // Circuit not up yet — drop the run; the stream's ARQ resends.
-            cells.drain(..run_len);
-            return Ok(());
+            // The scalar path retains unsent cells too. In particular do not
+            // drain this DATA run merely because its replacement route is cold.
+            return Err(veil_onion_stream::send_backpressure(Duration::from_millis(
+                25,
+            )));
         };
         if self.route_session_stale(&route) {
             self.mark_route_stale(dst.node, &route).await;
@@ -5054,6 +5076,194 @@ mod tests {
         let services =
             veil_node_runtime::embedded_services_for(&runtime.access().local_node_id()).unwrap();
         (dir, runtime, services)
+    }
+
+    #[tokio::test]
+    async fn cold_stream_route_retains_unsent_handshake_and_data() {
+        use veil_onion_stream::{Addr, CellSender};
+        let (_dir, mut runtime, _services) = offline_feed_fixture().await;
+        let me = runtime.access().local_node_id();
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(4);
+        let cells = super::try_open_circuit(me, in_tx, CircuitMode::PublishedRendezvous).unwrap();
+        let destination = Addr {
+            node: [0x8b; 32],
+            app: [0x82; 32],
+        };
+        let frames = [
+            Frame::Syn {
+                stream_id: 11,
+                isn: 100,
+                win: 8192,
+            },
+            Frame::SynAck {
+                stream_id: 12,
+                isn: 100,
+                win: 8192,
+                ack: 1,
+            },
+            Frame::Data {
+                stream_id: 13,
+                seq: 100,
+                win: 8192,
+                payload: b"request",
+            },
+            Frame::Ack {
+                stream_id: 14,
+                ack: 100,
+                win: 8192,
+                sacks: Default::default(),
+            },
+        ];
+        let mut results = Vec::new();
+        for frame in frames {
+            let mut encoded = Vec::new();
+            frame.encode_into(&mut encoded);
+            let mut pending = std::collections::VecDeque::from([encoded.clone()]);
+            let result = cells.send_many(destination, &mut pending).await;
+            results.push((result.err().map(|e| e.kind()), pending, vec![encoded]));
+        }
+        // Exercise the separately optimized DATA run path, not just scalars.
+        let mut encoded = Vec::new();
+        Frame::Data {
+            stream_id: 15,
+            seq: 100,
+            win: 8192,
+            payload: b"payload",
+        }
+        .encode_into(&mut encoded);
+        let mut next = Vec::new();
+        Frame::Data {
+            stream_id: 15,
+            seq: 107,
+            win: 8192,
+            payload: b"next",
+        }
+        .encode_into(&mut next);
+        let expected = vec![encoded, next];
+        let mut pending = std::collections::VecDeque::from(expected.clone());
+        let result = cells.send_many(destination, &mut pending).await;
+        results.push((result.err().map(|e| e.kind()), pending, expected));
+        runtime.stop().await.unwrap();
+        for (error, pending, expected) in results {
+            assert_eq!(
+                error,
+                Some(std::io::ErrorKind::WouldBlock),
+                "a cold local route must not acknowledge a cell it did not send"
+            );
+            assert_eq!(
+                pending.into_iter().collect::<Vec<_>>(),
+                expected,
+                "the driver must retain the exact unsent cells for local retry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_stream_route_resumes_without_waiting_for_handshake_rto() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::Duration;
+        use veil_onion_stream::{Addr, CellSender, Config, StreamMux};
+        struct WarmingSender {
+            me: Addr,
+            cold: Option<Arc<super::CircuitCells>>,
+            ready: AtomicBool,
+            attempted: tokio::sync::Notify,
+            wire: tokio::sync::mpsc::Sender<(Addr, Vec<u8>)>,
+        }
+        impl CellSender for WarmingSender {
+            async fn send(&self, dst: Addr, cell: Vec<u8>) -> std::io::Result<()> {
+                if let Some(cold) = &self.cold
+                    && !self.ready.load(Ordering::Acquire)
+                {
+                    let result = cold.send(dst, cell).await;
+                    self.attempted.notify_one();
+                    return result;
+                }
+                self.wire
+                    .try_send((self.me, cell))
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::WouldBlock, "wire full"))
+            }
+        }
+        let (_dir, mut runtime, _services) = offline_feed_fixture().await;
+        let me = runtime.access().local_node_id();
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(4);
+        let cold =
+            Arc::new(super::try_open_circuit(me, in_tx, CircuitMode::PublishedRendezvous).unwrap());
+        let a = Addr {
+            node: [0xa8; 32],
+            app: [1; 32],
+        };
+        let b = Addr {
+            node: [0xaa; 32],
+            app: [2; 32],
+        };
+        let (a_tx, a_rx) = tokio::sync::mpsc::channel(64);
+        let (b_tx, b_rx) = tokio::sync::mpsc::channel(64);
+        let forward = Arc::new(WarmingSender {
+            me: a,
+            cold: Some(cold),
+            ready: AtomicBool::new(false),
+            attempted: Default::default(),
+            wire: b_tx,
+        });
+        let backward = Arc::new(WarmingSender {
+            me: b,
+            cold: None,
+            ready: AtomicBool::new(true),
+            attempted: Default::default(),
+            wire: a_tx,
+        });
+        let config = Config {
+            handshake_rto_ms: 6000,
+            ..Config::default()
+        };
+        let mux_a = StreamMux::new(a.node, forward.clone(), a_rx, config);
+        let mux_b = StreamMux::new(b.node, backward, b_rx, config);
+        let mut outgoing = mux_a.open(b);
+        outgoing.write_all(b"manifest request").await.unwrap();
+        let attempted =
+            tokio::time::timeout(Duration::from_secs(2), forward.attempted.notified()).await;
+        forward.ready.store(true, Ordering::Release);
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let (mut incoming, peer) = mux_b.accept().await.unwrap();
+            assert_eq!(peer.node, a.node);
+            let mut bytes = [0u8; 16];
+            let mut got = 0;
+            while got < bytes.len() {
+                let n = incoming.read(&mut bytes[got..]).await.unwrap();
+                assert!(n > 0);
+                got += n;
+            }
+            assert_eq!(&bytes, b"manifest request");
+            incoming.write_all(b"manifest").await.unwrap();
+            let mut reply = [0u8; 8];
+            let mut got = 0;
+            while got < reply.len() {
+                let n = outgoing.read(&mut reply[got..]).await.unwrap();
+                assert!(n > 0);
+                got += n;
+            }
+            assert_eq!(&reply, b"manifest");
+            incoming
+                .reset(veil_onion_stream::wire::reset_reason::APP)
+                .await;
+        })
+        .await;
+        outgoing
+            .reset(veil_onion_stream::wire::reset_reason::APP)
+            .await;
+        runtime.stop().await.unwrap();
+        assert!(
+            attempted.is_ok(),
+            "the real cold SDK path was not exercised"
+        );
+        assert!(
+            result.is_ok(),
+            "a locally unsent SYN waited for the six-second network RTO"
+        );
     }
 
     fn feed_envelope(tag: [u8; 32], cell: &[u8]) -> Vec<u8> {
