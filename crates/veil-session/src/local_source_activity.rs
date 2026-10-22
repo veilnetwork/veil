@@ -276,11 +276,22 @@ impl LocalSourceActivity {
     /// conservatively. Actual negative feedback invalidates that health first.
     pub(crate) fn note_primary_transport_pressure(&self, now: Instant) {
         self.note_reliable_transport_pressure(now);
-        if self.flight.transport_pressure(now) {
-            let mut state = lock!(self.state);
-            let until = now + PRESSURE_GRACE;
-            state.pressure_until = Some(state.pressure_until.map_or(until, |old| old.max(until)));
+        self.note_unmeasured_primary_delay(now);
+    }
+
+    /// Retain legacy conservative admission when consumer measurements are
+    /// unavailable. An absolute path delay is not measured consumer failure:
+    /// fresh positive health leaves both the lossy pool and DATA unchanged.
+    /// The flight pool decides atomically, without extending a health lease.
+    pub(crate) fn note_unmeasured_primary_delay(&self, now: Instant) -> bool {
+        if !self.flight.transport_pressure(now) {
+            return false;
         }
+        self.note_reliable_transport_pressure(now);
+        let mut state = lock!(self.state);
+        let until = now + PRESSURE_GRACE;
+        state.pressure_until = Some(state.pressure_until.map_or(until, |old| old.max(until)));
+        true
     }
 
     /// Sustained delay growth on this endpoint's authenticated primary path
@@ -633,6 +644,38 @@ mod tests {
             "the warm's real bytes already consume the competing window"
         );
         policy.closed();
+    }
+
+    #[test]
+    fn unmeasured_path_delay_keeps_legacy_protection_without_penalizing_healthy_consumers() {
+        let source = LocalSourceActivity::default();
+        let now = Instant::now();
+        source.note(now);
+        assert!(source.note_unmeasured_primary_delay(now));
+        assert!(source.allow_secondary(8192, now));
+        assert!(!source.allow_secondary(8192, now));
+        let healthy = now + PRESSURE_GRACE;
+        source.note(healthy);
+        source.note_feedback(false, healthy);
+        assert!(!source.note_unmeasured_primary_delay(healthy));
+        assert!(source.allow_secondary(60000, healthy));
+        assert!(source.allow_secondary(60000, healthy));
+        // Known health must not silently reset the ordinary DATA ramp either.
+        assert!(
+            lock!(source.state)
+                .reliable_transport_pressure_until
+                .is_none_or(|until| until <= healthy)
+        );
+        assert!(!source.note_unmeasured_primary_delay(healthy + Duration::from_secs(1)));
+        let stale = healthy + IDLE_GRACE;
+        source.note(stale);
+        assert!(source.note_unmeasured_primary_delay(stale));
+        let recovered = stale + PRESSURE_GRACE;
+        source.note(recovered);
+        source.note_feedback(false, recovered);
+        assert!(!source.note_unmeasured_primary_delay(recovered));
+        source.note_feedback(true, recovered);
+        assert!(source.note_unmeasured_primary_delay(recovered));
     }
 
     #[test]
