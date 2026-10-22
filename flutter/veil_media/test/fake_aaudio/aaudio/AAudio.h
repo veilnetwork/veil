@@ -1,0 +1,35 @@
+#pragma once
+#include <cstdint>
+struct AAudioStream;
+struct AAudioStreamBuilder;
+using aaudio_result_t = int32_t;
+using aaudio_format_t = int32_t;
+using aaudio_data_callback_result_t = int32_t;
+using AAudioStream_dataCallback = aaudio_data_callback_result_t (*)(AAudioStream*, void*, void*, int32_t);
+using AAudioStream_errorCallback = void (*)(AAudioStream*, void*, aaudio_result_t);
+constexpr int AAUDIO_OK = 0;
+constexpr int AAUDIO_ERROR_DISCONNECTED = -899;
+constexpr int AAUDIO_DIRECTION_INPUT = 1, AAUDIO_DIRECTION_OUTPUT = 0;
+constexpr int AAUDIO_FORMAT_PCM_I16 = 1, AAUDIO_SHARING_MODE_SHARED = 1;
+constexpr int AAUDIO_PERFORMANCE_MODE_LOW_LATENCY = 12;
+constexpr int AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION = 7;
+constexpr int AAUDIO_USAGE_VOICE_COMMUNICATION = 2, AAUDIO_CONTENT_TYPE_SPEECH = 1;
+constexpr int AAUDIO_CALLBACK_RESULT_CONTINUE = 0;
+aaudio_result_t AAudio_createStreamBuilder(AAudioStreamBuilder**);
+aaudio_result_t AAudioStreamBuilder_delete(AAudioStreamBuilder*);
+void AAudioStreamBuilder_setDirection(AAudioStreamBuilder*, int32_t);
+void AAudioStreamBuilder_setSampleRate(AAudioStreamBuilder*, int32_t);
+void AAudioStreamBuilder_setChannelCount(AAudioStreamBuilder*, int32_t);
+void AAudioStreamBuilder_setFormat(AAudioStreamBuilder*, aaudio_format_t);
+void AAudioStreamBuilder_setSharingMode(AAudioStreamBuilder*, int32_t);
+void AAudioStreamBuilder_setPerformanceMode(AAudioStreamBuilder*, int32_t);
+void AAudioStreamBuilder_setDeviceId(AAudioStreamBuilder*, int32_t);
+void AAudioStreamBuilder_setDataCallback(AAudioStreamBuilder*, AAudioStream_dataCallback, void*);
+void AAudioStreamBuilder_setErrorCallback(AAudioStreamBuilder*, AAudioStream_errorCallback, void*);
+aaudio_result_t AAudioStreamBuilder_openStream(AAudioStreamBuilder*, AAudioStream**);
+aaudio_result_t AAudioStream_requestStart(AAudioStream*);
+aaudio_result_t AAudioStream_requestStop(AAudioStream*);
+aaudio_result_t AAudioStream_close(AAudioStream*);
+int32_t AAudioStream_getSampleRate(AAudioStream*);
+int32_t AAudioStream_getChannelCount(AAudioStream*);
+aaudio_format_t AAudioStream_getFormat(AAudioStream*);
