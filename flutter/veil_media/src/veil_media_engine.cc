@@ -190,6 +190,7 @@ webrtc::SdpAudioFormat VeilOpusSendFormat() {
 // prior with no ceiling generated video-sized padding probes on the audio
 // source connection. Keep room for Opus/FEC/RTP overhead without competing
 // with real audio for a budget that only the separate video Call can use.
+// Framing-aware unicast routes update this ceiling on their own worker below.
 // This caps estimator/probe traffic; codec and Veil/relay policies are unchanged.
 void configure_call_audio_transport(webrtc::CallConfig& config) {
   config.bitrate_config.start_bitrate_bps = 48'000;
@@ -1064,6 +1065,7 @@ struct WebrtcState {
   std::atomic<int> video_packet_overhead{0};
 #if defined(VEIL_MEDIA_TEST_HOOKS)
   std::shared_ptr<std::atomic<int>> audio_route_restarts = std::make_shared<std::atomic<int>>(0);
+  std::shared_ptr<std::atomic<int>> audio_route_ceiling = std::make_shared<std::atomic<int>>(0);
   std::shared_ptr<std::atomic<int>> video_route_restarts = std::make_shared<std::atomic<int>>(0);
 #endif
   std::unique_ptr<veil_media::VeilTransportShim> shim;
@@ -1462,6 +1464,13 @@ void apply_audio_route(VeilMediaEngine* engine, bool force = false) {
   auto* ws = engine->ws.get();
   const auto generation = ws->route_generation.load();
   if (!force && ws->audio_route_applied.load() == generation) return;
+  webrtc::BitrateConstraints limits;
+  limits.start_bitrate_bps = -1;  // Preserve the path's current estimate.
+  limits.max_bitrate_bps = veil_media::framing_audio_transport_ceiling_bps(
+      engine->audio_packet_overhead.load());
+  // Client preferences can only tighten CallConfig's original maximum. Update
+  // that base constraint so a larger measured overhead can actually raise it.
+  ws->call->GetTransportControllerSend()->SetSdpBitrateParameters(limits);
   ws->call->GetTransportControllerSend()->OnNetworkRouteChanged(
       "opaque", opaque_route(generation, engine->audio_packet_overhead.load()));
   ws->audio_route_applied.store(generation);
@@ -1909,7 +1918,7 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
 #if defined(VEIL_MEDIA_TEST_HOOKS)
   if (std::getenv("VEIL_MEDIA_TEST_ROUTE_OBSERVER"))
     call_cfg.per_call_network_controller_factory =
-        std::make_unique<veil_media::test::RouteObserverFactory>(ws->audio_route_restarts);
+        std::make_unique<veil_media::test::RouteObserverFactory>(ws->audio_route_restarts, ws->audio_route_ceiling);
 #endif
   ws->call = webrtc::Call::Create(std::move(call_cfg));
   webrtc::CallConfig video_cfg(create_low_latency_environment(true),
@@ -3512,6 +3521,10 @@ int veil_media_engine_set_audio_packet_overhead(VeilMediaEngine* engine, int byt
     // audio worker must not hold up host route control for the usual 10 s.
     const bool applied = veil_media::run_on_with_timeout(ws->worker_tq.get(), [&] {
       const auto generation = ws->route_generation.load();
+      webrtc::BitrateConstraints limits;
+      limits.start_bitrate_bps = -1;
+      limits.max_bitrate_bps = veil_media::framing_audio_transport_ceiling_bps(bytes);
+      ws->call->GetTransportControllerSend()->SetSdpBitrateParameters(limits);
       ws->call->GetTransportControllerSend()->OnNetworkRouteChanged(
           "opaque", opaque_route(generation, bytes));
       ws->audio_route_applied.store(generation);

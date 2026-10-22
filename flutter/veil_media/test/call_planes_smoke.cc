@@ -1,4 +1,5 @@
 #include "veil_media_engine.h"
+#include "veil_audio_adaptor_config.h"
 #include <array>
 #include <atomic>
 #include <cassert>
@@ -34,6 +35,7 @@ extern "C" VeilMediaEngine* veil_media_test_dual_overhead_codec_create(
     uint64_t, const uint8_t*, const uint8_t*, int, int);
 extern "C" int veil_media_test_video_transport_overhead(VeilMediaEngine*);
 extern "C" int veil_media_test_audio_transport_overhead(VeilMediaEngine*);
+extern "C" int veil_media_test_audio_transport_ceiling(VeilMediaEngine*);
 extern "C" int veil_media_test_direct_packet(VeilMediaEngine*, int);
 extern "C" uint64_t veil_media_test_direct_encoded_frames(VeilMediaEngine*);
 extern "C" int veil_media_test_pause_with_held_video_worker(VeilMediaEngine*, VeilGroupMediaEngine*);
@@ -766,6 +768,8 @@ int main(int argc, char** argv) {
         veil_media_engine_destroy);
     assert(e);
     assert(veil_media_test_audio_transport_overhead(e.get()) == 509);
+    assert(veil_media_test_audio_transport_ceiling(e.get()) ==
+           veil_media::framing_audio_transport_ceiling_bps(509));
     assert(veil_media_test_video_transport_overhead(e.get()) == 536);
     assert(veil_media_engine_start_video(e.get(), 1, 1, 150, 15) == VEIL_MEDIA_OK);
     // Stream creation/configuration must retain both independent route models.
@@ -776,6 +780,13 @@ int main(int argc, char** argv) {
     assert(veil_media_test_audio_transport_overhead(e.get()) == 509);
     assert(veil_media_test_route_restarts(e.get(), 0) == 0);
     assert(veil_media_test_route_restarts(e.get(), 1) == 0);
+    // Observe the real GCC constraints, not the requested host value. Client
+    // preferences alone cannot lift CallConfig's original 96-kbit maximum.
+    assert(veil_media_engine_set_audio_packet_overhead(e.get(), 209) == VEIL_MEDIA_OK);
+    assert(veil_media_test_audio_transport_ceiling(e.get()) == 96000);
+    assert(veil_media_engine_set_audio_packet_overhead(e.get(), 509) == VEIL_MEDIA_OK);
+    assert(veil_media_test_audio_transport_ceiling(e.get()) ==
+           veil_media::framing_audio_transport_ceiling_bps(509));
     const auto blocked = [](void* context) {
       auto* engine = static_cast<VeilMediaEngine*>(context);
       const auto start = std::chrono::steady_clock::now();

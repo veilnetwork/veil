@@ -79,7 +79,10 @@ fn poll_stream_write(
         if state.closed {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                WRITER_CLOSED,
+                // A peer/reader close retires only this stream's credit. The
+                // shared IPC writer can still serve other streams. Preserve
+                // the existing FFI closed-handle classification as well.
+                "veil stream already closed",
             )));
         }
         if state.bytes <= overhead {
@@ -482,5 +485,35 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "veil stream already closed");
+        // A retired stream must not be diagnosed as a failed IPC connection.
+        // Prove that a second stream can still write through this writer.
+        let (_other_events, other_rx) = mpsc::channel(8);
+        let mut other = VeilStream::new(8, writer, other_rx);
+        other.write_all(b"still live").await.unwrap();
+        // Dropping the first VeilStream also enqueues its normal close.
+        let frame = loop {
+            let frame = frames.recv().await.unwrap();
+            if veil_proto::codec::decode_header(&frame).unwrap().msg_type
+                == LocalAppMsg::StreamData as u16
+            {
+                break frame;
+            }
+        };
+        let data = StreamDataPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+        assert_eq!(data.stream_id, 8);
+        assert_eq!(data.data, b"still live");
+    }
+
+    #[tokio::test]
+    async fn ipc_writer_exit_is_distinct_from_stream_credit_close() {
+        let (tx, frames) = mpsc::channel::<crate::client::IpcWriterFrame>(8);
+        let writer = SharedWriter::new(tx).with_stream_credit(true);
+        let (_events, rx) = mpsc::channel(8);
+        let mut stream = VeilStream::new(7, writer, rx);
+        drop(frames);
+        let error = stream.write_all(b"cannot write").await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), WRITER_CLOSED);
     }
 }

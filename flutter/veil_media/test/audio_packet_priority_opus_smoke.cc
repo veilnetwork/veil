@@ -100,6 +100,31 @@ int main() {
   const int resumed_before = video;
   feed(200, true, 60, 40);
   require(!priority->VideoBlocked() && video > resumed_before, "video did not resume after real short packet");
+
+  // Field regression: after yielding on a high-overhead route, the fixed
+  // 96-kbit audio Call ceiling cannot fund short packets. Exercise actual
+  // Opus, including DTX, with the production route-derived GCC ceiling.
+  require(encoder->SetDtx(true), "DTX unavailable");
+  for (int route_overhead : {209, 360, 509}) {
+    priority->PauseVideo(true, clock.TimeInMicroseconds());
+    long_not_before = clock.TimeInMicroseconds() + veil_media::AudioPacketPriority::kQuietUs;
+    encoder->OnReceivedOverhead(route_overhead + 20);
+    allocation(64000);
+    feed(200, false, 60);
+    feed(200, false, 60, 60);
+    priority->PauseVideo(false, clock.TimeInMicroseconds());
+    if (route_overhead == 509) {
+      allocation(96000);
+      feed(300, true, 60, 60);
+      require(priority->VideoBlocked(), "old fixed ceiling unexpectedly funds relay recovery");
+    }
+    allocation(veil_media::framing_audio_transport_ceiling_bps(route_overhead));
+    require(priority->VideoBlocked(), "ceiling update bypassed emitted-short ACK");
+    const int before = video;
+    feed(300, true, 60, 40);
+    require(!priority->VideoBlocked() && video > before,
+            "production ceiling failed to release packetization hold");
+  }
   opus_decoder_destroy(decoder);
   std::printf("ok: %d real Opus packets decode; low BWE keeps video live with <=40ms; quiet permits60; short ACK resumes video\n", packets);
 }
