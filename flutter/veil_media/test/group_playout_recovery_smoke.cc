@@ -117,13 +117,16 @@ extern "C" int veil_media_set_recv_callback(
   return 0;
 }
 
-int main() {
+int main(int argc, char** argv) {
   std::array<std::array<uint8_t, 32>, 3> ids{};
   using Engine = std::unique_ptr<VeilGroupMediaEngine,
                                  decltype(&veil_media_group_engine_destroy)>;
   std::vector<Engine> engines;
   for (size_t i = 0; i < ids.size(); ++i) {
     ids[i][0] = static_cast<uint8_t>(i + 1);
+    ids[i][1] = '"';
+    ids[i][2] = '\\';
+    ids[i][3] = 0xff;
     engines.emplace_back(veil_media_test_group_codec_create(ids[i].data()),
                          veil_media_group_engine_destroy);
     assert(engines.back());
@@ -220,9 +223,23 @@ int main() {
              &drive) == 0);
   char *stats = veil_media_group_engine_get_stats(engines[0].get());
   assert(stats);
+  // Mock participant ids contain NUL/control bytes. The native JSON must
+  // encode them, not terminate midway through video_delivery_peers.
+  for (const auto c : std::string(stats))
+    assert(static_cast<unsigned char>(c) >= 32 && static_cast<unsigned char>(c) < 127);
+  for (const char* field : {"\"audio_latency_recovery_count\":",
+                            "\"audio_latency_discarded_ms\":",
+                            "\"audio_latency_fallback_frames\":"})
+    assert(std::strstr(stats, field));
   const auto recoveries = Counter(stats, "audio_latency_recovery_count");
   const auto discarded = Counter(stats, "audio_latency_discarded_ms");
   const auto fallbacks = Counter(stats, "audio_latency_fallback_frames");
+  if (argc == 2) {
+    FILE* output = std::fopen(argv[1], "wb");
+    assert(output);
+    assert(std::fwrite(stats, 1, std::strlen(stats), output) == std::strlen(stats));
+    assert(std::fclose(output) == 0);
+  }
   veil_media_free_string(stats);
   for (auto &e : engines)
     assert(veil_media_group_engine_stop_audio(e.get()) == VEIL_MEDIA_OK);

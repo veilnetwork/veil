@@ -13,4 +13,18 @@ fi
 clang++ -std=c++20 -Wall -Wextra -Werror -Wl,-export_dynamic \
   -I"$ROOT/src" "$ROOT/test/group_playout_recovery_smoke.cc" \
   "$DYLIB" -Wl,-rpath,"$(dirname "$DYLIB")" -o "$STAND_DIR/smoke"
-"$STAND_DIR/smoke"
+"$STAND_DIR/smoke" "$STAND_DIR/stats.json"
+python3 - "$STAND_DIR/stats.json" <<'PYTEST'
+import json, re, sys
+with open(sys.argv[1], encoding='utf-8') as stream:
+    stats = json.load(stream)
+peers = stats['video_delivery_peers']
+expected = {prefix + '00' * 28 for prefix in ['02225cff', '03225cff']}
+assert set(peers) == expected
+assert all(re.fullmatch('[0-9a-f]{64}', key) for key in peers)
+assert set(stats['audio_receivers']) == expected
+for name in ['audio_latency_recovery_count', 'audio_latency_discarded_ms',
+             'audio_latency_fallback_frames']:
+    assert isinstance(stats[name], int)
+print('group stats: valid UTF-8 JSON, hex peer keys and complete numeric counters')
+PYTEST
