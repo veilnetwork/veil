@@ -18,9 +18,37 @@ use tokio::time::Instant;
 use crate::engine::{Config, Event, StreamEngine};
 use crate::wire::reset_reason;
 
+#[derive(Debug)]
+struct SendRetryAfter(u64);
+
+impl std::fmt::Display for SendRetryAfter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("local stream carrier is not ready")
+    }
+}
+
+impl std::error::Error for SendRetryAfter {}
+
+/// Local backpressure with a suggested retry cadence. A route being built may
+/// need a slower retry than a full socket queue. The driver remains responsive
+/// to reads, cancellation and protocol timers while waiting; no wire field or
+/// network retransmission timer changes. Bounds prevent spinning or parking a
+/// stream indefinitely. Ordinary `WouldBlock` keeps its one-millisecond retry.
+pub fn send_backpressure(retry_after: Duration) -> io::Error {
+    let millis = retry_after.as_millis().clamp(1, 1000) as u64;
+    io::Error::new(io::ErrorKind::WouldBlock, SendRetryAfter(millis))
+}
+
+fn send_retry_delay_ms(error: &io::Error) -> u64 {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<SendRetryAfter>())
+        .map_or(SEND_WOULD_BLOCK_RETRY_MS, |delay| delay.0)
+}
+
 /// The cell carrier the stream rides. Best-effort + lossy: `send_cell` may be
-/// dropped downstream (the engine's ARQ repairs it); `Err` means a PERMANENT
-/// failure (circuit torn down). `recv_cell` returns `None` on clean close.
+/// dropped downstream (ARQ repairs it); `WouldBlock` is an unsent local cell.
+/// Other errors are permanent. `recv_cell` returns `None` on clean close.
 pub trait CellDuplex: Send {
     fn send_cell(&mut self, cell: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
     /// Send a burst of cells in order. Cells the carrier accepts are popped
@@ -527,7 +555,9 @@ async fn drive<D: CellDuplex>(
                         would_block_retries = would_block_retries.saturating_add(1);
                     }
                     blocked_since_ms.get_or_insert(now);
-                    send_retry_at = Some(now.saturating_add(SEND_WOULD_BLOCK_RETRY_MS));
+                    // Route lookup itself may have awaited I/O. The suggested
+                    // delay starts when that attempt returns, not before it.
+                    send_retry_at = Some(now_ms(&base).saturating_add(send_retry_delay_ms(&e)));
                     break;
                 }
                 Err(_) => {
