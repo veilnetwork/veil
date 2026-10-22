@@ -13,7 +13,7 @@
 //! does NOT (the responder's first data byte is its `iss`). The responder learns
 //! its SYN_ACK arrived implicitly — any later frame from the initiator proves it.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crate::seq;
 use crate::wire::{Frame, MSS, SackRange, SackVec, reset_reason};
@@ -191,6 +191,47 @@ struct Seg {
     sacked: bool,
     /// Marked for retransmission (a hole below the highest SACK, or an RTO).
     needs_resend: bool,
+    /// Reserved in the send window, but this attempt is still in the driver's
+    /// bounded local queue. It cannot substantiate a network loss or RTT.
+    local_pending: bool,
+    /// An earlier copy may still arrive while a repair waits locally.
+    handed_off: bool,
+}
+
+/// Correlates a driver's local handoff without copying payloads. A partial
+/// carrier send can accept non-prefix cells (route striping), so queue length
+/// alone cannot identify which segments actually left.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct LocalTransmit {
+    seq: u32,
+    span: u32,
+    is_fin: bool,
+}
+
+impl LocalTransmit {
+    pub(crate) fn from_cell(cell: &[u8]) -> Option<Self> {
+        match Frame::decode(cell)? {
+            Frame::Data { seq, payload, .. } => Some(Self {
+                seq,
+                span: payload.len() as u32,
+                is_fin: false,
+            }),
+            Frame::Fin { seq, .. } => Some(Self {
+                seq,
+                span: 1,
+                is_fin: true,
+            }),
+            _ => None,
+        }
+    }
+
+    fn for_segment(segment: &Seg) -> Self {
+        Self {
+            seq: segment.seq,
+            span: segment.span(),
+            is_fin: segment.is_fin,
+        }
+    }
 }
 impl Seg {
     /// Sequence space this segment consumes (FIN consumes 1).
@@ -323,6 +364,7 @@ pub struct StreamEngine {
     persist_deadline: Option<u64>,
     force_probe: bool,
     events: VecDeque<Event>,
+    track_local_handoffs: bool,
 }
 
 impl StreamEngine {
@@ -447,7 +489,34 @@ impl StreamEngine {
             persist_deadline: None,
             force_probe: false,
             events: VecDeque::new(),
+            track_local_handoffs: false,
         }
+    }
+
+    /// The async driver reserves window space at poll time, then confirms
+    /// actual carrier acceptance. Standalone sans-IO callers retain their
+    /// existing convention that polling a cell constitutes its send.
+    pub(crate) fn track_local_handoffs(&mut self) {
+        debug_assert!(self.tx.segs.is_empty());
+        self.track_local_handoffs = true;
+    }
+
+    pub(crate) fn local_handoff(&mut self, accepted: &HashMap<LocalTransmit, usize>, now: u64) {
+        if !accepted.values().any(|count| *count > 0) {
+            return;
+        }
+        for segment in &mut self.tx.segs {
+            if segment.local_pending
+                && accepted
+                    .get(&LocalTransmit::for_segment(segment))
+                    .is_some_and(|n| *n > 0)
+            {
+                segment.local_pending = false;
+                segment.handed_off = true;
+                segment.sent_ms = now;
+            }
+        }
+        self.tx.refresh_local_rto(now);
     }
 
     // ---- app surface ----------------------------------------------------
@@ -707,7 +776,8 @@ impl StreamEngine {
         for r in sacks.as_slice() {
             for i in 0..self.tx.segs.len() {
                 let s = &self.tx.segs[i];
-                if !s.sacked && seq::geq(s.seq, r.start) && seq::leq(s.end(), r.end) {
+                if s.handed_off && !s.sacked && seq::geq(s.seq, r.start) && seq::leq(s.end(), r.end)
+                {
                     let (sent_ms, end, retransmitted) = (s.sent_ms, s.end(), s.retransmitted);
                     self.tx.segs[i].sacked = true;
                     if self.cfg.rack && !retransmitted {
@@ -781,7 +851,18 @@ impl StreamEngine {
                 self.tx.update_rto(r, &self.cfg);
             }
             self.tx.arm_or_clear_rto(now);
-        } else if ack == self.tx.snd_una && !self.tx.segs.is_empty() {
+            if self.track_local_handoffs {
+                self.tx.refresh_local_rto(now);
+            }
+        } else if ack == self.tx.snd_una
+            && !self.tx.segs.is_empty()
+            && (!self.track_local_handoffs
+                || self
+                    .tx
+                    .segs
+                    .iter()
+                    .any(|s| s.handed_off && !s.sacked && !s.local_pending))
+        {
             // ---- duplicate ACK ----
             self.tx.dup_acks += 1;
             if self.tx.dup_acks == 3 && !self.tx.in_recovery && !self.cfg.rack {
@@ -806,6 +887,9 @@ impl StreamEngine {
         // dup-ACK count never declares loss here; only time + a later delivery.
         if self.cfg.rack && self.rack_detect_loss(now) && !self.tx.in_recovery {
             self.enter_fast_recovery();
+        }
+        if self.track_local_handoffs {
+            self.tx.refresh_local_rto(now);
         }
     }
 
@@ -907,11 +991,19 @@ impl StreamEngine {
             // 3a. Retransmit a marked hole first — SACK-aware, so we never resend
             //     a segment the receiver already acknowledged out of order.
             if self.tx.pace_budget > 0
-                && let Some(idx) = self.tx.segs.iter().position(|s| s.needs_resend)
+                && let Some(idx) = self
+                    .tx
+                    .segs
+                    .iter()
+                    .position(|s| s.needs_resend && !s.local_pending)
             {
                 self.tx.segs[idx].needs_resend = false;
                 self.tx.segs[idx].retransmitted = true;
                 self.tx.segs[idx].sent_ms = now;
+                self.tx.segs[idx].local_pending = self.track_local_handoffs;
+                if self.track_local_handoffs {
+                    self.tx.refresh_local_rto(now);
+                }
                 self.tx.pace_budget = self.tx.pace_budget.saturating_sub(1);
                 self.encode_seg_at(idx, out);
                 return true;
@@ -995,11 +1087,21 @@ impl StreamEngine {
                 data,
                 is_fin: false,
                 sent_ms: now,
-                retransmitted: false,
+                retransmitted: self.track_local_handoffs
+                    && self
+                        .tx
+                        .rewind_high
+                        .is_some_and(|high| seq::lt(seq_no, high)),
                 sacked: false,
                 needs_resend: false,
+                local_pending: self.track_local_handoffs,
+                handed_off: !self.track_local_handoffs
+                    || self
+                        .tx
+                        .rewind_high
+                        .is_some_and(|high| seq::leq(seq_no.wrapping_add(take as u32), high)),
             });
-            if self.tx.rto_deadline.is_none() {
+            if !self.track_local_handoffs && self.tx.rto_deadline.is_none() {
                 self.tx.rto_deadline = Some(now + self.tx.rto_ms);
             }
             return true;
@@ -1014,11 +1116,21 @@ impl StreamEngine {
                 data: Vec::new(),
                 is_fin: true,
                 sent_ms: now,
-                retransmitted: false,
+                retransmitted: self.track_local_handoffs
+                    && self
+                        .tx
+                        .rewind_high
+                        .is_some_and(|high| seq::lt(seq_no, high)),
                 sacked: false,
                 needs_resend: false,
+                local_pending: self.track_local_handoffs,
+                handed_off: !self.track_local_handoffs
+                    || self
+                        .tx
+                        .rewind_high
+                        .is_some_and(|high| seq::leq(seq_no.wrapping_add(1), high)),
             });
-            if self.tx.rto_deadline.is_none() {
+            if !self.track_local_handoffs && self.tx.rto_deadline.is_none() {
                 self.tx.rto_deadline = Some(now + self.tx.rto_ms);
             }
             return true;
@@ -1059,7 +1171,11 @@ impl StreamEngine {
         for s in self.tx.segs.iter_mut().rev() {
             if s.sacked {
                 sacked_above += 1;
-            } else if sacked_above >= DUP_THRESH && !s.retransmitted && !s.needs_resend {
+            } else if sacked_above >= DUP_THRESH
+                && !s.local_pending
+                && !s.retransmitted
+                && !s.needs_resend
+            {
                 s.needs_resend = true;
                 any = true;
             }
@@ -1072,7 +1188,7 @@ impl StreamEngine {
                 .tx
                 .segs
                 .iter_mut()
-                .find(|s| !s.sacked && !s.retransmitted && !s.needs_resend)
+                .find(|s| !s.sacked && !s.local_pending && !s.retransmitted && !s.needs_resend)
         {
             f.needs_resend = true;
         }
@@ -1108,7 +1224,7 @@ impl StreamEngine {
         let mut any = false;
         let mut next: Option<u64> = None;
         for s in self.tx.segs.iter_mut() {
-            if s.sacked || s.needs_resend {
+            if s.sacked || s.local_pending || s.needs_resend {
                 continue;
             }
             // Unlike the SACK-count scanner, a retransmitted segment is NOT
@@ -1133,7 +1249,12 @@ impl StreamEngine {
     }
 
     fn mark_oldest_unsacked_for_rto(&mut self) {
-        if let Some(s) = self.tx.segs.iter_mut().find(|s| !s.sacked) {
+        if let Some(s) = self
+            .tx
+            .segs
+            .iter_mut()
+            .find(|s| !s.sacked && !s.local_pending)
+        {
             // RTO means the current repair attempt itself may have been lost.
             // Unlike fast-retransmit's SACK scanner, do not skip a segment just
             // because it was retransmitted once already; the oldest unsacked
@@ -1201,9 +1322,11 @@ impl StreamEngine {
         // Data RTO + retry cap. If the deadline is stale (nothing left unacked),
         // CLEAR it — leaving a past deadline would make the driver's timer fire
         // every poll as sleep(0) and busy-spin.
+        let no_network_flight = self.track_local_handoffs
+            && !self.tx.segs.iter().any(|s| !s.sacked && !s.local_pending);
         if let Some(dl) = self.tx.rto_deadline
             && now >= dl
-            && self.tx.segs.is_empty()
+            && (self.tx.segs.is_empty() || no_network_flight)
         {
             self.tx.rto_deadline = None;
         } else if let Some(dl) = self.tx.rto_deadline
@@ -1223,6 +1346,7 @@ impl StreamEngine {
             let flight = self.tx.snd_nxt.wrapping_sub(self.tx.snd_una);
             let no_sack_rewind = self.cfg.rto_rewind_no_sack
                 && self.tx.segs.iter().all(|s| !s.sacked)
+                && self.tx.segs.iter().all(|s| !s.local_pending)
                 && self.tx.segs.iter().any(|s| !s.is_fin);
             let rto_basis = if no_sack_rewind {
                 // In the pinned circuit path we rewind no-SACK RTO flights back
@@ -1284,7 +1408,9 @@ impl StreamEngine {
                 self.tx.pace_budget = 0;
                 self.tx.rto_deadline = None;
             } else if self.cfg.rto_rewind_no_sack {
-                // Circuit transport, but we DO have SACK feedback. This is not
+                // SACK feedback or locally queued cells require selective
+                // recovery: rewinding would invalidate the driver's unsent
+                // cells. This is not
                 // the "rewind the whole contiguous burst" case above: the
                 // receiver already holds higher-sequence data, so replaying the
                 // whole flight would create a duplicate storm. Still, classic
@@ -1304,10 +1430,18 @@ impl StreamEngine {
                 // With SACK feedback, keep the selective-retransmit model: the
                 // receiver may already hold high-sequence data, and mark_holes()
                 // / later SACKs can repair without replaying the whole flight.
-                if let Some(s) = self.tx.segs.iter_mut().find(|s| !s.sacked) {
+                if let Some(s) = self
+                    .tx
+                    .segs
+                    .iter_mut()
+                    .find(|s| !s.sacked && !s.local_pending)
+                {
                     s.needs_resend = true;
                 }
                 self.tx.rto_deadline = Some(now + self.tx.rto_ms);
+            }
+            if self.track_local_handoffs {
+                self.tx.refresh_local_rto(now);
             }
         }
         // Zero-window persist probe.
@@ -1325,6 +1459,13 @@ impl StreamEngine {
 
     /// Earliest time [`Self::on_timeout`] needs to run again.
     pub fn next_timeout(&self) -> Option<u64> {
+        self.next_timeout_with_pacing(true)
+    }
+
+    /// A driver with committed local cells cannot poll more transmissions;
+    /// an already-due pacing tick would otherwise spin instead of waiting for
+    /// its carrier retry, inbound progress or an actual protocol timeout.
+    pub(crate) fn next_timeout_with_pacing(&self, include_pacing: bool) -> Option<u64> {
         let mut t: Option<u64> = None;
         let mut merge = |x: Option<u64>| {
             if let Some(v) = x {
@@ -1337,7 +1478,7 @@ impl StreamEngine {
         merge(self.persist_deadline);
         merge(self.ack_deadline);
         // If new data is ready but held back only by pacing, wake to release it.
-        if self.phase == Phase::Established && self.paced_send_ready() {
+        if include_pacing && self.phase == Phase::Established && self.paced_send_ready() {
             merge(Some(self.tx.pace_next_ms));
         }
         t
@@ -1485,9 +1626,35 @@ fn encode(frame: Frame<'_>, out: &mut Vec<u8>) {
 
 impl TxState {
     fn ack_limit(&self) -> u32 {
-        self.rewind_high
+        let mut limit = self
+            .rewind_high
             .map(|h| seq::max(self.snd_nxt, h))
-            .unwrap_or(self.snd_nxt)
+            .unwrap_or(self.snd_nxt);
+        for segment in &self.segs {
+            if !segment.handed_off {
+                let mut known = seq::max(segment.seq, self.snd_una);
+                if let Some(high) = self.rewind_high {
+                    known = seq::max(known, seq::min(high, segment.end()));
+                }
+                limit = seq::min(limit, known);
+                break;
+            }
+        }
+        limit
+    }
+
+    fn refresh_local_rto(&mut self, now: u64) {
+        match self.segs.iter().find(|s| !s.sacked && !s.local_pending) {
+            None => self.rto_deadline = None,
+            Some(first) => {
+                let age_bound = first.sent_ms.saturating_add(self.rto_ms);
+                self.rto_deadline = Some(
+                    self.rto_deadline
+                        .unwrap_or_else(|| now.saturating_add(self.rto_ms))
+                        .max(age_bound),
+                );
+            }
+        }
     }
 
     fn trim_rewound_pending_after_ack(&mut self, ack: u32) {
@@ -1780,6 +1947,140 @@ impl RxState {
 mod tests {
     use super::*;
 
+    fn tracked_flight(iss: u32, size: usize) -> (StreamEngine, Vec<LocalTransmit>) {
+        let cfg = Config {
+            mss: 64,
+            init_cwnd: 512,
+            recv_window: 4096,
+            init_rto_ms: 50,
+            min_rto_ms: 40,
+            max_rto_ms: 1000,
+            rto_rewind_no_sack: true,
+            rack: true,
+            ..Config::default()
+        };
+        let mut engine = StreamEngine::connect(11, cfg, 0, iss);
+        engine.track_local_handoffs();
+        engine.on_synack(500, 4096, iss.wrapping_add(1), 0);
+        engine.write(&vec![0x39; size]);
+        let mut encoded = Vec::new();
+        let mut tokens = Vec::new();
+        while engine.poll_transmit(10, &mut encoded) {
+            if let Some(token) = LocalTransmit::from_cell(&encoded) {
+                tokens.push(token);
+            }
+        }
+        (engine, tokens)
+    }
+
+    #[test]
+    fn tracked_local_cells_cannot_be_acked_sacked_or_fast_retransmitted() {
+        for iss in [100, u32::MAX - 127] {
+            let (mut engine, cells) = tracked_flight(iss, 256);
+            let initial_una = engine.tx.snd_una;
+            let initial_cwnd = engine.tx.cwnd;
+            engine.on_ack(engine.tx.snd_nxt, 4096, &SackVec::new(), 20);
+            let mut sacks = SackVec::new();
+            assert!(sacks.push(SackRange {
+                start: cells[2].seq,
+                end: cells[2].seq.wrapping_add(cells[2].span)
+            }));
+            for now in 21..25 {
+                engine.on_ack(initial_una, 4096, &sacks, now);
+            }
+            assert_eq!(engine.tx.snd_una, initial_una);
+            assert_eq!(engine.tx.cwnd, initial_cwnd);
+            assert!(!engine.tx.in_recovery);
+            assert!(
+                engine
+                    .tx
+                    .segs
+                    .iter()
+                    .all(|s| s.local_pending && !s.sacked && !s.needs_resend)
+            );
+            assert_eq!(engine.tx.rto_deadline, None);
+        }
+    }
+
+    #[test]
+    fn tracked_nonprefix_handoff_and_rtt_exclude_local_wait() {
+        let (mut engine, cells) = tracked_flight(u32::MAX - 127, 256);
+        engine.local_handoff(&HashMap::from([(cells[2], 1)]), 200);
+        let mut sacks = SackVec::new();
+        assert!(sacks.push(SackRange {
+            start: cells[2].seq,
+            end: cells[2].seq.wrapping_add(cells[2].span)
+        }));
+        engine.on_ack(engine.tx.snd_una, 4096, &sacks, 210);
+        assert!(engine.tx.segs[2].sacked && !engine.tx.segs[2].local_pending);
+        assert!(!engine.tx.in_recovery && engine.tx.segs[0].local_pending);
+        assert_eq!(engine.tx.rto_deadline, None);
+        engine.local_handoff(&HashMap::from([(cells[0], 1)]), 500);
+        engine.on_ack(
+            cells[0].seq.wrapping_add(cells[0].span),
+            4096,
+            &SackVec::new(),
+            510,
+        );
+        assert_eq!(engine.tx.srtt, Some(10));
+        assert_eq!(
+            engine.tx.rto_deadline, None,
+            "only unhanded or already SACKed cells remain"
+        );
+    }
+
+    #[test]
+    fn tracked_fin_requires_handoff_and_keeps_its_network_timeout() {
+        let (mut engine, data) = tracked_flight(100, 64);
+        engine.finish();
+        let mut encoded = Vec::new();
+        assert!(engine.poll_transmit(20, &mut encoded));
+        let fin = LocalTransmit::from_cell(&encoded).unwrap();
+        assert!(fin.is_fin);
+        engine.local_handoff(&HashMap::from([(data[0], 1)]), 100);
+        engine.on_ack(fin.seq, 4096, &SackVec::new(), 110);
+        engine.on_ack(fin.seq.wrapping_add(1), 4096, &SackVec::new(), 120);
+        assert!(!engine.is_send_complete());
+        engine.on_timeout(10_000);
+        assert_eq!(engine.tx.consec_rto, 0);
+        engine.local_handoff(&HashMap::from([(fin, 1)]), 20_000);
+        engine.on_timeout(21_000);
+        assert!(
+            engine.tx.consec_rto > 0,
+            "a handed-off lost FIN still needs recovery"
+        );
+        engine.on_ack(fin.seq.wrapping_add(1), 4096, &SackVec::new(), 21_001);
+        assert!(engine.is_send_complete());
+    }
+
+    #[test]
+    fn tracked_rewind_allows_late_old_ack_but_not_unsent_new_tail() {
+        let (mut engine, original) = tracked_flight(100, 96);
+        engine.local_handoff(&original.into_iter().map(|t| (t, 1)).collect(), 10);
+        engine.on_timeout(100);
+        let high = engine.tx.rewind_high.unwrap();
+        engine.write(&[0x71; 64]);
+        let mut encoded = Vec::new();
+        let mut replay = HashMap::new();
+        while engine.poll_transmit(101, &mut encoded) {
+            if let Some(token) = LocalTransmit::from_cell(&encoded) {
+                replay.insert(token, 1);
+            }
+        }
+        let replay_end = engine.tx.snd_nxt;
+        assert!(seq::gt(replay_end, high));
+        engine.on_ack(high, 4096, &SackVec::new(), 102);
+        assert_eq!(engine.tx.snd_una, high);
+        engine.on_ack(replay_end, 4096, &SackVec::new(), 103);
+        assert_eq!(
+            engine.tx.snd_una, high,
+            "new bytes have not left the carrier"
+        );
+        engine.local_handoff(&replay, 104);
+        engine.on_ack(replay_end, 4096, &SackVec::new(), 105);
+        assert_eq!(engine.tx.snd_una, replay_end);
+    }
+
     #[test]
     fn bbr_rate_estimate_ratchets_up_and_ignores_thin_windows() {
         let cfg = Config {
@@ -2029,6 +2330,8 @@ mod tests {
                 retransmitted: false,
                 sacked: false,
                 needs_resend: false,
+                local_pending: false,
+                handed_off: true,
             });
         }
         e
@@ -2109,6 +2412,8 @@ mod tests {
             retransmitted: false,
             sacked: false,
             needs_resend: false,
+            local_pending: false,
+            handed_off: true,
         });
 
         e.on_timeout(100);
@@ -2184,6 +2489,8 @@ mod tests {
                 retransmitted: false,
                 sacked: !missing_hole,
                 needs_resend: false,
+                local_pending: false,
+                handed_off: true,
             });
         }
 
@@ -2232,6 +2539,8 @@ mod tests {
                 retransmitted: false,
                 sacked: !missing_hole,
                 needs_resend: false,
+                local_pending: false,
+                handed_off: true,
             });
         }
 
