@@ -857,13 +857,22 @@ struct CircuitEntry {
     /// handshake retransmits those cells several times before the app-level
     /// manifest timeout fires; treating that retransmit as "new work on an old
     /// quiet circuit" rotated the path mid-handshake and made the accepted
-    /// stream EOF before its 48-byte request arrived. New stream ids after the
-    /// same quiet window still force a fresh circuit, which is the resume path.
+    /// stream EOF before its 48-byte request arrived. Explicit handshake/data
+    /// timeout recovery updates this index together with the sticky route,
+    /// without retiring the shared pool. New stream ids after the same quiet
+    /// window can still trigger the make-before-break refill.
     handshake_streams: HashSet<u32>,
     stats: Arc<CircuitRouteStats>,
 }
 
 impl CircuitEntry {
+    fn note_handshake_stream(&mut self, stream_id: u32) {
+        if self.handshake_streams.len() >= 256 && !self.handshake_streams.contains(&stream_id) {
+            self.handshake_streams.clear();
+        }
+        self.handshake_streams.insert(stream_id);
+    }
+
     fn route(&self) -> CircuitRoute {
         CircuitRoute {
             circuit: Arc::clone(&self.circuit),
@@ -1435,6 +1444,30 @@ impl CellSender for CircuitCells {
                 .await;
         }
         Ok(())
+    }
+
+    async fn on_stream_handshake_rto(&self, dst: Addr, stream_id: u32, retries: u32) {
+        if self.mode != CircuitMode::PublishedRendezvous {
+            return;
+        }
+        let route = self
+            .stream_routes
+            .lock()
+            .await
+            .get(&(dst.node, stream_id, RouteClass::Bulk))
+            .cloned();
+        let Some(route) = route else {
+            return;
+        };
+        let remapped = self.remap_stream_route(dst.node, stream_id, &route).await;
+        diag_node(
+            &self.me,
+            &format!(
+                "outbound handshake timeout stream={stream_id} retries={retries} remapped={remapped}; keeping shared circuit pool",
+            ),
+        );
+        self.ensure_outbound_opening(dst.node, RouteClass::Bulk)
+            .await;
     }
 
     async fn on_stream_data_rto(&self, dst: Addr, stream_id: u32, consec_rto: u32, snd_una: u32) {
@@ -2230,9 +2263,9 @@ impl CircuitCells {
                     .await?;
                 if route.is_none() && route_class == RouteClass::Bulk {
                     // All currently usable bulk routes may be at their soft
-                    // active-stream admission limit. Drop this SYN/DATA cell and
-                    // let ARQ retry while a background refill tries to restore a
-                    // wider route pool.
+                    // active-stream admission limit. The caller retains this
+                    // SYN/DATA cell for local retry while a background refill
+                    // tries to restore a wider route pool.
                     self.ensure_outbound_opening(dst_node, route_class).await;
                 }
                 if let (Some(stream_id), Some(route)) = (stream_id, route.clone()) {
@@ -2511,11 +2544,7 @@ impl CircuitCells {
         let entry = &mut entries[idx];
         entry.last_used = now;
         if route_class == RouteClass::Bulk {
-            if entry.handshake_streams.len() >= 256 && !entry.handshake_streams.contains(&stream_id)
-            {
-                entry.handshake_streams.clear();
-            }
-            entry.handshake_streams.insert(stream_id);
+            entry.note_handshake_stream(stream_id);
         }
         Some(entry.route())
     }
@@ -2590,6 +2619,102 @@ impl CircuitCells {
             .await;
     }
 
+    /// Change one stream's Bulk pin, leaving shared circuits and other streams
+    /// intact. Both route indices must agree: deleting only `stream_routes`
+    /// lets `handshake_streams` immediately restore the old path.
+    async fn remap_stream_route(
+        &self,
+        dst_node: [u8; 32],
+        stream_id: u32,
+        old: &CircuitRoute,
+    ) -> bool {
+        let now = Instant::now();
+        let cooled_relays = self
+            .route_cooldowns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let cooled_hops = self
+            .first_hop_cooldowns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        // Hold pool -> stream_routes in this order so a refill cannot retire
+        // the target between selection and pinning. Other route updates release
+        // stream_routes before awaiting the pool.
+        let mut pool = self.outbound_circuits.lock().await;
+        let Some(entries) = pool.get_mut(&dst_node) else {
+            return false;
+        };
+        let target = {
+            entries
+                .iter()
+                .filter(|entry| {
+                    let hop = entry.circuit.first_hop();
+                    !Arc::ptr_eq(&entry.circuit, &old.circuit)
+                        // A different device or receiver generation does not
+                        // own this stream's sequence/reassembly state, even if
+                        // its ad is valid for the same identity address.
+                        && entry.peer_cookie == old.peer_cookie
+                        && match old.envelope {
+                            CircuitEnvelope::ProtectedIntro { receiver_x25519_pk, .. } =>
+                                entry.receiver_x25519_pk == receiver_x25519_pk,
+                            CircuitEnvelope::LegacyClearSender { .. } => true,
+                        }
+                        && cooled_relays
+                            .get(&entry.rendezvous_node)
+                            .is_none_or(|until| *until <= now)
+                        && cooled_hops.get(&hop).is_none_or(|until| *until <= now)
+                        && self.services.has_live_session(&hop)
+                        && self.services.session_close_generation(&hop)
+                            == entry.first_hop_close_generation
+                        && (self.bulk_route_active_limit == 0
+                            || entry.stats.active_streams() < self.bulk_route_active_limit as u64)
+                })
+                .min_by_key(|entry| {
+                    (
+                        entry.circuit.first_hop() == old.circuit.first_hop(),
+                        entry.stats.active_streams(),
+                    )
+                })
+                .map(CircuitEntry::route)
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        {
+            let mut routes = self.stream_routes.lock().await;
+            let key = (dst_node, stream_id, RouteClass::Bulk);
+            if routes
+                .get(&key)
+                .is_none_or(|current| !Arc::ptr_eq(&current.circuit, &old.circuit))
+            {
+                return false;
+            }
+            if let Some(stats) = target.stats.as_ref() {
+                stats.record_stream_open();
+            }
+            if let Some(previous) = routes.insert(key, target.clone()) {
+                record_stream_route_closed(RouteClass::Bulk, &previous);
+            }
+            let ack_key = (dst_node, stream_id, RouteClass::Ack);
+            if routes
+                .get(&ack_key)
+                .is_some_and(|ack| Arc::ptr_eq(&ack.circuit, &old.circuit))
+            {
+                routes.insert(ack_key, target.clone());
+            }
+            for entry in entries {
+                entry.handshake_streams.remove(&stream_id);
+                if Arc::ptr_eq(&entry.circuit, &target.circuit) {
+                    entry.note_handshake_stream(stream_id);
+                    entry.last_used = now;
+                }
+            }
+        }
+        true
+    }
+
     async fn mark_route_no_progress(
         &self,
         dst_node: [u8; 32],
@@ -2614,6 +2739,30 @@ impl CircuitCells {
         let quarantine_route = (route_local_evidence
             && (consec_rto >= 3 || stream_rto_events > CIRCUIT_ROUTE_NO_PROGRESS_RTO_EVENTS))
             || !self.services.has_live_session(&first_hop);
+        if !quarantine_route {
+            let remapped = self.remap_stream_route(dst_node, stream_id, route).await;
+            let stats = route
+                .stats
+                .as_ref()
+                .map(|stats| stats.snapshot().to_string())
+                .unwrap_or_else(|| "stats=none".to_string());
+            diag_node(
+                &self.me,
+                &format!(
+                    "outbound stream no-progress retry for {} stream={} via R={} consec_rto={} stream_rto_events={} snd_una={} remapped={} {stats} — keeping rendezvous warm",
+                    short_node(&dst_node),
+                    stream_id,
+                    short_node(&relay),
+                    consec_rto,
+                    stream_rto_events,
+                    snd_una,
+                    remapped,
+                ),
+            );
+            self.ensure_outbound_opening(dst_node, RouteClass::Bulk)
+                .await;
+            return;
+        }
         // Pool-preserving guard: on a small relay set, two concurrent
         // quarantines that each cool a rendezvous AND a first-hop can leave
         // ZERO openable routes for the whole cooldown (observed live: every
@@ -3188,6 +3337,12 @@ impl CellSender for HubCells {
         match self {
             HubCells::Anon(c) => c.send_many(dst, cells).await,
             HubCells::Circuit(c) => c.send_many(dst, cells).await,
+        }
+    }
+
+    async fn on_stream_handshake_rto(&self, dst: Addr, stream_id: u32, retries: u32) {
+        if let HubCells::Circuit(c) = self {
+            c.on_stream_handshake_rto(dst, stream_id, retries).await;
         }
     }
 
