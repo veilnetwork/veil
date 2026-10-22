@@ -12,6 +12,9 @@ use veil_util::lock;
 pub(super) const ACTIVE_RELIABLE_BYTES: u64 = 1024;
 // Small bounded control writes on the parent must not inherit child pressure.
 pub(super) const INDEPENDENT_RELIABLE_BYTES: u64 = 16 * 1024;
+// Compatibility protection for callers without fresh consumer measurements.
+// A healthy distant path must not be classified as congested by RTT alone.
+const UNMEASURED_PRIMARY_RTT: Duration = Duration::from_millis(150);
 
 #[derive(Default)]
 struct PrimaryPathFeedback {
@@ -253,14 +256,20 @@ impl LocalReliableAdmission {
         let delayed = self
             .feedback
             .observe(rtt_us, expired, lost, congestion_events);
+        let unmeasured_delay = !ack_blocked
+            && !delayed
+            && rtt_us > UNMEASURED_PRIMARY_RTT.as_micros() as u64
+            && self.source_activity.note_unmeasured_primary_delay(now);
         if ack_blocked || delayed {
             self.source_activity.note_primary_transport_pressure(now);
+        }
+        if ack_blocked || delayed || unmeasured_delay {
             // The parent writer must consume the same pressure observation as
             // other local producers. A low/stale RTT during blocked ACKs must
             // not leave a larger file window open while video alone is held.
             self.pressure_until = Some(now + PRESSURE_GRACE);
         }
-        ack_blocked || delayed
+        ack_blocked || delayed || unmeasured_delay
     }
 
     fn pressured(&self, now: Instant) -> bool {
