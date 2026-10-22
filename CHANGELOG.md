@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Do not drain the decoder below its adaptive reserve solely to catch up with
+  upstream RTP age. Keep the independent hard local-buffer budget unchanged.
+  Cover the regression and schedule recurring-jitter test arrivals by source
+  RTP time rather than host callback timing, without relaxing test thresholds.
 - Coalesce ready reliable-stream receive frames into one bounded read instead
   of returning one IPC fragment per FFI/Dart worker round-trip. Preserve prompt
   short reads, partial-frame ordering, empty DATA handling and exact credits.

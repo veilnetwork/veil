@@ -75,8 +75,16 @@ class RecoveringNetEq final : public webrtc::NetEq {
         // 30 ms before an extra 10-ms pull. PLC/error guards remain below.
         const auto lag = UpdateDecodedClock(*frame)
             ? rtp_lag_.Output(frame->timestamp_, webrtc::TimeMicros()) : std::nullopt;
+        // RTP age also includes time spent upstream. Do not repeatedly cut a
+        // local queue below NetEq's own jitter reserve: it will refill toward
+        // that target and manufacture another catch-up event. Preserve one
+        // packet around the actual adaptive target before using age alone.
+        // The independent hard storage budget below remains unchanged.
+        const int64_t local_reserve_ms = std::max<int64_t>(
+            frame_headroom_ms_ + 30,
+            static_cast<int64_t>(std::max(0, inner_->TargetDelayMs())) + frame_headroom_ms_);
         const bool age_excess = lag && *lag > RecoveryBudgetMs() - 20 &&
-            state.current_buffer_size_ms >= static_cast<uint64_t>(frame_headroom_ms_ + 30);
+            state.current_buffer_size_ms >= static_cast<uint64_t>(local_reserve_ms);
         if ((!age_excess && state.current_buffer_size_ms <= static_cast<uint64_t>(RecoveryBudgetMs())) ||
             (inner_->SyncBufferSizeMs() < 20 && !state.next_packet_available))
           break;
