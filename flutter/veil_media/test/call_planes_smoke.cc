@@ -30,6 +30,7 @@ extern "C" int veil_media_test_group_blocked_audio_stats(VeilGroupMediaEngine*, 
 extern "C" int veil_media_test_group_emit_rtcp(VeilGroupMediaEngine*);
 extern "C" int veil_media_test_group_fanout_packet(VeilGroupMediaEngine*, int);
 extern "C" int veil_media_test_video_bandwidth(VeilMediaEngine*);
+extern "C" int veil_media_test_group_video_transport_budget(VeilGroupMediaEngine*, int);
 extern "C" int veil_media_test_audio_bandwidth();
 extern "C" VeilMediaEngine* veil_media_test_dual_overhead_codec_create(
     uint64_t, const uint8_t*, const uint8_t*, int, int);
@@ -543,6 +544,24 @@ int main(int argc, char** argv) {
           : veil_media_engine_get_local_video_frame(one.get(), rgba.data(), rgba.size(), &w, &h);
       assert(preview > 0 && w == width && h == height);
       assert(budget(150, 6) == VEIL_MEDIA_OK);
+      if (room) {
+        // There is no receiving group participant in this source-only fixture
+        // to report TWCC. Supply an actual larger allocator budget explicitly.
+        assert(veil_media_test_group_video_transport_budget(group.get(), 150000) == 0);
+      }
+      // Retuning posts to WebRTC's encoder queue. The old low allocation
+      // remains authoritative until SetRates actually delivers the larger
+      // budget; an accepted host request must not clear that protection.
+      const auto recovery_deadline = std::chrono::steady_clock::now() +
+          std::chrono::seconds(3);
+      while ((metric("video_frame_pixel_cap") || metric("video_frame_budget_bytes")) &&
+             std::chrono::steady_clock::now() < recovery_deadline) {
+        assert((room ? veil_media_group_engine_push_video_frame(group.get(), y.data(), uv.data(), uv.data(),
+                    width, height, width, width / 2, width / 2, 0)
+                     : veil_media_engine_push_video_frame(one.get(), y.data(), uv.data(), uv.data(),
+                    width, height, width, width / 2, width / 2, 0)) == VEIL_MEDIA_OK);
+        std::this_thread::sleep_for(std::chrono::milliseconds(35));
+      }
       assert(metric("video_frame_pixel_cap") == 0);
       assert(metric("video_frame_budget_bytes") == 0);
       std::printf("%s low-rate VP8 frame sizing, packetization, preview and recovery OK\n",
