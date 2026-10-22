@@ -14,6 +14,7 @@ class Decoder final : public webrtc::NetEq {
   int mode = 0;
   int frame_ms = 0;
   int buffer_ms_override = 0;
+  int target_ms = 0;
   int maximum_delay = 0;
   int maximum_delay_calls = 0;
   int insert_result = 0;
@@ -53,7 +54,7 @@ class Decoder final : public webrtc::NetEq {
   }
   bool SetBaseMinimumDelayMs(int) override { return true; }
   int GetBaseMinimumDelayMs() const override { return 0; }
-  int TargetDelayMs() const override { return 0; }
+  int TargetDelayMs() const override { return target_ms; }
   int FilteredCurrentDelayMs() const override { return 0; }
   int NetworkStatistics(webrtc::NetEqNetworkStatistics*) override { return 0; }
   webrtc::NetEqNetworkStatistics CurrentNetworkStatistics() const override { return {}; }
@@ -80,7 +81,7 @@ class RenderClock : public webrtc::ClockInterface {
 
 void DecodedAgeRegression(int mode = 0, int queued_ms = 90,
                           bool witness = true, bool aligned = true,
-                          bool explicit_action = false) {
+                          bool explicit_action = false, int target_ms = 0) {
   RenderClock wall;
   auto* previous = webrtc::SetClockForTesting(&wall);
   {
@@ -90,6 +91,7 @@ void DecodedAgeRegression(int mode = 0, int queued_ms = 90,
     observed->fault_after = 2;
     observed->frame_ms = 40;
     observed->buffer_ms_override = queued_ms;
+    observed->target_ms = target_ms;
     observed->clocked_output = true;
     observed->packet_witness = witness;
     auto stats = std::make_shared<veil_media::PlayoutRecoveryStats>();
@@ -119,7 +121,7 @@ void DecodedAgeRegression(int mode = 0, int queued_ms = 90,
     auto action = explicit_action ? std::optional<webrtc::NetEq::Operation>(
         webrtc::NetEq::Operation::kNormal) : std::nullopt;
     assert(recovering.GetAudio(&frame, nullptr, nullptr, action) == 0);
-    const bool attempt = queued_ms >= 70 && witness && aligned &&
+    const bool attempt = queued_ms >= std::max(70, target_ms + 40) && witness && aligned &&
         !explicit_action && mode != 6;
     const bool skipped = attempt && mode == 0;
     assert(observed->pulls == (attempt ? 3 : 2));
@@ -134,6 +136,12 @@ void DecodedAgeRegression(int mode = 0, int queued_ms = 90,
 
 int main() {
   DecodedAgeRegression();
+  // Physical render trace: RTP age initiated a trim with only 84 ms stored,
+  // below the adaptive 120-ms target. The decoder then refilled that target,
+  // causing repeated speech discards and keeping video permanently paused.
+  DecodedAgeRegression(0, 90, true, true, false, 120);
+  DecodedAgeRegression(0, 150, true, true, false, 120);
+  DecodedAgeRegression(0, 160, true, true, false, 120);
   DecodedAgeRegression(0, 60); // Leave a complete packet plus 20 ms.
   DecodedAgeRegression(0, 90, false); // Never infer an output clock.
   DecodedAgeRegression(0, 90, true, false); // A stale decoder origin.

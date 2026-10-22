@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -55,6 +56,7 @@ static bool duplex_feedback = false;
 static bool handover_network = false;
 static bool delivery_stall = false;
 static bool recurring_jitter = false;
+static std::optional<std::pair<uint32_t, Clock::time_point>> recurring_rtp_origin;
 static bool mature_jitter = false;
 static bool padding_only = false;
 static bool foreign_audio_only = false;
@@ -107,7 +109,13 @@ extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t 
   if (handover_network)
     handover_sequences.emplace_back(chan, uint16_t(p[2]) << 8 | p[3]);
   const auto now = Clock::now();
-  const double at = milliseconds(now);
+  double at = milliseconds(now);
+  if (recurring_jitter) {
+    const uint32_t timestamp = uint32_t(p[4]) << 24 | uint32_t(p[5]) << 16 |
+                               uint32_t(p[6]) << 8 | p[7];
+    if (!recurring_rtp_origin) recurring_rtp_origin = {timestamp, now};
+    at = static_cast<uint32_t>(timestamp - recurring_rtp_origin->first) / 48.0;
+  }
   // Exercise both a short burst and repeated bursts across ten seconds.
   // Each is followed by a healthy path; PCM must shed the old playout tail.
   // Lossless bounded reordering for long Opus packets, distinct from stalls.
@@ -118,6 +126,16 @@ extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t 
       ? (static_cast<int>(at) / 200 % 2 ? 300 : 40) : 40;
   ++sent_packets;
   auto due = now + std::chrono::milliseconds(delay);
+  if (recurring_jitter) {
+    // Both capacity controls run the same receive policy. Scheduling a 40/300
+    // ms jump from wall-clock callbacks assigned a different delay to packets
+    // near every 200-ms boundary, measuring unrelated PLC variation instead of
+    // the policy. Keep the synthetic path on the source's actual RTP clock;
+    // real callback lateness is still measured separately. Gates are unchanged.
+    due = recurring_rtp_origin->second +
+        std::chrono::microseconds(static_cast<int64_t>(at * 1000)) +
+        std::chrono::milliseconds(delay);
+  }
   if (mature_jitter) {
     // Captured ingress is overwhelmingly ordered: model a delivery pause
     // holding later packets behind it. Delaying alternate packets lets them
@@ -1118,6 +1136,7 @@ int main(int argc, char** argv) {
     {
       std::lock_guard lock(mu);
       pending.clear(); sent_packets = 0;
+      recurring_rtp_origin.reset();
       source_channel = 200 + capacity; receiver_channel = 300 + capacity;
     }
     using Engine = std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)>;
