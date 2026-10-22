@@ -95,6 +95,17 @@ int main() {
   require(priority->VideoBlocked(), "resume ignored current long packet mode");
   feed(200, true, 60, 60);
   require(priority->VideoBlocked(), "unfunded short packets reopened video");
+  priority->AllowSparseVideo(true);
+  const int sparse_before = video;
+  feed(300, true, 60, 60);
+  require(!priority->VideoBlocked() && video > sparse_before,
+          "sparse video recovery latched behind real 60-ms Opus");
+  priority->PauseVideo(true, clock.TimeInMicroseconds());
+  require(priority->VideoBlocked(), "sparse trial bypassed measured audio pause");
+  feed(200, true, 60); // The just-admitted sparse frame must drain first.
+  priority->PauseVideo(false, clock.TimeInMicroseconds());
+  priority->AllowSparseVideo(false);
+  require(priority->VideoBlocked(), "larger video source bypassed short-packet ACK");
   allocation(160000);
   require(priority->VideoBlocked(), "requested short allocation was treated as emitted ACK");
   const int resumed_before = video;

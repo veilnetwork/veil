@@ -1119,6 +1119,18 @@ struct WebrtcState {
 };
 
 template <typename VideoState>
+void set_video_source_cadence(VideoState* ws, double fps) {
+  // Publish the real capture gate before permitting a sparse codec trial;
+  // withdraw permission before raising cadence beyond that trial.
+  const bool sparse = fps > 0 && fps <= 1;
+  if (ws->audio_packet_priority && !sparse)
+    ws->audio_packet_priority->AllowSparseVideo(false);
+  ws->video_max_fps.store(fps, std::memory_order_relaxed);
+  if (ws->audio_packet_priority && sparse)
+    ws->audio_packet_priority->AllowSparseVideo(true);
+}
+
+template <typename VideoState>
 bool should_encode_video_frame(VideoState* ws) {
   if (ws == nullptr) return false;
   if (ws->video_send_paused.load()) return false;
@@ -2525,7 +2537,7 @@ int veil_media_group_engine_start_video(VeilGroupMediaEngine* engine) {
             webrtc::DegradationPreference::MAINTAIN_FRAMERATE);
         ws->video_send_stream->Start();
         ws->video_target_bitrate_bps = bps;
-        ws->video_max_fps.store(initial_fps, std::memory_order_relaxed);
+        set_video_source_cadence(ws, initial_fps);
         ws->prepared_video_bps = 0;
         ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
       }
@@ -2620,7 +2632,7 @@ static int veil_media_group_engine_apply_video_budget(VeilGroupMediaEngine* engi
       ws->video_call->SetClientBitratePreferences(
           veil_media::video_bitrate_settings(bps, true, false));
       ws->video_target_bitrate_bps = bps;
-      ws->video_max_fps.store(fps, std::memory_order_relaxed);
+      set_video_source_cadence(ws, fps);
       ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
     }
     rc = VEIL_MEDIA_OK;
@@ -3663,7 +3675,7 @@ int veil_media_engine_start_video(VeilMediaEngine* engine, int send, int recv,
       const int bps = kbps * 1000;
       ws->video_frame_budget->SetProfile(bps);
       ws->video_target_bitrate_bps = bps;
-      ws->video_max_fps.store(fps, std::memory_order_relaxed);
+      set_video_source_cadence(ws, fps);
       ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
       // Start at the route budget. Negotiated feedback subsequently owns the
       // estimate; older peers still need the profile floor to keep the encoder
@@ -3813,7 +3825,7 @@ static int veil_media_engine_apply_video_budget(VeilMediaEngine* engine,
                                             !independent_feedback));
     }
     ws->video_target_bitrate_bps = bps;
-    ws->video_max_fps.store(fps, std::memory_order_relaxed);
+    set_video_source_cadence(ws, fps);
     ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
     vlog("video: retuned to %d kbps @ %.3f fps", kbps, fps);
     rc = VEIL_MEDIA_OK;

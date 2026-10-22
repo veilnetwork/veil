@@ -345,6 +345,22 @@ extern "C" int veil_media_test_video_bandwidth(VeilMediaEngine* e) {
   return bandwidth;
 }
 
+// A group fixture with no real receivers cannot acquire transport feedback.
+// Fund its recovery through the real allocator, rather than clearing the
+// frame-size policy directly or treating a requested profile as bandwidth.
+extern "C" int veil_media_test_group_video_transport_budget(
+    VeilGroupMediaEngine* e, int bitrate_bps) {
+  if (!e || !e->ws || bitrate_bps < 1000) return VEIL_MEDIA_ERR_ARG;
+  webrtc::BitrateSettings settings;
+  settings.min_bitrate_bps = bitrate_bps;
+  settings.start_bitrate_bps = bitrate_bps;
+  settings.max_bitrate_bps = bitrate_bps;
+  auto* ws = e->ws.get();
+  return run_on(ws->video_worker_tq.get(), [&] {
+    ws->video_call->SetClientBitratePreferences(settings);
+  }) ? VEIL_MEDIA_OK : VEIL_MEDIA_ERR_STATE;
+}
+
 // Exercise the real Call allocator -> ChannelSend -> Opus path, not a copy
 // of its config. Legacy peers without negotiated TWCC retain their bitrate.
 extern "C" int veil_media_test_audio_bandwidth() {

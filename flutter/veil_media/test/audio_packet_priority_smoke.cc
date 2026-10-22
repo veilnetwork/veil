@@ -97,5 +97,37 @@ int main() {
   p.Disable();
   assert(p.BeginVideo());
   p.EndVideo(false, 37'000'000);
+  {
+    // The app has already reduced its actual capture gate to <=1 fps. A
+    // healthy sparse trial must not depend on first funding 40-ms Opus.
+    AudioPacketPriority sparse;
+    sparse.Enable();
+    sparse.WantLongPackets(true, 0);
+    assert(sparse.TryGrantLongPackets(0));
+    sparse.Encoded(60);
+    sparse.ExpectVideo(true, 0);
+    assert(sparse.VideoBlocked());
+    sparse.AllowSparseVideo(true);
+    assert(!sparse.VideoBlocked() && sparse.BeginVideo());
+    assert(sparse.TryGrantLongPackets(1)); // Sparse RTP can coexist with 60 ms.
+    sparse.EndVideo(true, 2);
+    sparse.PauseVideo(true, 3); // Real measured trouble still stops the source.
+    assert(sparse.VideoBlocked() && !sparse.BeginVideo());
+    assert(!sparse.VideoHeldForAudio()); // Report the explicit pause accurately.
+    sparse.PauseVideo(false, 4);
+    assert(!sparse.VideoBlocked());
+    sparse.AllowSparseVideo(false); // A higher frame rate still needs funding.
+    assert(sparse.VideoBlocked() && !sparse.BeginVideo());
+    sparse.WantLongPackets(false, 5);
+    assert(sparse.VideoBlocked());
+    sparse.Encoded(40);
+    assert(!sparse.VideoBlocked());
+    sparse.AllowSparseVideo(true);
+    sparse.ResetAudio();
+    assert(sparse.VideoBlocked()); // No synthetic ACK for missing audio.
+    sparse.Encoded(60);
+    sparse.ExpectVideo(false, 6);
+    assert(!sparse.BeginVideo());
+  }
   std::puts("ok: emitted short ACK, real video quiescence, in-flight admission, resume and clock bounds");
 }

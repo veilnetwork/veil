@@ -30,4 +30,5 @@ if [ "$#" -eq 0 ]; then
   "$STAND_DIR/repair-stats"
   python3 "$ROOT/test/run_playout_recovery_smoke.py"
   "$ROOT/test/run_group_playout_recovery_smoke.sh" "$STAND_DIR/libveil_media.dylib"
+  bash "$ROOT/test/run_sparse_video_packetization_smoke.sh" "$STAND_DIR/libveil_media.dylib"
 fi
