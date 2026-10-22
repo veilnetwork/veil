@@ -16,6 +16,10 @@ class AudioPacketPriority {
 
   void Enable() { enabled_.store(true, std::memory_order_release); }
   void Disable() { enabled_.store(false, std::memory_order_release); }
+  // A source capped at <=1 fps may measure its sparse recovery trial while
+  // Opus still needs 60-ms packets. Measured audio trouble can pause that
+  // source normally; packet duration alone is not evidence of congestion.
+  void AllowSparseVideo(bool allowed) { sparse_video_.store(allowed); }
   bool WantsLongPackets() const { return want_long_.load(); }
   void ExpectVideo(bool expected, int64_t now_us) {
     const bool old = expected_.exchange(expected);
@@ -32,6 +36,10 @@ class AudioPacketPriority {
     // A short allocation is not proof that Opus has emitted a short packet.
   }
   bool TryGrantLongPackets(int64_t now_us) {
+    if (SparseVideoAllowed()) {
+      hold_.store(true, std::memory_order_release);
+      return true;
+    }
     if (expected_.load() && !paused_.load() && !hold_.load() &&
         last_video_us_.load() >= 0) return false;
     const bool old_hold = hold_.exchange(true, std::memory_order_acq_rel);
@@ -55,14 +63,16 @@ class AudioPacketPriority {
   void ResetAudio() { audio_ms_.store(0); }
   bool VideoHeldForAudio() const {
     return enabled_.load(std::memory_order_acquire) && expected_.load() &&
-        (hold_.load(std::memory_order_acquire) ||
-         audio_ms_.load() == 0 || audio_ms_.load() > 40);
+        (audio_ms_.load() == 0 ||
+         (!sparse_video_.load() &&
+          (hold_.load(std::memory_order_acquire) || audio_ms_.load() > 40)));
   }
   bool VideoBlocked() const {
     return (enabled_.load() && expected_.load() && paused_.load()) || VideoHeldForAudio();
   }
   bool LongPacketsAllowed(int64_t now_us) const {
     if (!enabled_.load(std::memory_order_acquire)) return true;
+    if (SparseVideoAllowed()) return true;
     if (expected_.load() && !paused_.load() && !hold_.load()) return false;
     if (video_in_flight_.load(std::memory_order_acquire) != 0) return false;
     const int64_t last = last_video_us_.load(std::memory_order_acquire);
@@ -87,12 +97,16 @@ class AudioPacketPriority {
   }
 
  private:
+  bool SparseVideoAllowed() const {
+    return sparse_video_.load() && expected_.load() && !paused_.load();
+  }
   void BeginQuiet(int64_t now_us) {
     int64_t empty = -1;
     quiet_us_.compare_exchange_strong(empty, now_us);
   }
   std::atomic<bool> enabled_{false}, expected_{false}, paused_{false};
   std::atomic<bool> want_long_{false}, hold_{false};
+  std::atomic<bool> sparse_video_{false};
   std::atomic<int> audio_ms_{0};
   std::atomic<unsigned> video_in_flight_{0};
   std::atomic<int64_t> quiet_us_{-1}, last_video_us_{-1};
