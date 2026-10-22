@@ -84,11 +84,6 @@ pub const STREAM_ENDPOINT_ID: u32 = 12;
 /// Both peers must agree.
 const CIRCUIT_ENV: &str = "VEIL_ONION_STREAM_CIRCUIT";
 const CIRCUIT_PREFER_RENDEZVOUS_ENV: &str = "VEIL_ONION_STREAM_PREFER_RENDEZVOUS";
-// Current public test stand preference. c6ace22e repeatedly reset long
-// published-rendezvous stream soaks, while 3d3575c9 completed the same 64 MiB
-// transfers without session resets. Operators can still override this order via
-// VEIL_ONION_STREAM_PREFER_RENDEZVOUS / debug.veil.onion_stream_prefer_rendezvous.
-const CIRCUIT_TEST_STAND_PREFERRED_RENDEZVOUS_PREFIX: &str = "3d3575c9";
 const ANDROID_CIRCUIT_PROP: &str = "debug.veil.onion_stream_circuit";
 const ANDROID_PREFER_RENDEZVOUS_PROP: &str = "debug.veil.onion_stream_prefer_rendezvous";
 
@@ -189,13 +184,24 @@ fn rendezvous_preference_rank(relay: &[u8; 32], prefixes: &[String]) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-fn rendezvous_default_stand_rank(relay: &[u8; 32]) -> usize {
-    let relay_hex = relay.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    if relay_hex.starts_with(CIRCUIT_TEST_STAND_PREFERRED_RENDEZVOUS_PREFIX) {
-        0
-    } else {
-        1
-    }
+fn rank_stream_rendezvous_ads(
+    ads: &mut [veil_anonymity::rendezvous::RendezvousAd],
+    preferred: &[String],
+) {
+    // The resolver orders fresh registrations first. Preserve that criterion
+    // even when a partial refresh retains older, still-valid fallbacks: their
+    // receive circuit may belong to an earlier process. Only an explicit
+    // operator preference can override it; no relay has a built-in advantage.
+    // The stable sort retains resolver order for indistinguishable adverts.
+    ads.sort_by(|left, right| {
+        rendezvous_preference_rank(&left.rendezvous_node_id, preferred)
+            .cmp(&rendezvous_preference_rank(
+                &right.rendezvous_node_id,
+                preferred,
+            ))
+            .then_with(|| right.valid_from_unix.cmp(&left.valid_from_unix))
+            .then_with(|| left.rendezvous_node_id.cmp(&right.rendezvous_node_id))
+    });
 }
 
 fn short_cookie(cookie: &[u8; COOKIE_LEN]) -> String {
@@ -4338,21 +4344,8 @@ async fn open_outbound_circuit(
         })
         .collect::<Vec<_>>()
         .join(",");
-    let mut indexed = ads.into_iter().enumerate().collect::<Vec<_>>();
-    indexed.sort_by(|(left_index, left), (right_index, right)| {
-        rendezvous_preference_rank(&left.rendezvous_node_id, &preferred)
-            .cmp(&rendezvous_preference_rank(
-                &right.rendezvous_node_id,
-                &preferred,
-            ))
-            .then_with(|| {
-                rendezvous_default_stand_rank(&left.rendezvous_node_id)
-                    .cmp(&rendezvous_default_stand_rank(&right.rendezvous_node_id))
-            })
-            .then_with(|| left.rendezvous_node_id.cmp(&right.rendezvous_node_id))
-            .then_with(|| left_index.cmp(right_index))
-    });
-    let mut ranked_ads = indexed.into_iter().map(|(_, ad)| ad).collect::<Vec<_>>();
+    rank_stream_rendezvous_ads(&mut ads, &preferred);
+    let mut ranked_ads = ads;
     let after_rank = ranked_ads
         .iter()
         .map(|ad| {
@@ -5855,6 +5848,51 @@ mod tests {
             rendezvous_kem_pk: Vec::new(),
             wire_version: 5,
         }
+    }
+
+    #[test]
+    fn stream_rendezvous_ranking_prefers_current_registration_over_relay_id() {
+        let mut retired = ad_signed_by(&[1; 32], [2; 32]);
+        retired.rendezvous_node_id = [0x10; 32];
+        retired.valid_from_unix = 100;
+        let mut current = retired.clone();
+        current.rendezvous_node_id = [0xf0; 32];
+        current.valid_from_unix = 200;
+        let mut ads = vec![retired.clone(), current.clone()];
+        super::rank_stream_rendezvous_ads(&mut ads, &[]);
+        assert_eq!(ads[0].rendezvous_node_id, current.rendezvous_node_id);
+
+        // An explicit local setting is still honored; it is not a compiled
+        // default from a prior stand run.
+        super::rank_stream_rendezvous_ads(&mut ads, &["10".to_owned()]);
+        assert_eq!(ads[0].rendezvous_node_id, retired.rendezvous_node_id);
+
+        // Per-relay deduplication must keep the new registration cookie.
+        current.rendezvous_node_id = retired.rendezvous_node_id;
+        current.auth_cookie = [9; 16];
+        let mut ads = vec![retired, current];
+        super::rank_stream_rendezvous_ads(&mut ads, &[]);
+        let mut seen = std::collections::HashSet::new();
+        ads.retain(|ad| seen.insert(ad.rendezvous_node_id));
+        assert_eq!(ads.len(), 1);
+        assert_eq!(ads[0].auth_cookie, [9; 16]);
+    }
+
+    #[test]
+    fn stream_rendezvous_ranking_is_stable_with_equal_generation() {
+        let mut a = ad_signed_by(&[1; 32], [2; 32]);
+        a.rendezvous_node_id = [0x10; 32];
+        a.valid_from_unix = 200;
+        let mut b = a.clone();
+        b.rendezvous_node_id = [0xf0; 32];
+        let mut duplicate = a.clone();
+        duplicate.auth_cookie = [9; 16];
+        let mut ads = vec![b, a, duplicate];
+        super::rank_stream_rendezvous_ads(&mut ads, &[]);
+        assert_eq!(ads[0].rendezvous_node_id, [0x10; 32]);
+        assert_eq!(ads[0].auth_cookie, [0x0c; 16]);
+        assert_eq!(ads[1].auth_cookie, [9; 16]);
+        assert_eq!(ads[2].rendezvous_node_id, [0xf0; 32]);
     }
 
     /// A route opened to an identity over a device's ad is answered by that
