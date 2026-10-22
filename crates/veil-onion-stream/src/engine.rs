@@ -159,6 +159,9 @@ impl Default for Config {
 pub enum Event {
     /// Handshake complete — the stream may carry data both ways.
     Connected,
+    /// An unconfirmed SYN/SYN_ACK was handed off but its network timer expired.
+    /// The carrier may retry another path without retiring unrelated streams.
+    HandshakeRto { retries: u32 },
     /// A DATA retransmission timeout fired without new cumulative ACK progress.
     /// Useful to the carrier for route health/failover; not terminal.
     DataRto { consec_rto: u32, snd_una: u32 },
@@ -205,7 +208,15 @@ struct Seg {
 pub(crate) struct LocalTransmit {
     seq: u32,
     span: u32,
-    is_fin: bool,
+    kind: TransmitKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum TransmitKind {
+    Data,
+    Fin,
+    Syn,
+    SynAck,
 }
 
 impl LocalTransmit {
@@ -214,12 +225,22 @@ impl LocalTransmit {
             Frame::Data { seq, payload, .. } => Some(Self {
                 seq,
                 span: payload.len() as u32,
-                is_fin: false,
+                kind: TransmitKind::Data,
             }),
             Frame::Fin { seq, .. } => Some(Self {
                 seq,
                 span: 1,
-                is_fin: true,
+                kind: TransmitKind::Fin,
+            }),
+            Frame::Syn { isn, .. } => Some(Self {
+                seq: isn,
+                span: 0,
+                kind: TransmitKind::Syn,
+            }),
+            Frame::SynAck { isn, .. } => Some(Self {
+                seq: isn,
+                span: 0,
+                kind: TransmitKind::SynAck,
             }),
             _ => None,
         }
@@ -229,7 +250,11 @@ impl LocalTransmit {
         Self {
             seq: segment.seq,
             span: segment.span(),
-            is_fin: segment.is_fin,
+            kind: if segment.is_fin {
+                TransmitKind::Fin
+            } else {
+                TransmitKind::Data
+            },
         }
     }
 }
@@ -353,6 +378,10 @@ pub struct StreamEngine {
     hs_deadline: Option<u64>,
     /// Consecutive handshake retransmits with no peer response (dead detection).
     hs_retries: u32,
+    hs_local_pending: bool,
+    /// Bound a continuously rejected local handshake by the existing retry
+    /// budget, without reporting it as network loss or rotating shared routes.
+    hs_local_deadline: Option<u64>,
     ack_pending: bool,
     /// Delayed-ACK state: ACK after the configured number of advancing DATA
     /// segments, or after a short timer. Gaps/duplicates/FIN are immediate.
@@ -482,6 +511,8 @@ impl StreamEngine {
             syn_acked: false,
             hs_deadline: None,
             hs_retries: 0,
+            hs_local_pending: false,
+            hs_local_deadline: None,
             ack_pending: false,
             ack_eliciting: 0,
             ack_deadline: None,
@@ -499,11 +530,28 @@ impl StreamEngine {
     pub(crate) fn track_local_handoffs(&mut self) {
         debug_assert!(self.tx.segs.is_empty());
         self.track_local_handoffs = true;
+        self.hs_deadline = None;
     }
 
     pub(crate) fn local_handoff(&mut self, accepted: &HashMap<LocalTransmit, usize>, now: u64) {
         if !accepted.values().any(|count| *count > 0) {
             return;
+        }
+        if self.hs_local_pending && self.handshake_unconfirmed() {
+            let handshake = LocalTransmit {
+                seq: self.tx.iss,
+                span: 0,
+                kind: if self.phase == Phase::SynSent {
+                    TransmitKind::Syn
+                } else {
+                    TransmitKind::SynAck
+                },
+            };
+            if accepted.get(&handshake).is_some_and(|count| *count > 0) {
+                self.hs_local_pending = false;
+                self.hs_local_deadline = None;
+                self.hs_deadline = Some(now.saturating_add(self.cfg.handshake_rto_ms));
+            }
         }
         for segment in &mut self.tx.segs {
             if segment.local_pending
@@ -517,6 +565,18 @@ impl StreamEngine {
             }
         }
         self.tx.refresh_local_rto(now);
+    }
+
+    pub(crate) fn handshake_unconfirmed(&self) -> bool {
+        !self.syn_acked && matches!(self.phase, Phase::SynSent | Phase::Established)
+    }
+
+    fn arm_local_handshake_limit(&mut self, now: u64) {
+        let budget = self
+            .cfg
+            .handshake_rto_ms
+            .saturating_mul(u64::from(self.cfg.max_retransmits) + 1);
+        self.hs_local_deadline = Some(now.saturating_add(budget));
     }
 
     // ---- app surface ----------------------------------------------------
@@ -686,7 +746,8 @@ impl StreamEngine {
                 self.tx.rwnd = win;
                 self.phase = Phase::Established;
                 self.send_synack = true;
-                self.hs_deadline = Some(now + self.cfg.handshake_rto_ms);
+                self.hs_deadline =
+                    (!self.track_local_handoffs).then_some(now + self.cfg.handshake_rto_ms);
                 self.hs_retries = 0;
                 self.events.push_back(Event::Connected);
             }
@@ -707,6 +768,8 @@ impl StreamEngine {
             self.syn_acked = true;
             self.hs_deadline = None;
             self.hs_retries = 0;
+            self.hs_local_pending = false;
+            self.hs_local_deadline = None;
             self.phase = Phase::Established;
             self.ack_now(); // tell the peer we're up (implicit SYN_ACK ack)
             self.events.push_back(Event::Connected);
@@ -721,6 +784,8 @@ impl StreamEngine {
             self.syn_acked = true;
             self.hs_deadline = None;
             self.hs_retries = 0;
+            self.hs_local_pending = false;
+            self.hs_local_deadline = None;
         }
     }
 
@@ -940,6 +1005,11 @@ impl StreamEngine {
         // 2. Handshake.
         if self.send_syn {
             self.send_syn = false;
+            if self.track_local_handoffs && self.handshake_unconfirmed() {
+                self.hs_local_pending = true;
+                self.hs_deadline = None;
+                self.arm_local_handshake_limit(now);
+            }
             encode(
                 Frame::Syn {
                     stream_id: self.stream_id,
@@ -952,6 +1022,11 @@ impl StreamEngine {
         }
         if self.send_synack {
             self.send_synack = false;
+            if self.track_local_handoffs && self.handshake_unconfirmed() {
+                self.hs_local_pending = true;
+                self.hs_deadline = None;
+                self.arm_local_handshake_limit(now);
+            }
             encode(
                 Frame::SynAck {
                     stream_id: self.stream_id,
@@ -1286,6 +1361,14 @@ impl StreamEngine {
         if self.phase == Phase::Closed {
             return;
         }
+        if self
+            .hs_local_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.hs_local_deadline = None;
+            self.declare_dead();
+            return;
+        }
         if self.ack_deadline.is_some_and(|dl| now >= dl) {
             self.ack_now();
         }
@@ -1307,7 +1390,11 @@ impl StreamEngine {
                 Phase::Established => self.send_synack = true,
                 _ => {}
             }
-            self.hs_deadline = Some(now + self.cfg.handshake_rto_ms);
+            self.events.push_back(Event::HandshakeRto {
+                retries: self.hs_retries,
+            });
+            self.hs_deadline =
+                (!self.track_local_handoffs).then_some(now + self.cfg.handshake_rto_ms);
         }
         // RACK reorder timer: a segment's loss deadline lay in the future when
         // detection last ran — re-check now that it has passed.
@@ -1473,6 +1560,7 @@ impl StreamEngine {
             }
         };
         merge(self.hs_deadline);
+        merge(self.hs_local_deadline);
         merge(self.tx.rto_deadline);
         merge(self.tx.rack_deadline);
         merge(self.persist_deadline);
@@ -1947,6 +2035,111 @@ impl RxState {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tracked_unhanded_handshake_does_not_start_network_retries() {
+        for responder in [false, true] {
+            let cfg = Config {
+                handshake_rto_ms: 50,
+                ..Config::default()
+            };
+            let mut engine = if responder {
+                StreamEngine::accept(11, cfg, 0, 500)
+            } else {
+                StreamEngine::connect(11, cfg, 0, 100)
+            };
+            engine.track_local_handoffs();
+            if responder {
+                engine.on_syn(100, 8192, 0);
+            }
+            let mut encoded = Vec::new();
+            assert!(engine.poll_transmit(0, &mut encoded));
+            engine.on_timeout(250);
+            assert_eq!(
+                engine.hs_retries, 0,
+                "a handshake still queued locally is not network loss"
+            );
+            assert!(!engine.send_syn && !engine.send_synack);
+        }
+    }
+
+    #[test]
+    fn tracked_handshake_network_retries_start_at_handoff_and_keep_the_cap() {
+        for responder in [false, true] {
+            let cfg = Config {
+                handshake_rto_ms: 50,
+                max_retransmits: 2,
+                ..Config::default()
+            };
+            let mut engine = if responder {
+                StreamEngine::accept(11, cfg, 0, 500)
+            } else {
+                StreamEngine::connect(11, cfg, 0, 100)
+            };
+            engine.track_local_handoffs();
+            if responder {
+                engine.on_syn(100, 8192, 0);
+            }
+            let mut cell = Vec::new();
+            assert!(engine.poll_transmit(0, &mut cell));
+            for (index, at) in [100, 300, 500].into_iter().enumerate() {
+                let token = LocalTransmit::from_cell(&cell).unwrap();
+                engine.local_handoff(&HashMap::from([(token, 1)]), at);
+                engine.on_timeout(at + 49);
+                assert_eq!(engine.hs_retries, index as u32);
+                engine.on_timeout(at + 50);
+                if index < 2 {
+                    assert_eq!(engine.hs_retries, index as u32 + 1);
+                    assert!(engine.events.contains(&Event::HandshakeRto {
+                        retries: index as u32 + 1
+                    }));
+                    assert!(engine.poll_transmit(at + 51, &mut cell));
+                    engine.on_timeout(at + 100);
+                    assert_eq!(
+                        engine.hs_retries,
+                        index as u32 + 1,
+                        "local retry wait counted as network loss"
+                    );
+                } else {
+                    assert!(engine.is_closed(), "handshake retry cap disappeared");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_syn_after_confirmation_does_not_rearm_handshake_recovery() {
+        let cfg = Config {
+            handshake_rto_ms: 50,
+            ..Config::default()
+        };
+        let mut engine = StreamEngine::accept(11, cfg, 0, 500);
+        engine.track_local_handoffs();
+        engine.on_syn(100, 8192, 0);
+        let mut cell = Vec::new();
+        assert!(engine.poll_transmit(0, &mut cell));
+        engine.local_handoff(
+            &HashMap::from([(LocalTransmit::from_cell(&cell).unwrap(), 1)]),
+            10,
+        );
+        engine.on_data(101, 8192, b"request", 20);
+        engine.on_syn(100, 8192, 100);
+        assert!(engine.poll_transmit(100, &mut cell));
+        assert!(matches!(Frame::decode(&cell), Some(Frame::SynAck { .. })));
+        engine.local_handoff(
+            &HashMap::from([(LocalTransmit::from_cell(&cell).unwrap(), 1)]),
+            110,
+        );
+        engine.on_timeout(1000);
+        assert_eq!(engine.hs_deadline, None);
+        assert_eq!(engine.hs_retries, 0);
+        assert!(
+            !engine
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::HandshakeRto { .. }))
+        );
+    }
+
     fn tracked_flight(iss: u32, size: usize) -> (StreamEngine, Vec<LocalTransmit>) {
         let cfg = Config {
             mss: 64,
@@ -1966,7 +2159,9 @@ mod tests {
         let mut encoded = Vec::new();
         let mut tokens = Vec::new();
         while engine.poll_transmit(10, &mut encoded) {
-            if let Some(token) = LocalTransmit::from_cell(&encoded) {
+            if let Some(token) = LocalTransmit::from_cell(&encoded)
+                && matches!(token.kind, TransmitKind::Data | TransmitKind::Fin)
+            {
                 tokens.push(token);
             }
         }
@@ -2036,7 +2231,7 @@ mod tests {
         let mut encoded = Vec::new();
         assert!(engine.poll_transmit(20, &mut encoded));
         let fin = LocalTransmit::from_cell(&encoded).unwrap();
-        assert!(fin.is_fin);
+        assert_eq!(fin.kind, TransmitKind::Fin);
         engine.local_handoff(&HashMap::from([(data[0], 1)]), 100);
         engine.on_ack(fin.seq, 4096, &SackVec::new(), 110);
         engine.on_ack(fin.seq.wrapping_add(1), 4096, &SackVec::new(), 120);

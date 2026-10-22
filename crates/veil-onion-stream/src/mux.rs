@@ -69,6 +69,17 @@ pub trait CellSender: Send + Sync + 'static {
             Ok(())
         }
     }
+    /// An unconfirmed handshake timed out after local handoff. A carrier can
+    /// select another ordinary path; shared senders default to ignoring it.
+    fn on_stream_handshake_rto(
+        &self,
+        dst: Addr,
+        stream_id: u32,
+        retries: u32,
+    ) -> impl Future<Output = ()> + Send {
+        let _ = (dst, stream_id, retries);
+        std::future::ready(())
+    }
     fn on_stream_data_rto(
         &self,
         dst: Addr,
@@ -191,6 +202,11 @@ impl<S: CellSender> CellDuplex for MuxDuplex<S> {
     }
     async fn recv_cells(&mut self, out: &mut Vec<Vec<u8>>, max: usize) -> io::Result<usize> {
         Ok(self.inbound_rx.recv_many(out, max).await)
+    }
+    async fn on_handshake_rto(&mut self, stream_id: u32, retries: u32) {
+        self.sender
+            .on_stream_handshake_rto(self.peer, stream_id, retries)
+            .await;
     }
     async fn on_data_rto(&mut self, stream_id: u32, consec_rto: u32, snd_una: u32) {
         self.sender

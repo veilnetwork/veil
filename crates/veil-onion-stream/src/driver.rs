@@ -92,6 +92,15 @@ pub trait CellDuplex: Send {
             }
         }
     }
+    /// Only an unconfirmed, locally accepted handshake can trigger this event.
+    fn on_handshake_rto(
+        &mut self,
+        stream_id: u32,
+        retries: u32,
+    ) -> impl Future<Output = ()> + Send {
+        let _ = (stream_id, retries);
+        std::future::ready(())
+    }
     fn on_data_rto(
         &mut self,
         stream_id: u32,
@@ -437,9 +446,8 @@ async fn drive<D: CellDuplex>(
     let mut cell = Vec::with_capacity(crate::wire::MAX_CELL);
     // Inbound burst buffer for `recv_cells` — reused across loop turns.
     let mut rx_cells: Vec<Vec<u8>> = Vec::new();
-    // Cells the engine has committed to flight but the carrier has not yet
-    // accepted (batch in progress or local backpressure). FIFO preserves the
-    // engine's emission order.
+    // Bounded local reservations awaiting carrier acceptance. Unaccepted cells
+    // keep their relative emission order, including partial striped sends.
     let mut outbound: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
     let mut send_retry_at: Option<u64> = None;
     let mut blocked_since_ms: Option<u64> = None;
@@ -485,6 +493,11 @@ async fn drive<D: CellDuplex>(
                 Event::PeerFinished => set_end(&end, End::Eof),
                 Event::Reset(r) => set_end(&end, End::Reset(r)),
                 Event::Connected => {}
+                Event::HandshakeRto { retries } => {
+                    if engine.handshake_unconfirmed() {
+                        duplex.on_handshake_rto(engine.stream_id(), retries).await;
+                    }
+                }
                 Event::DataRto {
                     consec_rto,
                     snd_una,
@@ -526,6 +539,7 @@ async fn drive<D: CellDuplex>(
         // session TX queue full), not proof that the peer/path lost a packet.
         // The engine has reserved every polled DATA/FIN in its send window,
         // but network timing starts only when the carrier accepts that cell.
+        // SYN/SYN_ACK timers use the same acceptance boundary.
         // Whatever the carrier does not accept stays queued in `outbound`
         // and is retried before polling more engine output. A striped carrier
         // can accept a non-prefix subset, so correlate the retained cells.
