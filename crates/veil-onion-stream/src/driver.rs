@@ -15,7 +15,7 @@ use tokio::sync::{Notify, mpsc};
 // timeline. In production it is the real monotonic clock.
 use tokio::time::Instant;
 
-use crate::engine::{Config, Event, StreamEngine};
+use crate::engine::{Config, Event, LocalTransmit, StreamEngine};
 use crate::wire::reset_reason;
 
 #[derive(Debug)]
@@ -51,12 +51,11 @@ fn send_retry_delay_ms(error: &io::Error) -> u64 {
 /// Other errors are permanent. `recv_cell` returns `None` on clean close.
 pub trait CellDuplex: Send {
     fn send_cell(&mut self, cell: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
-    /// Send a burst of cells in order. Cells the carrier accepts are popped
-    /// from the front of `cells`; on `Err` the failing cell and everything
-    /// after it stay queued so the caller can retry (`WouldBlock`) or tear
-    /// down. The default forwards cell-by-cell; carriers with per-cell
-    /// route/pacing/lock overhead should override and amortize it across the
-    /// run.
+    /// Send a burst of cells. Remove only accepted cells; on `Err` retain
+    /// every unaccepted cell for retry (`WouldBlock`) or teardown. The default
+    /// accepts a FIFO prefix. A striped carrier may accept a non-prefix subset;
+    /// retained cells keep their relative order. Carriers can override this
+    /// method to amortize per-cell route/pacing/lock overhead.
     fn send_cells(
         &mut self,
         cells: &mut std::collections::VecDeque<Vec<u8>>,
@@ -429,6 +428,7 @@ async fn drive<D: CellDuplex>(
     data_tx: mpsc::Sender<Vec<u8>>,
     end: Arc<Mutex<End>>,
 ) {
+    engine.track_local_handoffs();
     let base = Instant::now();
     let now_ms = |b: &Instant| b.elapsed().as_millis() as u64;
     let debug_summary_period_ms = debug_summary_period_ms(engine.debug_summary_period_ms());
@@ -446,6 +446,7 @@ async fn drive<D: CellDuplex>(
     let mut would_block_total: u64 = 0;
     let mut would_block_retries: u64 = 0;
     let mut would_block_recovered: u64 = 0;
+    let mut local_transmits = std::collections::HashMap::<LocalTransmit, usize>::new();
     loop {
         let now = now_ms(&base);
         if let Some(period_ms) = debug_summary_period_ms
@@ -523,12 +524,13 @@ async fn drive<D: CellDuplex>(
         //
         // A `WouldBlock` from the cell carrier is local backpressure (bounded
         // session TX queue full), not proof that the peer/path lost a packet.
-        // The engine has already committed every polled cell to its sent
-        // flight, so silently dropping one would manufacture loss and drive
-        // RTO/cwnd collapse. Whatever the carrier does not accept stays queued
-        // in `outbound` (in emission order) and is retried before polling more
-        // engine output.
+        // The engine has reserved every polled DATA/FIN in its send window,
+        // but network timing starts only when the carrier accepts that cell.
+        // Whatever the carrier does not accept stays queued in `outbound`
+        // and is retried before polling more engine output. A striped carrier
+        // can accept a non-prefix subset, so correlate the retained cells.
         loop {
+            let now = now_ms(&base);
             if outbound.is_empty() && !engine.is_closed() {
                 while outbound.len() < MAX_OUTBOUND_BURST && engine.poll_transmit(now, &mut cell) {
                     outbound.push_back(cell.clone());
@@ -541,7 +543,22 @@ async fn drive<D: CellDuplex>(
                 break;
             }
             let retrying = send_retry_at.is_some();
-            match duplex.send_cells(&mut outbound).await {
+            local_transmits.clear();
+            for cell in &outbound {
+                if let Some(token) = LocalTransmit::from_cell(cell) {
+                    *local_transmits.entry(token).or_default() += 1;
+                }
+            }
+            let send_result = duplex.send_cells(&mut outbound).await;
+            for cell in &outbound {
+                if let Some(token) = LocalTransmit::from_cell(cell)
+                    && let Some(count) = local_transmits.get_mut(&token)
+                {
+                    *count = count.saturating_sub(1);
+                }
+            }
+            engine.local_handoff(&local_transmits, now_ms(&base));
+            match send_result {
                 Ok(()) => {
                     send_retry_at = None;
                     blocked_since_ms = None;
@@ -573,7 +590,7 @@ async fn drive<D: CellDuplex>(
         }
 
         // 5. Block until the next thing happens.
-        let mut timeout_at = engine.next_timeout();
+        let mut timeout_at = engine.next_timeout_with_pacing(outbound.is_empty());
         if !outbound.is_empty()
             && let Some(retry_at) = send_retry_at
         {
