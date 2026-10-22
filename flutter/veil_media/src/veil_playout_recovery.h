@@ -11,6 +11,7 @@
 #include "api/neteq/neteq_factory.h"
 #include "api/neteq/tick_timer.h"
 #include "modules/audio_coding/neteq/neteq_impl.h"
+#include "modules/audio_coding/neteq/packet_buffer.h"
 #include "veil_playout_trace.h"
 #include "veil_audio_recovery.h"
 #include "veil_audio_rtp_lag.h"
@@ -41,8 +42,8 @@ class RecoveringNetEq final : public webrtc::NetEq {
         ? inner_->GetOperationsAndState().current_buffer_size_ms : 0;
     bool silent = false;
     int sample_rate = 0;
-    // Packet arrival estimation measures real render callbacks, not the extra
-    // decoded blocks intentionally discarded within one callback. Otherwise
+    // Packet arrival and queue waiting time measure real render callbacks,
+    // not the extra decoded blocks discarded within one callback. Otherwise
     // catch-up invents network jitter and the estimator repeatedly rebuilds
     // the backlog we just removed, including across an Opus DTX interval.
     if (arrival_clock_) arrival_clock_->Increment();
@@ -258,8 +259,8 @@ class RecoveringNetEq final : public webrtc::NetEq {
   int frame_headroom_ms_ = 20;
   int requested_maximum_delay_ms_ = 0;
   int applied_target_ceiling_ms_ = -1;
-  // Outlives the controller inside inner_. Its other NetEq dependencies keep
-  // their original timer for decoding/packet bookkeeping.
+  // Outlives the controller and packet-buffer stopwatches inside inner_.
+  // The decoder's own timer still counts all decoded blocks.
   std::unique_ptr<webrtc::TickTimer> arrival_clock_;
   std::unique_ptr<webrtc::NetEq> inner_;
   std::shared_ptr<PlayoutRecoveryStats> stats_;
@@ -293,8 +294,14 @@ class RecoveringNetEqFactory final : public webrtc::NetEqFactory {
       webrtc::scoped_refptr<webrtc::AudioDecoderFactory> decoder) const override {
     auto clock = std::make_unique<webrtc::TickTimer>();
     ArrivalClockControllerFactory controller(clock.get());
-    auto inner = std::make_unique<webrtc::NetEqImpl>(config,
-        webrtc::NetEqImpl::Dependencies(env, config, std::move(decoder), controller));
+    webrtc::NetEqImpl::Dependencies deps(env, config, std::move(decoder), controller);
+    // NetEq's default packet buffer shares its decoder tick timer. Catch-up
+    // performs several decoder pulls within one render callback; counting
+    // those as elapsed waiting time invents queue delay and feeds it back to
+    // the controller. Use the same render clock as packet-arrival history.
+    deps.packet_buffer = std::make_unique<webrtc::PacketBuffer>(
+        env.field_trials(), config.max_packets_in_buffer, clock.get(), deps.stats.get());
+    auto inner = std::make_unique<webrtc::NetEqImpl>(config, std::move(deps));
     return std::make_unique<RecoveringNetEq>(
         std::move(inner), stats_, std::move(clock), config.max_delay_ms);
   }
