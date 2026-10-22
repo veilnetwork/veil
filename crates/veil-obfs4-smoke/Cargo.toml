@@ -1,6 +1,6 @@
 [package]
 name = "veil-obfs4-smoke"
-version = "0.11.43"
+version = "0.11.44"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
