@@ -267,35 +267,54 @@ impl AsyncRead for VeilStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if !self.read_buf.is_empty() {
-            let n = self.read_buf.len().min(buf.remaining());
-            buf.put_slice(&self.read_buf[..n]);
-            self.read_buf.drain(..n);
-            self.credit_window(n);
+        if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-
-        if self.read_closed {
-            return Poll::Ready(Ok(())); // EOF
-        }
-
-        match self.rx.poll_recv(cx) {
-            Poll::Ready(Some(StreamEvent::Data(data))) => {
-                let n = data.len().min(buf.remaining());
-                buf.put_slice(&data[..n]);
-                if n < data.len() {
-                    self.read_buf.extend_from_slice(&data[n..]);
+        let before = buf.filled().len();
+        // Drain only ready frames. The FFI caller otherwise crosses into a new
+        // Dart worker for every 2-KiB IPC frame even with a full receive queue.
+        // Cap work per poll, including empty frames from an untrusted peer.
+        for _ in 0..64 {
+            if !self.read_buf.is_empty() {
+                let n = self.read_buf.len().min(buf.remaining());
+                buf.put_slice(&self.read_buf[..n]);
+                self.read_buf.drain(..n);
+            }
+            if buf.remaining() == 0 || self.read_closed {
+                break;
+            }
+            match self.rx.poll_recv(cx) {
+                Poll::Ready(Some(StreamEvent::Data(data))) => {
+                    let n = data.len().min(buf.remaining());
+                    buf.put_slice(&data[..n]);
+                    if n < data.len() {
+                        self.read_buf.extend_from_slice(&data[n..]);
+                    }
                 }
-                // Credit only the bytes actually delivered to the consumer; the
-                // buffered remainder is credited when a later read drains it.
-                self.credit_window(n);
-                Poll::Ready(Ok(()))
+                Poll::Ready(Some(StreamEvent::Close)) | Poll::Ready(None) => {
+                    self.read_closed = true;
+                    break;
+                }
+                Poll::Pending => {
+                    let n = buf.filled().len() - before;
+                    self.credit_window(n);
+                    return if n > 0 {
+                        Poll::Ready(Ok(()))
+                    } else {
+                        Poll::Pending
+                    };
+                }
             }
-            Poll::Ready(Some(StreamEvent::Close)) | Poll::Ready(None) => {
-                self.read_closed = true;
-                Poll::Ready(Ok(())) // EOF
-            }
-            Poll::Pending => Poll::Pending,
+        }
+        let n = buf.filled().len() - before;
+        self.credit_window(n);
+        if n > 0 || self.read_closed {
+            Poll::Ready(Ok(()))
+        } else {
+            // Empty DATA is not EOF. Bound a continuously ready producer, and
+            // retry on the next poll without waiting for a new channel event.
+            cx.waker().wake_by_ref();
+            Poll::Pending
         }
     }
 }
@@ -377,7 +396,91 @@ impl Drop for VeilStream {
 mod tests {
     use super::*;
     use crate::client::SharedWriter;
+    use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn read_drains_queued_frames_without_waiting_for_more_bytes() {
+        let (tx, mut ipc) = mpsc::channel::<crate::client::IpcWriterFrame>(8);
+        let writer = SharedWriter::new(tx);
+        let (events, rx) = mpsc::channel(64);
+        let mut stream = VeilStream::new_acceptor(7, writer, rx);
+        let expected: Vec<_> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        for chunk in expected.chunks(2048) {
+            events
+                .send(StreamEvent::Data(chunk.to_vec()))
+                .await
+                .unwrap();
+        }
+        let mut bytes = vec![0; 64 * 1024];
+        let n = stream.read(&mut bytes).await.unwrap();
+        assert_eq!(
+            n,
+            expected.len(),
+            "queued IPC frames must share one FFI read"
+        );
+        assert_eq!(bytes, expected);
+        let frame = ipc.recv().await.unwrap();
+        let credit = StreamWindowPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+        assert_eq!(credit.increment as usize, n);
+        assert!(
+            ipc.try_recv().is_err(),
+            "credit is coalesced with this read"
+        );
+        events.send(StreamEvent::Data(vec![9; 17])).await.unwrap();
+        // The producer remains live and has not supplied another full buffer.
+        let n = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            stream.read(&mut bytes),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&bytes[..n], &[9; 17]);
+        events.send(StreamEvent::Close).await.unwrap();
+        assert_eq!(stream.read(&mut bytes).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn coalesced_reads_preserve_partial_frames_empty_data_and_eof() {
+        let (tx, _ipc) = mpsc::channel::<crate::client::IpcWriterFrame>(8);
+        let writer = SharedWriter::new(tx);
+        let (events, rx) = mpsc::channel(128);
+        let mut stream = VeilStream::new(7, writer, rx);
+        // More empty frames than the per-poll fairness budget. They must
+        // neither manufacture EOF nor strand a consumer with data queued.
+        for _ in 0..80 {
+            events.send(StreamEvent::Data(Vec::new())).await.unwrap();
+        }
+        let expected: Vec<_> = (0..100_003).map(|i| (i % 251) as u8).collect();
+        events
+            .send(StreamEvent::Data(expected[..70_000].to_vec()))
+            .await
+            .unwrap();
+        events
+            .send(StreamEvent::Data(expected[70_000..].to_vec()))
+            .await
+            .unwrap();
+        events.send(StreamEvent::Close).await.unwrap();
+        assert_eq!(stream.read(&mut []).await.unwrap(), 0);
+        let mut actual = Vec::new();
+        let mut buf = [0; 4097];
+        loop {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(1), stream.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            actual.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(
+            actual, expected,
+            "partial reads must not lose or duplicate bytes"
+        );
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
+    }
 
     #[tokio::test]
     async fn bounded_stream_frames_preserve_bytes_and_one_close_under_backpressure() {

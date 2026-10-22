@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Coalesce ready reliable-stream receive frames into one bounded read instead
+  of returning one IPC fragment per FFI/Dart worker round-trip. Preserve prompt
+  short reads, partial-frame ordering, empty DATA handling and exact credits.
 - Derive the unicast audio congestion-control ceiling from route framing so
   the fixed 96-kbit ceiling cannot permanently prevent 40-ms Opus recovery
   and retain video's packetization hold. Keep the speech payload ceiling,
