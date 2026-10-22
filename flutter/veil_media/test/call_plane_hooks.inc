@@ -674,4 +674,9 @@ extern "C" int veil_media_test_audio_transport_overhead(VeilMediaEngine* e) {
       })) return -1;
   return bytes;
 }
+extern "C" int veil_media_test_audio_transport_ceiling(VeilMediaEngine* e) {
+  if (!e || !e->ws) return -1;
+  if (!run_on(e->ws->network_tq.get(), [] {})) return -1;
+  return e->ws->audio_route_ceiling->load();
+}
 #pragma GCC visibility pop

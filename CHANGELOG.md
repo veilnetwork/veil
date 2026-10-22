@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Derive the unicast audio congestion-control ceiling from route framing so
+  the fixed 96-kbit ceiling cannot permanently prevent 40-ms Opus recovery
+  and retain video's packetization hold. Keep the speech payload ceiling,
+  congestion estimate, measured audio pause and relay policies unchanged.
+- Distinguish a retired stream's write credit from an exited IPC writer in
+  stream errors; retain closed-stream FFI classification and independent writes.
+
 ## v0.11.44 — 2026-10-22
 
 ### Changed
