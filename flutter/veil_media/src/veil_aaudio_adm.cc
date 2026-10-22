@@ -20,11 +20,14 @@
 #include <dlfcn.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <span>
+#include <thread>
 
 #include "api/audio/audio_device_defines.h"
 #include "api/make_ref_counted.h"
@@ -57,8 +60,16 @@ class VeilAAudioAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
                           webrtc::AudioDeviceModule> {
  public:
   explicit VeilAAudioAdm(const webrtc::Environment& env)
-      : env_(env), audio_device_buffer_(env, /*create_detached=*/true) {}
-  ~VeilAAudioAdm() override { Terminate(); }
+      : env_(env), audio_device_buffer_(env, /*create_detached=*/true) {
+    recovery_thread_ = std::thread([this] { RecoverDisconnectedStreams(); });
+  }
+  ~VeilAAudioAdm() override {
+    // Close joins AAudio callbacks before their userdata or fine buffers die.
+    Terminate();
+    recovery_stopping_.store(true);
+    recovery_cv_.notify_one();
+    recovery_thread_.join();
+  }
 
   int32_t RegisterAudioCallback(webrtc::AudioTransport* cb) override {
     return audio_device_buffer_.RegisterAudioCallback(cb);
@@ -143,11 +154,17 @@ class VeilAAudioAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     std::lock_guard<std::mutex> l(lock_);
     if (recording_.load()) return 0;
     if (!OpenRecordStreamLocked()) return -1;
-    rec_fine_->ResetRecord();
+    rec_fine_ = std::make_unique<webrtc::FineAudioBuffer>(&audio_device_buffer_);
     audio_device_buffer_.StartRecording();
     recording_.store(true);
     const aaudio_result_t r = AAudioStream_requestStart(rec_stream_);
     ALOG("aaudio_adm: StartRecording requestStart=%d", (int)r);
+    if (r != AAUDIO_OK) {
+      recording_.store(false);
+      CloseRecordStreamLocked();
+      audio_device_buffer_.StopRecording();
+      return -1;
+    }
     return 0;
   }
   int32_t StopRecording() override {
@@ -164,11 +181,17 @@ class VeilAAudioAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     std::lock_guard<std::mutex> l(lock_);
     if (playing_.load()) return 0;
     if (!OpenPlayStreamLocked()) return -1;
-    play_fine_->ResetPlayout();
+    play_fine_ = std::make_unique<webrtc::FineAudioBuffer>(&audio_device_buffer_);
     audio_device_buffer_.StartPlayout();
     playing_.store(true);
     const aaudio_result_t r = AAudioStream_requestStart(play_stream_);
     ALOG("aaudio_adm: StartPlayout requestStart=%d", (int)r);
+    if (r != AAUDIO_OK) {
+      playing_.store(false);
+      ClosePlayStreamLocked();
+      audio_device_buffer_.StopPlayout();
+      return -1;
+    }
     return 0;
   }
   int32_t StopPlayout() override {
@@ -195,7 +218,9 @@ class VeilAAudioAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
                                            AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
     const int32_t device_id = recording_device_id_.load();
     if (device_id > 0) AAudioStreamBuilder_setDeviceId(b, device_id);
+    rec_generation_.fetch_add(1);
     AAudioStreamBuilder_setDataCallback(b, &VeilAAudioAdm::RecordCallback, this);
+    AAudioStreamBuilder_setErrorCallback(b, &VeilAAudioAdm::RecordErrorCallback, this);
     const aaudio_result_t r = AAudioStreamBuilder_openStream(b, &rec_stream_);
     AAudioStreamBuilder_delete(b);
     if (r != AAUDIO_OK || rec_stream_ == nullptr) {
@@ -213,11 +238,14 @@ class VeilAAudioAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     return true;
   }
   void CloseRecordStreamLocked() {
+    rec_generation_.fetch_add(1);
+    rec_recovery_.store(0);
     if (rec_stream_) {
       AAudioStream_requestStop(rec_stream_);
       AAudioStream_close(rec_stream_);
       rec_stream_ = nullptr;
     }
+    rec_recovery_.store(0);
   }
   bool OpenPlayStreamLocked() {
     AAudioStreamBuilder* b = nullptr;
@@ -235,7 +263,9 @@ class VeilAAudioAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
                                            AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
     const int32_t device_id = playout_device_id_.load();
     if (device_id > 0) AAudioStreamBuilder_setDeviceId(b, device_id);
+    play_generation_.fetch_add(1);
     AAudioStreamBuilder_setDataCallback(b, &VeilAAudioAdm::PlayCallback, this);
+    AAudioStreamBuilder_setErrorCallback(b, &VeilAAudioAdm::PlayErrorCallback, this);
     const aaudio_result_t r = AAudioStreamBuilder_openStream(b, &play_stream_);
     AAudioStreamBuilder_delete(b);
     if (r != AAUDIO_OK || play_stream_ == nullptr) {
@@ -252,10 +282,85 @@ class VeilAAudioAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     return true;
   }
   void ClosePlayStreamLocked() {
+    play_generation_.fetch_add(1);
+    play_recovery_.store(0);
     if (play_stream_) {
       AAudioStream_requestStop(play_stream_);
       AAudioStream_close(play_stream_);
       play_stream_ = nullptr;
+    }
+    play_recovery_.store(0);
+  }
+
+  // AAudio forbids close/reopen on its error callback thread. The callback
+  // only publishes the current generation. One owned worker serializes all
+  // recovery with ordinary stop/device/start operations using lock_. No detached
+  // thread captures this ADM, and retired generations cannot revive a stream.
+  static void RecordErrorCallback(AAudioStream*, void* ud, aaudio_result_t error) {
+    auto* self = static_cast<VeilAAudioAdm*>(ud);
+    self->rec_error_.store(error);
+    self->rec_recovery_.store(self->rec_generation_.load());
+    self->recovery_cv_.notify_one();
+  }
+  static void PlayErrorCallback(AAudioStream*, void* ud, aaudio_result_t error) {
+    auto* self = static_cast<VeilAAudioAdm*>(ud);
+    self->play_error_.store(error);
+    self->play_recovery_.store(self->play_generation_.load());
+    self->recovery_cv_.notify_one();
+  }
+  void RecoverDisconnectedStreams() {
+    std::unique_lock<std::mutex> wait_lock(recovery_wait_lock_);
+    while (!recovery_stopping_.load()) {
+      // A timed wait also covers a notification racing entry to the wait.
+      recovery_cv_.wait_for(wait_lock, std::chrono::milliseconds(100), [this] {
+        return recovery_stopping_.load() || rec_recovery_.load() != 0 ||
+               play_recovery_.load() != 0;
+      });
+      if (recovery_stopping_.load()) break;
+      const auto rec = rec_recovery_.exchange(0);
+      const auto play = play_recovery_.exchange(0);
+      bool retry = false;
+      {
+        std::lock_guard<std::mutex> lock(lock_);
+        if (rec != 0 && rec == rec_generation_.load() && recording_.load()) {
+          ALOG("aaudio_adm: recover recording error=%d", (int)rec_error_.load());
+          CloseRecordStreamLocked();
+          bool started = OpenRecordStreamLocked();
+          if (started) {
+            // A reopened device can negotiate different rate/channel settings.
+            // Its old callback has exited before this buffer is replaced.
+            // AudioDeviceBuffer remains started on its original control
+            // sequence; recovery only replaces the native device and adapter.
+            rec_fine_ = std::make_unique<webrtc::FineAudioBuffer>(&audio_device_buffer_);
+            started = AAudioStream_requestStart(rec_stream_) == AAUDIO_OK;
+          }
+          ALOG("aaudio_adm: recover recording started=%d", (int)started);
+          if (!started) {
+            CloseRecordStreamLocked();
+            rec_recovery_.store(rec_generation_.load());
+            retry = true;
+          }
+        }
+        if (play != 0 && play == play_generation_.load() && playing_.load()) {
+          ALOG("aaudio_adm: recover playout error=%d", (int)play_error_.load());
+          ClosePlayStreamLocked();
+          bool started = OpenPlayStreamLocked();
+          if (started) {
+            play_fine_ = std::make_unique<webrtc::FineAudioBuffer>(&audio_device_buffer_);
+            started = AAudioStream_requestStart(play_stream_) == AAUDIO_OK;
+          }
+          ALOG("aaudio_adm: recover playout started=%d", (int)started);
+          if (!started) {
+            ClosePlayStreamLocked();
+            play_recovery_.store(play_generation_.load());
+            retry = true;
+          }
+        }
+      }
+      // Device removal can outlast one open. Avoid a busy retry loop; stop and
+      // destruction still wake immediately and clear the desired active flags.
+      if (retry) recovery_cv_.wait_for(wait_lock, std::chrono::milliseconds(250),
+                                      [this] { return recovery_stopping_.load(); });
     }
   }
 
@@ -305,6 +410,13 @@ class VeilAAudioAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   AAudioStream* play_stream_ = nullptr;
   int32_t rec_channels_ = kChannels;
   int32_t play_channels_ = kChannels;
+  std::atomic<uint64_t> rec_generation_{0}, play_generation_{0};
+  std::atomic<uint64_t> rec_recovery_{0}, play_recovery_{0};
+  std::atomic<int32_t> rec_error_{0}, play_error_{0};
+  std::atomic<bool> recovery_stopping_{false};
+  std::mutex recovery_wait_lock_;
+  std::condition_variable recovery_cv_;
+  std::thread recovery_thread_;
 };
 
 }  // namespace

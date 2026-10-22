@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Recover Android AAudio capture and playout after the OS disconnects a
+  stream during speaker, headset or other device changes. Serialize reopen
+  on an owned worker, reject retired generations and join it at teardown.
+  Propagate initial requestStart failures instead of reporting live audio.
 - Do not drain the decoder below its adaptive reserve solely to catch up with
   upstream RTP age. Keep the independent hard local-buffer budget unchanged.
   Cover the regression and schedule recurring-jitter test arrivals by source
