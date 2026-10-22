@@ -1378,13 +1378,19 @@ impl CellSender for CircuitCells {
         };
         if self.route_session_stale(&route) {
             self.mark_route_stale(dst.node, &route).await;
-            // Treat stale route exactly like a dropped cell. The stream engine
-            // retransmits, while route selection/opening moves to a fresh path.
-            if ack_copies > 0 {
-                self.send_ack_copies(dst.node, route.rendezvous_node, &cell, ack_copies)
-                    .await;
+            if ack_copies > 0
+                && self
+                    .send_ack_copies(dst.node, route.rendezvous_node, &cell, ack_copies)
+                    .await
+                    > 0
+            {
+                return Ok(());
             }
-            return Ok(());
+            // The stale first hop never accepted this cell. Keep it pending
+            // while route selection moves to a fresh path.
+            return Err(veil_onion_stream::send_backpressure(Duration::from_millis(
+                25,
+            )));
         }
         let env = self.stream_envelope(&route, &cell, is_handshake)?;
         if is_data {
@@ -1397,24 +1403,11 @@ impl CellSender for CircuitCells {
             0
         };
         if let Err(e) = self.send_stream_envelope(&route.circuit, &env, is_data) {
-            if e == veil_node_runtime::DataCircuitSendError::QueueFull {
-                if accepted_ack_copies > 0 {
-                    return Ok(());
-                }
-                // Local first-hop session TX queue is full. The encoded stream
-                // cell has not entered the transport, so surface backpressure to
-                // the stream driver and let it retry the same cell instead of
-                // manufacturing packet loss/RTO recovery.
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "circuit first-hop TX queue full",
-                ));
+            let error = self.stream_enqueue_error(dst.node, &route, e).await;
+            if accepted_ack_copies > 0 {
+                return Ok(());
             }
-            self.mark_route_send_failed(dst.node, &route, e).await;
-            // Preserve ARQ semantics: a route enqueue failure is equivalent to a
-            // dropped cell. The stream engine will retransmit and route
-            // selection can pick a non-cooled path next time.
-            return Ok(());
+            return Err(error);
         }
         if let Some(stats) = route.stats.as_ref()
             && let Some(snapshot) = stats.record_send(is_data, data_payload_len)
@@ -1854,9 +1847,9 @@ impl CircuitCells {
         };
         if self.route_session_stale(&route) {
             self.mark_route_stale(dst.node, &route).await;
-            // Stale route == dropped run: ARQ retransmits on a fresh path.
-            cells.drain(..run_len);
-            return Ok(());
+            return Err(veil_onion_stream::send_backpressure(Duration::from_millis(
+                25,
+            )));
         }
         self.data_pacer.wait_n(dst.node, run_len as u32).await;
         // Route striping: distribute the stream across distinct first hops,
@@ -1894,16 +1887,27 @@ impl CircuitCells {
                 self.mark_outbound_non_handshake(dst.node, &route).await;
             }
             if let Some(err) = err {
-                return self
-                    .finish_failed_chunk(dst.node, &route, err, run_len - sent, cells)
-                    .await;
+                return Err(self.stream_enqueue_error(dst.node, &route, err).await);
             }
             self.maybe_shed_slow_bulk_route(dst.node, stream_id, &route)
                 .await;
             return Ok(());
         }
+        self.send_striped_run(dst, stream_id, &route, &alternates, run_len, cells)
+            .await
+    }
+
+    async fn send_striped_run(
+        &self,
+        dst: Addr,
+        stream_id: u32,
+        route: &CircuitRoute,
+        alternates: &[CircuitRoute],
+        run_len: usize,
+        cells: &mut std::collections::VecDeque<Vec<u8>>,
+    ) -> io::Result<()> {
         let mut routes: Vec<&CircuitRoute> = Vec::with_capacity(1 + alternates.len());
-        routes.push(&route);
+        routes.push(route);
         routes.extend(alternates.iter());
         let n = routes.len();
         // INTERLEAVE cells across routes (round-robin), do NOT hand each route a
@@ -1922,62 +1926,53 @@ impl CircuitCells {
         // Drain the run once; dispatch cell i to route (base+i) % n.
         let run: Vec<Vec<u8>> = cells.drain(..run_len).collect();
         let mut per_route_ok = vec![true; n];
-        let mut failed_routes: Vec<usize> = Vec::new();
-        let mut i = 0usize;
-        while i < run.len() {
+        let mut failed_routes = Vec::new();
+        let mut per_route_sent = vec![false; n];
+        let mut retained = std::collections::VecDeque::new();
+        let mut terminal_error = None;
+        for (i, cell) in run.iter().enumerate() {
             let ri = (base + i) % n;
             if !per_route_ok[ri] {
-                // Route already failed this run: requeue for ARQ repair on a
-                // healthy route in a later pass, skip it.
-                cells.push_back(run[i].clone());
-                i += 1;
+                // No handoff on this route: retain the exact cell for a later
+                // local retry, while healthy stripes can still make progress.
+                retained.push_back(cell.clone());
                 continue;
             }
-            match self.send_one_cell_on_route(&routes[ri].peer_cookie, routes[ri], &run[i]) {
-                Ok(true) => i += 1,
-                Ok(false) => {
-                    // Enqueue rejected (not queue-full): mark the route dead for
-                    // the rest of this run; requeue this cell for ARQ repair.
+            match self.send_one_cell_on_route(&routes[ri].peer_cookie, routes[ri], cell) {
+                Ok(()) => per_route_sent[ri] = true,
+                Err(error @ veil_node_runtime::DataCircuitSendError::NoRelays) => {
                     per_route_ok[ri] = false;
-                    failed_routes.push(ri);
-                    cells.push_back(run[i].clone());
-                    i += 1;
+                    failed_routes.push((ri, error));
+                    retained.push_back(cell.clone());
                 }
-                Err(_) => {
-                    // Local first-hop TX queue full: push this cell and the
-                    // whole undelivered tail back (front, in order) so the
-                    // driver retries them next poll. No manufactured loss.
-                    for cell in run[i..].iter().rev() {
-                        cells.push_front(cell.clone());
-                    }
-                    for ri in failed_routes {
-                        self.mark_route_send_failed(
-                            dst.node,
-                            routes[ri],
-                            veil_node_runtime::DataCircuitSendError::QueueFull,
-                        )
-                        .await;
-                    }
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "circuit first-hop TX queue full (striped)",
-                    ));
+                Err(error) => {
+                    retained.extend(run[i..].iter().cloned());
+                    terminal_error = Some((ri, error));
+                    break;
                 }
             }
         }
-        for ri in failed_routes {
-            self.mark_route_send_failed(
-                dst.node,
-                routes[ri],
-                veil_node_runtime::DataCircuitSendError::QueueFull,
-            )
-            .await;
+        // Earlier rejected stripes must precede the unsent tail and unrelated
+        // suffix. Only accepted cells disappear from the caller's handoff set.
+        retained.append(cells);
+        *cells = retained;
+        let mut result = Ok(());
+        for (ri, error) in failed_routes.into_iter().chain(terminal_error) {
+            result = Err(self.stream_enqueue_error(dst.node, routes[ri], error).await);
         }
-        mark_circuit_activity(&self.activity);
-        self.mark_outbound_non_handshake(dst.node, &route).await;
-        self.maybe_shed_slow_bulk_route(dst.node, stream_id, &route)
-            .await;
-        Ok(())
+        if per_route_sent.iter().any(|sent| *sent) {
+            mark_circuit_activity(&self.activity);
+            for (ri, sent) in per_route_sent.iter().enumerate() {
+                if *sent {
+                    self.mark_outbound_non_handshake(dst.node, routes[ri]).await;
+                }
+            }
+        }
+        if per_route_sent[0] {
+            self.maybe_shed_slow_bulk_route(dst.node, stream_id, route)
+                .await;
+        }
+        result
     }
 
     /// Only DATA enters the recoverable stream's independent local transport.
@@ -2000,15 +1995,14 @@ impl CircuitCells {
         }
     }
 
-    /// Send ONE already-decoded stream cell on `route`. `Ok(true)` = accepted,
-    /// `Ok(false)` = route enqueue rejected (mark it), `Err(WouldBlock)` =
-    /// local first-hop TX queue full (retry the exact cell).
+    /// Preserve the actual local enqueue result, including a missing session,
+    /// a full queue, and an unrecoverable oversized envelope.
     fn send_one_cell_on_route(
         &self,
         cookie: &[u8; COOKIE_LEN],
         route: &CircuitRoute,
         cell: &[u8],
-    ) -> io::Result<bool> {
+    ) -> Result<(), veil_node_runtime::DataCircuitSendError> {
         let data_payload_len = match Frame::decode(cell) {
             Some(Frame::Data { payload, .. }) => payload.len(),
             _ => 0,
@@ -2025,29 +2019,23 @@ impl CircuitCells {
         }
         env.extend_from_slice(cell);
         if env.len() > circuit_env_max() {
-            return Err(io::Error::other("circuit stream envelope too large"));
+            return Err(veil_node_runtime::DataCircuitSendError::PayloadTooLarge);
         }
         match self.send_stream_envelope(&route.circuit, &env, true) {
             Ok(()) => {
                 if let Some(stats) = route.stats.as_ref() {
                     stats.record_send(true, data_payload_len);
                 }
-                Ok(true)
+                Ok(())
             }
-            Err(veil_node_runtime::DataCircuitSendError::QueueFull) => Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "circuit first-hop TX queue full",
-            )),
-            Err(_) => Ok(false),
+            Err(error) => Err(error),
         }
     }
 
     /// Send `count` cells from the front of `cells` on `route`. Returns how
     /// many were accepted plus the enqueue error, if one stopped the chunk
-    /// early. `Err(WouldBlock)` = local first-hop TX queue full, unsent cells
-    /// stay queued for the driver's retry. On a non-queue enqueue failure the
-    /// caller decides how much of the tail to drop
-    /// (see [`Self::finish_failed_chunk`]).
+    /// early. Every unaccepted cell stays queued; callers classify the local
+    /// error and still account for the accepted prefix.
     fn send_chunk_on_route(
         &self,
         dst_node: [u8; 32],
@@ -2082,14 +2070,6 @@ impl CircuitCells {
                 )));
             }
             if let Err(e) = self.send_stream_envelope(&route.circuit, &env, true) {
-                if e == veil_node_runtime::DataCircuitSendError::QueueFull {
-                    // Sent cells are gone; the failing cell and the rest of the
-                    // run stay queued for the caller's WouldBlock retry.
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "circuit first-hop TX queue full",
-                    ));
-                }
                 return Ok((sent, Some(e)));
             }
             if let Some(stats) = route.stats.as_ref()
@@ -2112,20 +2092,29 @@ impl CircuitCells {
         Ok((sent, None))
     }
 
-    /// A route rejected an enqueue mid-chunk (not queue-full): mark it and
-    /// drop the chunk's remaining cells — ARQ retransmits them, and route
-    /// selection moves off the cooled path.
-    async fn finish_failed_chunk(
+    /// Local rejection is not network loss. A full queue can retry normally;
+    /// a missing session needs route recovery; oversized cells must fail rather
+    /// than spin or quarantine an otherwise healthy route.
+    async fn stream_enqueue_error(
         &self,
         dst_node: [u8; 32],
         route: &CircuitRoute,
         err: veil_node_runtime::DataCircuitSendError,
-        remaining: usize,
-        cells: &mut std::collections::VecDeque<Vec<u8>>,
-    ) -> io::Result<()> {
-        self.mark_route_send_failed(dst_node, route, err).await;
-        cells.drain(..remaining.min(cells.len()));
-        Ok(())
+    ) -> io::Error {
+        use veil_node_runtime::DataCircuitSendError;
+        match err {
+            DataCircuitSendError::QueueFull => {
+                io::Error::new(io::ErrorKind::WouldBlock, "circuit first-hop TX queue full")
+            }
+            DataCircuitSendError::NoRelays => {
+                self.mark_route_send_failed(dst_node, route, err).await;
+                veil_onion_stream::send_backpressure(Duration::from_millis(25))
+            }
+            DataCircuitSendError::PayloadTooLarge => io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "circuit stream envelope too large",
+            ),
+        }
     }
 
     /// Healthy pool routes to stripe extra chunks over: distinct circuit AND
@@ -4968,6 +4957,10 @@ fn retire_circuits_later(
 #[cfg(all(test, unix))]
 #[path = "anon_stream/source_lane_tests.rs"]
 mod source_lane_tests;
+
+#[cfg(all(test, feature = "test-low-difficulty"))]
+#[path = "anon_stream/local_enqueue_tests.rs"]
+mod local_enqueue_tests;
 
 #[cfg(test)]
 mod tests {
