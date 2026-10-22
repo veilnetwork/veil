@@ -51,11 +51,11 @@ pub trait CellSender: Send + Sync + 'static {
     /// A cold route may use [`crate::send_backpressure`] to suggest a slower
     /// cadence without sleeping inside the driver's send operation.
     fn send(&self, dst: Addr, cell: Vec<u8>) -> impl Future<Output = io::Result<()>> + Send;
-    /// Send an ordered burst of cells to one peer. Accepted cells are popped
-    /// from the front of `cells`; on `Err` the failing cell and everything
-    /// after it stay queued for the caller to retry (`WouldBlock`) or tear
-    /// down. The default forwards cell-by-cell; carriers with per-cell
-    /// route/pacing/lock overhead should override and amortize it.
+    /// Send a burst of cells to one peer. Remove only accepted cells; on `Err`
+    /// retain every unaccepted cell for retry (`WouldBlock`) or teardown.
+    /// The default accepts a FIFO prefix. A striped carrier may accept a
+    /// non-prefix subset; retained cells keep their relative order. Carriers
+    /// with per-cell route/pacing/lock overhead can override and amortize it.
     fn send_many(
         &self,
         dst: Addr,
