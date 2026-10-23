@@ -232,6 +232,7 @@ struct RealtimeDatagramLane {
     source_activity: Arc<crate::local_source_activity::LocalSourceActivity>,
     primary_record_expired: u64,
     pressure_trace: [(u64, Option<std::time::Instant>); LOCAL_TRACE_SLOTS],
+    recoverable_wait_trace: [Option<std::time::Instant>; 3],
     peer_rotates: bool,
     peer_circuit_datagrams: bool,
     peer_neutral_forwards: bool,
@@ -442,6 +443,39 @@ impl RealtimeSender {
 }
 
 impl RealtimeDatagramLane {
+    /// Opt-in local wait evidence; no source role or scheduling hint is sent.
+    fn trace_recoverable_wait(
+        &mut self,
+        logger: &veil_observability::NodeLogger,
+        peer: &NodeIdBytes,
+        gate: usize,
+        queued_at: std::time::Instant,
+        capacity: Option<(usize, usize)>,
+    ) {
+        if !crate::rt_trace::rt_trace_enabled() {
+            return;
+        }
+        let Some(last) = self.recoverable_wait_trace.get_mut(gate) else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if last.is_some_and(|at| now.saturating_duration_since(at).as_secs() < 1) {
+            return;
+        }
+        *last = Some(now);
+        logger.info(
+            "session.rt_trace.recoverable_wait",
+            format!(
+                "peer_id={} gate={} queued_ms={} needed_bytes={} available_bytes={} scope=endpoint",
+                hex_short(peer),
+                ["child_unavailable", "transport_capacity", "source_budget"][gate],
+                now.saturating_duration_since(queued_at).as_millis(),
+                capacity.map_or(0, |(needed, _)| needed),
+                capacity.map_or(0, |(_, available)| available),
+            ),
+        );
+    }
+
     /// Trusted local sources with negotiated children must never collapse
     /// back onto the parent's congestion budget or ordered writer. Forwarded
     /// INTERACTIVE traffic keeps ordinary compatibility; no wire role grants
@@ -4302,6 +4336,7 @@ impl SessionRunner {
                             hex_short(&self.peer_id), offer.peer_flows, offer.parallel.is_some() && offer.peer_flows && offer.peer_rotates, offer.peer_circuit_datagrams));
                         Some(RealtimeDatagramLane {
                             pressure_trace: [(0, None); LOCAL_TRACE_SLOTS],
+                            recoverable_wait_trace: [None; 3],
                             source_activity: source_activity.clone(),
                             primary_record_expired: 0,
                             local_reliable: Some(
@@ -4347,6 +4382,7 @@ impl SessionRunner {
                             hex_short(&self.peer_id), veil_transport::ordered_records::MAX_RECORD_BYTES, offer.peer_circuit_datagrams));
                         Some(RealtimeDatagramLane {
                             pressure_trace: [(0, None); LOCAL_TRACE_SLOTS],
+                            recoverable_wait_trace: [None; 3],
                             source_activity: source_activity.clone(),
                             primary_record_expired: 0,
                             local_reliable: None,
@@ -5060,6 +5096,13 @@ impl SessionRunner {
                         }) else {
                             if independent_source {
                                 if recoverable_data {
+                                    lane.trace_recoverable_wait(
+                                        &self.logger,
+                                        &self.peer_id,
+                                        0,
+                                        envelope.queued_at,
+                                        None,
+                                    );
                                     defer_local_datagram(
                                         &mut pq,
                                         envelope,
@@ -5168,6 +5211,13 @@ impl SessionRunner {
                                 continue;
                             }
                             if recoverable_data {
+                                lane.trace_recoverable_wait(
+                                    &self.logger,
+                                    &self.peer_id,
+                                    1,
+                                    envelope.queued_at,
+                                    Some((planned_queue_charge, available)),
+                                );
                                 defer_local_datagram(
                                     &mut pq,
                                     envelope,
@@ -5249,6 +5299,13 @@ impl SessionRunner {
                             ),
                         } {
                             if recoverable_data {
+                                lane.trace_recoverable_wait(
+                                    &self.logger,
+                                    &self.peer_id,
+                                    2,
+                                    envelope.queued_at,
+                                    Some((planned_queue_charge, available)),
+                                );
                                 defer_local_datagram(
                                     &mut pq,
                                     envelope,
