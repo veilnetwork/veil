@@ -430,6 +430,11 @@ pub struct StreamEngine {
     ack_pending: bool,
     /// Optional RFC 2883-style first SACK; fresh DATA must not erase it before ACK encoding.
     duplicate_range: Option<SackRange>,
+    /// Buffered DATA that triggered the newest ACK. Its coalesced block must
+    /// remain visible when older gaps consume all available SACK slots.
+    recent_sack_seq: Option<u32>,
+    /// Local numeric diagnostic: newest blocks that an oldest-first ACK would omit.
+    sack_recent_promotions: u64,
     /// Delayed-ACK state: ACK after the configured number of advancing DATA
     /// segments, or after a short timer. Gaps/duplicates/FIN are immediate.
     ack_eliciting: u8,
@@ -570,6 +575,8 @@ impl StreamEngine {
             hs_local_deadline: None,
             ack_pending: false,
             duplicate_range: None,
+            recent_sack_seq: None,
+            sack_recent_promotions: 0,
             ack_eliciting: 0,
             ack_deadline: None,
             rst_to_send: None,
@@ -752,7 +759,7 @@ impl StreamEngine {
              adv={} ack_pending={} eof={} fin(req={},sent={},ack={}) \
              srtt={:?} rttvar={} rto={}ms pace_next={}ms delayed_ack={}/{:?} \
              rto_dl={:?} persist_dl={:?} bbr_bw={} bbr_rtt_min={:?} bbr_cap={:?} \
-             rack={} reo_wnd={} rack_rtt={} rto_skipped_sacked={}",
+             rack={} reo_wnd={} rack_rtt={} rto_skipped_sacked={} sack_recent_promotions={}",
             self.phase,
             self.tx.snd_una,
             self.tx.snd_nxt,
@@ -792,6 +799,7 @@ impl StreamEngine {
             self.rack_reo_wnd(),
             self.tx.rack_rtt_ms,
             self.tx.rto_sacked_segments_skipped,
+            self.sack_recent_promotions,
         )
     }
 
@@ -898,6 +906,9 @@ impl StreamEngine {
             self.duplicate_range = duplicate_range;
         }
         let advanced = self.rx.accept(seg_seq, payload);
+        if self.rx.oo.contains_key(&seg_seq) {
+            self.recent_sack_seq = Some(seg_seq);
+        }
         self.ack_data(advanced, now);
     }
 
@@ -1617,6 +1628,12 @@ impl StreamEngine {
     fn make_ack(&mut self) -> Frame<'static> {
         let mut sacks = SackVec::new();
         let blocks = self.rx.sack_blocks();
+        let recent = self.recent_sack_seq.and_then(|seq_no| {
+            blocks
+                .iter()
+                .find(|(start, end)| seq::geq(seq_no, *start) && seq::lt(seq_no, *end))
+                .copied()
+        });
         let duplicate = self.duplicate_range.take();
         let enclosing = duplicate
             .filter(|d| seq::geq(d.start, self.rx.rcv_nxt))
@@ -1632,8 +1649,25 @@ impl StreamEngine {
         if let Some((start, end)) = enclosing {
             let _ = sacks.push(SackRange { start, end });
         }
+        // Report the latest receipt before repeating older ranges. Otherwise
+        // eight persistent early gaps hide all newer deliveries, so the
+        // sender's SACK scoreboard, RACK frontier and rate model go stale.
+        // D-SACK keeps its first slot and above-ACK enclosing second slot.
+        if let Some((start, end)) = recent
+            && recent != enclosing
+        {
+            let old_prefix_has_recent = blocks
+                .iter()
+                .filter(|block| Some(**block) != enclosing)
+                .take(crate::wire::MAX_SACKS - sacks.len())
+                .any(|block| *block == (start, end));
+            if !old_prefix_has_recent {
+                self.sack_recent_promotions = self.sack_recent_promotions.saturating_add(1);
+            }
+            let _ = sacks.push(SackRange { start, end });
+        }
         for (start, end) in blocks {
-            if enclosing == Some((start, end)) {
+            if enclosing == Some((start, end)) || recent == Some((start, end)) {
                 continue;
             }
             if !sacks.push(SackRange { start, end }) {
@@ -4414,6 +4448,123 @@ mod tests {
         e.syn_acked = true;
         e.rx.rcv_nxt = start;
         e
+    }
+
+    #[test]
+    fn sack_capacity_never_hides_the_most_recent_received_block() {
+        for start in [100u32, u32::MAX - 127] {
+            let mut e = duplicate_receiver(start);
+            for i in 0..16u32 {
+                let seq = start.wrapping_add(i * 32 + 16);
+                e.on_data(seq, 4096, &[0x39; 16], u64::from(i + 1));
+                let wire = e.make_ack().encode();
+                let Some(Frame::Ack { ack, sacks, .. }) = Frame::decode(&wire) else {
+                    panic!("invalid ACK");
+                };
+                assert_eq!(ack, start);
+                assert!(sacks.as_slice().len() <= crate::wire::MAX_SACKS);
+                assert!(
+                    sacks.as_slice().contains(&SackRange {
+                        start: seq,
+                        end: seq.wrapping_add(16)
+                    }),
+                    "a persistent early gap hid the newest arrival"
+                );
+                assert_eq!(e.readable_len(), 0);
+            }
+            // Coalescing must report the whole block, and rejected DATA must
+            // not displace the last actual receipt from a saturated ACK.
+            e.on_data(start.wrapping_add(480), 4096, &[0x39; 16], 30);
+            e.on_data(start.wrapping_add(e.rx.window + 64), 4096, &[0x39; 16], 31);
+            let Frame::Ack { sacks, .. } = e.make_ack() else {
+                unreachable!()
+            };
+            assert_eq!(
+                sacks.as_slice()[0],
+                SackRange {
+                    start: start.wrapping_add(464),
+                    end: start.wrapping_add(512)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn full_sack_feedback_keeps_sender_delivery_and_rack_frontier_current() {
+        for iss in [100u32, u32::MAX - 127] {
+            let cfg = Config {
+                mss: 16,
+                init_cwnd: 1024,
+                recv_window: 4096,
+                bbr: true,
+                rack: true,
+                ..Config::default()
+            };
+            let mut sender = StreamEngine::connect(9, cfg, 0, iss);
+            sender.on_synack(500, 4096, iss.wrapping_add(1), 0);
+            let mut receiver = duplicate_receiver(iss.wrapping_add(1));
+            let data: Vec<u8> = (0..512).map(|i| (i * 37 % 251) as u8).collect();
+            sender.write(&data);
+            let mut cell = Vec::new();
+            let mut originals = Vec::new();
+            while sender.poll_transmit(10, &mut cell) {
+                if matches!(Frame::decode(&cell), Some(Frame::Data { .. })) {
+                    originals.push(cell.clone());
+                }
+            }
+            assert_eq!(originals.len(), 32);
+            for (i, original) in originals.iter().enumerate().skip(1).step_by(2) {
+                receiver.on_cell(original, 20 + i as u64);
+                sender.on_cell(&receiver.make_ack().encode(), 21 + i as u64);
+            }
+            assert_eq!(sender.tx.delivered, 256, "new receipts were hidden");
+            assert_eq!(sender.tx.rack_end_seq, iss.wrapping_add(513));
+            assert!(sender.tx.segs.iter().skip(1).step_by(2).all(|s| s.sacked));
+            let mut received = Vec::new();
+            let mut bytes = [0; 512];
+            for now in 100..2000 {
+                sender.on_timeout(now);
+                while sender.poll_transmit(now, &mut cell) {
+                    receiver.on_cell(&cell, now);
+                    sender.on_cell(&receiver.make_ack().encode(), now);
+                    let n = receiver.read(&mut bytes);
+                    received.extend_from_slice(&bytes[..n]);
+                }
+                if received.len() == data.len() {
+                    break;
+                }
+            }
+            assert_eq!(received, data);
+        }
+    }
+
+    #[test]
+    fn a_pending_dsack_keeps_the_newest_fresh_sack_at_full_capacity() {
+        for start in [100u32, u32::MAX - 127] {
+            let mut e = duplicate_receiver(start);
+            for i in 0..12u32 {
+                e.on_data(start.wrapping_add(i * 32 + 16), 4096, &[1; 16], 1);
+            }
+            let duplicate = start.wrapping_add(11 * 32 + 16);
+            e.on_data(duplicate, 4096, &[1; 16], 2);
+            let fresh = start.wrapping_add(12 * 32 + 16);
+            e.on_data(fresh, 4096, &[2; 16], 3);
+            let wire = e.make_ack().encode();
+            let Some(Frame::Ack { sacks, .. }) = Frame::decode(&wire) else {
+                panic!("invalid ACK");
+            };
+            let dsack = SackRange {
+                start: duplicate,
+                end: duplicate.wrapping_add(16),
+            };
+            assert_eq!(sacks.as_slice()[0], dsack);
+            assert_eq!(sacks.as_slice()[1], dsack);
+            assert!(sacks.as_slice().contains(&SackRange {
+                start: fresh,
+                end: fresh.wrapping_add(16)
+            }));
+            assert_eq!(sacks.len(), crate::wire::MAX_SACKS);
+        }
     }
 
     #[test]
