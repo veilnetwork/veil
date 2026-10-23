@@ -2,6 +2,142 @@
 use super::*;
 use veil_onion_stream::CellSender;
 
+/// Console diagnostics are process-global. Run the real offline services in a
+/// child so the count cannot include another parallel fixture's failures.
+#[tokio::test]
+async fn fast_no_relays_failure_does_not_restart_on_every_carrier_retry() {
+    const CHILD: &str = "VEIL_TEST_FAST_CIRCUIT_RETRY_CHILD";
+    if let Ok(mode) = std::env::var(CHILD) {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use veil_anonymity::rendezvous::{rendezvous_ad_dht_key_at, sign_rendezvous_ad_v5};
+        async fn advertised_receiver(f: &Fixture) -> [u8; 32] {
+            let key = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
+            let receiver = *blake3::hash(&STANDARD.decode(&key.public_key).unwrap()).as_bytes();
+            let now = veil_util::unix_secs_now_u64();
+            let ad = sign_rendezvous_ad_v5(
+                receiver,
+                f.hop,
+                [0x52; COOKIE_LEN],
+                [0x33; 32],
+                now,
+                now + 3600,
+                &[],
+                &[],
+                &[],
+                0,
+                &[],
+                &key.public_key,
+                &key.private_key,
+                veil_types::SignatureAlgorithm::Ed25519,
+            )
+            .unwrap();
+            f.cells
+                .services
+                .dht
+                .store_local(rendezvous_ad_dht_key_at(&receiver, 0), ad);
+            let ads = f
+                .cells
+                .services
+                .resolve_stream_rendezvous_ads(receiver)
+                .await
+                .unwrap();
+            assert!(ads.iter().any(|ad| ad.auth_cookie == [0x52; COOKIE_LEN]));
+            receiver
+        }
+        let mut f = fixture().await;
+        let receiver = advertised_receiver(&f).await;
+        let other_receiver = if mode == "peer" {
+            Some(advertised_receiver(&f).await)
+        } else {
+            None
+        };
+        let audio = f
+            .cells
+            .isolated_producer(crate::media::LocalMediaPlane::Primary);
+        // A valid receiver ad exists, but the fixture has no complete relay
+        // path. Each completed real opener fails with NoRelays immediately.
+        for _ in 0..16 {
+            f.cells
+                .ensure_outbound_opening(receiver, RouteClass::Bulk)
+                .await;
+            if let Some(other) = other_receiver {
+                f.cells
+                    .ensure_outbound_opening(other, RouteClass::Bulk)
+                    .await;
+            }
+            if mode == "producer" {
+                audio
+                    .ensure_outbound_opening(receiver, RouteClass::Bulk)
+                    .await;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if mode == "retry" {
+            // No sleeping background worker retries on its own. A later
+            // carrier request can try again once the failure cooldown expires.
+            tokio::time::sleep(CIRCUIT_OPEN_FAILURE_RETRY + Duration::from_millis(50)).await;
+            f.cells
+                .ensure_outbound_opening(receiver, RouteClass::Bulk)
+                .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if mode == "usable" {
+            // A healthy route published during the cooldown remains usable;
+            // retry admission must never gate the actual carrier send.
+            // Use a different relay: the failed one above is legitimately
+            // in its existing route-send cooldown.
+            let (healthy, _, mut healthy_outbox) = add_circuit(&f.cells.services);
+            let primary = route(&healthy, f.cells.me);
+            f.cells
+                .outbound_circuits
+                .lock()
+                .await
+                .insert(receiver, vec![entry(&primary, &[])]);
+            while healthy_outbox.try_recv().is_ok() {}
+            f.cells
+                .send(
+                    Addr {
+                        node: receiver,
+                        app: [0xbc; 32],
+                    },
+                    frames(71)[0].clone(),
+                )
+                .await
+                .unwrap();
+            assert!(healthy_outbox.try_recv().is_ok());
+        }
+        f.runtime.stop().await.unwrap();
+        assert_eq!(crate::veil_debug_flush_console_logs(2000), 0);
+        return;
+    }
+    for (mode, expected) in [
+        ("burst", 1),
+        ("retry", 2),
+        ("peer", 2),
+        ("producer", 2),
+        ("usable", 1),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "anon_stream::local_enqueue_tests::fast_no_relays_failure_does_not_restart_on_every_carrier_retry",
+            "--nocapture",
+        ])
+        .env(CHILD, mode)
+        .output()
+        .unwrap();
+        assert!(output.status.success(), "child case failed: {mode}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let failures = stderr
+            .lines()
+            .filter(|line| {
+                line.contains("outbound circuit open failed for ") && line.contains("NoRelays")
+            })
+            .count();
+        assert_eq!(failures, expected, "retry admission failed: {mode}");
+    }
+}
+
 #[tokio::test]
 async fn file_outbound_candidates_do_not_replace_the_advertised_receive_registration() {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
