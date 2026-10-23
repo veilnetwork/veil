@@ -71,7 +71,7 @@ pub mod write_error_tracker;
 // transcript hash; wiring the FSM into it as a second barrier is a documented
 // deferral (see `handshake.rs`). Kept public so downstream test/sim code can
 // reuse the model.
-pub use frame_outbox::{FrameOutbox, FrameSender};
+pub use frame_outbox::{BuildSendError, FrameOutbox, FrameSender};
 pub use fsm::{SessionFsm, SessionHandshakeData, SessionPhase};
 pub use manager::{RemoteRole, SessionEntry, SessionId, SessionRegistry};
 pub use outbox::SessionOutbox;
