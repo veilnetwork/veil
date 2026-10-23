@@ -879,6 +879,7 @@ struct CircuitCells {
 pub(crate) mod media_routes;
 pub(crate) use media_routes::{CONTROL_MAGIC as MEDIA_ROUTE_CONTROL_MAGIC, MediaRoutes};
 
+#[derive(Clone)]
 struct CircuitEntry {
     circuit: Arc<veil_node_runtime::DataCircuit>,
     rendezvous_node: [u8; 32],
@@ -3450,7 +3451,12 @@ impl CircuitCells {
                 path_group,
             )
             .await;
-            outbound_opening.lock().await.remove(&dst_node);
+            // A slow old opener must not erase a newer task's debounce slot.
+            let mut opening = outbound_opening.lock().await;
+            if opening.get(&dst_node) == Some(&now) {
+                opening.remove(&dst_node);
+            }
+            drop(opening);
             if let Err(e) = opened {
                 diag_node(
                     &me,
@@ -3468,69 +3474,16 @@ impl CircuitCells {
         dst_node: [u8; 32],
         route_class: RouteClass,
     ) -> io::Result<Option<CircuitRoute>> {
-        let now = Instant::now();
-        let should_open = {
-            let mut opening = self.outbound_opening.lock().await;
-            if let Some(started) = opening.get(&dst_node) {
-                now.duration_since(*started) >= CIRCUIT_CONFIRM_TIMEOUT * 2
-            } else {
-                true
-            }
-            .then(|| opening.insert(dst_node, now))
-            .is_some()
-        };
-
-        if should_open {
-            let opened = open_outbound_circuit(
-                self.services.clone(),
-                dst_node,
-                self.me,
-                Arc::clone(&self.reg_kp),
-                Arc::clone(&self.epoch),
-                self.in_tx.clone(),
-                Arc::clone(&self.activity),
-                Arc::clone(&self.inbound_activity),
-                Arc::clone(&self.outbound_circuits),
-                Arc::clone(&self.peer_tags),
-                Arc::clone(&self.outbound_peer_tags),
-                Arc::clone(&self.peer_aliases),
-                Arc::clone(&self.route_cooldowns),
-                Arc::clone(&self.first_hop_cooldowns),
-                self.outbound_pool_target_for(route_class),
-                self.private_outbound_registration,
-                self.path_group.clone(),
-            )
-            .await;
-            self.outbound_opening.lock().await.remove(&dst_node);
-            if let Err(e) = opened {
-                diag_node(
-                    &self.me,
-                    &format!(
-                        "outbound circuit handshake-open failed for {}: {e}",
-                        short_node(&dst_node)
-                    ),
-                );
-            }
-        } else {
-            let deadline = Instant::now() + CIRCUIT_CONFIRM_TIMEOUT;
-            while Instant::now() < deadline {
-                if let Some(entries) = self.outbound_circuits.lock().await.get(&dst_node)
-                    && let Some(entry) = entries.first()
-                {
-                    return Ok(Some(entry.route()));
-                }
-                if !self.outbound_opening.lock().await.contains_key(&dst_node) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        }
-
-        let circuits = self.outbound_circuits.lock().await;
-        Ok(circuits
-            .get(&dst_node)
-            .and_then(|entries| entries.first())
-            .map(CircuitEntry::route))
+        // Pool construction belongs to its debounced background task. Waiting
+        // here parks the stream driver, including receive/reset handling, for
+        // whole relay-confirmation windows. The caller retains its SYN and
+        // retries local WouldBlock while the first confirmed route warms.
+        self.ensure_outbound_opening(dst_node, route_class).await;
+        Ok(self.outbound_circuits.try_lock().ok().and_then(|pool| {
+            pool.get(&dst_node)
+                .and_then(|entries| entries.first())
+                .map(CircuitEntry::route)
+        }))
     }
 }
 
@@ -4829,6 +4782,7 @@ async fn open_outbound_circuit(
     let mut last_err = "no receiver rendezvous ad opened".to_string();
     let mut opened_entries = Vec::new();
     let peer_tag = outbound_peer_tag(&outbound_peer_tags, dst_node);
+    let mut kept_in_flight = 0;
     for ad in ranked_ads {
         if opened_entries.len() >= pool_target {
             break;
@@ -4952,6 +4906,10 @@ async fn open_outbound_circuit(
             handshake_streams: HashSet::new(),
             stats: Arc::new(CircuitRouteStats::new(now)),
         });
+        // Make a confirmed prefix usable before waiting on slower candidates.
+        kept_in_flight =
+            publish_outbound_candidates(&services, dst_node, &outbound_circuits, &opened_entries)
+                .await;
         mark_circuit_activity(&activity);
         diag_node(
             &me,
@@ -4967,6 +4925,23 @@ async fn open_outbound_circuit(
     if opened_entries.is_empty() {
         return Err(format!("open to receiver ad: {last_err}"));
     }
+    let opened_count = opened_entries.len();
+    diag_node(
+        &me,
+        &format!(
+            "outbound circuit pool ready for {} routes={opened_count}/{pool_target} (kept {kept_in_flight} in-flight)",
+            short_node(&dst_node),
+        ),
+    );
+    Ok(())
+}
+
+async fn publish_outbound_candidates(
+    services: &veil_node_runtime::NodeServices,
+    dst_node: [u8; 32],
+    outbound_circuits: &Arc<tokio::sync::Mutex<OutboundCircuitPool>>,
+    opened_entries: &[CircuitEntry],
+) -> usize {
     let opened_count = opened_entries.len();
     // MAKE-BEFORE-BREAK refill (device-verified churn root, 2026-07-07): this
     // refill used to full-REPLACE the pool, retiring every prior circuit. Fired
@@ -4987,9 +4962,22 @@ async fn open_outbound_circuit(
         .collect();
     let merge_now = Instant::now();
     let mut pool = outbound_circuits.lock().await;
-    let prior = pool.remove(&dst_node).unwrap_or_default();
+    let mut prior = pool.remove(&dst_node).unwrap_or_default();
     let mut retired: Vec<Arc<veil_node_runtime::DataCircuit>> = Vec::new();
-    let mut merged = opened_entries;
+    let mut merged = Vec::with_capacity(MAX_CIRCUIT_OUTBOUND_POOL);
+    for candidate in opened_entries {
+        // A published prefix may already carry a live handshake/data stream.
+        // Preserve its current metadata rather than restoring the opener's
+        // earlier snapshot when a later candidate becomes ready.
+        if let Some(index) = prior
+            .iter()
+            .position(|entry| Arc::ptr_eq(&entry.circuit, &candidate.circuit))
+        {
+            merged.push(prior.remove(index));
+        } else {
+            merged.push(candidate.clone());
+        }
+    }
     for entry in prior {
         let busy = entry.stats.active_streams() > 0;
         let fresh = merge_now.duration_since(entry.opened_at) < CIRCUIT_CONFIRM_TIMEOUT;
@@ -5003,15 +4991,8 @@ async fn open_outbound_circuit(
     let kept_in_flight = merged.len().saturating_sub(opened_count);
     pool.insert(dst_node, merged);
     drop(pool);
-    retire_circuits_later(&services, retired);
-    diag_node(
-        &me,
-        &format!(
-            "outbound circuit pool ready for {} routes={opened_count}/{pool_target} (kept {kept_in_flight} in-flight)",
-            short_node(&dst_node),
-        ),
-    );
-    Ok(())
+    retire_circuits_later(services, retired);
+    kept_in_flight
 }
 
 /// Confirm a circuit that carries a cookie registration. While waiting for the
