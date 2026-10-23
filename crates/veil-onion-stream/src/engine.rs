@@ -1103,6 +1103,16 @@ impl StreamEngine {
     /// Fill `out` with the next cell to send; `false` if nothing is pending.
     /// The driver loops this until it returns `false`.
     pub fn poll_transmit(&mut self, now: u64, out: &mut Vec<u8>) -> bool {
+        self.poll_transmit_inner(now, out, true)
+    }
+
+    /// Local backlog may hold fresh DATA for seconds. Poll only control and
+    /// paced repairs without reserving more new DATA/FIN behind that backlog.
+    pub(crate) fn poll_repair_transmit(&mut self, now: u64, out: &mut Vec<u8>) -> bool {
+        self.poll_transmit_inner(now, out, false)
+    }
+
+    fn poll_transmit_inner(&mut self, now: u64, out: &mut Vec<u8>, allow_new: bool) -> bool {
         // 1. RST is terminal + highest priority.
         if let Some(reason) = self.rst_to_send.take() {
             encode(
@@ -1148,6 +1158,11 @@ impl StreamEngine {
                 },
                 out,
             );
+            return true;
+        }
+        // While a local DATA tail is blocked, keep reverse-direction ACKs
+        // ahead of repairs too. Normal emission ordering is unchanged.
+        if !allow_new && self.poll_ack(out) {
             return true;
         }
         if self.phase == Phase::Established {
@@ -1210,19 +1225,17 @@ impl StreamEngine {
                 return true;
             }
             // 3b. New data / FIN, congestion + flow limited + paced.
-            if (self.force_probe || self.tx.pace_budget > 0) && self.create_next_segment(now) {
+            if allow_new
+                && (self.force_probe || self.tx.pace_budget > 0)
+                && self.create_next_segment(now)
+            {
                 self.tx.pace_budget = self.tx.pace_budget.saturating_sub(1);
                 self.encode_seg_at(self.tx.segs.len() - 1, out);
                 return true;
             }
         }
         // 4. Standalone ACK.
-        if self.ack_pending && self.phase != Phase::Closed {
-            self.ack_pending = false;
-            self.ack_eliciting = 0;
-            self.ack_deadline = None;
-            let f = self.make_ack();
-            encode(f, out);
+        if self.poll_ack(out) {
             return true;
         }
         // Nothing to send: if we're blocked on a zero peer-window with data
@@ -1235,6 +1248,18 @@ impl StreamEngine {
             self.persist_deadline = None;
         }
         false
+    }
+
+    fn poll_ack(&mut self, out: &mut Vec<u8>) -> bool {
+        if !self.ack_pending || self.phase == Phase::Closed {
+            return false;
+        }
+        self.ack_pending = false;
+        self.ack_eliciting = 0;
+        self.ack_deadline = None;
+        let frame = self.make_ack();
+        encode(frame, out);
+        true
     }
 
     /// We have data (or a FIN) to send, nothing is in flight to elicit an ACK,
