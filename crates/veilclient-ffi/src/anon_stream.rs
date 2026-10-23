@@ -1960,6 +1960,41 @@ impl CircuitCells {
                 self.mark_outbound_non_handshake(dst.node, &route).await;
             }
             if let Some(err) = err {
+                if err == veil_node_runtime::DataCircuitSendError::QueueFull {
+                    // A locally rejected tail has no network handoff yet. It
+                    // can use another already-open path to the exact receiver,
+                    // even below the normal striping quantum. Try the bounded
+                    // pool rather than preselecting one possibly full outbox.
+                    let mut remaining = run_len - sent;
+                    for alternate in self
+                        .stripe_alternates(dst.node, &route, MAX_CIRCUIT_OUTBOUND_POOL)
+                        .await
+                    {
+                        let (accepted, rejected) =
+                            self.send_chunk_on_route(dst.node, &alternate, remaining, cells)?;
+                        if accepted > 0 {
+                            mark_circuit_activity(&self.activity);
+                            self.mark_outbound_non_handshake(dst.node, &alternate).await;
+                            remaining -= accepted;
+                        }
+                        if remaining == 0 {
+                            return Ok(());
+                        }
+                        match rejected {
+                            Some(veil_node_runtime::DataCircuitSendError::QueueFull) => (),
+                            Some(error @ veil_node_runtime::DataCircuitSendError::NoRelays) => {
+                                let _ =
+                                    self.stream_enqueue_error(dst.node, &alternate, error).await;
+                            }
+                            Some(error) => {
+                                return Err(self
+                                    .stream_enqueue_error(dst.node, &alternate, error)
+                                    .await);
+                            }
+                            None => (),
+                        }
+                    }
+                }
                 return Err(self.stream_enqueue_error(dst.node, &route, err).await);
             }
             self.maybe_shed_slow_bulk_route(dst.node, stream_id, &route)
@@ -2013,7 +2048,10 @@ impl CircuitCells {
             }
             match self.send_one_cell_on_route(&routes[ri].peer_cookie, routes[ri], cell) {
                 Ok(()) => per_route_sent[ri] = true,
-                Err(error @ veil_node_runtime::DataCircuitSendError::NoRelays) => {
+                Err(
+                    error @ (veil_node_runtime::DataCircuitSendError::NoRelays
+                    | veil_node_runtime::DataCircuitSendError::QueueFull),
+                ) => {
                     per_route_ok[ri] = false;
                     failed_routes.push((ri, error));
                     retained.push_back(cell.clone());
@@ -2233,6 +2271,9 @@ impl CircuitCells {
             for entry in entries {
                 if out.len() >= max_extra {
                     break;
+                }
+                if !entry.serves_receiver(primary) {
+                    continue;
                 }
                 let first_hop = entry.circuit.first_hop();
                 if used_first_hops.contains(&first_hop) {
