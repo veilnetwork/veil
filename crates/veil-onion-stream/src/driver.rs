@@ -452,6 +452,9 @@ const SEND_WOULD_BLOCK_RETRY_MS: u64 = 1;
 /// already bounds one poll pass (<= max_pacing_batch); this is a backstop so
 /// a stuck carrier cannot accumulate unbounded committed cells locally.
 const MAX_OUTBOUND_BURST: usize = 512;
+/// Leave room inside the existing local bound for newly due ACKs/repairs.
+/// These use the same carrier and admission budget as their ordinary peers.
+const REPAIR_RESERVE: usize = 8;
 /// Upper bound on inbound cells drained per loop turn. The relay splice can
 /// legitimately deliver hundreds of cells in one scheduler burst; processing
 /// them in one turn (one ACK/transmit pass) instead of one full loop turn per
@@ -503,7 +506,8 @@ async fn drive<D: CellDuplex>(
     // Inbound burst buffer for `recv_cells` — reused across loop turns.
     let mut rx_cells: Vec<Vec<u8>> = Vec::new();
     // Bounded local reservations awaiting carrier acceptance. Unaccepted cells
-    // keep their relative emission order, including partial striped sends.
+    // keep their relative order, including partial striped sends. Newly due
+    // control/repair can precede a retained fresh-DATA tail.
     let mut outbound: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
     let mut send_retry_at: Option<u64> = None;
     let mut close_handoff_deadline: Option<u64> = None;
@@ -606,15 +610,28 @@ async fn drive<D: CellDuplex>(
         // The engine has reserved every polled DATA/FIN in its send window,
         // but network timing starts only when the carrier accepts that cell.
         // SYN/SYN_ACK timers use the same acceptance boundary.
-        // Whatever the carrier does not accept stays queued in `outbound`
-        // and is retried before polling more engine output. A striped carrier
-        // can accept a non-prefix subset, so correlate the retained cells.
+        // Whatever the carrier does not accept stays queued in `outbound`.
+        // Do not reserve more fresh DATA until that tail drains, but allow due
+        // repairs/ACKs to precede it: otherwise a lost first response byte waits
+        // for an entire locally blocked window before its repair is even polled.
+        // A striped carrier can accept a non-prefix subset, so correlate cells.
         loop {
             let now = now_ms(&base);
             if outbound.is_empty() && !engine.is_closed() {
-                while outbound.len() < MAX_OUTBOUND_BURST && engine.poll_transmit(now, &mut cell) {
+                while outbound.len() < MAX_OUTBOUND_BURST - REPAIR_RESERVE
+                    && engine.poll_transmit(now, &mut cell)
+                {
                     outbound.push_back(cell.clone());
                 }
+            } else if !engine.is_closed() {
+                let retained = outbound.len();
+                while outbound.len() < MAX_OUTBOUND_BURST
+                    && engine.poll_repair_transmit(now, &mut cell)
+                {
+                    outbound.push_back(cell.clone());
+                }
+                let urgent = outbound.len() - retained;
+                outbound.rotate_right(urgent);
             }
             if outbound.is_empty() {
                 break;
