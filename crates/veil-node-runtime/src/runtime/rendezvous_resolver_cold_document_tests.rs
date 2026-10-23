@@ -7,6 +7,136 @@ use veil_anonymity::rendezvous::{
 };
 use veil_proto::{identity_document::IdentityDocument, routing::RecursiveQueryPayload};
 
+#[tokio::test]
+async fn mailbox_only_stream_cache_rechecks_once_for_concurrent_waiters() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use veil_anonymity::rendezvous::{MAX_RENDEZVOUS_AD_SLOTS, rendezvous_ad_dht_key_at};
+    let me = [0x11; 32];
+    let key = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
+    let public = base64::engine::general_purpose::STANDARD
+        .decode(&key.public_key)
+        .unwrap();
+    let receiver = *blake3::hash(&public).as_bytes();
+    let mailbox = crate::NodeServices::mailbox_rendezvous_cookie(&receiver);
+    let identity_mailbox = [0x42; 16];
+    let stream_cookie = [0x53; 16];
+    let now = veil_util::unix_secs_now_u64();
+    let make_ad = |cookie, relay| {
+        sign_rendezvous_ad_v5(
+            receiver,
+            [relay; 32],
+            cookie,
+            [0x33; 32],
+            now,
+            now + 3600,
+            &[],
+            &[],
+            &[],
+            0,
+            &[],
+            &key.public_key,
+            &key.private_key,
+            veil_types::SignatureAlgorithm::Ed25519,
+        )
+        .unwrap()
+    };
+    let values = Arc::new(Mutex::new(std::collections::HashMap::from([
+        (
+            rendezvous_ad_dht_key_at(&receiver, 0),
+            make_ad(mailbox, 0x71),
+        ),
+        (
+            rendezvous_ad_dht_key_at(&receiver, 1),
+            make_ad(identity_mailbox, 0x72),
+        ),
+    ])));
+    let dht = Arc::new(veil_dht::KademliaService::new(me));
+    let mut reg = veil_session::SessionTxRegistry::new();
+    let mut rx = reg.register([0xAA; 32]);
+    let registry = Arc::new(RwLock::new(reg));
+    let pending = Arc::new(Mutex::new(std::collections::HashMap::<
+        [u8; 16],
+        veil_dispatcher::PendingRecursive,
+    >::new()));
+    let queries = Arc::new(AtomicUsize::new(0));
+    let replies = tokio::spawn({
+        let pending = pending.clone();
+        let queries = queries.clone();
+        let values = values.clone();
+        async move {
+            while let Some((_, frame)) = rx.recv().await {
+                let query =
+                    RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+                queries.fetch_add(1, Ordering::Relaxed);
+                let bytes = lock!(values)
+                    .get(&query.target_key)
+                    .cloned()
+                    .unwrap_or_default();
+                let waiter = lock!(pending).remove(&query.query_id).unwrap();
+                let _ = waiter.tx.send(bytes);
+            }
+        }
+    });
+    let cache = Arc::new(super::super::anonymity_state::RendezvousResolveCache::new());
+    let logger = Arc::new(veil_observability::NodeLogger::new_noop());
+    let mode = ResolveMode::Stream {
+        mailbox_cookie: mailbox,
+        identity_mailbox_cookie: Some(identity_mailbox),
+    };
+    let lookup = || {
+        resolve_fresh_rendezvous_ads(
+            &dht,
+            &registry,
+            &pending,
+            me,
+            &cache,
+            &logger,
+            receiver,
+            std::time::Duration::from_secs(1),
+            mode,
+        )
+    };
+    let initial = lookup().await;
+    assert_eq!(initial.len(), 2);
+    let first_queries = queries.load(Ordering::Relaxed);
+    assert_eq!(first_queries, MAX_RENDEZVOUS_AD_SLOTS as usize);
+    lock!(values).insert(
+        rendezvous_ad_dht_key_at(&receiver, 2),
+        make_ad(stream_cookie, 0x73),
+    );
+    for _ in 0..8 {
+        assert_eq!(lookup().await.len(), 2);
+    }
+    assert_eq!(
+        queries.load(Ordering::Relaxed),
+        first_queries,
+        "a recently resolved miss caused one network walk per caller"
+    );
+    assert_eq!(
+        cache.get(&receiver, now).unwrap().len(),
+        2,
+        "the ordinary mailbox cache must remain usable"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let results = futures::future::join_all((0..8).map(|_| lookup())).await;
+    let total_queries = queries.load(Ordering::Relaxed);
+    replies.abort();
+    assert!(replies.await.unwrap_err().is_cancelled());
+    assert!(lock!(pending).is_empty());
+    assert!(
+        results
+            .iter()
+            .all(|ads| ads.iter().any(|ad| ad.auth_cookie == stream_cookie)),
+        "a mailbox cookie, including the identity's cookie at a device address, hid the stream ad"
+    );
+    assert_eq!(
+        total_queries,
+        first_queries * 2,
+        "concurrent waiters must share one refreshing slot walk"
+    );
+    assert_eq!(cache.get(&receiver, now).unwrap().len(), 3);
+}
+
 struct IdentityFixture {
     dir: std::path::PathBuf,
     document: IdentityDocument,
@@ -129,7 +259,7 @@ async fn lookup(
         &Arc::new(veil_observability::NodeLogger::new_noop()),
         receiver,
         std::time::Duration::from_secs(1),
-        false,
+        ResolveMode::Any,
     )
     .await;
     replies.abort();

@@ -155,6 +155,20 @@ impl RendezvousResolveCache {
     /// Return a recently network-validated route set, filtering out ads whose
     /// signed validity ended while the cache entry was resident.
     pub fn get(&self, receiver: &[u8; 32], now_unix: u64) -> Option<Vec<RendezvousAd>> {
+        self.get_satisfying(receiver, now_unix, |_| true, self.ttl)
+    }
+
+    /// A recent lookup may contain valid ads but none usable by this caller
+    /// (e.g. mailbox registrations before a stream receive circuit is ready).
+    /// Reuse that miss only for `missing_ttl`, without removing the valid ads
+    /// needed by other callers or shortening the TTL of a usable route set.
+    pub(super) fn get_satisfying(
+        &self,
+        receiver: &[u8; 32],
+        now_unix: u64,
+        usable: impl Fn(&RendezvousAd) -> bool,
+        missing_ttl: std::time::Duration,
+    ) -> Option<Vec<RendezvousAd>> {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let entry = inner.get(receiver)?;
         if entry.checked_at.elapsed() >= self.ttl {
@@ -172,6 +186,8 @@ impl RendezvousResolveCache {
             .collect();
         if ads.is_empty() {
             inner.remove(receiver);
+            None
+        } else if !ads.iter().any(usable) && entry.checked_at.elapsed() >= missing_ttl {
             None
         } else {
             Some(ads)
@@ -898,6 +914,78 @@ mod tests {
             immediately_stale.get(&receiver, 100).is_none(),
             "route-cache TTL, not the ad validity window, controls re-resolution"
         );
+    }
+
+    #[test]
+    fn an_unusable_route_set_has_a_shorter_ttl_without_purging_other_uses() {
+        let receiver = [7; 32];
+        let cache = RendezvousResolveCache::with_params(std::time::Duration::from_secs(60), 4);
+        let miss_ttl = std::time::Duration::from_secs(1);
+        let ready = |ad: &RendezvousAd| ad.auth_cookie == [3; 16];
+        cache.put(receiver, vec![ad(7, 1, 90, 200)]);
+        assert!(
+            cache
+                .get_satisfying(&receiver, 100, ready, miss_ttl)
+                .is_some(),
+            "recent misses must coalesce retries instead of repeatedly walking the DHT"
+        );
+        cache
+            .inner
+            .lock()
+            .unwrap()
+            .get_mut(&receiver)
+            .unwrap()
+            .checked_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        assert!(
+            cache
+                .get_satisfying(&receiver, 100, ready, miss_ttl)
+                .is_none()
+        );
+        assert!(
+            cache.get(&receiver, 100).is_some(),
+            "stream miss must not remove valid mailbox routes"
+        );
+        assert!(cache.last_known_valid(&receiver, 100).is_some());
+
+        cache.put(receiver, vec![ad(7, 1, 90, 200), ad(7, 3, 90, 200)]);
+        cache
+            .inner
+            .lock()
+            .unwrap()
+            .get_mut(&receiver)
+            .unwrap()
+            .checked_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        assert_eq!(
+            cache
+                .get_satisfying(&receiver, 100, ready, miss_ttl)
+                .unwrap()
+                .len(),
+            2,
+            "a usable stream route retains the ordinary cache TTL"
+        );
+
+        cache.put(receiver, vec![ad(7, 1, 90, 200), ad(7, 3, 10, 99)]);
+        cache
+            .inner
+            .lock()
+            .unwrap()
+            .get_mut(&receiver)
+            .unwrap()
+            .checked_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        assert!(
+            cache
+                .get_satisfying(&receiver, 100, ready, miss_ttl)
+                .is_none(),
+            "an expired stream ad cannot make the remaining mailbox cache stream-ready"
+        );
+        assert_eq!(cache.get(&receiver, 100).unwrap().len(), 1);
+        cache.remove(&receiver);
+        assert!(
+            cache
+                .get_satisfying(&receiver, 100, ready, miss_ttl)
+                .is_none()
+        );
+        assert!(cache.last_known_valid(&receiver, 100).is_none());
     }
 
     #[test]
