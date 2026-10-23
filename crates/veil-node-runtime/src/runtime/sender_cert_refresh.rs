@@ -43,6 +43,46 @@ impl Budget {
     }
 }
 
+/// A warm ratchet may outlive a partition and keep authenticating a removed
+/// device without ever taking the certificate-miss path. Recheck a known
+/// sender's signed document in the background while it is active. Local
+/// changes are still applied synchronously before opening each packet.
+pub(super) fn revalidator(
+    resolver: Arc<crate::mlkem_resolver::DhtMlKemEkResolver>,
+    runtime: tokio::runtime::Handle,
+) -> veil_dispatcher::PeerCertInvalidateFn {
+    let budget = Arc::new(Mutex::new(Budget::default()));
+    let slots = Arc::new(tokio::sync::Semaphore::new(4));
+    Arc::new(move |peer| {
+        resolver.refresh_local_document(*peer);
+        if !resolver.has_verified_sender(peer) {
+            return;
+        }
+        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+            return;
+        };
+        if !budget
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .admit((*peer, [0; 16]), Instant::now())
+        {
+            return;
+        }
+        let resolver = Arc::clone(&resolver);
+        let peer = *peer;
+        runtime.spawn(async move {
+            let _slot = slot;
+            // This compares reachable holders even when our local DHT value
+            // is valid. Merely re-reading that old value recreates the gap.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                resolver.fetch_verified_document(peer, None),
+            )
+            .await;
+        });
+    })
+}
+
 pub(super) fn warmer(
     resolver: Arc<dyn veil_types::MlKemEkResolver>,
     runtime: tokio::runtime::Handle,
