@@ -23,7 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -550,6 +550,9 @@ const MAX_CIRCUIT_BULK_ROUTE_ACTIVE_LIMIT: usize = 64;
 // local handoff retries must not rebuild that same unavailable path every
 // few milliseconds. Keep the first attempt immediate and retry on demand.
 const CIRCUIT_OPEN_FAILURE_RETRY: Duration = Duration::from_secs(1);
+// Repeated DATA can ask for an alternative even when the peer advertises no
+// new rendezvous. Bound that discovery work without delaying actual repairs.
+const CIRCUIT_POOL_EXPAND_INTERVAL: Duration = Duration::from_secs(1);
 const STREAM_RENDEZVOUS_AD_FRESH_GRACE_SECS: u64 = 30;
 const CIRCUIT_ROUTE_SEND_COOLDOWN: Duration = Duration::from_secs(60);
 // `StreamEngine::consec_rto` resets on any cumulative ACK progress. A black-holed
@@ -847,6 +850,8 @@ struct CircuitCells {
     /// running-opener guard, these also bound a fast NoRelays/error loop.
     /// Expired entries are pruned on admission and completion.
     outbound_retry_after: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
+    /// Discovery-only cadence. Warm/repair admission does not consult it.
+    outbound_expand_after: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
     /// Shared DATA-cell pacer per destination node. Multiple onion streams to the
     /// same peer share one pinned rendezvous/circuit bottleneck; if every stream
     /// independently paces at the path ceiling, their aggregate burst still
@@ -887,24 +892,37 @@ struct CircuitCells {
 pub(crate) mod media_routes;
 pub(crate) use media_routes::{CONTROL_MAGIC as MEDIA_ROUTE_CONTROL_MAGIC, MediaRoutes};
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
 enum PoolOpenIntent {
+    Expand,
     Warm,
     Refresh,
 }
 
+impl PoolOpenIntent {
+    fn load(value: &AtomicU8) -> Self {
+        match value.load(Ordering::Acquire) {
+            0 => Self::Expand,
+            1 => Self::Warm,
+            2 => Self::Refresh,
+            _ => unreachable!("invalid local pool intent"),
+        }
+    }
+}
+
 struct OutboundOpening {
     started: Instant,
-    /// A repair can join a warm task after it has decided to reuse a path.
-    /// Keep that request until a fresh construction pass has completed.
-    refresh_required: Arc<AtomicBool>,
+    /// Coalesced requests can strengthen discovery to warming or repair.
+    /// Admission and completion retain that demand under the running-slot lock.
+    required_intent: Arc<AtomicU8>,
 }
 
 impl OutboundOpening {
     fn new(started: Instant, intent: PoolOpenIntent) -> Self {
         Self {
             started,
-            refresh_required: Arc::new(AtomicBool::new(matches!(intent, PoolOpenIntent::Refresh))),
+            required_intent: Arc::new(AtomicU8::new(intent as u8)),
         }
     }
 }
@@ -1662,6 +1680,7 @@ impl CircuitCells {
             next_outbound_route: Arc::new(Mutex::new(HashMap::new())),
             outbound_opening: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             outbound_retry_after: Arc::new(Mutex::new(HashMap::new())),
+            outbound_expand_after: Arc::new(Mutex::new(HashMap::new())),
             bulk_shed_marks: Arc::new(Mutex::new(HashMap::new())),
             // Media does not use stream pacing or ACK striping. Keep its route
             // health and repair local, too: a video route's failure must not
@@ -3276,8 +3295,7 @@ impl CircuitCells {
         let Some(target) = target else {
             // No usable alternative right now: keep the streak and kick a
             // refill so the shed fires as soon as the pool widens.
-            self.ensure_outbound_opening(dst_node, RouteClass::Bulk)
-                .await;
+            self.ensure_outbound_expansion(dst_node).await;
             return;
         };
         let swapped = {
@@ -3328,8 +3346,7 @@ impl CircuitCells {
                 stats.snapshot(),
             ),
         );
-        self.ensure_outbound_opening(dst_node, RouteClass::Bulk)
-            .await;
+        self.ensure_outbound_expansion(dst_node).await;
     }
 
     async fn mark_route_send_failed(
@@ -3425,6 +3442,11 @@ impl CircuitCells {
             .await;
     }
 
+    async fn ensure_outbound_expansion(&self, dst_node: [u8; 32]) {
+        self.schedule_outbound_opening(dst_node, RouteClass::Bulk, PoolOpenIntent::Expand)
+            .await;
+    }
+
     async fn ensure_outbound_opening(&self, dst_node: [u8; 32], route_class: RouteClass) {
         self.schedule_outbound_opening(dst_node, route_class, PoolOpenIntent::Refresh)
             .await;
@@ -3437,16 +3459,16 @@ impl CircuitCells {
         intent: PoolOpenIntent,
     ) {
         let now = Instant::now();
-        let refresh_required = {
+        let required_intent = {
             let mut opening = self.outbound_opening.lock().await;
             if let Some(running) = opening.get(&dst_node) {
                 // Circuit open/confirmation can legitimately take a few seconds
                 // on a cold phone. Do not start a stampede of duplicate opens;
                 // if a task gets wedged, allow a later retransmit to kick a new one.
                 if now.duration_since(running.started) < CIRCUIT_CONFIRM_TIMEOUT * 2 {
-                    if matches!(intent, PoolOpenIntent::Refresh) {
-                        running.refresh_required.store(true, Ordering::Release);
-                    }
+                    running
+                        .required_intent
+                        .fetch_max(intent as u8, Ordering::AcqRel);
                     return;
                 }
             }
@@ -3460,10 +3482,21 @@ impl CircuitCells {
                     return;
                 }
             }
+            if intent == PoolOpenIntent::Expand {
+                let mut expand_after = self
+                    .outbound_expand_after
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                expand_after.retain(|_, until| *until > now);
+                if expand_after.contains_key(&dst_node) {
+                    return;
+                }
+                expand_after.insert(dst_node, now + CIRCUIT_POOL_EXPAND_INTERVAL);
+            }
             let running = OutboundOpening::new(now, intent);
-            let refresh_required = Arc::clone(&running.refresh_required);
+            let required_intent = Arc::clone(&running.required_intent);
             opening.insert(dst_node, running);
-            refresh_required
+            required_intent
         };
 
         let services = self.services.clone();
@@ -3474,6 +3507,7 @@ impl CircuitCells {
         let activity = Arc::clone(&self.activity);
         let inbound_activity = Arc::clone(&self.inbound_activity);
         let outbound_circuits = Arc::clone(&self.outbound_circuits);
+        let stream_routes = Arc::clone(&self.stream_routes);
         let outbound_opening = Arc::clone(&self.outbound_opening);
         let outbound_retry_after = Arc::clone(&self.outbound_retry_after);
         let peer_tags = Arc::clone(&self.peer_tags);
@@ -3486,7 +3520,27 @@ impl CircuitCells {
         let path_group = self.path_group.clone();
         tokio::spawn(async move {
             loop {
-                let refresh = refresh_required.load(Ordering::Acquire);
+                let intent = PoolOpenIntent::load(&required_intent);
+                let represented_rendezvous = if intent == PoolOpenIntent::Expand {
+                    // The slow stream's pinned circuit can outlive its pool
+                    // entry. Include both indices, using the normal lock order.
+                    let pool = outbound_circuits.lock().await;
+                    let routes = stream_routes.lock().await;
+                    let mut represented: HashSet<_> = pool
+                        .get(&dst_node)
+                        .into_iter()
+                        .flatten()
+                        .map(|entry| entry.rendezvous_node)
+                        .collect();
+                    represented.extend(routes.iter().filter_map(|((peer, _, _), route)| {
+                        (*peer == dst_node)
+                            .then_some(route.rendezvous_node)
+                            .flatten()
+                    }));
+                    represented
+                } else {
+                    HashSet::new()
+                };
                 let opened = open_outbound_circuit(
                     services.clone(),
                     dst_node,
@@ -3503,7 +3557,8 @@ impl CircuitCells {
                     Arc::clone(&route_cooldowns),
                     Arc::clone(&first_hop_cooldowns),
                     pool_target,
-                    !refresh,
+                    intent,
+                    represented_rendezvous,
                     private_registration,
                     path_group.clone(),
                 )
@@ -3517,19 +3572,19 @@ impl CircuitCells {
                         ),
                     );
                 }
-                // Admission and completion share this lock. A repair that
-                // joins a warm pass cannot be lost between its last intent
-                // check and removal of the running slot. At most one extra
-                // pass is needed: the flag only changes from warm to refresh.
+                // Admission and completion share this lock. A stronger joined
+                // request cannot disappear while the running slot is cleared.
+                // Intent only increases: expand -> warm -> refresh.
                 let mut opening = outbound_opening.lock().await;
-                if opening.get(&dst_node).is_some_and(|running| {
-                    Arc::ptr_eq(&running.refresh_required, &refresh_required)
-                }) {
-                    // A warm pass that built everything afresh already served
-                    // the joined repair. Repeat only when it reused a path;
-                    // failed cold construction keeps the normal retry backoff.
-                    let reused = opened.as_ref().is_ok_and(|count| *count > 0);
-                    if !refresh && reused && refresh_required.load(Ordering::Acquire) {
+                if opening
+                    .get(&dst_node)
+                    .is_some_and(|running| Arc::ptr_eq(&running.required_intent, &required_intent))
+                {
+                    // A pass that built everything afresh already served a
+                    // stronger request. Revisit only skipped/reused routes;
+                    // failed cold construction keeps its normal retry backoff.
+                    let unrefreshed = opened.as_ref().is_ok_and(|count| *count > 0);
+                    if unrefreshed && PoolOpenIntent::load(&required_intent) > intent {
                         drop(opening);
                         continue;
                     }
@@ -4080,6 +4135,7 @@ fn try_open_circuit(
     let first_hop_cooldowns = Arc::new(Mutex::new(HashMap::new()));
     let outbound_opening = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let outbound_retry_after = Arc::new(Mutex::new(HashMap::new()));
+    let outbound_expand_after = Arc::new(Mutex::new(HashMap::new()));
     let peer_tags: SharedPeerTags = Arc::new(Mutex::new(HashMap::new()));
     let outbound_peer_tags: SharedOutboundPeerTags = Arc::new(Mutex::new(HashMap::new()));
     let peer_aliases = veil_onion_stream::PeerAliases::default();
@@ -4464,6 +4520,7 @@ fn try_open_circuit(
         bulk_shed_marks: Arc::new(Mutex::new(HashMap::new())),
         outbound_opening,
         outbound_retry_after,
+        outbound_expand_after,
         data_pacer,
         outbound_pool_target,
         ack_outbound_pool_target,
@@ -4609,7 +4666,7 @@ async fn open_inbound_circuits(
 }
 
 /// Resolve the current peer binding and prepare its pool. Returns the number
-/// of reused routes, so a joined repair knows whether fresh work is still due.
+/// of skipped/reused routes, so a stronger joined request can revisit them.
 // Circuit construction owns one coherent snapshot of the hub's shared state;
 // grouping these handles would only move, rather than reduce, the coupling.
 #[allow(clippy::too_many_arguments)]
@@ -4629,7 +4686,8 @@ async fn open_outbound_circuit(
     route_cooldowns: RouteCooldowns,
     first_hop_cooldowns: FirstHopCooldowns,
     pool_target: usize,
-    reuse_usable: bool,
+    intent: PoolOpenIntent,
+    represented_rendezvous: HashSet<[u8; 32]>,
     private_registration: bool,
     path_group: veil_node_runtime::LocalCircuitPathGroup,
 ) -> Result<usize, String> {
@@ -4841,7 +4899,7 @@ async fn open_outbound_circuit(
         })
         .cloned()
         .collect::<Vec<_>>();
-    if !uncooled_ads.is_empty() {
+    if !uncooled_ads.is_empty() || intent == PoolOpenIntent::Expand {
         ranked_ads = uncooled_ads;
     }
     if before_cooldown != ranked_ads.len() {
@@ -4854,6 +4912,19 @@ async fn open_outbound_circuit(
                 ranked_ads.len()
             ),
         );
+    }
+    let mut skipped_count = 0;
+    if intent == PoolOpenIntent::Expand {
+        // Throughput shedding needs a DIFFERENT rendezvous, not another path
+        // to an already represented one. Do not republish skipped snapshots as
+        // ready or clear their measured health; explicit repair owns refresh.
+        skipped_count = before_cooldown - ranked_ads.len();
+        let before_expand = ranked_ads.len();
+        ranked_ads.retain(|ad| !represented_rendezvous.contains(&ad.rendezvous_node_id));
+        skipped_count += before_expand - ranked_ads.len();
+        if ranked_ads.is_empty() {
+            return Ok(skipped_count);
+        }
     }
     let pool_target = desired_pool_target;
     if pool_target > 1 && ranked_ads.len() < pool_target {
@@ -4876,7 +4947,7 @@ async fn open_outbound_circuit(
         if opened_entries.len() >= pool_target {
             break;
         }
-        if reuse_usable {
+        if intent == PoolOpenIntent::Warm {
             let reusable = {
                 let pool = outbound_circuits.lock().await;
                 let now = Instant::now();
@@ -5075,16 +5146,16 @@ async fn open_outbound_circuit(
                 short_node(&dst_node),
             ),
         );
-        return Ok(reused_count);
+        return Ok(reused_count + skipped_count);
     }
     diag_node(
         &me,
         &format!(
-            "outbound circuit pool ready for {} routes={opened_count}/{pool_target} (reused {reused_count}, kept {kept_in_flight} in-flight)",
+            "outbound circuit pool ready for {} routes={opened_count}/{pool_target} (reused {reused_count}, kept {kept_in_flight} in-flight) intent={intent:?}",
             short_node(&dst_node),
         ),
     );
-    Ok(reused_count)
+    Ok(reused_count + skipped_count)
 }
 
 async fn publish_outbound_candidates(

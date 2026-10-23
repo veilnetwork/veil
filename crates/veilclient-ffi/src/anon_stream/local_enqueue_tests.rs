@@ -5,30 +5,36 @@ use veil_onion_stream::CellSender;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use veil_anonymity::rendezvous::{rendezvous_ad_dht_key_at, sign_rendezvous_ad_v5};
 async fn advertised_receiver(f: &Fixture) -> [u8; 32] {
+    advertised_receiver_at_relays(f, &[f.hop]).await
+}
+
+async fn advertised_receiver_at_relays(f: &Fixture, relays: &[[u8; 32]]) -> [u8; 32] {
     let key = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
     let receiver = *blake3::hash(&STANDARD.decode(&key.public_key).unwrap()).as_bytes();
     let now = veil_util::unix_secs_now_u64();
-    let ad = sign_rendezvous_ad_v5(
-        receiver,
-        f.hop,
-        [0x52; COOKIE_LEN],
-        [0x33; 32],
-        now,
-        now + 3600,
-        &[],
-        &[],
-        &[],
-        0,
-        &[],
-        &key.public_key,
-        &key.private_key,
-        veil_types::SignatureAlgorithm::Ed25519,
-    )
-    .unwrap();
-    f.cells
-        .services
-        .dht
-        .store_local(rendezvous_ad_dht_key_at(&receiver, 0), ad);
+    for (index, relay) in relays.iter().enumerate() {
+        let ad = sign_rendezvous_ad_v5(
+            receiver,
+            *relay,
+            [0x52; COOKIE_LEN],
+            [0x33; 32],
+            now,
+            now + 3600,
+            &[],
+            &[],
+            &[],
+            0,
+            &[],
+            &key.public_key,
+            &key.private_key,
+            veil_types::SignatureAlgorithm::Ed25519,
+        )
+        .unwrap();
+        f.cells
+            .services
+            .dht
+            .store_local(rendezvous_ad_dht_key_at(&receiver, index as u8), ad);
+    }
     let ads = f
         .cells
         .services
@@ -36,7 +42,205 @@ async fn advertised_receiver(f: &Fixture) -> [u8; 32] {
         .await
         .unwrap();
     assert!(ads.iter().any(|ad| ad.auth_cookie == [0x52; COOKIE_LEN]));
+    assert!(
+        relays
+            .iter()
+            .all(|relay| ads.iter().any(|ad| ad.rendezvous_node_id == *relay))
+    );
     receiver
+}
+
+/// A throughput shed needs a DIFFERENT rendezvous. Repeated DATA with only
+/// the already represented relay must not construct another same-R path.
+#[tokio::test]
+async fn slow_route_expansion_only_constructs_missing_rendezvous() {
+    const CHILD: &str = "VEIL_TEST_SLOW_EXPANSION_CHILD";
+    if let Ok(mode) = std::env::var(CHILD) {
+        let mut f = fixture().await;
+        let relays = if matches!(mode.as_str(), "new-relay" | "cooled-new-relay") {
+            vec![f.hop, [0x91; 32]]
+        } else {
+            vec![f.hop]
+        };
+        let receiver = advertised_receiver_at_relays(&f, &relays).await;
+        if mode == "cooled-new-relay" {
+            mark_rendezvous_cooldown(
+                &f.cells.route_cooldowns,
+                [0x91; 32],
+                Duration::from_secs(60),
+            );
+        }
+        f.circuit.confirmed_flag().store(true, Ordering::Relaxed);
+        let mut primary = protected_route(&f.circuit, f.cells.me);
+        primary.peer_cookie = [0x52; COOKIE_LEN];
+        primary.envelope = CircuitEnvelope::ProtectedIntro {
+            peer_tag: [0x32; CIRCUIT_PEER_TAG_LEN],
+            receiver_x25519_pk: [0x33; 32],
+        };
+        let stats = primary.stats.as_ref().unwrap();
+        stats.record_stream_open();
+        stats
+            .slow_windows
+            .store(CIRCUIT_ROUTE_SHED_SLOW_WINDOWS, Ordering::Relaxed);
+        stats.slow_mark_expiry_ms.store(60_000, Ordering::Relaxed);
+        let mut original = entry(&primary, &[71]);
+        original.receiver_x25519_pk = [0x33; 32];
+        if mode != "pinned-only" {
+            f.cells
+                .outbound_circuits
+                .lock()
+                .await
+                .insert(receiver, vec![original]);
+        }
+        f.cells
+            .stream_routes
+            .lock()
+            .await
+            .insert((receiver, 71, RouteClass::Bulk), primary.clone());
+        let mut alternative_outbox = None;
+        let alternative = if mode == "ready-alternative" {
+            let (alternative, _, outbox) = add_circuit(&f.cells.services);
+            alternative.confirmed_flag().store(true, Ordering::Relaxed);
+            alternative_outbox = Some(outbox);
+            let mut other = protected_route(&alternative, f.cells.me);
+            other.peer_cookie = primary.peer_cookie;
+            other.envelope = primary.envelope;
+            let mut other_entry = entry(&other, &[]);
+            other_entry.receiver_x25519_pk = [0x33; 32];
+            f.cells
+                .outbound_circuits
+                .lock()
+                .await
+                .get_mut(&receiver)
+                .unwrap()
+                .push(other_entry);
+            Some(other)
+        } else {
+            None
+        };
+        async fn finish(cells: &CircuitCells, receiver: [u8; 32]) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while cells.outbound_opening.lock().await.contains_key(&receiver) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("expansion did not finish");
+        }
+        for index in 0..16 {
+            let current = f
+                .cells
+                .stream_routes
+                .lock()
+                .await
+                .get(&(receiver, 71, RouteClass::Bulk))
+                .unwrap()
+                .clone();
+            f.cells
+                .maybe_shed_slow_bulk_route(receiver, 71, &current)
+                .await;
+            if index == 0 && matches!(mode.as_str(), "overlap-warm" | "overlap-repair") {
+                assert!(
+                    f.cells
+                        .outbound_opening
+                        .lock()
+                        .await
+                        .contains_key(&receiver)
+                );
+                if mode == "overlap-warm" {
+                    f.cells.warm_outbound(receiver).await;
+                } else {
+                    f.cells
+                        .ensure_outbound_opening(receiver, RouteClass::Bulk)
+                        .await;
+                }
+            }
+            finish(&f.cells, receiver).await;
+        }
+        if matches!(mode.as_str(), "later-same" | "cooled-new-relay") {
+            tokio::time::sleep(CIRCUIT_OPEN_FAILURE_RETRY + Duration::from_millis(50)).await;
+            f.cells
+                .maybe_shed_slow_bulk_route(receiver, 71, &primary)
+                .await;
+            finish(&f.cells, receiver).await;
+        }
+        if mode == "repair" {
+            f.cells
+                .ensure_outbound_opening(receiver, RouteClass::Bulk)
+                .await;
+            finish(&f.cells, receiver).await;
+        } else if mode == "warm" {
+            f.cells.warm_outbound(receiver).await;
+            finish(&f.cells, receiver).await;
+        }
+        let selected = f
+            .cells
+            .stream_routes
+            .lock()
+            .await
+            .get(&(receiver, 71, RouteClass::Bulk))
+            .unwrap()
+            .clone();
+        if let Some(other) = alternative {
+            assert!(Arc::ptr_eq(&selected.circuit, &other.circuit));
+            assert_eq!(stats.active_streams(), 0);
+            assert_eq!(other.stats.as_ref().unwrap().active_streams(), 1);
+            assert!(
+                f.cells
+                    .bulk_shed_marks
+                    .lock()
+                    .unwrap()
+                    .contains_key(&receiver)
+            );
+        } else {
+            assert!(Arc::ptr_eq(&selected.circuit, &primary.circuit));
+            assert_eq!(stats.active_streams(), 1);
+            assert!(
+                !f.cells
+                    .bulk_shed_marks
+                    .lock()
+                    .unwrap()
+                    .contains_key(&receiver)
+            );
+        }
+        f.runtime.stop().await.unwrap();
+        drop(alternative_outbox);
+        assert_eq!(crate::veil_debug_flush_console_logs(2000), 0);
+        return;
+    }
+    for (mode, expected_candidates) in [
+        ("same-relay", 0),
+        ("later-same", 0),
+        ("pinned-only", 0),
+        ("ready-alternative", 0),
+        ("new-relay", 1),
+        ("cooled-new-relay", 0),
+        ("repair", 1),
+        ("warm", 1),
+        ("overlap-warm", 1),
+        ("overlap-repair", 1),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "anon_stream::local_enqueue_tests::slow_route_expansion_only_constructs_missing_rendezvous", "--nocapture"])
+            .env(CHILD, mode).output().unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let candidates = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter(|line| {
+                line.contains("outbound R=")
+                    && line.contains("open failed after ")
+                    && line.contains("NoRelays")
+            })
+            .count();
+        assert_eq!(
+            candidates, expected_candidates,
+            "unnecessary construction or missing expansion: {mode}"
+        );
+    }
 }
 
 /// A warm request must not reconstruct a matching, usable path. The fixture
