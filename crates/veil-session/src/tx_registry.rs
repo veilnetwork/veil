@@ -49,7 +49,9 @@ use veil_cfg::NodeId;
 use veil_types::NodeIdBytes;
 
 use super::priority_queue::INTERACTIVE;
-use crate::frame_outbox::{FrameOutbox, FrameSender, frame_channel_with_source_activity};
+use crate::frame_outbox::{
+    BuildSendError, FrameOutbox, FrameSender, frame_channel_with_source_activity,
+};
 
 /// A priority-tagged frame: `(priority, frame_bytes)`.
 ///
@@ -748,6 +750,63 @@ impl SessionTxRegistry {
         )
     }
 
+    /// Reserve recoverable source admission before constructing a sealed
+    /// frame. The synchronous builder must not re-enter this registry. This
+    /// preserves normal activity, diagnostics and queue-rejection accounting.
+    pub fn send_recoverable_with_result<E>(
+        &self,
+        peer_id: &NodeIdBytes,
+        expected_len: usize,
+        build: impl FnOnce() -> Result<veil_bufpool::PooledShared, E>,
+    ) -> Result<(), BuildSendError<E>> {
+        let entry = self
+            .senders
+            .get(peer_id)
+            .ok_or(BuildSendError::Queue(SendToError::Missing))?;
+        let result = entry.tx.try_send_recoverable_with(expected_len, || {
+            let frame = build()?;
+            crate::frame_diag::note_outbound(peer_id, &frame, "tx_registry");
+            crate::frame_diag::note_chunk_frame("relay_enqueue", &frame);
+            Ok(frame)
+        });
+        match &result {
+            Ok(()) => {
+                if let Some(ts) = self.last_active.get(peer_id) {
+                    ts.store(now_ms(), Ordering::Relaxed);
+                }
+            }
+            Err(BuildSendError::Queue(SendToError::Full)) => self.note_queue_full(peer_id),
+            _ => {}
+        }
+        result
+    }
+
+    fn note_queue_full(&self, peer_id: &NodeIdBytes) {
+        // LIMIT: the per-session TX channel (depth = self.capacity) is
+        // full, so this frame is silently dropped — the caller only sees
+        // a `false` return, never a reason. This is a prime bulk-transfer
+        // loss source (a fast sender outruns the peer's drain). Surface
+        // it: debug per drop, throttled warn so it's visible but not a
+        // flood.
+        let n = self.drops_total.fetch_add(1, Ordering::Relaxed) + 1;
+        log::debug!(
+            "LIMIT tx_queue: session TX channel FULL — frame dropped \
+             (peer {}, cap {}, total_drops {})",
+            veil_util::hex_short(peer_id),
+            self.capacity,
+            n,
+        );
+        if n.is_power_of_two() || n.is_multiple_of(1000) {
+            log::warn!(
+                "LIMIT tx_queue: {} frames dropped on full session \
+                 channels (cap {}); latest peer {}",
+                n,
+                self.capacity,
+                veil_util::hex_short(peer_id),
+            );
+        }
+    }
+
     fn send_to_arc_with_carrier(
         &self,
         peer_id: &NodeIdBytes,
@@ -782,29 +841,7 @@ impl SessionTxRegistry {
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                // LIMIT: the per-session TX channel (depth = self.capacity) is
-                // full, so this frame is silently dropped — the caller only sees
-                // a `false` return, never a reason. This is a prime bulk-transfer
-                // loss source (a fast sender outruns the peer's drain). Surface
-                // it: debug per drop, throttled warn so it's visible but not a
-                // flood.
-                let n = self.drops_total.fetch_add(1, Ordering::Relaxed) + 1;
-                log::debug!(
-                    "LIMIT tx_queue: session TX channel FULL — frame dropped \
-                     (peer {}, cap {}, total_drops {})",
-                    veil_util::hex_short(peer_id),
-                    self.capacity,
-                    n,
-                );
-                if n.is_power_of_two() || n.is_multiple_of(1000) {
-                    log::warn!(
-                        "LIMIT tx_queue: {} frames dropped on full session \
-                         channels (cap {}); latest peer {}",
-                        n,
-                        self.capacity,
-                        veil_util::hex_short(peer_id),
-                    );
-                }
+                self.note_queue_full(peer_id);
                 Err(SendToError::Full)
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -978,6 +1015,85 @@ impl SessionTxRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_recoverable_send_preserves_activity_and_full_accounting() {
+        let peer = [0x71; 32];
+        let mut registry = SessionTxRegistry::with_capacity(1);
+        let _rx = registry.register(peer);
+        registry
+            .last_active
+            .get(&peer)
+            .unwrap()
+            .store(1, Ordering::Relaxed);
+        let calls = std::cell::Cell::new(0);
+        let build = || {
+            calls.set(calls.get() + 1);
+            Ok::<_, &'static str>(veil_bufpool::pooled_shared_from_vec(vec![42; 64]))
+        };
+        assert!(matches!(
+            registry.send_recoverable_with_result(
+                &peer,
+                64,
+                || Err::<veil_bufpool::PooledShared, _>("build failed")
+            ),
+            Err(BuildSendError::Build("build failed"))
+        ));
+        assert_eq!(
+            registry
+                .last_active
+                .get(&peer)
+                .unwrap()
+                .load(Ordering::Relaxed),
+            1
+        );
+        registry
+            .send_recoverable_with_result(&peer, 64, build)
+            .unwrap();
+        let active = registry
+            .last_active
+            .get(&peer)
+            .unwrap()
+            .load(Ordering::Relaxed);
+        assert!(active > 1);
+        let drops = registry.drops_total.load(Ordering::Relaxed);
+        assert!(matches!(
+            registry.send_recoverable_with_result(&peer, 64, build),
+            Err(BuildSendError::Queue(SendToError::Full))
+        ));
+        assert_eq!(registry.drops_total.load(Ordering::Relaxed), drops + 1);
+        assert_eq!(
+            registry
+                .last_active
+                .get(&peer)
+                .unwrap()
+                .load(Ordering::Relaxed),
+            active
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn deferred_recoverable_send_skips_builder_for_missing_and_closed_sessions() {
+        let peer = [0x71; 32];
+        let mut registry = SessionTxRegistry::with_capacity(1);
+        let calls = std::cell::Cell::new(0);
+        let build = || {
+            calls.set(calls.get() + 1);
+            Ok::<_, &'static str>(veil_bufpool::pooled_shared_from_vec(vec![42; 64]))
+        };
+        assert!(matches!(
+            registry.send_recoverable_with_result(&peer, 64, build),
+            Err(BuildSendError::Queue(SendToError::Missing))
+        ));
+        let mut rx = registry.register(peer);
+        rx.close();
+        assert!(matches!(
+            registry.send_recoverable_with_result(&peer, 64, build),
+            Err(BuildSendError::Queue(SendToError::Closed))
+        ));
+        assert_eq!(calls.get(), 0);
+    }
 
     #[tokio::test]
     async fn live_registration_snapshot_tracks_reconnect_and_closed_outboxes() {

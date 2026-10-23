@@ -20,6 +20,14 @@ pub const RESERVED_QUEUE_DEPTH: usize = 64;
 /// belongs before publishing, not in a large buffer of aging wire envelopes.
 /// This does not change the independent primary or ordinary transit budgets.
 pub const RELIABLE_SOURCE_QUEUE_DEPTH: usize = 4;
+
+/// Queue admission and synchronous frame construction have different failures.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BuildSendError<E> {
+    Queue(crate::SendToError),
+    Build(E),
+    LengthMismatch,
+}
 // One packet-sized frame uses one credit. Compatibility frames use several,
 // and an oversized frame owns the whole lookahead rather than sitting behind
 // three other huge envelopes. Capping its cost permits eventual admission.
@@ -117,6 +125,44 @@ pub struct FrameSender {
 }
 
 impl FrameSender {
+    /// Reserve the same ordinary queue and byte credits as recoverable
+    /// `try_send`, before calling a builder that may allocate a crypto nonce.
+    /// Dropping either reservation on a build failure restores admission;
+    /// accepted frames keep their credit through the scheduler as usual.
+    pub fn try_send_recoverable_with<E>(
+        &self,
+        expected_len: usize,
+        build: impl FnOnce() -> Result<veil_bufpool::PooledShared, E>,
+    ) -> Result<(), BuildSendError<E>> {
+        use crate::SendToError;
+        if self.ordinary.is_closed() {
+            return Err(BuildSendError::Queue(SendToError::Closed));
+        }
+        let credit = self
+            .reliable_credits
+            .clone()
+            .try_acquire_many_owned(reliable_source_cost(expected_len))
+            .map_err(|_| BuildSendError::Queue(SendToError::Full))?;
+        let permit = self.ordinary.try_reserve().map_err(|error| {
+            BuildSendError::Queue(match error {
+                mpsc::error::TrySendError::Full(()) => SendToError::Full,
+                mpsc::error::TrySendError::Closed(()) => SendToError::Closed,
+            })
+        })?;
+        let frame = build().map_err(BuildSendError::Build)?;
+        if frame.len() != expected_len {
+            return Err(BuildSendError::LengthMismatch);
+        }
+        if self.ordinary.is_closed() {
+            return Err(BuildSendError::Queue(SendToError::Closed));
+        }
+        let mut envelope =
+            FrameEnvelope::from((veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE, frame));
+        envelope.reliable_credit = Some(credit);
+        permit.send(envelope);
+        Ok(())
+    }
+
     /// Generic transport readiness only; does not alter relay scheduling.
     pub fn has_datagram_transport(&self) -> bool {
         self.status.has_datagram_transport()
@@ -581,6 +627,97 @@ impl FrameOutbox {
 mod tests {
     use super::*;
     use veil_proto::priority::{INTERACTIVE, REALTIME};
+
+    #[tokio::test]
+    async fn recoverable_builder_reserves_credit_through_scheduler_restore() {
+        let (tx, mut rx) = frame_channel(8);
+        let calls = std::cell::Cell::new(0);
+        let build = || {
+            calls.set(calls.get() + 1);
+            Ok::<_, &'static str>(veil_bufpool::pooled_shared_from_vec(vec![42; 2048]))
+        };
+        tx.try_send_recoverable_with(2048, build).unwrap();
+        tx.try_send_recoverable_with(2048, build).unwrap();
+        let mut pq = crate::PriorityQueue::with_default_weights();
+        pq.push_envelope(rx.recv_envelope().await.unwrap(), true);
+        assert!(matches!(
+            tx.try_send_recoverable_with(2048, build),
+            Err(BuildSendError::Queue(crate::SendToError::Full))
+        ));
+        let frame = pq.pop_datagram_envelope_if(|_| true).unwrap();
+        assert!(frame.reliable_credit.is_some());
+        pq.restore_lossy_envelope(frame);
+        assert!(matches!(
+            tx.try_send_recoverable_with(2048, build),
+            Err(BuildSendError::Queue(crate::SendToError::Full))
+        ));
+        assert_eq!(calls.get(), 2, "rejected builder consumed a nonce/work");
+        drop(pq);
+        tx.try_send_recoverable_with(2048, build).unwrap();
+        assert_eq!(calls.get(), 3);
+        assert_eq!(
+            rx.recv().await.unwrap().0,
+            veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
+        );
+    }
+
+    #[test]
+    fn recoverable_builder_does_not_run_on_full_or_closed_ingress() {
+        let (tx, mut rx) = frame_channel(1);
+        tx.try_send((INTERACTIVE, veil_bufpool::pooled_shared_from_vec(vec![1])))
+            .unwrap();
+        let calls = std::cell::Cell::new(0);
+        let build = || {
+            calls.set(calls.get() + 1);
+            Ok::<_, &'static str>(veil_bufpool::pooled_shared_from_vec(vec![42; 2048]))
+        };
+        assert!(matches!(
+            tx.try_send_recoverable_with(2048, build),
+            Err(BuildSendError::Queue(crate::SendToError::Full))
+        ));
+        assert_eq!(
+            tx.reliable_credits.available_permits(),
+            RELIABLE_SOURCE_QUEUE_DEPTH
+        );
+        rx.close();
+        assert!(matches!(
+            tx.try_send_recoverable_with(2048, build),
+            Err(BuildSendError::Queue(crate::SendToError::Closed))
+        ));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn recoverable_builder_failure_releases_reserved_slot_and_credit() {
+        let (tx, mut rx) = frame_channel(1);
+        assert!(matches!(
+            tx.try_send_recoverable_with(2048, || Err::<veil_bufpool::PooledShared, _>(
+                "build failed"
+            )),
+            Err(BuildSendError::Build("build failed"))
+        ));
+        assert_eq!(tx.ordinary.capacity(), 1);
+        assert_eq!(
+            tx.reliable_credits.available_permits(),
+            RELIABLE_SOURCE_QUEUE_DEPTH
+        );
+        assert!(matches!(
+            tx.try_send_recoverable_with(2048, || Ok::<_, &'static str>(
+                veil_bufpool::pooled_shared_from_vec(vec![1; 2047])
+            )),
+            Err(BuildSendError::LengthMismatch)
+        ));
+        assert_eq!(tx.ordinary.capacity(), 1);
+        assert_eq!(
+            tx.reliable_credits.available_permits(),
+            RELIABLE_SOURCE_QUEUE_DEPTH
+        );
+        tx.try_send_recoverable_with(2048, || {
+            Ok::<_, &'static str>(veil_bufpool::pooled_shared_from_vec(vec![1; 2048]))
+        })
+        .unwrap();
+        assert_eq!(rx.recv().await.unwrap().1.len(), 2048);
+    }
 
     #[tokio::test]
     async fn recoverable_data_credit_survives_scheduler_and_datagram_restore() {

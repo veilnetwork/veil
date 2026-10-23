@@ -2287,19 +2287,52 @@ impl NodeServices {
         use veil_anonymity::circuit_data::{Direction, apply_layers, wrap_payload};
         use veil_anonymity::circuit_wire::CircuitDataPayload;
 
-        let seq = circ.alloc_seq().ok_or(DataCircuitSendError::NoRelays)?; // exhausted → rotate
-        let mut buf = wrap_payload(payload, circ.cell_bytes)
-            .map_err(|_| DataCircuitSendError::PayloadTooLarge)?;
-        apply_layers(&circ.keys, Direction::Forward, seq, &mut buf)
-            .map_err(|_| DataCircuitSendError::NoRelays)?;
-        let cell = CircuitDataPayload {
-            circuit_id: circ.origin_circuit_id,
-            seq,
-            ciphertext: buf,
-        };
-        let enc = cell
+        // Invalid inputs must not spend nonces, even on a full/missing route.
+        if payload.len() > circ.cell_bytes.get() - veil_anonymity::circuit_data::LEN_PREFIX {
+            return Err(DataCircuitSendError::PayloadTooLarge);
+        }
+        if circ.next_seq.load(std::sync::atomic::Ordering::Relaxed) == u32::MAX {
+            return Err(DataCircuitSendError::NoRelays); // rotate even if ingress is full
+        }
+        let encode = || {
+            let mut buf = wrap_payload(payload, circ.cell_bytes)
+                .map_err(|_| DataCircuitSendError::PayloadTooLarge)?;
+            let seq = circ.alloc_seq().ok_or(DataCircuitSendError::NoRelays)?;
+            apply_layers(&circ.keys, Direction::Forward, seq, &mut buf)
+                .map_err(|_| DataCircuitSendError::NoRelays)?;
+            CircuitDataPayload {
+                circuit_id: circ.origin_circuit_id,
+                seq,
+                ciphertext: buf,
+            }
             .encode(circ.cell_bytes)
-            .map_err(|_| DataCircuitSendError::NoRelays)?;
+            .map_err(|_| DataCircuitSendError::NoRelays)
+        };
+        if local_lane == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE && expires_at.is_none() {
+            // A rejected source cell has no network handoff. Reserve the
+            // existing queue/credits before sealing so retries cannot burn a
+            // large sequence gap and age genuine cells out of replay windows.
+            let frame_len =
+                veil_proto::HEADER_SIZE + CircuitDataPayload::HEADER_LEN + circ.cell_bytes.get();
+            return rlock!(self.session_tx_registry)
+                .send_recoverable_with_result(&circ.first_hop, frame_len, || {
+                    let enc = encode()?;
+                    Ok(veil_bufpool::pooled_shared_from_vec(
+                        super::sending::relay_chain_frame(transport, &enc),
+                    ))
+                })
+                .map_err(|error| match error {
+                    veil_session::BuildSendError::Build(error) => error,
+                    veil_session::BuildSendError::Queue(veil_session::SendToError::Full) => {
+                        DataCircuitSendError::QueueFull
+                    }
+                    veil_session::BuildSendError::Queue(_)
+                    | veil_session::BuildSendError::LengthMismatch => {
+                        DataCircuitSendError::NoRelays
+                    }
+                });
+        }
+        let enc = encode()?;
         let result = match expires_at {
             Some(expires_at) => self.send_relay_chain_frame_on_local_lane_before(
                 &circ.first_hop,
