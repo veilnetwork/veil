@@ -117,6 +117,17 @@ pub trait CellDuplex: Send {
         let _ = (stream_id, end);
         std::future::ready(())
     }
+    /// Local engine demand at the timeout. Legacy carriers keep their callback.
+    fn on_data_rto_with_demand(
+        &mut self,
+        stream_id: u32,
+        consec_rto: u32,
+        snd_una: u32,
+        app_limited: bool,
+    ) -> impl Future<Output = ()> + Send {
+        let _ = app_limited;
+        self.on_data_rto(stream_id, consec_rto, snd_una)
+    }
     /// The stream's final delivery model (measured bottleneck rate, min RTT,
     /// total delivered bytes), reported once just before `on_stream_closed`.
     /// Carriers may cache it per peer to warm-start follow-up streams (see
@@ -562,9 +573,15 @@ async fn drive<D: CellDuplex>(
                 Event::DataRto {
                     consec_rto,
                     snd_una,
+                    app_limited,
                 } => {
                     duplex
-                        .on_data_rto(engine.stream_id(), consec_rto, snd_una)
+                        .on_data_rto_with_demand(
+                            engine.stream_id(),
+                            consec_rto,
+                            snd_una,
+                            app_limited && cmd_rx.is_empty() && outbound.is_empty(),
+                        )
                         .await;
                 }
             }

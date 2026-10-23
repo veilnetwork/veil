@@ -100,6 +100,18 @@ pub trait CellSender: Send + Sync + 'static {
         let _ = (dst, stream_id, end);
         std::future::ready(())
     }
+    /// Demand is local-only. Existing senders retain their conservative policy.
+    fn on_stream_data_rto_with_demand(
+        &self,
+        dst: Addr,
+        stream_id: u32,
+        consec_rto: u32,
+        snd_una: u32,
+        app_limited: bool,
+    ) -> impl Future<Output = ()> + Send {
+        let _ = app_limited;
+        self.on_stream_data_rto(dst, stream_id, consec_rto, snd_una)
+    }
 }
 
 /// Per-stream inbound queue depth (cells). Bounded: a slow stream drops excess
@@ -220,6 +232,17 @@ impl<S: CellSender> CellDuplex for MuxDuplex<S> {
     async fn on_data_rto(&mut self, stream_id: u32, consec_rto: u32, snd_una: u32) {
         self.sender
             .on_stream_data_rto(self.peer, stream_id, consec_rto, snd_una)
+            .await;
+    }
+    async fn on_data_rto_with_demand(
+        &mut self,
+        stream_id: u32,
+        consec_rto: u32,
+        snd_una: u32,
+        app_limited: bool,
+    ) {
+        self.sender
+            .on_stream_data_rto_with_demand(self.peer, stream_id, consec_rto, snd_una, app_limited)
             .await;
     }
     async fn on_stream_closed(&mut self, stream_id: u32, end: End) {

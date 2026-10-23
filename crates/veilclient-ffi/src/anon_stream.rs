@@ -559,7 +559,8 @@ const CIRCUIT_ROUTE_SEND_COOLDOWN: Duration = Duration::from_secs(60);
 // circuit can still dribble one repaired MSS per coarse RTO, so `consec_rto`
 // never reaches 2 while the file transfer is effectively stuck. Count repeated
 // RTOs for the SAME stream as well, but do not aggregate independent p12 range
-// streams into a fake route-wide failure.
+// streams into a fake route-wide failure. Isolated app-limited writes with ACK
+// progress between their timeouts must not build a backlogged-crawl streak.
 const CIRCUIT_ROUTE_NO_PROGRESS_RTO_EVENTS: u64 = 3;
 // A route-level RTO is only a weak signal when the same route is actively
 // carrying other DATA/ACK streams. With high range fanout (p10/p12) ACK jitter
@@ -1159,7 +1160,13 @@ impl CircuitRouteStats {
         self.snapshot()
     }
 
-    fn record_rto(&self, stream_id: u32, snd_una: u32) -> RouteRtoSnapshot {
+    fn record_rto(
+        &self,
+        stream_id: u32,
+        snd_una: u32,
+        consec_rto: u32,
+        app_limited: bool,
+    ) -> RouteRtoSnapshot {
         self.rto_events.fetch_add(1, Ordering::Relaxed);
         let (stream_rto_events, stream_snd_una_advanced) =
             if let Ok(mut stream_rtos) = self.stream_rtos.lock() {
@@ -1171,7 +1178,14 @@ impl CircuitRouteStats {
                     last_snd_una: snd_una,
                 });
                 let advanced = entry.last_snd_una != snd_una;
-                entry.events = entry.events.saturating_add(1);
+                // Preserve the anti-dribble guard for a continuously queued
+                // file. Only the engine/driver can establish that no app or
+                // local replay tail was waiting at this small-flight RTO.
+                entry.events = if app_limited && consec_rto == 1 && advanced {
+                    1
+                } else {
+                    entry.events.saturating_add(1)
+                };
                 entry.last_snd_una = snd_una;
                 (entry.events, advanced)
             } else {
@@ -1565,6 +1579,18 @@ impl CellSender for CircuitCells {
     }
 
     async fn on_stream_data_rto(&self, dst: Addr, stream_id: u32, consec_rto: u32, snd_una: u32) {
+        self.on_stream_data_rto_with_demand(dst, stream_id, consec_rto, snd_una, false)
+            .await;
+    }
+
+    async fn on_stream_data_rto_with_demand(
+        &self,
+        dst: Addr,
+        stream_id: u32,
+        consec_rto: u32,
+        snd_una: u32,
+        app_limited: bool,
+    ) {
         if self.mode != CircuitMode::PublishedRendezvous {
             return;
         }
@@ -1580,7 +1606,7 @@ impl CellSender for CircuitCells {
         let route_rto = route
             .stats
             .as_ref()
-            .map(|stats| stats.record_rto(stream_id, snd_una));
+            .map(|stats| stats.record_rto(stream_id, snd_una, consec_rto, app_limited));
         let stream_rto_events = route_rto
             .as_ref()
             .map(|rto| rto.stream_rto_events)
@@ -3751,6 +3777,20 @@ impl CellSender for HubCells {
                 c.on_stream_data_rto(dst, stream_id, consec_rto, snd_una)
                     .await;
             }
+        }
+    }
+
+    async fn on_stream_data_rto_with_demand(
+        &self,
+        dst: Addr,
+        stream_id: u32,
+        consec_rto: u32,
+        snd_una: u32,
+        app_limited: bool,
+    ) {
+        if let HubCells::Circuit(c) = self {
+            c.on_stream_data_rto_with_demand(dst, stream_id, consec_rto, snd_una, app_limited)
+                .await;
         }
     }
 

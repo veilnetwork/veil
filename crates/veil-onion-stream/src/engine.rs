@@ -169,7 +169,13 @@ pub enum Event {
     HandshakeRto { retries: u32 },
     /// A DATA retransmission timeout fired without new cumulative ACK progress.
     /// Useful to the carrier for route health/failover; not terminal.
-    DataRto { consec_rto: u32, snd_una: u32 },
+    DataRto {
+        consec_rto: u32,
+        snd_una: u32,
+        /// At most one MSS in flight, with no queued app/local-replay tail.
+        /// Isolated loss here does not imply a continuously backlogged crawl.
+        app_limited: bool,
+    },
     /// The peer sent FIN: the read side has reached clean EOF.
     PeerFinished,
     /// Abnormal teardown — NOT EOF. The app should resume (`reason` from
@@ -1654,12 +1660,16 @@ impl StreamEngine {
                 self.declare_dead();
                 return;
             }
+            let mss = self.cfg.mss as u32;
+            let flight = self.tx.snd_nxt.wrapping_sub(self.tx.snd_una);
             self.events.push_back(Event::DataRto {
                 consec_rto: self.tx.consec_rto,
                 snd_una: self.tx.snd_una,
+                app_limited: self.tx.pending.is_empty()
+                    && flight <= mss
+                    && self.tx.rewind_high.is_none()
+                    && self.tx.segs.iter().all(|s| !s.local_pending),
             });
-            let mss = self.cfg.mss as u32;
-            let flight = self.tx.snd_nxt.wrapping_sub(self.tx.snd_una);
             let no_sack_rewind = self.cfg.rto_rewind_no_sack
                 && self.tx.segs.iter().all(|s| !s.sacked)
                 && self.tx.segs.iter().all(|s| !s.local_pending)
@@ -2426,6 +2436,84 @@ impl RxState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rto_demand_keeps_locally_queued_and_rewound_flight_conservative() {
+        for locally_pending in [false, true] {
+            let cfg = Config {
+                mss: 8,
+                init_cwnd: 16,
+                init_rto_ms: 50,
+                min_rto_ms: 50,
+                max_rto_ms: 50,
+                rto_rewind_no_sack: true,
+                ..Config::default()
+            };
+            let mut engine = StreamEngine::connect(11, cfg, 0, 100);
+            if locally_pending {
+                engine.track_local_handoffs();
+            }
+            let mut cell = Vec::new();
+            assert!(engine.poll_transmit(0, &mut cell));
+            Frame::SynAck {
+                stream_id: 11,
+                isn: 500,
+                win: 8192,
+                ack: 101,
+            }
+            .encode_into(&mut cell);
+            engine.on_cell(&cell, 1);
+            while engine.poll_event().is_some() {}
+            let span = if locally_pending { 4 } else { 8 };
+            engine.write(&vec![0x39; span]);
+            loop {
+                assert!(engine.poll_transmit(10, &mut cell));
+                if matches!(Frame::decode(&cell), Some(Frame::Data { .. })) {
+                    break;
+                }
+            }
+            if locally_pending {
+                let accepted = HashMap::from([(LocalTransmit::from_cell(&cell).unwrap(), 1)]);
+                engine.local_handoff(&accepted, 10);
+            }
+            engine.write(&vec![0x39; span]);
+            assert!(engine.poll_transmit(20, &mut cell));
+            // Either the second half has no local acceptance, or the whole
+            // handed-off flight is genuinely larger than one MSS.
+            engine.on_timeout(80);
+            assert!(matches!(
+                engine.poll_event(),
+                Some(Event::DataRto {
+                    app_limited: false,
+                    ..
+                })
+            ));
+            if !locally_pending {
+                // Rewind the old larger flight, ACK its first replay, then
+                // leave one MSS in flight with an outstanding rewind ceiling.
+                assert!(engine.poll_transmit(81, &mut cell));
+                Frame::Ack {
+                    stream_id: 11,
+                    ack: 109,
+                    win: 8192,
+                    sacks: Default::default(),
+                }
+                .encode_into(&mut cell);
+                engine.on_cell(&cell, 82);
+                assert!(engine.poll_transmit(100, &mut cell));
+                assert!(engine.tx.pending.is_empty());
+                assert!(engine.tx.rewind_high.is_some());
+                engine.on_timeout(160);
+                assert!(matches!(
+                    engine.poll_event(),
+                    Some(Event::DataRto {
+                        app_limited: false,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
 
     #[test]
     fn synack_must_acknowledge_exactly_this_openers_syn() {
