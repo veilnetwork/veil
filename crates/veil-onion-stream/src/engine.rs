@@ -1896,7 +1896,12 @@ impl StreamEngine {
     /// This preserves the byte stream while dropping the phantom in-flight count
     /// that otherwise pins cwnd below the old lost flight for many minutes.
     fn requeue_unsacked_flight_for_rto(&mut self) {
-        let rewind_high = self.tx.snd_nxt;
+        // A later RTO may interrupt a much smaller replay/probe. The original
+        // flight can still arrive, so its ACK ceiling must survive every rewind.
+        let rewind_high = self
+            .tx
+            .rewind_high
+            .map_or(self.tx.snd_nxt, |high| seq::max(high, self.tx.snd_nxt));
         let mut requeued = VecDeque::new();
         let mut rewound_fin = false;
         for seg in self.tx.segs.drain(..) {
@@ -1921,7 +1926,9 @@ impl StreamEngine {
         self.tx.pending = requeued;
         self.tx.snd_nxt = self.tx.snd_una;
         self.tx.rewind_high = Some(rewind_high);
-        self.tx.rewind_fin = rewound_fin;
+        // A partial replay need not reach the original FIN. Keep its sequence
+        // accounting until a valid ACK covers it, including across later RTOs.
+        self.tx.rewind_fin |= rewound_fin;
         if rewound_fin {
             self.tx.fin_sent = false;
         }
@@ -2834,6 +2841,75 @@ mod tests {
         engine.local_handoff(&replay, 104);
         engine.on_ack(replay_end, 4096, &SackVec::new(), 105);
         assert_eq!(engine.tx.snd_una, replay_end);
+    }
+
+    fn exercise_repeated_rewind_late_ack(iss: u32, rack: bool, with_fin: bool) {
+        let (mut engine, mut original) = tracked_flight(iss, 256);
+        engine.cfg.rack = rack;
+        let mut encoded = Vec::new();
+        if with_fin {
+            engine.finish();
+            assert!(engine.poll_transmit(11, &mut encoded));
+            let fin = LocalTransmit::from_cell(&encoded).unwrap();
+            assert_eq!(fin.kind, TransmitKind::Fin);
+            original.push(fin);
+        }
+        engine.local_handoff(&original.into_iter().map(|t| (t, 1)).collect(), 12);
+        let original_high = engine.tx.snd_nxt;
+        let future = if with_fin {
+            &[][..]
+        } else {
+            &b"future tail"[..]
+        };
+        engine.write(future);
+
+        // The entire original flight left locally, but its ACK is delayed.
+        engine.on_timeout(100);
+        // Only one replay segment leaves before another RTO. The original
+        // flight is larger than this replay, including a FIN when requested.
+        engine.cfg.max_pacing_batch = 1;
+        assert!(engine.poll_transmit(101, &mut encoded));
+        let replay = LocalTransmit::from_cell(&encoded).unwrap();
+        assert_eq!(replay.kind, TransmitKind::Data);
+        assert!(seq::lt(engine.tx.snd_nxt, original_high));
+        engine.local_handoff(&HashMap::from([(replay, 1)]), 102);
+        engine.on_timeout(1000);
+        assert_eq!(engine.tx.consec_rto, 2);
+
+        let before_ack = engine.tx.snd_una;
+        engine.on_ack(original_high.wrapping_add(1), 4096, &SackVec::new(), 1001);
+        assert_eq!(engine.tx.snd_una, before_ack, "unsent bytes were ACKed");
+        engine.on_ack(original_high, 4096, &SackVec::new(), 1002);
+        assert_eq!(
+            engine.tx.snd_una, original_high,
+            "second rewind forgot the original handed-off flight"
+        );
+        assert_eq!(
+            engine.tx.pending.iter().copied().collect::<Vec<_>>(),
+            future
+        );
+        assert_eq!(engine.tx.consec_rto, 0, "late receipt is real progress");
+        if with_fin {
+            assert!(engine.is_send_complete(), "late original FIN ACK was lost");
+        }
+    }
+
+    #[test]
+    fn repeated_rewind_accepts_late_ack_for_original_data() {
+        for iss in [100, u32::MAX - 127] {
+            for rack in [false, true] {
+                exercise_repeated_rewind_late_ack(iss, rack, false);
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_rewind_accepts_late_ack_for_original_fin() {
+        for iss in [100, u32::MAX - 127] {
+            for rack in [false, true] {
+                exercise_repeated_rewind_late_ack(iss, rack, true);
+            }
+        }
     }
 
     #[test]
