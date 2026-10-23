@@ -14,6 +14,7 @@ struct Observed {
     sends: Mutex<HashMap<u32, u32>>,
     bytes: Mutex<Vec<u8>>,
     lost_repairs: Notify,
+    prefix_received: Notify,
     complete: Notify,
 }
 
@@ -24,6 +25,7 @@ struct RepeatedLossPeer {
     obs: Arc<Observed>,
     tx: mpsc::UnboundedSender<Vec<u8>>,
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    staggered: bool,
 }
 
 impl CellDuplex for RepeatedLossPeer {
@@ -35,6 +37,9 @@ impl CellDuplex for RepeatedLossPeer {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         if let Some(Frame::Data { seq, payload, .. }) = Frame::decode(cell) {
+            if self.staggered {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
             assert_eq!(payload.len(), 16);
             let offset = seq.wrapping_sub(self.first_data);
             let drop = {
@@ -58,7 +63,10 @@ impl CellDuplex for RepeatedLossPeer {
         if n > 0 {
             let mut bytes = self.obs.bytes.lock().unwrap();
             bytes.extend_from_slice(&buf[..n]);
-            if bytes.len() == 128 {
+            if self.staggered && bytes.len() == 16 {
+                self.obs.prefix_received.notify_one();
+            }
+            if bytes.len() == if self.staggered { 144 } else { 128 } {
                 self.obs.complete.notify_one();
             }
         }
@@ -74,7 +82,7 @@ impl CellDuplex for RepeatedLossPeer {
     }
 }
 
-async fn repair_lost_retransmissions(rack: bool) {
+async fn repair_lost_retransmissions(rack: bool, staggered: bool) {
     for iss in [100u32, u32::MAX - 32] {
         let config = Config {
             mss: 16,
@@ -83,7 +91,7 @@ async fn repair_lost_retransmissions(rack: bool) {
             init_rto_ms: 100,
             min_rto_ms: 100,
             max_rto_ms: 1000,
-            max_pacing_batch: 4,
+            max_pacing_batch: if staggered { 1 } else { 4 },
             rto_rewind_no_sack: true,
             rack,
             ack_every: 1,
@@ -94,13 +102,25 @@ async fn repair_lost_retransmissions(rack: bool) {
         let peer = RepeatedLossPeer {
             engine: StreamEngine::accept(7, config, 0, 500),
             base: Instant::now(),
-            first_data: iss.wrapping_add(1),
+            first_data: iss.wrapping_add(if staggered { 17 } else { 1 }),
             obs: obs.clone(),
             tx,
             rx,
+            staggered,
         };
         let stream = OnionStream::connect(peer, config, 7, iss);
         let payload: Vec<_> = (0..128).map(|n| n as u8).collect();
+        let mut expected = Vec::new();
+        if staggered {
+            // An acknowledged prefix warms RTT/pacing before the lossy flight,
+            // so each repair is admitted in a separate one-cell pacing tick.
+            stream.write_all(&[0xAA; 16]).await.unwrap();
+            tokio::time::timeout(Duration::from_millis(20), obs.prefix_received.notified())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            expected.extend_from_slice(&[0xAA; 16]);
+        }
         stream.write_all(&payload).await.unwrap();
         tokio::time::timeout(Duration::from_millis(80), obs.lost_repairs.notified())
             .await
@@ -113,7 +133,8 @@ async fn repair_lost_retransmissions(rack: bool) {
             .reset(veil_onion_stream::wire::reset_reason::APP)
             .await;
         result.expect("SACK recovery waited another backed-off RTO for each lost repair");
-        assert_eq!(*obs.bytes.lock().unwrap(), payload);
+        expected.extend_from_slice(&payload);
+        assert_eq!(*obs.bytes.lock().unwrap(), expected);
         let sends = obs.sends.lock().unwrap();
         for offset in [0, 16, 32] {
             assert_eq!(
@@ -130,10 +151,20 @@ async fn repair_lost_retransmissions(rack: bool) {
 
 #[tokio::test(start_paused = true)]
 async fn sack_count_recovery_repairs_multiple_lost_retransmissions_in_one_rto() {
-    repair_lost_retransmissions(false).await;
+    repair_lost_retransmissions(false, false).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn rack_recovery_repairs_multiple_lost_retransmissions_in_one_rto() {
-    repair_lost_retransmissions(true).await;
+    repair_lost_retransmissions(true, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn staggered_sack_repairs_do_not_inherit_the_oldest_holes_rto_backoff() {
+    repair_lost_retransmissions(false, true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn staggered_rack_repairs_do_not_inherit_the_oldest_holes_rto_backoff() {
+    repair_lost_retransmissions(true, true).await;
 }
