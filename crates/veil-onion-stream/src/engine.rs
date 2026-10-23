@@ -42,6 +42,8 @@ const BBR_BW_SAMPLE_SPACING_MS: u64 = 100;
 const BBR_ENGAGE_DELIVERED: u64 = 1024 * 1024;
 /// Expiry of the windowed-minimum RTT sample.
 const BBR_MIN_RTT_WINDOW_MS: u64 = 30_000;
+/// Higher-sequence SACKed segments needed to establish a hole by count.
+const SACK_LOSS_THRESHOLD: usize = 3;
 
 /// Tunables. Bytes for windows, millis for timers.
 #[derive(Clone, Copy, Debug)]
@@ -857,6 +859,7 @@ impl StreamEngine {
                 {
                     let (sent_ms, end, retransmitted) = (s.sent_ms, s.end(), s.retransmitted);
                     self.tx.segs[i].sacked = true;
+                    self.tx.segs[i].needs_resend = false;
                     if self.cfg.rack && !retransmitted {
                         self.tx.rack_on_delivery(sent_ms, end, now);
                     }
@@ -1250,7 +1253,6 @@ impl StreamEngine {
     /// retransmitting it (as a naive "every hole below the highest SACK" would)
     /// floods the high-BDP onion path with thousands of premature duplicates.
     fn mark_holes(&mut self, fallback_oldest: bool) {
-        const DUP_THRESH: usize = 3;
         // Segments are in ascending seq order; walking from the back, count the
         // SACKed segments seen so far (those with a higher seq than the current).
         let mut sacked_above = 0usize;
@@ -1258,7 +1260,7 @@ impl StreamEngine {
         for s in self.tx.segs.iter_mut().rev() {
             if s.sacked {
                 sacked_above += 1;
-            } else if sacked_above >= DUP_THRESH
+            } else if sacked_above >= SACK_LOSS_THRESHOLD
                 && !s.local_pending
                 && !s.retransmitted
                 && !s.needs_resend
@@ -1278,6 +1280,29 @@ impl StreamEngine {
                 .find(|s| !s.sacked && !s.local_pending && !s.retransmitted && !s.needs_resend)
         {
             f.needs_resend = true;
+        }
+    }
+
+    /// A SACK-count fast repair is marked `retransmitted` permanently for
+    /// Karn's rule and to avoid replaying it on every duplicate ACK. Once that
+    /// repair's own RTO has expired, however, the marker must not strand all
+    /// but the oldest hole behind another backed-off RTO. Re-repair only
+    /// proven holes whose last actual handoff is old enough, under the normal
+    /// pacer. Recent or still locally queued repairs are not network loss.
+    fn mark_expired_sack_repairs(&mut self, now: u64, expired_rto_ms: u64) {
+        let mut sacked_above = 0usize;
+        for s in self.tx.segs.iter_mut().rev() {
+            if s.sacked {
+                sacked_above += 1;
+            } else if sacked_above >= SACK_LOSS_THRESHOLD
+                && s.retransmitted
+                && s.handed_off
+                && !s.local_pending
+                && !s.needs_resend
+                && now.saturating_sub(s.sent_ms) >= expired_rto_ms
+            {
+                s.needs_resend = true;
+            }
         }
     }
 
@@ -1485,6 +1510,7 @@ impl StreamEngine {
             self.tx.ssthresh = ssthresh;
             self.tx.in_recovery = false;
             self.tx.dup_acks = 0;
+            let expired_rto_ms = self.tx.rto_ms;
             self.tx.rto_ms = (self.tx.rto_ms * 2).min(self.cfg.max_rto_ms); // backoff
             if no_sack_rewind {
                 // No SACK feedback means the receiver has not reported any
@@ -1520,6 +1546,7 @@ impl StreamEngine {
                 // mark the proven holes for paced retransmit.
                 self.tx.cwnd = ssthresh.max(self.cfg.init_cwnd).min(self.tx.rwnd).max(mss);
                 self.mark_holes(true);
+                self.mark_expired_sack_repairs(now, expired_rto_ms);
                 self.mark_oldest_unsacked_for_rto();
                 self.tx.pace_next_ms = now;
                 self.tx.pace_budget = 0;
@@ -2766,6 +2793,130 @@ mod tests {
             "SACK RTO should mark proven holes for paced repair"
         );
         assert_eq!(e.tx.rto_deadline, Some(100 + e.tx.rto_ms));
+    }
+
+    fn repeated_sack_holes(tracked: bool) -> StreamEngine {
+        let cfg = Config {
+            mss: 16,
+            init_cwnd: 128,
+            recv_window: 4096,
+            init_rto_ms: 100,
+            min_rto_ms: 100,
+            max_rto_ms: 1000,
+            rto_rewind_no_sack: true,
+            ..Config::default()
+        };
+        let mut e = StreamEngine::connect(9, cfg, 0, 100);
+        if tracked {
+            e.track_local_handoffs();
+        }
+        e.phase = Phase::Established;
+        e.syn_acked = true;
+        e.tx.rwnd = cfg.recv_window;
+        e.tx.snd_una = 101;
+        e.tx.snd_nxt = 101 + 8 * 16;
+        e.tx.rto_deadline = Some(110);
+        for i in 0..8 {
+            e.tx.segs.push_back(Seg {
+                seq: 101 + i * 16,
+                data: vec![i as u8; 16],
+                is_fin: false,
+                sent_ms: 10,
+                retransmitted: i < 3,
+                sacked: i >= 3,
+                needs_resend: false,
+                local_pending: false,
+                handed_off: true,
+            });
+        }
+        e
+    }
+
+    #[test]
+    fn circuit_sack_rto_repairs_all_expired_retransmitted_holes() {
+        for rack in [false, true] {
+            for tracked in [false, true] {
+                let mut e = repeated_sack_holes(tracked);
+                e.cfg.rack = rack;
+                e.on_timeout(110);
+                let marked: Vec<_> = e.tx.segs.iter().map(|s| s.needs_resend).collect();
+                assert_eq!(
+                    marked,
+                    [true, true, true, false, false, false, false, false],
+                    "a lost repair left other expired holes waiting for another backed-off RTO"
+                );
+                assert!(
+                    e.tx.segs.iter().take(3).all(|s| s.retransmitted),
+                    "Karn's ambiguous-RTT marker must survive another repair"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rto_does_not_repeat_fresh_or_locally_pending_sack_repairs() {
+        for guard in 0..3 {
+            let mut e = repeated_sack_holes(true);
+            match guard {
+                0 => e.tx.segs[1].sent_ms = 109, // newly handed off
+                1 => e.tx.segs[1].local_pending = true,
+                _ => e.tx.segs[1].handed_off = false,
+            }
+            // A lost tail without enough higher SACKs is not a proven hole.
+            e.tx.segs[7].sacked = false;
+            e.tx.segs[7].retransmitted = true;
+            e.on_timeout(110);
+            let marked: Vec<_> = e.tx.segs.iter().map(|s| s.needs_resend).collect();
+            assert_eq!(
+                marked,
+                [true, false, true, false, false, false, false, false]
+            );
+            assert!(e.tx.segs.iter().take(3).all(|s| s.retransmitted));
+        }
+        let mut classic = repeated_sack_holes(false);
+        classic.cfg.rto_rewind_no_sack = false;
+        classic.on_timeout(110);
+        assert_eq!(
+            classic
+                .tx
+                .segs
+                .iter()
+                .map(|s| s.needs_resend)
+                .collect::<Vec<_>>(),
+            [true, false, false, false, false, false, false, false]
+        );
+    }
+
+    #[test]
+    fn late_sack_cancels_a_marked_but_not_yet_emitted_repair() {
+        let mut e = repeated_sack_holes(false);
+        for s in e.tx.segs.iter_mut().take(3) {
+            s.retransmitted = false;
+        }
+        e.mark_holes(false);
+        assert!(e.tx.segs.iter().take(3).all(|s| s.needs_resend));
+        // The missing middle original arrives after loss detection, before
+        // pacing emitted its repair. A SACK must cancel that queued decision.
+        let mut sacks = SackVec::new();
+        assert!(sacks.push(SackRange {
+            start: 117,
+            end: 133
+        }));
+        let mut cell = Vec::new();
+        Frame::Ack {
+            stream_id: 9,
+            ack: 101,
+            win: 4096,
+            sacks,
+        }
+        .encode_into(&mut cell);
+        e.on_cell(&cell, 30);
+        assert!(e.tx.segs[1].sacked);
+        assert!(
+            !e.tx.segs[1].needs_resend,
+            "late SACK left a now-unnecessary retransmission ready for the pacer"
+        );
+        assert!(e.tx.segs[0].needs_resend && e.tx.segs[2].needs_resend);
     }
 
     #[test]
