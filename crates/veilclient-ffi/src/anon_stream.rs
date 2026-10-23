@@ -546,6 +546,10 @@ const DEFAULT_CIRCUIT_INIT_CWND_MSS: usize = 64;
 const MAX_CIRCUIT_INIT_CWND_MSS: usize = 256;
 const MAX_CIRCUIT_OUTBOUND_POOL: usize = 8;
 const MAX_CIRCUIT_BULK_ROUTE_ACTIVE_LIMIT: usize = 64;
+// A cold path can fail synchronously (e.g. NoRelays). The stream driver's
+// local handoff retries must not rebuild that same unavailable path every
+// few milliseconds. Keep the first attempt immediate and retry on demand.
+const CIRCUIT_OPEN_FAILURE_RETRY: Duration = Duration::from_secs(1);
 const STREAM_RENDEZVOUS_AD_FRESH_GRACE_SECS: u64 = 30;
 const CIRCUIT_ROUTE_SEND_COOLDOWN: Duration = Duration::from_secs(60);
 // `StreamEngine::consec_rto` resets on any cumulative ACK progress. A black-holed
@@ -839,6 +843,10 @@ struct CircuitCells {
     /// in the background. A stream cell sender must never block the stream driver
     /// on circuit construction; the ARQ layer retransmits dropped cells.
     outbound_opening: Arc<tokio::sync::Mutex<HashMap<[u8; 32], Instant>>>,
+    /// Brief per-peer retry deadlines after completed failures. Unlike the
+    /// running-opener guard, these also bound a fast NoRelays/error loop.
+    /// Expired entries are pruned on admission and completion.
+    outbound_retry_after: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
     /// Shared DATA-cell pacer per destination node. Multiple onion streams to the
     /// same peer share one pinned rendezvous/circuit bottleneck; if every stream
     /// independently paces at the path ceiling, their aggregate burst still
@@ -1631,6 +1639,7 @@ impl CircuitCells {
             stream_receivers: Arc::new(Mutex::new(HashMap::new())),
             next_outbound_route: Arc::new(Mutex::new(HashMap::new())),
             outbound_opening: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            outbound_retry_after: Arc::new(Mutex::new(HashMap::new())),
             bulk_shed_marks: Arc::new(Mutex::new(HashMap::new())),
             // Media does not use stream pacing or ACK striping. Keep its route
             // health and repair local, too: a video route's failure must not
@@ -3388,8 +3397,8 @@ impl CircuitCells {
     /// first serve/pull otherwise pays the full cold-pool price inside the
     /// peer's 25 s manifest window (attempt 1 dies, attempt 2 rides the pool
     /// the failure opened). Idempotent and cheap: `ensure_outbound_opening`
-    /// debounces concurrent opens and the open task itself tops up an
-    /// already-full pool as a no-op.
+    /// debounces concurrent opens and briefly backs off completed failures.
+    /// A successful prewarm can refresh an existing pool.
     async fn warm_outbound(&self, dst_node: [u8; 32]) {
         if self.mode != CircuitMode::PublishedRendezvous {
             return;
@@ -3410,6 +3419,16 @@ impl CircuitCells {
                     return;
                 }
             }
+            {
+                let mut retry_after = self
+                    .outbound_retry_after
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                retry_after.retain(|_, until| *until > now);
+                if retry_after.contains_key(&dst_node) {
+                    return;
+                }
+            }
             opening.insert(dst_node, now);
         }
 
@@ -3422,6 +3441,7 @@ impl CircuitCells {
         let inbound_activity = Arc::clone(&self.inbound_activity);
         let outbound_circuits = Arc::clone(&self.outbound_circuits);
         let outbound_opening = Arc::clone(&self.outbound_opening);
+        let outbound_retry_after = Arc::clone(&self.outbound_retry_after);
         let peer_tags = Arc::clone(&self.peer_tags);
         let outbound_peer_tags = Arc::clone(&self.outbound_peer_tags);
         let peer_aliases = Arc::clone(&self.peer_aliases);
@@ -3454,6 +3474,14 @@ impl CircuitCells {
             // A slow old opener must not erase a newer task's debounce slot.
             let mut opening = outbound_opening.lock().await;
             if opening.get(&dst_node) == Some(&now) {
+                if opened.is_err() {
+                    let completed = Instant::now();
+                    let mut retry_after = outbound_retry_after
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    retry_after.retain(|_, until| *until > completed);
+                    retry_after.insert(dst_node, completed + CIRCUIT_OPEN_FAILURE_RETRY);
+                }
                 opening.remove(&dst_node);
             }
             drop(opening);
@@ -4000,6 +4028,7 @@ fn try_open_circuit(
     let route_cooldowns = Arc::new(Mutex::new(HashMap::new()));
     let first_hop_cooldowns = Arc::new(Mutex::new(HashMap::new()));
     let outbound_opening = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let outbound_retry_after = Arc::new(Mutex::new(HashMap::new()));
     let peer_tags: SharedPeerTags = Arc::new(Mutex::new(HashMap::new()));
     let outbound_peer_tags: SharedOutboundPeerTags = Arc::new(Mutex::new(HashMap::new()));
     let peer_aliases = veil_onion_stream::PeerAliases::default();
@@ -4383,6 +4412,7 @@ fn try_open_circuit(
         first_hop_cooldowns,
         bulk_shed_marks: Arc::new(Mutex::new(HashMap::new())),
         outbound_opening,
+        outbound_retry_after,
         data_pacer,
         outbound_pool_target,
         ack_outbound_pool_target,
