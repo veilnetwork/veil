@@ -5200,9 +5200,18 @@ async fn open_outbound_circuit(
             stats: Arc::new(CircuitRouteStats::new(now)),
         });
         // Make a confirmed prefix usable before waiting on slower candidates.
-        kept_in_flight =
-            publish_outbound_candidates(&services, dst_node, &outbound_circuits, &opened_entries)
-                .await;
+        kept_in_flight = publish_outbound_candidates(
+            &services,
+            dst_node,
+            &outbound_circuits,
+            &opened_entries,
+            OutboundCooldownRecovery {
+                route_cooldowns: &route_cooldowns,
+                first_hop_cooldowns: &first_hop_cooldowns,
+                observed: &cooled_relays,
+            },
+        )
+        .await;
         published_count = opened_entries.len();
         mark_circuit_activity(&activity);
         diag_node(
@@ -5221,9 +5230,18 @@ async fn open_outbound_circuit(
     }
     let opened_count = opened_entries.len();
     if published_count != opened_count {
-        kept_in_flight =
-            publish_outbound_candidates(&services, dst_node, &outbound_circuits, &opened_entries)
-                .await;
+        kept_in_flight = publish_outbound_candidates(
+            &services,
+            dst_node,
+            &outbound_circuits,
+            &opened_entries,
+            OutboundCooldownRecovery {
+                route_cooldowns: &route_cooldowns,
+                first_hop_cooldowns: &first_hop_cooldowns,
+                observed: &cooled_relays,
+            },
+        )
+        .await;
     }
     if reused_count == opened_count {
         diag_node_debug(
@@ -5245,11 +5263,54 @@ async fn open_outbound_circuit(
     Ok(reused_count + skipped_count)
 }
 
+/// Only a confirmed replacement may recover a failure seen before its open.
+/// Comparing the observed deadline preserves failures recorded during setup.
+struct OutboundCooldownRecovery<'a> {
+    route_cooldowns: &'a RouteCooldowns,
+    first_hop_cooldowns: &'a FirstHopCooldowns,
+    observed: &'a HashMap<[u8; 32], Instant>,
+}
+
+impl OutboundCooldownRecovery<'_> {
+    fn clear_recovered(
+        &self,
+        services: &veil_node_runtime::NodeServices,
+        candidate: &CircuitEntry,
+    ) -> bool {
+        let Some(observed) = self.observed.get(&candidate.rendezvous_node) else {
+            return false;
+        };
+        let first_hop = candidate.circuit.first_hop();
+        if !candidate.circuit.is_confirmed()
+            || !services.has_live_session(&first_hop)
+            || services.session_close_generation(&first_hop) != candidate.first_hop_close_generation
+            || self
+                .first_hop_cooldowns
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&first_hop)
+                .is_some_and(|until| *until > Instant::now())
+        {
+            return false;
+        }
+        let mut cooldowns = self
+            .route_cooldowns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if cooldowns.get(&candidate.rendezvous_node) != Some(observed) {
+            return false;
+        }
+        cooldowns.remove(&candidate.rendezvous_node);
+        true
+    }
+}
+
 async fn publish_outbound_candidates(
     services: &veil_node_runtime::NodeServices,
     dst_node: [u8; 32],
     outbound_circuits: &Arc<tokio::sync::Mutex<OutboundCircuitPool>>,
     opened_entries: &[CircuitEntry],
+    recovery: OutboundCooldownRecovery<'_>,
 ) -> usize {
     let opened_count = opened_entries.len();
     // MAKE-BEFORE-BREAK refill (device-verified churn root, 2026-07-07): this
@@ -5271,6 +5332,21 @@ async fn publish_outbound_candidates(
         .collect();
     let merge_now = Instant::now();
     let mut pool = outbound_circuits.lock().await;
+    for candidate in opened_entries {
+        // When every rendezvous is cooled, the opener deliberately attempts
+        // them as a last resort. A confirmed replacement must become eligible;
+        // otherwise selection rejects the whole new pool and reopens it again.
+        // Never erase a concurrent newer failure or a first-hop quarantine.
+        if recovery.clear_recovered(services, candidate)
+            && veil_session::rt_trace::rt_trace_enabled()
+        {
+            diag(&format!(
+                "outbound confirmed rendezvous recovery for {} via R={}",
+                short_node(&dst_node),
+                short_node(&candidate.rendezvous_node),
+            ));
+        }
+    }
     let mut prior = pool.remove(&dst_node).unwrap_or_default();
     let mut retired: Vec<Arc<veil_node_runtime::DataCircuit>> = Vec::new();
     let mut merged = Vec::with_capacity(MAX_CIRCUIT_OUTBOUND_POOL);
