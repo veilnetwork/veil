@@ -66,6 +66,12 @@ pub trait CellSender: Send + Sync + 'static {
             while let Some(front) = cells.front() {
                 self.send(dst, front.clone()).await?;
                 cells.pop_front();
+                // A successful sender may return Ready immediately. Let its
+                // local receiver/feed run between cells instead of turning a
+                // queued burst into artificial loss at a bounded ingress.
+                if !cells.is_empty() {
+                    tokio::task::yield_now().await;
+                }
             }
             Ok(())
         }
@@ -487,6 +493,35 @@ async fn demux<S: CellSender>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ReadyQueueSender(mpsc::Sender<Vec<u8>>);
+
+    impl CellSender for ReadyQueueSender {
+        async fn send(&self, _dst: Addr, cell: Vec<u8>) -> io::Result<()> {
+            self.0
+                .try_send(cell)
+                .map_err(|e| io::Error::new(io::ErrorKind::WouldBlock, e.to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn default_batch_allows_a_bounded_local_receiver_to_drain_in_order() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let receive = tokio::spawn(async move {
+            let mut cells = Vec::new();
+            while let Some(cell) = rx.recv().await {
+                cells.push(cell);
+            }
+            cells
+        });
+        let expected: Vec<Vec<u8>> = (0..32).map(|i| vec![i; 17]).collect();
+        let mut pending = expected.clone().into();
+        let sender = ReadyQueueSender(tx);
+        sender.send_many(addr(2), &mut pending).await.unwrap();
+        assert!(pending.is_empty());
+        drop(sender);
+        assert_eq!(receive.await.unwrap(), expected);
+    }
 
     struct NoSender;
 
