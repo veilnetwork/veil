@@ -1845,6 +1845,135 @@ async fn short_data_tail_retries_bound_alternates_after_full_first_hops() {
 }
 
 #[tokio::test]
+async fn single_data_request_uses_the_same_bound_queue_recovery_as_a_burst() {
+    for all_full in [false, true] {
+        for direct in [false, true] {
+            let mut f = fixture().await;
+            let destination = Addr {
+                node: [0xb9; 32],
+                app: [0xbc; 32],
+            };
+            let primary = protected_route(&f.circuit, f.cells.me);
+            let (wrong, _, mut wrong_outbox) = add_circuit(&f.cells.services);
+            let (full, _, _full_outbox) = add_circuit(&f.cells.services);
+            let (good, _, mut good_outbox) = add_circuit(&f.cells.services);
+            let good = protected_route(&good, f.cells.me);
+            while wrong_outbox.try_recv().is_ok() {}
+            while good_outbox.try_recv().is_ok() {}
+            let mut wrong = entry(&protected_route(&wrong, f.cells.me), &[]);
+            wrong.receiver_x25519_pk[0] ^= 1;
+            f.cells.outbound_circuits.lock().await.insert(
+                destination.node,
+                vec![
+                    entry(&primary, &[71]),
+                    wrong,
+                    entry(&protected_route(&full, f.cells.me), &[]),
+                    entry(&good, &[]),
+                ],
+            );
+            f.cells
+                .stream_routes
+                .lock()
+                .await
+                .insert((destination.node, 71, RouteClass::Bulk), primary.clone());
+            f.cells.stripe_routes = 1;
+            fill_ordinary_outbox(&f.cells, &f.circuit);
+            fill_ordinary_outbox(&f.cells, &full);
+            if all_full {
+                fill_ordinary_outbox(&f.cells, &good.circuit);
+            }
+            let mut encoded = Vec::new();
+            Frame::Data {
+                stream_id: 71,
+                seq: 101,
+                win: 8192,
+                payload: &[0x39; 48],
+            }
+            .encode_into(&mut encoded);
+            let mut pending = std::collections::VecDeque::from([encoded.clone()]);
+            let result = if direct {
+                f.cells.send(destination, encoded.clone()).await
+            } else {
+                f.cells.send_many(destination, &mut pending).await
+            };
+            let mut accepted = 0;
+            if !all_full {
+                while let Ok((lane, bytes)) = good_outbox.try_recv() {
+                    assert_eq!(lane, veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE);
+                    let header =
+                        veil_proto::codec::decode_header(&bytes[..veil_proto::HEADER_SIZE])
+                            .unwrap();
+                    assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+                    accepted += 1;
+                }
+            }
+            let wrong_received = wrong_outbox.try_recv().is_ok();
+            let primary_sent = primary.stats.as_ref().unwrap().snapshot().data_cells;
+            let good_sent = good.stats.as_ref().unwrap().snapshot().data_cells;
+            let cooled = !f.cells.route_cooldowns.lock().unwrap().is_empty();
+            let pinned = f
+                .cells
+                .stream_routes
+                .lock()
+                .await
+                .get(&(destination.node, 71, RouteClass::Bulk))
+                .cloned()
+                .unwrap();
+            f.runtime.stop().await.unwrap();
+            assert!(!wrong_received, "single DATA changed the receiver key");
+            assert!(!cooled, "local queue pressure quarantined a route");
+            assert!(Arc::ptr_eq(&pinned.circuit, &primary.circuit));
+            assert_eq!(primary_sent, 0);
+            if all_full {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+                assert_eq!(pending, std::collections::VecDeque::from([encoded]));
+                assert_eq!(good_sent, 0);
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "single request ignored a usable path: {result:?}"
+                );
+                if !direct {
+                    assert!(pending.is_empty());
+                }
+                assert_eq!(accepted, 1, "request was lost or duplicated");
+                assert_eq!(good_sent, 1);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn oversized_single_data_remains_invalid_input_without_path_cooldown() {
+    let mut f = fixture().await;
+    let destination = Addr {
+        node: [0xb9; 32],
+        app: [0xbc; 32],
+    };
+    let primary = protected_route(&f.circuit, f.cells.me);
+    f.cells
+        .stream_routes
+        .lock()
+        .await
+        .insert((destination.node, 71, RouteClass::Bulk), primary.clone());
+    let mut encoded = Vec::new();
+    Frame::Data {
+        stream_id: 71,
+        seq: 101,
+        win: 8192,
+        payload: &vec![0x39; circuit_env_max()],
+    }
+    .encode_into(&mut encoded);
+    let error = f.cells.send(destination, encoded).await.unwrap_err();
+    let sent = primary.stats.as_ref().unwrap().snapshot().data_cells;
+    let cooled = !f.cells.route_cooldowns.lock().unwrap().is_empty();
+    f.runtime.stop().await.unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(sent, 0);
+    assert!(!cooled);
+}
+
+#[tokio::test]
 async fn ack_redundancy_tries_a_healthy_third_path_after_shared_first_hop_queue_full() {
     let mut observed = Vec::new();
     for all_full in [false, true] {

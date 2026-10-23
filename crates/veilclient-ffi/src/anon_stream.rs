@@ -1416,7 +1416,7 @@ impl CellSender for CircuitCells {
                 }
             }
             match run_stream_id {
-                Some(stream_id) if run_len > 1 => {
+                Some(stream_id) => {
                     self.send_data_run(dst, stream_id, run_len, cells).await?;
                 }
                 _ => {
@@ -1431,11 +1431,20 @@ impl CellSender for CircuitCells {
 
     async fn send(&self, dst: Addr, cell: Vec<u8>) -> io::Result<()> {
         let decoded = Frame::decode(&cell);
+        if let Some(Frame::Data { stream_id, .. }) = decoded {
+            // Small requests need the same alternate-path admission as a
+            // larger run. A full pinned queue must not strand a single DATA
+            // while another already-open, receiver-bound path is available.
+            return self
+                .send_data_run(
+                    dst,
+                    stream_id,
+                    1,
+                    &mut std::collections::VecDeque::from([cell]),
+                )
+                .await;
+        }
         let stream_id = decoded.as_ref().map(|frame| frame.stream_id());
-        let data_payload_len = match decoded.as_ref() {
-            Some(Frame::Data { payload, .. }) => payload.len(),
-            _ => 0,
-        };
         // Keep SYN/SYN_ACK on the bulk route: in the file-download pattern the
         // responder sends the payload after SYN_ACK, so treating SYN_ACK as
         // control-only can accidentally shrink the sender's DATA pool to 1 route.
@@ -1457,7 +1466,6 @@ impl CellSender for CircuitCells {
             _ => None,
         };
         let is_handshake = handshake_stream_id.is_some();
-        let is_data = matches!(decoded, Some(Frame::Data { .. }));
         let Some(route) = self
             .circuit_for(dst.node, stream_id, route_class, is_handshake)
             .await?
@@ -1496,16 +1504,13 @@ impl CellSender for CircuitCells {
             )));
         }
         let env = self.stream_envelope(&route, &cell, is_handshake)?;
-        if is_data {
-            self.data_pacer.wait(dst.node).await;
-        }
         let accepted_ack_copies = if ack_copies > 0 {
             self.send_ack_copies(dst.node, Some(&route), &cell, ack_copies)
                 .await
         } else {
             0
         };
-        if let Err(e) = self.send_stream_envelope(&route.circuit, &env, is_data) {
+        if let Err(e) = self.send_stream_envelope(&route.circuit, &env, false) {
             let error = self.stream_enqueue_error(dst.node, &route, e).await;
             if accepted_ack_copies > 0 {
                 return Ok(());
@@ -1513,7 +1518,7 @@ impl CellSender for CircuitCells {
             return Err(error);
         }
         if let Some(stats) = route.stats.as_ref()
-            && let Some(snapshot) = stats.record_send(is_data, data_payload_len)
+            && let Some(snapshot) = stats.record_send(false, 0)
             && let Some(relay) = route.rendezvous_node
         {
             diag_node(
@@ -1529,13 +1534,6 @@ impl CellSender for CircuitCells {
         mark_circuit_activity(&self.activity);
         if !is_handshake {
             self.mark_outbound_non_handshake(dst.node, &route).await;
-        }
-        if is_data
-            && route_class == RouteClass::Bulk
-            && let Some(stream_id) = stream_id
-        {
-            self.maybe_shed_slow_bulk_route(dst.node, stream_id, &route)
-                .await;
         }
         Ok(())
     }
@@ -2272,11 +2270,14 @@ impl CircuitCells {
             }
             env.extend_from_slice(cell);
             if env.len() > circuit_env_max() {
-                return Err(io::Error::other(format!(
-                    "circuit stream envelope too large: {} > {}",
-                    env.len(),
-                    circuit_env_max()
-                )));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "circuit stream envelope too large: {} > {}",
+                        env.len(),
+                        circuit_env_max()
+                    ),
+                ));
             }
             if let Err(e) = self.send_stream_envelope(&route.circuit, &env, true) {
                 return Ok((sent, Some(e)));
