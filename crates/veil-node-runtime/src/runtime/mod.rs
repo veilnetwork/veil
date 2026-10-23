@@ -4021,6 +4021,8 @@ mod onion_epoch_tests {
 }
 
 #[cfg(test)]
+mod circuit_admission_tests;
+#[cfg(test)]
 mod tests;
 
 /// Stable, non-resolvable cleartext receiver-id for a CIRCUIT-BACKED introduce
@@ -4231,7 +4233,12 @@ impl DataCircuit {
     fn alloc_seq(&self) -> Option<u32> {
         let prev = self
             .next_seq
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |seq| seq.checked_add(1),
+            )
+            .ok()?;
         prev.checked_add(1)
     }
 }
