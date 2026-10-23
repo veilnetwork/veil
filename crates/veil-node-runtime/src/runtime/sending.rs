@@ -680,7 +680,7 @@ impl NodeServices {
             &self.logger,
             receiver_node_id,
             AD_RESOLVE_TIMEOUT,
-            false,
+            rendezvous_resolver::ResolveMode::Any,
         )
         .await;
         // Pick the most-recently-PUBLISHED ad (highest valid_from_unix, set to

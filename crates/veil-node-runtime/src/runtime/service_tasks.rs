@@ -1661,7 +1661,7 @@ impl NodeRuntime {
                         &logger,
                         receiver_id,
                         AD_RESOLVE_TIMEOUT,
-                        true, // force: bypass fast-paths, don't re-mark activity
+                        super::rendezvous_resolver::ResolveMode::RefreshAhead,
                     )
                     .await;
                     logger.debug(

@@ -57,6 +57,70 @@ async fn fixture() -> Fixture {
     }
 }
 
+#[tokio::test]
+async fn stream_lookup_does_not_wait_for_a_mailbox_only_cache_to_expire() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use veil_anonymity::rendezvous::{rendezvous_ad_dht_key_at, sign_rendezvous_ad_v5};
+    let mut f = fixture().await;
+    let services = f.runtime.access();
+    let key = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
+    let receiver = *blake3::hash(&STANDARD.decode(&key.public_key).unwrap()).as_bytes();
+    let mailbox_cookie = veil_node_runtime::NodeServices::mailbox_rendezvous_cookie(&receiver);
+    let stream_cookie = [0x52; COOKIE_LEN];
+    assert_ne!(stream_cookie, mailbox_cookie);
+    let now = veil_util::unix_secs_now_u64();
+    let ad = |cookie| {
+        sign_rendezvous_ad_v5(
+            receiver,
+            [0x71; 32],
+            cookie,
+            [0x33; 32],
+            now,
+            now + 3600,
+            &[],
+            &[],
+            &[],
+            0,
+            &[],
+            &key.public_key,
+            &key.private_key,
+            veil_types::SignatureAlgorithm::Ed25519,
+        )
+        .unwrap()
+    };
+    services
+        .dht
+        .store_local(rendezvous_ad_dht_key_at(&receiver, 0), ad(mailbox_cookie));
+    let first = services
+        .resolve_stream_rendezvous_ads(receiver)
+        .await
+        .unwrap();
+    assert!(first.iter().all(|ad| ad.auth_cookie == mailbox_cookie));
+    let cached_at = Instant::now();
+    // The stream registration appears AFTER an earlier lookup cached only
+    // mailbox ads. Its independently signed slot is already available to the
+    // resolver; a 15-second general positive-cache hit must not hide it.
+    services
+        .dht
+        .store_local(rendezvous_ad_dht_key_at(&receiver, 1), ad(stream_cookie));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let second = services
+        .resolve_stream_rendezvous_ads(receiver)
+        .await
+        .unwrap();
+    let found = second.iter().any(|ad| ad.auth_cookie == stream_cookie);
+    let elapsed = cached_at.elapsed();
+    f.runtime.stop().await.unwrap();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "test did not stay inside the ordinary cache TTL"
+    );
+    assert!(
+        found,
+        "mailbox-only positive cache hid an available, signed stream ad"
+    );
+}
+
 fn add_circuit(
     services: &veil_node_runtime::NodeServices,
 ) -> (

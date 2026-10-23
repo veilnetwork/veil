@@ -34,6 +34,44 @@ use super::service_tasks::{
 #[path = "rendezvous_resolver_cold_document_tests.rs"]
 mod cold_document_tests;
 
+/// Cache reuse depends on what the caller can actually send through. Mailbox
+/// ads alone are a short miss for a stream, not a usable 15-second route hit.
+#[derive(Clone, Copy)]
+pub(super) enum ResolveMode {
+    Any,
+    Stream {
+        mailbox_cookie: [u8; 16],
+        identity_mailbox_cookie: Option<[u8; 16]>,
+    },
+    RefreshAhead,
+}
+
+impl ResolveMode {
+    fn cached_ads(
+        self,
+        cache: &super::anonymity_state::RendezvousResolveCache,
+        receiver: &[u8; 32],
+        now: u64,
+    ) -> Option<Vec<veil_anonymity::rendezvous::RendezvousAd>> {
+        match self {
+            Self::Any => cache.get(receiver, now),
+            Self::RefreshAhead => None,
+            Self::Stream {
+                mailbox_cookie,
+                identity_mailbox_cookie,
+            } => cache.get_satisfying(
+                receiver,
+                now,
+                |ad| {
+                    ad.auth_cookie != mailbox_cookie
+                        && Some(ad.auth_cookie) != identity_mailbox_cookie
+                },
+                std::time::Duration::from_secs(1),
+            ),
+        }
+    }
+}
+
 // ── T1.4 P5c: rendezvous-replica resolver ──────────────────────
 //
 // Replica-aware lookup for the receiver's RendezvousAd. Apps call
@@ -130,11 +168,9 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
     logger: &Arc<veil_observability::NodeLogger>,
     receiver_id: [u8; 32],
     timeout: std::time::Duration,
-    // `true` for the background refresh-ahead task: bypass the cache
-    // fast-paths (the entry is still TTL-fresh — that's WHY it can be
-    // re-walked before a send hits an expired one) and don't mark the
-    // receiver as send-active (the refresher must not keep itself alive).
-    force_refresh: bool,
+    // RefreshAhead bypasses cache fast-paths and does not mark the receiver
+    // send-active: the background refresher must not keep itself alive.
+    mode: ResolveMode,
 ) -> Vec<veil_anonymity::rendezvous::RendezvousAd> {
     use super::rendezvous_ad_binding::ad_binding_ok;
     use veil_anonymity::rendezvous::{
@@ -145,6 +181,7 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let force_refresh = matches!(mode, ResolveMode::RefreshAhead);
     if !force_refresh {
         // Feed the refresh-ahead task: this receiver is being actively sent
         // to, keep its route warm for the activity window.
@@ -163,14 +200,14 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
         // mailbox drain's cold path depends on it. It just does not buy a
         // standing subscription to re-walk forever.
         note_send_target(resolve_cache, receiver_id, local_node_id);
-        if let Some(ads) = resolve_cache.get(&receiver_id, now) {
+        if let Some(ads) = mode.cached_ads(resolve_cache, &receiver_id, now) {
             return ads;
         }
     }
     let _refresh_guard = resolve_cache.lock_refresh(receiver_id).await;
     // Another send may have completed the refresh while this one waited for
     // the per-recipient single-flight lock.
-    if !force_refresh && let Some(ads) = resolve_cache.get(&receiver_id, now) {
+    if let Some(ads) = mode.cached_ads(resolve_cache, &receiver_id, now) {
         return ads;
     }
 
@@ -852,7 +889,7 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
                 &self.logger,
                 receiver_id,
                 std::time::Duration::from_millis(3500),
-                false,
+                ResolveMode::Any,
             )
             .await;
             // The DHT copy of a receiver's ads disappears as soon as it stops
