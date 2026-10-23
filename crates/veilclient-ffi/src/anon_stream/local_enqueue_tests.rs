@@ -1343,6 +1343,189 @@ async fn racing_same_class_selections_pin_and_account_for_one_route() {
 }
 
 #[tokio::test]
+async fn stale_session_eviction_preserves_a_ready_same_rendezvous_replacement() {
+    let mut f = fixture().await;
+    let destination = Addr {
+        node: [0xb9; 32],
+        app: [0xbc; 32],
+    };
+    let mut old = protected_route(&f.circuit, f.cells.me);
+    // The fixture keeps a real live outbox. Only the retained handle's
+    // generation differs, exactly the stale-handle guard used after reconnect.
+    old.first_hop_close_generation = f
+        .cells
+        .services
+        .session_close_generation(&f.hop)
+        .wrapping_add(1);
+    assert!(f.cells.route_session_stale(&old));
+    assert!(f.cells.services.has_live_session(&f.hop));
+    let (fresh, _rx) = f
+        .cells
+        .services
+        .open_data_circuit(&[f.hop], b"replacement")
+        .unwrap();
+    let fresh = Arc::new(fresh);
+    fresh.confirmed_flag().store(true, Ordering::Release);
+    let ready = protected_route(&fresh, f.cells.me);
+    f.cells
+        .outbound_circuits
+        .lock()
+        .await
+        .insert(destination.node, vec![entry(&ready, &[72])]);
+    f.cells
+        .remember_stream_receiver(destination.node, 71, &old)
+        .unwrap();
+    f.cells
+        .remember_stream_receiver(destination.node, 72, &ready)
+        .unwrap();
+    old.stats.as_ref().unwrap().record_stream_open();
+    ready.stats.as_ref().unwrap().record_stream_open();
+    {
+        let mut pins = f.cells.stream_routes.lock().await;
+        pins.insert((destination.node, 71, RouteClass::Bulk), old.clone());
+        pins.insert((destination.node, 72, RouteClass::Bulk), ready.clone());
+        pins.insert((destination.node, 72, RouteClass::Ack), ready.clone());
+    }
+    while f._outbox.try_recv().is_ok() {}
+    f.cells.mark_route_stale(destination.node, &old).await;
+    let replacement_kept = f
+        .cells
+        .outbound_circuits
+        .lock()
+        .await
+        .get(&destination.node)
+        .is_some_and(|entries| entries.iter().any(|e| Arc::ptr_eq(&e.circuit, &fresh)));
+    let active_pin_kept = f
+        .cells
+        .stream_routes
+        .lock()
+        .await
+        .get(&(destination.node, 72, RouteClass::Bulk))
+        .is_some_and(|r| Arc::ptr_eq(&r.circuit, &fresh));
+    let ack_pin_kept = f
+        .cells
+        .stream_routes
+        .lock()
+        .await
+        .get(&(destination.node, 72, RouteClass::Ack))
+        .is_some_and(|r| Arc::ptr_eq(&r.circuit, &fresh));
+    let relay_cooled = f.cells.route_cooldowns.lock().unwrap().contains_key(&f.hop);
+    let hop_cooled = f
+        .cells
+        .first_hop_cooldowns
+        .lock()
+        .unwrap()
+        .contains_key(&f.hop);
+    let active_before = ready.stats.as_ref().unwrap().active_streams();
+    let mut data = data_run(71, 1);
+    let sent = f.cells.send_many(destination, &mut data).await;
+    let mut accepted = 0;
+    while let Ok((lane, _)) = f._outbox.try_recv() {
+        assert_eq!(lane, veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE);
+        accepted += 1;
+    }
+    let old_active = old.stats.as_ref().unwrap().active_streams();
+    f.runtime.stop().await.unwrap();
+    assert!(
+        replacement_kept,
+        "late stale handle removed the ready replacement at the same R"
+    );
+    assert!(
+        active_pin_kept && ack_pin_kept,
+        "stale handle evicted another live stream's pins"
+    );
+    assert!(
+        !relay_cooled && !hop_cooled,
+        "reconnected live hop was quarantined by its old handle"
+    );
+    assert_eq!(
+        active_before, 1,
+        "live replacement lost its admission accounting"
+    );
+    assert_eq!(old_active, 0);
+    assert!(sent.is_ok() && data.is_empty());
+    assert_eq!(
+        accepted, 1,
+        "the retained stream must hand off on the ready replacement"
+    );
+}
+
+#[tokio::test]
+async fn stale_session_eviction_preserves_real_cooldowns_and_dead_hop_guards() {
+    for guard in ["rendezvous", "first_hop", "dead_hop"] {
+        let mut f = fixture().await;
+        let destination = Addr {
+            node: [0xb9; 32],
+            app: [0xbc; 32],
+        };
+        let mut old = protected_route(&f.circuit, f.cells.me);
+        old.first_hop_close_generation = f
+            .cells
+            .services
+            .session_close_generation(&f.hop)
+            .wrapping_add(1);
+        let (fresh, _rx) = f
+            .cells
+            .services
+            .open_data_circuit(&[f.hop], b"replacement")
+            .unwrap();
+        let ready = protected_route(&Arc::new(fresh), f.cells.me);
+        f.cells
+            .outbound_circuits
+            .lock()
+            .await
+            .insert(destination.node, vec![entry(&ready, &[])]);
+        f.cells
+            .remember_stream_receiver(destination.node, 71, &old)
+            .unwrap();
+        old.stats.as_ref().unwrap().record_stream_open();
+        f.cells
+            .stream_routes
+            .lock()
+            .await
+            .insert((destination.node, 71, RouteClass::Bulk), old.clone());
+        if guard == "rendezvous" {
+            mark_rendezvous_cooldown(&f.cells.route_cooldowns, f.hop, Duration::from_secs(120));
+        } else if guard == "first_hop" {
+            mark_first_hop_cooldown(
+                &f.cells.first_hop_cooldowns,
+                f.hop,
+                Duration::from_secs(120),
+            );
+        } else {
+            f.cells
+                .services
+                .session_tx_registry
+                .write()
+                .unwrap()
+                .unregister(&f.hop);
+        }
+        let relay_errors = f.cells.route_cooldowns.lock().unwrap().clone();
+        let hop_errors = f.cells.first_hop_cooldowns.lock().unwrap().clone();
+        while f._outbox.try_recv().is_ok() {}
+        f.cells.mark_route_stale(destination.node, &old).await;
+        let relay_after = f.cells.route_cooldowns.lock().unwrap().clone();
+        let hop_after = f.cells.first_hop_cooldowns.lock().unwrap().clone();
+        let mut data = data_run(71, 1);
+        let sent = f.cells.send_many(destination, &mut data).await;
+        let data_admitted = std::iter::from_fn(|| f._outbox.try_recv().ok())
+            .any(|(lane, _)| lane == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE);
+        f.runtime.stop().await.unwrap();
+        assert_eq!(
+            relay_after, relay_errors,
+            "real relay failures changed: {guard}"
+        );
+        assert_eq!(hop_after, hop_errors, "real hop failures changed: {guard}");
+        assert_eq!(sent.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(data.len(), 1, "an unaccepted cell was discarded: {guard}");
+        assert!(
+            !data_admitted,
+            "unavailable/cooled path accepted data: {guard}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn stale_route_eviction_does_not_rebind_a_live_stream_to_another_receiver() {
     let mut observed = Vec::new();
     for different in ["cookie", "key"] {
