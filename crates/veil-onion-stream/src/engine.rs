@@ -767,9 +767,13 @@ impl StreamEngine {
 
     fn on_synack(&mut self, isn: u32, win: u32, ack: u32, _now: u64) {
         if self.phase == Phase::SynSent {
-            if seq::geq(ack, self.tx.iss.wrapping_add(1)) {
-                self.tx.snd_una = self.tx.iss.wrapping_add(1); // our SYN acked
+            // No DATA can precede this handshake. Only an exact ACK of our
+            // SYN belongs here; a stale/malformed answer must not establish
+            // the stream or turn off its handshake recovery timer.
+            if ack != self.tx.iss.wrapping_add(1) {
+                return;
             }
+            self.tx.snd_una = self.tx.iss.wrapping_add(1); // our SYN acked
             self.tx.snd_nxt = seq::max(self.tx.snd_nxt, self.tx.snd_una);
             self.rx.rcv_nxt = isn; // SYN_ACK consumes no seq
             self.tx.rwnd = win;
@@ -2052,6 +2056,48 @@ impl RxState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synack_must_acknowledge_exactly_this_openers_syn() {
+        for iss in [100u32, u32::MAX] {
+            for invalid_ack in [iss, iss.wrapping_sub(1), iss.wrapping_add(2)] {
+                let mut engine = StreamEngine::connect(11, Config::default(), 0, iss);
+                let mut cell = Vec::new();
+                assert!(engine.poll_transmit(0, &mut cell));
+                Frame::SynAck {
+                    stream_id: 11,
+                    isn: 500,
+                    win: 8192,
+                    ack: invalid_ack,
+                }
+                .encode_into(&mut cell);
+                engine.on_cell(&cell, 10);
+                assert_eq!(
+                    engine.phase,
+                    Phase::SynSent,
+                    "an unrelated/stale SYN_ACK completed this handshake"
+                );
+                assert!(!engine.events.contains(&Event::Connected));
+                assert_eq!(engine.rx.rcv_nxt, 0);
+                assert!(
+                    engine.hs_deadline.is_some(),
+                    "invalid answer disabled handshake recovery"
+                );
+                Frame::SynAck {
+                    stream_id: 11,
+                    isn: 500,
+                    win: 8192,
+                    ack: iss.wrapping_add(1),
+                }
+                .encode_into(&mut cell);
+                engine.on_cell(&cell, 20);
+                assert_eq!(engine.phase, Phase::Established);
+                assert_eq!(engine.tx.snd_una, iss.wrapping_add(1));
+                assert_eq!(engine.rx.rcv_nxt, 500);
+                assert!(engine.events.contains(&Event::Connected));
+            }
+        }
+    }
 
     #[test]
     fn tracked_unhanded_handshake_does_not_start_network_retries() {

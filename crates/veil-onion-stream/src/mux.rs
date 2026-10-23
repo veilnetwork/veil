@@ -19,13 +19,14 @@
 //! through a channel (drained from the `AppReceiver`). Everything here is unit-
 //! tested against an in-memory bus.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use rand_core::{OsRng, RngCore};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 use crate::driver::{CellDuplex, End, OnionStream};
@@ -120,11 +121,19 @@ const ACCEPT_BACKLOG: usize = 64;
 type StreamKey = (Peer, u32);
 type Routes = Arc<Mutex<HashMap<StreamKey, mpsc::Sender<Vec<u8>>>>>;
 
-/// How many stream ids `open` tries before taking one anyway.
-///
-/// Only ever more than one after the id space has come round — see the probe
-/// in [`StreamMux::open`].
-const OPEN_ID_PROBES: u32 = 64;
+/// Share the allocation sequence across hub recreations in this process. A
+/// remote mux can retain a live stream after only our hub/transport restarts;
+/// resetting to 1 then reuses its key and routes the fresh SYN to the old app.
+/// The OS-random start also avoids deterministic reuse after a process restart.
+/// Wire ids retain the existing 31-bit counter plus direction parity, so this
+/// reduces restart collisions rather than creating an unlimited id namespace.
+static NEXT_STREAM_ID: OnceLock<Arc<AtomicU32>> = OnceLock::new();
+
+fn stream_id_allocator() -> Arc<AtomicU32> {
+    NEXT_STREAM_ID
+        .get_or_init(|| Arc::new(AtomicU32::new(OsRng.next_u32())))
+        .clone()
+}
 
 /// Per-peer final delivery models `(btl_bw B/s, rtt_min ms, recorded)` from
 /// closed streams, used to warm-start the next stream's BBR estimator (see
@@ -307,7 +316,7 @@ impl<S: CellSender> StreamMux<S> {
             cfg,
             routes,
             bw_cache,
-            next_id: Arc::new(AtomicU32::new(1)),
+            next_id: stream_id_allocator(),
             accept_rx: AsyncMutex::new(accept_rx),
         }
     }
@@ -322,29 +331,20 @@ impl<S: CellSender> StreamMux<S> {
         // Take a key nothing is routed on. `(n << 1) | parity` from a `u32`
         // repeats after 2^31 opens, and inserting on top of a live route
         // silently steals that stream's inbound cells (report9 V-20).
-        //
-        // The accept side already checks before it inserts; only this side
-        // replaced. A probe costs one map lookup and only ever runs twice
-        // after the id space has come round.
-        let mut sid = 0;
-        let mut key = (peer.node, sid);
-        {
+        // Never displace an existing route, including when more than the old
+        // 64-probe budget is occupied after counter wrap.
+        let (sid, key) = {
             let mut routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
-            for _ in 0..OPEN_ID_PROBES {
+            loop {
                 let n = self.next_id.fetch_add(1, Ordering::Relaxed);
-                sid = (n << 1) | parity;
-                key = (peer.node, sid);
-                if !routes.contains_key(&key) {
-                    break;
+                let sid = (n << 1) | parity;
+                let key = (peer.node, sid);
+                if let Entry::Vacant(entry) = routes.entry(key) {
+                    entry.insert(tx.clone());
+                    break (sid, key);
                 }
             }
-            // Every probed key is live for this peer, which needs that many
-            // concurrent streams to one peer in exactly this stretch of the id
-            // space. The last candidate is taken anyway: `open` has no way to
-            // refuse, and the drop guard above at least keeps the displaced
-            // stream from tearing down this one on its way out.
-            routes.insert(key, tx.clone());
-        }
+        };
         let duplex = MuxDuplex {
             sender: self.sender.clone(),
             peer,
@@ -471,6 +471,40 @@ mod tests {
         async fn send(&self, _dst: Addr, _cell: Vec<u8>) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn open_skips_all_live_ids_instead_of_stealing_the_last_probe() {
+        let (_tx, rx) = mpsc::channel(1);
+        let mut mux = StreamMux::new(addr(1).node, Arc::new(NoSender), rx, Config::default());
+        // An isolated allocator exercises occupied keys across u32 wrap, not
+        // the production process-wide counter used by concurrently run tests.
+        let start = u32::MAX - 32;
+        mux.next_id = Arc::new(AtomicU32::new(start));
+        let peer = addr(2);
+        let mut live = Vec::new();
+        for offset in 0..65 {
+            let sid = start.wrapping_add(offset) << 1;
+            let (tx, rx) = mpsc::channel(STREAM_INBOX);
+            mux.routes
+                .lock()
+                .unwrap()
+                .insert((peer.node, sid), tx.clone());
+            live.push((sid, tx, rx));
+        }
+        let stream = mux.open(peer);
+        {
+            let routes = mux.routes.lock().unwrap();
+            assert_eq!(
+                routes.len(),
+                live.len() + 1,
+                "open displaced a live route after exhausting its probe budget"
+            );
+            for (sid, tx, _rx) in &live {
+                assert!(routes.get(&(peer.node, *sid)).unwrap().same_channel(tx));
+            }
+        }
+        stream.reset(crate::wire::reset_reason::APP).await;
     }
 
     /// A duplex that has ended must not take down the route of the stream that

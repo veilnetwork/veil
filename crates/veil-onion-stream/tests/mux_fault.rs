@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -230,6 +231,156 @@ async fn read_exact(stream: &mut OnionStream, n: usize) -> io::Result<Vec<u8>> {
         out.extend_from_slice(&buf[..got]);
     }
     Ok(out)
+}
+
+/// A dead source generation cannot send FIN/RST or continue replying after the
+/// endpoint is rebound. This models an abrupt hub/process loss, not a graceful
+/// stream close that would remove the receiver's old route before the retry.
+struct EpochSender {
+    inner: BusSender,
+    alive: Arc<AtomicBool>,
+    syns: Arc<Mutex<Vec<u32>>>,
+}
+
+impl CellSender for EpochSender {
+    async fn send(&self, dst: Addr, cell: Vec<u8>) -> io::Result<()> {
+        if !self.alive.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(Frame::Syn { stream_id, .. }) = Frame::decode(&cell) {
+            self.syns.lock().unwrap().push(stream_id);
+        }
+        self.inner.send(dst, cell).await
+    }
+}
+
+async fn restart_one_hub_with_live_remote_stream(a: Addr, b: Addr) {
+    let bus = Bus::new(a.node, b.node);
+    let (a_tx, a_rx) = mpsc::channel(4096);
+    let (b_tx, b_rx) = mpsc::channel(4096);
+    bus.register(a.node, a_tx);
+    bus.register(b.node, b_tx);
+    let old_alive = Arc::new(AtomicBool::new(true));
+    let syns = Arc::new(Mutex::new(Vec::new()));
+    let mux_a = StreamMux::new(
+        a.node,
+        Arc::new(EpochSender {
+            inner: BusSender {
+                bus: bus.clone(),
+                me: a,
+            },
+            alive: old_alive.clone(),
+            syns: syns.clone(),
+        }),
+        a_rx,
+        fast_cfg(),
+    );
+    let mux_b = StreamMux::new(
+        b.node,
+        Arc::new(BusSender {
+            bus: bus.clone(),
+            me: b,
+        }),
+        b_rx,
+        fast_cfg(),
+    );
+    let mut old_source = mux_a.open(b);
+    old_source.write_all(b"old-request").await.unwrap();
+    let (mut old_receiver, _) = tokio::time::timeout(Duration::from_secs(1), mux_b.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        read_exact(&mut old_receiver, 11).await.unwrap(),
+        b"old-request"
+    );
+    old_receiver.write_all(b"old-response").await.unwrap();
+    assert_eq!(
+        read_exact(&mut old_source, 12).await.unwrap(),
+        b"old-response"
+    );
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        syns.lock().unwrap().len(),
+        1,
+        "first handshake must be healthy"
+    );
+
+    old_alive.store(false, Ordering::Release);
+    drop(old_source);
+    drop(mux_a);
+    let (new_tx, new_rx) = mpsc::channel(4096);
+    bus.register(a.node, new_tx);
+    let new_mux = StreamMux::new(
+        a.node,
+        Arc::new(EpochSender {
+            inner: BusSender {
+                bus: bus.clone(),
+                me: a,
+            },
+            alive: Arc::new(AtomicBool::new(true)),
+            syns: syns.clone(),
+        }),
+        new_rx,
+        fast_cfg(),
+    );
+    let mut fresh = new_mux.open(b);
+    fresh.write_all(b"fresh-request").await.unwrap();
+    let accepted = tokio::time::timeout(Duration::from_millis(250), mux_b.accept()).await;
+    {
+        let sent = syns.lock().unwrap();
+        assert!(
+            sent.len() >= 2,
+            "fresh SYN must actually reach the transport"
+        );
+    }
+    let (mut fresh_receiver, _) = accepted
+        .expect("restarted source attached its SYN to the still-live old remote stream")
+        .unwrap();
+    {
+        let sent = syns.lock().unwrap();
+        assert_ne!(sent[0], sent[1]);
+    }
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), read_exact(&mut fresh_receiver, 13))
+            .await
+            .unwrap()
+            .unwrap(),
+        b"fresh-request"
+    );
+    fresh_receiver.write_all(b"fresh-response").await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), read_exact(&mut fresh, 14))
+            .await
+            .unwrap()
+            .unwrap(),
+        b"fresh-response"
+    );
+    assert_eq!(
+        old_receiver.end_reason(),
+        veil_onion_stream::End::Open,
+        "test accidentally retired the old remote stream before retry"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), old_receiver.read(&mut [0; 1]))
+            .await
+            .is_err(),
+        "new request leaked into the old application stream"
+    );
+    fresh.reset(reset_reason::APP).await;
+    old_receiver.reset(reset_reason::APP).await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn restarted_lower_node_opens_fresh_stream_without_waiting_for_remote_cleanup() {
+    restart_one_hub_with_live_remote_stream(addr(1), addr(2)).await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn restarted_higher_node_opens_fresh_stream_without_waiting_for_remote_cleanup() {
+    restart_one_hub_with_live_remote_stream(addr(2), addr(1)).await;
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
