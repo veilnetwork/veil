@@ -836,6 +836,8 @@ struct CircuitCells {
     stream_routes: Arc<tokio::sync::Mutex<HashMap<StreamRouteKey, CircuitRoute>>>,
     stream_receivers: SharedStreamReceivers,
     next_outbound_route: NextOutboundRoute,
+    /// Sampled local route-admission diagnostics, only while RT tracing is on.
+    selection_misses: Arc<AtomicU64>,
     route_cooldowns: RouteCooldowns,
     first_hop_cooldowns: FirstHopCooldowns,
     /// Per-destination anti-flap mark for throughput shedding: a crawling
@@ -1558,7 +1560,7 @@ impl CellSender for CircuitCells {
                 "outbound handshake timeout stream={stream_id} retries={retries} remapped={remapped}; keeping shared circuit pool",
             ),
         );
-        self.ensure_outbound_opening(dst.node, RouteClass::Bulk)
+        self.ensure_outbound_opening_for(dst.node, RouteClass::Bulk, "handshake_rto")
             .await;
     }
 
@@ -1676,6 +1678,7 @@ impl CircuitCells {
             stream_routes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             stream_receivers: Arc::new(Mutex::new(HashMap::new())),
             next_outbound_route: Arc::new(Mutex::new(HashMap::new())),
+            selection_misses: Arc::new(AtomicU64::new(0)),
             outbound_opening: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             outbound_retry_after: Arc::new(Mutex::new(HashMap::new())),
             outbound_expand_after: Arc::new(Mutex::new(HashMap::new())),
@@ -2499,7 +2502,8 @@ impl CircuitCells {
                     // active-stream admission limit. The caller retains this
                     // SYN/DATA cell for local retry while a background refill
                     // tries to restore a wider route pool.
-                    self.ensure_outbound_opening(dst_node, route_class).await;
+                    self.ensure_outbound_opening_for(dst_node, route_class, "route_unavailable")
+                        .await;
                 }
                 if let (Some(stream_id), Some(route)) = (stream_id, route.clone()) {
                     let mut routes = self.stream_routes.lock().await;
@@ -2642,7 +2646,12 @@ impl CircuitCells {
                                 &self.services,
                                 idle.into_iter().map(|entry| entry.circuit).collect(),
                             );
-                            self.ensure_outbound_opening(dst_node, route_class).await;
+                            self.ensure_outbound_opening_for(
+                                dst_node,
+                                route_class,
+                                "pool_cold_or_quiet",
+                            )
+                            .await;
                             if let Some(route) = route {
                                 return Ok(Some(route));
                             }
@@ -2714,7 +2723,8 @@ impl CircuitCells {
                 .await;
         }
 
-        self.ensure_outbound_opening(dst_node, route_class).await;
+        self.ensure_outbound_opening_for(dst_node, route_class, "pool_cold_or_quiet")
+            .await;
         Ok(None)
     }
 
@@ -2762,6 +2772,10 @@ impl CircuitCells {
             cooldowns.clone()
         };
         let binding = self.stream_receiver(dst_node, stream_id);
+        let compatible = entries
+            .iter()
+            .filter(|entry| binding.is_none_or(|binding| binding.matches_entry(entry)))
+            .count();
         let usable_indices = (0..entries.len())
             .filter(|idx| {
                 binding.is_none_or(|binding| binding.matches_entry(&entries[*idx]))
@@ -2782,6 +2796,18 @@ impl CircuitCells {
             .take(route_count)
             .collect::<Vec<_>>();
         if usable_indices.is_empty() {
+            self.note_route_selection_miss(
+                dst_node,
+                route_class,
+                if compatible == 0 {
+                    "receiver_binding"
+                } else {
+                    "route_health"
+                },
+                entries.len(),
+                compatible,
+                0,
+            );
             return None;
         }
         let candidate_indices =
@@ -2794,6 +2820,14 @@ impl CircuitCells {
                     })
                     .collect::<Vec<_>>();
                 if under_limit.is_empty() {
+                    self.note_route_selection_miss(
+                        dst_node,
+                        route_class,
+                        "active_limit",
+                        entries.len(),
+                        compatible,
+                        usable_indices.len(),
+                    );
                     return None;
                 }
                 under_limit
@@ -2825,6 +2859,31 @@ impl CircuitCells {
             entry.note_handshake_stream(stream_id);
         }
         Some(entry.route())
+    }
+
+    fn note_route_selection_miss(
+        &self,
+        dst_node: [u8; 32],
+        route_class: RouteClass,
+        reason: &'static str,
+        pool: usize,
+        compatible: usize,
+        usable: usize,
+    ) {
+        if !veil_session::rt_trace::rt_trace_enabled() {
+            return;
+        }
+        let misses = self.selection_misses.fetch_add(1, Ordering::Relaxed) + 1;
+        if misses.is_power_of_two() || misses.is_multiple_of(1000) {
+            diag_node(
+                &self.me,
+                &format!(
+                    "route selection blocked for {} class={route_class:?} reason={reason} pool={pool} compatible={compatible} usable={usable} active_limit={} misses={misses}",
+                    short_node(&dst_node),
+                    self.bulk_route_active_limit,
+                ),
+            );
+        }
     }
 
     fn route_session_stale(&self, route: &CircuitRoute) -> bool {
@@ -2893,7 +2952,7 @@ impl CircuitCells {
                 CIRCUIT_ROUTE_SEND_COOLDOWN.as_secs(),
             ),
         );
-        self.ensure_outbound_opening(dst_node, RouteClass::Bulk)
+        self.ensure_outbound_opening_for(dst_node, RouteClass::Bulk, "stale_session")
             .await;
     }
 
@@ -3032,7 +3091,7 @@ impl CircuitCells {
                     remapped,
                 ),
             );
-            self.ensure_outbound_opening(dst_node, RouteClass::Bulk)
+            self.ensure_outbound_opening_for(dst_node, RouteClass::Bulk, "data_no_progress")
                 .await;
             return;
         }
@@ -3189,7 +3248,7 @@ impl CircuitCells {
             )
         };
         diag_node(&self.me, &message);
-        self.ensure_outbound_opening(dst_node, RouteClass::Bulk)
+        self.ensure_outbound_opening_for(dst_node, RouteClass::Bulk, "data_no_progress")
             .await;
     }
 
@@ -3415,7 +3474,7 @@ impl CircuitCells {
                 CIRCUIT_ROUTE_SEND_COOLDOWN.as_secs(),
             ),
         );
-        self.ensure_outbound_opening(dst_node, RouteClass::Bulk)
+        self.ensure_outbound_opening_for(dst_node, RouteClass::Bulk, "send_failure")
             .await;
     }
 
@@ -3439,17 +3498,32 @@ impl CircuitCells {
         if self.mode != CircuitMode::PublishedRendezvous {
             return;
         }
-        self.schedule_outbound_opening(dst_node, RouteClass::Bulk, PoolOpenIntent::Warm)
+        self.schedule_outbound_opening(dst_node, RouteClass::Bulk, PoolOpenIntent::Warm, "warm")
             .await;
     }
 
     async fn ensure_outbound_expansion(&self, dst_node: [u8; 32]) {
-        self.schedule_outbound_opening(dst_node, RouteClass::Bulk, PoolOpenIntent::Expand)
-            .await;
+        self.schedule_outbound_opening(
+            dst_node,
+            RouteClass::Bulk,
+            PoolOpenIntent::Expand,
+            "expand",
+        )
+        .await;
     }
 
     async fn ensure_outbound_opening(&self, dst_node: [u8; 32], route_class: RouteClass) {
-        self.schedule_outbound_opening(dst_node, route_class, PoolOpenIntent::Refresh)
+        self.ensure_outbound_opening_for(dst_node, route_class, "explicit")
+            .await;
+    }
+
+    async fn ensure_outbound_opening_for(
+        &self,
+        dst_node: [u8; 32],
+        route_class: RouteClass,
+        cause: &'static str,
+    ) {
+        self.schedule_outbound_opening(dst_node, route_class, PoolOpenIntent::Refresh, cause)
             .await;
     }
 
@@ -3458,6 +3532,7 @@ impl CircuitCells {
         dst_node: [u8; 32],
         route_class: RouteClass,
         intent: PoolOpenIntent,
+        cause: &'static str,
     ) {
         let now = Instant::now();
         let required_intent = {
@@ -3500,6 +3575,15 @@ impl CircuitCells {
             required_intent
         };
 
+        if intent == PoolOpenIntent::Refresh && veil_session::rt_trace::rt_trace_enabled() {
+            diag_node(
+                &self.me,
+                &format!(
+                    "outbound refresh admitted for {} cause={cause}",
+                    short_node(&dst_node),
+                ),
+            );
+        }
         let services = self.services.clone();
         let me = self.me;
         let reg_kp = Arc::clone(&self.reg_kp);
@@ -3613,7 +3697,8 @@ impl CircuitCells {
         // here parks the stream driver, including receive/reset handling, for
         // whole relay-confirmation windows. The caller retains its SYN and
         // retries local WouldBlock while the first confirmed route warms.
-        self.ensure_outbound_opening(dst_node, route_class).await;
+        self.ensure_outbound_opening_for(dst_node, route_class, "handshake_cold")
+            .await;
         Ok(self.outbound_circuits.try_lock().ok().and_then(|pool| {
             pool.get(&dst_node)
                 .and_then(|entries| entries.first())
@@ -4516,6 +4601,7 @@ fn try_open_circuit(
         stream_routes,
         stream_receivers,
         next_outbound_route,
+        selection_misses: Arc::new(AtomicU64::new(0)),
         route_cooldowns,
         first_hop_cooldowns,
         bulk_shed_marks: Arc::new(Mutex::new(HashMap::new())),
