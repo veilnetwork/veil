@@ -24,7 +24,7 @@ const BBR_RATE_WINDOW_MS: u64 = 2_000;
 /// Minimum spacing between delivery checkpoints.
 const BBR_SAMPLE_SPACING_MS: u64 = 20;
 /// Minimum sample span, and the strict byte floor for app-limited observations.
-/// Backlogged low-rate probes scale the byte floor to the current model/MSS.
+/// Thin samples need a fully backlogged window and at least one segment.
 const BBR_MIN_SPAN_MS: u64 = 300;
 const BBR_MIN_DELIVERED: u64 = 64 * 1024;
 /// The bottleneck-rate estimate is the MAX of qualifying samples over this
@@ -328,10 +328,13 @@ struct TxState {
     fin_sent: bool,
     fin_acked: bool,
     // ---- BBR-lite delivery model (maintained only when cfg.bbr) ----
-    /// Total bytes acknowledged by cumulative ACK advance.
+    /// Data bytes credited once by cumulative ACK or first SACK receipt.
     delivered: u64,
     /// Delivery checkpoints (t_ms, delivered) spanning the rate window.
     rate_samples: VecDeque<(u64, u64)>,
+    /// Most recent application-limited delivery observation. Thin samples
+    /// spanning that observation cannot replace the model after a quiet gap.
+    bbr_last_app_limited_ms: Option<u64>,
     /// Qualifying rate samples (t_ms, bytes/sec); the estimate is their max
     /// over [`BBR_BW_WINDOW_MS`] (see the constants for why max, not decay).
     bw_samples: VecDeque<(u64, u64)>,
@@ -508,6 +511,7 @@ impl StreamEngine {
                 fin_acked: false,
                 delivered: 0,
                 rate_samples: VecDeque::new(),
+                bbr_last_app_limited_ms: None,
                 bw_samples: if warm {
                     VecDeque::from([(0, cfg.warm_btl_bw)])
                 } else {
@@ -2208,6 +2212,9 @@ impl TxState {
     /// produce no qualifying sample and leave the estimate untouched.
     fn bbr_on_delivered(&mut self, acked: u32, now: u64, backlogged: bool, mss: u32) {
         self.delivered = self.delivered.saturating_add(acked as u64);
+        if !backlogged {
+            self.bbr_last_app_limited_ms = Some(now);
+        }
         let push = self
             .rate_samples
             .back()
@@ -2232,16 +2239,14 @@ impl TxState {
         };
         let span = t1.saturating_sub(t0);
         let bytes = d1.saturating_sub(d0);
-        // A fixed 64 KiB gate cannot be reached inside the 2 s rate window
-        // when our own low model paces a backlogged flow below that volume.
-        // Qualify a probe at the current model's minimum sample span instead,
-        // retaining both the time floor and at least one full segment. Sparse
-        // application traffic keeps the strict gate and cannot overwrite a seed.
-        let min_bytes = if backlogged {
-            (self.btl_bw.saturating_mul(BBR_MIN_SPAN_MS) / 1000).clamp(
-                u64::from(mss.max(1)).min(BBR_MIN_DELIVERED),
-                BBR_MIN_DELIVERED,
-            )
+        // The byte floor must not depend on the old rate: a slow path cannot
+        // qualify a replacement for an overestimated seed. Backlogged traffic
+        // needs a full segment and the unchanged minimum time span instead.
+        // Keep the strict floor if the window crosses a known app-limited
+        // observation, even when a new burst has already filled pending again.
+        let fully_backlogged = backlogged && self.bbr_last_app_limited_ms.is_none_or(|at| t0 > at);
+        let min_bytes = if fully_backlogged {
+            u64::from(mss.max(1)).min(BBR_MIN_DELIVERED)
         } else {
             BBR_MIN_DELIVERED
         };
@@ -2517,6 +2522,18 @@ mod tests {
     // Real engine pacing/ACK transitions on a 256 KiB/s serialized duplex link.
     // Each direction adds 5 ms propagation; no drops or cross-device clocks.
     fn paced_warm_path(seed: u64, sparse: bool, batch: u32, link_rate: u64) -> (u64, u64, usize) {
+        let (rate, delivered, pending, _) = paced_path(seed, sparse, batch, link_rate, None, false);
+        (rate, delivered, pending)
+    }
+
+    fn paced_path(
+        seed: u64,
+        sparse: bool,
+        batch: u32,
+        link_rate: u64,
+        capacity_drop: Option<(u64, u64)>,
+        bursty: bool,
+    ) -> (u64, u64, usize, u64) {
         let cfg = Config {
             bbr: true,
             mss: 1024,
@@ -2527,6 +2544,8 @@ mod tests {
             ack_every: 1,
             ack_delay_ms: 0,
             max_pacing_batch: batch,
+            rto_rewind_no_sack: capacity_drop.is_some(),
+            rack: capacity_drop.is_some(),
             ..Config::default()
         };
         let mut sender = StreamEngine::connect(7, cfg, 0, 100);
@@ -2540,7 +2559,7 @@ mod tests {
             0,
             500,
         );
-        if !sparse {
+        if !sparse && !bursty {
             sender.write(&vec![0x39; 16 * 1024 * 1024]);
         }
         let mut forward = VecDeque::<(u64, Vec<u8>)>::new();
@@ -2548,7 +2567,28 @@ mod tests {
         let (mut forward_ready, mut reverse_ready) = (0u64, 0u64);
         let mut cell = Vec::new();
         let mut consumed = [0u8; 65536];
-        for now in 0..=20000u64 {
+        let mut delivered_at_drop = None;
+        let duration = if capacity_drop.is_some() {
+            30000
+        } else {
+            20000
+        };
+        for now in 0..=duration {
+            if capacity_drop.is_some_and(|(at, _)| now == at) {
+                // A disrupted handover loses the already queued packets;
+                // actual ARQ must repair them on the lower-capacity path.
+                forward.clear();
+                reverse.clear();
+                forward_ready = now;
+                reverse_ready = now;
+                delivered_at_drop = Some(sender.tx.delivered);
+            }
+            let rate = capacity_drop
+                .filter(|(at, _)| now >= *at)
+                .map_or(link_rate, |(_, rate)| rate);
+            if bursty && (now == 50 || now == 12100) {
+                sender.write(&vec![0x39; 32 * 1024]);
+            }
             if sparse && now > 0 && now % 50 == 0 {
                 sender.write(&[0x39; 100]);
             }
@@ -2565,16 +2605,14 @@ mod tests {
                 if !sender.poll_transmit(now, &mut cell) {
                     break;
                 }
-                forward_ready =
-                    forward_ready.max(now) + (cell.len() as u64 * 1000).div_ceil(link_rate);
+                forward_ready = forward_ready.max(now) + (cell.len() as u64 * 1000).div_ceil(rate);
                 forward.push_back((forward_ready + 5, cell.clone()));
             }
             for _ in 0..8 {
                 if !receiver.poll_transmit(now, &mut cell) {
                     break;
                 }
-                reverse_ready =
-                    reverse_ready.max(now) + (cell.len() as u64 * 1000).div_ceil(link_rate);
+                reverse_ready = reverse_ready.max(now) + (cell.len() as u64 * 1000).div_ceil(rate);
                 reverse.push_back((reverse_ready + 5, cell.clone()));
             }
         }
@@ -2582,6 +2620,7 @@ mod tests {
             sender.tx.btl_bw,
             sender.tx.delivered,
             sender.tx.pending.len(),
+            delivered_at_drop.map_or(0, |before| sender.tx.delivered - before),
         )
     }
 
@@ -2734,14 +2773,59 @@ mod tests {
 
     #[test]
     fn backlogged_bbr_stays_bounded_on_a_genuinely_slow_path() {
-        let (rate, delivered, pending) = paced_warm_path(12440, false, 256, 8192);
-        eprintln!("slow_path final_rate={rate} delivered={delivered} pending={pending}");
+        for seed in [12440, 128 * 1024, 1024 * 1024] {
+            let (rate, delivered, pending) = paced_warm_path(seed, false, 256, 8192);
+            eprintln!(
+                "slow_path seed={seed} final_rate={rate} delivered={delivered} pending={pending}"
+            );
+            assert!(pending > 1024 * 1024);
+            assert!(
+                rate > 6000 && rate <= 8192,
+                "slow path model is not bounded: {seed} -> {rate}"
+            );
+            assert!(delivered > 64 * 1024 && delivered < 20 * 8192);
+        }
+    }
+
+    #[test]
+    fn bbr_app_gap_does_not_replace_a_fast_seed_with_a_quiet_span() {
+        let seed = 128 * 1024;
+        let (rate, delivered, pending, _) = paced_path(seed, false, 256, 256 * 1024, None, true);
+        eprintln!("app_gap seed={seed} final_rate={rate} delivered={delivered}");
+        assert_eq!(delivered, 64 * 1024);
+        assert_eq!(pending, 0);
+        assert!(
+            rate >= seed,
+            "an application gap cratered the model: {seed} -> {rate}"
+        );
+    }
+
+    #[test]
+    fn backlogged_bbr_tracks_a_capacity_drop_and_repairs_handover_loss() {
+        let (rate, delivered, pending, after_drop) = paced_path(
+            128 * 1024,
+            false,
+            256,
+            256 * 1024,
+            Some((8000, 8192)),
+            false,
+        );
+        eprintln!(
+            "capacity_drop final_rate={rate} delivered={delivered} pending={pending} after_drop={after_drop}"
+        );
+        assert!(
+            after_drop > 64 * 1024,
+            "delivery did not recover after the disrupted handover"
+        );
         assert!(pending > 1024 * 1024);
         assert!(
-            rate > 6000 && rate <= 8192,
-            "slow path model is not bounded: {rate}"
+            delivered > 1024 * 1024,
+            "test never delivered at the initial fast rate"
         );
-        assert!(delivered > 64 * 1024 && delivered < 20 * 8192);
+        assert!(
+            rate > 6000 && rate <= 8192,
+            "degraded path remained overestimated: {rate}"
+        );
     }
 
     #[test]
