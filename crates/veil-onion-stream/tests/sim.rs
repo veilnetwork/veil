@@ -781,44 +781,47 @@ fn smaller_window_throttles_but_completes() {
 /// window (no floor given here) and deliver with near-zero spurious resends.
 #[test]
 fn rack_two_path_reorder_adapts_without_spurious_collapse() {
-    let mss = veil_onion_stream::MSS;
-    let data = payload(300 * mss, 42);
-    let ch = Channel {
-        loss: 0.0,
-        dup: 0.0,
-        base_delay: 0,
-        jitter: 0,
-        two_path: Some((100, 500)),
-    };
-    let cfg = Config {
-        rack: true,
-        // Handshake over the slow route RTTs at exactly the 1s default —
-        // keep the SYN retransmit out of the wire-cell accounting.
-        handshake_rto_ms: 3_000,
-        ..Config::default()
-    };
-    let out = run_oneway(&data, ch, 9, cfg);
-    assert!(out.completed, "two-path transfer did not complete");
-    assert_eq!(out.received, data, "byte corruption under reordering");
-    let payload_cells = data.len().div_ceil(mss) as u64;
-    // Spurious resends are allowed while the reorder window is still
-    // learning (costs ~15% of the first flights; ACKs alternate routes too,
-    // so the window must grow past the data delta before it converges). The
-    // SACK-count detector resends a large share of EVERY flight here and
-    // collapses ssthresh; anything near-payload proves adaptation.
-    assert!(
-        out.tx_cells < payload_cells + payload_cells / 4 + 8,
-        "spurious retransmit storm under two-path reordering: {} cells for {} payload",
-        out.tx_cells,
-        payload_cells
-    );
-    assert!(
-        !out.a_events
-            .iter()
-            .any(|e| matches!(e, Event::DataRto { .. })),
-        "reordering alone must never fire the RTO: {:?}",
-        out.a_events
-    );
+    for bbr in [false, true] {
+        let mss = veil_onion_stream::MSS;
+        let data = payload(300 * mss, 42);
+        let ch = Channel {
+            loss: 0.0,
+            dup: 0.0,
+            base_delay: 0,
+            jitter: 0,
+            two_path: Some((100, 500)),
+        };
+        let cfg = Config {
+            rack: true,
+            bbr,
+            // Handshake over the slow route RTTs at exactly the 1s default —
+            // keep the SYN retransmit out of the wire-cell accounting.
+            handshake_rto_ms: 3_000,
+            ..Config::default()
+        };
+        let out = run_oneway(&data, ch, 9, cfg);
+        assert!(out.completed, "two-path transfer did not complete");
+        assert_eq!(out.received, data, "byte corruption under reordering");
+        let payload_cells = data.len().div_ceil(mss) as u64;
+        // Spurious resends are allowed while the reorder window is still
+        // learning (costs ~15% of the first flights; ACKs alternate routes too,
+        // so the window must grow past the data delta before it converges). The
+        // SACK-count detector resends a large share of EVERY flight here and
+        // collapses ssthresh; anything near-payload proves adaptation.
+        assert!(
+            out.tx_cells < payload_cells + payload_cells / 4 + 8,
+            "spurious retransmit storm under two-path reordering: {} cells for {} payload",
+            out.tx_cells,
+            payload_cells
+        );
+        assert!(
+            !out.a_events
+                .iter()
+                .any(|e| matches!(e, Event::DataRto { .. })),
+            "reordering alone must never fire the RTO: {:?}",
+            out.a_events
+        );
+    }
 }
 
 /// Same two-path striping with a carrier-set reorder floor covering the

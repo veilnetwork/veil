@@ -918,6 +918,10 @@ impl StreamEngine {
         }
         // ACK fields are simultaneous evidence, not sequential network arrivals.
         let prior_rack_frontier = self.tx.rack_xmit_ms;
+        // BBR measures first receipt of an original, including SACK. RTO
+        // deliberately keeps its cumulative-ACK timing policy: fast-route SACKs
+        // alone cannot safely shorten the deadline for slower in-flight cells.
+        let mut rtt_sent_ms: Option<u64> = None;
         // SACK: mark fully-covered unacked segments as RECEIVED so a later RTO /
         // fast-retransmit never resends them (the big source of duplicate cells
         // over the high-RTT onion path).
@@ -930,9 +934,12 @@ impl StreamEngine {
                     self.tx.segs[i].sacked = true;
                     self.tx.segs[i].needs_resend = false;
                     self.tx.segs[i].sack_repair_deadline = None;
-                    if self.cfg.rack && !retransmitted {
-                        self.tx
-                            .rack_on_delivery(sent_ms, end, now, prior_rack_frontier);
+                    if !retransmitted {
+                        rtt_sent_ms = Some(rtt_sent_ms.map_or(sent_ms, |old| old.max(sent_ms)));
+                        if self.cfg.rack {
+                            self.tx
+                                .rack_on_delivery(sent_ms, end, now, prior_rack_frontier);
+                        }
                     }
                 }
             }
@@ -947,6 +954,10 @@ impl StreamEngine {
                     let s = self.tx.segs.pop_front().unwrap();
                     if !s.retransmitted {
                         rtt_sample = Some(now.saturating_sub(s.sent_ms) as u32);
+                        if s.handed_off && !s.sacked {
+                            rtt_sent_ms =
+                                Some(rtt_sent_ms.map_or(s.sent_ms, |old| old.max(s.sent_ms)));
+                        }
                         if self.cfg.rack && !s.sacked {
                             self.tx
                                 .rack_on_delivery(s.sent_ms, s.end(), now, prior_rack_frontier);
@@ -1002,9 +1013,6 @@ impl StreamEngine {
                 self.tx.complete_rack_recovery();
             }
             if let Some(r) = rtt_sample {
-                if self.cfg.bbr {
-                    self.tx.bbr_on_rtt(r, now);
-                }
                 self.tx.update_rto(r, &self.cfg);
             }
             self.tx.arm_or_clear_rto(now);
@@ -1037,6 +1045,12 @@ impl StreamEngine {
                 if !self.cfg.rack {
                     self.mark_holes(false);
                 }
+            }
+        }
+        if let Some(sent_ms) = rtt_sent_ms {
+            let rtt = now.saturating_sub(sent_ms).min(u64::from(u32::MAX)) as u32;
+            if self.cfg.bbr {
+                self.tx.bbr_on_rtt(rtt, now);
             }
         }
         // RACK: every ACK (cumulative, SACK or duplicate) may have advanced the
@@ -2554,6 +2568,139 @@ mod tests {
             }
         }
         (engine, tokens)
+    }
+
+    #[test]
+    fn bbr_rtt_uses_first_sack_without_local_wait_or_replay() {
+        for iss in [100, u32::MAX - 127] {
+            for rack in [false, true] {
+                let (mut e, cells) = tracked_flight(iss, 256);
+                e.cfg.rack = rack;
+                e.cfg.bbr = true;
+                e.local_handoff(&HashMap::from([(cells[2], 1)]), 500);
+                let mut sacks = SackVec::new();
+                sacks.push(SackRange {
+                    start: cells[2].seq,
+                    end: cells[2].seq.wrapping_add(cells[2].span),
+                });
+                let una = e.tx.snd_una;
+                e.on_ack(una, 4096, &sacks, 510);
+                assert_eq!(e.tx.srtt, None, "SACK alone changed cumulative RTO timing");
+                assert_eq!(e.tx.rtt_min, Some((10, 510)));
+                let timing = (e.tx.srtt, e.tx.rttvar, e.tx.rto_ms, e.tx.rtt_min);
+                e.on_ack(una, 4096, &sacks, 10_000);
+                assert_eq!(
+                    (e.tx.srtt, e.tx.rttvar, e.tx.rto_ms, e.tx.rtt_min),
+                    timing,
+                    "repeated SACK resampled previously received bytes"
+                );
+                assert_eq!(e.tx.rto_deadline, None);
+            }
+        }
+    }
+
+    #[test]
+    fn bbr_rtt_does_not_resample_a_sacked_tail_after_head_repair() {
+        for iss in [100, u32::MAX - 127] {
+            for rack in [false, true] {
+                let (mut e, cells) = tracked_flight(iss, 256);
+                e.cfg.rack = rack;
+                e.cfg.bbr = true;
+                e.local_handoff(&cells.iter().map(|t| (*t, 1)).collect(), 10);
+                let mut sacks = SackVec::new();
+                sacks.push(SackRange {
+                    start: cells[1].seq,
+                    end: cells
+                        .last()
+                        .unwrap()
+                        .seq
+                        .wrapping_add(cells.last().unwrap().span),
+                });
+                e.on_ack(e.tx.snd_una, 4096, &sacks, 20);
+                // Seed a clean sample too: this isolates cumulative re-sampling
+                // from the independently tested missing first-SACK measurement.
+                e.tx.update_rto(10, &e.cfg);
+                e.tx.bbr_on_rtt(10, 20);
+                let timing = (e.tx.srtt, e.tx.rttvar, e.tx.rto_ms, e.tx.rtt_min);
+                e.on_timeout(100);
+                let mut encoded = Vec::new();
+                assert!(e.poll_transmit(100, &mut encoded));
+                let repair = LocalTransmit::from_cell(&encoded).unwrap();
+                assert_eq!(repair.seq, cells[0].seq);
+                e.local_handoff(&HashMap::from([(repair, 1)]), 100);
+                // Recovery delay exceeds min-RTT lifetime. Already-SACKed
+                // originals must not replace it with an invented 40-second RTT.
+                e.on_ack(e.tx.snd_nxt, 4096, &SackVec::new(), 40_020);
+                assert_eq!(
+                    e.tx.rtt_min, timing.3,
+                    "head repair wait replaced first-receipt RTT"
+                );
+                // Preserve the conservative cumulative-ACK RTO estimator. Its
+                // 40,010-ms ACK age must not also become a BBR path sample.
+                assert_eq!(e.tx.srtt, Some(5010));
+                assert_eq!(e.tx.rto_ms, e.cfg.max_rto_ms);
+                assert!(e.tx.segs.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn bbr_rtt_uses_latest_original_across_ack_fields() {
+        for iss in [100, u32::MAX - 127] {
+            for reverse_fields in [false, true] {
+                let (mut e, cells) = tracked_flight(iss, 256);
+                e.cfg.rack = false;
+                e.cfg.bbr = true;
+                for (token, at) in cells.iter().zip([10, 20, 30, 40]) {
+                    e.local_handoff(&HashMap::from([(*token, 1)]), at);
+                }
+                let mut sacks = SackVec::new();
+                let indices = if reverse_fields { [3, 1] } else { [1, 3] };
+                for i in indices {
+                    sacks.push(SackRange {
+                        start: cells[i].seq,
+                        end: cells[i].seq.wrapping_add(cells[i].span),
+                    });
+                }
+                e.on_ack(cells[0].seq.wrapping_add(cells[0].span), 4096, &sacks, 50);
+                assert_eq!(
+                    e.tx.rtt_min,
+                    Some((10, 50)),
+                    "ACK field order changed BBR sample"
+                );
+                assert_eq!(e.tx.srtt, Some(40), "cumulative RTO policy changed");
+                assert_eq!(e.tx.rttvar, 20);
+            }
+        }
+    }
+
+    #[test]
+    fn bbr_rtt_sack_preserves_karn_handoff_and_disabled_guards() {
+        for guard in 0..3 {
+            let (mut e, cells) = tracked_flight(u32::MAX - 127, 256);
+            e.cfg.bbr = guard != 2;
+            if guard != 0 {
+                e.local_handoff(&cells.iter().map(|t| (*t, 1)).collect(), 10);
+            }
+            if guard == 1 {
+                // A loss detector orders a tail repair; poll and actual carrier
+                // acceptance make its ACK ambiguous under Karn's rule.
+                e.tx.segs[2].needs_resend = true;
+                let mut encoded = Vec::new();
+                assert!(e.poll_transmit(100, &mut encoded));
+                let repair = LocalTransmit::from_cell(&encoded).unwrap();
+                assert_eq!(repair.seq, cells[2].seq);
+                e.local_handoff(&HashMap::from([(repair, 1)]), 100);
+            }
+            let mut sacks = SackVec::new();
+            sacks.push(SackRange {
+                start: cells[2].seq,
+                end: cells[2].seq.wrapping_add(cells[2].span),
+            });
+            e.on_ack(e.tx.snd_una, 4096, &sacks, 110);
+            assert_eq!(e.tx.rtt_min, None);
+            assert_eq!(e.tx.srtt, None);
+        }
     }
 
     #[test]
