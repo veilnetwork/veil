@@ -4362,7 +4362,10 @@ fn try_open_circuit(
     Some(CircuitCells {
         path_group,
         local_datagram_lane: veil_proto::priority::INTERACTIVE,
-        private_outbound_registration: false,
+        // An outbound setup/probe must not replace our advertised inbound
+        // cookie at the same rendezvous relay. Independent candidate keys also
+        // keep concurrent opens from redirecting one another's probe echoes.
+        private_outbound_registration: true,
         services,
         me,
         mode,
@@ -5404,7 +5407,7 @@ mod tests {
                 .unwrap();
         }
         // The repaired audio route has its own cookie; neither video nor the
-        // published file/receive route is displaced by its higher generation.
+        // published receive route is displaced by its higher generation.
         assert_eq!(registry.len(), 4);
         for (index, registration) in candidates.iter().enumerate() {
             assert_eq!(
@@ -6083,7 +6086,7 @@ mod tests {
         let screen = files.isolated_producer(crate::media::LocalMediaPlane::Screen);
         assert!(screen.private_outbound_registration);
         assert_eq!(screen.local_datagram_lane, veil_proto::priority::BACKGROUND);
-        assert!(!files.private_outbound_registration);
+        assert!(files.private_outbound_registration);
         assert!(audio.private_outbound_registration && video.private_outbound_registration);
         // Receive authentication remains common to files and all media producers.
         assert!(Arc::ptr_eq(&files.peer_tags, &audio.peer_tags));
