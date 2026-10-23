@@ -213,6 +213,9 @@ struct Seg {
     /// A proven SACK hole from an existing RTO whose own last handoff has not
     /// expired yet. It must not inherit another hole's exponential backoff.
     sack_repair_deadline: Option<u64>,
+    /// Valid original RTT observed on its first SACK. Apply only after
+    /// cumulative retirement, and only to grow the conservative RTO.
+    sack_first_rtt_ms: Option<u32>,
 }
 
 /// Correlates a driver's local handoff without copying payloads. A partial
@@ -303,6 +306,9 @@ struct TxState {
     rttvar: u32,
     rto_ms: u64,
     rto_deadline: Option<u64>,
+    // Local diagnostics: retired SACKed segments whose raw cumulative ACK age
+    // was not reused as a fresh RTT sample.
+    rto_sacked_segments_skipped: u64,
     /// Cached minimum of Seg::sack_repair_deadline. Normal send/timeout polls
     /// must not scan the entire flight when no deferred repair exists.
     next_sack_repair_ms: Option<u64>,
@@ -500,6 +506,7 @@ impl StreamEngine {
                 rttvar: 0,
                 rto_ms: cfg.init_rto_ms,
                 rto_deadline: None,
+                rto_sacked_segments_skipped: 0,
                 next_sack_repair_ms: None,
                 consec_rto: 0,
                 pace_next_ms: 0,
@@ -745,7 +752,7 @@ impl StreamEngine {
              adv={} ack_pending={} eof={} fin(req={},sent={},ack={}) \
              srtt={:?} rttvar={} rto={}ms pace_next={}ms delayed_ack={}/{:?} \
              rto_dl={:?} persist_dl={:?} bbr_bw={} bbr_rtt_min={:?} bbr_cap={:?} \
-             rack={} reo_wnd={} rack_rtt={}",
+             rack={} reo_wnd={} rack_rtt={} rto_skipped_sacked={}",
             self.phase,
             self.tx.snd_una,
             self.tx.snd_nxt,
@@ -784,6 +791,7 @@ impl StreamEngine {
             self.cfg.rack,
             self.rack_reo_wnd(),
             self.tx.rack_rtt_ms,
+            self.tx.rto_sacked_segments_skipped,
         )
     }
 
@@ -930,9 +938,11 @@ impl StreamEngine {
         let prior_rack_frontier = self.tx.rack_xmit_ms;
         let old_una = self.tx.snd_una;
         let mut newly_delivered = 0u32;
+        let mut deferred_sack_rtt: Option<u32> = None;
         // BBR measures first receipt of an original, including SACK. RTO
-        // deliberately keeps its cumulative-ACK timing policy: fast-route SACKs
-        // alone cannot safely shorten the deadline for slower in-flight cells.
+        // keeps cumulative-ACK timing: fast SACKs alone do not shorten the
+        // deadline for slower cells. Already-SACKed data cannot be timed again
+        // when a later head repair finally advances that cumulative ACK.
         let mut rtt_sent_ms: Option<u64> = None;
         // SACK: mark fully-covered unacked segments as RECEIVED so a later RTO /
         // fast-retransmit never resends them (the big source of duplicate cells
@@ -950,6 +960,8 @@ impl StreamEngine {
                     self.tx.segs[i].needs_resend = false;
                     self.tx.segs[i].sack_repair_deadline = None;
                     if !retransmitted {
+                        self.tx.segs[i].sack_first_rtt_ms =
+                            Some(now.saturating_sub(sent_ms).min(u64::from(u32::MAX)) as u32);
                         rtt_sent_ms = Some(rtt_sent_ms.map_or(sent_ms, |old| old.max(sent_ms)));
                         if self.cfg.rack {
                             self.tx
@@ -976,7 +988,16 @@ impl StreamEngine {
                         sacked_overlap += s.end().wrapping_sub(seq::max(s.seq, old_una));
                     }
                     if !s.retransmitted {
-                        rtt_sample = Some(now.saturating_sub(s.sent_ms) as u32);
+                        if !s.sacked {
+                            rtt_sample = Some(now.saturating_sub(s.sent_ms) as u32);
+                        } else {
+                            self.tx.rto_sacked_segments_skipped =
+                                self.tx.rto_sacked_segments_skipped.saturating_add(1);
+                            if let Some(rtt) = s.sack_first_rtt_ms {
+                                deferred_sack_rtt =
+                                    Some(deferred_sack_rtt.map_or(rtt, |prior| prior.max(rtt)));
+                            }
+                        }
                         if s.handed_off && !s.sacked {
                             rtt_sent_ms =
                                 Some(rtt_sent_ms.map_or(s.sent_ms, |old| old.max(s.sent_ms)));
@@ -1047,6 +1068,12 @@ impl StreamEngine {
             }
             if let Some(r) = rtt_sample {
                 self.tx.update_rto(r, &self.cfg);
+            }
+            if let Some(r) = deferred_sack_rtt {
+                // Preserve the slow-path evidence from the FIRST SACK. It may
+                // grow a conservative timer, but cannot collapse its backoff
+                // using an older receipt or include the head-repair delay.
+                self.tx.raise_rto_from_deferred_sample(r, &self.cfg);
             }
             self.tx.arm_or_clear_rto(now);
             if self.track_local_handoffs {
@@ -1364,6 +1391,7 @@ impl StreamEngine {
                         .rewind_high
                         .is_some_and(|high| seq::leq(seq_no.wrapping_add(take as u32), high)),
                 sack_repair_deadline: None,
+                sack_first_rtt_ms: None,
             });
             if !self.track_local_handoffs && self.tx.rto_deadline.is_none() {
                 self.tx.rto_deadline = Some(now + self.tx.rto_ms);
@@ -1394,6 +1422,7 @@ impl StreamEngine {
                         .rewind_high
                         .is_some_and(|high| seq::leq(seq_no.wrapping_add(1), high)),
                 sack_repair_deadline: None,
+                sack_first_rtt_ms: None,
             });
             if !self.track_local_handoffs && self.tx.rto_deadline.is_none() {
                 self.tx.rto_deadline = Some(now + self.tx.rto_ms);
@@ -2353,6 +2382,22 @@ impl TxState {
         self.rto_ms = rto.clamp(cfg.min_rto_ms, cfg.max_rto_ms);
     }
 
+    fn raise_rto_from_deferred_sample(&mut self, r_ms: u32, cfg: &Config) {
+        let previous = (self.srtt, self.rttvar, self.rto_ms);
+        self.update_rto(r_ms, cfg);
+        // A slower first receipt can represent another path. Use the same
+        // conservative 3*RTT initialization bound as a first measurement,
+        // rather than letting the fast-path average erase that evidence.
+        self.rto_ms = self.rto_ms.max(
+            u64::from(r_ms)
+                .saturating_mul(3)
+                .clamp(cfg.min_rto_ms, cfg.max_rto_ms),
+        );
+        if self.rto_ms <= previous.2 {
+            (self.srtt, self.rttvar, self.rto_ms) = previous;
+        }
+    }
+
     fn arm_or_clear_rto(&mut self, now: u64) {
         if self.segs.is_empty() {
             self.rto_deadline = None;
@@ -3111,6 +3156,157 @@ mod tests {
     }
 
     #[test]
+    fn sacked_tail_does_not_turn_local_repair_wait_into_a_new_rto_sample() {
+        for iss in [100, u32::MAX - 127] {
+            for rack in [false, true] {
+                let (mut e, cells) = tracked_flight(iss, 256);
+                e.cfg.rack = rack;
+                e.local_handoff(&cells.iter().map(|t| (*t, 1)).collect(), 10);
+                let mut sacks = SackVec::new();
+                sacks.push(SackRange {
+                    start: cells[1].seq,
+                    end: cells
+                        .last()
+                        .unwrap()
+                        .seq
+                        .wrapping_add(cells.last().unwrap().span),
+                });
+                e.on_ack(e.tx.snd_una, 4096, &sacks, 20);
+                e.tx.update_rto(10, &e.cfg);
+                e.on_timeout(100);
+                let mut encoded = Vec::new();
+                assert!(e.poll_transmit(100, &mut encoded));
+                let repair = LocalTransmit::from_cell(&encoded).unwrap();
+                assert_eq!(repair.seq, cells[0].seq);
+                // The repair waits locally, not on the wire. Its real handoff
+                // still receives an ACK after the original ten-ms path RTT.
+                e.on_timeout(5000);
+                assert!(e.tx.segs[0].local_pending);
+                assert_eq!(e.tx.rto_deadline, None);
+                e.local_handoff(&HashMap::from([(repair, 1)]), 9000);
+                let before = (e.tx.srtt, e.tx.rttvar, e.tx.rto_ms);
+                e.on_ack(e.tx.snd_nxt, 4096, &SackVec::new(), 9010);
+                assert!(e.tx.segs.is_empty());
+                assert_eq!(e.tx.rto_sacked_segments_skipped, 3);
+                assert_eq!(
+                    (e.tx.srtt, e.tx.rttvar, e.tx.rto_ms),
+                    before,
+                    "already-delivered tail invented a nine-second path sample"
+                );
+                // A subsequent lost tail is eligible for repair after the
+                // retained 80-ms timeout, not an invented 1000-ms sample.
+                e.write(&[0x71; 64]);
+                assert!(e.poll_transmit(9020, &mut encoded));
+                let lost = LocalTransmit::from_cell(&encoded).unwrap();
+                e.local_handoff(&HashMap::from([(lost, 1)]), 9020);
+                e.on_timeout(9020 + before.2);
+                assert!(e.poll_transmit(9020 + before.2, &mut encoded));
+                let repeated = LocalTransmit::from_cell(&encoded).unwrap();
+                assert!(repeated == lost);
+                e.local_handoff(&HashMap::from([(repeated, 1)]), 9020 + before.2);
+                e.on_ack(e.tx.snd_nxt, 4096, &SackVec::new(), 9030 + before.2);
+                // The next genuinely new delivery may update the estimator.
+                e.write(&[0x72; 64]);
+                assert!(e.poll_transmit(9040 + before.2, &mut encoded));
+                let fresh = LocalTransmit::from_cell(&encoded).unwrap();
+                e.local_handoff(&HashMap::from([(fresh, 1)]), 9040 + before.2);
+                e.on_ack(e.tx.snd_nxt, 4096, &SackVec::new(), 9050 + before.2);
+                assert_eq!(e.tx.srtt, Some(10));
+                assert_eq!(e.tx.rto_ms, e.cfg.min_rto_ms);
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_sack_first_receipt_can_grow_but_not_shorten_the_recovery_timer() {
+        let (mut e, cells) = tracked_flight(100, 256);
+        e.cfg.rack = false;
+        e.local_handoff(&cells.iter().map(|t| (*t, 1)).collect(), 10);
+        e.tx.update_rto(10, &e.cfg);
+        let mut sacks = SackVec::new();
+        sacks.push(SackRange {
+            start: cells[1].seq,
+            end: cells
+                .last()
+                .unwrap()
+                .seq
+                .wrapping_add(cells.last().unwrap().span),
+        });
+        e.on_ack(e.tx.snd_una, 4096, &sacks, 200);
+        assert_eq!((e.tx.srtt, e.tx.rto_ms), (Some(10), 40));
+        e.on_timeout(200);
+        let mut encoded = Vec::new();
+        assert!(e.poll_transmit(200, &mut encoded));
+        let repair = LocalTransmit::from_cell(&encoded).unwrap();
+        e.local_handoff(&HashMap::from([(repair, 1)]), 9000);
+        e.on_ack(e.tx.snd_nxt, 4096, &SackVec::new(), 9010);
+        // 190 ms was a real first receipt, not the nine-second head wait.
+        assert_eq!((e.tx.srtt, e.tx.rttvar, e.tx.rto_ms), (Some(32), 48, 570));
+        let timing = (e.tx.srtt, e.tx.rttvar, e.tx.rto_ms);
+        e.on_ack(e.tx.snd_nxt, 4096, &sacks, 30_000);
+        assert_eq!((e.tx.srtt, e.tx.rttvar, e.tx.rto_ms), timing);
+    }
+
+    #[test]
+    fn original_head_local_wait_does_not_resample_the_already_received_tail() {
+        let (mut e, cells) = tracked_flight(100, 256);
+        e.local_handoff(&cells[1..].iter().map(|t| (*t, 1)).collect(), 10);
+        e.tx.update_rto(10, &e.cfg);
+        let mut sacks = SackVec::new();
+        sacks.push(SackRange {
+            start: cells[1].seq,
+            end: cells
+                .last()
+                .unwrap()
+                .seq
+                .wrapping_add(cells.last().unwrap().span),
+        });
+        e.on_ack(e.tx.snd_una, 4096, &sacks, 20);
+        e.on_timeout(5000);
+        assert!(e.tx.segs[0].local_pending);
+        assert_eq!(e.tx.rto_deadline, None);
+        e.local_handoff(&HashMap::from([(cells[0], 1)]), 9000);
+        e.on_ack(e.tx.snd_nxt, 4096, &SackVec::new(), 9010);
+        assert!(e.tx.segs.is_empty());
+        assert_eq!(e.tx.srtt, Some(10));
+        assert_eq!(e.tx.rto_ms, e.cfg.min_rto_ms);
+        assert_eq!(e.tx.rto_sacked_segments_skipped, 3);
+    }
+
+    #[test]
+    fn a_sacked_tail_does_not_hide_a_slow_first_delivery_of_the_original_head() {
+        let (mut e, cells) = tracked_flight(100, 256);
+        e.cfg.max_rto_ms = 30_000;
+        e.local_handoff(&cells.iter().map(|t| (*t, 1)).collect(), 10);
+        e.tx.update_rto(10, &e.cfg);
+        e.tx.rto_ms = 20_000; // a retained backoff permits the slow original
+        let mut sacks = SackVec::new();
+        sacks.push(SackRange {
+            start: cells[1].seq,
+            end: cells
+                .last()
+                .unwrap()
+                .seq
+                .wrapping_add(cells.last().unwrap().span),
+        });
+        e.on_ack(e.tx.snd_una, 4096, &sacks, 20);
+        assert_eq!(e.tx.srtt, Some(10));
+        assert_eq!(
+            e.tx.rto_ms, 20_000,
+            "fast SACKs changed the backed-off timer"
+        );
+        e.on_timeout(9000);
+        assert!(!e.tx.segs[0].retransmitted);
+        e.on_ack(e.tx.snd_nxt, 4096, &SackVec::new(), 9010);
+        assert_eq!(e.tx.srtt, Some(1133));
+        assert_eq!(e.tx.rttvar, 2251);
+        assert_eq!(
+            e.tx.rto_ms, 10_137,
+            "the original head's real delay was lost"
+        );
+    }
+
+    #[test]
     fn bbr_rtt_does_not_resample_a_sacked_tail_after_head_repair() {
         for iss in [100, u32::MAX - 127] {
             for rack in [false, true] {
@@ -3139,6 +3335,7 @@ mod tests {
                 let repair = LocalTransmit::from_cell(&encoded).unwrap();
                 assert_eq!(repair.seq, cells[0].seq);
                 e.local_handoff(&HashMap::from([(repair, 1)]), 100);
+                let backed_off_timing = (e.tx.srtt, e.tx.rttvar, e.tx.rto_ms);
                 // Recovery delay exceeds min-RTT lifetime. Already-SACKed
                 // originals must not replace it with an invented 40-second RTT.
                 e.on_ack(e.tx.snd_nxt, 4096, &SackVec::new(), 40_020);
@@ -3146,10 +3343,9 @@ mod tests {
                     e.tx.rtt_min, timing.3,
                     "head repair wait replaced first-receipt RTT"
                 );
-                // Preserve the conservative cumulative-ACK RTO estimator. Its
-                // 40,010-ms ACK age must not also become a BBR path sample.
-                assert_eq!(e.tx.srtt, Some(5010));
-                assert_eq!(e.tx.rto_ms, e.cfg.max_rto_ms);
+                // No fresh original was received: preserve the backed-off
+                // timer instead of sampling the old tail's head-repair wait.
+                assert_eq!((e.tx.srtt, e.tx.rttvar, e.tx.rto_ms), backed_off_timing);
                 assert!(e.tx.segs.is_empty());
             }
         }
@@ -3653,6 +3849,7 @@ mod tests {
                 local_pending: false,
                 handed_off: true,
                 sack_repair_deadline: None,
+                sack_first_rtt_ms: None,
             });
         }
         e
@@ -3736,6 +3933,7 @@ mod tests {
             local_pending: false,
             handed_off: true,
             sack_repair_deadline: None,
+            sack_first_rtt_ms: None,
         });
 
         e.on_timeout(100);
@@ -3814,6 +4012,7 @@ mod tests {
                 local_pending: false,
                 handed_off: true,
                 sack_repair_deadline: None,
+                sack_first_rtt_ms: None,
             });
         }
 
@@ -3867,6 +4066,7 @@ mod tests {
                 local_pending: false,
                 handed_off: true,
                 sack_repair_deadline: None,
+                sack_first_rtt_ms: None,
             });
         }
         e
@@ -4082,6 +4282,7 @@ mod tests {
                 local_pending: false,
                 handed_off: true,
                 sack_repair_deadline: None,
+                sack_first_rtt_ms: None,
             });
         }
 
