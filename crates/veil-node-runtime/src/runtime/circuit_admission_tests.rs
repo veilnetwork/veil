@@ -182,3 +182,177 @@ async fn exhausted_circuit_requests_rotation_even_when_recoverable_ingress_is_fu
     assert_eq!(result, Err(DataCircuitSendError::NoRelays));
     assert_eq!(unchanged, u32::MAX);
 }
+
+/// Real local admission failures must not accumulate paths that never reached
+/// their first hop. Keep a live path throughout, exceed the real origin cap,
+/// and require a new build to succeed as soon as the queue becomes usable.
+async fn rejected_builds_release_state(kind: &str, failure: &str) {
+    use veil_anonymity::directory::{relay_directory_dht_key, sign_entry};
+    use veil_types::{AnonOnionSendError, SignatureAlgorithm};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut config = super::tests::runtime_config_with_metrics();
+    config.peers.clear();
+    config.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+    config.anonymity.receive_anonymous = true;
+    veil_cfg::save_config(&path, &config).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.unwrap();
+    let services = runtime.access();
+    let key = veil_crypto::generate_keypair(SignatureAlgorithm::Ed25519);
+    let public =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &key.public_key)
+            .unwrap();
+    let hop = *blake3::hash(&public).as_bytes();
+    let xpk = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([3; 32]));
+    services.dht.store_local(
+        relay_directory_dht_key(&hop),
+        sign_entry(
+            hop,
+            xpk.to_bytes(),
+            1_000_000,
+            1,
+            &key.public_key,
+            &key.private_key,
+            SignatureAlgorithm::Ed25519,
+        )
+        .unwrap(),
+    );
+    let mut outbox = services.session_tx_registry.write().unwrap().register(hop);
+    let (live, mut live_inbound) = services.open_data_circuit(&[hop], b"live path").unwrap();
+    assert!(outbox.try_recv().is_ok(), "live path was not handed off");
+    let table = services.dispatcher.circuit_origin.as_ref().unwrap();
+    let before = table.len();
+    let sinks_before = services.dispatcher.stream_recv.lock().unwrap().len();
+    assert_eq!(before, 1, "fixture must contain exactly the live path");
+    assert_eq!(sinks_before, 1);
+
+    match failure {
+        "full" => {
+            let mut filled = false;
+            for _ in 0..8192 {
+                match services.send_relay_chain_frame(&hop, RelayChainMsg::CircuitBuild, b"fill") {
+                    Ok(()) => {}
+                    Err(veil_session::SendToError::Full) => {
+                        filled = true;
+                        break;
+                    }
+                    Err(other) => panic!("unexpected queue fill failure: {other:?}"),
+                }
+            }
+            assert!(filled, "fixture never reached actual queue backpressure");
+        }
+        "closed" => outbox.close(),
+        "missing" => {
+            services
+                .session_tx_registry
+                .write()
+                .unwrap()
+                .unregister(&hop);
+        }
+        _ => unreachable!("unknown local failure fixture"),
+    }
+    let expected = match failure {
+        "full" => veil_session::SendToError::Full,
+        "closed" => veil_session::SendToError::Closed,
+        "missing" => veil_session::SendToError::Missing,
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        services.send_relay_chain_frame(&hop, RelayChainMsg::CircuitBuild, b"probe"),
+        Err(expected)
+    );
+    let epoch = std::sync::atomic::AtomicU64::new(0);
+    let build = || -> std::result::Result<(), AnonOnionSendError> {
+        match kind {
+            "data" => services.open_data_circuit(&[hop], b"new path").map(|_| ()),
+            "service" | "reply" => services
+                .build_onion_circuit_once(&[hop], [0x52; 16], &key, &epoch, kind == "reply")
+                .map(|_| ()),
+            _ => unreachable!("unknown circuit build kind"),
+        }
+    };
+    let attempts = table.cap() + 1;
+    for _ in 0..attempts {
+        assert!(matches!(build(), Err(AnonOnionSendError::NoRelays)));
+    }
+    let after_rejection = table.len();
+    let sinks_after_rejection = services.dispatcher.stream_recv.lock().unwrap().len();
+    let live_kept = table.lookup(&hop, live.origin_circuit_id()).is_some()
+        && services
+            .dispatcher
+            .stream_recv
+            .lock()
+            .unwrap()
+            .contains_key(&live.origin_circuit_id());
+    let live_receiver_kept = matches!(
+        live_inbound.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    );
+    if failure == "full" {
+        while outbox.try_recv().is_ok() {}
+    } else {
+        outbox = services.session_tx_registry.write().unwrap().register(hop);
+    }
+    let recovered = build().is_ok();
+    let mut accepted_builds = 0;
+    while let Ok((_, frame)) = outbox.try_recv() {
+        let header = veil_proto::codec::decode_header(&frame[..HEADER_SIZE]).unwrap();
+        accepted_builds += usize::from(
+            header.family == veil_proto::family::FrameFamily::RelayChain as u8
+                && header.msg_type == RelayChainMsg::CircuitBuild as u16,
+        );
+    }
+    let after_success = table.len();
+    let sinks_after_success = services.dispatcher.stream_recv.lock().unwrap().len();
+    runtime.stop().await.unwrap();
+    println!(
+        "build rollback {kind}/{failure}: attempts={attempts} origins={before}->{after_rejection}->{after_success} sinks={sinks_before}->{sinks_after_rejection}->{sinks_after_success} recovered={recovered} admitted={accepted_builds}"
+    );
+    assert!(
+        recovered && accepted_builds == 1,
+        "failed {kind}/{failure} builds prevented immediate recovery"
+    );
+    assert_eq!(
+        after_rejection, before,
+        "failed {kind}/{failure} build leaked origin state"
+    );
+    assert_eq!(
+        sinks_after_rejection, sinks_before,
+        "failed build leaked return sinks"
+    );
+    assert!(
+        live_kept && live_receiver_kept,
+        "rollback discarded the live path"
+    );
+    assert_eq!(
+        after_success,
+        before + 1,
+        "successful build lost its origin state"
+    );
+    assert_eq!(
+        sinks_after_success,
+        sinks_before + usize::from(kind == "data")
+    );
+}
+
+#[tokio::test]
+async fn rejected_data_builds_do_not_exhaust_origin_capacity() {
+    for failure in ["full", "closed", "missing"] {
+        rejected_builds_release_state("data", failure).await;
+    }
+}
+
+#[tokio::test]
+async fn rejected_service_builds_do_not_exhaust_origin_capacity() {
+    for failure in ["full", "closed", "missing"] {
+        rejected_builds_release_state("service", failure).await;
+    }
+}
+
+#[tokio::test]
+async fn rejected_reply_builds_do_not_retain_unreachable_paths() {
+    for failure in ["full", "closed", "missing"] {
+        rejected_builds_release_state("reply", failure).await;
+    }
+}
