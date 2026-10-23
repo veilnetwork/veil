@@ -1790,3 +1790,115 @@ async fn stream_recovery_never_switches_receiver_cookie_or_key() {
         }
     }
 }
+
+#[tokio::test]
+async fn cold_registered_opening_does_not_park_the_handshake_carrier() {
+    let mut f = fixture().await;
+    let destination = Addr {
+        node: [0xb9; 32],
+        app: [0xbc; 32],
+    };
+    // The resolver/opener is live but has not published its first route yet.
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let opener = tokio::spawn(async {
+        let _ = release_rx.await;
+    });
+    f.cells
+        .outbound_opening
+        .lock()
+        .await
+        .insert(destination.node, Instant::now());
+    assert!(!opener.is_finished());
+    let result = tokio::time::timeout(
+        Duration::from_millis(50),
+        f.cells.send(destination, frames(71)[0].clone()),
+    )
+    .await;
+    release_tx.send(()).unwrap();
+    opener.await.unwrap();
+    f.runtime.stop().await.unwrap();
+    let error = result
+        .expect("cold shared opener parked the carrier instead of returning local backpressure")
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+}
+
+#[tokio::test]
+async fn published_pool_prefix_is_usable_and_keeps_live_metadata_on_refill() {
+    let mut f = fixture().await;
+    let destination = Addr {
+        node: [0xb9; 32],
+        app: [0xbc; 32],
+    };
+    let primary = route(&f.circuit, f.cells.me);
+    while f._outbox.try_recv().is_ok() {}
+    let candidates = vec![entry(&primary, &[])];
+    publish_outbound_candidates(
+        &f.cells.services,
+        destination.node,
+        &f.cells.outbound_circuits,
+        &candidates,
+    )
+    .await;
+    // A later candidate is still warming, but the first confirmed route must
+    // already carry the opener's SYN without waiting for the whole pool.
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let pending = tokio::spawn(async {
+        let _ = release_rx.await;
+    });
+    f.cells
+        .outbound_opening
+        .lock()
+        .await
+        .insert(destination.node, Instant::now());
+    let sent = tokio::time::timeout(
+        Duration::from_millis(50),
+        f.cells.send(destination, frames(71)[0].clone()),
+    )
+    .await;
+    let mut cells_sent = 0;
+    while f._outbox.try_recv().is_ok() {
+        cells_sent += 1;
+    }
+    let active = primary.stats.as_ref().unwrap().active_streams();
+    {
+        let mut pool = f.cells.outbound_circuits.lock().await;
+        let first = &mut pool.get_mut(&destination.node).unwrap()[0];
+        first.note_handshake_stream(71);
+        // Metadata changed by live traffic must survive the opener's old copy.
+        first.last_non_handshake = first.opened_at + Duration::from_millis(1);
+    }
+    let (second, _, _second_outbox) = add_circuit(&f.cells.services);
+    let second = route(&second, f.cells.me);
+    let mut candidates = candidates;
+    candidates.push(entry(&second, &[]));
+    publish_outbound_candidates(
+        &f.cells.services,
+        destination.node,
+        &f.cells.outbound_circuits,
+        &candidates,
+    )
+    .await;
+    let (ordered, preserved, same_activity, bounded) = {
+        let pool = f.cells.outbound_circuits.lock().await;
+        let entries = pool.get(&destination.node).unwrap();
+        (
+            Arc::ptr_eq(&entries[0].circuit, &primary.circuit)
+                && Arc::ptr_eq(&entries[1].circuit, &second.circuit),
+            entries[0].handshake_streams.contains(&71)
+                && entries[0].last_non_handshake > entries[0].opened_at,
+            entries[0].stats.active_streams() == active,
+            entries.len() <= MAX_CIRCUIT_OUTBOUND_POOL,
+        )
+    };
+    release_tx.send(()).unwrap();
+    pending.await.unwrap();
+    f.runtime.stop().await.unwrap();
+    assert!(
+        sent.expect("ready prefix waited for a later candidate")
+            .is_ok()
+    );
+    assert_eq!(cells_sent, 1);
+    assert!(active > 0);
+    assert!(ordered && preserved && same_activity && bounded);
+}
