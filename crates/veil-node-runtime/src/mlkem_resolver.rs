@@ -434,6 +434,13 @@ impl DhtMlKemEkResolver {
         }
     }
 
+    /// A receive-side freshness probe may spend work only on a sender whose
+    /// key was verified before. Arbitrary claimed identities use the separate
+    /// bounded certificate warmer, never this periodic document refresh.
+    pub(crate) fn has_verified_sender(&self, peer: &NodeIdBytes) -> bool {
+        rlock!(self.peer_ratchet_keys).contains_key(peer)
+    }
+
     /// New resolver bound to a node's runtime components.  `step_timeout`
     /// applies to each of the three DHT walks individually — total budget
     /// is at most `3 × step_timeout`.
