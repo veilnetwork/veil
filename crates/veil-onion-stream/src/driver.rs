@@ -450,6 +450,7 @@ async fn drive<D: CellDuplex>(
     // keep their relative emission order, including partial striped sends.
     let mut outbound: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
     let mut send_retry_at: Option<u64> = None;
+    let mut close_handoff_deadline: Option<u64> = None;
     let mut blocked_since_ms: Option<u64> = None;
     let mut would_block_total: u64 = 0;
     let mut would_block_retries: u64 = 0;
@@ -518,6 +519,15 @@ async fn drive<D: CellDuplex>(
         // is about to consume the bytes immediately, forcing the sender into
         // zero-window/persist pulses.
         loop {
+            // Dropping the entire handle is the graceful close path: queued
+            // writes still finish, and late reverse-direction credits still
+            // need transport ACKs. No reader remains to consume these bytes.
+            // A reader-only drop with a live writer retains its abort behavior.
+            if data_tx.is_closed() && cmd_rx.is_closed() {
+                let mut discarded = vec![0u8; engine.readable_len().min(DELIVER_CHUNK)];
+                while engine.read(&mut discarded) > 0 {}
+                break;
+            }
             let Ok(permit) = data_tx.try_reserve() else {
                 break;
             };
@@ -598,13 +608,30 @@ async fn drive<D: CellDuplex>(
             }
         }
 
-        // 4. Done? Terminal RST, or both directions cleanly finished.
-        if engine.is_closed() || (engine.is_send_complete() && engine.is_eof()) {
+        // 4. Both byte directions may be done while a final ACK is still
+        // rejected by the local carrier. Retiring then strands the peer's FIN
+        // or final credit. Keep retrying without inventing network loss, but
+        // bound an unavailable carrier by the configured retry-policy ceiling.
+        if engine.is_send_complete() && engine.is_eof() {
+            if outbound.is_empty() {
+                break;
+            }
+            let now = now_ms(&base);
+            let deadline = close_handoff_deadline
+                .get_or_insert_with(|| now.saturating_add(engine.close_handoff_timeout_ms()));
+            if now >= *deadline {
+                engine.reset(reset_reason::TIMED_OUT);
+            }
+        }
+        if engine.is_closed() {
             break;
         }
 
         // 5. Block until the next thing happens.
         let mut timeout_at = engine.next_timeout_with_pacing(outbound.is_empty());
+        if let Some(deadline) = close_handoff_deadline {
+            timeout_at = Some(timeout_at.map_or(deadline, |t| t.min(deadline)));
+        }
         if !outbound.is_empty()
             && let Some(retry_at) = send_retry_at
         {
@@ -646,7 +673,8 @@ async fn drive<D: CellDuplex>(
                             permit.send(tmp);
                         }
                     }
-                    Err(_) => engine.reset(reset_reason::APP), // app stopped reading
+                    Err(_) if cmd_rx.is_closed() => (), // whole handle dropped; drain above
+                    Err(_) => engine.reset(reset_reason::APP), // reader-only drop
                 }
             }
         }
