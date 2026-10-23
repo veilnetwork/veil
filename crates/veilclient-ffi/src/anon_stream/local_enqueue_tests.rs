@@ -498,7 +498,7 @@ async fn stale_primary_ack_completes_when_an_alternate_actually_accepts_it() {
             rendezvous_node: hop,
             first_hop_close_generation: 0,
             peer_tag: [0x32; CIRCUIT_PEER_TAG_LEN],
-            peer_cookie: [0x35; COOKIE_LEN],
+            peer_cookie: primary.peer_cookie,
             receiver_x25519_pk: [3; 32],
             opened_at: now,
             last_used: now,
@@ -531,6 +531,170 @@ async fn stale_primary_ack_completes_when_an_alternate_actually_accepts_it() {
     assert!(pending.is_empty());
     assert_eq!(copies, 1);
     assert_eq!(count, 1);
+}
+
+fn fill_ordinary_outbox(cells: &CircuitCells, circuit: &veil_node_runtime::DataCircuit) {
+    for _ in 0..65536 {
+        match cells
+            .services
+            .send_circuit_cell_detailed(circuit, b"ordinary traffic")
+        {
+            Ok(()) => (),
+            Err(veil_node_runtime::DataCircuitSendError::QueueFull) => return,
+            error => panic!("unexpected local enqueue result: {error:?}"),
+        }
+    }
+    panic!("ordinary outbox did not reach its actual bounded capacity");
+}
+
+#[tokio::test]
+async fn ack_redundancy_tries_a_healthy_third_path_after_shared_first_hop_queue_full() {
+    let mut observed = Vec::new();
+    for all_full in [false, true] {
+        let mut f = fixture().await;
+        let destination = Addr {
+            node: [0xb9; 32],
+            app: [0xbc; 32],
+        };
+        let primary = route(&f.circuit, f.cells.me);
+        let (_directory, second_hop, _second_outbox) = add_circuit(&f.cells.services);
+        let (shared_first, _rx) = f
+            .cells
+            .services
+            .open_data_circuit(&[f.hop, second_hop], b"shared first hop")
+            .unwrap();
+        let mut shared_first = route(&Arc::new(shared_first), f.cells.me);
+        shared_first.rendezvous_node = Some(second_hop);
+        let (healthy, _, mut healthy_outbox) = add_circuit(&f.cells.services);
+        let healthy = route(&healthy, f.cells.me);
+        while healthy_outbox.try_recv().is_ok() {}
+        f.cells.outbound_circuits.lock().await.insert(
+            destination.node,
+            vec![
+                entry(&primary, &[]),
+                entry(&shared_first, &[]),
+                entry(&healthy, &[]),
+            ],
+        );
+        f.cells
+            .stream_routes
+            .lock()
+            .await
+            .insert((destination.node, 71, RouteClass::Ack), primary);
+        f.cells.ack_redundancy = 2;
+        fill_ordinary_outbox(&f.cells, &f.circuit);
+        if all_full {
+            fill_ordinary_outbox(&f.cells, &healthy.circuit);
+        }
+        let encoded = frames(71)[2].clone();
+        let mut pending = std::collections::VecDeque::from([encoded.clone()]);
+        let result = f.cells.send_many(destination, &mut pending).await;
+        let copies = f.cells.ack_dup_sent.load(Ordering::Relaxed);
+        let mut sent = 0;
+        if !all_full {
+            while let Ok((priority, bytes)) = healthy_outbox.try_recv() {
+                assert_eq!(priority, veil_proto::priority::INTERACTIVE);
+                let header =
+                    veil_proto::codec::decode_header(&bytes[..veil_proto::HEADER_SIZE]).unwrap();
+                assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+                sent += 1;
+            }
+        }
+        f.runtime.stop().await.unwrap();
+        observed.push((
+            all_full,
+            result.err().map(|e| e.kind()),
+            pending,
+            encoded,
+            copies,
+            sent,
+        ));
+    }
+    for (all_full, error, pending, encoded, copies, sent) in observed {
+        if all_full {
+            assert_eq!(error, Some(io::ErrorKind::WouldBlock));
+            assert_eq!(pending, std::collections::VecDeque::from([encoded]));
+            assert_eq!(copies, 0);
+        } else {
+            assert_eq!(error, None, "a healthy distinct first hop was never tried");
+            assert!(pending.is_empty());
+            assert_eq!(
+                copies, 1,
+                "failed attempts must not consume or inflate the copy budget"
+            );
+            assert_eq!(sent, 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn ack_fallback_keeps_receiver_binding_and_the_successful_copy_budget() {
+    for primary_known in [false, true] {
+        for different in ["cookie", "key"] {
+            let mut f = fixture().await;
+            let destination = [0xb9; 32];
+            let mut primary = route(&f.circuit, f.cells.me);
+            primary.envelope = CircuitEnvelope::ProtectedIntro {
+                peer_tag: [0x32; CIRCUIT_PEER_TAG_LEN],
+                receiver_x25519_pk: [3; 32],
+            };
+            f.cells
+                .stream_routes
+                .lock()
+                .await
+                .insert((destination, 71, RouteClass::Bulk), primary.clone());
+            let (wrong, _, mut wrong_outbox) = add_circuit(&f.cells.services);
+            let (good, _, mut good_outbox) = add_circuit(&f.cells.services);
+            let (extra, _, mut extra_outbox) = add_circuit(&f.cells.services);
+            for outbox in [&mut wrong_outbox, &mut good_outbox, &mut extra_outbox] {
+                while outbox.try_recv().is_ok() {}
+            }
+            let mut wrong = entry(&route(&wrong, f.cells.me), &[]);
+            if different == "cookie" {
+                wrong.peer_cookie[0] ^= 1;
+            } else {
+                wrong.receiver_x25519_pk[0] ^= 1;
+            }
+            f.cells.outbound_circuits.lock().await.insert(
+                destination,
+                vec![
+                    wrong,
+                    entry(&route(&good, f.cells.me), &[]),
+                    entry(&route(&extra, f.cells.me), &[]),
+                ],
+            );
+            let ack = frames(71)[2].clone();
+            let accepted = f
+                .cells
+                .send_ack_copies(destination, primary_known.then_some(&primary), &ack, 1)
+                .await;
+            let mut counts = [0usize; 3];
+            for (index, outbox) in [&mut wrong_outbox, &mut good_outbox, &mut extra_outbox]
+                .into_iter()
+                .enumerate()
+            {
+                while outbox.try_recv().is_ok() {
+                    counts[index] += 1;
+                }
+            }
+            f.cells.stream_routes.lock().await.clear();
+            let unbound = f.cells.send_ack_copies(destination, None, &ack, 1).await;
+            let no_unbound_frames = [&mut wrong_outbox, &mut good_outbox, &mut extra_outbox]
+                .into_iter()
+                .all(|outbox| outbox.try_recv().is_err());
+            let copies = f.cells.ack_dup_sent.load(Ordering::Relaxed);
+            f.runtime.stop().await.unwrap();
+            assert_eq!(accepted, 1);
+            assert_eq!(
+                counts,
+                [0, 1, 0],
+                "wrong receiver or excess ACK copies; primary_known={primary_known}, differing={different}"
+            );
+            assert_eq!(unbound, 0);
+            assert!(no_unbound_frames);
+            assert_eq!(copies, 1);
+        }
+    }
 }
 
 #[tokio::test]
