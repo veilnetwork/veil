@@ -61,6 +61,10 @@ pub struct SackRange {
 }
 
 /// A fixed-capacity, inline (alloc-free) list of up to [`MAX_SACKS`] ranges.
+/// An optional RFC 2883-style duplicate report occupies the first range:
+/// either below cumulative ACK, or enclosed by the second ordinary range.
+/// The v1 layout is unchanged; peers without duplicate feedback continue to
+/// use the ordinary SACK scoreboard.
 #[derive(Clone, Copy, Default)]
 pub struct SackVec {
     ranges: [SackRange; MAX_SACKS],

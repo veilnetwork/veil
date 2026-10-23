@@ -44,6 +44,9 @@ const BBR_ENGAGE_DELIVERED: u64 = 1024 * 1024;
 const BBR_MIN_RTT_WINDOW_MS: u64 = 30_000;
 /// Higher-sequence SACKed segments needed to establish a hole by count.
 const SACK_LOSS_THRESHOLD: usize = 3;
+/// RTT evidence and retransmission history expire independently of BBR.
+const RACK_SAMPLE_WINDOW_MS: u64 = 30_000;
+const RACK_REPAIR_HISTORY_LIMIT: usize = 128;
 
 /// Tunables. Bytes for windows, millis for timers.
 #[derive(Clone, Copy, Debug)]
@@ -360,6 +363,25 @@ struct TxState {
     rack_reo_max_ms: u32,
     /// Wake-up for segments whose RACK loss deadline is still in the future.
     rack_deadline: Option<u64>,
+    /// Original-only RTT evidence; independent of BBR and Karn-ambiguous repairs.
+    rack_min_rtt: Option<(u32, u64)>,
+    /// At most one matched duplicate observation per completed send round.
+    rack_dsack_round: Option<u32>,
+    /// Remaining DSACK-free recovery exits before forgetting the allowance.
+    rack_reo_persist: u8,
+    /// Bounded metadata only, populated on local repair reservation/handoff.
+    rack_repairs: VecDeque<RackRepair>,
+    /// Measured duplicate-feedback span above min RTT, capped at the current RTO when learned.
+    rack_dsack_reo_ms: u32,
+}
+
+/// No payload copies: bounded metadata survives cumulative ACK removal so a
+/// later duplicate report can identify a real, potentially spurious repair.
+struct RackRepair {
+    start: u32,
+    end: u32,
+    original_ms: u64,
+    handed_off_ms: Option<u64>,
 }
 
 struct RxState {
@@ -391,6 +413,8 @@ pub struct StreamEngine {
     /// budget, without reporting it as network loss or rotating shared routes.
     hs_local_deadline: Option<u64>,
     ack_pending: bool,
+    /// Optional RFC 2883-style first SACK; fresh DATA must not erase it before ACK encoding.
+    duplicate_range: Option<SackRange>,
     /// Delayed-ACK state: ACK after the configured number of advancing DATA
     /// segments, or after a short timer. Gaps/duplicates/FIN are immediate.
     ack_eliciting: u8,
@@ -505,6 +529,11 @@ impl StreamEngine {
                 rack_rtt_ms: 0,
                 rack_reo_max_ms: 0,
                 rack_deadline: None,
+                rack_min_rtt: None,
+                rack_dsack_round: None,
+                rack_reo_persist: 0,
+                rack_repairs: VecDeque::new(),
+                rack_dsack_reo_ms: 0,
             },
             rx: RxState {
                 rcv_nxt: 0,
@@ -523,6 +552,7 @@ impl StreamEngine {
             hs_local_pending: false,
             hs_local_deadline: None,
             ack_pending: false,
+            duplicate_range: None,
             ack_eliciting: 0,
             ack_deadline: None,
             rst_to_send: None,
@@ -572,6 +602,17 @@ impl StreamEngine {
                 segment.handed_off = true;
                 segment.sent_ms = now;
                 segment.sack_repair_deadline = None;
+                if self.cfg.rack && segment.retransmitted {
+                    let end = segment.end();
+                    if let Some(repair) = self
+                        .tx
+                        .rack_repairs
+                        .iter_mut()
+                        .find(|r| r.start == segment.seq && r.end == end)
+                    {
+                        repair.handed_off_ms = Some(now);
+                    }
+                }
             }
         }
         if self.tx.next_sack_repair_ms.is_some() {
@@ -823,6 +864,21 @@ impl StreamEngine {
         if payload.is_empty() {
             return;
         }
+        let end = seg_seq.wrapping_add(payload.len() as u32);
+        let duplicate_range = if seq::lt(seg_seq, self.rx.rcv_nxt) {
+            Some(SackRange {
+                start: seg_seq,
+                end: seq::min(end, self.rx.rcv_nxt),
+            })
+        } else {
+            self.rx.oo.get(&seg_seq).map(|old| SackRange {
+                start: seg_seq,
+                end: seq::min(end, seg_seq.wrapping_add(old.len() as u32)),
+            })
+        };
+        if duplicate_range.is_some() {
+            self.duplicate_range = duplicate_range;
+        }
         let advanced = self.rx.accept(seg_seq, payload);
         self.ack_data(advanced, now);
     }
@@ -860,6 +916,8 @@ impl StreamEngine {
         if seq::gt(ack, self.tx.ack_limit()) {
             return;
         }
+        // ACK fields are simultaneous evidence, not sequential network arrivals.
+        let prior_rack_frontier = self.tx.rack_xmit_ms;
         // SACK: mark fully-covered unacked segments as RECEIVED so a later RTO /
         // fast-retransmit never resends them (the big source of duplicate cells
         // over the high-RTT onion path).
@@ -873,7 +931,8 @@ impl StreamEngine {
                     self.tx.segs[i].needs_resend = false;
                     self.tx.segs[i].sack_repair_deadline = None;
                     if self.cfg.rack && !retransmitted {
-                        self.tx.rack_on_delivery(sent_ms, end, now);
+                        self.tx
+                            .rack_on_delivery(sent_ms, end, now, prior_rack_frontier);
                     }
                 }
             }
@@ -888,8 +947,9 @@ impl StreamEngine {
                     let s = self.tx.segs.pop_front().unwrap();
                     if !s.retransmitted {
                         rtt_sample = Some(now.saturating_sub(s.sent_ms) as u32);
-                        if self.cfg.rack {
-                            self.tx.rack_on_delivery(s.sent_ms, s.end(), now);
+                        if self.cfg.rack && !s.sacked {
+                            self.tx
+                                .rack_on_delivery(s.sent_ms, s.end(), now, prior_rack_frontier);
                         }
                     }
                     if s.is_fin {
@@ -903,6 +963,8 @@ impl StreamEngine {
             self.tx.snd_una = ack;
             self.tx.trim_rewound_pending_after_ack(ack);
             self.tx.dup_acks = 0;
+            let recovery_exited =
+                self.tx.consec_rto > 0 || (self.tx.in_recovery && seq::geq(ack, self.tx.recover));
             self.tx.consec_rto = 0; // progress: reset dead-link counter
             if self.cfg.bbr {
                 self.tx.bbr_on_delivered(acked, now);
@@ -936,6 +998,9 @@ impl StreamEngine {
                 self.tx.cwnd = self.tx.cwnd.saturating_add(inc); // congestion avoidance
             }
 
+            if recovery_exited {
+                self.tx.complete_rack_recovery();
+            }
             if let Some(r) = rtt_sample {
                 if self.cfg.bbr {
                     self.tx.bbr_on_rtt(r, now);
@@ -977,6 +1042,9 @@ impl StreamEngine {
         // RACK: every ACK (cumulative, SACK or duplicate) may have advanced the
         // delivery frontier — re-run time-threshold detection once per ACK. A
         // dup-ACK count never declares loss here; only time + a later delivery.
+        if self.cfg.rack {
+            self.tx.note_dsack(ack, sacks, now);
+        }
         if self.cfg.rack && self.rack_detect_loss(now) && !self.tx.in_recovery {
             self.enter_fast_recovery();
         }
@@ -1106,6 +1174,16 @@ impl StreamEngine {
                 self.tx.segs[idx].sack_repair_deadline = None;
                 if self.tx.next_sack_repair_ms.is_some() {
                     self.tx.refresh_sack_repair_deadline();
+                }
+                if self.cfg.rack {
+                    let s = &self.tx.segs[idx];
+                    self.tx.record_rack_repair(
+                        s.seq,
+                        s.end(),
+                        s.sent_ms,
+                        (!self.track_local_handoffs).then_some(now),
+                        now,
+                    );
                 }
                 self.tx.segs[idx].retransmitted = true;
                 self.tx.segs[idx].sent_ms = now;
@@ -1369,7 +1447,8 @@ impl StreamEngine {
             Some((r, _)) => r / 4,
             None => self.tx.srtt.unwrap_or(0) / 4,
         };
-        base.max(self.cfg.rack_reo_floor_ms)
+        base.max(self.tx.rack_dsack_reo_ms)
+            .max(self.cfg.rack_reo_floor_ms)
             .max((self.tx.rack_reo_max_ms / 4).saturating_mul(5))
             .max(5)
     }
@@ -1430,9 +1509,28 @@ impl StreamEngine {
         }
     }
 
-    fn make_ack(&self) -> Frame<'static> {
+    fn make_ack(&mut self) -> Frame<'static> {
         let mut sacks = SackVec::new();
-        for (start, end) in self.rx.sack_blocks() {
+        let blocks = self.rx.sack_blocks();
+        let duplicate = self.duplicate_range.take();
+        let enclosing = duplicate
+            .filter(|d| seq::geq(d.start, self.rx.rcv_nxt))
+            .and_then(|d| {
+                blocks
+                    .iter()
+                    .find(|(a, b)| seq::leq(*a, d.start) && seq::geq(*b, d.end))
+                    .copied()
+            });
+        if let Some(d) = duplicate {
+            let _ = sacks.push(d);
+        }
+        if let Some((start, end)) = enclosing {
+            let _ = sacks.push(SackRange { start, end });
+        }
+        for (start, end) in blocks {
+            if enclosing == Some((start, end)) {
+                continue;
+            }
             if !sacks.push(SackRange { start, end }) {
                 break;
             }
@@ -1821,6 +1919,109 @@ fn encode(frame: Frame<'_>, out: &mut Vec<u8>) {
 }
 
 impl TxState {
+    /// Keep only recent, actually handed-off repairs as evidence for D-SACK.
+    /// A queued candidate is not evidence until local_handoff accepts it.
+    fn record_rack_repair(
+        &mut self,
+        start: u32,
+        end: u32,
+        original_ms: u64,
+        handed_off_ms: Option<u64>,
+        now: u64,
+    ) {
+        self.rack_repairs.retain(|r| {
+            now.saturating_sub(r.handed_off_ms.unwrap_or(r.original_ms)) <= RACK_SAMPLE_WINDOW_MS
+        });
+        if let Some(repair) = self
+            .rack_repairs
+            .iter_mut()
+            .find(|r| r.start == start && r.end == end)
+        {
+            if handed_off_ms.is_some() {
+                repair.handed_off_ms = handed_off_ms;
+            }
+            return;
+        }
+        if self.rack_repairs.len() == RACK_REPAIR_HISTORY_LIMIT {
+            self.rack_repairs.pop_front();
+        }
+        self.rack_repairs.push_back(RackRepair {
+            start,
+            end,
+            original_ms,
+            handed_off_ms,
+        });
+    }
+
+    fn note_dsack(&mut self, ack: u32, sacks: &SackVec, now: u64) {
+        let Some(first) = sacks.as_slice().first() else {
+            return;
+        };
+        if !seq::lt(first.start, first.end) || seq::gt(first.end, self.ack_limit()) {
+            return;
+        }
+        // RFC 2883 layout: duplicate below cumulative ACK, or an above-ACK
+        // duplicate enclosed in the immediately following ordinary SACK.
+        let duplicate = seq::leq(first.end, ack)
+            || sacks
+                .as_slice()
+                .get(1)
+                .is_some_and(|r| seq::leq(r.start, first.start) && seq::geq(r.end, first.end));
+        if !duplicate {
+            return;
+        }
+        let Some((minimum, _)) = self
+            .rack_min_rtt
+            .filter(|(_, at)| now.saturating_sub(*at) <= RACK_SAMPLE_WINDOW_MS)
+        else {
+            return;
+        };
+        let mut observation: Option<u64> = None;
+        self.rack_repairs.retain(|r| {
+            let Some(at) = r.handed_off_ms else {
+                return true;
+            };
+            if now.saturating_sub(at) > RACK_SAMPLE_WINDOW_MS {
+                return false;
+            }
+            if seq::leq(first.start, r.start) && seq::geq(first.end, r.end) {
+                let span = now
+                    .saturating_sub(r.original_ms)
+                    .saturating_sub(u64::from(minimum));
+                observation = Some(observation.map_or(span, |old| old.min(span)));
+                false // One report per actual repair; replay cannot grow the window.
+            } else {
+                true
+            }
+        });
+        let Some(observation) = observation else {
+            return;
+        };
+        if self
+            .rack_dsack_round
+            .is_some_and(|end| seq::geq(self.snd_una, end))
+        {
+            self.rack_dsack_round = None;
+        }
+        if self.rack_dsack_round.is_none() {
+            // Both DATA and ACK may take different paths. SRTT alone can be
+            // below their measured settling spread. Use matched duplicate
+            // feedback, bounded by the existing RTO, without changing RTO.
+            self.rack_dsack_reo_ms = self
+                .rack_dsack_reo_ms
+                .max(observation.min(self.rto_ms).min(u64::from(u32::MAX)) as u32);
+            self.rack_reo_persist = 16;
+            self.rack_dsack_round = Some(self.snd_nxt);
+        }
+    }
+
+    fn complete_rack_recovery(&mut self) {
+        self.rack_reo_persist = self.rack_reo_persist.saturating_sub(1);
+        if self.rack_reo_persist == 0 {
+            self.rack_dsack_reo_ms = 0;
+        }
+    }
+
     fn refresh_sack_repair_deadline(&mut self) {
         self.next_sack_repair_ms = self
             .segs
@@ -1888,13 +2089,22 @@ impl TxState {
     /// Record one delivered ORIGINAL segment into the RACK state. Advances the
     /// "most recently sent, known delivered" point and, when the delivered
     /// segment had been overtaken (a later send already delivered), learns the
-    /// reordering window from the gap.
-    fn rack_on_delivery(&mut self, seg_sent_ms: u64, seg_end: u32, now: u64) {
-        if self.rack_xmit_ms > seg_sent_ms {
-            // Overtaken original finally arrived: the send-time gap to the
-            // newest delivered segment is exactly the reordering tolerance
-            // RACK must allow before declaring the next such laggard lost.
-            let sample = (self.rack_xmit_ms - seg_sent_ms).min(u32::MAX as u64) as u32;
+    /// reordering window from the gap. Already-SACKed bytes must never call
+    /// this again at cumulative ACK; compare with the pre-ACK frontier so ACK
+    /// field iteration order cannot manufacture a late delivery.
+    fn rack_on_delivery(&mut self, seg_sent_ms: u64, seg_end: u32, now: u64, prior_frontier: u64) {
+        let rtt = now.saturating_sub(seg_sent_ms).min(u64::from(u32::MAX)) as u32;
+        if self
+            .rack_min_rtt
+            .is_none_or(|(r, t)| rtt <= r || now.saturating_sub(t) > RACK_SAMPLE_WINDOW_MS)
+        {
+            self.rack_min_rtt = Some((rtt.max(1), now));
+        }
+        if prior_frontier > seg_sent_ms {
+            // A newly reported original trails the previous ACK's frontier.
+            // The send-time gap is one reordering signal; matched D-SACKs
+            // separately cover repairs that made original timing ambiguous.
+            let sample = (prior_frontier - seg_sent_ms).min(u32::MAX as u64) as u32;
             self.rack_reo_max_ms = self.rack_reo_max_ms.max(sample);
         }
         if seg_sent_ms > self.rack_xmit_ms
@@ -1902,7 +2112,7 @@ impl TxState {
         {
             self.rack_xmit_ms = seg_sent_ms;
             self.rack_end_seq = seg_end;
-            self.rack_rtt_ms = now.saturating_sub(seg_sent_ms).min(u32::MAX as u64) as u32;
+            self.rack_rtt_ms = rtt;
         }
     }
 
@@ -3126,5 +3336,348 @@ mod tests {
             e.tx.segs.iter().any(|s| s.needs_resend),
             "SACK RTO should still mark proven holes for paced repair"
         );
+    }
+    #[test]
+    fn rack_delivery_counted_once() {
+        let mut e = repeated_sack_holes(true);
+        e.cfg.rack = true;
+        for s in &mut e.tx.segs {
+            s.sacked = false;
+            s.retransmitted = false;
+            s.local_pending = true;
+            s.handed_off = false;
+            s.sent_ms = 0;
+        }
+        // Accept the original head and next original in distinct real local
+        // handoffs. Other reserved cells have not left yet.
+        for (index, at) in [(0, 1), (1, 10)] {
+            let token = LocalTransmit::for_segment(&e.tx.segs[index]);
+            e.local_handoff(&HashMap::from([(token, 1)]), at);
+        }
+        let mut cell = Vec::new();
+        let mut sacks = SackVec::new();
+        assert!(sacks.push(SackRange {
+            start: 117,
+            end: 133
+        }));
+        Frame::Ack {
+            stream_id: 9,
+            ack: 101,
+            win: 4096,
+            sacks,
+        }
+        .encode_into(&mut cell);
+        e.on_cell(&cell, 20);
+        assert_eq!(e.tx.rack_reo_max_ms, 0);
+        // The head repair leaves later; another original is accepted afterwards.
+        assert!(e.poll_transmit(90, &mut cell));
+        assert!(matches!(
+            Frame::decode(&cell),
+            Some(Frame::Data { seq: 101, .. })
+        ));
+        let head_repair = LocalTransmit::from_cell(&cell).unwrap();
+        e.local_handoff(&HashMap::from([(head_repair, 1)]), 90);
+        let later_original = LocalTransmit::for_segment(&e.tx.segs[3]);
+        e.local_handoff(&HashMap::from([(later_original, 1)]), 100);
+        let mut sacks = SackVec::new();
+        assert!(sacks.push(SackRange {
+            start: 149,
+            end: 165
+        }));
+        Frame::Ack {
+            stream_id: 9,
+            ack: 101,
+            win: 4096,
+            sacks,
+        }
+        .encode_into(&mut cell);
+        e.on_cell(&cell, 110);
+        assert_eq!(e.tx.rack_reo_max_ms, 0);
+        // This cumulative ACK adds only the repaired head. The original at 10ms
+        // was already reported at 20ms; it has not just arrived late at 120ms.
+        Frame::Ack {
+            stream_id: 9,
+            ack: 133,
+            win: 4096,
+            sacks: SackVec::new(),
+        }
+        .encode_into(&mut cell);
+        e.on_cell(&cell, 120);
+        assert_eq!(
+            e.tx.rack_reo_max_ms, 0,
+            "previously SACKed original was counted again as a newly late delivery"
+        );
+    }
+    #[test]
+    fn rack_ack_field_order_does_not_invent_reordering() {
+        let mut e = repeated_sack_holes(false);
+        e.cfg.rack = true;
+        for (i, s) in e.tx.segs.iter_mut().enumerate() {
+            s.sacked = false;
+            s.retransmitted = false;
+            s.sent_ms = 10 * (i as u64 + 1);
+        }
+        let mut sacks = SackVec::new();
+        assert!(sacks.push(SackRange {
+            start: 181,
+            end: 197
+        }));
+        // A single ACK reports the early prefix and a later SACK together.
+        e.on_ack(165, 4096, &sacks, 200);
+        assert_eq!(e.tx.rack_reo_max_ms, 0);
+        assert_eq!(e.tx.rack_xmit_ms, 60);
+        // A genuinely new, overtaken original is different evidence.
+        e.on_ack(181, 4096, &SackVec::new(), 210);
+        assert_eq!(e.tx.rack_reo_max_ms, 10);
+    }
+
+    #[test]
+    fn rack_repeated_sack_does_not_resample_delivery_or_minimum_rtt() {
+        let mut e = repeated_sack_holes(false);
+        e.cfg.rack = true;
+        e.tx.segs[3].sacked = false;
+        let mut sacks = SackVec::new();
+        assert!(sacks.push(SackRange {
+            start: 149,
+            end: 165
+        }));
+        e.on_ack(101, 4096, &sacks, 20);
+        let timing = (e.tx.rack_rtt_ms, e.tx.rack_min_rtt, e.tx.rack_xmit_ms);
+        e.on_ack(101, 4096, &sacks, 2000);
+        assert_eq!(
+            (e.tx.rack_rtt_ms, e.tx.rack_min_rtt, e.tx.rack_xmit_ms),
+            timing
+        );
+    }
+
+    fn duplicate_receiver(start: u32) -> StreamEngine {
+        let mut e = StreamEngine::accept(9, Config::default(), 0, 500);
+        e.phase = Phase::Established;
+        e.syn_acked = true;
+        e.rx.rcv_nxt = start;
+        e
+    }
+
+    #[test]
+    fn dsack_reports_only_duplicate_prefix_and_survives_fresh_data() {
+        for start in [100u32, u32::MAX - 7] {
+            let mut e = duplicate_receiver(start);
+            e.on_data(start, 4096, &[1; 16], 1);
+            e.on_data(start.wrapping_add(8), 4096, &[2; 16], 2);
+            e.on_data(start.wrapping_add(24), 4096, &[3; 8], 3);
+            let mut wire = Vec::new();
+            e.make_ack().encode_into(&mut wire);
+            let Some(Frame::Ack { ack, sacks, .. }) = Frame::decode(&wire) else {
+                panic!("ACK lost wire compatibility");
+            };
+            assert_eq!(ack, start.wrapping_add(32));
+            assert_eq!(
+                sacks.as_slice(),
+                &[SackRange {
+                    start: start.wrapping_add(8),
+                    end: start.wrapping_add(16)
+                }]
+            );
+            assert_eq!(
+                e.readable_len(),
+                32,
+                "duplicate bytes reached the application"
+            );
+            let Frame::Ack { sacks, .. } = e.make_ack() else {
+                unreachable!()
+            };
+            assert!(
+                sacks.as_slice().is_empty(),
+                "duplicate report was replayed without new DATA"
+            );
+        }
+    }
+
+    #[test]
+    fn dsack_above_ack_has_enclosing_second_block_even_at_wire_capacity() {
+        let mut e = duplicate_receiver(100);
+        for i in 1..=10 {
+            e.on_data(100 + i * 32, 4096, &[1; 16], u64::from(i));
+        }
+        e.on_data(420, 4096, &[1; 16], 20);
+        let mut wire = Vec::new();
+        e.make_ack().encode_into(&mut wire);
+        let Some(Frame::Ack { ack, sacks, .. }) = Frame::decode(&wire) else {
+            panic!("invalid SACK encoding");
+        };
+        assert_eq!(ack, 100);
+        assert_eq!(sacks.as_slice().len(), crate::wire::MAX_SACKS);
+        assert_eq!(
+            sacks.as_slice()[0],
+            SackRange {
+                start: 420,
+                end: 436
+            }
+        );
+        assert_eq!(
+            sacks.as_slice()[1],
+            SackRange {
+                start: 420,
+                end: 436
+            }
+        );
+        assert_eq!(e.readable_len(), 0);
+    }
+
+    fn duplicate_feedback() -> (StreamEngine, SackVec) {
+        let mut e = repeated_sack_holes(false);
+        e.cfg.rack = true;
+        e.tx.rack_min_rtt = Some((20, 20));
+        e.tx.rto_ms = 1000;
+        let mut sacks = SackVec::new();
+        assert!(sacks.push(SackRange {
+            start: 101,
+            end: 117
+        }));
+        (e, sacks)
+    }
+
+    #[test]
+    fn dsack_feedback_requires_a_real_recent_matching_handoff() {
+        for invalid in 0..6 {
+            let (mut e, mut sacks) = duplicate_feedback();
+            let mut ack = 117;
+            match invalid {
+                0 => {}                                                     // Never retransmitted.
+                1 => e.tx.record_rack_repair(101, 117, 10, None, 100),      // Local queue only.
+                2 => e.tx.record_rack_repair(117, 133, 10, Some(100), 100), // Unrelated range.
+                3 => {
+                    e.tx.record_rack_repair(101, 117, 10, Some(100), 100);
+                    ack = 101;
+                } // Ordinary SACK.
+                4 => {
+                    e.tx.record_rack_repair(101, 117, 10, Some(100), 100);
+                    sacks = SackVec::new();
+                    assert!(sacks.push(SackRange {
+                        start: 101,
+                        end: 300
+                    }));
+                }
+                _ => {
+                    e.tx.record_rack_repair(101, 117, 10, Some(100), 100);
+                    e.tx.rack_min_rtt = None;
+                }
+            }
+            e.tx.note_dsack(ack, &sacks, 300);
+            assert_eq!(e.tx.rack_dsack_reo_ms, 0, "invalid evidence case {invalid}");
+            assert_eq!(e.tx.rack_reo_persist, 0);
+        }
+        let (mut e, sacks) = duplicate_feedback();
+        e.tx.record_rack_repair(101, 117, 10, Some(100), 100);
+        e.tx.rack_min_rtt = Some((20, 100 + RACK_SAMPLE_WINDOW_MS));
+        e.tx.note_dsack(117, &sacks, 100 + RACK_SAMPLE_WINDOW_MS + 1);
+        assert_eq!(e.tx.rack_dsack_reo_ms, 0, "expired repair was accepted");
+        assert!(e.tx.rack_repairs.is_empty());
+    }
+
+    #[test]
+    fn dsack_feedback_is_consumed_and_capped_without_changing_rto() {
+        let (mut e, sacks) = duplicate_feedback();
+        e.tx.record_rack_repair(101, 117, 10, Some(100), 100);
+        e.tx.note_dsack(117, &sacks, 300);
+        assert_eq!(e.tx.rack_dsack_reo_ms, 270);
+        assert!(e.tx.rack_repairs.is_empty());
+        // Even after a round has completed, an old report cannot grow the allowance.
+        e.tx.snd_una = e.tx.snd_nxt;
+        e.tx.note_dsack(117, &sacks, 2000);
+        assert_eq!(e.tx.rack_dsack_reo_ms, 270);
+        e.tx.record_rack_repair(101, 117, 10, Some(2100), 2100);
+        e.tx.note_dsack(117, &sacks, 2200);
+        assert_eq!(e.tx.rack_dsack_reo_ms, 1000);
+        assert_eq!(e.tx.rto_ms, 1000);
+        for _ in 0..15 {
+            e.tx.complete_rack_recovery();
+        }
+        assert_eq!(e.tx.rack_dsack_reo_ms, 1000);
+        e.tx.complete_rack_recovery();
+        assert_eq!(e.tx.rack_dsack_reo_ms, 0);
+    }
+
+    #[test]
+    fn dsack_above_ack_and_sequence_wrap_are_recognized() {
+        for above in [false, true] {
+            let (mut e, _) = duplicate_feedback();
+            let start = u32::MAX - 7;
+            let end = start.wrapping_add(16);
+            e.tx.snd_nxt = 100;
+            let mut sacks = SackVec::new();
+            assert!(sacks.push(SackRange { start, end }));
+            if above {
+                assert!(sacks.push(SackRange {
+                    start: start.wrapping_sub(8),
+                    end: 16
+                }));
+            }
+            e.tx.record_rack_repair(start, end, 10, Some(100), 100);
+            e.tx.note_dsack(
+                if above { start.wrapping_sub(16) } else { end },
+                &sacks,
+                300,
+            );
+            assert_eq!(e.tx.rack_dsack_reo_ms, 270);
+        }
+    }
+
+    #[test]
+    fn rack_repair_history_is_bounded_and_queued_retries_do_not_erase_handoff() {
+        let (mut e, _) = duplicate_feedback();
+        for i in 0..RACK_REPAIR_HISTORY_LIMIT + 20 {
+            e.tx.record_rack_repair(i as u32, i as u32 + 1, 10, Some(100), 100);
+        }
+        assert_eq!(e.tx.rack_repairs.len(), RACK_REPAIR_HISTORY_LIMIT);
+        assert_eq!(e.tx.rack_repairs[0].start, 20);
+        e.tx.record_rack_repair(147, 148, 50, None, 200);
+        let last = e.tx.rack_repairs.back().unwrap();
+        assert_eq!((last.original_ms, last.handed_off_ms), (10, Some(100)));
+        e.tx.record_rack_repair(
+            500,
+            501,
+            300,
+            Some(200 + RACK_SAMPLE_WINDOW_MS),
+            200 + RACK_SAMPLE_WINDOW_MS,
+        );
+        assert_eq!(e.tx.rack_repairs.len(), 1);
+    }
+
+    #[test]
+    fn tracked_repair_is_not_dsack_evidence_until_actual_handoff() {
+        let mut e = repeated_sack_holes(true);
+        e.cfg.rack = true;
+        e.tx.rack_min_rtt = Some((20, 20));
+        e.tx.segs[0].retransmitted = false;
+        e.tx.segs[0].needs_resend = true;
+        let mut wire = Vec::new();
+        assert!(e.poll_transmit(100, &mut wire));
+        assert_eq!(e.tx.rack_repairs.len(), 1);
+        assert!(e.tx.rack_repairs[0].handed_off_ms.is_none());
+        let mut sacks = SackVec::new();
+        assert!(sacks.push(SackRange {
+            start: 101,
+            end: 117
+        }));
+        e.tx.note_dsack(117, &sacks, 120);
+        assert_eq!(e.tx.rack_dsack_reo_ms, 0);
+        let token = LocalTransmit::from_cell(&wire).unwrap();
+        e.local_handoff(&HashMap::from([(token, 1)]), 150);
+        e.on_ack(117, 4096, &sacks, 180);
+        assert_eq!(
+            e.tx.segs.front().unwrap().seq,
+            117,
+            "D-SACK must match history after cumulative removal"
+        );
+        assert_eq!(e.tx.rack_dsack_reo_ms, 100);
+    }
+    #[test]
+    fn dsack_does_not_learn_from_expired_original_rtt() {
+        let (mut e, sacks) = duplicate_feedback();
+        let now = RACK_SAMPLE_WINDOW_MS + 100;
+        e.tx.record_rack_repair(101, 117, 10, Some(now - 10), now - 10);
+        e.tx.note_dsack(117, &sacks, now);
+        assert_eq!(e.tx.rack_dsack_reo_ms, 0);
     }
 }
