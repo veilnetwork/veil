@@ -23,8 +23,8 @@ use crate::wire::{Frame, MSS, SackRange, SackVec, reset_reason};
 const BBR_RATE_WINDOW_MS: u64 = 2_000;
 /// Minimum spacing between delivery checkpoints.
 const BBR_SAMPLE_SPACING_MS: u64 = 20;
-/// Minimum span/bytes before a window qualifies as a rate sample — thinner
-/// windows are treated as app-limited and leave the estimate untouched.
+/// Minimum sample span, and the strict byte floor for app-limited observations.
+/// Backlogged low-rate probes scale the byte floor to the current model/MSS.
 const BBR_MIN_SPAN_MS: u64 = 300;
 const BBR_MIN_DELIVERED: u64 = 64 * 1024;
 /// The bottleneck-rate estimate is the MAX of qualifying samples over this
@@ -924,6 +924,8 @@ impl StreamEngine {
         }
         // ACK fields are simultaneous evidence, not sequential network arrivals.
         let prior_rack_frontier = self.tx.rack_xmit_ms;
+        let old_una = self.tx.snd_una;
+        let mut newly_delivered = 0u32;
         // BBR measures first receipt of an original, including SACK. RTO
         // deliberately keeps its cumulative-ACK timing policy: fast-route SACKs
         // alone cannot safely shorten the deadline for slower in-flight cells.
@@ -937,6 +939,9 @@ impl StreamEngine {
                 if s.handed_off && !s.sacked && seq::geq(s.seq, r.start) && seq::leq(s.end(), r.end)
                 {
                     let (sent_ms, end, retransmitted) = (s.sent_ms, s.end(), s.retransmitted);
+                    if !s.is_fin && seq::gt(end, old_una) {
+                        newly_delivered += end.wrapping_sub(seq::max(s.seq, old_una));
+                    }
                     self.tx.segs[i].sacked = true;
                     self.tx.segs[i].needs_resend = false;
                     self.tx.segs[i].sack_repair_deadline = None;
@@ -954,10 +959,18 @@ impl StreamEngine {
 
         if seq::gt(ack, self.tx.snd_una) {
             // ---- new data acknowledged ----
+            // SACK is first-delivery evidence, including on this very ACK.
+            // Subtract its overlap before crediting cumulative progress so
+            // repairing a hole does not deliver the already-received tail twice.
+            let mut sacked_overlap = 0u32;
+            let fin_was_acked = self.tx.fin_acked;
             let mut rtt_sample: Option<u32> = None;
             while let Some(front) = self.tx.segs.front() {
                 if seq::leq(front.end(), ack) {
                     let s = self.tx.segs.pop_front().unwrap();
+                    if s.sacked && !s.is_fin && seq::gt(s.end(), old_una) {
+                        sacked_overlap += s.end().wrapping_sub(seq::max(s.seq, old_una));
+                    }
                     if !s.retransmitted {
                         rtt_sample = Some(now.saturating_sub(s.sent_ms) as u32);
                         if s.handed_off && !s.sacked {
@@ -976,16 +989,26 @@ impl StreamEngine {
                     break;
                 }
             }
+            if let Some(s) = self.tx.segs.front()
+                && s.sacked
+                && !s.is_fin
+            {
+                let start = seq::max(s.seq, old_una);
+                if seq::gt(ack, start) {
+                    sacked_overlap += ack.wrapping_sub(start);
+                }
+            }
             let acked = ack.wrapping_sub(self.tx.snd_una);
             self.tx.snd_una = ack;
             self.tx.trim_rewound_pending_after_ack(ack);
+            let fin_delivered = u32::from(!fin_was_acked && self.tx.fin_acked);
+            newly_delivered += acked
+                .saturating_sub(sacked_overlap)
+                .saturating_sub(fin_delivered);
             self.tx.dup_acks = 0;
             let recovery_exited =
                 self.tx.consec_rto > 0 || (self.tx.in_recovery && seq::geq(ack, self.tx.recover));
             self.tx.consec_rto = 0; // progress: reset dead-link counter
-            if self.cfg.bbr {
-                self.tx.bbr_on_delivered(acked, now);
-            }
 
             if self.tx.in_recovery {
                 if seq::geq(ack, self.tx.recover) {
@@ -1058,6 +1081,10 @@ impl StreamEngine {
             if self.cfg.bbr {
                 self.tx.bbr_on_rtt(rtt, now);
             }
+        }
+        if self.cfg.bbr && newly_delivered > 0 {
+            self.tx
+                .bbr_on_delivered(newly_delivered, now, !self.tx.pending.is_empty(), mss);
         }
         // RACK: every ACK (cumulative, SACK or duplicate) may have advanced the
         // delivery frontier — re-run time-threshold detection once per ACK. A
@@ -1853,7 +1880,11 @@ impl StreamEngine {
             // shapes the wire burst, and one 32-cell tick (~130 KB) is far
             // below the relay-queue sizes that caused historic burst loss.
             let cells_per_sec = (rate / mss).max(1);
-            let interval = (32_000 / cells_per_sec).clamp(1, 100);
+            // A smaller configured batch must shorten the interval too;
+            // clamping only the budget would cap throughput at batch/100 ms
+            // and prevent the delivery model from probing past that rate.
+            let quantum = self.cfg.max_pacing_batch.clamp(1, 32) as u64;
+            let interval = (quantum * 1000 / cells_per_sec).clamp(1, 100);
             let batch = (rate.saturating_mul(interval))
                 .div_ceil(1000 * mss)
                 .clamp(1, self.cfg.max_pacing_batch.max(1) as u64) as u32;
@@ -2175,7 +2206,7 @@ impl TxState {
     /// Record newly delivered bytes and refresh the bottleneck-rate estimate
     /// over a sliding window of delivery checkpoints. Quiet/app-limited spans
     /// produce no qualifying sample and leave the estimate untouched.
-    fn bbr_on_delivered(&mut self, acked: u32, now: u64) {
+    fn bbr_on_delivered(&mut self, acked: u32, now: u64, backlogged: bool, mss: u32) {
         self.delivered = self.delivered.saturating_add(acked as u64);
         let push = self
             .rate_samples
@@ -2201,7 +2232,20 @@ impl TxState {
         };
         let span = t1.saturating_sub(t0);
         let bytes = d1.saturating_sub(d0);
-        if span < BBR_MIN_SPAN_MS || bytes < BBR_MIN_DELIVERED {
+        // A fixed 64 KiB gate cannot be reached inside the 2 s rate window
+        // when our own low model paces a backlogged flow below that volume.
+        // Qualify a probe at the current model's minimum sample span instead,
+        // retaining both the time floor and at least one full segment. Sparse
+        // application traffic keeps the strict gate and cannot overwrite a seed.
+        let min_bytes = if backlogged {
+            (self.btl_bw.saturating_mul(BBR_MIN_SPAN_MS) / 1000).clamp(
+                u64::from(mss.max(1)).min(BBR_MIN_DELIVERED),
+                BBR_MIN_DELIVERED,
+            )
+        } else {
+            BBR_MIN_DELIVERED
+        };
+        if span < BBR_MIN_SPAN_MS || bytes < min_bytes {
             return;
         }
         let sample = bytes.saturating_mul(1000) / span.max(1);
@@ -2436,6 +2480,269 @@ impl RxState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backlogged_bbr_can_outprobe_a_low_seed_on_a_fast_path() {
+        for seed in [8192, 12440, 24576] {
+            for batch in [1, 4, 256] {
+                let (rate, delivered, pending) = paced_warm_path(seed, false, batch, 256 * 1024);
+                eprintln!(
+                    "seed={seed} batch={batch} final_rate={rate} delivered={delivered} pending={pending}"
+                );
+                assert!(pending > 1024 * 1024, "test must stay backlogged");
+                assert!(
+                    rate > seed * 4,
+                    "backlogged model stayed at its low seed: {seed} -> {rate}"
+                );
+                assert!(
+                    rate > 200 * 1024,
+                    "model did not discover the fast link: {rate}"
+                );
+                assert!(
+                    delivered > 1024 * 1024,
+                    "fast path remained throttled by its warm model"
+                );
+                assert!(rate < 350 * 1024, "model exceeded the serialized test link");
+            }
+        }
+        let seed = 128 * 1024;
+        let (rate, delivered, _) = paced_warm_path(seed, true, 4, 256 * 1024);
+        assert!(delivered > 0 && delivered < 65536);
+        assert_eq!(
+            rate, seed,
+            "sparse app writes must not replace the warm model"
+        );
+    }
+
+    // Real engine pacing/ACK transitions on a 256 KiB/s serialized duplex link.
+    // Each direction adds 5 ms propagation; no drops or cross-device clocks.
+    fn paced_warm_path(seed: u64, sparse: bool, batch: u32, link_rate: u64) -> (u64, u64, usize) {
+        let cfg = Config {
+            bbr: true,
+            mss: 1024,
+            init_cwnd: 4096,
+            recv_window: 1024 * 1024,
+            warm_btl_bw: seed,
+            warm_rtt_min_ms: 100,
+            ack_every: 1,
+            ack_delay_ms: 0,
+            max_pacing_batch: batch,
+            ..Config::default()
+        };
+        let mut sender = StreamEngine::connect(7, cfg, 0, 100);
+        let mut receiver = StreamEngine::accept(
+            7,
+            Config {
+                bbr: false,
+                warm_btl_bw: 0,
+                ..cfg
+            },
+            0,
+            500,
+        );
+        if !sparse {
+            sender.write(&vec![0x39; 16 * 1024 * 1024]);
+        }
+        let mut forward = VecDeque::<(u64, Vec<u8>)>::new();
+        let mut reverse = VecDeque::<(u64, Vec<u8>)>::new();
+        let (mut forward_ready, mut reverse_ready) = (0u64, 0u64);
+        let mut cell = Vec::new();
+        let mut consumed = [0u8; 65536];
+        for now in 0..=20000u64 {
+            if sparse && now > 0 && now % 50 == 0 {
+                sender.write(&[0x39; 100]);
+            }
+            while forward.front().is_some_and(|(at, _)| *at <= now) {
+                receiver.on_cell(&forward.pop_front().unwrap().1, now);
+            }
+            while reverse.front().is_some_and(|(at, _)| *at <= now) {
+                sender.on_cell(&reverse.pop_front().unwrap().1, now);
+            }
+            while receiver.read(&mut consumed) > 0 {}
+            sender.on_timeout(now);
+            receiver.on_timeout(now);
+            for _ in 0..8 {
+                if !sender.poll_transmit(now, &mut cell) {
+                    break;
+                }
+                forward_ready =
+                    forward_ready.max(now) + (cell.len() as u64 * 1000).div_ceil(link_rate);
+                forward.push_back((forward_ready + 5, cell.clone()));
+            }
+            for _ in 0..8 {
+                if !receiver.poll_transmit(now, &mut cell) {
+                    break;
+                }
+                reverse_ready =
+                    reverse_ready.max(now) + (cell.len() as u64 * 1000).div_ceil(link_rate);
+                reverse.push_back((reverse_ready + 5, cell.clone()));
+            }
+        }
+        (
+            sender.tx.btl_bw,
+            sender.tx.delivered,
+            sender.tx.pending.len(),
+        )
+    }
+
+    #[test]
+    fn bbr_counts_first_sack_delivery_once_before_the_hole_is_repaired() {
+        let cfg = Config {
+            bbr: true,
+            mss: 1024,
+            init_cwnd: 256 * 1024,
+            recv_window: 1024 * 1024,
+            ..Config::default()
+        };
+        let mut engine = StreamEngine::connect(7, cfg, 0, 100);
+        let mut cell = Vec::new();
+        assert!(engine.poll_transmit(0, &mut cell));
+        Frame::SynAck {
+            stream_id: 7,
+            isn: 500,
+            win: 1024 * 1024,
+            ack: 101,
+        }
+        .encode_into(&mut cell);
+        engine.on_cell(&cell, 1);
+        while engine.poll_event().is_some() {}
+        engine.write(&vec![0x39; 128 * 1024]);
+        let mut sent = 0;
+        let mut now = 10;
+        while sent < 128 {
+            if engine.poll_transmit(now, &mut cell) {
+                if matches!(Frame::decode(&cell), Some(Frame::Data { .. })) {
+                    sent += 1;
+                }
+            } else {
+                now += 1;
+            }
+            assert!(now < 10000);
+        }
+        let mut last_sacks = SackVec::default();
+        for index in 1..128u32 {
+            let mut sacks = SackVec::default();
+            sacks.push(SackRange {
+                start: 101 + 1024,
+                end: 101 + (index + 1) * 1024,
+            });
+            Frame::Ack {
+                stream_id: 7,
+                ack: 101,
+                win: 1024 * 1024,
+                sacks,
+            }
+            .encode_into(&mut cell);
+            engine.on_cell(&cell, 1000 + u64::from(index) * 20);
+            last_sacks = sacks;
+        }
+        assert_eq!(
+            engine.tx.delivered,
+            127 * 1024,
+            "selectively delivered bytes were hidden from BBR"
+        );
+        assert!(engine.tx.btl_bw > 40000 && engine.tx.btl_bw < 70000);
+        let before = engine.tx.delivered;
+        Frame::Ack {
+            stream_id: 7,
+            ack: 101,
+            win: 1024 * 1024,
+            sacks: last_sacks,
+        }
+        .encode_into(&mut cell);
+        engine.on_cell(&cell, 3600);
+        assert_eq!(
+            engine.tx.delivered, before,
+            "duplicate SACK was credited twice"
+        );
+        Frame::Ack {
+            stream_id: 7,
+            ack: 101 + 128 * 1024,
+            win: 1024 * 1024,
+            sacks: Default::default(),
+        }
+        .encode_into(&mut cell);
+        engine.on_cell(&cell, 3610);
+        assert_eq!(
+            engine.tx.delivered,
+            128 * 1024,
+            "cumulative repair re-credited the old SACK tail"
+        );
+    }
+
+    #[test]
+    fn bbr_delivery_preserves_partial_wrap_handoff_fin_and_disabled_guards() {
+        for iss in [100, u32::MAX - 127] {
+            for rack in [false, true] {
+                for enabled in [false, true] {
+                    let (mut e, cells) = tracked_flight(iss, 256);
+                    e.cfg.bbr = enabled;
+                    e.cfg.rack = rack;
+                    let una = e.tx.snd_una;
+                    let credited = |bytes| if enabled { bytes } else { 0 };
+                    let mut sacks = SackVec::new();
+                    sacks.push(SackRange {
+                        start: una.wrapping_add(128),
+                        end: una.wrapping_add(256),
+                    });
+                    sacks.push(SackRange {
+                        start: una.wrapping_add(192),
+                        end: una.wrapping_add(256),
+                    });
+                    e.on_ack(una, 4096, &sacks, 20);
+                    assert_eq!(e.tx.delivered, 0, "unhanded local data was credited");
+                    e.local_handoff(&cells[2..].iter().map(|t| (*t, 1)).collect(), 30);
+                    e.on_ack(una, 4096, &sacks, 31);
+                    e.on_ack(una, 4096, &sacks, 32);
+                    assert_eq!(e.tx.delivered, credited(128));
+                    e.local_handoff(&cells[..2].iter().map(|t| (*t, 1)).collect(), 33);
+                    e.on_ack(una.wrapping_add(32), 4096, &SackVec::new(), 34);
+                    assert_eq!(e.tx.delivered, credited(160));
+                    sacks.push(SackRange {
+                        start: una,
+                        end: una.wrapping_add(256),
+                    });
+                    e.on_ack(una.wrapping_add(96), 4096, &sacks, 35);
+                    assert_eq!(
+                        e.tx.delivered,
+                        credited(256),
+                        "same-ACK cumulative/SACK overlap"
+                    );
+                    e.on_ack(una.wrapping_add(256), 4096, &SackVec::new(), 36);
+                    e.on_ack(una, 4096, &sacks, 37);
+                    assert_eq!(
+                        e.tx.delivered,
+                        credited(256),
+                        "repair/replay double counted"
+                    );
+                    e.finish();
+                    let mut encoded = Vec::new();
+                    assert!(e.poll_transmit(100, &mut encoded));
+                    let fin = LocalTransmit::from_cell(&encoded).unwrap();
+                    assert_eq!(fin.kind, TransmitKind::Fin);
+                    let end = fin.seq.wrapping_add(1);
+                    e.on_ack(end, 4096, &SackVec::new(), 101);
+                    assert!(!e.tx.fin_acked, "unhanded FIN was accepted");
+                    e.local_handoff(&HashMap::from([(fin, 1)]), 110);
+                    e.on_ack(end, 4096, &SackVec::new(), 120);
+                    assert!(e.is_send_complete());
+                    assert_eq!(e.tx.delivered, credited(256), "FIN is not application data");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn backlogged_bbr_stays_bounded_on_a_genuinely_slow_path() {
+        let (rate, delivered, pending) = paced_warm_path(12440, false, 256, 8192);
+        eprintln!("slow_path final_rate={rate} delivered={delivered} pending={pending}");
+        assert!(pending > 1024 * 1024);
+        assert!(
+            rate > 6000 && rate <= 8192,
+            "slow path model is not bounded: {rate}"
+        );
+        assert!(delivered > 64 * 1024 && delivered < 20 * 8192);
+    }
 
     #[test]
     fn rto_demand_keeps_locally_queued_and_rewound_flight_conservative() {
@@ -2934,6 +3241,7 @@ mod tests {
     fn exercise_repeated_rewind_late_ack(iss: u32, rack: bool, with_fin: bool) {
         let (mut engine, mut original) = tracked_flight(iss, 256);
         engine.cfg.rack = rack;
+        engine.cfg.bbr = true;
         let mut encoded = Vec::new();
         if with_fin {
             engine.finish();
@@ -2977,6 +3285,15 @@ mod tests {
             future
         );
         assert_eq!(engine.tx.consec_rto, 0, "late receipt is real progress");
+        assert_eq!(
+            engine.tx.delivered, 256,
+            "late ACK must credit data once, excluding FIN"
+        );
+        engine.on_ack(original_high, 4096, &SackVec::new(), 1003);
+        assert_eq!(
+            engine.tx.delivered, 256,
+            "replayed old-flight ACK was credited twice"
+        );
         if with_fin {
             assert!(engine.is_send_complete(), "late original FIN ACK was lost");
         }
@@ -3010,7 +3327,7 @@ mod tests {
         // Deliver 1 MiB over 1s in 20ms steps -> ~1 MiB/s estimate.
         let step_bytes = (1024 * 1024) / 50;
         for i in 0..=50u64 {
-            e.tx.bbr_on_delivered(step_bytes, i * 20);
+            e.tx.bbr_on_delivered(step_bytes, i * 20, false, cfg.mss as u32);
         }
         let mib = 1024 * 1024;
         assert!(
@@ -3022,7 +3339,7 @@ mod tests {
         // A thin (app-limited) window: a trickle far below BBR_MIN_DELIVERED
         // must not crater the estimate.
         for i in 51..=80u64 {
-            e.tx.bbr_on_delivered(100, i * 20);
+            e.tx.bbr_on_delivered(100, i * 20, false, cfg.mss as u32);
         }
         assert!(
             e.tx.btl_bw >= before / 2,
@@ -3116,7 +3433,7 @@ mod tests {
         while t < 3_000 {
             t += 20;
             let bytes = rate_at(t) * 20 / 1000;
-            e.tx.bbr_on_delivered(bytes as u32, t);
+            e.tx.bbr_on_delivered(bytes as u32, t, false, cfg.mss as u32);
             if rate_at(t) < 12_000_000 {
                 assert!(
                     e.tx.bbr_startup,
@@ -3145,7 +3462,7 @@ mod tests {
         let mut exit_at = None;
         while t < 3_000 {
             t += 20;
-            d.tx.bbr_on_delivered((800_000u64 * 20 / 1000) as u32, t);
+            d.tx.bbr_on_delivered((800_000u64 * 20 / 1000) as u32, t, false, cfg.mss as u32);
             if !d.tx.bbr_startup && exit_at.is_none() {
                 exit_at = Some(t);
             }
@@ -3181,7 +3498,7 @@ mod tests {
         while t < 3_000 {
             t += 20;
             let bytes = rate_at(t) * 20 / 1000;
-            e.tx.bbr_on_delivered(bytes as u32, t);
+            e.tx.bbr_on_delivered(bytes as u32, t, false, cfg.mss as u32);
             if !e.tx.bbr_startup && climb_exit.is_none() && rate_at(t) < 6_000_000 {
                 climb_exit = Some(t);
             }
@@ -3193,7 +3510,7 @@ mod tests {
         // Hold the ceiling: the estimate converges and STARTUP must now exit.
         while t < 8_000 {
             t += 20;
-            e.tx.bbr_on_delivered((6_000_000u64 * 20 / 1000) as u32, t);
+            e.tx.bbr_on_delivered((6_000_000u64 * 20 / 1000) as u32, t, false, cfg.mss as u32);
         }
         assert!(
             !e.tx.bbr_startup,
