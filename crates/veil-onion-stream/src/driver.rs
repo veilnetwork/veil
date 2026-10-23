@@ -6,7 +6,10 @@
 
 use std::future::{Future, pending};
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use tokio::sync::{Notify, mpsc, watch};
@@ -154,6 +157,24 @@ pub struct OnionStream {
     residual: Vec<u8>,
     end: Arc<Mutex<End>>,
     abort: OnionAbort,
+    connection: OnionConnection,
+}
+
+/// Read-only local handshake state. Queueing app bytes or handing off a SYN
+/// does not make a connection ready; the engine must accept the peer handshake.
+#[derive(Clone)]
+pub struct OnionConnection {
+    connected: Arc<AtomicBool>,
+    end: Arc<Mutex<End>>,
+}
+
+impl OnionConnection {
+    pub fn is_connected(&self) -> io::Result<bool> {
+        if let End::Reset(reason) = end_of(&self.end) {
+            return reset_err(reason);
+        }
+        Ok(self.connected.load(Ordering::Acquire))
+    }
 }
 
 impl OnionStream {
@@ -181,6 +202,10 @@ impl OnionStream {
         let (reset_tx, reset_rx) = watch::channel(None);
         let (data_tx, data_rx) = mpsc::channel(16);
         let end = Arc::new(Mutex::new(End::Open));
+        let connection = OnionConnection {
+            connected: Arc::new(AtomicBool::new(false)),
+            end: end.clone(),
+        };
         let abort = OnionAbort {
             end: end.clone(),
             notify: Arc::new(Notify::new()),
@@ -193,6 +218,7 @@ impl OnionStream {
             reset_rx,
             data_tx,
             end.clone(),
+            connection.connected.clone(),
         ));
         OnionStream {
             cmd_tx,
@@ -200,6 +226,7 @@ impl OnionStream {
             residual: Vec::new(),
             end,
             abort,
+            connection,
         }
     }
 
@@ -245,6 +272,10 @@ impl OnionStream {
     /// the reset command.
     pub fn abort_handle(&self) -> OnionAbort {
         self.abort.clone()
+    }
+
+    pub fn connection_handle(&self) -> OnionConnection {
+        self.connection.clone()
     }
 
     /// Split into independently-owned read + write halves so a caller can read
@@ -459,6 +490,7 @@ async fn drive<D: CellDuplex>(
     mut reset_rx: watch::Receiver<Option<u8>>,
     data_tx: mpsc::Sender<Vec<u8>>,
     end: Arc<Mutex<End>>,
+    connected: Arc<AtomicBool>,
 ) {
     engine.track_local_handoffs();
     let base = Instant::now();
@@ -517,7 +549,7 @@ async fn drive<D: CellDuplex>(
             match ev {
                 Event::PeerFinished => set_end(&end, End::Eof),
                 Event::Reset(r) => set_end(&end, End::Reset(r)),
-                Event::Connected => {}
+                Event::Connected => connected.store(true, Ordering::Release),
                 Event::HandshakeRto { retries } => {
                     if engine.handshake_unconfirmed() {
                         duplex.on_handshake_rto(engine.stream_id(), retries).await;

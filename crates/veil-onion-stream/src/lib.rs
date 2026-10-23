@@ -61,7 +61,8 @@ pub mod seq;
 pub mod wire;
 
 pub use driver::{
-    CellDuplex, End, OnionAbort, OnionReader, OnionStream, OnionWriter, send_backpressure,
+    CellDuplex, End, OnionAbort, OnionConnection, OnionReader, OnionStream, OnionWriter,
+    send_backpressure,
 };
 pub use engine::{Config, Event, StreamEngine};
 pub use mux::{Addr, CellSender, Peer, PeerAliases, StreamMux};
