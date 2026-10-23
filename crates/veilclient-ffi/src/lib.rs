@@ -682,6 +682,7 @@ async fn stream_io_until_closed<T>(
 pub struct VeilAnonStreamFfi {
     bundle: Arc<RuntimeBundle>,
     abort: veil_onion_stream::OnionAbort,
+    connection: veil_onion_stream::OnionConnection,
     reader: TokioMutex<Option<veil_onion_stream::OnionReader>>,
     writer: TokioMutex<Option<veil_onion_stream::OnionWriter>>,
 }

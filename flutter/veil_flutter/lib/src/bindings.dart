@@ -2392,6 +2392,17 @@ final Pointer<VeilAnonStreamFfi> Function(
             )>>('veil_anon_stream_accept')
     .asFunction();
 
+// Readiness follows the remote handshake, not optimistic local writes.
+final int Function(Pointer<VeilAnonStreamFfi>, Pointer<Pointer<Utf8>>)
+    veilAnonStreamIsConnected = nativeLib
+        .lookup<
+            NativeFunction<
+                Int32 Function(
+                  Pointer<VeilAnonStreamFfi>,
+                  Pointer<Pointer<Utf8>>,
+                )>>('veil_anon_stream_is_connected')
+        .asFunction();
+
 // read -> ssize_t (IntPtr): n>0 bytes, 0 = clean EOF, <0 = reset (resume).
 final int Function(
   Pointer<VeilAnonStreamFfi>,

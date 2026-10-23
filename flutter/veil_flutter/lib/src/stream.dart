@@ -472,6 +472,25 @@ class VeilAnonStream {
   final _writeGate = _AsyncGate(1);
   bool _closed = false;
 
+  /// Whether the engine accepted the peer handshake. This local query never
+  /// waits for network I/O and does not imply application-data delivery.
+  bool get isConnected {
+    _ensureOpen();
+    final err = calloc<Pointer<Utf8>>();
+    try {
+      final result = ffi.veilAnonStreamIsConnected(_stream, err);
+      if (result < 0) {
+        throw VeilException(
+          'anon stream connection failed: ${_readErrAndFree(err)}',
+          code: result,
+        );
+      }
+      return result == 1;
+    } finally {
+      calloc.free(err);
+    }
+  }
+
   /// Queue [data] for reliable delivery (flow-controlled). Empty is a no-op.
   /// Runs on a worker isolate — the FFI write can block on back-pressure, which
   /// on the UI isolate would freeze the app (ANR).

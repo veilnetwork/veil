@@ -3531,6 +3531,15 @@ int32_t veil_anon_stream_warm_peer(VeilHandle *handle,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Nonblocking handshake state: 1 after the peer handshake is accepted, 0 while
+ * opening, negative on reset or an invalid/closed handle. Local writes and
+ * queue admission do not imply readiness or peer receipt of application bytes.
+ */
+ int veil_anon_stream_is_connected(VeilAnonStreamFfi *stream, char **err_out) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Read up to `cap` bytes. Returns the count (0 = clean EOF), or a negative
  * error code (the stream was reset → the app should resume).
  */
