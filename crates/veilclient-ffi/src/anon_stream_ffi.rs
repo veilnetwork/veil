@@ -67,10 +67,12 @@ pub unsafe extern "C" fn veil_anon_stream_open(
         .runtime
         .block_on(async { hub.open(veil_onion_stream::Addr { node, app }) });
     let abort = stream.abort_handle();
+    let connection = stream.connection_handle();
     let (rd, wr) = stream.into_split();
     let ffi = VeilAnonStreamFfi {
         bundle,
         abort,
+        connection,
         reader: TokioMutex::new(Some(rd)),
         writer: TokioMutex::new(Some(wr)),
     };
@@ -123,10 +125,12 @@ pub unsafe extern "C" fn veil_anon_stream_accept(
                 ptr::copy_nonoverlapping(src.app.as_ptr(), out_src_app_id, 32);
             }
             let abort = stream.abort_handle();
+            let connection = stream.connection_handle();
             let (rd, wr) = stream.into_split();
             let ffi = VeilAnonStreamFfi {
                 bundle,
                 abort,
+                connection,
                 reader: TokioMutex::new(Some(rd)),
                 writer: TokioMutex::new(Some(wr)),
             };
@@ -180,6 +184,48 @@ pub unsafe extern "C" fn veil_anon_stream_warm_peer(
         hub.warm_outbound(node).await;
     });
     0
+}
+
+/// Nonblocking handshake state: 1 after the peer handshake is accepted, 0 while
+/// opening, negative on reset or an invalid/closed handle. Local writes and
+/// queue admission do not imply readiness or peer receipt of application bytes.
+#[unsafe(no_mangle)]
+#[cfg(feature = "node-embedded")]
+pub unsafe extern "C" fn veil_anon_stream_is_connected(
+    stream: *mut VeilAnonStreamFfi,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_anon_stream_is_connected") } {
+        return rc;
+    }
+    get_or_return!(
+        stream_ref,
+        anon_stream_table(),
+        stream,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilAnonStreamFfi"
+    );
+    match stream_ref.connection.is_connected() {
+        Ok(connected) => i32::from(connected),
+        Err(error) => {
+            unsafe { write_err(err_out, error.to_string()) };
+            VEIL_ERR_CLOSED
+        }
+    }
+}
+
+#[cfg(all(test, feature = "node-embedded"))]
+#[test]
+fn anon_stream_connection_query_rejects_null_and_unknown_tokens() {
+    for token in [0, 0x0af5_0007] {
+        let mut error = ptr::null_mut();
+        let result =
+            unsafe { veil_anon_stream_is_connected(token as *mut VeilAnonStreamFfi, &mut error) };
+        assert_eq!(result, VEIL_ERR_INVALID_ARG);
+        assert!(!error.is_null());
+        unsafe { veil_free_string(error) };
+    }
 }
 
 /// Read up to `cap` bytes. Returns the count (0 = clean EOF), or a negative
