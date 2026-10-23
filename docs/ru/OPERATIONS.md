@@ -56,6 +56,20 @@ kill <pid>          # или `systemctl stop veil-node`
 
 ### Инспекция peer'ов и сессий
 
+Команды управления через Unix-сокет запускаются от того же пользователя ОС,
+что и служба узла. Если служба работает от `veil`, запуск CLI от `root` также
+отклоняется; старые клиенты могут показать `Broken pipe` или сброс соединения.
+Для systemd проверьте `systemctl show veil.service -p User` и используйте
+указанную учётную запись, например:
+
+```bash
+sudo -u veil -- veil-cli -c /var/lib/veil/node.toml node dht list
+```
+
+Предупреждение о неподписанном конфиге независимо от этого: подпись конфига
+не даёт доступ к сокету управления. Для административного TCP-подключения
+через loopback используется аутентификация токеном.
+
 ```bash
 veil-cli -c node.toml peers list             # configured peers
 veil-cli -c node.toml peers banned           # активные баны (manual + temp)

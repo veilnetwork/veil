@@ -257,7 +257,37 @@ pub fn bind_unix(path: &Path) -> Result<AdminListener> {
 /// Connect to an admin listener over a Unix domain socket.
 #[cfg(unix)]
 pub async fn connect_unix(path: &Path) -> Result<AdminStream> {
-    Ok(AdminStream(local_transport::connect_unix(path).await?))
+    // SAFETY: geteuid has no arguments and cannot fail.
+    connect_unix_for_uid(path, unsafe { libc::geteuid() }).await
+}
+
+#[cfg(unix)]
+async fn connect_unix_for_uid(path: &Path, local_uid: libc::uid_t) -> Result<AdminStream> {
+    let stream = local_transport::connect_unix(path).await?;
+    // Match the server's existing same-user policy. Without this check a root
+    // CLI talking to a non-root service sees only BrokenPipe/connection reset
+    // when the server drops it before reading the request. Kernel credentials
+    // identify the listener; socket-file ownership is not an authority here.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    if let local_transport::LocalStream::Unix(unix) = &stream {
+        let peer_uid = unix.peer_cred()?.uid();
+        if peer_uid != local_uid {
+            return Err(NodeError::AdminProtocol(format!(
+                "admin access denied: node service runs as OS uid {peer_uid}, \
+                 but this command runs as uid {local_uid}; run the CLI as the \
+                 same OS user as the node service (for example: \
+                 sudo -u '#{peer_uid}' -- veil-cli ...)"
+            )));
+        }
+    }
+    let _ = local_uid; // Other Unix platforms retain the server's existing policy.
+    Ok(AdminStream(stream))
 }
 
 /// Non-Unix stub — see [`bind_unix`].
@@ -305,6 +335,70 @@ pub async fn connect_named_pipe(name: &str, token: &AdminToken) -> Result<AdminS
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    #[tokio::test]
+    async fn unix_admin_reports_wrong_os_user_before_sending_a_request() {
+        let dir = crate::test_support::scratch_dir("veil-admin-peer-uid");
+        let path = dir.join("admin.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        // The listener has a genuine kernel uid. Present the client's other
+        // uid to the same connect/check path without changing the test process's
+        // credentials (or requiring privileged CI).
+        let server_uid = unsafe { libc::geteuid() };
+        let different_uid = server_uid.wrapping_add(1);
+        let (client, accepted) = tokio::join!(
+            connect_unix_for_uid(&path, different_uid),
+            listener.accept(),
+        );
+        let err = match client {
+            Ok(_) => panic!("different-uid admin client was admitted"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(matches!(err, NodeError::AdminProtocol(_)));
+        assert!(message.contains(&format!("node service runs as OS uid {server_uid}")));
+        assert!(message.contains(&format!("command runs as uid {different_uid}")));
+        assert!(message.contains("same OS user"));
+        assert!(message.contains(&format!("sudo -u '#{server_uid}'")));
+        let (mut server, _) = accepted.unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            server.read(&mut byte).await.unwrap(),
+            0,
+            "rejected client sent request bytes"
+        );
+        drop((server, listener));
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_admin_same_os_user_still_connects_and_exchanges_bytes() {
+        let dir = crate::test_support::scratch_dir("veil-admin-peer-uid-ok");
+        let path = dir.join("admin.sock");
+        let listener = bind_unix(&path).unwrap();
+        let (client, accepted) = tokio::join!(connect_unix(&path), listener.accept());
+        let mut client = client.unwrap();
+        let (mut server, peer) = accepted.unwrap();
+        assert!(peer.uid_matches_local);
+        client.write_all(b"request").await.unwrap();
+        let mut bytes = [0u8; 7];
+        server.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"request");
+        server.write_all(b"response").await.unwrap();
+        let mut bytes = [0u8; 8];
+        client.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"response");
+        drop((client, server, listener));
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
 
     #[test]
     fn token_generate_yields_unique_values() {
