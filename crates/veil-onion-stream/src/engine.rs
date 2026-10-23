@@ -201,6 +201,9 @@ struct Seg {
     local_pending: bool,
     /// An earlier copy may still arrive while a repair waits locally.
     handed_off: bool,
+    /// A proven SACK hole from an existing RTO whose own last handoff has not
+    /// expired yet. It must not inherit another hole's exponential backoff.
+    sack_repair_deadline: Option<u64>,
 }
 
 /// Correlates a driver's local handoff without copying payloads. A partial
@@ -291,6 +294,9 @@ struct TxState {
     rttvar: u32,
     rto_ms: u64,
     rto_deadline: Option<u64>,
+    /// Cached minimum of Seg::sack_repair_deadline. Normal send/timeout polls
+    /// must not scan the entire flight when no deferred repair exists.
+    next_sack_repair_ms: Option<u64>,
     /// Consecutive RTO firings with no intervening new-data ack (dead detection).
     consec_rto: u32,
     /// Pacing: earliest time the next NEW-data segment may go on the wire. The
@@ -461,6 +467,7 @@ impl StreamEngine {
                 rttvar: 0,
                 rto_ms: cfg.init_rto_ms,
                 rto_deadline: None,
+                next_sack_repair_ms: None,
                 consec_rto: 0,
                 pace_next_ms: 0,
                 pace_budget: 0,
@@ -564,7 +571,11 @@ impl StreamEngine {
                 segment.local_pending = false;
                 segment.handed_off = true;
                 segment.sent_ms = now;
+                segment.sack_repair_deadline = None;
             }
+        }
+        if self.tx.next_sack_repair_ms.is_some() {
+            self.tx.refresh_sack_repair_deadline();
         }
         self.tx.refresh_local_rto(now);
     }
@@ -860,6 +871,7 @@ impl StreamEngine {
                     let (sent_ms, end, retransmitted) = (s.sent_ms, s.end(), s.retransmitted);
                     self.tx.segs[i].sacked = true;
                     self.tx.segs[i].needs_resend = false;
+                    self.tx.segs[i].sack_repair_deadline = None;
                     if self.cfg.rack && !retransmitted {
                         self.tx.rack_on_delivery(sent_ms, end, now);
                     }
@@ -970,6 +982,9 @@ impl StreamEngine {
         }
         if self.track_local_handoffs {
             self.tx.refresh_local_rto(now);
+        }
+        if self.tx.next_sack_repair_ms.is_some() {
+            self.tx.refresh_sack_repair_deadline();
         }
     }
 
@@ -1088,6 +1103,10 @@ impl StreamEngine {
                     .position(|s| s.needs_resend && !s.local_pending)
             {
                 self.tx.segs[idx].needs_resend = false;
+                self.tx.segs[idx].sack_repair_deadline = None;
+                if self.tx.next_sack_repair_ms.is_some() {
+                    self.tx.refresh_sack_repair_deadline();
+                }
                 self.tx.segs[idx].retransmitted = true;
                 self.tx.segs[idx].sent_ms = now;
                 self.tx.segs[idx].local_pending = self.track_local_handoffs;
@@ -1190,6 +1209,7 @@ impl StreamEngine {
                         .tx
                         .rewind_high
                         .is_some_and(|high| seq::leq(seq_no.wrapping_add(take as u32), high)),
+                sack_repair_deadline: None,
             });
             if !self.track_local_handoffs && self.tx.rto_deadline.is_none() {
                 self.tx.rto_deadline = Some(now + self.tx.rto_ms);
@@ -1219,6 +1239,7 @@ impl StreamEngine {
                         .tx
                         .rewind_high
                         .is_some_and(|high| seq::leq(seq_no.wrapping_add(1), high)),
+                sack_repair_deadline: None,
             });
             if !self.track_local_handoffs && self.tx.rto_deadline.is_none() {
                 self.tx.rto_deadline = Some(now + self.tx.rto_ms);
@@ -1288,7 +1309,8 @@ impl StreamEngine {
     /// repair's own RTO has expired, however, the marker must not strand all
     /// but the oldest hole behind another backed-off RTO. Re-repair only
     /// proven holes whose last actual handoff is old enough, under the normal
-    /// pacer. Recent or still locally queued repairs are not network loss.
+    /// pacer. Recent handed-off holes retain their own expiry rather than the
+    /// new global backoff. Locally queued repairs are not network loss.
     fn mark_expired_sack_repairs(&mut self, now: u64, expired_rto_ms: u64) {
         let mut sacked_above = 0usize;
         for s in self.tx.segs.iter_mut().rev() {
@@ -1299,11 +1321,43 @@ impl StreamEngine {
                 && s.handed_off
                 && !s.local_pending
                 && !s.needs_resend
-                && now.saturating_sub(s.sent_ms) >= expired_rto_ms
             {
-                s.needs_resend = true;
+                let deadline = s.sent_ms.saturating_add(expired_rto_ms);
+                if now >= deadline {
+                    s.needs_resend = true;
+                    s.sack_repair_deadline = None;
+                } else {
+                    s.sack_repair_deadline = Some(
+                        s.sack_repair_deadline
+                            .map_or(deadline, |old| old.min(deadline)),
+                    );
+                }
             }
         }
+        self.tx.refresh_sack_repair_deadline();
+    }
+
+    /// Continue a previously declared RTO at the remaining holes' individual
+    /// deadlines. This is not another network-loss verdict or congestion cut.
+    fn mark_due_sack_repairs(&mut self, now: u64) {
+        if self
+            .tx
+            .next_sack_repair_ms
+            .is_none_or(|deadline| now < deadline)
+        {
+            return;
+        }
+        for s in &mut self.tx.segs {
+            if s.sack_repair_deadline
+                .is_some_and(|deadline| now >= deadline)
+            {
+                s.sack_repair_deadline = None;
+                if !s.sacked && s.retransmitted && s.handed_off && !s.local_pending {
+                    s.needs_resend = true;
+                }
+            }
+        }
+        self.tx.refresh_sack_repair_deadline();
     }
 
     /// RACK reordering window: how long a segment may trail a later-sent,
@@ -1443,6 +1497,7 @@ impl StreamEngine {
         {
             self.enter_fast_recovery();
         }
+        self.mark_due_sack_repairs(now);
         // Data RTO + retry cap. If the deadline is stale (nothing left unacked),
         // CLEAR it — leaving a past deadline would make the driver's timer fire
         // every poll as sleep(0) and busy-spin.
@@ -1604,6 +1659,9 @@ impl StreamEngine {
         merge(self.tx.rack_deadline);
         merge(self.persist_deadline);
         merge(self.ack_deadline);
+        if self.phase == Phase::Established {
+            merge(self.tx.next_sack_repair_ms);
+        }
         // If new data is ready but held back only by pacing, wake to release it.
         if include_pacing && self.phase == Phase::Established && self.paced_send_ready() {
             merge(Some(self.tx.pace_next_ms));
@@ -1721,6 +1779,7 @@ impl StreamEngine {
             };
             requeued.extend(seg.data.into_iter().skip(skip));
         }
+        self.tx.next_sack_repair_ms = None;
         requeued.append(&mut self.tx.pending);
         self.tx.pending = requeued;
         self.tx.snd_nxt = self.tx.snd_una;
@@ -1762,6 +1821,14 @@ fn encode(frame: Frame<'_>, out: &mut Vec<u8>) {
 }
 
 impl TxState {
+    fn refresh_sack_repair_deadline(&mut self) {
+        self.next_sack_repair_ms = self
+            .segs
+            .iter()
+            .filter_map(|s| s.sack_repair_deadline)
+            .min();
+    }
+
     fn ack_limit(&self) -> u32 {
         let mut limit = self
             .rewind_high
@@ -2618,6 +2685,7 @@ mod tests {
                 needs_resend: false,
                 local_pending: false,
                 handed_off: true,
+                sack_repair_deadline: None,
             });
         }
         e
@@ -2700,6 +2768,7 @@ mod tests {
             needs_resend: false,
             local_pending: false,
             handed_off: true,
+            sack_repair_deadline: None,
         });
 
         e.on_timeout(100);
@@ -2777,6 +2846,7 @@ mod tests {
                 needs_resend: false,
                 local_pending: false,
                 handed_off: true,
+                sack_repair_deadline: None,
             });
         }
 
@@ -2811,6 +2881,8 @@ mod tests {
             e.track_local_handoffs();
         }
         e.phase = Phase::Established;
+        e.send_syn = false;
+        e.hs_deadline = None;
         e.syn_acked = true;
         e.tx.rwnd = cfg.recv_window;
         e.tx.snd_una = 101;
@@ -2827,6 +2899,7 @@ mod tests {
                 needs_resend: false,
                 local_pending: false,
                 handed_off: true,
+                sack_repair_deadline: None,
             });
         }
         e
@@ -2920,6 +2993,96 @@ mod tests {
     }
 
     #[test]
+    fn deferred_sack_holes_wake_at_their_own_expiry_without_another_rto() {
+        let mut e = repeated_sack_holes(true);
+        e.tx.segs[1].sent_ms = 11;
+        e.tx.segs[2].sent_ms = 12;
+        e.on_timeout(110);
+        assert!(e.tx.segs[0].needs_resend);
+        assert!(!e.tx.segs[1].needs_resend && !e.tx.segs[2].needs_resend);
+        assert_eq!(e.next_timeout_with_pacing(false), Some(111));
+        let window = e.tx.cwnd;
+        e.on_timeout(111);
+        assert!(e.tx.segs[1].needs_resend);
+        assert!(!e.tx.segs[2].needs_resend);
+        assert_eq!(e.next_timeout_with_pacing(false), Some(112));
+        e.on_timeout(112);
+        assert!(e.tx.segs[2].needs_resend);
+        assert_eq!(e.tx.next_sack_repair_ms, None);
+        assert_eq!(
+            e.tx.consec_rto, 1,
+            "continuing a repair is not a fresh network timeout"
+        );
+        assert_eq!(e.tx.rto_ms, 200);
+        assert_eq!(
+            e.tx.cwnd, window,
+            "deferred repair cut the congestion window again"
+        );
+    }
+
+    #[test]
+    fn sack_and_cumulative_ack_cancel_deferred_repair_deadlines() {
+        for cumulative in [false, true] {
+            let mut e = repeated_sack_holes(true);
+            e.tx.segs[1].sent_ms = 11;
+            e.tx.segs[2].sent_ms = 12;
+            e.on_timeout(110);
+            assert_eq!(e.tx.next_sack_repair_ms, Some(111));
+            let mut sacks = SackVec::new();
+            if !cumulative {
+                assert!(sacks.push(SackRange {
+                    start: 117,
+                    end: 149
+                }));
+            }
+            let mut cell = Vec::new();
+            Frame::Ack {
+                stream_id: 9,
+                ack: if cumulative { 229 } else { 101 },
+                win: 4096,
+                sacks,
+            }
+            .encode_into(&mut cell);
+            e.on_cell(&cell, 110);
+            assert_eq!(e.tx.next_sack_repair_ms, None);
+            assert!(e.next_timeout_with_pacing(false).is_none_or(|at| at > 112));
+            e.on_timeout(112);
+            assert!(
+                e.tx.segs.iter().all(|s| s.sacked || s.seq == 101),
+                "canceled deadline retained a live missing segment"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_repair_attempt_cancels_its_old_deferred_deadline() {
+        let mut e = repeated_sack_holes(true);
+        e.tx.segs[1].sent_ms = 11;
+        e.tx.segs[2].sacked = true;
+        e.on_timeout(110);
+        assert_eq!(e.tx.next_sack_repair_ms, Some(111));
+        // A newer loss detector may order a repair before its old RTO-cohort
+        // deadline. Once emitted/handed off, that old deadline is obsolete.
+        e.tx.segs[1].needs_resend = true;
+        let mut cell = Vec::new();
+        for expected_seq in [101, 117] {
+            assert!(e.poll_transmit(110, &mut cell));
+            assert!(
+                matches!(Frame::decode(&cell), Some(Frame::Data { seq, .. }) if seq == expected_seq)
+            );
+            let token = LocalTransmit::from_cell(&cell).unwrap();
+            e.local_handoff(&HashMap::from([(token, 1)]), 110);
+        }
+        assert_eq!(e.tx.next_sack_repair_ms, None);
+        e.on_timeout(111);
+        assert!(
+            !e.tx.segs[1].needs_resend,
+            "old deadline repeated a fresh repair"
+        );
+        assert_eq!(e.tx.consec_rto, 1);
+    }
+
+    #[test]
     fn circuit_sack_rto_can_use_soft_loss_decrease() {
         let mss = MSS as u32;
         let cfg = Config {
@@ -2951,6 +3114,7 @@ mod tests {
                 needs_resend: false,
                 local_pending: false,
                 handed_off: true,
+                sack_repair_deadline: None,
             });
         }
 
