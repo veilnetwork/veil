@@ -639,6 +639,14 @@ impl StreamEngine {
             && self.tx.segs.is_empty()
             && (!self.tx.fin_requested || self.tx.fin_acked)
     }
+    /// Bound a final locally queued ACK by the existing retry policy, even
+    /// though both DATA directions have finished and no network RTO remains.
+    pub(crate) fn close_handoff_timeout_ms(&self) -> u64 {
+        self.cfg
+            .max_rto_ms
+            .saturating_mul(u64::from(self.cfg.max_retransmits) + 1)
+            .max(1)
+    }
     pub fn cwnd(&self) -> u32 {
         self.tx.cwnd
     }
