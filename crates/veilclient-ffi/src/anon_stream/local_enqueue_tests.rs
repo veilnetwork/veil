@@ -2,6 +2,86 @@
 use super::*;
 use veil_onion_stream::CellSender;
 
+#[tokio::test]
+async fn file_outbound_candidates_do_not_replace_the_advertised_receive_registration() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use veil_anonymity::{
+        circuit_data::CircuitCellBytes,
+        circuit_register::{CircuitRegisterPayload, CircuitRendezvousRegistry},
+        circuit_setup::CircuitInstall,
+        circuit_table::CircuitTable,
+    };
+    let mut f = fixture().await;
+    let key = &f.cells.reg_kp;
+    let epoch = &f.cells.epoch;
+    let published = outbound_registration(key, epoch, false).unwrap();
+    let mut registrations = vec![published];
+    for _ in 0..3 {
+        registrations.push(
+            outbound_registration(key, epoch, f.cells.private_outbound_registration).unwrap(),
+        );
+    }
+    let table = CircuitTable::new();
+    let registry = CircuitRendezvousRegistry::with_params(8, 300);
+    let link = [0x8d; 32];
+    for (index, registration) in registrations.iter().enumerate() {
+        let id = index as u32 + 1;
+        table
+            .install(
+                &CircuitInstall {
+                    circuit_id_in: id,
+                    circuit_id_out: 0,
+                    circuit_key: [9; 32],
+                    cell_bytes: CircuitCellBytes::legacy(),
+                },
+                link,
+                None,
+                0,
+            )
+            .unwrap();
+        let reg_pk = STANDARD
+            .decode(&registration.keypair.public_key)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        // Use the actual configured epoch owner, as circuit construction does.
+        let epoch = registration.epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = CircuitRegisterPayload::signing_bytes(&registration.cookie, &reg_pk, epoch);
+        let payload = CircuitRegisterPayload {
+            cookie: registration.cookie,
+            reg_pk,
+            epoch,
+            signature: veil_crypto::sign_message(
+                veil_types::SignatureAlgorithm::Ed25519,
+                &registration.keypair.public_key,
+                &registration.keypair.private_key,
+                &bytes,
+            )
+            .unwrap(),
+        };
+        registry
+            .register(&payload, table.lookup_forward(&link, id).unwrap(), 0)
+            .unwrap();
+    }
+    let received_on = registry
+        .lookup(&registrations[0].cookie)
+        .unwrap()
+        .circuit_id_in;
+    f.runtime.stop().await.unwrap();
+    assert_eq!(
+        received_on, 1,
+        "outbound setup displaced the advertised inbound receive circuit"
+    );
+    assert_eq!(registry.len(), 4);
+    assert_eq!(f.cells.epoch.load(Ordering::Relaxed), 1);
+    for (index, registration) in registrations.iter().enumerate() {
+        assert_eq!(
+            registry.lookup(&registration.cookie).unwrap().circuit_id_in,
+            index as u32 + 1
+        );
+    }
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     runtime: veil_node_runtime::NodeRuntime,
