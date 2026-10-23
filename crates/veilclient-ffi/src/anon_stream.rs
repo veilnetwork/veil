@@ -603,6 +603,46 @@ type SharedPeerTags = Arc<Mutex<HashMap<[u8; CIRCUIT_PEER_TAG_LEN], [u8; 32]>>>;
 type SharedOutboundPeerTags = Arc<Mutex<HashMap<[u8; 32], [u8; CIRCUIT_PEER_TAG_LEN]>>>;
 type OutboundCircuitPool = HashMap<[u8; 32], Vec<CircuitEntry>>;
 type StreamRouteKey = ([u8; 32], u32, RouteClass);
+type StreamReceiverKey = ([u8; 32], u32);
+type SharedStreamReceivers = Arc<Mutex<HashMap<StreamReceiverKey, StreamReceiverBinding>>>;
+const MAX_STREAM_ROUTE_ENTRIES: usize = 4096;
+const MAX_STREAM_RECEIVER_BINDINGS: usize = 4096;
+
+/// Receiver identity belongs to the stream lifetime, not an evictable path.
+/// This contains public routing metadata only, without circuit keys/ownership.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StreamReceiverBinding {
+    cookie: [u8; COOKIE_LEN],
+    protected_key: Option<[u8; 32]>,
+}
+
+impl StreamReceiverBinding {
+    fn from_route(route: &CircuitRoute) -> Self {
+        Self {
+            cookie: route.peer_cookie,
+            protected_key: match route.envelope {
+                CircuitEnvelope::ProtectedIntro {
+                    receiver_x25519_pk, ..
+                } => Some(receiver_x25519_pk),
+                CircuitEnvelope::LegacyClearSender { .. } => None,
+            },
+        }
+    }
+
+    fn matches_route(&self, route: &CircuitRoute) -> bool {
+        self.cookie == route.peer_cookie
+            && self.protected_key.is_none_or(|key| {
+                matches!(route.envelope, CircuitEnvelope::ProtectedIntro { receiver_x25519_pk, .. } if key == receiver_x25519_pk)
+            })
+    }
+
+    fn matches_entry(&self, entry: &CircuitEntry) -> bool {
+        self.cookie == entry.peer_cookie
+            && self
+                .protected_key
+                .is_none_or(|key| key == entry.receiver_x25519_pk)
+    }
+}
 type RouteCooldowns = Arc<Mutex<HashMap<[u8; 32], Instant>>>;
 type FirstHopCooldowns = Arc<Mutex<HashMap<[u8; 32], Instant>>>;
 type NextOutboundRoute = Arc<Mutex<HashMap<([u8; 32], RouteClass), usize>>>;
@@ -787,6 +827,7 @@ struct CircuitCells {
     /// peer tags.
     outbound_circuits: Arc<tokio::sync::Mutex<OutboundCircuitPool>>,
     stream_routes: Arc<tokio::sync::Mutex<HashMap<StreamRouteKey, CircuitRoute>>>,
+    stream_receivers: SharedStreamReceivers,
     next_outbound_route: NextOutboundRoute,
     route_cooldowns: RouteCooldowns,
     first_hop_cooldowns: FirstHopCooldowns,
@@ -867,13 +908,7 @@ struct CircuitEntry {
 
 impl CircuitEntry {
     fn serves_receiver(&self, route: &CircuitRoute) -> bool {
-        self.peer_cookie == route.peer_cookie
-            && match route.envelope {
-                CircuitEnvelope::ProtectedIntro {
-                    receiver_x25519_pk, ..
-                } => self.receiver_x25519_pk == receiver_x25519_pk,
-                CircuitEnvelope::LegacyClearSender { .. } => true,
-            }
+        StreamReceiverBinding::from_route(route).matches_entry(self)
     }
 
     fn note_handshake_stream(&mut self, stream_id: u32) {
@@ -1559,6 +1594,15 @@ impl CellSender for CircuitCells {
         for (route_class, route) in removed_routes {
             record_stream_route_closed(route_class, &route);
         }
+        if let Some(entries) = self.outbound_circuits.lock().await.get_mut(&dst.node) {
+            for entry in entries {
+                entry.handshake_streams.remove(&stream_id);
+            }
+        }
+        self.stream_receivers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(dst.node, stream_id));
     }
 }
 
@@ -1583,6 +1627,7 @@ impl CircuitCells {
             },
             outbound_circuits: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             stream_routes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            stream_receivers: Arc::new(Mutex::new(HashMap::new())),
             next_outbound_route: Arc::new(Mutex::new(HashMap::new())),
             outbound_opening: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             bulk_shed_marks: Arc::new(Mutex::new(HashMap::new())),
@@ -1781,21 +1826,24 @@ impl CircuitCells {
             return 0;
         }
         let binding = match primary_route {
-            Some(route) => route.clone(),
+            Some(route) => StreamReceiverBinding::from_route(route),
             None => {
                 let Some(Frame::Ack { stream_id, .. }) = Frame::decode(cell) else {
                     return 0;
                 };
-                let Some(route) = self
-                    .stream_routes
-                    .lock()
-                    .await
-                    .get(&(dst_node, stream_id, RouteClass::Bulk))
-                    .cloned()
-                else {
+                let binding = match self.stream_receiver(dst_node, Some(stream_id)) {
+                    Some(binding) => Some(binding),
+                    None => self
+                        .stream_routes
+                        .lock()
+                        .await
+                        .get(&(dst_node, stream_id, RouteClass::Bulk))
+                        .map(StreamReceiverBinding::from_route),
+                };
+                let Some(binding) = binding else {
                     return 0;
                 };
-                route
+                binding
             }
         };
         let primary_relay = primary_route.and_then(|route| route.rendezvous_node);
@@ -1823,8 +1871,7 @@ impl CircuitCells {
             };
             let mut copies = Vec::new();
             for entry in entries {
-                if Some(entry.rendezvous_node) == primary_relay || !entry.serves_receiver(&binding)
-                {
+                if Some(entry.rendezvous_node) == primary_relay || !binding.matches_entry(entry) {
                     continue;
                 }
                 let first_hop = entry.circuit.first_hop();
@@ -2302,6 +2349,42 @@ impl CircuitCells {
         out
     }
 
+    fn stream_receiver(
+        &self,
+        dst_node: [u8; 32],
+        stream_id: Option<u32>,
+    ) -> Option<StreamReceiverBinding> {
+        let stream_id = stream_id?;
+        self.stream_receivers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&(dst_node, stream_id))
+            .copied()
+    }
+
+    fn remember_stream_receiver(
+        &self,
+        dst_node: [u8; 32],
+        stream_id: u32,
+        route: &CircuitRoute,
+    ) -> io::Result<StreamReceiverBinding> {
+        let mut receivers = self
+            .stream_receivers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(binding) = receivers.get(&(dst_node, stream_id)) {
+            return Ok(*binding);
+        }
+        if receivers.len() >= MAX_STREAM_RECEIVER_BINDINGS {
+            return Err(veil_onion_stream::send_backpressure(Duration::from_millis(
+                25,
+            )));
+        }
+        let binding = StreamReceiverBinding::from_route(route);
+        receivers.insert((dst_node, stream_id), binding);
+        Ok(binding)
+    }
+
     async fn circuit_for(
         &self,
         dst_node: [u8; 32],
@@ -2329,15 +2412,32 @@ impl CircuitCells {
                     stats: None,
                 })),
             CircuitMode::PublishedRendezvous => {
-                if let Some(stream_id) = stream_id
-                    && let Some(route) = self
-                        .stream_routes
-                        .lock()
-                        .await
-                        .get(&(dst_node, stream_id, route_class))
-                        .cloned()
-                {
-                    return Ok(Some(route));
+                if let Some(stream_id) = stream_id {
+                    let mut routes = self.stream_routes.lock().await;
+                    // Bootstrap pre-existing pins as well as new streams. Bulk
+                    // is authoritative when an independently chosen ACK pin is
+                    // inconsistent. Once set, eviction cannot change binding.
+                    if let Some(seed) = routes
+                        .get(&(dst_node, stream_id, RouteClass::Bulk))
+                        .or_else(|| routes.get(&(dst_node, stream_id, RouteClass::Ack)))
+                    {
+                        let _ = self.remember_stream_receiver(dst_node, stream_id, seed)?;
+                    }
+                    let key = (dst_node, stream_id, route_class);
+                    if let Some(route) = routes.get(&key).cloned() {
+                        let binding = self.remember_stream_receiver(dst_node, stream_id, &route)?;
+                        if binding.matches_route(&route) {
+                            return Ok(Some(route));
+                        }
+                        if let Some(removed) = routes.remove(&key) {
+                            record_stream_route_closed(route_class, &removed);
+                        }
+                    }
+                    if route_class == RouteClass::Ack
+                        && self.stream_receiver(dst_node, Some(stream_id)).is_none()
+                    {
+                        return Ok(None); // no known receiver for this ACK
+                    }
                 }
                 let route = self
                     .ensure_outbound_circuit(dst_node, stream_id, route_class, is_handshake)
@@ -2351,11 +2451,38 @@ impl CircuitCells {
                 }
                 if let (Some(stream_id), Some(route)) = (stream_id, route.clone()) {
                     let mut routes = self.stream_routes.lock().await;
-                    if routes.len() >= 4096
+                    let binding = self.remember_stream_receiver(dst_node, stream_id, &route)?;
+                    if !binding.matches_route(&route) {
+                        // Another route class may have established the binding
+                        // while this selection awaited construction/refill.
+                        return Ok(None);
+                    }
+                    if let Some(existing) = routes.get(&(dst_node, stream_id, route_class))
+                        && binding.matches_route(existing)
+                    {
+                        // Another caller committed while selection awaited the
+                        // pool. Reuse that pin without counting a second open.
+                        return Ok(Some(existing.clone()));
+                    }
+                    if routes.len() >= MAX_STREAM_ROUTE_ENTRIES
                         && !routes.contains_key(&(dst_node, stream_id, route_class))
                     {
-                        for ((_, _, old_class), old_route) in routes.drain() {
-                            record_stream_route_closed(old_class, &old_route);
+                        // ACK pins are an optional cache. Never discard live
+                        // Bulk pins or their active-stream accounting to admit
+                        // another class/stream. An uncached ACK can still use
+                        // an independently selected, correctly bound path.
+                        let evict = routes
+                            .keys()
+                            .find(|(_, _, class)| *class == RouteClass::Ack)
+                            .copied();
+                        if let Some(key) = evict {
+                            routes.remove(&key);
+                        } else if route_class == RouteClass::Ack {
+                            return Ok(Some(route));
+                        } else {
+                            return Err(veil_onion_stream::send_backpressure(
+                                Duration::from_millis(25),
+                            ));
                         }
                     }
                     if route_class == RouteClass::Bulk
@@ -2378,6 +2505,7 @@ impl CircuitCells {
         is_handshake: bool,
     ) -> io::Result<Option<CircuitRoute>> {
         let now = Instant::now();
+        let binding = self.stream_receiver(dst_node, stream_id);
         let retired = {
             let mut circuits = self.outbound_circuits.lock().await;
             if let Some(entries) = circuits.get_mut(&dst_node) {
@@ -2388,6 +2516,7 @@ impl CircuitCells {
                     if let Some(entry) = entries.iter_mut().find(|entry| {
                         route_class == RouteClass::Bulk
                             && entry.handshake_streams.contains(&stream_id)
+                            && binding.is_none_or(|binding| binding.matches_entry(entry))
                     }) {
                         entry.last_used = now;
                         return Ok(Some(entry.route()));
@@ -2452,7 +2581,7 @@ impl CircuitCells {
                             let route = self.select_outbound_route(
                                 dst_node,
                                 entries,
-                                stream_id,
+                                Some(stream_id),
                                 route_class,
                                 now,
                             );
@@ -2476,7 +2605,7 @@ impl CircuitCells {
                         let route = self.select_outbound_route(
                             dst_node,
                             entries,
-                            stream_id,
+                            Some(stream_id),
                             route_class,
                             now,
                         );
@@ -2490,7 +2619,7 @@ impl CircuitCells {
                         .unwrap_or(CIRCUIT_IDLE_REFRESH_AFTER);
                     if idle_for < CIRCUIT_IDLE_REFRESH_AFTER {
                         let route =
-                            self.select_outbound_route(dst_node, entries, 0, route_class, now);
+                            self.select_outbound_route(dst_node, entries, None, route_class, now);
                         return Ok(route);
                     }
                     diag_node(
@@ -2512,11 +2641,18 @@ impl CircuitCells {
             retire_circuits_later(&self.services, retired);
         }
         {
-            let circuits = self.outbound_circuits.lock().await;
-            if let Some(entries) = circuits.get(&dst_node)
-                && let Some(entry) = entries.first()
-            {
-                return Ok(Some(entry.route()));
+            let mut circuits = self.outbound_circuits.lock().await;
+            if let Some(entries) = circuits.get_mut(&dst_node) {
+                let route = self.select_outbound_route(
+                    dst_node,
+                    entries,
+                    stream_id,
+                    route_class,
+                    Instant::now(),
+                );
+                if route.is_some() {
+                    return Ok(route);
+                }
             }
         }
 
@@ -2542,7 +2678,7 @@ impl CircuitCells {
         &self,
         dst_node: [u8; 32],
         entries: &mut [CircuitEntry],
-        stream_id: u32,
+        stream_id: Option<u32>,
         route_class: RouteClass,
         now: Instant,
     ) -> Option<CircuitRoute> {
@@ -2573,18 +2709,25 @@ impl CircuitCells {
             cooldowns.retain(|_, until| *until > cooldown_now);
             cooldowns.clone()
         };
-        let usable_indices = (0..route_count)
+        let binding = self.stream_receiver(dst_node, stream_id);
+        let usable_indices = (0..entries.len())
             .filter(|idx| {
-                cooled_relays
-                    .get(&entries[*idx].rendezvous_node)
-                    .is_none_or(|until| *until <= cooldown_now)
+                binding.is_none_or(|binding| binding.matches_entry(&entries[*idx]))
+                    && cooled_relays
+                        .get(&entries[*idx].rendezvous_node)
+                        .is_none_or(|until| *until <= cooldown_now)
                     && cooled_first_hops
                         .get(&entries[*idx].circuit.first_hop())
                         .is_none_or(|until| *until <= cooldown_now)
                     && self
                         .services
                         .has_live_session(&entries[*idx].circuit.first_hop())
+                    && self
+                        .services
+                        .session_close_generation(&entries[*idx].circuit.first_hop())
+                        == entries[*idx].first_hop_close_generation
             })
+            .take(route_count)
             .collect::<Vec<_>>();
         if usable_indices.is_empty() {
             return None;
@@ -2624,7 +2767,9 @@ impl CircuitCells {
         };
         let entry = &mut entries[idx];
         entry.last_used = now;
-        if route_class == RouteClass::Bulk {
+        if route_class == RouteClass::Bulk
+            && let Some(stream_id) = stream_id
+        {
             entry.note_handshake_stream(stream_id);
         }
         Some(entry.route())
@@ -2879,6 +3024,7 @@ impl CircuitCells {
                         entries.iter().any(|entry| {
                             let entry_first_hop = entry.circuit.first_hop();
                             entry.rendezvous_node != relay
+                                && entry.serves_receiver(route)
                                 && (!block_first_hop || entry_first_hop != first_hop)
                                 && !cooled_relays.contains(&entry.rendezvous_node)
                                 && !cooled_first_hops.contains(&entry_first_hop)
@@ -3070,9 +3216,12 @@ impl CircuitCells {
                     .filter(|entry| {
                         let entry_first_hop = entry.circuit.first_hop();
                         entry.rendezvous_node != relay
+                            && entry.serves_receiver(route)
                             && !cooled_relays.contains(&entry.rendezvous_node)
                             && !cooled_first_hops.contains(&entry_first_hop)
                             && self.services.has_live_session(&entry_first_hop)
+                            && self.services.session_close_generation(&entry_first_hop)
+                                == entry.first_hop_close_generation
                             // A marked target is measurably crawling too —
                             // remapping onto it is pure churn (observed live
                             // as a 3d↔c92 ping-pong every shed cooldown).
@@ -3893,6 +4042,7 @@ fn try_open_circuit(
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let outbound_circuits = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let stream_routes = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let stream_receivers = Arc::new(Mutex::new(HashMap::new()));
     let next_outbound_route = Arc::new(Mutex::new(HashMap::new()));
     let route_cooldowns = Arc::new(Mutex::new(HashMap::new()));
     let first_hop_cooldowns = Arc::new(Mutex::new(HashMap::new()));
@@ -4271,6 +4421,7 @@ fn try_open_circuit(
         inbound_circuits,
         outbound_circuits,
         stream_routes,
+        stream_receivers,
         next_outbound_route,
         route_cooldowns,
         first_hop_cooldowns,
