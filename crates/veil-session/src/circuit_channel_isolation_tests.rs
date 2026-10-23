@@ -25,6 +25,158 @@ fn circuit_frame(cid: u32) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn unavailable_ordered_source_uses_an_unowned_authenticated_spare() {
+    for (source, &priority) in ORDERED_PRIORITIES.iter().enumerate() {
+        for occupied in [false, true] {
+            let parent = ParallelParent::new([1; 32], [2; 32], [3; 32]);
+            let remote = ParallelParent::new([1; 32], [3; 32], [2; 32]);
+            let diagnostics = Arc::new(ParallelDiagnostics::default());
+            let context = super::super::ordered_receiver_tests::pool_fixture_context();
+            let mut pool = Pool::default();
+            let assigned = pool.assignments.source(source).unwrap().physical;
+            let spare = if occupied {
+                pool.assignments.transit(None, 0).unwrap().physical
+            } else {
+                (assigned + 1) % TOTAL_SLOTS
+            };
+            let (channel, keys, raw) = raw_pair(&parent, &remote, 65536);
+            let mut decoder = crate::datagram_flows::SessionDatagramRx::new(
+                keys.rx_key(),
+                &keys.session_id,
+                true,
+            );
+            let receiver = keys.into_ordered(Box::new(raw)).unwrap();
+            pool.slots[spare] = Some(Ready::new(
+                Owner::Outgoing(channel),
+                parent.handle(),
+                context,
+                diagnostics.clone(),
+            ));
+            let status = Arc::new(LocalDatagramStatus::default());
+            let lease = Arc::new(status.activate_without_signaling());
+            assert_eq!(
+                status.request(priority),
+                crate::LocalDatagramChannelState::Warming
+            );
+            mark(&mut pool, &Arc::downgrade(&lease));
+            let frame = circuit_frame(1);
+            let (_, body, kind) = decode_realtime_lane_frame(&frame).unwrap();
+            let selected =
+                pool.selected_sender(priority, body, kind, None, &[17; 32], &diagnostics);
+            if occupied {
+                assert!(
+                    selected.is_none(),
+                    "another owner's ready channel was stolen"
+                );
+                assert_eq!(
+                    status.state(priority),
+                    crate::LocalDatagramChannelState::Warming
+                );
+                assert_eq!(pool.assignments.source_physical(source), Some(assigned));
+                continue;
+            }
+            assert!(
+                selected.is_some(),
+                "ready spare ignored while assigned child is unavailable"
+            );
+            assert_eq!(
+                status.state(priority),
+                crate::LocalDatagramChannelState::Ready
+            );
+            assert_eq!(pool.assignments.source_physical(source), Some(spare));
+            assert!(pool.slots[assigned].is_none());
+            publish(&selected.unwrap(), &frame);
+            let packet = timeout(Duration::from_secs(1), receiver.handle().recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let decoded = decoder
+                .decode_datagram(&packet, std::time::Instant::now())
+                .unwrap()
+                .unwrap();
+            assert_eq!(decoded, frame, "recovery changed the neutral frame");
+        }
+    }
+}
+
+#[tokio::test]
+async fn unavailable_ordered_transit_uses_an_unowned_authenticated_spare() {
+    let parent = ParallelParent::new([1; 32], [2; 32], [3; 32]);
+    let remote = ParallelParent::new([1; 32], [3; 32], [2; 32]);
+    let diagnostics = Arc::new(ParallelDiagnostics::default());
+    let context = super::super::ordered_receiver_tests::pool_fixture_context();
+    let mut pool = Pool::default();
+    let frame = circuit_frame(1);
+    let (_, body, kind) = decode_realtime_lane_frame(&frame).unwrap();
+    let table = CircuitTable::new();
+    let state = table
+        .install(
+            &CircuitInstall {
+                circuit_id_in: 1,
+                circuit_id_out: 1,
+                circuit_key: [5; 32],
+                cell_bytes: CircuitCellBytes::new(1024).unwrap(),
+            },
+            [7; 32],
+            Some([8; 32]),
+            1000,
+        )
+        .unwrap();
+    let witness = state.outbound_carrier(true);
+    let salt = [17; 32];
+    let bucket = parallel_lanes::neutral_transit_index(&salt, body, kind).unwrap();
+    let assigned = pool
+        .assignments
+        .transit(Some(&witness), bucket)
+        .unwrap()
+        .physical;
+    let spare = (assigned + 1) % TOTAL_SLOTS;
+    let (channel, keys, raw) = raw_pair(&parent, &remote, 65536);
+    let mut decoder =
+        crate::datagram_flows::SessionDatagramRx::new(keys.rx_key(), &keys.session_id, true);
+    let receiver = keys.into_ordered(Box::new(raw)).unwrap();
+    pool.slots[spare] = Some(Ready::new(
+        Owner::Outgoing(channel),
+        parent.handle(),
+        context,
+        diagnostics.clone(),
+    ));
+    let selected = pool
+        .selected_sender(
+            veil_proto::priority::INTERACTIVE,
+            body,
+            kind,
+            Some(&witness),
+            &salt,
+            &diagnostics,
+        )
+        .expect("neutral transit ignored its ready spare");
+    assert!(Arc::ptr_eq(
+        &selected,
+        &pool.slots[spare].as_ref().unwrap().sender
+    ));
+    assert_eq!(
+        pool.assignments
+            .transit(Some(&witness), bucket)
+            .unwrap()
+            .physical,
+        spare
+    );
+    publish(&selected, &frame);
+    let packet = timeout(Duration::from_secs(1), receiver.handle().recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        decoder
+            .decode_datagram(&packet, std::time::Instant::now())
+            .unwrap()
+            .unwrap(),
+        frame
+    );
+}
+
+#[tokio::test]
 async fn colliding_cold_circuits_progress_on_independent_authenticated_pipes() {
     verify_colliding_circuits(2, false).await;
 }

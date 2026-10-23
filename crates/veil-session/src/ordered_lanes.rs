@@ -197,13 +197,16 @@ fn mark(pool: &mut Pool, readiness: &Weak<LocalDatagramLease>) {
         let status = lease.status();
         let mut changed = false;
         for (index, priority) in ORDERED_PRIORITIES.iter().enumerate() {
-            if status.pending() & (1 << index) != 0 {
-                pool.assignments.source(index);
-            }
-            let ready = pool
-                .assignments
-                .source_physical(index)
-                .is_some_and(|physical| pool.slots[physical].as_ref().is_some_and(Ready::alive));
+            let ready = if status.pending() & (1 << index) != 0 {
+                pool.assignments
+                    .source(index)
+                    .and_then(|selected| pool.ready_selection(selected))
+                    .is_some()
+            } else {
+                pool.assignments
+                    .source_physical(index)
+                    .is_some_and(|physical| pool.slots[physical].as_ref().is_some_and(Ready::alive))
+            };
             changed |=
                 (status.state(*priority) == crate::LocalDatagramChannelState::Ready) != ready;
             lease.mark_framing(
@@ -444,6 +447,16 @@ impl Drop for OrderedSession {
 }
 
 impl Pool {
+    fn ready_selection(
+        &mut self,
+        selected: channel_assignments::Selection,
+    ) -> Option<channel_assignments::Selection> {
+        let slots = &self.slots;
+        self.assignments.ready_selection(selected, |index| {
+            slots[index].as_ref().is_some_and(Ready::alive)
+        })
+    }
+
     fn selected_sender(
         &mut self,
         priority: u8,
@@ -464,9 +477,8 @@ impl Pool {
             let ingress = parallel_lanes::transit_witness(kind, ingress);
             self.assignments.transit(ingress, bucket)?
         };
-        let ready = self.slots[selected.physical]
-            .as_ref()
-            .filter(|ready| ready.alive())?;
+        let selected = self.ready_selection(selected)?;
+        let ready = self.slots[selected.physical].as_ref()?;
         let mut sender = lock!(ready.sender);
         sender.sent_counter = Some((diagnostics.clone(), selected.counter));
         Some(ready.sender.clone())
