@@ -2310,7 +2310,21 @@ impl RxState {
     }
 
     fn drain_oo(&mut self) {
-        while let Some((&k, _)) = self.oo.range(..).next() {
+        loop {
+            // BTreeMap orders raw u32 values, not stream sequence space. Start
+            // half a sequence space behind rcv_nxt: with a window below 2^31,
+            // all ready/overlapping blocks precede future blocks in this order.
+            // Two tree lookups avoid scanning the post-wrap tail for each block.
+            let floor = self.rcv_nxt.wrapping_sub(1 << 31);
+            let Some(k) = self
+                .oo
+                .range(floor..)
+                .next()
+                .or_else(|| self.oo.range(..floor).next())
+                .map(|(&k, _)| k)
+            else {
+                break;
+            };
             if seq::leq(k, self.rcv_nxt) {
                 let v = self.oo.remove(&k).unwrap();
                 self.oo_bytes -= v.len();
@@ -2343,7 +2357,13 @@ impl RxState {
     /// Contiguous out-of-order blocks above `rcv_nxt`, for SACK.
     fn sack_blocks(&self) -> Vec<(u32, u32)> {
         let mut blocks: Vec<(u32, u32)> = Vec::new();
-        for (&start, v) in self.oo.iter() {
+        // Unconsumed blocks are ahead of rcv_nxt, including numerically small
+        // post-wrap keys. Serial order also coalesces adjacency across zero.
+        for (&start, v) in self
+            .oo
+            .range(self.rcv_nxt..)
+            .chain(self.oo.range(..self.rcv_nxt))
+        {
             let end = start.wrapping_add(v.len() as u32);
             if let Some(last) = blocks.last_mut()
                 && last.1 == start
@@ -3679,5 +3699,109 @@ mod tests {
         e.tx.record_rack_repair(101, 117, 10, Some(now - 10), now - 10);
         e.tx.note_dsack(117, &sacks, now);
         assert_eq!(e.tx.rack_dsack_reo_ms, 0);
+    }
+    #[test]
+    fn sequence_wrap_reassembly_drains_ready_blocks() {
+        for start in [100u32, u32::MAX - 15] {
+            for order in [[8u32, 16], [16, 8]] {
+                let expected: Vec<u8> = (0..24).collect();
+                let mut e = duplicate_receiver(start);
+                for offset in order {
+                    e.on_data(
+                        start.wrapping_add(offset),
+                        4096,
+                        &expected[offset as usize..offset as usize + 8],
+                        1,
+                    );
+                }
+                e.on_data(start, 4096, &expected[..8], 2);
+                let mut received = [0; 24];
+                assert_eq!(
+                    e.read(&mut received),
+                    24,
+                    "ready bytes were stranded after wrap"
+                );
+                assert_eq!(received.as_slice(), expected);
+                assert!(e.rx.oo.is_empty());
+                assert_eq!(e.rx.oo_bytes, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn sequence_wrap_reassembly_drains_partial_overlap_and_duplicates() {
+        for start in [100u32, u32::MAX - 15] {
+            let expected: Vec<u8> = (0..32).collect();
+            let mut e = duplicate_receiver(start);
+            e.on_data(start.wrapping_add(24), 4096, &expected[24..], 1);
+            e.on_data(start.wrapping_add(8), 4096, &expected[8..24], 2);
+            e.on_data(start, 4096, &expected[..12], 3);
+            assert_eq!(
+                e.readable_len(),
+                32,
+                "overlapping ready block waited for an unnecessary retransmission"
+            );
+            // Duplicates after draining must not append any bytes.
+            e.on_data(start.wrapping_add(8), 4096, &expected[8..24], 4);
+            let mut received = [0; 40];
+            assert_eq!(e.read(&mut received), 32);
+            assert_eq!(&received[..32], expected);
+            assert!(e.rx.oo.is_empty());
+            assert_eq!(e.rx.oo_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn sequence_wrap_reassembly_keeps_real_gaps() {
+        for start in [100u32, u32::MAX - 15] {
+            let expected: Vec<u8> = (0..32).collect();
+            let mut e = duplicate_receiver(start);
+            e.on_data(start.wrapping_add(24), 4096, &expected[24..], 1);
+            e.on_data(start.wrapping_add(8), 4096, &expected[8..16], 2);
+            e.on_data(start, 4096, &expected[..8], 3);
+            let mut received = [0; 32];
+            assert_eq!(
+                e.read(&mut received),
+                16,
+                "receiver must stop at the missing middle"
+            );
+            assert_eq!(&received[..16], &expected[..16]);
+            assert_eq!(
+                e.rx.sack_blocks(),
+                vec![(start.wrapping_add(24), start.wrapping_add(32))]
+            );
+            e.on_data(start.wrapping_add(16), 4096, &expected[16..24], 4);
+            assert_eq!(e.read(&mut received[16..]), 16);
+            assert_eq!(received.as_slice(), expected);
+            assert_eq!(e.rx.oo_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn sequence_wrap_sack_blocks_are_serially_ordered_and_coalesced() {
+        for start in [100u32, u32::MAX - 31] {
+            let mut e = duplicate_receiver(start);
+            // Six adjacent blocks straddle zero; the head remains missing.
+            for i in (1u32..=6).rev() {
+                e.on_data(start.wrapping_add(i * 8), 4096, &[1; 8], u64::from(i));
+            }
+            assert_eq!(
+                e.rx.sack_blocks(),
+                vec![(start.wrapping_add(8), start.wrapping_add(56))]
+            );
+            let mut wire = Vec::new();
+            e.make_ack().encode_into(&mut wire);
+            let Some(Frame::Ack { ack, sacks, .. }) = Frame::decode(&wire) else {
+                panic!("bad ACK");
+            };
+            assert_eq!(ack, start);
+            assert_eq!(
+                sacks.as_slice(),
+                &[SackRange {
+                    start: start.wrapping_add(8),
+                    end: start.wrapping_add(56)
+                }]
+            );
+        }
     }
 }
