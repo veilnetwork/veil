@@ -589,6 +589,12 @@ async fn drive<D: CellDuplex>(
                     if retrying {
                         would_block_recovered = would_block_recovered.saturating_add(1);
                     }
+                    if outbound.is_empty() {
+                        // A paced carrier await can make the next send tick due.
+                        // Poll inbound/commands/timers between accepted bursts;
+                        // do not refill and drain an entire window before ACKs.
+                        break;
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     would_block_total = would_block_total.saturating_add(1);
