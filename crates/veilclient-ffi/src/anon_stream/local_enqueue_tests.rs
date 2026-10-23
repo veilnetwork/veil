@@ -548,6 +548,189 @@ fn fill_ordinary_outbox(cells: &CircuitCells, circuit: &veil_node_runtime::DataC
 }
 
 #[tokio::test]
+async fn stripe_candidates_preserve_the_streams_exact_receiver_binding() {
+    for different in ["cookie", "key"] {
+        let mut f = fixture().await;
+        let destination = [0xb9; 32];
+        let mut primary = route(&f.circuit, f.cells.me);
+        primary.envelope = CircuitEnvelope::ProtectedIntro {
+            peer_tag: [0x32; CIRCUIT_PEER_TAG_LEN],
+            receiver_x25519_pk: [3; 32],
+        };
+        let (wrong, _, _wrong_outbox) = add_circuit(&f.cells.services);
+        let (good, _, _good_outbox) = add_circuit(&f.cells.services);
+        let good = route(&good, f.cells.me);
+        let mut wrong = entry(&route(&wrong, f.cells.me), &[]);
+        if different == "cookie" {
+            wrong.peer_cookie[0] ^= 1;
+        } else {
+            wrong.receiver_x25519_pk[0] ^= 1;
+        }
+        f.cells.outbound_circuits.lock().await.insert(
+            destination,
+            vec![entry(&primary, &[71]), wrong, entry(&good, &[])],
+        );
+        let selected = f.cells.stripe_alternates(destination, &primary, 1).await;
+        f.runtime.stop().await.unwrap();
+        assert_eq!(selected.len(), 1);
+        assert!(
+            Arc::ptr_eq(&selected[0].circuit, &good.circuit),
+            "selected another receiver's {different}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_full_primary_outbox_does_not_stop_a_healthy_stripe() {
+    let mut f = fixture().await;
+    let primary = route(&f.circuit, f.cells.me);
+    let (alternate, _, mut outbox) = add_circuit(&f.cells.services);
+    let alternate = route(&alternate, f.cells.me);
+    while outbox.try_recv().is_ok() {}
+    fill_ordinary_outbox(&f.cells, &f.circuit);
+    f.cells.stripe_rr.store(0, Ordering::Relaxed);
+    let mut pending = data_run(71, 4);
+    let suffix = frames(99)[2].clone();
+    let expected: std::collections::VecDeque<_> = pending
+        .iter()
+        .step_by(2)
+        .cloned()
+        .chain([suffix.clone()])
+        .collect();
+    pending.push_back(suffix);
+    let result = f
+        .cells
+        .send_striped_run(
+            Addr {
+                node: [0xb9; 32],
+                app: [0xbc; 32],
+            },
+            71,
+            &primary,
+            std::slice::from_ref(&alternate),
+            4,
+            &mut pending,
+        )
+        .await;
+    let mut accepted = 0;
+    while outbox.try_recv().is_ok() {
+        accepted += 1;
+    }
+    let cooled = f.cells.route_cooldowns.lock().unwrap().contains_key(&f.hop);
+    let sent = alternate.stats.as_ref().unwrap().snapshot().data_cells;
+    f.runtime.stop().await.unwrap();
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(pending, expected);
+    assert_eq!(
+        accepted, 2,
+        "full primary prevented a healthy stripe from being tried"
+    );
+    assert_eq!(sent, 2);
+    assert!(
+        !cooled,
+        "local saturation quarantined a healthy network route"
+    );
+}
+
+#[tokio::test]
+async fn short_data_tail_retries_bound_alternates_after_full_first_hops() {
+    for all_full in [false, true] {
+        for accepted_prefix in [0, 1] {
+            let mut f = fixture().await;
+            let destination = Addr {
+                node: [0xb9; 32],
+                app: [0xbc; 32],
+            };
+            let mut primary = route(&f.circuit, f.cells.me);
+            primary.envelope = CircuitEnvelope::ProtectedIntro {
+                peer_tag: [0x32; CIRCUIT_PEER_TAG_LEN],
+                receiver_x25519_pk: [3; 32],
+            };
+            let (wrong, _, mut wrong_outbox) = add_circuit(&f.cells.services);
+            let (full, _, _full_outbox) = add_circuit(&f.cells.services);
+            let (good, _, mut good_outbox) = add_circuit(&f.cells.services);
+            let good = route(&good, f.cells.me);
+            while wrong_outbox.try_recv().is_ok() {}
+            while good_outbox.try_recv().is_ok() {}
+            let mut wrong = entry(&route(&wrong, f.cells.me), &[]);
+            wrong.receiver_x25519_pk[0] ^= 1;
+            f.cells.outbound_circuits.lock().await.insert(
+                destination.node,
+                vec![
+                    entry(&primary, &[71]),
+                    wrong,
+                    entry(&route(&full, f.cells.me), &[]),
+                    entry(&good, &[]),
+                ],
+            );
+            f.cells
+                .stream_routes
+                .lock()
+                .await
+                .insert((destination.node, 71, RouteClass::Bulk), primary.clone());
+            // This is path recovery, including when ordinary multi-path
+            // striping is disabled, not a reason to change that configuration.
+            f.cells.stripe_routes = 1;
+            fill_ordinary_outbox(&f.cells, &f.circuit);
+            fill_ordinary_outbox(&f.cells, &full);
+            if all_full {
+                fill_ordinary_outbox(&f.cells, &good.circuit);
+            }
+            if accepted_prefix == 1 {
+                f._outbox.try_recv().unwrap();
+            }
+            let mut pending = data_run(71, 2); // below STRIPE_MIN_RUN_CELLS
+            let suffix = frames(99)[2].clone();
+            pending.push_back(suffix.clone());
+            let expected_blocked = pending
+                .iter()
+                .skip(accepted_prefix)
+                .cloned()
+                .collect::<std::collections::VecDeque<_>>();
+            let result = f
+                .cells
+                .send_data_run(destination, 71, 2, &mut pending)
+                .await;
+            let mut accepted_on_good = 0;
+            if !all_full {
+                while let Ok((local_lane, bytes)) = good_outbox.try_recv() {
+                    assert_eq!(local_lane, veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE);
+                    let header =
+                        veil_proto::codec::decode_header(&bytes[..veil_proto::HEADER_SIZE])
+                            .unwrap();
+                    assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+                    accepted_on_good += 1;
+                }
+            }
+            let wrong_received = wrong_outbox.try_recv().is_ok();
+            let primary_sent = primary.stats.as_ref().unwrap().snapshot().data_cells;
+            let good_sent = good.stats.as_ref().unwrap().snapshot().data_cells;
+            let cooled = !f.cells.route_cooldowns.lock().unwrap().is_empty();
+            f.runtime.stop().await.unwrap();
+            assert!(
+                !wrong_received,
+                "recovery sent DATA to another receiver key"
+            );
+            assert!(!cooled, "full queues quarantined a network route");
+            assert_eq!(primary_sent, accepted_prefix as u64);
+            if all_full {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+                assert_eq!(pending, expected_blocked);
+                assert_eq!(good_sent, 0);
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "healthy bound third path was not tried: {result:?}"
+                );
+                assert_eq!(pending, std::collections::VecDeque::from([suffix]));
+                assert_eq!(accepted_on_good, 2 - accepted_prefix);
+                assert_eq!(good_sent, (2 - accepted_prefix) as u64);
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn ack_redundancy_tries_a_healthy_third_path_after_shared_first_hop_queue_full() {
     let mut observed = Vec::new();
     for all_full in [false, true] {
