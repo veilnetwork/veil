@@ -345,15 +345,9 @@ pub unsafe extern "C" fn veil_anon_stream_abort(stream: *mut VeilAnonStreamFfi) 
     let Some(stream_ref) = HandleTable::remove(anon_stream_table(), stream as usize) else {
         return;
     };
+    // A blocked write holds the writer mutex while waiting for DATA admission.
+    // Cancellation has its own bounded signal and must not wait for that lock.
     stream_ref
         .abort
-        .abort(veil_onion_stream::wire::reset_reason::APP);
-    let bundle = Arc::clone(&stream_ref.bundle);
-    let _task = bundle.runtime.spawn(async move {
-        let guard = stream_ref.writer.lock().await;
-        if let Some(wr) = guard.as_ref() {
-            wr.abort_local(veil_onion_stream::wire::reset_reason::APP);
-            wr.reset(veil_onion_stream::wire::reset_reason::APP).await;
-        }
-    });
+        .reset(veil_onion_stream::wire::reset_reason::APP);
 }

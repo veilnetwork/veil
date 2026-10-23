@@ -9,7 +9,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 // tokio's monotonic clock (NOT std::time::Instant): it honours `start_paused`'s
 // virtual time in tests, so the engine's clock and the driver's sleeps share one
 // timeline. In production it is the real monotonic clock.
@@ -143,7 +143,6 @@ pub enum End {
 enum AppCmd {
     Write(Vec<u8>),
     Finish,
-    Reset(u8),
 }
 
 /// App-facing handle to a reliable onion byte-stream. The sender uses
@@ -179,13 +178,22 @@ impl OnionStream {
         D: CellDuplex + 'static,
     {
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (reset_tx, reset_rx) = watch::channel(None);
         let (data_tx, data_rx) = mpsc::channel(16);
         let end = Arc::new(Mutex::new(End::Open));
         let abort = OnionAbort {
             end: end.clone(),
             notify: Arc::new(Notify::new()),
+            reset_tx,
         };
-        tokio::spawn(drive(engine, duplex, cmd_rx, data_tx, end.clone()));
+        tokio::spawn(drive(
+            engine,
+            duplex,
+            cmd_rx,
+            reset_rx,
+            data_tx,
+            end.clone(),
+        ));
         OnionStream {
             cmd_tx,
             data_rx,
@@ -211,8 +219,7 @@ impl OnionStream {
 
     /// Abort the stream; the peer observes [`End::Reset`].
     pub async fn reset(&self, reason: u8) {
-        self.abort.abort(reason);
-        let _ = self.cmd_tx.send(AppCmd::Reset(reason)).await;
+        self.abort.reset(reason);
     }
 
     /// Read up to `buf.len()` delivered bytes. `Ok(0)` = clean EOF; an
@@ -265,6 +272,7 @@ impl OnionStream {
 pub struct OnionAbort {
     end: Arc<Mutex<End>>,
     notify: Arc<Notify>,
+    reset_tx: watch::Sender<Option<u8>>,
 }
 
 impl OnionAbort {
@@ -273,6 +281,21 @@ impl OnionAbort {
     pub fn abort(&self, reason: u8) {
         set_end(&self.end, End::Reset(reason));
         self.notify.notify_waiters();
+    }
+
+    /// Wake readers and request a best-effort wire reset without waiting for
+    /// the writer mutex or a backpressured application-data queue. Only the
+    /// first reset is retained; repeated requests cannot grow a control queue.
+    /// The driver consumes it when the current carrier operation returns.
+    pub fn reset(&self, reason: u8) {
+        self.abort(reason);
+        self.reset_tx.send_if_modified(|pending| {
+            if pending.is_some() {
+                return false;
+            }
+            *pending = Some(reason);
+            true
+        });
     }
 }
 
@@ -320,8 +343,7 @@ impl OnionWriter {
     }
     /// See [`OnionStream::reset`].
     pub async fn reset(&self, reason: u8) {
-        self.abort.abort(reason);
-        let _ = self.cmd_tx.send(AppCmd::Reset(reason)).await;
+        self.abort.reset(reason);
     }
     /// Locally wake readers without waiting for the async driver command queue.
     pub fn abort_local(&self, reason: u8) {
@@ -434,6 +456,7 @@ async fn drive<D: CellDuplex>(
     mut engine: StreamEngine,
     mut duplex: D,
     mut cmd_rx: mpsc::Receiver<AppCmd>,
+    mut reset_rx: watch::Receiver<Option<u8>>,
     data_tx: mpsc::Sender<Vec<u8>>,
     end: Arc<Mutex<End>>,
 ) {
@@ -443,6 +466,7 @@ async fn drive<D: CellDuplex>(
     let debug_summary_period_ms = debug_summary_period_ms(engine.debug_summary_period_ms());
     let mut next_debug_summary_ms = debug_summary_period_ms.unwrap_or(0);
     let mut cmd_open = true;
+    let mut reset_open = true;
     let mut cell = Vec::with_capacity(crate::wire::MAX_CELL);
     // Inbound burst buffer for `recv_cells` — reused across loop turns.
     let mut rx_cells: Vec<Vec<u8>> = Vec::new();
@@ -645,11 +669,20 @@ async fn drive<D: CellDuplex>(
         }
         tokio::select! {
             biased;
+            changed = reset_rx.changed(), if reset_open => {
+                if changed.is_err() {
+                    reset_open = false;
+                } else if let Some(reason) = *reset_rx.borrow_and_update() {
+                    // Never put cancellation behind DATA's high-water guard.
+                    // Leave retained DATA unsent and use the final RST flush.
+                    engine.reset(reason);
+                    break;
+                }
+            }
             cmd = cmd_rx.recv(), if cmd_open && engine.send_buffer_len() < SEND_HIGH_WATER => {
                 match cmd {
                     Some(AppCmd::Write(d)) => { engine.write(&d); }
                     Some(AppCmd::Finish) => { engine.finish(); }
-                    Some(AppCmd::Reset(r)) => { engine.reset(r); }
                     None => { cmd_open = false; engine.finish(); } // handle dropped → finish send
                 }
             }
