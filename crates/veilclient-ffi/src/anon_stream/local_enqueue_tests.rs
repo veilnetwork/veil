@@ -2540,6 +2540,160 @@ async fn cold_registered_opening_does_not_park_the_handshake_carrier() {
 }
 
 #[tokio::test]
+async fn isolated_small_rtos_keep_the_route_but_backlog_and_blackhole_recover() {
+    use veil_onion_stream::{Config, Event, StreamEngine};
+    for rewind in [false, true] {
+        for mode in ["isolated", "backlogged", "blackhole", "legacy"] {
+            let mut f = fixture().await;
+            let destination = Addr {
+                node: [0xb9; 32],
+                app: [0xbc; 32],
+            };
+            let primary = protected_route(&f.circuit, f.cells.me);
+            let (alternate, _, mut alternate_outbox) = add_circuit(&f.cells.services);
+            let alternate = protected_route(&alternate, f.cells.me);
+            primary.stats.as_ref().unwrap().record_stream_open();
+            f.cells.outbound_circuits.lock().await.insert(
+                destination.node,
+                vec![entry(&primary, &[71]), entry(&alternate, &[])],
+            );
+            f.cells
+                .stream_routes
+                .lock()
+                .await
+                .insert((destination.node, 71, RouteClass::Bulk), primary.clone());
+            let hub = HubCells::Circuit(Box::new(f.cells.clone()));
+            let cfg = Config {
+                mss: 8,
+                init_cwnd: 8,
+                init_rto_ms: 50,
+                min_rto_ms: 50,
+                max_rto_ms: 50,
+                rto_rewind_no_sack: rewind,
+                ..Config::default()
+            };
+            let mut engine = StreamEngine::connect(71, cfg, 0, 100);
+            let mut cell = Vec::new();
+            assert!(engine.poll_transmit(0, &mut cell));
+            Frame::SynAck {
+                stream_id: 71,
+                isn: 500,
+                win: 8192,
+                ack: 101,
+            }
+            .encode_into(&mut cell);
+            engine.on_cell(&cell, 1);
+            while engine.poll_event().is_some() {}
+            let mut replaced = false;
+            let mut contexts = Vec::new();
+            let mut ack_end = 101;
+            let expected_rtos = if mode == "blackhole" { 2 } else { 5 };
+            for index in 0..expected_rtos {
+                let now = 1000 + index * 1000;
+                if index == 0 || mode != "blackhole" {
+                    let payload = vec![0x39; if mode == "backlogged" { 64 } else { 8 }];
+                    assert_eq!(engine.write(&payload), payload.len());
+                }
+                for _ in 0..4 {
+                    if !engine.poll_transmit(now, &mut cell) {
+                        break;
+                    }
+                    if let Some(Frame::Data { seq, payload, .. }) = Frame::decode(&cell) {
+                        ack_end = seq.wrapping_add(payload.len() as u32);
+                        hub.send(destination, cell.clone()).await.unwrap();
+                        break;
+                    }
+                }
+                while f._outbox.try_recv().is_ok() {}
+                while alternate_outbox.try_recv().is_ok() {}
+                engine.on_timeout(now + 60);
+                let mut got_rto = false;
+                while let Some(event) = engine.poll_event() {
+                    if let Event::DataRto {
+                        consec_rto,
+                        snd_una,
+                        app_limited,
+                    } = event
+                    {
+                        got_rto = true;
+                        contexts.push(app_limited);
+                        if mode == "legacy" {
+                            hub.on_stream_data_rto(destination, 71, consec_rto, snd_una)
+                                .await;
+                        } else {
+                            hub.on_stream_data_rto_with_demand(
+                                destination,
+                                71,
+                                consec_rto,
+                                snd_una,
+                                app_limited,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                assert!(
+                    got_rto,
+                    "test must exercise a real engine RTO: {mode} {index}"
+                );
+                if mode != "blackhole" {
+                    // The repair is locally admitted before its ACK arrives.
+                    for _ in 0..4 {
+                        if !engine.poll_transmit(now + 61, &mut cell) {
+                            break;
+                        }
+                        if matches!(Frame::decode(&cell), Some(Frame::Data { .. })) {
+                            hub.send(destination, cell.clone()).await.unwrap();
+                            break;
+                        }
+                    }
+                    while f._outbox.try_recv().is_ok() {}
+                    while alternate_outbox.try_recv().is_ok() {}
+                    Frame::Ack {
+                        stream_id: 71,
+                        ack: ack_end,
+                        win: 8192,
+                        sacks: Default::default(),
+                    }
+                    .encode_into(&mut cell);
+                    engine.on_cell(&cell, now + 62);
+                }
+                let pin = f
+                    .cells
+                    .stream_routes
+                    .lock()
+                    .await
+                    .get(&(destination.node, 71, RouteClass::Bulk))
+                    .cloned();
+                replaced |= pin.is_none_or(|pin| !Arc::ptr_eq(&pin.circuit, &primary.circuit));
+            }
+            let total_rtos = primary.stats.as_ref().unwrap().snapshot().rto_events
+                + alternate.stats.as_ref().unwrap().snapshot().rto_events;
+            let cooled = !f.cells.route_cooldowns.lock().unwrap().is_empty();
+            f.runtime.stop().await.unwrap();
+            assert_eq!(total_rtos, expected_rtos, "RTO diagnostics were hidden");
+            if mode == "isolated" || mode == "legacy" {
+                assert!(contexts.iter().all(|limited| *limited));
+            } else if mode == "backlogged" {
+                assert!(contexts.iter().all(|limited| !limited));
+            }
+            if mode == "isolated" {
+                assert!(
+                    !replaced,
+                    "acknowledged tiny writes replaced their route (rewind={rewind})"
+                );
+                assert!(!cooled, "a progressing app-limited stream cooled a path");
+            } else {
+                assert!(
+                    replaced,
+                    "backlog, blackhole or legacy recovery disabled: {mode} {rewind}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn confirmed_last_resort_route_can_recover_its_observed_cooldown() {
     for mode in [
         "recovered",
