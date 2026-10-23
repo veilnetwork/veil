@@ -2540,6 +2540,115 @@ async fn cold_registered_opening_does_not_park_the_handshake_carrier() {
 }
 
 #[tokio::test]
+async fn confirmed_last_resort_route_can_recover_its_observed_cooldown() {
+    for mode in [
+        "recovered",
+        "newer_relay_error",
+        "newer_hop_error",
+        "unconfirmed",
+        "stale_generation",
+        "dead_hop",
+        "error_after_snapshot",
+    ] {
+        let mut f = fixture().await;
+        let destination = Addr {
+            node: [0xb9; 32],
+            app: [0xbc; 32],
+        };
+        let mut ready = protected_route(&f.circuit, f.cells.me);
+        ready
+            .circuit
+            .confirmed_flag()
+            .store(mode != "unconfirmed", Ordering::Release);
+        if mode == "stale_generation" {
+            ready.first_hop_close_generation += 1;
+        }
+        while f._outbox.try_recv().is_ok() {}
+        if mode != "error_after_snapshot" {
+            mark_rendezvous_cooldown(&f.cells.route_cooldowns, f.hop, Duration::from_secs(60));
+        }
+        let observed = f.cells.route_cooldowns.lock().unwrap().clone();
+        if mode == "newer_relay_error" || mode == "error_after_snapshot" {
+            mark_rendezvous_cooldown(&f.cells.route_cooldowns, f.hop, Duration::from_secs(120));
+        }
+        if mode == "newer_hop_error" {
+            mark_first_hop_cooldown(
+                &f.cells.first_hop_cooldowns,
+                f.hop,
+                Duration::from_secs(120),
+            );
+        }
+        if mode == "dead_hop" {
+            f.cells
+                .services
+                .session_tx_registry
+                .write()
+                .unwrap()
+                .unregister(&f.hop);
+        }
+        let expected_error = f.cells.route_cooldowns.lock().unwrap().get(&f.hop).copied();
+        publish_outbound_candidates(
+            &f.cells.services,
+            destination.node,
+            &f.cells.outbound_circuits,
+            &[entry(&ready, &[])],
+            OutboundCooldownRecovery {
+                route_cooldowns: &f.cells.route_cooldowns,
+                first_hop_cooldowns: &f.cells.first_hop_cooldowns,
+                observed: &observed,
+            },
+        )
+        .await;
+        let selected = {
+            let mut pool = f.cells.outbound_circuits.lock().await;
+            f.cells.select_outbound_route(
+                destination.node,
+                pool.get_mut(&destination.node).unwrap(),
+                Some(71),
+                RouteClass::Bulk,
+                Instant::now(),
+            )
+        };
+        let current_error = f.cells.route_cooldowns.lock().unwrap().get(&f.hop).copied();
+        let mut accepted = 0;
+        if selected.is_some() {
+            let mut cell = Vec::new();
+            Frame::Data {
+                stream_id: 71,
+                seq: 101,
+                win: 8192,
+                payload: b"request",
+            }
+            .encode_into(&mut cell);
+            f.cells.send(destination, cell).await.unwrap();
+            while let Ok((lane, _)) = f._outbox.try_recv() {
+                assert_eq!(lane, veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE);
+                accepted += 1;
+            }
+        }
+        f.runtime.stop().await.unwrap();
+        if mode == "recovered" {
+            assert!(
+                selected.is_some(),
+                "confirmed recovery stayed excluded by its old cooldown"
+            );
+            assert_eq!(current_error, None);
+            assert_eq!(accepted, 1);
+        } else {
+            assert!(
+                selected.is_none(),
+                "ineligible recovery became usable: {mode}"
+            );
+            assert_eq!(
+                current_error, expected_error,
+                "newer or unproven failure was erased: {mode}"
+            );
+            assert_eq!(accepted, 0);
+        }
+    }
+}
+
+#[tokio::test]
 async fn published_pool_prefix_is_usable_and_keeps_live_metadata_on_refill() {
     let mut f = fixture().await;
     let destination = Addr {
@@ -2554,6 +2663,11 @@ async fn published_pool_prefix_is_usable_and_keeps_live_metadata_on_refill() {
         destination.node,
         &f.cells.outbound_circuits,
         &candidates,
+        OutboundCooldownRecovery {
+            route_cooldowns: &f.cells.route_cooldowns,
+            first_hop_cooldowns: &f.cells.first_hop_cooldowns,
+            observed: &HashMap::new(),
+        },
     )
     .await;
     // A later candidate is still warming, but the first confirmed route must
@@ -2592,6 +2706,11 @@ async fn published_pool_prefix_is_usable_and_keeps_live_metadata_on_refill() {
         destination.node,
         &f.cells.outbound_circuits,
         &candidates,
+        OutboundCooldownRecovery {
+            route_cooldowns: &f.cells.route_cooldowns,
+            first_hop_cooldowns: &f.cells.first_hop_cooldowns,
+            observed: &HashMap::new(),
+        },
     )
     .await;
     let (ordered, preserved, same_activity, bounded) = {
