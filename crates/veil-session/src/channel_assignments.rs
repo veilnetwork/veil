@@ -81,6 +81,31 @@ impl<const N: usize> ChannelAssignments<N> {
         })
     }
 
+    /// Reuse an authenticated spare while this owner's channel is unavailable.
+    /// Never move a healthy owner, displace another owner or extend capacity.
+    /// The same rule applies to local sources and neutral transit connections.
+    pub fn ready_selection(
+        &mut self,
+        selected: Selection,
+        mut ready: impl FnMut(usize) -> bool,
+    ) -> Option<Selection> {
+        if selected.physical >= self.capacity || self.owners[selected.physical].is_none() {
+            return None;
+        }
+        if ready(selected.physical) {
+            return Some(selected);
+        }
+        let physical =
+            (0..self.capacity).find(|&index| self.owners[index].is_none() && ready(index))?;
+        let owner = self.owners[selected.physical].take()?;
+        let counter = match &owner {
+            Owner::Source(source) => *source,
+            _ => SOURCE_COUNT + physical,
+        };
+        self.owners[physical] = Some(owner);
+        Some(Selection { physical, counter })
+    }
+
     /// Opaque authenticated ingress/circuit ownership, never frame contents,
     /// chooses a distinct live connection. Legacy ingress retains neutral buckets.
     /// Saturation returns None instead of merging two live known connections.
@@ -173,6 +198,59 @@ mod tests {
     }
     fn witness(value: &Arc<Ingress>) -> Carrier {
         Arc::downgrade(&(value.clone() as Arc<dyn DatagramCarrier>))
+    }
+
+    #[test]
+    fn unavailable_owners_use_only_unowned_ready_channels_without_extra_capacity() {
+        for transit in [false, true] {
+            let mut pool = ChannelAssignments::<3>::default();
+            let flow = ingress(1, 1);
+            let initial = if transit {
+                pool.transit(Some(&witness(&flow)), 0).unwrap()
+            } else {
+                pool.source(0).unwrap()
+            };
+            assert_eq!(initial.physical, 0);
+            let other = pool.source(1).unwrap();
+            // The only healthy channel is owned by another flow: do not steal.
+            assert!(
+                pool.ready_selection(initial, |index| index == other.physical)
+                    .is_none()
+            );
+            assert_eq!(pool.source_physical(1), Some(other.physical));
+            // A healthy existing owner does not move just because a spare exists.
+            assert_eq!(
+                pool.ready_selection(initial, |index| {
+                    assert_eq!(index, initial.physical);
+                    true
+                })
+                .unwrap()
+                .physical,
+                initial.physical
+            );
+            let recovered = pool
+                .ready_selection(initial, |index| index != initial.physical)
+                .unwrap();
+            assert_eq!(recovered.physical, 2);
+            assert_eq!(
+                recovered.counter,
+                if transit { SOURCE_COUNT + 2 } else { 0 }
+            );
+            assert_eq!(pool.source_physical(1), Some(other.physical));
+            if transit {
+                assert_eq!(pool.transit(Some(&witness(&flow)), 1).unwrap().physical, 2);
+            } else {
+                assert_eq!(pool.source_physical(0), Some(2));
+            }
+            // Relocation releases the old assignment, not an extra connection.
+            let last = pool.source(2).unwrap();
+            assert_eq!(last.physical, 0);
+            assert!(pool.transit(Some(&witness(&ingress(1, 2))), 0).is_none());
+            assert!(
+                pool.ready_selection(last, |index| index != last.physical)
+                    .is_none()
+            );
+        }
     }
 
     #[test]
