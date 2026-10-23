@@ -102,6 +102,18 @@ fn route(circuit: &Arc<veil_node_runtime::DataCircuit>, sender: [u8; 32]) -> Cir
     }
 }
 
+fn protected_route(
+    circuit: &Arc<veil_node_runtime::DataCircuit>,
+    sender: [u8; 32],
+) -> CircuitRoute {
+    let mut route = route(circuit, sender);
+    route.envelope = CircuitEnvelope::ProtectedIntro {
+        peer_tag: [0x32; CIRCUIT_PEER_TAG_LEN],
+        receiver_x25519_pk: [3; 32],
+    };
+    route
+}
+
 fn entry(route: &CircuitRoute, streams: &[u32]) -> CircuitEntry {
     let now = Instant::now();
     CircuitEntry {
@@ -545,6 +557,456 @@ fn fill_ordinary_outbox(cells: &CircuitCells, circuit: &veil_node_runtime::DataC
         }
     }
     panic!("ordinary outbox did not reach its actual bounded capacity");
+}
+
+#[tokio::test]
+async fn first_ack_keeps_bulk_receiver_and_independent_ack_path() {
+    let mut observed = Vec::new();
+    for different in ["cookie", "key"] {
+        let mut f = fixture().await;
+        let destination = [0xb9; 32];
+        let primary = protected_route(&f.circuit, f.cells.me);
+        f.cells
+            .outbound_circuits
+            .lock()
+            .await
+            .insert(destination, vec![entry(&primary, &[])]);
+        f.cells
+            .circuit_for(destination, Some(71), RouteClass::Bulk, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let (wrong, _, _wrong_outbox) = add_circuit(&f.cells.services);
+        let (good, _, _good_outbox) = add_circuit(&f.cells.services);
+        let good = protected_route(&good, f.cells.me);
+        let mut wrong = entry(&protected_route(&wrong, f.cells.me), &[]);
+        if different == "cookie" {
+            wrong.peer_cookie[0] ^= 1;
+        } else {
+            wrong.receiver_x25519_pk[0] ^= 1;
+        }
+        f.cells.outbound_circuits.lock().await.insert(
+            destination,
+            vec![wrong, entry(&good, &[]), entry(&primary, &[71])],
+        );
+        f.cells.ack_outbound_pool_target = 1;
+        let ack = f
+            .cells
+            .circuit_for(destination, Some(71), RouteClass::Ack, false)
+            .await
+            .unwrap()
+            .unwrap();
+        f.runtime.stop().await.unwrap();
+        observed.push((different, Arc::ptr_eq(&ack.circuit, &good.circuit)));
+    }
+    for (different, correct) in observed {
+        assert!(
+            correct,
+            "first ACK ignored the Bulk receiver {different} or lost its independent path"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_ack_without_a_stream_binding_does_not_guess_a_receiver() {
+    let mut f = fixture().await;
+    let destination = [0xb9; 32];
+    let primary = protected_route(&f.circuit, f.cells.me);
+    f.cells
+        .outbound_circuits
+        .lock()
+        .await
+        .insert(destination, vec![entry(&primary, &[])]);
+    let ack = f
+        .cells
+        .circuit_for(destination, Some(71), RouteClass::Ack, false)
+        .await
+        .unwrap();
+    let bulk = f
+        .cells
+        .circuit_for(destination, Some(71), RouteClass::Bulk, true)
+        .await
+        .unwrap();
+    let later_ack = f
+        .cells
+        .circuit_for(destination, Some(71), RouteClass::Ack, false)
+        .await
+        .unwrap();
+    f.runtime.stop().await.unwrap();
+    assert!(ack.is_none());
+    assert!(bulk.is_some() && later_ack.is_some());
+}
+
+#[tokio::test]
+async fn racing_same_class_selections_pin_and_account_for_one_route() {
+    let mut f = fixture().await;
+    let destination = [0xb9; 32];
+    let primary = protected_route(&f.circuit, f.cells.me);
+    let (second, _, _outbox) = add_circuit(&f.cells.services);
+    let second = protected_route(&second, f.cells.me);
+    let mut pool = f.cells.outbound_circuits.lock().await;
+    pool.insert(destination, vec![entry(&primary, &[]), entry(&second, &[])]);
+    let mut first = Box::pin(
+        f.cells
+            .circuit_for(destination, Some(71), RouteClass::Bulk, true),
+    );
+    let mut other = Box::pin(
+        f.cells
+            .circuit_for(destination, Some(71), RouteClass::Bulk, true),
+    );
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    // Both callers see an empty pin cache, then park at the real pool lock.
+    assert!(std::future::Future::poll(first.as_mut(), &mut context).is_pending());
+    assert!(std::future::Future::poll(other.as_mut(), &mut context).is_pending());
+    let pins = f.cells.stream_routes.lock().await;
+    drop(pool);
+    // Both finish pool selection, then park before committing the cache pin.
+    assert!(std::future::Future::poll(first.as_mut(), &mut context).is_pending());
+    assert!(std::future::Future::poll(other.as_mut(), &mut context).is_pending());
+    drop(pins);
+    let (first, other) = tokio::join!(first, other);
+    let first = first.unwrap().unwrap();
+    let other = other.unwrap().unwrap();
+    let active = primary.stats.as_ref().unwrap().active_streams()
+        + second.stats.as_ref().unwrap().active_streams();
+    f.cells
+        .on_stream_closed(
+            Addr {
+                node: destination,
+                app: [0xbc; 32],
+            },
+            71,
+            End::Eof,
+        )
+        .await;
+    let after_close = primary.stats.as_ref().unwrap().active_streams()
+        + second.stats.as_ref().unwrap().active_streams();
+    f.runtime.stop().await.unwrap();
+    assert!(
+        Arc::ptr_eq(&first.circuit, &other.circuit),
+        "same stream committed two different Bulk pins"
+    );
+    assert_eq!(active, 1, "one stream consumed two admission slots");
+    assert_eq!(after_close, 0, "close leaked an admission slot");
+}
+
+#[tokio::test]
+async fn stale_route_eviction_does_not_rebind_a_live_stream_to_another_receiver() {
+    let mut observed = Vec::new();
+    for different in ["cookie", "key"] {
+        for matching in [false, true] {
+            let mut f = fixture().await;
+            let destination = [0xb9; 32];
+            let primary = protected_route(&f.circuit, f.cells.me);
+            f.cells
+                .outbound_circuits
+                .lock()
+                .await
+                .insert(destination, vec![entry(&primary, &[])]);
+            f.cells
+                .circuit_for(destination, Some(71), RouteClass::Bulk, true)
+                .await
+                .unwrap()
+                .unwrap();
+            let (wrong, _, _wrong_outbox) = add_circuit(&f.cells.services);
+            let (good, _, _good_outbox) = add_circuit(&f.cells.services);
+            let good = protected_route(&good, f.cells.me);
+            let mut wrong = entry(&protected_route(&wrong, f.cells.me), &[]);
+            if different == "cookie" {
+                wrong.peer_cookie[0] ^= 1;
+            } else {
+                wrong.receiver_x25519_pk[0] ^= 1;
+            }
+            let mut entries = vec![entry(&primary, &[71]), wrong];
+            if matching {
+                entries.push(entry(&good, &[]));
+            }
+            f.cells
+                .outbound_circuits
+                .lock()
+                .await
+                .insert(destination, entries);
+            f.cells.mark_route_stale(destination, &primary).await;
+            let next = f
+                .cells
+                .circuit_for(destination, Some(71), RouteClass::Bulk, false)
+                .await
+                .unwrap();
+            let correct = match next {
+                Some(route) => matching && Arc::ptr_eq(&route.circuit, &good.circuit),
+                None => !matching,
+            };
+            // A fresh stream can legitimately choose the other device. The
+            // old stream can do so only after its own lifetime has ended.
+            let fresh = f
+                .cells
+                .circuit_for(destination, Some(72), RouteClass::Bulk, true)
+                .await
+                .unwrap();
+            let new_allowed = fresh.as_ref().is_some_and(|route| {
+                !StreamReceiverBinding::from_route(&primary).matches_route(route)
+            });
+            f.cells
+                .on_stream_closed(
+                    Addr {
+                        node: destination,
+                        app: [0xbc; 32],
+                    },
+                    71,
+                    End::Eof,
+                )
+                .await;
+            f.cells
+                .next_outbound_route
+                .lock()
+                .unwrap()
+                .insert((destination, RouteClass::Bulk), 0);
+            let reused = f
+                .cells
+                .circuit_for(destination, Some(71), RouteClass::Bulk, true)
+                .await
+                .unwrap();
+            let released = reused.as_ref().is_some_and(|route| {
+                !StreamReceiverBinding::from_route(&primary).matches_route(route)
+            });
+            let unrelated_kept = f.cells.stream_routes.lock().await.contains_key(&(
+                destination,
+                72,
+                RouteClass::Bulk,
+            ));
+            f.runtime.stop().await.unwrap();
+            observed.push((
+                different,
+                matching,
+                correct && new_allowed && released && unrelated_kept,
+            ));
+        }
+    }
+    for (different, matching, correct) in observed {
+        assert!(
+            correct,
+            "live stream rebound after cache eviction: {different}, matching alternative={matching}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cached_wrong_ack_is_reselected_without_changing_bulk_binding() {
+    let mut f = fixture().await;
+    let destination = [0xb9; 32];
+    let primary = protected_route(&f.circuit, f.cells.me);
+    let (wrong, _, _wrong_outbox) = add_circuit(&f.cells.services);
+    let (good, _, _good_outbox) = add_circuit(&f.cells.services);
+    let mut wrong = protected_route(&wrong, f.cells.me);
+    wrong.peer_cookie[0] ^= 1;
+    let good = protected_route(&good, f.cells.me);
+    f.cells.outbound_circuits.lock().await.insert(
+        destination,
+        vec![
+            entry(&good, &[]),
+            entry(&wrong, &[]),
+            entry(&primary, &[71]),
+        ],
+    );
+    {
+        let mut routes = f.cells.stream_routes.lock().await;
+        routes.insert((destination, 71, RouteClass::Bulk), primary.clone());
+        routes.insert((destination, 71, RouteClass::Ack), wrong);
+    }
+    let ack = f
+        .cells
+        .circuit_for(destination, Some(71), RouteClass::Ack, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let bulk = f
+        .cells
+        .circuit_for(destination, Some(71), RouteClass::Bulk, false)
+        .await
+        .unwrap()
+        .unwrap();
+    f.runtime.stop().await.unwrap();
+    assert!(Arc::ptr_eq(&ack.circuit, &good.circuit));
+    assert!(Arc::ptr_eq(&bulk.circuit, &primary.circuit));
+}
+
+#[tokio::test]
+async fn ack_copy_recovery_keeps_binding_after_bulk_pin_eviction() {
+    let mut f = fixture().await;
+    let destination = [0xb9; 32];
+    let primary = protected_route(&f.circuit, f.cells.me);
+    f.cells
+        .outbound_circuits
+        .lock()
+        .await
+        .insert(destination, vec![entry(&primary, &[])]);
+    f.cells
+        .circuit_for(destination, Some(71), RouteClass::Bulk, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let (wrong, _, mut wrong_outbox) = add_circuit(&f.cells.services);
+    let (good, _, mut good_outbox) = add_circuit(&f.cells.services);
+    let mut wrong = entry(&protected_route(&wrong, f.cells.me), &[]);
+    wrong.receiver_x25519_pk[0] ^= 1;
+    let good = protected_route(&good, f.cells.me);
+    while wrong_outbox.try_recv().is_ok() {}
+    while good_outbox.try_recv().is_ok() {}
+    f.cells.outbound_circuits.lock().await.insert(
+        destination,
+        vec![entry(&primary, &[71]), wrong, entry(&good, &[])],
+    );
+    f.cells.mark_route_stale(destination, &primary).await;
+    let ack = frames(71)[2].clone();
+    let accepted = f.cells.send_ack_copies(destination, None, &ack, 1).await;
+    let wrong_sent = wrong_outbox.try_recv().is_ok();
+    let good_sent = good_outbox.try_recv().is_ok();
+    f.cells
+        .on_stream_closed(
+            Addr {
+                node: destination,
+                app: [0xbc; 32],
+            },
+            71,
+            End::Eof,
+        )
+        .await;
+    let after_close = f.cells.send_ack_copies(destination, None, &ack, 1).await;
+    f.runtime.stop().await.unwrap();
+    assert_eq!(accepted, 1);
+    assert!(!wrong_sent && good_sent);
+    assert_eq!(
+        after_close, 0,
+        "closed stream guessed a new receiver for its ACK"
+    );
+}
+
+#[tokio::test]
+async fn route_cache_pressure_keeps_live_bulk_pins_and_receiver_admission_bounded() {
+    let mut f = fixture().await;
+    let destination = [0xb9; 32];
+    let primary = protected_route(&f.circuit, f.cells.me);
+    f.cells
+        .outbound_circuits
+        .lock()
+        .await
+        .insert(destination, vec![entry(&primary, &[])]);
+    f.cells.bulk_route_active_limit = 0;
+    for sid in 1..=MAX_STREAM_RECEIVER_BINDINGS as u32 {
+        f.cells
+            .circuit_for(destination, Some(sid), RouteClass::Bulk, true)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let ack = f
+        .cells
+        .circuit_for(destination, Some(1), RouteClass::Ack, false)
+        .await;
+    let bulk_kept = f
+        .cells
+        .stream_routes
+        .lock()
+        .await
+        .get(&(destination, 2, RouteClass::Bulk))
+        .is_some_and(|route| Arc::ptr_eq(&route.circuit, &primary.circuit));
+    let new_sid = MAX_STREAM_RECEIVER_BINDINGS as u32 + 1;
+    let full = f
+        .cells
+        .circuit_for(destination, Some(new_sid), RouteClass::Bulk, true)
+        .await;
+    let full_rejected = full
+        .as_ref()
+        .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock);
+    f.cells
+        .on_stream_closed(
+            Addr {
+                node: destination,
+                app: [0xbc; 32],
+            },
+            1,
+            End::Eof,
+        )
+        .await;
+    let resumed = f
+        .cells
+        .circuit_for(destination, Some(new_sid), RouteClass::Bulk, true)
+        .await;
+    let bindings = f.cells.stream_receivers.lock().unwrap().len();
+    let pinned = f.cells.stream_routes.lock().await.len();
+    let active = primary.stats.as_ref().unwrap().active_streams();
+    f.runtime.stop().await.unwrap();
+    assert!(
+        ack.unwrap().is_some(),
+        "full pin cache blocked an existing stream ACK"
+    );
+    assert!(bulk_kept, "cache pressure evicted a live Bulk pin");
+    assert!(
+        full_rejected,
+        "receiver admission erased or exceeded the live binding bound"
+    );
+    assert!(
+        resumed.unwrap().is_some(),
+        "closed stream failed to release admission"
+    );
+    assert!(bindings <= MAX_STREAM_RECEIVER_BINDINGS && pinned <= MAX_STREAM_ROUTE_ENTRIES);
+    assert_eq!(active, MAX_STREAM_RECEIVER_BINDINGS as u64);
+}
+
+#[tokio::test]
+async fn slow_route_shedding_keeps_the_original_receiver() {
+    for matching in [false, true] {
+        let mut f = fixture().await;
+        let destination = [0xb9; 32];
+        let primary = protected_route(&f.circuit, f.cells.me);
+        f.cells
+            .outbound_circuits
+            .lock()
+            .await
+            .insert(destination, vec![entry(&primary, &[])]);
+        f.cells
+            .circuit_for(destination, Some(71), RouteClass::Bulk, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let (wrong, _, _wrong_outbox) = add_circuit(&f.cells.services);
+        let (good, _, _good_outbox) = add_circuit(&f.cells.services);
+        let good = protected_route(&good, f.cells.me);
+        let mut wrong = entry(&protected_route(&wrong, f.cells.me), &[]);
+        wrong.peer_cookie[0] ^= 1;
+        let mut entries = vec![entry(&primary, &[71]), wrong];
+        if matching {
+            entries.push(entry(&good, &[]));
+        }
+        f.cells
+            .outbound_circuits
+            .lock()
+            .await
+            .insert(destination, entries);
+        let stats = primary.stats.as_ref().unwrap();
+        stats
+            .slow_windows
+            .store(CIRCUIT_ROUTE_SHED_SLOW_WINDOWS, Ordering::Relaxed);
+        stats.slow_mark_expiry_ms.store(60_000, Ordering::Relaxed);
+        f.cells
+            .maybe_shed_slow_bulk_route(destination, 71, &primary)
+            .await;
+        let selected = f
+            .cells
+            .circuit_for(destination, Some(71), RouteClass::Bulk, false)
+            .await
+            .unwrap()
+            .unwrap();
+        f.runtime.stop().await.unwrap();
+        assert!(Arc::ptr_eq(
+            &selected.circuit,
+            if matching {
+                &good.circuit
+            } else {
+                &primary.circuit
+            }
+        ));
+    }
 }
 
 #[tokio::test]
