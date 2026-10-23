@@ -866,6 +866,16 @@ struct CircuitEntry {
 }
 
 impl CircuitEntry {
+    fn serves_receiver(&self, route: &CircuitRoute) -> bool {
+        self.peer_cookie == route.peer_cookie
+            && match route.envelope {
+                CircuitEnvelope::ProtectedIntro {
+                    receiver_x25519_pk, ..
+                } => self.receiver_x25519_pk == receiver_x25519_pk,
+                CircuitEnvelope::LegacyClearSender { .. } => true,
+            }
+    }
+
     fn note_handshake_stream(&mut self, stream_id: u32) {
         if self.handshake_streams.len() >= 256 && !self.handshake_streams.contains(&stream_id) {
             self.handshake_streams.clear();
@@ -1389,7 +1399,7 @@ impl CellSender for CircuitCells {
             self.mark_route_stale(dst.node, &route).await;
             if ack_copies > 0
                 && self
-                    .send_ack_copies(dst.node, route.rendezvous_node, &cell, ack_copies)
+                    .send_ack_copies(dst.node, Some(&route), &cell, ack_copies)
                     .await
                     > 0
             {
@@ -1406,7 +1416,7 @@ impl CellSender for CircuitCells {
             self.data_pacer.wait(dst.node).await;
         }
         let accepted_ack_copies = if ack_copies > 0 {
-            self.send_ack_copies(dst.node, route.rendezvous_node, &cell, ack_copies)
+            self.send_ack_copies(dst.node, Some(&route), &cell, ack_copies)
                 .await
         } else {
             0
@@ -1763,13 +1773,32 @@ impl CircuitCells {
     async fn send_ack_copies(
         &self,
         dst_node: [u8; 32],
-        primary_relay: Option<[u8; 32]>,
+        primary_route: Option<&CircuitRoute>,
         cell: &[u8],
         max_extra: usize,
     ) -> usize {
         if max_extra == 0 {
             return 0;
         }
+        let binding = match primary_route {
+            Some(route) => route.clone(),
+            None => {
+                let Some(Frame::Ack { stream_id, .. }) = Frame::decode(cell) else {
+                    return 0;
+                };
+                let Some(route) = self
+                    .stream_routes
+                    .lock()
+                    .await
+                    .get(&(dst_node, stream_id, RouteClass::Bulk))
+                    .cloned()
+                else {
+                    return 0;
+                };
+                route
+            }
+        };
+        let primary_relay = primary_route.and_then(|route| route.rendezvous_node);
         let cooldown_now = Instant::now();
         let cooled_relays = {
             let cooldowns = self
@@ -1792,13 +1821,10 @@ impl CircuitCells {
             let Some(entries) = circuits.get(&dst_node) else {
                 return 0;
             };
-            let mut used_relays: Vec<[u8; 32]> = primary_relay.into_iter().collect();
             let mut copies = Vec::new();
             for entry in entries {
-                if copies.len() >= max_extra {
-                    break;
-                }
-                if used_relays.contains(&entry.rendezvous_node) {
+                if Some(entry.rendezvous_node) == primary_relay || !entry.serves_receiver(&binding)
+                {
                     continue;
                 }
                 let first_hop = entry.circuit.first_hop();
@@ -1818,13 +1844,24 @@ impl CircuitCells {
                 if self.route_session_stale(&route) {
                     continue;
                 }
-                used_relays.push(entry.rendezvous_node);
                 copies.push(route);
             }
             copies
         };
         let mut accepted = 0;
+        let mut used_relays: Vec<[u8; 32]> = primary_relay.into_iter().collect();
         for alt in copies {
+            // A failed local enqueue is not a copy. Keep trying the bounded
+            // pool until the configured number of real handoffs is reached.
+            if accepted >= max_extra {
+                break;
+            }
+            if alt
+                .rendezvous_node
+                .is_some_and(|relay| used_relays.contains(&relay))
+            {
+                continue;
+            }
             let Ok(env) = self.stream_envelope(&alt, cell, false) else {
                 continue;
             };
@@ -1834,6 +1871,9 @@ impl CircuitCells {
                 .is_ok()
             {
                 accepted += 1;
+                if let Some(relay) = alt.rendezvous_node {
+                    used_relays.push(relay);
+                }
                 if let Some(stats) = alt.stats.as_ref() {
                     let _ = stats.record_send(false, 0);
                 }
@@ -2655,12 +2695,7 @@ impl CircuitCells {
                         // A different device or receiver generation does not
                         // own this stream's sequence/reassembly state, even if
                         // its ad is valid for the same identity address.
-                        && entry.peer_cookie == old.peer_cookie
-                        && match old.envelope {
-                            CircuitEnvelope::ProtectedIntro { receiver_x25519_pk, .. } =>
-                                entry.receiver_x25519_pk == receiver_x25519_pk,
-                            CircuitEnvelope::LegacyClearSender { .. } => true,
-                        }
+                        && entry.serves_receiver(old)
                         && cooled_relays
                             .get(&entry.rendezvous_node)
                             .is_none_or(|until| *until <= now)
