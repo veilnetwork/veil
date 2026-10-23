@@ -208,17 +208,17 @@ async fn slow_route_expansion_only_constructs_missing_rendezvous() {
         assert_eq!(crate::veil_debug_flush_console_logs(2000), 0);
         return;
     }
-    for (mode, expected_candidates) in [
-        ("same-relay", 0),
-        ("later-same", 0),
-        ("pinned-only", 0),
-        ("ready-alternative", 0),
-        ("new-relay", 1),
-        ("cooled-new-relay", 0),
-        ("repair", 1),
-        ("warm", 1),
-        ("overlap-warm", 1),
-        ("overlap-repair", 1),
+    for (mode, expected_candidates, expected_discovery_passes) in [
+        ("same-relay", 0, 1),
+        ("later-same", 0, 2),
+        ("pinned-only", 0, 1),
+        ("ready-alternative", 0, 1),
+        ("new-relay", 1, 1),
+        ("cooled-new-relay", 0, 2),
+        ("repair", 1, 2),
+        ("warm", 1, 2),
+        ("overlap-warm", 1, 1),
+        ("overlap-repair", 1, 1),
     ] {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "anon_stream::local_enqueue_tests::slow_route_expansion_only_constructs_missing_rendezvous", "--nocapture"])
@@ -239,6 +239,17 @@ async fn slow_route_expansion_only_constructs_missing_rendezvous() {
         assert_eq!(
             candidates, expected_candidates,
             "unnecessary construction or missing expansion: {mode}"
+        );
+        // Count completed ad resolution/ranking passes as well as actual
+        // construction. A permanently suppressed probe would hide future ads;
+        // an unbounded no-op probe would still run on every DATA cell.
+        let discovery_passes = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter(|line| line.contains("outbound rendezvous rank for "))
+            .count();
+        assert_eq!(
+            discovery_passes, expected_discovery_passes,
+            "discovery cadence or re-probe failed: {mode}"
         );
     }
 }
