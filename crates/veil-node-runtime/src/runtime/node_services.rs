@@ -1391,17 +1391,16 @@ impl NodeServices {
         }
 
         // Send the CircuitBuild envelope to the first hop over its session.
-        if self
-            .send_relay_chain_frame(
-                &first_hop,
-                veil_proto::family::RelayChainMsg::CircuitBuild,
-                &setup,
-            )
-            .is_err()
-        {
+        if let Err(reason) = self.send_relay_chain_frame(
+            &first_hop,
+            veil_proto::family::RelayChainMsg::CircuitBuild,
+            &setup,
+        ) {
+            // The build never entered the first-hop queue. There is no
+            // installed path to retain for late return traffic or tear down.
+            origin_table.remove(&first_hop, origin_circuit_id);
             log::debug!(
-                "build_onion_circuit_once NoRelays: CircuitBuild send to first hop {} failed (no live session)",
-                veil_util::hex_short(&first_hop),
+                "build_onion_circuit_once NoRelays: CircuitBuild local handoff rejected: {reason:?}",
             );
             return Err(AnonOnionSendError::NoRelays);
         }
@@ -1514,23 +1513,28 @@ impl NodeServices {
             map.insert(circ.origin_circuit_id, tx);
         }
         if !origin_table.insert(std::sync::Arc::new(origin)) {
+            log::warn!(
+                "open_data_circuit NoRelays: origin_table FULL (cap {}, len {})",
+                origin_table.cap(),
+                origin_table.len(),
+            );
             if let Ok(mut map) = self.dispatcher.stream_recv.lock() {
                 map.remove(&circ.origin_circuit_id); // roll back on table-full
             }
             return Err(AnonOnionSendError::NoRelays);
         }
-        if self
-            .send_relay_chain_frame(
-                &circ.first_hop,
-                veil_proto::family::RelayChainMsg::CircuitBuild,
-                &setup,
-            )
-            .is_err()
-        {
-            if let Ok(mut map) = self.dispatcher.stream_recv.lock() {
-                map.remove(&circ.origin_circuit_id); // roll back on no live first-hop session
-            }
+        if let Err(reason) = self.send_relay_chain_frame(
+            &circ.first_hop,
+            veil_proto::family::RelayChainMsg::CircuitBuild,
+            &setup,
+        ) {
+            // Roll back both allocations. close_data_circuit alone deliberately
+            // retains origin state for previously admitted shared paths.
+            origin_table.remove(&circ.first_hop, circ.origin_circuit_id);
             self.close_data_circuit(circ.origin_circuit_id);
+            log::debug!(
+                "open_data_circuit NoRelays: CircuitBuild local handoff rejected: {reason:?}",
+            );
             return Err(AnonOnionSendError::NoRelays);
         }
         Ok((circ, rx))
