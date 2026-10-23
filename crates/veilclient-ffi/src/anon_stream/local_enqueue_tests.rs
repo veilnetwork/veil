@@ -2,48 +2,205 @@
 use super::*;
 use veil_onion_stream::CellSender;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use veil_anonymity::rendezvous::{rendezvous_ad_dht_key_at, sign_rendezvous_ad_v5};
+async fn advertised_receiver(f: &Fixture) -> [u8; 32] {
+    let key = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
+    let receiver = *blake3::hash(&STANDARD.decode(&key.public_key).unwrap()).as_bytes();
+    let now = veil_util::unix_secs_now_u64();
+    let ad = sign_rendezvous_ad_v5(
+        receiver,
+        f.hop,
+        [0x52; COOKIE_LEN],
+        [0x33; 32],
+        now,
+        now + 3600,
+        &[],
+        &[],
+        &[],
+        0,
+        &[],
+        &key.public_key,
+        &key.private_key,
+        veil_types::SignatureAlgorithm::Ed25519,
+    )
+    .unwrap();
+    f.cells
+        .services
+        .dht
+        .store_local(rendezvous_ad_dht_key_at(&receiver, 0), ad);
+    let ads = f
+        .cells
+        .services
+        .resolve_stream_rendezvous_ads(receiver)
+        .await
+        .unwrap();
+    assert!(ads.iter().any(|ad| ad.auth_cookie == [0x52; COOKIE_LEN]));
+    receiver
+}
+
+/// A warm request must not reconstruct a matching, usable path. The fixture
+/// supplies a real signed receiver ad and live first-hop session; attempting a
+/// NEW path still fails NoRelays because there is no complete two-hop route.
+/// Count those real construction failures in an isolated diagnostic process.
+#[tokio::test]
+async fn warming_ready_pool_reuses_routes_but_preserves_repair() {
+    const CHILD: &str = "VEIL_TEST_READY_POOL_WARM_CHILD";
+    if let Ok(mode) = std::env::var(CHILD) {
+        let mut f = fixture().await;
+        let receiver = advertised_receiver(&f).await;
+        f.circuit.confirmed_flag().store(true, Ordering::Relaxed);
+        let primary = route(&f.circuit, f.cells.me);
+        let mut ready = entry(&primary, &[71]);
+        ready.peer_cookie = [0x52; COOKIE_LEN];
+        ready.receiver_x25519_pk = [0x33; 32];
+        match mode.as_str() {
+            "unconfirmed" => f.circuit.confirmed_flag().store(false, Ordering::Relaxed),
+            "cookie" => ready.peer_cookie = [0x53; COOKIE_LEN],
+            "key" => ready.receiver_x25519_pk = [0x34; 32],
+            "generation" => ready.first_hop_close_generation += 1,
+            "dead" => {
+                f.cells
+                    .services
+                    .session_tx_registry
+                    .write()
+                    .unwrap()
+                    .unregister(&f.hop);
+            }
+            "cooled-relay" => {
+                mark_rendezvous_cooldown(&f.cells.route_cooldowns, f.hop, Duration::from_secs(60))
+            }
+            "cooled-hop" => mark_first_hop_cooldown(
+                &f.cells.first_hop_cooldowns,
+                f.hop,
+                Duration::from_secs(60),
+            ),
+            "slow" => ready
+                .stats
+                .slow_mark_expiry_ms
+                .store(60_000, Ordering::Relaxed),
+            "quiet" | "busy" | "recent-data" => {
+                ready.opened_at -= CIRCUIT_HANDSHAKE_REOPEN_AFTER + Duration::from_secs(1);
+                ready.last_non_handshake = ready.opened_at;
+                if mode == "busy" {
+                    ready.stats.record_stream_open();
+                } else if mode == "recent-data" {
+                    ready.last_non_handshake = Instant::now();
+                }
+            }
+            _ => {}
+        }
+        if !matches!(mode.as_str(), "empty" | "cold-overlap") {
+            f.cells
+                .outbound_circuits
+                .lock()
+                .await
+                .insert(receiver, vec![ready]);
+        }
+        // Coalesce a repair with a warm opener that is blocked on the pool.
+        // It must still perform a fresh construction, even if the warm pass
+        // finds a reusable route after the lock is released.
+        let pool_owners = Arc::strong_count(&f.cells.outbound_circuits);
+        let overlap = matches!(mode.as_str(), "overlap" | "cold-overlap");
+        let held = if overlap {
+            Some(f.cells.outbound_circuits.lock().await)
+        } else {
+            None
+        };
+        f.cells.warm_outbound(receiver).await;
+        if overlap {
+            // The scheduled worker owns one clone; its construction pass owns
+            // another only AFTER sampling the warm/refresh flag. Keep the pool
+            // locked until that pass is live, so this exercises an upgrade
+            // after the worker selected reuse, without a timing-only sleep.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while Arc::strong_count(&f.cells.outbound_circuits) < pool_owners + 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("warm construction pass did not start");
+            f.cells
+                .ensure_outbound_opening(receiver, RouteClass::Bulk)
+                .await;
+        }
+        drop(held);
+        async fn finish_opening(cells: &CircuitCells, receiver: [u8; 32]) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while cells.outbound_opening.lock().await.contains_key(&receiver) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("background opener did not finish");
+        }
+        finish_opening(&f.cells, receiver).await;
+        if mode == "repair" {
+            f.cells
+                .ensure_outbound_opening(receiver, RouteClass::Bulk)
+                .await;
+            finish_opening(&f.cells, receiver).await;
+        } else {
+            f.cells.warm_outbound(receiver).await;
+            finish_opening(&f.cells, receiver).await;
+        }
+        if matches!(mode.as_str(), "ready" | "busy" | "recent-data") {
+            let pool = f.cells.outbound_circuits.lock().await;
+            let kept = &pool.get(&receiver).unwrap()[0];
+            assert!(Arc::ptr_eq(&kept.circuit, &primary.circuit));
+            assert!(Arc::ptr_eq(&kept.stats, primary.stats.as_ref().unwrap()));
+            assert!(kept.handshake_streams.contains(&71));
+            assert_eq!(kept.stats.active_streams(), u64::from(mode == "busy"));
+        }
+        f.runtime.stop().await.unwrap();
+        assert_eq!(crate::veil_debug_flush_console_logs(2000), 0);
+        return;
+    }
+    for (mode, expected) in [
+        ("cold-overlap", 1),
+        ("ready", 0),
+        ("busy", 0),
+        ("recent-data", 0),
+        ("empty", 1),
+        ("unconfirmed", 1),
+        ("quiet", 1),
+        ("cooled-relay", 1),
+        ("cooled-hop", 1),
+        ("slow", 1),
+        ("dead", 1),
+        ("generation", 1),
+        ("cookie", 1),
+        ("key", 1),
+        ("repair", 1),
+        ("overlap", 1),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "anon_stream::local_enqueue_tests::warming_ready_pool_reuses_routes_but_preserves_repair", "--nocapture"])
+            .env(CHILD, mode).output().unwrap();
+        assert!(
+            output.status.success(),
+            "child case failed: {mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let failures = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter(|line| {
+                line.contains("outbound circuit open failed for ") && line.contains("NoRelays")
+            })
+            .count();
+        assert_eq!(
+            failures, expected,
+            "unnecessary warm construction or suppressed repair: {mode}"
+        );
+    }
+}
+
 /// Console diagnostics are process-global. Run the real offline services in a
 /// child so the count cannot include another parallel fixture's failures.
 #[tokio::test]
 async fn fast_no_relays_failure_does_not_restart_on_every_carrier_retry() {
     const CHILD: &str = "VEIL_TEST_FAST_CIRCUIT_RETRY_CHILD";
     if let Ok(mode) = std::env::var(CHILD) {
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
-        use veil_anonymity::rendezvous::{rendezvous_ad_dht_key_at, sign_rendezvous_ad_v5};
-        async fn advertised_receiver(f: &Fixture) -> [u8; 32] {
-            let key = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
-            let receiver = *blake3::hash(&STANDARD.decode(&key.public_key).unwrap()).as_bytes();
-            let now = veil_util::unix_secs_now_u64();
-            let ad = sign_rendezvous_ad_v5(
-                receiver,
-                f.hop,
-                [0x52; COOKIE_LEN],
-                [0x33; 32],
-                now,
-                now + 3600,
-                &[],
-                &[],
-                &[],
-                0,
-                &[],
-                &key.public_key,
-                &key.private_key,
-                veil_types::SignatureAlgorithm::Ed25519,
-            )
-            .unwrap();
-            f.cells
-                .services
-                .dht
-                .store_local(rendezvous_ad_dht_key_at(&receiver, 0), ad);
-            let ads = f
-                .cells
-                .services
-                .resolve_stream_rendezvous_ads(receiver)
-                .await
-                .unwrap();
-            assert!(ads.iter().any(|ad| ad.auth_cookie == [0x52; COOKIE_LEN]));
-            receiver
-        }
         let mut f = fixture().await;
         let receiver = advertised_receiver(&f).await;
         let other_receiver = if mode == "peer" {
@@ -2019,11 +2176,10 @@ async fn cold_registered_opening_does_not_park_the_handshake_carrier() {
     let opener = tokio::spawn(async {
         let _ = release_rx.await;
     });
-    f.cells
-        .outbound_opening
-        .lock()
-        .await
-        .insert(destination.node, Instant::now());
+    f.cells.outbound_opening.lock().await.insert(
+        destination.node,
+        OutboundOpening::new(Instant::now(), PoolOpenIntent::Refresh),
+    );
     assert!(!opener.is_finished());
     let result = tokio::time::timeout(
         Duration::from_millis(50),
@@ -2062,11 +2218,10 @@ async fn published_pool_prefix_is_usable_and_keeps_live_metadata_on_refill() {
     let pending = tokio::spawn(async {
         let _ = release_rx.await;
     });
-    f.cells
-        .outbound_opening
-        .lock()
-        .await
-        .insert(destination.node, Instant::now());
+    f.cells.outbound_opening.lock().await.insert(
+        destination.node,
+        OutboundOpening::new(Instant::now(), PoolOpenIntent::Refresh),
+    );
     let sent = tokio::time::timeout(
         Duration::from_millis(50),
         f.cells.send(destination, frames(71)[0].clone()),
