@@ -56,6 +56,19 @@ kill <pid>          # or `systemctl stop veil-node`
 
 ### Inspect peers and sessions
 
+Run Unix-socket admin commands as the same OS user as the node service. A
+root shell is also a different user when the service runs as `veil`; older
+clients can report `Broken pipe` or a reset instead of explaining the refusal.
+For a systemd service, check `systemctl show veil.service -p User`, then use that
+account, for example:
+
+```bash
+sudo -u veil -- veil-cli -c /var/lib/veil/node.toml node dht list
+```
+
+The unsigned-config warning is independent: signing the config does not grant
+admin-socket access. TCP-loopback admin endpoints use token authentication.
+
 ```bash
 veil-cli -c node.toml peers list             # configured peers
 veil-cli -c node.toml peers banned           # active bans (manual + temp)
