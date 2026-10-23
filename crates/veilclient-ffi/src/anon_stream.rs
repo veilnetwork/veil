@@ -2925,40 +2925,61 @@ impl CircuitCells {
         let Some(relay) = route.rendezvous_node else {
             return;
         };
-        mark_rendezvous_cooldown(&self.route_cooldowns, relay, CIRCUIT_ROUTE_SEND_COOLDOWN);
         let first_hop = route.circuit.first_hop();
-        mark_first_hop_cooldown(
-            &self.first_hop_cooldowns,
-            first_hop,
-            CIRCUIT_ROUTE_SEND_COOLDOWN,
-        );
-        let removed_routes = {
+        // A stale handle identifies a lost session generation, not a failure
+        // of a freshly reconnected peer or of the remote rendezvous. In
+        // particular, a delayed caller must not evict a replacement published
+        // at the same R or quarantine its already-live first hop for a minute.
+        // Real send/no-progress cooldowns are retained unchanged.
+        let (removed_routes, retired) = {
+            // Same pool -> pins lock order as remap_stream_route. A publisher
+            // cannot replace the entry between classification and removal.
+            let mut circuits = self.outbound_circuits.lock().await;
             let mut routes = self.stream_routes.lock().await;
+            let live = self.services.has_live_session(&first_hop);
+            let generation = self.services.session_close_generation(&first_hop);
+            let invalidated = |circuit: &Arc<veil_node_runtime::DataCircuit>,
+                               captured_generation| {
+                Arc::ptr_eq(circuit, &route.circuit)
+                    || (circuit.first_hop() == first_hop
+                        && (!live || captured_generation != generation))
+            };
             let mut removed = Vec::new();
             routes.retain(|(node, _, route_class), cached| {
-                let keep = *node != dst_node || cached.rendezvous_node != Some(relay);
+                let keep = *node != dst_node
+                    || !invalidated(&cached.circuit, cached.first_hop_close_generation);
                 if !keep {
                     removed.push((*route_class, cached.clone()));
                 }
                 keep
             });
-            removed
+            // Retire obsolete pins even if their circuit has already left the
+            // pool. Deduplicate shared handles, and do not schedule another
+            // grace timer for a late notification that removed nothing.
+            let mut retired = Vec::new();
+            for (_, removed_route) in &removed {
+                if !retired
+                    .iter()
+                    .any(|old| Arc::ptr_eq(old, &removed_route.circuit))
+                {
+                    retired.push(Arc::clone(&removed_route.circuit));
+                }
+            }
+            if let Some(entries) = circuits.get_mut(&dst_node) {
+                entries.retain(|entry| {
+                    let remove = invalidated(&entry.circuit, entry.first_hop_close_generation);
+                    if remove && !retired.iter().any(|old| Arc::ptr_eq(old, &entry.circuit)) {
+                        retired.push(Arc::clone(&entry.circuit));
+                    }
+                    !remove
+                });
+            }
+            (removed, retired)
         };
         for (route_class, route) in removed_routes {
             record_stream_route_closed(route_class, &route);
         }
-        let retired = {
-            let mut circuits = self.outbound_circuits.lock().await;
-            circuits.get_mut(&dst_node).and_then(|entries| {
-                entries
-                    .iter()
-                    .position(|entry| entry.rendezvous_node == relay)
-                    .map(|idx| entries.remove(idx).circuit)
-            })
-        };
-        if let Some(retired) = retired {
-            retire_circuits_later(&self.services, vec![retired]);
-        }
+        retire_circuits_later(&self.services, retired);
         let stats = route
             .stats
             .as_ref()
@@ -2967,7 +2988,7 @@ impl CircuitCells {
         diag_node(
             &self.me,
             &format!(
-                "outbound route stale for {} via R={} path={} first_hop={} live={} gen={} now={} {stats} — cooled for {}s",
+                "outbound route stale for {} via R={} path={} first_hop={} live={} gen={} now={} {stats} — retired obsolete session handles",
                 short_node(&dst_node),
                 short_node(&relay),
                 short_path(route.circuit.relay_path()),
@@ -2975,7 +2996,6 @@ impl CircuitCells {
                 self.services.has_live_session(&first_hop),
                 route.first_hop_close_generation,
                 self.services.session_close_generation(&first_hop),
-                CIRCUIT_ROUTE_SEND_COOLDOWN.as_secs(),
             ),
         );
         self.ensure_outbound_opening_for(dst_node, RouteClass::Bulk, "stale_session")
