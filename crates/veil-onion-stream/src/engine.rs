@@ -1678,7 +1678,17 @@ impl StreamEngine {
                 rewound_fin = true;
                 continue;
             }
-            requeued.extend(seg.data);
+            // An old ACK can split a larger segment formed by a previous
+            // rewind. That segment still carries its original prefix for
+            // ordinary retransmission at the original sequence number. A new
+            // rewind starts at snd_una, so copying that prefix here would move
+            // acknowledged bytes forward and deliver them a second time.
+            let skip = if seq::lt(seg.seq, self.tx.snd_una) {
+                self.tx.snd_una.wrapping_sub(seg.seq) as usize
+            } else {
+                0
+            };
+            requeued.extend(seg.data.into_iter().skip(skip));
         }
         requeued.append(&mut self.tx.pending);
         self.tx.pending = requeued;
