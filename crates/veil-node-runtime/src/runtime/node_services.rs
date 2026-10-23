@@ -1743,7 +1743,12 @@ impl NodeServices {
             &self.logger,
             receiver_node_id,
             AD_RESOLVE_TIMEOUT,
-            false,
+            rendezvous_resolver::ResolveMode::Stream {
+                mailbox_cookie: Self::mailbox_rendezvous_cookie(&receiver_node_id),
+                identity_mailbox_cookie: self
+                    .identity_of_device_local(&receiver_node_id)
+                    .map(|identity| Self::mailbox_rendezvous_cookie(&identity)),
+            },
         )
         .await;
 
