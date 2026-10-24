@@ -165,6 +165,17 @@ pub fn peer_mlkem_certs_path(config_path: &Path) -> PathBuf {
 }
 
 impl MlKemCertStore {
+    /// The host owns persistence for an ephemeral/deniable node. Neither
+    /// certificate copies nor peer authorization floors may escape to its
+    /// runtime directory when the global persistence switch is off.
+    pub(crate) fn for_runtime(config_path: &Path, persist_enabled: bool, now_unix: u64) -> Self {
+        if persist_enabled {
+            Self::load(config_path, now_unix)
+        } else {
+            Self::ephemeral()
+        }
+    }
+
     /// Read the snapshot beside `config_path`, dropping anything already past
     /// its signed validity window.
     ///
@@ -506,6 +517,82 @@ pub(crate) mod fixture {
 mod tests {
     use super::fixture::{NOW, signer};
     use super::*;
+
+    fn snapshot_signer(seed: u8) -> super::fixture::Signer {
+        use ed25519_dalek::{Signer as _, SigningKey};
+        // The older crypto-only fixture has a ten-year document window. Wire
+        // decoding rightly caps document freshness at 30 days, so a snapshot
+        // round trip needs the same shape as a real published document.
+        let mut fixture = signer(seed);
+        fixture.doc.valid_until_unix = NOW + 30 * 86_400;
+        let mut message = veil_proto::identity_document::DOC_SIG_CONTEXT.to_vec();
+        message.extend_from_slice(&fixture.doc.canonical_signing_bytes());
+        fixture.doc.document_sig = SigningKey::from_bytes(&[seed ^ 0xff; 32])
+            .sign(&message)
+            .to_bytes()
+            .to_vec();
+        fixture
+    }
+
+    #[test]
+    fn disabled_runtime_persistence_neither_reads_nor_writes_peer_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        // A stale/corrupt file must not be loaded in an explicitly memory-only
+        // runtime either. It belongs to another persistence lifecycle.
+        let floors = directory.path().join("peer_identity_floors.json");
+        std::fs::write(&floors, b"unreadable as JSON").unwrap();
+        let before = std::fs::read(&floors).unwrap();
+        let signer = snapshot_signer(0x31);
+        let cert = signer.cert([0xab; 16], NOW, NOW + 3600, 1);
+        let store = MlKemCertStore::for_runtime(&config, false, NOW);
+        assert!(store.document_floor.observe(&signer.doc, NOW));
+        assert!(store.remember(&cert, NOW));
+        assert!(matches!(
+            store.recall(&signer.doc.node_id, &[0xab; 16], &signer.doc, NOW),
+            CertRecall::Verified(_)
+        ));
+        assert!(!peer_mlkem_certs_path(&config).exists());
+        assert_eq!(std::fs::read(&floors).unwrap(), before);
+        drop(store);
+        let restarted = MlKemCertStore::for_runtime(&config, false, NOW);
+        assert!(
+            restarted
+                .document_floor
+                .current(&signer.doc.node_id)
+                .is_none()
+        );
+        assert!(restarted.is_empty());
+    }
+
+    #[test]
+    fn enabled_runtime_persistence_still_restores_peer_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let signer = snapshot_signer(0x32);
+        let cert = signer.cert([0xab; 16], NOW, NOW + 3600, 1);
+        let store = MlKemCertStore::for_runtime(&config, true, NOW);
+        assert!(store.document_floor.observe(&signer.doc, NOW));
+        assert!(store.remember(&cert, NOW));
+        drop(store);
+        let rows: Vec<String> = serde_json::from_slice(
+            &std::fs::read(directory.path().join("peer_identity_floors.json")).unwrap(),
+        )
+        .unwrap();
+        let restored_doc = IdentityDocument::decode(&STANDARD.decode(&rows[0]).unwrap()).unwrap();
+        veil_identity::verify::verify_identity_document_bindings(&restored_doc).unwrap();
+        let restarted = MlKemCertStore::for_runtime(&config, true, NOW);
+        assert!(
+            restarted
+                .document_floor
+                .current(&signer.doc.node_id)
+                .is_some()
+        );
+        assert!(matches!(
+            restarted.recall(&signer.doc.node_id, &[0xab; 16], &signer.doc, NOW),
+            CertRecall::Verified(_)
+        ));
+    }
 
     /// The measured case: nothing on the DHT for a device that is off, and a
     /// certificate remembered from when it was on. What decides is the

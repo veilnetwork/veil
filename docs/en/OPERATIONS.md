@@ -813,7 +813,8 @@ State that survives restart (lives next to `config.toml`):
 | `mlkem.key` | Per-instance ML-KEM-768 keypair | Auto-regenerates if missing |
 | `name_claims/*.bin` | Persisted sovereign name claims | Yes — re-publishable from disk |
 
-Peer identity floors are security state, not a disposable discovery cache.
+With runtime persistence enabled, peer identity floors are security state,
+not a disposable discovery cache.
 Their signed documents are checked on load and never grant current delegation
 rights by themselves. A malformed/unreadable snapshot refuses peer-document
 authorization until repaired from a valid backup. At most 512 identities are
@@ -821,6 +822,10 @@ remembered: ordinary entries use LRU eviction, while entries carrying revocation
 are retained; if all slots carry revocations, new identities are refused. Failed
 snapshot writes retain the floor in memory and retry on the next observation;
 restart durability requires a successful write.
+With `persist_enabled = false`, both peer certificates and identity floors stay
+in memory and no peer snapshot is read or written. An embedded host must retain
+authorization floors in its own protected storage to extend rollback protection
+across process restarts; a recreated temporary runtime directory does not do so.
 
 ### Crash + restart
 
