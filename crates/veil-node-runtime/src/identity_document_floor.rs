@@ -224,6 +224,28 @@ impl IdentityDocumentFloor {
             })
     }
 
+    /// Revalidate an ALREADY authenticated device/owner binding retained by a
+    /// host application. This does not authenticate an anonymous stream claim.
+    /// Unknown, expired or not-yet-checkpointed documents cannot preserve it.
+    pub(crate) fn allows_device_proof(&self, peer: &[u8; 32], device: &[u8; 32], now: u64) -> bool {
+        let state = lock!(self.state);
+        if state.unreadable {
+            return false;
+        }
+        let Some(floor) = state.rows.get(peer) else {
+            return false;
+        };
+        let doc = &floor.document;
+        (!state.host_restored || floor.changed_revision <= state.durable_revision)
+            && doc.valid_until_unix >= now
+            && !doc.revoked_devices.iter().any(|r| &r.device_id == device)
+            && doc.identity_keys.iter().any(|key| {
+                &key.device_id == device
+                    && key.valid_from_unix <= now
+                    && now <= key.valid_until_unix
+            })
+    }
+
     pub(crate) fn ephemeral() -> Self {
         Self {
             path: None,
@@ -532,6 +554,74 @@ mod tests {
         assert_eq!(store.revision(), first);
         assert!(store.observe(&document(7, 1001, true), 1001));
         assert!(store.revision() > first);
+    }
+
+    #[test]
+    fn cached_device_proof_is_fenced_by_current_revocation_without_reset() {
+        let store = IdentityDocumentFloor::ephemeral();
+        let before = document(91, 1000, false);
+        let old = before.identity_keys[0].device_id;
+        assert!(!store.allows_device_proof(&before.node_id, &old, 1000));
+        assert!(store.observe(&before, 1000));
+        assert!(store.allows_device_proof(&before.node_id, &old, 1000));
+        assert!(!store.allows_device_proof(&[0; 32], &old, 1000));
+        assert!(!store.allows_device_proof(&before.node_id, &[0; 32], 1000));
+        let master = SigningKey::from_bytes(&blake3::derive_key(
+            "floor test master",
+            &91_u64.to_le_bytes(),
+        ));
+        let next_signer = SigningKey::from_bytes(&blake3::derive_key(
+            "floor test device",
+            &92_u64.to_le_bytes(),
+        ));
+        let mut next = document(92, 1001, false);
+        next.node_id = before.node_id;
+        next.master_pubkey.clone_from(&before.master_pubkey);
+        let key = &mut next.identity_keys[0];
+        key.master_sig = master
+            .sign(&certify_message(
+                &next.node_id,
+                key.algo,
+                &key.pubkey,
+                &key.device_id,
+                key.valid_from_unix,
+                key.valid_until_unix,
+            ))
+            .to_bytes()
+            .to_vec();
+        next.revoked_devices.push(RevokedDevice {
+            device_id: old,
+            master_sig: master
+                .sign(&RevokedDevice::signing_message(&next.node_id, &old))
+                .to_bytes()
+                .to_vec(),
+        });
+        let mut signed = DOC_SIG_CONTEXT.to_vec();
+        signed.extend_from_slice(&next.canonical_signing_bytes());
+        next.document_sig = next_signer.sign(&signed).to_bytes().to_vec();
+        assert!(store.observe(&next, 1001));
+        assert!(!store.allows_device_proof(&before.node_id, &old, 1001));
+        assert!(store.allows_device_proof(&next.node_id, &next.identity_keys[0].device_id, 1001));
+        assert!(!store.observe(&before, 1002));
+        assert!(!store.allows_device_proof(&before.node_id, &old, 1002));
+    }
+
+    #[test]
+    fn device_proof_requires_durable_readable_unexpired_authorization() {
+        let store = IdentityDocumentFloor::ephemeral();
+        store
+            .import_host(br#"{"version":1,"entries":[]}"#, 1000)
+            .unwrap();
+        let doc = document(93, 1000, false);
+        let device = doc.identity_keys[0].device_id;
+        assert!(store.observe(&doc, 1000));
+        assert!(!store.allows_device_proof(&doc.node_id, &device, 1000));
+        store.acknowledge_host(store.revision()).unwrap();
+        assert!(store.allows_device_proof(&doc.node_id, &device, 1000));
+        assert!(!store.allows_device_proof(&doc.node_id, &device, 0));
+        assert!(!store.allows_device_proof(&doc.node_id, &device, doc.valid_until_unix + 1));
+        lock!(store.state).unreadable = true;
+        assert!(!store.allows_device_proof(&doc.node_id, &device, 1000));
     }
 
     #[test]
