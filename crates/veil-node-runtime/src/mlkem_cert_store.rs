@@ -146,6 +146,7 @@ struct CertSnapshot {
 /// `(node_id, instance_id) → signed MlKemKeyCert`, atomically snapshotted next
 /// to `config.toml`.
 pub struct MlKemCertStore {
+    pub(crate) document_floor: crate::identity_document_floor::IdentityDocumentFloor,
     /// `None` for a store with nowhere to write — tests, and any runtime built
     /// without a config path. Everything else behaves identically, so a caller
     /// never has to ask whether persistence is on.
@@ -201,6 +202,9 @@ impl MlKemCertStore {
         }
         prune(&mut rows, now_unix);
         Self {
+            document_floor: crate::identity_document_floor::IdentityDocumentFloor::load(
+                config_path,
+            ),
             path: Some(path),
             rows: Mutex::new(rows),
         }
@@ -210,6 +214,7 @@ impl MlKemCertStore {
     #[must_use]
     pub fn ephemeral() -> Self {
         Self {
+            document_floor: crate::identity_document_floor::IdentityDocumentFloor::ephemeral(),
             path: None,
             rows: Mutex::new(BTreeMap::new()),
         }
