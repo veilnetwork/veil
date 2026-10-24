@@ -361,18 +361,23 @@ impl<S: CellSender> StreamMux<S> {
         // repeats after 2^31 opens, and inserting on top of a live route
         // silently steals that stream's inbound cells (report9 V-20).
         // Never displace an existing route, including when more than the old
-        // 64-probe budget is occupied after counter wrap.
-        let (sid, key) = {
+        // 64-probe budget is occupied after counter wrap. A long collision run
+        // fails locally instead of parking demux behind an unbounded scan.
+        let selected = 'claim: {
             let mut routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
-            loop {
+            for _ in 0..MAX_OPEN_PROBES {
                 let n = self.next_id.fetch_add(1, Ordering::Relaxed);
                 let sid = (n << 1) | parity;
                 let key = (peer.node, sid);
                 if let Entry::Vacant(entry) = routes.entry(key) {
                     entry.insert(tx.clone());
-                    break (sid, key);
+                    break 'claim Some((sid, key));
                 }
             }
+            None
+        };
+        let Some((sid, key)) = selected else {
+            return OnionStream::refused();
         };
         let duplex = MuxDuplex {
             sender: self.sender.clone(),
@@ -405,6 +410,11 @@ fn initial_seq(sid: u32) -> u32 {
 /// whole batch of routable cells; only SYNs (new streams) take the slow path.
 const DEMUX_RX_BURST: usize = 256;
 
+// Far above the previous 64-probe correctness regression, but finite under
+// adversarial collision pressure. No synchronous open holds the global routes
+// mutex for a scan of the entire stream-id space.
+const MAX_OPEN_PROBES: usize = 4096;
+
 async fn demux<S: CellSender>(
     sender: Arc<S>,
     mut inbound: mpsc::Receiver<(Addr, Vec<u8>)>,
@@ -414,6 +424,22 @@ async fn demux<S: CellSender>(
     cfg: Config,
     aliases: PeerAliases,
 ) {
+    // Refusals must not wait on the carrier in the shared receive loop. One
+    // bounded worker sends best-effort resets; a full refusal queue drops the
+    // SYN instead, allowing the opener's ordinary handshake retry to recover.
+    let (refuse_tx, mut refuse_rx) = mpsc::channel::<(Addr, u32)>(ACCEPT_BACKLOG);
+    let refuse_sender = sender.clone();
+    tokio::spawn(async move {
+        while let Some((peer, stream_id)) = refuse_rx.recv().await {
+            let reset = Frame::Rst {
+                stream_id,
+                reason: crate::wire::reset_reason::REFUSED,
+            }
+            .encode();
+            let _ =
+                tokio::time::timeout(Duration::from_secs(1), refuse_sender.send(peer, reset)).await;
+        }
+    });
     let mut batch: Vec<(Addr, Vec<u8>)> = Vec::new();
     let mut new_streams: Vec<(Addr, Vec<u8>)> = Vec::new();
     loop {
@@ -463,6 +489,16 @@ async fn demux<S: CellSender>(
                     continue;
                 }
             }
+            // Reserve before creating a route/driver: a full application
+            // backlog must neither park demux nor spawn unbounded reset tasks.
+            let permit = match accept_tx.try_reserve() {
+                Ok(permit) => permit,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    let _ = refuse_tx.try_send((src, key.1));
+                    continue;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return,
+            };
             let (tx, rx) = mpsc::channel(STREAM_INBOX);
             let _ = tx.try_send(cell); // deliver the SYN itself
             routes
@@ -483,9 +519,7 @@ async fn demux<S: CellSender>(
             // seed at least as much as the open side.
             let cfg = warm_config(cfg, &bw_cache, src.node);
             let stream = OnionStream::accept(duplex, cfg, key.1, initial_seq(key.1));
-            if accept_tx.send((stream, src)).await.is_err() {
-                return; // nobody is accepting anymore
-            }
+            permit.send((stream, src));
         }
     }
 }
@@ -501,6 +535,109 @@ mod tests {
             self.0
                 .try_send(cell)
                 .map_err(|e| io::Error::new(io::ErrorKind::WouldBlock, e.to_string()))
+        }
+    }
+
+    struct RefusalSender {
+        resets: mpsc::Sender<u32>,
+        block: bool,
+    }
+
+    impl CellSender for RefusalSender {
+        async fn send(&self, _dst: Addr, cell: Vec<u8>) -> io::Result<()> {
+            if let Some(Frame::Rst {
+                stream_id,
+                reason: crate::wire::reset_reason::REFUSED,
+            }) = Frame::decode(&cell)
+            {
+                let _ = self.resets.try_send(stream_id);
+                if self.block {
+                    std::future::pending::<()>().await;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn full_accept_backlog_does_not_block_other_peers_even_if_reset_send_stalls() {
+        for block in [false, true] {
+            let (resets, mut reset_rx) = mpsc::channel(4);
+            let (feed, inbound) = mpsc::channel(256);
+            let (accept_tx, mut accept_rx) = mpsc::channel(ACCEPT_BACKLOG);
+            let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+            let existing = (addr(3).node, 9000);
+            let (existing_tx, mut existing_rx) = mpsc::channel(4);
+            routes.lock().unwrap().insert(existing, existing_tx);
+            let demux_task = tokio::spawn(demux(
+                Arc::new(RefusalSender { resets, block }),
+                inbound,
+                routes.clone(),
+                Arc::new(Mutex::new(HashMap::new())),
+                accept_tx,
+                Config::default(),
+                PeerAliases::default(),
+            ));
+            for sid in 0..=ACCEPT_BACKLOG as u32 {
+                feed.send((
+                    addr(2),
+                    Frame::Syn {
+                        stream_id: sid,
+                        isn: 100,
+                        win: 8192,
+                    }
+                    .encode(),
+                ))
+                .await
+                .unwrap();
+            }
+            let refused = tokio::time::timeout(Duration::from_secs(1), reset_rx.recv())
+                .await
+                .expect("full backlog never refused the excess SYN");
+            assert_eq!(refused, Some(ACCEPT_BACKLOG as u32));
+            let marker = Frame::Data {
+                stream_id: existing.1,
+                seq: 100,
+                win: 8192,
+                payload: b"still routed",
+            }
+            .encode();
+            feed.send((addr(3), marker.clone())).await.unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_millis(250), existing_rx.recv())
+                    .await
+                    .expect("an unrelated stream stalled behind the full backlog"),
+                Some(marker),
+            );
+            assert_eq!(accept_rx.len(), ACCEPT_BACKLOG);
+            assert_eq!(routes.lock().unwrap().len(), ACCEPT_BACKLOG + 1);
+
+            // Taking an accepted stream frees a slot for another peer.
+            let (first, _) = accept_rx.recv().await.unwrap();
+            first.abort_handle().reset(crate::wire::reset_reason::APP);
+            feed.send((
+                addr(4),
+                Frame::Syn {
+                    stream_id: 10000,
+                    isn: 100,
+                    win: 8192,
+                }
+                .encode(),
+            ))
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while accept_rx.len() != ACCEPT_BACKLOG {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("accept did not recover after freeing a slot");
+            drop(feed);
+            demux_task.await.unwrap();
+            while let Some((stream, _)) = accept_rx.recv().await {
+                stream.abort_handle().reset(crate::wire::reset_reason::APP);
+            }
         }
     }
 
@@ -563,6 +700,43 @@ mod tests {
             }
         }
         stream.reset(crate::wire::reset_reason::APP).await;
+    }
+
+    #[tokio::test]
+    async fn open_refuses_long_collision_run_without_stealing_or_leaking_routes() {
+        let (_tx, rx) = mpsc::channel(1);
+        let mut mux = StreamMux::new(addr(1).node, Arc::new(NoSender), rx, Config::default());
+        mux.next_id = Arc::new(AtomicU32::new(0));
+        let peer = addr(2);
+        let mut live = Vec::new();
+        for n in 0..MAX_OPEN_PROBES as u32 + 1 {
+            let (tx, rx) = mpsc::channel(1);
+            mux.routes
+                .lock()
+                .unwrap()
+                .insert((peer.node, n << 1), tx.clone());
+            live.push((n << 1, tx, rx));
+        }
+        let mut refused = mux.open(peer);
+        assert_eq!(
+            refused.end_reason(),
+            End::Reset(crate::wire::reset_reason::REFUSED)
+        );
+        assert!(refused.connection_handle().is_connected().is_err());
+        assert!(refused.write_all(b"no network attempt").await.is_err());
+        assert!(refused.read(&mut [0; 1]).await.is_err());
+        {
+            let routes = mux.routes.lock().unwrap();
+            assert_eq!(routes.len(), live.len());
+            for (sid, tx, _) in &live {
+                assert!(routes.get(&(peer.node, *sid)).unwrap().same_channel(tx));
+            }
+        }
+        // The allocator advanced past its exhausted probe budget. The next
+        // open can skip the one remaining collision and use a free key.
+        let accepted = mux.open(peer);
+        assert_eq!(accepted.end_reason(), End::Open);
+        accepted.reset(crate::wire::reset_reason::APP).await;
     }
 
     /// A duplex that has ended must not take down the route of the stream that
