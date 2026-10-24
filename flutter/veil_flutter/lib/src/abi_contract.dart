@@ -17,7 +17,7 @@
 /// Compare against `veil_abi_contract_hash()` from the loaded library
 /// BEFORE using it. See `native.dart`.
 const String veilAbiContractHash =
-    'af688ec4b8f37d4f16a955a5b14753e4676e8f95b263e418e144b3daf7bdfd9a';
+    'f586bb2b02d0aa2d3080912bcde963cb0feb92fa44e1659f7870dd1d3e5e1069';
 
 // -- Constants lifted from the generated header --------------------------
 
@@ -231,6 +231,10 @@ const int veilPairTargetInternalError = 6;
 const int veilMaxPairCeremonyBytes = 65536;
 /// `VEIL_PAIR_OOB_CODE_LEN`
 const int veilPairOobCodeLen = 6;
+/// `VEIL_PEER_AUTHORIZATION_MAX_STATE_LEN`
+const int veilPeerAuthorizationMaxStateLen = 12582912;
+/// `VEIL_ERR_PEER_AUTHORIZATION_BUFFER_TOO_SMALL`
+const int veilErrPeerAuthorizationBufferTooSmall = -40;
 /// `VEIL_RATCHET_KEY_LEN`
 const int veilRatchetKeyLen = 64;
 /// `VEIL_RATCHET_MAX_STATE_LEN`

@@ -514,6 +514,17 @@
  */
 #define VEIL_PAIR_OOB_CODE_LEN 6
 
+/**
+ * Host buffer ceiling for signed peer authorization documents. The data
+ * contains peer identifiers: retain it only in the host's encrypted space.
+ */
+#define VEIL_PEER_AUTHORIZATION_MAX_STATE_LEN ((12 * 1024) * 1024)
+
+/**
+ * Export wrote no payload. Retry with `*out_length` bytes of capacity.
+ */
+#define VEIL_ERR_PEER_AUTHORIZATION_BUFFER_TOO_SMALL -40
+
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
  * Byte length of a conversation key.
@@ -4579,6 +4590,61 @@ int veil_pair_target_build_confirm(VeilHandle *handle,
                                    size_t out_confirm_buf_cap,
                                    size_t *out_confirm_len,
                                    char **err_out)
+;
+
+/**
+ * Acknowledge exactly the exported revision after durable encrypted storage.
+ * Documents learned since that export remain unusable until their own commit.
+ *
+ * # Safety
+ * `handle` must be live and `err_out` must be writable.
+ */
+ int veil_peer_authorization_ack(VeilHandle *handle, uint64_t revision, char **err_out) ;
+
+/**
+ * Current process-local peer authorization revision. Cache reads do not move
+ * it; accepted document changes and initial host restore do.
+ *
+ * # Safety
+ * `handle` must be live; `out_revision` and `err_out` must be writable.
+ */
+ int veil_peer_authorization_version(VeilHandle *handle, uint64_t *out_revision, char **err_out) ;
+
+/**
+ * Snapshot all retained peer floors and their exact revision under one lock.
+ * A snapshot consumes no dirty state. The host advances its saved revision
+ * only after its encrypted publication is durable. JSON v1 contains `entries`
+ * of `{peer: lowercase node-id hex, document: base64 signed document}`.
+ *
+ * # Safety
+ * `handle` must be live. `out_length`, `out_revision` and `err_out` writable.
+ * `out_buf` must be writable for `capacity` bytes; NULL is allowed at capacity
+ * zero for a size query. Insufficient capacity writes no payload bytes.
+ */
+
+int veil_peer_authorization_export(VeilHandle *handle,
+                                   uint8_t *out_buf,
+                                   size_t capacity,
+                                   size_t *out_length,
+                                   uint64_t *out_revision,
+                                   char **err_out)
+;
+
+/**
+ * Restore the host's durable negative evidence once, before binding the app's
+ * endpoints or sending application traffic. Signed historical documents are
+ * rechecked; they never grant current delegation rights. Transient native-boot
+ * observations are replayed against this durable baseline. Clears warm sender
+ * key caches so pre-restore authorization cannot survive restoration.
+ *
+ * # Safety
+ * `handle` must be live; `bytes` readable for `length`; `err_out` writable.
+ */
+
+int veil_peer_authorization_restore(VeilHandle *handle,
+                                    const uint8_t *bytes,
+                                    size_t length,
+                                    char **err_out)
 ;
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)

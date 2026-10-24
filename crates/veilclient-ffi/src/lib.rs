@@ -7786,6 +7786,7 @@ mod tests;
 #[cfg(all(test, feature = "node-embedded", not(target_os = "android")))]
 mod trace_logging_tests;
 
+pub mod peer_authorization;
 pub mod ratchet;
 
 #[cfg(test)]
