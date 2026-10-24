@@ -826,6 +826,18 @@ With `persist_enabled = false`, both peer certificates and identity floors stay
 in memory and no peer snapshot is read or written. An embedded host must retain
 authorization floors in its own protected storage to extend rollback protection
 across process restarts; a recreated temporary runtime directory does not do so.
+The embedded API provides `veil_peer_authorization_restore`, `..._version`,
+`..._export` and `..._ack` for this. Restore once before binding application
+endpoints, using the identity's encrypted storage (including an empty snapshot
+on first use). Native code validates all signed documents and replays transient
+boot observations against the restored baseline. Export is non-destructive;
+after the encrypted commit succeeds, acknowledge exactly its exported revision.
+New document authorizations remain unavailable until that acknowledgement;
+changes learned during the commit remain pending. Restore clears warm sender
+key caches. The host must poll versions/checkpoint while the runtime is active,
+retry failures and checkpoint again before closing the handle. No identifiers
+or document bytes belong in diagnostics. This protects ordinary restarts, not
+an operator replacing the entire encrypted container with an older backup.
 
 ### Crash + restart
 
