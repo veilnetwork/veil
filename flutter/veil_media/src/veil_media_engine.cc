@@ -3328,6 +3328,7 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
 
   // Streams must be created on the Call's worker queue.
   const bool created = run_on(ws->worker_tq.get(), [&]() {
+    ws->audio_packet_priority->SetAudioSending(send && !engine->mic_muted);
     if (ws->audio_state && ws->adm)
       ws->audio_state->SetRecording(!engine->mic_muted);
     // The Call's audio network state defaults to kNetworkDown, which makes the
@@ -3484,6 +3485,7 @@ int veil_media_engine_stop_audio(VeilMediaEngine* engine) {
             ws->call->DestroyAudioSendStream(ws->send_stream);
             ws->send_stream = nullptr;
           }
+          ws->audio_packet_priority->SetAudioSending(false);
           if (ws->recv_stream) {
             ws->recv_stream->Stop();
             ws->call->DestroyAudioReceiveStream(ws->recv_stream);
@@ -4209,9 +4211,14 @@ int veil_media_engine_set_mic_muted(VeilMediaEngine* engine, int muted) {
       });
     }
     const bool configured = run_on(ws->worker_tq.get(), [&] {
+      // Close before unmute can restart capture; reopen for a mute only after
+      // the worker applied it. Repeated unmute does not reset fresh evidence.
+      if (!engine->mic_muted)
+        ws->audio_packet_priority->SetAudioSending(ws->send_stream != nullptr);
       if (ws->send_stream) ws->send_stream->SetMuted(engine->mic_muted);
       if (ws->audio_state && ws->adm)
         ws->audio_state->SetRecording(!engine->mic_muted);
+      if (engine->mic_muted) ws->audio_packet_priority->SetAudioSending(false);
     });
     if (!engine->mic_muted) {
       if (!configured) return VEIL_MEDIA_ERR_STATE;
