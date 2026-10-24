@@ -29,6 +29,32 @@ int main() {
   }
   AudioPacketPriority p;
   {
+    AudioPacketPriority muted;
+    muted.Enable();
+    muted.SetAudioSending(false);
+    muted.ExpectVideo(true, 0);
+    assert(!muted.VideoHeldForAudio() && muted.BeginVideo());
+    muted.EndVideo(true, 1);
+    muted.PauseVideo(true, 2);
+    assert(muted.VideoBlocked() && !muted.BeginVideo()); // Explicit pressure remains binding.
+    muted.PauseVideo(false, 3);
+    assert(!muted.VideoBlocked());
+    muted.SetAudioSending(true);
+    assert(muted.VideoHeldForAudio()); // Resume needs a real packet, not a mute toggle.
+    muted.Encoded(20);
+    assert(!muted.VideoBlocked());
+    muted.SetAudioSending(true);
+    assert(!muted.VideoBlocked()); // Idempotent unmute cannot keep blanking video.
+    muted.SetAudioSending(false);
+    muted.Encoded(60); // An old queued encode cannot freeze a muted source.
+    assert(!muted.VideoBlocked());
+    muted.SetAudioSending(true);
+    assert(muted.VideoBlocked());
+    muted.WantLongPackets(false, 4);
+    muted.Encoded(40);
+    assert(!muted.VideoBlocked());
+  }
+  {
     AudioPacketPriority starting;
     starting.Enable();
     starting.ExpectVideo(true, 0);

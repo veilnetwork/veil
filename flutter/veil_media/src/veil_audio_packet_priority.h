@@ -16,6 +16,13 @@ class AudioPacketPriority {
 
   void Enable() { enabled_.store(true, std::memory_order_release); }
   void Disable() { enabled_.store(false, std::memory_order_release); }
+  // Muted, receive-only and stopped audio cannot emit a fresh short packet.
+  // They must not freeze video waiting for nonexistent capture.
+  // On resume close the gate until a fresh actual audio packet is observed.
+  void SetAudioSending(bool sending) {
+    if (sending && !audio_sending_.load(std::memory_order_acquire)) audio_ms_.store(0);
+    audio_sending_.store(sending, std::memory_order_release);
+  }
   // A source capped at <=1 fps may measure its sparse recovery trial while
   // Opus still needs 60-ms packets. Measured audio trouble can pause that
   // source normally; packet duration alone is not evidence of congestion.
@@ -62,7 +69,8 @@ class AudioPacketPriority {
   }
   void ResetAudio() { audio_ms_.store(0); }
   bool VideoHeldForAudio() const {
-    return enabled_.load(std::memory_order_acquire) && expected_.load() &&
+    return enabled_.load(std::memory_order_acquire) &&
+        audio_sending_.load(std::memory_order_acquire) && expected_.load() &&
         (audio_ms_.load() == 0 ||
          (!sparse_video_.load() &&
           (hold_.load(std::memory_order_acquire) || audio_ms_.load() > 40)));
@@ -105,6 +113,7 @@ class AudioPacketPriority {
     quiet_us_.compare_exchange_strong(empty, now_us);
   }
   std::atomic<bool> enabled_{false}, expected_{false}, paused_{false};
+  std::atomic<bool> audio_sending_{true};
   std::atomic<bool> want_long_{false}, hold_{false};
   std::atomic<bool> sparse_video_{false};
   std::atomic<int> audio_ms_{0};
