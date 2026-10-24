@@ -198,11 +198,15 @@ int main() {
   assert(veil_media_engine_set_mic_muted(e, 0) == 0);
   sender_muted = false;
   assert(metric(e, "audio_packetization_video_hold") == 1);
+  drive(30, true); // Drain video handed to the encoder before unmute.
+  const auto unmuted_hold = metric(e, "video_tx_frames");
   drive(150, true);
   assert(metric(e, "audio_packetization_video_hold") == 1);
+  assert(metric(e, "video_tx_frames") == unmuted_hold);
+  const auto before_sparse_resume = metric(e, "video_tx_frames");
   assert(veil_media_engine_set_video_budget(e, 30, 1) == 0);
   drive(300, true);
-  assert(metric(e, "video_tx_frames") >= held + 2);
+  assert(metric(e, "video_tx_frames") >= before_sparse_resume + 2);
   assert(metric(e, "audio_tx_packet_duration_ms") == 60);
   std::puts("sparse VP8 survives long Opus; explicit pause and larger-source protection retained");
 }
