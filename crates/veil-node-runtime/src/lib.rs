@@ -11,6 +11,7 @@ pub mod connectivity_gain;
 pub mod dht_fallback;
 pub mod dht_glue;
 pub mod error;
+mod identity_document_floor;
 pub mod identity_local;
 pub mod key_passphrase;
 pub mod lazy_miner;

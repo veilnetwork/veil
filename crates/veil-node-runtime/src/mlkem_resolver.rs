@@ -323,7 +323,10 @@ impl DhtMlKemEkResolver {
     /// remain usable only while the same device is endorsed by the current
     /// master-signed document. No network work is performed here.
     fn observe_document(&self, doc: &IdentityDocument) -> bool {
-        if doc.valid_until_unix < unix_now() {
+        // Shared by resolver instances and persisted beside remembered certs.
+        // Consult before the per-resolver digest shortcut: another resolver may
+        // already have learned a newer revocation for this same identity.
+        if !self.cert_store.document_floor.observe(doc, unix_now()) {
             return false;
         }
         let digest = *blake3::hash(&doc.encode()).as_bytes();
@@ -424,6 +427,11 @@ impl DhtMlKemEkResolver {
     }
 
     pub(crate) fn refresh_local_document(&self, peer: NodeIdBytes) {
+        // A sibling resolver may have seen a revocation that the local DHT
+        // replica no longer serves. Apply that shared floor to warm caches too.
+        if let Some(doc) = self.cert_store.document_floor.current(&peer) {
+            self.observe_document(&doc);
+        }
         if let Some(doc) = self
             .dht
             .get_local(&IdentityDocument::dht_key(&peer))
@@ -518,6 +526,13 @@ impl DhtMlKemEkResolver {
     /// maps are bounded independently and this one can have been evicted while
     /// the certificate is still cached.
     fn publish_ratchet_key(&self, target_node_id: [u8; 32], cert: &VerifiedMlkemCert) {
+        if !self
+            .cert_store
+            .document_floor
+            .allows_cert(&target_node_id, cert, unix_now())
+        {
+            return;
+        }
         let mut keys = wlock!(self.peer_ratchet_keys);
         if keys.len() >= veil_proto::budget::MAX_PEER_MLKEM_CACHE
             && !keys.contains_key(&target_node_id)
@@ -724,7 +739,12 @@ impl DhtMlKemEkResolver {
         let cert = {
             let cache = rlock!(self.cert_cache);
             let (cert, ts) = cache.get(&target_node_id)?;
-            if !cert_is_still_usable(cert, ts, self.cert_ttl, now_for_cache) {
+            if !cert_is_still_usable(cert, ts, self.cert_ttl, now_for_cache)
+                || !self
+                    .cert_store
+                    .document_floor
+                    .allows_cert(&target_node_id, cert, now_for_cache)
+            {
                 return None;
             }
             cert.clone()
@@ -971,6 +991,10 @@ impl DhtMlKemEkResolver {
         if let Some((cert, ts)) =
             rlock!(self.instance_cert_cache).get(&(target_node_id, instance_id))
             && cert_is_still_usable(cert, ts, self.cert_ttl, now_for_cache)
+            && self
+                .cert_store
+                .document_floor
+                .allows_cert(&target_node_id, cert, now_for_cache)
         {
             let cert = cert.clone();
             self.log_dbg(
@@ -983,6 +1007,10 @@ impl DhtMlKemEkResolver {
         }
         if let Some((cert, ts)) = rlock!(self.cert_cache).get(&target_node_id)
             && cert_is_still_usable(cert, ts, self.cert_ttl, now_for_cache)
+            && self
+                .cert_store
+                .document_floor
+                .allows_cert(&target_node_id, cert, now_for_cache)
             && cert.instance_id == instance_id
         {
             let cert = cert.clone();
@@ -1808,6 +1836,10 @@ impl DhtMlKemEkResolver {
 
         if let Some((cert, ts)) = rlock!(self.cert_cache).get(&target_node_id)
             && cert_is_still_usable(cert, ts, self.cert_ttl, now_unix)
+            && self
+                .cert_store
+                .document_floor
+                .allows_cert(&target_node_id, cert, now_unix)
         {
             let cert = cert.clone();
             self.publish_ratchet_key(target_node_id, &cert);
@@ -1866,6 +1898,10 @@ impl DhtMlKemEkResolver {
         if let Some((cert, ts)) =
             rlock!(self.instance_cert_cache).get(&(target_node_id, instance_id))
             && cert_is_still_usable(cert, ts, self.cert_ttl, now_for_cache)
+            && self
+                .cert_store
+                .document_floor
+                .allows_cert(&target_node_id, cert, now_for_cache)
         {
             let cert = cert.clone();
             self.publish_ratchet_key(target_node_id, &cert);
@@ -1875,6 +1911,10 @@ impl DhtMlKemEkResolver {
         // mismatch is a miss, never a substitution.
         if let Some((cert, ts)) = rlock!(self.cert_cache).get(&target_node_id)
             && cert_is_still_usable(cert, ts, self.cert_ttl, now_for_cache)
+            && self
+                .cert_store
+                .document_floor
+                .allows_cert(&target_node_id, cert, now_for_cache)
             && cert.instance_id == instance_id
         {
             let cert = cert.clone();
@@ -2437,7 +2477,10 @@ mod tests {
                 cert.encode(),
             );
         }
-        let resolver = make_test_resolver(Arc::clone(&dht));
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let mut resolver = make_test_resolver(Arc::clone(&dht));
+        resolver.cert_store = Arc::new(MlKemCertStore::load(&config, now));
         let stored_doc = IdentityDocument::decode(
             &dht.get_local(&IdentityDocument::dht_key(&target))
                 .expect("stored document"),
@@ -2489,7 +2532,16 @@ mod tests {
         );
         // An old replica and a still-valid revoked signing key must not restore
         // an authorization this receiver has already learned to retire.
+        // Exercise the original digest-cache eviction and a process restart.
+        lock!(resolver.checked_documents).clear();
         dht.store_local(IdentityDocument::dht_key(&target), old.encode());
+        let mut restarted = make_test_resolver(Arc::clone(&dht));
+        restarted.cert_store = Arc::new(MlKemCertStore::load(&config, now));
+        assert!(
+            restarted
+                .resolve_cert_for_instance_cached(target, b_instance)
+                .is_none()
+        );
         assert!(
             resolver
                 .resolve_cert_for_instance_cached(target, b_instance)

@@ -806,11 +806,21 @@ State that survives restart (lives next to `config.toml`):
 | `bans.json` | Manual bans (persisted) | Yes — protects against rejoining attackers |
 | `dht_values.json` | Local DHT shard values (sovereign identity records, name claims) | Yes — sovereign-name resolution |
 | `peers_discovered.json` | PEX-learned peers | No — re-discovered via PEX |
+| `peer_identity_floors.json` | Verified peer-document timestamp floors and grow-only revocations | Yes — prevents old replicas from restoring revoked devices after restart |
 | `identity_document.bin` | Sovereign identity | **Yes — back this up** |
 | `device_identity_sk.bin` | Per-device Ed25519 secret seed | **Yes — back this up** |
 | `instance_id` | Local instance UUID + label | **Yes** — tied to identity_keys[] |
 | `mlkem.key` | Per-instance ML-KEM-768 keypair | Auto-regenerates if missing |
 | `name_claims/*.bin` | Persisted sovereign name claims | Yes — re-publishable from disk |
+
+Peer identity floors are security state, not a disposable discovery cache.
+Their signed documents are checked on load and never grant current delegation
+rights by themselves. A malformed/unreadable snapshot refuses peer-document
+authorization until repaired from a valid backup. At most 512 identities are
+remembered: ordinary entries use LRU eviction, while entries carrying revocations
+are retained; if all slots carry revocations, new identities are refused. Failed
+snapshot writes retain the floor in memory and retry on the next observation;
+restart durability requires a successful write.
 
 ### Crash + restart
 
