@@ -46,6 +46,10 @@ const BBR_MIN_RTT_WINDOW_MS: u64 = 30_000;
 const SACK_LOSS_THRESHOLD: usize = 3;
 /// RTT evidence and retransmission history expire independently of BBR.
 const RACK_SAMPLE_WINDOW_MS: u64 = 30_000;
+// One maximum per second keeps the recent reordering evidence bounded to 31
+// buckets. Retaining the partially expired oldest bucket is conservative by
+// at most one second; it never forgets a still-recent slow route prematurely.
+const RACK_REORDER_BUCKET_MS: u64 = 1_000;
 const RACK_REPAIR_HISTORY_LIMIT: usize = 128;
 
 /// Tunables. Bytes for windows, millis for timers.
@@ -372,10 +376,11 @@ struct TxState {
     rack_end_seq: u32,
     /// RTT measured on that most recent delivery (ms).
     rack_rtt_ms: u32,
-    /// Largest observed reordering gap (ms): when an overtaken original is
+    /// Largest RECENT reordering gap (ms): when an overtaken original is
     /// finally delivered, how much LATER-sent data had already been delivered.
     /// Under route striping this converges on the cross-route latency delta.
     rack_reo_max_ms: u32,
+    rack_reo_samples: VecDeque<(u64, u32)>,
     /// Wake-up for segments whose RACK loss deadline is still in the future.
     rack_deadline: Option<u64>,
     /// Original-only RTT evidence; independent of BBR and Karn-ambiguous repairs.
@@ -559,6 +564,7 @@ impl StreamEngine {
                 rack_end_seq: 0,
                 rack_rtt_ms: 0,
                 rack_reo_max_ms: 0,
+                rack_reo_samples: VecDeque::new(),
                 rack_deadline: None,
                 rack_min_rtt: None,
                 rack_dsack_round: None,
@@ -800,7 +806,8 @@ impl StreamEngine {
              adv={} ack_pending={} eof={} fin(req={},sent={},ack={}) \
              srtt={:?} rttvar={} rto={}ms pace_next={}ms delayed_ack={}/{:?} \
              rto_dl={:?} persist_dl={:?} bbr_bw={} bbr_rtt_min={:?} bbr_cap={:?} \
-             rack={} reo_wnd={} rack_rtt={} rto_skipped_sacked={} sack_recent_promotions={}",
+             rack={} reo_wnd={} rack_rtt={} rto_skipped_sacked={} sack_recent_promotions={} \
+             reo_observed_ms={} reo_duplicate_ms={}",
             self.phase,
             self.tx.snd_una,
             self.tx.snd_nxt,
@@ -841,6 +848,8 @@ impl StreamEngine {
             self.tx.rack_rtt_ms,
             self.tx.rto_sacked_segments_skipped,
             self.sack_recent_promotions,
+            self.tx.rack_reo_max_ms,
+            self.tx.rack_dsack_reo_ms,
         )
     }
 
@@ -1617,6 +1626,7 @@ impl StreamEngine {
     /// the future arm the reorder timer instead. Returns whether anything was
     /// newly marked for retransmission.
     fn rack_detect_loss(&mut self, now: u64) -> bool {
+        self.tx.expire_rack_reordering(now);
         if self.tx.rack_xmit_ms == 0 || self.phase != Phase::Established {
             self.tx.rack_deadline = None;
             return false;
@@ -2300,7 +2310,7 @@ impl TxState {
             // The send-time gap is one reordering signal; matched D-SACKs
             // separately cover repairs that made original timing ambiguous.
             let sample = (prior_frontier - seg_sent_ms).min(u32::MAX as u64) as u32;
-            self.rack_reo_max_ms = self.rack_reo_max_ms.max(sample);
+            self.observe_rack_reordering(sample, now);
         }
         if seg_sent_ms > self.rack_xmit_ms
             || (seg_sent_ms == self.rack_xmit_ms && seq::gt(seg_end, self.rack_end_seq))
@@ -2309,6 +2319,40 @@ impl TxState {
             self.rack_end_seq = seg_end;
             self.rack_rtt_ms = rtt;
         }
+    }
+
+    fn expire_rack_reordering(&mut self, now: u64) {
+        let oldest = now.saturating_sub(RACK_SAMPLE_WINDOW_MS) / RACK_REORDER_BUCKET_MS;
+        let mut removed = false;
+        while self
+            .rack_reo_samples
+            .front()
+            .is_some_and(|(bucket, _)| *bucket < oldest)
+        {
+            self.rack_reo_samples.pop_front();
+            removed = true;
+        }
+        if removed {
+            self.rack_reo_max_ms = self
+                .rack_reo_samples
+                .iter()
+                .map(|(_, sample)| *sample)
+                .max()
+                .unwrap_or(0);
+        }
+    }
+
+    fn observe_rack_reordering(&mut self, sample: u32, now: u64) {
+        self.expire_rack_reordering(now);
+        let bucket = now / RACK_REORDER_BUCKET_MS;
+        if let Some((last, maximum)) = self.rack_reo_samples.back_mut()
+            && bucket <= *last
+        {
+            *maximum = (*maximum).max(sample);
+        } else {
+            self.rack_reo_samples.push_back((bucket, sample));
+        }
+        self.rack_reo_max_ms = self.rack_reo_max_ms.max(sample);
     }
 
     /// Record newly delivered bytes and refresh the bottleneck-rate estimate
@@ -4564,6 +4608,68 @@ mod tests {
         // A genuinely new, overtaken original is different evidence.
         e.on_ack(181, 4096, &SackVec::new(), 210);
         assert_eq!(e.tx.rack_reo_max_ms, 10);
+    }
+
+    #[test]
+    fn rack_reordering_forgets_old_spikes_but_retains_recent_slow_routes() {
+        let mut e = repeated_sack_holes(false);
+        e.cfg.rack = true;
+        e.tx.rtt_min = Some((80, 0));
+        e.tx.rack_dsack_reo_ms = 0;
+        // One original arrived six seconds late. A permanently retained max
+        // used to penalize every later loss for the rest of this stream.
+        e.tx.observe_rack_reordering(6000, 100);
+        assert_eq!(e.rack_reo_wnd(), 7500);
+        e.tx.observe_rack_reordering(400, 20_100);
+        e.tx.observe_rack_reordering(20, 29_100);
+        e.tx.expire_rack_reordering(30_999);
+        assert_eq!(
+            e.tx.rack_reo_max_ms, 6000,
+            "partial oldest bucket is retained conservatively"
+        );
+        // Real detection, not a separate maintenance task, expires the spike.
+        e.rack_detect_loss(31_000);
+        assert_eq!(
+            e.tx.rack_reo_max_ms, 400,
+            "the recent slow route must survive expiry of the older maximum"
+        );
+        assert_eq!(e.rack_reo_wnd(), 500);
+        // A genuinely lost head in a later flight is repaired using current
+        // evidence, not delayed by the six-second spike from the old route.
+        for (i, segment) in e.tx.segs.iter_mut().enumerate() {
+            segment.sent_ms = 31_000 + i as u64 * 10;
+            segment.sacked = i != 0;
+            segment.needs_resend = false;
+            segment.local_pending = false;
+        }
+        e.tx.rack_xmit_ms = 31_010;
+        e.tx.rack_rtt_ms = 100;
+        assert!(e.rack_detect_loss(31_600));
+        assert!(e.tx.segs.front().unwrap().needs_resend);
+        e.rack_detect_loss(51_000);
+        assert_eq!(e.rack_reo_wnd(), 25);
+        e.cfg.rack_reo_floor_ms = 900;
+        e.rack_detect_loss(61_000);
+        assert_eq!(
+            e.rack_reo_wnd(),
+            900,
+            "carrier's explicit multipath floor is unchanged"
+        );
+    }
+
+    #[test]
+    fn rack_reordering_window_is_bounded_and_keeps_continuous_reordering() {
+        let mut e = repeated_sack_holes(false);
+        for now in (0..400_000).step_by(10) {
+            e.tx.observe_rack_reordering(400 + (now % 100) as u32, now);
+            assert!(e.tx.rack_reo_samples.len() <= 31);
+            if now >= 1000 {
+                assert_eq!(e.tx.rack_reo_max_ms, 490);
+            }
+        }
+        e.tx.expire_rack_reordering(431_000);
+        assert_eq!(e.tx.rack_reo_max_ms, 0);
+        assert!(e.tx.rack_reo_samples.is_empty());
     }
 
     #[test]
