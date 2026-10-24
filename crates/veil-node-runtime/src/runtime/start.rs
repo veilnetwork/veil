@@ -564,13 +564,15 @@ impl NodeRuntime {
         // backs, and from `config_path` because that is where every other
         // learned-state snapshot this runtime keeps already lives
         // (`peers_discovered.json`, `bans.json`).
-        let shared_peer_mlkem_cert_store = Arc::new(crate::mlkem_cert_store::MlKemCertStore::load(
-            &config_path,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-        ));
+        let shared_peer_mlkem_cert_store =
+            Arc::new(crate::mlkem_cert_store::MlKemCertStore::for_runtime(
+                &config_path,
+                config.persist_enabled,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            ));
         // The device Diffie-Hellman half of the same certificates, kept apart
         // so the frame dispatcher can read it: the dispatcher decides sender
         // provenance synchronously and cannot reach this crate's cert type.
