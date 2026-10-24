@@ -22,6 +22,30 @@ use std::sync::Arc;
 use super::*;
 
 impl NodeServices {
+    /// Fence a host's previously authenticated device mapping using this
+    /// node's local signed document and monotone authorization floor. No
+    /// network lookup or trust in a new stream's claimed sender is involved.
+    pub fn peer_device_proof_allowed(&self, peer: &[u8; 32], device: &[u8; 32], now: u64) -> bool {
+        use veil_proto::identity_document::IdentityDocument;
+        if let Some(doc) = self
+            .dht
+            .get_local(&IdentityDocument::dht_key(peer))
+            .and_then(|raw| IdentityDocument::decode(&raw).ok())
+            .filter(|doc| &doc.node_id == peer)
+        {
+            // observe verifies every binding/signature before advancing the
+            // floor; unchanged verified bytes take its digest fast path.
+            self.identity
+                .peer_mlkem_cert_store
+                .document_floor
+                .observe(&doc, now);
+        }
+        self.identity
+            .peer_mlkem_cert_store
+            .document_floor
+            .allows_device_proof(peer, device, now)
+    }
+
     /// Does this node still hold a peer row for `node_id`?
     ///
     /// An outbound connector task retries for the life of the process, so
