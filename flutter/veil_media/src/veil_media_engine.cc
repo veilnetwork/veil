@@ -2386,7 +2386,9 @@ int veil_media_group_engine_set_audio_budget(VeilGroupMediaEngine* engine,
 
 int veil_media_group_engine_stop_audio(VeilGroupMediaEngine* engine) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
-  if (!engine->audio_running.exchange(false)) return VEIL_MEDIA_OK;
+  // A previous stop may have disabled the ADM but timed out before destroying
+  // its streams. The requested state alone cannot prove cleanup completed.
+  engine->audio_running.store(false);
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (engine->ws && engine->ws->call) {
     GroupWebrtcState* ws = engine->ws.get();
@@ -3467,7 +3469,9 @@ int veil_media_engine_stop_audio(VeilMediaEngine* engine) {
   if (engine->ws && engine->ws->shim)
     engine->ws->shim->SetAudioMirrorChannel(0);
 #endif
-  if (!engine->audio_running.exchange(false)) return VEIL_MEDIA_OK;
+  // Always retry worker cleanup: a cancelled stop already clears this flag
+  // while leaving the Call's streams alive. Repeating stop must not hide that.
+  engine->audio_running.store(false);
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (engine->ws && engine->ws->call) {
     WebrtcState* ws = engine->ws.get();

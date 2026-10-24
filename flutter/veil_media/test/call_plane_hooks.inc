@@ -191,6 +191,82 @@ extern "C" int veil_media_test_group_blocked_audio_stats(
   return check(ctx, 0, 0, 0);
 }
 
+// Cancel a real stop before it reaches the Call worker, then retry through the
+// public API. The counting ADM never opens hardware; all streams are real.
+extern "C" int veil_media_test_audio_stop_retry() {
+  struct ResetFactory {
+    bool prior = g_call_plane_recording_adm;
+    ResetFactory() { g_call_plane_recording_adm = true; }
+    ~ResetFactory() { g_call_plane_recording_adm = prior; }
+  } reset;
+  const uint8_t local[32] = {0x51}, peer[32] = {0x52};
+  int failure = 0;
+  for (bool room : {false, true}) {
+    std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> one(
+        room ? nullptr : veil_media_engine_create(91, local, peer),
+        veil_media_engine_destroy);
+    std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> group(
+        room ? veil_media_group_engine_create(local) : nullptr,
+        veil_media_group_engine_destroy);
+    if ((!room && !one) || (room && !group)) return 1;
+    if (room && veil_media_group_engine_add_peer(group.get(), 91, peer) != VEIL_MEDIA_OK)
+      return 2;
+    const auto start = [&] {
+      return room ? veil_media_group_engine_start_audio(group.get())
+                  : veil_media_engine_start_audio(one.get(), 1, 1);
+    };
+    const auto stop = [&] {
+      return room ? veil_media_group_engine_stop_audio(group.get())
+                  : veil_media_engine_stop_audio(one.get());
+    };
+    auto* worker = room ? group->ws->worker_tq.get() : one->ws->worker_tq.get();
+    auto* video_worker = room ? group->ws->video_worker_tq.get()
+                              : one->ws->video_worker_tq.get();
+    const auto stream_count = [&] {
+      int count = 0;
+      if (!run_on(worker, [&] {
+            if (room) {
+              count += group->ws->send_stream != nullptr;
+              for (const auto& entry : group->ws->peers)
+                count += entry.second->recv_stream != nullptr;
+            } else {
+              count += one->ws->send_stream != nullptr;
+              count += one->ws->recv_stream != nullptr;
+            }
+          })) return -1;
+      return count;
+    };
+    if (start() != VEIL_MEDIA_OK || stream_count() != 2) return 3;
+    int first = VEIL_MEDIA_OK, second = VEIL_MEDIA_OK;
+    {
+      HeldQueues held(worker, video_worker);
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      while (!held.first->entered.load() || !held.second->entered.load()) {
+        if (std::chrono::steady_clock::now() >= deadline) return 4;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      first = stop();
+      second = stop();
+    }
+    // Drain the abandoned work before counting; a timed-out task must not run
+    // late and make the retry look effective by cleaning up on its behalf.
+    const int retained = stream_count();
+    const int retry = stop();
+    const int remaining = stream_count();
+    std::fprintf(stderr, "%s audio stop: blocked=%d repeated=%d retained=%d "
+                         "retry=%d remaining=%d\n", room ? "group" : "direct",
+                 first, second, retained, retry, remaining);
+    if (first != VEIL_MEDIA_ERR_STATE || second != VEIL_MEDIA_ERR_STATE ||
+        retained != 2 || retry != VEIL_MEDIA_OK || remaining != 0) failure = 5;
+    // Also clean up safely on the unfixed baseline: restart sets the old flag
+    // before the healthy stop. It must not be necessary for the tested retry.
+    if (start() != VEIL_MEDIA_OK || stream_count() != 2 ||
+        stop() != VEIL_MEDIA_OK || stream_count() != 0 ||
+        stop() != VEIL_MEDIA_OK || stream_count() != 0) return 6;
+  }
+  return failure;
+}
+
 // Exercise the production RTCP encoder using the real cached receive sample,
 // without waiting for WebRTC's randomized report timer.
 extern "C" int veil_media_test_group_emit_rtcp(VeilGroupMediaEngine* e) {
