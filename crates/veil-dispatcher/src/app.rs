@@ -609,7 +609,10 @@ impl FrameDispatcher {
             // conversation for good.
             AppMsg::AppSendUnopenable => {
                 if let Some(ratchet) = &self.crypto.ratchet {
-                    let dropped = ratchet.forget_peer(&sender);
+                    // The OVL1 peer identifies the physical endpoint. A
+                    // sovereign alias must not turn its reset into a reset
+                    // of every other device sharing that identity.
+                    let dropped = ratchet.forget_peer_device(&sender, node_id.as_bytes());
                     self.logger.warn(
                         "app.ratchet.peer_cannot_open",
                         format!(

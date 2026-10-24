@@ -259,10 +259,10 @@ async fn process_auth_deliver(
 /// conversation, as the direct-session `AppSendUnopenable` does, so the next
 /// send re-keys.
 ///
-/// Under both names the replier goes by. We keyed the conversation under
-/// whatever address we sealed to, which is its identity or the one device that
-/// signed, and the reply cannot say which; the signature proves both. The
-/// cached certificate rows go too, or the re-key re-seals to the row that was
+/// Under both names the replier goes by, but only its physical instance:
+/// independent sibling chains must survive a reset from another device.
+/// The signature establishes exactly which device is reporting the failure.
+/// Cached certificate rows go too, or the re-key re-seals to the row that was
 /// just refused (defect №35).
 pub(crate) fn forget_after_signed_unopenable(
     dispatcher: &veil_dispatcher::FrameDispatcher,
@@ -275,9 +275,11 @@ pub(crate) fn forget_after_signed_unopenable(
     } else {
         &[identity, device]
     };
-    let dropped = dispatcher.crypto.ratchet.as_ref().map_or(0, |ratchet| {
-        names.iter().map(|n| ratchet.forget_peer(n)).sum()
-    });
+    let dropped = dispatcher
+        .crypto
+        .ratchet
+        .as_ref()
+        .map_or(0, |ratchet| ratchet.forget_peer_device(&identity, &device));
     let invalidate = dispatcher
         .peer_cert_invalidate
         .lock()

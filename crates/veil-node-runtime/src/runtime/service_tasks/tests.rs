@@ -3347,7 +3347,7 @@ fn epic481_4_dedup_drops_all_when_every_pubkey_known() {
 
 /// Our end of a conversation store, holding one conversation with each of
 /// `peers` — what sealing a first message to each leaves behind.
-fn ratchet_with_conversations(peers: &[[u8; 32]]) -> veil_e2e::RatchetRuntime {
+fn ratchet_with_conversations(peers: &[([u8; 32], [u8; 16])]) -> veil_e2e::RatchetRuntime {
     let seed_of = |tag: u8| [tag; veil_e2e::DK_SEED_BYTES];
     let ring_of = |tag: u8| {
         let (ek, _) = veil_e2e::keypair_from_dk_seed(&seed_of(tag)).expect("keypair");
@@ -3360,13 +3360,13 @@ fn ratchet_with_conversations(peers: &[[u8; 32]]) -> veil_e2e::RatchetRuntime {
         local_instance_id: Arc::new(std::sync::RwLock::new(Some([0x01; 16]))),
         peer_ratchet_keys: Arc::new(std::sync::RwLock::new(veil_e2e::PeerRatchetKeyCache::new())),
     };
-    for (i, peer) in peers.iter().enumerate() {
+    for (i, (peer, instance)) in peers.iter().enumerate() {
         let ring = ring_of(0x40 + i as u8);
         let (ek, pk) = (ring.current_ek(), ring.current_ratchet_pk());
         us.seal_for(
             veil_e2e::PeerRatchetKeys {
                 node_id: peer,
-                instance_id: &[0x40 + i as u8; 16],
+                instance_id: instance,
                 mlkem_ek: &ek,
                 ratchet_pk: &pk,
                 authorized_until_unix: u64::MAX,
@@ -3386,7 +3386,11 @@ fn ratchet_with_conversations(peers: &[[u8; 32]]) -> veil_e2e::RatchetRuntime {
 #[test]
 fn a_signed_unopenable_reply_forgets_the_replier_under_both_names_and_no_one_else() {
     let (identity, device, bystander) = ([0x1D; 32], [0xDE; 32], [0xBE; 32]);
-    let ratchet = ratchet_with_conversations(&[identity, device, bystander]);
+    let ratchet = ratchet_with_conversations(&[
+        (identity, [0xDE; 16]),
+        (device, [0xDE; 16]),
+        (bystander, [0xBE; 16]),
+    ]);
     let mut dispatcher = veil_dispatcher::make_test_dispatcher(veil_cfg::NodeRole::Core);
     dispatcher.crypto = Arc::new(veil_dispatcher::CryptoContext {
         ratchet: Some(ratchet.clone()),
@@ -3426,7 +3430,7 @@ fn a_signed_unopenable_reply_forgets_the_replier_under_both_names_and_no_one_els
 #[test]
 fn a_single_device_replier_is_forgotten_once() {
     let identity = [0x1D; 32];
-    let ratchet = ratchet_with_conversations(&[identity]);
+    let ratchet = ratchet_with_conversations(&[(identity, [0x40; 16])]);
     let mut dispatcher = veil_dispatcher::make_test_dispatcher(veil_cfg::NodeRole::Core);
     dispatcher.crypto = Arc::new(veil_dispatcher::CryptoContext {
         ratchet: Some(ratchet.clone()),
@@ -3446,4 +3450,63 @@ fn a_single_device_replier_is_forgotten_once() {
         1
     );
     assert_eq!(*invalidated.lock().unwrap(), vec![identity]);
+}
+
+#[test]
+fn a_signed_unopenable_reply_preserves_the_same_identitys_other_device() {
+    let (identity, device, bystander) = ([0x1D; 32], [0xDE; 32], [0xBE; 32]);
+    let sibling_instance = [0xAD; 16];
+    let ratchet = ratchet_with_conversations(&[
+        (identity, [0xDE; 16]),
+        (device, [0xDE; 16]),
+        (identity, sibling_instance),
+        (bystander, [0xBE; 16]),
+    ]);
+    let mut dispatcher = veil_dispatcher::make_test_dispatcher(veil_cfg::NodeRole::Core);
+    dispatcher.crypto = Arc::new(veil_dispatcher::CryptoContext {
+        ratchet: Some(ratchet.clone()),
+        ..(*dispatcher.crypto).clone()
+    });
+    assert_eq!(ratchet.store.keys().len(), 4);
+    let logger = veil_observability::NodeLogger::new_noop();
+    assert_eq!(
+        forget_after_signed_unopenable(&dispatcher, &logger, identity, device),
+        2
+    );
+    let keys = ratchet.store.keys();
+    assert!(
+        keys.iter()
+            .any(|key| key.peer_node_id == identity && key.peer_instance_id == sibling_instance),
+        "one device's reset must preserve its sibling's established chain"
+    );
+    assert!(keys.iter().any(|key| key.peer_node_id == bystander));
+    assert_eq!(keys.len(), 2);
+}
+
+#[test]
+fn an_identity_addressed_device_reset_still_preserves_its_sibling() {
+    let identity = [0x1D; 32];
+    let sibling_instance = [0xAD; 16];
+    let ratchet =
+        ratchet_with_conversations(&[(identity, [0x1D; 16]), (identity, sibling_instance)]);
+    let mut dispatcher = veil_dispatcher::make_test_dispatcher(veil_cfg::NodeRole::Core);
+    dispatcher.crypto = Arc::new(veil_dispatcher::CryptoContext {
+        ratchet: Some(ratchet.clone()),
+        ..(*dispatcher.crypto).clone()
+    });
+    let logger = veil_observability::NodeLogger::new_noop();
+    assert_eq!(
+        forget_after_signed_unopenable(&dispatcher, &logger, identity, identity),
+        1
+    );
+    assert_eq!(ratchet.store.keys().len(), 1);
+    assert_eq!(ratchet.store.keys()[0].peer_instance_id, sibling_instance);
+}
+
+#[test]
+fn an_ambiguous_legacy_reset_does_not_guess_which_instance_failed() {
+    let identity = [0x1D; 32];
+    let ratchet = ratchet_with_conversations(&[(identity, [0x40; 16]), (identity, [0x41; 16])]);
+    assert_eq!(ratchet.forget_peer_device(&identity, &identity), 0);
+    assert_eq!(ratchet.store.keys().len(), 2);
 }
