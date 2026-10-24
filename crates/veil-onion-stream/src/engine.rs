@@ -399,6 +399,15 @@ struct RackRepair {
     handed_off_ms: Option<u64>,
 }
 
+// Bound map/Vec metadata as well as payload bytes. This accommodates a full
+// 8 MiB production window at the negotiated ~2 KiB cell size with room for
+// segment-size changes. Tiny segments beyond the cap are not acknowledged as
+// received; ARQ retries them after the gap drains. Never evict a SACKed entry.
+const MAX_REORDERED_SEGMENTS: usize = 8192;
+// Serial comparisons require outstanding sequence space strictly below half
+// the u32 range, including with BBR off and an untrusted advertised window.
+const MAX_INFLIGHT_BYTES: u32 = (1 << 31) - 1;
+
 struct RxState {
     rcv_nxt: u32,
     window: u32, // configured buffer size (bytes)
@@ -643,6 +652,38 @@ impl StreamEngine {
             self.tx.refresh_sack_repair_deadline();
         }
         self.tx.refresh_local_rto(now);
+    }
+
+    /// Cancel a queued DATA/FIN attempt when authenticated ACK/SACK evidence
+    /// already covers it. In particular, a delayed original can arrive while
+    /// its repair is still waiting for local carrier credit. Control frames
+    /// and any cell containing an unsacked tail must keep their normal path.
+    pub(crate) fn discard_received_cell(&mut self, cell: &[u8]) -> bool {
+        let Some(token) = LocalTransmit::from_cell(cell) else {
+            return false;
+        };
+        if !matches!(token.kind, TransmitKind::Data | TransmitKind::Fin) {
+            return false;
+        }
+        let end = token.seq.wrapping_add(token.span);
+        let covered = seq::leq(end, self.tx.snd_una);
+        let overlaps =
+            |segment: &Seg| seq::lt(segment.seq, end) && seq::lt(token.seq, segment.end());
+        if !covered
+            && (!self.tx.segs.iter().any(overlaps)
+                || self.tx.segs.iter().any(|s| overlaps(s) && !s.sacked))
+        {
+            return false;
+        }
+        for segment in self.tx.segs.iter_mut().filter(|s| overlaps(s)) {
+            segment.local_pending = false;
+        }
+        // A repair that never left cannot later substantiate reordering.
+        // Keep evidence from earlier repairs that really were handed off.
+        self.tx.rack_repairs.retain(|repair| {
+            repair.handed_off_ms.is_some() || repair.start != token.seq || repair.end != end
+        });
+        true
     }
 
     pub(crate) fn handshake_unconfirmed(&self) -> bool {
@@ -1350,7 +1391,7 @@ impl StreamEngine {
     /// 2x the measured BDP when BBR-lite shaping is active so a loss-free
     /// path does not park a full receive window in queues.
     fn effective_send_window(&self) -> u32 {
-        let window = self.tx.cwnd.min(self.tx.rwnd);
+        let window = self.tx.cwnd.min(self.tx.rwnd).min(MAX_INFLIGHT_BYTES);
         match self.tx.bbr_window_cap(&self.cfg) {
             Some(cap) => window.min(cap),
             None => window,
@@ -1364,7 +1405,7 @@ impl StreamEngine {
         let window = self.effective_send_window();
         let inflight = self.tx.snd_nxt.wrapping_sub(self.tx.snd_una);
         let probe = self.force_probe;
-        if !probe && seq::geq(inflight, window) {
+        if !probe && inflight >= window {
             return false; // window full
         }
         // A persist probe is allowed exactly one byte past a closed window.
@@ -2477,8 +2518,8 @@ impl RxState {
     }
 
     fn store_oo(&mut self, seq_no: u32, payload: &[u8]) {
-        if self.oo.contains_key(&seq_no) {
-            return; // already have this block's start
+        if self.oo.contains_key(&seq_no) || self.oo.len() >= MAX_REORDERED_SEGMENTS {
+            return; // duplicate or no metadata capacity; do not promise SACK
         }
         let win_end = self.rcv_nxt.wrapping_add(self.window);
         let mut end = seq_no.wrapping_add(payload.len() as u32);
@@ -2564,6 +2605,56 @@ impl RxState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn huge_peer_window_cannot_cross_the_serial_half_range() {
+        for una in [0, u32::MAX - 15] {
+            let mut engine = StreamEngine::accept(7, Config::default(), 0, 0);
+            engine.phase = Phase::Established;
+            engine.tx.cwnd = u32::MAX;
+            engine.tx.rwnd = u32::MAX;
+            engine.tx.snd_una = una;
+            engine.tx.snd_nxt = una.wrapping_add(MAX_INFLIGHT_BYTES - 32);
+            engine.tx.pending.extend([0x31; 64]);
+            assert_eq!(engine.effective_send_window(), MAX_INFLIGHT_BYTES);
+            assert!(engine.create_next_segment(0));
+            assert_eq!(engine.inflight_bytes(), MAX_INFLIGHT_BYTES);
+            assert_eq!(engine.tx.segs.back().unwrap().data.len(), 32);
+            assert!(!engine.create_next_segment(1));
+        }
+    }
+
+    #[test]
+    fn reordered_tiny_segments_are_count_bounded_and_resume_after_gap_repair() {
+        for start in [100u32, u32::MAX - 4096] {
+            let mut engine = StreamEngine::accept(7, Config::default(), 0, 0);
+            engine.rx.rcv_nxt = start;
+            for offset in 1..=MAX_REORDERED_SEGMENTS as u32 {
+                engine.rx.accept(start.wrapping_add(offset), &[0x31]);
+            }
+            assert_eq!(engine.rx.oo.len(), MAX_REORDERED_SEGMENTS);
+            let rejected = start.wrapping_add(MAX_REORDERED_SEGMENTS as u32 + 1);
+            engine.rx.accept(rejected, &[0x32]);
+            assert_eq!(engine.rx.oo.len(), MAX_REORDERED_SEGMENTS);
+            assert!(!engine.rx.oo.contains_key(&rejected));
+            assert_eq!(engine.rx.oo_bytes, MAX_REORDERED_SEGMENTS);
+            assert_eq!(
+                engine.rx.sack_blocks(),
+                vec![(start.wrapping_add(1), rejected)]
+            );
+
+            assert!(engine.rx.accept(start, &[0x30]));
+            assert!(engine.rx.oo.is_empty());
+            assert_eq!(engine.rx.oo_bytes, 0);
+            assert_eq!(engine.rx.rcv_nxt, rejected);
+            assert!(engine.rx.accept(rejected, &[0x32]));
+            let received: Vec<_> = engine.rx.read_buf.iter().copied().collect();
+            let mut expected = vec![0x30];
+            expected.extend(std::iter::repeat_n(0x31, MAX_REORDERED_SEGMENTS));
+            expected.push(0x32);
+            assert_eq!(received, expected);
+        }
+    }
 
     #[test]
     fn backlogged_bbr_can_outprobe_a_low_seed_on_a_fast_path() {
@@ -3158,6 +3249,58 @@ mod tests {
             }
         }
         (engine, tokens)
+    }
+
+    #[test]
+    fn queued_repair_is_cancelled_on_sack_without_fabricating_a_handoff() {
+        for iss in [100, u32::MAX - 127] {
+            let (mut e, tokens) = tracked_flight(iss, 256);
+            e.local_handoff(&tokens.iter().map(|t| (*t, 1)).collect(), 10);
+            e.tx.segs[1].needs_resend = true;
+            let mut repair = Vec::new();
+            assert!(e.poll_repair_transmit(20, &mut repair));
+            let token = LocalTransmit::from_cell(&repair).unwrap();
+            assert_eq!(token.seq, tokens[1].seq);
+            assert!(!e.discard_received_cell(&repair));
+            assert!(e.tx.segs[1].local_pending);
+            let mut sacks = SackVec::new();
+            sacks.push(SackRange {
+                start: token.seq,
+                end: token.seq.wrapping_add(token.span),
+            });
+            e.on_ack(e.tx.snd_una, 4096, &sacks, 30);
+            let sent_ms = e.tx.segs[1].sent_ms;
+            assert!(e.discard_received_cell(&repair));
+            assert!(!e.tx.segs[1].local_pending);
+            assert_eq!(e.tx.segs[1].sent_ms, sent_ms);
+            assert!(!e.tx.rack_repairs.iter().any(|r| r.start == token.seq));
+
+            // An arbitrary SACK must not cancel an original never handed off.
+            let (mut unsent, _) = tracked_flight(iss, 256);
+            unsent.on_ack(unsent.tx.snd_una, 4096, &sacks, 30);
+            assert!(!unsent.discard_received_cell(&repair));
+            // A partial cumulative ACK still leaves a needed payload tail.
+            let first = Frame::Data {
+                stream_id: 11,
+                seq: tokens[0].seq,
+                win: 4096,
+                payload: &[0x39; 64],
+            }
+            .encode();
+            e.on_ack(tokens[0].seq.wrapping_add(32), 4096, &SackVec::new(), 40);
+            assert!(!e.discard_received_cell(&first));
+            e.on_ack(e.tx.snd_nxt, 4096, &SackVec::new(), 50);
+            assert!(e.discard_received_cell(&first));
+            assert!(
+                !e.discard_received_cell(
+                    &Frame::Rst {
+                        stream_id: 11,
+                        reason: reset_reason::APP,
+                    }
+                    .encode()
+                )
+            );
+        }
     }
 
     #[test]

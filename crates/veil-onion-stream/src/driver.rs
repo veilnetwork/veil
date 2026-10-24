@@ -189,6 +189,32 @@ impl OnionConnection {
 }
 
 impl OnionStream {
+    /// A local admission failure, with no route, driver or network attempt.
+    /// Keep `StreamMux::open`'s existing handle API while exposing a prompt
+    /// reset to connection/read/write callers instead of probing indefinitely.
+    pub(crate) fn refused() -> Self {
+        let (cmd_tx, _) = mpsc::channel(1);
+        let (_, data_rx) = mpsc::channel(1);
+        let (reset_tx, _) = watch::channel(None);
+        let end = Arc::new(Mutex::new(End::Reset(reset_reason::REFUSED)));
+        let abort = OnionAbort {
+            end: end.clone(),
+            notify: Arc::new(Notify::new()),
+            reset_tx,
+        };
+        Self {
+            cmd_tx,
+            data_rx,
+            residual: Vec::new(),
+            connection: OnionConnection {
+                connected: Arc::new(AtomicBool::new(false)),
+                end: end.clone(),
+            },
+            end,
+            abort,
+        }
+    }
+
     /// Initiator side over `duplex`.
     pub fn connect<D>(duplex: D, cfg: Config, stream_id: u32, iss: u32) -> Self
     where
@@ -634,6 +660,9 @@ async fn drive<D: CellDuplex>(
         // A striped carrier can accept a non-prefix subset, so correlate cells.
         loop {
             let now = now_ms(&base);
+            // An original may have reached the peer while its repair waited
+            // here. Do not hand that stale repair to the carrier after SACK.
+            outbound.retain(|cell| !engine.discard_received_cell(cell));
             if outbound.is_empty() && !engine.is_closed() {
                 while outbound.len() < MAX_OUTBOUND_BURST - REPAIR_RESERVE
                     && engine.poll_transmit(now, &mut cell)
