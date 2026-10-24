@@ -13,6 +13,53 @@ pub const VEIL_PEER_AUTHORIZATION_MAX_STATE_LEN: size_t = 12 * 1024 * 1024;
 /// Export wrote no payload. Retry with `*out_length` bytes of capacity.
 pub const VEIL_ERR_PEER_AUTHORIZATION_BUFFER_TOO_SMALL: c_int = -40;
 
+/// Revalidate a host's previously authenticated device/identity binding against
+/// retained verified authorization. This is not proof of an anonymous caller.
+/// Unknown, expired, revoked or not-yet-durable delegation returns false.
+///
+/// # Safety
+/// The two ids must each be readable for 32 bytes. `out_allowed` and `err_out`
+/// must be writable; `handle` must identify a live client connection.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_peer_device_proof_allowed(
+    handle: *mut VeilHandle,
+    peer_id: *const u8,
+    device_id: *const u8,
+    out_allowed: *mut u8,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_peer_device_proof_allowed") } {
+        return rc;
+    }
+    null_check!(err_out, "handle" => handle, "peer_id" => peer_id,
+        "device_id" => device_id, "out_allowed" => out_allowed);
+    unsafe { *out_allowed = 0 };
+    get_or_return!(
+        live,
+        handle_table(),
+        handle,
+        err_out,
+        VEIL_ERR_INVALID_ARG,
+        "VeilHandle"
+    );
+    let services = match embedded_services_for_bundle(&live.bundle) {
+        Ok(services) => services,
+        Err(error) => {
+            unsafe { write_err(err_out, error) };
+            return VEIL_ERR;
+        }
+    };
+    let peer: &[u8; 32] = unsafe { &*peer_id.cast::<[u8; 32]>() };
+    let device: &[u8; 32] = unsafe { &*device_id.cast::<[u8; 32]>() };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    unsafe {
+        *out_allowed = u8::from(services.peer_device_proof_allowed(peer, device, now));
+    }
+    VEIL_OK
+}
+
 /// Acknowledge exactly the exported revision after durable encrypted storage.
 /// Documents learned since that export remain unusable until their own commit.
 ///
@@ -224,7 +271,21 @@ mod tests {
         let mut revision = 9;
         let mut length = 9;
         let mut guard = [0xab; 8];
+        let ids = [0u8; 32];
+        let mut allowed = 1;
         unsafe {
+            assert_eq!(
+                veil_peer_device_proof_allowed(
+                    stale,
+                    ids.as_ptr(),
+                    ids.as_ptr(),
+                    &mut allowed,
+                    &mut error
+                ),
+                VEIL_ERR_INVALID_ARG
+            );
+            assert_eq!(allowed, 0);
+            crate::veil_free_string(error);
             assert_eq!(
                 veil_peer_authorization_version(stale, &mut revision, &mut error),
                 VEIL_ERR_INVALID_ARG

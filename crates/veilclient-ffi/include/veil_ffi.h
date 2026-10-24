@@ -4593,6 +4593,23 @@ int veil_pair_target_build_confirm(VeilHandle *handle,
 ;
 
 /**
+ * Revalidate a host's previously authenticated device/identity binding against
+ * retained verified authorization. This is not proof of an anonymous caller.
+ * Unknown, expired, revoked or not-yet-durable delegation returns false.
+ *
+ * # Safety
+ * The two ids must each be readable for 32 bytes. `out_allowed` and `err_out`
+ * must be writable; `handle` must identify a live client connection.
+ */
+
+int veil_peer_device_proof_allowed(VeilHandle *handle,
+                                   const uint8_t *peer_id,
+                                   const uint8_t *device_id,
+                                   uint8_t *out_allowed,
+                                   char **err_out)
+;
+
+/**
  * Acknowledge exactly the exported revision after durable encrypted storage.
  * Documents learned since that export remain unusable until their own commit.
  *
