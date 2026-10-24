@@ -2549,6 +2549,45 @@ impl RatchetRuntime {
         keys.iter().filter(|k| self.store.forget(k)).count()
     }
 
+    /// Reset only the physical device that reported an unopenable frame.
+    /// The caller must establish the device through a verified document
+    /// signature or its authenticated transport session, never an app claim.
+    ///
+    /// Sovereign instance ids are the first 16 bytes of the device id. Keep
+    /// both addressing forms (identity and physical key), but preserve every
+    /// sibling's independent chain. A legacy peer may use an arbitrary
+    /// instance id: retain that fallback only when exactly one instance is
+    /// held. An ambiguous old reply must not discard several healthy devices.
+    pub fn forget_peer_device(&self, peer_node_id: &[u8; 32], device_id: &[u8; 32]) -> usize {
+        let instance: [u8; 16] = device_id[..16].try_into().expect("fixed device id prefix");
+        let keys: Vec<_> = {
+            let g = self.store.lock();
+            let all: Vec<_> = g
+                .entries
+                .keys()
+                .filter(|key| &key.peer_node_id == peer_node_id || &key.peer_node_id == device_id)
+                .copied()
+                .collect();
+            let exact: Vec<_> = all
+                .iter()
+                .filter(|key| key.peer_instance_id == instance)
+                .copied()
+                .collect();
+            if exact.is_empty()
+                && peer_node_id == device_id
+                && all.first().is_some_and(|first| {
+                    all.iter()
+                        .all(|key| key.peer_instance_id == first.peer_instance_id)
+                })
+            {
+                all
+            } else {
+                exact
+            }
+        };
+        keys.iter().filter(|key| self.store.forget(key)).count()
+    }
+
     /// Diagnostic: is a conversation with this peer stored, and has it ever
     /// opened anything?
     ///
