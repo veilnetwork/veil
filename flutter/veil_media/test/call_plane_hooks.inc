@@ -267,6 +267,56 @@ extern "C" int veil_media_test_audio_stop_retry() {
   return failure;
 }
 
+// Real destruction must wait for cancelled stream cleanup before freeing the
+// Call and its transports. Run each case in its own process: the old code hits
+// WebRTC's fatal live-stream check before the held queue recovers.
+extern "C" int veil_media_test_destroy_with_held_worker(int room, int video) {
+  struct ResetFactory {
+    bool prior = g_call_plane_recording_adm;
+    ResetFactory() { g_call_plane_recording_adm = true; }
+    ~ResetFactory() { g_call_plane_recording_adm = prior; }
+  } reset;
+  const uint8_t local[32] = {0x53}, peer[32] = {0x54};
+  std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> one(
+      room ? nullptr : veil_media_engine_create(92, local, peer),
+      veil_media_engine_destroy);
+  std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> group(
+      room ? veil_media_group_engine_create(local) : nullptr,
+      veil_media_group_engine_destroy);
+  if ((!room && !one) || (room && !group)) return 1;
+  if (room && veil_media_group_engine_add_peer(group.get(), 92, peer) != VEIL_MEDIA_OK)
+    return 2;
+  if ((room ? veil_media_group_engine_start_audio(group.get())
+            : veil_media_engine_start_audio(one.get(), 1, 1)) != VEIL_MEDIA_OK ||
+      (room ? veil_media_group_engine_start_video(group.get())
+            : veil_media_engine_start_video(one.get(), 1, 1, 150, 15)) != VEIL_MEDIA_OK)
+    return 3;
+  auto* worker = room ? (video ? group->ws->video_worker_tq.get() : group->ws->worker_tq.get())
+                      : (video ? one->ws->video_worker_tq.get() : one->ws->worker_tq.get());
+  auto* network = room ? (video ? group->ws->video_network_tq.get() : group->ws->network_tq.get())
+                       : (video ? one->ws->video_network_tq.get() : one->ws->network_tq.get());
+  HeldQueues held(worker, network);
+  const auto entered_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!held.first->entered.load() || !held.second->entered.load()) {
+    if (std::chrono::steady_clock::now() >= entered_deadline) return 4;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const auto start = std::chrono::steady_clock::now();
+  std::thread release([first = held.first, second = held.second, start] {
+    std::this_thread::sleep_until(start + std::chrono::milliseconds(12500));
+    first->released.store(true);
+    second->released.store(true);
+  });
+  if (room) veil_media_group_engine_destroy(group.release());
+  else veil_media_engine_destroy(one.release());
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  release.join();
+  std::fprintf(stderr, "%s destroy with held %s worker: %.0f ms, returned safely\n",
+               room ? "group" : "direct", video ? "video" : "audio",
+               std::chrono::duration<double, std::milli>(elapsed).count());
+  return elapsed >= std::chrono::seconds(10) && elapsed < std::chrono::seconds(20) ? 0 : 5;
+}
+
 // Exercise the production RTCP encoder using the real cached receive sample,
 // without waiting for WebRTC's randomized report timer.
 extern "C" int veil_media_test_group_emit_rtcp(VeilGroupMediaEngine* e) {
