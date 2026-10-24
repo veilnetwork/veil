@@ -15,6 +15,8 @@
 
 extern "C" VeilMediaEngine* veil_media_test_adaptive_codec_create(
     uint64_t, const uint8_t*, const uint8_t*, int);
+extern "C" VeilMediaEngine* veil_media_test_codec_create_unstarted(
+    uint64_t, const uint8_t*, const uint8_t*);
 extern "C" int veil_media_test_audio_fixed_transport_budget(VeilMediaEngine*, int);
 extern "C" int veil_media_test_audio_capture_tone(VeilMediaEngine*, int);
 extern "C" int veil_media_test_audio_playout_pcm(VeilMediaEngine*, int16_t*, size_t);
@@ -31,8 +33,10 @@ extern "C" int veil_media_set_recv_callback(
 }
 extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* p, size_t size) {
   std::lock_guard lock(wire_mutex);
+  assert(chan == 200 || chan == 300 || chan == 400 || chan == 500);
+  const uint64_t destination = chan == 200 ? 300 : chan == 300 ? 200 : chan == 400 ? 500 : 400;
   wire.push_back({std::chrono::steady_clock::now() + std::chrono::milliseconds(20),
-                 chan == 200 ? 300u : 200u, std::vector<uint8_t>(p, p + size)});
+                 destination, std::vector<uint8_t>(p, p + size)});
   return 0;
 }
 extern "C" int veil_media_send_video_control_datagram(
@@ -70,6 +74,59 @@ uint64_t metric(VeilMediaEngine* engine, const char* name) {
 int main() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   const uint8_t local[32] = {1}, peer[32] = {2};
+  {
+    // Real streams, but the existing synthetic ADM: no device or capture
+    // callback is used while muted. Video cannot await an impossible Opus ACK.
+    std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> muted(
+        veil_media_test_codec_create_unstarted(400, local, peer), veil_media_engine_destroy);
+    std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> sink(
+        veil_media_test_codec_create_unstarted(500, peer, local), veil_media_engine_destroy);
+    assert(muted && sink);
+    assert(veil_media_engine_set_independent_transport_feedback(muted.get(), 1) == 0);
+    assert(veil_media_engine_set_audio_packet_overhead(muted.get(), 209) == 0);
+    assert(veil_media_engine_set_mic_muted(muted.get(), 1) == 0);
+    assert(veil_media_engine_set_mic_muted(sink.get(), 1) == 0);
+    assert(veil_media_engine_start_audio(muted.get(), 1, 1) == 0);
+    assert(veil_media_engine_start_audio(sink.get(), 0, 1) == 0);
+    assert(veil_media_engine_start_video(sink.get(), 0, 1, 150, 8) == 0);
+    assert(veil_media_engine_start_video(muted.get(), 1, 0, 150, 8) == 0);
+    std::vector<uint8_t> y(320 * 240, 128), uv(320 * 240 / 4, 128);
+    const auto drive_muted_video = [&](int ticks) {
+      const auto start = std::chrono::steady_clock::now();
+      for (int tick = 0; tick < ticks; ++tick) {
+        std::this_thread::sleep_until(start + std::chrono::milliseconds(tick * 10));
+        y[0] = static_cast<uint8_t>(tick);
+        assert(veil_media_engine_push_video_frame(muted.get(),
+            y.data(), uv.data(), uv.data(), 320, 240, 320, 160, 160, 0) == 0);
+        deliver();
+      }
+    };
+    drive_muted_video(200);
+    const auto frames = metric(muted.get(), "video_tx_frames");
+    std::printf("initially muted: encoded=%llu decoded=%llu audio_packet_ms=%llu hold=%llu\n",
+        static_cast<unsigned long long>(frames),
+        static_cast<unsigned long long>(metric(sink.get(), "video_rx_deliver_frames")),
+        static_cast<unsigned long long>(metric(muted.get(), "audio_tx_packet_duration_ms")),
+        static_cast<unsigned long long>(metric(muted.get(), "audio_packetization_video_hold")));
+    assert(metric(muted.get(), "audio_tx_packet_duration_ms") == 0);
+    assert(frames >= 4 && metric(sink.get(), "video_rx_deliver_frames") >= 2);
+    assert(metric(muted.get(), "audio_packetization_video_hold") == 0);
+    assert(veil_media_engine_stop_audio(muted.get()) == 0);
+    const auto before_stopped = metric(muted.get(), "video_tx_frames");
+    drive_muted_video(100);
+    assert(metric(muted.get(), "video_tx_frames") >= before_stopped + 4);
+    // Receive-only audio has no encoder to provide fresh packet evidence.
+    assert(veil_media_engine_set_mic_muted(muted.get(), 0) == 0);
+    assert(veil_media_engine_start_audio(muted.get(), 0, 1) == 0);
+    const auto before_receive_only = metric(muted.get(), "video_tx_frames");
+    drive_muted_video(100);
+    assert(metric(muted.get(), "video_tx_frames") >= before_receive_only + 4);
+    assert(metric(muted.get(), "audio_packetization_video_hold") == 0);
+    std::puts("stopped and receive-only audio preserve ongoing video without capture");
+    muted.reset(); sink.reset();
+    std::lock_guard lock(wire_mutex);
+    wire.clear();
+  }
   std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> engine(
       veil_media_test_adaptive_codec_create(200, local, peer, 209),
       veil_media_engine_destroy);
@@ -84,11 +141,12 @@ int main() {
   assert(veil_media_engine_start_video(receiver.get(), 0, 1, 30, 1) == 0);
   std::vector<uint8_t> y(320 * 240, 128), uv(320 * 240 / 4, 128);
   std::array<int16_t, 480> pcm{};
+  bool sender_muted = false;
   const auto drive = [&](int ticks, bool video) {
     const auto start = std::chrono::steady_clock::now();
     for (int tick = 0; tick < ticks; ++tick) {
       std::this_thread::sleep_until(start + std::chrono::milliseconds(tick * 10));
-      assert(veil_media_test_audio_capture_tone(e, 600) == 0);
+      if (!sender_muted) assert(veil_media_test_audio_capture_tone(e, 600) == 0);
       assert(veil_media_test_audio_capture_tone(receiver.get(), 900) == 0);
       deliver();
       assert(veil_media_test_audio_playout_pcm(e, pcm.data(), pcm.size()) == 480);
@@ -125,6 +183,22 @@ int main() {
   const auto held = metric(e, "video_tx_frames");
   drive(150, true);
   assert(metric(e, "video_tx_frames") == held);
+  assert(metric(e, "audio_packetization_video_hold") == 1);
+  // A user mute stops capture; it does not promise a short audio packet.
+  // The already held >1-fps source must resume without any capture callback.
+  assert(veil_media_engine_set_mic_muted(e, 1) == 0);
+  sender_muted = true;
+  const auto before_mute = metric(e, "video_tx_frames");
+  drive(150, true);
+  std::printf("muted after 60-ms Opus: frames=%llu hold=%llu\n",
+      static_cast<unsigned long long>(metric(e, "video_tx_frames") - before_mute),
+      static_cast<unsigned long long>(metric(e, "audio_packetization_video_hold")));
+  assert(metric(e, "video_tx_frames") >= before_mute + 2);
+  assert(metric(e, "audio_packetization_video_hold") == 0);
+  assert(veil_media_engine_set_mic_muted(e, 0) == 0);
+  sender_muted = false;
+  assert(metric(e, "audio_packetization_video_hold") == 1);
+  drive(150, true);
   assert(metric(e, "audio_packetization_video_hold") == 1);
   assert(veil_media_engine_set_video_budget(e, 30, 1) == 0);
   drive(300, true);
