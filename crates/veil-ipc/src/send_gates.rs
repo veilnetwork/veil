@@ -22,6 +22,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// several stuck destinations together still leave room for a live one.
 pub(crate) const MAX_SENDS_PER_DESTINATION: usize = 4;
 
+/// Keep at least half of the process-wide retained-body budget available to
+/// other IPC connections. A 16 MiB frame (including a decoded batch copy) fits.
+pub(crate) const CONNECTION_SEND_BYTES: usize = 32 * 1024 * 1024;
+
 // What the cap is FOR: four stuck destinations together must still leave the
 // connection's pool room for a live one. Checked where it cannot be skipped.
 const _: () = assert!(
@@ -30,17 +34,25 @@ const _: () = assert!(
 );
 
 /// Admission happens before spawning, and both guards live until the body
-/// and any per-destination wait are gone. Busy senders receive NO_ROUTE and
+/// and any per-destination wait are gone. Busy senders receive SERVER_BUSY and
 /// retry from their existing host outbox; the IPC loop stays responsive.
 pub(crate) fn admit_queued_send(
     jobs: &Arc<Semaphore>,
     bytes: &Arc<Semaphore>,
+    connection_bytes: &Arc<Semaphore>,
     retained: usize,
-) -> Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+) -> Option<(
+    OwnedSemaphorePermit,
+    OwnedSemaphorePermit,
+    OwnedSemaphorePermit,
+)> {
     let count = Arc::clone(jobs).try_acquire_owned().ok()?;
     let cost = u32::try_from(retained.max(1)).ok()?;
+    let local = Arc::clone(connection_bytes)
+        .try_acquire_many_owned(cost)
+        .ok()?;
     let memory = Arc::clone(bytes).try_acquire_many_owned(cost).ok()?;
-    Some((count, memory))
+    Some((count, local, memory))
 }
 
 /// The gates of one IPC connection, created with it.
@@ -112,15 +124,46 @@ mod tests {
     fn queued_send_admission_bounds_both_waiters_and_bytes_and_releases_on_drop() {
         let jobs = Arc::new(Semaphore::new(2));
         let bytes = Arc::new(Semaphore::new(100));
-        let one = admit_queued_send(&jobs, &bytes, 60).unwrap();
-        assert!(admit_queued_send(&jobs, &bytes, 41).is_none());
+        let local = Arc::new(Semaphore::new(100));
+        let one = admit_queued_send(&jobs, &bytes, &local, 60).unwrap();
+        assert!(admit_queued_send(&jobs, &bytes, &local, 41).is_none());
         assert_eq!(jobs.available_permits(), 1); // failed byte admission rolls back
-        let two = admit_queued_send(&jobs, &bytes, 1).unwrap();
-        assert!(admit_queued_send(&jobs, &bytes, 1).is_none());
+        let two = admit_queued_send(&jobs, &bytes, &local, 1).unwrap();
+        assert!(admit_queued_send(&jobs, &bytes, &local, 1).is_none());
         drop((one, two));
         assert_eq!(jobs.available_permits(), 2);
         assert_eq!(bytes.available_permits(), 100);
-        assert!(admit_queued_send(&jobs, &bytes, usize::MAX).is_none());
+        assert_eq!(local.available_permits(), 100);
+        assert!(admit_queued_send(&jobs, &bytes, &local, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn one_connection_cannot_take_the_entire_shared_send_budget() {
+        let jobs_a = Arc::new(Semaphore::new(128));
+        let jobs_b = Arc::new(Semaphore::new(128));
+        let shared = Arc::new(Semaphore::new(64 * 1024 * 1024));
+        let bytes_a = Arc::new(Semaphore::new(CONNECTION_SEND_BYTES));
+        let bytes_b = Arc::new(Semaphore::new(CONNECTION_SEND_BYTES));
+        let frame = 16 * 1024 * 1024;
+        let a1 = admit_queued_send(&jobs_a, &shared, &bytes_a, frame).unwrap();
+        let a2 = admit_queued_send(&jobs_a, &shared, &bytes_a, frame).unwrap();
+        assert!(admit_queued_send(&jobs_a, &shared, &bytes_a, frame).is_none());
+        assert_eq!(jobs_a.available_permits(), 126);
+        let b = admit_queued_send(&jobs_b, &shared, &bytes_b, 512).unwrap();
+        drop((a1, a2, b));
+        assert_eq!(shared.available_permits(), 64 * 1024 * 1024);
+        assert_eq!(bytes_a.available_permits(), CONNECTION_SEND_BYTES);
+        assert_eq!(bytes_b.available_permits(), CONNECTION_SEND_BYTES);
+
+        // A failure at the global budget must also release the local charge.
+        let held = shared
+            .clone()
+            .try_acquire_many_owned(64 * 1024 * 1024)
+            .unwrap();
+        assert!(admit_queued_send(&jobs_a, &shared, &bytes_a, frame).is_none());
+        assert_eq!(bytes_a.available_permits(), CONNECTION_SEND_BYTES);
+        assert_eq!(jobs_a.available_permits(), 128);
+        drop(held);
     }
 
     const SLOW: [u8; 32] = [0x41; 32];
