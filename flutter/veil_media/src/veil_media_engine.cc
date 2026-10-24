@@ -319,6 +319,17 @@ template <typename F>
   return ran;
 }
 
+// Unlike a control request, destruction cannot abandon the Call or free its
+// dependencies after a scheduling timeout. Queue deletion already joins its
+// worker; keep ownership until cleanup actually runs on that worker. Each
+// cancelled attempt retains the same run_on lifetime handshake.
+template <typename F>
+void finish_on_worker(webrtc::TaskQueueBase* tq, F&& f) {
+  while (!run_on(tq, std::forward<F>(f))) {
+    vlog("media: teardown waiting for worker; live state retained");
+  }
+}
+
 // SSRC from the first 4 bytes of a node id (never 0 — 0 is an invalid SSRC).
 uint32_t ssrc_of(const uint8_t id[32]) {
   uint32_t s = (uint32_t(id[0]) << 24) | (uint32_t(id[1]) << 16) |
@@ -2039,13 +2050,23 @@ void veil_media_engine_destroy(VeilMediaEngine* engine) {
   if (engine->ws && engine->ws->android420_dispatcher)
     engine->ws->android420_dispatcher->Stop();
 #endif
-  veil_media_engine_stop_video(engine);
-  veil_media_engine_stop_audio(engine);
+  int video_stopped = veil_media_engine_stop_video(engine);
+  int audio_stopped = veil_media_engine_stop_audio(engine);
+  // Stop both capture paths before retrying a stalled queue. A cancelled
+  // stop still owns streams; Call's destructor requires all of them gone.
+  while (video_stopped != VEIL_MEDIA_OK)
+    video_stopped = veil_media_engine_stop_video(engine);
+  while (audio_stopped != VEIL_MEDIA_OK)
+    audio_stopped = veil_media_engine_stop_audio(engine);
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (engine->ws) {
     if (engine->ws->shim) engine->ws->shim->Stop();
-    engine->ws->video_call.reset();
-    engine->ws->call.reset();  // after streams (stop_audio) + shim->Stop()
+    finish_on_worker(engine->ws->video_worker_tq.get(), [&] {
+      engine->ws->video_call.reset();
+    });
+    finish_on_worker(engine->ws->worker_tq.get(), [&] {
+      engine->ws->call.reset();  // after streams (stop_audio) + shim->Stop()
+    });
     if (engine->ws->adm) {
       auto* adm = engine->ws->adm.get();
       run_on_adm_thread([adm] { adm->Terminate(); });
@@ -3295,8 +3316,12 @@ int veil_media_group_engine_get_local_video_frame(
 
 void veil_media_group_engine_destroy(VeilGroupMediaEngine* engine) {
   if (engine == nullptr) return;
-  veil_media_group_engine_stop_video(engine);
-  veil_media_group_engine_stop_audio(engine);
+  int video_stopped = veil_media_group_engine_stop_video(engine);
+  int audio_stopped = veil_media_group_engine_stop_audio(engine);
+  while (video_stopped != VEIL_MEDIA_OK)
+    video_stopped = veil_media_group_engine_stop_video(engine);
+  while (audio_stopped != VEIL_MEDIA_OK)
+    audio_stopped = veil_media_group_engine_stop_audio(engine);
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (engine->ws) {
     for (auto& entry : engine->ws->peers) {
@@ -3304,8 +3329,12 @@ void veil_media_group_engine_destroy(VeilGroupMediaEngine* engine) {
       entry.second->shim->Stop();
     }
     engine->ws->peers.clear();
-    engine->ws->video_call.reset();
-    engine->ws->call.reset();
+    finish_on_worker(engine->ws->video_worker_tq.get(), [&] {
+      engine->ws->video_call.reset();
+    });
+    finish_on_worker(engine->ws->worker_tq.get(), [&] {
+      engine->ws->call.reset();
+    });
     if (engine->ws->adm) {
       auto* adm = engine->ws->adm.get();
       run_on_adm_thread([adm] { adm->Terminate(); });

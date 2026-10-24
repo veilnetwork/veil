@@ -62,7 +62,9 @@ VeilMediaEngine *veil_media_engine_create(uint64_t veil_chan,
                                           const uint8_t *peer_id);
 
 /* Tear down: stops all streams, unregisters the recv callback, frees the
- * engine. Does NOT close the veil media channel (caller owns it). */
+ * engine. Does NOT close the veil media channel (caller owns it).
+ * Waits for worker cleanup, including retries after scheduling timeouts.
+ * The caller must not hold a lock needed by a media callback. */
 void veil_media_engine_destroy(VeilMediaEngine *engine);
 
 /* Rebind an already-running engine to a caller-owned, authenticated channel
@@ -111,6 +113,7 @@ int veil_media_engine_set_speaker_muted(VeilMediaEngine *engine, int muted);
  * never cross Dart. Channels remain caller-owned. */
 VeilGroupMediaEngine *veil_media_group_engine_create(
     const uint8_t *local_id);
+/* Same synchronous worker-cleanup contract as veil_media_engine_destroy. */
 void veil_media_group_engine_destroy(VeilGroupMediaEngine *engine);
 int veil_media_group_engine_add_peer(VeilGroupMediaEngine *engine,
                                      uint64_t veil_chan,
