@@ -328,6 +328,13 @@ pub type DeviceCertsFuture<'a> = std::pin::Pin<
 >;
 
 pub trait MlKemEkResolver: Send + Sync {
+    /// A unique delegated identity hint from previously verified local documents.
+    /// This alone grants no membership or encryption key: the caller must
+    /// resolve current certificates and match the exact physical device.
+    fn identity_hint_for_device(&self, _device: &[u8; 32]) -> Option<[u8; 32]> {
+        None
+    }
+
     /// Resolve from already-local, cryptographically verified records only.
     ///
     /// Latency-critical best-effort traffic can use this before starting the

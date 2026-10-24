@@ -767,7 +767,7 @@ async fn try_ratchet_seal(
     // walk the DHT for it waits seconds, and the sends behind it in the same
     // burst wait too — a slow seal is logged so a stall has a name.
     let resolve_started = std::time::Instant::now();
-    let pairing = ctx.session_instance_lookup.as_deref().and_then(|lookup| {
+    let session_pairing = ctx.session_instance_lookup.as_deref().and_then(|lookup| {
         // Linking preserves the physical key while replacing the temporary
         // identity. A still-live pre-link session can retain that old identity
         // until its next handshake. Our current master-authorized document is
@@ -776,6 +776,46 @@ async fn try_ratchet_seal(
             .own_device_pairing(dst_node_id)
             .or_else(|| lookup.session_pairing(dst_node_id))
     });
+    // After a cold restart the peer can answer over relays, without a direct
+    // session. Its verified certificate still binds physical device, identity
+    // and instance. An old certificate under the physical address is not a
+    // replacement for this identity binding.
+    let may_use_delegation = session_pairing.is_none_or(|pairing| pairing.identity == *dst_node_id);
+    let mut certificate_pairing = may_use_delegation
+        .then(|| ratchet.verified_pairing_for_device(dst_node_id, veil_util::unix_secs_now_u64()))
+        .flatten();
+    let mut cold_cert = None;
+    if may_use_delegation
+        && certificate_pairing.is_none()
+        && let Some(identity) = resolver.identity_hint_for_device(dst_node_id)
+    {
+        let certs = if cached_only {
+            resolver.resolve_device_certs_cached(identity)
+        } else {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                resolver.resolve_device_certs(identity),
+            )
+            .await
+            .ok()?
+        };
+        let now = veil_util::unix_secs_now_u64();
+        let mut matching = certs.into_iter().filter(|(device, cert)| {
+            device == dst_node_id && cert.node_id == identity && now <= cert.valid_until_unix
+        });
+        let (_, cert) = matching.next()?;
+        if matching.any(|(_, other)| other.instance_id != cert.instance_id) {
+            return None;
+        }
+        certificate_pairing = Some((identity, cert.instance_id));
+        cold_cert = Some(cert);
+    }
+    // A session can still describe the pre-link self identity. A current
+    // verified delegation replaces that self name, but never another
+    // identity's authenticated session or our current own-device document.
+    let pairing = certificate_pairing
+        .map(|(identity, instance)| veil_types::SessionPairing { identity, instance })
+        .or(session_pairing);
     let session_instance = pairing
         .map(|p| p.instance)
         .or_else(|| {
@@ -785,20 +825,24 @@ async fn try_ratchet_seal(
         })
         .or_else(|| ratchet.reply_instance(dst_node_id, veil_util::unix_secs_now_u64()));
     // What a CERTIFICATE is looked up under. The destination remains what the
-    // frame is routed to; only the key changes, and only when a session has
-    // proved an identity to change it to.
+    // frame is routed to; only the key changes, and only when a session or a
+    // current verified device certificate has proved the identity binding.
     let cert_key = pairing.map_or(*dst_node_id, |p| p.identity);
-    let paired = match session_instance {
-        Some(instance) => match resolver.resolve_cert_for_instance_cached(cert_key, instance) {
-            Some(c) => Some(c),
-            None if cached_only => None,
-            None => resolver.resolve_cert_for_instance(cert_key, instance).await,
-        },
-        // No live session, or a legacy handshake that proved no instance:
-        // nothing named a device, so the singular resolve below stays the
-        // answer — which is today's behaviour, and exact for the
-        // single-instance peer.
-        None => None,
+    let paired = if cold_cert.is_some() {
+        cold_cert
+    } else {
+        match session_instance {
+            Some(instance) => match resolver.resolve_cert_for_instance_cached(cert_key, instance) {
+                Some(c) => Some(c),
+                None if cached_only => None,
+                None => resolver.resolve_cert_for_instance(cert_key, instance).await,
+            },
+            // No live session, or a legacy handshake that proved no instance:
+            // nothing named a device, so the singular resolve below stays the
+            // answer — which is today's behaviour, and exact for the
+            // single-instance peer.
+            None => None,
+        }
     };
 
     // Local records first. The full walk is three DHT rounds and this is the
@@ -810,6 +854,9 @@ async fn try_ratchet_seal(
     // session. Returning no seal here would instead lose sender proof.
     let cert = match paired {
         Some(c) => c,
+        // This address was bound to ONE instance by a current certificate.
+        // A failed refresh must not replace it with another sibling's key.
+        None if certificate_pairing.is_some() => return None,
         None => match resolver.resolve_cert_cached(cert_key) {
             Some(c) => c,
             None if cached_only => return None,
@@ -1093,6 +1140,29 @@ pub(crate) async fn handle_ipc_send(
     //   through untouched.
     let ratchet_ok = !send.anonymous && !relay_wire_realtime && !relay_media_sealed;
     let remote = send.dst_node_id != *local_node_id;
+    // Keep this binding across async resolution: an ordinary device reply
+    // without its exact delegated certificate must not fall back to its old
+    // standalone physical key or plaintext.
+    let delegated_device = !relay_control_compat
+        && ratchet_ok
+        && remote
+        && !send.my_other_devices
+        && ctx
+            .session_instance_lookup
+            .as_deref()
+            .and_then(|lookup| lookup.own_device_pairing(&send.dst_node_id))
+            .is_none()
+        && ctx.ratchet.as_ref().is_some_and(|ratchet| {
+            ratchet.identity().is_some()
+                && (ratchet
+                    .verified_pairing_for_device(&send.dst_node_id, veil_util::unix_secs_now_u64())
+                    .is_some()
+                    || ctx
+                        .mlkem_ek_resolver
+                        .as_deref()
+                        .and_then(|resolver| resolver.identity_hint_for_device(&send.dst_node_id))
+                        .is_some())
+        });
 
     // THE PATH BEFORE THE SEAL. A ratchet seal spends a step of the sending
     // chain and the host persists it, whether or not the frame then goes
@@ -1175,6 +1245,10 @@ pub(crate) async fn handle_ipc_send(
         && (relay_control_compat && send.data.len() <= 4096
             || !relay_control_compat
                 && !send.my_other_devices
+                // A physical reply target is not a family identity. Treating
+                // it as one resolves its old self certificate and bypasses
+                // try_ratchet_seal's delegated identity binding entirely.
+                && !delegated_device
                 && ctx
                     .session_instance_lookup
                     .as_deref()
@@ -1502,6 +1576,9 @@ pub(crate) async fn handle_ipc_send(
     } else {
         None
     };
+    if delegated_device && sealed.is_none() {
+        return app_send_error(sink, ipc_send_err::NO_E2E_KEY).await;
+    }
     // Ratchet associated data names the stable identity, not this transport
     // device. Carry the exact identity snapshot used by the seal: a cold peer
     // cannot recover it from an unknown sending instance or physical address.
@@ -4817,6 +4894,374 @@ mod ratchet_send_tests {
             .expect("the peer opens it");
         assert_eq!(opened.plaintext, b"addressed to a device");
         assert!(opened.authenticated);
+    }
+
+    #[tokio::test]
+    async fn a_cold_device_reply_uses_its_verified_identity_without_a_session() {
+        const DEVICE: [u8; 32] = [0xB7; 32];
+        let fx = fixture(vec![RELAY]);
+        assert!(fx.pairing_device.is_none());
+        let cert = fx.certs.resolve_cert_cached(PEER).unwrap();
+        wlock!(fx.me.peer_ratchet_keys)
+            .entry(PEER)
+            .or_default()
+            .remember_with_device(
+                cert.instance_id,
+                cert.ratchet_x25519_pk,
+                cert.valid_until_unix,
+                Some(DEVICE),
+            );
+        let ctx = fx.ctx(true);
+        let (payload, _, _) = try_ratchet_seal(&ctx, &DEVICE, b"cold reply", false)
+            .await
+            .expect("a verified device certificate supplies the identity binding");
+        let opened = fx
+            .peer
+            .open_payload(&ME, &payload, veil_util::unix_secs_now_u64())
+            .expect("the current identity opens the reply");
+        assert_eq!(opened.plaintext, b"cold reply");
+        assert!(opened.authenticated);
+    }
+
+    #[tokio::test]
+    async fn a_delegated_device_reply_does_not_use_its_old_self_identity() {
+        const DEVICE: [u8; 32] = [0xB7; 32];
+        let fx = fixture(vec![RELAY]);
+        let cert = fx.certs.resolve_cert_cached(PEER).unwrap();
+        wlock!(fx.me.peer_ratchet_keys)
+            .entry(PEER)
+            .or_default()
+            .remember_with_device(
+                cert.instance_id,
+                cert.ratchet_x25519_pk,
+                cert.valid_until_unix,
+                Some(DEVICE),
+            );
+        let mut ctx = fx.ctx(true);
+        ctx.session_instance_lookup = Some(Arc::new(PairedDevice {
+            device: DEVICE,
+            pairing: veil_types::SessionPairing {
+                identity: DEVICE,
+                instance: cert.instance_id,
+            },
+        }));
+        let (payload, _, _) = try_ratchet_seal(&ctx, &DEVICE, b"delegated reply", false)
+            .await
+            .expect("current delegation precedes the device's old self identity");
+        assert_eq!(
+            fx.peer
+                .open_payload(&ME, &payload, veil_util::unix_secs_now_u64())
+                .unwrap()
+                .plaintext,
+            b"delegated reply"
+        );
+        ctx.session_instance_lookup = Some(Arc::new(PairedDevice {
+            device: DEVICE,
+            pairing: veil_types::SessionPairing {
+                identity: [0xE9; 32],
+                instance: cert.instance_id,
+            },
+        }));
+        assert!(
+            try_ratchet_seal(&ctx, &DEVICE, b"a different authenticated identity", false)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cold_device_reply_never_substitutes_a_siblings_certificate() {
+        const DEVICE: [u8; 32] = [0xB7; 32];
+        let (mut fx, _) = family_fixture();
+        let key = fx.peer.seed_ring.read().unwrap().current_ratchet_pk();
+        wlock!(fx.me.peer_ratchet_keys)
+            .entry(PEER)
+            .or_default()
+            .remember_with_device(PEER_INSTANCE, key, u64::MAX, Some(DEVICE));
+        // The current lookup only has the OTHER device's certificate.
+        let wrong = fx.certs.resolve_cert_cached(PEER).unwrap();
+        assert_eq!(wrong.instance_id, SIBLING_INSTANCE);
+        fx.certs = Arc::new(Certs(wrong));
+        let ctx = fx.ctx(true);
+        assert!(
+            try_ratchet_seal(&ctx, &DEVICE, b"not for the sibling", false)
+                .await
+                .is_none()
+        );
+        assert!(
+            try_ratchet_seal(&ctx, &DEVICE, b"cached only", true)
+                .await
+                .is_none()
+        );
+    }
+
+    struct ColdDeviceDirectory {
+        device: [u8; 32],
+        certs: Vec<([u8; 32], veil_types::VerifiedPeerCert)>,
+    }
+    impl veil_types::MlKemEkResolver for ColdDeviceDirectory {
+        fn identity_hint_for_device(&self, device: &[u8; 32]) -> Option<[u8; 32]> {
+            (*device == self.device).then_some(PEER)
+        }
+        fn resolve_device_certs_cached(
+            &self,
+            target: [u8; 32],
+        ) -> Vec<([u8; 32], veil_types::VerifiedPeerCert)> {
+            assert_eq!(target, PEER);
+            self.certs.clone()
+        }
+        fn resolve_cert(
+            &self,
+            _: [u8; 32],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<veil_types::VerifiedPeerCert>> + Send + '_>,
+        > {
+            Box::pin(async { None })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cold_document_hint_requires_the_exact_current_device_certificate() {
+        const DEVICE: [u8; 32] = [0xB7; 32];
+        let mut fx = fixture(vec![RELAY]);
+        let cert = fx.certs.resolve_cert_cached(PEER).unwrap();
+        assert!(rlock!(fx.me.peer_ratchet_keys).is_empty());
+        fx.certs = Arc::new(ColdDeviceDirectory {
+            device: DEVICE,
+            certs: vec![(DEVICE, cert.clone())],
+        });
+        let mut ctx = fx.ctx(true);
+        ctx.session_instance_lookup = Some(Arc::new(PairedDevice {
+            device: DEVICE,
+            pairing: veil_types::SessionPairing {
+                identity: DEVICE,
+                instance: cert.instance_id,
+            },
+        }));
+        let (payload, _, _) = try_ratchet_seal(&ctx, &DEVICE, b"first cold reply", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            fx.peer
+                .open_payload(&ME, &payload, veil_util::unix_secs_now_u64())
+                .unwrap()
+                .plaintext,
+            b"first cold reply"
+        );
+        for certs in [
+            vec![],
+            vec![([0xE9; 32], cert.clone())],
+            vec![(
+                DEVICE,
+                veil_types::VerifiedPeerCert {
+                    node_id: [0xE9; 32],
+                    ..cert.clone()
+                },
+            )],
+            vec![(
+                DEVICE,
+                veil_types::VerifiedPeerCert {
+                    valid_until_unix: 1,
+                    ..cert.clone()
+                },
+            )],
+            vec![
+                (DEVICE, cert.clone()),
+                (
+                    DEVICE,
+                    veil_types::VerifiedPeerCert {
+                        instance_id: [0x92; 16],
+                        ..cert.clone()
+                    },
+                ),
+            ],
+        ] {
+            fx.certs = Arc::new(ColdDeviceDirectory {
+                device: DEVICE,
+                certs,
+            });
+            let ctx = fx.ctx(true);
+            for cached in [false, true] {
+                assert!(
+                    try_ratchet_seal(&ctx, &DEVICE, b"no valid exact certificate", cached)
+                        .await
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_targeted_device_relay_reply_keeps_its_identity_binding() {
+        const DEVICE: [u8; 32] = [0xB7; 32];
+        let mut fx = fixture(vec![RELAY]);
+        let cert = fx.certs.resolve_cert_cached(PEER).unwrap();
+        fx.certs = Arc::new(ColdDeviceDirectory {
+            device: DEVICE,
+            certs: vec![(DEVICE, cert)],
+        });
+        let mut wh = sink().await;
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload_to(DEVICE, b"targeted relay reply"),
+            &fx.ctx(true),
+        )
+        .await
+        .unwrap();
+        let sent = fx.taken();
+        assert_eq!(sent.len(), 1);
+        let (hop, bytes) = &sent[0];
+        assert_eq!(*hop, RELAY);
+        let frame = veil_proto::delivery::ForwardPayload::decode(&bytes[veil_proto::HEADER_SIZE..])
+            .unwrap();
+        assert_eq!(frame.envelope.recipient.node_id, DEVICE);
+        assert_eq!(
+            fx.peer
+                .open_payload(&ME, &frame.envelope.payload, veil_util::unix_secs_now_u64())
+                .unwrap()
+                .plaintext,
+            b"targeted relay reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_delegated_reply_cannot_fall_back_to_an_old_physical_key() {
+        const DEVICE: [u8; 32] = [0xB7; 32];
+        let mut fx = fixture(vec![RELAY]);
+        fx.certs = Arc::new(ColdDeviceDirectory {
+            device: DEVICE,
+            certs: vec![],
+        });
+        let old_key = fx.peer.seed_ring.read().unwrap().current_ek().to_vec();
+        wlock!(fx.peer_mlkem).insert(
+            DEVICE,
+            (
+                veil_e2e::PeerMlKemKey::unattested(old_key),
+                std::time::Instant::now(),
+            ),
+        );
+        let mut wh = sink().await;
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload_to(DEVICE, b"wait for the exact delegated key"),
+            &fx.ctx(true),
+        )
+        .await
+        .unwrap();
+        assert!(
+            fx.taken().is_empty(),
+            "a missing delegated certificate must not select the old standalone physical key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_own_device_can_still_receive_its_encrypted_link_bootstrap() {
+        const DEVICE: [u8; 32] = [0xB7; 32];
+        let mut fx = fixture(vec![RELAY]);
+        fx.certs = Arc::new(ColdDeviceDirectory {
+            device: DEVICE,
+            certs: vec![],
+        });
+        let old_key = fx.peer.seed_ring.read().unwrap().current_ek().to_vec();
+        wlock!(fx.peer_mlkem).insert(
+            DEVICE,
+            (
+                veil_e2e::PeerMlKemKey::unattested(old_key),
+                std::time::Instant::now(),
+            ),
+        );
+        let mut ctx = fx.ctx(true);
+        ctx.session_instance_lookup = Some(Arc::new(AdoptedSiblingSession {
+            device: DEVICE,
+            current: veil_types::SessionPairing {
+                identity: ME,
+                instance: PEER_INSTANCE,
+            },
+        }));
+        let mut wh = sink().await;
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload_to(DEVICE, b"encrypted link bootstrap"),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fx.taken().len(),
+            1,
+            "the own document names a pending sibling before it has adopted our identity; its bootstrap still uses its temporary key"
+        );
+    }
+
+    #[test]
+    fn cold_device_binding_requires_unique_current_certificate_evidence() {
+        const DEVICE: [u8; 32] = [0xB7; 32];
+        let fx = fixture(vec![RELAY]);
+        let now = veil_util::unix_secs_now_u64();
+        let cert = fx.certs.resolve_cert_cached(PEER).unwrap();
+        let remember = |identity, instance, key, until, physical| {
+            wlock!(fx.me.peer_ratchet_keys)
+                .entry(identity)
+                .or_default()
+                .remember_with_device(instance, key, until, physical);
+        };
+        assert_eq!(fx.me.verified_pairing_for_device(&DEVICE, now), None);
+        remember(
+            PEER,
+            cert.instance_id,
+            cert.ratchet_x25519_pk,
+            now - 1,
+            Some(DEVICE),
+        );
+        assert_eq!(fx.me.verified_pairing_for_device(&DEVICE, now), None);
+        remember(
+            PEER,
+            cert.instance_id,
+            cert.ratchet_x25519_pk,
+            now + 10,
+            None,
+        );
+        assert_eq!(fx.me.verified_pairing_for_device(&DEVICE, now), None);
+        remember(
+            PEER,
+            cert.instance_id,
+            cert.ratchet_x25519_pk,
+            now + 10,
+            Some(DEVICE),
+        );
+        assert_eq!(
+            fx.me.verified_pairing_for_device(&DEVICE, now),
+            Some((PEER, cert.instance_id))
+        );
+        // A rotation of the same instance is the same binding.
+        remember(PEER, cert.instance_id, [0x91; 32], now + 10, Some(DEVICE));
+        assert_eq!(
+            fx.me.verified_pairing_for_device(&DEVICE, now),
+            Some((PEER, cert.instance_id))
+        );
+        remember(DEVICE, cert.instance_id, [0x94; 32], now + 10, Some(DEVICE));
+        assert_eq!(
+            fx.me.verified_pairing_for_device(&DEVICE, now),
+            Some((PEER, cert.instance_id)),
+            "the old self certificate is not another delegation"
+        );
+        // Neither a matching prefix nor a different identity is authority.
+        let mut other = DEVICE;
+        other[31] ^= 1;
+        assert_eq!(fx.me.verified_pairing_for_device(&other, now), None);
+        remember(
+            [0xE9; 32],
+            cert.instance_id,
+            [0x91; 32],
+            now + 10,
+            Some(DEVICE),
+        );
+        assert_eq!(fx.me.verified_pairing_for_device(&DEVICE, now), None);
+        wlock!(fx.me.peer_ratchet_keys).remove(&[0xE9; 32]);
+        remember(PEER, [0x92; 16], [0x93; 32], now + 10, Some(DEVICE));
+        assert_eq!(fx.me.verified_pairing_for_device(&DEVICE, now), None);
+        wlock!(fx.me.peer_ratchet_keys).clear();
+        assert_eq!(fx.me.verified_pairing_for_device(&DEVICE, now), None);
     }
 
     /// CONTROL: with no session to prove an identity, the destination is still

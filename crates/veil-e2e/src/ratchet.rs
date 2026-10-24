@@ -2627,6 +2627,46 @@ impl RatchetRuntime {
             .cloned()
     }
 
+    /// The unique delegated identity and instance whose verified certificate
+    /// names this physical device. A relayed reply has no live handshake to
+    /// supply that binding, but must still seal under the identity, not the
+    /// transport address. This selects a certificate lookup; sealing must
+    /// resolve that exact instance again. Expired, absent or ambiguous evidence
+    /// supplies no alias. Routes, instance prefixes and persisted conversations
+    /// alone never establish membership.
+    #[must_use]
+    pub fn verified_pairing_for_device(
+        &self,
+        device: &[u8; 32],
+        now_unix: u64,
+    ) -> Option<([u8; 32], [u8; 16])> {
+        let keys = self
+            .peer_ratchet_keys
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pairing = None;
+        for (identity, devices) in keys.iter() {
+            // A device's self identity is already its transport address; it
+            // is not a competing delegation. Linking keeps that physical key
+            // while adopting an identity, so the old self certificate may
+            // remain valid alongside the current delegated one.
+            if identity == device {
+                continue;
+            }
+            for entry in &devices.keys {
+                if entry.device.as_ref() != Some(device) || now_unix > entry.valid_until {
+                    continue;
+                }
+                let candidate = (*identity, entry.instance);
+                if pairing.is_some_and(|held| held != candidate) {
+                    return None;
+                }
+                pairing = Some(candidate);
+            }
+        }
+        pairing
+    }
+
     /// Prefer an endpoint that has actually answered us over an arbitrary
     /// registry row. This is a routing hint only: sealing still resolves a
     /// current certificate for the exact instance. Never select an unproven,

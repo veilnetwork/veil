@@ -198,6 +198,38 @@ impl IdentityDocumentFloor {
             .map(|floor| floor.document.clone())
     }
 
+    /// A cold sender may know the identity before its certificate caches have
+    /// been rebuilt. This is only a lookup hint: the resolver must revalidate
+    /// the current document, registry and exact device certificate afterwards.
+    /// The physical key's self document is not a second delegated identity.
+    pub(crate) fn identity_hint_for_device(&self, device: &[u8; 32], now: u64) -> Option<[u8; 32]> {
+        let state = lock!(self.state);
+        if state.unreadable {
+            return None;
+        }
+        let mut identities = state
+            .rows
+            .iter()
+            .filter(|(identity, floor)| {
+                let doc = &floor.document;
+                *identity != device
+                    && (!state.host_restored || floor.changed_revision <= state.durable_revision)
+                    && doc.valid_until_unix >= now
+                    && !doc
+                        .revoked_devices
+                        .iter()
+                        .any(|revoked| &revoked.device_id == device)
+                    && doc.identity_keys.iter().any(|key| {
+                        &key.device_id == device
+                            && key.valid_from_unix <= now
+                            && now <= key.valid_until_unix
+                    })
+            })
+            .map(|(identity, _)| *identity);
+        let identity = identities.next()?;
+        identities.next().is_none().then_some(identity)
+    }
+
     pub(crate) fn allows_cert(
         &self,
         peer: &[u8; 32],
@@ -416,6 +448,91 @@ mod tests {
     use veil_proto::identity_document::{
         ALGO_ED25519, DOC_SIG_CONTEXT, IdentityKey, RevokedDevice,
     };
+
+    #[test]
+    fn cold_device_identity_hint_survives_restore_but_never_guesses_membership() {
+        let first = document(1, 100, false);
+        let device = first.identity_keys[0].device_id;
+        let floor = IdentityDocumentFloor::ephemeral();
+        assert_eq!(floor.identity_hint_for_device(&device, 1000), None);
+        assert!(floor.observe(&first, 1000));
+        assert_eq!(
+            floor.identity_hint_for_device(&device, 1000),
+            Some(first.node_id)
+        );
+        let (_, bytes) = floor.export_host().unwrap();
+        let restored = IdentityDocumentFloor::ephemeral();
+        restored.import_host(&bytes, 1000).unwrap();
+        assert_eq!(
+            restored.identity_hint_for_device(&device, 1000),
+            Some(first.node_id)
+        );
+        assert_eq!(
+            restored.identity_hint_for_device(&device, first.valid_until_unix + 1),
+            None
+        );
+        let mut other_device = device;
+        other_device[31] ^= 1;
+        assert_eq!(restored.identity_hint_for_device(&other_device, 1000), None);
+
+        let sub = SigningKey::from_bytes(&blake3::derive_key(
+            "floor test device",
+            &1u64.to_le_bytes(),
+        ));
+        let mut self_doc = first.clone();
+        self_doc.node_id = device;
+        self_doc.master_pubkey = sub.verifying_key().to_bytes().to_vec();
+        let key = &mut self_doc.identity_keys[0];
+        key.master_sig = sub
+            .sign(&certify_message(
+                &device,
+                key.algo,
+                &key.pubkey,
+                &key.device_id,
+                key.valid_from_unix,
+                key.valid_until_unix,
+            ))
+            .to_bytes()
+            .to_vec();
+        let mut signed = DOC_SIG_CONTEXT.to_vec();
+        signed.extend_from_slice(&self_doc.canonical_signing_bytes());
+        self_doc.document_sig = sub.sign(&signed).to_bytes().to_vec();
+        assert!(floor.observe(&self_doc, 1000));
+        assert_eq!(
+            floor.identity_hint_for_device(&device, 1000),
+            Some(first.node_id)
+        );
+
+        // Two masters can legitimately delegate the same physical key. The
+        // lookup must not pick one by hash-map iteration order.
+        let mut second = document(2, 100, false);
+        let master = SigningKey::from_bytes(&blake3::derive_key(
+            "floor test master",
+            &2u64.to_le_bytes(),
+        ));
+        let sub = SigningKey::from_bytes(&blake3::derive_key(
+            "floor test device",
+            &1u64.to_le_bytes(),
+        ));
+        second.identity_keys[0] = first.identity_keys[0].clone();
+        let key = &mut second.identity_keys[0];
+        key.master_sig = master
+            .sign(&certify_message(
+                &second.node_id,
+                key.algo,
+                &key.pubkey,
+                &key.device_id,
+                key.valid_from_unix,
+                key.valid_until_unix,
+            ))
+            .to_bytes()
+            .to_vec();
+        let mut signed = DOC_SIG_CONTEXT.to_vec();
+        signed.extend_from_slice(&second.canonical_signing_bytes());
+        second.document_sig = sub.sign(&signed).to_bytes().to_vec();
+        assert!(floor.observe(&second, 1000));
+        assert_eq!(floor.identity_hint_for_device(&device, 1000), None);
+    }
 
     fn document(index: u64, issued: u64, revoked: bool) -> IdentityDocument {
         let master = SigningKey::from_bytes(&blake3::derive_key(
