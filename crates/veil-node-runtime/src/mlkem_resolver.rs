@@ -1972,6 +1972,12 @@ fn to_peer_cert(cert: VerifiedMlkemCert) -> veil_types::VerifiedPeerCert {
 }
 
 impl MlKemEkResolver for DhtMlKemEkResolver {
+    fn identity_hint_for_device(&self, device: &[u8; 32]) -> Option<[u8; 32]> {
+        self.cert_store
+            .document_floor
+            .identity_hint_for_device(device, unix_now())
+    }
+
     fn resolve_device_certs_cached(
         &self,
         target: NodeIdBytes,
@@ -2918,10 +2924,24 @@ mod tests {
         verify_mlkem_cert(&cert, &s.doc, now).expect("valid fixture certificate");
         dht.store_local(MlKemKeyCert::dht_key(&target, &instance), cert.encode());
         let resolver = make_test_resolver(Arc::clone(&dht));
+        assert_eq!(resolver.identity_hint_for_device(&device), None);
         let pairs = resolver.resolve_device_certs_cached(target);
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, device);
         assert_eq!(pairs[0].1.instance_id, instance);
+        assert_eq!(resolver.identity_hint_for_device(&device), Some(target));
+        let (_, host_state) = resolver.cert_store.export_peer_authorization().unwrap();
+        let restored_store = Arc::new(MlKemCertStore::ephemeral());
+        restored_store
+            .restore_peer_authorization(&host_state, now)
+            .unwrap();
+        let cold =
+            make_test_resolver_with_store(Arc::new(KademliaService::new([1; 32])), restored_store);
+        assert_eq!(cold.identity_hint_for_device(&device), Some(target));
+        assert!(
+            cold.resolve_device_certs_cached(target).is_empty(),
+            "the persisted hint alone is not a current certificate"
+        );
         registry.sig[0] ^= 1;
         dht.store_local(InstanceRegistry::dht_key(&target), registry.encode());
         assert!(
