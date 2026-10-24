@@ -275,8 +275,6 @@ pub struct DhtMlKemEkResolver {
 
 struct CheckedDocument {
     digest: [u8; 32],
-    issued_at: u64,
-    revoked: std::collections::HashSet<NodeIdBytes>,
 }
 
 /// What one certificate walk is for: a node, and the device of it when a
@@ -331,22 +329,14 @@ impl DhtMlKemEkResolver {
         }
         let digest = *blake3::hash(&doc.encode()).as_bytes();
         let mut checked = lock!(self.checked_documents);
-        if let Some(previous) = checked.get(&doc.node_id) {
-            if previous.digest == digest {
-                return true;
-            }
-            if doc.issued_at_unix < previous.issued_at
-                || doc.identity_keys.iter().any(|key| {
-                    previous.revoked.contains(&key.device_id)
-                        && !doc
-                            .revoked_devices
-                            .iter()
-                            .any(|revoked| revoked.device_id == key.device_id)
-                })
-            {
-                return false;
-            }
+        if let Some(previous) = checked.get(&doc.node_id)
+            && previous.digest == digest
+        {
+            return self.cert_store.peer_authorization_is_durable(&doc.node_id);
         }
+        // Monotonic authorization belongs to the shared floor above. This
+        // table only avoids repeated cache invalidation; a pre-restore replica
+        // must not outrank the host's durable floor.
         let now = unix_now();
         if verify_identity_document(doc, now).is_err() {
             return false;
@@ -406,24 +396,27 @@ impl DhtMlKemEkResolver {
         for cert in survivors {
             self.publish_ratchet_key(doc.node_id, &cert);
         }
-        let mut revoked = checked
-            .remove(&doc.node_id)
-            .map_or_else(std::collections::HashSet::new, |old| old.revoked);
-        revoked.extend(doc.revoked_devices.iter().map(|key| key.device_id));
         if checked.len() >= veil_proto::budget::MAX_PEER_MLKEM_CACHE
             && let Some(victim) = checked.keys().next().copied()
         {
             checked.remove(&victim);
         }
-        checked.insert(
-            doc.node_id,
-            CheckedDocument {
-                digest,
-                issued_at: doc.issued_at_unix,
-                revoked,
-            },
-        );
-        true
+        checked.insert(doc.node_id, CheckedDocument { digest });
+        self.cert_store.peer_authorization_is_durable(&doc.node_id)
+    }
+
+    async fn observe_document_ready(&self, doc: &IdentityDocument) -> bool {
+        if self.observe_document(doc) {
+            return true;
+        }
+        // A host checkpoint is local work, not an absent DHT record. Wait
+        // briefly rather than installing a 10-second negative resolve cache.
+        if self.cert_store.peer_authorization_is_pending(&doc.node_id)
+            && self.cert_store.wait_peer_authorization(&doc.node_id).await
+        {
+            return self.observe_document(doc);
+        }
+        false
     }
 
     pub(crate) fn refresh_local_document(&self, peer: NodeIdBytes) {
@@ -654,7 +647,10 @@ impl DhtMlKemEkResolver {
             if doc.is_none() {
                 self.log_dbg("mlkem_resolver.doc.dht_miss", &target_node_id, "");
             }
-            return doc.filter(|doc| self.observe_document(doc));
+            return match doc {
+                Some(doc) if self.observe_document_ready(&doc).await => Some(doc),
+                _ => None,
+            };
         }
         let doc_bytes = match self
             .dht_recursive_get(doc_key, self.step_timeout, direct_peer, |b| {
@@ -696,7 +692,7 @@ impl DhtMlKemEkResolver {
             );
             return None;
         }
-        self.observe_document(&doc).then_some(doc)
+        self.observe_document_ready(&doc).await.then_some(doc)
     }
 
     /// Resolve + verify the recipient's current ML-KEM cert — the full
@@ -2530,6 +2526,36 @@ mod tests {
                 .resolve_cert_for_instance_cached(target, a_instance)
                 .is_some()
         );
+        // The embedded host restores a stronger durable baseline AFTER native
+        // boot may already have seen an old replica and warmed its digest and
+        // certificate caches. Those shortcuts must consult the restored floor.
+        let baseline = resolver.cert_store.export_peer_authorization().unwrap().1;
+        dht.store_local(IdentityDocument::dht_key(&target), old.encode());
+        let embedded_boot = make_test_resolver(Arc::clone(&dht));
+        assert!(
+            embedded_boot
+                .resolve_cert_for_instance_cached(target, a_instance)
+                .is_some()
+        );
+        assert!(
+            embedded_boot
+                .resolve_cert_for_instance_cached(target, b_instance)
+                .is_some()
+        );
+        embedded_boot
+            .cert_store
+            .restore_peer_authorization(&baseline, now)
+            .unwrap();
+        assert!(
+            embedded_boot
+                .resolve_cert_for_instance_cached(target, b_instance)
+                .is_none()
+        );
+        assert!(
+            embedded_boot
+                .resolve_cert_for_instance_cached(target, a_instance)
+                .is_some()
+        );
         // An old replica and a still-valid revoked signing key must not restore
         // an authorization this receiver has already learned to retire.
         // Exercise the original digest-cache eviction and a process restart.
@@ -2561,6 +2587,51 @@ mod tests {
                 .resolve_cert_for_instance_cached(target, a_instance)
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn fetched_document_waits_for_host_commit_instead_of_becoming_a_dht_miss() {
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let mut fixture = crate::mlkem_cert_store::fixture::signer(0x31);
+        let now = unix_now();
+        fixture.doc.issued_at_unix = now - 1;
+        fixture.doc.valid_until_unix = now + 3600;
+        let mut message = veil_proto::identity_document::DOC_SIG_CONTEXT.to_vec();
+        message.extend_from_slice(&fixture.doc.canonical_signing_bytes());
+        fixture.doc.document_sig = SigningKey::from_bytes(&[0x31 ^ 0xff; 32])
+            .sign(&message)
+            .to_bytes()
+            .to_vec();
+        let target = fixture.doc.node_id;
+        verify_identity_document(&fixture.doc, now).unwrap();
+        let dht = Arc::new(KademliaService::new([1; 32]));
+        dht.store_local(IdentityDocument::dht_key(&target), fixture.doc.encode());
+        let resolver = make_test_resolver(dht);
+        resolver
+            .cert_store
+            .restore_peer_authorization(br#"{"version":1,"entries":[]}"#, now)
+            .unwrap();
+        let store = resolver.cert_store.clone();
+        let checkpoint = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while !store.peer_authorization_is_pending(&target) {
+                    tokio::task::yield_now().await;
+                }
+                store
+                    .acknowledge_peer_authorization(store.peer_authorization_version())
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        assert!(
+            resolver
+                .fetch_verified_document(target, None)
+                .await
+                .is_some()
+        );
+        checkpoint.await.unwrap();
+        assert!(resolver.cert_store.peer_authorization_is_durable(&target));
     }
 
     /// Resolver whose verified-cert cache we hold a handle to, so a test can

@@ -81,6 +81,12 @@ pub type CertKey = ([u8; 32], [u8; 16]);
 /// has to answer for people actually corresponded with.
 pub const MAX_REMEMBERED_CERTS: usize = 256;
 
+/// Maximum serialized host-owned peer authorization state. Contains signed
+/// public documents, including contact identifiers: store it inside the host's
+/// protected identity container, never in logs or anonymous diagnostics.
+pub const MAX_PEER_AUTHORIZATION_STATE_BYTES: usize =
+    crate::identity_document_floor::MAX_HOST_SNAPSHOT_BYTES;
+
 /// What the store held for one device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CertRecall {
@@ -165,6 +171,39 @@ pub fn peer_mlkem_certs_path(config_path: &Path) -> PathBuf {
 }
 
 impl MlKemCertStore {
+    /// Process-local revision; unchanged by repeated cache reads.
+    pub fn peer_authorization_version(&self) -> u64 {
+        self.document_floor.revision()
+    }
+
+    /// Non-destructive snapshot for the embedded host's protected storage.
+    pub fn export_peer_authorization(&self) -> Result<(u64, Vec<u8>), String> {
+        self.document_floor.export_host()
+    }
+
+    /// One-time boot restore of signed negative evidence, before app traffic.
+    pub fn restore_peer_authorization(&self, bytes: &[u8], now_unix: u64) -> Result<(), String> {
+        self.document_floor.import_host(bytes, now_unix)
+    }
+
+    /// Called only after the host has durably published the exported snapshot.
+    pub fn acknowledge_peer_authorization(&self, revision: u64) -> Result<(), String> {
+        self.document_floor.acknowledge_host(revision)
+    }
+
+    pub(crate) fn peer_authorization_is_durable(&self, peer: &[u8; 32]) -> bool {
+        self.document_floor.is_durable(peer)
+    }
+
+    pub(crate) fn peer_authorization_is_pending(&self, peer: &[u8; 32]) -> bool {
+        self.document_floor.is_pending(peer)
+    }
+
+    pub(crate) async fn wait_peer_authorization(&self, peer: &[u8; 32]) -> bool {
+        self.document_floor
+            .wait_durable(peer, std::time::Duration::from_secs(3))
+            .await
+    }
     /// The host owns persistence for an ephemeral/deniable node. Neither
     /// certificate copies nor peer authorization floors may escape to its
     /// runtime directory when the global persistence switch is off.
