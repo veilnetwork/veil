@@ -3844,8 +3844,11 @@ async fn reader_task(
                 // diff-audit L7: the daemon reports an async send failure (no
                 // route / terminal NACK) for a fire-and-forget send that already
                 // returned success. Surface it to the event sink as an
-                // ANON_SEND_FAILED event (payload = content_id) instead of
-                // silently dropping it, so an app that subscribes can react.
+                // ANON_SEND_FAILED event instead of silently dropping it. The
+                // payload is the daemon's error body (u16 code, optionally
+                // followed by correlation data), not a bare content_id. Local
+                // admission failures and loss-tolerant batch refusals carry
+                // only the code; they cannot identify individual network cells.
                 let event = VeilEvent {
                     kind: veilcore::proto::event_kind::ANON_SEND_FAILED,
                     payload: body.to_vec(),
