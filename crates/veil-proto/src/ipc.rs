@@ -2211,6 +2211,11 @@ pub mod ipc_send_err {
     /// mailbox was undiscoverable. Every unique `(relay, cookie)` also stayed
     /// in memory and was cloned in full on every tick (report17 V17-M6).
     pub const RENDEZVOUS_SLOTS_FULL: u16 = 11;
+    /// The daemon's bounded local send queue/body budget is full. No route
+    /// lookup or network send was attempted. Reliable callers may retry with
+    /// backoff; a loss-tolerant batch is rejected as a whole, without per-cell
+    /// receipts or a promise of network delivery.
+    pub const SERVER_BUSY: u16 = 12;
 }
 
 // ── RegisterOnionServicePayload ──────────────────────────────────────────────
