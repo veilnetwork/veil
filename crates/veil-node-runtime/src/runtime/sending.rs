@@ -720,6 +720,114 @@ impl NodeServices {
         local_lane: u8,
     ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
         use veil_types::AnonOnionSendError;
+        let sovereign = self
+            .identity
+            .sovereign_identity
+            .get()
+            .ok_or(AnonOnionSendError::NoIdentity)?;
+        let now = veil_util::unix_secs_now_u64();
+        let authorization = &self.identity.peer_mlkem_cert_store.document_floor;
+        // An explicit physical destination stays device-scoped. In particular,
+        // a sibling-to-sibling sync must not fan back out to the whole family.
+        let owner = own_chat_identity(&sovereign.document, &receiver_node_id, now)
+            .or_else(|| authorization.identity_hint_for_device(&receiver_node_id, now));
+        if let Some(identity) = owner {
+            return self
+                .send_anonymous_authenticated_device(
+                    receiver_node_id,
+                    Some(identity),
+                    None,
+                    target_app_id,
+                    target_endpoint_id,
+                    data,
+                    hop_count,
+                    reply,
+                    local_lane,
+                )
+                .await;
+        }
+        let ads = rendezvous_resolver::resolve_fresh_rendezvous_ads(
+            &self.dht,
+            &self.session_tx_registry,
+            &self.dispatcher.pending_recursive,
+            *self.identity.local_identity.node_id.as_bytes(),
+            &self.anonymity.rendezvous_resolve_cache,
+            &self.logger,
+            receiver_node_id,
+            std::time::Duration::from_millis(3500),
+            rendezvous_resolver::ResolveMode::ChatFamily,
+            authorization,
+        )
+        .await;
+        let targets = super::rendezvous_ad_binding::authorized_identity_devices(
+            authorization,
+            &receiver_node_id,
+            veil_util::unix_secs_now_u64(),
+        );
+        match targets {
+            None => {
+                self.send_anonymous_authenticated_device(
+                    receiver_node_id,
+                    None,
+                    Some(ads),
+                    target_app_id,
+                    target_endpoint_id,
+                    data,
+                    hop_count,
+                    reply,
+                    local_lane,
+                )
+                .await
+            }
+            Some(targets) if targets.is_empty() => Err(AnonOnionSendError::NoRendezvous),
+            Some(targets) => {
+                // The shared (identity, cookie) alias can belong to just one
+                // device at a relay. Every physical registration is independent.
+                // Send the same application frame to all authorized devices;
+                // app-level frame/message ids still deduplicate sibling copies.
+                // Bounded by MAX_IDENTITY_KEYS and concurrent so a missing A
+                // cannot hold an online B behind A's discovery timeout.
+                let results = futures::future::join_all(targets.into_iter().map(|device| {
+                    let prefetched = (device == receiver_node_id).then(|| ads.clone());
+                    self.send_anonymous_authenticated_device(
+                        device,
+                        Some(receiver_node_id),
+                        prefetched,
+                        target_app_id,
+                        target_endpoint_id,
+                        data,
+                        hop_count,
+                        reply,
+                        local_lane,
+                    )
+                }))
+                .await;
+                if results.iter().any(|result| result.is_ok()) {
+                    Ok(())
+                } else {
+                    results
+                        .into_iter()
+                        .next()
+                        .unwrap_or(Err(AnonOnionSendError::NoRendezvous))
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_anonymous_authenticated_device(
+        &self,
+        receiver_node_id: [u8; 32],
+        authorized_identity: Option<[u8; 32]>,
+        prefetched_ads: Option<Vec<veil_anonymity::rendezvous::RendezvousAd>>,
+        target_app_id: [u8; 32],
+        target_endpoint_id: u32,
+        data: &[u8],
+        hop_count: usize,
+        reply: Option<([u8; 32], u32)>,
+        local_lane: u8,
+    ) -> std::result::Result<(), veil_types::AnonOnionSendError> {
+        use veil_types::AnonOnionSendError;
 
         const AD_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(3500);
         const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -778,24 +886,30 @@ impl NodeServices {
         // a relay that no longer owns the cookie (`cookie_unknown`). Compare
         // independently-served candidates on a short cadence and repair the
         // local mirror with the newest publication.
-        let ads = rendezvous_resolver::resolve_fresh_rendezvous_ads(
-            &self.dht,
-            &self.session_tx_registry,
-            &self.dispatcher.pending_recursive,
-            *self.identity.local_identity.node_id.as_bytes(),
-            &self.anonymity.rendezvous_resolve_cache,
-            &self.logger,
-            receiver_node_id,
-            AD_RESOLVE_TIMEOUT,
-            rendezvous_resolver::ResolveMode::Any,
-            &self.identity.peer_mlkem_cert_store.document_floor,
-        )
-        .await;
-        let identity = self
-            .identity
-            .sovereign_identity
-            .get()
-            .and_then(|sov| own_chat_identity(&sov.document, &receiver_node_id, stall_now_unix))
+        let ads = match prefetched_ads {
+            Some(ads) => ads,
+            None => {
+                rendezvous_resolver::resolve_fresh_rendezvous_ads(
+                    &self.dht,
+                    &self.session_tx_registry,
+                    &self.dispatcher.pending_recursive,
+                    *self.identity.local_identity.node_id.as_bytes(),
+                    &self.anonymity.rendezvous_resolve_cache,
+                    &self.logger,
+                    receiver_node_id,
+                    AD_RESOLVE_TIMEOUT,
+                    rendezvous_resolver::ResolveMode::Any,
+                    &self.identity.peer_mlkem_cert_store.document_floor,
+                )
+                .await
+            }
+        };
+        let identity = authorized_identity
+            .or_else(|| {
+                self.identity.sovereign_identity.get().and_then(|sov| {
+                    own_chat_identity(&sov.document, &receiver_node_id, stall_now_unix)
+                })
+            })
             .or_else(|| {
                 self.identity
                     .peer_mlkem_cert_store
@@ -882,6 +996,18 @@ impl NodeServices {
             Some(&self.dispatcher.crypto.peer_cap_flags),
         )
         .await;
+
+        // Discovery can overlap a new revocation learned by a sibling send.
+        // Never let a self-bound physical ad bypass that identity's authority.
+        if let Some(identity) = authorized_identity
+            && !self.peer_device_proof_allowed(
+                &identity,
+                &receiver_node_id,
+                veil_util::unix_secs_now_u64(),
+            )
+        {
+            return Err(AnonOnionSendError::NoRendezvous);
+        }
 
         self.send_via_rendezvous_authenticated_on_local_lane(
             &chosen[0],

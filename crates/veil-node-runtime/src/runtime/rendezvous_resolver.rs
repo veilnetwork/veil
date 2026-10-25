@@ -39,6 +39,8 @@ mod cold_document_tests;
 #[derive(Clone, Copy)]
 pub(super) enum ResolveMode {
     Any,
+    /// Discover the current device family even when its shared alias has no ad.
+    ChatFamily,
     Stream {
         mailbox_cookie: [u8; 16],
         identity_mailbox_cookie: Option<[u8; 16]>,
@@ -55,8 +57,11 @@ impl ResolveMode {
         dht: &Arc<veil_dht::KademliaService>,
         authorization: &crate::identity_document_floor::IdentityDocumentFloor,
     ) -> Option<Vec<veil_anonymity::rendezvous::RendezvousAd>> {
+        if matches!(self, Self::ChatFamily) && authorization.current(receiver).is_none() {
+            return None;
+        }
         let ads = match self {
-            Self::Any => cache.get(receiver, now),
+            Self::Any | Self::ChatFamily => cache.get(receiver, now),
             Self::RefreshAhead => None,
             Self::Stream {
                 mailbox_cookie,
@@ -301,12 +306,13 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
     // Even when the cached document admits the signer, refresh delegation
     // along with its ad. Otherwise an active but revoked key's fresh ad keeps
     // the old document sufficient forever and the revocation is never learned.
-    let needs_delegation = slots.iter().any(|(_, _, candidates)| {
-        candidates.iter().any(|bytes| {
-            decode_rendezvous_ad(bytes)
-                .is_ok_and(|ad| veil_anonymity::rendezvous::verify_rendezvous_ad(&ad).is_err())
-        })
-    });
+    let needs_delegation = matches!(mode, ResolveMode::ChatFamily)
+        || slots.iter().any(|(_, _, candidates)| {
+            candidates.iter().any(|bytes| {
+                decode_rendezvous_ad(bytes)
+                    .is_ok_and(|ad| veil_anonymity::rendezvous::verify_rendezvous_ad(&ad).is_err())
+            })
+        });
     if needs_delegation {
         use veil_proto::identity_document::IdentityDocument;
 
