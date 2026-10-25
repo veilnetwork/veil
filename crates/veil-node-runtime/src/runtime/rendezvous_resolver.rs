@@ -39,6 +39,8 @@ mod cold_document_tests;
 #[derive(Clone, Copy)]
 pub(super) enum ResolveMode {
     Any,
+    /// Opportunistic route read; does not subscribe the device to refresh-ahead.
+    Prefetch,
     /// Discover the current device family even when its shared alias has no ad.
     ChatFamily,
     Stream {
@@ -61,7 +63,7 @@ impl ResolveMode {
             return None;
         }
         let ads = match self {
-            Self::Any => cache.get(receiver, now),
+            Self::Any | Self::Prefetch => cache.get(receiver, now),
             Self::ChatFamily => cache.get_with_document_check(receiver, now),
             Self::RefreshAhead => None,
             Self::Stream {
@@ -89,6 +91,65 @@ impl ResolveMode {
 }
 
 // ── T1.4 P5c: rendezvous-replica resolver ──────────────────────
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn send_with_family_route_prefetch<F: std::future::Future>(
+    dht: &Arc<veil_dht::KademliaService>,
+    registry: &Arc<std::sync::RwLock<veil_session::SessionTxRegistry>>,
+    pending: &Arc<
+        std::sync::Mutex<std::collections::HashMap<[u8; 16], veil_dispatcher::PendingRecursive>>,
+    >,
+    local_node_id: [u8; 32],
+    cache: &Arc<super::anonymity_state::RendezvousResolveCache>,
+    logger: &Arc<veil_observability::NodeLogger>,
+    receiver: [u8; 32],
+    timeout: std::time::Duration,
+    authorization: &crate::identity_document_floor::IdentityDocumentFloor,
+    send: F,
+) -> F::Output {
+    // With a fresh family cache there is no document wait to overlap. This is
+    // only an optimization gate: `send` still revalidates the cached routes.
+    if cache
+        .get_with_document_check(&receiver, veil_util::unix_secs_now_u64())
+        .is_some()
+    {
+        return send.await;
+    }
+    // Reads of already-known physical routes can overlap the family document
+    // refresh. This snapshot NEVER authorizes a send: `send` must still select
+    // its targets from the refreshed document and fence each exact device.
+    let known = super::rendezvous_ad_binding::authorized_identity_devices(
+        authorization,
+        &receiver,
+        veil_util::unix_secs_now_u64(),
+    )
+    .unwrap_or_default();
+    let prefetch =
+        futures::future::join_all(known.into_iter().filter(|device| *device != receiver).map(
+            |device| {
+                resolve_fresh_rendezvous_ads(
+                    dht,
+                    registry,
+                    pending,
+                    local_node_id,
+                    cache,
+                    logger,
+                    device,
+                    timeout,
+                    ResolveMode::Prefetch,
+                    authorization,
+                )
+            },
+        ));
+    futures::pin_mut!(prefetch, send);
+    // Do not hold an online destination behind a now-revoked/missing device's
+    // speculative read. There are no detached tasks, and cancellation releases
+    // the ordinary pending-query entries and single-flight cache guards.
+    match futures::future::select(send, prefetch).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right((_, send)) => send.await,
+    }
+}
 //
 // Replica-aware lookup for the receiver's RendezvousAd. Apps call
 // `LocalAppMsg::LookupRendezvousReplicas` → IPC server → this impl, which
@@ -219,7 +280,9 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
         // Resolving self still WORKS — the walk below runs as asked, and the
         // mailbox drain's cold path depends on it. It just does not buy a
         // standing subscription to re-walk forever.
-        note_send_target(resolve_cache, receiver_id, local_node_id);
+        if !matches!(mode, ResolveMode::Prefetch) {
+            note_send_target(resolve_cache, receiver_id, local_node_id);
+        }
         if let Some(ads) = mode.cached_ads(resolve_cache, &receiver_id, now, dht, authorization) {
             return ads;
         }

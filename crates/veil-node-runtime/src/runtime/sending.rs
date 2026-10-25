@@ -746,7 +746,7 @@ impl NodeServices {
                 )
                 .await;
         }
-        let ads = rendezvous_resolver::resolve_fresh_rendezvous_ads(
+        rendezvous_resolver::send_with_family_route_prefetch(
             &self.dht,
             &self.session_tx_registry,
             &self.dispatcher.pending_recursive,
@@ -755,63 +755,78 @@ impl NodeServices {
             &self.logger,
             receiver_node_id,
             std::time::Duration::from_millis(3500),
-            rendezvous_resolver::ResolveMode::ChatFamily,
             authorization,
-        )
-        .await;
-        let targets = super::rendezvous_ad_binding::authorized_identity_devices(
-            authorization,
-            &receiver_node_id,
-            veil_util::unix_secs_now_u64(),
-        );
-        match targets {
-            None => {
-                self.send_anonymous_authenticated_device(
+            async {
+                let ads = rendezvous_resolver::resolve_fresh_rendezvous_ads(
+                    &self.dht,
+                    &self.session_tx_registry,
+                    &self.dispatcher.pending_recursive,
+                    *self.identity.local_identity.node_id.as_bytes(),
+                    &self.anonymity.rendezvous_resolve_cache,
+                    &self.logger,
                     receiver_node_id,
-                    None,
-                    Some(ads),
-                    target_app_id,
-                    target_endpoint_id,
-                    data,
-                    hop_count,
-                    reply,
-                    local_lane,
+                    std::time::Duration::from_millis(3500),
+                    rendezvous_resolver::ResolveMode::ChatFamily,
+                    authorization,
                 )
-                .await
-            }
-            Some(targets) if targets.is_empty() => Err(AnonOnionSendError::NoRendezvous),
-            Some(targets) => {
-                // The shared (identity, cookie) alias can belong to just one
-                // device at a relay. Every physical registration is independent.
-                // Send the same application frame to all authorized devices;
-                // app-level frame/message ids still deduplicate sibling copies.
-                // Bounded by MAX_IDENTITY_KEYS and concurrent so a missing A
-                // cannot hold an online B behind A's discovery timeout.
-                let results = futures::future::join_all(targets.into_iter().map(|device| {
-                    let prefetched = (device == receiver_node_id).then(|| ads.clone());
-                    self.send_anonymous_authenticated_device(
-                        device,
-                        Some(receiver_node_id),
-                        prefetched,
-                        target_app_id,
-                        target_endpoint_id,
-                        data,
-                        hop_count,
-                        reply,
-                        local_lane,
-                    )
-                }))
                 .await;
-                if results.iter().any(|result| result.is_ok()) {
-                    Ok(())
-                } else {
-                    results
-                        .into_iter()
-                        .next()
-                        .unwrap_or(Err(AnonOnionSendError::NoRendezvous))
+                let targets = super::rendezvous_ad_binding::authorized_identity_devices(
+                    authorization,
+                    &receiver_node_id,
+                    veil_util::unix_secs_now_u64(),
+                );
+                match targets {
+                    None => {
+                        self.send_anonymous_authenticated_device(
+                            receiver_node_id,
+                            None,
+                            Some(ads),
+                            target_app_id,
+                            target_endpoint_id,
+                            data,
+                            hop_count,
+                            reply,
+                            local_lane,
+                        )
+                        .await
+                    }
+                    Some(targets) if targets.is_empty() => Err(AnonOnionSendError::NoRendezvous),
+                    Some(targets) => {
+                        // The shared (identity, cookie) alias can belong to just one
+                        // device at a relay. Every physical registration is independent.
+                        // Send the same application frame to all authorized devices;
+                        // app-level frame/message ids still deduplicate sibling copies.
+                        // Bounded by MAX_IDENTITY_KEYS and concurrent so a missing A
+                        // cannot hold an online B behind A's discovery timeout.
+                        let results =
+                            futures::future::join_all(targets.into_iter().map(|device| {
+                                let prefetched = (device == receiver_node_id).then(|| ads.clone());
+                                self.send_anonymous_authenticated_device(
+                                    device,
+                                    Some(receiver_node_id),
+                                    prefetched,
+                                    target_app_id,
+                                    target_endpoint_id,
+                                    data,
+                                    hop_count,
+                                    reply,
+                                    local_lane,
+                                )
+                            }))
+                            .await;
+                        if results.iter().any(|result| result.is_ok()) {
+                            Ok(())
+                        } else {
+                            results
+                                .into_iter()
+                                .next()
+                                .unwrap_or(Err(AnonOnionSendError::NoRendezvous))
+                        }
+                    }
                 }
-            }
-        }
+            },
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
