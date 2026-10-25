@@ -4277,15 +4277,24 @@ impl AnonStreamHub {
         channel: u64,
         cipher: Arc<crate::media::MediaCipher>,
     ) -> Option<Arc<MediaRoutes>> {
-        self.media_cells.as_ref().map(|cores| {
-            MediaRoutes::new(
+        match self.cells.as_ref() {
+            HubCells::Circuit(core) => Some(MediaRoutes::new(
                 peer,
                 channel,
-                cores.clone(),
+                // A close cancels these producers and retires their circuits.
+                // Sharing the hub's producers would close concurrent calls and
+                // permanently disable fallback opening for subsequent calls.
+                [
+                    core.isolated_producer(LocalMediaPlane::Primary),
+                    core.isolated_producer(LocalMediaPlane::Secondary),
+                    core.isolated_producer(LocalMediaPlane::Screen),
+                    core.isolated_producer(LocalMediaPlane::Control),
+                ],
                 cipher,
                 Some(Arc::clone(&self._sender)),
-            )
-        })
+            )),
+            HubCells::Anon(_) => None,
+        }
     }
 
     fn media_producer(&self, plane: LocalMediaPlane) -> Option<&CircuitCells> {
@@ -5911,6 +5920,10 @@ fn retire_circuits_later(
 #[cfg(all(test, unix))]
 #[path = "anon_stream/source_lane_tests.rs"]
 mod source_lane_tests;
+
+#[cfg(all(test, unix))]
+#[path = "anon_stream/call_scope_tests.rs"]
+mod call_scope_tests;
 
 #[cfg(all(test, feature = "test-low-difficulty"))]
 #[path = "anon_stream/local_enqueue_tests.rs"]
