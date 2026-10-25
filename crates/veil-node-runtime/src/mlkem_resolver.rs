@@ -1765,6 +1765,22 @@ where
 
     let deadline = tokio::time::Instant::now() + timeout;
     let query_ids: Vec<_> = sent.iter().map(|q| q.query_id).collect();
+    struct PendingQueries<'a> {
+        pending: &'a Mutex<std::collections::HashMap<[u8; 16], PendingRecursive>>,
+        ids: Vec<[u8; 16]>,
+    }
+    impl Drop for PendingQueries<'_> {
+        fn drop(&mut self) {
+            let mut pending = lock!(self.pending);
+            for id in &self.ids {
+                pending.remove(id);
+            }
+        }
+    }
+    let queries = PendingQueries {
+        pending: pending_recursive,
+        ids: query_ids,
+    };
     let mut replies: futures::stream::FuturesUnordered<_> = sent
         .into_iter()
         .map(|query| async move {
@@ -1784,11 +1800,7 @@ where
         }
     }
     // Dispatcher removes successful entries; this also clears timed-out ones.
-    let mut pending = lock!(pending_recursive);
-    for query_id in query_ids {
-        pending.remove(&query_id);
-    }
-    drop(pending);
+    drop(queries);
 
     // Exact duplicates from replicated holders carry no additional routing
     // information and only inflate the downstream sort/cache.
@@ -2182,6 +2194,34 @@ fn registry_freshness(r: &InstanceRegistry) -> (u64, u64) {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn cancelled_candidate_lookup_releases_its_pending_queries() {
+        let dht = Arc::new(KademliaService::new([0x71; 32]));
+        let mut reg = SessionTxRegistry::new();
+        let mut rx = reg.register([0x72; 32]);
+        let registry = Arc::new(RwLock::new(reg));
+        let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        {
+            let mut lookup = Box::pin(recursive_dht_get_candidates(
+                &dht,
+                &registry,
+                &pending,
+                [0x71; 32],
+                [0x73; 32],
+                std::time::Duration::from_secs(60),
+                1,
+                |_| true,
+            ));
+            assert!(futures::poll!(lookup.as_mut()).is_pending());
+            assert!(rx.try_recv().is_ok(), "lookup must actually be in flight");
+            assert_eq!(lock!(pending).len(), 1);
+        }
+        assert!(
+            lock!(pending).is_empty(),
+            "cancelled lookup retained a pending slot"
+        );
+    }
 
     #[test]
     fn a_cached_certificate_expires_when_its_owner_said_it_would() {
