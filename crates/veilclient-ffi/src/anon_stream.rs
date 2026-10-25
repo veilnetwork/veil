@@ -4679,7 +4679,9 @@ fn try_open_circuit(
                 let idle_for = circuit_idle_for(&activity_bg);
                 if mode == CircuitMode::PublishedRendezvous {
                     let have = circuit_slot.lock().await.len();
-                    let want = services_bg.local_published_rendezvous_relays().len();
+                    let mut wanted = services_bg.local_published_rendezvous_relays();
+                    retain_stream_circuit_relays(&services_bg, &mut wanted);
+                    let want = wanted.len();
                     if want > have
                         && generation_age >= CIRCUIT_PUBLISHED_RELAY_EXPAND_AFTER
                         && idle_for >= CIRCUIT_PUBLISHED_RELAY_EXPAND_AFTER
@@ -4854,6 +4856,28 @@ type OpenedInboundCircuit = (
     mpsc::Receiver<Vec<u8>>,
 );
 
+/// A receive-anonymous/mailbox peer need not hold relay circuit state. Do not
+/// repeatedly rebuild a healthy stream pool to cover a publisher whose
+/// authenticated handshake explicitly says it cannot carry onion circuits.
+/// Unknown remote relays remain candidates: their directory is resolved by
+/// normal circuit opening, without requiring a direct session first.
+fn retain_stream_circuit_relays(
+    services: &veil_node_runtime::NodeServices,
+    relays: &mut Vec<[u8; 32]>,
+) {
+    let flags = services
+        .dispatcher
+        .crypto
+        .peer_cap_flags
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    relays.retain(|relay| {
+        flags
+            .get(relay)
+            .is_none_or(|f| f & veil_proto::session::cap_flags::ANONYMITY_RELAY != 0)
+    });
+}
+
 async fn open_inbound_circuits(
     services: &veil_node_runtime::NodeServices,
     me: [u8; 32],
@@ -4883,6 +4907,7 @@ async fn open_inbound_circuits(
                     }
                 }
             }
+            retain_stream_circuit_relays(services, &mut relays);
             if relays.is_empty() {
                 return Err(AnonOnionSendError::NoRendezvous);
             }
