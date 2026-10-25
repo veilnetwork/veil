@@ -2451,9 +2451,7 @@ impl FrameDispatcher {
                     // flood the local store past its per-origin byte cap via the
                     // recursive plane — the same accounting the direct STORE path
                     // (handle_store) enforces.
-                    if !self
-                        .dht
-                        .store_with_origin(q.target_key, q.payload.clone(), origin)
+                    if !self.store_discovery_value(q.target_key, q.payload.clone(), origin)
                     {
                         // per-origin byte cap exceeded — drop silently
                         // (DoS-resistance: do not sign a failure response).
@@ -2917,7 +2915,7 @@ impl FrameDispatcher {
                 {
                     // payload = raw value bytes; mirror into the local DHT so
                     // subsequent lookups resolve without another round-trip.
-                    self.dht.store_local(p.target_key, resp.payload.clone());
+                    self.mirror_discovery_value(p.target_key, resp.payload.clone());
                 }
                 recursive_query_type::STORE => {
                     // payload = `[1]` on success; nothing to cache — just signal.
