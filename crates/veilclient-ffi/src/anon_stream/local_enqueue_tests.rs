@@ -599,6 +599,38 @@ struct Fixture {
     _outbox: veil_session::FrameOutbox,
 }
 
+/// A host retaining the retired C entry point must not make this receiver
+/// undiscoverable. Exercise the real publisher and verify its signed DHT ad,
+/// rather than only checking that the compatibility call returns.
+#[tokio::test]
+async fn retired_publish_pause_does_not_suppress_stream_rendezvous() {
+    use veil_anonymity::rendezvous::{
+        MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, verify_rendezvous_ad,
+    };
+
+    let mut f = fixture().await;
+    let services = f.runtime.access();
+    let receiver = services.local_node_id();
+    let cookie = [0x59; COOKIE_LEN];
+    crate::veil_debug_set_publish_pause(1);
+    services.publish_stream_rendezvous_ad(f.hop, cookie);
+    crate::veil_debug_set_publish_pause(0);
+    let ad = (0..MAX_RENDEZVOUS_AD_SLOTS)
+        .filter_map(|slot| {
+            services
+                .dht
+                .get_local(&rendezvous_ad_dht_key_at(&receiver, slot))
+        })
+        .filter_map(|bytes| decode_rendezvous_ad(&bytes).ok())
+        .find(|ad| ad.auth_cookie == cookie);
+    f.runtime.stop().await.unwrap();
+
+    let ad = ad.expect("legacy debug calls must not suppress a receiver's new ad");
+    verify_rendezvous_ad(&ad).expect("the published ad must remain authentic");
+    assert_eq!(ad.receiver_node_id, receiver);
+    assert_eq!(ad.rendezvous_node_id, f.hop);
+}
+
 #[tokio::test]
 async fn exact_call_receiver_uses_a_matching_route_even_when_another_relay_is_first() {
     let mut f = fixture().await;

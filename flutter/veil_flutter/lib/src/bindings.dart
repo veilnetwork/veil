@@ -2301,13 +2301,6 @@ final void Function(int) veilDebugSetRtTrace = nativeLib
     .lookup<NativeFunction<Void Function(Int32)>>('veil_debug_set_rt_trace')
     .asFunction();
 
-// debug_set_publish_pause(on) — pause/resume the embedded node's periodic
-// publish machinery (RTT-spike experiment; mid-call measurement only).
-final void Function(int) veilDebugSetPublishPause = nativeLib
-    .lookup<NativeFunction<Void Function(Int32)>>(
-        'veil_debug_set_publish_pause')
-    .asFunction();
-
 // media_channel_set_batching(chan, mode) -> 0 ok / -1 unknown/unsupported.
 // Modes: 0 off, 1 legacy audio+video batch, 2 compact relay cells.
 // A wire-format selector only: every mode seals identically.
