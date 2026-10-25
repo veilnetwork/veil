@@ -39,6 +39,41 @@ pub(crate) fn ad_binding_ok(dht: &Arc<KademliaService>, ad: &RendezvousAd) -> bo
         .is_ok()
 }
 
+/// Network consumers must consult the same monotone authorization floor as
+/// certificate resolution, including host checkpoint state. A signed old ad or
+/// an old DHT document cannot restore a device already known to be revoked.
+pub(crate) fn peer_ad_binding_ok(
+    dht: &Arc<KademliaService>,
+    authorization: &crate::identity_document_floor::IdentityDocumentFloor,
+    ad: &RendezvousAd,
+) -> bool {
+    if veil_anonymity::rendezvous::verify_rendezvous_ad(ad).is_ok() {
+        return true;
+    }
+    use veil_proto::identity_document::IdentityDocument;
+    let now = veil_util::unix_secs_now_u64();
+    if let Some(doc) = dht
+        .get_local(&IdentityDocument::dht_key(&ad.receiver_node_id))
+        .and_then(|bytes| IdentityDocument::decode(&bytes).ok())
+        .filter(|doc| doc.node_id == ad.receiver_node_id)
+    {
+        authorization.observe(&doc, now);
+    }
+    let Some(doc) = authorization.current(&ad.receiver_node_id) else {
+        return false;
+    };
+    if veil_identity::verify::verify_identity_document(&doc, now).is_err() {
+        return false;
+    }
+    let keys: Vec<_> = doc
+        .identity_keys
+        .iter()
+        .filter(|key| authorization.allows_device_proof(&doc.node_id, &key.device_id, now))
+        .map(|key| key.pubkey.clone())
+        .collect();
+    veil_anonymity::rendezvous::verify_rendezvous_ad_delegated(ad, &doc.node_id, &keys).is_ok()
+}
+
 /// The device pubkeys a VERIFIED identity document names for `node_id`.
 ///
 /// The full verifier ladder, clock included: this document came off the
@@ -47,6 +82,9 @@ fn identity_device_keys(dht: &Arc<KademliaService>, node_id: &[u8; 32]) -> Optio
     let key = veil_proto::identity_document::IdentityDocument::dht_key(node_id);
     let bytes = dht.get_local(&key)?;
     let doc = veil_proto::identity_document::IdentityDocument::decode(&bytes).ok()?;
+    if &doc.node_id != node_id {
+        return None;
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -98,6 +136,394 @@ mod tests {
         RendezvousPublisherEntry, decode_rendezvous_ad, rendezvous_ad_dht_key, verify_rendezvous_ad,
     };
     use veil_observability::NodeLogger;
+
+    fn delegated_document(
+        seed: u8,
+        issued: u64,
+        revoke_second: bool,
+    ) -> (
+        veil_proto::identity_document::IdentityDocument,
+        [ed25519_dalek::SigningKey; 2],
+    ) {
+        use ed25519_dalek::{Signer, SigningKey};
+        use veil_crypto::identity::{certify_message, compute_node_id};
+        use veil_proto::identity_document::{
+            ALGO_ED25519, DOC_SIG_CONTEXT, IdentityDocument, IdentityKey, RevokedDevice,
+        };
+        let master = SigningKey::from_bytes(&[seed; 32]);
+        let devices = [
+            SigningKey::from_bytes(&[seed + 1; 32]),
+            SigningKey::from_bytes(&[seed + 2; 32]),
+        ];
+        let identity = compute_node_id(master.verifying_key().as_bytes());
+        let until = issued + 7200;
+        let mut keys = devices
+            .iter()
+            .map(|device| {
+                let pk = device.verifying_key().to_bytes();
+                let device_id = compute_node_id(&pk);
+                IdentityKey {
+                    algo: ALGO_ED25519,
+                    pubkey: pk.to_vec(),
+                    device_id,
+                    valid_from_unix: issued,
+                    valid_until_unix: until,
+                    master_sig: master
+                        .sign(&certify_message(
+                            &identity,
+                            ALGO_ED25519,
+                            &pk,
+                            &device_id,
+                            issued,
+                            until,
+                        ))
+                        .to_bytes()
+                        .to_vec(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let revoked = if revoke_second {
+            let device_id = keys.pop().unwrap().device_id;
+            vec![RevokedDevice {
+                device_id,
+                master_sig: master
+                    .sign(&RevokedDevice::signing_message(&identity, &device_id))
+                    .to_bytes()
+                    .to_vec(),
+            }]
+        } else {
+            vec![]
+        };
+        let mut document = IdentityDocument {
+            node_id: identity,
+            master_algo: ALGO_ED25519,
+            master_pubkey: master.verifying_key().to_bytes().to_vec(),
+            issued_at_unix: issued,
+            valid_until_unix: until,
+            sig_key_idx: 0,
+            revoked_devices: revoked,
+            identity_keys: keys,
+            document_sig: vec![],
+        };
+        let mut message = DOC_SIG_CONTEXT.to_vec();
+        message.extend_from_slice(&document.canonical_signing_bytes());
+        document.document_sig = devices[0].sign(&message).to_bytes().to_vec();
+        let document = IdentityDocument::decode(&document.encode()).unwrap();
+        (document, devices)
+    }
+
+    fn delegated_ad_bytes(
+        receiver: [u8; 32],
+        signer: &ed25519_dalek::SigningKey,
+        now: u64,
+    ) -> Vec<u8> {
+        veil_anonymity::rendezvous::sign_rendezvous_ad(
+            receiver,
+            [0x41; 32],
+            [0x42; 16],
+            [0x43; 32],
+            now,
+            now + 3600,
+            &[],
+            &[],
+            &[],
+            &base64::engine::general_purpose::STANDARD.encode(signer.verifying_key().to_bytes()),
+            &base64::engine::general_purpose::STANDARD.encode(signer.to_bytes()),
+            veil_types::SignatureAlgorithm::Ed25519,
+        )
+        .unwrap()
+    }
+
+    fn delegated_ad(
+        receiver: [u8; 32],
+        signer: &ed25519_dalek::SigningKey,
+        now: u64,
+    ) -> RendezvousAd {
+        decode_rendezvous_ad(&delegated_ad_bytes(receiver, signer, now)).unwrap()
+    }
+
+    #[test]
+    fn an_identity_ad_refuses_a_revoked_device_even_with_a_valid_signature() {
+        use veil_proto::identity_document::IdentityDocument;
+        let now = veil_util::unix_secs_now_u64();
+        let (before, devices) = delegated_document(11, now - 60, false);
+        let (revoked, _) = delegated_document(11, now - 59, true);
+        veil_identity::verify::verify_identity_document(&revoked, now).unwrap();
+        let dht = Arc::new(KademliaService::new([0x10; 32]));
+        let key = IdentityDocument::dht_key(&before.node_id);
+        let active_ad = delegated_ad(before.node_id, &devices[0], now);
+        let old_ad = delegated_ad(before.node_id, &devices[1], now);
+        assert!(
+            verify_rendezvous_ad(&old_ad).is_err(),
+            "must use delegated verification"
+        );
+        dht.store_local(key, before.encode());
+        assert!(ad_binding_ok(&dht, &active_ad));
+        assert!(ad_binding_ok(&dht, &old_ad));
+        dht.store_local(key, revoked.encode());
+        assert!(ad_binding_ok(&dht, &active_ad));
+        assert!(
+            !ad_binding_ok(&dht, &old_ad),
+            "a revoked device must not redirect the identity's new traffic"
+        );
+    }
+
+    #[test]
+    fn an_identity_ad_refuses_a_valid_document_for_a_different_identity() {
+        use veil_proto::identity_document::IdentityDocument;
+        let now = veil_util::unix_secs_now_u64();
+        let (victim, _) = delegated_document(21, now - 60, false);
+        let (other, devices) = delegated_document(31, now - 60, false);
+        veil_identity::verify::verify_identity_document(&other, now).unwrap();
+        let ad = delegated_ad(victim.node_id, &devices[1], now);
+        let dht = Arc::new(KademliaService::new([0x10; 32]));
+        // STORE's canonical-key gate normally blocks this remotely. The read
+        // boundary still must bind the actual document, not the lookup key.
+        dht.store_local(IdentityDocument::dht_key(&victim.node_id), other.encode());
+        assert!(!ad_binding_ok(&dht, &ad));
+    }
+
+    async fn peer_lookup(
+        dht: &Arc<KademliaService>,
+        authorization: &crate::identity_document_floor::IdentityDocumentFloor,
+        cache: &Arc<super::super::anonymity_state::RendezvousResolveCache>,
+        receiver: [u8; 32],
+    ) -> Vec<RendezvousAd> {
+        super::super::rendezvous_resolver::resolve_fresh_rendezvous_ads(
+            dht,
+            &Arc::new(std::sync::RwLock::new(
+                veil_session::SessionTxRegistry::new(),
+            )),
+            &Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            [0x10; 32],
+            cache,
+            &Arc::new(NodeLogger::new_noop()),
+            receiver,
+            std::time::Duration::from_millis(50),
+            super::super::rendezvous_resolver::ResolveMode::Any,
+            authorization,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_cached_identity_route_is_rejected_after_an_observed_device_revocation() {
+        use super::super::anonymity_state::RendezvousResolveCache;
+        use crate::identity_document_floor::IdentityDocumentFloor;
+        use veil_proto::identity_document::IdentityDocument;
+        let now = veil_util::unix_secs_now_u64();
+        let (before, devices) = delegated_document(11, now - 60, false);
+        let (revoked, _) = delegated_document(11, now - 59, true);
+        let authorization = IdentityDocumentFloor::ephemeral();
+        assert!(authorization.observe(&before, now));
+        let dht = Arc::new(KademliaService::new([0x10; 32]));
+        dht.store_local(IdentityDocument::dht_key(&before.node_id), before.encode());
+        let cache = Arc::new(RendezvousResolveCache::new());
+        let old_ad = delegated_ad(before.node_id, &devices[1], now);
+        cache.put(before.node_id, vec![old_ad]);
+        assert_eq!(
+            peer_lookup(&dht, &authorization, &cache, before.node_id)
+                .await
+                .len(),
+            1
+        );
+        assert!(authorization.observe(&revoked, now));
+        assert!(
+            peer_lookup(&dht, &authorization, &cache, before.node_id)
+                .await
+                .is_empty(),
+            "a still-signed cached route must not undo an observed revocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restored_device_revocation_rejects_stale_dht_routes() {
+        use super::super::anonymity_state::RendezvousResolveCache;
+        use crate::identity_document_floor::IdentityDocumentFloor;
+        use veil_proto::identity_document::IdentityDocument;
+        let now = veil_util::unix_secs_now_u64();
+        let (before, devices) = delegated_document(11, now - 60, false);
+        let (revoked, _) = delegated_document(11, now - 59, true);
+        let previous = IdentityDocumentFloor::ephemeral();
+        assert!(previous.observe(&revoked, now));
+        let (_, bytes) = previous.export_host().unwrap();
+        let authorization = IdentityDocumentFloor::ephemeral();
+        authorization.import_host(&bytes, now).unwrap();
+        let dht = Arc::new(KademliaService::new([0x10; 32]));
+        dht.store_local(IdentityDocument::dht_key(&before.node_id), before.encode());
+        dht.store_local(
+            rendezvous_ad_dht_key(&before.node_id),
+            delegated_ad_bytes(before.node_id, &devices[1], now),
+        );
+        let cache = Arc::new(RendezvousResolveCache::new());
+        assert!(
+            peer_lookup(&dht, &authorization, &cache, before.node_id)
+                .await
+                .is_empty(),
+            "a stale DHT document must not restore rights forgotten by the route cache"
+        );
+        cache.put(
+            before.node_id,
+            vec![delegated_ad(before.node_id, &devices[0], now)],
+        );
+        assert_eq!(
+            peer_lookup(&dht, &authorization, &cache, before.node_id)
+                .await
+                .len(),
+            1,
+            "the remaining active device must remain reachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_routes_wait_for_the_hosts_authorization_checkpoint() {
+        use super::super::anonymity_state::RendezvousResolveCache;
+        use crate::identity_document_floor::IdentityDocumentFloor;
+        use veil_proto::identity_document::IdentityDocument;
+        let now = veil_util::unix_secs_now_u64();
+        let (doc, devices) = delegated_document(11, now - 60, false);
+        let authorization = IdentityDocumentFloor::ephemeral();
+        authorization
+            .import_host(br#"{"version":1,"entries":[]}"#, now)
+            .unwrap();
+        let dht = Arc::new(KademliaService::new([0x10; 32]));
+        dht.store_local(IdentityDocument::dht_key(&doc.node_id), doc.encode());
+        let ad = delegated_ad(doc.node_id, &devices[1], now);
+        dht.store_local(
+            rendezvous_ad_dht_key(&doc.node_id),
+            delegated_ad_bytes(doc.node_id, &devices[1], now),
+        );
+        let cache = Arc::new(RendezvousResolveCache::new());
+        cache.put(doc.node_id, vec![ad.clone()]);
+        assert!(
+            peer_lookup(&dht, &authorization, &cache, doc.node_id)
+                .await
+                .is_empty()
+        );
+        assert!(!authorization.is_durable(&doc.node_id));
+        authorization
+            .acknowledge_host(authorization.revision())
+            .unwrap();
+        cache.put(doc.node_id, vec![ad]);
+        assert_eq!(
+            peer_lookup(&dht, &authorization, &cache, doc.node_id)
+                .await
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_authorization_store_cannot_admit_a_cached_delegated_ad() {
+        use super::super::anonymity_state::RendezvousResolveCache;
+        use crate::identity_document_floor::IdentityDocumentFloor;
+        use veil_proto::identity_document::IdentityDocument;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("peer_identity_floors.json"), b"not-json").unwrap();
+        let authorization = IdentityDocumentFloor::load(&dir.path().join("node.toml"));
+        let now = veil_util::unix_secs_now_u64();
+        let (doc, devices) = delegated_document(11, now - 60, false);
+        let dht = Arc::new(KademliaService::new([0x10; 32]));
+        dht.store_local(IdentityDocument::dht_key(&doc.node_id), doc.encode());
+        let cache = Arc::new(RendezvousResolveCache::new());
+        cache.put(
+            doc.node_id,
+            vec![delegated_ad(doc.node_id, &devices[1], now)],
+        );
+        assert!(
+            peer_lookup(&dht, &authorization, &cache, doc.node_id)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn refreshing_a_delegated_ad_fetches_a_newer_revocation_even_when_the_old_document_matches()
+     {
+        use super::super::{
+            anonymity_state::RendezvousResolveCache,
+            rendezvous_resolver::{ResolveMode, resolve_fresh_rendezvous_ads},
+        };
+        use crate::identity_document_floor::IdentityDocumentFloor;
+        use std::sync::{
+            Mutex, RwLock,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use veil_proto::{identity_document::IdentityDocument, routing::RecursiveQueryPayload};
+        let now = veil_util::unix_secs_now_u64();
+        let (before, devices) = delegated_document(11, now - 60, false);
+        let (revoked, _) = delegated_document(11, now - 59, true);
+        let authorization = IdentityDocumentFloor::ephemeral();
+        assert!(authorization.observe(&before, now));
+        let dht = Arc::new(KademliaService::new([0x10; 32]));
+        let doc_key = IdentityDocument::dht_key(&before.node_id);
+        let ad_key = rendezvous_ad_dht_key(&before.node_id);
+        let ad_bytes = delegated_ad_bytes(before.node_id, &devices[1], now);
+        dht.store_local(doc_key, before.encode());
+        dht.store_local(ad_key, ad_bytes.clone());
+        let mut registry = veil_session::SessionTxRegistry::new();
+        let mut rx = registry.register([0x51; 32]);
+        let registry = Arc::new(RwLock::new(registry));
+        let pending = Arc::new(Mutex::new(std::collections::HashMap::<
+            [u8; 16],
+            veil_dispatcher::PendingRecursive,
+        >::new()));
+        let fetched = Arc::new(AtomicUsize::new(0));
+        let replies = tokio::spawn({
+            let pending = pending.clone();
+            let fetched = fetched.clone();
+            let revoked_bytes = revoked.encode();
+            async move {
+                while let Some((_, frame)) = rx.recv().await {
+                    let query =
+                        RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+                    let bytes = if query.target_key == doc_key {
+                        fetched.fetch_add(1, Ordering::Relaxed);
+                        revoked_bytes.clone()
+                    } else if query.target_key == ad_key {
+                        ad_bytes.clone()
+                    } else {
+                        vec![]
+                    };
+                    let waiter = pending.lock().unwrap().remove(&query.query_id).unwrap();
+                    let _ = waiter.tx.send(bytes);
+                }
+            }
+        });
+        let cache = Arc::new(RendezvousResolveCache::new());
+        cache.put(
+            before.node_id,
+            vec![delegated_ad(before.node_id, &devices[1], now)],
+        );
+        let ads = resolve_fresh_rendezvous_ads(
+            &dht,
+            &registry,
+            &pending,
+            [0x10; 32],
+            &cache,
+            &Arc::new(NodeLogger::new_noop()),
+            before.node_id,
+            std::time::Duration::from_secs(1),
+            ResolveMode::RefreshAhead,
+            &authorization,
+        )
+        .await;
+        replies.abort();
+        assert!(replies.await.unwrap_err().is_cancelled());
+        assert!(pending.lock().unwrap().is_empty());
+        assert!(
+            fetched.load(Ordering::Relaxed) > 0,
+            "a valid cached document must not suppress the revocation lookup"
+        );
+        assert!(ads.is_empty());
+        assert_eq!(
+            authorization
+                .current(&before.node_id)
+                .unwrap()
+                .issued_at_unix,
+            revoked.issued_at_unix
+        );
+    }
 
     /// Both addresses, and only when they are two.
     ///

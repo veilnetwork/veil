@@ -52,8 +52,10 @@ impl ResolveMode {
         cache: &super::anonymity_state::RendezvousResolveCache,
         receiver: &[u8; 32],
         now: u64,
+        dht: &Arc<veil_dht::KademliaService>,
+        authorization: &crate::identity_document_floor::IdentityDocumentFloor,
     ) -> Option<Vec<veil_anonymity::rendezvous::RendezvousAd>> {
-        match self {
+        let ads = match self {
             Self::Any => cache.get(receiver, now),
             Self::RefreshAhead => None,
             Self::Stream {
@@ -68,7 +70,15 @@ impl ResolveMode {
                 },
                 std::time::Duration::from_secs(1),
             ),
+        }?;
+        if ads
+            .iter()
+            .any(|ad| !super::rendezvous_ad_binding::peer_ad_binding_ok(dht, authorization, ad))
+        {
+            cache.remove(receiver);
+            return None;
         }
+        Some(ads)
     }
 }
 
@@ -91,6 +101,7 @@ pub struct RendezvousResolverImpl {
     local_node_id: [u8; 32],
     resolve_cache: Arc<super::anonymity_state::RendezvousResolveCache>,
     logger: Arc<veil_observability::NodeLogger>,
+    peer_authorization: Arc<crate::mlkem_cert_store::MlKemCertStore>,
 }
 
 impl RendezvousResolverImpl {
@@ -105,6 +116,7 @@ impl RendezvousResolverImpl {
         local_node_id: [u8; 32],
         resolve_cache: Arc<super::anonymity_state::RendezvousResolveCache>,
         logger: Arc<veil_observability::NodeLogger>,
+        peer_authorization: Arc<crate::mlkem_cert_store::MlKemCertStore>,
     ) -> Self {
         Self {
             dht,
@@ -113,6 +125,7 @@ impl RendezvousResolverImpl {
             local_node_id,
             resolve_cache,
             logger,
+            peer_authorization,
         }
     }
 }
@@ -171,8 +184,9 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
     // RefreshAhead bypasses cache fast-paths and does not mark the receiver
     // send-active: the background refresher must not keep itself alive.
     mode: ResolveMode,
+    authorization: &crate::identity_document_floor::IdentityDocumentFloor,
 ) -> Vec<veil_anonymity::rendezvous::RendezvousAd> {
-    use super::rendezvous_ad_binding::ad_binding_ok;
+    use super::rendezvous_ad_binding::peer_ad_binding_ok;
     use veil_anonymity::rendezvous::{
         MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, is_currently_valid, rendezvous_ad_dht_key_at,
     };
@@ -200,14 +214,14 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
         // mailbox drain's cold path depends on it. It just does not buy a
         // standing subscription to re-walk forever.
         note_send_target(resolve_cache, receiver_id, local_node_id);
-        if let Some(ads) = mode.cached_ads(resolve_cache, &receiver_id, now) {
+        if let Some(ads) = mode.cached_ads(resolve_cache, &receiver_id, now, dht, authorization) {
             return ads;
         }
     }
     let _refresh_guard = resolve_cache.lock_refresh(receiver_id).await;
     // Another send may have completed the refresh while this one waited for
     // the per-recipient single-flight lock.
-    if let Some(ads) = mode.cached_ads(resolve_cache, &receiver_id, now) {
+    if let Some(ads) = mode.cached_ads(resolve_cache, &receiver_id, now, dht, authorization) {
         return ads;
     }
 
@@ -241,7 +255,7 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
                 // Strictly bound, or bound by the receiver's identity document
                 // — a device of an identity advertising at the identity's own
                 // address, which is the only address its contacts know it by.
-                .filter(|ad| ad_binding_ok(dht, ad))
+                .filter(|ad| peer_ad_binding_ok(dht, authorization, ad))
                 .filter(|ad| is_currently_valid(ad, now).is_ok()),
         );
     }
@@ -284,10 +298,14 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
     } else {
         Vec::new()
     };
+    // Even when the cached document admits the signer, refresh delegation
+    // along with its ad. Otherwise an active but revoked key's fresh ad keeps
+    // the old document sufficient forever and the revocation is never learned.
     let needs_delegation = slots.iter().any(|(_, _, candidates)| {
-        candidates
-            .iter()
-            .any(|bytes| decode_rendezvous_ad(bytes).is_ok_and(|ad| !ad_binding_ok(dht, &ad)))
+        candidates.iter().any(|bytes| {
+            decode_rendezvous_ad(bytes)
+                .is_ok_and(|ad| veil_anonymity::rendezvous::verify_rendezvous_ad(&ad).is_err())
+        })
     });
     if needs_delegation {
         use veil_proto::identity_document::IdentityDocument;
@@ -318,16 +336,23 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
             },
         )
         .await;
-        if let Some((_, bytes)) = documents
+        let mut documents: Vec<_> = documents
             .into_iter()
-            .filter_map(|bytes| {
-                IdentityDocument::decode(&bytes)
-                    .ok()
-                    .map(|doc| (doc.issued_at_unix, bytes))
-            })
-            .max_by_key(|(issued_at, _)| *issued_at)
-        {
-            dht.store_local(key, bytes);
+            .filter_map(|bytes| IdentityDocument::decode(&bytes).ok())
+            .filter(|doc| doc.node_id == receiver_id)
+            .collect();
+        documents.sort_by_key(|doc| std::cmp::Reverse(doc.issued_at_unix));
+        for doc in documents {
+            authorization.observe(&doc, veil_util::unix_secs_now_u64());
+        }
+        // The floor may already know a newer signed document than every
+        // replica. Repair the local mirror from that evidence, never roll it
+        // back to a merely valid but older response.
+        if let Some(current) = authorization.current(&receiver_id) {
+            dht.store_local(key, current.encode());
+            authorization
+                .wait_durable(&receiver_id, timeout.min(std::time::Duration::from_secs(1)))
+                .await;
             logger.info(
                 "anonymity.rendezvous.delegation.resolved",
                 format!("receiver={}", veil_util::hex_short(&receiver_id)),
@@ -340,7 +365,7 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
             .into_iter()
             .filter_map(|bytes| decode_rendezvous_ad(&bytes).ok().map(|ad| (ad, bytes)))
             .filter(|(ad, _)| {
-                ad_binding_ok(dht, ad)
+                peer_ad_binding_ok(dht, authorization, ad)
                     && is_currently_valid(ad, veil_util::unix_secs_now_u64()).is_ok()
             })
             .collect();
@@ -890,6 +915,7 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
                 receiver_id,
                 std::time::Duration::from_millis(3500),
                 ResolveMode::Any,
+                &self.peer_authorization.document_floor,
             )
             .await;
             // The DHT copy of a receiver's ads disappears as soon as it stops
@@ -917,6 +943,13 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
                     ads = stale;
                 }
             }
+            ads.retain(|ad| {
+                super::rendezvous_ad_binding::peer_ad_binding_ok(
+                    &self.dht,
+                    &self.peer_authorization.document_floor,
+                    ad,
+                )
+            });
             // Prefer the freshest signed ad before relay dedup. This avoids
             // returning a stale pre-cookie-fix ad just because it was in a
             // lower-numbered slot for the same relay.

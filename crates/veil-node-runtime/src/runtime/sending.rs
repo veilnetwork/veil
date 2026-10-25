@@ -788,6 +788,7 @@ impl NodeServices {
             receiver_node_id,
             AD_RESOLVE_TIMEOUT,
             rendezvous_resolver::ResolveMode::Any,
+            &self.identity.peer_mlkem_cert_store.document_floor,
         )
         .await;
         let identity = self
