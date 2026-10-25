@@ -15,6 +15,47 @@ fn sender(writer: SharedWriter) -> AppSender {
     }
 }
 
+#[tokio::test]
+async fn anonymous_control_can_avoid_the_authored_data_credit_lane() {
+    let (tx, mut rx) = mpsc::channel::<IpcWriterFrame>(4);
+    let sender = sender(SharedWriter::new(tx));
+    sender
+        .send_anonymous_authenticated([1; 32], [2; 32], 3, b"control")
+        .await
+        .unwrap();
+    let ordinary = rx.recv().await.unwrap();
+    assert_eq!(
+        veil_proto::ipc::ipc_local_source_lane(&decode_header(&ordinary).unwrap()),
+        veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
+    );
+    sender
+        .send_on_local_lane(
+            veil_proto::priority::INTERACTIVE,
+            [1; 32],
+            [2; 32],
+            3,
+            b"control",
+            true,
+        )
+        .await
+        .unwrap();
+    let control = rx.recv().await.unwrap();
+    assert_eq!(
+        veil_proto::ipc::ipc_local_source_lane(&decode_header(&control).unwrap()),
+        veil_proto::priority::INTERACTIVE
+    );
+    assert_eq!(
+        &ordinary[HEADER_SIZE..],
+        &control[HEADER_SIZE..],
+        "recipient, payload and authenticated anonymity must stay identical"
+    );
+    assert!(
+        AppIpcSendPayload::decode(&control[HEADER_SIZE..])
+            .unwrap()
+            .anonymous_authenticated
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn whole_source_work_has_one_ipc_deadline_and_legacy_fallback() {
     use veil_proto::ipc_lossy_batch::LocalLossyBatchPayload;
