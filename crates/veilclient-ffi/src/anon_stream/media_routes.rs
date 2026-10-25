@@ -469,11 +469,11 @@ impl MediaRoutes {
         let receive_planes = self.receive_plane_count();
         for plane in 0..receive_planes {
             let routes = Arc::clone(self);
-            tasks.push(runtime.spawn(routes.run_plane(plane)));
+            tasks.push(runtime.spawn(routes.run_receiver(plane)));
         }
-        for plane in receive_planes..4 {
+        for plane in 0..4 {
             let routes = Arc::clone(self);
-            tasks.push(runtime.spawn(routes.run_auxiliary_sender(plane)));
+            tasks.push(runtime.spawn(routes.run_sender(plane)));
         }
         let routes = Arc::clone(self);
         tasks.push(runtime.spawn(routes.advertise()));
@@ -732,7 +732,7 @@ impl MediaRoutes {
         }
     }
 
-    async fn run_auxiliary_sender(self: Arc<Self>, i: usize) {
+    async fn run_sender(self: Arc<Self>, i: usize) {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -740,20 +740,15 @@ impl MediaRoutes {
             if self.closed.load(Ordering::Acquire) {
                 break;
             }
-            let active = if i == 2 {
-                &self.screen_active
-            } else {
-                &self.control_active
-            };
-            if active.load(Ordering::Acquire) {
+            if self.outgoing_active(i) {
                 self.refresh_outgoing(i).await;
             }
         }
     }
 
-    /// Construction, repair and expiry are independent for each local producer.
-    /// A stalled secondary build cannot delay the primary offer or its repair.
-    async fn run_plane(self: Arc<Self>, i: usize) {
+    /// Receive publication and repair must progress while an unrelated outgoing
+    /// circuit waits for confirmation. Each direction has one bounded worker.
+    async fn run_receiver(self: Arc<Self>, i: usize) {
         let core = &self.cores[i];
         let Some(intro_key) = core.services.stream_peer_intro_public_key() else {
             return;
@@ -766,9 +761,6 @@ impl MediaRoutes {
             tick.tick().await;
             if self.closed.load(Ordering::Acquire) {
                 break;
-            }
-            if self.outgoing_active(i) {
-                self.refresh_outgoing(i).await;
             }
             retired.retain(|(since, _)| since.elapsed() < PRIVATE_RETIRE_GRACE);
             if !incoming.as_ref().is_some_and(PinnedRoute::is_live) {
@@ -1237,7 +1229,7 @@ mod tests {
             .iter()
             .map(|t| t.abort_handle())
             .collect();
-        assert_eq!(aborts.len(), 5);
+        assert_eq!(aborts.len(), 9);
         assert!(!routes.screen_active.load(Ordering::Acquire));
         routes.stop();
         routes.accept_control(&offer(1, 1).encode());
