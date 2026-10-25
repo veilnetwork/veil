@@ -1,6 +1,6 @@
 [package]
 name = "veilclient-ffi"
-version = "0.11.44"
+version = "0.11.45"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "C-FFI surface around veilclient — driver for non-Rust hosts (Flutter, Swift, Kotlin)"

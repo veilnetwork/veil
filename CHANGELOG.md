@@ -1,9 +1,27 @@
 # Changelog
 
-## Unreleased
+## v0.11.45 — 2026-10-25
 
 ### Fixed
 
+- Recover reliable anonymous streams after route churn, local backpressure,
+  interrupted transfers and source restarts. Preserve authenticated receiver
+  binding, accepted-byte accounting, sequence-wrap ordering and final ACK/FIN
+  evidence; bound SYN admission and out-of-order bookkeeping.
+- Correct SACK/RACK repair timing and BBR delivery sampling, including sparse,
+  app-limited and degraded paths. Keep ready alternative circuits usable while
+  replacements warm up; exclude explicitly non-circuit publishers.
+- Persist signed device-revocation floors, refresh cached authorization and
+  route anonymous identity traffic through currently authorized devices.
+  Embedded hosts can checkpoint peer authorization in their encrypted store
+  instead of leaving separate persistent peer-store files.
+- Bootstrap anonymous call routes through authenticated family delivery and
+  give each call independent fallback-producer ownership. Retire isolated
+  circuits and pending opens when their owning call closes.
+- Keep video flowing when local audio is muted and across Opus packet-duration
+  changes. Finish or retry native worker cleanup before destroying calls.
+- Explain Unix admin socket user mismatches instead of an unqualified broken
+  pipe. Bound IPC per-connection queued bytes and report busy admission.
 - Export numeric receive time-stretch sample counters in endpoint JSON to
   distinguish preemptive expansion, acceleration and forced catch-up.
 - Encode group video-delivery peer keys as hex in native JSON. Binary map keys
@@ -26,6 +44,16 @@
   congestion estimate, measured audio pause and relay policies unchanged.
 - Distinguish a retired stream's write credit from an exited IPC writer in
   stream errors; retain closed-stream FFI classification and independent writes.
+
+### Compatibility and limitations
+
+- Rebuild native bindings, transport and call wrappers together. No relay media
+  classification/priority, call mailbox fallback or container-format change.
+- Optional endpoint traces aid diagnosis; normal reports exclude identifiers
+  and absolute native timestamps. Removed runtime publication-pause controls.
+- Physical P2P, relay and anonymous calls have been exercised, but remaining
+  video stalls and audio interruptions are documented by the xVeil stand.
+  Cellular call quality and universal startup/latency guarantees are not claimed.
 
 ## v0.11.44 — 2026-10-22
 
