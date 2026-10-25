@@ -629,6 +629,45 @@ mod tests {
     use veil_proto::priority::{INTERACTIVE, REALTIME};
 
     #[tokio::test]
+    async fn interactive_control_does_not_spend_a_recoverable_cell_credit() {
+        let (tx, mut rx) = frame_channel(8);
+        let mut header = veil_proto::FrameHeader::new(
+            veil_proto::family::FrameFamily::RelayChain as u8,
+            veil_proto::family::RelayChainMsg::Hop as u16,
+        );
+        header.set_priority(INTERACTIVE);
+        header.body_len = 16_384;
+        let mut cell = veil_proto::codec::encode_header(&header).to_vec();
+        cell.resize(cell.len() + 16_384, 0x53);
+        let frame = veil_bufpool::pooled_shared_from_vec(cell);
+        tx.try_send((veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE, frame.clone()))
+            .unwrap();
+        let held = rx.recv_envelope().await.unwrap();
+        assert_eq!(tx.reliable_credits.available_permits(), 0);
+        assert!(
+            tx.try_send((veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE, frame.clone()))
+                .is_err()
+        );
+        tx.try_send((INTERACTIVE, frame.clone())).unwrap();
+        let control = rx.recv_envelope().await.unwrap();
+        assert_eq!(
+            control.frame.1, held.frame.1,
+            "source choice must not change any wire byte"
+        );
+        assert!(control.reliable_credit.is_none());
+        assert_eq!(
+            tx.reliable_credits.available_permits(),
+            0,
+            "control cannot consume DATA credit"
+        );
+        drop(held);
+        assert_eq!(
+            tx.reliable_credits.available_permits(),
+            RELIABLE_SOURCE_QUEUE_DEPTH
+        );
+    }
+
+    #[tokio::test]
     async fn recoverable_builder_reserves_credit_through_scheduler_restore() {
         let (tx, mut rx) = frame_channel(8);
         let calls = std::cell::Cell::new(0);
