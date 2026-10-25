@@ -35,6 +35,8 @@ struct Stand {
     hold_reliable_route_probes: Arc<std::sync::atomic::AtomicBool>,
     held_route_probes: Arc<std::sync::atomic::AtomicUsize>,
     hold_primary_datagrams: Arc<std::sync::atomic::AtomicBool>,
+    cut_link: Arc<Mutex<Option<(usize, usize)>>>,
+    cut_link_frames: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl Drop for Stand {
     fn drop(&mut self) {
@@ -65,6 +67,8 @@ impl Stand {
             hold_reliable_route_probes: Arc::default(),
             held_route_probes: Arc::default(),
             hold_primary_datagrams: Arc::default(),
+            cut_link: Arc::default(),
+            cut_link_frames: Arc::default(),
         };
         let mut configs = Vec::new();
         for _ in 0..middle_count + 3 {
@@ -279,6 +283,8 @@ impl Stand {
         let hold_reliable_route_probes = Arc::clone(&self.hold_reliable_route_probes);
         let held_route_probes = Arc::clone(&self.held_route_probes);
         let hold_primary_datagrams = Arc::clone(&self.hold_primary_datagrams);
+        let cut_link = Arc::clone(&self.cut_link);
+        let cut_link_frames = Arc::clone(&self.cut_link_frames);
         let mut rx = self.services[from]
             .session_tx_registry
             .write()
@@ -290,6 +296,10 @@ impl Stand {
                     veil_proto::codec::decode_header_with_limit(&bytes[..HEADER_SIZE], 65536)
                         .unwrap();
                 if header.family != FrameFamily::RelayChain as u8 {
+                    continue;
+                }
+                if *cut_link.lock().unwrap() == Some((from, to)) {
+                    cut_link_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
                 assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
@@ -618,6 +628,70 @@ async fn audio_only_call_receives_video_without_reserving_an_outgoing_video_rout
         "receiving video must not activate the receiver's own camera route"
     );
     stand.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_outgoing_construction_cannot_delay_our_receive_address() {
+    let mut stand = Stand::with_middle_count(2).await;
+    // A can receive through R(3). The peer's advertised address uses the
+    // other relay(2), reached through middle(4); that last link blackholes.
+    stand.connect(4, 2);
+    stand.connect(2, 4);
+    *stand.cut_link.lock().unwrap() = Some((4, 2));
+    let a = &stand.services[0];
+    let c = &stand.services[1];
+    let ca = channel(a.local_node_id(), c.local_node_id(), [0xa1; 32], [0xc1; 32]);
+    let registry = stand.services[3]
+        .dispatcher
+        .circuit_rendezvous
+        .as_ref()
+        .unwrap();
+    wait_until(|| registry.lookup(&a.onion_stream_local_cookie()).is_some()).await;
+    let mut offer = b"VMR1".to_vec();
+    offer.extend_from_slice(&1u64.to_be_bytes());
+    offer.extend_from_slice(&1u64.to_be_bytes());
+    offer.extend_from_slice(&[1, 0]); // one primary address
+    offer.extend_from_slice(&stand.services[2].local_node_id());
+    offer.extend_from_slice(&[0xa7; 16]);
+    offer.extend_from_slice(&c.stream_peer_intro_public_key().unwrap());
+    ca.routes.accept_control(&offer);
+    ca.routes.start(&tokio::runtime::Handle::current());
+    let published = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if ca
+                .routes
+                .receive_addresses_for_test()
+                .iter()
+                .any(|(p, _)| *p == 0)
+                && stand
+                    .cut_link_frames
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    > 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let outgoing = ca.routes.outgoing_for_test().await;
+    let blocked = stand
+        .cut_link_frames
+        .load(std::sync::atomic::Ordering::Relaxed);
+    drop(ca);
+    stand.stop().await;
+    assert!(
+        blocked > 0,
+        "negative control: the test must exercise the broken link"
+    );
+    assert!(
+        published.is_ok(),
+        "our receive address waited behind the peer's stalled route"
+    );
+    assert!(
+        !outgoing.iter().any(|r| r.plane == 0),
+        "negative control: the peer's circuit must remain unconfirmed"
+    );
 }
 
 // Separate endpoint carriers deliberately have independent progress. Delaying
