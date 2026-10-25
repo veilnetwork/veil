@@ -463,3 +463,192 @@ fn generic_ad_cache_is_not_evidence_of_a_completed_family_document_lookup() {
         "an ordinary cached ad may have been checked without refreshing the list of devices"
     );
 }
+
+#[tokio::test]
+async fn known_device_routes_are_requested_before_the_family_lookup_finishes() {
+    let identity = IdentityFixture::new();
+    let receiver = identity.document.node_id;
+    let device = identity.document.identity_keys[0].device_id;
+    assert_ne!(receiver, device);
+    let me = [0x61; 32];
+    let dht = Arc::new(veil_dht::KademliaService::new(me));
+    let cache = Arc::new(super::super::anonymity_state::RendezvousResolveCache::new());
+    let logger = Arc::new(veil_observability::NodeLogger::new_noop());
+    let authorization = crate::identity_document_floor::IdentityDocumentFloor::ephemeral();
+    assert!(authorization.observe(&identity.document, veil_util::unix_secs_now_u64()));
+    let values = std::collections::HashMap::from([
+        (rendezvous_ad_dht_key(&receiver), identity.ad(receiver)),
+        (rendezvous_ad_dht_key(&device), identity.ad(device)),
+        (
+            IdentityDocument::dht_key(&receiver),
+            identity.document.encode(),
+        ),
+    ]);
+    let mut reg = veil_session::SessionTxRegistry::new();
+    let mut rx = reg.register([0x62; 32]);
+    let registry = Arc::new(RwLock::new(reg));
+    let pending = Arc::new(Mutex::new(std::collections::HashMap::<
+        [u8; 16],
+        veil_dispatcher::PendingRecursive,
+    >::new()));
+    let replies = tokio::spawn({
+        let pending = pending.clone();
+        async move {
+            let mut held = Vec::<(tokio::sync::oneshot::Sender<Vec<u8>>, Vec<u8>)>::new();
+            let mut device_requested = false;
+            while let Some((_, frame)) = rx.recv().await {
+                let q = RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+                let Some(waiter) = lock!(pending).remove(&q.query_id) else {
+                    continue;
+                };
+                let bytes = values.get(&q.target_key).cloned().unwrap_or_default();
+                if q.target_key == rendezvous_ad_dht_key(&device) {
+                    device_requested = true;
+                    let _ = waiter.tx.send(bytes);
+                    for (tx, bytes) in held.drain(..) {
+                        let _ = tx.send(bytes);
+                    }
+                } else if device_requested {
+                    let _ = waiter.tx.send(bytes);
+                } else {
+                    held.push((waiter.tx, bytes));
+                }
+            }
+        }
+    });
+    let timeout = std::time::Duration::from_millis(300);
+    let count = send_with_family_route_prefetch(
+        &dht,
+        &registry,
+        &pending,
+        me,
+        &cache,
+        &logger,
+        receiver,
+        timeout,
+        &authorization,
+        async {
+            let ads = resolve_fresh_rendezvous_ads(
+                &dht,
+                &registry,
+                &pending,
+                me,
+                &cache,
+                &logger,
+                receiver,
+                timeout,
+                ResolveMode::ChatFamily,
+                &authorization,
+            )
+            .await;
+            ads.len()
+        },
+    )
+    .await;
+    replies.abort();
+    assert!(replies.await.unwrap_err().is_cancelled());
+    assert!(lock!(pending).is_empty());
+    assert_eq!(
+        count, 1,
+        "the serial family lookup expired before the known device was queried"
+    );
+    assert!(
+        !cache
+            .refresh_candidates(
+                std::time::Duration::from_secs(300),
+                std::time::Duration::from_secs(60),
+            )
+            .contains(&device),
+        "a speculative route lookup enrolled an unused device in refresh-ahead",
+    );
+}
+
+async fn check_prefetch_cancellation(known: bool, family_cached: bool) {
+    let identity = IdentityFixture::new();
+    let receiver = identity.document.node_id;
+    let device = identity.document.identity_keys[0].device_id;
+    let me = [0x63; 32];
+    let dht = Arc::new(veil_dht::KademliaService::new(me));
+    let cache = Arc::new(super::super::anonymity_state::RendezvousResolveCache::new());
+    let logger = Arc::new(veil_observability::NodeLogger::new_noop());
+    let authorization = crate::identity_document_floor::IdentityDocumentFloor::ephemeral();
+    if known {
+        assert!(authorization.observe(&identity.document, veil_util::unix_secs_now_u64()));
+    }
+    if family_cached {
+        cache.put_with_document_check(
+            receiver,
+            vec![decode_rendezvous_ad(&identity.ad(receiver)).unwrap()],
+            true,
+        );
+    }
+    let mut reg = veil_session::SessionTxRegistry::new();
+    let mut rx = reg.register([0x64; 32]);
+    let registry = Arc::new(RwLock::new(reg));
+    let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let (finish, finished) = tokio::sync::oneshot::channel();
+    let mut send = Box::pin(send_with_family_route_prefetch(
+        &dht,
+        &registry,
+        &pending,
+        me,
+        &cache,
+        &logger,
+        receiver,
+        std::time::Duration::from_secs(60),
+        &authorization,
+        async {
+            finished.await.unwrap();
+            17
+        },
+    ));
+    assert!(futures::poll!(send.as_mut()).is_pending());
+    if known && !family_cached {
+        assert!(
+            rx.try_recv().is_ok(),
+            "a real speculative lookup must be in flight"
+        );
+        assert!(!lock!(pending).is_empty());
+    } else {
+        assert!(
+            rx.try_recv().is_err(),
+            "unknown devices must not be guessed or queried"
+        );
+        assert!(lock!(pending).is_empty());
+    }
+    finish.send(()).unwrap();
+    assert!(
+        matches!(futures::poll!(send.as_mut()), std::task::Poll::Ready(17)),
+        "a finished send was held behind the unanswered speculative lookup"
+    );
+    assert!(lock!(pending).is_empty());
+    assert!(
+        cache
+            .refresh_candidates(
+                std::time::Duration::from_secs(300),
+                std::time::Duration::from_secs(60),
+            )
+            .is_empty(),
+        "prefetch must not keep the background refresher active"
+    );
+    let mut guard = Box::pin(cache.lock_refresh(device));
+    assert!(
+        futures::poll!(guard.as_mut()).is_ready(),
+        "prefetch retained a cache lock"
+    );
+}
+
+#[tokio::test]
+async fn completed_send_cancels_slow_prefetch_and_releases_all_query_state() {
+    check_prefetch_cancellation(true, false).await;
+}
+
+#[tokio::test]
+async fn unknown_family_does_not_launch_speculative_device_queries() {
+    check_prefetch_cancellation(false, false).await;
+}
+
+#[tokio::test]
+async fn a_fresh_family_cache_needs_no_additional_speculative_reads() {
+    check_prefetch_cancellation(true, true).await;
+}
