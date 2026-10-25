@@ -57,10 +57,10 @@ pub mod control;
 pub mod delivery;
 pub mod diag;
 pub mod discovery;
+pub mod envelope_chunks;
 mod identity_document_store;
 #[cfg(test)]
 mod identity_document_store_tests;
-pub mod envelope_chunks;
 pub mod pending_ack;
 pub mod routing;
 pub mod service_budget;
