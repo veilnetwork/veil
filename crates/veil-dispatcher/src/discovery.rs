@@ -526,9 +526,7 @@ impl FrameDispatcher {
                             }
                             origin
                         };
-                        if !self
-                            .dht
-                            .store_with_origin(payload.key, payload.value, origin)
+                        if !self.store_discovery_value(payload.key, payload.value, origin)
                         {
                             // per-origin byte cap exceeded — soft-drop (matches the
                             // recursive plane's DoS-resistant behaviour).
