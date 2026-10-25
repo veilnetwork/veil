@@ -161,6 +161,17 @@ async fn process_auth_deliver(
         }
     };
 
+    // Resolution and signature verification can overlap a newer document
+    // learned by another consumer. Fence the exact signer again before its
+    // proof may teach the host a device route or obtain any history response.
+    if !access.peer_device_proof_allowed(&auth.sender_node_id, &sender_device_id, now_unix) {
+        logger.info(
+            "anonymity.auth_deliver.device_not_authorized",
+            "authenticated delivery signer is no longer authorized",
+        );
+        return;
+    }
+
     // 3. Replay check AFTER signature verify, so a forger cannot poison the
     //    cache with bogus (sender, nonce) entries to suppress a real sender.
     if let Err(e) = replay_cache.check_and_record(&auth.sender_node_id, auth.nonce, now_unix) {

@@ -46,6 +46,16 @@ impl NodeServices {
             .allows_device_proof(peer, device, now)
     }
 
+    /// Route an incoming onion device address to a known peer identity. This
+    /// is only a receive-key selection hint: the call AEAD remains mandatory.
+    /// Unknown, revoked, expired or uncheckpointed delegations return no hint.
+    pub fn peer_identity_for_device(&self, device: &[u8; 32], now: u64) -> Option<[u8; 32]> {
+        self.identity
+            .peer_mlkem_cert_store
+            .document_floor
+            .identity_hint_for_device(device, now)
+    }
+
     /// Does this node still hold a peer row for `node_id`?
     ///
     /// An outbound connector task retries for the life of the process, so
@@ -564,6 +574,7 @@ impl NodeServices {
         use veil_proto::identity_document::IdentityDocument;
 
         let key = IdentityDocument::dht_key(&node_id);
+        let deadline = tokio::time::Instant::now() + timeout;
 
         // quorum policy preserved verbatim — N replicas
         // queried, ≥QUORUM matches required, anti-sybil at resolve.
@@ -593,9 +604,6 @@ impl NodeServices {
                     }
                 }
             })?;
-        // Cache-poison fix: overwrite the local DHT shard
-        // with the quorum-winning bytes.
-        self.dht.store_local(key, bytes.clone());
         let doc = IdentityDocument::decode(&bytes)
             .map_err(|e| ResolveError::IdentityDocMalformed(e.to_string()))?;
         if doc.node_id != node_id {
@@ -606,8 +614,38 @@ impl NodeServices {
                 veil_util::hex_short(&node_id),
             )));
         }
+        verify_identity_document(&doc, now_unix_secs).map_err(ResolveError::IdentityDocInvalid)?;
+        // AuthDeliver and migration resolution must honor the same durable
+        // revocation floor as certificates and rendezvous ads. A locally valid
+        // old replica is not authority to restore an already revoked signer.
+        let authorization = &self.identity.peer_mlkem_cert_store.document_floor;
+        for candidate in replicas
+            .iter()
+            .filter_map(|bytes| IdentityDocument::decode(bytes).ok())
+        {
+            if candidate.node_id == node_id {
+                authorization.observe(&candidate, now_unix_secs);
+            }
+        }
+        if !authorization
+            .wait_durable(
+                &node_id,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+        {
+            return Err(ResolveError::IdentityDocMalformed(
+                "peer identity authorization is unavailable or not checkpointed".into(),
+            ));
+        }
+        let doc = authorization.current(&node_id).ok_or_else(|| {
+            ResolveError::IdentityDocMalformed("peer identity authorization is unavailable".into())
+        })?;
         let validated = verify_identity_document(&doc, now_unix_secs)
             .map_err(ResolveError::IdentityDocInvalid)?;
+        // Repair the mirror from accepted authorization, never from the stale
+        // replica that happened to win a byte-equality quorum.
+        self.dht.store_local(key, doc.encode());
         Ok((validated, doc))
     }
 

@@ -5622,7 +5622,13 @@ async fn run_circuit_feed(
             {
                 // This unadvertised receive address belongs to one call. It
                 // never bridges files or another group's peer into the hub.
-                if node == *peer || services.identity_of_device_local(&node) == Some(*peer) {
+                if node == *peer
+                    || services.peer_device_proof_allowed(
+                        peer,
+                        &node,
+                        veil_util::unix_secs_now_u64(),
+                    )
+                {
                     // Endpoint-only test evidence, before media AEAD admission.
                     // Circuit probes do not count as encoded media traffic.
                     #[cfg(test)]
@@ -5650,7 +5656,19 @@ async fn run_circuit_feed(
                 }
                 continue;
             }
-            if crate::media::dispatch_onion_cell(node, &framed[cell_offset..]) {
+            if framed[cell_offset] == crate::media::MEDIA_MAGIC {
+                // Published stream introductions name a physical device, while
+                // the app's call callback is keyed by the shared identity.
+                // The monotone floor supplies only a currently authorized hint;
+                // AEAD/replay admission and exact callback leases still decide
+                // what may enter that identity's call. Stream demux is unchanged.
+                let identity =
+                    services.peer_identity_for_device(&node, veil_util::unix_secs_now_u64());
+                crate::media::dispatch_onion_cell_with_identity(
+                    node,
+                    identity,
+                    &framed[cell_offset..],
+                );
                 continue;
             }
             match in_tx.try_reserve() {
