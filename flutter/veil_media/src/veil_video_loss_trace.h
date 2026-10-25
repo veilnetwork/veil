@@ -21,7 +21,10 @@ class VideoLossTrace {
                           size_t packets = 131072, size_t reports = 8192)
       : enabled_(enabled), packet_limit_(std::min(packets, size_t(131072))),
         report_limit_(std::min(reports, size_t(8192))), id_(enabled ? NextId() : 0) {
-    if (enabled_) { packets_.reserve(packet_limit_); reports_.reserve(report_limit_); }
+    if (enabled_) {
+      packets_.reserve(packet_limit_); reports_.reserve(report_limit_);
+      sender_reports_.reserve(report_limit_);
+    }
   }
   ~VideoLossTrace() { Flush(); }
 
@@ -73,6 +76,13 @@ class VideoLossTrace {
     for (size_t at = 0; at < p.size(); at += BlockSize(p, at)) {
       const size_t base = p[at+1] == 200 ? 28 : p[at+1] == 201 ? 8 : 0;
       if (!base) continue;
+      if (p[at+1] == 200) {
+        ++sender_report_seen_;
+        if (sender_reports_.size() < report_limit_)
+          sender_reports_.push_back({at_us, Word(p.data()+at+4),
+              (Word(p.data()+at+8) << 16) | (Word(p.data()+at+12) >> 16),
+              stage, result});
+      }
       for (size_t i = 0; i < (p[at]&31); ++i) {
         const auto* b = p.data()+at+base+i*24;
         const uint32_t loss = uint32_t(b[5])<<16 | uint32_t(b[6])<<8 | b[7];
@@ -97,9 +107,10 @@ class VideoLossTrace {
     if (!file) return;
     // A unique recorder id disambiguates retained peer shims in a group log.
     const auto id = static_cast<unsigned long long>(id_);
-    std::fprintf(file, "video.loss.begin id=%llu packets=%zu packet_seen=%llu reports=%zu report_seen=%llu malformed=%llu\n",
+    std::fprintf(file, "video.loss.begin id=%llu packets=%zu packet_seen=%llu reports=%zu report_seen=%llu malformed=%llu sender_reports=%zu sender_report_seen=%llu\n",
                  id, packets_.size(), (unsigned long long)packet_seen_, reports_.size(),
-                 (unsigned long long)report_seen_, (unsigned long long)malformed_);
+                 (unsigned long long)report_seen_, (unsigned long long)malformed_,
+                 sender_reports_.size(), (unsigned long long)sender_report_seen_);
     for (const auto& p : packets_)
       std::fprintf(file, "video.loss.rtp id=%llu stage=%c at_us=%lld ssrc=%u seq=%u timestamp=%u bytes=%u payload=%u marker=%d result=%d channel=%llu\n",
                    id, p.stage, (long long)p.at_us, p.ssrc, unsigned(p.sequence),
@@ -110,6 +121,12 @@ class VideoLossTrace {
                    id, r.stage, (long long)r.at_us, r.reporter, r.ssrc,
                    unsigned(r.fraction), r.lost, r.highest, r.jitter, r.lsr,
                    r.dlsr, r.result);
+    // Compact NTP is the exact token echoed by RR.LSR. Pairing these endpoint
+    // events separates transport time from receiver residence without assuming
+    // synchronized clocks. No packet payload or file I/O on the callback.
+    for (const auto& s : sender_reports_)
+      std::fprintf(file, "video.loss.sr id=%llu stage=%c at_us=%lld ssrc=%u compact_ntp=%u result=%d\n",
+                   id, s.stage, (long long)s.at_us, s.ssrc, s.compact_ntp, s.result);
     const bool ok = std::fflush(file) == 0 && !std::ferror(file);
     std::fprintf(file, "video.loss.end id=%llu write_ok=%d\n", id, int(ok));
     std::fclose(file);
@@ -147,13 +164,21 @@ class VideoLossTrace {
     uint8_t fraction;
     int result;
   };
+  struct SenderReport {
+    int64_t at_us;
+    uint32_t ssrc, compact_ntp;
+    char stage;
+    int result;
+  };
   const bool enabled_;
   const size_t packet_limit_, report_limit_;
   const uint64_t id_;
   std::mutex mu_;
   bool flushed_ = false;
-  uint64_t packet_seen_ = 0, report_seen_ = 0, malformed_ = 0;
+  uint64_t packet_seen_ = 0, report_seen_ = 0, malformed_ = 0,
+           sender_report_seen_ = 0;
   std::vector<Packet> packets_;
   std::vector<Report> reports_;
+  std::vector<SenderReport> sender_reports_;
 };
 }  // namespace veil_media
