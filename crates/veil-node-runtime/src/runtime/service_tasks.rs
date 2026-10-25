@@ -212,6 +212,12 @@ async fn process_auth_deliver(
             .anonymity
             .send_stall
             .note_answer(&auth.sender_node_id);
+        // A family send now addresses each device's own rendezvous. Its
+        // authenticated reply proves that exact physical leg, not merely that
+        // some sibling received another copy of the logical message.
+        if sender_device_id != auth.sender_node_id {
+            access.anonymity.send_stall.note_answer(&sender_device_id);
+        }
     }
 
     // 4. Deliver with the VERIFIED sender node_id. If the message carried a
