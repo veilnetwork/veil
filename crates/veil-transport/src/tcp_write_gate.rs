@@ -36,7 +36,16 @@ pub(crate) fn gate<T: IoStream>(
         tcp.as_fd()
             .try_clone_to_owned()
             .and_then(|fd| {
-                tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::WRITABLE)
+                // SAFETY: the cloned OwnedFd is valid and moves into AsyncFd.
+                // No code closes or replaces that descriptor while registered;
+                // borrowing it for poll does not transfer ownership.
+                unsafe {
+                    tokio::io::unix::AsyncFd::register_with_interest(
+                        fd,
+                        tokio::io::Interest::WRITABLE,
+                    )
+                }
+                .map_err(io::Error::from)
             })
             .ok()
     };
