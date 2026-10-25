@@ -548,6 +548,146 @@ async fn expect_packets(rx: &mut mpsc::Receiver<Received>, wanted: &[Vec<u8>]) {
     .unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn production_hub_keeps_fallback_media_live_across_other_and_previous_call_closes() {
+    let stand = Stand::new().await;
+    let a = &stand.services[0];
+    let c = &stand.services[1];
+    let directory = tempfile::tempdir().unwrap();
+    let sock = directory.path().join("app.sock");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut server = veil_ipc::IpcServer::new(
+        veil_ipc::IpcEndpoint::Unix(sock.clone()),
+        shutdown_rx,
+        Arc::new(veil_app::AppEndpointRegistry::new()),
+        a.local_node_id(),
+    );
+    let server_task = tokio::spawn(async move { server.run().await.unwrap() });
+    wait_until(|| sock.exists()).await;
+    let client = veilclient::VeilClient::connect(&sock).await.unwrap();
+    let app = client
+        .bind_named(
+            crate::anon_stream::STREAM_NAMESPACE,
+            crate::anon_stream::STREAM_NAME,
+            crate::anon_stream::STREAM_ENDPOINT_ID,
+        )
+        .await
+        .unwrap();
+    let (sender, receiver) = app.into_split();
+    let (messages, _streams) = receiver.into_parts();
+    let hub = crate::anon_stream::AnonStreamHub::new(a.local_node_id(), sender, messages);
+    let mut peer = channel(c.local_node_id(), a.local_node_id(), [0xc1; 32], [0xa1; 32]);
+    let registry = stand.services[3]
+        .dispatcher
+        .circuit_rendezvous
+        .as_ref()
+        .unwrap();
+    wait_until(|| {
+        registry.lookup(&a.onion_stream_local_cookie()).is_some()
+            && registry.lookup(&c.onion_stream_local_cookie()).is_some()
+    })
+    .await;
+    stand.copy_ads(0, 1);
+    let make = || {
+        let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let cipher =
+            Arc::new(cipher_for_test(&c.local_node_id(), &[0xa1; 32], &[0xc1; 32]).unwrap());
+        (
+            hub.private_media_routes(c.local_node_id(), id, Arc::clone(&cipher))
+                .unwrap(),
+            cipher,
+        )
+    };
+    let (old, _old_cipher) = make();
+    let (survivor, cipher) = make();
+    survivor.warm(LocalMediaPlane::Primary).await;
+    let origins = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let ids = survivor
+                .fallback_origins_for_test(LocalMediaPlane::Primary)
+                .await;
+            if !ids.is_empty() {
+                break ids;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let table = a.dispatcher.circuit_origin.as_ref().unwrap();
+    let mut exact_packets = Vec::new();
+    for seq in 1..=2 {
+        if seq == 2 {
+            old.stop();
+        }
+        assert!(
+            origins
+                .iter()
+                .all(|(hop, id)| table.lookup(hop, *id).is_some()),
+            "closing another call retired a live call's fallback origin"
+        );
+        let wanted = packet(111, seq);
+        let sealed = cipher.seal(&wanted).unwrap();
+        assert!(
+            survivor
+                .send_fallback_for_test(LocalMediaPlane::Primary, &sealed)
+                .await
+        );
+        exact_packets.push(
+            tokio::time::timeout(Duration::from_secs(3), peer.rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .packet
+                == wanted,
+        );
+    }
+    survivor.stop();
+    let (next, next_cipher) = make();
+    next.warm(LocalMediaPlane::Primary).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while next
+            .fallback_origins_for_test(LocalMediaPlane::Primary)
+            .await
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a subsequent call could not open its real fallback");
+    let wanted = packet(111, 3);
+    assert!(
+        next.send_fallback_for_test(
+            LocalMediaPlane::Primary,
+            &next_cipher.seal(&wanted).unwrap()
+        )
+        .await
+    );
+    exact_packets.push(
+        tokio::time::timeout(Duration::from_secs(3), peer.rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .packet
+            == wanted,
+    );
+    next.stop();
+    assert!(
+        origins
+            .iter()
+            .all(|(hop, id)| table.lookup(hop, *id).is_none())
+    );
+    drop((old, survivor, next, peer, hub));
+    drop(client);
+    let _ = shutdown_tx.send(true);
+    server_task.await.unwrap();
+    stand.stop().await;
+    assert_eq!(exact_packets, vec![true, true, true]);
+    assert!(!sock.exists());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closing_a_call_cancels_unconfirmed_fallback_without_waiting_for_timeout() {
     let stand = Stand::new().await;
