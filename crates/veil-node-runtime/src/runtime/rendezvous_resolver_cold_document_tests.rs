@@ -351,3 +351,115 @@ async fn strict_rendezvous_does_not_require_a_document_walk() {
         "a self-bound ad must not wait on a missing document"
     );
 }
+
+async fn parallel_document_fixture(mode: ResolveMode, known: bool) {
+    use tokio::sync::oneshot;
+    let identity = IdentityFixture::new();
+    let receiver = identity.document.node_id;
+    let me = [0x51; 32];
+    let dht = Arc::new(veil_dht::KademliaService::new(me));
+    let ad_key = rendezvous_ad_dht_key(&receiver);
+    let doc_key = IdentityDocument::dht_key(&receiver);
+    let ad = identity.ad(receiver);
+    let document = identity.document.encode();
+    let mut reg = veil_session::SessionTxRegistry::new();
+    let mut rx = reg.register([0x52; 32]);
+    let registry = Arc::new(RwLock::new(reg));
+    let pending = Arc::new(Mutex::new(std::collections::HashMap::<
+        [u8; 16],
+        veil_dispatcher::PendingRecursive,
+    >::new()));
+    let replies = tokio::spawn({
+        let pending = Arc::clone(&pending);
+        async move {
+            let mut held: Vec<(oneshot::Sender<Vec<u8>>, Vec<u8>)> = Vec::new();
+            let mut doc_seen = false;
+            while let Some((_, frame)) = rx.recv().await {
+                let query =
+                    RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+                let Some(waiter) = lock!(pending).remove(&query.query_id) else {
+                    continue;
+                };
+                if query.target_key == doc_key {
+                    doc_seen = true;
+                    let _ = waiter.tx.send(document.clone());
+                    for (tx, bytes) in held.drain(..) {
+                        let _ = tx.send(bytes);
+                    }
+                } else {
+                    let bytes = if query.target_key == ad_key {
+                        ad.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    if doc_seen {
+                        let _ = waiter.tx.send(bytes);
+                    } else {
+                        held.push((waiter.tx, bytes));
+                    }
+                }
+            }
+        }
+    });
+    let authorization = crate::identity_document_floor::IdentityDocumentFloor::ephemeral();
+    if known {
+        assert!(authorization.observe(&identity.document, veil_util::unix_secs_now_u64()));
+    }
+    let ads = resolve_fresh_rendezvous_ads(
+        &dht,
+        &registry,
+        &pending,
+        me,
+        &Arc::new(super::super::anonymity_state::RendezvousResolveCache::new()),
+        &Arc::new(veil_observability::NodeLogger::new_noop()),
+        receiver,
+        std::time::Duration::from_millis(300),
+        mode,
+        &authorization,
+    )
+    .await;
+    replies.abort();
+    assert!(replies.await.unwrap_err().is_cancelled());
+    assert!(lock!(pending).is_empty());
+    assert_eq!(
+        ads.len(),
+        1,
+        "a family lookup must request the document while ad replies are still pending"
+    );
+}
+
+#[tokio::test]
+async fn family_document_lookup_does_not_wait_for_advertisement_replies() {
+    parallel_document_fixture(ResolveMode::ChatFamily, false).await;
+}
+
+#[tokio::test]
+async fn delegated_background_refresh_does_not_serialize_document_and_ad_lookups() {
+    parallel_document_fixture(ResolveMode::RefreshAhead, true).await;
+}
+
+#[test]
+fn generic_ad_cache_is_not_evidence_of_a_completed_family_document_lookup() {
+    let identity = IdentityFixture::new();
+    let receiver = identity.document.node_id;
+    let now = veil_util::unix_secs_now_u64();
+    let dht = Arc::new(veil_dht::KademliaService::new([0x53; 32]));
+    let authorization = crate::identity_document_floor::IdentityDocumentFloor::ephemeral();
+    assert!(authorization.observe(&identity.document, now));
+    let cache = super::super::anonymity_state::RendezvousResolveCache::new();
+    cache.put(
+        receiver,
+        vec![decode_rendezvous_ad(&identity.ad(receiver)).unwrap()],
+    );
+    assert!(
+        ResolveMode::Any
+            .cached_ads(&cache, &receiver, now, &dht, &authorization)
+            .is_some()
+    );
+    assert!(
+        ResolveMode::ChatFamily
+            .cached_ads(&cache, &receiver, now, &dht, &authorization)
+            .is_none(),
+        "an ordinary cached ad may have been checked without refreshing the list of devices"
+    );
+}
