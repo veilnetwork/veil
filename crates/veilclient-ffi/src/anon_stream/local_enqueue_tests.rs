@@ -599,6 +599,66 @@ struct Fixture {
     _outbox: veil_session::FrameOutbox,
 }
 
+#[tokio::test]
+async fn exact_call_receiver_uses_a_matching_route_even_when_another_relay_is_first() {
+    let mut f = fixture().await;
+    let (second, second_hop, mut second_outbox) = add_circuit(&f.cells.services);
+    f.circuit.confirmed_flag().store(true, Ordering::Release);
+    second.confirmed_flag().store(true, Ordering::Release);
+    let destination = [0xb3; 32];
+    f.cells.outbound_circuits.lock().await.insert(
+        destination,
+        vec![
+            entry(&protected_route(&f.circuit, f.cells.me), &[]),
+            entry(&protected_route(&second, f.cells.me), &[]),
+        ],
+    );
+    while f._outbox.try_recv().is_ok() {}
+    while second_outbox.try_recv().is_ok() {}
+    let receiver = media_routes::ReceiveAddress {
+        plane: 0,
+        relay: second_hop,
+        cookie: [0x57; 16],
+        intro_key: [0x33; 32],
+    };
+    let cipher = crate::media::cipher_for_test(&destination, &[0x81; 32], &[0x82; 32]).unwrap();
+    let mut accepted = 0;
+    for _ in 0..4 {
+        let sealed = cipher
+            .seal_on_plane(LocalMediaPlane::Primary, b"audio")
+            .unwrap();
+        accepted += usize::from(
+            f.cells
+                .send_datagram_to_receiver(destination, &sealed, Some(&receiver))
+                .await,
+        );
+    }
+    let datagrams = |rx: &mut veil_session::FrameOutbox| {
+        let mut count = 0;
+        while let Ok((_, bytes)) = rx.try_recv() {
+            let header = veil_proto::codec::decode_header_with_limit(
+                &bytes[..veil_proto::HEADER_SIZE],
+                65536,
+            )
+            .unwrap();
+            count += usize::from(
+                header.family == veil_proto::family::FrameFamily::RelayChain as u8
+                    && header.msg_type == veil_proto::family::RelayChainMsg::CircuitDatagram as u16,
+            );
+        }
+        count
+    };
+    let wrong = datagrams(&mut f._outbox);
+    let wanted = datagrams(&mut second_outbox);
+    f.runtime.stop().await.unwrap();
+    assert_eq!(
+        accepted, 4,
+        "a healthy matching route must not lose round-robin turns"
+    );
+    assert_eq!(wrong, 0, "no packet may use the unrelated rendezvous");
+    assert_eq!(wanted, 4);
+}
+
 async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");

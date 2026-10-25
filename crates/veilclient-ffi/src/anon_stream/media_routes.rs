@@ -35,11 +35,11 @@ impl BootstrapBudget {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ReceiveAddress {
-    plane: u8,
-    relay: [u8; 32],
-    cookie: [u8; 16],
-    intro_key: [u8; 32],
+pub(super) struct ReceiveAddress {
+    pub(super) plane: u8,
+    pub(super) relay: [u8; 32],
+    pub(super) cookie: [u8; 16],
+    pub(super) intro_key: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -678,10 +678,28 @@ impl MediaRoutes {
             outgoing.take();
         }
         drop(outgoing);
+        self.send_fallback(plane, sealed).await
+    }
+
+    async fn send_fallback(&self, plane: LocalMediaPlane, sealed: &SealedMediaCell) -> bool {
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        let i = plane_index(plane);
         #[cfg(test)]
         self.fallback_attempts[i].fetch_add(1, Ordering::Relaxed);
         crate::media::trace_sealed_cell("onion_fallback_begin", &self.peer, sealed.as_bytes());
-        core.send_datagram(self.peer, sealed).await
+        let receiver = self
+            .offers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .highest
+            .as_ref()
+            .and_then(|offer| offer.receive_address(i))
+            .cloned();
+        self.cores[i]
+            .send_datagram_to_receiver(self.peer, sealed, receiver.as_ref())
+            .await
     }
 
     async fn refresh_outgoing(self: &Arc<Self>, i: usize) {
@@ -911,6 +929,26 @@ pub(crate) async fn fixture(
 
 #[cfg(test)]
 impl MediaRoutes {
+    pub(crate) async fn send_fallback_for_test(
+        &self,
+        plane: LocalMediaPlane,
+        sealed: &SealedMediaCell,
+    ) -> bool {
+        self.send_fallback(plane, sealed).await
+    }
+
+    pub(crate) async fn fallback_cookies_for_test(&self, plane: LocalMediaPlane) -> Vec<[u8; 16]> {
+        self.cores[plane_index(plane)]
+            .outbound_circuits
+            .lock()
+            .await
+            .get(&self.peer)
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.peer_cookie)
+            .collect()
+    }
+
     pub(crate) fn received_offer_for_test(&self) -> Option<Vec<u8>> {
         self.offers
             .lock()

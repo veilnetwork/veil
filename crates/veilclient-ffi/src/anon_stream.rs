@@ -1790,11 +1790,21 @@ impl CircuitCells {
     /// Returns `true` if the cell entered the first-hop TX queue or expired
     /// locally (which must not trigger route repair), `false` on send failure.
     async fn send_datagram(&self, dst_node: [u8; 32], sealed: &SealedMediaCell) -> bool {
+        self.send_datagram_to_receiver(dst_node, sealed, None).await
+    }
+
+    async fn send_datagram_to_receiver(
+        &self,
+        dst_node: [u8; 32],
+        sealed: &SealedMediaCell,
+        receiver: Option<&media_routes::ReceiveAddress>,
+    ) -> bool {
         self.send_framed_datagram(
             dst_node,
             crate::media::MEDIA_MAGIC,
             sealed.as_bytes(),
             sealed.local_deadline(),
+            receiver,
         )
         .await
     }
@@ -1805,6 +1815,7 @@ impl CircuitCells {
         magic: u8,
         payload: &[u8],
         deadline: Option<tokio::time::Instant>,
+        receiver: Option<&media_routes::ReceiveAddress>,
     ) -> bool {
         let expired = || deadline.is_some_and(|at| tokio::time::Instant::now() >= at);
         if expired() {
@@ -1823,19 +1834,57 @@ impl CircuitCells {
         // means no route is up yet — `circuit_for` has already kicked a
         // background open, so just drop this datagram (no ARQ) and let the next
         // one ride the warm pool.
-        let route = match self
+        let mut route = match self
             .circuit_for(dst_node, None, RouteClass::Bulk, false)
             .await
         {
             Ok(Some(route)) => route,
             _ => return false,
         };
+        if let Some(receiver) = receiver
+            && route.rendezvous_node != Some(receiver.relay)
+        {
+            // A retained pool may contain several rendezvous during repair.
+            // Select an existing matching path rather than dropping every
+            // round-robin turn which happened to choose another relay.
+            let Ok(mut pool) = self.outbound_circuits.try_lock() else {
+                return false;
+            };
+            let Some(entries) = pool.get_mut(&dst_node) else {
+                return false;
+            };
+            let Some(matching) = self.select_outbound_route_for_relay(
+                dst_node,
+                entries,
+                None,
+                RouteClass::Bulk,
+                Instant::now(),
+                Some(receiver.relay),
+            ) else {
+                return false;
+            };
+            route = matching;
+        }
         if expired() {
             return true;
         }
         if self.route_session_stale(&route) {
             self.mark_route_stale(dst_node, &route).await;
             return false;
+        }
+        if let Some(receiver) = receiver {
+            // The public family ad can point at a sibling which did not
+            // answer. Reuse only the transport to this exact rendezvous;
+            // cookie and introduction key come from the current call AEAD.
+            // Never mutate the public pool entry or retarget a different R.
+            if route.rendezvous_node != Some(receiver.relay) {
+                return false;
+            }
+            route.peer_cookie = receiver.cookie;
+            route.envelope = CircuitEnvelope::ProtectedIntro {
+                peer_tag: outbound_peer_tag(&self.outbound_peer_tags, dst_node),
+                receiver_x25519_pk: receiver.intro_key,
+            };
         }
         // Attach the sender intro (is_handshake=true for the ENVELOPE only —
         // circuit_for above still selects a Bulk route). On a ProtectedIntro
@@ -2770,6 +2819,18 @@ impl CircuitCells {
         route_class: RouteClass,
         now: Instant,
     ) -> Option<CircuitRoute> {
+        self.select_outbound_route_for_relay(dst_node, entries, stream_id, route_class, now, None)
+    }
+
+    fn select_outbound_route_for_relay(
+        &self,
+        dst_node: [u8; 32],
+        entries: &mut [CircuitEntry],
+        stream_id: Option<u32>,
+        route_class: RouteClass,
+        now: Instant,
+        relay: Option<[u8; 32]>,
+    ) -> Option<CircuitRoute> {
         if entries.is_empty() {
             return None;
         }
@@ -2800,11 +2861,15 @@ impl CircuitCells {
         let binding = self.stream_receiver(dst_node, stream_id);
         let compatible = entries
             .iter()
-            .filter(|entry| binding.is_none_or(|binding| binding.matches_entry(entry)))
+            .filter(|entry| {
+                relay.is_none_or(|relay| relay == entry.rendezvous_node)
+                    && binding.is_none_or(|binding| binding.matches_entry(entry))
+            })
             .count();
         let usable_indices = (0..entries.len())
             .filter(|idx| {
-                binding.is_none_or(|binding| binding.matches_entry(&entries[*idx]))
+                relay.is_none_or(|relay| relay == entries[*idx].rendezvous_node)
+                    && binding.is_none_or(|binding| binding.matches_entry(&entries[*idx]))
                     && cooled_relays
                         .get(&entries[*idx].rendezvous_node)
                         .is_none_or(|until| *until <= cooldown_now)
