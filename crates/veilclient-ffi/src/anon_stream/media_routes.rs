@@ -791,7 +791,9 @@ impl MediaRoutes {
             }
             retired.retain(|(since, _)| since.elapsed() < PRIVATE_RETIRE_GRACE);
             if !incoming.as_ref().is_some_and(PinnedRoute::is_live) {
-                for relay in core.services.local_published_rendezvous_relays() {
+                let mut relays = core.services.local_published_rendezvous_relays();
+                retain_stream_circuit_relays(&core.services, &mut relays);
+                for relay in relays {
                     if let Some(route) = open_private_route(core, relay, &self).await {
                         let address = ReceiveAddress {
                             plane: i as u8,

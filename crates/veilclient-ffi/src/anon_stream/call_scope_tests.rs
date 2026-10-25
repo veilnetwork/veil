@@ -3,6 +3,53 @@
 use super::*;
 
 #[tokio::test]
+async fn stream_pool_does_not_expand_for_explicit_receive_only_peers() {
+    use veil_proto::session::cap_flags::{ANONYMITY_RELAY, CAN_RELAY};
+    let (_dir, mut runtime, services) = tests::offline_feed_fixture().await;
+    let receiving_only = [0x81; 32];
+    let circuit_relay = [0x82; 32];
+    let unknown_remote = [0x83; 32];
+    let no_capabilities = [0x84; 32];
+    {
+        let mut flags = services.dispatcher.crypto.peer_cap_flags.write().unwrap();
+        flags.insert(receiving_only, CAN_RELAY);
+        flags.insert(circuit_relay, ANONYMITY_RELAY);
+        flags.insert(no_capabilities, 0);
+    }
+    let mut candidates = vec![
+        receiving_only,
+        circuit_relay,
+        unknown_remote,
+        no_capabilities,
+    ];
+    retain_stream_circuit_relays(&services, &mut candidates);
+    assert_eq!(candidates, vec![circuit_relay, unknown_remote]);
+    // A newly authenticated capability update must make the same publisher
+    // eligible; filtering must not leave a negative cache or erase its row.
+    services
+        .dispatcher
+        .crypto
+        .peer_cap_flags
+        .write()
+        .unwrap()
+        .insert(receiving_only, ANONYMITY_RELAY | CAN_RELAY);
+    let mut refreshed = vec![receiving_only, circuit_relay, unknown_remote];
+    retain_stream_circuit_relays(&services, &mut refreshed);
+    assert_eq!(refreshed.len(), 3);
+    assert_eq!(
+        services
+            .dispatcher
+            .crypto
+            .peer_cap_flags
+            .read()
+            .unwrap()
+            .len(),
+        3
+    );
+    runtime.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn closing_one_call_does_not_disable_other_or_future_fallbacks_on_the_same_hub() {
     let (_dir, mut runtime, services) = tests::offline_feed_fixture().await;
     let me = services.local_node_id();
