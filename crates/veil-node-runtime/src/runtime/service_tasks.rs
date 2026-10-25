@@ -1634,6 +1634,7 @@ impl NodeRuntime {
         const ACTIVE_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
         const AD_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(3500);
 
+        let peer_authorization = Arc::clone(&self.identity.peer_mlkem_cert_store);
         let dht = Arc::clone(&self.dht);
         let session_tx_registry = Arc::clone(&self.session_tx_registry);
         let pending_recursive = Arc::clone(&self.dispatcher.pending_recursive);
@@ -1664,6 +1665,7 @@ impl NodeRuntime {
                         receiver_id,
                         AD_RESOLVE_TIMEOUT,
                         super::rendezvous_resolver::ResolveMode::RefreshAhead,
+                        &peer_authorization.document_floor,
                     )
                     .await;
                     logger.debug(

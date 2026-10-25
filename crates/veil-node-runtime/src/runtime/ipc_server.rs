@@ -748,6 +748,7 @@ impl NodeRuntime {
                 *self.identity.local_identity.node_id.as_bytes(),
                 Arc::clone(&self.anonymity.rendezvous_resolve_cache),
                 Arc::clone(&self.logger),
+                Arc::clone(&self.identity.peer_mlkem_cert_store),
             ));
         server = server.with_rendezvous_resolver(resolver);
         // log IpcServer::run failure instead of swallowing.

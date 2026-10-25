@@ -1777,6 +1777,7 @@ impl NodeServices {
                     .identity_of_device_local(&receiver_node_id)
                     .map(|identity| Self::mailbox_rendezvous_cookie(&identity)),
             },
+            &self.identity.peer_mlkem_cert_store.document_floor,
         )
         .await;
 

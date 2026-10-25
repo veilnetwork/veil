@@ -83,6 +83,7 @@ async fn mailbox_only_stream_cache_rechecks_once_for_concurrent_waiters() {
         mailbox_cookie: mailbox,
         identity_mailbox_cookie: Some(identity_mailbox),
     };
+    let authorization = crate::identity_document_floor::IdentityDocumentFloor::ephemeral();
     let lookup = || {
         resolve_fresh_rendezvous_ads(
             &dht,
@@ -94,6 +95,7 @@ async fn mailbox_only_stream_cache_rechecks_once_for_concurrent_waiters() {
             receiver,
             std::time::Duration::from_secs(1),
             mode,
+            &authorization,
         )
     };
     let initial = lookup().await;
@@ -260,6 +262,7 @@ async fn lookup(
         receiver,
         std::time::Duration::from_secs(1),
         ResolveMode::Any,
+        &crate::identity_document_floor::IdentityDocumentFloor::ephemeral(),
     )
     .await;
     replies.abort();
