@@ -7,7 +7,7 @@
 - Update Tokio to 1.53.3 for RUSTSEC-2026-0386 and use its explicit descriptor
   registration API with owned descriptors on Apple/FreeBSD paths. Update the
   application and fuzz lockfiles; retain the advisory-policy gate.
-- Update k256 to 0.14.0, crypto-bigint to 0.7.8 and ctutils to 0.4.5 for
+- Update k256 to 0.14.0, crypto-bigint to 0.7.9 and ctutils to 0.4.5 for
   RUSTSEC-2026-0387/RUSTSEC-2026-0385 constant-time arithmetic fixes. Retain
   raw-prehash BIP-340 Nostr signatures and the existing discovery wire format.
 - Recover reliable anonymous streams after route churn, local backpressure,
