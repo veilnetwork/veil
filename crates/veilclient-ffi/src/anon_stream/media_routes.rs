@@ -940,6 +940,7 @@ pub(crate) async fn fixture(
 
 #[cfg(test)]
 impl MediaRoutes {
+    #[cfg(feature = "test-low-difficulty")]
     pub(crate) async fn send_fallback_for_test(
         &self,
         plane: LocalMediaPlane,
@@ -948,6 +949,7 @@ impl MediaRoutes {
         self.send_fallback(plane, sealed).await
     }
 
+    #[cfg(feature = "test-low-difficulty")]
     pub(crate) async fn fallback_cookies_for_test(&self, plane: LocalMediaPlane) -> Vec<[u8; 16]> {
         self.cores[plane_index(plane)]
             .outbound_circuits
@@ -960,6 +962,7 @@ impl MediaRoutes {
             .collect()
     }
 
+    #[cfg(feature = "test-low-difficulty")]
     pub(crate) async fn fallback_origins_for_test(
         &self,
         plane: LocalMediaPlane,
