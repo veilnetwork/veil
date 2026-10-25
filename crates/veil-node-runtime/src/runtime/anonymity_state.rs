@@ -47,6 +47,7 @@ const MAX_RENDEZVOUS_RESOLVE_CACHE: usize = 1024;
 struct CachedRendezvousAds {
     ads: Vec<RendezvousAd>,
     checked_at: std::time::Instant,
+    document_checked_at: Option<std::time::Instant>,
 }
 
 /// Short-lived cache of ads that were compared across independent DHT
@@ -158,6 +159,16 @@ impl RendezvousResolveCache {
         self.get_satisfying(receiver, now_unix, |_| true, self.ttl)
     }
 
+    /// A family send needs both a recent route and a recent document lookup.
+    /// An ordinary ad refresh must not extend the device-list freshness window.
+    pub(super) fn get_with_document_check(
+        &self,
+        receiver: &[u8; 32],
+        now_unix: u64,
+    ) -> Option<Vec<RendezvousAd>> {
+        self.get_satisfying_inner(receiver, now_unix, |_| true, self.ttl, true)
+    }
+
     /// A recent lookup may contain valid ads but none usable by this caller
     /// (e.g. mailbox registrations before a stream receive circuit is ready).
     /// Reuse that miss only for `missing_ttl`, without removing the valid ads
@@ -169,8 +180,26 @@ impl RendezvousResolveCache {
         usable: impl Fn(&RendezvousAd) -> bool,
         missing_ttl: std::time::Duration,
     ) -> Option<Vec<RendezvousAd>> {
+        self.get_satisfying_inner(receiver, now_unix, usable, missing_ttl, false)
+    }
+
+    fn get_satisfying_inner(
+        &self,
+        receiver: &[u8; 32],
+        now_unix: u64,
+        usable: impl Fn(&RendezvousAd) -> bool,
+        missing_ttl: std::time::Duration,
+        require_document: bool,
+    ) -> Option<Vec<RendezvousAd>> {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let entry = inner.get(receiver)?;
+        if require_document
+            && !entry
+                .document_checked_at
+                .is_some_and(|at| at.elapsed() < self.ttl)
+        {
+            return None;
+        }
         if entry.checked_at.elapsed() >= self.ttl {
             // Stale for the LIVE path, which is what this TTL is about — but the
             // ads are kept rather than dropped, because a deposit may still use
@@ -238,6 +267,15 @@ impl RendezvousResolveCache {
     }
 
     pub fn put(&self, receiver: [u8; 32], ads: Vec<RendezvousAd>) {
+        self.put_with_document_check(receiver, ads, false);
+    }
+
+    pub(super) fn put_with_document_check(
+        &self,
+        receiver: [u8; 32],
+        ads: Vec<RendezvousAd>,
+        document_checked: bool,
+    ) {
         if ads.is_empty() {
             return;
         }
@@ -255,11 +293,20 @@ impl RendezvousResolveCache {
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&oldest);
         }
+        let document_checked_at = if document_checked {
+            Some(std::time::Instant::now())
+        } else {
+            // Preserve the earlier stamp, never renew it from an ad-only walk.
+            inner
+                .get(&receiver)
+                .and_then(|entry| entry.document_checked_at)
+        };
         inner.insert(
             receiver,
             CachedRendezvousAds {
                 ads,
                 checked_at: std::time::Instant::now(),
+                document_checked_at,
             },
         );
     }
@@ -897,6 +944,52 @@ mod tests {
             rendezvous_kem_pk: Vec::new(),
             wire_version: 5,
         }
+    }
+
+    #[test]
+    fn ad_only_refresh_cannot_renew_family_document_freshness() {
+        let receiver = [7; 32];
+        let cache = RendezvousResolveCache::with_params(std::time::Duration::from_secs(60), 4);
+        cache.put(receiver, vec![ad(7, 1, 90, 200)]);
+        assert!(cache.get(&receiver, 100).is_some());
+        assert!(cache.get_with_document_check(&receiver, 100).is_none());
+        cache.put_with_document_check(receiver, vec![ad(7, 1, 90, 200)], true);
+        assert!(cache.get_with_document_check(&receiver, 100).is_some());
+        let checked = {
+            cache
+                .inner
+                .lock()
+                .unwrap()
+                .get(&receiver)
+                .unwrap()
+                .document_checked_at
+        };
+        cache.put(receiver, vec![ad(7, 2, 90, 200)]);
+        assert_eq!(
+            cache
+                .inner
+                .lock()
+                .unwrap()
+                .get(&receiver)
+                .unwrap()
+                .document_checked_at,
+            checked
+        );
+        assert_eq!(
+            cache.get_with_document_check(&receiver, 100).unwrap()[0].rendezvous_node_id,
+            [2; 32]
+        );
+        {
+            let mut inner = cache.inner.lock().unwrap();
+            inner.get_mut(&receiver).unwrap().document_checked_at =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(61));
+        }
+        cache.put(receiver, vec![ad(7, 3, 90, 200)]);
+        assert!(cache.get(&receiver, 100).is_some(), "the route is fresh");
+        assert!(
+            cache.get_with_document_check(&receiver, 100).is_none(),
+            "the device-list refresh is not"
+        );
     }
 
     #[test]
