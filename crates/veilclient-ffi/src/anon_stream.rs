@@ -3827,9 +3827,16 @@ impl CellSender for HubCells {
 fn spawn_anon_feed(
     mut msg_rx: mpsc::Receiver<IncomingMessage>,
     in_tx: mpsc::Sender<(Addr, Vec<u8>)>,
+    route_control_only: bool,
 ) {
     tokio::spawn(async move {
         while let Some(msg) = msg_rx.recv().await {
+            if route_control_only {
+                if msg.provenance.is_authenticated() {
+                    crate::media::dispatch_onion_route_control(msg.src_node_id, &msg.data);
+                }
+                continue;
+            }
             // The authenticated anonymous transport delivers src_app_id = [0;32]
             // (no sender app id) — DERIVE the peer's stream endpoint app from its
             // node id (the deterministic `app_id(node, ns, name)` both ends bind).
@@ -4085,13 +4092,16 @@ impl AnonStreamHub {
             // ceiling. The hub exists before any circuit does and its pools
             // hold several, so the policy — not one circuit — is what the one
             // shared engine can be sized against. See `circuit_mss_for`.
-            Some(c) => (
-                HubCells::Circuit(Box::new(c)),
-                circuit_mss_for(veil_anonymity::circuit_origin::choose_cell_bytes()),
-            ),
+            Some(c) => {
+                spawn_anon_feed(msg_rx, in_tx, true);
+                (
+                    HubCells::Circuit(Box::new(c)),
+                    circuit_mss_for(veil_anonymity::circuit_origin::choose_cell_bytes()),
+                )
+            }
             None => {
                 // Datagram path (default / fallback): feed inbound from msg_rx.
-                spawn_anon_feed(msg_rx, in_tx);
+                spawn_anon_feed(msg_rx, in_tx, false);
                 let data_pace_interval = stream_data_pace_interval(false);
                 diag_node(
                     &me,
@@ -4173,9 +4183,15 @@ impl AnonStreamHub {
         channel: u64,
         cipher: Arc<crate::media::MediaCipher>,
     ) -> Option<Arc<MediaRoutes>> {
-        self.media_cells
-            .as_ref()
-            .map(|cores| MediaRoutes::new(peer, channel, cores.clone(), cipher))
+        self.media_cells.as_ref().map(|cores| {
+            MediaRoutes::new(
+                peer,
+                channel,
+                cores.clone(),
+                cipher,
+                Some(Arc::clone(&self._sender)),
+            )
+        })
     }
 
     fn media_producer(&self, plane: LocalMediaPlane) -> Option<&CircuitCells> {

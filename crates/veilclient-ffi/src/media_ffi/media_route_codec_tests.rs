@@ -311,6 +311,7 @@ async fn codec_routes_ready(stand: &Stand, channels: &[&Channel; 2]) {
     stand.copy_ads(1, 0);
     for channel in channels {
         channel.routes.start(&tokio::runtime::Handle::current());
+        channel.routes.warm(LocalMediaPlane::Secondary).await;
     }
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
