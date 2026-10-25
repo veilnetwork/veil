@@ -1,6 +1,6 @@
 [package]
 name = "ogate"
-version = "0.11.44"
+version = "0.11.45"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Veil-network TUN bridge: connect two or more machines via virtual IP over the veil (open or authorized membership)."
