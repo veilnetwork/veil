@@ -74,6 +74,34 @@ pub(crate) fn peer_ad_binding_ok(
     veil_anonymity::rendezvous::verify_rendezvous_ad_delegated(ad, &doc.node_id, &keys).is_ok()
 }
 
+/// Physical receive addresses of an already verified identity. `None` keeps
+/// legacy self-bound receivers usable when no identity document is known;
+/// `Some([])` is a known identity without durable current device authority and
+/// must never fall back to its shared rendezvous alias.
+pub(super) fn authorized_identity_devices(
+    authorization: &crate::identity_document_floor::IdentityDocumentFloor,
+    identity: &[u8; 32],
+    now: u64,
+) -> Option<Vec<[u8; 32]>> {
+    let doc = authorization.current(identity)?;
+    if veil_identity::verify::verify_identity_document(&doc, now).is_err() {
+        return Some(Vec::new());
+    }
+    let mut devices = Vec::new();
+    for key in doc
+        .identity_keys
+        .iter()
+        .take(veil_proto::identity_document::MAX_IDENTITY_KEYS)
+    {
+        if authorization.allows_device_proof(identity, &key.device_id, now)
+            && !devices.contains(&key.device_id)
+        {
+            devices.push(key.device_id);
+        }
+    }
+    Some(devices)
+}
+
 /// The device pubkeys a VERIFIED identity document names for `node_id`.
 ///
 /// The full verifier ladder, clock included: this document came off the
@@ -240,6 +268,61 @@ mod tests {
         now: u64,
     ) -> RendezvousAd {
         decode_rendezvous_ad(&delegated_ad_bytes(receiver, signer, now)).unwrap()
+    }
+
+    #[test]
+    fn anonymous_identity_targets_are_physical_and_follow_current_revocation() {
+        use veil_crypto::identity::compute_node_id;
+        let now = veil_util::unix_secs_now_u64();
+        let (before, devices) = delegated_document(161, now - 60, false);
+        let (revoked, _) = delegated_document(161, now - 59, true);
+        let floor = crate::identity_document_floor::IdentityDocumentFloor::ephemeral();
+        assert_eq!(
+            authorized_identity_devices(&floor, &before.node_id, now),
+            None
+        );
+        assert!(floor.observe(&before, now));
+        let ids: Vec<_> = devices
+            .iter()
+            .map(|k| compute_node_id(k.verifying_key().as_bytes()))
+            .collect();
+        assert_eq!(
+            authorized_identity_devices(&floor, &before.node_id, now),
+            Some(ids.clone())
+        );
+        assert!(!ids.contains(&before.node_id));
+        assert!(floor.observe(&revoked, now));
+        assert!(!floor.observe(&before, now));
+        assert_eq!(
+            authorized_identity_devices(&floor, &before.node_id, now),
+            Some(vec![ids[0]])
+        );
+        assert_eq!(
+            authorized_identity_devices(&floor, &before.node_id, revoked.valid_until_unix + 1),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn anonymous_identity_targets_wait_for_the_host_checkpoint() {
+        let now = veil_util::unix_secs_now_u64();
+        let (doc, _) = delegated_document(171, now - 60, false);
+        let floor = crate::identity_document_floor::IdentityDocumentFloor::ephemeral();
+        floor
+            .import_host(br#"{"version":1,"entries":[]}"#, now)
+            .unwrap();
+        assert!(floor.observe(&doc, now));
+        assert_eq!(
+            authorized_identity_devices(&floor, &doc.node_id, now),
+            Some(Vec::new())
+        );
+        floor.acknowledge_host(floor.revision()).unwrap();
+        assert_eq!(
+            authorized_identity_devices(&floor, &doc.node_id, now)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
