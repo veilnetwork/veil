@@ -180,12 +180,14 @@ int main() {
   assert(metric(e, "video_tx_frames") >= paused + 2);
   assert(veil_media_engine_set_video_budget(e, 30, 3) == 0);
   drive(30, true);
-  const auto held = metric(e, "video_tx_frames");
+  const auto higher = metric(e, "video_tx_frames");
+  const auto higher_audio = metric(receiver.get(), "audio_rx_pkts");
   drive(150, true);
-  assert(metric(e, "video_tx_frames") == held);
-  assert(metric(e, "audio_packetization_video_hold") == 1);
+  assert(metric(e, "video_tx_frames") >= higher + 2);
+  assert(metric(receiver.get(), "audio_rx_pkts") > higher_audio);
+  assert(metric(e, "audio_packetization_video_hold") == 0);
   // A user mute stops capture; it does not promise a short audio packet.
-  // The already held >1-fps source must resume without any capture callback.
+  // A live >1-fps source must keep flowing without any capture callback.
   assert(veil_media_engine_set_mic_muted(e, 1) == 0);
   sender_muted = true;
   const auto before_mute = metric(e, "video_tx_frames");
@@ -198,15 +200,15 @@ int main() {
   assert(veil_media_engine_set_mic_muted(e, 0) == 0);
   sender_muted = false;
   assert(metric(e, "audio_packetization_video_hold") == 1);
-  drive(30, true); // Drain video handed to the encoder before unmute.
-  const auto unmuted_hold = metric(e, "video_tx_frames");
+  drive(30, true); // Resume with actual audio, independent of packet duration.
+  const auto unmuted = metric(e, "video_tx_frames");
   drive(150, true);
-  assert(metric(e, "audio_packetization_video_hold") == 1);
-  assert(metric(e, "video_tx_frames") == unmuted_hold);
+  assert(metric(e, "audio_packetization_video_hold") == 0);
+  assert(metric(e, "video_tx_frames") >= unmuted + 2);
   const auto before_sparse_resume = metric(e, "video_tx_frames");
   assert(veil_media_engine_set_video_budget(e, 30, 1) == 0);
   drive(300, true);
   assert(metric(e, "video_tx_frames") >= before_sparse_resume + 2);
   assert(metric(e, "audio_tx_packet_duration_ms") == 60);
-  std::puts("sparse VP8 survives long Opus; explicit pause and larger-source protection retained");
+  std::puts("VP8 grows past sparse trial with live Opus; explicit pause, mute and capture witness retained");
 }
