@@ -12,10 +12,8 @@
 //! wrong place — the machinery in its own file and the twelve calls that use
 //! it a thousand lines deep in `lib.rs`.
 //!
-//! `veil_debug_set_rt_trace` and `veil_debug_set_publish_pause` sat in the
-//! middle of this run and did NOT come along: they are debug knobs for the
-//! whole node, not part of the media plane, and the only thing they shared
-//! with it was an address in the file.
+//! Node-wide tracing and the retired publish-pause compatibility symbol stay
+//! in `lib.rs`; neither belongs to the media plane.
 //!
 //! Moved verbatim out of `lib.rs` (report24 RUNTIME-3), declared `pub mod` so
 //! cbindgen still exports every declaration; the generated header is reordered

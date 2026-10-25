@@ -768,13 +768,12 @@ pub extern "C" fn veil_debug_console_log_write_errors() -> u64 {
     veil_observability::console_log_stats().write_errors
 }
 
-/// EXPERIMENT SWITCH (call-RTT-spike investigation): pause/resume the
-/// embedded node's periodic publish machinery (rendezvous-ad refresh, DHT
-/// republish fan-out). Mid-call measurement only — paused ads age toward
-/// their validity horizon; see `veil_session::rt_trace::set_publish_pause`.
+/// Retired experiment entry point, retained as an inert C compatibility symbol.
+/// The argument is ignored; rendezvous refresh and DHT republishing cannot be
+/// paused through this function.
 #[unsafe(no_mangle)]
 pub extern "C" fn veil_debug_set_publish_pause(on: c_int) {
-    veil_session::rt_trace::set_publish_pause(on != 0);
+    let _ = on;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
