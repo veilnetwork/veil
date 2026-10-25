@@ -1319,6 +1319,32 @@ pub(crate) fn dispatch_onion_cell_with_identity(
     }
 }
 
+/// The named stream endpoint also bootstraps sealed route offers through
+/// authenticated family fanout. Never turn that small control path into a
+/// media/stream ingress or trust its outer sender to authorize a call.
+#[cfg(feature = "node-embedded")]
+fn open_onion_route_control(peer: [u8; 32], cell: &[u8]) -> Option<(RecvLease, Vec<u8>)> {
+    if cell.len() > crate::anon_stream::media_routes::BOOTSTRAP_MAX_BYTES
+        || cell.first() != Some(&MEDIA_MAGIC)
+    {
+        return None;
+    }
+    let lease = recv_lease(&peer)?;
+    let plaintext = lease.cipher.open(&cell[1..])?;
+    plaintext
+        .starts_with(anon_stream_control_magic())
+        .then_some((lease, plaintext))
+}
+
+#[cfg(feature = "node-embedded")]
+pub(crate) fn dispatch_onion_route_control(peer: [u8; 32], cell: &[u8]) {
+    let Some((lease, plaintext)) = open_onion_route_control(peer, cell) else {
+        return;
+    };
+    // Channel close/replacement is rechecked by the normal route dispatcher.
+    crate::media_ffi::dispatch_route_control(peer, lease.chan, &lease.cipher, &plaintext);
+}
+
 #[cfg(feature = "node-embedded")]
 pub(crate) fn dispatch_private_onion_cell(
     peer: [u8; 32],
@@ -1774,6 +1800,58 @@ mod tests {
         clear_recv_callback(identity, 965);
     }
 
+    #[cfg(feature = "node-embedded")]
+    #[test]
+    fn route_bootstrap_requires_the_current_call_key_and_cannot_deliver_rtp() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let peer = [0xe1; 32];
+        let ours = cipher(peer, [0x71; 32], [0x72; 32]);
+        let theirs = peer_cipher([0x72; 32], [0x71; 32]);
+        set_recv_callback(peer, 971, record, std::ptr::null_mut(), Arc::clone(&ours));
+        RX_CALLS.store(0, Ordering::SeqCst);
+        let mut control = [anon_stream_control_magic().as_slice(), &[1; 98]].concat();
+        control[20] = 1; // one route
+        control[21] = 0; // primary receive plane
+        let wire = Transport::Onion.wire(theirs.seal(&control).unwrap());
+        let (lease, decoded) = open_onion_route_control(peer, &wire).unwrap();
+        assert_eq!(lease.chan, 971);
+        assert_eq!(decoded, control);
+        assert!(open_onion_route_control(peer, &wire).is_none(), "replay");
+        assert!(
+            open_onion_route_control([0xe2; 32], &wire).is_none(),
+            "wrong peer"
+        );
+        let wrong_key = peer_cipher([0x74; 32], [0x73; 32]);
+        assert!(
+            open_onion_route_control(
+                peer,
+                &Transport::Onion.wire(wrong_key.seal(&control).unwrap())
+            )
+            .is_none()
+        );
+        assert!(
+            open_onion_route_control(
+                peer,
+                &Transport::Onion.wire(theirs.seal(b"RTP is not route control").unwrap())
+            )
+            .is_none()
+        );
+        let large = theirs.seal(&vec![1; 512]).unwrap();
+        let mut large_wire = vec![MEDIA_MAGIC];
+        large_wire.extend_from_slice(large.as_bytes());
+        assert!(open_onion_route_control(peer, &large_wire).is_none());
+        assert!(
+            ours.open(large.as_bytes()).is_some(),
+            "oversize rejected before AEAD/replay work"
+        );
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 0);
+        clear_recv_callback(peer, 971);
+        assert!(
+            open_onion_route_control(peer, &Transport::Onion.wire(theirs.seal(&control).unwrap()))
+                .is_none()
+        );
+    }
+
     #[test]
     fn video_flood_cannot_age_delayed_audio_out_on_any_transport() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1982,6 +2060,7 @@ mod tests {
             let theirs = peer_cipher(b_to_a, a_to_b);
             set_recv_callback(peer, 2, record, std::ptr::null_mut(), Arc::clone(&ours));
             RX_CALLS.store(0, Ordering::SeqCst);
+            let before = recv_count(peer);
 
             // A third party naming itself as our call peer, on this transport.
             inject_as_peer(transport, peer, &[0x80u8; 160]);
@@ -1995,7 +2074,7 @@ mod tests {
             );
             assert_eq!(
                 recv_count(peer),
-                0,
+                before,
                 "{transport:?}: a stranger must not be able to fake liveness"
             );
 

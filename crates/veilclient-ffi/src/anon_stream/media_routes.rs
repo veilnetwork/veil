@@ -11,6 +11,28 @@ const PROBE_STALE_AFTER: Duration = Duration::from_secs(12);
 const PROBE_IDLE_AFTER: Duration = Duration::from_secs(2);
 const PROBE_RETRY_AFTER: Duration = Duration::from_secs(6);
 const DATAGRAM_WARM_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const BOOTSTRAP_MAX_BYTES: usize =
+    1 + crate::media::MEDIA_SEAL_OVERHEAD + 21 + ROUTE_BYTES * 4;
+
+#[derive(Default)]
+struct BootstrapBudget {
+    revision: u64,
+    sent: u8,
+}
+
+impl BootstrapBudget {
+    fn admit(&mut self, revision: u64) -> bool {
+        if self.revision != revision {
+            self.revision = revision;
+            self.sent = 0;
+        }
+        if self.sent >= 4 {
+            return false;
+        }
+        self.sent += 1;
+        true
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ReceiveAddress {
@@ -385,10 +407,12 @@ pub(crate) struct MediaRoutes {
     channel: u64,
     cores: [CircuitCells; 4],
     cipher: Arc<crate::media::MediaCipher>,
+    bootstrap_sender: Option<Arc<AppSender>>,
     outgoing: [tokio::sync::Mutex<Option<(ReceiveAddress, PinnedRoute, u64)>>; 4],
     repair_generation: [AtomicU64; 4],
     offers: Mutex<OfferInbox>,
     closed: AtomicBool,
+    secondary_active: AtomicBool,
     screen_active: AtomicBool,
     control_active: AtomicBool,
     incoming: Mutex<([Option<ReceiveAddress>; 4], u64)>,
@@ -409,16 +433,19 @@ impl MediaRoutes {
         channel: u64,
         cores: [CircuitCells; 4],
         cipher: Arc<crate::media::MediaCipher>,
+        bootstrap_sender: Option<Arc<AppSender>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             peer,
             channel,
             cores,
             cipher,
+            bootstrap_sender,
             outgoing: std::array::from_fn(|_| tokio::sync::Mutex::new(None)),
             repair_generation: std::array::from_fn(|_| AtomicU64::new(0)),
             offers: Mutex::new(OfferInbox::default()),
             closed: AtomicBool::new(false),
+            secondary_active: AtomicBool::new(false),
             screen_active: AtomicBool::new(false),
             control_active: AtomicBool::new(false),
             incoming: Mutex::new((std::array::from_fn(|_| None), 0)),
@@ -462,7 +489,8 @@ impl MediaRoutes {
 
     fn outgoing_active(&self, i: usize) -> bool {
         match i {
-            0 | 1 => true,
+            0 => true,
+            1 => self.secondary_active.load(Ordering::Acquire),
             2 => self.screen_active.load(Ordering::Acquire),
             3 => self.control_active.load(Ordering::Acquire),
             _ => unreachable!("unknown local producer"),
@@ -526,7 +554,11 @@ impl MediaRoutes {
 
     pub(crate) async fn warm(&self, plane: LocalMediaPlane) {
         let i = plane_index(plane);
-        if i == 2 {
+        if i == 1 {
+            // Incoming video addresses remain published even when our camera
+            // is off. Only the first outgoing video packet needs a send route.
+            self.secondary_active.store(true, Ordering::Release);
+        } else if i == 2 {
             self.screen_active.store(true, Ordering::Release);
         } else if i == 3 {
             self.control_active.store(true, Ordering::Release);
@@ -774,6 +806,7 @@ impl MediaRoutes {
     /// during migration and retries a lost offer without using a mailbox.
     async fn advertise(self: Arc<Self>) {
         self.warm(LocalMediaPlane::Control).await;
+        let mut bootstrap = BootstrapBudget::default();
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -792,6 +825,30 @@ impl MediaRoutes {
                     routes: published.0.iter().flatten().cloned().collect(),
                 }
             };
+            // A family identity's public stream cookie may still belong to a
+            // sibling which did not answer. Bootstrap only the opaque per-call
+            // receive offer through authenticated family delivery as well.
+            // It discloses no physical device id and changes no relay header.
+            if bootstrap.admit(offer.revision)
+                && let Some(sender) = &self.bootstrap_sender
+                && let Some(sealed) = self.cipher.seal_call_control(&offer.encode())
+            {
+                let mut body = vec![crate::media::MEDIA_MAGIC];
+                body.extend_from_slice(sealed.as_bytes());
+                let app = veil_app::address::app_id(&self.peer, STREAM_NAMESPACE, STREAM_NAME);
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    sender.send_on_local_lane(
+                        veil_proto::priority::INTERACTIVE,
+                        self.peer,
+                        app,
+                        STREAM_ENDPOINT_ID,
+                        &body,
+                        true,
+                    ),
+                )
+                .await;
+            }
             for offer in self.advertisement_offers(offer) {
                 if let Some(sealed) = self
                     .cipher
@@ -855,6 +912,7 @@ pub(crate) async fn fixture(
             core.isolated_producer(LocalMediaPlane::Control),
         ],
         cipher,
+        None,
     );
     (dir, runtime, routes)
 }
@@ -920,7 +978,7 @@ impl MediaRoutes {
             cfg,
             aliases,
         ));
-        (Self::new(peer, channel, cores, cipher), mux)
+        (Self::new(peer, channel, cores, cipher, None), mux)
     }
 
     pub(crate) fn receive_addresses_for_test(&self) -> Vec<(u8, [u8; 16])> {
@@ -965,6 +1023,22 @@ impl MediaRoutes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_is_bounded_per_receive_publication() {
+        let mut budget = BootstrapBudget::default();
+        for _ in 0..4 {
+            assert!(budget.admit(1));
+        }
+        for _ in 0..100 {
+            assert!(!budget.admit(1));
+        }
+        assert!(
+            budget.admit(2),
+            "a new receive address needs a new bounded announcement"
+        );
+        assert_eq!(BOOTSTRAP_MAX_BYTES, 382);
+    }
 
     #[tokio::test]
     async fn blocked_control_route_cannot_hold_audio_or_retarget_its_receive_address() {

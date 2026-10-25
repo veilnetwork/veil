@@ -538,6 +538,88 @@ async fn expect_packets(rx: &mut mpsc::Receiver<Received>, wanted: &[Vec<u8>]) {
     .unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audio_only_call_receives_video_without_reserving_an_outgoing_video_route() {
+    let stand = Stand::new().await;
+    let a = &stand.services[0];
+    let c = &stand.services[1];
+    let ca = channel(a.local_node_id(), c.local_node_id(), [0xa1; 32], [0xc1; 32]);
+    let mut cc = channel(c.local_node_id(), a.local_node_id(), [0xc1; 32], [0xa1; 32]);
+    let registry = stand.services[3]
+        .dispatcher
+        .circuit_rendezvous
+        .as_ref()
+        .unwrap();
+    wait_until(|| {
+        registry.lookup(&a.onion_stream_local_cookie()).is_some()
+            && registry.lookup(&c.onion_stream_local_cookie()).is_some()
+    })
+    .await;
+    stand.copy_ads(0, 1);
+    stand.copy_ads(1, 0);
+    ca.routes.start(&tokio::runtime::Handle::current());
+    cc.routes.start(&tokio::runtime::Handle::current());
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if ca.routes.receive_addresses_for_test().len() == 4
+                && cc.routes.receive_addresses_for_test().len() == 4
+                && ca.routes.outgoing_for_test().await.len() >= 2
+                && cc.routes.outgoing_for_test().await.len() >= 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Allow another maintenance tick: a dormant camera must not allocate a
+    // circuit in the background, while every incoming plane remains ready.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for routes in [&ca.routes, &cc.routes] {
+        let planes: Vec<_> = routes
+            .outgoing_for_test()
+            .await
+            .iter()
+            .map(|r| r.plane)
+            .collect();
+        assert_eq!(
+            planes,
+            [0, 3],
+            "audio-only call allocated an unused producer"
+        );
+    }
+    let video = packet(96, 1);
+    assert_eq!(send(ca.id, &video), 0);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !ca
+            .routes
+            .outgoing_for_test()
+            .await
+            .iter()
+            .any(|r| r.plane == 1)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The first loss-tolerant frame can expire during circuit construction.
+    // A fresh packet must traverse the route activated by that first frame.
+    let video = packet(96, 2);
+    assert_eq!(send(ca.id, &video), 0);
+    expect_packet(&mut cc.rx, &video).await;
+    assert!(
+        !cc.routes
+            .outgoing_for_test()
+            .await
+            .iter()
+            .any(|r| r.plane == 1),
+        "receiving video must not activate the receiver's own camera route"
+    );
+    stand.stop().await;
+}
+
 // Separate endpoint carriers deliberately have independent progress. Delaying
 // reliable recovery traffic must not retire a working datagram circuit; losing
 // that circuit's own datagrams MUST still expire it at the original 12-s gate.
@@ -563,6 +645,8 @@ async fn private_route_liveness_follows_its_datagram_carrier_not_reliable_mainte
     stand.copy_ads(1, 0);
     ca.routes.start(&tokio::runtime::Handle::current());
     cc.routes.start(&tokio::runtime::Handle::current());
+    ca.routes.warm(LocalMediaPlane::Secondary).await;
+    cc.routes.warm(LocalMediaPlane::Secondary).await;
     tokio::time::timeout(Duration::from_secs(20), async {
         while ca.routes.outgoing_for_test().await.len() < 3
             || cc.routes.outgoing_for_test().await.len() < 3
@@ -673,6 +757,8 @@ async fn private_routes_negotiate_splice_and_repair_while_video_ingress_is_stall
     stand.copy_ads(1, 0);
     ca.routes.start(&tokio::runtime::Handle::current());
     cc.routes.start(&tokio::runtime::Handle::current());
+    ca.routes.warm(LocalMediaPlane::Secondary).await;
+    cc.routes.warm(LocalMediaPlane::Secondary).await;
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             if ca.routes.outgoing_for_test().await.len() == 3
@@ -945,6 +1031,8 @@ async fn private_media_routes_deliver_over_real_multihop_obfs4_sessions() {
     stand.copy_ads(1, 0);
     ca.routes.start(&tokio::runtime::Handle::current());
     cc.routes.start(&tokio::runtime::Handle::current());
+    ca.routes.warm(LocalMediaPlane::Secondary).await;
+    cc.routes.warm(LocalMediaPlane::Secondary).await;
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if ca.routes.outgoing_for_test().await.len() == 3
@@ -1159,6 +1247,8 @@ async fn extended_receive_routes_interoperate_with_legacy_peer_over_real_obfs4()
     stand.copy_ads(1, 0);
     ca.routes.start(&tokio::runtime::Handle::current());
     cc.routes.start(&tokio::runtime::Handle::current());
+    ca.routes.warm(LocalMediaPlane::Secondary).await;
+    cc.routes.warm(LocalMediaPlane::Secondary).await;
     ca.routes.warm(LocalMediaPlane::Screen).await;
     cc.routes.warm(LocalMediaPlane::Screen).await;
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -1235,6 +1325,8 @@ async fn private_media_paths_use_distinct_first_hops_when_alternatives_exist() {
     stand.copy_ads(1, 0);
     ca.routes.start(&tokio::runtime::Handle::current());
     cc.routes.start(&tokio::runtime::Handle::current());
+    ca.routes.warm(LocalMediaPlane::Secondary).await;
+    cc.routes.warm(LocalMediaPlane::Secondary).await;
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             if ca.routes.outgoing_for_test().await.len() == 3
