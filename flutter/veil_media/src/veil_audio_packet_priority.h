@@ -16,7 +16,7 @@ class AudioPacketPriority {
 
   void Enable() { enabled_.store(true, std::memory_order_release); }
   void Disable() { enabled_.store(false, std::memory_order_release); }
-  // Muted, receive-only and stopped audio cannot emit a fresh short packet.
+  // Muted, receive-only and stopped audio cannot emit a fresh packet.
   // They must not freeze video waiting for nonexistent capture.
   // On resume close the gate until a fresh actual audio packet is observed.
   void SetAudioSending(bool sending) {
@@ -50,8 +50,9 @@ class AudioPacketPriority {
     if (expected_.load() && !paused_.load() && !hold_.load() &&
         last_video_us_.load() >= 0) return false;
     const bool old_hold = hold_.exchange(true, std::memory_order_acq_rel);
-    // Close the video admission gate before checking its last admission. A
-    // concurrent resume cannot reopen video between proof and codec update.
+    // Retain the long-packet choice while checking the source's quiet period.
+    // This is codec coordination, not permission to pause live video: measured
+    // audio pressure and the explicit pause remain the source controller's job.
     if ((expected_.load() && !paused_.load() && !old_hold &&
          last_video_us_.load() >= 0) ||
         !LongPacketsAllowed(now_us)) {
@@ -69,11 +70,14 @@ class AudioPacketPriority {
   }
   void ResetAudio() { audio_ms_.store(0); }
   bool VideoHeldForAudio() const {
+    // A 60-ms Opus packet is not evidence of congestion. Waiting for a short
+    // packet after a sparse video probe froze a healthy camera for tens of
+    // seconds while ANA was still using its low audio-only allocation. Keep
+    // the initial/resumed capture witness, but let measured audio feedback
+    // govern video reduction once any real audio packet has been emitted.
     return enabled_.load(std::memory_order_acquire) &&
         audio_sending_.load(std::memory_order_acquire) && expected_.load() &&
-        (audio_ms_.load() == 0 ||
-         (!sparse_video_.load() &&
-          (hold_.load(std::memory_order_acquire) || audio_ms_.load() > 40)));
+        audio_ms_.load() == 0;
   }
   bool VideoBlocked() const {
     return (enabled_.load() && expected_.load() && paused_.load()) || VideoHeldForAudio();

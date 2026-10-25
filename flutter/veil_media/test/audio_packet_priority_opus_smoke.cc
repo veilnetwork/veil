@@ -92,9 +92,10 @@ int main() {
   feed(200, false, 60, 60);
   require(long_packets > 0, "fully yielded narrow path lost 60-ms support");
   priority->PauseVideo(false, clock.TimeInMicroseconds());
-  require(priority->VideoBlocked(), "resume ignored current long packet mode");
-  feed(200, true, 60, 60);
-  require(priority->VideoBlocked(), "unfunded short packets reopened video");
+  require(!priority->VideoBlocked(), "real 60-ms Opus latched resumed video");
+  const int before_long_resume = video;
+  feed(200, true, 60);
+  require(video > before_long_resume, "video waited for a funded short packet");
   priority->AllowSparseVideo(true);
   const int sparse_before = video;
   feed(300, true, 60, 60);
@@ -105,16 +106,16 @@ int main() {
   feed(200, true, 60); // The just-admitted sparse frame must drain first.
   priority->PauseVideo(false, clock.TimeInMicroseconds());
   priority->AllowSparseVideo(false);
-  require(priority->VideoBlocked(), "larger video source bypassed short-packet ACK");
+  require(!priority->VideoBlocked(), "leaving sparse trial froze live video");
   allocation(160000);
-  require(priority->VideoBlocked(), "requested short allocation was treated as emitted ACK");
+  require(!priority->VideoBlocked(), "a codec allocation paused video");
   const int resumed_before = video;
   feed(200, true, 60, 40);
-  require(!priority->VideoBlocked() && video > resumed_before, "video did not resume after real short packet");
+  require(!priority->VideoBlocked() && video > resumed_before, "short-packet transition interrupted video");
 
-  // Field regression: after yielding on a high-overhead route, the fixed
-  // 96-kbit audio Call ceiling cannot fund short packets. Exercise actual
-  // Opus, including DTX, with the production route-derived GCC ceiling.
+  // A low audio-only allocation after yielding must not freeze a healthy
+  // video source on high-overhead routes. Real Opus remains continuous while
+  // the controller changes duration, including at the route-derived ceiling.
   require(encoder->SetDtx(true), "DTX unavailable");
   for (int route_overhead : {209, 360, 509}) {
     priority->PauseVideo(true, clock.TimeInMicroseconds());
@@ -126,16 +127,18 @@ int main() {
     priority->PauseVideo(false, clock.TimeInMicroseconds());
     if (route_overhead == 509) {
       allocation(96000);
-      feed(300, true, 60, 60);
-      require(priority->VideoBlocked(), "old fixed ceiling unexpectedly funds relay recovery");
+      const int before_narrow = video;
+      feed(300, true, 60);
+      require(video > before_narrow && !priority->VideoBlocked(),
+              "low audio allocation froze video on a high-overhead route");
     }
     allocation(veil_media::framing_audio_transport_ceiling_bps(route_overhead));
-    require(priority->VideoBlocked(), "ceiling update bypassed emitted-short ACK");
+    require(!priority->VideoBlocked(), "ceiling update interrupted video");
     const int before = video;
     feed(300, true, 60, 40);
     require(!priority->VideoBlocked() && video > before,
-            "production ceiling failed to release packetization hold");
+            "production ceiling interrupted video or codec transition");
   }
   opus_decoder_destroy(decoder);
-  std::printf("ok: %d real Opus packets decode; low BWE keeps video live with <=40ms; quiet permits60; short ACK resumes video\n", packets);
+  std::printf("ok: %d real Opus packets decode; low BWE keeps video live; quiet permits60; resuming needs no short-packet ACK\n", packets);
 }

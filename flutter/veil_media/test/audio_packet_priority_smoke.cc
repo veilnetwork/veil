@@ -61,8 +61,9 @@ int main() {
     starting.Encoded(20);
     starting.WantLongPackets(true, 1);
     assert(starting.TryGrantLongPackets(1));
-    assert(starting.VideoBlocked());
-    assert(!starting.BeginVideo());  // No video ever admitted: source is yielded.
+    assert(!starting.VideoBlocked()); // A codec request is not a video pause.
+    assert(starting.BeginVideo());
+    starting.EndVideo(true, 1);
     starting.WantLongPackets(false, 2);
     starting.Encoded(40);
     assert(starting.BeginVideo());
@@ -77,9 +78,9 @@ int main() {
   assert(p.TryGrantLongPackets(0));  // Audio-only is immediately supported.
   p.Encoded(60);
   p.ExpectVideo(true, 1);
-  assert(p.VideoHeldForAudio());
+  assert(!p.VideoHeldForAudio()); // Real long audio is a valid capture witness.
   p.WantLongPackets(false, 2);
-  assert(p.VideoHeldForAudio());  // Requested short is not an emitted short.
+  assert(!p.VideoHeldForAudio()); // Short-packet funding cannot latch the camera.
   p.Encoded(40);
   assert(!p.VideoBlocked());
   assert(p.BeginVideo());
@@ -96,12 +97,13 @@ int main() {
   assert(p.TryGrantLongPackets(32'000'000));
   p.Encoded(60);
   p.PauseVideo(false, 32'000'001);
-  assert(p.VideoBlocked());
-  assert(!p.BeginVideo());
-  p.Encoded(40);  // An old pending short packet cannot acknowledge recovery.
-  assert(p.VideoBlocked());
+  assert(!p.VideoBlocked());
+  assert(p.BeginVideo());
+  p.EndVideo(true, 32'000'001);
+  p.Encoded(40);
+  assert(!p.VideoBlocked());
   p.WantLongPackets(false, 32'000'002);
-  assert(p.VideoBlocked());
+  assert(!p.VideoBlocked());
   p.Encoded(40);
   assert(!p.VideoBlocked());
   assert(p.BeginVideo());
@@ -132,7 +134,7 @@ int main() {
     assert(sparse.TryGrantLongPackets(0));
     sparse.Encoded(60);
     sparse.ExpectVideo(true, 0);
-    assert(sparse.VideoBlocked());
+    assert(!sparse.VideoBlocked());
     sparse.AllowSparseVideo(true);
     assert(!sparse.VideoBlocked() && sparse.BeginVideo());
     assert(sparse.TryGrantLongPackets(1)); // Sparse RTP can coexist with 60 ms.
@@ -142,10 +144,11 @@ int main() {
     assert(!sparse.VideoHeldForAudio()); // Report the explicit pause accurately.
     sparse.PauseVideo(false, 4);
     assert(!sparse.VideoBlocked());
-    sparse.AllowSparseVideo(false); // A higher frame rate still needs funding.
-    assert(sparse.VideoBlocked() && !sparse.BeginVideo());
+    sparse.AllowSparseVideo(false); // A probe cannot close an already live source.
+    assert(!sparse.VideoBlocked() && sparse.BeginVideo());
+    sparse.EndVideo(true, 4);
     sparse.WantLongPackets(false, 5);
-    assert(sparse.VideoBlocked());
+    assert(!sparse.VideoBlocked());
     sparse.Encoded(40);
     assert(!sparse.VideoBlocked());
     sparse.AllowSparseVideo(true);
@@ -155,5 +158,5 @@ int main() {
     sparse.ExpectVideo(false, 6);
     assert(!sparse.BeginVideo());
   }
-  std::puts("ok: emitted short ACK, real video quiescence, in-flight admission, resume and clock bounds");
+  std::puts("ok: capture witness, long Opus video continuity, explicit pause, quiescence, in-flight admission and clock bounds");
 }
