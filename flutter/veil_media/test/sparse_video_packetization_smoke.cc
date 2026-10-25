@@ -170,6 +170,21 @@ int main() {
   assert(metric(receiver.get(), "video_rx_deliver_frames") >= 2);
   assert(metric(e, "audio_tx_packet_duration_ms") == 60);
   assert(metric(e, "audio_packetization_video_hold") == 0);
+  // A cautious 25% probe from one FPS uses fractional cadence, not an
+  // integer-rounded jump. Exercise the public budget API and actual VP8
+  // output for long enough to distinguish 1.25 FPS from both 1 and 2 FPS.
+  assert(veil_media_engine_set_video_budget(e, 19, 1.25) == 0);
+  drive(200, true); // Let the acknowledged reconfiguration settle.
+  const auto fractional_before = metric(e, "video_tx_frames");
+  const auto fractional_audio = metric(receiver.get(), "audio_rx_pkts");
+  drive(1200, true);
+  const auto fractional_frames = metric(e, "video_tx_frames") - fractional_before;
+  std::printf("fractional 19-kbit/1.25-fps probe: %llu frames in 12 seconds\n",
+      static_cast<unsigned long long>(fractional_frames));
+  assert(fractional_frames >= 14 && fractional_frames <= 16);
+  assert(metric(receiver.get(), "audio_rx_pkts") > fractional_audio);
+  assert(metric(e, "audio_packetization_video_hold") == 0);
+  assert(veil_media_engine_set_video_budget(e, 30, 1) == 0);
   assert(veil_media_engine_set_video_send_paused(e, 1) == 0);
   drive(30, true); // Drain a frame already handed to the asynchronous encoder.
   const auto paused = metric(e, "video_tx_frames");
