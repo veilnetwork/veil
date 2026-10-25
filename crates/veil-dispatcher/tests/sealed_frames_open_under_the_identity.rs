@@ -35,14 +35,17 @@ fn the_sealed_path_does_not_open_under_the_session_peer() {
     );
 }
 
-/// The conversation a peer says it cannot open must be dropped under the SAME
-/// key it was stored by, or the drop misses and the next send re-uses a
-/// conversation the peer has already abandoned.
+/// Keep the resolved identity, but scope the reset to the physical session
+/// endpoint. A broad identity reset would discard healthy sibling chains.
 #[test]
-fn forgetting_a_conversation_uses_the_same_key() {
+fn forgetting_a_conversation_uses_the_resolved_identity_and_reporting_device() {
     assert!(
-        APP_RS.contains("ratchet.forget_peer(&sender)"),
-        "forget_peer must name the conversation's own key",
+        APP_RS.contains("ratchet.forget_peer_device(&sender, node_id.as_bytes())"),
+        "reset must use the resolved identity and authenticated physical endpoint",
+    );
+    assert!(
+        !APP_RS.contains("ratchet.forget_peer(&sender)"),
+        "one device's reset must not discard every sibling's conversation",
     );
 }
 
