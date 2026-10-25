@@ -96,7 +96,7 @@ pub fn identity_from_seed(veil_secret: &[u8], epoch: u64) -> SigningKey {
         h.update(veil_secret);
         h.update(&epoch.to_be_bytes());
         h.update(&counter.to_be_bytes());
-        if let Ok(key) = SigningKey::from_bytes(h.finalize().as_bytes()) {
+        if let Ok(key) = SigningKey::from_slice(h.finalize().as_bytes()) {
             return key;
         }
     }

@@ -134,7 +134,7 @@ pub fn verify(event: &Event) -> Result<(), EventError> {
     if pubkey.len() != 32 {
         return Err(EventError::Malformed);
     }
-    let verifying = VerifyingKey::from_bytes(&pubkey).map_err(|_| EventError::Malformed)?;
+    let verifying = VerifyingKey::from_slice(&pubkey).map_err(|_| EventError::Malformed)?;
     let raw = unhex(&event.sig).ok_or(EventError::Malformed)?;
     // Length FIRST. `k256` 0.13.4 panics inside `Signature::try_from` on a
     // slice shorter than 64 bytes (`mid > len`), and this slice comes from a
@@ -192,7 +192,7 @@ mod tests {
     use super::*;
 
     fn key(byte: u8) -> SigningKey {
-        SigningKey::from_bytes(&[byte; 32]).expect("a valid scalar")
+        SigningKey::from_slice(&[byte; 32]).expect("a valid scalar")
     }
 
     #[test]
@@ -245,6 +245,37 @@ mod tests {
         assert_eq!(event.sig.len(), 128, "a schnorr signature is 64 bytes");
         assert_eq!(tag_value(&event, "d"), Some("veil-rendezvous"));
         assert_eq!(tag_value(&event, "missing"), None);
+    }
+
+    #[test]
+    fn k256_upgrade_preserves_previous_nostr_events() {
+        // Generated independently with the preceding k256 0.13.4 dependency,
+        // using only the public test scalar [7; 32]. Check both receiving an
+        // old event and producing exactly the same raw-prehash signature.
+        let previous = Event {
+            id: "f2a117b19f4e0caf5e7a99e82caef06c943b055b12b364a27d000f5e83e46b2f".into(),
+            pubkey: "989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f".into(),
+            created_at: 1700000000,
+            kind: KIND_APP_DATA,
+            tags: vec![vec!["d".into(), "veil-rendezvous".into()]],
+            content: "compatibility fixture".into(),
+            sig: concat!(
+                "9f28e8f914beb8b064868463c5f1377306ef469a52fdb8d6d47ad93ff51cb82a789",
+                "3e6241328b3415cb00a2023b68106bd70f838aae102735a0aa84119d8a8c9"
+            )
+            .into(),
+        };
+        assert_eq!(verify(&previous), Ok(()));
+        assert_eq!(
+            sign(
+                &key(7),
+                previous.created_at,
+                previous.kind,
+                previous.tags.clone(),
+                &previous.content
+            ),
+            previous
+        );
     }
 
     #[test]
