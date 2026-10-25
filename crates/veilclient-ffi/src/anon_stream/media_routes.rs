@@ -537,6 +537,11 @@ impl MediaRoutes {
 
     pub(crate) fn stop(&self) {
         self.closed.store(true, Ordering::Release);
+        for core in &self.cores {
+            if let Some(owner) = &core.producer_owner {
+                owner.close();
+            }
+        }
         for task in self
             .tasks
             .lock()
@@ -553,6 +558,9 @@ impl MediaRoutes {
     }
 
     pub(crate) async fn warm(&self, plane: LocalMediaPlane) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
         let i = plane_index(plane);
         if i == 1 {
             // Incoming video addresses remain published even when our camera
@@ -617,6 +625,7 @@ impl MediaRoutes {
         if let Some((address, owned, _)) = outgoing.as_ref() {
             let route = CircuitRoute {
                 circuit: Arc::clone(&owned.circuit),
+                _lifetime: None,
                 rendezvous_node: Some(address.relay),
                 first_hop_close_generation: owned.close_generation,
                 peer_cookie: address.cookie,
@@ -946,6 +955,28 @@ impl MediaRoutes {
             .into_iter()
             .flatten()
             .map(|entry| entry.peer_cookie)
+            .collect()
+    }
+
+    pub(crate) async fn fallback_origins_for_test(
+        &self,
+        plane: LocalMediaPlane,
+    ) -> Vec<([u8; 32], u32)> {
+        self.cores[plane_index(plane)]
+            .outbound_circuits
+            .lock()
+            .await
+            .values()
+            .flatten()
+            .map(|entry| (entry.circuit.first_hop(), entry.circuit.origin_circuit_id()))
+            .collect()
+    }
+
+    pub(crate) fn fallback_tasks_for_test(&self) -> Vec<tokio::task::AbortHandle> {
+        self.cores
+            .iter()
+            .filter_map(|core| core.producer_owner.as_ref())
+            .flat_map(|owner| owner.tasks_for_test())
             .collect()
     }
 

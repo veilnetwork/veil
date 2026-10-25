@@ -549,6 +549,219 @@ async fn expect_packets(rx: &mut mpsc::Receiver<Received>, wanted: &[Vec<u8>]) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_a_call_cancels_unconfirmed_fallback_without_waiting_for_timeout() {
+    let stand = Stand::new().await;
+    let a = &stand.services[0];
+    let c = &stand.services[1];
+    // Build the real hub and call routes without starting media pumps: a pump
+    // warms its primary route immediately, before we can install the cut.
+    let id = MEDIA_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (routes, _files_a) = MediaRoutes::on_node_for_test(
+        a.local_node_id(),
+        c.local_node_id(),
+        id,
+        Arc::new(cipher_for_test(&c.local_node_id(), &[0xa1; 32], &[0xc1; 32]).unwrap()),
+    );
+    let (peer_routes, _files_c) = MediaRoutes::on_node_for_test(
+        c.local_node_id(),
+        a.local_node_id(),
+        id,
+        Arc::new(cipher_for_test(&a.local_node_id(), &[0xc1; 32], &[0xa1; 32]).unwrap()),
+    );
+    let registry = stand.services[3]
+        .dispatcher
+        .circuit_rendezvous
+        .as_ref()
+        .unwrap();
+    wait_until(|| {
+        registry.lookup(&a.onion_stream_local_cookie()).is_some()
+            && registry.lookup(&c.onion_stream_local_cookie()).is_some()
+    })
+    .await;
+    stand.copy_ads(0, 1);
+    let table = a.dispatcher.circuit_origin.as_ref().unwrap();
+    let snapshot = || {
+        let mut ids = std::collections::HashSet::new();
+        table.for_each(|c| {
+            ids.insert((c.first_hop, c.origin_circuit_id));
+        });
+        ids
+    };
+    let before = snapshot();
+    // The first hop receives the setup, but the final hop never sees it.
+    // No CircuitBuilt/echo can complete the pending confirmation.
+    *stand.cut_link.lock().unwrap() = Some((2, 3));
+    routes.warm(LocalMediaPlane::Primary).await;
+    wait_until(|| {
+        stand
+            .cut_link_frames
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    })
+    .await;
+    let pending: Vec<_> = snapshot().difference(&before).copied().collect();
+    assert!(
+        !pending.is_empty(),
+        "a real origin candidate must have been allocated"
+    );
+    assert!(
+        routes
+            .fallback_origins_for_test(LocalMediaPlane::Primary)
+            .await
+            .is_empty()
+    );
+    let tasks = routes.fallback_tasks_for_test();
+    assert!(!tasks.is_empty());
+    routes.stop();
+    // Keeping the routes alive also rules out success solely from Arc drop.
+    routes.warm(LocalMediaPlane::Primary).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let retired = pending.iter().all(|(hop, id)| {
+                let relay = stand
+                    .services
+                    .iter()
+                    .find(|s| s.local_node_id() == *hop)
+                    .unwrap();
+                table.lookup(hop, *id).is_none()
+                    && relay
+                        .dispatcher
+                        .circuit_table
+                        .as_ref()
+                        .unwrap()
+                        .lookup_forward(&a.local_node_id(), *id)
+                        .is_none()
+            });
+            if retired && tasks.iter().all(|task| task.is_finished()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("closing must cancel confirmation and release its allocated circuit");
+    assert!(routes.fallback_tasks_for_test().is_empty());
+    assert!(registry.lookup(&a.onion_stream_local_cookie()).is_some());
+    peer_routes.stop();
+    drop(routes);
+    drop(peer_routes);
+    stand.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_a_call_releases_fallback_circuits_while_file_streams_stay_live() {
+    let stand = Stand::new().await;
+    let a = &stand.services[0];
+    let c = &stand.services[1];
+    let ca = channel(a.local_node_id(), c.local_node_id(), [0xa1; 32], [0xc1; 32]);
+    let cc = channel(c.local_node_id(), a.local_node_id(), [0xc1; 32], [0xa1; 32]);
+    let registry = stand.services[3]
+        .dispatcher
+        .circuit_rendezvous
+        .as_ref()
+        .unwrap();
+    wait_until(|| {
+        registry.lookup(&a.onion_stream_local_cookie()).is_some()
+            && registry.lookup(&c.onion_stream_local_cookie()).is_some()
+    })
+    .await;
+    stand.copy_ads(0, 1);
+    // Do not start private-route workers: the fallback's lifetime must be
+    // checked independently of the already-owned private routes.
+    ca.routes.warm(LocalMediaPlane::Primary).await;
+    let origins = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let origins = ca
+                .routes
+                .fallback_origins_for_test(LocalMediaPlane::Primary)
+                .await;
+            if !origins.is_empty() {
+                break origins;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the real fallback must be established before closing it");
+    let origin_table = a.dispatcher.circuit_origin.as_ref().unwrap();
+    for (hop, id) in &origins {
+        assert!(origin_table.lookup(hop, *id).is_some());
+        let relay = stand
+            .services
+            .iter()
+            .find(|s| s.local_node_id() == *hop)
+            .unwrap();
+        assert!(
+            relay
+                .dispatcher
+                .circuit_table
+                .as_ref()
+                .unwrap()
+                .lookup_forward(&a.local_node_id(), *id)
+                .is_some()
+        );
+    }
+    let files = Arc::clone(&ca.files);
+    drop(ca);
+    let retired = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if origins.iter().all(|(hop, id)| {
+                let relay = stand
+                    .services
+                    .iter()
+                    .find(|s| s.local_node_id() == *hop)
+                    .unwrap();
+                origin_table.lookup(hop, *id).is_none()
+                    && relay
+                        .dispatcher
+                        .circuit_table
+                        .as_ref()
+                        .unwrap()
+                        .lookup_forward(&a.local_node_id(), *id)
+                        .is_none()
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    // Nodes stay running throughout: node teardown/TTL cannot hide a leak.
+    assert!(
+        retired.is_ok(),
+        "closed-call fallback still occupies origin/relay slots"
+    );
+    assert!(registry.lookup(&a.onion_stream_local_cookie()).is_some());
+    let expected = b"file stream after media close";
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let outgoing = files.open(veil_onion_stream::Addr {
+            node: c.local_node_id(),
+            app: [0; 32],
+        });
+        let send = async {
+            outgoing.write_all(expected).await.unwrap();
+            outgoing.finish().await.unwrap();
+        };
+        let receive = async {
+            let (mut incoming, _) = cc.files.accept().await.unwrap();
+            let mut actual = vec![0; expected.len()];
+            let mut offset = 0;
+            while offset < actual.len() {
+                let count = incoming.read(&mut actual[offset..]).await.unwrap();
+                assert!(count > 0, "file stream ended prematurely");
+                offset += count;
+            }
+            assert_eq!(actual, expected);
+        };
+        tokio::join!(send, receive);
+    })
+    .await
+    .expect("the shared file hub must survive media-only cleanup");
+    drop(cc);
+    stand.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fallback_uses_the_call_receive_address_instead_of_an_obsolete_public_cookie() {
     let stand = Stand::new().await;
     let a = &stand.services[0];

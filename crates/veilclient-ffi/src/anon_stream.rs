@@ -36,6 +36,9 @@ use veilclient::{AppSender, IncomingMessage};
 
 use crate::media::{LocalMediaPlane, SealedMediaCell};
 
+mod producer_circuits;
+use producer_circuits::{ProducerCircuit, ProducerCircuitOwner};
+
 /// Emit a one-line diagnostic that NEVER panics. `eprintln!` PANICS if the
 /// underlying stderr write fails — and under `flutter run` the desktop app's
 /// stderr is a pipe that can break, so an `eprintln!` mid-stream panicked and,
@@ -804,6 +807,7 @@ impl CellSender for AnonCells {
 /// receiver can map the opaque tag back to the sender's node id.
 #[derive(Clone)]
 struct CircuitCells {
+    producer_owner: Option<Arc<ProducerCircuitOwner>>,
     path_group: veil_node_runtime::LocalCircuitPathGroup,
     /// Only lossy local sends use this lane; it is absent from circuit frames.
     local_datagram_lane: u8,
@@ -933,6 +937,7 @@ impl OutboundOpening {
 #[derive(Clone)]
 struct CircuitEntry {
     circuit: Arc<veil_node_runtime::DataCircuit>,
+    lifetime: Option<Arc<ProducerCircuit>>,
     rendezvous_node: [u8; 32],
     first_hop_close_generation: u64,
     peer_tag: [u8; CIRCUIT_PEER_TAG_LEN],
@@ -973,6 +978,7 @@ impl CircuitEntry {
     fn route(&self) -> CircuitRoute {
         CircuitRoute {
             circuit: Arc::clone(&self.circuit),
+            _lifetime: self.lifetime.clone(),
             rendezvous_node: Some(self.rendezvous_node),
             first_hop_close_generation: self.first_hop_close_generation,
             peer_cookie: self.peer_cookie,
@@ -997,6 +1003,7 @@ fn record_stream_route_closed(route_class: RouteClass, route: &CircuitRoute) {
 #[derive(Clone)]
 struct CircuitRoute {
     circuit: Arc<veil_node_runtime::DataCircuit>,
+    _lifetime: Option<Arc<ProducerCircuit>>,
     rendezvous_node: Option<[u8; 32]>,
     first_hop_close_generation: u64,
     /// Cookie every cell on this route is addressed to — see
@@ -1682,11 +1689,21 @@ impl CellSender for CircuitCells {
 }
 
 impl CircuitCells {
+    fn retire_outbound_circuits(&self, circuits: Vec<Arc<veil_node_runtime::DataCircuit>>) {
+        // Isolated producer guards retire their own circuits. The file hub's
+        // delayed receive-sink cleanup would needlessly retain services for
+        // ten minutes after a media channel closed.
+        if self.producer_owner.is_none() {
+            retire_circuits_later(&self.services, circuits);
+        }
+    }
+
     /// Independent local circuit ownership for an out-of-band producer.
     /// Published receive registration, feeds and authentication stay hub-wide;
     /// the role of the producer is never added to a circuit frame.
     fn isolated_producer(&self, plane: LocalMediaPlane) -> Self {
         Self {
+            producer_owner: Some(Arc::new(ProducerCircuitOwner::default())),
             path_group: match plane {
                 LocalMediaPlane::Primary | LocalMediaPlane::Secondary => self.path_group.isolated(),
                 LocalMediaPlane::Screen | LocalMediaPlane::Control => {
@@ -2531,6 +2548,7 @@ impl CircuitCells {
                 .cloned()
                 .map(|circuit| CircuitRoute {
                     circuit,
+                    _lifetime: None,
                     rendezvous_node: None,
                     first_hop_close_generation: 0,
                     // Validation mode has no ad to read a cookie out of; it keeps
@@ -2717,8 +2735,7 @@ impl CircuitCells {
                                 now,
                             );
                             drop(circuits);
-                            retire_circuits_later(
-                                &self.services,
+                            self.retire_outbound_circuits(
                                 idle.into_iter().map(|entry| entry.circuit).collect(),
                             );
                             self.ensure_outbound_opening_for(
@@ -2774,7 +2791,7 @@ impl CircuitCells {
             }
         };
         if let Some(retired) = retired {
-            retire_circuits_later(&self.services, retired);
+            self.retire_outbound_circuits(retired);
         }
         {
             let mut circuits = self.outbound_circuits.lock().await;
@@ -3044,7 +3061,7 @@ impl CircuitCells {
         for (route_class, route) in removed_routes {
             record_stream_route_closed(route_class, &route);
         }
-        retire_circuits_later(&self.services, retired);
+        self.retire_outbound_circuits(retired);
         let stats = route
             .stats
             .as_ref()
@@ -3327,7 +3344,7 @@ impl CircuitCells {
                     .unwrap_or_default()
             };
             if !retired.is_empty() {
-                retire_circuits_later(&self.services, retired);
+                self.retire_outbound_circuits(retired);
             }
         }
         let message = if quarantine_route {
@@ -3568,7 +3585,7 @@ impl CircuitCells {
             })
         };
         if let Some(retired) = retired {
-            retire_circuits_later(&self.services, vec![retired]);
+            self.retire_outbound_circuits(vec![retired]);
         }
         let stats = route
             .stats
@@ -3645,6 +3662,13 @@ impl CircuitCells {
         intent: PoolOpenIntent,
         cause: &'static str,
     ) {
+        if self
+            .producer_owner
+            .as_ref()
+            .is_some_and(|owner| owner.is_closed())
+        {
+            return;
+        }
         let now = Instant::now();
         let required_intent = {
             let mut opening = self.outbound_opening.lock().await;
@@ -3714,7 +3738,8 @@ impl CircuitCells {
         let pool_target = self.outbound_pool_target_for(route_class);
         let private_registration = self.private_outbound_registration;
         let path_group = self.path_group.clone();
-        tokio::spawn(async move {
+        let producer_owner = self.producer_owner.clone();
+        let task = tokio::spawn(async move {
             loop {
                 let intent = PoolOpenIntent::load(&required_intent);
                 let represented_rendezvous = if intent == PoolOpenIntent::Expand {
@@ -3757,6 +3782,7 @@ impl CircuitCells {
                     represented_rendezvous,
                     private_registration,
                     path_group.clone(),
+                    producer_owner.clone(),
                 )
                 .await;
                 if let Err(e) = &opened {
@@ -3797,6 +3823,9 @@ impl CircuitCells {
                 break;
             }
         });
+        if let Some(owner) = &self.producer_owner {
+            owner.track_task(task.abort_handle());
+        }
     }
 
     async fn open_outbound_for_handshake(
@@ -4723,6 +4752,7 @@ fn try_open_circuit(
         }
     });
     Some(CircuitCells {
+        producer_owner: None,
         path_group,
         local_datagram_lane: veil_proto::priority::INTERACTIVE,
         // An outbound setup/probe must not replace our advertised inbound
@@ -4918,6 +4948,7 @@ async fn open_outbound_circuit(
     represented_rendezvous: HashSet<[u8; 32]>,
     private_registration: bool,
     path_group: veil_node_runtime::LocalCircuitPathGroup,
+    producer_owner: Option<Arc<ProducerCircuitOwner>>,
 ) -> Result<usize, String> {
     let desired_pool_target = pool_target.clamp(1, MAX_CIRCUIT_OUTBOUND_POOL);
     let mut ads = services
@@ -5254,7 +5285,8 @@ async fn open_outbound_circuit(
         // AND recognises the loopback splice-probe echo used below — the open
         // above registered OUR cookie at this relay, so a probe up this
         // candidate echoes back down it exactly as on the inbound side.
-        spawn_circuit_feed(
+        let candidate = Arc::new(candidate);
+        let feed = spawn_circuit_feed(
             services.clone(),
             recv_rx,
             in_tx.clone(),
@@ -5263,6 +5295,14 @@ async fn open_outbound_circuit(
             Arc::clone(&peer_tags),
             Some(candidate.confirmed_flag()),
         );
+        let lifetime = match &producer_owner {
+            Some(owner) => Some(
+                owner
+                    .track_circuit(services.clone(), Arc::clone(&candidate), feed)
+                    .ok_or_else(|| "local producer closed during circuit open".to_owned())?,
+            ),
+            None => None,
+        };
         if !confirm_circuit_with_probe(&services, &candidate, &registration.cookie).await {
             last_err = format!(
                 "R={} confirmation timed out after {}ms (no ACK, no probe echo)",
@@ -5278,11 +5318,12 @@ async fn open_outbound_circuit(
             // Even with probes the registration can be live with every echo
             // lost; the feed above keeps receiving for the retire grace while
             // a later open picks a confirmed send path.
-            retire_circuits_later(&services, vec![Arc::new(candidate)]);
+            if producer_owner.is_none() {
+                retire_circuits_later(&services, vec![candidate]);
+            }
             continue;
         }
 
-        let candidate = Arc::new(candidate);
         let now = Instant::now();
         let first_hop = candidate.first_hop();
         if !services.has_live_session(&first_hop) {
@@ -5294,7 +5335,9 @@ async fn open_outbound_circuit(
             );
             mark_first_hop_cooldown(&first_hop_cooldowns, first_hop, CIRCUIT_ROUTE_SEND_COOLDOWN);
             diag_node(&me, &format!("outbound {last_err}"));
-            retire_circuits_later(&services, vec![candidate]);
+            if producer_owner.is_none() {
+                retire_circuits_later(&services, vec![candidate]);
+            }
             continue;
         }
         if cooled_first_hops
@@ -5308,7 +5351,9 @@ async fn open_outbound_circuit(
                 short_node(&first_hop)
             );
             diag_node(&me, &format!("outbound {last_err}"));
-            retire_circuits_later(&services, vec![candidate]);
+            if producer_owner.is_none() {
+                retire_circuits_later(&services, vec![candidate]);
+            }
             continue;
         }
         if opened_entries
@@ -5329,6 +5374,7 @@ async fn open_outbound_circuit(
         note_answering_device(&peer_aliases, &ad, dst_node);
         opened_entries.push(CircuitEntry {
             circuit: Arc::clone(&candidate),
+            lifetime,
             rendezvous_node: ad.rendezvous_node_id,
             first_hop_close_generation: services.session_close_generation(&first_hop),
             peer_tag,
@@ -5510,7 +5556,7 @@ async fn publish_outbound_candidates(
         let dup = opened_first_hops.contains(&entry.circuit.first_hop());
         if (busy || fresh) && !dup && merged.len() < MAX_CIRCUIT_OUTBOUND_POOL {
             merged.push(entry);
-        } else {
+        } else if entry.lifetime.is_none() {
             retired.push(entry.circuit);
         }
     }
@@ -5566,7 +5612,7 @@ fn spawn_circuit_feed(
     inbound_activity: Option<Arc<Mutex<Instant>>>,
     peer_tags: SharedPeerTags,
     confirmed: Option<Arc<std::sync::atomic::AtomicBool>>,
-) {
+) -> tokio::task::AbortHandle {
     tokio::spawn(run_circuit_feed(
         services,
         recv_rx,
@@ -5576,7 +5622,8 @@ fn spawn_circuit_feed(
         peer_tags,
         confirmed,
         CircuitFeedMode::Streams,
-    ));
+    ))
+    .abort_handle()
 }
 
 enum CircuitFeedMode {
