@@ -836,6 +836,7 @@ fn add_circuit(
 fn route(circuit: &Arc<veil_node_runtime::DataCircuit>, sender: [u8; 32]) -> CircuitRoute {
     CircuitRoute {
         circuit: Arc::clone(circuit),
+        _lifetime: None,
         rendezvous_node: Some(circuit.first_hop()),
         first_hop_close_generation: 0,
         peer_cookie: [0x42; COOKIE_LEN],
@@ -862,6 +863,7 @@ fn entry(route: &CircuitRoute, streams: &[u32]) -> CircuitEntry {
     let now = Instant::now();
     CircuitEntry {
         circuit: Arc::clone(&route.circuit),
+        lifetime: route._lifetime.clone(),
         rendezvous_node: route.rendezvous_node.unwrap(),
         first_hop_close_generation: route.first_hop_close_generation,
         peer_tag: [0x32; CIRCUIT_PEER_TAG_LEN],
@@ -963,6 +965,7 @@ async fn reject_without_handoff(stale_guard: bool) {
         if stale_guard {
             let route = CircuitRoute {
                 circuit: Arc::clone(&f.circuit),
+                _lifetime: None,
                 rendezvous_node: Some(f.hop),
                 first_hop_close_generation: 0,
                 peer_cookie: [0x42; COOKIE_LEN],
@@ -1251,6 +1254,7 @@ async fn stale_primary_ack_completes_when_an_alternate_actually_accepts_it() {
         destination.node,
         vec![CircuitEntry {
             circuit: alternate,
+            lifetime: None,
             rendezvous_node: hop,
             first_hop_close_generation: 0,
             peer_tag: [0x32; CIRCUIT_PEER_TAG_LEN],
