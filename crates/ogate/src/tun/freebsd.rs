@@ -86,7 +86,12 @@ impl Device {
             }
         }
 
-        let async_fd = AsyncFd::new(owned).map_err(TunError::Io)?;
+        // SAFETY: owned is the valid descriptor opened above and moves into
+        // AsyncFd. Readers/writers only borrow it; none closes or replaces it
+        // before the last Arc drops the registration and its OwnedFd.
+        let async_fd = unsafe { AsyncFd::register(owned) }
+            .map_err(std::io::Error::from)
+            .map_err(TunError::Io)?;
 
         // Audit batch 2026-05-24: NO Mutex wrap.  `AsyncFd::readable()` and
         // `AsyncFd::writable()` are independent — both can have in-flight
