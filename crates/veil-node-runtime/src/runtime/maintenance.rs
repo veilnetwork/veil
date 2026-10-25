@@ -1046,11 +1046,6 @@ impl NodeRuntime {
             MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, is_currently_valid,
             rendezvous_ad_dht_key_at, sign_rendezvous_ad_v5,
         };
-        // Call-RTT-spike experiment switch: skip the refresh tick entirely
-        // while publish is paused (see veil_session::rt_trace::publish_pause).
-        if veil_session::rt_trace::publish_pause_enabled() {
-            return 0;
-        }
         // Only what can actually be published is copied.
         //
         // The whole registry was cloned on every tick — every entry with its
