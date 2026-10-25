@@ -94,6 +94,8 @@ pub enum SenderError {
         "reply requested but this node has no anonymity key — set [anonymity].receive_anonymous to be reply-capable"
     )]
     MissingReplyCapability,
+    #[error("local anonymous send queue remained full")]
+    LocalBackpressure,
 }
 
 impl From<PacketError> for SenderError {

@@ -26,6 +26,107 @@ use std::sync::Arc;
 
 use super::*;
 
+type BuiltIntroduce = ([u8; 32], Vec<u8>);
+
+/// Select one current chat registration from already verified advertisements.
+/// A linked device publishes at its physical address using its identity's chat
+/// cookie. Its old self cookie can remain valid in DHT after the restart. Only
+/// a verified device delegation may supply the additional chat-cookie candidate;
+/// unrelated (possibly newer) onion-stream advertisements are not chat routes.
+fn chat_rendezvous_ads(
+    mut ads: Vec<veil_anonymity::rendezvous::RendezvousAd>,
+    receiver_node_id: &[u8; 32],
+    identity: Option<&[u8; 32]>,
+    cap: usize,
+) -> Vec<veil_anonymity::rendezvous::RendezvousAd> {
+    if cap == 0 {
+        return Vec::new();
+    }
+    let physical_cookie = service_tasks::rendezvous_cookie_from_node_id(receiver_node_id);
+    let identity_cookie = identity.map(service_tasks::rendezvous_cookie_from_node_id);
+    // Prefer the current identity when pre-link and post-link publications land
+    // in the same second. Otherwise freshness decides between the two known
+    // chat cookies, before the generation filter below.
+    ads.sort_by_key(|ad| {
+        std::cmp::Reverse((ad.valid_from_unix, Some(ad.auth_cookie) == identity_cookie))
+    });
+    let primary = ads
+        .iter()
+        .find(|ad| ad.auth_cookie == physical_cookie || Some(ad.auth_cookie) == identity_cookie);
+    // Keep the legacy fallback only when no delegated identity is known.
+    let Some(primary) = primary.or_else(|| identity.is_none().then(|| ads.first()).flatten())
+    else {
+        return Vec::new();
+    };
+    let cookie = primary.auth_cookie;
+    let generation = primary.valid_from_unix;
+    let receiver_key = primary.receiver_x25519_pk;
+    let kem_algo = primary.rendezvous_kem_algo;
+    let kem_key = primary.rendezvous_kem_pk.clone();
+    let mut seen_relays = std::collections::HashSet::new();
+    ads.into_iter()
+        .filter(|ad| {
+            ad.auth_cookie == cookie
+                && ad.valid_from_unix == generation
+                && ad.receiver_x25519_pk == receiver_key
+                && ad.rendezvous_kem_algo == kem_algo
+                && ad.rendezvous_kem_pk == kem_key
+                && seen_relays.insert(ad.rendezvous_node_id)
+        })
+        .take(cap)
+        .collect()
+}
+
+/// The local sovereign document is already signature-verified on admission;
+/// still check the selected sibling's authorization window and revocation now.
+fn own_chat_identity(
+    doc: &veil_proto::identity_document::IdentityDocument,
+    device: &[u8; 32],
+    now: u64,
+) -> Option<[u8; 32]> {
+    if &doc.node_id == device
+        || doc.valid_until_unix < now
+        || doc
+            .revoked_devices
+            .iter()
+            .any(|revoked| &revoked.device_id == device)
+    {
+        return None;
+    }
+    doc.identity_keys
+        .iter()
+        .enumerate()
+        .find_map(|(index, key)| {
+            (&key.device_id == device
+                && veil_identity::verify::authorize_device_key_at(doc, index, now).is_ok())
+            .then_some(doc.node_id)
+        })
+}
+
+/// Wait only for source-local capacity, retaining one already-built cell.
+/// The bounded FIFO and neutral wire header are unchanged. No registry lock is
+/// held while waiting; session closure/removal is never retried here.
+async fn enqueue_introduce_with_backpressure(
+    registry: &std::sync::RwLock<veil_session::SessionTxRegistry>,
+    peer: &[u8; 32],
+    local_lane: u8,
+    frame: Vec<u8>,
+    deadline: tokio::time::Instant,
+) -> std::result::Result<(), veil_session::SendToError> {
+    let frame = veil_bufpool::pooled_shared_from_vec(frame);
+    loop {
+        let result = rlock!(registry).send_to_arc_result(peer, local_lane, frame.clone());
+        if result != Err(veil_session::SendToError::Full) {
+            return result;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return result;
+        }
+        tokio::time::sleep_until(deadline.min(now + std::time::Duration::from_millis(2))).await;
+    }
+}
+
 /// One `RelayChain::<msg>` control frame, header and body.
 pub(crate) fn relay_chain_frame(msg: veil_proto::family::RelayChainMsg, body: &[u8]) -> Vec<u8> {
     use veil_proto::{codec::encode_header, family::FrameFamily, header::FrameHeader};
@@ -363,6 +464,7 @@ impl NodeServices {
 
         // Each fragment: [APP_DELIVER_AUTH tag][AuthDeliverFragment] → sealed +
         // onion-routed to the rendezvous independently.
+        let enqueue_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         for (idx, chunk) in auth_bytes.chunks(chunk_size).enumerate() {
             let frag = veil_proto::AuthDeliverFragment {
                 msg_id,
@@ -383,27 +485,32 @@ impl NodeServices {
                 // receiver's CURRENT registration set, so a single chain lands
                 // and the extra copies were pure traffic (device-verified
                 // 2026-07-05: 15/15 delivered at redundancy=1). A genuine
-                // R→recipient cell loss falls back to the mailbox-drain hot
-                // window, same as bulk fragments.
+                // forward loss needs an application retry of the signed whole.
+                // Local backpressure below keeps source queue pressure from
+                // discarding fragments before they reach the first hop.
                 let relay = relays[idx % relays.len()];
-                self.send_sealed_introduce_on_local_lane(
+                self.send_sealed_introduce_with_backpressure(
                     relay,
                     &sealed_plaintext,
                     hop_count,
                     circuit_backed,
                     local_lane,
-                )?;
+                    enqueue_deadline,
+                )
+                .await?;
             } else {
                 // Bounded retransmit: send the fragment `redundancy` times over
                 // independent circuits; the recipient de-dups by (msg_id, frag_idx).
                 for _ in 0..redundancy.max(1) {
-                    self.send_sealed_introduce_on_local_lane(
+                    self.send_sealed_introduce_with_backpressure(
                         ad,
                         &sealed_plaintext,
                         hop_count,
                         circuit_backed,
                         local_lane,
-                    )?;
+                        enqueue_deadline,
+                    )
+                    .await?;
                 }
             }
         }
@@ -671,7 +778,7 @@ impl NodeServices {
         // a relay that no longer owns the cookie (`cookie_unknown`). Compare
         // independently-served candidates on a short cadence and repair the
         // local mirror with the newest publication.
-        let mut ads = rendezvous_resolver::resolve_fresh_rendezvous_ads(
+        let ads = rendezvous_resolver::resolve_fresh_rendezvous_ads(
             &self.dht,
             &self.session_tx_registry,
             &self.dispatcher.pending_recursive,
@@ -683,74 +790,23 @@ impl NodeServices {
             rendezvous_resolver::ResolveMode::Any,
         )
         .await;
-        // Pick the most-recently-PUBLISHED ad (highest valid_from_unix, set to
-        // now at publish), NOT the highest valid_until. The auth_cookie is
-        // per-period (derive_onion_auth_cookie(seed, now/86400)), so the
-        // freshest-published ad carries the cookie that matches the receiver's
-        // CURRENT registration. Ranking by valid_until preferred a stale ad from
-        // a previous period that merely has a LONGER validity window (e.g. an old
-        // 24h ad over today's 1h ad) — its old-period cookie then mismatched at
-        // the relay and EVERY introduce was dropped as `cookie_unknown` (the
-        // onion content path's residual ~30% loss after the replica-resolver fix;
-        // this `send_anonymous_authenticated_to` selection is the one the content
-        // send actually uses).
-        ads.sort_by_key(|ad| std::cmp::Reverse(ad.valid_from_unix));
-        if ads.is_empty() {
+        let identity = self
+            .identity
+            .sovereign_identity
+            .get()
+            .and_then(|sov| own_chat_identity(&sov.document, &receiver_node_id, stall_now_unix))
+            .or_else(|| {
+                self.identity
+                    .peer_mlkem_cert_store
+                    .document_floor
+                    .identity_hint_for_device(&receiver_node_id, stall_now_unix)
+            });
+        let mut chosen = chat_rendezvous_ads(ads, &receiver_node_id, identity.as_ref(), 3);
+        if chosen.is_empty() {
             return Err(AnonOnionSendError::NoRendezvous);
         }
-        // The receiver's CHAT cookie is deterministic + public
-        // (`rendezvous_cookie_from_node_id`, the same XOR-fold the recipient
-        // task and the app's mailbox publisher register under). Filter to it
-        // UP FRONT: the resolved union can also contain other same-receiver
-        // publications (e.g. the onion-stream cookie published for a
-        // just-opened stream circuit) whose valid_from can outrank the chat
-        // ads — taking ads[0].auth_cookie blindly then aimed every chat
-        // introduce at the stream registration. Fall back to the freshest
-        // ad's cookie only if no ad carries the expected chat cookie
-        // (unexpected publisher — behave like the legacy selection).
-        let expected_cookie = service_tasks::rendezvous_cookie_from_node_id(&receiver_node_id);
-        let primary_cookie = if ads.iter().any(|a| a.auth_cookie == expected_cookie) {
-            expected_cookie
-        } else {
-            ads[0].auth_cookie
-        };
-        // Keep up to MAX distinct-relay ads (freshest-first). The recipient
-        // registered on several rendezvous relays; bulk content is round-robined
-        // across them for parallel-endpoint throughput instead of funnelling
-        // redundant copies through one. A recipient on a single relay yields one
-        // ad → classic path.
-        const MAX_PARALLEL_RELAYS: usize = 3;
-        // GENERATION gate: the receiver re-signs ALL its plain ads together with
-        // one shared valid_from stamp (see `tick_publish_rendezvous_ads`), so
-        // "the receiver's current relay set" is exactly the same-cookie ads
-        // carrying the NEWEST stamp. The chat cookie itself never rotates, so
-        // cookie equality cannot tell a live relay from one the receiver left
-        // minutes ago whose unexpired ad still floats around DHT replicas — the
-        // relay dropped that registration the moment the receiver's session
-        // closed, and an introduce there is silently dropped as cookie_unknown.
-        // Spreading strictly within the newest generation keeps every parallel
-        // introduce on a relay of the receiver's current registration set.
-        let primary_generation = ads
-            .iter()
-            .find(|a| a.auth_cookie == primary_cookie)
-            .map(|a| a.valid_from_unix)
-            .unwrap_or(ads[0].valid_from_unix);
-        let mut chosen: Vec<veil_anonymity::rendezvous::RendezvousAd> = Vec::new();
-        let mut seen_relays = std::collections::HashSet::new();
-        for a in ads {
-            if a.auth_cookie != primary_cookie {
-                continue; // different publication (e.g. stream cookie)
-            }
-            if a.valid_from_unix != primary_generation {
-                continue; // stale generation → receiver likely left this relay
-            }
-            if seen_relays.insert(a.rendezvous_node_id) {
-                chosen.push(a);
-                if chosen.len() >= MAX_PARALLEL_RELAYS {
-                    break;
-                }
-            }
-        }
+        let mut seen_relays: std::collections::HashSet<_> =
+            chosen.iter().map(|ad| ad.rendezvous_node_id).collect();
         // Stalled route: additionally introduce at connected relay candidates
         // the resolvable ads did NOT name, XOR-ordered by R's node_id (the same
         // metric R's own recipient task uses to pick its relays, so the overlap
@@ -1825,6 +1881,87 @@ impl NodeServices {
         circuit_backed: bool,
         local_lane: u8,
     ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
+        let Some((first_hop_node_id, frame)) =
+            self.build_sealed_introduce(ad, sealed_plaintext, hop_count, circuit_backed)?
+        else {
+            return Ok(());
+        };
+        if let Some(ref reg) = self.dispatcher.session_tx_registry {
+            let guard = wlock!(reg);
+            let sent = guard.send_to_result(&first_hop_node_id, local_lane, frame);
+            drop(guard);
+            if let Err(e) = sent {
+                // Introduce lost. Rare with the liveness guard above (session
+                // died between snapshot and send, or TX queue Full). Log the
+                // reason + record the failure; still fire-and-forget (see
+                // send_anonymous — a synchronous error would leak first-hop
+                // reachability).
+                match e {
+                    veil_session::SendToError::Missing => log::debug!(
+                        "anonymity.first_hop.session_missing path=introduce first_hop={}",
+                        veil_util::hex_short(&first_hop_node_id),
+                    ),
+                    _ => log::warn!(
+                        "anonymity.first_hop.send_failed path=introduce reason={e:?} first_hop={}",
+                        veil_util::hex_short(&first_hop_node_id),
+                    ),
+                }
+                self.anonymity
+                    .relay_reputation
+                    .record_failure(first_hop_node_id);
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_sealed_introduce_with_backpressure(
+        &self,
+        ad: &veil_anonymity::rendezvous::RendezvousAd,
+        sealed_plaintext: &[u8],
+        hop_count: usize,
+        circuit_backed: bool,
+        local_lane: u8,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<(), veil_anonymity::sender::SenderError> {
+        let Some((first_hop, frame)) =
+            self.build_sealed_introduce(ad, sealed_plaintext, hop_count, circuit_backed)?
+        else {
+            return Ok(());
+        };
+        if let Some(ref registry) = self.dispatcher.session_tx_registry {
+            match enqueue_introduce_with_backpressure(
+                registry, &first_hop, local_lane, frame, deadline,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(veil_session::SendToError::Full) => {
+                    // Source congestion is not a remote relay failure. Let the
+                    // application retry the signed whole instead of claiming
+                    // success after dropping a necessary fragment locally.
+                    log::warn!(
+                        "anonymity.source_queue.full authenticated message could not \
+                         enter the local queue within its deadline"
+                    );
+                    return Err(veil_anonymity::sender::SenderError::LocalBackpressure);
+                }
+                Err(_) => {
+                    // Preserve silent-drop behavior for first-hop reachability.
+                    self.anonymity.relay_reputation.record_failure(first_hop);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn build_sealed_introduce(
+        &self,
+        ad: &veil_anonymity::rendezvous::RendezvousAd,
+        sealed_plaintext: &[u8],
+        hop_count: usize,
+        circuit_backed: bool,
+    ) -> std::result::Result<Option<BuiltIntroduce>, veil_anonymity::sender::SenderError> {
         use veil_anonymity::rendezvous::{IntroducePayload, encrypt_introduce, final_hop_kind};
 
         // Step 2: seal to receiver_x25519_pk. Rendezvous cannot read
@@ -1897,7 +2034,7 @@ impl NodeServices {
             None => {
                 // Rendezvous not in our DHT cache — same silent-drop
                 // semantics as `send_anonymous` first-hop unreachable.
-                return Ok(());
+                return Ok(None);
             }
         };
 
@@ -2025,32 +2162,7 @@ impl NodeServices {
         hdr.set_priority(veil_proto::priority::INTERACTIVE);
         let mut frame = encode_header(&hdr).to_vec();
         frame.extend_from_slice(&cell[..]);
-        if let Some(ref reg) = self.dispatcher.session_tx_registry {
-            let guard = wlock!(reg);
-            let sent = guard.send_to_result(&first_hop_node_id, local_lane, frame);
-            drop(guard);
-            if let Err(e) = sent {
-                // Introduce lost. Rare with the liveness guard above (session
-                // died between snapshot and send, or TX queue Full). Log the
-                // reason + record the failure; still fire-and-forget (see
-                // send_anonymous — a synchronous error would leak first-hop
-                // reachability).
-                match e {
-                    veil_session::SendToError::Missing => log::debug!(
-                        "anonymity.first_hop.session_missing path=introduce first_hop={}",
-                        veil_util::hex_short(&first_hop_node_id),
-                    ),
-                    _ => log::warn!(
-                        "anonymity.first_hop.send_failed path=introduce reason={e:?} first_hop={}",
-                        veil_util::hex_short(&first_hop_node_id),
-                    ),
-                }
-                self.anonymity
-                    .relay_reputation
-                    .record_failure(first_hop_node_id);
-            }
-        }
-        Ok(())
+        Ok(Some((first_hop_node_id, frame)))
     }
 }
 
@@ -2123,5 +2235,260 @@ mod local_circuit_lanes_tests {
             assert_eq!(header.msg_type, RelayChainMsg::CircuitData as u16);
             assert_eq!(&frame[HEADER_SIZE..], body);
         }
+    }
+}
+
+#[cfg(test)]
+mod chat_ad_tests {
+    use super::*;
+    fn ad(
+        receiver: [u8; 32],
+        cookie: [u8; 16],
+        relay: u8,
+        generation: u64,
+    ) -> veil_anonymity::rendezvous::RendezvousAd {
+        veil_anonymity::rendezvous::RendezvousAd {
+            receiver_node_id: receiver,
+            rendezvous_node_id: [relay; 32],
+            auth_cookie: cookie,
+            receiver_x25519_pk: [7; 32],
+            valid_from_unix: generation,
+            valid_until_unix: generation + 10_000,
+            issuer_pk: String::new(),
+            issuer_algo: veil_types::SignatureAlgorithm::Ed25519,
+            signature: Vec::new(),
+            push_envelope: Vec::new(),
+            capability_token: Vec::new(),
+            wake_hmac_envelope: Vec::new(),
+            rendezvous_kem_algo: 0,
+            rendezvous_kem_pk: Vec::new(),
+            wire_version: 5,
+        }
+    }
+    #[test]
+    fn a_linked_devices_current_chat_cookie_precedes_its_old_self_cookie() {
+        let mut device = [0; 32];
+        device[0] = 0x11;
+        let mut identity = [0; 32];
+        identity[0] = 0x42;
+        let before = service_tasks::rendezvous_cookie_from_node_id(&device);
+        let current = service_tasks::rendezvous_cookie_from_node_id(&identity);
+        assert_ne!(before, current);
+        let selected = chat_rendezvous_ads(
+            vec![
+                ad(device, before, 1, 10),
+                ad(device, current, 2, 20),
+                ad(device, current, 3, 20),
+                ad(device, [0x99; 16], 4, 30), // an even newer STREAM ad
+            ],
+            &device,
+            Some(&identity),
+            3,
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|a| a.rendezvous_node_id)
+                .collect::<Vec<_>>(),
+            vec![[2; 32], [3; 32]]
+        );
+        assert!(selected.iter().all(|a| a.auth_cookie == current));
+    }
+
+    #[test]
+    fn same_second_identity_rotation_does_not_select_the_old_self_cookie() {
+        let device = [1; 32];
+        let mut identity = device;
+        identity[0] = 2;
+        let old = service_tasks::rendezvous_cookie_from_node_id(&device);
+        let current = service_tasks::rendezvous_cookie_from_node_id(&identity);
+        let selected = chat_rendezvous_ads(
+            vec![ad(device, old, 1, 10), ad(device, current, 2, 10)],
+            &device,
+            Some(&identity),
+            3,
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].auth_cookie, current);
+    }
+
+    #[test]
+    fn stream_ads_are_not_a_fallback_for_a_known_identity() {
+        let device = [1; 32];
+        let identity = [2; 32];
+        assert!(
+            chat_rendezvous_ads(
+                vec![ad(device, [9; 16], 1, 100)],
+                &device,
+                Some(&identity),
+                3,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_generation_uses_distinct_relays_with_the_same_receiver_keys() {
+        let device = [1; 32];
+        let cookie = service_tasks::rendezvous_cookie_from_node_id(&device);
+        let mut wrong_key = ad(device, cookie, 4, 10);
+        wrong_key.receiver_x25519_pk = [8; 32];
+        let mut wrong_kem = ad(device, cookie, 5, 10);
+        wrong_kem.rendezvous_kem_pk = vec![8; 32];
+        let selected = chat_rendezvous_ads(
+            vec![
+                ad(device, cookie, 1, 10),
+                ad(device, cookie, 1, 10),
+                ad(device, cookie, 2, 9),
+                wrong_key,
+                wrong_kem,
+                ad(device, cookie, 3, 10),
+                ad(device, cookie, 6, 10),
+            ],
+            &device,
+            None,
+            2,
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|a| a.rendezvous_node_id)
+                .collect::<Vec<_>>(),
+            vec![[1; 32], [3; 32]]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_local_queue_waits_for_capacity_without_losing_a_fragment() {
+        let peer = [0x67; 32];
+        let mut registry = veil_session::SessionTxRegistry::with_capacity(1);
+        let mut rx = registry.register(peer);
+        let lane = veil_proto::priority::INTERACTIVE;
+        registry.send_to_result(&peer, lane, vec![1]).unwrap();
+        let registry = std::sync::RwLock::new(registry);
+        let (sent, mut rx) = tokio::join!(
+            enqueue_introduce_with_backpressure(
+                &registry,
+                &peer,
+                lane,
+                vec![2],
+                tokio::time::Instant::now() + std::time::Duration::from_millis(200)
+            ),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                let (actual_lane, first) = rx.recv().await.unwrap();
+                assert_eq!(actual_lane, lane);
+                assert_eq!(&first[..], &[1]);
+                rx
+            },
+        );
+        assert!(
+            sent.is_ok(),
+            "a transient local queue must not discard a signed fragment: {sent:?}"
+        );
+        let (actual_lane, second) = rx.try_recv().unwrap();
+        assert_eq!(actual_lane, lane);
+        assert_eq!(&second[..], &[2]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn local_queue_wait_is_bounded_and_does_not_retry_missing_sessions() {
+        let peer = [0x68; 32];
+        let mut registry = veil_session::SessionTxRegistry::with_capacity(1);
+        let mut rx = registry.register(peer);
+        let lane = veil_proto::priority::INTERACTIVE;
+        registry.send_to_result(&peer, lane, vec![1]).unwrap();
+        let registry = std::sync::RwLock::new(registry);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            enqueue_introduce_with_backpressure(
+                &registry,
+                &peer,
+                lane,
+                vec![2],
+                tokio::time::Instant::now() + std::time::Duration::from_millis(10),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Err(veil_session::SendToError::Full));
+        assert_eq!(&rx.try_recv().unwrap().1[..], &[1]);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            enqueue_introduce_with_backpressure(
+                &registry,
+                &[0; 32],
+                lane,
+                vec![3],
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1)
+            )
+            .await,
+            Err(veil_session::SendToError::Missing)
+        );
+    }
+
+    #[test]
+    fn a_chat_alias_requires_a_current_signed_device_delegation() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use veil_crypto::identity::{certify_message, compute_node_id};
+        use veil_proto::identity_document::{
+            ALGO_ED25519, DOC_SIG_CONTEXT, IdentityDocument, IdentityKey, RevokedDevice,
+        };
+        let master = SigningKey::from_bytes(&[1; 32]);
+        let sub = SigningKey::from_bytes(&[2; 32]);
+        let pubkey = sub.verifying_key().to_bytes();
+        let device = compute_node_id(&pubkey);
+        let identity = compute_node_id(master.verifying_key().as_bytes());
+        let mut doc = IdentityDocument {
+            node_id: identity,
+            master_algo: ALGO_ED25519,
+            master_pubkey: master.verifying_key().to_bytes().to_vec(),
+            issued_at_unix: 100,
+            valid_until_unix: 2000,
+            sig_key_idx: 0,
+            identity_keys: vec![IdentityKey {
+                algo: ALGO_ED25519,
+                pubkey: pubkey.to_vec(),
+                device_id: device,
+                valid_from_unix: 100,
+                valid_until_unix: 2000,
+                master_sig: master
+                    .sign(&certify_message(
+                        &identity,
+                        ALGO_ED25519,
+                        &pubkey,
+                        &device,
+                        100,
+                        2000,
+                    ))
+                    .to_bytes()
+                    .to_vec(),
+            }],
+            revoked_devices: vec![],
+            document_sig: vec![],
+        };
+        let sign = |doc: &mut IdentityDocument| {
+            let mut message = DOC_SIG_CONTEXT.to_vec();
+            message.extend_from_slice(&doc.canonical_signing_bytes());
+            doc.document_sig = sub.sign(&message).to_bytes().to_vec();
+        };
+        sign(&mut doc);
+        assert_eq!(own_chat_identity(&doc, &device, 1000), Some(identity));
+        assert_eq!(own_chat_identity(&doc, &[9; 32], 1000), None);
+        assert_eq!(own_chat_identity(&doc, &device, 2001), None);
+        let mut invalid = doc.clone();
+        invalid.document_sig[0] ^= 1;
+        assert_eq!(own_chat_identity(&invalid, &device, 1000), None);
+        doc.revoked_devices.push(RevokedDevice {
+            device_id: device,
+            master_sig: master
+                .sign(&RevokedDevice::signing_message(&identity, &device))
+                .to_bytes()
+                .to_vec(),
+        });
+        sign(&mut doc);
+        assert!(veil_identity::verify::verify_identity_document(&doc, 1000).is_ok());
+        assert_eq!(own_chat_identity(&doc, &device, 1000), None);
     }
 }
