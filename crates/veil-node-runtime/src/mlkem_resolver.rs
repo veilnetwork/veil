@@ -1781,21 +1781,42 @@ where
         pending: pending_recursive,
         ids: query_ids,
     };
+    let trace_started = std::time::Instant::now();
+    let trace = veil_session::rt_trace::rt_trace_enabled();
     let mut replies: futures::stream::FuturesUnordered<_> = sent
         .into_iter()
         .map(|query| async move {
-            tokio::time::timeout_at(deadline, query.rx)
-                .await
-                .ok()
-                .and_then(Result::ok)
+            (
+                query.peer,
+                tokio::time::timeout_at(deadline, query.rx).await,
+            )
         })
         .collect();
     use futures::StreamExt;
-    while let Some(reply) = replies.next().await {
-        if let Some(bytes) = reply
-            && !bytes.is_empty()
-            && is_valid(&bytes)
-        {
+    while let Some((peer, reply)) = replies.next().await {
+        let (outcome, bytes) = match reply {
+            Ok(Ok(bytes)) => (
+                if bytes.is_empty() { "empty" } else { "value" },
+                Some(bytes),
+            ),
+            Ok(Err(_)) => ("closed", None),
+            Err(_) => ("timeout", None),
+        };
+        let valid = bytes
+            .as_ref()
+            .is_some_and(|bytes| !bytes.is_empty() && is_valid(bytes));
+        // Explicit endpoint diagnostics only. Bounded by the ordinary replica
+        // query cap; no record content, callback I/O or routing-policy change.
+        // Raw target/peer identifiers stay in private traces, never reports.
+        if trace {
+            log::info!(
+                "dht.candidates.reply target={} peer={} outcome={outcome} valid={valid} elapsed_ms={}",
+                veil_util::hex_short(&key),
+                veil_util::hex_short(&peer),
+                trace_started.elapsed().as_millis(),
+            );
+        }
+        if valid && let Some(bytes) = bytes {
             out.push(bytes);
         }
     }
