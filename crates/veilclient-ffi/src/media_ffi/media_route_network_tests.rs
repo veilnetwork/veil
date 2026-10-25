@@ -549,6 +549,128 @@ async fn expect_packets(rx: &mut mpsc::Receiver<Received>, wanted: &[Vec<u8>]) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fallback_uses_the_call_receive_address_instead_of_an_obsolete_public_cookie() {
+    let stand = Stand::new().await;
+    let a = &stand.services[0];
+    let c = &stand.services[1];
+    let mut cc = channel(c.local_node_id(), a.local_node_id(), [0xc1; 32], [0xa1; 32]);
+    cc.routes.start(&tokio::runtime::Handle::current());
+    wait_until(|| cc.routes.receive_addresses_for_test().len() == 4).await;
+    // A family's public ad may refer to a different, unavailable device. The
+    // selected call endpoint still has its own authenticated receive address.
+    let obsolete_cookie = [0xb7; 16];
+    let registry = stand.services[3]
+        .dispatcher
+        .circuit_rendezvous
+        .as_ref()
+        .unwrap();
+    assert!(registry.lookup(&obsolete_cookie).is_none());
+    wait_until(|| registry.lookup(&c.onion_stream_local_cookie()).is_some()).await;
+    let identity = &c.identity.local_identity;
+    let obsolete_key = stand.services[2].stream_peer_intro_public_key().unwrap();
+    assert_ne!(obsolete_key, c.stream_peer_intro_public_key().unwrap());
+    let now = veil_util::unix_secs_now_u64();
+    let obsolete_ad = veil_anonymity::rendezvous::sign_rendezvous_ad_v5(
+        c.local_node_id(),
+        stand.services[3].local_node_id(),
+        obsolete_cookie,
+        obsolete_key,
+        now,
+        now + 1800,
+        &[],
+        &[],
+        &[],
+        0,
+        &[],
+        &identity.public_key,
+        &identity.private_key,
+        identity.algo,
+    )
+    .unwrap();
+    // Give A only the stale sibling record. Its signature is valid, but its
+    // cookie and introduction key both differ from the selected call endpoint.
+    for slot in 0..veil_anonymity::rendezvous::MAX_RENDEZVOUS_AD_SLOTS {
+        let key = veil_anonymity::rendezvous::rendezvous_ad_dht_key_at(&c.local_node_id(), slot);
+        a.dht.store_local(key, obsolete_ad.clone());
+    }
+    let resolved = a
+        .resolve_stream_rendezvous_ads(c.local_node_id())
+        .await
+        .unwrap();
+    assert!(!resolved.is_empty());
+    assert!(
+        resolved
+            .iter()
+            .all(|ad| ad.auth_cookie == obsolete_cookie && ad.receiver_x25519_pk == obsolete_key)
+    );
+    let ca = channel(a.local_node_id(), c.local_node_id(), [0xa1; 32], [0xc1; 32]);
+    // Deliberately do not start A's private route workers: only its normal
+    // fallback pool can transmit. C's encrypted offer must still reach A.
+    wait_until(|| ca.routes.received_offer_for_test().is_some()).await;
+    let cipher = Arc::clone(&MEDIA_CHANNELS.read().unwrap().get(&ca.id).unwrap().cipher);
+    let wanted = packet(111, 71);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let sealed = cipher
+                .seal_on_plane(LocalMediaPlane::Primary, &wanted)
+                .unwrap();
+            if ca
+                .routes
+                .send_fallback_for_test(LocalMediaPlane::Primary, &sealed)
+                .await
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("negative control: a real fallback circuit must accept the packet");
+    let public_cookies = ca
+        .routes
+        .fallback_cookies_for_test(LocalMediaPlane::Primary)
+        .await;
+    let received = tokio::time::timeout(Duration::from_secs(2), cc.rx.recv()).await;
+    let private_received = cc.routes.received_media_cells_for_test()[0];
+    // A cookie registered at R cannot be reused at an unrelated relay, even
+    // if the healthy public pool would otherwise accept this new packet.
+    let mut other_relay = ca.routes.received_offer_for_test().unwrap();
+    let revision = u64::from_be_bytes(other_relay[12..20].try_into().unwrap());
+    other_relay[12..20].copy_from_slice(&(revision + 1000).to_be_bytes());
+    assert_eq!(other_relay[21], 0);
+    other_relay[22..54].copy_from_slice(&stand.services[2].local_node_id());
+    ca.routes.accept_control(&other_relay);
+    let rejected = cipher
+        .seal_on_plane(LocalMediaPlane::Primary, &packet(111, 72))
+        .unwrap();
+    let wrong_relay_accepted = ca
+        .routes
+        .send_fallback_for_test(LocalMediaPlane::Primary, &rejected)
+        .await;
+    assert!(ca.routes.outgoing_for_test().await.is_empty());
+    drop((ca, cc));
+    stand.stop().await;
+    assert_eq!(
+        public_cookies,
+        [obsolete_cookie],
+        "fixture must use the obsolete public ad"
+    );
+    let packet = received
+        .expect("fallback sent to the obsolete public cookie")
+        .unwrap()
+        .packet;
+    assert_eq!(packet, wanted);
+    assert!(
+        private_received > 0,
+        "packet must arrive at the selected private receive address"
+    );
+    assert!(
+        !wrong_relay_accepted,
+        "must not retarget a circuit to another relay"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn audio_only_call_receives_video_without_reserving_an_outgoing_video_route() {
     let stand = Stand::new().await;
     let a = &stand.services[0];
