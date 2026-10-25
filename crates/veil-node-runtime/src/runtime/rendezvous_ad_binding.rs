@@ -242,6 +242,53 @@ mod tests {
         decode_rendezvous_ad(&delegated_ad_bytes(receiver, signer, now)).unwrap()
     }
 
+    #[tokio::test]
+    async fn auth_sender_resolution_cannot_roll_back_a_known_or_restored_revocation() {
+        use veil_proto::identity_document::IdentityDocument;
+        let now = veil_util::unix_secs_now_u64();
+        let (before, _) = delegated_document(151, now - 60, false);
+        let (revoked, _) = delegated_document(151, now - 59, true);
+        let mut outcomes = Vec::new();
+        for restored in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let mut config = super::super::tests::runtime_config_with_metrics();
+            config.peers.clear();
+            config.global.builtin_seed_policy = veil_cfg::BuiltinSeedPolicy::Never;
+            config.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+            veil_cfg::save_config(&path, &config).unwrap();
+            let mut runtime = super::super::NodeRuntime::start(&path, true).await.unwrap();
+            let access = runtime.access();
+            assert!(
+                access
+                    .identity
+                    .peer_mlkem_cert_store
+                    .document_floor
+                    .observe(&revoked, now)
+            );
+            drop(access);
+            if restored {
+                runtime.stop().await.unwrap();
+                runtime = super::super::NodeRuntime::start(&path, true).await.unwrap();
+            }
+            let access = runtime.access();
+            access
+                .dht
+                .store_local(IdentityDocument::dht_key(&before.node_id), before.encode());
+            let resolved = access
+                .resolve_one_identity_doc(
+                    before.node_id,
+                    now,
+                    std::time::Duration::from_millis(100),
+                )
+                .await;
+            let result = resolved.map(|(_, doc)| doc.revoked_devices.len());
+            runtime.stop().await.unwrap();
+            outcomes.push((restored, result.unwrap()));
+        }
+        assert_eq!(outcomes, vec![(false, 1), (true, 1)]);
+    }
+
     #[test]
     fn an_identity_ad_refuses_a_revoked_device_even_with_a_valid_signature() {
         use veil_proto::identity_document::IdentityDocument;

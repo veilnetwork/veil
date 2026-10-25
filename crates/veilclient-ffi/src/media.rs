@@ -1296,6 +1296,29 @@ pub(crate) fn dispatch_onion_cell(peer: [u8; 32], cell: &[u8]) -> bool {
     true
 }
 
+/// The identity hint comes from the runtime's verified device authorization.
+/// It selects a receive key; only that call's AEAD admits the payload.
+pub(crate) fn dispatch_onion_cell_with_identity(
+    peer: [u8; 32],
+    identity: Option<[u8; 32]>,
+    cell: &[u8],
+) -> bool {
+    if cell.first() != Some(&MEDIA_MAGIC) {
+        return false;
+    }
+    let selected = recv_lease(&peer).map(|lease| (peer, lease)).or_else(|| {
+        identity.and_then(|identity| recv_lease(&identity).map(|lease| (identity, lease)))
+    });
+    if let Some((expected_peer, lease)) = selected {
+        // Keep counts and private-route control on the identity that owns the
+        // callback, never on the untrusted outer envelope's device name.
+        dispatch_inbound_with_lease(expected_peer, &cell[1..], lease);
+        true
+    } else {
+        dispatch_onion_cell(peer, cell)
+    }
+}
+
 #[cfg(feature = "node-embedded")]
 pub(crate) fn dispatch_private_onion_cell(
     peer: [u8; 32],
@@ -1694,6 +1717,61 @@ mod tests {
             MediaCipher::new(&[0x9au8; 32], &[0xa1u8; 32], &[0xa2u8; 32]).expect("usable");
         let sealed = attacker.seal(plaintext).expect("attacker can seal");
         transport.ingress(peer, &transport.wire(sealed));
+    }
+
+    #[test]
+    fn onion_device_identity_hint_selects_the_call_key_without_authorizing_plaintext() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let identity = [0xd1; 32];
+        let device = [0xd2; 32];
+        let ours = cipher(identity, [0x31; 32], [0x32; 32]);
+        let theirs = peer_cipher([0x32; 32], [0x31; 32]);
+        set_recv_callback(identity, 965, record, std::ptr::null_mut(), ours);
+        RX_CALLS.store(0, Ordering::SeqCst);
+        let before = recv_count(identity);
+        let wire = Transport::Onion.wire(theirs.seal(b"voice").unwrap());
+        // A transport device id alone cannot pick a different identity's key.
+        dispatch_onion_cell(device, &wire);
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 0);
+        assert!(dispatch_onion_cell_with_identity(
+            device,
+            Some(identity),
+            &wire
+        ));
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(recv_count(identity), before + 1);
+        // Replay under an alias is still the same receive-key replay window.
+        dispatch_onion_cell_with_identity(device, Some(identity), &wire);
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 1);
+        let forged =
+            Transport::Onion.wire(peer_cipher([0x34; 32], [0x33; 32]).seal(b"forged").unwrap());
+        dispatch_onion_cell_with_identity(device, Some(identity), &forged);
+        dispatch_onion_cell_with_identity(
+            device,
+            Some(identity),
+            &Transport::Onion.wire_unsealed(b"unsealed"),
+        );
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 1);
+        // Other carriers keep their existing exact-peer dispatch contract.
+        let other = theirs.seal(b"other carrier").unwrap();
+        dispatch_inbound_auto(device, other.as_bytes());
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 1);
+        // A physical callback has priority; the hint cannot redirect it.
+        set_recv_callback(
+            device,
+            966,
+            record,
+            std::ptr::null_mut(),
+            cipher(device, [0x35; 32], [0x36; 32]),
+        );
+        dispatch_onion_cell_with_identity(
+            device,
+            Some(identity),
+            &Transport::Onion.wire(theirs.seal(b"wrong slot").unwrap()),
+        );
+        assert_eq!(RX_CALLS.load(Ordering::SeqCst), 1);
+        clear_recv_callback(device, 966);
+        clear_recv_callback(identity, 965);
     }
 
     #[test]
