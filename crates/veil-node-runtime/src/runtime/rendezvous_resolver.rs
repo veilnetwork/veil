@@ -61,7 +61,8 @@ impl ResolveMode {
             return None;
         }
         let ads = match self {
-            Self::Any | Self::ChatFamily => cache.get(receiver, now),
+            Self::Any => cache.get(receiver, now),
+            Self::ChatFamily => cache.get_with_document_check(receiver, now),
             Self::RefreshAhead => None,
             Self::Stream {
                 mailbox_cookie,
@@ -298,15 +299,46 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
     // has been resolved; filtering by the local shard above discarded that ad
     // forever on a cold sender. NOTHING below enters a route cache or the DHT
     // mirror until the complete signature/delegation check succeeds.
-    let slots = if ads.is_empty() {
-        futures::future::join_all(walks).await
-    } else {
-        Vec::new()
+    // A family send always needs the document. A known delegated identity's
+    // ordinary/background/stream refresh needs it too. These are independent
+    // reads with identical authority checks; do not serialize two full DHT
+    // deadlines while holding this receiver's single-flight lock.
+    let document_in_parallel = matches!(mode, ResolveMode::ChatFamily)
+        || (!from_local_mirror
+            && authorization.current(&receiver_id).is_some_and(|doc| {
+                doc.identity_keys
+                    .iter()
+                    .any(|key| key.device_id != receiver_id)
+            }));
+    let read_slots = async {
+        if ads.is_empty() {
+            futures::future::join_all(walks).await
+        } else {
+            Vec::new()
+        }
     };
+    let read_document = async {
+        if document_in_parallel {
+            Some(
+                lookup_receiver_documents(
+                    dht,
+                    session_tx_registry,
+                    pending_recursive,
+                    local_node_id,
+                    receiver_id,
+                    timeout,
+                )
+                .await,
+            )
+        } else {
+            None
+        }
+    };
+    let (slots, early_documents) = futures::join!(read_slots, read_document);
     // Even when the cached document admits the signer, refresh delegation
     // along with its ad. Otherwise an active but revoked key's fresh ad keeps
     // the old document sufficient forever and the revocation is never learned.
-    let needs_delegation = matches!(mode, ResolveMode::ChatFamily)
+    let needs_delegation = early_documents.is_some()
         || slots.iter().any(|(_, _, candidates)| {
             candidates.iter().any(|bytes| {
                 decode_rendezvous_ad(bytes)
@@ -322,26 +354,20 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
         // existing fast path. Compare all normal replica holders, including a
         // valid local copy, so a stale remote document cannot overwrite a newer
         // verified delegation already held here.
-        let documents = crate::mlkem_resolver::recursive_dht_get_candidates(
-            dht,
-            session_tx_registry,
-            pending_recursive,
-            local_node_id,
-            key,
-            timeout,
-            veil_proto::budget::DHT_REPLICATION_K,
-            |bytes| {
-                IdentityDocument::decode(bytes).is_ok_and(|doc| {
-                    doc.node_id == receiver_id
-                        && veil_identity::verify::verify_identity_document(
-                            &doc,
-                            veil_util::unix_secs_now_u64(),
-                        )
-                        .is_ok()
-                })
-            },
-        )
-        .await;
+        let documents = match early_documents {
+            Some(documents) => documents,
+            None => {
+                lookup_receiver_documents(
+                    dht,
+                    session_tx_registry,
+                    pending_recursive,
+                    local_node_id,
+                    receiver_id,
+                    timeout,
+                )
+                .await
+            }
+        };
         let mut documents: Vec<_> = documents
             .into_iter()
             .filter_map(|bytes| IdentityDocument::decode(&bytes).ok())
@@ -416,9 +442,46 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
                 ads[0].valid_from_unix,
             ),
         );
-        resolve_cache.put(receiver_id, ads.clone());
+        if needs_delegation {
+            resolve_cache.put_with_document_check(receiver_id, ads.clone(), true);
+        } else {
+            resolve_cache.put(receiver_id, ads.clone());
+        }
     }
     ads
+}
+
+async fn lookup_receiver_documents(
+    dht: &Arc<veil_dht::KademliaService>,
+    registry: &Arc<std::sync::RwLock<veil_session::SessionTxRegistry>>,
+    pending: &Arc<
+        std::sync::Mutex<std::collections::HashMap<[u8; 16], veil_dispatcher::PendingRecursive>>,
+    >,
+    local_node_id: [u8; 32],
+    receiver_id: [u8; 32],
+    timeout: std::time::Duration,
+) -> Vec<Vec<u8>> {
+    use veil_proto::identity_document::IdentityDocument;
+    crate::mlkem_resolver::recursive_dht_get_candidates(
+        dht,
+        registry,
+        pending,
+        local_node_id,
+        IdentityDocument::dht_key(&receiver_id),
+        timeout,
+        veil_proto::budget::DHT_REPLICATION_K,
+        |bytes| {
+            IdentityDocument::decode(bytes).is_ok_and(|doc| {
+                doc.node_id == receiver_id
+                    && veil_identity::verify::verify_identity_document(
+                        &doc,
+                        veil_util::unix_secs_now_u64(),
+                    )
+                    .is_ok()
+            })
+        },
+    )
+    .await
 }
 
 /// Adapts the runtime's `NodeServices` to the IPC-layer [`veil_types::
