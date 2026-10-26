@@ -465,10 +465,11 @@ impl FrameDispatcher {
                                 Ok(origin) => origin,
                                 Err(disposition) => return disposition,
                             };
-                            if !self
-                                .dht
-                                .store_with_origin(payload.key, payload.value, origin)
-                            {
+                            if !self.dht.store_space_discovery_sample(
+                                payload.key,
+                                &payload.value,
+                                origin,
+                            ) {
                                 return DispatchResult::RateLimited;
                             }
                             return DispatchResult::NoResponse;
@@ -1390,9 +1391,8 @@ impl FrameDispatcher {
 
     /// STORE/mirror conflict gate for the multi-writer public-Space index.
     ///
-    /// Each DHT node retains one deterministic rendezvous sample for a search
-    /// token; a K-replica contested read therefore returns a bounded diverse
-    /// set instead of converging on a last-writer-wins singleton.
+    /// Each DHT node retains a bounded deterministic set of independent
+    /// holder samples. Commit re-merges against the current value under CAS.
     #[allow(clippy::result_large_err)]
     pub fn space_discovery_store_gate(
         &self,
@@ -1400,8 +1400,8 @@ impl FrameDispatcher {
         value: &[u8],
     ) -> Result<[u8; 32], DispatchResult> {
         use veil_crypto::space_discovery::{
-            SpaceDiscoveryError, SpaceDiscoveryRecord, SpaceDiscoveryStoreDecision,
-            space_discovery_store_decision,
+            SpaceDiscoveryError, SpaceDiscoveryRecord, decode_space_discovery_samples,
+            merge_space_discovery_sample,
         };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1431,11 +1431,13 @@ impl FrameDispatcher {
         let existing = self.dht.get_local(key);
         let same_holder_refresh = existing
             .as_deref()
-            .and_then(SpaceDiscoveryRecord::from_bytes)
-            .is_some_and(|current| {
-                current.route == record.route
-                    && current.space_id == record.space_id
-                    && current.holder_node_id == record.holder_node_id
+            .and_then(decode_space_discovery_samples)
+            .is_some_and(|records| {
+                records.iter().any(|current| {
+                    current.route == record.route
+                        && current.space_id == record.space_id
+                        && current.holder_node_id == record.holder_node_id
+                })
             });
         // A common search-token key is intentionally multi-writer. Only a
         // refresh of the exact same holder+Space sample is quota-exempt;
@@ -1450,12 +1452,12 @@ impl FrameDispatcher {
         {
             return Err(DispatchResult::NoResponse);
         }
-        match space_discovery_store_decision(existing.as_deref(), value, now, &self.local_node_id) {
-            SpaceDiscoveryStoreDecision::RejectInvalid => Err(DispatchResult::Violation(
-                "Store: invalid SpaceDiscoveryRecord".to_owned(),
-            )),
-            SpaceDiscoveryStoreDecision::RejectKeepExisting => Err(DispatchResult::NoResponse),
-            SpaceDiscoveryStoreDecision::Accept => Ok(record.holder_node_id),
+        if merge_space_discovery_sample(existing.as_deref(), value, now, &self.local_node_id)
+            .is_some()
+        {
+            Ok(record.holder_node_id)
+        } else {
+            Err(DispatchResult::NoResponse)
         }
     }
 
@@ -1475,14 +1477,12 @@ impl FrameDispatcher {
             .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
             .unwrap_or(0);
         let existing = self.dht.get_local(key);
-        matches!(
-            veil_crypto::space_discovery::space_discovery_store_decision(
-                existing.as_deref(),
-                value,
-                now,
-                &self.local_node_id,
-            ),
-            veil_crypto::space_discovery::SpaceDiscoveryStoreDecision::Accept
+        veil_crypto::space_discovery::merge_space_discovery_sample(
+            existing.as_deref(),
+            value,
+            now,
+            &self.local_node_id,
         )
+        .is_some()
     }
 }

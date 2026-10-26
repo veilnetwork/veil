@@ -916,6 +916,15 @@ impl KademliaService {
             let inner = lock!(self.inner);
             inner.store.get_no_promote(&payload.key)
         };
+        let local_value = local_value.and_then(|value| {
+            if value.get(..2)
+                == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_SAMPLES_MAGIC[..])
+            {
+                veil_crypto::space_discovery::space_discovery_sample_for_query(&value, &[])
+            } else {
+                Some(value)
+            }
+        });
         if let Some(v) = local_value {
             FindValueResponse::Value(v)
         } else {
@@ -1892,15 +1901,32 @@ impl KademliaService {
         value: Vec<u8>,
         outbox: Arc<dyn FrameRouter>,
     ) -> Result<usize, KademliaError> {
-        // Store locally. audit cycle-6 (P1): use `store_local` (trusted internal
-        // write, ORIGIN_INTERNAL) rather than `handle_store` — this is the node's
-        // OWN replication decision for an already-validated self-authenticating
-        // record (all callers: `p_net_ban_sync` signs+verifies first and applies
-        // the ban to its BanList separately; `dht_republish` filters to
-        // `is_self_authenticating_dht_value`; `debug` is an operator command). It
-        // must NOT be subject to the `allow_unsigned_store` gate, which now
-        // defaults to false and would otherwise reject this local copy.
-        self.store_local(key, value.clone());
+        let values = if value.get(..2)
+            == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_SAMPLES_MAGIC[..])
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+                .unwrap_or(0);
+            veil_crypto::space_discovery::live_space_discovery_samples(&value, &key, now)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|record| record.to_bytes())
+                .collect::<Vec<_>>()
+        } else {
+            vec![value]
+        };
+        for value in &values {
+            if value.get(..2) == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_DHT_MAGIC[..])
+            {
+                self.store_space_discovery_sample(key, value, super::store::ORIGIN_INTERNAL);
+            } else {
+                self.store_local(key, value.clone());
+            }
+        }
+        if values.is_empty() {
+            return Ok(0);
+        }
 
         // Find K closest peers.
         let closest = self
@@ -1930,25 +1956,31 @@ impl KademliaService {
             if !self.count_replica_skip(&contact.node_id) {
                 continue;
             }
-            let request_id = self.store_req_id.fetch_add(1, Ordering::Relaxed);
-            let payload = StorePayload::unsigned(key, value.clone());
-            let body = payload.encode();
-            let mut hdr = veil_proto::header::FrameHeader::new(
-                veil_proto::family::FrameFamily::Discovery as u8,
-                veil_proto::family::DiscoveryMsg::Store as u16,
-            );
-            hdr.body_len = body.len() as u32;
-            hdr.request_id = request_id;
-            let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
-            frame.extend_from_slice(&body);
-            // Fire-and-forget: drop the response channel (we don't wait for an ack).
-            // `send_request` returns Some(receiver) when the frame was accepted
-            // onto the outbox; None when there is no live session for the peer
-            // and the replica is genuinely lost on this round.
-            if outbox
-                .send_request(contact.node_id, request_id, frame)
-                .is_some()
-            {
+            let mut sent_to_peer = false;
+            for value in &values {
+                let request_id = self.store_req_id.fetch_add(1, Ordering::Relaxed);
+                let payload = StorePayload::unsigned(key, value.clone());
+                let body = payload.encode();
+                let mut hdr = veil_proto::header::FrameHeader::new(
+                    veil_proto::family::FrameFamily::Discovery as u8,
+                    veil_proto::family::DiscoveryMsg::Store as u16,
+                );
+                hdr.body_len = body.len() as u32;
+                hdr.request_id = request_id;
+                let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
+                frame.extend_from_slice(&body);
+                // Fire-and-forget: drop the response channel (we don't wait for an ack).
+                // `send_request` returns Some(receiver) when the frame was accepted
+                // onto the outbox; None when there is no live session for the peer
+                // and the replica is genuinely lost on this round.
+                if outbox
+                    .send_request(contact.node_id, request_id, frame)
+                    .is_some()
+                {
+                    sent_to_peer = true;
+                }
+            }
+            if sent_to_peer {
                 sent += 1;
             }
         }

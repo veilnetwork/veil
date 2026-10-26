@@ -117,7 +117,7 @@ impl NodeServices {
         // `|_| true` to preserve the old unconditional fast path.
         validate: impl Fn(&[u8]) -> bool,
     ) -> Vec<Vec<u8>> {
-        self.dht_get_replicated_inner(key, n_replicas, timeout, validate, true)
+        self.dht_get_replicated_inner(key, n_replicas, timeout, validate, true, vec![])
             .await
     }
 
@@ -136,7 +136,21 @@ impl NodeServices {
         timeout: std::time::Duration,
         validate: impl Fn(&[u8]) -> bool,
     ) -> Vec<Vec<u8>> {
-        self.dht_get_replicated_inner(key, n_replicas, timeout, validate, false)
+        self.dht_get_replicated_inner(key, n_replicas, timeout, validate, false, vec![])
+            .await
+    }
+
+    /// Bounded selector extension for multi-holder Space discovery. Older
+    /// responders ignore the FIND_VALUE payload and return their singleton.
+    pub(crate) async fn dht_get_replicated_contested_with_payload(
+        &self,
+        key: [u8; 32],
+        n_replicas: usize,
+        timeout: std::time::Duration,
+        validate: impl Fn(&[u8]) -> bool,
+        payload: Vec<u8>,
+    ) -> Vec<Vec<u8>> {
+        self.dht_get_replicated_inner(key, n_replicas, timeout, validate, false, payload)
             .await
     }
 
@@ -147,11 +161,29 @@ impl NodeServices {
         timeout: std::time::Duration,
         validate: impl Fn(&[u8]) -> bool,
         local_fast_path: bool,
+        query_payload: Vec<u8>,
     ) -> Vec<Vec<u8>> {
         // Validated local value. A local value that fails `validate`
         // (poisoned / unverifiable) never short-circuits and never joins the
         // replica set — the resolver's post-quorum `store_local` repairs it.
-        let mut local = self.dht.get_local(&key).filter(|value| validate(value));
+        let mut local = self
+            .dht
+            .get_local(&key)
+            .and_then(|value| {
+                if value.get(..2)
+                    == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_DHT_MAGIC[..])
+                    || value.get(..2)
+                        == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_SAMPLES_MAGIC[..])
+                {
+                    veil_crypto::space_discovery::space_discovery_sample_for_query(
+                        &value,
+                        &query_payload,
+                    )
+                } else {
+                    Some(value)
+                }
+            })
+            .filter(|value| validate(value));
         if local_fast_path && let Some(value) = local.take() {
             return vec![value];
         }
@@ -198,7 +230,7 @@ impl NodeServices {
                 ttl: 40,
                 query_type: veil_proto::routing::recursive_query_type::FIND_VALUE,
                 reply_port: 0,
-                payload: vec![],
+                payload: query_payload.clone(),
             };
             let q_bytes = q.encode();
             let mut hdr = veil_proto::header::FrameHeader::new(

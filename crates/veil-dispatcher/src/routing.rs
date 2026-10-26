@@ -2143,7 +2143,19 @@ impl FrameDispatcher {
         // Try to answer locally.
         match q.query_type {
             recursive_query_type::FIND_VALUE => {
-                if let Some(value) = self.dht.get_local(&q.target_key) {
+                if let Some(mut value) = self.dht.get_local(&q.target_key) {
+                    if value.get(..2)
+                        == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_DHT_MAGIC[..])
+                        || value.get(..2)
+                            == Some(
+                                &veil_crypto::space_discovery::SPACE_DISCOVERY_SAMPLES_MAGIC[..],
+                            )
+                    {
+                        value = veil_crypto::space_discovery::space_discovery_sample_for_query(
+                            &value, &q.payload,
+                        )
+                        .unwrap_or_default();
+                    }
                     // l: demoted to DEBUG.
                     self.logger.debug(
                         "recursive.answer.local",
@@ -2405,7 +2417,7 @@ impl FrameDispatcher {
                             };
                         if !self
                             .dht
-                            .store_with_origin(q.target_key, q.payload.clone(), origin)
+                            .store_space_discovery_sample(q.target_key, &q.payload, origin)
                         {
                             return DispatchResult::NoResponse;
                         }
