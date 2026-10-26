@@ -1340,11 +1340,21 @@ impl NodeServices {
     /// addressed cells R would never splice. Every stream answer goes to the
     /// opener's device address, so this is the path every reply takes.
     ///
-    /// Unverified on purpose: the answer is only used to leave a cookie OUT,
+    /// Prefer the host-restored verified document floor: after a cold start
+    /// the DHT mirror can still be empty while that device binding is known.
+    /// Otherwise an identity mailbox ad under the device's address looks like
+    /// a stream ad, and the return cells target a cookie R cannot splice.
+    ///
+    /// The DHT fallback is unverified on purpose: the answer only leaves a cookie OUT,
     /// and a forged document can only name an identity whose mailbox cookie
     /// is not the device's stream cookie. Local only, like `ad_binding_ok`: a
     /// resolve must not block on a DHT walk.
     pub fn identity_of_device_local(&self, device: &[u8; 32]) -> Option<[u8; 32]> {
+        if let Some(identity) =
+            self.peer_identity_for_device(device, veil_util::unix_secs_now_u64())
+        {
+            return Some(identity);
+        }
         let values = self.dht.snapshot_values();
         identity_listing_device(values.iter().map(|v| v.value.as_slice()), device)
     }
