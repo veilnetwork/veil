@@ -4166,9 +4166,11 @@ pub struct DataCircuit {
     /// Next FORWARD seq. 0 is reserved (the wire numbers from 1), so the first
     /// allocation returns 1. NEVER wraps — a reused seq reuses an XOR keystream
     /// (breaks confidentiality); exhaustion returns `None` so the caller rotates
-    /// the circuit (in practice the 600 s origin-table TTL rotates first).
+    /// the circuit.
     next_seq: std::sync::atomic::AtomicU32,
     confirmed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared with the origin table; only admitted local sends renew idle GC.
+    last_sent_unix: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Size of every cell on this circuit — the number its setup negotiated.
     cell_bytes: veil_anonymity::circuit_data::CircuitCellBytes,
 }
@@ -4199,6 +4201,15 @@ impl From<DataCircuitSendError> for veil_types::AnonOnionSendError {
 }
 
 impl DataCircuit {
+    fn note_local_handoff(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.last_sent_unix
+            .fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The originator-link circuit id (return cells carry it; also the splice key
     /// at R once the rendezvous-splice path lands).
     pub fn origin_circuit_id(&self) -> u32 {

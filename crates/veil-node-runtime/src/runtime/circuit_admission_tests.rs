@@ -19,6 +19,7 @@ fn circuit(last: u32) -> DataCircuit {
         keys: vec![[0x25; 32]],
         next_seq: AtomicU32::new(last),
         confirmed: Arc::new(AtomicBool::new(true)),
+        last_sent_unix: Default::default(),
         cell_bytes: CircuitCellBytes::new(2048).unwrap(),
     }
 }
@@ -108,12 +109,15 @@ async fn rejected_recoverable_cells_do_not_push_fresh_cells_out_of_replay_window
     };
     assert_eq!(send(), Ok(()));
     assert_eq!(send(), Ok(()));
+    circuit.last_sent_unix.store(7, Ordering::Relaxed);
     for _ in 0..ReplayWindow::WINDOW + 2 {
         assert_eq!(send(), Err(DataCircuitSendError::QueueFull));
     }
+    assert_eq!(circuit.last_sent_unix.load(Ordering::Relaxed), 7);
     let first = receive_seq(&mut rx);
     let second = receive_seq(&mut rx);
     assert_eq!(send(), Ok(()));
+    assert!(circuit.last_sent_unix.load(Ordering::Relaxed) > 7);
     let third = receive_seq(&mut rx);
     runtime.stop().await.unwrap();
     let mut replay = ReplayWindow::new();
@@ -144,12 +148,14 @@ async fn invalid_circuit_payload_does_not_consume_a_sequence_on_a_full_queue() {
             .unwrap();
     }
     let before = circuit.next_seq.load(Ordering::Relaxed);
+    circuit.last_sent_unix.store(7, Ordering::Relaxed);
     let error = services.send_circuit_datagram_on_local_lane_detailed(
         &circuit,
         &vec![0; 2048],
         veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
     );
     let after = circuit.next_seq.load(Ordering::Relaxed);
+    assert_eq!(circuit.last_sent_unix.load(Ordering::Relaxed), 7);
     runtime.stop().await.unwrap();
     assert_eq!(error, Err(DataCircuitSendError::PayloadTooLarge));
     assert_eq!(
@@ -183,12 +189,47 @@ async fn exhausted_circuit_requests_rotation_even_when_recoverable_ingress_is_fu
     assert_eq!(unchanged, u32::MAX);
 }
 
-/// Real local admission failures must not accumulate paths that never reached
-/// their first hop. Keep a live path throughout, exceed the real origin cap,
-/// and require a new build to succeed as soon as the queue becomes usable.
-async fn rejected_builds_release_state(kind: &str, failure: &str) {
+#[tokio::test]
+async fn expired_or_unroutable_cells_do_not_renew_the_origin_idle_clock() {
+    let (_dir, mut runtime, circuit, mut rx) = fixture().await;
+    let services = runtime.access();
+    circuit.last_sent_unix.store(7, Ordering::Relaxed);
+    assert_eq!(
+        services.send_circuit_datagram_on_local_lane_before(
+            &circuit,
+            b"expired",
+            veil_proto::priority::INTERACTIVE,
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        ),
+        Ok(())
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "expired cell entered the source queue"
+    );
+    assert_eq!(circuit.last_sent_unix.load(Ordering::Relaxed), 7);
+    services
+        .session_tx_registry
+        .write()
+        .unwrap()
+        .unregister(&circuit.first_hop);
+    assert_eq!(
+        services.send_circuit_cell_detailed(&circuit, b"unroutable"),
+        Err(DataCircuitSendError::NoRelays)
+    );
+    assert_eq!(circuit.last_sent_unix.load(Ordering::Relaxed), 7);
+    runtime.stop().await.unwrap();
+}
+
+async fn originated_fixture() -> (
+    tempfile::TempDir,
+    NodeRuntime,
+    [u8; 32],
+    veil_crypto::GeneratedKeyPair,
+    veil_session::FrameOutbox,
+) {
     use veil_anonymity::directory::{relay_directory_dht_key, sign_entry};
-    use veil_types::{AnonOnionSendError, SignatureAlgorithm};
+    use veil_types::SignatureAlgorithm;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
@@ -197,7 +238,7 @@ async fn rejected_builds_release_state(kind: &str, failure: &str) {
     config.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
     config.anonymity.receive_anonymous = true;
     veil_cfg::save_config(&path, &config).unwrap();
-    let mut runtime = NodeRuntime::start(&path, true).await.unwrap();
+    let runtime = NodeRuntime::start(&path, true).await.unwrap();
     let services = runtime.access();
     let key = veil_crypto::generate_keypair(SignatureAlgorithm::Ed25519);
     let public =
@@ -218,7 +259,66 @@ async fn rejected_builds_release_state(kind: &str, failure: &str) {
         )
         .unwrap(),
     );
-    let mut outbox = services.session_tx_registry.write().unwrap().register(hop);
+    let outbox = services.session_tx_registry.write().unwrap().register(hop);
+    (dir, runtime, hop, key, outbox)
+}
+
+#[tokio::test]
+async fn active_origin_survives_creation_age_after_real_local_handoff() {
+    use veil_anonymity::circuit_origin::OriginCircuitTable;
+    for recoverable in [false, true] {
+        let (_dir, mut runtime, hop, _key, mut outbox) = originated_fixture().await;
+        let services = runtime.access();
+        let (circuit, _inbound) = services.open_data_circuit(&[hop], b"live path").unwrap();
+        outbox
+            .try_recv()
+            .expect("build reached the first-hop queue");
+        let table = services.dispatcher.circuit_origin.as_ref().unwrap();
+        let original = table.lookup(&hop, circuit.origin_circuit_id()).unwrap();
+        original.mark_confirmed();
+        // Change only the build clock. The real handle and origin retain any
+        // shared activity witness installed by the production builder.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut aged = (*original).clone();
+        aged.created_unix = now - OriginCircuitTable::DEFAULT_TTL_SECS - 1;
+        assert!(table.insert(Arc::new(aged)));
+        let sent = if recoverable {
+            services.send_circuit_datagram_on_local_lane_detailed(
+                &circuit,
+                b"payload",
+                veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
+            )
+        } else {
+            services.send_circuit_cell_detailed(&circuit, b"payload")
+        };
+        assert_eq!(sent, Ok(()));
+        outbox.try_recv().expect("data reached the first-hop queue");
+        let removed = table.gc(now);
+        let kept = table.lookup(&hop, circuit.origin_circuit_id()).is_some();
+        // With no further local send, the state must still be collectable.
+        table.gc(now + OriginCircuitTable::DEFAULT_TTL_SECS + 2);
+        let expired = table.lookup(&hop, circuit.origin_circuit_id()).is_none();
+        let expired_handle_unconfirmed = !circuit.confirmed.load(Ordering::Acquire);
+        runtime.stop().await.unwrap();
+        assert_eq!(removed, 0, "GC discarded an actively used origin");
+        assert!(kept && expired);
+        assert!(
+            expired_handle_unconfirmed,
+            "expired handle must trigger repair"
+        );
+    }
+}
+
+/// Real local admission failures must not accumulate paths that never reached
+/// their first hop. Keep a live path throughout, exceed the real origin cap,
+/// and require a new build to succeed as soon as the queue becomes usable.
+async fn rejected_builds_release_state(kind: &str, failure: &str) {
+    use veil_types::AnonOnionSendError;
+    let (_dir, mut runtime, hop, key, mut outbox) = originated_fixture().await;
+    let services = runtime.access();
     let (live, mut live_inbound) = services.open_data_circuit(&[hop], b"live path").unwrap();
     assert!(outbox.try_recv().is_ok(), "live path was not handed off");
     let table = services.dispatcher.circuit_origin.as_ref().unwrap();

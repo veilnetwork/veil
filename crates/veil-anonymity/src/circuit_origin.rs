@@ -41,6 +41,10 @@ pub struct OriginCircuit {
     pub origin_circuit_id: CircuitId,
     /// Build time (unix secs) for idle GC / rotation.
     pub created_unix: u64,
+    /// Last successful local DATA/keepalive handoff. Shared with the data
+    /// handle, so idle GC does not discard a busy persistent circuit. Remote
+    /// return traffic cannot renew this clock; replies retain their hard cap.
+    pub last_sent_unix: Arc<std::sync::atomic::AtomicU64>,
     /// Establishment confirmation (diff-audit Δ2-d): set when the terminus's
     /// `CircuitBuilt` ACK reaches the originator, proving the whole path is up.
     /// `Arc<AtomicBool>` so it survives the table's `Arc<OriginCircuit>` sharing.
@@ -222,6 +226,7 @@ pub fn build_origin_circuit(
         first_hop: hops[0].node_id,
         origin_circuit_id: cids[0],
         created_unix: now_unix,
+        last_sent_unix: Default::default(),
         confirmed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         is_reply: false, // callers building a REPLY circuit set this afterwards
         last_return_unix: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -352,7 +357,22 @@ impl OriginCircuitTable {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let ttl = self.ttl_secs;
         let before = g.len();
-        g.retain(|_, c| now_unix.saturating_sub(c.created_unix) < ttl);
+        g.retain(|_, c| {
+            let last_used = if c.is_reply {
+                c.created_unix
+            } else {
+                c.created_unix
+                    .max(c.last_sent_unix.load(std::sync::atomic::Ordering::Relaxed))
+            };
+            let keep = now_unix.saturating_sub(last_used) < ttl;
+            if !keep {
+                // A retained data handle must repair instead of continuing to
+                // send on a path whose return keys are no longer in the table.
+                c.confirmed
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+            keep
+        });
         before - g.len()
     }
 
@@ -505,9 +525,30 @@ mod tests {
         let (_e2, o2) = build_origin_circuit(&[h2], CircuitCellBytes::legacy(), b"", 100).unwrap();
         assert!(!t.insert(Arc::new(o2)));
 
-        // GC past TTL frees it.
+        // Remote return traffic does not prove continued local ownership and
+        // cannot retain origin slots by replaying old valid cells.
+        oc.mark_confirmed();
+        oc.mark_returned(100 + 300);
+        // GC past the local idle TTL frees it and invalidates retained handles.
         assert_eq!(t.gc(100 + 300), 1);
+        assert!(!oc.is_confirmed());
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn reply_origin_keeps_its_hard_lifetime_cap() {
+        let table = OriginCircuitTable::with_params(1, 300);
+        let (_secret, hop) = hop();
+        let (_, mut origin) =
+            build_origin_circuit(&[hop], CircuitCellBytes::legacy(), b"", 100).unwrap();
+        origin.is_reply = true;
+        // This clock belongs to persistent DATA, not the lifetime of a
+        // one-shot reply, even if a future caller happens to share it.
+        origin
+            .last_sent_unix
+            .store(1000, std::sync::atomic::Ordering::Relaxed);
+        assert!(table.insert(Arc::new(origin)));
+        assert_eq!(table.gc(400), 1);
     }
 
     /// An unanswered reply circuit lives its full unserved lifetime, and not a
