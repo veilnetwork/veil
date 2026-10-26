@@ -12,7 +12,7 @@
 //   * cargo-ndk: `cargo install cargo-ndk --locked`
 //   * Android NDK (path в `local.properties` or `ANDROID_NDK_HOME`)
 //
-// Skipping the cargo build:  set `VEIL_SKIP_CARGO=1` in the
+// Skipping the cargo build:  set `VEIL_SKIP_CARGO=true` in the
 // environment OR pass `-PveilSkipCargo=true` to gradle.  Useful
 // for CI jobs that pre-build the .so via `scripts/build-mobile.sh`
 // and just want gradle to pick up the existing artifacts.
@@ -166,12 +166,15 @@ cargoTargetMap.each { abi, triple ->
         // build, silently, which is how a phone ended up running app code
         // from today against a native library from eight days before.
         onlyIf {
-            if (file(built).exists()) {
-                return true
-            }
             if (cargoSkip) {
+                // Explicit pre-staging owns this input. A shared target may
+                // contain a different revision or feature set; its existence
+                // must never override the library the caller selected.
                 logger.lifecycle("veil: VEIL_SKIP_CARGO — using pre-staged jniLibs/${abi}")
                 return false
+            }
+            if (file(built).exists()) {
+                return true
             }
             throw new GradleException(
                 "veil: cargo built no library at ${built} for ${abi}.\n" +

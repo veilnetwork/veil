@@ -180,6 +180,13 @@ pub enum RatchetSpliceError {
     #[error("no ratchet session for this conversation")]
     NoSession,
 
+    /// A held chain uses a sender key absent from the current verified
+    /// certificates for that instance. Reading it as a claim would consume
+    /// the frame (and let delivery ACK it) even though the application must
+    /// reject it. Keep the receive state and ask the sender to re-key instead.
+    #[error("ratchet sender key needs a fresh authenticated agreement")]
+    SenderKeyChanged,
+
     /// A prologue was refused against a held conversation. It may be a
     /// replay or a restart waiting for certificate lookup/admission; neither
     /// case justifies telling the sender to discard its working chain.
@@ -1976,6 +1983,25 @@ fn open_inner(
     {
         let mut g = store.lock();
         if let Some(entry) = g.entries.get_mut(&key) {
+            if !proves_authorship
+                && entry.ever_proven()
+                && peer_devices.is_some_and(|devices| {
+                    devices.names_instance(&sender_instance_id, now_unix)
+                        && !devices.contains(&sender_instance_id, &entry.peer_ik, now_unix)
+                        && !entry.crossed_receive.as_ref().is_some_and(|other| {
+                            devices.contains(&sender_instance_id, &other.peer_ik, now_unix)
+                        })
+                })
+            {
+                // A restart loses the previous certificate cache, while a
+                // proven conversation deliberately survives key rotation.
+                // Neither historical standing nor an instance name proves
+                // the old key under the new certificate. Do not consume this
+                // frame or silently acknowledge data the app cannot accept.
+                // A fresh, currently authenticated prologue still takes the
+                // normal replay/freshness admission path below.
+                return Err(RatchetSpliceError::SenderKeyChanged);
+            }
             match entry.open_held(&frame, &held_context, &mut rng) {
                 Ok(HeldOpened {
                     plaintext,
@@ -2838,20 +2864,28 @@ mod tests {
         )
         .unwrap()
         .0;
-        let opened = open(
+        let refused = open(
             &b.store,
             &b.me(),
             &a.node_id,
             &payload,
             Some(&other_key),
             NOW,
+        );
+        assert!(matches!(refused, Err(RatchetSpliceError::SenderKeyChanged)));
+        // Refusing a changed key grants no device authority and consumes no
+        // message key. The same frame still opens with its actual certificate.
+        let opened = open(
+            &b.store,
+            &b.me(),
+            &a.node_id,
+            &payload,
+            Some(&published),
+            NOW,
         )
         .unwrap();
-        assert!(
-            !opened.authenticated,
-            "a held deadline cannot authorize a key absent from current verified evidence"
-        );
-        assert_eq!(opened.sender_device_id, None);
+        assert!(opened.authenticated);
+        assert_eq!(opened.sender_device_id, Some(transport));
     }
 
     struct Device {
@@ -4438,6 +4472,87 @@ mod tests {
         .expect("open");
         assert_eq!(got.plaintext, b"still me");
         assert!(got.authenticated);
+    }
+
+    #[test]
+    fn restored_session_with_rotated_sender_key_requests_fresh_proof() {
+        let (a, b) = (device(0x66), device(0x67));
+        a_to_b(&a, &b, b"first").unwrap();
+        a_to_b(&b, &a, b"answer").unwrap();
+        let key = b.store.keys()[0];
+        let snapshot = b.store.export(&key).unwrap();
+        b.store.forget(&key);
+        b.store.import(&key, &snapshot, NOW + 1).unwrap();
+
+        let old_key = a.ratchet_pk();
+        let seed = [0x68; DK_SEED_BYTES];
+        let (ek, _) = crate::keypair_from_dk_seed(&seed).unwrap();
+        a.ring
+            .rotate(NOW + 1, 1, seed, ek, MLKEM_SEED_MIN_OVERLAP_SECS)
+            .unwrap();
+        let (bek, bpk) = (b.ek(), b.ratchet_pk());
+        let current = dev(a.instance_id, &a.ratchet_pk());
+        let payload = seal(
+            &a.store,
+            &a.me(),
+            keys(&b, &bek, &bpk),
+            b"retry me",
+            NOW + 11,
+        )
+        .unwrap()
+        .0;
+        assert_eq!(payload[2], KIND_FRAME);
+        assert!(matches!(
+            open(
+                &b.store,
+                &b.me(),
+                &a.node_id,
+                &payload,
+                Some(&current),
+                NOW + 11
+            ),
+            Err(RatchetSpliceError::SenderKeyChanged)
+        ));
+        assert_eq!(
+            b.store.export(&key).unwrap().as_slice(),
+            snapshot.as_slice(),
+            "refusal preserves receive state"
+        );
+
+        // A warm cache that still verifies both rotations needs no reset.
+        let warm = RatchetStore::new();
+        warm.import(&key, &snapshot, NOW + 1).unwrap();
+        let mut both = current.clone();
+        both.remember(a.instance_id, old_key, u64::MAX);
+        assert!(
+            open(&warm, &b.me(), &a.node_id, &payload, Some(&both), NOW + 11)
+                .unwrap()
+                .authenticated
+        );
+
+        // The authenticated unopenable reply makes the sender start over.
+        a.store.forget(&a.store.keys()[0]);
+        let fresh = seal(
+            &a.store,
+            &a.me(),
+            keys(&b, &bek, &bpk),
+            b"retry me",
+            NOW + 12,
+        )
+        .unwrap()
+        .0;
+        assert_eq!(fresh[2], KIND_PROLOGUE);
+        let got = open(
+            &b.store,
+            &b.me(),
+            &a.node_id,
+            &fresh,
+            Some(&current),
+            NOW + 12,
+        )
+        .unwrap();
+        assert!(got.authenticated);
+        assert_eq!(got.plaintext, b"retry me");
     }
 
     #[test]
