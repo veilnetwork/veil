@@ -5672,6 +5672,20 @@ enum CircuitFeedMode {
     },
 }
 
+fn trace_stream_ingress(event: &'static str, count: &mut u64) {
+    if !veil_session::rt_trace::rt_trace_enabled() {
+        return;
+    }
+    *count = count.saturating_add(1);
+    // Endpoint diagnostics only: no peer, tag, cookie, sequence or payload.
+    // Bound output even when a broken path repeatedly supplies unusable cells.
+    if count.is_power_of_two() {
+        diag(&format!(
+            "onion-stream-ingress: event={event} count={count}"
+        ));
+    }
+}
+
 /// The cell carrier is best-effort even for reliable streams: their end-to-end
 /// ARQ repairs dropped cells. Never await a stream queue slot here, because the
 /// following cell can be media or a circuit probe. StreamMux already uses this
@@ -5690,6 +5704,10 @@ async fn run_circuit_feed(
     mode: CircuitFeedMode,
 ) {
     let mut stream_queue_drops = 0u64;
+    let mut intro_rejections = 0u64;
+    let mut unknown_tags = 0u64;
+    let mut syn_received = 0u64;
+    let mut syn_ack_received = 0u64;
     // Drain inbound bursts: the relay splice delivers many cells per
     // scheduler turn, and one activity stamp per batch is enough.
     let mut batch: Vec<Vec<u8>> = Vec::new();
@@ -5735,6 +5753,7 @@ async fn run_circuit_feed(
                 }
                 let sealed = &framed[cell_offset + 1..cell_offset + 1 + CIRCUIT_INTRO_LEN];
                 let Some(node) = open_stream_peer_intro(&services, &tag, sealed) else {
+                    trace_stream_ingress("intro_rejected", &mut intro_rejections);
                     continue;
                 };
                 {
@@ -5754,6 +5773,7 @@ async fn run_circuit_feed(
             {
                 node
             } else {
+                trace_stream_ingress("unknown_tag", &mut unknown_tags);
                 // Backward-compatible validation/legacy path: the first 32 bytes
                 // are the clear sender node id rather than an opaque tag.
                 tag
@@ -5839,6 +5859,17 @@ async fn run_circuit_feed(
                     // A congested stream must not spend media's receive time
                     // allocating payloads that will immediately be discarded.
                     let app = veil_app::address::app_id(&node, STREAM_NAMESPACE, STREAM_NAME);
+                    if veil_session::rt_trace::rt_trace_enabled() {
+                        match Frame::decode(&framed[cell_offset..]) {
+                            Some(Frame::Syn { .. }) => {
+                                trace_stream_ingress("syn_admitted", &mut syn_received);
+                            }
+                            Some(Frame::SynAck { .. }) => {
+                                trace_stream_ingress("syn_ack_admitted", &mut syn_ack_received);
+                            }
+                            _ => {}
+                        }
+                    }
                     permit.send((Addr { node, app }, framed[cell_offset..].to_vec()));
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -6048,12 +6079,22 @@ mod tests {
         veil_node_runtime::NodeRuntime,
         veil_node_runtime::NodeServices,
     ) {
+        offline_feed_fixture_with_receive(false).await
+    }
+
+    async fn offline_feed_fixture_with_receive(
+        receive_anonymous: bool,
+    ) -> (
+        tempfile::TempDir,
+        veil_node_runtime::NodeRuntime,
+        veil_node_runtime::NodeServices,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let mut config = veil_cfg::build_stub_config_with_ephemeral_identity(false).unwrap();
         config.identity.as_mut().unwrap().role = veil_cfg::NodeRole::Leaf;
         config.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
-        config.anonymity.receive_anonymous = false;
+        config.anonymity.receive_anonymous = receive_anonymous;
         veil_cfg::save_config(&path, &config).unwrap();
         let runtime = veil_node_runtime::NodeRuntime::start(&path, true)
             .await
@@ -6255,6 +6296,49 @@ mod tests {
         let mut framed = tag.to_vec();
         framed.extend_from_slice(cell);
         framed
+    }
+
+    #[tokio::test]
+    async fn rejected_peer_intro_does_not_mask_a_later_valid_handshake_reply() {
+        let (_dir, mut runtime, services) = offline_feed_fixture_with_receive(true).await;
+        let peer = [0xa6; 32];
+        let tag = [0xa7; 32];
+        let cell = Frame::SynAck {
+            stream_id: 41,
+            isn: 500,
+            ack: 101,
+            win: 8192,
+        }
+        .encode();
+        let current_key = services.stream_peer_intro_public_key().unwrap();
+        let mut wrong_key = current_key;
+        wrong_key[0] ^= 0x42;
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        for key in [wrong_key, current_key] {
+            let mut framed = tag.to_vec();
+            framed.push(super::CIRCUIT_INTRO_MARKER);
+            framed.extend(super::seal_stream_peer_intro(&peer, &tag, &key).unwrap());
+            framed.extend_from_slice(&cell);
+            tx.try_send(framed).unwrap();
+        }
+        drop(tx);
+        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(4);
+        super::run_circuit_feed(
+            services,
+            rx,
+            stream_tx,
+            None,
+            None,
+            std::sync::Arc::default(),
+            None,
+            super::CircuitFeedMode::Streams,
+        )
+        .await;
+        let (from, received) = stream_rx.try_recv().unwrap();
+        assert_eq!(from.node, peer);
+        assert_eq!(received, cell);
+        assert!(stream_rx.try_recv().is_err());
+        runtime.stop().await.unwrap();
     }
 
     struct FeedMediaReceiver {
