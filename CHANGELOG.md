@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.11.46 — 2026-10-26
+
+### Fixed
+
+- Retain up to five independently signed Public Space holder samples per route
+  with bounded deterministic ranking, instead of replacing every replica with
+  one holder. Merge publication, direct and recursive STORE, mirror and periodic
+  republish updates atomically, including stale-refresh and concurrent writers.
+- Resolve indexed holder samples within the existing 16 KiB wire limit and
+  reserve the complete signed carrier overhead in application payloads.
+  Preserve singleton compatibility, expiry validation and storage quotas.
+
 ## v0.11.45 — 2026-10-25
 
 ### Fixed
