@@ -55,7 +55,9 @@ typedef struct VeilGroupMediaEngine VeilGroupMediaEngine;
  * SSRCs are derived from the node ids so the two endpoints agree without an
  * extra negotiation: our send-ssrc = f(local_id) = peer's recv remote-ssrc, and
  * vice versa. The engine installs its inbound recv callback on `veil_chan` and
- * sends outbound RTP/RTCP through it. Returns NULL on failure.
+ * sends outbound RTP/RTCP through it. Returns NULL on failure, including when
+ * the platform audio device module cannot be created. The caller still owns
+ * the channel and must close it on failure.
  */
 VeilMediaEngine *veil_media_engine_create(uint64_t veil_chan,
                                           const uint8_t *local_id,
@@ -110,7 +112,8 @@ int veil_media_engine_set_speaker_muted(VeilMediaEngine *engine, int muted);
  * stream. Each peer contributes one veil datagram channel and one receive
  * stream. The single encoded mic stream is fanned out natively; decoded peer
  * streams are mixed by WebRTC before the ADM speaker callback. Packet bytes
- * never cross Dart. Channels remain caller-owned. */
+ * never cross Dart. Channels remain caller-owned. Create returns NULL if the
+ * platform audio device module cannot be created. */
 VeilGroupMediaEngine *veil_media_group_engine_create(
     const uint8_t *local_id);
 /* Same synchronous worker-cleanup contract as veil_media_engine_destroy. */

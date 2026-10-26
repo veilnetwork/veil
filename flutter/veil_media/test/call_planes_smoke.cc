@@ -24,6 +24,7 @@ extern "C" int veil_media_test_group_with_held_video(VeilGroupMediaEngine*, int 
 extern "C" int veil_media_test_direct_call_planes(VeilMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_blocked_audio_stats(VeilMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_muted_capture_lifecycle();
+extern "C" int veil_media_test_missing_audio_device();
 extern "C" int veil_media_test_audio_probe_budget();
 extern "C" int veil_media_test_group_call_planes(VeilGroupMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_group_blocked_audio_stats(VeilGroupMediaEngine*, Injector, void*);
@@ -315,6 +316,22 @@ static void wait_playout(VeilGroupMediaEngine* e, uint64_t reports, uint64_t del
   if (reports) assert(group_stat(e, "audio_playout_ms") == delay);
 }
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--missing-audio-device") == 0) {
+    const int result = veil_media_test_missing_audio_device();
+    if (result != 0) {
+      std::fprintf(stderr, "missing audio device failed: %d\n", result);
+      return 1;
+    }
+    {
+      std::lock_guard lock(callback_mu);
+      if (callbacks.contains(82) || callbacks.contains(83)) {
+        std::fputs("missing audio device: callback registration leaked\n", stderr);
+        return 1;
+      }
+    }
+    std::fputs("missing audio device: direct/group construction refuses safely and recovers\n", stderr);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--video-loss-persistence") == 0) {
     uint8_t local[32] = {1}, peer[32] = {2}, other[32] = {3};
     constexpr uint32_t audio = 0x01000000u;
@@ -852,6 +869,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::fprintf(stderr, "direct/group: muted start/rebuild opens no capture; unmute encodes Opus\n");
+  if (veil_media_test_missing_audio_device() != 0) return 1;
   uint8_t local[32] = {1}, peer[32] = {2};
   for (int enabled : {0, 1}) {
     const uint64_t chan = 21 + enabled;

@@ -1804,6 +1804,7 @@ bool start_capture(webrtc::AudioDeviceModule* adm, const char* who) {
 webrtc::scoped_refptr<webrtc::AudioDeviceModule> create_audio_device(
     const webrtc::Environment& env) {
 #if defined(VEIL_MEDIA_TEST_HOOKS)
+  if (g_call_plane_missing_adm) return nullptr;
   if (g_call_plane_recording_adm)
     return webrtc::make_ref_counted<StandRecordingAdm>(env);
 #endif
@@ -1872,6 +1873,12 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
   // cannot silently diverge. In particular, macOS uses WebRTC's CoreAudio HAL
   // path while iOS retains the AVAudioSession-aware custom ADM.
   ws->adm = create_audio_device(ws->env);
+  if (!ws->adm) {
+    // AudioState requires an ADM. Passing null survives release construction
+    // but dereferences it when an audio stream starts (debug builds DCHECK).
+    vlog("media: create failed — audio device module unavailable");
+    return nullptr;
+  }
   if (ws->adm) {
     int32_t init_rc = 0;
     bool rec_avail = false, play_avail = false;
@@ -2093,6 +2100,10 @@ VeilGroupMediaEngine* veil_media_group_engine_create(
   ws->video_network_tq = ws->env.task_queue_factory().CreateTaskQueue(
       "veil-group-video-net", webrtc::TaskQueueFactory::Priority::kNormal);
   ws->adm = create_audio_device(ws->env);
+  if (!ws->adm) {
+    vlog("group media: create failed — audio device module unavailable");
+    return nullptr;
+  }
   if (ws->adm) run_on_adm_thread([&] { ws->adm->Init(); });
   ws->apm = webrtc::BuiltinAudioProcessingBuilder(
       veil_media::CallAudioProcessingConfig()).Build(ws->env);

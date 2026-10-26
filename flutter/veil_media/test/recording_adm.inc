@@ -6,6 +6,7 @@
 
 namespace {
 bool g_call_plane_recording_adm = false;
+bool g_call_plane_missing_adm = false;
 class StandRecordingAdm : public webrtc::AudioDeviceModuleImpl {
  public:
   explicit StandRecordingAdm(const webrtc::Environment& env)
