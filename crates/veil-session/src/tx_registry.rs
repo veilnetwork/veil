@@ -169,6 +169,13 @@ impl SessionTxRegistry {
             .then_some(768)
     }
 
+    /// Local source backpressure only. Observe the shared pacing debt without
+    /// changing admission; ordinary idle/full queues retain the 1-ms retry.
+    pub fn local_reliable_source_retry_delay(&self) -> std::time::Duration {
+        self.source_activity
+            .reliable_retry_delay(std::time::Instant::now())
+    }
+
     /// Create with a custom per-session channel capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -769,14 +776,13 @@ impl SessionTxRegistry {
             crate::frame_diag::note_chunk_frame("relay_enqueue", &frame);
             Ok(frame)
         });
-        match &result {
-            Ok(()) => {
-                if let Some(ts) = self.last_active.get(peer_id) {
-                    ts.store(now_ms(), Ordering::Relaxed);
-                }
-            }
-            Err(BuildSendError::Queue(SendToError::Full)) => self.note_queue_full(peer_id),
-            _ => {}
+        // On Full the builder did not run and the producer retains the cell.
+        // Counting each retry as a discarded frame reports fictitious loss
+        // (and emits repeated warnings) during deliberate pacing.
+        if result.is_ok()
+            && let Some(ts) = self.last_active.get(peer_id)
+        {
+            ts.store(now_ms(), Ordering::Relaxed);
         }
         result
     }
@@ -1061,7 +1067,11 @@ mod tests {
             registry.send_recoverable_with_result(&peer, 64, build),
             Err(BuildSendError::Queue(SendToError::Full))
         ));
-        assert_eq!(registry.drops_total.load(Ordering::Relaxed), drops + 1);
+        assert_eq!(
+            registry.drops_total.load(Ordering::Relaxed),
+            drops,
+            "rejected construction is backpressure, not a discarded frame"
+        );
         assert_eq!(
             registry
                 .last_active
@@ -1071,6 +1081,15 @@ mod tests {
             active
         );
         assert_eq!(calls.get(), 1);
+        assert_eq!(
+            registry.send_to_result(&peer, INTERACTIVE, vec![42; 64]),
+            Err(SendToError::Full)
+        );
+        assert_eq!(
+            registry.drops_total.load(Ordering::Relaxed),
+            drops + 1,
+            "best-effort overflow must still count the discarded frame"
+        );
     }
 
     #[test]
