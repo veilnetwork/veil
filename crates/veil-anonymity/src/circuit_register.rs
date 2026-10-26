@@ -440,12 +440,25 @@ impl CircuitRendezvousRegistry {
         g.subs.get(cookie).map(|s| Arc::clone(&s.circuit))
     }
 
-    /// Drop a cookie's subscription (e.g. on circuit teardown).
-    pub fn remove(&self, cookie: &[u8; COOKIE_LEN]) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(cookie);
+    /// Remove only the subscription owned by this circuit incarnation.
+    /// A newer registration may have moved the same cookie before the old
+    /// path's teardown arrives. Compare and remove under one lock; link-local
+    /// circuit ids alone are insufficient, since they can also be reused.
+    pub fn remove_if_current(
+        &self,
+        cookie: &[u8; COOKIE_LEN],
+        circuit: &Arc<CircuitState>,
+    ) -> bool {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if g.subs
+            .get(cookie)
+            .is_some_and(|sub| Arc::ptr_eq(&sub.circuit, circuit))
+        {
+            g.remove(cookie);
+            true
+        } else {
+            false
+        }
     }
 
     /// Evict subscriptions older than the TTL. Returns the count removed.
@@ -796,14 +809,15 @@ mod tests {
         let link = [0xE5u8; 32];
 
         let (torn_down, _) = signed_at(1);
-        reg.register(&torn_down, circuit_from(&table, link, 1), 0)
+        let torn_down_circuit = circuit_from(&table, link, 1);
+        reg.register(&torn_down, Arc::clone(&torn_down_circuit), 0)
             .unwrap();
         let (expires, _) = signed_at(1);
         reg.register(&expires, circuit_from(&table, link, 2), 0)
             .unwrap();
         assert_eq!(reg.link_occupancy(&link), 2);
 
-        reg.remove(&torn_down.cookie); // teardown path
+        assert!(reg.remove_if_current(&torn_down.cookie, &torn_down_circuit));
         assert_eq!(reg.link_occupancy(&link), 1);
 
         assert_eq!(reg.gc(300), 1); // TTL path
@@ -813,6 +827,29 @@ mod tests {
             "the link's bucket must go with its last binding"
         );
         assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn stale_teardown_cannot_remove_a_reused_circuit_number() {
+        let reg = CircuitRendezvousRegistry::with_link_cap(1000, 8, 300);
+        let table = CircuitTable::new();
+        let link = [0xE5u8; 32];
+        let key = generate_keypair(SignatureAlgorithm::Ed25519);
+        let (first, _) = signed_with(1, &key);
+        let old = circuit_from(&table, link, 7);
+        reg.register(&first, Arc::clone(&old), 0).unwrap();
+        table.remove(&link, 7);
+        let current = circuit_from(&table, link, 7);
+        let (refresh, _) = signed_with(2, &key);
+        reg.register(&refresh, Arc::clone(&current), 1).unwrap();
+
+        assert!(!reg.remove_if_current(&first.cookie, &old));
+        assert!(Arc::ptr_eq(&reg.lookup(&first.cookie).unwrap(), &current));
+        assert_eq!(reg.link_occupancy(&link), 1);
+        assert!(reg.remove_if_current(&first.cookie, &current));
+        assert_eq!(reg.link_occupancy(&link), 0);
+        assert!(reg.is_empty());
+        assert!(!reg.remove_if_current(&first.cookie, &current));
     }
 
     /// A service rebuilds its circuit down a fresh path every 150 s and
