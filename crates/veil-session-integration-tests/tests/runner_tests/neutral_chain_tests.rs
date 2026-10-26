@@ -107,6 +107,7 @@ async fn chain(rotate: bool, ordered: bool, forwards: bool) {
                         first_hop: ids[if node == 0 { 1 } else { 2 }],
                         origin_circuit_id: cid,
                         created_unix: 0,
+                        last_sent_unix: Default::default(),
                         confirmed: Arc::default(),
                         is_reply: false,
                         last_return_unix: Arc::default(),
