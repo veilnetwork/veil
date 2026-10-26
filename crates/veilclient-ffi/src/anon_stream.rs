@@ -336,11 +336,10 @@ const _: () = assert!(
 );
 const CIRCUIT_HOPS: usize = 2;
 // How long a pinned INBOUND circuit may sit idle (no received data) before it is
-// rebuilt on a fresh path. Raised 45s -> 300s: the 45s rebuild cadence was pure
-// churn now that (a) the 15s forward heartbeat keeps the circuit + its hop TCP
-// sessions alive, and (b) the recipient recheck re-registers the rendezvous
-// cookie every 15s (subscription TTL 600s), so neither liveness nor the relay
-// registration needs a frequent circuit rebuild. Each rebuild opens a brief
+// rebuilt on a fresh path. The jittered forward heartbeat keeps the circuit's
+// idle clock and its receive subscription live without rebuilding it. The plain
+// rendezvous-recipient recheck owns a DIFFERENT mailbox cookie; it does not
+// renew the stream registration. Each rebuild opens a brief
 // window where an introduce forwarded down the retiring generation stalls until
 // the sender's retry hits the new one — device-observed as ~10-20s inbound
 // stalls (desktop receiver, 234 generations/session). Fewer rebuilds = fewer
