@@ -25,7 +25,7 @@ void publishSpaceDiscoveryRecord({
   if (selfNodeId.length != 32) {
     throw VeilException('selfNodeId must be 32 bytes');
   }
-  if (record.isEmpty || record.length > 17 * 1024) {
+  if (record.isEmpty || record.length > 16 * 1024) {
     throw VeilException('Space discovery record has invalid length');
   }
   final selfPointer = calloc<Uint8>(32);
@@ -134,13 +134,13 @@ List<Uint8List> decodeSpaceDiscoveryReplicaBuffer(Uint8List bytes) {
   }
 
   final count = takeU32();
-  if (count > 5) {
+  if (count > 30) {
     throw const FormatException('too many Space discovery replicas');
   }
   final records = <Uint8List>[];
   for (var index = 0; index < count; index++) {
     final length = takeU32();
-    if (length == 0 || length > 17 * 1024 || offset + length > bytes.length) {
+    if (length == 0 || length > 16 * 1024 || offset + length > bytes.length) {
       throw const FormatException('invalid Space discovery record length');
     }
     records.add(Uint8List.fromList(bytes.sublist(offset, offset + length)));

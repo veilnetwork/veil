@@ -5,7 +5,10 @@ use veil_proto::identity_document::{IDENTITY_DOCUMENT_MAGIC, IdentityDocument};
 
 impl FrameDispatcher {
     pub(crate) fn mirror_discovery_value(&self, key: [u8; 32], value: Vec<u8>) {
-        if value.get(..2) == Some(&IDENTITY_DOCUMENT_MAGIC[..]) {
+        if value.get(..2) == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_DHT_MAGIC[..]) {
+            self.dht
+                .store_space_discovery_sample(key, &value, veil_dht::store::ORIGIN_INTERNAL);
+        } else if value.get(..2) == Some(&IDENTITY_DOCUMENT_MAGIC[..]) {
             self.store_discovery_value(key, value, veil_dht::store::ORIGIN_INTERNAL);
         } else {
             self.dht.store_local(key, value);

@@ -7313,6 +7313,53 @@ mod tests {
     }
 
     #[test]
+    fn space_samples_direct_recursive_and_mirror_stores_preserve_independent_holders() {
+        use veil_crypto::space_discovery::{SpaceDiscoveryRoute, decode_space_discovery_samples};
+        let now = veil_util::unix_secs_now_u64() * 1000;
+        let route = SpaceDiscoveryRoute::Search([0x31; 32]);
+        let first = signed_space_discovery(route, [0x41; 32], 0x51, now);
+        let second = signed_space_discovery(route, [0x41; 32], 0x52, now);
+        let refreshed = signed_space_discovery(route, [0x41; 32], 0x51, now + 1);
+        let key = route.dht_key();
+        for role in [veil_cfg::NodeRole::Core, veil_cfg::NodeRole::Leaf] {
+            let dispatcher = make_test_dispatcher(role);
+            let (header, body) = make_store_frame(&veil_proto::discovery::StorePayload::unsigned(
+                key,
+                first.to_bytes(),
+            ));
+            assert!(matches!(
+                dispatcher.dispatch(&header, &body, [1; 32]),
+                DispatchResult::NoResponse
+            ));
+            let header = veil_proto::header::FrameHeader::new(
+                veil_proto::family::FrameFamily::Routing as u8,
+                veil_proto::family::RoutingMsg::RecursiveQuery as u16,
+            );
+            let body = veil_proto::routing::RecursiveQueryPayload {
+                query_id: [1; 16],
+                target_key: key,
+                reply_to: [1; 32],
+                ttl: 8,
+                query_type: veil_proto::routing::recursive_query_type::STORE,
+                reply_port: 0,
+                payload: second.to_bytes(),
+            }
+            .encode();
+            assert!(matches!(
+                dispatcher.dispatch(&header, &body, [1; 32]),
+                DispatchResult::NoResponse
+            ));
+            assert!(dispatcher.mirror_cache_admissible(&refreshed.to_bytes(), &key));
+            dispatcher.mirror_discovery_value(key, refreshed.to_bytes());
+            dispatcher.mirror_discovery_value(key, first.to_bytes());
+            let records =
+                decode_space_discovery_samples(&dispatcher.dht.get_local(&key).unwrap()).unwrap();
+            assert_eq!(records.len(), 2);
+            assert!(records.contains(&refreshed) && records.contains(&second));
+        }
+    }
+
+    #[test]
     fn space_discovery_store_accepts_canonical_signed_record() {
         use veil_proto::discovery::StorePayload;
         let now = std::time::SystemTime::now()
