@@ -235,7 +235,7 @@ impl OnionStream {
     where
         D: CellDuplex + 'static,
     {
-        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx) = mpsc::channel(APP_COMMAND_CAPACITY);
         let (reset_tx, reset_rx) = watch::channel(None);
         let (data_tx, data_rx) = mpsc::channel(16);
         let end = Arc::new(Mutex::new(End::Open));
@@ -478,6 +478,8 @@ fn broken() -> io::Error {
 /// Stop accepting new app writes once this many bytes are buffered unsent
 /// (send-side back-pressure; the bounded cmd channel then stalls `write_all`).
 const SEND_HIGH_WATER: usize = 4 << 20;
+/// Bound both queued app commands and the ready-command batch per driver turn.
+const APP_COMMAND_CAPACITY: usize = 8;
 /// Chunk size for moving delivered bytes out of the engine to the reader.
 const DELIVER_CHUNK: usize = 256 * 1024;
 /// Local transport backpressure retry cadence. `WouldBlock` means the cell did
@@ -775,10 +777,29 @@ async fn drive<D: CellDuplex>(
                 }
             }
             cmd = cmd_rx.recv(), if cmd_open && engine.send_buffer_len() < SEND_HIGH_WATER => {
-                match cmd {
-                    Some(AppCmd::Write(d)) => { engine.write(&d); }
-                    Some(AppCmd::Finish) => { engine.finish(); }
-                    None => { cmd_open = false; engine.finish(); } // handle dropped → finish send
+                // Coalesce only already-ready writes before polling DATA. In
+                // particular, 2 KiB SDK writes must not each create a nearly
+                // empty padded tail when the carrier MSS is slightly smaller.
+                // Never await a batch, cross FIN, or bypass the high-water
+                // guard. The bounded turn still polls control/inbound/timers
+                // between carrier bursts, even with a continuously busy app.
+                let mut next = cmd;
+                for admitted in 0..APP_COMMAND_CAPACITY {
+                    match next {
+                        Some(AppCmd::Write(d)) => { engine.write(&d); }
+                        Some(AppCmd::Finish) => { engine.finish(); break; }
+                        None => { cmd_open = false; engine.finish(); break; }
+                    }
+                    if admitted + 1 == APP_COMMAND_CAPACITY
+                        || engine.send_buffer_len() >= SEND_HIGH_WATER
+                    {
+                        break;
+                    }
+                    next = match cmd_rx.try_recv() {
+                        Ok(cmd) => Some(cmd),
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => None,
+                    };
                 }
             }
             inbound = duplex.recv_cells(&mut rx_cells, MAX_RX_BURST) => {
