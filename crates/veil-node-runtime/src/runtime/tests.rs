@@ -434,6 +434,107 @@ fn a_device_is_traced_to_the_identity_whose_document_lists_it() {
     );
 }
 
+/// The host restores verified peer documents before the volatile DHT mirror.
+/// Return streams must still recognize a sibling's identity mailbox cookie.
+#[tokio::test]
+async fn cold_stream_reply_recognizes_identity_without_a_dht_document() {
+    use ed25519_dalek::{Signer, SigningKey};
+    use veil_crypto::identity::{certify_message, compute_node_id};
+    use veil_proto::identity_document::{
+        ALGO_ED25519, DOC_SIG_CONTEXT, IdentityDocument, IdentityKey,
+    };
+
+    let now = veil_util::unix_secs_now_u64();
+    let master = SigningKey::from_bytes(&[0x74; 32]);
+    let sub = SigningKey::from_bytes(&[0x75; 32]);
+    let pubkey = sub.verifying_key().to_bytes();
+    let device = compute_node_id(&pubkey);
+    let identity = compute_node_id(master.verifying_key().as_bytes());
+    let expires = now + 86400;
+    let mut doc = IdentityDocument {
+        node_id: identity,
+        master_algo: ALGO_ED25519,
+        master_pubkey: master.verifying_key().to_bytes().to_vec(),
+        issued_at_unix: now,
+        valid_until_unix: expires,
+        sig_key_idx: 0,
+        identity_keys: vec![IdentityKey {
+            algo: ALGO_ED25519,
+            pubkey: pubkey.to_vec(),
+            device_id: device,
+            valid_from_unix: now,
+            valid_until_unix: expires,
+            master_sig: master
+                .sign(&certify_message(
+                    &identity,
+                    ALGO_ED25519,
+                    &pubkey,
+                    &device,
+                    now,
+                    expires,
+                ))
+                .to_bytes()
+                .to_vec(),
+        }],
+        revoked_devices: Vec::new(),
+        document_sig: Vec::new(),
+    };
+    let mut signed = DOC_SIG_CONTEXT.to_vec();
+    signed.extend_from_slice(&doc.canonical_signing_bytes());
+    doc.document_sig = sub.sign(&signed).to_bytes().to_vec();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut config = veil_cfg::build_stub_config_with_ephemeral_identity(false).unwrap();
+    config.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+    config.anonymity.receive_anonymous = false;
+    veil_cfg::save_config(&path, &config).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.unwrap();
+    assert!(
+        runtime
+            .access()
+            .identity
+            .peer_mlkem_cert_store
+            .document_floor
+            .observe(&doc, now)
+    );
+    let (_, snapshot) = runtime
+        .access()
+        .identity
+        .peer_mlkem_cert_store
+        .document_floor
+        .export_host()
+        .unwrap();
+    runtime.stop().await.unwrap();
+    drop(runtime);
+
+    let mut restarted = NodeRuntime::start(&path, true).await.unwrap();
+    let services = restarted.access();
+    services
+        .identity
+        .peer_mlkem_cert_store
+        .document_floor
+        .import_host(&snapshot, now)
+        .unwrap();
+    assert!(
+        services
+            .dht
+            .get_local(&IdentityDocument::dht_key(&identity))
+            .is_none()
+    );
+    assert_eq!(
+        services.peer_identity_for_device(&device, now),
+        Some(identity)
+    );
+    let actual = services.identity_of_device_local(&device);
+    restarted.stop().await.unwrap();
+    assert_eq!(
+        actual,
+        Some(identity),
+        "a cold reply must exclude the identity mailbox cookie"
+    );
+}
+
 /// A deferred node that takes on its real identity advertises the anonymity
 /// key it opens introduces with.
 ///
