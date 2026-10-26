@@ -2408,7 +2408,9 @@ impl CircuitCells {
         use veil_node_runtime::DataCircuitSendError;
         match err {
             DataCircuitSendError::QueueFull => {
-                io::Error::new(io::ErrorKind::WouldBlock, "circuit first-hop TX queue full")
+                let retry = veil_util::rlock!(self.services.session_tx_registry)
+                    .local_reliable_source_retry_delay();
+                veil_onion_stream::send_backpressure(retry)
             }
             DataCircuitSendError::NoRelays => {
                 self.mark_route_send_failed(dst_node, route, err).await;

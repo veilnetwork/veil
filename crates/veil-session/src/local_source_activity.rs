@@ -260,6 +260,30 @@ impl LocalSourceActivity {
             .is_some_and(|at| now.saturating_duration_since(at) < IDLE_GRACE)
     }
 
+    /// A full source queue need not be polled every millisecond while its
+    /// drain is deliberately paced. This is only a bounded retry hint: it
+    /// grants no credit, reserves no turn and never delays a carrier's ACKs
+    /// by more than one scheduler retry interval.
+    pub(crate) fn reliable_retry_delay(&self, now: Instant) -> Duration {
+        let state = lock!(self.state);
+        let immediate = Duration::from_millis(1);
+        if !state
+            .last_primary
+            .is_some_and(|at| now.saturating_duration_since(at) < IDLE_GRACE)
+        {
+            return immediate;
+        }
+        let debt = state
+            .reliable_next
+            .into_iter()
+            .chain(state.signaling_next)
+            .filter(|at| now < *at)
+            .max()
+            .map(|at| at.saturating_duration_since(now))
+            .unwrap_or(immediate);
+        debt.clamp(immediate, Duration::from_millis(10))
+    }
+
     /// Only trusted local consumer feedback can publish measured pressure.
     /// Other runners consume it exclusively for their own secondary producers.
     pub(crate) fn note_pressure(&self, now: Instant) {
@@ -617,6 +641,43 @@ impl LocalSourceActivity {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn retry_hint_tracks_paid_debt_without_charging_or_extending_activity() {
+        let source = LocalSourceActivity::default();
+        let now = Instant::now();
+        let immediate = Duration::from_millis(1);
+        assert_eq!(source.reliable_retry_delay(now), immediate);
+        source.note(now);
+        source.note_pressure(now);
+        assert_eq!(source.reliable_retry_delay(now), immediate);
+        source.admit_reliable_secondary(1024, now).unwrap();
+        let due = now + SECONDARY_PROBE_INTERVAL;
+        // Repeated observations cannot refund debt or reserve an extra turn.
+        for _ in 0..100 {
+            assert_eq!(source.reliable_retry_delay(now), Duration::from_millis(10));
+        }
+        assert_eq!(source.admit_reliable_secondary(1, now), Err(due));
+        assert_eq!(
+            source.reliable_retry_delay(due - Duration::from_millis(3)),
+            Duration::from_millis(3)
+        );
+        assert_eq!(source.reliable_retry_delay(due), immediate);
+        // Signaling debt shares the uplink, but not DATA's fair queue turn.
+        source.admit_signaling(4096, due).unwrap();
+        assert_eq!(source.reliable_retry_delay(due), Duration::from_millis(10));
+        assert_eq!(
+            source.admit_reliable_secondary(1, due),
+            Err(due + SECONDARY_PROBE_INTERVAL)
+        );
+        // Even a large compatibility debt cannot retain an idle primary.
+        source
+            .admit_reliable_secondary(60000, due + SECONDARY_PROBE_INTERVAL)
+            .unwrap();
+        let idle = now + IDLE_GRACE;
+        assert_eq!(source.reliable_retry_delay(idle), immediate);
+        assert!(source.admit_reliable_secondary(60000, idle).is_ok());
+    }
 
     #[test]
     fn warm_budget_factories_reject_neutral_lanes_and_reuse_actual_flight() {
