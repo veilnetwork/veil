@@ -72,7 +72,8 @@ extern "C" int veil_media_test_audio_timing_anchor(VeilMediaEngine* e, int sourc
 
 namespace {
 using PlaneInjector = int (*)(void*, uint64_t, uint32_t, uint32_t);
-uint64_t sent_audio_packets(WebrtcState* ws) {
+template <typename State>
+uint64_t sent_audio_packets(State* ws) {
   uint64_t count = 0;
   run_on(ws->worker_tq.get(), [&] {
     if (ws->send_stream) count = ws->send_stream->GetStats().packets_sent;
@@ -390,6 +391,63 @@ extern "C" int veil_media_test_audio_probe_budget() {
     };
     const int result = room ? check(group->ws.get()) : check(one->ws.get());
     if (result) return result;
+  }
+  return 0;
+}
+
+// AudioState requires a non-null ADM. A platform factory refusal must not
+// construct an invalid state that crashes when a send/receive stream starts.
+extern "C" int veil_media_test_missing_audio_device() {
+  uint8_t local[32] = {0x65}, peer[32] = {0x66};
+  {
+    struct ResetFactory {
+      bool prior = g_call_plane_missing_adm;
+      ResetFactory() { g_call_plane_missing_adm = true; }
+      ~ResetFactory() { g_call_plane_missing_adm = prior; }
+    } reset;
+    bool direct_rejected = true, group_rejected = true;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(
+          veil_media_engine_create(82, local, peer), veil_media_engine_destroy);
+      std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> g(
+          veil_media_group_engine_create(local), veil_media_group_engine_destroy);
+      direct_rejected &= !e;
+      group_rejected &= !g;
+    }
+    if (!direct_rejected || !group_rejected) {
+      std::fprintf(stderr, "missing ADM: direct_rejected=%d group_rejected=%d\n",
+                   direct_rejected, group_rejected);
+      return 1;
+    }
+  }
+  // A failed construction must release its queues/registrations and not
+  // prevent a later call using the same channel after the device returns.
+  struct CountingFactory {
+    bool prior = g_call_plane_recording_adm;
+    CountingFactory() { g_call_plane_recording_adm = true; }
+    ~CountingFactory() { g_call_plane_recording_adm = prior; }
+  } counting;
+  {
+    std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(
+        veil_media_engine_create(82, local, peer), veil_media_engine_destroy);
+    if (!e || veil_media_engine_start_audio(e.get(), 1, 1) != VEIL_MEDIA_OK)
+      return 2;
+    auto* device = static_cast<StandRecordingAdm*>(e->ws->adm.get());
+    if (!device->Recording() || !device->Playing()) return 3;
+    device->Capture(60);
+    if (sent_audio_packets(e->ws.get()) == 0) return 4;
+    if (veil_media_engine_stop_audio(e.get()) != VEIL_MEDIA_OK) return 5;
+  }
+  {
+    std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> e(
+        veil_media_group_engine_create(local), veil_media_group_engine_destroy);
+    if (!e || veil_media_group_engine_add_peer(e.get(), 83, peer) != VEIL_MEDIA_OK ||
+        veil_media_group_engine_start_audio(e.get()) != VEIL_MEDIA_OK) return 6;
+    auto* device = static_cast<StandRecordingAdm*>(e->ws->adm.get());
+    if (!device->Recording() || !device->Playing()) return 7;
+    device->Capture(60);
+    if (sent_audio_packets(e->ws.get()) == 0) return 8;
+    if (veil_media_group_engine_stop_audio(e.get()) != VEIL_MEDIA_OK) return 9;
   }
   return 0;
 }
