@@ -15,6 +15,10 @@ use veil_util::lock;
 /// "unopenable" reply — the one signal that makes it drop its side and key a
 /// fresh conversation.
 ///
+/// `SenderKeyChanged` also needs a fresh agreement: the old chain can still
+/// decrypt, but its key is absent from current certificate evidence. Passing
+/// that plaintext up as a claim would acknowledge data the app must reject.
+///
 /// Each variant here is a sender sealing into something this end does not
 /// hold (see the call sites for the history of the first three).
 /// `Ratchet(_)` joined them for the prologue that fails its key agreement: it
@@ -38,6 +42,7 @@ pub(crate) fn ratchet_failure_warrants_reply(e: &veil_e2e::RatchetSpliceError) -
         veil_e2e::RatchetSpliceError::WedgedConversationDropped
             | veil_e2e::RatchetSpliceError::NotForThisDevice
             | veil_e2e::RatchetSpliceError::NoSession
+            | veil_e2e::RatchetSpliceError::SenderKeyChanged
             | veil_e2e::RatchetSpliceError::Ratchet(_)
     )
 }

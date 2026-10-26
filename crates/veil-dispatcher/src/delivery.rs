@@ -5433,6 +5433,80 @@ mod ratchet_terminal_tests {
     }
 
     #[test]
+    fn rotated_sender_key_requests_repair_without_delivery_or_ack() {
+        use veil_proto::delivery::ForwardPayload;
+        use veil_proto::family::AppMsg;
+        use veil_session::SessionTxRegistry;
+        for direct in [false, true] {
+            let (alice, bob) = (party(ALICE, 0xA1), party(BOB, 0xB1));
+            learn(&alice, &bob);
+            learn(&bob, &alice);
+            let now = veil_util::unix_secs_now_u64();
+            let first = seal(&alice, &bob, b"first");
+            bob.runtime.open_payload(&ALICE, &first, now).unwrap();
+            let reply = seal(&bob, &alice, b"answer");
+            alice.runtime.open_payload(&BOB, &reply, now).unwrap();
+            // Simulate a cold resolver holding only a rotated certificate.
+            wlock!(bob.runtime.peer_ratchet_keys).clear();
+            wlock!(bob.runtime.peer_ratchet_keys)
+                .entry(ALICE)
+                .or_default()
+                .remember(alice.instance_id, [0xF1; 32], u64::MAX);
+            let key = bob.runtime.store.keys()[0];
+            let before = bob.runtime.store.export(&key).unwrap();
+            let (mut disp, _handle, mut app_rx) = dispatcher_for(&bob);
+            let reg = Arc::new(RwLock::new(SessionTxRegistry::new()));
+            let mut relay_rx = reg.write().unwrap().register(RELAY);
+            disp.session_tx_registry = Some(reg);
+            *disp.unopenable_signer.lock().unwrap() =
+                Some(Arc::new(|peer| Some(fake_reply(*peer))));
+            let sealed = seal(&alice, &bob, b"not silently acknowledged");
+            if direct {
+                let body = veil_proto::app::AppSendPayload {
+                    src_app_id: [0xA1; 32],
+                    app_id: APP,
+                    endpoint_id: ENDPOINT,
+                    data: veil_bufpool::pooled_shared_from_vec(sealed),
+                }
+                .encode();
+                let mut header = veil_proto::header::FrameHeader::new(
+                    FrameFamily::App as u8,
+                    AppMsg::AppSendSealed as u16,
+                );
+                header.body_len = body.len() as u32;
+                let response = disp.dispatch(&header, &body, NodeId::from(ALICE));
+                let crate::DispatchResult::Response(bytes) = response else {
+                    panic!("repair response required")
+                };
+                let header = veil_proto::codec::decode_header(&bytes).unwrap();
+                assert_eq!(header.msg_type, AppMsg::AppSendUnopenable as u16);
+                assert!(relay_rx.try_recv().is_err());
+            } else {
+                let (header, body) = forward_frame([0x31; 32], sealed);
+                disp.dispatch(&header, &body, NodeId::from(RELAY));
+                let (_, bytes) = relay_rx.try_recv().expect("signed repair through relay");
+                let header = veil_proto::codec::decode_header(&bytes).unwrap();
+                assert_eq!(header.msg_type, DeliveryMsg::Forward as u16);
+                let forward =
+                    ForwardPayload::decode(&bytes[veil_proto::header::HEADER_SIZE..]).unwrap();
+                assert_eq!(
+                    forward.envelope.app_id,
+                    veil_proto::RATCHET_UNOPENABLE_APP_ID
+                );
+                assert!(
+                    relay_rx.try_recv().is_err(),
+                    "no delivery ACK for rejected ciphertext"
+                );
+            }
+            assert!(take(&mut app_rx).is_none());
+            assert_eq!(
+                bob.runtime.store.export(&key).unwrap().as_slice(),
+                before.as_slice()
+            );
+        }
+    }
+
+    #[test]
     fn repeated_ratchet_payloads_neither_reset_nor_wedge_the_conversation() {
         use veil_session::SessionTxRegistry;
         fn dispatch_payload(

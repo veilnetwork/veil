@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Request a fresh authenticated agreement when a restored ratchet chain uses
+  a sender key absent from the current verified certificates for that instance.
+  Preserve receive state until repair instead of consuming and acknowledging
+  plaintext that applications must reject as unproven. Reuse bounded direct or
+  signed relayed repair replies; retain replay and prologue freshness checks.
+- Preserve explicitly staged Android native libraries when Cargo is skipped,
+  even if a shared Cargo target contains an older library.
+
 ## v0.11.46 — 2026-10-26
 
 ### Fixed
