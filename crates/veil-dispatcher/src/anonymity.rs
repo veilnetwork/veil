@@ -3015,6 +3015,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn receiver_heartbeat_keeps_its_registered_circuit_reachable_past_ttl() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use veil_anonymity::circuit_data::{
+            CIRCUIT_HEARTBEAT_MAGIC, CircuitCellBytes, Direction, apply_layer, wrap_payload,
+        };
+        use veil_anonymity::circuit_register::{
+            CircuitRegisterPayload, CircuitRendezvousRegistry, DEFAULT_SUBSCRIPTION_TTL_SECS,
+            cookie_for_reg_pk,
+        };
+        use veil_anonymity::circuit_setup::CircuitInstall;
+        use veil_anonymity::circuit_table::CircuitTable;
+        use veil_anonymity::circuit_wire::CircuitDataPayload;
+        use veil_crypto::{generate_keypair, sign_message};
+        use veil_types::SignatureAlgorithm;
+
+        let mut d = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        let table = std::sync::Arc::new(CircuitTable::new());
+        let registry = std::sync::Arc::new(CircuitRendezvousRegistry::new());
+        d.circuit_table = Some(table.clone());
+        d.circuit_rendezvous = Some(registry.clone());
+        let now = super::circuit_now_unix();
+        let old = now - DEFAULT_SUBSCRIPTION_TTL_SECS - 1;
+        let prev = [0xEE; 32];
+        let state = table
+            .install(
+                &CircuitInstall {
+                    circuit_id_in: 77,
+                    circuit_id_out: 0,
+                    circuit_key: [7; 32],
+                    cell_bytes: CircuitCellBytes::legacy(),
+                },
+                prev,
+                None,
+                old,
+            )
+            .unwrap();
+        let kp = generate_keypair(SignatureAlgorithm::Ed25519);
+        let reg_pk = STANDARD.decode(&kp.public_key).unwrap().try_into().unwrap();
+        let cookie = cookie_for_reg_pk(&reg_pk);
+        let registration = CircuitRegisterPayload {
+            cookie,
+            reg_pk,
+            epoch: 1,
+            signature: sign_message(
+                SignatureAlgorithm::Ed25519,
+                &kp.public_key,
+                &kp.private_key,
+                &CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk, 1),
+            )
+            .unwrap(),
+        };
+        registry
+            .register(&registration, state.clone(), old)
+            .unwrap();
+
+        // The endpoint's existing forward heartbeat reaches the real handler.
+        // It renews circuit activity without rebuilding or re-registering.
+        let mut ciphertext = wrap_payload(CIRCUIT_HEARTBEAT_MAGIC, state.cell_bytes).unwrap();
+        apply_layer(&state.circuit_key, Direction::Forward, 1, &mut ciphertext);
+        let body = CircuitDataPayload {
+            circuit_id: 77,
+            seq: 1,
+            ciphertext,
+        }
+        .encode(state.cell_bytes)
+        .unwrap();
+        let mut header = FrameHeader::new(
+            FrameFamily::RelayChain as u8,
+            RelayChainMsg::CircuitData as u16,
+        );
+        header.body_len = body.len() as u32;
+        d.dispatch_relay_chain(&header, &body, NodeId::from(prev));
+        assert_eq!(table.gc(now), 0, "the owning circuit is still live");
+        assert_eq!(registry.gc(now), 0, "its receive binding must also survive");
+        assert!(std::sync::Arc::ptr_eq(
+            &registry.lookup(&cookie).unwrap(),
+            &state
+        ));
+
+        // Model the last valid activity aging out. Replaying that heartbeat
+        // cannot refresh either clock; stale registrations still expire.
+        state.touch(old);
+        d.dispatch_relay_chain(&header, &body, NodeId::from(prev));
+        assert_eq!(registry.gc(now), 1);
+        assert_eq!(registry.link_occupancy(&prev), 0);
+    }
+
     /// diff-audit B1: the terminus emits a `CircuitBuilt` ACK only when the
     /// circuit is USABLE for its role. For a registration-carrying circuit that
     /// means the cookie→circuit binding must SUCCEED first; a rejected

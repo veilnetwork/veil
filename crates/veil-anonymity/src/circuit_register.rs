@@ -82,7 +82,8 @@ pub fn cookie_for_reg_pk(reg_pk: &[u8; REG_PK_LEN]) -> [u8; COOKIE_LEN] {
 /// Default cap on circuit-backed subscriptions at one relay (mirrors the
 /// rendezvous registry's `MAX_REGISTRATIONS`).
 pub const MAX_CIRCUIT_SUBSCRIPTIONS: usize = 10_000;
-/// Default subscription TTL — refreshed on re-register.
+/// Receiver-idle subscription TTL. Re-registration or accepted traffic UP the
+/// registered circuit keeps it live; traffic addressed TO its cookie does not.
 pub const DEFAULT_SUBSCRIPTION_TTL_SECS: u64 = 600;
 /// Cap on subscriptions whose circuit arrived over ONE neighbour link.
 ///
@@ -461,14 +462,26 @@ impl CircuitRendezvousRegistry {
         }
     }
 
-    /// Evict subscriptions older than the TTL. Returns the count removed.
+    /// Evict subscriptions whose receiver has been idle for the TTL.
+    /// At a terminus, `last_seen_unix` is touched only by replay-admitted
+    /// forward cells from the circuit owner (including existing heartbeats).
+    /// Splicing third-party traffic DOWN the circuit does not touch that clock,
+    /// so senders cannot retain an abandoned subscription by knowing its cookie.
+    /// Returns the count removed.
     pub fn gc(&self, now_unix: u64) -> usize {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let ttl = self.ttl_secs;
         let expired: Vec<[u8; COOKIE_LEN]> = g
             .subs
             .iter()
-            .filter(|(_, s)| now_unix.saturating_sub(s.registered_unix) >= ttl)
+            .filter(|(_, s)| {
+                let owner_seen = *s
+                    .circuit
+                    .last_seen_unix
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                now_unix.saturating_sub(s.registered_unix.max(owner_seen)) >= ttl
+            })
             .map(|(c, _)| *c)
             .collect();
         // Through `Inner::remove` rather than `retain`, so the per-link index
@@ -850,6 +863,51 @@ mod tests {
         assert_eq!(reg.link_occupancy(&link), 0);
         assert!(reg.is_empty());
         assert!(!reg.remove_if_current(&first.cookie, &current));
+    }
+
+    #[test]
+    fn owner_activity_preserves_binding_for_multiple_ttls() {
+        let reg = CircuitRendezvousRegistry::new();
+        let table = CircuitTable::new();
+        let link = [0xE5; 32];
+        let state = circuit_from(&table, link, 7);
+        let (registration, _) = signed();
+        let mut now = 1000;
+        state.touch(now);
+        reg.register(&registration, Arc::clone(&state), now)
+            .unwrap();
+        for _ in 0..30 {
+            now += 90; // longest existing jittered endpoint heartbeat interval
+            state.touch(now);
+            assert_eq!(table.gc(now), 0);
+            assert_eq!(reg.gc(now), 0);
+            assert!(Arc::ptr_eq(
+                &reg.lookup(&registration.cookie).unwrap(),
+                &state
+            ));
+        }
+        assert_eq!(reg.gc(now + DEFAULT_SUBSCRIPTION_TTL_SECS - 1), 0);
+        assert_eq!(reg.gc(now + DEFAULT_SUBSCRIPTION_TTL_SECS), 1);
+        assert_eq!(reg.link_occupancy(&link), 0);
+    }
+
+    #[test]
+    fn third_party_traffic_cannot_extend_the_receiver_idle_deadline() {
+        let reg = CircuitRendezvousRegistry::new();
+        let table = CircuitTable::new();
+        let state = circuit_from(&table, [0xE5; 32], 7);
+        let (registration, _) = signed();
+        state.touch(1000);
+        reg.register(&registration, Arc::clone(&state), 1000)
+            .unwrap();
+        let deadline = 1000 + DEFAULT_SUBSCRIPTION_TTL_SECS;
+        // Looking up the cookie and recording forwarded introductions may keep
+        // delivering replies; neither proves the original receiver is alive.
+        reg.lookup(&registration.cookie)
+            .unwrap()
+            .mark_served(deadline - 1);
+        assert_eq!(reg.gc(deadline - 1), 0);
+        assert_eq!(reg.gc(deadline), 1);
     }
 
     /// A service rebuilds its circuit down a fresh path every 150 s and
