@@ -1607,6 +1607,7 @@ impl NodeServices {
             keys: origin.circuit_keys.clone(),
             next_seq: std::sync::atomic::AtomicU32::new(0),
             confirmed: std::sync::Arc::clone(&origin.confirmed),
+            last_sent_unix: std::sync::Arc::clone(&origin.last_sent_unix),
             cell_bytes: origin.cell_bytes,
         };
         // Register the stream return-cell sink keyed by origin_circuit_id BEFORE
@@ -2423,7 +2424,7 @@ impl NodeServices {
             // large sequence gap and age genuine cells out of replay windows.
             let frame_len =
                 veil_proto::HEADER_SIZE + CircuitDataPayload::HEADER_LEN + circ.cell_bytes.get();
-            return rlock!(self.session_tx_registry)
+            let result = rlock!(self.session_tx_registry)
                 .send_recoverable_with_result(&circ.first_hop, frame_len, || {
                     let enc = encode()?;
                     Ok(veil_bufpool::pooled_shared_from_vec(
@@ -2440,6 +2441,10 @@ impl NodeServices {
                         DataCircuitSendError::NoRelays
                     }
                 });
+            if result.is_ok() {
+                circ.note_local_handoff();
+            }
+            return result;
         }
         let enc = encode()?;
         let result = match expires_at {
@@ -2463,6 +2468,9 @@ impl NodeServices {
                 DataCircuitSendError::NoRelays
             }
         })?;
+        if expires_at.is_none_or(|deadline| std::time::Instant::now() < deadline) {
+            circ.note_local_handoff();
+        }
         Ok(())
     }
 

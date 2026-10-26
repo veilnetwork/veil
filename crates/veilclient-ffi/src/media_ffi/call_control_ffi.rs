@@ -280,7 +280,13 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    // Sending intentionally returns BUSY rather than waiting for CONTROLS.
+    // These exact queue/close assertions require an uncontended fixture;
+    // another test's registry operation must not turn -1/0 into valid BUSY.
+    static FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+
     struct Fixture {
+        _serial: std::sync::MutexGuard<'static, ()>,
         id: u64,
         peer: [u8; 32],
         cipher: Arc<media::MediaCipher>,
@@ -302,6 +308,9 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        let serial = FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let id = MEDIA_NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let mut peer = [0xcd; 32];
         peer[24..].copy_from_slice(&id.to_be_bytes());
@@ -352,6 +361,7 @@ mod tests {
             Arc::clone(&cipher),
         );
         Fixture {
+            _serial: serial,
             id,
             peer,
             cipher,
