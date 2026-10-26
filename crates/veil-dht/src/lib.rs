@@ -16,6 +16,7 @@ pub mod network_querier;
 pub mod republish;
 pub mod routing;
 pub mod shard;
+mod space_discovery;
 pub mod store;
 pub mod traits;
 pub mod transport_cache;

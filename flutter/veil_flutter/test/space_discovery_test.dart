@@ -32,18 +32,27 @@ void main() {
     ]);
   });
 
+  test('decodes all bounded holder slots without increasing per-record size',
+      () {
+    final values = [
+      for (var index = 0; index < 30; index++) List.filled(16 * 1024, index)
+    ];
+    expect(decodeSpaceDiscoveryReplicaBuffer(_buffer(values)),
+        values.map(Uint8List.fromList).toList());
+  });
+
   test('rejects truncation, excess count, oversized and trailing bytes', () {
     expect(
       () => decodeSpaceDiscoveryReplicaBuffer(Uint8List(3)),
       throwsFormatException,
     );
     expect(
-      () => decodeSpaceDiscoveryReplicaBuffer(_buffer(List.filled(6, [1]))),
+      () => decodeSpaceDiscoveryReplicaBuffer(_buffer(List.filled(31, [1]))),
       throwsFormatException,
     );
     final oversizedHeader = ByteData(8)
       ..setUint32(0, 1, Endian.little)
-      ..setUint32(4, 17 * 1024 + 1, Endian.little);
+      ..setUint32(4, 16 * 1024 + 1, Endian.little);
     expect(
       () => decodeSpaceDiscoveryReplicaBuffer(
         oversizedHeader.buffer.asUint8List(),

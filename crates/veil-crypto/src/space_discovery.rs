@@ -11,9 +11,17 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 pub const SPACE_DISCOVERY_DHT_MAGIC: [u8; 2] = *b"XS";
 pub const SPACE_DISCOVERY_RECORD_VERSION: u8 = 1;
-pub const MAX_SPACE_DISCOVERY_PAYLOAD: usize = 16 * 1024;
+// The complete signed carrier, not just its opaque application payload, must
+// fit the existing 16 KiB DHT wire-value budget.
+pub const MAX_SPACE_DISCOVERY_RECORD_BYTES: usize = 16 * 1024;
+pub const SPACE_DISCOVERY_RECORD_OVERHEAD: usize = 216;
+pub const MAX_SPACE_DISCOVERY_PAYLOAD: usize =
+    MAX_SPACE_DISCOVERY_RECORD_BYTES - SPACE_DISCOVERY_RECORD_OVERHEAD;
 pub const MAX_SPACE_DISCOVERY_LIFETIME_MILLIS: u64 = 2 * 60 * 60 * 1_000;
 pub const SPACE_DISCOVERY_CLOCK_SKEW_MILLIS: u64 = 5 * 60 * 1_000;
+
+mod samples;
+pub use samples::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpaceDiscoveryRoute {
@@ -207,13 +215,11 @@ pub enum SpaceDiscoveryStoreDecision {
     RejectInvalid,
 }
 
-/// Bounded multi-writer sampling for one search-token key.
+/// Legacy single-value arbitration for integrations with a singleton store.
 ///
-/// One DHT shard stores one value, while a contested lookup reads K replicas.
-/// Different replicas therefore use their own node id as the rendezvous salt:
-/// they retain different deterministic samples instead of every replica being
-/// overwritten by the same last writer. A refresh from the same holder for the
-/// same Space always replaces its older sample.
+/// The node runtime now uses [`merge_space_discovery_sample`]: independent
+/// replica salts alone cannot guarantee even two holders in a small network.
+/// Keep this comparator for existing single-value consumers.
 pub fn space_discovery_store_decision(
     existing: Option<&[u8]>,
     incoming: &[u8],

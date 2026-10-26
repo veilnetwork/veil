@@ -127,6 +127,19 @@ impl NodeRuntime {
     /// applies the receiver's rule first. `nickname_store_decision` is that
     /// rule, and it is the same call the STORE gate makes.
     pub fn is_republishable_dht_value_at(value: &[u8], now_unix_ms: u64) -> bool {
+        if value.get(..2) == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_SAMPLES_MAGIC[..])
+        {
+            return veil_crypto::space_discovery::decode_space_discovery_samples(value)
+                .and_then(|records| records.first().map(|record| record.route.dht_key()))
+                .and_then(|key| {
+                    veil_crypto::space_discovery::live_space_discovery_samples(
+                        value,
+                        &key,
+                        now_unix_ms,
+                    )
+                })
+                .is_some_and(|records| !records.is_empty());
+        }
         if !Self::is_self_authenticating_dht_value(value) {
             return false;
         }
@@ -290,5 +303,35 @@ mod tests {
         .to_bytes();
         assert!(NodeRuntime::is_republishable_dht_value_at(&valid, 1_500));
         assert!(!NodeRuntime::is_republishable_dht_value_at(&valid, 2_000));
+    }
+
+    #[test]
+    fn space_discovery_bucket_republish_keeps_live_holders_after_another_expires() {
+        use veil_crypto::space_discovery::merge_space_discovery_sample;
+        let first = SpaceDiscoveryRecord::sign(
+            SpaceDiscoveryRoute::Search([3; 32]),
+            [4; 32],
+            &SigningKey::from_bytes(&[9; 32]),
+            1_000,
+            2_000,
+            vec![1],
+        )
+        .to_bytes();
+        let second = SpaceDiscoveryRecord::sign(
+            SpaceDiscoveryRoute::Search([3; 32]),
+            [4; 32],
+            &SigningKey::from_bytes(&[8; 32]),
+            1_000,
+            3_000,
+            vec![2],
+        )
+        .to_bytes();
+        let bucket = merge_space_discovery_sample(Some(&first), &second, 1_500, &[7; 32]).unwrap();
+        assert!(NodeRuntime::is_republishable_dht_value_at(&bucket, 2_000));
+        assert!(!NodeRuntime::is_republishable_dht_value_at(&bucket, 3_000));
+        let mut forged = bucket;
+        let end = forged.len() - 1;
+        forged[end] ^= 1;
+        assert!(!NodeRuntime::is_republishable_dht_value_at(&forged, 1_500));
     }
 }

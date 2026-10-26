@@ -1,16 +1,16 @@
 //! Public Space discovery over the existing contested DHT read plane.
 //!
 //! xVeil owns and verifies the strict descriptor payload. The node runtime
-//! only accepts the self-authenticating outer carrier, samples multi-writer
-//! search keys per replica, and returns all valid contested replicas to the
+//! only accepts the self-authenticating outer carrier, retains bounded sets
+//! of independent holder samples, and returns valid contested samples to the
 //! application for holder-quorum merge.
 
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use veil_crypto::space_discovery::{
-    SpaceDiscoveryRecord, SpaceDiscoveryRoute, SpaceDiscoveryStoreDecision,
-    space_discovery_store_decision,
+    MAX_SPACE_DISCOVERY_SAMPLES, SpaceDiscoveryRecord, SpaceDiscoveryRoute,
+    space_discovery_sample_query,
 };
 
 use super::NodeServices;
@@ -41,17 +41,8 @@ impl NodeServices {
             return Err("SpaceDiscoveryRecord holder is not this embedded node".to_owned());
         }
         let key = record.route.dht_key();
-        if matches!(
-            space_discovery_store_decision(
-                self.dht.get_local(&key).as_deref(),
-                &bytes,
-                now,
-                &self.local_node_id,
-            ),
-            SpaceDiscoveryStoreDecision::Accept
-        ) {
-            self.dht.store_local(key, bytes.clone());
-        }
+        self.dht
+            .store_space_discovery_sample(key, &bytes, veil_dht::store::ORIGIN_INTERNAL);
         crate::identity_local::publisher_dht::replicate_dht_value(
             &self.dht,
             &self.session_tx_registry,
@@ -64,30 +55,33 @@ impl NodeServices {
 
     /// Read a bounded contested replica set for an exact Space or search token.
     ///
-    /// No candidate is collapsed to a last-writer winner here: independent
-    /// replicas intentionally retain different rendezvous samples, and the
-    /// application verifies descriptor/holder signatures and quorum.
+    /// Query bounded sample slots concurrently. Each response is still one
+    /// original carrier within the existing DHT wire-size budget. Legacy peers
+    /// repeat their singleton; duplicate bytes never count as extra holders.
     pub async fn space_discovery_resolve(
         &self,
         route: SpaceDiscoveryRoute,
         timeout: Duration,
     ) -> Vec<Vec<u8>> {
         let now = unix_now_ms();
-        let values = self
-            .dht_get_replicated_contested(
+        let batches = futures::future::join_all((0..MAX_SPACE_DISCOVERY_SAMPLES).map(|index| {
+            let selector = space_discovery_sample_query(index).expect("bounded sample index");
+            self.dht_get_replicated_contested_with_payload(
                 route.dht_key(),
                 SPACE_DISCOVERY_REPLICAS,
                 timeout,
-                |bytes| {
+                move |bytes| {
                     SpaceDiscoveryRecord::from_bytes(bytes).is_some_and(|record| {
                         record.route == route && record.verify_at(now).is_ok()
                     })
                 },
+                selector.to_vec(),
             )
-            .await;
+        }))
+        .await;
+        let values = batches.into_iter().flatten();
         let mut seen = HashSet::new();
         values
-            .into_iter()
             .filter(|bytes| {
                 let Some(record) = SpaceDiscoveryRecord::from_bytes(bytes) else {
                     return false;
