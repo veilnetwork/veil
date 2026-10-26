@@ -218,7 +218,7 @@ struct Seg {
     /// expired yet. It must not inherit another hole's exponential backoff.
     sack_repair_deadline: Option<u64>,
     /// Valid original RTT observed on its first SACK. Apply only after
-    /// cumulative retirement, and only to grow the conservative RTO.
+    /// cumulative retirement; old receipts may only grow the conservative RTO.
     sack_first_rtt_ms: Option<u32>,
 }
 
@@ -293,6 +293,12 @@ impl Seg {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RtoBackoff {
+    started_ms: u64,
+    flight_end: u32,
+}
+
 struct TxState {
     iss: u32,
     snd_una: u32,
@@ -310,6 +316,10 @@ struct TxState {
     rttvar: u32,
     rto_ms: u64,
     rto_deadline: Option<u64>,
+    /// A fresh post-RTO original may release backoff only after cumulative
+    /// delivery covers the whole flight that the timeout protected.
+    rto_backoff: Option<RtoBackoff>,
+    rto_fresh_sack_updates: u64,
     // Local diagnostics: retired SACKed segments whose raw cumulative ACK age
     // was not reused as a fresh RTT sample.
     rto_sacked_segments_skipped: u64,
@@ -525,6 +535,8 @@ impl StreamEngine {
                 rttvar: 0,
                 rto_ms: cfg.init_rto_ms,
                 rto_deadline: None,
+                rto_backoff: None,
+                rto_fresh_sack_updates: 0,
                 rto_sacked_segments_skipped: 0,
                 next_sack_repair_ms: None,
                 consec_rto: 0,
@@ -806,7 +818,7 @@ impl StreamEngine {
              adv={} ack_pending={} eof={} fin(req={},sent={},ack={}) \
              srtt={:?} rttvar={} rto={}ms pace_next={}ms delayed_ack={}/{:?} \
              rto_dl={:?} persist_dl={:?} bbr_bw={} bbr_rtt_min={:?} bbr_cap={:?} \
-             rack={} reo_wnd={} rack_rtt={} rto_skipped_sacked={} sack_recent_promotions={} \
+             rack={} reo_wnd={} rack_rtt={} rto_skipped_sacked={} sack_rto_refreshes={} sack_recent_promotions={} \
              reo_observed_ms={} reo_duplicate_ms={}",
             self.phase,
             self.tx.snd_una,
@@ -847,6 +859,7 @@ impl StreamEngine {
             self.rack_reo_wnd(),
             self.tx.rack_rtt_ms,
             self.tx.rto_sacked_segments_skipped,
+            self.tx.rto_fresh_sack_updates,
             self.sack_recent_promotions,
             self.tx.rack_reo_max_ms,
             self.tx.rack_dsack_reo_ms,
@@ -1000,6 +1013,7 @@ impl StreamEngine {
         let old_una = self.tx.snd_una;
         let mut newly_delivered = 0u32;
         let mut deferred_sack_rtt: Option<u32> = None;
+        let mut fresh_sack_rtt: Option<u32> = None;
         // BBR measures first receipt of an original, including SACK. RTO
         // keeps cumulative-ACK timing: fast SACKs alone do not shorten the
         // deadline for slower cells. Already-SACKed data cannot be timed again
@@ -1057,6 +1071,16 @@ impl StreamEngine {
                             if let Some(rtt) = s.sack_first_rtt_ms {
                                 deferred_sack_rtt =
                                     Some(deferred_sack_rtt.map_or(rtt, |prior| prior.max(rtt)));
+                                if self.tx.rto_backoff.is_some_and(|backoff| {
+                                    s.sent_ms > backoff.started_ms
+                                        && seq::geq(ack, backoff.flight_end)
+                                        && now.saturating_sub(
+                                            s.sent_ms.saturating_add(u64::from(rtt)),
+                                        ) < self.cfg.max_rto_ms
+                                }) {
+                                    fresh_sack_rtt =
+                                        Some(fresh_sack_rtt.map_or(rtt, |prior| prior.max(rtt)));
+                                }
                             }
                         }
                         if s.handed_off && !s.sacked {
@@ -1127,13 +1151,20 @@ impl StreamEngine {
             if recovery_exited {
                 self.tx.complete_rack_recovery();
             }
-            if let Some(r) = rtt_sample {
+            if let Some(r) = rtt_sample.or(fresh_sack_rtt) {
+                if rtt_sample.is_none() {
+                    self.tx.rto_fresh_sack_updates =
+                        self.tx.rto_fresh_sack_updates.saturating_add(1);
+                }
                 self.tx.update_rto(r, &self.cfg);
+                self.tx.rto_backoff = None;
             }
             if let Some(r) = deferred_sack_rtt {
                 // Preserve the slow-path evidence from the FIRST SACK. It may
-                // grow a conservative timer, but cannot collapse its backoff
-                // using an older receipt or include the head-repair delay.
+                // grow a conservative timer. Only a recent original handed
+                // off after the latest RTO, cumulatively retired beyond that
+                // timeout's flight, can release its backoff above. Old receipts
+                // and the head-repair wait never become new path measurements.
                 self.tx.raise_rto_from_deferred_sample(r, &self.cfg);
             }
             self.tx.arm_or_clear_rto(now);
@@ -1858,6 +1889,13 @@ impl StreamEngine {
             self.tx.in_recovery = false;
             self.tx.dup_acks = 0;
             let expired_rto_ms = self.tx.rto_ms;
+            self.tx.rto_backoff = Some(RtoBackoff {
+                started_ms: now,
+                flight_end: self
+                    .tx
+                    .rewind_high
+                    .map_or(self.tx.snd_nxt, |high| seq::max(high, self.tx.snd_nxt)),
+            });
             self.tx.rto_ms = (self.tx.rto_ms * 2).min(self.cfg.max_rto_ms); // backoff
             if no_sack_rewind {
                 // No SACK feedback means the receiver has not reported any
@@ -3372,6 +3410,160 @@ mod tests {
                     "repeated SACK resampled previously received bytes"
                 );
                 assert_eq!(e.tx.rto_deadline, None);
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_post_recovery_sack_timing_releases_only_the_completed_rto_backoff() {
+        for iss in [100, u32::MAX - 127] {
+            for rack in [false, true] {
+                for scenario in 0..3 {
+                    let lose_fresh_repair = scenario == 1;
+                    let stale_receipt = scenario == 2;
+                    let (mut e, old) = tracked_flight(iss, 256);
+                    e.cfg.rack = rack;
+                    e.local_handoff(&old.iter().map(|t| (*t, 1)).collect(), 10);
+                    e.tx.update_rto(10, &e.cfg);
+                    let mut sacks = SackVec::new();
+                    sacks.push(SackRange {
+                        start: old[1].seq,
+                        end: old[3].seq.wrapping_add(old[3].span),
+                    });
+                    e.on_ack(e.tx.snd_una, 4096, &sacks, 20);
+                    e.on_timeout(100);
+                    let mut cell = Vec::new();
+                    assert!(e.poll_repair_transmit(100, &mut cell));
+                    let repair = LocalTransmit::from_cell(&cell).unwrap();
+                    e.local_handoff(&HashMap::from([(repair, 1)]), 110);
+                    e.on_ack(e.tx.snd_nxt, 4096, &SackVec::new(), 120);
+                    let backed_off = e.tx.rto_ms;
+                    assert!(backed_off > e.cfg.min_rto_ms);
+                    assert!(e.tx.segs.is_empty());
+                    // Only old pre-RTO receipt evidence was retired above.
+                    // It cannot reset the conservative recovery timer.
+                    assert_eq!(backed_off, 80);
+
+                    e.write(&[0x61; 256]);
+                    let mut fresh = Vec::new();
+                    for now in 130..150 {
+                        while e.poll_transmit(now, &mut cell) {
+                            if let Some(token) = LocalTransmit::from_cell(&cell)
+                                && token.kind == TransmitKind::Data
+                            {
+                                fresh.push(token);
+                            }
+                        }
+                        if fresh.len() == 4 {
+                            break;
+                        }
+                    }
+                    assert_eq!(fresh.len(), 4);
+                    e.local_handoff(&fresh.iter().map(|t| (*t, 1)).collect(), 200);
+                    let mut sacks = SackVec::new();
+                    sacks.push(SackRange {
+                        start: fresh[1].seq,
+                        end: fresh[3].seq.wrapping_add(fresh[3].span),
+                    });
+                    for now in 210..213 {
+                        e.on_ack(e.tx.snd_una, 4096, &sacks, now);
+                    }
+                    assert_eq!(e.tx.rto_ms, backed_off, "SACK alone lowered RTO");
+                    e.on_timeout(220);
+                    assert!(e.poll_repair_transmit(220, &mut cell));
+                    let repair = LocalTransmit::from_cell(&cell).unwrap();
+                    assert_eq!(repair.seq, fresh[0].seq);
+                    if !stale_receipt {
+                        e.local_handoff(&HashMap::from([(repair, 1)]), 220);
+                    }
+                    let ack_at = if lose_fresh_repair {
+                        // A newer RTO makes the previously fresh SACK old.
+                        // Its eventual cumulative retirement must preserve
+                        // THIS backoff rather than reuse the earlier epoch.
+                        e.on_timeout(400);
+                        assert_eq!(e.tx.rto_ms, backed_off * 2);
+                        assert!(e.poll_repair_transmit(400, &mut cell));
+                        let repair = LocalTransmit::from_cell(&cell).unwrap();
+                        e.local_handoff(&HashMap::from([(repair, 1)]), 410);
+                        420
+                    } else if stale_receipt {
+                        // A long local repair wait does not make an old first
+                        // receipt a fresh timing observation at retirement.
+                        e.on_timeout(3000);
+                        assert!(e.tx.segs[0].local_pending);
+                        e.local_handoff(&HashMap::from([(repair, 1)]), 3000);
+                        3010
+                    } else {
+                        230
+                    };
+                    e.on_ack(e.tx.snd_nxt, 4096, &SackVec::new(), ack_at);
+                    assert!(e.tx.segs.is_empty());
+                    assert_eq!(e.tx.consec_rto, 0);
+                    let expected = if lose_fresh_repair {
+                        backed_off * 2
+                    } else if stale_receipt {
+                        backed_off
+                    } else {
+                        e.cfg.min_rto_ms
+                    };
+                    assert_eq!(
+                        e.tx.rto_ms, expected,
+                        "fresh post-recovery originals retained an older exponential backoff"
+                    );
+                    assert_eq!(
+                        e.tx.rto_fresh_sack_updates,
+                        u64::from(!lose_fresh_repair && !stale_receipt)
+                    );
+                    // Replayed feedback cannot time the same originals again.
+                    let timing = (e.tx.srtt, e.tx.rttvar, e.tx.rto_ms);
+                    e.on_ack(e.tx.snd_nxt, 4096, &sacks, ack_at + 1000);
+                    assert_eq!((e.tx.srtt, e.tx.rttvar, e.tx.rto_ms), timing);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn post_rto_sack_cannot_shorten_the_timer_before_the_old_flight_is_retired() {
+        for iss in [100, u32::MAX - 127] {
+            for rack in [false, true] {
+                let (mut e, cells) = tracked_flight(iss, 256);
+                e.cfg.rack = rack;
+                e.local_handoff(&cells[..2].iter().map(|t| (*t, 1)).collect(), 10);
+                e.tx.update_rto(10, &e.cfg);
+                let mut sacks = SackVec::new();
+                sacks.push(SackRange {
+                    start: cells[1].seq,
+                    end: cells[1].seq.wrapping_add(cells[1].span),
+                });
+                e.on_ack(e.tx.snd_una, 4096, &sacks, 20);
+                e.on_timeout(100);
+                let mut cell = Vec::new();
+                assert!(e.poll_repair_transmit(100, &mut cell));
+                let repair = LocalTransmit::from_cell(&cell).unwrap();
+                let backed_off = e.tx.rto_ms;
+                e.local_handoff(&HashMap::from([(cells[2], 1)]), 200);
+                let mut sacks = SackVec::new();
+                sacks.push(SackRange {
+                    start: cells[1].seq,
+                    end: cells[2].seq.wrapping_add(cells[2].span),
+                });
+                e.on_ack(e.tx.snd_una, 4096, &sacks, 210);
+                e.local_handoff(&HashMap::from([(repair, 1)]), 220);
+                e.on_ack(
+                    cells[2].seq.wrapping_add(cells[2].span),
+                    4096,
+                    &SackVec::new(),
+                    230,
+                );
+                assert_eq!(e.tx.segs.len(), 1);
+                assert!(e.tx.segs[0].local_pending);
+                assert_eq!(e.tx.rto_ms, backed_off);
+                assert_eq!(e.tx.rto_fresh_sack_updates, 0);
+                // A genuinely new cumulative sample retains its usual role.
+                e.local_handoff(&HashMap::from([(cells[3], 1)]), 300);
+                e.on_ack(e.tx.snd_nxt, 4096, &SackVec::new(), 310);
+                assert_eq!(e.tx.rto_ms, e.cfg.min_rto_ms);
             }
         }
     }
