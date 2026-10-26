@@ -1674,13 +1674,13 @@ impl FrameDispatcher {
         if let Some(state) = table.lookup_forward(&link, p.circuit_id) {
             let next = state.next_link;
             let cid_out = state.circuit_id_out;
-            // Terminus circuit backing a circuit-rendezvous sub → evict it now
-            // (don't wait for the registry TTL).
+            // Evict only this circuit's subscription. A delayed teardown from
+            // an older path must not erase a newer registration of the cookie.
             if next.is_none()
                 && let (Some(reg), Some(cookie)) =
                     (&self.circuit_rendezvous, state.registered_cookie())
             {
-                reg.remove(&cookie);
+                reg.remove_if_current(&cookie, &state);
             }
             table.remove(&link, p.circuit_id);
             if let Some(nl) = next {
@@ -3397,6 +3397,7 @@ mod tests {
     async fn circuit_forward_splices_to_registered_cookie_return() {
         circuit_forward_splices_to_registered_cookie_return_with_transport(
             RelayChainMsg::CircuitData,
+            false,
         )
         .await;
     }
@@ -3405,12 +3406,22 @@ mod tests {
     async fn circuit_forward_splices_to_registered_cookie_return_datagram() {
         circuit_forward_splices_to_registered_cookie_return_with_transport(
             RelayChainMsg::CircuitDatagram,
+            false,
         )
         .await;
     }
 
+    #[tokio::test]
+    async fn stale_circuit_teardown_preserves_refreshed_receiver_and_delivery() {
+        for transport in [RelayChainMsg::CircuitData, RelayChainMsg::CircuitDatagram] {
+            circuit_forward_splices_to_registered_cookie_return_with_transport(transport, true)
+                .await;
+        }
+    }
+
     async fn circuit_forward_splices_to_registered_cookie_return_with_transport(
         transport: RelayChainMsg,
+        refresh_receiver: bool,
     ) {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD;
@@ -3431,7 +3442,7 @@ mod tests {
         d.circuit_rendezvous = Some(std::sync::Arc::new(CircuitRendezvousRegistry::new()));
 
         // Capture frames R emits toward the RECEIVER's hop (the spliced return).
-        let recv_hop = [0xEE; 32];
+        let mut recv_hop = [0xEE; 32];
         let send_hop = [0xDD; 32];
         let mut reg_tx = SessionTxRegistry::new();
         let mut recv_rx = reg_tx.register(NodeId::from(recv_hop));
@@ -3487,6 +3498,73 @@ mod tests {
             "receiver cookie bound to its return circuit"
         );
         let _ = recv_rx.try_recv(); // drain the CircuitBuilt ACK toward recv_hop
+
+        if refresh_receiver {
+            // A newer signed registration moves the SAME cookie to another
+            // path. Circuit ids are link-local: reuse the number on a different
+            // neighbour so comparing the id alone cannot satisfy this test.
+            let old_hop = recv_hop;
+            recv_hop = [0xCC; 32];
+            recv_rx = d
+                .session_tx_registry
+                .as_ref()
+                .unwrap()
+                .write()
+                .unwrap()
+                .register(NodeId::from(recv_hop));
+            let epoch = epoch + 1;
+            let refreshed = CircuitRegisterPayload {
+                cookie,
+                reg_pk,
+                epoch,
+                signature: sign_message(
+                    SignatureAlgorithm::Ed25519,
+                    &kp.public_key,
+                    &kp.private_key,
+                    &CircuitRegisterPayload::signing_bytes(&cookie, &reg_pk, epoch),
+                )
+                .unwrap(),
+            };
+            let hop = CircuitSetupHop {
+                node_id: [0u8; 32],
+                pubkey: pk,
+                circuit_id_in: recv_cid,
+                circuit_id_out: 0,
+                circuit_key: [4u8; 32],
+            };
+            let env = build_circuit_setup(
+                &[hop],
+                veil_anonymity::circuit_data::CircuitCellBytes::legacy(),
+                &refreshed.encode(),
+            )
+            .unwrap();
+            rhdr.body_len = env.len() as u32;
+            d.dispatch_relay_chain(&rhdr, &env, NodeId::from(recv_hop));
+            recv_rx
+                .try_recv()
+                .expect("refreshed registration confirmed");
+
+            // The old path closes AFTER the new one is confirmed. Its teardown
+            // must free that path without erasing the replacement subscription.
+            let body = veil_anonymity::circuit_wire::CircuitTeardownPayload {
+                circuit_id: recv_cid,
+            }
+            .encode();
+            let mut header = FrameHeader::new(
+                FrameFamily::RelayChain as u8,
+                RelayChainMsg::CircuitTeardown as u16,
+            );
+            header.body_len = body.len() as u32;
+            d.dispatch_relay_chain(&header, &body, NodeId::from(old_hop));
+            assert!(
+                d.circuit_table
+                    .as_ref()
+                    .unwrap()
+                    .lookup_forward(&old_hop, recv_cid)
+                    .is_none(),
+                "old circuit itself was freed"
+            );
+        }
 
         // (2) SENDER's circuit at R: a plain terminus build arriving from send_hop.
         let send_cid = 42u32;
