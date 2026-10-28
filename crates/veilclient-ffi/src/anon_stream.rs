@@ -6100,8 +6100,10 @@ mod tests {
         let runtime = veil_node_runtime::NodeRuntime::start(&path, true)
             .await
             .unwrap();
-        let services =
-            veil_node_runtime::embedded_services_for(&runtime.access().local_node_id()).unwrap();
+        // Every deferred stub shares one pre-mined identity. A parallel
+        // fixture may publish different receive capabilities under that id;
+        // use this runtime's own view rather than the process-wide last writer.
+        let services = runtime.access();
         (dir, runtime, services)
     }
 

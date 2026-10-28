@@ -161,6 +161,13 @@ pub enum RatchetSkipError {
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RatchetSpliceError {
+    /// The journaling host must commit a sending floor before encryption.
+    #[error("ratchet sending chain needs a durable host reservation")]
+    HostReservationRequired,
+
+    /// The owner closed or superseded this journaled publication context.
+    #[error("ratchet host publication attachment is closed")]
+    HostPublicationClosed,
     /// The payload is not a ratchet payload, or is truncated.
     #[error("malformed ratchet payload: {0}")]
     Malformed(&'static str),
@@ -892,7 +899,12 @@ impl Entry {
     }
 }
 
+mod host_publication;
+use host_publication::HostPublication;
+pub use host_publication::{HostPublicationError, HostPublicationState};
+
 struct Inner {
+    host_publication: HostPublication,
     entries: BTreeMap<ConversationKey, Entry>,
     version: u64,
     /// Conversations whose bytes changed, each against the version at which
@@ -1108,6 +1120,7 @@ impl RatchetStore {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner {
+                host_publication: HostPublication::default(),
                 entries: BTreeMap::new(),
                 version: 0,
                 dirty: BTreeMap::new(),
@@ -1570,6 +1583,31 @@ pub fn seal(
     app_payload: &[u8],
     now_unix: u64,
 ) -> Result<(Vec<u8>, [u8; ACK_KEY_LEN]), RatchetSpliceError> {
+    seal_for_attachment(store, me, peer, app_payload, now_unix, None)
+}
+
+/// Seal for one host attachment, checking ownership under the same lock as
+/// key consumption. A request already queued by an old owner cannot borrow a
+/// successor's committed floors.
+pub fn seal_for_host(
+    store: &RatchetStore,
+    me: &RatchetIdentity,
+    peer: PeerRatchetKeys<'_>,
+    app_payload: &[u8],
+    now_unix: u64,
+    expected_epoch: u64,
+) -> Result<(Vec<u8>, [u8; ACK_KEY_LEN]), RatchetSpliceError> {
+    seal_for_attachment(store, me, peer, app_payload, now_unix, Some(expected_epoch))
+}
+
+fn seal_for_attachment(
+    store: &RatchetStore,
+    me: &RatchetIdentity,
+    peer: PeerRatchetKeys<'_>,
+    app_payload: &[u8],
+    now_unix: u64,
+    expected_epoch: Option<u64>,
+) -> Result<(Vec<u8>, [u8; ACK_KEY_LEN]), RatchetSpliceError> {
     let mut ack_key = [0u8; ACK_KEY_LEN];
     ack_key[..SENT_AT_LEN].copy_from_slice(&now_unix.to_be_bytes());
     let tag_end = SENT_AT_LEN + TREE_CAPABLE_TAG.len();
@@ -1578,7 +1616,8 @@ pub fn seal(
     let mut plaintext = Zeroizing::new(Vec::with_capacity(ACK_KEY_LEN + app_payload.len()));
     plaintext.extend_from_slice(&ack_key);
     plaintext.extend_from_slice(app_payload);
-    seal_inner(store, me, peer, &plaintext, now_unix).map(|payload| (payload, ack_key))
+    seal_inner(store, me, peer, &plaintext, now_unix, expected_epoch)
+        .map(|payload| (payload, ack_key))
 }
 
 fn seal_inner(
@@ -1587,6 +1626,7 @@ fn seal_inner(
     peer: PeerRatchetKeys<'_>,
     plaintext: &[u8],
     now_unix: u64,
+    expected_epoch: Option<u64>,
 ) -> Result<Vec<u8>, RatchetSpliceError> {
     if peer.ratchet_pk == &[0u8; 32] {
         // The canonical low-order point: every Diffie-Hellman against it is a
@@ -1627,6 +1667,10 @@ fn seal_inner(
 
     let mut g = store.lock();
 
+    if expected_epoch.is_some_and(|epoch| epoch != g.host_publication.epoch) {
+        return Err(RatchetSpliceError::HostPublicationClosed);
+    }
+
     // Settle the conversation against the certificate BEFORE sealing anything
     // into it.
     //
@@ -1665,6 +1709,19 @@ fn seal_inner(
         }
     }
 
+    // The check and key consumption share this store lock. A prior host read
+    // cannot authorize a second queued command after the first exhausts it.
+    let fresh = !g.entries.contains_key(&key);
+    let position = g.entries.get(&key).and_then(|e| e.session.send_position());
+    {
+        let Inner {
+            entries,
+            host_publication,
+            ..
+        } = &mut *g;
+        host_publication.prune_at_capacity(|key| entries.contains_key(key));
+        host_publication.check(key, position)?;
+    }
     let (kind, blob) = match g.entries.get_mut(&key) {
         Some(entry) => {
             let frame = entry.session.encrypt(plaintext, &ad)?;
@@ -1737,6 +1794,15 @@ fn seal_inner(
         }
     };
     g.commit_change(key);
+    if fresh {
+        let Inner {
+            entries,
+            host_publication,
+            ..
+        } = &mut *g;
+        host_publication.prune_at_capacity(|key| entries.contains_key(key));
+        host_publication.first_seal(key)?;
+    }
     drop(g);
 
     Ok(encode_payload(
@@ -6145,6 +6211,325 @@ mod tests {
     }
 
     #[test]
+    fn a_prechecked_host_window_must_not_reuse_a_published_message_key() {
+        let (a, b) = settled_pair(0xB3);
+        let key = ConversationKey {
+            local_instance_id: a.instance_id,
+            peer_node_id: b.node_id,
+            peer_instance_id: b.instance_id,
+        };
+        while a.store.send_position(&key).unwrap().next < 31 {
+            seal_at(&a, &b, b"fixture padding", NOW);
+        }
+        let snapshot = a.store.export(&key).unwrap();
+        let before = a.store.send_position(&key).unwrap();
+        let epoch = a.store.begin_host_publication();
+        a.store
+            .allow_host_publication(
+                epoch,
+                &key,
+                &[veil_ratchet::SendPosition {
+                    chain: before.chain,
+                    next: 32,
+                }],
+            )
+            .unwrap();
+        assert!(a.store.send_position(&key).unwrap().next < 32);
+        assert!(a.store.send_position(&key).unwrap().next < 32);
+        seal_at(&a, &b, b"first outstanding", NOW);
+        let version = a.store.version();
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        assert!(matches!(
+            seal(
+                &a.store,
+                &a.me(),
+                keys(&b, &ek, &pk),
+                b"observed-message",
+                NOW
+            ),
+            Err(RatchetSpliceError::HostReservationRequired)
+        ));
+        assert_eq!(a.store.send_position(&key).unwrap().next, 32);
+        assert_eq!(a.store.version(), version);
+        // The host commits the next reservation before installing this floor.
+        a.store
+            .allow_host_publication(
+                epoch,
+                &key,
+                &[veil_ratchet::SendPosition {
+                    chain: before.chain,
+                    next: 64,
+                }],
+            )
+            .unwrap();
+        let old_plaintext = b"observed-message";
+        let published = seal_at(&a, &b, old_plaintext, NOW);
+        // A crash loses all volatile floors. Restore the old snapshot and burn
+        // through the host's last COMMITTED reservation, including that send.
+        let resumed = a.store.begin_host_publication();
+        a.store.import(&key, &snapshot, NOW).unwrap();
+        a.store
+            .skip_send_to(
+                &key,
+                veil_ratchet::SendPosition {
+                    chain: before.chain,
+                    next: 64,
+                },
+            )
+            .unwrap();
+        a.store
+            .allow_host_publication(
+                resumed,
+                &key,
+                &[veil_ratchet::SendPosition {
+                    chain: before.chain,
+                    next: 96,
+                }],
+            )
+            .unwrap();
+        let new_plaintext = b"changed--message";
+        let repeated = seal_at(&a, &b, new_plaintext, NOW);
+        let n = old_plaintext.len();
+        let old_tail = &published[published.len() - 16 - n..published.len() - 16];
+        let new_tail = &repeated[repeated.len() - 16 - n..repeated.len() - 16];
+        let cipher_xor: Vec<u8> = old_tail.iter().zip(new_tail).map(|(a, b)| a ^ b).collect();
+        let plain_xor: Vec<u8> = old_plaintext
+            .iter()
+            .zip(new_plaintext)
+            .map(|(a, b)| a ^ b)
+            .collect();
+        assert_ne!(
+            cipher_xor, plain_xor,
+            "a previously published keystream must not repeat after recovery"
+        );
+    }
+
+    #[test]
+    fn fresh_host_chain_waits_once_and_keeps_its_prologue_readable() {
+        let (a, b) = (device(0x35), device(0xA1));
+        let key = ConversationKey {
+            local_instance_id: a.instance_id,
+            peer_node_id: b.node_id,
+            peer_instance_id: b.instance_id,
+        };
+        let epoch = a.store.begin_host_publication();
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        for _ in 0..10 {
+            assert!(matches!(
+                seal(
+                    &a.store,
+                    &a.me(),
+                    keys(&b, &ek, &pk),
+                    b"first actual post",
+                    NOW
+                ),
+                Err(RatchetSpliceError::HostReservationRequired)
+            ));
+            assert_eq!(
+                a.store.send_position(&key).unwrap().next,
+                1,
+                "blocked retries cannot keep burning unseen keys"
+            );
+        }
+        assert_eq!(a.store.host_publication_state().required, 1);
+        let at = a.store.send_position(&key).unwrap();
+        a.store
+            .allow_host_publication(
+                epoch,
+                &key,
+                &[veil_ratchet::SendPosition {
+                    chain: at.chain,
+                    next: 33,
+                }],
+            )
+            .unwrap();
+        let payload = seal_at(&a, &b, b"first actual post", NOW);
+        assert_eq!(
+            open_at(&b, &a, &payload, NOW).unwrap().plaintext,
+            b"first actual post"
+        );
+        assert_eq!(a.store.host_publication_state().required, 0);
+    }
+
+    #[test]
+    fn parallel_seals_cannot_overrun_the_one_remaining_host_position() {
+        let (a, b) = settled_pair(0x53);
+        let key = ConversationKey {
+            local_instance_id: a.instance_id,
+            peer_node_id: b.node_id,
+            peer_instance_id: b.instance_id,
+        };
+        let at = a.store.send_position(&key).unwrap();
+        let epoch = a.store.begin_host_publication();
+        a.store
+            .allow_host_publication(
+                epoch,
+                &key,
+                &[veil_ratchet::SendPosition {
+                    chain: at.chain,
+                    next: at.next + 1,
+                }],
+            )
+            .unwrap();
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        let successes = std::thread::scope(|scope| {
+            let jobs: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"parallel", NOW))
+                })
+                .collect();
+            jobs.into_iter()
+                .map(|job| job.join().unwrap().is_ok())
+                .filter(|ok| *ok)
+                .count()
+        });
+        assert_eq!(successes, 1);
+        assert_eq!(a.store.send_position(&key).unwrap().next, at.next + 1);
+    }
+
+    #[test]
+    fn retired_host_cannot_authorize_or_close_its_successor() {
+        let (a, b) = settled_pair(0x61);
+        let key = ConversationKey {
+            local_instance_id: a.instance_id,
+            peer_node_id: b.node_id,
+            peer_instance_id: b.instance_id,
+        };
+        let at = a.store.send_position(&key).unwrap();
+        let first = a.store.begin_host_publication();
+        let second = a.store.begin_host_publication();
+        let marks = [veil_ratchet::SendPosition {
+            chain: at.chain,
+            next: at.next + 32,
+        }];
+        assert_eq!(
+            a.store.allow_host_publication(first, &key, &marks),
+            Err(HostPublicationError::Inactive)
+        );
+        a.store.end_host_publication(first);
+        assert!(a.store.host_publication_state().active);
+        a.store
+            .allow_host_publication(second, &key, &marks)
+            .unwrap();
+        seal_at(&a, &b, b"new owner", NOW);
+        a.store.end_host_publication(second);
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        let before = a.store.send_position(&key).unwrap();
+        assert!(matches!(
+            seal(&a.store, &a.me(), keys(&b, &ek, &pk), b"closed", NOW),
+            Err(RatchetSpliceError::HostPublicationClosed)
+        ));
+        assert_eq!(a.store.send_position(&key).unwrap(), before);
+    }
+
+    #[test]
+    fn host_floor_is_bounded_and_old_requests_cannot_borrow_a_new_owner() {
+        let (a, b) = settled_pair(0x76);
+        let key = ConversationKey {
+            local_instance_id: a.instance_id,
+            peer_node_id: b.node_id,
+            peer_instance_id: b.instance_id,
+        };
+        let at = a.store.send_position(&key).unwrap();
+        let old = a.store.begin_host_publication();
+        let epoch = a.store.begin_host_publication();
+        assert_eq!(
+            a.store.allow_host_publication(
+                epoch,
+                &key,
+                &[SendPosition {
+                    chain: at.chain,
+                    next: at.next + veil_ratchet::MAX_SEND_SKIP + 1
+                }]
+            ),
+            Err(HostPublicationError::TooFar)
+        );
+        a.store
+            .allow_host_publication(
+                epoch,
+                &key,
+                &[SendPosition {
+                    chain: at.chain,
+                    next: at.next + 32,
+                }],
+            )
+            .unwrap();
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        assert!(matches!(
+            seal_for_host(&a.store, &a.me(), keys(&b, &ek, &pk), b"retired", NOW, old),
+            Err(RatchetSpliceError::HostPublicationClosed)
+        ));
+        assert_eq!(a.store.send_position(&key).unwrap(), at);
+        assert!(
+            seal_for_host(
+                &a.store,
+                &a.me(),
+                keys(&b, &ek, &pk),
+                b"current",
+                NOW,
+                epoch
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_dh_rotation_cannot_publish_using_the_previous_chain_floor() {
+        let (a, b) = settled_pair(0x77);
+        let key = ConversationKey {
+            local_instance_id: a.instance_id,
+            peer_node_id: b.node_id,
+            peer_instance_id: b.instance_id,
+        };
+        let previous = a.store.send_position(&key).unwrap();
+        let epoch = a.store.begin_host_publication();
+        a.store
+            .allow_host_publication(
+                epoch,
+                &key,
+                &[SendPosition {
+                    chain: previous.chain,
+                    next: previous.next + 32,
+                }],
+            )
+            .unwrap();
+        let first = seal_at(&a, &b, b"before turn", NOW);
+        open_at(&b, &a, &first, NOW).unwrap();
+        let reply = seal_at(&b, &a, b"new peer turn", NOW);
+        open_at(&a, &b, &reply, NOW).unwrap();
+        let current = a.store.send_position(&key).unwrap();
+        assert_ne!(current.chain, previous.chain);
+        let (ek, pk) = (b.ek(), b.ratchet_pk());
+        assert!(matches!(
+            seal_for_host(
+                &a.store,
+                &a.me(),
+                keys(&b, &ek, &pk),
+                b"after turn",
+                NOW,
+                epoch
+            ),
+            Err(RatchetSpliceError::HostReservationRequired)
+        ));
+        assert_eq!(a.store.send_position(&key).unwrap(), current);
+        a.store
+            .allow_host_publication(
+                epoch,
+                &key,
+                &[SendPosition {
+                    chain: current.chain,
+                    next: current.next + 32,
+                }],
+            )
+            .unwrap();
+        let post = seal_at(&a, &b, b"after turn", NOW);
+        assert_eq!(
+            open_at(&b, &a, &post, NOW).unwrap().plaintext,
+            b"after turn"
+        );
+    }
+
+    #[test]
     fn stored_sending_positions_describe_the_snapshot_not_live_state() {
         let (a, b) = settled_pair(0xA4);
         let key = ConversationKey {
@@ -6657,6 +7042,7 @@ mod tests {
             keys(&b, &ek, &pk),
             &plaintext,
             NOW + 60,
+            None,
         )
         .expect("seal");
         assert_eq!(sent_at(&plaintext, NOW + 60), None, "test premise");
@@ -6794,7 +7180,7 @@ mod tests {
         plaintext.extend_from_slice(b"from an older build");
         let (ek, pk) = (b.ek(), b.ratchet_pk());
         let payload =
-            seal_inner(&a.store, &a.me(), keys(&b, &ek, &pk), &plaintext, NOW).expect("seal");
+            seal_inner(&a.store, &a.me(), keys(&b, &ek, &pk), &plaintext, NOW, None).expect("seal");
         open_from(&b, &a, &payload);
         assert!(!peer_supports_tree(&b));
 

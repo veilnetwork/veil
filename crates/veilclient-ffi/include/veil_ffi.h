@@ -607,6 +607,35 @@
 #define VEIL_RATCHET_MAX_SEND_POSITIONS 2
 #endif
 
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * The queried attachment is retired or has been superseded.
+ */
+#define VEIL_RATCHET_HOST_RETIRED 0
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * The queried attachment is active and no chain currently needs a floor.
+ */
+#define VEIL_RATCHET_HOST_IDLE 1
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * At least one encryption is waiting for a committed reservation.
+ */
+#define VEIL_RATCHET_HOST_NEEDS_RESERVATION 2
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Another owner has replaced this attachment; its state must not be saved
+ * into the retired owner's container.
+ */
+#define VEIL_RATCHET_HOST_SUPERSEDED 3
+#endif
+
 typedef struct Option_MediaRecvFn Option_MediaRecvFn;
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
@@ -5017,6 +5046,59 @@ int veil_ratchet_import(VeilHandle *handle,
  * [`VEIL_RATCHET_KEY_LEN`] readable bytes.
  */
  int veil_ratchet_forget(VeilHandle *handle, const uint8_t *key_64, char **err_out) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Begin a journaled publication attachment. Must precede application sends.
+ * Memory-only stores remain unchanged until this API is explicitly called.
+ *
+ * # Safety
+ * `handle` is live; `out_epoch` is writable. Standard error-pointer contract.
+ */
+ int veil_ratchet_host_begin(VeilHandle *handle, uint64_t *out_epoch, char **err_out) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Read this attachment's bounded reservation demand without changing keys.
+ *
+ * # Safety
+ * `handle` is live; `out_state` is writable. Standard error-pointer contract.
+ */
+ int veil_ratchet_host_state(VeilHandle *handle, uint64_t epoch, int *out_state, char **err_out) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Install public chain/index floors only AFTER the host committed them.
+ * Records are 32 chain bytes followed by a big-endian u32 exclusive end.
+ * An absent/retired chain cannot acquire authority from another chain's mark.
+ *
+ * # Safety
+ * `handle` is live; `key_64` names 64 readable bytes; `marks` names
+ * `count * 36` readable bytes (may be null only for count zero). Error contract
+ * matches the other ratchet entry points. Count is bounded before any read.
+ */
+
+int veil_ratchet_host_allow(VeilHandle *handle,
+                            uint64_t epoch,
+                            const uint8_t *key_64,
+                            const uint8_t *marks,
+                            size_t count,
+                            char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
+ * Close only this attachment. Blocked requests fail closed, never downgrade.
+ * Closing a superseded epoch is an idempotent no-op for the current owner.
+ *
+ * # Safety
+ * `handle` is live. Standard error-pointer contract.
+ */
+ int veil_ratchet_host_end(VeilHandle *handle, uint64_t epoch, char **err_out) ;
 #endif
 
 #ifdef __cplusplus
