@@ -71,10 +71,13 @@ class VeilBackground {
   ///
   /// Idempotent — calling start when the service is already running
   /// just refreshes the notification text.
+  /// [callSession] scopes notification actions to this call instance. Hosts
+  /// must validate it against their current call before applying an action.
   static Future<void> start({
     String? title,
     String? text,
     bool hangupAction = false,
+    String? callSession,
     bool ringing = false,
     bool microphone = false,
     bool camera = false,
@@ -85,6 +88,7 @@ class VeilBackground {
       if (title != null) 'title': title,
       if (text != null) 'text': text,
       if (hangupAction) 'hangupAction': true,
+      if (callSession != null) 'callSession': callSession,
       if (ringing) 'ringing': true,
       if (microphone) 'microphone': true,
       if (camera) 'camera': true,
