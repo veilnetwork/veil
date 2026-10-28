@@ -29,13 +29,18 @@ import java.security.SecureRandom
  * replay, or a stale PendingIntent the system re-delivers — finds nothing.
  * Each `buildNotification` mints fresh tokens, and the notification is rebuilt
  * on every call-state change, so the live buttons always carry a valid one.
+ *
+ * A host-provided session is bound to the capability and carried through the
+ * activity callback. The host must ALSO match it against its current call:
+ * the call can change after consume succeeds but before Dart handles the action.
  */
 object CallActionCapability {
     private val rng = SecureRandom()
     private val lock = Any()
 
     /** action → the single token currently honoured for it. */
-    private val live = HashMap<String, String>()
+    private data class Capability(val token: String, val session: String?)
+    private val live = HashMap<String, Capability>()
 
     /**
      * Mint (and store) the capability for [action], replacing any previous one.
@@ -44,11 +49,12 @@ object CallActionCapability {
      * notification the user can actually see should work, and rebuilding the
      * notification is what makes older ones unreachable.
      */
-    fun mint(action: String): String {
+    @JvmOverloads
+    fun mint(action: String, session: String? = null): String {
         val bytes = ByteArray(32)
         rng.nextBytes(bytes)
         val token = bytes.joinToString("") { "%02x".format(it) }
-        synchronized(lock) { live[action] = token }
+        synchronized(lock) { live[action] = Capability(token, session) }
         return token
     }
 
@@ -60,7 +66,8 @@ object CallActionCapability {
      * but a length-and-prefix compare is the kind of thing that becomes one
      * after someone adds a retry path, and the cost here is nil.
      */
-    fun consume(action: String?, token: String?): Boolean {
+    @JvmOverloads
+    fun consume(action: String?, token: String?, session: String? = null): Boolean {
         if (action == null || token == null) return false
         // ONE critical section: compare AND remove (audit V-12). Split across
         // two `synchronized` blocks, two concurrent callers both read the same
@@ -71,7 +78,7 @@ object CallActionCapability {
         // an action is dispatched from anywhere else.
         synchronized(lock) {
             val expected = live[action] ?: return false
-            if (!constantTimeEquals(expected, token)) return false
+            if (expected.session != session || !constantTimeEquals(expected.token, token)) return false
             live.remove(action)
             return true
         }
@@ -94,4 +101,5 @@ object CallActionCapability {
 
     /** Extra key naming the requested action (`accept` / `hangup`). */
     const val EXTRA_CALL_ACTION: String = "xveil_call_action"
+    const val EXTRA_CALL_SESSION: String = "xveil_call_session"
 }

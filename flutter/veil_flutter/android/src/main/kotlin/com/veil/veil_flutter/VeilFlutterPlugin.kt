@@ -211,6 +211,7 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 val title = call.argument<String>("title")
                 val text  = call.argument<String>("text")
                 val hangupAction = call.argument<Boolean>("hangupAction") ?: false
+                val callSession = call.argument<String>("callSession")
                 val ringing = call.argument<Boolean>("ringing") ?: false
                 val microphone = call.argument<Boolean>("microphone") ?: false
                 val camera = call.argument<Boolean>("camera") ?: false
@@ -219,6 +220,7 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                     if (title != null) putExtra(VeilDaemonService.EXTRA_NOTIFICATION_TITLE, title)
                     if (text  != null) putExtra(VeilDaemonService.EXTRA_NOTIFICATION_TEXT, text)
                     putExtra(VeilDaemonService.EXTRA_HANGUP_ACTION, hangupAction)
+                    if (callSession != null) putExtra(CallActionCapability.EXTRA_CALL_SESSION, callSession)
                     putExtra(VeilDaemonService.EXTRA_RINGING, ringing)
                     putExtra(VeilDaemonService.EXTRA_MICROPHONE, microphone)
                     putExtra(VeilDaemonService.EXTRA_CAMERA, camera)
