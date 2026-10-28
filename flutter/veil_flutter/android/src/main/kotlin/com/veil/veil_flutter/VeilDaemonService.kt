@@ -109,11 +109,12 @@ class VeilDaemonService : Service() {
                     ?: getString(R.string.veil_default_title)
                 val text = intent?.getStringExtra(EXTRA_NOTIFICATION_TEXT)
                 val hangupAction = intent?.getBooleanExtra(EXTRA_HANGUP_ACTION, false) ?: false
+                val callSession = intent?.getStringExtra(CallActionCapability.EXTRA_CALL_SESSION)
                 val ringing = intent?.getBooleanExtra(EXTRA_RINGING, false) ?: false
                 val microphone = intent?.getBooleanExtra(EXTRA_MICROPHONE, false) ?: false
                 val camera = intent?.getBooleanExtra(EXTRA_CAMERA, false) ?: false
                 startForegroundCompat(
-                    buildNotification(title, text, hangupAction, ringing),
+                    buildNotification(title, text, hangupAction, ringing, callSession),
                     microphone = microphone,
                     camera = camera,
                 )
@@ -189,6 +190,7 @@ class VeilDaemonService : Service() {
         text: String?,
         hangupAction: Boolean = false,
         ringing: Boolean = false,
+        callSession: String? = null,
     ): Notification {
         val openIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
             addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
@@ -217,16 +219,26 @@ class VeilDaemonService : Service() {
             .setContentIntent(openPendingIntent)
         if (text != null) builder.setContentText(text)
         if (hangupAction && openIntent != null) {
+            val scopedCallIntent = Intent(openIntent).apply {
+                // PendingIntent identity ignores extras. Without a distinct
+                // category, UPDATE_CURRENT can rewrite an old call's button
+                // with the next call's token/session before it is delivered.
+                // A category avoids introducing a navigable deep-link URI.
+                if (callSession != null) {
+                    addCategory("com.veil.veil_flutter.CALL_SESSION.$callSession")
+                }
+            }
             if (ringing) {
-                val acceptIntent = Intent(openIntent).apply {
+                val acceptIntent = Intent(scopedCallIntent).apply {
                     action = APP_ACTION_ACCEPT
                     putExtra(CallActionCapability.EXTRA_CALL_ACTION, "accept")
+                    putExtra(CallActionCapability.EXTRA_CALL_SESSION, callSession)
                     // Without this the extra above is a request any installed
                     // app can make of the exported launcher activity. See
                     // CallActionCapability.
                     putExtra(
                         CallActionCapability.EXTRA_CALL_TOKEN,
-                        CallActionCapability.mint("accept"),
+                        CallActionCapability.mint("accept", callSession),
                     )
                 }
                 val acceptPendingIntent = PendingIntent.getActivity(
@@ -241,12 +253,13 @@ class VeilDaemonService : Service() {
                     acceptPendingIntent,
                 )
             }
-            val endIntent = Intent(openIntent).apply {
+            val endIntent = Intent(scopedCallIntent).apply {
                 action = APP_ACTION_HANGUP
                 putExtra(CallActionCapability.EXTRA_CALL_ACTION, "hangup")
+                putExtra(CallActionCapability.EXTRA_CALL_SESSION, callSession)
                 putExtra(
                     CallActionCapability.EXTRA_CALL_TOKEN,
-                    CallActionCapability.mint("hangup"),
+                    CallActionCapability.mint("hangup", callSession),
                 )
             }
             val endPendingIntent = PendingIntent.getActivity(
