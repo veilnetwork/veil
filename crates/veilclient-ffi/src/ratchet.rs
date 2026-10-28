@@ -30,6 +30,9 @@
 // with the in-process node compiled in — was caught here rather than in CI.
 #[cfg(feature = "node-embedded")]
 use std::ptr;
+
+#[cfg(feature = "node-embedded")]
+pub mod host_publication_ffi;
 #[cfg(feature = "node-embedded")]
 use std::sync::Arc;
 

@@ -2216,6 +2216,9 @@ pub mod ipc_send_err {
     /// backoff; a loss-tolerant batch is rejected as a whole, without per-cell
     /// receipts or a promise of network delivery.
     pub const SERVER_BUSY: u16 = 12;
+    /// A journaled local owner has not committed the sending-key reservation,
+    /// or that owner closed. Never substitute an unratcheted publication.
+    pub const RATCHET_NOT_DURABLE: u16 = 13;
 }
 
 // ── RegisterOnionServicePayload ──────────────────────────────────────────────

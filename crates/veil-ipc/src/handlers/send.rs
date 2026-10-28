@@ -724,156 +724,231 @@ type RatchetSeal = (Vec<u8>, [u8; 32], [u8; 32]);
 /// run with no sovereign identity, and a recipient may legitimately have no
 /// certificate published yet, and refusing to talk to either would break
 /// first contact for exactly the people who need it.
-async fn try_ratchet_seal(
+// The final admission check and key consumption share the native store lock.
+// A blocked host floor never grants unratcheted/plaintext fallback.
+async fn seal_with_host_floor(
+    store: &veil_e2e::RatchetStore,
+    expected_epoch: u64,
+    deadline: tokio::time::Instant,
+    me: &veil_e2e::RatchetIdentity,
+    peer: veil_e2e::PeerRatchetKeys<'_>,
+    data: &[u8],
+) -> Result<(Vec<u8>, [u8; 32]), veil_e2e::RatchetSpliceError> {
+    let key = veil_e2e::ConversationKey {
+        local_instance_id: me.local_instance_id,
+        peer_node_id: *peer.node_id,
+        peer_instance_id: *peer.instance_id,
+    };
+    let mut waiting = false;
+    loop {
+        let pending = store
+            .host_publication_pending(expected_epoch, &key)
+            .map_err(|_| veil_e2e::RatchetSpliceError::HostPublicationClosed)?;
+        if waiting && tokio::time::Instant::now() >= deadline {
+            return Err(veil_e2e::RatchetSpliceError::HostReservationRequired);
+        }
+        if waiting && pending {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            continue;
+        }
+        let keys = veil_e2e::PeerRatchetKeys {
+            node_id: peer.node_id,
+            instance_id: peer.instance_id,
+            mlkem_ek: peer.mlkem_ek,
+            ratchet_pk: peer.ratchet_pk,
+            authorized_until_unix: peer.authorized_until_unix,
+        };
+        match veil_e2e::ratchet::seal_for_host(
+            store,
+            me,
+            keys,
+            data,
+            veil_util::unix_secs_now_u64(),
+            expected_epoch,
+        ) {
+            Err(veil_e2e::RatchetSpliceError::HostReservationRequired)
+                if tokio::time::Instant::now() < deadline =>
+            {
+                waiting = true;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn try_ratchet_seal_checked(
     ctx: &IpcSendContext,
     dst_node_id: &[u8; 32],
     data: &[u8],
     cached_only: bool,
-) -> Option<RatchetSeal> {
-    let ratchet = ctx.ratchet.as_ref()?;
-    // Cheap gate before anything expensive: no device identity, no ratchet.
-    let me = ratchet.identity()?;
-    let resolver = ctx.mlkem_ek_resolver.as_deref()?;
+    expected_epoch: u64,
+    host_deadline: tokio::time::Instant,
+) -> Result<Option<RatchetSeal>, ()> {
+    let resolved = async {
+        let ratchet = ctx.ratchet.as_ref()?;
+        // Cheap gate before anything expensive: no device identity, no ratchet.
+        let me = ratchet.identity()?;
+        let resolver = ctx.mlkem_ek_resolver.as_deref()?;
 
-    // Which device of the recipient's family? Before defect №35 two answers
-    // to that question were given independently: the cert below by the
-    // resolver's `max_by_key(last_seen_unix_ms)` over registry rows that all
-    // publish 0 — i.e. by whichever row the iterator happened to end on,
-    // cached for 30 minutes — and the transport by the one live session to
-    // the identity, terminating at whichever device rendezvous happened to
-    // resolve. In a five-device family they disagree 4/5 of the time; the
-    // receiving device refuses the frame (`NotForThisDevice`), the sender is
-    // never told, and it re-sends its prologue every ~9 s forever. The
-    // session's validated identity proof names the device it actually ends
-    // at, so when the send is session-backed that instance — not the cache's
-    // tie accident — is the authoritative pairing.
-    //
-    // AND UNDER WHICH NAME IS ITS CERTIFICATE PUBLISHED? Not necessarily the
-    // one this send addressed. A certificate lives at
-    // `dht_key(identity, instance_id)`, while a send names a transport
-    // destination — an identity for a contact, a DEVICE for a sibling or for
-    // any peer we reach by one of its devices. The two coincide on a
-    // single-device peer, which is why keying the lookup on the destination
-    // went unnoticed, and diverge on exactly the multi-device case. The same
-    // correction is already recorded in `offline_seal.rs` for our own
-    // devices: asking under a device id computes a key nobody ever wrote to.
-    //
-    // The session's proof carries BOTH names, from one validation, so they
-    // cannot disagree.
-    // No live session: if the destination is one of OUR devices, the pair
-    // comes from our own document instead — the identity the sibling's frames
-    // arrive under, so the conversation we seal in is the one we open in.
-    // How long finding the recipient's certificate took. A send that has to
-    // walk the DHT for it waits seconds, and the sends behind it in the same
-    // burst wait too — a slow seal is logged so a stall has a name.
-    let resolve_started = std::time::Instant::now();
-    let session_pairing = ctx.session_instance_lookup.as_deref().and_then(|lookup| {
-        // Linking preserves the physical key while replacing the temporary
-        // identity. A still-live pre-link session can retain that old identity
-        // until its next handshake. Our current master-authorized document is
-        // authoritative for our siblings, before any stale session snapshot.
-        lookup
-            .own_device_pairing(dst_node_id)
-            .or_else(|| lookup.session_pairing(dst_node_id))
-    });
-    // After a cold restart the peer can answer over relays, without a direct
-    // session. Its verified certificate still binds physical device, identity
-    // and instance. An old certificate under the physical address is not a
-    // replacement for this identity binding.
-    let may_use_delegation = session_pairing.is_none_or(|pairing| pairing.identity == *dst_node_id);
-    let mut certificate_pairing = may_use_delegation
-        .then(|| ratchet.verified_pairing_for_device(dst_node_id, veil_util::unix_secs_now_u64()))
-        .flatten();
-    let mut cold_cert = None;
-    if may_use_delegation
-        && certificate_pairing.is_none()
-        && let Some(identity) = resolver.identity_hint_for_device(dst_node_id)
-    {
-        let certs = if cached_only {
-            resolver.resolve_device_certs_cached(identity)
-        } else {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                resolver.resolve_device_certs(identity),
-            )
-            .await
-            .ok()?
-        };
-        let now = veil_util::unix_secs_now_u64();
-        let mut matching = certs.into_iter().filter(|(device, cert)| {
-            device == dst_node_id && cert.node_id == identity && now <= cert.valid_until_unix
+        // Which device of the recipient's family? Before defect №35 two answers
+        // to that question were given independently: the cert below by the
+        // resolver's `max_by_key(last_seen_unix_ms)` over registry rows that all
+        // publish 0 — i.e. by whichever row the iterator happened to end on,
+        // cached for 30 minutes — and the transport by the one live session to
+        // the identity, terminating at whichever device rendezvous happened to
+        // resolve. In a five-device family they disagree 4/5 of the time; the
+        // receiving device refuses the frame (`NotForThisDevice`), the sender is
+        // never told, and it re-sends its prologue every ~9 s forever. The
+        // session's validated identity proof names the device it actually ends
+        // at, so when the send is session-backed that instance — not the cache's
+        // tie accident — is the authoritative pairing.
+        //
+        // AND UNDER WHICH NAME IS ITS CERTIFICATE PUBLISHED? Not necessarily the
+        // one this send addressed. A certificate lives at
+        // `dht_key(identity, instance_id)`, while a send names a transport
+        // destination — an identity for a contact, a DEVICE for a sibling or for
+        // any peer we reach by one of its devices. The two coincide on a
+        // single-device peer, which is why keying the lookup on the destination
+        // went unnoticed, and diverge on exactly the multi-device case. The same
+        // correction is already recorded in `offline_seal.rs` for our own
+        // devices: asking under a device id computes a key nobody ever wrote to.
+        //
+        // The session's proof carries BOTH names, from one validation, so they
+        // cannot disagree.
+        // No live session: if the destination is one of OUR devices, the pair
+        // comes from our own document instead — the identity the sibling's frames
+        // arrive under, so the conversation we seal in is the one we open in.
+        // How long finding the recipient's certificate took. A send that has to
+        // walk the DHT for it waits seconds, and the sends behind it in the same
+        // burst wait too — a slow seal is logged so a stall has a name.
+        let resolve_started = std::time::Instant::now();
+        let session_pairing = ctx.session_instance_lookup.as_deref().and_then(|lookup| {
+            // Linking preserves the physical key while replacing the temporary
+            // identity. A still-live pre-link session can retain that old identity
+            // until its next handshake. Our current master-authorized document is
+            // authoritative for our siblings, before any stale session snapshot.
+            lookup
+                .own_device_pairing(dst_node_id)
+                .or_else(|| lookup.session_pairing(dst_node_id))
         });
-        let (_, cert) = matching.next()?;
-        if matching.any(|(_, other)| other.instance_id != cert.instance_id) {
-            return None;
+        // After a cold restart the peer can answer over relays, without a direct
+        // session. Its verified certificate still binds physical device, identity
+        // and instance. An old certificate under the physical address is not a
+        // replacement for this identity binding.
+        let may_use_delegation =
+            session_pairing.is_none_or(|pairing| pairing.identity == *dst_node_id);
+        let mut certificate_pairing = may_use_delegation
+            .then(|| {
+                ratchet.verified_pairing_for_device(dst_node_id, veil_util::unix_secs_now_u64())
+            })
+            .flatten();
+        let mut cold_cert = None;
+        if may_use_delegation
+            && certificate_pairing.is_none()
+            && let Some(identity) = resolver.identity_hint_for_device(dst_node_id)
+        {
+            let certs = if cached_only {
+                resolver.resolve_device_certs_cached(identity)
+            } else {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    resolver.resolve_device_certs(identity),
+                )
+                .await
+                .ok()?
+            };
+            let now = veil_util::unix_secs_now_u64();
+            let mut matching = certs.into_iter().filter(|(device, cert)| {
+                device == dst_node_id && cert.node_id == identity && now <= cert.valid_until_unix
+            });
+            let (_, cert) = matching.next()?;
+            if matching.any(|(_, other)| other.instance_id != cert.instance_id) {
+                return None;
+            }
+            certificate_pairing = Some((identity, cert.instance_id));
+            cold_cert = Some(cert);
         }
-        certificate_pairing = Some((identity, cert.instance_id));
-        cold_cert = Some(cert);
-    }
-    // A session can still describe the pre-link self identity. A current
-    // verified delegation replaces that self name, but never another
-    // identity's authenticated session or our current own-device document.
-    let pairing = certificate_pairing
-        .map(|(identity, instance)| veil_types::SessionPairing { identity, instance })
-        .or(session_pairing);
-    let session_instance = pairing
-        .map(|p| p.instance)
-        .or_else(|| {
-            ctx.session_instance_lookup
-                .as_deref()
-                .and_then(|lookup| lookup.session_instance(dst_node_id))
-        })
-        .or_else(|| ratchet.reply_instance(dst_node_id, veil_util::unix_secs_now_u64()));
-    // What a CERTIFICATE is looked up under. The destination remains what the
-    // frame is routed to; only the key changes, and only when a session or a
-    // current verified device certificate has proved the identity binding.
-    let cert_key = pairing.map_or(*dst_node_id, |p| p.identity);
-    let paired = if cold_cert.is_some() {
-        cold_cert
-    } else {
-        match session_instance {
-            Some(instance) => match resolver.resolve_cert_for_instance_cached(cert_key, instance) {
-                Some(c) => Some(c),
-                None if cached_only => None,
-                None => resolver.resolve_cert_for_instance(cert_key, instance).await,
-            },
-            // No live session, or a legacy handshake that proved no instance:
-            // nothing named a device, so the singular resolve below stays the
-            // answer — which is today's behaviour, and exact for the
-            // single-instance peer.
-            None => None,
-        }
-    };
+        // A session can still describe the pre-link self identity. A current
+        // verified delegation replaces that self name, but never another
+        // identity's authenticated session or our current own-device document.
+        let pairing = certificate_pairing
+            .map(|(identity, instance)| veil_types::SessionPairing { identity, instance })
+            .or(session_pairing);
+        let session_instance = pairing
+            .map(|p| p.instance)
+            .or_else(|| {
+                ctx.session_instance_lookup
+                    .as_deref()
+                    .and_then(|lookup| lookup.session_instance(dst_node_id))
+            })
+            .or_else(|| ratchet.reply_instance(dst_node_id, veil_util::unix_secs_now_u64()));
+        // What a CERTIFICATE is looked up under. The destination remains what the
+        // frame is routed to; only the key changes, and only when a session or a
+        // current verified device certificate has proved the identity binding.
+        let cert_key = pairing.map_or(*dst_node_id, |p| p.identity);
+        let paired = if cold_cert.is_some() {
+            cold_cert
+        } else {
+            match session_instance {
+                Some(instance) => {
+                    match resolver.resolve_cert_for_instance_cached(cert_key, instance) {
+                        Some(c) => Some(c),
+                        None if cached_only => None,
+                        None => resolver.resolve_cert_for_instance(cert_key, instance).await,
+                    }
+                }
+                // No live session, or a legacy handshake that proved no instance:
+                // nothing named a device, so the singular resolve below stays the
+                // answer — which is today's behaviour, and exact for the
+                // single-instance peer.
+                None => None,
+            }
+        };
 
-    // Local records first. The full walk is three DHT rounds and this is the
-    // ordinary send path; the 30-minute verified-cert cache above it means a
-    // peer costs that walk once, not once per message.
-    //
-    // Prefer the named endpoint. The compatibility fallback stays sealed;
-    // direct fan-out verifies the resulting target before handing it to a
-    // session. Returning no seal here would instead lose sender proof.
-    let cert = match paired {
-        Some(c) => c,
-        // This address was bound to ONE instance by a current certificate.
-        // A failed refresh must not replace it with another sibling's key.
-        None if certificate_pairing.is_some() => return None,
-        None => match resolver.resolve_cert_cached(cert_key) {
+        // Local records first. The full walk is three DHT rounds and this is the
+        // ordinary send path; the 30-minute verified-cert cache above it means a
+        // peer costs that walk once, not once per message.
+        //
+        // Prefer the named endpoint. The compatibility fallback stays sealed;
+        // direct fan-out verifies the resulting target before handing it to a
+        // session. Returning no seal here would instead lose sender proof.
+        let cert = match paired {
             Some(c) => c,
-            None if cached_only => return None,
-            None => resolver.resolve_cert(cert_key).await?,
-        },
-    };
-    let resolve_ms = resolve_started.elapsed().as_millis();
-    if resolve_ms >= 1_000 {
-        log::warn!(
-            "ratchet.seal_slow dst={} resolve_ms={resolve_ms} device_named={}",
-            veil_util::bytes_to_hex(&dst_node_id[..4]),
-            session_instance.is_some(),
-        );
-    }
+            // This address was bound to ONE instance by a current certificate.
+            // A failed refresh must not replace it with another sibling's key.
+            None if certificate_pairing.is_some() => return None,
+            None => match resolver.resolve_cert_cached(cert_key) {
+                Some(c) => c,
+                None if cached_only => return None,
+                None => resolver.resolve_cert(cert_key).await?,
+            },
+        };
+        let resolve_ms = resolve_started.elapsed().as_millis();
+        if resolve_ms >= 1_000 {
+            log::warn!(
+                "ratchet.seal_slow dst={} resolve_ms={resolve_ms} device_named={}",
+                veil_util::bytes_to_hex(&dst_node_id[..4]),
+                session_instance.is_some(),
+            );
+        }
 
-    match veil_e2e::ratchet::seal(
+        Some((ratchet, me, cert))
+    }
+    .await;
+    if let Some(ratchet) = &ctx.ratchet {
+        let state = ratchet.store.host_publication_state();
+        if state.epoch != expected_epoch || (state.epoch != 0 && !state.active) {
+            return Err(());
+        }
+    }
+    let Some((ratchet, me, cert)) = resolved else {
+        return Ok(None);
+    };
+    match seal_with_host_floor(
         &ratchet.store,
+        expected_epoch,
+        host_deadline,
         &me,
         veil_e2e::PeerRatchetKeys {
             node_id: &cert.node_id,
@@ -883,15 +958,23 @@ async fn try_ratchet_seal(
             authorized_until_unix: cert.valid_until_unix,
         },
         data,
-        veil_util::unix_secs_now_u64(),
-    ) {
-        Ok((payload, ack_key)) => Some((payload, ack_key, me.local_node_id)),
+    )
+    .await
+    {
+        Ok((payload, ack_key)) => Ok(Some((payload, ack_key, me.local_node_id))),
+        Err(
+            veil_e2e::RatchetSpliceError::HostReservationRequired
+            | veil_e2e::RatchetSpliceError::HostPublicationClosed,
+        ) => Err(()),
+        Err(veil_e2e::RatchetSpliceError::CertificateExpired { .. }) if expected_epoch != 0 => {
+            Err(())
+        }
         Err(e) => {
             log::debug!(
                 "ratchet.seal_failed dst={} {e}",
                 veil_util::bytes_to_hex(&dst_node_id[..4])
             );
-            None
+            Ok(None)
         }
     }
 }
@@ -961,6 +1044,10 @@ pub(crate) async fn handle_ipc_send(
         .unwrap_or(0);
     let relay_wire_realtime = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME != 0;
     let relay_control_compat = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_CONTROL_COMPAT != 0;
+    let request_host_epoch = ctx
+        .ratchet
+        .as_ref()
+        .map_or(0, |r| r.store.host_publication_state().epoch);
     let short_control = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_LOCAL_SHORT_CONTROL != 0;
     let short_deadline = ctx.source_received_at + veil_proto::ipc::LOCAL_SHORT_DATAGRAM_MAX_AGE;
     let relay_realtime = relay_wire_realtime || relay_control_compat;
@@ -1299,8 +1386,10 @@ pub(crate) async fn handle_ipc_send(
             if hops.is_empty() && identity_hops.is_empty() {
                 continue;
             }
-            let Ok((payload, _)) = veil_e2e::ratchet::seal(
+            let Ok((payload, _)) = seal_with_host_floor(
                 &ratchet.store,
+                request_host_epoch,
+                family_deadline,
                 &me,
                 veil_e2e::PeerRatchetKeys {
                     node_id: &cert.node_id,
@@ -1310,8 +1399,9 @@ pub(crate) async fn handle_ipc_send(
                     authorized_until_unix: cert.valid_until_unix,
                 },
                 &send.data,
-                now,
-            ) else {
+            )
+            .await
+            else {
                 continue;
             };
             use veil_proto::recipient::Recipient;
@@ -1488,6 +1578,7 @@ pub(crate) async fn handle_ipc_send(
         timing.plan_ms.set(plan_started.elapsed().as_millis());
         let mut any_sent = false;
         let mut admission_failed = false;
+        let mut host_failed = false;
         let mut seal_ms = 0;
         // Scope all admission futures to this IPC request. A full sibling's
         // background queue must not hold up another live device's ciphertext.
@@ -1496,13 +1587,25 @@ pub(crate) async fn handle_ipc_send(
             .map(|device| async move {
                 let device = &device;
                 if !device_matches_identity(ctx, device, &request.dst_node_id) {
-                    return (*device, false, true, 0);
+                    return (*device, false, ipc_send_err::NO_ROUTE, 0);
                 }
                 let seal_started = std::time::Instant::now();
-                let sealed = try_ratchet_seal(ctx, device, &request.data, false).await;
+                let sealed = match try_ratchet_seal_checked(
+                    ctx,
+                    device,
+                    &request.data,
+                    false,
+                    request_host_epoch,
+                    deadline,
+                )
+                .await
+                {
+                    Ok(sealed) => sealed,
+                    Err(()) => return (*device, false, ipc_send_err::RATCHET_NOT_DURABLE, 0),
+                };
                 let seal_ms = seal_started.elapsed().as_millis();
                 if !device_matches_identity(ctx, device, &request.dst_node_id) {
-                    return (*device, false, true, seal_ms);
+                    return (*device, false, ipc_send_err::NO_ROUTE, seal_ms);
                 }
                 let copy_for = sealed
                     .as_ref()
@@ -1514,7 +1617,7 @@ pub(crate) async fn handle_ipc_send(
                         veil_util::bytes_to_hex(&request.dst_node_id[..4]),
                         veil_util::bytes_to_hex(&device[..4]),
                     );
-                    return (*device, false, false, seal_ms);
+                    return (*device, false, 0, seal_ms);
                 }
                 let outcome = if let Some((payload, _, _)) = &sealed
                     && payload.len() > veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES
@@ -1544,23 +1647,31 @@ pub(crate) async fn handle_ipc_send(
                 (
                     *device,
                     accepted,
-                    matches!(
+                    if matches!(
                         outcome,
                         DirectAdmission::TimedOut | DirectAdmission::Rejected
-                    ),
+                    ) {
+                        ipc_send_err::NO_ROUTE
+                    } else {
+                        0
+                    },
                     seal_ms,
                 )
             })
             .buffer_unordered(8);
         while let Some((_, accepted, failed, elapsed)) = copies.next().await {
             any_sent |= accepted;
-            admission_failed |= failed;
+            admission_failed |= failed == ipc_send_err::NO_ROUTE;
+            host_failed |= failed == ipc_send_err::RATCHET_NOT_DURABLE;
             seal_ms += elapsed;
         }
         timing.seal_ms.set(seal_ms);
         if any_sent {
             timing.path.set("identity_fanout");
             return app_send_ok(sink, send.require_ack).await;
+        }
+        if host_failed {
+            return app_send_error(sink, ipc_send_err::RATCHET_NOT_DURABLE).await;
         }
         if admission_failed {
             return app_send_error(sink, ipc_send_err::NO_ROUTE).await;
@@ -1572,7 +1683,23 @@ pub(crate) async fn handle_ipc_send(
     }
     let seal_started = std::time::Instant::now();
     let sealed = if ratchet_ok && remote {
-        try_ratchet_seal(ctx, &send.dst_node_id, &send.data, relay_control_compat).await
+        match try_ratchet_seal_checked(
+            ctx,
+            &send.dst_node_id,
+            &send.data,
+            relay_control_compat,
+            request_host_epoch,
+            if relay_control_compat {
+                control_source_deadline
+            } else {
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30)
+            },
+        )
+        .await
+        {
+            Ok(sealed) => sealed,
+            Err(()) => return app_send_error(sink, ipc_send_err::RATCHET_NOT_DURABLE).await,
+        }
     } else {
         None
     };
@@ -2786,6 +2913,26 @@ mod relay_hop_tests {
 
 #[cfg(all(test, unix))]
 mod ratchet_send_tests {
+    async fn try_ratchet_seal(
+        ctx: &super::IpcSendContext,
+        dst: &[u8; 32],
+        data: &[u8],
+        cached: bool,
+    ) -> Option<super::RatchetSeal> {
+        super::try_ratchet_seal_checked(
+            ctx,
+            dst,
+            data,
+            cached,
+            ctx.ratchet
+                .as_ref()
+                .map_or(0, |r| r.store.host_publication_state().epoch),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("fixture has no blocked host publication")
+    }
+
     use super::*;
     use std::sync::Arc;
     use std::time::Duration;
@@ -3656,6 +3803,137 @@ mod ratchet_send_tests {
             peer: peer_rt,
             session_instance: None,
         }
+    }
+
+    #[tokio::test]
+    async fn journaled_direct_and_relay_sends_wait_for_a_committed_native_floor() {
+        for direct in [true, false] {
+            let fx = fixture(if direct {
+                vec![PEER, RELAY]
+            } else {
+                vec![RELAY]
+            });
+            let ctx = fx.ctx(true);
+            let epoch = fx.me.store.begin_host_publication();
+            let mut wh = sink().await;
+            let request = payload(false, b"held until commit");
+            let mut reply = SendReply::Inline(&mut wh);
+            let sending = handle_ipc_send(&mut reply, &request, &ctx);
+            let committing = async {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while fx.me.store.host_publication_state().required == 0 {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(
+                    fx.taken().is_empty(),
+                    "not even an unratcheted carrier may escape"
+                );
+                let key = fx.me.store.keys()[0];
+                let at = fx.me.store.send_position(&key).unwrap();
+                tokio::time::sleep(Duration::from_millis(65)).await;
+                assert_eq!(fx.me.store.send_position(&key).unwrap(), at);
+                assert!(fx.taken().is_empty());
+                fx.me
+                    .store
+                    .allow_host_publication(
+                        epoch,
+                        &key,
+                        &[veil_e2e::ratchet::SendPosition {
+                            chain: at.chain,
+                            next: at.next + 32,
+                        }],
+                    )
+                    .unwrap();
+            };
+            let (sent, ()) = tokio::join!(sending, committing);
+            sent.unwrap();
+            let frames = fx.taken();
+            assert_eq!(frames.len(), 1);
+            let frame = &frames[0].1;
+            let sealed = if direct {
+                veil_proto::app::AppSendPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                    .unwrap()
+                    .data
+                    .to_vec()
+            } else {
+                veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                    .unwrap()
+                    .envelope
+                    .payload
+            };
+            let opened = fx
+                .peer
+                .open_payload(&ME, &sealed, veil_util::unix_secs_now_u64())
+                .unwrap();
+            assert!(opened.authenticated);
+            assert_eq!(opened.plaintext, b"held until commit");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_journaled_wait_deadline_or_retired_owner_never_downgrades() {
+        let fx = fixture(vec![PEER, RELAY]);
+        let ctx = fx.ctx(true);
+        let epoch = fx.me.store.begin_host_publication();
+        let result = try_ratchet_seal_checked(
+            &ctx,
+            &PEER,
+            b"deadline",
+            false,
+            epoch,
+            tokio::time::Instant::now() + Duration::from_millis(45),
+        )
+        .await;
+        assert!(result.is_err());
+        let key = fx.me.store.keys()[0];
+        let before = fx.me.store.send_position(&key).unwrap();
+        assert_eq!(
+            before.next, 1,
+            "only the unpublished initial handshake may consume a key"
+        );
+        let successor = fx.me.store.begin_host_publication();
+        fx.me
+            .store
+            .allow_host_publication(
+                successor,
+                &key,
+                &[veil_e2e::ratchet::SendPosition {
+                    chain: before.chain,
+                    next: before.next + 32,
+                }],
+            )
+            .unwrap();
+        assert!(
+            try_ratchet_seal_checked(
+                &ctx,
+                &PEER,
+                b"old queued request",
+                false,
+                epoch,
+                tokio::time::Instant::now() + Duration::from_secs(1)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(fx.me.store.send_position(&key).unwrap(), before);
+        fx.me.store.end_host_publication(successor);
+        assert!(
+            try_ratchet_seal_checked(
+                &ctx,
+                &PEER,
+                b"closed request",
+                false,
+                successor,
+                tokio::time::Instant::now() + Duration::from_secs(1)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(fx.me.store.send_position(&key).unwrap(), before);
+        assert!(fx.taken().is_empty());
     }
 
     /// PEER as a two-device family: the live session ends at PEER_INSTANCE,
