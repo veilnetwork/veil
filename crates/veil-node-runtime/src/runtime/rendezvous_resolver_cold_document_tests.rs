@@ -146,6 +146,128 @@ struct IdentityFixture {
     sk: String,
 }
 
+#[tokio::test]
+async fn unknown_sender_prefetches_document_before_other_ad_replicas_finish() {
+    check_unknown_document_prefetch(false).await;
+}
+
+#[tokio::test]
+async fn cancelling_unknown_document_prefetch_releases_pending_queries() {
+    check_unknown_document_prefetch(true).await;
+}
+
+async fn check_unknown_document_prefetch(cancel: bool) {
+    use std::future::Future;
+    let identity = IdentityFixture::new();
+    let receiver = identity.document.node_id;
+    let ad = identity.ad(receiver);
+    assert!(
+        veil_anonymity::rendezvous::verify_rendezvous_ad(&decode_rendezvous_ad(&ad).unwrap())
+            .is_err()
+    );
+    let me = [0x11; 32];
+    let dht = Arc::new(veil_dht::KademliaService::new(me));
+    let mut reg = veil_session::SessionTxRegistry::new();
+    let mut rx = reg.register([0xAA; 32]);
+    let registry = Arc::new(RwLock::new(reg));
+    let pending = Arc::new(Mutex::new(std::collections::HashMap::<
+        [u8; 16],
+        veil_dispatcher::PendingRecursive,
+    >::new()));
+    let cache = Arc::new(super::super::anonymity_state::RendezvousResolveCache::new());
+    let logger = Arc::new(veil_observability::NodeLogger::new_noop());
+    let authorization = crate::identity_document_floor::IdentityDocumentFloor::ephemeral();
+    let mut lookup = Box::pin(resolve_fresh_rendezvous_ads(
+        &dht,
+        &registry,
+        &pending,
+        me,
+        &cache,
+        &logger,
+        receiver,
+        std::time::Duration::from_secs(60),
+        ResolveMode::Stream {
+            mailbox_cookie: crate::NodeServices::mailbox_rendezvous_cookie(&receiver),
+            identity_mailbox_cookie: None,
+        },
+        &authorization,
+    ));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(lookup.as_mut().poll(&mut cx).is_pending());
+    let mut ad_queries = Vec::new();
+    while let Ok((_, frame)) = rx.try_recv() {
+        ad_queries.push(RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap());
+    }
+    assert_eq!(
+        ad_queries.len(),
+        veil_anonymity::rendezvous::MAX_RENDEZVOUS_AD_SLOTS as usize
+    );
+    let first = ad_queries
+        .iter()
+        .find(|q| q.target_key == rendezvous_ad_dht_key(&receiver))
+        .unwrap();
+    lock!(pending)
+        .remove(&first.query_id)
+        .unwrap()
+        .tx
+        .send(ad)
+        .unwrap();
+    assert!(lookup.as_mut().poll(&mut cx).is_pending());
+    let document_query = rx.try_recv().ok().map(|(_, frame)| {
+        RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap()
+    });
+    let early = document_query
+        .as_ref()
+        .is_some_and(|q| q.target_key == IdentityDocument::dht_key(&receiver));
+    if !early {
+        drop(lookup);
+        assert!(lock!(pending).is_empty());
+        panic!("a delegated ad arrived but the document walk still waits for unrelated ad replies");
+    }
+    let query = document_query.unwrap();
+    if cancel {
+        drop(lookup);
+        assert!(lock!(pending).is_empty());
+        assert!(authorization.current(&receiver).is_none());
+        assert!(
+            cache
+                .get(&receiver, veil_util::unix_secs_now_u64())
+                .is_none()
+        );
+        return;
+    }
+    lock!(pending)
+        .remove(&query.query_id)
+        .unwrap()
+        .tx
+        .send(identity.document.encode())
+        .unwrap();
+    assert!(lookup.as_mut().poll(&mut cx).is_pending());
+    // The resolver itself must not publish or authorize the prefetched raw
+    // bytes before all ad comparisons and its durable authorization barrier.
+    // Replies here use pending channels, not Dispatcher transport mirroring.
+    assert!(authorization.current(&receiver).is_none());
+    assert!(
+        dht.get_local(&IdentityDocument::dht_key(&receiver))
+            .is_none()
+    );
+    assert!(dht.get_local(&rendezvous_ad_dht_key(&receiver)).is_none());
+    assert!(
+        cache
+            .get(&receiver, veil_util::unix_secs_now_u64())
+            .is_none()
+    );
+    for query in ad_queries {
+        if let Some(p) = lock!(pending).remove(&query.query_id) {
+            let _ = p.tx.send(Vec::new());
+        }
+    }
+    let ads = lookup.await;
+    assert_eq!(ads.len(), 1);
+    assert!(authorization.current(&receiver).is_some());
+    assert!(lock!(pending).is_empty());
+}
+
 impl IdentityFixture {
     fn new() -> Self {
         let now = veil_util::unix_secs_now_u64();

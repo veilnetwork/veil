@@ -330,8 +330,17 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
     }
     let from_local_mirror = !ads.is_empty();
 
-    let walks = (0..MAX_RENDEZVOUS_AD_SLOTS).map(|idx| {
+    let document_in_parallel = matches!(mode, ResolveMode::ChatFamily)
+        || (!from_local_mirror
+            && authorization.current(&receiver_id).is_some_and(|doc| {
+                doc.identity_keys
+                    .iter()
+                    .any(|key| key.device_id != receiver_id)
+            }));
+    let (document_hint, mut document_hint_rx) = tokio::sync::watch::channel(document_in_parallel);
+    let walks = (0..MAX_RENDEZVOUS_AD_SLOTS).map(move |idx| {
         let key = rendezvous_ad_dht_key_at(&receiver_id, idx);
+        let hint = document_hint.clone();
         async move {
             let candidates = crate::mlkem_resolver::recursive_dht_get_candidates(
                 dht,
@@ -344,12 +353,27 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
                 // On the three-seed production topology this deliberately asks
                 // all three instead of accepting whichever seed replies first.
                 veil_proto::budget::DHT_REPLICATION_K,
-                |bytes| {
-                    decode_rendezvous_ad(bytes)
+                move |bytes| {
+                    let candidate = decode_rendezvous_ad(bytes)
                         .ok()
                         .filter(|ad| ad.receiver_node_id == receiver_id)
-                        .filter(|ad| is_currently_valid(ad, now).is_ok())
-                        .is_some()
+                        .filter(|ad| is_currently_valid(ad, now).is_ok());
+                    let already_needed = *hint.borrow();
+                    if !already_needed
+                        && candidate.as_ref().is_some_and(|ad| {
+                            veil_anonymity::rendezvous::verify_rendezvous_ad(ad).is_err()
+                        })
+                    {
+                        // An untrusted candidate may start a bounded read,
+                        // never authorize a route. Do not wait for unrelated
+                        // slot/replica deadlines to start the document walk.
+                        hint.send_if_modified(|needed| {
+                            let changed = !*needed;
+                            *needed = true;
+                            changed
+                        });
+                    }
+                    candidate.is_some()
                 },
             )
             .await;
@@ -366,36 +390,36 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
     // ordinary/background/stream refresh needs it too. These are independent
     // reads with identical authority checks; do not serialize two full DHT
     // deadlines while holding this receiver's single-flight lock.
-    let document_in_parallel = matches!(mode, ResolveMode::ChatFamily)
-        || (!from_local_mirror
-            && authorization.current(&receiver_id).is_some_and(|doc| {
-                doc.identity_keys
-                    .iter()
-                    .any(|key| key.device_id != receiver_id)
-            }));
-    let read_slots = async {
-        if ads.is_empty() {
+    let read_slots = async move {
+        if !from_local_mirror {
             futures::future::join_all(walks).await
         } else {
+            drop(walks); // close the hint when no network slot walk is needed
             Vec::new()
         }
     };
     let read_document = async {
-        if document_in_parallel {
-            Some(
-                lookup_receiver_documents(
-                    dht,
-                    session_tx_registry,
-                    pending_recursive,
-                    local_node_id,
-                    receiver_id,
-                    timeout,
-                )
-                .await,
-            )
-        } else {
-            None
+        loop {
+            if *document_hint_rx.borrow_and_update() {
+                break;
+            }
+            if document_hint_rx.changed().await.is_err() {
+                // Every slot completed without a delegated candidate. Strict
+                // self-bound ads keep their no-document-lookup fast path.
+                return None;
+            }
         }
+        Some(
+            lookup_receiver_documents(
+                dht,
+                session_tx_registry,
+                pending_recursive,
+                local_node_id,
+                receiver_id,
+                timeout,
+            )
+            .await,
+        )
     };
     let (slots, early_documents) = futures::join!(read_slots, read_document);
     // Even when the cached document admits the signer, refresh delegation
