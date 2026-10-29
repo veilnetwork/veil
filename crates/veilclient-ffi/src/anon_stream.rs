@@ -1656,6 +1656,27 @@ impl CellSender for CircuitCells {
         .await;
     }
 
+    async fn on_stream_linger(&self, dst: Addr, stream_id: u32) {
+        if self.mode != CircuitMode::PublishedRendezvous {
+            return;
+        }
+        // Only the ACK responder remains. Release Bulk capacity exactly once,
+        // but retain the ACK pin and immutable receiver binding until close.
+        let removed =
+            self.stream_routes
+                .lock()
+                .await
+                .remove(&(dst.node, stream_id, RouteClass::Bulk));
+        if let Some(route) = removed {
+            record_stream_route_closed(RouteClass::Bulk, &route);
+        }
+        if let Some(entries) = self.outbound_circuits.lock().await.get_mut(&dst.node) {
+            for entry in entries {
+                entry.handshake_streams.remove(&stream_id);
+            }
+        }
+    }
+
     async fn on_stream_closed(&self, dst: Addr, stream_id: u32, _end: End) {
         if self.mode != CircuitMode::PublishedRendezvous {
             return;
@@ -2752,7 +2773,7 @@ impl CircuitCells {
                             // (cooldown / admission limit) — open a fresh
                             // handshake circuit rather than dropping the SYN.
                             return self
-                                .open_outbound_for_handshake(dst_node, route_class)
+                                .open_outbound_for_handshake(dst_node, Some(stream_id), route_class)
                                 .await;
                         }
                     } else {
@@ -2812,7 +2833,7 @@ impl CircuitCells {
 
         if is_handshake {
             return self
-                .open_outbound_for_handshake(dst_node, route_class)
+                .open_outbound_for_handshake(dst_node, stream_id, route_class)
                 .await;
         }
 
@@ -3832,6 +3853,7 @@ impl CircuitCells {
     async fn open_outbound_for_handshake(
         &self,
         dst_node: [u8; 32],
+        stream_id: Option<u32>,
         route_class: RouteClass,
     ) -> io::Result<Option<CircuitRoute>> {
         // Pool construction belongs to its debounced background task. Waiting
@@ -3840,10 +3862,19 @@ impl CircuitCells {
         // retries local WouldBlock while the first confirmed route warms.
         self.ensure_outbound_opening_for(dst_node, route_class, "handshake_cold")
             .await;
-        Ok(self.outbound_circuits.try_lock().ok().and_then(|pool| {
-            pool.get(&dst_node)
-                .and_then(|entries| entries.first())
-                .map(CircuitEntry::route)
+        Ok(self.outbound_circuits.try_lock().ok().and_then(|mut pool| {
+            pool.get_mut(&dst_node).and_then(|entries| {
+                // Publication may have raced admission. Recheck the same
+                // receiver, health and capacity rules as the ordinary path;
+                // never fall back to an arbitrary first (possibly cooled) entry.
+                self.select_outbound_route(
+                    dst_node,
+                    entries,
+                    stream_id,
+                    route_class,
+                    Instant::now(),
+                )
+            })
         }))
     }
 }
@@ -3906,6 +3937,12 @@ impl CellSender for HubCells {
         if let HubCells::Circuit(c) = self {
             c.on_stream_data_rto_with_demand(dst, stream_id, consec_rto, snd_una, app_limited)
                 .await;
+        }
+    }
+
+    async fn on_stream_linger(&self, dst: Addr, stream_id: u32) {
+        if let HubCells::Circuit(c) = self {
+            c.on_stream_linger(dst, stream_id).await;
         }
     }
 

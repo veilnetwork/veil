@@ -599,6 +599,210 @@ struct Fixture {
     _outbox: veil_session::FrameOutbox,
 }
 
+#[tokio::test]
+async fn completed_stream_releases_bulk_admission_but_retains_its_ack_binding() {
+    let mut f = fixture().await;
+    let destination = Addr {
+        node: [0xb9; 32],
+        app: [0xbc; 32],
+    };
+    let primary = protected_route(&f.circuit, f.cells.me);
+    f.cells.bulk_route_active_limit = 1;
+    let hub = HubCells::Circuit(Box::new(f.cells.clone()));
+    f.cells
+        .outbound_circuits
+        .lock()
+        .await
+        .insert(destination.node, vec![entry(&primary, &[])]);
+    f.cells
+        .circuit_for(destination.node, Some(71), RouteClass::Bulk, true)
+        .await
+        .unwrap()
+        .unwrap();
+    f.cells
+        .circuit_for(destination.node, Some(71), RouteClass::Ack, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(primary.stats.as_ref().unwrap().active_streams(), 1);
+    hub.on_stream_linger(destination, 71).await;
+    let active_during_linger = primary.stats.as_ref().unwrap().active_streams();
+    let binding = f.cells.stream_receiver(destination.node, Some(71));
+    let ack = f
+        .cells
+        .circuit_for(destination.node, Some(71), RouteClass::Ack, false)
+        .await
+        .unwrap();
+    let next = f
+        .cells
+        .circuit_for(destination.node, Some(73), RouteClass::Bulk, true)
+        .await
+        .unwrap();
+    hub.on_stream_linger(destination, 71).await;
+    let after_duplicate_linger = primary.stats.as_ref().unwrap().active_streams();
+    hub.on_stream_closed(destination, 71, End::Eof).await;
+    let after_close = primary.stats.as_ref().unwrap().active_streams();
+    let completed_binding_removed = f
+        .cells
+        .stream_receiver(destination.node, Some(71))
+        .is_none();
+    f.runtime.stop().await.unwrap();
+    assert_eq!(
+        active_during_linger, 0,
+        "the final-ACK responder consumed the only data admission slot"
+    );
+    assert!(binding.is_some_and(|b| b.matches_route(&primary)) && ack.is_some());
+    assert!(
+        next.is_some(),
+        "a completed file kept a new handshake waiting for the close lease"
+    );
+    assert_eq!(
+        (after_duplicate_linger, after_close),
+        (1, 1),
+        "final cleanup decremented the next stream's admission"
+    );
+    assert!(completed_binding_removed);
+}
+
+#[tokio::test]
+async fn cold_handshake_fallback_does_not_bypass_route_admission() {
+    let mut outcomes = Vec::new();
+    for unavailable in ["relay_cooldown", "hop_cooldown", "active_limit"] {
+        let mut f = fixture().await;
+        let destination = Addr {
+            node: [0xb9; 32],
+            app: [0xbc; 32],
+        };
+        let primary = protected_route(&f.circuit, f.cells.me);
+        primary.stats.as_ref().unwrap().record_stream_open();
+        let mut old = entry(&primary, &[65]);
+        let quiet = Instant::now() - CIRCUIT_HANDSHAKE_REOPEN_AFTER - Duration::from_secs(1);
+        old.opened_at = quiet;
+        old.last_non_handshake = quiet;
+        f.cells
+            .outbound_circuits
+            .lock()
+            .await
+            .insert(destination.node, vec![old]);
+        // A background replacement is already pending. The handshake may
+        // neither wait for it nor use a path rejected by the normal selector.
+        f.cells.outbound_opening.lock().await.insert(
+            destination.node,
+            OutboundOpening::new(Instant::now(), PoolOpenIntent::Refresh),
+        );
+        match unavailable {
+            "relay_cooldown" => {
+                mark_rendezvous_cooldown(&f.cells.route_cooldowns, f.hop, Duration::from_secs(60))
+            }
+            "hop_cooldown" => mark_first_hop_cooldown(
+                &f.cells.first_hop_cooldowns,
+                f.hop,
+                Duration::from_secs(60),
+            ),
+            "active_limit" => f.cells.bulk_route_active_limit = 1,
+            _ => unreachable!(),
+        }
+        while f._outbox.try_recv().is_ok() {}
+        let encoded = Frame::SynAck {
+            stream_id: 71,
+            isn: 100,
+            win: 8192,
+            ack: 1,
+        }
+        .encode();
+        let mut pending = std::collections::VecDeque::from([encoded.clone()]);
+        let result = f.cells.send_many(destination, &mut pending).await;
+        let untouched = pending == std::collections::VecDeque::from([encoded]);
+        let emitted = f._outbox.try_recv().is_ok();
+        let pinned = f
+            .cells
+            .stream_receiver(destination.node, Some(71))
+            .is_some();
+        let active = primary.stats.as_ref().unwrap().active_streams();
+        f.runtime.stop().await.unwrap();
+        outcomes.push((
+            unavailable,
+            result.err().map(|e| e.kind()),
+            untouched,
+            emitted,
+            pinned,
+            active,
+        ));
+    }
+    for (unavailable, error, untouched, emitted, pinned, active) in outcomes {
+        assert_eq!(error, Some(io::ErrorKind::WouldBlock), "{unavailable}");
+        assert!(
+            untouched && !emitted && !pinned,
+            "inadmissible {unavailable} path accepted a handshake"
+        );
+        assert_eq!(
+            active, 1,
+            "handshake inflated an inadmissible path's active count"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cold_handshake_rechecks_a_refilled_pool_and_preserves_receiver_binding() {
+    let mut f = fixture().await;
+    let destination = [0xb9; 32];
+    let primary = protected_route(&f.circuit, f.cells.me);
+    primary.stats.as_ref().unwrap().record_stream_open();
+    f.cells
+        .remember_stream_receiver(destination, 71, &primary)
+        .unwrap();
+    let mut old = entry(&primary, &[65]);
+    let quiet = Instant::now() - CIRCUIT_HANDSHAKE_REOPEN_AFTER - Duration::from_secs(1);
+    old.opened_at = quiet;
+    old.last_non_handshake = quiet;
+    mark_rendezvous_cooldown(&f.cells.route_cooldowns, f.hop, Duration::from_secs(60));
+    f.cells
+        .outbound_circuits
+        .lock()
+        .await
+        .insert(destination, vec![old]);
+    let (good, _, _good_outbox) = add_circuit(&f.cells.services);
+    let good = protected_route(&good, f.cells.me);
+    let (wrong, _, _wrong_outbox) = add_circuit(&f.cells.services);
+    let mut wrong = entry(&protected_route(&wrong, f.cells.me), &[]);
+    wrong.peer_cookie[0] ^= 1;
+    f.cells.outbound_opening.lock().await.insert(
+        destination,
+        OutboundOpening::new(Instant::now(), PoolOpenIntent::Refresh),
+    );
+    let opening = f.cells.outbound_opening.lock().await;
+    let mut selection =
+        Box::pin(
+            f.cells
+                .circuit_for(destination, Some(71), RouteClass::Bulk, true),
+        );
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(std::future::Future::poll(selection.as_mut(), &mut context).is_pending());
+    // Simulate publication while admission is suspended at the opener lock.
+    // The first newly published route belongs to another receiver generation.
+    {
+        let mut pool = f.cells.outbound_circuits.lock().await;
+        let entries = pool.get_mut(&destination).unwrap();
+        entries.insert(0, wrong);
+        entries.push(entry(&good, &[]));
+    }
+    drop(opening);
+    let selected = selection.await.unwrap();
+    let correct = selected
+        .as_ref()
+        .is_some_and(|r| Arc::ptr_eq(&r.circuit, &good.circuit));
+    let binding = f.cells.stream_receiver(destination, Some(71)).unwrap();
+    let old_active = primary.stats.as_ref().unwrap().active_streams();
+    let good_active = good.stats.as_ref().unwrap().active_streams();
+    f.runtime.stop().await.unwrap();
+    assert!(
+        correct,
+        "handshake ignored a compatible healthy route published during admission"
+    );
+    assert!(binding.matches_route(&primary));
+    assert_eq!((old_active, good_active), (1, 1));
+}
+
 /// A host retaining the retired C entry point must not make this receiver
 /// undiscoverable. Exercise the real publisher and verify its signed DHT ad,
 /// rather than only checking that the compatibility call returns.
