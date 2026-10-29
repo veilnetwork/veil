@@ -355,8 +355,8 @@ struct TxState {
     delivered: u64,
     /// Delivery checkpoints (t_ms, delivered) spanning the rate window.
     rate_samples: VecDeque<(u64, u64)>,
-    /// Most recent application-limited delivery observation. Thin samples
-    /// spanning that observation cannot replace the model after a quiet gap.
+    /// Most recent application- or receiver-window-limited observation. Thin
+    /// samples spanning it cannot replace the model after a quiet gap.
     bbr_last_app_limited_ms: Option<u64>,
     /// Qualifying rate samples (t_ms, bytes/sec); the estimate is their max
     /// over [`BBR_BW_WINDOW_MS`] (see the constants for why max, not decay).
@@ -1088,6 +1088,15 @@ impl StreamEngine {
         // below is also useful and must not be discarded with the old window.
         let window_changed = seq::geq(ack, self.tx.snd_una) && self.tx.rwnd != win;
         if seq::geq(ack, self.tx.snd_una) {
+            if self.cfg.bbr && (win == 0 || self.tx.rwnd == 0) {
+                // A closed receive window stops the source independently of
+                // network capacity. Do not span that wait in a delivery-rate
+                // sample (including when this ACK reopens it). Keep receipt
+                // accounting and the existing bandwidth estimate/seed intact;
+                // only fresh post-reopening delivery can train the model again.
+                self.tx.rate_samples.clear();
+                self.tx.bbr_last_app_limited_ms = Some(now);
+            }
             self.tx.rwnd = win;
             if win > 0 {
                 self.tx.window_hint_probe_used = false;
@@ -4222,6 +4231,46 @@ mod tests {
             before,
             e.tx.btl_bw
         );
+    }
+
+    #[test]
+    fn bbr_flow_epochs_preserve_the_seed_and_ignore_stale_or_future_zero_windows() {
+        let cfg = Config {
+            bbr: true,
+            warm_btl_bw: 128 * 1024,
+            warm_rtt_min_ms: 100,
+            ..Config::default()
+        };
+        let mut e = StreamEngine::connect(7, cfg, 0, 100);
+        e.phase = Phase::Established;
+        e.syn_acked = true;
+        e.tx.snd_una = 101;
+        e.tx.snd_nxt = 101;
+        e.tx.rate_samples.extend([(0, 0), (20, 64)]);
+        let model = e.delivery_model();
+        let seed_samples = e.tx.bw_samples.clone();
+        e.on_ack(101, 0, &SackVec::new(), 1000);
+        assert!(e.tx.rate_samples.is_empty());
+        assert_eq!(e.delivery_model(), model);
+        assert_eq!(e.tx.bw_samples, seed_samples);
+        // A delivery/probe while closed must not bridge the reopening boundary.
+        e.tx.rate_samples.push_back((1010, 64));
+        e.on_ack(101, 4096, &SackVec::new(), 2000);
+        assert!(e.tx.rate_samples.is_empty());
+        assert_eq!(e.delivery_model(), model);
+        assert_eq!(e.tx.bw_samples, seed_samples);
+
+        // Obsolete and impossible window advertisements are not epoch changes.
+        e.tx.rate_samples.extend([(2020, 64), (2040, 128)]);
+        let fresh = e.tx.rate_samples.clone();
+        let limited = e.tx.bbr_last_app_limited_ms;
+        for ack in [100, 102] {
+            e.on_ack(ack, 0, &SackVec::new(), 2050);
+            assert_eq!(e.tx.rate_samples, fresh);
+            assert_eq!(e.tx.bbr_last_app_limited_ms, limited);
+            assert_eq!(e.tx.rwnd, 4096);
+            assert_eq!(e.tx.bw_samples, seed_samples);
+        }
     }
 
     #[test]
