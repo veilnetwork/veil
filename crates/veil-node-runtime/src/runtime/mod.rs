@@ -34,6 +34,7 @@ mod nat_punch;
 mod nat_traversal;
 pub mod nickname;
 mod node_services;
+mod stream_preparation_trace;
 pub use local_circuit_paths::LocalCircuitPathGroup;
 mod offline_seal;
 mod p_net_ban_sync;

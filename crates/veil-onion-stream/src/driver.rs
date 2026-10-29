@@ -541,7 +541,7 @@ fn drain_app_commands(
     }
 }
 
-fn debug_summary_period_ms(configured: u64) -> Option<u64> {
+pub(crate) fn debug_summary_period_ms(configured: u64) -> Option<u64> {
     let from_env = std::env::var(DEBUG_SUMMARY_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
