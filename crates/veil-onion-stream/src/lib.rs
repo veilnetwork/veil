@@ -27,7 +27,8 @@
 //! `DATA`, `ACK`, `FIN`, `RST`. Multi-byte fields big-endian. A full-duplex
 //! stream carries a `DATA`/`FIN` byte-sequence in EACH direction with its own
 //! ISN + window; `ACK` (cumulative + up to [`wire::MAX_SACKS`] selective ranges)
-//! and a piggy-backed receive window flow the other way.
+//! and its receive window flow the other way. The v1 DATA piggyback window is
+//! retained on wire but not applied: its age relative to an ACK is unknowable.
 //!
 //! ## Reliability + congestion control (TCP NewReno-shaped, well-trodden)
 //! - **Byte sequence numbers** (`u32`, TCP-style **modular** comparison via
