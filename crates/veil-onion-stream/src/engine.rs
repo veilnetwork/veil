@@ -107,7 +107,11 @@ pub struct Config {
     /// engages BBR pacing/window shaping from the first byte; a cold stream
     /// waits for qualifying live delivery samples. Both use STARTUP's 2x
     /// probing before the steady 5/4 gain. The 10s max-window expires the
-    /// seed once real samples land; NewReno loss handling applies underneath.
+    /// seed once real samples land. A qualifying backlogged measurement can
+    /// replace it sooner; a lower rate needs a regular delivery clock so an
+    /// underfilled flight is not mistaken for reduced path capacity. Live
+    /// measurements retain their ordinary max filter. NewReno loss handling
+    /// applies underneath.
     /// Callers should seed conservatively (e.g. half the last measured rate).
     pub warm_btl_bw: u64,
     /// Warm-start seed for the windowed-minimum RTT (ms). Only used when
@@ -520,8 +524,8 @@ impl StreamEngine {
         // Warm start: seed the delivery model from a previous stream to the
         // same peer so a follow-up bulk stream skips the estimator climb (the
         // cold ramp costs seconds per stream; see Config::warm_btl_bw). The
-        // seed enters the same windowed-max filter as live samples, so it
-        // expires like any sample once real data flows.
+        // seed is a provisional max-filter entry. Qualified backlogged
+        // evidence can replace it; it otherwise expires like any sample.
         let warm = cfg.bbr && cfg.warm_btl_bw > 0;
         let warm_rtt = (warm && cfg.warm_rtt_min_ms > 0).then_some((cfg.warm_rtt_min_ms, 0u64));
         let mut init_cwnd = cfg.init_cwnd.max(cfg.mss as u32);
@@ -2647,6 +2651,18 @@ impl TxState {
             return;
         }
         let sample = bytes.saturating_mul(1000) / span.max(1);
+        // Timestamp zero belongs only to the warm cache hint: a live rate
+        // requires a positive BBR_MIN_SPAN_MS. Do not let an old path's rate
+        // mask a fresh backlogged measurement for the whole max-filter window.
+        // Sparse/application-limited observations keep the hint; independently
+        // measured highs keep their ordinary ten-second max-filter lifetime.
+        let replaced_seed = fully_backlogged
+            && self.bw_samples.front().is_some_and(|&(at, seed)| {
+                at == 0 && (sample >= seed || self.bbr_seed_has_regular_delivery_clock())
+            });
+        if replaced_seed {
+            self.bw_samples.pop_front();
+        }
         let store = self
             .bw_samples
             .back()
@@ -2669,6 +2685,14 @@ impl TxState {
             .map(|&(_, rate)| rate)
             .max()
             .unwrap_or(0);
+        if replaced_seed {
+            // Judge subsequent growth against this path rather than the old
+            // cache. Otherwise three rounds below the old seed end STARTUP
+            // while the new path is still climbing from its first sample.
+            self.bbr_bw_at_probe = self.btl_bw;
+            self.bbr_stall_rounds = 0;
+            self.bbr_probe_checked_ms = now;
+        }
         // STARTUP plateau detection (classic BBR shape): stay at 2x pacing
         // gain until the estimate stops growing >=25% for three ROUND TRIPS,
         // then drop to the steady 5/4 probe gain. The cadence must be a round
@@ -2692,6 +2716,34 @@ impl TxState {
                 }
             }
         }
+    }
+
+    /// A low mean across ACK bursts separated by a flight's RTT can be window
+    /// limitation, not a lower bottleneck rate. Only retire a higher warm hint
+    /// on at least three reasonably regular delivery-checkpoint intervals with
+    /// more than one checkpoint per observed RTT. Otherwise keep its ordinary
+    /// max-filter expiry and let subsequent evidence settle the ambiguity.
+    fn bbr_seed_has_regular_delivery_clock(&self) -> bool {
+        let Some(rtt) = self.srtt.or(self.rtt_min.map(|(rtt, _)| rtt)) else {
+            return false;
+        };
+        let mut previous = None;
+        let mut shortest = u64::MAX;
+        let mut longest = 0;
+        let mut intervals = 0;
+        for &(at, _) in &self.rate_samples {
+            if let Some(before) = previous {
+                let gap = at.saturating_sub(before);
+                if gap == 0 {
+                    return false;
+                }
+                shortest = shortest.min(gap);
+                longest = longest.max(gap);
+                intervals += 1;
+            }
+            previous = Some(at);
+        }
+        intervals >= 3 && shortest <= u64::from(rtt) / 2 && longest <= shortest.saturating_mul(4)
     }
 
     /// Expiry alone cannot turn our own standing queue into propagation RTT.
@@ -4653,6 +4705,92 @@ mod tests {
         }
         assert_eq!(emitted, 4);
         assert_eq!(e.tx.srtt, None);
+    }
+
+    #[test]
+    fn backlogged_live_rate_replaces_an_overestimated_warm_seed() {
+        let cfg = Config {
+            bbr: true,
+            warm_btl_bw: 1024 * 1024,
+            warm_rtt_min_ms: 200,
+            mss: 1000,
+            ..Config::default()
+        };
+        let mut e = StreamEngine::connect(7, cfg, 0, 100);
+        for at in (20..=600).step_by(20) {
+            e.tx.bbr_on_delivered(640, at, true, 1000);
+        }
+        assert_eq!(e.tx.delivered, 30 * 640);
+        assert_eq!(e.tx.btl_bw, 32_000, "the cached rate masked live delivery");
+        assert_eq!(e.tx.bbr_bw_at_probe, 32_000);
+        assert_eq!(e.tx.bbr_stall_rounds, 0);
+        assert!(
+            e.tx.bbr_startup,
+            "the new path still needs its probe rounds"
+        );
+
+        // After replacing the cache hint, the usual windowed max must retain
+        // genuinely measured highs rather than chasing each lower ACK sample.
+        e.tx.bbr_on_delivered(64_000, 620, true, 1000);
+        let high = e.tx.btl_bw;
+        for at in (640..=1200).step_by(20) {
+            e.tx.bbr_on_delivered(640, at, true, 1000);
+        }
+        assert_eq!(e.tx.btl_bw, high);
+    }
+
+    #[test]
+    fn replacing_a_warm_seed_keeps_independent_live_samples() {
+        let cfg = Config {
+            bbr: true,
+            warm_btl_bw: 1024 * 1024,
+            ..Config::default()
+        };
+        let mut e = StreamEngine::connect(7, cfg, 0, 100);
+        e.tx.srtt = Some(100);
+        e.tx.bw_samples.push_back((100, 2 * 1024 * 1024));
+        for at in (200..=600).step_by(20) {
+            e.tx.bbr_on_delivered(640, at, true, 1000);
+        }
+        assert_eq!(e.tx.btl_bw, 2 * 1024 * 1024);
+        assert!(!e.tx.bw_samples.iter().any(|&(at, _)| at == 0));
+        assert!(e.tx.bw_samples.contains(&(100, 2 * 1024 * 1024)));
+    }
+
+    #[test]
+    fn a_warm_seed_survives_sparse_and_flight_limited_delivery() {
+        let cfg = Config {
+            bbr: true,
+            warm_btl_bw: 1024 * 1024,
+            warm_rtt_min_ms: 50,
+            mss: 1000,
+            ..Config::default()
+        };
+        for app_limited in [false, true] {
+            let mut e = StreamEngine::connect(7, cfg, 0, 100);
+            e.tx.srtt = Some(500);
+            for at in [20, 40, 60, 560, 580, 600, 1100, 1120, 1140] {
+                e.tx.bbr_on_delivered(16_000, at, !app_limited, 1000);
+            }
+            assert_eq!(e.tx.btl_bw, cfg.warm_btl_bw);
+            assert_eq!(e.tx.bw_samples.front(), Some(&(0, cfg.warm_btl_bw)));
+            if !app_limited {
+                // Ambiguity must not permanently pin the cache once the burst
+                // gaps have left the observation window and delivery settles.
+                for at in (1160..=3600).step_by(20) {
+                    e.tx.bbr_on_delivered(640, at, true, 1000);
+                }
+                assert!(!e.tx.bw_samples.iter().any(|&(at, _)| at == 0));
+                assert!(e.tx.btl_bw < cfg.warm_btl_bw);
+            }
+        }
+        // One ACK/checkpoint per round is ambiguous even with regular spacing.
+        let mut e = StreamEngine::connect(7, cfg, 0, 100);
+        e.tx.srtt = Some(500);
+        for at in [20, 520, 1020, 1520] {
+            e.tx.bbr_on_delivered(16_000, at, true, 1000);
+        }
+        assert_eq!(e.tx.btl_bw, cfg.warm_btl_bw);
     }
 
     #[test]
