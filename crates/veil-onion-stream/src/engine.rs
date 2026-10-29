@@ -1026,7 +1026,6 @@ impl StreamEngine {
     }
 
     fn on_ack(&mut self, ack: u32, win: u32, sacks: &SackVec, now: u64) {
-        self.tx.rwnd = win;
         self.note_peer_progress();
         if self.phase == Phase::SynSent || self.phase == Phase::Closed {
             return;
@@ -1036,6 +1035,15 @@ impl StreamEngine {
         // congestion growth below into an arbitrary cwnd jump.
         if seq::gt(ack, self.tx.ack_limit()) {
             return;
+        }
+        // ACKs can arrive out of order over independent return circuits, or
+        // after local carrier backpressure retained an older ACK. Do not let
+        // an older cumulative point overwrite a newer window (notably with
+        // zero, which would stall new DATA until a persist probe). Equal ACKs
+        // still carry window updates/dup-ACK evidence; old SACK information
+        // below is also useful and must not be discarded with the old window.
+        if seq::geq(ack, self.tx.snd_una) {
+            self.tx.rwnd = win;
         }
         // ACK fields are simultaneous evidence, not sequential network arrivals.
         let prior_rack_frontier = self.tx.rack_xmit_ms;
