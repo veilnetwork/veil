@@ -36,12 +36,10 @@ const BBR_MIN_DELIVERED: u64 = 64 * 1024;
 const BBR_BW_WINDOW_MS: u64 = 10_000;
 /// Minimum spacing between stored bandwidth samples.
 const BBR_BW_SAMPLE_SPACING_MS: u64 = 100;
-/// BBR engages only after this many bytes were delivered on the stream, so
-/// slow start first climbs to a realistic rate: an estimate seeded from the
-/// first slow-start round-trips caps the window at a crawl.
-const BBR_ENGAGE_DELIVERED: u64 = 1024 * 1024;
 /// Expiry of the windowed-minimum RTT sample.
 const BBR_MIN_RTT_WINDOW_MS: u64 = 30_000;
+/// Hold a drained small flight through at least one fresh RTT observation.
+const BBR_PROBE_RTT_HOLD_MS: u64 = 200;
 /// Higher-sequence SACKed segments needed to establish a hole by count.
 const SACK_LOSS_THRESHOLD: usize = 3;
 /// RTT evidence and retransmission history expire independently of BBR.
@@ -106,11 +104,10 @@ pub struct Config {
     pub ack_delay_ms: u64,
     /// Warm-start seed for the BBR-lite bottleneck estimate (bytes/sec), from
     /// a previous stream to the same peer. 0 = cold start. A warm stream
-    /// engages BBR pacing/window shaping from the first byte (no
-    /// 1 MiB engage gate, no STARTUP): the 10s max-window naturally expires
-    /// the seed once real samples land, and NewReno loss handling still
-    /// applies underneath, so a stale (too-high) seed self-corrects within a
-    /// window while a too-low seed is out-probed at the steady 5/4 gain.
+    /// engages BBR pacing/window shaping from the first byte; a cold stream
+    /// waits for qualifying live delivery samples. Both use STARTUP's 2x
+    /// probing before the steady 5/4 gain. The 10s max-window expires the
+    /// seed once real samples land; NewReno loss handling applies underneath.
     /// Callers should seed conservatively (e.g. half the last measured rate).
     pub warm_btl_bw: u64,
     /// Warm-start seed for the windowed-minimum RTT (ms). Only used when
@@ -382,6 +379,9 @@ struct TxState {
     bbr_probe_checked_ms: u64,
     /// Windowed minimum round-trip time (ms) and the time it was recorded.
     rtt_min: Option<(u32, u64)>,
+    /// Local-only drain/measurement; never authorizes a packet or changes ARQ.
+    bbr_rtt_probe: Option<RttProbe>,
+    bbr_probe_retry_after_ms: u64,
     // ---- RACK time-threshold loss detection (maintained only when cfg.rack) ----
     /// Send time of the most recently SENT segment known delivered (0 = none
     /// yet). Repairs can advance it only after the minimum-RTT ambiguity check;
@@ -408,6 +408,12 @@ struct TxState {
     rack_repairs: VecDeque<RackRepair>,
     /// Measured duplicate-feedback span above min RTT, capped at the current RTO when learned.
     rack_dsack_reo_ms: u32,
+}
+
+struct RttProbe {
+    started_ms: u64,
+    drained_at_ms: Option<u64>,
+    sample_ms: Option<u32>,
 }
 
 /// No payload copies: bounded metadata survives cumulative ACK removal so a
@@ -577,6 +583,8 @@ impl StreamEngine {
                 bbr_stall_rounds: 0,
                 bbr_probe_checked_ms: 0,
                 rtt_min: warm_rtt.map(|(r, t)| (r.max(1), t)),
+                bbr_rtt_probe: None,
+                bbr_probe_retry_after_ms: 0,
                 rack_xmit_ms: 0,
                 rack_end_seq: 0,
                 rack_rtt_ms: 0,
@@ -846,7 +854,7 @@ impl StreamEngine {
              pending={} dup={} recov={} consec_rto={} | rcv_nxt={} read_buf={} oo={} oo_bytes={} \
              adv={} ack_pending={} eof={} fin(req={},sent={},ack={}) \
              srtt={:?} rttvar={} rto={}ms pace_next={}ms delayed_ack={}/{:?} \
-             rto_dl={:?} persist_dl={:?} bbr_bw={} bbr_rtt_min={:?} bbr_cap={:?} \
+             rto_dl={:?} persist_dl={:?} bbr_bw={} bbr_rtt_min={:?} bbr_cap={:?} bbr_probe_rtt={} \
              rack={} reo_wnd={} rack_rtt={} rto_skipped_sacked={} sack_rto_refreshes={} sack_recent_promotions={} \
              reo_observed_ms={} reo_duplicate_ms={}",
             self.phase,
@@ -884,6 +892,7 @@ impl StreamEngine {
             self.tx.btl_bw,
             self.tx.rtt_min.map(|(rtt, _)| rtt),
             self.tx.bbr_window_cap(&self.cfg),
+            self.tx.bbr_rtt_probe.is_some(),
             self.cfg.rack,
             self.rack_reo_wnd(),
             self.tx.rack_rtt_ms,
@@ -1250,7 +1259,7 @@ impl StreamEngine {
         if let Some(sent_ms) = rtt_sent_ms {
             let rtt = now.saturating_sub(sent_ms).min(u64::from(u32::MAX)) as u32;
             if self.cfg.bbr {
-                self.tx.bbr_on_rtt(rtt, now);
+                self.tx.bbr_on_rtt(rtt, sent_ms, now, &self.cfg);
             }
         }
         if self.cfg.bbr && newly_delivered > 0 {
@@ -1317,6 +1326,7 @@ impl StreamEngine {
     }
 
     fn poll_transmit_inner(&mut self, now: u64, out: &mut Vec<u8>, allow_new: bool) -> bool {
+        self.tx.advance_bbr_probe(now, &self.cfg);
         // 1. RST is terminal + highest priority.
         if let Some(reason) = self.rst_to_send.take() {
             encode(
@@ -1819,6 +1829,7 @@ impl StreamEngine {
         if self.phase == Phase::Closed {
             return;
         }
+        self.tx.advance_bbr_probe(now, &self.cfg);
         if self
             .hs_local_deadline
             .is_some_and(|deadline| now >= deadline)
@@ -2039,6 +2050,7 @@ impl StreamEngine {
         merge(self.ack_deadline);
         if self.phase == Phase::Established {
             merge(self.tx.next_sack_repair_ms);
+            merge(self.tx.bbr_probe_deadline(&self.cfg));
         }
         // If new data is ready but held back only by pacing, wake to release it.
         if include_pacing && self.phase == Phase::Established && self.paced_send_ready() {
@@ -2059,40 +2071,8 @@ impl StreamEngine {
         // more bandwidth while the 2xBDP window cap bounds the standing
         // queue. Window/srtt pacing below would chase its own queueing delay
         // (srtt inflates -> rate holds at the same self-built queue).
-        if self.cfg.bbr
-            && self.tx.btl_bw > 0
-            && self.tx.rtt_min.is_some()
-            && (self.tx.delivered >= BBR_ENGAGE_DELIVERED || self.cfg.warm_btl_bw > 0)
-        {
-            // STARTUP doubles the estimate each round trip; steady state
-            // probes at 5/4 (see bbr_startup).
-            let rate = if self.tx.bbr_startup {
-                self.tx.btl_bw.saturating_mul(2)
-            } else {
-                self.tx.btl_bw.saturating_mul(5) / 4
-            }; // bytes/sec
-            let mss = self.cfg.mss.max(1) as u64;
-            // Pick a tick long enough to release >=32 whole cells, then round
-            // the per-tick budget UP: rounding down quantized the real rate to
-            // a fraction of the target (live: half), which fed the estimator
-            // slower samples than it paced for. The >=32 emission quantum
-            // (was >=4) matters twice on a phone: 8x fewer driver wakes at the
-            // same rate, and the carrier only fans a DATA run out across
-            // multiple routes when a single emission is big enough to be worth
-            // splitting (route striping; live the 4-cell runs never met the
-            // stripe threshold). The carrier's shared token-bucket pacer still
-            // shapes the wire burst, and one 32-cell tick (~130 KB) is far
-            // below the relay-queue sizes that caused historic burst loss.
-            let cells_per_sec = (rate / mss).max(1);
-            // A smaller configured batch must shorten the interval too;
-            // clamping only the budget would cap throughput at batch/100 ms
-            // and prevent the delivery model from probing past that rate.
-            let quantum = self.cfg.max_pacing_batch.clamp(1, 32) as u64;
-            let interval = (quantum * 1000 / cells_per_sec).clamp(1, 100);
-            let batch = (rate.saturating_mul(interval))
-                .div_ceil(1000 * mss)
-                .clamp(1, self.cfg.max_pacing_batch.max(1) as u64) as u32;
-            return (interval, batch);
+        if self.cfg.bbr && self.tx.btl_bw > 0 && self.tx.rtt_min.is_some() {
+            return bbr_pacing_params(&self.cfg, self.tx.btl_bw, self.tx.bbr_startup);
         }
         // Spread the EFFECTIVE window (min of cwnd and the peer's rwnd) across one
         // RTT — never cwnd alone. When cwnd has run far past a smaller rwnd, pacing
@@ -2207,6 +2187,31 @@ impl StreamEngine {
 
 fn encode(frame: Frame<'_>, out: &mut Vec<u8>) {
     frame.encode_into(out);
+}
+
+/// The window floor must cover the ACTUAL pacing quantum, not a fixed
+/// 64-cell flight on arbitrarily slow paths. Keep the existing batching:
+/// up to 32 cells per tick, bounded at 100 ms on a slower link, rounded up
+/// so the estimator is not fed an artificially truncated sending rate.
+fn bbr_pacing_params(cfg: &Config, bandwidth: u64, startup: bool) -> (u64, u32) {
+    let rate = if startup {
+        bandwidth.saturating_mul(2)
+    } else {
+        bandwidth.saturating_mul(5) / 4
+    };
+    let mss = cfg.mss.max(1) as u64;
+    let cells_per_sec = (rate / mss).max(1);
+    let quantum = cfg.max_pacing_batch.clamp(1, 32) as u64;
+    let interval = (quantum * 1000 / cells_per_sec).clamp(1, 100);
+    let batch = rate
+        .saturating_mul(interval)
+        .div_ceil(1000 * mss)
+        .clamp(1, cfg.max_pacing_batch.max(1) as u64) as u32;
+    (interval, batch)
+}
+
+fn bbr_probe_window(cfg: &Config) -> u32 {
+    (cfg.mss as u64).saturating_mul(4).min(u64::from(u32::MAX)) as u32
 }
 
 impl TxState {
@@ -2548,15 +2553,73 @@ impl TxState {
         }
     }
 
-    /// Windowed-minimum RTT: keep the smallest clean sample, but let the
-    /// window expire so a route change eventually re-anchors the estimate.
-    fn bbr_on_rtt(&mut self, r_ms: u32, now: u64) {
-        let replace = match self.rtt_min {
-            None => true,
-            Some((min, stamp)) => r_ms <= min || now.saturating_sub(stamp) > BBR_MIN_RTT_WINDOW_MS,
-        };
-        if replace {
-            self.rtt_min = Some((r_ms.max(1), now));
+    /// Expiry alone cannot turn our own standing queue into propagation RTT.
+    /// A higher replacement needs a small drained flight and an original sent
+    /// after that drain. Loss timers and RACK keep their separate observations.
+    fn bbr_on_rtt(&mut self, r_ms: u32, sent_ms: u64, now: u64, cfg: &Config) {
+        self.advance_bbr_probe(now, cfg);
+        if self.bbr_rtt_probe.is_none() {
+            match self.rtt_min {
+                None => {
+                    self.rtt_min = Some((r_ms.max(1), now));
+                    return;
+                }
+                Some((min, _)) if r_ms <= min => {
+                    self.rtt_min = Some((r_ms.max(1), now));
+                    return;
+                }
+                Some((_, stamp)) if now.saturating_sub(stamp) <= BBR_MIN_RTT_WINDOW_MS => {
+                    return;
+                }
+                _ if now < self.bbr_probe_retry_after_ms => return,
+                _ => {}
+            }
+            self.bbr_rtt_probe = Some(RttProbe {
+                started_ms: now,
+                drained_at_ms: None,
+                sample_ms: None,
+            });
+        }
+        let probe = self.bbr_rtt_probe.as_mut().unwrap();
+        if self.snd_nxt.wrapping_sub(self.snd_una) <= bbr_probe_window(cfg) {
+            let drained_at = *probe.drained_at_ms.get_or_insert(now);
+            if sent_ms >= drained_at {
+                probe.sample_ms = Some(probe.sample_ms.map_or(r_ms.max(1), |r| r.min(r_ms.max(1))));
+            }
+        }
+        self.advance_bbr_probe(now, cfg);
+    }
+
+    fn bbr_probe_deadline(&self, cfg: &Config) -> Option<u64> {
+        let probe = self.bbr_rtt_probe.as_ref()?;
+        let lease = probe
+            .started_ms
+            .saturating_add(cfg.max_rto_ms.max(BBR_PROBE_RTT_HOLD_MS));
+        let done = probe
+            .drained_at_ms
+            .filter(|_| probe.sample_ms.is_some())
+            .map(|at| at.saturating_add(BBR_PROBE_RTT_HOLD_MS));
+        Some(done.map_or(lease, |at| at.min(lease)))
+    }
+
+    fn advance_bbr_probe(&mut self, now: u64, cfg: &Config) {
+        if !self.bbr_probe_deadline(cfg).is_some_and(|at| now >= at) {
+            return;
+        }
+        let probe = self.bbr_rtt_probe.take().unwrap();
+        if let (Some(at), Some(rtt)) = (probe.drained_at_ms, probe.sample_ms)
+            && at.saturating_add(BBR_PROBE_RTT_HOLD_MS)
+                <= probe
+                    .started_ms
+                    .saturating_add(cfg.max_rto_ms.max(BBR_PROBE_RTT_HOLD_MS))
+        {
+            self.rtt_min = Some((rtt, now));
+            self.bbr_probe_retry_after_ms = 0;
+        } else {
+            // A failed drain/measurement must neither pin cwnd forever nor
+            // invent a fresh RTT. Back off another attempt without retiming
+            // the old measurement or releasing any network RTO backoff.
+            self.bbr_probe_retry_after_ms = now.saturating_add(BBR_MIN_RTT_WINDOW_MS);
         }
     }
 
@@ -2564,15 +2627,22 @@ impl TxState {
     /// delay product, once both estimates exist. `None` (startup / bbr off)
     /// means no extra cap.
     fn bbr_window_cap(&self, cfg: &Config) -> Option<u32> {
-        if !cfg.bbr
-            || self.btl_bw == 0
-            || (self.delivered < BBR_ENGAGE_DELIVERED && cfg.warm_btl_bw == 0)
-        {
+        if !cfg.bbr || self.btl_bw == 0 {
             return None;
+        }
+        if self.bbr_rtt_probe.is_some() {
+            return Some(bbr_probe_window(cfg));
         }
         let (rtt_min, _) = self.rtt_min?;
         let bdp = self.btl_bw.saturating_mul(rtt_min as u64) / 1000;
-        let floor = (cfg.init_cwnd as u64).max(64 * cfg.mss as u64);
+        let (_, batch) = bbr_pacing_params(cfg, self.btl_bw, self.bbr_startup);
+        // Two actual pacing batches leave wakeup/ACK headroom. init_cwnd is
+        // an initial flight, not a permanent minimum after a live model has
+        // established a slower bottleneck. A four-segment floor still allows
+        // delayed ACKs and probes without retaining seconds of stale DATA.
+        let floor = (cfg.mss as u64)
+            .saturating_mul((2 * u64::from(batch)).max(4))
+            .min(u64::from(u32::MAX));
         // STARTUP paces at 2x the estimate; sustaining that probe needs
         // 2x btl_bw x srtt of flight, and with live srtt a notch above rtt_min
         // a 2x-BDP cap starves the very probe that is supposed to discover the
@@ -2580,7 +2650,13 @@ impl TxState {
         // reason). Steady state keeps the tight 2x cap that bounds the
         // standing queue.
         let gain = if self.bbr_startup { 3 } else { 2 };
-        Some(bdp.saturating_mul(gain).clamp(floor, u32::MAX as u64) as u32)
+        let cap = bdp.saturating_mul(gain).clamp(floor, u32::MAX as u64);
+        // BDP is byte-granular but a full bulk segment pays one fixed wire
+        // cell. Keep the shaping window aligned so each ACK does not release
+        // a tiny DATA tail into another padded cell. Real peer-window limits
+        // and genuinely short application writes retain their usual behavior.
+        let mss = cfg.mss.max(1) as u64;
+        Some((cap - cap % mss) as u32)
     }
 
     fn update_rto(&mut self, r_ms: u32, cfg: &Config) {
@@ -3801,7 +3877,7 @@ mod tests {
                 // Seed a clean sample too: this isolates cumulative re-sampling
                 // from the independently tested missing first-SACK measurement.
                 e.tx.update_rto(10, &e.cfg);
-                e.tx.bbr_on_rtt(10, 20);
+                e.tx.bbr_on_rtt(10, 10, 20, &e.cfg);
                 let timing = (e.tx.srtt, e.tx.rttvar, e.tx.rto_ms, e.tx.rtt_min);
                 e.on_timeout(100);
                 let mut encoded = Vec::new();
@@ -4114,16 +4190,19 @@ mod tests {
         e.tx.rwnd = cfg.recv_window;
         e.tx.cwnd = 16 * 1024 * 1024; // loss-free growth far past the path BDP
         e.tx.btl_bw = 3 * 1024 * 1024; // 3 MiB/s
-        e.tx.delivered = BBR_ENGAGE_DELIVERED; // model warm
+        e.tx.delivered = 1024 * 1024; // model warm
         e.tx.rtt_min = Some((200, 0)); // 200ms propagation
         let bdp = 3 * 1024 * 1024 * 200 / 1000;
         // While STARTUP still probes at 2x pacing, the cap must leave the
         // probe headroom (3x BDP).
-        assert_eq!(e.tx.bbr_window_cap(&e.cfg), Some(3 * bdp));
+        let startup_cap = e.tx.bbr_window_cap(&e.cfg).unwrap();
+        assert!(startup_cap <= 3 * bdp && 3 * bdp - startup_cap < cfg.mss as u32);
+        assert_eq!(startup_cap % cfg.mss as u32, 0);
         // Steady state: BDP = 3 MiB/s * 0.2s = 614.4 KiB; cap = 2x.
         e.tx.bbr_startup = false;
         let cap = e.tx.bbr_window_cap(&e.cfg).expect("model warm");
-        assert_eq!(cap, 2 * bdp);
+        assert!(cap <= 2 * bdp && 2 * bdp - cap < cfg.mss as u32);
+        assert_eq!(cap % cfg.mss as u32, 0);
         assert_eq!(e.effective_send_window(), cap);
         // Without estimates the cap must vanish (startup behaves classically).
         e.tx.btl_bw = 0;
@@ -4141,7 +4220,7 @@ mod tests {
         };
         let e = StreamEngine::connect(7, cfg, 0, 10_000);
         // Model seeded, window cap live at zero bytes delivered (a cold
-        // stream would return None until 1 MiB). STARTUP is KEPT, with the
+        // stream first needs qualifying live samples). STARTUP is KEPT, with the
         // plateau clock anchored at the seed: the mux caches half the
         // previous rate, so the 2x STARTUP pacing probes exactly the cached
         // rate and only a genuinely faster path keeps the climb alive.
@@ -4151,10 +4230,12 @@ mod tests {
         assert_eq!(e.tx.rtt_min.map(|(r, _)| r), Some(150));
         let bdp = 6_000_000u64 * 150 / 1000; // 900 KB
         // STARTUP window cap leaves probe headroom (3x BDP).
-        assert_eq!(e.tx.bbr_window_cap(&e.cfg), Some(3 * bdp as u32));
+        let cap = e.tx.bbr_window_cap(&e.cfg).unwrap();
+        assert!(u64::from(cap) <= 3 * bdp && 3 * bdp - u64::from(cap) < cfg.mss as u64);
+        assert_eq!(cap % cfg.mss as u32, 0);
         // First flight opens near the seeded BDP (capped at 1 MiB).
         assert_eq!(e.tx.cwnd, bdp as u32);
-        // A cold config keeps the engage gate.
+        // A cold config has no estimate yet, so it keeps ordinary slow start.
         let cold = Config {
             bbr: true,
             ..Config::default()
@@ -4277,19 +4358,101 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bbr_min_rtt_keeps_min_until_window_expiry() {
+    fn rtt_probe_engine() -> StreamEngine {
         let cfg = Config {
             bbr: true,
+            mss: 1000,
+            max_rto_ms: 2000,
             ..Config::default()
         };
-        let mut e = StreamEngine::connect(7, cfg, 0, 10_000);
-        e.tx.bbr_on_rtt(180, 0);
-        e.tx.bbr_on_rtt(900, 1_000); // queue-inflated sample: ignored
-        assert_eq!(e.tx.rtt_min.map(|(r, _)| r), Some(180));
-        // After the window expires a fresh (even larger) sample re-anchors.
-        e.tx.bbr_on_rtt(400, BBR_MIN_RTT_WINDOW_MS + 2_000);
-        assert_eq!(e.tx.rtt_min.map(|(r, _)| r), Some(400));
+        let mut e = StreamEngine::connect(7, cfg, 0, 100);
+        e.phase = Phase::Established;
+        e.send_syn = false;
+        e.syn_acked = true;
+        e.hs_deadline = None;
+        e.tx.snd_una = e.tx.snd_nxt;
+        e.tx.btl_bw = 128_000;
+        e.tx.rtt_min = Some((180, 0));
+        e
+    }
+
+    #[test]
+    fn bbr_expired_minimum_requires_a_drained_post_probe_sample() {
+        let mut e = rtt_probe_engine();
+        let cfg = e.cfg;
+        e.tx.bbr_on_rtt(900, 100, 1000, &cfg);
+        assert_eq!(e.tx.rtt_min, Some((180, 0)));
+        let start = BBR_MIN_RTT_WINDOW_MS + 1;
+        e.tx.snd_nxt = e.tx.snd_una.wrapping_add(12_000);
+        e.tx.bbr_on_rtt(900, start - 900, start, &cfg);
+        assert_eq!(e.tx.rtt_min, Some((180, 0)));
+        assert_eq!(e.tx.bbr_window_cap(&cfg), Some(4000));
+        assert!(e.tx.bbr_rtt_probe.as_ref().unwrap().drained_at_ms.is_none());
+
+        e.tx.snd_una = e.tx.snd_nxt; // the old flight has drained
+        e.tx.bbr_on_rtt(900, start - 800, start + 100, &cfg);
+        assert_eq!(
+            e.tx.bbr_rtt_probe.as_ref().unwrap().drained_at_ms,
+            Some(start + 100)
+        );
+        assert!(e.tx.bbr_rtt_probe.as_ref().unwrap().sample_ms.is_none());
+        // Even a later arriving old original is not a post-drain sample.
+        e.tx.bbr_on_rtt(500, start - 100, start + 400, &cfg);
+        assert_eq!(e.tx.rtt_min, Some((180, 0)));
+        assert!(e.tx.bbr_rtt_probe.is_some());
+        // Genuine higher propagation delay is learnable after the drain.
+        e.tx.bbr_on_rtt(400, start + 100, start + 500, &cfg);
+        assert_eq!(e.tx.rtt_min, Some((400, start + 500)));
+        assert!(e.tx.bbr_rtt_probe.is_none());
+    }
+
+    #[test]
+    fn bbr_probe_completes_on_its_timer_without_an_extra_ack() {
+        let mut e = rtt_probe_engine();
+        let cfg = e.cfg;
+        let start = BBR_MIN_RTT_WINDOW_MS + 1;
+        e.tx.bbr_on_rtt(500, start - 500, start, &cfg);
+        e.tx.bbr_on_rtt(100, start, start + 100, &cfg);
+        assert!(e.tx.bbr_rtt_probe.is_some()); // minimum hold not elapsed
+        assert_eq!(e.next_timeout(), Some(start + BBR_PROBE_RTT_HOLD_MS));
+        e.on_timeout(start + BBR_PROBE_RTT_HOLD_MS);
+        assert_eq!(e.tx.rtt_min, Some((100, start + BBR_PROBE_RTT_HOLD_MS)));
+        assert!(e.tx.bbr_rtt_probe.is_none());
+        assert!(e.tx.bbr_window_cap(&cfg).unwrap() > 4000);
+        assert_eq!(e.next_timeout(), None);
+    }
+
+    #[test]
+    fn failed_bbr_probe_has_a_fixed_lease_and_keeps_rto_evidence() {
+        let mut e = rtt_probe_engine();
+        let cfg = e.cfg;
+        let start = BBR_MIN_RTT_WINDOW_MS + 1;
+        e.tx.snd_nxt = e.tx.snd_una.wrapping_add(12_000);
+        e.tx.bbr_on_rtt(500, start - 500, start, &cfg);
+        let old = (e.tx.rtt_min, e.tx.srtt, e.tx.rttvar, e.tx.rto_ms);
+        let deadline = start + cfg.max_rto_ms;
+        assert_eq!(e.next_timeout(), Some(deadline));
+        // Repeated pre-drain feedback must not extend the lease.
+        e.tx.bbr_on_rtt(1500, start, start + 1500, &cfg);
+        assert_eq!(e.next_timeout(), Some(deadline));
+        e.on_timeout(deadline);
+        assert!(e.tx.bbr_rtt_probe.is_none());
+        assert_eq!((e.tx.rtt_min, e.tx.srtt, e.tx.rttvar, e.tx.rto_ms), old);
+        assert_eq!(e.next_timeout(), None);
+        e.tx.bbr_on_rtt(900, deadline - 900, deadline + 1, &cfg);
+        assert!(
+            e.tx.bbr_rtt_probe.is_none(),
+            "failed probe immediately restarted"
+        );
+    }
+
+    #[test]
+    fn bbr_lower_rtt_refreshes_without_waiting_for_a_probe() {
+        let mut e = rtt_probe_engine();
+        let cfg = e.cfg;
+        e.tx.bbr_on_rtt(120, 880, 1000, &cfg);
+        assert_eq!(e.tx.rtt_min, Some((120, 1000)));
+        assert!(e.tx.bbr_rtt_probe.is_none());
     }
 
     fn engine_with_tiny_no_sack_flight(rto_rewind_no_sack: bool) -> StreamEngine {
