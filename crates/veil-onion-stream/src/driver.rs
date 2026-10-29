@@ -19,7 +19,8 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::Instant;
 
 use crate::engine::{Config, Event, LocalTransmit, StreamEngine};
-use crate::wire::reset_reason;
+use crate::seq;
+use crate::wire::{Frame, reset_reason};
 
 #[derive(Debug)]
 struct SendRetryAfter(u64);
@@ -129,7 +130,8 @@ pub trait CellDuplex: Send {
         self.on_data_rto(stream_id, consec_rto, snd_una)
     }
     /// The stream's final delivery model (measured bottleneck rate, min RTT,
-    /// total delivered bytes), reported once just before `on_stream_closed`.
+    /// total delivered bytes), reported once when data transfer completes,
+    /// before any optional final-ACK responder and `on_stream_closed`.
     /// Carriers may cache it per peer to warm-start follow-up streams (see
     /// `Config::warm_btl_bw`). Default: ignored.
     fn on_stream_model(
@@ -878,16 +880,113 @@ async fn drive<D: CellDuplex>(
             End::Reset(reset_reason::APP)
         },
     );
+    let stream_id = engine.stream_id();
+    let linger = engine.completed_close_ack();
     let (btl_bw, rtt_min_ms, delivered) = engine.delivery_model();
+    // Surface already-queued bytes and EOF immediately. Only a tiny fixed ACK
+    // and the existing return route are retained; not engine/read/write buffers.
+    drop(data_tx);
+    drop(cmd_rx);
+    drop(engine);
+    drop(outbound);
+    drop(rx_cells);
+    drop(local_transmits);
+    drop(cell);
     if btl_bw > 0 {
         duplex
-            .on_stream_model(engine.stream_id(), btl_bw, rtt_min_ms, delivered)
+            .on_stream_model(stream_id, btl_bw, rtt_min_ms, delivered)
             .await;
     }
-    duplex
-        .on_stream_closed(engine.stream_id(), end_of(&end))
-        .await;
-    // Dropping `data_tx` here makes the reader observe EOF/reset.
+    if let Some((duration_ms, ack)) = linger {
+        linger_completed(&mut duplex, &mut reset_rx, duration_ms, &ack).await;
+    }
+    duplex.on_stream_closed(stream_id, end_of(&end)).await;
+}
+
+/// Keep the final ACK reachable after a best-effort handoff. No app DATA,
+/// loss verdicts, RTO callbacks, or ACK-to-ACK replies during this bounded wait.
+async fn linger_completed<D: CellDuplex>(
+    duplex: &mut D,
+    reset_rx: &mut watch::Receiver<Option<u8>>,
+    duration_ms: u64,
+    ack_cell: &[u8],
+) {
+    let Some(Frame::Ack { stream_id, ack, .. }) = Frame::decode(ack_cell) else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_millis(duration_ms);
+    let mut reset_open = true;
+    let mut ready_cells = 0;
+    loop {
+        if reset_rx.borrow().is_some() {
+            return;
+        }
+        ready_cells += 1;
+        if ready_cells == 64 {
+            tokio::task::yield_now().await;
+            ready_cells = 0;
+        }
+        let received = tokio::select! {
+            biased;
+            changed = reset_rx.changed(), if reset_open => {
+                if changed.is_err() { reset_open = false; }
+                continue;
+            }
+            _ = tokio::time::sleep_until(deadline) => return,
+            result = duplex.recv_cell() => result,
+        };
+        let Ok(Some(cell)) = received else {
+            return;
+        };
+        let duplicate = match Frame::decode(&cell) {
+            Some(Frame::Fin {
+                stream_id: sid,
+                seq,
+            }) => sid == stream_id && seq == ack.wrapping_sub(1),
+            Some(Frame::Data {
+                stream_id: sid,
+                seq,
+                payload,
+                ..
+            }) => {
+                sid == stream_id
+                    && seq::leq(seq.wrapping_add(payload.len() as u32), ack.wrapping_sub(1))
+            }
+            Some(Frame::Rst { stream_id: sid, .. }) if sid == stream_id => return,
+            _ => false,
+        };
+        if !duplicate {
+            continue;
+        }
+        let mut pending = std::collections::VecDeque::from([ack_cell.to_vec()]);
+        loop {
+            let sent = tokio::select! {
+                biased;
+                changed = reset_rx.changed(), if reset_open => {
+                    if changed.is_err() { reset_open = false; }
+                    if reset_rx.borrow().is_some() { return; }
+                    continue;
+                }
+                _ = tokio::time::sleep_until(deadline) => return,
+                result = duplex.send_cells(&mut pending) => result,
+            };
+            let retry_ms = match sent {
+                Ok(()) if pending.is_empty() => break,
+                Ok(()) => SEND_WOULD_BLOCK_RETRY_MS,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => send_retry_delay_ms(&e),
+                Err(_) => return,
+            };
+            let retry = Instant::now() + Duration::from_millis(retry_ms);
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => return,
+                changed = reset_rx.changed(), if reset_open => {
+                    if changed.is_err() { reset_open = false; }
+                    if reset_rx.borrow().is_some() { return; }
+                }
+                _ = tokio::time::sleep_until(retry) => {}
+            }
+        }
+    }
 }
 
 fn set_end(end: &Arc<Mutex<End>>, v: End) {
@@ -896,6 +995,7 @@ fn set_end(end: &Arc<Mutex<End>>, v: End) {
         *g = v;
     }
 }
+
 fn set_end_if_open(end: &Arc<Mutex<End>>, v: End) -> bool {
     let mut g = end.lock().unwrap_or_else(|p| p.into_inner());
     if *g == End::Open {
@@ -914,5 +1014,147 @@ async fn wait_until(base: &Instant, at: Option<u64>) {
             tokio::time::sleep(Duration::from_millis(t.saturating_sub(now))).await;
         }
         None => pending::<()>().await,
+    }
+}
+
+#[cfg(test)]
+mod close_linger_tests {
+    use super::*;
+    use crate::wire::SackVec;
+
+    struct Peer {
+        rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        sending: Arc<Notify>,
+        block_send: bool,
+    }
+    impl CellDuplex for Peer {
+        async fn send_cell(&mut self, cell: &[u8]) -> io::Result<()> {
+            self.sending.notify_one();
+            if self.block_send {
+                pending::<()>().await;
+            }
+            self.sent.lock().unwrap().push(cell.to_vec());
+            Ok(())
+        }
+        async fn recv_cell(&mut self) -> io::Result<Option<Vec<u8>>> {
+            Ok(self.rx.recv().await)
+        }
+    }
+    fn ack() -> Vec<u8> {
+        Frame::Ack {
+            stream_id: 7,
+            ack: 1000,
+            win: 0,
+            sacks: SackVec::new(),
+        }
+        .encode()
+    }
+    fn peer() -> (Peer, mpsc::UnboundedSender<Vec<u8>>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Peer {
+                rx,
+                sent: Arc::new(Mutex::new(Vec::new())),
+                sending: Arc::new(Notify::new()),
+                block_send: false,
+            },
+            tx,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_witness_only_replies_to_its_completed_data_and_fin() {
+        let (mut peer, tx) = peer();
+        let (_reset, mut reset_rx) = watch::channel(None);
+        for cell in [
+            Frame::Ack {
+                stream_id: 7,
+                ack: 1,
+                win: 1,
+                sacks: SackVec::new(),
+            },
+            Frame::Fin {
+                stream_id: 8,
+                seq: 999,
+            },
+            Frame::Data {
+                stream_id: 7,
+                seq: 1000,
+                win: 1,
+                payload: &[1],
+            },
+            Frame::Fin {
+                stream_id: 7,
+                seq: 999,
+            },
+            Frame::Data {
+                stream_id: 7,
+                seq: 990,
+                win: 1,
+                payload: &[1],
+            },
+            Frame::Rst {
+                stream_id: 7,
+                reason: reset_reason::APP,
+            },
+        ] {
+            tx.send(cell.encode()).unwrap();
+        }
+        linger_completed(&mut peer, &mut reset_rx, 100, &ack()).await;
+        assert_eq!(*peer.sent.lock().unwrap(), vec![ack(), ack()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn duplicates_do_not_extend_the_fixed_close_deadline() {
+        let (mut peer, tx) = peer();
+        let (_reset, mut reset_rx) = watch::channel(None);
+        let task = tokio::spawn(async move {
+            linger_completed(&mut peer, &mut reset_rx, 100, &ack()).await;
+        });
+        tokio::task::yield_now().await;
+        for _ in 0..2 {
+            tokio::time::advance(Duration::from_millis(40)).await;
+            tx.send(
+                Frame::Fin {
+                    stream_id: 7,
+                    seq: 999,
+                }
+                .encode(),
+            )
+            .unwrap();
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(21)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            task.is_finished(),
+            "duplicate traffic renewed the close lease"
+        );
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicit_reset_cancels_a_blocked_close_ack_without_waiting_for_timeout() {
+        let (mut peer, tx) = peer();
+        peer.block_send = true;
+        let sending = peer.sending.clone();
+        let (reset, mut reset_rx) = watch::channel(None);
+        let task = tokio::spawn(async move {
+            linger_completed(&mut peer, &mut reset_rx, 100, &ack()).await;
+        });
+        tx.send(
+            Frame::Fin {
+                stream_id: 7,
+                seq: 999,
+            }
+            .encode(),
+        )
+        .unwrap();
+        sending.notified().await;
+        let before = Instant::now();
+        reset.send(Some(reset_reason::APP)).unwrap();
+        task.await.unwrap();
+        assert_eq!(Instant::now(), before, "reset waited for the linger timer");
     }
 }

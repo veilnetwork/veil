@@ -4159,6 +4159,14 @@ fn stream_config(me: [u8; 32], cells: &HubCells, mss: usize) -> Config {
         },
         ack_delay_ms: 5,
         debug_summary_ms,
+        // A completed circuit can lose its final ACK after local admission.
+        // Keep a tiny receive/ACK responder for two maximum RTO intervals;
+        // application EOF and engine buffers are released immediately.
+        close_linger_ms: if is_circuit {
+            max_rto_ms.saturating_mul(2)
+        } else {
+            0
+        },
         rack,
         rack_reo_floor_ms,
         ..Config::default()
