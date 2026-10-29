@@ -807,9 +807,10 @@ impl DhtMlKemEkResolver {
             .dht_get_freshest(
                 cert_key,
                 |b| {
-                    MlKemKeyCert::decode(b)
-                        .ok()
-                        .filter(|c| verify_mlkem_cert(c, &doc, now_unix).is_ok())
+                    MlKemKeyCert::decode(b).ok().filter(|c| {
+                        cert_addresses_instance(c, &target_node_id, &instance.instance_id)
+                            && verify_mlkem_cert(c, &doc, now_unix).is_ok()
+                    })
                 },
                 |c| (c.cert_version, c.valid_from_unix),
             )
@@ -1115,6 +1116,11 @@ impl DhtMlKemEkResolver {
             candidates,
             |b| {
                 MlKemKeyCert::decode(b).ok().filter(|c| {
+                    if !cert_addresses_instance(c, &target_node_id, &instance_id) {
+                        *lock!(rejected) =
+                            Some("certificate addresses another node or instance".into());
+                        return false;
+                    }
                     match verify_mlkem_cert(c, &doc, now_unix) {
                         Ok(_) => true,
                         Err(e) => {
@@ -1308,9 +1314,10 @@ impl DhtMlKemEkResolver {
                 .dht_get_freshest(
                     cert_key,
                     |b| {
-                        MlKemKeyCert::decode(b)
-                            .ok()
-                            .filter(|c| verify_mlkem_cert(c, doc, now_unix).is_ok())
+                        MlKemKeyCert::decode(b).ok().filter(|c| {
+                            cert_addresses_instance(c, &target_node_id, &instance.instance_id)
+                                && verify_mlkem_cert(c, doc, now_unix).is_ok()
+                        })
                     },
                     |c| (c.cert_version, c.valid_from_unix),
                 )
@@ -1958,6 +1965,9 @@ impl DhtMlKemEkResolver {
             &instance.instance_id,
         ))?)
         .ok()?;
+        if !cert_addresses_instance(&cert, &target_node_id, &instance.instance_id) {
+            return None;
+        }
         let verified = verify_mlkem_cert(&cert, &doc, now_unix).ok()?;
         self.cache_verified(target_node_id, &verified);
         self.log_dbg("mlkem_resolver.cert.local_hit", &target_node_id, "");
@@ -2226,6 +2236,13 @@ static INSTANCE_WALKS_IN_FLIGHT: std::sync::atomic::AtomicUsize =
 /// rest of the codebase's log conventions).
 fn hex8(node_id: &[u8; 32]) -> String {
     veil_util::bytes_to_hex(&node_id[..4])
+}
+
+/// A valid signature authenticates a certificate, not the DHT slot that
+/// returned it. Bind candidates before freshness selection or mirror/cache
+/// publication so a newer sibling certificate cannot hide the requested one.
+fn cert_addresses_instance(cert: &MlKemKeyCert, node: &[u8; 32], instance: &[u8; 16]) -> bool {
+    cert.node_id == *node && cert.instance_id == *instance
 }
 
 /// Supersede order for two signed `InstanceRegistry` candidates of the same
@@ -3095,6 +3112,140 @@ mod tests {
             label: String::new(),
             last_seen_unix_ms: 0,
         }
+    }
+
+    struct CertSlotFixture {
+        resolver: DhtMlKemEkResolver,
+        doc: IdentityDocument,
+        correct: MlKemKeyCert,
+        wrong: MlKemKeyCert,
+        now: u64,
+    }
+
+    fn cert_slot_fixture() -> CertSlotFixture {
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let seed = 0x2b;
+        let mut s = crate::mlkem_cert_store::fixture::signer(seed);
+        let now = unix_now();
+        let sk = SigningKey::from_bytes(&[seed ^ 0xff; 32]);
+        s.doc.issued_at_unix = now - 60;
+        s.doc.valid_until_unix = now + 3600;
+        let mut msg = veil_proto::identity_document::DOC_SIG_CONTEXT.to_vec();
+        msg.extend_from_slice(&s.doc.canonical_signing_bytes());
+        s.doc.document_sig = sk.sign(&msg).to_bytes().to_vec();
+        IdentityDocument::decode(&s.doc.encode()).unwrap();
+        verify_identity_document(&s.doc, now).unwrap();
+        let correct = s.cert([0xab; 16], now - 60, now + 3600, 3);
+        let wrong = s.cert([0xcd; 16], now - 60, now + 3600, 99);
+        verify_mlkem_cert(&wrong, &s.doc, now).unwrap();
+        let mut registry = InstanceRegistry {
+            node_id: s.doc.node_id,
+            reg_version: 1,
+            signing_identity_key_idx: 0,
+            instances: vec![entry(correct.instance_id)],
+            sig: Vec::new(),
+        };
+        let mut msg = INSTANCE_REGISTRY_SIG_CONTEXT.to_vec();
+        msg.extend_from_slice(&registry.canonical_signing_bytes());
+        registry.sig = sk.sign(&msg).to_bytes().to_vec();
+        assert!(verify_instance_registry_sig(&registry, &s.doc));
+        let dht = Arc::new(KademliaService::new([1; 32]));
+        dht.store_local(IdentityDocument::dht_key(&s.doc.node_id), s.doc.encode());
+        dht.store_local(InstanceRegistry::dht_key(&s.doc.node_id), registry.encode());
+        // A valid, newer certificate belongs to a DIFFERENT canonical slot.
+        dht.store_local(
+            MlKemKeyCert::dht_key(&s.doc.node_id, &correct.instance_id),
+            wrong.encode(),
+        );
+        CertSlotFixture {
+            resolver: make_test_resolver(dht),
+            doc: s.doc,
+            correct,
+            wrong,
+            now,
+        }
+    }
+
+    #[tokio::test]
+    async fn node_cached_cert_rejects_another_instances_certificate() {
+        let f = cert_slot_fixture();
+        assert!(f.resolver.resolve_cert_cached(f.doc.node_id).is_none());
+        assert!(rlock!(f.resolver.cert_cache).is_empty());
+        assert!(rlock!(f.resolver.peer_mlkem_keys).is_empty());
+        assert!(rlock!(f.resolver.peer_ratchet_keys).is_empty());
+    }
+
+    #[tokio::test]
+    async fn node_walk_rejects_another_instances_certificate() {
+        let f = cert_slot_fixture();
+        assert!(
+            f.resolver
+                .fetch_verified_cert(f.doc.node_id)
+                .await
+                .is_none()
+        );
+        assert!(f.resolver.cert_store.is_empty());
+        assert!(rlock!(f.resolver.cert_cache).is_empty());
+    }
+
+    #[tokio::test]
+    async fn family_walk_rejects_another_instances_certificate() {
+        let f = cert_slot_fixture();
+        let resolved = f
+            .resolver
+            .certs_for_instances(
+                f.doc.node_id,
+                &f.doc,
+                &[entry(f.correct.instance_id)],
+                f.now,
+            )
+            .await;
+        assert!(resolved.certs.is_empty());
+        assert_eq!(resolved.unknown_devices, 1);
+        assert!(f.resolver.cert_store.is_empty());
+    }
+
+    #[tokio::test]
+    async fn instance_walk_selects_its_slot_before_comparing_versions() {
+        use veil_proto::routing::RecursiveQueryPayload;
+        let mut f = cert_slot_fixture();
+        let key = MlKemKeyCert::dht_key(&f.doc.node_id, &f.correct.instance_id);
+        f.resolver.dht.store_local(key, f.correct.encode());
+        let mut registry = SessionTxRegistry::new();
+        let mut rx = registry.register([0x91; 32]);
+        f.resolver.session_tx_registry = Arc::new(RwLock::new(registry));
+        let pending = f.resolver.pending_recursive.clone();
+        let dht = f.resolver.dht.clone();
+        let wrong = f.wrong.encode();
+        let responder = tokio::spawn(async move {
+            while let Some((_, frame)) = rx.recv().await {
+                let query =
+                    RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+                let bytes = if query.target_key == key {
+                    wrong.clone()
+                } else {
+                    dht.get_local(&query.target_key).unwrap_or_default()
+                };
+                if let Some(waiter) = lock!(pending).remove(&query.query_id) {
+                    let _ = waiter.tx.send(bytes);
+                }
+            }
+        });
+        let result = f
+            .resolver
+            .fetch_verified_cert_for_instance(f.doc.node_id, f.correct.instance_id)
+            .await;
+        responder.abort();
+        let _ = responder.await;
+        assert_eq!(result.unwrap().instance_id, f.correct.instance_id);
+        assert_eq!(f.resolver.dht.get_local(&key), Some(f.correct.encode()));
+        assert!(lock!(f.resolver.pending_recursive).is_empty());
+        assert!(matches!(
+            f.resolver
+                .cert_store
+                .recall(&f.doc.node_id, &f.wrong.instance_id, &f.doc, f.now),
+            CertRecall::Absent
+        ));
     }
 
     /// The measured production case, at the function the mailbox seal calls.
