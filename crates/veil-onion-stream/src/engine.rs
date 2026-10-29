@@ -311,6 +311,7 @@ struct TxState {
     ssthresh: u32,
     rwnd: u32,                    // peer-advertised receive window
     window_hint_probe_used: bool, // at most one DATA-hint probe per closed window
+    persist_probe: Option<PersistProbe>,
     dup_acks: u32,
     in_recovery: bool,
     recover: u32, // NewReno: snd_nxt at the moment loss was detected
@@ -409,6 +410,11 @@ struct TxState {
     rack_repairs: VecDeque<RackRepair>,
     /// Measured duplicate-feedback span above min RTT, capped at the current RTO when learned.
     rack_dsack_reo_ms: u32,
+}
+
+struct PersistProbe {
+    seq: u32,
+    replied: bool,
 }
 
 struct RttProbe {
@@ -542,6 +548,7 @@ impl StreamEngine {
                 ssthresh: cfg.init_ssthresh,
                 rwnd: cfg.mss as u32, // until the peer tells us, allow one segment
                 window_hint_probe_used: false,
+                persist_probe: None,
                 dup_acks: 0,
                 in_recovery: false,
                 recover: iss,
@@ -1087,6 +1094,7 @@ impl StreamEngine {
         // still carry window updates/dup-ACK evidence; old SACK information
         // below is also useful and must not be discarded with the old window.
         let window_changed = seq::geq(ack, self.tx.snd_una) && self.tx.rwnd != win;
+        let window_reopened = seq::geq(ack, self.tx.snd_una) && self.tx.rwnd == 0 && win > 0;
         if seq::geq(ack, self.tx.snd_una) {
             if self.cfg.bbr && (win == 0 || self.tx.rwnd == 0) {
                 // A closed receive window stops the source independently of
@@ -1148,6 +1156,24 @@ impl StreamEngine {
             }
         }
         let mss = self.cfg.mss as u32;
+        let probe_refused =
+            ack == self.tx.snd_una && self.tx.rwnd == 0 && self.tx.window_probe_handed_off();
+        if probe_refused {
+            // This is a live peer refusing send credit, NOT an ACK of the byte.
+            // Remember a response for this attempt without extending its timer.
+            self.tx.persist_probe.as_mut().unwrap().replied = true;
+            self.tx.consec_rto = 0;
+        } else if window_reopened
+            && ack == self.tx.snd_una
+            && self.tx.window_probe_handed_off()
+            && self.tx.persist_probe.as_ref().is_some_and(|p| p.replied)
+        {
+            // The byte was refused. Retry that same byte using normal repair
+            // pacing instead of sending a tail past the known hole or waiting
+            // for another full persist interval. No receipt credit is invented.
+            self.tx.segs.front_mut().unwrap().needs_resend = true;
+            self.tx.rto_deadline = Some(now.saturating_add(self.tx.rto_ms));
+        }
 
         if seq::gt(ack, self.tx.snd_una) {
             // ---- new data acknowledged ----
@@ -1216,6 +1242,14 @@ impl StreamEngine {
             }
             let acked = ack.wrapping_sub(self.tx.snd_una);
             self.tx.snd_una = ack;
+            if self
+                .tx
+                .persist_probe
+                .as_ref()
+                .is_some_and(|p| seq::gt(ack, p.seq))
+            {
+                self.tx.persist_probe = None;
+            }
             self.tx.trim_rewound_pending_after_ack(ack);
             let fin_delivered = u32::from(!fin_was_acked && self.tx.fin_acked);
             newly_delivered += acked
@@ -1278,6 +1312,7 @@ impl StreamEngine {
                 self.tx.refresh_local_rto(now);
             }
         } else if ack == self.tx.snd_una
+            && !probe_refused
             // A reader freeing buffer space reports flow control, not loss.
             // Keep genuine dup-ACK evidence (unchanged window), and fresh SACK
             // receipts even when that same ACK also changes the window.
@@ -1483,6 +1518,14 @@ impl StreamEngine {
                 }
                 self.tx.segs[idx].retransmitted = true;
                 self.tx.segs[idx].sent_ms = now;
+                if let Some(probe) = self.tx.persist_probe.as_mut()
+                    && probe.seq == self.tx.segs[idx].seq
+                {
+                    probe.replied = false;
+                    if !self.track_local_handoffs {
+                        self.tx.rto_deadline = Some(now.saturating_add(self.tx.rto_ms));
+                    }
+                }
                 self.tx.segs[idx].local_pending = self.track_local_handoffs;
                 if self.track_local_handoffs {
                     self.tx.refresh_local_rto(now);
@@ -1574,6 +1617,19 @@ impl StreamEngine {
             self.force_probe = false;
             let data: Vec<u8> = self.tx.pending.drain(..take).collect();
             let seq_no = self.tx.snd_nxt;
+            if probe && self.tx.rwnd == 0 {
+                self.tx.persist_probe = Some(PersistProbe {
+                    seq: seq_no,
+                    replied: false,
+                });
+            } else if self
+                .tx
+                .persist_probe
+                .as_ref()
+                .is_some_and(|p| p.seq == seq_no)
+            {
+                self.tx.persist_probe = None;
+            }
             self.tx.snd_nxt = self.tx.snd_nxt.wrapping_add(take as u32);
             self.tx.segs.push_back(Seg {
                 seq: seq_no,
@@ -1942,6 +1998,18 @@ impl StreamEngine {
             self.tx.rto_deadline = None;
         } else if let Some(dl) = self.tx.rto_deadline
             && now >= dl
+            && self.tx.rwnd == 0
+            && self.tx.window_probe_handed_off()
+            && self.tx.persist_probe.as_ref().is_some_and(|p| p.replied)
+        {
+            // A zero-window reply kept the peer alive but did not ACK the
+            // probe. Repeat only that byte at the existing RTO cadence, without
+            // a loss event, cwnd cut or retry-budget charge. A silent attempt
+            // still enters the ordinary bounded loss path below.
+            self.tx.segs.front_mut().unwrap().needs_resend = true;
+            self.tx.rto_deadline = None; // armed by poll/handoff of the retry
+        } else if let Some(dl) = self.tx.rto_deadline
+            && now >= dl
             && !self.tx.segs.is_empty()
         {
             self.tx.consec_rto += 1;
@@ -2269,6 +2337,21 @@ fn bbr_probe_window(cfg: &Config) -> u32 {
 }
 
 impl TxState {
+    fn window_probe_handed_off(&self) -> bool {
+        self.persist_probe.as_ref().is_some_and(|probe| {
+            probe.seq == self.snd_una
+                && self.segs.len() == 1
+                && self.segs.front().is_some_and(|s| {
+                    s.seq == probe.seq
+                        && !s.is_fin
+                        && s.data.len() == 1
+                        && s.handed_off
+                        && !s.local_pending
+                        && !s.sacked
+                })
+        })
+    }
+
     /// Keep only recent, actually handed-off repairs as evidence for D-SACK.
     /// A queued candidate is not evidence until local_handoff accepts it.
     fn record_rack_repair(
@@ -4271,6 +4354,53 @@ mod tests {
             assert_eq!(e.tx.rwnd, 4096);
             assert_eq!(e.tx.bw_samples, seed_samples);
         }
+    }
+
+    #[test]
+    fn persist_reply_requires_the_current_attempts_local_handoff() {
+        let cfg = Config {
+            mss: 16,
+            init_rto_ms: 50,
+            min_rto_ms: 50,
+            max_rto_ms: 400,
+            ..Config::default()
+        };
+        let mut e = StreamEngine::connect(7, cfg, 0, 100);
+        e.track_local_handoffs();
+        let mut cell = Vec::new();
+        assert!(e.poll_transmit(0, &mut cell)); // SYN actually left before its answer
+        let syn = LocalTransmit::from_cell(&cell).unwrap();
+        e.local_handoff(&HashMap::from([(syn, 1)]), 0);
+        e.on_synack(500, 32, 101, 0);
+        e.on_ack(101, 0, &SackVec::new(), 1);
+        e.write(&[2; 16]);
+        assert!(e.poll_transmit(1, &mut cell)); // handshake ACK
+        assert!(!e.poll_transmit(1, &mut cell));
+        let at = e.next_timeout().unwrap();
+        e.on_timeout(at);
+        assert!(e.poll_transmit(at, &mut cell));
+        let token = LocalTransmit::from_cell(&cell).unwrap();
+        e.on_ack(101, 0, &SackVec::new(), at + 1);
+        assert!(!e.tx.persist_probe.as_ref().unwrap().replied);
+        let accepted = HashMap::from([(token, 1)]);
+        e.local_handoff(&accepted, at + 2);
+        assert!(!e.poll_transmit(at + 2, &mut cell)); // driver drains polls; clears stale persist tick
+        e.on_ack(101, 0, &SackVec::new(), at + 3);
+        assert!(e.tx.persist_probe.as_ref().unwrap().replied);
+
+        let due = e.next_timeout().unwrap();
+        e.on_timeout(due);
+        assert!(e.poll_transmit(due, &mut cell));
+        assert!(!e.tx.persist_probe.as_ref().unwrap().replied);
+        e.on_ack(101, 0, &SackVec::new(), due + 1);
+        assert!(
+            !e.tx.persist_probe.as_ref().unwrap().replied,
+            "old reply covered a locally blocked retry"
+        );
+        e.local_handoff(&accepted, due + 2);
+        e.on_ack(101, 0, &SackVec::new(), due + 3);
+        assert!(e.tx.persist_probe.as_ref().unwrap().replied);
+        assert_eq!(e.tx.snd_una, 101);
     }
 
     #[test]
