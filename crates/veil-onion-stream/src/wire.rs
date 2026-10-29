@@ -130,6 +130,9 @@ pub enum Frame<'a> {
     },
     /// Stream data: `seq` = byte offset of `payload[0]`; `win` = sender's current
     /// receive window (piggy-backed for the reverse direction).
+    /// Kept on v1 wire for compatibility. The engine uses handshake/ACK windows
+    /// instead: DATA has no reverse cumulative ACK to order this value against
+    /// a newer ACK received over another circuit.
     Data {
         stream_id: u32,
         seq: u32,

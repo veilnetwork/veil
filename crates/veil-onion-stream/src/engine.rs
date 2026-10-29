@@ -309,7 +309,8 @@ struct TxState {
     segs: VecDeque<Seg>,   // sent, unacked, in seq order
     cwnd: u32,
     ssthresh: u32,
-    rwnd: u32, // peer-advertised receive window
+    rwnd: u32,                    // peer-advertised receive window
+    window_hint_probe_used: bool, // at most one DATA-hint probe per closed window
     dup_acks: u32,
     in_recovery: bool,
     recover: u32, // NewReno: snd_nxt at the moment loss was detected
@@ -436,7 +437,8 @@ const MAX_INFLIGHT_BYTES: u32 = (1 << 31) - 1;
 
 struct RxState {
     rcv_nxt: u32,
-    window: u32, // configured buffer size (bytes)
+    window: u32,          // configured buffer size (bytes)
+    last_ack_window: u32, // free space advertised by our latest ACK
     read_buf: VecDeque<u8>,
     oo: BTreeMap<u32, Vec<u8>>, // out-of-order, keyed by seq (kept non-overlapping)
     oo_bytes: usize,
@@ -539,6 +541,7 @@ impl StreamEngine {
                 cwnd: init_cwnd,
                 ssthresh: cfg.init_ssthresh,
                 rwnd: cfg.mss as u32, // until the peer tells us, allow one segment
+                window_hint_probe_used: false,
                 dup_acks: 0,
                 in_recovery: false,
                 recover: iss,
@@ -600,6 +603,7 @@ impl StreamEngine {
             rx: RxState {
                 rcv_nxt: 0,
                 window: cfg.recv_window,
+                last_ack_window: cfg.recv_window,
                 read_buf: VecDeque::new(),
                 oo: BTreeMap::new(),
                 oo_bytes: 0,
@@ -759,6 +763,23 @@ impl StreamEngine {
         let n = buf.len().min(self.rx.read_buf.len());
         for slot in buf.iter_mut().take(n) {
             *slot = self.rx.read_buf.pop_front().unwrap();
+        }
+        // A stopped reader can close (or nearly close) the peer's send window.
+        // Once it resumes, no incoming DATA is guaranteed to elicit another ACK:
+        // notify the peer without waiting for its persist timer. Coalesce small
+        // reads until an MSS or half the buffer is free again, and only notify
+        // for a previously small window. An ample window already lets DATA/ACKs
+        // progress; extra window-only ACKs there needlessly perturb ACK timing.
+        // poll_ack encodes the latest space, not one update per read. DATA's window has
+        // no ACK sequence and cannot safely substitute for this notification.
+        let threshold = (self.rx.window / 2).max(1).min(self.cfg.mss.max(1) as u32);
+        if n > 0
+            && self.phase == Phase::Established
+            && !self.rx.eof
+            && self.rx.last_ack_window <= threshold
+            && self.rx.advertised().saturating_sub(self.rx.last_ack_window) >= threshold
+        {
+            self.ack_now();
         }
         n
     }
@@ -987,7 +1008,12 @@ impl StreamEngine {
             return;
         }
         self.note_peer_progress();
-        self.tx.rwnd = win; // piggy-backed reverse-direction window
+        // v1 DATA carries the reverse receive window, but no cumulative ACK
+        // for OUR bytes. Its own sequence cannot order it against an ACK on
+        // another circuit: even first-seen/in-order DATA can predate a newer
+        // window update. Only handshake/validated ACKs control our send window.
+        // Keep encoding the field for older peers; payload and SACK/dup evidence
+        // are processed normally, including when DATA was delayed or repeated.
         if payload.is_empty() {
             return;
         }
@@ -1011,6 +1037,15 @@ impl StreamEngine {
             self.recent_sack_seq = Some(seg_seq);
         }
         self.ack_data(advanced, now);
+        // Older receivers do not ACK app reads. Their piggyback can hint that
+        // space reopened, but cannot grant send credit. Solicit a fresh ACK
+        // with the existing one-byte persist probe, at most once until a
+        // validated nonzero ACK reopens the window. Repeated/stale DATA cannot
+        // create a stream of probes or release a full flight past a zero window.
+        if win > 0 && self.zero_window_blocked() && !self.tx.window_hint_probe_used {
+            self.tx.window_hint_probe_used = true;
+            self.force_probe = true;
+        }
     }
 
     fn on_peer_fin(&mut self, fin_seq: u32, now: u64) {
@@ -1051,8 +1086,13 @@ impl StreamEngine {
         // zero, which would stall new DATA until a persist probe). Equal ACKs
         // still carry window updates/dup-ACK evidence; old SACK information
         // below is also useful and must not be discarded with the old window.
+        let window_changed = seq::geq(ack, self.tx.snd_una) && self.tx.rwnd != win;
         if seq::geq(ack, self.tx.snd_una) {
             self.tx.rwnd = win;
+            if win > 0 {
+                self.tx.window_hint_probe_used = false;
+                self.force_probe = false;
+            }
         }
         // ACK fields are simultaneous evidence, not sequential network arrivals.
         let prior_rack_frontier = self.tx.rack_xmit_ms;
@@ -1229,6 +1269,10 @@ impl StreamEngine {
                 self.tx.refresh_local_rto(now);
             }
         } else if ack == self.tx.snd_una
+            // A reader freeing buffer space reports flow control, not loss.
+            // Keep genuine dup-ACK evidence (unchanged window), and fresh SACK
+            // receipts even when that same ACK also changes the window.
+            && (!window_changed || newly_delivered > 0)
             && !self.tx.segs.is_empty()
             && (!self.track_local_handoffs
                 || self
@@ -1814,10 +1858,11 @@ impl StreamEngine {
                 break;
             }
         }
+        self.rx.last_ack_window = self.rx.advertised();
         Frame::Ack {
             stream_id: self.stream_id,
             ack: self.rx.rcv_nxt,
-            win: self.rx.advertised(),
+            win: self.rx.last_ack_window,
             sacks,
         }
     }
