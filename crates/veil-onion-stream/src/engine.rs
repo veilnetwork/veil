@@ -119,6 +119,10 @@ pub struct Config {
     pub warm_rtt_min_ms: u32,
     /// Optional driver-side diagnostic dump period. 0 disables it.
     pub debug_summary_ms: u64,
+    /// Retain the completed driver's return route to re-ACK duplicate DATA/FIN
+    /// after a lost final ACK, capped at two maximum RTOs. Zero opts out.
+    /// This never delays application EOF.
+    pub close_linger_ms: u64,
     /// RACK-style time-threshold loss detection (RFC 8985 shape). Replaces the
     /// SACK-count (`IsLost`, 3 SACKed-above) and 3-dup-ACK triggers: a segment
     /// is marked lost only when one sent LATER was delivered AND the segment's
@@ -157,6 +161,7 @@ impl Default for Config {
             warm_btl_bw: 0,
             warm_rtt_min_ms: 0,
             debug_summary_ms: 0,
+            close_linger_ms: 0,
             rack: false,
             rack_reo_floor_ms: 0,
         }
@@ -775,6 +780,30 @@ impl StreamEngine {
         self.tx.pending.is_empty()
             && self.tx.segs.is_empty()
             && (!self.tx.fin_requested || self.tx.fin_acked)
+    }
+    /// Small immutable close witness; release engine buffers before lingering.
+    pub(crate) fn completed_close_ack(&self) -> Option<(u64, Vec<u8>)> {
+        if self.cfg.close_linger_ms == 0
+            || self.phase != Phase::Established
+            || !self.tx.fin_requested
+            || !self.tx.fin_acked
+            || !self.is_send_complete()
+            || !self.is_eof()
+        {
+            return None;
+        }
+        Some((
+            self.cfg
+                .close_linger_ms
+                .min(self.cfg.max_rto_ms.saturating_mul(2)),
+            Frame::Ack {
+                stream_id: self.stream_id,
+                ack: self.rx.rcv_nxt,
+                win: 0,
+                sacks: SackVec::new(),
+            }
+            .encode(),
+        ))
     }
     /// Bound a final locally queued ACK by the existing retry policy, even
     /// though both DATA directions have finished and no network RTO remains.
