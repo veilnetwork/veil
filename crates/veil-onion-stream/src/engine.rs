@@ -2185,17 +2185,21 @@ impl StreamEngine {
     /// are represented by a small batch on a 1 ms tick; slower rates use one
     /// segment every N milliseconds.
     fn pace_params(&self) -> (u64, u32) {
-        let Some(srtt) = self.tx.srtt else {
-            return (0, u32::MAX);
-        };
         // BBR-lite: once the delivery model is warm, pace at 5/4 of the
         // measured bottleneck rate — enough overdrive to keep probing for
         // more bandwidth while the 2xBDP window cap bounds the standing
         // queue. Window/srtt pacing below would chase its own queueing delay
         // (srtt inflates -> rate holds at the same self-built queue).
-        if self.cfg.bbr && self.tx.btl_bw > 0 && self.tx.rtt_min.is_some() {
+        // A cached bandwidth seed already supplies the rate before the first
+        // live DATA RTT. Pacing itself needs no RTT: waiting for srtt here
+        // released the entire initial window as an unpaced warm-start burst.
+        // The independent BDP window cap still waits for a usable RTT.
+        if self.cfg.bbr && self.tx.btl_bw > 0 {
             return bbr_pacing_params(&self.cfg, self.tx.btl_bw, self.tx.bbr_startup);
         }
+        let Some(srtt) = self.tx.srtt else {
+            return (0, u32::MAX);
+        };
         // Spread the EFFECTIVE window (min of cwnd and the peer's rwnd) across one
         // RTT — never cwnd alone. When cwnd has run far past a smaller rwnd, pacing
         // off cwnd would send much faster than the window can ever drain, rebuilding
@@ -4583,6 +4587,72 @@ mod tests {
         // Without estimates the cap must vanish (startup behaves classically).
         e.tx.btl_bw = 0;
         assert_eq!(e.effective_send_window(), e.tx.cwnd.min(e.tx.rwnd));
+    }
+
+    #[test]
+    fn warm_bandwidth_paces_before_the_first_data_rtt() {
+        for first_data_ms in [0, 4000] {
+            assert_warm_first_tick(200, first_data_ms);
+        }
+    }
+
+    #[test]
+    fn warm_bandwidth_paces_even_without_a_cached_rtt() {
+        for first_data_ms in [0, 4000] {
+            assert_warm_first_tick(0, first_data_ms);
+        }
+    }
+
+    fn assert_warm_first_tick(warm_rtt_min_ms: u32, first_data_ms: u64) {
+        let cfg = Config {
+            bbr: true,
+            mss: 1000,
+            init_cwnd: 64_000,
+            recv_window: 1 << 20,
+            warm_btl_bw: 100_000,
+            warm_rtt_min_ms,
+            max_pacing_batch: 4,
+            ..Config::default()
+        };
+        let mut e = StreamEngine::connect(7, cfg, 0, 100);
+        let mut wire = Vec::new();
+        assert!(e.poll_transmit(0, &mut wire));
+        assert!(matches!(Frame::decode(&wire), Some(Frame::Syn { .. })));
+        Frame::SynAck {
+            stream_id: 7,
+            isn: 500,
+            win: cfg.recv_window,
+            ack: 101,
+        }
+        .encode_into(&mut wire);
+        e.on_cell(&wire, 0);
+        assert_eq!(e.phase, Phase::Established);
+        assert!(e.poll_ack(&mut wire));
+        e.write(&vec![0x5a; 128_000]);
+        assert_eq!(e.tx.srtt, None, "no live DATA RTT has arrived");
+        let mut emitted = 0;
+        while e.poll_transmit(first_data_ms, &mut wire) {
+            assert!(matches!(Frame::decode(&wire), Some(Frame::Data { .. })));
+            emitted += 1;
+        }
+        // STARTUP's 2 x 100 KB/s releases four 1000-byte segments per 20 ms,
+        // including the first tick. It must not release the whole 60/64 KB
+        // window just because no original DATA has been acknowledged yet.
+        // Late-wake catch-up is also capped by max_pacing_batch, here four.
+        assert_eq!(emitted, 4);
+        assert!(!e.poll_transmit(first_data_ms + 1, &mut wire));
+        e.ack_pending = true;
+        assert!(e.poll_transmit(first_data_ms + 1, &mut wire));
+        assert!(matches!(Frame::decode(&wire), Some(Frame::Ack { .. })));
+        assert!(!e.poll_transmit(first_data_ms + 1, &mut wire));
+        assert_eq!(e.next_timeout(), Some(first_data_ms + 20));
+        emitted = 0;
+        while e.poll_transmit(first_data_ms + 20, &mut wire) {
+            assert!(matches!(Frame::decode(&wire), Some(Frame::Data { .. })));
+            emitted += 1;
+        }
+        assert_eq!(emitted, 4);
+        assert_eq!(e.tx.srtt, None);
     }
 
     #[test]
