@@ -5031,10 +5031,12 @@ async fn open_outbound_circuit(
     producer_owner: Option<Arc<ProducerCircuitOwner>>,
 ) -> Result<usize, String> {
     let desired_pool_target = pool_target.clamp(1, MAX_CIRCUIT_OUTBOUND_POOL);
+    let resolve_started = Instant::now();
     let mut ads = services
         .resolve_stream_rendezvous_ads(dst_node)
         .await
         .map_err(|e| format!("resolve receiver ads: {e:?}"))?;
+    let resolve_ms = resolve_started.elapsed().as_millis();
     let resolved_ads = ads.len();
     // The receiver's plain ad space carries two classes: MAILBOX ads under the
     // node_id-derived cookie the rendezvous-recipient task publishes, and the
@@ -5120,7 +5122,7 @@ async fn open_outbound_circuit(
     diag_node(
         &me,
         &format!(
-            "outbound stream rendezvous filter for {} stream_ads={} ads {}->{} fresh={}->{} max_valid_from={}",
+            "outbound stream rendezvous filter for {} stream_ads={} ads {}->{} fresh={}->{} max_valid_from={} resolve_ms={resolve_ms}",
             short_node(&dst_node),
             before_fresh_filter,
             resolved_ads,
@@ -5383,7 +5385,12 @@ async fn open_outbound_circuit(
             ),
             None => None,
         };
-        if !confirm_circuit_with_probe(&services, &candidate, &registration.cookie).await {
+        let circuit_open_ms = started.elapsed().as_millis();
+        let confirm_started = Instant::now();
+        let confirmed =
+            confirm_circuit_with_probe(&services, &candidate, &registration.cookie).await;
+        let confirm_ms = confirm_started.elapsed().as_millis();
+        if !confirmed {
             last_err = format!(
                 "R={} confirmation timed out after {}ms (no ACK, no probe echo)",
                 short_node(&ad.rendezvous_node_id),
@@ -5467,6 +5474,7 @@ async fn open_outbound_circuit(
             stats: Arc::new(CircuitRouteStats::new(now)),
         });
         // Make a confirmed prefix usable before waiting on slower candidates.
+        let publish_started = Instant::now();
         kept_in_flight = publish_outbound_candidates(
             &services,
             dst_node,
@@ -5479,16 +5487,17 @@ async fn open_outbound_circuit(
             },
         )
         .await;
+        let publish_ms = publish_started.elapsed().as_millis();
         published_count = opened_entries.len();
         mark_circuit_activity(&activity);
         diag_node(
             &me,
             &format!(
-                "outbound circuit ready for {} via R={} path={} open_confirm={}ms",
+                "outbound circuit ready for {} via R={} path={} open_confirm={}ms circuit_open_ms={circuit_open_ms} confirm_ms={confirm_ms} publish_ms={publish_ms}",
                 short_node(&dst_node),
                 short_node(&ad.rendezvous_node_id),
                 short_path(candidate.relay_path()),
-                started.elapsed().as_millis()
+                started.elapsed().as_millis(),
             ),
         );
     }
