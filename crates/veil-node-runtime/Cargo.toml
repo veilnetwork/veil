@@ -113,5 +113,8 @@ url = "2.5"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 zeroize = "1"
 
+[dev-dependencies]
+tokio = { version = "1.42", features = ["test-util"] }
+
 [lints]
 workspace = true
