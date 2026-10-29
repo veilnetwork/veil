@@ -64,6 +64,12 @@ use crate::mlkem_cert_store::{CertRecall, MlKemCertStore};
 /// at ~9 sec in the worst case.
 const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Independent instance slots may wait on silent replicas. Walk a bounded
+/// number together so a full 16-instance registry needs four certificate
+/// windows rather than sixteen, without changing any replica's freshness
+/// window or the global pending-query cap.
+const MAX_CONCURRENT_CERT_WALKS: usize = 4;
+
 /// TTL for the verified-cert fast-path cache. A recipient's ML-KEM EK changes
 /// rarely: on a new instance (fresh install / identity reset), or on the
 /// recipient's scheduled mailbox-key rotation, which defaults to once every
@@ -1304,24 +1310,37 @@ impl DhtMlKemEkResolver {
         instances: &[veil_proto::instance_registry::InstanceEntry],
         now_unix: u64,
     ) -> ResolvedCerts {
+        use futures::StreamExt;
+
         let mut out = ResolvedCerts {
             certs: Vec::with_capacity(instances.len()),
             ..ResolvedCerts::default()
         };
-        for instance in instances {
-            let cert_key = MlKemKeyCert::dht_key(&target_node_id, &instance.instance_id);
-            let fetched = self
-                .dht_get_freshest(
-                    cert_key,
-                    |b| {
-                        MlKemKeyCert::decode(b).ok().filter(|c| {
-                            cert_addresses_instance(c, &target_node_id, &instance.instance_id)
-                                && verify_mlkem_cert(c, doc, now_unix).is_ok()
-                        })
-                    },
-                    |c| (c.cert_version, c.valid_from_unix),
-                )
-                .await;
+        // Keep registry order in the result while overlapping independent
+        // network waits. No spawned tail: dropping this stream cancels every
+        // active walk and its PendingQueries guard cleans up only its IDs.
+        let mut lookups = futures::stream::iter(0..instances.len())
+            .map(|index| {
+                let instance_id = instances[index].instance_id;
+                async move {
+                    let cert_key = MlKemKeyCert::dht_key(&target_node_id, &instance_id);
+                    let fetched = self
+                        .dht_get_freshest(
+                            cert_key,
+                            |b| {
+                                MlKemKeyCert::decode(b).ok().filter(|c| {
+                                    cert_addresses_instance(c, &target_node_id, &instance_id)
+                                        && verify_mlkem_cert(c, doc, now_unix).is_ok()
+                                })
+                            },
+                            |c| (c.cert_version, c.valid_from_unix),
+                        )
+                        .await;
+                    (instance_id, fetched)
+                }
+            })
+            .buffered(MAX_CONCURRENT_CERT_WALKS);
+        while let Some((instance_id, fetched)) = lookups.next().await {
             match fetched
                 .as_ref()
                 .map(|c| (c, verify_mlkem_cert(c, doc, now_unix)))
@@ -1345,7 +1364,7 @@ impl DhtMlKemEkResolver {
             // is OFF, not an error — and it used to end the seal. A device
             // whose cert we have held since it was last online is still sealable
             // for as long as that certificate's own signed window says so.
-            match self.recall_cert(target_node_id, instance.instance_id, doc, now_unix) {
+            match self.recall_cert(target_node_id, instance_id, doc, now_unix) {
                 CertRecall::Verified(cert) => out.certs.push(*cert),
                 CertRecall::Expired { .. } => out.expired_devices += 1,
                 CertRecall::Absent => out.unknown_devices += 1,
@@ -3111,6 +3130,167 @@ mod tests {
             bound_identity_key_idx: 0,
             label: String::new(),
             last_seen_unix_ms: 0,
+        }
+    }
+
+    // FuturesUnordered may cooperatively self-wake before polling every new
+    // child. Drive those scheduled polls to quiescence before inspecting the
+    // queues; one manual poll is not an executor turn.
+    fn poll_family_to_stall<F: std::future::Future>(
+        mut future: std::pin::Pin<&mut F>,
+    ) -> std::task::Poll<F::Output> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Wake(AtomicBool);
+        impl futures::task::ArcWake for Wake {
+            fn wake_by_ref(this: &Arc<Self>) {
+                this.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let wake = Arc::new(Wake(AtomicBool::new(false)));
+        let waker = futures::task::waker(Arc::clone(&wake));
+        let mut cx = std::task::Context::from_waker(&waker);
+        loop {
+            wake.0.store(false, Ordering::SeqCst);
+            let result = future.as_mut().poll(&mut cx);
+            if result.is_ready() || !wake.0.load(Ordering::SeqCst) {
+                return result;
+            }
+        }
+    }
+
+    fn family_walk_fixture(
+        count: u8,
+    ) -> (
+        DhtMlKemEkResolver,
+        IdentityDocument,
+        Vec<veil_proto::instance_registry::InstanceEntry>,
+        Vec<MlKemKeyCert>,
+    ) {
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let signer = current_cert_signer(0x2c);
+        let now = unix_now();
+        let instances: Vec<_> = (1..=count).map(|i| entry([i; 16])).collect();
+        let certs: Vec<_> = instances
+            .iter()
+            .map(|i| signer.cert(i.instance_id, now - 60, now + 1800, 2))
+            .collect();
+        let mut registry = InstanceRegistry {
+            node_id: signer.doc.node_id,
+            reg_version: 1,
+            signing_identity_key_idx: 0,
+            instances: instances.clone(),
+            sig: Vec::new(),
+        };
+        let mut msg = INSTANCE_REGISTRY_SIG_CONTEXT.to_vec();
+        msg.extend_from_slice(&registry.canonical_signing_bytes());
+        registry.sig = SigningKey::from_bytes(&[0x2c ^ 0xff; 32])
+            .sign(&msg)
+            .to_bytes()
+            .to_vec();
+        assert!(verify_instance_registry_sig(&registry, &signer.doc));
+        let dht = Arc::new(KademliaService::new([1; 32]));
+        dht.store_local(
+            IdentityDocument::dht_key(&signer.doc.node_id),
+            signer.doc.encode(),
+        );
+        dht.store_local(
+            InstanceRegistry::dht_key(&signer.doc.node_id),
+            registry.encode(),
+        );
+        for instance in &instances {
+            let old = signer.cert(instance.instance_id, now - 60, now + 1800, 1);
+            dht.store_local(
+                MlKemKeyCert::dht_key(&signer.doc.node_id, &instance.instance_id),
+                old.encode(),
+            );
+        }
+        (make_test_resolver(dht), signer.doc, instances, certs)
+    }
+
+    #[tokio::test]
+    async fn family_walk_overlaps_bounded_requests_and_keeps_registry_order() {
+        let (resolver, doc, instances, certs) = family_walk_fixture(6);
+        let mut rx = wlock!(resolver.session_tx_registry).register([0x91; 32]);
+        let mut lookup =
+            Box::pin(resolver.certs_for_instances(doc.node_id, &doc, &instances, unix_now()));
+        for batch_size in [4, 2] {
+            assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+            let queries: Vec<_> = (0..batch_size)
+                .map(|_| {
+                    let (_, frame) = rx.try_recv().expect("independent slots must overlap");
+                    RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap()
+                })
+                .collect();
+            assert!(rx.try_recv().is_err(), "family lookup must remain bounded");
+            assert_eq!(lock!(resolver.pending_recursive).len(), batch_size);
+            // A later slot answers first. The final vector must still follow
+            // the registry, and each remote v2 must beat its local v1.
+            for query in queries.into_iter().rev() {
+                let cert = certs
+                    .iter()
+                    .find(|c| {
+                        MlKemKeyCert::dht_key(&doc.node_id, &c.instance_id) == query.target_key
+                    })
+                    .unwrap();
+                lock!(resolver.pending_recursive)
+                    .remove(&query.query_id)
+                    .unwrap()
+                    .tx
+                    .send(cert.encode())
+                    .unwrap();
+            }
+        }
+        let got = lookup.await;
+        assert_eq!(got.unknown_devices, 0);
+        assert_eq!(got.expired_devices, 0);
+        assert_eq!(got.certs.len(), instances.len());
+        for (actual, expected) in got.certs.iter().zip(&certs) {
+            assert_eq!(actual.instance_id, expected.instance_id);
+            assert_eq!(actual.cert_version, 2);
+            let key = MlKemKeyCert::dht_key(&doc.node_id, &expected.instance_id);
+            assert_eq!(resolver.dht.get_local(&key), Some(expected.encode()));
+        }
+        assert!(lock!(resolver.pending_recursive).is_empty());
+    }
+
+    #[tokio::test]
+    async fn family_walk_cancellation_releases_every_pending_slot() {
+        let (resolver, doc, instances, _) = family_walk_fixture(6);
+        let _rx = wlock!(resolver.session_tx_registry).register([0x91; 32]);
+        let mut lookup =
+            Box::pin(resolver.certs_for_instances(doc.node_id, &doc, &instances, unix_now()));
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        assert_eq!(lock!(resolver.pending_recursive).len(), 4);
+        drop(lookup);
+        assert!(lock!(resolver.pending_recursive).is_empty());
+        assert!(resolver.cert_store.is_empty());
+    }
+
+    // This is the ordinary IPC family's existing 30-second source budget,
+    // measured with a paused clock, not a wall-clock performance threshold.
+    // A reachable holder stays silent even though all signed values exist
+    // locally: freshest-wins must still give that replica its normal window.
+    #[tokio::test(start_paused = true)]
+    async fn family_walk_silent_replica_fits_the_ordinary_source_budget() {
+        let count = veil_proto::instance_registry::MAX_INSTANCES as u8;
+        let (resolver, doc, instances, _) = family_walk_fixture(count);
+        let _rx = wlock!(resolver.session_tx_registry).register([0x91; 32]);
+        let start = tokio::time::Instant::now();
+        let got = tokio::time::timeout(
+            Duration::from_secs(30),
+            resolver.fetch_verified_certs(doc.node_id),
+        )
+        .await;
+        assert!(lock!(resolver.pending_recursive).is_empty());
+        let got = got.expect("valid family must resolve before the source budget is spent");
+        assert_eq!(got.certs.len(), instances.len());
+        assert_eq!(got.unknown_devices, 0);
+        assert_eq!(got.expired_devices, 0);
+        // Two metadata windows + four waves of four certificate windows.
+        assert_eq!(start.elapsed(), Duration::from_secs(18));
+        for (cert, instance) in got.certs.iter().zip(instances) {
+            assert_eq!(cert.instance_id, instance.instance_id);
+            assert_eq!(cert.cert_version, 1);
         }
     }
 
