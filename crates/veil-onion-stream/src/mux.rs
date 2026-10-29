@@ -97,6 +97,12 @@ pub trait CellSender: Send + Sync + 'static {
         let _ = (dst, stream_id, consec_rto, snd_una);
         std::future::ready(())
     }
+    /// Both byte directions finished. Release data admission while the driver
+    /// retains its route for the bounded final-ACK responder.
+    fn on_stream_linger(&self, dst: Addr, stream_id: u32) -> impl Future<Output = ()> + Send {
+        let _ = (dst, stream_id);
+        std::future::ready(())
+    }
     fn on_stream_closed(
         &self,
         dst: Addr,
@@ -250,6 +256,9 @@ impl<S: CellSender> CellDuplex for MuxDuplex<S> {
         self.sender
             .on_stream_data_rto_with_demand(self.peer, stream_id, consec_rto, snd_una, app_limited)
             .await;
+    }
+    async fn on_stream_linger(&mut self, stream_id: u32) {
+        self.sender.on_stream_linger(self.peer, stream_id).await;
     }
     async fn on_stream_closed(&mut self, stream_id: u32, end: End) {
         self.sender
@@ -809,6 +818,42 @@ mod tests {
             routes.lock().unwrap().get(&key).is_none(),
             "the duplex left its own route behind"
         );
+    }
+
+    #[tokio::test]
+    async fn linger_forwards_data_completion_without_removing_the_receive_route() {
+        struct Events(Arc<Mutex<Vec<(Addr, u32)>>>);
+        impl CellSender for Events {
+            async fn send(&self, _dst: Addr, _cell: Vec<u8>) -> io::Result<()> {
+                Ok(())
+            }
+            async fn on_stream_linger(&self, dst: Addr, stream_id: u32) {
+                self.0.lock().unwrap().push((dst, stream_id));
+            }
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let peer = Addr {
+            node: [4; 32],
+            app: [0; 32],
+        };
+        let key = (peer.node, 5);
+        let (tx, rx) = mpsc::channel(1);
+        routes.lock().unwrap().insert(key, tx.clone());
+        let mut duplex = MuxDuplex {
+            sender: Arc::new(Events(events.clone())),
+            peer,
+            key,
+            routes: routes.clone(),
+            bw_cache: Arc::new(Mutex::new(HashMap::new())),
+            inbound_rx: rx,
+            route_tx: tx,
+        };
+        duplex.on_stream_linger(5).await;
+        assert_eq!(*events.lock().unwrap(), vec![(peer, 5)]);
+        assert!(routes.lock().unwrap().contains_key(&key));
+        drop(duplex);
+        assert!(!routes.lock().unwrap().contains_key(&key));
     }
 
     #[test]
