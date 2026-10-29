@@ -590,6 +590,15 @@ struct FamilyRelayResult {
     accepted: bool,
     source_failed: bool,
     host_failed: bool,
+    timing: FamilySendTiming,
+}
+
+#[derive(Clone, Copy, Default)]
+struct FamilySendTiming {
+    resolve_ms: u128,
+    seal_ms: u128,
+    admission_ms: u128,
+    certificates: usize,
 }
 
 /// One ordinary reliable copy, or the existing control copies, per verified
@@ -623,12 +632,16 @@ async fn send_family_relay_copies(
     let mut any_sent = false;
     let mut source_failed = false;
     let mut host_failed = false;
+    let mut timing = FamilySendTiming::default();
+    let resolve_started = std::time::Instant::now();
     let family = tokio::time::timeout_at(
         family_deadline,
         resolver.resolve_device_certs(send.dst_node_id),
     )
     .await
     .unwrap_or_else(|_| resolver.resolve_device_certs_cached(send.dst_node_id));
+    timing.resolve_ms = resolve_started.elapsed().as_millis();
+    timing.certificates = family.len();
     for (device, cert) in family {
         if !relay_control_compat && tokio::time::Instant::now() >= family_deadline {
             source_failed = true;
@@ -661,7 +674,8 @@ async fn send_family_relay_copies(
         if hops.is_empty() && identity_hops.is_empty() {
             continue;
         }
-        let (payload, _) = match seal_with_host_floor(
+        let seal_started = std::time::Instant::now();
+        let sealed = seal_with_host_floor(
             &ratchet.store,
             request_host_epoch,
             family_deadline,
@@ -675,8 +689,9 @@ async fn send_family_relay_copies(
             },
             &send.data,
         )
-        .await
-        {
+        .await;
+        timing.seal_ms += seal_started.elapsed().as_millis();
+        let (payload, _) = match sealed {
             Ok(sealed) => sealed,
             Err(
                 veil_e2e::RatchetSpliceError::HostReservationRequired
@@ -694,6 +709,7 @@ async fn send_family_relay_copies(
             } else {
                 identity_hops
             };
+            let admission_started = std::time::Instant::now();
             let outcome = forward_ordinary_family_copy(
                 reg,
                 send,
@@ -704,6 +720,7 @@ async fn send_family_relay_copies(
                 family_deadline,
             )
             .await;
+            timing.admission_ms += admission_started.elapsed().as_millis();
             any_sent |= outcome == DirectAdmission::Accepted;
             if matches!(
                 outcome,
@@ -743,10 +760,12 @@ async fn send_family_relay_copies(
             };
             let bytes = envelope.encode();
             for hop in hops.into_iter().take(3) {
-                if let Some(sent) =
+                let admission_started = std::time::Instant::now();
+                let packetized =
                     send_packetized_control(reg, &envelope, &hop, local_priority, family_deadline)
-                        .await
-                {
+                        .await;
+                timing.admission_ms += admission_started.elapsed().as_millis();
+                if let Some(sent) = packetized {
                     any_sent |= sent;
                     continue;
                 }
@@ -774,6 +793,7 @@ async fn send_family_relay_copies(
         accepted: any_sent,
         source_failed,
         host_failed,
+        timing,
     }
 }
 
@@ -1267,6 +1287,7 @@ struct SendTiming {
     plan_ms: std::cell::Cell<u128>,
     seal_ms: std::cell::Cell<u128>,
     path: std::cell::Cell<&'static str>,
+    family: std::cell::Cell<FamilySendTiming>,
 }
 
 impl SendTiming {
@@ -1277,6 +1298,7 @@ impl SendTiming {
             plan_ms: std::cell::Cell::new(0),
             seal_ms: std::cell::Cell::new(0),
             path: std::cell::Cell::new("unknown"),
+            family: std::cell::Cell::new(FamilySendTiming::default()),
         }
     }
 }
@@ -1285,13 +1307,18 @@ impl Drop for SendTiming {
     fn drop(&mut self) {
         let total = self.started.elapsed().as_millis();
         if total >= 1_000 {
+            let family = self.family.get();
             log::warn!(
-                "ipc.send_slow at={} dst={} total_ms={total} plan_ms={} seal_ms={} path={}",
+                "ipc.send_slow at={} dst={} total_ms={total} plan_ms={} seal_ms={} path={} family_resolve_ms={} family_seal_ms={} family_admission_ms={} family_certificates={}",
                 veil_util::unix_secs_now_u64(),
                 veil_util::bytes_to_hex(&self.dst.get()),
                 self.plan_ms.get(),
                 self.seal_ms.get(),
                 self.path.get(),
+                family.resolve_ms,
+                family.seal_ms,
+                family.admission_ms,
+                family.certificates,
             );
         }
     }
@@ -1632,6 +1659,13 @@ pub(crate) async fn handle_ipc_send(
         } else {
             tokio::time::Instant::now() + std::time::Duration::from_secs(30)
         };
+        // Record attempted paths too: a failed family send used to report
+        // path=unknown with zero stage times, hiding the entire source wait.
+        timing.path.set(if relay_control_compat {
+            "call_device_fanout"
+        } else {
+            "relay_device_fanout"
+        });
         let outcome = send_family_relay_copies(
             ctx,
             &send,
@@ -1642,6 +1676,7 @@ pub(crate) async fn handle_ipc_send(
             None,
         )
         .await;
+        timing.family.set(outcome.timing);
         if outcome.accepted {
             timing.path.set(if relay_control_compat {
                 "call_device_fanout"
@@ -1858,6 +1893,7 @@ pub(crate) async fn handle_ipc_send(
             }
         };
         let (_, relayed) = tokio::join!(direct_copies, relay_copies);
+        timing.family.set(relayed.timing);
         any_sent |= relayed.accepted;
         admission_failed |= relayed.source_failed;
         host_failed |= relayed.host_failed;
