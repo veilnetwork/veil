@@ -498,6 +498,285 @@ fn device_matches_identity(ctx: &IpcSendContext, device: &[u8; 32], identity: &[
         .is_none_or(|pairing| pairing.identity == *identity)
 }
 
+/// Reuse the same sealed bytes over reliable relay hops, including after a
+/// direct source closes mid-transfer. Only outer routing metadata is renewed.
+async fn forward_ordinary_family_copy(
+    reg: &dyn FrameBroadcaster,
+    send: &AppIpcSendPayload,
+    sender: [u8; 32],
+    instance: [u8; 16],
+    payload: Vec<u8>,
+    hops: Vec<[u8; 32]>,
+    family_deadline: tokio::time::Instant,
+) -> DirectAdmission {
+    use veil_proto::delivery::DeliveryEnvelope;
+    use veil_proto::family::DeliveryMsg;
+    use veil_proto::recipient::Recipient;
+    let now = veil_util::unix_secs_now_u64();
+    let envelope = DeliveryEnvelope {
+        recipient: Recipient::specific(send.dst_node_id, instance),
+        sender_node_id: sender,
+        src_app_id: send.src_app_id,
+        app_id: send.app_id,
+        endpoint_id: send.endpoint_id,
+        content_id: {
+            let mut id = [0u8; 32];
+            use rand_core::RngCore;
+            rand_core::OsRng.fill_bytes(&mut id);
+            id
+        },
+        created_at: now,
+        ttl_secs: 30,
+        payload,
+        trace_id: 0,
+        require_ack: false,
+    };
+    // Use the normal reliable source and shared deadline for all
+    // chunks, never the call-control datagram lane. The encrypted
+    // envelope has no media/application priority visible to relays.
+    for hop in hops.into_iter().take(3) {
+        if tokio::time::Instant::now() >= family_deadline {
+            return DirectAdmission::TimedOut;
+        }
+        let segment = source_segment_bytes(reg, envelope.payload.len());
+        let frames = if envelope.payload.len() > segment
+            || envelope.payload.len() > veil_proto::delivery::ENVELOPE_CHUNKING_THRESHOLD
+        {
+            let Some(chunks) = EnvelopeChunks::new(&envelope, false, segment) else {
+                return DirectAdmission::Rejected;
+            };
+            chunks.frames_for(hop).collect::<Vec<_>>()
+        } else {
+            let bytes = envelope.encode();
+            let mut header =
+                FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+            header.set_priority(veil_proto::priority::INTERACTIVE);
+            header.body_len = (32 + bytes.len() + 9) as u32;
+            let mut frame = codec::encode_header(&header).to_vec();
+            frame.extend_from_slice(&hop);
+            frame.extend_from_slice(&bytes);
+            frame.extend_from_slice(&0u64.to_be_bytes());
+            frame.push(0);
+            vec![frame]
+        };
+        let admitted = tokio::time::timeout_at(family_deadline, async {
+            for frame in frames {
+                if !reg.send_reliable_to(&hop, frame).await {
+                    return false;
+                }
+            }
+            true
+        })
+        .await;
+        match admitted {
+            Ok(true) => return DirectAdmission::Accepted,
+            Ok(false) => {} // a closed hop may use an alternate path
+            Err(_) => return DirectAdmission::TimedOut, // source pressure keeps the same deadline
+        }
+    }
+    DirectAdmission::Missing
+}
+
+/// Already targeted live instances must not spend a second ratchet step on
+/// the relay leg. Physical endpoint addresses are last-choice relay candidates.
+#[derive(Default)]
+struct DirectFamilyRecipients {
+    devices: std::collections::HashSet<[u8; 32]>,
+    instances: std::collections::HashSet<[u8; 16]>,
+}
+
+#[derive(Default)]
+struct FamilyRelayResult {
+    accepted: bool,
+    source_failed: bool,
+    host_failed: bool,
+}
+
+/// One ordinary reliable copy, or the existing control copies, per verified
+/// family instance. In a mixed send, bounded family discovery runs alongside
+/// direct admission. Use its verified result even when a cold local registry
+/// has not retained the new rows. No background tail outlives this operation.
+async fn send_family_relay_copies(
+    ctx: &IpcSendContext,
+    send: &AppIpcSendPayload,
+    request_host_epoch: u64,
+    family_deadline: tokio::time::Instant,
+    relay_control_compat: bool,
+    local_priority: u8,
+    direct: Option<&DirectFamilyRecipients>,
+) -> FamilyRelayResult {
+    use veil_proto::delivery::DeliveryEnvelope;
+    use veil_proto::family::DeliveryMsg;
+    let (Some(ratchet), Some(resolver), Some(reg)) = (
+        ctx.ratchet.as_ref(),
+        ctx.mlkem_ek_resolver.as_deref(),
+        ctx.session_tx_registry.as_deref(),
+    ) else {
+        return FamilyRelayResult::default();
+    };
+    let Some(me) = ratchet.identity() else {
+        return FamilyRelayResult::default();
+    };
+    let local_node_id = &ctx.local_node_id;
+    let route_cache = ctx.route_cache.as_deref();
+    let now = veil_util::unix_secs_now_u64();
+    let mut any_sent = false;
+    let mut source_failed = false;
+    let mut host_failed = false;
+    let family = tokio::time::timeout_at(
+        family_deadline,
+        resolver.resolve_device_certs(send.dst_node_id),
+    )
+    .await
+    .unwrap_or_else(|_| resolver.resolve_device_certs_cached(send.dst_node_id));
+    for (device, cert) in family {
+        if !relay_control_compat && tokio::time::Instant::now() >= family_deadline {
+            source_failed = true;
+            break;
+        }
+        if device == *local_node_id
+            || cert.node_id != send.dst_node_id
+            || !device_matches_identity(ctx, &device, &send.dst_node_id)
+            || direct.is_some_and(|targets| targets.instances.contains(&cert.instance_id))
+        {
+            continue;
+        }
+        let mut hops = ordinary_relay_hops(None, &device, route_cache, reg, true);
+        // A cached device route can accept frames while its attachment is
+        // stale. Also use the identity's current attachment, restricted to
+        // this same verified instance. Queue admission on either path is
+        // not receipt. No DHT wait or new alias authority is introduced.
+        let mut identity_hops = if device != send.dst_node_id {
+            ordinary_relay_hops(None, &send.dst_node_id, route_cache, reg, true)
+        } else {
+            Vec::new()
+        };
+        if let Some(targets) = direct {
+            // Prefer an independent relay to an endpoint that may be a leaf.
+            // Keep the endpoint as a last candidate: a core family member can
+            // legitimately be the only remaining route to its sibling.
+            hops.sort_by_key(|hop| targets.devices.contains(hop));
+            identity_hops.sort_by_key(|hop| targets.devices.contains(hop));
+        }
+        if hops.is_empty() && identity_hops.is_empty() {
+            continue;
+        }
+        let (payload, _) = match seal_with_host_floor(
+            &ratchet.store,
+            request_host_epoch,
+            family_deadline,
+            &me,
+            veil_e2e::PeerRatchetKeys {
+                node_id: &cert.node_id,
+                instance_id: &cert.instance_id,
+                mlkem_ek: &cert.mlkem_ek,
+                ratchet_pk: &cert.ratchet_x25519_pk,
+                authorized_until_unix: cert.valid_until_unix,
+            },
+            &send.data,
+        )
+        .await
+        {
+            Ok(sealed) => sealed,
+            Err(
+                veil_e2e::RatchetSpliceError::HostReservationRequired
+                | veil_e2e::RatchetSpliceError::HostPublicationClosed,
+            ) => {
+                host_failed = true;
+                continue;
+            }
+            Err(_) => continue,
+        };
+        use veil_proto::recipient::Recipient;
+        if !relay_control_compat {
+            let generic_hops = if identity_hops.is_empty() {
+                hops
+            } else {
+                identity_hops
+            };
+            let outcome = forward_ordinary_family_copy(
+                reg,
+                send,
+                me.local_node_id,
+                cert.instance_id,
+                payload,
+                generic_hops,
+                family_deadline,
+            )
+            .await;
+            any_sent |= outcome == DirectAdmission::Accepted;
+            if matches!(
+                outcome,
+                DirectAdmission::TimedOut | DirectAdmission::Rejected
+            ) {
+                source_failed = true;
+                break;
+            }
+            continue;
+        }
+        for (recipient, hops) in [
+            (Recipient::any(device), hops),
+            (
+                Recipient::specific(send.dst_node_id, cert.instance_id),
+                identity_hops,
+            ),
+        ] {
+            // Relay dedup precedes recipient resolution. Each addressing
+            // path needs its own outer id, retaining identical ciphertext
+            // sealed once for the same device. Ratchet/app replay authority
+            // still admits the first logical signal only.
+            let mut nonce = [0u8; 32];
+            use rand_core::RngCore;
+            rand_core::OsRng.fill_bytes(&mut nonce);
+            let envelope = DeliveryEnvelope {
+                recipient,
+                sender_node_id: me.local_node_id,
+                src_app_id: send.src_app_id,
+                app_id: send.app_id,
+                endpoint_id: send.endpoint_id,
+                content_id: *blake3::hash(&nonce).as_bytes(),
+                created_at: now,
+                ttl_secs: veil_proto::delivery::FORWARD_REALTIME_TTL_SECS,
+                payload: payload.clone(),
+                trace_id: 0,
+                require_ack: false,
+            };
+            let bytes = envelope.encode();
+            for hop in hops.into_iter().take(3) {
+                if let Some(sent) =
+                    send_packetized_control(reg, &envelope, &hop, local_priority, family_deadline)
+                        .await
+                {
+                    any_sent |= sent;
+                    continue;
+                }
+                let datagram = reg.has_neutral_forward_datagram_transport(&hop);
+                let mut header =
+                    FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+                header.set_priority(veil_proto::priority::INTERACTIVE);
+                header.body_len = (32 + bytes.len() + 8 + 1 + usize::from(datagram) * 2) as u32;
+                let mut frame = codec::encode_header(&header).to_vec();
+                frame.extend_from_slice(&hop);
+                frame.extend_from_slice(&bytes);
+                frame.extend_from_slice(&0u64.to_be_bytes());
+                frame.push(0);
+                if datagram {
+                    frame.push(veil_proto::delivery::FORWARD_TRAFFIC_CLASS_MARKER);
+                    frame.push(veil_proto::priority::INTERACTIVE);
+                }
+                // Keep the endpoint's signaling producer separate from its
+                // primary media producer. The relay header remains neutral.
+                any_sent |= reg.send_to(&hop, local_priority, frame);
+            }
+        }
+    }
+    FamilyRelayResult {
+        accepted: any_sent,
+        source_failed,
+        host_failed,
+    }
+}
+
 /// Hand `frame`, sealed for the instance `sealed_for`, to the device it is
 /// sealed for — and to no other.
 ///
@@ -1324,11 +1603,9 @@ pub(crate) async fn handle_ipc_send(
     if ratchet_ok
         && remote
         && !send.require_ack
-        && let (Some(ratchet), Some(resolver), Some(reg)) = (
-            ctx.ratchet.as_ref(),
-            ctx.mlkem_ek_resolver.as_deref(),
-            session_tx_registry,
-        )
+        && ctx.ratchet.is_some()
+        && ctx.mlkem_ek_resolver.is_some()
+        && let Some(reg) = session_tx_registry
         && (relay_control_compat && send.data.len() <= 4096
             || !relay_control_compat
                 && !send.my_other_devices
@@ -1349,199 +1626,35 @@ pub(crate) async fn handle_ipc_send(
                             .iter()
                             .any(|device| active.contains(device))
                 })
-        && let Some(me) = ratchet.identity()
     {
-        use veil_proto::delivery::DeliveryEnvelope;
-        use veil_proto::family::DeliveryMsg;
-        let mut any_sent = false;
-        let now = veil_util::unix_secs_now_u64();
         let family_deadline = if relay_control_compat {
             control_source_deadline
         } else {
             tokio::time::Instant::now() + std::time::Duration::from_secs(30)
         };
-        // A newly linked endpoint may know only the caller's offline sibling.
-        // Cached-only fan-out then repeatedly seals every answer for the wrong
-        // machine. Warm the complete verified family within this request's
-        // existing control deadline, retaining partial cached results on timeout.
-        let _ = tokio::time::timeout_at(
+        let outcome = send_family_relay_copies(
+            ctx,
+            &send,
+            request_host_epoch,
             family_deadline,
-            resolver.resolve_device_certs(send.dst_node_id),
+            relay_control_compat,
+            local_priority,
+            None,
         )
         .await;
-        for (device, cert) in resolver.resolve_device_certs_cached(send.dst_node_id) {
-            if device == *local_node_id || cert.node_id != send.dst_node_id {
-                continue;
-            }
-            let hops = ordinary_relay_hops(None, &device, route_cache, reg, true);
-            // A cached device route can accept frames while its attachment is
-            // stale. Also use the identity's current attachment, restricted to
-            // this same verified instance. Queue admission on either path is
-            // not receipt. No DHT wait or new alias authority is introduced.
-            let identity_hops = if device != send.dst_node_id {
-                ordinary_relay_hops(None, &send.dst_node_id, route_cache, reg, true)
-            } else {
-                Vec::new()
-            };
-            if hops.is_empty() && identity_hops.is_empty() {
-                continue;
-            }
-            let Ok((payload, _)) = seal_with_host_floor(
-                &ratchet.store,
-                request_host_epoch,
-                family_deadline,
-                &me,
-                veil_e2e::PeerRatchetKeys {
-                    node_id: &cert.node_id,
-                    instance_id: &cert.instance_id,
-                    mlkem_ek: &cert.mlkem_ek,
-                    ratchet_pk: &cert.ratchet_x25519_pk,
-                    authorized_until_unix: cert.valid_until_unix,
-                },
-                &send.data,
-            )
-            .await
-            else {
-                continue;
-            };
-            use veil_proto::recipient::Recipient;
-            if !relay_control_compat {
-                let envelope = DeliveryEnvelope {
-                    recipient: Recipient::specific(send.dst_node_id, cert.instance_id),
-                    sender_node_id: me.local_node_id,
-                    src_app_id: send.src_app_id,
-                    app_id: send.app_id,
-                    endpoint_id: send.endpoint_id,
-                    content_id: {
-                        let mut id = [0u8; 32];
-                        use rand_core::RngCore;
-                        rand_core::OsRng.fill_bytes(&mut id);
-                        id
-                    },
-                    created_at: now,
-                    ttl_secs: 30,
-                    payload,
-                    trace_id: 0,
-                    require_ack: false,
-                };
-                // Use the normal reliable source and shared deadline for all
-                // chunks, never the call-control datagram lane. The encrypted
-                // envelope has no media/application priority visible to relays.
-                let generic_hops = if identity_hops.is_empty() {
-                    hops
-                } else {
-                    identity_hops
-                };
-                for hop in generic_hops.into_iter().take(3) {
-                    let segment = source_segment_bytes(reg, envelope.payload.len());
-                    let frames = if envelope.payload.len() > segment
-                        || envelope.payload.len()
-                            > veil_proto::delivery::ENVELOPE_CHUNKING_THRESHOLD
-                    {
-                        let Some(chunks) = EnvelopeChunks::new(&envelope, false, segment) else {
-                            continue;
-                        };
-                        chunks.frames_for(hop).collect::<Vec<_>>()
-                    } else {
-                        let bytes = envelope.encode();
-                        let mut header = FrameHeader::new(
-                            FrameFamily::Delivery as u8,
-                            DeliveryMsg::Forward as u16,
-                        );
-                        header.set_priority(veil_proto::priority::INTERACTIVE);
-                        header.body_len = (32 + bytes.len() + 9) as u32;
-                        let mut frame = codec::encode_header(&header).to_vec();
-                        frame.extend_from_slice(&hop);
-                        frame.extend_from_slice(&bytes);
-                        frame.extend_from_slice(&0u64.to_be_bytes());
-                        frame.push(0);
-                        vec![frame]
-                    };
-                    let admitted = tokio::time::timeout_at(family_deadline, async {
-                        for frame in frames {
-                            if !reg.send_reliable_to(&hop, frame).await {
-                                return false;
-                            }
-                        }
-                        true
-                    })
-                    .await
-                    .unwrap_or(false);
-                    if admitted {
-                        any_sent = true;
-                        break;
-                    }
-                }
-                continue;
-            }
-            for (recipient, hops) in [
-                (Recipient::any(device), hops),
-                (
-                    Recipient::specific(send.dst_node_id, cert.instance_id),
-                    identity_hops,
-                ),
-            ] {
-                // Relay dedup precedes recipient resolution. Each addressing
-                // path needs its own outer id, retaining identical ciphertext
-                // sealed once for the same device. Ratchet/app replay authority
-                // still admits the first logical signal only.
-                let mut nonce = [0u8; 32];
-                use rand_core::RngCore;
-                rand_core::OsRng.fill_bytes(&mut nonce);
-                let envelope = DeliveryEnvelope {
-                    recipient,
-                    sender_node_id: me.local_node_id,
-                    src_app_id: send.src_app_id,
-                    app_id: send.app_id,
-                    endpoint_id: send.endpoint_id,
-                    content_id: *blake3::hash(&nonce).as_bytes(),
-                    created_at: now,
-                    ttl_secs: veil_proto::delivery::FORWARD_REALTIME_TTL_SECS,
-                    payload: payload.clone(),
-                    trace_id: 0,
-                    require_ack: false,
-                };
-                let bytes = envelope.encode();
-                for hop in hops.into_iter().take(3) {
-                    if let Some(sent) = send_packetized_control(
-                        reg,
-                        &envelope,
-                        &hop,
-                        local_priority,
-                        control_source_deadline,
-                    )
-                    .await
-                    {
-                        any_sent |= sent;
-                        continue;
-                    }
-                    let datagram = reg.has_neutral_forward_datagram_transport(&hop);
-                    let mut header =
-                        FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
-                    header.set_priority(veil_proto::priority::INTERACTIVE);
-                    header.body_len = (32 + bytes.len() + 8 + 1 + usize::from(datagram) * 2) as u32;
-                    let mut frame = codec::encode_header(&header).to_vec();
-                    frame.extend_from_slice(&hop);
-                    frame.extend_from_slice(&bytes);
-                    frame.extend_from_slice(&0u64.to_be_bytes());
-                    frame.push(0);
-                    if datagram {
-                        frame.push(veil_proto::delivery::FORWARD_TRAFFIC_CLASS_MARKER);
-                        frame.push(veil_proto::priority::INTERACTIVE);
-                    }
-                    // Keep the endpoint's signaling producer separate from its
-                    // primary media producer. The relay header remains neutral.
-                    any_sent |= reg.send_to(&hop, local_priority, frame);
-                }
-            }
-        }
-        if any_sent {
+        if outcome.accepted {
             timing.path.set(if relay_control_compat {
                 "call_device_fanout"
             } else {
                 "relay_device_fanout"
             });
             return app_send_ok(sink, false).await;
+        }
+        if outcome.host_failed {
+            return app_send_error(sink, ipc_send_err::RATCHET_NOT_DURABLE).await;
+        }
+        if outcome.source_failed {
+            return app_send_error(sink, ipc_send_err::NO_ROUTE).await;
         }
     }
 
@@ -1568,11 +1681,33 @@ pub(crate) async fn handle_ipc_send(
         && let Some(reg) = session_tx_registry
     {
         let active = reg.active_node_ids();
-        let devices: Vec<[u8; 32]> = reg
+        let mut devices: Vec<[u8; 32]> = reg
             .devices_of(&send.dst_node_id)
             .into_iter()
             .filter(|d| active.contains(d))
             .collect();
+        if !delegated_device
+            && !send.my_other_devices
+            && !send.require_ack
+            && !relay_control_compat
+            && active.contains(&send.dst_node_id)
+            && device_matches_identity(ctx, &send.dst_node_id, &send.dst_node_id)
+            && !devices.contains(&send.dst_node_id)
+            && ctx
+                .session_instance_lookup
+                .as_deref()
+                .and_then(|lookup| lookup.session_instance(&send.dst_node_id))
+                .is_some()
+        {
+            devices.push(send.dst_node_id);
+        }
+        let mut direct = DirectFamilyRecipients::default();
+        for device in &devices {
+            if device_matches_identity(ctx, device, &send.dst_node_id) {
+                direct.devices.insert(*device);
+                direct.instances.insert(device_instance(ctx, device));
+            }
+        }
         use futures::{StreamExt, stream};
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         timing.plan_ms.set(plan_started.elapsed().as_millis());
@@ -1583,6 +1718,7 @@ pub(crate) async fn handle_ipc_send(
         // Scope all admission futures to this IPC request. A full sibling's
         // background queue must not hold up another live device's ciphertext.
         let request = &send;
+        let direct_family = &direct;
         let mut copies = stream::iter(devices)
             .map(|device| async move {
                 let device = &device;
@@ -1619,7 +1755,7 @@ pub(crate) async fn handle_ipc_send(
                     );
                     return (*device, false, 0, seal_ms);
                 }
-                let outcome = if let Some((payload, _, _)) = &sealed
+                let mut outcome = if let Some((payload, _, _)) = &sealed
                     && payload.len() > veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES
                 {
                     admit_direct_sealed(ctx, request, *device, payload, deadline).await
@@ -1640,6 +1776,34 @@ pub(crate) async fn handle_ipc_send(
                 } else {
                     DirectAdmission::Missing
                 };
+                if outcome == DirectAdmission::Missing
+                    && !relay_control_compat
+                    && !request.my_other_devices
+                    && !request.require_ack
+                    && !delegated_device
+                    && let Some((payload, _, sender)) = &sealed
+                    && let Some(instance) = copy_for
+                {
+                    // A closed path is distinct from source backpressure.
+                    // Reuse this device's seal, never a singular sibling's row.
+                    let mut hops =
+                        ordinary_relay_hops(None, &request.dst_node_id, route_cache, reg, true);
+                    hops.retain(|hop| hop != device);
+                    hops.sort_by_key(|hop| direct_family.devices.contains(hop));
+                    let forwarded = forward_ordinary_family_copy(
+                        reg,
+                        request,
+                        *sender,
+                        instance,
+                        payload.clone(),
+                        hops,
+                        deadline,
+                    )
+                    .await;
+                    if forwarded != DirectAdmission::Missing {
+                        outcome = forwarded;
+                    }
+                }
                 let accepted = outcome == DirectAdmission::Accepted;
                 if accepted && sealed.is_some() {
                     emit_e2e_plaintext_capture(capture_tx, local_node_id, device, &request.data);
@@ -1659,12 +1823,44 @@ pub(crate) async fn handle_ipc_send(
                 )
             })
             .buffer_unordered(8);
-        while let Some((_, accepted, failed, elapsed)) = copies.next().await {
-            any_sent |= accepted;
-            admission_failed |= failed == ipc_send_err::NO_ROUTE;
-            host_failed |= failed == ipc_send_err::RATCHET_NOT_DURABLE;
-            seal_ms += elapsed;
-        }
+        let relay_copies = async {
+            if !send.require_ack
+                && !relay_control_compat
+                && !send.my_other_devices
+                && !delegated_device
+                && !direct.instances.is_empty()
+                && ctx
+                    .session_instance_lookup
+                    .as_deref()
+                    .and_then(|lookup| lookup.own_device_pairing(&send.dst_node_id))
+                    .is_none()
+            {
+                send_family_relay_copies(
+                    ctx,
+                    &send,
+                    request_host_epoch,
+                    deadline,
+                    false,
+                    local_priority,
+                    Some(&direct),
+                )
+                .await
+            } else {
+                FamilyRelayResult::default()
+            }
+        };
+        let direct_copies = async {
+            while let Some((_, accepted, failed, elapsed)) = copies.next().await {
+                any_sent |= accepted;
+                admission_failed |= failed == ipc_send_err::NO_ROUTE;
+                host_failed |= failed == ipc_send_err::RATCHET_NOT_DURABLE;
+                seal_ms += elapsed;
+            }
+        };
+        let (_, relayed) = tokio::join!(direct_copies, relay_copies);
+        any_sent |= relayed.accepted;
+        admission_failed |= relayed.source_failed;
+        host_failed |= relayed.host_failed;
         timing.seal_ms.set(seal_ms);
         if any_sent {
             timing.path.set("identity_fanout");
@@ -4176,6 +4372,14 @@ mod ratchet_send_tests {
         sender_device: [u8; 32],
         receiver_device: [u8; 32],
     ) -> (veil_dispatcher::FrameDispatcher, veil_session::FrameOutbox) {
+        identity_first_relay_instance(sender_device, receiver_device, PEER_INSTANCE)
+    }
+
+    fn identity_first_relay_instance(
+        sender_device: [u8; 32],
+        receiver_device: [u8; 32],
+        receiver_instance: [u8; 16],
+    ) -> (veil_dispatcher::FrameDispatcher, veil_session::FrameOutbox) {
         use veil_identity::verify::ValidatedIdentity;
         use veil_proto::session::{AttachPayload, CapabilitiesPayload, IdentityPayload, role_bits};
         use veil_session::{RemoteRole, SessionEntry, SessionRegistry, SessionTxRegistry};
@@ -4185,7 +4389,7 @@ mod ratchet_send_tests {
         let mut sessions = SessionRegistry::new();
         for (device, identity, instance) in [
             (sender_device, ME, MY_INSTANCE),
-            (receiver_device, PEER, PEER_INSTANCE),
+            (receiver_device, PEER, receiver_instance),
         ] {
             sessions.insert(SessionEntry {
                 session_id: device,
@@ -4769,51 +4973,59 @@ mod ratchet_send_tests {
                 vec![PEER, RELAY]
             }
         }
-        let fx = fixture(vec![PEER, RELAY]);
-        let source = Arc::new(ClosedAfterPrefix {
-            direct_attempts: AtomicUsize::new(0),
-            frames: Mutex::new(Vec::new()),
-        });
-        let mut ctx = fx.ctx(true);
-        ctx.session_tx_registry = Some(source.clone());
-        let data = vec![0x62; 12_000];
-        let mut wh = sink().await;
-        handle_ipc_send(
-            &mut SendReply::Inline(&mut wh),
-            &payload(false, &data),
-            &ctx,
-        )
-        .await
-        .unwrap();
-        let frames = lock!(source.frames);
-        assert!(frames.len() > 2);
-        assert_eq!(frames[0].0, PEER);
-        assert!(frames[1..].iter().all(|(hop, _)| *hop == RELAY));
-        let (dispatcher, _endpoint, mut receiver) = direct_receiver(&fx.peer, PEER, PEER_INSTANCE);
-        let mut first_piece = None;
-        for (hop, frame) in frames.iter() {
-            let f = veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
-                .unwrap();
-            let chunk =
-                veil_proto::delivery::ChunkedEnvelopePayload::decode(&f.envelope.payload).unwrap();
-            if *hop == PEER {
-                first_piece = Some(chunk.data);
-            } else if chunk.chunk_index == 0 {
-                assert_eq!(
-                    first_piece.as_ref().unwrap(),
-                    &chunk.data,
-                    "partial failure must not spend another ratchet seal"
+        for proven_session in [false, true] {
+            let mut fx = fixture(vec![PEER, RELAY]);
+            if proven_session {
+                fx.session_instance = Some(PEER_INSTANCE);
+            }
+            let source = Arc::new(ClosedAfterPrefix {
+                direct_attempts: AtomicUsize::new(0),
+                frames: Mutex::new(Vec::new()),
+            });
+            let mut ctx = fx.ctx(true);
+            ctx.session_tx_registry = Some(source.clone());
+            let data = vec![0x62; 12_000];
+            let mut wh = sink().await;
+            handle_ipc_send(
+                &mut SendReply::Inline(&mut wh),
+                &payload(false, &data),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            let frames = lock!(source.frames);
+            assert!(frames.len() > 2);
+            assert_eq!(frames[0].0, PEER);
+            assert!(frames[1..].iter().all(|(hop, _)| *hop == RELAY));
+            let (dispatcher, _endpoint, mut receiver) =
+                direct_receiver(&fx.peer, PEER, PEER_INSTANCE);
+            let mut first_piece = None;
+            for (hop, frame) in frames.iter() {
+                let f =
+                    veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                        .unwrap();
+                let chunk =
+                    veil_proto::delivery::ChunkedEnvelopePayload::decode(&f.envelope.payload)
+                        .unwrap();
+                if *hop == PEER {
+                    first_piece = Some(chunk.data);
+                } else if chunk.chunk_index == 0 {
+                    assert_eq!(
+                        first_piece.as_ref().unwrap(),
+                        &chunk.data,
+                        "partial failure must not spend another ratchet seal"
+                    );
+                }
+                let header = codec::decode_header(frame).unwrap();
+                dispatcher.dispatch(
+                    &header,
+                    &frame[veil_proto::HEADER_SIZE..],
+                    veil_cfg::NodeId::from(ME),
                 );
             }
-            let header = codec::decode_header(frame).unwrap();
-            dispatcher.dispatch(
-                &header,
-                &frame[veil_proto::HEADER_SIZE..],
-                veil_cfg::NodeId::from(ME),
-            );
+            assert_eq!(take_direct(&mut receiver), data);
+            assert!(receiver.try_recv().is_err());
         }
-        assert_eq!(take_direct(&mut receiver), data);
-        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test(start_paused = true)]
@@ -4923,6 +5135,490 @@ mod ratchet_send_tests {
             &*outbox.recv().await.unwrap().1,
             [2],
             "timed-out source released its credit"
+        );
+    }
+
+    fn mixed_family_fixture(
+        registry_knows_relayed_device: bool,
+    ) -> (
+        Fixture,
+        veil_e2e::RatchetRuntime,
+        [u8; 32],
+        [u8; 32],
+        IpcSendContext,
+    ) {
+        let (mut fx, sibling) = family_fixture();
+        let mut direct_device = [0u8; 32];
+        direct_device[..16].copy_from_slice(&PEER_INSTANCE);
+        let mut relayed_device = [0u8; 32];
+        relayed_device[..16].copy_from_slice(&SIBLING_INSTANCE);
+        fx.outbox = Arc::new(Outbox {
+            live: vec![direct_device, RELAY],
+            datagram: Vec::new(),
+            sent: Mutex::new(Vec::new()),
+            family: if registry_knows_relayed_device {
+                vec![direct_device, relayed_device]
+            } else {
+                vec![direct_device]
+            },
+        });
+        let mut ctx = fx.ctx(true);
+        ctx.session_instance_lookup = Some(Arc::new(FamilySessions(vec![
+            (
+                direct_device,
+                veil_types::SessionPairing {
+                    identity: PEER,
+                    instance: PEER_INSTANCE,
+                },
+            ),
+            (
+                relayed_device,
+                veil_types::SessionPairing {
+                    identity: PEER,
+                    instance: SIBLING_INSTANCE,
+                },
+            ),
+        ])));
+        (fx, sibling, direct_device, relayed_device, ctx)
+    }
+
+    fn feed_mixed_family_frame(
+        hop: [u8; 32],
+        frame: &[u8],
+        direct_device: [u8; 32],
+        direct: &veil_dispatcher::FrameDispatcher,
+        relay: &veil_dispatcher::FrameDispatcher,
+        forwarded: &mut veil_session::FrameOutbox,
+        relayed: &veil_dispatcher::FrameDispatcher,
+    ) {
+        if hop == direct_device {
+            feed_direct(direct, frame);
+        } else {
+            assert_eq!(hop, RELAY);
+            let header = codec::decode_header(frame).unwrap();
+            assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
+            assert!(
+                !veil_proto::delivery::ForwardPayload::is_realtime_datagram_eligible(
+                    &frame[veil_proto::HEADER_SIZE..]
+                )
+            );
+            relay.dispatch(
+                &header,
+                &frame[veil_proto::HEADER_SIZE..],
+                veil_cfg::NodeId::from(ME),
+            );
+            while let Ok((_, frame)) = forwarded.try_recv() {
+                let header = codec::decode_header(&frame).unwrap();
+                relayed.dispatch(
+                    &header,
+                    &frame[veil_proto::HEADER_SIZE..],
+                    veil_cfg::NodeId::from(RELAY),
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_mixed_family_keeps_direct_and_relayed_recipients() {
+        for registry_knows_relayed_device in [false, true] {
+            let (fx, sibling, direct_device, _relayed_device, ctx) =
+                mixed_family_fixture(registry_knows_relayed_device);
+            let plaintext = b"mixed transport family delivery";
+            let mut wh = sink().await;
+            handle_ipc_send(
+                &mut SendReply::Inline(&mut wh),
+                &payload(false, plaintext),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            let sent = fx.taken();
+            let mut direct = None;
+            let mut relayed = None;
+            for (hop, bytes) in sent {
+                let header = codec::decode_header(&bytes).unwrap();
+                if hop == direct_device
+                    && header.msg_type == veil_proto::family::AppMsg::AppSendSealed as u16
+                {
+                    let body =
+                        veil_proto::app::AppSendPayload::decode(&bytes[veil_proto::HEADER_SIZE..])
+                            .unwrap();
+                    assert!(
+                        direct.replace(body.data).is_none(),
+                        "do not duplicate the direct recipient"
+                    );
+                } else if hop == RELAY && header.family == FrameFamily::Delivery as u8 {
+                    let forward = veil_proto::delivery::ForwardPayload::decode(
+                        &bytes[veil_proto::HEADER_SIZE..],
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        forward.envelope.recipient,
+                        veil_proto::recipient::Recipient::specific(PEER, SIBLING_INSTANCE)
+                    );
+                    if let Some(prior) = relayed.replace(forward.envelope.payload) {
+                        assert_eq!(
+                            relayed.as_ref().unwrap(),
+                            &prior,
+                            "alternate paths reuse one ciphertext"
+                        );
+                    }
+                }
+            }
+            let now = veil_util::unix_secs_now_u64();
+            assert_eq!(
+                fx.peer
+                    .open_payload(
+                        &ME,
+                        &direct.expect("direct device receives its own ciphertext"),
+                        now
+                    )
+                    .unwrap()
+                    .plaintext,
+                plaintext
+            );
+            let wire =
+                relayed.expect("a direct sibling must not suppress the relayed sibling's copy");
+            let opened = sibling.open_payload(&ME, &wire, now).unwrap();
+            assert!(opened.authenticated);
+            assert_eq!(opened.plaintext, plaintext);
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_family_never_uses_expired_or_foreign_sibling_authority() {
+        for foreign in [false, true] {
+            let (fx, _sibling, one, two, mut ctx) = mixed_family_fixture(false);
+            if foreign {
+                ctx.session_instance_lookup = Some(Arc::new(FamilySessions(vec![
+                    (
+                        one,
+                        veil_types::SessionPairing {
+                            identity: PEER,
+                            instance: PEER_INSTANCE,
+                        },
+                    ),
+                    (
+                        two,
+                        veil_types::SessionPairing {
+                            identity: [0xd9; 32],
+                            instance: SIBLING_INSTANCE,
+                        },
+                    ),
+                ])));
+            } else {
+                let mut rows = fx
+                    .certs
+                    .resolve_device_certs_cached(PEER)
+                    .into_iter()
+                    .map(|(_, cert)| cert)
+                    .collect::<Vec<_>>();
+                rows.iter_mut()
+                    .find(|cert| cert.instance_id == SIBLING_INSTANCE)
+                    .unwrap()
+                    .valid_until_unix = 0;
+                ctx.mlkem_ek_resolver = Some(Arc::new(FamilyCerts(rows)));
+            }
+            let mut wh = sink().await;
+            handle_ipc_send(
+                &mut SendReply::Inline(&mut wh),
+                &payload(false, b"only the authorized endpoint"),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            let frames = fx.taken();
+            assert_eq!(
+                frames.len(),
+                1,
+                "no relay copy for unusable sibling authority"
+            );
+            assert_eq!(frames[0].0, one);
+            let direct =
+                veil_proto::app::AppSendPayload::decode(&frames[0].1[veil_proto::HEADER_SIZE..])
+                    .unwrap();
+            assert_eq!(
+                fx.peer
+                    .open_payload(&ME, &direct.data, veil_util::unix_secs_now_u64())
+                    .unwrap()
+                    .plaintext,
+                b"only the authorized endpoint"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_family_resolve_does_not_park_direct_or_discard_fresh_rows() {
+        struct ResolvingFamily {
+            rows: FamilyCerts,
+            release: tokio::sync::Notify,
+        }
+        impl veil_types::MlKemEkResolver for ResolvingFamily {
+            fn resolve_device_certs_cached(
+                &self,
+                target: [u8; 32],
+            ) -> Vec<([u8; 32], veil_types::VerifiedPeerCert)> {
+                self.rows
+                    .resolve_device_certs_cached(target)
+                    .into_iter()
+                    .take(1)
+                    .collect()
+            }
+            fn resolve_device_certs(&self, target: [u8; 32]) -> veil_types::DeviceCertsFuture<'_> {
+                Box::pin(async move {
+                    self.release.notified().await;
+                    // Resolution returns a fresh verified row without relying
+                    // on the transport's pre-existing family registry cache.
+                    self.rows.resolve_device_certs_cached(target)
+                })
+            }
+            fn resolve_cert_cached(
+                &self,
+                target: [u8; 32],
+            ) -> Option<veil_types::VerifiedPeerCert> {
+                self.rows.resolve_cert_cached(target)
+            }
+            fn resolve_cert(
+                &self,
+                target: [u8; 32],
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Option<veil_types::VerifiedPeerCert>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                self.rows.resolve_cert(target)
+            }
+            fn resolve_cert_for_instance_cached(
+                &self,
+                target: [u8; 32],
+                instance: [u8; 16],
+            ) -> Option<veil_types::VerifiedPeerCert> {
+                self.rows.resolve_cert_for_instance_cached(target, instance)
+            }
+        }
+        let (fx, sibling, one, _two, mut ctx) = mixed_family_fixture(false);
+        let rows = fx
+            .certs
+            .resolve_device_certs_cached(PEER)
+            .into_iter()
+            .map(|(_, cert)| cert)
+            .collect();
+        let resolver = Arc::new(ResolvingFamily {
+            rows: FamilyCerts(rows),
+            release: tokio::sync::Notify::new(),
+        });
+        ctx.mlkem_ek_resolver = Some(resolver.clone());
+        let body = payload(false, b"the newly discovered sibling gets its copy too");
+        let mut wh = sink().await;
+        let mut reply = SendReply::Inline(&mut wh);
+        let mut send = Box::pin(handle_ipc_send(&mut reply, &body, &ctx));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut send)
+                .await
+                .is_err()
+        );
+        let direct = fx.taken();
+        assert_eq!(direct.len(), 1);
+        assert_eq!(
+            direct[0].0, one,
+            "direct admission does not wait on family discovery"
+        );
+        resolver.release.notify_one();
+        send.await.unwrap();
+        let relayed = fx.taken();
+        assert_eq!(relayed.len(), 1);
+        assert_eq!(relayed[0].0, RELAY);
+        let envelope =
+            veil_proto::delivery::ForwardPayload::decode(&relayed[0].1[veil_proto::HEADER_SIZE..])
+                .unwrap()
+                .envelope;
+        assert_eq!(
+            sibling
+                .open_payload(&ME, &envelope.payload, veil_util::unix_secs_now_u64())
+                .unwrap()
+                .plaintext,
+            b"the newly discovered sibling gets its copy too"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_family_large_copies_cross_a_real_relay_and_deliver_once() {
+        for size in [12_000, 100_000] {
+            let (fx, sibling, one, two, ctx) = mixed_family_fixture(true);
+            let data = (0..size).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+            let mut wh = sink().await;
+            handle_ipc_send(
+                &mut SendReply::Inline(&mut wh),
+                &payload(false, &data),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            let frames = fx.taken();
+            assert!(frames.iter().any(|(hop, _)| *hop == one));
+            assert!(frames.iter().any(|(hop, _)| *hop == RELAY));
+            let (first, _a, mut a_rx) = direct_receiver(&fx.peer, one, PEER_INSTANCE);
+            let (second, _b, mut b_rx) = direct_receiver(&sibling, two, SIBLING_INSTANCE);
+            let (relay, mut forwarded) = identity_first_relay_instance(ME, two, SIBLING_INSTANCE);
+            for (hop, frame) in &frames {
+                feed_mixed_family_frame(*hop, frame, one, &first, &relay, &mut forwarded, &second);
+            }
+            assert_eq!(take_direct(&mut a_rx), data);
+            assert_eq!(take_direct(&mut b_rx), data);
+            for (hop, frame) in &frames {
+                feed_mixed_family_frame(*hop, frame, one, &first, &relay, &mut forwarded, &second);
+            }
+            assert!(a_rx.try_recv().is_err());
+            assert!(b_rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_family_real_source_credit_keeps_the_other_recipient_moving() {
+        for blocked_direct in [false, true] {
+            let (fx, sibling, one, two, mut ctx) = mixed_family_fixture(true);
+            let registry = Arc::new(RwLock::new(veil_session::SessionTxRegistry::with_capacity(
+                1,
+            )));
+            let mut direct = wlock!(registry).register(one);
+            let mut relay_source = wlock!(registry).register(RELAY);
+            ctx.session_tx_registry = Some(Arc::new(DirectFamilySource {
+                inner: veil_session::glue::SessionTxBroadcaster::new(registry.clone()),
+                devices: vec![one],
+            }));
+            let blocked = if blocked_direct { one } else { RELAY };
+            assert!(rlock!(registry).send_to(&blocked, veil_proto::priority::BACKGROUND, vec![0]));
+            let (first, _a, mut a_rx) = direct_receiver(&fx.peer, one, PEER_INSTANCE);
+            let (second, _b, mut b_rx) = direct_receiver(&sibling, two, SIBLING_INSTANCE);
+            let (relay, mut forwarded) = identity_first_relay_instance(ME, two, SIBLING_INSTANCE);
+            let data = vec![0x6d; 12_000];
+            let body = payload(false, &data);
+            let mut wh = sink().await;
+            let mut reply = SendReply::Inline(&mut wh);
+            let mut admission = Box::pin(handle_ipc_send(&mut reply, &body, &ctx));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while if blocked_direct { b_rx.is_empty() } else { a_rx.is_empty() } {
+                    tokio::select! {
+                        result = &mut admission => panic!("blocked source completed before release: {result:?}"),
+                        frame = async {
+                            if blocked_direct { relay_source.recv().await } else { direct.recv().await }
+                        } => {
+                            let (_, frame) = frame.unwrap();
+                            let hop = if blocked_direct { RELAY } else { one };
+                            feed_mixed_family_frame(hop, &frame, one, &first, &relay, &mut forwarded, &second);
+                        }
+                    }
+                }
+            }).await.expect("the independent recipient progresses while its sibling is full");
+            assert!(
+                registry.try_write().is_ok(),
+                "no session lock spans admission"
+            );
+            let first_data = if blocked_direct {
+                take_direct(&mut b_rx)
+            } else {
+                take_direct(&mut a_rx)
+            };
+            assert_eq!(first_data, data);
+            let placeholder = if blocked_direct {
+                direct.recv().await
+            } else {
+                relay_source.recv().await
+            };
+            assert_eq!(&*placeholder.unwrap().1, [0]);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    tokio::select! {
+                        result = &mut admission => { result.unwrap(); break; },
+                        frame = direct.recv() => feed_mixed_family_frame(one, &frame.unwrap().1, one, &first, &relay, &mut forwarded, &second),
+                        frame = relay_source.recv() => feed_mixed_family_frame(RELAY, &frame.unwrap().1, one, &first, &relay, &mut forwarded, &second),
+                    }
+                }
+            }).await.unwrap();
+            while let Ok((_, frame)) = direct.try_recv() {
+                feed_mixed_family_frame(one, &frame, one, &first, &relay, &mut forwarded, &second);
+            }
+            while let Ok((_, frame)) = relay_source.try_recv() {
+                feed_mixed_family_frame(
+                    RELAY,
+                    &frame,
+                    one,
+                    &first,
+                    &relay,
+                    &mut forwarded,
+                    &second,
+                );
+            }
+            let later = if blocked_direct {
+                take_direct(&mut a_rx)
+            } else {
+                take_direct(&mut b_rx)
+            };
+            assert_eq!(later, data);
+            assert!(a_rx.try_recv().is_err());
+            assert!(b_rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn family_relay_source_deadline_does_not_restart_legacy_fallback() {
+        use tokio::io::AsyncReadExt;
+        let (mut fx, _sibling) = family_fixture();
+        fx.outbox = Arc::new(Outbox {
+            live: vec![RELAY],
+            ..Outbox::default()
+        });
+        let registry = Arc::new(RwLock::new(veil_session::SessionTxRegistry::with_capacity(
+            1,
+        )));
+        let mut relay = wlock!(registry).register(RELAY);
+        let mut ctx = fx.ctx(true);
+        ctx.session_tx_registry = Some(Arc::new(veil_session::glue::SessionTxBroadcaster::new(
+            registry.clone(),
+        )));
+        assert!(rlock!(registry).send_to(&RELAY, veil_proto::priority::BACKGROUND, vec![0]));
+        let (writer, mut reader) = tokio::net::UnixStream::pair().unwrap();
+        let (_, wh) = writer.into_split();
+        let mut wh = veil_local_transport::LocalWriteHalf::Unix(wh);
+        let mut reply = SendReply::Inline(&mut wh);
+        let body = payload(false, &vec![9; 12_000]);
+        let mut admission = Box::pin(handle_ipc_send(&mut reply, &body, &ctx));
+        let began = tokio::time::Instant::now();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut admission)
+                .await
+                .is_err()
+        );
+        tokio::time::advance(Duration::from_secs(31)).await;
+        admission.await.unwrap();
+        assert!(
+            began.elapsed() < Duration::from_secs(32),
+            "no fresh deadline after a family source timeout"
+        );
+        let mut status = vec![0; veil_proto::HEADER_SIZE + 2];
+        reader.read_exact(&mut status).await.unwrap();
+        assert_eq!(
+            &status[veil_proto::HEADER_SIZE..],
+            &ipc_send_err::NO_ROUTE.to_be_bytes()
+        );
+        assert_eq!(&*relay.recv().await.unwrap().1, [0]);
+        assert!(
+            relay.try_recv().is_err(),
+            "no later full copy after admission timeout"
+        );
+        assert!(
+            ctx.session_tx_registry
+                .as_ref()
+                .unwrap()
+                .send_reliable_to(&RELAY, vec![2])
+                .await
+        );
+        assert_eq!(
+            &*relay.recv().await.unwrap().1,
+            [2],
+            "source credit released"
         );
     }
 
@@ -5646,10 +6342,31 @@ mod ratchet_send_tests {
         .expect("send");
 
         let sent = fx.taken();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].0, PEER, "down the direct session");
-        let body = veil_proto::app::AppSendPayload::decode(&sent[0].1[veil_proto::HEADER_SIZE..])
+        let direct = sent
+            .iter()
+            .filter(|(device, _)| *device == PEER)
+            .collect::<Vec<_>>();
+        assert_eq!(direct.len(), 1, "one seal down the direct session");
+        let body = veil_proto::app::AppSendPayload::decode(&direct[0].1[veil_proto::HEADER_SIZE..])
             .expect("body");
+        let relayed = sent
+            .iter()
+            .find(|(hop, _)| *hop == RELAY)
+            .expect("the cached sibling has its independent relay copy");
+        let forward =
+            veil_proto::delivery::ForwardPayload::decode(&relayed.1[veil_proto::HEADER_SIZE..])
+                .unwrap();
+        assert_eq!(
+            sibling
+                .open_payload(
+                    &ME,
+                    &forward.envelope.payload,
+                    veil_util::unix_secs_now_u64()
+                )
+                .unwrap()
+                .plaintext,
+            b"to the device the session ends at"
+        );
         let now = veil_util::unix_secs_now_u64();
         assert!(
             matches!(
