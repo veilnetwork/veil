@@ -424,6 +424,78 @@ const DEMUX_RX_BURST: usize = 256;
 // mutex for a scan of the entire stream-id space.
 const MAX_OPEN_PROBES: usize = 4096;
 
+/// Endpoint-only observations; never included in a cell or sent to a relay.
+#[derive(Default, Debug)]
+struct MuxCounters {
+    received: u64,
+    routed: u64,
+    inbox_full: u64,
+    inbox_full_data: u64,
+    inbox_full_ack: u64,
+    inbox_full_control: u64,
+    inbox_closed: u64,
+    unknown: u64,
+    invalid: u64,
+    accept_full: u64,
+    accepted: u64,
+}
+
+impl MuxCounters {
+    fn route(&mut self, tx: &mpsc::Sender<Vec<u8>>, cell: Vec<u8>) {
+        match tx.try_send(cell) {
+            Ok(()) => self.routed = self.routed.saturating_add(1),
+            Err(mpsc::error::TrySendError::Full(cell)) => {
+                self.inbox_full = self.inbox_full.saturating_add(1);
+                let bucket = match Frame::decode(&cell) {
+                    Some(Frame::Data { .. }) => &mut self.inbox_full_data,
+                    Some(Frame::Ack { .. }) => &mut self.inbox_full_ack,
+                    _ => &mut self.inbox_full_control,
+                };
+                *bucket = bucket.saturating_add(1);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.inbox_closed = self.inbox_closed.saturating_add(1);
+            }
+        }
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "received={} routed={} inbox_full={} inbox_full_data={} inbox_full_ack={} inbox_full_control={} inbox_closed={} unknown={} invalid={} accept_full={} accepted={}",
+            self.received,
+            self.routed,
+            self.inbox_full,
+            self.inbox_full_data,
+            self.inbox_full_ack,
+            self.inbox_full_control,
+            self.inbox_closed,
+            self.unknown,
+            self.invalid,
+            self.accept_full,
+            self.accepted,
+        )
+    }
+
+    fn log(&self, diagnostic_id: Option<u32>) {
+        let Some(id) = diagnostic_id else { return };
+        // A process-local ordinal separates concurrently existing muxes. It
+        // is neither a peer/stream identifier nor stable across app restarts.
+        #[cfg(target_os = "android")]
+        log::info!("onion-stream-mux[{id}]: {}", self.summary());
+        #[cfg(not(target_os = "android"))]
+        {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "onion-stream-mux[{id}]: {}",
+                self.summary()
+            );
+        }
+    }
+}
+
+static NEXT_MUX_DIAGNOSTIC_ID: AtomicU32 = AtomicU32::new(1);
+
 async fn demux<S: CellSender>(
     sender: Arc<S>,
     mut inbound: mpsc::Receiver<(Addr, Vec<u8>)>,
@@ -432,7 +504,12 @@ async fn demux<S: CellSender>(
     accept_tx: mpsc::Sender<(OnionStream, Addr)>,
     cfg: Config,
     aliases: PeerAliases,
-) {
+) -> MuxCounters {
+    let period =
+        crate::driver::debug_summary_period_ms(cfg.debug_summary_ms).map(Duration::from_millis);
+    let diagnostic_id = period.map(|_| NEXT_MUX_DIAGNOSTIC_ID.fetch_add(1, Ordering::Relaxed));
+    let mut counters = MuxCounters::default();
+    let mut last_report: Option<Instant> = None;
     // Refusals must not wait on the carrier in the shared receive loop. One
     // bounded worker sends best-effort resets; a full refusal queue drops the
     // SYN instead, allowing the opener's ordinary handshake retry to recover.
@@ -454,21 +531,25 @@ async fn demux<S: CellSender>(
     loop {
         batch.clear();
         if inbound.recv_many(&mut batch, DEMUX_RX_BURST).await == 0 {
-            return; // hub feed closed
+            counters.log(diagnostic_id);
+            return counters; // hub feed closed
         }
         // Fast path: route the whole batch under ONE lock. In the handshake
         // protocol no DATA precedes the peer's SYN_ACK, so a not-yet-routed
         // non-SYN cell here is stale/junk exactly as it was per-cell.
         new_streams.clear();
+        let full_before = counters.inbox_full;
         {
             let routes_g = routes.lock().unwrap_or_else(|p| p.into_inner());
             for (src, cell) in batch.drain(..) {
+                counters.received = counters.received.saturating_add(1);
                 let Some(frame) = Frame::decode(&cell) else {
+                    counters.invalid = counters.invalid.saturating_add(1);
                     continue; // junk
                 };
                 let key = (src.node, frame.stream_id());
                 if let Some(tx) = routes_g.get(&key) {
-                    let _ = tx.try_send(cell); // full → drop, ARQ recovers
+                    counters.route(tx, cell); // full → drop, ARQ recovers
                 } else if matches!(frame, Frame::Syn { .. }) {
                     new_streams.push((src, cell));
                 } else if let Some(tx) = aliases
@@ -479,7 +560,9 @@ async fn demux<S: CellSender>(
                 {
                     // An answer from the device for a stream opened to its
                     // identity (see `PeerAliases`).
-                    let _ = tx.try_send(cell);
+                    counters.route(tx, cell);
+                } else {
+                    counters.unknown = counters.unknown.saturating_add(1);
                 }
             }
         }
@@ -494,7 +577,7 @@ async fn demux<S: CellSender>(
             {
                 let routes_g = routes.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(tx) = routes_g.get(&key) {
-                    let _ = tx.try_send(cell);
+                    counters.route(tx, cell);
                     continue;
                 }
             }
@@ -503,13 +586,18 @@ async fn demux<S: CellSender>(
             let permit = match accept_tx.try_reserve() {
                 Ok(permit) => permit,
                 Err(mpsc::error::TrySendError::Full(_)) => {
+                    counters.accept_full = counters.accept_full.saturating_add(1);
                     let _ = refuse_tx.try_send((src, key.1));
                     continue;
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => return,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    counters.log(diagnostic_id);
+                    return counters;
+                }
             };
             let (tx, rx) = mpsc::channel(STREAM_INBOX);
-            let _ = tx.try_send(cell); // deliver the SYN itself
+            counters.route(&tx, cell); // deliver the SYN itself
+            counters.accepted = counters.accepted.saturating_add(1);
             routes
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -530,12 +618,134 @@ async fn demux<S: CellSender>(
             let stream = OnionStream::accept(duplex, cfg, key.1, initial_seq(key.1));
             permit.send((stream, src));
         }
+        if let Some(period) = period {
+            let now = Instant::now();
+            if last_report.is_none_or(|last| now.duration_since(last) >= period)
+                || (full_before == 0 && counters.inbox_full > 0)
+            {
+                counters.log(diagnostic_id);
+                last_report = Some(now);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inbox_diagnostics_distinguish_full_data_ack_control_and_closed() {
+        let (tx, rx) = mpsc::channel(1);
+        let mut counts = MuxCounters::default();
+        let first = Frame::Data {
+            stream_id: 7,
+            seq: 1,
+            win: 8192,
+            payload: b"PRIVATE_SENTINEL",
+        }
+        .encode();
+        counts.route(&tx, first.clone());
+        for cell in [
+            first.clone(),
+            Frame::Ack {
+                stream_id: 7,
+                ack: 1,
+                win: 1,
+                sacks: Default::default(),
+            }
+            .encode(),
+            Frame::Fin {
+                stream_id: 7,
+                seq: 1,
+            }
+            .encode(),
+        ] {
+            counts.route(&tx, cell);
+        }
+        drop(rx);
+        counts.route(&tx, first);
+        assert_eq!(
+            (counts.routed, counts.inbox_full, counts.inbox_closed),
+            (1, 3, 1)
+        );
+        assert_eq!(
+            (
+                counts.inbox_full_data,
+                counts.inbox_full_ack,
+                counts.inbox_full_control
+            ),
+            (1, 1, 1)
+        );
+        for field in counts.summary().split_whitespace() {
+            let (name, value) = field.split_once('=').unwrap();
+            assert!(name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
+            assert!(value.bytes().all(|b| b.is_ascii_digit()));
+        }
+        assert!(!counts.summary().contains("PRIVATE_SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn demux_counts_alias_queue_drops_separately_from_unknown_and_invalid() {
+        let (feed, inbound) = mpsc::channel(8);
+        let (accept_tx, _accept_rx) = mpsc::channel(1);
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(vec![0]).unwrap();
+        let routes: Routes = Arc::new(Mutex::new(HashMap::from([((addr(3).node, 7), tx)])));
+        let aliases = Arc::new(Mutex::new(HashMap::from([(addr(2).node, addr(3).node)])));
+        for cell in [
+            Frame::Data {
+                stream_id: 7,
+                seq: 1,
+                win: 8192,
+                payload: b"payload",
+            }
+            .encode(),
+            Frame::Ack {
+                stream_id: 7,
+                ack: 1,
+                win: 8192,
+                sacks: Default::default(),
+            }
+            .encode(),
+            vec![0xff],
+            Frame::Fin {
+                stream_id: 99,
+                seq: 1,
+            }
+            .encode(),
+        ] {
+            feed.send((addr(2), cell)).await.unwrap();
+        }
+        drop(feed);
+        let counts = demux(
+            Arc::new(NoSender),
+            inbound,
+            routes,
+            Arc::new(Mutex::new(HashMap::new())),
+            accept_tx,
+            Config::default(),
+            aliases,
+        )
+        .await;
+        assert_eq!(
+            (counts.received, counts.routed, counts.inbox_full),
+            (4, 0, 2)
+        );
+        assert_eq!(
+            (
+                counts.inbox_full_data,
+                counts.inbox_full_ack,
+                counts.invalid,
+                counts.unknown
+            ),
+            (1, 1, 1, 1)
+        );
+        assert_eq!(
+            (counts.inbox_closed, counts.accept_full, counts.accepted),
+            (0, 0, 0)
+        );
+    }
 
     struct ReadyQueueSender(mpsc::Sender<Vec<u8>>);
 
@@ -643,7 +853,8 @@ mod tests {
             .await
             .expect("accept did not recover after freeing a slot");
             drop(feed);
-            demux_task.await.unwrap();
+            let counts = demux_task.await.unwrap();
+            assert_eq!(counts.accept_full, 1);
             while let Some((stream, _)) = accept_rx.recv().await {
                 stream.abort_handle().reset(crate::wire::reset_reason::APP);
             }

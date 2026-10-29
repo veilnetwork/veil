@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use super::stream_preparation_trace::{Stage as StreamStage, Trace as StreamTrace};
 use super::*;
 
 impl NodeServices {
@@ -1843,6 +1844,8 @@ impl NodeServices {
 
         const AD_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(3500);
 
+        let mut trace = StreamTrace::new(&self.logger, StreamStage::ReceiverAds);
+
         let ads = rendezvous_resolver::resolve_fresh_rendezvous_ads(
             &self.dht,
             &self.session_tx_registry,
@@ -1861,6 +1864,15 @@ impl NodeServices {
             &self.identity.peer_mlkem_cert_store.document_floor,
         )
         .await;
+
+        if trace.enabled() {
+            trace.address_kind(match self.identity_of_device_local(&receiver_node_id) {
+                Some(identity) if identity == receiver_node_id => 1,
+                Some(_) => 2,
+                None => 0,
+            });
+        }
+        trace.finish(!ads.is_empty(), ads.len());
 
         if ads.is_empty() {
             return Err(AnonOnionSendError::NoRendezvous);
@@ -1904,6 +1916,7 @@ impl NodeServices {
         use veil_anonymity::directory::relay_directory_dht_key;
 
         const RELAY_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(3500);
+        let mut trace = StreamTrace::new(&self.logger, StreamStage::RelayDirectory);
 
         let relay_key = relay_directory_dht_key(&relay);
         if self
@@ -1911,6 +1924,8 @@ impl NodeServices {
             .get_local(&relay_key)
             .is_some_and(|bytes| Self::valid_stream_relay_directory_entry(relay, &bytes))
         {
+            trace.local();
+            trace.finish(true, 1);
             return true;
         }
 
@@ -1934,9 +1949,11 @@ impl NodeServices {
             && Self::valid_stream_relay_directory_entry(relay, &bytes)
         {
             self.dht.store_local(relay_key, bytes);
+            trace.finish(true, 1);
             return true;
         }
 
+        trace.finish(false, 0);
         false
     }
 
@@ -2100,10 +2117,14 @@ impl NodeServices {
         (DataCircuit, tokio::sync::mpsc::Receiver<Vec<u8>>),
         veil_types::AnonOnionSendError,
     > {
+        let mut trace = StreamTrace::new(&self.logger, StreamStage::CircuitOpen);
         let relay_path = match self.select_onion_relay_path_to(rendezvous_node_id, hop_count) {
             Ok(path) => path,
             Err(_) => {
+                let mut wait_trace = StreamTrace::new(&self.logger, StreamStage::DirectoryWarmLock);
                 let _warm_guard = self.anonymity.stream_relay_directory_warm_lock.lock().await;
+                wait_trace.finish(true, 1);
+                drop(wait_trace);
 
                 // Another parallel stream worker may have completed the
                 // cold-start warm while we waited for the single-flight
@@ -2111,6 +2132,8 @@ impl NodeServices {
                 match self.select_onion_relay_path_to(rendezvous_node_id, hop_count) {
                     Ok(path) => path,
                     Err(_) => {
+                        let mut warm_trace =
+                            StreamTrace::new(&self.logger, StreamStage::DirectoryWarm);
                         let cached = self
                             .cache_stream_relay_directories_for_path(rendezvous_node_id, hop_count)
                             .await;
@@ -2125,6 +2148,9 @@ impl NodeServices {
                             Some(&self.dispatcher.crypto.peer_cap_flags),
                         )
                         .await;
+
+                        warm_trace.finish(true, cached);
+                        drop(warm_trace);
 
                         let path =
                             self.select_onion_relay_path_to(rendezvous_node_id, hop_count)?;
@@ -2154,9 +2180,12 @@ impl NodeServices {
                 Ok::<_, veil_types::AnonOnionSendError>((opened, first_hop))
             })?;
             circuit._local_path = Some(reservation);
+            trace.finish(true, 1);
             return Ok((circuit, rx));
         }
-        self.open_stream_circuit(&relay_path, reg_kp, last_epoch)
+        let result = self.open_stream_circuit(&relay_path, reg_kp, last_epoch);
+        trace.finish(result.is_ok(), usize::from(result.is_ok()));
+        result
     }
 
     /// Open a pinned stream circuit to the receiver's PUBLISHED rendezvous relay.
