@@ -609,8 +609,8 @@ impl StreamEngine {
             },
             rx: RxState {
                 rcv_nxt: 0,
-                window: cfg.recv_window,
-                last_ack_window: cfg.recv_window,
+                window: cfg.recv_window.min(MAX_INFLIGHT_BYTES),
+                last_ack_window: cfg.recv_window.min(MAX_INFLIGHT_BYTES),
                 read_buf: VecDeque::new(),
                 oo: BTreeMap::new(),
                 oo_bytes: 0,
@@ -1031,16 +1031,16 @@ impl StreamEngine {
                 end: seq::min(end, self.rx.rcv_nxt),
             })
         } else {
-            self.rx.oo.get(&seg_seq).map(|old| SackRange {
+            self.rx.stored_end(seg_seq).map(|stored_end| SackRange {
                 start: seg_seq,
-                end: seq::min(end, seg_seq.wrapping_add(old.len() as u32)),
+                end: seq::min(end, stored_end),
             })
         };
         if duplicate_range.is_some() {
             self.duplicate_range = duplicate_range;
         }
         let advanced = self.rx.accept(seg_seq, payload);
-        if self.rx.oo.contains_key(&seg_seq) {
+        if self.rx.stored_end(seg_seq).is_some() {
             self.recent_sack_seq = Some(seg_seq);
         }
         self.ack_data(advanced, now);
@@ -2856,15 +2856,37 @@ impl RxState {
             payload = &payload[skip..];
             seg_seq = self.rcv_nxt;
         }
-        // Reject beyond the advertised window.
-        let win_end = self.rcv_nxt.wrapping_add(self.window);
-        if seq::geq(seg_seq, win_end) {
+        // Keep a stable capacity edge: advancing rcv_nxt moves bytes into
+        // read_buf, so only application reads can move this edge forward.
+        // Do not subtract OO here: their missing prefix still needs its space,
+        // and already-SACKed ranges may not be evicted to admit that prefix.
+        let space = self.window.saturating_sub(self.read_buf.len() as u32);
+        let offset = seg_seq.wrapping_sub(self.rcv_nxt);
+        if offset >= space {
             return false;
         }
+        payload = &payload[..payload.len().min((space - offset) as usize)];
         if seg_seq == self.rcv_nxt {
-            self.read_buf.extend(payload.iter().copied());
-            self.rcv_nxt = self.rcv_nxt.wrapping_add(payload.len() as u32);
-            self.drain_oo();
+            let end = seg_seq.wrapping_add(payload.len() as u32);
+            while seq::lt(self.rcv_nxt, end) {
+                // Copy only a true gap, then drain previously stored bytes.
+                // This preserves first-received SACK content under overlap,
+                // and filling the head works even at the metadata count cap.
+                let next = self
+                    .oo
+                    .range(self.rcv_nxt..)
+                    .next()
+                    .or_else(|| self.oo.first_key_value())
+                    .map(|(&start, _)| start)
+                    .filter(|&start| seq::lt(start, end))
+                    .unwrap_or(end);
+                let from = self.rcv_nxt.wrapping_sub(seg_seq) as usize;
+                let count = next.wrapping_sub(self.rcv_nxt) as usize;
+                self.read_buf
+                    .extend(payload[from..from + count].iter().copied());
+                self.rcv_nxt = next;
+                self.drain_oo();
+            }
             self.try_consume_fin();
             true
         } else {
@@ -2874,20 +2896,59 @@ impl RxState {
     }
 
     fn store_oo(&mut self, seq_no: u32, payload: &[u8]) {
-        if self.oo.contains_key(&seq_no) || self.oo.len() >= MAX_REORDERED_SEGMENTS {
-            return; // duplicate or no metadata capacity; do not promise SACK
+        let slots = MAX_REORDERED_SEGMENTS.saturating_sub(self.oo.len());
+        if slots == 0 {
+            return; // no metadata capacity; do not promise new receipt
         }
-        let win_end = self.rcv_nxt.wrapping_add(self.window);
-        let mut end = seq_no.wrapping_add(payload.len() as u32);
-        if seq::gt(end, win_end) {
-            end = win_end;
+        let end = seq_no.wrapping_add(payload.len() as u32);
+        // One predecessor may cover our start (including across u32 wrap).
+        // Visit only starts inside the new range: O(log n + overlaps), not a
+        // scan of the whole map for each following segment of a large gap.
+        let preceding = self
+            .oo
+            .range(..seq_no)
+            .next_back()
+            .or_else(|| self.oo.last_key_value())
+            .filter(|&(&start, _)| seq::lt(start, seq_no));
+        let (first, second) = if seq_no < end {
+            (self.oo.range(seq_no..end), self.oo.range(0..0))
+        } else {
+            (self.oo.range(seq_no..), self.oo.range(..end))
+        };
+        let mut cursor = seq_no;
+        let mut gaps = Vec::new();
+        for (&start, data) in preceding.into_iter().chain(first).chain(second) {
+            if seq::gt(start, cursor) {
+                gaps.push((cursor, start.wrapping_sub(cursor) as usize));
+                if gaps.len() == slots {
+                    break;
+                }
+            }
+            cursor = seq::max(cursor, start.wrapping_add(data.len() as u32));
+            if seq::geq(cursor, end) {
+                break;
+            }
         }
-        let len = end.wrapping_sub(seq_no) as usize;
-        if len == 0 || len > payload.len() {
-            return;
+        if gaps.len() < slots && seq::lt(cursor, end) {
+            gaps.push((cursor, end.wrapping_sub(cursor) as usize));
         }
-        self.oo.insert(seq_no, payload[..len].to_vec());
-        self.oo_bytes += len;
+        for (start, len) in gaps {
+            let from = start.wrapping_sub(seq_no) as usize;
+            self.oo.insert(start, payload[from..from + len].to_vec());
+            self.oo_bytes += len;
+        }
+    }
+
+    /// End of the stored interval containing this byte, with modular ordering.
+    fn stored_end(&self, point: u32) -> Option<u32> {
+        self.oo
+            .range(..=point)
+            .next_back()
+            .or_else(|| self.oo.last_key_value())
+            .and_then(|(&start, bytes)| {
+                let end = start.wrapping_add(bytes.len() as u32);
+                (seq::geq(point, start) && seq::lt(point, end)).then_some(end)
+            })
     }
 
     fn drain_oo(&mut self) {
@@ -3009,6 +3070,97 @@ mod tests {
             expected.extend(std::iter::repeat_n(0x31, MAX_REORDERED_SEGMENTS));
             expected.push(0x32);
             assert_eq!(received, expected);
+        }
+    }
+
+    #[test]
+    fn receive_capacity_matches_bitmap_with_overlap_reads_and_sequence_wrap() {
+        fn draw(state: &mut u64) -> usize {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (*state >> 32) as usize
+        }
+        let source: Vec<u8> = (0..1024).map(|i| (i ^ (i >> 8)) as u8).collect();
+        for start in [100u32, u32::MAX - 31, u32::MAX - 511] {
+            for seed in 1..=12 {
+                let mut state = seed;
+                let mut e = StreamEngine::accept(
+                    7,
+                    Config {
+                        recv_window: 64,
+                        ..Config::default()
+                    },
+                    0,
+                    500,
+                );
+                e.rx.rcv_nxt = start;
+                let mut known = vec![false; source.len()];
+                let mut prefix = 0usize;
+                let mut read = 0usize;
+                for _ in 0..1500 {
+                    if draw(&mut state).is_multiple_of(4) {
+                        let mut buf = vec![0; draw(&mut state) % 33];
+                        let n = e.read(&mut buf);
+                        assert_eq!(n, buf.len().min(prefix - read));
+                        assert_eq!(&buf[..n], &source[read..read + n]);
+                        read += n;
+                    }
+                    let offset = prefix.saturating_sub(24) + draw(&mut state) % 128;
+                    if offset < source.len() {
+                        let end = (offset + 1 + draw(&mut state) % 96).min(source.len());
+                        // Independent byte bitmap: acknowledge only positions
+                        // inside current app credit, and never forget receipt.
+                        for slot in known
+                            .iter_mut()
+                            .take(end.min(read + 64))
+                            .skip(offset.max(prefix))
+                        {
+                            *slot = true;
+                        }
+                        e.rx.accept(start.wrapping_add(offset as u32), &source[offset..end]);
+                    }
+                    while prefix < known.len() && known[prefix] {
+                        prefix += 1;
+                    }
+                    assert_eq!(e.rx.rcv_nxt, start.wrapping_add(prefix as u32));
+                    assert_eq!(
+                        e.rx.read_buf.iter().copied().collect::<Vec<_>>(),
+                        source[read..prefix]
+                    );
+                    assert!(e.rx.read_buf.len() + e.rx.oo_bytes <= 64);
+                    assert_eq!(e.rx.oo_bytes, e.rx.oo.values().map(Vec::len).sum::<usize>());
+                    let mut held = vec![false; source.len()];
+                    held[..prefix].fill(true);
+                    for (&at, bytes) in &e.rx.oo {
+                        let off = at.wrapping_sub(start) as usize;
+                        assert!(off > prefix && off + bytes.len() <= read + 64);
+                        assert_eq!(bytes.as_slice(), &source[off..off + bytes.len()]);
+                        for slot in &mut held[off..off + bytes.len()] {
+                            assert!(!*slot, "overlapping range stored more than once");
+                            *slot = true;
+                        }
+                    }
+                    assert_eq!(
+                        held, known,
+                        "SACKed bytes disappeared or unreceived bytes appeared"
+                    );
+                }
+                while read < source.len() {
+                    let next = e.rx.rcv_nxt.wrapping_sub(start) as usize;
+                    let edge = (read + 64).min(source.len());
+                    if next < edge {
+                        e.rx.accept(start.wrapping_add(next as u32), &source[next..edge]);
+                    }
+                    let mut buf = [0; 64];
+                    let n = e.read(&mut buf);
+                    assert!(n > 0, "head gap cannot be filled after overlap");
+                    assert_eq!(&buf[..n], &source[read..read + n]);
+                    read += n;
+                }
+                assert!(e.rx.oo.is_empty());
+                assert_eq!(e.rx.oo_bytes, 0);
+            }
         }
     }
 

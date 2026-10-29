@@ -11,6 +11,7 @@ use veil_onion_stream::{CellDuplex, Config, End, Frame, OnionStream};
 struct Observations {
     acks: Vec<(u32, u32)>,
     closed: usize,
+    losses: usize,
 }
 
 #[derive(Default)]
@@ -48,6 +49,95 @@ impl CellDuplex for Carrier {
         self.witness.state.lock().unwrap().closed += 1;
         self.witness.changed.notify_one();
     }
+
+    async fn on_data_rto(&mut self, _: u32, _: u32, _: u32) {
+        self.witness.state.lock().unwrap().losses += 1;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_real_receiver_refuses_probes_then_resumes_without_byte_loss() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (a_tx, b_rx) = mpsc::channel(128);
+        let (b_tx, a_rx) = mpsc::channel(128);
+        let witness = Arc::new(Witness::default());
+        let cfg = Config {
+            mss: 16,
+            recv_window: 32,
+            init_cwnd: 32,
+            ack_every: 1,
+            init_rto_ms: 50,
+            min_rto_ms: 50,
+            max_rto_ms: 400,
+            max_retransmits: 2,
+            rack: true,
+            rto_rewind_no_sack: true,
+            ..Config::default()
+        };
+        let sender = OnionStream::connect(
+            Carrier {
+                tx: a_tx,
+                rx: a_rx,
+                record_ack: false,
+                witness: witness.clone(),
+            },
+            cfg,
+            7,
+            100,
+        );
+        let mut receiver = OnionStream::accept(
+            Carrier {
+                tx: b_tx,
+                rx: b_rx,
+                record_ack: true,
+                witness: witness.clone(),
+            },
+            cfg,
+            7,
+            500,
+        );
+        let payload: Vec<u8> = (0..2048).map(|i| (i ^ (i >> 8)) as u8).collect();
+        sender.write_all(&payload).await.unwrap();
+        sender.finish().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let refused = witness
+            .state
+            .lock()
+            .unwrap()
+            .acks
+            .windows(2)
+            .filter(|pair| pair[0].1 == 0 && pair[1] == pair[0])
+            .count();
+        assert!(
+            refused > 2,
+            "full receiver accepted probes instead of holding the cumulative ACK"
+        );
+        let mut got = Vec::new();
+        let mut buf = [0; 256];
+        loop {
+            let n = receiver.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, payload);
+        loop {
+            let changed = witness.changed.notified();
+            if witness.state.lock().unwrap().closed == 2 {
+                break;
+            }
+            changed.await;
+        }
+        assert_eq!(witness.state.lock().unwrap().losses, 0);
+        eprintln!(
+            "real_receiver_refusals={refused} bytes={} drivers_closed=2 loss_events=0",
+            got.len()
+        );
+        drop(sender);
+    })
+    .await
+    .expect("real receiver capacity watchdog expired");
 }
 
 async fn next_ack(witness: &Witness, cursor: &mut usize) -> (u32, u32) {
