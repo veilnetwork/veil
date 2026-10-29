@@ -1064,8 +1064,37 @@ impl DhtMlKemEkResolver {
         target_node_id: [u8; 32],
         instance_id: [u8; 16],
     ) -> Option<VerifiedMlkemCert> {
-        // ── Step 1: IdentityDocument (same walk as the singular resolve) ────
-        let doc = self.fetch_verified_document(target_node_id, None).await?;
+        // The authenticated session already named the instance, so BOTH DHT
+        // keys are known. Overlap their replica waits instead of charging the
+        // cold send two sequential timeouts. Certificate bytes are only a
+        // bounded prefetch: no cert cache/store/key publication until the
+        // freshest verified document has passed its durable authorization
+        // barrier below. A failed document cancels the other walk and its
+        // pending-query guard. Keep querying all replicas, not first-wins.
+        let cert_key = MlKemKeyCert::dht_key(&target_node_id, &instance_id);
+        let (doc, candidates) = tokio::try_join!(
+            async {
+                self.fetch_verified_document(target_node_id, None)
+                    .await
+                    .ok_or(())
+            },
+            async {
+                Ok::<_, ()>(
+                    recursive_dht_get_candidates(
+                        &self.dht,
+                        &self.session_tx_registry,
+                        &self.pending_recursive,
+                        self.local_node_id,
+                        cert_key,
+                        self.step_timeout,
+                        veil_proto::budget::DHT_REPLICATION_K,
+                        |bytes| MlKemKeyCert::decode(bytes).is_ok(),
+                    )
+                    .await,
+                )
+            },
+        )
+        .ok()?;
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
@@ -1075,31 +1104,28 @@ impl DhtMlKemEkResolver {
         // Freshest-of-candidates by the cert's own supersede order, exactly as
         // in the singular walk (see the Step-3 comment there for why
         // first-replica-wins was a production message-loss path).
-        let cert_key = MlKemKeyCert::dht_key(&target_node_id, &instance_id);
         // Why a candidate was thrown away, kept for the miss line below: the
         // filter drops every cert that does not verify, so a miss alone cannot
         // tell "nobody holds it" from "it is there and our document does not
         // vouch for it" — and the second is what a device linked after the
         // document we hold looks like.
         let rejected: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-        let from_dht = match self
-            .dht_get_freshest(
-                cert_key,
-                |b| {
-                    MlKemKeyCert::decode(b).ok().filter(|c| {
-                        match verify_mlkem_cert(c, &doc, now_unix) {
-                            Ok(_) => true,
-                            Err(e) => {
-                                *lock!(rejected) = Some(format!("{e:?}"));
-                                false
-                            }
+        let from_dht = match self.select_freshest_candidate(
+            cert_key,
+            candidates,
+            |b| {
+                MlKemKeyCert::decode(b).ok().filter(|c| {
+                    match verify_mlkem_cert(c, &doc, now_unix) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            *lock!(rejected) = Some(format!("{e:?}"));
+                            false
                         }
-                    })
-                },
-                |c| (c.cert_version, c.valid_from_unix),
-            )
-            .await
-        {
+                    }
+                })
+            },
+            |c| (c.cert_version, c.valid_from_unix),
+        ) {
             Some(cert) => match verify_mlkem_cert(&cert, &doc, now_unix) {
                 Ok(verified) => {
                     self.cert_store.remember(&cert, now_unix);
@@ -1437,6 +1463,19 @@ impl DhtMlKemEkResolver {
             |b| decode_verify(b).is_some(),
         )
         .await;
+        self.select_freshest_candidate(key, candidates, decode_verify, freshness)
+    }
+
+    /// Called only with the final verifier, including the current authorized
+    /// document for prefetched certificates. Unverified bytes must never repair
+    /// the local mirror or enter the verified-key caches.
+    fn select_freshest_candidate<T>(
+        &self,
+        key: [u8; 32],
+        candidates: Vec<Vec<u8>>,
+        decode_verify: impl Fn(&[u8]) -> Option<T>,
+        freshness: impl Fn(&T) -> (u64, u64),
+    ) -> Option<T> {
         let mut decoded: Vec<(T, Vec<u8>)> = candidates
             .into_iter()
             .filter_map(|bytes| decode_verify(&bytes).map(|v| (v, bytes)))
@@ -2477,6 +2516,178 @@ mod tests {
             Arc::new(crate::mlkem_cert_store::MlKemCertStore::ephemeral()),
             Arc::new(NodeLogger::new_noop()),
         )
+    }
+
+    fn current_cert_signer(seed: u8) -> crate::mlkem_cert_store::fixture::Signer {
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let mut fixture = crate::mlkem_cert_store::fixture::signer(seed);
+        let now = unix_now();
+        fixture.doc.issued_at_unix = now - 60;
+        fixture.doc.valid_until_unix = now + 3600;
+        let mut bytes = veil_proto::identity_document::DOC_SIG_CONTEXT.to_vec();
+        bytes.extend_from_slice(&fixture.doc.canonical_signing_bytes());
+        fixture.doc.document_sig = SigningKey::from_bytes(&[seed ^ 0xff; 32])
+            .sign(&bytes)
+            .to_bytes()
+            .to_vec();
+        fixture
+    }
+
+    // Read the actual queued requests before answering either one. No elapsed
+    // time assertion: the certificate key is known from the session, so its
+    // request must not wait behind the document's replica timeout.
+    fn instance_requests(rx: &mut veil_session::FrameOutbox) -> Vec<RecursiveQueryPayload> {
+        (0..2)
+            .map(|_| {
+                let (_, frame) = rx
+                    .try_recv()
+                    .expect("document and certificate requests must both be in flight");
+                RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn instance_walk_overlaps_requests_and_keeps_the_freshest_verified_certificate() {
+        let signer = current_cert_signer(0x65);
+        let now = unix_now();
+        let target = signer.doc.node_id;
+        let instance = [0xab; 16];
+        let old = signer.cert(instance, now - 60, now + 1800, 1);
+        let fresh = signer.cert(instance, now - 30, now + 1800, 2);
+        let dht = Arc::new(KademliaService::new([1; 32]));
+        let resolver = make_test_resolver(Arc::clone(&dht));
+        let (mut a, mut b) = {
+            let mut reg = wlock!(resolver.session_tx_registry);
+            (reg.register([2; 32]), reg.register([3; 32]))
+        };
+        let mut lookup = Box::pin(resolver.fetch_verified_cert_for_instance(target, instance));
+        assert!(futures::poll!(lookup.as_mut()).is_pending());
+        let a_queries = instance_requests(&mut a);
+        let b_queries = instance_requests(&mut b);
+        let answer = |queries: Vec<RecursiveQueryPayload>, cert: &MlKemKeyCert| {
+            for query in queries {
+                let value = if query.target_key == IdentityDocument::dht_key(&target) {
+                    signer.doc.encode()
+                } else {
+                    assert_eq!(query.target_key, MlKemKeyCert::dht_key(&target, &instance));
+                    cert.encode()
+                };
+                lock!(resolver.pending_recursive)
+                    .remove(&query.query_id)
+                    .unwrap()
+                    .tx
+                    .send(value)
+                    .unwrap();
+            }
+        };
+        answer(a_queries, &old);
+        assert!(futures::poll!(lookup.as_mut()).is_pending());
+        assert!(rlock!(resolver.instance_cert_cache).is_empty());
+        answer(b_queries, &fresh);
+        let got = lookup.await.expect("verified fresh certificate");
+        assert_eq!(
+            got.cert_version, 2,
+            "the slower fresh replica must still win"
+        );
+        assert_eq!(got.instance_id, instance);
+        assert!(lock!(resolver.pending_recursive).is_empty());
+    }
+
+    #[tokio::test]
+    async fn prefetched_certificate_cannot_authorize_an_invalid_document_or_signature() {
+        for invalid_document in [true, false] {
+            let mut signer = current_cert_signer(0x66);
+            let now = unix_now();
+            let target = signer.doc.node_id;
+            let instance = [0xcd; 16];
+            let mut cert = signer.cert(instance, now - 60, now + 1800, 1);
+            if invalid_document {
+                signer.doc.document_sig[0] ^= 1;
+            } else {
+                cert.sig[0] ^= 1;
+            }
+            let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+            let mut rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+            let mut lookup = Box::pin(resolver.fetch_verified_cert_for_instance(target, instance));
+            assert!(futures::poll!(lookup.as_mut()).is_pending());
+            for query in instance_requests(&mut rx) {
+                let value = if query.target_key == IdentityDocument::dht_key(&target) {
+                    signer.doc.encode()
+                } else {
+                    cert.encode()
+                };
+                lock!(resolver.pending_recursive)
+                    .remove(&query.query_id)
+                    .unwrap()
+                    .tx
+                    .send(value)
+                    .unwrap();
+            }
+            assert!(lookup.await.is_none());
+            assert!(rlock!(resolver.instance_cert_cache).is_empty());
+            assert!(rlock!(resolver.peer_ratchet_keys).is_empty());
+            assert!(resolver.cert_store.is_empty());
+            assert!(lock!(resolver.pending_recursive).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn prefetched_certificate_waits_for_the_host_authorization_checkpoint() {
+        let signer = current_cert_signer(0x67);
+        let now = unix_now();
+        let target = signer.doc.node_id;
+        let instance = [0xab; 16];
+        let cert = signer.cert(instance, now - 60, now + 1800, 1);
+        let dht = Arc::new(KademliaService::new([1; 32]));
+        dht.store_local(IdentityDocument::dht_key(&target), signer.doc.encode());
+        dht.store_local(MlKemKeyCert::dht_key(&target, &instance), cert.encode());
+        let resolver = make_test_resolver(dht);
+        resolver
+            .cert_store
+            .restore_peer_authorization(br#"{"version":1,"entries":[]}"#, now)
+            .unwrap();
+        let mut lookup = Box::pin(resolver.fetch_verified_cert_for_instance(target, instance));
+        assert!(futures::poll!(lookup.as_mut()).is_pending());
+        assert!(resolver.cert_store.peer_authorization_is_pending(&target));
+        assert!(rlock!(resolver.instance_cert_cache).is_empty());
+        assert!(rlock!(resolver.peer_ratchet_keys).is_empty());
+        assert!(resolver.cert_store.is_empty());
+        let (revision, _) = resolver.cert_store.export_peer_authorization().unwrap();
+        resolver
+            .cert_store
+            .acknowledge_peer_authorization(revision)
+            .unwrap();
+        assert_eq!(
+            lookup.await.expect("durably authorized key").instance_id,
+            instance
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_document_cancels_the_still_pending_certificate_prefetch() {
+        let mut signer = current_cert_signer(0x68);
+        signer.doc.document_sig[0] ^= 1;
+        let target = signer.doc.node_id;
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        let mut rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+        let mut lookup = Box::pin(resolver.fetch_verified_cert_for_instance(target, [0xab; 16]));
+        assert!(futures::poll!(lookup.as_mut()).is_pending());
+        let queries = instance_requests(&mut rx);
+        let document_query = queries
+            .iter()
+            .find(|q| q.target_key == IdentityDocument::dht_key(&target))
+            .unwrap();
+        lock!(resolver.pending_recursive)
+            .remove(&document_query.query_id)
+            .unwrap()
+            .tx
+            .send(signer.doc.encode())
+            .unwrap();
+        assert_eq!(lock!(resolver.pending_recursive).len(), 1);
+        assert!(lookup.await.is_none());
+        assert!(lock!(resolver.pending_recursive).is_empty());
+        assert!(rlock!(resolver.instance_cert_cache).is_empty());
     }
 
     #[test]
