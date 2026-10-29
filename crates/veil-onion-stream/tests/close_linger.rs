@@ -15,6 +15,8 @@ use veil_onion_stream::{CellDuplex, Config, Frame, OnionStream, StreamEngine};
 struct Link {
     tx: mpsc::UnboundedSender<Vec<u8>>,
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    lingering: Arc<AtomicUsize>,
+    closed: Arc<AtomicUsize>,
 }
 impl CellDuplex for Link {
     async fn send_cell(&mut self, cell: &[u8]) -> io::Result<()> {
@@ -24,6 +26,12 @@ impl CellDuplex for Link {
     }
     async fn recv_cell(&mut self) -> io::Result<Option<Vec<u8>>> {
         Ok(self.rx.recv().await)
+    }
+    async fn on_stream_linger(&mut self, _stream_id: u32) {
+        self.lingering.fetch_add(1, Ordering::Relaxed);
+    }
+    async fn on_stream_closed(&mut self, _stream_id: u32, _end: veil_onion_stream::End) {
+        self.closed.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -85,11 +93,33 @@ async fn lost_final_ack(graceful_drop: bool) {
             }
         }
     });
-    let mut stream = OnionStream::connect(Link { tx, rx }, cfg, 7, 100);
+    let lingering = Arc::new(AtomicUsize::new(0));
+    let closed = Arc::new(AtomicUsize::new(0));
+    let mut stream = OnionStream::connect(
+        Link {
+            tx,
+            rx,
+            lingering: lingering.clone(),
+            closed: closed.clone(),
+        },
+        cfg,
+        7,
+        100,
+    );
     stream.write_all(b"12345678").await.unwrap();
     stream.finish().await.unwrap();
     let mut buf = [0; 8];
     assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
+    assert_eq!(
+        lingering.load(Ordering::Relaxed),
+        1,
+        "data admission was not released before the close lease"
+    );
+    assert_eq!(
+        closed.load(Ordering::Relaxed),
+        0,
+        "the final-ACK return route closed too early"
+    );
     assert!(
         !peer.is_finished(),
         "application EOF must precede the close repair"

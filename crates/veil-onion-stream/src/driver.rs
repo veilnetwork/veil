@@ -114,6 +114,11 @@ pub trait CellDuplex: Send {
         let _ = (stream_id, consec_rto, snd_una);
         std::future::ready(())
     }
+    /// Both byte directions finished; retain only the final-ACK return path.
+    fn on_stream_linger(&mut self, stream_id: u32) -> impl Future<Output = ()> + Send {
+        let _ = stream_id;
+        std::future::ready(())
+    }
     fn on_stream_closed(&mut self, stream_id: u32, end: End) -> impl Future<Output = ()> + Send {
         let _ = (stream_id, end);
         std::future::ready(())
@@ -898,6 +903,7 @@ async fn drive<D: CellDuplex>(
             .await;
     }
     if let Some((duration_ms, ack)) = linger {
+        duplex.on_stream_linger(stream_id).await;
         linger_completed(&mut duplex, &mut reset_rx, duration_ms, &ack).await;
     }
     duplex.on_stream_closed(stream_id, end_of(&end)).await;
