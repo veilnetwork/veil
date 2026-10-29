@@ -501,6 +501,39 @@ const REPAIR_RESERVE: usize = 8;
 const MAX_RX_BURST: usize = 256;
 const DEBUG_SUMMARY_ENV: &str = "VEIL_ONION_STREAM_DEBUG_SUMMARY_MS";
 
+fn drain_app_commands(
+    engine: &mut StreamEngine,
+    cmd_rx: &mut mpsc::Receiver<AppCmd>,
+    cmd_open: &mut bool,
+    first: Option<AppCmd>,
+) {
+    let mut next = first;
+    for admitted in 0..APP_COMMAND_CAPACITY {
+        match next {
+            Some(AppCmd::Write(d)) => {
+                engine.write(&d);
+            }
+            Some(AppCmd::Finish) => {
+                engine.finish();
+                break;
+            }
+            None => {
+                *cmd_open = false;
+                engine.finish();
+                break;
+            }
+        }
+        if admitted + 1 == APP_COMMAND_CAPACITY || engine.send_buffer_len() >= SEND_HIGH_WATER {
+            break;
+        }
+        next = match cmd_rx.try_recv() {
+            Ok(cmd) => Some(cmd),
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => None,
+        };
+    }
+}
+
 fn debug_summary_period_ms(configured: u64) -> Option<u64> {
     let from_env = std::env::var(DEBUG_SUMMARY_ENV)
         .ok()
@@ -776,32 +809,6 @@ async fn drive<D: CellDuplex>(
                     break;
                 }
             }
-            cmd = cmd_rx.recv(), if cmd_open && engine.send_buffer_len() < SEND_HIGH_WATER => {
-                // Coalesce only already-ready writes before polling DATA. In
-                // particular, 2 KiB SDK writes must not each create a nearly
-                // empty padded tail when the carrier MSS is slightly smaller.
-                // Never await a batch, cross FIN, or bypass the high-water
-                // guard. The bounded turn still polls control/inbound/timers
-                // between carrier bursts, even with a continuously busy app.
-                let mut next = cmd;
-                for admitted in 0..APP_COMMAND_CAPACITY {
-                    match next {
-                        Some(AppCmd::Write(d)) => { engine.write(&d); }
-                        Some(AppCmd::Finish) => { engine.finish(); break; }
-                        None => { cmd_open = false; engine.finish(); break; }
-                    }
-                    if admitted + 1 == APP_COMMAND_CAPACITY
-                        || engine.send_buffer_len() >= SEND_HIGH_WATER
-                    {
-                        break;
-                    }
-                    next = match cmd_rx.try_recv() {
-                        Ok(cmd) => Some(cmd),
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => None,
-                    };
-                }
-            }
             inbound = duplex.recv_cells(&mut rx_cells, MAX_RX_BURST) => {
                 match inbound {
                     Ok(n) if n > 0 => {
@@ -810,11 +817,23 @@ async fn drive<D: CellDuplex>(
                     }
                     Ok(_) | Err(_) => { engine.reset(reset_reason::TIMED_OUT); } // circuit closed
                 }
+                // Prefer ready ACKs over app writes, but admit a bounded batch
+                // here too so continuous inbound traffic cannot starve writers.
+                if cmd_open && !engine.is_closed() && engine.send_buffer_len() < SEND_HIGH_WATER {
+                    match cmd_rx.try_recv() {
+                        Ok(cmd) => drain_app_commands(&mut engine, &mut cmd_rx, &mut cmd_open, Some(cmd)),
+                        Err(mpsc::error::TryRecvError::Empty) => (),
+                        Err(mpsc::error::TryRecvError::Disconnected) =>
+                            drain_app_commands(&mut engine, &mut cmd_rx, &mut cmd_open, None),
+                    }
+                }
             }
-            () = wait_until(&base, timeout_at) => {
-                let n = now_ms(&base);
-                engine.on_timeout(n);
+            cmd = cmd_rx.recv(), if cmd_open && engine.send_buffer_len() < SEND_HIGH_WATER => {
+                // Coalesce only already-ready writes; never await a batch,
+                // cross FIN, or bypass the high-water bound.
+                drain_app_commands(&mut engine, &mut cmd_rx, &mut cmd_open, cmd);
             }
+            () = wait_until(&base, timeout_at) => {}
             // Delivered bytes are stuck because `data_tx` was full — wake when the
             // app frees a slot so we can hand off the rest (without this, the
             // driver parks with read_buf > 0 and the close never completes).
@@ -832,6 +851,16 @@ async fn drive<D: CellDuplex>(
                     Err(_) => engine.reset(reset_reason::APP), // reader-only drop
                 }
             }
+        }
+        // Input/app traffic can remain continuously ready. Re-evaluate due
+        // protocol timers after EVERY bounded turn, after processing any ready
+        // ACKs, rather than relying on the lower-priority sleep branch winning.
+        let now = now_ms(&base);
+        if engine
+            .next_timeout_with_pacing(false)
+            .is_some_and(|deadline| now >= deadline)
+        {
+            engine.on_timeout(now);
         }
     }
 
