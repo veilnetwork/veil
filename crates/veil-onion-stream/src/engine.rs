@@ -378,9 +378,9 @@ struct TxState {
     /// Windowed minimum round-trip time (ms) and the time it was recorded.
     rtt_min: Option<(u32, u64)>,
     // ---- RACK time-threshold loss detection (maintained only when cfg.rack) ----
-    /// Send time of the most recently SENT original segment known delivered
-    /// (0 = none yet). Retransmitted segments never feed this: without wire
-    /// timestamps their ACK cannot be attributed to a specific transmission.
+    /// Send time of the most recently SENT segment known delivered (0 = none
+    /// yet). Repairs can advance it only after the minimum-RTT ambiguity check;
+    /// their timing never feeds the original-only RTT/reordering estimators.
     rack_xmit_ms: u64,
     /// End sequence of that segment — tie-break between equal send times.
     rack_end_seq: u32,
@@ -1027,7 +1027,8 @@ impl StreamEngine {
                 let s = &self.tx.segs[i];
                 if s.handed_off && !s.sacked && seq::geq(s.seq, r.start) && seq::leq(s.end(), r.end)
                 {
-                    let (sent_ms, end, retransmitted) = (s.sent_ms, s.end(), s.retransmitted);
+                    let (sent_ms, end, retransmitted, local_pending) =
+                        (s.sent_ms, s.end(), s.retransmitted, s.local_pending);
                     if !s.is_fin && seq::gt(end, old_una) {
                         newly_delivered += end.wrapping_sub(seq::max(s.seq, old_una));
                     }
@@ -1038,10 +1039,15 @@ impl StreamEngine {
                         self.tx.segs[i].sack_first_rtt_ms =
                             Some(now.saturating_sub(sent_ms).min(u64::from(u32::MAX)) as u32);
                         rtt_sent_ms = Some(rtt_sent_ms.map_or(sent_ms, |old| old.max(sent_ms)));
-                        if self.cfg.rack {
-                            self.tx
-                                .rack_on_delivery(sent_ms, end, now, prior_rack_frontier);
-                        }
+                    }
+                    if self.cfg.rack && !local_pending {
+                        self.tx.rack_on_delivery(
+                            sent_ms,
+                            end,
+                            now,
+                            prior_rack_frontier,
+                            retransmitted,
+                        );
                     }
                 }
             }
@@ -1087,10 +1093,15 @@ impl StreamEngine {
                             rtt_sent_ms =
                                 Some(rtt_sent_ms.map_or(s.sent_ms, |old| old.max(s.sent_ms)));
                         }
-                        if self.cfg.rack && !s.sacked {
-                            self.tx
-                                .rack_on_delivery(s.sent_ms, s.end(), now, prior_rack_frontier);
-                        }
+                    }
+                    if self.cfg.rack && s.handed_off && !s.local_pending && !s.sacked {
+                        self.tx.rack_on_delivery(
+                            s.sent_ms,
+                            s.end(),
+                            now,
+                            prior_rack_frontier,
+                            s.retransmitted,
+                        );
                     }
                     if s.is_fin {
                         self.tx.fin_acked = true;
@@ -2329,21 +2340,34 @@ impl TxState {
         }
     }
 
-    /// Record one delivered ORIGINAL segment into the RACK state. Advances the
-    /// "most recently sent, known delivered" point and, when the delivered
-    /// segment had been overtaken (a later send already delivered), learns the
-    /// reordering window from the gap. Already-SACKed bytes must never call
-    /// this again at cumulative ACK; compare with the pre-ACK frontier so ACK
-    /// field iteration order cannot manufacture a late delivery.
-    fn rack_on_delivery(&mut self, seg_sent_ms: u64, seg_end: u32, now: u64, prior_frontier: u64) {
+    /// Advance RACK's delivery point once per first receipt. RFC 8985 §6.2
+    /// permits repair timing when its age is at least the known minimum RTT.
+    /// Without a fresh original-only minimum, keep the conservative RTO path.
+    /// Repairs never train min RTT or original reordering: their ACK remains
+    /// ambiguous for those estimators (and for Karn's SRTT/BBR callers above).
+    fn rack_on_delivery(
+        &mut self,
+        seg_sent_ms: u64,
+        seg_end: u32,
+        now: u64,
+        prior_frontier: u64,
+        retransmitted: bool,
+    ) {
         let rtt = now.saturating_sub(seg_sent_ms).min(u64::from(u32::MAX)) as u32;
-        if self
+        if retransmitted {
+            let Some((minimum, at)) = self.rack_min_rtt else {
+                return;
+            };
+            if now.saturating_sub(at) > RACK_SAMPLE_WINDOW_MS || rtt < minimum {
+                return;
+            }
+        } else if self
             .rack_min_rtt
             .is_none_or(|(r, t)| rtt <= r || now.saturating_sub(t) > RACK_SAMPLE_WINDOW_MS)
         {
             self.rack_min_rtt = Some((rtt.max(1), now));
         }
-        if prior_frontier > seg_sent_ms {
+        if !retransmitted && prior_frontier > seg_sent_ms {
             // A newly reported original trails the previous ACK's frontier.
             // The send-time gap is one reordering signal; matched D-SACKs
             // separately cover repairs that made original timing ambiguous.
@@ -4708,6 +4732,148 @@ mod tests {
             "SACK RTO should still mark proven holes for paced repair"
         );
     }
+    fn rack_repaired_flight() -> StreamEngine {
+        let mut e = repeated_sack_holes(true);
+        e.cfg.rack = true;
+        e.tx.rack_xmit_ms = 10;
+        e.tx.rack_rtt_ms = 20;
+        e.tx.rack_min_rtt = Some((20, 10));
+        e.tx.rto_ms = 10_000;
+        e.tx.rto_deadline = Some(10_000);
+        for (s, sent) in e.tx.segs.iter_mut().take(3).zip([100, 120, 140]) {
+            s.sent_ms = sent;
+        }
+        e
+    }
+
+    #[test]
+    fn rack_delivered_repair_exposes_earlier_lost_repairs_without_another_rto() {
+        let mut e = rack_repaired_flight();
+        let mut sacks = SackVec::new();
+        sacks.push(SackRange {
+            start: 133,
+            end: 149,
+        });
+        e.on_ack(101, 4096, &sacks, 230);
+        assert!(e.tx.segs[0].needs_resend && e.tx.segs[1].needs_resend);
+        assert!(!e.tx.segs[2].needs_resend);
+        assert_eq!(e.tx.rack_xmit_ms, 140);
+        assert_eq!(e.tx.consec_rto, 0);
+        let mut cell = Vec::new();
+        assert!(e.poll_transmit(230, &mut cell));
+        assert!(matches!(
+            Frame::decode(&cell),
+            Some(Frame::Data { seq: 101, .. })
+        ));
+    }
+
+    #[test]
+    fn rack_cumulative_repair_can_expose_older_sequence_later_holes() {
+        let mut e = rack_repaired_flight();
+        // The head repair was sent after the other repairs. Its receipt is
+        // useful evidence even though its sequence number is lower.
+        e.tx.segs[0].sent_ms = 200;
+        e.on_ack(117, 4096, &SackVec::new(), 230);
+        assert_eq!(e.tx.rack_xmit_ms, 200);
+        assert!(e.tx.segs[0].needs_resend && e.tx.segs[1].needs_resend);
+        assert_eq!(e.tx.consec_rto, 0);
+    }
+
+    #[test]
+    fn rack_repair_timing_keeps_karn_estimators_and_original_reordering_unchanged() {
+        let mut e = rack_repaired_flight();
+        let old = (e.tx.srtt, e.tx.rttvar, e.tx.rack_min_rtt, e.tx.rtt_min);
+        let mut sacks = SackVec::new();
+        sacks.push(SackRange {
+            start: 133,
+            end: 149,
+        });
+        e.on_ack(101, 4096, &sacks, 230);
+        assert_eq!(e.tx.rack_rtt_ms, 90);
+        assert_eq!(
+            (e.tx.srtt, e.tx.rttvar, e.tx.rack_min_rtt, e.tx.rtt_min),
+            old
+        );
+        assert_eq!(e.tx.rack_reo_max_ms, 0);
+        let point = (e.tx.rack_xmit_ms, e.tx.rack_rtt_ms);
+        e.on_ack(149, 4096, &sacks, 250);
+        assert_eq!((e.tx.rack_xmit_ms, e.tx.rack_rtt_ms), point);
+    }
+
+    #[test]
+    fn rack_repair_delivery_requires_a_fresh_minimum_rtt_and_real_handoff() {
+        for mode in [
+            "early",
+            "missing-min",
+            "stale-min",
+            "local-pending",
+            "not-handed-off",
+        ] {
+            let mut e = rack_repaired_flight();
+            let now = if mode == "stale-min" { 30_011 } else { 230 };
+            match mode {
+                "early" => e.tx.segs[2].sent_ms = 220,
+                "missing-min" => e.tx.rack_min_rtt = None,
+                "local-pending" => e.tx.segs[2].local_pending = true,
+                "not-handed-off" => e.tx.segs[2].handed_off = false,
+                _ => {}
+            }
+            let mut sacks = SackVec::new();
+            sacks.push(SackRange {
+                start: 133,
+                end: 149,
+            });
+            e.on_ack(101, 4096, &sacks, now);
+            assert_eq!(e.tx.rack_xmit_ms, 10, "{mode}");
+            assert!(!e.tx.segs[0].needs_resend, "{mode}");
+        }
+    }
+
+    #[test]
+    fn rack_delivered_repair_preserves_the_carrier_reordering_floor() {
+        let mut e = rack_repaired_flight();
+        e.cfg.rack_reo_floor_ms = 8000;
+        let mut sacks = SackVec::new();
+        sacks.push(SackRange {
+            start: 133,
+            end: 149,
+        });
+        e.on_ack(101, 4096, &sacks, 230);
+        assert_eq!(e.tx.rack_deadline, Some(8190));
+        assert!(!e.tx.segs[0].needs_resend);
+        e.on_timeout(8189);
+        assert!(!e.tx.segs[0].needs_resend);
+        e.on_timeout(8190);
+        assert!(e.tx.segs[0].needs_resend);
+        assert_eq!(e.tx.consec_rto, 0);
+    }
+
+    #[test]
+    fn rack_repair_frontier_handles_equal_send_times_across_sequence_wrap() {
+        let mut e = rack_repaired_flight();
+        let offset = u32::MAX - 130;
+        e.tx.snd_una = e.tx.snd_una.wrapping_add(offset);
+        e.tx.snd_nxt = e.tx.snd_nxt.wrapping_add(offset);
+        for s in &mut e.tx.segs {
+            s.seq = s.seq.wrapping_add(offset);
+        }
+        for s in e.tx.segs.iter_mut().take(3) {
+            s.sent_ms = 140;
+        }
+        let mut sacks = SackVec::new();
+        sacks.push(SackRange {
+            start: e.tx.segs[2].seq,
+            end: e.tx.segs[2].end(),
+        });
+        e.on_ack(e.tx.snd_una, 4096, &sacks, 230);
+        assert_eq!(e.tx.rack_xmit_ms, 140);
+        assert_eq!(e.tx.rack_end_seq, 18);
+        assert!(!e.tx.segs[0].needs_resend);
+        e.on_timeout(235);
+        assert!(e.tx.segs[0].needs_resend && e.tx.segs[1].needs_resend);
+        assert_eq!(e.tx.consec_rto, 0);
+    }
+
     #[test]
     fn rack_delivery_counted_once() {
         let mut e = repeated_sack_holes(true);
