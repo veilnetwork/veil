@@ -1517,13 +1517,29 @@ impl DhtMlKemEkResolver {
     }
 }
 
+/// Release only this lookup's entries, including when its caller cancels the
+/// future. Successful replies may already have removed their entries.
+struct PendingQueries<'a> {
+    pending: &'a Mutex<std::collections::HashMap<[u8; 16], PendingRecursive>>,
+    ids: Vec<[u8; 16]>,
+}
+
+impl Drop for PendingQueries<'_> {
+    fn drop(&mut self) {
+        let mut pending = lock!(self.pending);
+        for id in &self.ids {
+            pending.remove(id);
+        }
+    }
+}
+
 /// Recursive DHT FIND_VALUE walk shared by the DHT resolvers (ML-KEM EK,
 /// relay-key, and rendezvous-ad). Mirrors `NodeRuntime::dht_recursive_get` but
 /// takes the shared references explicitly so it doesn't depend on any one
 /// resolver struct. Validated-local-fast-path (mirror-cache-poison resistant) →
 /// forward a `RecursiveQuery(FIND_VALUE)` to the top-2 closest session peers →
 /// await the matching `RecursiveResponse`. Returns `None` on local-miss +
-/// no-peers / timeout. `is_valid` gates ONLY the local fast path.
+/// no-peers / queue refusal / timeout. `is_valid` gates ONLY the local fast path.
 ///
 /// `direct_peer` is the **connected-peer fast path** for cold routing tables:
 /// when resolving a record that the target node itself is the authoritative
@@ -1611,7 +1627,11 @@ pub(crate) async fn recursive_dht_get(
         );
     }
 
-    {
+    let _queries = PendingQueries {
+        pending: pending_recursive,
+        ids: vec![query_id],
+    };
+    let admitted = {
         let guard = rlock!(session_tx_registry);
         // Connected-peer fast path: if we're resolving a record whose
         // authoritative holder is a node we have a live session to, ask only it
@@ -1622,22 +1642,27 @@ pub(crate) async fn recursive_dht_get(
             Some(dp) if peers.contains(&dp) => vec![dp],
             _ => peers.iter().take(2).copied().collect(),
         };
+        let mut admitted = false;
         for pid in &direct_targets {
-            guard.send_to(
+            admitted |= guard.send_to(
                 pid,
                 veil_proto::header::priority::INTERACTIVE,
                 frame.clone(),
             );
         }
+        admitted
+    };
+    if !admitted {
+        // The registry can still list a full/closing session. Waiting for its
+        // reply when no request entered any queue adds a full resolver timeout
+        // to local backpressure. Preserve the top-2 fan and connected-holder
+        // policy; only an actually admitted request may await a response.
+        return None;
     }
 
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(bytes)) => Some(bytes),
-        _ => {
-            let mut m = lock!(pending_recursive);
-            m.remove(&query_id);
-            None
-        }
+        _ => None,
     }
 }
 
@@ -1804,18 +1829,6 @@ where
 
     let deadline = tokio::time::Instant::now() + timeout;
     let query_ids: Vec<_> = sent.iter().map(|q| q.query_id).collect();
-    struct PendingQueries<'a> {
-        pending: &'a Mutex<std::collections::HashMap<[u8; 16], PendingRecursive>>,
-        ids: Vec<[u8; 16]>,
-    }
-    impl Drop for PendingQueries<'_> {
-        fn drop(&mut self) {
-            let mut pending = lock!(self.pending);
-            for id in &self.ids {
-                pending.remove(id);
-            }
-        }
-    }
     let queries = PendingQueries {
         pending: pending_recursive,
         ids: query_ids,
@@ -2254,6 +2267,117 @@ fn registry_freshness(r: &InstanceRegistry) -> (u64, u64) {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn recursive_get_with_no_queue_admission_finishes_without_waiting() {
+        let dht = Arc::new(KademliaService::new([1; 32]));
+        let peer = [2; 32];
+        let mut reg = SessionTxRegistry::with_capacity(1);
+        let _rx = reg.register(peer);
+        let mut filled = 0;
+        while reg.send_to(&peer, veil_proto::header::priority::INTERACTIVE, vec![0]) {
+            filled += 1;
+            assert!(filled < 100, "fixture queue must be bounded");
+        }
+        assert!(filled > 0);
+        let registry = Arc::new(RwLock::new(reg));
+        let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        for direct in [None, Some(peer)] {
+            let mut lookup = Box::pin(recursive_dht_get(
+                &dht,
+                &registry,
+                &pending,
+                [1; 32],
+                [3; 32],
+                Duration::from_secs(60),
+                direct,
+                |_| false,
+            ));
+            assert!(
+                matches!(
+                    futures::poll!(lookup.as_mut()),
+                    std::task::Poll::Ready(None)
+                ),
+                "no query entered a session queue, so no answer can arrive"
+            );
+            assert!(lock!(pending).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_recursive_get_releases_its_own_pending_query_only() {
+        let dht = Arc::new(KademliaService::new([1; 32]));
+        let mut reg = SessionTxRegistry::new();
+        let mut rx = reg.register([2; 32]);
+        let registry = Arc::new(RwLock::new(reg));
+        let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (other_tx, _other_rx) = tokio::sync::oneshot::channel();
+        lock!(pending).insert(
+            [9; 16],
+            PendingRecursive {
+                target_key: [9; 32],
+                query_type: recursive_query_type::FIND_VALUE,
+                tx: other_tx,
+            },
+        );
+        {
+            let mut lookup = Box::pin(recursive_dht_get(
+                &dht,
+                &registry,
+                &pending,
+                [1; 32],
+                [3; 32],
+                Duration::from_secs(60),
+                None,
+                |_| false,
+            ));
+            assert!(futures::poll!(lookup.as_mut()).is_pending());
+            assert!(rx.try_recv().is_ok(), "the query must really be queued");
+            assert_eq!(lock!(pending).len(), 2);
+        }
+        let remaining = lock!(pending);
+        assert_eq!(remaining.len(), 1, "cancellation must clean up immediately");
+        assert!(remaining.contains_key(&[9; 16]));
+    }
+
+    #[tokio::test]
+    async fn recursive_get_waits_for_an_admitted_second_peer_when_first_is_full() {
+        let dht = Arc::new(KademliaService::new([1; 32]));
+        let mut reg = SessionTxRegistry::with_capacity(1);
+        let _full_rx = reg.register([2; 32]);
+        let mut responsive = reg.register([3; 32]);
+        let mut filled = 0;
+        while reg.send_to(&[2; 32], veil_proto::header::priority::INTERACTIVE, vec![0]) {
+            filled += 1;
+            assert!(filled < 100);
+        }
+        assert!(filled > 0);
+        let registry = Arc::new(RwLock::new(reg));
+        let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut lookup = Box::pin(recursive_dht_get(
+            &dht,
+            &registry,
+            &pending,
+            [1; 32],
+            [0; 32],
+            Duration::from_secs(60),
+            None,
+            |_| false,
+        ));
+        assert!(futures::poll!(lookup.as_mut()).is_pending());
+        let (_, frame) = responsive
+            .try_recv()
+            .expect("the second peer must receive the query");
+        let query = RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+        lock!(pending)
+            .remove(&query.query_id)
+            .unwrap()
+            .tx
+            .send(b"answer".to_vec())
+            .unwrap();
+        assert_eq!(lookup.await, Some(b"answer".to_vec()));
+        assert!(lock!(pending).is_empty());
+    }
 
     #[tokio::test]
     async fn cancelled_candidate_lookup_releases_its_pending_queries() {
