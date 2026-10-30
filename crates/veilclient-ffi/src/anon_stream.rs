@@ -2306,7 +2306,7 @@ impl CircuitCells {
         envelope: &[u8],
         recoverable_data: bool,
     ) -> Result<(), veil_node_runtime::DataCircuitSendError> {
-        if recoverable_data {
+        let result = if recoverable_data {
             self.services.send_circuit_datagram_on_local_lane_detailed(
                 circuit,
                 envelope,
@@ -2314,7 +2314,31 @@ impl CircuitCells {
             )
         } else {
             self.services.send_circuit_cell_detailed(circuit, envelope)
+        };
+        if envelope.len() >= COOKIE_LEN + CIRCUIT_PEER_TAG_LEN
+            && let Some(observation) = veil_anonymity::circuit_trace::local(&envelope[COOKIE_LEN..])
+        {
+            // Endpoint-only interpretation. Relays only see the keyed token
+            // of opaque bytes, never this stream/range classification.
+            let frame = Frame::decode(&envelope[COOKIE_LEN + CIRCUIT_PEER_TAG_LEN..]);
+            let range = match frame {
+                Some(Frame::Data {
+                    stream_id,
+                    seq,
+                    payload,
+                    ..
+                }) => format!("sid={stream_id} data_seq={seq} data_len={}", payload.len()),
+                _ => "control=true".to_owned(),
+            };
+            diag(&format!(
+                "onion-stream-cell: event={} token={} prefix={} origin_cid={} {range} result={result:?}",
+                observation.event,
+                observation.token,
+                observation.prefix,
+                circuit.origin_circuit_id(),
+            ));
         }
+        result
     }
 
     /// Preserve the actual local enqueue result, including a missing session,
