@@ -273,7 +273,15 @@ async fn warming_ready_pool_reuses_routes_but_preserves_repair() {
             "unconfirmed" => f.circuit.confirmed_flag().store(false, Ordering::Relaxed),
             "cookie" => ready.peer_cookie = [0x53; COOKIE_LEN],
             "key" => ready.receiver_x25519_pk = [0x34; 32],
-            "generation" => ready.first_hop_close_generation += 1,
+            "generation" => {
+                f._outbox = f
+                    .cells
+                    .services
+                    .session_tx_registry
+                    .write()
+                    .unwrap()
+                    .register_owned(f.hop, [0x74; 32]);
+            }
             "dead" => {
                 f.cells
                     .services
@@ -942,6 +950,52 @@ async fn fixture() -> Fixture {
 }
 
 #[tokio::test]
+async fn ffi_route_health_uses_the_native_tx_registration_witness() {
+    for replaced in [true, false] {
+        let mut f = fixture().await;
+        f.circuit.confirmed_flag().store(true, Ordering::Release);
+        let mut route = protected_route(&f.circuit, f.cells.me);
+        let mut entries = vec![entry(&route, &[])];
+        if replaced {
+            // A replacement is visible before the old runner exits/bump occurs.
+            f._outbox = f
+                .cells
+                .services
+                .session_tx_registry
+                .write()
+                .unwrap()
+                .register_owned(f.hop, [0x74; 32]);
+        } else {
+            // Close-counter snapshots are diagnostic, not the lifetime authority.
+            route.first_hop_close_generation = route.first_hop_close_generation.wrapping_add(1);
+            entries[0].first_hop_close_generation = route.first_hop_close_generation;
+        }
+        let native_current = f.cells.services.data_circuit_session_current(&f.circuit);
+        let stale = f.cells.route_session_stale(&route);
+        let selected = f
+            .cells
+            .select_outbound_route(
+                [0xb9; 32],
+                &mut entries,
+                None,
+                RouteClass::Ack,
+                Instant::now(),
+            )
+            .is_some();
+        f.runtime.stop().await.unwrap();
+        assert_eq!(native_current, !replaced);
+        assert_eq!(
+            stale, replaced,
+            "FFI disagreed with the native circuit witness"
+        );
+        assert_eq!(
+            selected, !replaced,
+            "selector used a diagnostic counter as authority"
+        );
+    }
+}
+
+#[tokio::test]
 async fn stream_lookup_does_not_wait_for_a_mailbox_only_cache_to_expire() {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use veil_anonymity::rendezvous::{rendezvous_ad_dht_key_at, sign_rendezvous_ad_v5};
@@ -1357,7 +1411,10 @@ async fn striped_route_failure_preserves_nonprefix_pending_cells_and_suffix() {
     assert_eq!(pending.into_iter().collect::<Vec<_>>(), expected);
     assert_eq!(accepted, 2);
     assert_eq!(snapshot.data_cells, 2);
-    assert!(primary_failed && !alternate_cooled);
+    // An absent TX registration makes the old circuit stale. Retire that
+    // handle without quarantining the hop: a replacement session may already
+    // be connecting, and its routes must remain eligible.
+    assert!(!primary_failed && !alternate_cooled);
 }
 
 #[tokio::test]
@@ -1649,14 +1706,15 @@ async fn stale_session_eviction_preserves_a_ready_same_rendezvous_replacement() 
         node: [0xb9; 32],
         app: [0xbc; 32],
     };
-    let mut old = protected_route(&f.circuit, f.cells.me);
-    // The fixture keeps a real live outbox. Only the retained handle's
-    // generation differs, exactly the stale-handle guard used after reconnect.
-    old.first_hop_close_generation = f
+    let old = protected_route(&f.circuit, f.cells.me);
+    // Replace the actual TX entry while the old close counter is unchanged.
+    f._outbox = f
         .cells
         .services
-        .session_close_generation(&f.hop)
-        .wrapping_add(1);
+        .session_tx_registry
+        .write()
+        .unwrap()
+        .register_owned(f.hop, [0x74; 32]);
     assert!(f.cells.route_session_stale(&old));
     assert!(f.cells.services.has_live_session(&f.hop));
     let (fresh, _rx) = f
@@ -1687,7 +1745,13 @@ async fn stale_session_eviction_preserves_a_ready_same_rendezvous_replacement() 
         pins.insert((destination.node, 72, RouteClass::Ack), ready.clone());
     }
     while f._outbox.try_recv().is_ok() {}
-    f.cells.mark_route_stale(destination.node, &old).await;
+    f.cells
+        .mark_route_send_failed(
+            destination.node,
+            &old,
+            veil_node_runtime::DataCircuitSendError::NoRelays,
+        )
+        .await;
     let replacement_kept = f
         .cells
         .outbound_circuits
@@ -1758,12 +1822,14 @@ async fn stale_session_eviction_preserves_real_cooldowns_and_dead_hop_guards() {
             node: [0xb9; 32],
             app: [0xbc; 32],
         };
-        let mut old = protected_route(&f.circuit, f.cells.me);
-        old.first_hop_close_generation = f
+        let old = protected_route(&f.circuit, f.cells.me);
+        f._outbox = f
             .cells
             .services
-            .session_close_generation(&f.hop)
-            .wrapping_add(1);
+            .session_tx_registry
+            .write()
+            .unwrap()
+            .register_owned(f.hop, [0x74; 32]);
         let (fresh, _rx) = f
             .cells
             .services
@@ -3192,13 +3258,19 @@ async fn confirmed_last_resort_route_can_recover_its_observed_cooldown() {
             node: [0xb9; 32],
             app: [0xbc; 32],
         };
-        let mut ready = protected_route(&f.circuit, f.cells.me);
+        let ready = protected_route(&f.circuit, f.cells.me);
         ready
             .circuit
             .confirmed_flag()
             .store(mode != "unconfirmed", Ordering::Release);
         if mode == "stale_generation" {
-            ready.first_hop_close_generation += 1;
+            f._outbox = f
+                .cells
+                .services
+                .session_tx_registry
+                .write()
+                .unwrap()
+                .register_owned(f.hop, [0x74; 32]);
         }
         while f._outbox.try_recv().is_ok() {}
         if mode != "error_after_snapshot" {
