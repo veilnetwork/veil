@@ -563,6 +563,31 @@ async fn demux<S: CellSender>(
                     counters.route(tx, cell);
                 } else {
                     counters.unknown = counters.unknown.saturating_add(1);
+                    // Endpoint-only, opt-in and lifetime-bounded. No payload,
+                    // address or key is formatted; protocol offsets let a
+                    // private trace distinguish a late final credit/FIN from
+                    // unrelated stale traffic. The normal logger is queued.
+                    if let Some(id) = diagnostic_id
+                        && counters.unknown <= 64
+                    {
+                        let (kind, offset, bytes) = match frame {
+                            Frame::Syn { isn, .. } => ("syn", isn, 0),
+                            Frame::SynAck { isn, .. } => ("syn_ack", isn, 0),
+                            Frame::Data { seq, payload, .. } => ("data", seq, payload.len()),
+                            Frame::Ack { ack, .. } => ("ack", ack, 0),
+                            Frame::Fin { seq, .. } => ("fin", seq, 0),
+                            Frame::Rst { .. } => ("rst", 0, 0),
+                        };
+                        let sid_route = routes_g.keys().any(|(_, sid)| *sid == key.1);
+                        let alias_known = aliases
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .contains_key(&src.node);
+                        log::info!(
+                            "onion-stream-mux[{id}]: unknown_cell stream={} kind={kind} offset={offset} bytes={bytes} sid_route={sid_route} alias_known={alias_known}",
+                            key.1,
+                        );
+                    }
                 }
             }
         }
