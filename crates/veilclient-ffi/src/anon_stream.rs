@@ -4537,8 +4537,16 @@ fn try_open_circuit(
         // make the receiver storm re-register cycles; reset to 0 the moment
         // a cycle confirms its full relay set.
         let mut early_refresh_streak = 0u32;
+        let mut session_repair_relays: Option<HashSet<[u8; 32]>> = None;
+        let mut next_session_repair_at: Option<Instant> = None;
         loop {
             attempt += 1;
+            if session_repair_relays.is_some() {
+                if let Some(deadline) = next_session_repair_at {
+                    tokio::time::sleep(deadline.saturating_duration_since(Instant::now())).await;
+                }
+                next_session_repair_at = Some(Instant::now() + CIRCUIT_UNCONFIRMED_RETRY_AFTER);
+            }
             let opened = match open_inbound_circuits(
                 &services_bg,
                 me,
@@ -4546,6 +4554,7 @@ fn try_open_circuit(
                 &epoch_bg,
                 mode,
                 &path_group_bg,
+                session_repair_relays.as_ref(),
             )
             .await
             {
@@ -4583,12 +4592,14 @@ fn try_open_circuit(
                 // CircuitBuild is queued. Do not publish the handle until R has
                 // accepted the cookie registration and either CircuitBuilt or a
                 // loopback splice-probe echo came back.
-                if !confirm_circuit_with_probe(&services_bg, &candidate, &cookie).await {
+                if !confirm_circuit_with_probe(&services_bg, &candidate, &cookie).await
+                    || !services_bg.data_circuit_session_current(&candidate)
+                {
                     if let Some(relay) = relay {
                         diag_node(
                             &me,
                             &format!(
-                                "inbound circuit confirmation timed out at R={} (no ACK, no probe echo) — keeping receive sink for grace",
+                                "inbound circuit not confirmed on current session at R={} — keeping receive sink for grace",
                                 short_node(&relay)
                             ),
                         );
@@ -4621,6 +4632,7 @@ fn try_open_circuit(
                 continue;
             }
 
+            session_repair_relays = None;
             let retired = {
                 // MERGE the freshly confirmed circuits into the slot instead of
                 // replacing it wholesale (device-verified 2026-07-06): on a
@@ -4700,6 +4712,30 @@ fn try_open_circuit(
             loop {
                 tokio::time::sleep(CIRCUIT_REFRESH_POLL).await;
                 let now = Instant::now();
+                if mode == CircuitMode::PublishedRendezvous {
+                    let snapshot = circuit_slot.lock().await.clone();
+                    let stale = inbound_session_repair_relays(
+                        snapshot.iter().filter_map(|c| {
+                            c.relay_path()
+                                .last()
+                                .copied()
+                                .map(|relay| (relay, services_bg.data_circuit_session_current(c)))
+                        }),
+                        now,
+                        next_session_repair_at,
+                    );
+                    if !stale.is_empty() {
+                        diag_node(
+                            &me,
+                            &format!(
+                                "{} inbound registration(s) lost first-hop session — repairing affected relays",
+                                stale.len(),
+                            ),
+                        );
+                        session_repair_relays = Some(stale);
+                        break;
+                    }
+                }
                 // Keepalive: send a forward heartbeat UP each confirmed inbound
                 // circuit so its first-hop TCP session (and every hop's socket
                 // along the path) stays warm. Without it an idle receiver's
@@ -4707,8 +4743,8 @@ fn try_open_circuit(
                 // behind a dead TCP until the receiver next transmits — the
                 // on-device delivery stalls. Snapshot the Arcs so the (sync)
                 // sends don't hold the slot lock; a QueueFull/NoRelays here is
-                // harmless (the next tick retries, and a truly dead circuit is
-                // rotated by the idle-refresh below).
+                // harmless under backpressure. Known session losses are
+                // repaired above without waiting for hub-wide idle.
                 if now.saturating_duration_since(last_heartbeat) >= heartbeat_wait {
                     last_heartbeat = now;
                     heartbeat_wait = circuit_heartbeat_wait();
@@ -4924,6 +4960,22 @@ fn retain_stream_circuit_relays(
     });
 }
 
+/// A known local session loss warrants repair even while other streams keep
+/// the hub active. Rate-limit repair itself, not ordinary cell delivery.
+fn inbound_session_repair_relays(
+    circuits: impl IntoIterator<Item = ([u8; 32], bool)>,
+    now: Instant,
+    retry_at: Option<Instant>,
+) -> HashSet<[u8; 32]> {
+    if retry_at.is_some_and(|deadline| now < deadline) {
+        return HashSet::new();
+    }
+    circuits
+        .into_iter()
+        .filter_map(|(relay, current)| (!current).then_some(relay))
+        .collect()
+}
+
 async fn open_inbound_circuits(
     services: &veil_node_runtime::NodeServices,
     me: [u8; 32],
@@ -4931,6 +4983,7 @@ async fn open_inbound_circuits(
     epoch: &AtomicU64,
     mode: CircuitMode,
     path_group: &veil_node_runtime::LocalCircuitPathGroup,
+    repair_relays: Option<&HashSet<[u8; 32]>>,
 ) -> Result<Vec<OpenedInboundCircuit>, veil_types::AnonOnionSendError> {
     use veil_types::AnonOnionSendError;
 
@@ -4940,13 +4993,26 @@ async fn open_inbound_circuits(
             .await
             .map(|(circuit, rx)| vec![(None, circuit, rx)]),
         CircuitMode::PublishedRendezvous => {
-            let mut relays = services.local_published_rendezvous_relays();
-            for relay in services.pinned_rendezvous_relays() {
+            // Reconnect repair already knows the affected termini. Rebuild only
+            // those bindings; do not rotate healthy registrations or wait for a
+            // self-address DHT lookup before restoring a known receive path.
+            let mut relays: Vec<_> = if let Some(repair) = repair_relays {
+                repair.iter().copied().collect()
+            } else {
+                services.local_published_rendezvous_relays()
+            };
+            for relay in services
+                .pinned_rendezvous_relays()
+                .into_iter()
+                .filter(|_| repair_relays.is_none())
+            {
                 if !relays.contains(&relay) {
                     relays.push(relay);
                 }
             }
-            if let Ok(resolved) = services.resolve_stream_rendezvous_relays(me).await {
+            if repair_relays.is_none()
+                && let Ok(resolved) = services.resolve_stream_rendezvous_relays(me).await
+            {
                 for relay in resolved {
                     if !relays.contains(&relay) {
                         relays.push(relay);
@@ -5463,7 +5529,7 @@ async fn open_outbound_circuit(
             circuit: Arc::clone(&candidate),
             lifetime,
             rendezvous_node: ad.rendezvous_node_id,
-            first_hop_close_generation: services.session_close_generation(&first_hop),
+            first_hop_close_generation: candidate.first_hop_close_generation(),
             peer_tag,
             peer_cookie: ad.auth_cookie,
             receiver_x25519_pk: ad.receiver_x25519_pk,
@@ -6051,6 +6117,40 @@ mod tests {
     };
     use veil_anonymity::circuit_register::COOKIE_LEN;
     use veil_onion_stream::wire::{DATA_OVERHEAD, Frame, MAX_CELL};
+
+    #[test]
+    fn inbound_session_repair_preserves_healthy_relays_and_bounds_retries() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let healthy = [1; 32];
+        let stale = [2; 32];
+        let other_stale = [3; 32];
+        let pool = [
+            (healthy, true),
+            (stale, false),
+            (stale, false),
+            (other_stale, false),
+        ];
+        assert_eq!(
+            super::inbound_session_repair_relays(pool, now, None),
+            [stale, other_stale].into_iter().collect()
+        );
+        let retry = now + Duration::from_secs(30);
+        assert!(
+            super::inbound_session_repair_relays(
+                pool,
+                retry - Duration::from_nanos(1),
+                Some(retry)
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            super::inbound_session_repair_relays(pool, retry, Some(retry)),
+            [stale, other_stale].into_iter().collect()
+        );
+        assert!(super::inbound_session_repair_relays([(healthy, true)], retry, None).is_empty());
+        assert!(super::inbound_session_repair_relays([], retry, None).is_empty());
+    }
 
     #[test]
     fn private_media_registrations_cannot_replace_other_producers_at_a_relay() {

@@ -1200,6 +1200,13 @@ impl NodeServices {
             .unwrap_or(0)
     }
 
+    /// A replacement session does not inherit the relay's old circuit mapping.
+    /// This is a local lifetime check, not proof of end-to-end reachability.
+    pub fn data_circuit_session_current(&self, circuit: &DataCircuit) -> bool {
+        self.session_close_generation(&circuit.first_hop) == circuit.first_hop_close_generation
+            && self.has_live_session(&circuit.first_hop)
+    }
+
     /// Whether the session TX registry currently has a live sender for `peer`.
     /// Long-lived circuit handles use this as a cheap pre-flight guard: a route
     /// can become unusable before its close-generation observer has noticed the
@@ -1568,6 +1575,7 @@ impl NodeServices {
         if relay_path.is_empty() {
             return Err(AnonOnionSendError::NoRelays);
         }
+        let first_hop_close_generation = self.session_close_generation(&relay_path[0]);
         // Receive-capable only: we must own the origin table to open returns.
         let Some(origin_table) = &self.dispatcher.circuit_origin else {
             return Err(AnonOnionSendError::NoIdentity);
@@ -1603,6 +1611,7 @@ impl NodeServices {
         let circ = DataCircuit {
             _local_path: None,
             first_hop: origin.first_hop,
+            first_hop_close_generation,
             relay_path: relay_path.to_vec(),
             origin_circuit_id: origin.origin_circuit_id,
             keys: origin.circuit_keys.clone(),
@@ -2432,6 +2441,9 @@ impl NodeServices {
         }
         if circ.next_seq.load(std::sync::atomic::Ordering::Relaxed) == u32::MAX {
             return Err(DataCircuitSendError::NoRelays); // rotate even if ingress is full
+        }
+        if !self.data_circuit_session_current(circ) {
+            return Err(DataCircuitSendError::NoRelays);
         }
         let encode = || {
             let mut buf = wrap_payload(payload, circ.cell_bytes)

@@ -712,7 +712,7 @@ async fn cold_handshake_fallback_does_not_bypass_route_admission() {
         .encode();
         let mut pending = std::collections::VecDeque::from([encoded.clone()]);
         let result = f.cells.send_many(destination, &mut pending).await;
-        let untouched = pending == std::collections::VecDeque::from([encoded]);
+        let untouched = pending == [encoded];
         let emitted = f._outbox.try_recv().is_ok();
         let pinned = f
             .cells
@@ -3372,4 +3372,35 @@ async fn published_pool_prefix_is_usable_and_keeps_live_metadata_on_refill() {
     assert_eq!(cells_sent, 1);
     assert!(active > 0);
     assert!(ordered && preserved && same_activity && bounded);
+}
+
+#[tokio::test]
+async fn inbound_repair_ignores_backpressure_but_detects_a_closed_first_hop() {
+    let mut f = fixture().await;
+    let (healthy, healthy_hop, _healthy_outbox) = add_circuit(&f.cells.services);
+    f.circuit.confirmed_flag().store(true, Ordering::Release);
+    healthy.confirmed_flag().store(true, Ordering::Release);
+    let snapshot = [Arc::clone(&f.circuit), healthy];
+    let select = || {
+        inbound_session_repair_relays(
+            snapshot.iter().map(|c| {
+                (
+                    *c.relay_path().last().unwrap(),
+                    f.cells.services.data_circuit_session_current(c),
+                )
+            }),
+            Instant::now(),
+            None,
+        )
+    };
+    fill_ordinary_outbox(&f.cells, &f.circuit);
+    assert!(select().is_empty(), "a full queue is not a lost session");
+    f._outbox.close();
+    let affected = select();
+    f.runtime.stop().await.unwrap();
+    assert_eq!(affected, [f.hop].into_iter().collect());
+    assert!(
+        !affected.contains(&healthy_hop),
+        "healthy receive path was rotated"
+    );
 }
