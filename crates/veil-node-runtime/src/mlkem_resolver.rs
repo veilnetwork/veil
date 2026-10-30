@@ -262,6 +262,9 @@ pub struct DhtMlKemEkResolver {
     /// Documents already checked by this resolver. A certificate TTL is not
     /// permission to ignore a newer signed revocation in the local DHT.
     checked_documents: Mutex<std::collections::HashMap<NodeIdBytes, CheckedDocument>>,
+    /// Only overlapping full-document requests share a replica walk. Every
+    /// caller independently verifies the candidates and its durable host floor.
+    document_walks: Mutex<DocumentWalks>,
     /// One walk per device at a time: callers asking for the same device while
     /// a walk is running wait for it and read what it found.
     instance_walk_gates: Arc<Mutex<InstanceWalkGates>>,
@@ -287,6 +290,65 @@ struct CheckedDocument {
 /// device was named (`None` = the node's current certificate, whichever device).
 type InstanceKey = ([u8; 32], Option<[u8; 16]>);
 type InstanceWalkGates = std::collections::HashMap<InstanceKey, Arc<tokio::sync::Mutex<()>>>;
+
+const MAX_DOCUMENT_WALKS: usize = 64;
+type DocumentWalks = std::collections::HashMap<NodeIdBytes, Arc<DocumentWalk>>;
+
+struct DocumentWalk {
+    deadline: tokio::time::Instant,
+    candidates: tokio::sync::OnceCell<Vec<Vec<u8>>>,
+}
+
+/// Keep the wave alive through authorization, then discard the last result.
+/// OnceCell cancellation lets a remaining caller replace the initializer;
+/// retries retain the first wave's deadline, never restart its replica window.
+struct DocumentWalkLease<'a> {
+    walks: &'a Mutex<DocumentWalks>,
+    target: NodeIdBytes,
+    walk: Arc<DocumentWalk>,
+}
+
+impl<'a> DocumentWalkLease<'a> {
+    fn try_new(
+        walks: &'a Mutex<DocumentWalks>,
+        target: NodeIdBytes,
+        timeout: Duration,
+    ) -> Option<Self> {
+        let mut entries = lock!(walks);
+        let walk = if let Some(walk) = entries.get(&target) {
+            Arc::clone(walk)
+        } else {
+            // Saturation only disables coalescing for a new key, never lookup.
+            if entries.len() >= MAX_DOCUMENT_WALKS {
+                return None;
+            }
+            let walk = Arc::new(DocumentWalk {
+                deadline: tokio::time::Instant::now() + timeout,
+                candidates: tokio::sync::OnceCell::new(),
+            });
+            entries.insert(target, Arc::clone(&walk));
+            walk
+        };
+        Some(Self {
+            walks,
+            target,
+            walk,
+        })
+    }
+}
+
+impl Drop for DocumentWalkLease<'_> {
+    fn drop(&mut self) {
+        let mut entries = lock!(self.walks);
+        if Arc::strong_count(&self.walk) == 2
+            && entries
+                .get(&self.target)
+                .is_some_and(|walk| Arc::ptr_eq(walk, &self.walk))
+        {
+            entries.remove(&self.target);
+        }
+    }
+}
 
 /// Own the map entry while holding OR waiting for its async turn. A cancelled
 /// waiter must not remove the current owner's gate; the last caller removes
@@ -554,6 +616,7 @@ impl DhtMlKemEkResolver {
             step_timeout: DEFAULT_STEP_TIMEOUT,
             cert_ttl: CERT_CACHE_TTL,
             checked_documents: Mutex::new(std::collections::HashMap::new()),
+            document_walks: Mutex::new(DocumentWalks::new()),
             instance_walk_gates: Arc::new(Mutex::new(std::collections::HashMap::new())),
             instance_walk_misses: Arc::new(RwLock::new(std::collections::HashMap::new())),
             instance_miss_ttl: INSTANCE_MISS_TTL,
@@ -715,18 +778,50 @@ impl DhtMlKemEkResolver {
         // resolves), so the single steered walk stays.
         if direct_peer.is_none() {
             let started = veil_session::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
-            let doc = self
-                .dht_get_freshest(
-                    doc_key,
-                    |b| {
-                        IdentityDocument::decode(b).ok().filter(|d| {
-                            d.node_id == target_node_id
-                                && verify_identity_document(d, now_unix).is_ok()
-                        })
-                    },
-                    |d| (d.issued_at_unix, 0),
-                )
-                .await;
+            let wave =
+                DocumentWalkLease::try_new(&self.document_walks, target_node_id, self.step_timeout);
+            let mut candidates = if let Some(wave) = &wave {
+                wave.walk
+                    .candidates
+                    .get_or_init(|| {
+                        self.collect_document_candidates(
+                            doc_key,
+                            wave.walk
+                                .deadline
+                                .saturating_duration_since(tokio::time::Instant::now()),
+                        )
+                    })
+                    .await
+                    .clone()
+            } else {
+                self.collect_document_candidates(doc_key, self.step_timeout)
+                    .await
+            };
+            // Shared bytes are candidates only. No caller may repair the mirror
+            // or authorize from another caller's decode, clock or host barrier.
+            // A caller joining during the checkpoint must also compare evidence
+            // that arrived AFTER the network wave completed. Otherwise it could
+            // reinstall old bytes over a new local revocation publication.
+            for bytes in self.dht.get_local(&doc_key).into_iter().chain(
+                self.cert_store
+                    .document_floor
+                    .current(&target_node_id)
+                    .map(|doc| doc.encode()),
+            ) {
+                if !candidates.contains(&bytes) {
+                    candidates.push(bytes);
+                }
+            }
+            let doc = self.select_freshest_candidate(
+                doc_key,
+                candidates,
+                |b| {
+                    IdentityDocument::decode(b).ok().filter(|d| {
+                        d.node_id == target_node_id && verify_identity_document(d, now_unix).is_ok()
+                    })
+                },
+                |d| (d.issued_at_unix, 0),
+            );
             self.trace_resolve_stage(
                 &target_node_id,
                 "document_lookup",
@@ -795,6 +890,30 @@ impl DhtMlKemEkResolver {
             return None;
         }
         self.observe_document_ready(&doc).await.then_some(doc)
+    }
+
+    async fn collect_document_candidates(&self, key: [u8; 32], timeout: Duration) -> Vec<Vec<u8>> {
+        if timeout.is_zero() {
+            // A replacement initializer inherits an already-expired wave.
+            // Preserve its local candidate without issuing already-late queries.
+            return self
+                .dht
+                .get_local(&key)
+                .filter(|b| IdentityDocument::decode(b).is_ok())
+                .into_iter()
+                .collect();
+        }
+        recursive_key_material_candidates(
+            &self.dht,
+            &self.session_tx_registry,
+            &self.pending_recursive,
+            self.local_node_id,
+            key,
+            timeout,
+            veil_proto::budget::DHT_REPLICATION_K,
+            |b| IdentityDocument::decode(b).is_ok(),
+        )
+        .await
     }
 
     /// Resolve + verify the recipient's current ML-KEM cert — the full
@@ -1171,7 +1290,7 @@ impl DhtMlKemEkResolver {
             },
             async {
                 Ok::<_, ()>(
-                    recursive_dht_get_candidates(
+                    recursive_key_material_candidates(
                         &self.dht,
                         &self.session_tx_registry,
                         &self.pending_recursive,
@@ -1584,7 +1703,7 @@ impl DhtMlKemEkResolver {
         decode_verify: impl Fn(&[u8]) -> Option<T>,
         freshness: impl Fn(&T) -> (u64, u64),
     ) -> Option<T> {
-        let candidates = recursive_dht_get_candidates(
+        let candidates = recursive_key_material_candidates(
             &self.dht,
             &self.session_tx_registry,
             &self.pending_recursive,
@@ -1875,6 +1994,63 @@ pub(crate) async fn recursive_dht_get_candidates<F>(
 where
     F: Fn(&[u8]) -> bool,
 {
+    recursive_dht_get_candidates_policy(
+        dht,
+        session_tx_registry,
+        pending_recursive,
+        local_node_id,
+        key,
+        timeout,
+        max_peers,
+        false,
+        is_valid,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recursive_key_material_candidates<F>(
+    dht: &Arc<KademliaService>,
+    session_tx_registry: &Arc<RwLock<SessionTxRegistry>>,
+    pending_recursive: &Arc<Mutex<std::collections::HashMap<[u8; 16], PendingRecursive>>>,
+    local_node_id: [u8; 32],
+    key: [u8; 32],
+    timeout: Duration,
+    max_peers: usize,
+    is_valid: F,
+) -> Vec<Vec<u8>>
+where
+    F: Fn(&[u8]) -> bool,
+{
+    recursive_dht_get_candidates_policy(
+        dht,
+        session_tx_registry,
+        pending_recursive,
+        local_node_id,
+        key,
+        timeout,
+        max_peers,
+        true,
+        is_valid,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recursive_dht_get_candidates_policy<F>(
+    dht: &Arc<KademliaService>,
+    session_tx_registry: &Arc<RwLock<SessionTxRegistry>>,
+    pending_recursive: &Arc<Mutex<std::collections::HashMap<[u8; 16], PendingRecursive>>>,
+    local_node_id: [u8; 32],
+    key: [u8; 32],
+    timeout: Duration,
+    max_peers: usize,
+    retry_once: bool,
+    is_valid: F,
+) -> Vec<Vec<u8>>
+where
+    F: Fn(&[u8]) -> bool,
+{
     let mut out = Vec::new();
     if let Some(value) = dht.get_local(&key)
         && is_valid(&value)
@@ -1990,16 +2166,56 @@ where
                 veil_util::bytes_to_hex(&digest.as_bytes()[..8])
             });
             async move {
+                let walk_tag = trace.then(|| {
+                    veil_util::bytes_to_hex(&blake3::hash(&query.query_id).as_bytes()[..8])
+                });
+                // The peer may silently refuse before decode/dedup when its
+                // query token bucket is empty. Repeat once after refill time,
+                // with the SAME ID/TTL/body so its existing dedup entry suppresses
+                // another forward. Keep the original deadline.
+                let jitter_ms = u16::from_be_bytes([query.query_id[0], query.query_id[1]]) % 251;
+                let retry_at = tokio::time::Instant::now() + Duration::from_millis(500 + u64::from(jitter_ms));
+                let rx = query.rx;
+                tokio::pin!(rx);
+                if retry_once && retry_at < deadline {
+                    tokio::select! {
+                        biased;
+                        reply = &mut rx => return (query.peer, tag, walk_tag, Ok(reply)),
+                        _ = tokio::time::sleep_until(retry_at) => {}
+                    }
+                    if tokio::time::Instant::now() < deadline {
+                        let outcome = {
+                            let registry = rlock!(session_tx_registry);
+                            match registry.queued_for(&query.peer) {
+                                Some(0) => if registry.send_to(&query.peer, veil_proto::header::priority::INTERACTIVE, query.frame) { "accepted" } else { "refused" },
+                                Some(_) => "locally_queued",
+                                None => "missing",
+                            }
+                        };
+                        if trace {
+                            log::info!(
+                                "dht.candidates.retry op={} lookup={trace_lookup} local={} target={} peer={} outcome={outcome} elapsed_ms={} qtag={}",
+                                veil_ipc::route_trace::operation_id(),
+                                hex8(&local_node_id),
+                                hex8(&key),
+                                hex8(&query.peer),
+                                trace_started.elapsed().as_millis(),
+                                tag.as_deref().unwrap_or("off"),
+                            );
+                        }
+                    }
+                }
                 (
                     query.peer,
                     tag,
-                    tokio::time::timeout_at(deadline, query.rx).await,
+                    walk_tag,
+                    tokio::time::timeout_at(deadline, rx).await,
                 )
             }
         })
         .collect();
     use futures::StreamExt;
-    while let Some((peer, tag, reply)) = replies.next().await {
+    while let Some((peer, tag, walk_tag, reply)) = replies.next().await {
         let (outcome, bytes) = match reply {
             Ok(Ok(bytes)) => (
                 if bytes.is_empty() { "empty" } else { "value" },
@@ -2016,13 +2232,14 @@ where
         // Raw target/peer identifiers stay in private traces, never reports.
         if trace {
             log::info!(
-                "dht.candidates.reply target={} peer={} outcome={outcome} valid={valid} elapsed_ms={} op={} lookup={trace_lookup} local={} qtag={}",
+                "dht.candidates.reply target={} peer={} outcome={outcome} valid={valid} elapsed_ms={} op={} lookup={trace_lookup} local={} qtag={} walk_tag={}",
                 veil_util::hex_short(&key),
                 veil_util::hex_short(&peer),
                 trace_started.elapsed().as_millis(),
                 veil_ipc::route_trace::operation_id(),
                 hex8(&local_node_id),
                 tag.as_deref().unwrap_or("off"),
+                walk_tag.as_deref().unwrap_or("off"),
             );
         }
         if valid && let Some(bytes) = bytes {
@@ -2847,6 +3064,643 @@ mod tests {
                 RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap()
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn document_burst_shares_one_full_replica_walk_without_first_response_wins() {
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let signer = current_cert_signer(0x71);
+        let target = signer.doc.node_id;
+        let mut fresh = signer.doc.clone();
+        fresh.issued_at_unix += 1;
+        let mut msg = veil_proto::identity_document::DOC_SIG_CONTEXT.to_vec();
+        msg.extend_from_slice(&fresh.canonical_signing_bytes());
+        fresh.document_sig = SigningKey::from_bytes(&[0x71 ^ 0xff; 32])
+            .sign(&msg)
+            .to_bytes()
+            .to_vec();
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        let (mut a, mut b) = {
+            let mut registry = wlock!(resolver.session_tx_registry);
+            (registry.register([2; 32]), registry.register([3; 32]))
+        };
+        let mut one = Box::pin(resolver.fetch_verified_document(target, None));
+        let mut two = Box::pin(resolver.fetch_verified_document(target, None));
+        assert!(poll_family_to_stall(one.as_mut()).is_pending());
+        assert!(poll_family_to_stall(two.as_mut()).is_pending());
+        let (_, frame) = a.try_recv().unwrap();
+        let qa = RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+        let (_, frame) = b.try_recv().unwrap();
+        let qb = RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+        assert!(
+            a.try_recv().is_err(),
+            "same document must not be queried twice at one peer"
+        );
+        assert!(
+            b.try_recv().is_err(),
+            "same document must not be queried twice at another peer"
+        );
+        assert_eq!(lock!(resolver.pending_recursive).len(), 2);
+        lock!(resolver.pending_recursive)
+            .remove(&qa.query_id)
+            .unwrap()
+            .tx
+            .send(signer.doc.encode())
+            .unwrap();
+        assert!(poll_family_to_stall(one.as_mut()).is_pending());
+        assert!(poll_family_to_stall(two.as_mut()).is_pending());
+        lock!(resolver.pending_recursive)
+            .remove(&qb.query_id)
+            .unwrap()
+            .tx
+            .send(fresh.encode())
+            .unwrap();
+        assert_eq!(one.await.unwrap().issued_at_unix, fresh.issued_at_unix);
+        assert_eq!(two.await.unwrap().issued_at_unix, fresh.issued_at_unix);
+        assert!(lock!(resolver.pending_recursive).is_empty());
+        // A completed burst is not a document TTL cache: another call must ask
+        // every replica again, even though the local mirror is now populated.
+        let mut next = Box::pin(resolver.fetch_verified_document(target, None));
+        assert!(poll_family_to_stall(next.as_mut()).is_pending());
+        assert!(a.try_recv().is_ok());
+        assert!(b.try_recv().is_ok());
+        drop(next);
+        assert!(lock!(resolver.pending_recursive).is_empty());
+    }
+
+    #[tokio::test]
+    async fn document_burst_keeps_all_waiters_behind_the_host_checkpoint() {
+        let signer = current_cert_signer(0x72);
+        let target = signer.doc.node_id;
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        resolver
+            .cert_store
+            .restore_peer_authorization(br#"{"version":1,"entries":[]}"#, unix_now())
+            .unwrap();
+        let mut rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+        let mut one = Box::pin(resolver.fetch_verified_document(target, None));
+        let mut two = Box::pin(resolver.fetch_verified_document(target, None));
+        assert!(poll_family_to_stall(one.as_mut()).is_pending());
+        assert!(poll_family_to_stall(two.as_mut()).is_pending());
+        let (_, frame) = rx.try_recv().unwrap();
+        let q = RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "only one physical lookup for concurrent callers"
+        );
+        lock!(resolver.pending_recursive)
+            .remove(&q.query_id)
+            .unwrap()
+            .tx
+            .send(signer.doc.encode())
+            .unwrap();
+        assert!(poll_family_to_stall(one.as_mut()).is_pending());
+        assert!(poll_family_to_stall(two.as_mut()).is_pending());
+        assert!(resolver.cert_store.peer_authorization_is_pending(&target));
+        let mut three = Box::pin(resolver.fetch_verified_document(target, None));
+        assert!(poll_family_to_stall(three.as_mut()).is_pending());
+        assert!(
+            rx.try_recv().is_err(),
+            "a caller during authorization must join the same burst"
+        );
+        assert!(rlock!(resolver.peer_ratchet_keys).is_empty());
+        resolver
+            .cert_store
+            .acknowledge_peer_authorization(resolver.cert_store.peer_authorization_version())
+            .unwrap();
+        for result in [one.await, two.await, three.await] {
+            assert!(result.is_some());
+        }
+        assert!(lock!(resolver.pending_recursive).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn document_burst_cancelled_initializer_keeps_the_original_replica_deadline() {
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])))
+            .with_step_timeout(Duration::from_secs(10));
+        let mut rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+        let target = [0x73; 32];
+        let start = tokio::time::Instant::now();
+        let mut one = Box::pin(resolver.fetch_verified_document(target, None));
+        assert!(poll_family_to_stall(one.as_mut()).is_pending());
+        assert!(rx.try_recv().is_ok());
+        tokio::time::advance(Duration::from_secs(4)).await;
+        let mut two = Box::pin(resolver.fetch_verified_document(target, None));
+        assert!(poll_family_to_stall(two.as_mut()).is_pending());
+        assert!(
+            rx.try_recv().is_err(),
+            "the waiter must not start another walk"
+        );
+        drop(one);
+        assert!(lock!(resolver.pending_recursive).is_empty());
+        assert!(poll_family_to_stall(two.as_mut()).is_pending());
+        assert!(
+            rx.try_recv().is_ok(),
+            "a live waiter replaces the cancelled initializer"
+        );
+        assert!(two.await.is_none());
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
+        assert!(lock!(resolver.pending_recursive).is_empty());
+    }
+
+    #[tokio::test]
+    async fn document_burst_untrusted_candidates_do_not_authorize_any_waiter() {
+        for wrong_identity in [true, false] {
+            let mut signer = current_cert_signer(0x75);
+            let target = if wrong_identity {
+                [0x76; 32]
+            } else {
+                signer.doc.document_sig[0] ^= 1;
+                signer.doc.node_id
+            };
+            let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+            let mut rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+            let mut one = Box::pin(resolver.fetch_verified_document(target, None));
+            let mut two = Box::pin(resolver.fetch_verified_document(target, None));
+            assert!(poll_family_to_stall(one.as_mut()).is_pending());
+            assert!(poll_family_to_stall(two.as_mut()).is_pending());
+            let (_, frame) = rx.try_recv().unwrap();
+            let q = RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+            assert!(rx.try_recv().is_err());
+            lock!(resolver.pending_recursive)
+                .remove(&q.query_id)
+                .unwrap()
+                .tx
+                .send(signer.doc.encode())
+                .unwrap();
+            assert!(one.await.is_none());
+            assert!(two.await.is_none());
+            assert!(
+                resolver
+                    .dht
+                    .get_local(&IdentityDocument::dht_key(&target))
+                    .is_none()
+            );
+            assert!(
+                resolver
+                    .cert_store
+                    .document_floor
+                    .current(&target)
+                    .is_none()
+            );
+            assert!(lock!(resolver.document_walks).is_empty());
+            assert!(rlock!(resolver.peer_ratchet_keys).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn document_burst_late_waiter_keeps_newer_local_revocation() {
+        use ed25519_dalek::{Signer as _, SigningKey};
+        use veil_proto::identity_document::RevokedDevice;
+        let signer = current_cert_signer(0x74);
+        let target = signer.doc.node_id;
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        resolver
+            .cert_store
+            .restore_peer_authorization(br#"{"version":1,"entries":[]}"#, unix_now())
+            .unwrap();
+        let mut rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+        let mut first = Box::pin(resolver.fetch_verified_document(target, None));
+        assert!(poll_family_to_stall(first.as_mut()).is_pending());
+        let (_, frame) = rx.try_recv().unwrap();
+        let q = RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+        lock!(resolver.pending_recursive)
+            .remove(&q.query_id)
+            .unwrap()
+            .tx
+            .send(signer.doc.encode())
+            .unwrap();
+        assert!(poll_family_to_stall(first.as_mut()).is_pending());
+        assert!(resolver.cert_store.peer_authorization_is_pending(&target));
+
+        let mut fresh = signer.doc.clone();
+        fresh.issued_at_unix += 1;
+        fresh.revoked_devices.push(RevokedDevice {
+            device_id: [0x77; 32],
+            master_sig: SigningKey::from_bytes(&[0x74; 32])
+                .sign(&RevokedDevice::signing_message(&target, &[0x77; 32]))
+                .to_bytes()
+                .to_vec(),
+        });
+        let mut message = veil_proto::identity_document::DOC_SIG_CONTEXT.to_vec();
+        message.extend_from_slice(&fresh.canonical_signing_bytes());
+        fresh.document_sig = SigningKey::from_bytes(&[0x74 ^ 0xff; 32])
+            .sign(&message)
+            .to_bytes()
+            .to_vec();
+        verify_identity_document(&fresh, unix_now()).unwrap();
+        let key = IdentityDocument::dht_key(&target);
+        // A new authenticated publication arrived after this wave completed,
+        // while its first caller was still waiting for host persistence.
+        resolver.dht.store_local(key, fresh.encode());
+        let mut late = Box::pin(resolver.fetch_verified_document(target, None));
+        assert!(poll_family_to_stall(late.as_mut()).is_pending());
+        assert!(
+            rx.try_recv().is_err(),
+            "the overlapping caller shares this wave"
+        );
+        assert_eq!(
+            IdentityDocument::decode(&resolver.dht.get_local(&key).unwrap())
+                .unwrap()
+                .issued_at_unix,
+            fresh.issued_at_unix,
+            "the shared result must not clobber the newer local publication",
+        );
+        resolver
+            .cert_store
+            .acknowledge_peer_authorization(resolver.cert_store.peer_authorization_version())
+            .unwrap();
+        assert!(
+            first.await.is_none(),
+            "old caller cannot regain stale authority"
+        );
+        let accepted = late.await.unwrap();
+        assert_eq!(accepted.issued_at_unix, fresh.issued_at_unix);
+        assert_eq!(accepted.revoked_devices.len(), 1);
+        assert!(lock!(resolver.document_walks).is_empty());
+        assert!(lock!(resolver.pending_recursive).is_empty());
+    }
+
+    #[tokio::test]
+    async fn document_burst_cannot_restore_old_authorization_during_a_checkpoint() {
+        use ed25519_dalek::{Signer as _, SigningKey};
+        use veil_proto::identity_document::RevokedDevice;
+        let signer = current_cert_signer(0x74);
+        let target = signer.doc.node_id;
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        resolver
+            .cert_store
+            .restore_peer_authorization(br#"{"version":1,"entries":[]}"#, unix_now())
+            .unwrap();
+        let mut rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+        let mut one = Box::pin(resolver.fetch_verified_document(target, None));
+        let mut two = Box::pin(resolver.fetch_verified_document(target, None));
+        assert!(poll_family_to_stall(one.as_mut()).is_pending());
+        assert!(poll_family_to_stall(two.as_mut()).is_pending());
+        let (_, frame) = rx.try_recv().unwrap();
+        let q = RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+        assert!(rx.try_recv().is_err());
+        lock!(resolver.pending_recursive)
+            .remove(&q.query_id)
+            .unwrap()
+            .tx
+            .send(signer.doc.encode())
+            .unwrap();
+        assert!(poll_family_to_stall(one.as_mut()).is_pending());
+        assert!(poll_family_to_stall(two.as_mut()).is_pending());
+        let mut fresh = signer.doc.clone();
+        fresh.issued_at_unix += 1;
+        fresh.revoked_devices.push(RevokedDevice {
+            device_id: [0x77; 32],
+            master_sig: SigningKey::from_bytes(&[0x74; 32])
+                .sign(&RevokedDevice::signing_message(&target, &[0x77; 32]))
+                .to_bytes()
+                .to_vec(),
+        });
+        let mut message = veil_proto::identity_document::DOC_SIG_CONTEXT.to_vec();
+        message.extend_from_slice(&fresh.canonical_signing_bytes());
+        fresh.document_sig = SigningKey::from_bytes(&[0x74 ^ 0xff; 32])
+            .sign(&message)
+            .to_bytes()
+            .to_vec();
+        verify_identity_document(&fresh, unix_now()).unwrap();
+        assert!(
+            !resolver.observe_document(&fresh),
+            "new negative evidence is pending host persistence"
+        );
+        resolver
+            .cert_store
+            .acknowledge_peer_authorization(resolver.cert_store.peer_authorization_version())
+            .unwrap();
+        assert!(one.await.is_none());
+        assert!(two.await.is_none());
+        assert_eq!(
+            resolver
+                .cert_store
+                .document_floor
+                .current(&target)
+                .unwrap()
+                .revoked_devices
+                .len(),
+            1
+        );
+        assert!(lock!(resolver.document_walks).is_empty());
+    }
+
+    #[tokio::test]
+    async fn document_burst_cancellation_cleans_the_pool_and_never_merges_other_targets() {
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        let mut rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+        let mut one = Box::pin(resolver.fetch_verified_document([0x78; 32], None));
+        let mut two = Box::pin(resolver.fetch_verified_document([0x78; 32], None));
+        let mut other = Box::pin(resolver.fetch_verified_document([0x79; 32], None));
+        for future in [&mut one, &mut two, &mut other] {
+            assert!(poll_family_to_stall(future.as_mut()).is_pending());
+        }
+        assert_eq!(lock!(resolver.pending_recursive).len(), 2);
+        assert_eq!(lock!(resolver.document_walks).len(), 2);
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+        drop(one);
+        assert_eq!(
+            lock!(resolver.document_walks).len(),
+            2,
+            "the waiter keeps its wave"
+        );
+        drop(two);
+        assert_eq!(lock!(resolver.document_walks).len(), 1);
+        drop(other);
+        assert!(lock!(resolver.document_walks).is_empty());
+        assert!(lock!(resolver.pending_recursive).is_empty());
+    }
+
+    #[tokio::test]
+    async fn document_burst_pool_capacity_falls_back_without_losing_queries() {
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        let _rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+        let mut lookups = Vec::new();
+        for index in 0..=MAX_DOCUMENT_WALKS {
+            let mut future = Box::pin(resolver.fetch_verified_document([index as u8; 32], None));
+            assert!(poll_family_to_stall(future.as_mut()).is_pending());
+            lookups.push(future);
+        }
+        assert_eq!(lock!(resolver.document_walks).len(), MAX_DOCUMENT_WALKS);
+        assert_eq!(
+            lock!(resolver.pending_recursive).len(),
+            MAX_DOCUMENT_WALKS + 1
+        );
+        drop(lookups);
+        assert!(lock!(resolver.document_walks).is_empty());
+        assert!(lock!(resolver.pending_recursive).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_candidate_walk_never_repeats_background_slot_queries() {
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        let mut rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+        let start = tokio::time::Instant::now();
+        let mut lookup = Box::pin(recursive_dht_get_candidates(
+            &resolver.dht,
+            &resolver.session_tx_registry,
+            &resolver.pending_recursive,
+            [1; 32],
+            [3; 32],
+            Duration::from_secs(3),
+            1,
+            |_| false,
+        ));
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        assert!(rx.try_recv().is_ok());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        assert!(
+            rx.try_recv().is_err(),
+            "only key-material walks opt in to a repeat"
+        );
+        assert!(lookup.await.is_empty());
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+        assert!(rx.try_recv().is_err());
+        assert!(lock!(resolver.pending_recursive).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn candidate_retry_reuses_the_query_and_accepts_the_predecode_drop_repair() {
+        // A relay's pre-decode quota may silently drop an admitted query. Its
+        // next copy has not been deduplicated there yet. Exercise that exact
+        // missing-first-request boundary without sleeping in wall time.
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        let mut rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+        let mut lookup = Box::pin(recursive_key_material_candidates(
+            &resolver.dht,
+            &resolver.session_tx_registry,
+            &resolver.pending_recursive,
+            [1; 32],
+            [3; 32],
+            Duration::from_secs(3),
+            1,
+            |b| b == [7],
+        ));
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        let (_, first) = rx.try_recv().unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        let (_, retry) = rx
+            .try_recv()
+            .expect("a silent quota drop needs one bounded repeat");
+        assert_eq!(
+            retry, first,
+            "no new query ID, payload, TTL, or destination"
+        );
+        assert!(rx.try_recv().is_err());
+        let query = RecursiveQueryPayload::decode(&retry[veil_proto::HEADER_SIZE..]).unwrap();
+        assert_eq!(lock!(resolver.pending_recursive).len(), 1);
+        lock!(resolver.pending_recursive)
+            .remove(&query.query_id)
+            .unwrap()
+            .tx
+            .send(vec![7])
+            .unwrap();
+        assert_eq!(lookup.await, vec![vec![7]]);
+        assert!(lock!(resolver.pending_recursive).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn candidate_retry_still_waits_for_the_fresh_replica() {
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let signer = current_cert_signer(0x7a);
+        let target = signer.doc.node_id;
+        let mut fresh = signer.doc.clone();
+        fresh.issued_at_unix += 1;
+        let mut message = veil_proto::identity_document::DOC_SIG_CONTEXT.to_vec();
+        message.extend_from_slice(&fresh.canonical_signing_bytes());
+        fresh.document_sig = SigningKey::from_bytes(&[0x7a ^ 0xff; 32])
+            .sign(&message)
+            .to_bytes()
+            .to_vec();
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        let (mut a, mut b) = {
+            let mut reg = wlock!(resolver.session_tx_registry);
+            (reg.register([2; 32]), reg.register([3; 32]))
+        };
+        let mut lookup = Box::pin(resolver.fetch_verified_document(target, None));
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        let (_, frame) = a.try_recv().unwrap();
+        let qa = RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+        let (_, first_b) = b.try_recv().unwrap();
+        lock!(resolver.pending_recursive)
+            .remove(&qa.query_id)
+            .unwrap()
+            .tx
+            .send(signer.doc.encode())
+            .unwrap();
+        assert!(
+            poll_family_to_stall(lookup.as_mut()).is_pending(),
+            "early stale valid answer cannot win"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        assert!(a.try_recv().is_err(), "never repeat an answered replica");
+        let (_, retry) = b.try_recv().expect("only the silent replica is repeated");
+        assert_eq!(retry, first_b);
+        let qb = RecursiveQueryPayload::decode(&retry[veil_proto::HEADER_SIZE..]).unwrap();
+        lock!(resolver.pending_recursive)
+            .remove(&qb.query_id)
+            .unwrap()
+            .tx
+            .send(fresh.encode())
+            .unwrap();
+        assert_eq!(lookup.await.unwrap().issued_at_unix, fresh.issued_at_unix);
+        assert!(lock!(resolver.pending_recursive).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn candidate_retry_is_once_only_and_never_extends_the_deadline() {
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        let mut rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+        let start = tokio::time::Instant::now();
+        let mut lookup = Box::pin(recursive_key_material_candidates(
+            &resolver.dht,
+            &resolver.session_tx_registry,
+            &resolver.pending_recursive,
+            [1; 32],
+            [3; 32],
+            Duration::from_secs(3),
+            1,
+            |_| false,
+        ));
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        let (_, first) = rx.try_recv().unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        let (_, retry) = rx
+            .try_recv()
+            .expect("one repeat inside the original window");
+        assert_eq!(retry, first);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        assert!(rx.try_recv().is_err());
+        assert!(lookup.await.is_empty());
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+        assert!(rx.try_recv().is_err());
+        assert!(lock!(resolver.pending_recursive).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn candidate_retry_does_not_duplicate_work_still_in_the_local_queue() {
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        let mut rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+        let mut lookup = Box::pin(recursive_key_material_candidates(
+            &resolver.dht,
+            &resolver.session_tx_registry,
+            &resolver.pending_recursive,
+            [1; 32],
+            [3; 32],
+            Duration::from_secs(3),
+            1,
+            |_| false,
+        ));
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        assert_eq!(
+            rlock!(resolver.session_tx_registry).queued_for(&[2; 32]),
+            Some(1)
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        assert_eq!(
+            rlock!(resolver.session_tx_registry).queued_for(&[2; 32]),
+            Some(1)
+        );
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+        assert!(lookup.await.is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "skipping a retry must not schedule a later one"
+        );
+        assert!(lock!(resolver.pending_recursive).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn candidate_retry_does_not_repeat_explicit_empty_or_closed_replies() {
+        for closed in [true, false] {
+            let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+            let mut rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+            let start = tokio::time::Instant::now();
+            let mut lookup = Box::pin(recursive_key_material_candidates(
+                &resolver.dht,
+                &resolver.session_tx_registry,
+                &resolver.pending_recursive,
+                [1; 32],
+                [3; 32],
+                Duration::from_secs(3),
+                1,
+                |_| true,
+            ));
+            assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+            let (_, frame) = rx.try_recv().unwrap();
+            let q = RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+            let pending = lock!(resolver.pending_recursive)
+                .remove(&q.query_id)
+                .unwrap();
+            if closed {
+                drop(pending);
+            } else {
+                pending.tx.send(Vec::new()).unwrap();
+            }
+            assert!(lookup.await.is_empty());
+            assert_eq!(start.elapsed(), Duration::ZERO);
+            tokio::time::advance(Duration::from_secs(4)).await;
+            assert!(rx.try_recv().is_err());
+            assert!(lock!(resolver.pending_recursive).is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn candidate_retry_cancellation_leaves_no_timer_or_pending_query() {
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        let mut rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+        let mut lookup = Box::pin(recursive_key_material_candidates(
+            &resolver.dht,
+            &resolver.session_tx_registry,
+            &resolver.pending_recursive,
+            [1; 32],
+            [3; 32],
+            Duration::from_secs(3),
+            1,
+            |_| false,
+        ));
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        assert!(rx.try_recv().is_ok());
+        drop(lookup);
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(rx.try_recv().is_err());
+        assert!(lock!(resolver.pending_recursive).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn candidate_retry_short_budget_uses_the_original_local_fallback() {
+        let dht = Arc::new(KademliaService::new([1; 32]));
+        dht.store_local([3; 32], vec![7]);
+        let resolver = make_test_resolver(dht);
+        let mut rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+        let start = tokio::time::Instant::now();
+        let mut lookup = Box::pin(recursive_key_material_candidates(
+            &resolver.dht,
+            &resolver.session_tx_registry,
+            &resolver.pending_recursive,
+            [1; 32],
+            [3; 32],
+            Duration::from_millis(200),
+            1,
+            |b| b == [7],
+        ));
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(lookup.await, vec![vec![7]]);
+        assert_eq!(start.elapsed(), Duration::from_millis(200));
+        assert!(rx.try_recv().is_err());
+        assert!(lock!(resolver.pending_recursive).is_empty());
     }
 
     #[tokio::test]

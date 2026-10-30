@@ -1993,10 +1993,14 @@ impl FrameDispatcher {
                 if total.is_power_of_two() {
                     let tag = blake3::hash(body);
                     log::info!(
-                        "dht.query.rate_limit local={} peer={} process_refusals={total} qtag={}",
+                        "dht.query.rate_limit local={} peer={} process_refusals={total} qtag={} walk_tag={}",
                         veil_util::hex_short(&self.local_node_id),
                         veil_util::hex_short(peer_id.as_bytes()),
                         veil_util::bytes_to_hex(&tag.as_bytes()[..8]),
+                        body.get(..16).map_or_else(
+                            || "short".to_owned(),
+                            |id| { veil_util::bytes_to_hex(&blake3::hash(id).as_bytes()[..8]) }
+                        ),
                     );
                 }
             }
@@ -2020,8 +2024,33 @@ impl FrameDispatcher {
             Err(e) => return DispatchResult::Violation(format!("bad RecursiveQuery: {e}")),
         };
 
+        // Operator-only lookup attribution. Unlike the ordinary NodeLogger,
+        // this follows the live trace switch of an embedded/deferred node.
+        // The tags contain no record bytes; they are still private metadata
+        // and must not be included in the anonymous diagnostic export.
+        let trace_tag = veil_session::rt_trace::rt_trace_enabled().then(|| {
+            let digest = blake3::hash(body);
+            veil_util::bytes_to_hex(&digest.as_bytes()[..8])
+        });
+        let (trace_target, trace_type, trace_ttl, trace_id) =
+            (q.target_key, q.query_type, q.ttl, q.query_id);
+        let trace_query = |outcome: &str, selected: usize, admitted: usize| {
+            if let Some(tag) = &trace_tag {
+                log::info!(
+                    "dht.query.step local={} peer={} target={} qtag={tag} walk_tag={} type={} ttl={} outcome={outcome} selected={selected} admitted={admitted}",
+                    veil_util::hex_short(&self.local_node_id),
+                    veil_util::hex_short(peer_id.as_bytes()),
+                    veil_util::hex_short(&trace_target),
+                    veil_util::bytes_to_hex(&blake3::hash(&trace_id).as_bytes()[..8]),
+                    trace_type,
+                    trace_ttl,
+                );
+            }
+        };
+
         // Dedup: prevent loops in recursive forwarding.
         if lock!(self.recursive_query_seen).check_and_insert(q.query_id) {
+            trace_query("duplicate", 0, 0);
             return DispatchResult::NoResponse;
         }
 
@@ -2161,6 +2190,7 @@ impl FrameDispatcher {
         match q.query_type {
             recursive_query_type::FIND_VALUE => {
                 if let Some(mut value) = self.dht.get_local(&q.target_key) {
+                    trace_query("local_value", 0, 0);
                     if value.get(..2)
                         == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_DHT_MAGIC[..])
                         || value.get(..2)
@@ -2655,6 +2685,7 @@ impl FrameDispatcher {
 
         // Not answered locally — greedy forward to closest contact.
         if q.ttl == 0 {
+            trace_query("ttl_exhausted", 0, 0);
             self.logger.warn(
                 "recursive.ttl_exhausted",
                 format!("target={}", veil_util::hex_short(&q.target_key)),
@@ -2668,6 +2699,7 @@ impl FrameDispatcher {
         // their bandwidth ~2× per recursive hop (up to TTL=20 deep).
         // RouteRequest forwarding (line 478) already has the same gate.
         if !lock!(self.abuse.dht_quota).allow(*peer_id.as_bytes()) {
+            trace_query("forward_quota", 0, 0);
             self.logger.warn(
                 "recursive.forward.rate_limited",
                 format!(
@@ -2722,6 +2754,7 @@ impl FrameDispatcher {
         };
         let frame = encode_routing_frame(RoutingMsg::RecursiveQuery, &forwarded.encode());
 
+        let mut admitted = 0;
         if let Some(reg) = &self.session_tx_registry {
             let guard = wlock!(reg);
             // Forward to top-2 closest (parallel routing).
@@ -2732,13 +2765,14 @@ impl FrameDispatcher {
                 if *next_hop == self.local_node_id {
                     continue;
                 }
-                guard.send_to(
+                admitted += usize::from(guard.send_to(
                     next_hop,
                     veil_proto::header::priority::INTERACTIVE,
                     frame.clone(),
-                );
+                ));
             }
         }
+        trace_query("forward", closest.len(), admitted);
 
         DispatchResult::NoResponse
     }
