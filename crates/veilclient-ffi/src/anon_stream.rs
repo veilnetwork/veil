@@ -2941,11 +2941,7 @@ impl CircuitCells {
                         .is_none_or(|until| *until <= cooldown_now)
                     && self
                         .services
-                        .has_live_session(&entries[*idx].circuit.first_hop())
-                    && self
-                        .services
-                        .session_close_generation(&entries[*idx].circuit.first_hop())
-                        == entries[*idx].first_hop_close_generation
+                        .data_circuit_session_current(&entries[*idx].circuit)
             })
             .take(route_count)
             .collect::<Vec<_>>();
@@ -3044,9 +3040,7 @@ impl CircuitCells {
         if route.rendezvous_node.is_none() {
             return false;
         }
-        let first_hop = route.circuit.first_hop();
-        self.services.session_close_generation(&first_hop) != route.first_hop_close_generation
-            || !self.services.has_live_session(&first_hop)
+        !self.services.data_circuit_session_current(&route.circuit)
     }
 
     async fn mark_route_stale(&self, dst_node: [u8; 32], route: &CircuitRoute) {
@@ -3064,18 +3058,14 @@ impl CircuitCells {
             // cannot replace the entry between classification and removal.
             let mut circuits = self.outbound_circuits.lock().await;
             let mut routes = self.stream_routes.lock().await;
-            let live = self.services.has_live_session(&first_hop);
-            let generation = self.services.session_close_generation(&first_hop);
-            let invalidated = |circuit: &Arc<veil_node_runtime::DataCircuit>,
-                               captured_generation| {
+            let invalidated = |circuit: &Arc<veil_node_runtime::DataCircuit>| {
                 Arc::ptr_eq(circuit, &route.circuit)
                     || (circuit.first_hop() == first_hop
-                        && (!live || captured_generation != generation))
+                        && !self.services.data_circuit_session_current(circuit))
             };
             let mut removed = Vec::new();
             routes.retain(|(node, _, route_class), cached| {
-                let keep = *node != dst_node
-                    || !invalidated(&cached.circuit, cached.first_hop_close_generation);
+                let keep = *node != dst_node || !invalidated(&cached.circuit);
                 if !keep {
                     removed.push((*route_class, cached.clone()));
                 }
@@ -3095,7 +3085,7 @@ impl CircuitCells {
             }
             if let Some(entries) = circuits.get_mut(&dst_node) {
                 entries.retain(|entry| {
-                    let remove = invalidated(&entry.circuit, entry.first_hop_close_generation);
+                    let remove = invalidated(&entry.circuit);
                     if remove && !retired.iter().any(|old| Arc::ptr_eq(old, &entry.circuit)) {
                         retired.push(Arc::clone(&entry.circuit));
                     }
@@ -3171,9 +3161,7 @@ impl CircuitCells {
                             .get(&entry.rendezvous_node)
                             .is_none_or(|until| *until <= now)
                         && cooled_hops.get(&hop).is_none_or(|until| *until <= now)
-                        && self.services.has_live_session(&hop)
-                        && self.services.session_close_generation(&hop)
-                            == entry.first_hop_close_generation
+                        && self.services.data_circuit_session_current(&entry.circuit)
                         && (self.bulk_route_active_limit == 0
                             || entry.stats.active_streams() < self.bulk_route_active_limit as u64)
                 })
@@ -3504,9 +3492,7 @@ impl CircuitCells {
                             && entry.serves_receiver(route)
                             && !cooled_relays.contains(&entry.rendezvous_node)
                             && !cooled_first_hops.contains(&entry_first_hop)
-                            && self.services.has_live_session(&entry_first_hop)
-                            && self.services.session_close_generation(&entry_first_hop)
-                                == entry.first_hop_close_generation
+                            && self.services.data_circuit_session_current(&entry.circuit)
                             // A marked target is measurably crawling too —
                             // remapping onto it is pure churn (observed live
                             // as a 3d↔c92 ping-pong every shed cooldown).
@@ -3589,6 +3575,13 @@ impl CircuitCells {
         route: &CircuitRoute,
         err: veil_node_runtime::DataCircuitSendError,
     ) {
+        // Registration may change after selection and before native enqueue.
+        // This old handle cannot condemn the fresh session or another route
+        // already published at the same rendezvous.
+        if self.route_session_stale(route) {
+            self.mark_route_stale(dst_node, route).await;
+            return;
+        }
         let Some(relay) = route.rendezvous_node else {
             return;
         };
@@ -5467,9 +5460,7 @@ async fn open_outbound_circuit(
                                 && entry.peer_cookie == ad.auth_cookie
                                 && entry.receiver_x25519_pk == ad.receiver_x25519_pk
                                 && entry.circuit.confirmed_flag().load(Ordering::Acquire)
-                                && services.has_live_session(&first_hop)
-                                && services.session_close_generation(&first_hop)
-                                    == entry.first_hop_close_generation
+                                && services.data_circuit_session_current(&entry.circuit)
                                 && !entry.stats.slow_marked(now)
                                 && (!old_quiet || entry.stats.active_streams() > 0)
                                 && route_cooldowns
@@ -5720,8 +5711,7 @@ impl OutboundCooldownRecovery<'_> {
         };
         let first_hop = candidate.circuit.first_hop();
         if !candidate.circuit.is_confirmed()
-            || !services.has_live_session(&first_hop)
-            || services.session_close_generation(&first_hop) != candidate.first_hop_close_generation
+            || !services.data_circuit_session_current(&candidate.circuit)
             || self
                 .first_hop_cooldowns
                 .lock()
