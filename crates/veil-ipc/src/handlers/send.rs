@@ -1337,6 +1337,7 @@ async fn try_ratchet_seal_checked(
 /// minute inside the node with nothing in the log to say which step held it.
 struct SendTiming {
     started: std::time::Instant,
+    source: [u8; 4],
     dst: std::cell::Cell<[u8; 4]>,
     plan_ms: std::cell::Cell<u128>,
     seal_ms: std::cell::Cell<u128>,
@@ -1345,9 +1346,10 @@ struct SendTiming {
 }
 
 impl SendTiming {
-    fn new() -> Self {
+    fn new(source: &[u8; 32]) -> Self {
         Self {
             started: std::time::Instant::now(),
+            source: source[..4].try_into().unwrap_or([0; 4]),
             dst: std::cell::Cell::new([0; 4]),
             plan_ms: std::cell::Cell::new(0),
             seal_ms: std::cell::Cell::new(0),
@@ -1367,9 +1369,18 @@ impl Drop for SendTiming {
             } else {
                 ("ipc.send_sample", log::Level::Info)
             };
+            let correlation = if crate::route_trace::is_enabled() {
+                format!(
+                    " op={} local={}",
+                    crate::route_trace::operation_id(),
+                    veil_util::bytes_to_hex(&self.source)
+                )
+            } else {
+                String::new()
+            };
             log::log!(
                 level,
-                "{event} at={} dst={} total_ms={total} plan_ms={} seal_ms={} path={} family_resolve_ms={} family_seal_ms={} family_admission_ms={} family_certificates={} family_evidence={:?}",
+                "{event} at={} dst={} total_ms={total} plan_ms={} seal_ms={} path={} family_resolve_ms={} family_seal_ms={} family_admission_ms={} family_certificates={} family_evidence={:?}{correlation}",
                 veil_util::unix_secs_now_u64(),
                 veil_util::bytes_to_hex(&self.dst.get()),
                 self.plan_ms.get(),
@@ -1390,7 +1401,19 @@ pub(crate) async fn handle_ipc_send(
     body: &[u8],
     ctx: &IpcSendContext,
 ) -> std::io::Result<()> {
-    let timing = SendTiming::new();
+    crate::route_trace::operation_scope(
+        crate::route_trace::is_enabled(),
+        handle_ipc_send_inner(sink, body, ctx),
+    )
+    .await
+}
+
+async fn handle_ipc_send_inner(
+    sink: &mut SendReply<'_>,
+    body: &[u8],
+    ctx: &IpcSendContext,
+) -> std::io::Result<()> {
+    let timing = SendTiming::new(&ctx.local_node_id);
     // Borrowed out of the now-owned context so the body below reads exactly as
     // it did when the context itself was borrowed.
     let app_registry = &*ctx.app_registry;
