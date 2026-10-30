@@ -6,6 +6,7 @@ description = "OVL1 frame dispatcher: routes incoming frames (control, session, 
 license = "MIT OR Apache-2.0"
 
 [features]
+circuit-trace = ["veil-anonymity/circuit-trace"]
 # Verbose relay-path tracing (cookie_unknown / session_forwarded / register.ok
 # logged WITH the rendezvous cookie) for debugging delivery. OFF by default —
 # the cookie is a subscriber-linkable value, so production builds keep the

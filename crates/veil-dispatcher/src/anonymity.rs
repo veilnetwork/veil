@@ -1403,6 +1403,8 @@ impl FrameDispatcher {
                     state.observe_carrier(false, cell.seq, carrier);
                 }
                 state.touch(now);
+                let trace = veil_anonymity::circuit_trace::peer(&state.prev_link)
+                    .map(|observation| (observation, std::time::Instant::now()));
                 let mut buf = cell.ciphertext.clone();
                 apply_layer(&state.circuit_key, Direction::Return, cell.seq, &mut buf);
                 let out = CircuitDataPayload {
@@ -1430,6 +1432,16 @@ impl FrameDispatcher {
                         &b,
                         Some(state.outbound_carrier(false)),
                     );
+                    if let Some((observation, started)) = trace {
+                        self.logger.info(
+                            "anonymity.circuit.trace.return",
+                            format!(
+                                "event={} link={} in_cid={} out_cid={} seq={} accepted={sent} local_us={}",
+                                observation.event, observation.token, cell.circuit_id,
+                                state.circuit_id_in, cell.seq, started.elapsed().as_micros(),
+                            ),
+                        );
+                    }
                     circuit_data_diag(|d| {
                         if sent {
                             d.ret_relay_ok = d.ret_relay_ok.saturating_add(1);
@@ -1884,6 +1896,9 @@ impl FrameDispatcher {
     ) -> bool {
         use veil_anonymity::circuit_data::{Direction, apply_layer, wrap_payload};
         use veil_anonymity::circuit_wire::CircuitDataPayload;
+        // Match only an operator-selected opaque prefix. No stream/media parser
+        // lives here; the same fixed-size cell and scheduling policy are used.
+        let trace = veil_anonymity::circuit_trace::selected(bytes);
         let mut buf = match wrap_payload(bytes, circuit.cell_bytes) {
             Ok(b) => b,
             Err(_) => {
@@ -1908,6 +1923,19 @@ impl FrameDispatcher {
                 &body,
                 Some(circuit.outbound_carrier(false)),
             );
+            if let Some(observation) = trace {
+                self.logger.info(
+                    "anonymity.circuit.trace.splice",
+                    format!(
+                        "event={} token={} prefix={} out_cid={} seq={} accepted={sent}",
+                        observation.event,
+                        observation.token,
+                        observation.prefix,
+                        circuit.circuit_id_in,
+                        seq,
+                    ),
+                );
+            }
             circuit_data_diag(|d| {
                 if sent {
                     d.splice_ok = d.splice_ok.saturating_add(1);
@@ -1964,6 +1992,27 @@ impl FrameDispatcher {
         } else {
             guard.send_to_result(node_id.as_bytes(), veil_proto::priority::INTERACTIVE, frame)
         };
+        drop(guard); // diagnostic file refresh/logging must not hold the TX registry
+        if matches!(
+            msg,
+            RelayChainMsg::CircuitData | RelayChainMsg::CircuitDatagram
+        ) && let Some(observation) = veil_anonymity::circuit_trace::peer(node_id.as_bytes())
+            && veil_anonymity::circuit_wire::CircuitDataPayload::validate(body).is_ok()
+        {
+            // Header only: no ciphertext copy or inspection. This line and the
+            // return mapping share (out_cid, seq) on this explicitly scoped link.
+            self.logger.info(
+                "anonymity.circuit.trace.egress",
+                format!(
+                    "event={} link={} out_cid={} seq={} result={:?}",
+                    observation.event,
+                    observation.token,
+                    u32::from_be_bytes(body[..4].try_into().unwrap()),
+                    u32::from_be_bytes(body[4..8].try_into().unwrap()),
+                    sent,
+                ),
+            );
+        }
         if let Err(err) = sent {
             circuit_data_diag(|d| match err {
                 veil_session::SendToError::Missing => {
@@ -2018,6 +2067,10 @@ impl FrameDispatcher {
         }
     }
 }
+
+#[cfg(all(test, unix, feature = "circuit-trace"))]
+#[path = "anonymity/cell_trace_tests.rs"]
+mod cell_trace_tests;
 
 #[cfg(test)]
 mod tests {
