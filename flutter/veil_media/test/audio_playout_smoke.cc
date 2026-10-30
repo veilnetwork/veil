@@ -1,6 +1,20 @@
 // Real Opus/NetEq and production Call wiring, synthetic ADM and plaintext
 // Veil boundary. No physical microphone/speaker, app profile or relay is used.
 #include "veil_media_engine.h"
+#include "veil_audio_level_band.h"
+
+static_assert(veil_media::AudioLevelBand(-1) == -1);
+static_assert(veil_media::AudioLevelBand(32768) == -1);
+static_assert(veil_media::AudioLevelBand(0) == 0);
+static_assert(veil_media::AudioLevelBand(32) == 1);
+static_assert(veil_media::AudioLevelBand(33) == 2);
+static_assert(veil_media::AudioLevelBand(184) == 2);
+static_assert(veil_media::AudioLevelBand(185) == 3);
+static_assert(veil_media::AudioLevelBand(1036) == 3);
+static_assert(veil_media::AudioLevelBand(1037) == 4);
+static_assert(veil_media::AudioLevelBand(5827) == 4);
+static_assert(veil_media::AudioLevelBand(5828) == 5);
+static_assert(veil_media::AudioLevelBand(32767) == 5);
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -559,6 +573,7 @@ static void verify_silence(bool after_jitter = false) {
   uint64_t dtx_start_discarded = 0, dtx_end_discarded = 0;
   int first_resumed_tick = -1;
   size_t silent_start_packets = 0, silent_end_packets = 0, recovered_ticks = 0;
+  bool input_tone_seen = false, output_tone_seen = false, silence_seen = false;
   double max_lateness = 0;
   for (int tick = 0; tick < resume_tick + 400; ++tick) {
     std::this_thread::sleep_until(origin + std::chrono::milliseconds(10 * tick));
@@ -576,6 +591,16 @@ static void verify_silence(bool after_jitter = false) {
     }
     if (tick == silent_tick) { before_interruptions = metric(receiver.get(), "audio_interruption_count"); before_concealed = metric(receiver.get(), "audio_concealed_samples"); silent_start_packets = sent_packets; }
     if (tick == resume_tick) silent_end_packets = sent_packets;
+    if (tick % 10 == 0 && tick > 100 && tick < silent_tick) {
+      const auto input = metric(source.get(), "audio_input_level_band");
+      const auto output = metric(receiver.get(), "audio_output_level_band");
+      input_tone_seen |= input > 0 && input <= 5;
+      output_tone_seen |= output > 0 && output <= 5;
+    }
+    if (tick == resume_tick - 100) {
+      silence_seen = metric(source.get(), "audio_input_level_band") == 0 &&
+          metric(receiver.get(), "audio_output_level_band") == 0;
+    }
     if (tick == silent_tick + 100)
       dtx_start_discarded = metric(receiver.get(), "audio_latency_discarded_ms");
     if (tick == resume_tick - 1)
@@ -600,6 +625,7 @@ static void verify_silence(bool after_jitter = false) {
   std::fflush(stdout);
   assert(max_lateness < 30);
   assert(silent_end_packets - silent_start_packets > 20);
+  assert(input_tone_seen && output_tone_seen && silence_seen);
   assert(silent_end_packets - silent_start_packets < 150); // Opus DTX is exercised
   assert(max_age < 500); // intentional silence must not trigger receive repair
   // Healthy DTX must also retain valid low-delay feedback for video recovery.
