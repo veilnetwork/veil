@@ -3403,3 +3403,83 @@ async fn inbound_repair_ignores_backpressure_but_detects_a_closed_first_hop() {
         "healthy receive path was rotated"
     );
 }
+
+/// A silent first registration must not keep a ready neighbour's receiver off.
+/// The confirmation is held by an explicit gate, not a network-time threshold.
+#[tokio::test]
+async fn slow_confirmation_does_not_delay_other_inbound_feeds() {
+    use std::{future::Future, task::Poll};
+    let mut f = fixture().await;
+    let (second, _hop, _outbox) = add_circuit(&f.cells.services);
+    let (first_tx, first_rx) = mpsc::channel(4);
+    let (second_tx, second_rx) = mpsc::channel(4);
+    let (in_tx, mut in_rx) = mpsc::channel(4);
+    let started = Arc::new(AtomicU64::new(0));
+    let tasks = Arc::new(Mutex::new(Vec::new()));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let candidates = vec![(Arc::clone(&f.circuit), first_rx), (second, second_rx)];
+    let mut activation = Box::pin(start_then_confirm_inbound(
+        candidates,
+        |(c, rx)| {
+            started.fetch_add(1, Ordering::Relaxed);
+            let task = spawn_circuit_feed(
+                f.cells.services.clone(),
+                rx,
+                in_tx.clone(),
+                None,
+                None,
+                Arc::clone(&f.cells.peer_tags),
+                Some(c.confirmed_flag()),
+            );
+            tasks.lock().unwrap().push(task);
+            c
+        },
+        |c| {
+            let gate = Arc::clone(&gate);
+            async move {
+                gate.notified().await;
+                c
+            }
+        },
+    ));
+    // Poll exactly to the held first confirmation. The operation cannot
+    // advance past it until this test explicitly polls/releases it again.
+    std::future::poll_fn(|cx| {
+        assert!(activation.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let started_count = started.load(Ordering::Relaxed);
+    let cell = Frame::Syn {
+        stream_id: 91,
+        isn: 500,
+        win: 8192,
+    }
+    .encode();
+    let mut envelope = [0x81; 32].to_vec();
+    envelope.extend_from_slice(&cell);
+    let mut received = false;
+    if started_count == 2 {
+        second_tx.send(envelope).await.unwrap();
+        // Watchdog only; correctness is that the confirmation gate stays shut.
+        received = tokio::time::timeout(Duration::from_secs(5), in_rx.recv())
+            .await
+            .unwrap()
+            .is_some_and(|(_, got)| got == cell);
+    }
+    drop(activation);
+    drop(first_tx);
+    drop(second_tx);
+    for task in tasks.lock().unwrap().drain(..) {
+        task.abort();
+    }
+    f.runtime.stop().await.unwrap();
+    assert_eq!(
+        started_count, 2,
+        "a pending confirmation prevented the other feed from starting"
+    );
+    assert!(
+        received,
+        "ready circuit did not deliver while its neighbour was unconfirmed"
+    );
+}
