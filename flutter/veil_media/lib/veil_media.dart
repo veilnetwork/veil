@@ -554,8 +554,14 @@ class VeilMediaEngine {
   }
 
   void setMicMuted(bool muted) {
+    trySetMicMuted(muted);
+  }
+
+  /// Apply capture intent and report a refused native device/worker operation.
+  /// In particular, unmuting may need to start a previously stopped microphone.
+  bool trySetMicMuted(bool muted) {
     _ensure();
-    ffi.veilMediaEngineSetMicMuted(_ptr, muted ? 1 : 0);
+    return ffi.veilMediaEngineSetMicMuted(_ptr, muted ? 1 : 0) == 0;
   }
 
   void setSpeakerMuted(bool muted) {
