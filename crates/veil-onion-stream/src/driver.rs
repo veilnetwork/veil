@@ -619,14 +619,6 @@ async fn drive<D: CellDuplex>(
             next_debug_summary_ms = now.saturating_add(period_ms);
         }
 
-        // 0. Once the peer has finished AND we've handed off everything we
-        //    received, close our own (often empty) write half so both ends
-        //    exchange FINs and settle cleanly. Done BEFORE the drain so the
-        //    courtesy FIN actually goes out this iteration (not after we park).
-        if engine.is_eof() {
-            engine.finish();
-        }
-
         // 1. Surface terminal events.
         while let Some(ev) = engine.poll_event() {
             match ev {
@@ -683,6 +675,15 @@ async fn drive<D: CellDuplex>(
             }
             tmp.truncate(n);
             permit.send(tmp);
+        }
+
+        // EOF may become visible only when the last bytes above leave the
+        // engine's read buffer. Close our write half AFTER that handoff and
+        // BEFORE transmitting or considering retirement. Otherwise an empty
+        // sender can pass is_send_complete without ever requesting a FIN,
+        // retiring its ACK route while the peer still awaits its final ACK/EOF.
+        if engine.is_eof() {
+            engine.finish();
         }
 
         // 3. Drain everything the engine wants to put on the wire and hand it
