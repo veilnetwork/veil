@@ -5168,6 +5168,40 @@ async fn open_inbound_circuits(
     }
 }
 
+/// A cancelled/failed unpublished file candidate keeps the existing receive
+/// grace; an isolated producer's own lifetime guard retires it immediately.
+struct PendingOutboundCircuit {
+    services: veil_node_runtime::NodeServices,
+    candidate: Arc<veil_node_runtime::DataCircuit>,
+    lifetime: Option<Arc<ProducerCircuit>>,
+    retire_on_drop: bool,
+}
+
+impl Drop for PendingOutboundCircuit {
+    fn drop(&mut self) {
+        if self.retire_on_drop && self.lifetime.is_none() {
+            retire_circuits_later(&self.services, vec![Arc::clone(&self.candidate)]);
+        }
+    }
+}
+
+// One silent candidate must leave capacity for an alternative, including a
+// single-route media producer. The batch stops once the pool target is published.
+const MAX_CONCURRENT_OUTBOUND_ATTEMPTS: usize = 2;
+
+fn outbound_attempts<C, R, F>(
+    candidates: Vec<C>,
+    prepare: impl FnMut(C) -> F,
+) -> impl futures::Stream<Item = R>
+where
+    F: std::future::Future<Output = R>,
+{
+    use futures::StreamExt;
+    futures::stream::iter(candidates)
+        .map(prepare)
+        .buffer_unordered(MAX_CONCURRENT_OUTBOUND_ATTEMPTS)
+}
+
 /// Resolve the current peer binding and prepare its pool. Returns the number
 /// of skipped/reused routes, so a stronger joined request can revisit them.
 // Circuit construction owns one coherent snapshot of the hub's shared state;
@@ -5443,76 +5477,137 @@ async fn open_outbound_circuit(
             ),
         );
     }
+    use futures::StreamExt;
     let mut last_err = "no receiver rendezvous ad opened".to_string();
     let mut opened_entries = Vec::new();
     let peer_tag = outbound_peer_tag(&outbound_peer_tags, dst_node);
     let mut kept_in_flight = 0;
     let mut published_count = 0;
     let mut reused_count = 0;
-    for ad in ranked_ads {
-        if opened_entries.len() >= pool_target {
-            break;
-        }
-        if intent == PoolOpenIntent::Warm {
-            let reusable = {
-                let pool = outbound_circuits.lock().await;
-                let now = Instant::now();
-                pool.get(&dst_node).and_then(|entries| {
-                    entries
-                        .iter()
-                        .find(|entry| {
-                            let first_hop = entry.circuit.first_hop();
-                            let old_quiet = now.duration_since(entry.opened_at)
-                                >= CIRCUIT_HANDSHAKE_REOPEN_AFTER
-                                && now.duration_since(entry.last_non_handshake)
-                                    >= CIRCUIT_HANDSHAKE_REOPEN_AFTER;
-                            entry.rendezvous_node == ad.rendezvous_node_id
-                                && entry.peer_cookie == ad.auth_cookie
-                                && entry.receiver_x25519_pk == ad.receiver_x25519_pk
-                                && entry.circuit.confirmed_flag().load(Ordering::Acquire)
-                                && services.data_circuit_session_current(&entry.circuit)
-                                && !entry.stats.slow_marked(now)
-                                && (!old_quiet || entry.stats.active_streams() > 0)
-                                && route_cooldowns
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .get(&entry.rendezvous_node)
-                                    .is_none_or(|until| *until <= now)
-                                && first_hop_cooldowns
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .get(&first_hop)
-                                    .is_none_or(|until| *until <= now)
-                        })
-                        .cloned()
-                })
-            };
-            if let Some(entry) = reusable {
-                // Keep the same circuit and stats, including live stream pins.
-                // The publication merge below preserves any intervening traffic
-                // metadata instead of restoring this snapshot.
-                note_answering_device(&peer_aliases, &ad, dst_node);
-                opened_entries.push(entry);
-                reused_count += 1;
-                continue;
+    let attempts = outbound_attempts(ranked_ads, |ad| {
+        let services = services.clone();
+        let reg_kp = reg_kp.clone();
+        let epoch = epoch.clone();
+        let in_tx = in_tx.clone();
+        let activity = activity.clone();
+        let inbound_activity = inbound_activity.clone();
+        let outbound_circuits = outbound_circuits.clone();
+        let peer_tags = peer_tags.clone();
+        let peer_aliases = peer_aliases.clone();
+        let route_cooldowns = route_cooldowns.clone();
+        let first_hop_cooldowns = first_hop_cooldowns.clone();
+        let path_group = path_group.clone();
+        let producer_owner = producer_owner.clone();
+        let cooled_first_hops = &cooled_first_hops;
+        async move {
+            let last_err;
+            if intent == PoolOpenIntent::Warm {
+                let reusable = {
+                    let pool = outbound_circuits.lock().await;
+                    let now = Instant::now();
+                    pool.get(&dst_node).and_then(|entries| {
+                        entries
+                            .iter()
+                            .find(|entry| {
+                                let first_hop = entry.circuit.first_hop();
+                                let old_quiet = now.duration_since(entry.opened_at)
+                                    >= CIRCUIT_HANDSHAKE_REOPEN_AFTER
+                                    && now.duration_since(entry.last_non_handshake)
+                                        >= CIRCUIT_HANDSHAKE_REOPEN_AFTER;
+                                entry.rendezvous_node == ad.rendezvous_node_id
+                                    && entry.peer_cookie == ad.auth_cookie
+                                    && entry.receiver_x25519_pk == ad.receiver_x25519_pk
+                                    && entry.circuit.confirmed_flag().load(Ordering::Acquire)
+                                    && services.data_circuit_session_current(&entry.circuit)
+                                    && !entry.stats.slow_marked(now)
+                                    && (!old_quiet || entry.stats.active_streams() > 0)
+                                    && route_cooldowns
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .get(&entry.rendezvous_node)
+                                        .is_none_or(|until| *until <= now)
+                                    && first_hop_cooldowns
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .get(&first_hop)
+                                        .is_none_or(|until| *until <= now)
+                            })
+                            .cloned()
+                    })
+                };
+                if let Some(entry) = reusable {
+                    // Keep the same circuit and stats, including live stream pins.
+                    // The publication merge below preserves any intervening traffic
+                    // metadata instead of restoring this snapshot.
+                    note_answering_device(&peer_aliases, &ad, dst_node);
+                    return Ok((entry, true, None, None));
+                }
             }
-        }
-        let started = Instant::now();
-        let registration = outbound_registration(&reg_kp, &epoch, private_registration)?;
-        let (candidate, recv_rx) = match services
-            .open_stream_circuit_to_rendezvous_relay_in_group(
-                ad.rendezvous_node_id,
-                &registration.keypair,
-                &registration.epoch,
-                CIRCUIT_HOPS,
-                Some(&path_group),
-            )
-            .await
-        {
-            Ok(opened) => opened,
-            Err(e) => {
+            let started = Instant::now();
+            let registration = outbound_registration(&reg_kp, &epoch, private_registration)?;
+            let (candidate, recv_rx) = match services
+                .open_stream_circuit_to_rendezvous_relay_in_group(
+                    ad.rendezvous_node_id,
+                    &registration.keypair,
+                    &registration.epoch,
+                    CIRCUIT_HOPS,
+                    Some(&path_group),
+                )
+                .await
+            {
+                Ok(opened) => opened,
+                Err(e) => {
+                    last_err = format!(
+                        "R={} open failed after {}ms: {e:?}",
+                        short_node(&ad.rendezvous_node_id),
+                        started.elapsed().as_millis()
+                    );
+                    mark_rendezvous_cooldown(
+                        &route_cooldowns,
+                        ad.rendezvous_node_id,
+                        CIRCUIT_ROUTE_SEND_COOLDOWN,
+                    );
+                    diag_node(&me, &format!("outbound {last_err}"));
+                    return Err(last_err);
+                }
+            };
+
+            // Start the return-cell feed immediately: it consumes early peer cells
+            // AND recognises the loopback splice-probe echo used below — the open
+            // above registered OUR cookie at this relay, so a probe up this
+            // candidate echoes back down it exactly as on the inbound side.
+            let candidate = Arc::new(candidate);
+            let feed = spawn_circuit_feed(
+                services.clone(),
+                recv_rx,
+                in_tx.clone(),
+                Some(Arc::clone(&activity)),
+                Some(Arc::clone(&inbound_activity)),
+                Arc::clone(&peer_tags),
+                Some(candidate.confirmed_flag()),
+            );
+            let lifetime = match &producer_owner {
+                Some(owner) => Some(
+                    owner
+                        .track_circuit(services.clone(), Arc::clone(&candidate), feed)
+                        .ok_or_else(|| "local producer closed during circuit open".to_owned())?,
+                ),
+                None => None,
+            };
+            let pending = PendingOutboundCircuit {
+                services: services.clone(),
+                candidate: Arc::clone(&candidate),
+                lifetime,
+                retire_on_drop: true,
+            };
+            let circuit_open_ms = started.elapsed().as_millis();
+            let confirm_started = Instant::now();
+            let confirmed =
+                confirm_circuit_with_probe(&services, &candidate, &registration.cookie).await;
+            let confirm_ms = confirm_started.elapsed().as_millis();
+            if !confirmed {
                 last_err = format!(
-                    "R={} open failed after {}ms: {e:?}",
+                    "R={} confirmation timed out after {}ms (no ACK, no probe echo)",
                     short_node(&ad.rendezvous_node_id),
                     started.elapsed().as_millis()
                 );
@@ -5522,120 +5617,73 @@ async fn open_outbound_circuit(
                     CIRCUIT_ROUTE_SEND_COOLDOWN,
                 );
                 diag_node(&me, &format!("outbound {last_err}"));
-                continue;
+                // Even with probes the registration can be live with every echo
+                // lost; the feed above keeps receiving for the retire grace while
+                // a later open picks a confirmed send path.
+                return Err(last_err);
             }
-        };
 
-        // Start the return-cell feed immediately: it consumes early peer cells
-        // AND recognises the loopback splice-probe echo used below — the open
-        // above registered OUR cookie at this relay, so a probe up this
-        // candidate echoes back down it exactly as on the inbound side.
-        let candidate = Arc::new(candidate);
-        let feed = spawn_circuit_feed(
-            services.clone(),
-            recv_rx,
-            in_tx.clone(),
-            Some(Arc::clone(&activity)),
-            Some(Arc::clone(&inbound_activity)),
-            Arc::clone(&peer_tags),
-            Some(candidate.confirmed_flag()),
-        );
-        let lifetime = match &producer_owner {
-            Some(owner) => Some(
-                owner
-                    .track_circuit(services.clone(), Arc::clone(&candidate), feed)
-                    .ok_or_else(|| "local producer closed during circuit open".to_owned())?,
-            ),
-            None => None,
-        };
-        let circuit_open_ms = started.elapsed().as_millis();
-        let confirm_started = Instant::now();
-        let confirmed =
-            confirm_circuit_with_probe(&services, &candidate, &registration.cookie).await;
-        let confirm_ms = confirm_started.elapsed().as_millis();
-        if !confirmed {
-            last_err = format!(
-                "R={} confirmation timed out after {}ms (no ACK, no probe echo)",
-                short_node(&ad.rendezvous_node_id),
-                started.elapsed().as_millis()
-            );
-            mark_rendezvous_cooldown(
-                &route_cooldowns,
-                ad.rendezvous_node_id,
-                CIRCUIT_ROUTE_SEND_COOLDOWN,
-            );
-            diag_node(&me, &format!("outbound {last_err}"));
-            // Even with probes the registration can be live with every echo
-            // lost; the feed above keeps receiving for the retire grace while
-            // a later open picks a confirmed send path.
-            if producer_owner.is_none() {
-                retire_circuits_later(&services, vec![candidate]);
-            }
-            continue;
-        }
-
-        let now = Instant::now();
-        let first_hop = candidate.first_hop();
-        if !services.has_live_session(&first_hop) {
-            last_err = format!(
-                "R={} path={} first-hop {} not live after confirm",
-                short_node(&ad.rendezvous_node_id),
-                short_path(candidate.relay_path()),
-                short_node(&first_hop)
-            );
-            mark_first_hop_cooldown(&first_hop_cooldowns, first_hop, CIRCUIT_ROUTE_SEND_COOLDOWN);
-            diag_node(&me, &format!("outbound {last_err}"));
-            if producer_owner.is_none() {
-                retire_circuits_later(&services, vec![candidate]);
-            }
-            continue;
-        }
-        if cooled_first_hops
-            .get(&first_hop)
-            .is_some_and(|until| *until > now)
-        {
-            last_err = format!(
-                "R={} path={} first-hop {} cooled",
-                short_node(&ad.rendezvous_node_id),
-                short_path(candidate.relay_path()),
-                short_node(&first_hop)
-            );
-            diag_node(&me, &format!("outbound {last_err}"));
-            if producer_owner.is_none() {
-                retire_circuits_later(&services, vec![candidate]);
-            }
-            continue;
-        }
-        if opened_entries
-            .iter()
-            .any(|entry: &CircuitEntry| entry.circuit.first_hop() == first_hop)
-        {
-            diag_node(
-                &me,
-                &format!(
-                    "outbound R={} path={} duplicate first-hop {} — keeping as standby",
+            let now = Instant::now();
+            let first_hop = candidate.first_hop();
+            if !services.data_circuit_session_current(&candidate) {
+                last_err = format!(
+                    "R={} path={} first-hop {} not current after confirm",
                     short_node(&ad.rendezvous_node_id),
                     short_path(candidate.relay_path()),
                     short_node(&first_hop)
-                ),
-            );
+                );
+                diag_node(&me, &format!("outbound {last_err}"));
+                return Err(last_err);
+            }
+            if cooled_first_hops
+                .get(&first_hop)
+                .is_some_and(|until| *until > now)
+            {
+                last_err = format!(
+                    "R={} path={} first-hop {} cooled",
+                    short_node(&ad.rendezvous_node_id),
+                    short_path(candidate.relay_path()),
+                    short_node(&first_hop)
+                );
+                diag_node(&me, &format!("outbound {last_err}"));
+                return Err(last_err);
+            }
+            note_answering_device(&peer_aliases, &ad, dst_node);
+            let entry = CircuitEntry {
+                circuit: Arc::clone(&candidate),
+                lifetime: pending.lifetime.clone(),
+                rendezvous_node: ad.rendezvous_node_id,
+                first_hop_close_generation: candidate.first_hop_close_generation(),
+                peer_tag,
+                peer_cookie: ad.auth_cookie,
+                receiver_x25519_pk: ad.receiver_x25519_pk,
+                opened_at: now,
+                last_used: now,
+                last_non_handshake: now,
+                handshake_streams: HashSet::new(),
+                stats: Arc::new(CircuitRouteStats::new(now)),
+            };
+            Ok((
+                entry,
+                false,
+                Some((started, circuit_open_ms, confirm_ms)),
+                Some(pending),
+            ))
         }
-
-        note_answering_device(&peer_aliases, &ad, dst_node);
-        opened_entries.push(CircuitEntry {
-            circuit: Arc::clone(&candidate),
-            lifetime,
-            rendezvous_node: ad.rendezvous_node_id,
-            first_hop_close_generation: candidate.first_hop_close_generation(),
-            peer_tag,
-            peer_cookie: ad.auth_cookie,
-            receiver_x25519_pk: ad.receiver_x25519_pk,
-            opened_at: now,
-            last_used: now,
-            last_non_handshake: now,
-            handshake_streams: HashSet::new(),
-            stats: Arc::new(CircuitRouteStats::new(now)),
-        });
+    });
+    futures::pin_mut!(attempts);
+    while let Some(result) = attempts.next().await {
+        let (entry, reused, timing, mut pending) = match result {
+            Ok(ready) => ready,
+            Err(error) => {
+                last_err = error;
+                continue;
+            }
+        };
+        let candidate = Arc::clone(&entry.circuit);
+        let relay = entry.rendezvous_node;
+        opened_entries.push(entry);
+        reused_count += usize::from(reused);
         // Make a confirmed prefix usable before waiting on slower candidates.
         let publish_started = Instant::now();
         kept_in_flight = publish_outbound_candidates(
@@ -5650,19 +5698,27 @@ async fn open_outbound_circuit(
             },
         )
         .await;
+        if let Some(pending) = pending.as_mut() {
+            pending.retire_on_drop = false;
+        }
         let publish_ms = publish_started.elapsed().as_millis();
         published_count = opened_entries.len();
         mark_circuit_activity(&activity);
-        diag_node(
-            &me,
-            &format!(
-                "outbound circuit ready for {} via R={} path={} open_confirm={}ms circuit_open_ms={circuit_open_ms} confirm_ms={confirm_ms} publish_ms={publish_ms}",
-                short_node(&dst_node),
-                short_node(&ad.rendezvous_node_id),
-                short_path(candidate.relay_path()),
-                started.elapsed().as_millis(),
-            ),
-        );
+        if let Some((started, circuit_open_ms, confirm_ms)) = timing {
+            diag_node(
+                &me,
+                &format!(
+                    "outbound circuit ready for {} via R={} path={} open_confirm={}ms circuit_open_ms={circuit_open_ms} confirm_ms={confirm_ms} publish_ms={publish_ms}",
+                    short_node(&dst_node),
+                    short_node(&relay),
+                    short_path(candidate.relay_path()),
+                    started.elapsed().as_millis(),
+                ),
+            );
+        }
+        if opened_entries.len() >= pool_target {
+            break;
+        }
     }
     if opened_entries.is_empty() {
         return Err(format!("open to receiver ad: {last_err}"));
@@ -6189,6 +6245,10 @@ fn retire_circuits_later(
         });
     }
 }
+
+#[cfg(test)]
+#[path = "anon_stream/outbound_activation_tests.rs"]
+mod outbound_activation_tests;
 
 #[cfg(test)]
 #[path = "anon_stream/inbound_activation_tests.rs"]

@@ -950,6 +950,65 @@ async fn fixture() -> Fixture {
 }
 
 #[tokio::test]
+async fn unpublished_outbound_candidate_keeps_grace_then_releases_only_its_sink() {
+    let mut f = fixture().await;
+    let services = f.cells.services.clone();
+    let cancelled_id = f.circuit.origin_circuit_id();
+    let (kept, _kept_rx) = services
+        .open_data_circuit(&[f.hop], b"kept fixture")
+        .unwrap();
+    let kept = Arc::new(kept);
+    let kept_id = kept.origin_circuit_id();
+    let cancelled = PendingOutboundCircuit {
+        services: services.clone(),
+        candidate: Arc::clone(&f.circuit),
+        lifetime: None,
+        retire_on_drop: true,
+    };
+    let published = PendingOutboundCircuit {
+        services: services.clone(),
+        candidate: kept,
+        lifetime: None,
+        retire_on_drop: false,
+    };
+    tokio::time::pause();
+    drop(cancelled);
+    drop(published);
+    tokio::task::yield_now().await;
+    tokio::time::advance(CIRCUIT_RETIRE_GRACE - Duration::from_millis(1)).await;
+    let during_grace = services
+        .dispatcher
+        .stream_recv
+        .lock()
+        .unwrap()
+        .contains_key(&cancelled_id);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    // Give Tokio's millisecond timer wheel and the spawned retirement task
+    // one driver turn; advance() alone does not run every expired future.
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let retired = !services
+        .dispatcher
+        .stream_recv
+        .lock()
+        .unwrap()
+        .contains_key(&cancelled_id);
+    let kept = services
+        .dispatcher
+        .stream_recv
+        .lock()
+        .unwrap()
+        .contains_key(&kept_id);
+    services.close_data_circuit(kept_id);
+    f.runtime.stop().await.unwrap();
+    assert!(during_grace, "cancelled candidate lost receive grace");
+    assert!(
+        retired,
+        "cancelled candidate retained its receive sink after grace"
+    );
+    assert!(kept, "cancelled batch retired a published candidate");
+}
+
+#[tokio::test]
 async fn ffi_route_health_uses_the_native_tx_registration_witness() {
     for replaced in [true, false] {
         let mut f = fixture().await;
