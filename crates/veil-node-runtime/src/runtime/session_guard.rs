@@ -232,13 +232,11 @@ pub fn release_session(
     h.session_outbox.unregister_owned(peer_id, session_id);
 
     // Bump on EVERY runner exit, superseded or not — and note this is
-    // deliberately OUTSIDE the owner check. The consumer is a long-lived
-    // circuit handle asking "did the session I built this route on go
-    // away", and a replacement is exactly that: the old session's keys
-    // are gone, so frames for a circuit pinned to it are undeliverable
-    // even though the peer itself is reachable again through the new
-    // session. Suppressing the bump on a replacement would leave those
-    // handles believing a dead first hop was live.
+    // deliberately OUTSIDE the owner check. Preserve the diagnostic/public
+    // meaning: any runner exit, including one superseded by a new session.
+    // DataCircuit uses the exact TX registration as its lifetime witness:
+    // this old runner may be exiting AFTER a fresh circuit was already built,
+    // so this counter alone must not invalidate the new circuit.
     bump_close_generation(h.session_close_generations, peer_id.as_bytes());
 
     if superseded {

@@ -940,6 +940,15 @@ impl SessionTxRegistry {
             .collect()
     }
 
+    /// Lifetime witness for this peer's current live TX entry. A delayed exit
+    /// of an older runner does not change it; accepted replacement does.
+    pub fn live_registration(&self, peer: &NodeIdBytes) -> Option<u64> {
+        self.senders
+            .get(peer)
+            .filter(|entry| !entry.tx.is_closed())
+            .map(|entry| entry.registration)
+    }
+
     /// Sorted live registrations for maintenance replication. Reconnects to
     /// the same peer change this witness; queue traffic and rejected duplicate
     /// admission do not. It neither holds sender handles nor includes stale

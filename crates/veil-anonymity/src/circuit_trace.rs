@@ -79,6 +79,7 @@ mod enabled {
     const MAX_EVENTS: u64 = 32768;
     #[cfg(unix)]
     const MAX_FILE_BYTES: u64 = 4096;
+    #[cfg(any(unix, test))]
     const MAX_FILTERS: usize = 16;
 
     #[derive(Default)]
