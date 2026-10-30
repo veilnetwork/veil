@@ -1609,6 +1609,12 @@ impl CellSender for CircuitCells {
         let Some(route) = route else {
             return;
         };
+        // A delayed timer is evidence about its captured handle, never about
+        // a replacement session. Retire it before charging RTO/defer counters.
+        if self.route_session_stale(&route) {
+            self.mark_route_stale(dst.node, &route).await;
+            return;
+        }
         let route_rto = route
             .stats
             .as_ref()
@@ -3218,6 +3224,10 @@ impl CircuitCells {
         stream_rto_events: u64,
         snd_una: u32,
     ) {
+        if self.route_session_stale(route) {
+            self.mark_route_stale(dst_node, route).await;
+            return;
+        }
         let Some(relay) = route.rendezvous_node else {
             return;
         };
@@ -3228,11 +3238,11 @@ impl CircuitCells {
         // (observed live as a full pool collapse: consec_rto=3/4/5 with
         // stream_rto_events=1 per route). Quarantine needs route-local
         // evidence: at least two RTO events for this stream on THIS route.
-        // A dead first-hop session is still quarantined immediately.
+        // Lost first-hop registrations are retired separately above, not
+        // evidence against a replacement connection at the same hop.
         let route_local_evidence = stream_rto_events >= 2;
-        let quarantine_route = (route_local_evidence
-            && (consec_rto >= 3 || stream_rto_events > CIRCUIT_ROUTE_NO_PROGRESS_RTO_EVENTS))
-            || !self.services.has_live_session(&first_hop);
+        let quarantine_route = route_local_evidence
+            && (consec_rto >= 3 || stream_rto_events > CIRCUIT_ROUTE_NO_PROGRESS_RTO_EVENTS);
         if !quarantine_route {
             let remapped = self.remap_stream_route(dst_node, stream_id, route).await;
             let stats = route
@@ -3301,7 +3311,7 @@ impl CircuitCells {
                                 && (!block_first_hop || entry_first_hop != first_hop)
                                 && !cooled_relays.contains(&entry.rendezvous_node)
                                 && !cooled_first_hops.contains(&entry_first_hop)
-                                && self.services.has_live_session(&entry_first_hop)
+                                && self.services.data_circuit_session_current(&entry.circuit)
                         })
                     })
                     .unwrap_or(false)
