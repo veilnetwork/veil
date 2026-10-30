@@ -59,6 +59,14 @@ const MethodChannel _channel = MethodChannel('veil_flutter/lifecycle');
 class VeilBackground {
   VeilBackground._(); // not instantiable
 
+  /// Read-only operational flags/volume; no labels or settings payloads.
+  /// A missing/older plugin is reported as unavailable by the caller.
+  static Future<Map<Object?, Object?>?> diagnosticState() async {
+    if (!Platform.isAndroid) return null;
+    return _channel
+        .invokeMapMethod<Object?, Object?>('diagnosticBackgroundState');
+  }
+
   /// Start the foreground service.  Returns immediately; the service
   /// itself takes over keeping the process alive.
   ///

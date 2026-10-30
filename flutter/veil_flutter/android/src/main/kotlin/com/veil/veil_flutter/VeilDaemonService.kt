@@ -70,6 +70,12 @@ class VeilDaemonService : Service() {
         private const val APP_ACTION_HANGUP = "network.veil.xveil.action.HANGUP_CALL"
         private const val APP_ACTION_ACCEPT = "network.veil.xveil.action.ACCEPT_CALL"
         private const val TAG = "VeilDaemonService"
+        // Same-process, read-only diagnostics; never expose notification text.
+        private var diagnosticInstance: VeilDaemonService? = null
+        fun diagnosticState(): Map<String, Boolean> = mapOf(
+            "serviceForeground" to (diagnosticInstance?.foregroundActive == true),
+            "wakeLockHeld" to (diagnosticInstance?.wakeLock?.isHeld == true),
+        )
     }
 
     // Partial wake lock held for the service's lifetime. A foreground service
@@ -81,9 +87,11 @@ class VeilDaemonService : Service() {
     // fire on schedule and the connection stays warm. Costs battery — which is
     // exactly why the whole background service is opt-in.
     private var wakeLock: PowerManager.WakeLock? = null
+    private var foregroundActive = false
 
     override fun onCreate() {
         super.onCreate()
+        diagnosticInstance = this
         ensureChannel()
         // Start foreground IMMEDIATELY (within 5 s of onCreate) — Android
         // 12+ is strict about this and kills the service otherwise.
@@ -128,6 +136,8 @@ class VeilDaemonService : Service() {
     }
 
     override fun onDestroy() {
+        foregroundActive = false
+        if (diagnosticInstance === this) diagnosticInstance = null
         releaseWakeLock()
         super.onDestroy()
     }
@@ -287,7 +297,9 @@ class VeilDaemonService : Service() {
     ) {
         try {
             startForegroundOrThrow(notification, microphone, camera)
+            foregroundActive = true
         } catch (refused: IllegalStateException) {
+            foregroundActive = false
             // ForegroundServiceStartNotAllowedException, from Android 12. It
             // extends IllegalStateException and is NOT a SecurityException, so
             // the media-type catch below never saw it and it escaped out of
@@ -350,6 +362,7 @@ class VeilDaemonService : Service() {
     }
 
     private fun stopForegroundCompat() {
+        foregroundActive = false
         // The notification carrying the accept / hangup buttons is going away,
         // so the capabilities it handed out must go with it. Without this a
         // PendingIntent the system still holds — or one already delivered and
