@@ -138,7 +138,7 @@ pub(crate) fn relay_chain_frame(msg: veil_proto::family::RelayChainMsg, body: &[
     frame
 }
 
-fn enqueue_relay_chain_frame(
+pub(super) fn enqueue_relay_chain_frame(
     registry: &veil_session::SessionTxRegistry,
     peer: &[u8; 32],
     msg: veil_proto::family::RelayChainMsg,
@@ -150,7 +150,7 @@ fn enqueue_relay_chain_frame(
     registry.send_to_result(peer, local_lane, relay_chain_frame(msg, body))
 }
 
-fn enqueue_relay_chain_frame_before(
+pub(super) fn enqueue_relay_chain_frame_before(
     registry: &veil_session::SessionTxRegistry,
     peer: &[u8; 32],
     msg: veil_proto::family::RelayChainMsg,
@@ -186,18 +186,6 @@ impl NodeServices {
     ) -> std::result::Result<(), veil_session::SendToError> {
         let guard = wlock!(self.session_tx_registry);
         enqueue_relay_chain_frame(&guard, peer, msg, body, local_lane)
-    }
-
-    pub(crate) fn send_relay_chain_frame_on_local_lane_before(
-        &self,
-        peer: &[u8; 32],
-        msg: veil_proto::family::RelayChainMsg,
-        body: &[u8],
-        local_lane: u8,
-        expires_at: std::time::Instant,
-    ) -> std::result::Result<(), veil_session::SendToError> {
-        let guard = rlock!(self.session_tx_registry);
-        enqueue_relay_chain_frame_before(&guard, peer, msg, body, local_lane, expires_at)
     }
 
     /// Authenticated rendezvous send (Epic 482 v1, "any recipient"): like

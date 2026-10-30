@@ -1191,8 +1191,9 @@ impl NodeServices {
     }
 
     /// Monotonic generation incremented whenever the session runner for `peer`
-    /// exits. Long-lived circuit handles can sample this at open time and later
-    /// detect that their first-hop relay session churned underneath them.
+    /// exits, including a superseded runner. Diagnostic/downstream callers may
+    /// sample it; DataCircuit lifetime uses the exact TX registration instead,
+    /// because an older runner may exit after a fresh circuit has been built.
     pub fn session_close_generation(&self, peer: &[u8; 32]) -> u64 {
         lock!(self.session_close_generations)
             .get(peer)
@@ -1204,8 +1205,8 @@ impl NodeServices {
     /// Remote state may survive reconnect; this local lifetime check neither
     /// guarantees its survival nor proves end-to-end reachability.
     pub fn data_circuit_session_current(&self, circuit: &DataCircuit) -> bool {
-        self.session_close_generation(&circuit.first_hop) == circuit.first_hop_close_generation
-            && self.has_live_session(&circuit.first_hop)
+        rlock!(self.session_tx_registry).live_registration(&circuit.first_hop)
+            == Some(circuit.first_hop_registration)
     }
 
     /// Whether the session TX registry currently has a live sender for `peer`.
@@ -1581,6 +1582,9 @@ impl NodeServices {
         let Some(origin_table) = &self.dispatcher.circuit_origin else {
             return Err(AnonOnionSendError::NoIdentity);
         };
+        let first_hop_registration = rlock!(self.session_tx_registry)
+            .live_registration(&relay_path[0])
+            .ok_or(AnonOnionSendError::NoRelays)?;
         // Resolve each hop's anonymity X25519 key from the local relay directory.
         let mut hops = Vec::with_capacity(relay_path.len());
         for nid in relay_path {
@@ -1613,6 +1617,7 @@ impl NodeServices {
             _local_path: None,
             first_hop: origin.first_hop,
             first_hop_close_generation,
+            first_hop_registration,
             relay_path: relay_path.to_vec(),
             origin_circuit_id: origin.origin_circuit_id,
             keys: origin.circuit_keys.clone(),
@@ -1639,11 +1644,21 @@ impl NodeServices {
             }
             return Err(AnonOnionSendError::NoRelays);
         }
-        if let Err(reason) = self.send_relay_chain_frame(
-            &circ.first_hop,
-            veil_proto::family::RelayChainMsg::CircuitBuild,
-            &setup,
-        ) {
+        let build_admission = {
+            let registry = rlock!(self.session_tx_registry);
+            if registry.live_registration(&circ.first_hop) != Some(first_hop_registration) {
+                Err(veil_session::SendToError::Missing)
+            } else {
+                super::sending::enqueue_relay_chain_frame(
+                    &registry,
+                    &circ.first_hop,
+                    veil_proto::family::RelayChainMsg::CircuitBuild,
+                    &setup,
+                    veil_proto::priority::INTERACTIVE,
+                )
+            }
+        };
+        if let Err(reason) = build_admission {
             // Roll back both allocations. close_data_circuit alone deliberately
             // retains origin state for previously admitted shared paths.
             origin_table.remove(&circ.first_hop, circ.origin_circuit_id);
@@ -2443,7 +2458,11 @@ impl NodeServices {
         if circ.next_seq.load(std::sync::atomic::Ordering::Relaxed) == u32::MAX {
             return Err(DataCircuitSendError::NoRelays); // rotate even if ingress is full
         }
-        if !self.data_circuit_session_current(circ) {
+        // Keep the witness check and local enqueue under one read guard.
+        // Replacement cannot race encryption/nonce allocation into a new TX
+        // entry, and an old runner's late close-counter bump is irrelevant.
+        let registry = rlock!(self.session_tx_registry);
+        if registry.live_registration(&circ.first_hop) != Some(circ.first_hop_registration) {
             return Err(DataCircuitSendError::NoRelays);
         }
         let encode = || {
@@ -2466,7 +2485,7 @@ impl NodeServices {
             // large sequence gap and age genuine cells out of replay windows.
             let frame_len =
                 veil_proto::HEADER_SIZE + CircuitDataPayload::HEADER_LEN + circ.cell_bytes.get();
-            let result = rlock!(self.session_tx_registry)
+            let result = registry
                 .send_recoverable_with_result(&circ.first_hop, frame_len, || {
                     let enc = encode()?;
                     Ok(veil_bufpool::pooled_shared_from_vec(
@@ -2490,14 +2509,16 @@ impl NodeServices {
         }
         let enc = encode()?;
         let result = match expires_at {
-            Some(expires_at) => self.send_relay_chain_frame_on_local_lane_before(
+            Some(expires_at) => super::sending::enqueue_relay_chain_frame_before(
+                &registry,
                 &circ.first_hop,
                 transport,
                 &enc,
                 local_lane,
                 expires_at,
             ),
-            None => self.send_relay_chain_frame_on_local_lane(
+            None => super::sending::enqueue_relay_chain_frame(
+                &registry,
                 &circ.first_hop,
                 transport,
                 &enc,

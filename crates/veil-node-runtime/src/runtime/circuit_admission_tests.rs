@@ -15,6 +15,7 @@ fn circuit(last: u32) -> DataCircuit {
         _local_path: None,
         first_hop: [0x71; 32],
         first_hop_close_generation: 0,
+        first_hop_registration: 1,
         relay_path: vec![[0x71; 32]],
         origin_circuit_id: 7,
         keys: vec![[0x25; 32]],
@@ -514,5 +515,72 @@ async fn reconnected_session_rejects_old_circuit_before_local_handoff() {
             fresh_enqueued,
             "replacement circuit could not use live session"
         );
+    }
+}
+
+#[tokio::test]
+async fn late_old_runner_exit_preserves_circuit_built_on_replacement_session() {
+    for recoverable in [false, true] {
+        let (_dir, mut runtime, hop, _key, _initial) = originated_fixture().await;
+        let services = runtime.access();
+        let mut old_tx = services
+            .session_tx_registry
+            .write()
+            .unwrap()
+            .register_owned(hop, [1; 32]);
+        let (old, _old_rx) = services.open_data_circuit(&[hop], b"old owner").unwrap();
+        old_tx.try_recv().unwrap();
+        let mut fresh_tx = services
+            .session_tx_registry
+            .write()
+            .unwrap()
+            .register_owned(hop, [2; 32]);
+        let (fresh, _fresh_rx) = services.open_data_circuit(&[hop], b"new owner").unwrap();
+        fresh_tx.try_recv().unwrap();
+        assert!(services.data_circuit_session_current(&fresh));
+        assert!(!session_guard::release_session(
+            session_guard::SessionRelease {
+                session_tx_registry: &services.session_tx_registry,
+                session_outbox: &services.session_outbox,
+                session_close_generations: &services.session_close_generations,
+                identity: &services.identity,
+                dispatcher: &services.dispatcher,
+                logger: &services.logger,
+            },
+            hop.into(),
+            &[1; 32],
+            false,
+        ));
+        let still_current = services.data_circuit_session_current(&fresh);
+        let obsolete_current = services.data_circuit_session_current(&old);
+        let result = if recoverable {
+            services.send_circuit_datagram_on_local_lane_detailed(
+                &fresh,
+                b"payload",
+                veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
+            )
+        } else {
+            services.send_circuit_cell_detailed(&fresh, b"payload")
+        };
+        let admitted = fresh_tx.try_recv().is_ok();
+        let before_close = fresh.next_seq.load(Ordering::Relaxed);
+        drop(fresh_tx); // closed entry is unusable even before runner cleanup
+        let closed_current = services.data_circuit_session_current(&fresh);
+        let closed_send = services.send_circuit_cell_detailed(&fresh, b"after close");
+        let after_close = fresh.next_seq.load(Ordering::Relaxed);
+        runtime.stop().await.unwrap();
+        assert!(
+            still_current,
+            "late old runner invalidated a circuit built on the live replacement"
+        );
+        assert!(
+            !obsolete_current,
+            "a replacement must still invalidate the old circuit"
+        );
+        assert_eq!(result, Ok(()));
+        assert!(admitted);
+        assert!(!closed_current);
+        assert_eq!(closed_send, Err(DataCircuitSendError::NoRelays));
+        assert_eq!(before_close, after_close, "closed entry consumed a nonce");
     }
 }
