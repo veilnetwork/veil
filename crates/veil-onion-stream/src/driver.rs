@@ -887,6 +887,17 @@ async fn drive<D: CellDuplex>(
     );
     let stream_id = engine.stream_id();
     let linger = engine.completed_close_ack();
+    if debug_summary_period_ms.is_some() {
+        debug_summary_log(
+            stream_id,
+            format!(
+                "now={} retiring=true linger={} {}",
+                now_ms(&base),
+                linger.is_some(),
+                engine.debug_summary(),
+            ),
+        );
+    }
     let (btl_bw, rtt_min_ms, delivered) = engine.delivery_model();
     // Surface already-queued bytes and EOF immediately. Only a tiny fixed ACK
     // and the existing return route are retained; not engine/read/write buffers.
@@ -907,6 +918,9 @@ async fn drive<D: CellDuplex>(
         linger_completed(&mut duplex, &mut reset_rx, duration_ms, &ack).await;
     }
     duplex.on_stream_closed(stream_id, end_of(&end)).await;
+    if debug_summary_period_ms.is_some() {
+        debug_summary_log(stream_id, format!("now={} retired=true", now_ms(&base)));
+    }
 }
 
 /// Keep the final ACK reachable after a best-effort handoff. No app DATA,
