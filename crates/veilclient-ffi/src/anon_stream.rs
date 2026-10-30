@@ -4578,55 +4578,54 @@ fn try_open_circuit(
                 }
             };
 
-            let mut confirmed = Vec::with_capacity(opened.len());
-            let mut confirmed_relays = Vec::with_capacity(opened.len());
-            let mut unconfirmed_relay_count = 0usize;
-            for (relay, candidate, recv_rx) in opened {
-                // Inbound feed: legacy validation cells are `[sender_node 32][cell]`;
-                // published cells are `[peer_tag 32][intro?][cell]`. Start it
-                // BEFORE confirmation: it consumes cells arriving right after
-                // the registration lands, and it recognises the loopback
-                // splice-probe echo that confirms the path when the one-shot
-                // CircuitBuilt ACK is lost (see confirm_circuit_with_probe).
-                spawn_circuit_feed(
-                    services_bg.clone(),
-                    recv_rx,
-                    in_tx_bg.clone(),
-                    Some(Arc::clone(&activity_bg)),
-                    Some(Arc::clone(&inbound_activity_bg)),
-                    Arc::clone(&peer_tags_bg),
-                    Some(candidate.confirmed_flag()),
-                );
-                // Circuit open is intentionally optimistic: it returns once
-                // CircuitBuild is queued. Do not publish the handle until R has
-                // accepted the cookie registration and either CircuitBuilt or a
-                // loopback splice-probe echo came back.
-                if !confirm_circuit_with_probe(&services_bg, &candidate, &cookie).await
-                    || !services_bg.data_circuit_session_current(&candidate)
-                {
-                    if let Some(relay) = relay {
-                        diag_node(
-                            &me,
-                            &format!(
-                                "inbound circuit not confirmed on current session at R={} — keeping receive sink for grace",
-                                short_node(&relay)
-                            ),
-                        );
-                        unconfirmed_relay_count += 1;
+            let results = start_then_confirm_inbound(
+                opened,
+                |(relay, candidate, recv_rx)| {
+                    // Start the receiver before probing its registration.
+                    spawn_circuit_feed(
+                        services_bg.clone(), recv_rx, in_tx_bg.clone(),
+                        Some(Arc::clone(&activity_bg)),
+                        Some(Arc::clone(&inbound_activity_bg)),
+                        Arc::clone(&peer_tags_bg), Some(candidate.confirmed_flag()),
+                    );
+                    (relay, candidate)
+                },
+                |(relay, candidate)| {
+                    let services = services_bg.clone();
+                    async move {
+                        // Neither a probe nor a late ACK can authorize a handle
+                        // from a session that closed during confirmation.
+                        if !confirm_circuit_with_probe(&services, &candidate, &cookie).await
+                            || !services.data_circuit_session_current(&candidate)
+                        {
+                            if let Some(relay) = relay {
+                                diag_node(&me, &format!(
+                                    "inbound circuit not confirmed on current session at R={} — keeping receive sink for grace",
+                                    short_node(&relay),
+                                ));
+                            }
+                            retire_circuits_later(&services, vec![Arc::new(candidate)]);
+                            return (relay, None);
+                        }
+                        if let Some(relay) = relay {
+                            services.publish_stream_rendezvous_ad(relay, cookie);
+                        }
+                        (relay, Some(Arc::new(candidate)))
                     }
-                    // Even with probes, the registration can in principle be
-                    // live with every echo lost. Keep the receive half alive
-                    // for the normal retire grace so a late splice still lands;
-                    // if the registration never landed, it stays idle and is
-                    // cleaned up later.
-                    retire_circuits_later(&services_bg, vec![Arc::new(candidate)]);
-                    continue;
+                },
+            ).await;
+            let mut confirmed = Vec::with_capacity(results.len());
+            let mut confirmed_relays = Vec::with_capacity(results.len());
+            let mut unconfirmed_relay_count = 0usize;
+            for (relay, candidate) in results {
+                if let Some(candidate) = candidate {
+                    if let Some(relay) = relay {
+                        confirmed_relays.push(relay);
+                    }
+                    confirmed.push(candidate);
+                } else if relay.is_some() {
+                    unconfirmed_relay_count += 1;
                 }
-                if let Some(relay) = relay {
-                    services_bg.publish_stream_rendezvous_ad(relay, cookie);
-                    confirmed_relays.push(relay);
-                }
-                confirmed.push(Arc::new(candidate));
             }
 
             if confirmed.is_empty() {
@@ -4971,6 +4970,26 @@ fn retain_stream_circuit_relays(
             .get(relay)
             .is_none_or(|f| f & veil_proto::session::cap_flags::ANONYMITY_RELAY != 0)
     });
+}
+
+/// Activation and confirmation share one generation, but receiving cells must
+/// not depend on another candidate finishing its confirmation wait.
+async fn start_then_confirm_inbound<C, S, R, F>(
+    candidates: Vec<C>,
+    mut start: impl FnMut(C) -> S,
+    mut confirm: impl FnMut(S) -> F,
+) -> Vec<R>
+where
+    F: std::future::Future<Output = R>,
+{
+    // Arm every receiver before entering even the first confirmation wait.
+    // A silent neighbour must not leave an already registered path unread.
+    let started: Vec<_> = candidates.into_iter().map(&mut start).collect();
+    let mut results = Vec::with_capacity(started.len());
+    for candidate in started {
+        results.push(confirm(candidate).await);
+    }
+    results
 }
 
 /// Retry failed repair on an unchanged carrier set at most every 30 seconds.
