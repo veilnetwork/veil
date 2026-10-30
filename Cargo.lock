@@ -5517,6 +5517,7 @@ dependencies = [
  "tokio",
  "tun 0.8.13",
  "tun2proxy",
+ "veil-util",
  "windows-sys 0.61.2",
 ]
 

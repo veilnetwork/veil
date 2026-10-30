@@ -32,7 +32,7 @@ pub fn monotonic_us() -> Option<u64> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

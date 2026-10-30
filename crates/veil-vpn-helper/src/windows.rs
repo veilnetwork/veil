@@ -47,7 +47,7 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::policy::{HelperConfig, MAX_CONFIG_BYTES, RouteMode, ValidatedPolicy};
 
-const TUN_NAME: &str = "xVeil VPN";
+const TUN_NAME: &str = veil_util::outbound_interface::WINDOWS_VPN_ADAPTER_NAME;
 const TUN_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 1);
 const TUN_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 252);
 const ROUTE_METRIC: u32 = 1;
