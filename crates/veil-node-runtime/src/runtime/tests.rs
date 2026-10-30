@@ -4152,6 +4152,112 @@ async fn the_deferred_placeholder_is_never_published_as_an_identity() {
     );
 }
 
+/// Reload must leave a complete, verifiable bundle in the DHT actually used
+/// by the new dispatcher, before any periodic republish or peer can repair it.
+fn reload_identity_bundle_ready(rt: &NodeRuntime) -> bool {
+    use veil_proto::{
+        identity_document::IdentityDocument, instance_registry::InstanceRegistry,
+        mlkem_cert::MlKemKeyCert,
+    };
+    let Some(sov) = rt.identity.sovereign_identity.get() else {
+        return false;
+    };
+    let target = *sov.node_id();
+    let instance = sov.active_instance_id();
+    let Some(doc) = rt
+        .dht
+        .get_local(&IdentityDocument::dht_key(&target))
+        .and_then(|b| IdentityDocument::decode(&b).ok())
+    else {
+        return false;
+    };
+    let now = veil_util::unix_secs_now_u64();
+    if doc.node_id != target || veil_identity::verify::verify_identity_document(&doc, now).is_err()
+    {
+        return false;
+    }
+    let Some(reg) = rt
+        .dht
+        .get_local(&InstanceRegistry::dht_key(&target))
+        .and_then(|b| InstanceRegistry::decode(&b).ok())
+    else {
+        return false;
+    };
+    if reg.encode() != super::identity_publish::full_registry(&sov).encode() {
+        return false;
+    }
+    let Some(cert) = rt
+        .dht
+        .get_local(&MlKemKeyCert::dht_key(&target, &instance))
+        .and_then(|b| MlKemKeyCert::decode(&b).ok())
+    else {
+        return false;
+    };
+    let Ok(cert) = veil_identity::mlkem_fanout::verify_mlkem_cert(&cert, &doc, now) else {
+        return false;
+    };
+    cert.node_id == target
+        && cert.instance_id == instance
+        && cert.mlkem_pubkey.as_slice() == rt.identity.mlkem_keys.current_ek()
+        && cert.ratchet_x25519_pubkey == rt.identity.mlkem_keys.current_ratchet_pk()
+}
+
+async fn reload_bundle_without_a_network_repair(deferred: bool) -> (bool, bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    let mut real = runtime_config_with_listen();
+    real.peers.clear();
+    real.global.builtin_seed_policy = veil_cfg::BuiltinSeedPolicy::Never;
+    real.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+    let mut boot = if deferred {
+        veil_cfg::build_stub_config_with_ephemeral_identity(false).unwrap()
+    } else {
+        real.clone()
+    };
+    boot.peers.clear();
+    boot.global.builtin_seed_policy = veil_cfg::BuiltinSeedPolicy::Never;
+    boot.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+    veil_cfg::save_config(&path, &boot).unwrap();
+    let mut rt = NodeRuntime::start_marked(&path, true, deferred)
+        .await
+        .unwrap();
+    let before = reload_identity_bundle_ready(&rt);
+    let stopped = rt.take_stop_tasks_context();
+    NodeRuntime::do_stop_tasks(stopped).await;
+    rt.apply_reload_after_stop(real).await.unwrap();
+    // No sleep, peer, injected DHT value or forced maintenance tick. Capture
+    // before stop so teardown cannot accidentally make this assertion green.
+    let after = reload_identity_bundle_ready(&rt);
+    rt.stop().await.unwrap();
+    (before, after)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reload_keeps_the_unchanged_identity_bundle_in_the_live_dht() {
+    let (before, after) = reload_bundle_without_a_network_repair(false).await;
+    assert!(
+        before,
+        "control: cold start publishes the current key bundle"
+    );
+    assert!(
+        after,
+        "same-identity reload must not discard its own document/registry/cert"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reload_publishes_the_promoted_identity_bundle_into_the_live_dht() {
+    let (before, after) = reload_bundle_without_a_network_repair(true).await;
+    assert!(
+        !before,
+        "the deferred placeholder must not publish a bundle"
+    );
+    assert!(
+        after,
+        "promotion must publish into the new DHT, not its discarded predecessor"
+    );
+}
+
 /// The deferred boot is the one caller that must say its identity is a
 /// placeholder. Held in the source: the boot runs a whole foreground node and
 /// its admin endpoint, which no unit test stands up.
