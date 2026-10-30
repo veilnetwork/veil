@@ -374,7 +374,24 @@ pub unsafe extern "C" fn veil_anon_stream_close(stream: *mut VeilAnonStreamFfi) 
     if stream.is_null() {
         return;
     }
-    let _ = HandleTable::remove(anon_stream_table(), stream as usize);
+    let Some(stream_ref) = HandleTable::remove(anon_stream_table(), stream as usize) else {
+        return;
+    };
+    // A blocking FFI read owns an Arc to this same object. Merely removing
+    // the token leaves its writer alive, so neither FIN nor the peer's EOF
+    // can release that read. Drop only the write half now; queued bytes still
+    // drain through the ordinary graceful driver close, without a reset.
+    if let Ok(mut writer) = stream_ref.writer.try_lock() {
+        writer.take();
+        return;
+    }
+    // An already-entered write may be waiting on local admission. Do not
+    // block the C caller or cut that write short: retire its half after it
+    // leaves the mutex. Token removal makes this one task per live close.
+    let runtime = stream_ref.bundle.runtime.handle().clone();
+    runtime.spawn(async move {
+        stream_ref.writer.lock().await.take();
+    });
 }
 
 /// Abort + free the stream handle (idempotent, NULL-safe). Use for timeout /
@@ -397,3 +414,7 @@ pub unsafe extern "C" fn veil_anon_stream_abort(stream: *mut VeilAnonStreamFfi) 
         .abort
         .reset(veil_onion_stream::wire::reset_reason::APP);
 }
+
+#[cfg(all(test, feature = "node-embedded", unix))]
+#[path = "anon_stream_close_tests.rs"]
+mod close_tests;
