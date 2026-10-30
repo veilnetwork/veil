@@ -13,6 +13,7 @@
 
 #include "veil_bounded_vp8.h"
 #include "veil_media_engine.h"
+#include "veil_audio_level_band.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1449,6 +1450,10 @@ struct VeilMediaEngine {
   std::atomic<bool> audio_running{false};
   bool mic_muted = false;
   bool speaker_muted = false;
+  // Last requested ADM start result, not a claim about current hardware state.
+  // -1 = not attempted (including deliberately muted capture), 0 = refused.
+  int capture_start_result = -1;
+  int playout_start_result = -1;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   std::unique_ptr<WebrtcState> ws;
 #endif
@@ -3440,15 +3445,21 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
        (int)recv, (int)engine->mic_muted, ws->adm ? "yes" : "NULL");
   bool capture_failed = false;
   bool playout_failed = false;
+  engine->capture_start_result = -1;
+  engine->playout_start_result = -1;
   if (ws->adm) {
     if (send && !engine->mic_muted) {
       // Same contract as set_mic_muted/group start: surface a capture device
       // that refuses to start instead of silently sending nothing.
-      if (!start_capture(ws->adm.get(), "adm start")) capture_failed = true;
+      capture_failed = !start_capture(ws->adm.get(), "adm start");
+      engine->capture_start_result = capture_failed ? 0 : 1;
     }
     // Same contract as capture: a playout that refused is a device failure
     // the caller has to hear about, not a line in a log (report19 V19-M3).
-    if (recv && !start_playout(ws->adm.get())) playout_failed = true;
+    if (recv) {
+      playout_failed = !start_playout(ws->adm.get());
+      engine->playout_start_result = playout_failed ? 0 : 1;
+    }
     int recording = 0, playing = 0;
     run_on_adm_thread([&] {
       recording = ws->adm->Recording();
@@ -4466,6 +4477,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     int audio_interruption_count = 0;
     int audio_interruption_duration_ms = 0;
     uint64_t audio_tx_pkts = 0;
+    int audio_input_level_band = -1, audio_output_level_band = -1;
     uint64_t audio_tx_retransmitted_pkts = 0;
     int64_t audio_encoder_target_bps = 0;
     int audio_send_bandwidth_bps = 0;
@@ -4521,6 +4533,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
       if (ws->send_stream) {
         const auto sent = ws->send_stream->GetStats();
         audio_tx_pkts = sent.packets_sent;
+        audio_input_level_band = veil_media::AudioLevelBand(sent.audio_level);
         audio_tx_retransmitted_pkts = sent.retransmitted_packets_sent;
         audio_encoder_target_bps = sent.target_bitrate_bps;
       }
@@ -4534,6 +4547,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         const auto r =
             ws->recv_stream->GetStats(/*get_and_clear_legacy_stats=*/false);
         audio_rx_pkts = r.packets_received;
+        audio_output_level_band = veil_media::AudioLevelBand(r.audio_level);
         // WebRTC's last packet includes padding probes. They still advance
         // RTCP counters, but cannot prove that encoded audio is arriving.
         audio_rx_native_age_ms = ws->shim->audio_payload_receive_age_ms();
@@ -4653,6 +4667,9 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     const int written = std::snprintf(
         json, sizeof(json),
         "{\"tx_pkts\":%llu,\"rx_pkts\":%llu,\"audio_rx_pkts\":%llu,"
+        "\"audio_input_level_band\":%d,\"audio_output_level_band\":%d,"
+        "\"audio_capture_start_result\":%d,\"audio_playout_start_result\":%d,"
+        "\"speaker_muted\":%d,"
         "\"audio_rx_native_age_ms\":%lld,\"audio_concealed_samples\":%llu,"
         "\"audio_mirror_enabled\":%d,\"audio_mirror_tx_attempts\":%llu,"
         "\"audio_mirror_tx_queued\":%llu,\"audio_rx_duplicate_packets\":%llu,"
@@ -4704,6 +4721,9 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         static_cast<unsigned long long>(ws->shim->outbound_packet_count()),
         static_cast<unsigned long long>(ws->shim->inbound_packet_count()),
         static_cast<unsigned long long>(audio_rx_pkts),
+        audio_input_level_band, audio_output_level_band,
+        engine->capture_start_result, engine->playout_start_result,
+        engine->speaker_muted ? 1 : 0,
         static_cast<long long>(audio_rx_native_age_ms),
         static_cast<unsigned long long>(audio_concealed_samples),
         ws->shim->audio_mirror_channel() != 0 ? 1 : 0,

@@ -15,9 +15,11 @@
 package com.veil.veil_flutter
 
 import android.app.Activity
+import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.media.AudioManager
 import android.net.Uri
 import android.net.VpnService
 import android.os.Build
@@ -277,6 +279,33 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                     true
                 }
                 result.success(ok)
+            }
+            "diagnosticBackgroundState" -> {
+                val pm = ctx.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+                val state = VeilDaemonService.diagnosticState().toMutableMap()
+                if (pm != null) {
+                    state["interactive"] = pm.isInteractive
+                    state["powerSave"] = pm.isPowerSaveMode
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        state["deviceIdle"] = pm.isDeviceIdleMode
+                        state["batteryExempt"] = pm.isIgnoringBatteryOptimizations(ctx.packageName)
+                    }
+                }
+                if (am != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    state["backgroundRestricted"] = am.isBackgroundRestricted
+                }
+                val snapshot = state.toMutableMap<String, Any>()
+                val audio = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                if (audio != null) {
+                    snapshot["systemMicMuted"] = audio.isMicrophoneMute
+                    val max = audio.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+                    if (max > 0) {
+                        snapshot["callVolumePercent"] =
+                            (100L * audio.getStreamVolume(AudioManager.STREAM_VOICE_CALL) / max).toInt()
+                    }
+                }
+                result.success(snapshot)
             }
             "requestIgnoreBatteryOptimizations" -> {
                 if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
