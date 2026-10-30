@@ -4538,14 +4538,23 @@ fn try_open_circuit(
         // a cycle confirms its full relay set.
         let mut early_refresh_streak = 0u32;
         let mut session_repair_relays: Option<HashSet<[u8; 32]>> = None;
-        let mut next_session_repair_at: Option<Instant> = None;
+        let mut session_repair_backoff = InboundSessionRepairBackoff::default();
         loop {
             attempt += 1;
             if session_repair_relays.is_some() {
-                if let Some(deadline) = next_session_repair_at {
-                    tokio::time::sleep(deadline.saturating_duration_since(Instant::now())).await;
+                loop {
+                    let sessions = services_bg
+                        .session_tx_registry
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .live_registration_snapshot();
+                    let now = Instant::now();
+                    if session_repair_backoff.ready(now, &sessions) {
+                        session_repair_backoff.attempted(now, sessions);
+                        break;
+                    }
+                    tokio::time::sleep(CIRCUIT_REFRESH_POLL).await;
                 }
-                next_session_repair_at = Some(Instant::now() + CIRCUIT_UNCONFIRMED_RETRY_AFTER);
             }
             let opened = match open_inbound_circuits(
                 &services_bg,
@@ -4714,6 +4723,11 @@ fn try_open_circuit(
                 let now = Instant::now();
                 if mode == CircuitMode::PublishedRendezvous {
                     let snapshot = circuit_slot.lock().await.clone();
+                    let sessions = services_bg
+                        .session_tx_registry
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .live_registration_snapshot();
                     let stale = inbound_session_repair_relays(
                         snapshot.iter().filter_map(|c| {
                             c.relay_path()
@@ -4721,8 +4735,7 @@ fn try_open_circuit(
                                 .copied()
                                 .map(|relay| (relay, services_bg.data_circuit_session_current(c)))
                         }),
-                        now,
-                        next_session_repair_at,
+                        session_repair_backoff.ready(now, &sessions),
                     );
                     if !stale.is_empty() {
                         diag_node(
@@ -4960,14 +4973,37 @@ fn retain_stream_circuit_relays(
     });
 }
 
-/// A known local session loss warrants repair even while other streams keep
-/// the hub active. Rate-limit repair itself, not ordinary cell delivery.
+/// Retry failed repair on an unchanged carrier set at most every 30 seconds.
+/// A newly admitted session is new capacity: never make reconnect pay the
+/// cooldown consumed by an attempt on the previous (possibly dying) sessions.
+#[derive(Default)]
+struct InboundSessionRepairBackoff {
+    retry_at: Option<Instant>,
+    attempted_sessions: Vec<([u8; 32], u64)>,
+}
+
+impl InboundSessionRepairBackoff {
+    fn ready(&self, now: Instant, sessions: &[([u8; 32], u64)]) -> bool {
+        !sessions.is_empty()
+            && (self.retry_at.is_none_or(|deadline| now >= deadline)
+                || sessions
+                    .iter()
+                    .any(|entry| !self.attempted_sessions.contains(entry)))
+    }
+
+    fn attempted(&mut self, now: Instant, sessions: Vec<([u8; 32], u64)>) {
+        self.retry_at = Some(now + CIRCUIT_UNCONFIRMED_RETRY_AFTER);
+        self.attempted_sessions = sessions;
+    }
+}
+
+/// Known session loss warrants repair even while other streams keep the hub
+/// active. No healthy terminus should be rotated merely to repair its neighbour.
 fn inbound_session_repair_relays(
     circuits: impl IntoIterator<Item = ([u8; 32], bool)>,
-    now: Instant,
-    retry_at: Option<Instant>,
+    attempt_allowed: bool,
 ) -> HashSet<[u8; 32]> {
-    if retry_at.is_some_and(|deadline| now < deadline) {
+    if !attempt_allowed {
         return HashSet::new();
     }
     circuits
@@ -6119,37 +6155,35 @@ mod tests {
     use veil_onion_stream::wire::{DATA_OVERHEAD, Frame, MAX_CELL};
 
     #[test]
-    fn inbound_session_repair_preserves_healthy_relays_and_bounds_retries() {
+    fn inbound_session_repair_preserves_healthy_relays_and_reconnect_bypasses_cooldown() {
         use std::time::{Duration, Instant};
         let now = Instant::now();
         let healthy = [1; 32];
         let stale = [2; 32];
-        let other_stale = [3; 32];
-        let pool = [
-            (healthy, true),
-            (stale, false),
-            (stale, false),
-            (other_stale, false),
-        ];
-        assert_eq!(
-            super::inbound_session_repair_relays(pool, now, None),
-            [stale, other_stale].into_iter().collect()
-        );
-        let retry = now + Duration::from_secs(30);
+        let pool = [(healthy, true), (stale, false), (stale, false)];
+        let mut backoff = super::InboundSessionRepairBackoff::default();
         assert!(
-            super::inbound_session_repair_relays(
-                pool,
-                retry - Duration::from_nanos(1),
-                Some(retry)
-            )
-            .is_empty()
+            !backoff.ready(now, &[]),
+            "offline must not consume repair attempts"
         );
+        let sessions = vec![(healthy, 1), (stale, 2)];
+        assert!(backoff.ready(now, &sessions));
+        backoff.attempted(now, sessions.clone());
+        let retry = now + Duration::from_secs(30);
+        assert!(!backoff.ready(retry - Duration::from_nanos(1), &sessions));
+        assert!(
+            !backoff.ready(now, &sessions[..1]),
+            "closing a session adds no capacity"
+        );
+        assert!(backoff.ready(retry, &sessions));
+        let reconnected = vec![(healthy, 1), (stale, 3)];
+        assert!(backoff.ready(now + Duration::from_secs(1), &reconnected));
         assert_eq!(
-            super::inbound_session_repair_relays(pool, retry, Some(retry)),
-            [stale, other_stale].into_iter().collect()
+            super::inbound_session_repair_relays(pool, true),
+            [stale].into_iter().collect()
         );
-        assert!(super::inbound_session_repair_relays([(healthy, true)], retry, None).is_empty());
-        assert!(super::inbound_session_repair_relays([], retry, None).is_empty());
+        assert!(super::inbound_session_repair_relays(pool, false).is_empty());
+        assert!(super::inbound_session_repair_relays([(healthy, true)], true).is_empty());
     }
 
     #[test]

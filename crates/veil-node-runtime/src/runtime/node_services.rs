@@ -1200,8 +1200,9 @@ impl NodeServices {
             .unwrap_or(0)
     }
 
-    /// A replacement session does not inherit the relay's old circuit mapping.
-    /// This is a local lifetime check, not proof of end-to-end reachability.
+    /// Treat a replaced first-hop session as a reason to rebuild the circuit.
+    /// Remote state may survive reconnect; this local lifetime check neither
+    /// guarantees its survival nor proves end-to-end reachability.
     pub fn data_circuit_session_current(&self, circuit: &DataCircuit) -> bool {
         self.session_close_generation(&circuit.first_hop) == circuit.first_hop_close_generation
             && self.has_live_session(&circuit.first_hop)
