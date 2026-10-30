@@ -395,7 +395,9 @@ struct TxState {
     rack_xmit_ms: u64,
     /// End sequence of that segment — tie-break between equal send times.
     rack_end_seq: u32,
-    /// RTT measured on that most recent delivery (ms).
+    /// RTT of the youngest valid transmission first reported by the latest
+    /// delivery ACK (ms). A reordered receipt updates it without moving the
+    /// latest-send frontier backward.
     rack_rtt_ms: u32,
     /// Largest RECENT reordering gap (ms): when an overtaken original is
     /// finally delivered, how much LATER-sent data had already been delivered.
@@ -1121,6 +1123,11 @@ impl StreamEngine {
         let mut newly_delivered = 0u32;
         let mut deferred_sack_rtt: Option<u32> = None;
         let mut fresh_sack_rtt: Option<u32> = None;
+        // RACK.rtt follows valid first receipts, independently of whether the
+        // latest send-time frontier advances. All fields belong to one ACK:
+        // select its youngest valid transmission, as RFC 8985's ascending
+        // send-time iteration would, without depending on SACK block order.
+        let mut rack_rtt_sample: Option<u32> = None;
         // BBR measures first receipt of an original, including SACK. RTO
         // keeps cumulative-ACK timing: fast SACKs alone do not shorten the
         // deadline for slower cells. Already-SACKed data cannot be timed again
@@ -1147,14 +1154,17 @@ impl StreamEngine {
                             Some(now.saturating_sub(sent_ms).min(u64::from(u32::MAX)) as u32);
                         rtt_sent_ms = Some(rtt_sent_ms.map_or(sent_ms, |old| old.max(sent_ms)));
                     }
-                    if self.cfg.rack && !local_pending {
-                        self.tx.rack_on_delivery(
+                    if self.cfg.rack
+                        && !local_pending
+                        && let Some(rtt) = self.tx.rack_on_delivery(
                             sent_ms,
                             end,
                             now,
                             prior_rack_frontier,
                             retransmitted,
-                        );
+                        )
+                    {
+                        rack_rtt_sample = Some(rack_rtt_sample.map_or(rtt, |old| old.min(rtt)));
                     }
                 }
             }
@@ -1219,14 +1229,19 @@ impl StreamEngine {
                                 Some(rtt_sent_ms.map_or(s.sent_ms, |old| old.max(s.sent_ms)));
                         }
                     }
-                    if self.cfg.rack && s.handed_off && !s.local_pending && !s.sacked {
-                        self.tx.rack_on_delivery(
+                    if self.cfg.rack
+                        && s.handed_off
+                        && !s.local_pending
+                        && !s.sacked
+                        && let Some(rtt) = self.tx.rack_on_delivery(
                             s.sent_ms,
                             s.end(),
                             now,
                             prior_rack_frontier,
                             s.retransmitted,
-                        );
+                        )
+                    {
+                        rack_rtt_sample = Some(rack_rtt_sample.map_or(rtt, |old| old.min(rtt)));
                     }
                     if s.is_fin {
                         self.tx.fin_acked = true;
@@ -1361,6 +1376,9 @@ impl StreamEngine {
         // RACK: every ACK (cumulative, SACK or duplicate) may have advanced the
         // delivery frontier — re-run time-threshold detection once per ACK. A
         // dup-ACK count never declares loss here; only time + a later delivery.
+        if let Some(rtt) = rack_rtt_sample {
+            self.tx.rack_rtt_ms = rtt;
+        }
         if self.cfg.rack {
             self.tx.note_dsack(ack, sacks, now);
         }
@@ -2539,14 +2557,12 @@ impl TxState {
         now: u64,
         prior_frontier: u64,
         retransmitted: bool,
-    ) {
+    ) -> Option<u32> {
         let rtt = now.saturating_sub(seg_sent_ms).min(u64::from(u32::MAX)) as u32;
         if retransmitted {
-            let Some((minimum, at)) = self.rack_min_rtt else {
-                return;
-            };
+            let (minimum, at) = self.rack_min_rtt?;
             if now.saturating_sub(at) > RACK_SAMPLE_WINDOW_MS || rtt < minimum {
-                return;
+                return None;
             }
         } else if self
             .rack_min_rtt
@@ -2566,8 +2582,11 @@ impl TxState {
         {
             self.rack_xmit_ms = seg_sent_ms;
             self.rack_end_seq = seg_end;
-            self.rack_rtt_ms = rtt;
         }
+        // A reordered delivery can have an older send time than the frontier
+        // while carrying a newer, slower RTT measurement. The caller combines
+        // all valid receipts from this ACK before running loss detection.
+        Some(rtt)
     }
 
     fn expire_rack_reordering(&mut self, now: u64) {
@@ -5579,9 +5598,14 @@ mod tests {
             old
         );
         assert_eq!(e.tx.rack_reo_max_ms, 0);
-        let point = (e.tx.rack_xmit_ms, e.tx.rack_rtt_ms);
         e.on_ack(149, 4096, &sacks, 250);
-        assert_eq!((e.tx.rack_xmit_ms, e.tx.rack_rtt_ms), point);
+        // The repeated SACK adds no sample, but the newly cumulatively ACKed
+        // repairs do: the youngest valid repair left at 120ms (RTT 130ms).
+        assert_eq!((e.tx.rack_xmit_ms, e.tx.rack_rtt_ms), (140, 130));
+        assert_eq!(
+            (e.tx.srtt, e.tx.rttvar, e.tx.rack_min_rtt, e.tx.rtt_min),
+            old
+        );
     }
 
     #[test]
@@ -5750,6 +5774,109 @@ mod tests {
         // A genuinely new, overtaken original is different evidence.
         e.on_ack(181, 4096, &SackVec::new(), 210);
         assert_eq!(e.tx.rack_reo_max_ms, 10);
+    }
+
+    fn reordered_original_flight(base: u32) -> StreamEngine {
+        let mut e = repeated_sack_holes(false);
+        e.cfg.rack = true;
+        e.cfg.bbr = true;
+        e.tx.rtt_min = Some((80, 100));
+        e.tx.rto_ms = 1000;
+        e.tx.rto_deadline = Some(1100);
+        e.tx.snd_una = base;
+        e.tx.snd_nxt = base.wrapping_add(8 * 16);
+        for (i, s) in e.tx.segs.iter_mut().enumerate() {
+            s.seq = base.wrapping_add(i as u32 * 16);
+            s.sent_ms = 100 + i as u64;
+            s.retransmitted = false;
+        }
+        e
+    }
+
+    fn sack_segment(e: &mut StreamEngine, base: u32, index: u32, now: u64) {
+        let mut sacks = SackVec::new();
+        assert!(sacks.push(SackRange {
+            start: base.wrapping_add(index * 16),
+            end: base.wrapping_add((index + 1) * 16),
+        }));
+        e.on_ack(base, 4096, &sacks, now);
+    }
+
+    #[test]
+    fn rack_reordered_original_retimes_loss_without_advancing_send_frontier() {
+        for base in [101, u32::MAX - 20] {
+            let mut e = reordered_original_flight(base);
+            // Three originals leave one millisecond apart. The newest is
+            // delivered first (80ms RTT), then the middle (94ms RTT), while
+            // the head is still in transit. There is no loss in this schedule.
+            sack_segment(&mut e, base, 2, 182);
+            assert_eq!(e.tx.rack_xmit_ms, 102);
+            assert_eq!(e.tx.rack_rtt_ms, 80);
+            assert_eq!(e.tx.rack_deadline, Some(200));
+            sack_segment(&mut e, base, 1, 195);
+            assert_eq!(e.tx.rack_xmit_ms, 102, "send frontier must not rewind");
+            assert_eq!(e.tx.rack_rtt_ms, 94, "late first receipt was ignored");
+            assert_eq!(e.tx.rack_deadline, Some(214));
+            let cwnd = e.tx.cwnd;
+            e.on_timeout(201);
+            assert!(!e.tx.segs.front().unwrap().needs_resend);
+            assert!(!e.tx.in_recovery, "loss-free reordering cut the window");
+            assert_eq!(e.tx.cwnd, cwnd);
+            e.on_ack(base.wrapping_add(48), 4096, &SackVec::new(), 205);
+            assert!(!e.tx.in_recovery);
+            assert_eq!(e.tx.consec_rto, 0);
+            assert_eq!(e.tx.rack_rtt_ms, 105);
+        }
+    }
+
+    #[test]
+    fn rack_reordered_original_still_repairs_a_real_loss_at_updated_deadline() {
+        for base in [101, u32::MAX - 20] {
+            let mut e = reordered_original_flight(base);
+            sack_segment(&mut e, base, 2, 182);
+            sack_segment(&mut e, base, 1, 195);
+            e.on_timeout(213);
+            assert!(!e.tx.segs.front().unwrap().needs_resend);
+            // Unlike the previous test, the head really was lost. A fresh
+            // delivery sample postpones detection, but does not disable it or
+            // wait for the unrelated 1000ms RTO.
+            e.on_timeout(214);
+            assert!(e.tx.segs.front().unwrap().needs_resend);
+            assert!(e.tx.in_recovery);
+            assert_eq!(e.tx.consec_rto, 0);
+        }
+    }
+
+    #[test]
+    fn rack_rtt_sample_is_independent_of_sack_block_and_ack_field_order() {
+        for reverse in [false, true] {
+            let mut e = reordered_original_flight(101);
+            e.tx.rack_xmit_ms = 150;
+            e.tx.rack_rtt_ms = 80;
+            e.tx.segs[2].sent_ms = 130;
+            e.tx.segs[4].sacked = false;
+            e.tx.segs[4].sent_ms = 140;
+            let ranges = [
+                SackRange {
+                    start: 133,
+                    end: 149,
+                },
+                SackRange {
+                    start: 165,
+                    end: 181,
+                },
+            ];
+            let mut sacks = SackVec::new();
+            for index in if reverse { [1, 0] } else { [0, 1] } {
+                assert!(sacks.push(ranges[index]));
+            }
+            // One ACK contains two SACK receipts and the older cumulative
+            // prefix. RFC 8985's send-time order selects the youngest valid
+            // receipt (60ms), regardless of their order in the wire fields.
+            e.on_ack(117, 4096, &sacks, 200);
+            assert_eq!(e.tx.rack_rtt_ms, 60);
+            assert_eq!(e.tx.rack_xmit_ms, 150);
+        }
     }
 
     #[test]
