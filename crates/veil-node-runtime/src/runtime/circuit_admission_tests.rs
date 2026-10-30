@@ -14,6 +14,7 @@ fn circuit(last: u32) -> DataCircuit {
     DataCircuit {
         _local_path: None,
         first_hop: [0x71; 32],
+        first_hop_close_generation: 0,
         relay_path: vec![[0x71; 32]],
         origin_circuit_id: 7,
         keys: vec![[0x25; 32]],
@@ -454,5 +455,64 @@ async fn rejected_service_builds_do_not_exhaust_origin_capacity() {
 async fn rejected_reply_builds_do_not_retain_unreachable_paths() {
     for failure in ["full", "closed", "missing"] {
         rejected_builds_release_state("reply", failure).await;
+    }
+}
+
+/// Reconnecting to the same relay does not restore its old circuit mapping.
+/// A live replacement TX queue must not make an obsolete handle look usable.
+#[tokio::test]
+async fn reconnected_session_rejects_old_circuit_before_local_handoff() {
+    for recoverable in [false, true] {
+        let (_dir, mut runtime, hop, _key, mut old_outbox) = originated_fixture().await;
+        let services = runtime.access();
+        let (old, _old_rx) = services
+            .open_data_circuit(&[hop], b"old generation")
+            .unwrap();
+        old_outbox.try_recv().unwrap();
+        services
+            .session_close_generations
+            .lock()
+            .unwrap()
+            .insert(hop, 1);
+        let mut replacement = services.session_tx_registry.write().unwrap().register(hop);
+        old.last_sent_unix.store(7, Ordering::Relaxed);
+        let send = |c: &DataCircuit| {
+            if recoverable {
+                services.send_circuit_datagram_on_local_lane_detailed(
+                    c,
+                    b"payload",
+                    veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
+                )
+            } else {
+                services.send_circuit_cell_detailed(c, b"payload")
+            }
+        };
+        // A delayed Built/probe echo cannot make an old session current.
+        old.confirmed.store(true, Ordering::Relaxed);
+        assert_eq!(old.first_hop_close_generation(), 0);
+        assert!(!services.data_circuit_session_current(&old));
+        let stale = send(&old);
+        let stale_enqueued = replacement.try_recv().is_ok();
+        let stale_seq = old.next_seq.load(Ordering::Relaxed);
+        let stale_activity = old.last_sent_unix.load(Ordering::Relaxed);
+        let (fresh, _fresh_rx) = services.open_data_circuit(&[hop], b"replacement").unwrap();
+        replacement.try_recv().unwrap();
+        assert_eq!(fresh.first_hop_close_generation(), 1);
+        assert!(services.data_circuit_session_current(&fresh));
+        let fresh_sent = send(&fresh);
+        let fresh_enqueued = replacement.try_recv().is_ok();
+        runtime.stop().await.unwrap();
+        assert_eq!(stale, Err(DataCircuitSendError::NoRelays));
+        assert!(
+            !stale_enqueued,
+            "obsolete circuit entered replacement session"
+        );
+        assert_eq!(stale_seq, 0, "obsolete circuit consumed a nonce");
+        assert_eq!(stale_activity, 7, "obsolete circuit renewed its idle lease");
+        assert_eq!(fresh_sent, Ok(()));
+        assert!(
+            fresh_enqueued,
+            "replacement circuit could not use live session"
+        );
     }
 }

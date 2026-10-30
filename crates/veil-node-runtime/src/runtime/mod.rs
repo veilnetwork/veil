@@ -4160,6 +4160,7 @@ fn map_sender_err(e: veil_anonymity::sender::SenderError) -> veil_types::AnonOni
 pub struct DataCircuit {
     _local_path: Option<local_circuit_paths::Reservation>,
     first_hop: [u8; 32],
+    first_hop_close_generation: u64,
     relay_path: Vec<[u8; 32]>,
     origin_circuit_id: u32,
     /// Per-hop keys, first-hop → terminus order (wraps each FORWARD cell).
@@ -4220,6 +4221,12 @@ impl DataCircuit {
     /// First hop's node id (return cells arrive from here).
     pub fn first_hop(&self) -> [u8; 32] {
         self.first_hop
+    }
+
+    /// Session-close generation captured before the circuit build is queued.
+    /// Confirmation arriving later must not refresh this witness.
+    pub fn first_hop_close_generation(&self) -> u64 {
+        self.first_hop_close_generation
     }
 
     /// Full origin relay path, first hop → terminus.
