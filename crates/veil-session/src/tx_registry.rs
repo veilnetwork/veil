@@ -980,6 +980,12 @@ impl SessionTxRegistry {
         self.senders.values().map(|entry| entry.tx.queued()).sum()
     }
 
+    /// Local queue pressure for one registered peer. A resolver may avoid
+    /// repeating a request whose original could still be waiting locally.
+    pub fn queued_for(&self, peer: &NodeIdBytes) -> Option<usize> {
+        self.senders.get(peer).map(|entry| entry.tx.queued())
+    }
+
     /// Evict the `n` least-recently-active sessions to free memory.
     /// Drops the mpsc sender for the oldest sessions. Reads timestamps
     /// via `AtomicU64::load` so it observes whatever the hot send path
