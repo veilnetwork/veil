@@ -164,18 +164,29 @@ pub(crate) fn replicate_dht_value(
         );
     }
 
+    // The cold-table fallback must respect the same handshake preference as
+    // closest-peer selection. Otherwise filling spare slots immediately puts
+    // NO_DHT_SERVICE peers back into the publication set. Snapshot before the
+    // TX-registry lock: never acquire the DHT lock while holding that lock.
+    // Peers without capabilities are still eligible.
+    let declined: std::collections::HashSet<_> = dht
+        .routing_table_contacts()
+        .into_iter()
+        .filter(|contact| !contact.dht_service())
+        .map(|contact| contact.node_id)
+        .collect();
     let candidates = {
         let guard = tx_reg.read().unwrap_or_else(|p| p.into_inner());
         let mut candidates: Vec<[u8; 32]> = candidates_with_uri
             .into_iter()
             .map(|(n, _)| n)
-            .filter(|n| guard.has_session(n))
+            .filter(|n| !declined.contains(n) && guard.has_session(n))
             .collect();
         for peer in guard.peer_ids() {
             if candidates.len() >= veil_proto::budget::DHT_REPLICATION_K {
                 break;
             }
-            if peer != local_node_id && !candidates.contains(&peer) {
+            if peer != local_node_id && !declined.contains(&peer) && !candidates.contains(&peer) {
                 candidates.push(peer);
             }
         }
@@ -411,6 +422,68 @@ mod tests {
         // The DHT's local lookup must now return the stored bytes.
         let got = dht.get_local(&key).expect("value stored locally");
         assert_eq!(got, value);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_replication_fallback_does_not_reintroduce_a_known_decliner() {
+        let dht = fresh_kademlia().await;
+        let quiet = [2; 32];
+        let serving = [3; 32];
+        let unknown = [4; 32];
+        dht.add_contact_trusted(veil_dht::routing::Contact::with_caps(
+            quiet,
+            "tcp://quiet:9000",
+            veil_types::DiscoveryMode::Public,
+            false,
+        ));
+        dht.add_contact_trusted(veil_dht::routing::Contact::with_caps(
+            serving,
+            "tcp://serving:9000",
+            veil_types::DiscoveryMode::Public,
+            true,
+        ));
+        let mut registry = SessionTxRegistry::new();
+        let receivers: Vec<_> = [quiet, serving, unknown]
+            .into_iter()
+            .map(|peer| (peer, registry.register(peer)))
+            .collect();
+        let publisher =
+            DhtBackedPublisher::with_replication(dht, Arc::new(RwLock::new(registry)), [1; 32]);
+        publisher.put([0xAA; 32], vec![0x42; 100]).await.unwrap();
+        let mut waits = tokio::task::JoinSet::new();
+        for (peer, mut receiver) in receivers {
+            waits.spawn(async move {
+                (
+                    peer,
+                    tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                        .await
+                        .ok()
+                        .flatten(),
+                )
+            });
+        }
+        let mut got = std::collections::HashSet::new();
+        while let Some(result) = waits.join_next().await {
+            let (peer, frame) = result.unwrap();
+            if let Some((_, bytes)) = frame {
+                let header = veil_proto::codec::decode_header(&bytes).unwrap();
+                assert_eq!(
+                    header.family,
+                    veil_proto::family::FrameFamily::Routing as u8
+                );
+                let query = veil_proto::routing::RecursiveQueryPayload::decode(
+                    &bytes[veil_proto::HEADER_SIZE..],
+                )
+                .unwrap();
+                assert_eq!(
+                    query.query_type,
+                    veil_proto::routing::recursive_query_type::STORE
+                );
+                assert_eq!(query.payload, vec![0x42; 100]);
+                got.insert(peer);
+            }
+        }
+        assert_eq!(got, std::collections::HashSet::from([serving, unknown]));
     }
 
     #[tokio::test]
