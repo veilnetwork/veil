@@ -4972,8 +4972,12 @@ fn retain_stream_circuit_relays(
     });
 }
 
-/// Activation and confirmation share one generation, but receiving cells must
-/// not depend on another candidate finishing its confirmation wait.
+const MAX_CONCURRENT_INBOUND_CONFIRMATIONS: usize =
+    veil_anonymity::rendezvous::MAX_RENDEZVOUS_AD_SLOTS as usize;
+
+/// Activate all feeds first, then confirm independently within this generation.
+/// A silent candidate must delay neither receiving nor publication on a ready
+/// neighbour. Each confirmer still owns its probe, session check and retirement.
 async fn start_then_confirm_inbound<C, S, R, F>(
     candidates: Vec<C>,
     mut start: impl FnMut(C) -> S,
@@ -4982,14 +4986,27 @@ async fn start_then_confirm_inbound<C, S, R, F>(
 where
     F: std::future::Future<Output = R>,
 {
+    use futures::StreamExt;
+
     // Arm every receiver before entering even the first confirmation wait.
     // A silent neighbour must not leave an already registered path unread.
     let started: Vec<_> = candidates.into_iter().map(&mut start).collect();
-    let mut results = Vec::with_capacity(started.len());
-    for candidate in started {
-        results.push(confirm(candidate).await);
+    // No spawned tail: cancellation drops all confirmations with this batch.
+    // Even an oversized operator-pinned set cannot create unlimited probes.
+    let mut confirmations = futures::stream::iter(started.into_iter().enumerate())
+        .map(|(index, candidate)| {
+            let future = confirm(candidate);
+            async move { (index, future.await) }
+        })
+        .buffer_unordered(MAX_CONCURRENT_INBOUND_CONFIRMATIONS);
+    let mut results = Vec::new();
+    while let Some(result) = confirmations.next().await {
+        results.push(result);
     }
-    results
+    // Keep caller merge/log ordering deterministic, while each ready
+    // confirmer's publication happens before waiting for its neighbours.
+    results.sort_unstable_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
 }
 
 /// Retry failed repair on an unchanged carrier set at most every 30 seconds.
@@ -6148,6 +6165,10 @@ fn retire_circuits_later(
         });
     }
 }
+
+#[cfg(test)]
+#[path = "anon_stream/inbound_activation_tests.rs"]
+mod inbound_activation_tests;
 
 #[cfg(all(test, unix))]
 #[path = "anon_stream/source_lane_tests.rs"]
