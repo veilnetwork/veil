@@ -10,6 +10,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name       = "veilclient_ffi"
 
 [features]
+circuit-trace = ["veil-anonymity/circuit-trace"]
 # `tls-boring` ON by default — the mobile lib carries the browser-like TLS
 # ClientHello + rotation backend (censorship-resistance baseline for the
 # mobile-apps stage). The android (`cargo ndk`) and iOS (xcframework) builds
