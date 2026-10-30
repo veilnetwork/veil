@@ -4161,6 +4161,8 @@ pub struct DataCircuit {
     _local_path: Option<local_circuit_paths::Reservation>,
     first_hop: [u8; 32],
     first_hop_close_generation: u64,
+    /// The actual TX entry on which this circuit's build was admitted.
+    first_hop_registration: u64,
     relay_path: Vec<[u8; 32]>,
     origin_circuit_id: u32,
     /// Per-hop keys, first-hop → terminus order (wraps each FORWARD cell).
@@ -4223,8 +4225,9 @@ impl DataCircuit {
         self.first_hop
     }
 
-    /// Session-close generation captured before the circuit build is queued.
-    /// Confirmation arriving later must not refresh this witness.
+    /// Diagnostic close-counter sampled before the build. This counts exits
+    /// of superseded runners too; the actual lifetime witness is the TX entry.
+    /// Confirmation arriving later must not refresh either snapshot.
     pub fn first_hop_close_generation(&self) -> u64 {
         self.first_hop_close_generation
     }
