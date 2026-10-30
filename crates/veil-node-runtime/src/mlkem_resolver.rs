@@ -288,6 +288,62 @@ struct CheckedDocument {
 type InstanceKey = ([u8; 32], Option<[u8; 16]>);
 type InstanceWalkGates = std::collections::HashMap<InstanceKey, Arc<tokio::sync::Mutex<()>>>;
 
+/// Own the map entry while holding OR waiting for its async turn. A cancelled
+/// waiter must not remove the current owner's gate; the last caller removes
+/// only its own entry, including cancellation and unwinding.
+struct InstanceWalkGate<'a> {
+    gates: &'a Mutex<InstanceWalkGates>,
+    key: InstanceKey,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl<'a> InstanceWalkGate<'a> {
+    fn new(gates: &'a Mutex<InstanceWalkGates>, key: InstanceKey) -> Self {
+        let gate = Arc::clone(
+            lock!(gates)
+                .entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        );
+        Self { gates, key, gate }
+    }
+}
+
+impl Drop for InstanceWalkGate<'_> {
+    fn drop(&mut self) {
+        let mut gates = lock!(self.gates);
+        if Arc::strong_count(&self.gate) == 2
+            && gates
+                .get(&self.key)
+                .is_some_and(|gate| Arc::ptr_eq(gate, &self.gate))
+        {
+            gates.remove(&self.key);
+        }
+    }
+}
+
+/// This is a gauge, unlike the resolver's cumulative instance_walks counter.
+/// A caller's timeout may drop the walk at either await, before its normal exit.
+struct ActiveInstanceWalk<'a> {
+    counter: &'a std::sync::atomic::AtomicUsize,
+    concurrent: usize,
+}
+
+impl<'a> ActiveInstanceWalk<'a> {
+    fn new(counter: &'a std::sync::atomic::AtomicUsize) -> Self {
+        Self {
+            counter,
+            concurrent: counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+        }
+    }
+}
+
+impl Drop for ActiveInstanceWalk<'_> {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// How long a device whose certificate walk found nothing is left alone.
 ///
 /// A walk is three DHT rounds, 3–6 s, and a miss was never remembered, so every
@@ -929,12 +985,8 @@ impl DhtMlKemEkResolver {
         if self.recently_missed(&key) {
             return None;
         }
-        let gate = Arc::clone(
-            lock!(self.instance_walk_gates)
-                .entry(key)
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-        );
-        let turn = gate.lock().await;
+        let gate = InstanceWalkGate::new(&self.instance_walk_gates, key);
+        let turn = gate.gate.lock().await;
         let out = if let Some(cert) = cached() {
             Some(cert)
         } else if self.recently_missed(&key) {
@@ -943,13 +995,13 @@ impl DhtMlKemEkResolver {
             let walk_started = std::time::Instant::now();
             self.instance_walks
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let concurrent =
-                INSTANCE_WALKS_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let active = ActiveInstanceWalk::new(&INSTANCE_WALKS_IN_FLIGHT);
+            let concurrent = active.concurrent;
             if !self.instance_walk_delay.is_zero() {
                 tokio::time::sleep(self.instance_walk_delay).await;
             }
             let found = walk().await;
-            INSTANCE_WALKS_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            drop(active);
             self.logger.info(
                 "mlkem_resolver.instance_cert.walked",
                 format!(
@@ -969,14 +1021,6 @@ impl DhtMlKemEkResolver {
             found
         };
         drop(turn);
-        // The gate goes once nobody else holds it: the map and this caller are
-        // the only two owners left.
-        {
-            let mut gates = lock!(self.instance_walk_gates);
-            if Arc::strong_count(&gate) <= 2 {
-                gates.remove(&key);
-            }
-        }
         out
     }
 
@@ -3743,6 +3787,136 @@ mod tests {
             resolver.resolve_cert_for_instance_cached(target, [0xee; 16]),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn active_walk_counter_follows_cancelled_and_panicking_future_lifetimes() {
+        use futures::FutureExt as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // A local gauge isolates the production guard from other tests' real
+        // concurrent resolver walks; the resolver uses the same guard globally.
+        let counter = AtomicUsize::new(0);
+        let mut running = Box::pin(async {
+            let _active = ActiveInstanceWalk::new(&counter);
+            futures::future::pending::<()>().await;
+        });
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        let panicked = std::panic::AssertUnwindSafe(async {
+            let active = ActiveInstanceWalk::new(&counter);
+            assert_eq!(active.concurrent, 2);
+            panic!("controlled active walk failure");
+        })
+        .catch_unwind()
+        .await;
+        assert!(panicked.is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        drop(running);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_certificate_walks_release_gate_and_pending_queries() {
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        let _rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+        for n in 0..16 {
+            // Both public entrypoints use the same gate owner. Cancellation is
+            // not a negative network result and must not remember a miss.
+            let target = [0x80 + n; 32];
+            let mut node = Box::pin(resolver.fetch_verified_cert(target));
+            assert!(poll_family_to_stall(node.as_mut()).is_pending());
+            assert_eq!(lock!(resolver.instance_walk_gates).len(), 1);
+            drop(node);
+            assert!(lock!(resolver.pending_recursive).is_empty());
+            assert!(lock!(resolver.instance_walk_gates).is_empty());
+            let mut instance = Box::pin(resolver.fetch_verified_cert_for_instance(target, [n; 16]));
+            assert!(poll_family_to_stall(instance.as_mut()).is_pending());
+            assert_eq!(lock!(resolver.pending_recursive).len(), 2);
+            drop(instance);
+            assert!(lock!(resolver.pending_recursive).is_empty());
+            assert!(lock!(resolver.instance_walk_gates).is_empty());
+            assert!(rlock!(resolver.instance_walk_misses).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_certificate_walk_preserves_waiter_then_releases_last_gate() {
+        for cancel_owner in [true, false] {
+            let signer = current_cert_signer(0x69);
+            let target = signer.doc.node_id;
+            let instance = [0x42; 16];
+            let now = unix_now();
+            let cert = signer.cert(instance, now - 60, now + 1800, 1);
+            let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+            let mut rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+            let mut owner = Box::pin(resolver.fetch_verified_cert_for_instance(target, instance));
+            assert!(poll_family_to_stall(owner.as_mut()).is_pending());
+            let first = instance_requests(&mut rx);
+            let mut waiter = Box::pin(resolver.fetch_verified_cert_for_instance(target, instance));
+            assert!(poll_family_to_stall(waiter.as_mut()).is_pending());
+            assert!(
+                rx.try_recv().is_err(),
+                "the waiter must not start a second walk"
+            );
+            assert_eq!(resolver.instance_walk_count(), 1);
+            let (mut remaining, queries) = if cancel_owner {
+                drop(owner);
+                assert!(lock!(resolver.pending_recursive).is_empty());
+                assert_eq!(lock!(resolver.instance_walk_gates).len(), 1);
+                assert!(poll_family_to_stall(waiter.as_mut()).is_pending());
+                assert_eq!(resolver.instance_walk_count(), 2);
+                (waiter, instance_requests(&mut rx))
+            } else {
+                drop(waiter);
+                assert_eq!(lock!(resolver.instance_walk_gates).len(), 1);
+                (owner, first)
+            };
+            // A third caller still joins the SAME gate after cancellation.
+            let mut third = Box::pin(resolver.fetch_verified_cert_for_instance(target, instance));
+            assert!(poll_family_to_stall(third.as_mut()).is_pending());
+            assert!(rx.try_recv().is_err());
+            for q in queries {
+                let bytes = if q.target_key == IdentityDocument::dht_key(&target) {
+                    signer.doc.encode()
+                } else {
+                    assert_eq!(q.target_key, MlKemKeyCert::dht_key(&target, &instance));
+                    cert.encode()
+                };
+                lock!(resolver.pending_recursive)
+                    .remove(&q.query_id)
+                    .unwrap()
+                    .tx
+                    .send(bytes)
+                    .unwrap();
+            }
+            assert!(remaining.as_mut().await.is_some());
+            drop(remaining);
+            assert!(third.as_mut().await.is_some());
+            drop(third);
+            assert_eq!(
+                resolver.instance_walk_count(),
+                if cancel_owner { 2 } else { 1 }
+            );
+            assert!(lock!(resolver.instance_walk_gates).is_empty());
+            assert!(lock!(resolver.pending_recursive).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_certificate_walk_releases_its_gate() {
+        use futures::FutureExt as _;
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        let key = ([0x83; 32], Some([0x42; 16]));
+        let result = std::panic::AssertUnwindSafe(resolver.walk_once(
+            key,
+            || None,
+            || async { panic!("controlled walk failure") },
+        ))
+        .catch_unwind()
+        .await;
+        assert!(result.is_err());
+        assert!(lock!(resolver.instance_walk_gates).is_empty());
+        assert!(rlock!(resolver.instance_walk_misses).is_empty());
     }
 
     // With no peers configured a real walk yields None, so a `Some(_)` can
