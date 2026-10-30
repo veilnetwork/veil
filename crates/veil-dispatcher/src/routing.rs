@@ -1983,6 +1983,23 @@ impl FrameDispatcher {
         // but each one still costs sig-verify, lookup, and TTL-slot work — so
         // throttle the SOURCE of the queries, not just the deduplicated set.
         if !lock!(self.abuse.recursive_query_limiter).allow(*peer_id.as_bytes()) {
+            // Sparse, operator-enabled correlation with the originating lookup.
+            // No payload/nonce bytes, no protocol change, and no peer-state map.
+            // Power-of-two samples bound logging even during a query flood.
+            if veil_session::rt_trace::rt_trace_enabled() {
+                static REFUSALS: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let total = REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if total.is_power_of_two() {
+                    let tag = blake3::hash(body);
+                    log::info!(
+                        "dht.query.rate_limit local={} peer={} process_refusals={total} qtag={}",
+                        veil_util::hex_short(&self.local_node_id),
+                        veil_util::hex_short(peer_id.as_bytes()),
+                        veil_util::bytes_to_hex(&tag.as_bytes()[..8]),
+                    );
+                }
+            }
             return DispatchResult::NoResponse;
         }
         // Being a hop of somebody else's walk, paid out of this node's hourly
