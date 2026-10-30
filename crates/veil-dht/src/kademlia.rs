@@ -736,13 +736,11 @@ impl KademliaService {
         let inner = lock!(self.inner);
         let mut contacts: Vec<Contact> = inner
             .routing
-            .find_closest(target, self.k())
+            .find_closest_filtered(target, self.k(), |c| {
+                matches!(c.discovery_mode(), veil_types::DiscoveryMode::Public)
+                    && self.count_service_skip(c)
+            })
             .into_iter()
-            .filter(|c| matches!(c.discovery_mode(), veil_types::DiscoveryMode::Public))
-            // A no-service peer must never be handed to a walker as a closer
-            // node: every referral turns into store/query traffic at the peer
-            // that asked not to receive any.
-            .filter(|c| self.count_service_skip(c))
             .cloned()
             .collect();
 
@@ -1495,9 +1493,8 @@ impl KademliaService {
     pub fn find_closest_nodes(&self, target: &[u8; 32], k: usize) -> Vec<[u8; 32]> {
         lock!(self.inner)
             .routing
-            .find_closest(target, k)
+            .find_closest_filtered(target, k, |c| self.count_service_skip(c))
             .into_iter()
-            .filter(|c| self.count_service_skip(c))
             .map(|c| c.node_id)
             .collect()
     }
@@ -1514,9 +1511,8 @@ impl KademliaService {
     ) -> Vec<super::routing::Contact> {
         lock!(self.inner)
             .routing
-            .find_closest(target, k)
+            .find_closest_filtered(target, k, |c| self.count_service_skip(c))
             .into_iter()
-            .filter(|c| self.count_service_skip(c))
             .cloned()
             .collect()
     }
@@ -1534,9 +1530,8 @@ impl KademliaService {
     ) -> Vec<([u8; 32], String)> {
         lock!(self.inner)
             .routing
-            .find_closest(target, k)
+            .find_closest_filtered(target, k, |c| self.count_service_skip(c))
             .into_iter()
-            .filter(|c| self.count_service_skip(c))
             .map(|c| (c.node_id, c.transport.clone()))
             .collect()
     }
@@ -1552,12 +1547,11 @@ impl KademliaService {
     pub fn find_closest_public_node_ids(&self, target: &[u8; 32], k: usize) -> Vec<[u8; 32]> {
         let public: Vec<_> = lock!(self.inner)
             .routing
-            .find_closest(target, self.k())
-            .into_iter()
-            .filter(|c| {
+            .find_closest_filtered(target, self.k(), |c| {
                 matches!(c.discovery_mode(), veil_types::DiscoveryMode::Public)
                     && self.count_service_skip(c)
             })
+            .into_iter()
             .map(|c| c.node_id)
             .collect();
         let half_cap = public.len().div_ceil(2).max(1);
@@ -1672,9 +1666,8 @@ impl KademliaService {
             let inner = lock!(self.inner);
             inner
                 .routing
-                .find_closest(&key, self.k())
+                .find_closest_filtered(&key, self.k(), |c| self.count_service_skip(c))
                 .into_iter()
-                .filter(|c| self.count_service_skip(c))
                 .cloned()
                 .collect()
         };
@@ -1800,9 +1793,8 @@ impl KademliaService {
             let inner = lock!(self.inner);
             let mut seeds: Vec<Contact> = inner
                 .routing
-                .find_closest(&target, self.k())
+                .find_closest_filtered(&target, self.k(), |c| self.count_service_skip(c))
                 .into_iter()
-                .filter(|c| self.count_service_skip(c))
                 .cloned()
                 .collect();
             // Also seed from all peers with active sessions so nodes not yet in
@@ -2226,6 +2218,109 @@ mod tests {
 
         // Verify the local store at C is intact.
         assert_eq!(svc_c.stored_keys(), 1);
+    }
+
+    // Closer peers can decline DHT work without hiding the serving peers
+    // behind them. A post-selection filter used to exhaust every slot first.
+    fn crowded_candidate_service(private_nearest: bool) -> KademliaService {
+        let svc = KademliaService::new([0; 32]);
+        for n in 1..=20 {
+            svc.add_contact_trusted(Contact::with_caps(
+                [n; 32],
+                format!("tcp://quiet-{n}:9000"),
+                if private_nearest {
+                    veil_types::DiscoveryMode::ContactsOnly
+                } else {
+                    veil_types::DiscoveryMode::Public
+                },
+                private_nearest,
+            ));
+        }
+        for n in [0x40, 0x60] {
+            // No capabilities yet is not a refusal.
+            svc.add_contact_trusted(Contact::new([n; 32], format!("tcp://server-{n}:9000")));
+        }
+        assert_eq!(svc.routing_table_contacts().len(), 22);
+        svc
+    }
+
+    #[test]
+    fn closest_selection_fills_slots_after_dht_decliners() {
+        let svc = crowded_candidate_service(false);
+        let expected = vec![[0x40; 32], [0x60; 32]];
+        let nodes = svc.find_closest_nodes(&[0; 32], 2);
+        let contacts: Vec<_> = svc
+            .find_closest_contacts(&[0; 32], 2)
+            .into_iter()
+            .map(|c| c.node_id)
+            .collect();
+        let transports: Vec<_> = svc
+            .find_closest_with_transport(&[0; 32], 2)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            (nodes, contacts, transports),
+            (expected.clone(), expected.clone(), expected)
+        );
+        assert!(svc.find_closest_nodes(&[0; 32], 0).is_empty());
+    }
+
+    #[test]
+    fn public_selection_fills_slots_without_exposing_private_contacts() {
+        for private_nearest in [false, true] {
+            let svc = crowded_candidate_service(private_nearest);
+            let ids = svc.find_closest_public_node_ids(&[0; 32], 20);
+            let ranked: Vec<_> = svc
+                .ranked_public_contacts(&[0; 32], 20)
+                .into_iter()
+                .map(|c| c.node_id)
+                .collect();
+            // Preserve the existing half-set response cap: two eligible public
+            // contacts permit ONE referral, not the twenty private/quiet ones.
+            assert_eq!((ids, ranked), (vec![[0x40; 32]], vec![[0x40; 32]]));
+        }
+    }
+
+    #[tokio::test]
+    async fn iterative_walks_seed_serving_contacts_beyond_closer_decliners() {
+        let svc = crowded_candidate_service(false);
+        let node_router = Arc::new(RecordingRouter {
+            peers: vec![],
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let found = svc
+            .find_node_iterative_network([0; 32], node_router.clone())
+            .await;
+        let value_router = Arc::new(RecordingRouter {
+            peers: vec![],
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let value = svc
+            .find_value_iterative_network([0; 32], value_router.clone())
+            .await;
+        assert!(value.is_none(), "silent router is no evidence of a value");
+        let queried = |router: &RecordingRouter| -> std::collections::HashSet<_> {
+            router
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        let expected = std::collections::HashSet::from([[0x40; 32], [0x60; 32]]);
+        assert_eq!(
+            (queried(&node_router), queried(&value_router)),
+            (expected.clone(), expected.clone())
+        );
+        assert_eq!(
+            found
+                .into_iter()
+                .map(|c| c.node_id)
+                .collect::<std::collections::HashSet<_>>(),
+            expected
+        );
     }
 
     fn service(seed: u8) -> KademliaService {

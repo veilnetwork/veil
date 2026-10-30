@@ -744,6 +744,22 @@ impl RoutingTable {
     /// and the working-set memory is `K` rather than `N` — important for
     /// the lookup hot path which runs on every recursive DHT walk.
     pub fn find_closest(&self, target: &[u8; 32], k: usize) -> Vec<&Contact> {
+        self.find_closest_filtered(target, k, |_| true)
+    }
+
+    /// Select the closest eligible contacts BEFORE applying the result cap.
+    /// Filtering an already truncated list lets nearby non-serving/private
+    /// contacts hide every usable hop behind them. Keep the same bounded
+    /// max-heap and XOR ordering as the unfiltered selection.
+    pub fn find_closest_filtered<F>(
+        &self,
+        target: &[u8; 32],
+        k: usize,
+        mut eligible: F,
+    ) -> Vec<&Contact>
+    where
+        F: FnMut(&Contact) -> bool,
+    {
         if k == 0 {
             return Vec::new();
         }
@@ -756,7 +772,12 @@ impl RoutingTable {
         // the heap orders by `(distance, index)` ascending so equal-distance
         // contacts come back in deterministic insertion order.
         let mut heap: BinaryHeap<([u8; 32], usize)> = BinaryHeap::with_capacity(k);
-        let contacts: Vec<&Contact> = self.buckets.iter().flatten().collect();
+        let contacts: Vec<&Contact> = self
+            .buckets
+            .iter()
+            .flatten()
+            .filter(|contact| eligible(contact))
+            .collect();
         for (idx, c) in contacts.iter().enumerate() {
             let d = xor_distance(target, &c.node_id);
             if heap.len() < k {
@@ -923,6 +944,33 @@ mod tests {
 
     fn make_contact(seed: u8) -> Contact {
         Contact::new([seed; 32], format!("tcp://node-{seed}:9000"))
+    }
+
+    #[test]
+    fn filtered_closest_matches_exhaustive_eligible_xor_order() {
+        let mut table = RoutingTable::new([0; 32]);
+        for seed in 1..=160 {
+            table.insert_trusted(make_contact(seed));
+        }
+        for target in [[0; 32], [17; 32], [255; 32]] {
+            for modulus in [1, 2, 3, 7, 251] {
+                let eligible = |c: &Contact| c.node_id[0] % modulus == 0;
+                let mut all: Vec<_> = table.all_contacts().into_iter().filter(eligible).collect();
+                all.sort_by_key(|c| xor_distance(&target, &c.node_id));
+                for k in [0, 1, 2, 7, 20, 256] {
+                    let actual: Vec<_> = table
+                        .find_closest_filtered(&target, k, eligible)
+                        .into_iter()
+                        .map(|c| c.node_id)
+                        .collect();
+                    let expected: Vec<_> = all.iter().take(k).map(|c| c.node_id).collect();
+                    assert_eq!(
+                        actual, expected,
+                        "target={target:?}, modulus={modulus}, k={k}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
