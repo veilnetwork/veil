@@ -150,6 +150,11 @@ fn enabled() -> &'static AtomicBool {
     })
 }
 
+/// Observe the same switch without adding a dependency on the session crate.
+pub(crate) fn is_enabled() -> bool {
+    enabled().load(Ordering::Relaxed)
+}
+
 /// Embedded-node twin of the existing VEIL_RT_TRACE stand switch.
 pub fn set_enabled(on: bool) {
     enabled().store(on, Ordering::Relaxed);
