@@ -5092,6 +5092,19 @@ async fn open_inbound_circuits(
             .await
             .map(|(circuit, rx)| vec![(None, circuit, rx)]),
         CircuitMode::PublishedRendezvous => {
+            // A self-ad lookup cannot create an onion first hop when every
+            // connected peer explicitly declines circuit transit. Unknown
+            // capabilities remain eligible, just as for remote rendezvous R;
+            // a newly admitted/updated peer is rechecked on the next attempt.
+            let mut carriers = services
+                .session_tx_registry
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .peer_ids();
+            retain_stream_circuit_relays(services, &mut carriers);
+            if carriers.is_empty() {
+                return Err(AnonOnionSendError::NoRelays);
+            }
             // Reconnect repair already knows the affected termini. Rebuild only
             // those bindings; do not rotate healthy registrations or wait for a
             // self-address DHT lookup before restoring a known receive path.
@@ -6261,6 +6274,10 @@ mod source_lane_tests;
 #[cfg(all(test, unix))]
 #[path = "anon_stream/call_scope_tests.rs"]
 mod call_scope_tests;
+
+#[cfg(all(test, feature = "node-embedded"))]
+#[path = "anon_stream/inbound_carrier_tests.rs"]
+mod inbound_carrier_tests;
 
 #[cfg(all(test, feature = "test-low-difficulty"))]
 #[path = "anon_stream/local_enqueue_tests.rs"]
