@@ -3389,8 +3389,7 @@ async fn inbound_repair_ignores_backpressure_but_detects_a_closed_first_hop() {
                     f.cells.services.data_circuit_session_current(c),
                 )
             }),
-            Instant::now(),
-            None,
+            true,
         )
     };
     fill_ordinary_outbox(&f.cells, &f.circuit);
