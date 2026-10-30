@@ -599,6 +599,25 @@ struct FamilySendTiming {
     seal_ms: u128,
     admission_ms: u128,
     certificates: usize,
+    evidence: FamilySendEvidence,
+}
+
+/// Source-local outcomes, never destination receipts. No peer/instance IDs.
+#[derive(Clone, Copy, Debug, Default)]
+struct FamilySendEvidence {
+    filtered_local: usize,
+    filtered_identity: usize,
+    filtered_pairing: usize,
+    filtered_direct: usize,
+    no_hops: usize,
+    seal_attempts: usize,
+    sealed: usize,
+    seal_failed: usize,
+    host_failed: usize,
+    source_attempts: usize,
+    source_accepted: usize,
+    source_rejected: usize,
+    source_timed_out: usize,
 }
 
 /// One ordinary reliable copy, or the existing control copies, per verified
@@ -644,14 +663,24 @@ async fn send_family_relay_copies(
     timing.certificates = family.len();
     for (device, cert) in family {
         if !relay_control_compat && tokio::time::Instant::now() >= family_deadline {
+            timing.evidence.source_timed_out += 1;
             source_failed = true;
             break;
         }
-        if device == *local_node_id
-            || cert.node_id != send.dst_node_id
-            || !device_matches_identity(ctx, &device, &send.dst_node_id)
-            || direct.is_some_and(|targets| targets.instances.contains(&cert.instance_id))
-        {
+        if device == *local_node_id {
+            timing.evidence.filtered_local += 1;
+            continue;
+        }
+        if cert.node_id != send.dst_node_id {
+            timing.evidence.filtered_identity += 1;
+            continue;
+        }
+        if !device_matches_identity(ctx, &device, &send.dst_node_id) {
+            timing.evidence.filtered_pairing += 1;
+            continue;
+        }
+        if direct.is_some_and(|targets| targets.instances.contains(&cert.instance_id)) {
+            timing.evidence.filtered_direct += 1;
             continue;
         }
         let mut hops = ordinary_relay_hops(None, &device, route_cache, reg, true);
@@ -672,9 +701,11 @@ async fn send_family_relay_copies(
             identity_hops.sort_by_key(|hop| targets.devices.contains(hop));
         }
         if hops.is_empty() && identity_hops.is_empty() {
+            timing.evidence.no_hops += 1;
             continue;
         }
         let seal_started = std::time::Instant::now();
+        timing.evidence.seal_attempts += 1;
         let sealed = seal_with_host_floor(
             &ratchet.store,
             request_host_epoch,
@@ -697,11 +728,16 @@ async fn send_family_relay_copies(
                 veil_e2e::RatchetSpliceError::HostReservationRequired
                 | veil_e2e::RatchetSpliceError::HostPublicationClosed,
             ) => {
+                timing.evidence.host_failed += 1;
                 host_failed = true;
                 continue;
             }
-            Err(_) => continue,
+            Err(_) => {
+                timing.evidence.seal_failed += 1;
+                continue;
+            }
         };
+        timing.evidence.sealed += 1;
         use veil_proto::recipient::Recipient;
         if !relay_control_compat {
             let generic_hops = if identity_hops.is_empty() {
@@ -710,6 +746,7 @@ async fn send_family_relay_copies(
                 identity_hops
             };
             let admission_started = std::time::Instant::now();
+            timing.evidence.source_attempts += 1;
             let outcome = forward_ordinary_family_copy(
                 reg,
                 send,
@@ -722,6 +759,11 @@ async fn send_family_relay_copies(
             .await;
             timing.admission_ms += admission_started.elapsed().as_millis();
             any_sent |= outcome == DirectAdmission::Accepted;
+            match outcome {
+                DirectAdmission::Accepted => timing.evidence.source_accepted += 1,
+                DirectAdmission::TimedOut => timing.evidence.source_timed_out += 1,
+                _ => timing.evidence.source_rejected += 1,
+            }
             if matches!(
                 outcome,
                 DirectAdmission::TimedOut | DirectAdmission::Rejected
@@ -760,12 +802,18 @@ async fn send_family_relay_copies(
             };
             let bytes = envelope.encode();
             for hop in hops.into_iter().take(3) {
+                timing.evidence.source_attempts += 1;
                 let admission_started = std::time::Instant::now();
                 let packetized =
                     send_packetized_control(reg, &envelope, &hop, local_priority, family_deadline)
                         .await;
                 timing.admission_ms += admission_started.elapsed().as_millis();
                 if let Some(sent) = packetized {
+                    if sent {
+                        timing.evidence.source_accepted += 1;
+                    } else {
+                        timing.evidence.source_rejected += 1;
+                    }
                     any_sent |= sent;
                     continue;
                 }
@@ -785,7 +833,13 @@ async fn send_family_relay_copies(
                 }
                 // Keep the endpoint's signaling producer separate from its
                 // primary media producer. The relay header remains neutral.
-                any_sent |= reg.send_to(&hop, local_priority, frame);
+                let sent = reg.send_to(&hop, local_priority, frame);
+                if sent {
+                    timing.evidence.source_accepted += 1;
+                } else {
+                    timing.evidence.source_rejected += 1;
+                }
+                any_sent |= sent;
             }
         }
     }
@@ -1306,10 +1360,16 @@ impl SendTiming {
 impl Drop for SendTiming {
     fn drop(&mut self) {
         let total = self.started.elapsed().as_millis();
-        if total >= 1_000 {
-            let family = self.family.get();
-            log::warn!(
-                "ipc.send_slow at={} dst={} total_ms={total} plan_ms={} seal_ms={} path={} family_resolve_ms={} family_seal_ms={} family_admission_ms={} family_certificates={}",
+        let family = self.family.get();
+        if total >= 1_000 || (crate::route_trace::is_enabled() && family.certificates > 0) {
+            let (event, level) = if total >= 1_000 {
+                ("ipc.send_slow", log::Level::Warn)
+            } else {
+                ("ipc.send_sample", log::Level::Info)
+            };
+            log::log!(
+                level,
+                "{event} at={} dst={} total_ms={total} plan_ms={} seal_ms={} path={} family_resolve_ms={} family_seal_ms={} family_admission_ms={} family_certificates={} family_evidence={:?}",
                 veil_util::unix_secs_now_u64(),
                 veil_util::bytes_to_hex(&self.dst.get()),
                 self.plan_ms.get(),
@@ -1319,6 +1379,7 @@ impl Drop for SendTiming {
                 family.seal_ms,
                 family.admission_ms,
                 family.certificates,
+                family.evidence,
             );
         }
     }
@@ -5318,6 +5379,65 @@ mod ratchet_send_tests {
             let opened = sibling.open_payload(&ME, &wire, now).unwrap();
             assert!(opened.authenticated);
             assert_eq!(opened.plaintext, plaintext);
+        }
+    }
+
+    #[tokio::test]
+    async fn family_stage_evidence_distinguishes_filter_route_and_admission() {
+        for mode in 0..3 {
+            let (_fx, _sibling, one, two, mut ctx) = mixed_family_fixture(false);
+            let direct = DirectFamilyRecipients {
+                devices: [one].into_iter().collect(),
+                instances: [PEER_INSTANCE].into_iter().collect(),
+            };
+            if mode == 1 {
+                ctx.session_instance_lookup = Some(Arc::new(FamilySessions(vec![(
+                    two,
+                    veil_types::SessionPairing {
+                        identity: [0xd9; 32],
+                        instance: SIBLING_INSTANCE,
+                    },
+                )])));
+            } else if mode == 2 {
+                ctx.session_tx_registry = Some(Arc::new(Outbox {
+                    live: vec![],
+                    datagram: vec![],
+                    sent: Mutex::new(vec![]),
+                    family: vec![],
+                }));
+                ctx.route_cache = None;
+            }
+            let request = AppIpcSendPayload::decode(&payload(false, b"private test body")).unwrap();
+            let epoch = ctx
+                .ratchet
+                .as_ref()
+                .unwrap()
+                .store
+                .host_publication_state()
+                .epoch;
+            let got = send_family_relay_copies(
+                &ctx,
+                &request,
+                epoch,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                false,
+                veil_proto::priority::INTERACTIVE,
+                Some(&direct),
+            )
+            .await;
+            assert_eq!(got.timing.certificates, 2);
+            let e = got.timing.evidence;
+            assert_eq!(e.filtered_direct, 1);
+            assert_eq!(e.filtered_pairing, usize::from(mode == 1));
+            assert_eq!(e.no_hops, usize::from(mode == 2));
+            assert_eq!(e.seal_attempts, usize::from(mode == 0));
+            assert_eq!(e.sealed, usize::from(mode == 0));
+            assert_eq!(e.source_attempts, usize::from(mode == 0));
+            assert_eq!(e.source_accepted, usize::from(mode == 0));
+            assert_eq!(got.accepted, mode == 0);
+            let exported = format!("{e:?}");
+            assert!(!exported.contains("private test body"));
+            assert!(!exported.contains(&veil_util::bytes_to_hex(&two)));
         }
     }
 
