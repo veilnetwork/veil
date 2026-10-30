@@ -378,6 +378,26 @@ fn miss_window(base: Duration, streak: u32) -> Duration {
 }
 
 impl DhtMlKemEkResolver {
+    fn trace_resolve_stage(
+        &self,
+        target: &[u8; 32],
+        phase: &'static str,
+        started: Option<std::time::Instant>,
+        success: bool,
+        count: usize,
+    ) {
+        let Some(started) = started else { return };
+        if veil_session::rt_trace::rt_trace_enabled() {
+            log::info!(
+                "mlkem.resolve.stage op={} local={} dst={} phase={phase} elapsed_ms={} success={success} count={count}",
+                veil_ipc::route_trace::operation_id(),
+                hex8(&self.local_node_id),
+                hex8(target),
+                started.elapsed().as_millis(),
+            );
+        }
+    }
+
     /// Invalidate authorization from removed devices before a cached cert can
     /// republish it into the synchronous ratchet receive path. Public keys
     /// remain usable only while the same device is endorsed by the current
@@ -694,6 +714,7 @@ impl DhtMlKemEkResolver {
         // direct peer the caller knows the authoritative holder (relay-key
         // resolves), so the single steered walk stays.
         if direct_peer.is_none() {
+            let started = veil_session::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
             let doc = self
                 .dht_get_freshest(
                     doc_key,
@@ -706,12 +727,31 @@ impl DhtMlKemEkResolver {
                     |d| (d.issued_at_unix, 0),
                 )
                 .await;
+            self.trace_resolve_stage(
+                &target_node_id,
+                "document_lookup",
+                started,
+                doc.is_some(),
+                usize::from(doc.is_some()),
+            );
             if doc.is_none() {
                 self.log_dbg("mlkem_resolver.doc.dht_miss", &target_node_id, "");
             }
             return match doc {
-                Some(doc) if self.observe_document_ready(&doc).await => Some(doc),
-                _ => None,
+                Some(doc) => {
+                    let started =
+                        veil_session::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
+                    let ready = self.observe_document_ready(&doc).await;
+                    self.trace_resolve_stage(
+                        &target_node_id,
+                        "document_authorization",
+                        started,
+                        ready,
+                        usize::from(ready),
+                    );
+                    ready.then_some(doc)
+                }
+                None => None,
             };
         }
         let doc_bytes = match self
@@ -1305,15 +1345,19 @@ impl DhtMlKemEkResolver {
     /// send — it may never have come online since it was admitted — so this
     /// returns the ones that verified, and empty only when none did.
     pub async fn fetch_verified_certs(&self, target_node_id: [u8; 32]) -> ResolvedCerts {
+        let started = veil_session::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
         let Some(doc) = self.fetch_verified_document(target_node_id, None).await else {
+            self.trace_resolve_stage(&target_node_id, "family_document", started, false, 0);
             return ResolvedCerts::stopped_at(ResolveStage::DocumentUnresolved);
         };
+        self.trace_resolve_stage(&target_node_id, "family_document", started, true, 1);
         let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
             return ResolvedCerts::default();
         };
         let now_unix = now.as_secs();
 
         let reg_key = InstanceRegistry::dht_key(&target_node_id);
+        let started = veil_session::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
         let Some(reg) = self
             .dht_get_freshest(
                 reg_key,
@@ -1326,12 +1370,30 @@ impl DhtMlKemEkResolver {
             )
             .await
         else {
+            self.trace_resolve_stage(&target_node_id, "family_registry", started, false, 0);
             self.log_dbg("mlkem_resolver.registry.dht_miss", &target_node_id, "");
             return ResolvedCerts::stopped_at(ResolveStage::RegistryUnresolved);
         };
+        self.trace_resolve_stage(
+            &target_node_id,
+            "family_registry",
+            started,
+            true,
+            reg.instances.len(),
+        );
 
-        self.certs_for_instances(target_node_id, &doc, &reg.instances, now_unix)
-            .await
+        let started = veil_session::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
+        let resolved = self
+            .certs_for_instances(target_node_id, &doc, &reg.instances, now_unix)
+            .await;
+        self.trace_resolve_stage(
+            &target_node_id,
+            "family_certificates",
+            started,
+            !resolved.certs.is_empty(),
+            resolved.certs.len(),
+        );
+        resolved
     }
 
     /// Resolve the ML-KEM cert of each named instance and keep the ones that
@@ -1905,17 +1967,39 @@ where
     };
     let trace_started = std::time::Instant::now();
     let trace = veil_session::rt_trace::rt_trace_enabled();
+    let trace_lookup = if trace {
+        DHT_TRACE_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    } else {
+        0
+    };
+    if trace {
+        log::info!(
+            "dht.candidates.begin op={} lookup={trace_lookup} local={} target={} admitted={} local_values={}",
+            veil_ipc::route_trace::operation_id(),
+            hex8(&local_node_id),
+            hex8(&key),
+            sent.len(),
+            out.len(),
+        );
+    }
     let mut replies: futures::stream::FuturesUnordered<_> = sent
         .into_iter()
-        .map(|query| async move {
-            (
-                query.peer,
-                tokio::time::timeout_at(deadline, query.rx).await,
-            )
+        .map(|query| {
+            let tag = trace.then(|| {
+                let digest = blake3::hash(&query.frame[veil_proto::HEADER_SIZE..]);
+                veil_util::bytes_to_hex(&digest.as_bytes()[..8])
+            });
+            async move {
+                (
+                    query.peer,
+                    tag,
+                    tokio::time::timeout_at(deadline, query.rx).await,
+                )
+            }
         })
         .collect();
     use futures::StreamExt;
-    while let Some((peer, reply)) = replies.next().await {
+    while let Some((peer, tag, reply)) = replies.next().await {
         let (outcome, bytes) = match reply {
             Ok(Ok(bytes)) => (
                 if bytes.is_empty() { "empty" } else { "value" },
@@ -1932,10 +2016,13 @@ where
         // Raw target/peer identifiers stay in private traces, never reports.
         if trace {
             log::info!(
-                "dht.candidates.reply target={} peer={} outcome={outcome} valid={valid} elapsed_ms={}",
+                "dht.candidates.reply target={} peer={} outcome={outcome} valid={valid} elapsed_ms={} op={} lookup={trace_lookup} local={} qtag={}",
                 veil_util::hex_short(&key),
                 veil_util::hex_short(&peer),
                 trace_started.elapsed().as_millis(),
+                veil_ipc::route_trace::operation_id(),
+                hex8(&local_node_id),
+                tag.as_deref().unwrap_or("off"),
             );
         }
         if valid && let Some(bytes) = bytes {
@@ -1949,6 +2036,16 @@ where
     // information and only inflate the downstream sort/cache.
     out.sort();
     out.dedup();
+    if trace {
+        log::info!(
+            "dht.candidates.complete op={} lookup={trace_lookup} local={} target={} elapsed_ms={} values={}",
+            veil_ipc::route_trace::operation_id(),
+            hex8(&local_node_id),
+            hex8(&key),
+            trace_started.elapsed().as_millis(),
+            out.len(),
+        );
+    }
     out
 }
 
@@ -2294,6 +2391,7 @@ fn verify_instance_registry_sig(reg: &InstanceRegistry, doc: &IdentityDocument) 
 /// Instance-certificate walks running right now, across every resolver.
 static INSTANCE_WALKS_IN_FLIGHT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+static DHT_TRACE_LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Format the first 4 bytes of a node_id as 8 hex chars (matches the
 /// rest of the codebase's log conventions).

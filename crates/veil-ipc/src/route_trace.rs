@@ -4,11 +4,33 @@
 //! not merely generic QUIC readiness and not proof of a particular send path.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
+static NEXT_OPERATION: AtomicU64 = AtomicU64::new(1);
+tokio::task_local! {
+    static OPERATION: u64;
+}
+
+/// A process-local diagnostic correlation, never an IPC/wire field. Scoped
+/// child futures inherit it; unrelated/spawned tasks do not. Disabled tracing
+/// allocates no identifier, and cancellation restores the previous task scope.
+pub async fn operation_scope<F: std::future::Future>(enabled: bool, future: F) -> F::Output {
+    if enabled {
+        OPERATION
+            .scope(NEXT_OPERATION.fetch_add(1, Ordering::Relaxed), future)
+            .await
+    } else {
+        future.await
+    }
+}
+
+/// Zero means no diagnostic operation context, not a delivery identifier.
+pub fn operation_id() -> u64 {
+    OPERATION.try_with(|id| *id).unwrap_or(0)
+}
 type Key = ([u8; 32], [u8; 32], u8, [u8; 32]);
 struct Sample {
     logged_at: Instant,
@@ -358,6 +380,49 @@ pub(crate) fn observe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn operation_ids_follow_scoped_futures_without_cross_task_leakage() {
+        assert_eq!(operation_id(), 0);
+        let one = operation_scope(true, async {
+            let id = operation_id();
+            assert_ne!(id, 0);
+            tokio::task::yield_now().await;
+            assert_eq!(operation_id(), id);
+            assert_eq!(tokio::spawn(async { operation_id() }).await.unwrap(), 0);
+            id
+        });
+        let two = operation_scope(true, async {
+            let id = operation_id();
+            tokio::task::yield_now().await;
+            assert_eq!(operation_id(), id);
+            id
+        });
+        let (one, two) = tokio::join!(one, two);
+        assert_ne!(one, two);
+        assert_eq!(operation_id(), 0);
+        assert_eq!(operation_scope(false, async { operation_id() }).await, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_and_panicking_operations_restore_the_trace_scope() {
+        use futures::FutureExt as _;
+        let mut blocked = Box::pin(operation_scope(true, async {
+            assert_ne!(operation_id(), 0);
+            futures::future::pending::<()>().await;
+        }));
+        assert!(futures::poll!(blocked.as_mut()).is_pending());
+        assert_eq!(operation_id(), 0);
+        drop(blocked);
+        let panicked = std::panic::AssertUnwindSafe(operation_scope(true, async {
+            assert_ne!(operation_id(), 0);
+            panic!("controlled diagnostic scope failure");
+        }))
+        .catch_unwind()
+        .await;
+        assert!(panicked.is_err());
+        assert_eq!(operation_id(), 0);
+    }
     use veil_proto::ipc::{AppIpcRtSendPayload, AppIpcSendPayload};
 
     fn cell(seq: u64) -> Vec<u8> {
