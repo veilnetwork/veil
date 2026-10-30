@@ -629,35 +629,6 @@ impl NodeRuntime {
             );
         }
 
-        // The identity in force CHANGED, so what the DHT holds for this node is
-        // the previous identity's. The only publish used to be the one-shot at
-        // startup, which had already run under the placeholder a deniable boot
-        // starts from — so a promoted node advertised a certificate for an
-        // identity it no longer used, every peer's PQXDH agreement failed
-        // against it, and each side dropped the other's frames in silence.
-        // Measured before this: 0 of 86 single-shot frames delivered in either
-        // direction between two devices on the same LAN, with four publish
-        // records in the log and every one under the placeholder id.
-        //
-        // The mailbox kept working throughout — it resolves different records —
-        // which is exactly why this looked like anything but an identity bug.
-        if identity_changed && let Some(sov) = self.identity.sovereign_identity.get() {
-            let veil_dir_path = self.identity_dir.clone();
-            super::identity_publish::publish_sovereign_identity(
-                &sov,
-                &self.dht,
-                &self.identity.mlkem_keys,
-                &veil_dir_path,
-                // Sessions exist by now: replicate, or the records land in this
-                // node's own shard and no peer ever resolves them.
-                Some((
-                    &self.session_tx_registry,
-                    *self.identity.local_identity.node_id.as_bytes(),
-                )),
-                &self.logger,
-            )
-            .await;
-        }
         // re-prime global mobile background-mode
         // multiplier from reloaded config — operator may have
         // bumped it to react to observed cellular usage.
@@ -752,6 +723,26 @@ impl NodeRuntime {
             }
             Arc::new(svc)
         };
+        // This reload has just replaced the DHT. Publish into THIS instance,
+        // before its dispatcher/services are exposed, including when the
+        // identity did not change. Publishing earlier wrote the promoted
+        // bundle into the discarded predecessor; guarding on identity_changed
+        // left an ordinary same-identity reload with no local bundle at all.
+        // A periodic/network repair must not be required to find our own keys.
+        if let Some(sov) = self.identity.sovereign_identity.get() {
+            super::identity_publish::publish_sovereign_identity(
+                &sov,
+                &self.dht,
+                &self.identity.mlkem_keys,
+                &self.identity_dir,
+                Some((
+                    &self.session_tx_registry,
+                    *self.identity.local_identity.node_id.as_bytes(),
+                )),
+                &self.logger,
+            )
+            .await;
+        }
         // DiscoveryService must wrap (possibly-new) DHT so
         // announce_app_endpoint publishes signed records for cross-DHT
         // replication. Created after the DHT is built.
