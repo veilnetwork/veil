@@ -16,6 +16,7 @@ serde_json = "1"
 sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
+veil-util = { path = "../veil-util" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 tun = { version = "=0.8.13", features = ["async", "verify_binary_signature"] }
 tun2proxy = { version = "=0.8.2", default-features = false }

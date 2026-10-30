@@ -734,11 +734,11 @@ fn open_owner_only_create_new(path: &std::path::Path) -> std::io::Result<std::fs
         // looks at the mask, and `create_new` without it is refused with
         // "creating or truncating a file requires write or append access".
         // The mask is what actually reaches `CreateFileW`.
-        return std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .write(true)
             .access_mode(GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC)
             .create_new(true)
-            .open(path);
+            .open(path)
     }
     #[cfg(not(windows))]
     {
