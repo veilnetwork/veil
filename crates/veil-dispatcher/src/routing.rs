@@ -1978,6 +1978,30 @@ impl FrameDispatcher {
     // ── Recursive DHT routing ─────────────────────────────────────
 
     pub(crate) fn handle_recursive_query(&self, body: &[u8], peer_id: NodeId) -> DispatchResult {
+        // Loops and converging walk branches return IDs already processed by
+        // this node. Discard those without debiting the quota for NEW work.
+        // Only a read-only, fixed-size ID peek may precede admission: inserting
+        // here would let an unadmitted unique-ID flood fill the dedup cache.
+        // Unseen/malformed traffic still meets both budgets before decoding.
+        if let Some(id) = body.get(..16) {
+            let id: [u8; 16] = id.try_into().expect("fixed-size query ID slice");
+            if lock!(self.recursive_query_seen).contains_live(&id) {
+                if veil_session::rt_trace::rt_trace_enabled() {
+                    static DUPLICATES: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let total = DUPLICATES.fetch_add(1, Ordering::Relaxed) + 1;
+                    if total.is_power_of_two() {
+                        log::info!(
+                            "dht.query.duplicate_drop local={} peer={} process_duplicates={total} walk_tag={}",
+                            veil_util::hex_short(&self.local_node_id),
+                            veil_util::hex_short(peer_id.as_bytes()),
+                            veil_util::bytes_to_hex(&blake3::hash(&id).as_bytes()[..8]),
+                        );
+                    }
+                }
+                return DispatchResult::NoResponse;
+            }
+        }
         // Per-peer rate limit BEFORE decode: a flood of malformed queries should
         // also be quenched. Distinct `query_id` values bypass the dedup below
         // but each one still costs sig-verify, lookup, and TTL-slot work — so
@@ -2048,7 +2072,8 @@ impl FrameDispatcher {
             }
         };
 
-        // Dedup: prevent loops in recursive forwarding.
+        // Dedup again after admission: concurrent first arrivals may both pass
+        // the read-only peek. Exactly one may perform/forward the query.
         if lock!(self.recursive_query_seen).check_and_insert(q.query_id) {
             trace_query("duplicate", 0, 0);
             return DispatchResult::NoResponse;

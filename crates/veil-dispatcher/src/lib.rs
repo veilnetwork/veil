@@ -400,7 +400,7 @@ pub struct AbuseContext {
     /// the quota are silently dropped (the initiator times out and tries a
     /// different coordinator).
     pub nat_probe_forward_quota: Arc<Mutex<DhtQuota>>,
-    /// Per-peer rate limiter on `RecursiveQuery` frames (recursive
+    /// Per-peer rate limiter on unseen `RecursiveQuery` frames (recursive
     /// DHT routing). A peer can fire arbitrary `query_id`s targeting any
     /// key; each query consumes signature/decode work plus a TTL slot in
     /// `recursive_query_seen`. The pre-existing dedup catches loops on
@@ -408,7 +408,9 @@ pub struct AbuseContext {
     /// to amplify load on every node along the recursive forward chain.
     /// Capped at a generous burst (legitimate Kademlia clients rarely
     /// exceed a few queries/sec) — frames over the budget are silently
-    /// dropped (not Violation: the peer may simply be reconnecting after
+    /// dropped. Already-processed IDs are discarded by a read-only peek before
+    /// charging work; all unseen IDs, including malformed frames, remain metered
+    /// before decode (not Violation: the peer may simply be reconnecting after
     /// a long absence).
     pub recursive_query_limiter: Arc<Mutex<PerPeerLimiter>>,
 }
@@ -461,10 +463,11 @@ pub type AuthDeliverTx = mpsc::Sender<AuthDeliverInbound>;
 
 // ── ExpiryCache ───────────────────────────────────────────────────────────────
 
-/// Generic deduplication set with TTL expiry and O(1) oldest-entry eviction.
+/// Generic deduplication set with TTL expiry and O(log n) oldest-entry eviction.
 ///
 /// # Complexity
 /// * `check_and_insert`: amortised O(log n) — O(log n) heap push/pop, O(1) set ops.
+/// * `contains_live`: O(1) membership/deadline peek, with no mutation or cleanup.
 /// * Eviction when full: O(log n) — one `BinaryHeap::pop` instead of the
 ///   previous O(n) `min_by_key` scan over the expiry Vec.
 ///
@@ -502,7 +505,7 @@ impl<K: Eq> Ord for ExpiryCacheEntry<K> {
 }
 
 pub struct ExpiryCache<K> {
-    entries: HashSet<K>,
+    entries: HashMap<K, Instant>,
     heap: BinaryHeap<Reverse<ExpiryCacheEntry<K>>>,
     ttl: Duration,
     max_size: usize,
@@ -511,11 +514,20 @@ pub struct ExpiryCache<K> {
 impl<K: Hash + Eq + Copy + Ord> ExpiryCache<K> {
     pub fn new(ttl: Duration, max_size: usize) -> Self {
         Self {
-            entries: HashSet::new(),
+            entries: HashMap::new(),
             heap: BinaryHeap::new(),
             ttl,
             max_size,
         }
+    }
+
+    /// Constant-time, read-only membership check. Does not prune, insert, or
+    /// refresh deadlines: safe before admission when only already-seen work
+    /// can be discarded. Unseen IDs cannot allocate cache state here.
+    pub(crate) fn contains_live(&self, key: &K) -> bool {
+        self.entries
+            .get(key)
+            .is_some_and(|until| Instant::now() < *until)
     }
 
     /// Returns `true` if `key` was already seen.
@@ -532,7 +544,7 @@ impl<K: Hash + Eq + Copy + Ord> ExpiryCache<K> {
                 break;
             }
         }
-        if self.entries.contains(&key) {
+        if self.entries.contains_key(&key) {
             return true;
         }
         // Evict the oldest entry in O(log n) when at capacity.
@@ -541,7 +553,7 @@ impl<K: Hash + Eq + Copy + Ord> ExpiryCache<K> {
         {
             self.entries.remove(&oldest.key);
         }
-        self.entries.insert(key);
+        self.entries.insert(key, now + self.ttl);
         self.heap.push(Reverse(ExpiryCacheEntry {
             expires_at: now + self.ttl,
             key,
@@ -5766,6 +5778,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn expiry_cache_live_peek_neither_mutates_nor_refreshes() {
+        let mut cache = ExpiryCache::new(Duration::from_secs(60), 2);
+        assert!(!cache.contains_live(&1));
+        assert!(cache.entries.is_empty() && cache.heap.is_empty());
+        assert!(!cache.check_and_insert(1));
+        assert!(!cache.check_and_insert(2));
+        let deadlines = cache.entries.clone();
+        for _ in 0..64 {
+            assert!(cache.contains_live(&1));
+            assert!(!cache.contains_live(&3));
+        }
+        assert_eq!(cache.entries, deadlines);
+        assert_eq!(cache.heap.len(), 2);
+
+        // Inject expiry rather than sleep. The older expired entry must not
+        // hide a live entry, and even this lookup must do no bulk cleanup.
+        let expired = Instant::now() - Duration::from_secs(1);
+        cache.entries.insert(1, expired);
+        cache.heap = cache
+            .entries
+            .iter()
+            .map(|(&key, &expires_at)| Reverse(ExpiryCacheEntry { key, expires_at }))
+            .collect();
+        assert!(!cache.contains_live(&1));
+        assert!(cache.contains_live(&2));
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.heap.len(), 2);
+        assert!(!cache.check_and_insert(1));
+        assert!(cache.contains_live(&1));
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.heap.len(), 2);
+
+        assert!(!cache.check_and_insert(3));
+        assert!(
+            !cache.contains_live(&2),
+            "peek must not alter oldest-entry eviction"
+        );
+    }
+
     /// audit cycle-8 H8: the value-carrying ExpiryMap (terminal ACK-replay cache)
     /// returns the stored value within TTL, drops it after expiry, and bounds at
     /// capacity.
@@ -7291,6 +7343,92 @@ mod tests {
             matches!(result, DispatchResult::Violation(_)),
             "recursive plane must reject NK-magic junk as a violation, got {result:?}",
         );
+    }
+
+    #[test]
+    fn recursive_query_duplicates_do_not_spend_new_work_quota() {
+        use veil_proto::routing::{RecursiveQueryPayload, recursive_query_type};
+        let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+        *lock!(dispatcher.abuse.recursive_query_limiter) =
+            PerPeerLimiter::new(0.001, 2.0, Duration::from_secs(300));
+        let peer = veil_cfg::NodeId::from([0x81; 32]);
+        let body = |id| {
+            RecursiveQueryPayload {
+                query_id: [id; 16],
+                target_key: [0x82; 32],
+                reply_to: *peer.as_bytes(),
+                ttl: 1,
+                query_type: recursive_query_type::FIND_VALUE,
+                reply_port: 0,
+                payload: vec![],
+            }
+            .encode()
+        };
+        assert!(matches!(
+            dispatcher.handle_recursive_query(&body(1), peer),
+            DispatchResult::NoResponse
+        ));
+        for _ in 0..64 {
+            assert!(matches!(
+                dispatcher.handle_recursive_query(&body(1), peer),
+                DispatchResult::NoResponse
+            ));
+        }
+        dispatcher.handle_recursive_query(&body(2), peer);
+        dispatcher.handle_recursive_query(&body(3), peer);
+        let mut seen = lock!(dispatcher.recursive_query_seen);
+        assert!(
+            seen.check_and_insert([2; 16]),
+            "loop copies must leave a token for the second distinct query"
+        );
+        assert!(
+            !seen.check_and_insert([3; 16]),
+            "distinct queries must still exhaust the original quota"
+        );
+    }
+
+    #[test]
+    fn recursive_query_unseen_malformed_frames_still_spend_quota_before_decode() {
+        use veil_proto::routing::{RecursiveQueryPayload, recursive_query_type};
+        for malformed in [vec![0x91; 4], vec![0x92; 16]] {
+            let dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+            *lock!(dispatcher.abuse.recursive_query_limiter) =
+                PerPeerLimiter::new(0.001, 2.0, Duration::from_secs(300));
+            let peer = veil_cfg::NodeId::from([0x93; 32]);
+            for _ in 0..2 {
+                assert!(matches!(
+                    dispatcher.handle_recursive_query(&malformed, peer),
+                    DispatchResult::Violation(_)
+                ));
+            }
+            // A third malformed frame must be dropped before decoding, and
+            // untrusted IDs must not have entered the dedup cache at all.
+            assert!(matches!(
+                dispatcher.handle_recursive_query(&malformed, peer),
+                DispatchResult::NoResponse
+            ));
+            assert!(lock!(dispatcher.recursive_query_seen).entries.is_empty());
+            for id in 1..=64 {
+                let body = RecursiveQueryPayload {
+                    query_id: [id; 16],
+                    target_key: [0x94; 32],
+                    reply_to: *peer.as_bytes(),
+                    ttl: 1,
+                    query_type: recursive_query_type::FIND_VALUE,
+                    reply_port: 0,
+                    payload: vec![],
+                }
+                .encode();
+                assert!(matches!(
+                    dispatcher.handle_recursive_query(&body, peer),
+                    DispatchResult::NoResponse
+                ));
+            }
+            assert!(
+                lock!(dispatcher.recursive_query_seen).entries.is_empty(),
+                "unadmitted IDs must not allocate dedup entries"
+            );
+        }
     }
 
     // ── Public Space discovery STORE gate ("XS") ─────────────────────────────
