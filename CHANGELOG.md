@@ -12,6 +12,9 @@
 - Deliver local identity-document change notices through the bounded interactive
   TX queue rather than letting best-effort background replication delay or
   reject a revocation behind unrelated publication records.
+- Send the current identity document to a newly admitted neighbor that missed
+  reload-time notifications. Revalidate live peer authorization when a verified
+  document is stored, without waiting for another application packet.
 
 - Request a fresh authenticated agreement when a restored ratchet chain uses
   a sender key absent from the current verified certificates for that instance.
