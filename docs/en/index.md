@@ -32,6 +32,7 @@ Veil is a decentralized hybrid open-source network written in Rust, implementing
 | [Crate Architecture](CRATE_ARCHITECTURE.md) | Project developers | How the workspace crates are split and what each one owns |
 | [Capacity](CAPACITY.md) | Operators, engineers | Capacity planning: limits, budgets, and scaling characteristics |
 | [Contracts](CONTRACTS.md) | Project developers | Cross-module contracts and invariants that callers rely on |
+| [Durable ratchet publication](ratchet-host-publication.md) | Embedding applications | Host-owned ratchet reservations, durable publication and crash recovery |
 | [Contributing](CONTRIBUTING.md) | Project developers | From a fresh checkout to a clean pull request, assuming no prior work on Veil |
 | [Messenger dev guide](messenger-dev.md) | App developers | Building a Signal-style messenger on veil: sovereign identity plus async delivery |
 | [Adaptive failover](adaptive-failover.md) | Operators, engineers | How a dead path is scored and re-routed automatically |
