@@ -5082,47 +5082,83 @@ fn the_identity_selfcheck_is_owned_by_its_task() {
 /// the network`, so nothing could be sealed for it. An earlier run showed the
 /// same asymmetry one step out — document resolved, registry did not.
 ///
-/// Structural, like [`the_identity_selfcheck_is_owned_by_its_task`] above: the
-/// arm lives inside a `tokio::select!` several closures deep, and what is being
-/// pinned is WHICH publish path it reaches.
-#[test]
-fn a_topology_change_republishes_every_record() {
-    let src = include_str!("sovereign_republish.rs");
-    let at = src
-        .find("_ = route_updated.notified() => {")
-        .expect("the topology-driven republish arm is gone or was renamed");
-    // Bounded at the next arm so this reads THIS arm and not the file.
-    let rest = &src[at..];
-    let end = rest
-        .find("_ = on_change_tick.tick()")
-        .expect("the arm after the topology one is gone — the slice is unbounded");
-    let arm = &rest[..end];
-
-    assert!(
-        arm.contains("interval.reset_immediately()"),
-        "the topology arm no longer pulls the full publish forward, so a node \
-         whose boot publish reached nobody stays unresolvable until the 6h tick"
-    );
-    // CONTROL: and it must not go back to publishing one record by hand —
-    // that is exactly the shape that left the registry and the cert behind.
-    assert!(
-        !arm.contains("publish_identity_document("),
-        "the topology arm publishes the document by hand again; the registry \
-         and the ML-KEM cert do not travel with it"
-    );
-
-    // CONTROL for the guard itself: the arm it defers to still publishes all
-    // three records, or deferring to it proves nothing.
-    for record in [
-        "publish_identity_document(",
-        "publish_instance_registry(",
-        "publish_mlkem_cert(",
-    ] {
-        assert!(
-            src.contains(record),
-            "the interval arm no longer publishes {record} — the topology arm \
-             now defers to a path that does not cover it"
+/// Drive the actual service and decode the three required STORE records;
+/// branch spelling is not evidence that the whole bundle travelled.
+#[tokio::test(flavor = "current_thread")]
+async fn a_topology_change_republishes_every_record() {
+    use veil_proto::{
+        identity_document::IdentityDocument, instance_registry::InstanceRegistry,
+        mlkem_cert::MlKemKeyCert,
+    };
+    let (mut rt, _dir) = isolated_identity_republisher().await;
+    let sov = rt.identity.sovereign_identity.get().unwrap();
+    let identity = *sov.node_id();
+    let instance = sov.active_instance_id();
+    let keys = [
+        IdentityDocument::dht_key(&identity),
+        InstanceRegistry::dht_key(&identity),
+        MlKemKeyCert::dht_key(&identity, &instance),
+    ];
+    async fn bundle(
+        rx: &mut veil_session::frame_outbox::FrameOutbox,
+        keys: &[[u8; 32]; 3],
+    ) -> Option<std::collections::HashMap<[u8; 32], Vec<u8>>> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut got = std::collections::HashMap::new();
+            while got.len() < keys.len() {
+                let (_, bytes) = rx.recv().await?;
+                let query = veil_proto::routing::RecursiveQueryPayload::decode(
+                    &bytes[veil_proto::HEADER_SIZE..],
+                )
+                .ok()?;
+                if query.query_type == veil_proto::routing::recursive_query_type::STORE
+                    && keys.contains(&query.target_key)
+                {
+                    got.insert(query.target_key, query.payload);
+                }
+            }
+            Some(got)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+    tokio::time::pause();
+    let mut first = rt.session_tx_registry.write().unwrap().register([0x52; 32]);
+    rt.spawn_sovereign_identity_republish_task();
+    let initial = bundle(&mut first, &keys).await;
+    let mut second = rt.session_tx_registry.write().unwrap().register([0x53; 32]);
+    rt.event_bus.publish(veil_proto::EventPayload {
+        kind: veil_proto::event_kind::SESSIONS_CHANGED,
+        payload: 2u16.to_be_bytes().to_vec(),
+    });
+    let copy = bundle(&mut second, &keys).await;
+    tokio::time::resume();
+    let held_ek = rt.identity.mlkem_keys.current_ek().to_vec();
+    let held_pk = rt.identity.mlkem_keys.current_ratchet_pk();
+    rt.stop().await.unwrap();
+    for received in [initial, copy] {
+        let received = received.expect("both peers need document, registry AND certificate");
+        let doc = IdentityDocument::decode(&received[&keys[0]]).unwrap();
+        veil_identity::verify::verify_identity_document(&doc, veil_util::unix_secs_now_u64())
+            .unwrap();
+        assert_eq!(doc.node_id, identity);
+        let registry = InstanceRegistry::decode(&received[&keys[1]]).unwrap();
+        assert_eq!(
+            registry.encode(),
+            super::identity_publish::full_registry(&sov).encode()
         );
+        let cert = MlKemKeyCert::decode(&received[&keys[2]]).unwrap();
+        let cert = veil_identity::mlkem_fanout::verify_mlkem_cert(
+            &cert,
+            &doc,
+            veil_util::unix_secs_now_u64(),
+        )
+        .unwrap();
+        assert_eq!(cert.node_id, identity);
+        assert_eq!(cert.instance_id, instance);
+        assert_eq!(cert.mlkem_pubkey, held_ek);
+        assert_eq!(cert.ratchet_x25519_pubkey, held_pk);
     }
 }
 
@@ -5547,4 +5583,73 @@ async fn retiring_owned_data_circuits_releases_slots_and_sends_ordinary_teardown
     }
     runtime.stop().await.unwrap();
     let _ = fs::remove_file(path);
+}
+
+// The session event supplies a buffered wake-up. `route_updated` is a
+// shared Notify, so a new session need not leave a notification for this task.
+async fn isolated_identity_republisher() -> (NodeRuntime, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    let mut config = runtime_config_with_listen();
+    config.peers.clear();
+    config.global.builtin_seed_policy = veil_cfg::BuiltinSeedPolicy::Never;
+    config.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+    veil_cfg::save_config(&path, &config).unwrap();
+    let mut rt = NodeRuntime::start(&path, true).await.unwrap();
+    let stopped = rt.take_stop_tasks_context();
+    NodeRuntime::do_stop_tasks(stopped).await;
+    rt.shutdown_tx = Some(tokio::sync::watch::channel(false).0);
+    (rt, dir)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn first_session_event_publishes_without_the_five_second_poll() {
+    let (mut rt, _dir) = isolated_identity_republisher().await;
+    tokio::time::pause();
+    rt.spawn_sovereign_identity_republish_task();
+    // Let the service enter its empty-session wait before the event. The
+    // first-session snapshot is not the only way this check may pass.
+    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    let mut rx = rt.session_tx_registry.write().unwrap().register([0x52; 32]);
+    rt.event_bus.publish(veil_proto::EventPayload {
+        kind: veil_proto::event_kind::SESSIONS_CHANGED,
+        payload: 1u16.to_be_bytes().to_vec(),
+    });
+    // Virtual time: prove that we do not depend on either the 5 s first-peer
+    // poll or even the test build's 3 s periodic warmup. No wall-clock SLA.
+    let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await;
+    tokio::time::resume();
+    rt.stop().await.unwrap();
+    assert!(
+        received.is_ok_and(|frame| frame.is_some()),
+        "session event left the own bundle local until the fallback timer"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn new_session_gets_the_bundle_inside_full_republish_debounce() {
+    let (mut rt, _dir) = isolated_identity_republisher().await;
+    tokio::time::pause();
+    let mut first = rt.session_tx_registry.write().unwrap().register([0x52; 32]);
+    rt.spawn_sovereign_identity_republish_task();
+    // Allow the old implementation's test warmup (3 s) for this control;
+    // the NEW peer below must not then wait through another full debounce.
+    let control = tokio::time::timeout(std::time::Duration::from_secs(4), first.recv()).await;
+    let mut second = rt.session_tx_registry.write().unwrap().register([0x53; 32]);
+    rt.event_bus.publish(veil_proto::EventPayload {
+        kind: veil_proto::event_kind::SESSIONS_CHANGED,
+        payload: 2u16.to_be_bytes().to_vec(),
+    });
+    let received = tokio::time::timeout(std::time::Duration::from_secs(1), second.recv()).await;
+    tokio::time::resume();
+    rt.stop().await.unwrap();
+    assert!(
+        control.is_ok_and(|frame| frame.is_some()),
+        "control first peer must receive the bundle"
+    );
+    assert!(
+        received.is_ok_and(|frame| frame.is_some()),
+        "the second peer was held behind the full-bundle debounce"
+    );
 }

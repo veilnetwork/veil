@@ -50,7 +50,7 @@ pub fn adaptive_republish_interval(
 /// that wake-up as a reason to publish a complete identity bundle again.
 /// Session registrations catch same-peer reconnects even if the routing table
 /// never removes the peer; the DHT revision catches remote membership changes.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ReplicationTopology {
     routing_revision: u64,
     sessions: Vec<([u8; 32], u64)>,
@@ -119,6 +119,9 @@ impl NodeRuntime {
         // `DEBOUNCE_AFTER_PUBLISH` window below — to keep cellular
         // bandwidth + battery cost bounded on cheap Android.
         let route_updated = Arc::clone(&self.dispatcher.route_updated);
+        // Subscribe before spawning: handshakes can finish before the new task
+        // is polled, and shared Notify wakeups are not a first-session witness.
+        let mut sessions_rx = self.event_bus.subscribe();
         let logger = Arc::clone(&self.logger);
         // MlKemCert republish needs the node's own ML-KEM ek to re-sign
         // with a fresh validity window each tick.
@@ -181,7 +184,7 @@ impl NodeRuntime {
             "sovereign_identity_republish",
             async move {
                 let publisher =
-                    crate::identity_local::publisher_dht::DhtBackedPublisher::with_replication(
+                    crate::identity_local::publisher_dht::DhtBackedPublisher::with_topology_replication(
                         dht,
                         session_tx_registry,
                         local_node_id_for_replication,
@@ -287,10 +290,10 @@ impl NodeRuntime {
                 // The startup publish is local-only. A newly started phone can
                 // already have a session while its first contact is trying to
                 // resolve its document and mailbox certificate; waiting the
-                // full 120 s warmup makes that request look lost. Poll only
-                // until the first live session, then pull the complete bundle
-                // publish forward. The topology notification is not a reliable
-                // first-session signal (and used to be debounced at startup).
+                // full 120 s warmup makes that request look lost. Session events
+                // now publish immediately; keep this poll only as a backstop
+                // until the first publication. A shared route Notify alone is
+                // not a reliable first-session signal.
                 let mut first_network_publish_pending = true;
                 let mut first_network_tick = tokio::time::interval_at(
                     tokio::time::Instant::now() + Duration::from_secs(5),
@@ -364,8 +367,24 @@ impl NodeRuntime {
                     std::time::Duration::from_secs(60);
                 let mut last_topology_publish_at: Option<tokio::time::Instant> = None;
                 let mut published_topology: Option<ReplicationTopology> = None;
+                let mut reconciled_topology: Option<ReplicationTopology> = None;
                 let mut pending_topology_at: Option<tokio::time::Instant> = None;
+                let mut pending_placement_at: Option<tokio::time::Instant> = None;
+                // Coalesce real topology events without moving an already set
+                // deadline. A continuous handshake stream cannot starve repair.
+                const PLACEMENT_COALESCE: Duration = Duration::from_millis(100);
+                const PLACEMENT_RETRY: Duration = Duration::from_secs(1);
                 let mut next_publish_reason = "warmup";
+                // A session may predate subscription during startup/reload.
+                if !sessions_for_first_publish
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_empty()
+                {
+                    first_network_publish_pending = false;
+                    next_publish_reason = "first_session";
+                    interval.reset_immediately();
+                }
 
                 loop {
                     tokio::select! {
@@ -397,12 +416,25 @@ impl NodeRuntime {
                         // identity document to the current K-closest so the
                         // freshly-joined peer picks up a replica without
                         // waiting for the next 6 h tick.
-                        _ = route_updated.notified() => {
+                        changed = async {
+                            loop {
+                                tokio::select! {
+                                    _ = route_updated.notified() => break true,
+                                    event = sessions_rx.recv() => match event {
+                                        Ok(ev) if ev.kind == veil_proto::event_kind::SESSIONS_CHANGED => break true,
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break true,
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break false,
+                                        _ => {},
+                                    }
+                                }
+                            }
+                        } => {
+                            if !changed { break; }
                             let now = tokio::time::Instant::now();
                             let topology = ReplicationTopology::snapshot(
                                 &dht_for_density, &sessions_for_first_publish,
                             );
-                            if !topology.needs_publish(published_topology.as_ref()) {
+                            if !topology.needs_publish(reconciled_topology.as_ref().or(published_topology.as_ref())) {
                                 continue;
                             }
                             if first_network_publish_pending {
@@ -415,6 +447,7 @@ impl NodeRuntime {
                             ) {
                                 pending_topology_at = last_topology_publish_at
                                     .map(|last| last + TOPOLOGY_REPUBLISH_DEBOUNCE);
+                                pending_placement_at.get_or_insert(now + PLACEMENT_COALESCE);
                                 continue;
                             }
                             last_topology_publish_at = Some(now);
@@ -450,6 +483,26 @@ impl NodeRuntime {
                             // to cover every record. The debounce above still
                             // bounds the cost under churn.
                             interval.reset_immediately();
+                        }
+                        _ = async {
+                            if let Some(at) = pending_placement_at {
+                                tokio::time::sleep_until(at).await;
+                            }
+                        }, if pending_placement_at.is_some() => {
+                            pending_placement_at = None;
+                            let topology = ReplicationTopology::snapshot(
+                                &dht_for_density, &sessions_for_first_publish,
+                            );
+                            let report = publisher.reconcile_topology();
+                            reconciled_topology = Some(topology);
+                            if report.retry {
+                                pending_placement_at = Some(tokio::time::Instant::now() + PLACEMENT_RETRY);
+                            }
+                            if report.enqueued > 0 {
+                                logger.debug("node.sovereign_identity.placement", format!(
+                                    "enqueued={} retry={}", report.enqueued, report.retry,
+                                ));
+                            }
                         }
                         _ = async {
                             if let Some(at) = pending_topology_at {
@@ -568,9 +621,14 @@ impl NodeRuntime {
                             // complete bundle. Do not consume a changed witness
                             // when its notification was merely debounced.
                             pending_topology_at = None;
+                            publisher.begin_bundle();
                             published_topology = Some(ReplicationTopology::snapshot(
                                 &dht_for_density, &sessions_for_first_publish,
                             ));
+                            reconciled_topology = published_topology.clone();
+                            // Also retry local queue admission failures after a
+                            // full publish, even if no further event arrives.
+                            pending_placement_at = Some(tokio::time::Instant::now() + PLACEMENT_COALESCE);
                             last_topology_publish_at = Some(tokio::time::Instant::now());
                             let monotonic_marker = if veil_session::rt_trace::rt_trace_enabled() {
                                 veil_util::diagnostic_clock::monotonic_us()
