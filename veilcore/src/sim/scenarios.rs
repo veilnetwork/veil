@@ -3783,42 +3783,32 @@ mod tests {
             assert!(ok, "pre-publish: node {i} should have {0} sessions", n - 1);
         }
 
-        // The value MUST be a recognized self-authenticating DHT record: the
-        // recursive-STORE receiver runs `validate_store_value_by_magic` and
-        // drops any payload without a known 2-byte magic prefix (audit cycle-7
-        // / N1 signed-store gate), so an arbitrary blob never replicates. Use
-        // node 0's own IdentityDocument bytes — they carry
-        // IDENTITY_DOCUMENT_MAGIC and structurally decode at the gate.
-        net.node(0)
-            .runtime
-            .debug_republish_sovereign_identity()
-            .await
-            .expect("re-publish sovereign identity into local DHT");
-        let alice_node_id = *net
-            .node(0)
-            .runtime
-            .sovereign_identity()
-            .expect("node 0 sovereign identity")
-            .node_id();
-        let doc_key = crate::proto::identity_document::IdentityDocument::dht_key(&alice_node_id);
-        let value: Vec<u8> = net
-            .node(0)
-            .runtime
-            .dht_get_local(&doc_key)
-            .expect("node 0's IdentityDocument is in its local DHT after republish");
-        // Under its OWN key. This used to publish under an arbitrary one, on
-        // the ground that id-type records passed the key-binding gate for any
-        // key — the pass-through report24 V4-STORE-01 closed, because a write
-        // evicts whatever is in the slot and a record admitted to a slot its
-        // content does not name is how one kind takes another's place.
-        //
-        // What the arbitrary key bought was isolation: nothing else publishes
-        // there, so an arrival could only be this fan-out. The `before` count
-        // below buys the same thing at the canonical key, and the periodic
-        // republish cannot supply it either — this scenario leaves
-        // `republish_interval_secs` at its 1800-second default, while the
-        // scenarios that exercise that path set it to 2.
-        let key = doc_key;
+        // Use a valid record which no running node owns. Startup and
+        // topology-triggered republication already distribute each node's own
+        // document; those arrivals cannot witness this explicit fan-out.
+        // A detached signed document keeps the canonical key-binding gate and
+        // all production maintenance enabled without a competing publisher.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after UNIX epoch")
+            .as_secs();
+        let document = crate::cfg::sovereign_flow::build_standalone_identity_document(
+            &veil_util::sensitive_bytes::SensitiveBytesN::from_bytes([0xD1; 32]),
+            now,
+            now + 7 * 86_400,
+        )
+        .expect("detached signed identity document");
+        veil_identity::verify::verify_identity_document(&document, now)
+            .expect("replicated fixture must pass the full verifier");
+        let key = crate::proto::identity_document::IdentityDocument::dht_key(&document.node_id);
+        let value = document.encode();
+        for i in 0..n {
+            assert_ne!(
+                net.node(i).runtime.sovereign_identity().unwrap().node_id(),
+                &document.node_id,
+                "no runtime may auto-publish the detached fixture",
+            );
+        }
         let before = (1..n)
             .filter(|i| net.node(*i).runtime.debug_dht_raw_value(&key).is_some())
             .count();
