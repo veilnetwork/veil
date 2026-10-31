@@ -9,6 +9,9 @@
   floors awaiting checkpoint under cache pressure and refuse transactional
   restore that would forget revocations learned during native boot.
 - Verify legacy signed sleep notices outside the shared peer-key cache lock.
+- Deliver local identity-document change notices through the bounded interactive
+  TX queue rather than letting best-effort background replication delay or
+  reject a revocation behind unrelated publication records.
 
 - Request a fresh authenticated agreement when a restored ratchet chain uses
   a sender key absent from the current verified certificates for that instance.
