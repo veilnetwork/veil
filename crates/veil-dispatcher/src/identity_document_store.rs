@@ -65,6 +65,12 @@ impl FrameDispatcher {
                     live == current.as_deref()
                 })
             {
+                // This is also a live authorization update, not just DHT
+                // placement. Apply the already verified local document now:
+                // waiting for another app packet leaves native/host device
+                // proofs stale while the new revocation is already stored.
+                // The CAS released the DHT lock before invoking the callback.
+                self.revalidate_peer_certificate(&incoming.node_id);
                 return true;
             }
             if self.dht.get_local(&key) == current {
