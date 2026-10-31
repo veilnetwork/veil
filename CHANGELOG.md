@@ -4,6 +4,13 @@
 
 ## v0.11.47 — 2026-10-31
 
+### Dependencies
+
+- Update libz-sys to 1.1.31 (RUSTSEC-2026-0418) and zstd-sys to 2.1.2
+  (RUSTSEC-2026-0410). Keep the vulnerability gate enabled without exceptions.
+  The former requires cc >=1.6 to expose build environments (this snapshot
+  pins cc 1.2.62); the latter affects wasm32, outside the shipped native targets.
+
 ### Fixed
 
 - Keep file-backed peer authorization fail-closed until its snapshot is
