@@ -80,10 +80,8 @@ impl FrameDispatcher {
             }
 
             SessionMsg::SleepAdvertisement => {
-                // a peer tells us it is about to go offline and
-                // expects to wake up at `expected_wake_ts`. Mailbox hosts
-                // (Gateway/Core) extend per-recipient retention so queued
-                // messages survive the sleep window.
+                // Legacy peer sleep notice; retained for authenticated
+                // observability, with no mailbox-retention side effects.
                 let payload = match SleepAdvertisementPayload::decode(body) {
                     Ok(p) => p,
                     Err(e) => {
@@ -105,8 +103,13 @@ impl FrameDispatcher {
                 // The cache is populated by the OVL1 handshake, so the key
                 // is always available here.
                 {
-                    let cache = lock!(self.crypto.peer_pubkeys);
-                    let (algo_byte, pubkey_bytes) = match cache.get(node_id.as_bytes()) {
+                    // Signature verification must not hold the shared key
+                    // cache lock (in particular for Falcon). Snapshot the
+                    // handshake-authenticated key without weakening validation.
+                    let (algo_byte, pubkey_bytes) = match lock!(self.crypto.peer_pubkeys)
+                        .get(node_id.as_bytes())
+                        .cloned()
+                    {
                         Some(entry) => entry,
                         None => {
                             return DispatchResult::Violation(format!(
@@ -115,7 +118,7 @@ impl FrameDispatcher {
                             ));
                         }
                     };
-                    let algo = if *algo_byte == 2 {
+                    let algo = if algo_byte == 2 {
                         veil_cfg::SignatureAlgorithm::Falcon512
                     } else {
                         veil_cfg::SignatureAlgorithm::Ed25519

@@ -28,7 +28,7 @@
 //! length 0..=4 KiB × random bytes. Combined coverage stays under a
 //! second on a fast machine; the test runs on every `cargo test`.
 //!
-//! Adding a new wire-decode path: append it to `DECODERS` below. CI
+//! Adding a new wire-decode path: append it to `decoders()` below. CI
 //! will then sweep it under the full adversarial battery automatically.
 //!
 //! Strategic context: the dispatcher's `dispatch` function calls
@@ -36,8 +36,9 @@
 //! (see `veilcore/src/node/dispatcher/`). This registry aims to cover EVERY
 //! remote-peer-reachable wire decoder so the dispatcher cannot be panic'd by a
 //! hostile body. It is a maintained allow-list, NOT an automatic guarantee:
-//! a decoder that exists but is missing from `decoders()` is NOT swept, so the
-//! coverage holds only as far as the list is kept in sync. When you add a new
+//! a decoder that exists but is missing from `decoders()` is NOT swept. A
+//! source-inventory guard now detects public inherent `decode` omissions;
+//! macro-generated and nonstandard entrypoints still require review. When you add a new
 //! `decode(&[u8])` on a remote-peer payload, append it below. Out of scope:
 //! `ipc::*` decoders (local, uid-gated loopback — not remote-peer bytes) and
 //! signature-verify paths (covered by their own crates' tests).
@@ -52,9 +53,12 @@ type DecoderFn = fn(&[u8]);
 
 macro_rules! decoder {
     ($payload:path) => {
-        |buf: &[u8]| {
-            let _ = <$payload>::decode(buf);
-        }
+        (
+            stringify!($payload),
+            (|buf: &[u8]| {
+                let _ = <$payload>::decode(buf);
+            }) as DecoderFn,
+        )
     };
 }
 
@@ -65,238 +69,128 @@ macro_rules! decoder {
 fn decoders() -> Vec<(&'static str, DecoderFn)> {
     vec![
         // Session negotiation is reachable before peer authentication.
-        ("HelloPayload", decoder!(p::session::HelloPayload)),
-        ("IdentityPayload", decoder!(p::session::IdentityPayload)),
-        (
-            "CapabilitiesPayload",
-            decoder!(p::session::CapabilitiesPayload),
-        ),
-        (
-            "KeyAgreementPayload",
-            decoder!(p::session::KeyAgreementPayload),
-        ),
-        (
-            "SessionConfirmPayload",
-            decoder!(p::session::SessionConfirmPayload),
-        ),
-        ("AttachPayload", decoder!(p::session::AttachPayload)),
-        ("DetachPayload", decoder!(p::session::DetachPayload)),
-        (
-            "SleepAdvertisementPayload",
-            decoder!(p::session::SleepAdvertisementPayload),
-        ),
-        (
-            "TransportMigrationNotifyPayload",
-            decoder!(p::session::TransportMigrationNotifyPayload),
-        ),
-        ("KeepalivePayload", decoder!(p::session::KeepalivePayload)),
-        ("RekeyPayload", decoder!(p::session::RekeyPayload)),
-        (
-            "MlKemRekeyEkPayload",
-            decoder!(p::session::MlKemRekeyEkPayload),
-        ),
-        (
-            "HybridKexCtPayload",
-            decoder!(p::session::HybridKexCtPayload),
-        ),
-        (
-            "HandoffInitPayload",
-            decoder!(p::session::HandoffInitPayload),
-        ),
-        ("HandoffAckPayload", decoder!(p::session::HandoffAckPayload)),
-        (
-            "HandoffAttachPayload",
-            decoder!(p::session::HandoffAttachPayload),
-        ),
-        (
-            "HandoffChallengePayload",
-            decoder!(p::session::HandoffChallengePayload),
-        ),
-        (
-            "HandoffResponsePayload",
-            decoder!(p::session::HandoffResponsePayload),
-        ),
+        decoder!(p::session::HelloPayload),
+        decoder!(p::session::IdentityPayload),
+        decoder!(p::session::CapabilitiesPayload),
+        decoder!(p::session::KeyAgreementPayload),
+        decoder!(p::session::SessionConfirmPayload),
+        decoder!(p::session::AttachPayload),
+        decoder!(p::session::DetachPayload),
+        decoder!(p::session::SleepAdvertisementPayload),
+        decoder!(p::session::TransportMigrationNotifyPayload),
+        decoder!(p::session::KeepalivePayload),
+        decoder!(p::session::RekeyPayload),
+        decoder!(p::session::MlKemRekeyEkPayload),
+        decoder!(p::session::HybridKexCtPayload),
+        decoder!(p::session::HandoffInitPayload),
+        decoder!(p::session::HandoffAckPayload),
+        decoder!(p::session::HandoffAttachPayload),
+        decoder!(p::session::HandoffChallengePayload),
+        decoder!(p::session::HandoffResponsePayload),
         // ── anycast ────────────────────────────────────────────────────
-        ("AnycastRecord", decoder!(p::anycast::AnycastRecord)),
-        ("AnycastList", decoder!(p::anycast::AnycastList)),
-        (
-            "AnycastResolvePayload",
-            decoder!(p::anycast::AnycastResolvePayload),
-        ),
-        (
-            "AnycastResultPayload",
-            decoder!(p::anycast::AnycastResultPayload),
-        ),
-        (
-            "AnycastAdvertisePayload",
-            decoder!(p::anycast::AnycastAdvertisePayload),
-        ),
-        (
-            "AnycastWithdrawPayload",
-            decoder!(p::anycast::AnycastWithdrawPayload),
-        ),
+        decoder!(p::anycast::AnycastRecord),
+        decoder!(p::anycast::AnycastList),
+        decoder!(p::anycast::AnycastResolvePayload),
+        decoder!(p::anycast::AnycastResultPayload),
+        decoder!(p::anycast::AnycastAdvertisePayload),
+        decoder!(p::anycast::AnycastWithdrawPayload),
         // ── app (LocalApp / veil App frames) ────────────────────────
-        ("AppOpenPayload", decoder!(p::app::AppOpenPayload)),
-        ("AppDataPayload", decoder!(p::app::AppDataPayload)),
-        ("AppClosePayload", decoder!(p::app::AppClosePayload)),
-        ("AppSendPayload", decoder!(p::app::AppSendPayload)),
+        decoder!(p::app::AppOpenPayload),
+        decoder!(p::app::AppDataPayload),
+        decoder!(p::app::AppClosePayload),
+        decoder!(p::app::AppSendPayload),
         // ── control (live in `control.rs`, not `routing.rs`) ──────────
-        (
-            "NeighborOfferPayload",
-            decoder!(p::control::NeighborOfferPayload),
-        ),
-        ("RouteProbePayload", decoder!(p::control::RouteProbePayload)),
-        ("RouteReplyPayload", decoder!(p::control::RouteReplyPayload)),
-        (
-            "NatProbeRequestPayload",
-            decoder!(p::control::NatProbeRequestPayload),
-        ),
-        (
-            "NatProbeReplyPayload",
-            decoder!(p::control::NatProbeReplyPayload),
-        ),
-        (
-            "NatRelayRequestPayload",
-            decoder!(p::control::NatRelayRequestPayload),
-        ),
+        decoder!(p::control::NeighborOfferPayload),
+        decoder!(p::control::RouteProbePayload),
+        decoder!(p::control::RouteReplyPayload),
+        decoder!(p::control::NatProbeRequestPayload),
+        decoder!(p::control::NatProbeReplyPayload),
+        decoder!(p::control::NatRelayRequestPayload),
         // ── delivery ───────────────────────────────────────────────────
-        ("ForwardPayload", decoder!(p::delivery::ForwardPayload)),
-        (
-            "DeliveryStatusPayload",
-            decoder!(p::delivery::DeliveryStatusPayload),
-        ),
+        decoder!(p::delivery::ForwardPayload),
+        decoder!(p::delivery::DeliveryStatusPayload),
         // ── discovery (signed DHT records + IPC payloads) ─────────────
-        (
-            "AnnounceAttachmentPayload",
-            decoder!(p::discovery::AnnounceAttachmentPayload),
-        ),
-        (
-            "GetAttachmentPayload",
-            decoder!(p::discovery::GetAttachmentPayload),
-        ),
-        (
-            "GetAppEndpointPayload",
-            decoder!(p::discovery::GetAppEndpointPayload),
-        ),
-        (
-            "FindNodeV2Payload",
-            decoder!(p::discovery::FindNodeV2Payload),
-        ),
-        (
-            "ResolveTransportPayload",
-            decoder!(p::discovery::ResolveTransportPayload),
-        ),
-        ("FindValuePayload", decoder!(p::discovery::FindValuePayload)),
-        ("StorePayload", decoder!(p::discovery::StorePayload)),
-        ("DeletePayload", decoder!(p::discovery::DeletePayload)),
+        decoder!(p::discovery::AnnounceAttachmentPayload),
+        decoder!(p::discovery::GetAttachmentPayload),
+        decoder!(p::discovery::GetAppEndpointPayload),
+        decoder!(p::discovery::FindNodeV2Payload),
+        decoder!(p::discovery::ResolveTransportPayload),
+        decoder!(p::discovery::FindValuePayload),
+        decoder!(p::discovery::StorePayload),
+        decoder!(p::discovery::DeletePayload),
         // ── routing ────────────────────────────────────────────────────
-        (
-            "RouteAnnouncePayload",
-            decoder!(p::routing::RouteAnnouncePayload),
-        ),
-        (
-            "RouteWithdrawPayload",
-            decoder!(p::routing::RouteWithdrawPayload),
-        ),
-        (
-            "RouteRequestPayload",
-            decoder!(p::routing::RouteRequestPayload),
-        ),
-        (
-            "RouteResponsePayload",
-            decoder!(p::routing::RouteResponsePayload),
-        ),
-        (
-            "PowChallengePayload",
-            decoder!(p::routing::PowChallengePayload),
-        ),
-        (
-            "PowResponsePayload",
-            decoder!(p::routing::PowResponsePayload),
-        ),
-        ("PowAcceptPayload", decoder!(p::routing::PowAcceptPayload)),
-        (
-            "RecursiveQueryPayload",
-            decoder!(p::routing::RecursiveQueryPayload),
-        ),
-        (
-            "RecursiveResponsePayload",
-            decoder!(p::routing::RecursiveResponsePayload),
-        ),
-        (
-            "RouteDiscoverOfferPayload",
-            decoder!(p::routing::RouteDiscoverOfferPayload),
-        ),
-        (
-            "RouteAnnounceAliasedPayload",
-            decoder!(p::routing::RouteAnnounceAliasedPayload),
-        ),
-        (
-            "RouteWithdrawAliasedPayload",
-            decoder!(p::routing::RouteWithdrawAliasedPayload),
-        ),
+        decoder!(p::routing::RouteAnnouncePayload),
+        decoder!(p::routing::RouteWithdrawPayload),
+        decoder!(p::routing::RouteRequestPayload),
+        decoder!(p::routing::RouteResponsePayload),
+        decoder!(p::routing::PowChallengePayload),
+        decoder!(p::routing::PowResponsePayload),
+        decoder!(p::routing::PowAcceptPayload),
+        decoder!(p::routing::RecursiveQueryPayload),
+        decoder!(p::routing::RecursiveResponsePayload),
+        decoder!(p::routing::RouteDiscoverOfferPayload),
+        decoder!(p::routing::RouteAnnounceAliasedPayload),
+        decoder!(p::routing::RouteWithdrawAliasedPayload),
         // ── identity / sovereign-identity wire types ───────────────────
-        (
-            "IdentityDocument",
-            decoder!(p::identity_document::IdentityDocument),
-        ),
-        (
-            "InstanceRegistry",
-            decoder!(p::instance_registry::InstanceRegistry),
-        ),
-        ("NameClaim", decoder!(p::name_claim_v2::NameClaim)),
-        ("IdentityProof", decoder!(p::identity_proof::IdentityProof)),
-        ("PairingInvite", decoder!(p::pairing_invite::PairingInvite)),
-        ("MlKemKeyCert", decoder!(p::mlkem_cert::MlKemKeyCert)),
+        decoder!(p::identity_document::IdentityDocument),
+        decoder!(p::instance_registry::InstanceRegistry),
+        decoder!(p::name_claim_v2::NameClaim),
+        decoder!(p::identity_proof::IdentityProof),
+        decoder!(p::pairing_invite::PairingInvite),
+        decoder!(p::mlkem_cert::MlKemKeyCert),
         // ── e2e / mailbox / pex / mesh / epidemic ──────────────────────
-        ("EpidemicPayload", decoder!(p::epidemic::EpidemicPayload)),
-        ("E2eEnvelope", decoder!(p::e2e::E2eEnvelope)),
-        ("RelayChainHop", decoder!(p::relay_chain::RelayChainHop)),
+        decoder!(p::epidemic::EpidemicPayload),
+        decoder!(p::e2e::E2eEnvelope),
+        decoder!(p::relay_chain::RelayChainHop),
         // ── pex (random-walk peer exchange) ────────────────────────────
-        ("PexWalk", decoder!(p::pex::PexWalk)),
-        ("PexChallenge", decoder!(p::pex::PexChallenge)),
-        ("PexResponse", decoder!(p::pex::PexResponse)),
-        ("PexPeer", decoder!(p::pex::PexPeer)),
-        ("PexResult", decoder!(p::pex::PexResult)),
+        decoder!(p::pex::PexWalk),
+        decoder!(p::pex::PexChallenge),
+        decoder!(p::pex::PexResponse),
+        decoder!(p::pex::PexPeer),
+        decoder!(p::pex::PexResult),
         // ── delivery (nested relay/transit/chunk payloads) ─────────────
-        ("DeliveryEnvelope", decoder!(p::delivery::DeliveryEnvelope)),
-        (
-            "ChunkedEnvelopePayload",
-            decoder!(p::delivery::ChunkedEnvelopePayload),
-        ),
-        (
-            "TransitFramePayload",
-            decoder!(p::delivery::TransitFramePayload),
-        ),
-        (
-            "RecursiveRelayPayload",
-            decoder!(p::delivery::RecursiveRelayPayload),
-        ),
-        ("RelayPathPayload", decoder!(p::delivery::RelayPathPayload)),
+        decoder!(p::delivery::DeliveryEnvelope),
+        decoder!(p::delivery::ChunkedEnvelopePayload),
+        decoder!(p::delivery::TransitFramePayload),
+        decoder!(p::delivery::RecursiveRelayPayload),
+        decoder!(p::delivery::RelayPathPayload),
         // ── mesh (realm beacon/ack/frame) ──────────────────────────────
-        ("MeshFrame", decoder!(p::mesh::MeshFrame)),
-        ("MeshBeaconPayload", decoder!(p::mesh::MeshBeaconPayload)),
-        ("MeshAckPayload", decoder!(p::mesh::MeshAckPayload)),
+        decoder!(p::mesh::MeshFrame),
+        decoder!(p::mesh::MeshBeaconPayload),
+        decoder!(p::mesh::MeshAckPayload),
         // ── rendezvous (ephemeral endpoint) ────────────────────────────
-        (
-            "RequestEphemeralEndpointPayload",
-            decoder!(p::rendezvous::RequestEphemeralEndpointPayload),
-        ),
-        (
-            "EphemeralEndpointResponsePayload",
-            decoder!(p::rendezvous::EphemeralEndpointResponsePayload),
-        ),
+        decoder!(p::rendezvous::RequestEphemeralEndpointPayload),
+        decoder!(p::rendezvous::EphemeralEndpointResponsePayload),
         // ── diag (ping/trace) ──────────────────────────────────────────
-        ("DiagPingPayload", decoder!(p::diag::DiagPingPayload)),
-        ("DiagPongPayload", decoder!(p::diag::DiagPongPayload)),
-        (
-            "DiagTraceProbePayload",
-            decoder!(p::diag::DiagTraceProbePayload),
-        ),
-        (
-            "DiagTraceHopPayload",
-            decoder!(p::diag::DiagTraceHopPayload),
-        ),
+        decoder!(p::diag::DiagPingPayload),
+        decoder!(p::diag::DiagPongPayload),
+        decoder!(p::diag::DiagTraceProbePayload),
+        decoder!(p::diag::DiagTraceHopPayload),
+        decoder!(p::anycast::AnycastReportFailurePayload),
+        decoder!(p::app::AppReceiptPayload),
+        decoder!(p::app::AppWindowUpdatePayload),
+        decoder!(p::app::AppRtDataPayload),
+        decoder!(p::discovery::EpochDifficultyRecord),
+        decoder!(p::discovery::GatewayRef),
+        decoder!(p::discovery::AttachmentResponse),
+        decoder!(p::discovery::AppEndpointResponse),
+        decoder!(p::discovery::NodeContact),
+        decoder!(p::discovery::FindNodeResponse),
+        decoder!(p::discovery::FindNodeV2Response),
+        decoder!(p::discovery::SignedTransportAnnouncement),
+        decoder!(p::discovery::ResolveTransportResponse),
+        decoder!(p::discovery::FindValueResponse),
+        decoder!(p::discovery::DhtValue),
+        decoder!(p::introducer::IntroduceRequest),
+        decoder!(p::pair_session::PairingHello),
+        decoder!(p::pair_session::PairingCert),
+        decoder!(p::pair_session::PairingConfirm),
+        decoder!(p::prekey_bundle::PrekeyBundle),
+        decoder!(p::recipient::Recipient),
+        decoder!(p::relay_key::RelayKeyRecord),
+        decoder!(p::routing::RouteDiscoveryPacket),
+        decoder!(p::session::SessionTicket),
+        decoder!(p::transport_hints::TransportHintResultPayload),
         // ── recipient (offset-based decode_from) ───────────────────────
         ("Recipient::decode_from", |buf: &[u8]| {
             let mut pos = 0usize;
@@ -365,6 +259,78 @@ fn adversarial_inputs() -> Vec<(&'static str, Vec<u8>)> {
     }
 
     out
+}
+
+/// Catch registry drift without a fragile count or hand-written second list.
+/// Parse inherent public decode methods from production source. The only
+/// module exemptions are local IPC, whose authenticated-host scope is stated
+/// above; every other one-slice decoder must be executable in the sweep.
+#[test]
+fn every_public_wire_decode_is_registered() {
+    use std::collections::BTreeSet;
+    fn collect(items: &[syn::Item], prefix: &str, found: &mut BTreeSet<String>) {
+        for item in items {
+            match item {
+                syn::Item::Mod(module) => {
+                    if module.attrs.iter().any(|a| {
+                        a.path().is_ident("cfg")
+                            && a.parse_args::<syn::Path>()
+                                .is_ok_and(|p| p.is_ident("test"))
+                    }) {
+                        continue;
+                    }
+                    if let Some((_, items)) = &module.content {
+                        collect(items, &format!("{prefix}::{}", module.ident), found);
+                    }
+                }
+                syn::Item::Impl(implementation) if implementation.trait_.is_none() => {
+                    let syn::Type::Path(ty) = implementation.self_ty.as_ref() else {
+                        continue;
+                    };
+                    for item in &implementation.items {
+                        let syn::ImplItem::Fn(method) = item else {
+                            continue;
+                        };
+                        if method.sig.ident != "decode"
+                            || !matches!(method.vis, syn::Visibility::Public(_))
+                        {
+                            continue;
+                        }
+                        assert_eq!(
+                            method.sig.inputs.len(),
+                            1,
+                            "classify new decoder signature explicitly"
+                        );
+                        let name = ty.path.segments.last().unwrap().ident.to_string();
+                        found.insert(format!("p::{prefix}::{name}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut source = BTreeSet::new();
+    for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let module = path.file_stem().unwrap().to_str().unwrap();
+        if matches!(module, "ipc" | "ipc_lossy_batch") {
+            continue;
+        }
+        let parsed = syn::parse_file(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        collect(&parsed.items, module, &mut source);
+    }
+    let registry: BTreeSet<_> = decoders()
+        .into_iter()
+        .map(|(name, _)| name.to_owned())
+        .collect();
+    let missing: Vec<_> = source.difference(&registry).collect();
+    assert!(
+        missing.is_empty(),
+        "wire decoders absent from executable panic sweep: {missing:?}"
+    );
 }
 
 #[test]
