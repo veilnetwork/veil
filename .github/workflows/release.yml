@@ -41,6 +41,11 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
     inputs:
+      source_ref:
+        description: 'Existing immutable v* source tag to rebuild; empty uses the event ref.'
+        required: false
+        type: string
+        default: ''
       version:
         description: 'Semver string (e.g. 1.2.3) — must match a git tag if release_existing.'
         required: true
@@ -107,7 +112,7 @@ jobs:
             runner: ubuntu-latest
             cross_linker: aarch64-linux-gnu-gcc
           - triple: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
           - triple: x86_64-pc-windows-msvc
             runner: windows-latest
             is_windows: true
@@ -125,6 +130,26 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_ref || github.ref }}
+
+      - name: Verify immutable source
+        if: inputs.source_ref != ''
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "source_ref must be an existing version tag"; exit 1; }
+          expected="$(git rev-parse "$SOURCE_REF^{commit}")"
+          [[ "$SOURCE_REF" == "$RELEASE_TAG" ]] || { echo "source_ref must match the release version"; exit 1; }
+          actual="$(git rev-parse HEAD)"
+          [[ "$actual" == "$expected" ]] || { echo "checkout does not match source_ref"; exit 1; }
+          echo "verified_source=$actual"
+
+      - name: Set the macOS deployment target to 12.0
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo 'MACOSX_DEPLOYMENT_TARGET=12.0' >> "$GITHUB_ENV"
 
       - name: Compute SOURCE_DATE_EPOCH from HEAD
         id: epoch
@@ -348,6 +373,22 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+
+      - name: Verify immutable source
+        if: inputs.source_ref != ''
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "source_ref must be an existing version tag"; exit 1; }
+          expected="$(git rev-parse "$SOURCE_REF^{commit}")"
+          [[ "$SOURCE_REF" == "$RELEASE_TAG" ]] || { echo "source_ref must match the release version"; exit 1; }
+          actual="$(git rev-parse HEAD)"
+          [[ "$actual" == "$expected" ]] || { echo "checkout does not match source_ref"; exit 1; }
+          echo "verified_source=$actual"
 
       - name: Download all artifacts
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
