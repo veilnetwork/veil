@@ -478,6 +478,18 @@ impl NodeRuntime {
         // publishers (session insert/remove sites + MobileEventForwarder)
         // share the same Arc so every event reaches every connected app.
         let event_bus: Arc<veil_ipc::EventBus> = Arc::clone(&self.event_bus);
+        let authorization_bus = Arc::downgrade(&event_bus);
+        self.identity
+            .peer_mlkem_cert_store
+            .document_floor
+            .set_host_change_notifier(Arc::new(move || {
+                if let Some(bus) = authorization_bus.upgrade() {
+                    bus.publish(veil_proto::EventPayload {
+                        kind: veil_proto::event_kind::PEER_AUTHORIZATION_CHANGED,
+                        payload: Vec::new(),
+                    });
+                }
+            }));
         server = server.with_event_bus(Arc::clone(&event_bus));
         // 489.5: install mobile-event sink so apps can
         // toggle background mode and notify network-state changes via IPC.

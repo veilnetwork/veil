@@ -6200,6 +6200,10 @@ pub mod event_kind {
     /// poll back-off. Best-effort hint — a missed wake only delays the next
     /// scheduled drain, never loses the deposit. Payload: empty.
     pub const MAILBOX_WAKE: u8 = 5;
+    /// Host-owned peer authorization changed. Local IPC wake hint only;
+    /// empty payload, no peer identifiers or authority. The host still must
+    /// export, durably store and ACK the exact native snapshot revision.
+    pub const PEER_AUTHORIZATION_CHANGED: u8 = 6;
 }
 
 /// Payload [`crate::family::LocalAppMsg::Event`].
