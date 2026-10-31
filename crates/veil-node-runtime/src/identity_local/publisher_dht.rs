@@ -290,9 +290,11 @@ fn encode_replication(local_node_id: [u8; 32], dht_key: [u8; 32], value: Vec<u8>
 /// nodes are closest to its DHT slot. A recursive STORE may forward elsewhere
 /// without updating a leaf's local mirror; that leaves its warm certificate
 /// cache accepting a device the owner has just revoked. Use the existing
-/// direct STORE format and ordinary paced local replication, with no new
-/// relay class or application hint. The receiver still verifies the signed
-/// document before granting any sender authority.
+/// direct STORE format and the bounded interactive TX queue. A revocation
+/// notice is security control for an existing peer, not best-effort DHT
+/// placement: the background publication queue can delay it for a minute or
+/// refuse it behind unrelated records. Media retains its higher priority.
+/// The receiver still verifies the document before changing authorization.
 pub(crate) fn notify_live_identity_verifiers(
     registry: &Arc<RwLock<SessionTxRegistry>>,
     local_device: [u8; 32],
@@ -317,7 +319,13 @@ pub(crate) fn notify_live_identity_verifiers(
     peers
         .into_iter()
         .filter(|peer| *peer != local_device)
-        .filter(|peer| SessionTxRegistry::send_local_replication(registry, *peer, frame.clone()))
+        .filter(|peer| {
+            registry.read().unwrap_or_else(|p| p.into_inner()).send_to(
+                peer,
+                veil_proto::priority::INTERACTIVE,
+                frame.clone(),
+            )
+        })
         .count()
 }
 
@@ -445,6 +453,41 @@ mod tests {
             );
             assert_eq!(stored.value, document.encode());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn document_update_is_not_lost_behind_best_effort_replication() {
+        let document = crate::mlkem_cert_store::fixture::signer(0x31).doc;
+        let peer = [2; 32];
+        let mut registry = SessionTxRegistry::new();
+        let mut receiver = registry.register(peer);
+        let registry = Arc::new(RwLock::new(registry));
+        assert!(SessionTxRegistry::send_local_replication(
+            &registry,
+            peer,
+            vec![0; 8192],
+        ));
+        // The first background record starts the pacing interval. Queue
+        // enough unrelated publication behind it to exhaust admission; no
+        // virtual time is advanced and no timing threshold is asserted.
+        receiver.recv().await.unwrap();
+        let mut queued = 0;
+        while SessionTxRegistry::send_local_replication(&registry, peer, vec![0; 8192]) {
+            queued += 1;
+            assert!(queued <= 64);
+        }
+        assert!(queued > 0);
+        assert_eq!(
+            notify_live_identity_verifiers(&registry, [1; 32], &document),
+            1
+        );
+        let (priority, frame) = receiver
+            .try_recv()
+            .expect("security update reaches the live TX queue");
+        assert_eq!(priority, veil_proto::priority::INTERACTIVE);
+        let payload =
+            veil_proto::discovery::StorePayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+        assert_eq!(payload.value, document.encode());
     }
 
     #[tokio::test]
