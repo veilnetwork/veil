@@ -8,6 +8,9 @@
   durable, including retry notification after a failed write. Preserve host
   floors awaiting checkpoint under cache pressure and refuse transactional
   restore that would forget revocations learned during native boot.
+- Recheck the live authorization floor before returning asynchronous family
+  certificate results, so a revocation received during the network walk
+  cannot be bypassed by its old document snapshot.
 - Verify legacy signed sleep notices outside the shared peer-key cache lock.
 - Deliver local identity-document change notices through the bounded interactive
   TX queue rather than letting best-effort background replication delay or

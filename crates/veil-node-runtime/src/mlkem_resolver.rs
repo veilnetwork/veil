@@ -1595,6 +1595,16 @@ impl DhtMlKemEkResolver {
                 CertRecall::Absent => out.unknown_devices += 1,
             }
         }
+        // The document above is a snapshot taken before several independent
+        // network waits. A verified revocation can arrive while they are in
+        // flight. Do not return an old-document certificate as authority for
+        // a new outgoing copy after the live floor has retired its device.
+        self.refresh_local_document(target_node_id);
+        out.certs.retain(|cert| {
+            self.cert_store
+                .document_floor
+                .allows_cert(&target_node_id, cert, unix_now())
+        });
         self.logger.debug(
             "mlkem_resolver.resolved_all",
             format!(
@@ -3846,8 +3856,8 @@ mod tests {
         assert!(rlock!(resolver.instance_cert_cache).is_empty());
     }
 
-    #[test]
-    fn a_new_document_retires_warm_sender_keys_without_waiting_for_certificate_ttl() {
+    #[tokio::test]
+    async fn a_new_document_retires_warm_sender_keys_without_waiting_for_certificate_ttl() {
         use crate::mlkem_cert_store::fixture::signer;
         use ed25519_dalek::{Signer as _, SigningKey};
         use veil_crypto::identity::{certify_message, compute_node_id};
@@ -3936,6 +3946,15 @@ mod tests {
             );
         }
         assert!(rlock!(resolver.peer_ratchet_keys)[&target].names_instance(&b_instance, now));
+        // A family walk captured the old document and is waiting for a remote
+        // certificate when a signed revocation arrives on another task.
+        let mut rx = wlock!(resolver.session_tx_registry).register([0x91; 32]);
+        let entries = [entry(b_instance)];
+        let mut pending_family =
+            Box::pin(resolver.certs_for_instances(target, &old, &entries, now));
+        assert!(poll_family_to_stall(pending_family.as_mut()).is_pending());
+        let (_, frame) = rx.try_recv().expect("certificate lookup admitted");
+        let query = RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
         let mut current = old.clone();
         current.issued_at_unix = now;
         current.identity_keys.pop(); // canonical documents remove revoked live rows
@@ -3955,6 +3974,19 @@ mod tests {
                 .is_none()
         );
         assert!(!rlock!(resolver.peer_ratchet_keys)[&target].names_instance(&b_instance, now));
+        lock!(resolver.pending_recursive)
+            .remove(&query.query_id)
+            .unwrap()
+            .tx
+            .send(
+                dht.get_local(&MlKemKeyCert::dht_key(&target, &b_instance))
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            pending_family.await.certs.is_empty(),
+            "a delayed family result must not authorize a device revoked during its await"
+        );
         assert!(
             resolver
                 .resolve_cert_for_instance_cached(target, a_instance)
