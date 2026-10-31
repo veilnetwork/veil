@@ -45,7 +45,9 @@
 //! [`FrameBroadcaster`]: veil_types::FrameBroadcaster
 //! [`DHT_REPLICATION_K`]: veil_proto::budget::DHT_REPLICATION_K
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+
+mod placement;
 
 use async_trait::async_trait;
 
@@ -75,6 +77,7 @@ pub struct DhtBackedPublisher {
     /// recursive query and as the self-skip filter so we don't try
     /// to STORE-fan-out to ourselves.
     local_node_id: [u8; 32],
+    placement: Option<Mutex<placement::PlacementTracker>>,
 }
 
 impl DhtBackedPublisher {
@@ -86,6 +89,7 @@ impl DhtBackedPublisher {
             dht,
             session_tx_registry: None,
             local_node_id: [0u8; 32],
+            placement: None,
         }
     }
 
@@ -103,6 +107,35 @@ impl DhtBackedPublisher {
             dht,
             session_tx_registry: Some(session_tx_registry),
             local_node_id,
+            placement: None,
+        }
+    }
+
+    /// The sovereign maintenance task may repair placement without re-signing
+    /// or re-sending the entire bundle to every unchanged neighbor.
+    pub(crate) fn with_topology_replication(
+        dht: Arc<KademliaService>,
+        registry: Arc<RwLock<SessionTxRegistry>>,
+        local: [u8; 32],
+    ) -> Self {
+        let mut publisher = Self::with_replication(dht, registry, local);
+        publisher.placement = Some(Mutex::new(placement::PlacementTracker::default()));
+        publisher
+    }
+
+    pub(crate) fn begin_bundle(&self) {
+        if let Some(tracker) = &self.placement {
+            tracker.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        }
+    }
+
+    pub(crate) fn reconcile_topology(&self) -> placement::PlacementReport {
+        match (&self.placement, &self.session_tx_registry) {
+            (Some(tracker), Some(registry)) => tracker
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .reconcile(&self.dht, registry, self.local_node_id),
+            _ => placement::PlacementReport::default(),
         }
     }
 }
@@ -120,6 +153,17 @@ impl IdentityPublisher for DhtBackedPublisher {
         // (no-op until peers exist). Delegated to the shared sync helper so the
         // rendezvous-ad maintenance publish replicates the same way.
         if let Some(ref tx_reg) = self.session_tx_registry {
+            if let Some(tracker) = &self.placement
+                && tracker.lock().unwrap_or_else(|p| p.into_inner()).publish(
+                    dht_key,
+                    &value,
+                    &self.dht,
+                    tx_reg,
+                    self.local_node_id,
+                )
+            {
+                return Ok(());
+            }
             replicate_dht_value(&self.dht, tx_reg, self.local_node_id, dht_key, value);
         }
         Ok(())
@@ -138,6 +182,24 @@ pub(crate) fn replicate_dht_value(
     dht_key: [u8; 32],
     value: Vec<u8>,
 ) {
+    let candidates = replication_targets(dht, tx_reg, local_node_id, dht_key);
+    if candidates.is_empty() {
+        return;
+    }
+    let frame = encode_replication(local_node_id, dht_key, value);
+    // Own best-effort records retain the same aggregate paced BACKGROUND
+    // queue; interactive resolves and opaque relay transit are untouched.
+    for peer in candidates {
+        let _ = SessionTxRegistry::send_local_replication(tx_reg, peer, frame.clone());
+    }
+}
+
+fn replication_targets(
+    dht: &Arc<KademliaService>,
+    tx_reg: &Arc<RwLock<SessionTxRegistry>>,
+    local_node_id: [u8; 32],
+    dht_key: [u8; 32],
+) -> Vec<[u8; 32]> {
     let candidates_with_uri = dht
         .find_closest_with_transport(&dht_key, veil_proto::budget::DHT_REPLICATION_K)
         .into_iter()
@@ -192,14 +254,10 @@ pub(crate) fn replicate_dht_value(
         }
         candidates
     };
-    // A phone can connect to its first seed before its DHT routing table has
-    // learned that peer. The active session is already a valid STORE path;
-    // returning on an empty closest-set above left all startup identity and
-    // mailbox records local until the next republish.
-    if candidates.is_empty() {
-        return;
-    }
+    candidates
+}
 
+fn encode_replication(local_node_id: [u8; 32], dht_key: [u8; 32], value: Vec<u8>) -> Vec<u8> {
     // Build the RecursiveQuery(STORE) frame once.
     let query_id: [u8; 16] = {
         use rand_core::RngCore;
@@ -225,28 +283,7 @@ pub(crate) fn replicate_dht_value(
     let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
     frame.extend_from_slice(&q_bytes);
 
-    // Fan-out — fire-and-forget. Peers without a direct session are silently
-    // skipped; the STORE forwards greedily on receivers we DO have sessions to.
-    //
-    // Paced local BACKGROUND publications. Nothing waits on this: it republishes a
-    // record we already hold, on a half-life cadence with hours of slack, and
-    // the call does not even read the outcome. INTERACTIVE bought it nothing
-    // and cost something — the outbound coalescer only packs when the queue
-    // HEAD is BULK or BACKGROUND, so an interactive republish at the head
-    // switches packing off for that drain pass and every frame behind it pays
-    // its own padding bucket.
-    //
-    // Measured 23.08 on an idle phone: 260 bytes of framing and padding per
-    // frame against 190 B/s of bodies on one seed link — about twice the
-    // payload. 84 of the 99 send sites in the dispatcher and runtime pass
-    // INTERACTIVE, so the classification had become a default rather than a
-    // statement, and the coalescer's gate could almost never open.
-    //
-    // Send-path DHT lookups keep INTERACTIVE: a resolve in service of an
-    // actual send IS latency-sensitive. This one is not.
-    for peer in candidates {
-        let _ = SessionTxRegistry::send_local_replication(tx_reg, peer, frame.clone());
-    }
+    frame
 }
 
 /// Notify connected verifiers of a document change, independently of which
