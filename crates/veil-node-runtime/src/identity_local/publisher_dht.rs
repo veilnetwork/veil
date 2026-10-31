@@ -300,6 +300,35 @@ pub(crate) fn notify_live_identity_verifiers(
     local_device: [u8; 32],
     document: &veil_proto::identity_document::IdentityDocument,
 ) -> usize {
+    let frame = identity_document_notice(document);
+    let peers = registry
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .peer_ids();
+    let registry = registry.read().unwrap_or_else(|p| p.into_inner());
+    peers
+        .into_iter()
+        .filter(|peer| *peer != local_device)
+        .filter(|peer| registry.send_to(peer, veil_proto::priority::INTERACTIVE, frame.clone()))
+        .count()
+}
+
+/// A peer that connects after reload missed the one-shot fanout. Send only to
+/// that newly admitted peer, rather than replaying the bundle to all neighbors
+/// on every topology change. This is local admission, not remote receipt.
+pub(crate) fn notify_new_identity_verifier(
+    registry: &Arc<RwLock<SessionTxRegistry>>,
+    peer: &[u8; 32],
+    document: &veil_proto::identity_document::IdentityDocument,
+) -> bool {
+    registry.read().unwrap_or_else(|p| p.into_inner()).send_to(
+        peer,
+        veil_proto::priority::INTERACTIVE,
+        identity_document_notice(document),
+    )
+}
+
+fn identity_document_notice(document: &veil_proto::identity_document::IdentityDocument) -> Vec<u8> {
     let body = veil_proto::discovery::StorePayload::unsigned(
         veil_proto::identity_document::IdentityDocument::dht_key(&document.node_id),
         document.encode(),
@@ -312,21 +341,7 @@ pub(crate) fn notify_live_identity_verifiers(
     header.body_len = body.len() as u32;
     let mut frame = veil_proto::codec::encode_header(&header).to_vec();
     frame.extend_from_slice(&body);
-    let peers = registry
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .peer_ids();
-    peers
-        .into_iter()
-        .filter(|peer| *peer != local_device)
-        .filter(|peer| {
-            registry.read().unwrap_or_else(|p| p.into_inner()).send_to(
-                peer,
-                veil_proto::priority::INTERACTIVE,
-                frame.clone(),
-            )
-        })
-        .count()
+    frame
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -488,6 +503,26 @@ mod tests {
         let payload =
             veil_proto::discovery::StorePayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
         assert_eq!(payload.value, document.encode());
+    }
+
+    #[tokio::test]
+    async fn reconnect_notice_targets_only_the_new_peer() {
+        let doc = crate::mlkem_cert_store::fixture::signer(0x32).doc;
+        let mut registry = SessionTxRegistry::new();
+        let mut existing = registry.register([2; 32]);
+        let mut newcomer = registry.register([3; 32]);
+        let registry = Arc::new(RwLock::new(registry));
+        assert!(notify_new_identity_verifier(&registry, &[3; 32], &doc));
+        assert!(
+            existing.try_recv().is_err(),
+            "a new session must not trigger global fanout"
+        );
+        let (priority, bytes) = newcomer.try_recv().unwrap();
+        assert_eq!(priority, veil_proto::priority::INTERACTIVE);
+        let stored =
+            veil_proto::discovery::StorePayload::decode(&bytes[veil_proto::HEADER_SIZE..]).unwrap();
+        assert_eq!(stored.value, doc.encode());
+        assert!(!notify_new_identity_verifier(&registry, &[4; 32], &doc));
     }
 
     #[tokio::test]

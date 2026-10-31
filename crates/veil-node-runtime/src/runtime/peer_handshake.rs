@@ -1448,6 +1448,19 @@ pub async fn register_connection_session(
         .as_ref()
         .map(|v| v.active_instance_id);
     lock!(runtime.session_registry).insert(session_entry);
+    // A peer may reconnect just after a device was revoked. It missed the
+    // reload-time notice and its warm certificate cache can still endorse the
+    // removed device. Queue the CURRENT local document at session admission;
+    // the receiver verifies and checkpoints
+    // it through the ordinary discovery/authorization path. Rejected handshakes
+    // above this point disclose nothing and enqueue nothing.
+    if let Some(identity) = runtime.identity.sovereign_identity.get() {
+        crate::identity_local::publisher_dht::notify_new_identity_verifier(
+            &runtime.session_tx_registry,
+            remote_identity.node_id.as_bytes(),
+            &identity.document,
+        );
+    }
     runtime.logger.info(
         "session.open",
         format!(

@@ -119,6 +119,40 @@ fn recursive_identity_republish_preserves_revocations() {
     stale_republish(true);
 }
 
+#[test]
+fn stored_revocation_revalidates_live_authorization_without_an_app_packet() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for recursive in [false, true] {
+        let dispatcher = make_test_dispatcher(NodeRole::Core);
+        let doc = document(veil_util::unix_secs_now_u64() - 1, true);
+        let peer = doc.node_id;
+        let key = IdentityDocument::dht_key(&peer);
+        let expected = doc.encode();
+        let dht = Arc::clone(&dispatcher.dht);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        *dispatcher.peer_cert_revalidate.lock().unwrap() = Some(Arc::new(move |identity| {
+            assert_eq!(*identity, peer);
+            assert_eq!(dht.get_local(&key).as_deref(), Some(expected.as_slice()));
+            observed.fetch_add(1, Ordering::SeqCst);
+        }));
+        store(&dispatcher, &doc, recursive, 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a verified revocation left warm authorization unchanged until the next app packet"
+        );
+        let mut invalid = doc;
+        invalid.document_sig[0] ^= 1;
+        assert!(!dispatcher.store_discovery_value(key, invalid.encode(), peer));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "invalid bytes cannot trigger revalidation"
+        );
+    }
+}
+
 fn resign(doc: &mut IdentityDocument) {
     let mut signed = DOC_SIG_CONTEXT.to_vec();
     signed.extend(doc.canonical_signing_bytes());
