@@ -33,6 +33,12 @@ name: mobile-cross-compile
 
 on:
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Existing immutable v* source tag to rebuild; empty uses the event ref.'
+        required: false
+        type: string
+        default: ''
   push:
     tags:
       - 'mobile-v*'
@@ -63,6 +69,21 @@ jobs:
           - x86_64-linux-android
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+
+      - name: Verify immutable source
+        if: inputs.source_ref != ''
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "source_ref must be an existing version tag"; exit 1; }
+          expected="$(git rev-parse "$SOURCE_REF^{commit}")"
+          actual="$(git rev-parse HEAD)"
+          [[ "$actual" == "$expected" ]] || { echo "checkout does not match source_ref"; exit 1; }
+          echo "verified_source=$actual"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -114,6 +135,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+
+      - name: Verify immutable source
+        if: inputs.source_ref != ''
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "source_ref must be an existing version tag"; exit 1; }
+          expected="$(git rev-parse "$SOURCE_REF^{commit}")"
+          actual="$(git rev-parse HEAD)"
+          [[ "$actual" == "$expected" ]] || { echo "checkout does not match source_ref"; exit 1; }
+          echo "verified_source=$actual"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -140,7 +176,7 @@ jobs:
   ios-and-macos:
     name: apple-${{ matrix.triple }}
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-    runs-on: macos-14
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
@@ -152,6 +188,21 @@ jobs:
           - x86_64-apple-darwin
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+
+      - name: Verify immutable source
+        if: inputs.source_ref != ''
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "source_ref must be an existing version tag"; exit 1; }
+          expected="$(git rev-parse "$SOURCE_REF^{commit}")"
+          actual="$(git rev-parse HEAD)"
+          [[ "$actual" == "$expected" ]] || { echo "checkout does not match source_ref"; exit 1; }
+          echo "verified_source=$actual"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -160,6 +211,10 @@ jobs:
 
       - name: Add the cross target to the PINNED toolchain
         run: rustup target add ${{ matrix.triple }}
+
+      - name: Set the macOS deployment target to 12.0
+        if: contains(matrix.triple, 'apple-darwin')
+        run: echo 'MACOSX_DEPLOYMENT_TARGET=12.0' >> "$GITHUB_ENV"
 
       # The script owns the iOS specifics this file used to get wrong: a
       # staticlib via `cargo rustc` (Apple disallows third-party dylibs in iOS
@@ -182,10 +237,25 @@ jobs:
     # finish so it can pull their artifacts.
     name: ios-xcframework
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-    runs-on: macos-14
+    runs-on: macos-15
     needs: ios-and-macos
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+
+      - name: Verify immutable source
+        if: inputs.source_ref != ''
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "source_ref must be an existing version tag"; exit 1; }
+          expected="$(git rev-parse "$SOURCE_REF^{commit}")"
+          actual="$(git rev-parse HEAD)"
+          [[ "$actual" == "$expected" ]] || { echo "checkout does not match source_ref"; exit 1; }
+          echo "verified_source=$actual"
 
       - name: Download device slice
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
@@ -226,6 +296,21 @@ jobs:
           - aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+
+      - name: Verify immutable source
+        if: inputs.source_ref != ''
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "source_ref must be an existing version tag"; exit 1; }
+          expected="$(git rev-parse "$SOURCE_REF^{commit}")"
+          actual="$(git rev-parse HEAD)"
+          [[ "$actual" == "$expected" ]] || { echo "checkout does not match source_ref"; exit 1; }
+          echo "verified_source=$actual"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
