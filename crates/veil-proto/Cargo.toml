@@ -30,6 +30,7 @@ zeroize = { version = "1.7", features = ["derive"] }
 
 [dev-dependencies]
 proptest = "1"
+syn = { version = "2", features = ["full"] }
 
 [lints]
 workspace = true

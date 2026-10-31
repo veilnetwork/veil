@@ -5280,6 +5280,7 @@ dependencies = [
  "rand_core 0.6.4",
  "serde",
  "serde_json",
+ "syn 2.0.117",
  "thiserror 2.0.18",
  "veil-bufpool",
  "veil-error",

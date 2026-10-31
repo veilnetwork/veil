@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Keep file-backed peer authorization fail-closed until its snapshot is
+  durable, including retry notification after a failed write. Preserve host
+  floors awaiting checkpoint under cache pressure and refuse transactional
+  restore that would forget revocations learned during native boot.
+- Verify legacy signed sleep notices outside the shared peer-key cache lock.
+
 - Request a fresh authenticated agreement when a restored ratchet chain uses
   a sender key absent from the current verified certificates for that instance.
   Preserve receive state until repair instead of consuming and acknowledging
@@ -11,6 +17,11 @@
   signed relayed repair replies; retain replay and prologue freshness checks.
 - Preserve explicitly staged Android native libraries when Cargo is skipped,
   even if a shared Cargo target contains an older library.
+
+### Validation
+
+- Expand the wire-decoder panic sweep by 25 entrypoints and check the registry
+  against public inherent decoders in production source. No wire change.
 
 ## v0.11.46 — 2026-10-26
 

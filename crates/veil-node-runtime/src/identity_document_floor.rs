@@ -1,5 +1,8 @@
 //! Persistent negative authorization evidence. Stored documents never grant
 //! rights: incoming material still needs a fresh, fully verified document.
+//! Restore preserves revocations already known to this process. A rollback of
+//! every local copy cannot be detected here without an independent witness;
+//! a signed snapshot counter alone would roll back with the snapshot.
 use std::{
     collections::HashMap,
     io::Read,
@@ -83,6 +86,7 @@ impl IdentityDocumentFloor {
     pub(crate) fn is_durable(&self, peer: &[u8; 32]) -> bool {
         let state = lock!(self.state);
         !state.unreadable
+            && (self.path.is_none() || !state.dirty)
             && (!state.host_restored
                 || state
                     .rows
@@ -196,10 +200,28 @@ impl IdentityDocumentFloor {
         let transient: Vec<_> = state.rows.values().map(|r| r.document.clone()).collect();
         restored.revision = state.revision.saturating_add(1);
         restored.host_restored = true;
-        *state = restored;
-        for doc in transient {
-            self.observe_locked(&mut state, &doc, now);
+        for doc in &transient {
+            self.observe_locked(&mut restored, doc, now);
         }
+        // Both sources carry independently verified negative evidence. Neither
+        // a newer timestamp nor a full cache permits restore to forget a
+        // revocation learned during boot. Build the candidate transactionally:
+        // an incompatible snapshot must leave RAM intact and restore retryable.
+        // Do not merge signed documents by editing their revocation lists.
+        for doc in &transient {
+            if doc.revoked_devices.iter().any(|revoked| {
+                !restored.rows.get(&doc.node_id).is_some_and(|floor| {
+                    floor
+                        .document
+                        .revoked_devices
+                        .iter()
+                        .any(|r| r.device_id == revoked.device_id)
+                })
+            }) {
+                return Err("peer authorization restore would forget a known revocation".into());
+            }
+        }
+        *state = restored;
         drop(state);
         self.notify_host_changed();
         Ok(())
@@ -250,11 +272,13 @@ impl IdentityDocumentFloor {
         now: u64,
     ) -> bool {
         let state = lock!(self.state);
-        if state.unreadable {
+        if state.unreadable || (self.path.is_some() && state.dirty) {
             return false;
         }
         let Some(floor) = state.rows.get(peer) else {
-            return true;
+            // An attached host must checkpoint an observed document before a
+            // certificate can use it, including after a durable row was evicted.
+            return !state.host_restored;
         };
         let doc = &floor.document;
         (!state.host_restored || floor.changed_revision <= state.durable_revision)
@@ -274,7 +298,7 @@ impl IdentityDocumentFloor {
     /// Unknown, expired or not-yet-checkpointed documents cannot preserve it.
     pub(crate) fn allows_device_proof(&self, peer: &[u8; 32], device: &[u8; 32], now: u64) -> bool {
         let state = lock!(self.state);
-        if state.unreadable {
+        if state.unreadable || (self.path.is_some() && state.dirty) {
             return false;
         }
         let Some(floor) = state.rows.get(peer) else {
@@ -418,7 +442,11 @@ impl IdentityDocumentFloor {
             let victim = state
                 .rows
                 .iter()
-                .filter(|(_, floor)| floor.document.revoked_devices.is_empty())
+                .filter(|(_, floor)| {
+                    floor.document.revoked_devices.is_empty()
+                        && (!state.host_restored
+                            || floor.changed_revision <= state.durable_revision)
+                })
                 .min_by_key(|(_, floor)| floor.touched)
                 .map(|(node, _)| *node);
             let Some(victim) = victim else {
@@ -461,6 +489,9 @@ impl IdentityDocumentFloor {
         state.dirty =
             !write_snapshot_ordered(path, &snapshot, "peer identity floors", next_snapshot_seq())
                 .is_durable();
+        if !state.dirty {
+            self.checkpointed.notify_waiters();
+        }
     }
 }
 
@@ -935,13 +966,100 @@ mod tests {
         let obstructed = dir.path().join("peer_identity_floors.json");
         std::fs::create_dir(&obstructed).unwrap();
         let current = document(1, 1000, true);
+        let cert = veil_identity::mlkem_fanout::VerifiedMlkemCert {
+            node_id: current.node_id,
+            device_id: Some(current.identity_keys[0].device_id),
+            instance_id: [1; 16],
+            mlkem_algo: 1,
+            mlkem_pubkey: vec![1; 32],
+            ratchet_x25519_pubkey: [2; 32],
+            cert_version: 1,
+            valid_until_unix: current.valid_until_unix,
+        };
         assert!(store.observe(&current, 1000));
         assert!(lock!(store.state).dirty);
+        assert!(!store.is_durable(&current.node_id));
+        assert!(!store.allows_cert(&current.node_id, &cert, 1000));
+        assert!(!store.allows_device_proof(&current.node_id, &cert.device_id.unwrap(), 1000));
         assert!(!store.observe(&document(1, 999, false), 1000));
         std::fs::remove_dir(&obstructed).unwrap();
         assert!(store.observe(&current, 1000));
         assert!(!lock!(store.state).dirty);
+        assert!(store.is_durable(&current.node_id));
+        assert!(store.allows_cert(&current.node_id, &cert, 1000));
+        assert!(store.allows_device_proof(&current.node_id, &cert.device_id.unwrap(), 1000));
         let restarted = IdentityDocumentFloor::load(&config);
         assert!(!restarted.observe(&document(1, 999, false), 1000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn file_publication_retry_wakes_the_durability_waiter() {
+        use std::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = IdentityDocumentFloor::load(&dir.path().join("config.toml"));
+        let obstructed = dir.path().join("peer_identity_floors.json");
+        std::fs::create_dir(&obstructed).unwrap();
+        let doc = document(2, 1000, true);
+        assert!(store.observe(&doc, 1000));
+        let mut waiting =
+            Box::pin(store.wait_durable(&doc.node_id, std::time::Duration::from_secs(3)));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(waiting.as_mut().poll(&mut cx), Poll::Pending));
+        std::fs::remove_dir(&obstructed).unwrap();
+        assert!(store.observe(&doc, 1000));
+        assert!(matches!(waiting.as_mut().poll(&mut cx), Poll::Ready(true)));
+    }
+
+    #[test]
+    fn host_pending_floors_keep_their_slots_until_checkpointed() {
+        let store = IdentityDocumentFloor::ephemeral();
+        store
+            .import_host(br#"{"version":1,"entries":[]}"#, 1000)
+            .unwrap();
+        let first = document(0, 1000, false);
+        assert!(store.observe(&first, 1000));
+        for index in 1..MAX_PEER_MLKEM_CACHE as u64 {
+            assert!(store.observe(&document(index, 1000, false), 1000));
+        }
+        let extra = document(MAX_PEER_MLKEM_CACHE as u64, 1000, false);
+        assert!(
+            !store.observe(&extra, 1000),
+            "pending authorization cannot be displaced"
+        );
+        assert!(store.is_pending(&first.node_id));
+        assert!(!store.is_durable(&first.node_id));
+        store.acknowledge_host(store.revision()).unwrap();
+        assert!(
+            store.observe(&extra, 1000),
+            "checkpointed rows remain eligible for LRU eviction"
+        );
+        assert_eq!(lock!(store.state).rows.len(), MAX_PEER_MLKEM_CACHE);
+    }
+
+    #[test]
+    fn restore_cannot_erase_a_boot_revocation_with_an_older_signed_document() {
+        let peer = 27;
+        let host = IdentityDocumentFloor::ephemeral();
+        assert!(host.observe(&document(peer, 1001, false), 1001));
+        let snapshot = host.export_host().unwrap().1;
+        let boot = IdentityDocumentFloor::ephemeral();
+        let revoked = document(peer, 1000, true);
+        assert!(boot.observe(&revoked, 1001));
+        let before = boot.export_host().unwrap();
+        assert!(boot.import_host(&snapshot, 1001).is_err());
+        assert_eq!(
+            boot.export_host().unwrap(),
+            before,
+            "refusal is transactional"
+        );
+        assert!(!lock!(boot.state).host_restored);
+        let stronger = IdentityDocumentFloor::ephemeral();
+        assert!(stronger.observe(&document(peer, 1002, true), 1002));
+        boot.import_host(&stronger.export_host().unwrap().1, 1002)
+            .unwrap();
+        assert!(!boot.observe(&document(peer, 1003, false), 1003));
     }
 }
