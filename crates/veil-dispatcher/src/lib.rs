@@ -11,7 +11,7 @@
 //! The dispatcher is clone-cheap because all services are behind `Arc`.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex, RwLock};

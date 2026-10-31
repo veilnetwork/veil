@@ -237,7 +237,7 @@ fn replication_targets(
         .filter(|contact| !contact.dht_service())
         .map(|contact| contact.node_id)
         .collect();
-    let candidates = {
+    {
         let guard = tx_reg.read().unwrap_or_else(|p| p.into_inner());
         let mut candidates: Vec<[u8; 32]> = candidates_with_uri
             .into_iter()
@@ -253,8 +253,7 @@ fn replication_targets(
             }
         }
         candidates
-    };
-    candidates
+    }
 }
 
 fn encode_replication(local_node_id: [u8; 32], dht_key: [u8; 32], value: Vec<u8>) -> Vec<u8> {

@@ -954,7 +954,7 @@ mod tests {
         }
         for target in [[0; 32], [17; 32], [255; 32]] {
             for modulus in [1, 2, 3, 7, 251] {
-                let eligible = |c: &Contact| c.node_id[0] % modulus == 0;
+                let eligible = |c: &Contact| c.node_id[0].is_multiple_of(modulus);
                 let mut all: Vec<_> = table.all_contacts().into_iter().filter(eligible).collect();
                 all.sort_by_key(|c| xor_distance(&target, &c.node_id));
                 for k in [0, 1, 2, 7, 20, 256] {

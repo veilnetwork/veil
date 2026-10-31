@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.11.47 — 2026-10-31
+
 ### Fixed
 
 - Keep file-backed peer authorization fail-closed until its snapshot is
@@ -27,8 +29,31 @@
 - Preserve explicitly staged Android native libraries when Cargo is skipped,
   even if a shared Cargo target contains an older library.
 
+### Reliability
+
+- Keep receiver flow control authoritative across reordered ACK/DATA, notify
+  senders when reads reopen a small window and preserve retry budgets during
+  zero-window persistence. Bound overlapping receive data and queued repairs.
+- Pace BBR streams from the start, drain before accepting a larger minimum RTT
+  and replace obsolete bandwidth seeds with sustained fresh measurements.
+- Bind circuit lifetime to its exact live TX registration. Prepare and confirm
+  independent inbound/outbound paths concurrently within existing bounds, and
+  prevent old timeout callbacks from quarantining replacement paths.
+- Complete FIN/ACK teardown after lost control packets without holding bulk
+  admission slots. Resume interrupted transfers through current circuit paths.
+- Bind certificates to the requested instance before caching, overlap bounded
+  cold lookups and release all pending state when searches are cancelled.
+- Avoid redundant DHT work and repair identity replica placement when sessions
+  change. Refresh the selected Windows outbound interfaces for each new socket.
+
 ### Validation
 
+- Local runtime/dispatcher/onion-stream gates passed: 1190 tests, with 11
+  ignored tests reported separately. Four isolated process scenarios verified
+  device revocation, including offline and warm-cache reconnect variants.
+- Slow large-backlog application catch-up remains under investigation. This
+  release does not claim full multi-device, physical Windows 10 or long-offline
+  qualification, nor a demonstrated fix for deferred historical complaints.
 - Expand the wire-decoder panic sweep by 25 entrypoints and check the registry
   against public inherent decoders in production source. No wire change.
 
