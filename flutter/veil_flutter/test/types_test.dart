@@ -14,6 +14,7 @@ void main() {
       expect(VeilEventKind.fromWire(1), VeilEventKind.mobileTierChanged);
       expect(VeilEventKind.fromWire(2), VeilEventKind.identityRotated);
       expect(VeilEventKind.fromWire(3), VeilEventKind.mailboxDrained);
+      expect(VeilEventKind.fromWire(6), VeilEventKind.peerAuthorizationChanged);
     });
 
     test('fromWire maps unknown to VeilEventKind.unknown', () {

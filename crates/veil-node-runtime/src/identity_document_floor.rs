@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     io::Read,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -56,9 +56,20 @@ pub(crate) struct IdentityDocumentFloor {
     path: Option<PathBuf>,
     state: Mutex<State>,
     checkpointed: tokio::sync::Notify,
+    host_changed: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl IdentityDocumentFloor {
+    pub(crate) fn set_host_change_notifier(&self, notify: Arc<dyn Fn() + Send + Sync>) {
+        *lock!(self.host_changed) = Some(notify);
+    }
+
+    fn notify_host_changed(&self) {
+        let notify = lock!(self.host_changed).clone();
+        if let Some(notify) = notify {
+            notify();
+        }
+    }
     pub(crate) fn is_pending(&self, peer: &[u8; 32]) -> bool {
         let state = lock!(self.state);
         !state.unreadable
@@ -189,6 +200,8 @@ impl IdentityDocumentFloor {
         for doc in transient {
             self.observe_locked(&mut state, &doc, now);
         }
+        drop(state);
+        self.notify_host_changed();
         Ok(())
     }
     pub(crate) fn current(&self, peer: &[u8; 32]) -> Option<IdentityDocument> {
@@ -283,6 +296,7 @@ impl IdentityDocumentFloor {
             path: None,
             state: Mutex::new(State::default()),
             checkpointed: tokio::sync::Notify::new(),
+            host_changed: Mutex::new(None),
         }
     }
 
@@ -353,12 +367,22 @@ impl IdentityDocumentFloor {
             path: Some(path),
             state: Mutex::new(state),
             checkpointed: tokio::sync::Notify::new(),
+            host_changed: Mutex::new(None),
         }
     }
 
     pub(crate) fn observe(&self, doc: &IdentityDocument, now: u64) -> bool {
         let mut state = lock!(self.state);
-        self.observe_locked(&mut state, doc, now)
+        let before = state.revision;
+        let accepted = self.observe_locked(&mut state, doc, now);
+        let changed = state.host_restored && state.revision != before;
+        drop(state);
+        // A local wake hint, never an authorization. Emit outside the floor
+        // lock so a host may immediately export the current snapshot.
+        if changed {
+            self.notify_host_changed();
+        }
+        accepted
     }
 
     fn observe_locked(&self, state: &mut State, doc: &IdentityDocument, now: u64) -> bool {
@@ -448,6 +472,43 @@ mod tests {
     use veil_proto::identity_document::{
         ALGO_ED25519, DOC_SIG_CONTEXT, IdentityKey, RevokedDevice,
     };
+
+    #[test]
+    fn host_wake_is_revision_only_and_never_discharges_durability() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = Arc::new(IdentityDocumentFloor::ephemeral());
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let weak = Arc::downgrade(&store);
+        let count = Arc::clone(&wakes);
+        store.set_host_change_notifier(Arc::new(move || {
+            // A notifier may export immediately: the floor lock is not held.
+            let floor = weak.upgrade().unwrap();
+            assert!(floor.export_host().is_ok());
+            count.fetch_add(1, Ordering::SeqCst);
+        }));
+        let doc = document(17, 1000, false);
+        assert!(store.observe(&doc, 1000));
+        assert_eq!(wakes.load(Ordering::SeqCst), 0); // No host attached yet.
+        store
+            .import_host(br#"{"version":1,"entries":[]}"#, 1000)
+            .unwrap();
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(store.is_pending(&doc.node_id));
+        let revision = store.revision();
+        store.acknowledge_host(revision).unwrap();
+        assert!(store.is_durable(&doc.node_id));
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(store.observe(&doc, 1000));
+        assert_eq!(wakes.load(Ordering::SeqCst), 1); // Exact replay is quiet.
+        let mut invalid = document(17, 1001, true);
+        invalid.document_sig[0] ^= 1;
+        assert!(!store.observe(&invalid, 1001));
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(store.observe(&document(17, 1001, true), 1001));
+        assert_eq!(wakes.load(Ordering::SeqCst), 2);
+        store.acknowledge_host(revision).unwrap();
+        assert!(!store.is_durable(&doc.node_id)); // Wake and old ACK grant nothing.
+    }
 
     #[test]
     fn cold_device_identity_hint_survives_restore_but_never_guesses_membership() {
