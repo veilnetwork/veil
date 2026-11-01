@@ -3658,6 +3658,94 @@ mod tests {
         );
     }
 
+    /// A cold private chain has live neighbors but no earned transit score.
+    /// Keep the policy explicit: topology and local enqueue alone do not imply
+    /// that RecursiveRelay may use the next neighbor. This mirrors the S4 stop
+    /// in the six-server stand without weakening the production gate.
+    #[test]
+    fn recursive_relay_cold_neighbor_stops_until_transit_reputation_is_earned() {
+        use std::sync::{Arc, Mutex, RwLock};
+        use veil_proto::{
+            delivery::{DeliveryEnvelope, ForwardPayload, RecursiveRelayPayload},
+            family::{DeliveryMsg, FrameFamily},
+            header::FrameHeader,
+        };
+
+        let next = [0x33; 32];
+        let incoming = [0x55; 32];
+        let target = [0xAA; 32];
+        let registry = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let mut outgoing = registry.write().unwrap().register(next);
+        let reputation = Arc::new(Mutex::new(veil_reputation::ReputationTracker::new()));
+        reputation.lock().unwrap().session_opened(next.into());
+        let mut dispatcher = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        dispatcher.local_node_id = [0x44; 32];
+        dispatcher.session_tx_registry = Some(registry);
+        dispatcher.reputation = Some(Arc::clone(&reputation));
+        for id in [next, incoming] {
+            dispatcher
+                .dht
+                .add_contact_trusted(veil_dht::routing::Contact::new(
+                    id,
+                    "quic://192.0.2.1:18443",
+                ));
+        }
+        let forward = ForwardPayload {
+            next_hop_node_id: target,
+            envelope: DeliveryEnvelope {
+                recipient: veil_proto::recipient::Recipient::any(target),
+                sender_node_id: [0x66; 32],
+                src_app_id: [1; 32],
+                app_id: [2; 32],
+                endpoint_id: 3,
+                content_id: [4; 32],
+                created_at: veil_util::unix_secs_now_u64(),
+                ttl_secs: 30,
+                payload: b"opaque stand payload".to_vec(),
+                trace_id: 0,
+                require_ack: false,
+            },
+            relay_hops: 1,
+            delivery_attempt: None,
+            traffic_class: None,
+        };
+        let mut recursive = RecursiveRelayPayload {
+            dst_node_id: target,
+            originator_pseudonym: [0x77; 32],
+            query_id: 1,
+            hop_count: 5,
+            payload: forward.encode(),
+        };
+        let header = FrameHeader::new(
+            FrameFamily::Delivery as u8,
+            DeliveryMsg::RecursiveRelay as u16,
+        );
+        dispatcher.dispatch(&header, &recursive.encode(), incoming);
+        assert!(
+            outgoing.try_recv().is_err(),
+            "cold peer must not bypass the transit gate"
+        );
+
+        // Positive control changes only the earned score and the replay ID.
+        // No sleep, altered clock, disabled admission, or target session.
+        for _ in 0..2000 {
+            reputation.lock().unwrap().record_relay_success(next.into());
+        }
+        assert!(reputation.lock().unwrap().can_transit(&next.into()));
+        recursive.query_id = 2;
+        dispatcher.dispatch(&header, &recursive.encode(), incoming);
+        let (_, bytes) = outgoing
+            .try_recv()
+            .expect("eligible neighbor receives the same payload");
+        let sent = RecursiveRelayPayload::decode(&bytes[veil_proto::HEADER_SIZE..]).unwrap();
+        assert_eq!(sent.payload, recursive.payload);
+        assert_eq!(sent.hop_count, recursive.hop_count - 1);
+        assert!(
+            outgoing.try_recv().is_err(),
+            "single-hop forwarding, without fan-out"
+        );
+    }
+
     /// with mailbox removed, a RecursiveRelay frame with hop_count=0
     /// is silently dropped (was: spilled to mailbox for later delivery).
     #[test]

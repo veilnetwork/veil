@@ -1,4 +1,4 @@
-//! Opt-in, role-blind correlation of bounded opaque Forward payloads.
+//! Opt-in, role-blind correlation of bounded opaque forwarding payloads.
 //! No payload bytes, keys, RTP metadata or application classes are retained.
 //! These local observations never select admission, priority or a transport.
 
@@ -7,7 +7,10 @@ use std::sync::{
     OnceLock,
     atomic::{AtomicU64, Ordering},
 };
-use veil_proto::{delivery::ForwardPayload, header::FrameHeader};
+use veil_proto::{
+    delivery::{ForwardPayload, RecursiveRelayPayload},
+    header::FrameHeader,
+};
 
 const MAX_BODY: usize = 8192;
 const ROW_LIMIT: u64 = 524_288;
@@ -34,21 +37,33 @@ pub fn payload_digest(payload: &[u8]) -> Option<String> {
 struct Sample {
     digest: String,
     bytes: usize,
+    wrapper: &'static str,
 }
 
 fn sample(header: &FrameHeader, body: &[u8]) -> Option<Sample> {
-    if header.family != veil_proto::family::FrameFamily::Delivery as u8
-        || header.msg_type != veil_proto::family::DeliveryMsg::Forward as u16
-        || body.len() > MAX_BODY
-    {
+    if header.family != veil_proto::family::FrameFamily::Delivery as u8 || body.len() > MAX_BODY {
         return None;
     }
-    // Use the normal bounded Forward decoder, including its extension policy.
-    // Payload contents and sender traffic hints never select these records.
-    let forward = ForwardPayload::decode(body).ok()?;
+    // One bounded routing wrapper only. RecursiveRelay carries an ordinary
+    // ForwardPayload, not another frame: do not recursively follow untrusted
+    // wrappers or interpret application/cryptographic payload formats.
+    let (forward, wrapper) = match header.msg_type {
+        n if n == veil_proto::family::DeliveryMsg::Forward as u16 => {
+            (ForwardPayload::decode(body).ok()?, "forward")
+        }
+        n if n == veil_proto::family::DeliveryMsg::RecursiveRelay as u16 => {
+            let recursive = RecursiveRelayPayload::decode(body).ok()?;
+            (
+                ForwardPayload::decode(&recursive.payload).ok()?,
+                "recursive",
+            )
+        }
+        _ => return None,
+    };
     Some(Sample {
         digest: digest(&forward.envelope.payload)?,
         bytes: forward.envelope.payload.len(),
+        wrapper,
     })
 }
 
@@ -62,11 +77,12 @@ fn record(stage: &str, node: &[u8; 32], peer: &[u8; 32], sample: &Sample) {
     }
     let monotonic_us = veil_util::diagnostic_clock::monotonic_us().map_or(-1, i128::from);
     log::info!(
-        "delivery.opaque_trace stage={stage} monotonic_us={monotonic_us} node={} peer={} opaque_bytes={} opaque_sha256={}",
+        "delivery.opaque_trace stage={stage} monotonic_us={monotonic_us} node={} peer={} opaque_bytes={} opaque_sha256={} wrapper={}",
         veil_util::hex_str(&node[..4]),
         veil_util::hex_str(&peer[..4]),
         sample.bytes,
         sample.digest,
+        sample.wrapper,
     );
 }
 
@@ -182,6 +198,55 @@ mod tests {
                 digest(&bytes).unwrap()
             );
         }
+    }
+
+    fn recursive_header() -> FrameHeader {
+        FrameHeader::new(
+            veil_proto::family::FrameFamily::Delivery as u8,
+            veil_proto::family::DeliveryMsg::RecursiveRelay as u16,
+        )
+    }
+
+    fn recursive_body(inner: Vec<u8>) -> Vec<u8> {
+        veil_proto::delivery::RecursiveRelayPayload {
+            dst_node_id: [9; 32],
+            originator_pseudonym: [8; 32],
+            query_id: 7,
+            hop_count: 6,
+            payload: inner,
+        }
+        .encode()
+    }
+
+    #[test]
+    fn payload_identity_survives_recursive_relay_wrapping() {
+        let mut f = forward(vec![0x51; 235]);
+        let first = sample(&header(), &f.encode()).unwrap();
+        let wrapped = recursive_body(f.encode());
+        let next = sample(&recursive_header(), &wrapped)
+            .expect("recursive transport must retain the opaque correlation witness");
+        assert_eq!(first.digest, next.digest);
+        assert_eq!(first.bytes, next.bytes);
+        assert_eq!(first.wrapper, "forward");
+        assert_eq!(next.wrapper, "recursive");
+        f.envelope.payload[100] ^= 1;
+        assert_ne!(
+            first.digest,
+            sample(&recursive_header(), &recursive_body(f.encode()))
+                .unwrap()
+                .digest,
+        );
+    }
+
+    #[test]
+    fn recursive_observation_is_bounded_and_decodes_one_wrapper_only() {
+        let wrapped = recursive_body(forward(vec![0x51; 235]).encode());
+        for end in 0..wrapped.len() {
+            assert!(sample(&recursive_header(), &wrapped[..end]).is_none());
+        }
+        assert!(sample(&recursive_header(), &recursive_body(vec![0; MAX_BODY])).is_none());
+        assert!(sample(&recursive_header(), &recursive_body(vec![])).is_none());
+        assert!(sample(&recursive_header(), &recursive_body(wrapped)).is_none());
     }
 
     #[test]
