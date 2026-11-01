@@ -124,7 +124,12 @@ void DecodedAgeRegression(int mode = 0, int queued_ms = 90,
     auto action = explicit_action ? std::optional<webrtc::NetEq::Operation>(
         webrtc::NetEq::Operation::kNormal) : std::nullopt;
     assert(recovering.GetAudio(&frame, nullptr, nullptr, action) == 0);
-    const bool attempt = queued_ms >= std::max(70, target_ms + 40) && witness && aligned &&
+    // This fixture's aligned decoded output is 150 ms old at the second
+    // render. An adaptive reserve larger than that is not stale backlog.
+    const int budget = std::max(160, target_ms + 80);
+    const bool age_excess = witness && aligned && 150 > budget - 20 &&
+        queued_ms >= std::max(70, target_ms + 80);
+    const bool attempt = (queued_ms > budget || age_excess) &&
         !explicit_action && mode != 6;
     const bool skipped = attempt && mode == 0;
     assert(observed->pulls == (attempt ? 3 : 2));
@@ -234,8 +239,8 @@ int main() {
     assert(two.discarded_ms == 0 && two.last_discard_us == 0);
     assert(!totals->receivers.Snapshot(33).known);
   }
-  // The decoder must not refill toward a target above the catch-up budget.
-  // Reserve one decoded packet's headroom for ordinary packet-sized arrivals.
+  // Permit an adaptive jitter target while preserving explicit caller bounds.
+  // Changing packet duration alone must not force that target higher.
   {
     auto decoder = std::make_unique<Decoder>();
     auto* observed = decoder.get();
@@ -243,12 +248,12 @@ int main() {
     observed->frame_ms = 40;
     auto stats = std::make_shared<veil_media::PlayoutRecoveryStats>();
     veil_media::RecoveringNetEq recovering(std::move(decoder), stats);
-    assert(observed->maximum_delay == 100); // unknown initial packet: 20 ms
+    assert(observed->maximum_delay == 400);
     webrtc::AudioFrame frame;
     bool muted = false;
     int rate = 0;
     recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
-    assert(observed->maximum_delay == 120); // 160 - actual 40-ms packet
+    assert(observed->maximum_delay == 400);
     const int calls = observed->maximum_delay_calls;
     recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
     assert(observed->maximum_delay_calls == calls);
@@ -261,26 +266,26 @@ int main() {
     recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
     assert(observed->maximum_delay == 50);
     assert(recovering.SetMaximumDelay(0));
-    assert(observed->maximum_delay == 100);
+    assert(observed->maximum_delay == 400);
     assert(recovering.SetMaximumDelay(500));
-    assert(observed->maximum_delay == 100);
+    assert(observed->maximum_delay == 400);
     assert(!recovering.SetMaximumDelay(-1));
     observed->frame_ms = 40;
     recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
-    assert(observed->maximum_delay == 120);
+    assert(observed->maximum_delay == 400);
     observed->frame_ms = 0; // silence/unknown must not invent a smaller packet
     recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
-    assert(observed->maximum_delay == 120);
+    assert(observed->maximum_delay == 400);
     observed->mode = 1; // PLC is generated output, not a new packet duration
     observed->frame_ms = 20;
     recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
-    assert(observed->maximum_delay == 120);
+    assert(observed->maximum_delay == 400);
     observed->mode = 2; // muted output cannot change the known duration either
     recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
-    assert(observed->maximum_delay == 120);
+    assert(observed->maximum_delay == 400);
     observed->mode = 5;
     recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
-    assert(observed->maximum_delay == 100); // a real shorter decoded packet
+    assert(observed->maximum_delay == 400);
     assert(stats->count == 0 && stats->discarded_ms == 0);
   }
   // Packet-sized headroom increases only as normal speech establishes the
@@ -296,7 +301,7 @@ int main() {
     veil_media::RecoveringNetEq recovering(std::move(decoder), stats);
     webrtc::AudioFrame frame;
     recovering.GetAudio(&frame, nullptr, nullptr, std::nullopt);
-    assert(observed->maximum_delay == budget_ms - packet_ms);
+    assert(observed->maximum_delay == 400);
     assert(stats->discarded_ms == 0 && observed->pulls == 1);
     // Just above that packet duration's budget, bounded catch-up still runs.
     observed->buffer_ms_override += 10;
@@ -315,6 +320,47 @@ int main() {
     webrtc::AudioFrame frame;
     recovering.GetAudio(&frame, nullptr, nullptr, std::nullopt);
     assert(observed->maximum_delay == 40);
+  }
+  // A jitter reserve is useful speech, not a device-stall backlog. The
+  // nominal packet-sized bound still applies when no such reserve is needed.
+  for (const int packet_ms : {20, 40, 60}) for (const int target_ms : {140, 260, 380}) {
+    auto decoder = std::make_unique<Decoder>();
+    auto* observed = decoder.get();
+    observed->mode = 5;
+    observed->frame_ms = packet_ms;
+    observed->target_ms = target_ms;
+    observed->buffer_ms_override = target_ms + 2 * packet_ms;
+    auto stats = std::make_shared<veil_media::PlayoutRecoveryStats>();
+    veil_media::RecoveringNetEq recovering(std::move(decoder), stats);
+    webrtc::AudioFrame frame;
+    assert(recovering.GetAudio(&frame, nullptr, nullptr, std::nullopt) == 0);
+    assert(observed->pulls == 1 && stats->discarded_ms == 0);
+    observed->buffer_ms_override += 10;
+    assert(recovering.GetAudio(&frame, nullptr, nullptr, std::nullopt) == 0);
+    assert(observed->pulls == 18 && stats->discarded_ms == 160);
+  }
+  // PLC/mute/unknown duration cannot shrink the known speech-packet reserve.
+  for (const int kind : {0, 1, 2}) {
+    auto decoder = std::make_unique<Decoder>();
+    auto* observed = decoder.get();
+    observed->mode = 5;
+    observed->frame_ms = 60;
+    observed->buffer_ms_override = 180;
+    auto stats = std::make_shared<veil_media::PlayoutRecoveryStats>();
+    veil_media::RecoveringNetEq recovering(std::move(decoder), stats);
+    webrtc::AudioFrame frame;
+    assert(recovering.GetAudio(&frame, nullptr, nullptr, std::nullopt) == 0);
+    observed->mode = kind;
+    observed->frame_ms = kind == 0 ? 0 : 20;
+    recovering.GetAudio(&frame, nullptr, nullptr, std::nullopt);
+    observed->mode = 5;
+    observed->frame_ms = 0;
+    const auto before = observed->pulls;
+    recovering.GetAudio(&frame, nullptr, nullptr, std::nullopt);
+    assert(observed->pulls == before + 1 && stats->discarded_ms == 0);
+    observed->frame_ms = 20;
+    recovering.GetAudio(&frame, nullptr, nullptr, std::nullopt);
+    assert(stats->discarded_ms == 160);
   }
   // Diagnostic capture must require both switches, remain bounded and defer
   // every file operation until the renderer has stopped and the owner dies.

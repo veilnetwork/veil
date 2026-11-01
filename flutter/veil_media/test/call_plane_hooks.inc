@@ -777,6 +777,17 @@ extern "C" VeilGroupMediaEngine* veil_media_test_group_codec_create(
   g_call_plane_recording_adm = true;
   auto* e = veil_media_group_engine_create(local);
   g_call_plane_recording_adm = previous;
+  if (e && e->ws) {
+    // This fixture measures RTP/Opus/mixer catch-up with periodic tone
+    // markers, not acoustic speech processing. Duplex AEC/NS can transform
+    // those markers independently of packet delivery or receiver recovery.
+    // Production defaults and live controls are checked by the separate
+    // audio-processing smoke, which creates ordinary engines with DSP on.
+    auto config = e->ws->apm->GetConfig();
+    config.echo_canceller.enabled = false;
+    config.noise_suppression.enabled = false;
+    e->ws->apm->ApplyConfig(config);
+  }
   return e;
 }
 

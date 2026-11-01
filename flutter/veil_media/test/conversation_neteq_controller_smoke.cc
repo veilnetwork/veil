@@ -42,6 +42,17 @@ struct Fixture {
 };
 
 int main() {
+  {
+    // A high adaptive target still needs a complete packet of headroom.
+    // max(target, jitter + packet) omitted that packet when target dominated.
+    Fixture f;
+    assert(f.controller->SetMinimumDelay(200));
+    assert(f.controller->TargetLevelMs() == 200);
+    for (int i = 0; i < 5; ++i) f.clock.Increment();
+    f.status.packet_buffer_info = {false, 10560, 10560, 10560, 11};
+    // 220 ms packet buffer + 10 ms sync: below target + packet + guard.
+    assert(f.decide() == Op::kNormal);
+  }
   // Real history sees 100 ms arrival variation. The real delay manager still
   // starts at80ms. Stock WebRTC tolerates180ms here (80+100+20), even though
   // the expected speech is ready. Production wiring must gently accelerate.
