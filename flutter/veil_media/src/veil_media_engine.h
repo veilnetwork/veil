@@ -107,6 +107,12 @@ int veil_media_engine_stop_audio(VeilMediaEngine *engine);
 int veil_media_engine_set_mic_muted(VeilMediaEngine *engine, int muted);
 int veil_media_engine_set_speaker_muted(VeilMediaEngine *engine, int muted);
 
+/* Local capture processing. AEC remains on. May be applied before or during
+ * capture; returns an error when the real APM is unavailable. */
+int veil_media_engine_set_noise_suppression(VeilMediaEngine *engine, int enabled);
+int veil_media_group_engine_set_noise_suppression(VeilGroupMediaEngine *engine, int enabled);
+
+
 /* ---- N-party audio ------------------------------------------------------
  * One group engine owns exactly one ADM, AudioState/AudioMixer and Opus send
  * stream. Each peer contributes one veil datagram channel and one receive

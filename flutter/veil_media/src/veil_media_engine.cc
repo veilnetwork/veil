@@ -4254,6 +4254,27 @@ int veil_media_engine_get_local_video_frame(VeilMediaEngine* engine,
   return 0;
 }
 
+int veil_media_engine_set_noise_suppression(VeilMediaEngine* engine, int enabled) {
+  if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  // Control ABI calls are serialized by the owner. ApplyConfig/GetConfig
+  // acquire APM's render and capture locks; no media-worker wait/cancellation
+  // or device restart is needed for this local processing option.
+  if (engine->ws && veil_media::SetCallNoiseSuppression(engine->ws->apm.get(), enabled != 0))
+    return VEIL_MEDIA_OK;
+#endif
+  return VEIL_MEDIA_ERR_STATE;
+}
+
+int veil_media_group_engine_set_noise_suppression(VeilGroupMediaEngine* engine, int enabled) {
+  if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
+#if defined(VEIL_MEDIA_HAVE_WEBRTC)
+  if (engine->ws && veil_media::SetCallNoiseSuppression(engine->ws->apm.get(), enabled != 0))
+    return VEIL_MEDIA_OK;
+#endif
+  return VEIL_MEDIA_ERR_STATE;
+}
+
 int veil_media_engine_set_mic_muted(VeilMediaEngine* engine, int muted) {
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
   engine->mic_muted = muted != 0;

@@ -258,6 +258,35 @@ final int Function(Pointer<VeilMediaEngineHandle>, int)
                     Int32)>>('veil_media_engine_set_mic_muted')
         .asFunction();
 
+int Function(Pointer<VeilMediaEngineHandle>, int)? _lookupNoiseSuppression() {
+  try {
+    return nativeLib.lookupFunction<
+        Int32 Function(Pointer<VeilMediaEngineHandle>, Int32),
+        int Function(Pointer<VeilMediaEngineHandle>, int)>(
+      'veil_media_engine_set_noise_suppression',
+    );
+  } on ArgumentError {
+    return null;
+  }
+}
+
+final veilMediaEngineSetNoiseSuppression = _lookupNoiseSuppression();
+
+int Function(Pointer<VeilGroupMediaEngineHandle>, int)?
+    _lookupGroupNoiseSuppression() {
+  try {
+    return nativeLib.lookupFunction<
+        Int32 Function(Pointer<VeilGroupMediaEngineHandle>, Int32),
+        int Function(Pointer<VeilGroupMediaEngineHandle>, int)>(
+      'veil_media_group_engine_set_noise_suppression',
+    );
+  } on ArgumentError {
+    return null;
+  }
+}
+
+final veilMediaGroupEngineSetNoiseSuppression = _lookupGroupNoiseSuppression();
+
 // set_speaker_muted(engine*, muted int) -> int
 final int Function(Pointer<VeilMediaEngineHandle>, int)
     veilMediaEngineSetSpeakerMuted = nativeLib

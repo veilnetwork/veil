@@ -10,6 +10,28 @@ void check(bool value, String reason) {
 }
 
 void main() {
+  test('direct and group noise controls propagate absence, refusal and disposal', () {
+    final present = Platform.environment['STAND_OLD_ENGINE'] != '1';
+    final direct = VeilMediaEngine.create(
+        veilChan: 1, localId: Uint8List(32), peerId: Uint8List(32))!;
+    final group = VeilGroupMediaEngine.create(localId: Uint8List(32))!;
+    expect(direct.supportsNoiseSuppression, present);
+    expect(group.supportsNoiseSuppression, present);
+    expect(direct.setNoiseSuppression(false), present);
+    expect(group.setNoiseSuppression(false), present);
+    expect(direct.setNoiseSuppression(true), isFalse);
+    expect(group.setNoiseSuppression(true), isFalse);
+    if (present) {
+      final native = DynamicLibrary.open(Platform.environment['VEIL_MEDIA_DYLIB']!);
+      final read = native.lookupFunction<Int32 Function(), int Function()>(
+          'stand_noise_enabled');
+      expect(read(), 0);
+    }
+    direct.dispose();
+    group.dispose();
+    expect(() => direct.setNoiseSuppression(false), throwsStateError);
+    expect(() => group.setNoiseSuppression(false), throwsStateError);
+  });
   test('native microphone refusal, retry, mute and disposal', () {
     final native =
         DynamicLibrary.open(Platform.environment['VEIL_MEDIA_DYLIB']!);
