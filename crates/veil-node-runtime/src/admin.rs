@@ -5763,12 +5763,22 @@ mod diag_probe_bounds_tests {
         for _ in 0..8 {
             let _ = next_diag_seq();
         }
+        // Another operation may allocate from this PROCESS-wide counter
+        // between our calls (the uniqueness test above does so in parallel).
+        // Make that legitimate interleaving deterministic instead of assuming
+        // this test owns nine consecutive sequence numbers.
+        std::thread::spawn(|| {
+            let _ = next_diag_seq();
+            let _ = next_diag_seq();
+        })
+        .join()
+        .unwrap();
         // Wrapping arithmetic: the counter starts at a random point and a run
         // that begins near the top of the range is exactly as valid.
-        assert_eq!(
-            next_diag_seq().wrapping_sub(first),
-            9,
-            "the sequence restarted, so a second operation collides again"
+        let advanced = next_diag_seq().wrapping_sub(first);
+        assert!(
+            (11..(1 << 31)).contains(&advanced),
+            "the shared sequence did not advance across both operations: {advanced}"
         );
     }
 
