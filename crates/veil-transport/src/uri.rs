@@ -393,7 +393,10 @@ fn host(url: &Url) -> Result<String> {
 }
 
 fn port(url: &Url) -> Result<u16> {
-    url.port()
+    // url normalizes the standard WS/WSS ports away, even when the caller
+    // explicitly supplied :80/:443. Recover those known defaults; transports
+    // without a standard URL port must still specify one.
+    url.port_or_known_default()
         .ok_or_else(|| TransportError::InvalidUri("missing port".to_owned()))
 }
 
@@ -612,6 +615,35 @@ fn fmt_query(query: &Option<String>) -> String {
 mod tests {
     use super::TransportUri;
     use std::path::PathBuf;
+
+    #[test]
+    fn websocket_standard_ports_survive_url_normalization() {
+        for (text, expected) in [
+            ("ws://node.example.org:80/veil", 80),
+            ("wss://node.example.org:443/veil", 443),
+            ("ws://node.example.org/veil", 80),
+            ("wss://node.example.org/veil", 443),
+            ("ws://[::1]:80/veil", 80),
+            ("wss://[::1]:443/veil", 443),
+            ("wss://node.example.org:9443/veil", 9443),
+        ] {
+            let uri = TransportUri::parse(text).unwrap_or_else(|error| panic!("{text}: {error}"));
+            match &uri {
+                TransportUri::Ws { port, .. } | TransportUri::Wss { port, .. } => {
+                    assert_eq!(*port, expected)
+                }
+                _ => panic!("wrong transport"),
+            }
+            assert_eq!(TransportUri::parse(&uri.to_string()).unwrap(), uri);
+        }
+        for text in [
+            "tcp://node.example.org",
+            "tls://node.example.org",
+            "quic://node.example.org",
+        ] {
+            assert!(TransportUri::parse(text).is_err());
+        }
+    }
 
     #[test]
     fn parses_tcp_uri() {
