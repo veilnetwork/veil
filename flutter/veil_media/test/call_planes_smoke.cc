@@ -315,7 +315,14 @@ static void wait_playout(VeilGroupMediaEngine* e, uint64_t reports, uint64_t del
   assert(group_stat(e, "audio_playout_reports") == reports);
   if (reports) assert(group_stat(e, "audio_playout_ms") == delay);
 }
+extern "C" int veil_media_test_audio_processing_controls();
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--audio-processing") == 0) {
+    const int rc = veil_media_test_audio_processing_controls();
+    if (rc != 0) { std::fprintf(stderr, "audio processing controls failed: %d\n", rc); return 1; }
+    std::puts("PASS direct/group native NS controls retain AEC/AGC and live streams");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--missing-audio-device") == 0) {
     const int result = veil_media_test_missing_audio_device();
     if (result != 0) {

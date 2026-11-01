@@ -879,4 +879,62 @@ extern "C" int veil_media_test_audio_transport_ceiling(VeilMediaEngine* e) {
   if (!run_on(e->ws->network_tq.get(), [] {})) return -1;
   return e->ws->audio_route_ceiling->load();
 }
+// Only the test dylib sees these internals. Production exposes local control
+// setters, not arbitrary access to APM or microphones.
+extern "C" int veil_media_test_audio_processing_controls() {
+  struct Factory {
+    bool prior = g_call_plane_recording_adm;
+    Factory() { g_call_plane_recording_adm = true; }
+    ~Factory() { g_call_plane_recording_adm = prior; }
+  } factory;
+  uint8_t local[32] = {0x61}, peer[32] = {0x62};
+  auto voice = [](const auto& apm, bool ns) {
+    const auto config = apm->GetConfig();
+    return config.echo_canceller.enabled && config.noise_suppression.enabled == ns &&
+        config.gain_controller2.enabled && config.gain_controller2.adaptive_digital.enabled &&
+        config.gain_controller2.adaptive_digital.max_gain_db == 30.0f;
+  };
+  if (veil_media_engine_set_noise_suppression(nullptr, 0) != VEIL_MEDIA_ERR_ARG ||
+      veil_media_group_engine_set_noise_suppression(nullptr, 0) != VEIL_MEDIA_ERR_ARG) return 1;
+  {
+    std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(
+        veil_media_engine_create(82, local, peer), veil_media_engine_destroy);
+    if (!e || !voice(e->ws->apm, true)) return 2;
+    if (veil_media_engine_set_noise_suppression(e.get(), 0) != VEIL_MEDIA_OK ||
+        !voice(e->ws->apm, false)) return 3;
+    if (veil_media_engine_start_audio(e.get(), 1, 1) != VEIL_MEDIA_OK) return 4;
+    auto* device = static_cast<StandRecordingAdm*>(e->ws->adm.get());
+    const auto starts = device->recording_starts.load();
+    auto* stream = e->ws->send_stream;
+    for (bool ns : {true, false, true}) {
+      if (veil_media_engine_set_noise_suppression(e.get(), ns) != VEIL_MEDIA_OK ||
+          !voice(e->ws->apm, ns) || !device->Recording() || !device->Playing() ||
+          device->recording_starts.load() != starts || e->ws->send_stream != stream) return 5;
+      device->Capture(10);
+    }
+    if (sent_audio_packets(e->ws.get()) == 0) return 6;
+    if (veil_media_engine_stop_audio(e.get()) != VEIL_MEDIA_OK) return 7;
+  }
+  {
+    std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> e(
+        veil_media_group_engine_create(local), veil_media_group_engine_destroy);
+    if (!e || !voice(e->ws->apm, true)) return 8;
+    if (veil_media_group_engine_set_noise_suppression(e.get(), 0) != VEIL_MEDIA_OK ||
+        !voice(e->ws->apm, false)) return 9;
+    if (veil_media_group_engine_add_peer(e.get(), 83, peer) != VEIL_MEDIA_OK ||
+        veil_media_group_engine_start_audio(e.get()) != VEIL_MEDIA_OK) return 10;
+    auto* device = static_cast<StandRecordingAdm*>(e->ws->adm.get());
+    const auto starts = device->recording_starts.load();
+    auto* stream = e->ws->send_stream;
+    for (bool ns : {true, false, true}) {
+      if (veil_media_group_engine_set_noise_suppression(e.get(), ns) != VEIL_MEDIA_OK ||
+          !voice(e->ws->apm, ns) || !device->Recording() || !device->Playing() ||
+          device->recording_starts.load() != starts || e->ws->send_stream != stream) return 11;
+      device->Capture(10);
+    }
+    if (sent_audio_packets(e->ws.get()) == 0) return 12;
+    if (veil_media_group_engine_stop_audio(e.get()) != VEIL_MEDIA_OK) return 13;
+  }
+  return 0;
+}
 #pragma GCC visibility pop

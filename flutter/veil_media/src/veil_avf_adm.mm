@@ -810,7 +810,9 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
 #if TARGET_OS_IPHONE
     // AVAudioEngine does not choose a bidirectional voice route on iOS by
     // itself. Configure the process audio session before touching inputNode:
-    // VoiceChat enables the platform AEC path, Bluetooth headsets remain
+    // VoiceChat selects voice routing/session policy; this mode alone does
+    // not enable AVAudioEngine voice processing. Call's APM supplies software
+    // AEC. Bluetooth headsets remain
     // available, and the built-in speaker is the safe default for a call.
     AVAudioSession* session = [AVAudioSession sharedInstance];
     NSError* session_error = nil;

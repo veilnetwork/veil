@@ -564,6 +564,16 @@ class VeilMediaEngine {
     return ffi.veilMediaEngineSetMicMuted(_ptr, muted ? 1 : 0) == 0;
   }
 
+  bool get supportsNoiseSuppression =>
+      ffi.veilMediaEngineSetNoiseSuppression != null;
+
+  bool setNoiseSuppression(bool enabled) {
+    _ensure();
+    return ffi.veilMediaEngineSetNoiseSuppression
+            ?.call(_ptr, enabled ? 1 : 0) ==
+        0;
+  }
+
   void setSpeakerMuted(bool muted) {
     _ensure();
     ffi.veilMediaEngineSetSpeakerMuted(_ptr, muted ? 1 : 0);
@@ -705,6 +715,16 @@ class VeilGroupMediaEngine {
   /// Local payload/framing control; does not restart the RTP sender or ADM.
   bool get supportsAudioBudget =>
       ffi.veilMediaGroupEngineSetAudioBudget != null;
+
+  bool get supportsNoiseSuppression =>
+      ffi.veilMediaGroupEngineSetNoiseSuppression != null;
+
+  bool setNoiseSuppression(bool enabled) {
+    _ensure();
+    return ffi.veilMediaGroupEngineSetNoiseSuppression
+            ?.call(_ptr, enabled ? 1 : 0) ==
+        0;
+  }
 
   bool setAudioBudget({required int packetMs, required int payloadBps}) {
     _ensure();
