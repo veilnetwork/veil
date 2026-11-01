@@ -65,7 +65,20 @@ impl DiscoveryPaths {
         } else {
             MAX_PER_PEER
         };
-        if self.requests.len() >= MAX_REQUESTS || count >= cap {
+        // Transit peers, including many distinct peers, cannot spend the
+        // local request budget. Never evict a live return-path witness: it
+        // binds replies to the originally admitted ingress.
+        let local_count = self
+            .requests
+            .values()
+            .filter(|p| p.reply == ReplyTo::Local)
+            .count();
+        let limit = if reply == ReplyTo::Local {
+            MAX_REQUESTS
+        } else {
+            MAX_REQUESTS - MAX_LOCAL_REQUESTS + local_count
+        };
+        if self.requests.len() >= limit || count >= cap {
             return false;
         }
         self.requests.insert(key, RequestPath { reply, at: now });
@@ -198,13 +211,40 @@ mod tests {
     fn global_capacity_refuses_new_entries_without_eviction() {
         let now = Instant::now();
         let mut paths = DiscoveryPaths::default();
-        for i in 0..MAX_REQUESTS {
+        for i in 0..MAX_REQUESTS - MAX_LOCAL_REQUESTS {
             let mut peer = [0; 32];
             peer[..8].copy_from_slice(&(i as u64).to_be_bytes());
             assert!(paths.remember_request(request(i as u32), ReplyTo::Peer(peer), now));
         }
+        for i in 0..MAX_LOCAL_REQUESTS {
+            assert!(paths.remember_request(request(8000 + i as u32), ReplyTo::Local, now));
+        }
+        assert_eq!(paths.requests.len(), MAX_REQUESTS);
+        assert!(!paths.remember_request(request(9999), ReplyTo::Local, now));
+        assert!(!paths.remember_request(request(9999), ReplyTo::Peer([9; 32]), now));
+        assert!(paths.request_path(request(0), now).is_some());
+        assert!(paths.remember_request(request(9999), ReplyTo::Local, now + TTL));
+        assert_eq!(paths.requests.len(), 1);
+    }
+    #[test]
+    fn sybil_request_pressure_keeps_a_bounded_local_reserve() {
+        let now = Instant::now();
+        let mut paths = DiscoveryPaths::default();
+        for i in 0..MAX_REQUESTS - MAX_LOCAL_REQUESTS {
+            let mut peer = [0; 32];
+            peer[..8].copy_from_slice(&((i / MAX_PER_PEER) as u64).to_be_bytes());
+            assert!(paths.remember_request(request(i as u32), ReplyTo::Peer(peer), now));
+        }
+        assert!(!paths.remember_request(request(8000), ReplyTo::Peer([9; 32]), now));
+        for i in 0..MAX_LOCAL_REQUESTS {
+            assert!(paths.remember_request(request(9000 + i as u32), ReplyTo::Local, now));
+        }
+        assert_eq!(paths.requests.len(), MAX_REQUESTS);
         assert!(!paths.remember_request(request(9999), ReplyTo::Local, now));
         assert!(paths.request_path(request(0), now).is_some());
+        // Replays cannot replace another request or renew the reserve lease.
+        assert!(paths.remember_request(request(9000), ReplyTo::Local, now + TTL / 2));
+        assert_eq!(paths.request_path(request(9000), now + TTL), None);
         assert!(paths.remember_request(request(9999), ReplyTo::Local, now + TTL));
         assert_eq!(paths.requests.len(), 1);
     }

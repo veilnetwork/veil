@@ -723,7 +723,7 @@ impl PowChallengePayload {
         buf
     }
 
-    /// Parse the base layout and any recognized discovery context.
+    /// Parse exactly the base layout or the supported signed discovery context.
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
         if buf.len() < Self::WIRE_SIZE {
             return Err(ProtoError::BufferTooShort {
@@ -745,11 +745,21 @@ impl PowChallengePayload {
                     got: buf.len(),
                 });
             }
+            if buf.len() > Self::WIRE_SIZE + 40 {
+                return Err(ProtoError::TrailingBytes {
+                    trailing: buf.len() - Self::WIRE_SIZE - 40,
+                });
+            }
             Some(PowChallengeContext {
                 request_id: u32::from_be_bytes(super::read_array::<4>(buf, Self::WIRE_SIZE + 4)?),
                 ed25519_pubkey: super::read_array::<32>(buf, Self::WIRE_SIZE + 8)?,
             })
         } else {
+            if !extra.is_empty() {
+                return Err(ProtoError::TrailingBytes {
+                    trailing: extra.len(),
+                });
+            }
             None
         };
         Ok(Self {
@@ -1314,6 +1324,37 @@ mod tests {
         assert_ne!(signed, p.signable_bytes());
         p.context = None;
         assert_ne!(signed, p.signable_bytes());
+    }
+
+    #[test]
+    fn pow_challenge_rejects_unrecognized_or_trailing_extensions() {
+        let mut p = PowChallengePayload {
+            requester_node_id: [1; 32],
+            acceptor_node_id: [2; 32],
+            challenge_nonce: [3; 32],
+            difficulty: 4,
+            signature: [5; 64],
+            context: None,
+        };
+        for context in [
+            None,
+            Some(PowChallengeContext {
+                request_id: 6,
+                ed25519_pubkey: [7; 32],
+            }),
+        ] {
+            p.context = context;
+            let encoded = p.encode();
+            assert_eq!(PowChallengePayload::decode(&encoded).unwrap(), p);
+            for suffix in [vec![0], vec![0; 40], b"unknown extension".to_vec()] {
+                let mut malformed = encoded.clone();
+                malformed.extend(suffix);
+                assert!(PowChallengePayload::decode(&malformed).is_err());
+            }
+        }
+        let mut unknown = p.encode();
+        unknown[PowChallengePayload::WIRE_SIZE] ^= 1;
+        assert!(PowChallengePayload::decode(&unknown).is_err());
     }
 
     #[test]
