@@ -706,6 +706,21 @@ extern "C" int veil_media_test_audio_capture_tone(
   return VEIL_MEDIA_OK;
 }
 
+// Explicit codec-only qualification, never a production constructor default.
+// Identical periodic tones at both ends form a correlated AEC reference even
+// without an acoustic echo. Keep DSP-on speech/controls as a separate oracle.
+extern "C" int veil_media_test_use_codec_only_tones(VeilMediaEngine* e) {
+  if (!e) return VEIL_MEDIA_ERR_ARG;
+  if (!e->ws || !e->ws->apm) return VEIL_MEDIA_ERR_STATE;
+  auto config = e->ws->apm->GetConfig();
+  config.echo_canceller.enabled = false;
+  config.noise_suppression.enabled = false;
+  e->ws->apm->ApplyConfig(config);
+  config = e->ws->apm->GetConfig();
+  return !config.echo_canceller.enabled && !config.noise_suppression.enabled
+      ? VEIL_MEDIA_OK : VEIL_MEDIA_ERR_STATE;
+}
+
 // The host chooses its own pre-start route controls. Anonymous routes must
 // not inherit the non-onion helper's packet-overhead/1000-byte RTP overrides.
 extern "C" VeilMediaEngine* veil_media_test_codec_create_unstarted(
@@ -917,6 +932,18 @@ extern "C" int veil_media_test_audio_processing_controls() {
   };
   if (veil_media_engine_set_noise_suppression(nullptr, 0) != VEIL_MEDIA_ERR_ARG ||
       veil_media_group_engine_set_noise_suppression(nullptr, 0) != VEIL_MEDIA_ERR_ARG) return 1;
+  if (veil_media_test_use_codec_only_tones(nullptr) != VEIL_MEDIA_ERR_ARG) return 15;
+  {
+    std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(
+        veil_media_engine_create(84, local, peer), veil_media_engine_destroy);
+    if (!e || !voice(e->ws->apm, true) ||
+        veil_media_test_use_codec_only_tones(e.get()) != VEIL_MEDIA_OK) return 16;
+    const auto config = e->ws->apm->GetConfig();
+    if (config.echo_canceller.enabled || config.noise_suppression.enabled ||
+        !config.gain_controller2.enabled ||
+        !config.gain_controller2.adaptive_digital.enabled) return 17;
+  }
+  // A prior codec-only fixture must not alter later ordinary engines.
   {
     std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(
         veil_media_engine_create(82, local, peer), veil_media_engine_destroy);
