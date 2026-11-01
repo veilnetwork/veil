@@ -41,6 +41,17 @@ fn client_only_trace_keeps_its_diagnostics() {
         } else {
             assert!(log::log_enabled!(log::Level::Info));
             log::info!("CLIENT_TRACE_CONSOLE_MARKER");
+            let cipher =
+                crate::media::cipher_for_test(&[0x15; 32], &[0x16; 32], &[0x17; 32]).unwrap();
+            let sealed = cipher.seal(b"PRIVATE_CONTROL_SAMPLE_PLAINTEXT").unwrap();
+            let expected =
+                veil_util::hex_str(&<sha2::Sha256 as sha2::Digest>::digest(sealed.as_bytes()));
+            // A candidate control has no RTP header. It still needs an opaque
+            // witness to join the endpoint to role-blind relay observations.
+            crate::media::trace_sealed_cell("diagnostic_test", &[0x15; 32], sealed.as_bytes());
+            crate::veil_debug_set_rt_trace(0);
+            crate::media::trace_sealed_cell("diagnostic_disabled", &[0x15; 32], sealed.as_bytes());
+            eprintln!("CLIENT_TRACE_SAMPLE_SHA:{expected}");
         }
         assert_eq!(crate::veil_debug_flush_console_logs(2000), 0);
         assert_eq!(crate::veil_debug_console_log_dropped(), 0);
@@ -69,5 +80,18 @@ fn client_only_trace_keeps_its_diagnostics() {
             usize::from(mode == "default"),
             "{mode}: {stderr}"
         );
+        if mode == "default" {
+            let expected = stderr
+                .lines()
+                .find_map(|line| line.strip_prefix("CLIENT_TRACE_SAMPLE_SHA:"))
+                .unwrap();
+            assert!(
+                stderr.contains(&format!("opaque_sha256={expected}")),
+                "missing opaque control witness: {stderr}"
+            );
+            assert_eq!(stderr.matches("opaque_sha256=").count(), 1);
+            assert!(!stderr.contains("PRIVATE_CONTROL_SAMPLE_PLAINTEXT"));
+            assert!(!stderr.contains("diagnostic_disabled"));
+        }
     }
 }
