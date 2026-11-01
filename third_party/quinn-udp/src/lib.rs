@@ -152,6 +152,30 @@ pub struct Transmit<'a> {
     pub src_ip: Option<IpAddr>,
 }
 
+/// Optional diagnostic hook for local errors which `UdpSocketState::send`
+/// converts to success. It does not change UDP retry/error semantics. The
+/// observer must not retain the borrowed transmit or expose its addresses.
+#[cfg(not(wasm_browser))]
+pub fn set_send_error_observer(observer: fn(&Transmit<'_>, &std::io::Error)) -> bool {
+    SEND_ERROR_OBSERVER.set(observer).is_ok()
+}
+
+#[cfg(not(wasm_browser))]
+type SendErrorObserver = fn(&Transmit<'_>, &std::io::Error);
+#[cfg(not(wasm_browser))]
+static SEND_ERROR_OBSERVER: std::sync::OnceLock<SendErrorObserver> = std::sync::OnceLock::new();
+
+#[cfg(not(wasm_browser))]
+fn observe_send_error(transmit: &Transmit<'_>, result: &std::io::Result<()>) {
+    if let Err(error) = result {
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            if let Some(observer) = SEND_ERROR_OBSERVER.get() {
+                observer(transmit, error);
+            }
+        }
+    }
+}
+
 /// Log at most 1 IO error per minute
 #[cfg(not(wasm_browser))]
 const IO_ERROR_LOG_INTERVAL: Duration = std::time::Duration::from_secs(60);
@@ -238,5 +262,60 @@ impl EcnCodepoint {
                 return None;
             }
         })
+    }
+}
+
+#[cfg(all(test, unix))]
+mod send_error_observer_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static OBSERVED: AtomicUsize = AtomicUsize::new(0);
+    fn observer(transmit: &Transmit<'_>, error: &std::io::Error) {
+        if transmit.contents.starts_with(b"observed-ignored-send") {
+            assert_ne!(error.kind(), std::io::ErrorKind::WouldBlock);
+            OBSERVED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn actual_ignored_kernel_errors_are_observed_without_changing_send_policy() {
+        assert!(set_send_error_observer(observer));
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let state = UdpSocketState::new((&socket).into()).unwrap();
+        let mut oversized = vec![0; 65536];
+        let marker = b"observed-ignored-send";
+        oversized[..marker.len()].copy_from_slice(marker);
+        let mut transmit = Transmit {
+            destination: "127.0.0.1:9".parse().unwrap(),
+            ecn: None,
+            contents: &oversized,
+            segment_size: None,
+            src_ip: None,
+        };
+        assert!(state.try_send((&socket).into(), &transmit).is_err());
+        assert_eq!(
+            OBSERVED.load(Ordering::SeqCst),
+            0,
+            "try_send exposes its own errors"
+        );
+        state.send((&socket).into(), &transmit).unwrap();
+        assert_eq!(
+            OBSERVED.load(Ordering::SeqCst),
+            1,
+            "EMSGSIZE is still ignored but observable"
+        );
+        // A v4-only socket cannot send an IPv6 datagram. Exercise a second
+        // error class without relying on whether a platform allows port zero.
+        transmit.destination = "[::1]:9".parse().unwrap();
+        transmit.contents = marker;
+        assert!(state.try_send((&socket).into(), &transmit).is_err());
+        state.send((&socket).into(), &transmit).unwrap();
+        assert_eq!(OBSERVED.load(Ordering::SeqCst), 2);
+        observe_send_error(&transmit, &Err(std::io::ErrorKind::WouldBlock.into()));
+        assert_eq!(
+            OBSERVED.load(Ordering::SeqCst),
+            2,
+            "backpressure is not a dropped send"
+        );
     }
 }

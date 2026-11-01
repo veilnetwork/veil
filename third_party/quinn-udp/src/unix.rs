@@ -252,7 +252,9 @@ impl UdpSocketState {
     /// If you would like to handle these errors yourself, use [`UdpSocketState::try_send`]
     /// instead.
     pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        match send(self, socket.0, transmit) {
+        let result = send(self, socket.0, transmit);
+        super::observe_send_error(transmit, &result);
+        match result {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
             // - EMSGSIZE is expected for MTU probes. Future work might be able to avoid
