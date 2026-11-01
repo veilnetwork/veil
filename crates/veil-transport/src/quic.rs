@@ -112,7 +112,9 @@ pub struct QuicDatagramPathStats {
     /// IP/UDP headers; prepared sends can still be waiting for the socket.
     pub udp_sent_bytes: u64,
     pub udp_received_bytes: u64,
-    /// UDP payload bytes successfully handed to the socket, not remote ACKs.
+    /// UDP payload bytes admitted by the socket API, not remote ACKs. The UDP
+    /// backend may ignore local errors; opt-in rejected_datagram trace reveals
+    /// those, so this counter alone does not prove kernel or wire acceptance.
     pub udp_socket_sent_bytes: u64,
     pub acknowledgments_received: u64,
     pub stream_frames_sent: u64,

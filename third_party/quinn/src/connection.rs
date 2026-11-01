@@ -45,16 +45,17 @@ pub struct ConnectionDriverStats {
     pub timer_late_max_us: u64,
     /// Number of timers processed at least 100 ms late.
     pub timer_stalls: u64,
-    /// Last wait from packet preparation until successful UDP socket handoff.
+    /// Last wait from packet preparation until the UDP API admitted the send.
     pub udp_send_wait_last_us: u64,
     /// Largest completed packet-to-socket wait (does not measure kernel/network time).
     pub udp_send_wait_max_us: u64,
-    /// Number of completed UDP handoffs delayed at least 100 ms locally.
+    /// Number of UDP API admissions delayed at least 100 ms locally.
     pub udp_send_stalls: u64,
     /// Age of a prepared transmit still waiting for the UDP socket, at snapshot time.
     pub udp_send_pending_us: u64,
-    /// UDP payload bytes successfully handed to the socket. Excludes IP/UDP
-    /// headers and does not imply network delivery or remote acknowledgment.
+    /// UDP payload bytes admitted by the socket API. Some backends deliberately
+    /// ignore local errors, exposed separately by the opt-in send-error trace.
+    /// Excludes IP/UDP headers; not proof of kernel or remote acceptance.
     pub udp_socket_sent_bytes: u64,
 }
 

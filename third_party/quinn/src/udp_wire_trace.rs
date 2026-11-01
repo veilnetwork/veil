@@ -2,8 +2,9 @@
 //! No addresses, wire connection IDs, contents, media roles or wire fields are emitted.
 //! A process-local connection ordinal joins send samples to transport counters;
 //! it is neither a pointer nor a protocol identifier and never leaves the log.
-//! This measures socket handoff to peer socket read, including kernel/scheduling
-//! time; it does not on its own attribute that delay to the carrier.
+//! Send samples mark UDP API admission; the backend can ignore local errors.
+//! An opt-in rejected-datagram sample distinguishes those from kernel sends.
+//! Timing includes kernel/scheduling and does not itself attribute carrier delay.
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -17,17 +18,61 @@ static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
 static NEXT_CONNECTION_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn next_connection_trace_id() -> u64 {
+    // Install the environment-gated UDP observer before a connection driver
+    // can perform its very first send, including an ignored local error.
+    let _ = enabled();
     NEXT_CONNECTION_TRACE_ID.fetch_add(1, Ordering::Relaxed)
 }
 fn enabled_cell() -> &'static AtomicBool {
     ENABLED.get_or_init(|| {
-        AtomicBool::new(std::env::var("VEIL_RT_TRACE").is_ok_and(|v| v.trim() == "1"))
+        let on = std::env::var("VEIL_RT_TRACE").is_ok_and(|v| v.trim() == "1");
+        #[cfg(not(wasm_browser))]
+        if on {
+            let _ = udp::set_send_error_observer(record_send_error);
+        }
+        AtomicBool::new(on)
     })
 }
 
 /// Toggle local encrypted-datagram correlation. Disabled by default.
 pub fn set_udp_wire_trace(on: bool) {
     enabled_cell().store(on, Ordering::Relaxed);
+    #[cfg(not(wasm_browser))]
+    if on {
+        let _ = udp::set_send_error_observer(record_send_error);
+    }
+}
+
+#[cfg(not(wasm_browser))]
+fn record_send_error(transmit: &udp::Transmit<'_>, error: &std::io::Error) {
+    if !enabled() {
+        return;
+    }
+    // The UDP API deliberately ignores non-WouldBlock errors, including MTU
+    // probe errors. A following `stage=send` therefore means API admission,
+    // not necessarily kernel acceptance. Expose that distinction without the
+    // source/destination addresses or free-form OS exception text.
+    let errno = error.raw_os_error().unwrap_or(0);
+    log::info!(
+        "quic.udp_wire.send_error errno={errno} kind={:?} bytes={} segment_size={}",
+        error.kind(),
+        transmit.contents.len(),
+        transmit.segment_size.unwrap_or(0),
+    );
+    for bytes in transmit.contents.chunks(
+        transmit
+            .segment_size
+            .filter(|n| *n > 0)
+            .unwrap_or(transmit.contents.len().max(1)),
+    ) {
+        let digest = fingerprint(bytes);
+        if digest & 15 == 0 {
+            log::info!(
+                "quic.udp_wire.rejected_datagram errno={errno} digest={digest:016x} bytes={}",
+                bytes.len(),
+            );
+        }
+    }
 }
 
 // This is a correlation tag, not an authentication primitive. Fixed keys of
@@ -131,13 +176,26 @@ mod tests {
         record_receive(&a, Some(123456789), true);
         record_send(&batch, Some(1200), 41);
         record_send(&a, None, 42);
+        let error = std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "PRIVATE_DIAGNOSTIC_SENTINEL",
+        );
+        let transmit = udp::Transmit {
+            destination: "127.0.0.1:9".parse().unwrap(),
+            ecn: None,
+            contents: &batch,
+            segment_size: Some(1200),
+            src_ip: None,
+        };
+        record_send_error(&transmit, &error);
         set_udp_wire_trace(false);
         record("send", &batch, Some(1200));
         record_send(&a, None, 41);
+        record_send_error(&transmit, &error);
         let rows = LOGGER.0.lock().unwrap();
         assert_eq!(
             rows.len(),
-            7,
+            10,
             "SDK log bridge must receive sampled datagrams"
         );
         assert!(rows[0].contains("stage=send"));
@@ -160,6 +218,14 @@ mod tests {
         assert!(rows[6].contains("connection_trace_id=42"));
         assert_eq!(digest(&rows[0]), digest(&rows[4]));
         assert_eq!(digest(&rows[4]), digest(&rows[6]));
+        assert!(rows[7].contains("quic.udp_wire.send_error errno=0 kind=InvalidInput"));
+        assert_eq!(digest(&rows[0]), digest(&rows[8]));
+        assert!(rows[8].contains("quic.udp_wire.rejected_datagram"));
+        assert_eq!(digest(&rows[1]), digest(&rows[9]));
+        for row in rows.iter() {
+            assert!(!row.contains("PRIVATE_DIAGNOSTIC_SENTINEL"));
+            assert!(!row.contains("127.0.0.1"));
+        }
     }
 
     #[test]
