@@ -887,6 +887,16 @@ extern "C" int veil_media_test_audio_processing_controls() {
     Factory() { g_call_plane_recording_adm = true; }
     ~Factory() { g_call_plane_recording_adm = prior; }
   } factory;
+  const auto exported = [](char* json, bool ns) {
+    if (!json) return false;
+    const std::string value(json);
+    veil_media_free_string(json);
+    return value.find("\"audio_aec_enabled\":1") != std::string::npos &&
+        value.find(std::string("\"audio_ns_enabled\":") + (ns ? "1" : "0")) != std::string::npos &&
+        value.find("\"audio_agc_enabled\":1") != std::string::npos;
+  };
+  if (audio_processing_stats(nullptr) !=
+      ",\"audio_aec_enabled\":-1,\"audio_ns_enabled\":-1,\"audio_agc_enabled\":-1") return 14;
   uint8_t local[32] = {0x61}, peer[32] = {0x62};
   auto voice = [](const auto& apm, bool ns) {
     const auto config = apm->GetConfig();
@@ -899,7 +909,8 @@ extern "C" int veil_media_test_audio_processing_controls() {
   {
     std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> e(
         veil_media_engine_create(82, local, peer), veil_media_engine_destroy);
-    if (!e || !voice(e->ws->apm, true)) return 2;
+    if (!e || !voice(e->ws->apm, true) ||
+        !exported(veil_media_engine_get_stats(e.get()), true)) return 2;
     if (veil_media_engine_set_noise_suppression(e.get(), 0) != VEIL_MEDIA_OK ||
         !voice(e->ws->apm, false)) return 3;
     if (veil_media_engine_start_audio(e.get(), 1, 1) != VEIL_MEDIA_OK) return 4;
@@ -909,7 +920,8 @@ extern "C" int veil_media_test_audio_processing_controls() {
     for (bool ns : {true, false, true}) {
       if (veil_media_engine_set_noise_suppression(e.get(), ns) != VEIL_MEDIA_OK ||
           !voice(e->ws->apm, ns) || !device->Recording() || !device->Playing() ||
-          device->recording_starts.load() != starts || e->ws->send_stream != stream) return 5;
+          device->recording_starts.load() != starts || e->ws->send_stream != stream ||
+          !exported(veil_media_engine_get_stats(e.get()), ns)) return 5;
       device->Capture(10);
     }
     if (sent_audio_packets(e->ws.get()) == 0) return 6;
@@ -918,7 +930,8 @@ extern "C" int veil_media_test_audio_processing_controls() {
   {
     std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> e(
         veil_media_group_engine_create(local), veil_media_group_engine_destroy);
-    if (!e || !voice(e->ws->apm, true)) return 8;
+    if (!e || !voice(e->ws->apm, true) ||
+        !exported(veil_media_group_engine_get_stats(e.get()), true)) return 8;
     if (veil_media_group_engine_set_noise_suppression(e.get(), 0) != VEIL_MEDIA_OK ||
         !voice(e->ws->apm, false)) return 9;
     if (veil_media_group_engine_add_peer(e.get(), 83, peer) != VEIL_MEDIA_OK ||
@@ -929,7 +942,8 @@ extern "C" int veil_media_test_audio_processing_controls() {
     for (bool ns : {true, false, true}) {
       if (veil_media_group_engine_set_noise_suppression(e.get(), ns) != VEIL_MEDIA_OK ||
           !voice(e->ws->apm, ns) || !device->Recording() || !device->Playing() ||
-          device->recording_starts.load() != starts || e->ws->send_stream != stream) return 11;
+          device->recording_starts.load() != starts || e->ws->send_stream != stream ||
+          !exported(veil_media_group_engine_get_stats(e.get()), ns)) return 11;
       device->Capture(10);
     }
     if (sent_audio_packets(e->ws.get()) == 0) return 12;
