@@ -170,6 +170,9 @@ impl HotStandbyController {
     /// in the map. On success the entry is inserted into `auto_alt_uris`
     /// — `alt_uri_for` will fall back to it when no operator-configured
     /// alt URI exists. Returns the chosen URI for observability.
+    /// A non-empty refreshed list replaces the learned set, including when
+    /// it contains no usable alternate. An empty list leaves prior knowledge
+    /// intact, matching the runtime's legacy/omitted-TLV handling.
     pub fn auto_set_alt_uri_from_transports(
         &self,
         peer_id: NodeId,
@@ -203,6 +206,16 @@ impl HotStandbyController {
             }
             map.insert(key, candidate.clone());
             return Some(candidate.clone());
+        }
+        if !transports.is_empty() {
+            // A fresh authenticated advertisement can withdraw its old
+            // listener. Keeping that entry would keep selecting a route the
+            // peer no longer offers. Explicit operator configuration lives
+            // in a separate map and must not be cleared by peer updates.
+            self.auto_alt_uris
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(peer_id.as_bytes());
         }
         None
     }
@@ -598,6 +611,100 @@ mod tests {
                 .is_none()
         );
         assert!(c.alt_uri_for(&peer).is_none());
+    }
+
+    #[test]
+    fn auto_set_alt_uri_refresh_withdraws_previous_alternate() {
+        let c = test_controller(4);
+        let peer = NodeId::from([0x61; 32]);
+        let primary = "tcp://primary.example:9000";
+        c.auto_set_alt_uri_from_transports(
+            peer,
+            &[primary.to_owned(), "tls://old.example:9443".to_owned()],
+            primary,
+        );
+        assert_eq!(
+            c.alt_uri_for(&peer).as_deref(),
+            Some("tls://old.example:9443")
+        );
+
+        assert!(
+            c.auto_set_alt_uri_from_transports(peer, &[primary.to_owned()], primary)
+                .is_none()
+        );
+        assert!(
+            c.alt_uri_for(&peer).is_none(),
+            "a fresh list withdrew the old listener"
+        );
+        assert!(!c.try_auto_trigger(peer, [1; 32], [2; 32]));
+    }
+
+    #[test]
+    fn auto_set_alt_uri_refresh_preserves_manual_and_other_peer() {
+        let c = test_controller(4);
+        let peer = NodeId::from([0x62; 32]);
+        let other = NodeId::from([0x63; 32]);
+        let primary = "tcp://primary.example:9000";
+        c.auto_set_alt_uri_from_transports(peer, &["tls://old.example:9443".to_owned()], primary);
+        c.auto_set_alt_uri_from_transports(
+            other,
+            &["tls://other.example:9443".to_owned()],
+            primary,
+        );
+        c.set_alt_uri(peer, "tls://operator.example:9443".to_owned());
+
+        c.auto_set_alt_uri_from_transports(peer, &[primary.to_owned()], primary);
+        assert_eq!(
+            c.alt_uri_for(&peer).as_deref(),
+            Some("tls://operator.example:9443")
+        );
+        c.clear_alt_uri(&peer);
+        assert!(
+            c.alt_uri_for(&peer).is_none(),
+            "removing manual config must not reveal a withdrawn listener"
+        );
+        assert_eq!(
+            c.alt_uri_for(&other).as_deref(),
+            Some("tls://other.example:9443")
+        );
+    }
+
+    #[test]
+    fn auto_set_alt_uri_refresh_discards_previous_when_no_dialable_alternative() {
+        let c = test_controller(4);
+        let peer = NodeId::from([0x64; 32]);
+        let primary = "tcp://primary.example:9000";
+        c.auto_set_alt_uri_from_transports(peer, &["tls://old.example:9443".to_owned()], primary);
+        let replacement = [
+            "not-an-endpoint".to_owned(),
+            "webtunnel-wss://new.example:8443".to_owned(),
+        ];
+
+        assert!(
+            c.auto_set_alt_uri_from_transports(peer, &replacement, primary)
+                .is_none()
+        );
+        assert!(
+            c.alt_uri_for(&peer).is_none(),
+            "no usable replacement must not leave the old listener selected"
+        );
+    }
+
+    #[test]
+    fn auto_set_alt_uri_empty_update_retains_previous_alternate() {
+        // Runtime skips an empty list: a legacy/resumed peer may omit the TLV.
+        let c = test_controller(4);
+        let peer = NodeId::from([0x65; 32]);
+        let primary = "tcp://primary.example:9000";
+        c.auto_set_alt_uri_from_transports(peer, &["tls://old.example:9443".to_owned()], primary);
+        assert!(
+            c.auto_set_alt_uri_from_transports(peer, &[], primary)
+                .is_none()
+        );
+        assert_eq!(
+            c.alt_uri_for(&peer).as_deref(),
+            Some("tls://old.example:9443")
+        );
     }
 
     #[test]
