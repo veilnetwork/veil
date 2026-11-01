@@ -977,6 +977,32 @@ impl NodeServices {
         }
     }
 
+    /// Retain every connector until node shutdown has cancelled and joined it.
+    /// A shutdown watch is not ownership: an active SessionRunner does not poll
+    /// the connector's watch while it owns its canonical stream. Returning only
+    /// abort handles lets LAN candidates retire their connector without detaching
+    /// its join handle from the node.
+    pub(crate) fn spawn_owned_outbound_peers(
+        &self,
+        peers: Vec<crate::types::PeerConfigEntry>,
+        shutdown: &tokio::sync::watch::Sender<bool>,
+    ) -> Vec<tokio::task::AbortHandle> {
+        // Serialize admission with do_stop_tasks' snapshot. Once it has signalled
+        // shutdown no stale producer can add a new connector behind that snapshot;
+        // one admitted before the signal is registered before teardown takes it.
+        let mut tasks = lock_tasks(&self.tasks);
+        if *shutdown.borrow() {
+            return Vec::new();
+        }
+        let handles = crate::outbound_connector::spawn_outbound_peers(peers, self, shutdown);
+        let aborts = handles.iter().map(|handle| handle.abort_handle()).collect();
+        if tasks.peers.len() + handles.len() >= 256 {
+            tasks.peers.retain(|handle| !handle.is_finished());
+        }
+        tasks.peers.extend(handles);
+        aborts
+    }
+
     pub(crate) fn spawn_punched_inbound(
         &self,
         connection: Box<dyn veil_transport::TransportConnection>,

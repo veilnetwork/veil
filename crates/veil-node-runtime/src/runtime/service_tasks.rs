@@ -2312,11 +2312,7 @@ pub(crate) async fn dial_and_learn(
     // so the ordinary reconnect loop can own it from here. It claims one slot
     // per node_id, so a peer met at two meeting points -- or met again on the
     // next pass -- still gets exactly one.
-    let handles =
-        crate::outbound_connector::spawn_outbound_peers(vec![proven.clone()], access, shutdown_tx);
-    // Detached on purpose: each loop watches the same shutdown channel and
-    // ends with it, and this task has no task-set of its own to park them in.
-    drop(handles);
+    access.spawn_owned_outbound_peers(vec![proven.clone()], shutdown_tx);
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

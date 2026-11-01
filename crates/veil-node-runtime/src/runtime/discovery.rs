@@ -881,7 +881,6 @@ impl NodeRuntime {
         let dht = Arc::clone(&self.dht);
         let access = self.access();
         let shutdown_tx = self.shutdown_tx.clone();
-        let tasks = Arc::clone(&self.tasks);
 
         let handle = supervised_spawn(Arc::clone(&self.logger), "lan_discovery", async move {
             let bound = match announce {
@@ -1075,13 +1074,8 @@ impl NodeRuntime {
                 lock_state(&state).peers.insert(peer_id, entry.clone());
                 let mut abort = None;
                 if let Some(ref stx) = shutdown_tx {
-                    let handles =
-                        crate::outbound_connector::spawn_outbound_peers(vec![entry], &access, stx);
-                    // The abort handle stays with the candidate; the join
-                    // handle stays with the task list, so shutdown still
-                    // waits for it.
-                    abort = handles.first().map(|h| h.abort_handle());
-                    lock_tasks(&tasks).sessions.extend(handles);
+                    let handles = access.spawn_owned_outbound_peers(vec![entry], stx);
+                    abort = handles.first().cloned();
                 }
                 seen.insert(
                     bp.public_key.clone(),

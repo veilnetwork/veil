@@ -143,7 +143,6 @@ impl NodeRuntime {
             let dht = Arc::clone(&self.dht);
             let access = self.access();
             let shutdown_tx = self.shutdown_tx.clone();
-            let tasks = Arc::clone(&self.tasks);
             let my_pubkey_async = my_pubkey.clone();
             // Snapshot every pubkey we already know about (operator-curated
             // bootstrap_peers + configured peers + cache). Captured here
@@ -310,12 +309,7 @@ impl NodeRuntime {
                         };
                         lock_state(&state).peers.insert(peer_id, entry.clone());
                         if let Some(ref stx) = shutdown_tx {
-                            let handles = crate::outbound_connector::spawn_outbound_peers(
-                                vec![entry],
-                                &access,
-                                stx,
-                            );
-                            lock_tasks(&tasks).sessions.extend(handles);
+                            access.spawn_owned_outbound_peers(vec![entry], stx);
                         }
                     }
                 },
@@ -364,7 +358,6 @@ impl NodeRuntime {
             let dht = Arc::clone(&self.dht);
             let access = self.access();
             let shutdown_tx = self.shutdown_tx.clone();
-            let tasks = Arc::clone(&self.tasks);
             let my_pubkey_async = my_pubkey.clone();
             // What this operator will accept from an unsigned TXT record. No
             // pins and the last resort allowed is the default, which is what
@@ -435,12 +428,7 @@ impl NodeRuntime {
                     };
                     lock_state(&state).peers.insert(peer_id, entry.clone());
                     if let Some(ref stx) = shutdown_tx {
-                        let handles = crate::outbound_connector::spawn_outbound_peers(
-                            vec![entry],
-                            &access,
-                            stx,
-                        );
-                        lock_tasks(&tasks).sessions.extend(handles);
+                        access.spawn_owned_outbound_peers(vec![entry], stx);
                     }
                 }
             });
@@ -565,12 +553,8 @@ impl NodeRuntime {
             lock_state(&self.state).peers.insert(peer_id, entry.clone());
 
             if let Some(ref shutdown_tx) = self.shutdown_tx {
-                let handles = crate::outbound_connector::spawn_outbound_peers(
-                    vec![entry],
-                    &self.access(),
-                    shutdown_tx,
-                );
-                lock_tasks(&self.tasks).sessions.extend(handles);
+                self.access()
+                    .spawn_owned_outbound_peers(vec![entry], shutdown_tx);
             }
         }
     }
@@ -634,7 +618,6 @@ impl NodeRuntime {
         let state = Arc::clone(&self.state);
         let dht = Arc::clone(&self.dht);
         let access = self.access();
-        let tasks = Arc::clone(&self.tasks);
         let metrics = self.metrics.clone();
         let my_pubkey = self.identity.local_identity.public_key.clone();
 
@@ -730,24 +713,7 @@ impl NodeRuntime {
                             };
                             lock_state(&state).peers.insert(peer_id, entry.clone());
 
-                            let handles =
-                                crate::outbound_connector::spawn_outbound_peers(
-                                    vec![entry],
-                                    &access,
-                                    &shutdown_tx_clone,
-                                );
-                            // Funnel through push_session_handle so the
-                            // 256-entry prune-on-overflow logic catches
-                            // the stale JoinHandles from prior retry
-                            // waves; raw `extend` bypasses pruning and
-                            // grows the Vec linearly with retry count.
-                            {
-                                let mut t = lock_tasks(&tasks);
-                                if t.sessions.len() + handles.len() >= 256 {
-                                    t.sessions.retain(|h| !h.is_finished());
-                                }
-                                t.sessions.extend(handles);
-                            }
+                            access.spawn_owned_outbound_peers(vec![entry], &shutdown_tx_clone);
                         }
                     }
                     Ok(_) = shutdown_rx.changed() => {

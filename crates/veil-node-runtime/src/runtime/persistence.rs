@@ -354,7 +354,7 @@ pub fn load_discovered_peers(
             // exactly when a censored node has nothing else to bootstrap from.
             st.handshaked.insert(*node_id.as_bytes());
         }
-        let _ = crate::outbound_connector::spawn_outbound_peers(vec![entry], access, shutdown_tx);
+        access.spawn_owned_outbound_peers(vec![entry], shutdown_tx);
         restored += 1;
     }
     LoadOutcome::Loaded { count: restored }

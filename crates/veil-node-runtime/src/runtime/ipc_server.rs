@@ -608,16 +608,14 @@ impl NodeRuntime {
                 let dial_access = self.access();
                 let dial_shutdown_tx = shutdown_tx.clone();
                 let mut dial_shutdown_rx = shutdown_tx.subscribe();
-                tokio::spawn(async move {
+                let dial_handle = tokio::spawn(async move {
                     loop {
                         tokio::select! {
                             _ = dial_shutdown_rx.changed() => break,
                             recv = dial_rx.recv() => match recv {
                                 Some(entry) => {
-                                    let _ = crate::outbound_connector::spawn_outbound_peers(
-                                        vec![entry],
-                                        &dial_access,
-                                        &dial_shutdown_tx,
+                                    dial_access.spawn_owned_outbound_peers(
+                                        vec![entry], &dial_shutdown_tx,
                                     );
                                     // A repeat join for an already-claimed peer
                                     // no-ops in spawn_outbound_peers (per-node-id
@@ -633,6 +631,7 @@ impl NodeRuntime {
                         }
                     }
                 });
+                super::push_session_handle(&self.tasks, dial_handle);
             }
             Arc::new(crate::bootstrap_join::BootstrapJoinForwarder::new(
                 Arc::clone(&self.logger),
