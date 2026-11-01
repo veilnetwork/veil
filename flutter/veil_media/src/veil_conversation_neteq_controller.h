@@ -75,7 +75,7 @@ class ConversationNetEqController final : public webrtc::DecisionLogic {
       // Preserve one complete packet and the actual recent arrival variation
       // before borrowing local queue headroom. Future packets beyond a hole
       // cannot fund speech acceleration ahead of that hole.
-      const int reserve = std::max(target, history_->GetMaxDelayMs() + packet_ms) + 20;
+      const int reserve = std::max(target, history_->GetMaxDelayMs()) + packet_ms + 20;
       const bool contiguous = !status.packet_buffer_info.dtx_or_cng &&
           status.packet_buffer_info.num_packets > 0 &&
           status.packet_buffer_info.span_samples == status.packet_buffer_info.num_samples;

@@ -1,5 +1,7 @@
 // Three real group mixers/Opus pipelines; a mocked Veil boundary forwards
-// every packet FIFO. No physical microphone, speaker or network is opened.
+// every packet FIFO. Tone factories isolate codec/receiver timing from AEC/NS;
+// default speech DSP has its own real-APM controls/near-speech tests.
+// No physical microphone, speaker or network is opened.
 #undef NDEBUG
 #include "veil_media_engine.h"
 #include <algorithm>
@@ -223,6 +225,8 @@ int main(int argc, char** argv) {
              &drive) == 0);
   char *stats = veil_media_group_engine_get_stats(engines[0].get());
   assert(stats);
+  assert(std::strstr(stats, "\"audio_aec_enabled\":0"));
+  assert(std::strstr(stats, "\"audio_ns_enabled\":0"));
   // Mock participant ids contain NUL/control bytes. The native JSON must
   // encode them, not terminate midway through video_delivery_peers.
   for (const auto c : std::string(stats))

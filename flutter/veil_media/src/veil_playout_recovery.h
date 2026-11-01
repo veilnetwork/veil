@@ -72,18 +72,18 @@ class RecoveringNetEq final : public webrtc::NetEq {
       for (; skipped < 16;) {
         const auto state = inner_->GetOperationsAndState();
         // Storage alone misses time already spent upstream. Use only an
-        // aligned decoded-packet clock, and require a complete packet plus
-        // 30 ms before an extra 10-ms pull. PLC/error guards remain below.
+        // aligned decoded-packet clock and preserve the packet-sized jitter
+        // reserve before an extra 10-ms pull. PLC/error guards remain below.
         const auto lag = UpdateDecodedClock(*frame)
             ? rtp_lag_.Output(frame->timestamp_, webrtc::TimeMicros()) : std::nullopt;
         // RTP age also includes time spent upstream. Do not repeatedly cut a
         // local queue below NetEq's own jitter reserve: it will refill toward
-        // that target and manufacture another catch-up event. Preserve one
-        // packet around the actual adaptive target before using age alone.
+        // that target and manufacture another catch-up event. Arrival/decoder
+        // headroom must be the same for age-only and storage-driven catch-up.
         // The independent hard storage budget below remains unchanged.
         const int64_t local_reserve_ms = std::max<int64_t>(
             frame_headroom_ms_ + 30,
-            static_cast<int64_t>(std::max(0, inner_->TargetDelayMs())) + frame_headroom_ms_);
+            JitterReserveMs());
         const bool age_excess = lag && *lag > RecoveryBudgetMs() - 20 &&
             state.current_buffer_size_ms >= static_cast<uint64_t>(local_reserve_ms);
         if ((!age_excess && state.current_buffer_size_ms <= static_cast<uint64_t>(RecoveryBudgetMs())) ||
@@ -234,21 +234,27 @@ class RecoveringNetEq final : public webrtc::NetEq {
         std::llabs(static_cast<int32_t>(frame.timestamp_ - *decoded_stamp_)) <=
             (frame_headroom_ms_ + 20) * 48;
   }
-  // NetEq's target and the hard catch-up must have compatible budgets.
-  // Leave room for one ordinary decoded packet arrival; otherwise NetEq
-  // refills toward a level that this wrapper discards on every render tick.
-  // This caps the desired level, not actual storage, FEC or usable catch-up.
-  // Long Opus packets need additional reorder headroom: cutting 60-ms
-  // packets at 120 ms repeatedly discards usable speech on a lossless path
-  // with 100-ms arrival variation. Short packets retain the original 120-ms
-  // recovery bound; applying 200 ms to them delays group-mixer recovery.
-  // Never exceed the endpoint's 200-ms video-pressure ceiling. These are
-  // maximum queue budgets, not a fixed playout delay or network RTT.
+  // A short nominal queue must not erase the reserve NetEq actually needs
+  // for network jitter. Otherwise an arrival burst is trimmed, NetEq refills
+  // that reserve, and the following burst creates another underrun. Preserve
+  // the adaptive target plus packet-arrival/decoder headroom. On healthy paths
+  // the old packet-sized budget still bounds device-stall catch-up.
+  // The ceiling permits adaptation; it does not force a 400-ms target, change
+  // packetization or relax a stricter caller-supplied maximum. The packet
+  // buffer and the 16-pull callback limit remain bounded independently.
+  static constexpr int kMaximumAdaptiveTargetMs = 400;
+  int JitterReserveMs() const {
+    const int target = std::clamp(inner_->TargetDelayMs(), 0, kMaximumAdaptiveTargetMs);
+    // A packet may already fund decoder lookahead/reordered arrival. Neither
+    // hard nor RTP-age catch-up may spend that same reserve a second time.
+    return target + 2 * frame_headroom_ms_;
+  }
   int RecoveryBudgetMs() const {
-    return std::clamp(80 + 2 * frame_headroom_ms_, 120, 200);
+    const int nominal = std::clamp(80 + 2 * frame_headroom_ms_, 120, 200);
+    return std::max(nominal, JitterReserveMs());
   }
   bool ApplyTargetCeiling() {
-    int ceiling = RecoveryBudgetMs() - frame_headroom_ms_;
+    int ceiling = kMaximumAdaptiveTargetMs;
     if (requested_maximum_delay_ms_ > 0)
       ceiling = std::min(ceiling, requested_maximum_delay_ms_);
     if (ceiling == applied_target_ceiling_ms_) return true;
