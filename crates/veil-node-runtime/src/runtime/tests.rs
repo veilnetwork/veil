@@ -25,6 +25,396 @@ use super::peer_handshake::{
 use super::uri_helpers::{uri_has_port_zero, uri_scheme};
 use super::*;
 
+/// A retained transport witness models the handles held by generic siblings.
+/// Cancelling the canonical handshake must retire the connection explicitly,
+/// rather than waiting for all clones or QUIC's idle timeout to go away.
+#[tokio::test]
+async fn cancelling_a_canonical_quic_handshake_closes_its_exact_transport() {
+    use veil_transport::{PunchedQuicRole, TransportContext, promote_punched_quic};
+    let mut cfg = runtime_config_with_listen();
+    cfg.peers.clear();
+    cfg.bootstrap_peers.clear();
+    cfg.listen.clear();
+    cfg.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+    cfg.pex.enabled = false;
+    cfg.identity.as_mut().unwrap().lazy_mining = false;
+    let path = save_test_config("canonical-quic-cancel", cfg).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.unwrap();
+    let left = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let right = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (left_addr, right_addr) = (left.local_addr().unwrap(), right.local_addr().unwrap());
+    let context = Arc::new(TransportContext::for_debug().unwrap());
+    let remote_ctx = Arc::clone(&context);
+    let remote = tokio::spawn(async move {
+        promote_punched_quic(right, left_addr, remote_ctx, PunchedQuicRole::Responder)
+            .await
+            .unwrap()
+    });
+    let transport = promote_punched_quic(left, right_addr, context, PunchedQuicRole::Initiator)
+        .await
+        .unwrap();
+    let witness = transport.quic_datagrams().unwrap();
+    let ctx = runtime.access().make_session_context();
+    let task = tokio::spawn(peer_handshake::register_connection_session(
+        ctx,
+        SessionSource::Outbound(PeerId::new(1)),
+        None,
+        None,
+        SessionState::DebugAttached,
+        transport,
+        true,
+    ));
+    // The responder cannot accept this bidi stream until the real OVL1 HELLO
+    // was written; it then withholds its reply, holding the handshake pending.
+    let remote = timeout(Duration::from_secs(3), remote)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!witness.is_closed());
+    assert!(
+        !task.is_finished(),
+        "fixture must still hold the handshake pending"
+    );
+    task.abort();
+    let _ = task.await;
+    let retired = witness.is_closed();
+    witness.close();
+    drop(remote);
+    runtime.stop().await.unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+    assert!(
+        retired,
+        "cancelled canonical handshake left its QUIC connection live"
+    );
+}
+
+#[tokio::test]
+async fn dropping_an_attached_canonical_quic_session_closes_retained_handles() {
+    use veil_transport::{PunchedQuicRole, TransportContext, promote_punched_quic};
+    let mut cfg = runtime_config_with_listen();
+    cfg.peers.clear();
+    cfg.bootstrap_peers.clear();
+    cfg.listen.clear();
+    cfg.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+    cfg.pex.enabled = false;
+    cfg.identity.as_mut().unwrap().lazy_mining = false;
+    let path = save_test_config("canonical-quic-close", cfg).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.unwrap();
+    let left = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let right = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (left_addr, right_addr) = (left.local_addr().unwrap(), right.local_addr().unwrap());
+    let context = Arc::new(TransportContext::for_debug().unwrap());
+    let remote_ctx = Arc::clone(&context);
+    let remote = tokio::spawn(async move {
+        let connection =
+            promote_punched_quic(right, left_addr, remote_ctx, PunchedQuicRole::Responder)
+                .await
+                .unwrap();
+        let mut stream = connection.into_stream().unwrap();
+        perform_ovl1_handshake(
+            &mut stream,
+            &test_handshake_identity(),
+            veil_cfg::NodeRole::Core,
+            veil_cfg::DiscoveryMode::Public,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            false,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        stream
+    });
+    let transport = promote_punched_quic(left, right_addr, context, PunchedQuicRole::Initiator)
+        .await
+        .unwrap();
+    let witness = transport.quic_datagrams().unwrap();
+    let session = timeout(
+        Duration::from_secs(5),
+        peer_handshake::register_connection_session(
+            runtime.access().make_session_context(),
+            SessionSource::Outbound(PeerId::new(1)),
+            None,
+            None,
+            SessionState::DebugAttached,
+            transport,
+            true,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let remote = remote.await.unwrap();
+    assert!(!witness.is_closed());
+    drop(session);
+    let retired = witness.is_closed();
+    witness.close();
+    drop(remote);
+    runtime.stop().await.unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+    assert!(
+        retired,
+        "dropped canonical session left retained QUIC handles live"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_an_inbound_quic_prefix_peek_closes_its_transport() {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    struct ReadProbe {
+        inner: BoxIoStream,
+        first: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+    impl AsyncRead for ReadProbe {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(first) = self.first.take() {
+                let _ = first.send(());
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+    impl AsyncWrite for ReadProbe {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, data)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+    struct ReadObserved {
+        inner: Box<dyn veil_transport::TransportConnection>,
+        first: tokio::sync::oneshot::Sender<()>,
+    }
+    impl veil_transport::TransportConnection for ReadObserved {
+        fn capabilities(&self) -> &veil_transport::TransportCapabilities {
+            self.inner.capabilities()
+        }
+        fn peer_meta(&self) -> &veil_transport::PeerMeta {
+            self.inner.peer_meta()
+        }
+        fn quic_datagrams(&self) -> Option<veil_transport::QuicDatagramHandle> {
+            self.inner.quic_datagrams()
+        }
+        fn into_stream(self: Box<Self>) -> veil_transport::error::Result<BoxIoStream> {
+            Ok(Box::new(ReadProbe {
+                inner: self.inner.into_stream()?,
+                first: Some(self.first),
+            }))
+        }
+        fn close<'a>(
+            &'a mut self,
+        ) -> futures::future::BoxFuture<'a, veil_transport::error::Result<()>> {
+            self.inner.close()
+        }
+    }
+    use veil_transport::{PunchedQuicRole, TransportContext, promote_punched_quic};
+    let mut cfg = runtime_config_with_listen();
+    cfg.peers.clear();
+    cfg.bootstrap_peers.clear();
+    cfg.listen.clear();
+    cfg.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+    cfg.pex.enabled = false;
+    cfg.identity.as_mut().unwrap().lazy_mining = false;
+    let path = save_test_config("canonical-quic-inbound-cancel", cfg).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.unwrap();
+    let left = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let right = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (left_addr, right_addr) = (left.local_addr().unwrap(), right.local_addr().unwrap());
+    let context = Arc::new(TransportContext::for_debug().unwrap());
+    let remote_ctx = Arc::clone(&context);
+    let incoming = tokio::spawn(async move {
+        promote_punched_quic(right, left_addr, remote_ctx, PunchedQuicRole::Responder)
+            .await
+            .unwrap()
+    });
+    let sender = promote_punched_quic(left, right_addr, context, PunchedQuicRole::Initiator)
+        .await
+        .unwrap();
+    let peer_handle = sender.quic_datagrams().unwrap();
+    let mut sender = sender.into_stream().unwrap();
+    sender.write_all(b"O").await.unwrap(); // Advertise bidi, withhold the rest of its preface.
+    let incoming = timeout(Duration::from_secs(3), incoming)
+        .await
+        .unwrap()
+        .unwrap();
+    let witness = incoming.quic_datagrams().unwrap();
+    let (first_read, read_started) = tokio::sync::oneshot::channel();
+    let incoming = Box::new(ReadObserved {
+        inner: incoming,
+        first: first_read,
+    });
+    let task = tokio::spawn(peer_handshake::register_connection_session(
+        runtime.access().make_session_context(),
+        SessionSource::Inbound(ListenId::new(1)),
+        None,
+        None,
+        SessionState::DebugAttached,
+        incoming,
+        false,
+    ));
+    read_started.await.unwrap();
+    assert!(!task.is_finished(), "inbound prefix must remain incomplete");
+    task.abort();
+    let _ = task.await;
+    let retired = witness.is_closed();
+    witness.close();
+    peer_handle.close();
+    drop(sender);
+    runtime.stop().await.unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+    assert!(
+        retired,
+        "cancelled unclassified inbound transport remained live"
+    );
+}
+
+/// A verified HandoffAttach transfers ownership to an existing session: the
+/// admission guard must not close the adopted transport on its early return.
+#[tokio::test]
+async fn verified_handoff_adopts_quic_without_closing_the_transport() {
+    use veil_proto::{
+        codec::{decode_header, encode_header},
+        family::{FrameFamily, SessionMsg},
+        header::{FrameHeader, HEADER_SIZE},
+        session::{HandoffAttachPayload, HandoffChallengePayload, HandoffResponsePayload},
+    };
+    use veil_transport::{PunchedQuicRole, TransportContext, promote_punched_quic};
+    async fn frame(writer: &mut BoxIoStream, kind: SessionMsg, body: impl AsRef<[u8]>) {
+        let body = body.as_ref();
+        let mut header = FrameHeader::new(FrameFamily::Session as u8, kind as u16);
+        header.body_len = body.len() as u32;
+        writer.write_all(&encode_header(&header)).await.unwrap();
+        writer.write_all(&body).await.unwrap();
+    }
+    let mut cfg = runtime_config_with_listen();
+    cfg.peers.clear();
+    cfg.bootstrap_peers.clear();
+    cfg.listen.clear();
+    cfg.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+    cfg.pex.enabled = false;
+    cfg.identity.as_mut().unwrap().lazy_mining = false;
+    let path = save_test_config("canonical-quic-adoption", cfg).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.unwrap();
+    let sid = [0x42; 32];
+    let key = [0x88; 32];
+    let services = runtime.access();
+    services
+        .handoff
+        .registry
+        .insert(sid, [0x66; 32].into(), [0x77; 32], key);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<BoxIoStream>(1);
+    let _swap_guard = services
+        .handoff
+        .swap_registry
+        .register(sid, [0x99; 32].into(), tx, [0; 32]);
+    let left = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let right = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (left_addr, right_addr) = (left.local_addr().unwrap(), right.local_addr().unwrap());
+    let context = Arc::new(TransportContext::for_debug().unwrap());
+    let remote_ctx = Arc::clone(&context);
+    let incoming = tokio::spawn(async move {
+        promote_punched_quic(right, left_addr, remote_ctx, PunchedQuicRole::Responder)
+            .await
+            .unwrap()
+    });
+    let sender = promote_punched_quic(left, right_addr, context, PunchedQuicRole::Initiator)
+        .await
+        .unwrap();
+    let peer_handle = sender.quic_datagrams().unwrap();
+    let mut sender = sender.into_stream().unwrap();
+    frame(
+        &mut sender,
+        SessionMsg::HandoffAttach,
+        HandoffAttachPayload { session_id: sid }.encode(),
+    )
+    .await;
+    let incoming = timeout(Duration::from_secs(3), incoming)
+        .await
+        .unwrap()
+        .unwrap();
+    let witness = incoming.quic_datagrams().unwrap();
+    let task = tokio::spawn(peer_handshake::register_connection_session(
+        services.make_session_context(),
+        SessionSource::Inbound(ListenId::new(1)),
+        None,
+        None,
+        SessionState::DebugAttached,
+        incoming,
+        false,
+    ));
+    let mut header = [0; HEADER_SIZE];
+    timeout(Duration::from_secs(3), sender.read_exact(&mut header))
+        .await
+        .unwrap()
+        .unwrap();
+    let header = decode_header(&header).unwrap();
+    assert_eq!(header.msg_type, SessionMsg::HandoffChallenge as u16);
+    let mut body = vec![0; header.body_len as usize];
+    sender.read_exact(&mut body).await.unwrap();
+    let challenge = HandoffChallengePayload::decode(&body).unwrap().challenge;
+    let hmac = HandoffAttachPayload::compute_hmac(&key, &sid, &challenge);
+    frame(
+        &mut sender,
+        SessionMsg::HandoffResponse,
+        HandoffResponsePayload { hmac }.encode(),
+    )
+    .await;
+    assert!(
+        timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    let remained_open = !witness.is_closed();
+    let mut adopted = rx.recv().await.unwrap();
+    sender.write_all(b"adopted").await.unwrap();
+    let mut payload = [0; 7];
+    timeout(Duration::from_secs(3), adopted.read_exact(&mut payload))
+        .await
+        .unwrap()
+        .unwrap();
+    witness.close();
+    peer_handle.close();
+    drop(adopted);
+    drop(sender);
+    runtime.stop().await.unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+    assert!(
+        remained_open,
+        "verified handoff must retain its adopted QUIC connection"
+    );
+    assert_eq!(&payload, b"adopted");
+}
+
 /// Exercise the production connector with a transport dial that cannot finish
 /// by itself. The only way to retry is to cancel it after the network-change
 /// wake. Timeouts below are deadlock guards on a paused clock, not a measured

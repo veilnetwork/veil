@@ -539,6 +539,10 @@ pub async fn register_connection_session(
     // its primary byte stream. Non-QUIC transports return None and preserve
     // the ordered-stream-only behavior exactly.
     let quic_datagrams = connection.quic_datagrams();
+    // Own the raw transport before any await, including prefix sniffing. A
+    // verified handoff/parallel binding below explicitly adopts it; every
+    // other cancellation/refusal closes this exact connection.
+    let mut quic_owner = super::session_guard::CanonicalQuicOwner::new(quic_datagrams.clone());
     let parallel_quic = connection.parallel_quic();
     let parallel_ordered = connection.parallel_stream();
     let stream_binding = connection.stream_channel_binding();
@@ -569,6 +573,7 @@ pub async fn register_connection_session(
         .await
         {
             PeekOutcome::HandoffBound => {
+                quic_owner.disarm_after_adoption();
                 runtime.logger.info(
                     "session.handoff.accept_bound",
                     format!(
@@ -599,7 +604,10 @@ pub async fn register_connection_session(
             .peek_and_dispatch_with_binding(stream, quic_datagrams.clone(), stream_binding)
             .await
         {
-            ParallelPeekOutcome::Bound => return Ok(None),
+            ParallelPeekOutcome::Bound => {
+                quic_owner.disarm_after_adoption();
+                return Ok(None);
+            }
             ParallelPeekOutcome::Handshake(new_stream) => stream = new_stream,
             ParallelPeekOutcome::Drop(reason) => {
                 return Err(NodeError::Handshake(format!(
@@ -1642,7 +1650,8 @@ pub async fn register_connection_session(
             runtime.dispatcher.reputation.clone(),
             runtime.event_bus,
             Some(runtime.outbound_connector_refresh),
-        ),
+        )
+        .with_quic_owner(quic_owner),
     };
     // SessionGuard now owns the slot — disarm our IpSlotGuard so its
     // Drop is a no-op.  SessionGuard's Drop will decrement on session
