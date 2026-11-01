@@ -70,7 +70,7 @@ pub use hint_registry::{SchemeCounters, TransportHintRegistry};
 pub use quic::{
     DEFAULT_RELIABLE_SEND_WINDOW_BYTES, PunchedQuicRole, QuicDatagramHandle, QuicDatagramPathStats,
     QuicDatagramSendError, QuicParallelHandle, REALTIME_DATAGRAM_BUFFER_BYTES,
-    promote_punched_quic,
+    promote_punched_quic, set_quic_accept_trace,
 };
 pub use registry::{TransportHintSink, TransportRegistry};
 pub use traits::{
