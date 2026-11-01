@@ -75,6 +75,8 @@ pub type SessionTxOwner = [u8; 32];
 
 #[derive(Debug)]
 struct SessionTxEntry {
+    // Explicit retirement is independent of a producer retaining its sender.
+    retire: mpsc::Sender<()>,
     tx: FrameSender,
     owner: Option<SessionTxOwner>,
     direct_app_chunks: bool,
@@ -253,12 +255,13 @@ impl SessionTxRegistry {
     pub fn register(&mut self, peer_id: impl Into<NodeId>) -> FrameOutbox {
         let peer_id = *peer_id.into().as_bytes();
         self.prune_closed();
-        let (tx, rx) =
+        let (tx, mut rx) =
             frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
         self.next_registration = self.next_registration.wrapping_add(1);
         self.senders.insert(
             peer_id,
             SessionTxEntry {
+                retire: rx.bind_registration_retirement(),
                 tx,
                 owner: None,
                 direct_app_chunks: false,
@@ -278,12 +281,13 @@ impl SessionTxRegistry {
     ) -> FrameOutbox {
         let peer_id = *peer_id.into().as_bytes();
         self.prune_closed();
-        let (tx, rx) =
+        let (tx, mut rx) =
             frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
         self.next_registration = self.next_registration.wrapping_add(1);
         self.senders.insert(
             peer_id,
             SessionTxEntry {
+                retire: rx.bind_registration_retirement(),
                 tx,
                 owner: Some(owner),
                 direct_app_chunks: false,
@@ -310,12 +314,13 @@ impl SessionTxRegistry {
         if self.senders.contains_key(&peer_id) {
             return None;
         }
-        let (tx, rx) =
+        let (tx, mut rx) =
             frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
         self.next_registration = self.next_registration.wrapping_add(1);
         self.senders.insert(
             peer_id,
             SessionTxEntry {
+                retire: rx.bind_registration_retirement(),
                 tx,
                 owner: None,
                 direct_app_chunks: false,
@@ -410,12 +415,13 @@ impl SessionTxRegistry {
         self.senders.remove(&peer_id);
         self.last_active.remove(&peer_id);
 
-        let (tx, rx) =
+        let (tx, mut rx) =
             frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
         self.next_registration = self.next_registration.wrapping_add(1);
         self.senders.insert(
             peer_id,
             SessionTxEntry {
+                retire: rx.bind_registration_retirement(),
                 tx,
                 owner: Some(owner),
                 direct_app_chunks: false,
@@ -431,7 +437,10 @@ impl SessionTxRegistry {
     /// Reserved for administrative force-teardown and unowned synthetic
     /// entries. Normal OVL1 runner cleanup uses [`Self::unregister_owned`].
     pub fn unregister(&mut self, peer_id: &NodeIdBytes) {
-        self.senders.remove(peer_id);
+        if let Some(entry) = self.senders.remove(peer_id) {
+            // Removing the map entry alone cannot close cloned producer senders.
+            let _ = entry.retire.try_send(());
+        }
         self.last_active.remove(peer_id);
     }
 
@@ -451,7 +460,10 @@ impl SessionTxRegistry {
         {
             return false;
         }
-        self.senders.remove(peer_id);
+        if let Some(entry) = self.senders.remove(peer_id) {
+            // Removing the map entry alone cannot close cloned producer senders.
+            let _ = entry.retire.try_send(());
+        }
         self.last_active.remove(peer_id);
         true
     }
@@ -1579,3 +1591,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tx_registration_lifetime_tests.rs"]
+mod registration_lifetime_tests;
