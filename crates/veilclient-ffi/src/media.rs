@@ -1200,8 +1200,14 @@ pub(crate) fn trace_sealed_cell_with_source_queue(
         let monotonic_us = veil_util::diagnostic_clock::monotonic_us().map_or(-1i128, i128::from);
         #[cfg(not(feature = "node-embedded"))]
         let monotonic_us = -1i128;
+        // Include opaque controls as well as RTP: a candidate may have no RTP
+        // lease yet. This joins the endpoint sample to the existing role-blind
+        // Forward trace without logging plaintext or interpreting it at relays.
+        // The existing runtime gate and sparse sampling bound the hashing cost.
+        use sha2::Digest as _;
+        let opaque_sha256 = format!("{:x}", sha2::Sha256::digest(payload));
         log::info!(
-            "media.cell.sample at_ms={at_ms} monotonic_us={monotonic_us} stage={stage} peer={:02x}{:02x}{:02x}{:02x} epoch={epoch:016x} seq={seq} bytes={} delivery_daemon_age_us={daemon_age_us} delivery_sdk_age_us={sdk_age_us} source_queue_max_us={source_queue_max_us} delivery_daemon_queue_age_us={daemon_queue_age_us}",
+            "media.cell.sample at_ms={at_ms} monotonic_us={monotonic_us} stage={stage} peer={:02x}{:02x}{:02x}{:02x} epoch={epoch:016x} seq={seq} bytes={} delivery_daemon_age_us={daemon_age_us} delivery_sdk_age_us={sdk_age_us} source_queue_max_us={source_queue_max_us} delivery_daemon_queue_age_us={daemon_queue_age_us} opaque_sha256={opaque_sha256}",
             peer[0],
             peer[1],
             peer[2],
