@@ -647,28 +647,50 @@ pub async fn register_connection_session(
         let mlkem_ek_bytes: Vec<u8> = runtime.identity.mlkem_keys.current_ek().to_vec();
         let capture_tx = Arc::clone(&runtime.dispatcher.capture_tx);
         let local_id: [u8; 32] = *runtime.identity.local_identity.node_id.as_bytes();
-        let hs_capture =
-            move |inbound: bool, family: u8, msg_type: u16, body: &[u8], peer_id: [u8; 32]| {
-                let guard = lock!(capture_tx);
-                if let Some(ref tx) = *guard {
-                    let ts_us = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_micros() as u64;
-                    let ev = veil_dispatcher::CaptureEvent::new_truncated(
-                        ts_us,
-                        inbound,
-                        peer_id,
-                        local_id,
-                        family,
-                        msg_type,
-                        body.len() as u32,
-                        body,
-                        false, // not e2e_plaintext
+        // Metadata-only, operator-gated stage observations. A TX event means
+        // write/flush completed locally; RX means a decoded frame reached this
+        // hook, not that its identity/proof has already been authenticated.
+        // Never log the body, its size, remote identity or transport address.
+        let stage_started =
+            veil_session::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
+        let stage_logger = Arc::clone(&runtime.logger);
+        if stage_started.is_some() {
+            stage_logger.info(
+                "handshake.stage.begin",
+                format!("link_id={link_id} source={source}"),
+            );
+        }
+        let hs_capture = move |inbound: bool,
+                               family: u8,
+                               msg_type: u16,
+                               body: &[u8],
+                               peer_id: [u8; 32]| {
+            if let Some(started) = stage_started {
+                stage_logger.info(
+                        "handshake.stage.frame",
+                        format!("link_id={link_id} rx={inbound} family={family} msg={msg_type} elapsed_ms={}", started.elapsed().as_millis()),
                     );
-                    let _ = tx.send(ev);
-                }
-            };
+            }
+            let guard = lock!(capture_tx);
+            if let Some(ref tx) = *guard {
+                let ts_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros() as u64;
+                let ev = veil_dispatcher::CaptureEvent::new_truncated(
+                    ts_us,
+                    inbound,
+                    peer_id,
+                    local_id,
+                    family,
+                    msg_type,
+                    body.len() as u32,
+                    body,
+                    false, // not e2e_plaintext
+                );
+                let _ = tx.send(ev);
+            }
+        };
         let known_remote_id: Option<[u8; 32]> = handshake_remote_id(source, expected_peer.as_ref());
         // Session-resumption fast-path. RE-ENABLED (audit cycle-2): the prior
         // CRITICAL — resumption restored the ORIGINAL session's tx/rx keys into a
@@ -826,6 +848,29 @@ pub async fn register_connection_session(
                 link_id,
             )))
         });
+        if let Some(started) = stage_started {
+            runtime.logger.info(
+                "handshake.stage.end",
+                format!(
+                    "link_id={link_id} ok={} elapsed_ms={}",
+                    hs_result.is_ok(),
+                    started.elapsed().as_millis()
+                ),
+            );
+            if let Some(handle) = &quic_datagrams {
+                let stats = handle.path_stats();
+                runtime.logger.info(
+                    "handshake.stage.quic",
+                    format!(
+                        "link_id={link_id} udp_sent={} udp_received={} stream_sent={} stream_received={} acknowledgments={} lost={} pto={} in_flight={} retained={}",
+                        stats.udp_sent, stats.udp_received, stats.stream_frames_sent,
+                        stats.stream_frames_received, stats.acknowledgments_received,
+                        stats.lost_packets, stats.pto_count, stats.in_flight_bytes,
+                        stats.stream_retained_bytes,
+                    ),
+                );
+            }
+        }
         match hs_result {
             Ok(r) => {
                 if !runtime.allowed_peer_algos.is_empty() {
