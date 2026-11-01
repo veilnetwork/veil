@@ -451,6 +451,22 @@ pub fn spawn_outbound_peers(
                 }
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
+                    _ = access.force_reconnect_notify.notified() => {
+                        // A dial/transport handshake can still be using the
+                        // previous local network. Waiting for its timeout also
+                        // loses this broadcast before the backoff arm starts
+                        // listening. Cancel it just like an endpoint refresh,
+                        // then re-run admission checks and dial on the new
+                        // attachment with the initial retry budget.
+                        access.logger.info(
+                            "peer.connect.interrupted",
+                            format!("peer={} reason=network_changed", veil_util::hex_short(&peer_node_id)),
+                        );
+                        backoff = backoff_min;
+                        consecutive_failures = 0;
+                        first_failure_at = None;
+                        continue;
+                    }
                     changed = refresh_rx.changed() => {
                         if changed.is_err() { break; }
                         // The entry in NodeState now carries a newer endpoint.

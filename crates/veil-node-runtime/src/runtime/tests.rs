@@ -25,6 +25,133 @@ use super::peer_handshake::{
 use super::uri_helpers::{uri_has_port_zero, uri_scheme};
 use super::*;
 
+/// Exercise the production connector with a transport dial that cannot finish
+/// by itself. The only way to retry is to cancel it after the network-change
+/// wake. Timeouts below are deadlock guards on a paused clock, not a measured
+/// latency requirement or a shortened production handshake timeout.
+#[tokio::test(start_paused = true)]
+async fn network_change_cancels_pending_transport_dial_before_retry() {
+    use futures::future::BoxFuture;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use veil_transport::{
+        Transport, TransportCapabilities, TransportConnection, TransportContext, TransportListener,
+    };
+
+    struct CancelWitness(u64, tokio::sync::mpsc::UnboundedSender<u64>);
+    impl Drop for CancelWitness {
+        fn drop(&mut self) {
+            let _ = self.1.send(self.0);
+        }
+    }
+    struct GatedTransport {
+        next: AtomicU64,
+        started: tokio::sync::mpsc::UnboundedSender<u64>,
+        cancelled: tokio::sync::mpsc::UnboundedSender<u64>,
+    }
+    impl Transport for GatedTransport {
+        fn scheme(&self) -> &'static str {
+            "tcp"
+        }
+        fn capabilities(&self) -> TransportCapabilities {
+            TransportCapabilities::stream_connection()
+        }
+        fn connect<'a>(
+            &'a self,
+            _: &'a TransportUri,
+            _: Arc<TransportContext>,
+        ) -> BoxFuture<'a, veil_transport::error::Result<Box<dyn TransportConnection>>> {
+            Box::pin(async move {
+                let id = self.next.fetch_add(1, Ordering::SeqCst);
+                let _witness = CancelWitness(id, self.cancelled.clone());
+                self.started.send(id).unwrap();
+                std::future::pending().await
+            })
+        }
+        fn bind<'a>(
+            &'a self,
+            _: &'a TransportUri,
+            _: Arc<TransportContext>,
+        ) -> BoxFuture<'a, veil_transport::error::Result<Box<dyn TransportListener>>> {
+            Box::pin(async { unreachable!("fixture is dial-only") })
+        }
+    }
+    let mut config = runtime_config_with_listen();
+    config.peers.clear();
+    config.bootstrap_peers.clear();
+    config.listen.clear();
+    config.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+    config.pex.enabled = false;
+    config.identity.as_mut().unwrap().lazy_mining = false;
+    let path = save_test_config("network-change-pending-dial", config).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.unwrap();
+    let mut services = runtime.access();
+    let (started_tx, mut started) = tokio::sync::mpsc::unbounded_channel();
+    let (cancelled_tx, mut cancelled) = tokio::sync::mpsc::unbounded_channel();
+    let mut registry = TransportRegistry::new();
+    registry.register(Arc::new(GatedTransport {
+        next: AtomicU64::new(1),
+        started: started_tx,
+        cancelled: cancelled_tx,
+    }));
+    services.registry = Arc::new(registry);
+    let keys = test_support::ed25519_keypair();
+    let peer = crate::types::PeerConfigEntry {
+        peer_id: PeerId::new(1),
+        node_id: NodeId::from_public_key(SignatureAlgorithm::Ed25519, &keys.public_key).unwrap(),
+        public_key: keys.public_key,
+        nonce: veil_cfg::default_nonce_base64(),
+        transport: "tcp://127.0.0.1:9".into(),
+        algo: SignatureAlgorithm::Ed25519,
+        tls_cert: None,
+        tls_key: None,
+        tls_ca_cert: None,
+        bootstrap_only: true,
+        source: crate::types::PeerSource::Bootstrap,
+    };
+    services
+        .state
+        .lock()
+        .unwrap()
+        .peers
+        .insert(peer.peer_id, peer.clone());
+    let (shutdown, _) = tokio::sync::watch::channel(false);
+    let handles = crate::outbound_connector::spawn_outbound_peers(vec![peer], &services, &shutdown);
+    assert_eq!(handles.len(), 1);
+    assert_eq!(
+        timeout(Duration::from_secs(10), started.recv())
+            .await
+            .unwrap(),
+        Some(1)
+    );
+    assert!(
+        cancelled.try_recv().is_err(),
+        "dial must still be pending before the event"
+    );
+    assert_eq!(
+        runtime.force_reconnect_all_peers(),
+        0,
+        "a pending dial is not a registered session"
+    );
+    let dropped = timeout(Duration::from_secs(1), cancelled.recv()).await;
+    let retried = timeout(Duration::from_secs(1), started.recv()).await;
+    let _ = shutdown.send(true);
+    for handle in handles {
+        handle.await.unwrap();
+    }
+    runtime.stop().await.unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+    assert_eq!(
+        dropped.ok().flatten(),
+        Some(1),
+        "network change did not cancel the stale dial"
+    );
+    assert_eq!(
+        retried.ok().flatten(),
+        Some(2),
+        "new dial did not start after network change"
+    );
+}
+
 fn provider_test_ad(tag: u8) -> veil_anonymity::rendezvous::RendezvousAd {
     veil_anonymity::rendezvous::RendezvousAd {
         receiver_node_id: [tag; 32],
