@@ -47,6 +47,15 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application>
+        <activity
+            android:name=".CallScreenActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:taskAffinity="${applicationId}.incomingCall"
+            android:theme="@android:style/Theme.Material.NoActionBar"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true" />
         <service
             android:name=".VeilDaemonService"
             android:exported="false"

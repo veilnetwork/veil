@@ -1,0 +1,10 @@
+<resources>
+    <string name="veil_call_screen_incoming">Incoming xVeil call</string>
+    <string name="veil_call_screen_ongoing">xVeil call in progress</string>
+    <string name="veil_call_screen_answer">Answer</string>
+    <string name="veil_call_screen_decline">Decline</string>
+    <string name="veil_call_screen_end">End call</string>
+    <string name="veil_call_screen_open">Open app</string>
+    <string name="veil_call_screen_unknown">Contact</string>
+    <string name="veil_call_screen_avatar">Caller avatar</string>
+</resources>

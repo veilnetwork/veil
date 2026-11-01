@@ -209,6 +209,12 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                     ))
                 }
             }
+            "setCallPresentation" -> {
+                val session = call.argument<String>("callSession")
+                val name = call.argument<String>("callerName")
+                val avatar = call.argument<ByteArray>("avatar")
+                result.success(CallScreenActivity.updateCaller(session, name, avatar))
+            }
             "startBackgroundService" -> {
                 val title = call.argument<String>("title")
                 val text  = call.argument<String>("text")
@@ -217,6 +223,7 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 val ringing = call.argument<Boolean>("ringing") ?: false
                 val microphone = call.argument<Boolean>("microphone") ?: false
                 val camera = call.argument<Boolean>("camera") ?: false
+                CallScreenActivity.prepare(if (hangupAction) callSession else null)
                 val intent = Intent(ctx, VeilDaemonService::class.java).apply {
                     action = VeilDaemonService.ACTION_START
                     if (title != null) putExtra(VeilDaemonService.EXTRA_NOTIFICATION_TITLE, title)

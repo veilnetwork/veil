@@ -1,0 +1,10 @@
+<resources>
+    <string name="veil_call_screen_incoming">Входящий звонок xVeil</string>
+    <string name="veil_call_screen_ongoing">Разговор в xVeil</string>
+    <string name="veil_call_screen_answer">Ответить</string>
+    <string name="veil_call_screen_decline">Отклонить</string>
+    <string name="veil_call_screen_end">Завершить</string>
+    <string name="veil_call_screen_open">Открыть приложение</string>
+    <string name="veil_call_screen_unknown">Контакт</string>
+    <string name="veil_call_screen_avatar">Аватар звонящего</string>
+</resources>

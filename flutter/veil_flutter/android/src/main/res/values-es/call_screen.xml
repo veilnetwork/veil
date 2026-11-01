@@ -1,0 +1,10 @@
+<resources>
+    <string name="veil_call_screen_incoming">Llamada entrante de xVeil</string>
+    <string name="veil_call_screen_ongoing">Llamada de xVeil en curso</string>
+    <string name="veil_call_screen_answer">Responder</string>
+    <string name="veil_call_screen_decline">Rechazar</string>
+    <string name="veil_call_screen_end">Finalizar</string>
+    <string name="veil_call_screen_open">Abrir aplicación</string>
+    <string name="veil_call_screen_unknown">Contacto</string>
+    <string name="veil_call_screen_avatar">Avatar de quien llama</string>
+</resources>

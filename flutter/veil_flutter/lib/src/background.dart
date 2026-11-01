@@ -44,6 +44,7 @@
 // need a platform check.
 
 import 'dart:io' show Platform;
+import 'dart:typed_data' show Uint8List;
 
 import 'package:flutter/services.dart' show MethodChannel;
 
@@ -101,6 +102,23 @@ class VeilBackground {
       if (microphone) 'microphone': true,
       if (camera) 'camera': true,
     });
+  }
+
+  /// Update the call-only window from locally held contact data. Kept in the
+  /// app process only: never a notification PendingIntent, URI, path or log.
+  /// Late results for an ended/replaced session are rejected by the platform.
+  static Future<bool> setCallPresentation({
+    required String callSession,
+    required String callerName,
+    Uint8List? avatar,
+  }) async {
+    if (!Platform.isAndroid) return false;
+    return await _channel.invokeMethod<bool>('setCallPresentation', {
+          'callSession': callSession,
+          'callerName': callerName,
+          if (avatar != null) 'avatar': avatar,
+        }) ??
+        false;
   }
 
   /// Stop the foreground service.  Use this on explicit user
