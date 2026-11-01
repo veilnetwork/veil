@@ -1068,6 +1068,18 @@ impl DhtMlKemEkResolver {
             },
         };
 
+        // A verified revocation can arrive while the document/certificate
+        // replies are in flight. Recheck the shared current floor before
+        // publishing keys, caching, or returning this snapshot as seal authority.
+        self.refresh_local_document(target_node_id);
+        if !self
+            .cert_store
+            .document_floor
+            .allows_cert(&target_node_id, &verified, unix_now())
+        {
+            return None;
+        }
+
         // ── Step 4: cache writeback ────────────────────────────────
         // Every per-peer cache is [`MAX_PEER_MLKEM_CACHE`]-bounded LRU — same
         // policy as the handshake-time insert site in
@@ -1396,6 +1408,18 @@ impl DhtMlKemEkResolver {
                 &target_node_id,
                 "cert slot returned a different device's certificate",
             );
+            return None;
+        }
+
+        // A verified revocation can arrive while the document/certificate
+        // replies are in flight. Recheck the shared current floor before
+        // publishing keys, caching, or returning this snapshot as seal authority.
+        self.refresh_local_document(target_node_id);
+        if !self
+            .cert_store
+            .document_floor
+            .allows_cert(&target_node_id, &verified, unix_now())
+        {
             return None;
         }
 
@@ -3711,6 +3735,183 @@ mod tests {
         assert_eq!(start.elapsed(), Duration::from_millis(200));
         assert!(rx.try_recv().is_err());
         assert!(lock!(resolver.pending_recursive).is_empty());
+    }
+
+    /// Hold the certificate reply after the document snapshot was accepted,
+    /// then publish a valid revocation through the shared live floor.
+    async fn revoke_during_single_certificate_walk(named_instance: bool, revoke_target: bool) {
+        use ed25519_dalek::{Signer as _, SigningKey};
+        use veil_crypto::identity::{certify_message, compute_node_id};
+        use veil_proto::identity_document::{
+            ALGO_ED25519, DOC_SIG_CONTEXT, IdentityKey, RevokedDevice,
+        };
+        let seed = 0x76;
+        let signer = current_cert_signer(seed);
+        let now = unix_now();
+        let master = SigningKey::from_bytes(&[seed; 32]);
+        let a_key = SigningKey::from_bytes(&[seed ^ 0xff; 32]);
+        let b_key = SigningKey::from_bytes(&[0x37; 32]);
+        let b_pub = b_key.verifying_key();
+        let b_id = compute_node_id(b_pub.as_bytes());
+        let mut old = signer.doc.clone();
+        old.identity_keys.push(IdentityKey {
+            algo: ALGO_ED25519,
+            pubkey: b_pub.as_bytes().to_vec(),
+            device_id: b_id,
+            valid_from_unix: now - 60,
+            valid_until_unix: now + 3600,
+            master_sig: master
+                .sign(&certify_message(
+                    &old.node_id,
+                    ALGO_ED25519,
+                    b_pub.as_bytes(),
+                    &b_id,
+                    now - 60,
+                    now + 3600,
+                ))
+                .to_bytes()
+                .to_vec(),
+        });
+        let sign_doc = |doc: &mut IdentityDocument, key: &SigningKey| {
+            let mut msg = DOC_SIG_CONTEXT.to_vec();
+            msg.extend_from_slice(&doc.canonical_signing_bytes());
+            doc.document_sig = key.sign(&msg).to_bytes().to_vec();
+        };
+        sign_doc(&mut old, &a_key);
+        verify_identity_document(&old, now).unwrap();
+        let cert = signer.cert([0xab; 16], now - 60, now + 1800, 1);
+        verify_mlkem_cert(&cert, &old, now).unwrap();
+        let mut registry = InstanceRegistry {
+            node_id: old.node_id,
+            reg_version: 1,
+            signing_identity_key_idx: 0,
+            instances: vec![entry(cert.instance_id)],
+            sig: Vec::new(),
+        };
+        let mut registry_msg = INSTANCE_REGISTRY_SIG_CONTEXT.to_vec();
+        registry_msg.extend_from_slice(&registry.canonical_signing_bytes());
+        registry.sig = a_key.sign(&registry_msg).to_bytes().to_vec();
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        let mut rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+        let target = old.node_id;
+        let cert_key = MlKemKeyCert::dht_key(&target, &cert.instance_id);
+        let mut lookup = Box::pin(async {
+            if named_instance {
+                resolver
+                    .fetch_verified_cert_for_instance(target, cert.instance_id)
+                    .await
+            } else {
+                resolver.fetch_verified_cert(target).await
+            }
+        });
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        let mut held_cert = None;
+        let read_requests = |rx: &mut veil_session::FrameOutbox, count| {
+            (0..count)
+                .map(|_| {
+                    let (_, frame) = rx.try_recv().expect("expected resolver stage request");
+                    RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        for query in read_requests(&mut rx, if named_instance { 2 } else { 1 }) {
+            if query.target_key == cert_key {
+                held_cert = Some(query);
+            } else {
+                assert_eq!(query.target_key, IdentityDocument::dht_key(&target));
+                lock!(resolver.pending_recursive)
+                    .remove(&query.query_id)
+                    .unwrap()
+                    .tx
+                    .send(old.encode())
+                    .unwrap();
+            }
+        }
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        if !named_instance {
+            let requests = read_requests(&mut rx, 1);
+            let query = &requests[0];
+            assert_eq!(query.target_key, InstanceRegistry::dht_key(&target));
+            lock!(resolver.pending_recursive)
+                .remove(&query.query_id)
+                .unwrap()
+                .tx
+                .send(registry.encode())
+                .unwrap();
+            assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+            let requests = read_requests(&mut rx, 1);
+            held_cert = requests.into_iter().next();
+        }
+        let query = held_cert.expect("certificate request held after the accepted document");
+        assert_eq!(query.target_key, cert_key);
+        assert_eq!(
+            resolver
+                .cert_store
+                .document_floor
+                .current(&target)
+                .unwrap()
+                .issued_at_unix,
+            old.issued_at_unix
+        );
+        let revoked_index = if revoke_target { 0 } else { 1 };
+        let revoked_id = old.identity_keys[revoked_index].device_id;
+        let mut current = old.clone();
+        current.issued_at_unix += 1;
+        current.identity_keys.remove(revoked_index);
+        current.sig_key_idx = 0;
+        current.revoked_devices.push(RevokedDevice {
+            device_id: revoked_id,
+            master_sig: master
+                .sign(&RevokedDevice::signing_message(&target, &revoked_id))
+                .to_bytes()
+                .to_vec(),
+        });
+        sign_doc(&mut current, if revoke_target { &b_key } else { &a_key });
+        verify_identity_document(&current, now).unwrap();
+        assert!(resolver.observe_document(&current));
+        lock!(resolver.pending_recursive)
+            .remove(&query.query_id)
+            .unwrap()
+            .tx
+            .send(cert.encode())
+            .unwrap();
+        let resolved = lookup.await;
+        if !revoke_target {
+            let resolved =
+                resolved.expect("an unrelated device revocation must preserve this certificate");
+            assert_eq!(resolved.instance_id, cert.instance_id);
+            assert!(lock!(resolver.pending_recursive).is_empty());
+            return;
+        }
+        assert!(
+            resolved.is_none(),
+            "walk returned a certificate retired while its reply was pending"
+        );
+        assert!(rlock!(resolver.cert_cache).is_empty());
+        assert!(rlock!(resolver.instance_cert_cache).is_empty());
+        assert!(rlock!(resolver.peer_mlkem_keys).is_empty());
+        assert!(rlock!(resolver.peer_ratchet_keys).is_empty());
+        assert!(lock!(resolver.pending_recursive).is_empty());
+    }
+
+    #[tokio::test]
+    async fn node_walk_rechecks_revocation_after_certificate_reply() {
+        revoke_during_single_certificate_walk(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn instance_walk_rechecks_revocation_after_certificate_reply() {
+        revoke_during_single_certificate_walk(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn node_walk_preserves_surviving_device_after_unrelated_revocation() {
+        revoke_during_single_certificate_walk(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn instance_walk_preserves_surviving_device_after_unrelated_revocation() {
+        revoke_during_single_certificate_walk(true, false).await;
     }
 
     #[tokio::test]
