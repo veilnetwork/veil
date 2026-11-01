@@ -397,6 +397,9 @@ impl FrameSender {
 
 #[derive(Debug)]
 pub struct FrameOutbox {
+    // The registry can explicitly retire this queue even while a producer
+    // retains a sender. Normal replacement still permits a pinned old send.
+    registration_retirement: Option<mpsc::Receiver<()>>,
     source_activity: std::sync::Arc<crate::local_source_activity::LocalSourceActivity>,
     ordinary: EnvelopeReceiver,
     network_control: Option<EnvelopeReceiver>,
@@ -434,6 +437,7 @@ pub(crate) fn frame_channel_with_source_activity(
             )),
         },
         FrameOutbox {
+            registration_retirement: None,
             source_activity,
             ordinary: EnvelopeReceiver::Live(ordinary),
             network_control: Some(EnvelopeReceiver::Live(control)),
@@ -449,6 +453,7 @@ pub(crate) fn frame_channel_with_source_activity(
 impl From<mpsc::Receiver<PriorityFrame>> for FrameOutbox {
     fn from(ordinary: mpsc::Receiver<PriorityFrame>) -> Self {
         Self {
+            registration_retirement: None,
             source_activity: std::sync::Arc::default(),
             ordinary: EnvelopeReceiver::Legacy(ordinary),
             network_control: None,
@@ -461,6 +466,15 @@ impl From<mpsc::Receiver<PriorityFrame>> for FrameOutbox {
 }
 
 impl FrameOutbox {
+    /// An explicit administrative close, separate from ordinary sender lifetime.
+    /// Dropping the registry entry alone must not cancel a pinned in-flight send.
+    pub(crate) fn bind_registration_retirement(&mut self) -> mpsc::Sender<()> {
+        assert!(self.registration_retirement.is_none());
+        let (owner, retirement) = mpsc::channel(1);
+        self.registration_retirement = Some(retirement);
+        owner
+    }
+
     pub(crate) fn source_activity(&self) -> &crate::local_source_activity::LocalSourceActivity {
         &self.source_activity
     }
@@ -534,6 +548,15 @@ impl FrameOutbox {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<FrameEnvelope>> {
+        if self
+            .registration_retirement
+            .as_mut()
+            .is_some_and(|owner| matches!(owner.poll_recv(cx), Poll::Ready(Some(()))))
+        {
+            // Preserve the existing queued-frame/EOF order, but forbid any
+            // further admission and unblock sends holding a borrowed sender.
+            self.close();
+        }
         let mut pending = false;
         for lane in self.receive_order() {
             let receiver = match lane {
@@ -563,6 +586,13 @@ impl FrameOutbox {
     }
 
     pub(crate) fn try_recv_envelope(&mut self) -> Result<FrameEnvelope, mpsc::error::TryRecvError> {
+        if self
+            .registration_retirement
+            .as_mut()
+            .is_some_and(|owner| owner.try_recv().is_ok())
+        {
+            self.close();
+        }
         let mut empty = false;
         for lane in self.receive_order() {
             let receiver = match lane {
