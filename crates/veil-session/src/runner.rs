@@ -102,6 +102,8 @@ pub enum NextInput {
     Byte(u8),
     /// A priority-tagged frame was received from the outbox.
     OutboxFrame(crate::frame_outbox::FrameEnvelope),
+    /// The registered sender was removed while waiting on a silent wire.
+    OutboxClosed,
     /// An RPC request arrived in the rpc_outbox while waiting.
     RpcRequest(OutboxRequest),
     /// A timer (keepalive or idle-check) fired — caller should loop back.
@@ -185,12 +187,15 @@ async fn await_next_input(
             Err(ordered_reader::ReadError::Closed(e)) => NextInput::ReadClosed(e),
             Err(e) => NextInput::ReadFailed(e),
         },
-        Some(frame) = async {
+        frame = async {
             match outbox {
                 Some(rx) => rx.recv_envelope().await,
                 None     => pending::<Option<crate::frame_outbox::FrameEnvelope>>().await,
             }
-        } => NextInput::OutboxFrame(frame),
+        } => match frame {
+            Some(frame) => NextInput::OutboxFrame(frame),
+            None => NextInput::OutboxClosed,
+        },
         Some(req) = async {
             match rpc_outbox {
                 Some(rx) => rx.recv().await,
@@ -6546,7 +6551,12 @@ impl SessionRunner {
                         Self::queue_rpc_request(req, &mut pq, &mut pending_responses);
                         continue;
                     }
-                    NextInput::LocalDatagramWarm | NextInput::WriterReady => continue,
+                    // Re-enter the existing drain/EOF teardown at the top of
+                    // the loop. Ignoring None here left network-change and
+                    // operator disconnect waiting for an unrelated timer/RX.
+                    NextInput::OutboxClosed
+                    | NextInput::LocalDatagramWarm
+                    | NextInput::WriterReady => continue,
                     // Timer fires for keepalive/idle checks; also evict stale RPC
                     // response slots so they don't accumulate during quiet periods
                     // when no new RPC requests arrive.
@@ -7506,6 +7516,10 @@ use veil_util::hex_short;
 // such file or attribute exists. Runner unit tests live inline in `#[cfg(test)]`
 // modules in this file (e.g. `m1_empty_frame_aead_tests`) and in the
 // `veil-session-integration-tests` crate.
+
+#[cfg(test)]
+#[path = "outbox_close_tests.rs"]
+mod outbox_close_tests;
 
 #[cfg(test)]
 mod m1_empty_frame_aead_tests {
