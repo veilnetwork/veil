@@ -1369,12 +1369,8 @@ impl NodeRuntime {
         let Some(shutdown_tx) = &self.shutdown_tx else {
             return;
         };
-        let handles = crate::outbound_connector::spawn_outbound_peers(
-            self.peers(),
-            &self.access(),
-            shutdown_tx,
-        );
-        lock_tasks(&self.tasks).peers.extend(handles);
+        self.access()
+            .spawn_owned_outbound_peers(self.peers(), shutdown_tx);
         // Load previously-discovered peers from disk.
         persistence::load_discovered_peers(
             &self.config_path,
@@ -1409,9 +1405,8 @@ impl NodeRuntime {
                 st.peers.insert(entry.peer_id, entry.clone());
             }
         }
-        let handles =
-            crate::outbound_connector::spawn_outbound_peers(entries, &self.access(), shutdown_tx);
-        lock_tasks(&self.tasks).peers.extend(handles);
+        self.access()
+            .spawn_owned_outbound_peers(entries, shutdown_tx);
     }
 
     fn lock_state(&self) -> MutexGuard<'_, NodeState> {

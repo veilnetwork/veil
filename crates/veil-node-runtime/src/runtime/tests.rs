@@ -415,6 +415,140 @@ async fn verified_handoff_adopts_quic_without_closing_the_transport() {
     assert_eq!(&payload, b"adopted");
 }
 
+/// A restored peer must be stopped with its node, even while its canonical
+/// runner is blocked waiting for input. A shutdown watch alone is insufficient:
+/// the connector does not poll that watch while it owns an active runner.
+#[tokio::test]
+async fn stopping_the_node_retires_a_restored_peers_active_connection() {
+    let mut cfg = runtime_config_with_listen();
+    cfg.peers.clear();
+    cfg.bootstrap_peers.clear();
+    cfg.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+    cfg.pex.enabled = false;
+    cfg.ipc.enabled = false;
+    cfg.identity.as_mut().unwrap().lazy_mining = false;
+    let path = save_test_config("restored-peer-owner", cfg).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.unwrap();
+    let services = runtime.access();
+    // A non-bootstrap restored row follows directional canonical admission.
+    let local = services.local_node_id;
+    let (keys, peer_id) = loop {
+        let keys = test_support::ed25519_keypair();
+        let id = NodeId::from_public_key(SignatureAlgorithm::Ed25519, &keys.public_key).unwrap();
+        if local.as_slice() < id.as_bytes().as_slice() {
+            break (keys, id);
+        }
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    fs::write(
+        persistence::discovered_peers_path(&path),
+        serde_json::to_vec(&serde_json::json!([{
+            "node_id": peer_id.to_string(), "public_key": keys.public_key,
+            "nonce": veil_cfg::default_nonce_base64(),
+            "transport": format!("tcp://localhost:{}", address.port()), "source": "exchanged"
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    let loaded = persistence::load_discovered_peers(
+        &path,
+        &runtime.state,
+        &services,
+        runtime.shutdown_tx.as_ref().unwrap(),
+    );
+    assert_eq!(loaded, persistence::LoadOutcome::Loaded { count: 1 });
+    let (mut remote, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let identity = HandshakeIdentity {
+        algo: SignatureAlgorithm::Ed25519,
+        public_key: keys.public_key,
+        private_key: keys.private_key,
+        nonce: veil_cfg::default_nonce_base64(),
+        node_id: peer_id,
+    };
+    timeout(
+        Duration::from_secs(5),
+        perform_ovl1_handshake(
+            &mut remote,
+            &identity,
+            veil_cfg::NodeRole::Core,
+            veil_cfg::DiscoveryMode::Public,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            false,
+            true,
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if runtime
+                .sessions()
+                .iter()
+                .any(|s| s.node_id == Some(peer_id))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let old_shutdown = runtime.shutdown_tx.as_ref().unwrap().clone();
+    runtime.stop().await.unwrap();
+    // This is an independent remote witness, not the local live-session map
+    // (finalize_stop_state clears that map even when a detached runner lives).
+    let mut received = Vec::new();
+    let closed = timeout(Duration::from_secs(3), remote.read_to_end(&mut received)).await;
+    let retired = matches!(closed, Ok(Ok(_)));
+    // Leave the old implementation clean after its deliberate failing case.
+    runtime.force_reconnect_all_peers();
+    drop(remote);
+    timeout(Duration::from_secs(5), async {
+        while !services
+            .outbound_connector_refresh
+            .lock()
+            .unwrap()
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let late = services.spawn_owned_outbound_peers(runtime.peers(), &old_shutdown);
+    assert!(
+        late.is_empty(),
+        "a stale producer admitted work after node.stop"
+    );
+    assert!(
+        services
+            .outbound_connector_refresh
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+    assert!(
+        retired,
+        "node.stop returned while a restored peer's active socket remained open"
+    );
+}
+
 /// Exercise the production connector with a transport dial that cannot finish
 /// by itself. The only way to retry is to cancel it after the network-change
 /// wake. Timeouts below are deadlock guards on a paused clock, not a measured

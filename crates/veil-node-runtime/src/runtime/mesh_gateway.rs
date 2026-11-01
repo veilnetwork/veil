@@ -177,12 +177,7 @@ impl NodeRuntime {
                     // Dial stagger is the rank-derived `delay_ms` above plus the
                     // fixed 10 s failover poll. (The old `gateway_failover_delay_secs`
                     // config knob was removed — it was plumbed but never applied.)
-                    let handles = crate::outbound_connector::spawn_outbound_peers(
-                        vec![entry],
-                        &access,
-                        &shutdown_tx_clone,
-                    );
-                    let _ = handles;
+                    access.spawn_owned_outbound_peers(vec![entry], &shutdown_tx_clone);
                 }
             }
         });
@@ -542,13 +537,7 @@ impl NodeRuntime {
                             veil_util::redact_addr_for_log(&gw.veil_addr),
                         ),
                     );
-                    // `access` drives the connector internally — the returned
-                    // handles are already tracked through shutdown_tx_clone.
-                    let _ = crate::outbound_connector::spawn_outbound_peers(
-                        vec![entry],
-                        &access,
-                        &shutdown_tx_clone,
-                    );
+                    access.spawn_owned_outbound_peers(vec![entry], &shutdown_tx_clone);
                 }
             }
         });

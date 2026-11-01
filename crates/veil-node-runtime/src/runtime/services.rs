@@ -502,8 +502,8 @@ impl NodeRuntime {
                                                     veil_util::redact_addr_for_log(&p.transport),
                                                 ),
                                             );
-                                            let _ = crate::outbound_connector::spawn_outbound_peers(
-                                                vec![entry], &access, &shutdown_tx_clone,
+                                            access.spawn_owned_outbound_peers(
+                                                vec![entry], &shutdown_tx_clone,
                                             );
                                         }
                                         // Persist all exchanged peers to disk.
