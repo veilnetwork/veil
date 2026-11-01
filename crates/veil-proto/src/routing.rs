@@ -643,6 +643,14 @@ impl RouteResponsePayload {
 
 // ── PowChallengePayload ───────────────────────────────────────────────────────
 
+/// Context is covered by the issuer signature and checked against a local
+/// request witness before an unknown issuer may consume PoW solver resources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PowChallengeContext {
+    pub request_id: u32,
+    pub ed25519_pubkey: [u8; 32],
+}
+
 /// PoW challenge issued by the acceptor to the requester.
 ///
 /// Wire layout:
@@ -654,6 +662,12 @@ impl RouteResponsePayload {
 /// [97..161] signature [u8; 64] — ed25519(acceptor_privkey
 /// requester||acceptor||nonce||difficulty)
 /// ```
+///
+/// An optional 40-byte `RDP1 || request_id || ed25519_pubkey` context follows
+/// the base body. Its request ID and key are additionally signed with a domain
+/// separator. An unknown issuer is accepted only with this self-authenticating
+/// key AND a live locally-issued request witness. Stripping the context breaks
+/// the signature. Legacy known-peer challenges retain their original layout.
 ///
 /// Solution: find `nonce[32]` such that the first `difficulty` bits of
 /// `BLAKE3(requester_id || challenge_nonce || nonce)` are zero.
@@ -669,6 +683,9 @@ pub struct PowChallengePayload {
     pub difficulty: u8,
     /// Ed25519 signature over [`Self::signable_bytes`].
     pub signature: [u8; 64],
+    /// Signed request correlation and self-authenticating issuer key.
+    /// Legacy challenges from already-known peers may omit the context.
+    pub context: Option<PowChallengeContext>,
 }
 
 impl PowChallengePayload {
@@ -682,21 +699,31 @@ impl PowChallengePayload {
         buf.extend_from_slice(&self.acceptor_node_id);
         buf.extend_from_slice(&self.challenge_nonce);
         buf.push(self.difficulty);
+        if let Some(context) = &self.context {
+            buf.extend_from_slice(b"veil/route-pow/context/v1");
+            buf.extend_from_slice(&context.request_id.to_be_bytes());
+            buf.extend_from_slice(&context.ed25519_pubkey);
+        }
         buf
     }
 
-    /// Encode to the fixed 161-byte layout.
-    pub fn encode(&self) -> [u8; Self::WIRE_SIZE] {
-        let mut buf = [0u8; Self::WIRE_SIZE];
+    /// Encode the 161-byte base and optional signed discovery context.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = vec![0u8; Self::WIRE_SIZE];
         buf[0..32].copy_from_slice(&self.requester_node_id);
         buf[32..64].copy_from_slice(&self.acceptor_node_id);
         buf[64..96].copy_from_slice(&self.challenge_nonce);
         buf[96] = self.difficulty;
         buf[97..161].copy_from_slice(&self.signature);
+        if let Some(context) = &self.context {
+            buf.extend_from_slice(b"RDP1");
+            buf.extend_from_slice(&context.request_id.to_be_bytes());
+            buf.extend_from_slice(&context.ed25519_pubkey);
+        }
         buf
     }
 
-    /// Parse from a 161-byte buffer.
+    /// Parse the base layout and any recognized discovery context.
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
         if buf.len() < Self::WIRE_SIZE {
             return Err(ProtoError::BufferTooShort {
@@ -704,12 +731,34 @@ impl PowChallengePayload {
                 got: buf.len(),
             });
         }
+        let extra = &buf[Self::WIRE_SIZE..];
+        if !extra.is_empty() && b"RDP1".starts_with(extra) {
+            return Err(ProtoError::BufferTooShort {
+                need: Self::WIRE_SIZE + 40,
+                got: buf.len(),
+            });
+        }
+        let context = if buf.get(Self::WIRE_SIZE..Self::WIRE_SIZE + 4) == Some(b"RDP1") {
+            if buf.len() < Self::WIRE_SIZE + 40 {
+                return Err(ProtoError::BufferTooShort {
+                    need: Self::WIRE_SIZE + 40,
+                    got: buf.len(),
+                });
+            }
+            Some(PowChallengeContext {
+                request_id: u32::from_be_bytes(super::read_array::<4>(buf, Self::WIRE_SIZE + 4)?),
+                ed25519_pubkey: super::read_array::<32>(buf, Self::WIRE_SIZE + 8)?,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             requester_node_id: super::read_array::<32>(buf, 0)?,
             acceptor_node_id: super::read_array::<32>(buf, 32)?,
             challenge_nonce: super::read_array::<32>(buf, 64)?,
             difficulty: buf[96],
             signature: super::read_array::<64>(buf, 97)?,
+            context,
         })
     }
 }
@@ -1239,6 +1288,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pow_context_roundtrip_and_signature_input_bind_request_and_issuer_key() {
+        let mut p = PowChallengePayload {
+            requester_node_id: [1; 32],
+            acceptor_node_id: [2; 32],
+            challenge_nonce: [3; 32],
+            difficulty: 4,
+            signature: [5; 64],
+            context: Some(PowChallengeContext {
+                request_id: 6,
+                ed25519_pubkey: [7; 32],
+            }),
+        };
+        let encoded = p.encode();
+        assert_eq!(encoded.len(), PowChallengePayload::WIRE_SIZE + 40);
+        assert_eq!(PowChallengePayload::decode(&encoded).unwrap(), p);
+        for end in PowChallengePayload::WIRE_SIZE + 1..encoded.len() {
+            assert!(PowChallengePayload::decode(&encoded[..end]).is_err());
+        }
+        let signed = p.signable_bytes();
+        p.context.as_mut().unwrap().request_id ^= 1;
+        assert_ne!(signed, p.signable_bytes());
+        p.context.as_mut().unwrap().request_id ^= 1;
+        p.context.as_mut().unwrap().ed25519_pubkey[0] ^= 1;
+        assert_ne!(signed, p.signable_bytes());
+        p.context = None;
+        assert_ne!(signed, p.signable_bytes());
+    }
+
+    #[test]
     fn route_announce_roundtrip() {
         let p = RouteAnnouncePayload {
             origin_node_id: [1u8; 32],
@@ -1436,6 +1514,7 @@ mod tests {
     #[test]
     fn pow_challenge_roundtrip() {
         let p = PowChallengePayload {
+            context: None,
             requester_node_id: [11u8; 32],
             acceptor_node_id: [12u8; 32],
             challenge_nonce: [0xBBu8; 32],

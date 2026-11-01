@@ -971,6 +971,7 @@ impl NodeRuntime {
             target_labels: build_target_labels(&config.routing),
             route_updated: Arc::clone(&shared_route_updated),
             pow_difficulty: config.abuse.pow_min_difficulty as u8,
+            discovery_paths: Arc::new(Mutex::new(Default::default())),
             pow_pending: Arc::new(Mutex::new(veil_dispatcher::PowPendingTable::new())),
             discovery_mode: config.routing.discovery_mode,
             dht_service: config.dht.participate,

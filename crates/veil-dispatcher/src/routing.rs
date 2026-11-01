@@ -12,12 +12,13 @@ use veil_proto::{
     family::RoutingMsg,
     header::FrameHeader,
     routing::{
-        PowAcceptPayload, PowChallengePayload, PowResponsePayload, RecursiveQueryPayload,
-        RecursiveResponsePayload, RouteAnnounceAliasedPayload, RouteAnnouncePayload,
-        RouteRequestPayload, RouteResponsePayload, RouteWithdrawAliasedPayload,
-        RouteWithdrawPayload, recursive_query_type,
+        PowAcceptPayload, PowChallengeContext, PowChallengePayload, PowResponsePayload,
+        RecursiveQueryPayload, RecursiveResponsePayload, RouteAnnounceAliasedPayload,
+        RouteAnnouncePayload, RouteRequestPayload, RouteResponsePayload,
+        RouteWithdrawAliasedPayload, RouteWithdrawPayload, recursive_query_type,
     },
 };
+use veil_routing::discovery_paths::{ChallengeKey, ReplyTo, RequestKey};
 
 // ── Route-score constants ────────────────────────────────────────────────────
 //
@@ -531,6 +532,46 @@ impl FrameDispatcher {
         response
     }
 
+    /// A supplied key proves only this transport node ID and signature. It
+    /// does not install a sovereign identity, ratchet key, or authorization.
+    fn routing_signature_with_key(
+        &self,
+        node: &[u8; 32],
+        bytes: &[u8],
+        signature: &[u8; 64],
+        supplied: Option<&[u8]>,
+    ) -> bool {
+        match self.check_routing_sig(node, bytes, signature) {
+            SigResult::Valid => true,
+            SigResult::Invalid => false,
+            SigResult::UnknownKey => {
+                let Some(key) = supplied else {
+                    return false;
+                };
+                if key.len() != 32 || blake3::hash(key).as_bytes() != node {
+                    return false;
+                }
+                let Ok(raw): Result<[u8; 32], _> = key.try_into() else {
+                    return false;
+                };
+                let Ok(key) = VerifyingKey::from_bytes(&raw) else {
+                    return false;
+                };
+                key.verify(bytes, &Signature::from_bytes(signature)).is_ok()
+            }
+        }
+    }
+
+    fn send_discovery_reply(&self, peer: [u8; 32], msg: RoutingMsg, body: &[u8]) {
+        if let Some(registry) = &self.session_tx_registry {
+            rlock!(registry).send_to(
+                &peer,
+                veil_proto::priority::INTERACTIVE,
+                encode_routing_frame(msg, body),
+            );
+        }
+    }
+
     fn handle_route_request(&self, body: &[u8], peer_id: NodeId) -> DispatchResult {
         let p = match RouteRequestPayload::decode(body) {
             Ok(p) => p,
@@ -618,10 +659,23 @@ impl FrameDispatcher {
             // letting an attacker probe arbitrary node_ids and de-anonymise
             // them. See `handle_pow_response` for the deferred reply path.
             if self.pow_difficulty > 0 {
+                let request_key = RequestKey {
+                    requester: p.requester_node_id,
+                    target: p.target_node_id,
+                    id: p.request_id,
+                };
+                if !lock!(self.discovery_paths).remember_request(
+                    request_key,
+                    ReplyTo::Peer(*peer_id.as_bytes()),
+                    Instant::now(),
+                ) {
+                    return DispatchResult::NoResponse;
+                }
                 use rand_core::{OsRng, RngCore};
                 let mut challenge_nonce = [0u8; 32];
                 OsRng.fill_bytes(&mut challenge_nonce);
                 let mut challenge = PowChallengePayload {
+                    context: None,
                     requester_node_id: p.requester_node_id,
                     acceptor_node_id: self.local_node_id,
                     challenge_nonce,
@@ -629,6 +683,10 @@ impl FrameDispatcher {
                     signature: [0u8; 64],
                 };
                 if let Some(ref key) = self.crypto.local_signing_key {
+                    challenge.context = Some(PowChallengeContext {
+                        request_id: p.request_id,
+                        ed25519_pubkey: key.verifying_key().to_bytes(),
+                    });
                     challenge.signature = key.sign(&challenge.signable_bytes()).to_bytes();
                 }
                 {
@@ -646,22 +704,13 @@ impl FrameDispatcher {
                         now,
                     );
                 }
-                let cf = encode_routing_frame(RoutingMsg::PowChallenge, &challenge.encode());
-                if let Some(ref reg) = self.session_tx_registry {
-                    // LOCK ORDER: snapshot route_cache lookup BEFORE wlock!(reg)
-                    // per canonical order `route_cache → session_tx_registry`.
-                    let route_cache_fallback =
-                        rlock!(self.route_cache).lookup(&p.requester_node_id);
-                    let guard = wlock!(reg);
-                    if !guard.send_to(
-                        &p.requester_node_id,
-                        veil_proto::header::priority::INTERACTIVE,
-                        cf.clone(),
-                    ) {
-                        let dest = route_cache_fallback.unwrap_or(*peer_id.as_bytes());
-                        guard.send_to(&dest, veil_proto::header::priority::INTERACTIVE, cf);
-                    }
-                }
+                // Return to the request's actual ingress, not an unrelated
+                // cached route for its untrusted requester claim.
+                self.send_discovery_reply(
+                    *peer_id.as_bytes(),
+                    RoutingMsg::PowChallenge,
+                    &challenge.encode(),
+                );
                 // RouteResponse intentionally deferred — sent only after
                 // PowResponse verifies in `handle_pow_response`.
                 return DispatchResult::NoResponse;
@@ -721,6 +770,18 @@ impl FrameDispatcher {
             let fwd = RouteRequestPayload { ttl: ttl - 1, ..p };
             let frame = encode_routing_frame(RoutingMsg::RouteRequest, &fwd.encode());
             if let Some(reg) = &self.session_tx_registry {
+                let key = RequestKey {
+                    requester: fwd.requester_node_id,
+                    target: fwd.target_node_id,
+                    id: fwd.request_id,
+                };
+                if !lock!(self.discovery_paths).remember_request(
+                    key,
+                    ReplyTo::Peer(*peer_id.as_bytes()),
+                    Instant::now(),
+                ) {
+                    return DispatchResult::NoResponse;
+                }
                 wlock!(reg).send_to_all_except_with_priority(
                     peer_id.as_bytes(),
                     veil_proto::header::priority::BACKGROUND,
@@ -841,6 +902,41 @@ impl FrameDispatcher {
             // Wake up any IPC send that is waiting for this route.
             self.route_updated.notify_waiters();
         } else {
+            let request = RequestKey {
+                requester: p.requester_node_id,
+                target: p.target_node_id,
+                id: p.request_id,
+            };
+            let reply = lock!(self.discovery_paths).request_path(request, Instant::now());
+            if let Some(ReplyTo::Peer(back)) = reply {
+                if back == *peer_id.as_bytes()
+                    || !lock!(self.abuse.dht_contact_quota).allow(*peer_id.as_bytes())
+                {
+                    return DispatchResult::NoResponse;
+                }
+                if !self.routing_signature_with_key(
+                    &p.target_node_id,
+                    &p.signable_bytes(),
+                    &p.signature,
+                    p.ed25519_pubkey.as_deref(),
+                ) {
+                    return self
+                        .drop_relayed("RouteResponse: target signature not verifiable", peer_id);
+                }
+                // A signed response to this admitted request proves a route
+                // through its incoming hop, just as at the requester. Never
+                // learn requester claims or routes from unsigned replies.
+                wlock!(self.route_cache).insert_labelled(
+                    p.target_node_id,
+                    *peer_id.as_bytes(),
+                    20_000,
+                    2,
+                    p.target_labels.clone(),
+                );
+                self.route_updated.notify_waiters();
+                self.send_discovery_reply(back, RoutingMsg::RouteResponse, body);
+                return DispatchResult::NoResponse;
+            }
             // Route toward requester.
             let frame = encode_routing_frame(RoutingMsg::RouteResponse, &p.encode());
             if let Some(reg) = &self.session_tx_registry {
@@ -919,24 +1015,34 @@ impl FrameDispatcher {
                     peer_id,
                 );
             }
-            // SEC-004b: Verify acceptor's signature before spawning solver.
-            // The signature covers requester||acceptor||nonce||difficulty and
-            // is signed by acceptor_privkey. We must have acceptor's pubkey
-            // in our peer_pubkeys cache (set during handshake with acceptor).
-            // UnknownKey treated as Violation: we must have exchanged keys with
-            // the acceptor during the session handshake before a challenge arrives.
-            // Both failures belong to the acceptor, not to the courier: a bad
-            // signature is the acceptor's forgery, and an unknown key means we
-            // have simply never handshaked with the acceptor — which is the
-            // ordinary case for a challenge that came several hops. The
-            // neighbouring `RouteRequest` path already reasons this way about
-            // its own unknown keys; this one did not.
-            match self.check_routing_sig(&p.acceptor_node_id, &p.signable_bytes(), &p.signature) {
-                SigResult::Valid => {}
-                _ => {
+            // Verify the issuer before starting any solver. A new context
+            // binds the query ID and issuer key, and additionally requires
+            // a live locally-issued request. The key may be unknown to the
+            // requester, but must hash to the requested transport node ID.
+            // Legacy context-free challenges still require a cached key.
+            // Neither failure is attributed to the relay that carried it.
+            let context = p.context.as_ref();
+            if let Some(context) = context {
+                let request = RequestKey {
+                    requester: p.requester_node_id,
+                    target: p.acceptor_node_id,
+                    id: context.request_id,
+                };
+                if lock!(self.discovery_paths).request_path(request, Instant::now())
+                    != Some(ReplyTo::Local)
+                {
                     return self
-                        .drop_relayed("PowChallenge: acceptor signature not verifiable", peer_id);
+                        .drop_relayed("PowChallenge: no live local request witness", peer_id);
                 }
+            }
+            if !self.routing_signature_with_key(
+                &p.acceptor_node_id,
+                &p.signable_bytes(),
+                &p.signature,
+                context.map(|c| c.ed25519_pubkey.as_slice()),
+            ) {
+                return self
+                    .drop_relayed("PowChallenge: acceptor signature not verifiable", peer_id);
             }
             // Deduplicate challenge nonces to prevent replay flooding.
             // A single acceptor can issue the same nonce to hundreds of relays;
@@ -946,6 +1052,42 @@ impl FrameDispatcher {
             }
             // The challenge is addressed to us and passes auth — solve it.
             return DispatchResult::SolvePow(p);
+        }
+        if let Some(context) = &p.context {
+            if !lock!(self.abuse.pow_challenge_limiter).allow(*peer_id.as_bytes()) {
+                return DispatchResult::NoResponse;
+            }
+            if !self.routing_signature_with_key(
+                &p.acceptor_node_id,
+                &p.signable_bytes(),
+                &p.signature,
+                Some(&context.ed25519_pubkey),
+            ) {
+                return self
+                    .drop_relayed("PowChallenge: transit signature not verifiable", peer_id);
+            }
+            let request = RequestKey {
+                requester: p.requester_node_id,
+                target: p.acceptor_node_id,
+                id: context.request_id,
+            };
+            let key = ChallengeKey {
+                requester: p.requester_node_id,
+                acceptor: p.acceptor_node_id,
+                nonce: p.challenge_nonce,
+            };
+            let path = lock!(self.discovery_paths).remember_challenge(
+                key,
+                request,
+                *peer_id.as_bytes(),
+                Instant::now(),
+            );
+            if let Some(path) = path {
+                if let ReplyTo::Peer(back) = path.reply {
+                    self.send_discovery_reply(back, RoutingMsg::PowChallenge, body);
+                }
+            }
+            return DispatchResult::NoResponse;
         }
         // Relay toward requester.
         let frame = encode_routing_frame(RoutingMsg::PowChallenge, body);
@@ -1002,21 +1144,16 @@ impl FrameDispatcher {
             // correlate this RouteResponse with the original
             // RouteRequest.
             let response = self.build_signed_route_response(request_id, p.requester_node_id);
-            let rf = encode_routing_frame(RoutingMsg::RouteResponse, &response.encode());
-            if let Some(ref reg) = self.session_tx_registry {
-                // LOCK ORDER: snapshot route_cache fallback BEFORE wlock!(reg).
-                let route_cache_fallback = rlock!(self.route_cache).lookup(&p.requester_node_id);
-                let guard = wlock!(reg);
-                if !guard.send_to(
-                    &p.requester_node_id,
-                    veil_proto::header::priority::INTERACTIVE,
-                    rf.clone(),
-                ) && let Some(hop) = route_cache_fallback
-                    && &hop != peer_id.as_bytes()
-                {
-                    guard.send_to(&hop, veil_proto::header::priority::INTERACTIVE, rf);
-                }
-            }
+            let request = RequestKey {
+                requester: p.requester_node_id,
+                target: self.local_node_id,
+                id: request_id,
+            };
+            let back = match lock!(self.discovery_paths).request_path(request, Instant::now()) {
+                Some(ReplyTo::Peer(back)) => back,
+                _ => *peer_id.as_bytes(),
+            };
+            self.send_discovery_reply(back, RoutingMsg::RouteResponse, &response.encode());
 
             // PoW accepted — also send PowAccept with first listen
             // transport for backward compatibility (signals "PoW
@@ -1040,24 +1177,23 @@ impl FrameDispatcher {
                     challenge_nonce: p.challenge_nonce,
                     transport,
                 };
-                let af = encode_routing_frame(RoutingMsg::PowAccept, &accept.encode());
-                if let Some(ref reg) = self.session_tx_registry {
-                    // LOCK ORDER: snapshot route_cache fallback BEFORE wlock!(reg).
-                    let route_cache_fallback =
-                        rlock!(self.route_cache).lookup(&p.requester_node_id);
-                    let guard = wlock!(reg);
-                    if !guard.send_to(
-                        &p.requester_node_id,
-                        veil_proto::header::priority::INTERACTIVE,
-                        af.clone(),
-                    ) && let Some(hop) = route_cache_fallback
-                        && &hop != peer_id.as_bytes()
-                    {
-                        guard.send_to(&hop, veil_proto::header::priority::INTERACTIVE, af);
-                    }
-                }
+                self.send_discovery_reply(back, RoutingMsg::PowAccept, &accept.encode());
             }
         } else {
+            let key = ChallengeKey {
+                requester: p.requester_node_id,
+                acceptor: p.acceptor_node_id,
+                nonce: p.challenge_nonce,
+            };
+            let path = lock!(self.discovery_paths).challenge_path(key, Instant::now());
+            if let Some(path) = path {
+                if path.reply == ReplyTo::Peer(*peer_id.as_bytes())
+                    && path.issuer_hop != *peer_id.as_bytes()
+                {
+                    self.send_discovery_reply(path.issuer_hop, RoutingMsg::PowResponse, body);
+                }
+                return DispatchResult::NoResponse;
+            }
             // Relay toward acceptor.
             let frame = encode_routing_frame(RoutingMsg::PowResponse, body);
             if let Some(ref reg) = self.session_tx_registry {
@@ -1094,6 +1230,19 @@ impl FrameDispatcher {
             );
             self.route_updated.notify_waiters();
         } else {
+            let path = lock!(self.discovery_paths).accept_path(
+                p.requester_node_id,
+                p.challenge_nonce,
+                Instant::now(),
+            );
+            if let Some(path) = path {
+                if path.issuer_hop == *peer_id.as_bytes() {
+                    if let ReplyTo::Peer(back) = path.reply {
+                        self.send_discovery_reply(back, RoutingMsg::PowAccept, body);
+                    }
+                }
+                return DispatchResult::NoResponse;
+            }
             // Relay toward requester.
             let frame = encode_routing_frame(RoutingMsg::PowAccept, body);
             if let Some(ref reg) = self.session_tx_registry {

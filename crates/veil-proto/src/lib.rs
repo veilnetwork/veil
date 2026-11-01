@@ -155,9 +155,10 @@ pub use mesh::{
     mesh_ack_status,
 };
 pub use routing::{
-    PowAcceptPayload, PowChallengePayload, PowResponsePayload, RouteAnnounceAliasedPayload,
-    RouteAnnouncePayload, RouteDiscoverOfferPayload, RouteDiscoveryPacket, RouteRequestPayload,
-    RouteResponsePayload, RouteWithdrawAliasedPayload, RouteWithdrawPayload,
+    PowAcceptPayload, PowChallengeContext, PowChallengePayload, PowResponsePayload,
+    RouteAnnounceAliasedPayload, RouteAnnouncePayload, RouteDiscoverOfferPayload,
+    RouteDiscoveryPacket, RouteRequestPayload, RouteResponsePayload, RouteWithdrawAliasedPayload,
+    RouteWithdrawPayload,
 };
 pub use session::{RekeyPayload, SessionAlias, SleepAdvertisementPayload};
 use thiserror::Error;

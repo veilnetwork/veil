@@ -1220,6 +1220,7 @@ impl NodeRuntime {
             route_updated: Arc::clone(&self.dispatcher.route_updated),
             local_node_id: *self.identity.local_identity.node_id.as_bytes(),
             signing_key: self.dispatcher.crypto.local_signing_key.clone(),
+            discovery_paths: Arc::clone(&self.dispatcher.discovery_paths),
             metrics,
             logger,
             route_request_backoff_ms,
