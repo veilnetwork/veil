@@ -224,6 +224,32 @@ fn claim_or_refresh_connector(
     Some(rx)
 }
 
+/// A refresh is a hint to re-read the selected row, not proof that the dial
+/// became stale. Keep the same pending future for duplicate discoveries; only
+/// replacement dial/admission parameters or retirement should cancel it.
+async fn wait_for_dial_target_change(
+    access: &NodeServices,
+    original: &PeerConfigEntry,
+    attempt: &PeerConfigEntry,
+    refresh: &mut watch::Receiver<u64>,
+) -> Result<(), watch::error::RecvError> {
+    loop {
+        refresh.changed().await?;
+        let current = access.current_peer_entry(original.node_id.as_bytes());
+        if current.is_none()
+            && crate::runtime::peer_handshake::identity_mismatch_drops_record(original.source)
+        {
+            return Ok(());
+        }
+        // Same fallback as the attempt selector: operator/synthetic rows can
+        // be outside the learned table. Compare the WHOLE row, including
+        // verification keys/nonce/TLS pins, not just its transport URI.
+        if current.as_ref().unwrap_or(original) != attempt {
+            return Ok(());
+        }
+    }
+}
+
 /// Spawn one reconnect loop per configured peer.
 ///
 /// Returns handles for all spawned tasks so the caller can abort them on
@@ -467,11 +493,11 @@ pub fn spawn_outbound_peers(
                         first_failure_at = None;
                         continue;
                     }
-                    changed = refresh_rx.changed() => {
+                    changed = wait_for_dial_target_change(&access, &peer, &attempt, &mut refresh_rx) => {
                         if changed.is_err() { break; }
-                        // The entry in NodeState now carries a newer endpoint.
-                        // Drop the stale connect future and retry immediately;
-                        // connect_peer_active re-reads the entry on every call.
+                        // A different selected row (or its retirement) makes
+                        // this attempt stale. Identical rediscovery is consumed
+                        // by the waiter without dropping the connect/handshake.
                         backoff = backoff_min;
                         consecutive_failures = 0;
                         first_failure_at = None;
