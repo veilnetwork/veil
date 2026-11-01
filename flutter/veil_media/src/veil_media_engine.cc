@@ -286,6 +286,21 @@ void update_atomic_max(std::atomic<int64_t>* target, int64_t value) {
 #endif
 
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
+// Actual APM configuration, never inferred from a UI preference or ABI version.
+// Unknown stays distinct from disabled; no samples or device labels are exposed.
+std::string audio_processing_stats(webrtc::AudioProcessing* apm) {
+  int aec = -1, ns = -1, agc = -1;
+  if (apm) {
+    const auto config = apm->GetConfig();
+    aec = config.echo_canceller.enabled ? 1 : 0;
+    ns = config.noise_suppression.enabled ? 1 : 0;
+    agc = config.gain_controller2.enabled ? 1 : 0;
+  }
+  return ",\"audio_aec_enabled\":" + std::to_string(aec) +
+         ",\"audio_ns_enabled\":" + std::to_string(ns) +
+         ",\"audio_agc_enabled\":" + std::to_string(agc);
+}
+
 // Run `f` synchronously on `tq` and block until it finishes. webrtc::Call and
 // its streams must be created/destroyed on the worker task queue (they call
 // TaskQueueBase::Current(), which is null on the FFI caller thread → crash).
@@ -2993,6 +3008,7 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   // Capability remains explicit on a stalled worker: unknown audio never
   // falls back to video ingress. These fields are endpoint-local JSON only.
   std::string snapshot(json, static_cast<size_t>(written) - 1);
+  snapshot += audio_processing_stats(ws->apm.get());
   const auto frame_budget = ws->video_frame_budget->snapshot();
   snapshot += ",\"video_frame_budget_bytes\":" + std::to_string(frame_budget.bytes) +
               ",\"video_frame_pixel_cap\":" + std::to_string(frame_budget.max_pixels) +
@@ -4822,6 +4838,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
            sizeof(json), written);
     } else {
       std::string snapshot(json, static_cast<size_t>(written) - 1);
+      snapshot += audio_processing_stats(ws->apm.get());
       snapshot += ",\"media_route_generation\":" + std::to_string(ws->route_generation.load()) +
                   ",\"audio_bwe_route_generation\":" + std::to_string(ws->audio_route_applied.load()) +
                   ",\"video_bwe_route_generation\":" + std::to_string(ws->video_route_applied.load());
