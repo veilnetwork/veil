@@ -2474,6 +2474,8 @@ class VeilClient implements Finalizable {
   /// (Epic 489.5).  Triggers eager gateway-failover so the app does
   /// not wait for keepalive timeout to detect dead sessions on a
   /// Wi-Fi → Cellular flip.
+  /// Completes after the daemon dispatches the notification, before remote
+  /// connections necessarily recover. Safe to close a temporary client then.
   Future<void> notifyNetworkChanged(NetworkKind kind, {int mtuHint = 0}) async {
     _ensureOpen();
     return Future(() {
