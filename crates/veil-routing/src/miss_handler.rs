@@ -125,6 +125,24 @@ pub fn spawn(ctx: MissHandlerCtx) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run(ctx))
 }
 
+// Limit simultaneous network walks, not merely the number of tasks waiting
+// for a semaphore. The existing bounded input channel remains the backlog.
+const MAX_CONCURRENT_ROUTE_LOOKUPS: usize = 4;
+
+struct LookupCtx {
+    broadcaster: Arc<dyn FrameBroadcaster>,
+    route_cache: Arc<std::sync::RwLock<RouteCache>>,
+    route_updated: Arc<Notify>,
+    local_node_id: [u8; 32],
+    signing_key: Option<Arc<SigningKey>>,
+    discovery_paths: Arc<std::sync::Mutex<crate::discovery_paths::DiscoveryPaths>>,
+    metrics: Option<Arc<dyn RoutingMetrics>>,
+    logger: Arc<dyn RoutingLogger>,
+    route_request_backoff_ms: [u64; 3],
+    partition_threshold: f64,
+    iterative_dht_fallback: Option<Arc<dyn IterativeDhtFallback>>,
+}
+
 async fn run(ctx: MissHandlerCtx) {
     let MissHandlerCtx {
         mut shutdown_rx,
@@ -142,129 +160,179 @@ async fn run(ctx: MissHandlerCtx) {
         iterative_dht_fallback,
     } = ctx;
 
-    let mut dedup: std::collections::HashMap<[u8; 32], std::time::Instant> =
-        std::collections::HashMap::new();
-    // priority-aware deduplication ignored — same
-    // destination dedups regardless of priority (we only need ONE
-    // resolution for a target; the priority just informs the timeout).
-    // Periodic cleanup keeps the dedup map bounded even when no miss events
-    // arrive for a long time.
+    let lookup = Arc::new(LookupCtx {
+        broadcaster,
+        route_cache,
+        route_updated,
+        local_node_id,
+        signing_key,
+        discovery_paths,
+        metrics,
+        logger,
+        route_request_backoff_ms,
+        partition_threshold,
+        iterative_dht_fallback,
+    });
+    let mut dedup = std::collections::HashMap::<[u8; 32], tokio::time::Instant>::new();
+    let mut active = std::collections::HashSet::new();
+    let mut targets = std::collections::HashMap::new();
+    let mut jobs = tokio::task::JoinSet::new();
     let mut cleanup_ticker = tokio::time::interval(DEDUP_TTL * 10);
     cleanup_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
+    if *shutdown_rx.borrow() {
+        return;
+    }
     loop {
         tokio::select! {
-            // biased: shutdown must win over in-flight miss events or tick
-            // work so `node stop` doesn't wait for the next channel message.
             biased;
-            Ok(_) = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() { break; }
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() { break; }
+            }
+            completed = jobs.join_next_with_id(), if !jobs.is_empty() => {
+                let id = match completed.expect("nonempty lookup set") {
+                    Ok((id, ())) => id,
+                    Err(error) => {
+                        lookup.logger.warn("route.lookup.failed", "route lookup task did not complete");
+                        error.id()
+                    }
+                };
+                if let Some(target) = targets.remove(&id) {
+                    active.remove(&target);
+                }
             }
             _ = cleanup_ticker.tick() => {
-                let now = std::time::Instant::now();
-                dedup.retain(|_, t| now.duration_since(*t) < DEDUP_TTL * 10);
+                let now = tokio::time::Instant::now();
+                dedup.retain(|_, at| now.duration_since(*at) < DEDUP_TTL * 10);
             }
-            msg = rx.recv() => {
+            msg = rx.recv(), if jobs.len() < MAX_CONCURRENT_ROUTE_LOOKUPS => {
                 let Some((dst, priority)) = msg else { break };
-                let now = std::time::Instant::now();
-
-                // Already-in-flight: skip re-flood. removed the
-                // mailbox-flush sidecar that used to run here.
-                if dedup.get(&dst).is_some_and(|t| now.duration_since(*t) < DEDUP_TTL) {
+                let now = tokio::time::Instant::now();
+                // The short re-flood cooldown can expire while a slow fallback
+                // is still alive. Never run two walks for the same address.
+                if active.contains(&dst)
+                    || dedup.get(&dst).is_some_and(|at| now.duration_since(*at) < DEDUP_TTL) {
                     continue;
                 }
                 dedup.insert(dst, now);
-
-                if let Some(m) = &metrics { m.inc_discovery_triggered(); }
-
-                let flooded = flood_route_request(
-                    &dst, local_node_id, signing_key.as_deref(), broadcaster.as_ref(), &discovery_paths,
-                );
-
-                let mut found = if flooded {
-                    wait_for_route(&dst, &route_cache, &route_updated, route_request_backoff_ms).await
-                } else { false };
-
-                // iterative-DHT fallback. Triggered ONLY if
-                // legacy `RouteRequest` flood exhausted its retries without a route.
-                // Behaviour-preserving: `None` skips this block entirely and we
-                // record the partition event below.
-                if !found && let Some(fallback) = iterative_dht_fallback.as_ref() {
-                    logger.info(
-                        "route.dht_fallback.start",
-                        &format!("target={}", hex_short_8(&dst)),
-                    );
-                    if let Some(m) = &metrics {
-                        m.inc_dht_fallback_triggered();
-                    }
-                    let oneshot_ok = fallback.try_seed_route_via_find_node(dst, priority).await;
-                    // Re-check the route cache REGARDLESS of the oneshot result.
-                    // `oneshot_ok` only reflects whether our RecursiveResponse
-                    // oneshot fired; but the dispatcher ALSO seeds candidate
-                    // next-hops into route_cache from PARTIAL recursive responses
-                    // that arrive along the path (see DhtRouteFallback docs). So
-                    // a route can recover even when the oneshot timed out.
-                    // Counting `resolved`/`miss` off the oneshot (as before)
-                    // under-counted real recoveries and mislabeled them as
-                    // partitions. Tie the outcome to whether a route actually
-                    // appeared instead. On oneshot success, give the seeded
-                    // route a brief window to settle; on oneshot miss, any seed
-                    // already arrived during the timeout, so an immediate check
-                    // adds no latency to the (already-slow) miss path.
-                    found = if oneshot_ok {
-                        wait_for_route(
-                            &dst, &route_cache, &route_updated, route_request_backoff_ms,
-                        ).await
-                    } else {
-                        rlock!(route_cache).lookup(&dst).is_some()
-                    };
-                    if found {
-                        if let Some(m) = &metrics {
-                            m.inc_dht_fallback_resolved();
-                        }
-                        logger.info(
-                            "route.dht_fallback.resolved",
-                            &format!(
-                                "target={} oneshot={} cache_seeded={}",
-                                hex_short_8(&dst), oneshot_ok, !oneshot_ok
-                            ),
-                        );
-                    } else {
-                        if let Some(m) = &metrics {
-                            m.inc_dht_fallback_miss();
-                        }
-                        logger.info(
-                            "route.dht_fallback.miss",
-                            &format!("target={} oneshot={}", hex_short_8(&dst), oneshot_ok),
-                        );
-                    }
-                }
-
-                if !found {
-                    // Persistent miss — record failure event and possibly warn.
-                    if let Some(m) = &metrics {
-                        let score = m.record_reachability_event(false);
-                        if score < partition_threshold {
-                            logger.warn(
-                                "network.partition_suspected",
-                                &format!(
-                                    "reachability_score={score:.2} threshold={partition_threshold:.2}"
-                                ),
-                            );
-                        }
-                    }
-                    continue;
-                }
-
-                if let Some(m) = &metrics {
-                    m.inc_route_recovery();
-                    m.record_reachability_event(true);
-                }
-                // mailbox flush removed. Application layer retries
-                // delivery via the freshly-learned route on its own cadence.
+                active.insert(dst);
+                let shared = Arc::clone(&lookup);
+                let job = jobs.spawn(async move { lookup_one(&shared, dst, priority).await; });
+                targets.insert(job.id(), dst);
             }
         }
     }
+    // Aborts and joins every child, so no walk outlives shutdown/receiver close.
+    // Aborting this parent also drops JoinSet and aborts its owned children.
+    jobs.shutdown().await;
+}
+
+async fn lookup_one(ctx: &LookupCtx, dst: [u8; 32], priority: u8) {
+    let LookupCtx {
+        broadcaster,
+        route_cache,
+        route_updated,
+        local_node_id,
+        signing_key,
+        discovery_paths,
+        metrics,
+        logger,
+        route_request_backoff_ms,
+        partition_threshold,
+        iterative_dht_fallback,
+    } = ctx;
+    if let Some(m) = metrics {
+        m.inc_discovery_triggered();
+    }
+
+    let flooded = flood_route_request(
+        &dst,
+        *local_node_id,
+        signing_key.as_deref(),
+        broadcaster.as_ref(),
+        discovery_paths,
+    );
+
+    let mut found = if flooded {
+        wait_for_route(&dst, route_cache, route_updated, *route_request_backoff_ms).await
+    } else {
+        false
+    };
+
+    // iterative-DHT fallback. Triggered ONLY if
+    // legacy `RouteRequest` flood exhausted its retries without a route.
+    // Behaviour-preserving: `None` skips this block entirely and we
+    // record the partition event below.
+    if !found && let Some(fallback) = iterative_dht_fallback.as_ref() {
+        logger.info(
+            "route.dht_fallback.start",
+            &format!("target={}", hex_short_8(&dst)),
+        );
+        if let Some(m) = metrics {
+            m.inc_dht_fallback_triggered();
+        }
+        let oneshot_ok = fallback.try_seed_route_via_find_node(dst, priority).await;
+        // Re-check the route cache REGARDLESS of the oneshot result.
+        // `oneshot_ok` only reflects whether our RecursiveResponse
+        // oneshot fired; but the dispatcher ALSO seeds candidate
+        // next-hops into route_cache from PARTIAL recursive responses
+        // that arrive along the path (see DhtRouteFallback docs). So
+        // a route can recover even when the oneshot timed out.
+        // Counting `resolved`/`miss` off the oneshot (as before)
+        // under-counted real recoveries and mislabeled them as
+        // partitions. Tie the outcome to whether a route actually
+        // appeared instead. On oneshot success, give the seeded
+        // route a brief window to settle; on oneshot miss, any seed
+        // already arrived during the timeout, so an immediate check
+        // adds no latency to the (already-slow) miss path.
+        found = if oneshot_ok {
+            wait_for_route(&dst, route_cache, route_updated, *route_request_backoff_ms).await
+        } else {
+            rlock!(route_cache).lookup(&dst).is_some()
+        };
+        if found {
+            if let Some(m) = metrics {
+                m.inc_dht_fallback_resolved();
+            }
+            logger.info(
+                "route.dht_fallback.resolved",
+                &format!(
+                    "target={} oneshot={} cache_seeded={}",
+                    hex_short_8(&dst),
+                    oneshot_ok,
+                    !oneshot_ok
+                ),
+            );
+        } else {
+            if let Some(m) = metrics {
+                m.inc_dht_fallback_miss();
+            }
+            logger.info(
+                "route.dht_fallback.miss",
+                &format!("target={} oneshot={}", hex_short_8(&dst), oneshot_ok),
+            );
+        }
+    }
+
+    if !found {
+        // Persistent miss — record failure event and possibly warn.
+        if let Some(m) = metrics {
+            let score = m.record_reachability_event(false);
+            if score < *partition_threshold {
+                logger.warn(
+                    "network.partition_suspected",
+                    &format!("reachability_score={score:.2} threshold={partition_threshold:.2}"),
+                );
+            }
+        }
+        return;
+    }
+
+    if let Some(m) = metrics {
+        m.inc_route_recovery();
+        m.record_reachability_event(true);
+    }
+    // mailbox flush removed. Application layer retries
+    // delivery via the freshly-learned route on its own cadence.
 }
 
 /// Draw a fresh `RouteRequest` correlation id from the OS CSPRNG.
@@ -340,14 +408,28 @@ async fn wait_for_route(
     route_updated: &Arc<Notify>,
     backoff_ms: [u64; 3],
 ) -> bool {
+    let mut deadline = tokio::time::Instant::now();
     for &ms in &backoff_ms {
-        let notified = route_updated.notified();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(ms), notified).await;
-        if rlock!(route_cache).lookup(dst).is_some() {
-            return true;
+        deadline += std::time::Duration::from_millis(ms);
+        loop {
+            let notified = route_updated.notified();
+            tokio::pin!(notified);
+            // Register before reading the cache: notify_waiters does not keep
+            // a permit for a future that has not been polled/enabled yet.
+            notified.as_mut().enable();
+            if rlock!(route_cache).lookup(dst).is_some() {
+                return true;
+            }
+            // A shared notification may concern any other destination. It
+            // must neither consume an attempt nor renew this one's deadline.
+            if tokio::time::Instant::now() >= deadline
+                || tokio::time::timeout_at(deadline, notified).await.is_err()
+            {
+                break;
+            }
         }
     }
-    false
+    rlock!(route_cache).lookup(dst).is_some()
 }
 
 #[cfg(test)]
@@ -356,6 +438,242 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, RwLock};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn wait_for_route_observes_a_reply_that_arrived_before_its_first_poll() {
+        use std::task::{Context, Poll, Waker};
+        let cache = Arc::new(RwLock::new(RouteCache::new(Duration::from_secs(60))));
+        let updated = Arc::new(Notify::new());
+        let target = [0x71; 32];
+        cache.write().unwrap().insert(target, [0x72; 32], 20_000, 2);
+        updated.notify_waiters(); // No registered waiter yet: not a stored permit.
+        let mut waiting = Box::pin(wait_for_route(&target, &cache, &updated, [1000; 3]));
+        assert_eq!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_route_notices_do_not_exhaust_another_targets_wait() {
+        use std::task::{Context, Poll, Waker};
+        let cache = Arc::new(RwLock::new(RouteCache::new(Duration::from_secs(60))));
+        let updated = Arc::new(Notify::new());
+        let target = [0x71; 32];
+        let mut waiting = Box::pin(wait_for_route(&target, &cache, &updated, [1000; 3]));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Pending);
+        // No clock advances. These are notifications for OTHER destinations.
+        for _ in 0..4 {
+            updated.notify_waiters();
+            assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Pending);
+        }
+        cache.write().unwrap().insert(target, [0x72; 32], 20_000, 2);
+        updated.notify_waiters();
+        assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Ready(true));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notices_and_late_polls_do_not_extend_the_original_wait_deadline() {
+        use std::task::{Context, Poll, Waker};
+        let cache = Arc::new(RwLock::new(RouteCache::new(Duration::from_secs(60))));
+        let updated = Arc::new(Notify::new());
+        let target = [0x71; 32];
+        let mut waiting = Box::pin(wait_for_route(&target, &cache, &updated, [1000; 3]));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Pending);
+        tokio::time::advance(Duration::from_secs(3)).await;
+        updated.notify_waiters();
+        assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Ready(false));
+    }
+
+    struct HeldFallback {
+        entered: mpsc::UnboundedSender<[u8; 32]>,
+        release: Arc<tokio::sync::Semaphore>,
+        active: Arc<AtomicU64>,
+        peak: Arc<AtomicU64>,
+    }
+    impl IterativeDhtFallback for HeldFallback {
+        fn try_seed_route_via_find_node<'a>(
+            &'a self,
+            target: [u8; 32],
+            _: u8,
+        ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+            Box::pin(async move {
+                struct Active(Arc<AtomicU64>);
+                impl Drop for Active {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+                let count = self.active.fetch_add(1, Ordering::Relaxed) + 1;
+                let _active = Active(self.active.clone());
+                self.peak.fetch_max(count, Ordering::Relaxed);
+                self.entered.send(target).unwrap();
+                self.release.acquire().await.unwrap().forget();
+                false
+            })
+        }
+    }
+
+    struct HeldHandler {
+        input: mpsc::Sender<([u8; 32], u8)>,
+        shutdown: watch::Sender<bool>,
+        task: tokio::task::JoinHandle<()>,
+        starts: mpsc::UnboundedReceiver<[u8; 32]>,
+        held: Arc<HeldFallback>,
+        broadcaster: Arc<CapturingBroadcaster>,
+    }
+
+    fn held_handler() -> HeldHandler {
+        let (tx, rx) = mpsc::channel(32);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (entered, starts) = mpsc::unbounded_channel();
+        let held = Arc::new(HeldFallback {
+            entered,
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+            active: Arc::new(AtomicU64::new(0)),
+            peak: Arc::new(AtomicU64::new(0)),
+        });
+        let broadcaster = Arc::new(CapturingBroadcaster::default());
+        let handle = spawn(MissHandlerCtx {
+            shutdown_rx,
+            rx,
+            broadcaster: broadcaster.clone(),
+            route_cache: Arc::new(RwLock::new(RouteCache::new(Duration::from_secs(60)))),
+            route_updated: Arc::new(Notify::new()),
+            local_node_id: [0; 32],
+            signing_key: None,
+            discovery_paths: Arc::new(Mutex::new(Default::default())),
+            metrics: None,
+            logger: Arc::new(NoopLogger),
+            route_request_backoff_ms: [0; 3],
+            partition_threshold: 0.5,
+            iterative_dht_fallback: Some(held.clone()),
+        });
+        HeldHandler {
+            input: tx,
+            shutdown,
+            task: handle,
+            starts,
+            held,
+            broadcaster,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_target_does_not_block_the_next_targets_discovery() {
+        let HeldHandler {
+            input: tx,
+            shutdown,
+            task: handle,
+            mut starts,
+            held,
+            ..
+        } = held_handler();
+        tx.send(([0x41; 32], 1)).await.unwrap();
+        assert_eq!(starts.recv().await, Some([0x41; 32]));
+        tx.send(([0x42; 32], 1)).await.unwrap();
+        // Virtual tick flushes ready tasks, not a wall-clock latency bound.
+        // The first lookup is still held by a gate, not by a network timeout.
+        let second = tokio::time::timeout(Duration::from_millis(1), starts.recv()).await;
+        shutdown.send(true).unwrap();
+        held.release.add_permits(32);
+        handle.await.unwrap();
+        assert_eq!(second.unwrap_or(None), Some([0x42; 32]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lookup_concurrency_is_bounded_and_shutdown_cancels_held_walks() {
+        let HeldHandler {
+            input: tx,
+            shutdown,
+            task: handle,
+            mut starts,
+            held,
+            ..
+        } = held_handler();
+        for target in 1..=8 {
+            tx.send(([target; 32], 1)).await.unwrap();
+        }
+        for _ in 0..MAX_CONCURRENT_ROUTE_LOOKUPS {
+            starts.recv().await.unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), starts.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            held.active.load(Ordering::Relaxed),
+            MAX_CONCURRENT_ROUTE_LOOKUPS as u64
+        );
+        held.release.add_permits(1);
+        let next = starts.recv().await.unwrap();
+        assert_eq!(next, [5; 32]);
+        assert!(held.peak.load(Ordering::Relaxed) <= MAX_CONCURRENT_ROUTE_LOOKUPS as u64);
+        shutdown.send(true).unwrap();
+        handle.await.unwrap();
+        assert_eq!(
+            held.active.load(Ordering::Relaxed),
+            0,
+            "shutdown joins cancellation"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_inflight_target_stays_deduplicated_after_the_short_cooldown_expires() {
+        let HeldHandler {
+            input: tx,
+            shutdown,
+            task: handle,
+            mut starts,
+            held,
+            broadcaster: frames,
+        } = held_handler();
+        tx.send(([0x41; 32], 1)).await.unwrap();
+        assert_eq!(starts.recv().await, Some([0x41; 32]));
+        tokio::time::advance(DEDUP_TTL + Duration::from_secs(1)).await;
+        for _ in 0..8 {
+            tx.send(([0x41; 32], 1)).await.unwrap();
+        }
+        tx.send(([0x42; 32], 1)).await.unwrap();
+        assert_eq!(starts.recv().await, Some([0x42; 32]));
+        let requests: Vec<_> = frames
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                RouteRequestPayload::decode(&f[veil_proto::HEADER_SIZE..])
+                    .unwrap()
+                    .target_node_id
+            })
+            .collect();
+        assert_eq!(requests, vec![[0x41; 32], [0x42; 32]]);
+        shutdown.send(true).unwrap();
+        handle.await.unwrap();
+        assert_eq!(held.active.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closing_the_miss_input_cancels_its_held_lookups() {
+        let HeldHandler {
+            input: tx,
+            shutdown: _shutdown,
+            task: handle,
+            mut starts,
+            held,
+            ..
+        } = held_handler();
+        tx.send(([0x41; 32], 1)).await.unwrap();
+        starts.recv().await.unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        assert_eq!(held.active.load(Ordering::Relaxed), 0);
+    }
 
     #[derive(Default)]
     struct MockMetrics {
