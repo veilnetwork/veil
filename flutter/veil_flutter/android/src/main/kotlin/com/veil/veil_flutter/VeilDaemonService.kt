@@ -66,6 +66,7 @@ class VeilDaemonService : Service() {
         private const val CALL_INCOMING_CHANNEL_NAME = "Incoming xVeil calls"
         private const val CALL_ONGOING_CHANNEL_NAME = "Ongoing xVeil calls"
         private const val NOTIFICATION_ID = 0xfee1
+        private const val INCOMING_NOTIFICATION_ID = 0xfee6
         private const val WAKE_LOCK_TAG = "veil:daemon"
         private const val APP_ACTION_HANGUP = "network.veil.xveil.action.HANGUP_CALL"
         private const val APP_ACTION_ACCEPT = "network.veil.xveil.action.ACCEPT_CALL"
@@ -88,6 +89,7 @@ class VeilDaemonService : Service() {
     // exactly why the whole background service is opt-in.
     private var wakeLock: PowerManager.WakeLock? = null
     private var foregroundActive = false
+    private var incomingSession: String? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -121,11 +123,32 @@ class VeilDaemonService : Service() {
                 val ringing = intent?.getBooleanExtra(EXTRA_RINGING, false) ?: false
                 val microphone = intent?.getBooleanExtra(EXTRA_MICROPHONE, false) ?: false
                 val camera = intent?.getBooleanExtra(EXTRA_CAMERA, false) ?: false
-                startForegroundCompat(
-                    buildNotification(title, text, hangupAction, ringing, callSession),
-                    microphone = microphone,
-                    camera = camera,
-                )
+                val manager = getSystemService(NotificationManager::class.java)
+                if (ringing && hangupAction && callSession != null) {
+                    // SystemUI evaluates fullScreenIntent when an alert is
+                    // ADDED. Promoting the existing daemon notification is
+                    // merely an update and can leave a locked phone ringing
+                    // without opening a call surface. Give each call its own
+                    // alert lifecycle, separate from foreground retention.
+                    startForegroundCompat(
+                        buildNotification(getString(R.string.veil_default_title), null),
+                        microphone = microphone, camera = camera,
+                    )
+                    if (foregroundActive) {
+                        if (incomingSession != callSession) manager.cancel(INCOMING_NOTIFICATION_ID)
+                        incomingSession = callSession
+                        manager.notify(INCOMING_NOTIFICATION_ID,
+                            buildNotification(title, text, true, true, callSession))
+                    }
+                } else {
+                    manager.cancel(INCOMING_NOTIFICATION_ID)
+                    incomingSession = null
+                    if (!hangupAction) CallScreenActivity.clear()
+                    startForegroundCompat(
+                        buildNotification(title, text, hangupAction, false, callSession),
+                        microphone = microphone, camera = camera,
+                    )
+                }
                 acquireWakeLock()
             }
         }
@@ -136,6 +159,7 @@ class VeilDaemonService : Service() {
     }
 
     override fun onDestroy() {
+        CallScreenActivity.clear()
         foregroundActive = false
         if (diagnosticInstance === this) diagnosticInstance = null
         releaseWakeLock()
@@ -218,6 +242,8 @@ class VeilDaemonService : Service() {
             hangupAction -> CALL_ONGOING_CHANNEL_ID
             else -> CHANNEL_ID
         }
+        var screenAnswer: Intent? = null
+        var screenEnd: Intent? = null
         val builder = NotificationCompat.Builder(this, channelId)
             .setContentTitle(title)
             .setSmallIcon(R.drawable.veil_notification_icon)
@@ -251,6 +277,7 @@ class VeilDaemonService : Service() {
                         CallActionCapability.mint("accept", callSession),
                     )
                 }
+                screenAnswer = acceptIntent
                 val acceptPendingIntent = PendingIntent.getActivity(
                     this,
                     0xfee4,
@@ -272,6 +299,7 @@ class VeilDaemonService : Service() {
                     CallActionCapability.mint("hangup", callSession),
                 )
             }
+            screenEnd = endIntent
             val endPendingIntent = PendingIntent.getActivity(
                 this,
                 0xfee3,
@@ -284,7 +312,21 @@ class VeilDaemonService : Service() {
                 endPendingIntent,
             )
         }
-        if (ringing && openPendingIntent != null) {
+        if (hangupAction) CallScreenActivity.update(callSession, ringing, screenAnswer, screenEnd, text, title)
+        if (ringing && callSession != null && screenEnd != null && CallScreenActivity.hasHost()) {
+            val screen = PendingIntent.getActivity(
+                this, 0xfee5, CallScreenActivity.intent(this, callSession),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            builder.setContentIntent(screen)
+            builder.setOnlyAlertOnce(true)
+            // Android 14+ can revoke this special access independently of
+            // POST_NOTIFICATIONS. Keep the ordinary actionable alert if denied.
+            if (CallScreenActivity.fullScreenAllowed(this)) {
+                builder.setFullScreenIntent(screen, true)
+            }
+        } else if (ringing && openPendingIntent != null && CallScreenActivity.fullScreenAllowed(this)) {
+            // SDK consumers without a call-only Host keep their own UI.
             builder.setFullScreenIntent(openPendingIntent, true)
         }
         return builder.build()
@@ -363,6 +405,9 @@ class VeilDaemonService : Service() {
 
     private fun stopForegroundCompat() {
         foregroundActive = false
+        getSystemService(NotificationManager::class.java).cancel(INCOMING_NOTIFICATION_ID)
+        incomingSession = null
+        CallScreenActivity.clear()
         // The notification carrying the accept / hangup buttons is going away,
         // so the capabilities it handed out must go with it. Without this a
         // PendingIntent the system still holds — or one already delivered and
