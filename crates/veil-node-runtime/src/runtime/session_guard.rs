@@ -44,7 +44,35 @@ use super::{NodeLogger, NodeMetrics};
 /// optional handle below.
 pub type ConnectorRefreshMap = Arc<Mutex<std::collections::HashMap<[u8; 32], watch::Sender<u64>>>>;
 
+/// The canonical OVL1 session owns this exact QUIC connection. Generic
+/// siblings and diagnostic clones may keep handles alive, but cannot extend
+/// the session's transport lifetime after its owner exits. Never look up the
+/// peer here: a replacement can already own another connection to that peer.
+#[derive(Default)]
+pub(super) struct CanonicalQuicOwner(Option<veil_transport::QuicDatagramHandle>);
+
+impl CanonicalQuicOwner {
+    pub(super) fn new(handle: Option<veil_transport::QuicDatagramHandle>) -> Self {
+        Self(handle)
+    }
+
+    /// An authenticated existing session has adopted this connection/stream.
+    /// Its binding now owns the lifetime; our admission guard must not close it.
+    pub(super) fn disarm_after_adoption(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CanonicalQuicOwner {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.0 {
+            handle.close();
+        }
+    }
+}
+
 pub struct SessionGuard {
+    quic_owner: Option<CanonicalQuicOwner>,
     live_sessions: Arc<Mutex<BTreeMap<LinkId, SessionInfo>>>,
     link_id: LinkId,
     logger: Arc<NodeLogger>,
@@ -100,6 +128,7 @@ impl SessionGuard {
         connector_refresh: Option<ConnectorRefreshMap>,
     ) -> Self {
         Self {
+            quic_owner: None,
             live_sessions,
             link_id,
             logger,
@@ -114,6 +143,11 @@ impl SessionGuard {
             event_bus,
             connector_refresh,
         }
+    }
+
+    pub(super) fn with_quic_owner(mut self, owner: CanonicalQuicOwner) -> Self {
+        self.quic_owner = Some(owner);
+        self
     }
 }
 
@@ -263,6 +297,11 @@ pub fn release_session(
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
+        // Retire only our transport, before taking any node state locks.
+        // Connection close wakes sibling watchers and the remote session now,
+        // instead of leaving it to a keepalive/idle timeout after stream drop.
+        drop(self.quic_owner.take());
+
         // Snapshot-then-publish: take each lock briefly to mutate its
         // map, then release before doing observable side-effects
         // (event_bus.publish, reputation notify, log).  Keeps the
