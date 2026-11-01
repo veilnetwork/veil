@@ -504,6 +504,7 @@ async fn forward_ordinary_family_copy(
     reg: &dyn FrameBroadcaster,
     send: &AppIpcSendPayload,
     sender: [u8; 32],
+    device: [u8; 32],
     instance: [u8; 16],
     payload: Vec<u8>,
     hops: Vec<[u8; 32]>,
@@ -514,7 +515,11 @@ async fn forward_ordinary_family_copy(
     use veil_proto::recipient::Recipient;
     let now = veil_util::unix_secs_now_u64();
     let envelope = DeliveryEnvelope {
-        recipient: Recipient::specific(send.dst_node_id, instance),
+        // `device` came from the verified identity/instance registry. Transit
+        // cores can discover its transport route without having a sovereign
+        // session alias. Keep the exact instance tag; ratchet authentication
+        // still binds the ciphertext to send.dst_node_id and that instance.
+        recipient: Recipient::specific(device, instance),
         sender_node_id: sender,
         src_app_id: send.src_app_id,
         app_id: send.app_id,
@@ -751,6 +756,7 @@ async fn send_family_relay_copies(
                 reg,
                 send,
                 me.local_node_id,
+                device,
                 cert.instance_id,
                 payload,
                 generic_hops,
@@ -1913,6 +1919,7 @@ async fn handle_ipc_send_inner(
                         reg,
                         request,
                         *sender,
+                        *device,
                         instance,
                         payload.clone(),
                         hops,
@@ -5341,7 +5348,7 @@ mod ratchet_send_tests {
     #[tokio::test]
     async fn ordinary_mixed_family_keeps_direct_and_relayed_recipients() {
         for registry_knows_relayed_device in [false, true] {
-            let (fx, sibling, direct_device, _relayed_device, ctx) =
+            let (fx, sibling, direct_device, relayed_device, ctx) =
                 mixed_family_fixture(registry_knows_relayed_device);
             let plaintext = b"mixed transport family delivery";
             let mut wh = sink().await;
@@ -5374,7 +5381,10 @@ mod ratchet_send_tests {
                     .unwrap();
                     assert_eq!(
                         forward.envelope.recipient,
-                        veil_proto::recipient::Recipient::specific(PEER, SIBLING_INSTANCE)
+                        veil_proto::recipient::Recipient::specific(
+                            relayed_device,
+                            SIBLING_INSTANCE
+                        )
                     );
                     if let Some(prior) = relayed.replace(forward.envelope.payload) {
                         assert_eq!(
@@ -5802,6 +5812,75 @@ mod ratchet_send_tests {
     }
 
     #[tokio::test]
+    async fn ordinary_family_copy_crosses_a_relay_without_a_sovereign_session_alias() {
+        let (mut fx, sibling) = family_fixture();
+        let cert = fx
+            .certs
+            .resolve_device_certs_cached(PEER)
+            .into_iter()
+            .find(|(_, cert)| cert.instance_id == PEER_INSTANCE)
+            .unwrap();
+        let device = cert.0;
+        fx.certs = Arc::new(FamilyCerts(vec![cert.1]));
+        fx.outbox = Arc::new(Outbox {
+            live: vec![RELAY],
+            datagram: Vec::new(),
+            sent: Mutex::new(Vec::new()),
+            family: Vec::new(),
+        });
+        let mut wh = sink().await;
+        handle_ipc_send(
+            &mut SendReply::Inline(&mut wh),
+            &payload(false, b"verified instance across a cold relay"),
+            &fx.ctx(true),
+        )
+        .await
+        .unwrap();
+        let frames = fx.taken();
+        assert_eq!(frames.len(), 1, "one ciphertext for the verified device");
+        let mut relay = veil_dispatcher::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        relay.local_node_id = RELAY;
+        let registry = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let mut downstream = wlock!(registry).register(device);
+        relay.session_tx_registry = Some(registry);
+        // The next hop knows the transport node, not the peer's sovereign
+        // identity. This is normal for an intermediate core in a long path.
+        let (receiver, _endpoint, mut rx) = direct_receiver(&fx.peer, device, PEER_INSTANCE);
+        let (wrong, _wrong_endpoint, mut wrong_rx) =
+            direct_receiver(&sibling, device, SIBLING_INSTANCE);
+        for (hop, frame) in frames {
+            assert_eq!(hop, RELAY);
+            let header = codec::decode_header(&frame).unwrap();
+            relay.dispatch(
+                &header,
+                &frame[veil_proto::HEADER_SIZE..],
+                veil_cfg::NodeId::from(ME),
+            );
+            let (_, forwarded) = downstream
+                .try_recv()
+                .expect("a verified device must not require an identity alias at every hop");
+            let payload =
+                veil_proto::delivery::ForwardPayload::decode(&forwarded[veil_proto::HEADER_SIZE..])
+                    .unwrap();
+            assert_eq!(
+                payload.envelope.recipient,
+                veil_proto::recipient::Recipient::specific(device, PEER_INSTANCE)
+            );
+            feed_direct(&receiver, &forwarded);
+            feed_direct(&wrong, &forwarded);
+        }
+        assert_eq!(
+            take_direct(&mut rx),
+            b"verified instance across a cold relay"
+        );
+        assert!(rx.try_recv().is_err(), "no duplicate");
+        assert!(
+            wrong_rx.try_recv().is_err(),
+            "same transport cannot bypass the instance binding"
+        );
+    }
+
+    #[tokio::test]
     async fn ordinary_relay_send_seals_each_device_even_without_a_direct_session() {
         let (mut fx, sibling) = family_fixture();
         fx.outbox = Arc::new(Outbox {
@@ -5833,7 +5912,14 @@ mod ratchet_send_tests {
             assert!(instances.insert(instance));
             assert_eq!(
                 f.envelope.recipient,
-                veil_proto::recipient::Recipient::specific(PEER, instance)
+                veil_proto::recipient::Recipient::specific(
+                    {
+                        let mut device = [0u8; 32];
+                        device[..16].copy_from_slice(&instance);
+                        device
+                    },
+                    instance
+                )
             );
             let endpoint = if instance == PEER_INSTANCE {
                 &fx.peer
