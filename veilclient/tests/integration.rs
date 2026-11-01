@@ -792,8 +792,8 @@ async fn set_mobile_background_mode_propagates_to_sink() {
         .await
         .unwrap();
 
-    // Allow the server-side dispatch task to drain the writes.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The network-change barrier also witnesses the preceding mode updates
+    // on this same FIFO connection; no drain sleep is needed.
 
     // chore: snapshot the lock contents into owned values
     // before the `.await` boundary so the `MutexGuard` doesn't cross
@@ -815,6 +815,112 @@ async fn set_mobile_background_mode_propagates_to_sink() {
 
     let _ = shutdown_tx.send(true);
     let _ = server_handle.await;
+}
+
+/// A temporary FFI client is closed immediately after this method returns.
+/// Queue admission is insufficient: closing its runtime cancels the writer.
+/// On this single-thread runtime the peer cannot process a frame during our
+/// first poll, so an enqueue-only implementation deterministically returns
+/// early. No sleep or latency threshold establishes the receipt boundary.
+#[tokio::test(flavor = "current_thread")]
+async fn network_change_waits_for_dispatch_before_temporary_client_closes() {
+    #[derive(Default)]
+    struct NetworkSink(Mutex<Vec<NetworkChangedPayload>>);
+    impl MobileEventSink for NetworkSink {
+        fn set_mobile_background_mode(&self, _: MobileBackgroundMode) {}
+        fn network_changed(&self, payload: NetworkChangedPayload) {
+            self.0.lock().unwrap().push(payload);
+        }
+    }
+    let sink = Arc::new(NetworkSink::default());
+    let sock = temp_socket();
+    let (shutdown, server) = start_server_full(
+        sock.clone(),
+        vec![0; 32],
+        0,
+        Some(Arc::clone(&sink) as Arc<dyn MobileEventSink>),
+        None,
+        None,
+        None,
+    )
+    .await;
+    let client = veilclient::VeilClient::connect(&sock).await.unwrap();
+    let mut notification =
+        Box::pin(client.notify_network_changed(veilclient::NetworkKind::Cellular, 1280));
+    let first = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(notification.as_mut(), cx))
+    })
+    .await;
+    assert!(
+        first.is_pending(),
+        "network change returned on queue admission before daemon dispatch"
+    );
+    notification.await.unwrap();
+    let received = sink.0.lock().unwrap().clone();
+    assert_eq!(
+        received.len(),
+        1,
+        "completion must witness dispatch, without a drain sleep"
+    );
+    assert_eq!(received[0].kind, veil_proto::NetworkKind::Cellular);
+    assert_eq!(received[0].mtu_hint, 1280);
+    drop(client);
+    let _ = shutdown.send(true);
+    let _ = server.await;
+}
+
+/// Model the last temporary FFI handle releasing its runtime immediately.
+/// A current-thread guest makes the problematic scheduling reproducible: an
+/// enqueue-only notify never yields to its dedicated writer before shutdown.
+/// The server is real and independently driven, not an imitation of the sink.
+#[tokio::test]
+async fn temporary_runtime_delivers_network_change_before_immediate_shutdown() {
+    #[derive(Default)]
+    struct NetworkSink(Mutex<Vec<NetworkChangedPayload>>);
+    impl MobileEventSink for NetworkSink {
+        fn set_mobile_background_mode(&self, _: MobileBackgroundMode) {}
+        fn network_changed(&self, payload: NetworkChangedPayload) {
+            self.0.lock().unwrap().push(payload);
+        }
+    }
+    let sink = Arc::new(NetworkSink::default());
+    let sock = temp_socket();
+    let (shutdown, server) = start_server_full(
+        sock.clone(),
+        vec![0; 32],
+        0,
+        Some(Arc::clone(&sink) as Arc<dyn MobileEventSink>),
+        None,
+        None,
+        None,
+    )
+    .await;
+    tokio::task::spawn_blocking(move || {
+        let guest = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        guest.block_on(async {
+            let client = veilclient::VeilClient::connect(&sock).await.unwrap();
+            client
+                .notify_network_changed(veilclient::NetworkKind::Cellular, 1280)
+                .await
+                .unwrap();
+            drop(client);
+        });
+        drop(guest);
+    })
+    .await
+    .unwrap();
+    let received = sink.0.lock().unwrap().clone();
+    assert_eq!(
+        received.len(),
+        1,
+        "temporary runtime shut down before sending the notification"
+    );
+    assert_eq!(received[0].kind, veil_proto::NetworkKind::Cellular);
+    let _ = shutdown.send(true);
+    let _ = server.await;
 }
 
 #[tokio::test]

@@ -2201,7 +2201,10 @@ impl VeilClient {
     ///
     /// Daemon eagerly retries gateway connect attempts, so the user-facing
     /// reconnect-after-Wi-Fi-flip latency drops from keepalive-timeout
-    /// (~30 s) to sub-second. Fire-and-forget: no reply frame.
+    /// (~30 s) to sub-second. The notification itself has no reply frame, so
+    /// an inline identity query on the same FIFO connection acts as a dispatch
+    /// barrier. Success means the daemon processed the notification, not that
+    /// its peer connections have already recovered.
     ///
     /// Pass `mtu_hint = 0` if unknown (the wire-level "use default" value).
     pub async fn notify_network_changed(
@@ -2212,7 +2215,14 @@ impl VeilClient {
         let payload = veilcore::proto::NetworkChangedPayload { kind, mtu_hint };
         self.writer
             .write_frame(LocalAppMsg::NetworkChanged as u16, &payload.encode())
-            .await
+            .await?;
+        // A temporary FFI client can be closed as soon as this returns. Queue
+        // admission alone is unsafe: dropping its RuntimeBundle cancels the
+        // writer before the notification necessarily reaches the socket.
+        // Both handlers run inline in the daemon's connection loop, so the
+        // existing bounded RPC witnesses dispatch without a new wire message
+        // or a sleep. Do not replace it with a local enqueue/flush witness.
+        self.node_identity().await.map(|_| ())
     }
 
     /// Query the daemon for its own identity.
