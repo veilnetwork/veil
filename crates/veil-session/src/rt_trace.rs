@@ -47,6 +47,7 @@ pub fn set_rt_trace(on: bool) {
     cell().store(on, Ordering::Relaxed);
     veil_transport::set_udp_wire_trace(on);
     veil_transport::tcp_trace::set_enabled(on);
+    veil_transport::set_quic_accept_trace(on);
 }
 
 /// Wall time of a synchronous runner stage, excluding its asynchronous input

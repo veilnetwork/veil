@@ -3,7 +3,9 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use tokio::time::timeout;
 
+mod accept_trace;
 mod parallel;
+pub use accept_trace::set_enabled as set_quic_accept_trace;
 pub use parallel::QuicParallelHandle;
 
 use super::{
@@ -1041,6 +1043,56 @@ struct QuicTransportListener {
 /// connection then stalls could hold the accept path indefinitely.
 const QUIC_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Keep the same TLS and first-stream deadlines for both listener entrypoints.
+/// Trace guards only borrow the connection, including cancellation, so observing
+/// a failed accept cannot keep a dead connection alive.
+async fn finish_native_handshake(
+    incoming: quinn::Incoming,
+    trace: &mut accept_trace::AcceptTrace,
+) -> Result<quinn::Connection> {
+    trace.stage("tls");
+    // Consume Incoming once before placing Connecting inside a timeout.
+    let connecting = incoming.accept().map_err(|e| {
+        trace.outcome("tls_rejected");
+        quic_error(e)
+    })?;
+    match timeout(QUIC_HANDSHAKE_TIMEOUT, connecting).await {
+        Ok(Ok(connection)) => Ok(connection),
+        Ok(Err(error)) => {
+            trace.outcome("tls_failed");
+            Err(error.into())
+        }
+        Err(_) => {
+            trace.outcome("tls_timeout");
+            Err(quic_error("quic handshake timed out"))
+        }
+    }
+}
+
+async fn accept_native_stream(
+    connection: &quinn::Connection,
+    trace: &mut accept_trace::AcceptTrace,
+) -> Result<BoxIoStream> {
+    let (send, recv) = {
+        let mut span = trace.first_stream(connection);
+        match timeout(QUIC_HANDSHAKE_TIMEOUT, connection.accept_bi()).await {
+            Ok(Ok(streams)) => {
+                span.outcome("ready");
+                streams
+            }
+            Ok(Err(error)) => {
+                span.outcome("stream_failed");
+                return Err(error.into());
+            }
+            Err(_) => {
+                span.outcome("stream_timeout");
+                return Err(quic_error("quic accept_bi timed out"));
+            }
+        }
+    };
+    Ok(Box::new(QuicBidiStream { recv, send }))
+}
+
 impl TransportListener for QuicTransportListener {
     fn accept<'a>(&'a self) -> BoxFuture<'a, Result<Box<dyn TransportConnection>>> {
         Box::pin(async move {
@@ -1057,20 +1109,11 @@ impl TransportListener for QuicTransportListener {
             // `IntoFuture` adapter can re-enter its consuming `accept()` while
             // unwinding a cancelled accept; quinn then panics on its empty
             // internal state. `Connecting` is the actual cancellable future.
-            let connecting = incoming.accept().map_err(quic_error)?;
-            let connection = tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, connecting)
-                .await
-                .map_err(|_| quic_error("quic handshake timed out"))??;
+            let mut trace = accept_trace::AcceptTrace::dequeued();
+            let connection = finish_native_handshake(incoming, &mut trace).await?;
             let remote_addr = connection.remote_address();
             let peer_meta = native_quic_peer(self.bind_uri.clone(), local_addr, Some(remote_addr));
-
-            let stream: BoxIoStream = {
-                let (send, recv) =
-                    tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, connection.accept_bi())
-                        .await
-                        .map_err(|_| quic_error("quic accept_bi timed out"))??;
-                Box::new(QuicBidiStream { recv, send })
-            };
+            let stream = accept_native_stream(&connection, &mut trace).await?;
 
             Ok(boxed_parallel_quic_connection(
                 peer_meta,
@@ -1100,22 +1143,14 @@ impl TransportListener for QuicTransportListener {
             let bind_uri = self.bind_uri.clone();
             let endpoint = self.endpoint.clone();
             let context = Arc::clone(&self.context);
+            let mut trace = accept_trace::AcceptTrace::dequeued();
             let finish: BoxFuture<'static, Result<Box<dyn TransportConnection>>> =
                 Box::pin(async move {
                     // See `accept()` above: consume Incoming once, then time
                     // out the resulting handshake future.
-                    let connecting = incoming.accept().map_err(quic_error)?;
-                    let connection = tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, connecting)
-                        .await
-                        .map_err(|_| quic_error("quic handshake timed out"))??;
+                    let connection = finish_native_handshake(incoming, &mut trace).await?;
                     let peer_meta = native_quic_peer(bind_uri, local_addr, Some(remote_addr));
-                    let stream: BoxIoStream = {
-                        let (send, recv) =
-                            tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, connection.accept_bi())
-                                .await
-                                .map_err(|_| quic_error("quic accept_bi timed out"))??;
-                        Box::new(QuicBidiStream { recv, send })
-                    };
+                    let stream = accept_native_stream(&connection, &mut trace).await?;
                     Ok(boxed_parallel_quic_connection(
                         peer_meta, endpoint, connection, stream, context, false,
                     ))
