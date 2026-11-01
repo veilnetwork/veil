@@ -1057,6 +1057,7 @@ pub struct FrameDispatcher {
     /// listen transports is *deferred* until the requester returns a valid
     /// `PowResponse` — probing-by-id no longer leaks transports for free.
     pub pow_difficulty: u8,
+    pub discovery_paths: Arc<Mutex<veil_routing::discovery_paths::DiscoveryPaths>>,
     /// Pending PoW challenges issued by this node (acting as acceptor).
     /// Maps `challenge_nonce → (requester_node_id, difficulty, request_id)`.
     /// Entries are consumed when the matching `PowResponse` arrives;
@@ -2120,6 +2121,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         target_labels: vec![],
         route_updated: Arc::new(Notify::new()),
         pow_difficulty: 0,
+        discovery_paths: Arc::new(Mutex::new(Default::default())),
         pow_pending: Arc::new(Mutex::new(PowPendingTable::new())),
         discovery_mode: veil_cfg::DiscoveryMode::Public,
         dht_service: true,
@@ -2991,6 +2993,7 @@ mod tests {
             target_labels: vec![],
             route_updated: Arc::new(Notify::new()),
             pow_difficulty: 0,
+            discovery_paths: Arc::new(Mutex::new(Default::default())),
             pow_pending: Arc::new(Mutex::new(PowPendingTable::new())),
             discovery_mode: veil_cfg::DiscoveryMode::Public,
             dht_service: true,
@@ -3311,6 +3314,16 @@ mod tests {
             ttl: 7,
             signature: [0u8; 64],
         };
+        // The real miss-handler records this witness before broadcasting.
+        assert!(disp_a.discovery_paths.lock().unwrap().remember_request(
+            veil_routing::discovery_paths::RequestKey {
+                requester: a_id,
+                target: c_id,
+                id: req.request_id
+            },
+            veil_routing::discovery_paths::ReplyTo::Local,
+            std::time::Instant::now(),
+        ));
         let rr_hdr = FrameHeader::new(FrameFamily::Routing as u8, RoutingMsg::RouteRequest as u16);
         let result = disp_c.dispatch(&rr_hdr, &req.encode(), a_id);
 
@@ -3512,6 +3525,7 @@ mod tests {
 
         // Build a valid challenge payload, then corrupt the signature.
         let mut challenge = PowChallengePayload {
+            context: None,
             requester_node_id: a_id,
             acceptor_node_id: c_id,
             challenge_nonce: [0x55u8; 32],
@@ -3572,6 +3586,7 @@ mod tests {
         );
 
         let mut challenge = PowChallengePayload {
+            context: None,
             requester_node_id: a_id,
             acceptor_node_id: c_id,
             challenge_nonce: [0x11u8; 32],
@@ -3619,6 +3634,7 @@ mod tests {
 
         // Build a valid challenge.
         let mut challenge = PowChallengePayload {
+            context: None,
             requester_node_id: a_id,
             acceptor_node_id: c_id,
             challenge_nonce: [0x77u8; 32],
@@ -9282,3 +9298,6 @@ mod tests {
         assert_eq!(snap[0], "198.51.100.9:2000".parse().unwrap());
     }
 }
+
+#[cfg(test)]
+mod route_discovery_chain_tests;

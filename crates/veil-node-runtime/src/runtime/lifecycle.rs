@@ -1212,6 +1212,7 @@ impl NodeRuntime {
             target_labels: build_target_labels(&config.routing),
             route_updated: Arc::new(tokio::sync::Notify::new()),
             pow_difficulty: config.abuse.pow_min_difficulty as u8,
+            discovery_paths: Arc::clone(&self.dispatcher.discovery_paths),
             pow_pending: Arc::new(Mutex::new(veil_dispatcher::PowPendingTable::new())),
             discovery_mode: config.routing.discovery_mode,
             dht_service: config.dht.participate,

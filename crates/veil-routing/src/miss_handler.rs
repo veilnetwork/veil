@@ -91,6 +91,7 @@ pub struct MissHandlerCtx {
     pub route_updated: Arc<Notify>,
     pub local_node_id: [u8; 32],
     pub signing_key: Option<Arc<SigningKey>>,
+    pub discovery_paths: Arc<std::sync::Mutex<crate::discovery_paths::DiscoveryPaths>>,
     pub metrics: Option<Arc<dyn RoutingMetrics>>,
     pub logger: Arc<dyn RoutingLogger>,
     /// Three retry back-offs in milliseconds (default 500, 1000, 2000).
@@ -133,6 +134,7 @@ async fn run(ctx: MissHandlerCtx) {
         route_updated,
         local_node_id,
         signing_key,
+        discovery_paths,
         metrics,
         logger,
         route_request_backoff_ms,
@@ -175,13 +177,13 @@ async fn run(ctx: MissHandlerCtx) {
 
                 if let Some(m) = &metrics { m.inc_discovery_triggered(); }
 
-                flood_route_request(
-                    &dst, local_node_id, signing_key.as_deref(), broadcaster.as_ref(),
+                let flooded = flood_route_request(
+                    &dst, local_node_id, signing_key.as_deref(), broadcaster.as_ref(), &discovery_paths,
                 );
 
-                let mut found = wait_for_route(
-                    &dst, &route_cache, &route_updated, route_request_backoff_ms,
-                ).await;
+                let mut found = if flooded {
+                    wait_for_route(&dst, &route_cache, &route_updated, route_request_backoff_ms).await
+                } else { false };
 
                 // iterative-DHT fallback. Triggered ONLY if
                 // legacy `RouteRequest` flood exhausted its retries without a route.
@@ -294,7 +296,8 @@ fn flood_route_request(
     local_node_id: [u8; 32],
     signing_key: Option<&SigningKey>,
     broadcaster: &dyn FrameBroadcaster,
-) {
+    discovery_paths: &Arc<std::sync::Mutex<crate::discovery_paths::DiscoveryPaths>>,
+) -> bool {
     let request_id = fresh_request_id();
     let mut req = RouteRequestPayload {
         target_node_id: *dst,
@@ -312,7 +315,21 @@ fn flood_route_request(
     hdr.body_len = req_bytes.len() as u32;
     let mut rr_frame = encode_header(&hdr).to_vec();
     rr_frame.extend_from_slice(&req_bytes);
+    let key = crate::discovery_paths::RequestKey {
+        requester: local_node_id,
+        target: *dst,
+        id: request_id,
+    };
+    // Publish before the broadcast: a fast reply must find its request witness.
+    if !veil_util::lock!(discovery_paths).remember_request(
+        key,
+        crate::discovery_paths::ReplyTo::Local,
+        std::time::Instant::now(),
+    ) {
+        return false;
+    }
     broadcaster.send_to_all(Arc::from(rr_frame.as_slice()));
+    true
 }
 
 /// Wait for either a `route_updated` notification OR the full back-off window
@@ -394,13 +411,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn request_witness_is_published_before_broadcast_and_capacity_refusal_sends_nothing() {
+        struct AtBroadcast {
+            capture: CapturingBroadcaster,
+            paths: Arc<std::sync::Mutex<crate::discovery_paths::DiscoveryPaths>>,
+        }
+        impl FrameBroadcaster for AtBroadcast {
+            fn send_to(&self, _: &[u8; 32], _: u8, _: Vec<u8>) -> bool {
+                false
+            }
+            fn send_to_all_with_priority(&self, priority: u8, bytes: Arc<[u8]>) {
+                let req = RouteRequestPayload::decode(&bytes[veil_proto::HEADER_SIZE..]).unwrap();
+                assert_eq!(
+                    veil_util::lock!(self.paths).request_path(
+                        crate::discovery_paths::RequestKey {
+                            requester: req.requester_node_id,
+                            target: req.target_node_id,
+                            id: req.request_id
+                        },
+                        std::time::Instant::now()
+                    ),
+                    Some(crate::discovery_paths::ReplyTo::Local),
+                    "witness must exist at the actual emit boundary"
+                );
+                self.capture.send_to_all_with_priority(priority, bytes);
+            }
+            fn active_node_ids(&self) -> Vec<[u8; 32]> {
+                vec![]
+            }
+        }
+        let paths = Arc::new(std::sync::Mutex::new(Default::default()));
+        let broadcaster = AtBroadcast {
+            capture: CapturingBroadcaster::default(),
+            paths: Arc::clone(&paths),
+        };
+        let me = [1; 32];
+        let target = [2; 32];
+        assert!(flood_route_request(&target, me, None, &broadcaster, &paths));
+        let frames = broadcaster.capture.frames.lock().unwrap();
+        let request = RouteRequestPayload::decode(&frames[0][veil_proto::HEADER_SIZE..]).unwrap();
+        assert_eq!(
+            veil_util::lock!(paths).request_path(
+                crate::discovery_paths::RequestKey {
+                    requester: me,
+                    target,
+                    id: request.request_id
+                },
+                std::time::Instant::now()
+            ),
+            Some(crate::discovery_paths::ReplyTo::Local)
+        );
+        drop(frames);
+        for _ in 0..1024 {
+            let _ = flood_route_request(&target, me, None, &broadcaster, &paths);
+        }
+        let before = broadcaster.capture.frames.lock().unwrap().len();
+        assert!(!flood_route_request(
+            &target,
+            me,
+            None,
+            &broadcaster,
+            &paths
+        ));
+        assert_eq!(broadcaster.capture.frames.lock().unwrap().len(), before);
+    }
+
     /// The `request_id`s the flood path actually emits, in order.
     fn flooded_request_ids(n: usize) -> Vec<u32> {
         let bc = CapturingBroadcaster::default();
         for i in 0..n {
             let mut dst = [0u8; 32];
             dst[0] = i as u8;
-            flood_route_request(&dst, [0u8; 32], None, &bc);
+            flood_route_request(
+                &dst,
+                [0u8; 32],
+                None,
+                &bc,
+                &Arc::new(std::sync::Mutex::new(Default::default())),
+            );
         }
         let frames = bc.frames.lock().unwrap();
         assert_eq!(frames.len(), n, "one frame per flood call");
@@ -505,6 +594,7 @@ mod tests {
             route_updated: Arc::new(Notify::new()),
             local_node_id: [0u8; 32],
             signing_key: None,
+            discovery_paths: Arc::new(std::sync::Mutex::new(Default::default())),
             metrics: Some(metrics.clone() as Arc<dyn RoutingMetrics>),
             logger: Arc::new(NoopLogger),
             // tiny backoffs so the initial RouteRequest wait exhausts fast
