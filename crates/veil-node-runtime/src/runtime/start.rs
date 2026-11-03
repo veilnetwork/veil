@@ -1195,10 +1195,6 @@ impl NodeRuntime {
                 hot_standby_controller_arc.set_alt_uri(node_id, uri.clone());
             }
         }
-        // Built before the literal because the connectivity-gain hook
-        // (mobility slice) shares the same Notify with the
-        // `force_reconnect_notify` field below.
-        let force_reconnect_notify_arc = Arc::new(tokio::sync::Notify::new());
         let mut runtime = Self {
             config_path,
             identity_dir: veil_dir_path.clone(),
@@ -1253,12 +1249,10 @@ impl NodeRuntime {
             // periodic poll. Drives the < 1 s failover acceptance bar.
             gateway_failover_notify: Arc::new(tokio::sync::Notify::new()),
             // see field doc comment.
-            force_reconnect_notify: Arc::clone(&force_reconnect_notify_arc),
+            force_reconnect_notify: Arc::new(tokio::sync::Notify::new()),
             // mobility slice: outbound-session-established fan-out
-            // (srflx re-probe + debounced force_reconnect wake).
-            connectivity_gain: Arc::new(crate::connectivity_gain::ConnectivityGain::new(
-                force_reconnect_notify_arc,
-            )),
+            // (srflx re-probe + debounced wake of sleeping retries).
+            connectivity_gain: Arc::new(crate::connectivity_gain::ConnectivityGain::new()),
             // shared push-event bus. Default capacity (256)
             // — fast subscribers consume events in microseconds; only
             // pathologically slow consumers (Flutter UI mid-paint) ever

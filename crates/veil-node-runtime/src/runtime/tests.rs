@@ -549,6 +549,45 @@ async fn stopping_the_node_retires_a_restored_peers_active_connection() {
     );
 }
 
+/// A fresh session is evidence to wake sleeping retries, not evidence that
+/// another peer's already running transport dial belongs to a stale network.
+/// Poll the actual cancellation subscription before/after the production hook;
+/// no elapsed-time threshold or task-scheduling assumption is involved.
+#[tokio::test]
+async fn connectivity_gain_does_not_cancel_inflight_transport_dials() {
+    let mut config = runtime_config_with_listen();
+    config.peers.clear();
+    config.bootstrap_peers.clear();
+    config.listen.clear();
+    config.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+    config.pex.enabled = false;
+    config.identity.as_mut().unwrap().lazy_mining = false;
+    let path = save_test_config("connectivity-gain-keeps-dials", config).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.unwrap();
+    let services = runtime.access();
+    let mut cancel = Box::pin(services.force_reconnect_notify.notified());
+    let mut srflx = Box::pin(services.connectivity_gain.srflx_wake());
+    let mut retry = Box::pin(services.connectivity_gain.retry_wake());
+    assert!(futures::poll!(&mut retry).is_pending());
+    assert!(futures::poll!(&mut cancel).is_pending());
+    assert!(futures::poll!(&mut srflx).is_pending());
+    services.connectivity_gain.on_outbound_session_established();
+    let cancels_pending_dial = futures::poll!(&mut cancel).is_ready();
+    let refreshed_address = futures::poll!(&mut srflx).is_ready();
+    let wakes_retry = futures::poll!(&mut retry).is_ready();
+    drop(retry);
+    drop(cancel);
+    drop(srflx);
+    runtime.stop().await.unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+    assert!(refreshed_address, "gain hook did not re-probe our address");
+    assert!(wakes_retry, "gain hook did not wake sleeping retries");
+    assert!(
+        !cancels_pending_dial,
+        "one successful session canceled unrelated in-flight transport dials"
+    );
+}
+
 /// Exercise the production connector with a transport dial that cannot finish
 /// by itself. The only way to retry is to cancel it after the network-change
 /// wake. Timeouts below are deadlock guards on a paused clock, not a measured
@@ -651,6 +690,9 @@ async fn network_change_cancels_pending_transport_dial_before_retry() {
         cancelled.try_recv().is_err(),
         "dial must still be pending before the event"
     );
+    // A sibling success must not consume or suppress the following real
+    // network-change cancellation, even inside the gain debounce window.
+    services.connectivity_gain.on_outbound_session_established();
     assert_eq!(
         runtime.force_reconnect_all_peers(),
         0,

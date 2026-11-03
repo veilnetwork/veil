@@ -27,6 +27,22 @@ use veil_session::manager::RemoteRole;
 use crate::runtime::NodeServices;
 use crate::types::PeerConfigEntry;
 
+// Network changes invalidate an in-flight dial. A sibling's successful
+// handshake only wakes idle retries. Keep the latter out of the dial select.
+fn wait_for_retry_wake(access: &NodeServices) -> impl std::future::Future<Output = ()> + '_ {
+    // Arm both subscriptions at construction, before the outer select starts
+    // polling. Otherwise wrapping Notified in an async fn loses broadcasts
+    // arriving between construction and the wrapper's first poll.
+    let forced = access.force_reconnect_notify.notified();
+    let gained = access.connectivity_gain.retry_wake();
+    async move {
+        tokio::select! {
+            _ = forced => {},
+            _ = gained => {},
+        }
+    }
+}
+
 // ── frame builders ────────────────────────────────────────────────────────────
 
 /// Build an immediate `ROUTE_PROBE` frame for the startup probe.
@@ -412,7 +428,7 @@ pub fn spawn_outbound_peers(
                     tokio::select! {
                         _ = shutdown_rx.changed() => break,
                         _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
-                        _ = access.force_reconnect_notify.notified() => {}
+                        _ = wait_for_retry_wake(&access) => {}
                         changed = refresh_rx.changed() => {
                             if changed.is_err() { break; }
                         }
@@ -441,7 +457,7 @@ pub fn spawn_outbound_peers(
                     tokio::select! {
                         _ = shutdown_rx.changed() => break,
                         _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
-                        _ = access.force_reconnect_notify.notified() => {}
+                        _ = wait_for_retry_wake(&access) => {}
                         changed = refresh_rx.changed() => {
                             if changed.is_err() { break; }
                         }
@@ -468,7 +484,7 @@ pub fn spawn_outbound_peers(
                     tokio::select! {
                         _ = shutdown_rx.changed() => break,
                         _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
-                        _ = access.force_reconnect_notify.notified() => {}
+                        _ = wait_for_retry_wake(&access) => {}
                         changed = refresh_rx.changed() => {
                             if changed.is_err() { break; }
                         }
@@ -961,7 +977,7 @@ pub fn spawn_outbound_peers(
                                     tokio::select! {
                                         _ = shutdown_rx.changed() => break,
                                         _ = tokio::time::sleep(jittered(pause)) => {}
-                                        _ = access.force_reconnect_notify.notified() => {
+                                        _ = wait_for_retry_wake(&access) => {
                                             stillborn_pause = backoff_min;
                                         }
                                         changed = refresh_rx.changed() => {
@@ -1095,7 +1111,7 @@ pub fn spawn_outbound_peers(
                                 tokio::select! {
                                     _ = shutdown_rx.changed() => break,
                                     _ = tokio::time::sleep(sleep_dur) => {}
-                                    _ = access.force_reconnect_notify.notified() => {
+                                    _ = wait_for_retry_wake(&access) => {
                                         woken_by_connectivity = true;
                                     }
                                     changed = refresh_rx.changed() => {
