@@ -198,8 +198,8 @@ use veil_mesh::UdpRealm;
 use super::persistence::persist_discovered_peers;
 use super::{
     InboundSessionContext, NodeRuntime, NodeServices, SessionRuntimeContext,
-    derive_listener_obfs4_psk, listen_transport_context, lock_state, lock_tasks,
-    push_session_handle, spawn_inbound_session,
+    derive_listener_obfs4_psk, inbound_session, listen_transport_context, lock_state, lock_tasks,
+    push_session_handle,
 };
 
 impl NodeRuntime {
@@ -1151,8 +1151,9 @@ impl NodeRuntime {
                                 } else {
                                     connection
                                 };
-                                let handle = spawn_inbound_session(ctx, connection);
-                                let _ = handle.await;
+                                // Keep the runner in this owned task: cancelling
+                                // the wrapper must cancel the session as well.
+                                inbound_session(ctx, connection, false).await;
                             });
                             push_session_handle(&tasks, wrapped);
                         }
