@@ -6969,6 +6969,29 @@ impl SessionRunner {
             let rt_trace_t0 = crate::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
             let rt_trace_body_len = body.len();
             let result = self.dispatcher.dispatch(&header, body, self.peer_id);
+            // A node going down sends this before dropping its transports.
+            // Gateway detach alone left its sender live until keepalive/EOF,
+            // so a quick restart could have replies queued to the old runner.
+            // Only the authenticated canonical session may end itself, and
+            // only after normal dispatch accepted the notice. Ordinary detach
+            // and migration retain their gateway-only semantics.
+            if matches!(result, DispatchResult::NoResponse)
+                && header.family == FrameFamily::Session as u8
+                && header.msg_type == SessionMsg::Detach as u16
+                && matches!(
+                    veil_proto::session::DetachPayload::decode(body),
+                    Ok(payload) if payload.reason == veil_proto::session::detach_reason::SHUTDOWN
+                )
+            {
+                self.logger.info(
+                    "session.peer_shutdown",
+                    format!(
+                        "peer_id={} — authenticated shutdown; retiring this session",
+                        hex_short(&self.peer_id)
+                    ),
+                );
+                break;
+            }
             if let Some(t0) = rt_trace_t0 {
                 let elapsed_ms = t0.elapsed().as_millis();
                 if elapsed_ms >= crate::rt_trace::SLOW_DISPATCH_MS {

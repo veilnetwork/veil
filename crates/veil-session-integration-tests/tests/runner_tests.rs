@@ -6915,3 +6915,6 @@ async fn fresh_rx_with_unacked_keepalive_does_not_storm_failover_attempts() {
 
 #[path = "runner_tests/reliable_stream_tests.rs"]
 mod reliable_stream_tests;
+
+#[path = "runner_tests/shutdown_detach_tests.rs"]
+mod shutdown_detach_tests;
