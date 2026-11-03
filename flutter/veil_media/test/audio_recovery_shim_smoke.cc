@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "modules/rtp_rtcp/source/rtcp_packet/receiver_report.h"
+#include "modules/rtp_rtcp/source/rtcp_packet/transport_feedback.h"
 #include "rtc_base/time_utils.h"
 #include "veil_transport_shim.h"
 
@@ -68,6 +69,70 @@ int main() {
             "original admission failure not distinguished");
     send_result = 0;
     source.Stop();
+  }
+  // Exact TWCC says only a padding probe was lost: it must not become an
+  // application-level persistent image-loss event. Raw RR remains unchanged.
+  for (int scenario = 0; scenario < 9; ++scenario) {
+    VeilTransportShim probe(198, nullptr, nullptr, nullptr, nullptr);
+    probe.SetLocalVideoSsrc(33);
+    probe.SetIndependentTransportFeedback(true);
+    probe.Start();
+    const auto began = webrtc::TimeMicros();
+    for (int seq = 1; seq <= 5; ++seq) {
+      std::vector<uint8_t> packet{0x90, 96, 0, uint8_t(seq), 0, 0, 0, 1,
+          0, 0, 0, 33, 0xbe, 0xde, 0, 1, 0x11, 0, uint8_t(seq), 0, 7};
+      if (seq == 2 && scenario != 1 && scenario != 2 && scenario != 8) {
+        packet[0] |= 0x20; packet.back() = 1;
+      }
+      webrtc::PacketOptions options;
+      require(probe.SendRtp(packet, options), "TWCC fixture not sent");
+    }
+    const auto report = [&](int high, int lost, bool twcc, int64_t at) {
+      webrtc::rtcp::ReceiverReport rr;
+      rr.SetSenderSsrc(44);
+      webrtc::rtcp::ReportBlock block;
+      block.SetMediaSsrc(33);
+      block.SetCumulativeLost(lost);
+      block.SetFractionLost(lost ? 32 : 0);
+      block.SetExtHighestSeqNum(high);
+      rr.AddReportBlock(block);
+      const auto built = rr.Build();
+      std::vector<uint8_t> compound(built.data(), built.data()+built.size());
+      if (twcc) {
+        webrtc::rtcp::TransportFeedback feedback;
+        feedback.SetSenderSsrc(44);
+        feedback.SetMediaSsrc(scenario == 3 ? 11 : 33);
+        feedback.SetBase(1, webrtc::Timestamp::Micros(began));
+        const int feedback_high = scenario == 4 ? 6 : high;
+        for (int n=1; n<=feedback_high; ++n) {
+          if (n != 2 || (scenario == 2 && high >= 4))
+            feedback.AddReceivedPacket(n, webrtc::Timestamp::Micros(began+n*1000));
+        }
+        const auto bytes = feedback.Build();
+        compound.insert(compound.end(), bytes.data(), bytes.data()+bytes.size());
+      }
+      if (scenario == 5) compound.insert(compound.end(), {0x80, 204, 0, 1});
+      AudioRecoveryFeedbackTest::Observe(probe, compound, at);
+    };
+    report(1, 0, false, began+100'000);
+    if (scenario == 6) probe.SetIndependentTransportFeedback(false);
+    report(3, 1, scenario != 7, began+200'000);
+    if (scenario == 8) {
+      // A new transport sequence carrying the same original RTP packet is
+      // a successful NACK retransmission, not a new image or a new gap.
+      std::vector<uint8_t> repair{0x90, 96, 0, 2, 0, 0, 0, 1,
+          0, 0, 0, 33, 0xbe, 0xde, 0, 1, 0x11, 0, 6, 0, 7};
+      webrtc::PacketOptions options;
+      require(probe.SendRtp(repair, options), "repair fixture not sent");
+    }
+    report(scenario == 8 ? 6 : 4, 1, scenario != 7, began+3'300'000);
+    const bool expect_event = scenario == 1 || scenario == 3 || scenario == 4 ||
+                              scenario == 6 || scenario == 7;
+    require((probe.video_feedback().persistent_loss_report_us > 0) == expect_event,
+            "TWCC payload loss / padding / fallback / retransmission classification failed");
+    require(scenario == 5 || probe.video_feedback().loss_pct > 0,
+            "raw RR loss was erased instead of classifying application evidence");
+    probe.Stop();
   }
   webrtc::rtcp::ReceiverReport rr;
   rr.SetSenderSsrc(22);

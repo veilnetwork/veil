@@ -42,6 +42,7 @@
 #include "veil_audio_send_stats.h"
 #include "veil_audio_packet_priority.h"
 #include "veil_video_loss_persistence.h"
+#include "veil_video_payload_loss.h"
 #include "veil_rtcp_send_stats.h"
 #include "veil_audio_redundancy.h"
 #include "veil_audio_recovery_feedback.h"
@@ -58,6 +59,10 @@ class TaskQueueBase;
 }  // namespace webrtc
 
 namespace veil_media {
+
+// Record only validated VP8 RTP with the negotiated transport-sequence extension.
+void RememberVideoLossPacket(VideoPacketHistory& history, std::span<const uint8_t> packet,
+                             uint32_t local_ssrc, int64_t now_us);
 
 // Endpoint-local RR/SR observation for this authenticated peer channel.
 struct RtcpFeedbackSnapshot {
@@ -127,7 +132,8 @@ class VeilTransportShim : public webrtc::Transport {
                     webrtc::Call* video_call,
                     webrtc::TaskQueueBase* video_network_queue,
                     std::shared_ptr<RtcpSendStats> group_rtcp_stats = nullptr,
-                    std::shared_ptr<AudioPacketPriority> audio_priority = nullptr);
+                    std::shared_ptr<AudioPacketPriority> audio_priority = nullptr,
+                    std::shared_ptr<VideoPacketHistory> video_history = nullptr);
   ~VeilTransportShim() override;
 
   VeilTransportShim(const VeilTransportShim&) = delete;
@@ -367,6 +373,8 @@ class VeilTransportShim : public webrtc::Transport {
   uint64_t video_source_epoch_ = 0;
   int64_t video_delivery_sent_us_ = 0;
   VideoLossPersistence video_loss_persistence_;
+  std::shared_ptr<VideoPacketHistory> video_packet_history_;
+  VideoPayloadLoss video_payload_loss_;
   AudioPlayoutSnapshot audio_playout_feedback_;
   struct LocalAudioPlayout {
     bool enabled = false;
