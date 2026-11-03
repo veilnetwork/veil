@@ -48,6 +48,9 @@ async fn shutdown_detach_retires_a_runner_without_waiting_for_eof() {
         ended.is_ok(),
         "SHUTDOWN left the old session eligible for sends"
     );
+    ended
+        .unwrap()
+        .expect("shutdown runner must exit without a panic");
     let mut byte = [0];
     assert_eq!(client.read(&mut byte).await.unwrap(), 0);
 }
