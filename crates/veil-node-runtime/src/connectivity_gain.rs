@@ -10,7 +10,7 @@
 //!    immediately (instead of the 300 s periodic tick), so
 //!    `listen_transports` / `own_external_addrs` carry the NEW external
 //!    IP by the time the app's next direct-endpoint exchange mints URIs.
-//! 2. **outbound-connector loops** — `force_reconnect_notify` wakes
+//! 2. **outbound-connector loops** — a dedicated retry wake notifies
 //!    every loop parked in a backoff / pre-check sleep so peers that
 //!    were unreachable on the OLD network get re-dialed promptly (the
 //!    woken loop also resets its exponential backoff — the failure
@@ -40,25 +40,23 @@ pub const GAIN_DEBOUNCE: Duration = Duration::from_secs(15);
 
 /// Shared connectivity-gain state. One per runtime; `Arc`-cloned into
 /// `NodeServices` (outbound connector) and the srflx probe task.
+#[derive(Default)]
 pub struct ConnectivityGain {
     /// Single-consumer wake for the srflx probe task. `notify_one` so a
     /// fire while the task is mid-probe leaves a stored permit — the
     /// wake is consumed on the task's next `notified().await` instead
     /// of being lost.
     srflx_probe_wake: tokio::sync::Notify,
-    /// The runtime-wide outbound-connector wake handle (same object the
-    /// mobile `NetworkChanged` IPC event fires).
-    force_reconnect_notify: std::sync::Arc<tokio::sync::Notify>,
+    /// Wake sleeping retry/backoff loops only. A successful sibling connection
+    /// does not invalidate another peer's in-progress transport handshake.
+    /// Mobile NetworkChanged keeps its separate cancellation notification.
+    retry_wake: tokio::sync::Notify,
     last_reconnect_fanout: Mutex<Option<Instant>>,
 }
 
 impl ConnectivityGain {
-    pub fn new(force_reconnect_notify: std::sync::Arc<tokio::sync::Notify>) -> Self {
-        Self {
-            srflx_probe_wake: tokio::sync::Notify::new(),
-            force_reconnect_notify,
-            last_reconnect_fanout: Mutex::new(None),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Called by the outbound connector right after a session finishes
@@ -79,8 +77,16 @@ impl ConnectivityGain {
             }
         };
         if fire {
-            self.force_reconnect_notify.notify_waiters();
+            self.retry_wake.notify_waiters();
         }
+    }
+
+    /// Wait for fresh egress evidence while sleeping between attempts. Do not
+    /// select this against a live dial: the old path is not known to be stale.
+    pub fn retry_wake(&self) -> impl std::future::Future<Output = ()> + '_ {
+        // Construct Notified now: notify_waiters also reaches an unpolled
+        // Notified, but cannot reach one hidden inside a not-yet-polled async fn.
+        self.retry_wake.notified()
     }
 
     /// Await the next srflx wake (single consumer: the probe task).
@@ -126,13 +132,12 @@ mod tests {
 
     #[tokio::test]
     async fn gain_hook_fires_reconnect_once_per_window() {
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let gain = ConnectivityGain::new(Arc::clone(&notify));
+        let gain = Arc::new(ConnectivityGain::new());
 
         // Arm a waiter BEFORE firing (notify_waiters stores no permit).
         let waiter = {
-            let notify = Arc::clone(&notify);
-            tokio::spawn(async move { notify.notified().await })
+            let gain = Arc::clone(&gain);
+            tokio::spawn(async move { gain.retry_wake().await })
         };
         tokio::task::yield_now().await;
 
@@ -144,8 +149,8 @@ mod tests {
 
         // Second fire inside the window: reconnect fan-out suppressed.
         let waiter2 = {
-            let notify = Arc::clone(&notify);
-            tokio::spawn(async move { notify.notified().await })
+            let gain = Arc::clone(&gain);
+            tokio::spawn(async move { gain.retry_wake().await })
         };
         tokio::task::yield_now().await;
         gain.on_outbound_session_established();
@@ -158,8 +163,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_created_retry_waiter_observes_gain_before_its_first_poll() {
+        let gain = ConnectivityGain::new();
+        let mut waiter = Box::pin(gain.retry_wake());
+        gain.on_outbound_session_established();
+        assert!(
+            futures::poll!(&mut waiter).is_ready(),
+            "a retry wake between select construction and first poll was lost"
+        );
+    }
+
+    #[tokio::test]
     async fn gain_hook_srflx_wake_has_permit_semantics() {
-        let gain = ConnectivityGain::new(Arc::new(tokio::sync::Notify::new()));
+        let gain = ConnectivityGain::new();
         // Fire BEFORE anyone awaits — notify_one must store the permit.
         gain.on_outbound_session_established();
         tokio::time::timeout(Duration::from_secs(1), gain.srflx_wake())

@@ -676,7 +676,7 @@ pub struct NodeRuntime {
     pub force_reconnect_notify: Arc<tokio::sync::Notify>,
     /// P2P mobility slice: connectivity-gain hook — outbound session
     /// establishment fans out to the srflx probe task + (debounced)
-    /// `force_reconnect_notify`. See `connectivity_gain.rs`.
+    /// retry wake. See `connectivity_gain.rs`.
     pub connectivity_gain: Arc<crate::connectivity_gain::ConnectivityGain>,
     /// shared push-event bus. IPC server subscribes one
     /// receiver per connected client and emits `LocalAppMsg::Event`
