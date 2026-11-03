@@ -28,6 +28,7 @@
 #include "modules/rtp_rtcp/source/rtcp_packet/common_header.h"
 #include "modules/rtp_rtcp/source/rtcp_packet/receiver_report.h"
 #include "modules/rtp_rtcp/source/rtcp_packet/sender_report.h"
+#include "modules/rtp_rtcp/source/rtcp_packet/transport_feedback.h"
 #include "system_wrappers/include/clock.h"
 #include "modules/rtp_rtcp/source/rtp_packet_received.h"
 #include "modules/rtp_rtcp/source/rtp_util.h"  // webrtc::IsRtcpPacket
@@ -68,18 +69,36 @@ void slog(const char* fmt, ...) {
 }
 }  // namespace
 
+void RememberVideoLossPacket(VideoPacketHistory& history,
+                             std::span<const uint8_t> bytes,
+                             uint32_t local_ssrc, int64_t now_us) {
+  if (!local_ssrc) return;
+  webrtc::RtpHeaderExtensionMap extensions;
+  extensions.Register<webrtc::TransportSequenceNumber>(webrtc::RtpHeaderExtensionId(1));
+  webrtc::RtpPacketReceived packet(&extensions);
+  uint16_t transport;
+  if (!packet.Parse(bytes) || packet.Ssrc() != local_ssrc ||
+      packet.PayloadType() != 96 ||
+      !packet.GetExtension<webrtc::TransportSequenceNumber>(&transport)) return;
+  history.Record(transport, packet.SequenceNumber(), packet.Timestamp(),
+                 packet.payload_size() > 0, now_us);
+}
+
 VeilTransportShim::VeilTransportShim(uint64_t veil_chan,
                                      webrtc::Call* call,
                                      webrtc::TaskQueueBase* network_queue,
                                      webrtc::Call* video_call,
                                      webrtc::TaskQueueBase* video_network_queue,
                                      std::shared_ptr<RtcpSendStats> group_rtcp_stats,
-                                     std::shared_ptr<AudioPacketPriority> audio_priority)
+                                     std::shared_ptr<AudioPacketPriority> audio_priority,
+                                     std::shared_ptr<VideoPacketHistory> video_history)
     : audio_priority_(std::move(audio_priority)),
       veil_chan_(veil_chan), call_(call), network_queue_(network_queue),
       video_call_(video_call), video_network_queue_(video_network_queue),
       audio_ingress_diagnostics_(diag::enabled()),
       audio_trace_capacity_(diag::rtp_trace_capacity()),
+      video_packet_history_(video_history ? std::move(video_history)
+                                          : std::make_shared<VideoPacketHistory>()),
       group_rtcp_stats_(std::move(group_rtcp_stats)) {}
 
 VeilTransportShim::~VeilTransportShim() {
@@ -253,6 +272,7 @@ bool VeilTransportShim::RebindChannel(uint64_t veil_chan, bool retain_previous_r
     auto* clock = webrtc::Clock::GetRealTimeClock();
     rtcp_route_clock_.Reset(webrtc::CompactNtp(clock->CurrentNtpTime()));
     video_loss_persistence_.RouteChanged();
+    video_payload_loss_.Reset(webrtc::TimeMicros());
     // Retain loss/playout evidence and the engine's live counters. Cached
     // RTT about the previous sender path is unknown for the new path.
     for (auto* feedback : {&audio_feedback_, &video_feedback_}) {
@@ -285,6 +305,8 @@ bool VeilTransportShim::SendRtp(std::span<const uint8_t> packet,
       packet, local_audio_ssrc_.load(std::memory_order_relaxed), started_ns);
   const bool video = video_send_stats_.mark_attempt(
       packet, local_video_ssrc_.load(std::memory_order_relaxed), started_ns, 96);
+  if (video) RememberVideoLossPacket(*video_packet_history_, packet,
+      local_video_ssrc_.load(std::memory_order_relaxed), started_ns / 1000);
   const int rc =
       veil_media_send_datagram(veil_chan_, packet.data(), packet.size());
   if (guarded_video) audio_priority_->EndVideo(rc == 0, webrtc::TimeMicros());
@@ -592,6 +614,7 @@ void VeilTransportShim::ResetVideoLossEvidence() {
   ++video_source_epoch_;
   video_send_stats_.reset_payload_clock();
   video_loss_persistence_.Reset();
+  video_payload_loss_.Reset(webrtc::TimeMicros());
   video_feedback_.persistent_loss_report_us = 0;
 }
 
@@ -692,6 +715,8 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
   if (local == 0 && video == 0) return;
   RtcpFeedbackSnapshot candidate, video_candidate;
   AudioPlayoutSnapshot playout;
+  std::vector<VideoPayloadLoss::Status> transport_statuses;
+  bool transport_seen = false, transport_known = true;
   std::optional<VideoDeliveryReport> delivery;
   std::optional<AudioRecoveryReport> recovery;
   std::optional<AudioConcealmentReport> concealment;
@@ -732,6 +757,24 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
       webrtc::rtcp::SenderReport report;
       if (!report.Parse(header)) return;
       observe(report.report_blocks());
+    } else if (header.type() == 205 && header.count() == 15) {
+      webrtc::rtcp::TransportFeedback feedback;
+      if (!feedback.Parse(header)) return;
+      // Audio and video Calls have independent transport sequence spaces.
+      // Accept only an explicit video target from this authenticated peer.
+      if (video && feedback.media_ssrc() == video && independent_transport_feedback()) {
+        transport_seen = true;
+        if (feedback.GetPacketStatusCount() + transport_statuses.size() >
+            VideoPacketHistory::kCapacity) {
+          transport_known = false;
+        } else {
+          feedback.ForAllPackets([&](uint16_t sequence, webrtc::TimeDelta delta) {
+            const auto p = video_packet_history_->Find(sequence, arrived_us);
+            if (!p) transport_known = false;
+            else transport_statuses.push_back({*p, delta.IsFinite()});
+          });
+        }
+      }
     } else if (header.type() == 204 && header.payload_size_bytes() >= 8 &&
                (read_be32(header.payload() + 4) == kVideoDeliveryAppName ||
                 read_be32(header.payload() + 4) == kVideoDeliveryTargetAppName)) {
@@ -771,8 +814,14 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
     offset += header.packet_size();
   }
   if (candidate.arrived_us > 0 || video_candidate.arrived_us > 0 ||
-      playout.supported || recovery || concealment || delivery) {
+      playout.supported || recovery || concealment || delivery || transport_seen) {
     std::lock_guard lock(audio_feedback_mu_);
+    if (transport_seen) {
+      video_payload_loss_.Observe(transport_statuses, transport_known, arrived_us);
+      if (video_payload_loss_.FreshAt(arrived_us))
+        video_feedback_.persistent_loss_report_us = std::max(
+            video_feedback_.persistent_loss_report_us, video_payload_loss_.event_us());
+    }
     if (delivery) peer_video_delivery_.Observe(*delivery, video, arrived_us);
     if (recovery) peer_audio_recovery_.Observe(*recovery, local, arrived_us);
     if (concealment) peer_audio_concealment_.Observe(*concealment, local, arrived_us);
@@ -799,10 +848,11 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
       if (!rtcp_route_clock_.Accepts(video_candidate.last_sender_report)) video_candidate.rtt_ms = 0;
       video_candidate.loss_report_us = std::max(video_candidate.loss_report_us,
                                                 video_feedback_.loss_report_us);
+      const auto rr_event = video_loss_persistence_.Observe(
+          video_candidate.cumulative_lost, video_candidate.highest_sequence, arrived_us);
       video_candidate.persistent_loss_report_us = std::max(
           video_feedback_.persistent_loss_report_us,
-          video_loss_persistence_.Observe(video_candidate.cumulative_lost,
-              video_candidate.highest_sequence, arrived_us));
+          video_payload_loss_.FreshAt(arrived_us) ? video_payload_loss_.event_us() : rr_event);
       video_feedback_ = video_candidate;
     }
     if (playout.supported && (!audio_playout_feedback_.supported ||

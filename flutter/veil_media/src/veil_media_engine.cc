@@ -395,8 +395,10 @@ class GroupFanoutTransport : public webrtc::Transport {
  public:
   GroupFanoutTransport(webrtc::Call* call, webrtc::Call* video_call,
                        uint32_t audio_ssrc, uint32_t video_ssrc,
-                       std::shared_ptr<veil_media::RtcpSendStats> rtcp_stats)
+                       std::shared_ptr<veil_media::RtcpSendStats> rtcp_stats,
+                       std::shared_ptr<veil_media::VideoPacketHistory> video_history)
       : rtcp_stats_(std::move(rtcp_stats)), video_ssrc_(video_ssrc),
+        video_history_(std::move(video_history)),
         audio_send_trace_(audio_ssrc),
         call_(call), video_call_(video_call) {}
 
@@ -429,6 +431,7 @@ class GroupFanoutTransport : public webrtc::Transport {
     // Snapshot under a short lock; video/RTCP sends must not hold audio here.
     // A removed/closed handle rejects a late already-selected send in Veil.
     const auto channels = Snapshot();
+    veil_media::RememberVideoLossPacket(*video_history_, packet, video_ssrc_, webrtc::TimeMicros());
     bool any = false;
     for (const uint64_t chan : channels) {
       const int64_t began_ns = webrtc::TimeMicros() * 1000;
@@ -511,6 +514,7 @@ class GroupFanoutTransport : public webrtc::Transport {
   }
   std::atomic<uint64_t> audio_drops_{0};
   const uint32_t video_ssrc_;
+  const std::shared_ptr<veil_media::VideoPacketHistory> video_history_;
   veil_media::RtpSendStats video_stats_;
   veil_media::VideoLossTrace video_send_trace_;
   veil_media::GroupAudioSendTrace audio_send_trace_;
@@ -1227,6 +1231,8 @@ struct GroupWebrtcState {
   // erase previously admitted copies from these call-wide diagnostics.
   std::shared_ptr<veil_media::RtcpSendStats> rtcp_send_stats =
       std::make_shared<veil_media::RtcpSendStats>();
+  std::shared_ptr<veil_media::VideoPacketHistory> video_packet_history =
+      std::make_shared<veil_media::VideoPacketHistory>();
   std::unique_ptr<GroupFanoutTransport> fanout;
   webrtc::AudioSendStream* send_stream = nullptr;  // owned by Call
   webrtc::scoped_refptr<webrtc::AudioEncoderFactory> audio_encoder_factory;
@@ -2165,7 +2171,7 @@ VeilGroupMediaEngine* veil_media_group_engine_create(
   ws->fanout = std::make_unique<GroupFanoutTransport>(
       ws->call.get(), ws->video_call.get(), group_audio_ssrc_of(engine->local),
       group_video_ssrc_of(engine->local),
-      ws->rtcp_send_stats);
+      ws->rtcp_send_stats, ws->video_packet_history);
   engine->ws = std::move(ws);
 #endif
   return engine.release();
@@ -2208,7 +2214,8 @@ int veil_media_group_engine_add_peer(VeilGroupMediaEngine* engine,
   std::memcpy(peer->id, peer_id, 32);
   peer->shim = std::make_unique<veil_media::VeilTransportShim>(
       veil_chan, ws->call.get(), ws->network_tq.get(),
-      ws->video_call.get(), ws->video_network_tq.get(), ws->rtcp_send_stats);
+      ws->video_call.get(), ws->video_network_tq.get(), ws->rtcp_send_stats,
+      nullptr, ws->video_packet_history);
   peer->shim->SetLocalAudioSsrc(local_audio_ssrc);
   peer->shim->SetRemoteAudioSsrc(remote_ssrc);
   peer->shim->SetLocalVideoSsrc(local_video_ssrc);
