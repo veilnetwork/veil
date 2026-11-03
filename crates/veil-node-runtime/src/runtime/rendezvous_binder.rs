@@ -11,7 +11,7 @@
 //!    actual `Box<dyn TransportListener>`.
 //! 3. Spawns a dedicated short-lived accept task that mirrors the
 //!    Phase 5f accept-loop pattern (scanner-shield ban check, per-
-//!    spawn inbound-handshake semaphore, full `spawn_inbound_session`
+//!    spawn inbound-handshake semaphore, full `inbound_session`
 //!    pipeline) but bounded by [`OnDemandLifecycle`] (TTL deadline +
 //!    accept-budget).
 //!
@@ -33,17 +33,17 @@ use veil_session::rendezvous::BindClosure;
 use veil_transport::{TransportContext, TransportListener, TransportRegistry, TransportUri};
 
 use super::{
-    InboundSessionContext, RuntimeTasks, SessionRuntimeContext, push_session_handle,
-    spawn_inbound_session,
+    InboundSessionContext, RuntimeTasks, SessionRuntimeContext, inbound_session,
+    push_session_handle,
 };
 
-// ── AcceptBundle — captured Arcs needed for spawn_inbound_session ───
+// ── AcceptBundle — captured Arcs needed for inbound_session ───
 
 /// Cloneable bundle of all `Arc`s + values needed to build a
 /// [`SessionRuntimeContext`] and spawn an inbound session.  Construction
 /// happens once in `wire_rendezvous_controller_for_listen`; each
 /// accepted connection clones (cheap — all `Arc`s) and calls
-/// [`spawn_inbound_session`].
+/// [`inbound_session`].
 #[derive(Clone)]
 pub struct AcceptBundle {
     pub ctx: SessionRuntimeContext,
@@ -103,7 +103,7 @@ impl BindClosure for RendezvousBinder {
 /// Accept-loop wrapper bounded by [`OnDemandLifecycle`].  Mirrors the
 /// Phase 5f accept-loop pattern in `services.rs::spawn_listeners` (scanner-
 /// shield check + accept-waiter dispatch + inbound-handshake semaphore
-/// + `spawn_inbound_session` pipeline) but exits cleanly on TTL OR
+/// + `inbound_session` pipeline) but exits cleanly on TTL OR
 ///   after `max_accepts` sessions accepted.
 ///
 /// Per-accept flow:
@@ -114,7 +114,7 @@ impl BindClosure for RendezvousBinder {
 /// 4. Pop a pending-accept waiter if any (debug-CLI accept hooks).
 /// 5. Try-acquire inbound-handshake semaphore permit; drop connection
 ///    if cap reached.
-/// 6. Call [`spawn_inbound_session`] with a freshly-cloned
+/// 6. Call [`inbound_session`] with a freshly-cloned
 ///    [`SessionRuntimeContext`].
 /// 7. `lifecycle.note_accept()` — decrement budget; break if returns 1.
 async fn run_on_demand_accept_task(
@@ -224,21 +224,20 @@ async fn run_on_demand_accept_task(
                         }
                     };
 
-                    // Spawn the session.  SessionRuntimeContext clone
-                    // is cheap (all Arc clones inside).
-                    let handle = spawn_inbound_session(
+                    let session = inbound_session(
                         InboundSessionContext {
                             runtime: bundle.ctx.clone(),
                             listen_id,
                             listener_handle,
                         },
                         connection,
+                        false,
                     );
-                    // Wrap the handle to keep the permit alive for the
-                    // session's lifetime.  Same idiom as Phase 5f.
+                    // Own the future, not a second spawned task. Cancellation
+                    // must drop its session and permit together.
                     let wrapped = tokio::spawn(async move {
                         let _permit = permit;
-                        let _ = handle.await;
+                        session.await;
                     });
                     push_session_handle(&bundle.tasks, wrapped);
 

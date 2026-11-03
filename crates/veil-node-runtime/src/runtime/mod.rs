@@ -3091,7 +3091,7 @@ pub fn spawn_inbound_session(
     inbound: InboundSessionContext,
     connection: Box<dyn veil_transport::TransportConnection>,
 ) -> JoinHandle<()> {
-    spawn_inbound_session_with_directional_override(inbound, connection, false)
+    tokio::spawn(inbound_session(inbound, connection, false))
 }
 
 /// The responder half of a coordinated NAT recovery has no reverse dial to
@@ -3101,15 +3101,17 @@ fn spawn_punched_inbound_session(
     inbound: InboundSessionContext,
     connection: Box<dyn veil_transport::TransportConnection>,
 ) -> JoinHandle<()> {
-    spawn_inbound_session_with_directional_override(inbound, connection, true)
+    tokio::spawn(inbound_session(inbound, connection, true))
 }
 
-fn spawn_inbound_session_with_directional_override(
+/// The listener awaits this future in its registered handshake task. A second
+/// spawn would detach the runner when that task is cancelled during node.stop.
+fn inbound_session(
     inbound: InboundSessionContext,
     connection: Box<dyn veil_transport::TransportConnection>,
     bypass_directional: bool,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    async move {
         // B5: Ok(None) means the inbound connection was bound
         // to an existing session via HandoffAttach — no new runner to
         // spawn, the existing one picked up the warm socket. Ok(Some)
@@ -3355,7 +3357,7 @@ fn spawn_inbound_session_with_directional_override(
             );
             let _ = runner.stream.shutdown().await;
         }
-    })
+    }
 }
 
 // oncurrency-the legacy

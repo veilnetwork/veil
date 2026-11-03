@@ -3179,6 +3179,42 @@ async fn bootstrap_find_node_contacts_added_to_dht() {
 
 // ── graceful shutdown ──────────────────────────────────────────
 
+/// The listener's handshake supervisor owns the resulting runner too. Aborting
+/// its wrapper must not detach a second spawned task with the live socket.
+#[tokio::test(flavor = "current_thread")]
+async fn stopping_the_node_retires_a_listeners_active_inbound_connection() {
+    let path = save_test_config("inbound-stop-owner", runtime_config_with_listen()).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.unwrap();
+    let listen = runtime.listens().into_iter().next().unwrap();
+    let registry = TransportRegistry::with_defaults();
+    let ctx = Arc::new(TransportContext::for_debug().unwrap());
+    let uri = TransportUri::parse(&format!("tcp://{}", listen.local_addr.unwrap())).unwrap();
+    let connection = registry.connect(&uri, ctx).await.unwrap();
+    let mut stream = connection.into_stream().unwrap();
+    complete_test_handshake(&mut stream).await;
+    timeout(Duration::from_secs(3), async {
+        while runtime.sessions().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    runtime.stop().await.unwrap();
+    // finalize_stop_state clears the local map even if a detached runner lives.
+    // Observe EOF at the remote socket independently of that map.
+    let mut received = Vec::new();
+    let closed = timeout(Duration::from_secs(3), stream.read_to_end(&mut received)).await;
+    let retired = matches!(closed, Ok(Ok(_)));
+    // Clean the deliberate red case as well: the remote close releases its task.
+    drop(stream);
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+    assert!(
+        retired,
+        "node.stop detached an inbound runner and left its socket open"
+    );
+}
+
 /// `stop` must complete without panicking and log "all listeners stopped".
 /// The Detach broadcast path is exercised by stop_tasks; since there are no
 /// active sessions in this test the send_to_all is a no-op.
