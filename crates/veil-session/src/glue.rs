@@ -400,11 +400,16 @@ mod tests {
             "old capability must not activate replacement"
         );
         assert_eq!(&*old.recv().await.unwrap().1, [0]);
-        assert!(admission.await);
-        assert_eq!(
-            &*old.recv().await.unwrap().1,
-            [1],
-            "waiting credit retains exact modern sender"
+        assert!(
+            !admission.await,
+            "replacement retires the exact sender; an unadmitted suffix must fail"
+        );
+        assert!(
+            matches!(
+                old.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ),
+            "the accepted prefix drained without keeping the retired sender alive"
         );
         assert!(
             replacement.try_recv().is_err(),

@@ -566,14 +566,18 @@ impl FrameOutbox {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<FrameEnvelope>> {
-        if self
-            .registration_retirement
-            .as_mut()
-            .is_some_and(|owner| matches!(owner.poll_recv(cx), Poll::Ready(Some(()))))
-        {
+        let retired =
+            self.registration_retirement
+                .as_mut()
+                .and_then(|owner| match owner.poll_recv(cx) {
+                    Poll::Ready(message) => Some(message.is_none()),
+                    Poll::Pending => None,
+                });
+        if let Some(owner_gone) = retired {
             // Preserve the existing queued-frame/EOF order, but forbid any
-            // further admission and unblock sends holding a borrowed sender.
-            self.close();
+            // further admission. Replacement drops the registration's owner;
+            // borrowed producers must not keep that old queue alive.
+            self.close_registration(owner_gone);
         }
         let mut pending = false;
         for lane in self.receive_order() {
@@ -604,12 +608,16 @@ impl FrameOutbox {
     }
 
     pub(crate) fn try_recv_envelope(&mut self) -> Result<FrameEnvelope, mpsc::error::TryRecvError> {
-        if self
-            .registration_retirement
-            .as_mut()
-            .is_some_and(|owner| owner.try_recv().is_ok())
-        {
-            self.close();
+        let retired =
+            self.registration_retirement
+                .as_mut()
+                .and_then(|owner| match owner.try_recv() {
+                    Ok(()) => Some(false),
+                    Err(mpsc::error::TryRecvError::Disconnected) => Some(true),
+                    Err(mpsc::error::TryRecvError::Empty) => None,
+                });
+        if let Some(owner_gone) = retired {
+            self.close_registration(owner_gone);
         }
         let mut empty = false;
         for lane in self.receive_order() {
@@ -658,6 +666,21 @@ impl FrameOutbox {
                 .reserved
                 .as_ref()
                 .is_none_or(EnvelopeReceiver::is_closed)
+    }
+
+    fn close_registration(&mut self, owner_gone: bool) {
+        // Terminal once, whether explicitly retired or released by its owner.
+        self.registration_retirement = None;
+        self.close();
+        if crate::rt_trace::rt_trace_enabled() {
+            let at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            log::info!(
+                "session.rt_trace.registration_retired at_ms={at_ms} owner_gone={owner_gone}"
+            );
+        }
     }
 
     pub fn close(&mut self) {
@@ -1191,6 +1214,31 @@ mod tests {
                 RELIABLE_SOURCE_QUEUE_DEPTH
             );
         }
+    }
+
+    #[tokio::test]
+    async fn replacement_owner_end_closes_try_recv_after_queued_prefix() {
+        let peer = [0x35; 32];
+        let mut registry = crate::SessionTxRegistry::with_capacity(8);
+        let mut old = registry.register_owned(peer, [1; 32]);
+        let sender = registry.get_sender(&peer).unwrap().clone();
+        sender.try_send(frame(3, 21)).unwrap();
+        let mut replacement = registry.register_owned(peer, [2; 32]);
+        assert_eq!(&*old.try_recv().unwrap().1, &[21]);
+        assert!(
+            matches!(old.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)),
+            "try_recv ignored owner end while a borrowed sender kept ingress open"
+        );
+        assert!(matches!(
+            sender.try_send(frame(3, 22)),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+        assert!(matches!(
+            replacement.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(registry.send_to(&peer, INTERACTIVE, vec![23]));
+        assert_eq!(&*replacement.try_recv().unwrap().1, &[23]);
     }
 
     #[tokio::test]
