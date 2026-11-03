@@ -340,8 +340,26 @@ impl FrameSender {
     /// ingress AND the scheduler, so draining ingress cannot erase pressure.
     pub(crate) async fn send_reliable(&self, bytes: veil_bufpool::PooledShared) -> bool {
         let cost = reliable_source_cost(bytes.len());
-        let Ok(credit) = self.reliable_credits.clone().acquire_many_owned(cost).await else {
-            return false;
+        let credit = tokio::select! {
+            biased;
+            // Already admitted records can outlive this receiver in a child
+            // actor/scheduler. Their credit must remain charged, but a closed
+            // ingress must not wait for it before reporting the route gone.
+            _ = self.ordinary.closed() => {
+                if crate::rt_trace::rt_trace_enabled() {
+                    let at_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                    log::info!(
+                        "session.rt_trace.reliable_source_closed at_ms={at_ms} bytes={} credits={}",
+                        bytes.len(), self.reliable_credits.available_permits(),
+                    );
+                }
+                return false;
+            },
+            credit = self.reliable_credits.clone().acquire_many_owned(cost) => match credit {
+                Ok(credit) => credit,
+                Err(_) => return false,
+            },
         };
         crate::frame_diag::note_chunk_frame("source_enqueue", &bytes);
         self.ordinary
@@ -1107,6 +1125,72 @@ mod tests {
         drop(held);
         assert!(waiting.await);
         assert_eq!(&*rx.recv().await.unwrap().1, &[9]);
+    }
+
+    #[tokio::test]
+    async fn closed_reliable_ingress_wakes_all_credit_waiters_before_scheduler_release() {
+        use std::future::Future;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::task::{Wake, Waker};
+        struct Flag(AtomicBool);
+        impl Wake for Flag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        for drop_receiver in [false, true] {
+            let (tx, mut rx) = frame_channel(8);
+            assert!(
+                tx.send_reliable(veil_bufpool::pooled_shared_from_vec(vec![7; 60 * 1024]))
+                    .await
+            );
+            // A scheduler/child actor may retain this already admitted frame
+            // beyond the session receiver's lifetime. Its debt stays real.
+            let held = rx.recv_envelope().await.unwrap();
+            assert_eq!(tx.reliable_credits.available_permits(), 0);
+            let mut waiters = Vec::new();
+            for byte in 0..4 {
+                let flag = Arc::new(Flag(AtomicBool::new(false)));
+                let waker = Waker::from(flag.clone());
+                let mut waiting = Box::pin(tx.send_reliable(frame(3, byte).1));
+                assert!(
+                    waiting
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                flag.0.store(false, Ordering::SeqCst);
+                waiters.push((waiting, flag, waker));
+            }
+            if drop_receiver {
+                drop(rx);
+            } else {
+                rx.close();
+            }
+            for (mut waiting, flag, waker) in waiters {
+                assert!(
+                    flag.0.load(Ordering::SeqCst),
+                    "closed ingress did not wake a reliable producer"
+                );
+                assert_eq!(
+                    waiting.as_mut().poll(&mut Context::from_waker(&waker)),
+                    Poll::Ready(false)
+                );
+            }
+            assert_eq!(
+                tx.reliable_credits.available_permits(),
+                0,
+                "closing must not forgive the scheduler's retained debt"
+            );
+            drop(held);
+            assert_eq!(
+                tx.reliable_credits.available_permits(),
+                RELIABLE_SOURCE_QUEUE_DEPTH
+            );
+        }
     }
 
     #[tokio::test]
