@@ -1350,6 +1350,7 @@ struct SendTiming {
     path: std::cell::Cell<&'static str>,
     family: std::cell::Cell<FamilySendTiming>,
     bytes: std::cell::Cell<usize>,
+    source_wait_ms: u128,
     small_trace: std::cell::Cell<bool>,
     direct_ms: std::cell::Cell<u128>,
     direct_status: std::cell::Cell<&'static str>,
@@ -1361,7 +1362,7 @@ struct SendTiming {
 }
 
 impl SendTiming {
-    fn new(source: &[u8; 32]) -> Self {
+    fn new(source: &[u8; 32], source_received_at: std::time::Instant) -> Self {
         Self {
             started: std::time::Instant::now(),
             source: source[..4].try_into().unwrap_or([0; 4]),
@@ -1371,6 +1372,7 @@ impl SendTiming {
             path: std::cell::Cell::new("unknown"),
             family: std::cell::Cell::new(FamilySendTiming::default()),
             bytes: std::cell::Cell::new(0),
+            source_wait_ms: source_received_at.elapsed().as_millis(),
             small_trace: std::cell::Cell::new(false),
             direct_ms: std::cell::Cell::new(0),
             direct_status: std::cell::Cell::new("not_attempted"),
@@ -1415,7 +1417,7 @@ impl Drop for SendTiming {
             };
             log::log!(
                 level,
-                "{event} at={} dst={} total_ms={total} plan_ms={} seal_ms={} path={} family_resolve_ms={} family_seal_ms={} family_admission_ms={} family_certificates={} family_evidence={:?} at_ms={at_ms} bytes={} direct_admission_ms={} direct_status={} fallback_key_ms={} fallback_key_status={} relay_lookup_ms={} relay_admission_ms={relay_admission_ms} relay_status={} trace_drops={}{correlation}",
+                "{event} at={} dst={} total_ms={total} plan_ms={} seal_ms={} path={} family_resolve_ms={} family_seal_ms={} family_admission_ms={} family_certificates={} family_evidence={:?} at_ms={at_ms} bytes={} source_wait_ms={} direct_admission_ms={} direct_status={} fallback_key_ms={} fallback_key_status={} relay_lookup_ms={} relay_admission_ms={relay_admission_ms} relay_status={} trace_drops={}{correlation}",
                 at_ms / 1000,
                 veil_util::bytes_to_hex(&self.dst.get()),
                 self.plan_ms.get(),
@@ -1427,6 +1429,7 @@ impl Drop for SendTiming {
                 family.certificates,
                 family.evidence,
                 self.bytes.get(),
+                self.source_wait_ms,
                 self.direct_ms.get(),
                 self.direct_status.get(),
                 self.fallback_key_ms.get(),
@@ -1456,7 +1459,7 @@ async fn handle_ipc_send_inner(
     body: &[u8],
     ctx: &IpcSendContext,
 ) -> std::io::Result<()> {
-    let timing = SendTiming::new(&ctx.local_node_id);
+    let timing = SendTiming::new(&ctx.local_node_id, ctx.source_received_at);
     // Borrowed out of the now-owned context so the body below reads exactly as
     // it did when the context itself was borrowed.
     let app_registry = &*ctx.app_registry;
