@@ -2967,7 +2967,7 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
         const auto frame = peer->video_sink->delivery_frame();
         peer->shim->SetLocalVideoDelivery(peer->video_ssrc,
             v.rtp_stats.packet_counter.payload_bytes, frame.first,
-            frame.second, v.current_delay_ms, webrtc::TimeMicros());
+            frame.second, v.current_delay_ms, webrtc::TimeMicros(), v.target_delay_ms);
       }
     }
     if (ws->video_send_stream) {
@@ -4660,7 +4660,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
               const auto frame = ws->video_sink->delivery_frame();
               ws->shim->SetLocalVideoDelivery(video_ssrc_of(engine->peer),
                   v.rtp_stats.packet_counter.payload_bytes, frame.first,
-                  frame.second, v.current_delay_ms, webrtc::TimeMicros());
+                  frame.second, v.current_delay_ms, webrtc::TimeMicros(), v.target_delay_ms);
             }
           }
         }, std::chrono::milliseconds(20));

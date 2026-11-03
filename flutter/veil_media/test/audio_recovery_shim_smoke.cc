@@ -265,6 +265,41 @@ int main() {
   AudioRecoveryFeedbackTest::Observe(sender, bad_video, video_now + 50);
   require(sender.video_delivery_json(video_now + 50) == delivery,
           "reserved video fields were accepted");
+  // The send path rejects future samples and retains its 950-ms cadence.
+  std::this_thread::sleep_for(std::chrono::milliseconds(960));
+  const auto target_now = webrtc::TimeMicros();
+  receiver.SetLocalVideoDelivery(33, 2400, 2, 0x10u, 290, target_now, 260);
+  const auto with_target = sent;
+  require(with_target.size() == video_compound.size() &&
+          veil_media::RecoveryRead32(with_target.data()+16) == veil_media::kVideoDeliveryTargetAppName,
+          "measured target did not select fixed-size VVD2");
+  for (const auto* packet : {&video_compound, &with_target}) {
+    for (size_t length = 0; length < 60; ++length) {
+      require(!veil_media::DecodeVideoDelivery({packet->data()+12, length}, 0),
+              "truncated delivery report was accepted");
+    }
+  }
+  AudioRecoveryFeedbackTest::Observe(sender, with_target, target_now + 10);
+  require(sender.video_delivery_json(target_now + 10).find("\"target_delay_ms\":260") != std::string::npos,
+          "VVD2 target did not cross the real compound parser");
+  for (int variant = 0; variant < 6; ++variant) {
+    VeilTransportShim clean(89, nullptr, nullptr, nullptr, nullptr);
+    clean.SetLocalVideoSsrc(33);
+    clean.Start();
+    auto packet = with_target;
+    if (variant == 0 || variant == 1)
+      veil_media::RecoveryWrite32(packet.data()+64, variant == 0 ? 0 : 60000);
+    if (variant == 2) veil_media::RecoveryWrite32(packet.data()+64, 60001);
+    if (variant == 3) packet.back() = 1;
+    if (variant == 4) packet[8] = 0x81;  // Unsupported APP subtype.
+    if (variant == 5) packet.insert(packet.end(), video_compound.end()-64, video_compound.end());
+    AudioRecoveryFeedbackTest::Observe(clean, packet, target_now + 20);
+    const auto json = clean.video_delivery_json(target_now + 20);
+    require(variant < 2 ? json.find(std::string("\"target_delay_ms\":") +
+              (variant == 0 ? "0" : "60000")) != std::string::npos : json == "{}",
+            "VVD2 bounds/reserved/subtype/mixed-duplicate check failed");
+    clean.Stop();
+  }
   receiver.Stop();
   receiver.SendRtcp(original, {});
   require(sent == original, "stopped source appended recovery");

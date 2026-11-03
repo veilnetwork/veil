@@ -192,7 +192,8 @@ class VeilTransportShim : public webrtc::Transport {
   void SetLocalVideoSsrc(uint32_t ssrc) { local_video_ssrc_.store(ssrc); }
   RtcpFeedbackSnapshot video_feedback() const;
   void SetLocalVideoDelivery(uint32_t remote_ssrc, uint64_t bytes,
-      uint64_t frames, uint32_t timestamp, int delay_ms, int64_t sampled_us);
+      uint64_t frames, uint32_t timestamp, int delay_ms, int64_t sampled_us,
+      int target_delay_ms = -1);
   std::string video_delivery_json(int64_t now_us, uint32_t source_timestamp = 0,
       uint64_t source_bytes = 0, bool source_timestamp_valid = false) const;
   void ResetVideoLossEvidence();
