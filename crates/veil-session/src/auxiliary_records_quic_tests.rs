@@ -27,6 +27,9 @@ fn data(byte: u8) -> veil_bufpool::PooledShared {
 }
 
 struct Stand {
+    // The fixture models a live node: its registration owner must outlive
+    // the runner, rather than disappear when construction returns.
+    _registry: crate::SessionTxRegistry,
     task: JoinHandle<()>,
     sender: crate::FrameSender,
     rpc: Arc<crate::SessionOutbox>,
@@ -125,6 +128,7 @@ impl Stand {
         let remote = ParallelSession::new(remote_offer, &[3; 32], &[2; 32], [1; 32], context, None);
         let task = tokio::spawn(async move { runner.run().await });
         Self {
+            _registry: registry,
             task,
             sender,
             rpc,
