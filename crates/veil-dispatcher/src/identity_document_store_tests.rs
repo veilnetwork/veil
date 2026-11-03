@@ -131,11 +131,13 @@ fn stored_revocation_revalidates_live_authorization_without_an_app_packet() {
         let dht = Arc::clone(&dispatcher.dht);
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&calls);
-        *dispatcher.peer_cert_revalidate.lock().unwrap() = Some(Arc::new(move |identity| {
-            assert_eq!(*identity, peer);
-            assert_eq!(dht.get_local(&key).as_deref(), Some(expected.as_slice()));
-            observed.fetch_add(1, Ordering::SeqCst);
-        }));
+        *dispatcher.peer_cert_revalidate.lock().unwrap() =
+            Some(Arc::new(move |identity, instance| {
+                assert!(instance.is_none());
+                assert_eq!(*identity, peer);
+                assert_eq!(dht.get_local(&key).as_deref(), Some(expected.as_slice()));
+                observed.fetch_add(1, Ordering::SeqCst);
+            }));
         store(&dispatcher, &doc, recursive, 1);
         assert_eq!(
             calls.load(Ordering::SeqCst),

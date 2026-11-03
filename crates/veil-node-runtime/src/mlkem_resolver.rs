@@ -586,6 +586,18 @@ impl DhtMlKemEkResolver {
         rlock!(self.peer_ratchet_keys).contains_key(peer)
     }
 
+    /// Called after refresh_local_document has applied the current floor. A
+    /// different sibling's key cannot suppress the named device's cache repair.
+    pub(crate) fn has_verified_sender_instance(
+        &self,
+        peer: &NodeIdBytes,
+        instance: &[u8; 16],
+    ) -> bool {
+        rlock!(self.peer_ratchet_keys)
+            .get(peer)
+            .is_some_and(|keys| keys.names_instance(instance, unix_now()))
+    }
+
     /// New resolver bound to a node's runtime components.  `step_timeout`
     /// applies to each of the three DHT walks individually — total budget
     /// is at most `3 × step_timeout`.

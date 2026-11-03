@@ -305,6 +305,11 @@ pub type PeerCertInvalidateFn = Arc<dyn Fn(&[u8; 32]) + Send + Sync>;
 /// a subsequent successful authenticated open.
 pub type PeerCertWarmFn = Arc<dyn Fn([u8; 32], [u8; 16]) + Send + Sync>;
 
+/// Apply current authorization and restore one named device's already verified
+/// local certificate before opening ciphertext. None is a document-only refresh;
+/// a claimed instance can select cache work, never authorize a key by itself.
+pub type PeerCertRevalidateFn = Arc<dyn Fn(&[u8; 32], Option<[u8; 16]>) + Send + Sync>;
+
 /// Signs a relayed "cannot open" reply to the peer named by the argument, or
 /// `None` when this node has no identity to sign with (or its own limit says
 /// not now). Installed by the runtime into
@@ -933,7 +938,7 @@ pub struct FrameDispatcher {
     pub peer_cert_invalidate: Arc<Mutex<Option<PeerCertInvalidateFn>>>,
     pub peer_cert_warm: Arc<Mutex<Option<PeerCertWarmFn>>>,
     /// Refresh learned local document changes before trusting cached sender evidence.
-    pub peer_cert_revalidate: Arc<Mutex<Option<PeerCertInvalidateFn>>>,
+    pub peer_cert_revalidate: Arc<Mutex<Option<PeerCertRevalidateFn>>>,
 
     /// When each peer was last told `AppSendUnopenable`. One reply per peer
     /// per [`UNOPENABLE_REPLY_INTERVAL`]: the frames a sender had in flight

@@ -136,13 +136,17 @@ impl FrameDispatcher {
     }
 
     pub(crate) fn revalidate_peer_certificate(&self, sender: &[u8; 32]) {
+        self.revalidate_peer_instance(sender, None);
+    }
+
+    pub(crate) fn revalidate_peer_instance(&self, sender: &[u8; 32], instance: Option<[u8; 16]>) {
         let check = self
             .peer_cert_revalidate
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         if let Some(check) = check {
-            check(sender);
+            check(sender, instance);
         }
     }
 
@@ -453,7 +457,10 @@ impl FrameDispatcher {
                     return DispatchResult::NoResponse;
                 };
                 let now_unix = veil_util::unix_secs_now_u64();
-                self.revalidate_peer_certificate(&sender);
+                self.revalidate_peer_instance(
+                    &sender,
+                    veil_e2e::payload_instances(&payload.data).map(|(instance, _)| instance),
+                );
                 match ratchet.open_payload(&sender, &payload.data, now_unix) {
                     Ok(opened) => {
                         // The session identifies its physical peer. A cached

@@ -2003,7 +2003,10 @@ impl FrameDispatcher {
                 }
             }
             let now_unix = veil_util::unix_secs_now_u64();
-            self.revalidate_peer_certificate(&ratchet_peer);
+            self.revalidate_peer_instance(
+                &ratchet_peer,
+                veil_e2e::payload_instances(&envelope.payload).map(|(instance, _)| instance),
+            );
             match ratchet.open_payload(&ratchet_peer, &envelope.payload, now_unix) {
                 Ok(opened) => {
                     // A newly linked sending device is not necessarily in our
@@ -4787,6 +4790,111 @@ mod ratchet_terminal_tests {
             None,
             "a proven AUTHOR is not a proven ROUTE"
         );
+    }
+
+    #[test]
+    fn a_cached_device_certificate_is_restored_before_the_first_direct_ratchet_open() {
+        cached_certificate_open(true);
+    }
+
+    #[test]
+    fn a_cached_device_certificate_is_restored_before_the_first_relay_ratchet_open() {
+        cached_certificate_open(false);
+    }
+
+    fn cached_certificate_open(direct: bool) {
+        const DEVICE: [u8; 32] = [0xAD; 32];
+        let (alice, bob) = (party(ALICE, 0xA3), party(BOB, 0xB3));
+        // Separate bounded caches: the verified certificate is still local,
+        // but its receive-key entry has been evicted. Model only that trusted
+        // cache's write-through, not authorization from the packet's claim.
+        assert!(rlock!(bob.runtime.peer_ratchet_keys).is_empty());
+        let (mut disp, _endpoint, mut rx) = dispatcher_for(&bob);
+        if direct {
+            use veil_proto::session::{AttachPayload, CapabilitiesPayload, IdentityPayload};
+            let mut sessions = veil_session::SessionRegistry::new();
+            sessions.insert(veil_session::SessionEntry {
+                session_id: [0x77; 32],
+                remote_node_id: DEVICE,
+                remote_identity: IdentityPayload {
+                    algo: 1,
+                    public_key: DEVICE.to_vec(),
+                    nonce: vec![],
+                    node_id: DEVICE,
+                    mlkem_pubkey: None,
+                },
+                remote_capabilities: CapabilitiesPayload {
+                    extra_flags2: 0,
+                    roles_supported: 1,
+                    flags: 0,
+                    extra_flags: 0,
+                    discovery_mode: 0,
+                },
+                remote_attach: AttachPayload {
+                    role: 3,
+                    realm_id: 0,
+                    attach_epoch: 1,
+                    mailbox_preference_count: 0,
+                    gateway_preference_count: 0,
+                    flags: 0,
+                },
+                remote_role: veil_session::RemoteRole::Core,
+                validated_sovereign_identity: Some(veil_identity::verify::ValidatedIdentity {
+                    node_id: ALICE,
+                    master_algo: 0,
+                    master_pubkey: vec![0xEE; 32],
+                    active_identity_pubkey: vec![0xFF; 32],
+                    active_identity_algo: 0,
+                    active_key_idx: 0,
+                    active_device_id: DEVICE,
+                    active_instance_id: alice.instance_id,
+                }),
+            });
+            disp.session_registry = Some(Arc::new(std::sync::Mutex::new(sessions)));
+        }
+        let keys = Arc::clone(&bob.runtime.peer_ratchet_keys);
+        let instance = alice.instance_id;
+        let key = alice.ring.current_ratchet_pk();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        *disp.peer_cert_revalidate.lock().unwrap() = Some(Arc::new(move |sender, named| {
+            seen.lock().unwrap().push(named);
+            if *sender == ALICE && named == Some(instance) {
+                wlock!(keys)
+                    .entry(ALICE)
+                    .or_default()
+                    .remember(instance, key, u64::MAX);
+            }
+        }));
+        let payload = seal(&alice, &bob, b"first verified frame");
+        let (header, body, hop) = if direct {
+            let body = veil_proto::app::AppSendPayload {
+                src_app_id: APP,
+                app_id: APP,
+                endpoint_id: ENDPOINT,
+                data: veil_bufpool::pooled_shared_from_vec(payload),
+            }
+            .encode();
+            let mut header = FrameHeader::new(
+                FrameFamily::App as u8,
+                veil_proto::family::AppMsg::AppSendSealed as u16,
+            );
+            header.body_len = body.len() as u32;
+            (header, body, DEVICE)
+        } else {
+            let (header, body) = forward_frame([0x15; 32], payload);
+            (header, body, RELAY)
+        };
+        disp.dispatch(&header, &body, NodeId::from(hop));
+        let (sender, provenance, data) = take(&mut rx).expect("first frame delivered");
+        assert_eq!(sender, ALICE);
+        assert_eq!(data, b"first verified frame");
+        assert_eq!(
+            provenance,
+            SenderProvenance::Signed,
+            "a verified local certificate must be applied before consuming the message key"
+        );
+        assert_eq!(*calls.lock().unwrap(), vec![Some(instance)]);
     }
 
     /// The flag is load-bearing, not decorative: with the sender's certificate

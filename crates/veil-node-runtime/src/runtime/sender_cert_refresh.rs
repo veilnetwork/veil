@@ -50,11 +50,24 @@ impl Budget {
 pub(super) fn revalidator(
     resolver: Arc<crate::mlkem_resolver::DhtMlKemEkResolver>,
     runtime: tokio::runtime::Handle,
-) -> veil_dispatcher::PeerCertInvalidateFn {
+) -> veil_dispatcher::PeerCertRevalidateFn {
     let budget = Arc::new(Mutex::new(Budget::default()));
     let slots = Arc::new(tokio::sync::Semaphore::new(4));
-    Arc::new(move |peer| {
+    Arc::new(move |peer, instance| {
         resolver.refresh_local_document(*peer);
+        if let Some(instance) = instance
+            && !resolver.has_verified_sender_instance(peer, &instance)
+        {
+            // The certificate cache and receive-key cache are bounded
+            // independently. Restore an exact, current local certificate
+            // BEFORE open consumes the message key; never await a DHT walk or
+            // trust the header's instance without normal certificate checks.
+            let _ = veil_types::MlKemEkResolver::resolve_cert_for_instance_cached(
+                resolver.as_ref(),
+                *peer,
+                instance,
+            );
+        }
         if !resolver.has_verified_sender(peer) {
             return;
         }
