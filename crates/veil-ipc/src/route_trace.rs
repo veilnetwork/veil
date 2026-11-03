@@ -10,6 +10,55 @@ use std::time::{Duration, Instant};
 
 static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
 static NEXT_OPERATION: AtomicU64 = AtomicU64::new(1);
+static SMALL_SEND_DROPS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Default)]
+struct SmallSendBudget {
+    window: Option<Instant>,
+    used: u16,
+}
+
+impl SmallSendBudget {
+    fn admit(&mut self, now: Instant) -> bool {
+        if self
+            .window
+            .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(1))
+        {
+            self.window = Some(now);
+            self.used = 0;
+        }
+        if self.used >= 128 {
+            return false;
+        }
+        self.used += 1;
+        true
+    }
+}
+
+static SMALL_SEND_BUDGET: Mutex<SmallSendBudget> = Mutex::new(SmallSendBudget {
+    window: None,
+    used: 0,
+});
+
+/// Opt-in ordinary local-send metadata only. Bound the extra fast records;
+/// existing slow/family observations keep their independent policies.
+pub(crate) fn sample_small_send(bytes: usize) -> bool {
+    if bytes > 4096 || !is_enabled() {
+        return false;
+    }
+    let admitted = SMALL_SEND_BUDGET
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .admit(Instant::now());
+    if !admitted {
+        SMALL_SEND_DROPS.fetch_add(1, Ordering::Relaxed);
+    }
+    admitted
+}
+
+pub(crate) fn small_send_drops() -> u64 {
+    SMALL_SEND_DROPS.load(Ordering::Relaxed)
+}
 tokio::task_local! {
     static OPERATION: u64;
 }
@@ -380,6 +429,26 @@ pub(crate) fn observe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_fast_send_samples_are_bounded_and_do_not_bank_idle_credit() {
+        let start = Instant::now();
+        let mut budget = SmallSendBudget::default();
+        for _ in 0..128 {
+            assert!(budget.admit(start));
+        }
+        for _ in 0..1000 {
+            assert!(!budget.admit(start + Duration::from_millis(999)));
+        }
+        // A long idle period buys one new bounded window, not accumulated
+        // credit which could flood the diagnostic sink on reconnect.
+        let later = start + Duration::from_secs(60);
+        for _ in 0..128 {
+            assert!(budget.admit(later));
+        }
+        assert!(!budget.admit(later));
+        assert!(!budget.admit(start));
+    }
 
     #[tokio::test]
     async fn operation_ids_follow_scoped_futures_without_cross_task_leakage() {

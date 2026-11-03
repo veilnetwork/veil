@@ -1349,6 +1349,15 @@ struct SendTiming {
     seal_ms: std::cell::Cell<u128>,
     path: std::cell::Cell<&'static str>,
     family: std::cell::Cell<FamilySendTiming>,
+    bytes: std::cell::Cell<usize>,
+    small_trace: std::cell::Cell<bool>,
+    direct_ms: std::cell::Cell<u128>,
+    direct_status: std::cell::Cell<&'static str>,
+    fallback_key_ms: std::cell::Cell<u128>,
+    fallback_key_status: std::cell::Cell<&'static str>,
+    relay_lookup_ms: std::cell::Cell<u128>,
+    relay_admission_started: std::cell::Cell<Option<std::time::Instant>>,
+    relay_status: std::cell::Cell<&'static str>,
 }
 
 impl SendTiming {
@@ -1361,6 +1370,15 @@ impl SendTiming {
             seal_ms: std::cell::Cell::new(0),
             path: std::cell::Cell::new("unknown"),
             family: std::cell::Cell::new(FamilySendTiming::default()),
+            bytes: std::cell::Cell::new(0),
+            small_trace: std::cell::Cell::new(false),
+            direct_ms: std::cell::Cell::new(0),
+            direct_status: std::cell::Cell::new("not_attempted"),
+            fallback_key_ms: std::cell::Cell::new(0),
+            fallback_key_status: std::cell::Cell::new("not_attempted"),
+            relay_lookup_ms: std::cell::Cell::new(0),
+            relay_admission_started: std::cell::Cell::new(None),
+            relay_status: std::cell::Cell::new("not_attempted"),
         }
     }
 }
@@ -1369,7 +1387,18 @@ impl Drop for SendTiming {
     fn drop(&mut self) {
         let total = self.started.elapsed().as_millis();
         let family = self.family.get();
-        if total >= 1_000 || (crate::route_trace::is_enabled() && family.certificates > 0) {
+        if total >= 1_000
+            || (crate::route_trace::is_enabled() && family.certificates > 0)
+            || (self.small_trace.get() && crate::route_trace::sample_small_send(self.bytes.get()))
+        {
+            let at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let relay_admission_ms = self
+                .relay_admission_started
+                .get()
+                .map_or(0, |at| at.elapsed().as_millis());
             let (event, level) = if total >= 1_000 {
                 ("ipc.send_slow", log::Level::Warn)
             } else {
@@ -1386,8 +1415,8 @@ impl Drop for SendTiming {
             };
             log::log!(
                 level,
-                "{event} at={} dst={} total_ms={total} plan_ms={} seal_ms={} path={} family_resolve_ms={} family_seal_ms={} family_admission_ms={} family_certificates={} family_evidence={:?}{correlation}",
-                veil_util::unix_secs_now_u64(),
+                "{event} at={} dst={} total_ms={total} plan_ms={} seal_ms={} path={} family_resolve_ms={} family_seal_ms={} family_admission_ms={} family_certificates={} family_evidence={:?} at_ms={at_ms} bytes={} direct_admission_ms={} direct_status={} fallback_key_ms={} fallback_key_status={} relay_lookup_ms={} relay_admission_ms={relay_admission_ms} relay_status={} trace_drops={}{correlation}",
+                at_ms / 1000,
                 veil_util::bytes_to_hex(&self.dst.get()),
                 self.plan_ms.get(),
                 self.seal_ms.get(),
@@ -1397,6 +1426,14 @@ impl Drop for SendTiming {
                 family.admission_ms,
                 family.certificates,
                 family.evidence,
+                self.bytes.get(),
+                self.direct_ms.get(),
+                self.direct_status.get(),
+                self.fallback_key_ms.get(),
+                self.fallback_key_status.get(),
+                self.relay_lookup_ms.get(),
+                self.relay_status.get(),
+                crate::route_trace::small_send_drops(),
             );
         }
     }
@@ -1464,6 +1501,7 @@ async fn handle_ipc_send_inner(
         Ok(s) => s,
         Err(_) => return Ok(()), // drop malformed
     };
+    timing.bytes.set(send.data.len());
 
     if short_control
         && (!relay_media_sealed
@@ -1674,6 +1712,7 @@ async fn handle_ipc_send_inner(
     timing
         .dst
         .set(send.dst_node_id[..4].try_into().unwrap_or([0; 4]));
+    timing.small_trace.set(!relay_realtime);
     let plan_started = std::time::Instant::now();
     let mut planned: Option<PlannedRelay> = None;
     if ratchet_ok
@@ -2111,6 +2150,7 @@ async fn handle_ipc_send_inner(
         // one link. The relay path was E2E-sealed and this one was not, which
         // is the opposite of where the traffic is.
         let mut direct_admission_failed = false;
+        let direct_started = std::time::Instant::now();
         let sent = if !relay_realtime
             && let Some((payload, _, _)) = &sealed
             && payload.len() > source_segment_bytes(reg, payload.len())
@@ -2198,6 +2238,14 @@ async fn handle_ipc_send_inner(
                     app_send_frame(&send, sealed.as_ref().map(|(p, _, _)| p.as_slice())),
                 )
         };
+        timing.direct_ms.set(direct_started.elapsed().as_millis());
+        timing.direct_status.set(if sent {
+            "accepted"
+        } else if direct_admission_failed {
+            "rejected"
+        } else {
+            "miss"
+        });
         if direct_admission_failed {
             // Queue pressure is not a broken route. Never inject the original
             // large frame or another full copy after a source admission timeout.
@@ -2233,6 +2281,7 @@ async fn handle_ipc_send_inner(
                 // NO_E2E_KEY, never plaintext. Only the no-E2E-infrastructure
                 // node would relay in the clear, and it gets no fallback.
                 let will_seal = sealed.is_some() || relay_media_sealed || peer_mlkem_keys.is_some();
+                let lookup_started = std::time::Instant::now();
                 let discovered = try_lookup_or_discover(
                     &send.dst_node_id,
                     local_node_id,
@@ -2243,6 +2292,9 @@ async fn handle_ipc_send_inner(
                     ctx.pending_recursive.as_deref(),
                 )
                 .await;
+                timing
+                    .relay_lookup_ms
+                    .set(lookup_started.elapsed().as_millis());
                 ordinary_relay_hops(discovered, &send.dst_node_id, route_cache, reg, will_seal)
             };
             let source_lane =
@@ -2316,6 +2368,7 @@ async fn handle_ipc_send_inner(
                     // packet can fit one hop-level QUIC DATAGRAM.
                     (*send.data).to_vec()
                 } else if let Some(keys) = peer_mlkem_keys {
+                    let key_started = std::time::Instant::now();
                     // Only while its owner still vouches for it; an expired
                     // one is a miss, and a miss walks the DHT for a current
                     // certificate (report20 V18-M12).
@@ -2323,6 +2376,11 @@ async fn handle_ipc_send_inner(
                     let mut recipient_ek = rlock!(keys)
                         .get(&send.dst_node_id)
                         .and_then(|(key, _)| key.usable_at(now_unix).map(<[u8]>::to_vec));
+                    timing.fallback_key_status.set(if recipient_ek.is_some() {
+                        "cached"
+                    } else {
+                        "missing"
+                    });
 
                     // Epic 486.1 slice 3 (audit batch 2026-05-23): cold-start
                     // cache miss → attempt DHT-based EK resolution.  The
@@ -2335,6 +2393,7 @@ async fn handle_ipc_send_inner(
                     if recipient_ek.is_none()
                         && let Some(resolver) = ctx.mlkem_ek_resolver.as_deref()
                     {
+                        timing.fallback_key_status.set("resolving");
                         // Call control cannot sit behind the resolver's three
                         // multi-replica DHT freshness rounds (up to 9 s after
                         // every node restart). Its compatibility relay copy is
@@ -2348,7 +2407,15 @@ async fn handle_ipc_send_inner(
                         } else {
                             resolver.resolve_ek(send.dst_node_id).await
                         };
+                        timing.fallback_key_status.set(if recipient_ek.is_some() {
+                            "resolved"
+                        } else {
+                            "missing"
+                        });
                     }
+                    timing
+                        .fallback_key_ms
+                        .set(key_started.elapsed().as_millis());
 
                     if let Some(ek) = recipient_ek {
                         if send.anonymous {
@@ -2502,6 +2569,12 @@ async fn handle_ipc_send_inner(
                     trace_id,
                     require_ack: send.require_ack,
                 };
+                // This is the final source stage, so Drop also records early
+                // admission errors/timeouts without borrowing a Cell across await.
+                timing
+                    .relay_admission_started
+                    .set(Some(std::time::Instant::now()));
+                timing.relay_status.set("pending");
                 // Oversized payload → relay-preserving chunking. Split the
                 // (already-E2E) payload into small endpoint-owned pieces, each
                 // carried in its OWN relayable `DeliveryEnvelope` (same addressing
@@ -2527,6 +2600,7 @@ async fn handle_ipc_send_inner(
                     let orig_content_id = envelope.content_id;
                     let Some(chunks) = EnvelopeChunks::new(&envelope, want_ack, segment_size)
                     else {
+                        timing.relay_status.set("invalid");
                         return app_send_error(sink, ipc_send_err::NO_ROUTE).await;
                     };
                     let hops_to_try = forced_relay_hops.clone();
@@ -2543,6 +2617,7 @@ async fn handle_ipc_send_inner(
                     let admission_deadline = tokio::time::Instant::now()
                         + std::time::Duration::from_secs(remaining_secs);
                     if !relay_realtime && remaining_secs == 0 {
+                        timing.relay_status.set("expired");
                         return app_send_error(sink, ipc_send_err::NO_ROUTE).await;
                     }
                     for next_hop in &hops_to_try {
@@ -2567,6 +2642,7 @@ async fn handle_ipc_send_inner(
                         let all_ok = admitted.as_ref().is_ok_and(|accepted| *accepted);
                         if all_ok {
                             delivered = true;
+                            timing.relay_status.set("accepted");
                             if want_ack && let Some(tracker) = ctx.pending_ack.as_deref() {
                                 let _ = lock!(tracker).register_batch(
                                     orig_content_id,
@@ -2580,6 +2656,7 @@ async fn handle_ipc_send_inner(
                             break;
                         }
                         if admitted.is_err() {
+                            timing.relay_status.set("timeout");
                             // A slow source queue is not evidence of a dead hop.
                             // Do not spray another full copy after the deadline.
                             return app_send_error(sink, ipc_send_err::NO_ROUTE).await;
@@ -2599,6 +2676,7 @@ async fn handle_ipc_send_inner(
                         }
                         return Ok(());
                     }
+                    timing.relay_status.set("refused");
                     if let Some(cache) = route_cache {
                         wlock!(cache).invalidate(&send.dst_node_id);
                     }
@@ -2722,6 +2800,11 @@ async fn handle_ipc_send_inner(
                         ),
                         None => reg.send_to(&next_hop, source_lane, fwd_frame.clone()),
                     });
+                    if relayed {
+                        timing.relay_status.set("accepted");
+                    } else if timing.relay_status.get() != "accepted" {
+                        timing.relay_status.set("refused");
+                    }
                     if relay_media_sealed {
                         if relayed {
                             crate::route_trace::sealed_relay_hop_sample(
