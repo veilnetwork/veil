@@ -542,8 +542,9 @@ RtcpFeedbackSnapshot VeilTransportShim::video_feedback() const {
 }
 
 void VeilTransportShim::SetLocalVideoDelivery(uint32_t remote, uint64_t bytes,
-    uint64_t frames, uint32_t timestamp, int delay, int64_t sampled) {
-  if (!remote || delay < 0 || delay > 60000 || sampled <= 0) return;
+    uint64_t frames, uint32_t timestamp, int delay, int64_t sampled, int target) {
+  if (!remote || delay < 0 || delay > 60000 || sampled <= 0 ||
+      target < -1 || target > 60000) return;
   bool send = false;
   {
     std::lock_guard lock(audio_feedback_mu_);
@@ -551,7 +552,8 @@ void VeilTransportShim::SetLocalVideoDelivery(uint32_t remote, uint64_t bytes,
     const uint64_t origin = !old.origin || old.target_ssrc != remote ||
         bytes < old.bytes || frames < old.frames ? sampled : old.origin;
     local_video_delivery_ = {remote, origin, uint64_t(sampled), bytes, frames,
-                              timestamp, uint32_t(delay)};
+                              timestamp, uint32_t(delay), target < 0 ? std::nullopt :
+                                  std::optional<uint32_t>(target)};
     // A bounded receiver report avoids waiting several seconds for the
     // ordinary RTCP timer at the one-fps startup floor. No padding/probe data.
     if (frames && sampled - video_delivery_sent_us_ >= 950'000 &&
@@ -731,7 +733,8 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
       if (!report.Parse(header)) return;
       observe(report.report_blocks());
     } else if (header.type() == 204 && header.payload_size_bytes() >= 8 &&
-               read_be32(header.payload() + 4) == kVideoDeliveryAppName) {
+               (read_be32(header.payload() + 4) == kVideoDeliveryAppName ||
+                read_be32(header.payload() + 4) == kVideoDeliveryTargetAppName)) {
       if (delivery) return;
       delivery = DecodeVideoDelivery(
           {header.payload(), header.payload_size_bytes()}, header.count());
