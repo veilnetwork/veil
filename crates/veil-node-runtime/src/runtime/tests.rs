@@ -25,6 +25,195 @@ use super::peer_handshake::{
 use super::uri_helpers::{uri_has_port_zero, uri_scheme};
 use super::*;
 
+/// Keep the old admission alive after its client disappears, as a relay does
+/// until its reader/reaper notices a mobile handover. No runner/idle timeout
+/// is involved: admission itself must distinguish the resumed predecessor
+/// from a newer session which the old ticket has no right to replace.
+async fn unknown_leaf_resume_fixture(newer_owner: bool, resume: bool) {
+    use veil_proto::session::ClientTicketEntry;
+    use veil_session::handshake::OvlHandshakeResult;
+
+    async fn connect(
+        runtime: &NodeRuntime,
+        identity: &HandshakeIdentity,
+        ticket: Option<ClientTicketEntry>,
+    ) -> (
+        Result<Option<AttachedDebugSession>>,
+        OvlHandshakeResult,
+        BoxIoStream,
+    ) {
+        let registry = TransportRegistry::with_defaults();
+        let ctx = Arc::new(TransportContext::for_debug().unwrap());
+        let listener = registry
+            .bind(
+                &TransportUri::parse("tcp://127.0.0.1:0").unwrap(),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        let uri = TransportUri::parse(&format!("tcp://{}", listener.local_addr())).unwrap();
+        let (client, server) = tokio::join!(registry.connect(&uri, ctx), listener.accept());
+        let mut client = client.unwrap().into_stream().unwrap();
+        let (accepted, result) = timeout(Duration::from_secs(12), async {
+            tokio::join!(
+                peer_handshake::register_connection_session(
+                    runtime.access().make_session_context(),
+                    SessionSource::Inbound(ListenId::new(1)),
+                    None,
+                    None,
+                    SessionState::Active,
+                    server.unwrap(),
+                    false,
+                ),
+                perform_ovl1_handshake(
+                    &mut client,
+                    identity,
+                    veil_cfg::NodeRole::Leaf,
+                    veil_cfg::DiscoveryMode::IntroductionOnly,
+                    None,
+                    None,
+                    None,
+                    Some([0; 32]),
+                    ticket,
+                    None,
+                    None,
+                    &[],
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+        })
+        .await
+        .expect("real handshake fixture must terminate");
+        (accepted, result.unwrap(), client)
+    }
+
+    // The ordinary runtime fixture and test_handshake_identity share a cached
+    // key. A real resumption requires two distinct nodes for directional KDF.
+    static CLIENT: std::sync::OnceLock<HandshakeIdentity> = std::sync::OnceLock::new();
+    let identity = CLIENT.get_or_init(|| {
+        let cfg = veil_cfg::identity_ops::IdentityUseCases::new(
+            veil_cfg::identity_ops::IdentityPowParams {
+                difficulty: veil_crypto::DEFAULT_POW_DIFFICULTY,
+                timeout: Duration::from_secs(300),
+                threads: veil_crypto::available_thread_count(),
+            },
+        )
+        .provision(SignatureAlgorithm::Ed25519, None)
+        .unwrap();
+        HandshakeIdentity {
+            algo: cfg.algo,
+            node_id: NodeId::from_public_key(cfg.algo, &cfg.public_key).unwrap(),
+            public_key: cfg.public_key,
+            private_key: cfg.private_key,
+            nonce: cfg.nonce,
+        }
+    });
+    let mut config = runtime_config_with_listen();
+    config.peers.clear();
+    config.bootstrap_peers.clear();
+    config.listen.clear();
+    config.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+    config.pex.enabled = false;
+    config.identity.as_mut().unwrap().lazy_mining = false;
+    let path = save_test_config("unknown-leaf-resume", config).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.unwrap();
+    let (old, client_keys, client) = connect(&runtime, identity, None).await;
+    let old = old.unwrap().unwrap();
+    let peer = *old.peer_id.as_bytes();
+    let services = runtime.access();
+    assert!(services.state.lock().unwrap().peers.is_empty());
+    let ticket = ClientTicketEntry {
+        blob: services
+            .resumption
+            .ticket_issuer
+            .lock()
+            .unwrap()
+            .issue_for_instance(
+                old.session_keys.session_id,
+                peer,
+                [0; 16],
+                old.session_keys.tx_key,
+                old.session_keys.rx_key,
+            ),
+        tx_key: client_keys.session_keys.tx_key,
+        rx_key: client_keys.session_keys.rx_key,
+        session_id: client_keys.session_keys.session_id,
+        peer_public_key: client_keys.public_key,
+        peer_nonce: client_keys.nonce,
+        issued_at: std::time::Instant::now(),
+    };
+    drop(client); // The relay-side old admission deliberately remains open.
+    let successor_rx = newer_owner.then(|| {
+        services
+            .session_tx_registry
+            .write()
+            .unwrap()
+            .register_owned(peer, [0xAA; 32])
+    });
+    let before = services
+        .session_tx_registry
+        .read()
+        .unwrap()
+        .live_registration(&peer);
+    let (next, _, client) = connect(&runtime, identity, resume.then_some(ticket)).await;
+    let admitted = matches!(&next, Ok(Some(_)));
+    let after = services
+        .session_tx_registry
+        .read()
+        .unwrap()
+        .live_registration(&peer);
+    drop(old); // Late predecessor teardown must leave the successor intact.
+    let survived = services
+        .session_tx_registry
+        .read()
+        .unwrap()
+        .has_session(&peer);
+    drop(next);
+    drop(client);
+    drop(successor_rx);
+    runtime.stop().await.unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+    if resume && !newer_owner {
+        assert!(
+            admitted,
+            "authenticated leaf resumption was rejected by its own stale predecessor"
+        );
+        assert_ne!(
+            before, after,
+            "resumption did not replace the old TX registration"
+        );
+        assert!(survived, "late old guard removed the resumed registration");
+    } else {
+        assert!(
+            !admitted,
+            "a fresh handshake or obsolete ticket displaced a live session"
+        );
+        assert_eq!(before, after, "rejected reconnect changed TX registration");
+        if newer_owner {
+            assert!(survived, "old guard removed a newer owner");
+        }
+    }
+}
+
+#[tokio::test]
+async fn unknown_leaf_resumption_replaces_only_its_predecessor() {
+    unknown_leaf_resume_fixture(false, true).await;
+}
+
+#[tokio::test]
+async fn unknown_leaf_old_ticket_cannot_replace_a_newer_owner() {
+    unknown_leaf_resume_fixture(true, true).await;
+}
+
+#[tokio::test]
+async fn unknown_leaf_full_handshake_cannot_replace_a_live_session() {
+    unknown_leaf_resume_fixture(false, false).await;
+}
+
 /// A retained transport witness models the handles held by generic siblings.
 /// Cancelling the canonical handshake must retire the connection explicitly,
 /// rather than waiting for all clones or QUIC's idle timeout to go away.

@@ -39,8 +39,9 @@ use veil_routing::VivaldiCoord;
 use veil_session::handshake::{OvlHandshakeResult, SovereignHandshakeCtx, perform_ovl1_handshake};
 use veil_transport::{TransportConnection, TransportContext};
 
-use veil_cfg::{DiscoveryMode, NodeId};
+use veil_cfg::{DiscoveryMode, NodeId, NodeRole};
 use veil_crypto::session_kdf::SessionKeys;
+use veil_session::RemoteRole;
 
 use super::ip_slot::{IpSlotGuard, check_and_reserve_ip_slot};
 use super::uri_helpers::{uri_has_port_zero, uri_scheme};
@@ -642,7 +643,7 @@ pub async fn register_connection_session(
     // `pending_peer_state` is derived during the handshake but published —
     // per-peer caches and the `session_registry` entry alike — only after the
     // accept gates pass (audit cycle-9 CRIT-6, and the caches likewise).
-    let (remote_identity, pending_peer_state): (RemoteHandshakeInfo, PendingPeerState) = {
+    let (remote_identity, pending_peer_state, authenticated_resume_parent) = {
         let role = runtime.dispatcher.role;
         let mlkem_ek_bytes: Vec<u8> = runtime.identity.mlkem_keys.current_ek().to_vec();
         let capture_tx = Arc::clone(&runtime.dispatcher.capture_tx);
@@ -981,6 +982,7 @@ pub async fn register_connection_session(
                         shared_udp_reflectors,
                     },
                     pending_peer_state,
+                    r.authenticated_resume_parent,
                 )
             }
             Err(err) => {
@@ -1364,13 +1366,30 @@ pub async fn register_connection_session(
                 .session_tx_registry
                 .write()
                 .unwrap_or_else(|p| p.into_inner());
-            let evicted_open = evict_stale_on_dedup && reg.has_session(&remote_nid);
+            // A one-sided mobile Leaf is normally absent from a Core's dial
+            // rows. Its old half-open link used to reject even an authenticated
+            // resume until the reaper noticed it. The verified ticket may
+            // replace ONLY its exact predecessor, not whichever session happens
+            // to own the peer now. Scope this independently of learned-peer
+            // eviction: mesh/scheduled rows and plain unknown handshakes keep
+            // their existing first-wins policy.
+            let resumed_predecessor = !new_is_outbound
+                && unknown_leaf_resume_may_replace(
+                    runtime.dispatcher.role,
+                    pending_peer_state.entry.remote_role,
+                    matched_source,
+                )
+                && authenticated_resume_parent
+                    .as_ref()
+                    .is_some_and(|parent| reg.owns_live_session(&remote_nid, parent));
+            let evict_open = evict_stale_on_dedup || resumed_predecessor;
+            let evicted_open = evict_open && reg.has_session(&remote_nid);
             let rx = reg.try_register_directional(
                 remote_nid,
                 &local_nid,
                 new_is_outbound,
                 bypass_directional,
-                evict_stale_on_dedup,
+                evict_open,
                 session_owner,
             );
             if rx.is_some() {
@@ -1384,13 +1403,20 @@ pub async fn register_connection_session(
                 );
             }
             if evicted_open && rx.is_some() {
+                let (event, reason) = if resumed_predecessor {
+                    (
+                        "session.resume_replace",
+                        "authenticated leaf resume replaced its exact predecessor",
+                    )
+                } else {
+                    (
+                        "session.reconnect_evict",
+                        "learned inbound reconnect evicted a stale session's tx (fast M5-zombie clear)",
+                    )
+                };
                 runtime.logger.info(
-                    "session.reconnect_evict",
-                    format!(
-                        "node_id={} — learned inbound reconnect evicted a stale \
-                         session's tx (fast M5-zombie clear)",
-                        veil_util::hex_short(&remote_nid),
-                    ),
+                    event,
+                    format!("node_id={} — {reason}", veil_util::hex_short(&remote_nid),),
                 );
             }
             rx
@@ -1930,6 +1956,20 @@ pub fn inbound_may_replace_live_session(matched_source: Option<PeerSource>) -> b
     }
 }
 
+/// Only a no-row Leaf returning to a Core may use ticket-bound predecessor
+/// replacement. Possession and exact TX ownership are checked separately at
+/// admission under one write lock; this classifier grants nothing on its own.
+fn unknown_leaf_resume_may_replace(
+    local_role: NodeRole,
+    remote_role: RemoteRole,
+    matched_source: Option<PeerSource>,
+) -> bool {
+    matches!(
+        (local_role, remote_role, matched_source),
+        (NodeRole::Core, RemoteRole::Leaf, None)
+    )
+}
+
 /// Whether an outbound dial to this row carries an expectation about who will
 /// answer.
 ///
@@ -2145,8 +2185,47 @@ mod who_writes_first_tests {
 
 #[cfg(test)]
 mod live_session_eviction_tests {
-    use super::{inbound_bypasses_directional, inbound_may_replace_live_session};
+    use super::{
+        inbound_bypasses_directional, inbound_may_replace_live_session,
+        unknown_leaf_resume_may_replace,
+    };
     use crate::types::PeerSource;
+
+    #[test]
+    fn ticket_predecessor_replacement_is_only_for_a_no_row_leaf_at_a_core() {
+        use veil_cfg::NodeRole;
+        use veil_session::RemoteRole;
+        assert!(unknown_leaf_resume_may_replace(
+            NodeRole::Core,
+            RemoteRole::Leaf,
+            None
+        ));
+        assert!(!unknown_leaf_resume_may_replace(
+            NodeRole::Leaf,
+            RemoteRole::Leaf,
+            None
+        ));
+        assert!(!unknown_leaf_resume_may_replace(
+            NodeRole::Core,
+            RemoteRole::Core,
+            None
+        ));
+        for source in [
+            PeerSource::Configured,
+            PeerSource::Bootstrap,
+            PeerSource::Exchanged,
+            PeerSource::Autodiscovered,
+            PeerSource::Lan,
+            PeerSource::Rendezvous,
+            PeerSource::PinnedRelay,
+        ] {
+            assert!(!unknown_leaf_resume_may_replace(
+                NodeRole::Core,
+                RemoteRole::Leaf,
+                Some(source)
+            ));
+        }
+    }
 
     #[test]
     fn arriving_on_a_schedule_does_not_end_a_session_we_are_holding() {

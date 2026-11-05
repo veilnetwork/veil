@@ -171,6 +171,7 @@ async fn upgraded_client_and_server_keep_legacy_resume_fallback() {
         assert_eq!(new.session_keys.tx_key, old.rx_key);
         assert_eq!(new.session_keys.rx_key, old.tx_key);
         assert!(!new.remote_caps_stated);
+        assert!(new.authenticated_resume_parent.is_none());
         assert!(!new.remote_capabilities.supports_circuit_datagrams());
         assert!(!new.remote_capabilities.supports_parallel_quic());
         assert!(!new.remote_capabilities.supports_direct_app_chunks());

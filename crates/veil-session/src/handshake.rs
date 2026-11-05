@@ -254,6 +254,12 @@ pub struct OvlHandshakeResult {
     /// carried the instance, or one for a peer that never proved a sovereign
     /// identity. It means "unspecified", never "device zero".
     pub resumed_peer_instance_id: Option<[u8; 16]>,
+    /// Server-side predecessor named by our verified resumption ticket, only
+    /// after the peer also proved possession of the freshly derived keys in
+    /// its authenticated ATTACH metadata. Merely presenting an opaque ticket
+    /// (legacy fast resume) is not evidence for replacing an existing session.
+    /// Never populated by a full handshake or by the client side of resume.
+    pub authenticated_resume_parent: Option<[u8; 32]>,
 }
 
 /// Maximum frame body size accepted during the handshake phase (before the peer
@@ -725,6 +731,8 @@ where
                         // a resumption; the runtime resolves the binding for
                         // exactly this (identity, instance) pair.
                         resumed_peer_instance_id: Some(ticket.peer_instance_id),
+                        authenticated_resume_parent: remote_caps_stated
+                            .then_some(ticket.session_id),
                     });
                 }
                 // peer_id mismatch → fall through to full handshake.
@@ -875,6 +883,7 @@ where
                     // here. The runtime falls back to the peer's binding only
                     // when that peer has exactly one known device.
                     resumed_peer_instance_id: None,
+                    authenticated_resume_parent: None,
                 });
             }
             Ok(SessionMsg::Identity) => {
@@ -1841,6 +1850,7 @@ where
         // The full path proved the peer's device outright; nothing was
         // inherited from a ticket.
         resumed_peer_instance_id: None,
+        authenticated_resume_parent: None,
     })
 }
 
@@ -3021,7 +3031,7 @@ mod tests {
     /// 1. Full handshake between server (with TicketIssuer) and client.
     /// 2. Server sends SESSION_TICKET to client (simulated by direct call).
     /// 3. Client reconnects presenting the ticket → fast-path accepted.
-    /// 4. Verify the resumed session produces the same session_id as the ticket.
+    /// 4. Verify fresh keys and a fresh connection id agree across both sides.
     #[tokio::test]
     async fn session_resumption_fast_path_succeeds() {
         use crate::ticket::{TicketIssuer, TicketKey};
@@ -3241,9 +3251,9 @@ mod tests {
             "server rx must equal client tx on the resumed session"
         );
 
-        // session_id is carried through unchanged (identifier, not cipher input).
-        assert_eq!(srv2.session_keys.session_id, srv_session_id);
-        assert_eq!(cli2.session_keys.session_id, entry.session_id);
+        // A new runner must not inherit its predecessor's registry lifetime.
+        assert_ne!(srv2.session_keys.session_id, srv_session_id);
+        assert_ne!(cli2.session_keys.session_id, entry.session_id);
         assert_eq!(
             srv2.session_keys.session_id, cli2.session_keys.session_id,
             "resumed session_id must match on both sides"
@@ -3259,6 +3269,8 @@ mod tests {
             Some(PEER_INSTANCE),
             "the responder must recover the peer's device from the ticket"
         );
+        assert_eq!(srv2.authenticated_resume_parent, Some(srv_session_id));
+        assert!(cli2.authenticated_resume_parent.is_none());
         assert!(
             cli2.resumed_peer_instance_id.is_none(),
             "the initiator's ticket names IT to the responder, not the responder to it"

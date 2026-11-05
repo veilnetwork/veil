@@ -15,6 +15,13 @@ is expensive: it re-runs the PoW-bound identity exchange, the key exchange
 IDs, its peer aliases, and any outstanding rekey state. Hot-standby avoids all
 of that.
 
+Ticket fast resumption is different from this handover: it creates a new runner
+with fresh keys and a fresh connection `session_id`, bound to the predecessor
+and both resume nonces. Reusing the predecessor's identifier would let its late
+teardown remove the new runner's registrations. Peers must use the updated
+resume-ID derivation together; preserving old-version resume compatibility is
+not part of this rollout. `HandoffAttach` still preserves the live runner's ID.
+
 ---
 
 ## Status
