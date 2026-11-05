@@ -601,36 +601,15 @@ impl NodeRuntime {
             // drops the dial (peer stays registered; dialed later) rather than
             // accumulating unboundedly.
             const BOOTSTRAP_JOIN_DIAL_QUEUE: usize = 128;
-            let (dial_tx, mut dial_rx) = tokio::sync::mpsc::channel::<crate::types::PeerConfigEntry>(
+            let (dial_tx, dial_rx) = tokio::sync::mpsc::channel::<crate::types::PeerConfigEntry>(
                 BOOTSTRAP_JOIN_DIAL_QUEUE,
             );
             if let Some(shutdown_tx) = &self.shutdown_tx {
-                let dial_access = self.access();
-                let dial_shutdown_tx = shutdown_tx.clone();
-                let mut dial_shutdown_rx = shutdown_tx.subscribe();
-                let dial_handle = tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            _ = dial_shutdown_rx.changed() => break,
-                            recv = dial_rx.recv() => match recv {
-                                Some(entry) => {
-                                    dial_access.spawn_owned_outbound_peers(
-                                        vec![entry], &dial_shutdown_tx,
-                                    );
-                                    // A repeat join for an already-claimed peer
-                                    // no-ops in spawn_outbound_peers (per-node-id
-                                    // slot), but the live reconnect loop may be
-                                    // mid 30-s sleep while the entry's transport
-                                    // was just refreshed (P2P endpoint exchange /
-                                    // network change). Kick it awake so the new
-                                    // address is dialed now, not up to 30 s later.
-                                    dial_access.force_reconnect_notify.notify_waiters();
-                                }
-                                None => break, // forwarder dropped → no more joins
-                            },
-                        }
-                    }
-                });
+                let dial_handle = crate::bootstrap_join::spawn_dial_drain(
+                    self.access(),
+                    shutdown_tx.clone(),
+                    dial_rx,
+                );
                 super::push_session_handle(&self.tasks, dial_handle);
             }
             Arc::new(crate::bootstrap_join::BootstrapJoinForwarder::new(

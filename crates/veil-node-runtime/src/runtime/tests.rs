@@ -901,6 +901,216 @@ async fn duplicate_peer_hint_preserves_pending_dial_until_target_changes() {
     );
 }
 
+/// Exercise the same drain as IPC with a dial that remains pending until
+/// cancelled. Paused-clock timeouts are deadlock guards, not speed thresholds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BootstrapJoinDialCase {
+    NewSibling,
+    Identical,
+    IdleRetry,
+}
+
+async fn bootstrap_join_preserves_pending_dial_fixture(case: BootstrapJoinDialCase) {
+    let repeat_same_peer = case != BootstrapJoinDialCase::NewSibling;
+    let idle_retry = case == BootstrapJoinDialCase::IdleRetry;
+    use futures::future::BoxFuture;
+    use veil_ipc::{BootstrapJoinOutcome, BootstrapJoinSink};
+    use veil_transport::{
+        Transport, TransportCapabilities, TransportConnection, TransportContext, TransportListener,
+    };
+
+    struct Witness(String, tokio::sync::mpsc::UnboundedSender<String>);
+    impl Drop for Witness {
+        fn drop(&mut self) {
+            let _ = self.1.send(self.0.clone());
+        }
+    }
+    struct Gated {
+        fail_first: std::sync::atomic::AtomicBool,
+        started: tokio::sync::mpsc::UnboundedSender<String>,
+        cancelled: tokio::sync::mpsc::UnboundedSender<String>,
+    }
+    impl Transport for Gated {
+        fn scheme(&self) -> &'static str {
+            "tcp"
+        }
+        fn capabilities(&self) -> TransportCapabilities {
+            TransportCapabilities::stream_connection()
+        }
+        fn connect<'a>(
+            &'a self,
+            uri: &'a TransportUri,
+            _: Arc<TransportContext>,
+        ) -> BoxFuture<'a, veil_transport::error::Result<Box<dyn TransportConnection>>> {
+            Box::pin(async move {
+                let name = uri.to_string();
+                self.started.send(name.clone()).unwrap();
+                if self
+                    .fail_first
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(std::io::Error::other("fixture refused first dial").into());
+                }
+                let _witness = Witness(name, self.cancelled.clone());
+                std::future::pending().await
+            })
+        }
+        fn bind<'a>(
+            &'a self,
+            _: &'a TransportUri,
+            _: Arc<TransportContext>,
+        ) -> BoxFuture<'a, veil_transport::error::Result<Box<dyn TransportListener>>> {
+            Box::pin(async { unreachable!("dial-only fixture") })
+        }
+    }
+    let mut config = runtime_config_with_listen();
+    config.peers.clear();
+    config.bootstrap_peers.clear();
+    config.listen.clear();
+    config.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+    config.pex.enabled = false;
+    config.identity.as_mut().unwrap().lazy_mining = false;
+    if idle_retry {
+        config.connection.reconnect_backoff_min_ms = 60_000;
+        config.connection.reconnect_backoff_max_ms = 60_000;
+    }
+    let path = save_test_config("bootstrap-join-dial-isolation", config).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.unwrap();
+    let mut services = runtime.access();
+    let (started_tx, mut started) = tokio::sync::mpsc::unbounded_channel();
+    let (cancelled_tx, mut cancelled) = tokio::sync::mpsc::unbounded_channel();
+    let mut registry = TransportRegistry::new();
+    registry.register(Arc::new(Gated {
+        fail_first: std::sync::atomic::AtomicBool::new(idle_retry),
+        started: started_tx,
+        cancelled: cancelled_tx,
+    }));
+    services.registry = Arc::new(registry);
+    let (queue, entries) = tokio::sync::mpsc::channel(8);
+    let (shutdown, _) = tokio::sync::watch::channel(false);
+    let drain =
+        crate::bootstrap_join::spawn_dial_drain(services.clone(), shutdown.clone(), entries);
+    let forwarder = crate::bootstrap_join::BootstrapJoinForwarder::new(
+        Arc::clone(&services.logger),
+        Arc::clone(&services.state),
+        Arc::clone(&services.dht),
+        queue,
+    );
+    let make_peer = |port| {
+        let keys = test_support::ed25519_keypair();
+        veil_cfg::BootstrapPeer {
+            transport: format!("tcp://127.0.0.1:{port}"),
+            public_key: keys.public_key,
+            nonce: veil_cfg::default_nonce_base64(),
+            algo: SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        }
+    };
+    let a = make_peer(19001);
+    let uri_a = veil_bootstrap::encode_bootstrap_uri(&a).unwrap();
+    assert!(matches!(
+        forwarder.join_uri(&uri_a, None, None),
+        BootstrapJoinOutcome::Ok { .. }
+    ));
+    assert_eq!(
+        timeout(Duration::from_secs(10), started.recv())
+            .await
+            .unwrap(),
+        Some(a.transport.clone())
+    );
+    assert!(cancelled.try_recv().is_err());
+    let mut target = if repeat_same_peer {
+        a.clone()
+    } else {
+        make_peer(19002)
+    };
+    let uri = veil_bootstrap::encode_bootstrap_uri(&target).unwrap();
+    let joined = forwarder.join_uri(&uri, None, None);
+    assert!(matches!(
+        joined,
+        BootstrapJoinOutcome::Ok { .. } | BootstrapJoinOutcome::AlreadyRegistered { .. }
+    ));
+    if !repeat_same_peer {
+        // Drain admission is witnessed by the NEW peer's real connect call.
+        loop {
+            let next = timeout(Duration::from_secs(10), started.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if next == target.transport {
+                break;
+            }
+        }
+    }
+    // The configured retry is at least 48 virtual seconds away (60 s ±20%).
+    // An unchanged rejoin must still wake that peer without waiting for it.
+    let idle_woke = !idle_retry
+        || timeout(Duration::from_secs(1), started.recv())
+            .await
+            .ok()
+            .flatten()
+            == Some(a.transport.clone());
+    let cancelled_by_join = timeout(Duration::from_secs(1), cancelled.recv())
+        .await
+        .ok()
+        .flatten();
+    // Positive control: the same IPC path must still replace a changed target.
+    let old_target = target.transport.clone();
+    target.transport = "tcp://127.0.0.1:19003".into();
+    let uri = veil_bootstrap::encode_bootstrap_uri(&target).unwrap();
+    assert!(matches!(
+        forwarder.join_uri(&uri, None, None),
+        BootstrapJoinOutcome::AlreadyRegistered { .. }
+    ));
+    let retargeted = timeout(Duration::from_secs(10), async {
+        while let Some(next) = started.recv().await {
+            if next == target.transport {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    let mut dropped_target = false;
+    while let Ok(next) = cancelled.try_recv() {
+        dropped_target |= next == old_target;
+    }
+    let _ = shutdown.send(true);
+    drain.await.unwrap();
+    runtime.stop().await.unwrap();
+    let _ = fs::remove_dir_all(path.parent().unwrap());
+    assert!(
+        idle_woke,
+        "identical bootstrap join did not wake its own idle retry"
+    );
+    assert!(retargeted, "changed bootstrap target was not dialed");
+    assert!(
+        dropped_target,
+        "changed target did not retire its stale attempt"
+    );
+    assert_eq!(
+        cancelled_by_join, None,
+        "BootstrapJoin cancelled an unchanged in-flight dial"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn bootstrap_new_sibling_join_preserves_pending_dial() {
+    bootstrap_join_preserves_pending_dial_fixture(BootstrapJoinDialCase::NewSibling).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn bootstrap_identical_rejoin_preserves_pending_dial() {
+    bootstrap_join_preserves_pending_dial_fixture(BootstrapJoinDialCase::Identical).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn bootstrap_identical_rejoin_still_wakes_idle_retry() {
+    bootstrap_join_preserves_pending_dial_fixture(BootstrapJoinDialCase::IdleRetry).await;
+}
+
 fn provider_test_ad(tag: u8) -> veil_anonymity::rendezvous::RendezvousAd {
     veil_anonymity::rendezvous::RendezvousAd {
         receiver_node_id: [tag; 32],
