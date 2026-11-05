@@ -961,6 +961,15 @@ impl SessionTxRegistry {
             .map(|entry| entry.registration)
     }
 
+    /// Is this exact authenticated session still the live owner? Callers that
+    /// use this to replace an entry must retain the registry write lock across
+    /// both this check and registration so a newer owner cannot interleave.
+    pub fn owns_live_session(&self, peer: &NodeIdBytes, owner: &SessionTxOwner) -> bool {
+        self.senders
+            .get(peer)
+            .is_some_and(|entry| entry.owner.as_ref() == Some(owner) && !entry.tx.is_closed())
+    }
+
     /// Sorted live registrations for maintenance replication. Reconnects to
     /// the same peer change this witness; queue traffic and rejected duplicate
     /// admission do not. It neither holds sender handles nor includes stale
@@ -1048,6 +1057,24 @@ impl SessionTxRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacing_a_session_retires_cloned_producers() {
+        let peer = [2; 32];
+        let mut reg = SessionTxRegistry::new();
+        let mut old = reg
+            .try_register_directional(peer, &[1; 32], false, true, false, [3; 32])
+            .unwrap();
+        let held_by_media = reg.get_sender(&peer).unwrap().clone();
+        let _next = reg
+            .try_register_directional(peer, &[1; 32], false, true, true, [4; 32])
+            .unwrap();
+        assert!(
+            matches!(old.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)),
+            "replaced runner stayed alive through a cloned producer"
+        );
+        drop(held_by_media);
+    }
 
     #[test]
     fn deferred_recoverable_send_preserves_activity_and_full_accounting() {

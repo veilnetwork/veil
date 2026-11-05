@@ -237,9 +237,10 @@ pub fn derive_rekey_keys(
 ///   session (server: the ticket's keys; client: the `ClientTicketEntry`
 ///   keys). They are role-swapped between peers (one side's tx is the other's
 ///   rx), so the IKM canonical-sorts the pair to a value both sides agree on.
-/// * `session_id` — carried through unchanged; it identifies the session but
-///   does not feed the AEAD nonce (which keys on tx/rx + counter), so only the
-///   keys need to be fresh.
+/// * `session_id` — identifies the predecessor. The resumed connection gets
+///   a fresh identifier bound to this parent and both nonces. Reusing the
+///   parent's id lets a late old-runner teardown remove the new registry,
+///   alias and handoff entries even though the cipher keys are different.
 /// * `client_resume_nonce` / `server_resume_nonce` — fresh 32-byte nonces, one
 ///   minted by each peer and exchanged in the resume HELLO / ATTACH. Ordered
 ///   client-then-server (both peers know which role they played) so the salt is
@@ -275,8 +276,8 @@ pub fn derive_resume_keys(
     salt[RESUME_NONCE_LEN..].copy_from_slice(server_resume_nonce);
 
     let hkdf = Hkdf::<Sha256>::new(Some(&salt), ikm.as_slice());
-    // 64 bytes = tx_key (32) || rx_key (32); session_id is carried through, not
-    // re-derived. 64 << HKDF-SHA256 max okm (8160 B), so expand is infallible.
+    // Keep the directional key derivation unchanged. The connection identifier
+    // below is public metadata, not cipher material.
     let mut okm = veil_util::sensitive_bytes::SensitiveBytes::new(64);
     hkdf.expand(HKDF_RESUME_INFO, okm.as_mut_slice())
         .expect("64 <= HKDF-SHA256 max okm");
@@ -294,10 +295,21 @@ pub fn derive_resume_keys(
         (key_b, key_a)
     };
 
+    // A full ticket resumption creates a new runner with fresh keys; it is not
+    // a HandoffAttach which moves the same runner and preserves its lifetime.
+    // Domain-separate this public identifier and canonicalize peer order so
+    // both sides agree while either fresh nonce distinguishes a reconnect.
+    let mut id = blake3::Hasher::new();
+    id.update(b"ovl1-resumed-connection-id-v1");
+    id.update(session_id);
+    id.update(&salt);
+    id.update(local_node_id.min(remote_node_id));
+    id.update(local_node_id.max(remote_node_id));
+
     SessionKeys {
         tx_key,
         rx_key,
-        session_id: *session_id,
+        session_id: *id.finalize().as_bytes(),
     }
 }
 
@@ -495,6 +507,51 @@ mod tests {
     // ── derive_resume_keys (session-resumption nonce reuse fix) ──────────────
 
     #[test]
+    fn resumed_connections_have_distinct_session_ids() {
+        let parent = [0x99; 32];
+        let derive = |client_nonce, server_nonce| {
+            derive_resume_keys(
+                &[0x11; 32],
+                &[0x22; 32],
+                &parent,
+                &client_nonce,
+                &server_nonce,
+                &node_id(1),
+                &node_id(2),
+            )
+        };
+        let a = derive([1; 32], [2; 32]);
+        let b = derive([1; 32], [3; 32]);
+        let c = derive([4; 32], [2; 32]);
+        assert_ne!(
+            a.session_id, parent,
+            "resumption reuses its predecessor's lifetime token"
+        );
+        assert_ne!(
+            a.session_id, b.session_id,
+            "server nonce did not distinguish resumptions"
+        );
+        assert_ne!(
+            a.session_id, c.session_id,
+            "client nonce did not distinguish resumptions"
+        );
+        assert_eq!(a.session_id, derive([1; 32], [2; 32]).session_id);
+        let other_parent = derive_resume_keys(
+            &[0x11; 32],
+            &[0x22; 32],
+            &[0x98; 32],
+            &[1; 32],
+            &[2; 32],
+            &node_id(1),
+            &node_id(2),
+        );
+        assert_ne!(
+            a.session_id, other_parent.session_id,
+            "connection id lost its predecessor binding"
+        );
+    }
+
+    #[test]
     fn resume_both_sides_agree_and_keys_are_fresh() {
         // Original session: K1 = initiator→responder key, K2 = responder→initiator.
         // The two peers hold the pair role-swapped.
@@ -529,9 +586,9 @@ mod tests {
         // Cross-side agreement: the resumed session works in both directions.
         assert_eq!(cli.tx_key, srv.rx_key, "client tx must equal server rx");
         assert_eq!(cli.rx_key, srv.tx_key, "client rx must equal server tx");
-        // session_id carried through unchanged.
-        assert_eq!(cli.session_id, sid);
-        assert_eq!(srv.session_id, sid);
+        // Both sides identify the new connection, not the old runner.
+        assert_eq!(cli.session_id, srv.session_id);
+        assert_ne!(cli.session_id, sid);
         // Keys are FRESH — never the original keys (this is the whole point).
         assert_ne!(cli.tx_key, k1);
         assert_ne!(cli.rx_key, k2);
