@@ -9,7 +9,8 @@
 // calls must use `Isolate.run` to avoid freezing the UI: `connect` (IPC
 // APP_HELLO handshake), `joinBootstrapUri` (network join), and
 // `restoreIdentity{,Encrypted}` (key derivation / Argon2id) now do, as does
-// `VeilStream.read()`.  The remaining `Future(() {...})` calls are quick IPC
+// `VeilStream.read()` and `notifyNetworkChanged` (IPC dispatch barrier).
+// The remaining `Future(() {...})` calls are quick IPC
 // round-trips; drive any that prove heavy from a worker isolate too.
 //
 // Memory: every Pointer<Utf8> from C must be freed with veilFreeString
@@ -107,6 +108,22 @@ Uint8List _aead(
 // be sent to the worker isolate. The veil connection handle is a process-global
 // token (the generational handle table lives in native memory), so the worker
 // re-derives the same connection from the raw int address.
+
+void _notifyNetworkChangedWorker(int handleAddr, int kind, int mtuHint) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final rc = ffi.veilNotifyNetworkChanged(handle, kind, mtuHint, errOut);
+    if (rc != ffi.veilOk) {
+      throw VeilException(
+        'notify_network_changed failed: ${_readErrAndFree(errOut)}',
+        code: rc,
+      );
+    }
+  } finally {
+    calloc.free(errOut);
+  }
+}
 
 /// Off-isolate body of [AppHandle.openStream] — veil_stream_open blocks the
 /// thread until the stream FSM is set up, so it runs here. Returns the new
@@ -2478,24 +2495,15 @@ class VeilClient implements Finalizable {
   /// connections necessarily recover. Safe to close a temporary client then.
   Future<void> notifyNetworkChanged(NetworkKind kind, {int mtuHint = 0}) async {
     _ensureOpen();
-    return Future(() {
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        final rc = ffi.veilNotifyNetworkChanged(
-          _handle,
-          kind.wireByte,
-          mtuHint,
-          errOut,
-        );
-        if (rc != ffi.veilOk) {
-          throw VeilException(
-              'notify_network_changed failed: ${_readErrAndFree(errOut)}',
-              code: rc);
-        }
-      } finally {
-        calloc.free(errOut);
-      }
-    });
+    // Native waits for the daemon's inline dispatch receipt, up to the RPC
+    // deadline. A Future on this isolate still blocks audio delivery, timers
+    // and UI for that entire wait. Send only scalars, never this client's
+    // NativeCallable. Await keeps the Finalizable owner alive through the call.
+    final handleAddr = _handle.address;
+    final kindByte = kind.wireByte;
+    await Isolate.run(
+      () => _notifyNetworkChangedWorker(handleAddr, kindByte, mtuHint),
+    );
   }
 
   /// Bind an ephemeral application endpoint.  Returns an [AppHandle]
