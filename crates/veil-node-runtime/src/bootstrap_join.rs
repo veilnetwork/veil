@@ -23,6 +23,32 @@ use veil_bootstrap::{
 use veil_cfg::{BootstrapPeer, NodeId};
 use veil_observability::NodeLogger;
 
+/// Runtime-owned drain shared by IPC bootstrap joins and endpoint refreshes.
+pub(crate) fn spawn_dial_drain(
+    access: crate::runtime::NodeServices,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    mut entries: tokio::sync::mpsc::Receiver<PeerConfigEntry>,
+) -> tokio::task::JoinHandle<()> {
+    let mut shutdown_rx = shutdown.subscribe();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                entry = entries.recv() => match entry {
+                    Some(entry) => {
+                        // The per-peer refresh watch already wakes that peer's
+                        // idle retry and invalidates a changed dial target.
+                        // A global network-change wake would also cancel
+                        // unrelated, still-valid in-flight handshakes.
+                        access.spawn_owned_outbound_peers(vec![entry], &shutdown);
+                    }
+                    None => break,
+                }
+            }
+        }
+    })
+}
+
 /// Synthetic peer-id range for apps-added bootstrap peers. Distinct from
 /// configured peers (small u32), DNS bootstrap, and HTTPS seeds. Each new
 /// app-added peer claims the next slot via an atomic counter. Single source of
@@ -195,8 +221,8 @@ impl BootstrapJoinSink for BootstrapJoinForwarder {
             // may be long gone — so update the stored transport (app-added
             // entries only; a configured peer's address belongs to its config)
             // and re-enqueue a dial. Idempotence is preserved downstream: the
-            // connector's per-node-id slot claim silently no-ops when a
-            // reconnect loop is already alive, and its `has_session` pre-check
+            // connector's per-node-id slot refresh wakes the existing loop
+            // instead of spawning another, and its `has_session` pre-check
             // skips dialing a peer whose session is up.
             let refreshed = st
                 .peers
