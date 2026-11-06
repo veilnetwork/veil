@@ -37,6 +37,7 @@ use super::{
     TransportContext,
     error::{Result, TransportError},
     tcp::{bind_tcp_with_reuseaddr, configure_accepted_tcp, connect_tcp_stream, peer_meta},
+    tcp_trace::{HandshakeSide, HandshakeStream},
     traits::{
         BoxIoStream, RawInbound, Transport, TransportCapabilities, TransportConnection,
         TransportListener,
@@ -84,7 +85,7 @@ fn psk_from_context(ctx: &TransportContext) -> Result<NodeIdMacKey> {
 pub(crate) async fn connect_obfs4_stream(
     uri: &TransportUri,
     ctx: Arc<TransportContext>,
-) -> Result<(super::traits::PeerMeta, Obfs4Stream<tokio::net::TcpStream>)> {
+) -> Result<(super::traits::PeerMeta, Obfs4Stream<HandshakeStream>)> {
     let (host, port) = obfs4_parts(uri)?;
     let psk = psk_from_context(&ctx)?;
     let tcp = connect_tcp_stream(host, port, &ctx).await?;
@@ -105,12 +106,17 @@ pub(crate) async fn connect_obfs4_stream(
     // resource-exhaustion DoS. On timeout we drop the connection (Err).
     let wrapped = tokio::time::timeout(
         OBFS4_HANDSHAKE_TIMEOUT,
-        obfs4_client_connect_variant(tcp, &psk, ctx.obfs4_client_variant),
+        obfs4_client_connect_variant(
+            HandshakeStream::new(tcp, HandshakeSide::Client),
+            &psk,
+            ctx.obfs4_client_variant,
+        ),
     )
     .await
     .map_err(|_| TransportError::Tls("obfs4 client handshake timed out".to_string()))?
     .map_err(|e| TransportError::Tls(format!("obfs4 client handshake: {e}")))?;
 
+    wrapped.get_ref().complete();
     let peer = peer_meta("obfs4-tcp", uri.clone(), local_addr, remote_addr);
 
     Ok((peer, wrapped))
@@ -196,12 +202,17 @@ impl TransportListener for Obfs4TcpListener {
             // connection (Err) and the loop proceeds to the next accept.
             let (wrapped, _matched_variant) = tokio::time::timeout(
                 OBFS4_HANDSHAKE_TIMEOUT,
-                obfs4_server_accept_multi(tcp, &self.psk, &self.accept_variants),
+                obfs4_server_accept_multi(
+                    HandshakeStream::new(tcp, HandshakeSide::Server),
+                    &self.psk,
+                    &self.accept_variants,
+                ),
             )
             .await
             .map_err(|_| TransportError::Tls("obfs4 server handshake timed out".to_string()))?
             .map_err(|e| TransportError::Tls(format!("obfs4 server handshake: {e}")))?;
 
+            wrapped.get_ref().complete();
             let peer = peer_meta(
                 "obfs4-tcp",
                 self.bind_uri.clone(),
@@ -232,13 +243,18 @@ impl TransportListener for Obfs4TcpListener {
                 Box::pin(async move {
                     let (wrapped, _matched_variant) = tokio::time::timeout(
                         OBFS4_HANDSHAKE_TIMEOUT,
-                        obfs4_server_accept_multi(tcp, &psk, &variants),
+                        obfs4_server_accept_multi(
+                            HandshakeStream::new(tcp, HandshakeSide::Server),
+                            &psk,
+                            &variants,
+                        ),
                     )
                     .await
                     .map_err(|_| {
                         TransportError::Tls("obfs4 server handshake timed out".to_string())
                     })?
                     .map_err(|e| TransportError::Tls(format!("obfs4 server handshake: {e}")))?;
+                    wrapped.get_ref().complete();
                     let peer = peer_meta("obfs4-tcp", bind_uri, local_addr, Some(remote_addr));
                     let offer = super::stream_parallel::StreamParallelHandle::new(context, None);
                     Ok(boxed_stream_connection_obfs4(peer, wrapped, Some(offer)))
@@ -261,12 +277,12 @@ impl TransportListener for Obfs4TcpListener {
 /// Newtype wrapping `Obfs4Stream<TcpStream>` so we can implement the
 /// crate's local `IoStream` marker trait.
 struct Obfs4IoStream {
-    stream: Obfs4Stream<tokio::net::TcpStream>,
+    stream: Obfs4Stream<HandshakeStream>,
     write_trace: super::tcp_trace::WriteTrace,
 }
 
 impl Obfs4IoStream {
-    fn new(stream: Obfs4Stream<tokio::net::TcpStream>) -> Self {
+    fn new(stream: Obfs4Stream<HandshakeStream>) -> Self {
         Self {
             stream,
             write_trace: Default::default(),
@@ -275,7 +291,7 @@ impl Obfs4IoStream {
 
     fn trace_write(&mut self, operation: &'static str, pending: bool) {
         self.write_trace.observe(
-            self.stream.get_ref(),
+            self.stream.get_ref().socket(),
             operation,
             pending,
             self.stream.pending_ciphertext_bytes(),
@@ -321,16 +337,16 @@ impl tokio::io::AsyncWrite for Obfs4IoStream {
     }
 }
 
-pub(crate) fn boxed_obfs4_io(stream: Obfs4Stream<tokio::net::TcpStream>) -> BoxIoStream {
+pub(crate) fn boxed_obfs4_io(stream: Obfs4Stream<HandshakeStream>) -> BoxIoStream {
     let stream = Obfs4IoStream::new(stream);
     Box::new(crate::tcp_write_gate::gate(stream, |io| {
-        io.stream.get_ref()
+        io.stream.get_ref().socket()
     }))
 }
 
 fn boxed_stream_connection_obfs4(
     peer: super::traits::PeerMeta,
-    stream: Obfs4Stream<tokio::net::TcpStream>,
+    stream: Obfs4Stream<HandshakeStream>,
     parallel: Option<super::stream_parallel::StreamParallelHandle>,
 ) -> Box<dyn TransportConnection> {
     let binding = stream.channel_binding();
