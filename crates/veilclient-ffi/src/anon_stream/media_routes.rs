@@ -186,6 +186,8 @@ struct PinnedRoute {
     cookie: [u8; 16],
     relay: [u8; 32],
     created: Instant,
+    // Diagnostic snapshot only: superseded runners can exit after a new
+    // route is built. The circuit's exact TX registration owns its lifetime.
     close_generation: u64,
     last_activity: Mutex<(u64, Instant)>,
     last_probe: Mutex<Option<Instant>>,
@@ -203,11 +205,7 @@ impl PinnedRoute {
         }
         self.created.elapsed() < REFRESH_AFTER
             && last_activity.1.elapsed() < PROBE_STALE_AFTER
-            && self.services.has_live_session(&self.circuit.first_hop())
-            && self
-                .services
-                .session_close_generation(&self.circuit.first_hop())
-                == self.close_generation
+            && self.services.data_circuit_session_current(&self.circuit)
     }
 
     async fn prepare_datagram(&self) {
@@ -269,7 +267,6 @@ impl PinnedRoute {
         let circuit = Arc::clone(&self.circuit);
         let cookie = self.cookie;
         let lane = self.local_datagram_lane;
-        let generation = self.close_generation;
         let activity = Arc::clone(&self.receive_activity);
         let deadline = tokio::time::Instant::now() + DATAGRAM_WARM_TIMEOUT;
         let mut pending = self.probe_task.lock().unwrap_or_else(|p| p.into_inner());
@@ -285,8 +282,7 @@ impl PinnedRoute {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 if tokio::time::Instant::now() >= deadline
                     || activity.load(Ordering::Acquire) != baseline
-                    || !services.has_live_session(&circuit.first_hop())
-                    || services.session_close_generation(&circuit.first_hop()) != generation
+                    || !services.data_circuit_session_current(&circuit)
                 {
                     break;
                 }
@@ -378,7 +374,7 @@ async fn open_private_route(
             )),
         },
     ));
-    let close_generation = core.services.session_close_generation(&circuit.first_hop());
+    let close_generation = circuit.first_hop_close_generation();
     let owned = PinnedRoute {
         services: core.services.clone(),
         circuit,
@@ -1089,6 +1085,82 @@ impl MediaRoutes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn private_route_lifetime_follows_its_exact_tx_registration() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use veil_anonymity::directory::{relay_directory_dht_key, sign_entry};
+
+        let (_dir, mut runtime, services) =
+            super::super::tests::offline_feed_fixture_with_receive(true).await;
+        let key = veil_crypto::generate_keypair(veil_types::SignatureAlgorithm::Ed25519);
+        let hop = *blake3::hash(&STANDARD.decode(&key.public_key).unwrap()).as_bytes();
+        services.dht.store_local(
+            relay_directory_dht_key(&hop),
+            sign_entry(
+                hop,
+                [3; 32],
+                1_000_000,
+                1,
+                &key.public_key,
+                &key.private_key,
+                veil_types::SignatureAlgorithm::Ed25519,
+            )
+            .unwrap(),
+        );
+        let pin = |circuit| PinnedRoute {
+            services: services.clone(),
+            circuit: Arc::new(circuit),
+            feed: tokio::spawn(std::future::pending()),
+            cookie: [4; 16],
+            relay: hop,
+            created: Instant::now(),
+            close_generation: services.session_close_generation(&hop),
+            last_activity: Mutex::new((0, Instant::now())),
+            last_probe: Mutex::new(None),
+            receive_activity: Arc::new(AtomicU64::new(0)),
+            probe_task: Mutex::new(None),
+            local_datagram_lane: veil_proto::priority::REALTIME,
+        };
+        let old_tx = services
+            .session_tx_registry
+            .write()
+            .unwrap()
+            .register_owned(hop, [1; 32]);
+        let (old, _old_rx) = services.open_data_circuit(&[hop], b"old owner").unwrap();
+        let old = pin(old);
+        assert!(old.is_live());
+        let close_generation = services.session_close_generation(&hop);
+        let fresh_tx = services
+            .session_tx_registry
+            .write()
+            .unwrap()
+            .register_owned(hop, [2; 32]);
+        assert_eq!(services.session_close_generation(&hop), close_generation);
+        assert!(!services.data_circuit_session_current(&old.circuit));
+        let old_still_live = old.is_live();
+        let (fresh, _fresh_rx) = services.open_data_circuit(&[hop], b"fresh owner").unwrap();
+        let mut fresh = pin(fresh);
+        let fresh_live = fresh.is_live();
+        // A diagnostic snapshot differing from the current exit counter must
+        // not invalidate a circuit whose actual TX registration is unchanged.
+        fresh.close_generation = close_generation.wrapping_add(1);
+        let diagnostic_independent = fresh.is_live();
+        drop(fresh_tx);
+        let closed_still_live = fresh.is_live();
+        drop((old_tx, old, fresh));
+        runtime.stop().await.unwrap();
+        assert!(
+            !old_still_live,
+            "replacement must invalidate the old private route before runner exit"
+        );
+        assert!(fresh_live);
+        assert!(
+            diagnostic_independent,
+            "the diagnostic close counter is not a lifetime witness"
+        );
+        assert!(!closed_still_live);
+    }
 
     #[test]
     fn bootstrap_is_bounded_per_receive_publication() {

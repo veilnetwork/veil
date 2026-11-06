@@ -6412,7 +6412,7 @@ mod tests {
         offline_feed_fixture_with_receive(false).await
     }
 
-    async fn offline_feed_fixture_with_receive(
+    pub(super) async fn offline_feed_fixture_with_receive(
         receive_anonymous: bool,
     ) -> (
         tempfile::TempDir,
