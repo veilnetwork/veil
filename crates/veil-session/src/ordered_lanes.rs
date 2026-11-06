@@ -230,6 +230,10 @@ fn worker(
 ) -> RealtimeReceiverTask {
     RealtimeReceiverTask(tokio::spawn(async move {
         let mut attempts = tokio::task::JoinSet::new();
+        // Proofs already passed the parent/exporter and directional lease
+        // gates. Finish their bounded ACK flights independently: one blocked
+        // socket must not park ready children, outgoing completions or reaping.
+        let mut acknowledging = tokio::task::JoinSet::new();
         let mut attempt_slots: std::collections::HashMap<tokio::task::Id, usize> =
             std::collections::HashMap::new();
         let mut warming = [false; TOTAL_SLOTS];
@@ -242,10 +246,8 @@ fn worker(
                 biased;
                 _ = parent.retired() => break,
                 _ = offer.handle.closed() => break,
-                Some(child) = incoming.recv() => {
-                    // Finish the already verified proof on its same fresh
-                    // transport. Parent retirement wakes this bounded flight.
-                    if let Ok(channel) = child.finish().await {
+                Some(result) = acknowledging.join_next(), if !acknowledging.is_empty() => {
+                    if let Ok(Ok(channel)) = result {
                         let ready = Ready::new(Owner::Incoming(channel), parent.clone(), context.clone(), offer.diagnostics.clone());
                         let mut pool = lock!(pool);
                         if !offer.handle.can_connect() && let Some(slot) = pool.slots.iter_mut().find(|slot| slot.is_none()) {
@@ -257,6 +259,11 @@ fn worker(
                         }
                         mark(&mut pool, &readiness);
                     }
+                },
+                Some(child) = incoming.recv(), if acknowledging.len() < StreamParallelHandle::CONNECTIONS_PER_DIRECTION => {
+                    // Keep the existing per-direction connection limit even
+                    // if queued proofs and completed tasks overlap locally.
+                    acknowledging.spawn(child.finish());
                 },
                 Some(result) = attempts.join_next_with_id(), if !attempts.is_empty() => {
                     let (index, result) = match result {
@@ -308,6 +315,10 @@ fn worker(
                 },
             }
         }
+        // Retire the actual flights before this worker reports completion;
+        // cancellation must release their transports and directional leases.
+        acknowledging.abort_all();
+        while acknowledging.join_next().await.is_some() {}
     }))
 }
 
@@ -492,3 +503,7 @@ mod forward_channel_isolation_tests;
 #[cfg(test)]
 #[path = "circuit_channel_isolation_tests.rs"]
 mod circuit_channel_isolation_tests;
+
+#[cfg(test)]
+#[path = "ordered_binding_progress_tests.rs"]
+mod ordered_binding_progress_tests;
