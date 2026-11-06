@@ -418,6 +418,7 @@ pub struct FrameOutbox {
     // The registry can explicitly retire this queue even while a producer
     // retains a sender. Normal replacement still permits a pinned old send.
     registration_retirement: Option<mpsc::Receiver<()>>,
+    explicitly_retired: bool,
     source_activity: std::sync::Arc<crate::local_source_activity::LocalSourceActivity>,
     ordinary: EnvelopeReceiver,
     network_control: Option<EnvelopeReceiver>,
@@ -456,6 +457,7 @@ pub(crate) fn frame_channel_with_source_activity(
         },
         FrameOutbox {
             registration_retirement: None,
+            explicitly_retired: false,
             source_activity,
             ordinary: EnvelopeReceiver::Live(ordinary),
             network_control: Some(EnvelopeReceiver::Live(control)),
@@ -472,6 +474,7 @@ impl From<mpsc::Receiver<PriorityFrame>> for FrameOutbox {
     fn from(ordinary: mpsc::Receiver<PriorityFrame>) -> Self {
         Self {
             registration_retirement: None,
+            explicitly_retired: false,
             source_activity: std::sync::Arc::default(),
             ordinary: EnvelopeReceiver::Legacy(ordinary),
             network_control: None,
@@ -670,6 +673,7 @@ impl FrameOutbox {
 
     fn close_registration(&mut self, owner_gone: bool) {
         // Terminal once, whether explicitly retired or released by its owner.
+        self.explicitly_retired = !owner_gone;
         self.registration_retirement = None;
         self.close();
         if crate::rt_trace::rt_trace_enabled() {
@@ -681,6 +685,12 @@ impl FrameOutbox {
                 "session.rt_trace.registration_retired at_ms={at_ms} owner_gone={owner_gone}"
             );
         }
+    }
+
+    /// Administrative disconnect cancels wire work as well as admission.
+    /// Ordinary replacement/sender EOF still permits the writer to drain.
+    pub(crate) fn explicitly_retired(&self) -> bool {
+        self.explicitly_retired
     }
 
     pub fn close(&mut self) {
