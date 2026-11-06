@@ -15,6 +15,10 @@ use std::time::{Duration, Instant};
 
 use tokio::net::TcpStream;
 
+#[path = "tcp_handshake_trace.rs"]
+mod handshake;
+pub(crate) use handshake::{HandshakeSide, HandshakeStream};
+
 static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
 static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
 const SLOW: Duration = Duration::from_millis(50);
