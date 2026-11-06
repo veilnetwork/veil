@@ -59,6 +59,47 @@ use super::{
 /// handshake + round-trip yet tight enough to bound the attack.
 const OBFS4_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+const OBFS4_BACKUP_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+// A black-holed TCP flow need not imply that another flow to the same address
+// is broken. Race at most one delayed candidate; keep a slow valid primary,
+// and never spawn a detached task. The caller owns the unchanged TOTAL budget.
+// These are pre-session transports: only the selected obfs4-verified stream
+// proceeds to OVL1 or the existing parent-bound auxiliary proof.
+async fn connect_with_backup<T, E, P, B, F>(
+    primary: P,
+    backup: F,
+    delay: std::time::Duration,
+) -> std::result::Result<T, E>
+where
+    P: std::future::Future<Output = std::result::Result<T, E>>,
+    B: std::future::Future<Output = std::result::Result<T, E>>,
+    F: FnOnce() -> B,
+{
+    tokio::pin!(primary);
+    tokio::select! {
+        biased;
+        result = &mut primary => return result,
+        _ = tokio::time::sleep(delay) => {},
+    }
+    let backup = backup();
+    tokio::pin!(backup);
+    tokio::select! {
+        result = &mut primary => match result {
+            Ok(value) => Ok(value),
+            Err(primary_error) => backup.await.or(Err(primary_error)),
+        },
+        result = &mut backup => match result {
+            Ok(value) => Ok(value),
+            Err(_) => primary.await,
+        },
+    }
+}
+
+#[cfg(test)]
+#[path = "obfs4_backup_tests.rs"]
+mod obfs4_backup_tests;
+
 /// Plain TCP + obfs4 wrapping.
 #[derive(Debug, Default)]
 pub struct Obfs4TcpTransport;
@@ -89,8 +130,9 @@ pub(crate) async fn connect_obfs4_stream(
     let (host, port) = obfs4_parts(uri)?;
     let psk = psk_from_context(&ctx)?;
     let tcp = connect_tcp_stream(host, port, &ctx).await?;
-    let local_addr = tcp.local_addr().ok();
-    let remote_addr = tcp.peer_addr().ok();
+    let stream = HandshakeStream::new(tcp, HandshakeSide::Client);
+    let attempt = stream.connection_id();
+    let stream = stream.for_attempt(attempt, "primary");
 
     // Phase 2 kill-switch: client variant pulled from
     // TransportContext.  Default V1 preserves pre-Phase-2
@@ -104,21 +146,41 @@ pub(crate) async fn connect_obfs4_stream(
     // connect and then stalls the obfs4 handshake would otherwise wedge
     // this outbound dial indefinitely — across many such dials that is a
     // resource-exhaustion DoS. On timeout we drop the connection (Err).
-    let wrapped = tokio::time::timeout(
+    let selected = tokio::time::timeout(
         OBFS4_HANDSHAKE_TIMEOUT,
-        obfs4_client_connect_variant(
-            HandshakeStream::new(tcp, HandshakeSide::Client),
-            &psk,
-            ctx.obfs4_client_variant,
+        connect_with_backup(
+            finish_client_handshake(stream, uri, &psk, ctx.obfs4_client_variant),
+            || async {
+                let tcp = connect_tcp_stream(host, port, &ctx).await?;
+                let stream =
+                    HandshakeStream::new(tcp, HandshakeSide::Client).for_attempt(attempt, "backup");
+                finish_client_handshake(stream, uri, &psk, ctx.obfs4_client_variant).await
+            },
+            OBFS4_BACKUP_DELAY,
         ),
     )
     .await
-    .map_err(|_| TransportError::Tls("obfs4 client handshake timed out".to_string()))?
-    .map_err(|e| TransportError::Tls(format!("obfs4 client handshake: {e}")))?;
+    .map_err(|_| TransportError::Tls("obfs4 client handshake timed out".to_string()))??;
+    selected.1.get_ref().selected();
+    Ok(selected)
+}
 
+async fn finish_client_handshake(
+    stream: HandshakeStream,
+    uri: &TransportUri,
+    psk: &NodeIdMacKey,
+    variant: WireFormatVariant,
+) -> Result<(super::traits::PeerMeta, Obfs4Stream<HandshakeStream>)> {
+    let peer = peer_meta(
+        "obfs4-tcp",
+        uri.clone(),
+        stream.socket().local_addr().ok(),
+        stream.socket().peer_addr().ok(),
+    );
+    let wrapped = obfs4_client_connect_variant(stream, psk, variant)
+        .await
+        .map_err(|e| TransportError::Tls(format!("obfs4 client handshake: {e}")))?;
     wrapped.get_ref().complete();
-    let peer = peer_meta("obfs4-tcp", uri.clone(), local_addr, remote_addr);
-
     Ok((peer, wrapped))
 }
 

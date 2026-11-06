@@ -36,6 +36,8 @@ struct Observation {
     phase: Phase,
     written_bytes: u64,
     read_bytes: u64,
+    attempt: Option<u64>,
+    candidate: Option<&'static str>,
 }
 
 impl Observation {
@@ -45,12 +47,12 @@ impl Observation {
             return;
         }
         log::info!(target: "transport.tcp_trace.handshake",
-            "tcp_handshake connection={} monotonic_us={} side={:?} outcome={} phase={:?} elapsed_ms={} written_bytes={} read_bytes={} socket={:?} kernel={:?}",
+            "tcp_handshake connection={} monotonic_us={} side={:?} outcome={} phase={:?} elapsed_ms={} written_bytes={} read_bytes={} socket={:?} kernel={:?} attempt={:?} candidate={:?}",
             self.connection,
             veil_util::diagnostic_clock::monotonic_us().map_or_else(|| "unknown".to_owned(), |us| us.to_string()),
             self.side, outcome, self.phase, self.started.elapsed().as_millis(),
             self.written_bytes, self.read_bytes,
-            SocketMetadata::read(socket), KernelSnapshot::read(socket));
+            SocketMetadata::read(socket), KernelSnapshot::read(socket), self.attempt, self.candidate);
     }
 }
 
@@ -76,6 +78,8 @@ impl HandshakeStream {
             phase: Phase::Connected,
             written_bytes: 0,
             read_bytes: 0,
+            attempt: None,
+            candidate: None,
         });
         let stream = Self {
             socket,
@@ -89,6 +93,27 @@ impl HandshakeStream {
 
     pub(crate) fn socket(&self) -> &TcpStream {
         &self.socket
+    }
+
+    pub(crate) fn connection_id(&self) -> Option<u64> {
+        self.observation.as_ref().map(|o| o.connection)
+    }
+
+    /// Same opt-in scope as the socket observations. A local attempt number
+    /// groups its primary/backup sockets; it is never sent to a peer.
+    pub(crate) fn for_attempt(mut self, attempt: Option<u64>, candidate: &'static str) -> Self {
+        if let Some(o) = &mut self.observation {
+            o.attempt = attempt;
+            o.candidate = Some(candidate);
+            o.log(&self.socket, "linked");
+        }
+        self
+    }
+
+    pub(crate) fn selected(&self) {
+        if let Some(o) = &self.observation {
+            o.log(&self.socket, "selected");
+        }
     }
 
     pub(crate) fn complete(&self) {
@@ -242,7 +267,9 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_observer_keeps_no_handshake_state_and_preserves_io() {
-        let (mut io, mut remote) = pair(false).await;
+        let (io, mut remote) = pair(false).await;
+        assert!(io.connection_id().is_none());
+        let mut io = io.for_attempt(Some(123), "backup");
         assert!(io.observation.is_none());
         remote.write_all(b"wire").await.unwrap();
         let mut bytes = [0; 4];
@@ -251,6 +278,7 @@ mod tests {
         io.write_all(&bytes).await.unwrap();
         remote.read_exact(&mut bytes).await.unwrap();
         io.complete();
+        io.selected();
         assert!(io.observation.is_none());
         io.shutdown().await.unwrap();
         assert_eq!(remote.read(&mut bytes).await.unwrap(), 0);
@@ -289,8 +317,9 @@ mod tests {
             log::max_level(),
         );
         log::set_max_level(log::LevelFilter::Info);
-        let (mut io, mut remote) = pair(true).await;
+        let (io, mut remote) = pair(true).await;
         let connection = io.observation.as_ref().unwrap().connection;
+        let mut io = io.for_attempt(Some(connection), "backup");
         let payload = b"private-handshake-canary";
         io.write_all(payload).await.unwrap();
         io.flush().await.unwrap();
@@ -314,9 +343,13 @@ mod tests {
             .filter(|row| row.starts_with(&key))
             .cloned()
             .collect();
-        assert_eq!(rows.len(), 2, "one start and one incomplete observation");
+        assert_eq!(rows.len(), 3, "start, linked and incomplete observation");
         assert!(rows[0].contains("outcome=start"));
-        let end = &rows[1];
+        assert!(rows[1].contains("outcome=linked"));
+        let end = &rows[2];
+        assert!(end.contains(&format!(
+            "attempt=Some({connection}) candidate=Some(\"backup\")"
+        )));
         assert!(end.contains("outcome=incomplete phase=Read"));
         assert!(end.contains(&format!("written_bytes={} read_bytes=0", payload.len())));
         assert!(end.contains("socket=Ok(SocketMetadata { local_port:"));
