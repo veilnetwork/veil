@@ -130,7 +130,16 @@ impl NodeRuntime {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .unban(node_id.as_bytes());
-        persist_bans(&self.ban_list, &self.config_path)
+        let outcome = persist_bans(&self.ban_list, &self.config_path);
+        // The in-memory unban applies even if persistence failed. Wake the
+        // matching connector's retained watch rather than waiting for its
+        // 30-second ban poll or interrupting unrelated pending dials with a
+        // global network-change notification. This does not retire sessions
+        // or bypass the remaining admission checks on the next attempt.
+        if let Some(refresh) = lock!(self.outbound_connector_refresh).get(node_id.as_bytes()) {
+            refresh.send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+        outcome
     }
 
     /// Toggle the mobile background-mode flag.

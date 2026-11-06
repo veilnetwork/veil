@@ -426,9 +426,9 @@ pub fn spawn_outbound_peers(
                 // never resumed even though policy said we
                 // should dial.  Fix: sleep + recheck instead of
                 // exiting; ban expiration naturally pulls us back into
-                // the dial path.  `force_reconnect_notify` wakes us
-                // immediately on operator-initiated unban (admin tear-
-                // down keeps stale entries from out of the registry).
+                // the dial path. The per-peer refresh watch wakes this
+                // connector on operator-initiated unban; a network-change
+                // broadcast remains a separate wake source.
                 if lock!(access.dispatcher.abuse.ban_list).is_banned(&peer_node_id) {
                     tokio::select! {
                         _ = shutdown_rx.changed() => break,

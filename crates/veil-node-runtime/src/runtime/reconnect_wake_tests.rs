@@ -3,7 +3,7 @@
 //! so the fixture can deliver a broadcast in that exact gap without sleeps.
 use super::tests::{runtime_config_with_listen, save_test_config};
 use super::*;
-use futures::future::BoxFuture;
+use futures::{FutureExt, future::BoxFuture};
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use veil_transport::{
@@ -16,6 +16,7 @@ enum Wake {
     Connectivity,
     None,
     NetworkWhileBanned,
+    OperatorUnban,
 }
 
 struct Gate {
@@ -124,7 +125,7 @@ async fn retry_wake_gap_fixture(wake: Wake) {
             Wake::Network => forced.notify_waiters(),
             Wake::Connectivity => gain.on_outbound_session_established(),
             Wake::None => {}
-            Wake::NetworkWhileBanned => {
+            Wake::NetworkWhileBanned | Wake::OperatorUnban => {
                 banned
                     .lock()
                     .unwrap()
@@ -150,7 +151,66 @@ async fn retry_wake_gap_fixture(wake: Wake) {
     // On this current-thread executor the connector continues synchronously
     // from formatting until it parks. A retained broadcast starts dial two
     // before that park; a lost broadcast parks on the unchanged 60-s pause.
-    let retried_without_timer = second_rx.try_recv().is_ok();
+    let mut retried_without_timer = second_rx.try_recv().is_ok();
+    let mut unban_preserved_policy = true;
+    let mut unban_durable = true;
+    let mut unban_clock_unchanged = true;
+    if matches!(wake, Wake::OperatorUnban) {
+        // The formatting callback installed the ban and woke the retry once.
+        // This current-thread task then parked on the real connector's ban
+        // guard. Lift that ban through the operator API without a timer tick.
+        let other_node = [0xfa; 32];
+        let (other_tx, other_rx) = tokio::sync::watch::channel(0_u64);
+        services
+            .outbound_connector_refresh
+            .lock()
+            .unwrap()
+            .insert(other_node, other_tx);
+        services
+            .dispatcher
+            .abuse
+            .ban_list
+            .lock()
+            .unwrap()
+            .ban_manual(other_node, "unrelated ban must remain authoritative");
+        let was_banned = services
+            .dispatcher
+            .abuse
+            .ban_list
+            .lock()
+            .unwrap()
+            .is_banned(&peer_node);
+        let global_wake = services.force_reconnect_notify.notified();
+        tokio::pin!(global_wake);
+        global_wake.as_mut().enable();
+        tokio::time::pause();
+        let before = tokio::time::Instant::now();
+        unban_durable = runtime.unban_node(peer_node.into()).is_durable();
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            if second_rx.try_recv().is_ok() {
+                retried_without_timer = true;
+                break;
+            }
+        }
+        unban_clock_unchanged = tokio::time::Instant::now() == before;
+        unban_preserved_policy = was_banned
+            && !other_rx.has_changed().unwrap()
+            && global_wake.as_mut().now_or_never().is_none()
+            && services
+                .dispatcher
+                .abuse
+                .ban_list
+                .lock()
+                .unwrap()
+                .is_banned(&other_node);
+        services
+            .outbound_connector_refresh
+            .lock()
+            .unwrap()
+            .remove(&other_node);
+        tokio::time::resume();
+    }
     let formats = gate.formats.load(Ordering::SeqCst);
     let is_banned = services
         .dispatcher
@@ -174,9 +234,18 @@ async fn retry_wake_gap_fixture(wake: Wake) {
         "the gap must follow the transport and connector formats"
     );
     assert_eq!(is_banned, matches!(wake, Wake::NetworkWhileBanned));
+    assert!(
+        unban_preserved_policy,
+        "unban woke or lifted an unrelated peer ban"
+    );
+    assert!(unban_durable, "fixture unban did not persist");
+    assert!(unban_clock_unchanged, "a timer rescued the unban retry");
     assert_eq!(
         retried_without_timer,
-        matches!(wake, Wake::Network | Wake::Connectivity),
+        matches!(
+            wake,
+            Wake::Network | Wake::Connectivity | Wake::OperatorUnban
+        ),
         "a broadcast in the failure-to-backoff gap was lost, or retry bypassed the unchanged pause/ban"
     );
 }
@@ -196,6 +265,11 @@ async fn retry_wake_gap_without_event_preserves_backoff() {
 #[tokio::test(flavor = "current_thread")]
 async fn retry_wake_gap_does_not_bypass_ban() {
     retry_wake_gap_fixture(Wake::NetworkWhileBanned).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn operator_unban_wakes_only_its_banned_connector() {
+    retry_wake_gap_fixture(Wake::OperatorUnban).await;
 }
 
 /// A retained gain must not let our own successful handshake erase the
