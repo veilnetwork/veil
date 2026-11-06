@@ -4922,6 +4922,13 @@ impl SessionRunner {
                                         KEEPALIVE_SWAP_ATTEMPT_CEILING,
                                     ),
                                 );
+                                // TX is already declared unusable, genuine RX
+                                // is stale and no recovery remains. Draining
+                                // this writer only delays the connector by its
+                                // five-second graceful-stop budget. Cancel the
+                                // owned writer and still join its teardown;
+                                // ordinary/idle shutdown keeps the drain grace.
+                                writer_handle.0.abort();
                                 Self::stop_writer(wire_tx, &mut writer_handle).await;
                                 return;
                             }
