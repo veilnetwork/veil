@@ -2531,6 +2531,9 @@ async fn primary_blackout_limits_local_data_on_a_different_neighbor() {
 #[path = "reliable_source_pressure_quic_tests.rs"]
 mod reliable_source_pressure_quic_tests;
 
+#[path = "keepalive_writer_shutdown_tests.rs"]
+mod keepalive_writer_shutdown_tests;
+
 #[tokio::test]
 #[ignore = "Manual controlled Cubic/BBR comparison under neutral packet loss"]
 async fn characterize_primary_small_packet_loss_with_congestion_controllers() {
