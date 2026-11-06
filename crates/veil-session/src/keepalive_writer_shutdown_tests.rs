@@ -1,4 +1,4 @@
-//! Exercise the real runner's terminal keepalive path with a stuck writer.
+//! Exercise terminal and ordinary writer shutdown through the real runner.
 use super::super::{OwnedWriter, SessionRunner, WireBlob, writer_task};
 use super::reliable_source_pressure_quic_tests::make_runner;
 use std::{
@@ -177,4 +177,166 @@ async fn ordinary_writer_shutdown_still_drains_the_accepted_blob() {
     peer.read_exact(&mut bytes).await.unwrap();
     assert_eq!(&bytes, b"kept");
     stop.await;
+}
+
+struct GatedWriter {
+    open: Arc<AtomicBool>,
+    writes: Arc<AtomicUsize>,
+    bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+    waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+    dropped: Arc<AtomicBool>,
+}
+impl AsyncRead for GatedWriter {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Pending
+    }
+}
+impl AsyncWrite for GatedWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        *self.waker.lock().unwrap() = Some(cx.waker().clone());
+        if !self.open.load(Ordering::SeqCst) {
+            return Poll::Pending;
+        }
+        self.bytes.lock().unwrap().extend_from_slice(bytes);
+        Poll::Ready(Ok(bytes.len()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+impl Drop for GatedWriter {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+async fn registry_close_while_writer_is_blocked(explicit: bool, owned: bool) {
+    let peer = [0xB1; 32];
+    let owner = [0x71; 32];
+    let mut registry = crate::SessionTxRegistry::new();
+    let outbox = if owned {
+        registry.register_owned(peer, owner)
+    } else {
+        registry.register(peer)
+    };
+    // A borrowed producer must not hide an explicit retirement or substitute
+    // sender EOF for the event under test.
+    let producer = registry.get_sender(&peer).unwrap().clone();
+    let mut header = veil_proto::FrameHeader::new(
+        veil_proto::family::FrameFamily::App as u8,
+        veil_proto::family::AppMsg::AppData as u16,
+    );
+    header.set_priority(veil_proto::priority::INTERACTIVE);
+    header.body_len = 4;
+    let mut expected = veil_proto::codec::encode_header(&header).to_vec();
+    expected.extend_from_slice(b"kept");
+    producer
+        .try_send((
+            veil_proto::priority::INTERACTIVE,
+            veil_bufpool::pooled_shared_from_vec(expected.clone()),
+        ))
+        .unwrap();
+    let open = Arc::new(AtomicBool::new(false));
+    let writes = Arc::new(AtomicUsize::new(0));
+    let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let waker = Arc::new(std::sync::Mutex::new(None));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mut runner = make_runner(
+        Box::new(GatedWriter {
+            open: open.clone(),
+            writes: writes.clone(),
+            bytes: bytes.clone(),
+            waker: waker.clone(),
+            dropped: dropped.clone(),
+        }),
+        outbox,
+        None,
+    );
+    // Keep this control's wire bytes exact; no padding/cover, timer, read EOF
+    // or keepalive teardown can replace the registry-close path.
+    runner.crypto.tx_cipher = None;
+    runner.crypto.rx_cipher = None;
+    assert!(runner.keepalive_interval.is_zero() && runner.idle_timeout.is_zero());
+    let mut run = Box::pin(runner.run());
+    for _ in 0..32 {
+        assert!(poll_once(run.as_mut()).await.is_pending());
+        tokio::task::yield_now().await;
+        if writes.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+    }
+    assert!(writes.load(Ordering::SeqCst) > 0, "writer never blocked");
+    assert!(bytes.lock().unwrap().is_empty());
+    let replacement = if explicit {
+        if owned {
+            assert!(registry.unregister_owned(&peer, &owner));
+        } else {
+            registry.unregister(&peer);
+        }
+        None
+    } else {
+        // Normal replacement releases the previous registry owner. It is not
+        // an administrative disconnect; already accepted bytes may drain.
+        Some(registry.register_owned(peer, [0x72; 32]))
+    };
+    let decision_at = tokio::time::Instant::now();
+    let mut returned = false;
+    for _ in 0..8 {
+        if poll_once(run.as_mut()).await.is_ready() {
+            returned = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    if !explicit {
+        assert!(!returned, "replacement aborted the accepted wire blob");
+        open.store(true, Ordering::SeqCst);
+        if let Some(waker) = waker.lock().unwrap().take() {
+            waker.wake();
+        }
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            if poll_once(run.as_mut()).await.is_ready() {
+                returned = true;
+                break;
+            }
+        }
+        assert_eq!(*bytes.lock().unwrap(), expected);
+        assert!(registry.has_session(&peer), "old runner harmed replacement");
+    }
+    assert_eq!(tokio::time::Instant::now(), decision_at);
+    drop(run);
+    drop(runner);
+    tokio::task::yield_now().await;
+    assert!(dropped.load(Ordering::SeqCst), "writer transport leaked");
+    drop(producer);
+    drop(replacement);
+    assert!(returned, "registry close still pays writer drain grace");
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_registry_retirement_aborts_blocked_writer() {
+    registry_close_while_writer_is_blocked(true, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_owned_retirement_aborts_blocked_writer() {
+    registry_close_while_writer_is_blocked(true, true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn ordinary_registry_replacement_drains_blocked_writer() {
+    registry_close_while_writer_is_blocked(false, true).await;
 }

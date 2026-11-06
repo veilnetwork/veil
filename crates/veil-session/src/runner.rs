@@ -4718,6 +4718,13 @@ impl SessionRunner {
                     && let std::ops::ControlFlow::Break(()) =
                         self.drain_outbox_into_pq(outbox, &mut pq, &mut timers, &mut ingress_trace)
                 {
+                    if outbox.explicitly_retired() {
+                        // Network-change/operator retirement means the old
+                        // transport must go now. A blocked write must not add
+                        // the normal drain grace before reconnect can proceed.
+                        // Plain owner replacement keeps its graceful drain.
+                        writer_handle.0.abort();
+                    }
                     Self::stop_writer(wire_tx, &mut writer_handle).await;
                     return;
                 }
