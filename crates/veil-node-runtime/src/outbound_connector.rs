@@ -27,19 +27,18 @@ use veil_session::manager::RemoteRole;
 use crate::runtime::NodeServices;
 use crate::types::PeerConfigEntry;
 
-// Network changes invalidate an in-flight dial. A sibling's successful
-// handshake only wakes idle retries. Keep the latter out of the dial select.
-fn wait_for_retry_wake(access: &NodeServices) -> impl std::future::Future<Output = ()> + '_ {
-    // Arm both subscriptions at construction, before the outer select starts
-    // polling. Otherwise wrapping Notified in an async fn loses broadcasts
-    // arriving between construction and the wrapper's first poll.
-    let forced = access.force_reconnect_notify.notified();
-    let gained = access.connectivity_gain.retry_wake();
-    async move {
-        tokio::select! {
-            _ = forced => {},
-            _ = gained => {},
-        }
+// Subscriptions belong to the whole connector pass, not the eventual sleep.
+// Notify::notify_waiters does not retain a permit for a later subscription:
+// a signal between checking peer state / selecting a failed dial and entering
+// backoff must still wake that pass. A sibling gain only wakes retry waits;
+// only the separately retained network subscription may cancel a live dial.
+async fn wait_for_retry_wake(
+    forced: std::pin::Pin<&mut tokio::sync::futures::Notified<'_>>,
+    gained: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+) {
+    tokio::select! {
+        _ = forced => {},
+        _ = gained => {},
     }
 }
 
@@ -356,6 +355,12 @@ pub fn spawn_outbound_peers(
             let we_keep_outbound = access.local_node_id.as_slice() < peer_node_id.as_slice();
 
             loop {
+                // Arm before any state check, dial, error formatting or log.
+                // Keeping these futures also covers the check-to-wait gap in
+                // has_session/directional/ban guards and after a failed dial.
+                let forced = access.force_reconnect_notify.notified();
+                let gained = access.connectivity_gain.retry_wake();
+                tokio::pin!(forced, gained);
                 // Mark refreshes that arrived while a healthy SessionRunner
                 // owned the task as observed. `watch` retains a generation,
                 // not a one-shot permit, so a stale wake cannot cancel the
@@ -428,7 +433,7 @@ pub fn spawn_outbound_peers(
                     tokio::select! {
                         _ = shutdown_rx.changed() => break,
                         _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
-                        _ = wait_for_retry_wake(&access) => {}
+                        _ = wait_for_retry_wake(forced.as_mut(), gained.as_mut()) => {}
                         changed = refresh_rx.changed() => {
                             if changed.is_err() { break; }
                         }
@@ -457,7 +462,7 @@ pub fn spawn_outbound_peers(
                     tokio::select! {
                         _ = shutdown_rx.changed() => break,
                         _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
-                        _ = wait_for_retry_wake(&access) => {}
+                        _ = wait_for_retry_wake(forced.as_mut(), gained.as_mut()) => {}
                         changed = refresh_rx.changed() => {
                             if changed.is_err() { break; }
                         }
@@ -484,7 +489,7 @@ pub fn spawn_outbound_peers(
                     tokio::select! {
                         _ = shutdown_rx.changed() => break,
                         _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
-                        _ = wait_for_retry_wake(&access) => {}
+                        _ = wait_for_retry_wake(forced.as_mut(), gained.as_mut()) => {}
                         changed = refresh_rx.changed() => {
                             if changed.is_err() { break; }
                         }
@@ -493,7 +498,7 @@ pub fn spawn_outbound_peers(
                 }
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
-                    _ = access.force_reconnect_notify.notified() => {
+                    _ = forced.as_mut() => {
                         // A dial/transport handshake can still be using the
                         // previous local network. Waiting for its timeout also
                         // loses this broadcast before the backoff arm starts
@@ -859,6 +864,11 @@ pub fn spawn_outbound_peers(
                                 // connector loops so peers unreachable on the
                                 // old path get re-dialed promptly.
                                 access.connectivity_gain.on_outbound_session_established();
+                                // Our own success is not an external recovery
+                                // wake for our eventual stillborn-session pause.
+                                // Re-arm only gain, retaining any network change
+                                // through setup, runner lifetime and teardown.
+                                gained.set(access.connectivity_gain.retry_wake());
                                 //gossip our self-signed
                                 // transport announcement to the new peer (mirror of
                                 // the inbound path) so resolves of `local_node_id`
@@ -977,7 +987,7 @@ pub fn spawn_outbound_peers(
                                     tokio::select! {
                                         _ = shutdown_rx.changed() => break,
                                         _ = tokio::time::sleep(jittered(pause)) => {}
-                                        _ = wait_for_retry_wake(&access) => {
+                                        _ = wait_for_retry_wake(forced.as_mut(), gained.as_mut()) => {
                                             stillborn_pause = backoff_min;
                                         }
                                         changed = refresh_rx.changed() => {
@@ -1111,7 +1121,7 @@ pub fn spawn_outbound_peers(
                                 tokio::select! {
                                     _ = shutdown_rx.changed() => break,
                                     _ = tokio::time::sleep(sleep_dur) => {}
-                                    _ = wait_for_retry_wake(&access) => {
+                                    _ = wait_for_retry_wake(forced.as_mut(), gained.as_mut()) => {
                                         woken_by_connectivity = true;
                                     }
                                     changed = refresh_rx.changed() => {
