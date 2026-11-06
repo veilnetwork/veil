@@ -45,7 +45,7 @@ impl Observation {
             return;
         }
         log::info!(target: "transport.tcp_trace.handshake",
-            "connection={} monotonic_us={} side={:?} outcome={} phase={:?} elapsed_ms={} written_bytes={} read_bytes={} socket={:?} kernel={:?}",
+            "tcp_handshake connection={} monotonic_us={} side={:?} outcome={} phase={:?} elapsed_ms={} written_bytes={} read_bytes={} socket={:?} kernel={:?}",
             self.connection,
             veil_util::diagnostic_clock::monotonic_us().map_or_else(|| "unknown".to_owned(), |us| us.to_string()),
             self.side, outcome, self.phase, self.started.elapsed().as_millis(),
@@ -305,7 +305,7 @@ mod tests {
         .await;
         drop(io);
         assert_eq!(remote.read(&mut byte).await.unwrap(), 0);
-        let key = format!("connection={connection} ");
+        let key = format!("tcp_handshake connection={connection} ");
         let rows: Vec<_> = RECORDER
             .0
             .lock()
@@ -331,6 +331,8 @@ mod tests {
             "socket must still be live when sampled"
         );
         for row in rows {
+            // Android may discard the log target: the message stays identifiable.
+            assert!(row.starts_with("tcp_handshake "));
             assert!(!row.contains("private-handshake-canary"));
             assert!(!row.contains("127.0.0.1"));
         }
