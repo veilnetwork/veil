@@ -2,6 +2,116 @@ use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::time::timeout;
 
+struct FaultStream {
+    read_error: Option<io::ErrorKind>,
+    write_error: Option<io::ErrorKind>,
+    write_zero: bool,
+    read_polled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl tokio::io::AsyncRead for FaultStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        _: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        self.read_polled
+            .store(true, std::sync::atomic::Ordering::Release);
+        match self.read_error {
+            Some(kind) => std::task::Poll::Ready(Err(io::Error::new(kind, "PRIVATE_IO_CANARY"))),
+            None => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for FaultStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        _: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match self.write_error {
+            Some(kind) => std::task::Poll::Ready(Err(io::Error::new(kind, "PRIVATE_IO_CANARY"))),
+            None if self.write_zero => std::task::Poll::Ready(Ok(0)),
+            None => std::task::Poll::Pending,
+        }
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn first_io_failure_is_typed_and_survives_teardown_without_error_text() {
+    for (read_error, write_error, write_zero, expected) in [
+        (
+            Some(io::ErrorKind::ConnectionReset),
+            None,
+            false,
+            RecordCloseReason::ReadError,
+        ),
+        // An InvalidData error from an encrypted transport is not evidence
+        // that the local two-byte record length parser rejected a record.
+        (
+            Some(io::ErrorKind::InvalidData),
+            None,
+            false,
+            RecordCloseReason::ReadError,
+        ),
+        (
+            None,
+            Some(io::ErrorKind::BrokenPipe),
+            false,
+            RecordCloseReason::WriteError,
+        ),
+        (None, None, true, RecordCloseReason::WriteZero),
+    ] {
+        let plane = OrderedRecordPlane::new(Box::new(FaultStream {
+            read_error,
+            write_error,
+            write_zero,
+            read_polled: Arc::default(),
+        }));
+        let h = plane.handle();
+        h.send(b"opaque").unwrap();
+        timeout(Duration::from_secs(1), h.closed()).await.unwrap();
+        until(|| plane.tasks.iter().all(|task| task.is_finished())).await;
+        assert_eq!(h.progress().close_reason, expected);
+        h.close();
+        drop(plane);
+        assert_eq!(h.progress().close_reason, expected);
+        assert!(!format!("{:?}", h.progress()).contains("PRIVATE_IO_CANARY"));
+    }
+}
+
+#[tokio::test]
+async fn cancelled_reader_retains_a_terminal_cause_and_wakes_other_half() {
+    let polled: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+    let plane = OrderedRecordPlane::new(Box::new(FaultStream {
+        read_error: None,
+        write_error: None,
+        write_zero: false,
+        read_polled: polled.clone(),
+    }));
+    let h = plane.handle();
+    until(|| polled.load(std::sync::atomic::Ordering::Acquire)).await;
+    plane.tasks[0].abort();
+    timeout(Duration::from_secs(1), h.closed()).await.unwrap();
+    until(|| plane.tasks.iter().all(|task| task.is_finished())).await;
+    assert_eq!(h.progress().close_reason, RecordCloseReason::TaskEnded);
+    drop(plane);
+    assert_eq!(h.progress().close_reason, RecordCloseReason::TaskEnded);
+}
+
 async fn raw_record(peer: &mut DuplexStream) -> Vec<u8> {
     timeout(Duration::from_secs(2), async {
         let len = peer.read_u16().await.unwrap() as usize;
@@ -51,6 +161,8 @@ async fn duplex_records_flush_the_last_buffered_record_and_preserve_boundaries()
         .await;
     assert_eq!(left.send_buffer_space(), RECORD_BUFFER_BYTES);
     assert_eq!(right.send_buffer_space(), RECORD_BUFFER_BYTES);
+    assert_eq!(left.progress().close_reason, RecordCloseReason::Open);
+    assert_eq!(right.progress().close_reason, RecordCloseReason::Open);
 }
 
 #[tokio::test]
@@ -68,6 +180,7 @@ async fn queued_expiry_skips_unsent_records_and_preserves_the_live_child() {
     h.send(b"fresh").unwrap();
     until(|| h.progress().expired_records == 5).await;
     assert!(h.max_size().is_some());
+    assert_eq!(h.progress().close_reason, RecordCloseReason::Open);
     assert_eq!(peer.read_u8().await.unwrap(), b'x');
     assert_eq!(raw_record(&mut peer).await, b"fresh");
     until(|| h.progress().completed_records == 1 && h.progress().expired_records == 5).await;
@@ -134,6 +247,17 @@ async fn invalid_or_truncated_record_closes_both_halves_before_dispatch() {
         );
         assert_eq!(h.send(b"reply"), Err(RecordSendError::Closed));
         until(|| plane.tasks.iter().all(|task| task.is_finished())).await;
+        let expected = if wire.len() == 2 {
+            RecordCloseReason::InvalidRecord
+        } else {
+            RecordCloseReason::ReadEof
+        };
+        assert_eq!(h.progress().close_reason, expected);
+        // Teardown of either half and a later owner drop cannot replace the
+        // initiating cause with the generic close observed by the other half.
+        h.close();
+        drop(plane);
+        assert_eq!(h.progress().close_reason, expected);
     }
 }
 
@@ -161,6 +285,7 @@ async fn owner_drop_wakes_retained_pending_reads_and_other_planes_survive() {
         io::ErrorKind::ConnectionAborted
     );
     until(|| h.0.capacity.available_permits() == RECORD_BUFFER_BYTES).await;
+    assert_eq!(h.progress().close_reason, RecordCloseReason::OwnerClosed);
     let (a, b) = tokio::io::duplex(4096);
     let sibling_a = OrderedRecordPlane::new(Box::new(a));
     let sibling_b = OrderedRecordPlane::new(Box::new(b));
@@ -183,6 +308,7 @@ async fn incomplete_write_timeout_closes_the_whole_plane_without_resuming_framin
     assert_eq!(h.progress().completed_records, 0);
     until(|| plane.tasks.iter().all(|task| task.is_finished())).await;
     assert_eq!(h.0.capacity.available_permits(), RECORD_BUFFER_BYTES);
+    assert_eq!(h.progress().close_reason, RecordCloseReason::WriteTimeout);
 }
 
 #[tokio::test]
@@ -214,6 +340,10 @@ async fn partial_record_expiry_retires_only_its_child_and_a_fresh_child_can_deli
     until(|| plane.tasks.iter().all(|task| task.is_finished())).await;
     assert_eq!(h.progress().completed_records, 0);
     assert_eq!(h.progress().expired_records, 1);
+    assert_eq!(
+        h.progress().close_reason,
+        RecordCloseReason::PartialRecordExpired
+    );
     assert_eq!(h.0.capacity.available_permits(), RECORD_BUFFER_BYTES);
     assert_eq!(h.send(b"old connection"), Err(RecordSendError::Closed));
     let mut tail = Vec::new();
