@@ -567,7 +567,9 @@ mod tests {
             }
             let output = command.output().unwrap();
             assert!(
-                output.status.success(),
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("running 1 test")
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
                 "sampling configuration {configuration:?}: {}{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr),
