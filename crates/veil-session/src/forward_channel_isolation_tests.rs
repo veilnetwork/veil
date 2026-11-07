@@ -52,6 +52,117 @@ fn opaque_forward(fill: u8) -> Vec<u8> {
     veil_proto::codec::encode_frame(&header, &body)
 }
 
+#[tokio::test]
+async fn own_keepalive_does_not_hold_neutral_forward_behind_a_full_canonical_writer() {
+    use crate::keepalive_emit::{PendingKeepaliveProbe, enqueue_probe};
+    use crate::priority_queue::{HeadAdmission, PriorityQueue};
+
+    // The real writer owns a partially written first blob and a full channel.
+    // Its reader stays alive and unread; no timeout/EOF can free this capacity.
+    let (canonical, mut peer) = tokio::io::duplex(1);
+    let canonical: veil_transport::BoxIoStream = Box::new(canonical);
+    let (_read, write) = tokio::io::split(canonical);
+    let (wire_tx, wire_rx) = mpsc::channel::<super::super::WireBlob>(1);
+    let _writer = super::super::OwnedWriter(tokio::spawn(super::super::writer_task(
+        write,
+        wire_rx,
+        None,
+        None,
+        None,
+        Arc::new(veil_observability::NodeLogger::new_noop()),
+        "fixture".into(),
+    )));
+    let first = veil_bufpool::pooled_shared_from_vec(vec![0x31; 64]);
+    let second = veil_bufpool::pooled_shared_from_vec(vec![0x72; 64]);
+    wire_tx.send(first.clone().into()).await.unwrap();
+    wire_tx.send(second.clone().into()).await.unwrap();
+    assert_eq!(wire_tx.capacity(), 0);
+
+    let mut queue = PriorityQueue::with_default_weights();
+    let mut pending = PendingKeepaliveProbe::new();
+    let now = tokio::time::Instant::now();
+    assert!(!enqueue_probe(&mut queue, &mut pending, now));
+    assert!(enqueue_probe(
+        &mut queue,
+        &mut pending,
+        now + Duration::from_secs(1)
+    ));
+    assert_eq!(pending.oldest(), Some(now));
+    let frames = [opaque_forward(21), opaque_forward(22)];
+    for frame in &frames {
+        queue.push_lossy(
+            veil_proto::priority::INTERACTIVE,
+            veil_bufpool::pooled_shared_from_vec(frame.clone()),
+        );
+    }
+
+    // The independent ordered child has real parent/exporter proof, session
+    // encryption, framing and receive decoding. It grants no source class.
+    let parent = ParallelParent::new([1; 32], [2; 32], [3; 32]);
+    let remote = ParallelParent::new([1; 32], [3; 32], [2; 32]);
+    let (channel, keys, raw) = raw_pair(&parent, &remote, 65536);
+    let sender = Arc::new(Mutex::new(RealtimeSender::new(
+        channel.handle(),
+        crate::datagram_flows::SessionDatagramTx::new(
+            channel.keys.tx_key(),
+            &channel.keys.session_id,
+            true,
+        ),
+    )));
+    let mut decoder =
+        crate::datagram_flows::SessionDatagramRx::new(keys.rx_key(), &keys.session_id, true);
+    let receiver = keys.into_ordered(Box::new(raw)).unwrap();
+    for expected in &frames {
+        let selected = queue
+            .pop_admitted_envelope(|_, frame, _, _| {
+                if super::super::datagram_lane_supports_frame(frame, true, true) {
+                    HeadAdmission::Allow
+                } else {
+                    HeadAdmission::FlushBatch
+                }
+            })
+            .expect("own keepalive blocked an independent neutral Forward");
+        assert_eq!(selected.frame.0, veil_proto::priority::INTERACTIVE);
+        assert_eq!(&*selected.frame.1, expected);
+        assert_eq!(wire_tx.capacity(), 0);
+        publish(&sender, &selected.frame.1);
+        let packet = timeout(Duration::from_secs(1), receiver.handle().recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let decoded = decoder
+            .decode_datagram(&packet, std::time::Instant::now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(&decoded, expected);
+        assert_eq!(wire_tx.capacity(), 0);
+    }
+    assert_eq!(queue.drops_total(), 0);
+    assert_eq!(
+        queue.len(),
+        2,
+        "both unacked parent probes must remain queued"
+    );
+    for _ in 0..2 {
+        let probe = queue
+            .pop_admitted_envelope(|_, _, _, _| HeadAdmission::Allow)
+            .unwrap();
+        assert_eq!(probe.frame.0, crate::LOCAL_NETWORK_CONTROL_LANE);
+        let header = decode_header(&probe.frame.1).unwrap();
+        assert_eq!(header.family, FrameFamily::Control as u8);
+        assert_eq!(header.msg_type, veil_proto::ControlMsg::Keepalive as u16);
+        assert!(
+            !super::super::auxiliary_records::outgoing_eligible(&probe.frame.1),
+            "a healthy child must not turn the parent TX probe into child health"
+        );
+    }
+    assert_eq!(pending.oldest(), Some(now));
+    let mut bytes = [0; 128];
+    peer.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(&bytes[..64], &*first);
+    assert_eq!(&bytes[64..], &*second);
+}
+
 pub(super) fn publish(sender: &Arc<Mutex<RealtimeSender>>, frame: &[u8]) {
     let (_, body, kind) = decode_realtime_lane_frame(frame).unwrap();
     let mut sender = lock!(sender);

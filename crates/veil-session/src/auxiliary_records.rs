@@ -16,6 +16,17 @@ pub struct Received {
 }
 
 pub(crate) fn eligible(frame: &[u8]) -> bool {
+    eligible_direction(frame, false)
+}
+
+/// An own keepalive probes the canonical TX leg. Sending it on a healthy
+/// auxiliary child would clear that probe while the parent remains blocked.
+/// Receive eligibility and replies, including KeepaliveAck, stay unchanged.
+pub(crate) fn outgoing_eligible(frame: &[u8]) -> bool {
+    eligible_direction(frame, true)
+}
+
+fn eligible_direction(frame: &[u8], outgoing: bool) -> bool {
     if !crate::reliable_frames::valid_plain(frame) || decode_realtime_lane_frame(frame).is_some() {
         return false;
     }
@@ -23,6 +34,12 @@ pub(crate) fn eligible(frame: &[u8]) -> bool {
         return false;
     };
     if header.family == FrameFamily::Session as u8 {
+        return false;
+    }
+    if outgoing
+        && header.family == FrameFamily::Control as u8
+        && header.msg_type == ControlMsg::Keepalive as u16
+    {
         return false;
     }
     if header.family == FrameFamily::App as u8 {
@@ -104,6 +121,21 @@ mod tests {
     use crate::{parallel_binding::ParallelParent, reliable_frames::ReliableFrameChannel};
     use tokio::time::{Duration, timeout};
 
+    #[test]
+    fn own_keepalive_probe_stays_canonical_without_rejecting_received_control() {
+        let probe = crate::keepalive_emit::build_keepalive_frame();
+        assert!(eligible(&probe), "receive compatibility must not change");
+        assert!(
+            !outgoing_eligible(&probe),
+            "TX probe must observe its parent"
+        );
+        let mut ack = probe.clone();
+        let mut header = decode_header(&ack).unwrap();
+        header.msg_type = ControlMsg::KeepaliveAck as u16;
+        ack[..veil_proto::header::HEADER_SIZE]
+            .copy_from_slice(&veil_proto::codec::encode_header(&header));
+        assert!(outgoing_eligible(&ack));
+    }
     #[test]
     fn peer_triggered_data_replies_keep_neutral_local_admission() {
         use crate::priority_queue::{HeadAdmission, PriorityQueue};

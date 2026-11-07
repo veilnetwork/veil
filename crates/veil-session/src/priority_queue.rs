@@ -53,6 +53,17 @@ fn queue_index(priority: u8) -> usize {
     }
 }
 
+// Private queue indices are not lower wire priorities. Keep their existing
+// logical class for admission and mobile batching, without merging their FIFO
+// or WRR state: DATA is background; network maintenance/signaling interactive.
+fn service_priority(index: usize) -> u8 {
+    match index {
+        4 => BACKGROUND,
+        5 | 6 => INTERACTIVE,
+        _ => index as u8,
+    }
+}
+
 /// g: maximum aggregate frames buffered across all local
 /// queues per session. Above this, lowest-priority frames are
 /// shed first; same priority shed front-of-queue (oldest).
@@ -605,27 +616,32 @@ impl PriorityQueue {
             // Shed one frame from the lowest priority that has any queued —
             // prefer victimising lower-priority traffic over dropping the
             // incoming frame, so REALTIME/INTERACTIVE stays responsive when
-            // BULK floods the queue. Larger index = lower priority, so scan
-            // lowest→p and only victimise frames AT OR BELOW the incoming frame's
-            // priority. If everything queued outranks the incoming frame (e.g.
+            // BULK floods the queue. Private queue numbers are not urgency:
+            // only victimise logical classes AT OR BELOW the incoming class.
+            // If everything queued outranks the incoming frame (e.g.
             // a BACKGROUND cover frame arriving into a queue full of REALTIME
             // data), drop the INCOMING frame instead of inverting priority.
             // (audit cycle-8 F4.)
             let mut shed = false;
-            for shed_p in (p..LOCAL_QUEUE_COUNT).rev() {
-                if let Some(index) = self.queues[shed_p]
-                    .iter()
-                    .position(|q| q.reliable_credit.is_none())
-                {
-                    if let Some(queued) = self.queues[shed_p].remove(index) {
-                        queued.trace_lossy_drop(shed_p as u8, "queue_overflow");
-                        if queued.lossy_realtime {
-                            self.lossy_realtime_len[shed_p] -= 1;
-                        }
+            'find_victim: for class in (service_priority(p)..=BACKGROUND).rev() {
+                for shed_p in (0..LOCAL_QUEUE_COUNT).rev() {
+                    if service_priority(shed_p) != class {
+                        continue;
                     }
-                    self.drops_total.fetch_add(1, Ordering::Relaxed);
-                    shed = true;
-                    break;
+                    if let Some(index) = self.queues[shed_p]
+                        .iter()
+                        .position(|q| q.reliable_credit.is_none())
+                    {
+                        if let Some(queued) = self.queues[shed_p].remove(index) {
+                            queued.trace_lossy_drop(shed_p as u8, "queue_overflow");
+                            if queued.lossy_realtime {
+                                self.lossy_realtime_len[shed_p] -= 1;
+                            }
+                        }
+                        self.drops_total.fetch_add(1, Ordering::Relaxed);
+                        shed = true;
+                        break 'find_victim;
+                    }
                 }
             }
             if !shed {
@@ -766,14 +782,15 @@ impl PriorityQueue {
         (0..LOCAL_QUEUE_COUNT as u8).find(|&p| !self.queues[p as usize].is_empty())
     }
 
-    /// Local signaling retains interactive urgency on ordered compatibility
-    /// paths. Its private queue number must not engage battery batching.
+    /// Private network control/signaling queues retain interactive urgency.
+    /// Their indices must not engage battery batching on canonical paths.
     pub(crate) fn coalescing_priority(&self) -> Option<u8> {
-        if !self.queues[LOCAL_SIGNALING_LANE as usize].is_empty() {
-            Some(self.peek_priority().unwrap_or(INTERACTIVE).min(INTERACTIVE))
-        } else {
-            self.peek_priority()
-        }
+        self.queues
+            .iter()
+            .enumerate()
+            .filter(|(_, queue)| !queue.is_empty())
+            .map(|(index, _)| service_priority(index))
+            .min()
     }
 
     pub(crate) fn note_local_primary(&mut self, now: Instant) {
@@ -1183,6 +1200,57 @@ mod tests {
             coalescer.coalesce_deadline(window, pq.coalescing_priority()),
             None
         );
+    }
+
+    #[test]
+    fn own_keepalive_does_not_inherit_the_mobile_background_batch_window() {
+        let now = tokio::time::Instant::now();
+        let coalescer = crate::outbound_batch_coalescer::OutboundBatchCoalescer::new(now);
+        let window = Some(Duration::from_secs(1));
+        let mut queue = PriorityQueue::with_default_weights();
+        queue.push(BULK, arc(b"bulk"));
+        assert!(coalescer.is_coalescing(now, window, queue.coalescing_priority()));
+        crate::keepalive_emit::enqueue_probe(
+            &mut queue,
+            &mut crate::keepalive_emit::PendingKeepaliveProbe::new(),
+            now,
+        );
+        assert!(!coalescer.is_coalescing(now, window, queue.coalescing_priority()));
+        assert_eq!(
+            coalescer.coalesce_deadline(window, queue.coalescing_priority()),
+            None
+        );
+    }
+
+    #[test]
+    fn own_keepalive_keeps_interactive_admission_at_full_capacity() {
+        let is_probe = |bytes: &[u8]| {
+            veil_proto::codec::decode_header(bytes).is_ok_and(|header| {
+                header.family == veil_proto::FrameFamily::Control as u8
+                    && header.msg_type == veil_proto::ControlMsg::Keepalive as u16
+            })
+        };
+        let mut pending = crate::keepalive_emit::PendingKeepaliveProbe::new();
+        let mut queue = PriorityQueue::with_capacity(DEFAULT_WEIGHTS, 2);
+        queue.push(BULK, arc(b"old bulk"));
+        queue.push(BULK, arc(b"new bulk"));
+        crate::keepalive_emit::enqueue_probe(&mut queue, &mut pending, tokio::time::Instant::now());
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.drops_total(), 1);
+        let frames: Vec<_> = std::iter::from_fn(|| queue.pop()).collect();
+        assert!(
+            frames.iter().any(|f| is_probe(f)),
+            "private queue number dropped an interactive probe"
+        );
+        assert!(frames.iter().any(|f| f.as_ref() == b"new bulk"));
+        assert!(!frames.iter().any(|f| f.as_ref() == b"old bulk"));
+
+        let mut queue = PriorityQueue::with_capacity(DEFAULT_WEIGHTS, 1);
+        crate::keepalive_emit::enqueue_probe(&mut queue, &mut pending, tokio::time::Instant::now());
+        queue.push(BACKGROUND, arc(b"must not replace the probe"));
+        assert_eq!(queue.drops_total(), 1);
+        assert!(is_probe(&queue.pop().unwrap()));
+        assert!(queue.is_empty());
     }
 
     #[test]
