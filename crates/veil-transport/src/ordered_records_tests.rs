@@ -134,7 +134,9 @@ fn record_trace_observes_real_io_without_claiming_remote_ack() {
             .output()
             .unwrap();
         assert!(
-            output.status.success(),
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("running 1 test")
+                && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
