@@ -40,8 +40,11 @@ fn platform_interval() -> Option<String> {
     None
 }
 
-fn configured_interval(environment: Option<&str>, platform: Option<&str>) -> u64 {
-    interval(environment.or(platform))
+fn configured_interval(environment: Option<&std::ffi::OsStr>, platform: Option<&str>) -> u64 {
+    match environment {
+        Some(value) => interval(value.to_str()),
+        None => interval(platform),
+    }
 }
 
 /// Keep the first candidate and every Nth cell. An explicitly configured
@@ -52,7 +55,7 @@ fn configured_interval(environment: Option<&str>, platform: Option<&str>) -> u64
 pub fn sample(sequence: u64) -> bool {
     static INTERVAL: OnceLock<u64> = OnceLock::new();
     let every = *INTERVAL.get_or_init(|| {
-        let environment = std::env::var("VEIL_RT_TRACE_SEALED_EVERY").ok();
+        let environment = std::env::var_os("VEIL_RT_TRACE_SEALED_EVERY");
         let platform = environment.is_none().then(platform_interval).flatten();
         configured_interval(environment.as_deref(), platform.as_deref())
     });
@@ -97,12 +100,23 @@ mod tests {
 
     #[test]
     fn platform_sampling_is_bounded_and_never_overrides_explicit_environment() {
-        assert_eq!(configured_interval(None, Some("1")), 1);
-        assert_eq!(configured_interval(None, Some("0")), 50);
-        assert_eq!(configured_interval(None, Some("51")), 50);
-        assert_eq!(configured_interval(None, None), 50);
-        assert_eq!(configured_interval(Some("10"), Some("1")), 10);
+        let choose = |environment: Option<&str>, platform| {
+            configured_interval(environment.map(std::ffi::OsStr::new), platform)
+        };
+        assert_eq!(choose(None, Some("1")), 1);
+        assert_eq!(choose(None, Some("0")), 50);
+        assert_eq!(choose(None, Some("51")), 50);
+        assert_eq!(choose(None, None), 50);
+        assert_eq!(choose(Some("10"), Some("1")), 10);
         // An explicit invalid environment option still retains sparse mode.
-        assert_eq!(configured_interval(Some("0"), Some("1")), 50);
+        assert_eq!(choose(Some("0"), Some("1")), 50);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_explicit_environment_retains_sparse_mode() {
+        use std::os::unix::ffi::OsStrExt;
+        let invalid = std::ffi::OsStr::from_bytes(&[0xff]);
+        assert_eq!(configured_interval(Some(invalid), Some("1")), 50);
     }
 }
