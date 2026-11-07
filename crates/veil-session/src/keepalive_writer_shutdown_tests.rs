@@ -179,6 +179,114 @@ async fn ordinary_writer_shutdown_still_drains_the_accepted_blob() {
     stop.await;
 }
 
+struct FlushBlocked {
+    flushing: Arc<AtomicBool>,
+    shutdowns: Arc<AtomicUsize>,
+    dropped: Arc<AtomicBool>,
+}
+impl AsyncRead for FlushBlocked {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Pending
+    }
+}
+impl AsyncWrite for FlushBlocked {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Ready(Ok(bytes.len()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.flushing.store(true, Ordering::SeqCst);
+        Poll::Pending
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.shutdowns.fetch_add(1, Ordering::SeqCst);
+        Poll::Pending
+    }
+}
+impl Drop for FlushBlocked {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_flush_releases_runner_and_registry_without_drain_grace() {
+    let peer = [0xB1; 32];
+    let mut registry = crate::SessionTxRegistry::new();
+    let outbox = registry.register(peer);
+    // Retain the producer: outbox EOF cannot substitute for writer failure.
+    let producer = registry.get_sender(&peer).unwrap().clone();
+    let header = veil_proto::FrameHeader::new(
+        veil_proto::family::FrameFamily::App as u8,
+        veil_proto::family::AppMsg::AppData as u16,
+    );
+    producer
+        .try_send((
+            veil_proto::priority::INTERACTIVE,
+            veil_bufpool::pooled_shared_from_vec(
+                veil_proto::codec::encode_header(&header).to_vec(),
+            ),
+        ))
+        .unwrap();
+    let flushing = Arc::new(AtomicBool::new(false));
+    let shutdowns = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mut runner = make_runner(
+        Box::new(FlushBlocked {
+            flushing: flushing.clone(),
+            shutdowns: shutdowns.clone(),
+            dropped: dropped.clone(),
+        }),
+        outbox,
+        None,
+    );
+    assert!(runner.keepalive_interval.is_zero() && runner.idle_timeout.is_zero());
+    let mut run = Box::pin(runner.run());
+    for _ in 0..32 {
+        assert!(poll_once(run.as_mut()).await.is_pending());
+        tokio::task::yield_now().await;
+        if flushing.load(Ordering::SeqCst) {
+            break;
+        }
+    }
+    assert!(
+        flushing.load(Ordering::SeqCst),
+        "writer never reached flush"
+    );
+    tokio::time::advance(super::super::WRITE_PROGRESS_TIMEOUT).await;
+    let decision_at = tokio::time::Instant::now();
+    let mut returned = false;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+        if poll_once(run.as_mut()).await.is_ready() {
+            returned = true;
+            break;
+        }
+    }
+    assert_eq!(tokio::time::Instant::now(), decision_at);
+    drop(run);
+    drop(runner);
+    tokio::task::yield_now().await;
+    assert!(
+        returned,
+        "terminal flush still gates reconnect on drain grace"
+    );
+    assert!(
+        !registry.has_session(&peer),
+        "dead session remains registered"
+    );
+    assert_eq!(shutdowns.load(Ordering::SeqCst), 0);
+    assert!(dropped.load(Ordering::SeqCst), "failed transport leaked");
+    drop(producer);
+}
+
 struct GatedWriter {
     open: Arc<AtomicBool>,
     writes: Arc<AtomicUsize>,
