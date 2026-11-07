@@ -1077,12 +1077,20 @@ fn spawn_realtime_receiver(
             let frame = match rx.decode_datagram(&datagram, std::time::Instant::now()) {
                 Ok(Some(frame)) => frame,
                 Ok(None) => {
+                    handle.trace_ordered_record(
+                        veil_transport::ordered_record_trace::Stage::FragmentPending,
+                        &datagram,
+                    );
                     if tracing {
                         trace.window.fragments_pending += 1;
                     }
                     continue;
                 }
                 Err(_) => {
+                    handle.trace_ordered_record(
+                        veil_transport::ordered_record_trace::Stage::DecodeRejected,
+                        &datagram,
+                    );
                     if tracing {
                         trace.window.decode_rejected += 1;
                     }
@@ -1100,6 +1108,16 @@ fn spawn_realtime_receiver(
             };
             // Only a fully authenticated, replay-checked and eligible complete
             // frame proves liveness. Rejected fragments never reach this point.
+            if let Some(child) = handle.ordered_trace_id() {
+                crate::opaque_forward_trace::ordered_fragment(
+                    crate::opaque_forward_trace::OrderedStage::AuthenticatedFrame,
+                    None,
+                    &peer_id,
+                    &frame,
+                    child,
+                    &datagram,
+                );
+            }
             activity.note(
                 tokio::time::Instant::now(),
                 kind == RealtimeLaneFrameKind::DirectApp,
@@ -5457,6 +5475,16 @@ impl SessionRunner {
                         // Expiration never changes nonce/counter allocation.
                         let expires_at = local_datagram_expiry(&envelope);
                         for datagram in &datagrams {
+                            if let Some(child) = sender_state.handle.ordered_trace_id() {
+                                crate::opaque_forward_trace::ordered_fragment(
+                                    crate::opaque_forward_trace::OrderedStage::SendAttempt,
+                                    Some(&self.local_node_id),
+                                    &self.peer_id,
+                                    outgoing,
+                                    child,
+                                    datagram,
+                                );
+                            }
                             if sender_state.handle.send_buffer_space()
                                 < sender_state.handle.queue_charge(datagram.len())
                             {

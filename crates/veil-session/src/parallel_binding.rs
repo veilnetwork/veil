@@ -354,6 +354,10 @@ pub struct BoundOrderedHandle {
 }
 
 impl BoundOrderedHandle {
+    pub fn local_trace_id(&self) -> u64 {
+        self.records.local_trace_id()
+    }
+
     pub fn is_closed(&self) -> bool {
         !self.parent.is_active() || self.records.is_closed()
     }

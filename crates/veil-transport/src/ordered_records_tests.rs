@@ -2,6 +2,146 @@ use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::time::timeout;
 
+#[test]
+fn record_trace_observes_real_io_without_claiming_remote_ack() {
+    const CHILD: &str = "VEIL_TEST_ORDERED_TRACE";
+    if let Ok(enabled) = std::env::var(CHILD) {
+        static EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        struct Sink;
+        impl log::Log for Sink {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, r: &log::Record<'_>) {
+                if r.target().ends_with("ordered_record_trace") {
+                    EVENTS.lock().unwrap().push(r.args().to_string());
+                }
+            }
+            fn flush(&self) {}
+        }
+        static SINK: Sink = Sink;
+        log::set_logger(&SINK).unwrap();
+        log::set_max_level(log::LevelFilter::Info);
+        let enabled = enabled == "1";
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                timeout(Duration::from_secs(3), async {
+                    let (left, right) = tokio::io::duplex(8192);
+                    let a = OrderedRecordPlane::new(Box::new(left));
+                    let ah = a.handle();
+                    assert_eq!(ah.local_trace_id() != 0, enabled);
+                    assert_eq!(ah.local_trace_id(), ah.clone().local_trace_id());
+                    let payload = b"PRIVATE_SYNTHETIC_RECORD";
+                    ah.send(payload).unwrap();
+                    while ah.progress().completed_records != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                    // Model a record that expired while queued. Exercise the
+                    // actual writer, not an invented successful send result.
+                    let stale = b"PRIVATE_EXPIRED_RECORD";
+                    let mut wire = (stale.len() as u16).to_be_bytes().to_vec();
+                    wire.extend_from_slice(stale);
+                    let permit =
+                        ah.0.capacity
+                            .clone()
+                            .try_acquire_many_owned(record_queue_charge(stale.len()) as u32)
+                            .unwrap();
+                    let past = Instant::now() - Duration::from_secs(1);
+                    ah.0.outgoing
+                        .send(Record {
+                            wire,
+                            queued_at: past,
+                            expires_at: past,
+                            _bytes: permit,
+                        })
+                        .unwrap();
+                    while ah.progress().expired_records != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                    let before_reader = EVENTS.lock().unwrap().clone();
+                    // The peer has not even started its read task. Local flush
+                    // completion cannot be counted as remote delivery or an ACK.
+                    if enabled {
+                        assert!(before_reader.iter().any(|s| s.contains("stage=flushed ")));
+                        assert!(
+                            !before_reader
+                                .iter()
+                                .any(|s| s.contains("stage=read_complete "))
+                        );
+                    }
+                    let b = OrderedRecordPlane::new(Box::new(right));
+                    let bh = b.handle();
+                    assert_eq!(bh.recv().await.unwrap(), payload);
+                    if enabled {
+                        assert_ne!(ah.local_trace_id(), bh.local_trace_id());
+                    }
+                    let rows = EVENTS.lock().unwrap().clone();
+                    if enabled {
+                        let digest = trace::fingerprint(payload).unwrap();
+                        let stale_digest = trace::fingerprint(stale).unwrap();
+                        assert!(
+                            rows.iter()
+                                .any(|s| s.contains("stage=expired_before_write ")
+                                    && s.contains(&stale_digest))
+                        );
+                        assert!(
+                            !rows
+                                .iter()
+                                .any(|s| s.contains("stage=flushed ") && s.contains(&stale_digest))
+                        );
+                        for stage in [
+                            "send_admitted",
+                            "write_start",
+                            "first_write",
+                            "flushed",
+                            "read_complete",
+                        ] {
+                            assert!(
+                                rows.iter().any(|s| s.contains(&format!("stage={stage} "))
+                                    && s.contains(&format!("record_sha256={digest}"))),
+                                "missing {stage}"
+                            );
+                        }
+                        for row in rows {
+                            assert!(!row.contains("PRIVATE_"));
+                            assert!(!row.contains("ack="));
+                            assert!(!row.contains("peer="));
+                        }
+                        assert!(trace::fingerprint(&[]).is_none());
+                        assert!(trace::fingerprint(&vec![0; MAX_RECORD_BYTES + 1]).is_none());
+                    } else {
+                        assert!(rows.is_empty());
+                        assert!(trace::fingerprint(payload).is_none());
+                    }
+                })
+                .await
+                .unwrap();
+            });
+        return;
+    }
+    for value in ["0", "1", "invalid"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ordered_records::tests::record_trace_observes_real_io_without_claiming_remote_ack",
+                "--nocapture",
+            ])
+            .env(CHILD, value)
+            .env("VEIL_DIAG_ORDERED_RECORDS", value)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 struct ObservedRead {
     stream: DuplexStream,
     bytes: Arc<std::sync::atomic::AtomicUsize>,
