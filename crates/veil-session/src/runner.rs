@@ -5642,7 +5642,8 @@ impl SessionRunner {
                             self.logger.info(
                                 "session.rt_trace.independent_fifo_wait",
                                 format!(
-                                    "at_ms={at_ms} oldest_wait_ms={} pq_depth={} canonical_writer_capacity={}",
+                                    "at_ms={at_ms} peer_id={} oldest_wait_ms={} pq_depth={} canonical_writer_capacity={}",
+                                    hex_short(&self.peer_id),
                                     age.as_millis(),
                                     pq.len(),
                                     wire_tx.capacity()
