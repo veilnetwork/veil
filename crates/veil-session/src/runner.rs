@@ -1047,6 +1047,20 @@ fn spawn_realtime_receiver(
             } {
                 Ok(datagram) => datagram,
                 Err(error) => {
+                    if tracing {
+                        // A peer can have several live/retiring receivers. The
+                        // peer alone does not identify which observed lane
+                        // closed, nor whether its canonical session survived.
+                        logger.info(
+                            "session.rt_trace.datagram_receiver_closed",
+                            format!(
+                                "peer_id={} receiver={} error={error} {}",
+                                hex_short(&peer_id),
+                                trace.id,
+                                handle.path_trace(),
+                            ),
+                        );
+                    }
                     logger.debug(
                         "session.realtime_datagram.receiver_closed",
                         format!("peer_id={} error={error}", hex_short(&peer_id)),
