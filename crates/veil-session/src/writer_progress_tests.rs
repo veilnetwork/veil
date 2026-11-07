@@ -2,6 +2,97 @@ use super::write_with_progress_timeout;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
+/// A failed transport may never finish shutdown (an obfs4 shutdown flushes
+/// its pending ciphertext). Once write/flush has failed, polling it again
+/// must not keep the writer and session retirement alive.
+struct FailedWriteBlockedShutdown {
+    fail_flush: bool,
+    shutdowns: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl tokio::io::AsyncRead for FailedWriteBlockedShutdown {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        _: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Pending
+    }
+}
+
+impl tokio::io::AsyncWrite for FailedWriteBlockedShutdown {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(if self.fail_flush {
+            Ok(bytes.len())
+        } else {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        })
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Pending
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.shutdowns
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::task::Poll::Pending
+    }
+}
+
+async fn failed_writer_releases_without_shutdown(fail_flush: bool) {
+    use std::{future::Future, sync::Arc, task::Poll};
+    let shutdowns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stream: veil_transport::BoxIoStream = Box::new(FailedWriteBlockedShutdown {
+        fail_flush,
+        shutdowns: shutdowns.clone(),
+    });
+    let (_read, write) = tokio::io::split(stream);
+    let (tx, rx) = tokio::sync::mpsc::channel::<super::WireBlob>(1);
+    tx.try_send(super::WireBlob::from(veil_bufpool::pooled_shared_from_vec(
+        b"failed".to_vec(),
+    )))
+    .unwrap();
+    let mut writer = Box::pin(super::writer_task(
+        write,
+        rx,
+        None,
+        None,
+        None,
+        Arc::new(veil_observability::NodeLogger::new_noop()),
+        "fixture".into(),
+    ));
+    let mut result = std::future::poll_fn(|cx| Poll::Ready(writer.as_mut().poll(cx))).await;
+    if fail_flush {
+        assert!(result.is_pending(), "fixture never blocked the flush");
+        tokio::time::advance(super::WRITE_PROGRESS_TIMEOUT).await;
+        result = std::future::poll_fn(|cx| Poll::Ready(writer.as_mut().poll(cx))).await;
+    }
+    assert!(result.is_ready(), "failed writer still waits for shutdown");
+    assert_eq!(shutdowns.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(tx.is_closed(), "failed writer retained its admission queue");
+}
+
+#[tokio::test(start_paused = true)]
+async fn write_error_does_not_enter_blocked_transport_shutdown() {
+    failed_writer_releases_without_shutdown(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn flush_timeout_does_not_enter_blocked_transport_shutdown() {
+    failed_writer_releases_without_shutdown(true).await;
+}
+
 #[tokio::test]
 async fn partial_progress_preserves_blob_beyond_one_idle_timeout() {
     let (mut writer, mut reader) = tokio::io::duplex(1);

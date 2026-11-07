@@ -1755,7 +1755,10 @@ async fn writer_task<B: Into<WireBlob>>(
                     "session.writer.write_error",
                     format!("peer_id={peer_id_short} len={wire_len} error={e}"),
                 );
-                break;
+                // Shutdown may flush the same failed buffered transport and
+                // block again. Drop its queue/write half now so retirement and
+                // reconnect do not pay stop_writer's graceful drain allowance.
+                return;
             }
             Err(timeout) => {
                 if let Some(m) = &metrics {
@@ -1774,13 +1777,15 @@ async fn writer_task<B: Into<WireBlob>>(
                         WRITE_PROGRESS_TIMEOUT.as_millis(),
                     ),
                 );
-                break;
+                // A timed-out flush is not a clean end-of-queue. In particular
+                // obfs4 shutdown retries pending ciphertext; the session needs
+                // a fresh authenticated connection instead of another drain.
+                return;
             }
         }
     }
-    // wire_rx closed (main loop dropped wire_tx) OR write error — flush
-    // best-effort and return. Main loop's `await` on the writer JoinHandle
-    // unblocks; session teardown proceeds.
+    // Only ordinary queue closure drains and shuts down gracefully. Terminal
+    // write failures above release ownership without retrying failed I/O.
     let _ = write_half.shutdown().await;
 }
 
