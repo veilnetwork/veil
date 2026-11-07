@@ -218,9 +218,9 @@ impl BootstrapJoinSink for BootstrapJoinForwarder {
             // P2P direct-session epic: a repeated join for a known peer is a
             // REFRESH, not a no-op. The caller (endpoint exchange, network
             // change) may carry a NEW dial address, and the previous session
-            // may be long gone — so update the stored transport (app-added
-            // entries only; a configured peer's address belongs to its config)
-            // and re-enqueue a dial. Idempotence is preserved downstream: the
+            // may be long gone — so refresh runtime-discovered addresses and
+            // re-enqueue a dial. Configured/pinned addresses remain owned by
+            // the operator. Idempotence is preserved downstream: the
             // connector's per-node-id slot refresh wakes the existing loop
             // instead of spawning another, and its `has_session` pre-check
             // skips dialing a peer whose session is up.
@@ -228,22 +228,36 @@ impl BootstrapJoinSink for BootstrapJoinForwarder {
                 .peers
                 .values_mut()
                 .find(|entry| entry.node_id == node_id)
-                .filter(|entry| entry.peer_id.get() >= APP_ADDED_PEER_ID_BASE)
                 .map(|entry| {
-                    entry.transport = peer.transport.clone();
-                    entry.tls_cert = peer.tls_cert.clone();
-                    entry.tls_ca_cert = peer.tls_ca_cert.clone();
-                    entry.clone()
+                    let may_refresh = entry.peer_id.get() >= APP_ADDED_PEER_ID_BASE
+                        && !matches!(
+                            entry.source,
+                            PeerSource::Configured | PeerSource::PinnedRelay
+                        );
+                    if may_refresh {
+                        entry.transport = peer.transport.clone();
+                        entry.tls_cert = peer.tls_cert.clone();
+                        entry.tls_ca_cert = peer.tls_ca_cert.clone();
+                    }
+                    // A configured peer still needs the same bounded redial
+                    // wake, using its operator-owned entry. Ignoring invite
+                    // overrides must not turn an explicit retry into a no-op.
+                    (entry.clone(), may_refresh)
                 });
             drop(st);
             let mut redialed = false;
-            if let Some(entry) = refreshed {
+            let mut dial_transport = peer.transport.clone();
+            if let Some((entry, may_refresh)) = refreshed {
                 // Keep the DHT contact's address current too (add_contact
-                // updates in place for a known node_id).
-                self.dht.add_contact(veil_dht::routing::Contact::new(
-                    node_id_bytes,
-                    &entry.transport,
-                ));
+                // updates in place for a known node_id). Only a refreshed
+                // runtime-discovered address may replace this routing metadata.
+                if may_refresh {
+                    self.dht.add_contact(veil_dht::routing::Contact::new(
+                        node_id_bytes,
+                        &entry.transport,
+                    ));
+                }
+                dial_transport = entry.transport.clone();
                 redialed = self.dial_tx.try_send(entry).is_ok();
             }
             self.logger.info(
@@ -251,7 +265,7 @@ impl BootstrapJoinSink for BootstrapJoinForwarder {
                 format!(
                     "node_id={} transport={} redialed={}",
                     veil_util::hex_short(&node_id_bytes),
-                    veil_util::redact_addr_for_log(&peer.transport),
+                    veil_util::redact_addr_for_log(&dial_transport),
                     redialed,
                 ),
             );
@@ -461,5 +475,180 @@ mod tests {
             .try_recv()
             .expect("repeat join must re-enqueue a dial");
         assert_eq!(redial.transport, "tcp://192.168.0.11:9000");
+    }
+
+    fn configured_join_fixture(
+        source: PeerSource,
+        peer_id: veil_cfg::PeerId,
+    ) -> (
+        BootstrapJoinForwarder,
+        Arc<Mutex<NodeState>>,
+        tokio::sync::mpsc::Receiver<PeerConfigEntry>,
+        BootstrapPeer,
+        PeerConfigEntry,
+    ) {
+        let kp = veil_crypto::generate_keypair(veil_cfg::SignatureAlgorithm::Ed25519);
+        let peer = BootstrapPeer {
+            transport: "tcp://192.0.2.25:9010".to_owned(),
+            public_key: kp.public_key.clone(),
+            nonce: "AAAAAAAA".to_owned(),
+            algo: veil_cfg::SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        };
+        let entry = PeerConfigEntry {
+            peer_id,
+            node_id: NodeId::from_public_key(peer.algo, &peer.public_key).unwrap(),
+            public_key: peer.public_key.clone(),
+            nonce: peer.nonce.clone(),
+            transport: peer.transport.clone(),
+            algo: peer.algo,
+            tls_cert: Some("operator certificate".to_owned()),
+            tls_key: Some("operator private key".to_owned()),
+            tls_ca_cert: Some("operator CA".to_owned()),
+            bootstrap_only: false,
+            source,
+        };
+        let state = empty_state();
+        state
+            .lock()
+            .unwrap()
+            .peers
+            .insert(entry.peer_id, entry.clone());
+        let dht = Arc::new(veil_dht::KademliaService::new([7u8; 32]));
+        let (dial_tx, dial_rx) = tokio::sync::mpsc::channel(1);
+        let forwarder = BootstrapJoinForwarder::new(
+            Arc::new(NodeLogger::new_noop()),
+            Arc::clone(&state),
+            dht,
+            dial_tx,
+        );
+        (forwarder, state, dial_rx, peer, entry)
+    }
+
+    #[test]
+    fn repeat_join_redials_configured_peer_without_replacing_operator_state() {
+        let (forwarder, state, mut dial_rx, peer, entry) =
+            configured_join_fixture(PeerSource::Configured, veil_cfg::PeerId::new(7));
+        let uri = veil_bootstrap::encode_bootstrap_uri(&peer).unwrap();
+        assert!(matches!(
+            forwarder.join_uri(&uri, None, None),
+            BootstrapJoinOutcome::AlreadyRegistered { .. }
+        ));
+        assert_eq!(
+            dial_rx
+                .try_recv()
+                .expect("known configured peer must be re-enqueued"),
+            entry
+        );
+        let state = state.lock().unwrap();
+        assert_eq!(state.peers.len(), 1);
+        assert_eq!(state.peers[&entry.peer_id], entry);
+    }
+
+    #[test]
+    fn repeat_join_configured_peer_ignores_invite_address_nonce_and_certificates() {
+        let (forwarder, state, mut dial_rx, mut peer, entry) =
+            configured_join_fixture(PeerSource::Configured, veil_cfg::PeerId::new(7));
+        peer.transport = "tcp://198.51.100.11:9999".to_owned();
+        peer.nonce = "BBBBBBBB".to_owned();
+        let uri = veil_bootstrap::encode_bootstrap_uri(&peer).unwrap();
+        assert!(matches!(
+            forwarder.join_uri(&uri, None, None),
+            BootstrapJoinOutcome::AlreadyRegistered { .. }
+        ));
+        assert_eq!(
+            dial_rx
+                .try_recv()
+                .expect("redial must retain the configured target"),
+            entry
+        );
+        assert_eq!(state.lock().unwrap().peers[&entry.peer_id], entry);
+    }
+
+    #[test]
+    fn repeat_join_pinned_peer_can_retry_after_dial_queue_backpressure() {
+        let (forwarder, state, mut dial_rx, peer, entry) = configured_join_fixture(
+            PeerSource::PinnedRelay,
+            veil_cfg::PeerId::new(crate::types::synthetic_peer_id::PINNED_RELAY_BASE + 7),
+        );
+        let uri = veil_bootstrap::encode_bootstrap_uri(&peer).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                forwarder.join_uri(&uri, None, None),
+                BootstrapJoinOutcome::AlreadyRegistered { .. }
+            ));
+        }
+        assert_eq!(
+            dial_rx
+                .try_recv()
+                .expect("first retry fills the bounded queue"),
+            entry
+        );
+        assert!(
+            dial_rx.try_recv().is_err(),
+            "backpressure must not duplicate entries"
+        );
+        assert!(matches!(
+            forwarder.join_uri(&uri, None, None),
+            BootstrapJoinOutcome::AlreadyRegistered { .. }
+        ));
+        assert_eq!(
+            dial_rx
+                .try_recv()
+                .expect("retry after capacity returns must wake dial"),
+            entry
+        );
+        assert_eq!(state.lock().unwrap().peers[&entry.peer_id], entry);
+    }
+
+    #[test]
+    fn invalid_repeat_invite_does_not_wake_configured_peer() {
+        let (forwarder, state, mut dial_rx, _, entry) =
+            configured_join_fixture(PeerSource::Configured, veil_cfg::PeerId::new(7));
+        assert!(!matches!(
+            forwarder.join_uri("veil:bootstrap?bad=1", None, None),
+            BootstrapJoinOutcome::AlreadyRegistered { .. } | BootstrapJoinOutcome::Ok { .. }
+        ));
+        assert!(dial_rx.try_recv().is_err());
+        assert_eq!(state.lock().unwrap().peers[&entry.peer_id], entry);
+    }
+
+    #[test]
+    fn repeat_join_configured_source_protects_even_an_app_range_id() {
+        let (forwarder, state, mut dial_rx, mut peer, entry) = configured_join_fixture(
+            PeerSource::Configured,
+            veil_cfg::PeerId::new(APP_ADDED_PEER_ID_BASE + 7),
+        );
+        peer.transport = "tcp://198.51.100.11:9999".to_owned();
+        let uri = veil_bootstrap::encode_bootstrap_uri(&peer).unwrap();
+        assert!(matches!(
+            forwarder.join_uri(&uri, None, None),
+            BootstrapJoinOutcome::AlreadyRegistered { .. }
+        ));
+        assert_eq!(dial_rx.try_recv().unwrap(), entry);
+        assert_eq!(state.lock().unwrap().peers[&entry.peer_id], entry);
+    }
+
+    #[test]
+    fn repeat_join_discovered_rendezvous_peer_keeps_endpoint_refresh() {
+        let (forwarder, state, mut dial_rx, mut peer, entry) = configured_join_fixture(
+            PeerSource::Rendezvous,
+            veil_cfg::PeerId::new(crate::types::synthetic_peer_id::RENDEZVOUS_BASE + 7),
+        );
+        peer.transport = "tcp://198.51.100.11:9999".to_owned();
+        let uri = veil_bootstrap::encode_bootstrap_uri(&peer).unwrap();
+        assert!(matches!(
+            forwarder.join_uri(&uri, None, None),
+            BootstrapJoinOutcome::AlreadyRegistered { .. }
+        ));
+        let expected = PeerConfigEntry {
+            transport: peer.transport,
+            tls_cert: peer.tls_cert,
+            tls_ca_cert: peer.tls_ca_cert,
+            ..entry
+        };
+        assert_eq!(dial_rx.try_recv().unwrap(), expected);
+        assert_eq!(state.lock().unwrap().peers[&expected.peer_id], expected);
     }
 }
