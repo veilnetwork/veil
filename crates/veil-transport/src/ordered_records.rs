@@ -5,8 +5,9 @@
 //! constructing the plane. Payloads remain independently authenticated by the
 //! existing session codec. The only framing field is a two-byte length inside
 //! the encrypted transport: no producer role, priority or deadline is sent.
-//! Every incoming record has the SAME local residence bound and oldest-first
-//! eviction policy. This codec must never carry ordinary reliable messages.
+//! Every incoming record has the SAME local residence bound, starting with
+//! its first byte, and oldest-first eviction policy. This codec must never
+//! carry ordinary reliable messages.
 
 use std::collections::VecDeque;
 use std::io;
@@ -90,6 +91,7 @@ pub enum RecordCloseReason {
     ReadEof,
     InvalidRecord,
     ReadError,
+    ReadTimeout,
     WriteError,
     WriteZero,
     PartialRecordExpired,
@@ -106,6 +108,7 @@ impl RecordCloseReason {
             Self::ReadEof => "read_eof",
             Self::InvalidRecord => "invalid_record",
             Self::ReadError => "read_error",
+            Self::ReadTimeout => "read_timeout",
             Self::WriteError => "write_error",
             Self::WriteZero => "write_zero",
             Self::PartialRecordExpired => "partial_record_expired",
@@ -412,13 +415,34 @@ async fn read_records<R: tokio::io::AsyncRead + Unpin>(mut reader: R, handle: Or
     let _close = CloseOnExit(handle.clone());
     let reading = async {
         loop {
-            let len = reader.read_u16().await? as usize;
-            if len == 0 || len > MAX_RECORD_BYTES {
-                handle.note_close_reason(RecordCloseReason::InvalidRecord);
-                return Err::<(), io::Error>(io::ErrorKind::InvalidData.into());
-            }
-            let mut bytes = vec![0; len];
-            reader.read_exact(&mut bytes).await?;
+            // Idle children may remain ready indefinitely. Once a prefix
+            // starts, however, a missing header/body suffix must not retain
+            // this child forever or make an obsolete record fresh when the
+            // suffix finally arrives. One deadline covers the entire suffix;
+            // partial progress never restarts it. Expiry closes this child,
+            // since skipping bytes on a live ordered stream corrupts framing.
+            let first = reader.read_u8().await?;
+            let queued_at = Instant::now();
+            let deadline = tokio::time::Instant::now() + handle.0.receive_max_age;
+            let remaining = async {
+                let second = reader.read_u8().await?;
+                let len = u16::from_be_bytes([first, second]) as usize;
+                if len == 0 || len > MAX_RECORD_BYTES {
+                    handle.note_close_reason(RecordCloseReason::InvalidRecord);
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                let mut bytes = vec![0; len];
+                reader.read_exact(&mut bytes).await?;
+                Ok::<_, io::Error>(bytes)
+            };
+            let bytes = tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => {
+                    handle.note_close_reason(RecordCloseReason::ReadTimeout);
+                    return Err::<(), io::Error>(io::ErrorKind::TimedOut.into());
+                },
+                result = remaining => result?,
+            };
             {
                 let mut q = handle.0.incoming.lock().unwrap_or_else(|e| e.into_inner());
                 if handle.0.closed.is_cancelled() {
@@ -445,7 +469,7 @@ async fn read_records<R: tokio::io::AsyncRead + Unpin>(mut reader: R, handle: Or
                 q.reserved_bytes += charge;
                 q.records.push_back(ReceivedRecord {
                     bytes,
-                    queued_at: now,
+                    queued_at,
                     charge,
                 });
                 let mut p = handle.0.progress.lock().unwrap_or_else(|e| e.into_inner());
