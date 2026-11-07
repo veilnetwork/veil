@@ -176,9 +176,11 @@ fn delivery_digest(data: &[u8]) -> Option<[u8; 32]> {
         return None;
     }
     let seq = u64::from_be_bytes(data[12..20].try_into().ok()?);
-    // Inspect only a fixed encrypted header for sparse sampling. Hash the
-    // ENTIRE ciphertext so an unverified header cannot alias an authentic cell.
-    (seq == 1 || (seq != 0 && seq.is_multiple_of(50))).then(|| *blake3::hash(data).as_bytes())
+    // Use the endpoint's same opt-in sample interval. A fixed 1/50 here made
+    // full captures lose their local timing stages for non-periodic cells.
+    // Hash the ENTIRE ciphertext so an unverified header cannot alias an
+    // authentic cell. This remains a bounded, silent local observation.
+    veil_util::sealed_trace::sample(seq).then(|| *blake3::hash(data).as_bytes())
 }
 
 /// Record a bounded, silent observation on the locally terminating delivery
@@ -500,6 +502,77 @@ mod tests {
         data.extend_from_slice(&seq.to_be_bytes());
         data.extend_from_slice(&[0xa5; 32]);
         data
+    }
+
+    #[test]
+    fn configured_delivery_sampling_in_fresh_processes() {
+        const CHILD: &str = "VEIL_TEST_DELIVERY_SAMPLING";
+        if let Ok(every) = std::env::var(CHILD) {
+            // Process isolation exercises the real OnceLock configuration;
+            // parallel unit tests must never mutate the host environment.
+            let every: u64 = every.parse().unwrap();
+            set_enabled(false);
+            observe_local_delivery(LocalDeliveryStage::SdkRead, &cell(1));
+            assert!(authenticated_local_delivery_ages(&cell(1)).is_none());
+            set_enabled(true);
+            for seq in 0..=151 {
+                let data = cell(seq);
+                let sampled = seq != 0 && (seq == 1 || seq.is_multiple_of(every));
+                let now = Instant::now();
+                observe_local_delivery_at(
+                    LocalDeliveryStage::DaemonQueued,
+                    &data,
+                    now - Duration::from_millis(80),
+                );
+                observe_local_delivery_at(
+                    LocalDeliveryStage::DaemonEncode,
+                    &data,
+                    now - Duration::from_millis(40),
+                );
+                observe_local_delivery_at(
+                    LocalDeliveryStage::SdkRead,
+                    &data,
+                    now - Duration::from_millis(20),
+                );
+                let ages = authenticated_local_delivery_ages(&data);
+                assert_eq!(ages.is_some(), sampled, "sequence {seq}, interval {every}");
+                if let Some(ages) = ages {
+                    assert!(ages.daemon_queue_age_us.unwrap() >= 80_000);
+                    assert!(ages.daemon_age_us.unwrap() >= 40_000);
+                    assert!(ages.sdk_age_us.unwrap() >= 20_000);
+                }
+                assert!(authenticated_local_delivery_ages(&data).is_none());
+            }
+            set_enabled(false);
+            return;
+        }
+        for (configuration, expected) in [
+            (None, "50"),
+            (Some("1"), "1"),
+            (Some("10"), "10"),
+            (Some("0"), "50"),
+            (Some("invalid"), "50"),
+        ] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "route_trace::tests::configured_delivery_sampling_in_fresh_processes",
+                    "--nocapture",
+                ])
+                .env(CHILD, expected)
+                .env_remove("VEIL_RT_TRACE_SEALED_EVERY");
+            if let Some(value) = configuration {
+                command.env("VEIL_RT_TRACE_SEALED_EVERY", value);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "sampling configuration {configuration:?}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
     }
 
     fn direct(data: Vec<u8>) -> Vec<u8> {
