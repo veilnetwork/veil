@@ -2,6 +2,140 @@ use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::time::timeout;
 
+struct ObservedRead {
+    stream: DuplexStream,
+    bytes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl tokio::io::AsyncRead for ObservedRead {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let before = buffer.filled().len();
+        let result = std::pin::Pin::new(&mut self.stream).poll_read(cx, buffer);
+        self.bytes.fetch_add(
+            buffer.filled().len() - before,
+            std::sync::atomic::Ordering::Release,
+        );
+        result
+    }
+}
+
+impl tokio::io::AsyncWrite for ObservedRead {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stream).poll_write(cx, bytes)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn incomplete_incoming_record_expires_from_first_byte_without_retiring_other_children() {
+    for prefix in [&[0][..], &[0, 3][..], &[0, 3, b'o'][..]] {
+        let (stream, mut peer) = tokio::io::duplex(4096);
+        let bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let plane = OrderedRecordPlane::new(Box::new(ObservedRead {
+            stream,
+            bytes: bytes.clone(),
+        }));
+        let h = plane.handle();
+        // Idle time must not start the incomplete-record budget.
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert!(!h.is_closed());
+        peer.write_all(prefix).await.unwrap();
+        until(|| bytes.load(std::sync::atomic::Ordering::Acquire) == prefix.len()).await;
+        tokio::time::sleep(RECORD_RECEIVE_MAX_AGE).await;
+        timeout(Duration::from_millis(1), h.closed())
+            .await
+            .expect("incomplete record retained a live child beyond its receive budget");
+        assert_eq!(h.progress().close_reason, RecordCloseReason::ReadTimeout);
+        assert_eq!(h.progress().received_records, 0);
+        assert_eq!(
+            h.send(b"must not reuse partial framing"),
+            Err(RecordSendError::Closed)
+        );
+        assert!(h.recv().await.is_err());
+        until(|| plane.tasks.iter().all(|task| task.is_finished())).await;
+
+        let (other, mut other_peer) = tokio::io::duplex(4096);
+        let other = OrderedRecordPlane::new(Box::new(other));
+        other_peer.write_all(&[0, 2, b'o', b'k']).await.unwrap();
+        assert_eq!(other.handle().recv().await.unwrap(), b"ok");
+        assert!(!other.handle().is_closed());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn incoming_trickle_does_not_restart_the_record_budget() {
+    let (stream, mut peer) = tokio::io::duplex(4096);
+    let bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let plane = OrderedRecordPlane::new(Box::new(ObservedRead {
+        stream,
+        bytes: bytes.clone(),
+    }));
+    let h = plane.handle();
+    peer.write_all(&[0]).await.unwrap();
+    until(|| bytes.load(std::sync::atomic::Ordering::Acquire) == 1).await;
+    tokio::time::sleep(RECORD_RECEIVE_MAX_AGE / 2).await;
+    peer.write_all(&[3, b'o']).await.unwrap();
+    until(|| bytes.load(std::sync::atomic::Ordering::Acquire) == 3).await;
+    tokio::time::sleep(RECORD_RECEIVE_MAX_AGE / 2).await;
+    timeout(Duration::from_millis(1), h.closed())
+        .await
+        .expect("header/body progress restarted the original record deadline");
+    assert_eq!(h.progress().received_records, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fragmented_incoming_record_keeps_first_byte_age_and_idle_children_remain_usable() {
+    let (stream, mut peer) = tokio::io::duplex(4096);
+    let bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let plane = OrderedRecordPlane::new(Box::new(ObservedRead {
+        stream,
+        bytes: bytes.clone(),
+    }));
+    let h = plane.handle();
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert!(!h.is_closed());
+    let before_first = Instant::now();
+    peer.write_all(&[0]).await.unwrap();
+    until(|| bytes.load(std::sync::atomic::Ordering::Acquire) == 1).await;
+    let after_first = Instant::now();
+    tokio::time::sleep(RECORD_RECEIVE_MAX_AGE / 2).await;
+    peer.write_all(&[3, b'o', b'l', b'd']).await.unwrap();
+    until(|| h.progress().received_records == 1).await;
+    {
+        let q = h.0.incoming.lock().unwrap();
+        let age_origin = q.records.front().unwrap().queued_at;
+        assert!(
+            age_origin >= before_first && age_origin <= after_first,
+            "completed assembly renewed the receive residence budget"
+        );
+    }
+    assert_eq!(h.recv().await.unwrap(), b"old");
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    peer.write_all(&[0, 2, b'o', b'k']).await.unwrap();
+    assert_eq!(h.recv().await.unwrap(), b"ok");
+    assert_eq!(h.progress().received_records, 2);
+    assert!(!h.is_closed());
+}
+
 struct FaultStream {
     read_error: Option<io::ErrorKind>,
     write_error: Option<io::ErrorKind>,

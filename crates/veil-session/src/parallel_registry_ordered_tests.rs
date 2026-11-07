@@ -706,3 +706,58 @@ async fn expired_ordered_child_closes_real_obfs4_io_reclaims_its_lease_and_keeps
     assert_eq!(f.diagnostics.active_connections(), 2);
     f.main_survives().await;
 }
+
+#[tokio::test]
+async fn incomplete_received_record_retires_only_authenticated_child_and_allows_replacement() {
+    for prefix in [&[0][..], &[0, 3, b'o'][..]] {
+        let mut f = Fixture::new(8).await;
+        let (outcome, mut client) = f.dispatch(None, true).await;
+        assert!(matches!(outcome, ParallelPeekOutcome::Bound));
+        let child = f.incoming.recv().await.unwrap();
+        let server = child.finish().await.unwrap();
+        let mut ack = [0; 32];
+        client.stream.read_exact(&mut ack).await.unwrap();
+        let _verified = client.pending.finish(&ack).unwrap();
+
+        let (outcome, sibling) = f.dispatch(None, true).await;
+        assert!(matches!(outcome, ParallelPeekOutcome::Bound));
+        let child = f.incoming.recv().await.unwrap();
+        let (sibling_server, sibling) = tokio::join!(child.finish(), sibling.finish());
+        let sibling_server = sibling_server.unwrap();
+
+        // Preserve a live authenticated obfs4 sender after flushing a partial
+        // record. No sender record-plane timer or EOF can rescue the receiver.
+        client.stream.write_all(prefix).await.unwrap();
+        client.stream.flush().await.unwrap();
+        timeout(Duration::from_secs(2), server.handle().closed())
+            .await
+            .expect("partial received record retained authenticated child");
+        assert_eq!(
+            server.handle().progress().close_reason,
+            veil_transport::ordered_records::RecordCloseReason::ReadTimeout,
+        );
+        assert_eq!(server.handle().progress().received_records, 0);
+        drop(server);
+        drop(client.stream);
+        assert_eq!(f.diagnostics.active_connections(), 1);
+        sibling.handle().send(b"sibling survives").unwrap();
+        assert_eq!(
+            sibling_server.handle().recv().await.unwrap(),
+            b"sibling survives"
+        );
+        f.main_survives().await;
+
+        let (outcome, replacement) = f.dispatch(None, true).await;
+        assert!(matches!(outcome, ParallelPeekOutcome::Bound));
+        let child = f.incoming.recv().await.unwrap();
+        let (replacement_server, replacement) = tokio::join!(child.finish(), replacement.finish());
+        let replacement_server = replacement_server.unwrap();
+        replacement.handle().send(b"fresh proof and keys").unwrap();
+        assert_eq!(
+            replacement_server.handle().recv().await.unwrap(),
+            b"fresh proof and keys"
+        );
+        assert_eq!(f.diagnostics.active_connections(), 2);
+        f.main_survives().await;
+    }
+}
