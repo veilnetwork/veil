@@ -4983,6 +4983,11 @@ impl SessionRunner {
                 // it, independently transported local sources may progress in
                 // their own round. Relayed cells never use that local bypass.
                 let mut source_pressure_retry: Option<std::time::Instant> = None;
+                // Snapshot the last reliable-child refusal in this turn only.
+                // A retry timer alone cannot distinguish a full child from
+                // canonical-writer or other admission pressure. No work is
+                // removed and no transport/cipher ownership changes here.
+                let mut reliable_child_pressure = None;
                 let mut datagram_waiting = [false; LOCAL_TRACE_SLOTS];
                 let mut datagram_drained = 0usize;
                 let mut disable_realtime_sender = false;
@@ -5895,6 +5900,13 @@ impl SessionRunner {
                                 match handle.try_reserve(frame) {
                                     Ok(reservation) => Some(reservation),
                                     Err(FrameReservationError::Full) => {
+                                        if crate::rt_trace::rt_trace_enabled() {
+                                            reliable_child_pressure = Some((
+                                                handle.free_queue_slots(),
+                                                handle.buffered_bytes(),
+                                                handle.record_progress(),
+                                            ));
+                                        }
                                         let retry = now + std::time::Duration::from_millis(10);
                                         source_pressure_retry = Some(source_pressure_retry.map_or(retry, |old| old.min(retry)));
                                         return HeadAdmission::DeferSource;
@@ -6334,10 +6346,19 @@ impl SessionRunner {
                     })
                 {
                     source_reliable_pressure_logged = Some(now);
+                    let child = reliable_child_pressure.map_or_else(
+                        || "pressure_route=other".to_owned(),
+                        |(slots, bytes, progress)| format!(
+                            "pressure_route=child child_free_slots={slots} child_actor_bytes={bytes} child_record_bytes={} child_completed={} child_received={}",
+                            progress.outgoing_buffered_bytes,
+                            progress.completed_records,
+                            progress.received_records,
+                        ),
+                    );
                     self.logger.info(
                         "session.rt_trace.local_reliable_pressure",
                         format!(
-                            "peer_id={} pq_depth={} retry_ms={} heads=[{}]",
+                            "peer_id={} pq_depth={} retry_ms={} heads=[{}] {child}",
                             hex_short(&self.peer_id),
                             pq.len(),
                             retry.saturating_duration_since(now).as_millis(),

@@ -266,6 +266,10 @@ impl ReliableFrameHandle {
         RECORD_BUFFER_BYTES - self.0.bytes.available_permits()
     }
 
+    pub(crate) fn free_queue_slots(&self) -> usize {
+        self.0.queue.capacity()
+    }
+
     pub fn record_progress(&self) -> veil_transport::reliable_records::RecordProgress {
         self.0.transport.progress()
     }
