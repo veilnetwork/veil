@@ -5434,6 +5434,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pki-types",
+ "sha2 0.10.9",
  "socket2",
  "thiserror 2.0.18",
  "tokio",

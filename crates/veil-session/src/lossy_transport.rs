@@ -67,6 +67,23 @@ impl From<BoundOrderedHandle> for LossyTransportHandle {
 }
 
 impl LossyTransportHandle {
+    pub(super) fn ordered_trace_id(&self) -> Option<u64> {
+        match self {
+            Self::Ordered(handle) => Some(handle.local_trace_id()).filter(|id| *id != 0),
+            Self::Quic(_) => None,
+        }
+    }
+
+    pub(super) fn trace_ordered_record(
+        &self,
+        stage: veil_transport::ordered_record_trace::Stage,
+        data: &[u8],
+    ) {
+        if let Some(child) = self.ordered_trace_id() {
+            veil_transport::ordered_record_trace::note(stage, child, data);
+        }
+    }
+
     pub(super) fn is_closed(&self) -> bool {
         match self {
             Self::Quic(handle) => handle.is_closed(),
@@ -127,7 +144,15 @@ impl LossyTransportHandle {
     pub(super) async fn recv(&self) -> veil_transport::Result<Vec<u8>> {
         match self {
             Self::Quic(handle) => handle.recv().await,
-            Self::Ordered(handle) => handle.recv().await.map_err(Into::into),
+            Self::Ordered(handle) => {
+                let data = handle.recv().await?;
+                veil_transport::ordered_record_trace::note(
+                    veil_transport::ordered_record_trace::Stage::DecodeInput,
+                    handle.local_trace_id(),
+                    &data,
+                );
+                Ok(data)
+            }
         }
     }
 
@@ -203,7 +228,8 @@ impl LossyTransportHandle {
                     .active_record_age
                     .map_or_else(|| "none".to_owned(), |age| age.as_micros().to_string());
                 format!(
-                    "transport=ordered record_close_reason={} records_reserved_bytes={} record_write_active_us={} record_queue_max_us={} record_write_max_us={} record_receive_queue_max_us={} records_flushed={} records_expired_outgoing={} records_incoming_bytes={} records_received={} records_evicted_incoming={} records_expired_incoming={}",
+                    "transport=ordered child_local={} record_close_reason={} records_reserved_bytes={} record_write_active_us={} record_queue_max_us={} record_write_max_us={} record_receive_queue_max_us={} records_flushed={} records_expired_outgoing={} records_incoming_bytes={} records_received={} records_evicted_incoming={} records_expired_incoming={}",
+                    handle.local_trace_id(),
                     p.close_reason.as_str(),
                     p.reserved_bytes,
                     active_us,

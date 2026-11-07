@@ -18,7 +18,12 @@ static ENABLED: OnceLock<bool> = OnceLock::new();
 static ROWS: AtomicU64 = AtomicU64::new(0);
 
 pub fn enabled() -> bool {
-    *ENABLED.get_or_init(|| std::env::var("VEIL_DIAG_OPAQUE_FORWARD").is_ok_and(|v| v == "1"))
+    *ENABLED.get_or_init(|| {
+        veil_util::operator_trace::enabled(
+            "VEIL_DIAG_OPAQUE_FORWARD",
+            c"debug.xveil.opaque_forward",
+        )
+    })
 }
 
 fn digest(payload: &[u8]) -> Option<String> {
@@ -140,6 +145,64 @@ pub fn selected(node: &[u8; 32], peer: &[u8; 32], frame: &[u8]) {
     }
 }
 
+pub(crate) enum OrderedStage {
+    SendAttempt,
+    AuthenticatedFrame,
+}
+
+/// Link an opaque Forward to an encrypted ordered fragment. A send attempt is
+/// not admission or delivery. On receive, this is the final fragment of an
+/// authenticated, eligible frame, not proof of application delivery.
+/// Both independent operator gates are required; nothing travels on the wire.
+pub(crate) fn ordered_fragment(
+    stage: OrderedStage,
+    node: Option<&[u8; 32]>,
+    peer: &[u8; 32],
+    frame: &[u8],
+    child: u64,
+    fragment: &[u8],
+) {
+    if !enabled() || ROWS.load(Ordering::Relaxed) > ROW_LIMIT {
+        return;
+    }
+    let Some(record_digest) = veil_transport::ordered_record_trace::fingerprint(fragment) else {
+        return;
+    };
+    let Ok(header) = veil_proto::codec::decode_header(frame) else {
+        return;
+    };
+    let Some(body) = frame.get(veil_proto::header::HEADER_SIZE..) else {
+        return;
+    };
+    if usize::from(header.header_len) != veil_proto::header::HEADER_SIZE
+        || header.body_len as usize != body.len()
+    {
+        return;
+    }
+    let Some(sample) = sample(&header, body) else {
+        return;
+    };
+    let row = ROWS.fetch_add(1, Ordering::Relaxed);
+    if row == ROW_LIMIT {
+        log::info!("delivery.opaque_trace_limit rows={ROW_LIMIT}");
+    }
+    if row >= ROW_LIMIT {
+        return;
+    }
+    let monotonic_us = veil_util::diagnostic_clock::monotonic_us().map_or(-1, i128::from);
+    let stage = match stage {
+        OrderedStage::SendAttempt => "send_attempt",
+        OrderedStage::AuthenticatedFrame => "authenticated_frame",
+    };
+    log::info!(
+        "delivery.opaque_record stage={stage} monotonic_us={monotonic_us} node={} peer={} opaque_sha256={} child_local={child} record_bytes={} record_sha256={record_digest}",
+        node.map_or_else(|| "-".to_owned(), |node| veil_util::hex_str(&node[..4])),
+        veil_util::hex_str(&peer[..4]),
+        sample.digest,
+        fragment.len(),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +235,107 @@ mod tests {
             veil_proto::family::FrameFamily::Delivery as u8,
             veil_proto::family::DeliveryMsg::Forward as u16,
         )
+    }
+
+    #[test]
+    fn ordered_fragment_link_requires_both_operator_gates() {
+        const CHILD: &str = "VEIL_TEST_OPAQUE_RECORD_LINK";
+        if let Ok(expected) = std::env::var(CHILD) {
+            static EVENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            struct Sink;
+            impl log::Log for Sink {
+                fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                    true
+                }
+                fn log(&self, r: &log::Record<'_>) {
+                    if r.target().ends_with("opaque_forward_trace") {
+                        EVENTS.lock().unwrap().push(r.args().to_string());
+                    }
+                }
+                fn flush(&self) {}
+            }
+            static SINK: Sink = Sink;
+            log::set_logger(&SINK).unwrap();
+            log::set_max_level(log::LevelFilter::Info);
+            let secret = b"PRIVATE_OPAQUE_PAYLOAD";
+            let wire = b"PRIVATE_ENCRYPTED_RECORD";
+            let body = forward(secret.to_vec()).encode();
+            let mut h = header();
+            h.body_len = body.len() as u32;
+            let mut frame = veil_proto::codec::encode_header(&h).to_vec();
+            frame.extend_from_slice(&body);
+            ordered_fragment(
+                OrderedStage::SendAttempt,
+                Some(&[1; 32]),
+                &[2; 32],
+                &frame,
+                7,
+                wire,
+            );
+            let rows = EVENTS.lock().unwrap().clone();
+            if expected == "1" {
+                assert_eq!(rows.len(), 1);
+                assert!(rows[0].contains(&format!("opaque_sha256={}", digest(secret).unwrap())));
+                assert!(rows[0].contains(&format!(
+                    "record_sha256={}",
+                    veil_transport::ordered_record_trace::fingerprint(wire).unwrap()
+                )));
+                assert!(rows[0].contains("child_local=7 "));
+                assert!(rows[0].contains("stage=send_attempt "));
+                assert!(!rows[0].contains("PRIVATE_"));
+                ordered_fragment(
+                    OrderedStage::AuthenticatedFrame,
+                    None,
+                    &[2; 32],
+                    &frame,
+                    8,
+                    wire,
+                );
+                assert!(EVENTS.lock().unwrap()[1].contains("stage=authenticated_frame "));
+                assert!(EVENTS.lock().unwrap()[1].contains("node=- "));
+                // Unknown/truncated frames and unbounded records cannot
+                // create links from arbitrary bytes in an enabled capture.
+                ordered_fragment(
+                    OrderedStage::SendAttempt,
+                    Some(&[1; 32]),
+                    &[2; 32],
+                    &frame[..frame.len() - 1],
+                    7,
+                    wire,
+                );
+                ordered_fragment(
+                    OrderedStage::SendAttempt,
+                    Some(&[1; 32]),
+                    &[2; 32],
+                    &frame,
+                    7,
+                    &vec![0; 1201],
+                );
+                assert_eq!(EVENTS.lock().unwrap().len(), 2);
+            } else {
+                assert!(rows.is_empty());
+            }
+            return;
+        }
+        for (opaque, records, expected) in [
+            ("0", "0", "0"),
+            ("1", "0", "0"),
+            ("0", "1", "0"),
+            ("1", "1", "1"),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "opaque_forward_trace::tests::ordered_fragment_link_requires_both_operator_gates", "--nocapture"])
+                .env(CHILD, expected)
+                .env("VEIL_DIAG_OPAQUE_FORWARD", opaque)
+                .env("VEIL_DIAG_ORDERED_RECORDS", records)
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

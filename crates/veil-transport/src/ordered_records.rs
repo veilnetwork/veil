@@ -19,6 +19,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::BoxIoStream;
+use crate::ordered_record_trace::{self as trace, Stage};
 
 pub const MAX_RECORD_BYTES: usize = 1200;
 pub const RECORD_BUFFER_BYTES: usize = crate::REALTIME_DATAGRAM_BUFFER_BYTES;
@@ -152,6 +153,7 @@ impl Incoming {
 }
 
 struct Inner {
+    trace_id: u64,
     closed: CancellationToken,
     capacity: Arc<Semaphore>,
     outgoing: mpsc::UnboundedSender<Record>,
@@ -186,6 +188,11 @@ pub struct RecordProgress {
 pub struct OrderedRecordHandle(Arc<Inner>);
 
 impl OrderedRecordHandle {
+    /// Process-local child observation ID; zero when operator tracing is off.
+    pub fn local_trace_id(&self) -> u64 {
+        self.0.trace_id
+    }
+
     pub fn max_size(&self) -> Option<usize> {
         (!self.0.closed.is_cancelled()).then_some(MAX_RECORD_BYTES)
     }
@@ -243,7 +250,9 @@ impl OrderedRecordHandle {
                 expires_at,
                 _bytes: permit,
             })
-            .map_err(|_| RecordSendError::Closed)
+            .map_err(|_| RecordSendError::Closed)?;
+        trace::note(Stage::SendAdmitted, self.local_trace_id(), payload);
+        Ok(())
     }
 
     /// Cancel-safe: losing a select branch never consumes a queued record.
@@ -364,6 +373,7 @@ impl OrderedRecordPlane {
     ) -> Self {
         let (outgoing, out_rx) = mpsc::unbounded_channel();
         let handle = OrderedRecordHandle(Arc::new(Inner {
+            trace_id: trace::new_child(),
             closed: CancellationToken::new(),
             capacity: Arc::new(Semaphore::new(RECORD_BUFFER_BYTES)),
             outgoing,
@@ -450,6 +460,7 @@ async fn read_records<R: tokio::io::AsyncRead + Unpin>(mut reader: R, handle: Or
                 }
                 let now = Instant::now();
                 let expired = q.expire(now, handle.0.receive_max_age);
+                trace::note(Stage::ReadComplete, handle.local_trace_id(), &bytes);
                 let charge = record_queue_charge(bytes.len());
                 let mut dropped = 0u64;
                 // Loss-tolerant input must stay fresh rather than stop reading
@@ -504,17 +515,31 @@ async fn write_records<W: tokio::io::AsyncWrite + Unpin>(
     let writing = async {
         while let Some(record) = outgoing.recv().await {
             let now = Instant::now();
+            let expired = record.expires_at <= now;
             {
                 let mut p = handle.0.progress.lock().unwrap_or_else(|e| e.into_inner());
                 p.max_outgoing_wait = p
                     .max_outgoing_wait
                     .max(now.saturating_duration_since(record.queued_at));
-                if record.expires_at <= now {
+                if expired {
                     p.expired = p.expired.saturating_add(1);
-                    continue;
+                } else {
+                    p.active_since = Some(now);
                 }
-                p.active_since = Some(now);
             }
+            if expired {
+                trace::note(
+                    Stage::ExpiredBeforeWrite,
+                    handle.local_trace_id(),
+                    &record.wire[2..],
+                );
+                continue;
+            }
+            trace::note(
+                Stage::WriteStart,
+                handle.local_trace_id(),
+                &record.wire[2..],
+            );
             let write = async {
                 // Cancellation for expiry is safe ONLY before the first
                 // successful write: Pending consumed no bytes. Once even one
@@ -528,6 +553,11 @@ async fn write_records<W: tokio::io::AsyncWrite + Unpin>(
                 if first == 0 {
                     return Err(io::ErrorKind::WriteZero.into());
                 }
+                trace::note(
+                    Stage::FirstWrite,
+                    handle.local_trace_id(),
+                    &record.wire[2..],
+                );
                 let finish = async {
                     writer.write_all(&record.wire[first..]).await?;
                     writer.flush().await
@@ -540,6 +570,8 @@ async fn write_records<W: tokio::io::AsyncWrite + Unpin>(
                         let mut p = handle.0.progress.lock().unwrap_or_else(|e| e.into_inner());
                         p.expired = p.expired.saturating_add(1);
                         p.note_close_reason(RecordCloseReason::PartialRecordExpired);
+                        drop(p);
+                        trace::note(Stage::ExpiredDuringWrite, handle.local_trace_id(), &record.wire[2..]);
                         return Err(io::Error::new(io::ErrorKind::TimedOut, "partial record expired"));
                     },
                     result = finish => result?,
@@ -551,6 +583,11 @@ async fn write_records<W: tokio::io::AsyncWrite + Unpin>(
             let complete = match tokio::time::timeout(write_timeout, write).await {
                 Ok(Ok(complete)) => complete,
                 Ok(Err(error)) => {
+                    trace::note(
+                        Stage::WriteError,
+                        handle.local_trace_id(),
+                        &record.wire[2..],
+                    );
                     handle.note_close_reason(if error.kind() == io::ErrorKind::WriteZero {
                         RecordCloseReason::WriteZero
                     } else {
@@ -559,6 +596,11 @@ async fn write_records<W: tokio::io::AsyncWrite + Unpin>(
                     return;
                 }
                 Err(_) => {
+                    trace::note(
+                        Stage::WriteTimeout,
+                        handle.local_trace_id(),
+                        &record.wire[2..],
+                    );
                     handle.note_close_reason(RecordCloseReason::WriteTimeout);
                     return;
                 }
@@ -572,6 +614,16 @@ async fn write_records<W: tokio::io::AsyncWrite + Unpin>(
             } else {
                 p.expired = p.expired.saturating_add(1);
             }
+            drop(p);
+            trace::note(
+                if complete {
+                    Stage::Flushed
+                } else {
+                    Stage::ExpiredBeforeWrite
+                },
+                handle.local_trace_id(),
+                &record.wire[2..],
+            );
         }
     };
     tokio::select! {
