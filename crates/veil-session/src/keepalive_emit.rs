@@ -69,6 +69,21 @@ pub fn build_keepalive_frame() -> Vec<u8> {
     frame
 }
 
+/// Only the runner's own timer calls this. A parent TX-health probe is local
+/// network maintenance, not a neutral forwarded FIFO entry. The outgoing
+/// auxiliary-record selector keeps its bytes on the canonical connection.
+pub(crate) fn enqueue_probe(
+    queue: &mut crate::priority_queue::PriorityQueue,
+    pending: &mut PendingKeepaliveProbe,
+    now: tokio::time::Instant,
+) -> bool {
+    queue.push(
+        crate::LOCAL_NETWORK_CONTROL_LANE,
+        veil_bufpool::pooled_shared_from_vec(build_keepalive_frame()),
+    );
+    pending.try_arm(now)
+}
+
 /// Ledger of an in-flight keepalive-ack expectation, tied to Epic 459
 /// stage (c.2.2) hot-standby TX-health detection.
 ///

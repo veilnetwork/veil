@@ -4833,13 +4833,11 @@ impl SessionRunner {
                     // oldest-armed timestamp on subsequent calls.
                     let keepalive_tick = timers.keepalive_due_and_reschedule(now);
                     if keepalive_tick {
-                        pq.push(
-                            veil_proto::priority::INTERACTIVE,
-                            veil_bufpool::pooled_shared_from_vec(
-                                crate::keepalive_emit::build_keepalive_frame(),
-                            ),
+                        let was_pending_set = crate::keepalive_emit::enqueue_probe(
+                            &mut pq,
+                            &mut pending_keepalive_probe,
+                            now,
                         );
-                        let was_pending_set = pending_keepalive_probe.try_arm(now);
                         // Debug-level so production logs aren't spammed
                         // with a pair of lines per keepalive cycle. The
                         // user-visible signal is `trigger_raised
@@ -5874,7 +5872,7 @@ impl SessionRunner {
                             && realtime_lane.as_ref().and_then(|lane| lane.parallel.as_ref())
                                 .is_some_and(ParallelChannels::has_auxiliary_app_streams);
                         let auxiliary = if (owned_reliable || priority == crate::LOCAL_NETWORK_CONTROL_LANE)
-                            && auxiliary_records::eligible(frame)
+                            && auxiliary_records::outgoing_eligible(frame)
                             && realtime_lane.as_ref().and_then(|lane|lane.parallel.as_ref()).is_some_and(ParallelChannels::has_auxiliary)
                         { Some(if priority == crate::LOCAL_NETWORK_CONTROL_LANE {
                             realtime_lane.as_ref().and_then(|lane| lane.parallel.as_ref())
