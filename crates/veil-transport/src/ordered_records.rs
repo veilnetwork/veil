@@ -61,6 +61,7 @@ struct Record {
 
 #[derive(Default)]
 struct Progress {
+    close_reason: RecordCloseReason,
     active_since: Option<Instant>,
     max_outgoing_wait: Duration,
     max_write_duration: Duration,
@@ -69,6 +70,50 @@ struct Progress {
     received: u64,
     dropped_incoming: u64,
     expired_incoming: u64,
+}
+
+impl Progress {
+    fn note_close_reason(&mut self, reason: RecordCloseReason) {
+        if self.close_reason == RecordCloseReason::Open {
+            self.close_reason = reason;
+        }
+    }
+}
+
+/// First locally observed terminal cause. Never contains an OS error message,
+/// peer address, record bytes or any material from the encrypted stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RecordCloseReason {
+    #[default]
+    Open,
+    OwnerClosed,
+    ReadEof,
+    InvalidRecord,
+    ReadError,
+    WriteError,
+    WriteZero,
+    PartialRecordExpired,
+    WriteTimeout,
+    WriterEnded,
+    TaskEnded,
+}
+
+impl RecordCloseReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::OwnerClosed => "owner_closed",
+            Self::ReadEof => "read_eof",
+            Self::InvalidRecord => "invalid_record",
+            Self::ReadError => "read_error",
+            Self::WriteError => "write_error",
+            Self::WriteZero => "write_zero",
+            Self::PartialRecordExpired => "partial_record_expired",
+            Self::WriteTimeout => "write_timeout",
+            Self::WriterEnded => "writer_ended",
+            Self::TaskEnded => "task_ended",
+        }
+    }
 }
 
 struct ReceivedRecord {
@@ -116,6 +161,7 @@ struct Inner {
 /// Local writer observations, not delivery acknowledgements or TCP RTT.
 #[derive(Debug, Clone, Copy)]
 pub struct RecordProgress {
+    pub close_reason: RecordCloseReason,
     pub reserved_bytes: usize,
     pub active_record_age: Option<Duration>,
     /// Cumulative residence before the writer starts, including expired work.
@@ -231,6 +277,21 @@ impl OrderedRecordHandle {
     }
 
     pub fn close(&self) {
+        self.close_with_reason(RecordCloseReason::OwnerClosed);
+    }
+
+    fn note_close_reason(&self, reason: RecordCloseReason) {
+        self.0
+            .progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_close_reason(reason);
+    }
+
+    fn close_with_reason(&self, reason: RecordCloseReason) {
+        // Release the progress guard before taking incoming below: receive
+        // and snapshots use the opposite (incoming -> progress) lock order.
+        self.note_close_reason(reason);
         self.0.closed.cancel();
         let mut q = self.0.incoming.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(oldest) = q.records.front() {
@@ -253,6 +314,7 @@ impl OrderedRecordHandle {
         let q = self.0.incoming.lock().unwrap_or_else(|e| e.into_inner());
         let p = self.0.progress.lock().unwrap_or_else(|e| e.into_inner());
         RecordProgress {
+            close_reason: p.close_reason,
             reserved_bytes: RECORD_BUFFER_BYTES - self.0.capacity.available_permits(),
             active_record_age: p.active_since.map(|at| at.elapsed()),
             max_outgoing_wait: p.max_outgoing_wait,
@@ -334,7 +396,7 @@ impl Drop for OrderedRecordPlane {
 struct CloseOnExit(OrderedRecordHandle);
 impl Drop for CloseOnExit {
     fn drop(&mut self) {
-        self.0.close();
+        self.0.close_with_reason(RecordCloseReason::TaskEnded);
         let mut p = self.0.0.progress.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(at) = p.active_since.take() {
             p.max_write_duration = p.max_write_duration.max(at.elapsed());
@@ -352,6 +414,7 @@ async fn read_records<R: tokio::io::AsyncRead + Unpin>(mut reader: R, handle: Or
         loop {
             let len = reader.read_u16().await? as usize;
             if len == 0 || len > MAX_RECORD_BYTES {
+                handle.note_close_reason(RecordCloseReason::InvalidRecord);
                 return Err::<(), io::Error>(io::ErrorKind::InvalidData.into());
             }
             let mut bytes = vec![0; len];
@@ -396,7 +459,14 @@ async fn read_records<R: tokio::io::AsyncRead + Unpin>(mut reader: R, handle: Or
     tokio::select! {
         biased;
         _ = handle.closed() => {},
-        _ = reading => {},
+        result = reading => {
+            if let Err(error) = result {
+                handle.note_close_reason(match error.kind() {
+                    io::ErrorKind::UnexpectedEof => RecordCloseReason::ReadEof,
+                    _ => RecordCloseReason::ReadError,
+                });
+            }
+        },
     }
 }
 
@@ -445,6 +515,7 @@ async fn write_records<W: tokio::io::AsyncWrite + Unpin>(
                     _ = tokio::time::sleep_until(record.expires_at.into()) => {
                         let mut p = handle.0.progress.lock().unwrap_or_else(|e| e.into_inner());
                         p.expired = p.expired.saturating_add(1);
+                        p.note_close_reason(RecordCloseReason::PartialRecordExpired);
                         return Err(io::Error::new(io::ErrorKind::TimedOut, "partial record expired"));
                     },
                     result = finish => result?,
@@ -455,7 +526,18 @@ async fn write_records<W: tokio::io::AsyncWrite + Unpin>(
             // with another prefix after a possibly partial record write.
             let complete = match tokio::time::timeout(write_timeout, write).await {
                 Ok(Ok(complete)) => complete,
-                _ => return,
+                Ok(Err(error)) => {
+                    handle.note_close_reason(if error.kind() == io::ErrorKind::WriteZero {
+                        RecordCloseReason::WriteZero
+                    } else {
+                        RecordCloseReason::WriteError
+                    });
+                    return;
+                }
+                Err(_) => {
+                    handle.note_close_reason(RecordCloseReason::WriteTimeout);
+                    return;
+                }
             };
             let mut p = handle.0.progress.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(at) = p.active_since.take() {
@@ -471,7 +553,7 @@ async fn write_records<W: tokio::io::AsyncWrite + Unpin>(
     tokio::select! {
         biased;
         _ = handle.closed() => {},
-        _ = writing => {},
+        _ = writing => handle.note_close_reason(RecordCloseReason::WriterEnded),
     }
 }
 
