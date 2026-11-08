@@ -21,8 +21,8 @@
 pub mod cache;
 pub mod control_plane;
 pub mod discovery_forwarder;
-pub mod discovery_paths;
 pub mod discovery_initiator;
+pub mod discovery_paths;
 pub mod loss_tracker;
 pub mod miss_handler;
 pub mod pow;
