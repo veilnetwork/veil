@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+## v0.11.48 — 2026-11-09
+
+### Fixed
+
+- Reconnect promptly on network changes, cancel stale handshakes without
+  interrupting unrelated dials, and retire every session task and writer with
+  its owner. Keep replacement leaf sessions and private media routes bound to
+  their exact live connection registration.
+- Restore ordered-channel readiness after a failed child without reserving
+  unopened channels or holding unrelated record handshakes behind their ACK.
+  Bound incomplete incoming records from their first byte.
+- Return cold discovery replies over authenticated reverse paths, address
+  device-family copies to the verified transport device, and reserve local
+  discovery capacity without weakening reputation or authorization checks.
+- Recheck revocation floors after singular certificate lookups. Restore
+  locally verified instance keys before opening retained ratchet state.
+- Reject unrecognized PoW challenge trailing bytes and conflicting QUIC/NAT
+  reflector UDP binds before starting a partially configured node.
+
+### Audio and Android
+
+- Enable call echo cancellation and noise suppression by default with live
+  processing controls. Preserve the adaptive speech reserve on jittery paths
+  and distinguish video payload losses from padding probes in delivery feedback.
+- Present scoped incoming-call controls above the Android keyguard, including
+  caller presentation, while keeping the main application behind the lock.
+- Extend opt-in anonymous Android diagnostics with bounded network-policy
+  categories. Keep detailed TCP/circuit observations behind operator gates;
+  identifiers, endpoints and raw traces do not enter anonymous exports.
+
+### Qualification and known limits
+
+- Call recovery has improved in controlled tests, but network-handover audio
+  pauses and transport stalls remain under investigation. A provider's website
+  allowlist may prevent connecting to overlay nodes even when Android reports
+  the default network as validated; this release does not bypass that policy.
+- Speech-processing code and diagnostic controls require freshly built media
+  engines. An unchanged native ABI is insufficient evidence of current code.
+- Historical documentation and test fixtures have been anonymized. Commit
+  identities use the project pseudonym and public contact address; source
+  hashes changed during the history cleanup.
+
 ## v0.11.47 — 2026-10-31
 
 ### Dependencies
