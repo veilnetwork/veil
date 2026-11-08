@@ -83,6 +83,9 @@ jobs:
       - name: Every tool CI installs is pinned
         run: ./scripts/check-workflow-pins.sh
 
+      - name: Artifact privacy scanner regression checks
+        run: python3 -m unittest discover -s scripts -p test_scan_artifacts.py
+
       - name: The triggers name a branch that exists
         # Also in pr-hygiene, and it has to be in both: that workflow stopped
         # running on main when this one started, so leaving the check only
