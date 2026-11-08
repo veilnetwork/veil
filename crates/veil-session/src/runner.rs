@@ -322,10 +322,12 @@ impl ParallelChannels {
         }
     }
     fn prepare(&mut self, priority: u8) {
-        if let Self::Quic(s) = self {
-            s.prepare(priority);
+        match self {
+            Self::Quic(s) => {
+                s.prepare(priority);
+            }
+            Self::Ordered(s) => s.prepare(),
         }
-        // Ordered pools prewarm all generic children independently of roles.
     }
     fn sender(
         &mut self,

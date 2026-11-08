@@ -428,6 +428,16 @@ impl OrderedSession {
         self.offer.diagnostics.rotate_generation();
     }
 
+    pub(super) fn prepare(&self) {
+        // Children are prewarmed independently of roles. A newly requested
+        // owner can use one immediately; do not wait for the worker's reaping
+        // tick to publish its framing/readiness. Keep the same assignment and
+        // live-parent checks as the worker's completion/timer publication.
+        if let Some(readiness) = &self.readiness {
+            mark(&mut lock!(self.pool), &Arc::downgrade(readiness));
+        }
+    }
+
     pub(super) fn sender_with_carrier(
         &self,
         priority: u8,

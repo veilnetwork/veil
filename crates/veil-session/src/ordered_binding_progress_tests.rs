@@ -178,6 +178,139 @@ impl Fixture {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn warmed_ordered_readiness_request_is_published_without_the_periodic_tick() {
+    use crate::LocalDatagramChannelState::{Ready as ChannelReady, Warming};
+    let fixture = Fixture::new().await;
+    let status = Arc::new(LocalDatagramStatus::default());
+    let offer = ParallelOrderedOffer::new(fixture.offer.handle.clone(), Arc::default());
+    let context = super::super::ordered_receiver_tests::pool_fixture_context();
+    let mut channels = ParallelChannels::Ordered(Box::new(OrderedSession::new(
+        offer,
+        &[3; 32],
+        &[2; 32],
+        [1; 32],
+        context,
+        Some(status.clone()),
+    )));
+    let binding = [51; 32];
+    let (hello, pending) = fixture.source.begin(binding).unwrap();
+    let (mut client, server) = tokio::io::duplex(65536);
+    client.write_all(&hello).await.unwrap();
+    let ParallelChannels::Ordered(session) = &channels else {
+        unreachable!()
+    };
+    let outcome = session
+        .offer
+        .registry
+        .peek_and_dispatch_with_binding(Box::new(server), None, Some(binding))
+        .await;
+    assert!(matches!(outcome, ParallelPeekOutcome::Bound));
+    let client = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        Client {
+            stream: client,
+            pending,
+        }
+        .finish(),
+    )
+    .await
+    .unwrap();
+    for _ in 0..128 {
+        if lock!(session.pool).slots.iter().flatten().count() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(lock!(session.pool).slots.iter().flatten().count(), 1);
+    // There is one real, authenticated, already-warmed child, but no producer
+    // has requested ownership yet. No wall-time performance threshold here.
+    assert_eq!(status.state(veil_proto::priority::REALTIME), Warming);
+    tokio::time::pause();
+    let before = tokio::time::Instant::now();
+    status.request_fresh(veil_proto::priority::REALTIME);
+    status.request_fresh(veil_proto::priority::BACKGROUND);
+    channels.prepare(veil_proto::priority::REALTIME);
+    let primary = status.state(veil_proto::priority::REALTIME);
+    let secondary = status.state(veil_proto::priority::BACKGROUND);
+    let no_timer = tokio::time::Instant::now() == before;
+    tokio::time::resume();
+    if primary != ChannelReady || !no_timer {
+        drop(channels);
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            primary, ChannelReady,
+            "ordered readiness request waited for the periodic worker tick"
+        );
+        assert!(no_timer);
+        return;
+    }
+    assert_eq!(
+        secondary, Warming,
+        "one child cannot serve two distinct owners"
+    );
+    let body = veil_proto::app::AppRtDataPayload {
+        src_app_id: [1; 32],
+        app_id: [2; 32],
+        endpoint_id: 1,
+        seq: 17,
+        timestamp_us: 0,
+        marker: 0,
+        payload_type: 111,
+        payload: vec![0x55; 32],
+    }
+    .encode();
+    let mut header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppRtData as u16);
+    header.set_priority(veil_proto::priority::REALTIME);
+    header.body_len = body.len() as u32;
+    let mut frame = encode_header(&header).to_vec();
+    frame.extend_from_slice(&body);
+    let sender = channels
+        .sender(
+            veil_proto::priority::REALTIME,
+            &body,
+            RealtimeLaneFrameKind::DirectApp,
+            None,
+        )
+        .unwrap();
+    let datagrams = lock!(sender).tx.encode_frame(1, &frame, 1200).unwrap();
+    assert_eq!(datagrams.len(), 1);
+    lock!(sender).handle.send(&datagrams[0]).unwrap();
+    let received = tokio::time::timeout(std::time::Duration::from_secs(2), client.handle().recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut decoder = crate::datagram_flows::SessionDatagramRx::new(
+        client.keys.rx_key(),
+        &client.keys.session_id,
+        true,
+    );
+    assert_eq!(
+        decoder
+            .decode_datagram(&received, std::time::Instant::now())
+            .unwrap()
+            .unwrap(),
+        frame
+    );
+    let ParallelChannels::Ordered(session) = &channels else {
+        unreachable!()
+    };
+    session.parent.retire();
+    status.request_fresh(veil_proto::priority::REALTIME);
+    channels.prepare(veil_proto::priority::REALTIME);
+    assert_ne!(
+        status.state(veil_proto::priority::REALTIME),
+        ChannelReady,
+        "retired parent cannot publish readiness"
+    );
+    drop(channels);
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn blocked_incoming_ack_does_not_delay_a_second_authenticated_child() {
     let mut fixture = Fixture::new().await;
     let (first, _first_client) = fixture.child(true, 4).await;
