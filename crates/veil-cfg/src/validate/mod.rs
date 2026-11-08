@@ -1358,6 +1358,97 @@ mod tests {
                     || issue.code == "nat_udp_reflector_invalid"
             }));
         }
+
+        #[test]
+        fn nat_udp_reflector_bind_conflicts_with_quic_listener() {
+            for (reflector, listener) in [
+                ("0.0.0.0:443", "quic://0.0.0.0:443"),
+                ("0.0.0.0:443", "quic://127.0.0.1:443"),
+                ("127.0.0.1:443", "quic://0.0.0.0:443"),
+                ("127.0.0.1:443", "quic://127.0.0.1:443"),
+                ("[::]:443", "quic://[::]:443"),
+                ("[::]:443", "quic://[::1]:443"),
+                ("[::1]:443", "quic://[::]:443"),
+                ("[::1]:443", "quic://[::1]:443?alpn=h3"),
+            ] {
+                let mut config = Config::default();
+                config.nat.udp_reflector_bind = Some(reflector.to_owned());
+                config.listen.push(ListenConfig {
+                    id: ListenId::new(1),
+                    transport: listener.to_owned(),
+                    ..Default::default()
+                });
+                let report = validate(&config);
+                let issue = report
+                    .issues
+                    .iter()
+                    .find(|issue| issue.code == "nat_udp_reflector_bind_conflicts_with_quic");
+                assert!(
+                    issue.is_some(),
+                    "missed conflicting binds: {reflector}, {listener}"
+                );
+                assert_eq!(issue.unwrap().key, "nat.udp_reflector_bind");
+                // Even the repair path must leave endpoint selection to the
+                // operator instead of silently moving either listener.
+                super::super::structural::apply_fixes(&mut config);
+                assert_eq!(config.nat.udp_reflector_bind.as_deref(), Some(reflector));
+                assert_eq!(config.listen[0].transport, listener);
+                assert!(
+                    validate(&config).issues.iter().any(|issue| {
+                        issue.code == "nat_udp_reflector_bind_conflicts_with_quic"
+                    })
+                );
+            }
+        }
+
+        #[test]
+        fn nat_udp_reflector_bind_allows_independent_listener_sockets() {
+            for (reflector, listener) in [
+                ("0.0.0.0:443", "obfs4-tcp://0.0.0.0:443"),
+                ("0.0.0.0:443", "tcp://0.0.0.0:443"),
+                ("0.0.0.0:443", "quic://0.0.0.0:4443"),
+                ("0.0.0.0:443", "quic://0.0.0.0:0"),
+                ("127.0.0.1:443", "quic://127.0.0.2:443"),
+                ("[::1]:443", "quic://[2001:db8::1]:443"),
+                // Cross-family wildcard behavior depends on the OS's IPv6-only
+                // setting. Do not reject a config on an unproven assumption.
+                ("0.0.0.0:443", "quic://[::]:443"),
+                ("[::]:443", "quic://0.0.0.0:443"),
+                // Structural validation must not perform DNS lookups.
+                ("0.0.0.0:443", "quic://node.example:443"),
+            ] {
+                let mut config = Config::default();
+                config.nat.udp_reflector_bind = Some(reflector.to_owned());
+                config.listen.push(ListenConfig {
+                    id: ListenId::new(1),
+                    transport: listener.to_owned(),
+                    ..Default::default()
+                });
+                assert!(
+                    !validate(&config).issues.iter().any(|issue| {
+                        issue.code == "nat_udp_reflector_bind_conflicts_with_quic"
+                    }),
+                    "rejected independent sockets: {reflector}, {listener}"
+                );
+            }
+        }
+
+        #[test]
+        fn nat_udp_reflector_bind_absent_does_not_reserve_a_port() {
+            let mut config = Config::default();
+            assert!(config.nat.udp_reflector_bind.is_none());
+            config.listen.push(ListenConfig {
+                id: ListenId::new(1),
+                transport: "quic://0.0.0.0:443".to_owned(),
+                ..Default::default()
+            });
+            assert!(
+                !validate(&config)
+                    .issues
+                    .iter()
+                    .any(|issue| { issue.code == "nat_udp_reflector_bind_conflicts_with_quic" })
+            );
+        }
     }
 
     fn broken_signature_identity() -> IdentityConfig {
