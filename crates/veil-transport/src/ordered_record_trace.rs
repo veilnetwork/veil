@@ -13,6 +13,42 @@ static ENABLED: OnceLock<bool> = OnceLock::new();
 static ROWS: AtomicU64 = AtomicU64::new(0);
 static NEXT_CHILD: AtomicU64 = AtomicU64::new(1);
 
+tokio::task_local! {
+    // Local writer context, never bytes or a field in the transport protocol.
+    static WRITING_CHILD: u64;
+}
+
+pub(crate) async fn writer_scope<F: std::future::Future>(child: u64, writer: F) -> F::Output {
+    if child == 0 {
+        writer.await
+    } else {
+        WRITING_CHILD.scope(child, writer).await
+    }
+}
+
+pub(crate) fn writing_child() -> Option<u64> {
+    if !enabled() {
+        return None;
+    }
+    WRITING_CHILD.try_with(|child| *child).ok()
+}
+
+// Record stages and their socket bindings share one operator budget.
+fn reserve_row(rows: &AtomicU64) -> bool {
+    if rows.load(Ordering::Relaxed) > LIMIT {
+        return false;
+    }
+    let row = rows.fetch_add(1, Ordering::Relaxed);
+    if row == LIMIT {
+        log::info!("transport.ordered_record_trace_limit rows={LIMIT}");
+    }
+    row < LIMIT
+}
+
+pub(crate) fn reserve_binding() -> bool {
+    enabled() && reserve_row(&ROWS)
+}
+
 pub fn enabled() -> bool {
     *ENABLED.get_or_init(|| {
         veil_util::operator_trace::enabled(
@@ -84,11 +120,7 @@ pub fn note(stage: Stage, child: u64, payload: &[u8]) {
     let Some(digest) = fingerprint(payload) else {
         return;
     };
-    let row = ROWS.fetch_add(1, Ordering::Relaxed);
-    if row == LIMIT {
-        log::info!("transport.ordered_record_trace_limit rows={LIMIT}");
-    }
-    if row >= LIMIT {
+    if !reserve_row(&ROWS) {
         return;
     }
     let monotonic_us = veil_util::diagnostic_clock::monotonic_us().map_or(-1, i128::from);
@@ -97,4 +129,17 @@ pub fn note(stage: Stage, child: u64, payload: &[u8]) {
         stage.label(),
         payload.len(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn record_and_binding_reservations_stop_at_the_shared_limit() {
+        let rows = AtomicU64::new(LIMIT - 1);
+        assert!(reserve_row(&rows));
+        assert!(!reserve_row(&rows));
+        assert!(!reserve_row(&rows));
+        assert_eq!(rows.load(Ordering::Relaxed), LIMIT + 1);
+    }
 }

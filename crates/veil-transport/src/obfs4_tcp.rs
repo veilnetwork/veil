@@ -345,9 +345,11 @@ struct Obfs4IoStream {
 
 impl Obfs4IoStream {
     fn new(stream: Obfs4Stream<HandshakeStream>) -> Self {
+        let write_trace =
+            super::tcp_trace::WriteTrace::from_connection(stream.get_ref().connection_id());
         Self {
             stream,
-            write_trace: Default::default(),
+            write_trace,
         }
     }
 

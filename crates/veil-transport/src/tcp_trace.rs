@@ -203,12 +203,20 @@ struct KernelProgress {
 pub(crate) struct WriteTrace {
     connection: u64,
     socket_metadata_reported: bool,
+    record_child_reported: Option<u64>,
     progress: KernelProgress,
     wait: Option<Wait>,
     last_log: Option<Instant>,
 }
 
 impl WriteTrace {
+    pub(crate) fn from_connection(connection: Option<u64>) -> Self {
+        Self {
+            connection: connection.unwrap_or_default(),
+            ..Self::default()
+        }
+    }
+
     /// Called after polling the real writer, never changes its result.
     pub(crate) fn observe(
         &mut self,
@@ -220,16 +228,37 @@ impl WriteTrace {
         if !enabled_cell().load(Ordering::Relaxed) {
             self.wait = None;
             self.socket_metadata_reported = false;
+            self.record_child_reported = None;
             if self.progress.samples != 0 {
                 self.progress = KernelProgress::default();
             }
             return;
         }
         let now = Instant::now();
+        self.observe_record_binding(stream);
         if operation == "flush" {
             self.observe_kernel_progress(stream, now);
         }
         self.observe_enabled(stream, operation, pending, ciphertext_bytes, now);
+    }
+
+    fn observe_record_binding(&mut self, stream: &TcpStream) {
+        let Some(child) = crate::ordered_record_trace::writing_child() else {
+            return;
+        };
+        if self.record_child_reported == Some(child) {
+            return;
+        }
+        self.record_child_reported = Some(child);
+        if !crate::ordered_record_trace::reserve_binding() {
+            return;
+        }
+        self.identify_socket(stream);
+        log::info!(target: "transport.tcp_trace.ordered_child",
+            "tcp_ordered_binding connection={} child_local={} monotonic_us={} socket={:?}",
+            self.connection, child,
+            veil_util::diagnostic_clock::monotonic_us().map_or_else(|| "unknown".to_owned(), |us| us.to_string()),
+            SocketMetadata::read(stream));
     }
 
     fn identify_socket(&mut self, stream: &TcpStream) {
@@ -388,6 +417,10 @@ mod tests {
         assert_eq!(trace.wait.as_ref().unwrap().ciphertext_bytes, 800);
     }
 }
+
+#[cfg(test)]
+#[path = "ordered_tcp_trace_tests.rs"]
+mod ordered_binding_tests;
 
 #[cfg(all(
     test,
