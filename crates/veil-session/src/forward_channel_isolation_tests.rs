@@ -53,6 +53,94 @@ fn opaque_forward(fill: u8) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn failed_cold_selections_do_not_block_a_ready_source_or_neutral_transit() {
+    for transit_first in [false, true] {
+        let parent = ParallelParent::new([1; 32], [2; 32], [3; 32]);
+        let remote = ParallelParent::new([1; 32], [3; 32], [2; 32]);
+        let diagnostics = Arc::new(ParallelDiagnostics::default());
+        let salt = blake3::derive_key("veil/transit-shard/v1", &[7; 32]);
+        let direct = super::super::ordered_receiver_tests::app_frame(501, 64);
+        let forwarded = opaque_forward(81);
+        let direct_body = &direct[veil_proto::header::HEADER_SIZE..];
+        let forwarded_body = &forwarded[veil_proto::header::HEADER_SIZE..];
+        let source = (
+            veil_proto::priority::REALTIME,
+            direct_body,
+            RealtimeLaneFrameKind::DirectApp,
+        );
+        let transit = (
+            veil_proto::priority::INTERACTIVE,
+            forwarded_body,
+            RealtimeLaneFrameKind::RelayForward,
+        );
+        let (first, second, expected) = if transit_first {
+            (transit, source, &direct)
+        } else {
+            (source, transit, &forwarded)
+        };
+        let mut pool = Pool::default();
+        assert!(
+            pool.selected_sender(first.0, first.1, first.2, None, &salt, &diagnostics)
+                .is_none()
+        );
+        // Complete precisely the channel a failed old-style selection would
+        // have reserved. There was no authenticated child to own at that time.
+        let mut reservations = channel_assignments::ChannelAssignments::<TOTAL_SLOTS>::default();
+        let physical = if transit_first {
+            let bucket = parallel_lanes::neutral_transit_index(
+                &salt,
+                forwarded_body,
+                RealtimeLaneFrameKind::RelayForward,
+            )
+            .unwrap();
+            reservations.transit(None, bucket).unwrap().physical
+        } else {
+            reservations.source(0).unwrap().physical
+        };
+        let (channel, keys, raw) = raw_pair(&parent, &remote, 65536);
+        let receiver = keys.into_ordered(Box::new(raw)).unwrap();
+        let mut decoder = crate::datagram_flows::SessionDatagramRx::new(
+            receiver.keys.rx_key(),
+            &receiver.keys.session_id,
+            true,
+        );
+        pool.slots[physical] = Some(Ready::new(
+            Owner::Outgoing(channel),
+            parent.handle(),
+            super::super::ordered_receiver_tests::pool_fixture_context(),
+            diagnostics.clone(),
+        ));
+        let selected = pool
+            .selected_sender(second.0, second.1, second.2, None, &salt, &diagnostics)
+            .expect("a failed cold probe pinned the only ready channel");
+        let packets = lock!(selected).tx.encode_frame(10, expected, 1200).unwrap();
+        assert_eq!(packets.len(), 1);
+        lock!(selected).handle.send(&packets[0]).unwrap();
+        let received = timeout(Duration::from_secs(1), receiver.handle().recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decoder
+                .decode_datagram(&received, std::time::Instant::now())
+                .unwrap()
+                .unwrap(),
+            *expected
+        );
+        // Ownership starts with successful selection, and is protected after
+        // that: the original cold requester cannot steal the healthy child.
+        assert!(
+            pool.selected_sender(first.0, first.1, first.2, None, &salt, &diagnostics)
+                .is_none()
+        );
+        let again = pool
+            .selected_sender(second.0, second.1, second.2, None, &salt, &diagnostics)
+            .unwrap();
+        assert!(Arc::ptr_eq(&selected, &again));
+    }
+}
+
+#[tokio::test]
 async fn own_keepalive_does_not_hold_neutral_forward_behind_a_full_canonical_writer() {
     use crate::keepalive_emit::{PendingKeepaliveProbe, enqueue_probe};
     use crate::priority_queue::{HeadAdmission, PriorityQueue};

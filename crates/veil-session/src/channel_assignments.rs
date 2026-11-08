@@ -81,6 +81,32 @@ impl<const N: usize> ChannelAssignments<N> {
         })
     }
 
+    /// Select only after finding an actual ready channel. A failed
+    /// check must not leave a new reservation on an unopened physical slot.
+    /// Keep explicit pre-existing ownership, including unavailable owners.
+    pub fn source_if_ready(
+        &mut self,
+        source: usize,
+        ready: impl FnMut(usize) -> bool,
+    ) -> Option<Selection> {
+        let existing = self.source_physical(source).is_some();
+        let selected = self.source(source)?;
+        self.finish_ready_probe(selected, !existing, ready)
+    }
+
+    fn finish_ready_probe(
+        &mut self,
+        selected: Selection,
+        newly_owned: bool,
+        ready: impl FnMut(usize) -> bool,
+    ) -> Option<Selection> {
+        let result = self.ready_selection(selected, ready);
+        if result.is_none() && newly_owned {
+            self.owners[selected.physical] = None;
+        }
+        result
+    }
+
     /// Reuse an authenticated spare while this owner's channel is unavailable.
     /// Never move a healthy owner, displace another owner or extend capacity.
     /// The same rule applies to local sources and neutral transit connections.
@@ -113,42 +139,67 @@ impl<const N: usize> ChannelAssignments<N> {
         self.transit_at(witness, bucket, Instant::now())
     }
 
+    /// The ordered pool prewarms generic connections without role-specific
+    /// reservations. Treat a failed transit probe exactly like a source probe.
+    pub fn transit_if_ready(
+        &mut self,
+        witness: Option<&Carrier>,
+        bucket: usize,
+        ready: impl FnMut(usize) -> bool,
+    ) -> Option<Selection> {
+        let (selected, newly_owned) = self.transit_assignment(witness, bucket, Instant::now())?;
+        self.finish_ready_probe(selected, newly_owned, ready)
+    }
+
     fn transit_at(
         &mut self,
         witness: Option<&Carrier>,
         bucket: usize,
         now: Instant,
     ) -> Option<Selection> {
+        self.transit_assignment(witness, bucket, now)
+            .map(|(selected, _)| selected)
+    }
+
+    fn transit_assignment(
+        &mut self,
+        witness: Option<&Carrier>,
+        bucket: usize,
+        now: Instant,
+    ) -> Option<(Selection, bool)> {
         self.reap(now);
         let flow = witness
             .and_then(|w| w.upgrade())
             .and_then(|w| w.local_transit_flow());
-        let physical = if let (Some(key), Some(witness)) = (flow, witness) {
+        let (physical, newly_owned) = if let (Some(key), Some(witness)) = (flow, witness) {
             if let Some(index) = self
                 .owners
                 .iter()
                 .position(|o| matches!(o, Some(Owner::Transit(existing, _)) if *existing == key))
             {
-                index
+                (index, false)
             } else {
                 let index = self.free(bucket)?;
                 self.owners[index] = Some(Owner::Transit(key, witness.clone()));
-                index
+                (index, true)
             }
         } else if let Some(index) = self.owners.iter().position(
             |o| matches!(o, Some(Owner::Legacy { bucket: existing, .. }) if *existing == bucket),
         ) {
             self.owners[index] = Some(Owner::Legacy { bucket, used: now });
-            index
+            (index, false)
         } else {
             let index = self.free(bucket)?;
             self.owners[index] = Some(Owner::Legacy { bucket, used: now });
-            index
+            (index, true)
         };
-        Some(Selection {
-            physical,
-            counter: SOURCE_COUNT + physical,
-        })
+        Some((
+            Selection {
+                physical,
+                counter: SOURCE_COUNT + physical,
+            },
+            newly_owned,
+        ))
     }
 
     fn free(&self, preferred: usize) -> Option<usize> {
@@ -250,6 +301,117 @@ mod tests {
                 pool.ready_selection(last, |index| index != last.physical)
                     .is_none()
             );
+        }
+    }
+
+    #[test]
+    fn failed_readiness_checks_do_not_allocate_empty_channels() {
+        let mut pool = ChannelAssignments::<2>::default();
+        for _ in 0..3 {
+            for source in 0..SOURCE_COUNT {
+                assert!(pool.source_if_ready(source, |_| false).is_none());
+                assert!(pool.source_physical(source).is_none());
+            }
+        }
+        // Completion order need not match a source's preferred slot.
+        let first = pool.source_if_ready(0, |index| index == 1).unwrap();
+        assert_eq!((first.physical, first.counter), (1, 0));
+        assert!(pool.source_if_ready(1, |index| index == 1).is_none());
+        assert!(pool.source_physical(1).is_none());
+        let second = pool.source_if_ready(1, |_| true).unwrap();
+        assert_eq!((second.physical, second.counter), (0, 1));
+        // Publishing another source never relocates a healthy existing owner.
+        let again = pool
+            .source_if_ready(0, |index| {
+                assert_eq!(index, first.physical);
+                true
+            })
+            .unwrap();
+        assert_eq!(again.physical, first.physical);
+        assert!(pool.source_if_ready(2, |_| true).is_none());
+    }
+
+    #[test]
+    fn readiness_checks_preserve_explicit_source_and_transit_ownership() {
+        for transit in [false, true] {
+            let mut pool = ChannelAssignments::<3>::default();
+            let flow = ingress(3, 1);
+            let other = if transit {
+                pool.transit(Some(&witness(&flow)), 0).unwrap()
+            } else {
+                pool.source(0).unwrap()
+            };
+            assert_eq!(other.physical, 0);
+            // An already owned channel is not a spare for this requester.
+            assert!(pool.source_if_ready(1, |index| index == 0).is_none());
+            assert!(pool.source_physical(1).is_none());
+            if transit {
+                assert_eq!(pool.transit(Some(&witness(&flow)), 1).unwrap().physical, 0);
+            } else {
+                assert_eq!(pool.source_physical(0), Some(0));
+                assert!(pool.source_if_ready(0, |_| false).is_none());
+                assert_eq!(pool.source_physical(0), Some(0));
+            }
+            let spare = pool.source_if_ready(1, |index| index == 2).unwrap();
+            assert_eq!((spare.physical, spare.counter), (2, 1));
+            let last = pool.source(2).unwrap();
+            assert_eq!(last.physical, 1);
+            assert!(pool.source_if_ready(3, |_| true).is_none());
+        }
+    }
+
+    #[test]
+    fn failed_transit_probes_do_not_reserve_slots_or_displace_other_owners() {
+        for known in [false, true] {
+            let mut pool = ChannelAssignments::<2>::default();
+            let flow = ingress(8, 1);
+            let weak = witness(&flow);
+            let carrier = known.then_some(&weak);
+            for _ in 0..3 {
+                assert!(pool.transit_if_ready(carrier, 1, |_| false).is_none());
+                assert!(pool.owners.iter().all(Option::is_none));
+            }
+            let source = pool.source_if_ready(0, |index| index == 1).unwrap();
+            assert!(
+                pool.transit_if_ready(carrier, 1, |index| index == 1)
+                    .is_none()
+            );
+            assert_eq!(pool.source_physical(0), Some(source.physical));
+            let transit = pool
+                .transit_if_ready(carrier, 1, |index| index == 0)
+                .unwrap();
+            assert_eq!((transit.physical, transit.counter), (0, SOURCE_COUNT));
+            assert!(pool.source_if_ready(1, |_| true).is_none());
+        }
+    }
+
+    #[test]
+    fn transit_probes_preserve_existing_reservations_and_reuse_only_unowned_spares() {
+        for known in [false, true] {
+            let mut pool = ChannelAssignments::<3>::default();
+            let flow = ingress(9, 1);
+            let weak = witness(&flow);
+            let carrier = known.then_some(&weak);
+            let initial = pool.transit(carrier, 0).unwrap();
+            let other = pool.source(1).unwrap();
+            assert!(
+                pool.transit_if_ready(carrier, 0, |index| index == other.physical)
+                    .is_none()
+            );
+            assert_eq!(pool.transit(carrier, 0).unwrap().physical, initial.physical);
+            let spare = pool
+                .transit_if_ready(carrier, 0, |index| index == 2)
+                .unwrap();
+            assert_eq!((spare.physical, spare.counter), (2, SOURCE_COUNT + 2));
+            assert_eq!(pool.source_physical(1), Some(other.physical));
+            // The old physical slot is released; no new connection was made.
+            assert_eq!(
+                pool.source_if_ready(0, |index| index == 0)
+                    .unwrap()
+                    .physical,
+                0
+            );
+            assert!(pool.source_if_ready(2, |_| true).is_none());
         }
     }
 
