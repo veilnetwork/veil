@@ -494,6 +494,13 @@ jobs:
           fi
           echo "notes: $(wc -l < "$RUNNER_TEMP/notes.md") lines from the $RELEASE_TAG entry"
 
+      - name: Scan release artifacts for private identifiers
+        env:
+          PATTERNS: |
+            ${{ secrets.LEAK_PATTERNS }}
+            ${{ secrets.RELEASE_PRIVATE_PATTERNS }}
+        run: python3 scripts/scan-artifacts.py out
+
       - name: Attach to Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
