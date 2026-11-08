@@ -198,9 +198,11 @@ fn mark(pool: &mut Pool, readiness: &Weak<LocalDatagramLease>) {
         let mut changed = false;
         for (index, priority) in ORDERED_PRIORITIES.iter().enumerate() {
             let ready = if status.pending() & (1 << index) != 0 {
+                let slots = &pool.slots;
                 pool.assignments
-                    .source(index)
-                    .and_then(|selected| pool.ready_selection(selected))
+                    .source_if_ready(index, |physical| {
+                        slots[physical].as_ref().is_some_and(Ready::alive)
+                    })
                     .is_some()
             } else {
                 pool.assignments
@@ -434,14 +436,9 @@ impl OrderedSession {
         // tick to publish its framing/readiness. Keep the same assignment and
         // live-parent checks as the worker's completion/timer publication.
         if let Some(readiness) = &self.readiness {
-            let mut pool = lock!(self.pool);
-            // This is an eager publication of existing children, not a cold
-            // allocation pass. Reserving empty slots here can give the first
-            // completed child to a later requester and strand the first one.
-            // Completion/timer publication keeps its existing allocation policy.
-            if pool.slots.iter().any(Option::is_some) {
-                mark(&mut pool, &Arc::downgrade(readiness));
-            }
+            // All publication paths use the same non-reserving failed probe,
+            // including the worker's first/periodic tick on a cold pool.
+            mark(&mut lock!(self.pool), &Arc::downgrade(readiness));
         }
     }
 
@@ -452,14 +449,24 @@ impl OrderedSession {
         kind: RealtimeLaneFrameKind,
         ingress: Option<&veil_anonymity::circuit_carrier::Carrier>,
     ) -> Option<Arc<Mutex<RealtimeSender>>> {
-        lock!(self.pool).selected_sender(
+        let selected = lock!(self.pool).selected_sender(
             priority,
             body,
             kind,
             ingress,
             &self.transit_salt,
             &self.offer.diagnostics,
-        )
+        );
+        if selected.is_none()
+            && ORDERED_PRIORITIES.contains(&priority)
+            && let Some(readiness) = &self.readiness
+        {
+            // Failed selection no longer expresses demand by pinning a slot.
+            // Keep that intent explicitly so completion publication can wake
+            // a queued source even without a preceding readiness API request.
+            readiness.request_pending(priority);
+        }
+        selected
     }
 }
 
@@ -475,16 +482,6 @@ impl Drop for OrderedSession {
 }
 
 impl Pool {
-    fn ready_selection(
-        &mut self,
-        selected: channel_assignments::Selection,
-    ) -> Option<channel_assignments::Selection> {
-        let slots = &self.slots;
-        self.assignments.ready_selection(selected, |index| {
-            slots[index].as_ref().is_some_and(Ready::alive)
-        })
-    }
-
     fn selected_sender(
         &mut self,
         priority: u8,
@@ -494,18 +491,19 @@ impl Pool {
         salt: &[u8; 32],
         diagnostics: &Arc<ParallelDiagnostics>,
     ) -> Option<Arc<Mutex<RealtimeSender>>> {
+        let slots = &self.slots;
+        let ready = |index: usize| slots[index].as_ref().is_some_and(Ready::alive);
         let selected = if let Some(source) = ORDERED_PRIORITIES.iter().position(|&p| p == priority)
         {
-            self.assignments.source(source)?
+            self.assignments.source_if_ready(source, ready)?
         } else {
             if priority != veil_proto::priority::INTERACTIVE {
                 return None;
             }
             let bucket = parallel_lanes::neutral_transit_index(salt, body, kind)?;
             let ingress = parallel_lanes::transit_witness(kind, ingress);
-            self.assignments.transit(ingress, bucket)?
+            self.assignments.transit_if_ready(ingress, bucket, ready)?
         };
-        let selected = self.ready_selection(selected)?;
         let ready = self.slots[selected.physical].as_ref()?;
         let mut sender = lock!(ready.sender);
         sender.sent_counter = Some((diagnostics.clone(), selected.counter));

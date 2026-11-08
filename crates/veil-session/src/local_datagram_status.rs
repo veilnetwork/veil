@@ -180,6 +180,26 @@ pub(crate) struct LocalDatagramLease {
 }
 
 impl LocalDatagramLease {
+    /// Preserve a failed source's demand without reserving an unopened child.
+    /// Repeated probes notify once, and an old lease cannot change a successor.
+    pub(crate) fn request_pending(&self, local_lane: u8) -> bool {
+        let Some(bit) = bit(local_lane) else {
+            return false;
+        };
+        let mut state = lock!(self.status.state);
+        if !Weak::ptr_eq(&state.owner, &Arc::downgrade(&self.owner))
+            || state.supported & bit == 0
+            || state.ready & bit != 0
+            || state.requested & bit != 0
+        {
+            return false;
+        }
+        state.requested |= bit;
+        drop(state);
+        self.status.notify.notify_one();
+        true
+    }
+
     pub(crate) fn mark_framing(&self, local_lane: u8, framing: Option<crate::LocalPacketFraming>) {
         self.mark_state(local_lane, framing.is_some(), framing);
     }
@@ -222,6 +242,45 @@ impl Drop for LocalDatagramLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lease_demand_is_idempotent_and_rearms_only_after_ready_is_lost() {
+        use std::future::Future;
+        let status = Arc::new(LocalDatagramStatus::default());
+        let lease = status.activate_without_signaling();
+        assert!(!lease.request_pending(crate::LOCAL_SIGNALING_LANE));
+        assert!(lease.request_pending(veil_proto::priority::REALTIME));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut notification = Box::pin(status.notified());
+        assert!(notification.as_mut().poll(&mut cx).is_ready());
+        drop(notification);
+        assert!(!lease.request_pending(veil_proto::priority::REALTIME));
+        let mut notification = Box::pin(status.notified());
+        assert!(notification.as_mut().poll(&mut cx).is_pending());
+        drop(notification);
+        lease.mark(veil_proto::priority::REALTIME, true);
+        assert_eq!(status.pending(), 0);
+        assert!(!lease.request_pending(veil_proto::priority::REALTIME));
+        lease.mark(veil_proto::priority::REALTIME, false);
+        assert!(lease.request_pending(veil_proto::priority::REALTIME));
+    }
+
+    #[test]
+    fn stale_lease_demand_cannot_change_or_resurrect_a_successor() {
+        let status = Arc::new(LocalDatagramStatus::default());
+        let old = status.activate_without_signaling();
+        let current = status.activate_without_signaling();
+        assert!(!old.request_pending(veil_proto::priority::REALTIME));
+        assert_eq!(status.pending(), 0);
+        assert!(current.request_pending(veil_proto::priority::REALTIME));
+        drop(current);
+        assert!(!old.request_pending(veil_proto::priority::REALTIME));
+        assert_eq!(status.pending(), 0);
+        assert_eq!(
+            status.state(veil_proto::priority::REALTIME),
+            LocalDatagramChannelState::Unsupported
+        );
+    }
 
     #[test]
     fn independent_network_control_requires_the_negotiated_lease() {

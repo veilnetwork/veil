@@ -30,7 +30,7 @@ fn ordered_pair(
     (a, b, left, right)
 }
 
-fn app_frame(seq: u32, size: usize) -> Vec<u8> {
+pub(super) fn app_frame(seq: u32, size: usize) -> Vec<u8> {
     let body = veil_proto::app::AppRtDataPayload {
         src_app_id: [1; 32],
         app_id: [2; 32],

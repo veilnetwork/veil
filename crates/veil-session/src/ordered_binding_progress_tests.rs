@@ -3,6 +3,7 @@
 //! pipes carry the actual exporter-bound proofs through ParallelRegistry.
 use super::*;
 use crate::parallel_binding::{HELLO_BYTES, PendingParallelBinding};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
@@ -181,7 +182,8 @@ impl Fixture {
 async fn cold_prepare_does_not_change_who_gets_the_first_completed_child() {
     use crate::LocalDatagramChannelState::{Ready as ChannelReady, Warming};
     let mut outcomes = Vec::new();
-    for eager in [false, true] {
+    for mode in 0..4 {
+        let eager = mode == 1;
         let fixture = Fixture::new().await;
         let status = Arc::new(LocalDatagramStatus::default());
         let context = super::super::ordered_receiver_tests::pool_fixture_context();
@@ -202,10 +204,53 @@ async fn cold_prepare_does_not_change_who_gets_the_first_completed_child() {
         let mut channels = ParallelChannels::Ordered(Box::new(session));
         tokio::time::pause();
         let before = tokio::time::Instant::now();
-        status.request_fresh(veil_proto::priority::REALTIME);
-        status.request_fresh(veil_proto::priority::BULK);
+        if mode != 3 {
+            status.request_fresh(veil_proto::priority::REALTIME);
+            status.request_fresh(veil_proto::priority::BULK);
+        }
         if eager {
             channels.prepare(veil_proto::priority::REALTIME);
+        }
+        if mode == 2 {
+            // The worker publishes from its first/periodic tick even before
+            // any child has completed. Exercise that same publisher twice;
+            // it must not pin either pending requester to an unopened slot.
+            let ParallelChannels::Ordered(session) = &channels else {
+                unreachable!()
+            };
+            for _ in 0..2 {
+                mark(
+                    &mut lock!(session.pool),
+                    &Arc::downgrade(session.readiness.as_ref().unwrap()),
+                );
+            }
+        }
+        if mode == 3 {
+            // A failed source selection also must not reserve a nonexistent
+            // child. Ordered connections are prewarmed independently of roles.
+            for priority in [veil_proto::priority::REALTIME, veil_proto::priority::BULK] {
+                assert!(
+                    channels
+                        .sender(priority, &[], RealtimeLaneFrameKind::DirectApp, None)
+                        .is_none()
+                );
+            }
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            let mut notification = Box::pin(status.notified());
+            assert!(notification.as_mut().poll(&mut cx).is_ready());
+            drop(notification);
+            for priority in [veil_proto::priority::REALTIME, veil_proto::priority::BULK] {
+                assert!(
+                    channels
+                        .sender(priority, &[], RealtimeLaneFrameKind::DirectApp, None)
+                        .is_none()
+                );
+            }
+            let mut notification = Box::pin(status.notified());
+            assert!(
+                notification.as_mut().poll(&mut cx).is_pending(),
+                "repeated unavailable-source probes must not keep the runner runnable"
+            );
         }
         let ParallelChannels::Ordered(session) = &channels else {
             unreachable!()
@@ -297,6 +342,16 @@ async fn cold_prepare_does_not_change_who_gets_the_first_completed_child() {
         outcomes[1],
         (true, ChannelReady, Warming, true),
         "eager publication must not reserve unopened children ahead of the first completion"
+    );
+    assert_eq!(
+        outcomes[2],
+        (false, ChannelReady, Warming, true),
+        "periodic publication must not reserve unopened children ahead of the first completion"
+    );
+    assert_eq!(
+        outcomes[3],
+        (false, ChannelReady, Warming, true),
+        "failed source selections must not reserve unopened children ahead of the first completion"
     );
 }
 
