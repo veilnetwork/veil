@@ -27,6 +27,46 @@ static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
 static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
 const SLOW: Duration = Duration::from_millis(50);
 const LOG_INTERVAL: Duration = Duration::from_secs(1);
+const FINE_INTERVAL: Duration = Duration::from_millis(100);
+const FINE_LEASE: Duration = Duration::from_secs(180);
+const FINE_ROWS: u64 = 8192;
+static FINE_PROGRESS: OnceLock<Option<FineProgress>> = OnceLock::new();
+
+// The ordinary once-per-second log cannot bracket a one-second mobile stall.
+// Explicit operator opt-in retains more of the snapshots already taken below;
+// it adds no socket queries, task, timer, protocol field or socket option.
+struct FineProgress {
+    started: Instant,
+    rows: AtomicU64,
+}
+
+impl FineProgress {
+    fn claim(&self, last_log: Option<Instant>, now: Instant) -> bool {
+        if now.saturating_duration_since(self.started) >= FINE_LEASE
+            || last_log.is_some_and(|last| now.saturating_duration_since(last) < FINE_INTERVAL)
+        {
+            return false;
+        }
+        self.rows
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |rows| {
+                (rows < FINE_ROWS).then_some(rows + 1)
+            })
+            .is_ok()
+    }
+}
+
+fn fine_progress() -> Option<&'static FineProgress> {
+    FINE_PROGRESS
+        .get_or_init(|| {
+            veil_util::operator_trace::enabled("VEIL_DIAG_TCP_FINE", c"debug.xveil.tcp_fine").then(
+                || FineProgress {
+                    started: Instant::now(),
+                    rows: AtomicU64::new(0),
+                },
+            )
+        })
+        .as_ref()
+}
 
 fn enabled_cell() -> &'static AtomicBool {
     ENABLED.get_or_init(|| {
@@ -376,18 +416,20 @@ impl WriteTrace {
                 );
             }
         }
-        if self
-            .progress
-            .last_log
-            .is_none_or(|last| now.saturating_duration_since(last) >= LOG_INTERVAL)
+        let fine = fine_progress().is_some_and(|detail| detail.claim(self.progress.last_log, now));
+        if fine
+            || self
+                .progress
+                .last_log
+                .is_none_or(|last| now.saturating_duration_since(last) >= LOG_INTERVAL)
         {
             log::info!(target: "transport.tcp_trace.kernel_progress",
-                "connection={} monotonic_us={} samples={} rtt_max_us={} queued_max_bytes={:?} notsent_max_bytes={:?} retransmitted_max_bytes={:?} kernel_now={:?}",
+                "connection={} monotonic_us={} samples={} rtt_max_us={} queued_max_bytes={:?} notsent_max_bytes={:?} retransmitted_max_bytes={:?} fine={} kernel_now={:?}",
                 self.connection,
                 veil_util::diagnostic_clock::monotonic_us().map_or_else(|| "unknown".to_owned(), |us| us.to_string()),
                 self.progress.samples, self.progress.rtt_max_us,
                 self.progress.queued_max_bytes, self.progress.notsent_max_bytes,
-                self.progress.retransmitted_max_bytes, snapshot);
+                self.progress.retransmitted_max_bytes, fine, snapshot);
             self.progress.last_log = Some(now);
         }
     }
@@ -564,6 +606,30 @@ mod ordered_binding_tests;
 mod kernel_progress_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn fine_progress_is_bounded_across_connections_without_extending_lease() {
+        let start = Instant::now();
+        let detail = FineProgress {
+            started: start,
+            rows: AtomicU64::new(FINE_ROWS - 2),
+        };
+        assert!(detail.claim(None, start));
+        assert!(!detail.claim(Some(start), start + Duration::from_millis(99)));
+        // Another socket shares the same process budget.
+        assert!(detail.claim(None, start + FINE_INTERVAL));
+        assert!(!detail.claim(None, start + FINE_INTERVAL));
+        assert_eq!(detail.rows.load(Ordering::Relaxed), FINE_ROWS);
+
+        let fresh = FineProgress {
+            started: start,
+            rows: AtomicU64::new(0),
+        };
+        assert!(fresh.claim(None, start + FINE_LEASE - FINE_INTERVAL));
+        assert!(!fresh.claim(None, start + FINE_LEASE));
+        assert!(!fresh.claim(None, start + FINE_LEASE + LOG_INTERVAL));
+        assert_eq!(fresh.rows.load(Ordering::Relaxed), 1);
+    }
 
     #[tokio::test]
     async fn successful_write_snapshot_preserves_socket_options_and_wire_bytes() {
