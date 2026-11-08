@@ -834,9 +834,15 @@ impl SessionTxRegistry {
     ) -> Result<(), SendToError> {
         crate::frame_diag::note_outbound(peer_id, &frame, "tx_registry");
         crate::frame_diag::note_chunk_frame("relay_enqueue", &frame);
+        let observation = crate::opaque_forward_trace::queue_admission(peer_id, &frame);
         let tx = match self.senders.get(peer_id) {
             Some(entry) => &entry.tx,
-            None => return Err(SendToError::Missing),
+            None => {
+                if let Some(observation) = observation {
+                    observation.finish(&Err(SendToError::Missing));
+                }
+                return Err(SendToError::Missing);
+            }
         };
         let queued = match carrier {
             Some(carrier) => tx
@@ -851,7 +857,7 @@ impl SessionTxRegistry {
                 }),
             None => tx.try_send((priority, frame)),
         };
-        match queued {
+        let result = match queued {
             Ok(_) => {
                 if let Some(ts) = self.last_active.get(peer_id) {
                     ts.store(now_ms(), Ordering::Relaxed);
@@ -867,7 +873,11 @@ impl SessionTxRegistry {
                 // write-lock op (prune_closed).
                 Err(SendToError::Closed)
             }
+        };
+        if let Some(observation) = observation {
+            observation.finish(&result);
         }
+        result
     }
 
     /// Send `bytes` to every registered session **except** `exclude_peer` at `INTERACTIVE` priority.
@@ -1053,6 +1063,10 @@ impl SessionTxRegistry {
             .saturating_mul(AVG_FRAME_BYTES)
     }
 }
+
+#[cfg(test)]
+#[path = "tx_registry_admission_trace_tests.rs"]
+mod admission_trace_tests;
 
 #[cfg(test)]
 mod tests {

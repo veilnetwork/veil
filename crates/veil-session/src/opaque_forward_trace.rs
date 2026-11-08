@@ -72,12 +72,16 @@ fn sample(header: &FrameHeader, body: &[u8]) -> Option<Sample> {
     })
 }
 
-fn record(stage: &str, node: &[u8; 32], peer: &[u8; 32], sample: &Sample) {
+fn reserve_row() -> bool {
     let row = ROWS.fetch_add(1, Ordering::Relaxed);
     if row == ROW_LIMIT {
         log::info!("delivery.opaque_trace_limit rows={ROW_LIMIT}");
     }
-    if row >= ROW_LIMIT {
+    row < ROW_LIMIT
+}
+
+fn record(stage: &str, node: &[u8; 32], peer: &[u8; 32], sample: &Sample) {
+    if !reserve_row() {
         return;
     }
     let monotonic_us = veil_util::diagnostic_clock::monotonic_us().map_or(-1, i128::from);
@@ -89,6 +93,58 @@ fn record(stage: &str, node: &[u8; 32], peer: &[u8; 32], sample: &Sample) {
         sample.digest,
         sample.wrapper,
     );
+}
+
+/// A bounded, opt-in witness of an actual ordinary-queue result. The registry
+/// has no local node id: keep it unknown rather than inventing a zero identity.
+/// Accepted means queued locally, never transport selection or peer delivery.
+pub(crate) struct QueueAdmission {
+    peer: [u8; 32],
+    sample: Sample,
+}
+
+impl QueueAdmission {
+    pub(crate) fn finish(self, result: &Result<(), crate::SendToError>) {
+        if !reserve_row() {
+            return;
+        }
+        use crate::SendToError;
+        let outcome = match result {
+            Ok(()) => "accepted",
+            Err(SendToError::Missing) => "missing",
+            Err(SendToError::Full) => "full",
+            Err(SendToError::Closed) => "closed",
+        };
+        let monotonic_us = veil_util::diagnostic_clock::monotonic_us().map_or(-1, i128::from);
+        log::info!(
+            "delivery.opaque_trace stage=queue_admission outcome={outcome} monotonic_us={monotonic_us} node=- peer={} opaque_bytes={} opaque_sha256={} wrapper={}",
+            veil_util::hex_str(&self.peer[..4]),
+            self.sample.bytes,
+            self.sample.digest,
+            self.sample.wrapper,
+        );
+    }
+}
+
+pub(crate) fn queue_admission(peer: &[u8; 32], frame: &[u8]) -> Option<QueueAdmission> {
+    if !enabled() || ROWS.load(Ordering::Relaxed) > ROW_LIMIT {
+        return None;
+    }
+    Some(QueueAdmission {
+        peer: *peer,
+        sample: sample_frame(frame)?,
+    })
+}
+
+fn sample_frame(frame: &[u8]) -> Option<Sample> {
+    let header = veil_proto::codec::decode_header(frame).ok()?;
+    let body = frame.get(veil_proto::header::HEADER_SIZE..)?;
+    if usize::from(header.header_len) != veil_proto::header::HEADER_SIZE
+        || header.body_len as usize != body.len()
+    {
+        return None;
+    }
+    sample(&header, body)
 }
 
 /// Bracket synchronous dispatch, including early returns. A return observation
@@ -129,18 +185,7 @@ pub fn selected(node: &[u8; 32], peer: &[u8; 32], frame: &[u8]) {
     if !enabled() || ROWS.load(Ordering::Relaxed) > ROW_LIMIT {
         return;
     }
-    let Ok(header) = veil_proto::codec::decode_header(frame) else {
-        return;
-    };
-    let Some(body) = frame.get(veil_proto::header::HEADER_SIZE..) else {
-        return;
-    };
-    if usize::from(header.header_len) != veil_proto::header::HEADER_SIZE
-        || header.body_len as usize != body.len()
-    {
-        return;
-    }
-    if let Some(sample) = sample(&header, body) {
+    if let Some(sample) = sample_frame(frame) {
         record("transport_selected", node, peer, &sample);
     }
 }
