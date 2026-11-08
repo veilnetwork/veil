@@ -449,7 +449,8 @@ impl OrderedSession {
         kind: RealtimeLaneFrameKind,
         ingress: Option<&veil_anonymity::circuit_carrier::Carrier>,
     ) -> Option<Arc<Mutex<RealtimeSender>>> {
-        let selected = lock!(self.pool).selected_sender(
+        let mut pool = lock!(self.pool);
+        let selected = pool.selected_sender(
             priority,
             body,
             kind,
@@ -461,9 +462,12 @@ impl OrderedSession {
             && ORDERED_PRIORITIES.contains(&priority)
             && let Some(readiness) = &self.readiness
         {
-            // Failed selection no longer expresses demand by pinning a slot.
-            // Keep that intent explicitly so completion publication can wake
-            // a queued source even without a preceding readiness API request.
+            // The child may have failed since its last Ready publication.
+            // Invalidate that snapshot before requesting a replacement;
+            // otherwise request_pending would discard demand as already ready.
+            // Keep the pool locked so a concurrent completion cannot publish
+            // a new Ready between this failed selection and invalidation.
+            readiness.mark_framing(priority, None);
             readiness.request_pending(priority);
         }
         selected
