@@ -21,6 +21,88 @@ impl log::Log for Sink {
 }
 static SINK: Sink = Sink;
 
+#[test]
+fn fine_kernel_progress_requires_both_operator_gates_and_preserves_wire() {
+    const CHILD: &str = "VEIL_TEST_TCP_FINE_PROGRESS";
+    if let Ok(expected) = std::env::var(CHILD) {
+        log::set_logger(&SINK).unwrap();
+        log::set_max_level(log::LevelFilter::Info);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let (client, server) = tokio::join!(
+                    tokio::net::TcpStream::connect(listener.local_addr().unwrap()),
+                    listener.accept()
+                );
+                let mut client = client.unwrap();
+                let (mut server, _) = server.unwrap();
+                let mut trace = super::WriteTrace::default();
+                for _ in 0..3 {
+                    client.write_all(b"PRIVATE_FINE_PAYLOAD").await.unwrap();
+                    client.flush().await.unwrap();
+                    trace.observe(&client, "flush", false, 0);
+                    let mut bytes = [0; 20];
+                    server.read_exact(&mut bytes).await.unwrap();
+                    assert_eq!(&bytes, b"PRIVATE_FINE_PAYLOAD");
+                    tokio::time::sleep(Duration::from_millis(110)).await;
+                }
+                let rows = EVENTS.lock().unwrap();
+                let progress: Vec<_> = rows
+                    .iter()
+                    .filter(|(target, _)| target == "transport.tcp_trace.kernel_progress")
+                    .collect();
+                match expected.as_str() {
+                    "off" => assert!(progress.is_empty()),
+                    "normal" => {
+                        assert!(!progress.is_empty());
+                        assert!(
+                            progress
+                                .iter()
+                                .all(|(_, text)| text.contains(" fine=false "))
+                        );
+                    }
+                    "fine" => {
+                        assert!(progress.len() >= 2);
+                        assert!(
+                            progress
+                                .iter()
+                                .all(|(_, text)| text.contains(" fine=true "))
+                        );
+                    }
+                    _ => panic!("unexpected test mode"),
+                }
+                assert!(
+                    rows.iter()
+                        .all(|(_, text)| !text.contains("PRIVATE_FINE_PAYLOAD"))
+                );
+            });
+        return;
+    }
+    for (rt, fine, expected) in [
+        ("0", "1", "off"),
+        ("1", "0", "normal"),
+        ("1", "true", "normal"),
+        ("1", "1", "fine"),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tcp_trace::ordered_binding_tests::fine_kernel_progress_requires_both_operator_gates_and_preserves_wire", "--nocapture"])
+            .env(CHILD, expected)
+            .env("VEIL_RT_TRACE", rt)
+            .env("VEIL_DIAG_TCP_FINE", fine)
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 fn field(row: &str, key: &str) -> u64 {
     row.split_whitespace()
         .find_map(|v| v.strip_prefix(key))
