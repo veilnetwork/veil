@@ -385,7 +385,10 @@ impl OrderedRecordPlane {
         let (read, write) = tokio::io::split(stream);
         let tasks = [
             tokio::spawn(read_records(read, handle.clone())),
-            tokio::spawn(write_records(write, out_rx, handle.clone(), write_timeout)),
+            tokio::spawn(trace::writer_scope(
+                handle.local_trace_id(),
+                write_records(write, out_rx, handle.clone(), write_timeout),
+            )),
         ];
         Self { handle, tasks }
     }
