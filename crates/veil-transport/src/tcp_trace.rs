@@ -19,6 +19,10 @@ use tokio::net::TcpStream;
 mod handshake;
 pub(crate) use handshake::{HandshakeSide, HandshakeStream};
 
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+#[path = "tcp_info_progress.rs"]
+mod linux_progress;
+
 static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
 static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
 const SLOW: Duration = Duration::from_millis(50);
@@ -49,6 +53,11 @@ struct KernelSnapshot {
     unacked_packets: Option<u32>,
     retransmitted_packets: Option<u32>,
     retransmitted_bytes: Option<u64>,
+    sent_bytes: Option<u64>,
+    acked_bytes: Option<u64>,
+    received_bytes: Option<u64>,
+    rto_retries: Option<u8>,
+    rto_backoff: Option<u8>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -56,15 +65,63 @@ struct SocketMetadata {
     local_port: u16,
     peer_port: u16,
     tcp_nodelay: bool,
+    send_mss_bytes: Option<u32>,
+    send_buffer_bytes: Option<usize>,
+    tcp_notsent_lowat: Option<u32>,
 }
 
 impl SocketMetadata {
     fn read(stream: &TcpStream) -> std::io::Result<Self> {
+        let socket = socket2::SockRef::from(stream);
         Ok(Self {
             local_port: stream.local_addr()?.port(),
             peer_port: stream.peer_addr()?.port(),
             tcp_nodelay: stream.nodelay()?,
+            send_mss_bytes: {
+                #[cfg(unix)]
+                {
+                    socket.tcp_mss().ok()
+                }
+                #[cfg(not(unix))]
+                {
+                    None
+                }
+            },
+            send_buffer_bytes: socket.send_buffer_size().ok(),
+            tcp_notsent_lowat: read_notsent_lowat(stream),
         })
+    }
+}
+
+fn read_notsent_lowat(stream: &TcpStream) -> Option<u32> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        socket2::SockRef::from(stream).tcp_notsent_lowat().ok()
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
+        // Same public Darwin TCP_NOTSENT_LOWAT option as tcp's setter. Read
+        // only a complete nonnegative integer; failure never changes I/O.
+        // SAFETY: a live borrowed socket and initialized integer/length.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                0x201,
+                (&mut value as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        };
+        (rc == 0 && len as usize == std::mem::size_of_val(&value) && value >= 0)
+            .then_some(value as u32)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        let _ = stream;
+        None
     }
 }
 
@@ -83,9 +140,9 @@ impl KernelSnapshot {
         let send_buffer_bytes = socket2::SockRef::from(stream).send_buffer_size()?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            // Stable Linux UAPI prefix and optional extension through
-            // tcpi_notsent_bytes (offset 144). Android libc does not expose
-            // tcp_info; decode native-endian u32s from the returned length
+            // Stable Linux UAPI prefix and optional cumulative counters.
+            // Android libc does not expose tcp_info; decode native-endian
+            // fields only from the kernel's returned length
             // instead of reading an uninitialised or version-dependent struct.
             let mut raw = [0u8; 256];
             let mut len = raw.len() as libc::socklen_t;
@@ -106,6 +163,10 @@ impl KernelSnapshot {
             if len < 104 {
                 return Err(std::io::ErrorKind::UnexpectedEof.into());
             }
+            let returned = raw
+                .get(..len as usize)
+                .ok_or(std::io::ErrorKind::InvalidData)?;
+            let progress = linux_progress::read(returned);
             let u32_at = |offset| u32::from_ne_bytes(raw[offset..offset + 4].try_into().unwrap());
             let mut queued = 0i32;
             // SAFETY: live socket and writable int matching SIOCOUTQ's ABI.
@@ -120,7 +181,12 @@ impl KernelSnapshot {
                 notsent_bytes: (len >= 148).then(|| u32_at(144)),
                 unacked_packets: Some(u32_at(24)),
                 retransmitted_packets: Some(u32_at(100)),
-                retransmitted_bytes: None,
+                retransmitted_bytes: progress.retransmitted_bytes,
+                sent_bytes: progress.sent_bytes,
+                acked_bytes: progress.acked_bytes,
+                received_bytes: progress.received_bytes,
+                rto_retries: progress.rto_retries,
+                rto_backoff: progress.rto_backoff,
             })
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -161,6 +227,11 @@ impl KernelSnapshot {
                 retransmitted_packets: None,
                 retransmitted_bytes: (len >= 80)
                     .then(|| u64::from_ne_bytes(raw[72..80].try_into().unwrap())),
+                sent_bytes: None,
+                acked_bytes: None,
+                received_bytes: None,
+                rto_retries: None,
+                rto_backoff: None,
             })
         }
     }
@@ -397,6 +468,65 @@ mod tests {
         assert!(after.send_buffer_bytes > 0);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn snapshot_reports_tcp_byte_progress_after_echo() {
+        use std::os::fd::AsRawFd;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, mut server) = connected().await;
+        let payload = [0x5a; 512];
+        client.write_all(&payload).await.unwrap();
+        let mut received = [0; 512];
+        server.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, payload);
+        server.write_all(&received).await.unwrap();
+        client.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, payload);
+
+        let mut raw = [0u8; 256];
+        let mut len = raw.len() as libc::socklen_t;
+        // SAFETY: this independent capability check borrows a live socket
+        // and initialized storage. It never reads beyond the returned prefix.
+        assert_eq!(
+            unsafe {
+                libc::getsockopt(
+                    client.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_INFO,
+                    raw.as_mut_ptr().cast(),
+                    &mut len,
+                )
+            },
+            0
+        );
+        let snapshot = format!("{:?}", KernelSnapshot::read(&client).unwrap());
+        // Debug is the field-labelled operator trace contract. The round trip
+        // verifies actual progress, including the echo's TCP ACK of our data.
+        for (field, required_prefix) in [
+            ("sent_bytes", 208),
+            ("acked_bytes", 128),
+            ("received_bytes", 136),
+        ] {
+            if len >= required_prefix {
+                let label = format!(" {field}: Some(");
+                let value = snapshot
+                    .split_once(&label)
+                    .and_then(|(_, rest)| rest.split(')').next())
+                    .and_then(|value| value.parse::<u64>().ok());
+                assert!(
+                    value.is_some_and(|bytes| bytes >= payload.len() as u64),
+                    "missing actual {field} progress: {snapshot}"
+                );
+            } else {
+                assert!(
+                    snapshot.contains(&format!(" {field}: None")),
+                    "unsupported {field} must remain unknown: {snapshot}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn pending_interval_survives_repoll_and_resets_at_completion() {
         let (a, _b) = connected().await;
@@ -469,11 +599,18 @@ mod kernel_progress_tests {
             let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
             let mut client = client.unwrap();
             let (mut server, observed_peer) = accepted.unwrap();
-            client.set_nodelay(nodelay).unwrap();
+            crate::tcp::configure_accepted_tcp(&client, nodelay, None).unwrap();
             let metadata = SocketMetadata::read(&client).unwrap();
             assert_eq!(metadata.local_port, observed_peer.port());
             assert_eq!(metadata.peer_port, address.port());
             assert_eq!(metadata.tcp_nodelay, nodelay);
+            let socket = socket2::SockRef::from(&client);
+            assert_eq!(
+                metadata.send_buffer_bytes,
+                Some(socket.send_buffer_size().unwrap())
+            );
+            assert_eq!(metadata.send_mss_bytes, Some(socket.tcp_mss().unwrap()));
+            assert_eq!(metadata.tcp_notsent_lowat, Some(4096));
             assert!(ports.insert(metadata.local_port));
             let mut trace = WriteTrace::default();
             trace.observe_kernel_progress(&client, Instant::now());
