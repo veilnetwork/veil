@@ -20,6 +20,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.media.AudioManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.net.VpnService
 import android.os.Build
@@ -310,6 +312,48 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                     if (max > 0) {
                         snapshot["callVolumePercent"] =
                             (100L * audio.getStreamVolume(AudioManager.STREAM_VOICE_CALL) / max).toInt()
+                    }
+                }
+                val connectivity = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                if (connectivity != null) {
+                    // Read-only categories, never Network.toString(), handles,
+                    // addresses, interface/SSID names or subscription details.
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        try {
+                            val networkState = mutableMapOf<String, Any>()
+                            val network = connectivity.activeNetwork
+                            val capabilities = network?.let { connectivity.getNetworkCapabilities(it) }
+                            val bound = connectivity.boundNetworkForProcess
+                            networkState["networkPresent"] = network != null
+                            networkState["networkCapabilitiesAvailable"] = capabilities != null
+                            networkState["networkMetered"] = connectivity.isActiveNetworkMetered
+                            networkState["processNetworkBound"] = bound != null
+                            if (bound != null) networkState["processNetworkIsDefault"] = bound == network
+                            if (capabilities != null) {
+                                networkState["networkWifi"] = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                                networkState["networkCellular"] = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
+                                networkState["networkVpn"] = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                                networkState["networkInternet"] = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                                networkState["networkValidated"] = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                                    networkState["networkNotSuspended"] = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_SUSPENDED)
+                                }
+                            }
+                            networkState["networkSnapshotAvailable"] = true
+                            snapshot.putAll(networkState)
+                        } catch (_: SecurityException) {
+                            // Absence/refusal must not be exported as offline.
+                            snapshot["networkSnapshotAvailable"] = false
+                        }
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        try {
+                            // Android constants: disabled=1, whitelisted=2,
+                            // enabled=3. This is policy, not proof of blocking.
+                            snapshot["restrictBackgroundStatus"] = connectivity.restrictBackgroundStatus
+                        } catch (_: SecurityException) {
+                            // Preserve the other independently available flags.
+                        }
                     }
                 }
                 result.success(snapshot)
