@@ -356,6 +356,114 @@ async fn cold_prepare_does_not_change_who_gets_the_first_completed_child() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn failed_ready_child_rearms_demand_before_a_spare_completion() {
+    use crate::LocalDatagramChannelState::{Ready as ChannelReady, Warming};
+    for &priority in ORDERED_PRIORITIES {
+        let fixture = Fixture::new().await;
+        let status = Arc::new(LocalDatagramStatus::default());
+        let context = super::super::ordered_receiver_tests::pool_fixture_context();
+        let offer = ParallelOrderedOffer::new(fixture.offer.handle.clone(), Arc::default());
+        let mut session = OrderedSession::new(
+            offer,
+            &[3; 32],
+            &[2; 32],
+            [1; 32],
+            context.clone(),
+            Some(status.clone()),
+        );
+        session._worker.0.abort();
+        assert!((&mut session._worker.0).await.unwrap_err().is_cancelled());
+        let make_child = |binding| {
+            let (hello, pending) = fixture.source.begin(binding).unwrap();
+            let (ack, local_keys) = session.parent.handle().accept(&hello, binding).unwrap();
+            let remote_keys = pending.finish(&ack).unwrap();
+            let (a, b) = tokio::io::duplex(65536);
+            let remote = remote_keys.into_ordered(Box::new(a)).unwrap();
+            let local = local_keys.into_ordered(Box::new(b)).unwrap();
+            let ready = Ready::new(
+                Owner::Outgoing(local),
+                session.parent.handle(),
+                context.clone(),
+                session.offer.diagnostics.clone(),
+            );
+            (ready, remote)
+        };
+        let (initial, _old_remote) = make_child([71; 32]);
+        let (spare, remote) = make_child([72; 32]);
+        tokio::time::pause();
+        let before = tokio::time::Instant::now();
+        status.request_fresh(priority);
+        lock!(session.pool).slots[0] = Some(initial);
+        mark(
+            &mut lock!(session.pool),
+            &Arc::downgrade(session.readiness.as_ref().unwrap()),
+        );
+        assert_eq!(status.state(priority), ChannelReady);
+        assert_eq!(status.pending(), 0);
+        let sender = session
+            .sender_with_carrier(priority, &[], RealtimeLaneFrameKind::DirectApp, None)
+            .unwrap();
+        lock!(sender).broken = true;
+        // The receiver/record writer can fail between periodic publications.
+        // Do not refresh readiness or send again after this single failure.
+        assert!(
+            session
+                .sender_with_carrier(priority, &[], RealtimeLaneFrameKind::DirectApp, None)
+                .is_none()
+        );
+        assert_eq!(
+            status.state(priority),
+            Warming,
+            "a failed selection must invalidate its stale Ready snapshot"
+        );
+        assert_ne!(status.pending(), 0, "the replacement demand must survive");
+        {
+            let mut pool = lock!(session.pool);
+            pool.slots[1] = Some(spare);
+            mark(
+                &mut pool,
+                &Arc::downgrade(session.readiness.as_ref().unwrap()),
+            );
+        }
+        assert_eq!(status.state(priority), ChannelReady);
+        assert_eq!(status.pending(), 0);
+        assert_eq!(tokio::time::Instant::now(), before);
+        tokio::time::resume();
+        let replacement = session
+            .sender_with_carrier(priority, &[], RealtimeLaneFrameKind::DirectApp, None)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&sender, &replacement));
+        let frame = super::super::ordered_receiver_tests::app_frame(23, 32);
+        let datagrams = lock!(replacement).tx.encode_frame(1, &frame, 1200).unwrap();
+        assert_eq!(datagrams.len(), 1);
+        lock!(replacement).handle.send(&datagrams[0]).unwrap();
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(2), remote.handle().recv())
+                .await
+                .unwrap()
+                .unwrap();
+        let mut decoder = crate::datagram_flows::SessionDatagramRx::new(
+            remote.keys.rx_key(),
+            &remote.keys.session_id,
+            true,
+        );
+        assert_eq!(
+            decoder
+                .decode_datagram(&received, std::time::Instant::now())
+                .unwrap()
+                .unwrap(),
+            frame
+        );
+        drop(session);
+        drop(remote);
+        drop(fixture);
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn warmed_ordered_readiness_request_is_published_without_the_periodic_tick() {
     use crate::LocalDatagramChannelState::{Ready as ChannelReady, Warming};
     let fixture = Fixture::new().await;
