@@ -241,6 +241,13 @@ pub const VALIDATION_RULES: &[ValidationRule] = &[
         fix: None,
     },
     ValidationRule {
+        code: "nat_udp_reflector_bind_conflicts_with_quic",
+        key: "nat.udp_reflector_bind",
+        message: "must not overlap a QUIC listener's UDP bind address; use separate UDP ports or addresses",
+        check: nat_udp_reflector_bind_conflicts_with_quic,
+        fix: None,
+    },
+    ValidationRule {
         code: "nat_udp_reflector_invalid",
         key: "nat.udp_reflectors[]",
         message: "every entry must be a numeric ip:port socket address with a non-zero port",
@@ -802,6 +809,38 @@ fn nat_udp_reflector_bind_invalid(config: &Config) -> bool {
         .udp_reflector_bind
         .as_deref()
         .is_some_and(|value| !valid_udp_reflector_addr(value))
+}
+
+fn nat_udp_reflector_bind_conflicts_with_quic(config: &Config) -> bool {
+    let Some(reflector) = config
+        .nat
+        .udp_reflector_bind
+        .as_deref()
+        .and_then(|value| value.parse::<std::net::SocketAddr>().ok())
+    else {
+        return false;
+    };
+    config.listen.iter().any(|listen| {
+        let Ok(TransportUri::Quic { host, port, .. }) = TransportUri::parse(&listen.transport)
+        else {
+            return false;
+        };
+        if port == 0 || port != reflector.port() {
+            return false;
+        }
+        // Numeric binds can be checked without DNS or opening a socket. Do
+        // not guess how a hostname resolves or whether IPv6 sockets accept
+        // IPv4 too: that depends on the runtime host's resolver/socket policy.
+        let Ok(ip) = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+        else {
+            return false;
+        };
+        ip.is_ipv4() == reflector.ip().is_ipv4()
+            && (ip == reflector.ip() || ip.is_unspecified() || reflector.ip().is_unspecified())
+    })
 }
 
 fn nat_udp_reflector_invalid(config: &Config) -> bool {
