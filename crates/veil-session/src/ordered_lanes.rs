@@ -434,7 +434,14 @@ impl OrderedSession {
         // tick to publish its framing/readiness. Keep the same assignment and
         // live-parent checks as the worker's completion/timer publication.
         if let Some(readiness) = &self.readiness {
-            mark(&mut lock!(self.pool), &Arc::downgrade(readiness));
+            let mut pool = lock!(self.pool);
+            // This is an eager publication of existing children, not a cold
+            // allocation pass. Reserving empty slots here can give the first
+            // completed child to a later requester and strand the first one.
+            // Completion/timer publication keeps its existing allocation policy.
+            if pool.slots.iter().any(Option::is_some) {
+                mark(&mut pool, &Arc::downgrade(readiness));
+            }
         }
     }
 

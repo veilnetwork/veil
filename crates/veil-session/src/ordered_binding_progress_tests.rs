@@ -178,6 +178,129 @@ impl Fixture {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn cold_prepare_does_not_change_who_gets_the_first_completed_child() {
+    use crate::LocalDatagramChannelState::{Ready as ChannelReady, Warming};
+    let mut outcomes = Vec::new();
+    for eager in [false, true] {
+        let fixture = Fixture::new().await;
+        let status = Arc::new(LocalDatagramStatus::default());
+        let context = super::super::ordered_receiver_tests::pool_fixture_context();
+        let offer = ParallelOrderedOffer::new(fixture.offer.handle.clone(), Arc::default());
+        let mut session = OrderedSession::new(
+            offer,
+            &[3; 32],
+            &[2; 32],
+            [1; 32],
+            context.clone(),
+            Some(status.clone()),
+        );
+        // Drive one authenticated completion explicitly. This models an
+        // outbound attempt completing at index 1 before index 0; the worker's
+        // periodic tick must not decide the result of this regression.
+        session._worker.0.abort();
+        assert!((&mut session._worker.0).await.unwrap_err().is_cancelled());
+        let mut channels = ParallelChannels::Ordered(Box::new(session));
+        tokio::time::pause();
+        let before = tokio::time::Instant::now();
+        status.request_fresh(veil_proto::priority::REALTIME);
+        status.request_fresh(veil_proto::priority::BULK);
+        if eager {
+            channels.prepare(veil_proto::priority::REALTIME);
+        }
+        let ParallelChannels::Ordered(session) = &channels else {
+            unreachable!()
+        };
+        let binding = [61; 32];
+        let (hello, pending) = fixture.source.begin(binding).unwrap();
+        let (ack, local_keys) = session.parent.handle().accept(&hello, binding).unwrap();
+        let remote_keys = pending.finish(&ack).unwrap();
+        let (a, b) = tokio::io::duplex(65536);
+        let remote = remote_keys.into_ordered(Box::new(a)).unwrap();
+        let local = local_keys.into_ordered(Box::new(b)).unwrap();
+        {
+            let mut pool = lock!(session.pool);
+            pool.slots[1] = Some(Ready::new(
+                Owner::Outgoing(local),
+                session.parent.handle(),
+                context,
+                session.offer.diagnostics.clone(),
+            ));
+            mark(
+                &mut pool,
+                &Arc::downgrade(session.readiness.as_ref().unwrap()),
+            );
+        }
+        let primary = status.state(veil_proto::priority::REALTIME);
+        let secondary = status.state(veil_proto::priority::BULK);
+        let no_timer = tokio::time::Instant::now() == before;
+        tokio::time::resume();
+        if primary == ChannelReady {
+            let body = veil_proto::app::AppRtDataPayload {
+                src_app_id: [1; 32],
+                app_id: [2; 32],
+                endpoint_id: 1,
+                seq: 19,
+                timestamp_us: 0,
+                marker: 0,
+                payload_type: 111,
+                payload: vec![0x57; 32],
+            }
+            .encode();
+            let mut header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppRtData as u16);
+            header.set_priority(veil_proto::priority::REALTIME);
+            header.body_len = body.len() as u32;
+            let mut frame = encode_header(&header).to_vec();
+            frame.extend_from_slice(&body);
+            let sender = channels
+                .sender(
+                    veil_proto::priority::REALTIME,
+                    &body,
+                    RealtimeLaneFrameKind::DirectApp,
+                    None,
+                )
+                .unwrap();
+            let datagrams = lock!(sender).tx.encode_frame(1, &frame, 1200).unwrap();
+            assert_eq!(datagrams.len(), 1);
+            lock!(sender).handle.send(&datagrams[0]).unwrap();
+            let received =
+                tokio::time::timeout(std::time::Duration::from_secs(2), remote.handle().recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut decoder = crate::datagram_flows::SessionDatagramRx::new(
+                remote.keys.rx_key(),
+                &remote.keys.session_id,
+                true,
+            );
+            assert_eq!(
+                decoder
+                    .decode_datagram(&received, std::time::Instant::now())
+                    .unwrap()
+                    .unwrap(),
+                frame
+            );
+        }
+        outcomes.push((eager, primary, secondary, no_timer));
+        drop(channels);
+        drop(remote);
+        drop(fixture);
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    }
+    assert_eq!(
+        outcomes[0],
+        (false, ChannelReady, Warming, true),
+        "control without eager publication must use the completed child"
+    );
+    assert_eq!(
+        outcomes[1],
+        (true, ChannelReady, Warming, true),
+        "eager publication must not reserve unopened children ahead of the first completion"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn warmed_ordered_readiness_request_is_published_without_the_periodic_tick() {
     use crate::LocalDatagramChannelState::{Ready as ChannelReady, Warming};
     let fixture = Fixture::new().await;
