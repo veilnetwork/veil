@@ -126,7 +126,7 @@ mod tests {
         // or the filter refuses the whole internet.
         for outside in [
             "8.8.8.8",
-            "198.51.100.104",
+            "8.8.4.4",
             "1.1.1.1",
             "203.0.113.9", // documentation: not routed, but nobody's inside
             "2001:4860:4860::8888",

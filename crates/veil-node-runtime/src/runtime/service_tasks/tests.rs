@@ -1055,7 +1055,7 @@ fn a_failed_dial_retires_only_the_row_it_minted() {
 
     // The slot was reclaimed for a DIFFERENT address while we waited.
     let mut elsewhere = mine.clone();
-    elsewhere.transport = "obfs4-tcp://198.51.100.104:5556".to_owned();
+    elsewhere.transport = "obfs4-tcp://8.8.4.4:5556".to_owned();
     elsewhere.node_id =
         veil_cfg::NodeId::from(*blake3::hash(elsewhere.transport.as_bytes()).as_bytes());
     assert!(
@@ -1271,15 +1271,17 @@ fn an_address_a_stranger_named_is_not_dialled_into_this_network() {
     }
 
     // ...and a real public address still is, or the layer finds nobody.
+    // Public resolvers are classification-only fixtures: no dial is made here.
+    // Documentation ranges cannot replace these because this gate rejects them.
     for public in [
         "8.8.8.8",
-        "198.51.100.104",
+        "8.8.4.4",
         "1.1.1.1",
         "[2001:4860:4860::8888]",
         // A mapped PUBLIC address is still public: the normalisation must
         // not refuse everything it touches.
         "[::ffff:8.8.8.8]",
-        "[::ffff:198.51.100.104]",
+        "[::ffff:8.8.4.4]",
     ] {
         assert!(
             rendezvous_destination_is_dialable(public),
@@ -1757,8 +1759,8 @@ fn what_we_publish_about_ourselves_is_public_and_unambiguous() {
     // Vacuity: a real public listener is still published, or the node
     // never announces itself anywhere.
     assert_eq!(
-        public_address_for(&listener("obfs4://198.51.100.104:5556"), &[]),
-        Some(("198.51.100.104".to_owned(), 5556))
+        public_address_for(&listener("obfs4://8.8.4.4:5556"), &[]),
+        Some(("8.8.4.4".to_owned(), 5556))
     );
 
     // The helper hands back a BARE v6 host, which is why the publisher has
