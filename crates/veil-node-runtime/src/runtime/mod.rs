@@ -3106,6 +3106,8 @@ fn spawn_punched_inbound_session(
 
 /// The listener awaits this future in its registered handshake task. A second
 /// spawn would detach the runner when that task is cancelled during node.stop.
+// Keep Send + 'static checked at this factory boundary, not only at spawn sites.
+#[allow(clippy::manual_async_fn)]
 fn inbound_session(
     inbound: InboundSessionContext,
     connection: Box<dyn veil_transport::TransportConnection>,
