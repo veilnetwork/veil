@@ -1082,10 +1082,10 @@ impl FrameDispatcher {
                 *peer_id.as_bytes(),
                 Instant::now(),
             );
-            if let Some(path) = path {
-                if let ReplyTo::Peer(back) = path.reply {
-                    self.send_discovery_reply(back, RoutingMsg::PowChallenge, body);
-                }
+            if let Some(path) = path
+                && let ReplyTo::Peer(back) = path.reply
+            {
+                self.send_discovery_reply(back, RoutingMsg::PowChallenge, body);
             }
             return DispatchResult::NoResponse;
         }
@@ -1236,10 +1236,10 @@ impl FrameDispatcher {
                 Instant::now(),
             );
             if let Some(path) = path {
-                if path.issuer_hop == *peer_id.as_bytes() {
-                    if let ReplyTo::Peer(back) = path.reply {
-                        self.send_discovery_reply(back, RoutingMsg::PowAccept, body);
-                    }
+                if path.issuer_hop == *peer_id.as_bytes()
+                    && let ReplyTo::Peer(back) = path.reply
+                {
+                    self.send_discovery_reply(back, RoutingMsg::PowAccept, body);
                 }
                 return DispatchResult::NoResponse;
             }

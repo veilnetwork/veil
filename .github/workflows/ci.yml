@@ -78,7 +78,7 @@ jobs:
         # Phase 6.50.b-followup: -D warnings gate locks in the clippy
         # cleanup batch.  New lints must be fixed OR explicitly
         # `#[allow(…)]`-d with a rationale comment before merge.
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --keep-going -- -D warnings
 
       - name: Every tool CI installs is pinned
         run: ./scripts/check-workflow-pins.sh
