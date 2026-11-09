@@ -500,7 +500,7 @@ async fn verified_handoff_adopts_quic_without_closing_the_transport() {
         let mut header = FrameHeader::new(FrameFamily::Session as u8, kind as u16);
         header.body_len = body.len() as u32;
         writer.write_all(&encode_header(&header)).await.unwrap();
-        writer.write_all(&body).await.unwrap();
+        writer.write_all(body).await.unwrap();
     }
     let mut cfg = runtime_config_with_listen();
     cfg.peers.clear();
