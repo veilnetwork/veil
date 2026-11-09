@@ -500,6 +500,8 @@ fn device_matches_identity(ctx: &IpcSendContext, device: &[u8; 32], identity: &[
 
 /// Reuse the same sealed bytes over reliable relay hops, including after a
 /// direct source closes mid-transfer. Only outer routing metadata is renewed.
+// Keep verified device/instance values distinct from sender and routing policy.
+#[allow(clippy::too_many_arguments)]
 async fn forward_ordinary_family_copy(
     reg: &dyn FrameBroadcaster,
     send: &AppIpcSendPayload,
