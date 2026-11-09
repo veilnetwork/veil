@@ -1,0 +1,102 @@
+name: testnet seed binary
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Existing immutable v* release tag; never a moving branch.'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '4'
+      RUSTFLAGS: '--remap-path-prefix=${{ github.workspace }}=. --remap-path-prefix=/home/runner=/HOME'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - name: Verify immutable source tag
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$SOURCE_REF^{commit}")"
+          echo "VERSION=${SOURCE_REF#v}" >> "$GITHUB_ENV"
+          epoch="$(git show -s --format=%at HEAD)"
+          echo "SOURCE_DATE_EPOCH=$epoch" >> "$GITHUB_ENV"
+          echo "VEIL_RELEASE_UNIX=$epoch" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: testnet-musl
+
+      - name: Verify isolated network features
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 --filter-platform x86_64-unknown-linux-musl \
+            --no-default-features --features veil-cli/rocksdb-cold,veil-cli/tls-boring,veil-cli/testnet-seeds,veil-node-runtime/testnet-seeds > "$RUNNER_TEMP/testnet-metadata.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          data = json.loads((Path(os.environ['RUNNER_TEMP']) / 'testnet-metadata.json').read_text())
+          packages = {p['id']: p for p in data['packages']}
+          found = set()
+          for node in data['resolve']['nodes']:
+              package = packages[node['id']]
+              if package['name'] in ['veil-cli', 'veil-bootstrap', 'veil-node-runtime']:
+                  assert package['version'] == os.environ['VERSION']
+                  assert 'testnet-seeds' in node['features']
+                  assert 'production-seeds' not in node['features']
+                  found.add(package['name'])
+          assert found == {'veil-cli', 'veil-bootstrap', 'veil-node-runtime'}
+          PY
+
+      - name: Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev cmake build-essential pkg-config golang ninja-build
+          pip3 install --user --break-system-packages 'cargo-zigbuild==0.22.3' 'ziglang==0.16.0'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build and identify the testnet binary
+        run: |
+          set -euo pipefail
+          cargo zigbuild --release --locked -p veil-cli --no-default-features \
+            --features rocksdb-cold,tls-boring,testnet-seeds,veil-node-runtime/testnet-seeds \
+            --target x86_64-unknown-linux-musl
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/veil-cli dist/veil-cli-testnet
+          dist/veil-cli-testnet --version | grep -Fx "veil-cli $VERSION"
+          git rev-parse HEAD > dist/SOURCE_COMMIT
+          printf '%s\n' 'rocksdb-cold,tls-boring,testnet-seeds,veil-node-runtime/testnet-seeds' > dist/FEATURES
+          printf '%s\n' "$VERSION" > dist/VERSION
+          (cd dist && sha256sum veil-cli-testnet > SHA256SUMS)
+
+      - name: Scan operator artifacts for private identifiers
+        env:
+          PATTERNS: |
+            ${{ secrets.LEAK_PATTERNS }}
+            ${{ secrets.RELEASE_PRIVATE_PATTERNS }}
+        run: python3 scripts/scan-artifacts.py dist
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: veil-testnet-${{ env.VERSION }}-x86_64-linux-musl
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
