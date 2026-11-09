@@ -9,15 +9,10 @@ impl Drop for Live {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
-fn attempt(
-    rx: oneshot::Receiver<Result<u8>>,
-    live: Arc<AtomicUsize>,
-) -> impl std::future::Future<Output = Result<u8>> {
-    async move {
-        live.fetch_add(1, Ordering::SeqCst);
-        let _live = Live(live);
-        rx.await.unwrap()
-    }
+async fn attempt(rx: oneshot::Receiver<Result<u8>>, live: Arc<AtomicUsize>) -> Result<u8> {
+    live.fetch_add(1, Ordering::SeqCst);
+    let _live = Live(live);
+    rx.await.unwrap()
 }
 fn failure(s: &str) -> TransportError {
     TransportError::Tls(s.to_owned())
