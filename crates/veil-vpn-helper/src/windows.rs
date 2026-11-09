@@ -40,6 +40,7 @@ use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
     PIPE_TYPE_BYTE, PIPE_WAIT,
 };
+use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, WaitForSingleObject,
@@ -838,9 +839,41 @@ fn write_status(path: &Path, token: &str, phase: &str, detail: Option<&str>) -> 
     fs::rename(&temp, path).map_err(|error| format!("publish Windows VPN status: {error}"))
 }
 
+fn system_netsh() -> io::Result<PathBuf> {
+    // Ask Windows, rather than trusting PATH, SystemRoot or the app directory.
+    // In particular, Windows need not be installed on the C: drive.
+    let mut buffer = vec![0u16; 256];
+    loop {
+        // SAFETY: buffer is writable for the advertised number of UTF-16 units.
+        let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+        if length == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if length as usize >= buffer.len() {
+            if length >= 32_768 {
+                return Err(io::Error::other(
+                    "Windows system directory exceeds path limit",
+                ));
+            }
+            buffer.resize(length as usize + 1, 0);
+            continue;
+        }
+        let directory = PathBuf::from(OsString::from_wide(&buffer[..length as usize]));
+        if !directory.is_absolute() {
+            return Err(io::Error::other("Windows system directory is not absolute"));
+        }
+        return Ok(directory.join("netsh.exe"));
+    }
+}
+
 fn clear_dns_servers(interface_index: u32) {
+    let Ok(netsh) = system_netsh() else {
+        // Cleanup is best-effort; never fall back to an untrusted executable.
+        return;
+    };
     for family in ["ipv4", "ipv6"] {
-        let _ = Command::new("netsh.exe")
+        let _ = Command::new(&netsh)
+            .env("PATH", netsh.parent().expect("system helper has a parent"))
             .args([
                 "interface",
                 family,
@@ -861,6 +894,14 @@ fn clear_dns_servers(interface_index: u32) {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn dns_cleanup_uses_the_absolute_system_helper() {
+        let helper = system_netsh().expect("Windows provides its system directory");
+        assert!(helper.is_absolute());
+        assert_eq!(helper.file_name().unwrap(), "netsh.exe");
+        assert!(helper.is_file());
+    }
 
     /// A well-formed request, as the host writes it.
     const REQUEST: &str = concat!(
