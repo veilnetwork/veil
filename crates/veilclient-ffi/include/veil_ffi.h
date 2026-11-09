@@ -1893,6 +1893,8 @@ int veil_create_bootstrap_invite(VeilHandle *handle,
  * Tell the daemon that the local network attachment changed. Triggers
  * an eager gateway-reconnect attempt so the app doesn't have to wait
  * for the keepalive timeout to detect that warm sessions are doomed.
+ * Returns after the daemon's inline dispatch barrier, so a temporary handle
+ * can be closed immediately. This does not wait for remote peer recovery.
  *
  * `kind` must be one of `VEIL_NET_*`. `mtu_hint = 0` means "use
  * default" (advisory only).
