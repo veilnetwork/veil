@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+## v0.11.49 — 2026-11-10
+
+### Fixed
+
+- Destroy Windows audio modules on the thread that created them. The final
+  release previously uninitialized the caller's COM apartment and could break
+  notification cancellation after calls. Direct and group calls, including
+  construction failure cleanup, retain the module until owner-thread release.
+- Expose the Windows system audio output as an explicit role. Check each stage
+  of a live output switch, restore the previous output on failure and report
+  failure instead of silently accepting an unusable route.
+- Resolve the Windows VPN DNS cleanup tool through the Windows system directory,
+  instead of searching an untrusted application directory or PATH.
+
+### Validation
+
+- A real-DLL Windows probe reproduces caller COM corruption in four original
+  engine/apartment combinations; all four pass with the fix. Separate portable
+  lifetime and output-selection checks cover error cleanup and rollback.
+- Isolated Android/Windows calls confirmed live speech in both directions.
+  Repeated calls, output switches and application lock/unlock completed on the
+  repaired engine. These checks do not qualify every audio device or provider.
+
 ## v0.11.48 — 2026-11-09
 
 ### Fixed
