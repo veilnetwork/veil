@@ -15,6 +15,7 @@
 #include "veil_media_engine.h"
 #include "veil_audio_level_band.h"
 #include "veil_audio_output_selection.h"
+#include "veil_owner_thread_ref.h"
 
 #include <algorithm>
 #include <atomic>
@@ -150,6 +151,10 @@ extern "C" int veil_media_send_datagram(uint64_t chan, const uint8_t* ptr,
                                          size_t len);
 extern "C" int veil_media_send_video_control_datagram(uint64_t chan, const uint8_t* ptr,
                                                        size_t len);
+
+#if defined(_WIN32) && defined(VEIL_MEDIA_HAVE_WEBRTC)
+void run_on_adm_thread(std::function<void()> fn);
+#endif
 
 namespace {
 
@@ -1076,6 +1081,15 @@ class Android420FrameDispatcher {
 struct WebrtcState {
   explicit WebrtcState(webrtc::Environment e) : env(std::move(e)) {}
   webrtc::Environment env;
+#if defined(_WIN32)
+  // The ADM's COM initializer must be destroyed on its creating thread.
+  // Keep the last reference past AudioState, Call and queue destruction,
+  // including early returns during construction. Terminate() alone does not
+  // destroy that initializer; a caller-thread final Release disconnects the
+  // caller's apartment and breaks unrelated WinRT notification operations.
+  veil_media::OwnerThreadRef<webrtc::scoped_refptr<webrtc::AudioDeviceModule>>
+      adm_lifetime{run_on_adm_thread};
+#endif
   std::unique_ptr<webrtc::TaskQueueBase, webrtc::TaskQueueDeleter> worker_tq;
   std::unique_ptr<webrtc::TaskQueueBase, webrtc::TaskQueueDeleter> network_tq;
   std::unique_ptr<webrtc::TaskQueueBase, webrtc::TaskQueueDeleter> video_worker_tq;
@@ -1216,6 +1230,10 @@ struct GroupPeerState {
 struct GroupWebrtcState {
   explicit GroupWebrtcState(webrtc::Environment e) : env(std::move(e)) {}
   webrtc::Environment env;
+#if defined(_WIN32)
+  veil_media::OwnerThreadRef<webrtc::scoped_refptr<webrtc::AudioDeviceModule>>
+      adm_lifetime{run_on_adm_thread};
+#endif
   std::unique_ptr<webrtc::TaskQueueBase, webrtc::TaskQueueDeleter> worker_tq;
   std::unique_ptr<webrtc::TaskQueueBase, webrtc::TaskQueueDeleter> network_tq;
   std::unique_ptr<webrtc::TaskQueueBase, webrtc::TaskQueueDeleter> video_worker_tq;
@@ -1900,6 +1918,9 @@ VeilMediaEngine* veil_media_engine_create(uint64_t veil_chan,
   // cannot silently diverge. In particular, macOS uses WebRTC's CoreAudio HAL
   // path while iOS retains the AVAudioSession-aware custom ADM.
   ws->adm = create_audio_device(ws->env);
+#if defined(_WIN32)
+  ws->adm_lifetime.Retain(ws->adm);
+#endif
   if (!ws->adm) {
     // AudioState requires an ADM. Passing null survives release construction
     // but dereferences it when an audio stream starts (debug builds DCHECK).
@@ -2127,6 +2148,9 @@ VeilGroupMediaEngine* veil_media_group_engine_create(
   ws->video_network_tq = ws->env.task_queue_factory().CreateTaskQueue(
       "veil-group-video-net", webrtc::TaskQueueFactory::Priority::kNormal);
   ws->adm = create_audio_device(ws->env);
+#if defined(_WIN32)
+  ws->adm_lifetime.Retain(ws->adm);
+#endif
   if (!ws->adm) {
     vlog("group media: create failed — audio device module unavailable");
     return nullptr;

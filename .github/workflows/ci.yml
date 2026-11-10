@@ -215,6 +215,9 @@ jobs:
       - name: Audio output selection preserves a working device on failure
         run: python3 flutter/veil_media/test/run_audio_output_selection_smoke.py
 
+      - name: Audio device final release stays on its owning thread
+        run: python3 flutter/veil_media/test/run_owner_thread_ref_smoke.py
+
       - name: Install cargo-audit
         # Phase 6.50.b audit-A2: `cargo audit` gates against the RustSec
         # advisory DB on every push to main.  Pinned minor (^0.22) for
