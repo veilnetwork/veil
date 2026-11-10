@@ -22,6 +22,10 @@ import 'package:ffi/ffi.dart';
 import 'src/i420.dart';
 import 'src/bindings.dart' as ffi;
 
+/// The Windows ADM's OS-selected output role, distinct from numeric device 0.
+/// Available when returned by [VeilMediaEngine.listAudioOutputs].
+const systemAudioOutputDeviceId = 'system-default';
+
 /// An enumerated audio device.
 class MediaDevice {
   const MediaDevice(

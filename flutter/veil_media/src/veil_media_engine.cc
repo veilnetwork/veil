@@ -14,6 +14,7 @@
 #include "veil_bounded_vp8.h"
 #include "veil_media_engine.h"
 #include "veil_audio_level_band.h"
+#include "veil_audio_output_selection.h"
 
 #include <algorithm>
 #include <atomic>
@@ -4358,6 +4359,11 @@ char* adm_devices_json(webrtc::AudioDeviceModule* adm, bool recording) {
   if (adm) {
     run_on_adm_thread([&] {
     const int16_t n = recording ? adm->RecordingDevices() : adm->PlayoutDevices();
+#if defined(_WIN32)
+    if (!recording && n > 0) {
+      out += "{\"id\":\"system-default\",\"label\":\"System default\",\"kind\":\"output\"}";
+    }
+#endif
     for (int16_t i = 0; i < n; ++i) {
       char name[webrtc::kAdmMaxDeviceNameSize] = {0};
       char guid[webrtc::kAdmMaxGuidSize] = {0};
@@ -4468,19 +4474,27 @@ int veil_media_engine_select_audio_output(VeilMediaEngine* engine,
   if (engine == nullptr || id == nullptr) return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!engine->ws || !engine->ws->adm) return VEIL_MEDIA_ERR_DEVICE;
-  const uint16_t idx = static_cast<uint16_t>(std::atoi(id));
   webrtc::AudioDeviceModule* adm = engine->ws->adm.get();
-  bool ok = true;
+  bool ok = false;
   run_on_adm_thread([&] {
+#if defined(_WIN32)
+    ok = veil_media::SelectAudioOutput(adm, id, g_chosen_playout, [&] {
+      auto rc = adm->SetPlayoutDevice(webrtc::AudioDeviceModule::kDefaultDevice);
+      if (rc != 0) {
+        rc = adm->SetPlayoutDevice(webrtc::AudioDeviceModule::kDefaultCommunicationDevice);
+      }
+      return rc;
+    });
+#else
+    const uint16_t idx = static_cast<uint16_t>(std::atoi(id));
     const bool was_playing = adm->Playing();
     adm->StopPlayout();
-    if (adm->SetPlayoutDevice(idx) != 0) {
-      ok = false;
-      return;
-    }
+    if (adm->SetPlayoutDevice(idx) != 0) return;
     g_chosen_playout = idx;
     adm->InitPlayout();
     if (was_playing) adm->StartPlayout();
+    ok = true;
+#endif
   });
   if (!ok) return VEIL_MEDIA_ERR_DEVICE;
 #endif
