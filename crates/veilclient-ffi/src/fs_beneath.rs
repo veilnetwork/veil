@@ -53,6 +53,21 @@ use std::ffi::{CStr, CString, c_char};
 
 use libc::size_t;
 
+// Internal building block for the crash-recoverable folder publisher. Keep
+// the new operation out of the C ABI until that protocol is wired as a whole.
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple"
+))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "R33-07 publication protocol integration pending")
+)]
+#[path = "fs_beneath/move_entry.rs"]
+mod move_entry;
+
 /// An open file, held by descriptor. The name it was opened by is not kept:
 /// nothing here ever looks at a path again.
 ///
@@ -390,6 +405,17 @@ fn win_open_at(
     directory: bool,
     create: bool,
 ) -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
+    win_open_at_with_access(dir, name, directory, create, 0)
+}
+
+#[cfg(windows)]
+fn win_open_at_with_access(
+    dir: windows_sys::Win32::Foundation::HANDLE,
+    name: &str,
+    directory: bool,
+    create: bool,
+    extra_access: u32,
+) -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
     use std::os::windows::ffi::OsStrExt as _;
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::NtCreateFile;
@@ -427,7 +453,7 @@ fn win_open_at(
         MaximumLength: bytes,
         Buffer: wide.as_mut_ptr(),
     };
-    let mut attrs = OBJECT_ATTRIBUTES {
+    let attrs = OBJECT_ATTRIBUTES {
         Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
         RootDirectory: dir,
         ObjectName: &mut unicode,
@@ -444,6 +470,7 @@ fn win_open_at(
     } else {
         FILE_GENERIC_READ | SYNCHRONIZE
     };
+    let access = access | extra_access;
     let options = FILE_SYNCHRONOUS_IO_NONALERT
         | if directory {
             FILE_DIRECTORY_FILE
@@ -456,7 +483,7 @@ fn win_open_at(
         NtCreateFile(
             &mut handle,
             access,
-            &mut attrs,
+            &attrs,
             &mut iosb,
             std::ptr::null(),
             FILE_ATTRIBUTE_NORMAL,
