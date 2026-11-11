@@ -15,6 +15,7 @@
 #include "veil_media_engine.h"
 #include "veil_audio_level_band.h"
 #include "veil_audio_output_selection.h"
+#include "veil_audio_input_selection.h"
 #include "veil_owner_thread_ref.h"
 
 #include <algorithm>
@@ -4472,21 +4473,21 @@ int veil_media_engine_select_audio_input(VeilMediaEngine* engine,
   if (engine == nullptr || id == nullptr) return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (!engine->ws || !engine->ws->adm) return VEIL_MEDIA_ERR_DEVICE;
-  const uint16_t idx = static_cast<uint16_t>(std::atoi(id));
-  // Stop -> switch -> restart so the change takes effect mid-call.
   webrtc::AudioDeviceModule* adm = engine->ws->adm.get();
-  bool ok = true;
+  bool ok = false;
   run_on_adm_thread([&] {
-    const bool was_recording = adm->Recording();
-    adm->StopRecording();
-    if (adm->SetRecordingDevice(idx) != 0) {
-      ok = false;
-      return;
-    }
-    // Remembered, so the next start does not undo it.
-    g_chosen_recording = idx;
-    adm->InitRecording();
-    if (was_recording) adm->StartRecording();
+    ok = veil_media::SelectAudioInput(adm, id, g_chosen_recording, [&] {
+#if defined(_WIN32)
+      auto rc = adm->SetRecordingDevice(
+          webrtc::AudioDeviceModule::kDefaultCommunicationDevice);
+      if (rc != 0) {
+        rc = adm->SetRecordingDevice(webrtc::AudioDeviceModule::kDefaultDevice);
+      }
+      return rc;
+#else
+      return adm->SetRecordingDevice(uint16_t{0});
+#endif
+    });
   });
   if (!ok) return VEIL_MEDIA_ERR_DEVICE;
 #endif
