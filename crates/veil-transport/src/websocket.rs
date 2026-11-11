@@ -381,7 +381,7 @@ fn make_path_callback(expected_path: String) -> PathCallback {
             // documenting the invariant.
             Err(http::Response::builder()
                 .status(http::StatusCode::NOT_FOUND)
-                .body(Some(format!("path not found: {}", req.uri().path())))
+                .body(Some("path not found".to_owned()))
                 .expect("404 response with literal status + Some body is well-formed"))
         }
     })
@@ -777,6 +777,33 @@ mod tests {
         let result = cb(&make_request("/wrong"), ok_response());
         let err_resp = result.expect_err("wrong path must be rejected");
         assert_eq!(err_resp.status(), http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rejected_upgrade_does_not_reflect_request_path() {
+        for path in [
+            "/user-supplied/fixture-path?query=fixture",
+            "/%3Cscript%3Efixture%3C/script%3E",
+        ] {
+            let (client, server) = tokio::io::duplex(4096);
+            let accept = tokio::spawn(async move {
+                tokio_tungstenite::accept_hdr_async(server, make_path_callback("/veil".to_owned()))
+                    .await
+            });
+            let result =
+                tokio_tungstenite::client_async(format!("ws://localhost{path}"), client).await;
+            let tokio_tungstenite::tungstenite::Error::Http(response) =
+                result.expect_err("wrong path must reject the upgrade")
+            else {
+                panic!("expected an HTTP rejection");
+            };
+            assert!(accept.await.unwrap().is_err());
+            assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+            assert_eq!(
+                response.body().as_deref(),
+                Some(b"path not found".as_slice())
+            );
+        }
     }
 
     #[test]
