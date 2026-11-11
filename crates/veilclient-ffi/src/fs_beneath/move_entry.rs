@@ -10,8 +10,10 @@ use super::split_components;
 
 #[cfg(unix)]
 use std::ffi::CString;
+#[cfg(all(unix, test))]
+use std::os::fd::FromRawFd;
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
@@ -53,6 +55,7 @@ pub(super) fn destination_leaf(source: &str, destination: &str) -> Result<String
 }
 
 impl PreparedMove {
+    #[cfg(test)]
     pub(super) fn open(root: &str, source: &str, destination: &str) -> Result<Self, String> {
         let destination = destination_leaf(source, destination)?;
         #[cfg(unix)]

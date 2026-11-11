@@ -53,18 +53,13 @@ use std::ffi::{CStr, CString, c_char};
 
 use libc::size_t;
 
-// Internal building block for the crash-recoverable folder publisher. Keep
-// the new operation out of the C ABI until that protocol is wired as a whole.
+// Descriptor-relative replacement and its root-scoped recovery/scan admission.
 #[cfg(any(
     windows,
     target_os = "linux",
     target_os = "android",
     target_vendor = "apple"
 ))]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "R33-07 publication protocol integration pending")
-)]
 #[path = "fs_beneath/move_entry.rs"]
 mod move_entry;
 
@@ -74,12 +69,11 @@ mod move_entry;
     target_os = "android",
     target_vendor = "apple"
 ))]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "R33-07 publication protocol integration pending")
-)]
 #[path = "fs_beneath/publication.rs"]
 mod publication;
+
+#[path = "fs_beneath/folder_ffi.rs"]
+mod folder_ffi;
 
 /// An open file, held by descriptor. The name it was opened by is not kept:
 /// nothing here ever looks at a path again.

@@ -14,6 +14,7 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::{Mutex, MutexGuard};
 use std::time::UNIX_EPOCH;
 
 #[cfg(unix)]
@@ -52,6 +53,158 @@ enum Stage {
 
 /// This and PreparedMove share one pinned OS directory, not separate walks.
 struct Parent(File);
+
+/// A root-wide admission shared by publication, recovery and the host scan.
+/// Holding it across recovery AND enumeration prevents another publisher's
+/// temporary missing name from being interpreted as a user deletion.
+pub(super) struct FolderSession {
+    root: Parent,
+    _lock: File,
+    operations: Mutex<()>,
+}
+
+impl FolderSession {
+    pub(super) fn open(root: &str) -> Result<Self, String> {
+        let root = Parent::open(root, ".xveil-anchor")?;
+        let lock = root.lock()?;
+        Ok(Self {
+            root,
+            _lock: lock,
+            operations: Mutex::new(()),
+        })
+    }
+
+    fn operation(&self) -> Result<MutexGuard<'_, ()>, String> {
+        self.operations.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => "folder publication is busy".to_owned(),
+            std::sync::TryLockError::Poisoned(_) => "folder admission failed".to_owned(),
+        })
+    }
+
+    pub(super) fn publish(
+        &self,
+        target: &str,
+        incoming: &str,
+        expected: Option<Version>,
+    ) -> Result<Outcome, String> {
+        self.publish_with_hook(target, incoming, expected, |_| Ok(()))
+    }
+
+    fn publish_with_hook(
+        &self,
+        target: &str,
+        incoming: &str,
+        expected: Option<Version>,
+        mut hook: impl FnMut(Stage) -> Result<(), String>,
+    ) -> Result<Outcome, String> {
+        let _operation = self.operation()?;
+        // One admission remains held for the entire transaction. Reopening
+        // a named root between steps would lose both pinning and exclusion.
+        super::move_entry::destination_leaf(incoming, target)?;
+        let target_parts = super::split_components(target)?;
+        let target_leaf = target_parts.last().ok_or("missing target")?;
+        let incoming_parts = super::split_components(incoming)?;
+        let incoming_leaf = incoming_parts.last().ok_or("missing incoming")?;
+        let stem = stem(incoming_leaf, ".incoming")?;
+        let parent = self.parent(target)?;
+        publish_locked(
+            &parent,
+            target_leaf,
+            incoming_leaf,
+            &stem,
+            expected,
+            &mut hook,
+        )
+    }
+
+    pub(super) fn recover(&self, relative_intent: &str) -> Result<bool, String> {
+        let _operation = self.operation()?;
+        let parts = super::split_components(relative_intent)?;
+        let name = parts.last().ok_or("missing intent")?;
+        let stem = stem(name, ".intent")?;
+        let parent = self.parent(relative_intent)?;
+        let mut journal = parent.required(name, false, true)?;
+        let intent = Intent::read(&mut journal)?;
+        if intent.settled {
+            return Ok(false);
+        }
+        recover_locked(&parent, &stem, &intent, &mut journal)?;
+        Ok(true)
+    }
+
+    /// The scan still enumerates by the host's pathname. Refuse a renamed or
+    /// substituted root before accepting that enumeration as a complete scan.
+    /// This is a consistency check, not an atomic filesystem snapshot.
+    pub(super) fn matches_root(&self, path: &str) -> Result<bool, String> {
+        let other = Parent::open(path, ".xveil-anchor")?;
+        same_object(&self.root.0, &other.0)
+    }
+
+    fn parent(&self, relative: &str) -> Result<Parent, String> {
+        let parts = super::split_components(relative)?;
+        #[cfg(windows)]
+        if parts.iter().any(|part| part.contains(':')) {
+            return Err("drive or alternate stream in folder path".to_owned());
+        }
+        let mut directory = self.root.0.try_clone().map_err(io_error)?;
+        for name in &parts[..parts.len() - 1] {
+            #[cfg(unix)]
+            {
+                let name = std::ffi::CString::new(*name).map_err(|_| "NUL in directory")?;
+                // SAFETY: a relative component, held directory and no-follow
+                // flags keep each step beneath the already opened root.
+                let fd = unsafe {
+                    libc::openat(
+                        directory.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(io_error(std::io::Error::last_os_error()));
+                }
+                // SAFETY: openat transfers one fresh descriptor.
+                directory = unsafe { File::from_raw_fd(fd) };
+            }
+            #[cfg(windows)]
+            {
+                let handle = super::win_open_at(directory.as_raw_handle(), name, true, false)?;
+                // SAFETY: win_open_at transfers one fresh handle.
+                directory = unsafe { File::from_raw_handle(handle) };
+            }
+        }
+        Ok(Parent(directory))
+    }
+}
+
+fn same_object(a: &File, b: &File) -> Result<bool, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let a = a.metadata().map_err(io_error)?;
+        let b = b.metadata().map_err(io_error)?;
+        Ok(a.dev() == b.dev() && a.ino() == b.ino())
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let id = |file: &File| {
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: the held file and writable info outlive the call.
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+                return Err(io_error(std::io::Error::last_os_error()));
+            }
+            Ok((
+                info.dwVolumeSerialNumber,
+                info.nFileIndexHigh,
+                info.nFileIndexLow,
+            ))
+        };
+        Ok(id(a)? == id(b)?)
+    }
+}
 
 impl Parent {
     fn open(root: &str, relative: &str) -> Result<Self, String> {
@@ -147,8 +300,10 @@ impl Parent {
             Some(file) => file,
             None => self.required(LOCK_NAME, true, true)?,
         };
-        file.try_lock()
-            .map_err(|_| "folder publication is busy".to_owned())?;
+        file.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => "folder publication is busy".to_owned(),
+            std::fs::TryLockError::Error(error) => io_error(error),
+        })?;
         Ok(file)
     }
 
@@ -255,8 +410,12 @@ fn io_error(error: std::io::Error) -> String {
 
 fn leaf(name: &str) -> Result<(), String> {
     let parts = super::split_components(name)?;
-    if parts.len() != 1 || parts[0] != name || name.contains(':') {
+    if parts.len() != 1 || parts[0] != name {
         return Err("publication requires a single relative filename".to_owned());
+    }
+    #[cfg(windows)]
+    if name.contains(':') {
+        return Err("publication filename must not name an alternate stream".to_owned());
     }
     Ok(())
 }
@@ -351,31 +510,35 @@ impl Intent {
     }
 }
 
-pub(super) fn publish(
+#[cfg(test)]
+fn publish(
     root: &str,
     target: &str,
     incoming: &str,
     expected: Option<Version>,
 ) -> Result<Outcome, String> {
-    publish_with_hook(root, target, incoming, expected, |_| Ok(()))
+    FolderSession::open(root)?.publish(target, incoming, expected)
 }
 
+#[cfg(test)]
 fn publish_with_hook(
     root: &str,
     target: &str,
     incoming: &str,
     expected: Option<Version>,
+    hook: impl FnMut(Stage) -> Result<(), String>,
+) -> Result<Outcome, String> {
+    FolderSession::open(root)?.publish_with_hook(target, incoming, expected, hook)
+}
+
+fn publish_locked(
+    parent: &Parent,
+    target_leaf: &str,
+    incoming_leaf: &str,
+    stem: &str,
+    expected: Option<Version>,
     mut hook: impl FnMut(Stage) -> Result<(), String>,
 ) -> Result<Outcome, String> {
-    // Also rejects different parents and aliases BEFORE touching either path.
-    super::move_entry::destination_leaf(incoming, target)?;
-    let target_parts = super::split_components(target)?;
-    let target_leaf = target_parts.last().ok_or("missing target")?;
-    let incoming_parts = super::split_components(incoming)?;
-    let incoming_leaf = incoming_parts.last().ok_or("missing incoming")?;
-    let stem = stem(incoming_leaf, ".incoming")?;
-    let parent = Parent::open(root, target)?;
-    let _lock = parent.lock()?;
     if parent.version(target_leaf)? != expected {
         return Ok(Outcome::LocalChanged);
     }
@@ -405,13 +568,13 @@ fn publish_with_hook(
         hook(Stage::PreviousMoved)?;
         // The actual displaced object may differ from the pre-move stat.
         if !matches!(parent.version(&previous_name), Ok(actual) if actual == expected) {
-            recover_locked(&parent, &stem, &intent, &mut journal)?;
+            recover_locked(parent, stem, &intent, &mut journal)?;
             return Ok(Outcome::LocalChanged);
         }
     }
     hook(Stage::BeforeInstall)?;
     if !parent.move_entry(incoming_leaf, target_leaf)? {
-        recover_locked(&parent, &stem, &intent, &mut journal)?;
+        recover_locked(parent, stem, &intent, &mut journal)?;
         return Ok(Outcome::LocalChanged);
     }
     parent.sync()?;
@@ -424,19 +587,9 @@ fn publish_with_hook(
 /// Recover ONE intent discovered by the host BEFORE it scans ordinary files.
 /// The host must not scan if this refuses. Successful recovery never deletes
 /// bytes: a newer occupied target and all side copies are left intact.
-pub(super) fn recover(root: &str, relative_intent: &str) -> Result<bool, String> {
-    let parts = super::split_components(relative_intent)?;
-    let name = parts.last().ok_or("missing intent")?;
-    let stem = stem(name, ".intent")?;
-    let parent = Parent::open(root, relative_intent)?;
-    let _lock = parent.lock()?;
-    let mut journal = parent.required(name, false, true)?;
-    let intent = Intent::read(&mut journal)?;
-    if intent.settled {
-        return Ok(false);
-    }
-    recover_locked(&parent, &stem, &intent, &mut journal)?;
-    Ok(true)
+#[cfg(test)]
+fn recover(root: &str, relative_intent: &str) -> Result<bool, String> {
+    FolderSession::open(root)?.recover(relative_intent)
 }
 
 fn recover_locked(
@@ -537,6 +690,119 @@ mod tests {
         assert_eq!(tree.read("target"), b"download");
         assert_eq!(tree.read(PREVIOUS), b"old");
         assert!(!recover(tree.root(), INTENT).unwrap());
+    }
+
+    #[test]
+    fn a_scan_session_blocks_publication_in_another_subdirectory() {
+        let tree = Tree::new();
+        std::fs::create_dir(tree.path().join("nested")).unwrap();
+        let incoming = format!("nested/{INCOMING}");
+        tree.put("nested/target", b"old");
+        tree.put(&incoming, b"download");
+        let expected = Some(tree.version("nested/target"));
+        let session = FolderSession::open(tree.root()).unwrap();
+        assert!(session.matches_root(tree.root()).unwrap());
+        assert_eq!(
+            publish(tree.root(), "nested/target", &incoming, expected).unwrap_err(),
+            "folder publication is busy"
+        );
+        assert_eq!(tree.read("nested/target"), b"old");
+        assert!(!tree.path().join(format!("nested/{INTENT}")).exists());
+        assert_eq!(child(tree.path(), "busy").status.code(), Some(74));
+        drop(session);
+        assert!(matches!(
+            publish(tree.root(), "nested/target", &incoming, expected).unwrap(),
+            Outcome::Published(_)
+        ));
+        assert_eq!(tree.read("nested/target"), b"download");
+    }
+
+    #[test]
+    fn one_session_can_recover_then_scan_then_publish_without_unlocking() {
+        let tree = Tree::new();
+        tree.put("target", b"old");
+        tree.put(INCOMING, b"first download");
+        let result = publish_with_hook(
+            tree.root(),
+            "target",
+            INCOMING,
+            Some(tree.version("target")),
+            |stage| {
+                if stage == Stage::PreviousMoved {
+                    return Err("simulated interruption".to_owned());
+                }
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!tree.path().join("target").exists());
+        let session = FolderSession::open(tree.root()).unwrap();
+        assert!(session.recover(INTENT).unwrap());
+        assert_eq!(tree.read("target"), b"old");
+        let second = ".xveil-1123456789abcdef0123456789abcdef.incoming";
+        tree.put(second, b"second download");
+        assert!(matches!(
+            session
+                .publish("target", second, Some(tree.version("target")))
+                .unwrap(),
+            Outcome::Published(_)
+        ));
+        assert!(session.matches_root(tree.root()).unwrap());
+        assert_eq!(tree.read("target"), b"second download");
+    }
+
+    #[test]
+    fn recovery_on_the_same_handle_cannot_settle_an_in_flight_publication() {
+        let tree = Tree::new();
+        tree.put("target", b"old");
+        tree.put(INCOMING, b"download");
+        let expected = Some(tree.version("target"));
+        let session = FolderSession::open(tree.root()).unwrap();
+        let mut reached = false;
+        session
+            .publish_with_hook("target", INCOMING, expected, |stage| {
+                if stage == Stage::IntentDurable {
+                    reached = true;
+                    assert_eq!(
+                        session.recover(INTENT).unwrap_err(),
+                        "folder publication is busy"
+                    );
+                    assert_eq!(
+                        session.publish("target", INCOMING, expected).unwrap_err(),
+                        "folder publication is busy"
+                    );
+                    assert_eq!(tree.read(INTENT)[SETTLED_OFFSET as usize], 0);
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(reached);
+        assert_eq!(tree.read("target"), b"download");
+        assert_eq!(tree.read(PREVIOUS), b"old");
+        assert!(!session.recover(INTENT).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_never_reopens_a_substituted_root_by_its_old_pathname() {
+        let tree = Tree::new();
+        std::fs::create_dir(tree.path().join("root")).unwrap();
+        tree.put("root/target", b"old");
+        tree.put(&format!("root/{INCOMING}"), b"download");
+        let path = tree.path().join("root");
+        let session = FolderSession::open(path.to_str().unwrap()).unwrap();
+        let expected = Some(tree.version("root/target"));
+        std::fs::rename(&path, tree.path().join("parked")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        tree.put("root/target", b"substituted root");
+        assert!(!session.matches_root(path.to_str().unwrap()).unwrap());
+        assert!(matches!(
+            session.publish("target", INCOMING, expected).unwrap(),
+            Outcome::Published(_)
+        ));
+        assert_eq!(tree.read("root/target"), b"substituted root");
+        assert_eq!(tree.read("parked/target"), b"download");
+        assert_eq!(tree.read(&format!("parked/{PREVIOUS}")), b"old");
     }
 
     #[test]
@@ -1057,7 +1323,6 @@ mod tests {
             "/absolute",
             "sub/file",
             "sub\\file",
-            "file:stream",
             ".xveil-sync.lock",
             "bad\0name",
         ] {
@@ -1070,5 +1335,35 @@ mod tests {
             assert!(recover(tree.root(), INTENT).is_err());
             assert_eq!(tree.read(INTENT), bytes);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_colon_inside_a_posix_filename_is_not_treated_as_a_windows_stream() {
+        let tree = Tree::new();
+        tree.put(INCOMING, b"download");
+        assert!(matches!(
+            publish(tree.root(), "note:2026.txt", INCOMING, None).unwrap(),
+            Outcome::Published(_)
+        ));
+        assert_eq!(tree.read("note:2026.txt"), b"download");
+        assert!(!recover(tree.root(), INTENT).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_intent_cannot_name_an_alternate_data_stream() {
+        let tree = Tree::new();
+        tree.put(INCOMING, b"download");
+        assert!(publish(tree.root(), "note:stream", INCOMING, None).is_err());
+        assert_eq!(tree.read(INCOMING), b"download");
+        assert!(!tree.path().join(INTENT).exists());
+        let target = b"note:stream";
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend([0, 0]);
+        bytes.extend((target.len() as u16).to_le_bytes());
+        bytes.extend(target);
+        tree.put(INTENT, &bytes);
+        assert!(recover(tree.root(), INTENT).is_err());
     }
 }
