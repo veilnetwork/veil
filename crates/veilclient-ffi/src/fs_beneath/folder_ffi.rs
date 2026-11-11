@@ -283,6 +283,79 @@ pub unsafe extern "C" fn veil_fs_saved_unchanged(
     }
 }
 
+/// Explicitly discard a confirmed saved copy. `saved` is the still-live
+/// descriptor returned by open_saved; replacements/changes are refused.
+/// `quarantine` must name a fresh protocol incoming sibling. Pending/corrupt
+/// journals and orphan previous files require recovery rather than deletion.
+/// Returns 1 removed, 0 changed, -1 refused. A refused/interrupted operation
+/// can leave its captured copy at quarantine, available for list/export.
+///
+/// # Safety
+/// Both handles must be live, paths valid C strings, err_out writable or NULL.
+/// Do not close or mutate either handle concurrently with this operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_fs_folder_discard_saved(
+    folder: *mut VeilFsFolder,
+    relative: *const c_char,
+    saved: *mut super::VeilFsFile,
+    quarantine: *const c_char,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    #[cfg(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple"
+    ))]
+    {
+        let result = (|| {
+            if folder.is_null() || saved.is_null() {
+                return Err("null saved handle".to_owned());
+            }
+            let relative = unsafe { arg(relative) }?;
+            let quarantine = unsafe { arg(quarantine) }?;
+            let saved = unsafe { &*saved };
+            let stamp = saved.saved_stamp.ok_or("not a saved-copy handle")?;
+            #[cfg(unix)]
+            let file = {
+                use std::os::fd::BorrowedFd;
+                // SAFETY: caller keeps the live source handle open.
+                let fd = unsafe { BorrowedFd::borrow_raw(saved.fd) };
+                std::fs::File::from(
+                    fd.try_clone_to_owned()
+                        .map_err(|_| "saved descriptor unavailable")?,
+                )
+            };
+            #[cfg(windows)]
+            let file = saved
+                .file
+                .try_clone()
+                .map_err(|_| "saved descriptor unavailable")?;
+            unsafe { &*folder }
+                .session
+                .discard_saved(relative, &file, stamp, quarantine)
+        })();
+        match result {
+            Ok(removed) => i32::from(removed),
+            Err(error) => {
+                unsafe { super::set_err(err_out, &error) };
+                -1
+            }
+        }
+    }
+    #[cfg(not(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple"
+    )))]
+    {
+        let _ = (folder, relative, saved, quarantine);
+        unsafe { super::set_err(err_out, "saved-copy cleanup unavailable") };
+        -1
+    }
+}
+
 /// Check that a host pathname still names the admitted root. A false result
 /// must refuse the host's scan, rather than interpret a moved folder as empty.
 /// This check does not turn a host scan into an atomic filesystem snapshot.
