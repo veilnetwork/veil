@@ -33,7 +33,7 @@ pub(super) struct PreparedMove {
     destination: String,
 }
 
-fn destination_leaf(source: &str, destination: &str) -> Result<String, String> {
+pub(super) fn destination_leaf(source: &str, destination: &str) -> Result<String, String> {
     let from = split_components(source)?;
     let to = split_components(destination)?;
     // split_components refuses an empty list, so both final indices exist.
@@ -85,6 +85,46 @@ impl PreparedMove {
             Ok(Self {
                 directory,
                 source,
+                destination,
+            })
+        }
+    }
+
+    /// Prepare another move under a directory already pinned by a transaction.
+    /// Reopening the parent by pathname between transaction steps would lose
+    /// the containment guarantee even though each individual move was safe.
+    pub(super) fn in_parent(
+        parent: &std::fs::File,
+        source: &str,
+        destination: &str,
+    ) -> Result<Self, String> {
+        let destination = destination_leaf(source, destination)?;
+        if split_components(source)?.len() != 1 {
+            return Err("move requires sibling leaf names".to_owned());
+        }
+        let directory = parent.try_clone().map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                directory: directory.into(),
+                source: CString::new(source).map_err(|_| "NUL in source")?,
+                destination: CString::new(destination).map_err(|_| "NUL in destination")?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Storage::FileSystem::DELETE;
+            let source = super::win_open_at_with_access(
+                directory.as_raw_handle(),
+                source,
+                false,
+                false,
+                DELETE,
+            )?;
+            Ok(Self {
+                directory: directory.into(),
+                // SAFETY: win_open_at transfers one fresh owned handle.
+                source: unsafe { OwnedHandle::from_raw_handle(source) },
                 destination,
             })
         }
