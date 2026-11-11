@@ -27,6 +27,8 @@ WEBRTC_OUT="${WEBRTC_OUT:-out/mac-arm64}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRCDIR="$SCRIPT_DIR/../src"
 SRCDIR="$(cd "$SRCDIR" && pwd)"
+PROVENANCE="$SCRIPT_DIR/../source_provenance.py"
+SOURCE_DIGEST="$(python3 "$PROVENANCE" --source "$SRCDIR")"
 DEST="${1:-$SCRIPT_DIR/Frameworks}"
 mkdir -p "$DEST"
 
@@ -144,6 +146,8 @@ link_dylib "$TMP/probe.dylib"
 nm -gU "$TMP/probe.dylib" | awk '{print $3}' | grep '^_veil_media_' > "$TMP/exported.txt"
 echo "==> link pass 2: final dylib with $(wc -l < "$TMP/exported.txt" | xargs) defined exports (deadstrip='${DEADSTRIP}')"
 link_dylib "$DEST/libveil_media.dylib" -Wl,-exported_symbols_list,"$TMP/exported.txt"
+python3 "$PROVENANCE" --source "$SRCDIR" --binary "$DEST/libveil_media.dylib" \
+  --expected-source "$SOURCE_DIGEST"
 
 echo "==> done: $DEST/libveil_media.dylib ($(du -h "$DEST/libveil_media.dylib" | cut -f1))"
 nm -gU "$DEST/libveil_media.dylib" | grep -c "T _veil_media_" | xargs echo "exported veil_media_* symbols:"
