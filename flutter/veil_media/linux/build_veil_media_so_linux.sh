@@ -33,7 +33,7 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # -std=c++20, linux sysroot), swapping only the source.
 compile_tu() {  # $1=src  $2=out.o
   python3 - "$CC_JSON" "$1" "$2" "$SRCDIR" "$WEBRTC_SRC" <<'PY' > "$TMP/tu.sh"
-import json,sys,re
+import json,sys,re,shlex
 cc=json.load(open(sys.argv[1])); src,out,shimdir=sys.argv[2],sys.argv[3],sys.argv[4]
 suffix='modules/pacing/pacing_controller.cc' if src.endswith('/webrtc_pacing/pacing_controller.cc') else 'call/call.cc'
 e=next((x for x in cc if x.get('file','').endswith(suffix)), None)
@@ -47,7 +47,8 @@ s=re.search(r'(\S*'+re.escape(suffix)+')',cmd).group(1)
 cmd=cmd.replace(s,src); cmd=re.sub(r'-o\s+\S+','-o '+out,cmd)
 cmd=re.sub(r'-MF\s+\S+', '-MF '+out+'.d', cmd)
 extra=' -I'+sys.argv[5]+'/third_party/protobuf/src' if '-DWEBRTC_ENABLE_PROTOBUF=1' in cmd else ''
-p=cmd.split(' ',1); cmd=p[0]+' -DVEIL_MEDIA_HAVE_WEBRTC=1 -I'+shimdir+extra+' '+p[1]
+privacy=shlex.quote('-ffile-prefix-map='+shimdir+'=/src/veil-media')
+p=cmd.split(' ',1); cmd=p[0]+' -DVEIL_MEDIA_HAVE_WEBRTC=1 -I'+shimdir+extra+' '+privacy+' '+p[1]
 open('/dev/stdout','w').write('cd "'+e['directory']+'"\n'+cmd+'\n')
 PY
   bash "$TMP/tu.sh"
