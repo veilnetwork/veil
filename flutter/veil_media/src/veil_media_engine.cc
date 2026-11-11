@@ -4385,8 +4385,10 @@ char* adm_devices_json(webrtc::AudioDeviceModule* adm, bool recording) {
     run_on_adm_thread([&] {
     const int16_t n = recording ? adm->RecordingDevices() : adm->PlayoutDevices();
 #if defined(_WIN32)
-    if (!recording && n > 0) {
-      out += "{\"id\":\"system-default\",\"label\":\"System default\",\"kind\":\"output\"}";
+    if (n > 0) {
+      out += "{\"id\":\"system-default\",\"label\":\"System default\",\"kind\":\"";
+      out += recording ? "input" : "output";
+      out += "\"}";
     }
 #endif
     for (int16_t i = 0; i < n; ++i) {
