@@ -26,6 +26,10 @@ import 'src/bindings.dart' as ffi;
 /// Available when returned by [VeilMediaEngine.listAudioOutputs].
 const systemAudioOutputDeviceId = 'system-default';
 
+/// The Windows ADM's OS-selected communications input role, distinct from 0.
+/// Available when returned by [VeilMediaEngine.listAudioInputs].
+const systemAudioInputDeviceId = 'system-default';
+
 /// An enumerated audio device.
 class MediaDevice {
   const MediaDevice(

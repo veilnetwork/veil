@@ -1,6 +1,7 @@
 // The runner extracts the exact production FFI body. The ADM only supplies
 // controlled failures; selection/restart/rollback decisions remain production.
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -10,8 +11,21 @@
 #endif
 
 namespace webrtc {
+inline constexpr int kAdmMaxDeviceNameSize = 128;
+inline constexpr int kAdmMaxGuidSize = 128;
 struct AudioDeviceModule {
   enum WindowsDeviceType { kDefaultDevice = -1, kDefaultCommunicationDevice = -2 };
+  int16_t device_count = 3;
+  int16_t RecordingDevices() const { return device_count; }
+  int16_t PlayoutDevices() const { return device_count; }
+  int RecordingDeviceName(int16_t i, char* name, char*) {
+    if (i < 0 || i >= device_count) return -1;
+    std::strcpy(name, ("input-" + std::to_string(i)).c_str()); return 0;
+  }
+  int PlayoutDeviceName(int16_t i, char* name, char*) {
+    if (i < 0 || i >= device_count) return -1;
+    std::strcpy(name, ("output-" + std::to_string(i)).c_str()); return 0;
+  }
   bool recording = true;
   bool initialized = true;
   int current = 5;
@@ -70,6 +84,12 @@ template <class F> void run_on_adm_thread(F f) { f(); }
 #undef _WIN32
 #endif
 #include "selected_input.inc"
+char* dup_cstr(const std::string& s) {
+  auto* p = static_cast<char*>(std::malloc(s.size() + 1));
+  std::memcpy(p, s.c_str(), s.size() + 1); return p;
+}
+#include "listed_inputs.inc"
+
 
 int main() {
   int checks = 0, failures = 0;
@@ -77,6 +97,24 @@ int main() {
     ++checks;
     if (!ok) { ++failures; std::cerr << "failed: " << scenario << '\n'; }
   };
+  {
+    auto adm = std::make_shared<webrtc::AudioDeviceModule>();
+    VeilMediaEngine engine{std::make_shared<State>(State{adm})};
+    char* raw = veil_media_engine_list_audio_inputs(&engine);
+    const std::string listed(raw); std::free(raw);
+#if defined(INPUT_FIXTURE_WINDOWS)
+    check(listed.find("\"id\":\"system-default\",\"label\":\"System default\",\"kind\":\"input\"") != std::string::npos,
+          "Windows enumerates an explicit dynamic input role");
+#else
+    check(listed.find("system-default") == std::string::npos,
+          "non-Windows does not invent role metadata");
+#endif
+    check(listed.find("\"id\":\"0\"") != std::string::npos, "numeric input identifiers retained");
+    adm->device_count = 0;
+    raw = veil_media_engine_list_audio_inputs(&engine);
+    check(std::string(raw) == "[]", "no microphone means no offered role");
+    std::free(raw);
+  }
   for (const std::string stage : {"set", "init", "start", "stop", "none"}) {
     auto adm = std::make_shared<webrtc::AudioDeviceModule>();
     adm->fail = stage;

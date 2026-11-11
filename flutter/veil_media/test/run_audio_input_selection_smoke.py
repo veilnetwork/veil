@@ -10,8 +10,13 @@ root = Path(__file__).resolve().parents[1]
 source = (root / "src/veil_media_engine.cc").read_text()
 start = source.index("int veil_media_engine_select_audio_input(")
 end = source.index("\nint veil_media_engine_select_audio_output(", start)
+list_start = source.index("char* adm_devices_json(")
+list_end = source.index("\n}  // namespace", list_start)
+ffi_start = source.index("char* veil_media_engine_list_audio_inputs(")
+ffi_end = source.index("\nchar* veil_media_engine_list_audio_outputs(", ffi_start)
 with tempfile.TemporaryDirectory(prefix="veil-audio-input-", dir=os.environ.get("TMPDIR")) as tmp:
     (Path(tmp) / "selected_input.inc").write_text(source[start:end])
+    (Path(tmp) / "listed_inputs.inc").write_text(source[list_start:list_end] + "\n" + source[ffi_start:ffi_end])
     failed = False
     for windows in (False, True):
         binary = Path(tmp) / ("input-windows" if windows else "input-nonwindows")
