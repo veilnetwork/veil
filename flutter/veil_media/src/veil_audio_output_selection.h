@@ -1,31 +1,14 @@
 #pragma once
 
-#include <cstdint>
-#include <cstring>
-#include <limits>
-#include <optional>
+#include "veil_audio_device_choice.h"
 
 namespace veil_media {
 
-inline constexpr char kSystemAudioOutputDeviceId[] = "system-default";
-
-struct AudioOutputChoice {
-  bool system_default;
-  uint16_t index;
-};
+inline constexpr const auto& kSystemAudioOutputDeviceId = kSystemAudioDeviceId;
+using AudioOutputChoice = AudioDeviceChoice;
 
 inline std::optional<AudioOutputChoice> ParseAudioOutputChoice(const char* id) {
-  if (id == nullptr || *id == '\0') return std::nullopt;
-  if (std::strcmp(id, kSystemAudioOutputDeviceId) == 0) {
-    return AudioOutputChoice{true, 0};
-  }
-  unsigned index = 0;
-  for (const char* p = id; *p; ++p) {
-    if (*p < '0' || *p > '9') return std::nullopt;
-    index = index * 10 + static_cast<unsigned>(*p - '0');
-    if (index > std::numeric_limits<uint16_t>::max()) return std::nullopt;
-  }
-  return AudioOutputChoice{false, static_cast<uint16_t>(index)};
+  return ParseAudioDeviceChoice(id);
 }
 
 // Caller serializes ADM access. An idle module is only configured here: its
