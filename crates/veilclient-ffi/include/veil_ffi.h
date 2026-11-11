@@ -667,8 +667,7 @@ typedef struct VeilApp VeilApp;
  * An open file, held by descriptor. The name it was opened by is not kept:
  * nothing here ever looks at a path again.
  *
- * `Debug` prints the descriptor and the length and no path, because there is
- * no path to print — which is the property this whole module exists for.
+ * `Debug` prints only the length, never a path or the saved-copy timestamp.
  */
 typedef struct VeilFsFile VeilFsFile;
 
@@ -2855,6 +2854,37 @@ VeilFsFile *veil_fs_folder_create_incoming(VeilFsFolder *folder,
                                            const char *incoming,
                                            char **err_out)
 ;
+
+/**
+ * Open a protocol `.previous`, `.incoming` or `.intent` through the admitted
+ * root without following links. NULL with no error means absent. Otherwise
+ * returns a read descriptor for veil_fs_read/close and its size/mtime.
+ * The file descriptor outlives the folder admission: release the admission
+ * before showing a user chooser. Never treat intent contents as an open path.
+ *
+ * # Safety
+ * folder/relative must be live; both outputs non-NULL and writable; err_out
+ * writable or NULL. Do not close the folder concurrently.
+ */
+
+VeilFsFile *veil_fs_folder_open_saved(VeilFsFolder *folder,
+                                      const char *relative,
+                                      uint64_t *size_out,
+                                      int64_t *modified_ms_out,
+                                      char **err_out)
+;
+
+/**
+ * Check saved-copy size and full-resolution mtime on the descriptor, not by
+ * pathname and not rounded to the display timestamp. Returns 1 unchanged,
+ * 0 changed, -1 error. Ordinary file handles have no saved-copy witness.
+ * This detects normal concurrent writes, not deliberately restored timestamps.
+ *
+ * # Safety
+ * handle must be live from open_saved and not closed concurrently; err_out
+ * writable or NULL. A closed handle is invalid, even if its pointer is non-NULL.
+ */
+ int32_t veil_fs_saved_unchanged(VeilFsFile *handle, char **err_out) ;
 
 /**
  * Check that a host pathname still names the admitted root. A false result

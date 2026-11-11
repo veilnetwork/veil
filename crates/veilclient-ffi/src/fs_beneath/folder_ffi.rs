@@ -113,10 +113,15 @@ pub unsafe extern "C" fn veil_fs_folder_create_incoming(
                     super::VeilFsFile {
                         fd: file.into_raw_fd(),
                         len: 0,
+                        saved_stamp: None,
                     }
                 };
                 #[cfg(windows)]
-                let handle = super::VeilFsFile { file, len: 0 };
+                let handle = super::VeilFsFile {
+                    file,
+                    len: 0,
+                    saved_stamp: None,
+                };
                 Box::into_raw(Box::new(handle))
             }
             Err(error) => {
@@ -135,6 +140,146 @@ pub unsafe extern "C" fn veil_fs_folder_create_incoming(
         let _ = (folder, incoming);
         unsafe { super::set_err(err_out, "folder publication unavailable on this host") };
         std::ptr::null_mut()
+    }
+}
+
+/// Open a protocol `.previous`, `.incoming` or `.intent` through the admitted
+/// root without following links. NULL with no error means absent. Otherwise
+/// returns a read descriptor for veil_fs_read/close and its size/mtime.
+/// The file descriptor outlives the folder admission: release the admission
+/// before showing a user chooser. Never treat intent contents as an open path.
+///
+/// # Safety
+/// folder/relative must be live; both outputs non-NULL and writable; err_out
+/// writable or NULL. Do not close the folder concurrently.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_fs_folder_open_saved(
+    folder: *mut VeilFsFolder,
+    relative: *const c_char,
+    size_out: *mut u64,
+    modified_ms_out: *mut i64,
+    err_out: *mut *mut c_char,
+) -> *mut super::VeilFsFile {
+    #[cfg(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple"
+    ))]
+    {
+        let result = (|| {
+            if folder.is_null() || size_out.is_null() || modified_ms_out.is_null() {
+                return Err("null handle or output".to_owned());
+            }
+            let relative = unsafe { arg(relative) }?;
+            let Some(file) = unsafe { &*folder }.session.open_saved(relative)? else {
+                return Ok(None);
+            };
+            let metadata = file.metadata().map_err(|_| "saved metadata unavailable")?;
+            let version = super::publication::version_metadata(&metadata)?;
+            let stamp = Some((
+                metadata.len(),
+                metadata.modified().map_err(|_| "saved mtime unavailable")?,
+            ));
+            #[cfg(unix)]
+            let handle = {
+                use std::os::fd::IntoRawFd;
+                super::VeilFsFile {
+                    fd: file.into_raw_fd(),
+                    len: version.size,
+                    saved_stamp: stamp,
+                }
+            };
+            #[cfg(windows)]
+            let handle = super::VeilFsFile {
+                file,
+                len: version.size,
+                saved_stamp: stamp,
+            };
+            unsafe {
+                *size_out = version.size;
+                *modified_ms_out = version.modified_ms;
+            }
+            Ok(Some(handle))
+        })();
+        match result {
+            Ok(Some(handle)) => Box::into_raw(Box::new(handle)),
+            Ok(None) => std::ptr::null_mut(),
+            Err(error) => {
+                unsafe { super::set_err(err_out, &error) };
+                std::ptr::null_mut()
+            }
+        }
+    }
+    #[cfg(not(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple"
+    )))]
+    {
+        let _ = (folder, relative, size_out, modified_ms_out);
+        unsafe { super::set_err(err_out, "folder saved files unavailable") };
+        std::ptr::null_mut()
+    }
+}
+
+/// Check saved-copy size and full-resolution mtime on the descriptor, not by
+/// pathname and not rounded to the display timestamp. Returns 1 unchanged,
+/// 0 changed, -1 error. Ordinary file handles have no saved-copy witness.
+/// This detects normal concurrent writes, not deliberately restored timestamps.
+///
+/// # Safety
+/// handle must be live from open_saved and not closed concurrently; err_out
+/// writable or NULL. A closed handle is invalid, even if its pointer is non-NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_fs_saved_unchanged(
+    handle: *mut super::VeilFsFile,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    #[cfg(any(unix, windows))]
+    {
+        let result = (|| {
+            if handle.is_null() {
+                return Err("null saved handle".to_owned());
+            }
+            let handle = unsafe { &*handle };
+            let expected = handle.saved_stamp.ok_or("not a saved-copy handle")?;
+            #[cfg(unix)]
+            let file = {
+                use std::os::fd::BorrowedFd;
+                // SAFETY: the live caller-owned file outlives this borrowed fd.
+                let fd = unsafe { BorrowedFd::borrow_raw(handle.fd) };
+                std::fs::File::from(
+                    fd.try_clone_to_owned()
+                        .map_err(|_| "saved descriptor unavailable")?,
+                )
+            };
+            #[cfg(windows)]
+            let file = handle
+                .file
+                .try_clone()
+                .map_err(|_| "saved descriptor unavailable")?;
+            let metadata = file.metadata().map_err(|_| "saved metadata unavailable")?;
+            Ok(expected
+                == (
+                    metadata.len(),
+                    metadata.modified().map_err(|_| "saved mtime unavailable")?,
+                ))
+        })();
+        match result {
+            Ok(same) => i32::from(same),
+            Err(error) => {
+                unsafe { super::set_err(err_out, &error) };
+                -1
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = handle;
+        unsafe { super::set_err(err_out, "saved-copy checks unavailable") };
+        -1
     }
 }
 
@@ -329,6 +474,105 @@ pub unsafe extern "C" fn veil_fs_folder_close(folder: *mut VeilFsFolder) {
     if !folder.is_null() {
         // SAFETY: the caller transfers its unique live handle back to its owner.
         drop(unsafe { Box::from_raw(folder) });
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod saved_tests {
+    use super::*;
+    use std::ffi::CString;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Tree(std::path::PathBuf);
+    impl Tree {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "veil-saved-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    struct Folder(*mut VeilFsFolder);
+    impl Drop for Folder {
+        fn drop(&mut self) {
+            unsafe { veil_fs_folder_close(self.0) };
+        }
+    }
+    struct Saved(*mut super::super::VeilFsFile);
+    impl Drop for Saved {
+        fn drop(&mut self) {
+            unsafe { super::super::veil_fs_close(self.0) };
+        }
+    }
+
+    #[test]
+    fn full_resolution_saved_witness_detects_same_millisecond_changes() {
+        let tree = Tree::new();
+        let name = ".xveil-0123456789abcdef0123456789abcdef.previous";
+        let path = tree.0.join(name);
+        std::fs::write(&path, b"before").unwrap();
+        let origin = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let set_time = |nanos| {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(origin + std::time::Duration::from_nanos(nanos)),
+                )
+                .unwrap();
+        };
+        set_time(100_000);
+        let root = CString::new(tree.0.to_str().unwrap()).unwrap();
+        let folder = Folder(unsafe { veil_fs_folder_open(root.as_ptr(), std::ptr::null_mut()) });
+        assert!(!folder.0.is_null());
+        let name = CString::new(name).unwrap();
+        let (mut size, mut modified) = (0, 0);
+        let saved = Saved(unsafe {
+            veil_fs_folder_open_saved(
+                folder.0,
+                name.as_ptr(),
+                &mut size,
+                &mut modified,
+                std::ptr::null_mut(),
+            )
+        });
+        assert!(!saved.0.is_null());
+        let debug = format!("{:?}", unsafe { &*saved.0 });
+        assert!(!debug.contains("saved_stamp"));
+        assert!(!debug.contains("SystemTime"));
+        assert!(!debug.contains(tree.0.to_str().unwrap()));
+        drop(folder);
+        assert_eq!(
+            unsafe { veil_fs_saved_unchanged(saved.0, std::ptr::null_mut()) },
+            1
+        );
+        std::fs::write(&path, b"after!").unwrap();
+        set_time(200_000);
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), size);
+        assert_eq!(
+            meta.modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
+            modified
+        );
+        assert_eq!(
+            unsafe { veil_fs_saved_unchanged(saved.0, std::ptr::null_mut()) },
+            0
+        );
     }
 }
 
