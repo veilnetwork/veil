@@ -75,6 +75,69 @@ pub unsafe extern "C" fn veil_fs_folder_open(
     }
 }
 
+/// Exclusively create a `.xveil-<32 lowercase hex>.incoming` file beneath the
+/// admitted root, creating missing parent directories without following links.
+/// Returns a file handle for veil_fs_write/sync/close, or NULL with an error.
+/// Flush and close that file before publishing. Keep the folder admission
+/// across the local write/publication; do not hold it across network waits.
+/// This never creates or replaces a user target directly.
+///
+/// # Safety
+/// `folder` must be an unclosed folder handle; `incoming` is live NUL-terminated
+/// UTF-8. `err_out` is writable or NULL. Do not close folder concurrently.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_fs_folder_create_incoming(
+    folder: *mut VeilFsFolder,
+    incoming: *const c_char,
+    err_out: *mut *mut c_char,
+) -> *mut super::VeilFsFile {
+    #[cfg(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple"
+    ))]
+    {
+        let result = (|| {
+            if folder.is_null() {
+                return Err("null folder handle".to_owned());
+            }
+            let incoming = unsafe { arg(incoming) }?;
+            unsafe { &*folder }.session.create_incoming(incoming)
+        })();
+        match result {
+            Ok(file) => {
+                #[cfg(unix)]
+                let handle = {
+                    use std::os::fd::IntoRawFd;
+                    super::VeilFsFile {
+                        fd: file.into_raw_fd(),
+                        len: 0,
+                    }
+                };
+                #[cfg(windows)]
+                let handle = super::VeilFsFile { file, len: 0 };
+                Box::into_raw(Box::new(handle))
+            }
+            Err(error) => {
+                unsafe { super::set_err(err_out, &error) };
+                std::ptr::null_mut()
+            }
+        }
+    }
+    #[cfg(not(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple"
+    )))]
+    {
+        let _ = (folder, incoming);
+        unsafe { super::set_err(err_out, "folder publication unavailable on this host") };
+        std::ptr::null_mut()
+    }
+}
+
 /// Check that a host pathname still names the admitted root. A false result
 /// must refuse the host's scan, rather than interpret a moved folder as empty.
 /// This check does not turn a host scan into an atomic filesystem snapshot.
