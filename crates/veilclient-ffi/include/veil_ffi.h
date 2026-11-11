@@ -673,6 +673,15 @@ typedef struct VeilApp VeilApp;
 typedef struct VeilFsFile VeilFsFile;
 
 /**
+ * An opaque caller-owned folder admission. Keep it alive across recovery AND
+ * enumeration. Every publisher of this folder must acquire the same admission.
+ * Child paths are walked from its pinned directory, never by reopening root.
+ * One admission belongs to one serialized host sequence: never enumerate
+ * while a publication on that same handle is in flight.
+ */
+typedef struct VeilFsFolder VeilFsFolder;
+
+/**
  * Opaque connection handle returned by [`veil_connect`].
  *
  * Wraps a strong `Arc` over [`RuntimeBundle`]; cloning an internal `Arc`
@@ -2816,6 +2825,77 @@ intptr_t veil_fs_read(VeilFsFile *handle,
  * `handle` must not be used again.
  */
  void veil_fs_close(VeilFsFile *handle) ;
+
+/**
+ * Acquire an exclusive folder admission, or return NULL with `*err_out` set.
+ * Acquisition never waits for another owner: a busy owner returns the exact
+ * diagnostic `folder publication is busy`. Other failures are final refusals.
+ * Release with `veil_fs_folder_close`, including on host exceptions.
+ *
+ * # Safety
+ * `root` must be a live NUL-terminated UTF-8 string. `err_out` must be writable
+ * or NULL. The handle must not be closed concurrently with any operation.
+ */
+ VeilFsFolder *veil_fs_folder_open(const char *root, char **err_out) ;
+
+/**
+ * Check that a host pathname still names the admitted root. A false result
+ * must refuse the host's scan, rather than interpret a moved folder as empty.
+ * This check does not turn a host scan into an atomic filesystem snapshot.
+ *
+ * # Safety
+ * `folder` must be a live unclosed handle from `veil_fs_folder_open`; `root`
+ * must be NUL-terminated UTF-8; `err_out` must be writable or NULL.
+ */
+ bool veil_fs_folder_matches_root(VeilFsFolder *folder, const char *root, char **err_out) ;
+
+/**
+ * Recover one discovered relative `.intent` before ordinary enumeration.
+ * Returns 1 if it was unsettled and recovered, 0 if already settled, -1 on a
+ * refusal. A refusal must stop the scan; it never means "there are no files".
+ * Keeps newer occupied names and all recovery copies. Never falls back to an
+ * ordinary rename. The root admission remains held after this call returns.
+ *
+ * # Safety
+ * `folder` must be an unclosed admitted handle; `relative_intent` must be a
+ * live NUL-terminated UTF-8 string. `err_out` must be writable or NULL.
+ */
+ int32_t veil_fs_folder_recover(VeilFsFolder *folder, const char *relative_intent, char **err_out) ;
+
+/**
+ * Install a prepared `.xveil-<32 lowercase hex>.incoming` sibling, preserving
+ * the displaced version and an intent for process-interruption recovery.
+ * Returns 1 on publication (writing the incoming version's stamp to outputs),
+ * 0 when the local version changed, -1 on error. With `expected_present=false`
+ * the size/mtime inputs are ignored and an occupied destination wins its name.
+ * A stamp is size plus Unix-epoch milliseconds, not an immutable snapshot.
+ * Previous copies are retained for explicit user review/cleanup.
+ *
+ * # Safety
+ * `folder` must remain live; paths must be NUL-terminated UTF-8. Both output
+ * pointers must be writable and non-NULL. `err_out` is writable or NULL.
+ */
+
+int32_t veil_fs_folder_publish(VeilFsFolder *folder,
+                               const char *target,
+                               const char *incoming,
+                               bool expected_present,
+                               uint64_t expected_size,
+                               int64_t expected_modified_ms,
+                               uint64_t *size_out,
+                               int64_t *modified_ms_out,
+                               char **err_out)
+;
+
+/**
+ * Release a folder admission. NULL is harmless. No outstanding operation may
+ * still reference the handle.
+ *
+ * # Safety
+ * A non-NULL handle must be caller-owned, unclosed and returned by
+ * `veil_fs_folder_open`. It must never be closed twice.
+ */
+ void veil_fs_folder_close(VeilFsFolder *folder) ;
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
