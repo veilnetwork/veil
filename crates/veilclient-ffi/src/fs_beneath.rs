@@ -78,9 +78,7 @@ mod folder_ffi;
 /// An open file, held by descriptor. The name it was opened by is not kept:
 /// nothing here ever looks at a path again.
 ///
-/// `Debug` prints the descriptor and the length and no path, because there is
-/// no path to print — which is the property this whole module exists for.
-#[derive(Debug)]
+/// `Debug` prints only the length, never a path or the saved-copy timestamp.
 pub struct VeilFsFile {
     #[cfg(unix)]
     fd: c_int,
@@ -90,6 +88,17 @@ pub struct VeilFsFile {
     #[cfg(windows)]
     file: std::fs::File,
     len: u64,
+    /// Saved-copy opens carry a full-resolution descriptor witness, not a path.
+    saved_stamp: Option<(u64, std::time::SystemTime)>,
+}
+
+impl std::fmt::Debug for VeilFsFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VeilFsFile")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(unix)]
@@ -585,7 +594,11 @@ fn open_beneath(root: &str, relative: &str) -> Result<VeilFsFile, String> {
         .metadata()
         .map_err(|e| format!("cannot stat the opened file: {e}"))?
         .len();
-    Ok(VeilFsFile { file, len })
+    Ok(VeilFsFile {
+        file,
+        len,
+        saved_stamp: None,
+    })
 }
 
 #[cfg(windows)]
@@ -600,7 +613,11 @@ fn create_beneath(root: &str, relative: &str) -> Result<VeilFsFile, String> {
     let handle = handle?;
     // SAFETY: `handle` is a fresh file handle this module owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle as *mut _) };
-    Ok(VeilFsFile { file, len: 0 })
+    Ok(VeilFsFile {
+        file,
+        len: 0,
+        saved_stamp: None,
+    })
 }
 
 #[cfg(windows)]
@@ -662,6 +679,7 @@ fn open_beneath(root: &str, relative: &str) -> Result<VeilFsFile, String> {
     Ok(VeilFsFile {
         fd,
         len: st.st_size.max(0) as u64,
+        saved_stamp: None,
     })
 }
 
@@ -745,7 +763,11 @@ fn create_beneath(root: &str, relative: &str) -> Result<VeilFsFile, String> {
     if fd < 0 {
         return Err(format!("cannot create the file beneath the root: {err}"));
     }
-    Ok(VeilFsFile { fd, len: 0 })
+    Ok(VeilFsFile {
+        fd,
+        len: 0,
+        saved_stamp: None,
+    })
 }
 
 /// Whether `name` under `dir` is a symlink, asked WITHOUT following it.

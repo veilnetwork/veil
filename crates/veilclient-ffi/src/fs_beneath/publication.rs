@@ -103,6 +103,22 @@ impl FolderSession {
             .required(name, true, true)
     }
 
+    /// Read a protocol copy or its intent through this root, never a user
+    /// target chosen from intent contents. The returned descriptor survives
+    /// releasing the admission; a chooser must not hold the folder lock.
+    pub(super) fn open_saved(&self, relative: &str) -> Result<Option<File>, String> {
+        let _operation = self.operation()?;
+        let parts = super::split_components(relative)?;
+        let name = parts.last().ok_or("missing saved entry")?;
+        if ![".previous", ".incoming", ".intent"]
+            .iter()
+            .any(|suffix| stem(name, suffix).is_ok())
+        {
+            return Err("invalid saved entry".to_owned());
+        }
+        self.parent(relative)?.file(name, false, false)
+    }
+
     fn publish_with_hook(
         &self,
         target: &str,
@@ -462,6 +478,10 @@ fn leaf(name: &str) -> Result<(), String> {
 
 fn version(file: &File) -> Result<Version, String> {
     let metadata = file.metadata().map_err(io_error)?;
+    version_metadata(&metadata)
+}
+
+pub(super) fn version_metadata(metadata: &std::fs::Metadata) -> Result<Version, String> {
     if !metadata.is_file() {
         return Err("publication source is not regular".to_owned());
     }
@@ -709,6 +729,38 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn a_saved_reader_keeps_its_object_after_admission_release_and_name_replacement() {
+        let tree = Tree::new();
+        tree.put(PREVIOUS, b"saved bytes");
+        let session = FolderSession::open(tree.root()).unwrap();
+        let mut reader = session.open_saved(PREVIOUS).unwrap().unwrap();
+        assert!(session.open_saved(INCOMING).unwrap().is_none());
+        for bad in ["target", "../escape", ".xveil-short.previous"] {
+            assert!(session.open_saved(bad).is_err());
+        }
+        drop(session);
+        let _next = FolderSession::open(tree.root()).unwrap();
+        std::fs::rename(tree.path().join(PREVIOUS), tree.path().join("moved-copy")).unwrap();
+        tree.put(PREVIOUS, b"replacement at the same name");
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"saved bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_copy_open_refuses_a_leaf_link() {
+        let tree = Tree::new();
+        let outside = Tree::new();
+        outside.put("private", b"untouched");
+        std::os::unix::fs::symlink(outside.path().join("private"), tree.path().join(PREVIOUS))
+            .unwrap();
+        let session = FolderSession::open(tree.root()).unwrap();
+        assert!(session.open_saved(PREVIOUS).is_err());
+        assert_eq!(outside.read("private"), b"untouched");
     }
 
     #[test]
