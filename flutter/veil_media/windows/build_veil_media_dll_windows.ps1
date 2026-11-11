@@ -158,6 +158,8 @@ try {
     # VEIL_MEDIA_HAVE_WEBRTC switches the engine from the ABI-only stub to the
     # real implementation; -I<src> finds veil_camera.h and friends.
     $cmd = $cmd -replace '^(\S+)', ('$1 -DVEIL_MEDIA_HAVE_WEBRTC=1 -I"' + $srcDirFwd + '"')
+    # Keep native __FILE__ diagnostics useful without embedding a local login.
+    $cmd += ' "/clang:-ffile-prefix-map=' + $srcDirFwd + '=/src/veil-media"'
     if ($tuCmd -match 'WEBRTC_ENABLE_PROTOBUF=1') {
       $protobufDir = (Join-Path $WebrtcSrc 'third_party/protobuf/src') -replace '\\', '/'
       $cmd += ' -I"' + $protobufDir + '"'

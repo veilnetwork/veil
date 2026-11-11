@@ -93,7 +93,8 @@ out_index=args.index('-o') + 1
 args[out_index]=out
 if '-MF' in args:
     args[args.index('-MF') + 1] = out + '.d'
-extra=['-DVEIL_MEDIA_HAVE_WEBRTC=1', '-I'+shimdir]
+extra=['-DVEIL_MEDIA_HAVE_WEBRTC=1', '-I'+shimdir,
+       '-ffile-prefix-map='+shimdir+'=/src/veil-media']
 if '-DWEBRTC_ENABLE_PROTOBUF=1' in args:
     extra.append('-I'+sys.argv[5]+'/third_party/protobuf/src')
 args[1:1]=extra
