@@ -2887,6 +2887,26 @@ VeilFsFile *veil_fs_folder_open_saved(VeilFsFolder *folder,
  int32_t veil_fs_saved_unchanged(VeilFsFile *handle, char **err_out) ;
 
 /**
+ * Explicitly discard a confirmed saved copy. `saved` is the still-live
+ * descriptor returned by open_saved; replacements/changes are refused.
+ * `quarantine` must name a fresh protocol incoming sibling. Pending/corrupt
+ * journals and orphan previous files require recovery rather than deletion.
+ * Returns 1 removed, 0 changed, -1 refused. A refused/interrupted operation
+ * can leave its captured copy at quarantine, available for list/export.
+ *
+ * # Safety
+ * Both handles must be live, paths valid C strings, err_out writable or NULL.
+ * Do not close or mutate either handle concurrently with this operation.
+ */
+
+int32_t veil_fs_folder_discard_saved(VeilFsFolder *folder,
+                                     const char *relative,
+                                     VeilFsFile *saved,
+                                     const char *quarantine,
+                                     char **err_out)
+;
+
+/**
  * Check that a host pathname still names the admitted root. A false result
  * must refuse the host's scan, rather than interpret a moved folder as empty.
  * This check does not turn a host scan into an atomic filesystem snapshot.

@@ -51,6 +51,13 @@ enum Stage {
     Settled,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiscardStage {
+    BeforeCapture,
+    Captured,
+    Removed,
+}
+
 /// This and PreparedMove share one pinned OS directory, not separate walks.
 struct Parent(File);
 
@@ -117,6 +124,101 @@ impl FolderSession {
             return Err("invalid saved entry".to_owned());
         }
         self.parent(relative)?.file(name, false, false)
+    }
+
+    /// Explicit removal only: the caller holds the selected saved descriptor
+    /// across confirmation. Unsettled/corrupt journals and orphan previous
+    /// copies require recovery, not deletion. Capture with exclusion before
+    /// checking identity, so a namespace replacement is preserved too.
+    pub(super) fn discard_saved(
+        &self,
+        relative: &str,
+        selected: &File,
+        stamp: (u64, std::time::SystemTime),
+        quarantine: &str,
+    ) -> Result<bool, String> {
+        self.discard_saved_with_hook(relative, selected, stamp, quarantine, |_| Ok(()))
+    }
+
+    fn discard_saved_with_hook(
+        &self,
+        relative: &str,
+        selected: &File,
+        stamp: (u64, std::time::SystemTime),
+        quarantine: &str,
+        mut hook: impl FnMut(DiscardStage) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        let _operation = self.operation()?;
+        let parts = super::split_components(relative)?;
+        let name = parts.last().ok_or("missing saved entry")?;
+        let (stem, previous) = if let Ok(stem) = stem(name, ".previous") {
+            (stem, true)
+        } else {
+            (stem(name, ".incoming")?, false)
+        };
+        let destination = super::move_entry::destination_leaf(relative, quarantine)?;
+        let spare_stem = self::stem(&destination, ".incoming")?;
+        if spare_stem == stem {
+            return Err("discard capture must have a fresh name".to_owned());
+        }
+        let parent = self.parent(relative)?;
+        for suffix in [".intent", ".previous", ".incoming"] {
+            if parent.entry_exists(&format!("{spare_stem}{suffix}"))? {
+                return Err("discard capture is occupied".to_owned());
+            }
+        }
+        let intent_name = format!("{stem}.intent");
+        let mut journal = parent.file(&intent_name, false, false)?;
+        if let Some(file) = journal.as_mut() {
+            if !Intent::read(file)?.settled {
+                return Err("saved copy still requires recovery".to_owned());
+            }
+        } else if previous {
+            return Err("previous copy has no recovery record".to_owned());
+        }
+        let matches = |file: &File| -> Result<bool, String> {
+            let metadata = file.metadata().map_err(io_error)?;
+            Ok(metadata.is_file()
+                && same_object(selected, file)?
+                && (metadata.len(), metadata.modified().map_err(io_error)?) == stamp)
+        };
+        if !matches(selected)? {
+            return Ok(false);
+        }
+        match parent.file(name, false, false)? {
+            Some(file) if matches(&file)? => {}
+            _ => return Ok(false),
+        }
+        hook(DiscardStage::BeforeCapture)?;
+        if !parent.move_entry(name, &destination)? {
+            return Err("discard capture is occupied".to_owned());
+        }
+        parent.sync()?;
+        hook(DiscardStage::Captured)?;
+        let captured = parent.required(&destination, false, false);
+        let matching = captured.as_ref().map_err(|e| e.clone()).and_then(matches);
+        if !matches!(matching, Ok(true)) {
+            // A new source entry or a late edit wins. Restore only into an
+            // empty name; otherwise keep the capture visible as an orphan.
+            parent.move_entry(&destination, name)?;
+            parent.sync()?;
+            return matching.map(|_| false);
+        }
+        let captured = captured?;
+        parent.remove_file(&destination, &captured)?;
+        parent.sync()?;
+        hook(DiscardStage::Removed)?;
+        // Settled records no longer authorize recovery. Remove metadata only
+        // after its last copy is gone. A crash at any earlier step leaves a
+        // harmless settled record and/or an exportable incoming capture.
+        if let Some(journal) = journal
+            && !parent.entry_exists(&format!("{stem}.previous"))?
+            && !parent.entry_exists(&format!("{stem}.incoming"))?
+        {
+            parent.remove_file(&intent_name, &journal)?;
+            parent.sync()?;
+        }
+        Ok(true)
     }
 
     fn publish_with_hook(
@@ -370,6 +472,59 @@ impl Parent {
     fn sync(&self) -> Result<(), String> {
         #[cfg(unix)]
         self.0.sync_all().map_err(io_error)?;
+        Ok(())
+    }
+
+    /// Delete only a protocol entry inside this pinned parent. Unix unlinkat
+    /// never follows a leaf link; Windows marks the opened no-reparse object.
+    /// The random capture namespace is reserved to this admitted operation.
+    /// This is explicit user deletion, not an immutable snapshot against an
+    /// external process writing through an already open file descriptor.
+    fn remove_file(&self, name: &str, selected: &File) -> Result<(), String> {
+        leaf(name)?;
+        #[cfg(unix)]
+        {
+            let file = self.required(name, false, false)?;
+            if !same_object(&file, selected)? {
+                return Err("discard entry changed".to_owned());
+            }
+            let name = std::ffi::CString::new(name).map_err(|_| "NUL in name")?;
+            // SAFETY: pinned directory and leaf C name outlive the syscall.
+            if unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                return Err(io_error(std::io::Error::last_os_error()));
+            }
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Wdk::Storage::FileSystem::{
+                FILE_DISPOSITION_INFORMATION, FileDispositionInformation, NtSetInformationFile,
+            };
+            use windows_sys::Win32::Foundation::STATUS_SUCCESS;
+            use windows_sys::Win32::Storage::FileSystem::DELETE;
+            use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+            let handle =
+                super::win_open_at_with_access(self.0.as_raw_handle(), name, false, false, DELETE)?;
+            // SAFETY: the NT open transfers one owned no-reparse file handle.
+            let file = unsafe { File::from_raw_handle(handle) };
+            if !same_object(&file, selected)? {
+                return Err("discard entry changed".to_owned());
+            }
+            let mut disposition = FILE_DISPOSITION_INFORMATION { DeleteFile: 1 };
+            let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+            // SAFETY: opened DELETE handle and both fixed-size buffers remain live.
+            let status = unsafe {
+                NtSetInformationFile(
+                    file.as_raw_handle(),
+                    &mut iosb,
+                    (&mut disposition as *mut FILE_DISPOSITION_INFORMATION).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFORMATION>() as u32,
+                    FileDispositionInformation,
+                )
+            };
+            if status != STATUS_SUCCESS {
+                return Err(format!("discard refused (NTSTATUS {status:#x})"));
+            }
+        }
         Ok(())
     }
 
@@ -728,6 +883,282 @@ mod tests {
     impl Drop for Tree {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    const DISCARD: &str = ".xveil-abcdef0123456789abcdef0123456789.incoming";
+
+    fn saved_stamp(file: &File) -> (u64, std::time::SystemTime) {
+        let m = file.metadata().unwrap();
+        (m.len(), m.modified().unwrap())
+    }
+
+    fn published_tree() -> Tree {
+        let tree = Tree::new();
+        tree.put("note.txt", b"previous bytes");
+        tree.put(INCOMING, b"current bytes");
+        let outcome = publish(
+            tree.root(),
+            "note.txt",
+            INCOMING,
+            Some(tree.version("note.txt")),
+        )
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Published(_)));
+        tree
+    }
+
+    #[test]
+    fn explicit_discard_removes_only_the_confirmed_completed_copy_and_last_intent() {
+        let tree = published_tree();
+        let session = FolderSession::open(tree.root()).unwrap();
+        let selected = session.open_saved(PREVIOUS).unwrap().unwrap();
+        assert!(
+            session
+                .discard_saved(PREVIOUS, &selected, saved_stamp(&selected), DISCARD)
+                .unwrap()
+        );
+        drop(selected); // Windows completes its delete after the final handle closes.
+        assert_eq!(tree.read("note.txt"), b"current bytes");
+        assert!(!tree.0.join(PREVIOUS).exists());
+        assert!(!tree.0.join(INTENT).exists());
+        assert!(!tree.0.join(DISCARD).exists());
+    }
+
+    #[test]
+    fn explicit_discard_accepts_an_unpublished_incoming_orphan_only() {
+        let tree = Tree::new();
+        tree.put(INCOMING, b"partial bytes");
+        tree.put(PREVIOUS, b"orphan previous");
+        let session = FolderSession::open(tree.root()).unwrap();
+        let previous = session.open_saved(PREVIOUS).unwrap().unwrap();
+        assert!(
+            session
+                .discard_saved(PREVIOUS, &previous, saved_stamp(&previous), DISCARD)
+                .is_err()
+        );
+        let incoming = session.open_saved(INCOMING).unwrap().unwrap();
+        assert!(
+            session
+                .discard_saved(INCOMING, &incoming, saved_stamp(&incoming), DISCARD)
+                .unwrap()
+        );
+        drop(incoming);
+        assert!(!tree.0.join(INCOMING).exists());
+        assert_eq!(tree.read(PREVIOUS), b"orphan previous");
+    }
+
+    #[test]
+    fn explicit_discard_refuses_unsettled_and_corrupt_records_without_a_move() {
+        let tree = published_tree();
+        let session = FolderSession::open(tree.root()).unwrap();
+        let selected = session.open_saved(PREVIOUS).unwrap().unwrap();
+        let mut bytes = tree.read(INTENT);
+        bytes[8] = 0;
+        for record in [bytes, b"corrupt".to_vec()] {
+            tree.put(INTENT, &record);
+            assert!(
+                session
+                    .discard_saved(PREVIOUS, &selected, saved_stamp(&selected), DISCARD)
+                    .is_err()
+            );
+            assert_eq!(tree.read(PREVIOUS), b"previous bytes");
+            assert!(!tree.0.join(DISCARD).exists());
+        }
+        assert_eq!(tree.read("note.txt"), b"current bytes");
+    }
+
+    #[test]
+    fn explicit_discard_rejects_a_late_edit_and_a_replaced_selected_name() {
+        let tree = published_tree();
+        let session = FolderSession::open(tree.root()).unwrap();
+        let selected = session.open_saved(PREVIOUS).unwrap().unwrap();
+        let stamp = saved_stamp(&selected);
+        tree.put(PREVIOUS, b"edited after confirmation");
+        assert!(
+            !session
+                .discard_saved(PREVIOUS, &selected, stamp, DISCARD)
+                .unwrap()
+        );
+        std::fs::rename(tree.0.join(PREVIOUS), tree.0.join("kept.txt")).unwrap();
+        tree.put(PREVIOUS, b"replacement");
+        assert!(
+            !session
+                .discard_saved(PREVIOUS, &selected, saved_stamp(&selected), DISCARD)
+                .unwrap()
+        );
+        assert_eq!(tree.read(PREVIOUS), b"replacement");
+        assert_eq!(tree.read("kept.txt"), b"edited after confirmation");
+    }
+
+    #[test]
+    fn discard_capture_preserves_a_namespace_race_instead_of_deleting_the_replacement() {
+        let tree = published_tree();
+        let session = FolderSession::open(tree.root()).unwrap();
+        let selected = session.open_saved(PREVIOUS).unwrap().unwrap();
+        assert!(
+            !session
+                .discard_saved_with_hook(
+                    PREVIOUS,
+                    &selected,
+                    saved_stamp(&selected),
+                    DISCARD,
+                    |stage| {
+                        if stage == DiscardStage::BeforeCapture {
+                            std::fs::rename(tree.0.join(PREVIOUS), tree.0.join("kept.txt"))
+                                .unwrap();
+                            tree.put(PREVIOUS, b"replacement at the last moment");
+                        }
+                        if stage == DiscardStage::Captured {
+                            tree.put(PREVIOUS, b"new occupied source name");
+                        }
+                        Ok(())
+                    }
+                )
+                .unwrap()
+        );
+        assert_eq!(tree.read(PREVIOUS), b"new occupied source name");
+        assert_eq!(tree.read(DISCARD), b"replacement at the last moment");
+        assert_eq!(tree.read("kept.txt"), b"previous bytes");
+        assert_eq!(tree.read("note.txt"), b"current bytes");
+    }
+
+    #[test]
+    fn discard_refuses_occupied_capture_or_another_parent_without_touching_bytes() {
+        let tree = published_tree();
+        let session = FolderSession::open(tree.root()).unwrap();
+        let selected = session.open_saved(PREVIOUS).unwrap().unwrap();
+        let stamp = saved_stamp(&selected);
+        tree.put(DISCARD, b"occupied");
+        assert!(
+            session
+                .discard_saved(PREVIOUS, &selected, stamp, DISCARD)
+                .is_err()
+        );
+        assert!(
+            session
+                .discard_saved(PREVIOUS, &selected, stamp, &format!("nested/{DISCARD}"))
+                .is_err()
+        );
+        assert!(
+            session
+                .discard_saved("note.txt", &selected, stamp, DISCARD)
+                .is_err()
+        );
+        assert_eq!(tree.read(DISCARD), b"occupied");
+        assert_eq!(tree.read(PREVIOUS), b"previous bytes");
+        assert_eq!(tree.read("note.txt"), b"current bytes");
+    }
+
+    #[test]
+    fn discard_failure_after_capture_leaves_an_exportable_orphan() {
+        let tree = published_tree();
+        let session = FolderSession::open(tree.root()).unwrap();
+        let selected = session.open_saved(PREVIOUS).unwrap().unwrap();
+        assert!(
+            session
+                .discard_saved_with_hook(
+                    PREVIOUS,
+                    &selected,
+                    saved_stamp(&selected),
+                    DISCARD,
+                    |stage| {
+                        if stage == DiscardStage::Captured {
+                            Err("interrupted".into())
+                        } else {
+                            Ok(())
+                        }
+                    }
+                )
+                .is_err()
+        );
+        let mut rescued = session.open_saved(DISCARD).unwrap().unwrap();
+        let mut bytes = Vec::new();
+        rescued.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"previous bytes");
+        assert!(!session.recover(INTENT).unwrap());
+        assert_eq!(tree.read("note.txt"), b"current bytes");
+    }
+
+    #[test]
+    fn discard_keeps_the_record_until_its_other_copy_is_explicitly_removed() {
+        let tree = published_tree();
+        tree.put(INCOMING, b"another retained candidate");
+        let session = FolderSession::open(tree.root()).unwrap();
+        let previous = session.open_saved(PREVIOUS).unwrap().unwrap();
+        assert!(
+            session
+                .discard_saved(PREVIOUS, &previous, saved_stamp(&previous), DISCARD)
+                .unwrap()
+        );
+        drop(previous);
+        assert!(tree.0.join(INTENT).exists());
+        assert_eq!(tree.read(INCOMING), b"another retained candidate");
+        let incoming = session.open_saved(INCOMING).unwrap().unwrap();
+        assert!(
+            session
+                .discard_saved(INCOMING, &incoming, saved_stamp(&incoming), DISCARD)
+                .unwrap()
+        );
+        drop(incoming);
+        assert!(!tree.0.join(INTENT).exists());
+        assert_eq!(tree.read("note.txt"), b"current bytes");
+    }
+
+    #[test]
+    fn process_exit_during_discard_keeps_unremoved_bytes_available() {
+        const STAGE: &str = "VEIL_FS_DISCARD_CRASH_QA_STAGE";
+        if let Ok(root) = std::env::var(CHILD_ROOT) {
+            let stage = std::env::var(STAGE).unwrap();
+            let session = FolderSession::open(&root).unwrap();
+            let selected = session.open_saved(PREVIOUS).unwrap().unwrap();
+            session
+                .discard_saved_with_hook(
+                    PREVIOUS,
+                    &selected,
+                    saved_stamp(&selected),
+                    DISCARD,
+                    |at| {
+                        let name = match at {
+                            DiscardStage::BeforeCapture => "before",
+                            DiscardStage::Captured => "captured",
+                            DiscardStage::Removed => "removed",
+                        };
+                        if stage == name {
+                            std::process::exit(79);
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            panic!("discard crash hook was not reached");
+        }
+        for stage in ["before", "captured", "removed"] {
+            let tree = published_tree();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "fs_beneath::publication::tests::process_exit_during_discard_keeps_unremoved_bytes_available", "--test-threads=1"])
+                .env(CHILD_ROOT, tree.root()).env(STAGE, stage).output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(79),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let session = FolderSession::open(tree.root()).unwrap();
+            assert!(!session.recover(INTENT).unwrap());
+            assert_eq!(tree.read("note.txt"), b"current bytes");
+            match stage {
+                "before" => assert_eq!(tree.read(PREVIOUS), b"previous bytes"),
+                "captured" => {
+                    assert_eq!(tree.read(DISCARD), b"previous bytes");
+                    assert!(session.open_saved(DISCARD).unwrap().is_some());
+                }
+                "removed" => {
+                    assert!(!tree.0.join(PREVIOUS).exists());
+                    assert!(!tree.0.join(DISCARD).exists());
+                }
+                _ => unreachable!(),
+            }
         }
     }
 
