@@ -4501,24 +4501,19 @@ int veil_media_engine_select_audio_output(VeilMediaEngine* engine,
   webrtc::AudioDeviceModule* adm = engine->ws->adm.get();
   bool ok = false;
   run_on_adm_thread([&] {
-#if defined(_WIN32)
     ok = veil_media::SelectAudioOutput(adm, id, g_chosen_playout, [&] {
+#if defined(_WIN32)
       auto rc = adm->SetPlayoutDevice(webrtc::AudioDeviceModule::kDefaultDevice);
       if (rc != 0) {
         rc = adm->SetPlayoutDevice(webrtc::AudioDeviceModule::kDefaultCommunicationDevice);
       }
       return rc;
-    });
 #else
-    const uint16_t idx = static_cast<uint16_t>(std::atoi(id));
-    const bool was_playing = adm->Playing();
-    adm->StopPlayout();
-    if (adm->SetPlayoutDevice(idx) != 0) return;
-    g_chosen_playout = idx;
-    adm->InitPlayout();
-    if (was_playing) adm->StartPlayout();
-    ok = true;
+      // Non-Windows ADMs use numeric device indices, not Windows roles.
+      // If no explicit choice was remembered, attempt their default index.
+      return adm->SetPlayoutDevice(uint16_t{0});
 #endif
+    });
   });
   if (!ok) return VEIL_MEDIA_ERR_DEVICE;
 #endif
