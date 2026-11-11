@@ -68,6 +68,19 @@ use libc::size_t;
 #[path = "fs_beneath/move_entry.rs"]
 mod move_entry;
 
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple"
+))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "R33-07 publication protocol integration pending")
+)]
+#[path = "fs_beneath/publication.rs"]
+mod publication;
+
 /// An open file, held by descriptor. The name it was opened by is not kept:
 /// nothing here ever looks at a path again.
 ///
@@ -416,6 +429,30 @@ fn win_open_at_with_access(
     create: bool,
     extra_access: u32,
 ) -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
+    win_try_open_at_with_access(dir, name, directory, create, extra_access)?
+        .ok_or_else(|| format!("{name:?} does not exist beneath the root"))
+}
+
+#[cfg(windows)]
+fn win_try_open_at_with_access(
+    dir: windows_sys::Win32::Foundation::HANDLE,
+    name: &str,
+    directory: bool,
+    create: bool,
+    extra_access: u32,
+) -> Result<Option<windows_sys::Win32::Foundation::HANDLE>, String> {
+    win_try_open_at_with_options(dir, name, directory, create, extra_access, true)
+}
+
+#[cfg(windows)]
+fn win_try_open_at_with_options(
+    dir: windows_sys::Win32::Foundation::HANDLE,
+    name: &str,
+    directory: bool,
+    create: bool,
+    extra_access: u32,
+    share_delete: bool,
+) -> Result<Option<windows_sys::Win32::Foundation::HANDLE>, String> {
     use std::os::windows::ffi::OsStrExt as _;
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::NtCreateFile;
@@ -487,13 +524,18 @@ fn win_open_at_with_access(
             &mut iosb,
             std::ptr::null(),
             FILE_ATTRIBUTE_NORMAL,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 },
             if create { FILE_CREATE } else { FILE_OPEN },
             options,
             std::ptr::null(),
             0,
         )
     };
+    // Absence is not a refusal to follow a reparse point or a permission error.
+    const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
+    if !create && status == STATUS_OBJECT_NAME_NOT_FOUND {
+        return Ok(None);
+    }
     if status != STATUS_SUCCESS {
         return Err(if status == STATUS_REPARSE_POINT_ENCOUNTERED {
             format!("{name:?} is a reparse point; it was not followed")
@@ -501,7 +543,7 @@ fn win_open_at_with_access(
             format!("cannot open {name:?} beneath the root (NTSTATUS {status:#x})")
         });
     }
-    Ok(handle)
+    Ok(Some(handle))
 }
 
 /// The walk, Windows spelling. Same rule as [`walk_to_parent`]: components are
