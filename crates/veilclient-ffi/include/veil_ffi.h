@@ -2839,6 +2839,24 @@ intptr_t veil_fs_read(VeilFsFile *handle,
  VeilFsFolder *veil_fs_folder_open(const char *root, char **err_out) ;
 
 /**
+ * Exclusively create a `.xveil-<32 lowercase hex>.incoming` file beneath the
+ * admitted root, creating missing parent directories without following links.
+ * Returns a file handle for veil_fs_write/sync/close, or NULL with an error.
+ * Flush and close that file before publishing. Keep the folder admission
+ * across the local write/publication; do not hold it across network waits.
+ * This never creates or replaces a user target directly.
+ *
+ * # Safety
+ * `folder` must be an unclosed folder handle; `incoming` is live NUL-terminated
+ * UTF-8. `err_out` is writable or NULL. Do not close folder concurrently.
+ */
+
+VeilFsFile *veil_fs_folder_create_incoming(VeilFsFolder *folder,
+                                           const char *incoming,
+                                           char **err_out)
+;
+
+/**
  * Check that a host pathname still names the admitted root. A false result
  * must refuse the host's scan, rather than interpret a moved folder as empty.
  * This check does not turn a host scan into an atomic filesystem snapshot.

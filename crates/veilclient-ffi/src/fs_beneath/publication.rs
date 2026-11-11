@@ -90,6 +90,19 @@ impl FolderSession {
         self.publish_with_hook(target, incoming, expected, |_| Ok(()))
     }
 
+    /// Create only a protocol incoming file, beneath this pinned root. Missing
+    /// parents are made descriptor-relative and reopened without following
+    /// links. The caller writes/flushes/closes it before publication; obtaining
+    /// this file never authorizes an overwrite of a user entry.
+    pub(super) fn create_incoming(&self, incoming: &str) -> Result<File, String> {
+        let _operation = self.operation()?;
+        let parts = super::split_components(incoming)?;
+        let name = parts.last().ok_or("missing incoming")?;
+        stem(name, ".incoming")?; // Validate before creating any directory.
+        self.parent_with_creation(incoming, true)?
+            .required(name, true, true)
+    }
+
     fn publish_with_hook(
         &self,
         target: &str,
@@ -141,6 +154,10 @@ impl FolderSession {
     }
 
     fn parent(&self, relative: &str) -> Result<Parent, String> {
+        self.parent_with_creation(relative, false)
+    }
+
+    fn parent_with_creation(&self, relative: &str, create: bool) -> Result<Parent, String> {
         let parts = super::split_components(relative)?;
         #[cfg(windows)]
         if parts.iter().any(|part| part.contains(':')) {
@@ -151,6 +168,18 @@ impl FolderSession {
             #[cfg(unix)]
             {
                 let name = std::ffi::CString::new(*name).map_err(|_| "NUL in directory")?;
+                if create {
+                    // EEXIST is only a candidate: the no-follow directory
+                    // open below must still accept the actual object.
+                    let result =
+                        unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+                    if result != 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() != std::io::ErrorKind::AlreadyExists {
+                            return Err(io_error(error));
+                        }
+                    }
+                }
                 // SAFETY: a relative component, held directory and no-follow
                 // flags keep each step beneath the already opened root.
                 let fd = unsafe {
@@ -168,7 +197,18 @@ impl FolderSession {
             }
             #[cfg(windows)]
             {
-                let handle = super::win_open_at(directory.as_raw_handle(), name, true, false)?;
+                let handle = super::win_open_at(directory.as_raw_handle(), name, true, false)
+                    .or_else(|error| {
+                        if !create {
+                            return Err(error);
+                        }
+                        // A concurrent creator can win the exclusive create.
+                        // Reopening still uses OBJ_DONT_REPARSE and directory
+                        // type checking; an error never selects a path fallback.
+                        super::win_open_at(directory.as_raw_handle(), name, true, true).or_else(
+                            |_| super::win_open_at(directory.as_raw_handle(), name, true, false),
+                        )
+                    })?;
                 // SAFETY: win_open_at transfers one fresh handle.
                 directory = unsafe { File::from_raw_handle(handle) };
             }
@@ -669,6 +709,81 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn incoming_creation_makes_real_parents_and_never_adopts_an_existing_file() {
+        let tree = Tree::new();
+        let session = FolderSession::open(tree.root()).unwrap();
+        let path = format!("one/two/{INCOMING}");
+        let mut file = session.create_incoming(&path).unwrap();
+        file.write_all(b"prepared").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert!(session.create_incoming(&path).is_err());
+        assert_eq!(tree.read(&path), b"prepared");
+        assert!(matches!(
+            session.publish("one/two/target", &path, None).unwrap(),
+            Outcome::Published(_)
+        ));
+        assert_eq!(tree.read("one/two/target"), b"prepared");
+    }
+
+    #[test]
+    fn invalid_incoming_does_not_create_parents_or_overwrite_user_files() {
+        let tree = Tree::new();
+        let session = FolderSession::open(tree.root()).unwrap();
+        for path in [
+            "nested/user.txt",
+            "nested/.xveil-short.incoming",
+            "../escape",
+        ] {
+            assert!(session.create_incoming(path).is_err());
+        }
+        assert!(!tree.path().join("nested").exists());
+        tree.put("file", b"user");
+        assert!(
+            session
+                .create_incoming(&format!("file/{INCOMING}"))
+                .is_err()
+        );
+        assert_eq!(tree.read("file"), b"user");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incoming_parent_creation_never_follows_a_link() {
+        let tree = Tree::new();
+        let outside = Tree::new();
+        std::os::unix::fs::symlink(outside.path(), tree.path().join("redirect")).unwrap();
+        let session = FolderSession::open(tree.root()).unwrap();
+        assert!(
+            session
+                .create_incoming(&format!("redirect/new/{INCOMING}"))
+                .is_err()
+        );
+        assert!(!outside.path().join("new").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn incoming_parent_creation_never_follows_a_junction() {
+        let tree = Tree::new();
+        let outside = Tree::new();
+        let junction = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(tree.path().join("redirect"))
+            .arg(outside.path())
+            .output()
+            .unwrap();
+        assert!(junction.status.success());
+        let session = FolderSession::open(tree.root()).unwrap();
+        assert!(
+            session
+                .create_incoming(&format!("redirect/new/{INCOMING}"))
+                .is_err()
+        );
+        assert!(!outside.path().join("new").exists());
     }
 
     #[test]
