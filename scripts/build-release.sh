@@ -205,6 +205,12 @@ cd "$REPO_ROOT"
 # selected through VEIL_CARGO_CMD; all other targets use plain `cargo build`.
 cargo "${VEIL_CARGO_CMD:-build}" "${cargo_args[@]}"
 
+# Cargo may have built somewhere else. Never stage an older file left in
+# the conventional target directory when the producer used an external one.
+cargo_output="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) cargo_output="${cargo_output//\\//}" ;; esac
+cargo_output="$(cd "$cargo_output" && pwd)"
+
 # ── Stage artifact directory + per-bin SHA-256 ─────────────────────────────
 
 stage="$ARTIFACT_ROOT/$target"
@@ -224,7 +230,7 @@ for b in "${bins[@]}"; do
   if [[ "$target" == *windows* ]]; then
     bin_name="$b.exe"
   fi
-  src_path="$REPO_ROOT/target/$target/release/$bin_name"
+  src_path="$cargo_output/$target/release/$bin_name"
   if [[ ! -f "$src_path" ]]; then
     echo "ERROR: build did not produce $src_path" >&2
     exit 1
@@ -253,7 +259,7 @@ if "$sign"; then
   # `update sign-manifest` subcommand.  Cached after first run.
   cargo build --release --bin veil-cli --locked \
     --features "$features" >/dev/null
-  host_cli="$REPO_ROOT/target/release/veil-cli"
+  host_cli="$cargo_output/release/veil-cli"
 
   binary_url_args=()
   for url in "${binary_urls[@]}"; do
