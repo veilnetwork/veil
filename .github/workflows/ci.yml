@@ -84,7 +84,9 @@ jobs:
         run: ./scripts/check-workflow-pins.sh
 
       - name: Artifact privacy scanner regression checks
-        run: python3 -m unittest discover -s scripts -p test_scan_artifacts.py
+        run: |
+          python3 -m unittest discover -s scripts -p test_scan_artifacts.py
+          python3 -m unittest discover -s scripts -p test_release_signing_workflow.py
 
       - name: The triggers name a branch that exists
         # Also in pr-hygiene, and it has to be in both: that workflow stopped
