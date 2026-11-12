@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+## v0.11.50 — 2026-11-12
+
+### Fixed
+
+- Restore the system microphone when a saved Windows input disappears. Preserve
+  the previous capture/output device if a live selection fails, including camera
+  selection failures and audio output changes on non-Windows platforms.
+- Add root-scoped, pinned file handles and recoverable same-parent publication
+  for folder downloads. Refuse replacing unrelated local edits and retain saved
+  versions for explicit recovery or guarded cleanup.
+- Reject WebSocket upgrades without reflecting untrusted request paths in the
+  response.
+- Keep Darwin host proc macros and packaged release binaries loadable. Stage
+  release executables from the actual Cargo output directory, including external
+  targets, instead of accepting a stale conventional-target binary.
+
+### Dependencies and build validation
+
+- Update Hickory resolver, net and proto together to 0.26.2 and rustix to 1.1.6.
+  Keep the vulnerability audit enabled without new exceptions and audit the
+  compiler-fixture lockfile as well as application and fuzz dependencies.
+- Remove local source paths from media diagnostics and bind local media builds
+  to their source digest. The updated audio changes require rebuilt engines;
+  an unchanged ABI alone does not prove that a binary contains these fixes.
+
 ## v0.11.49 — 2026-11-10
 
 ### Fixed
