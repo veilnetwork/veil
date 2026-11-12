@@ -17,9 +17,11 @@
 #include "veil_camera.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -136,6 +138,25 @@ void AppendJsonString(std::string* out, NSString* value) {
   out->push_back('"');
 }
 
+// Deferred AVFoundation operations outlive the capturer. Their session and
+// cancellation witness must not be borrowed from that object's storage.
+struct CameraSessionRun {
+  CameraSessionRun(AVCaptureSession* capture, AVCaptureVideoDataOutput* video)
+      : session(capture), output(video) {}
+  AVCaptureSession* session;
+  AVCaptureVideoDataOutput* output;
+  std::atomic<bool> cancelled{false};
+};
+
+dispatch_queue_t CameraControlQueue() {
+  // A replacement capturer must not open before the preceding session's
+  // deferred cleanup. Frames use their independent capture queues.
+  static dispatch_queue_t control = dispatch_queue_create(
+      "network.veil.camera.control", dispatch_queue_attr_make_with_qos_class(
+          DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
+  return control;
+}
+
 class AvfCameraCapturer : public CameraCapturer {
  public:
   explicit AvfCameraCapturer(CameraFrameCb cb) : cb_(std::move(cb)) {}
@@ -236,25 +257,41 @@ class AvfCameraCapturer : public CameraCapturer {
         }
         [dev unlockForConfiguration];
       }
-      session_ = session;
-      output_ = out;
-      delegate_ = delegate;
-      queue_ = q;
-      // [session startRunning] can block for a while (camera warm-up, and it can
-      // wedge harder when permission is not yet granted). Start() runs
-      // synchronously on the FFI/UI isolate (engine.cc drives start_camera from
-      // the Flutter caller), so kick startRunning OFF that thread — otherwise the
-      // whole app freezes on accept. Guard with session_==session so a Stop()
-      // that raced in first doesn't leave an orphaned running session.
-      dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        @autoreleasepool {
-          if (session_ == session) [session startRunning];
-        }
-      });
+      PublishSession(session, out, delegate, q);
     }
     return true;
   }
 
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+  // Real lifecycle with an inert AVCaptureSession subclass; no device/TCC.
+  void PublishSessionForTesting(AVCaptureSession* session,
+                               AVCaptureVideoDataOutput* output) {
+    PublishSession(session, output, nil, nil);
+  }
+#endif
+
+ private:
+  void PublishSession(AVCaptureSession* session,
+                      AVCaptureVideoDataOutput* output,
+                      VeilCamDelegate* delegate, dispatch_queue_t queue) {
+    session_ = session;
+    output_ = output;
+    delegate_ = delegate;
+    queue_ = queue;
+    const auto run = std::make_shared<CameraSessionRun>(session, output);
+    session_run_ = run;
+    // startRunning may block during warm-up. Keep it off the FFI/UI isolate,
+    // without capturing `this`. Stop cancels an unstarted run, or queues its
+    // cleanup AFTER a start already in progress on this serial queue.
+    dispatch_async(CameraControlQueue(), ^{
+      @autoreleasepool {
+        if (!run->cancelled.load(std::memory_order_acquire))
+          [run->session startRunning];
+      }
+    });
+  }
+
+ public:
   // AVCaptureSession has no loop of ours to fall out of: it is torn down by
   // [Stop] and by nothing else, so holding a session IS capturing here. A
   // session that fails at runtime posts AVCaptureSessionRuntimeError, which
@@ -264,8 +301,8 @@ class AvfCameraCapturer : public CameraCapturer {
 
   void Stop() override {
     @autoreleasepool {
-      AVCaptureSession* session = session_;
-      AVCaptureVideoDataOutput* output = output_;
+      const auto run = std::move(session_run_);
+      if (run) run->cancelled.store(true, std::memory_order_release);
       VeilCamDelegate* delegate = delegate_;
       dispatch_queue_t q = queue_;
       session_ = nil;
@@ -289,11 +326,12 @@ class AvfCameraCapturer : public CameraCapturer {
       } else if (delegate != nil) {
         delegate->cb_ = nullptr;
       }
-      if (session) {
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+      if (run) {
+        dispatch_async(CameraControlQueue(), ^{
           @autoreleasepool {
+            AVCaptureSession* session = run->session;
             if (session.running) [session stopRunning];
-            if (output) [session removeOutput:output];
+            if (run->output) [session removeOutput:run->output];
           }
         });
       }
@@ -306,6 +344,7 @@ class AvfCameraCapturer : public CameraCapturer {
   AVCaptureVideoDataOutput* output_ = nil;
   VeilCamDelegate* delegate_ = nil;
   dispatch_queue_t queue_ = nil;
+  std::shared_ptr<CameraSessionRun> session_run_;
 };
 
 }  // namespace
