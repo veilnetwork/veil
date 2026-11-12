@@ -9,20 +9,15 @@
  * full-res keyframes fan out into hundreds of cells and add seconds of
  * latency) and hands the planes to the CameraFrameCb.
  *
- * MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING is the load-bearing attribute: with
- * it the reader inserts a converter and will hand us NV12 whatever the camera
- * natively produces (MJPG on most USB webcams, YUY2 on others). Without it a
- * SetCurrentMediaType asking for NV12 fails on any device that does not
- * already emit it, which is most of them. The YUY2 and RGB32 branches below
- * are kept anyway: the converter is not present on every SKU (server images
- * ship without the media feature pack), and falling back beats no camera.
+ * Source Reader can decode compressed capture formats and its basic video
+ * processor supports YUV -> RGB32 conversion. It does not promise resizing or
+ * arbitrary conversion to NV12. Negotiate an uncompressed output independently
+ * of our target geometry when the exact NV12 request fails; scale in libyuv.
  *
  * Pure C++ + libyuv (already inside libwebrtc.a) — no WebRTC types.
  *
- * ⚠️ Written without a Windows host to compile on: see the header comment in
- * windows/build_veil_media_dll_windows.ps1. The structure mirrors the V4L2
- * backend that is known good; the MF specifics are from the documented API and
- * have never been run. Treat the first successful call as the real test.
+ * Native capture is qualified separately from transport/remote rendering;
+ * camera enumeration alone is not proof that frames can be captured.
  */
 #include "veil_camera.h"
 #include "veil_diag_log.h"
@@ -43,6 +38,7 @@
 #include <mfidl.h>
 #include <mfobjects.h>
 #include <mfreadwrite.h>
+#include "veil_mf_camera_format.h"
 
 #include <atomic>
 #include <chrono>
@@ -396,8 +392,8 @@ class MfCameraCapturer : public CameraCapturer {
     *(&source) = activate_source(utf8_to_wide(device.c_str()));
     if (!source) return false;
 
-    // ENABLE_VIDEO_PROCESSING is what makes the NV12 request below succeed on
-    // an MJPG-only webcam; see the file header.
+    // Enable the basic YUV -> RGB32 fallback, without depending on advanced
+    // video processors or asking Media Foundation to resize camera modes.
     ComPtr<IMFAttributes> reader_attrs;
     if (FAILED(MFCreateAttributes(&reader_attrs, 1)) ||
         FAILED(reader_attrs->SetUINT32(
@@ -418,23 +414,14 @@ class MfCameraCapturer : public CameraCapturer {
 
   enum class Fmt { kUnknown, kNv12, kYuy2, kRgb32 };
 
-  // Ask for NV12 at the requested size, then read back what we actually got.
-  // The camera picks the closest geometry it supports; the engine is told the
-  // real size through the frame callback, so a mismatch is not an error.
+  // Prefer exact NV12, then negotiate a readable format at camera geometry.
+  // Read back dimensions/stride instead of assuming the request was honoured.
   bool NegotiateFormat(int width, int height) {
-    ComPtr<IMFMediaType> want;
-    if (FAILED(MFCreateMediaType(&want))) return false;
-    want->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    want->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-    MFSetAttributeSize(want.Get(), MF_MT_FRAME_SIZE,
-                       static_cast<UINT32>(width),
-                       static_cast<UINT32>(height));
-    HRESULT hr = reader_->SetCurrentMediaType(
-        MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, want.Get());
+    HRESULT hr = mf_camera::RequestCaptureFormat(reader_.Get(), width, height);
     if (FAILED(hr)) {
-      // No converter available: take whatever the device offers natively and
-      // convert here, if it is one of the packed formats libyuv covers.
-      vcam_log("NV12 request refused (0x%08lx) — using the native format",
+      // Some systems have no suitable decoder/converter. An unchanged native
+      // format is still usable if the conversion branches below support it.
+      vcam_log("uncompressed capture requests refused (0x%08lx) — inspecting native format",
                static_cast<unsigned long>(hr));
     }
 
