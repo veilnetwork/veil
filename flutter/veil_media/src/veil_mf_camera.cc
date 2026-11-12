@@ -271,13 +271,21 @@ IMFMediaSource* activate_source(const std::wstring& symlink) {
           CoTaskMemFree(link);
         }
       }
-      if (match && FAILED(devices[i]->ActivateObject(IID_PPV_ARGS(&source)))) {
-        source = nullptr;
+      if (match) {
+        const HRESULT activated = devices[i]->ActivateObject(IID_PPV_ARGS(&source));
+        if (FAILED(activated)) {
+          vcam_log("camera: source activation refused (0x%08lx)",
+                   static_cast<unsigned long>(activated));
+          source = nullptr;
+        }
       }
     }
     devices[i]->Release();
   }
   CoTaskMemFree(devices);
+  if (source == nullptr && !symlink.empty()) {
+    vcam_log("camera: selected source unavailable");
+  }
   return source;
 }
 

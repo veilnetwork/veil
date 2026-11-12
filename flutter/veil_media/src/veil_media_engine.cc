@@ -4065,7 +4065,13 @@ int veil_media_engine_start_camera_device(VeilMediaEngine* engine,
     (defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__)) || \
      defined(_WIN32))
   WebrtcState* ws = engine->ws.get();
-  if (!ws || !ws->video_source) return VEIL_MEDIA_ERR_STATE;
+  vlog("camera: start requested %dx%d@%d selected=%d", width, height, fps,
+       device_id != nullptr && *device_id != '\0');
+  if (!ws || !ws->video_source) {
+    vlog("camera: start refused without mounted video source (engine_ready=%d)",
+         ws != nullptr);
+    return VEIL_MEDIA_ERR_STATE;
+  }
   // EXISTENCE IS NOT CAPTURE. The capturer's loop ends on its own when the
   // device goes away, and the object stays behind holding nothing. Answering
   // OK on the pointer alone meant a camera that had died could never be
