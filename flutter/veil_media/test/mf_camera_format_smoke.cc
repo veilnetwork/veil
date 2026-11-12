@@ -5,6 +5,7 @@
 #include <mferror.h>
 #include <cstdio>
 #include <vector>
+#include <thread>
 
 #include "veil_mf_camera_format.h"
 
@@ -77,7 +78,7 @@ bool select(const char* name, GUID subtype, bool exact, size_t calls) {
 }
 }
 
-int main() {
+int RunFormatFixture() {
   if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return 2;
   if (FAILED(MFStartup(MF_VERSION))) return 2;
   int failed = 0;
@@ -94,4 +95,12 @@ int main() {
   }
   std::printf("failed=%d\n", failed);
   MFShutdown(); CoUninitialize(); return failed ? 1 : 0;
+}
+
+int main() {
+  int result = 2;
+  // Exercise COM and Media Foundation on an explicitly owned thread, using
+  // the same ownership rule as the production capture backend.
+  std::thread([&] { result = RunFormatFixture(); }).join();
+  return result;
 }
