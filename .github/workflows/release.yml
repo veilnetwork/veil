@@ -309,54 +309,6 @@ jobs:
             sha256sum "$stage/${b}.exe" | awk -v n="${b}.exe" '{print $1"  "n}' >> "$stage/sha256.txt"
           done
 
-      # WRITTEN AFTER THE BUILD (audit V-02). The update-signing identity used
-      # to land on disk BEFORE `cargo build`, and cargo runs every dependency's
-      # `build.rs` with full filesystem access — so any package in the tree, at
-      # any depth, could read the key that signs updates for every user. The
-      # secret was already step-scoped; the FILE was not, and the file is what a
-      # build script reads. Nothing between the build and the signature needs
-      # it, so it now exists only for the step that uses it.
-      - name: Write release-signing identity (Linux host job only)
-        id: identity
-        if: matrix.runner == 'ubuntu-latest' && matrix.triple == 'x86_64-unknown-linux-gnu'
-        env:
-          IDENTITY_TOML: ${{ secrets.VEIL_RELEASE_IDENTITY_TOML }}
-        run: |
-          mkdir -p $RUNNER_TEMP/release-key
-          umask 077
-          printf '%s' "$IDENTITY_TOML" > $RUNNER_TEMP/release-key/identity.toml
-          echo "path=$RUNNER_TEMP/release-key/identity.toml" >> "$GITHUB_OUTPUT"
-
-      - name: Sign manifest (host build only — has signing key)
-        if: steps.identity.outputs.path != ''
-        run: |
-          set -euo pipefail
-          # A tag push hands us 'v0.4.1'; build-release.sh wants bare semver.
-          VERSION="${VERSION#v}"
-          # No automatic value for min-compatible is defensible in general, so
-          # fall back to the .0 of this minor line: 0.4.1 accepts updates from
-          # 0.4.0 up. Override with a dispatch when a release needs different
-          # reach.
-          if [ -z "$MIN_COMPAT" ]; then
-            MIN_COMPAT="${VERSION%.*}.0"
-          fi
-          echo "version=$VERSION min-compatible=$MIN_COMPAT"
-          ./scripts/build-release.sh \
-            --target ${{ matrix.triple }} \
-            --source-date-epoch ${{ steps.epoch.outputs.value }} \
-            --sign \
-            --identity ${{ steps.identity.outputs.path }} \
-            --version "$VERSION" \
-            --min-compatible-version "$MIN_COMPAT" \
-            --binary-url "https://github.com/${{ github.repository }}/releases/download/$RELEASE_TAG/veil-cli-${{ matrix.triple }}"
-        env:
-          # `min_compatible_version` has no sane automatic value, so a tag push
-          # defaults to the .0 of its own minor line: 0.4.1 accepts updates
-          # from 0.4.0 and up. Widen or narrow it with a dispatch when a
-          # release needs different reach.
-          VERSION: ${{ inputs.version || github.ref_name }}
-          MIN_COMPAT: ${{ inputs.min_compatible_version }}
-
       - name: Upload artifact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
@@ -418,6 +370,46 @@ jobs:
             done
           done
           ls -la out/
+
+      # A separate runner receives finished artifacts, never Cargo caches or
+      # build processes. The old --sign entry point rebuilt its host CLI after
+      # the identity had been written, undoing the earlier late-write boundary.
+      - name: Sign update manifest from staged host binary
+        env:
+          IDENTITY_TOML: ${{ secrets.VEIL_RELEASE_IDENTITY_TOML }}
+          VERSION: ${{ inputs.version || github.ref_name }}
+          MIN_COMPAT: ${{ inputs.min_compatible_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${VERSION#v}"
+          if [ -z "$MIN_COMPAT" ]; then
+            MIN_COMPAT="${VERSION%.*}.0"
+          fi
+          triple=x86_64-unknown-linux-gnu
+          host_cli="out/veil-cli-$triple"
+          test -s "$host_cli"
+          expected="$(awk '$2 == "veil-cli" {print $1}' "out/sha256-$triple.txt")"
+          [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+          actual="$(sha256sum "$host_cli" | awk '{print $1}')"
+          test "$actual" = "$expected"
+          chmod +x "$host_cli"
+          epoch="$(git show -s --format=%at HEAD)"
+          [[ "$epoch" =~ ^[0-9]+$ ]] && [ "$epoch" -gt 0 ]
+          test -n "$IDENTITY_TOML"
+          umask 077
+          keyfile="$(mktemp "$RUNNER_TEMP/veil-release-key.XXXXXX")"
+          trap 'rm -f "$keyfile"' EXIT
+          printf '%s' "$IDENTITY_TOML" > "$keyfile"
+          "$host_cli" update sign-manifest \
+            --binary "$host_cli" \
+            --version "$VERSION" \
+            --min-compatible-version "$MIN_COMPAT" \
+            --platform-target "$triple" \
+            --identity "$keyfile" \
+            --release-unix "$epoch" \
+            --output "out/manifest-$triple.bin" \
+            --binary-url "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/veil-cli-$triple"
 
       # SECRET SCOPED TO THIS STEP (audit V-02). It used to sit in the job's
       # `env:`, so every step — checkout, the artifact download, the release

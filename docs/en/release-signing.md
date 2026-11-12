@@ -42,6 +42,19 @@ Scope:
 
 ## Threat-model note
 
+The update-signing identity (`VEIL_RELEASE_IDENTITY_TOML`) is available only in
+the publishing job, on a separate runner from dependency compilation. That job
+checks the staged host CLI against its build checksum and invokes it directly;
+it does not call Cargo or `build-release.sh --sign`. A random mode-0600 key file
+is removed on exit, including signer failure. The installer Ed25519 key remains
+scoped to its separate signing step. These boundaries prevent dependency build
+scripts from sharing the runner on which release identities are staged; they do
+not replace trust in the compiled signing CLI or its source.
+
+For an immutable-tag rebuild using the current workflow, dispatch `release.yml`
+from `main` with `source_ref` set to that tag. Re-running a historical workflow
+uses its historical job definition.
+
 The signature is verified only when the installing host has **OpenSSL ≥ 3.0**
 (`pkeyutl -rawin` for one-shot Ed25519). LibreSSL — the default `openssl` on
 macOS — and OpenSSL ≤ 1.1 lack it. On such hosts the installer warns and falls

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Sign release UpdateManifests in the publishing job from the checksum-checked
+  host artifact. Keep release identities out of dependency build runners and
+  remove the temporary key on both success and signing failure.
+
 ## v0.11.50 — 2026-11-12
 
 ### Fixed
