@@ -1,0 +1,9 @@
+# Isolated compiler/loader regression fixture, not a production dependency.
+[package]
+name = "veil-release-macro-probe"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+zeroize = { version = "=1.8.2", features = ["derive"] }
+

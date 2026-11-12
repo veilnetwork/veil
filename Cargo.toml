@@ -101,6 +101,13 @@ strip = "debuginfo"
 # info but preserves the symbol table — binary grows ~1 MB but stack
 # traces stay readable.
 
+# These are compiler inputs, not shipped libraries. Stripping Darwin host
+# proc-macro dylibs can produce a misaligned LINKEDIT string pool that dyld
+# rejects, surfaced by rustc as E0463 (cannot find the derive crate). Keep
+# them loadable; the ordinary release target retains its stripping policy.
+[profile.release.build-override]
+strip = "none"
+
 # The identity proof-of-work in a DEV build. Its loop is an Ed25519 signature
 # and a BLAKE3 hash per candidate, both in these crates; unoptimized, mining one
 # identity at the canonical 24 bits took 36–160 s, and it runs wherever a debug
