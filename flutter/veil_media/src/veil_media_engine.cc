@@ -4888,6 +4888,11 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     } else {
       std::string snapshot(json, static_cast<size_t>(written) - 1);
       snapshot += audio_processing_stats(ws->apm.get());
+      // A retained capturer can stop on its own (for example, an MF read fails
+      // after device removal). No capturer means "not requested/unsupported",
+      // not a failure: Android supplies camera frames outside this object.
+      snapshot += ",\"camera_capturing\":" + std::to_string(
+          ws->camera ? (ws->camera->Capturing() ? 1 : 0) : -1);
       snapshot += ",\"media_route_generation\":" + std::to_string(ws->route_generation.load()) +
                   ",\"audio_bwe_route_generation\":" + std::to_string(ws->audio_route_applied.load()) +
                   ",\"video_bwe_route_generation\":" + std::to_string(ws->video_route_applied.load());
