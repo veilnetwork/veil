@@ -128,6 +128,14 @@ if [[ -z "$target" ]]; then
   exit 2
 fi
 
+# rustc's Mach-O strip step can produce a LINKEDIT rejected by newer dyld,
+# including a correctly signed executable. Strip staged Darwin artifacts
+# with Apple's tool below, rather than during Rust linking. A Darwin host
+# also builds the native CLI used for signing cross-target manifests.
+if [[ "$target" == *apple-darwin || "$(uname -s)" == Darwin ]]; then
+  export CARGO_PROFILE_RELEASE_STRIP=none
+fi
+
 if "$sign"; then
   for required in identity version; do
     if [[ -z "${!required}" ]]; then
@@ -222,6 +230,10 @@ for b in "${bins[@]}"; do
     exit 1
   fi
   cp "$src_path" "$stage/$bin_name"
+  if [[ "$target" == *apple-darwin ]]; then
+    xcrun strip -S "$stage/$bin_name"
+    codesign --force --sign - --timestamp=none "$stage/$bin_name"
+  fi
   # Strip whitespace/path from sha256sum output to keep it parseable.
   sha=$(sha256_of "$stage/$bin_name")
   echo "$sha  $bin_name" >> "$stage/sha256.txt"
