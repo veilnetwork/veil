@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## v0.11.51 — 2026-11-12
+
+### Fixed
+
+- Negotiate supported Windows camera formats when the requested dimensions are
+  rejected, and report startup failures and terminal capture state accurately.
+- Retain Apple camera session ownership across queued startup and teardown,
+  avoiding access to a destroyed capturer.
+- Sign finished update manifests on a separate runner without rebuilding
+  dependencies after the signing identity becomes available.
+
 - Sign release UpdateManifests in the publishing job from the checksum-checked
   host artifact. Keep release identities out of dependency build runners and
   remove the temporary key on both success and signing failure.
