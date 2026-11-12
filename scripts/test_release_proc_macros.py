@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import argparse
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PROFILE_ROOT = ROOT
 
 
 def profile_tables(name, values):
@@ -27,8 +29,8 @@ def profile_tables(name, values):
 @unittest.skipUnless(sys.platform == "darwin", "Requires the Darwin linker and loader")
 class ReleaseProcMacroTest(unittest.TestCase):
     def test_release_derive_compiles_and_its_host_library_loads(self):
-        manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
-        channel = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
+        manifest = tomllib.loads((PROFILE_ROOT / "Cargo.toml").read_text())
+        channel = tomllib.loads((PROFILE_ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
         host = subprocess.check_output(["rustc", f"+{channel}", "-vV"], text=True)
         host = next(line.removeprefix("host: ") for line in host.splitlines() if line.startswith("host: "))
         with tempfile.TemporaryDirectory(prefix="veil-release-macro-", dir="/private/tmp") as temporary:
@@ -67,4 +69,8 @@ class ReleaseProcMacroTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--workspace", type=Path, default=ROOT)
+    options, remaining = parser.parse_known_args()
+    PROFILE_ROOT = options.workspace.resolve(strict=True)
+    unittest.main(argv=[sys.argv[0], *remaining])
