@@ -42,8 +42,7 @@ class ReleaseProcMacroTest(unittest.TestCase):
             (source / "Cargo.toml").write_text((fixture / "Cargo.toml").read_text()
                 + "\n".join(profile_tables("profile.release", manifest["profile"]["release"])) + "\n")
             (source / "Cargo.lock").write_bytes((fixture / "Cargo.lock").read_bytes())
-            (source / "src/lib.rs").write_text(
-                '#[derive(zeroize::Zeroize)]\npub struct Secret([u8; 32]);\n')
+            (source / "src/lib.rs").write_bytes((fixture / "src/lib.rs").read_bytes())
             env = dict(os.environ)
             # A caller's workaround must not hide a broken workspace profile.
             for key in list(env):

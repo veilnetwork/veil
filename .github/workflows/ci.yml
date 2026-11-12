@@ -234,13 +234,16 @@ jobs:
         run: cargo install cargo-audit --version "^0.22" --locked
 
       - name: cargo audit (RustSec advisory DB)
-        # Phase 6.50.b audit-A2: fail the CI if any known CVE lands in the
-        # transitive graph.  Allow-list is currently empty — the prior
-        # `RUSTSEC-2025-0134` ignore was retired after `rustls-pemfile`
-        # was migrated to `rustls-pki-types::pem::PemObject` (Phase
-        # 6.50.b followup).  Add new ignores ONLY with a reference to a
-        # tracking issue/Epic.
+        # Real vulnerabilities are never ignored. Existing informational /
+        # maintenance exceptions and their rationale live in .cargo/audit.toml.
         run: cargo audit --deny warnings
+
+      - name: cargo audit (Darwin compiler fixture)
+        # Host proc macros execute during the native regression test, even
+        # though this isolated lock is not part of the production graph.
+        run: |
+          cargo metadata --manifest-path scripts/fixtures/darwin-proc-macro/Cargo.toml --locked --format-version 1 > /dev/null
+          cargo audit --deny warnings --file scripts/fixtures/darwin-proc-macro/Cargo.lock
 
       - name: cargo audit (fuzz lockfile)
         # report5: `fuzz/Cargo.toml` declares an empty `[workspace]` so
