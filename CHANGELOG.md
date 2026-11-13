@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.11.52 — 2026-11-13
+
 ### Fixed
 
 - Run Flutter endpoint binds outside the calling Dart isolate while waiting for
