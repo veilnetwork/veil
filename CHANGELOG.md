@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- Run Flutter endpoint binds outside the calling Dart isolate while waiting for
+  local IPC. Preserve native outcomes and return app ownership to the caller,
+  including when an admitted bind completes after the parent client closes.
+
 ## v0.11.51 — 2026-11-12
 
 ### Fixed
