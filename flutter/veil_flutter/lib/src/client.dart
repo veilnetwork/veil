@@ -725,6 +725,35 @@ Uint8List _registerEphemeralOnionServiceWorker(
   }
 }
 
+int _bindEndpointWorker(
+  int handleAddr,
+  String namespace,
+  String name,
+  int endpointId,
+  bool named,
+  bool deviceScoped,
+) {
+  final handle = Pointer<ffi.VeilHandle>.fromAddress(handleAddr);
+  final nsC = namespace.toNativeUtf8();
+  final nameC = name.toNativeUtf8();
+  final errOut = calloc<Pointer<Utf8>>();
+  try {
+    final app = deviceScoped
+        ? ffi.veilBindDeviceScoped(handle, nsC, nameC, endpointId, errOut)
+        : named
+            ? ffi.veilBindNamed(handle, nsC, nameC, endpointId, errOut)
+            : ffi.veilBind(handle, nsC, nameC, endpointId, errOut);
+    if (app == nullptr) {
+      throw VeilException('bind failed: ${_readErrAndFree(errOut)}');
+    }
+    return app.address;
+  } finally {
+    calloc.free(nsC);
+    calloc.free(nameC);
+    calloc.free(errOut);
+  }
+}
+
 int _bindCapabilityWorker(
   int handleAddr,
   Uint8List namespace,
@@ -2583,26 +2612,23 @@ class VeilClient implements Finalizable {
     bool deviceScoped = false,
   }) async {
     _ensureOpen();
-    return Future(() {
-      final nsC = namespace.toNativeUtf8();
-      final nameC = name.toNativeUtf8();
-      final errOut = calloc<Pointer<Utf8>>();
-      try {
-        final app = deviceScoped
-            ? ffi.veilBindDeviceScoped(_handle, nsC, nameC, endpointId, errOut)
-            : named
-                ? ffi.veilBindNamed(_handle, nsC, nameC, endpointId, errOut)
-                : ffi.veilBind(_handle, nsC, nameC, endpointId, errOut);
-        if (app == nullptr) {
-          throw VeilException('bind failed: ${_readErrAndFree(errOut)}');
-        }
-        return AppHandle._(app);
-      } finally {
-        calloc.free(nsC);
-        calloc.free(nameC);
-        calloc.free(errOut);
-      }
-    });
+    // Native bind waits for the IPC response (up to BIND_TIMEOUT_DEFAULT),
+    // including behind earlier requests on that connection. Future(() {...})
+    // would still block this isolate's timers, media handling and UI. Transfer
+    // only the opaque token and scalar arguments, never this client's callback.
+    // Await retains the Finalizable client; construct the app owner here.
+    final handleAddr = _handle.address;
+    final appAddr = await Isolate.run(
+      () => _bindEndpointWorker(
+        handleAddr,
+        namespace,
+        name,
+        endpointId,
+        named,
+        deviceScoped,
+      ),
+    );
+    return AppHandle._(Pointer<ffi.VeilApp>.fromAddress(appAddr));
   }
 
   /// Close the connection.  Aborts any active event subscription and
