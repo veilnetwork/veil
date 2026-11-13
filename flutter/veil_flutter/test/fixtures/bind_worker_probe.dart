@@ -28,15 +28,15 @@ Future<void> main(List<String> args) async {
   Future<AppHandle> bind() => switch (binding) {
         'named' => client.bindNamed(
             namespace: 'qa.namespace.λ',
-            name: 'name.тест',
+            name: 'name.\u0442\u0435\u0441\u0442',
             endpointId: 0x12345678),
         'device' => client.bindDeviceScoped(
             namespace: 'qa.namespace.λ',
-            name: 'name.тест',
+            name: 'name.\u0442\u0435\u0441\u0442',
             endpointId: 0x12345678),
         _ => client.bind(
             namespace: 'qa.namespace.λ',
-            name: 'name.тест',
+            name: 'name.\u0442\u0435\u0441\u0442',
             endpointId: 0x12345678),
       };
   var released = false, finishedEarly = false, returned = false;
