@@ -60,6 +60,21 @@ const MethodChannel _channel = MethodChannel('veil_flutter/lifecycle');
 class VeilBackground {
   VeilBackground._(); // not instantiable
 
+  /// Permanently seal this process's daemon-service admission until the caller
+  /// explicitly releases the returned owner. Late queued starts are fenced by
+  /// generation even after release. This verifies foreground/wake-lock release,
+  /// not destruction of the Android Service object, VPN or native node teardown.
+  /// A host must keep its own erasure/recovery gate closed on any failure.
+  static Future<VeilBackgroundRetirement> retire() async {
+    if (!Platform.isAndroid) return VeilBackgroundRetirement._(null);
+    final token =
+        await _channel.invokeMethod<String>('retireBackgroundService');
+    if (token == null || token.isEmpty || token.length > 64) {
+      throw StateError('Background retirement unavailable');
+    }
+    return VeilBackgroundRetirement._(token);
+  }
+
   /// Read-only operational flags/volume; no labels or settings payloads.
   /// A missing/older plugin is reported as unavailable by the caller.
   static Future<Map<Object?, Object?>?> diagnosticState() async {
@@ -156,5 +171,32 @@ class VeilBackground {
   static Future<void> openBackgroundSettings() async {
     if (!Platform.isAndroid) return;
     await _channel.invokeMethod<void>('openBackgroundSettings');
+  }
+}
+
+/// Retain through an enclosing operation's retry/lost reply. This object is a
+/// daemon admission owner, never authorization to erase a profile or OS keys.
+class VeilBackgroundRetirement {
+  VeilBackgroundRetirement._(this._token);
+  final String? _token;
+
+  Future<void> verifyReleasedResources() async {
+    final token = _token;
+    if (token == null) return;
+    final verified = await _channel.invokeMethod<bool>(
+      'verifyBackgroundRetirement',
+      {'token': token},
+    );
+    if (verified != true) throw StateError('Background retirement unverified');
+  }
+
+  /// The host calls this only after its enclosing native release protocol and
+  /// fresh lifetime handoff. It does not start the daemon; a new explicit start
+  /// is required. Repeating a lost successful reply cannot release a new owner.
+  Future<void> releaseAdmission() async {
+    final token = _token;
+    if (token == null) return;
+    await _channel
+        .invokeMethod<void>('releaseBackgroundRetirement', {'token': token});
   }
 }
