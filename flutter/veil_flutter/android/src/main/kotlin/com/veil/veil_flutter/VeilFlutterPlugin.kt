@@ -218,6 +218,11 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 result.success(CallScreenActivity.updateCaller(session, name, avatar))
             }
             "startBackgroundService" -> {
+                val generation = VeilDaemonService.startTicket()
+                if (generation == null) {
+                    result.error("BACKGROUND_RETIRED", "Background service admission is sealed", null)
+                    return
+                }
                 val title = call.argument<String>("title")
                 val text  = call.argument<String>("text")
                 val hangupAction = call.argument<Boolean>("hangupAction") ?: false
@@ -228,6 +233,7 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 CallScreenActivity.prepare(if (hangupAction) callSession else null)
                 val intent = Intent(ctx, VeilDaemonService::class.java).apply {
                     action = VeilDaemonService.ACTION_START
+                    putExtra(VeilDaemonService.EXTRA_START_GENERATION, generation)
                     if (title != null) putExtra(VeilDaemonService.EXTRA_NOTIFICATION_TITLE, title)
                     if (text  != null) putExtra(VeilDaemonService.EXTRA_NOTIFICATION_TEXT, text)
                     putExtra(VeilDaemonService.EXTRA_HANGUP_ACTION, hangupAction)
@@ -243,9 +249,36 @@ class VeilFlutterPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 }
                 result.success(null)
             }
+            "retireBackgroundService" -> {
+                try {
+                    result.success(VeilDaemonService.retire(ctx))
+                } catch (_: Exception) {
+                    result.error("BACKGROUND_RETIREMENT_FAILED", "Background retirement not verified", null)
+                }
+            }
+            "verifyBackgroundRetirement", "releaseBackgroundRetirement" -> {
+                val token = call.argument<String>("token")
+                if (token == null || token.length > 64) {
+                    result.error("BACKGROUND_RETIREMENT_FAILED", "Background retirement unavailable", null)
+                    return
+                }
+                try {
+                    if (call.method == "verifyBackgroundRetirement") {
+                        VeilDaemonService.verifyRetirement(ctx, token)
+                        result.success(true)
+                    } else {
+                        VeilDaemonService.releaseRetirement(ctx, token)
+                        result.success(null)
+                    }
+                } catch (_: Exception) {
+                    result.error("BACKGROUND_RETIREMENT_FAILED", "Background retirement not verified", null)
+                }
+            }
             "stopBackgroundService" -> {
                 val intent = Intent(ctx, VeilDaemonService::class.java).apply {
                     action = VeilDaemonService.ACTION_STOP
+                    putExtra(VeilDaemonService.EXTRA_START_GENERATION,
+                        VeilDaemonService.commandGeneration())
                 }
                 // Delivering ACTION_STOP through startService is what lets the
                 // service tear the node down on its own terms. From Android 12

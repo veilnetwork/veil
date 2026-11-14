@@ -32,6 +32,7 @@
 package com.veil.veil_flutter
 
 import android.app.Notification
+import android.app.ActivityManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -42,10 +43,12 @@ import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.os.Build
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import java.util.UUID
 
 class VeilDaemonService : Service() {
 
@@ -58,6 +61,7 @@ class VeilDaemonService : Service() {
         const val EXTRA_RINGING = "ringing"
         const val EXTRA_MICROPHONE = "microphone"
         const val EXTRA_CAMERA = "camera"
+        const val EXTRA_START_GENERATION = "start_generation"
 
         private const val CHANNEL_ID = "veil_daemon"
         private const val CALL_INCOMING_CHANNEL_ID = "veil_call_incoming_v2"
@@ -72,11 +76,73 @@ class VeilDaemonService : Service() {
         private const val APP_ACTION_ACCEPT = "network.veil.xveil.action.ACCEPT_CALL"
         private const val TAG = "VeilDaemonService"
         // Same-process, read-only diagnostics; never expose notification text.
-        private var diagnosticInstance: VeilDaemonService? = null
+        // Retain a failed cleanup owner rather than losing a live wake lock
+        // when onDestroy throws or a later instance is created. Main-thread only.
+        private val instances = mutableSetOf<VeilDaemonService>()
+        private val retirement = DaemonRetirementGate { UUID.randomUUID().toString() }
         fun diagnosticState(): Map<String, Boolean> = mapOf(
-            "serviceForeground" to (diagnosticInstance?.foregroundActive == true),
-            "wakeLockHeld" to (diagnosticInstance?.wakeLock?.isHeld == true),
+            "serviceForeground" to instances.any { it.foregroundActive || it.foregroundUncertain },
+            "wakeLockHeld" to instances.any { it.wakeLock?.isHeld == true },
         )
+
+        private fun requireMainThread() {
+            check(Looper.myLooper() == Looper.getMainLooper()) { "background thread unavailable" }
+        }
+
+        fun startTicket(): Long? {
+            requireMainThread()
+            return retirement.startTicket()
+        }
+
+        fun commandGeneration(): Long {
+            requireMainThread()
+            return retirement.commandGeneration()
+        }
+
+        /** Seals late START/sticky callbacks before touching resources. It
+         * confirms released resources, not completion of Android onDestroy.
+         */
+        fun retire(context: Context): String {
+            requireMainThread()
+            val token = retirement.begin()
+            for (instance in instances.toList()) instance.stopOwnedResources()
+            // A queued start can have prepared presentation before any service
+            // instance was created. Clear it while all starts are sealed.
+            context.getSystemService(NotificationManager::class.java).cancel(INCOMING_NOTIFICATION_ID)
+            CallScreenActivity.clear()
+            CallActionCapability.revokeAll()
+            context.stopService(Intent(context, VeilDaemonService::class.java))
+            verifyRetirement(context, token)
+            return token
+        }
+
+        private fun retirementResources(context: Context): Pair<Boolean, Boolean> {
+            val manager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+                ?: error("background observation unavailable")
+            // O+ reports this application's own services. No labels, addresses
+            // or component list crosses the channel. Failure is never absence.
+            @Suppress("DEPRECATION")
+            val running = manager.getRunningServices(Int.MAX_VALUE)
+                ?: error("background observation unavailable")
+            val osForeground = running.any {
+                it.service.packageName == context.packageName &&
+                    it.service.className == VeilDaemonService::class.java.name && it.foreground
+            }
+            return Pair(osForeground || instances.any { it.foregroundActive || it.foregroundUncertain },
+                instances.any { it.wakeLock?.isHeld == true })
+        }
+
+        fun verifyRetirement(context: Context, token: String) {
+            requireMainThread()
+            val (foreground, wakeLock) = retirementResources(context)
+            retirement.confirm(token, foreground, wakeLock)
+        }
+
+        fun releaseRetirement(context: Context, token: String) {
+            requireMainThread()
+            val (foreground, wakeLock) = retirementResources(context)
+            retirement.resume(token, foreground, wakeLock)
+        }
     }
 
     // Partial wake lock held for the service's lifetime. A foreground service
@@ -89,28 +155,43 @@ class VeilDaemonService : Service() {
     // exactly why the whole background service is opt-in.
     private var wakeLock: PowerManager.WakeLock? = null
     private var foregroundActive = false
+    private var foregroundUncertain = false
     private var incomingSession: String? = null
 
     override fun onCreate() {
         super.onCreate()
-        diagnosticInstance = this
+        instances.add(this)
+        if (!retirement.allowsStart()) {
+            stopSelf()
+            return
+        }
         ensureChannel()
-        // Start foreground IMMEDIATELY (within 5 s of onCreate) — Android
-        // 12+ is strict about this and kills the service otherwise.
-        // The notification text is updated later when onStartCommand
-        // receives the actual title / body via Intent extras.
-        startForegroundCompat(
-            buildNotification(getString(R.string.veil_default_title), null),
-            microphone = false,
-            camera = false,
-        )
+        // Promotion occurs immediately in the admitted onStartCommand, still
+        // within Android's foreground-start deadline. Creating an object for a
+        // stale queued intent must not publish a new foreground notification.
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val ticket = if (intent?.hasExtra(EXTRA_START_GENERATION) == true)
+            intent.getLongExtra(EXTRA_START_GENERATION, -1L) else null
+        val admitted = if (intent?.action == ACTION_STOP)
+            retirement.matchesGeneration(ticket)
+        else retirement.acceptStart(ticket, sticky = intent?.action == null)
+        if (!admitted) {
+            // A delayed old START cannot tear down an already admitted new
+            // generation's live notification or wake lock.
+            if (retirement.allowsStart() && (foregroundActive || wakeLock?.isHeld == true)) {
+                return START_STICKY
+            }
+            if (foregroundActive || foregroundUncertain || wakeLock?.isHeld == true) {
+                stopOwnedResources()
+            }
+            stopSelf()
+            return START_NOT_STICKY
+        }
         when (intent?.action) {
             ACTION_STOP -> {
-                releaseWakeLock()
-                stopForegroundCompat()
+                stopOwnedResources()
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -159,11 +240,21 @@ class VeilDaemonService : Service() {
     }
 
     override fun onDestroy() {
-        CallScreenActivity.clear()
-        foregroundActive = false
-        if (diagnosticInstance === this) diagnosticInstance = null
+        try {
+            // Retirement already cleaned this owner. Its delayed destruction
+            // must not revoke the replacement generation's call presentation.
+            if (foregroundActive || foregroundUncertain || wakeLock?.isHeld == true) {
+                stopOwnedResources()
+            }
+            instances.remove(this) // Only confirmed cleanup releases ownership.
+        } finally {
+            super.onDestroy()
+        }
+    }
+
+    private fun stopOwnedResources() {
         releaseWakeLock()
-        super.onDestroy()
+        stopForegroundCompat()
     }
 
     private fun acquireWakeLock() {
@@ -337,11 +428,12 @@ class VeilDaemonService : Service() {
         microphone: Boolean,
         camera: Boolean,
     ) {
+        foregroundUncertain = true
         try {
             startForegroundOrThrow(notification, microphone, camera)
             foregroundActive = true
+            foregroundUncertain = false
         } catch (refused: IllegalStateException) {
-            foregroundActive = false
             // ForegroundServiceStartNotAllowedException, from Android 12. It
             // extends IllegalStateException and is NOT a SecurityException, so
             // the media-type catch below never saw it and it escaped out of
@@ -404,7 +496,6 @@ class VeilDaemonService : Service() {
     }
 
     private fun stopForegroundCompat() {
-        foregroundActive = false
         getSystemService(NotificationManager::class.java).cancel(INCOMING_NOTIFICATION_ID)
         incomingSession = null
         CallScreenActivity.clear()
@@ -419,5 +510,7 @@ class VeilDaemonService : Service() {
             @Suppress("DEPRECATION")
             stopForeground(true)
         }
+        foregroundActive = false
+        foregroundUncertain = false
     }
 }
