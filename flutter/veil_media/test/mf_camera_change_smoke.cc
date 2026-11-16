@@ -12,14 +12,15 @@ enum class ChangeOutcome { kReadable, kRecovered, kStopped };
 class ChangedReader final : public IMFSourceReader {
  public:
   ChangedReader(GUID subtype, UINT32 width, UINT32 height, INT32 stride,
-                bool query_fails, bool notify, bool offer_sample, bool refuse)
+                bool query_fails, bool notify, bool offer_sample, bool refuse,
+                DWORD extra_flags = 0)
       : subtype_(subtype), width_(width), height_(height), stride_(stride),
         query_fails_(query_fails), notify_(notify), offer_sample_(offer_sample),
-        refuse_(refuse) {
+        refuse_(refuse), extra_flags_(extra_flags) {
     MFCreateMediaType(&current_);
   }
   ~ChangedReader() { current_->Release(); }
-  int sets = 0, reads = 0;
+  int sets = 0, reads = 0, after_error = 0;
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void**) override { return E_NOINTERFACE; }
   ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
   ULONG STDMETHODCALLTYPE Release() override { return 1; }
@@ -27,11 +28,13 @@ class ChangedReader final : public IMFSourceReader {
   HRESULT STDMETHODCALLTYPE SetStreamSelection(DWORD, BOOL) override { return E_NOTIMPL; }
   HRESULT STDMETHODCALLTYPE GetNativeMediaType(DWORD, DWORD, IMFMediaType**) override { return E_NOTIMPL; }
   HRESULT STDMETHODCALLTYPE GetCurrentMediaType(DWORD, IMFMediaType** out) override {
+    if (reads > 0 && (extra_flags_ & MF_SOURCE_READERF_ERROR)) ++after_error;
     *out = nullptr;
     if (reads > 0 && query_fails_) return E_FAIL;
     *out = current_; current_->AddRef(); return S_OK;
   }
   HRESULT STDMETHODCALLTYPE SetCurrentMediaType(DWORD, DWORD*, IMFMediaType* type) override {
+    if (reads > 0 && (extra_flags_ & MF_SOURCE_READERF_ERROR)) ++after_error;
     ++sets;
     if (reads > 0 && refuse_) return MF_E_INVALIDMEDIATYPE;
     current_->DeleteAllItems(); type->CopyAllItems(current_);
@@ -46,10 +49,11 @@ class ChangedReader final : public IMFSourceReader {
   HRESULT STDMETHODCALLTYPE SetCurrentPosition(REFGUID, REFPROPVARIANT) override { return E_NOTIMPL; }
   HRESULT STDMETHODCALLTYPE ReadSample(DWORD, DWORD, DWORD* stream, DWORD* flags,
                                        LONGLONG* timestamp, IMFSample** sample) override {
+    if (reads > 0 && (extra_flags_ & MF_SOURCE_READERF_ERROR)) ++after_error;
     ++reads; *stream = 0; *timestamp = 0; *sample = nullptr;
     if (reads == 1) {
       if (!notify_) {
-        *flags = MF_SOURCE_READERF_STREAMTICK;
+        *flags = MF_SOURCE_READERF_STREAMTICK | extra_flags_;
         return S_OK;
       }
       current_->DeleteAllItems();
@@ -57,7 +61,7 @@ class ChangedReader final : public IMFSourceReader {
       current_->SetGUID(MF_MT_SUBTYPE, subtype_);
       MFSetAttributeSize(current_, MF_MT_FRAME_SIZE, width_, height_);
       current_->SetUINT32(MF_MT_DEFAULT_STRIDE, static_cast<UINT32>(stride_));
-      *flags = MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED;
+      *flags = MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED | extra_flags_;
       if (offer_sample_) {
         // Opaque synthetic bytes, deliberately not an image. The old loop can
         // misroute this changed-type sample into the NV12 converter after it
@@ -87,10 +91,34 @@ class ChangedReader final : public IMFSourceReader {
   INT32 stride_;
   bool query_fails_;
   bool notify_, offer_sample_, refuse_;
+  DWORD extra_flags_;
   IMFMediaType* current_ = nullptr;
 };
 
 struct MfCameraTestPeer {
+  static bool FatalFlag(bool with_type_change) {
+    ChangedReader reader(MFVideoFormat_NV12, 352, 198, 352, false,
+                         with_type_change, with_type_change, false,
+                         MF_SOURCE_READERF_ERROR);
+    MfCameraCapturer camera(CameraFrameCb([](const uint8_t*, const uint8_t*,
+        const uint8_t*, int, int, int, int, int, int64_t) {}));
+    *(&camera.reader_) = &reader;
+    const bool opened = camera.NegotiateFormat(352, 198);
+    reader.sets = 0;
+    libyuv::metadata_conversion_calls = 0;
+    camera.running_.store(true);
+    camera.CaptureLoop();
+    camera.running_.store(false);
+    const bool ok = opened && reader.reads == 1 && reader.sets == 0 &&
+                    reader.after_error == 0 && libyuv::metadata_conversion_calls == 0;
+    camera.reader_.Reset();
+    std::printf("fatal flag%s: %s (reads=%d after_error=%d conversions=%d)\n",
+                with_type_change ? " with changed sample" : " with null sample",
+                ok ? "PASS" : "FAIL", reader.reads, reader.after_error,
+                libyuv::metadata_conversion_calls);
+    return ok;
+  }
+
   static bool Run(const char* label, GUID subtype, UINT32 width, UINT32 height,
                   INT32 stride, ChangeOutcome outcome, bool query_fails = false,
                   bool notify = true) {
@@ -141,6 +169,8 @@ int main() {
     using veil_media::MfCameraTestPeer;
     using veil_media::ChangeOutcome;
     int failed = 0;
+    failed += !MfCameraTestPeer::FatalFlag(false);
+    failed += !MfCameraTestPeer::FatalFlag(true);
     failed += !MfCameraTestPeer::Run("unchanged stream control", MFVideoFormat_NV12,
                                    352, 198, 352, ChangeOutcome::kReadable, false, false);
     failed += !MfCameraTestPeer::Run("NV12 geometry change", MFVideoFormat_NV12,
