@@ -13,10 +13,10 @@ class ChangedReader final : public IMFSourceReader {
  public:
   ChangedReader(GUID subtype, UINT32 width, UINT32 height, INT32 stride,
                 bool query_fails, bool notify, bool offer_sample, bool refuse,
-                DWORD extra_flags = 0)
+                DWORD extra_flags = 0, HRESULT read_result = S_OK)
       : subtype_(subtype), width_(width), height_(height), stride_(stride),
         query_fails_(query_fails), notify_(notify), offer_sample_(offer_sample),
-        refuse_(refuse), extra_flags_(extra_flags) {
+        refuse_(refuse), extra_flags_(extra_flags), read_result_(read_result) {
     MFCreateMediaType(&current_);
   }
   ~ChangedReader() { current_->Release(); }
@@ -52,6 +52,8 @@ class ChangedReader final : public IMFSourceReader {
     if (reads > 0 && (extra_flags_ & MF_SOURCE_READERF_ERROR)) ++after_error;
     ++reads; *stream = 0; *timestamp = 0; *sample = nullptr;
     if (reads == 1) {
+      *flags = 0;
+      if (FAILED(read_result_)) return read_result_;
       if (!notify_) {
         *flags = MF_SOURCE_READERF_STREAMTICK | extra_flags_;
         return S_OK;
@@ -92,6 +94,7 @@ class ChangedReader final : public IMFSourceReader {
   bool query_fails_;
   bool notify_, offer_sample_, refuse_;
   DWORD extra_flags_;
+  HRESULT read_result_;
   IMFMediaType* current_ = nullptr;
 };
 
@@ -109,13 +112,57 @@ struct MfCameraTestPeer {
     camera.running_.store(true);
     camera.CaptureLoop();
     camera.running_.store(false);
+    camera.Stop();
+    const auto diagnostic = camera.Diagnostics();
     const bool ok = opened && reader.reads == 1 && reader.sets == 0 &&
-                    reader.after_error == 0 && libyuv::metadata_conversion_calls == 0;
+                    reader.after_error == 0 && libyuv::metadata_conversion_calls == 0 &&
+                    diagnostic.status == 8 && diagnostic.hresult == S_OK &&
+                    diagnostic.reads == 1 && diagnostic.samples == 0 &&
+                    diagnostic.frames == 0 && diagnostic.dropped == 0;
     camera.reader_.Reset();
     std::printf("fatal flag%s: %s (reads=%d after_error=%d conversions=%d)\n",
                 with_type_change ? " with changed sample" : " with null sample",
                 ok ? "PASS" : "FAIL", reader.reads, reader.after_error,
                 libyuv::metadata_conversion_calls);
+    return ok;
+  }
+
+  static bool CaptureEvidence(bool failed_read) {
+    ChangedReader reader(MFVideoFormat_NV12, 352, 198, 352, false,
+                         true, true, false, 0,
+                         failed_read ? MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED : S_OK);
+    MfCameraCapturer camera(CameraFrameCb([](const uint8_t*, const uint8_t*,
+        const uint8_t*, int, int, int, int, int, int64_t) {}));
+    *(&camera.reader_) = &reader;
+    const bool opened = camera.NegotiateFormat(352, 198);
+    libyuv::metadata_conversion_calls = 0;
+    camera.running_.store(true);
+    camera.CaptureLoop();
+    camera.running_.store(false);
+    camera.Stop();
+    const auto diagnostic = camera.Diagnostics();
+    const bool ok = opened && diagnostic.status == (failed_read ? 7 : 9) &&
+        diagnostic.hresult == (failed_read
+          ? static_cast<uint32_t>(MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED) : 0) &&
+        diagnostic.reads == (failed_read ? 1u : 2u) &&
+        diagnostic.samples == (failed_read ? 0u : 1u) &&
+        diagnostic.frames == 0 && diagnostic.dropped == (failed_read ? 0u : 1u) &&
+        libyuv::metadata_conversion_calls == (failed_read ? 0 : 1);
+    camera.reader_.Reset();
+    std::printf("capture evidence %s: %s\n", failed_read ? "read refusal" : "conversion refusal",
+                ok ? "PASS" : "FAIL");
+    return ok;
+  }
+
+  static bool StoppedEvidence() {
+    MfCameraCapturer camera{CameraFrameCb()};
+    camera.SetDiagnosticStatus(2);
+    camera.Stop();
+    const auto diagnostic = camera.Diagnostics();
+    const bool ok = diagnostic.status == 3 && diagnostic.hresult == -1 &&
+        diagnostic.reads == 0 && diagnostic.samples == 0 &&
+        diagnostic.frames == 0 && diagnostic.dropped == 0;
+    std::printf("explicit stop evidence: %s\n", ok ? "PASS" : "FAIL");
     return ok;
   }
 
@@ -171,6 +218,9 @@ int main() {
     int failed = 0;
     failed += !MfCameraTestPeer::FatalFlag(false);
     failed += !MfCameraTestPeer::FatalFlag(true);
+    failed += !MfCameraTestPeer::CaptureEvidence(true);
+    failed += !MfCameraTestPeer::CaptureEvidence(false);
+    failed += !MfCameraTestPeer::StoppedEvidence();
     failed += !MfCameraTestPeer::Run("unchanged stream control", MFVideoFormat_NV12,
                                    352, 198, 352, ChangeOutcome::kReadable, false, false);
     failed += !MfCameraTestPeer::Run("NV12 geometry change", MFVideoFormat_NV12,
