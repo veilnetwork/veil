@@ -314,7 +314,15 @@ class MfCameraCapturer : public CameraCapturer {
     // — but stays JOINABLE. Assigning over a joinable `std::thread` below is
     // `std::terminate`, so the corpse has to be reaped first.
     if (thread_.joinable()) thread_.join();
-    if (!mf().ok()) return false;
+    {
+      std::lock_guard<std::mutex> lock(diagnostic_mutex_);
+      diagnostic_ = {};
+      diagnostic_.status = 1;
+    }
+    if (!mf().ok()) {
+      SetDiagnosticStatus(5);
+      return false;
+    }
     if (width <= 0) width = 352;
     if (height <= 0) height = 288;
     if (fps <= 0) fps = 15;
@@ -339,8 +347,9 @@ class MfCameraCapturer : public CameraCapturer {
     running_.store(true);
     thread_ = std::thread([this, device, width, height, &m, &cv, &settled,
                            &opened] {
-      const bool com_ok =
-          SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+      const HRESULT com_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      const bool com_ok = SUCCEEDED(com_result);
+      if (!com_ok) SetDiagnosticStatus(5, static_cast<uint32_t>(com_result));
       if (!com_ok) vcam_log("CoInitializeEx(MTA) failed on the capture thread");
       const bool ok = com_ok && OpenReader(device, width, height);
       {
@@ -385,15 +394,32 @@ class MfCameraCapturer : public CameraCapturer {
 
   bool Capturing() const override { return running_.load(); }
 
+  CameraCaptureDiagnostics Diagnostics() const override {
+    std::lock_guard<std::mutex> lock(diagnostic_mutex_);
+    return diagnostic_;
+  }
+
   void Stop() override {
     running_.store(false);
     // The thread releases the reader itself. Doing it here would touch a COM
     // object from a thread in another apartment — the very thing this class
     // now exists to avoid.
     if (thread_.joinable()) thread_.join();
+    std::lock_guard<std::mutex> lock(diagnostic_mutex_);
+    // An explicit stop must not erase the terminal cause of an earlier exit.
+    if (diagnostic_.status == 1 || diagnostic_.status == 2) {
+      diagnostic_.status = 3;
+      diagnostic_.hresult = -1;
+    }
   }
 
  private:
+  void SetDiagnosticStatus(int status, int64_t hresult = -1) {
+    std::lock_guard<std::mutex> lock(diagnostic_mutex_);
+    diagnostic_.status = status;
+    diagnostic_.hresult = hresult;
+  }
+
   // Everything Media Foundation, on the capture thread. Returns false with
   // nothing held.
   bool OpenReader(const std::string& device, int width, int height) {
@@ -401,25 +427,34 @@ class MfCameraCapturer : public CameraCapturer {
     // utf8_to_wide answers an empty string for both nullptr and "", and
     // activate_source reads an empty symlink as "the first camera".
     *(&source) = activate_source(utf8_to_wide(device.c_str()));
-    if (!source) return false;
+    if (!source) {
+      SetDiagnosticStatus(4);
+      return false;
+    }
 
     // Enable the basic YUV -> RGB32 fallback, without depending on advanced
     // video processors or asking Media Foundation to resize camera modes.
     ComPtr<IMFAttributes> reader_attrs;
-    if (FAILED(MFCreateAttributes(&reader_attrs, 1)) ||
-        FAILED(reader_attrs->SetUINT32(
-            MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE))) {
+    HRESULT hr = MFCreateAttributes(&reader_attrs, 1);
+    if (SUCCEEDED(hr)) hr = reader_attrs->SetUINT32(
+        MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+    if (FAILED(hr)) {
+      SetDiagnosticStatus(5, static_cast<uint32_t>(hr));
       return false;
     }
-    if (FAILED(MFCreateSourceReaderFromMediaSource(
-            source.Get(), reader_attrs.Get(), &reader_))) {
+    hr = MFCreateSourceReaderFromMediaSource(
+        source.Get(), reader_attrs.Get(), &reader_);
+    if (FAILED(hr)) {
+      SetDiagnosticStatus(5, static_cast<uint32_t>(hr));
       vcam_log("MFCreateSourceReaderFromMediaSource failed");
       return false;
     }
     if (!NegotiateFormat(width, height)) {
+      SetDiagnosticStatus(6);
       reader_.Reset();
       return false;
     }
+    SetDiagnosticStatus(2);
     return true;
   }
 
@@ -505,12 +540,18 @@ class MfCameraCapturer : public CameraCapturer {
       const HRESULT hr = reader_->ReadSample(
           static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0,
           &stream_index, &flags, &timestamp, &sample);
+      {
+        std::lock_guard<std::mutex> lock(diagnostic_mutex_);
+        ++diagnostic_.reads;
+      }
       if (FAILED(hr)) {
+        SetDiagnosticStatus(7, static_cast<uint32_t>(hr));
         vcam_log("ReadSample failed: 0x%08lx",
                  static_cast<unsigned long>(hr));
         break;
       }
       if ((flags & MF_SOURCE_READERF_ERROR) != 0) {
+        SetDiagnosticStatus(8, static_cast<uint32_t>(hr));
         // This flag invalidates the reader even when ReadSample returned S_OK.
         // Do not query a changed type, convert its sample or ask for another
         // frame after a fatal reader event. The owning thread retires capture
@@ -518,7 +559,10 @@ class MfCameraCapturer : public CameraCapturer {
         vcam_log("ReadSample reported a fatal source-reader flag");
         break;
       }
-      if ((flags & MF_SOURCE_READERF_ENDOFSTREAM) != 0) break;
+      if ((flags & MF_SOURCE_READERF_ENDOFSTREAM) != 0) {
+        SetDiagnosticStatus(9, static_cast<uint32_t>(hr));
+        break;
+      }
       if ((flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) != 0) {
         // The device renegotiated under us (a format change or a resume from
         // sleep). Re-read the geometry rather than converting the next frame
@@ -527,28 +571,42 @@ class MfCameraCapturer : public CameraCapturer {
           // Preserve the existing converter recovery for an unreadable output,
           // but discard THIS sample: it predates the newly negotiated format.
           // Only a subsequent ReadSample may use those conversion parameters.
-          if (!NegotiateFormat(cap_w_, cap_h_)) break;
+          if (!NegotiateFormat(cap_w_, cap_h_)) {
+            SetDiagnosticStatus(10);
+            break;
+          }
           continue;
         }
       }
       // A null sample with no error is a gap, not a failure: MF returns one
       // whenever the timeout elapses with nothing captured.
       if (!sample) continue;
+      {
+        std::lock_guard<std::mutex> lock(diagnostic_mutex_);
+        ++diagnostic_.samples;
+      }
 
       const int64_t t = now_us();
       if (cb_ != nullptr && t - last_us >= min_interval_us_) {
         last_us = t;
-        Deliver(sample.Get());
+        const bool delivered = Deliver(sample.Get());
+        std::lock_guard<std::mutex> lock(diagnostic_mutex_);
+        if (delivered) ++diagnostic_.frames;
+        else ++diagnostic_.dropped;
       }
     }
   }
 
-  void Deliver(IMFSample* sample) {
+  bool Deliver(IMFSample* sample) {
     ComPtr<IMFMediaBuffer> buffer;
-    if (FAILED(sample->ConvertToContiguousBuffer(&buffer))) return;
+    if (FAILED(sample->ConvertToContiguousBuffer(&buffer))) return false;
     BYTE* data = nullptr;
     DWORD len = 0;
-    if (FAILED(buffer->Lock(&data, nullptr, &len)) || data == nullptr) return;
+    if (FAILED(buffer->Lock(&data, nullptr, &len))) return false;
+    if (data == nullptr) {
+      buffer->Unlock();
+      return false;
+    }
 
     const int w = cap_w_, h = cap_h_;
     const int cw = (w + 1) / 2, ch = (h + 1) / 2;
@@ -601,7 +659,7 @@ class MfCameraCapturer : public CameraCapturer {
         break;
     }
     buffer->Unlock();
-    if (rc != 0) return;
+    if (rc != 0) return false;
 
     if (target_w_ > 0 && w > target_w_) {
       const int ow = target_w_ & ~1;             // even width
@@ -619,9 +677,12 @@ class MfCameraCapturer : public CameraCapturer {
     } else {
       cb_(y_.data(), u_.data(), v_.data(), w, h, w, cw, cw, /*ts_us=*/0);
     }
+    return true;
   }
 
   CameraFrameCb cb_;
+  mutable std::mutex diagnostic_mutex_;
+  CameraCaptureDiagnostics diagnostic_;
   std::atomic<bool> running_{false};
   std::thread thread_;
   ComPtr<IMFSourceReader> reader_;

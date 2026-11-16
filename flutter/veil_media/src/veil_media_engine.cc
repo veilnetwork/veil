@@ -1140,6 +1140,8 @@ struct WebrtcState {
   std::atomic<bool> test_video_run{false};
 #endif
   std::unique_ptr<veil_media::CameraCapturer> camera;  // real capture source
+  // Keep the last attempt's bounded evidence after a failed source is released.
+  veil_media::CameraCaptureDiagnostics camera_diagnostics;
   std::unique_ptr<veil_media::ScreenCapturer> screen;  // screen-share source
   int video_target_bitrate_bps = 0;
   std::atomic<double> video_max_fps{0};
@@ -4014,6 +4016,7 @@ int veil_media_engine_stop_video(VeilMediaEngine* engine) {
   // Stop the sources first so no OnFrame races the stream teardown.
   if (ws->camera) {
     ws->camera->Stop();
+    ws->camera_diagnostics = ws->camera->Diagnostics();
     ws->camera.reset();
   }
   if (ws->screen) {
@@ -4084,6 +4087,7 @@ int veil_media_engine_start_camera_device(VeilMediaEngine* engine,
   if (ws->camera && ws->camera->Capturing()) return VEIL_MEDIA_OK;
   if (ws->camera) {
     ws->camera->Stop();
+    ws->camera_diagnostics = ws->camera->Diagnostics();
     ws->camera.reset();
   }
   if (width <= 0) width = 352;
@@ -4093,6 +4097,7 @@ int veil_media_engine_start_camera_device(VeilMediaEngine* engine,
   // callback runs on the capture queue; push_i420 copies synchronously.
   veil_media::AdaptiveVideoSource* src = ws->video_source.get();
   VeilVideoSink* local_sink = ws->local_video_sink.get();
+  ws->camera_diagnostics = {};
   ws->camera.reset(veil_media::CreatePlatformCamera(
       [ws, src, local_sink](const uint8_t* y, const uint8_t* u,
                             const uint8_t* v, int w, int h, int sy, int su,
@@ -4104,6 +4109,7 @@ int veil_media_engine_start_camera_device(VeilMediaEngine* engine,
       }));
   if (!ws->camera) return VEIL_MEDIA_ERR_STATE;
   if (!ws->camera->Start(width, height, fps, device_id)) {
+    ws->camera_diagnostics = ws->camera->Diagnostics();
     ws->camera.reset();
     return VEIL_MEDIA_ERR_STATE;
   }
@@ -4123,6 +4129,7 @@ int veil_media_engine_stop_camera(VeilMediaEngine* engine) {
 #if defined(VEIL_MEDIA_HAVE_WEBRTC)
   if (engine->ws && engine->ws->camera) {
     engine->ws->camera->Stop();
+    engine->ws->camera_diagnostics = engine->ws->camera->Diagnostics();
     engine->ws->camera.reset();
   }
 #endif
@@ -4144,6 +4151,7 @@ int veil_media_engine_start_screen_source(VeilMediaEngine* engine,
   // The app layer restores the camera when the share ends.
   if (ws->camera) {
     ws->camera->Stop();
+    ws->camera_diagnostics = ws->camera->Diagnostics();
     ws->camera.reset();
   }
   veil_media::AdaptiveVideoSource* src = ws->video_source.get();
@@ -4893,6 +4901,14 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
       // not a failure: Android supplies camera frames outside this object.
       snapshot += ",\"camera_capturing\":" + std::to_string(
           ws->camera ? (ws->camera->Capturing() ? 1 : 0) : -1);
+      const auto camera = ws->camera ? ws->camera->Diagnostics()
+                                     : ws->camera_diagnostics;
+      snapshot += ",\"camera_capture_status\":" + std::to_string(camera.status) +
+                  ",\"camera_capture_hresult\":" + std::to_string(camera.hresult) +
+                  ",\"camera_capture_reads\":" + std::to_string(camera.reads) +
+                  ",\"camera_capture_samples\":" + std::to_string(camera.samples) +
+                  ",\"camera_capture_frames\":" + std::to_string(camera.frames) +
+                  ",\"camera_capture_dropped\":" + std::to_string(camera.dropped);
       snapshot += ",\"media_route_generation\":" + std::to_string(ws->route_generation.load()) +
                   ",\"audio_bwe_route_generation\":" + std::to_string(ws->audio_route_applied.load()) +
                   ",\"video_bwe_route_generation\":" + std::to_string(ws->video_route_applied.load());

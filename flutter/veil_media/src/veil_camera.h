@@ -30,6 +30,20 @@ using CameraFrameCb =
                        int width, int height, int stride_y, int stride_u,
                        int stride_v, int64_t ts_us)>;
 
+// Source-owned numeric evidence only. Unsupported backends return status -1;
+// this is not a capture failure. No device identity, pixels or timestamps.
+// MF status: 0 idle, 1 opening, 2 reading, 3 stopped, 4 source unavailable,
+// 5 reader creation failed, 6 format refused, 7 read failed, 8 fatal reader
+// flag, 9 end of stream, 10 format-change recovery failed.
+struct CameraCaptureDiagnostics {
+  int status = -1;
+  int64_t hresult = -1;  // Unknown, or an unsigned 32-bit HRESULT.
+  uint64_t reads = 0;
+  uint64_t samples = 0;
+  uint64_t frames = 0;  // Delivered to the camera callback, not encoded/sent.
+  uint64_t dropped = 0;  // Conversion/buffer refusal, not intentional pacing.
+};
+
 class CameraCapturer {
  public:
   virtual ~CameraCapturer() = default;
@@ -53,6 +67,7 @@ class CameraCapturer {
   //
   // Pure, so a new backend cannot forget to answer it.
   virtual bool Capturing() const = 0;
+  virtual CameraCaptureDiagnostics Diagnostics() const { return {}; }
 };
 
 // Creates the platform camera capturer, or null if this platform has none.
