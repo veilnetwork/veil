@@ -510,6 +510,14 @@ class MfCameraCapturer : public CameraCapturer {
                  static_cast<unsigned long>(hr));
         break;
       }
+      if ((flags & MF_SOURCE_READERF_ERROR) != 0) {
+        // This flag invalidates the reader even when ReadSample returned S_OK.
+        // Do not query a changed type, convert its sample or ask for another
+        // frame after a fatal reader event. The owning thread retires capture
+        // and clears running_ through its normal teardown after this return.
+        vcam_log("ReadSample reported a fatal source-reader flag");
+        break;
+      }
       if ((flags & MF_SOURCE_READERF_ENDOFSTREAM) != 0) break;
       if ((flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) != 0) {
         // The device renegotiated under us (a format change or a resume from
