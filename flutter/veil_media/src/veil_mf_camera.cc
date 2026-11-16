@@ -290,6 +290,9 @@ IMFMediaSource* activate_source(const std::wstring& symlink) {
 }
 
 class MfCameraCapturer : public CameraCapturer {
+#if defined(VEIL_MEDIA_MF_CAMERA_TEST)
+  friend struct MfCameraTestPeer;
+#endif
  public:
   explicit MfCameraCapturer(CameraFrameCb cb) : cb_(std::move(cb)) {}
   ~MfCameraCapturer() override { Stop(); }
@@ -432,10 +435,17 @@ class MfCameraCapturer : public CameraCapturer {
       vcam_log("uncompressed capture requests refused (0x%08lx) — inspecting native format",
                static_cast<unsigned long>(hr));
     }
+    return ReadCurrentFormat();
+  }
 
+  // Observe the output type describing the sample just returned by ReadSample.
+  // Re-requesting the old profile here would change the reader for FUTURE
+  // samples, while interpreting the current one with that new geometry/stride.
+  // Negotiation for a future sample remains separate from this observation.
+  bool ReadCurrentFormat() {
     ComPtr<IMFMediaType> got;
-    if (FAILED(reader_->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-                                            &got))) {
+    if (FAILED(reader_->GetCurrentMediaType(
+            static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), &got))) {
       return false;
     }
     // Not GUID_NULL: that name is an extern defined in uuid.lib, and pulling a
@@ -493,8 +503,8 @@ class MfCameraCapturer : public CameraCapturer {
       LONGLONG timestamp = 0;
       ComPtr<IMFSample> sample;
       const HRESULT hr = reader_->ReadSample(
-          MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &stream_index, &flags,
-          &timestamp, &sample);
+          static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0,
+          &stream_index, &flags, &timestamp, &sample);
       if (FAILED(hr)) {
         vcam_log("ReadSample failed: 0x%08lx",
                  static_cast<unsigned long>(hr));
@@ -505,7 +515,13 @@ class MfCameraCapturer : public CameraCapturer {
         // The device renegotiated under us (a format change or a resume from
         // sleep). Re-read the geometry rather than converting the next frame
         // with stale dimensions, which reads past the buffer.
-        if (!NegotiateFormat(cap_w_, cap_h_)) break;
+        if (!ReadCurrentFormat()) {
+          // Preserve the existing converter recovery for an unreadable output,
+          // but discard THIS sample: it predates the newly negotiated format.
+          // Only a subsequent ReadSample may use those conversion parameters.
+          if (!NegotiateFormat(cap_w_, cap_h_)) break;
+          continue;
+        }
       }
       // A null sample with no error is a gap, not a failure: MF returns one
       // whenever the timeout elapses with nothing captured.
