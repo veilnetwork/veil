@@ -99,6 +99,45 @@ class ChangedReader final : public IMFSourceReader {
 };
 
 struct MfCameraTestPeer {
+  static bool BufferLayout(const char* label, GUID subtype, UINT32 width,
+                           UINT32 height, INT32 stride, DWORD bytes,
+                           bool expected_format, bool expected_conversion,
+                           bool deliver = true) {
+    ChangedReader reader(subtype, width, height, stride, false, false, false, false);
+    ComPtr<IMFMediaType> type;
+    reader.GetCurrentMediaType(0, &type);
+    type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    type->SetGUID(MF_MT_SUBTYPE, subtype);
+    MFSetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, width, height);
+    type->SetUINT32(MF_MT_DEFAULT_STRIDE, static_cast<UINT32>(stride));
+    MfCameraCapturer camera{CameraFrameCb()};
+    *(&camera.reader_) = &reader;
+    const bool readable = camera.ReadCurrentFormat();
+    libyuv::metadata_conversion_calls = 0;
+    if (readable && deliver) {
+      // Real MF sample/buffer containing opaque bytes. Stand-ins never read or
+      // convert pixels: count whether the production admission reaches libyuv.
+      ComPtr<IMFSample> sample;
+      ComPtr<IMFMediaBuffer> buffer;
+      if (FAILED(MFCreateSample(&sample)) ||
+          FAILED(MFCreateMemoryBuffer(bytes, &buffer))) return false;
+      BYTE* data = nullptr;
+      if (FAILED(buffer->Lock(&data, nullptr, nullptr))) return false;
+      std::memset(data, 0, bytes);
+      buffer->Unlock();
+      buffer->SetCurrentLength(bytes);
+      sample->AddBuffer(buffer.Get());
+      camera.Deliver(sample.Get());
+    }
+    camera.reader_.Reset();
+    const bool ok = readable == expected_format &&
+        libyuv::metadata_conversion_calls == (expected_conversion ? 1 : 0);
+    std::printf("%s: %s (format=%d conversions=%d)\n", label,
+                ok ? "PASS" : "FAIL", readable ? 1 : 0,
+                libyuv::metadata_conversion_calls);
+    return ok;
+  }
+
   static bool FatalFlag(bool with_type_change) {
     ChangedReader reader(MFVideoFormat_NV12, 352, 198, 352, false,
                          with_type_change, with_type_change, false,
@@ -216,6 +255,40 @@ int main() {
     using veil_media::MfCameraTestPeer;
     using veil_media::ChangeOutcome;
     int failed = 0;
+    failed += !MfCameraTestPeer::BufferLayout("NV12 packed layout", MFVideoFormat_NV12,
+        4, 4, 4, 24, true, true);
+    failed += !MfCameraTestPeer::BufferLayout("NV12 padded layout", MFVideoFormat_NV12,
+        4, 4, 8, 48, true, true);
+    failed += !MfCameraTestPeer::BufferLayout("YUY2 packed layout", MFVideoFormat_YUY2,
+        4, 4, 8, 32, true, true);
+    failed += !MfCameraTestPeer::BufferLayout("RGB32 packed layout", MFVideoFormat_RGB32,
+        4, 4, 16, 64, true, true);
+    failed += !MfCameraTestPeer::BufferLayout("RGB32 bottom-up layout", MFVideoFormat_RGB32,
+        4, 4, -16, 64, true, true);
+    failed += !MfCameraTestPeer::BufferLayout("NV12 short row", MFVideoFormat_NV12,
+        4, 4, 2, 12, false, false);
+    failed += !MfCameraTestPeer::BufferLayout("YUY2 short row", MFVideoFormat_YUY2,
+        4, 4, 4, 16, false, false);
+    failed += !MfCameraTestPeer::BufferLayout("RGB32 short row", MFVideoFormat_RGB32,
+        4, 4, 8, 32, false, false);
+    failed += !MfCameraTestPeer::BufferLayout("NV12 odd chroma short row", MFVideoFormat_NV12,
+        3, 4, 3, 18, false, false);
+    failed += !MfCameraTestPeer::BufferLayout("NV12 odd chroma padded row", MFVideoFormat_NV12,
+        3, 4, 4, 24, true, true);
+    failed += !MfCameraTestPeer::BufferLayout("NV12 truncated chroma", MFVideoFormat_NV12,
+        4, 4, 4, 23, true, false);
+    failed += !MfCameraTestPeer::BufferLayout("YUY2 truncated rows", MFVideoFormat_YUY2,
+        4, 4, 8, 31, true, false);
+    failed += !MfCameraTestPeer::BufferLayout("RGB32 truncated rows", MFVideoFormat_RGB32,
+        4, 4, 16, 63, true, false);
+    // Metadata-only adversarial controls: do not allocate from these sizes on
+    // the old implementation. Rejection is checked before calling Deliver.
+    failed += !MfCameraTestPeer::BufferLayout("width outside signed conversion API", MFVideoFormat_NV12,
+        0x80000000u, 4, 4, 1, false, false, false);
+    failed += !MfCameraTestPeer::BufferLayout("height outside signed conversion API", MFVideoFormat_NV12,
+        4, 0x80000000u, 4, 1, false, false, false);
+    failed += !MfCameraTestPeer::BufferLayout("minimum signed RGB stride", MFVideoFormat_RGB32,
+        4, 4, static_cast<INT32>(0x80000000u), 1, false, false, false);
     failed += !MfCameraTestPeer::FatalFlag(false);
     failed += !MfCameraTestPeer::FatalFlag(true);
     failed += !MfCameraTestPeer::CaptureEvidence(true);
