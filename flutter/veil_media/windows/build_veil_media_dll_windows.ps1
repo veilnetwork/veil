@@ -64,6 +64,9 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $srcDir = (Resolve-Path (Join-Path $PSScriptRoot '..\src')).Path
+$provenance = Join-Path $PSScriptRoot '..\source_provenance.py'
+$sourceDigest = (& python $provenance --source $srcDir)
+if ($LASTEXITCODE -ne 0) { throw 'native media source digest failed' }
 $outDir = Join-Path $WebrtcSrc $WebrtcOut
 $ccJson = Join-Path $outDir 'compile_commands.json'
 
@@ -319,6 +322,9 @@ try {
     $objects + @($webrtcLib) + $cxxObjs + $systemLibs
   & $linker @linkArgs
   if ($LASTEXITCODE -ne 0) { throw 'link failed' }
+
+  & python $provenance --source $srcDir --binary $dll --expected-source $sourceDigest
+  if ($LASTEXITCODE -ne 0) { throw 'native media provenance failed' }
 
   Write-Host "==> done: $dll ($([math]::Round((Get-Item $dll).Length / 1MB, 1)) MB)"
   Write-Host "exported veil_media_* symbols: $($exported.Count)"
