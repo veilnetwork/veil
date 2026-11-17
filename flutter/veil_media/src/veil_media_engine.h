@@ -200,6 +200,8 @@ int veil_media_group_engine_hold_source_growth(VeilGroupMediaEngine *engine, uin
  * all receivers in this engine. Consume fresh counter deltas, not cached
  * totals; a new engine establishes a new baseline. These fields stay local.
  * Free this JSON with veil_media_free_string. */
+/* camera_capturing: 1 live native source, 0 retained stopped source, -1 absent.
+ * External frame producers (e.g. Android) are not diagnosed by this field. */
 char *veil_media_group_engine_get_stats(VeilGroupMediaEngine *engine);
 int veil_media_group_engine_start_camera(VeilGroupMediaEngine *engine,
                                          int width, int height, int fps);
