@@ -2985,6 +2985,7 @@ fn app_send_frame(send: &AppIpcSendPayload, sealed: Option<&[u8]>) -> Vec<u8> {
 /// waiter and an `APP_SEND_OK` per RTP packet only creates reverse IPC traffic
 /// and reader work. If no session to the destination exists,
 /// `APP_SEND_FAILED` with error code [`ipc_send_err::NO_SESSION`] is returned.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_rt_send(
     wh: &mut crate::transport::IpcWriteHalf,
     body: &[u8],
@@ -2993,6 +2994,7 @@ pub(crate) async fn handle_rt_send(
     rate_limiter: &mut Option<TokenBucket>,
     local_priority: u8,
     short_control: bool,
+    recipient_authorization: Option<&dyn veil_types::SessionInstanceLookup>,
 ) -> std::io::Result<()> {
     // Rate check — shared bucket with APP_SEND to prevent RT flooding.
     if rate_limited(wh, rate_limiter).await? {
@@ -3047,19 +3049,46 @@ pub(crate) async fn handle_rt_send(
     } else {
         local_priority.min(3)
     };
-    let sent = if short_control {
-        if local_priority != veil_proto::priority::INTERACTIVE {
-            return Ok(());
+    if short_control && local_priority != veil_proto::priority::INTERACTIVE {
+        return Ok(());
+    }
+    let deadline = std::time::Instant::now() + veil_proto::ipc::LOCAL_SHORT_DATAGRAM_MAX_AGE;
+    let mut devices = reg.devices_of(&send.dst_node_id);
+    if devices.is_empty() {
+        devices.push(send.dst_node_id);
+    }
+    devices.retain(|device| {
+        let Some(lookup) = recipient_authorization else {
+            return true;
+        };
+        let pairing = lookup
+            .own_device_pairing(device)
+            .or_else(|| lookup.session_pairing(device));
+        // A transport alias is not continuing permission to receive call
+        // control. Recheck the exact device of this identity, or the proven
+        // identity of an explicitly addressed physical device. No DHT wait.
+        if device != &send.dst_node_id {
+            pairing.is_none_or(|pair| pair.identity == send.dst_node_id)
+                && lookup.application_device_allowed(&send.dst_node_id, device)
+        } else {
+            pairing.is_none_or(|pair| lookup.application_device_allowed(&pair.identity, device))
         }
-        reg.send_to_peer_or_identity_before(
-            &send.dst_node_id,
-            source_lane,
-            frame,
-            std::time::Instant::now() + veil_proto::ipc::LOCAL_SHORT_DATAGRAM_MAX_AGE,
-        )
-    } else {
-        reg.send_to_peer_or_identity(&send.dst_node_id, source_lane, frame)
-    };
+    });
+    let mut sent = false;
+    if let Some((last, rest)) = devices.split_last() {
+        for device in rest {
+            sent |= if short_control {
+                reg.send_to_before(device, source_lane, frame.clone(), deadline)
+            } else {
+                reg.send_to(device, source_lane, frame.clone())
+            };
+        }
+        sent |= if short_control {
+            reg.send_to_before(last, source_lane, frame, deadline)
+        } else {
+            reg.send_to(last, source_lane, frame)
+        };
+    }
     crate::route_trace::sealed_rt_local_sample(
         if sent {
             "direct_queued"
@@ -3369,6 +3398,142 @@ mod ratchet_send_tests {
         family: Vec<[u8; 32]>,
     }
 
+    struct RtRecipients {
+        family: Vec<[u8; 32]>,
+        sent: Mutex<Vec<[u8; 32]>>,
+    }
+    impl FrameBroadcaster for RtRecipients {
+        fn send_to(&self, peer: &[u8; 32], _: u8, _: Vec<u8>) -> bool {
+            lock!(self.sent).push(*peer);
+            true
+        }
+        fn send_to_before(
+            &self,
+            peer: &[u8; 32],
+            lane: u8,
+            bytes: Vec<u8>,
+            deadline: std::time::Instant,
+        ) -> bool {
+            assert!(deadline > std::time::Instant::now());
+            self.send_to(peer, lane, bytes)
+        }
+        fn devices_of(&self, identity: &[u8; 32]) -> Vec<[u8; 32]> {
+            if identity == &PEER {
+                self.family.clone()
+            } else {
+                Vec::new()
+            }
+        }
+        fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {}
+        fn active_node_ids(&self) -> Vec<[u8; 32]> {
+            self.family.clone()
+        }
+    }
+    struct RtAuthorization(Vec<[u8; 32]>);
+    impl veil_types::SessionInstanceLookup for RtAuthorization {
+        fn session_instance(&self, _: &[u8; 32]) -> Option<[u8; 16]> {
+            Some([7; 16])
+        }
+        fn session_pairing(&self, _: &[u8; 32]) -> Option<veil_types::SessionPairing> {
+            Some(veil_types::SessionPairing {
+                identity: PEER,
+                instance: [7; 16],
+            })
+        }
+        fn application_device_allowed(&self, identity: &[u8; 32], device: &[u8; 32]) -> bool {
+            assert_eq!(identity, &PEER);
+            !self.0.contains(device)
+        }
+    }
+    async fn send_rt_recipient_case(
+        dst: [u8; 32],
+        family: Vec<[u8; 32]>,
+        denied: Option<Vec<[u8; 32]>>,
+        short: bool,
+    ) -> Vec<[u8; 32]> {
+        let capture = RtRecipients {
+            family,
+            sent: Mutex::new(Vec::new()),
+        };
+        let authorization = denied.map(RtAuthorization);
+        let mut wh = sink().await;
+        let send = AppIpcRtSendPayload {
+            dst_node_id: dst,
+            src_app_id: [1; 32],
+            dst_app_id: [2; 32],
+            endpoint_id: 13,
+            seq: 0,
+            timestamp_us: 0,
+            marker: 0,
+            payload_type: 0,
+            data: vec![1; 32],
+        }
+        .encode();
+        handle_rt_send(
+            &mut wh,
+            &send,
+            Some(&capture),
+            None,
+            &mut None,
+            veil_proto::priority::INTERACTIVE,
+            short,
+            authorization
+                .as_ref()
+                .map(|value| value as &dyn veil_types::SessionInstanceLookup),
+        )
+        .await
+        .unwrap();
+        capture.sent.into_inner().unwrap()
+    }
+    #[tokio::test]
+    async fn realtime_recipient_fence_excludes_revoked_sibling_and_keeps_valid_sibling() {
+        for short in [false, true] {
+            assert_eq!(
+                send_rt_recipient_case(
+                    PEER,
+                    vec![[0xA; 32], [0xB; 32]],
+                    Some(vec![[0xB; 32]]),
+                    short
+                )
+                .await,
+                vec![[0xA; 32]]
+            );
+        }
+    }
+    #[tokio::test]
+    async fn realtime_recipient_fence_rejects_all_revoked_without_identity_fallback() {
+        for short in [false, true] {
+            assert!(
+                send_rt_recipient_case(PEER, vec![[0xB; 32]], Some(vec![[0xB; 32]]), short)
+                    .await
+                    .is_empty()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn realtime_recipient_fence_checks_explicit_authenticated_device() {
+        for short in [false, true] {
+            assert!(
+                send_rt_recipient_case([0xB; 32], Vec::new(), Some(vec![[0xB; 32]]), short)
+                    .await
+                    .is_empty()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn realtime_recipient_controls_keep_legacy_and_authorized_fanout() {
+        for short in [false, true] {
+            assert_eq!(
+                send_rt_recipient_case(PEER, vec![[0xA; 32], [0xB; 32]], None, short).await,
+                vec![[0xA; 32], [0xB; 32]]
+            );
+            assert_eq!(
+                send_rt_recipient_case(PEER, vec![[0xA; 32]], Some(Vec::new()), short).await,
+                vec![[0xA; 32]]
+            );
+        }
+    }
+
     struct LaneCapture(Mutex<Vec<(u8, Vec<u8>)>>, Vec<[u8; 32]>);
 
     impl Default for LaneCapture {
@@ -3449,6 +3614,7 @@ mod ratchet_send_tests {
             &mut None,
             veil_proto::priority::INTERACTIVE,
             true,
+            None,
         )
         .await
         .unwrap();
@@ -3877,9 +4043,18 @@ mod ratchet_send_tests {
             veil_proto::priority::BULK,
             veil_proto::priority::BACKGROUND,
         ] {
-            handle_rt_send(&mut wh, &send, Some(&capture), None, &mut None, lane, false)
-                .await
-                .unwrap();
+            handle_rt_send(
+                &mut wh,
+                &send,
+                Some(&capture),
+                None,
+                &mut None,
+                lane,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
             let (priority, bytes) = lock!(capture.0).pop().unwrap();
             assert_eq!(
                 priority,
