@@ -39,9 +39,14 @@ patch applies to production builds, not to an excluded crate's own workspace):
 cargo test --manifest-path third_party/quinn-proto/Cargo.toml --lib
 cargo update --manifest-path third_party/quinn/Cargo.toml \
   --config 'patch.crates-io.quinn-proto.path="ABSOLUTE_PATH_TO/quinn-proto"' \
-  -p quinn-proto --precise 0.11.18
+  -p quinn-proto --precise 0.11.19
+cargo update --manifest-path third_party/quinn/Cargo.toml \
+  --config 'patch.crates-io.quinn-proto.path="ABSOLUTE_PATH_TO/quinn-proto"' \
+  --config 'patch.crates-io.quinn-udp.path="ABSOLUTE_PATH_TO/quinn-udp"' \
+  -p quinn-udp --precise 0.5.16
 cargo test --manifest-path third_party/quinn/Cargo.toml \
   --config 'patch.crates-io.quinn-proto.path="ABSOLUTE_PATH_TO/quinn-proto"' \
+  --config 'patch.crates-io.quinn-udp.path="ABSOLUTE_PATH_TO/quinn-udp"' \
   --no-default-features --features runtime-tokio,rustls-aws-lc-rs --lib
 ```
 
@@ -50,3 +55,5 @@ the root Cargo.lock with both path patches already selected.
 
 Verify versions with `scripts/check-quinn-provenance.py`
 before updating the manifest; compare the listed archive bytes before bumping a pin.
+
+The registry bases now include upstream stream-limit, Initial-token and truncated-UDP-receive fixes (quinn-proto 0.11.19, quinn-udp 0.5.16). Local expiration, pacing, timestamp metadata and Apple batching patches are retained.
