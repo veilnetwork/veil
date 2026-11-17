@@ -48,6 +48,7 @@
 #include <cstdlib>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -488,13 +489,14 @@ class MfCameraCapturer : public CameraCapturer {
     // that does not happen to already carry it.
     GUID subtype = {};
     if (FAILED(got->GetGUID(MF_MT_SUBTYPE, &subtype))) return false;
+    Fmt format = Fmt::kUnknown;
     if (subtype == MFVideoFormat_NV12) {
-      fmt_ = Fmt::kNv12;
+      format = Fmt::kNv12;
     } else if (subtype == MFVideoFormat_YUY2) {
-      fmt_ = Fmt::kYuy2;
+      format = Fmt::kYuy2;
     } else if (subtype == MFVideoFormat_RGB32 ||
                subtype == MFVideoFormat_ARGB32) {
-      fmt_ = Fmt::kRgb32;
+      format = Fmt::kRgb32;
     } else {
       vcam_log("unsupported capture subtype; no local video");
       return false;
@@ -502,11 +504,21 @@ class MfCameraCapturer : public CameraCapturer {
 
     UINT32 w = 0, h = 0;
     if (FAILED(MFGetAttributeSize(got.Get(), MF_MT_FRAME_SIZE, &w, &h)) ||
-        w == 0 || h == 0) {
+        w == 0 || h == 0 ||
+        w > static_cast<UINT32>((std::numeric_limits<int>::max)()) ||
+        h > static_cast<UINT32>((std::numeric_limits<int>::max)())) {
       return false;
     }
-    cap_w_ = static_cast<int>(w);
-    cap_h_ = static_cast<int>(h);
+    // libyuv receives signed dimensions/strides. A source must have room for
+    // the whole row, including the final UV pair of an odd-width YUV image.
+    // A stride-sized buffer is not safe if the converter reads a wider row.
+    const uint64_t chroma_width = (static_cast<uint64_t>(w) + 1) / 2;
+    const uint64_t minimum_stride = format == Fmt::kNv12 ? chroma_width * 2
+        : format == Fmt::kYuy2 ? chroma_width * 4
+                              : static_cast<uint64_t>(w) * 4;
+    if (minimum_stride > static_cast<uint64_t>((std::numeric_limits<int>::max)())) {
+      return false;
+    }
 
     // MF_MT_DEFAULT_STRIDE is optional and often absent on capture types. The
     // packed default is right for a contiguous buffer, which is what
@@ -517,14 +529,22 @@ class MfCameraCapturer : public CameraCapturer {
     // IMFAttributes has no GetINT32 at all — the round-trip through UINT32 is
     // the documented way to read it, not a shortcut.
     UINT32 stride_bits = 0;
+    int64_t stride = static_cast<int64_t>(minimum_stride);
     if (SUCCEEDED(got->GetUINT32(MF_MT_DEFAULT_STRIDE, &stride_bits)) &&
         stride_bits != 0) {
-      cap_stride_ = static_cast<int>(static_cast<INT32>(stride_bits));
-    } else {
-      cap_stride_ = fmt_ == Fmt::kYuy2   ? cap_w_ * 2
-                    : fmt_ == Fmt::kRgb32 ? cap_w_ * 4
-                                          : cap_w_;
+      stride = static_cast<INT32>(stride_bits);
     }
+    const uint64_t absolute_stride = static_cast<uint64_t>(stride < 0 ? -stride : stride);
+    if (absolute_stride < minimum_stride ||
+        absolute_stride > static_cast<uint64_t>((std::numeric_limits<int>::max)())) {
+      return false;
+    }
+    // Publish only a fully checked layout. Failed observation must not poison
+    // the previous geometry used by bounded format-recovery negotiation.
+    fmt_ = format;
+    cap_w_ = static_cast<int>(w);
+    cap_h_ = static_cast<int>(h);
+    cap_stride_ = static_cast<int>(stride);
     return true;
   }
 
@@ -609,7 +629,19 @@ class MfCameraCapturer : public CameraCapturer {
     }
 
     const int w = cap_w_, h = cap_h_;
-    const int cw = (w + 1) / 2, ch = (h + 1) / 2;
+    const int cw = w / 2 + w % 2, ch = h / 2 + h % 2;
+    const int stride = fmt_ == Fmt::kRgb32 ? cap_stride_
+        : cap_stride_ > 0 ? cap_stride_
+        : fmt_ == Fmt::kYuy2 ? cw * 4 : cw * 2;
+    const uint64_t absolute_stride = static_cast<uint64_t>(
+        stride < 0 ? -static_cast<int64_t>(stride) : stride);
+    const uint64_t rows = static_cast<uint64_t>(h) + (fmt_ == Fmt::kNv12 ? ch : 0);
+    // Check source extent in wide arithmetic BEFORE allocating I420 planes.
+    // The old packed-YUY2 DWORD product could wrap and admit a short buffer.
+    if (absolute_stride * rows > len) {
+      buffer->Unlock();
+      return false;
+    }
     y_.resize(static_cast<size_t>(w) * h);
     u_.resize(static_cast<size_t>(cw) * ch);
     v_.resize(static_cast<size_t>(cw) * ch);
@@ -617,26 +649,15 @@ class MfCameraCapturer : public CameraCapturer {
     int rc = -1;
     switch (fmt_) {
       case Fmt::kNv12: {
-        const int stride = cap_stride_ > 0 ? cap_stride_ : w;
         // The chroma plane follows the luma plane in a contiguous NV12 buffer,
         // interleaved UV at the same stride over half the rows.
         const size_t luma = static_cast<size_t>(stride) * h;
-        const size_t chroma = static_cast<size_t>(stride) * ch;
-        // BOTH PLANES. Checking only the luma left `NV12ToI420` free to read
-        // `chroma` bytes past the end of a short buffer: the guard proved the
-        // start of the chroma plane was inside the sample and said nothing
-        // about its length. The YUY2 and RGB32 arms beside this one always
-        // required their whole plane, so this was an oversight rather than a
-        // decision -- and the sample comes from a driver, which is not a place
-        // to take lengths on trust.
-        if (len < luma || len - luma < chroma) break;  // truncated; drop it
+        // The common extent check covers both luma and interleaved chroma.
         rc = libyuv::NV12ToI420(data, stride, data + luma, stride, y_.data(), w,
                                 u_.data(), cw, v_.data(), cw, w, h);
         break;
       }
       case Fmt::kYuy2: {
-        const int stride = cap_stride_ > 0 ? cap_stride_ : w * 2;
-        if (len < static_cast<DWORD>(stride) * h) break;
         rc = libyuv::YUY2ToI420(data, stride, y_.data(), w, u_.data(), cw,
                                 v_.data(), cw, w, h);
         break;
@@ -645,12 +666,8 @@ class MfCameraCapturer : public CameraCapturer {
         // A negative default stride is MF's way of saying bottom-up. libyuv
         // takes that convention directly, so pass the sign through and point
         // at the last row when it is negative.
-        const int stride = cap_stride_ != 0 ? cap_stride_ : w * 4;
-        const size_t need = static_cast<size_t>(stride < 0 ? -stride : stride) *
-                            static_cast<size_t>(h);
-        if (len < need) break;
         const uint8_t* src =
-            stride < 0 ? data + static_cast<size_t>(-stride) * (h - 1) : data;
+            stride < 0 ? data + static_cast<size_t>(absolute_stride) * (h - 1) : data;
         rc = libyuv::ARGBToI420(src, stride, y_.data(), w, u_.data(), cw,
                                 v_.data(), cw, w, h);
         break;
@@ -663,7 +680,7 @@ class MfCameraCapturer : public CameraCapturer {
 
     if (target_w_ > 0 && w > target_w_) {
       const int ow = target_w_ & ~1;             // even width
-      int oh = ((h * ow / w) + 1) & ~1;          // aspect-preserved, even
+      int oh = static_cast<int>(((static_cast<int64_t>(h) * ow / w) + 1) & ~int64_t{1});
       if (oh < 2) oh = 2;
       const int ocw = (ow + 1) / 2, och = (oh + 1) / 2;
       sy_.resize(static_cast<size_t>(ow) * oh);
