@@ -225,9 +225,33 @@ pub(crate) fn relayed_unopenable_signer(
 pub(crate) struct OwnDeviceAwareLookup {
     pub(crate) sessions: veil_session::glue::SessionInstanceDirectory,
     pub(crate) sovereign: super::identity_state::SovereignIdentityCell,
+    pub(crate) peer_authorization: Arc<MlKemCertStore>,
 }
 
 impl veil_types::SessionInstanceLookup for OwnDeviceAwareLookup {
+    fn application_device_allowed(&self, identity: &[u8; 32], device: &[u8; 32]) -> bool {
+        let now = veil_util::unix_secs_now_u64();
+        if let Some(sovereign) = self.sovereign.get()
+            && &sovereign.document.node_id == identity
+        {
+            let doc = &sovereign.document;
+            return doc.valid_until_unix >= now
+                && !doc
+                    .revoked_devices
+                    .iter()
+                    .any(|revoked| &revoked.device_id == device)
+                && doc.identity_keys.iter().any(|key| {
+                    &key.device_id == device
+                        && key.valid_from_unix <= now
+                        && now <= key.valid_until_unix
+                });
+        }
+        self.peer_authorization
+            .document_floor
+            .device_proof_policy(identity, device, now)
+            .unwrap_or(true)
+    }
+
     fn supports_direct_app_chunks(&self, peer_node_id: &[u8; 32]) -> bool {
         self.sessions.supports_direct_app_chunks(peer_node_id)
     }

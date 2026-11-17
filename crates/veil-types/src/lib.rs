@@ -495,6 +495,13 @@ pub struct VerifiedPeerCert {
 /// sovereign identity" (a legacy peer) — callers keep their singular,
 /// identity-addressed behaviour for both.
 pub trait SessionInstanceLookup: Send + Sync {
+    /// Recheck an already authenticated application recipient against current
+    /// authorization. This never authenticates a new pairing. Minimal/legacy
+    /// adapters have no document fence and retain their existing behavior.
+    fn application_device_allowed(&self, _identity: &[u8; 32], _device: &[u8; 32]) -> bool {
+        true
+    }
+
     /// The live authenticated session advertised the typed direct chunk decoder.
     /// Never infer this from cached discovery records or transport type.
     fn supports_direct_app_chunks(&self, _peer_node_id: &[u8; 32]) -> bool {

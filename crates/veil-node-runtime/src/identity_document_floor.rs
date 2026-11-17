@@ -297,22 +297,36 @@ impl IdentityDocumentFloor {
     /// host application. This does not authenticate an anonymous stream claim.
     /// Unknown, expired or not-yet-checkpointed documents cannot preserve it.
     pub(crate) fn allows_device_proof(&self, peer: &[u8; 32], device: &[u8; 32], now: u64) -> bool {
+        self.device_proof_policy(peer, device, now).unwrap_or(false)
+    }
+
+    /// Restrict a session binding without inventing authority for an unknown
+    /// identity. An attached host must checkpoint even its first document;
+    /// a standalone legacy session can have no document floor at all.
+    pub(crate) fn device_proof_policy(
+        &self,
+        peer: &[u8; 32],
+        device: &[u8; 32],
+        now: u64,
+    ) -> Option<bool> {
         let state = lock!(self.state);
         if state.unreadable || (self.path.is_some() && state.dirty) {
-            return false;
+            return Some(false);
         }
         let Some(floor) = state.rows.get(peer) else {
-            return false;
+            return state.host_restored.then_some(false);
         };
         let doc = &floor.document;
-        (!state.host_restored || floor.changed_revision <= state.durable_revision)
-            && doc.valid_until_unix >= now
-            && !doc.revoked_devices.iter().any(|r| &r.device_id == device)
-            && doc.identity_keys.iter().any(|key| {
-                &key.device_id == device
-                    && key.valid_from_unix <= now
-                    && now <= key.valid_until_unix
-            })
+        Some(
+            (!state.host_restored || floor.changed_revision <= state.durable_revision)
+                && doc.valid_until_unix >= now
+                && !doc.revoked_devices.iter().any(|r| &r.device_id == device)
+                && doc.identity_keys.iter().any(|key| {
+                    &key.device_id == device
+                        && key.valid_from_unix <= now
+                        && now <= key.valid_until_unix
+                }),
+        )
     }
 
     pub(crate) fn ephemeral() -> Self {
@@ -771,8 +785,13 @@ mod tests {
         let before = document(91, 1000, false);
         let old = before.identity_keys[0].device_id;
         assert!(!store.allows_device_proof(&before.node_id, &old, 1000));
+        assert_eq!(store.device_proof_policy(&before.node_id, &old, 1000), None);
         assert!(store.observe(&before, 1000));
         assert!(store.allows_device_proof(&before.node_id, &old, 1000));
+        assert_eq!(
+            store.device_proof_policy(&before.node_id, &old, 1000),
+            Some(true)
+        );
         assert!(!store.allows_device_proof(&[0; 32], &old, 1000));
         assert!(!store.allows_device_proof(&before.node_id, &[0; 32], 1000));
         let master = SigningKey::from_bytes(&blake3::derive_key(
@@ -810,6 +829,10 @@ mod tests {
         next.document_sig = next_signer.sign(&signed).to_bytes().to_vec();
         assert!(store.observe(&next, 1001));
         assert!(!store.allows_device_proof(&before.node_id, &old, 1001));
+        assert_eq!(
+            store.device_proof_policy(&before.node_id, &old, 1001),
+            Some(false)
+        );
         assert!(store.allows_device_proof(&next.node_id, &next.identity_keys[0].device_id, 1001));
         assert!(!store.observe(&before, 1002));
         assert!(!store.allows_device_proof(&before.node_id, &old, 1002));
@@ -823,14 +846,30 @@ mod tests {
             .unwrap();
         let doc = document(93, 1000, false);
         let device = doc.identity_keys[0].device_id;
+        assert_eq!(
+            store.device_proof_policy(&doc.node_id, &device, 1000),
+            Some(false)
+        );
         assert!(store.observe(&doc, 1000));
         assert!(!store.allows_device_proof(&doc.node_id, &device, 1000));
+        assert_eq!(
+            store.device_proof_policy(&doc.node_id, &device, 1000),
+            Some(false)
+        );
         store.acknowledge_host(store.revision()).unwrap();
         assert!(store.allows_device_proof(&doc.node_id, &device, 1000));
+        assert_eq!(
+            store.device_proof_policy(&doc.node_id, &device, 1000),
+            Some(true)
+        );
         assert!(!store.allows_device_proof(&doc.node_id, &device, 0));
         assert!(!store.allows_device_proof(&doc.node_id, &device, doc.valid_until_unix + 1));
         lock!(store.state).unreadable = true;
         assert!(!store.allows_device_proof(&doc.node_id, &device, 1000));
+        assert_eq!(
+            store.device_proof_policy(&doc.node_id, &device, 1000),
+            Some(false)
+        );
     }
 
     #[test]

@@ -3013,6 +3013,7 @@ async fn handle_ipc_client(
                                 &mut rate_limiter,
                                 hdr.priority(),
                                 hdr.flags & veil_proto::ipc::IPC_HEADER_SHORT_DATAGRAM != 0,
+                                session_instance_lookup.as_deref(),
                             ).await?;
                         }
                     }

@@ -427,6 +427,7 @@ impl NodeRuntime {
                 // no live session is keyed by the identity it answers under, not
                 // by the device id.
                 sovereign: self.identity.sovereign_identity.clone(),
+                peer_authorization: Arc::clone(&self.identity.peer_mlkem_cert_store),
             });
         *self
             .dispatcher
