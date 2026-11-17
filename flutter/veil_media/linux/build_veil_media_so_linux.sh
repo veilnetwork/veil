@@ -21,6 +21,8 @@ set -euo pipefail
 WEBRTC_SRC="${WEBRTC_SRC:-/webrtc/src}"
 WEBRTC_OUT="${WEBRTC_OUT:-out/linux-x64}"
 SRCDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../src" && pwd)"
+PROVENANCE="$SRCDIR/../source_provenance.py"
+SOURCE_DIGEST="$(python3 "$PROVENANCE" --source "$SRCDIR")"
 DEST="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 mkdir -p "$DEST"
 
@@ -123,6 +125,8 @@ if [ -z "${VEIL_MEDIA_NO_STRIP:-}" ] && [ -x "$STRIP" ]; then
 fi
 
 NM="$(dirname "$CLANGXX")/llvm-nm"
+python3 "$PROVENANCE" --source "$SRCDIR" --binary "$DEST/libveil_media.so" \
+  --expected-source "$SOURCE_DIGEST"
 echo "==> done: $DEST/libveil_media.so ($(du -h "$DEST/libveil_media.so" | cut -f1))"
 "$NM" -D --defined-only "$DEST/libveil_media.so" 2>/dev/null | grep -c " T veil_media_" | xargs echo "exported veil_media_* symbols:"
 echo "--- undefined veil_media_* (expect send_datagram + set_recv_callback) ---"

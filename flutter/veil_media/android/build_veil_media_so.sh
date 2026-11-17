@@ -37,6 +37,8 @@ case "$ANDROID_TARGET" in
 esac
 WEBRTC_OUT="${WEBRTC_OUT:-out/$ANDROID_TARGET}"
 SRCDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../src" && pwd)"
+PROVENANCE="$SRCDIR/../source_provenance.py"
+SOURCE_DIGEST="$(python3 "$PROVENANCE" --source "$SRCDIR")"
 DEST="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/jniLibs/$ANDROID_ABI_DIR}"
 mkdir -p "$DEST"
 
@@ -223,5 +225,7 @@ else
   echo "WARN: patchelf missing — add DT_NEEDED libveilclient_ffi.so manually" >&2
 fi
 
+python3 "$PROVENANCE" --source "$SRCDIR" --binary "$DEST/libveil_media.so" \
+  --expected-source "$SOURCE_DIGEST"
 echo "==> done: $DEST/libveil_media.so ($(du -h "$DEST/libveil_media.so" | cut -f1))"
 "${CLANGXX%clang++}llvm-nm" -D --defined-only "$DEST/libveil_media.so" 2>/dev/null | grep -c " T veil_media_" | xargs echo "exported veil_media_* symbols:"
