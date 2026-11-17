@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+## v0.11.53 — 2026-11-17
+
+### Fixed
+
+- Respect Media Foundation camera format changes, stop reads after terminal
+  capture errors and validate frame stride and dimensions before conversion.
+  Retain numeric capture diagnostics when a camera fails to start.
+- Expose actual group camera capture state so the host can stop advertising
+  video after its source has stopped.
+- Expose an owned Android daemon retirement boundary so hosts can verify native
+  resource release before profile erasure instead of trusting a Dart cache.
+
+### Dependencies and release validation
+
+- Update libz-sys to 1.1.33 and the vendored Quinn protocol/UDP bases to
+  0.11.19 / 0.5.16. Keep local transport extensions and audit registry bases
+  behind path overrides as well as the main and independent fuzz lockfiles.
+- Bind generated media libraries to the source digest captured before build
+  and the final postprocessed binary SHA. Carry producer records into platform
+  staging so unchanged exports cannot admit an older implementation.
+
+These changes do not establish the cause of the reported Windows 10 camera
+failure or every interruption during mobile network handover.
+
 ## v0.11.52 — 2026-11-13
 
 ### Fixed
