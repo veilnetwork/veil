@@ -3044,6 +3044,11 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   // falls back to video ingress. These fields are endpoint-local JSON only.
   std::string snapshot(json, static_cast<size_t>(written) - 1);
   snapshot += audio_processing_stats(ws->apm.get());
+  // A retained capturer may have stopped after startup (device removal/read
+  // failure). Keep that distinct from no native source, including Android's
+  // externally supplied frames. Encoding or transport counters cannot tell.
+  snapshot += ",\"camera_capturing\":" + std::to_string(
+      ws->camera ? (ws->camera->Capturing() ? 1 : 0) : -1);
   const auto frame_budget = ws->video_frame_budget->snapshot();
   snapshot += ",\"video_frame_budget_bytes\":" + std::to_string(frame_budget.bytes) +
               ",\"video_frame_pixel_cap\":" + std::to_string(frame_budget.max_pixels) +
