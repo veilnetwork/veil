@@ -54,6 +54,11 @@ ignore = [
     # The advisory is maintenance-only. Remove when netlink-packet-core drops
     # paste; no runtime vulnerability is being accepted here.
     "RUSTSEC-2024-0436", # paste — unmaintained (netlink macro dependency)
+    # chrono is required by the exact tun2proxy pin. This advisory records
+    # maintenance status only, with no patched version or reported exploit.
+    # Remove when upstream replaces its time dependency; do not relax the
+    # separate vulnerability gate (including the libz-sys patch).
+    "RUSTSEC-2026-0543", # chrono — unmaintained (tun2proxy dependency)
 ]
 
 [licenses]

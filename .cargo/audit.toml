@@ -34,4 +34,10 @@ ignore = [
     # maintenance-only and reports no vulnerability. Track upstream
     # netlink-packet-core and remove this exception once it drops paste.
     "RUSTSEC-2024-0436", # paste unmaintained
+
+    # The exact tun2proxy pin also requires chrono for its time/logging code.
+    # RustSec classifies this as maintenance-only, with no patched release or
+    # reported vulnerability. Keep the reviewed VPN-helper dependency pin;
+    # remove this exception when upstream switches to a maintained time crate.
+    "RUSTSEC-2026-0543", # chrono unmaintained (tun2proxy dependency)
 ]
