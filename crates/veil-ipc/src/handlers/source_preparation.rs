@@ -42,9 +42,11 @@ pub(crate) fn prepare(
         return State::Unsupported;
     }
     let mut result = State::Ready;
+    let mut any_ready = false;
     for peer in peers {
         let state =
             registry.prepare_local_datagram_channel(&peer, request.local_lane, request.refresh);
+        any_ready |= state == State::Ready;
         // Request every candidate, even if an earlier one cannot prepare.
         result = match (result, state) {
             (State::Unsupported, _) | (_, State::Unsupported) => State::Unsupported,
@@ -52,7 +54,14 @@ pub(crate) fn prepare(
             _ => State::Ready,
         };
     }
-    result
+    // Relayed sends prefer a ready first hop, so its local readiness is
+    // enough to start probing delivery. Direct aliases still cover every
+    // device. The relay's readiness does not attest to end-to-end delivery.
+    if request.relayed && any_ready {
+        State::Ready
+    } else {
+        result
+    }
 }
 
 #[cfg(test)]
@@ -63,6 +72,7 @@ mod tests {
     struct Registry {
         calls: Mutex<Vec<([u8; 32], u8)>>,
         state: State,
+        alternate: Option<([u8; 32], State)>,
         datagram_hop: Option<[u8; 32]>,
     }
     impl FrameBroadcaster for Registry {
@@ -74,7 +84,9 @@ mod tests {
         }
         fn prepare_local_datagram_channel(&self, peer: &[u8; 32], lane: u8, _: bool) -> State {
             self.calls.lock().unwrap().push((*peer, lane));
-            self.state
+            self.alternate
+                .filter(|(hop, _)| hop == peer)
+                .map_or(self.state, |(_, state)| state)
         }
         fn send_to(&self, _: &[u8; 32], _: u8, _: Vec<u8>) -> bool {
             panic!("preparation must not forward a packet")
@@ -106,6 +118,7 @@ mod tests {
         Registry {
             calls: Mutex::new(vec![]),
             state,
+            alternate: None,
             datagram_hop: None,
         }
     }
@@ -125,6 +138,31 @@ mod tests {
                 ([2; 32], veil_proto::priority::BULK),
             ]
         );
+    }
+
+    #[test]
+    fn relay_preparation_reports_ready_when_either_preferred_hop_can_send() {
+        for other in [State::Warming, State::Unsupported] {
+            for (first, second) in [(State::Ready, other), (other, State::Ready)] {
+                let mut r = registry(first);
+                r.alternate = Some(([3; 32], second));
+                assert_eq!(
+                    prepare(&request(true).encode(), true, |_| true, Some(&r), None),
+                    State::Ready
+                );
+                assert_eq!(
+                    *r.calls.lock().unwrap(),
+                    vec![
+                        ([2; 32], veil_proto::priority::BULK),
+                        ([3; 32], veil_proto::priority::BULK),
+                    ]
+                );
+                assert_eq!(
+                    prepare(&request(false).encode(), true, |_| true, Some(&r), None),
+                    other
+                );
+            }
+        }
     }
 
     #[test]

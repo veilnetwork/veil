@@ -29,8 +29,9 @@ where
     Q: FnMut(u8, bool) -> F,
     F: std::future::Future<Output = Result<Option<State>, ClientError>>,
 {
-    tokio::time::timeout(budget, async {
-        let mut states = [None; LANES.len()];
+    let started = Instant::now();
+    let mut states = [None; LANES.len()];
+    let result = tokio::time::timeout(budget, async {
         let mut begun = [false; LANES.len()];
         let mut last_primary_check: Option<Instant> = None;
         loop {
@@ -90,8 +91,21 @@ where
             tokio::time::sleep(delay).await;
         }
     })
-    .await
-    .unwrap_or(false)
+    .await;
+    if veil_session::rt_trace::rt_trace_enabled() {
+        log::info!(
+            "media.source_prepare ready={} deadline_reached={} elapsed_ms={} primary={:?} video={:?} screen={:?} data={:?} signaling={:?}",
+            matches!(result, Ok(true)),
+            result.is_err(),
+            started.elapsed().as_millis(),
+            states[0],
+            states[1],
+            states[2],
+            states[3],
+            states[4],
+        );
+    }
+    result.unwrap_or(false)
 }
 
 pub(super) fn prepare_app_sources(app: &VeilApp, peer: [u8; 32], relayed: bool) -> bool {
