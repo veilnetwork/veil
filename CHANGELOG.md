@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## v0.11.54 — 2026-11-18
+
+### Fixed
+
+- Recheck realtime recipients against current device authorization before
+  sending. Expose verified device revocations to hosts with identity scoping
+  so they can retire cached device routes.
+- Keep the host application's signal handlers in charge when an embedded
+  node starts or stops.
+
+### Diagnostics
+
+- Correlate physical TCP dial starts with their local connection attempts in
+  operator traces. Add regression coverage for data delivery during session
+  replacement and for an ordered connection pool with stalled handshakes.
+
 ## v0.11.53 — 2026-11-17
 
 ### Fixed
