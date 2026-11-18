@@ -526,3 +526,7 @@ mod circuit_channel_isolation_tests;
 #[cfg(test)]
 #[path = "ordered_binding_progress_tests.rs"]
 mod ordered_binding_progress_tests;
+
+#[cfg(test)]
+#[path = "ordered_outgoing_progress_tests.rs"]
+mod ordered_outgoing_progress_tests;
