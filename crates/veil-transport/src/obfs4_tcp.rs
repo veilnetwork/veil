@@ -130,7 +130,11 @@ pub(crate) async fn connect_obfs4_stream(
     let (host, port) = obfs4_parts(uri)?;
     let psk = psk_from_context(&ctx)?;
     let tcp = connect_tcp_stream(host, port, &ctx).await?;
-    let stream = HandshakeStream::new(tcp, HandshakeSide::Client);
+    let stream = HandshakeStream::new_in_context(
+        tcp,
+        HandshakeSide::Client,
+        ctx.tracing.tcp_connect_context(),
+    );
     let attempt = stream.connection_id();
     let stream = stream.for_attempt(attempt, "primary");
 
@@ -152,8 +156,12 @@ pub(crate) async fn connect_obfs4_stream(
             finish_client_handshake(stream, uri, &psk, ctx.obfs4_client_variant),
             || async {
                 let tcp = connect_tcp_stream(host, port, &ctx).await?;
-                let stream =
-                    HandshakeStream::new(tcp, HandshakeSide::Client).for_attempt(attempt, "backup");
+                let stream = HandshakeStream::new_in_context(
+                    tcp,
+                    HandshakeSide::Client,
+                    ctx.tracing.tcp_connect_context(),
+                )
+                .for_attempt(attempt, "backup");
                 finish_client_handshake(stream, uri, &psk, ctx.obfs4_client_variant).await
             },
             OBFS4_BACKUP_DELAY,
