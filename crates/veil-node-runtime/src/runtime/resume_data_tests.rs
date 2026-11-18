@@ -27,8 +27,8 @@ use veil_transport::{
     PeerMeta, TransportCapabilities, TransportConnection, TransportRegistry, TransportUri,
 };
 
-const APP: [u8; 32] = [0x63; 32];
-const ENDPOINT: u32 = 7;
+pub(super) const APP: [u8; 32] = [0x63; 32];
+pub(super) const ENDPOINT: u32 = 7;
 
 #[derive(Default)]
 struct ShutdownGate {
@@ -216,7 +216,7 @@ async fn connect(
     }
 }
 
-fn payload(seq: u32) -> AppRtDataPayload {
+pub(super) fn payload(seq: u32) -> AppRtDataPayload {
     use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::Aead};
     let mut nonce = [0; 12];
     nonce[..4].copy_from_slice(&seq.to_be_bytes());
@@ -239,7 +239,7 @@ fn payload(seq: u32) -> AppRtDataPayload {
     }
 }
 
-fn frame(payload: &AppRtDataPayload) -> Vec<u8> {
+pub(super) fn frame(payload: &AppRtDataPayload) -> Vec<u8> {
     let body = payload.encode();
     let mut header = FrameHeader::new(FrameFamily::App as u8, AppMsg::AppRtData as u16);
     header.body_len = body.len() as u32;

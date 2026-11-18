@@ -4025,6 +4025,8 @@ mod circuit_admission_tests;
 #[cfg(test)]
 mod network_retirement_tests;
 #[cfg(test)]
+mod ordered_resume_tests;
+#[cfg(test)]
 mod reconnect_wake_tests;
 #[cfg(test)]
 mod resume_data_tests;
