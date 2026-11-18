@@ -1307,17 +1307,16 @@ pub async fn run_foreground(config_path: impl AsRef<Path>, foreground_mode: bool
 /// without any listen ports, so no traffic exists to be ascribed to it.
 pub async fn run_foreground_deferred() -> Result<()> {
     // Convenience wrapper: no external shutdown source (signals / admin-stop
-    // still apply). Embedded hosts (the FFI `veil_node_stop`) want the
-    // shutdown-aware variant below.
+    // still apply). Embedded hosts use `run_embedded_deferred_with_shutdown`
+    // so this CLI loop does not take ownership of their process signals.
     // No work dir: the CLI runs where the platform temp dir is writable.
     run_foreground_deferred_with_shutdown(None, false, None, std::future::pending::<()>()).await
 }
 
 /// As [`run_foreground_deferred`] but awaits an additional `external_shutdown`
-/// future alongside the standard signal handlers — so an embedded host (the
-/// FFI node runtime) can trigger a graceful stop of a deferred-init node.
-/// Without this the deferred node is unstoppable (the bare
-/// [`run_foreground_deferred`] hardcodes a `pending()` shutdown).
+/// future alongside the standard process signal handlers. Embedded hosts must
+/// use [`run_embedded_deferred_with_shutdown`] instead: a node stopped through
+/// this standalone variant still leaves Tokio's process handlers registered.
 ///
 /// `anonymous` arms `[anonymity]` in the stub boot config so the deferred node
 /// is actually onion-reachable once its real identity is applied — see
@@ -1328,6 +1327,54 @@ pub async fn run_foreground_deferred_with_shutdown<F>(
     anonymous: bool,
     work_dir: Option<PathBuf>,
     external_shutdown: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    run_deferred_with_shutdown(
+        admin_endpoint,
+        anonymous,
+        work_dir,
+        external_shutdown,
+        ProcessSignals::Register,
+    )
+    .await
+}
+
+/// Embedded counterpart: the host owns process signals, including SIGHUP.
+/// Dropping a Tokio signal stream does not restore the host's disposition;
+/// therefore an embedded node must never register these streams in the first
+/// place. Stop it through `external_shutdown` or the authenticated admin API.
+pub async fn run_embedded_deferred_with_shutdown<F>(
+    admin_endpoint: Option<String>,
+    anonymous: bool,
+    work_dir: Option<PathBuf>,
+    external_shutdown: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    run_deferred_with_shutdown(
+        admin_endpoint,
+        anonymous,
+        work_dir,
+        external_shutdown,
+        ProcessSignals::PreserveHost,
+    )
+    .await
+}
+
+enum ProcessSignals {
+    Register,
+    PreserveHost,
+}
+
+async fn run_deferred_with_shutdown<F>(
+    admin_endpoint: Option<String>,
+    anonymous: bool,
+    work_dir: Option<PathBuf>,
+    external_shutdown: F,
+    signals: ProcessSignals,
 ) -> Result<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -1394,16 +1441,17 @@ where
     // code leaked the dir to OS reap).
     // The stub's `[identity]` is the placeholder, and the file cannot carry
     // that fact; it is passed alongside instead.
-    let result = run_foreground_marked(&config_path, true, external_shutdown, true).await;
+    let result = run_foreground_marked(&config_path, true, external_shutdown, true, signals).await;
     drop(tmp_dir);
     result
 }
 
 /// As [`run_foreground`] but awaits an additional shutdown future alongside
-/// the standard signal handlers. uses this so the Windows
-/// Service control handler can trigger a graceful stop when SCM sends
+/// the standard signal handlers. The Windows Service control handler uses
+/// this to trigger a graceful stop when SCM sends
 /// `ServiceControl::Stop`: the service module passes a future that resolves
 /// when its stop channel fires.
+/// Embedded libraries use [`run_embedded_with_shutdown`] instead.
 pub async fn run_foreground_with_shutdown<F>(
     config_path: impl AsRef<Path>,
     foreground_mode: bool,
@@ -1412,7 +1460,32 @@ pub async fn run_foreground_with_shutdown<F>(
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    run_foreground_marked(config_path, foreground_mode, external_shutdown, false).await
+    run_foreground_marked(
+        config_path,
+        foreground_mode,
+        external_shutdown,
+        false,
+        ProcessSignals::Register,
+    )
+    .await
+}
+
+/// Run an embedded node without taking over any host process signals.
+pub async fn run_embedded_with_shutdown<F>(
+    config_path: impl AsRef<Path>,
+    external_shutdown: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    run_foreground_marked(
+        config_path,
+        true,
+        external_shutdown,
+        false,
+        ProcessSignals::PreserveHost,
+    )
+    .await
 }
 
 /// The foreground loop, told whether the config's `[identity]` is the
@@ -1423,10 +1496,12 @@ async fn run_foreground_marked<F>(
     foreground_mode: bool,
     external_shutdown: F,
     ephemeral_identity: bool,
+    signals: ProcessSignals,
 ) -> Result<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    let register_process_signals = matches!(signals, ProcessSignals::Register);
     let config_path = config_path.as_ref().to_path_buf();
     let config = veil_cfg::load_config(&config_path)?;
     // Default runtime_dir = config file's parent. Multi-node setups are then
@@ -1439,7 +1514,9 @@ where
     // Reload config on SIGHUP — Unix-only; the helper itself is gated and
     // absent on Windows, so we omit the call entirely there.
     #[cfg(unix)]
-    spawn_sighup_reloader(Arc::clone(&runtime));
+    if register_process_signals {
+        spawn_sighup_reloader(Arc::clone(&runtime));
+    }
 
     prepare_admin_endpoint(&endpoint).await?;
     let (listener, anchor_path) = bind_admin_endpoint(&endpoint).await?;
@@ -1611,8 +1688,8 @@ where
     let mut admin_server_finished = false;
     tokio::pin!(external_shutdown);
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = wait_for_sigterm() => {}
+        _ = tokio::signal::ctrl_c(), if register_process_signals => {}
+        _ = wait_for_sigterm(), if register_process_signals => {}
         _ = &mut external_shutdown => {}
         _ = &mut admin_server => {
             admin_server_finished = true;

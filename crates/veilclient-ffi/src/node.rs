@@ -454,6 +454,8 @@ pub unsafe extern "C" fn veil_config_compose(
 /// Start an embedded node from a config file at `config_path` (`(ptr,len)`,
 /// UTF-8). Non-blocking. Returns an opaque handle, or null with `*err_out` set
 /// (free it with `veil_free_string`).
+/// The host retains its SIGINT/SIGTERM/SIGHUP handlers; use `veil_node_stop*`
+/// to stop this node without affecting the host process or sibling nodes.
 ///
 /// # Safety
 /// `config_path_ptr` must point to `config_path_len` readable bytes; `err_out`
@@ -642,11 +644,10 @@ fn start_thread(
             let foreground = async move {
                 match config {
                     Some(p) => {
-                        veil_node_runtime::admin::run_foreground_with_shutdown(p, true, shutdown)
-                            .await
+                        veil_node_runtime::admin::run_embedded_with_shutdown(p, shutdown).await
                     }
                     None => {
-                        veil_node_runtime::admin::run_foreground_deferred_with_shutdown(
+                        veil_node_runtime::admin::run_embedded_deferred_with_shutdown(
                             thread_admin_endpoint,
                             anonymous,
                             thread_work_dir,
