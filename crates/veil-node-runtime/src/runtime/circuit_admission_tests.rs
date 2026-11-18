@@ -82,12 +82,11 @@ async fn fixture() -> (
     veil_cfg::save_config(&path, &config).unwrap();
     let runtime = NodeRuntime::start(&path, true).await.unwrap();
     let services = runtime.access();
-    let outbox = services
-        .session_tx_registry
-        .write()
-        .unwrap()
-        .register([0x71; 32]);
-    (dir, runtime, circuit(0), outbox)
+    let mut circuit = circuit(0);
+    let mut tx = services.session_tx_registry.write().unwrap();
+    let outbox = tx.register(circuit.first_hop);
+    circuit.first_hop_registration = tx.live_registration(&circuit.first_hop).unwrap();
+    (dir, runtime, circuit, outbox)
 }
 fn receive_seq(rx: &mut veil_session::FrameOutbox) -> u32 {
     let (_, bytes) = rx.try_recv().unwrap();
