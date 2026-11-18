@@ -39,6 +39,7 @@ struct Observation {
     attempt: Option<u64>,
     candidate: Option<&'static str>,
     connect_context: Option<u64>,
+    tcp_connect_started_us: Option<u64>,
 }
 
 impl Observation {
@@ -48,12 +49,12 @@ impl Observation {
             return;
         }
         log::info!(target: "transport.tcp_trace.handshake",
-            "tcp_handshake connection={} monotonic_us={} side={:?} outcome={} phase={:?} elapsed_ms={} written_bytes={} read_bytes={} socket={:?} kernel={:?} attempt={:?} candidate={:?} connect_context={:?}",
+            "tcp_handshake connection={} monotonic_us={} side={:?} outcome={} phase={:?} elapsed_ms={} written_bytes={} read_bytes={} socket={:?} kernel={:?} attempt={:?} candidate={:?} connect_context={:?} tcp_connect_started_us={:?}",
             self.connection,
             veil_util::diagnostic_clock::monotonic_us().map_or_else(|| "unknown".to_owned(), |us| us.to_string()),
             self.side, outcome, self.phase, self.started.elapsed().as_millis(),
             self.written_bytes, self.read_bytes,
-            SocketMetadata::read(socket), KernelSnapshot::read(socket), self.attempt, self.candidate, self.connect_context);
+            SocketMetadata::read(socket), KernelSnapshot::read(socket), self.attempt, self.candidate, self.connect_context, self.tcp_connect_started_us);
     }
 }
 
@@ -80,6 +81,29 @@ impl HandshakeStream {
             side,
             enabled_cell().load(Ordering::Relaxed),
             context,
+            None,
+        )
+    }
+
+    /// Sample before polling each physical TCP connect, not at the logical
+    /// parent dial: auxiliary and delayed backup sockets begin independently.
+    pub(crate) fn connect_start_clock() -> Option<u64> {
+        super::is_enabled()
+            .then(veil_util::diagnostic_clock::monotonic_us)
+            .flatten()
+    }
+
+    pub(crate) fn new_client_after_connect(
+        socket: TcpStream,
+        context: Option<ConnectTraceContext>,
+        tcp_connect_started_us: Option<u64>,
+    ) -> Self {
+        Self::with_observation(
+            socket,
+            HandshakeSide::Client,
+            enabled_cell().load(Ordering::Relaxed),
+            context,
+            tcp_connect_started_us,
         )
     }
 
@@ -88,6 +112,7 @@ impl HandshakeStream {
         side: HandshakeSide,
         enabled: bool,
         context: Option<ConnectTraceContext>,
+        tcp_connect_started_us: Option<u64>,
     ) -> Self {
         let observation = enabled.then(|| Observation {
             connection: NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed),
@@ -100,6 +125,7 @@ impl HandshakeStream {
             attempt: None,
             candidate: None,
             connect_context: context.map(ConnectTraceContext::local_id),
+            tcp_connect_started_us,
         });
         let stream = Self {
             socket,
@@ -239,6 +265,7 @@ mod tests {
                 HandshakeSide::Client,
                 enabled,
                 context,
+                None,
             ),
             server.unwrap().0,
         )
@@ -435,6 +462,7 @@ mod tests {
         let before = RECORDER.rows.lock().unwrap().len();
         enabled_cell().store(false, Ordering::Relaxed);
         assert!(ConnectTraceContext::new_if_enabled().is_none());
+        assert!(HandshakeStream::connect_start_clock().is_none());
         drop(io);
         assert_eq!(
             RECORDER.rows.lock().unwrap().len(),
@@ -454,7 +482,8 @@ mod tests {
         let mut settings = TransportContext::for_debug().unwrap();
         settings.obfs4_psk = Some(Arc::new([0x42; 32]));
         settings.tracing.set_tcp_connect_context(Some(context));
-        tokio::time::timeout(Duration::from_secs(12), async {
+        let fixture_not_before = veil_util::diagnostic_clock::monotonic_us().unwrap();
+        let child_not_before = tokio::time::timeout(Duration::from_secs(12), async {
             let server = async {
                 let (mut stalled, _) = listener.accept().await.unwrap();
                 let mut byte = [0];
@@ -485,6 +514,7 @@ mod tests {
                     .await
                     .unwrap()
             };
+            let child_not_before = veil_util::diagnostic_clock::monotonic_us().unwrap();
             let (child, mut child_server) = tokio::join!(auxiliary.connect(), child_server);
             let mut child = child.unwrap().into_stream().unwrap();
             child.write_all(b"opaque child control").await.unwrap();
@@ -492,6 +522,7 @@ mod tests {
             let mut bytes = [0; 20];
             child_server.read_exact(&mut bytes).await.unwrap();
             assert_eq!(&bytes, b"opaque child control");
+            child_not_before
         })
         .await
         .expect("transport context fixture watchdog");
@@ -533,6 +564,46 @@ mod tests {
                 .filter(|row| row.contains("outcome=start"))
                 .count(),
             3
+        );
+        let mut socket_clocks: Vec<(u64, u64)> = rows
+            .iter()
+            .filter(|row| row.contains("outcome=start"))
+            .map(|row| {
+                let observed = row
+                    .split("monotonic_us=")
+                    .nth(1)
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let before_connect = row
+                    .split("tcp_connect_started_us=Some(")
+                    .nth(1)
+                    .expect("a physical socket needs its own pre-connect clock")
+                    .split(')')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                (observed, before_connect)
+            })
+            .collect();
+        socket_clocks.sort_unstable();
+        assert_eq!(socket_clocks.len(), 3);
+        assert!(
+            socket_clocks
+                .iter()
+                .all(|&(observed, before)| fixture_not_before <= before && before <= observed)
+        );
+        assert!(
+            socket_clocks[1].1 > socket_clocks[0].0,
+            "backup clock belongs to the delayed physical connect"
+        );
+        assert!(
+            socket_clocks[2].1 >= child_not_before,
+            "child must not inherit the parent's physical connect clock"
         );
         assert!(
             rows.iter()
