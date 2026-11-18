@@ -116,9 +116,35 @@ impl Default for QuicTransportSettings {
     }
 }
 
-/// Reserved hook for tracing spans emitted by transport code.
-#[derive(Clone, Debug, Default)]
-pub struct TracingHooks;
+/// Endpoint-local tracing associations, never transport protocol inputs.
+#[derive(Clone, Default)]
+pub struct TracingHooks {
+    tcp_connect_context: Option<crate::tcp_trace::ConnectTraceContext>,
+}
+
+impl TracingHooks {
+    pub fn set_tcp_connect_context(
+        &mut self,
+        context: Option<crate::tcp_trace::ConnectTraceContext>,
+    ) {
+        self.tcp_connect_context = context;
+    }
+
+    pub fn tcp_connect_context(&self) -> Option<crate::tcp_trace::ConnectTraceContext> {
+        self.tcp_connect_context
+    }
+}
+
+impl std::fmt::Debug for TracingHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TracingHooks")
+            .field(
+                "tcp_connect_context_present",
+                &self.tcp_connect_context.is_some(),
+            )
+            .finish()
+    }
+}
 
 /// Reserved hook for metrics counters emitted by transport code.
 #[derive(Clone, Debug, Default)]
@@ -307,7 +333,7 @@ impl TransportContext {
             tcp,
             quic,
             websocket_mode: WebSocketClientMode::Standard,
-            tracing: TracingHooks,
+            tracing: TracingHooks::default(),
             metrics: MetricsHooks,
             default_sni: None,
             obfs4_psk: None,

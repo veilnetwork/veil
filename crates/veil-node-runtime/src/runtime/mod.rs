@@ -4023,6 +4023,8 @@ mod onion_epoch_tests {
 #[cfg(test)]
 mod circuit_admission_tests;
 #[cfg(test)]
+mod dial_trace_tests;
+#[cfg(test)]
 mod network_retirement_tests;
 #[cfg(test)]
 mod ordered_resume_tests;

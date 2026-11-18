@@ -11,7 +11,7 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
-use super::{KernelSnapshot, NEXT_CONNECTION, SocketMetadata, enabled_cell};
+use super::{ConnectTraceContext, KernelSnapshot, NEXT_CONNECTION, SocketMetadata, enabled_cell};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum HandshakeSide {
@@ -38,6 +38,7 @@ struct Observation {
     read_bytes: u64,
     attempt: Option<u64>,
     candidate: Option<&'static str>,
+    connect_context: Option<u64>,
 }
 
 impl Observation {
@@ -47,12 +48,12 @@ impl Observation {
             return;
         }
         log::info!(target: "transport.tcp_trace.handshake",
-            "tcp_handshake connection={} monotonic_us={} side={:?} outcome={} phase={:?} elapsed_ms={} written_bytes={} read_bytes={} socket={:?} kernel={:?} attempt={:?} candidate={:?}",
+            "tcp_handshake connection={} monotonic_us={} side={:?} outcome={} phase={:?} elapsed_ms={} written_bytes={} read_bytes={} socket={:?} kernel={:?} attempt={:?} candidate={:?} connect_context={:?}",
             self.connection,
             veil_util::diagnostic_clock::monotonic_us().map_or_else(|| "unknown".to_owned(), |us| us.to_string()),
             self.side, outcome, self.phase, self.started.elapsed().as_millis(),
             self.written_bytes, self.read_bytes,
-            SocketMetadata::read(socket), KernelSnapshot::read(socket), self.attempt, self.candidate);
+            SocketMetadata::read(socket), KernelSnapshot::read(socket), self.attempt, self.candidate, self.connect_context);
     }
 }
 
@@ -66,10 +67,28 @@ pub(crate) struct HandshakeStream {
 
 impl HandshakeStream {
     pub(crate) fn new(socket: TcpStream, side: HandshakeSide) -> Self {
-        Self::with_observation(socket, side, enabled_cell().load(Ordering::Relaxed))
+        Self::new_in_context(socket, side, None)
     }
 
-    fn with_observation(socket: TcpStream, side: HandshakeSide, enabled: bool) -> Self {
+    pub(crate) fn new_in_context(
+        socket: TcpStream,
+        side: HandshakeSide,
+        context: Option<ConnectTraceContext>,
+    ) -> Self {
+        Self::with_observation(
+            socket,
+            side,
+            enabled_cell().load(Ordering::Relaxed),
+            context,
+        )
+    }
+
+    fn with_observation(
+        socket: TcpStream,
+        side: HandshakeSide,
+        enabled: bool,
+        context: Option<ConnectTraceContext>,
+    ) -> Self {
         let observation = enabled.then(|| Observation {
             connection: NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed),
             side,
@@ -80,6 +99,7 @@ impl HandshakeStream {
             read_bytes: 0,
             attempt: None,
             candidate: None,
+            connect_context: context.map(ConnectTraceContext::local_id),
         });
         let stream = Self {
             socket,
@@ -201,13 +221,25 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn pair(enabled: bool) -> (HandshakeStream, TcpStream) {
+        pair_in_context(enabled, None).await
+    }
+
+    async fn pair_in_context(
+        enabled: bool,
+        context: Option<ConnectTraceContext>,
+    ) -> (HandshakeStream, TcpStream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (client, server) = tokio::join!(
             TcpStream::connect(listener.local_addr().unwrap()),
             listener.accept()
         );
         (
-            HandshakeStream::with_observation(client.unwrap(), HandshakeSide::Client, enabled),
+            HandshakeStream::with_observation(
+                client.unwrap(),
+                HandshakeSide::Client,
+                enabled,
+                context,
+            ),
             server.unwrap().0,
         )
     }
@@ -282,24 +314,46 @@ mod tests {
         assert!(io.observation.is_none());
         io.shutdown().await.unwrap();
         assert_eq!(remote.read(&mut bytes).await.unwrap(), 0);
+        let context = ConnectTraceContext::allocate_if(true).unwrap();
+        let (io, _) = pair_in_context(false, Some(context)).await;
+        assert!(
+            io.observation.is_none(),
+            "a context must not enable the observer"
+        );
     }
 
-    struct Recorder(std::sync::Mutex<Vec<String>>);
+    struct Recorder {
+        rows: std::sync::Mutex<Vec<String>>,
+        contexts: std::sync::Mutex<Vec<u64>>,
+    }
     impl log::Log for Recorder {
         fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
             metadata.target() == "transport.tcp_trace.handshake"
         }
         fn log(&self, record: &log::Record<'_>) {
             if self.enabled(record.metadata()) {
-                let mut rows = self.0.lock().unwrap();
+                let row = record.args().to_string();
+                if !self
+                    .contexts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|id| row.contains(&format!("connect_context=Some({id})")))
+                {
+                    return;
+                }
+                let mut rows = self.rows.lock().unwrap();
                 if rows.len() < 256 {
-                    rows.push(record.args().to_string());
+                    rows.push(row);
                 }
             }
         }
         fn flush(&self) {}
     }
-    static RECORDER: Recorder = Recorder(std::sync::Mutex::new(Vec::new()));
+    static RECORDER: Recorder = Recorder {
+        rows: std::sync::Mutex::new(Vec::new()),
+        contexts: std::sync::Mutex::new(Vec::new()),
+    };
     static LOGGER: std::sync::Once = std::sync::Once::new();
 
     #[tokio::test]
@@ -317,7 +371,9 @@ mod tests {
             log::max_level(),
         );
         log::set_max_level(log::LevelFilter::Info);
-        let (io, mut remote) = pair(true).await;
+        let context = ConnectTraceContext::new_if_enabled().unwrap();
+        RECORDER.contexts.lock().unwrap().push(context.local_id());
+        let (io, mut remote) = pair_in_context(true, Some(context)).await;
         let connection = io.observation.as_ref().unwrap().connection;
         let mut io = io.for_attempt(Some(connection), "backup");
         let payload = b"private-handshake-canary";
@@ -336,7 +392,7 @@ mod tests {
         assert_eq!(remote.read(&mut byte).await.unwrap(), 0);
         let key = format!("tcp_handshake connection={connection} ");
         let rows: Vec<_> = RECORDER
-            .0
+            .rows
             .lock()
             .unwrap()
             .iter()
@@ -351,6 +407,10 @@ mod tests {
             "attempt=Some({connection}) candidate=Some(\"backup\")"
         )));
         assert!(end.contains("outcome=incomplete phase=Read"));
+        assert!(
+            rows.iter()
+                .all(|row| row.contains(&format!("connect_context=Some({})", context.local_id(),)))
+        );
         assert!(end.contains(&format!("written_bytes={} read_bytes=0", payload.len())));
         assert!(end.contains("socket=Ok(SocketMetadata { local_port:"));
         #[cfg(any(
@@ -369,5 +429,114 @@ mod tests {
             assert!(!row.contains("private-handshake-canary"));
             assert!(!row.contains("127.0.0.1"));
         }
+        real_obfs_primary_backup_and_child_keep_the_same_context().await;
+
+        let (io, _) = pair_in_context(true, Some(context)).await;
+        let before = RECORDER.rows.lock().unwrap().len();
+        enabled_cell().store(false, Ordering::Relaxed);
+        assert!(ConnectTraceContext::new_if_enabled().is_none());
+        drop(io);
+        assert_eq!(
+            RECORDER.rows.lock().unwrap().len(),
+            before,
+            "disabling capture must silence a retained context"
+        );
+    }
+
+    async fn real_obfs_primary_backup_and_child_keep_the_same_context() {
+        use crate::{Transport, TransportContext, TransportUri, obfs4_tcp::Obfs4TcpTransport};
+        use std::{collections::HashSet, sync::Arc, time::Duration};
+        let context = ConnectTraceContext::new_if_enabled().unwrap();
+        RECORDER.contexts.lock().unwrap().push(context.local_id());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = TransportUri::parse(&format!("obfs4-tcp://{}", listener.local_addr().unwrap()))
+            .unwrap();
+        let mut settings = TransportContext::for_debug().unwrap();
+        settings.obfs4_psk = Some(Arc::new([0x42; 32]));
+        settings.tracing.set_tcp_connect_context(Some(context));
+        tokio::time::timeout(Duration::from_secs(12), async {
+            let server = async {
+                let (mut stalled, _) = listener.accept().await.unwrap();
+                let mut byte = [0];
+                stalled.read_exact(&mut byte).await.unwrap();
+                let (backup, _) = listener.accept().await.unwrap();
+                let server =
+                    veil_obfs4::obfs4_server_accept(backup, &veil_obfs4::NodeIdMacKey([0x42; 32]))
+                        .await
+                        .unwrap();
+                (server, stalled)
+            };
+            let (client, (mut server, _stalled)) =
+                tokio::join!(Obfs4TcpTransport.connect(&uri, Arc::new(settings)), server,);
+            let client = client.unwrap();
+            let auxiliary = client.parallel_stream().unwrap();
+            let mut client = client.into_stream().unwrap();
+            client.write_all(b"opaque primary control").await.unwrap();
+            client.flush().await.unwrap();
+            let mut bytes = [0; 22];
+            server.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"opaque primary control");
+            // Transport primitive only: actual parent proof/admission is covered
+            // by runtime integration tests. The child must retain the context
+            // through its factory's cloned TransportContext.
+            let child_server = async {
+                let (tcp, _) = listener.accept().await.unwrap();
+                veil_obfs4::obfs4_server_accept(tcp, &veil_obfs4::NodeIdMacKey([0x42; 32]))
+                    .await
+                    .unwrap()
+            };
+            let (child, mut child_server) = tokio::join!(auxiliary.connect(), child_server);
+            let mut child = child.unwrap().into_stream().unwrap();
+            child.write_all(b"opaque child control").await.unwrap();
+            child.flush().await.unwrap();
+            let mut bytes = [0; 20];
+            child_server.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"opaque child control");
+        })
+        .await
+        .expect("transport context fixture watchdog");
+        let key = format!("connect_context=Some({})", context.local_id());
+        let rows: Vec<_> = RECORDER
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| row.contains(&key))
+            .cloned()
+            .collect();
+        let connections: HashSet<_> = rows
+            .iter()
+            .map(|row| {
+                row.split("connection=")
+                    .nth(1)
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            connections.len(),
+            3,
+            "silent primary, selected backup and independent child"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("outcome=selected")
+                && row.contains("candidate=Some(\"backup\")"))
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("outcome=selected")
+                && row.contains("candidate=Some(\"primary\")"))
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("outcome=start"))
+                .count(),
+            3
+        );
+        assert!(
+            rows.iter()
+                .all(|row| !row.contains("127.0.0.1") && !row.contains("opaque "))
+        );
     }
 }

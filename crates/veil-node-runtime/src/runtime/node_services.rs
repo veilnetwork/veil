@@ -1044,7 +1044,23 @@ impl NodeServices {
             metrics.inc_outbound_connect_attempts();
         }
         let uri = TransportUri::parse(&peer.transport)?;
-        let peer_ctx = Arc::new(peer_transport_context(&self.transport_ctx, &peer)?);
+        let mut peer_ctx = peer_transport_context(&self.transport_ctx, &peer)?;
+        let trace_context = veil_transport::tcp_trace::ConnectTraceContext::new_if_enabled();
+        peer_ctx.tracing.set_tcp_connect_context(trace_context);
+        if let Some(context) = trace_context {
+            self.logger.info(
+                "transport.connect.context",
+                format!(
+                    "context={} peer_slot={} scheme={} monotonic_us={}",
+                    context.local_id(),
+                    peer_id,
+                    uri.scheme(),
+                    veil_util::diagnostic_clock::monotonic_us()
+                        .map_or_else(|| "unknown".to_owned(), |us| us.to_string()),
+                ),
+            );
+        }
+        let peer_ctx = Arc::new(peer_ctx);
         // E20: a connection recovered via NAT-traversal / SOCKS fallback is a
         // one-sided, no-glare recovery dial — the primary URI was unreachable
         // and the peer is not reciprocally dialing — so it must bypass

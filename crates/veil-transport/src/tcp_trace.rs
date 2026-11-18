@@ -25,6 +25,36 @@ mod linux_progress;
 
 static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
 static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
+static NEXT_CONNECT_CONTEXT: AtomicU64 = AtomicU64::new(1);
+
+/// Local diagnostic association with a caller's dial operation. Cloned
+/// transport contexts retain it for that parent's auxiliary dials. It is not
+/// a connection ID, authenticated peer identity, credential or wire field.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ConnectTraceContext(u64);
+
+impl ConnectTraceContext {
+    /// Allocate only after the operator enabled TCP tracing. No maps, peer
+    /// addresses, persistent state or background tasks are retained.
+    pub fn new_if_enabled() -> Option<Self> {
+        Self::allocate_if(is_enabled())
+    }
+
+    fn allocate_if(enabled: bool) -> Option<Self> {
+        enabled.then(|| Self(NEXT_CONNECT_CONTEXT.fetch_add(1, Ordering::Relaxed)))
+    }
+
+    /// For explicit operator records only, never anonymous diagnostics.
+    pub fn local_id(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for ConnectTraceContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConnectTraceContext(..)")
+    }
+}
 const SLOW: Duration = Duration::from_millis(50);
 const LOG_INTERVAL: Duration = Duration::from_secs(1);
 const FINE_INTERVAL: Duration = Duration::from_millis(100);
@@ -77,6 +107,11 @@ fn enabled_cell() -> &'static AtomicBool {
 /// Embedded-node twin of the VEIL_RT_TRACE environment gate.
 pub fn set_enabled(on: bool) {
     enabled_cell().store(on, Ordering::Relaxed);
+}
+
+/// Current operator gate; disabling it also stops observations in progress.
+pub fn is_enabled() -> bool {
+    enabled_cell().load(Ordering::Relaxed)
 }
 
 /// The snapshots are consumed through field-labelled Debug output.
@@ -480,6 +515,23 @@ impl WriteTrace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_context_is_gated_fresh_cloneable_and_redacted_in_debug() {
+        assert!(ConnectTraceContext::allocate_if(false).is_none());
+        let first = ConnectTraceContext::allocate_if(true).unwrap();
+        let next = ConnectTraceContext::allocate_if(true).unwrap();
+        assert_ne!(first.local_id(), next.local_id());
+        let mut hooks = crate::TracingHooks::default();
+        hooks.set_tcp_connect_context(Some(first));
+        let cloned = hooks.clone();
+        assert_eq!(cloned.tcp_connect_context(), Some(first));
+        hooks.set_tcp_connect_context(None);
+        assert!(hooks.tcp_connect_context().is_none());
+        assert_eq!(cloned.tcp_connect_context(), Some(first));
+        assert_eq!(format!("{first:?}"), "ConnectTraceContext(..)");
+        assert!(!format!("{cloned:?}").contains(&first.local_id().to_string()));
+    }
 
     async fn connected() -> (TcpStream, TcpStream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
