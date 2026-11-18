@@ -220,6 +220,12 @@ pub trait FrameBroadcaster: Send + Sync {
     /// peers without importing veilcore's `SessionTxRegistry` concretely.
     fn active_node_ids(&self) -> Vec<[u8; 32]>;
 
+    /// Endpoint-local witness for newly admitted first-hop sessions. An
+    /// adapter without a registration registry can leave this unspecified.
+    fn latest_tx_registration(&self) -> Option<u64> {
+        None
+    }
+
     /// Live sessions belonging to the IDENTITY `identity`, as device node_ids.
     ///
     /// A sovereign peer holds ONE identity and one or more devices. The

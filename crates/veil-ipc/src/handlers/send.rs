@@ -61,8 +61,11 @@ enum RouteDiscoveryKind {
     Any,
     RelayOnly,
 }
-type RouteMisses =
-    std::collections::HashMap<([u8; 32], [u8; 32], RouteDiscoveryKind), std::time::Instant>;
+struct RouteMiss {
+    since: std::time::Instant,
+    registration: Option<u64>,
+}
+type RouteMisses = std::collections::HashMap<([u8; 32], [u8; 32], RouteDiscoveryKind), RouteMiss>;
 static ROUTE_MISSES: std::sync::LazyLock<std::sync::Mutex<RouteMisses>> =
     std::sync::LazyLock::new(Default::default);
 
@@ -119,7 +122,13 @@ fn warm_media_route(ctx: &IpcSendContext, dst: [u8; 32]) {
         RouteDiscoveryKind::RelayOnly,
     )
     .is_some()
-        || route_recently_missed(&ctx.local_node_id, &dst, RouteDiscoveryKind::RelayOnly)
+        || route_recently_missed(
+            &ctx.local_node_id,
+            &dst,
+            RouteDiscoveryKind::RelayOnly,
+            reg.latest_tx_registration(),
+        )
+        || !reg.active_node_ids().into_iter().any(|peer| peer != dst)
     {
         return;
     }
@@ -151,20 +160,38 @@ fn warm_media_route(ctx: &IpcSendContext, dst: [u8; 32]) {
     });
 }
 
-fn route_recently_missed(local: &[u8; 32], dst: &[u8; 32], kind: RouteDiscoveryKind) -> bool {
+fn route_recently_missed(
+    local: &[u8; 32],
+    dst: &[u8; 32],
+    kind: RouteDiscoveryKind,
+    registration: Option<u64>,
+) -> bool {
     ROUTE_MISSES
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get(&(*local, *dst, kind))
-        .is_some_and(|at| at.elapsed() < ROUTE_MISS_TTL)
+        .is_some_and(|miss| {
+            miss.since.elapsed() < ROUTE_MISS_TTL && miss.registration == registration
+        })
 }
 
-fn note_route_miss(local: &[u8; 32], dst: &[u8; 32], kind: RouteDiscoveryKind) {
+fn note_route_miss(
+    local: &[u8; 32],
+    dst: &[u8; 32],
+    kind: RouteDiscoveryKind,
+    registration: Option<u64>,
+) {
     let mut misses = ROUTE_MISSES.lock().unwrap_or_else(|p| p.into_inner());
     if misses.len() >= 4_096 {
-        misses.retain(|_, at| at.elapsed() < ROUTE_MISS_TTL);
+        misses.retain(|_, miss| miss.since.elapsed() < ROUTE_MISS_TTL);
     }
-    misses.insert((*local, *dst, kind), std::time::Instant::now());
+    misses.insert(
+        (*local, *dst, kind),
+        RouteMiss {
+            since: std::time::Instant::now(),
+            registration,
+        },
+    );
 }
 
 fn cached_discovery_hop(
@@ -259,9 +286,16 @@ async fn discover_route(
         return Some(hop);
     }
 
-    // A discovery that just found nothing is not repeated: the cache is what
-    // it would have filled, and it has been asked above.
-    if route_recently_missed(local_node_id, dst, kind) {
+    // A miss on an old set of relay connections cannot suppress discovery
+    // after any new TX registration, including a replacement of the same
+    // peer. Record the observed registration before sending the query.
+    let registration = match kind {
+        RouteDiscoveryKind::Any => None,
+        RouteDiscoveryKind::RelayOnly => {
+            session_tx_registry.and_then(|reg| reg.latest_tx_registration())
+        }
+    };
+    if route_recently_missed(local_node_id, dst, kind, registration) {
         return route_cache.and_then(|cache| {
             cached_discovery_hop(&rlock!(cache), dst, session_tx_registry, kind)
         });
@@ -352,12 +386,22 @@ async fn discover_route(
             }
             xor
         });
+        let mut admitted = false;
         for pid in peers.iter().take(2) {
-            reg.send_to(
+            admitted |= reg.send_to(
                 pid,
                 veil_proto::header::priority::INTERACTIVE,
                 rq_frame.clone(),
             );
+        }
+        if !admitted {
+            // Local backpressure or a disconnected node cannot establish
+            // anything about this destination. Leave the next send free to
+            // retry and remove the response slot for this unsent query.
+            if let Some(pending) = pending_recursive {
+                lock!(pending).remove(&query_id);
+            }
+            return cached_discovery_hop(&rlock!(cache), dst, session_tx_registry, kind);
         }
     }
 
@@ -399,7 +443,7 @@ async fn discover_route(
             elapsed.as_millis()
         );
     } else {
-        note_route_miss(local_node_id, dst, kind);
+        note_route_miss(local_node_id, dst, kind, registration);
         log::warn!(
             "route.discovery.miss dst={} elapsed_ms={}",
             veil_util::bytes_to_hex(&dst[..4]),
@@ -7419,6 +7463,92 @@ mod ratchet_send_tests {
         assert_eq!(fx.taken().len(), 1);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn unsent_route_discovery_does_not_wait_or_poison_retry() {
+        let local = [0xD1; 32];
+        let dst = [0xD2; 32];
+        let registry = Arc::new(RwLock::new(veil_session::SessionTxRegistry::with_capacity(
+            1,
+        )));
+        let reg = veil_session::glue::SessionTxBroadcaster::new(registry.clone());
+        let mut outbox = wlock!(registry).register(RELAY);
+        let lane = veil_proto::priority::INTERACTIVE;
+        assert!(reg.send_to(&RELAY, lane, vec![1]));
+        assert!(!reg.send_to(&RELAY, lane, vec![2]), "the queue is full");
+        let cache = RwLock::new(veil_routing::RouteCache::new(Duration::from_secs(30)));
+        let notify = tokio::sync::Notify::new();
+        let pending = Mutex::new(std::collections::HashMap::new());
+        let ask = || {
+            discover_route(
+                &dst,
+                &local,
+                Some(&cache),
+                Some(&reg),
+                Some(&notify),
+                None,
+                Some(&pending),
+                RouteDiscoveryKind::RelayOnly,
+            )
+        };
+        let mut first = Box::pin(ask());
+        assert_eq!(futures::poll!(&mut first), std::task::Poll::Ready(None));
+        assert!(lock!(pending).is_empty());
+        assert_eq!(&*outbox.try_recv().unwrap().1, &[1]);
+
+        let mut retry = Box::pin(ask());
+        assert!(futures::poll!(&mut retry).is_pending());
+        let (_, frame) = outbox
+            .try_recv()
+            .expect("retry reached the same restored queue");
+        let header = codec::decode_header(&frame).unwrap();
+        assert_eq!(
+            header.msg_type,
+            veil_proto::family::RoutingMsg::RecursiveQuery as u16
+        );
+        wlock!(cache).insert(dst, RELAY, 1, 2);
+        notify.notify_waiters();
+        assert_eq!(retry.await, Some(RELAY));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_miss_does_not_survive_a_replacement_session() {
+        let local = [0xD3; 32];
+        let dst = [0xD4; 32];
+        let registry = Arc::new(RwLock::new(veil_session::SessionTxRegistry::new()));
+        let reg = veil_session::glue::SessionTxBroadcaster::new(registry.clone());
+        let mut first_outbox = wlock!(registry).register(RELAY);
+        let cache = RwLock::new(veil_routing::RouteCache::new(Duration::from_secs(30)));
+        let notify = tokio::sync::Notify::new();
+        let ask = || {
+            discover_route(
+                &dst,
+                &local,
+                Some(&cache),
+                Some(&reg),
+                Some(&notify),
+                None,
+                None,
+                RouteDiscoveryKind::RelayOnly,
+            )
+        };
+        assert_eq!(ask().await, None);
+        first_outbox.try_recv().expect("first query was sent");
+        let mut same = Box::pin(ask());
+        assert_eq!(futures::poll!(&mut same), std::task::Poll::Ready(None));
+        assert!(first_outbox.try_recv().is_err());
+
+        // The public peer ID stays the same across the network change.
+        let mut replacement = wlock!(registry).register(RELAY);
+        let mut retry = Box::pin(ask());
+        assert!(futures::poll!(&mut retry).is_pending());
+        replacement
+            .try_recv()
+            .expect("retry reached the replacement session");
+        wlock!(cache).insert(dst, RELAY, 1, 2);
+        notify.notify_waiters();
+        assert_eq!(retry.await, Some(RELAY));
+    }
+
     #[tokio::test]
     async fn cancelled_discovery_allows_a_waiter_to_recover_the_route() {
         const LOCAL: [u8; 32] = [0xA3; 32];
@@ -7502,14 +7632,19 @@ mod ratchet_send_tests {
     #[test]
     fn a_remembered_route_miss_lapses() {
         let (local, dst) = ([0x5Au8; 32], [0x5Bu8; 32]);
-        note_route_miss(&local, &dst, RouteDiscoveryKind::Any);
-        assert!(route_recently_missed(&local, &dst, RouteDiscoveryKind::Any));
+        note_route_miss(&local, &dst, RouteDiscoveryKind::Any, None);
+        assert!(route_recently_missed(
+            &local,
+            &dst,
+            RouteDiscoveryKind::Any,
+            None
+        ));
         assert!(
-            !route_recently_missed(&local, &dst, RouteDiscoveryKind::RelayOnly),
+            !route_recently_missed(&local, &dst, RouteDiscoveryKind::RelayOnly, None),
             "a direct-route miss must not suppress an independent relay discovery",
         );
         assert!(
-            !route_recently_missed(&[0x5Cu8; 32], &dst, RouteDiscoveryKind::Any),
+            !route_recently_missed(&[0x5Cu8; 32], &dst, RouteDiscoveryKind::Any, None),
             "per asking node"
         );
         let long_ago = std::time::Instant::now()
@@ -7518,9 +7653,15 @@ mod ratchet_send_tests {
         ROUTE_MISSES
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert((local, dst, RouteDiscoveryKind::Any), long_ago);
+            .insert(
+                (local, dst, RouteDiscoveryKind::Any),
+                RouteMiss {
+                    since: long_ago,
+                    registration: None,
+                },
+            );
         assert!(
-            !route_recently_missed(&local, &dst, RouteDiscoveryKind::Any),
+            !route_recently_missed(&local, &dst, RouteDiscoveryKind::Any, None),
             "past the window it is not believed"
         );
     }
