@@ -1,6 +1,7 @@
 //! Source preparation during media open, before the host starts capture.
 //! The node receives only an owned LOCAL request; no dummy RTP or wire role.
 use super::*;
+use tokio::time::Instant;
 use veil_types::LocalDatagramChannelState as State;
 
 const LANES: [u8; 5] = [
@@ -10,6 +11,18 @@ const LANES: [u8; 5] = [
     veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
     veil_proto::ipc::LOCAL_SIGNALING_LANE,
 ];
+const MEDIA_LANES: usize = 3;
+const POLL_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+const PRIMARY_RECHECK: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn preparation_ready(index: usize, state: Option<State>) -> bool {
+    match index {
+        0 => state == Some(State::Ready),
+        1..MEDIA_LANES => matches!(state, Some(State::Ready | State::Unsupported)),
+        // DATA and signaling can finish warming in the background once accepted.
+        _ => state.is_some(),
+    }
+}
 
 async fn prepare_sources<Q, F>(mut query: Q, budget: std::time::Duration) -> bool
 where
@@ -19,42 +32,62 @@ where
     tokio::time::timeout(budget, async {
         let mut states = [None; LANES.len()];
         let mut begun = [false; LANES.len()];
+        let mut last_primary_check: Option<Instant> = None;
         loop {
             let mut quota_limited = false;
-            for (index, lane) in LANES.iter().enumerate() {
-                // DATA/control can continue preparing in the background.
-                // Refresh every media snapshot instead of reusing a Ready
-                // value across a quota retry, parent retirement or rekey.
-                if index >= 3 && states[index].is_some() {
-                    continue;
+            let mut deferred: [bool; LANES.len()] =
+                std::array::from_fn(|index| preparation_ready(index, states[index]));
+            // Check primary periodically while other lanes warm, so losing
+            // its support can still end the attempt before the deadline.
+            let periodic_primary_check =
+                deferred[0] && last_primary_check.is_some_and(|at| at.elapsed() >= PRIMARY_RECHECK);
+            deferred[0] &= !periodic_primary_check;
+            for validating in [false, true] {
+                for (index, lane) in LANES.iter().enumerate() {
+                    // Poll unresolved lanes first. Confirm deferred media
+                    // snapshots only when the other lanes are ready; cached
+                    // readiness cannot survive a retirement or rekey unchecked.
+                    if deferred[index] != validating || (validating && index >= MEDIA_LANES) {
+                        continue;
+                    }
+                    states[index] = match query(*lane, !begun[index]).await {
+                        Ok(state) => state,
+                        Err(_) => return false,
+                    };
+                    begun[index] |= states[index].is_some();
+                    quota_limited |= states[index].is_none();
+                    if index == 0 {
+                        if states[0] == Some(State::Unsupported) {
+                            // Legacy daemon/link: preserve the established open path.
+                            return false;
+                        }
+                        last_primary_check = Some(Instant::now());
+                    }
                 }
-                states[index] = match query(*lane, !begun[index]).await {
-                    Ok(state) => state,
-                    Err(_) => return false,
-                };
-                begun[index] |= states[index].is_some();
-                quota_limited |= states[index].is_none();
-                if index == 0 && states[index] == Some(State::Unsupported) {
-                    // Legacy daemon/link: preserve the established open path.
-                    return false;
-                }
-            }
-            if states[0] == Some(State::Ready)
-                && states[1..3]
+                if !states
                     .iter()
-                    .all(|s| matches!(s, Some(State::Ready | State::Unsupported)))
-                && states[3..].iter().all(Option::is_some)
-            {
-                return true;
+                    .enumerate()
+                    .all(|(i, &s)| preparation_ready(i, s))
+                {
+                    break;
+                }
+                if validating {
+                    return true;
+                }
             }
             // Share the existing 10-query/s bucket instead of starving a
             // later plane by repeatedly polling the first one at the cap.
-            tokio::time::sleep(std::time::Duration::from_millis(if quota_limited {
-                350
+            let delay = if quota_limited {
+                std::time::Duration::from_millis(350)
+            } else if periodic_primary_check {
+                // Let the bucket replenish the extra primary query as well
+                // as the ordinary poll. Otherwise the watchdog itself can
+                // drain a low bucket just before the last lane becomes ready.
+                POLL_STEP * 2
             } else {
-                100
-            }))
-            .await;
+                POLL_STEP
+            };
+            tokio::time::sleep(delay).await;
         }
     })
     .await
@@ -155,6 +188,86 @@ mod tests {
             .await
         );
         assert_eq!(counts[0], 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn warming_screen_lane_does_not_exhaust_the_local_query_budget() {
+        // Same initial burst and refill rate as the IPC query bucket. Only
+        // screen sharing is still warming; the other lanes can already send.
+        for (initial_tokens, warm_ms, expected_ms) in [(30.0, 2650, 2700), (8.0, 2800, 2800)] {
+            let started = tokio::time::Instant::now();
+            let mut last = started;
+            let mut tokens = initial_tokens;
+            let mut denied = 0;
+            let mut primary_queries = Vec::new();
+            let mut video_queries = 0;
+            let ready = prepare_sources(
+                |lane, _| {
+                    let now = tokio::time::Instant::now();
+                    tokens = (tokens + now.duration_since(last).as_secs_f64() * 10.0).min(30.0);
+                    last = now;
+                    let state = if tokens < 1.0 {
+                        denied += 1;
+                        None
+                    } else {
+                        tokens -= 1.0;
+                        if lane == veil_proto::priority::REALTIME {
+                            primary_queries.push(now);
+                        }
+                        if lane == veil_proto::priority::BULK {
+                            video_queries += 1;
+                        }
+                        Some(
+                            if lane == veil_proto::priority::BACKGROUND
+                                && now.duration_since(started)
+                                    < std::time::Duration::from_millis(warm_ms)
+                            {
+                                State::Warming
+                            } else {
+                                State::Ready
+                            },
+                        )
+                    };
+                    std::future::ready(Ok(state))
+                },
+                std::time::Duration::from_secs(3),
+            )
+            .await;
+            assert!(
+                ready,
+                "the screen lane became ready with {initial_tokens} initial tokens"
+            );
+            assert_eq!(started.elapsed().as_millis(), expected_ms);
+            assert_eq!(denied, 0);
+            assert_eq!(
+                primary_queries.len(),
+                7,
+                "bounded checks plus final recheck"
+            );
+            assert_eq!(primary_queries.last(), Some(&tokio::time::Instant::now()));
+            assert_eq!(video_queries, 2, "initial preparation and final recheck");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn primary_support_loss_is_observed_while_other_lanes_warm() {
+        let started = Instant::now();
+        let ready = prepare_sources(
+            |lane, _| {
+                let state = match lane {
+                    veil_proto::priority::REALTIME if started.elapsed() >= PRIMARY_RECHECK => {
+                        State::Unsupported
+                    }
+                    veil_proto::priority::BACKGROUND => State::Warming,
+                    _ => State::Ready,
+                };
+                std::future::ready(Ok(Some(state)))
+            },
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+        assert!(!ready);
+        assert_eq!(started.elapsed(), PRIMARY_RECHECK);
     }
 
     #[tokio::test]
