@@ -955,6 +955,44 @@ async fn forward_endpoint(
 type PendingRecursiveMap =
     Arc<Mutex<std::collections::HashMap<[u8; 16], veil_dispatcher_state::PendingRecursive>>>;
 
+/// Unlink the bound pathname even when the runtime aborts the server task.
+#[cfg(unix)]
+struct UnixSocketPath {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl UnixSocketPath {
+    fn new(path: PathBuf) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = path.symlink_metadata()?;
+        Ok(Self {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixSocketPath {
+    fn drop(&mut self) {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+        // Another listener may have reused the pathname in the meantime.
+        if self.path.symlink_metadata().is_ok_and(|metadata| {
+            metadata.file_type().is_socket()
+                && metadata.dev() == self.device
+                && metadata.ino() == self.inode
+        }) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 // ── IpcServer ───────────────────────────────────────────────────────────────
 
 /// IPC server that listens on a Unix-domain socket OR a TCP-loopback port
@@ -1639,6 +1677,8 @@ impl IpcServer {
         let tmp_path = socket_path.with_extension("tmp");
         let _ = std::fs::remove_file(&tmp_path);
         let listener = transport::bind_unix(&tmp_path)?;
+        #[cfg(unix)]
+        let mut owned_path = UnixSocketPath::new(tmp_path.clone())?;
 
         #[cfg(unix)]
         {
@@ -1649,6 +1689,7 @@ impl IpcServer {
         std::fs::rename(&tmp_path, &socket_path)?;
         #[cfg(unix)]
         {
+            owned_path.path = socket_path.clone();
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o600);
             std::fs::set_permissions(&socket_path, perms)?;
@@ -1656,6 +1697,7 @@ impl IpcServer {
 
         self.accept_loop(&listener).await;
 
+        #[cfg(not(unix))]
         let _ = std::fs::remove_file(&socket_path);
         Ok(())
     }

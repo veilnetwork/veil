@@ -32,6 +32,41 @@ fn temp_socket_path() -> PathBuf {
     std::env::temp_dir().join(format!("veil-ipc-test-{}-{}.sock", id, n))
 }
 
+#[tokio::test]
+async fn aborting_server_removes_only_its_unix_socket() {
+    for replace in [false, true] {
+        let path = temp_socket_path();
+        let (mut server, _shutdown, _) = make_server(path.clone());
+        let task = tokio::spawn(async move { server.run().await });
+        let client = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match UnixStream::connect(&path).await {
+                    Ok(stream) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(e) => panic!("cannot connect to test IPC: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("IPC listener did not start");
+        let replacement = replace.then(|| {
+            std::fs::remove_file(&path).unwrap();
+            UnixListener::bind(&path).unwrap()
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(client);
+        let exists_after_abort = path.exists();
+        if replacement.is_some() {
+            assert!(UnixStream::connect(&path).await.is_ok());
+        }
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(exists_after_abort, replace);
+    }
+}
+
 struct CapturingPeerBroadcaster {
     peer_id: [u8; 32],
     tx: tokio::sync::mpsc::UnboundedSender<(u8, Vec<u8>)>,
