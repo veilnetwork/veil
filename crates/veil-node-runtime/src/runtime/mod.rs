@@ -4027,6 +4027,8 @@ mod network_retirement_tests;
 #[cfg(test)]
 mod reconnect_wake_tests;
 #[cfg(test)]
+mod resume_data_tests;
+#[cfg(test)]
 mod tests;
 
 /// Stable, non-resolvable cleartext receiver-id for a CIRCUIT-BACKED introduce

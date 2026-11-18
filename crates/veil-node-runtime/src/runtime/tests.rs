@@ -91,27 +91,7 @@ async fn unknown_leaf_resume_fixture(newer_owner: bool, resume: bool) {
         (accepted, result.unwrap(), client)
     }
 
-    // The ordinary runtime fixture and test_handshake_identity share a cached
-    // key. A real resumption requires two distinct nodes for directional KDF.
-    static CLIENT: std::sync::OnceLock<HandshakeIdentity> = std::sync::OnceLock::new();
-    let identity = CLIENT.get_or_init(|| {
-        let cfg = veil_cfg::identity_ops::IdentityUseCases::new(
-            veil_cfg::identity_ops::IdentityPowParams {
-                difficulty: veil_crypto::DEFAULT_POW_DIFFICULTY,
-                timeout: Duration::from_secs(300),
-                threads: veil_crypto::available_thread_count(),
-            },
-        )
-        .provision(SignatureAlgorithm::Ed25519, None)
-        .unwrap();
-        HandshakeIdentity {
-            algo: cfg.algo,
-            node_id: NodeId::from_public_key(cfg.algo, &cfg.public_key).unwrap(),
-            public_key: cfg.public_key,
-            private_key: cfg.private_key,
-            nonce: cfg.nonce,
-        }
-    });
+    let identity = resumption_leaf_identity();
     let mut config = runtime_config_with_listen();
     config.peers.clear();
     config.bootstrap_peers.clear();
@@ -197,6 +177,30 @@ async fn unknown_leaf_resume_fixture(newer_owner: bool, resume: bool) {
             assert!(survived, "old guard removed a newer owner");
         }
     }
+}
+
+/// The runtime fixture uses a cached key. Resume tests need a distinct leaf
+/// with real PoW and directional keys; share its provisioning across fixtures.
+pub(super) fn resumption_leaf_identity() -> &'static HandshakeIdentity {
+    static CLIENT: std::sync::OnceLock<HandshakeIdentity> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        let cfg = veil_cfg::identity_ops::IdentityUseCases::new(
+            veil_cfg::identity_ops::IdentityPowParams {
+                difficulty: veil_crypto::DEFAULT_POW_DIFFICULTY,
+                timeout: Duration::from_secs(300),
+                threads: veil_crypto::available_thread_count(),
+            },
+        )
+        .provision(SignatureAlgorithm::Ed25519, None)
+        .unwrap();
+        HandshakeIdentity {
+            algo: cfg.algo,
+            node_id: NodeId::from_public_key(cfg.algo, &cfg.public_key).unwrap(),
+            public_key: cfg.public_key,
+            private_key: cfg.private_key,
+            nonce: cfg.nonce,
+        }
+    })
 }
 
 #[tokio::test]
