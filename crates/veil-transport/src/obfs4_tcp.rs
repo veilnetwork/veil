@@ -61,6 +61,19 @@ const OBFS4_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 const OBFS4_BACKUP_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
+// On Android a newly connected socket can remain stuck retransmitting its
+// first data after a radio change. Allow several retransmissions on each
+// canonical candidate, then let the connector try fresh sockets. A peer that
+// ACKs the data can still use the full obfs4 handshake budget.
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+const MOBILE_INITIAL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+#[derive(Clone, Copy)]
+pub(crate) enum Obfs4Dial {
+    Canonical,
+    Auxiliary,
+}
+
 // A black-holed TCP flow need not imply that another flow to the same address
 // is broken. Race at most one delayed candidate; keep a slow valid primary,
 // and never spawn a detached task. The caller owns the unchanged TOTAL budget.
@@ -126,6 +139,7 @@ fn psk_from_context(ctx: &TransportContext) -> Result<NodeIdMacKey> {
 pub(crate) async fn connect_obfs4_stream(
     uri: &TransportUri,
     ctx: Arc<TransportContext>,
+    dial: Obfs4Dial,
 ) -> Result<(super::traits::PeerMeta, Obfs4Stream<HandshakeStream>)> {
     let (host, port) = obfs4_parts(uri)?;
     let psk = psk_from_context(&ctx)?;
@@ -154,7 +168,7 @@ pub(crate) async fn connect_obfs4_stream(
     let selected = tokio::time::timeout(
         OBFS4_HANDSHAKE_TIMEOUT,
         connect_with_backup(
-            finish_client_handshake(stream, uri, &psk, ctx.obfs4_client_variant),
+            finish_client_handshake(stream, uri, &psk, ctx.obfs4_client_variant, dial),
             || async {
                 let tcp_connect_started_us = HandshakeStream::connect_start_clock();
                 let tcp = connect_tcp_stream(host, port, &ctx).await?;
@@ -164,7 +178,7 @@ pub(crate) async fn connect_obfs4_stream(
                     tcp_connect_started_us,
                 )
                 .for_attempt(attempt, "backup");
-                finish_client_handshake(stream, uri, &psk, ctx.obfs4_client_variant).await
+                finish_client_handshake(stream, uri, &psk, ctx.obfs4_client_variant, dial).await
             },
             OBFS4_BACKUP_DELAY,
         ),
@@ -180,7 +194,13 @@ async fn finish_client_handshake(
     uri: &TransportUri,
     psk: &NodeIdMacKey,
     variant: WireFormatVariant,
+    _dial: Obfs4Dial,
 ) -> Result<(super::traits::PeerMeta, Obfs4Stream<HandshakeStream>)> {
+    #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+    let reset_ack_timeout = matches!(_dial, Obfs4Dial::Canonical)
+        && socket2::SockRef::from(stream.socket())
+            .set_tcp_user_timeout(Some(MOBILE_INITIAL_ACK_TIMEOUT))
+            .is_ok();
     let peer = peer_meta(
         "obfs4-tcp",
         uri.clone(),
@@ -191,6 +211,13 @@ async fn finish_client_handshake(
         .await
         .map_err(|e| TransportError::Tls(format!("obfs4 client handshake: {e}")))?;
     wrapped.get_ref().complete();
+    // The socket now belongs to a potentially long-lived overlay session.
+    // If restoring the default fails, do not publish a session with the
+    // shorter timeout still applied.
+    #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+    if reset_ack_timeout {
+        socket2::SockRef::from(wrapped.get_ref().socket()).set_tcp_user_timeout(None)?;
+    }
     Ok((peer, wrapped))
 }
 
@@ -209,7 +236,8 @@ impl Transport for Obfs4TcpTransport {
         ctx: Arc<TransportContext>,
     ) -> BoxFuture<'a, Result<Box<dyn TransportConnection>>> {
         Box::pin(async move {
-            let (peer, wrapped) = connect_obfs4_stream(uri, Arc::clone(&ctx)).await?;
+            let (peer, wrapped) =
+                connect_obfs4_stream(uri, Arc::clone(&ctx), Obfs4Dial::Canonical).await?;
             let offer = super::stream_parallel::StreamParallelHandle::new(ctx, Some(uri.clone()));
             Ok(boxed_stream_connection_obfs4(peer, wrapped, Some(offer)))
         })
