@@ -3867,6 +3867,24 @@ uint64_t veil_media_open_relay_channel(VeilApp *app,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Open the same sealed relay channel, with a shorter preparation scope for
+ * callers that currently need only the primary lane. Visual lanes remain
+ * available for a later upgrade and still warm when used.
+ */
+
+uint64_t veil_media_open_relay_channel_with_preparation(VeilApp *app,
+                                                        const uint8_t *peer_node_id,
+                                                        const uint8_t *peer_app_id,
+                                                        uint32_t peer_endpoint_id,
+                                                        const uint8_t *tx_key,
+                                                        const uint8_t *rx_key,
+                                                        bool primary_only,
+                                                        char **err_out)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Set the channel's secondary local IPC sender before starting media. It must
  * bind the same application identity as the primary sender. No sender role
  * or local endpoint id is added to network packets. Returns 0 on success,

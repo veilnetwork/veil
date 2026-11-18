@@ -293,7 +293,8 @@ int _relayMediaOpenChannelWorker(
     Uint8List txKey,
     Uint8List rxKey,
     int secondaryAppAddr,
-    int screenAppAddr) {
+    int screenAppAddr,
+    bool primaryOnlyPreparation) {
   final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
   final pn = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerNode);
   final pa = calloc<Uint8>(32)..asTypedList(32).setAll(0, peerApp);
@@ -301,8 +302,11 @@ int _relayMediaOpenChannelWorker(
   final rx = calloc<Uint8>(32)..asTypedList(32).setAll(0, rxKey);
   final errOut = calloc<Pointer<Utf8>>();
   try {
-    final chan = ffi.veilMediaOpenRelayChannel(
-        app, pn, pa, peerEndpoint, tx, rx, errOut);
+    final chan = primaryOnlyPreparation
+        ? ffi.veilMediaOpenRelayChannelWithPreparation(
+            app, pn, pa, peerEndpoint, tx, rx, true, errOut)
+        : ffi.veilMediaOpenRelayChannel(
+            app, pn, pa, peerEndpoint, tx, rx, errOut);
     if (chan == 0) {
       throw VeilException(
           'relay media open failed: ${_readErrAndFree(errOut)}');
@@ -2978,6 +2982,8 @@ class AppHandle implements Finalizable {
   /// identities are direct but P2P is unavailable.
   /// [secondarySender] isolates local video writes and must bind the same app
   /// identity. Keep it open until the media channel closes.
+  /// A caller that currently needs only audio can set [primaryOnlyPreparation]
+  /// to prepare the primary lane. Visual lanes remain available on upgrade.
   Future<int> openRelayMediaChannel({
     required Uint8List dstNodeId,
     required Uint8List dstAppId,
@@ -2986,6 +2992,7 @@ class AppHandle implements Finalizable {
     required Uint8List rxKey,
     AppHandle? secondarySender,
     AppHandle? screenSender,
+    bool primaryOnlyPreparation = false,
   }) async {
     _ensureOpen();
     secondarySender?._ensureOpen();
@@ -3007,7 +3014,8 @@ class AppHandle implements Finalizable {
         txKey,
         rxKey,
         secondaryAppAddr,
-        screenAppAddr));
+        screenAppAddr,
+        primaryOnlyPreparation));
   }
 
   static bool get supportsMediaFeedbackSender =>
