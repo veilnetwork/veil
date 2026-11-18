@@ -196,13 +196,20 @@ impl SessionRegistry {
     /// to fan out to every live instance MUST use
     /// [`Self::peer_ids_for_identity`].
     pub fn get_by_node_id(&self, node_id: &NodeId) -> Option<&SessionEntry> {
-        let node_id_bytes = node_id.as_bytes();
+        self.sessions_for_identity(node_id).next()
+    }
+
+    /// Committed handshakes indexed under the identity they verified. Callers
+    /// deciding whether they can send must also check the current TX owner.
+    pub fn sessions_for_identity(&self, node_id: &NodeId) -> impl Iterator<Item = &SessionEntry> {
+        let node_id = *node_id.as_bytes();
         self.by_identity
-            .get(node_id_bytes)?
-            .iter()
-            .find_map(|inst| {
+            .get(&node_id)
+            .into_iter()
+            .flatten()
+            .filter_map(move |inst| {
                 self.by_identity_instance
-                    .get(&(*node_id_bytes, *inst))
+                    .get(&(node_id, *inst))
                     .and_then(|sid| self.sessions.get(sid))
             })
     }

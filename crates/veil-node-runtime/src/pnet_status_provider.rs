@@ -5,76 +5,49 @@
 //! When P-Net is not enabled the certificate cache stays empty, so queries
 //! reply `has_cert=false`; a live public-mode session can still be admitted.
 //!
-//! `admitted` is derived from `live_sessions`: even if a cert is
-//! cached, the peer might have disconnected since; surfacing a
-//! stale admission status would break failover semantics on
-//! the IPC consumer side.
+//! `admitted` requires a completed handshake and its current TX owner. The
+//! sender can be retired before the runner finishes tearing down, or reserved
+//! before the successor commits its handshake.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
+use veil_cfg::NodeId;
 use veil_ipc::PnetStatusProvider;
 use veil_proto::PnetStatusResultPayload;
+use veil_session::{SessionEntry, SessionRegistry, SessionTxRegistry};
 use veil_types::MembershipCert;
-
-use crate::types::{LinkId, SessionInfo};
-
-/// Snapshot of `live_sessions` keyed by peer node_id for fast
-/// `admitted=?` lookups (the live_sessions map is keyed by `LinkId`
-/// so a direct query is O(N) — acceptable for testnet but not for
-/// production IPC traffic).
-pub type LiveSessionsArc = Arc<std::sync::Mutex<std::collections::BTreeMap<LinkId, SessionInfo>>>;
+use veil_util::{lock, rlock};
 
 pub struct DaemonPnetStatus {
     verified_peer_certs: Arc<RwLock<HashMap<[u8; 32], MembershipCert>>>,
-    live_sessions: LiveSessionsArc,
+    sessions: Arc<Mutex<SessionRegistry>>,
+    tx: Arc<RwLock<SessionTxRegistry>>,
 }
 
 impl DaemonPnetStatus {
     pub fn new(
         verified_peer_certs: Arc<RwLock<HashMap<[u8; 32], MembershipCert>>>,
-        live_sessions: LiveSessionsArc,
+        sessions: Arc<Mutex<SessionRegistry>>,
+        tx: Arc<RwLock<SessionTxRegistry>>,
     ) -> Self {
         Self {
             verified_peer_certs,
-            live_sessions,
+            sessions,
+            tx,
         }
     }
 
     pub(crate) fn is_admitted(&self, peer_node_id: &[u8; 32]) -> bool {
-        // O(N) scan through live_sessions — N ≈ active session count
-        // (testnet: ≤ 100, production sessions plane uses up to 65K
-        // per Epic 302 sizing).  Acceptable for a per-stream IPC query
-        // since ogate / oproxy cache the result aggressively.
-        let g = match self.live_sessions.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        g.values().any(|info| {
-            // EITHER NAME OF THE SAME PEER.
-            //
-            // `node_id` is the device the handshake proved; `sovereign_node_id`
-            // is the identity that device proved it belongs to. An app asks
-            // about its CONTACT, and a contact is published as an identity —
-            // so matching only the device answered "no session" while a live
-            // direct session to that very person sat in this map. Measured on
-            // the stand 2026-09-19: `session.open state=active` under
-            // `fe9c1b06…`, `admitted=false` for `56d3769d…`, and the call
-            // negotiated to relay on the strength of that false.
-            //
-            // Both are checked, not one substituted for the other: a peer
-            // dialled BY device id must still answer to that id, and a legacy
-            // peer has no identity to answer to at all.
-            info.node_id
-                .as_ref()
-                .map(|n| n.as_bytes() == peer_node_id)
-                .unwrap_or(false)
-                || info
-                    .sovereign_node_id
-                    .as_ref()
-                    .map(|n| n.as_bytes() == peer_node_id)
-                    .unwrap_or(false)
-        })
+        // Match the runtime lock order and require the same owner in both
+        // registries. An old committed entry cannot admit a reserved successor.
+        let sessions = lock!(self.sessions);
+        let tx = rlock!(self.tx);
+        let name = NodeId::from(*peer_node_id);
+        let owns_sender =
+            |entry: &SessionEntry| tx.owns_live_session(&entry.remote_node_id, &entry.session_id);
+        sessions.get_by_peer_id(&name).is_some_and(owns_sender)
+            || sessions.sessions_for_identity(&name).any(owns_sender)
     }
 }
 
@@ -110,44 +83,75 @@ impl PnetStatusProvider for DaemonPnetStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{SessionSource, SessionState};
-    use veil_cfg::{NodeId, PeerId};
+    use veil_identity::verify::ValidatedIdentity;
+    use veil_proto::session::{AttachPayload, CapabilitiesPayload, IdentityPayload};
+    use veil_session::{FrameOutbox, RemoteRole};
 
     const DEVICE: [u8; 32] = [0xfeu8; 32];
     const IDENTITY: [u8; 32] = [0x56u8; 32];
     const STRANGER: [u8; 32] = [0x11u8; 32];
+    const OWNER: [u8; 32] = [0x42; 32];
 
     /// One live direct session, proved as `device` and belonging to
     /// `sovereign` — the shape a sovereign install actually produces.
-    fn provider(device: [u8; 32], sovereign: Option<[u8; 32]>) -> DaemonPnetStatus {
-        let mut sessions = std::collections::BTreeMap::new();
-        sessions.insert(
-            LinkId::new(1),
-            SessionInfo {
-                link_id: LinkId::new(1),
-                node_id: Some(NodeId::from(device)),
-                sovereign_node_id: sovereign.map(NodeId::from),
-                nonce: None,
-                matched_peer_id: None,
-                source: SessionSource::Outbound(PeerId::new(0x8800_0000)),
-                listener_handle: None,
-                state: SessionState::Active,
-                transport: "quic://192.168.1.111:9000".to_owned(),
-                remote_addr: None,
-                description: String::new(),
+    fn entry(device: [u8; 32], sovereign: Option<[u8; 32]>, owner: [u8; 32]) -> SessionEntry {
+        SessionEntry {
+            session_id: owner,
+            remote_node_id: device,
+            remote_identity: IdentityPayload {
+                algo: 1,
+                public_key: vec![5; 32],
+                nonce: vec![3; 16],
+                node_id: device,
+                mlkem_pubkey: None,
             },
-        );
-        DaemonPnetStatus::new(
+            remote_capabilities: CapabilitiesPayload {
+                roles_supported: 0,
+                flags: 0,
+                extra_flags: 0,
+                extra_flags2: 0,
+                discovery_mode: 0,
+            },
+            remote_attach: AttachPayload {
+                role: 0,
+                realm_id: 0,
+                attach_epoch: 1,
+                mailbox_preference_count: 0,
+                gateway_preference_count: 0,
+                flags: 0,
+            },
+            remote_role: RemoteRole::Leaf,
+            validated_sovereign_identity: sovereign.map(|node_id| ValidatedIdentity {
+                node_id,
+                master_algo: 1,
+                master_pubkey: vec![1; 32],
+                active_identity_pubkey: vec![2; 32],
+                active_identity_algo: 1,
+                active_key_idx: 0,
+                active_device_id: device,
+                active_instance_id: [device[0]; 16],
+            }),
+        }
+    }
+
+    fn provider(device: [u8; 32], sovereign: Option<[u8; 32]>) -> (DaemonPnetStatus, FrameOutbox) {
+        let mut sessions = SessionRegistry::new();
+        sessions.insert(entry(device, sovereign, OWNER));
+        let mut tx = SessionTxRegistry::new();
+        let outbox = tx.register_owned(device, OWNER);
+        let status = DaemonPnetStatus::new(
             Arc::new(RwLock::new(HashMap::new())),
             Arc::new(std::sync::Mutex::new(sessions)),
-        )
+            Arc::new(RwLock::new(tx)),
+        );
+        (status, outbox)
     }
 
     /// The question an APP asks is about a CONTACT, and a contact is an
     /// identity. A live session to that person's device must answer it.
     #[test]
     fn a_session_to_a_device_admits_its_identity() {
-        let p = provider(DEVICE, Some(IDENTITY));
+        let (p, _outbox) = provider(DEVICE, Some(IDENTITY));
         assert!(
             p.is_admitted(&IDENTITY),
             "a live direct session to this identity's device must admit the identity",
@@ -158,14 +162,14 @@ mod tests {
     /// still answers to that id.
     #[test]
     fn the_device_still_admits_itself() {
-        let p = provider(DEVICE, Some(IDENTITY));
+        let (p, _outbox) = provider(DEVICE, Some(IDENTITY));
         assert!(p.is_admitted(&DEVICE), "the device must still admit itself");
     }
 
     /// Neither name may admit a third party.
     #[test]
     fn a_stranger_is_not_admitted() {
-        let p = provider(DEVICE, Some(IDENTITY));
+        let (p, _outbox) = provider(DEVICE, Some(IDENTITY));
         assert!(
             !p.is_admitted(&STRANGER),
             "an unrelated node must not be admitted"
@@ -176,11 +180,45 @@ mod tests {
     /// an identity must not become admitted on the strength of its absence.
     #[test]
     fn no_proof_admits_only_the_device() {
-        let p = provider(DEVICE, None);
+        let (p, _outbox) = provider(DEVICE, None);
         assert!(p.is_admitted(&DEVICE));
         assert!(
             !p.is_admitted(&IDENTITY),
             "without a proof the identity has nothing to be admitted by",
         );
+    }
+
+    #[test]
+    fn old_committed_owner_cannot_admit_an_uncommitted_replacement() {
+        let (p, _old) = provider(DEVICE, Some(IDENTITY));
+        let successor = [0x43; 32];
+        let new = p.tx.write().unwrap().register_owned(DEVICE, successor);
+        assert!(!p.is_admitted(&DEVICE));
+        assert!(!p.is_admitted(&IDENTITY));
+
+        p.sessions
+            .lock()
+            .unwrap()
+            .insert(entry(DEVICE, None, successor));
+        assert!(p.is_admitted(&DEVICE));
+        assert!(!p.is_admitted(&IDENTITY));
+        drop(new);
+        assert!(!p.is_admitted(&DEVICE));
+    }
+
+    #[test]
+    fn a_retired_device_does_not_hide_its_committed_sibling() {
+        let (p, _old) = provider(DEVICE, Some(IDENTITY));
+        let sibling = [0xfa; 32];
+        let sibling_owner = [0x44; 32];
+        let _new = p.tx.write().unwrap().register_owned(sibling, sibling_owner);
+        p.sessions
+            .lock()
+            .unwrap()
+            .insert(entry(sibling, Some(IDENTITY), sibling_owner));
+        p.tx.write().unwrap().unregister(&DEVICE);
+        assert!(!p.is_admitted(&DEVICE));
+        assert!(p.is_admitted(&sibling));
+        assert!(p.is_admitted(&IDENTITY));
     }
 }
