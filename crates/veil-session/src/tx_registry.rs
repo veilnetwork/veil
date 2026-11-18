@@ -53,6 +53,10 @@ use crate::frame_outbox::{
     BuildSendError, FrameOutbox, FrameSender, frame_channel_with_source_activity,
 };
 
+// A recreated registry for the same node must not reuse the witness of a
+// prior route lookup that is still in the endpoint's short-lived cache.
+static NEXT_TX_REGISTRATION: AtomicU64 = AtomicU64::new(1);
+
 /// A priority-tagged frame: `(priority, frame_bytes)`.
 ///
 /// `PooledShared` is a refcounted handle whose final drop returns its
@@ -96,7 +100,7 @@ pub struct SessionTxRegistry {
     /// tick runs at second granularity, not millis.
     last_active: HashMap<NodeIdBytes, AtomicU64>,
     capacity: usize,
-    next_registration: u64,
+    latest_registration: u64,
     /// Cumulative count of frames dropped because a session channel was full.
     drops_total: Arc<AtomicU64>,
 }
@@ -122,7 +126,7 @@ impl Default for SessionTxRegistry {
             senders: HashMap::new(),
             last_active: HashMap::new(),
             capacity: DEFAULT_TX_QUEUE_DEPTH,
-            next_registration: 0,
+            latest_registration: 0,
             drops_total: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -186,7 +190,7 @@ impl SessionTxRegistry {
             senders: HashMap::new(),
             last_active: HashMap::new(),
             capacity,
-            next_registration: 0,
+            latest_registration: 0,
             drops_total: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -202,7 +206,7 @@ impl SessionTxRegistry {
             senders: HashMap::new(),
             last_active: HashMap::new(),
             capacity,
-            next_registration: 0,
+            latest_registration: 0,
             drops_total,
         }
     }
@@ -257,7 +261,7 @@ impl SessionTxRegistry {
         self.prune_closed();
         let (tx, mut rx) =
             frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
-        self.next_registration = self.next_registration.wrapping_add(1);
+        self.latest_registration = NEXT_TX_REGISTRATION.fetch_add(1, Ordering::Relaxed);
         self.senders.insert(
             peer_id,
             SessionTxEntry {
@@ -265,7 +269,7 @@ impl SessionTxRegistry {
                 tx,
                 owner: None,
                 direct_app_chunks: false,
-                registration: self.next_registration,
+                registration: self.latest_registration,
             },
         );
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
@@ -283,7 +287,7 @@ impl SessionTxRegistry {
         self.prune_closed();
         let (tx, mut rx) =
             frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
-        self.next_registration = self.next_registration.wrapping_add(1);
+        self.latest_registration = NEXT_TX_REGISTRATION.fetch_add(1, Ordering::Relaxed);
         self.senders.insert(
             peer_id,
             SessionTxEntry {
@@ -291,7 +295,7 @@ impl SessionTxRegistry {
                 tx,
                 owner: Some(owner),
                 direct_app_chunks: false,
-                registration: self.next_registration,
+                registration: self.latest_registration,
             },
         );
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
@@ -316,7 +320,7 @@ impl SessionTxRegistry {
         }
         let (tx, mut rx) =
             frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
-        self.next_registration = self.next_registration.wrapping_add(1);
+        self.latest_registration = NEXT_TX_REGISTRATION.fetch_add(1, Ordering::Relaxed);
         self.senders.insert(
             peer_id,
             SessionTxEntry {
@@ -324,7 +328,7 @@ impl SessionTxRegistry {
                 tx,
                 owner: None,
                 direct_app_chunks: false,
-                registration: self.next_registration,
+                registration: self.latest_registration,
             },
         );
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
@@ -417,7 +421,7 @@ impl SessionTxRegistry {
 
         let (tx, mut rx) =
             frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
-        self.next_registration = self.next_registration.wrapping_add(1);
+        self.latest_registration = NEXT_TX_REGISTRATION.fetch_add(1, Ordering::Relaxed);
         self.senders.insert(
             peer_id,
             SessionTxEntry {
@@ -425,7 +429,7 @@ impl SessionTxRegistry {
                 tx,
                 owner: Some(owner),
                 direct_app_chunks: false,
-                registration: self.next_registration,
+                registration: self.latest_registration,
             },
         );
         self.last_active.insert(peer_id, AtomicU64::new(now_ms()));
@@ -969,6 +973,10 @@ impl SessionTxRegistry {
             .get(peer)
             .filter(|entry| !entry.tx.is_closed())
             .map(|entry| entry.registration)
+    }
+
+    pub(crate) fn latest_registration(&self) -> u64 {
+        self.latest_registration
     }
 
     /// Is this exact authenticated session still the live owner? Callers that

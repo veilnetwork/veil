@@ -50,6 +50,10 @@ impl SessionTxBroadcaster {
 }
 
 impl veil_types::FrameBroadcaster for SessionTxBroadcaster {
+    fn latest_tx_registration(&self) -> Option<u64> {
+        Some(rlock!(self.inner).latest_registration())
+    }
+
     fn local_datagram_channel_state(
         &self,
         peer_id: &[u8; 32],
