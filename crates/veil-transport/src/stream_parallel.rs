@@ -90,7 +90,11 @@ impl StreamParallelHandle {
         let (peer, stream) = tokio::select! {
             biased;
             _ = self.0.parent.cancelled() => return Err(TransportError::Io(parent_closed())),
-            result = crate::obfs4_tcp::connect_obfs4_stream(target, Arc::clone(&self.0.context)) => result?,
+            result = crate::obfs4_tcp::connect_obfs4_stream(
+                target,
+                Arc::clone(&self.0.context),
+                crate::obfs4_tcp::Obfs4Dial::Auxiliary,
+            ) => result?,
         };
         let binding = stream.channel_binding();
         let stream = crate::obfs4_tcp::boxed_obfs4_io(stream);

@@ -259,3 +259,91 @@ async fn stalled_first_flow_uses_an_authenticated_second_socket_and_closes_the_f
 async fn unauthenticated_backup_cannot_replace_a_valid_primary() {
     real_socket_fixture(false).await;
 }
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+mod initial_ack {
+    use super::*;
+    use socket2::{SockFilter, SockRef};
+    use tokio::net::TcpStream;
+
+    async fn connected_pair() -> (TransportUri, TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, server) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let uri = TransportUri::parse(&format!("obfs4-tcp://{addr}")).unwrap();
+        (uri, client.unwrap(), server.unwrap().0)
+    }
+
+    async fn blocked_handshake(dial: Obfs4Dial) -> bool {
+        let (uri, client, server) = connected_pair().await;
+        // Drop incoming packets on this accepted loopback socket so the
+        // client sends its first flight over TCP without receiving any ACK.
+        const BPF_RET_K: u16 = 0x06;
+        let reject = SockFilter::new(BPF_RET_K, 0, 0, 0);
+        SockRef::from(&server).attach_filter(&[reject]).unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(8),
+            finish_client_handshake(
+                HandshakeStream::new(client, HandshakeSide::Client),
+                &uri,
+                &NodeIdMacKey([42; 32]),
+                WireFormatVariant::V1,
+                dial,
+            ),
+        )
+        .await;
+        match outcome {
+            Ok(Err(TransportError::Tls(error))) => {
+                assert!(
+                    error.contains(&std::io::Error::from_raw_os_error(libc::ETIMEDOUT).to_string())
+                );
+                true
+            }
+            Err(_) => false,
+            _ => panic!("black-holed loopback handshake returned an unexpected outcome"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unacked_first_flight_can_expire_before_the_obfs4_deadline() {
+        let (canonical, auxiliary) = tokio::join!(
+            blocked_handshake(Obfs4Dial::Canonical),
+            blocked_handshake(Obfs4Dial::Auxiliary),
+        );
+        assert!(canonical, "canonical TCP waited for the outer watchdog");
+        assert!(!auxiliary, "auxiliary TCP acquired the short timeout");
+    }
+
+    #[tokio::test]
+    async fn acked_first_flight_can_wait_and_upgraded_socket_uses_default() {
+        let (uri, client, server) = connected_pair().await;
+        let psk = NodeIdMacKey([42; 32]);
+        let client = finish_client_handshake(
+            HandshakeStream::new(client, HandshakeSide::Client),
+            &uri,
+            &psk,
+            WireFormatVariant::V1,
+            Obfs4Dial::Canonical,
+        );
+        let server = async {
+            // The kernel ACKs the client's bytes while obfs4 is still
+            // waiting for the server application to answer.
+            tokio::time::sleep(MOBILE_INITIAL_ACK_TIMEOUT + Duration::from_millis(500)).await;
+            veil_obfs4::obfs4_server_accept(server, &psk).await
+        };
+        let (client, server) = tokio::time::timeout(OBFS4_HANDSHAKE_TIMEOUT, async {
+            tokio::join!(client, server)
+        })
+        .await
+        .unwrap();
+        let client = client.unwrap().1;
+        let server = server.unwrap();
+        assert_eq!(client.channel_binding(), server.channel_binding());
+        assert_eq!(
+            SockRef::from(client.get_ref().socket())
+                .tcp_user_timeout()
+                .unwrap(),
+            None
+        );
+    }
+}
