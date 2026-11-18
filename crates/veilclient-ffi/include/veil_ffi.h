@@ -3050,6 +3050,26 @@ int veil_identity_document_authorizes(const uint8_t *doc_ptr,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Does the current, verified document of `node_id_32` explicitly revoke
+ * `device_id_32`? Returns 1 for a tombstone, 0 otherwise, and -1 for invalid
+ * arguments or a document that cannot be verified for this identity.
+ *
+ * Absence of a tombstone is NOT authorization. In particular, this does not
+ * admit an unknown device or replace delegation/session proof checks.
+ *
+ * # Safety
+ * `doc_ptr` must be readable for `doc_len` bytes; both id pointers for 32.
+ */
+
+int veil_identity_document_device_revoked(const uint8_t *doc_ptr,
+                                          size_t doc_len,
+                                          const uint8_t *node_id_32,
+                                          const uint8_t *device_id_32)
+;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Did this document authorise `pubkey_32` for something written at
  * `at_unix_secs`?
  *
@@ -3273,6 +3293,8 @@ char *veil_config_compose(const uint8_t *identity_toml_ptr,
  * Start an embedded node from a config file at `config_path` (`(ptr,len)`,
  * UTF-8). Non-blocking. Returns an opaque handle, or null with `*err_out` set
  * (free it with `veil_free_string`).
+ * The host retains its SIGINT/SIGTERM/SIGHUP handlers; use `veil_node_stop*`
+ * to stop this node without affecting the host process or sibling nodes.
  *
  * # Safety
  * `config_path_ptr` must point to `config_path_len` readable bytes; `err_out`
