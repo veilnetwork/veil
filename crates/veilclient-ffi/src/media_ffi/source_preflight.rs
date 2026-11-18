@@ -337,7 +337,15 @@ pub(super) fn install_and_prepare(chan: u64, app: Arc<VeilApp>) {
     // Existing direct/relay open is a blocking FFI operation on the SDK worker.
     // A legacy peer can consume the unknown subtype; its silence only expires
     // this best-effort bounded observation, never fails the established open.
+    let started = Instant::now();
     let ready = app.bundle.runtime.block_on(context.run());
+    if veil_session::rt_trace::rt_trace_enabled() {
+        log::info!(
+            "media.forward_prepare route={:?} ready={ready} elapsed_ms={}",
+            context.route,
+            started.elapsed().as_millis(),
+        );
+    }
     media::diag(format_args!("forwarding preparation ready={ready}"));
 }
 
