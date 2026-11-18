@@ -261,6 +261,44 @@ pub unsafe extern "C" fn veil_identity_document_authorizes(
     }
 }
 
+/// Does the current, verified document of `node_id_32` explicitly revoke
+/// `device_id_32`? Returns 1 for a tombstone, 0 otherwise, and -1 for invalid
+/// arguments or a document that cannot be verified for this identity.
+///
+/// Absence of a tombstone is NOT authorization. In particular, this does not
+/// admit an unknown device or replace delegation/session proof checks.
+///
+/// # Safety
+/// `doc_ptr` must be readable for `doc_len` bytes; both id pointers for 32.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_identity_document_device_revoked(
+    doc_ptr: *const u8,
+    doc_len: size_t,
+    node_id_32: *const u8,
+    device_id_32: *const u8,
+) -> c_int {
+    if doc_ptr.is_null() || node_id_32.is_null() || device_id_32.is_null() {
+        return SIGN_ERR;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(doc_ptr, doc_len) };
+    let identity = unsafe { std::slice::from_raw_parts(node_id_32, 32) };
+    let device = unsafe { std::slice::from_raw_parts(device_id_32, 32) };
+    let Ok(doc) = veil_proto::identity_document::IdentityDocument::decode(bytes) else {
+        return SIGN_ERR;
+    };
+    let now = veil_util::unix_secs_now_u64();
+    if doc.node_id != identity
+        || veil_identity::verify::verify_identity_document(&doc, now).is_err()
+    {
+        return SIGN_ERR;
+    }
+    c_int::from(
+        doc.revoked_devices
+            .iter()
+            .any(|entry| entry.device_id == device),
+    )
+}
+
 /// Did this document authorise `pubkey_32` for something written at
 /// `at_unix_secs`?
 ///
@@ -386,6 +424,65 @@ mod tests {
                 pubkey.as_ptr(),
                 at,
             )
+        }
+    }
+
+    fn device_revoked(doc: &[u8], identity: &[u8; 32], device: &[u8; 32]) -> c_int {
+        unsafe {
+            veil_identity_document_device_revoked(
+                doc.as_ptr(),
+                doc.len(),
+                identity.as_ptr(),
+                device.as_ptr(),
+            )
+        }
+    }
+
+    #[test]
+    fn device_tombstone_lookup_is_verified_and_identity_scoped() {
+        use veil_identity::sovereign_flow::{
+            MasterSecret, revoke_identity_device, save_standalone_identity_to_dir,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let seed = veil_util::sensitive_bytes::SensitiveBytesN::<32>::from_bytes([0x5C; 32]);
+        let now = veil_util::unix_secs_now_u64();
+        save_standalone_identity_to_dir(dir.path(), &seed, now - 3600, now + 86_400).unwrap();
+        let path = dir.path().join("identity_document.bin");
+        let before = std::fs::read(&path).unwrap();
+        let parsed = veil_proto::identity_document::IdentityDocument::decode(&before).unwrap();
+        let identity = parsed.node_id;
+        let mine = parsed.identity_keys[0].device_id;
+        let removed = [0xA7; 32];
+        assert_eq!(device_revoked(&before, &identity, &mine), 0);
+        // Unknown is not a tombstone; this API must not invent authorization.
+        assert_eq!(device_revoked(&before, &identity, &removed), 0);
+        assert!(
+            revoke_identity_device(
+                dir.path(),
+                MasterSecret::SigningKey(zeroize::Zeroizing::new(*seed.as_array())),
+                &removed,
+                now
+            )
+            .unwrap()
+        );
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(device_revoked(&after, &identity, &removed), 1);
+        assert_eq!(device_revoked(&after, &identity, &mine), 0);
+        assert_eq!(device_revoked(&after, &[0x71; 32], &removed), SIGN_ERR);
+        let mut tampered = after.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert_eq!(device_revoked(&tampered, &identity, &removed), SIGN_ERR);
+        assert_eq!(device_revoked(b"invalid", &identity, &removed), SIGN_ERR);
+        assert_eq!(device_revoked(&[], &identity, &removed), SIGN_ERR);
+        for (doc, node, device) in [
+            (std::ptr::null(), identity.as_ptr(), removed.as_ptr()),
+            (after.as_ptr(), std::ptr::null(), removed.as_ptr()),
+            (after.as_ptr(), identity.as_ptr(), std::ptr::null()),
+        ] {
+            assert_eq!(
+                unsafe { veil_identity_document_device_revoked(doc, after.len(), node, device) },
+                SIGN_ERR
+            );
         }
     }
 
