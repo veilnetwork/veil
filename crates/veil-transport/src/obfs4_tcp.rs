@@ -129,11 +129,12 @@ pub(crate) async fn connect_obfs4_stream(
 ) -> Result<(super::traits::PeerMeta, Obfs4Stream<HandshakeStream>)> {
     let (host, port) = obfs4_parts(uri)?;
     let psk = psk_from_context(&ctx)?;
+    let tcp_connect_started_us = HandshakeStream::connect_start_clock();
     let tcp = connect_tcp_stream(host, port, &ctx).await?;
-    let stream = HandshakeStream::new_in_context(
+    let stream = HandshakeStream::new_client_after_connect(
         tcp,
-        HandshakeSide::Client,
         ctx.tracing.tcp_connect_context(),
+        tcp_connect_started_us,
     );
     let attempt = stream.connection_id();
     let stream = stream.for_attempt(attempt, "primary");
@@ -155,11 +156,12 @@ pub(crate) async fn connect_obfs4_stream(
         connect_with_backup(
             finish_client_handshake(stream, uri, &psk, ctx.obfs4_client_variant),
             || async {
+                let tcp_connect_started_us = HandshakeStream::connect_start_clock();
                 let tcp = connect_tcp_stream(host, port, &ctx).await?;
-                let stream = HandshakeStream::new_in_context(
+                let stream = HandshakeStream::new_client_after_connect(
                     tcp,
-                    HandshakeSide::Client,
                     ctx.tracing.tcp_connect_context(),
+                    tcp_connect_started_us,
                 )
                 .for_attempt(attempt, "backup");
                 finish_client_handshake(stream, uri, &psk, ctx.obfs4_client_variant).await
