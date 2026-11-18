@@ -2184,6 +2184,30 @@ final int Function(
             )>>('veil_media_open_relay_channel')
     .asFunction();
 
+final int Function(
+  Pointer<VeilApp>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  bool,
+  Pointer<Pointer<Utf8>>,
+) veilMediaOpenRelayChannelWithPreparation = nativeLib
+    .lookup<
+        NativeFunction<
+            Uint64 Function(
+              Pointer<VeilApp>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Uint32,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Bool,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_media_open_relay_channel_with_preparation')
+    .asFunction();
+
 // A second local IPC sender with the same app identity. No role is sent to peers.
 final int Function(int, Pointer<VeilApp>, Pointer<Pointer<Utf8>>)
     veilMediaChannelSetSecondarySender = nativeLib

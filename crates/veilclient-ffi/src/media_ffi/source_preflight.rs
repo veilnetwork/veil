@@ -33,13 +33,15 @@ fn decode(body: &[u8]) -> Option<(usize, ProbeControl)> {
 }
 
 struct Attempt {
-    probes: [RouteProbe; PLANES],
+    probes: Vec<RouteProbe>,
 }
 
 impl Attempt {
-    fn new(route: ProbeRoute, now: Instant) -> Self {
+    fn new(route: ProbeRoute, now: Instant, primary_only: bool) -> Self {
         Self {
-            probes: std::array::from_fn(|_| RouteProbe::begin(route, now, BUDGET)),
+            probes: (0..if primary_only { 1 } else { PLANES })
+                .map(|_| RouteProbe::begin(route, now, BUDGET))
+                .collect(),
         }
     }
 
@@ -70,7 +72,9 @@ impl Attempt {
     }
 
     fn observe(&mut self, plane: usize, control: ProbeControl, now: Instant) {
-        self.probes[plane].observe(control, now);
+        if let Some(probe) = self.probes.get_mut(plane) {
+            probe.observe(control, now);
+        }
     }
 
     fn cancel(&mut self) {
@@ -202,11 +206,11 @@ impl Context {
         }
     }
 
-    pub(super) async fn run(&self) -> bool {
+    pub(super) async fn run(&self, primary_only: bool) -> bool {
         if !self.live() {
             return false;
         }
-        let attempt = Attempt::new(self.route, Instant::now());
+        let attempt = Attempt::new(self.route, Instant::now(), primary_only);
         let deadline = tokio::time::Instant::from_std(attempt.probes[0].deadline());
         let initial = attempt.initial();
         *self.attempt.lock().unwrap_or_else(|p| p.into_inner()) = Some(attempt);
@@ -330,7 +334,7 @@ pub(super) fn install(chan: u64, app: Arc<VeilApp>) -> Option<Arc<Context>> {
     Some(context)
 }
 
-pub(super) fn install_and_prepare(chan: u64, app: Arc<VeilApp>) {
+pub(super) fn install_and_prepare(chan: u64, app: Arc<VeilApp>, primary_only: bool) {
     let Some(context) = install(chan, Arc::clone(&app)) else {
         return;
     };
@@ -338,7 +342,7 @@ pub(super) fn install_and_prepare(chan: u64, app: Arc<VeilApp>) {
     // A legacy peer can consume the unknown subtype; its silence only expires
     // this best-effort bounded observation, never fails the established open.
     let started = Instant::now();
-    let ready = app.bundle.runtime.block_on(context.run());
+    let ready = app.bundle.runtime.block_on(context.run(primary_only));
     if veil_session::rt_trace::rt_trace_enabled() {
         log::info!(
             "media.forward_prepare route={:?} ready={ready} elapsed_ms={}",
@@ -423,8 +427,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn audio_only_preflight_still_requires_a_fresh_primary_echo() {
+        let now = Instant::now();
+        let mut attempt = Attempt::new(ProbeRoute::Relay, now, true);
+        let requests = attempt.initial();
+        assert_eq!(requests.len(), 1);
+        let (plane, control) = decode(&requests[0].1).unwrap();
+        assert_eq!(plane, 0);
+        let reply = control.reply().unwrap();
+        attempt.observe(1, reply, now);
+        assert!(!attempt.ready(now));
+        attempt.observe(plane, reply, now);
+        assert!(attempt.ready(now));
+        assert!(!attempt.ready(now + BUDGET + Duration::from_millis(1)));
+    }
+
+    #[test]
     fn legacy_decoder_consumes_extension_as_unknown_not_rtp() {
-        let attempt = Attempt::new(ProbeRoute::Relay, Instant::now());
+        let attempt = Attempt::new(ProbeRoute::Relay, Instant::now(), false);
         for (plane, payload) in attempt.initial() {
             assert!(payload.starts_with(crate::media_path_probe::MAGIC));
             assert!(ProbeControl::decode(&payload).is_none());
@@ -444,7 +464,7 @@ mod tests {
     #[test]
     fn all_three_distinct_challenges_are_required_and_cross_plane_replies_do_not_qualify() {
         let now = Instant::now();
-        let mut attempt = Attempt::new(ProbeRoute::Relay, now);
+        let mut attempt = Attempt::new(ProbeRoute::Relay, now, false);
         let requests = attempt.initial();
         let (_, first) = decode(&requests[0].1).unwrap();
         attempt.observe(1, first.reply().unwrap(), now);
@@ -465,7 +485,7 @@ mod tests {
     #[test]
     fn retries_are_bounded_and_late_replies_cannot_revive_preparation() {
         let now = Instant::now();
-        let mut attempt = Attempt::new(ProbeRoute::Direct, now);
+        let mut attempt = Attempt::new(ProbeRoute::Direct, now, false);
         let initial = attempt.initial();
         assert!(attempt.retries(now + Duration::from_millis(249)).is_empty());
         assert_eq!(attempt.retries(now + Duration::from_millis(250)), initial);

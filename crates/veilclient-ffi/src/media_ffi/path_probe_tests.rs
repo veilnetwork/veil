@@ -287,7 +287,7 @@ fn source_preflight_qualifies_before_rtp_callback_and_preserves_old_key_owner() 
             assert_eq!(planes.len(), 3);
             (captured, peer)
         });
-        let ready = fixture.runtime.block_on(context.run());
+        let ready = fixture.runtime.block_on(context.run(false));
         let (captured, returned_peer) = responder.join().unwrap();
         fixture.captured = captured;
         peer = returned_peer;
@@ -335,8 +335,8 @@ fn source_preflight_qualifies_before_rtp_callback_and_preserves_old_key_owner() 
             .recv_timeout(Duration::from_millis(50))
             .is_err()
     );
-    assert!(!fixture.runtime.block_on(context.run()));
-    assert!(!fixture.runtime.block_on(old_context.run()));
+    assert!(!fixture.runtime.block_on(context.run(false)));
+    assert!(!fixture.runtime.block_on(old_context.run(false)));
     assert_eq!(deliveries.load(Ordering::Relaxed), 0);
 }
 

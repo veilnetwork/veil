@@ -865,7 +865,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
         }
     }
 
-    let independent_ready = source_preparation::prepare_app_sources(&app_ref, peer, false);
+    let independent_ready = source_preparation::prepare_app_sources(&app_ref, peer, false, false);
 
     let (tx_hi, rx_hi) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_HI_QUEUE);
     let (tx_video, rx_video) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_VIDEO_QUEUE);
@@ -1052,7 +1052,7 @@ pub unsafe extern "C" fn veil_media_open_direct_channel(
             },
         );
     if independent_ready {
-        source_preflight::install_and_prepare(id, Arc::clone(&app_ref));
+        source_preflight::install_and_prepare(id, Arc::clone(&app_ref), false);
     }
     id
 }
@@ -1071,6 +1071,35 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
     peer_endpoint_id: u32,
     tx_key: *const u8,
     rx_key: *const u8,
+    err_out: *mut *mut c_char,
+) -> u64 {
+    unsafe {
+        veil_media_open_relay_channel_with_preparation(
+            app,
+            peer_node_id,
+            peer_app_id,
+            peer_endpoint_id,
+            tx_key,
+            rx_key,
+            false,
+            err_out,
+        )
+    }
+}
+
+/// Open the same sealed relay channel, with a shorter preparation scope for
+/// callers that currently need only the primary lane. Visual lanes remain
+/// available for a later upgrade and still warm when used.
+#[cfg(feature = "node-embedded")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_media_open_relay_channel_with_preparation(
+    app: *mut VeilApp,
+    peer_node_id: *const u8,
+    peer_app_id: *const u8,
+    peer_endpoint_id: u32,
+    tx_key: *const u8,
+    rx_key: *const u8,
+    primary_only: bool,
     err_out: *mut *mut c_char,
 ) -> u64 {
     if unsafe { guard::ffi_prelude(err_out, "veil_media_open_relay_channel") }.is_err() {
@@ -1094,7 +1123,8 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
         return 0;
     };
 
-    let independent_ready = source_preparation::prepare_app_sources(&app_ref, peer, true);
+    let independent_ready =
+        source_preparation::prepare_app_sources(&app_ref, peer, true, primary_only);
 
     let (tx_hi, rx_hi) = mpsc::channel::<QueuedMediaPacket>(MEDIA_TX_HI_QUEUE);
     let (tx_video_frames, rx_video_frames) =
@@ -1324,7 +1354,7 @@ pub unsafe extern "C" fn veil_media_open_relay_channel(
             },
         );
     if independent_ready {
-        source_preflight::install_and_prepare(id, Arc::clone(&app_ref));
+        source_preflight::install_and_prepare(id, Arc::clone(&app_ref), primary_only);
     }
     id
 }

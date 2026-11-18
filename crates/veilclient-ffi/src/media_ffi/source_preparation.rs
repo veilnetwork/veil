@@ -24,12 +24,21 @@ fn preparation_ready(index: usize, state: Option<State>) -> bool {
     }
 }
 
-async fn prepare_sources<Q, F>(mut query: Q, budget: std::time::Duration) -> bool
+async fn prepare_sources<Q, F>(
+    mut query: Q,
+    budget: std::time::Duration,
+    primary_only: bool,
+) -> bool
 where
     Q: FnMut(u8, bool) -> F,
     F: std::future::Future<Output = Result<Option<State>, ClientError>>,
 {
     let started = Instant::now();
+    let lanes = if primary_only {
+        &LANES[..1]
+    } else {
+        &LANES[..]
+    };
     let mut states = [None; LANES.len()];
     let result = tokio::time::timeout(budget, async {
         let mut begun = [false; LANES.len()];
@@ -44,7 +53,7 @@ where
                 deferred[0] && last_primary_check.is_some_and(|at| at.elapsed() >= PRIMARY_RECHECK);
             deferred[0] &= !periodic_primary_check;
             for validating in [false, true] {
-                for (index, lane) in LANES.iter().enumerate() {
+                for (index, lane) in lanes.iter().enumerate() {
                     // Poll unresolved lanes first. Confirm deferred media
                     // snapshots only when the other lanes are ready; cached
                     // readiness cannot survive a retirement or rekey unchecked.
@@ -67,6 +76,7 @@ where
                 }
                 if !states
                     .iter()
+                    .take(lanes.len())
                     .enumerate()
                     .all(|(i, &s)| preparation_ready(i, s))
                 {
@@ -108,7 +118,12 @@ where
     result.unwrap_or(false)
 }
 
-pub(super) fn prepare_app_sources(app: &VeilApp, peer: [u8; 32], relayed: bool) -> bool {
+pub(super) fn prepare_app_sources(
+    app: &VeilApp,
+    peer: [u8; 32],
+    relayed: bool,
+    primary_only: bool,
+) -> bool {
     // ffi_prelude has already rejected Tokio-worker reentry. Hosts execute
     // these existing blocking open functions on their SDK worker.
     let started = std::time::Instant::now();
@@ -126,6 +141,7 @@ pub(super) fn prepare_app_sources(app: &VeilApp, peer: [u8; 32], relayed: bool) 
             }
         },
         std::time::Duration::from_secs(3),
+        primary_only,
     ));
     media::diag(format_args!(
         "source preparation relayed={relayed} ready={ready} elapsed_ms={}",
@@ -139,6 +155,38 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    #[tokio::test(start_paused = true)]
+    async fn audio_only_does_not_wait_for_warming_visual_lanes() {
+        let budget = std::time::Duration::from_secs(3);
+        for primary_only in [false, true] {
+            let start = Instant::now();
+            let mut queried = Vec::new();
+            let ready = prepare_sources(
+                |lane, _| {
+                    queried.push(lane);
+                    let state = if lane == veil_proto::priority::REALTIME {
+                        State::Ready
+                    } else {
+                        State::Warming
+                    };
+                    std::future::ready(Ok(Some(state)))
+                },
+                budget,
+                primary_only,
+            )
+            .await;
+            assert_eq!(ready, primary_only);
+            if primary_only {
+                assert_eq!(queried, [veil_proto::priority::REALTIME]);
+                assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+            } else {
+                assert!(queried.contains(&veil_proto::priority::BULK));
+                assert!(queried.contains(&veil_proto::priority::BACKGROUND));
+                assert_eq!(start.elapsed(), budget);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn legacy_is_immediate_and_does_not_request_more_sources() {
         let mut calls = 0;
@@ -148,7 +196,8 @@ mod tests {
                     calls += 1;
                     std::future::ready(Ok(Some(State::Unsupported)))
                 },
-                std::time::Duration::from_secs(3)
+                std::time::Duration::from_secs(3),
+                false,
             )
             .await
         );
@@ -171,6 +220,7 @@ mod tests {
                 })))
             },
             std::time::Duration::from_secs(2),
+            false,
         )
         .await;
         assert!(ready);
@@ -197,7 +247,8 @@ mod tests {
                         _ => Some(State::Ready),
                     }))
                 },
-                std::time::Duration::from_secs(2)
+                std::time::Duration::from_secs(2),
+                false,
             )
             .await
         );
@@ -245,6 +296,7 @@ mod tests {
                     std::future::ready(Ok(state))
                 },
                 std::time::Duration::from_secs(3),
+                false,
             )
             .await;
             assert!(
@@ -278,6 +330,7 @@ mod tests {
                 std::future::ready(Ok(Some(state)))
             },
             std::time::Duration::from_secs(3),
+            false,
         )
         .await;
         assert!(!ready);
@@ -291,6 +344,7 @@ mod tests {
             prepare_sources(
                 |_, _| std::future::pending::<Result<Option<State>, ClientError>>(),
                 std::time::Duration::from_millis(20),
+                false,
             ),
         )
         .await
