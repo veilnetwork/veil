@@ -662,7 +662,8 @@ impl NodeServices {
         // as PnetStatusProvider, including verified sovereign aliases.
         let status = crate::pnet_status_provider::DaemonPnetStatus::new(
             Arc::clone(&self.verified_peer_certs),
-            Arc::clone(&self.live_sessions),
+            Arc::clone(&self.session_registry),
+            Arc::clone(&self.session_tx_registry),
         );
         if status.is_admitted(&peer_node_id) {
             return Outcome::Connected;

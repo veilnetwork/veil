@@ -219,6 +219,13 @@ async fn network_retirement_redials_and_sends_on_a_fresh_authenticated_session()
             let (mut old_peer, _) = listener.accept().await.unwrap();
             let old = handshake(&mut old_peer, &identity).await;
             (&mut gained).await;
+            let status = crate::pnet_status_provider::DaemonPnetStatus::new(
+                services.verified_peer_certs.clone(),
+                services.session_registry.clone(),
+                services.session_tx_registry.clone(),
+            );
+            let peer_id = identity.node_id.as_bytes();
+            assert!(status.is_admitted(peer_id));
             let old_registration = services
                 .session_tx_registry
                 .read()
@@ -256,6 +263,19 @@ async fn network_retirement_redials_and_sends_on_a_fresh_authenticated_session()
                 kind: veil_proto::NetworkKind::Cellular,
                 mtu_hint: 0,
             });
+            assert!(!gate.old_dropped.load(Ordering::SeqCst));
+            assert!(
+                services
+                    .live_sessions
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .any(|session| { session.node_id.as_ref() == Some(&identity.node_id) })
+            );
+            assert!(
+                !status.is_admitted(peer_id),
+                "retiring the sender must close admission before the runner exits"
+            );
             let mut redial = None;
             for _ in 0..64 {
                 tokio::task::yield_now().await;
@@ -292,6 +312,7 @@ async fn network_retirement_redials_and_sends_on_a_fresh_authenticated_session()
                 veil_crypto::session_cipher::SessionCipher::new(&new.session_keys.rx_key, true);
             rx.open(&body, &veil_proto::codec::frame_aad(&header))
                 .unwrap();
+            assert!(status.is_admitted(peer_id));
             assert_ne!(old.session_keys.session_id, new.session_keys.session_id);
             assert_ne!(old.session_keys.tx_key, new.session_keys.tx_key);
             drop(producer);

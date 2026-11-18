@@ -2239,7 +2239,7 @@ async fn runtime_creates_outbound_session_for_configured_peer() {
 //
 //   1. an app-added (bootstrap-only, dedup-exempt — exactly how
 //      P2PEndpointService registers direct peers) session is live
-//      → `live_sessions` non-empty ⇒ peer_pnet_status().admitted=true;
+//      → committed handshake and current TX owner ⇒ peer_pnet_status().admitted=true;
 //   2. the peer's address silently dies (scripted peer never responds
 //      after the handshake; socket stays open — no FIN/RST, the NAT
 //      black-hole shape) → the keepalive probe reaps the session
@@ -4988,7 +4988,8 @@ async fn attempt_hole_punch_does_not_claim_a_reserved_sender_is_connected() {
     assert!(
         !crate::pnet_status_provider::DaemonPnetStatus::new(
             Arc::clone(&services.verified_peer_certs),
-            Arc::clone(&services.live_sessions),
+            Arc::clone(&services.session_registry),
+            Arc::clone(&services.session_tx_registry),
         )
         .is_admitted(&unknown)
     );
@@ -5120,6 +5121,10 @@ async fn udp_punch_responder_rejects_non_public_srflx_offers_before_discovery() 
 /// capture used to drop registration before the future's first poll.
 #[tokio::test(flavor = "current_thread")]
 async fn punched_outbound_registration_lives_with_runner_and_cancellation() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use veil_proto::session::{AttachPayload, CapabilitiesPayload, IdentityPayload};
+    use veil_session::{RemoteRole, SessionEntry};
+
     for cancel_before_poll in [false, true] {
         let mut config = runtime_config_with_listen();
         let configured = config.peers.remove(0);
@@ -5164,6 +5169,34 @@ async fn punched_outbound_registration_lives_with_runner_and_cancellation() {
                 description: String::new(),
             },
         );
+        ctx.session_registry.lock().unwrap().insert(SessionEntry {
+            session_id: sid,
+            remote_node_id: peer_node,
+            remote_identity: IdentityPayload {
+                algo: peer.algo.wire_byte(),
+                public_key: STANDARD.decode(&peer.public_key).unwrap(),
+                nonce: STANDARD.decode(&peer.nonce).unwrap(),
+                node_id: peer_node,
+                mlkem_pubkey: None,
+            },
+            remote_capabilities: CapabilitiesPayload {
+                roles_supported: 0,
+                flags: 0,
+                extra_flags: 0,
+                extra_flags2: 0,
+                discovery_mode: 0,
+            },
+            remote_attach: AttachPayload {
+                role: 0,
+                realm_id: 0,
+                attach_epoch: 1,
+                mailbox_preference_count: 0,
+                gateway_preference_count: 0,
+                flags: 0,
+            },
+            remote_role: RemoteRole::Leaf,
+            validated_sovereign_identity: None,
+        });
         let guard = SessionGuard::new(
             ctx.live_sessions.clone(),
             link,
