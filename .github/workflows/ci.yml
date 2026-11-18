@@ -283,14 +283,16 @@ jobs:
         run: ./scripts/run-ci-hygiene.py --self-test
 
       - name: Install the Windows cross toolchain
-        # mingw-w64 only — no linking happens, `cargo check` needs a C compiler
-        # for ring / aws-lc-sys / pqcrypto-internals build scripts and nothing
-        # more. Bounded and non-interactive: an apt that can prompt or hang has
-        # wedged this repo's releases before.
+        # This gate checks x86_64-pc-windows-gnu. Install its C and C++
+        # compilers without pulling the other architecture and thread model.
+        # Bound both the download and the time spent on an unresponsive mirror.
         run: |
           sudo DEBIAN_FRONTEND=noninteractive timeout 300 apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive timeout 600 apt-get install -y --no-install-recommends mingw-w64
+          sudo DEBIAN_FRONTEND=noninteractive timeout 600 apt-get \
+            -o Acquire::Retries=2 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
+            gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix
           rustup target add x86_64-pc-windows-gnu
+          command -v x86_64-w64-mingw32-gcc x86_64-w64-mingw32-g++ x86_64-w64-mingw32-ar
 
       - name: windows type-check (veilclient-ffi)
         # `path_acl.rs` and `fs_beneath.rs` are `#[cfg(windows)]` in their
