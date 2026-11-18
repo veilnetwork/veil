@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## v0.11.55 — 2026-11-18
+
+### Fixed
+
+- Remove the node's Unix application IPC socket when the listener task is
+  cancelled during shutdown or reload. Keep any replacement socket at the
+  same path.
+
 ## v0.11.54 — 2026-11-18
 
 ### Fixed
