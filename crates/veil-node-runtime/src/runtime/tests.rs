@@ -5570,17 +5570,27 @@ async fn reload_publishes_the_promoted_identity_bundle_into_the_live_dht() {
 }
 
 /// The deferred boot is the one caller that must say its identity is a
-/// placeholder. Held in the source: the boot runs a whole foreground node and
-/// its admin endpoint, which no unit test stands up.
+/// placeholder. Guard both public entries and their shared caller; an admin
+/// readiness probe alone does not establish the placeholder publication rule.
 #[test]
 fn the_deferred_boot_marks_its_identity_as_a_placeholder() {
     let src = include_str!("../admin.rs");
+    for entry in [
+        "pub async fn run_foreground_deferred_with_shutdown",
+        "pub async fn run_embedded_deferred_with_shutdown",
+    ] {
+        let wrapper = &src[src.find(entry).expect("deferred entry")..];
+        let wrapper = &wrapper[..wrapper.find("\n}\n").expect("end of entry")];
+        assert!(wrapper.contains("run_deferred_with_shutdown("));
+    }
     let deferred = &src[src
-        .find("pub async fn run_foreground_deferred_with_shutdown")
-        .expect("deferred boot")..];
+        .find("async fn run_deferred_with_shutdown")
+        .expect("shared deferred boot")..];
     let deferred = &deferred[..deferred.find("\n}\n").expect("end of fn")];
+    let deferred = deferred.split_whitespace().collect::<String>();
     assert!(
-        deferred.contains("run_foreground_marked(") && deferred.contains(", true)"),
+        deferred
+            .contains("run_foreground_marked(&config_path,true,external_shutdown,true,signals)"),
         "the deferred boot must start its node with the placeholder marker"
     );
 }
