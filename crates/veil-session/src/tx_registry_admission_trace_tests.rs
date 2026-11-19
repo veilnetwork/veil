@@ -70,6 +70,7 @@ fn queue_outcomes_follow_actual_admission_behind_operator_gate() {
             Err(SendToError::Missing)
         );
         let mut receiver = registry.register(peer);
+        let old_registration = registry.live_registration(&peer).unwrap();
         assert_eq!(
             registry.send_to_result(&peer, INTERACTIVE, frame.clone()),
             Ok(())
@@ -85,8 +86,25 @@ fn queue_outcomes_follow_actual_admission_behind_operator_gate() {
             registry.send_to_on_carrier_result(&peer, frame.clone(), Arc::downgrade(&carrier)),
             Ok(())
         );
-        assert_eq!(&receiver.try_recv().unwrap().1[..], &frame);
+        let ready =
+            receiver.poll_recv(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+        let std::task::Poll::Ready(Some((_, polled))) = ready else {
+            panic!("queued frame must be immediately readable");
+        };
+        assert_eq!(&polled[..], &frame);
+        let successor = registry.register(peer);
+        let new_registration = registry.live_registration(&peer).unwrap();
+        assert_ne!(old_registration, new_registration);
+        assert_eq!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        );
         drop(receiver);
+        assert_eq!(
+            registry.send_to_result(&peer, INTERACTIVE, frame.clone()),
+            Ok(())
+        );
+        drop(successor);
         assert_eq!(
             registry.send_to_result(&peer, INTERACTIVE, frame.clone()),
             Err(SendToError::Closed)
@@ -101,20 +119,52 @@ fn queue_outcomes_follow_actual_admission_behind_operator_gate() {
         );
         let events = EVENTS.lock().unwrap().clone();
         if expected == "1" {
-            assert_eq!(events.len(), 5, "real queue outcomes were not observed");
             use sha2::Digest;
             let digest = veil_util::hex_str(&sha2::Sha256::digest(payload));
-            for (event, outcome) in events
+            let admissions: Vec<_> = events
                 .iter()
-                .zip(["missing", "accepted", "full", "accepted", "closed"])
-            {
-                assert!(event.contains("stage=queue_admission "));
+                .filter(|event| event.contains("stage=queue_admission "))
+                .collect();
+            assert_eq!(admissions.len(), 6, "real queue outcomes were not observed");
+            for (event, (outcome, registration)) in admissions.into_iter().zip([
+                ("missing", 0),
+                ("accepted", old_registration),
+                ("full", old_registration),
+                ("accepted", old_registration),
+                ("accepted", new_registration),
+                ("closed", new_registration),
+            ]) {
                 assert!(event.contains(&format!("outcome={outcome} ")));
+                assert!(event.contains(&format!("registration={registration} ")));
                 assert!(event.contains(&format!("opaque_sha256={digest} ")));
                 assert!(event.contains("node=- "));
                 assert!(event.contains("peer=02020202 "));
-                assert!(!event.contains("PRIVATE_"));
             }
+            let dequeued: Vec<_> = events
+                .iter()
+                .filter(|e| e.contains("stage=queue_dequeued "))
+                .collect();
+            assert_eq!(dequeued.len(), 2);
+            for event in dequeued {
+                assert!(event.contains(&format!("registration={old_registration} ")));
+                assert!(event.contains(&format!("opaque_sha256={digest} ")));
+            }
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.contains("stage=queue_state ")
+                        && event.contains("state=owner_released ")
+                        && event.contains(&format!("registration={old_registration} ")))
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.contains("stage=queue_state ")
+                        && event.contains("state=receiver_dropped ")
+                        && event.contains(&format!("registration={new_registration} "))
+                        && event.contains("pending=1"))
+            );
+            assert!(events.iter().all(|event| !event.contains("PRIVATE_")));
         } else {
             assert!(events.is_empty(), "disabled/invalid gate emitted metadata");
         }

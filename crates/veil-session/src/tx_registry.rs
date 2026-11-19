@@ -265,7 +265,7 @@ impl SessionTxRegistry {
         self.senders.insert(
             peer_id,
             SessionTxEntry {
-                retire: rx.bind_registration_retirement(),
+                retire: rx.bind_registration_retirement(peer_id, self.latest_registration),
                 tx,
                 owner: None,
                 direct_app_chunks: false,
@@ -291,7 +291,7 @@ impl SessionTxRegistry {
         self.senders.insert(
             peer_id,
             SessionTxEntry {
-                retire: rx.bind_registration_retirement(),
+                retire: rx.bind_registration_retirement(peer_id, self.latest_registration),
                 tx,
                 owner: Some(owner),
                 direct_app_chunks: false,
@@ -324,7 +324,7 @@ impl SessionTxRegistry {
         self.senders.insert(
             peer_id,
             SessionTxEntry {
-                retire: rx.bind_registration_retirement(),
+                retire: rx.bind_registration_retirement(peer_id, self.latest_registration),
                 tx,
                 owner: None,
                 direct_app_chunks: false,
@@ -425,7 +425,7 @@ impl SessionTxRegistry {
         self.senders.insert(
             peer_id,
             SessionTxEntry {
-                retire: rx.bind_registration_retirement(),
+                retire: rx.bind_registration_retirement(peer_id, self.latest_registration),
                 tx,
                 owner: Some(owner),
                 direct_app_chunks: false,
@@ -839,15 +839,13 @@ impl SessionTxRegistry {
         crate::frame_diag::note_outbound(peer_id, &frame, "tx_registry");
         crate::frame_diag::note_chunk_frame("relay_enqueue", &frame);
         let observation = crate::opaque_forward_trace::queue_admission(peer_id, &frame);
-        let tx = match self.senders.get(peer_id) {
-            Some(entry) => &entry.tx,
-            None => {
-                if let Some(observation) = observation {
-                    observation.finish(&Err(SendToError::Missing));
-                }
-                return Err(SendToError::Missing);
+        let Some(entry) = self.senders.get(peer_id) else {
+            if let Some(observation) = observation {
+                observation.finish(&Err(SendToError::Missing), 0);
             }
+            return Err(SendToError::Missing);
         };
+        let tx = &entry.tx;
         let queued = match carrier {
             Some(carrier) => tx
                 .try_send_on_carrier(frame, carrier)
@@ -879,7 +877,7 @@ impl SessionTxRegistry {
             }
         };
         if let Some(observation) = observation {
-            observation.finish(&result);
+            observation.finish(&result, entry.registration);
         }
         result
     }
