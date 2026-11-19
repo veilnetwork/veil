@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## v0.11.56 — 2026-11-19
+
+### Fixed
+
+- Retry preparation of a call's relay route when a usable session appears.
+  Check live session ownership before declaring a direct path ready.
+- Preserve established relay routes when a local queue is full and try an
+  alternative route when the first candidate cannot accept a media packet.
+- Bound the wait for the initial obfs4 acknowledgement on Android so a stalled
+  transport can recover after a network change.
+
+### Diagnostics
+
+- Correlate relay queue admission and retirement with opaque local generation
+  counters in operator traces.
+
 ## v0.11.55 — 2026-11-18
 
 ### Fixed
