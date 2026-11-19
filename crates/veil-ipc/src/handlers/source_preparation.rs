@@ -166,6 +166,34 @@ mod tests {
     }
 
     #[test]
+    fn relay_preparation_skips_cached_hops_without_a_live_session() {
+        let mut r = registry(State::Unsupported);
+        r.alternate = Some(([3; 32], State::Ready));
+        let mut cache = veil_routing::RouteCache::new(std::time::Duration::from_secs(60));
+        cache.insert([8; 32], [9; 32], 1000, 2);
+        cache.insert([8; 32], [5; 32], 2000, 2);
+        cache.insert([8; 32], [2; 32], 3000, 2);
+        let cache = RwLock::new(cache);
+        assert_eq!(
+            prepare(
+                &request(true).encode(),
+                true,
+                |_| true,
+                Some(&r),
+                Some(&cache)
+            ),
+            State::Ready
+        );
+        assert_eq!(
+            *r.calls.lock().unwrap(),
+            vec![
+                ([2; 32], veil_proto::priority::BULK),
+                ([3; 32], veil_proto::priority::BULK),
+            ]
+        );
+    }
+
+    #[test]
     fn requires_negotiation_owned_source_and_valid_payload() {
         let r = registry(State::Ready);
         let body = request(false).encode();

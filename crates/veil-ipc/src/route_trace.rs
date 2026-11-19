@@ -275,6 +275,36 @@ pub(crate) fn sealed_relay_hop_sample(stage: &str, local_lane: u8, hop: &[u8; 32
     }
 }
 
+/// Bounded first-hop order for a sampled, already sealed local primary cell.
+/// Join the three stages to `sealed_sample` on the same epoch and sequence.
+pub(crate) fn sealed_relay_candidates(body: &[u8], local_lane: u8) -> Option<RelayCandidates> {
+    if local_lane != veil_proto::priority::REALTIME || !is_enabled() {
+        return None;
+    }
+    relay_sample(body).map(RelayCandidates)
+}
+
+pub(crate) struct RelayCandidates(SealedLocalSample);
+
+impl RelayCandidates {
+    pub(crate) fn record(&self, stage: &str, hops: &[[u8; 32]]) {
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let sample = &self.0;
+        let order: Vec<_> = hops.iter().take(8).map(veil_util::hex_short).collect();
+        log::info!(
+            "ipc.rt_trace.relay_candidates at_ms={at_ms} stage={stage} dst={} epoch={:016x} seq={} hops={} order={}",
+            veil_util::bytes_to_hex(&sample.destination),
+            sample.epoch,
+            sample.seq,
+            hops.len(),
+            order.join(","),
+        );
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct SealedLocalSample {
     destination: [u8; 4],

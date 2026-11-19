@@ -7,8 +7,7 @@ pub fn sealed_relay_hops(
     cache: Option<&RwLock<veil_routing::RouteCache>>,
     registry: &dyn FrameBroadcaster,
 ) -> Vec<[u8; 32]> {
-    let mut hops =
-        crate::handlers::send::ordinary_relay_hops(None, destination, cache, registry, true);
+    let mut hops = crate::handlers::send::relay_hops_to_try(destination, cache, registry);
     prefer_datagrams(&mut hops, registry);
     hops
 }
