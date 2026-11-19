@@ -104,7 +104,9 @@ pub(crate) struct QueueAdmission {
 }
 
 impl QueueAdmission {
-    pub(crate) fn finish(self, result: &Result<(), crate::SendToError>) {
+    // A zero registration is reserved for a missing sender. The other values
+    // are process-local generations, not session or transport identifiers.
+    pub(crate) fn finish(self, result: &Result<(), crate::SendToError>, registration: u64) {
         if !reserve_row() {
             return;
         }
@@ -117,12 +119,52 @@ impl QueueAdmission {
         };
         let monotonic_us = veil_util::diagnostic_clock::monotonic_us().map_or(-1, i128::from);
         log::info!(
-            "delivery.opaque_trace stage=queue_admission outcome={outcome} monotonic_us={monotonic_us} node=- peer={} opaque_bytes={} opaque_sha256={} wrapper={}",
+            "delivery.opaque_trace stage=queue_admission outcome={outcome} monotonic_us={monotonic_us} node=- peer={} registration={registration} opaque_bytes={} opaque_sha256={} wrapper={}",
             veil_util::hex_str(&self.peer[..4]),
             self.sample.bytes,
             self.sample.digest,
             self.sample.wrapper,
         );
+    }
+}
+
+/// Observer for the exact registered receiver, installed only when tracing.
+#[derive(Debug)]
+pub(crate) struct QueueRegistration {
+    pub(crate) peer_prefix: [u8; 4],
+    pub(crate) generation: u64,
+}
+
+impl QueueRegistration {
+    pub(crate) fn dequeued(&self, frame: &[u8]) {
+        if ROWS.load(Ordering::Relaxed) > ROW_LIMIT {
+            return;
+        }
+        if let Some(sample) = sample_frame(frame)
+            && reserve_row()
+        {
+            // This may race the producer's post-enqueue admission observation.
+            let monotonic_us = veil_util::diagnostic_clock::monotonic_us().map_or(-1, i128::from);
+            log::info!(
+                "delivery.opaque_trace stage=queue_dequeued monotonic_us={monotonic_us} node=- peer={} registration={} opaque_bytes={} opaque_sha256={} wrapper={}",
+                veil_util::hex_str(&self.peer_prefix),
+                self.generation,
+                sample.bytes,
+                sample.digest,
+                sample.wrapper,
+            );
+        }
+    }
+
+    pub(crate) fn state(&self, state: &str, pending: usize) {
+        if reserve_row() {
+            let monotonic_us = veil_util::diagnostic_clock::monotonic_us().map_or(-1, i128::from);
+            log::info!(
+                "delivery.opaque_trace stage=queue_state state={state} monotonic_us={monotonic_us} node=- peer={} registration={} pending={pending}",
+                veil_util::hex_str(&self.peer_prefix),
+                self.generation,
+            );
+        }
     }
 }
 

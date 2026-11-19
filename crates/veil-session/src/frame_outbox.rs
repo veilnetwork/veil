@@ -10,7 +10,7 @@ use std::{
 
 use tokio::sync::mpsc;
 
-use crate::PriorityFrame;
+use crate::{PriorityFrame, opaque_forward_trace::QueueRegistration};
 
 pub const RESERVED_QUEUE_DEPTH: usize = 64;
 /// Keep only a small lookahead of already sealed local DATA. At the pressure
@@ -418,6 +418,7 @@ pub struct FrameOutbox {
     // The registry can explicitly retire this queue even while a producer
     // retains a sender. Normal replacement still permits a pinned old send.
     registration_retirement: Option<mpsc::Receiver<()>>,
+    diagnostic_registration: Option<QueueRegistration>,
     explicitly_retired: bool,
     source_activity: std::sync::Arc<crate::local_source_activity::LocalSourceActivity>,
     ordinary: EnvelopeReceiver,
@@ -457,6 +458,7 @@ pub(crate) fn frame_channel_with_source_activity(
         },
         FrameOutbox {
             registration_retirement: None,
+            diagnostic_registration: None,
             explicitly_retired: false,
             source_activity,
             ordinary: EnvelopeReceiver::Live(ordinary),
@@ -474,6 +476,7 @@ impl From<mpsc::Receiver<PriorityFrame>> for FrameOutbox {
     fn from(ordinary: mpsc::Receiver<PriorityFrame>) -> Self {
         Self {
             registration_retirement: None,
+            diagnostic_registration: None,
             explicitly_retired: false,
             source_activity: std::sync::Arc::default(),
             ordinary: EnvelopeReceiver::Legacy(ordinary),
@@ -489,10 +492,20 @@ impl From<mpsc::Receiver<PriorityFrame>> for FrameOutbox {
 impl FrameOutbox {
     /// An explicit administrative close, separate from ordinary sender lifetime.
     /// Dropping the registry entry alone must not cancel a pinned in-flight send.
-    pub(crate) fn bind_registration_retirement(&mut self) -> mpsc::Sender<()> {
+    pub(crate) fn bind_registration_retirement(
+        &mut self,
+        peer: [u8; 32],
+        generation: u64,
+    ) -> mpsc::Sender<()> {
         assert!(self.registration_retirement.is_none());
         let (owner, retirement) = mpsc::channel(1);
         self.registration_retirement = Some(retirement);
+        let [a, b, c, d, ..] = peer;
+        self.diagnostic_registration =
+            crate::opaque_forward_trace::enabled().then_some(QueueRegistration {
+                peer_prefix: [a, b, c, d],
+                generation,
+            });
         owner
     }
 
@@ -552,7 +565,7 @@ impl FrameOutbox {
         }
     }
 
-    fn received_from(&mut self, lane: usize) {
+    fn received_from(&mut self, lane: usize, envelope: &FrameEnvelope) {
         if lane == 0 {
             self.reserved_burst = self.reserved_burst.saturating_add(1);
         } else {
@@ -562,6 +575,9 @@ impl FrameOutbox {
             } else {
                 0
             };
+        }
+        if let Some(registration) = &self.diagnostic_registration {
+            registration.dequeued(&envelope.frame.1);
         }
     }
 
@@ -592,7 +608,7 @@ impl FrameOutbox {
             let Some(receiver) = receiver else { continue };
             match receiver.poll_recv(cx) {
                 Poll::Ready(Some(frame)) => {
-                    self.received_from(lane);
+                    self.received_from(lane, &frame);
                     return Poll::Ready(Some(frame));
                 }
                 Poll::Pending => pending = true,
@@ -632,7 +648,7 @@ impl FrameOutbox {
             let Some(receiver) = receiver else { continue };
             match receiver.try_recv() {
                 Ok(frame) => {
-                    self.received_from(lane);
+                    self.received_from(lane, &frame);
                     return Ok(frame);
                 }
                 Err(mpsc::error::TryRecvError::Empty) => empty = true,
@@ -676,6 +692,14 @@ impl FrameOutbox {
         self.explicitly_retired = !owner_gone;
         self.registration_retirement = None;
         self.close();
+        if let Some(registration) = &self.diagnostic_registration {
+            let state = if owner_gone {
+                "owner_released"
+            } else {
+                "explicitly_retired"
+            };
+            registration.state(state, self.len());
+        }
         if crate::rt_trace::rt_trace_enabled() {
             let at_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -700,6 +724,14 @@ impl FrameOutbox {
         }
         if let Some(reserved) = &mut self.reserved {
             reserved.close();
+        }
+    }
+}
+
+impl Drop for FrameOutbox {
+    fn drop(&mut self) {
+        if let Some(registration) = &self.diagnostic_registration {
+            registration.state("receiver_dropped", self.len());
         }
     }
 }
