@@ -1229,6 +1229,7 @@ impl NodeRuntime {
             // replays that straddle a config reload are still caught.
             forward_seen_set: Arc::clone(&self.dispatcher.forward_seen_set),
             forward_seen_content: Arc::clone(&self.dispatcher.forward_seen_content),
+            lossy_forward_retries: Arc::clone(&self.dispatcher.lossy_forward_retries),
             terminal_ack_replay: Arc::clone(&self.dispatcher.terminal_ack_replay),
             recursive_query_seen: Arc::clone(&self.dispatcher.recursive_query_seen),
             pending_recursive: Arc::clone(&self.dispatcher.pending_recursive),
