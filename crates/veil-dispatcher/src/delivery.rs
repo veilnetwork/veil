@@ -3,7 +3,7 @@ use veil_app::registry::SenderProvenance;
 use veil_cfg::NodeId;
 use veil_proto::{
     codec::encode_header,
-    delivery::{DeliveryEnvelope, ForwardPayload},
+    delivery::{DeliveryEnvelope, ForwardPayload, RecursiveRelayPayload},
     family::{DeliveryMsg, FrameFamily},
     header::FrameHeader,
 };
@@ -1039,31 +1039,32 @@ impl FrameDispatcher {
 
     /// DHT recursive-relay fallback: when neither route_cache nor a gateway
     /// can reach the recipient, find the DHT-closest nodes to `fwd_dst` and
-    /// wrap the forward in a `RecursiveRelayPayload` toward the first one
-    /// that has a live session. Returns `true` if a recursive-relay frame
-    /// was emitted (regardless of whether the underlying `send_to` succeeded
-    /// — failure is observed via the `send_to_failed` metric).
+    /// Wrap the forward in a `RecursiveRelayPayload` and try the live
+    /// candidates in distance order. Returns `true` on local queue admission.
     pub fn try_recursive_relay_via_dht(
         &self,
         payload: &ForwardPayload,
         peer_id: NodeId,
         fwd_dst: NodeIdBytes,
     ) -> bool {
-        use veil_proto::delivery::RecursiveRelayPayload;
         let closest = self.dht.find_closest_nodes(&fwd_dst, 3);
         let Some(reg) = &self.session_tx_registry else {
             return false;
         };
         let reg_guard = rlock!(reg);
+        let mut frame = None;
         for next in &closest {
-            if next == peer_id.as_bytes() || *next == self.local_node_id {
+            if next == peer_id.as_bytes()
+                || *next == self.local_node_id
+                || reg_guard.get_sender(next).is_none()
+            {
                 continue;
             }
-            if reg_guard.get_sender(next).is_some() {
+            let frame = frame.get_or_insert_with(|| {
                 let qid = self
                     .announce_seq
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let rr = RecursiveRelayPayload {
+                encode_recursive_relay_frame(&RecursiveRelayPayload {
                     dst_node_id: fwd_dst,
                     originator_pseudonym: RecursiveRelayPayload::make_pseudonym(
                         &self.local_node_id,
@@ -1072,24 +1073,20 @@ impl FrameDispatcher {
                     query_id: qid,
                     hop_count: veil_proto::budget::MAX_RECURSIVE_RELAY_HOPS,
                     payload: payload.encode(),
-                };
-                let rr_bytes = rr.encode();
-                let mut rr_hdr = veil_proto::header::FrameHeader::new(
-                    veil_proto::family::FrameFamily::Delivery as u8,
-                    veil_proto::family::DeliveryMsg::RecursiveRelay as u16,
-                );
-                rr_hdr.body_len = rr_bytes.len() as u32;
-                let frame = veil_proto::codec::encode_frame(&rr_hdr, &rr_bytes);
-                drop(reg_guard);
-                let sent =
-                    rlock!(reg).send_to(next, veil_proto::header::priority::INTERACTIVE, frame);
+                })
+            });
+            if reg_guard.send_to_arc(
+                next,
+                veil_proto::header::priority::INTERACTIVE,
+                frame.clone(),
+            ) {
                 if let Some(m) = &self.metrics {
-                    if !sent {
-                        m.inc_send_to_failed();
-                    }
                     m.inc_recursive_relay_initiated();
                 }
                 return true;
+            }
+            if let Some(m) = &self.metrics {
+                m.inc_send_to_failed();
             }
         }
         false
@@ -2305,7 +2302,6 @@ impl FrameDispatcher {
     /// if we have a session to the destination; (c) hop-limit exhausted
     /// → mailbox fallback; (d) greedy forward to Kademlia closest.
     fn handle_recursive_relay(&self, body: &[u8], peer_id: NodeId) -> DispatchResult {
-        use veil_proto::delivery::RecursiveRelayPayload;
         let rr = match RecursiveRelayPayload::decode(body) {
             Ok(f) => f,
             Err(e) => return DispatchResult::Violation(format!("bad RecursiveRelay: {e}")),
@@ -2377,21 +2373,26 @@ impl FrameDispatcher {
             fwd_hdr.body_len = rr.payload.len() as u32;
             // single-allocation frame assembly.
             let frame = veil_proto::codec::encode_frame(&fwd_hdr, &rr.payload);
-            rlock!(reg).send_to(
+            let queued = rlock!(reg).send_to(
                 &rr.dst_node_id,
                 veil_proto::header::priority::INTERACTIVE,
                 frame,
             );
-            wlock!(self.route_cache).insert(
-                rr.originator_pseudonym,
-                *peer_id.as_bytes(),
-                1_000,
-                rr.hop_count,
-            );
-            if let Some(m) = &self.metrics {
-                m.inc_recursive_relay_delivered();
+            if queued {
+                wlock!(self.route_cache).insert(
+                    rr.originator_pseudonym,
+                    *peer_id.as_bytes(),
+                    1_000,
+                    rr.hop_count,
+                );
+                if let Some(m) = &self.metrics {
+                    m.inc_recursive_relay_delivered();
+                }
+                return DispatchResult::NoResponse;
             }
-            return DispatchResult::NoResponse;
+            if let Some(m) = &self.metrics {
+                m.inc_send_to_failed();
+            }
         }
 
         // (c) Hop limit exhausted — : mailbox fallback removed
@@ -2411,23 +2412,20 @@ impl FrameDispatcher {
     }
 
     /// Attempt a greedy single-hop forward of a `RecursiveRelayPayload` to
-    /// the closest Kademlia contact (i) has a live session (ii) is not
-    /// the peer we received (split-horizon), and (iii) has earned transit
-    /// reputation. Returns `true` when a forward was sent.
-    fn forward_rr_to_closest(
-        &self,
-        rr: &veil_proto::delivery::RecursiveRelayPayload,
-        peer_id: NodeId,
-    ) -> bool {
+    /// the closest eligible Kademlia contact that admits the frame. Candidates
+    /// must have a live session and earned transit reputation.
+    fn forward_rr_to_closest(&self, rr: &RecursiveRelayPayload, peer_id: NodeId) -> bool {
         let reg = match &self.session_tx_registry {
             Some(r) => r,
             None => return false,
         };
         let closest = self.dht.find_closest_nodes(&rr.dst_node_id, 3);
         let reg_guard = rlock!(reg);
+        let mut frame = None;
         for next in &closest {
-            // Split-horizon + self-loop guard.
-            if next == peer_id.as_bytes() || *next == self.local_node_id {
+            // Split horizon, self-loop, and the destination already tried above.
+            if next == peer_id.as_bytes() || *next == self.local_node_id || *next == rr.dst_node_id
+            {
                 continue;
             }
             // skip peers without transit reputation.
@@ -2440,20 +2438,22 @@ impl FrameDispatcher {
                 continue;
             }
 
-            let fwd_rr = veil_proto::delivery::RecursiveRelayPayload {
-                hop_count: rr.hop_count - 1,
-                ..rr.clone()
-            };
-            let fwd_bytes = fwd_rr.encode();
-            let mut fwd_hdr = veil_proto::header::FrameHeader::new(
-                veil_proto::family::FrameFamily::Delivery as u8,
-                DeliveryMsg::RecursiveRelay as u16,
-            );
-            fwd_hdr.body_len = fwd_bytes.len() as u32;
-            // single-allocation frame assembly.
-            let frame = veil_proto::codec::encode_frame(&fwd_hdr, &fwd_bytes);
-            drop(reg_guard);
-            rlock!(reg).send_to(next, veil_proto::header::priority::INTERACTIVE, frame);
+            let frame = frame.get_or_insert_with(|| {
+                encode_recursive_relay_frame(&RecursiveRelayPayload {
+                    hop_count: rr.hop_count - 1,
+                    ..rr.clone()
+                })
+            });
+            if !reg_guard.send_to_arc(
+                next,
+                veil_proto::header::priority::INTERACTIVE,
+                frame.clone(),
+            ) {
+                if let Some(m) = &self.metrics {
+                    m.inc_send_to_failed();
+                }
+                continue;
+            }
             if let Some(m) = &self.metrics {
                 m.inc_recursive_relay_forwarded();
             }
@@ -2468,6 +2468,16 @@ impl FrameDispatcher {
         }
         false
     }
+}
+
+fn encode_recursive_relay_frame(rr: &RecursiveRelayPayload) -> veil_bufpool::PooledShared {
+    let body = rr.encode();
+    let mut header = FrameHeader::new(
+        FrameFamily::Delivery as u8,
+        DeliveryMsg::RecursiveRelay as u16,
+    );
+    header.body_len = body.len() as u32;
+    veil_bufpool::pooled_shared_from_vec(veil_proto::codec::encode_frame(&header, &body))
 }
 
 /// The Forward frame carrying a signed "cannot open" reply to `peer`, handed
@@ -3822,6 +3832,117 @@ mod tests {
             outgoing.try_recv().is_err(),
             "single-hop forwarding, without fan-out"
         );
+    }
+
+    #[test]
+    fn recursive_relay_tries_another_live_queue_after_refusal() {
+        use std::sync::{Arc, RwLock};
+        use veil_proto::{
+            delivery::{DeliveryEnvelope, ForwardPayload, RecursiveRelayPayload},
+            family::{DeliveryMsg, FrameFamily},
+            header::{FrameHeader, HEADER_SIZE, priority::INTERACTIVE},
+            recipient::Recipient,
+        };
+        use veil_session::SessionTxRegistry;
+        use veil_util::wlock;
+
+        let target = [0xC0; 32];
+        let closest = [0xC1; 32];
+        let alternate = [0xC2; 32];
+        let incoming = [0x55; 32];
+        let forward = ForwardPayload {
+            next_hop_node_id: target,
+            envelope: DeliveryEnvelope {
+                recipient: Recipient::any(target),
+                sender_node_id: incoming,
+                src_app_id: [1; 32],
+                app_id: [2; 32],
+                endpoint_id: 3,
+                content_id: [4; 32],
+                created_at: veil_util::unix_secs_now_u64(),
+                ttl_secs: 30,
+                payload: b"stand payload".to_vec(),
+                trace_id: 0,
+                require_ack: false,
+            },
+            relay_hops: 1,
+            delivery_attempt: None,
+            traffic_class: None,
+        };
+        let mut recursive = RecursiveRelayPayload {
+            dst_node_id: target,
+            originator_pseudonym: [0x77; 32],
+            query_id: 1,
+            hop_count: 5,
+            payload: forward.encode(),
+        };
+        let header = FrameHeader::new(
+            FrameFamily::Delivery as u8,
+            DeliveryMsg::RecursiveRelay as u16,
+        );
+
+        for path in ["origin", "greedy", "direct"] {
+            let registry = Arc::new(RwLock::new(SessionTxRegistry::with_capacity(1)));
+            let mut blocked = wlock!(registry).register(closest);
+            let mut backup = wlock!(registry).register(alternate);
+            let mut direct = (path == "direct").then(|| wlock!(registry).register(target));
+            assert!(rlock!(registry).send_to(&closest, INTERACTIVE, vec![1]));
+            if direct.is_some() {
+                assert!(rlock!(registry).send_to(&target, INTERACTIVE, vec![2]));
+            }
+            let mut dispatcher = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+            dispatcher.local_node_id = [0x44; 32];
+            dispatcher.session_tx_registry = Some(Arc::clone(&registry));
+            for id in [closest, alternate] {
+                dispatcher
+                    .dht
+                    .add_contact_trusted(veil_dht::routing::Contact::new(
+                        id,
+                        "quic://192.0.2.1:18443",
+                    ));
+            }
+            assert_eq!(
+                dispatcher.dht.find_closest_nodes(&target, 3),
+                [closest, alternate]
+            );
+
+            if path == "origin" {
+                assert!(dispatcher.try_recursive_relay_via_dht(&forward, incoming.into(), target));
+            } else {
+                dispatcher.dispatch(&header, &recursive.encode(), incoming);
+            }
+            let (priority, frame) = backup
+                .try_recv()
+                .unwrap_or_else(|_| panic!("{path}: no fallback"));
+            assert_eq!(priority, INTERACTIVE);
+            let sent = RecursiveRelayPayload::decode(&frame[HEADER_SIZE..]).unwrap();
+            assert_eq!(sent.dst_node_id, target);
+            assert_eq!(sent.payload, recursive.payload);
+            if path == "origin" {
+                assert_eq!(sent.hop_count, veil_proto::budget::MAX_RECURSIVE_RELAY_HOPS);
+                assert!(rlock!(registry).send_to(&alternate, INTERACTIVE, vec![3]));
+                assert!(!dispatcher.try_recursive_relay_via_dht(&forward, incoming.into(), target));
+                assert_eq!(&*backup.try_recv().unwrap().1, [3]);
+            } else {
+                assert_eq!(sent.query_id, recursive.query_id);
+                assert_eq!(sent.originator_pseudonym, recursive.originator_pseudonym);
+                assert_eq!(sent.hop_count, recursive.hop_count - 1);
+                assert_eq!(
+                    rlock!(dispatcher.route_cache).lookup(&recursive.originator_pseudonym),
+                    None
+                );
+            }
+            if let Some(direct) = &mut direct {
+                recursive.query_id += 1;
+                recursive.hop_count = 0;
+                dispatcher.dispatch(&header, &recursive.encode(), incoming);
+                assert_eq!(&*direct.try_recv().unwrap().1, [2]);
+                assert!(direct.try_recv().is_err());
+            }
+            assert_eq!(&*blocked.try_recv().unwrap().1, [1]);
+            assert!(blocked.try_recv().is_err());
+            assert!(backup.try_recv().is_err());
+        }
     }
 
     /// with mailbox removed, a RecursiveRelay frame with hop_count=0
