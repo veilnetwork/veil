@@ -210,6 +210,104 @@ fn cached_discovery_hop(
         .find(|hop| hop != dst && active.contains(hop))
 }
 
+type PendingRouteReplies =
+    Mutex<std::collections::HashMap<[u8; 16], veil_dispatcher_state::PendingRecursive>>;
+
+struct RouteQuery<'a> {
+    id: [u8; 16],
+    pending: Option<&'a PendingRouteReplies>,
+    response: Option<tokio::sync::oneshot::Receiver<Vec<u8>>>,
+}
+
+impl Drop for RouteQuery<'_> {
+    fn drop(&mut self) {
+        drop(self.response.take());
+        if let Some(pending) = self.pending {
+            lock!(pending).remove(&self.id);
+        }
+    }
+}
+
+async fn wait_for_route_response(query: &mut Option<RouteQuery<'_>>) {
+    let Some(query) = query.as_mut() else {
+        return std::future::pending().await;
+    };
+    let Some(response) = query.response.as_mut() else {
+        return std::future::pending().await;
+    };
+    let _ = response.await;
+    query.response = None;
+}
+
+fn enqueue_route_query<'a>(
+    reg: &dyn FrameBroadcaster,
+    peers: &[[u8; 32]],
+    local: &[u8; 32],
+    dst: &[u8; 32],
+    pending: Option<&'a PendingRouteReplies>,
+) -> Option<RouteQuery<'a>> {
+    use rand_core::RngCore;
+    use veil_proto::budget::MAX_PENDING_RECURSIVE;
+    use veil_proto::family::{FrameFamily, RoutingMsg};
+    use veil_proto::routing::{RecursiveQueryPayload, recursive_query_type};
+
+    if peers.is_empty() {
+        return None;
+    }
+    let mut id = [0u8; 16];
+    rand_core::OsRng.fill_bytes(&mut id);
+    let mut query = RouteQuery {
+        id,
+        pending: None,
+        response: None,
+    };
+    let request = RecursiveQueryPayload {
+        query_id: id,
+        target_key: *dst,
+        reply_to: *local,
+        ttl: 40,
+        query_type: recursive_query_type::FIND_NODE,
+        reply_port: 0,
+        payload: vec![],
+    };
+    let bytes = request.encode();
+    let mut hdr = veil_proto::header::FrameHeader::new(
+        FrameFamily::Routing as u8,
+        RoutingMsg::RecursiveQuery as u16,
+    );
+    hdr.body_len = bytes.len() as u32;
+    let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
+    frame.extend_from_slice(&bytes);
+
+    // Install the reply slot before packets can reach a fast neighbor.
+    if let Some(pending) = pending {
+        let mut map = lock!(pending);
+        map.retain(|_, reply| !reply.tx.is_closed());
+        if map.len() < MAX_PENDING_RECURSIVE {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            map.insert(
+                id,
+                veil_dispatcher_state::PendingRecursive {
+                    target_key: *dst,
+                    query_type: recursive_query_type::FIND_NODE,
+                    tx,
+                },
+            );
+            query.pending = Some(pending);
+            query.response = Some(rx);
+        }
+    }
+    let mut admitted = false;
+    for peer in peers {
+        admitted |= reg.send_to(
+            peer,
+            veil_proto::header::priority::INTERACTIVE,
+            frame.clone(),
+        );
+    }
+    admitted.then_some(query)
+}
+
 async fn try_lookup_or_discover(
     dst: &[u8; 32],
     local_node_id: &[u8; 32],
@@ -217,9 +315,7 @@ async fn try_lookup_or_discover(
     session_tx_registry: Option<&dyn FrameBroadcaster>,
     route_updated: Option<&tokio::sync::Notify>,
     peer_mlkem_keys: Option<&std::sync::RwLock<veil_e2e::PeerMlKemCache>>,
-    pending_recursive: Option<
-        &Mutex<std::collections::HashMap<[u8; 16], veil_dispatcher_state::PendingRecursive>>,
-    >,
+    pending_recursive: Option<&PendingRouteReplies>,
 ) -> Option<[u8; 32]> {
     discover_route(
         dst,
@@ -242,17 +338,9 @@ async fn discover_route(
     session_tx_registry: Option<&dyn FrameBroadcaster>,
     route_updated: Option<&tokio::sync::Notify>,
     peer_mlkem_keys: Option<&std::sync::RwLock<veil_e2e::PeerMlKemCache>>,
-    pending_recursive: Option<
-        &Mutex<std::collections::HashMap<[u8; 16], veil_dispatcher_state::PendingRecursive>>,
-    >,
+    pending_recursive: Option<&PendingRouteReplies>,
     kind: RouteDiscoveryKind,
 ) -> Option<[u8; 32]> {
-    use veil_proto::{
-        codec::encode_header,
-        family::{FrameFamily, RoutingMsg},
-        header::FrameHeader,
-    };
-
     let gate = discovery_gate((*local_node_id, *dst, kind));
     let _lookup = match gate.as_ref() {
         Some(gate) => Some(gate.lock().await),
@@ -312,97 +400,56 @@ async fn discover_route(
         veil_util::bytes_to_hex(&dst[..4])
     );
 
-    // Register for notification BEFORE sending the request so we don't miss
-    // a very fast reply.
     let notified = notify.notified();
-    // Oneshot receiver for the matching RecursiveResponse. Set
-    // inside the send block below when `pending_recursive` is available.
-    let rq_rx: Option<tokio::sync::oneshot::Receiver<Vec<u8>>>;
+    let mut peers = reg.active_node_ids();
+    if kind == RouteDiscoveryKind::RelayOnly {
+        // A direct reply only refreshes a route the relay-only send cannot use.
+        peers.retain(|peer| peer != dst);
+    }
+    peers.sort_by_key(|peer| std::array::from_fn::<_, 32, _>(|i| peer[i] ^ dst[i]));
 
-    // the legacy ROUTE_REQUEST flood-to-all path has been
-    // removed; discovery now goes solely through RecursiveQuery
-    // which is O(log N) vs O(N²) amplification of the old path.
-    {
-        // send RecursiveQuery(FindNode) to top-2 closest in DHT.
-        // This finds the target via greedy forwarding (O(log N) hops, pipelined)
-        // while ROUTE_REQUEST provides backward-compatible discovery.
-        let query_id: [u8; 16] = {
-            use rand_core::RngCore;
-            let mut id = [0u8; 16];
-            rand_core::OsRng.fill_bytes(&mut id);
-            id
-        };
-        let rq = veil_proto::routing::RecursiveQueryPayload {
-            query_id,
-            target_key: *dst,
-            reply_to: *local_node_id,
-            ttl: 40,
-            query_type: veil_proto::routing::recursive_query_type::FIND_NODE,
-            reply_port: 0,
-            payload: vec![],
-        };
-        let rq_bytes = rq.encode();
-        let mut rq_hdr = FrameHeader::new(
-            FrameFamily::Routing as u8,
-            RoutingMsg::RecursiveQuery as u16,
+    // Keep the normal greedy start. A relay lookup with no usable answer
+    // can probe one other live neighbor within the original wait window.
+    let mut alternate = if kind == RouteDiscoveryKind::RelayOnly {
+        peers.get(2)
+    } else {
+        None
+    };
+    let queue_alternate = |peer: &[u8; 32]| {
+        let queued = enqueue_route_query(
+            reg,
+            std::slice::from_ref(peer),
+            local_node_id,
+            dst,
+            pending_recursive,
         );
-        rq_hdr.body_len = rq_bytes.len() as u32;
-        let mut rq_frame = encode_header(&rq_hdr).to_vec();
-        rq_frame.extend_from_slice(&rq_bytes);
-        // Register a oneshot so the dispatcher's response handler can wake us
-        // the moment it has parsed the response and populated the cache.
-        rq_rx = pending_recursive.map(|map| {
-            use veil_proto::budget::MAX_PENDING_RECURSIVE;
-            let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
-            let mut m = map.lock().unwrap_or_else(|p| p.into_inner());
-            m.retain(|_, p| !p.tx.is_closed());
-            if m.len() < MAX_PENDING_RECURSIVE {
-                m.insert(
-                    query_id,
-                    veil_dispatcher_state::PendingRecursive {
-                        target_key: *dst,
-                        query_type: veil_proto::routing::recursive_query_type::FIND_NODE,
-                        tx,
-                    },
-                );
-            }
-            rx
-        });
-        // Send to the 2 closest peers by XOR distance to `dst` (
-        // — greedy start). Previously this was a bare `peer_ids.take(2)`
-        // which picked peers in arbitrary HashMap iteration order — under
-        // fragmented topology it frequently forwarded *away* from `dst`
-        // wasting a whole discovery round on the unlucky direction.
-        let mut peers = reg.active_node_ids();
-        if kind == RouteDiscoveryKind::RelayOnly {
-            // A direct reply would only refresh the direct route that cannot
-            // carry this relay-only send. Discover through ordinary mesh peers.
-            peers.retain(|peer| peer != dst);
-        }
-        peers.sort_by_key(|pid| {
-            let mut xor = [0u8; 32];
-            for i in 0..32 {
-                xor[i] = pid[i] ^ dst[i];
-            }
-            xor
-        });
-        let mut admitted = false;
-        for pid in peers.iter().take(2) {
-            admitted |= reg.send_to(
-                pid,
-                veil_proto::header::priority::INTERACTIVE,
-                rq_frame.clone(),
+        if crate::route_trace::is_enabled() {
+            log::info!(
+                "route.discovery.alternate dst={} first_hop={} admitted={} elapsed_ms={}",
+                veil_util::hex_short(dst),
+                veil_util::hex_short(peer),
+                queued.is_some(),
+                discovery_start.elapsed().as_millis(),
             );
         }
-        if !admitted {
-            // Local backpressure or a disconnected node cannot establish
-            // anything about this destination. Leave the next send free to
-            // retry and remove the response slot for this unsent query.
-            if let Some(pending) = pending_recursive {
-                lock!(pending).remove(&query_id);
-            }
-            return cached_discovery_hop(&rlock!(cache), dst, session_tx_registry, kind);
-        }
+        queued
+    };
+    let mut primary = enqueue_route_query(
+        reg,
+        &peers[..peers.len().min(2)],
+        local_node_id,
+        dst,
+        pending_recursive,
+    );
+    // When both primary queues refuse immediately, try the alternate without
+    // waiting. An entirely unsent search still cannot establish a route miss.
+    let mut backup = if primary.is_none() {
+        alternate.take().and_then(&queue_alternate)
+    } else {
+        None
+    };
+    if primary.is_none() && backup.is_none() {
+        return cached_discovery_hop(&rlock!(cache), dst, session_tx_registry, kind);
     }
 
     // The small RecursiveResponse can precede its larger signed key proof.
@@ -410,8 +457,9 @@ async fn discover_route(
     // another proof while the first one is still in flight. Unrelated route
     // notifications are only wakeups, never evidence for this destination.
     // Keep one fixed deadline and the legacy route-only fallback on expiry.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
-    let mut rq_rx = rq_rx;
+    let wait_started = tokio::time::Instant::now();
+    let deadline = wait_started + std::time::Duration::from_millis(500);
+    let alternate_at = wait_started + std::time::Duration::from_millis(200);
     tokio::pin!(notified);
     loop {
         // Register before checking the caches, including after each wakeup.
@@ -426,8 +474,17 @@ async fn discover_route(
         }
         tokio::select! {
             _ = &mut notified => {}
-            _ = async { let _ = rq_rx.as_mut().expect("guarded receiver").await; },
-                if rq_rx.is_some() => { rq_rx = None; }
+            _ = wait_for_route_response(&mut primary) => {}
+            _ = wait_for_route_response(&mut backup) => {}
+            _ = tokio::time::sleep_until(alternate_at), if alternate.is_some() => {
+                let peer = alternate.take().expect("guarded alternate");
+                // A route can arrive at the same time as the timer.
+                if tokio::time::Instant::now() < deadline
+                    && cached_discovery_hop(&rlock!(cache), dst, session_tx_registry, kind).is_none()
+                {
+                    backup = queue_alternate(peer);
+                }
+            }
             _ = tokio::time::sleep_until(deadline) => { break; }
         }
         notified.set(notify.notified());
@@ -7319,6 +7376,132 @@ mod ratchet_send_tests {
             fx.taken().is_empty(),
             "a live cached relay needs no new discovery"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_relay_discovery_reaches_the_third_hop_in_the_same_window() {
+        const LOCAL: [u8; 32] = [0xD1; 32];
+        const DST: [u8; 32] = [0x30; 32];
+        const FIRST: [u8; 32] = [0x31; 32];
+        const SECOND: [u8; 32] = [0x32; 32];
+        const REACHABLE: [u8; 32] = [0x33; 32];
+        const FOURTH: [u8; 32] = [0x34; 32];
+        let fx = fixture(vec![DST, FOURTH, REACHABLE, SECOND, FIRST]);
+        let notify = tokio::sync::Notify::new();
+        let pending = Mutex::new(std::collections::HashMap::new());
+        let start = tokio::time::Instant::now();
+        let lookup = discover_route(
+            &DST,
+            &LOCAL,
+            Some(&fx.route_cache),
+            Some(fx.outbox.as_ref()),
+            Some(&notify),
+            None,
+            Some(&pending),
+            RouteDiscoveryKind::RelayOnly,
+        );
+        let answer = async {
+            tokio::task::yield_now().await;
+            let sent = fx.taken();
+            assert_eq!(
+                sent.iter().map(|(hop, _)| *hop).collect::<Vec<_>>(),
+                [FIRST, SECOND]
+            );
+            let decode = |frame: &[u8]| {
+                veil_proto::routing::RecursiveQueryPayload::decode(
+                    &frame[veil_proto::HEADER_SIZE..],
+                )
+                .expect("ordinary FIND_NODE")
+            };
+            let first = decode(&sent[0].1);
+            // The first round answers without a usable first hop. Its
+            // correlation is already spent when the next candidate is tried.
+            let reply = lock!(pending).remove(&first.query_id).unwrap();
+            reply.tx.send(vec![]).unwrap();
+            tokio::time::sleep(Duration::from_millis(201)).await;
+            let sent = fx.taken();
+            assert_eq!(
+                sent.iter().map(|(hop, _)| *hop).collect::<Vec<_>>(),
+                [REACHABLE]
+            );
+            let extra = decode(&sent[0].1);
+            assert_ne!(extra.query_id, first.query_id);
+            assert_eq!(extra.target_key, DST);
+            let reply = lock!(pending).remove(&extra.query_id).unwrap();
+            // The dispatcher inserts validated candidates before delivering
+            // the correlated reply to its caller.
+            wlock!(fx.route_cache).insert(DST, REACHABLE, 10, 2);
+            reply.tx.send(vec![]).unwrap();
+        };
+        let (route, ()) = tokio::join!(lookup, answer);
+        assert_eq!(route, Some(REACHABLE));
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(lock!(pending).is_empty());
+        assert!(fx.taken().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_discovery_with_a_fast_route_leaves_the_third_hop_alone() {
+        let local = [0xD1; 32];
+        let dst = [0x40; 32];
+        let first = [0x41; 32];
+        let second = [0x42; 32];
+        let fx = fixture(vec![dst, [0x43; 32], second, first]);
+        let notify = tokio::sync::Notify::new();
+        let pending = Mutex::new(std::collections::HashMap::new());
+        let mut lookup = Box::pin(discover_route(
+            &dst,
+            &local,
+            Some(&fx.route_cache),
+            Some(fx.outbox.as_ref()),
+            Some(&notify),
+            None,
+            Some(&pending),
+            RouteDiscoveryKind::RelayOnly,
+        ));
+        assert!(futures::poll!(&mut lookup).is_pending());
+        tokio::time::advance(Duration::from_millis(100)).await;
+        wlock!(fx.route_cache).insert(dst, first, 10, 2);
+        notify.notify_waiters();
+        assert_eq!(lookup.await, Some(first));
+        assert_eq!(
+            fx.taken().iter().map(|(hop, _)| *hop).collect::<Vec<_>>(),
+            [first, second]
+        );
+        assert!(lock!(pending).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn route_discovery_cancellation_releases_all_outstanding_replies() {
+        for (kind, expected_queries) in [
+            (RouteDiscoveryKind::RelayOnly, 2),
+            (RouteDiscoveryKind::Any, 1),
+        ] {
+            let local = [0xD1; 32];
+            let dst = [0x50; 32];
+            let fx = fixture(vec![[0x51; 32], [0x52; 32], [0x53; 32]]);
+            let notify = tokio::sync::Notify::new();
+            let pending = Mutex::new(std::collections::HashMap::new());
+            let mut lookup = Box::pin(discover_route(
+                &dst,
+                &local,
+                Some(&fx.route_cache),
+                Some(fx.outbox.as_ref()),
+                Some(&notify),
+                None,
+                Some(&pending),
+                kind,
+            ));
+            assert!(futures::poll!(&mut lookup).is_pending());
+            assert_eq!(fx.taken().len(), 2);
+            assert_eq!(lock!(pending).len(), 1);
+            tokio::time::advance(Duration::from_millis(201)).await;
+            assert!(futures::poll!(&mut lookup).is_pending());
+            assert_eq!(fx.taken().len(), expected_queries - 1);
+            assert_eq!(lock!(pending).len(), expected_queries);
+            drop(lookup);
+            assert!(lock!(pending).is_empty());
+        }
     }
 
     #[tokio::test]
