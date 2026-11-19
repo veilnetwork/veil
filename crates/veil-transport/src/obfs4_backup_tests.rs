@@ -274,13 +274,40 @@ mod initial_ack {
         (uri, client.unwrap(), server.unwrap().0)
     }
 
-    async fn blocked_handshake(dial: Obfs4Dial) -> bool {
-        let (uri, client, server) = connected_pair().await;
+    fn block_first_flight(server: &TcpStream) {
         // Drop incoming packets on this accepted loopback socket so the
         // client sends its first flight over TCP without receiving any ACK.
         const BPF_RET_K: u16 = 0x06;
         let reject = SockFilter::new(BPF_RET_K, 0, 0, 0);
-        SockRef::from(&server).attach_filter(&[reject]).unwrap();
+        SockRef::from(server).attach_filter(&[reject]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn canonical_first_flight_expires_without_waiting_for_a_kernel_retransmission() {
+        let (uri, client, server) = connected_pair().await;
+        block_first_flight(&server);
+        let psk = NodeIdMacKey([42; 32]);
+        tokio::time::pause();
+        let handshake = finish_client_handshake(
+            HandshakeStream::new(client, HandshakeSide::Client),
+            &uri,
+            &psk,
+            WireFormatVariant::V1,
+            Obfs4Dial::Canonical,
+        );
+        // Advancing the executor clock does not advance Linux's TCP timer.
+        // The outer guard allows for the executor's millisecond timer wheel.
+        assert!(matches!(
+            tokio::time::timeout(MOBILE_INITIAL_ACK_TIMEOUT + Duration::from_millis(10), handshake)
+                .await,
+            Ok(Err(TransportError::Tls(error)))
+                if error.contains("no TCP acknowledgement for the obfs4 opening")
+        ));
+    }
+
+    async fn blocked_handshake(dial: Obfs4Dial) -> bool {
+        let (uri, client, server) = connected_pair().await;
+        block_first_flight(&server);
         let outcome = tokio::time::timeout(
             Duration::from_secs(8),
             finish_client_handshake(
@@ -296,6 +323,7 @@ mod initial_ack {
             Ok(Err(TransportError::Tls(error))) => {
                 assert!(
                     error.contains(&std::io::Error::from_raw_os_error(libc::ETIMEDOUT).to_string())
+                        || error.contains("no TCP acknowledgement for the obfs4 opening")
                 );
                 true
             }

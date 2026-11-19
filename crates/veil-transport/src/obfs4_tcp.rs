@@ -62,8 +62,8 @@ const OBFS4_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 const OBFS4_BACKUP_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 // On Android a newly connected socket can remain stuck retransmitting its
-// first data after a radio change. Allow several retransmissions on each
-// canonical candidate, then let the connector try fresh sockets. A peer that
+// first data after a radio change. Give each canonical candidate three seconds
+// for the first ACK, then let the connector try fresh sockets. A peer that
 // ACKs the data can still use the full obfs4 handshake budget.
 #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
 const MOBILE_INITIAL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -197,10 +197,17 @@ async fn finish_client_handshake(
     _dial: Obfs4Dial,
 ) -> Result<(super::traits::PeerMeta, Obfs4Stream<HandshakeStream>)> {
     #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
-    let reset_ack_timeout = matches!(_dial, Obfs4Dial::Canonical)
-        && socket2::SockRef::from(stream.socket())
+    let (stream, reset_ack_timeout) = if matches!(_dial, Obfs4Dial::Canonical) {
+        let reset = socket2::SockRef::from(stream.socket())
             .set_tcp_user_timeout(Some(MOBILE_INITIAL_ACK_TIMEOUT))
             .is_ok();
+        (
+            stream.with_initial_ack_deadline(MOBILE_INITIAL_ACK_TIMEOUT),
+            reset,
+        )
+    } else {
+        (stream, false)
+    };
     let peer = peer_meta(
         "obfs4-tcp",
         uri.clone(),

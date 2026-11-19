@@ -18,6 +18,38 @@ fn native_u64(raw: &[u8], offset: usize) -> Option<u64> {
     ))
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(super) fn socket_info<'a>(
+    fd: std::os::fd::BorrowedFd<'_>,
+    raw: &'a mut [u8],
+) -> std::io::Result<&'a [u8]> {
+    use std::os::fd::AsRawFd;
+    let mut len = raw.len() as libc::socklen_t;
+    // SAFETY: live borrowed descriptor, writable buffer and length. Neither
+    // the descriptor nor the pointer escapes this synchronous call.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            raw.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    raw.get(..len as usize)
+        .ok_or_else(|| std::io::ErrorKind::InvalidData.into())
+}
+
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+pub(super) fn acknowledged_bytes(stream: &tokio::net::TcpStream) -> Option<u64> {
+    use std::os::fd::AsFd;
+    let mut raw = [0u8; 128];
+    read(socket_info(stream.as_fd(), &mut raw).ok()?).acked_bytes
+}
+
 pub(super) fn read(raw: &[u8]) -> ByteProgress {
     ByteProgress {
         sent_bytes: native_u64(raw, 200),

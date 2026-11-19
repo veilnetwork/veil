@@ -13,6 +13,12 @@ use tokio::net::TcpStream;
 
 use super::{ConnectTraceContext, KernelSnapshot, NEXT_CONNECTION, SocketMetadata, enabled_cell};
 
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+struct InitialAckDeadline {
+    baseline: u64,
+    timer: Pin<Box<tokio::time::Sleep>>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum HandshakeSide {
     Client,
@@ -58,12 +64,13 @@ impl Observation {
     }
 }
 
-/// The wrapper is only an I/O observer; authentication, framing and deadlines
-/// remain owned by obfs4 and its transport caller. After upgrade it delegates
-/// without collecting application I/O. Neither socket options nor results change.
+/// Observes handshake I/O and applies the caller's optional initial ACK
+/// deadline. After upgrade it delegates without collecting application I/O.
 pub(crate) struct HandshakeStream {
     socket: TcpStream,
     observation: Option<Observation>,
+    #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+    initial_ack: Option<InitialAckDeadline>,
 }
 
 impl HandshakeStream {
@@ -130,6 +137,8 @@ impl HandshakeStream {
         let stream = Self {
             socket,
             observation,
+            #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+            initial_ack: None,
         };
         if let Some(o) = &stream.observation {
             o.log(&stream.socket, "start");
@@ -139,6 +148,18 @@ impl HandshakeStream {
 
     pub(crate) fn socket(&self) -> &TcpStream {
         &self.socket
+    }
+
+    #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+    pub(crate) fn with_initial_ack_deadline(mut self, timeout: std::time::Duration) -> Self {
+        self.initial_ack =
+            super::linux_progress::acknowledged_bytes(&self.socket).map(|baseline| {
+                InitialAckDeadline {
+                    baseline,
+                    timer: Box::pin(tokio::time::sleep(timeout)),
+                }
+            });
+        self
     }
 
     pub(crate) fn connection_id(&self) -> Option<u64> {
@@ -205,6 +226,26 @@ impl AsyncRead for HandshakeStream {
             o.read_bytes = o
                 .read_bytes
                 .saturating_add((buf.filled().len() - before) as u64);
+        }
+        // The client only reads after writing its opening flight. Give a
+        // socket with any ACK progress (or a reply) the regular handshake
+        // budget. TCP_USER_TIMEOUT alone can be observed late, on the next
+        // retransmission, even when the initial bytes have never been ACKed.
+        #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+        if let Some(deadline) = &mut self.initial_ack
+            && (!result.is_pending()
+                || std::future::Future::poll(deadline.timer.as_mut(), cx).is_ready())
+        {
+            let baseline = deadline.baseline;
+            self.initial_ack = None;
+            if result.is_pending()
+                && super::linux_progress::acknowledged_bytes(&self.socket) == Some(baseline)
+            {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "no TCP acknowledgement for the obfs4 opening",
+                )));
+            }
         }
         result
     }
