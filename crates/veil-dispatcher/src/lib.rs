@@ -635,11 +635,27 @@ impl<K: Hash + Eq + Copy + Ord, V> ExpiryMap<K, V> {
         self.prune_expired(now);
         self.entries.get(key)
     }
+
+    fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.prune_expired(Instant::now());
+        self.entries.get_mut(key)
+    }
 }
 
 /// Shared terminal-delivery ACK-replay cache: `content_id → (sender, ack_key)`
 /// (audit cycle-8 H8). Type alias to keep the dispatcher field readable.
 pub type TerminalAckReplay = Arc<Mutex<ExpiryMap<[u8; 32], ([u8; 32], [u8; 32])>>>;
+
+/// One short-lived allowance for a matching lossy copy from a different
+/// ingress after a failed forwarding pass. Consumed allowances keep their
+/// original expiry. This cache never changes the terminal replay guard.
+pub struct LossyForwardRetryCache(ExpiryMap<[u8; 32], Option<(NodeIdBytes, blake3::Hash)>>);
+
+impl Default for LossyForwardRetryCache {
+    fn default() -> Self {
+        Self(ExpiryMap::new(Duration::from_secs(1), 4096))
+    }
+}
 
 // ── RouteSeenSet ──────────────────────────────────────────────────────────────
 
@@ -1151,6 +1167,7 @@ pub struct FrameDispatcher {
     /// domains (see [`Self::forward_seen_set`]) cannot evict a content_id and
     /// re-open the payload-replay window within the TTL. (audit cycle-8 F9.)
     pub forward_seen_content: Arc<Mutex<ForwardSeenSet>>,
+    pub lossy_forward_retries: Arc<Mutex<LossyForwardRetryCache>>,
     /// Terminal-delivery ACK-replay cache (audit cycle-8 H8): `content_id →
     /// (ack_target_sender, ack_key)`. On a duplicate terminal arrival — a
     /// retransmit sent because our original DELIVERED ACK was lost — re-emit the
@@ -2147,6 +2164,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
             Duration::from_secs(veil_proto::budget::FORWARD_SEEN_SET_TTL_SECS),
             veil_proto::budget::MAX_FORWARD_SEEN_SET_SIZE,
         ))),
+        lossy_forward_retries: Default::default(),
         terminal_ack_replay: Arc::new(Mutex::new(ExpiryMap::new(
             Duration::from_secs(veil_proto::budget::FORWARD_SEEN_SET_TTL_SECS),
             veil_proto::budget::MAX_FORWARD_SEEN_SET_SIZE,
@@ -3019,6 +3037,7 @@ mod tests {
                 Duration::from_secs(30),
                 10_000,
             ))),
+            lossy_forward_retries: Default::default(),
             terminal_ack_replay: Arc::new(Mutex::new(ExpiryMap::new(
                 Duration::from_secs(30),
                 10_000,

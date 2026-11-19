@@ -532,7 +532,8 @@ impl FrameDispatcher {
         &self,
         payload: &ForwardPayload,
         peer_id: NodeId,
-    ) -> std::result::Result<u8, DispatchResult> {
+        lossy_retry: bool,
+    ) -> std::result::Result<(u8, bool), DispatchResult> {
         // backpressure — drop FORWARD when local congestion exceeds threshold.
         // score_u8 > 200 ≈ 78% load → reject transit traffic to protect local node.
         if let Some(ref cm) = self.congestion_monitor
@@ -652,11 +653,22 @@ impl FrameDispatcher {
                 lock!(self.forward_seen_content).check_and_insert(content_id)
             };
             if duplicate {
+                if lossy_retry
+                    && let Some(permit) = lock!(self.lossy_forward_retries).0.get_mut(&content_id)
+                    && let Some((previous, envelope_hash)) = permit
+                    && previous != peer_id.as_bytes()
+                    && *envelope_hash == blake3::hash(&payload.envelope.encode())
+                {
+                    // Consume before attempting admission. A second refusal
+                    // cannot reopen the retry, even from a different neighbor.
+                    *permit = None;
+                    return Ok((relay_hops_out, false));
+                }
                 return Err(DispatchResult::NoResponse);
             }
         }
 
-        Ok(relay_hops_out)
+        Ok((relay_hops_out, lossy_retry))
     }
 
     /// Collect and rank relay-hop candidates for `dst`, excluding `peer_id`
@@ -1159,7 +1171,7 @@ impl FrameDispatcher {
         peer_id: NodeId,
         traffic_class: u8,
     ) -> DispatchResult {
-        self.relay_forward_with_carrier(payload, peer_id, traffic_class, None)
+        self.relay_forward_with_carrier(payload, peer_id, traffic_class, None, false)
     }
 
     fn relay_forward_with_carrier(
@@ -1168,12 +1180,38 @@ impl FrameDispatcher {
         peer_id: NodeId,
         traffic_class: u8,
         carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
+        lossy_retry: bool,
     ) -> DispatchResult {
-        let relay_hops_out = match self.check_relay_preconditions(&payload, peer_id) {
-            Ok(hops) => hops,
-            Err(result) => return result,
-        };
+        let (relay_hops_out, may_retry) =
+            match self.check_relay_preconditions(&payload, peer_id, lossy_retry) {
+                Ok(pass) => pass,
+                Err(result) => return result,
+            };
+        if !self.admit_relay_forward(
+            &payload,
+            peer_id,
+            traffic_class,
+            carrier.as_ref(),
+            relay_hops_out,
+        ) && may_retry
+        {
+            let envelope_hash = blake3::hash(&payload.envelope.encode());
+            lock!(self.lossy_forward_retries).0.insert(
+                payload.envelope.content_id,
+                Some((*peer_id.as_bytes(), envelope_hash)),
+            );
+        }
+        DispatchResult::NoResponse
+    }
 
+    fn admit_relay_forward(
+        &self,
+        payload: &ForwardPayload,
+        peer_id: NodeId,
+        traffic_class: u8,
+        carrier: Option<&veil_anonymity::circuit_carrier::Carrier>,
+        relay_hops_out: u8,
+    ) -> bool {
         // sovereign fast-path. If a live, authenticated
         // session exists to the recipient's identity, forward directly
         // via that session — a 1-hop authenticated session is always
@@ -1182,13 +1220,13 @@ impl FrameDispatcher {
         // available (legacy peer, identity offline, or no registry
         // wired in this build).
         if self.try_sovereign_direct_forward_with_carrier(
-            &payload,
+            payload,
             peer_id,
             traffic_class,
             relay_hops_out,
-            carrier.as_ref(),
+            carrier,
         ) {
-            return DispatchResult::NoResponse;
+            return true;
         }
 
         // Intermediate relay — forward the envelope intact so that
@@ -1229,7 +1267,7 @@ impl FrameDispatcher {
             // fields — including `trace_id == 0` — or the receiver will reject
             // the frame with "bad Forward: buffer too short".
             let envelope_bytes = payload.envelope.encode();
-            let suffix = forward_suffix(&payload, relay_hops_out);
+            let suffix = forward_suffix(payload, relay_hops_out);
             let body_len = 32 + envelope_bytes.len() + suffix.len();
             let total_wire_len = veil_proto::header::HEADER_SIZE + body_len;
             let make_fwd_frame = |hop: NodeIdBytes| -> Vec<u8> {
@@ -1256,22 +1294,15 @@ impl FrameDispatcher {
             // Forward to a directly connected recipient with the same neutral
             // scheduling class as any other relay hop.
             let fwd_frame = make_fwd_frame(dst);
-            if send_forward_on_ingress(&reg_guard, &dst, traffic_class, fwd_frame, carrier.as_ref())
-                .is_ok()
+            if send_forward_on_ingress(&reg_guard, &dst, traffic_class, fwd_frame, carrier).is_ok()
             {
-                return DispatchResult::NoResponse;
+                return true;
             }
 
             let mut failed_hops = Vec::new();
             let mut try_hop = |hop| {
                 let frame = make_fwd_frame(hop);
-                match send_forward_on_ingress(
-                    &reg_guard,
-                    &hop,
-                    traffic_class,
-                    frame,
-                    carrier.as_ref(),
-                ) {
+                match send_forward_on_ingress(&reg_guard, &hop, traffic_class, frame, carrier) {
                     Ok(()) => true,
                     Err(error) => {
                         failed_hops.push((hop, error));
@@ -1332,7 +1363,7 @@ impl FrameDispatcher {
                         }
                     }
                     invalidate_unavailable(failed_hops);
-                    return DispatchResult::NoResponse;
+                    return true;
                 }
                 // All multi-path sends failed — fall through to single-hop logic.
             }
@@ -1349,7 +1380,7 @@ impl FrameDispatcher {
                 if any_sent {
                     drop(reg_guard);
                     invalidate_unavailable(failed_hops);
-                    return DispatchResult::NoResponse;
+                    return true;
                 }
                 // All ECMP paths failed — fall through to the linear scan below
                 // which will also attempt any non-ECMP candidates.
@@ -1403,7 +1434,7 @@ impl FrameDispatcher {
                 // record relay attempt for reputation scoring.
                 // Acquired after reg_guard is released to respect lock ordering.
                 lock!(self.control_plane.rtt_table()).record_relay_attempt(relay_hop);
-                return DispatchResult::NoResponse;
+                return true;
             }
         }
 
@@ -1412,14 +1443,14 @@ impl FrameDispatcher {
         // destination is a global-veil node that is not in the local route
         // cache but reachable through any connected gateway.
         if self.try_forward_via_gateway_with_carrier(
-            &payload,
+            payload,
             peer_id,
             fwd_dst,
             relay_hops_out,
             traffic_class,
-            carrier.as_ref(),
+            carrier,
         ) {
-            return DispatchResult::NoResponse;
+            return true;
         }
 
         // Route miss — trigger on-demand discovery so the message can
@@ -1444,16 +1475,7 @@ impl FrameDispatcher {
             m.inc_route_miss();
         }
 
-        // attempt DHT-routed recursive relay before mailbox fallback.
-        if self.try_recursive_relay_via_dht(&payload, peer_id, fwd_dst) {
-            return DispatchResult::NoResponse;
-        }
-
-        // mailbox subsystem removed. When no relay path exists
-        // and DHT recursive relay also fails, the frame is silently dropped.
-        // Reliable async delivery is now an application-layer concern (e.g.
-        // a future `veil-mailbox` crate built on top of this transport).
-        DispatchResult::NoResponse
+        self.try_recursive_relay_via_dht(payload, peer_id, fwd_dst)
     }
 
     /// Build and fire a `DeliveryStatus(DELIVERED)` frame toward `sender`.
@@ -1543,7 +1565,8 @@ impl FrameDispatcher {
         // loss-tolerant datagram eligibility is a separate transport decision.
         let _ = header;
         let traffic_class = payload.relay_traffic_class();
-        self.relay_forward_with_carrier(payload, peer_id, traffic_class, carrier)
+        let lossy_retry = ForwardPayload::is_realtime_datagram_eligible(body);
+        self.relay_forward_with_carrier(payload, peer_id, traffic_class, carrier, lossy_retry)
     }
 
     /// Peek the envelope's fixed-offset `created_at`+`ttl_secs` without
@@ -2627,6 +2650,112 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lossy_forward_accepts_one_alternate_copy_after_local_refusal() {
+        use std::sync::{Arc, RwLock};
+        use veil_proto::delivery::{DeliveryEnvelope, ForwardPayload};
+        use veil_proto::family::{DeliveryMsg, FrameFamily};
+        use veil_proto::header::{FrameHeader, HEADER_SIZE, priority::INTERACTIVE};
+        use veil_proto::recipient::Recipient;
+        use veil_session::SessionTxRegistry;
+        use veil_util::wlock;
+
+        let primary_ingress = [0xA1; 32];
+        let alternate_ingress = [0xA2; 32];
+        let destination = [0xB1; 32];
+        let mut dispatcher = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        dispatcher.local_node_id = [0xC1; 32];
+        let registry = Arc::new(RwLock::new(SessionTxRegistry::with_capacity(1)));
+        let mut output = wlock!(registry).register(destination);
+        dispatcher.session_tx_registry = Some(Arc::clone(&registry));
+        let forward = ForwardPayload {
+            next_hop_node_id: dispatcher.local_node_id,
+            envelope: DeliveryEnvelope {
+                recipient: Recipient::any(destination),
+                sender_node_id: [0xD1; 32],
+                src_app_id: [0xD2; 32],
+                app_id: [0xD3; 32],
+                endpoint_id: 1,
+                content_id: [0xD4; 32],
+                created_at: veil_util::unix_secs_now_u64(),
+                ttl_secs: 30,
+                payload: vec![7; 64],
+                trace_id: 0,
+                require_ack: false,
+            },
+            relay_hops: 1,
+            delivery_attempt: None,
+            traffic_class: Some(INTERACTIVE),
+        };
+        let dispatch = |packet: &ForwardPayload, ingress| {
+            let body = packet.encode();
+            let mut header =
+                FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+            header.body_len = body.len() as u32;
+            assert!(matches!(
+                dispatcher.dispatch(&header, &body, ingress),
+                crate::DispatchResult::NoResponse
+            ));
+        };
+        let fill = || assert!(rlock!(registry).send_to(&destination, INTERACTIVE, vec![9]));
+        let mut alternate = ForwardPayload {
+            relay_hops: 2,
+            ..forward.clone()
+        };
+
+        fill();
+        dispatch(&forward, primary_ingress);
+        assert_eq!(&*output.try_recv().unwrap().1, &[9]);
+        dispatch(&forward, primary_ingress);
+        assert!(
+            output.try_recv().is_err(),
+            "the same ingress is still deduplicated"
+        );
+        alternate.envelope.payload[0] = 4;
+        dispatch(&alternate, alternate_ingress);
+        assert!(
+            output.try_recv().is_err(),
+            "the alternate must carry the original envelope"
+        );
+        alternate.envelope.payload[0] = 7;
+        dispatch(&alternate, alternate_ingress);
+        let (lane, bytes) = output
+            .try_recv()
+            .expect("a later copy can use the drained queue");
+        assert_eq!(lane, INTERACTIVE);
+        let delivered = ForwardPayload::decode(&bytes[HEADER_SIZE..]).unwrap();
+        assert_eq!(delivered.envelope.payload, forward.envelope.payload);
+        assert_eq!(delivered.relay_hops, alternate.relay_hops + 1);
+        dispatch(&alternate, [0xA3; 32]);
+        assert!(
+            output.try_recv().is_err(),
+            "admitted work is deduplicated across paths"
+        );
+
+        let mut next = forward.clone();
+        next.envelope.content_id = [0xD5; 32];
+        fill();
+        dispatch(&next, primary_ingress);
+        dispatch(&next, alternate_ingress);
+        assert_eq!(&*output.try_recv().unwrap().1, &[9]);
+        dispatch(&next, [0xA3; 32]);
+        assert!(
+            output.try_recv().is_err(),
+            "a failed alternate spends the one retry"
+        );
+
+        next.envelope.content_id = [0xD6; 32];
+        next.traffic_class = None;
+        fill();
+        dispatch(&next, primary_ingress);
+        assert_eq!(&*output.try_recv().unwrap().1, &[9]);
+        dispatch(&next, alternate_ingress);
+        assert!(
+            output.try_recv().is_err(),
+            "ordered forwarding keeps the original rules"
+        );
+    }
+
     /// audit cycle-3 (M1): ECMP flow-pinning must be deterministic per flow
     /// regardless of the upstream weighted shuffle, keep the equal-cost group at
     /// the front, and permute `hop_attrs` in lockstep with `candidates`.
@@ -2867,11 +2996,11 @@ mod tests {
         for attempt in 1..=veil_proto::budget::MAX_DELIVERY_ATTEMPTS as u8 {
             forward.delivery_attempt = Some(attempt);
             assert!(matches!(
-                dispatcher.check_relay_preconditions(&forward, peer),
-                Ok(1)
+                dispatcher.check_relay_preconditions(&forward, peer, false),
+                Ok((1, false))
             ));
             assert!(matches!(
-                dispatcher.check_relay_preconditions(&forward, peer),
+                dispatcher.check_relay_preconditions(&forward, peer, false),
                 Err(DispatchResult::NoResponse)
             ));
         }
@@ -2879,14 +3008,14 @@ mod tests {
         forward.delivery_attempt =
             Some(u8::try_from(veil_proto::budget::MAX_DELIVERY_ATTEMPTS).unwrap() + 1);
         assert!(matches!(
-            dispatcher.check_relay_preconditions(&forward, peer),
+            dispatcher.check_relay_preconditions(&forward, peer, false),
             Err(DispatchResult::Violation(_))
         ));
 
         // Stripping the extension cannot buy an extra legacy forwarding pass.
         forward.delivery_attempt = None;
         assert!(matches!(
-            dispatcher.check_relay_preconditions(&forward, peer),
+            dispatcher.check_relay_preconditions(&forward, peer, false),
             Err(DispatchResult::NoResponse)
         ));
 
@@ -2895,7 +3024,7 @@ mod tests {
         forward.envelope.require_ack = false;
         forward.delivery_attempt = Some(1);
         assert!(matches!(
-            dispatcher.check_relay_preconditions(&forward, peer),
+            dispatcher.check_relay_preconditions(&forward, peer, false),
             Err(DispatchResult::Violation(_))
         ));
     }
