@@ -284,12 +284,11 @@ mod initial_ack {
 
     #[tokio::test]
     async fn canonical_first_flight_expires_without_waiting_for_a_kernel_retransmission() {
-        let (uri, client, server) = connected_pair().await;
-        block_first_flight(&server);
+        let (uri, client, _server) = connected_pair().await;
         let psk = NodeIdMacKey([42; 32]);
         tokio::time::pause();
         let handshake = finish_client_handshake(
-            HandshakeStream::new(client, HandshakeSide::Client),
+            HandshakeStream::new(client, HandshakeSide::Client).with_test_ack_bytes(1),
             &uri,
             &psk,
             WireFormatVariant::V1,
@@ -303,6 +302,28 @@ mod initial_ack {
             Ok(Err(TransportError::Tls(error)))
                 if error.contains("no TCP acknowledgement for the obfs4 opening")
         ));
+    }
+
+    #[tokio::test]
+    async fn auxiliary_handshake_keeps_its_original_budget() {
+        let (uri, client, _server) = connected_pair().await;
+        let psk = NodeIdMacKey([42; 32]);
+        tokio::time::pause();
+        let handshake = finish_client_handshake(
+            HandshakeStream::new(client, HandshakeSide::Client).with_test_ack_bytes(1),
+            &uri,
+            &psk,
+            WireFormatVariant::V1,
+            Obfs4Dial::Auxiliary,
+        );
+        assert!(
+            tokio::time::timeout(
+                MOBILE_INITIAL_ACK_TIMEOUT + Duration::from_millis(10),
+                handshake
+            )
+            .await
+            .is_err()
+        );
     }
 
     async fn blocked_handshake(dial: Obfs4Dial) -> bool {
@@ -333,6 +354,7 @@ mod initial_ack {
     }
 
     #[tokio::test]
+    #[ignore = "requires a host that permits attaching a classic socket filter"]
     async fn unacked_first_flight_can_expire_before_the_obfs4_deadline() {
         let (canonical, auxiliary) = tokio::join!(
             blocked_handshake(Obfs4Dial::Canonical),

@@ -71,6 +71,8 @@ pub(crate) struct HandshakeStream {
     observation: Option<Observation>,
     #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
     initial_ack: Option<InitialAckDeadline>,
+    #[cfg(all(test, any(target_os = "android", target_os = "linux")))]
+    test_ack_bytes: Option<u64>,
 }
 
 impl HandshakeStream {
@@ -139,6 +141,8 @@ impl HandshakeStream {
             observation,
             #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
             initial_ack: None,
+            #[cfg(all(test, any(target_os = "android", target_os = "linux")))]
+            test_ack_bytes: None,
         };
         if let Some(o) = &stream.observation {
             o.log(&stream.socket, "start");
@@ -152,13 +156,26 @@ impl HandshakeStream {
 
     #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
     pub(crate) fn with_initial_ack_deadline(mut self, timeout: std::time::Duration) -> Self {
-        self.initial_ack =
-            super::linux_progress::acknowledged_bytes(&self.socket).map(|baseline| {
-                InitialAckDeadline {
-                    baseline,
-                    timer: Box::pin(tokio::time::sleep(timeout)),
-                }
-            });
+        self.initial_ack = self.initial_ack_bytes().map(|baseline| InitialAckDeadline {
+            baseline,
+            timer: Box::pin(tokio::time::sleep(timeout)),
+        });
+        self
+    }
+
+    #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+    fn initial_ack_bytes(&self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(bytes) = self.test_ack_bytes {
+            return Some(bytes);
+        }
+        super::linux_progress::acknowledged_bytes(&self.socket)
+    }
+
+    /// Freeze the kernel observation while using real handshake I/O and clocks.
+    #[cfg(all(test, any(target_os = "android", target_os = "linux")))]
+    pub(crate) fn with_test_ack_bytes(mut self, bytes: u64) -> Self {
+        self.test_ack_bytes = Some(bytes);
         self
     }
 
@@ -238,9 +255,7 @@ impl AsyncRead for HandshakeStream {
         {
             let baseline = deadline.baseline;
             self.initial_ack = None;
-            if result.is_pending()
-                && super::linux_progress::acknowledged_bytes(&self.socket) == Some(baseline)
-            {
+            if result.is_pending() && self.initial_ack_bytes() == Some(baseline) {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "no TCP acknowledgement for the obfs4 opening",
