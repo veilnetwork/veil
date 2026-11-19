@@ -177,13 +177,11 @@ fn send_forward_on_ingress(
     priority: u8,
     frame: Vec<u8>,
     carrier: Option<&veil_anonymity::circuit_carrier::Carrier>,
-) -> bool {
+) -> Result<(), veil_session::SendToError> {
     if let Some(carrier) = carrier {
-        registry
-            .send_to_on_carrier_result(peer, frame, carrier.clone())
-            .is_ok()
+        registry.send_to_on_carrier_result(peer, frame, carrier.clone())
     } else {
-        registry.send_to(peer, priority, frame)
+        registry.send_to_result(peer, priority, frame)
     }
 }
 
@@ -314,7 +312,7 @@ impl FrameDispatcher {
             frame.extend_from_slice(&envelope_bytes);
             frame.extend_from_slice(&suffix);
 
-            if send_forward_on_ingress(&reg_guard, &target, traffic_class, frame, carrier) {
+            if send_forward_on_ingress(&reg_guard, &target, traffic_class, frame, carrier).is_ok() {
                 // Direct-forward counter would land here on a future
                 // operator-dashboard milestone (was closed
                 // without the metric; not critical to session correctness).
@@ -1036,7 +1034,7 @@ impl FrameDispatcher {
         frame.extend_from_slice(&gw);
         frame.extend_from_slice(&envelope_bytes);
         frame.extend_from_slice(&gw_suffix);
-        send_forward_on_ingress(&rlock!(reg), &gw, traffic_class, frame, carrier)
+        send_forward_on_ingress(&rlock!(reg), &gw, traffic_class, frame, carrier).is_ok()
     }
 
     /// DHT recursive-relay fallback: when neither route_cache nor a gateway
@@ -1262,13 +1260,49 @@ impl FrameDispatcher {
             // scheduling class as any other relay hop.
             let fwd_frame = make_fwd_frame(dst);
             if send_forward_on_ingress(&reg_guard, &dst, traffic_class, fwd_frame, carrier.as_ref())
+                .is_ok()
             {
                 return DispatchResult::NoResponse;
             }
 
-            // Collect failed hops to invalidate in RouteCache after releasing reg_guard.
-            // We must not hold reg_guard while locking route_cache (lock ordering).
-            let mut failed_hops: Vec<[u8; 32]> = Vec::new();
+            let mut failed_hops = Vec::new();
+            let mut try_hop = |hop| {
+                let frame = make_fwd_frame(hop);
+                match send_forward_on_ingress(
+                    &reg_guard,
+                    &hop,
+                    traffic_class,
+                    frame,
+                    carrier.as_ref(),
+                ) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        failed_hops.push((hop, error));
+                        false
+                    }
+                }
+            };
+            // Only acquire the cache lock after releasing reg_guard.
+            // Full queues keep their live routes for subsequent frames.
+            let invalidate_unavailable =
+                |failures: Vec<(NodeIdBytes, veil_session::SendToError)>| {
+                    let mut unavailable = failures
+                        .into_iter()
+                        .filter(|(_, error)| {
+                            matches!(
+                                error,
+                                veil_session::SendToError::Missing
+                                    | veil_session::SendToError::Closed
+                            )
+                        })
+                        .peekable();
+                    if unavailable.peek().is_some() {
+                        let mut cache = wlock!(self.route_cache);
+                        for (hop, _) in unavailable {
+                            cache.invalidate_hop(&dst, &hop);
+                        }
+                    }
+                };
 
             // ── multi-path delivery ──────────────────────────────────
             // When enabled and the frame priority is latency-sensitive (≤ min_priority)
@@ -1279,44 +1313,28 @@ impl FrameDispatcher {
                 && candidates.len() >= 2
             {
                 let n = (self.max_parallel_paths as usize).min(candidates.len());
-                let mut any_sent = false;
-                let mut mp_sent: u64 = 0;
+                let mut sent = 0;
                 for &hop in candidates.iter().take(n) {
-                    let fwd_frame = make_fwd_frame(hop);
-                    if send_forward_on_ingress(
-                        &reg_guard,
-                        &hop,
-                        traffic_class,
-                        fwd_frame,
-                        carrier.as_ref(),
-                    ) {
-                        any_sent = true;
-                        mp_sent += 1;
-                    } else {
-                        failed_hops.push(hop);
+                    if try_hop(hop) {
+                        sent += 1;
                     }
                 }
-                if any_sent {
+                if sent != 0 {
                     drop(reg_guard);
                     if let Some(m) = &self.metrics {
-                        m.inc_multi_path_sends(mp_sent);
+                        m.inc_multi_path_sends(sent);
                     }
                     // Record relay attempt for each hop we successfully sent to.
                     {
                         let rtt_lock = self.control_plane.rtt_table();
                         let mut rtt = lock!(rtt_lock);
                         for &hop in candidates.iter().take(n) {
-                            if !failed_hops.contains(&hop) {
+                            if !failed_hops.iter().any(|(failed, _)| *failed == hop) {
                                 rtt.record_relay_attempt(hop);
                             }
                         }
                     }
-                    if !failed_hops.is_empty() {
-                        let mut rc = wlock!(self.route_cache);
-                        for hop in &failed_hops {
-                            rc.invalidate_hop(&dst, hop);
-                        }
-                    }
+                    invalidate_unavailable(failed_hops);
                     return DispatchResult::NoResponse;
                 }
                 // All multi-path sends failed — fall through to single-hop logic.
@@ -1329,30 +1347,11 @@ impl FrameDispatcher {
             if self.redundant_send && ecmp_group_len >= 2 {
                 let mut any_sent = false;
                 for &hop in candidates.iter().take(ecmp_group_len) {
-                    let fwd_frame = make_fwd_frame(hop);
-                    match send_forward_on_ingress(
-                        &reg_guard,
-                        &hop,
-                        traffic_class,
-                        fwd_frame,
-                        carrier.as_ref(),
-                    ) {
-                        true => {
-                            any_sent = true;
-                        }
-                        false => {
-                            failed_hops.push(hop);
-                        }
-                    }
+                    any_sent |= try_hop(hop);
                 }
                 if any_sent {
                     drop(reg_guard);
-                    if !failed_hops.is_empty() {
-                        let mut rc = wlock!(self.route_cache);
-                        for hop in &failed_hops {
-                            rc.invalidate_hop(&dst, hop);
-                        }
-                    }
+                    invalidate_unavailable(failed_hops);
                     return DispatchResult::NoResponse;
                 }
                 // All ECMP paths failed — fall through to the linear scan below
@@ -1363,16 +1362,8 @@ impl FrameDispatcher {
             // AFTER releasing reg_guard (lock ordering: rtt_table must not be
             // acquired while session_tx_registry is held).
             let mut sent_hop: Option<[u8; 32]> = None;
-            for (idx, hop) in candidates.iter().enumerate() {
-                let hop = *hop;
-                let fwd_frame = make_fwd_frame(hop);
-                if send_forward_on_ingress(
-                    &reg_guard,
-                    &hop,
-                    traffic_class,
-                    fwd_frame,
-                    carrier.as_ref(),
-                ) {
+            for (idx, &hop) in candidates.iter().enumerate() {
+                if try_hop(hop) {
                     // record RTT of the selected route (pre-snapshotted above).
                     let rtt_ms = hop_attrs[idx].rtt_ms;
                     if let Some(m) = &self.metrics
@@ -1406,34 +1397,16 @@ impl FrameDispatcher {
                     }
                     sent_hop = Some(hop);
                     break;
-                } else {
-                    // channel full or closed — mark for immediate invalidation.
-                    failed_hops.push(hop);
                 }
             }
             drop(reg_guard);
+            invalidate_unavailable(failed_hops);
 
             if let Some(relay_hop) = sent_hop {
                 // record relay attempt for reputation scoring.
                 // Acquired after reg_guard is released to respect lock ordering.
                 lock!(self.control_plane.rtt_table()).record_relay_attempt(relay_hop);
-                // Invalidate any candidates that failed before we found a working hop.
-                if !failed_hops.is_empty() {
-                    let mut rc = wlock!(self.route_cache);
-                    for hop in &failed_hops {
-                        rc.invalidate_hop(&dst, hop);
-                    }
-                }
                 return DispatchResult::NoResponse;
-            }
-
-            // invalidate unreachable hops immediately so subsequent
-            // packets don't keep trying a dead path until RouteCache TTL expires.
-            if !failed_hops.is_empty() {
-                let mut rc = wlock!(self.route_cache);
-                for hop in &failed_hops {
-                    rc.invalidate_hop(&dst, hop);
-                }
             }
         }
 
@@ -2541,6 +2514,108 @@ mod tests {
     use super::HopAttrs;
     use veil_cfg::NodeId;
     use veil_util::rlock;
+
+    #[test]
+    fn forwarding_keeps_full_queues_in_the_route_cache() {
+        use crate::{DispatchResult, make_test_dispatcher};
+        use std::sync::{Arc, RwLock};
+        use veil_proto::delivery::{DeliveryEnvelope, ForwardPayload};
+        use veil_proto::family::{DeliveryMsg, FrameFamily};
+        use veil_proto::header::{FrameHeader, HEADER_SIZE, priority::INTERACTIVE};
+        use veil_proto::recipient::Recipient;
+        use veil_session::SessionTxRegistry;
+        use veil_util::wlock;
+
+        const SENDER: [u8; 32] = [0xA1; 32];
+        const DST: [u8; 32] = [0xC1; 32];
+        const HOP_A: [u8; 32] = [0xD1; 32];
+        const HOP_B: [u8; 32] = [0xD2; 32];
+        for (multi_path, redundant) in [(false, false), (true, false), (false, true)] {
+            let mut dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+            dispatcher.local_node_id = [0xDD; 32];
+            dispatcher.multi_path_enabled = multi_path;
+            dispatcher.multi_path_min_priority = INTERACTIVE;
+            dispatcher.max_parallel_paths = 2;
+            dispatcher.redundant_send = redundant;
+            let registry = Arc::new(RwLock::new(SessionTxRegistry::with_capacity(1)));
+            let mut a = wlock!(registry).register(HOP_A);
+            let mut b = wlock!(registry).register(HOP_B);
+            dispatcher.session_tx_registry = Some(registry.clone());
+            {
+                let mut cache = wlock!(dispatcher.route_cache);
+                cache.insert(DST, HOP_A, 100, 2);
+                cache.insert(DST, HOP_B, 100, 2);
+            }
+            let send = |content| {
+                let forward = ForwardPayload {
+                    next_hop_node_id: dispatcher.local_node_id,
+                    envelope: DeliveryEnvelope {
+                        recipient: Recipient::any(DST),
+                        sender_node_id: SENDER,
+                        src_app_id: [0xA2; 32],
+                        app_id: [0xA3; 32],
+                        endpoint_id: 0,
+                        content_id: [content; 32],
+                        created_at: veil_util::unix_secs_now_u64(),
+                        ttl_secs: 30,
+                        payload: vec![0x21; 64],
+                        trace_id: 0,
+                        require_ack: false,
+                    },
+                    relay_hops: 0,
+                    delivery_attempt: None,
+                    traffic_class: Some(INTERACTIVE),
+                };
+                let body = forward.encode();
+                let mut header =
+                    FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+                header.body_len = body.len() as u32;
+                assert!(matches!(
+                    dispatcher.dispatch(&header, &body, SENDER),
+                    DispatchResult::NoResponse
+                ));
+            };
+            let fill = || assert!(rlock!(registry).send_to(&HOP_A, INTERACTIVE, vec![7]));
+            fill();
+            let single = !multi_path && !redundant;
+            if single {
+                assert!(rlock!(registry).send_to(&HOP_B, INTERACTIVE, vec![8]));
+            }
+            send(1);
+            assert_eq!(&*a.try_recv().unwrap().1, &[7]);
+            let (_, routed) = b.try_recv().unwrap();
+            if single {
+                assert_eq!(&*routed, &[8]);
+            } else {
+                assert_eq!(
+                    ForwardPayload::decode(&routed[HEADER_SIZE..])
+                        .unwrap()
+                        .envelope
+                        .content_id,
+                    [1; 32]
+                );
+            }
+            assert_eq!(
+                rlock!(dispatcher.route_cache).lookup_all(&DST),
+                [HOP_A, HOP_B]
+            );
+
+            drop(b);
+            fill();
+            send(2);
+            assert_eq!(&*a.try_recv().unwrap().1, &[7]);
+            assert_eq!(rlock!(dispatcher.route_cache).lookup_all(&DST), [HOP_A]);
+
+            send(3);
+            let (lane, routed) = a
+                .try_recv()
+                .expect("drained cached hop carries the next frame");
+            assert_eq!(lane, INTERACTIVE);
+            let decoded = ForwardPayload::decode(&routed[HEADER_SIZE..]).unwrap();
+            assert_eq!(decoded.next_hop_node_id, HOP_A);
+            assert_eq!(decoded.envelope.content_id, [3; 32]);
+        }
+    }
 
     /// audit cycle-3 (M1): ECMP flow-pinning must be deterministic per flow
     /// regardless of the upstream weighted shuffle, keep the equal-cost group at
