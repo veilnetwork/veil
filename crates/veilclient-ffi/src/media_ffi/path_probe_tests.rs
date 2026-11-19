@@ -571,6 +571,52 @@ fn candidate_alias_requires_its_sealed_reply_and_never_counts_as_audio() {
 }
 
 #[test]
+fn same_relay_candidate_keeps_the_original_receiver_until_rebind() {
+    let _lock = FIXTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let old_audio = AtomicUsize::new(0);
+    let new_audio = AtomicUsize::new(0);
+    let mut fixture = Fixture::new();
+    let (old, _) = fixture.channel(ProbeRoute::Relay);
+    let (candidate, mut rx) = fixture.channel(ProbeRoute::Relay);
+    let register = |channel, counter: &AtomicUsize| {
+        assert_eq!(
+            unsafe {
+                veil_media_set_recv_callback(
+                    channel,
+                    Some(count_media),
+                    (counter as *const AtomicUsize).cast_mut().cast(),
+                )
+            },
+            0
+        );
+    };
+    register(old, &old_audio);
+
+    assert_eq!(veil_media_channel_begin_path_probe(candidate, 600), 0);
+    let request = ProbeControl::decode(&rx.blocking_recv().unwrap().payload).unwrap();
+    assert_eq!(veil_media_channel_poll_path_probe(candidate), 0);
+    let peer = media::cipher_for_test(&DEVICE, &RX, &TX).unwrap();
+    let reply = peer
+        .seal(&request.reply().unwrap().encode())
+        .unwrap()
+        .into_vec();
+    media::dispatch_inbound_auto(PEER_DEVICE, &reply);
+    assert_eq!(veil_media_channel_poll_path_probe(candidate), 1);
+    assert_eq!(old_audio.load(Ordering::Relaxed), 0);
+
+    let next_audio = || peer.seal(&[0x80, 111, 1, 2]).unwrap().into_vec();
+    media::dispatch_inbound_auto(PEER_DEVICE, &next_audio());
+    assert_eq!(old_audio.load(Ordering::Relaxed), 1);
+
+    register(candidate, &new_audio);
+    unsafe { veil_media_close_channel(old) };
+    media::dispatch_inbound_auto(PEER_DEVICE, &next_audio());
+    assert_eq!(old_audio.load(Ordering::Relaxed), 1);
+    assert_eq!(new_audio.load(Ordering::Relaxed), 1);
+    unsafe { veil_media_set_recv_callback(candidate, None, ptr::null_mut()) };
+}
+
+#[test]
 fn a_short_observation_also_bounds_the_queued_challenge() {
     let _lock = FIXTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut fixture = Fixture::new();
