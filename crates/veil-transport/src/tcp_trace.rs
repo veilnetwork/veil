@@ -220,29 +220,15 @@ impl KernelSnapshot {
             // fields only from the kernel's returned length
             // instead of reading an uninitialised or version-dependent struct.
             let mut raw = [0u8; 256];
-            let mut len = raw.len() as libc::socklen_t;
-            // SAFETY: live borrowed socket, writable buffer and size; neither
-            // descriptor nor pointer escapes this synchronous call.
-            let rc = unsafe {
-                libc::getsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_INFO,
-                    raw.as_mut_ptr().cast(),
-                    &mut len,
-                )
-            };
-            if rc != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+            use std::os::fd::AsFd;
+            let returned = linux_progress::socket_info(stream.as_fd(), &mut raw)?;
+            let len = returned.len();
             if len < 104 {
                 return Err(std::io::ErrorKind::UnexpectedEof.into());
             }
-            let returned = raw
-                .get(..len as usize)
-                .ok_or(std::io::ErrorKind::InvalidData)?;
             let progress = linux_progress::read(returned);
-            let u32_at = |offset| u32::from_ne_bytes(raw[offset..offset + 4].try_into().unwrap());
+            let u32_at =
+                |offset| u32::from_ne_bytes(returned[offset..offset + 4].try_into().unwrap());
             let mut queued = 0i32;
             // SAFETY: live socket and writable int matching SIOCOUTQ's ABI.
             let rc = unsafe { libc::ioctl(fd, libc::TIOCOUTQ, &mut queued) };
