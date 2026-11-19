@@ -2241,6 +2241,13 @@ final int Function(int, Pointer<VeilApp>, Pointer<Pointer<Utf8>>)
 final int Function(int, Pointer<Uint8>, int) veilMediaSendCallControl =
     nativeLib.lookupFunction<Int32 Function(Uint64, Pointer<Uint8>, Size),
         int Function(int, Pointer<Uint8>, int)>('veil_media_send_call_control');
+final bool supportsCallControlOnRelayPrimary =
+    nativeLib.providesSymbol('veil_media_send_call_control_on_relay_primary');
+final int Function(int, Pointer<Uint8>, int)
+    veilMediaSendCallControlOnRelayPrimary = nativeLib.lookupFunction<
+        Int32 Function(Uint64, Pointer<Uint8>, Size),
+        int Function(int, Pointer<Uint8>, int)>(
+    'veil_media_send_call_control_on_relay_primary');
 final int Function(int, Pointer<Uint8>, int) veilMediaPollCallControl =
     nativeLib.lookupFunction<Int32 Function(Uint64, Pointer<Uint8>, Size),
         int Function(int, Pointer<Uint8>, int)>('veil_media_poll_call_control');

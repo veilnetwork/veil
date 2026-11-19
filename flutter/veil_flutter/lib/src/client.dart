@@ -3056,7 +3056,11 @@ class AppHandle implements Finalizable {
   }
 
   /// Nonblocking queue admission, not a delivery acknowledgment.
-  bool sendCallControl(int chan, Uint8List payload) {
+  bool sendCallControl(
+    int chan,
+    Uint8List payload, {
+    bool relayPrimary = false,
+  }) {
     _ensureOpen();
     if (!supportsCallControl ||
         payload.isEmpty ||
@@ -3064,6 +3068,11 @@ class AppHandle implements Finalizable {
     final buf = calloc<Uint8>(payload.length);
     try {
       buf.asTypedList(payload.length).setAll(0, payload);
+      if (relayPrimary && ffi.supportsCallControlOnRelayPrimary) {
+        return ffi.veilMediaSendCallControlOnRelayPrimary(
+                chan, buf, payload.length) ==
+            0;
+      }
       return ffi.veilMediaSendCallControl(chan, buf, payload.length) == 0;
     } finally {
       calloc.free(buf);

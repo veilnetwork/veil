@@ -209,6 +209,81 @@ extern "C" fn count_media(ctx: *mut c_void, _: *const u8, _: usize) {
 }
 
 #[test]
+fn compact_settlement_uses_the_primary_relay_source_without_changing_wire_class() {
+    use crate::media_ffi::call_control_ffi::*;
+    let _lock = FIXTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _control_lock = CONTROL_FIXTURE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let mut fixture = Fixture::new();
+    let (direct, _) = fixture.channel(ProbeRoute::Direct);
+    let (relay, _) = fixture.channel(ProbeRoute::Relay);
+    for (id, path) in [direct, relay].into_iter().zip(fixture.paths()) {
+        MEDIA_CHANNELS
+            .write()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .control_destination = Some((path.peer_app_id, path.peer_endpoint_id));
+        assert_eq!(
+            unsafe { veil_media_channel_set_control_sender(id, path.app, ptr::null_mut()) },
+            0
+        );
+    }
+    let [_, path] = fixture.paths();
+    let payload = b"current route";
+    assert_eq!(
+        unsafe {
+            veil_media_send_call_control_on_relay_primary(direct, payload.as_ptr(), payload.len())
+        },
+        -1
+    );
+    let too_big = [0; 512];
+    assert_eq!(
+        unsafe {
+            veil_media_send_call_control_on_relay_primary(relay, too_big.as_ptr(), too_big.len())
+        },
+        -1
+    );
+    let remote = media::cipher_for_test(&DEVICE, &RX, &TX).unwrap();
+    for (send, expected_lane) in [
+        (
+            veil_media_send_call_control_on_relay_primary
+                as unsafe extern "C" fn(u64, *const u8, size_t) -> c_int,
+            veil_proto::priority::REALTIME,
+        ),
+        (
+            veil_media_send_call_control,
+            veil_proto::ipc::LOCAL_SIGNALING_LANE,
+        ),
+    ] {
+        assert_eq!(unsafe { send(relay, payload.as_ptr(), payload.len()) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let (_, lane, bytes) = fixture
+                .captured
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            let forward =
+                veil_proto::delivery::ForwardPayload::decode(&bytes[HEADER_SIZE..]).unwrap();
+            let Some(opened) = remote.open(&forward.envelope.payload) else {
+                continue; // Ignore an alternate copy of the previous nonce.
+            };
+            assert_eq!(lane, expected_lane);
+            assert_eq!(
+                codec::decode_header(&bytes).unwrap().priority(),
+                veil_proto::priority::INTERACTIVE
+            );
+            assert_eq!(forward.envelope.recipient.node_id, PEER_DEVICE);
+            assert_eq!(forward.envelope.app_id, path.peer_app_id);
+            assert_eq!(forward.envelope.endpoint_id, path.peer_endpoint_id);
+            assert_eq!(opened, [b"XVH1".as_slice(), payload].concat());
+            break;
+        }
+    }
+}
+
+#[test]
 fn source_preflight_qualifies_before_rtp_callback_and_preserves_old_key_owner() {
     let _lock = FIXTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let deliveries = AtomicUsize::new(0);
