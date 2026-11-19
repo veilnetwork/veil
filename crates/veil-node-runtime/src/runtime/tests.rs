@@ -101,10 +101,18 @@ async fn unknown_leaf_resume_fixture(newer_owner: bool, resume: bool) {
     config.identity.as_mut().unwrap().lazy_mining = false;
     let path = save_test_config("unknown-leaf-resume", config).unwrap();
     let mut runtime = NodeRuntime::start(&path, true).await.unwrap();
+    let services = runtime.access();
+    let mut events = services.event_bus.subscribe();
+    let mut admission_count = || {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|event| event.kind == veil_proto::event_kind::SESSION_ADMITTED)
+            .inspect(|event| assert!(event.payload.is_empty()))
+            .count()
+    };
     let (old, client_keys, client) = connect(&runtime, identity, None).await;
     let old = old.unwrap().unwrap();
     let peer = *old.peer_id.as_bytes();
-    let services = runtime.access();
+    let first_admissions = admission_count();
     assert!(services.state.lock().unwrap().peers.is_empty());
     let ticket = ClientTicketEntry {
         blob: services
@@ -147,6 +155,7 @@ async fn unknown_leaf_resume_fixture(newer_owner: bool, resume: bool) {
         .unwrap()
         .live_registration(&peer);
     drop(old); // Late predecessor teardown must leave the successor intact.
+    let subsequent_admissions = admission_count();
     let survived = services
         .session_tx_registry
         .read()
@@ -157,6 +166,12 @@ async fn unknown_leaf_resume_fixture(newer_owner: bool, resume: bool) {
     drop(successor_rx);
     runtime.stop().await.unwrap();
     let _ = fs::remove_dir_all(path.parent().unwrap());
+    assert_eq!(first_admissions, 1);
+    assert_eq!(
+        subsequent_admissions,
+        usize::from(admitted),
+        "only the committed successor can publish a fresh admission"
+    );
     if resume && !newer_owner {
         assert!(
             admitted,
@@ -293,6 +308,7 @@ async fn dropping_an_attached_canonical_quic_session_closes_retained_handles() {
     cfg.identity.as_mut().unwrap().lazy_mining = false;
     let path = save_test_config("canonical-quic-close", cfg).unwrap();
     let mut runtime = NodeRuntime::start(&path, true).await.unwrap();
+    let mut events = runtime.access().event_bus.subscribe();
     let left = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let right = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let (left_addr, right_addr) = (left.local_addr().unwrap(), right.local_addr().unwrap());
@@ -348,6 +364,8 @@ async fn dropping_an_attached_canonical_quic_session_closes_retained_handles() {
     .unwrap()
     .unwrap();
     let remote = remote.await.unwrap();
+    let debug_published_admission = std::iter::from_fn(|| events.try_recv().ok())
+        .any(|event| event.kind == veil_proto::event_kind::SESSION_ADMITTED);
     assert!(!witness.is_closed());
     drop(session);
     let retired = witness.is_closed();
@@ -355,6 +373,7 @@ async fn dropping_an_attached_canonical_quic_session_closes_retained_handles() {
     drop(remote);
     runtime.stop().await.unwrap();
     let _ = fs::remove_dir_all(path.parent().unwrap());
+    assert!(!debug_published_admission);
     assert!(
         retired,
         "dropped canonical session left retained QUIC handles live"

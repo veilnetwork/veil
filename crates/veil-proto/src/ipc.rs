@@ -6204,6 +6204,10 @@ pub mod event_kind {
     /// empty payload, no peer identifiers or authority. The host still must
     /// export, durably store and ACK the exact native snapshot revision.
     pub const PEER_AUTHORIZATION_CHANGED: u8 = 6;
+    /// A completed active overlay session owns its transmit registration.
+    /// Local IPC wake hint, including replacements with an unchanged count.
+    /// Empty payload. Consumers still qualify their own end-to-end route.
+    pub const SESSION_ADMITTED: u8 = 7;
 }
 
 /// Payload [`crate::family::LocalAppMsg::Event`].

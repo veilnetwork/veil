@@ -1527,6 +1527,24 @@ pub async fn register_connection_session(
         .as_ref()
         .map(|v| v.active_instance_id);
     lock!(runtime.session_registry).insert(session_entry);
+    // The list count is published before the handshake is committed.
+    // Publish usable session admission separately, after commitment and
+    // while this exact owner still holds its open TX registration.
+    if session_state == SessionState::Active && !referral_session {
+        let registry = runtime
+            .session_tx_registry
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        if registry.owns_live_session(
+            remote_identity.node_id.as_bytes(),
+            &remote_identity.session_keys.session_id,
+        ) {
+            runtime.event_bus.publish(veil_proto::EventPayload {
+                kind: veil_proto::event_kind::SESSION_ADMITTED,
+                payload: Vec::new(),
+            });
+        }
+    }
     // A peer may reconnect just after a device was revoked. It missed the
     // reload-time notice and its warm certificate cache can still endorse the
     // removed device. Queue the CURRENT local document at session admission;

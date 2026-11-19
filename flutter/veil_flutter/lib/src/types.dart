@@ -113,6 +113,8 @@ enum VeilEventKind {
   /// Matches veil_proto::event_kind::PEER_AUTHORIZATION_CHANGED. This extends
   /// the opaque event payload protocol, not the C function ABI.
   peerAuthorizationChanged(6),
+  /// Empty local-IPC hint that an active session gained a TX registration.
+  sessionAdmitted(7),
   unknown(-1);
 
   const VeilEventKind(this.wireByte);
