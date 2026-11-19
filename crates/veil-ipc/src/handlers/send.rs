@@ -2985,9 +2985,12 @@ async fn handle_ipc_send_inner(
                         }
                         return Ok(());
                     }
-                    // A packetized source can time out on local backpressure.
-                    // That is not evidence that the cached route is dead.
-                    if packetized.is_some() {
+                    // Media can be refused by a full local queue or its
+                    // source deadline. Try another hop for this cell without
+                    // changing route knowledge for the next cell. New media
+                    // sends already omit closed sessions when ranking hops.
+                    // Packetized control can also expire on local pressure.
+                    if relay_media_sealed || packetized.is_some() {
                         continue;
                     }
                     // send_to returned false: session is closed or full.
@@ -8592,6 +8595,91 @@ mod ratchet_send_tests {
                 codec::decode_header(&sent[0].1).unwrap().priority(),
                 veil_proto::priority::INTERACTIVE
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn full_media_source_queues_preserve_the_cached_relay() {
+        use veil_proto::priority::{BULK, REALTIME};
+        use veil_types::local_lossy_work::LocalLossyWork;
+
+        // In the absence of the cached route, the XOR fallback would send
+        // to NEARER first. A full queue must not change the next cell's route.
+        const NEARER: [u8; 32] = [0xB1; 32];
+        for (lane, fill_alternate) in [
+            (REALTIME, false),
+            (REALTIME, true),
+            (BULK, false),
+            (BULK, true),
+        ] {
+            let fx = fixture(vec![RELAY, NEARER]);
+            let registry = Arc::new(RwLock::new(veil_session::SessionTxRegistry::with_capacity(
+                1,
+            )));
+            let mut preferred = wlock!(registry).register(RELAY);
+            let mut alternate = wlock!(registry).register(NEARER);
+            wlock!(fx.route_cache).insert(PEER, RELAY, 10_000, 2);
+            assert!(rlock!(registry).send_to(&RELAY, lane, vec![7]));
+            if fill_alternate {
+                assert!(rlock!(registry).send_to(&NEARER, lane, vec![8]));
+            }
+
+            let mut ctx = fx.ctx(false);
+            ctx.session_tx_registry = Some(Arc::new(
+                veil_session::glue::SessionTxBroadcaster::new(registry.clone()),
+            ));
+            ctx.local_priority = lane;
+            let mut sealed = veil_proto::ipc::RELAY_MEDIA_SEALED_MAGIC.to_vec();
+            // Stay above the threshold for primary media to send two copies.
+            sealed.resize(513, 0xA5);
+            if lane == BULK {
+                ctx.local_work = LocalLossyWork::new(vec![sealed.len()]).unwrap().cell(0);
+            }
+            let flags = veil_proto::ipc::IPC_SEND_FLAG_RELAY_REALTIME
+                | veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED;
+            let mut body = payload_to(PEER, &sealed);
+            body[veil_proto::AppIpcSendPayload::FLAGS_RANGE].copy_from_slice(&flags.to_be_bytes());
+            let mut wh = sink().await;
+            handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+                .await
+                .unwrap();
+
+            assert!(rlock!(registry).has_session(&RELAY));
+            assert_eq!(&*preferred.try_recv().unwrap().1, &[7]);
+            let (_, frame) = alternate.try_recv().expect("alternate queue has a cell");
+            if fill_alternate {
+                assert_eq!(&*frame, &[8]);
+            } else {
+                let fwd =
+                    veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                        .unwrap();
+                assert_eq!(fwd.envelope.payload, sealed);
+            }
+
+            handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+                .await
+                .unwrap();
+            assert_eq!(rlock!(fx.route_cache).lookup(&PEER), Some(RELAY));
+            let (_, frame) = preferred
+                .try_recv()
+                .expect("drained preferred relay carries the next cell");
+            let fwd =
+                veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                    .unwrap();
+            assert_eq!(fwd.envelope.payload, sealed);
+            assert!(alternate.try_recv().is_err());
+
+            drop(preferred);
+            handle_ipc_send(&mut SendReply::Inline(&mut wh), &body, &ctx)
+                .await
+                .unwrap();
+            let (_, frame) = alternate
+                .try_recv()
+                .expect("closed preferred relay is skipped");
+            let fwd =
+                veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                    .unwrap();
+            assert_eq!(fwd.envelope.payload, sealed);
         }
     }
 
