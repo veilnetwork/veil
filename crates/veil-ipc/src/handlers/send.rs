@@ -460,16 +460,19 @@ async fn discover_route(
 /// discovery has only learned the direct peer (or has not populated the cache
 /// yet), any other live overlay session is already a valid first relay hop.
 /// This avoids putting the 500 ms reactive-discovery wait on every RTP packet.
-fn relay_hops_to_try(
+pub(crate) fn relay_hops_to_try(
     dst: &[u8; 32],
     route_cache: Option<&RwLock<veil_routing::RouteCache>>,
     session_tx_registry: &dyn FrameBroadcaster,
 ) -> Vec<[u8; 32]> {
     let mut hops = Vec::new();
+    let mut active = session_tx_registry.active_node_ids();
 
     if let Some(cache) = route_cache {
         for hop in rlock!(cache).lookup_all(dst) {
-            if &hop != dst && !hops.contains(&hop) {
+            // A score can outlive its local session. Do not let a cached hop
+            // consume a bounded source preparation slot without a live sender.
+            if &hop != dst && active.contains(&hop) && !hops.contains(&hop) {
                 hops.push(hop);
             }
         }
@@ -477,7 +480,6 @@ fn relay_hops_to_try(
 
     // Prefer peers closest to the destination in XOR space, matching the
     // recursive routing start policy.  Cached routes above remain first.
-    let mut active = session_tx_registry.active_node_ids();
     active.sort_by_key(|peer| {
         let mut xor = [0u8; 32];
         for i in 0..32 {
@@ -2365,9 +2367,19 @@ async fn handle_ipc_send_inner(
             // route order within equal readiness/transport groups.
             // This does not change relay policy or independent-flow consent.
             if relay_media_sealed {
+                let candidates = crate::route_trace::sealed_relay_candidates(body, local_priority);
+                if let Some(sample) = &candidates {
+                    sample.record("eligible", &forced_relay_hops);
+                }
                 crate::source_paths::prefer_datagrams(&mut forced_relay_hops, reg);
+                if let Some(sample) = &candidates {
+                    sample.record("transport", &forced_relay_hops);
+                }
                 crate::source_paths::warm_preferred_sources(&forced_relay_hops, reg, source_lane);
                 crate::source_paths::prefer_ready_sources(&mut forced_relay_hops, reg, source_lane);
+                if let Some(sample) = &candidates {
+                    sample.record("source_ready", &forced_relay_hops);
+                }
             }
             if !forced_relay_hops.is_empty() {
                 use veil_proto::delivery::DeliveryEnvelope;
