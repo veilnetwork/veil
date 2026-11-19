@@ -11,6 +11,15 @@ pub const VEIL_CALL_CONTROL_MAX_BYTES: size_t = 768;
 const MAX_PAYLOAD: usize = VEIL_CALL_CONTROL_MAX_BYTES;
 const QUEUE_DEPTH: usize = 8;
 const MAX_AGE: Duration = Duration::from_secs(5);
+// The sealed relay primary sender gives cells up to 512 bytes the same
+// first-hop diversity policy as ordinary small audio cells.
+const PRIMARY_RELAY_MAX_PAYLOAD: usize = 512 - media::MEDIA_SEAL_OVERHEAD - MAGIC.len();
+
+#[derive(Clone, Copy)]
+enum ControlSource {
+    Signaling,
+    PrimaryRelay,
+}
 
 struct ControlPacket {
     bytes: Vec<u8>,
@@ -19,7 +28,8 @@ struct ControlPacket {
 
 struct ControlChannel {
     cipher: Arc<media::MediaCipher>,
-    tx: mpsc::Sender<ControlPacket>,
+    relay: bool,
+    tx: mpsc::Sender<(ControlPacket, ControlSource)>,
     inbox: VecDeque<ControlPacket>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -32,16 +42,19 @@ impl Drop for ControlChannel {
 
 static CONTROLS: LazyLock<Mutex<HashMap<u64, ControlChannel>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+// BUSY is observable in nonblocking API tests even across unrelated channels.
+#[cfg(test)]
+pub(super) static CONTROL_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
 async fn drain_control<F, Fut>(
-    mut rx: mpsc::Receiver<ControlPacket>,
+    mut rx: mpsc::Receiver<(ControlPacket, ControlSource)>,
     cipher: Arc<media::MediaCipher>,
     mut send: F,
 ) where
-    F: FnMut(media::SealedMediaCell) -> Fut,
+    F: FnMut(media::SealedMediaCell, ControlSource) -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    while let Some(packet) = rx.recv().await {
+    while let Some((packet, source)) = rx.recv().await {
         if packet.deadline <= tokio::time::Instant::now() {
             continue;
         }
@@ -52,7 +65,7 @@ async fn drain_control<F, Fut>(
             continue;
         };
         let sealed = sealed.with_local_deadline(packet.deadline);
-        if !send(sealed).await {
+        if !send(sealed, source).await {
             break;
         }
     }
@@ -106,56 +119,70 @@ pub unsafe extern "C" fn veil_media_channel_set_control_sender(
         .direct_seq
         .clone()
         .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicU32::new(0)));
-    let task =
-        app_ref
-            .bundle
-            .runtime
-            .spawn(drain_control(rx, Arc::clone(&cipher), move |sealed| {
-                let sender = Arc::clone(&sender);
-                let seq = Arc::clone(&seq);
-                async move {
-                    let Some(guard) = sealed.lock_while_fresh(&sender).await else {
-                        return true;
-                    };
-                    let Some(sender) = guard.as_ref() else {
-                        return false;
-                    };
-                    let deadline = sealed
-                        .local_deadline()
-                        .expect("control retains admission deadline");
-                    if relay {
-                        let _ = sender
-                            .send_call_control_sealed_before_owned(
-                                peer,
-                                peer_app,
-                                peer_endpoint,
-                                sealed.into_vec(),
-                                deadline,
-                            )
-                            .await;
-                    } else {
-                        let _ = sender
-                            .send_rt_data_on_local_lane_before(
-                                veil_proto::priority::INTERACTIVE,
-                                peer,
-                                peer_app,
-                                peer_endpoint,
-                                seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                                0,
-                                0,
-                                0,
-                                sealed.as_bytes(),
-                                deadline,
-                            )
-                            .await;
-                    }
-                    true
+    let task = app_ref.bundle.runtime.spawn(drain_control(
+        rx,
+        Arc::clone(&cipher),
+        move |sealed, source| {
+            let sender = Arc::clone(&sender);
+            let seq = Arc::clone(&seq);
+            async move {
+                let Some(guard) = sealed.lock_while_fresh(&sender).await else {
+                    return true;
+                };
+                let Some(sender) = guard.as_ref() else {
+                    return false;
+                };
+                let deadline = sealed
+                    .local_deadline()
+                    .expect("control retains admission deadline");
+                if matches!(source, ControlSource::PrimaryRelay) {
+                    media::trace_sealed_cell("relay_control_primary", &peer, sealed.as_bytes());
+                    let _ = sender
+                        .send_relay_media_sealed_on_local_lane_before_tracked_owned(
+                            veil_proto::priority::REALTIME,
+                            peer,
+                            peer_app,
+                            peer_endpoint,
+                            sealed.into_vec(),
+                            deadline,
+                            None,
+                        )
+                        .await;
+                } else if relay {
+                    let _ = sender
+                        .send_call_control_sealed_before_owned(
+                            peer,
+                            peer_app,
+                            peer_endpoint,
+                            sealed.into_vec(),
+                            deadline,
+                        )
+                        .await;
+                } else {
+                    let _ = sender
+                        .send_rt_data_on_local_lane_before(
+                            veil_proto::priority::INTERACTIVE,
+                            peer,
+                            peer_app,
+                            peer_endpoint,
+                            seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                            0,
+                            0,
+                            0,
+                            sealed.as_bytes(),
+                            deadline,
+                        )
+                        .await;
                 }
-            }));
+                true
+            }
+        },
+    ));
     controls.insert(
         chan,
         ControlChannel {
             cipher,
+            relay,
             tx,
             inbox: VecDeque::new(),
             task,
@@ -173,7 +200,33 @@ pub unsafe extern "C" fn veil_media_send_call_control(
     ptr: *const u8,
     len: size_t,
 ) -> c_int {
-    if ptr.is_null() || len == 0 || len > MAX_PAYLOAD {
+    unsafe { enqueue_call_control(chan, ptr, len, ControlSource::Signaling) }
+}
+
+/// Queue one short ephemeral update through the established primary relay
+/// source. Requires a configured relay channel and retains the independent
+/// control sender, encryption epoch and bounded queue. Returns the same
+/// status as veil_media_send_call_control.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_media_send_call_control_on_relay_primary(
+    chan: u64,
+    ptr: *const u8,
+    len: size_t,
+) -> c_int {
+    unsafe { enqueue_call_control(chan, ptr, len, ControlSource::PrimaryRelay) }
+}
+
+unsafe fn enqueue_call_control(
+    chan: u64,
+    ptr: *const u8,
+    len: size_t,
+    source: ControlSource,
+) -> c_int {
+    let (limit, max_age) = match source {
+        ControlSource::Signaling => (MAX_PAYLOAD, MAX_AGE),
+        ControlSource::PrimaryRelay => (PRIMARY_RELAY_MAX_PAYLOAD, MEDIA_LOCAL_QUEUE_AGE),
+    };
+    if ptr.is_null() || len == 0 || len > limit {
         return -1;
     }
     let controls = match CONTROLS.try_lock() {
@@ -184,11 +237,14 @@ pub unsafe extern "C" fn veil_media_send_call_control(
     let Some(control) = controls.get(&chan) else {
         return -1;
     };
+    if matches!(source, ControlSource::PrimaryRelay) && !control.relay {
+        return -1;
+    }
     let packet = ControlPacket {
         bytes: unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec(),
-        deadline: tokio::time::Instant::now() + MAX_AGE,
+        deadline: tokio::time::Instant::now() + max_age,
     };
-    match control.tx.try_send(packet) {
+    match control.tx.try_send((packet, source)) {
         Ok(()) => 0,
         Err(mpsc::error::TrySendError::Full(_)) => 1,
         Err(mpsc::error::TrySendError::Closed(_)) => -1,
@@ -280,11 +336,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // Sending intentionally returns BUSY rather than waiting for CONTROLS.
-    // These exact queue/close assertions require an uncontended fixture;
-    // another test's registry operation must not turn -1/0 into valid BUSY.
-    static FIXTURE_LOCK: Mutex<()> = Mutex::new(());
-
     struct Fixture {
         _serial: std::sync::MutexGuard<'static, ()>,
         id: u64,
@@ -292,7 +343,7 @@ mod tests {
         cipher: Arc<media::MediaCipher>,
         remote: media::MediaCipher,
         engine_calls: Arc<AtomicUsize>,
-        _rx: mpsc::Receiver<ControlPacket>,
+        _rx: mpsc::Receiver<(ControlPacket, ControlSource)>,
     }
 
     impl Drop for Fixture {
@@ -308,7 +359,7 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
-        let serial = FIXTURE_LOCK
+        let serial = CONTROL_FIXTURE_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let id = MEDIA_NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -348,6 +399,7 @@ mod tests {
             id,
             ControlChannel {
                 cipher: Arc::clone(&cipher),
+                relay: false,
                 tx,
                 inbox: VecDeque::new(),
                 task: tokio::spawn(std::future::pending()),
@@ -491,22 +543,29 @@ mod tests {
         let f = fixture();
         let (tx, rx) = mpsc::channel(2);
         let now = tokio::time::Instant::now();
-        tx.send(ControlPacket {
-            bytes: b"old".to_vec(),
-            deadline: now - Duration::from_millis(1),
-        })
+        tx.send((
+            ControlPacket {
+                bytes: b"old".to_vec(),
+                deadline: now - Duration::from_millis(1),
+            },
+            ControlSource::PrimaryRelay,
+        ))
         .await
         .unwrap();
-        tx.send(ControlPacket {
-            bytes: b"new".to_vec(),
-            deadline: now + MAX_AGE,
-        })
+        tx.send((
+            ControlPacket {
+                bytes: b"new".to_vec(),
+                deadline: now + MAX_AGE,
+            },
+            ControlSource::Signaling,
+        ))
         .await
         .unwrap();
         drop(tx);
         let cells = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&cells);
-        drain_control(rx, Arc::clone(&f.cipher), move |cell| {
+        drain_control(rx, Arc::clone(&f.cipher), move |cell, source| {
+            assert!(matches!(source, ControlSource::Signaling));
             captured.lock().unwrap().push(cell);
             std::future::ready(true)
         })

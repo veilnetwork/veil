@@ -4105,6 +4105,16 @@ int veil_media_channel_configure_path_probes(uint64_t chan,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Queue one short ephemeral update through the established primary relay
+ * source. Requires a configured relay channel and retains the independent
+ * control sender, encryption epoch and bounded queue. Returns the same
+ * status as veil_media_send_call_control.
+ */
+ int veil_media_send_call_control_on_relay_primary(uint64_t chan, const uint8_t *ptr, size_t len) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Poll authenticated peer state into caller memory. Positive = bytes copied,
  * 0 = no fresh update, -1 = invalid/closed, -2 = output too small (not consumed).
  * Receipt is bound to this channel's cipher. No native callback enters Dart.
