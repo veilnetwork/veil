@@ -407,9 +407,9 @@ pub(crate) fn dispatch_control(cipher: &media::MediaCipher, plaintext: &[u8]) ->
 /// Candidate replies may name a different authenticated identity/device alias
 /// from the old RTP receiver. Only exact-size sealed controls get this bounded
 /// alternate-key lookup; ordinary RTP is opened once by its existing lease.
-pub(crate) fn dispatch_without_lease(payload: &[u8]) {
+pub(crate) fn dispatch_without_lease(payload: &[u8]) -> bool {
     if payload.len() != CONTROL_BYTES + media::MEDIA_SEAL_OVERHEAD {
-        return;
+        return false;
     }
     for context in contexts().into_iter().filter(|context| context.live()) {
         if let Some(plaintext) = context.cipher.open(payload) {
@@ -424,10 +424,10 @@ pub(crate) fn dispatch_without_lease(payload: &[u8]) {
                     payload,
                 );
             }
-            dispatch_control(&context.cipher, &plaintext);
-            return;
+            return dispatch_control(&context.cipher, &plaintext);
         }
     }
+    false
 }
 
 #[cfg(all(test, unix))]
