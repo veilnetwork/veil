@@ -19,7 +19,9 @@ static WORK_ROWS: AtomicU64 = AtomicU64::new(0);
 static ADMISSION_ROWS: AtomicU64 = AtomicU64::new(0);
 
 fn enabled() -> bool {
-    *ENABLED.get_or_init(|| std::env::var("VEIL_DIAG_SOURCE_CELLS").is_ok_and(|v| v == "1"))
+    *ENABLED.get_or_init(|| {
+        veil_util::operator_trace::enabled("VEIL_DIAG_SOURCE_CELLS", c"debug.xveil.source_cells")
+    })
 }
 
 fn owned_secondary(priority: u8) -> bool {
