@@ -56,7 +56,7 @@ fn queue_index(priority: u8) -> usize {
 // Private queue indices are not lower wire priorities. Keep their existing
 // logical class for admission and mobile batching, without merging their FIFO
 // or WRR state: DATA is background; network maintenance/signaling interactive.
-fn service_priority(index: usize) -> u8 {
+pub(crate) fn service_priority(index: usize) -> u8 {
     match index {
         4 => BACKGROUND,
         5 | 6 => INTERACTIVE,

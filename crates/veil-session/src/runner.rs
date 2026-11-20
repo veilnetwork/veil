@@ -614,6 +614,9 @@ const LOCAL_DATAGRAM_BACKLOG_BYTES: usize = 4 * 1024;
 /// throughput traffic. The choice is process-local; forwarded user packets at
 /// a relay all have INTERACTIVE priority and receive identical treatment.
 fn local_datagram_fits(priority: u8, wire_len: usize, available: usize) -> bool {
+    // Local queue indices do not encode their priority: signaling uses a
+    // separate FIFO, but must not be charged as bulk at transport admission.
+    let priority = crate::priority_queue::service_priority(usize::from(priority));
     let reserve = if priority >= veil_proto::priority::BULK {
         crate::datagram_flows::MAX_FRAME_WIRE_BYTES
     } else {
@@ -7928,6 +7931,28 @@ mod realtime_lane_frame_tests {
             usize::MAX - 1
         ));
     }
+    #[test]
+    fn signaling_uses_transport_space_already_reserved_from_bulk() {
+        use veil_proto::ipc::{LOCAL_RECOVERABLE_DATA_LANE, LOCAL_SIGNALING_LANE};
+        use veil_proto::priority::{BACKGROUND, BULK};
+
+        let frame = 1200;
+        let available = 4096;
+        assert!(super::local_datagram_fits(
+            LOCAL_SIGNALING_LANE,
+            frame,
+            available
+        ));
+        assert!(!super::local_datagram_fits(
+            LOCAL_SIGNALING_LANE,
+            frame,
+            frame - 1
+        ));
+        for lane in [BULK, BACKGROUND, LOCAL_RECOVERABLE_DATA_LANE] {
+            assert!(!super::local_datagram_fits(lane, frame, available));
+        }
+    }
+
     #[test]
     fn independent_primary_admission_bounds_stale_audio() {
         let capacity = veil_transport::REALTIME_DATAGRAM_BUFFER_BYTES;
