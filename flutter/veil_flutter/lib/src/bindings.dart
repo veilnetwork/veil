@@ -2292,6 +2292,11 @@ final int Function(int, int) veilMediaChannelBeginPathProbe = nativeLib
 final int Function(int) veilMediaChannelPollPathProbe =
     nativeLib.lookupFunction<Int32 Function(Uint64), int Function(int)>(
         'veil_media_channel_poll_path_probe');
+final bool supportsRelayProbeObservation =
+    nativeLib.providesSymbol('veil_media_channel_take_relay_probe_request');
+final int Function(int) veilMediaChannelTakeRelayProbeRequest =
+    nativeLib.lookupFunction<Int32 Function(Uint64), int Function(int)>(
+        'veil_media_channel_take_relay_probe_request');
 
 // start_direct_receiver(app, source_ns, ns_len, source_name, name_len, err)
 // -> VEIL_OK or error. Inbound RTP stays native and never crosses Dart.

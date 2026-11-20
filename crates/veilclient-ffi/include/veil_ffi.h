@@ -4086,6 +4086,15 @@ int veil_media_channel_configure_path_probes(uint64_t chan,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
+ * Consume one recent peer request for the relay route from a live direct
+ * channel. The host uses the observation to start its own qualification.
+ * Returns 1 for a request, 0 when absent, expired, closed or busy.
+ */
+ int veil_media_channel_take_relay_probe_request(uint64_t chan) ;
+#endif
+
+#if defined(VEIL_FFI_NODE_EMBEDDED)
+/**
  * Install a separate control IPC sender on an existing direct/relay channel.
  * Bind the same app identity on a separate connection, and negotiate peer
  * support first. Anonymous channels retain their existing signaling path.

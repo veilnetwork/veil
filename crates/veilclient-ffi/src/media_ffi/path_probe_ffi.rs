@@ -7,6 +7,8 @@ use crate::media_path_probe::{CONTROL_BYTES, ProbeControl, ProbeRoute, ProbeStat
 use std::sync::Weak;
 use std::time::{Duration, Instant};
 
+const RELAY_REQUEST_MAX_AGE: Duration = Duration::from_secs(1);
+
 /// Trusted host configuration, never read from a network envelope.
 #[repr(C)]
 pub struct VeilMediaProbePath {
@@ -30,6 +32,7 @@ pub(super) struct PathProbeContext {
     route: ProbeRoute,
     replies: [ReplyPath; 2],
     attempt: StdMutex<Option<RouteProbe>>,
+    relay_request_at: StdMutex<Option<Instant>>,
     last_echo: StdMutex<Option<Instant>>,
     echo_slot: Arc<tokio::sync::Semaphore>,
 }
@@ -274,6 +277,7 @@ pub unsafe extern "C" fn veil_media_channel_configure_path_probes(
         },
         replies: [direct, relay],
         attempt: StdMutex::new(None),
+        relay_request_at: StdMutex::new(None),
         last_echo: StdMutex::new(None),
         echo_slot: Arc::new(tokio::sync::Semaphore::new(1)),
     }));
@@ -393,6 +397,35 @@ fn contexts() -> Vec<Arc<PathProbeContext>> {
         .collect()
 }
 
+/// Consume one recent peer request for the relay route from a live direct
+/// channel. The host uses the observation to start its own qualification.
+/// Returns 1 for a request, 0 when absent, expired, closed or busy.
+#[unsafe(no_mangle)]
+pub extern "C" fn veil_media_channel_take_relay_probe_request(chan: u64) -> c_int {
+    let channels = match MEDIA_CHANNELS.try_read() {
+        Ok(map) => map,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return 0,
+    };
+    let Some(context) = channels
+        .get(&chan)
+        .and_then(|channel| channel.path_probe.as_ref())
+        .filter(|context| context.route == ProbeRoute::Direct && context.live())
+    else {
+        return 0;
+    };
+    let mut received = match context.relay_request_at.try_lock() {
+        Ok(received) => received,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return 0,
+    };
+    c_int::from(
+        received
+            .take()
+            .is_some_and(|when| when.elapsed() < RELAY_REQUEST_MAX_AGE),
+    )
+}
+
 /// Reverse preparation may use an alternate route only when the host already
 /// pinned it for this authenticated, non-anonymous call. The incoming envelope
 /// cannot choose a destination or authorize a new route.
@@ -427,6 +460,17 @@ pub(crate) fn dispatch_control(
     let mut matching = contexts();
     matching.retain(|context| context.live() && context.cipher.same_receive_key(cipher));
     if control.reply().is_some() {
+        if control.route == ProbeRoute::Relay {
+            // The request may have opened through the relay alias while the
+            // host still owns the direct channel. Both contexts share this
+            // call's receive key, so report it to the direct controller.
+            for context in matching.iter().filter(|c| c.route == ProbeRoute::Direct) {
+                *context
+                    .relay_request_at
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(Instant::now());
+            }
+        }
         // The decrypting channel owns this receive leg. A warming or retiring
         // sibling can share its key but has independent echo admission.
         if let Some(owner) = matching
