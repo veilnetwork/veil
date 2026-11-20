@@ -112,7 +112,7 @@ struct MfCameraTestPeer {
     type->SetUINT32(MF_MT_DEFAULT_STRIDE, static_cast<UINT32>(stride));
     MfCameraCapturer camera{CameraFrameCb()};
     *(&camera.reader_) = &reader;
-    const bool readable = camera.ReadCurrentFormat();
+    const bool readable = SUCCEEDED(camera.ReadCurrentFormat());
     libyuv::metadata_conversion_calls = 0;
     if (readable && deliver) {
       // Real MF sample/buffer containing opaque bytes. Stand-ins never read or
@@ -145,7 +145,7 @@ struct MfCameraTestPeer {
     MfCameraCapturer camera(CameraFrameCb([](const uint8_t*, const uint8_t*,
         const uint8_t*, int, int, int, int, int, int64_t) {}));
     *(&camera.reader_) = &reader;
-    const bool opened = camera.NegotiateFormat(352, 198);
+    const bool opened = camera.NegotiateFormat(352, 198, 6);
     reader.sets = 0;
     libyuv::metadata_conversion_calls = 0;
     camera.running_.store(true);
@@ -173,7 +173,7 @@ struct MfCameraTestPeer {
     MfCameraCapturer camera(CameraFrameCb([](const uint8_t*, const uint8_t*,
         const uint8_t*, int, int, int, int, int, int64_t) {}));
     *(&camera.reader_) = &reader;
-    const bool opened = camera.NegotiateFormat(352, 198);
+    const bool opened = camera.NegotiateFormat(352, 198, 6);
     libyuv::metadata_conversion_calls = 0;
     camera.running_.store(true);
     camera.CaptureLoop();
@@ -205,6 +205,19 @@ struct MfCameraTestPeer {
     return ok;
   }
 
+  static bool MissingSourceEvidence() {
+    MfCameraCapturer camera{CameraFrameCb()};
+    const bool opened = camera.OpenReader("fixture-nonexistent-camera", 352, 198);
+    const auto diagnostic = camera.Diagnostics();
+    const bool ok = !opened && diagnostic.status == 4 &&
+        diagnostic.hresult == static_cast<uint32_t>(MF_E_NOT_FOUND) &&
+        diagnostic.reads == 0 && diagnostic.frames == 0;
+    std::printf("missing source evidence: %s (stage=%d has_hresult=%d)\n",
+                ok ? "PASS" : "FAIL", diagnostic.status,
+                diagnostic.hresult >= 0 ? 1 : 0);
+    return ok;
+  }
+
   static bool Run(const char* label, GUID subtype, UINT32 width, UINT32 height,
                   INT32 stride, ChangeOutcome outcome, bool query_fails = false,
                   bool notify = true) {
@@ -216,7 +229,7 @@ struct MfCameraTestPeer {
         const uint8_t*, const uint8_t*, int, int, int, int, int, int64_t) {})
                                      : CameraFrameCb());
     *(&camera.reader_) = &reader;
-    const bool opened = camera.NegotiateFormat(352, 198);
+    const bool opened = camera.NegotiateFormat(352, 198, 6);
     reader.sets = 0;
     libyuv::metadata_conversion_calls = 0;
     camera.running_.store(true);
@@ -232,15 +245,20 @@ struct MfCameraTestPeer {
     const bool recovery_format = !recovered ||
         (camera.cap_w_ == 352 && camera.cap_h_ == 198 && camera.cap_stride_ == 352 &&
          camera.fmt_ == MfCameraCapturer::Fmt::kNv12);
+    const auto diagnostic = camera.Diagnostics();
+    const bool refusal_diagnosed = outcome != ChangeOutcome::kStopped ||
+        (diagnostic.status == 10 &&
+         diagnostic.hresult == static_cast<uint32_t>(
+             query_fails ? E_FAIL : MF_E_INVALIDMEDIATYPE));
     const int expected_sets = readable ? 0 : (recovered || query_fails ? 1 : 4);
     const bool ok = opened && reader.sets == expected_sets && refreshed &&
-                    subtype_matches && recovery_format &&
+                    subtype_matches && recovery_format && refusal_diagnosed &&
                     libyuv::metadata_conversion_calls == 0 &&
                     reader.reads == (readable || recovered ? 2 : 1);
     camera.reader_.Reset();
-    std::printf("%s: %s (sets=%d reads=%d conversions=%d)\n", label,
+    std::printf("%s: %s (sets=%d reads=%d conversions=%d evidence=%d)\n", label,
                 ok ? "PASS" : "FAIL", reader.sets, reader.reads,
-                libyuv::metadata_conversion_calls);
+                libyuv::metadata_conversion_calls, refusal_diagnosed ? 1 : 0);
     return ok;
   }
 };
@@ -294,6 +312,7 @@ int main() {
     failed += !MfCameraTestPeer::CaptureEvidence(true);
     failed += !MfCameraTestPeer::CaptureEvidence(false);
     failed += !MfCameraTestPeer::StoppedEvidence();
+    failed += !MfCameraTestPeer::MissingSourceEvidence();
     failed += !MfCameraTestPeer::Run("unchanged stream control", MFVideoFormat_NV12,
                                    352, 198, 352, ChangeOutcome::kReadable, false, false);
     failed += !MfCameraTestPeer::Run("NV12 geometry change", MFVideoFormat_NV12,

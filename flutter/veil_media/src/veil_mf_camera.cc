@@ -136,7 +136,7 @@ class MfPlatform {
     ready_cv_.wait(lock, [this] { return ready_; });
   }
 
-  bool ok() const { return started_.load(); }
+  HRESULT startup_result() const { return startup_result_.load(); }
 
   // Run `fn` on the MF thread and block until it has finished. Never call this
   // FROM the MF thread — nothing here does, and it would deadlock.
@@ -165,10 +165,14 @@ class MfPlatform {
   // thread is never joined and the object is never destroyed. That is the same
   // lifetime the static had — only the apartment it touches has moved.
   [[noreturn]] void Serve() {
-    const bool com_ok = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
-    if (!com_ok) vcam_log("CoInitializeEx(MTA) failed on the MF thread");
-    started_.store(com_ok && SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE)));
-    if (!started_.load()) vcam_log("MFStartup failed — no camera on this host");
+    HRESULT result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(result)) {
+      vcam_log("CoInitializeEx(MTA) failed on the MF thread");
+    } else {
+      result = MFStartup(MF_VERSION, MFSTARTUP_LITE);
+      if (FAILED(result)) vcam_log("MFStartup failed — no camera on this host");
+    }
+    startup_result_.store(result);
     {
       std::lock_guard<std::mutex> lock(m_);
       ready_ = true;
@@ -191,7 +195,7 @@ class MfPlatform {
   std::condition_variable task_cv_;
   std::deque<std::function<void()>> queue_;
   bool ready_ = false;
-  std::atomic<bool> started_{false};
+  std::atomic<HRESULT> startup_result_{E_UNEXPECTED};
 };
 
 // LEAKED ON PURPOSE — see the same note on `adm_host_thread()`.
@@ -241,26 +245,26 @@ void append_json_string(std::string& out, const std::string& value) {
 }
 
 // Activate the capture device matching `symlink`, or the first one when it is
-// empty. Returns null when there is no camera at all.
-IMFMediaSource* activate_source(const std::wstring& symlink) {
+// empty. Keep the native failure distinct from a missing device.
+HRESULT activate_source(const std::wstring& symlink, IMFMediaSource** source) {
   ComPtr<IMFAttributes> attrs;
-  if (FAILED(MFCreateAttributes(&attrs, 1))) return nullptr;
-  if (FAILED(attrs->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
-                            MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID))) {
-    return nullptr;
-  }
+  HRESULT hr = MFCreateAttributes(&attrs, 1);
+  if (FAILED(hr)) return hr;
+  hr = attrs->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+                      MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
+  if (FAILED(hr)) return hr;
   IMFActivate** devices = nullptr;
   UINT32 count = 0;
-  if (FAILED(MFEnumDeviceSources(attrs.Get(), &devices, &count)) ||
-      count == 0) {
+  hr = MFEnumDeviceSources(attrs.Get(), &devices, &count);
+  if (FAILED(hr) || count == 0) {
     if (devices != nullptr) CoTaskMemFree(devices);
     vcam_log("no video capture devices");
-    return nullptr;
+    return FAILED(hr) ? hr : MF_E_NOT_FOUND;
   }
 
-  IMFMediaSource* source = nullptr;
+  HRESULT activation = MF_E_NOT_FOUND;
   for (UINT32 i = 0; i < count; ++i) {
-    if (source == nullptr) {
+    if (*source == nullptr) {
       bool match = symlink.empty();
       if (!match) {
         wchar_t* link = nullptr;
@@ -273,21 +277,23 @@ IMFMediaSource* activate_source(const std::wstring& symlink) {
         }
       }
       if (match) {
-        const HRESULT activated = devices[i]->ActivateObject(IID_PPV_ARGS(&source));
-        if (FAILED(activated)) {
+        activation = devices[i]->ActivateObject(IID_PPV_ARGS(source));
+        if (FAILED(activation)) {
           vcam_log("camera: source activation refused (0x%08lx)",
-                   static_cast<unsigned long>(activated));
-          source = nullptr;
+                   static_cast<unsigned long>(activation));
+          *source = nullptr;
+        } else if (*source == nullptr) {
+          activation = E_UNEXPECTED;
         }
       }
     }
     devices[i]->Release();
   }
   CoTaskMemFree(devices);
-  if (source == nullptr && !symlink.empty()) {
+  if (*source == nullptr && !symlink.empty()) {
     vcam_log("camera: selected source unavailable");
   }
-  return source;
+  return activation;
 }
 
 class MfCameraCapturer : public CameraCapturer {
@@ -320,8 +326,9 @@ class MfCameraCapturer : public CameraCapturer {
       diagnostic_ = {};
       diagnostic_.status = 1;
     }
-    if (!mf().ok()) {
-      SetDiagnosticStatus(5);
+    const HRESULT platform_result = mf().startup_result();
+    if (FAILED(platform_result)) {
+      SetDiagnosticStatus(5, static_cast<uint32_t>(platform_result));
       return false;
     }
     if (width <= 0) width = 352;
@@ -427,16 +434,16 @@ class MfCameraCapturer : public CameraCapturer {
     ComPtr<IMFMediaSource> source;
     // utf8_to_wide answers an empty string for both nullptr and "", and
     // activate_source reads an empty symlink as "the first camera".
-    *(&source) = activate_source(utf8_to_wide(device.c_str()));
-    if (!source) {
-      SetDiagnosticStatus(4);
+    HRESULT hr = activate_source(utf8_to_wide(device.c_str()), &source);
+    if (FAILED(hr)) {
+      SetDiagnosticStatus(4, static_cast<uint32_t>(hr));
       return false;
     }
 
     // Enable the basic YUV -> RGB32 fallback, without depending on advanced
     // video processors or asking Media Foundation to resize camera modes.
     ComPtr<IMFAttributes> reader_attrs;
-    HRESULT hr = MFCreateAttributes(&reader_attrs, 1);
+    hr = MFCreateAttributes(&reader_attrs, 1);
     if (SUCCEEDED(hr)) hr = reader_attrs->SetUINT32(
         MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
     if (FAILED(hr)) {
@@ -450,8 +457,7 @@ class MfCameraCapturer : public CameraCapturer {
       vcam_log("MFCreateSourceReaderFromMediaSource failed");
       return false;
     }
-    if (!NegotiateFormat(width, height)) {
-      SetDiagnosticStatus(6);
+    if (!NegotiateFormat(width, height, 6)) {
       reader_.Reset();
       return false;
     }
@@ -463,7 +469,7 @@ class MfCameraCapturer : public CameraCapturer {
 
   // Prefer exact NV12, then negotiate a readable format at camera geometry.
   // Read back dimensions/stride instead of assuming the request was honoured.
-  bool NegotiateFormat(int width, int height) {
+  bool NegotiateFormat(int width, int height, int failure_status) {
     HRESULT hr = mf_camera::RequestCaptureFormat(reader_.Get(), width, height);
     if (FAILED(hr)) {
       // Some systems have no suitable decoder/converter. An unchanged native
@@ -471,24 +477,29 @@ class MfCameraCapturer : public CameraCapturer {
       vcam_log("uncompressed capture requests refused (0x%08lx) — inspecting native format",
                static_cast<unsigned long>(hr));
     }
-    return ReadCurrentFormat();
+    hr = ReadCurrentFormat();
+    if (FAILED(hr)) {
+      SetDiagnosticStatus(failure_status, static_cast<uint32_t>(hr));
+      return false;
+    }
+    return true;
   }
 
   // Observe the output type describing the sample just returned by ReadSample.
   // Re-requesting the old profile here would change the reader for FUTURE
   // samples, while interpreting the current one with that new geometry/stride.
   // Negotiation for a future sample remains separate from this observation.
-  bool ReadCurrentFormat() {
+  HRESULT ReadCurrentFormat() {
     ComPtr<IMFMediaType> got;
-    if (FAILED(reader_->GetCurrentMediaType(
-            static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), &got))) {
-      return false;
-    }
+    HRESULT hr = reader_->GetCurrentMediaType(
+        static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), &got);
+    if (FAILED(hr)) return hr;
     // Not GUID_NULL: that name is an extern defined in uuid.lib, and pulling a
     // library in for a zeroed struct is a link error waiting for the one build
     // that does not happen to already carry it.
     GUID subtype = {};
-    if (FAILED(got->GetGUID(MF_MT_SUBTYPE, &subtype))) return false;
+    hr = got->GetGUID(MF_MT_SUBTYPE, &subtype);
+    if (FAILED(hr)) return hr;
     Fmt format = Fmt::kUnknown;
     if (subtype == MFVideoFormat_NV12) {
       format = Fmt::kNv12;
@@ -499,15 +510,16 @@ class MfCameraCapturer : public CameraCapturer {
       format = Fmt::kRgb32;
     } else {
       vcam_log("unsupported capture subtype; no local video");
-      return false;
+      return MF_E_INVALIDMEDIATYPE;
     }
 
     UINT32 w = 0, h = 0;
-    if (FAILED(MFGetAttributeSize(got.Get(), MF_MT_FRAME_SIZE, &w, &h)) ||
-        w == 0 || h == 0 ||
+    hr = MFGetAttributeSize(got.Get(), MF_MT_FRAME_SIZE, &w, &h);
+    if (FAILED(hr)) return hr;
+    if (w == 0 || h == 0 ||
         w > static_cast<UINT32>((std::numeric_limits<int>::max)()) ||
         h > static_cast<UINT32>((std::numeric_limits<int>::max)())) {
-      return false;
+      return MF_E_INVALIDMEDIATYPE;
     }
     // libyuv receives signed dimensions/strides. A source must have room for
     // the whole row, including the final UV pair of an odd-width YUV image.
@@ -517,7 +529,7 @@ class MfCameraCapturer : public CameraCapturer {
         : format == Fmt::kYuy2 ? chroma_width * 4
                               : static_cast<uint64_t>(w) * 4;
     if (minimum_stride > static_cast<uint64_t>((std::numeric_limits<int>::max)())) {
-      return false;
+      return MF_E_INVALIDMEDIATYPE;
     }
 
     // MF_MT_DEFAULT_STRIDE is optional and often absent on capture types. The
@@ -537,7 +549,7 @@ class MfCameraCapturer : public CameraCapturer {
     const uint64_t absolute_stride = static_cast<uint64_t>(stride < 0 ? -stride : stride);
     if (absolute_stride < minimum_stride ||
         absolute_stride > static_cast<uint64_t>((std::numeric_limits<int>::max)())) {
-      return false;
+      return MF_E_INVALIDMEDIATYPE;
     }
     // Publish only a fully checked layout. Failed observation must not poison
     // the previous geometry used by bounded format-recovery negotiation.
@@ -545,7 +557,7 @@ class MfCameraCapturer : public CameraCapturer {
     cap_w_ = static_cast<int>(w);
     cap_h_ = static_cast<int>(h);
     cap_stride_ = static_cast<int>(stride);
-    return true;
+    return S_OK;
   }
 
   // Runs on the capture thread, inside the apartment [Start]'s thread body
@@ -587,14 +599,11 @@ class MfCameraCapturer : public CameraCapturer {
         // The device renegotiated under us (a format change or a resume from
         // sleep). Re-read the geometry rather than converting the next frame
         // with stale dimensions, which reads past the buffer.
-        if (!ReadCurrentFormat()) {
+        if (FAILED(ReadCurrentFormat())) {
           // Preserve the existing converter recovery for an unreadable output,
           // but discard THIS sample: it predates the newly negotiated format.
           // Only a subsequent ReadSample may use those conversion parameters.
-          if (!NegotiateFormat(cap_w_, cap_h_)) {
-            SetDiagnosticStatus(10);
-            break;
-          }
+          if (!NegotiateFormat(cap_w_, cap_h_, 10)) break;
           continue;
         }
       }
@@ -768,7 +777,7 @@ CameraCapturer* CreatePlatformCamera(CameraFrameCb cb) {
 // silently move that thread to MTA and take the audio device module down
 // with it later.
 std::string ListPlatformCamerasJson() {
-  if (!mf().ok()) return "[]";
+  if (FAILED(mf().startup_result())) return "[]";
   std::string result = "[]";
   mf().Run([&result] { result = EnumerateCamerasJson(); });
   return result;
