@@ -74,6 +74,10 @@ const MOBILE_INITIAL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::fro
 #[cfg(any(target_os = "android", target_os = "linux"))]
 const ORDERED_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+#[path = "ordered_ack_watch.rs"]
+mod ordered_ack_watch;
+
 #[derive(Clone, Copy)]
 pub(crate) enum Obfs4Dial {
     Canonical,
@@ -412,6 +416,8 @@ struct Obfs4IoStream {
     write_trace: super::tcp_trace::WriteTrace,
     #[cfg(any(target_os = "android", target_os = "linux"))]
     ordered_timeout_configured: bool,
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    ordered_ack_watch: ordered_ack_watch::OrderedAckWatch,
     #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
     session_open_started: bool,
     #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
@@ -427,6 +433,8 @@ impl Obfs4IoStream {
             write_trace,
             #[cfg(any(target_os = "android", target_os = "linux"))]
             ordered_timeout_configured: false,
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            ordered_ack_watch: Default::default(),
             #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
             session_open_started: false,
             #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
@@ -450,6 +458,24 @@ impl tokio::io::AsyncRead for Obfs4IoStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        if crate::ordered_records::READING_CHILD
+            .try_with(|_| ())
+            .is_ok()
+        {
+            let io = &mut *self;
+            if io.ordered_ack_watch.poll(cx, || {
+                super::tcp_trace::ordered_ack_progress(io.stream.get_ref().socket())
+            }) {
+                if super::tcp_trace::is_enabled() {
+                    log::info!("transport.ordered_ack_stall");
+                }
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "TCP acknowledgement stopped on ordered obfs4 child",
+                )));
+            }
+        }
         let result = std::pin::Pin::new(&mut self.stream).poll_read(cx, buf);
         #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
         if let Some(ack) = &mut self.session_open_ack
@@ -500,6 +526,12 @@ impl tokio::io::AsyncWrite for Obfs4IoStream {
             }
         }
         let result = std::pin::Pin::new(&mut self.stream).poll_write(cx, buf);
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        if self.ordered_timeout_configured
+            && matches!(result, std::task::Poll::Ready(Ok(n)) if n != 0)
+        {
+            self.ordered_ack_watch.note_write();
+        }
         self.trace_write("write", result.is_pending());
         result
     }
@@ -508,6 +540,10 @@ impl tokio::io::AsyncWrite for Obfs4IoStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let result = std::pin::Pin::new(&mut self.stream).poll_flush(cx);
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        if self.ordered_timeout_configured && matches!(result, std::task::Poll::Ready(Ok(()))) {
+            self.ordered_ack_watch.note_write();
+        }
         self.trace_write("flush", result.is_pending());
         result
     }

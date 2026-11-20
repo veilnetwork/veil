@@ -50,6 +50,15 @@ pub(super) fn acknowledged_bytes(stream: &tokio::net::TcpStream) -> Option<u64> 
     read(socket_info(stream.as_fd(), &mut raw).ok()?).acked_bytes
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn ordered_ack_progress(stream: &tokio::net::TcpStream) -> Option<(u32, u64)> {
+    use std::os::fd::AsFd;
+    let mut raw = [0u8; 128];
+    let info = socket_info(stream.as_fd(), &mut raw).ok()?;
+    let unacked = u32::from_ne_bytes(info.get(24..28)?.try_into().ok()?);
+    Some((unacked, read(info).acked_bytes?))
+}
+
 pub(super) fn read(raw: &[u8]) -> ByteProgress {
     ByteProgress {
         sent_bytes: native_u64(raw, 200),

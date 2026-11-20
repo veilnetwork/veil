@@ -25,6 +25,9 @@ pub(crate) use handshake::{HandshakeSide, HandshakeStream};
 #[path = "tcp_info_progress.rs"]
 mod linux_progress;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(super) use linux_progress::ordered_ack_progress;
+
 static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
 static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
 static NEXT_CONNECT_CONTEXT: AtomicU64 = AtomicU64::new(1);
