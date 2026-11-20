@@ -1179,6 +1179,23 @@ int veil_send(VeilApp *app,
 ;
 
 /**
+ * Submit a reliable live copy with bounded local queue and first-hop wait.
+ * The application keeps delivery state and retries on missing peer receipt.
+ * Only non-anonymous, ACK-free payloads up to 4096 bytes are supported.
+ * The deadline is local to the sender, with the ordinary sealed wire format.
+ * Each ID must address 32 readable bytes.
+ */
+
+int veil_send_bounded_reliable(VeilApp *app,
+                               const uint8_t *dst_node_id,
+                               const uint8_t *dst_app_id,
+                               uint32_t dst_endpoint_id,
+                               const uint8_t *data,
+                               size_t len,
+                               char **err_out)
+;
+
+/**
  * Send with a process-local queue (0..4). Selector 4 isolates recoverable DATA.
  * The lane is never a relay priority.
  * `anonymous_authenticated=1` retains authenticated onion-only routing; 0 is

@@ -13,8 +13,8 @@
 //! pool. A slow destination queues behind itself and holds at most
 //! [`MAX_SENDS_PER_DESTINATION`] pool slots; everyone else keeps moving.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::{collections::HashMap, future::Future};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -58,15 +58,19 @@ pub(crate) fn admit_queued_send(
 /// The gates of one IPC connection, created with it.
 #[derive(Default)]
 pub(crate) struct DestinationGates {
-    gates: Mutex<HashMap<[u8; 32], Arc<Semaphore>>>,
+    gates: Mutex<HashMap<[u8; 32], DestinationGate>>,
+}
+
+struct DestinationGate {
+    semaphore: Arc<Semaphore>,
+    users: usize,
 }
 
 /// A turn at one destination's gate. Dropping it hands the turn on, and the
 /// last one out removes the gate, so the map holds only destinations with a
 /// send in progress.
 pub(crate) struct DestinationTurn {
-    _permit: OwnedSemaphorePermit,
-    gate: Arc<Semaphore>,
+    permit: Option<OwnedSemaphorePermit>,
     owner: Arc<DestinationGates>,
     dst: [u8; 32],
 }
@@ -74,24 +78,26 @@ pub(crate) struct DestinationTurn {
 impl DestinationGates {
     /// Wait for a turn at `dst`'s gate.
     pub(crate) async fn enter(self: &Arc<Self>, dst: [u8; 32]) -> DestinationTurn {
-        let gate = {
+        let semaphore = {
             let mut gates = self.gates.lock().unwrap_or_else(|p| p.into_inner());
-            Arc::clone(
-                gates
-                    .entry(dst)
-                    .or_insert_with(|| Arc::new(Semaphore::new(MAX_SENDS_PER_DESTINATION))),
-            )
+            let gate = gates.entry(dst).or_insert_with(|| DestinationGate {
+                semaphore: Arc::new(Semaphore::new(MAX_SENDS_PER_DESTINATION)),
+                users: 0,
+            });
+            gate.users += 1;
+            Arc::clone(&gate.semaphore)
         };
-        let permit = Arc::clone(&gate)
+        let mut turn = DestinationTurn {
+            permit: None,
+            owner: Arc::clone(self),
+            dst,
+        };
+        let permit = semaphore
             .acquire_owned()
             .await
             .expect("a destination gate is never closed");
-        DestinationTurn {
-            _permit: permit,
-            gate,
-            owner: Arc::clone(self),
-            dst,
-        }
+        turn.permit = Some(permit);
+        turn
     }
 
     #[cfg(test)]
@@ -103,15 +109,64 @@ impl DestinationGates {
 impl Drop for DestinationTurn {
     fn drop(&mut self) {
         let mut gates = self.owner.gates.lock().unwrap_or_else(|p| p.into_inner());
-        // The permit is still held here (fields drop after this body), so the
-        // last turn out sees every other permit free. Three owners then: the
-        // map, this turn, and the owned permit, which keeps its own reference
-        // to the semaphore. A caller still waiting in `enter` holds a fourth.
-        if Arc::strong_count(&self.gate) == 3
-            && self.gate.available_permits() + 1 == MAX_SENDS_PER_DESTINATION
-        {
+        // Registered users include pending acquisitions, which can be cancelled
+        // by a source deadline without ever obtaining a permit.
+        drop(self.permit.take());
+        let gate = gates.get_mut(&self.dst).expect("registered destination");
+        gate.users -= 1;
+        if gate.users == 0 {
             gates.remove(&self.dst);
         }
+    }
+}
+
+/// Run the normal send pipeline under an optional budget set at IPC receipt.
+/// The deadline covers both waits and first-hop admission. A timed-out job
+/// releases its turns, permits and retained-body charge when the task exits.
+pub(crate) async fn run_send_job(
+    gates: &Arc<DestinationGates>,
+    slots: Arc<Semaphore>,
+    destination: Option<[u8; 32]>,
+    deadline: Option<tokio::time::Instant>,
+    send: impl Future<Output = ()>,
+) {
+    let job = async {
+        let started = std::time::Instant::now();
+        let _turn = match destination {
+            Some(dst) => Some(gates.enter(dst).await),
+            None => None,
+        };
+        let turn_ms = started.elapsed().as_millis();
+        if turn_ms >= 200 {
+            log::warn!(
+                "ipc.send_turn_wait at={} ms={turn_ms}",
+                veil_util::unix_secs_now_u64()
+            );
+        }
+        let started = std::time::Instant::now();
+        let _slot = slots.acquire_owned().await;
+        let waited_ms = started.elapsed().as_millis();
+        if waited_ms >= 1_000 {
+            log::warn!(
+                "ipc.send_permit_wait at={} ms={waited_ms}",
+                veil_util::unix_secs_now_u64()
+            );
+        }
+        if deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline) {
+            send.await;
+        }
+    };
+    if let Some(deadline) = deadline {
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => (),
+            _ = job => (),
+        }
+    } else {
+        job.await;
     }
 }
 
@@ -200,22 +255,81 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn expired_call_sends_release_active_and_queued_turns() {
+        let gates = Arc::new(DestinationGates::default());
+        let slots = Arc::new(Semaphore::new(MAX_SENDS_PER_DESTINATION));
+        let entered = std::cell::Cell::new(0);
+        let deadline =
+            tokio::time::Instant::now() + veil_proto::ipc::LOCAL_BOUNDED_RELIABLE_MAX_AGE;
+        let mut old = Vec::new();
+        for _ in 0..=MAX_SENDS_PER_DESTINATION {
+            old.push(Box::pin(run_send_job(
+                &gates,
+                Arc::clone(&slots),
+                Some(SLOW),
+                Some(deadline),
+                async {
+                    entered.set(entered.get() + 1);
+                    std::future::pending::<()>().await;
+                },
+            )));
+        }
+        for send in &mut old {
+            assert!(futures::poll!(send.as_mut()).is_pending());
+        }
+        assert_eq!(entered.get(), MAX_SENDS_PER_DESTINATION);
+        assert_eq!(slots.available_permits(), 0);
+        tokio::time::advance(veil_proto::ipc::LOCAL_BOUNDED_RELIABLE_MAX_AGE).await;
+        // Let active sends leave before dropping the already-expired waiter.
+        // The waiter must not inherit a newly free turn at the deadline.
+        for send in &mut old {
+            assert!(futures::poll!(send.as_mut()).is_ready());
+        }
+        assert_eq!(entered.get(), MAX_SENDS_PER_DESTINATION);
+        assert_eq!(gates.open_gates(), 0);
+        assert_eq!(slots.available_permits(), MAX_SENDS_PER_DESTINATION);
+
+        run_send_job(&gates, slots, Some(SLOW), None, async {
+            entered.set(entered.get() + 1);
+        })
+        .await;
+        assert_eq!(entered.get(), MAX_SENDS_PER_DESTINATION + 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_send_expires_while_waiting_for_a_pool_slot() {
+        let gates = Arc::new(DestinationGates::default());
+        let slots = Arc::new(Semaphore::new(0));
+        let deadline =
+            tokio::time::Instant::now() + veil_proto::ipc::LOCAL_BOUNDED_RELIABLE_MAX_AGE;
+        let send = run_send_job(&gates, slots, Some(SLOW), Some(deadline), async {
+            panic!("expired send reached the handler");
+        });
+        tokio::pin!(send);
+        assert!(futures::poll!(send.as_mut()).is_pending());
+        assert_eq!(gates.open_gates(), 1);
+        tokio::time::advance(veil_proto::ipc::LOCAL_BOUNDED_RELIABLE_MAX_AGE).await;
+        assert!(futures::poll!(send.as_mut()).is_ready());
+        assert_eq!(gates.open_gates(), 0);
+    }
+
     /// The gate is entered BEFORE the connection's pool slot, and on the send
     /// path itself. Held in the source because the send runs only inside a
     /// live IPC connection: entered after the slot, a stuck destination would
     /// still hold the pool while it waits.
     #[test]
     fn the_send_path_takes_its_destination_turn_before_a_pool_slot() {
-        let src = include_str!("server.rs");
-        let spawn = src
-            .find("handlers::send::SendReply::Offloop(reply_tx)")
-            .expect("the off-loop send spawn moved; this guard is stale");
-        let body = &src[..spawn];
+        let server = include_str!("server.rs");
+        assert!(server.contains("send_gates::run_send_job(&gates, sem, destination, deadline"));
+        let path = include_str!("send_gates.rs");
+        let job = path.find("pub(crate) async fn run_send_job(").unwrap();
+        let body = &path[job..path.find("#[cfg(test)]\nmod tests").unwrap()];
         let turn = body
-            .rfind("gates.enter(send.dst_node_id).await")
+            .find("gates.enter(dst).await")
             .expect("the send path no longer takes a destination turn");
         let slot = body
-            .rfind("sem.acquire_owned().await")
+            .find("slots.acquire_owned().await")
             .expect("the send path no longer takes a pool slot");
         assert!(turn < slot, "the destination turn must come first");
     }

@@ -1602,6 +1602,13 @@ pub const IPC_SEND_FLAG_MY_OTHER_DEVICES: u32 = 0x0000_0100;
 /// with already-sealed, ACK-free relay datagrams; not encoded in Delivery.
 pub const IPC_SEND_FLAG_LOCAL_SHORT_CONTROL: u32 = 0x0000_0200;
 
+/// Bound a reliable, ACK-free local application send from IPC receipt through
+/// first-hop admission. The caller retains its own retry and delivery state.
+/// This flag is never copied into a network frame.
+pub const IPC_SEND_FLAG_LOCAL_BOUNDED_RELIABLE: u32 = 0x0000_0400;
+pub const LOCAL_BOUNDED_RELIABLE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+pub const LOCAL_BOUNDED_RELIABLE_MAX_BYTES: usize = 4096;
+
 /// Versioned prefix of a symmetrically sealed relay-media cell. Shared by the
 /// local IPC gate and the media endpoint codec; relays never interpret it.
 pub const RELAY_MEDIA_SEALED_MAGIC: [u8; 4] = *b"VME1";

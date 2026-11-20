@@ -1620,7 +1620,66 @@ pub unsafe extern "C" fn veil_send(
     len: size_t,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, "veil_send") } {
+    unsafe {
+        send_reliable(
+            app,
+            dst_node_id,
+            dst_app_id,
+            dst_endpoint_id,
+            data,
+            len,
+            err_out,
+            false,
+        )
+    }
+}
+
+/// Submit a reliable live copy with bounded local queue and first-hop wait.
+/// The application keeps delivery state and retries on missing peer receipt.
+/// Only non-anonymous, ACK-free payloads up to 4096 bytes are supported.
+/// The deadline is local to the sender, with the ordinary sealed wire format.
+/// Each ID must address 32 readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_send_bounded_reliable(
+    app: *mut VeilApp,
+    dst_node_id: *const u8,
+    dst_app_id: *const u8,
+    dst_endpoint_id: u32,
+    data: *const u8,
+    len: size_t,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    unsafe {
+        send_reliable(
+            app,
+            dst_node_id,
+            dst_app_id,
+            dst_endpoint_id,
+            data,
+            len,
+            err_out,
+            true,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn send_reliable(
+    app: *mut VeilApp,
+    dst_node_id: *const u8,
+    dst_app_id: *const u8,
+    dst_endpoint_id: u32,
+    data: *const u8,
+    len: size_t,
+    err_out: *mut *mut c_char,
+    bounded: bool,
+) -> c_int {
+    let operation = if bounded {
+        "veil_send_bounded_reliable"
+    } else {
+        "veil_send"
+    };
+    if let Err(rc) = unsafe { guard::ffi_prelude(err_out, operation) } {
         return rc;
     }
     null_check!(err_out,
@@ -1637,6 +1696,10 @@ pub unsafe extern "C" fn veil_send(
     // bounds-check caller-supplied len BEFORE any
     // allocation. An untrusted caller passing usize::MAX would
     // trigger a 16 EiB Vec::with_capacity, OOM-killing the host.
+    if bounded && len > veil_proto::ipc::LOCAL_BOUNDED_RELIABLE_MAX_BYTES {
+        unsafe { write_err(err_out, "bounded reliable payload too large") };
+        return VEIL_ERR_INVALID_ARG;
+    }
     if len > VEIL_MAX_DATA_LEN {
         unsafe {
             write_err(
@@ -1687,14 +1750,28 @@ pub unsafe extern "C" fn veil_send(
     let mut lock_micros: u128 = 0;
     let send_res: Result<(), ClientError> = app_ref.bundle.runtime.block_on(async {
         let entered = std::time::Instant::now();
-        let inner_guard = app_ref.sender.lock().await;
+        let deadline = tokio::time::Instant::from_std(call_started)
+            + veil_proto::ipc::LOCAL_BOUNDED_RELIABLE_MAX_AGE;
+        let inner_guard = if bounded {
+            tokio::time::timeout_at(deadline, app_ref.sender.lock())
+                .await
+                .map_err(|_| ClientError::Protocol("bounded reliable send expired".into()))?
+        } else {
+            app_ref.sender.lock().await
+        };
         lock_micros = entered.elapsed().as_micros();
         let Some(sender) = inner_guard.as_ref() else {
             return Err(ClientError::Protocol("app already closed".to_string()));
         };
-        sender
-            .send(dst_node, dst_app, dst_endpoint_id, &payload)
-            .await
+        if bounded {
+            sender
+                .send_bounded_reliable(dst_node, dst_app, dst_endpoint_id, &payload, deadline)
+                .await
+        } else {
+            sender
+                .send(dst_node, dst_app, dst_endpoint_id, &payload)
+                .await
+        }
     });
     let total_micros = call_started.elapsed().as_micros();
     if total_micros >= 50_000 {

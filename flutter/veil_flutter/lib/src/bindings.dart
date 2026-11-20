@@ -396,6 +396,28 @@ final int Function(
             )>>('veil_send')
     .asFunction();
 
+final int Function(
+  Pointer<VeilApp>,
+  Pointer<Uint8>,
+  Pointer<Uint8>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Utf8>>,
+) veilSendBoundedReliable = nativeLib
+    .lookup<
+        NativeFunction<
+            Int32 Function(
+              Pointer<VeilApp>,
+              Pointer<Uint8>,
+              Pointer<Uint8>,
+              Uint32,
+              Pointer<Uint8>,
+              IntPtr,
+              Pointer<Pointer<Utf8>>,
+            )>>('veil_send_bounded_reliable')
+    .asFunction();
+
 /// Process-local source lane; it is stripped at the daemon boundary.
 final int Function(
   Pointer<VeilApp>,

@@ -1012,7 +1012,7 @@ void _sendToMyDevicesWorker(int appAddr, Uint8List myNodeId, Uint8List dstAppId,
 }
 
 void _sendWorker(int appAddr, Uint8List dstNodeId, Uint8List dstAppId,
-    int dstEndpointId, Uint8List data) {
+    int dstEndpointId, Uint8List data, bool boundedReliable) {
   final app = Pointer<ffi.VeilApp>.fromAddress(appAddr);
   final dstNode = calloc<Uint8>(32);
   final dstApp = calloc<Uint8>(32);
@@ -1024,7 +1024,8 @@ void _sendWorker(int appAddr, Uint8List dstNodeId, Uint8List dstAppId,
     if (data.isNotEmpty) {
       dataPtr.asTypedList(data.length).setAll(0, data);
     }
-    final rc = ffi.veilSend(
+    final send = boundedReliable ? ffi.veilSendBoundedReliable : ffi.veilSend;
+    final rc = send(
       app,
       dstNode,
       dstApp,
@@ -2722,11 +2723,15 @@ class AppHandle implements Finalizable {
   }
 
   /// Send a datagram to a remote peer.
+  /// With [boundedReliable], the caller retains its own delivery receipt and
+  /// retries. Payloads up to 4096 bytes use a bounded local pipeline with the
+  /// ordinary reliable transport and sealing.
   Future<void> send({
     required Uint8List dstNodeId,
     required Uint8List dstAppId,
     required int dstEndpointId,
     required Uint8List data,
+    bool boundedReliable = false,
   }) async {
     _ensureOpen();
     if (dstNodeId.length != 32 || dstAppId.length != 32) {
@@ -2734,7 +2739,7 @@ class AppHandle implements Finalizable {
     }
     final appAddr = _app.address;
     return Isolate.run(
-        () => _sendWorker(appAddr, dstNodeId, dstAppId, dstEndpointId, data));
+        () => _sendWorker(appAddr, dstNodeId, dstAppId, dstEndpointId, data, boundedReliable));
   }
 
   /// Choose this endpoint's queue (0..3), without a relay priority or role.
