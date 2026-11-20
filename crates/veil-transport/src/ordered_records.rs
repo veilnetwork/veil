@@ -33,6 +33,12 @@ pub const RECORD_RECEIVE_MAX_AGE: Duration = Duration::from_millis(200);
 // record; there is no producer-specific transport policy or wire deadline.
 const WRITE_COMPLETION_TIMEOUT: Duration = RECORD_RECEIVE_MAX_AGE;
 
+tokio::task_local! {
+    // Local context for the loss-tolerant writer. The value is zero when
+    // operator tracing is off. Reliable stream writers never enter this scope.
+    pub(crate) static WRITING_CHILD: u64;
+}
+
 /// Exact local queue reservation, including the framing prefix and the tiny
 /// record metadata floor. Session admission must use this rather than payload
 /// length alone; it is not a wire bandwidth or delivery acknowledgement.
@@ -383,12 +389,17 @@ impl OrderedRecordPlane {
             progress: Mutex::default(),
         }));
         let (read, write) = tokio::io::split(stream);
+        let child = handle.local_trace_id();
+        let writer = write_records(write, out_rx, handle.clone(), write_timeout);
         let tasks = [
             tokio::spawn(read_records(read, handle.clone())),
-            tokio::spawn(trace::writer_scope(
-                handle.local_trace_id(),
-                write_records(write, out_rx, handle.clone(), write_timeout),
-            )),
+            tokio::spawn(async move {
+                if child != 0 || cfg!(any(target_os = "android", all(test, target_os = "linux"))) {
+                    WRITING_CHILD.scope(child, writer).await;
+                } else {
+                    writer.await;
+                }
+            }),
         ];
         Self { handle, tasks }
     }

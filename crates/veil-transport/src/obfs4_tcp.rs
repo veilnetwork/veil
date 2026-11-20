@@ -68,6 +68,12 @@ const OBFS4_BACKUP_DELAY: std::time::Duration = std::time::Duration::from_secs(1
 #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
 const MOBILE_INITIAL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+// A loss-tolerant ordered child can be replaced independently. Bound TCP's
+// unacknowledged backlog on that socket after the record codec takes over,
+// even when writes and flushes still fit in the kernel's send buffer.
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+const MOBILE_ORDERED_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 #[derive(Clone, Copy)]
 pub(crate) enum Obfs4Dial {
     Canonical,
@@ -386,6 +392,8 @@ impl TransportListener for Obfs4TcpListener {
 struct Obfs4IoStream {
     stream: Obfs4Stream<HandshakeStream>,
     write_trace: super::tcp_trace::WriteTrace,
+    #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+    ordered_timeout_configured: bool,
 }
 
 impl Obfs4IoStream {
@@ -395,6 +403,8 @@ impl Obfs4IoStream {
         Self {
             stream,
             write_trace,
+            #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+            ordered_timeout_configured: false,
         }
     }
 
@@ -424,6 +434,19 @@ impl tokio::io::AsyncWrite for Obfs4IoStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
+        #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+        if !self.ordered_timeout_configured
+            && crate::ordered_records::WRITING_CHILD
+                .try_with(|_| ())
+                .is_ok()
+        {
+            self.ordered_timeout_configured = true;
+            if let Err(error) = socket2::SockRef::from(self.stream.get_ref().socket())
+                .set_tcp_user_timeout(Some(MOBILE_ORDERED_ACK_TIMEOUT))
+            {
+                log::debug!("ordered obfs4 TCP timeout unavailable: {error}");
+            }
+        }
         let result = std::pin::Pin::new(&mut self.stream).poll_write(cx, buf);
         self.trace_write("write", result.is_pending());
         result
