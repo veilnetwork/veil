@@ -394,7 +394,7 @@ impl OrderedRecordPlane {
         let tasks = [
             tokio::spawn(read_records(read, handle.clone())),
             tokio::spawn(async move {
-                if child != 0 || cfg!(any(target_os = "android", all(test, target_os = "linux"))) {
+                if child != 0 || cfg!(any(target_os = "android", target_os = "linux")) {
                     WRITING_CHILD.scope(child, writer).await;
                 } else {
                     writer.await;

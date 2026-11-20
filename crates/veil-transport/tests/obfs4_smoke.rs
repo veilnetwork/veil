@@ -90,6 +90,46 @@ async fn obfs4_smoke_two_node() {
     assert_eq!(server_got, payload, "server saw plaintext payload");
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn accepted_ordered_obfs4_child_retires_after_tcp_stops_acknowledging() {
+    use socket2::{SockFilter, SockRef};
+    use std::time::Duration;
+    use tokio::net::TcpStream;
+    use veil_obfs4::{NodeIdMacKey, obfs4_client_connect};
+    use veil_transport::ordered_records::OrderedRecordPlane;
+
+    let psk = [0x42; 32];
+    let registry = TransportRegistry::with_defaults();
+    let transport = registry.get("obfs4-tcp").unwrap();
+    let bind = TransportUri::parse("obfs4-tcp://127.0.0.1:0").unwrap();
+    let listener = transport.bind(&bind, ctx_with_psk(psk)).await.unwrap();
+    let socket = TcpStream::connect(listener.local_addr()).await.unwrap();
+    let psk = NodeIdMacKey(psk);
+    let (server, client) = tokio::join!(listener.accept(), obfs4_client_connect(socket, &psk));
+    let plane = OrderedRecordPlane::new(server.unwrap().into_stream().unwrap());
+    let mut client = client.unwrap();
+    let handle = plane.handle();
+    handle.send(b"ok").unwrap();
+    let mut record = [0; 4];
+    tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut record))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&record, b"\0\x02ok");
+
+    // Drop peer-bound packets on the established loopback socket. The
+    // relay can still flush locally, but can no longer receive TCP ACKs.
+    SockRef::from(client.get_ref())
+        .attach_filter(&[SockFilter::new(0x06, 0, 0, 0)])
+        .unwrap();
+    handle.send(b"stalled").unwrap();
+    tokio::time::timeout(Duration::from_secs(8), handle.closed())
+        .await
+        .expect("the stalled record child must retire");
+    assert_eq!(handle.progress().completed_records, 2);
+}
+
 /// Active-probe scenario: an attacker that doesn't know the PSK connects
 /// and attempts the handshake.  Server must silent-drop; client surfaces
 /// an error.
