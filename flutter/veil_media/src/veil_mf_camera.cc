@@ -430,24 +430,26 @@ class MfCameraCapturer : public CameraCapturer {
 
   // Everything Media Foundation, on the capture thread. Returns false with
   // nothing held.
-  bool OpenReader(const std::string& device, int width, int height) {
-    ComPtr<IMFMediaSource> source;
-    // utf8_to_wide answers an empty string for both nullptr and "", and
-    // activate_source reads an empty symlink as "the first camera".
-    HRESULT hr = activate_source(utf8_to_wide(device.c_str()), &source);
-    if (FAILED(hr)) {
-      SetDiagnosticStatus(4, static_cast<uint32_t>(hr));
-      return false;
-    }
-
+  bool OpenReader(
+      const std::string& device, int width, int height,
+      decltype(&MFCreateAttributes) create_attrs = MFCreateAttributes,
+      decltype(&activate_source) activate = activate_source) {
     // Enable the basic YUV -> RGB32 fallback, without depending on advanced
-    // video processors or asking Media Foundation to resize camera modes.
+    // video processors. Prepare it before activating a camera so a failure
+    // here cannot leave a source open without a reader to shut it down.
     ComPtr<IMFAttributes> reader_attrs;
-    hr = MFCreateAttributes(&reader_attrs, 1);
+    HRESULT hr = create_attrs(&reader_attrs, 1);
     if (SUCCEEDED(hr)) hr = reader_attrs->SetUINT32(
         MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
     if (FAILED(hr)) {
       SetDiagnosticStatus(5, static_cast<uint32_t>(hr));
+      return false;
+    }
+    ComPtr<IMFMediaSource> source;
+    // activate_source reads an empty symlink as "the first camera".
+    hr = activate(utf8_to_wide(device.c_str()), &source);
+    if (FAILED(hr)) {
+      SetDiagnosticStatus(4, static_cast<uint32_t>(hr));
       return false;
     }
     hr = MFCreateSourceReaderFromMediaSource(
