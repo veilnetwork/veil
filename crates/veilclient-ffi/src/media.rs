@@ -1237,7 +1237,9 @@ pub(crate) fn dispatch_inbound_auto(peer: [u8; 32], payload: &[u8]) {
             return;
         }
         #[cfg(feature = "node-embedded")]
-        crate::media_ffi::path_probe_ffi::dispatch_without_lease(payload);
+        if crate::media_ffi::path_probe_ffi::dispatch_without_lease(payload) {
+            return;
+        }
         media_drop_note("no-channel", peer, payload.len());
         return;
     };
@@ -1253,7 +1255,9 @@ fn dispatch_inbound_with_lease(peer: [u8; 32], payload: &[u8], lease: RecvLease)
             return false;
         }
         #[cfg(feature = "node-embedded")]
-        crate::media_ffi::path_probe_ffi::dispatch_without_lease(payload);
+        if crate::media_ffi::path_probe_ffi::dispatch_without_lease(payload) {
+            return false;
+        }
         media_drop_note("seal-open-failed", peer, payload.len());
         return false;
     };

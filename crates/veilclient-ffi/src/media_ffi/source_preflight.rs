@@ -414,6 +414,11 @@ pub(crate) fn dispatch_without_lease(payload: &[u8]) -> bool {
             }
             return true;
         }
+        // Preflight gets the first chance to open the alias. An ordinary
+        // path probe handled here bypasses the path probe's receive trace.
+        if ProbeControl::decode(&plaintext).is_some() {
+            media::trace_sealed_cell("received", &context.peer, payload);
+        }
         if super::path_probe_ffi::dispatch_control(&context.cipher, &plaintext) {
             return true;
         }
