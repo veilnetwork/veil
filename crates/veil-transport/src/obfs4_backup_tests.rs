@@ -264,6 +264,7 @@ async fn unauthenticated_backup_cannot_replace_a_valid_primary() {
 mod initial_ack {
     use super::*;
     use socket2::{SockFilter, SockRef};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
     async fn connected_pair() -> (TransportUri, TcpStream, TcpStream) {
@@ -395,5 +396,59 @@ mod initial_ack {
                 .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn ordered_records_bound_tcp_ack_stalls_after_the_obfs4_proof() {
+        let (uri, client, server) = connected_pair().await;
+        let psk = NodeIdMacKey([42; 32]);
+        let (client, server) = tokio::join!(
+            finish_client_handshake(
+                HandshakeStream::new(client, HandshakeSide::Client),
+                &uri,
+                &psk,
+                WireFormatVariant::V1,
+                Obfs4Dial::Auxiliary,
+            ),
+            veil_obfs4::obfs4_server_accept(server, &psk),
+        );
+        let client = client.unwrap().1;
+        let socket = SockRef::from(client.get_ref().socket())
+            .try_clone()
+            .unwrap();
+        let mut client = boxed_obfs4_io(client);
+        let mut server = server.unwrap();
+
+        // The proof (or an ordinary reliable write) precedes ownership by
+        // the record plane and must leave the socket's default unchanged.
+        client.write_all(b"proof").await.unwrap();
+        client.flush().await.unwrap();
+        let mut proof = [0; 5];
+        server.read_exact(&mut proof).await.unwrap();
+        assert_eq!(&proof, b"proof");
+        assert_eq!(socket.tcp_user_timeout().unwrap(), None);
+
+        let plane = crate::ordered_records::OrderedRecordPlane::new(client);
+        plane.handle().send(b"abc").unwrap();
+        let mut record = [0; 5];
+        tokio::time::timeout(Duration::from_secs(3), server.read_exact(&mut record))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&record, b"\0\x03abc");
+        assert_eq!(
+            socket.tcp_user_timeout().unwrap(),
+            Some(Duration::from_secs(3))
+        );
+
+        // The next record still fits in the local TCP send buffer. Stopping
+        // acknowledgements must retire this child even though flush returns.
+        block_first_flight(server.get_ref());
+        let handle = plane.handle();
+        handle.send(b"lost").unwrap();
+        tokio::time::timeout(Duration::from_secs(8), handle.closed())
+            .await
+            .unwrap();
+        assert_eq!(handle.progress().completed_records, 2);
     }
 }

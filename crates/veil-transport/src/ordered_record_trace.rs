@@ -13,24 +13,13 @@ static ENABLED: OnceLock<bool> = OnceLock::new();
 static ROWS: AtomicU64 = AtomicU64::new(0);
 static NEXT_CHILD: AtomicU64 = AtomicU64::new(1);
 
-tokio::task_local! {
-    // Local writer context, never bytes or a field in the transport protocol.
-    static WRITING_CHILD: u64;
-}
-
-pub(crate) async fn writer_scope<F: std::future::Future>(child: u64, writer: F) -> F::Output {
-    if child == 0 {
-        writer.await
-    } else {
-        WRITING_CHILD.scope(child, writer).await
-    }
-}
-
 pub(crate) fn writing_child() -> Option<u64> {
     if !enabled() {
         return None;
     }
-    WRITING_CHILD.try_with(|child| *child).ok()
+    crate::ordered_records::WRITING_CHILD
+        .try_with(|child| *child)
+        .ok()
 }
 
 // Record stages and their socket bindings share one operator budget.
