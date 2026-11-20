@@ -419,7 +419,7 @@ pub(crate) fn dispatch_without_lease(payload: &[u8]) -> bool {
         if ProbeControl::decode(&plaintext).is_some() {
             media::trace_sealed_cell("received", &context.peer, payload);
         }
-        if super::path_probe_ffi::dispatch_control(&context.cipher, &plaintext) {
+        if super::path_probe_ffi::dispatch_control(&context.cipher, &plaintext, payload) {
             return true;
         }
         return false;
