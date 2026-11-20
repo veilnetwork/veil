@@ -571,6 +571,44 @@ fn candidate_alias_requires_its_sealed_reply_and_never_counts_as_audio() {
 }
 
 #[test]
+fn authenticated_relay_request_wakes_only_the_direct_channel_once() {
+    let _lock = FIXTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut fixture = Fixture::new();
+    let (direct, _) = fixture.channel(ProbeRoute::Direct);
+    let (relay, _) = fixture.channel(ProbeRoute::Relay);
+    let peer = media::cipher_for_test(&DEVICE, &RX, &TX).unwrap();
+    let request = |route| {
+        RouteProbe::begin(route, Instant::now(), Duration::from_millis(600)).request_payload()
+    };
+    assert_eq!(veil_media_channel_take_relay_probe_request(direct), 0);
+    let direct_request = peer.seal(&request(ProbeRoute::Direct)).unwrap();
+    media::dispatch_inbound_auto(PEER, direct_request.as_bytes());
+    assert_eq!(veil_media_channel_take_relay_probe_request(direct), 0);
+
+    let relay_request = peer.seal(&request(ProbeRoute::Relay)).unwrap().into_vec();
+    let mut corrupted = relay_request.clone();
+    *corrupted.last_mut().unwrap() ^= 1;
+    media::dispatch_inbound_auto(PEER_DEVICE, &corrupted);
+    assert_eq!(veil_media_channel_take_relay_probe_request(direct), 0);
+    // The peer's relay alias can receive before the candidate owns the RTP
+    // lease. The observation still belongs to the current direct channel.
+    media::dispatch_inbound_auto(PEER_DEVICE, &relay_request);
+    assert_eq!(veil_media_channel_take_relay_probe_request(relay), 0);
+    assert_eq!(veil_media_channel_take_relay_probe_request(direct), 1);
+    assert_eq!(veil_media_channel_take_relay_probe_request(direct), 0);
+    media::dispatch_inbound_auto(PEER_DEVICE, &relay_request);
+    assert_eq!(veil_media_channel_take_relay_probe_request(direct), 0);
+    let context = MEDIA_CHANNELS.read().unwrap()[&direct]
+        .path_probe
+        .clone()
+        .unwrap();
+    *context.relay_request_at.lock().unwrap() = Some(Instant::now() - RELAY_REQUEST_MAX_AGE);
+    assert_eq!(veil_media_channel_take_relay_probe_request(direct), 0);
+    unsafe { veil_media_close_channel(direct) };
+    assert_eq!(veil_media_channel_take_relay_probe_request(direct), 0);
+}
+
+#[test]
 fn same_relay_candidate_keeps_the_original_receiver_until_rebind() {
     let _lock = FIXTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let old_audio = AtomicUsize::new(0);

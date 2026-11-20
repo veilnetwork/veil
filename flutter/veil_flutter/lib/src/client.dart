@@ -3163,6 +3163,13 @@ class AppHandle implements Finalizable {
     return false;
   }
 
+  /// Consume a fresh authenticated request to probe relay for this channel.
+  bool takeRelayProbeRequest(int chan) {
+    _ensureOpen();
+    return ffi.supportsRelayProbeObservation &&
+        ffi.veilMediaChannelTakeRelayProbeRequest(chan) == 1;
+  }
+
   /// Select the batching wire format on a direct/relay media channel.
   /// [compact] keeps relay cells small; video batches only packets from an
   /// already complete frame. It is valid on relay channels only.
