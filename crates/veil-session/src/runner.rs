@@ -5086,6 +5086,11 @@ impl SessionRunner {
                         if local_datagram_expiry(&envelope)
                             .is_some_and(|deadline| deadline <= std::time::Instant::now())
                         {
+                            crate::local_lossy_trace::cell(
+                                "queue_expired",
+                                outgoing_priority,
+                                outgoing,
+                            );
                             datagram_drained += 1;
                             continue;
                         }
@@ -5298,6 +5303,11 @@ impl SessionRunner {
                             // independent primary also bounds its own backlog.
                             // Relayed cells use neutral capacity admission. Drop this
                             // loss-tolerant cell before sending any fragments.
+                            crate::local_lossy_trace::cell(
+                                "transport_capacity_drop",
+                                outgoing_priority,
+                                outgoing,
+                            );
                             sender_state.trace_admission(
                                 &self.logger,
                                 &self.peer_id,
