@@ -451,4 +451,66 @@ mod initial_ack {
             .unwrap();
         assert_eq!(handle.progress().completed_records, 2);
     }
+
+    async fn opened_obfs4_pair() -> (BoxIoStream, Obfs4Stream<TcpStream>) {
+        let (uri, client, server) = connected_pair().await;
+        let psk = NodeIdMacKey([42; 32]);
+        let (client, server) = tokio::join!(
+            finish_client_handshake(
+                HandshakeStream::new(client, HandshakeSide::Client),
+                &uri,
+                &psk,
+                WireFormatVariant::V1,
+                Obfs4Dial::Canonical,
+            ),
+            veil_obfs4::obfs4_server_accept(server, &psk),
+        );
+        (boxed_obfs4_io(client.unwrap().1), server.unwrap())
+    }
+
+    #[tokio::test]
+    async fn outbound_session_first_flight_retires_an_unacknowledged_socket() {
+        let (mut client, server) = opened_obfs4_pair().await;
+        block_first_flight(server.get_ref());
+        tokio::time::pause();
+        let handshake = with_outbound_session_open(true, async {
+            client.write_all(b"OVL1 test opening").await?;
+            client.flush().await?;
+            client.read_u8().await
+        });
+        let error = tokio::time::timeout(
+            MOBILE_INITIAL_ACK_TIMEOUT + Duration::from_millis(10),
+            handshake,
+        )
+        .await
+        .expect("opening must end before the longer session deadline")
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("no TCP acknowledgement"));
+    }
+
+    #[tokio::test]
+    async fn acknowledged_outbound_session_open_keeps_the_longer_budget() {
+        let (mut client, mut server) = opened_obfs4_pair().await;
+        let delay = MOBILE_INITIAL_ACK_TIMEOUT + Duration::from_millis(350);
+        let client_handshake = with_outbound_session_open(true, async {
+            client.write_all(b"OVL1").await?;
+            client.flush().await?;
+            client.read_u8().await
+        });
+        let server_handshake = async {
+            let mut hello = [0; 4];
+            server.read_exact(&mut hello).await.unwrap();
+            assert_eq!(&hello, b"OVL1");
+            tokio::time::sleep(delay).await;
+            server.write_u8(42).await.unwrap();
+            server.flush().await.unwrap();
+        };
+        let (reply, ()) = tokio::time::timeout(OBFS4_HANDSHAKE_TIMEOUT, async {
+            tokio::join!(client_handshake, server_handshake)
+        })
+        .await
+        .unwrap();
+        assert_eq!(reply.unwrap(), 42);
+    }
 }

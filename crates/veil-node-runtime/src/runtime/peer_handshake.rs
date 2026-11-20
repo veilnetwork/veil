@@ -819,26 +819,29 @@ pub async fn register_connection_session(
         };
         let hs_result = tokio::time::timeout(
             hs_timeout,
-            perform_ovl1_handshake(
-                &mut stream,
-                &runtime.identity.local_identity,
-                role,
-                discovery_mode,
-                None,
-                Some(&mlkem_ek_bytes),
-                Some(&hs_capture),
-                known_remote_id,
-                resume_ticket,
-                ticket_verifier,
-                sovereign_ctx,
-                &local_advertised_transports,
-                anonymity_relay_capable,
-                dht_service,
-                Some(&is_banned_fn),
-                // P-Net Phase 2d: pass the loaded gate from
-                // SessionRuntimeContext. None when public-mode.
-                runtime.network_gate.as_deref(),
-                peer_observed_addr_for_attach,
+            veil_transport::obfs4_tcp::with_outbound_session_open(
+                matches!(source, SessionSource::Outbound(_)),
+                perform_ovl1_handshake(
+                    &mut stream,
+                    &runtime.identity.local_identity,
+                    role,
+                    discovery_mode,
+                    None,
+                    Some(&mlkem_ek_bytes),
+                    Some(&hs_capture),
+                    known_remote_id,
+                    resume_ticket,
+                    ticket_verifier,
+                    sovereign_ctx,
+                    &local_advertised_transports,
+                    anonymity_relay_capable,
+                    dht_service,
+                    Some(&is_banned_fn),
+                    // P-Net Phase 2d: pass the loaded gate from
+                    // SessionRuntimeContext. None when public-mode.
+                    runtime.network_gate.as_deref(),
+                    peer_observed_addr_for_attach,
+                ),
             ),
         )
         .await

@@ -80,6 +80,24 @@ pub(crate) enum Obfs4Dial {
     Auxiliary,
 }
 
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+tokio::task_local! {
+    static OUTBOUND_SESSION_OPEN: ();
+}
+
+/// Bound an unacknowledged first OVL1 flight on Android obfs4. Other
+/// transports, inbound opens and the registered session keep their deadlines.
+pub async fn with_outbound_session_open<F: std::future::Future>(
+    _outbound: bool,
+    handshake: F,
+) -> F::Output {
+    #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+    if _outbound {
+        return OUTBOUND_SESSION_OPEN.scope((), handshake).await;
+    }
+    handshake.await
+}
+
 // A black-holed TCP flow need not imply that another flow to the same address
 // is broken. Race at most one delayed candidate; keep a slow valid primary,
 // and never spawn a detached task. The caller owns the unchanged TOTAL budget.
@@ -394,6 +412,10 @@ struct Obfs4IoStream {
     write_trace: super::tcp_trace::WriteTrace,
     #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
     ordered_timeout_configured: bool,
+    #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+    session_open_started: bool,
+    #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+    session_open_ack: Option<super::tcp_trace::InitialAckDeadline>,
 }
 
 impl Obfs4IoStream {
@@ -405,6 +427,10 @@ impl Obfs4IoStream {
             write_trace,
             #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
             ordered_timeout_configured: false,
+            #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+            session_open_started: false,
+            #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+            session_open_ack: None,
         }
     }
 
@@ -424,7 +450,26 @@ impl tokio::io::AsyncRead for Obfs4IoStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+        let result = std::pin::Pin::new(&mut self.stream).poll_read(cx, buf);
+        #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+        if let Some(ack) = &mut self.session_open_ack
+            && (!result.is_pending() || ack.expired(cx))
+        {
+            let ack = self
+                .session_open_ack
+                .take()
+                .expect("polled first-flight deadline");
+            if result.is_pending()
+                && OUTBOUND_SESSION_OPEN.try_with(|_| ()).is_ok()
+                && ack.no_ack_progress(self.stream.get_ref().initial_ack_bytes())
+            {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "no TCP acknowledgement for the first OVL1 flight",
+                )));
+            }
+        }
+        result
     }
 }
 
@@ -434,6 +479,13 @@ impl tokio::io::AsyncWrite for Obfs4IoStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
+        #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+        if !self.session_open_started && OUTBOUND_SESSION_OPEN.try_with(|_| ()).is_ok() {
+            self.session_open_started = true;
+            self.session_open_ack = self.stream.get_ref().initial_ack_bytes().map(|baseline| {
+                super::tcp_trace::InitialAckDeadline::new(baseline, MOBILE_INITIAL_ACK_TIMEOUT)
+            });
+        }
         #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
         if !self.ordered_timeout_configured
             && crate::ordered_records::WRITING_CHILD

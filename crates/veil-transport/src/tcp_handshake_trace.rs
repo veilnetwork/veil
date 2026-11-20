@@ -14,9 +14,27 @@ use tokio::net::TcpStream;
 use super::{ConnectTraceContext, KernelSnapshot, NEXT_CONNECTION, SocketMetadata, enabled_cell};
 
 #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
-struct InitialAckDeadline {
+pub(crate) struct InitialAckDeadline {
     baseline: u64,
     timer: Pin<Box<tokio::time::Sleep>>,
+}
+
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+impl InitialAckDeadline {
+    pub(crate) fn new(baseline: u64, timeout: std::time::Duration) -> Self {
+        Self {
+            baseline,
+            timer: Box::pin(tokio::time::sleep(timeout)),
+        }
+    }
+
+    pub(crate) fn expired(&mut self, cx: &mut Context<'_>) -> bool {
+        std::future::Future::poll(self.timer.as_mut(), cx).is_ready()
+    }
+
+    pub(crate) fn no_ack_progress(&self, acknowledged: Option<u64>) -> bool {
+        acknowledged == Some(self.baseline)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -156,15 +174,14 @@ impl HandshakeStream {
 
     #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
     pub(crate) fn with_initial_ack_deadline(mut self, timeout: std::time::Duration) -> Self {
-        self.initial_ack = self.initial_ack_bytes().map(|baseline| InitialAckDeadline {
-            baseline,
-            timer: Box::pin(tokio::time::sleep(timeout)),
-        });
+        self.initial_ack = self
+            .initial_ack_bytes()
+            .map(|baseline| InitialAckDeadline::new(baseline, timeout));
         self
     }
 
     #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
-    fn initial_ack_bytes(&self) -> Option<u64> {
+    pub(crate) fn initial_ack_bytes(&self) -> Option<u64> {
         #[cfg(test)]
         if let Some(bytes) = self.test_ack_bytes {
             return Some(bytes);

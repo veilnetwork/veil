@@ -17,6 +17,8 @@ use tokio::net::TcpStream;
 
 #[path = "tcp_handshake_trace.rs"]
 mod handshake;
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+pub(crate) use handshake::InitialAckDeadline;
 pub(crate) use handshake::{HandshakeSide, HandshakeStream};
 
 #[cfg(any(target_os = "linux", target_os = "android", test))]
