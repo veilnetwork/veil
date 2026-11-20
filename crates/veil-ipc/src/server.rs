@@ -2708,41 +2708,39 @@ async fn handle_ipc_client(
                                         Some((bodies, work)) => (bodies.into_iter().map(veil_bufpool::pooled_shared_from_vec).collect::<Vec<_>>(), Some(work)),
                                         None => (vec![body_owned.into_shared()], None),
                                     };
-                                    let turn_waited = std::time::Instant::now();
-                                    let _turn = match veil_proto::AppIpcSendPayload::decode(
-                                        &bodies[0],
-                                    ) {
-                                        Ok(send) => Some(gates.enter(send.dst_node_id).await),
-                                        Err(_) => None,
-                                    };
-                                    let turn_ms = turn_waited.elapsed().as_millis();
-                                    if turn_ms >= 200 {
-                                        log::warn!(
-                                            "ipc.send_turn_wait at={} ms={turn_ms}",
-                                            veil_util::unix_secs_now_u64()
-                                        );
-                                    }
-                                    let waited = std::time::Instant::now();
-                                    let _permit = sem.acquire_owned().await;
-                                    let waited_ms = waited.elapsed().as_millis();
-                                    if waited_ms >= 1_000 {
-                                        // Every send slot of this connection was
-                                        // busy: whatever holds them is the stall.
-                                        log::warn!(
-                                            "ipc.send_permit_wait at={} ms={waited_ms}",
-                                            veil_util::unix_secs_now_u64()
-                                        );
-                                    }
-                                    let mut sink =
-                                        crate::handlers::send::SendReply::Offloop(reply_tx);
-                                    for (index, body) in bodies.iter().enumerate() {
-                                        ctx.local_work = work.as_ref().and_then(|work| work.cell(index));
-                                        if let Err(e) = crate::handlers::send::handle_ipc_send(&mut sink, body, &ctx).await {
-                                            if let Some(cell) = &ctx.local_work { cell.reject(); }
-                                            log::warn!("ipc send job ended: {e}");
-                                            break;
+                                    let decoded = veil_proto::AppIpcSendPayload::decode(&bodies[0]);
+                                    let flags = bodies[0]
+                                        .get(veil_proto::AppIpcSendPayload::FLAGS_RANGE)
+                                        .and_then(|bytes| bytes.try_into().ok())
+                                        .map(u32::from_be_bytes)
+                                        .unwrap_or_default();
+                                    let bounded_flag = veil_proto::ipc::IPC_SEND_FLAG_LOCAL_BOUNDED_RELIABLE;
+                                    let deadline = if flags & bounded_flag != 0 {
+                                        // The host owns retries. Exclude reply blocks, peer ACKs,
+                                        // source batches and any change to the ordinary wire path.
+                                        if flags != bounded_flag || work.is_some() ||
+                                            !decoded.as_ref().is_ok_and(|send| send.data.len()
+                                                <= veil_proto::ipc::LOCAL_BOUNDED_RELIABLE_MAX_BYTES)
+                                        {
+                                            return;
                                         }
-                                    }
+                                        Some(tokio::time::Instant::from_std(ctx.source_received_at)
+                                            + veil_proto::ipc::LOCAL_BOUNDED_RELIABLE_MAX_AGE)
+                                    } else {
+                                        None
+                                    };
+                                    let destination = decoded.ok().map(|send| send.dst_node_id);
+                                    crate::send_gates::run_send_job(&gates, sem, destination, deadline, async move {
+                                        let mut sink = crate::handlers::send::SendReply::Offloop(reply_tx);
+                                        for (index, body) in bodies.iter().enumerate() {
+                                            ctx.local_work = work.as_ref().and_then(|work| work.cell(index));
+                                            if let Err(e) = crate::handlers::send::handle_ipc_send(&mut sink, body, &ctx).await {
+                                                if let Some(cell) = &ctx.local_work { cell.reject(); }
+                                                log::warn!("ipc send job ended: {e}");
+                                                break;
+                                            }
+                                        }
+                                    }).await;
                                 });
                             } else {
                                 crate::route_trace::sealed_local_sample(

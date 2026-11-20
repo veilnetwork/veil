@@ -873,6 +873,43 @@ impl AppSender {
             .await
     }
 
+    /// Submit a reliable live copy backed by an application-level retry.
+    /// The daemon applies its own deadline from IPC receipt.
+    pub async fn send_bounded_reliable(
+        &self,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        data: &[u8],
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ClientError> {
+        if data.len() > veil_proto::ipc::LOCAL_BOUNDED_RELIABLE_MAX_BYTES {
+            return Err(ClientError::Protocol(
+                "bounded reliable payload too large".into(),
+            ));
+        }
+        let submitted = self
+            .writer
+            .write_app_ipc_send_on_local_lane_before_owned(
+                veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
+                &dst_node_id,
+                &self.app_id,
+                &dst_app_id,
+                dst_endpoint_id,
+                veil_proto::ipc::IPC_SEND_FLAG_LOCAL_BOUNDED_RELIABLE,
+                data,
+                deadline,
+                None,
+            )
+            .await?;
+        if !submitted {
+            return Err(ClientError::Protocol(
+                "bounded reliable send expired".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Send a loss-tolerant datagram through the non-onion Delivery relay path
     /// at REALTIME priority, even if a direct session also exists.
     pub async fn send_relay_realtime_owned(
