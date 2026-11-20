@@ -421,6 +421,9 @@ impl SessionTxRegistry {
 
         let (tx, mut rx) =
             frame_channel_with_source_activity(self.capacity, Arc::clone(&self.source_activity));
+        if let Some(status) = rx.local_datagram_status() {
+            status.set_runner_starting(true);
+        }
         self.latest_registration = NEXT_TX_REGISTRATION.fetch_add(1, Ordering::Relaxed);
         self.senders.insert(
             peer_id,

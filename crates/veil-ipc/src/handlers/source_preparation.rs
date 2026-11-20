@@ -43,27 +43,25 @@ pub(crate) fn prepare(
         // client's bounded preparation poll alive until one is available.
         return State::Warming;
     }
-    let mut result = State::Ready;
-    let mut any_ready = false;
+    let mut result = if request.relayed {
+        State::Unsupported
+    } else {
+        State::Ready
+    };
     for peer in peers {
         let state =
             registry.prepare_local_datagram_channel(&peer, request.local_lane, request.refresh);
-        any_ready |= state == State::Ready;
         // Request every candidate, even if an earlier one cannot prepare.
-        result = match (result, state) {
-            (State::Unsupported, _) | (_, State::Unsupported) => State::Unsupported,
-            (State::Warming, _) | (_, State::Warming) => State::Warming,
-            _ => State::Ready,
+        // Relayed sends use the best available hop. Direct aliases must
+        // cover every device. States are ordered Unsupported < Warming < Ready.
+        let rank = |state: &State| *state as u8;
+        result = if request.relayed {
+            std::cmp::max_by_key(result, state, rank)
+        } else {
+            std::cmp::min_by_key(result, state, rank)
         };
     }
-    // Relayed sends prefer a ready first hop, so its local readiness is
-    // enough to start probing delivery. Direct aliases still cover every
-    // device. The relay's readiness does not attest to end-to-end delivery.
-    if request.relayed && any_ready {
-        State::Ready
-    } else {
-        result
-    }
+    result
 }
 
 #[cfg(test)]
@@ -188,6 +186,26 @@ mod tests {
                     other
                 );
             }
+        }
+    }
+
+    #[test]
+    fn relay_preparation_keeps_warming_when_a_different_hop_is_unsupported() {
+        for (first, second) in [
+            (State::Unsupported, State::Warming),
+            (State::Warming, State::Unsupported),
+        ] {
+            let mut r = registry(first);
+            r.alternate = Some(([3; 32], second));
+            assert_eq!(
+                prepare(&request(true).encode(), true, |_| true, Some(&r), None),
+                State::Warming
+            );
+            assert_eq!(r.calls.lock().unwrap().len(), 2);
+            assert_eq!(
+                prepare(&request(false).encode(), true, |_| true, Some(&r), None),
+                State::Unsupported
+            );
         }
     }
 

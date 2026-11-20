@@ -34,6 +34,7 @@ pub(crate) struct LocalDatagramStatus {
 struct State {
     owner: Weak<()>,
     transport_owner: Weak<()>,
+    runner_starting: bool,
     neutral_forwards: bool,
     supported: u8,
     ready: u8,
@@ -49,6 +50,10 @@ fn bit(local_lane: u8) -> Option<u8> {
 }
 
 impl LocalDatagramStatus {
+    pub(crate) fn set_runner_starting(&self, starting: bool) {
+        lock!(self.state).runner_starting = starting;
+    }
+
     pub(crate) fn framing(&self, local_lane: u8) -> Option<crate::LocalPacketFraming> {
         let index = LOCAL_SOURCE_PRIORITIES
             .iter()
@@ -93,32 +98,39 @@ impl LocalDatagramStatus {
     }
 
     pub(crate) fn request(&self, local_lane: u8) -> LocalDatagramChannelState {
-        let current = self.state(local_lane);
-        if current == LocalDatagramChannelState::Warming {
-            if let Some(bit) = bit(local_lane) {
-                lock!(self.state).requested |= bit;
-            }
-            self.notify.notify_one();
-        }
-        current
+        self.prepare(local_lane, false)
     }
 
     /// A new caller must not reuse a Ready snapshot left by an idle/closed
     /// child. Require a runner check before subsequent polling can see Ready.
     pub(crate) fn request_fresh(&self, local_lane: u8) -> LocalDatagramChannelState {
+        self.prepare(local_lane, true)
+    }
+
+    fn prepare(&self, local_lane: u8, refresh: bool) -> LocalDatagramChannelState {
+        use LocalDatagramChannelState::{Ready, Unsupported, Warming};
         let Some(bit) = bit(local_lane) else {
-            return LocalDatagramChannelState::Unsupported;
+            return Unsupported;
         };
         let mut state = lock!(self.state);
-        if state.owner.strong_count() == 0 || state.supported & bit == 0 {
-            return LocalDatagramChannelState::Unsupported;
+        // A registered session may be visible before the runner installs
+        // its source lease. Keep preparation polling during that interval.
+        if state.runner_starting {
+            return Warming;
         }
-        state.ready &= !bit;
-        state.framing[bit.trailing_zeros() as usize] = None;
+        if state.owner.strong_count() == 0 || state.supported & bit == 0 {
+            return Unsupported;
+        }
+        if refresh {
+            state.ready &= !bit;
+            state.framing[bit.trailing_zeros() as usize] = None;
+        } else if state.ready & bit != 0 {
+            return Ready;
+        }
         state.requested |= bit;
         drop(state);
         self.notify.notify_one();
-        LocalDatagramChannelState::Warming
+        Warming
     }
 
     pub(crate) fn pending(&self) -> u8 {

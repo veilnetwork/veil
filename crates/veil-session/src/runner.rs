@@ -4452,6 +4452,11 @@ impl SessionRunner {
             _ => None,
         };
 
+        // The presence or absence of a local source lease is now known.
+        if let Some(status) = &local_datagram_status {
+            status.set_runner_starting(false);
+        }
+
         if realtime_lane
             .as_ref()
             .and_then(|lane| lane.parallel.as_ref())
