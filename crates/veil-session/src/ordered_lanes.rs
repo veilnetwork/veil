@@ -150,12 +150,16 @@ async fn connect(
     offer: ParallelOrderedOffer,
     parent: ParallelParentHandle,
     context: RealtimeReceiverContext,
+    connected_at: Option<&mut Option<std::time::Instant>>,
 ) -> Result<Ready, &'static str> {
     let connection = offer
         .handle
         .connect()
         .await
         .map_err(|_| "ordered child connect failed")?;
+    if let Some(connected_at) = connected_at {
+        *connected_at = Some(std::time::Instant::now());
+    }
     let exporter = connection
         .stream_channel_binding()
         .ok_or("ordered child binding unavailable")?;
@@ -305,8 +309,25 @@ fn worker(
                                 warming[index] = true;
                                 let offer = offer.clone(); let parent = parent.clone(); let context = context.clone();
                                 let task = attempts.spawn(async move {
-                                    let result = tokio::time::timeout(BIND_TIMEOUT, connect(offer, parent, context)).await
+                                    let trace = crate::rt_trace::stage_start().map(|started| {
+                                        (started, context.logger.clone(), context.peer_id)
+                                    });
+                                    let mut connected_at = None;
+                                    let result = tokio::time::timeout(
+                                        BIND_TIMEOUT,
+                                        connect(offer, parent, context, trace.is_some().then_some(&mut connected_at)),
+                                    ).await
                                         .unwrap_or(Err("ordered child binding timeout"));
+                                    if let Some((started, logger, peer)) = trace {
+                                        let elapsed_ms = started.elapsed().as_millis();
+                                        let transport_ms = connected_at.map(|at| (at - started).as_millis());
+                                        let bind_ms = connected_at.map(|at| at.elapsed().as_millis());
+                                        let outcome = result.as_ref().map_or_else(|reason| *reason, |_| "ready");
+                                        logger.info(
+                                            "session.rt_trace.ordered_child_open",
+                                            format!("peer_id={} elapsed_ms={elapsed_ms} transport_ms={transport_ms:?} bind_ms={bind_ms:?} outcome={outcome:?}", hex_short(&peer)),
+                                        );
+                                    }
                                     (index, result)
                                 });
                                 attempt_slots.insert(task.id(), index);
