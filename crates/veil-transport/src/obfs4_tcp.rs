@@ -71,8 +71,8 @@ const MOBILE_INITIAL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::fro
 // A loss-tolerant ordered child can be replaced independently. Bound TCP's
 // unacknowledged backlog on that socket after the record codec takes over,
 // even when writes and flushes still fit in the kernel's send buffer.
-#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
-const MOBILE_ORDERED_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+#[cfg(any(target_os = "android", target_os = "linux"))]
+const ORDERED_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Clone, Copy)]
 pub(crate) enum Obfs4Dial {
@@ -410,7 +410,7 @@ impl TransportListener for Obfs4TcpListener {
 struct Obfs4IoStream {
     stream: Obfs4Stream<HandshakeStream>,
     write_trace: super::tcp_trace::WriteTrace,
-    #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     ordered_timeout_configured: bool,
     #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
     session_open_started: bool,
@@ -425,7 +425,7 @@ impl Obfs4IoStream {
         Self {
             stream,
             write_trace,
-            #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             ordered_timeout_configured: false,
             #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
             session_open_started: false,
@@ -486,7 +486,7 @@ impl tokio::io::AsyncWrite for Obfs4IoStream {
                 super::tcp_trace::InitialAckDeadline::new(baseline, MOBILE_INITIAL_ACK_TIMEOUT)
             });
         }
-        #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         if !self.ordered_timeout_configured
             && crate::ordered_records::WRITING_CHILD
                 .try_with(|_| ())
@@ -494,7 +494,7 @@ impl tokio::io::AsyncWrite for Obfs4IoStream {
         {
             self.ordered_timeout_configured = true;
             if let Err(error) = socket2::SockRef::from(self.stream.get_ref().socket())
-                .set_tcp_user_timeout(Some(MOBILE_ORDERED_ACK_TIMEOUT))
+                .set_tcp_user_timeout(Some(ORDERED_ACK_TIMEOUT))
             {
                 log::debug!("ordered obfs4 TCP timeout unavailable: {error}");
             }
