@@ -1154,6 +1154,15 @@ pub(crate) fn trace_sealed_cell(stage: &str, peer: &[u8; 32], payload: &[u8]) {
     trace_sealed_cell_with_source_queue(stage, peer, payload, None);
 }
 
+pub(crate) fn sealed_trace_header(payload: &[u8]) -> Option<(u64, u64)> {
+    if payload.len() < MEDIA_SEALED_HEADER_LEN || !payload.starts_with(&MEDIA_SEALED_MAGIC) {
+        return None;
+    }
+    let epoch = u64::from_be_bytes(payload[4..12].try_into().unwrap());
+    let seq = u64::from_be_bytes(payload[12..20].try_into().unwrap());
+    Some((epoch, seq))
+}
+
 /// Source-local cumulative age up to the send pump. No wire field or relay
 /// metadata is added; None means this stage has no source-queue observation.
 pub(crate) fn trace_sealed_cell_with_source_queue(
@@ -1162,14 +1171,12 @@ pub(crate) fn trace_sealed_cell_with_source_queue(
     payload: &[u8],
     source_queue_max_us: Option<u64>,
 ) {
-    if !veil_session::rt_trace::rt_trace_enabled()
-        || payload.len() < MEDIA_SEALED_HEADER_LEN
-        || !payload.starts_with(&MEDIA_SEALED_MAGIC)
-    {
+    if !veil_session::rt_trace::rt_trace_enabled() {
         return;
     }
-    let epoch = u64::from_be_bytes(payload[4..12].try_into().unwrap());
-    let seq = u64::from_be_bytes(payload[12..20].try_into().unwrap());
+    let Some((epoch, seq)) = sealed_trace_header(payload) else {
+        return;
+    };
     // Include the first sealed candidate probe as well as periodic RTP.
     #[cfg(feature = "node-embedded")]
     let sampled = veil_util::sealed_trace::sample(seq);
@@ -1273,7 +1280,7 @@ fn dispatch_inbound_with_lease(peer: [u8; 32], payload: &[u8], lease: RecvLease)
         return true;
     }
     #[cfg(feature = "node-embedded")]
-    if crate::media_ffi::path_probe_ffi::dispatch_control(&lease.cipher, &plaintext) {
+    if crate::media_ffi::path_probe_ffi::dispatch_control(&lease.cipher, &plaintext, payload) {
         return true;
     }
     #[cfg(feature = "node-embedded")]

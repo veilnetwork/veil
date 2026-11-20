@@ -34,6 +34,24 @@ pub(super) struct PathProbeContext {
     echo_slot: Arc<tokio::sync::Semaphore>,
 }
 
+/// Join the already sampled sealed request and reply in the local trace.
+/// Never record the challenge token or derive a destination from the packet.
+fn trace_echo(
+    request: Option<(u64, u64)>,
+    route: ProbeRoute,
+    outcome: &str,
+    reply: Option<(u64, u64)>,
+) {
+    let Some((epoch, seq)) = request else { return };
+    let reply = reply.map_or_else(
+        || "none".to_owned(),
+        |(epoch, seq)| format!("{epoch:016x}/{seq}"),
+    );
+    log::info!(
+        "media.path_probe echo request={epoch:016x}/{seq} reply={reply} route={route:?} outcome={outcome}"
+    );
+}
+
 impl PathProbeContext {
     /// Both addresses are pinned by trusted host call state, never learned
     /// from an incoming packet. The peer's sending route is independent of
@@ -73,7 +91,7 @@ impl PathProbeContext {
         }
     }
 
-    fn echo(self: &Arc<Self>, control: ProbeControl) -> bool {
+    fn echo(self: &Arc<Self>, control: ProbeControl, request: Option<(u64, u64)>) -> bool {
         let Some(reply) = control.reply() else {
             return false;
         };
@@ -81,12 +99,15 @@ impl PathProbeContext {
             return false;
         }
         let Ok(permit) = Arc::clone(&self.echo_slot).try_acquire_owned() else {
+            trace_echo(request, reply.route, "busy", None);
             return true;
         };
         let now = Instant::now();
         {
             let mut last = self.last_echo.lock().unwrap_or_else(|p| p.into_inner());
             if last.is_some_and(|last| now.duration_since(last) < Duration::from_millis(200)) {
+                drop(last);
+                trace_echo(request, reply.route, "throttled", None);
                 return true;
             }
             *last = Some(now);
@@ -96,31 +117,37 @@ impl PathProbeContext {
         self.replies[index].app.bundle.runtime.spawn(async move {
             let _permit = permit;
             if !context.live() {
+                trace_echo(request, reply.route, "retired", None);
                 return;
             }
             let Some(sealed) = context
                 .cipher
                 .seal_on_plane(media::LocalMediaPlane::Primary, &reply.encode())
             else {
+                trace_echo(request, reply.route, "seal_failed", None);
                 return;
             };
             let deadline = tokio::time::Instant::now() + MEDIA_LOCAL_QUEUE_AGE;
             let sealed = sealed.with_local_deadline(deadline);
+            let reply_id = request.and_then(|_| media::sealed_trace_header(sealed.as_bytes()));
             let path = &context.replies[index];
             let Some(guard) = sealed.lock_while_fresh(&path.app.sender).await else {
+                trace_echo(request, reply.route, "sender_lock_expired", reply_id);
                 return;
             };
             if !context.live() {
+                trace_echo(request, reply.route, "retired", reply_id);
                 return;
             }
             let Some(sender) = guard.as_ref() else {
+                trace_echo(request, reply.route, "sender_closed", reply_id);
                 return;
             };
             // Force the requested candidate path in BOTH directions. Echoing
             // over the current sender would certify an untested reverse path.
-            match reply.route {
+            let result = match reply.route {
                 ProbeRoute::Direct => {
-                    let _ = sender
+                    sender
                         .send_rt_data_on_local_lane_before(
                             veil_proto::priority::REALTIME,
                             path.peer,
@@ -135,10 +162,10 @@ impl PathProbeContext {
                             sealed.as_bytes(),
                             deadline,
                         )
-                        .await;
+                        .await
                 }
                 ProbeRoute::Relay => {
-                    let _ = sender
+                    sender
                         .send_relay_media_sealed_on_local_lane_before_tracked_owned(
                             veil_proto::priority::REALTIME,
                             path.peer,
@@ -148,9 +175,15 @@ impl PathProbeContext {
                             deadline,
                             None,
                         )
-                        .await;
+                        .await
                 }
-            }
+            };
+            let outcome = match result {
+                Ok(true) => "ipc_accepted",
+                Ok(false) => "ipc_expired",
+                Err(_) => "ipc_failed",
+            };
+            trace_echo(request, reply.route, outcome, reply_id);
         });
         true
     }
@@ -380,19 +413,34 @@ pub(super) fn preparation_reply_path(
 
 /// Called only after the existing seal opened. Controls never reach the
 /// WebRTC callback or activity metrics. Their plaintext/nonce is never logged.
-pub(crate) fn dispatch_control(cipher: &media::MediaCipher, plaintext: &[u8]) -> bool {
+pub(crate) fn dispatch_control(
+    cipher: &media::MediaCipher,
+    plaintext: &[u8],
+    sealed: &[u8],
+) -> bool {
     if !plaintext.starts_with(crate::media_path_probe::MAGIC) {
         return false;
     }
     let Some(control) = ProbeControl::decode(plaintext) else {
         return true;
     };
-    let matching = contexts()
-        .into_iter()
-        .filter(|context| context.live() && context.cipher.same_receive_key(cipher));
+    let mut matching = contexts();
+    matching.retain(|context| context.live() && context.cipher.same_receive_key(cipher));
     if control.reply().is_some() {
+        // The decrypting channel owns this receive leg. A warming or retiring
+        // sibling can share its key but has independent echo admission.
+        if let Some(owner) = matching
+            .iter()
+            .position(|context| std::ptr::eq(context.cipher.as_ref(), cipher))
+        {
+            matching.swap(0, owner);
+        }
+        let request = veil_session::rt_trace::rt_trace_enabled()
+            .then(|| media::sealed_trace_header(sealed))
+            .flatten()
+            .filter(|&(_, seq)| veil_util::sealed_trace::sample(seq));
         for context in matching {
-            if context.echo(control) {
+            if context.echo(control, request) {
                 break;
             }
         }
@@ -424,7 +472,7 @@ pub(crate) fn dispatch_without_lease(payload: &[u8]) -> bool {
                     payload,
                 );
             }
-            return dispatch_control(&context.cipher, &plaintext);
+            return dispatch_control(&context.cipher, &plaintext, payload);
         }
     }
     false

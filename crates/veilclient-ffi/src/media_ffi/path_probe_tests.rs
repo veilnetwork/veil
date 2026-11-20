@@ -807,6 +807,67 @@ fn preparation_cannot_borrow_another_channels_pinned_paths() {
 }
 
 #[test]
+fn the_receive_owner_answers_even_if_an_alternate_context_is_busy() {
+    let _lock = FIXTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let deliveries = AtomicUsize::new(0);
+    let mut fixture = Fixture::new();
+    let (direct, _) = fixture.channel(ProbeRoute::Direct);
+    let (relay, _) = fixture.channel(ProbeRoute::Relay);
+    let direct_context = Arc::clone(
+        MEDIA_CHANNELS.read().unwrap()[&direct]
+            .path_probe
+            .as_ref()
+            .unwrap(),
+    );
+    let alternate = contexts()
+        .into_iter()
+        .find(|c| c.cipher.same_receive_key(&direct_context.cipher))
+        .unwrap();
+    let owner = if Arc::ptr_eq(&alternate, &direct_context) {
+        relay
+    } else {
+        direct
+    };
+    let owner_context = Arc::clone(
+        MEDIA_CHANNELS.read().unwrap()[&owner]
+            .path_probe
+            .as_ref()
+            .unwrap(),
+    );
+    let _busy = Arc::clone(&alternate.echo_slot)
+        .try_acquire_owned()
+        .unwrap();
+    assert_eq!(
+        unsafe {
+            veil_media_set_recv_callback(
+                owner,
+                Some(count_media),
+                (&deliveries as *const AtomicUsize).cast_mut().cast(),
+            )
+        },
+        0
+    );
+    let peer = media::cipher_for_test(&DEVICE, &RX, &TX).unwrap();
+    let mut probe = RouteProbe::begin(ProbeRoute::Relay, Instant::now(), Duration::from_secs(2));
+    let request = peer.seal(&probe.request_payload()).unwrap().into_vec();
+    media::dispatch_inbound_auto(PEER_DEVICE, &request);
+    assert!(owner_context.last_echo.lock().unwrap().is_some());
+    assert!(alternate.last_echo.lock().unwrap().is_none());
+    let (_, _, bytes) = fixture
+        .captured
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    let forward = veil_proto::delivery::ForwardPayload::decode(&bytes[HEADER_SIZE..]).unwrap();
+    assert_eq!(forward.envelope.recipient.node_id, PEER_DEVICE);
+    let reply = ProbeControl::decode(&peer.open(&forward.envelope.payload).unwrap()).unwrap();
+    assert!(matches!(
+        probe.observe(reply, Instant::now()),
+        ProbeStatus::Qualified(_)
+    ));
+    assert_eq!(deliveries.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn a_relay_request_uses_a_neutral_relay_echo_even_while_direct_is_active() {
     let _lock = FIXTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut fixture = Fixture::new();
