@@ -400,6 +400,15 @@ mod initial_ack {
 
     #[tokio::test]
     async fn ordered_records_bound_tcp_ack_stalls_after_the_obfs4_proof() {
+        ordered_records_ack_stall(false).await;
+    }
+
+    #[tokio::test]
+    async fn ordered_records_retire_without_a_kernel_ack_deadline() {
+        ordered_records_ack_stall(true).await;
+    }
+
+    async fn ordered_records_ack_stall(disable_kernel_deadline: bool) {
         let (uri, client, server) = connected_pair().await;
         let psk = NodeIdMacKey([42; 32]);
         let (client, server) = tokio::join!(
@@ -441,14 +450,20 @@ mod initial_ack {
             Some(Duration::from_secs(3))
         );
 
+        if disable_kernel_deadline {
+            // Model a kernel that offers no timely timeout notification.
+            // The connected TCP stream and its ACK measurements stay real.
+            socket.set_tcp_user_timeout(None).unwrap();
+        }
+
         // The next record still fits in the local TCP send buffer. Stopping
         // acknowledgements must retire this child even though flush returns.
         block_first_flight(server.get_ref());
         let handle = plane.handle();
         handle.send(b"lost").unwrap();
-        tokio::time::timeout(Duration::from_secs(8), handle.closed())
+        tokio::time::timeout(Duration::from_secs(5), handle.closed())
             .await
-            .unwrap();
+            .expect("the stalled child must retire after ACK progress stops");
         assert_eq!(handle.progress().completed_records, 2);
     }
 

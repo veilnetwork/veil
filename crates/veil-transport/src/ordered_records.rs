@@ -39,6 +39,11 @@ tokio::task_local! {
     pub(crate) static WRITING_CHILD: u64;
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+tokio::task_local! {
+    pub(crate) static READING_CHILD: ();
+}
+
 /// Exact local queue reservation, including the framing prefix and the tiny
 /// record metadata floor. Session admission must use this rather than payload
 /// length alone; it is not a wire bandwidth or delivery acknowledgement.
@@ -391,8 +396,11 @@ impl OrderedRecordPlane {
         let (read, write) = tokio::io::split(stream);
         let child = handle.local_trace_id();
         let writer = write_records(write, out_rx, handle.clone(), write_timeout);
+        let reader = read_records(read, handle.clone());
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        let reader = READING_CHILD.scope((), reader);
         let tasks = [
-            tokio::spawn(read_records(read, handle.clone())),
+            tokio::spawn(reader),
             tokio::spawn(async move {
                 if child != 0 || cfg!(any(target_os = "android", target_os = "linux")) {
                     WRITING_CHILD.scope(child, writer).await;
