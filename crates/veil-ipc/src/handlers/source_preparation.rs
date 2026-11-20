@@ -39,7 +39,9 @@ pub(crate) fn prepare(
         }
     };
     if peers.is_empty() {
-        return State::Unsupported;
+        // A relay can register after a local network change. Keep the
+        // client's bounded preparation poll alive until one is available.
+        return State::Warming;
     }
     let mut result = State::Ready;
     let mut any_ready = false;
@@ -74,6 +76,7 @@ mod tests {
         state: State,
         alternate: Option<([u8; 32], State)>,
         datagram_hop: Option<[u8; 32]>,
+        active: Vec<[u8; 32]>,
     }
     impl FrameBroadcaster for Registry {
         fn has_neutral_forward_datagram_transport(&self, peer: &[u8; 32]) -> bool {
@@ -95,7 +98,7 @@ mod tests {
             panic!("preparation must not broadcast a packet")
         }
         fn active_node_ids(&self) -> Vec<[u8; 32]> {
-            vec![[2; 32], [3; 32], [4; 32]]
+            self.active.clone()
         }
         fn devices_of(&self, id: &[u8; 32]) -> Vec<[u8; 32]> {
             if *id == [8; 32] {
@@ -120,7 +123,30 @@ mod tests {
             state,
             alternate: None,
             datagram_hop: None,
+            active: vec![[2; 32], [3; 32], [4; 32]],
         }
+    }
+
+    #[test]
+    fn relay_preparation_can_wait_for_the_first_live_hop() {
+        let mut r = registry(State::Ready);
+        let mut req = request(true);
+        req.local_lane = veil_proto::priority::REALTIME;
+        // The destination can remain connected while every relay reconnects.
+        r.active = vec![req.peer_node_id];
+        assert_eq!(
+            prepare(&req.encode(), true, |_| true, Some(&r), None),
+            State::Warming
+        );
+        assert!(r.calls.lock().unwrap().is_empty());
+
+        r.active.push([2; 32]);
+        req.refresh = false;
+        assert_eq!(
+            prepare(&req.encode(), true, |_| true, Some(&r), None),
+            State::Ready
+        );
+        assert_eq!(*r.calls.lock().unwrap(), vec![([2; 32], req.local_lane)]);
     }
 
     #[test]
