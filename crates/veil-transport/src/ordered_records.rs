@@ -32,6 +32,7 @@ pub const RECORD_RECEIVE_MAX_AGE: Duration = Duration::from_millis(200);
 // keeps its source slot unusable. Apply the same bounded lifetime to every
 // record; there is no producer-specific transport policy or wire deadline.
 const WRITE_COMPLETION_TIMEOUT: Duration = RECORD_RECEIVE_MAX_AGE;
+const FIRST_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(1);
 
 tokio::task_local! {
     // Local context for the loss-tolerant writer. The value is zero when
@@ -107,6 +108,7 @@ pub enum RecordCloseReason {
     WriteError,
     WriteZero,
     PartialRecordExpired,
+    FirstWriteStalled,
     WriteTimeout,
     WriterEnded,
     TaskEnded,
@@ -124,6 +126,7 @@ impl RecordCloseReason {
             Self::WriteError => "write_error",
             Self::WriteZero => "write_zero",
             Self::PartialRecordExpired => "partial_record_expired",
+            Self::FirstWriteStalled => "first_write_stalled",
             Self::WriteTimeout => "write_timeout",
             Self::WriterEnded => "writer_ended",
             Self::TaskEnded => "task_ended",
@@ -535,6 +538,8 @@ async fn write_records<W: tokio::io::AsyncWrite + Unpin>(
 ) {
     let _close = CloseOnExit(handle.clone());
     let writing = async {
+        let mut first_write_blocked_for = Duration::ZERO;
+        let mut last_first_write_expiry = None;
         while let Some(record) = outgoing.recv().await {
             let now = Instant::now();
             let expired = record.expires_at <= now;
@@ -562,6 +567,7 @@ async fn write_records<W: tokio::io::AsyncWrite + Unpin>(
                 handle.local_trace_id(),
                 &record.wire[2..],
             );
+            let mut first_pending_at = None;
             let write = async {
                 // Cancellation for expiry is safe ONLY before the first
                 // successful write: Pending consumed no bytes. Once even one
@@ -570,7 +576,13 @@ async fn write_records<W: tokio::io::AsyncWrite + Unpin>(
                 let first = tokio::select! {
                     biased;
                     _ = tokio::time::sleep_until(record.expires_at.into()) => return Ok(false),
-                    result = writer.write(&record.wire) => result?,
+                    result = std::future::poll_fn(|cx| {
+                        let result = std::pin::Pin::new(&mut writer).poll_write(cx, &record.wire);
+                        if result.is_pending() {
+                            first_pending_at.get_or_insert_with(Instant::now);
+                        }
+                        result
+                    }) => result?,
                 };
                 if first == 0 {
                     return Err(io::ErrorKind::WriteZero.into());
@@ -646,6 +658,30 @@ async fn write_records<W: tokio::io::AsyncWrite + Unpin>(
                 handle.local_trace_id(),
                 &record.wire[2..],
             );
+            if complete {
+                first_write_blocked_for = Duration::ZERO;
+                last_first_write_expiry = None;
+            } else if let Some(pending_at) = first_pending_at {
+                // Only count time spent waiting on the writer. Queue expiry,
+                // scheduler delays beyond the deadline, and idle gaps do not
+                // establish continuous demand on this child.
+                if last_first_write_expiry.is_some_and(|previous| {
+                    pending_at.saturating_duration_since(previous) >= RECORD_RECEIVE_MAX_AGE
+                }) {
+                    first_write_blocked_for = Duration::ZERO;
+                }
+                first_write_blocked_for += record.expires_at.saturating_duration_since(pending_at);
+                last_first_write_expiry = Some(record.expires_at);
+                if first_write_blocked_for >= FIRST_WRITE_STALL_TIMEOUT {
+                    handle.note_close_reason(RecordCloseReason::FirstWriteStalled);
+                    trace::note(
+                        Stage::FirstWriteStalled,
+                        handle.local_trace_id(),
+                        &record.wire[2..],
+                    );
+                    return;
+                }
+            }
         }
     };
     tokio::select! {
