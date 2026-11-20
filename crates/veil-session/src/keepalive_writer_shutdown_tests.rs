@@ -17,6 +17,41 @@ async fn poll_once<F: std::future::Future>(mut future: Pin<&mut F>) -> Poll<F::O
     std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
 }
 
+#[tokio::test]
+async fn admitted_session_preparation_waits_for_runner_capabilities() {
+    use crate::LocalDatagramChannelState::{Unsupported, Warming};
+
+    let peer = [0xB1; 32];
+    let lane = veil_proto::priority::REALTIME;
+    let mut registry = crate::SessionTxRegistry::new();
+    let outbox = registry
+        .try_register_directional(peer, &[0xA0; 32], true, false, false, [1; 32])
+        .unwrap();
+    assert_eq!(
+        registry.request_local_datagram_channel(&peer, lane),
+        Warming
+    );
+    assert_eq!(
+        registry.refresh_local_datagram_channel(&peer, lane),
+        Warming
+    );
+
+    let (wire, remote) = tokio::io::duplex(8192);
+    let mut runner = make_runner(Box::new(wire), outbox, None);
+    let mut run = Box::pin(runner.run());
+    assert!(poll_once(run.as_mut()).await.is_pending());
+    assert_eq!(
+        registry.request_local_datagram_channel(&peer, lane),
+        Unsupported
+    );
+    assert_eq!(
+        registry.refresh_local_datagram_channel(&peer, lane),
+        Unsupported
+    );
+    drop(remote);
+    run.await;
+}
+
 struct LogDir(PathBuf);
 impl Drop for LogDir {
     fn drop(&mut self) {
