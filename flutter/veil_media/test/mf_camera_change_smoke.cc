@@ -99,6 +99,33 @@ class ChangedReader final : public IMFSourceReader {
 };
 
 struct MfCameraTestPeer {
+  static inline int activations = 0;
+
+  static HRESULT CountActivation(const std::wstring&, IMFMediaSource** out) {
+    ++activations;
+    *out = nullptr;
+    return E_ACCESSDENIED;
+  }
+
+  static HRESULT WINAPI RefuseAttributes(IMFAttributes** out, UINT32) {
+    *out = nullptr;
+    return E_OUTOFMEMORY;
+  }
+
+  static bool FailedSetupDoesNotActivateSource() {
+    MfCameraCapturer camera{CameraFrameCb()};
+    activations = 0;
+    const bool opened = camera.OpenReader(
+        "", 352, 198, RefuseAttributes, CountActivation);
+    const auto diagnostic = camera.Diagnostics();
+    const bool ok = !opened && !camera.reader_ && activations == 0 &&
+        diagnostic.status == 5 &&
+        diagnostic.hresult == static_cast<uint32_t>(E_OUTOFMEMORY);
+    std::printf("reader setup refusal keeps camera closed: %s (activations=%d)\n",
+                ok ? "PASS" : "FAIL", activations);
+    return ok;
+  }
+
   static bool BufferLayout(const char* label, GUID subtype, UINT32 width,
                            UINT32 height, INT32 stride, DWORD bytes,
                            bool expected_format, bool expected_conversion,
@@ -313,6 +340,7 @@ int main() {
     failed += !MfCameraTestPeer::CaptureEvidence(false);
     failed += !MfCameraTestPeer::StoppedEvidence();
     failed += !MfCameraTestPeer::MissingSourceEvidence();
+    failed += !MfCameraTestPeer::FailedSetupDoesNotActivateSource();
     failed += !MfCameraTestPeer::Run("unchanged stream control", MFVideoFormat_NV12,
                                    352, 198, 352, ChangeOutcome::kReadable, false, false);
     failed += !MfCameraTestPeer::Run("NV12 geometry change", MFVideoFormat_NV12,
