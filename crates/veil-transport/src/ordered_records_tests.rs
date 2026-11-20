@@ -481,6 +481,53 @@ async fn deadline_also_applies_while_first_write_is_pending_without_progress() {
 }
 
 #[tokio::test]
+async fn repeated_blocked_first_writes_retire_only_the_stalled_child() {
+    let (mut stream, mut peer) = tokio::io::duplex(1);
+    stream.write_all(b"x").await.unwrap();
+    let plane = OrderedRecordPlane::new(Box::new(stream));
+    let handle = plane.handle();
+    let feed = async {
+        let mut interval = tokio::time::interval(Duration::from_millis(40));
+        loop {
+            interval.tick().await;
+            match handle.send(b"fresh demand") {
+                Ok(()) => {}
+                Err(RecordSendError::Closed) => return,
+                result => panic!("unexpected record admission: {result:?}"),
+            }
+        }
+    };
+    timeout(Duration::from_secs(3), async {
+        tokio::join!(feed, handle.closed());
+    })
+    .await
+    .expect("repeated first-write stalls kept the child live");
+    until(|| plane.tasks.iter().all(|task| task.is_finished())).await;
+    assert_eq!(handle.progress().completed_records, 0);
+    assert!(handle.progress().expired_records > 1);
+    assert_eq!(
+        handle.progress().close_reason,
+        RecordCloseReason::FirstWriteStalled
+    );
+    assert_eq!(handle.0.capacity.available_permits(), RECORD_BUFFER_BYTES);
+    let mut tail = Vec::new();
+    peer.read_to_end(&mut tail).await.unwrap();
+    assert_eq!(tail, b"x");
+
+    let (stream, replacement) = tokio::io::duplex(4096);
+    let plane = OrderedRecordPlane::new(Box::new(stream));
+    let replacement = OrderedRecordPlane::new(Box::new(replacement));
+    plane.handle().send(b"fresh replacement").unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(1), replacement.handle().recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        b"fresh replacement"
+    );
+}
+
+#[tokio::test]
 async fn byte_and_tiny_record_metadata_budgets_include_the_blocked_record() {
     for len in [1, MAX_RECORD_BYTES] {
         let (a, _unread_peer) = tokio::io::duplex(1);
