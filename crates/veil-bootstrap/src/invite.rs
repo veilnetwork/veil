@@ -25,7 +25,11 @@
 //! veil:bootstrap?pk=<b64-pubkey>&t=<endpoint>&a=<algo>&nc=<b64-nonce>[&tls_cert=<b64>][&tls_ca_cert=<b64>]
 //! ```
 //!
-//! Field ordering on **encode** is canonical (`pk → t → a → nc → tls_cert →
+//! An endpoint containing `&`, `=`, `?`, or `#` uses `t64=<base64url without
+//! padding>` in place of `t`. This preserves transport parameters while keeping
+//! the legacy literal representation of simple endpoints. Only one is allowed.
+//!
+//! Field ordering on **encode** is canonical (`pk → t/t64 → a → nc → tls_cert →
 //! tls_ca_cert`) so the same `BootstrapPeer` always renders to the same
 //! string — important for QR caching and for the "did the operator
 //! tamper with this URL" eyeball check. **Decode** accepts arbitrary
@@ -50,6 +54,8 @@ pub const MAX_BOOTSTRAP_URI_BYTES: usize = 4 * 1024;
 /// Canonical scheme prefix. Distinct from `veil:pair`
 /// so a recipient's tooling can route by scheme without ambiguity.
 pub const BOOTSTRAP_URI_SCHEME: &str = "veil:bootstrap";
+
+const ENDPOINT_DELIMITERS: [char; 4] = ['&', '=', '?', '#'];
 
 /// Errors emitted by [`decode_uri`].
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -86,15 +92,22 @@ pub enum BootstrapUriError {
 /// `BootstrapPeer` fields. TLS-cert fields are included only when set
 /// to keep the QR small for the common no-TLS case.
 pub fn encode_uri(peer: &BootstrapPeer) -> Result<String, BootstrapUriError> {
-    validate_endpoint(&peer.transport)?;
+    if peer.transport.is_empty() {
+        return Err(BootstrapUriError::EndpointEmpty);
+    }
 
     let mut out = String::with_capacity(BOOTSTRAP_URI_SCHEME.len() + 256);
     out.push_str(BOOTSTRAP_URI_SCHEME);
     // Canonical field order (see module doc).
     out.push_str("?pk=");
     out.push_str(&peer.public_key); // already base64 in BootstrapPeer
-    out.push_str("&t=");
-    out.push_str(&peer.transport);
+    if peer.transport.contains(ENDPOINT_DELIMITERS) {
+        out.push_str("&t64=");
+        URL_SAFE_NO_PAD.encode_string(peer.transport.as_bytes(), &mut out);
+    } else {
+        out.push_str("&t=");
+        out.push_str(&peer.transport);
+    }
     out.push_str("&a=");
     out.push_str(algo_to_str(peer.algo));
     out.push_str("&nc=");
@@ -132,6 +145,7 @@ pub fn decode_uri(s: &str) -> Result<BootstrapPeer, BootstrapUriError> {
 
     let mut pk: Option<&str> = None;
     let mut t: Option<&str> = None;
+    let mut t64: Option<&str> = None;
     let mut a: Option<&str> = None;
     let mut nc: Option<&str> = None;
     let mut tls_cert_b64: Option<&str> = None;
@@ -149,6 +163,7 @@ pub fn decode_uri(s: &str) -> Result<BootstrapPeer, BootstrapUriError> {
         match key {
             "pk" => assign_once(&mut pk, value, "pk")?,
             "t" => assign_once(&mut t, value, "t")?,
+            "t64" => assign_once(&mut t64, value, "t64")?,
             "a" => assign_once(&mut a, value, "a")?,
             "nc" => assign_once(&mut nc, value, "nc")?,
             "tls_cert" => assign_once(&mut tls_cert_b64, value, "tls_cert")?,
@@ -162,11 +177,21 @@ pub fn decode_uri(s: &str) -> Result<BootstrapPeer, BootstrapUriError> {
     }
 
     let pk = pk.ok_or(BootstrapUriError::MissingField { field: "pk" })?;
-    let t = t.ok_or(BootstrapUriError::MissingField { field: "t" })?;
     let a = a.ok_or(BootstrapUriError::MissingField { field: "a" })?;
     let nc = nc.ok_or(BootstrapUriError::MissingField { field: "nc" })?;
 
-    validate_endpoint(t)?;
+    let transport = match (t, t64) {
+        (Some(endpoint), None) => {
+            validate_literal_endpoint(endpoint)?;
+            endpoint.to_owned()
+        }
+        (None, Some(encoded)) => decode_b64_field(encoded, "t64")?,
+        (None, None) => return Err(BootstrapUriError::MissingField { field: "t" }),
+        (Some(_), Some(_)) => return Err(BootstrapUriError::DuplicateField { field: "t" }),
+    };
+    if transport.is_empty() {
+        return Err(BootstrapUriError::EndpointEmpty);
+    }
     let algo = algo_from_str(a)?;
     let tls_cert = tls_cert_b64
         .map(|b| decode_b64_field(b, "tls_cert"))
@@ -176,7 +201,7 @@ pub fn decode_uri(s: &str) -> Result<BootstrapPeer, BootstrapUriError> {
         .transpose()?;
 
     Ok(BootstrapPeer {
-        transport: t.to_owned(),
+        transport,
         public_key: pk.to_owned(),
         nonce: nc.to_owned(),
         algo,
@@ -225,11 +250,8 @@ fn decode_b64_field(b: &str, name: &'static str) -> Result<String, BootstrapUriE
     String::from_utf8(bytes).map_err(|_| BootstrapUriError::InvalidBase64 { field: name })
 }
 
-fn validate_endpoint(endpoint: &str) -> Result<(), BootstrapUriError> {
-    if endpoint.is_empty() {
-        return Err(BootstrapUriError::EndpointEmpty);
-    }
-    for ch in ['&', '=', '?', '#'] {
+fn validate_literal_endpoint(endpoint: &str) -> Result<(), BootstrapUriError> {
+    for ch in ENDPOINT_DELIMITERS {
         if endpoint.contains(ch) {
             return Err(BootstrapUriError::EndpointReservedChar {
                 endpoint: endpoint.to_owned(),
@@ -273,6 +295,23 @@ mod tests {
         let uri = encode_uri(&p).expect("encode");
         let p2 = decode_uri(&uri).expect("decode");
         assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn round_trip_transport_query_without_reinterpreting_outer_fields() {
+        let mut peer = sample_peer();
+        peer.transport =
+            "quic://198.51.100.20:39998?sni=seed.example&alpn=veil-quic&alpn=h%2B3".into();
+        peer.public_key = "+/8=".into();
+        peer.nonce = "//8=".into();
+        // Shared with the xVeil runtime registration regression.
+        let uri = concat!(
+            "veil:bootstrap?pk=+/8=&t64=",
+            "cXVpYzovLzE5OC41MS4xMDAuMjA6Mzk5OTg_c25pPXNlZWQuZXhhbXBsZSZhbHBuPXZlaWwtcXVpYyZhbHBuPWglMkIz",
+            "&a=ed25519&nc=//8=",
+        );
+        assert_eq!(encode_uri(&peer).unwrap(), uri);
+        assert_eq!(decode_uri(uri).unwrap(), peer);
     }
 
     #[test]
@@ -333,16 +372,30 @@ mod tests {
     }
 
     #[test]
-    fn epic481_1_encode_rejects_endpoint_with_reserved_chars() {
-        let mut p = sample_peer();
-        // Use `&` only — first char in the validator's check order so the
-        // failure variant is deterministic regardless of which other
-        // reserved chars happen to also appear.
-        p.transport = "tcp://x:1&junk".to_owned();
-        let err = encode_uri(&p).unwrap_err();
-        assert!(
-            matches!(err, BootstrapUriError::EndpointReservedChar { ch: '&', .. }),
-            "got: {err:?}"
+    fn decode_rejects_query_inside_literal_transport() {
+        let uri = "veil:bootstrap?pk=a&t=quic://x:1?alpn=h3&a=ed25519&nc=n";
+        assert!(matches!(
+            decode_uri(uri),
+            Err(BootstrapUriError::EndpointReservedChar { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_ambiguous_or_invalid_encoded_transport() {
+        let prefix = "veil:bootstrap?pk=a&a=ed25519&nc=n";
+        for fields in ["&t=tcp://x:1&t64=YQ", "&t64=YQ&t64=Yg"] {
+            assert!(matches!(
+                decode_uri(&format!("{prefix}{fields}")),
+                Err(BootstrapUriError::DuplicateField { .. })
+            ));
+        }
+        assert_eq!(
+            decode_uri(&format!("{prefix}&t64=!")),
+            Err(BootstrapUriError::InvalidBase64 { field: "t64" })
+        );
+        assert_eq!(
+            decode_uri(&format!("{prefix}&t64=")),
+            Err(BootstrapUriError::EndpointEmpty)
         );
     }
 
