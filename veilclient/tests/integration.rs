@@ -214,7 +214,10 @@ async fn source_lane_survives_sdk_ipc_but_is_absent_from_network_frame() {
         Arc::new(AppEndpointRegistry::new()),
         node_id(),
     )
-    .with_session_tx_registry(Arc::new(Capture(tx)));
+    .with_session_tx_registry(Arc::new(Capture(tx)))
+    // Trace sampling is a separate per-send decision. Keep it disabled while
+    // comparing the wire fields produced with and without a local deadline.
+    .with_trace_sample_rate(0.0);
     let task = tokio::spawn(async move {
         server.run().await.unwrap();
     });
