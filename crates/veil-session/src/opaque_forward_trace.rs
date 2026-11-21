@@ -189,6 +189,27 @@ fn sample_frame(frame: &[u8]) -> Option<Sample> {
     sample(&header, body)
 }
 
+/// Local signaling can carry ratchet ciphertext or chunks without the media
+/// header that the source media trace requires. Record an opaque fingerprint
+/// for a terminal scheduler refusal under the existing operator gate.
+pub(crate) fn signaling_drop(stage: &'static str, frame: &[u8]) {
+    if !enabled() || ROWS.load(Ordering::Relaxed) > ROW_LIMIT {
+        return;
+    }
+    let Some(sample) = sample_frame(frame) else {
+        return;
+    };
+    if reserve_row() {
+        let monotonic_us = veil_util::diagnostic_clock::monotonic_us().map_or(-1, i128::from);
+        log::info!(
+            "delivery.opaque_trace stage=source_signaling_drop reason={stage} monotonic_us={monotonic_us} node=- peer=- opaque_bytes={} opaque_sha256={} wrapper={}",
+            sample.bytes,
+            sample.digest,
+            sample.wrapper,
+        );
+    }
+}
+
 /// Bracket synchronous dispatch, including early returns. A return observation
 /// can follow downstream work already admitted by dispatch; it is not a send.
 pub struct Receive {
@@ -401,6 +422,26 @@ mod tests {
                 assert_eq!(EVENTS.lock().unwrap().len(), 2);
             } else {
                 assert!(rows.is_empty());
+            }
+            let prior = EVENTS.lock().unwrap().len();
+            let signaling = crate::LOCAL_SIGNALING_LANE;
+            crate::local_lossy_trace::cell(
+                "queue_expired",
+                veil_proto::priority::INTERACTIVE,
+                &frame,
+            );
+            crate::local_lossy_trace::cell("budget_admit", signaling, &frame);
+            assert_eq!(EVENTS.lock().unwrap().len(), prior);
+            crate::local_lossy_trace::cell("queue_expired", signaling, &frame);
+            let rows = EVENTS.lock().unwrap();
+            if enabled() {
+                assert_eq!(rows.len(), prior + 1);
+                let drop = &rows[prior];
+                assert!(drop.contains("stage=source_signaling_drop reason=queue_expired "));
+                assert!(drop.contains(&format!("opaque_sha256={}", digest(secret).unwrap())));
+                assert!(!drop.contains("PRIVATE_"));
+            } else {
+                assert_eq!(rows.len(), prior);
             }
             return;
         }
