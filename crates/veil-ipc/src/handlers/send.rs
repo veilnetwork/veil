@@ -912,12 +912,18 @@ async fn send_family_relay_copies(
                 require_ack: false,
             };
             let bytes = envelope.encode();
+            let chunks = EnvelopeChunks::for_packetized_control(reg, &envelope);
             for hop in hops.into_iter().take(3) {
                 timing.evidence.source_attempts += 1;
                 let admission_started = std::time::Instant::now();
-                let packetized =
-                    send_packetized_control(reg, &envelope, &hop, local_priority, family_deadline)
-                        .await;
+                let packetized = send_packetized_control(
+                    reg,
+                    chunks.as_ref(),
+                    &hop,
+                    local_priority,
+                    family_deadline,
+                )
+                .await;
                 timing.admission_ms += admission_started.elapsed().as_millis();
                 if let Some(sent) = packetized {
                     if sent {
@@ -2878,6 +2884,11 @@ async fn handle_ipc_send_inner(
                 };
                 let mut accepted_copies = 0;
                 let mut accepted_datagram_copy = false;
+                let control_chunks = if relay_control_compat {
+                    EnvelopeChunks::for_packetized_control(reg, &envelope)
+                } else {
+                    None
+                };
                 for (compat_attempts, next_hop) in hops_to_try.into_iter().enumerate() {
                     if relay_control_compat && compat_attempts >= 3 {
                         break;
@@ -2898,7 +2909,7 @@ async fn handle_ipc_send_inner(
                     let packetized = if relay_control_compat {
                         send_packetized_control(
                             reg,
-                            &envelope,
+                            control_chunks.as_ref(),
                             &next_hop,
                             source_lane,
                             control_source_deadline,
@@ -8270,10 +8281,11 @@ mod ratchet_send_tests {
                 self.0.active_node_ids()
             }
         }
+        const OTHER_RELAY: [u8; 32] = [0xb7; 32];
         const LEGACY: [u8; 32] = [0xb8; 32];
         for device_fanout in [false, true] {
-            let mut fx = fixture(vec![RELAY, LEGACY]);
-            Arc::get_mut(&mut fx.outbox).unwrap().datagram = vec![RELAY];
+            let mut fx = fixture(vec![RELAY, OTHER_RELAY, LEGACY]);
+            Arc::get_mut(&mut fx.outbox).unwrap().datagram = vec![RELAY, OTHER_RELAY];
             if device_fanout {
                 fx.certs = Arc::new(FamilyCerts(vec![
                     fx.certs.resolve_cert_cached(PEER).unwrap(),
@@ -8291,11 +8303,16 @@ mod ratchet_send_tests {
                 .await
                 .unwrap();
             let sent = fx.taken();
-            let modern: Vec<_> = sent.iter().filter(|(hop, _)| *hop == RELAY).collect();
-            assert!(modern.len() > 2, "actual origin packetization required");
+            for modern in [RELAY, OTHER_RELAY] {
+                assert!(
+                    sent.iter().filter(|(hop, _)| *hop == modern).count() > 2,
+                    "actual origin packetization required"
+                );
+            }
             assert!(sent.iter().any(|(hop, _)| *hop == LEGACY));
             let (dispatcher, _endpoint, mut receiver) =
                 direct_receiver(&fx.peer, PEER, PEER_INSTANCE);
+            let mut carrier_ids = std::collections::HashSet::new();
             for (hop, bytes) in sent.iter().rev() {
                 let header = codec::decode_header(bytes).unwrap();
                 assert_eq!(header.priority(), veil_proto::priority::INTERACTIVE);
@@ -8322,8 +8339,17 @@ mod ratchet_send_tests {
                 // The device-addressed fanout has a different physical target.
                 // Deliver the identity-addressed path to this identity fixture.
                 if forward.envelope.recipient_node_id() == PEER {
-                    for _ in 0..2 {
-                        dispatcher.dispatch(&header, wire_body, veil_cfg::NodeId::from(ME));
+                    assert!(carrier_ids.insert(forward.envelope.content_id));
+                    let chunk = veil_proto::delivery::ChunkedEnvelopePayload::decode(
+                        &forward.envelope.payload,
+                    )
+                    .unwrap();
+                    // Neither path reaches the destination with a complete
+                    // copy. Their complementary pieces must still assemble.
+                    if (chunk.chunk_index % 2 == 0) == (*hop == RELAY) {
+                        for _ in 0..2 {
+                            dispatcher.dispatch(&header, wire_body, veil_cfg::NodeId::from(*hop));
+                        }
                     }
                 }
             }
