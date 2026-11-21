@@ -95,6 +95,8 @@ struct TransferState {
     received_bytes: usize,
     /// Unix-secs deadline after which this partial transfer is evicted.
     deadline: u64,
+    /// Preserve the completion replay window independently of the wire TTL.
+    replay_deadline: u64,
 }
 
 struct CompletedTransfer {
@@ -170,6 +172,23 @@ impl EnvelopeChunkReassembler {
         // Opportunistic eviction of timed-out partials on each add.
         self.evict_expired(now);
 
+        let replay_deadline = now.saturating_add(CHUNK_REASSEMBLY_TTL_SECS);
+        // Once the carrier expires the Forward dispatcher rejects its
+        // remaining pieces. Keeping an unfinishable partial until the
+        // generic timeout consumes a sender's quota across later transfers.
+        // Typed direct app chunks have no wire envelope lifetime.
+        let deadline = if direct_peer.is_none() {
+            let expires_at = envelope
+                .created_at
+                .saturating_add(u64::from(envelope.ttl_secs));
+            if now > expires_at {
+                return AddChunkResult::Rejected("expired chunk envelope");
+            }
+            replay_deadline.min(expires_at)
+        } else {
+            replay_deadline
+        };
+
         if let Some(done) = self.completed.get(&key) {
             return if done.orig_content_id == chunk.orig_content_id {
                 AddChunkResult::CompletedReplay(done.orig_content_id)
@@ -229,7 +248,8 @@ impl EnvelopeChunkReassembler {
                     received,
                     received_count: 1,
                     received_bytes: data_len,
-                    deadline: now.saturating_add(CHUNK_REASSEMBLY_TTL_SECS),
+                    deadline,
+                    replay_deadline,
                 },
             );
             // A 1-chunk transfer completes immediately.
@@ -331,7 +351,7 @@ impl EnvelopeChunkReassembler {
         }
         let state = self.transfers.remove(transfer_id).expect("present");
         self.total_buffered = self.total_buffered.saturating_sub(state.received_bytes);
-        let completion_deadline = state.deadline;
+        let completion_deadline = state.replay_deadline;
 
         let mut payload = Vec::with_capacity(state.total_size as usize);
         for piece in state.received.into_iter() {
@@ -408,7 +428,9 @@ mod tests {
             endpoint_id: 42,
             content_id, // per-chunk unique id (unused by reassembly)
             created_at: 0,
-            ttl_secs: 30,
+            // Exercise the reassembly timer unless this test supplies a
+            // specific lifetime on the forwarded envelope.
+            ttl_secs: u32::MAX,
             payload: vec![],
             trace_id: 0,
             require_ack: false,
@@ -872,5 +894,46 @@ mod tests {
             ),
             AddChunkResult::Pending
         ));
+    }
+
+    #[test]
+    fn expired_forward_fragments_release_the_senders_transfer_slots() {
+        let mut reassembler = EnvelopeChunkReassembler::new();
+        let carrier = DeliveryEnvelope {
+            created_at: 100,
+            ttl_secs: 30,
+            ..carrier([0; 32])
+        };
+        for id in 0..MAX_TRANSFERS_PER_SENDER {
+            assert!(matches!(
+                reassembler.add_direct(&carrier, chunk([id as u8; 16], 0, 2, 4, vec![1, 2]), 125,),
+                AddChunkResult::Pending
+            ));
+        }
+        let next = DeliveryEnvelope {
+            created_at: 130,
+            ..carrier.clone()
+        };
+        let head = chunk([0xFE; 16], 0, 2, 4, vec![1, 2]);
+        assert!(matches!(
+            reassembler.add_direct(&next, head.clone(), 130),
+            AddChunkResult::Rejected("per-sender transfer quota exceeded")
+        ));
+        assert!(matches!(
+            reassembler.add_direct(&next, head, 131),
+            AddChunkResult::Pending
+        ));
+        assert_eq!(reassembler.transfer_count(), 1);
+        assert_eq!(reassembler.buffered_bytes(), 2);
+        assert!(matches!(
+            reassembler.add_direct(&carrier, chunk([0; 16], 1, 2, 4, vec![3, 4]), 131),
+            AddChunkResult::Rejected("expired chunk envelope")
+        ));
+        assert!(matches!(
+            reassembler.add_direct(&next, chunk([0xFE; 16], 1, 2, 4, vec![3, 4]), 132),
+            AddChunkResult::Complete(envelope) if envelope.payload == [1, 2, 3, 4]
+        ));
+        reassembler.evict_expired(161);
+        assert_eq!(reassembler.completed.len(), 1);
     }
 }
