@@ -2908,7 +2908,11 @@ async fn handle_ipc_send_inner(
                         None
                     };
                     let trace = if relay_control_compat && packetized.is_none() {
-                        crate::route_trace::OpaqueSource::sample(&fwd_frame, &next_hop, datagram_hop)
+                        crate::route_trace::OpaqueSource::sample(
+                            &fwd_frame,
+                            &next_hop,
+                            datagram_hop,
+                        )
                     } else {
                         None
                     };
