@@ -8346,7 +8346,7 @@ mod ratchet_send_tests {
                     .unwrap();
                     // Neither path reaches the destination with a complete
                     // copy. Their complementary pieces must still assemble.
-                    if (chunk.chunk_index % 2 == 0) == (*hop == RELAY) {
+                    if chunk.chunk_index.is_multiple_of(2) == (*hop == RELAY) {
                         for _ in 0..2 {
                             dispatcher.dispatch(&header, wire_body, veil_cfg::NodeId::from(*hop));
                         }
