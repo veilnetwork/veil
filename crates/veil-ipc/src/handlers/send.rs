@@ -944,7 +944,11 @@ async fn send_family_relay_copies(
                 }
                 // Keep the endpoint's signaling producer separate from its
                 // primary media producer. The relay header remains neutral.
+                let trace = crate::route_trace::OpaqueSource::sample(&frame, &hop, datagram);
                 let sent = reg.send_to(&hop, local_priority, frame);
+                if let Some(trace) = trace {
+                    trace.finish(sent);
+                }
                 if sent {
                     timing.evidence.source_accepted += 1;
                 } else {
@@ -2903,6 +2907,11 @@ async fn handle_ipc_send_inner(
                     } else {
                         None
                     };
+                    let trace = if relay_control_compat && packetized.is_none() {
+                        crate::route_trace::OpaqueSource::sample(&fwd_frame, &next_hop, datagram_hop)
+                    } else {
+                        None
+                    };
                     let relayed = packetized.unwrap_or_else(|| match ctx.local_work.as_ref() {
                         Some(cell) => reg.send_local_lossy_work(
                             &next_hop,
@@ -2918,6 +2927,9 @@ async fn handle_ipc_send_inner(
                         ),
                         None => reg.send_to(&next_hop, source_lane, fwd_frame.clone()),
                     });
+                    if let Some(trace) = trace {
+                        trace.finish(relayed);
+                    }
                     if relayed {
                         timing.relay_status.set("accepted");
                     } else if timing.relay_status.get() != "accepted" {

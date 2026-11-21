@@ -171,7 +171,12 @@ pub(super) async fn send_packetized_control(
                 if tokio::time::Instant::now() >= deadline {
                     return false;
                 }
-                if !reg.send_local_source_to(hop, local_lane, frame).await {
+                let trace = crate::route_trace::OpaqueSource::sample(&frame, hop, true);
+                let sent = reg.send_local_source_to(hop, local_lane, frame).await;
+                if let Some(trace) = trace {
+                    trace.finish(sent);
+                }
+                if !sent {
                     return false;
                 }
             }

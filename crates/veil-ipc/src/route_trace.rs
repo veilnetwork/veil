@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
 static NEXT_OPERATION: AtomicU64 = AtomicU64::new(1);
 static SMALL_SEND_DROPS: AtomicU64 = AtomicU64::new(0);
+static OPAQUE_SOURCE_ENABLED: OnceLock<bool> = OnceLock::new();
+static OPAQUE_SOURCE_ROWS: AtomicU64 = AtomicU64::new(0);
+const OPAQUE_SOURCE_LIMIT: u64 = 16_384;
 
 #[derive(Default)]
 struct SmallSendBudget {
@@ -80,6 +83,97 @@ pub async fn operation_scope<F: std::future::Future>(enabled: bool, future: F) -
 pub fn operation_id() -> u64 {
     OPERATION.try_with(|id| *id).unwrap_or(0)
 }
+
+/// Link an IPC operation to a frame handed to the first-hop queue. The
+/// payload must come from an origin-sealed Forward frame; for chunked
+/// copies this hashes the same individual payload as the session trace.
+pub(crate) struct OpaqueSource {
+    operation: u64,
+    peer: [u8; 4],
+    datagram_capable: bool,
+    bytes: usize,
+    digest: String,
+    outcome: &'static str,
+}
+
+impl OpaqueSource {
+    pub(crate) fn sample(frame: &[u8], peer: &[u8; 32], datagram_capable: bool) -> Option<Self> {
+        let operation = operation_id();
+        if operation == 0
+            || !is_enabled()
+            || !*OPAQUE_SOURCE_ENABLED.get_or_init(|| {
+                veil_util::operator_trace::enabled(
+                    "VEIL_DIAG_OPAQUE_FORWARD",
+                    c"debug.xveil.opaque_forward",
+                )
+            })
+            || OPAQUE_SOURCE_ROWS.load(Ordering::Relaxed) > OPAQUE_SOURCE_LIMIT
+        {
+            return None;
+        }
+        let (bytes, digest) = opaque_forward_fingerprint(frame)?;
+        let row = OPAQUE_SOURCE_ROWS.fetch_add(1, Ordering::Relaxed);
+        if row == OPAQUE_SOURCE_LIMIT {
+            log::info!("ipc.opaque_source_limit rows={OPAQUE_SOURCE_LIMIT}");
+        }
+        (row < OPAQUE_SOURCE_LIMIT).then(|| Self {
+            operation,
+            peer: [peer[0], peer[1], peer[2], peer[3]],
+            datagram_capable,
+            bytes,
+            digest,
+            outcome: "cancelled",
+        })
+    }
+
+    /// Accepted means queued at the source. It says nothing about transport
+    /// selection or delivery. Call before a receipt is visible to the app.
+    pub(crate) fn finish(mut self, accepted: bool) {
+        self.outcome = if accepted { "accepted" } else { "refused" };
+    }
+}
+
+impl Drop for OpaqueSource {
+    fn drop(&mut self) {
+        let monotonic_us = veil_util::diagnostic_clock::monotonic_us().map_or(-1, i128::from);
+        log::info!(
+            "ipc.opaque_source operation={} monotonic_us={monotonic_us} peer={} datagram_capable={} outcome={} opaque_bytes={} opaque_sha256={}",
+            self.operation,
+            veil_util::hex_str(&self.peer),
+            self.datagram_capable,
+            self.outcome,
+            self.bytes,
+            self.digest,
+        );
+    }
+}
+
+fn opaque_forward_fingerprint(frame: &[u8]) -> Option<(usize, String)> {
+    use sha2::{Digest, Sha256};
+    use veil_proto::{
+        codec,
+        delivery::ForwardPayload,
+        family::{DeliveryMsg, FrameFamily},
+        header::HEADER_SIZE,
+    };
+
+    let body = frame.get(HEADER_SIZE..)?;
+    if body.len() > 8192 {
+        return None;
+    }
+    let header = codec::decode_header(frame).ok()?;
+    if header.family != FrameFamily::Delivery as u8
+        || header.msg_type != DeliveryMsg::Forward as u16
+        || usize::from(header.header_len) != HEADER_SIZE
+        || header.body_len as usize != body.len()
+    {
+        return None;
+    }
+    let forward = ForwardPayload::decode(body).ok()?;
+    let payload = forward.envelope.payload;
+    (!payload.is_empty()).then(|| (payload.len(), veil_util::hex_str(&Sha256::digest(&payload))))
+}
+
 type Key = ([u8; 32], [u8; 32], u8, [u8; 32]);
 struct Sample {
     logged_at: Instant,
@@ -461,6 +555,60 @@ pub(crate) fn observe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opaque_source_fingerprints_the_payload_instead_of_the_forward_wrapper() {
+        use veil_proto::{
+            FrameHeader, codec,
+            delivery::{DeliveryEnvelope, ForwardPayload},
+            family::{DeliveryMsg, FrameFamily},
+            recipient::Recipient,
+        };
+
+        let mut forward = ForwardPayload {
+            next_hop_node_id: [1; 32],
+            envelope: DeliveryEnvelope {
+                recipient: Recipient::any([2; 32]),
+                sender_node_id: [3; 32],
+                src_app_id: [4; 32],
+                app_id: [5; 32],
+                endpoint_id: 6,
+                content_id: [7; 32],
+                created_at: 123,
+                ttl_secs: 30,
+                payload: b"abc".to_vec(),
+                trace_id: 0,
+                require_ack: false,
+            },
+            relay_hops: 0,
+            delivery_attempt: None,
+            traffic_class: None,
+        };
+        let frame = |forward: &ForwardPayload| {
+            let body = forward.encode();
+            let mut header =
+                FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+            header.body_len = body.len() as u32;
+            let mut frame = codec::encode_header(&header).to_vec();
+            frame.extend(body);
+            frame
+        };
+        let expected = Some((
+            3,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_string(),
+        ));
+        assert_eq!(opaque_forward_fingerprint(&frame(&forward)), expected);
+        forward.next_hop_node_id = [8; 32];
+        forward.traffic_class = Some(veil_proto::priority::INTERACTIVE);
+        let mut relayed = frame(&forward);
+        assert_eq!(opaque_forward_fingerprint(&relayed), expected);
+        relayed.pop();
+        assert_eq!(opaque_forward_fingerprint(&relayed), None);
+        forward.envelope.payload.clear();
+        assert_eq!(opaque_forward_fingerprint(&frame(&forward)), None);
+        forward.envelope.payload.resize(8193, 0);
+        assert_eq!(opaque_forward_fingerprint(&frame(&forward)), None);
+    }
 
     #[test]
     fn extra_fast_send_samples_are_bounded_and_do_not_bank_idle_credit() {
