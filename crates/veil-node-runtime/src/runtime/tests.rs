@@ -2193,6 +2193,59 @@ async fn accept_dial(listener: &TcpListener, what: &str) -> tokio::net::TcpStrea
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_connector_tries_the_next_address_for_the_same_identity() {
+    let primary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backup = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let keys = test_support::ed25519_keypair();
+    let mut config = runtime_config_with_listen();
+    config.peers.clear();
+    config.listen.clear();
+    config.identity.as_mut().unwrap().lazy_mining = false;
+    config.global.meeting_points = veil_cfg::MeetingPoints::Only(Vec::new());
+    config.global.builtin_seed_policy = veil_cfg::BuiltinSeedPolicy::Never;
+    config.pex.enabled = false;
+    config.connection.reconnect_backoff_min_ms = 50;
+    config.bootstrap_peers = [&primary, &backup]
+        .into_iter()
+        .map(|listener| veil_cfg::BootstrapPeer {
+            transport: format!("tcp://{}", listener.local_addr().unwrap()),
+            public_key: keys.public_key.clone(),
+            nonce: veil_cfg::default_nonce_base64(),
+            algo: SignatureAlgorithm::Ed25519,
+            tls_cert: None,
+            tls_ca_cert: None,
+        })
+        .collect();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    veil_cfg::save_config(&path, &config).unwrap();
+    let mut runtime = NodeRuntime::start(&path, true).await.unwrap();
+    let tried_backup = timeout(TEST_DIAL_WAIT, async {
+        let stream = accept_dial(&primary, "primary bootstrap address").await;
+        drop(stream);
+        // An extra connector in parallel would also make the backup
+        // observable here. The runtime must keep its one per-node claim.
+        assert_eq!(
+            runtime
+                .access()
+                .outbound_connector_refresh
+                .lock()
+                .unwrap()
+                .len(),
+            1
+        );
+        tokio::select! {
+            result = primary.accept() => { drop(result.unwrap()); false }
+            result = backup.accept() => { drop(result.unwrap()); true }
+        }
+    })
+    .await;
+    runtime.stop().await.unwrap();
+    assert!(tried_backup.expect("bootstrap retried after the failed handshake"));
+}
+
 // Audit batch 2026-05-24: probabilistically flaky after Phase E20
 // directional dedup landed (commit 4caea9b, 2026-05-22).  The test
 // uses a randomly-generated sovereign identity for the runtime AND
