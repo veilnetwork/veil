@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## v0.11.57 — 2026-11-21
+
+### Fixed
+
+- Release incomplete relayed message fragments when their envelope expires so
+  they stop consuming reassembly slots needed by later messages.
+- Bound the queue and admission wait for the optional reliable call fallback.
+  Keep signaling eligible for transport capacity reserved from bulk traffic.
+- Prepare Media Foundation camera readers before opening Windows cameras and
+  preserve camera startup and format errors for diagnostics.
+- Continue call relay preparation as sessions become available. Recover
+  ordered relay connections after stalled writes or missing acknowledgments.
+- Answer authenticated call path probes on their receiving channel.
+
+### Diagnostics
+
+- Correlate local signaling queue admission and drops with opaque forwarding
+  frames in operator traces.
+
 ## v0.11.56 — 2026-11-19
 
 ### Fixed
