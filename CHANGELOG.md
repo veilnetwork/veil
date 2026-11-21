@@ -8,6 +8,8 @@
 
 - Release incomplete relayed message fragments when their envelope expires so
   they stop consuming reassembly slots needed by later messages.
+- Reassemble call signaling sent through multiple relays even when each path
+  delivers only part of the same encrypted envelope.
 - Bound the queue and admission wait for the optional reliable call fallback.
   Keep signaling eligible for transport capacity reserved from bulk traffic.
 - Prepare Media Foundation camera readers before opening Windows cameras and

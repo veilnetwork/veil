@@ -30,6 +30,23 @@ pub(super) struct EnvelopeChunks<'a> {
 }
 
 impl<'a> EnvelopeChunks<'a> {
+    /// All first-hop copies of this envelope share one indexed transfer.
+    /// Keep distinct carrier content ids so a relay that saw one copy can
+    /// still forward another after its route has changed.
+    pub(super) fn for_packetized_control(
+        reg: &dyn veil_types::FrameBroadcaster,
+        envelope: &'a DeliveryEnvelope,
+    ) -> Option<Self> {
+        let segment = source_segment_bytes(reg, envelope.payload.len());
+        if envelope.require_ack
+            || segment >= veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES
+            || envelope.payload.len() <= segment
+        {
+            return None;
+        }
+        Self::new(envelope, false, segment)
+    }
+
     pub(super) fn new(
         envelope: &'a DeliveryEnvelope,
         require_ack: bool,
@@ -147,20 +164,15 @@ impl<'a> EnvelopeChunks<'a> {
 /// Reassembly precedes E2E opening, preserving the original ciphertext/proof.
 pub(super) async fn send_packetized_control(
     reg: &dyn veil_types::FrameBroadcaster,
-    envelope: &DeliveryEnvelope,
+    chunks: Option<&EnvelopeChunks<'_>>,
     hop: &[u8; 32],
     local_lane: u8,
     deadline: tokio::time::Instant,
 ) -> Option<bool> {
-    let segment = source_segment_bytes(reg, envelope.payload.len());
-    if envelope.require_ack
-        || !reg.has_neutral_forward_datagram_transport(hop)
-        || segment >= veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES
-        || envelope.payload.len() <= segment
-    {
+    if !reg.has_neutral_forward_datagram_transport(hop) {
         return None;
     }
-    let chunks = EnvelopeChunks::new(envelope, false, segment)?;
+    let chunks = chunks?;
     // Wait for ingress rather than dropping an unsent suffix on a full queue.
     // All copies share the caller's deadline; no registry lock spans the wait.
     Some(
@@ -378,7 +390,7 @@ mod tests {
         assert_eq!(
             send_packetized_control(
                 &source,
-                &envelope,
+                EnvelopeChunks::for_packetized_control(&source, &envelope).as_ref(),
                 &[6; 32],
                 lane,
                 tokio::time::Instant::now() + std::time::Duration::from_secs(5)
@@ -387,11 +399,12 @@ mod tests {
             None
         );
         envelope.require_ack = false;
+        let chunks = EnvelopeChunks::for_packetized_control(&source, &envelope);
         let began = tokio::time::Instant::now();
         assert_eq!(
             send_packetized_control(
                 &source,
-                &envelope,
+                chunks.as_ref(),
                 &[6; 32],
                 lane,
                 tokio::time::Instant::now() + std::time::Duration::from_secs(5)
@@ -402,7 +415,7 @@ mod tests {
         assert_eq!(began.elapsed(), std::time::Duration::from_secs(5));
         assert_eq!(source.0.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(
-            send_packetized_control(&source, &envelope, &[6; 32], lane, began).await,
+            send_packetized_control(&source, chunks.as_ref(), &[6; 32], lane, began).await,
             Some(false)
         );
         assert_eq!(source.0.load(std::sync::atomic::Ordering::Relaxed), 1);
