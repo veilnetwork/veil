@@ -84,14 +84,15 @@ class RenderClock : public webrtc::ClockInterface {
 
 void DecodedAgeRegression(int mode = 0, int queued_ms = 90,
                           bool witness = true, bool aligned = true,
-                          bool explicit_action = false, int target_ms = 0) {
+                          bool explicit_action = false, int target_ms = 0,
+                          int preceding_failure = 0) {
   RenderClock wall;
   auto* previous = webrtc::SetClockForTesting(&wall);
   {
     auto decoder = std::make_unique<Decoder>();
     auto* observed = decoder.get();
-    observed->mode = mode;
-    observed->fault_after = 2;
+    observed->mode = preceding_failure ? preceding_failure : mode;
+    observed->fault_after = preceding_failure ? 0 : 2;
     observed->frame_ms = 40;
     observed->buffer_ms_override = queued_ms;
     observed->target_ms = target_ms;
@@ -115,11 +116,14 @@ void DecodedAgeRegression(int mode = 0, int queued_ms = 90,
     observed->clock_origin = header.timestamp - 480 + (aligned ? 0 : 9600);
     webrtc::AudioFrame frame;
     wall.us = 1250000;
-    // Establish an actual decoded-packet witness without trimming. The next
-    // 10-ms block has no packet metadata of its own, as real NetEq can emit.
-    assert(recovering.GetAudio(&frame, nullptr, nullptr,
-        webrtc::NetEq::Operation::kNormal) == 0);
+    // The next 10-ms block has no packet metadata of its own. Only successful,
+    // unmuted speech may leave a timestamp witness for that block.
+    const int first = recovering.GetAudio(&frame, nullptr, nullptr,
+        webrtc::NetEq::Operation::kNormal);
+    assert(first == (preceding_failure == 3 ? webrtc::NetEq::kFail : 0));
     assert(observed->pulls == 1 && stats->discarded_ms == 0);
+    observed->mode = mode;
+    observed->fault_after = 2;
     wall.us = 1280000;
     auto action = explicit_action ? std::optional<webrtc::NetEq::Operation>(
         webrtc::NetEq::Operation::kNormal) : std::nullopt;
@@ -127,7 +131,7 @@ void DecodedAgeRegression(int mode = 0, int queued_ms = 90,
     // This fixture's aligned decoded output is 150 ms old at the second
     // render. An adaptive reserve larger than that is not stale backlog.
     const int budget = std::max(160, target_ms + 80);
-    const bool age_excess = witness && aligned && 150 > budget - 20 &&
+    const bool age_excess = !preceding_failure && witness && aligned && 150 > budget - 20 &&
         queued_ms >= std::max(70, target_ms + 80);
     const bool attempt = (queued_ms > budget || age_excess) &&
         !explicit_action && mode != 6;
@@ -138,6 +142,7 @@ void DecodedAgeRegression(int mode = 0, int queued_ms = 90,
     assert(frame.speech_type_ == webrtc::AudioFrame::kNormalSpeech);
     assert(frame.packet_infos_.empty());
     assert(stats->fallback_frames == (attempt && (mode == 1 || mode == 2) ? 1u : 0u));
+    if (preceding_failure) assert(stats->receivers.LagMs(header.ssrc, wall.us) == -1);
   }
   webrtc::SetClockForTesting(previous);
 }
@@ -189,6 +194,8 @@ int main() {
   DecodedAgeRegression(0, 90, true, false); // A stale decoder origin.
   DecodedAgeRegression(0, 90, true, true, true); // Caller-directed operation.
   for (int mode : {1, 2, 3, 6}) DecodedAgeRegression(mode);
+  for (int fault : {1, 2, 3})  // PLC, muted, and failed decoder output
+    DecodedAgeRegression(0, 90, true, true, false, 0, fault);
   for (int mode = 0; mode <= 9; ++mode) {
     auto decoder = std::make_unique<Decoder>();
     auto* observed = decoder.get();

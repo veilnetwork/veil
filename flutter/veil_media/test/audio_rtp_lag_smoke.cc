@@ -65,6 +65,21 @@ int main() {
     assert(!lag.MatchesPacket(8, stamp(1400), uint16_t(9000)));
   }
   {
+    AudioRtpLag lag;
+    for (int ms = 0; ms <= 1000; ms += 20)
+      lag.Packet(7, stamp(ms), 2'000'000 + ms * 1000, uint16_t(100 + ms / 20));
+    assert(lag.Output(stamp(920), 3'000'000) == 80);
+    // A restart can preserve packet sequence while resetting the RTP clock.
+    // A 1.2-s backwards step is inside the timestamp-only reorder window.
+    assert(lag.Packet(7, stamp(-200), 3'020'000, uint16_t(151)));
+    assert(!lag.Output(stamp(-200), 3'020'000));
+    assert(!lag.Packet(7, stamp(1000), 3'030'000, uint16_t(150)));
+    for (int i = 1; i <= 5; ++i)
+      assert(!lag.Packet(7, stamp(-200 + i * 20), 3'020'000 + i * 20'000,
+                         uint16_t(151 + i)));
+    assert(lag.Output(stamp(-140), 3'120'000) == 40);
+  }
+  {
     veil_media::AudioRecoveryRegistry registry;
     auto stream = registry.NewStream(); registry.Attach(7, stream);
     stream->SetLag(269, 1'234'567);

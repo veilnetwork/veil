@@ -53,8 +53,9 @@ class RecoveringNetEq final : public webrtc::NetEq {
       ResetLag();
       packet_buffer_flushes_ = flushes;
     }
-    if (result == kOK && !silent &&
-        frame->speech_type_ == webrtc::AudioFrame::kNormalSpeech) {
+    const bool normal_speech = result == kOK && !silent &&
+        frame->speech_type_ == webrtc::AudioFrame::kNormalSpeech;
+    if (normal_speech) {
       // PLC/CNG/muted output does not establish a new encoded packet size.
       const int frame_ms = inner_->GetOperationsAndState().current_frame_size_ms;
       if (frame_ms > 0) {
@@ -64,8 +65,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
     }
     unsigned skipped = 0;
     bool fallback = false;
-    if (result == kOK && !silent &&
-        frame->speech_type_ == webrtc::AudioFrame::kNormalSpeech && !action) {
+    if (normal_speech && !action) {
       // Bound work on the audio callback. Never force PLC/underrun to discard
       // audio that is not actually available. Keep the last good output if a
       // subsequent decoder call fails.
@@ -114,10 +114,11 @@ class RecoveringNetEq final : public webrtc::NetEq {
     // NetEq can keep an old output RTP origin across a sender rebuild even
     // while PCM is prompt. Require an actual decoded-packet clock witness;
     // never infer a timestamp offset from packet order or tone phase.
-    const bool aligned = UpdateDecodedClock(*frame);
+    // A failed or synthetic block can still carry packet metadata. It does
+    // not extend the timestamp witness to the next block without metadata.
+    if (!normal_speech) decoded_stamp_.reset();
     receiver_recovery_->SetLag(
-        result == kOK && !silent &&
-        frame->speech_type_ == webrtc::AudioFrame::kNormalSpeech && aligned
+        normal_speech && UpdateDecodedClock(*frame)
             ? rtp_lag_.Output(frame->timestamp_, webrtc::TimeMicros()) : std::nullopt,
         webrtc::TimeMicros());
     if (muted) *muted = silent;
