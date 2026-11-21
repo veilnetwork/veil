@@ -330,6 +330,14 @@ jobs:
     name: Test
     needs: hygiene
     runs-on: ubuntu-latest
+    env:
+      TCP_ACK_TEST_FILTER: >-
+        package(veil-transport) & (
+        test(=obfs4_tcp::obfs4_backup_tests::initial_ack::ordered_records_bound_tcp_ack_stalls_after_the_obfs4_proof) |
+        test(=obfs4_tcp::obfs4_backup_tests::initial_ack::ordered_records_retire_without_a_kernel_ack_deadline) |
+        test(=obfs4_tcp::obfs4_backup_tests::initial_ack::outbound_session_first_flight_retires_an_unacknowledged_socket) |
+        test(=accepted_ordered_obfs4_child_retires_after_tcp_stops_acknowledging)
+        )
     steps:
       - name: Free disk space
         # Phase Q.6 CI fix: GH Actions ubuntu-latest images pre-install
@@ -403,6 +411,29 @@ jobs:
           RUSTFLAGS: '-C link-arg=-fuse-ld=mold'
         run: cargo build --workspace --features veilcore/test-low-difficulty,veilcore/allow-empty-seeds
 
+      - name: Run TCP ACK socket fixtures
+        # Newer Linux kernels require CAP_NET_ADMIN to attach a TCP socket
+        # filter. Give only these loopback tests an isolated network namespace.
+        env:
+          CARGO_PROFILE_DEV_DEBUG: '1'
+          RUSTFLAGS: '-C link-arg=-fuse-ld=mold'
+        run: |
+          runner="$RUNNER_TEMP/veil-tcp-ack-runner"
+          cat > "$runner" <<'SH'
+          #!/usr/bin/env bash
+          for arg in "$@"; do
+            if [[ "$arg" == --list ]]; then
+              exec "$@"
+            fi
+          done
+          exec sudo -n unshare --net -- bash -c 'ip link set dev lo up && exec "$@"' bash "$@"
+          SH
+          chmod +x "$runner"
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$runner" \
+            cargo nextest run --workspace \
+              --features veilcore/test-low-difficulty,veilcore/allow-empty-seeds \
+              --lib --tests --no-tests=fail --test-threads=2 -E "$TCP_ACK_TEST_FILTER"
+
       - name: Run unit tests (nextest)
         # Keep every failure from this expensive build in one report.
         # Phase Q.5 CI fix: cargo-nextest run lib + bins + tests in parallel
@@ -427,7 +458,8 @@ jobs:
             --features veilcore/test-low-difficulty,veilcore/allow-empty-seeds \
             --lib --bins --tests \
             --no-fail-fast \
-            --test-threads=2
+            --test-threads=2 \
+            -E "not ($TCP_ACK_TEST_FILTER)"
 
       - name: Run feature-gated tests
         # The workspace pass above resolves every crate to its DEFAULT features,
