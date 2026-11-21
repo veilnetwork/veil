@@ -202,6 +202,18 @@ fn owned_frame_header(frame: &[u8]) -> Option<(u64, u64)> {
 }
 
 pub(crate) fn cell(stage: &'static str, priority: u8, frame: &[u8]) {
+    if priority == crate::LOCAL_SIGNALING_LANE
+        && matches!(
+            stage,
+            "queue_expired"
+                | "queue_overflow"
+                | "child_unavailable"
+                | "transport_capacity_drop"
+                | "budget_drop"
+        )
+    {
+        crate::opaque_forward_trace::signaling_drop(stage, frame);
+    }
     record_cell(stage, priority, frame, 0);
 }
 
