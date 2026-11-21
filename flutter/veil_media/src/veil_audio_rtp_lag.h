@@ -19,11 +19,13 @@ class AudioRtpLag {
   bool Packet(uint32_t ssrc, uint32_t stamp, int64_t now_us,
               std::optional<uint16_t> sequence = std::nullopt) {
     if (!ssrc || now_us <= 0) { Reset(); return true; }
+    const bool sequence_known = sequence && sequence_;
+    const int16_t sequence_step = sequence_known
+        ? static_cast<int16_t>(*sequence - *sequence_) : 0;
     bool restarted = false;
     if (!ssrc_ || ssrc != ssrc_ || now_us < last_seen_us_ ||
         now_us - last_seen_us_ > kHistoryUs ||
-        (sequence && sequence_ &&
-         std::abs(static_cast<int16_t>(*sequence - *sequence_)) > 128)) {
+        std::abs(sequence_step) > 128) {
       Reset();
       restarted = true;
       ssrc_ = ssrc;
@@ -32,10 +34,13 @@ class AudioRtpLag {
       distinct_packets_ = 1;
     } else {
       const int32_t delta = static_cast<int32_t>(stamp - anchor_stamp_);
+      // A queued packet from before a backwards clock reset can have a
+      // higher timestamp. Its older sequence must not advance the new clock.
+      if (delta > 0 && sequence_known && sequence_step <= 0) return false;
       // A clock restart or a wildly discontinuous timestamp must not turn a
-      // previous stream's floor into invented congestion. Reorder is retained;
-      // old duplicates do not advance the clock or warm up a new baseline.
-      if (delta < -5 * kHz ||
+      // previous stream's floor into invented congestion. An Opus packet
+      // with a newer sequence and an older timestamp has reset its clock.
+      if ((delta < 0 && sequence_step > 0) || delta < -5 * kHz ||
           (delta > 0 && std::llabs(TickUs(delta) - (now_us-anchor_us_)) > 5'000'000)) {
         Reset();
         Packet(ssrc, stamp, now_us, sequence);
@@ -48,7 +53,7 @@ class AudioRtpLag {
         ++distinct_packets_;
       }
     }
-    if (sequence && (!sequence_ || static_cast<int16_t>(*sequence - *sequence_) > 0))
+    if (sequence && (!sequence_ || sequence_step > 0))
       sequence_ = sequence;
     last_seen_us_ = now_us;
     const int32_t delta = static_cast<int32_t>(stamp - anchor_stamp_);
