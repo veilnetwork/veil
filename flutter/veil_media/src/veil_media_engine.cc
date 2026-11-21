@@ -4562,6 +4562,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     // video render delay target. Keep the RTP-span filter as a diagnostic.
     uint64_t audio_rx_pkts = 0;
     int64_t audio_rx_native_age_ms = -1;
+    std::optional<int64_t> audio_input_duration_ms;
     uint64_t audio_concealed_samples = 0;
     uint64_t audio_silent_concealed_samples = 0;
     uint64_t audio_output_emitted_samples = 0;
@@ -4633,6 +4634,11 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
         const auto sent = ws->send_stream->GetStats();
         audio_tx_pkts = sent.packets_sent;
         audio_input_level_band = veil_media::AudioLevelBand(sent.audio_level);
+        // WebRTC counts the duration at SendAudioData, before the encoder.
+        // Silence and DTX still count. A gap here cannot be caused by a relay.
+        if (sent.total_input_duration >= 0 && sent.total_input_duration <= 1'000'000) {
+          audio_input_duration_ms = std::llround(sent.total_input_duration * 1000);
+        }
         audio_tx_retransmitted_pkts = sent.retransmitted_packets_sent;
         audio_encoder_target_bps = sent.target_bitrate_bps;
       }
@@ -4984,6 +4990,9 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
           std::to_string(video_report.fresh_loss_report_us(loss_now_us));
       snapshot += ",\"video_persistent_loss_report_us\":" +
           std::to_string(video_report.fresh_persistent_loss_report_us(loss_now_us));
+      if (sampled && audio_input_duration_ms) {
+        snapshot += ",\"audio_input_duration_ms\":" + std::to_string(*audio_input_duration_ms);
+      }
       snapshot += ",\"audio_output_emitted_samples\":" + std::to_string(audio_output_emitted_samples);
       snapshot += ",\"audio_total_samples_received\":" + std::to_string(audio_total_samples_received);
       snapshot += ",\"audio_inserted_samples_for_deceleration\":" +

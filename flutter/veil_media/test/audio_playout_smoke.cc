@@ -571,6 +571,7 @@ static void verify_silence(bool after_jitter = false) {
   uint64_t max_silence_delay = 0, max_silence_buffer = 0;
   uint64_t max_recovered_delay = 0;
   uint64_t dtx_start_discarded = 0, dtx_end_discarded = 0;
+  uint64_t dtx_start_input = 0, dtx_end_input = 0;
   int first_resumed_tick = -1;
   size_t silent_start_packets = 0, silent_end_packets = 0, recovered_ticks = 0;
   bool input_tone_seen = false, output_tone_seen = false, silence_seen = false;
@@ -601,10 +602,14 @@ static void verify_silence(bool after_jitter = false) {
       silence_seen = metric(source.get(), "audio_input_level_band") == 0 &&
           metric(receiver.get(), "audio_output_level_band") == 0;
     }
-    if (tick == silent_tick + 100)
+    if (tick == silent_tick + 100) {
       dtx_start_discarded = metric(receiver.get(), "audio_latency_discarded_ms");
-    if (tick == resume_tick - 1)
+      dtx_start_input = metric(source.get(), "audio_input_duration_ms");
+    }
+    if (tick == resume_tick - 1) {
       dtx_end_discarded = metric(receiver.get(), "audio_latency_discarded_ms");
+      dtx_end_input = metric(source.get(), "audio_input_duration_ms");
+    }
     if (tick % 10 == 0 && tick >= silent_tick + 100 && tick < resume_tick) {
       max_age = std::max(max_age, metric(receiver.get(), "audio_rx_native_age_ms"));
       max_silence_delay = std::max(max_silence_delay, metric(receiver.get(), "audio_delay_ms"));
@@ -627,6 +632,7 @@ static void verify_silence(bool after_jitter = false) {
   assert(silent_end_packets - silent_start_packets > 20);
   assert(input_tone_seen && output_tone_seen && silence_seen);
   assert(silent_end_packets - silent_start_packets < 150); // Opus DTX is exercised
+  assert(dtx_end_input == dtx_start_input + 10 * (resume_tick - silent_tick - 101));
   assert(max_age < 500); // intentional silence must not trigger receive repair
   // Healthy DTX must also retain valid low-delay feedback for video recovery.
   // Packet activity alone would pass with a falsely inflated delay/buffer
