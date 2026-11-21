@@ -376,8 +376,9 @@ mod tests {
     #[test]
     fn join_uri_registers_peer_and_enqueues_dial() {
         let kp = veil_crypto::generate_keypair(veil_cfg::SignatureAlgorithm::Ed25519);
+        let endpoint = "quic://198.51.100.20:39998?sni=seed.example&alpn=veil-quic&alpn=h%2B3";
         let peer = BootstrapPeer {
-            transport: "tcp://10.9.8.7:9000".to_owned(),
+            transport: endpoint.to_owned(),
             public_key: kp.public_key.clone(),
             nonce: "AAAAAAAA".to_owned(),
             algo: veil_cfg::SignatureAlgorithm::Ed25519,
@@ -406,7 +407,7 @@ mod tests {
         let dialed = dial_rx
             .try_recv()
             .expect("app-added peer must be enqueued for dial");
-        assert_eq!(dialed.transport, "tcp://10.9.8.7:9000");
+        assert_eq!(dialed.transport, endpoint);
         assert!(
             dialed.peer_id.get() >= APP_ADDED_PEER_ID_BASE,
             "dialed entry must use the app-added synthetic peer_id range",
@@ -415,9 +416,7 @@ mod tests {
         // ...and registered in state.
         let st = state.lock().unwrap();
         assert!(
-            st.peers
-                .values()
-                .any(|e| e.transport == "tcp://10.9.8.7:9000"),
+            st.peers.values().any(|e| e.transport == endpoint),
             "peer must be registered in state.peers",
         );
     }
