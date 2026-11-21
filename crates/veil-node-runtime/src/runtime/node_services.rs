@@ -100,6 +100,41 @@ impl NodeServices {
             .cloned()
     }
 
+    /// The startup seed list can supply several addresses for one identity.
+    /// Use a later address only while the failed row is still current.
+    /// App joins and runtime discoveries keep their own replacement rules.
+    pub(crate) fn next_bootstrap_address(
+        &self,
+        primary: &PeerConfigEntry,
+        failed: &PeerConfigEntry,
+    ) -> Option<PeerConfigEntry> {
+        use std::ops::Bound::Excluded;
+
+        if !primary.is_startup_bootstrap() || !failed.is_startup_bootstrap() {
+            return None;
+        }
+        let state = lock_state(&self.state);
+        if state.peers.get(&failed.peer_id) != Some(failed) {
+            return None;
+        }
+        let end = PeerId::new(crate::types::synthetic_peer_id::APP_ADDED_BASE);
+        state
+            .peers
+            .range((Excluded(failed.peer_id), Excluded(end)))
+            .map(|(_, entry)| entry)
+            .find(|entry| {
+                entry.is_startup_bootstrap()
+                    && entry.node_id == primary.node_id
+                    && entry.transport != primary.transport
+                    && entry.transport != failed.transport
+            })
+            .cloned()
+    }
+
+    pub(crate) fn peer_entry_still_current(&self, entry: &PeerConfigEntry) -> bool {
+        lock_state(&self.state).peers.get(&entry.peer_id) == Some(entry)
+    }
+
     pub async fn dht_get_replicated(
         &self,
         key: [u8; 32],

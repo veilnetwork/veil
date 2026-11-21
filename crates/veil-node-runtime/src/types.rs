@@ -237,6 +237,15 @@ pub struct PeerConfigEntry {
     pub source: PeerSource,
 }
 
+impl PeerConfigEntry {
+    pub(crate) fn is_startup_bootstrap(&self) -> bool {
+        self.source == PeerSource::Bootstrap
+            && self.bootstrap_only
+            && (synthetic_peer_id::DNS_BASE..synthetic_peer_id::APP_ADDED_BASE)
+                .contains(&self.peer_id.get())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListenConfigEntry {
     pub listen_id: ListenId,

@@ -245,6 +245,7 @@ fn claim_or_refresh_connector(
 async fn wait_for_dial_target_change(
     access: &NodeServices,
     original: &PeerConfigEntry,
+    primary: &PeerConfigEntry,
     attempt: &PeerConfigEntry,
     refresh: &mut watch::Receiver<u64>,
 ) -> Result<(), watch::error::RecvError> {
@@ -256,10 +257,11 @@ async fn wait_for_dial_target_change(
         {
             return Ok(());
         }
-        // Same fallback as the attempt selector: operator/synthetic rows can
-        // be outside the learned table. Compare the WHOLE row, including
-        // verification keys/nonce/TLS pins, not just its transport URI.
-        if current.as_ref().unwrap_or(original) != attempt {
+        // The primary can be outside the learned table. Compare full rows,
+        // including their verification keys, nonces and TLS pins.
+        if current.as_ref().unwrap_or(original) != primary
+            || (attempt.peer_id != primary.peer_id && !access.peer_entry_still_current(attempt))
+        {
             return Ok(());
         }
     }
@@ -319,6 +321,7 @@ pub fn spawn_outbound_peers(
             let backoff_max = access.defaults.reconnect_backoff_max;
             let quiet_after = access.defaults.reconnect_quiet_after_failures;
             let mut backoff = backoff_min;
+            let mut failed_bootstrap: Option<(PeerConfigEntry, PeerConfigEntry)> = None;
             // The pause after a session refused straight after its handshake;
             // see `after_session_ended`. Separate from `backoff`, which a
             // successful handshake resets.
@@ -388,9 +391,16 @@ pub fn spawn_outbound_peers(
                 // Taken once per attempt: one snapshot, used for the dial and
                 // for everything the dial's success then publishes, so the two
                 // cannot disagree.
-                let attempt = access
+                let primary = access
                     .current_peer_entry(&peer_node_id)
                     .unwrap_or_else(|| peer.clone());
+                // A refreshed primary starts again at the newly selected
+                // address, even if the old fallback is still in the table.
+                let backup = failed_bootstrap
+                    .take()
+                    .filter(|(previous_primary, _)| previous_primary == &primary)
+                    .and_then(|(_, failed)| access.next_bootstrap_address(&primary, &failed));
+                let attempt = backup.as_ref().unwrap_or(&primary);
                 let dial_peer_id = attempt.peer_id;
 
                 // A learned row that has since been evicted takes its
@@ -514,7 +524,7 @@ pub fn spawn_outbound_peers(
                         first_failure_at = None;
                         continue;
                     }
-                    changed = wait_for_dial_target_change(&access, &peer, &attempt, &mut refresh_rx) => {
+                    changed = wait_for_dial_target_change(&access, &peer, &primary, attempt, &mut refresh_rx) => {
                         if changed.is_err() { break; }
                         // A different selected row (or its retirement) makes
                         // this attempt stale. Identical rediscovery is consumed
@@ -541,7 +551,7 @@ pub fn spawn_outbound_peers(
                                         "peer.recovered",
                                         format!(
                                             "peer_id={} after_failures={} down_for_ms={}",
-                                            peer.peer_id,
+                                            dial_peer_id,
                                             consecutive_failures,
                                             down_for.as_millis(),
                                         ),
@@ -1056,6 +1066,12 @@ pub fn spawn_outbound_peers(
                                 let is_duplicate = err_str.contains("duplicate session")
                                     || rlock!(access.session_tx_registry)
                                         .has_session(&peer_node_id);
+                                if !is_duplicate && attempt.is_startup_bootstrap() {
+                                    // Still use the existing per-peer pause.
+                                    // The next pass may try another address,
+                                    // but there is never a parallel dial.
+                                    failed_bootstrap = Some((primary.clone(), attempt.clone()));
+                                }
                                 // Apply battery scale to (jittered) sleep delay.
                                 let (sleep_dur, reason) = if is_duplicate {
                                     // 30 s — long enough that even if the inbound
@@ -1083,7 +1099,7 @@ pub fn spawn_outbound_peers(
                                             "peer.reconnect.scheduled",
                                             format!(
                                                 "peer_id={} delay_ms={} reason={}",
-                                                peer.peer_id,
+                                                dial_peer_id,
                                                 sleep_dur.as_millis(),
                                                 err_str
                                             ),
@@ -1096,7 +1112,7 @@ pub fn spawn_outbound_peers(
                                                  reconnect attempts will be logged at DEBUG \
                                                  (set connection.reconnect_quiet_after_failures = 0 \
                                                  to keep WARN)",
-                                                peer.peer_id,
+                                                dial_peer_id,
                                                 consecutive_failures,
                                             ),
                                         );
@@ -1105,7 +1121,7 @@ pub fn spawn_outbound_peers(
                                             "peer.reconnect.scheduled",
                                             format!(
                                                 "peer_id={} delay_ms={} streak={} reason={}",
-                                                peer.peer_id,
+                                                dial_peer_id,
                                                 sleep_dur.as_millis(),
                                                 consecutive_failures,
                                                 err_str
