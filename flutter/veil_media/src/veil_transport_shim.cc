@@ -265,7 +265,6 @@ bool VeilTransportShim::RebindChannel(uint64_t veil_chan, bool retain_previous_r
   // An alternate belongs to the previous outbound generation. The host can
   // qualify/reinstall it after committing this handover, never implicitly.
   audio_mirror_chan_.store(0, std::memory_order_release);
-  veil_chan_.store(veil_chan, std::memory_order_release);
   video_remb_cadence_.Reset();
   {
     std::lock_guard lock(audio_feedback_mu_);
@@ -273,12 +272,15 @@ bool VeilTransportShim::RebindChannel(uint64_t veil_chan, bool retain_previous_r
     rtcp_route_clock_.Reset(webrtc::CompactNtp(clock->CurrentNtpTime()));
     video_loss_persistence_.RouteChanged();
     video_payload_loss_.Reset(webrtc::TimeMicros());
-    // Retain loss/playout evidence and the engine's live counters. Cached
-    // RTT about the previous sender path is unknown for the new path.
-    for (auto* feedback : {&audio_feedback_, &video_feedback_}) {
-      feedback->rtt_ms = 0;
-      feedback->route_epoch = rtcp_route_clock_.epoch();
-    }
+    // Audio RR evidence collected on the old outbound path must not shed
+    // video on the new one. Fence queued reports by their ingress time.
+    // Receiver playout evidence and live media counters survive the switch.
+    audio_feedback_after_us_ = webrtc::TimeMicros();
+    audio_feedback_ = {};
+    audio_feedback_.route_epoch = rtcp_route_clock_.epoch();
+    video_feedback_.rtt_ms = 0;
+    video_feedback_.route_epoch = rtcp_route_clock_.epoch();
+    veil_chan_.store(veil_chan, std::memory_order_release);
   }
   receive_channels_.push_back(veil_chan);
   if (!retain_previous_receiver) ReleaseReceiveChannel(previous);
@@ -840,7 +842,8 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
           concealment->origin, concealment->sequence, concealment->concealed_samples,
           concealment->known, concealment->age_ms != kUnknownRecoveryAge, arrived_us);
     }
-    if (candidate.arrived_us > 0 && candidate.arrived_us >= audio_feedback_.arrived_us) {
+    if (candidate.arrived_us > audio_feedback_after_us_ &&
+        candidate.arrived_us >= audio_feedback_.arrived_us) {
       candidate.route_epoch = rtcp_route_clock_.epoch();
       if (!rtcp_route_clock_.Accepts(candidate.last_sender_report)) candidate.rtt_ms = 0;
       if (candidate.loss_report_us <= audio_feedback_.loss_report_us) {
