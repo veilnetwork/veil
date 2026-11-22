@@ -202,20 +202,21 @@ impl PacketBuilder {
         );
     }
 
+    /// Finish the packet and return the bytes charged to congestion flight.
     pub(super) fn finish_and_track(
         self,
         now: Instant,
         conn: &mut Connection,
         sent: Option<SentFrames>,
         buffer: &mut Vec<u8>,
-    ) {
+    ) -> u64 {
         let ack_eliciting = self.ack_eliciting;
         let exact_number = self.exact_number;
         let space_id = self.space;
         let (size, padded) = self.finish(conn, now, buffer);
         let sent = match sent {
             Some(sent) => sent,
-            None => return,
+            None => return 0,
         };
 
         let size = match padded || ack_eliciting {
@@ -254,6 +255,7 @@ impl PacketBuilder {
             conn.set_loss_detection_timer(now);
             conn.path.pacing.on_transmit(size);
         }
+        u64::from(size)
     }
 
     /// Encrypt packet, returning the length of the packet and whether padding was added

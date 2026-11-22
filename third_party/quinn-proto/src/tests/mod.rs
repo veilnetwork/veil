@@ -2485,13 +2485,19 @@ fn datagram_send_recv() {
 // A fixed, ordinary connection budget makes the residual-window boundary
 // deterministic without depending on loss or a particular congestion algorithm.
 #[derive(Clone)]
-struct FixedDatagramWindow(Arc<std::sync::atomic::AtomicU64>);
+struct FixedDatagramWindow {
+    window: Arc<std::sync::atomic::AtomicU64>,
+    sent: Arc<Mutex<Vec<(u64, u64)>>>,
+}
 
 impl congestion::Controller for FixedDatagramWindow {
+    fn on_sent(&mut self, _: Instant, bytes: u64, packet: u64) {
+        self.sent.lock().unwrap().push((bytes, packet));
+    }
     fn on_congestion_event(&mut self, _: Instant, _: Instant, _: bool, _: u64) {}
     fn on_mtu_update(&mut self, _: u16) {}
     fn window(&self) -> u64 {
-        self.0.load(std::sync::atomic::Ordering::Relaxed)
+        self.window.load(std::sync::atomic::Ordering::Relaxed)
     }
     fn clone_box(&self) -> Box<dyn congestion::Controller> {
         Box::new(self.clone())
@@ -2519,16 +2525,21 @@ fn residual_window_pair(
     FixedDatagramWindow,
 ) {
     let mut pair = Pair::default();
-    let window = Arc::new(std::sync::atomic::AtomicU64::new(12_000));
+    let controller = FixedDatagramWindow {
+        window: Arc::new(std::sync::atomic::AtomicU64::new(12_000)),
+        sent: Arc::default(),
+    };
     let mut config = client_config();
     let mut transport = TransportConfig::default();
-    transport.congestion_controller_factory(Arc::new(FixedDatagramWindow(Arc::clone(&window))));
+    transport.congestion_controller_factory(Arc::new(controller.clone()));
     transport.mtu_discovery_config(None);
     transport.pad_to_mtu(pad);
     config.transport_config(Arc::new(transport));
     let (client_ch, server_ch) = pair.connect_with(config);
     let limit = 3_000 + pair.client_conn_mut(client_ch).stats().path.in_flight_bytes;
-    window.store(limit, std::sync::atomic::Ordering::Relaxed);
+    controller
+        .window
+        .store(limit, std::sync::atomic::Ordering::Relaxed);
     let now = pair.time;
     // Leave less than an MTU in a valid congestion window, keeping both
     // ordinary packets outstanding until the next packet has been considered.
@@ -2545,24 +2556,29 @@ fn residual_window_pair(
         pair.client.outbound.push_back((tx, buf.into()));
     }
     assert!(pair.client_conn_mut(client_ch).stats().path.in_flight_bytes < limit);
-    (pair, client_ch, server_ch, FixedDatagramWindow(window))
+    (pair, client_ch, server_ch, controller)
 }
 
 #[test]
 fn small_datagram_uses_residual_congestion_window_before_expiry() {
     for max_datagrams in [1, 16] {
-        let (mut pair, client_ch, server_ch, _) = residual_window_pair(false);
+        let (mut pair, client_ch, server_ch, controller) = residual_window_pair(false);
         let now = pair.time;
         const SMALL: &[u8] = &[3; 64];
         pair.client_datagrams(client_ch)
             .send_with_expiry(SMALL.into(), false, now + Duration::from_millis(75))
             .unwrap();
+        controller.sent.lock().unwrap().clear();
         let mut buf = Vec::new();
         let tx = pair
             .client_conn_mut(client_ch)
             .poll_transmit(now, max_datagrams, &mut buf)
             .expect("small datagram fits the remaining window without waiting for an ACK");
         assert!(tx.size < 150);
+        let sent = controller.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, tx.size as u64);
+        drop(sent);
         assert!(pair.client_conn_mut(client_ch).stats().path.in_flight_bytes < 3_000);
         assert_eq!(
             pair.client_conn_mut(client_ch)
@@ -2600,11 +2616,15 @@ fn small_datagram_uses_residual_congestion_window_before_expiry() {
 
 #[test]
 fn due_ack_when_controller_window_is_full() {
-    let (mut pair, client, server, window) = residual_window_pair(false);
+    let (mut pair, client, server, controller) = residual_window_pair(false);
     let before = pair.client_conn_mut(client).stats();
     let flight = before.path.in_flight_bytes;
     assert!(flight > 0);
-    window.0.store(flight, std::sync::atomic::Ordering::Relaxed);
+    controller
+        .window
+        .store(flight, std::sync::atomic::Ordering::Relaxed);
+    assert!(controller.sent.lock().unwrap().len() >= 2);
+    controller.sent.lock().unwrap().clear();
     let queued = Bytes::from(vec![3; 1_000]);
     pair.client_datagrams(client)
         .send(queued.clone(), false)
@@ -2620,6 +2640,10 @@ fn due_ack_when_controller_window_is_full() {
     assert_eq!(after.frame_tx.acks, before.frame_tx.acks + 1);
     assert_eq!(after.frame_tx.datagram, before.frame_tx.datagram);
     assert_eq!(after.path.in_flight_bytes, flight);
+    assert!(
+        controller.sent.lock().unwrap().is_empty(),
+        "pure ACK traffic is not a send sample for the congestion controller"
+    );
 
     pair.drive();
     assert_eq!(
@@ -2633,6 +2657,10 @@ fn due_ack_when_controller_window_is_full() {
         );
     }
     assert_eq!(pair.server_datagrams(server).recv(), Some(queued));
+    assert!(
+        !controller.sent.lock().unwrap().is_empty(),
+        "the resumed data transmission still supplies a congestion sample"
+    );
 }
 
 #[test]

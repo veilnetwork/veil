@@ -593,6 +593,17 @@ impl Connection {
         let mut pad_datagram_to_mtu = false;
         let mut congestion_blocked = false;
         let mut residual_window_packet = false;
+        let mut sent_flight = 0;
+        let mut last_flight_packet = 0;
+        let mut finish_batch_packet =
+            |builder: PacketBuilder, conn: &mut Self, sent, buf: &mut Vec<u8>| {
+                let number = builder.exact_number;
+                let bytes = builder.finish_and_track(now, conn, sent, buf);
+                if bytes != 0 {
+                    sent_flight += bytes;
+                    last_flight_packet = number;
+                }
+            };
 
         // Iterate over all spaces and find data to send
         let mut space_idx = 0;
@@ -839,7 +850,7 @@ impl Connection {
                         builder.pad_to(segment_size as u16);
                     }
 
-                    builder.finish_and_track(now, self, sent_frames.take(), buf);
+                    finish_batch_packet(builder, self, sent_frames.take(), buf);
 
                     if num_datagrams == 1 {
                         // Set the segment size for this GSO batch to the size of the first UDP
@@ -911,7 +922,7 @@ impl Connection {
                 // datagram.
                 // Finish current packet without adding extra padding
                 if let Some(builder) = builder_storage.take() {
-                    builder.finish_and_track(now, self, sent_frames.take(), buf);
+                    finish_batch_packet(builder, self, sent_frames.take(), buf);
                 }
             }
 
@@ -1116,11 +1127,7 @@ impl Connection {
                 builder.pad_to(segment_size as u16);
             }
 
-            let last_packet_number = builder.exact_number;
-            builder.finish_and_track(now, self, sent_frames, buf);
-            self.path
-                .congestion
-                .on_sent(now, buf.len() as u64, last_packet_number);
+            finish_batch_packet(builder, self, sent_frames, buf);
 
             self.config.qlog_sink.emit_recovery_metrics(
                 self.pto_count,
@@ -1128,6 +1135,13 @@ impl Connection {
                 now,
                 self.orig_rem_cid,
             );
+        }
+        // A pure ACK must not overwrite a send observation used to estimate
+        // the delivery rate. Keep one sample for the whole coalesced batch.
+        if sent_flight != 0 {
+            self.path
+                .congestion
+                .on_sent(now, sent_flight, last_flight_packet);
         }
 
         self.app_limited = buf.is_empty() && !congestion_blocked;
