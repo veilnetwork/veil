@@ -78,6 +78,26 @@ int main() {
             "large burst did not protect audio immediately");
     require(severe.FreshReportUs(7'000'002) == 0, "large burst never expired");
   }
+  {
+    using Kind = AudioSoftLossWindow::Kind;
+    AudioSoftLossWindow damage;
+    damage.Observe(Kind::Concealment, 1, 1, 0, true, true, 1'000'000);
+    damage.Observe(Kind::Catchup, 1, 1, 0, true, true, 1'000'000);
+    damage.Observe(Kind::Concealment, 1, 2, 483*48, true, true, 2'000'000);
+    require(damage.FreshReportUs(2'000'000) == 2'000'000, "startup outage did not qualify");
+    damage.Observe(Kind::Concealment, 1, 3, 511*48, true, true, 3'000'000);
+    damage.Observe(Kind::Catchup, 1, 2, 10*48, true, true, 5'000'000);
+    damage.Observe(Kind::Catchup, 1, 3, 30*48, true, true, 6'000'000);
+    require(damage.Samples(6'000'000) == 541*48 &&
+                damage.FreshReportUs(6'000'000) == 2'000'000,
+            "already reported outage made small follow-up damage significant again");
+    damage.Observe(Kind::Concealment, 1, 4, 573*48, true, true, 7'000'000);
+    require(damage.FreshReportUs(7'000'000) == 7'000'000,
+            "fresh moderate damage over three seconds did not qualify separately");
+    damage.Observe(Kind::Catchup, 1, 4, 270*48, true, true, 7'100'000);
+    require(damage.FreshReportUs(7'100'000) == 7'100'000,
+            "another severe burst did not qualify immediately");
+  }
   AudioRecoveryRegistry registry_a, registry_b;
   const auto decoder_a = registry_a.NewStream();
   const auto decoder_b = registry_b.NewStream();

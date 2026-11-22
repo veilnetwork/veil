@@ -54,11 +54,23 @@ class AudioSoftLossWindow {
     if (!fresh || !delta) return;
     events_.push_back({at_us, std::min(delta, kMaximumSamples)});
     if (events_.size() > 4096) events_.pop_front();
-    const auto damage = Samples(at_us);
+    // Keep the full duration for diagnostics. A report for the controller
+    // needs enough new damage since the last report, so a small catch-up
+    // cannot requalify an already reported outage still in the window.
+    uint64_t damage = 0;
+    int64_t first_us = at_us;
+    for (const auto& event : events_) {
+      if (event.reported || event.at_us > at_us || at_us - event.at_us >= kWindowUs)
+        continue;
+      damage = std::min(kMaximumSamples, damage + event.samples);
+      first_us = std::min(first_us, event.at_us);
+    }
     if (damage >= kBurstThresholdSamples ||
-        (damage >= kThresholdSamples &&
-         at_us - events_.front().at_us >= kSustainedUs)) {
-      qualified_at_us_ = at_us;
+        (damage >= kThresholdSamples && at_us - first_us >= kSustainedUs)) {
+      for (auto& event : events_) {
+        if (event.at_us <= at_us) event.reported = true;
+      }
+      qualified_at_us_ = std::max(qualified_at_us_, at_us);
     }
   }
   bool supported() const { return supported_; }
@@ -88,7 +100,7 @@ class AudioSoftLossWindow {
   }
  private:
   struct Baseline { uint64_t sequence = 0, counter = 0; int64_t at_us = 0; };
-  struct Event { int64_t at_us; uint64_t samples; };
+  struct Event { int64_t at_us; uint64_t samples; bool reported = false; };
   void Prune(int64_t now_us) {
     while (!events_.empty() && now_us - events_.front().at_us >= kWindowUs)
       events_.pop_front();
