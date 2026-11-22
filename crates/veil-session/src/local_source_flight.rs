@@ -61,6 +61,7 @@ struct State {
     active_until: Option<Instant>,
     healthy_until: Option<Instant>,
     pressure_until: Option<Instant>,
+    transport_warning_at: Option<Instant>,
     growth_hold_until: Option<Instant>,
     // Retain, never enlarge, an already-permitted allowance through the
     // validated health sample's TTL, independently of the growth hold's end.
@@ -83,11 +84,12 @@ struct State {
 pub(crate) struct SourceFlightPool(Mutex<State>);
 
 impl State {
-    fn pressure(&mut self, now: Instant) {
-        self.pressure_until = Some(
-            self.pressure_until
-                .map_or(now + PRESSURE_GRACE, |at| at.max(now + PRESSURE_GRACE)),
-        );
+    fn pressure_deadline(&self) -> Option<Instant> {
+        self.pressure_until
+            .max(self.transport_warning_at.map(|at| at + PRESSURE_GRACE))
+    }
+
+    fn reduce_after_pressure(&mut self, now: Instant) {
         self.healthy_until = None;
         self.held_secondary_trial = None;
         self.delivered_credit = 0;
@@ -166,7 +168,7 @@ impl State {
     // A growth hold may retain the previously permitted limit until its
     // original deadline, without increasing it or banking a paid window.
     fn secondary_trial_limit(&self, now: Instant) -> Option<u64> {
-        if self.pressure_until.is_some_and(|until| now < until) {
+        if self.pressure_deadline().is_some_and(|until| now < until) {
             return None;
         }
         if self.growth_hold_until.is_some_and(|until| now < until) {
@@ -243,9 +245,14 @@ impl SourceFlightPool {
         let wakers = {
             let mut s = lock!(self.0);
             if pressured {
-                s.pressure(now);
-            } else {
-                s.healthy_until = Some(now + IDLE_GRACE);
+                s.pressure_until = s.pressure_until.max(Some(now + PRESSURE_GRACE));
+                s.reduce_after_pressure(now);
+            } else if s.transport_warning_at.is_none_or(|at| now > at) {
+                // A newer consumer sample can supersede a first-hop estimate.
+                // Measured pressure still runs to its own deadline, and the
+                // window stays reduced until demand and delivery fund growth.
+                s.transport_warning_at = None;
+                s.healthy_until = s.healthy_until.max(Some(now + IDLE_GRACE));
             }
             s.wakers()
         };
@@ -274,7 +281,8 @@ impl SourceFlightPool {
                 .delivery_diagnostics
                 .transport_pressure_applied
                 .saturating_add(1);
-            s.pressure(now);
+            s.transport_warning_at = s.transport_warning_at.max(Some(now));
+            s.reduce_after_pressure(now);
             s.wakers()
         };
         wake(wakers);
@@ -341,7 +349,7 @@ impl SourceFlightPool {
                         state.limit(now),
                         state.reserve(now),
                         state.healthy_until.is_some_and(|t| now < t),
-                        state.pressure_until.is_some_and(|t| now < t),
+                        state.pressure_deadline().is_some_and(|t| now < t),
                         state.delivered_credit,
                         state.delivery_diagnostics,
                         state.window,
@@ -544,7 +552,7 @@ impl LocalSendBudget for Binding {
                 s.reserve(now),
                 s.healthy_secondary_probe(now).unwrap_or(0),
                 s.healthy_until.is_some_and(|t| now < t),
-                s.pressure_until.is_some_and(|t| now < t),
+                s.pressure_deadline().is_some_and(|t| now < t),
                 s.growth_hold_until.is_some_and(|t| now < t)
             ))
         } else {
@@ -633,7 +641,7 @@ impl LocalSendBudget for Binding {
                     s.delivery_diagnostics.unhealthy.saturating_add(1);
                 return;
             }
-            if s.pressure_until.is_some_and(|t| now < t) {
+            if s.pressure_deadline().is_some_and(|t| now < t) {
                 s.delivery_diagnostics.pressured =
                     s.delivery_diagnostics.pressured.saturating_add(1);
                 return;
@@ -701,7 +709,7 @@ impl LocalSendBudget for Binding {
             .rows
             .get(&self.id)
             .filter(|row| row.role == Role::Secondary && row.source_coupled)
-            .and_then(|_| s.pressure_until.max(s.growth_hold_until))
+            .and_then(|_| s.pressure_deadline().max(s.growth_hold_until))
             .filter(|until| s.healthy_until.is_some_and(|healthy| *until < healthy));
         s.active_until
             .into_iter()
@@ -773,10 +781,35 @@ mod tests {
         pool.note_primary(expired);
         assert!(pool.transport_pressure(expired));
         assert_eq!(video.window(expired, 0, 1200), 1);
-        // A later positive sample cannot cancel the existing pressure lease.
-        pool.feedback(false, expired);
-        assert!(!pool.transport_pressure(expired));
-        assert_eq!(video.window(expired, 0, 1200), 1);
+        // A newer consumer sample can disprove an earlier first-hop warning.
+        // Recovery starts with the reduced window and must earn growth again.
+        let recovered = expired + Duration::from_millis(100);
+        pool.feedback(false, recovered);
+        assert!(!pool.transport_pressure(recovered));
+        assert_eq!(video.window(recovered, 0, 1200), 2401);
+    }
+
+    #[test]
+    fn stale_health_and_held_feedback_do_not_clear_first_hop_pressure() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let control = pool.binding(1, Role::Control, now).unwrap();
+        let video = pool.binding(2, Role::Secondary, now).unwrap();
+        control.update_flight(100_000);
+        pool.note_primary(now);
+        let warning = now + Duration::from_millis(200);
+        assert!(pool.transport_pressure(warning));
+        pool.feedback(false, now);
+        assert_eq!(video.window(warning, 0, 1200), 1);
+        assert!(pool.transport_pressure(warning));
+
+        let held = warning + Duration::from_millis(100);
+        pool.hold_growth(held, held + Duration::from_secs(1), held);
+        assert_eq!(video.window(held, 0, 1200), 1);
+        pool.feedback(false, held);
+        assert_eq!(video.window(held, 0, 1200), 1);
+        assert_eq!(video.next_wakeup(held), Some(held + Duration::from_secs(1)));
+        assert_eq!(video.window(held + Duration::from_secs(1), 0, 1200), 2401);
     }
 
     #[test]
@@ -788,6 +821,8 @@ mod tests {
         control.update_flight(100_000);
         pool.note_primary(now);
         pool.feedback(true, now);
+        let path_warning = now + Duration::from_millis(50);
+        assert!(pool.transport_pressure(path_warning));
         let recovered = now + Duration::from_millis(100);
         let grace_end = now + PRESSURE_GRACE;
         assert_eq!(video.next_wakeup(recovered), Some(now + IDLE_GRACE));
