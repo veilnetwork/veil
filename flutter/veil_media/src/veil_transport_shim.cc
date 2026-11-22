@@ -731,7 +731,11 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
       sample.highest_sequence = block.extended_high_seq_num();
       // Preserve sub-one-percent loss and a lossy block followed by a healthy
       // block in the same valid compound packet.
-      if (block.fraction_lost() != 0) sample.loss_report_us = arrived_us;
+      if (block.fraction_lost() != 0) {
+        sample.loss_report_us = arrived_us;
+        sample.loss_report_fraction = std::max(
+            sample.loss_report_fraction, int(block.fraction_lost()));
+      }
       const uint32_t clock_rate = audio ? 48000 : 90000;
       sample.jitter_ms = static_cast<int>(uint64_t(block.jitter()) * 1000 / clock_rate);
       sample.last_sender_report = block.last_sr();
@@ -839,8 +843,11 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
     if (candidate.arrived_us > 0 && candidate.arrived_us >= audio_feedback_.arrived_us) {
       candidate.route_epoch = rtcp_route_clock_.epoch();
       if (!rtcp_route_clock_.Accepts(candidate.last_sender_report)) candidate.rtt_ms = 0;
-      candidate.loss_report_us = std::max(candidate.loss_report_us,
-                                          audio_feedback_.loss_report_us);
+      if (candidate.loss_report_us <= audio_feedback_.loss_report_us) {
+        candidate.loss_report_fraction = std::max(
+            candidate.loss_report_fraction, audio_feedback_.loss_report_fraction);
+        candidate.loss_report_us = audio_feedback_.loss_report_us;
+      }
       audio_feedback_ = candidate;
     }
     if (video_candidate.arrived_us > 0 && video_candidate.arrived_us >= video_feedback_.arrived_us) {
