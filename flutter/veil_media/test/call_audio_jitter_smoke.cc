@@ -65,6 +65,7 @@ static std::vector<Packet> encode(const std::vector<int16_t>& speech, int ms) {
 static std::vector<Packet> network(const std::vector<Packet>& encoded, int profile, int seed) {
   std::mt19937 rng(seed);
   std::vector<Packet> result;
+  int serialized_until_ms = 0;
   for (auto p : encoded) {
     // 0 is the fixed 60-ms path; 1/2 add uniform jitter and reorder.
     if (profile == 1) p.at += rng()%101;
@@ -84,8 +85,15 @@ static std::vector<Packet> network(const std::vector<Packet>& encoded, int profi
     // the brief source lag overlaps the 550-ms network jitter measurement.
     if (profile == 8 && p.begin >= 10800) p.at += 50;
     if (profile == 8 && p.begin >= 18800) p.at += 40;
-    if ((profile == 7 || profile == 8) && p.at >= 4000) {
+    if ((profile == 7 || profile == 8 || profile == 9) && p.at >= 4000) {
       p.at += std::max(0, 550 - p.at % 1000);
+    }
+    if (profile == 9) {
+      // An open link drains the held packets at a finite rate, with other
+      // opaque datagrams serialized ahead of individual audio packets.
+      const int service_ms = 2 + static_cast<int>(rng() % 10);
+      serialized_until_ms = std::max(serialized_until_ms, p.at) + service_ms;
+      p.at = serialized_until_ms;
     }
     result.push_back(std::move(p));
   }
@@ -231,5 +239,18 @@ int main(int argc,char**argv) {
   need(spikes.max_target >= 300 && spikes.max_target <= 500, "source delays did not exercise the adaptive reserve");
   need(spikes.discarded == 0, "source delays erased the established jitter reserve");
   need(spikes.played_plc <= 90, "source delays added concealment beyond the introduced gaps");
+  auto serialized = network(encoded, 9, 197);
+  // Check every alignment of wire arrivals with the 10-ms decoder callback.
+  for (int phase = 0; phase < 10; ++phase) {
+    const auto measured = run(serialized, true, 10000);
+    std::printf("serialized 550-ms bursts at phase %d: concealed=%llu ms discarded=%llu ms target=%d ms\n",
+        phase, (unsigned long long)measured.played_plc,
+        (unsigned long long)measured.discarded, measured.max_target);
+    need(measured.max_target >= 300 && measured.max_target <= 500,
+        "serialized bursts did not exercise the adaptive reserve");
+    need(measured.discarded == 0, "paced bursts erased the jitter reserve");
+    need(measured.played_plc == 0, "paced bursts caused repeated played concealment");
+    for (auto& packet : serialized) ++packet.at;
+  }
   std::puts("PASS lossless jitter/reorder speech reserve across 20/40/60-ms Opus");
 }

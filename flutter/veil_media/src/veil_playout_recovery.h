@@ -261,7 +261,10 @@ class RecoveringNetEq final : public webrtc::NetEq {
     // of dropping it abruptly on an even later arrival.
     const int ceiling_ms = applied_target_ceiling_ms_ > 0
         ? applied_target_ceiling_ms_ : kMaximumAdaptiveTargetMs;
-    const int max_reserve_ms = ceiling_ms + frame_headroom_ms_ + headroom_ms;
+    // A burst that drains through a paced link can overlap one more encoded
+    // packet while decoder/render headroom is occupied. Bound the measured
+    // arrival allowance separately from the two packets of decoder headroom.
+    const int max_reserve_ms = ceiling_ms + 2 * headroom_ms;
     const int recent_ms = rtp_lag_.RecentArrivalVariationMs(now_us);
     if (target_reserve_ms <= NominalRecoveryBudgetMs() && recent_ms > max_reserve_ms)
       return target_reserve_ms;
