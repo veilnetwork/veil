@@ -2688,7 +2688,7 @@ async fn handle_ipc_client(
                                 // influence cadence. Expiry begins before any destination
                                 // or global handler wait and is never renewed by retries.
                                 let batch_owned = batch.map(|(bodies, sizes, key)| {
-                                    let schedule = lossy_cadence.observe(key, ctx.source_received_at);
+                                    let schedule = lossy_cadence.observe(key, ctx.source_received_at, sizes.len());
                                     let work = veil_types::local_lossy_work::LocalLossyWork::new_paced(
                                         sizes, schedule.span,
                                         ctx.source_received_at + schedule.max_age,
