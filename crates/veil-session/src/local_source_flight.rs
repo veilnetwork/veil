@@ -694,8 +694,18 @@ impl LocalSendBudget for Binding {
     }
     fn next_wakeup(&self, now: Instant) -> Option<Instant> {
         let s = lock!(self.pool.0);
+        // Positive feedback can arrive before an existing pressure or growth
+        // hold ends. Recheck the already-funded trial at that boundary even
+        // if this connection has no ACKs or new work to wake it.
+        let secondary_resume = s
+            .rows
+            .get(&self.id)
+            .filter(|row| row.role == Role::Secondary && row.source_coupled)
+            .and_then(|_| s.pressure_until.max(s.growth_hold_until))
+            .filter(|until| s.healthy_until.is_some_and(|healthy| *until < healthy));
         s.active_until
             .into_iter()
+            .chain(secondary_resume)
             .chain(s.rows.values().filter_map(|r| r.closed_until))
             .filter(|at| *at > now)
             .min()
@@ -767,6 +777,50 @@ mod tests {
         pool.feedback(false, expired);
         assert!(!pool.transport_pressure(expired));
         assert_eq!(video.window(expired, 0, 1200), 1);
+    }
+
+    #[test]
+    fn healthy_secondary_wakes_at_end_of_existing_pressure() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let control = pool.binding(1, Role::Control, now).unwrap();
+        let video = pool.binding(2, Role::Secondary, now).unwrap();
+        control.update_flight(100_000);
+        pool.note_primary(now);
+        pool.feedback(true, now);
+        let recovered = now + Duration::from_millis(100);
+        let grace_end = now + PRESSURE_GRACE;
+        assert_eq!(video.next_wakeup(recovered), Some(now + IDLE_GRACE));
+        pool.feedback(false, recovered);
+        assert_eq!(video.window(recovered, 0, 1200), 1);
+        assert_eq!(video.next_wakeup(recovered), Some(grace_end));
+        assert_eq!(control.next_wakeup(recovered), Some(now + IDLE_GRACE));
+        // The timer is the only event between feedback and the next poll.
+        assert_eq!(video.window(grace_end, 0, 1200), 2401);
+        assert_eq!(video.next_wakeup(grace_end), Some(now + IDLE_GRACE));
+    }
+
+    #[test]
+    fn secondary_resume_waits_for_the_longer_hold_and_requires_fresh_health() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let control = pool.binding(1, Role::Control, now).unwrap();
+        let video = pool.binding(2, Role::Secondary, now).unwrap();
+        control.update_flight(100_000);
+        pool.note_primary(now);
+        pool.feedback(true, now);
+        let held_until = now + Duration::from_millis(2500);
+        pool.hold_growth(now, held_until, now);
+        let recovered = now + Duration::from_millis(100);
+        pool.feedback(false, recovered);
+        assert_eq!(video.next_wakeup(recovered), Some(held_until));
+        assert_eq!(video.window(now + PRESSURE_GRACE, 0, 1200), 1);
+        assert_eq!(video.window(held_until, 0, 1200), 2401);
+
+        let later = now + Duration::from_secs(1);
+        pool.hold_growth(later, later + IDLE_GRACE, later);
+        pool.feedback(false, later);
+        assert_eq!(video.next_wakeup(later), Some(now + IDLE_GRACE));
     }
 
     #[test]
