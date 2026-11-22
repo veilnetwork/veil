@@ -1670,6 +1670,16 @@ impl DhtMlKemEkResolver {
         &self,
         target_node_id: [u8; 32],
     ) -> Option<veil_types::ResolvedRelayKey> {
+        self.fetch_relay_x25519_record(target_node_id)
+            .await
+            .map(|(key, _)| key)
+    }
+
+    /// The verified key and the signed publication time of the same record.
+    pub(crate) async fn fetch_relay_x25519_record(
+        &self,
+        target_node_id: [u8; 32],
+    ) -> Option<(veil_types::ResolvedRelayKey, u64)> {
         let doc = self
             .fetch_verified_document(target_node_id, Some(target_node_id))
             .await?;
@@ -1734,10 +1744,13 @@ impl DhtMlKemEkResolver {
         // The stamp goes with the key. Everything downstream — the IPC reply,
         // and the rendezvous ad built from it — needs to know when this stops
         // being the peer's key, and had no way to ask.
-        Some(veil_types::ResolvedRelayKey {
-            pk: verified.pk,
-            valid_until_unix: verified.valid_until_unix,
-        })
+        Some((
+            veil_types::ResolvedRelayKey {
+                pk: verified.pk,
+                valid_until_unix: verified.valid_until_unix,
+            },
+            record.valid_from_unix,
+        ))
     }
 
     /// Multi-replica FIND_VALUE: ask every directly-reachable replication
@@ -1746,7 +1759,7 @@ impl DhtMlKemEkResolver {
     /// and repair the local mirror with the winner's bytes.
     ///
     /// The ML-KEM walk analogue of the rendezvous freshest-ad selection
-    /// (`replicas_from_freshest_ads`): after receiver churn a STALE replica of
+    /// (`freshest_replica_ads`): after receiver churn a STALE replica of
     /// the identity document / instance registry / key cert stays correctly
     /// signed and unexpired, so the old first-replica-wins walk could seal a
     /// mailbox blob to OUTDATED material — the receiver then cannot open it

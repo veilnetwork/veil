@@ -11,7 +11,7 @@
 //!
 //!  * [`RendezvousResolverImpl`] answers `LookupRendezvousReplicas` for the
 //!    app, through the IPC server.
-//!  * `resolve_fresh_rendezvous_ads` and `replicas_from_freshest_ads` are the
+//!  * `resolve_fresh_rendezvous_ads` and `freshest_replica_ads` are the
 //!    rule itself — newest generation first, KEM-bearing preferred, one
 //!    replica per relay, capped.
 //!  * [`RuntimeAnonOnionSender`] is the caller that has to be right about it:
@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::mlkem_resolver::{CandidateRetry, recursive_dht_get_candidates};
+use crate::mlkem_resolver::{CandidateRetry, DhtMlKemEkResolver, recursive_dht_get_candidates};
 
 use veil_util::lock;
 
@@ -174,6 +174,7 @@ pub struct RendezvousResolverImpl {
     resolve_cache: Arc<super::anonymity_state::RendezvousResolveCache>,
     logger: Arc<veil_observability::NodeLogger>,
     peer_authorization: Arc<crate::mlkem_cert_store::MlKemCertStore>,
+    relay_key_resolver: Arc<DhtMlKemEkResolver>,
 }
 
 impl RendezvousResolverImpl {
@@ -188,6 +189,7 @@ impl RendezvousResolverImpl {
         local_node_id: [u8; 32],
         logger: Arc<veil_observability::NodeLogger>,
         peer_authorization: Arc<crate::mlkem_cert_store::MlKemCertStore>,
+        relay_key_resolver: Arc<DhtMlKemEkResolver>,
     ) -> Self {
         Self {
             dht,
@@ -197,7 +199,39 @@ impl RendezvousResolverImpl {
             resolve_cache: Arc::new(super::anonymity_state::RendezvousResolveCache::new()),
             logger,
             peer_authorization,
+            relay_key_resolver,
         }
+    }
+
+    async fn refresh_mailbox_relay_key(
+        &self,
+        ad: &veil_anonymity::rendezvous::RendezvousAd,
+    ) -> Option<veil_types::ResolvedRelayKey> {
+        use veil_anonymity::rendezvous::RENDEZVOUS_KEM_ALGO_X25519;
+
+        // Only the receiver may designate a mailbox relay. For that same relay
+        // a newer authenticated directory record can repair a stale KEM key
+        // while the receiver is offline. Push and wake envelopes are bound to
+        // the advertised key, so keep them together with it.
+        if ad.rendezvous_kem_algo != RENDEZVOUS_KEM_ALGO_X25519
+            || ad.rendezvous_kem_pk.len() != 32
+            || !ad.push_envelope.is_empty()
+            || !ad.wake_hmac_envelope.is_empty()
+        {
+            return None;
+        }
+        // Candidates run concurrently. Bound this additional wait even
+        // when DHT peers are silent and the ad walk used its full budget.
+        const KEY_REFRESH_BUDGET: Duration = Duration::from_millis(1500);
+        let (key, issued) = tokio::time::timeout(
+            KEY_REFRESH_BUDGET,
+            self.relay_key_resolver
+                .fetch_relay_x25519_record(ad.rendezvous_node_id),
+        )
+        .await
+        .ok()??;
+        (issued > ad.valid_from_unix && key.pk.as_slice() != ad.rendezvous_kem_pk.as_slice())
+            .then_some(key)
     }
 }
 
@@ -629,10 +663,10 @@ impl RuntimeAnonOnionSender {
     }
 }
 
-fn replicas_from_freshest_ads(
+fn freshest_replica_ads(
     mut ads: Vec<veil_anonymity::rendezvous::RendezvousAd>,
     cap: usize,
-) -> Vec<veil_ipc::ResolvedReplica> {
+) -> Vec<veil_anonymity::rendezvous::RendezvousAd> {
     // GENERATION gate (mirrors the live-introduce spread): the receiver
     // re-signs all its plain ads together with one shared valid_from stamp
     // (see tick_publish_rendezvous_ads), so the newest stamp identifies its
@@ -692,15 +726,7 @@ fn replicas_from_freshest_ads(
         if !seen_relays.insert(ad.rendezvous_node_id) {
             continue;
         }
-        out.push(veil_ipc::ResolvedReplica {
-            relay_node_id: ad.rendezvous_node_id,
-            valid_until_unix: ad.valid_until_unix,
-            push_envelope: ad.push_envelope,
-            capability_token: ad.capability_token,
-            wake_hmac_envelope: ad.wake_hmac_envelope,
-            rendezvous_kem_algo: ad.rendezvous_kem_algo,
-            rendezvous_kem_pk: ad.rendezvous_kem_pk,
-        });
+        out.push(ad);
         if out.len() >= cap {
             break;
         }
@@ -1097,8 +1123,7 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
                 .max(1)
                 .min(veil_anonymity::rendezvous::MAX_RENDEZVOUS_AD_SLOTS as usize);
             // Walk all slots CONCURRENTLY — bounded total ≈ ONE walk's timeout,
-            // not cap × timeout — so resolve_replicas returns within the IPC
-            // reply window (5s) even when every slot misses (e.g. the ad hasn't
+            // not cap × timeout — even when every slot misses (e.g. the ad hasn't
             // replicated yet). The local-fast-path validator only trusts a cached
             // ad that decodes, verifies, names this receiver, and is currently
             // valid (mirror-cache-poison resistant); remote results re-verified.
@@ -1140,17 +1165,47 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
                     ads = stale;
                 }
             }
-            ads.retain(|ad| {
+            let binding_ok = |ad: &veil_anonymity::rendezvous::RendezvousAd| {
                 super::rendezvous_ad_binding::peer_ad_binding_ok(
                     &self.dht,
                     &self.peer_authorization.document_floor,
                     ad,
                 )
-            });
+            };
+            ads.retain(binding_ok);
             // Prefer the freshest signed ad before relay dedup. This avoids
             // returning a stale pre-cookie-fix ad just because it was in a
             // lower-numbered slot for the same relay.
-            replicas_from_freshest_ads(ads, cap)
+            let ads = freshest_replica_ads(ads, cap);
+            let keys =
+                futures::future::join_all(ads.iter().map(|ad| self.refresh_mailbox_relay_key(ad)))
+                    .await;
+            // Re-check the window and signer against the live floor after
+            // waiting for all the relay keys.
+            let now = veil_util::unix_secs_now_u64();
+            ads.into_iter()
+                .zip(keys)
+                .filter(|(ad, _)| ad.valid_until_unix >= now && binding_ok(ad))
+                .map(|(ad, replacement)| {
+                    let (rendezvous_kem_pk, valid_until_unix) =
+                        match replacement.filter(|key| key.valid_until_unix >= now) {
+                            Some(key) => (
+                                key.pk.to_vec(),
+                                key.valid_until_unix.min(ad.valid_until_unix),
+                            ),
+                            None => (ad.rendezvous_kem_pk, ad.valid_until_unix),
+                        };
+                    veil_ipc::ResolvedReplica {
+                        relay_node_id: ad.rendezvous_node_id,
+                        valid_until_unix,
+                        push_envelope: ad.push_envelope,
+                        capability_token: ad.capability_token,
+                        wake_hmac_envelope: ad.wake_hmac_envelope,
+                        rendezvous_kem_algo: ad.rendezvous_kem_algo,
+                        rendezvous_kem_pk,
+                    }
+                })
+                .collect()
         })
     }
 }
@@ -1195,16 +1250,16 @@ mod tests {
         let fresh_other_relay = test_rendezvous_ad(0xB2, 290, 2);
         let fresh_same_relay = test_rendezvous_ad(0xA1, 300, 3);
 
-        let out = replicas_from_freshest_ads(
+        let out = freshest_replica_ads(
             vec![stale_same_relay, fresh_other_relay, fresh_same_relay],
             8,
         );
 
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0].relay_node_id, [0xA1; 32]);
+        assert_eq!(out[0].rendezvous_node_id, [0xA1; 32]);
         assert_eq!(out[0].valid_until_unix, 300);
         assert_eq!(out[0].rendezvous_kem_pk, vec![3; 32]);
-        assert_eq!(out[1].relay_node_id, [0xB2; 32]);
+        assert_eq!(out[1].rendezvous_node_id, [0xB2; 32]);
         assert_eq!(out[1].valid_until_unix, 290);
     }
 
@@ -1217,15 +1272,15 @@ mod tests {
         let old_generation = test_rendezvous_ad(0xA1, 100, 1);
         let current = test_rendezvous_ad(0xB2, 300, 2);
 
-        let out = replicas_from_freshest_ads(vec![old_generation.clone(), current], 8);
+        let out = freshest_replica_ads(vec![old_generation.clone(), current], 8);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].relay_node_id, [0xB2; 32]);
+        assert_eq!(out[0].rendezvous_node_id, [0xB2; 32]);
 
         // An all-stale view (resolver hit only lagging replicas) still
         // deposits somewhere rather than failing.
-        let out = replicas_from_freshest_ads(vec![old_generation], 8);
+        let out = freshest_replica_ads(vec![old_generation], 8);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].relay_node_id, [0xA1; 32]);
+        assert_eq!(out[0].rendezvous_node_id, [0xA1; 32]);
     }
 
     #[test]
@@ -1241,14 +1296,14 @@ mod tests {
         // window) — a KEM-bearing ad must still outrank the KEM-less one.
         let fresh_kem = test_rendezvous_ad(0xB2, 100, 7);
 
-        let out = replicas_from_freshest_ads(vec![stale_kemless, fresh_kem], 8);
+        let out = freshest_replica_ads(vec![stale_kemless, fresh_kem], 8);
 
         assert_eq!(out.len(), 2);
         // The KEM-bearing ad wins despite its EARLIER valid_until.
-        assert_eq!(out[0].relay_node_id, [0xB2; 32]);
+        assert_eq!(out[0].rendezvous_node_id, [0xB2; 32]);
         assert_eq!(out[0].rendezvous_kem_pk, vec![7; 32]);
         // The KEM-less ad is still returned, but only as the last-resort fallback.
-        assert_eq!(out[1].relay_node_id, [0xA1; 32]);
+        assert_eq!(out[1].rendezvous_node_id, [0xA1; 32]);
         assert!(out[1].rendezvous_kem_pk.is_empty());
     }
 
@@ -1276,7 +1331,7 @@ mod tests {
             rendezvous_kem_pk: vec![2; 32],
             ..test_rendezvous_ad(0xA1, 0, 2)
         };
-        let out = replicas_from_freshest_ads(vec![stale_long, fresh_short], 8);
+        let out = freshest_replica_ads(vec![stale_long, fresh_short], 8);
         assert_eq!(out.len(), 1, "same relay dedups to one");
         assert_eq!(
             out[0].rendezvous_kem_pk,
@@ -1288,7 +1343,7 @@ mod tests {
 
     #[test]
     fn rendezvous_replicas_respect_cap_after_freshness_sort() {
-        let out = replicas_from_freshest_ads(
+        let out = freshest_replica_ads(
             vec![
                 test_rendezvous_ad(0xA1, 100, 1),
                 test_rendezvous_ad(0xB2, 300, 2),
@@ -1298,7 +1353,7 @@ mod tests {
         );
 
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].relay_node_id, [0xB2; 32]);
+        assert_eq!(out[0].rendezvous_node_id, [0xB2; 32]);
         assert_eq!(out[0].valid_until_unix, 300);
     }
 

@@ -326,8 +326,9 @@ class RendezvousReplica {
   /// KEM algorithm tag for [rendezvousKemPk] (`0` = X25519).
   final int rendezvousKemAlgo;
 
-  /// The relay's KEM public key from the resolved v5 RendezvousAd — the seal
-  /// target the sender passes as `targetX25519Pk` to
+  /// The relay's KEM public key from the resolved v5 RendezvousAd or a
+  /// newer verified directory record for that relay. The sender passes it
+  /// as `targetX25519Pk` to
   /// [VeilClient.sendAnonymousDirect] to anonymously deposit a mailbox PUT at
   /// this relay's `(relayNodeId, MAILBOX_APP_ID, PUT_ENDPOINT)`. Empty for
   /// pre-v5 ads / no advertised key (fall back to the live rendezvous path).

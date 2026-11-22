@@ -405,8 +405,8 @@ impl NodeRuntime {
             Some(super::offline_seal::relayed_unopenable_signer(
                 self.identity.sovereign_identity.clone(),
             ));
-        let relay_key_resolver: Arc<dyn veil_types::RelayKeyResolver> =
-            dht_key_resolver as Arc<dyn veil_types::RelayKeyResolver>;
+        let relay_key_resolver =
+            Arc::clone(&dht_key_resolver) as Arc<dyn veil_types::RelayKeyResolver>;
         // Authenticated anonymous (onion/rendezvous) sender for the IPC
         // `anonymous_authenticated` flag. Holds the access bundle + the
         // configured circuit length.
@@ -739,6 +739,7 @@ impl NodeRuntime {
                 *self.identity.local_identity.node_id.as_bytes(),
                 Arc::clone(&self.logger),
                 Arc::clone(&self.identity.peer_mlkem_cert_store),
+                dht_key_resolver,
             ));
         server = server.with_rendezvous_resolver(resolver);
         // log IpcServer::run failure instead of swallowing.
