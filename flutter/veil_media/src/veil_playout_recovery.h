@@ -276,10 +276,13 @@ class RecoveringNetEq final : public webrtc::NetEq {
     // promoting it to a persistent playout allowance.
     // Stricter caller ceilings and longer frames keep their usual allowance.
     // This only gates decoded catch-up.
-    constexpr int kShortOpusPacketMs = 20;
+    // A 40-ms packet can also leave a full 500-ms target short of the next
+    // paced burst. In that case the packet-sized allowance would trim audio
+    // that has already arrived and force concealment during the next gap.
+    constexpr int kMaxShortOpusPacketMs = 40;
     constexpr int kShortPacketReserveLimitMs = 720 - kRenderBlockMs;
     const bool full_short_packet_queue = ceiling_ms == kMaximumAdaptiveTargetMs &&
-        frame_headroom_ms_ == kShortOpusPacketMs;
+        frame_headroom_ms_ <= kMaxShortOpusPacketMs;
     const int max_reserve_ms = full_short_packet_queue
         ? kShortPacketReserveLimitMs
         : ceiling_ms + 2 * headroom_ms;

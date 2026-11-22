@@ -243,6 +243,22 @@ int main(int argc,char**argv) {
          "overlapping paced bursts discarded packets inside NetEq");
     need(sustained.played_plc <= 150, "overlap caused repeated audio gaps");
   }
+  const auto encoded_40ms = encode(speech, 40);
+  for (int seed : {197, 17, 41}) {
+    const auto held = network(encoded_40ms, 12, seed);
+    need(held.size() == encoded_40ms.size(), "40-ms overlap removed packets");
+    const auto sustained = run(held, true, 10000, true);
+    std::printf("40-ms overlapping paced bursts, seed %d: concealed=%llu ms "
+                "hard_discard=%llu ms target=%d ms\n", seed,
+        (unsigned long long)sustained.played_plc,
+        (unsigned long long)sustained.discarded, sustained.max_target);
+    std::fflush(stdout);
+    need(sustained.max_target == 500, "40-ms overlap lost the 500 ms target");
+    need(sustained.packet_flushes == 0 && sustained.packet_discarded == 0,
+         "40-ms overlap dropped packets inside NetEq");
+    need(sustained.discarded == 0 && sustained.played_plc <= 20,
+         "40-ms catch-up removed speech needed for the next burst");
+  }
   for (int seed : {197, 17, 41}) {
     const auto held = network(encoded_20ms, 11, seed);
     need(held.size() == encoded_20ms.size(), "held burst removed packets");
