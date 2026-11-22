@@ -271,14 +271,14 @@ bool VeilTransportShim::RebindChannel(uint64_t veil_chan, bool retain_previous_r
     auto* clock = webrtc::Clock::GetRealTimeClock();
     rtcp_route_clock_.Reset(webrtc::CompactNtp(clock->CurrentNtpTime()));
     video_loss_persistence_.RouteChanged();
-    video_payload_loss_.Reset(webrtc::TimeMicros());
-    // Audio RR evidence collected on the old outbound path must not shed
-    // video on the new one. Fence queued reports by their ingress time.
+    route_feedback_after_us_ = webrtc::TimeMicros();
+    video_payload_loss_.Reset(route_feedback_after_us_);
+    // Loss and jitter measured on the old outbound path must not shed video
+    // on the new one. Fence queued reports by their ingress time.
     // Receiver playout evidence and live media counters survive the switch.
-    audio_feedback_after_us_ = webrtc::TimeMicros();
     audio_feedback_ = {};
+    video_feedback_ = {};
     audio_feedback_.route_epoch = rtcp_route_clock_.epoch();
-    video_feedback_.rtt_ms = 0;
     video_feedback_.route_epoch = rtcp_route_clock_.epoch();
     veil_chan_.store(veil_chan, std::memory_order_release);
   }
@@ -822,7 +822,7 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
   if (candidate.arrived_us > 0 || video_candidate.arrived_us > 0 ||
       playout.supported || recovery || concealment || delivery || transport_seen) {
     std::lock_guard lock(audio_feedback_mu_);
-    if (transport_seen) {
+    if (transport_seen && arrived_us > route_feedback_after_us_) {
       video_payload_loss_.Observe(transport_statuses, transport_known, arrived_us);
       if (video_payload_loss_.FreshAt(arrived_us))
         video_feedback_.persistent_loss_report_us = std::max(
@@ -842,7 +842,7 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
           concealment->origin, concealment->sequence, concealment->concealed_samples,
           concealment->known, concealment->age_ms != kUnknownRecoveryAge, arrived_us);
     }
-    if (candidate.arrived_us > audio_feedback_after_us_ &&
+    if (candidate.arrived_us > route_feedback_after_us_ &&
         candidate.arrived_us >= audio_feedback_.arrived_us) {
       candidate.route_epoch = rtcp_route_clock_.epoch();
       if (!rtcp_route_clock_.Accepts(candidate.last_sender_report)) candidate.rtt_ms = 0;
@@ -853,7 +853,8 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
       }
       audio_feedback_ = candidate;
     }
-    if (video_candidate.arrived_us > 0 && video_candidate.arrived_us >= video_feedback_.arrived_us) {
+    if (video_candidate.arrived_us > route_feedback_after_us_ &&
+        video_candidate.arrived_us >= video_feedback_.arrived_us) {
       video_candidate.route_epoch = rtcp_route_clock_.epoch();
       if (!rtcp_route_clock_.Accepts(video_candidate.last_sender_report)) video_candidate.rtt_ms = 0;
       video_candidate.loss_report_us = std::max(video_candidate.loss_report_us,

@@ -43,6 +43,9 @@ class AudioRecoveryFeedbackTest {
                       int64_t at) {
     shim.ObserveReceiverFeedback(bytes, at);
   }
+  static bool HasFreshVideoFeedback(VeilTransportShim& shim, int64_t at) {
+    return shim.video_payload_loss_.FreshAt(at);
+  }
 };
 }  // namespace veil_media
 int main() {
@@ -105,6 +108,81 @@ int main() {
     require(current.route_epoch == 1 && current.loss_report_us == received_us &&
                 current.loss_report_fraction == 51 && current.jitter_ms == 100,
             "fresh loss on the new path was not measured");
+    path.Stop();
+  }
+  {
+    VeilTransportShim path(195, nullptr, nullptr, nullptr, nullptr);
+    path.SetLocalVideoSsrc(33);
+    path.Start();
+    const auto report = [&](uint32_t highest, int lost, int64_t arrived) {
+      webrtc::rtcp::ReceiverReport rr;
+      rr.SetSenderSsrc(44);
+      webrtc::rtcp::ReportBlock block;
+      block.SetMediaSsrc(33);
+      block.SetExtHighestSeqNum(highest);
+      block.SetCumulativeLost(lost);
+      block.SetFractionLost(lost ? 32 : 0);
+      block.SetJitter(9000);
+      rr.AddReportBlock(block);
+      const auto bytes = rr.Build();
+      AudioRecoveryFeedbackTest::Observe(path, bytes, arrived);
+    };
+    const auto entered_us = webrtc::TimeMicros() - 5'000'000;
+    report(100, 0, entered_us);
+    report(101, 1, entered_us + 10'000);
+    const auto old_loss = entered_us + 3'020'000;
+    report(110, 1, old_loss);
+    require(path.video_feedback().persistent_loss_report_us == old_loss,
+            "fixture did not establish persistent video loss on the old route");
+    require(path.RebindChannel(194, true), "video route rebind failed");
+    const auto reset = path.video_feedback();
+    require(reset.route_epoch == 1 && reset.arrived_us == 0 &&
+                reset.loss_report_us == 0 && reset.persistent_loss_report_us == 0 &&
+                reset.loss_pct == 0 && reset.jitter_ms == 0,
+            "old route video loss and jitter survived handover");
+    report(120, 2, old_loss + 10'000);
+    require(path.video_feedback().arrived_us == 0,
+            "queued pre-handover report repopulated video measurements");
+    const auto started_us = webrtc::TimeMicros() + 1;
+    report(121, 1, started_us);
+    report(123, 2, started_us + 10'000);
+    const auto current_loss = started_us + 3'020'000;
+    report(132, 2, current_loss);
+    const auto current = path.video_feedback();
+    require(current.route_epoch == 1 && current.arrived_us == current_loss &&
+                current.persistent_loss_report_us == current_loss &&
+                current.jitter_ms == 100,
+            "fresh persistent video loss was not recognized on the new route");
+    path.Stop();
+  }
+  {
+    VeilTransportShim path(193, nullptr, nullptr, nullptr, nullptr);
+    path.SetLocalVideoSsrc(33);
+    path.SetIndependentTransportFeedback(true);
+    path.Start();
+    const auto report = [&](uint16_t sequence, int64_t arrived) {
+      webrtc::rtcp::TransportFeedback feedback;
+      feedback.SetSenderSsrc(44);
+      feedback.SetMediaSsrc(33);
+      const auto time = webrtc::Timestamp::Micros(arrived);
+      feedback.SetBase(sequence, time);
+      feedback.AddReceivedPacket(sequence, time);
+      const auto bytes = feedback.Build();
+      AudioRecoveryFeedbackTest::Observe(path, bytes, arrived);
+    };
+    const auto queued_us = webrtc::TimeMicros() - 1;
+    require(path.RebindChannel(192, true), "TWCC route rebind failed");
+    // A queued report with an unknown sequence would otherwise make all
+    // TWCC evidence fall back to RR for the rest of the new route.
+    report(49, queued_us);
+    std::vector<uint8_t> packet{0x90, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, 33,
+                               0xbe, 0xde, 0, 1, 0x11, 0, 50, 0, 7};
+    webrtc::PacketOptions options;
+    require(path.SendRtp(packet, options), "new route RTP fixture not sent");
+    const auto current_us = webrtc::TimeMicros() + 1;
+    report(50, current_us);
+    require(AudioRecoveryFeedbackTest::HasFreshVideoFeedback(path, current_us),
+            "old queued TWCC prevented fresh video feedback on the new route");
     path.Stop();
   }
   // Exact TWCC says only a padding probe was lost: it must not become an
