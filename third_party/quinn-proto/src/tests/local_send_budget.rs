@@ -7,6 +7,7 @@ use std::{
 
 #[derive(Debug, Default)]
 struct Budget {
+    limit: Option<AtomicU64>,
     flight: AtomicU64,
     peak: AtomicU64,
     delivered: AtomicU64,
@@ -19,7 +20,9 @@ impl LocalSendBudget for Budget {
         Some(Box::new(()))
     }
     fn window(&self, _: Instant, _: u64, _: u16) -> u64 {
-        2401
+        self.limit
+            .as_ref()
+            .map_or(2401, |limit| limit.load(Ordering::SeqCst))
     }
     fn update_flight(&self, bytes: u64) {
         self.flight.store(bytes, Ordering::SeqCst);
@@ -102,6 +105,47 @@ fn a_local_budget_limits_real_packets_and_survives_a_route_reset() {
         budget.closed.load(Ordering::SeqCst),
         1,
         "retained inspection handles do not prolong the participant"
+    );
+}
+
+#[test]
+fn blocked_local_datagram_does_not_hold_a_due_ack() {
+    let mut pair = Pair::default();
+    let (client, server) = pair.connect();
+    pair.drive();
+    let budget = Arc::new(Budget {
+        limit: Some(AtomicU64::new(1)),
+        ..Default::default()
+    });
+    assert!(pair
+        .server_conn_mut(server)
+        .set_local_send_budget(budget.clone()));
+
+    let baseline = pair.client_conn_mut(client).stats().frame_rx;
+    let before_flight = budget.flight.load(Ordering::SeqCst);
+    let message = b"queued camera packet";
+    pair.server_datagrams(server)
+        .send(Bytes::from_static(message), false)
+        .unwrap();
+
+    pair.client_conn_mut(client).immediate_ack();
+    pair.drive_client();
+    pair.drive_server();
+    pair.drive_client();
+    let received = pair.client_conn_mut(client).stats().frame_rx;
+    assert_eq!(
+        received.acks,
+        baseline.acks + 1,
+        "a due ACK must leave despite the blocked DATAGRAM"
+    );
+    assert_eq!(received.datagram, baseline.datagram);
+    assert_eq!(budget.flight.load(Ordering::SeqCst), before_flight);
+
+    budget.limit.as_ref().unwrap().store(2401, Ordering::SeqCst);
+    pair.drive();
+    assert_eq!(
+        pair.client_datagrams(client).recv().as_deref(),
+        Some(message.as_slice())
     );
 }
 

@@ -618,6 +618,7 @@ impl Connection {
                 continue;
             }
 
+            let mut ack_only_under_local_budget = false;
             let mut ack_eliciting = !self.spaces[space_id].pending.is_empty(&self.streams)
                 || self.spaces[space_id].ping_pending
                 || self.spaces[space_id].immediate_ack_pending;
@@ -726,14 +727,10 @@ impl Connection {
                     }
 
                     let bytes_to_send = next_datagram_limit as u64 + untracked_bytes;
-                    if self.path.in_flight.bytes + bytes_to_send
-                        >= self.local_congestion_window(now)
-                    {
+                    let local_window = self.local_congestion_window(now);
+                    if self.path.in_flight.bytes + bytes_to_send >= local_window {
                         self.block_local_budget(now);
-                        space_idx += 1;
                         congestion_blocked = true;
-                        // We continue instead of breaking here in order to avoid
-                        // blocking loss probes queued for higher spaces.
                         if space_id == SpaceId::Data {
                             self.record_datagram_block(
                                 now,
@@ -741,19 +738,40 @@ impl Connection {
                             );
                         }
                         trace!("blocked by congestion control");
-                        continue;
+                        // A due transport ACK releases flight at the peer.
+                        // Waiting for our own source allowance can leave both
+                        // endpoints waiting for credit on this connection.
+                        ack_only_under_local_budget = space_id == SpaceId::Data
+                            && can_send.acks
+                            && local_window < self.path.congestion.window()
+                            && self.state.is_established()
+                            && !close
+                            && !self.config.pad_to_mtu
+                            && self.path_responses.is_empty()
+                            && buf.is_empty();
+                        if !ack_only_under_local_budget {
+                            // Keep loss probes in higher spaces eligible.
+                            space_idx += 1;
+                            continue;
+                        }
+                        ack_eliciting = false;
+                        next_datagram_limit = segment_size;
                     }
 
                     // Check whether the next datagram is blocked by pacing
-                    let smoothed_rtt = self.path.rtt.get();
-                    if let Some(delay) = self.path.pacing.delay_with_rate(
-                        smoothed_rtt,
-                        bytes_to_send,
-                        self.path.current_mtu(),
-                        self.path.congestion.window(),
-                        self.path.congestion.metrics().pacing_rate,
-                        now,
-                    ) {
+                    let pacing_delay = if ack_only_under_local_budget {
+                        None
+                    } else {
+                        self.path.pacing.delay_with_rate(
+                            self.path.rtt.get(),
+                            bytes_to_send,
+                            self.path.current_mtu(),
+                            self.path.congestion.window(),
+                            self.path.congestion.metrics().pacing_rate,
+                            now,
+                        )
+                    };
+                    if let Some(delay) = pacing_delay {
                         self.timers.set(Timer::Pacing, delay);
                         if space_id == SpaceId::Data {
                             self.record_datagram_block(now, DatagramBlockReason::Pacing(delay));
@@ -1013,8 +1031,21 @@ impl Connection {
                 }
             }
 
-            let sent =
-                self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
+            let sent = if ack_only_under_local_budget {
+                let mut sent = SentFrames::default();
+                Self::try_populate_acks(
+                    now,
+                    self.receiving_ecn,
+                    &mut sent,
+                    &mut self.spaces[space_id],
+                    buf,
+                    &mut self.stats,
+                    builder.max_size,
+                );
+                sent
+            } else {
+                self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number)
+            };
 
             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
             // any other reason, there is a bug which leads to one component announcing write
@@ -1040,6 +1071,9 @@ impl Connection {
 
             // Keep information about the packet around until it gets finalized
             sent_frames = Some(sent);
+            if ack_only_under_local_budget {
+                break;
+            }
 
             // Don't increment space_idx.
             // We stay in the current space and check if there is more data to send.
