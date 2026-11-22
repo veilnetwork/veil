@@ -77,6 +77,8 @@ static std::vector<Packet> network(const std::vector<Packet>& encoded, int profi
       p.at += rng()%121;
       if (rng()%100 < 3) continue;
     }
+    // Reach the adaptive ceiling with real Opus and NetEq on a lossless path.
+    if (profile == 6) p.at += rng()%551;
     result.push_back(std::move(p));
   }
   std::stable_sort(result.begin(),result.end(),[](auto& a, auto& b){return a.at<b.at;});
@@ -165,11 +167,12 @@ int main(int argc,char**argv) {
       static_cast<unsigned char>(bytes[2*i]) | (static_cast<unsigned char>(bytes[2*i+1])<<8));
   std::puts("packet_ms,profile,custom,played_plc_ms,concealed_ms,max_plc_ms,conceal_events,hard_discard_ms,packet_discarded,accelerated_ms,queue_p95_ms,max_target_ms");
   bool passed = true;
+  int strongest_jitter_target_ms = 0;
   for (int seed : {197, 17, 41}) {
     std::printf("seed=%d\n", seed);
     for (int ms : {20, 40, 60}) {
       const auto encoded = encode(speech, ms);
-      for (int profile = 0; profile < 6; ++profile) {
+      for (int profile = 0; profile < 7; ++profile) {
         const auto trace = network(encoded, profile, seed);
         std::array<Metrics, 2> pair{};
         for (bool custom : {false, true}) {
@@ -186,13 +189,17 @@ int main(int argc,char**argv) {
         // Lossless traces must not create repeated concealment just to hold
         // the old fixed queue ceiling. A route step still has a causal gap;
         // compare with the same decoder receiving the very same packets.
-        if (profile != 5)
+        if (profile < 5)
           passed &= pair[1].played_plc <= pair[0].played_plc;
         if (profile == 0)
           passed &= pair[0].played_plc == 0 && pair[1].discarded == 0;
+        need(pair[1].max_target <= 500, "adaptive delay exceeded 500 ms");
+        if (profile == 6)
+          strongest_jitter_target_ms = std::max(strongest_jitter_target_ms, pair[1].max_target);
       }
     }
   }
   need(passed, "jitter reserve policy created extra played concealment on lossless traffic");
+  need(strongest_jitter_target_ms == 500, "heavy jitter never reached the 500 ms adaptive ceiling");
   std::puts("PASS lossless jitter/reorder speech reserve across 20/40/60-ms Opus");
 }
