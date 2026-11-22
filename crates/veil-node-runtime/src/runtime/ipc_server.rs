@@ -671,10 +671,9 @@ impl NodeRuntime {
         // by routing to `NodeRuntime::set_rendezvous_push_envelope`. Without it
         // IPC handler responds with `NoMatchingRendezvous` for every client request
         // (graceful degradation on nodes without active rendezvous publications).
-        let push_envelope_sink: Arc<dyn veil_ipc::PushEnvelopeSink> =
-            Arc::new(RendezvousPushEnvelopeForwarder::new(Arc::clone(
-                &self.anonymity.rendezvous_publisher_entries,
-            )));
+        let push_envelope_sink: Arc<dyn veil_ipc::PushEnvelopeSink> = Arc::new(
+            RendezvousPushEnvelopeForwarder::new(Arc::clone(&self.anonymity)),
+        );
         server = server.with_push_envelope_sink(push_envelope_sink);
         // In-network deposit-wake LISTENER: every node may be a mailbox
         // RECEIVER (not just relays), so bind the wake endpoint unconditionally
@@ -738,7 +737,6 @@ impl NodeRuntime {
                 Arc::clone(&self.session_tx_registry),
                 Arc::clone(&self.dispatcher.pending_recursive),
                 *self.identity.local_identity.node_id.as_bytes(),
-                Arc::clone(&self.anonymity.rendezvous_resolve_cache),
                 Arc::clone(&self.logger),
                 Arc::clone(&self.identity.peer_mlkem_cert_store),
             ));

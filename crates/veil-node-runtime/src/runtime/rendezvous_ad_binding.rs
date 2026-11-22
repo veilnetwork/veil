@@ -955,7 +955,7 @@ mod tests {
     /// held.
     #[test]
     fn a_sibling_devices_fresh_ad_is_not_overwritten() {
-        use std::sync::{Arc, Mutex};
+        use std::sync::Arc;
 
         let dir = std::env::temp_dir().join(format!(
             "rzv-sibling-{}",
@@ -1019,7 +1019,7 @@ mod tests {
         assert_ne!(first.public_key, second.public_key, "fixture: two devices");
 
         let entries = |relay: u8, window: u64| {
-            Arc::new(Mutex::new(vec![RendezvousPublisherEntry {
+            [RendezvousPublisherEntry {
                 rendezvous_node_id: [relay; 32],
                 auth_cookie: [relay; 16],
                 validity_window_secs: window,
@@ -1029,7 +1029,7 @@ mod tests {
                 rendezvous_kem_pk: Vec::new(),
                 ephemeral_ad_identity: None,
                 rendezvous_kem_valid_until_unix: 0,
-            }]))
+            }]
         };
         let logger = Arc::new(NodeLogger::new_noop());
         let x25519 = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
@@ -1038,6 +1038,7 @@ mod tests {
                            window: u64,
                            dht: &Arc<veil_dht::KademliaService>| {
             crate::runtime::NodeRuntime::publish_rendezvous_ads_at(
+                crate::runtime::anonymity_state::RendezvousAdNamespace::Live,
                 &entries(relay, window),
                 &x25519,
                 who,

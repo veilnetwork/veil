@@ -39,6 +39,7 @@ mod cold_document_tests;
 #[derive(Clone, Copy)]
 pub(super) enum ResolveMode {
     Any,
+    Mailbox,
     /// Opportunistic route read; does not subscribe the device to refresh-ahead.
     Prefetch,
     /// Discover the current device family even when its shared alias has no ad.
@@ -63,7 +64,7 @@ impl ResolveMode {
             return None;
         }
         let ads = match self {
-            Self::Any | Self::Prefetch => cache.get(receiver, now),
+            Self::Any | Self::Mailbox | Self::Prefetch => cache.get(receiver, now),
             Self::ChatFamily => cache.get_with_document_check(receiver, now),
             Self::RefreshAhead => None,
             Self::Stream {
@@ -181,7 +182,6 @@ impl RendezvousResolverImpl {
             >,
         >,
         local_node_id: [u8; 32],
-        resolve_cache: Arc<super::anonymity_state::RendezvousResolveCache>,
         logger: Arc<veil_observability::NodeLogger>,
         peer_authorization: Arc<crate::mlkem_cert_store::MlKemCertStore>,
     ) -> Self {
@@ -190,7 +190,7 @@ impl RendezvousResolverImpl {
             session_tx_registry,
             pending_recursive,
             local_node_id,
-            resolve_cache,
+            resolve_cache: Arc::new(super::anonymity_state::RendezvousResolveCache::new()),
             logger,
             peer_authorization,
         }
@@ -255,9 +255,21 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
 ) -> Vec<veil_anonymity::rendezvous::RendezvousAd> {
     use super::rendezvous_ad_binding::peer_ad_binding_ok;
     use veil_anonymity::rendezvous::{
-        MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, is_currently_valid, rendezvous_ad_dht_key_at,
+        MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, is_currently_valid,
     };
 
+    use super::anonymity_state::RendezvousAdNamespace;
+    let namespace = if matches!(mode, ResolveMode::Mailbox) {
+        RendezvousAdNamespace::Mailbox
+    } else {
+        RendezvousAdNamespace::Live
+    };
+    let matches_receiver = |ad: &veil_anonymity::rendezvous::RendezvousAd| {
+        ad.receiver_node_id == receiver_id
+            && (!matches!(mode, ResolveMode::Mailbox)
+                || !ad.rendezvous_kem_pk.is_empty()
+                || !ad.push_envelope.is_empty())
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -280,7 +292,7 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
         // Resolving self still WORKS — the walk below runs as asked, and the
         // mailbox drain's cold path depends on it. It just does not buy a
         // standing subscription to re-walk forever.
-        if !matches!(mode, ResolveMode::Prefetch) {
+        if !matches!(mode, ResolveMode::Prefetch | ResolveMode::Mailbox) {
             note_send_target(resolve_cache, receiver_id, local_node_id);
         }
         if let Some(ads) = mode.cached_ads(resolve_cache, &receiver_id, now, dht, authorization) {
@@ -318,9 +330,9 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
     if receiver_id == local_node_id {
         ads.extend(
             (0..MAX_RENDEZVOUS_AD_SLOTS)
-                .filter_map(|idx| dht.get_local(&rendezvous_ad_dht_key_at(&receiver_id, idx)))
+                .filter_map(|idx| dht.get_local(&namespace.key(&receiver_id, idx)))
                 .filter_map(|bytes| decode_rendezvous_ad(&bytes).ok())
-                .filter(|ad| ad.receiver_node_id == receiver_id)
+                .filter(matches_receiver)
                 // Strictly bound, or bound by the receiver's identity document
                 // — a device of an identity advertising at the identity's own
                 // address, which is the only address its contacts know it by.
@@ -339,7 +351,7 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
             }));
     let (document_hint, mut document_hint_rx) = tokio::sync::watch::channel(document_in_parallel);
     let walks = (0..MAX_RENDEZVOUS_AD_SLOTS).map(move |idx| {
-        let key = rendezvous_ad_dht_key_at(&receiver_id, idx);
+        let key = namespace.key(&receiver_id, idx);
         let hint = document_hint.clone();
         async move {
             let candidates = crate::mlkem_resolver::recursive_dht_get_candidates(
@@ -356,7 +368,7 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
                 move |bytes| {
                     let candidate = decode_rendezvous_ad(bytes)
                         .ok()
-                        .filter(|ad| ad.receiver_node_id == receiver_id)
+                        .filter(matches_receiver)
                         .filter(|ad| is_currently_valid(ad, now).is_ok());
                     let already_needed = *hint.borrow();
                     if !already_needed
@@ -1048,10 +1060,8 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
         Box<dyn std::future::Future<Output = Vec<veil_ipc::ResolvedReplica>> + Send + 'a>,
     > {
         Box::pin(async move {
-            // Walk every slot up to caller's cap or system max
-            // whichever is lower. Slot 0 produces the same key as
-            // legacy single-key publishers, so pre-T1.4 senders still
-            // see one entry; new senders see all K configured slots.
+            // The reply cap is independent of discovery. Read every mailbox
+            // slot so a low cap cannot hide a fresher replica.
             let cap = max_replicas
                 .max(1)
                 .min(veil_anonymity::rendezvous::MAX_RENDEZVOUS_AD_SLOTS as usize);
@@ -1070,7 +1080,7 @@ impl veil_ipc::RendezvousReplicaResolver for RendezvousResolverImpl {
                 &self.logger,
                 receiver_id,
                 std::time::Duration::from_millis(3500),
-                ResolveMode::Any,
+                ResolveMode::Mailbox,
                 &self.peer_authorization.document_floor,
             )
             .await;

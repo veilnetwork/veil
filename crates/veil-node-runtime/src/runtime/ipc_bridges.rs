@@ -29,19 +29,38 @@ use veil_util::lock;
 //
 // Hooks `LocalAppMsg::SetPushEnvelope` IPC requests to
 // `NodeRuntime::set_rendezvous_push_envelope` without round-trip through NodeRuntime
-// itself — holds an Arc clone of `rendezvous_publisher_entries` Mutex and
-// performs the in-place update on lookup. Mirrors the pattern of
+// itself — holds the shared anonymity state and updates matching rows in
+// both publisher registries. Mirrors the pattern of
 // `MobileEventForwarder` (which holds runtime sync-Notify clones).
 
 pub struct RendezvousPushEnvelopeForwarder {
-    entries: Arc<std::sync::Mutex<Vec<veil_anonymity::rendezvous::RendezvousPublisherEntry>>>,
+    anonymity: Arc<super::anonymity_state::AnonymityState>,
 }
 
 impl RendezvousPushEnvelopeForwarder {
-    pub(crate) fn new(
-        entries: Arc<std::sync::Mutex<Vec<veil_anonymity::rendezvous::RendezvousPublisherEntry>>>,
-    ) -> Self {
-        Self { entries }
+    pub(crate) fn new(anonymity: Arc<super::anonymity_state::AnonymityState>) -> Self {
+        Self { anonymity }
+    }
+
+    fn update_entries(
+        &self,
+        rendezvous_node_id: [u8; 32],
+        auth_cookie: [u8; 16],
+        update: impl Fn(&mut veil_anonymity::rendezvous::RendezvousPublisherEntry),
+    ) -> bool {
+        let mut updated = false;
+        for entries in [
+            &self.anonymity.rendezvous_publisher_entries,
+            &self.anonymity.mailbox_publisher_entries,
+        ] {
+            if let Some(entry) = lock!(entries).iter_mut().find(|e| {
+                e.rendezvous_node_id == rendezvous_node_id && e.auth_cookie == auth_cookie
+            }) {
+                update(entry);
+                updated = true;
+            }
+        }
+        updated
     }
 }
 
@@ -52,16 +71,9 @@ impl veil_ipc::PushEnvelopeSink for RendezvousPushEnvelopeForwarder {
         auth_cookie: [u8; 16],
         envelope: Vec<u8>,
     ) -> bool {
-        let mut entries = lock!(self.entries);
-        if let Some(entry) = entries
-            .iter_mut()
-            .find(|e| e.rendezvous_node_id == rendezvous_node_id && e.auth_cookie == auth_cookie)
-        {
-            entry.push_envelope = envelope;
-            true
-        } else {
-            false
-        }
+        self.update_entries(rendezvous_node_id, auth_cookie, |entry| {
+            entry.push_envelope.clone_from(&envelope);
+        })
     }
 
     fn set_rendezvous_wake_hmac_envelope(
@@ -70,16 +82,9 @@ impl veil_ipc::PushEnvelopeSink for RendezvousPushEnvelopeForwarder {
         auth_cookie: [u8; 16],
         envelope: Vec<u8>,
     ) -> bool {
-        let mut entries = lock!(self.entries);
-        if let Some(entry) = entries
-            .iter_mut()
-            .find(|e| e.rendezvous_node_id == rendezvous_node_id && e.auth_cookie == auth_cookie)
-        {
-            entry.wake_hmac_envelope = envelope;
-            true
-        } else {
-            false
-        }
+        self.update_entries(rendezvous_node_id, auth_cookie, |entry| {
+            entry.wake_hmac_envelope.clone_from(&envelope);
+        })
     }
 }
 
@@ -403,11 +408,16 @@ mod tests {
         RendezvousPushEnvelopeForwarder,
         Arc<std::sync::Mutex<Vec<veil_anonymity::rendezvous::RendezvousPublisherEntry>>>,
     ) {
-        let entries = Arc::new(std::sync::Mutex::new(rows));
-        (
-            RendezvousPushEnvelopeForwarder::new(Arc::clone(&entries)),
-            entries,
-        )
+        let anonymity = Arc::new(crate::runtime::anonymity_state::AnonymityState::new(
+            false,
+            0,
+            Arc::new(x25519_dalek::StaticSecret::from([1; 32])),
+            None,
+            Vec::new(),
+        ));
+        let entries = Arc::clone(&anonymity.rendezvous_publisher_entries);
+        *lock!(entries) = rows;
+        (RendezvousPushEnvelopeForwarder::new(anonymity), entries)
     }
 
     /// The cookie is the authorisation, not decoration.

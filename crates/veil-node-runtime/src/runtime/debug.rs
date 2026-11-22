@@ -67,6 +67,15 @@ impl NodeRuntime {
             &self.dht,
             &self.logger,
             None, // documented as local-only force-publish
+        ) + NodeRuntime::tick_publish_mailbox_ads(
+            &self.anonymity.mailbox_publisher_entries,
+            &self.anonymity.rendezvous_publisher_entries,
+            self.anonymity.x25519_sk.as_ref(),
+            &self.identity.local_identity,
+            &self.identity.sovereign_identity,
+            &self.dht,
+            &self.logger,
+            None,
         )
     }
 

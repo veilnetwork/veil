@@ -280,58 +280,38 @@ fn peer(pk: &str) -> BootstrapPeer {
 }
 
 #[test]
-fn kemless_reregister_preserves_existing_kem() {
-    // The app registers the relay's KEM pk (mailbox-by-discovery deposit
-    // target); veil's built-in receiver task then re-registers the SAME
-    // (relay, cookie) KEM-LESS on its tick. A full overwrite would drop the
-    // KEM and a sender would resolve usable(KEM)=0 (cannot deposit offline
-    // mail) — so the KEM-less path must PRESERVE an existing KEM.
-    let sk = std::sync::Arc::new(x25519_dalek::StaticSecret::from([7u8; 32]));
-    let state = std::sync::Arc::new(crate::runtime::anonymity_state::AnonymityState::new(
+fn mailbox_registration_does_not_consume_live_slots() {
+    let state = Arc::new(crate::runtime::anonymity_state::AnonymityState::new(
         false,
         0,
-        sk,
+        Arc::new(x25519_dalek::StaticSecret::from([7u8; 32])),
         None,
         Vec::new(),
     ));
-    let relay = [0xAB; 32];
     let cookie = [0xCD; 16];
-    let kem = vec![0x42u8; 32];
-
-    rendezvous_register_publisher_with_kem(&state, &relay, cookie, 3600, 1, kem.clone(), 0);
-    rendezvous_register_publisher(&state, &relay, cookie, 3600, None);
-
-    let entries = lock!(state.rendezvous_publisher_entries);
-    assert_eq!(entries.len(), 1, "same (relay,cookie) dedups to one entry");
-    assert_eq!(
-        entries[0].rendezvous_kem_pk, kem,
-        "KEM key must survive a KEM-less re-register (else usable(KEM)=0)"
-    );
-    assert_eq!(entries[0].rendezvous_kem_algo, 1);
-}
-
-#[test]
-fn kem_register_overwrites_kemless() {
-    // The reverse order must ALSO end KEM-bearing: a KEM-less entry first,
-    // then the app's KEM register, leaves the entry with the KEM.
-    let sk = std::sync::Arc::new(x25519_dalek::StaticSecret::from([9u8; 32]));
-    let state = std::sync::Arc::new(crate::runtime::anonymity_state::AnonymityState::new(
-        false,
+    let slots = veil_anonymity::rendezvous::MAX_RENDEZVOUS_AD_SLOTS;
+    for slot in 0..slots {
+        assert!(rendezvous_register_publisher(
+            &state,
+            &[slot; 32],
+            cookie,
+            3600,
+            None,
+        ));
+    }
+    assert!(rendezvous_register_publisher_with_kem(
+        &state,
+        &[0xAB; 32],
+        cookie,
+        3600,
         0,
-        sk,
-        None,
-        Vec::new(),
+        vec![0x42; 32],
+        0,
     ));
-    let relay = [0x01; 32];
-    let cookie = [0x02; 16];
-    let kem = vec![0x55u8; 32];
-
-    rendezvous_register_publisher(&state, &relay, cookie, 3600, None);
-    rendezvous_register_publisher_with_kem(&state, &relay, cookie, 3600, 1, kem.clone(), 0);
-
-    let entries = lock!(state.rendezvous_publisher_entries);
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].rendezvous_kem_pk, kem);
+    assert_eq!(
+        lock!(state.rendezvous_publisher_entries).len(),
+        slots as usize
+    );
 }
 
 #[test]

@@ -861,14 +861,9 @@ pub(crate) fn insert_publisher_entry(
     if let Some(pos) = entries.iter().position(|e| {
         e.rendezvous_node_id == entry.rendezvous_node_id && e.auth_cookie == entry.auth_cookie
     }) {
-        // PRESERVE a KEM key already advertised for this (relay, cookie). The app
-        // registers the relay's KEM pk (mailbox-by-discovery, the deposit target)
-        // and the built-in recipient task re-registers the SAME (relay, cookie)
-        // KEM-LESS on its tick — a full overwrite would DROP the KEM, so a sender
-        // resolves the ad with usable(KEM)=0 and cannot deposit offline mail
-        // (observed on-device as a persistent stash failure). Carry the existing
-        // KEM forward; this entry still functions as a rendezvous publisher, it
-        // just keeps the mailbox KEM it already had.
+        // A native caller can attach a KEM key to a live publisher row.
+        // Preserve that metadata on subsequent keyless refreshes of the same
+        // row. App-owned mailbox rows live in a separate registry.
         //
         // Only a KEM-LESS re-registration inherits. An entry that carries its
         // OWN key is a rotation and must replace the key, its algorithm and
@@ -916,10 +911,8 @@ pub(crate) fn rendezvous_register_publisher(
     insert_publisher_entry(&mut lock!(anonymity.rendezvous_publisher_entries), entry)
 }
 
-/// Like [`rendezvous_register_publisher`] but for a PLAIN (sovereign-signed)
-/// publisher that ALSO advertises the relay's KEM key — so a sender resolving
-/// the v5 ad can anonymously deposit a mailbox PUT at the relay. Dedups by
-/// (relay, cookie). The app-IPC entry point for mailbox-by-discovery.
+/// Register an app's independently discovered mailbox relay for sealed PUTs.
+/// A keyless IPC registration retains the ordinary rendezvous semantics.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rendezvous_register_publisher_with_kem(
     anonymity: &Arc<super::anonymity_state::AnonymityState>,
@@ -943,7 +936,12 @@ pub(crate) fn rendezvous_register_publisher_with_kem(
         // senders discover it by the receiver's real node_id.
         ephemeral_ad_identity: None,
     };
-    insert_publisher_entry(&mut lock!(anonymity.rendezvous_publisher_entries), entry)
+    let entries = if entry.rendezvous_kem_pk.is_empty() {
+        &anonymity.rendezvous_publisher_entries
+    } else {
+        &anonymity.mailbox_publisher_entries
+    };
+    insert_publisher_entry(&mut lock!(entries), entry)
 }
 
 /// Shared cold-path re-pick + re-register for the rendezvous-recipient task.

@@ -217,6 +217,7 @@ impl NodeRuntime {
         let publish_logger = Arc::clone(&self.logger);
         // receiver-controlled rendezvous-publisher state.
         let rendezvous_publisher_entries = Arc::clone(&self.anonymity.rendezvous_publisher_entries);
+        let mailbox_publisher_entries = Arc::clone(&self.anonymity.mailbox_publisher_entries);
         // follow-up: periodic refresh of adaptive params so the
         // proximity-gate threshold tightens automatically as the network
         // grows, without waiting for an explicit `node reload` from the
@@ -462,6 +463,16 @@ impl NodeRuntime {
                         // half-life. No-op when receiver has not
                         // called `register_rendezvous_publisher`.
                         Self::tick_publish_rendezvous_ads(
+                            &rendezvous_publisher_entries,
+                            &anonymity_x25519_sk,
+                            &local_identity_for_publish,
+                            &identity_for_publish.sovereign_identity,
+                            &dht_for_publish,
+                            &publish_logger,
+                            Some(&session_tx_registry_for_tick),
+                        );
+                        Self::tick_publish_mailbox_ads(
+                            &mailbox_publisher_entries,
                             &rendezvous_publisher_entries,
                             &anonymity_x25519_sk,
                             &local_identity_for_publish,
@@ -993,6 +1004,77 @@ impl NodeRuntime {
         logger: &Arc<veil_observability::NodeLogger>,
         session_tx_registry: Option<&Arc<RwLock<veil_session::tx_registry::SessionTxRegistry>>>,
     ) -> usize {
+        let snapshot: Vec<_> = lock!(entries)
+            .iter()
+            .take(usize::from(
+                veil_anonymity::rendezvous::MAX_RENDEZVOUS_AD_SLOTS,
+            ))
+            .cloned()
+            .collect();
+        Self::tick_publish_rendezvous_ads_in(
+            super::anonymity_state::RendezvousAdNamespace::Live,
+            &snapshot,
+            anonymity_x25519_sk,
+            local_identity,
+            sovereign,
+            dht,
+            logger,
+            session_tx_registry,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn tick_publish_mailbox_ads(
+        mailbox_entries: &Arc<Mutex<Vec<veil_anonymity::rendezvous::RendezvousPublisherEntry>>>,
+        live_entries: &Arc<Mutex<Vec<veil_anonymity::rendezvous::RendezvousPublisherEntry>>>,
+        anonymity_x25519_sk: &x25519_dalek::StaticSecret,
+        local_identity: &crate::local_identity::HandshakeIdentity,
+        sovereign: &super::identity_state::SovereignIdentityCell,
+        dht: &Arc<veil_dht::kademlia::KademliaService>,
+        logger: &Arc<veil_observability::NodeLogger>,
+        session_tx_registry: Option<&Arc<RwLock<veil_session::tx_registry::SessionTxRegistry>>>,
+    ) -> usize {
+        use veil_anonymity::rendezvous::MAX_RENDEZVOUS_AD_SLOTS;
+        let mut entries = lock!(mailbox_entries).clone();
+        // Native callers can still attach mailbox metadata to a live row.
+        // Expose those rows to mailbox lookup without another DHT walk.
+        for entry in lock!(live_entries).iter() {
+            if entries.len() >= usize::from(MAX_RENDEZVOUS_AD_SLOTS) {
+                break;
+            }
+            if entry.ephemeral_ad_identity.is_none()
+                && (!entry.rendezvous_kem_pk.is_empty() || !entry.push_envelope.is_empty())
+                && !entries.iter().any(|mailbox| {
+                    mailbox.rendezvous_node_id == entry.rendezvous_node_id
+                        && mailbox.auth_cookie == entry.auth_cookie
+                })
+            {
+                entries.push(entry.clone());
+            }
+        }
+        Self::tick_publish_rendezvous_ads_in(
+            super::anonymity_state::RendezvousAdNamespace::Mailbox,
+            &entries,
+            anonymity_x25519_sk,
+            local_identity,
+            sovereign,
+            dht,
+            logger,
+            session_tx_registry,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tick_publish_rendezvous_ads_in(
+        namespace: super::anonymity_state::RendezvousAdNamespace,
+        entries: &[veil_anonymity::rendezvous::RendezvousPublisherEntry],
+        anonymity_x25519_sk: &x25519_dalek::StaticSecret,
+        local_identity: &crate::local_identity::HandshakeIdentity,
+        sovereign: &super::identity_state::SovereignIdentityCell,
+        dht: &Arc<veil_dht::kademlia::KademliaService>,
+        logger: &Arc<veil_observability::NodeLogger>,
+        session_tx_registry: Option<&Arc<RwLock<veil_session::tx_registry::SessionTxRegistry>>>,
+    ) -> usize {
         super::rendezvous_ad_binding::receiver_addresses(
             *local_identity.node_id.as_bytes(),
             sovereign,
@@ -1000,6 +1082,7 @@ impl NodeRuntime {
         .iter()
         .map(|receiver| {
             Self::publish_rendezvous_ads_at(
+                namespace,
                 entries,
                 anonymity_x25519_sk,
                 local_identity,
@@ -1012,8 +1095,10 @@ impl NodeRuntime {
         .sum()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn publish_rendezvous_ads_at(
-        entries: &Arc<Mutex<Vec<veil_anonymity::rendezvous::RendezvousPublisherEntry>>>,
+        namespace: super::anonymity_state::RendezvousAdNamespace,
+        entries: &[veil_anonymity::rendezvous::RendezvousPublisherEntry],
         anonymity_x25519_sk: &x25519_dalek::StaticSecret,
         local_identity: &crate::local_identity::HandshakeIdentity,
         // The address the ad NAMES, which is not always the address that signs
@@ -1031,11 +1116,9 @@ impl NodeRuntime {
         // (boot/tests) keeps the legacy local-only behaviour.
         session_tx_registry: Option<&Arc<RwLock<veil_session::tx_registry::SessionTxRegistry>>>,
     ) -> usize {
-        //.4 follow-up: publish each `RendezvousPublisherEntry`
-        // under its own DHT slot (`rendezvous_ad_dht_key_at(receiver, idx)`)
-        // so senders can fan-out mailbox puts to K=3+ replicas. Slot 0
-        // is bit-exact with the legacy single-key derivation, so pre-T1.4
-        // resolvers see whatever entry is in slot 0 and ignore the rest.
+        // Each entry gets its own DHT slot. The live and mailbox sets each
+        // stamp their own generation, since their relay choices can change
+        // independently.
         //
         // Per-slot freshness check: if an existing ad in that slot
         // hasn't crossed half its validity window, skip re-signing it.
@@ -1044,21 +1127,9 @@ impl NodeRuntime {
         // since the maintenance period is short.
         use veil_anonymity::rendezvous::{
             MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, is_currently_valid,
-            rendezvous_ad_dht_key_at, sign_rendezvous_ad_v5,
+            sign_rendezvous_ad_v5,
         };
-        // Only what can actually be published is copied.
-        //
-        // The whole registry was cloned on every tick — every entry with its
-        // KEM key, its push envelope and its ephemeral signing key — and then
-        // the first `MAX_RENDEZVOUS_AD_SLOTS` of it were used. The registry is
-        // bounded now, so this is a small copy either way; taking the bound
-        // here keeps it small no matter what a future caller does to that Vec
-        // (report17 V17-M6).
-        let snapshot: Vec<_> = lock!(entries)
-            .iter()
-            .take(MAX_RENDEZVOUS_AD_SLOTS as usize)
-            .cloned()
-            .collect();
+        let snapshot = &entries[..entries.len().min(usize::from(MAX_RENDEZVOUS_AD_SLOTS))];
         if snapshot.is_empty() {
             return 0;
         }
@@ -1068,9 +1139,6 @@ impl NodeRuntime {
             .unwrap_or(0);
         let receiver_node_id = *receiver_node_id;
         let receiver_x25519_pk = x25519_dalek::PublicKey::from(anonymity_x25519_sk).to_bytes();
-        // Cap per-receiver slots at MAX_RENDEZVOUS_AD_SLOTS to bound
-        // DHT footprint when the entries vec grows pathologically.
-        let n_slots = snapshot.len().min(MAX_RENDEZVOUS_AD_SLOTS as usize);
         // Slot-level freshness probe. Time freshness alone is NOT enough:
         // the recipient can fail over to another relay while the previous
         // ad still has most of its validity window left. Skipping solely on
@@ -1091,7 +1159,7 @@ impl NodeRuntime {
                         local_identity.algo,
                     ),
                 };
-                let dht_key = rendezvous_ad_dht_key_at(&ad_node_id, idx as u8);
+                let dht_key = namespace.key(&ad_node_id, idx as u8);
                 let existing_bytes = dht.get_local(&dht_key)?;
                 let ad = decode_rendezvous_ad(&existing_bytes).ok()?;
                 // A sibling device's ad in this slot is not ours to overwrite
@@ -1144,7 +1212,6 @@ impl NodeRuntime {
         let plain_batch_fresh = {
             let stamps: Vec<Option<u64>> = snapshot
                 .iter()
-                .take(n_slots)
                 .enumerate()
                 .filter(|(_, e)| e.ephemeral_ad_identity.is_none())
                 .map(|(idx, e)| slot_fresh_stamp(idx, e))
@@ -1152,7 +1219,7 @@ impl NodeRuntime {
             stamps.iter().all(|s| s.is_some()) && stamps.windows(2).all(|w| w[0] == w[1])
         };
         let mut published = 0usize;
-        for (idx, entry) in snapshot.iter().take(n_slots).enumerate() {
+        for (idx, entry) in snapshot.iter().enumerate() {
             // A location-anonymous entry's ad is keyed and signed under its own
             // PSEUDO identity, which has nothing to do with the address this
             // pass publishes for — so every pass would produce the same ad at
@@ -1189,7 +1256,7 @@ impl NodeRuntime {
                     local_identity.algo,
                 ),
             };
-            let dht_key = rendezvous_ad_dht_key_at(&ad_node_id, idx as u8);
+            let dht_key = namespace.key(&ad_node_id, idx as u8);
             // Freshness: plain slots are generation-batched (all fresh AND
             // sharing one valid_from stamp, see `plain_batch_fresh`) so the
             // send path can identify the current relay set by the newest
@@ -2049,6 +2116,101 @@ mod tests {
         let ad = decode_rendezvous_ad(&bytes).expect("decode replacement ad");
         assert_eq!(ad.rendezvous_node_id, new_relay);
         assert_eq!(ad.auth_cookie, cookie);
+    }
+
+    #[test]
+    fn mailbox_ad_survives_live_relay_republication() {
+        use super::super::anonymity_state::{AnonymityState, RendezvousAdNamespace};
+        use super::super::service_tasks::{
+            rendezvous_register_publisher, rendezvous_register_publisher_with_kem,
+        };
+        use veil_anonymity::rendezvous::{decode_rendezvous_ad, verify_rendezvous_ad};
+
+        let identity = fresh_identity();
+        let receiver = identity.node_id.as_bytes();
+        let dht = Arc::new(KademliaService::new(*receiver));
+        let state = Arc::new(AnonymityState::new(
+            false,
+            0,
+            Arc::new(x25519_dalek::StaticSecret::from([0x22; 32])),
+            None,
+            Vec::new(),
+        ));
+        let sovereign = crate::runtime::identity_state::SovereignIdentityCell::new(None);
+        let logger = Arc::new(NodeLogger::new_noop());
+        let cookie = [0x45; 16];
+        let mailbox_relay = [0xA1; 32];
+        let live_relay = [0xA2; 32];
+        let kem = vec![0xA3; 32];
+        assert!(rendezvous_register_publisher_with_kem(
+            &state,
+            &mailbox_relay,
+            cookie,
+            3600,
+            0,
+            kem.clone(),
+            0,
+        ));
+        assert!(rendezvous_register_publisher(
+            &state,
+            &mailbox_relay,
+            cookie,
+            3600,
+            None,
+        ));
+        let publish = || {
+            NodeRuntime::tick_publish_rendezvous_ads(
+                &state.rendezvous_publisher_entries,
+                &state.x25519_sk,
+                &identity,
+                &sovereign,
+                &dht,
+                &logger,
+                None,
+            );
+            NodeRuntime::tick_publish_mailbox_ads(
+                &state.mailbox_publisher_entries,
+                &state.rendezvous_publisher_entries,
+                &state.x25519_sk,
+                &identity,
+                &sovereign,
+                &dht,
+                &logger,
+                None,
+            );
+        };
+        publish();
+        let mailbox_slot = RendezvousAdNamespace::Mailbox.key(receiver, 0);
+        let mailbox_bytes = dht.get_local(&mailbox_slot).expect("signed mailbox ad");
+
+        // Replace the live registration as a recipient recheck does. The
+        // mailbox relay can still accept offline deposits after that change.
+        lock!(state.rendezvous_publisher_entries).clear();
+        assert!(rendezvous_register_publisher(
+            &state,
+            &live_relay,
+            cookie,
+            3600,
+            None,
+        ));
+        publish();
+        assert_eq!(dht.get_local(&mailbox_slot).unwrap(), mailbox_bytes);
+        dht.delete_local(&mailbox_slot);
+        publish();
+        let restored_mailbox_bytes = dht
+            .get_local(&mailbox_slot)
+            .expect("the mailbox registration survived and can publish again");
+        let mailbox = decode_rendezvous_ad(&restored_mailbox_bytes).unwrap();
+        verify_rendezvous_ad(&mailbox).unwrap();
+        assert_eq!(mailbox.rendezvous_node_id, mailbox_relay);
+        assert_eq!(mailbox.rendezvous_kem_pk, kem);
+        let live_bytes = dht
+            .get_local(&RendezvousAdNamespace::Live.key(receiver, 0))
+            .unwrap();
+        let live = decode_rendezvous_ad(&live_bytes).unwrap();
+        verify_rendezvous_ad(&live).unwrap();
+        assert_eq!(live.rendezvous_node_id, live_relay);
+        assert!(live.rendezvous_kem_pk.is_empty());
     }
 
     /// diff-audit Δ2-c: an onion-service ad (ephemeral_ad_identity = Some) is

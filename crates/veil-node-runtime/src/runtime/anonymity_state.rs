@@ -28,6 +28,30 @@ use std::sync::{Arc, Mutex};
 use veil_anonymity::relay_reputation::RelayReputation;
 use veil_anonymity::rendezvous::{RendezvousAd, RendezvousPublisherEntry, is_currently_valid};
 
+/// The two publishers have separate lifetimes. A mailbox relay can accept
+/// sealed deposits even after a live session and its INTRODUCE registration
+/// have gone away.
+#[derive(Clone, Copy)]
+pub(crate) enum RendezvousAdNamespace {
+    Live,
+    Mailbox,
+}
+
+impl RendezvousAdNamespace {
+    pub(crate) fn key(self, receiver: &[u8; 32], slot: u8) -> [u8; 32] {
+        match self {
+            Self::Live => veil_anonymity::rendezvous::rendezvous_ad_dht_key_at(receiver, slot),
+            Self::Mailbox => {
+                let mut hash = blake3::Hasher::new();
+                hash.update(b"veil:v1:mailbox-ad-replica\0");
+                hash.update(receiver);
+                hash.update(&[slot]);
+                *hash.finalize().as_bytes()
+            }
+        }
+    }
+}
+
 /// Default TTL for a stored reply block — the brick-4 freshness window.
 pub const DEFAULT_REPLY_BLOCK_TTL_SECS: u64 = 300;
 /// Default cap on concurrently-stored reply blocks (FIFO-evicted).
@@ -699,9 +723,11 @@ pub struct AnonymityState {
     /// rendezvous-routed inbound delivery touch this.
     pub rendezvous_publisher_entries: Arc<Mutex<Vec<RendezvousPublisherEntry>>>,
 
-    /// Sender-side short-lived, network-validated rendezvous route cache.  It
-    /// is shared by the live onion send path and the mailbox-replica IPC lookup
-    /// so neither can get pinned to a still-valid but no-longer-live local ad.
+    /// App-registered offline deposit targets. Live-route reselection never
+    /// touches these slots, even when the same relay and cookie appear in both.
+    pub mailbox_publisher_entries: Arc<Mutex<Vec<RendezvousPublisherEntry>>>,
+
+    /// Sender-side short-lived, network-validated live rendezvous route cache.
     pub rendezvous_resolve_cache: Arc<RendezvousResolveCache>,
 
     /// The same cache for services addressed by IDENTITY rather than by
@@ -871,6 +897,7 @@ impl AnonymityState {
             advertised_bps,
             x25519_sk,
             rendezvous_publisher_entries: Arc::new(Mutex::new(Vec::new())),
+            mailbox_publisher_entries: Arc::new(Mutex::new(Vec::new())),
             rendezvous_resolve_cache: Arc::new(RendezvousResolveCache::new()),
             onion_resolve_cache: Arc::new(RendezvousResolveCache::new()),
             relay_entry_verify_cache: Arc::new(veil_anonymity::directory::VerifiedEntryCache::new()),
@@ -906,6 +933,7 @@ impl AnonymityState {
             advertised_bps: self.advertised_bps,
             x25519_sk,
             rendezvous_publisher_entries: Arc::clone(&self.rendezvous_publisher_entries),
+            mailbox_publisher_entries: Arc::clone(&self.mailbox_publisher_entries),
             rendezvous_resolve_cache: Arc::clone(&self.rendezvous_resolve_cache),
             onion_resolve_cache: Arc::clone(&self.onion_resolve_cache),
             relay_entry_verify_cache: Arc::clone(&self.relay_entry_verify_cache),
