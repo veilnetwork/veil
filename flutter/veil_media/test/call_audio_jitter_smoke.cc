@@ -293,6 +293,10 @@ int main(int argc,char**argv) {
           passed &= pair[1].played_plc <= pair[0].played_plc;
         if (profile == 0)
           passed &= pair[0].played_plc == 0 && pair[1].discarded == 0;
+        if (ms == 20 && profile == 4)
+          need(pair[1].played_plc <= 650, "speech acceleration deepened repeated burst gaps");
+        if (ms == 40 && profile == 0)
+          need(pair[1].q95 <= 55, "stable 40-ms speech retained an unnecessary reserve");
         need(pair[1].max_target <= 500, "adaptive delay exceeded 500 ms");
         if (profile == 6)
           strongest_jitter_target_ms = std::max(strongest_jitter_target_ms, pair[1].max_target);

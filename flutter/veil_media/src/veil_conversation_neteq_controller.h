@@ -75,26 +75,35 @@ class ConversationNetEqController final : public webrtc::DecisionLogic {
           status.packet_buffer_info.num_samples;
       const int packet_ms = khz_ > 0
           ? static_cast<int>(packet_length_samples() / static_cast<size_t>(khz_)) : 0;
-      // Preserve one complete packet and the actual recent arrival variation
-      // before borrowing local queue headroom. Future packets beyond a hole
-      // cannot fund speech acceleration ahead of that hole.
-      const int reserve = std::max(target, history_->GetMaxDelayMs()) + packet_ms + 20;
+      // Protect the target and recent jitter with two render blocks of
+      // headroom. Keep an extra complete packet once buffering has adapted
+      // beyond one packet or the RTP age exceeds the local queue by a block.
+      // Future packets beyond a hole cannot fund speech acceleration.
+      const int jitter = history_->GetMaxDelayMs();
+      const int reserve = std::max(target, jitter) + 20;
+      const int full_reserve = reserve + packet_ms;
       const bool contiguous = !status.packet_buffer_info.dtx_or_cng &&
           status.packet_buffer_info.num_packets > 0 &&
           status.packet_buffer_info.span_samples == status.packet_buffer_info.num_samples;
-      const bool excess_samples = khz_ > 0 &&
-          packet_ms > 0 && contiguous &&
-          samples / static_cast<size_t>(khz_) >= static_cast<size_t>(reserve);
+      const size_t queued_ms = khz_ > 0 ? samples / static_cast<size_t>(khz_) : 0;
+      constexpr size_t kRenderBlockMs = 10;
+      const bool delay_exceeds_queue =
+          static_cast<size_t>(std::max(0, delay)) >= queued_ms + kRenderBlockMs;
+      const bool reserve_extra_packet = target > packet_ms || delay_exceeds_queue;
+      const bool can_keep_reserve = packet_ms > 0 && contiguous &&
+          queued_ms >= static_cast<size_t>(reserve_extra_packet ? full_reserve : reserve);
+      const bool excess_samples = can_keep_reserve &&
+          queued_ms >= static_cast<size_t>(full_reserve);
       // The target ALREADY includes the measured jitter quantile. The stock
       // target + maximum recent jitter + 20-ms guard kept ordinary speech
       // queued around 197 ms with a 140-ms target. Keep the real arrival
       // history and target, but do not charge that jitter twice for speech.
       // DTX/concealment transitions keep the stock guard and behavior.
-      const int high = target + 20 +
-          (speech && excess_samples ? 0 : history_->GetMaxDelayMs());
-      if (delay >= high * 4) return Op::kFastAccelerate;
+      const int high = target + 20 + (speech && excess_samples ? 0 : jitter);
+      const bool can_accelerate = !speech || can_keep_reserve;
+      if (can_accelerate && delay >= high * 4) return Op::kFastAccelerate;
       if (!countdown_ || countdown_->Finished()) {
-        if (delay >= high) return Op::kAccelerate;
+        if (can_accelerate && delay >= high) return Op::kAccelerate;
         if (delay < target) return Op::kPreemptiveExpand;
       }
     }

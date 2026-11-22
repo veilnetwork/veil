@@ -97,6 +97,21 @@ int main() {
     assert(stock.decide() == Op::kNormal);
     assert(conversation.decide() == Op::kNormal);
   }
+  for (int extra_ticks : {8, 80}) {
+    Fixture stock(false), thin, gapped, buffered;
+    for (auto* f : {&stock, &thin, &gapped, &buffered}) {
+      for (int i = 0; i < extra_ticks; ++i) f->clock.Increment();
+    }
+    stock.status.packet_buffer_info = thin.status.packet_buffer_info =
+        {false, 960, 960, 960, 1};
+    gapped.status.packet_buffer_info.span_samples = 19200;
+    const auto accelerate = extra_ticks == 8
+        ? Op::kAccelerate : Op::kFastAccelerate;
+    assert(stock.decide() == accelerate);
+    assert(thin.decide() == Op::kNormal);
+    assert(gapped.decide() == Op::kNormal);
+    assert(buffered.decide() == accelerate);
+  }
   {
     Fixture f;
     assert(f.decide() == Op::kAccelerate);
