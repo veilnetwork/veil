@@ -74,19 +74,24 @@ class RecoveringNetEq final : public webrtc::NetEq {
         // Storage alone misses time already spent upstream. Use only an
         // aligned decoded-packet clock and preserve the packet-sized jitter
         // reserve before an extra 10-ms pull. PLC/error guards remain below.
+        const int64_t now_us = webrtc::TimeMicros();
         const auto lag = UpdateDecodedClock(*frame)
-            ? rtp_lag_.Output(frame->timestamp_, webrtc::TimeMicros()) : std::nullopt;
+            ? rtp_lag_.Output(frame->timestamp_, now_us) : std::nullopt;
         // RTP age also includes time spent upstream. Do not repeatedly cut a
         // local queue below NetEq's own jitter reserve: it will refill toward
         // that target and manufacture another catch-up event. Arrival/decoder
         // headroom must be the same for age-only and storage-driven catch-up.
-        // The independent hard storage budget below remains unchanged.
-        const int64_t local_reserve_ms = std::max<int64_t>(
-            frame_headroom_ms_ + 30,
-            JitterReserveMs());
-        const bool age_excess = lag && *lag > RecoveryBudgetMs() - 20 &&
-            state.current_buffer_size_ms >= static_cast<uint64_t>(local_reserve_ms);
-        if ((!age_excess && state.current_buffer_size_ms <= static_cast<uint64_t>(RecoveryBudgetMs())) ||
+        const int jitter_reserve_ms = JitterReserveMs(now_us);
+        const int recovery_budget_ms = std::max(
+            NominalRecoveryBudgetMs(), jitter_reserve_ms);
+        const int local_reserve_ms = std::max(frame_headroom_ms_ + 30, jitter_reserve_ms);
+        // Extra pulls consume a whole render block. A smaller apparent
+        // surplus cannot fund a pull without spending the reserve itself.
+        const bool storage_excess = state.current_buffer_size_ms >=
+            static_cast<uint64_t>(recovery_budget_ms + kRenderBlockMs);
+        const bool age_excess = lag && *lag > recovery_budget_ms - 20 &&
+            state.current_buffer_size_ms >= static_cast<uint64_t>(local_reserve_ms + kRenderBlockMs);
+        if ((!age_excess && !storage_excess) ||
             (inner_->SyncBufferSizeMs() < 20 && !state.next_packet_available))
           break;
         bool next_muted = false;
@@ -105,9 +110,9 @@ class RecoveringNetEq final : public webrtc::NetEq {
         ++skipped;
       }
     }
-    if (skipped) receiver_recovery_->Record(skipped * 10, webrtc::TimeMicros());
+    if (skipped) receiver_recovery_->Record(skipped * kRenderBlockMs, webrtc::TimeMicros());
     if (skipped || fallback) {
-      stats_->discarded_ms.fetch_add(skipped * 10, std::memory_order_relaxed);
+      stats_->discarded_ms.fetch_add(skipped * kRenderBlockMs, std::memory_order_relaxed);
       if (fallback) stats_->fallback_frames.fetch_add(1, std::memory_order_relaxed);
       stats_->count.fetch_add(1, std::memory_order_release);
     }
@@ -244,15 +249,25 @@ class RecoveringNetEq final : public webrtc::NetEq {
   // packetization or relax a stricter caller-supplied maximum. The packet
   // buffer and the 16-pull callback limit remain bounded independently.
   static constexpr int kMaximumAdaptiveTargetMs = 500;
-  int JitterReserveMs() const {
+  static constexpr int kRenderBlockMs = 10;
+  int JitterReserveMs(int64_t now_us) const {
     const int target = std::clamp(inner_->TargetDelayMs(), 0, kMaximumAdaptiveTargetMs);
-    // A packet may already fund decoder lookahead/reordered arrival. Neither
-    // hard nor RTP-age catch-up may spend that same reserve a second time.
-    return target + 2 * frame_headroom_ms_;
+    const int headroom_ms = 2 * frame_headroom_ms_;
+    if (target + headroom_ms <= NominalRecoveryBudgetMs())
+      return target + headroom_ms;
+    // NetEq pursues a target below some recurring arrival gaps. An aggressive
+    // catch-up after each burst can discard the very speech needed before the
+    // next one. Bound suppression of extra pulls by recent packet evidence
+    // and by the configured target ceiling plus one encoded packet. NetEq's
+    // own target, packet limit and time stretching remain independent.
+    const int ceiling_ms = applied_target_ceiling_ms_ > 0
+        ? applied_target_ceiling_ms_ : kMaximumAdaptiveTargetMs;
+    const int recent_ms = std::min(rtp_lag_.RecentArrivalVariationMs(now_us),
+                                   ceiling_ms + frame_headroom_ms_);
+    return std::max(target, recent_ms) + headroom_ms;
   }
-  int RecoveryBudgetMs() const {
-    const int nominal = std::clamp(80 + 2 * frame_headroom_ms_, 120, 200);
-    return std::max(nominal, JitterReserveMs());
+  int NominalRecoveryBudgetMs() const {
+    return std::clamp(80 + 2 * frame_headroom_ms_, 120, 200);
   }
   bool ApplyTargetCeiling() {
     int ceiling = kMaximumAdaptiveTargetMs;

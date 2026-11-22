@@ -80,6 +80,21 @@ int main() {
     assert(lag.Output(stamp(-140), 3'120'000) == 40);
   }
   {
+    AudioRtpLag lag;
+    for (uint16_t index = 0; index < 3; ++index)
+      lag.Packet(7, stamp(index * 20), 1'000'000 + index * 20'000, index);
+    assert(lag.RecentArrivalVariationMs(1'040'000) == 0);
+    lag.Packet(7, stamp(60), 1'610'000, 3);
+    assert(lag.RecentArrivalVariationMs(1'610'000) == 550);
+    // A replay and a reordered packet do not raise or renew the late bound.
+    lag.Packet(7, stamp(60), 1'700'000, 3);
+    lag.Packet(7, stamp(20), 1'800'000, 1);
+    assert(lag.RecentArrivalVariationMs(1'800'000) == 550);
+    assert(lag.RecentArrivalVariationMs(3'500'000) == 0);
+    lag.Packet(8, stamp(80), 1'820'000, 4);
+    assert(lag.RecentArrivalVariationMs(1'820'000) == 0);
+  }
+  {
     veil_media::AudioRecoveryRegistry registry;
     auto stream = registry.NewStream(); registry.Attach(7, stream);
     stream->SetLag(269, 1'234'567);

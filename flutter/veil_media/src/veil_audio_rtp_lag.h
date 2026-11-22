@@ -22,12 +22,13 @@ class AudioRtpLag {
     const bool sequence_known = sequence && sequence_;
     const int16_t sequence_step = sequence_known
         ? static_cast<int16_t>(*sequence - *sequence_) : 0;
-    bool restarted = false;
+    bool restarted = false, advances_clock = false;
     if (!ssrc_ || ssrc != ssrc_ || now_us < last_seen_us_ ||
         now_us - last_seen_us_ > kHistoryUs ||
         std::abs(sequence_step) > 128) {
       Reset();
       restarted = true;
+      advances_clock = true;
       ssrc_ = ssrc;
       anchor_stamp_ = stamp;
       anchor_us_ = first_us_ = now_us;
@@ -51,6 +52,7 @@ class AudioRtpLag {
         anchor_stamp_ = stamp;
         anchor_us_ = now_us;
         ++distinct_packets_;
+        advances_clock = true;
       }
     }
     if (sequence && (!sequence_ || sequence_step > 0))
@@ -63,7 +65,27 @@ class AudioRtpLag {
     auto& bucket = buckets_[epoch % buckets_.size()];
     if (bucket.epoch != epoch) bucket = {epoch, intercept};
     else bucket.minimum_us = std::min(bucket.minimum_us, intercept);
+    if (advances_clock) bucket.maximum_us = std::max(bucket.maximum_us, intercept);
     return restarted;
+  }
+
+  // Preserve real arrival variation before dropping decoded audio. Use a
+  // short window so a single burst cannot lengthen later catch-up. Duplicates
+  // and older packets do not establish a new late-arrival bound.
+  int RecentArrivalVariationMs(int64_t now_us) const {
+    if (distinct_packets_ < 3 || now_us < last_seen_us_) return 0;
+    const int64_t epoch = now_us / kBucketUs;
+    int64_t earliest = INT64_MAX, latest = INT64_MIN;
+    for (int64_t back = 0; back < 4 && back <= epoch; ++back) {
+      const auto& bucket = buckets_[(epoch - back) % buckets_.size()];
+      if (bucket.epoch != epoch - back || bucket.maximum_us == INT64_MIN)
+        continue;
+      earliest = std::min(earliest, bucket.minimum_us);
+      latest = std::max(latest, bucket.maximum_us);
+    }
+    return latest > earliest
+        ? static_cast<int>(std::min<int64_t>(60000, (latest - earliest) / 1000))
+        : 0;
   }
 
   bool MatchesPacket(uint32_t ssrc, uint32_t stamp, uint16_t sequence) const {
@@ -98,7 +120,9 @@ class AudioRtpLag {
   static int64_t TickUs(int64_t ticks) {
     return (ticks / kHz) * 1'000'000 + (ticks % kHz) * 1'000'000 / kHz;
   }
-  struct Bucket { int64_t epoch = -1, minimum_us = 0; };
+  struct Bucket {
+    int64_t epoch = -1, minimum_us = 0, maximum_us = INT64_MIN;
+  };
   std::array<Bucket, 60> buckets_{};
   uint32_t ssrc_ = 0, anchor_stamp_ = 0;
   int64_t anchor_ticks_ = 0, anchor_us_ = 0, first_us_ = 0, last_seen_us_ = 0;

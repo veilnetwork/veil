@@ -79,6 +79,10 @@ static std::vector<Packet> network(const std::vector<Packet>& encoded, int profi
     }
     // Reach the adaptive ceiling with real Opus and NetEq on a lossless path.
     if (profile == 6) p.at += rng()%551;
+    // Withhold the first 550 ms of each second, then deliver that entire
+    // burst in order. This still delivers every packet, including at onset.
+    if (profile == 7 && p.at >= 4000 && p.at % 1000 < 550)
+      p.at += 550 - p.at % 1000;
     result.push_back(std::move(p));
   }
   std::stable_sort(result.begin(),result.end(),[](auto& a, auto& b){return a.at<b.at;});
@@ -88,7 +92,8 @@ struct Metrics {
   uint64_t played_plc = 0, conceal = 0, discarded = 0, packet_discarded = 0, events = 0, accelerate = 0;
   int max_gap = 0, q95 = 0, max_target = 0;
 };
-static Metrics run(const std::vector<Packet>& packets, bool custom) {
+static Metrics run(const std::vector<Packet>& packets, bool custom,
+                   int sample_after_ms = 1500) {
   Wall wall;
   auto* prior = webrtc::SetClockForTesting(&wall);
   Metrics result;
@@ -127,8 +132,8 @@ static Metrics run(const std::vector<Packet>& packets, bool custom) {
       bool muted=false;
       need(neteq->GetAudio(&frame,&muted) == 0,"decode");
       need(frame.samples_per_channel_ == 480 && frame.num_channels_ == 1,"format");
-      if (at == 1500) { base=neteq->GetLifetimeStatistics(); discard_base=recovery->discarded_ms.load(); }
-      if (at > 1500) {
+      if (at == sample_after_ms) { base=neteq->GetLifetimeStatistics(); discard_base=recovery->discarded_ms.load(); }
+      if (at > sample_after_ms) {
         for (size_t i = 0; i < frame.samples_per_channel_; ++i) {
           const int64_t sample = frame.data()[i];
           output_energy += static_cast<uint64_t>(sample * sample);
@@ -201,5 +206,13 @@ int main(int argc,char**argv) {
   }
   need(passed, "jitter reserve policy created extra played concealment on lossless traffic");
   need(strongest_jitter_target_ms == 500, "heavy jitter never reached the 500 ms adaptive ceiling");
+  const auto burst = network(encode(speech, 20), 7, 197);
+  const auto settled = run(burst, true, 10000);
+  std::printf("periodic 550-ms bursts after setup: concealed=%llu ms discarded=%llu ms target=%d ms\n",
+      (unsigned long long)settled.played_plc,
+      (unsigned long long)settled.discarded, settled.max_target);
+  need(settled.max_target >= 300 && settled.max_target <= 500, "burst did not exercise the adaptive reserve");
+  need(settled.discarded == 0, "steady arrival bursts triggered destructive catch-up");
+  need(settled.played_plc == 0, "steady arrival bursts caused repeated played concealment");
   std::puts("PASS lossless jitter/reorder speech reserve across 20/40/60-ms Opus");
 }
