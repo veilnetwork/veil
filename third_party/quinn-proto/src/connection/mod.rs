@@ -690,12 +690,12 @@ impl Connection {
                     // their existing alignment. No application role is read.
                     // Initials, requested padding, path responses and loss
                     // probes retain their existing size requirements.
-                    if space_id == SpaceId::Data
+                    let unpadded_1rtt = space_id == SpaceId::Data
                         && self.state.is_established()
                         && !close
                         && !self.config.pad_to_mtu
-                        && self.path_responses.is_empty()
-                    {
+                        && self.path_responses.is_empty();
+                    if unpadded_1rtt {
                         let local_window = self.local_congestion_window(now);
                         let remaining = local_window
                             .saturating_sub(self.path.in_flight.bytes)
@@ -768,18 +768,24 @@ impl Connection {
                     }
 
                     // Check whether the next datagram is blocked by pacing
-                    let pacing_delay = if ack_only_under_local_budget {
+                    let mut pacing_delay = if ack_only_under_local_budget {
                         None
                     } else {
-                        self.path.pacing.delay_with_rate(
-                            self.path.rtt.get(),
-                            bytes_to_send,
-                            self.path.current_mtu(),
-                            self.path.congestion.window(),
-                            self.path.congestion.metrics().pacing_rate,
-                            now,
-                        )
+                        self.pacing_delay(now, bytes_to_send)
                     };
+                    if pacing_delay.is_some()
+                        && unpadded_1rtt
+                        && num_datagrams == 0
+                        && buf.is_empty()
+                    {
+                        if let Some(size) = self
+                            .lone_timed_datagram_packet_size(pn)
+                            .filter(|&size| size < next_datagram_limit)
+                        {
+                            next_datagram_limit = size;
+                            pacing_delay = self.pacing_delay(now, size as u64);
+                        }
+                    }
                     if let Some(delay) = pacing_delay {
                         self.timers.set(Timer::Pacing, delay);
                         if space_id == SpaceId::Data {
@@ -4040,6 +4046,39 @@ impl Connection {
                 .min(b.0.window(now, self.path.in_flight.bytes, self.path.current_mtu()))
                 .max(1)
         })
+    }
+
+    fn pacing_delay(&mut self, now: Instant, bytes: u64) -> Option<Instant> {
+        self.path.pacing.delay_with_rate(
+            self.path.rtt.get(),
+            bytes,
+            self.path.current_mtu(),
+            self.path.congestion.window(),
+            self.path.congestion.metrics().pacing_rate,
+            now,
+        )
+    }
+
+    /// A single timed DATAGRAM can use a smaller packet when a full MTU
+    /// would have to wait for pacing credit. The builder is limited to the
+    /// same size. Due ACKs, other control frames and streams use normal sizing.
+    fn lone_timed_datagram_packet_size(&self, pn: u64) -> Option<usize> {
+        let size = self.datagrams.lone_timed_frame_size()?;
+        let space = &self.spaces[SpaceId::Data];
+        if !self.path.validated
+            || self.path.challenge.is_some()
+            || !space.can_send(&self.streams).is_empty()
+            || self.streams.can_send_stream_data()
+            || (space.pending_acks.should_ack_non_eliciting()
+                && space.pending_acks.can_send_with_other_frames())
+        {
+            return None;
+        }
+        let frame_space = size.max(Datagram::SIZE_BOUND + 1);
+        Some(
+            (self.predict_1rtt_overhead(Some(pn)) + frame_space)
+                .max(MIN_PACKET_SPACE + self.tag_len_1rtt()),
+        )
     }
 
     /// Whether we have 1-RTT data to send

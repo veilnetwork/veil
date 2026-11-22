@@ -823,10 +823,14 @@ impl PendingAcks {
         // non-ACK-eliciting packets, then include an ACK to help the peer perform timely loss
         // detection even if they're not sending any ACK-eliciting packets themselves. Exact
         // threshold chosen somewhat arbitrarily.
-        const LAZY_ACK_THRESHOLD: u64 = 10;
-        if self.non_ack_eliciting_since_last_ack_sent > LAZY_ACK_THRESHOLD {
+        if self.should_ack_non_eliciting() {
             self.immediate_ack_required = true;
         }
+    }
+
+    pub(super) fn should_ack_non_eliciting(&self) -> bool {
+        const LAZY_ACK_THRESHOLD: u64 = 10;
+        self.non_ack_eliciting_since_last_ack_sent > LAZY_ACK_THRESHOLD
     }
 }
 

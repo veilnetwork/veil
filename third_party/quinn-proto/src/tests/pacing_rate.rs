@@ -64,3 +64,61 @@ fn controller_rate_reaches_the_real_encrypted_datagram_sender() {
     }
     assert_eq!(count, 64);
 }
+
+#[test]
+fn a_lone_timed_datagram_can_spend_less_than_a_full_mtu_of_pacing_credit() {
+    let mut config = TransportConfig::default();
+    config.congestion_controller_factory(Arc::new(RateFactory));
+    config.enable_segmentation_offload(false);
+    config.mtu_discovery_config(None);
+    let mut client_config = client_config();
+    client_config.transport_config(Arc::new(config));
+    let mut pair = Pair::default();
+    let (client, _) = pair.connect_with(client_config);
+    pair.drive();
+
+    let now = pair.time;
+    let conn = pair.client_conn_mut(client);
+    conn.path_changed(now);
+    let before = conn.stats().frame_tx.datagram;
+    let mut buf = Vec::new();
+    for _ in 0..2 {
+        conn.datagrams()
+            .send(Bytes::from(vec![1; 1024]), false)
+            .unwrap();
+        assert!(conn.poll_transmit(now, 1, &mut buf).is_some());
+        buf.clear();
+    }
+    assert_eq!(conn.stats().frame_tx.datagram, before + 2);
+
+    conn.datagrams()
+        .send_with_expiry_at(
+            Bytes::from(vec![2; 64]),
+            false,
+            now + Duration::from_millis(16),
+            now,
+        )
+        .unwrap();
+    let small = conn
+        .poll_transmit(now, 1, &mut buf)
+        .expect("remaining credit fits the timed packet");
+    assert!(small.size < usize::from(conn.current_mtu()));
+    assert_eq!(conn.stats().frame_tx.datagram, before + 3);
+    buf.clear();
+
+    conn.datagrams()
+        .send_with_expiry_at(
+            Bytes::from(vec![3; 512]),
+            false,
+            now + Duration::from_millis(20),
+            now,
+        )
+        .unwrap();
+    assert!(conn.poll_transmit(now, 1, &mut buf).is_none());
+    let paced = conn.poll_timeout().unwrap();
+    assert!(paced > now && paced < now + Duration::from_millis(20));
+    conn.handle_timeout(paced);
+    assert!(conn.poll_transmit(paced, 1, &mut buf).is_some());
+    assert_eq!(conn.stats().frame_tx.datagram, before + 4);
+    assert_eq!(conn.datagrams().expired_outgoing(), 0);
+}

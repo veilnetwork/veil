@@ -246,6 +246,11 @@ impl DatagramState {
         self.outgoing.queue.front().map(|d| d.data.len())
     }
 
+    pub(super) fn lone_timed_frame_size(&self) -> Option<usize> {
+        let packet = self.outgoing.queue.front()?;
+        (self.outgoing.queue.len() == 1 && packet.expires_at.is_some()).then(|| packet.size(true))
+    }
+
     pub(super) fn oldest_timed_age(&self, now: Instant) -> Option<Duration> {
         now.checked_duration_since(self.outgoing.queue.front()?.queued_at?)
     }
