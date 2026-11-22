@@ -2510,7 +2510,14 @@ impl congestion::ControllerFactory for FixedDatagramWindow {
     }
 }
 
-fn residual_window_pair(pad: bool) -> (Pair, ConnectionHandle, ConnectionHandle) {
+fn residual_window_pair(
+    pad: bool,
+) -> (
+    Pair,
+    ConnectionHandle,
+    ConnectionHandle,
+    FixedDatagramWindow,
+) {
     let mut pair = Pair::default();
     let window = Arc::new(std::sync::atomic::AtomicU64::new(12_000));
     let mut config = client_config();
@@ -2538,13 +2545,13 @@ fn residual_window_pair(pad: bool) -> (Pair, ConnectionHandle, ConnectionHandle)
         pair.client.outbound.push_back((tx, buf.into()));
     }
     assert!(pair.client_conn_mut(client_ch).stats().path.in_flight_bytes < limit);
-    (pair, client_ch, server_ch)
+    (pair, client_ch, server_ch, FixedDatagramWindow(window))
 }
 
 #[test]
 fn small_datagram_uses_residual_congestion_window_before_expiry() {
     for max_datagrams in [1, 16] {
-        let (mut pair, client_ch, server_ch) = residual_window_pair(false);
+        let (mut pair, client_ch, server_ch, _) = residual_window_pair(false);
         let now = pair.time;
         const SMALL: &[u8] = &[3; 64];
         pair.client_datagrams(client_ch)
@@ -2592,8 +2599,45 @@ fn small_datagram_uses_residual_congestion_window_before_expiry() {
 }
 
 #[test]
+fn due_ack_when_controller_window_is_full() {
+    let (mut pair, client, server, window) = residual_window_pair(false);
+    let before = pair.client_conn_mut(client).stats();
+    let flight = before.path.in_flight_bytes;
+    assert!(flight > 0);
+    window.0.store(flight, std::sync::atomic::Ordering::Relaxed);
+    let queued = Bytes::from(vec![3; 1_000]);
+    pair.client_datagrams(client)
+        .send(queued.clone(), false)
+        .unwrap();
+
+    // The peer has not received either outstanding packet yet and cannot
+    // release our send credit. Its request still makes an ACK due now.
+    let server_acks = pair.server_conn_mut(server).stats().frame_rx.acks;
+    pair.server_conn_mut(server).immediate_ack();
+    pair.drive_server();
+    pair.drive_client();
+    let after = pair.client_conn_mut(client).stats();
+    assert_eq!(after.frame_tx.acks, before.frame_tx.acks + 1);
+    assert_eq!(after.frame_tx.datagram, before.frame_tx.datagram);
+    assert_eq!(after.path.in_flight_bytes, flight);
+
+    pair.drive();
+    assert_eq!(
+        pair.server_conn_mut(server).stats().frame_rx.acks,
+        server_acks + 1
+    );
+    for fill in [1u8, 2] {
+        assert_eq!(
+            pair.server_datagrams(server).recv().unwrap(),
+            vec![fill; 1_000]
+        );
+    }
+    assert_eq!(pair.server_datagrams(server).recv(), Some(queued));
+}
+
+#[test]
 fn residual_window_keeps_requested_mtu_padding() {
-    let (mut pair, client_ch, server_ch) = residual_window_pair(true);
+    let (mut pair, client_ch, server_ch, _) = residual_window_pair(true);
     let now = pair.time;
     pair.client_datagrams(client_ch)
         .send(vec![3; 64].into(), false)
@@ -2624,7 +2668,7 @@ fn residual_window_keeps_requested_mtu_padding() {
 
 #[test]
 fn reliable_stream_uses_residual_window_without_exceeding_it() {
-    let (mut pair, client_ch, server_ch) = residual_window_pair(false);
+    let (mut pair, client_ch, server_ch, _) = residual_window_pair(false);
     let now = pair.time;
     let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
     let data = vec![7; 1_500];
@@ -2659,7 +2703,7 @@ fn reliable_stream_uses_residual_window_without_exceeding_it() {
 
 #[test]
 fn timed_datagram_block_observation_tracks_actual_window_and_excludes_expired_work() {
-    let (mut pair, client_ch, _) = residual_window_pair(false);
+    let (mut pair, client_ch, _, _) = residual_window_pair(false);
     let queued_at = pair.time;
     pair.client_datagrams(client_ch)
         .send_with_expiry_at(

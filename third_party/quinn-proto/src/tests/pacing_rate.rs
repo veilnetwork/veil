@@ -75,6 +75,48 @@ fn a_small_timed_head_can_use_pacing_credit_with_another_datagram_queued() {
     timed_head_can_spend_less_than_a_full_mtu_of_pacing_credit(true);
 }
 
+#[test]
+fn due_ack_when_controller_pacing_blocks_data() {
+    let mut config = TransportConfig::default();
+    config.congestion_controller_factory(Arc::new(RateFactory));
+    config.enable_segmentation_offload(false);
+    config.mtu_discovery_config(None);
+    let mut client_config = client_config();
+    client_config.transport_config(Arc::new(config));
+    let mut pair = Pair::default();
+    let (client, server) = pair.connect_with(client_config);
+    pair.drive();
+
+    let now = pair.time;
+    let conn = pair.client_conn_mut(client);
+    conn.path_changed(now);
+    let packet = Bytes::from(vec![1; 1024]);
+    let mut buf = Vec::new();
+    for _ in 0..2 {
+        conn.datagrams().send(packet.clone(), false).unwrap();
+        assert!(conn.poll_transmit(now, 1, &mut buf).is_some());
+        buf.clear();
+    }
+    conn.datagrams().send(packet, false).unwrap();
+    assert!(conn.poll_transmit(now, 1, &mut buf).is_none());
+    let paced = conn.poll_timeout().unwrap();
+    assert!(paced > now);
+    let before = conn.stats();
+
+    pair.server_conn_mut(server).immediate_ack();
+    pair.drive_server();
+    pair.drive_client();
+    let conn = pair.client_conn_mut(client);
+    let after = conn.stats();
+    assert_eq!(after.frame_tx.acks, before.frame_tx.acks + 1);
+    assert_eq!(after.frame_tx.datagram, before.frame_tx.datagram);
+    assert_eq!(after.path.in_flight_bytes, before.path.in_flight_bytes);
+    assert_eq!(conn.poll_timeout(), Some(paced));
+    conn.handle_timeout(paced);
+    assert!(conn.poll_transmit(paced, 1, &mut buf).is_some());
+    assert_eq!(conn.stats().frame_tx.datagram, before.frame_tx.datagram + 1);
+}
+
 fn timed_head_can_spend_less_than_a_full_mtu_of_pacing_credit(queue_both: bool) {
     let mut config = TransportConfig::default();
     config.congestion_controller_factory(Arc::new(RateFactory));

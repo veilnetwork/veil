@@ -618,7 +618,7 @@ impl Connection {
                 continue;
             }
 
-            let mut ack_only_under_local_budget = false;
+            let mut ack_only = false;
             let mut bypass_datagram_head = false;
             let mut ack_eliciting = !self.spaces[space_id].pending.is_empty(&self.streams)
                 || self.spaces[space_id].ping_pending
@@ -695,6 +695,10 @@ impl Connection {
                         && !close
                         && !self.config.pad_to_mtu
                         && self.path_responses.is_empty();
+                    // A due ACK can free the peer's send window. An ACK-only
+                    // packet uses no flight credit and needs no pacing (RFC
+                    // 9002 §§7, 7.7). Keep the existing padding and path rules.
+                    let may_send_ack_only = unpadded_1rtt && can_send.acks && buf.is_empty();
                     if unpadded_1rtt {
                         let local_window = self.local_congestion_window(now);
                         let remaining = local_window
@@ -747,28 +751,16 @@ impl Connection {
                             );
                         }
                         trace!("blocked by congestion control");
-                        // A due transport ACK releases flight at the peer.
-                        // Waiting for our own source allowance can leave both
-                        // endpoints waiting for credit on this connection.
-                        ack_only_under_local_budget = space_id == SpaceId::Data
-                            && can_send.acks
-                            && local_window < self.path.congestion.window()
-                            && self.state.is_established()
-                            && !close
-                            && !self.config.pad_to_mtu
-                            && self.path_responses.is_empty()
-                            && buf.is_empty();
-                        if !ack_only_under_local_budget {
+                        if !may_send_ack_only {
                             // Keep loss probes in higher spaces eligible.
                             space_idx += 1;
                             continue;
                         }
-                        ack_eliciting = false;
-                        next_datagram_limit = segment_size;
+                        ack_only = true;
                     }
 
                     // Check whether the next datagram is blocked by pacing
-                    let mut pacing_delay = if ack_only_under_local_budget {
+                    let mut pacing_delay = if ack_only {
                         None
                     } else {
                         self.pacing_delay(now, bytes_to_send)
@@ -795,7 +787,15 @@ impl Connection {
                         // Loss probes should be subject to pacing, even though
                         // they are not congestion controlled.
                         trace!("blocked by pacing");
-                        break;
+                        if !may_send_ack_only {
+                            break;
+                        }
+                        ack_only = true;
+                    }
+
+                    if ack_only {
+                        ack_eliciting = false;
+                        next_datagram_limit = segment_size;
                     }
                 }
 
@@ -1046,7 +1046,7 @@ impl Connection {
                 }
             }
 
-            let sent = if ack_only_under_local_budget {
+            let sent = if ack_only {
                 let mut sent = SentFrames::default();
                 Self::try_populate_acks(
                     now,
@@ -1093,7 +1093,7 @@ impl Connection {
 
             // Keep information about the packet around until it gets finalized
             sent_frames = Some(sent);
-            if ack_only_under_local_budget {
+            if ack_only {
                 break;
             }
 
