@@ -256,6 +256,7 @@ async fn compact_video_batches_ready_frames_without_crossing_cell_or_frame_bound
                     cadence_sample: true,
                     packets,
                     enqueued_at,
+                    deadline,
                 })
                 .unwrap();
             }
@@ -448,14 +449,18 @@ async fn stale_assembled_video_never_seals_or_precedes_a_fresh_frame() {
         audio,
         MediaVideoIngress::relay_frames(video, Arc::clone(&stats)),
     );
+    let expired_prefix = video_packet(7, false, 1);
+    let mut marker = video_packet(7, true, 2);
+    marker[2..4].copy_from_slice(&1u16.to_be_bytes());
+    marker[8..12].copy_from_slice(&expired_prefix[8..12]);
     assert_eq!(
         ingress.enqueue(QueuedMediaPacket {
-            payload: video_packet(7, false, 1),
+            payload: expired_prefix,
             deadline: tokio::time::Instant::now() - Duration::from_millis(1),
         }),
         0
     );
-    assert_eq!(ingress.enqueue(video_packet(7, true, 2).into()), 0);
+    assert_eq!(ingress.enqueue(marker.into()), 0);
     let fresh = video_packet(8, true, 3);
     assert_eq!(ingress.enqueue(fresh.clone().into()), 0);
     drop(ingress);
@@ -489,6 +494,73 @@ async fn stale_assembled_video_never_seals_or_precedes_a_fresh_frame() {
         sent_rx.try_recv().is_err(),
         "stale frame must not reach transport"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn only_contiguous_fresh_camera_fragments_can_finish_after_the_normal_deadline() {
+    for (screen, second_sequence, fragment_gap, same_source, expected) in [
+        (false, 0u16, 301u64, true, true), // Consecutive, including RTP sequence wrap.
+        (false, 1, 301, true, false),
+        (false, 0, 301, false, false),
+        (false, 0, 451, true, false),
+        (true, 0, 301, true, false),
+    ] {
+        let (audio, _audio_rx) = mpsc::channel(1);
+        let (video, video_rx) = mpsc::channel(1);
+        let (screen_tx, screen_rx) = mpsc::channel(1);
+        let stats = Arc::new(RelayMediaStats::default());
+        let ingress = MediaIngress::with_screen(
+            audio,
+            MediaVideoIngress::relay_frames(video, Arc::clone(&stats)),
+            MediaVideoIngress::relay_frames(screen_tx, Arc::clone(&stats)),
+        );
+        ingress.screen_sharing.store(screen, Ordering::Release);
+        let mut first = video_packet(7, false, 1);
+        first[2..4].copy_from_slice(&u16::MAX.to_be_bytes());
+        let mut tail = video_packet(7, true, 2);
+        tail[2..4].copy_from_slice(&second_sequence.to_be_bytes());
+        if same_source {
+            tail[8..12].copy_from_slice(&first[8..12]);
+        }
+        let started = tokio::time::Instant::now();
+        assert_eq!(ingress.enqueue(first.clone().into()), 0);
+        tokio::time::advance(Duration::from_millis(fragment_gap)).await;
+        assert_eq!(ingress.enqueue(tail.clone().into()), 0);
+        drop(ingress);
+
+        let (sink, mut sent) = mpsc::unbounded_channel();
+        let peer = [0x71; 32];
+        let cipher = Arc::new(cipher_for_test(&peer, &[1; 32], &[2; 32]).unwrap());
+        let receiver = cipher_for_test(&peer, &[2; 32], &[1; 32]).unwrap();
+        let plane = if screen {
+            LocalMediaPlane::Screen
+        } else {
+            LocalMediaPlane::Secondary
+        };
+        drain_relay_video_on_plane(
+            if screen { screen_rx } else { video_rx },
+            Arc::new(AtomicU8::new(MEDIA_BATCHING_OFF)),
+            cipher,
+            stats,
+            plane,
+            move |cell| {
+                sink.send(cell).unwrap();
+                async { true }
+            },
+        )
+        .await;
+        if expected {
+            for packet in [first, tail] {
+                let sealed = sent.try_recv().expect("the whole paced frame is sent");
+                assert_eq!(receiver.open(sealed.as_bytes()), Some(packet));
+                assert_eq!(
+                    sealed.local_deadline(),
+                    Some(started + Duration::from_millis(450))
+                );
+            }
+        }
+        assert!(sent.try_recv().is_err());
+    }
 }
 
 #[test]
@@ -763,10 +835,12 @@ async fn audio_continues_while_video_writer_is_blocked(relay: bool) {
     let video = video_packet(7, true, 3);
     let video_task = if relay {
         let (tx, rx) = mpsc::channel(1);
+        let enqueued_at = Instant::now();
         tx.send(RelayVideoFrame {
             cadence_sample: true,
             packets: vec![video.clone()],
-            enqueued_at: Instant::now(),
+            enqueued_at,
+            deadline: tokio::time::Instant::from_std(enqueued_at) + MEDIA_LOCAL_QUEUE_AGE,
         })
         .await
         .unwrap();
@@ -1977,6 +2051,7 @@ async fn complete_relay_frames_reach_the_batch_sink_as_independent_work_items() 
             cadence_sample: true,
             packets: packets.clone(),
             enqueued_at,
+            deadline: tokio::time::Instant::from_std(enqueued_at) + MEDIA_LOCAL_QUEUE_AGE,
         })
         .unwrap();
     }
@@ -1985,6 +2060,7 @@ async fn complete_relay_frames_reach_the_batch_sink_as_independent_work_items() 
         cadence_sample: false,
         packets: vec![control.clone()],
         enqueued_at,
+        deadline: tokio::time::Instant::from_std(enqueued_at) + MEDIA_LOCAL_QUEUE_AGE,
     })
     .unwrap();
     drop(tx);

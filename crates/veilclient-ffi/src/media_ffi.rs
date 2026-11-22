@@ -127,6 +127,8 @@ fn media_cell_plane(cell: &[u8]) -> media::LocalMediaPlane {
 // replay queued RTP/RTCP after local route construction or IPC stalls.
 #[cfg(feature = "node-embedded")]
 const MEDIA_LOCAL_QUEUE_AGE: std::time::Duration = std::time::Duration::from_millis(200);
+#[cfg(feature = "node-embedded")]
+const PACED_CAMERA_ASSEMBLY_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(450);
 
 #[cfg(feature = "node-embedded")]
 #[derive(Debug)]
@@ -473,7 +475,7 @@ async fn drain_relay_video_batches_on_plane<F, Fut>(
         } else {
             RELAY_VIDEO_BATCH_BODY_MAX
         };
-        let deadline = tokio::time::Instant::from_std(frame.enqueued_at) + MEDIA_LOCAL_QUEUE_AGE;
+        let deadline = frame.deadline;
         // Only an original completed frame supplies cadence. Repairs, padding
         // and RTCP retain the same source/byte limits but cannot retime the
         // next frame's local pacing. Relays never inspect these distinctions.
@@ -2067,7 +2069,8 @@ impl MediaIngress {
             // assembler and its contention/discard state, just like RTCP.
             return self.enqueue_video_control(payload);
         }
-        let source = if self.screen_sharing.load(Acquire) {
+        let screen_sharing = self.screen_sharing.load(Acquire);
+        let source = if screen_sharing {
             match &self.screen {
                 Some(screen) => screen,
                 None => return refuse_ingress(IngressRefusal::MissingScreen, true, -1),
@@ -2115,9 +2118,15 @@ impl MediaIngress {
                             .completed_deadline
                             .take()
                             .expect("complete frame retains its original deadline");
+                        let send_deadline = if screen_sharing {
+                            deadline
+                        } else {
+                            assembler.camera_deadline(&packets, deadline)
+                        };
                         let frame = RelayVideoFrame {
                             packets,
                             enqueued_at: deadline.into_std() - MEDIA_LOCAL_QUEUE_AGE,
+                            deadline: send_deadline,
                             cadence_sample: assembler.completed_cadence,
                         };
                         match tx.try_send(frame) {
@@ -2157,6 +2166,7 @@ impl MediaIngress {
                 // may consume or discard a partially assembled VP8 frame.
                 let frame = RelayVideoFrame {
                     enqueued_at: payload.deadline.into_std() - MEDIA_LOCAL_QUEUE_AGE,
+                    deadline: payload.deadline,
                     packets: vec![payload.payload],
                     cadence_sample: false,
                 };
@@ -2197,6 +2207,7 @@ impl MediaIngress {
 struct RelayVideoFrame {
     packets: Vec<Vec<u8>>,
     enqueued_at: std::time::Instant,
+    deadline: tokio::time::Instant,
     cadence_sample: bool,
 }
 
@@ -2419,6 +2430,7 @@ struct RelayVideoFrameAssembler {
     newest_timestamp: Option<u32>,
     timestamp: Option<u32>,
     frame_deadline: Option<tokio::time::Instant>,
+    frame_fragments_fresh: bool,
     completed_deadline: Option<tokio::time::Instant>,
     completed_cadence: bool,
     packets: Vec<Vec<u8>>,
@@ -2482,6 +2494,8 @@ impl RelayVideoFrameAssembler {
             self.reset();
         }
         self.timestamp = Some(timestamp);
+        self.frame_fragments_fresh = (self.frame_deadline.is_none() || self.frame_fragments_fresh)
+            && tokio::time::Instant::now() < deadline;
         self.frame_deadline = Some(
             self.frame_deadline
                 .map_or(deadline, |old| old.min(deadline)),
@@ -2506,6 +2520,37 @@ impl RelayVideoFrameAssembler {
         RelayVideoFramePush::Complete(std::mem::take(&mut self.packets))
     }
 
+    fn camera_deadline(
+        &self,
+        packets: &[Vec<u8>],
+        ordinary: tokio::time::Instant,
+    ) -> tokio::time::Instant {
+        // WebRTC can pace the pieces of one camera frame more than 200 ms
+        // apart. Only fresh, consecutive fragments of the same original RTP
+        // stream can use the extra assembly time. Anchor it at the first
+        // fragment, so a marker, an SDK stall or a repair cannot renew it.
+        let extended = ordinary - MEDIA_LOCAL_QUEUE_AGE + PACED_CAMERA_ASSEMBLY_MAX_AGE;
+        let now = tokio::time::Instant::now();
+        if !self.completed_cadence
+            || !self.frame_fragments_fresh
+            || packets.len() < 2
+            || now < ordinary
+            || now >= extended
+        {
+            return ordinary;
+        }
+        let contiguous = packets.windows(2).all(|pair| {
+            let before = &pair[0];
+            let after = &pair[1];
+            before.len() >= 12
+                && after.len() >= 12
+                && before[8..12] == after[8..12]
+                && u16::from_be_bytes([before[2], before[3]]).wrapping_add(1)
+                    == u16::from_be_bytes([after[2], after[3]])
+        });
+        if contiguous { extended } else { ordinary }
+    }
+
     fn discard_after_contention(&mut self) {
         self.reset();
         self.discard_until_marker = true;
@@ -2514,6 +2559,7 @@ impl RelayVideoFrameAssembler {
     fn reset(&mut self) {
         self.timestamp = None;
         self.frame_deadline = None;
+        self.frame_fragments_fresh = false;
         self.completed_deadline = None;
         self.completed_cadence = false;
         self.packets.clear();
