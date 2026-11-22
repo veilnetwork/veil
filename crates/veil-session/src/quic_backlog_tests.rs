@@ -68,11 +68,7 @@ fn independent_secondary_retry_preserves_deadline_and_other_sources_progress() {
     assert!(super::local_datagram_expiry(&envelope).is_none());
     envelope.carrier = None;
     envelope.expires_at = deadline;
-    for priority in [
-        REALTIME,
-        INTERACTIVE,
-        veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
-    ] {
+    for priority in [INTERACTIVE, veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE] {
         envelope.frame.0 = priority;
         assert!(!super::independent_source_capacity_retry(
             &envelope,
@@ -142,7 +138,7 @@ fn independent_secondary_retry_preserves_deadline_and_other_sources_progress() {
 }
 
 #[test]
-fn fresh_primary_capacity_wait_keeps_its_age_deadline_and_single_retry_turn() {
+fn primary_capacity_wait_survives_several_turns_with_its_original_deadline() {
     use crate::frame_outbox::FrameEnvelope;
     use crate::priority_queue::{HeadAdmission, PriorityQueue};
     use veil_proto::priority::{INTERACTIVE, REALTIME};
@@ -152,24 +148,39 @@ fn fresh_primary_capacity_wait_keeps_its_age_deadline_and_single_retry_turn() {
         veil_bufpool::pooled_shared_from_vec(b"audio".to_vec()),
     ));
     frame.queued_at = now;
-    frame.expires_at = Some(now + Duration::from_millis(100));
+    let frees_at = now + Duration::from_millis(12);
+    let deadline_at = now + Duration::from_millis(100);
+    frame.expires_at = Some(deadline_at);
     let deadline = frame.expires_at;
     assert!(super::independent_source_capacity_retry(&frame, true, now));
     assert!(!super::independent_source_capacity_retry(
         &frame, false, now
     ));
+    assert!(super::independent_source_capacity_retry(
+        &frame,
+        true,
+        frees_at - Duration::from_millis(1)
+    ));
     assert!(!super::independent_source_capacity_retry(
         &frame,
         true,
-        now + Duration::from_millis(2)
+        deadline_at
     ));
+    let original_lifetime = crate::priority_queue::LOCAL_PRIMARY_MAX_AGE;
+    frame.expires_at = Some(now + original_lifetime + Duration::from_secs(1));
+    assert!(!super::independent_source_capacity_retry(
+        &frame,
+        true,
+        now + original_lifetime
+    ));
+    frame.expires_at = deadline;
     let capacity = REALTIME_DATAGRAM_BUFFER_BYTES;
     assert!(!super::local_primary_datagram_fits(2202, capacity - 2202));
     let mut queue = PriorityQueue::with_default_weights();
     let mut waiting = false;
     let mut retry = None;
     super::defer_local_datagram(&mut queue, frame, &mut waiting, &mut retry);
-    assert_eq!(retry, Some(now + Duration::from_millis(2)));
+    assert!(waiting && retry.is_some_and(|at| at <= deadline_at));
     queue.push_lossy(
         INTERACTIVE,
         veil_bufpool::pooled_shared_from_vec(b"neutral".to_vec()),

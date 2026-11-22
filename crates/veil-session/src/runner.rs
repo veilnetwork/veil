@@ -675,11 +675,11 @@ fn independent_source_capacity_retry(
     independent
         && envelope.carrier.is_none()
         && match envelope.frame.0 {
-            // A momentarily occupied child must not discard a fresh primary
-            // behind a padded check. Allow only its first existing 2-ms retry
-            // turn, never the full 200-ms lifetime as a new queue allowance.
+            // An occupied child can drain after several retry turns. Keep
+            // primary frames in the existing bounded priority queue until their
+            // original deadline, without increasing the transport backlog.
             veil_proto::priority::REALTIME => {
-                now.saturating_duration_since(envelope.queued_at) < LOCAL_DATAGRAM_CAPACITY_RETRY
+                local_datagram_expiry(envelope).is_some_and(|deadline| now < deadline)
             }
             veil_proto::priority::BULK | veil_proto::priority::BACKGROUND => true,
             _ => false,
@@ -695,11 +695,8 @@ fn defer_local_datagram(
     waiting: &mut bool,
     retry_at: &mut Option<std::time::Instant>,
 ) {
-    let retry = if envelope.frame.0 == veil_proto::priority::REALTIME {
-        envelope.queued_at + LOCAL_DATAGRAM_CAPACITY_RETRY
-    } else {
-        std::time::Instant::now() + LOCAL_DATAGRAM_CAPACITY_RETRY
-    };
+    let next = std::time::Instant::now() + LOCAL_DATAGRAM_CAPACITY_RETRY;
+    let retry = local_datagram_expiry(&envelope).map_or(next, |deadline| next.min(deadline));
     pq.restore_lossy_envelope(envelope);
     *waiting = true;
     *retry_at = Some(retry_at.map_or(retry, |old| old.min(retry)));
