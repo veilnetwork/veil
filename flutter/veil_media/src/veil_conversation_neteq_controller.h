@@ -9,6 +9,9 @@
 #include "modules/audio_coding/neteq/packet_arrival_history.h"
 
 namespace veil_media {
+inline constexpr char kCallNetEqDelayManagerTrial[] =
+    "forget_factor:0.90,reorder_forget_factor:0.95";
+
 class ConversationNetEqController final : public webrtc::DecisionLogic {
  public:
   ConversationNetEqController(

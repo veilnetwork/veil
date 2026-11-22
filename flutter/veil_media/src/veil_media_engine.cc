@@ -1359,7 +1359,7 @@ class LowLatencyFieldTrials final : public webrtc::FieldTrialsView {
     // estimator caps current delay or discards queued speech. This is entirely
     // receiver-local; no media role or priority is disclosed to the network.
     if (key == "WebRTC-Audio-NetEqDelayManagerConfig")
-      return "forget_factor:0.90,reorder_forget_factor:0.95";
+      return veil_media::kCallNetEqDelayManagerTrial;
     if (key == "WebRTC-ForcePlayoutDelay") {
       // A small receiver-side floor lets WebRTC schedule through isolated
       // phone-radio bursts instead of presenting every arrival gap. Physical

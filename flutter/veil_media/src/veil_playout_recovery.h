@@ -18,9 +18,10 @@
 #include "veil_conversation_neteq_controller.h"
 
 namespace veil_media {
-// NetEq limits its target to 75% of the packet capacity in time. Keep room
-// above the 500-ms target for 20-ms Opus packets released in a batch.
-inline constexpr size_t kCallAudioPacketCapacity = 36;
+// Allow overlapping paced releases of 20-ms Opus packets to fit. A full
+// WebRTC packet buffer flushes every queued packet on the next insertion.
+// The independent adaptive target is still capped by RecoveringNetEq.
+inline constexpr size_t kCallAudioPacketCapacity = 40;
 
 struct PlayoutRecoveryStats {
   AudioRecoveryRegistry receivers;
@@ -269,14 +270,18 @@ class RecoveringNetEq final : public webrtc::NetEq {
         ? applied_target_ceiling_ms_ : kMaximumAdaptiveTargetMs;
     // A paced release can fill the short-packet queue even though the next
     // arrival gap is longer than the adaptive target. Keep that speech if
-    // the measured arrival variation calls for it. Bound this allowance by
-    // the duration of all but one packet slot. Stricter caller ceilings and
-    // longer frames keep their usual allowance. This only gates decoded catch-up.
+    // the measured arrival variation calls for it. Leave one render block
+    // below the call policy's 720-ms pressure rail for a full 500-ms target.
+    // The remaining packet slots can absorb a brief overlap without
+    // promoting it to a persistent playout allowance.
+    // Stricter caller ceilings and longer frames keep their usual allowance.
+    // This only gates decoded catch-up.
     constexpr int kShortOpusPacketMs = 20;
+    constexpr int kShortPacketReserveLimitMs = 720 - kRenderBlockMs;
     const bool full_short_packet_queue = ceiling_ms == kMaximumAdaptiveTargetMs &&
         frame_headroom_ms_ == kShortOpusPacketMs;
     const int max_reserve_ms = full_short_packet_queue
-        ? (kCallAudioPacketCapacity - 1) * kShortOpusPacketMs
+        ? kShortPacketReserveLimitMs
         : ceiling_ms + 2 * headroom_ms;
     const int recent_ms = rtp_lag_.RecentArrivalVariationMs(now_us);
     const bool adaptive = target_reserve_ms > NominalRecoveryBudgetMs();

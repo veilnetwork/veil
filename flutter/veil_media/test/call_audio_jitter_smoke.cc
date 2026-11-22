@@ -16,6 +16,7 @@
 #include <vector>
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
 #include "api/environment/environment_factory.h"
+#include "api/field_trials_view.h"
 #include "api/neteq/default_neteq_factory.h"
 #include "rtc_base/time_utils.h"
 #include "system_wrappers/include/clock.h"
@@ -94,10 +95,19 @@ static std::vector<Packet> network(const std::vector<Packet>& encoded, int profi
     if (profile == 11 && p.at >= 4000) {
       p.at += std::max(0, 630 - p.at % 1000);
     }
-    if (profile == 9 || profile == 10 || profile == 11) {
+    // Neighboring cohorts can overlap when control traffic delays the
+    // first part of a paced release. Transport still delivers every packet.
+    if (profile == 12 && p.at >= 4000) {
+      p.at += std::max(0, 670 - p.at % 1000);
+    }
+    if (profile >= 9 && profile <= 12) {
       // An open link drains the held packets at a finite rate, with other
       // opaque datagrams serialized ahead of individual audio packets.
-      const int service_ms = 2 + static_cast<int>(rng() % 10);
+      int service_ms = 2 + static_cast<int>(rng() % 10);
+      if (profile == 12 && p.begin >= 6000 &&
+          p.begin % 3000 < 1000 && p.begin % 1000 < 80) {
+        service_ms += 32;
+      }
       serialized_until_ms = std::max(serialized_until_ms, p.at) + service_ms;
       p.at = serialized_until_ms;
     }
@@ -112,14 +122,28 @@ struct Metrics {
   uint64_t packet_flushes = 0;
   int max_gap = 0, q95 = 0, max_target = 0, recovery_target_ms = 0;
 };
+class CallDelayTrials final : public webrtc::FieldTrialsView {
+ public:
+  std::string Lookup(absl::string_view key) const override {
+    if (key == "WebRTC-Audio-NetEqDelayManagerConfig")
+      return veil_media::kCallNetEqDelayManagerTrial;
+    return {};
+  }
+  std::unique_ptr<webrtc::FieldTrialsView> CreateCopy() const override {
+    return std::make_unique<CallDelayTrials>();
+  }
+};
+
 static Metrics run(const std::vector<Packet>& packets, bool custom,
-                   int sample_after_ms = 1500) {
+                   int sample_after_ms = 1500, bool call_delay_trials = false) {
   Wall wall;
   auto* prior = webrtc::SetClockForTesting(&wall);
   Metrics result;
   {
     webrtc::SimulatedClock clock(1000000);
-    const auto env = webrtc::CreateEnvironment(&clock);
+    const auto env = call_delay_trials
+        ? webrtc::CreateEnvironment(&clock, std::make_unique<CallDelayTrials>())
+        : webrtc::CreateEnvironment(&clock);
     webrtc::NetEq::Config config;
     config.sample_rate_hz = 48000;
     config.max_packets_in_buffer = veil_media::kCallAudioPacketCapacity;
@@ -206,6 +230,19 @@ int main(int argc,char**argv) {
   for(size_t i=0;i<speech.size();++i) speech[i]=static_cast<int16_t>(
       static_cast<unsigned char>(bytes[2*i]) | (static_cast<unsigned char>(bytes[2*i+1])<<8));
   const auto encoded_20ms = encode(speech, 20);
+  for (int seed : {197, 17, 41}) {
+    const auto held = network(encoded_20ms, 12, seed);
+    need(held.size() == encoded_20ms.size(), "overlap profile removed packets");
+    const auto sustained = run(held, true, 10000, true);
+    std::printf("overlapping paced bursts, seed %d: flushes=%llu concealed=%llu ms target=%d ms\n",
+        seed, (unsigned long long)sustained.packet_flushes,
+        (unsigned long long)sustained.played_plc, sustained.max_target);
+    std::fflush(stdout);
+    need(sustained.max_target == 500, "overlap lost the 500 ms adaptive target");
+    need(sustained.packet_flushes == 0 && sustained.packet_discarded == 0,
+         "overlapping paced bursts discarded packets inside NetEq");
+    need(sustained.played_plc <= 150, "overlap caused repeated audio gaps");
+  }
   for (int seed : {197, 17, 41}) {
     const auto held = network(encoded_20ms, 11, seed);
     need(held.size() == encoded_20ms.size(), "held burst removed packets");
