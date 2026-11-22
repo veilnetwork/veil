@@ -218,7 +218,15 @@ int main(int argc,char**argv) {
     std::fflush(stdout);
     need(burst.packet_flushes == 0, "lossless paced bursts flushed the packet buffer");
     need(burst.max_target == 500, "20-ms packets did not reach the 500 ms ceiling");
-    need(burst.played_plc <= 4500, "paced bursts repeatedly exhausted the adaptive reserve");
+    need(burst.played_plc <= 720, "played concealment exceeded the first paced hold");
+    const auto sustained = run(held, true, 10000);
+    std::printf("sustained paced bursts, seed %d: concealed=%llu ms discarded=%llu ms\n",
+        seed, (unsigned long long)sustained.played_plc,
+        (unsigned long long)sustained.discarded);
+    std::fflush(stdout);
+    need(sustained.max_target == 500, "sustained bursts did not exercise the 500 ms ceiling");
+    need(sustained.discarded == 0, "catch-up repeatedly trimmed speech needed for the next burst");
+    need(sustained.played_plc <= 10, "lossless bursts caused repeated concealment after adaptation");
   }
   std::puts("packet_ms,profile,custom,played_plc_ms,concealed_ms,max_plc_ms,conceal_events,hard_discard_ms,packet_discarded,accelerated_ms,queue_p95_ms,max_target_ms");
   bool passed = true;

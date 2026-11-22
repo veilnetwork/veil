@@ -267,10 +267,17 @@ class RecoveringNetEq final : public webrtc::NetEq {
     // of dropping it abruptly on an even later arrival.
     const int ceiling_ms = applied_target_ceiling_ms_ > 0
         ? applied_target_ceiling_ms_ : kMaximumAdaptiveTargetMs;
-    // A burst that drains through a paced link can overlap one more encoded
-    // packet while decoder/render headroom is occupied. Bound the measured
-    // arrival allowance separately from the two packets of decoder headroom.
-    const int max_reserve_ms = ceiling_ms + 2 * headroom_ms;
+    // A paced release can fill the short-packet queue even though the next
+    // arrival gap is longer than the adaptive target. Keep that speech if
+    // the measured arrival variation calls for it. Bound this allowance by
+    // the duration of all but one packet slot. Stricter caller ceilings and
+    // longer frames keep their usual allowance. This only gates decoded catch-up.
+    constexpr int kShortOpusPacketMs = 20;
+    const bool full_short_packet_queue = ceiling_ms == kMaximumAdaptiveTargetMs &&
+        frame_headroom_ms_ == kShortOpusPacketMs;
+    const int max_reserve_ms = full_short_packet_queue
+        ? (kCallAudioPacketCapacity - 1) * kShortOpusPacketMs
+        : ceiling_ms + 2 * headroom_ms;
     const int recent_ms = rtp_lag_.RecentArrivalVariationMs(now_us);
     const bool adaptive = target_reserve_ms > NominalRecoveryBudgetMs();
     // A paced release can temporarily report more variation than we can
