@@ -5494,6 +5494,11 @@ impl SessionRunner {
                         // A complete frame's fragments share one deadline.
                         // Expiration never changes nonce/counter allocation.
                         let expires_at = local_datagram_expiry(&envelope);
+                        let owned_camera = using_parallel
+                            && independent_source
+                            && outgoing_priority == veil_proto::priority::BULK
+                            && envelope.carrier.is_none()
+                            && envelope.local_work.is_some();
                         for datagram in &datagrams {
                             if let Some(child) = sender_state.handle.ordered_trace_id() {
                                 crate::opaque_forward_trace::ordered_fragment(
@@ -5527,6 +5532,9 @@ impl SessionRunner {
                                 }
                             }
                             let sent = match expires_at {
+                                Some(deadline) if owned_camera => sender_state
+                                    .handle
+                                    .send_owned_camera_before(datagram, deadline),
                                 Some(deadline) => {
                                     sender_state.handle.send_before(datagram, deadline)
                                 }

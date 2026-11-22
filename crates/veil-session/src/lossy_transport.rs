@@ -141,6 +141,20 @@ impl LossyTransportHandle {
         }
     }
 
+    /// Preserve the deadline selected for complete, endpoint-owned camera
+    /// work on its dedicated QUIC path. Other datagrams and ordered carriers
+    /// use the common local residence limit.
+    pub(super) fn send_owned_camera_before(
+        &self,
+        payload: &[u8],
+        deadline: Instant,
+    ) -> Result<(), LossySendError> {
+        match self {
+            Self::Quic(handle) => handle.send_before(payload, deadline).map_err(Into::into),
+            Self::Ordered(_) => self.send_before(payload, deadline),
+        }
+    }
+
     pub(super) async fn recv(&self) -> veil_transport::Result<Vec<u8>> {
         match self {
             Self::Quic(handle) => handle.recv().await,
