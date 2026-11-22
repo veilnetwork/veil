@@ -231,16 +231,12 @@ void configure_call_audio_send(webrtc::AudioSendStream::Config& config,
   }
 }
 
-// Preserve room for 600-ms Opus bursts. A smaller 12-packet capacity reduced
-// decoded PCM latency but flushed useful audio and substantially increased
-// physical call interruptions. A target-delay cap alone also failed the PCM
-// recovery gate. Keep fast time stretching without that lossy capacity change.
 #if defined(VEIL_MEDIA_TEST_HOOKS)
 size_t g_call_plane_audio_buffer_packets = 0;
 #endif
 void configure_call_audio_receive(
     webrtc::AudioReceiveStreamInterface::Config& config) {
-  config.jitter_buffer_max_packets = 30;
+  config.jitter_buffer_max_packets = veil_media::kCallAudioPacketCapacity;
 #if defined(VEIL_MEDIA_TEST_HOOKS)
   if (g_call_plane_audio_buffer_packets)
     config.jitter_buffer_max_packets = g_call_plane_audio_buffer_packets;
@@ -1359,7 +1355,7 @@ class LowLatencyFieldTrials final : public webrtc::FieldTrialsView {
     // bursts need separate handling: after histogram startup, the default
     // underrun factor 0.983 keeps a 10-second burst in the target long after
     // delivery recovers. Forget that history faster while retaining its
-    // 95th-percentile/500-ms estimator and the 30-packet capacity. Neither
+    // 95th-percentile estimator and the independent 500-ms target cap. Neither
     // estimator caps current delay or discards queued speech. This is entirely
     // receiver-local; no media role or priority is disclosed to the network.
     if (key == "WebRTC-Audio-NetEqDelayManagerConfig")

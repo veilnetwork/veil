@@ -18,6 +18,10 @@
 #include "veil_conversation_neteq_controller.h"
 
 namespace veil_media {
+// NetEq limits its target to 75% of the packet capacity in time. Keep room
+// above the 500-ms target for 20-ms Opus packets released in a batch.
+inline constexpr size_t kCallAudioPacketCapacity = 36;
+
 struct PlayoutRecoveryStats {
   AudioRecoveryRegistry receivers;
   std::atomic<uint64_t> count{0};
@@ -269,7 +273,11 @@ class RecoveringNetEq final : public webrtc::NetEq {
     const int max_reserve_ms = ceiling_ms + 2 * headroom_ms;
     const int recent_ms = rtp_lag_.RecentArrivalVariationMs(now_us);
     const bool adaptive = target_reserve_ms > NominalRecoveryBudgetMs();
-    const int measured_ms = !adaptive && recent_ms > max_reserve_ms
+    // A paced release can temporarily report more variation than we can
+    // retain. Allow a bounded overshoot to inform the first reserve without
+    // retaining that overshoot or treating long stalls as sustained jitter.
+    const int max_onset_variation_ms = max_reserve_ms + 2 * headroom_ms;
+    const int measured_ms = !adaptive && recent_ms > max_onset_variation_ms
         ? target_reserve_ms
         : std::max(target_reserve_ms, std::min(recent_ms + headroom_ms, max_reserve_ms));
     // The recent arrival maximum expires in 500-ms buckets. Removing the
