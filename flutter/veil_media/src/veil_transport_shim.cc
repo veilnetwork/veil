@@ -78,9 +78,11 @@ void RememberVideoLossPacket(VideoPacketHistory& history,
   webrtc::RtpPacketReceived packet(&extensions);
   uint16_t transport;
   if (!packet.Parse(bytes) || packet.Ssrc() != local_ssrc ||
-      packet.PayloadType() != 96 ||
-      !packet.GetExtension<webrtc::TransportSequenceNumber>(&transport)) return;
-  history.Record(transport, packet.SequenceNumber(), packet.Timestamp(),
+      packet.PayloadType() != 96) return;
+  const bool has_transport =
+      packet.GetExtension<webrtc::TransportSequenceNumber>(&transport);
+  history.Record(has_transport ? std::optional<uint16_t>(transport) : std::nullopt,
+                 packet.SequenceNumber(), packet.Timestamp(),
                  packet.payload_size() > 0, now_us);
 }
 
@@ -167,6 +169,7 @@ AudioSendSnapshot VeilTransportShim::audio_send_stats() const {
 }
 
 void VeilTransportShim::SetVideoSendPaused(bool paused) {
+  if (!paused && video_send_paused_.load()) ResumeVideoLossEvidence();
   video_send_paused_.store(paused);
   if (audio_priority_) audio_priority_->PauseVideo(paused, webrtc::TimeMicros());
 }
@@ -612,11 +615,23 @@ std::string VeilTransportShim::video_delivery_json(int64_t now,
 }
 
 void VeilTransportShim::ResetVideoLossEvidence() {
+  video_packet_history_->ResetRtpSequence();
   std::lock_guard lock(audio_feedback_mu_);
   ++video_source_epoch_;
   video_send_stats_.reset_payload_clock();
   video_loss_persistence_.Reset();
   video_payload_loss_.Reset(webrtc::TimeMicros());
+  video_feedback_.persistent_loss_report_us = 0;
+}
+
+void VeilTransportShim::ResumeVideoLossEvidence() {
+  const auto sent = video_packet_history_->LatestRtpSequence();
+  std::lock_guard lock(audio_feedback_mu_);
+  const auto now = webrtc::TimeMicros();
+  video_loss_persistence_.ResumeAfter(sent, now);
+  // Exact transport feedback can still report new packet losses, excluding
+  // transmissions from before the resume boundary. GCC receives raw RTCP.
+  video_payload_loss_.Reset(now);
   video_feedback_.persistent_loss_report_us = 0;
 }
 

@@ -505,7 +505,10 @@ class GroupFanoutTransport : public webrtc::Transport {
   }
 
  public:
-  void ResetVideoClock() { video_stats_.reset_payload_clock(); }
+  void ResetVideoClock() {
+    video_stats_.reset_payload_clock();
+    video_history_->ResetRtpSequence();
+  }
   uint64_t audio_drops() const { return audio_drops_.load(std::memory_order_relaxed); }
   veil_media::RtpSendSnapshot video_send_stats() const {
     return video_stats_.snapshot(webrtc::TimeMicros() * 1000);
@@ -2795,6 +2798,7 @@ int veil_media_group_engine_set_video_send_paused(VeilGroupMediaEngine* engine, 
   const bool scheduled = veil_media::run_on_with_timeout(ws->video_worker_tq.get(), [&] {
     if (ws->video_send_stream) ws->video_send_stream->GenerateKeyFrame({});
     ws->video_last_encoded_frame_us.store(0, std::memory_order_relaxed);
+    for (const auto& entry : ws->peers) entry.second->shim->ResumeVideoLossEvidence();
     ws->fanout->SetVideoSendPaused(false);
     ws->video_send_paused.store(false);
   }, std::chrono::milliseconds(20));

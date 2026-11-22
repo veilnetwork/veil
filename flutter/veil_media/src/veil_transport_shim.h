@@ -205,6 +205,7 @@ class VeilTransportShim : public webrtc::Transport {
   std::string video_delivery_json(int64_t now_us, uint32_t source_timestamp = 0,
       uint64_t source_bytes = 0, bool source_timestamp_valid = false) const;
   void ResetVideoLossEvidence();
+  void ResumeVideoLossEvidence();
   AudioPlayoutSnapshot audio_playout_feedback() const;
   // Group receive-worker samples only. Setting an unknown sample still
   // advertises support; unicast uses its negotiated call-health feedback.

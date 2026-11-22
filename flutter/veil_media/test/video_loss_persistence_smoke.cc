@@ -59,5 +59,36 @@ int main() {
   assert(p.Observe(1, 5, 22'000'000) == 0); // unknown history after rollback
   assert(p.Observe(2, 6, 23'000'000) == 0);
   assert(p.Observe(2, 7, 26'000'000) == 26'000'000);
+  // In the relay capture, the receiver could report the three missing
+  // packets only once a newly resumed frame advanced its highest sequence.
+  p.Reset();
+  assert(p.Observe(0, 25506, 30'776'000) == 0);
+  p.ResumeAfter(25509, 43'000'000);
+  assert(p.Observe(0, 25506, 43'300'000) == 0);  // Queued before the pause.
+  assert(p.Observe(3, 25510, 44'615'000) == 0);
+  assert(p.Observe(3, 25517, 47'645'000) == 0);  // Same old gap.
+  assert(p.Observe(5, 25521, 48'600'000) == 0);
+  assert(p.Observe(5, 25527, 51'638'000) == 51'638'000);
+  // A report within the old source's range must not set the resume baseline.
+  // Test both RTP's low-16-bit wrap and RR's extended sequence wrap.
+  p.Reset();
+  assert(p.Observe(0, 0xfffffffcu, 1'000'000) == 0);
+  p.ResumeAfter(0xffffu, 1'500'000);
+  assert(p.Observe(1, 0xfffffffeu, 2'000'000) == 0);
+  assert(p.Observe(3, 0, 3'000'000) == 0);
+  assert(p.Observe(3, 1, 6'100'000) == 0);
+  assert(p.Observe(4, 2, 7'000'000) == 0);
+  assert(p.Observe(4, 3, 10'000'000) == 10'000'000);
+  p.Reset();
+  assert(p.Observe(0, 100, 1'000'000) == 0);
+  p.ResumeAfter(100, 2'000'000);
+  assert(p.Observe(9, 100, 1'900'000) == 0);  // Older ingress processed later.
+  assert(p.Observe(1, 102, 3'000'000) == 0);  // One sequence withheld by the pause.
+  assert(p.Observe(1, 103, 6'000'000) == 0);
+  // After a long absence, the low-16-bit comparison alone is ambiguous.
+  p.ResumeAfter(100, 7'000'000);
+  assert(p.Observe(1, 40100, 23'000'000) == 0);
+  assert(p.Observe(2, 40102, 24'000'000) == 0);
+  assert(p.Observe(2, 40103, 27'000'000) == 27'000'000);
   std::puts("video loss persistence: late fill, sustained loss, replay, signed counters, wrap and lifecycle PASS");
 }

@@ -27,12 +27,25 @@ class VideoPacketHistory {
     int64_t sent_us = 0;
     bool payload = false;
   };
-  void Record(uint16_t transport, uint16_t rtp, uint32_t timestamp,
+  void Record(std::optional<uint16_t> transport, uint16_t rtp, uint32_t timestamp,
               bool payload, int64_t now_us) {
     if (now_us <= 0) return;
     std::lock_guard lock(mu_);
-    slots_[transport % kCapacity] = {transport,
+    // Retransmissions share the original RTP sequence. They must not move
+    // the sender's sequence boundary backwards, including across wrap.
+    if (!latest_rtp_ || static_cast<int16_t>(
+            static_cast<uint16_t>(rtp - *latest_rtp_)) > 0) latest_rtp_ = rtp;
+    if (!transport) return;
+    slots_[*transport % kCapacity] = {*transport,
         (uint64_t(timestamp) << 16) | rtp, ++ordinal_, now_us, payload};
+  }
+  std::optional<uint16_t> LatestRtpSequence() const {
+    std::lock_guard lock(mu_);
+    return latest_rtp_;
+  }
+  void ResetRtpSequence() {
+    std::lock_guard lock(mu_);
+    latest_rtp_.reset();
   }
   std::optional<Packet> Find(uint16_t transport, int64_t now_us) const {
     std::lock_guard lock(mu_);
@@ -45,6 +58,7 @@ class VideoPacketHistory {
   mutable std::mutex mu_;
   std::array<Packet, kCapacity> slots_{};
   uint64_t ordinal_ = 0;
+  std::optional<uint16_t> latest_rtp_;
 };
 
 // Exact per-authenticated-peer TWCC evidence for the application quality
@@ -58,7 +72,7 @@ class VideoPayloadLoss {
     began_us_ = began_us;
   }
   void Observe(const std::vector<Status>& statuses, bool all_known, int64_t now_us) {
-    if (now_us <= 0) return;
+    if (now_us <= 0 || now_us < began_us_) return;
     if (last_us_ > now_us) { Reset(now_us); return; }
     // Once a part of the report cannot be assigned, continuity is unknown.
     // Stay with RR until the next explicit source/route epoch. A later healthy

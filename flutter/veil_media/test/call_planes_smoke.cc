@@ -391,7 +391,27 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(3100));
     loss(190, video, 3, 124, 0);
     assert(stat(one.get(), "video_persistent_loss_report_us") == direct_loss);
-    std::puts("video loss: real RR parsing, late fill, unicast/group persistence and compound integrity PASS");
+    assert(veil_media_engine_set_video_send_paused(one.get(), 1) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_set_video_send_paused(room.get(), 1) == VEIL_MEDIA_OK);
+    assert(veil_media_engine_set_video_send_paused(one.get(), 0) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_set_video_send_paused(room.get(), 0) == VEIL_MEDIA_OK);
+    assert(stat(one.get(), "video_persistent_loss_report_us") == 0);
+    assert(group_stat(room.get(), "video_persistent_loss_report_us") == 0);
+    loss(190, video, 6, 129, 100);  // First report can include the pre-pause tail.
+    loss(191, room_video, 8, 120, 100);
+    std::this_thread::sleep_for(std::chrono::milliseconds(3100));
+    loss(190, video, 6, 130, 0);
+    loss(191, room_video, 8, 121, 0);
+    assert(stat(one.get(), "video_persistent_loss_report_us") == 0);
+    assert(group_stat(room.get(), "video_persistent_loss_report_us") == 0);
+    loss(190, video, 7, 132, 10);
+    loss(191, room_video, 9, 123, 10);
+    std::this_thread::sleep_for(std::chrono::milliseconds(3100));
+    loss(190, video, 7, 133, 0);
+    loss(191, room_video, 9, 124, 0);
+    assert(stat(one.get(), "video_persistent_loss_report_us") > direct_loss);
+    assert(group_stat(room.get(), "video_persistent_loss_report_us") > group_loss);
+    std::puts("video loss: real RR parsing, late fill, pause/resume, unicast/group persistence and compound integrity PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--audio-source-pixels") == 0) {

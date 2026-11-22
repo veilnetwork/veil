@@ -39,6 +39,7 @@ int main() {
   a.Observe({{*h.Find(4098, 6), true}}, true, 3'000'203);
   assert(!a.FreshAt(3'000'203)); // healthy short report can't restore unknown continuity
   a.Reset(5);
+  a.Observe({}, false, 4); // unclassified feedback queued before the new epoch
   a.Observe({{first, false}, {last, true}}, true, 100);
   assert(!a.FreshAt(100)); // superseded-route records cannot renew evidence
   a.Observe({{*h.Find(4098, 6), true}}, true, 101);
@@ -46,5 +47,14 @@ int main() {
   assert(!a.FreshAt(3'000'102));
   a.Observe({{*h.Find(4098, 6), true}}, true, 90);
   assert(!a.FreshAt(90));
+  // RR also needs a sequence boundary on links without a TWCC extension.
+  assert(h.LatestRtpSequence() == 95);
+  h.ResetRtpSequence();
+  assert(!h.LatestRtpSequence());
+  h.Record(std::nullopt, 65535, 100, true, 7);
+  h.Record(std::nullopt, 0, 100, true, 8);
+  h.Record(std::nullopt, 65535, 100, true, 9);  // Late retransmission.
+  assert(h.LatestRtpSequence() == 0);
+  assert(h.Find(4098, 9)->ordinal == 6);  // RR tracking did not add TWCC samples.
   std::puts("video payload loss: exact packet classes, real gap, late fill, replay, per-peer, bounds, wrap and epochs PASS");
 }
