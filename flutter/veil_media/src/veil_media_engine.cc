@@ -4747,9 +4747,10 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     // fresh RR/SR block for our audio SSRC can drive outbound adaptation.
     // Call-level RTT remains diagnostic when no such block is available.
     const auto video_report = ws->shim->video_feedback();
-    const bool video_feedback_available = video_report.fresh_at(webrtc::TimeMicros());
     const auto audio_report = ws->shim->audio_feedback();
-    const bool audio_feedback_available = audio_report.fresh_at(webrtc::TimeMicros());
+    const int64_t feedback_now_us = webrtc::TimeMicros();
+    const bool video_feedback_available = video_report.fresh_at(feedback_now_us);
+    const bool audio_feedback_available = audio_report.fresh_at(feedback_now_us);
     if (audio_feedback_available) {
       rtt_ms = audio_report.rtt_ms;
       tx_loss_pct = audio_report.loss_pct;
@@ -4999,6 +5000,10 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
           std::to_string(audio_loss_report_us > 0 ? audio_report.loss_report_fraction : 0);
       snapshot += ",\"audio_rtt_route_epoch\":" + std::to_string(audio_report.route_epoch);
       snapshot += ",\"video_rtt_route_epoch\":" + std::to_string(video_report.route_epoch);
+      snapshot += ",\"audio_feedback_age_ms\":" + std::to_string(audio_feedback_available
+          ? (feedback_now_us - audio_report.arrived_us) / 1000 : -1);
+      snapshot += ",\"video_feedback_age_ms\":" + std::to_string(video_feedback_available
+          ? (feedback_now_us - video_report.arrived_us) / 1000 : -1);
       snapshot += ",\"video_delivery_peers\":{\"peer\":" +
           ws->shim->video_delivery_json(webrtc::TimeMicros()) + "}";
       snapshot += ",\"video_loss_report_us\":" +

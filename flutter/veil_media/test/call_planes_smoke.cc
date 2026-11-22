@@ -707,6 +707,8 @@ int main(int argc, char** argv) {
       return stat(e.get(), key);
     };
     assert(stat(e.get(), "audio_loss_report_us") == 0);
+    assert(stat(e.get(), "audio_feedback_age_ms") == UINT64_MAX);
+    assert(stat(e.get(), "video_feedback_age_ms") == UINT64_MAX);
     report(160, 2, audio ^ 0x100, 255, 0);  // foreign SSRC
     auto bad = report_packet(2, audio, 1, 0);
     bad.push_back(0);  // invalid final compound block cannot partially publish
@@ -715,6 +717,9 @@ int main(int argc, char** argv) {
     assert(stat(e.get(), "audio_loss_report_us") == 0);
     report(160, 2, audio, 1, 0);  // 1/256 rounds below one percent
     const auto first = wait_stat("audio_loss_report_us", 0);
+    const auto first_audio_age = stat(e.get(), "audio_feedback_age_ms");
+    assert(first_audio_age != UINT64_MAX);
+    assert(stat(e.get(), "video_feedback_age_ms") == UINT64_MAX);
     assert(stat(e.get(), "audio_loss_report_fraction") == 1);
     assert(stat(e.get(), "audio_previous_loss_report_us") == 0);
     assert(stat(e.get(), "tx_loss_pct") == 0);
@@ -726,6 +731,9 @@ int main(int argc, char** argv) {
     // SR report blocks carry the same loss evidence as standalone RR.
     inject_raw(160, report_packet(2, video, 1, 0, true));
     const auto video_loss = wait_stat("video_loss_report_us", 0);
+    const auto first_video_age = stat(e.get(), "video_feedback_age_ms");
+    assert(first_video_age != UINT64_MAX);
+    assert(stat(e.get(), "audio_feedback_age_ms") >= first_video_age);
     assert(stat(e.get(), "audio_loss_report_us") == first);
     assert(stat(e.get(), "video_feedback_loss_pct") == 0);
     inject_raw(160, report_packet(2, audio, 1, 0, true));
@@ -782,6 +790,7 @@ int main(int argc, char** argv) {
     assert(stat(e.get(), "audio_loss_report_fraction") == 0);
     assert(stat(e.get(), "audio_previous_loss_report_us") == 0);
     assert(stat(e.get(), "video_loss_report_us") == 0);
+    assert(stat(e.get(), "video_feedback_age_ms") == UINT64_MAX);
     assert(group_stat(room.get(), "audio_loss_report_us") == 0);
     assert(stat(e.get(), "audio_feedback_reports") == 1);
     assert(group_stat(room.get(), "audio_feedback_reports") == 2);
