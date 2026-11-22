@@ -255,12 +255,12 @@ int main() {
     observed->frame_ms = 40;
     auto stats = std::make_shared<veil_media::PlayoutRecoveryStats>();
     veil_media::RecoveringNetEq recovering(std::move(decoder), stats);
-    assert(observed->maximum_delay == 400);
+    assert(observed->maximum_delay == 500);
     webrtc::AudioFrame frame;
     bool muted = false;
     int rate = 0;
     recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
-    assert(observed->maximum_delay == 400);
+    assert(observed->maximum_delay == 500);
     const int calls = observed->maximum_delay_calls;
     recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
     assert(observed->maximum_delay_calls == calls);
@@ -273,26 +273,26 @@ int main() {
     recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
     assert(observed->maximum_delay == 50);
     assert(recovering.SetMaximumDelay(0));
-    assert(observed->maximum_delay == 400);
-    assert(recovering.SetMaximumDelay(500));
-    assert(observed->maximum_delay == 400);
+    assert(observed->maximum_delay == 500);
+    assert(recovering.SetMaximumDelay(600));
+    assert(observed->maximum_delay == 500);
     assert(!recovering.SetMaximumDelay(-1));
     observed->frame_ms = 40;
     recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
-    assert(observed->maximum_delay == 400);
+    assert(observed->maximum_delay == 500);
     observed->frame_ms = 0; // silence/unknown must not invent a smaller packet
     recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
-    assert(observed->maximum_delay == 400);
+    assert(observed->maximum_delay == 500);
     observed->mode = 1; // PLC is generated output, not a new packet duration
     observed->frame_ms = 20;
     recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
-    assert(observed->maximum_delay == 400);
+    assert(observed->maximum_delay == 500);
     observed->mode = 2; // muted output cannot change the known duration either
     recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
-    assert(observed->maximum_delay == 400);
+    assert(observed->maximum_delay == 500);
     observed->mode = 5;
     recovering.GetAudio(&frame, &muted, &rate, std::nullopt);
-    assert(observed->maximum_delay == 400);
+    assert(observed->maximum_delay == 500);
     assert(stats->count == 0 && stats->discarded_ms == 0);
   }
   // Packet-sized headroom increases only as normal speech establishes the
@@ -308,7 +308,7 @@ int main() {
     veil_media::RecoveringNetEq recovering(std::move(decoder), stats);
     webrtc::AudioFrame frame;
     recovering.GetAudio(&frame, nullptr, nullptr, std::nullopt);
-    assert(observed->maximum_delay == 400);
+    assert(observed->maximum_delay == 500);
     assert(stats->discarded_ms == 0 && observed->pulls == 1);
     // Just above that packet duration's budget, bounded catch-up still runs.
     observed->buffer_ms_override += 10;
@@ -330,7 +330,7 @@ int main() {
   }
   // A jitter reserve is useful speech, not a device-stall backlog. The
   // nominal packet-sized bound still applies when no such reserve is needed.
-  for (const int packet_ms : {20, 40, 60}) for (const int target_ms : {140, 260, 380}) {
+  for (const int packet_ms : {20, 40, 60}) for (const int target_ms : {140, 260, 380, 500}) {
     auto decoder = std::make_unique<Decoder>();
     auto* observed = decoder.get();
     observed->mode = 5;

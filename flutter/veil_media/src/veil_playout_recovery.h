@@ -240,10 +240,10 @@ class RecoveringNetEq final : public webrtc::NetEq {
   // that reserve, and the following burst creates another underrun. Preserve
   // the adaptive target plus packet-arrival/decoder headroom. On healthy paths
   // the old packet-sized budget still bounds device-stall catch-up.
-  // The ceiling permits adaptation; it does not force a 400-ms target, change
+  // The ceiling permits adaptation; it does not force a 500-ms target, change
   // packetization or relax a stricter caller-supplied maximum. The packet
   // buffer and the 16-pull callback limit remain bounded independently.
-  static constexpr int kMaximumAdaptiveTargetMs = 400;
+  static constexpr int kMaximumAdaptiveTargetMs = 500;
   int JitterReserveMs() const {
     const int target = std::clamp(inner_->TargetDelayMs(), 0, kMaximumAdaptiveTargetMs);
     // A packet may already fund decoder lookahead/reordered arrival. Neither
