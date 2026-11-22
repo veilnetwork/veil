@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -24,6 +25,7 @@ class VideoLossTrace {
     if (enabled_) {
       packets_.reserve(packet_limit_); reports_.reserve(report_limit_);
       sender_reports_.reserve(report_limit_);
+      picture_losses_.reserve(report_limit_);
     }
   }
   ~VideoLossTrace() { Flush(); }
@@ -51,7 +53,8 @@ class VideoLossTrace {
                          Half(p.data()+2), stage, bool(p[1]&128), result, channel});
   }
 
-  void Rtcp(std::span<const uint8_t> p, char stage, int64_t at_us, int result) {
+  void Rtcp(std::span<const uint8_t> p, char stage, int64_t at_us, int result,
+            std::optional<int> video_admission = std::nullopt) {
     if (!enabled_) return;
     // Validate the whole compound before publishing even its first report.
     // Unknown types are skipped; invalid/truncated compounds yield no rows.
@@ -74,6 +77,17 @@ class VideoLossTrace {
     if (flushed_) return;
     if (!valid) { ++malformed_; return; }
     for (size_t at = 0; at < p.size(); at += BlockSize(p, at)) {
+      const auto bytes = BlockSize(p, at);
+      const size_t padding = (p[at] & 32) ? p[at + bytes - 1] : 0;
+      if (p[at + 1] == 206 && (p[at] & 31) == 1 && bytes - padding == 12) {
+        ++picture_loss_seen_;
+        if (picture_losses_.size() < report_limit_)
+          picture_losses_.push_back({at_us, Word(p.data() + at + 4),
+                                     Word(p.data() + at + 8), stage,
+                                     video_admission.value_or(result)});
+      }
+      // Only picture loss needs the extra observation at WebRTC delivery.
+      if (stage == 'd') continue;
       const size_t base = p[at+1] == 200 ? 28 : p[at+1] == 201 ? 8 : 0;
       if (!base) continue;
       if (p[at+1] == 200) {
@@ -107,10 +121,11 @@ class VideoLossTrace {
     if (!file) return;
     // A unique recorder id disambiguates retained peer shims in a group log.
     const auto id = static_cast<unsigned long long>(id_);
-    std::fprintf(file, "video.loss.begin id=%llu packets=%zu packet_seen=%llu reports=%zu report_seen=%llu malformed=%llu sender_reports=%zu sender_report_seen=%llu\n",
+    std::fprintf(file, "video.loss.begin id=%llu packets=%zu packet_seen=%llu reports=%zu report_seen=%llu malformed=%llu sender_reports=%zu sender_report_seen=%llu plis=%zu pli_seen=%llu\n",
                  id, packets_.size(), (unsigned long long)packet_seen_, reports_.size(),
                  (unsigned long long)report_seen_, (unsigned long long)malformed_,
-                 sender_reports_.size(), (unsigned long long)sender_report_seen_);
+                 sender_reports_.size(), (unsigned long long)sender_report_seen_,
+                 picture_losses_.size(), (unsigned long long)picture_loss_seen_);
     for (const auto& p : packets_)
       std::fprintf(file, "video.loss.rtp id=%llu stage=%c at_us=%lld ssrc=%u seq=%u timestamp=%u bytes=%u payload=%u marker=%d result=%d channel=%llu\n",
                    id, p.stage, (long long)p.at_us, p.ssrc, unsigned(p.sequence),
@@ -127,6 +142,9 @@ class VideoLossTrace {
     for (const auto& s : sender_reports_)
       std::fprintf(file, "video.loss.sr id=%llu stage=%c at_us=%lld ssrc=%u compact_ntp=%u result=%d\n",
                    id, s.stage, (long long)s.at_us, s.ssrc, s.compact_ntp, s.result);
+    for (const auto& p : picture_losses_)
+      std::fprintf(file, "video.loss.pli id=%llu stage=%c at_us=%lld reporter=%u ssrc=%u result=%d\n",
+                   id, p.stage, (long long)p.at_us, p.reporter, p.ssrc, p.result);
     const bool ok = std::fflush(file) == 0 && !std::ferror(file);
     std::fprintf(file, "video.loss.end id=%llu write_ok=%d\n", id, int(ok));
     std::fclose(file);
@@ -170,15 +188,22 @@ class VideoLossTrace {
     char stage;
     int result;
   };
+  struct PictureLoss {
+    int64_t at_us;
+    uint32_t reporter, ssrc;
+    char stage;
+    int result;
+  };
   const bool enabled_;
   const size_t packet_limit_, report_limit_;
   const uint64_t id_;
   std::mutex mu_;
   bool flushed_ = false;
   uint64_t packet_seen_ = 0, report_seen_ = 0, malformed_ = 0,
-           sender_report_seen_ = 0;
+           sender_report_seen_ = 0, picture_loss_seen_ = 0;
   std::vector<Packet> packets_;
   std::vector<Report> reports_;
   std::vector<SenderReport> sender_reports_;
+  std::vector<PictureLoss> picture_losses_;
 };
 }  // namespace veil_media

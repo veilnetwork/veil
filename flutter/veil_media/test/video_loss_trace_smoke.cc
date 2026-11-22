@@ -55,5 +55,21 @@ int main(int argc, char** argv) {
   }
   std::ifstream tail(path); text.assign(std::istreambuf_iterator<char>(tail),{});
   assert(text.find("packets=1 packet_seen=400 reports=1 report_seen=400 malformed=0 sender_reports=1 sender_report_seen=400")!=std::string::npos);
+  {
+    veil_media::VideoLossTrace trace(true, 1, 3);
+    const std::array<uint8_t, 12> pli{0x81, 206, 0, 2, 0,0,0,8, 0,0,0,7};
+    trace.Rtcp(pli, 's', 501, 0);
+    trace.Rtcp(pli, 'r', 502, 0, 1);
+    trace.Rtcp(pli, 'd', 503, 0);
+    std::array<uint8_t, 16> broken{};
+    std::copy(pli.begin(), pli.end(), broken.begin());
+    trace.Rtcp(broken, 'r', 504, 0, 0);
+  }
+  std::ifstream repair(path); text.assign((std::istreambuf_iterator<char>(repair)),{});
+  assert(text.find("plis=3 pli_seen=3")!=std::string::npos);
+  assert(text.find("stage=s at_us=501 reporter=8 ssrc=7 result=0")!=std::string::npos);
+  assert(text.find("stage=r at_us=502 reporter=8 ssrc=7 result=1")!=std::string::npos);
+  assert(text.find("stage=d at_us=503 reporter=8 ssrc=7 result=0")!=std::string::npos);
+  assert(text.find("at_us=504")==std::string::npos);
   std::remove(path);
 }

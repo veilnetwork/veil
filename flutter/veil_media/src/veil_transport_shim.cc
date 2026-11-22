@@ -517,16 +517,17 @@ void VeilTransportShim::OnVeilDatagram(void* ctx, const uint8_t* ptr,
   };
   const bool rtcp = webrtc::IsRtcpPacket(std::span<const uint8_t>(ptr, len));
   const bool accepted = enqueue(IsSecondaryInboundRtp(std::span<const uint8_t>(ptr, len)));
-  if (self->audio_ingress_diagnostics_) {
-    const std::span<const uint8_t> packet(ptr, len);
-    if (rtcp) self->video_loss_trace_.Rtcp(packet, 'r', arrived_us, accepted ? 0 : 1);
-    else self->video_loss_trace_.Rtp(packet, self->remote_video_ssrc_.load(),
-                                    'r', arrived_us, accepted ? 0 : 1);
-  }
   // Each Call owns independent SSRC/TWCC state. Delivery additionally filters
   // REMB: upstream does not check that message's target list before applying it.
   // A slow video network/worker queue cannot hold the audio copy.
-  if (rtcp) enqueue(true);
+  const bool accepted_video = rtcp && enqueue(true);
+  if (self->audio_ingress_diagnostics_) {
+    const std::span<const uint8_t> packet(ptr, len);
+    if (rtcp) self->video_loss_trace_.Rtcp(packet, 'r', arrived_us, accepted ? 0 : 1,
+                                         accepted_video ? 0 : 1);
+    else self->video_loss_trace_.Rtp(packet, self->remote_video_ssrc_.load(),
+                                    'r', arrived_us, accepted ? 0 : 1);
+  }
   if (accepted) {
     if (self->inbound_packet_count_.load(std::memory_order_relaxed) == 0)
       slog("shim first inbound chan=%llu len=%zu", (unsigned long long)self->veil_chan_.load(), len);
@@ -907,6 +908,8 @@ void VeilTransportShim::DeliverOnNetworkThread(
         filtered.foreign_remb_blocks, std::memory_order_relaxed);
     if (filtered.bytes.empty()) return;
     if (!secondary) ObserveReceiverFeedback(filtered.bytes, arrived_us);
+    else if (audio_ingress_diagnostics_)
+      video_loss_trace_.Rtcp(filtered.bytes, 'd', webrtc::TimeMicros(), 0);
     receiver->DeliverRtcpPacket(
         webrtc::CopyOnWriteBuffer(filtered.bytes.data(), filtered.bytes.size()));
     return;

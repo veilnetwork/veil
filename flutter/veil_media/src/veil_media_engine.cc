@@ -4595,6 +4595,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
     uint32_t audio_jb_target_ms = 0;
     int video_delay_ms = 0;
     int video_encoder_target_bps = 0;
+    int64_t video_tx_key_frames = -1;
     int video_jb_ms = 0;
     // Sender-side standing queue: RTCP bypasses the pacer, so a video RTP
     // packet can wait SECONDS in the pacer while rtt_ms stays flat — the
@@ -4725,8 +4726,13 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
 #endif
           if (ws->video_call)
             pacer_delay_ms = ws->video_call->GetStats().pacer_delay_ms;
-          if (ws->video_send_stream)
-            video_encoder_target_bps = ws->video_send_stream->GetStats().target_media_bitrate_bps;
+          if (ws->video_send_stream) {
+            const auto video = ws->video_send_stream->GetStats();
+            video_encoder_target_bps = video.target_media_bitrate_bps;
+            video_tx_key_frames = 0;
+            for (const auto& entry : video.substreams)
+              video_tx_key_frames += entry.second.frame_counts.key_frames;
+          }
           if (ws->video_recv_stream) {
             const auto v = ws->video_recv_stream->GetStats();
             video_delay_ms = v.current_delay_ms;
@@ -5023,6 +5029,7 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
       snapshot += ",\"video_tx_rtp_attempts\":" + std::to_string(video_send.attempts);
       snapshot += ",\"video_tx_rtp_queued\":" + std::to_string(video_send.queued);
       snapshot += ",\"video_tx_payload_pkts\":" + std::to_string(video_send.payload_packets);
+      snapshot += ",\"video_tx_key_frames\":" + std::to_string(video_tx_key_frames);
       snapshot += ",\"video_tx_padding_pkts\":" + std::to_string(video_send.padding_packets);
       snapshot += ",\"video_tx_payload_bytes\":" + std::to_string(video_send.payload_bytes);
       snapshot += ",\"video_tx_padding_bytes\":" + std::to_string(video_send.padding_bytes);

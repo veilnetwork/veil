@@ -16,11 +16,11 @@ use super::{
     COMPACT_RELAY_MEDIA_CELL_MAX, MEDIA_BATCHING_COMPACT_RELAY, MEDIA_BATCHING_LEGACY,
     MEDIA_BATCHING_OFF, MEDIA_CHANNELS, MEDIA_LOCAL_QUEUE_AGE, MEDIA_NEXT_ID, MediaChannel,
     MediaIngress, MediaSenderSlot, MediaVideoIngress, QueuedMediaPacket, RelayVideoFrame,
-    drain_anonymous_media, drain_media_packets, drain_media_packets_on_plane, drain_relay_video,
-    drain_relay_video_batches_on_plane, drain_relay_video_on_plane, media_batched_cells,
-    media_is_padding_only, media_is_rtcp, media_ready_batch, timed_media_cells,
-    veil_media_channel_set_screen_sharing, veil_media_close_channel, veil_media_send_datagram,
-    veil_media_send_video_control_datagram,
+    classify_rtcp, drain_anonymous_media, drain_media_packets, drain_media_packets_on_plane,
+    drain_relay_video, drain_relay_video_batches_on_plane, drain_relay_video_on_plane,
+    media_batched_cells, media_is_padding_only, media_is_rtcp, media_ready_batch,
+    timed_media_cells, veil_media_channel_set_screen_sharing, veil_media_close_channel,
+    veil_media_send_datagram, veil_media_send_video_control_datagram,
 };
 use super::{
     RELAY_VIDEO_FRAME_MAX_BYTES, RelayMediaStats, RelayVideoFrameAssembler, RelayVideoFramePush,
@@ -381,10 +381,13 @@ async fn relay_frame_repair_and_control_cannot_renew_original_fragment_age() {
         0
     );
     assert_eq!(
-        ingress.enqueue_video_control(QueuedMediaPacket {
-            payload: control.clone(),
-            deadline: control_deadline,
-        }),
+        ingress.enqueue_video_control(
+            QueuedMediaPacket {
+                payload: control.clone(),
+                deadline: control_deadline,
+            },
+            false,
+        ),
         0
     );
     assert_eq!(
@@ -2006,7 +2009,36 @@ async fn video_control_backpressure_never_falls_into_audio() {
     );
     unsafe { veil_media_close_channel(id) };
     assert_eq!(send_video_control_when_available(id, &rr), -1);
-    assert_eq!(ingress.enqueue_video_control(rr.to_vec().into()), -1);
+    assert_eq!(ingress.enqueue_video_control(rr.to_vec().into(), false), -1);
+}
+
+#[tokio::test]
+async fn video_keyframe_request_bypasses_a_stalled_camera_queue() {
+    let (audio, mut audio_rx) = mpsc::channel(1);
+    let (video, mut video_rx) = mpsc::channel(1);
+    let (feedback, mut feedback_rx) = mpsc::channel(1);
+    let ingress = MediaIngress::new(audio, MediaVideoIngress::Packets(video));
+    *ingress.feedback_tx.write().unwrap() = Some(feedback);
+    let (id, _) = register_test_ingress(ingress, [0xe8; 32]);
+    let rr = [0x80, 201, 0, 1, 0, 0, 0, 1];
+    let pli = [0x81, 206, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2];
+    let compound = [&rr[..], &pli].concat();
+    assert_eq!(classify_rtcp(&compound), Some(true));
+    assert_eq!(classify_rtcp(&[&compound[..], &[0x80, 201]].concat()), None);
+    assert_eq!(send_video_control_when_available(id, &rr), 0);
+    let result = send_video_control_when_available(id, &compound);
+    assert_eq!(
+        unsafe { veil_media_send_video_control_datagram(id, pli.as_ptr(), pli.len()) },
+        1
+    );
+    unsafe { veil_media_close_channel(id) };
+    assert_eq!(
+        result, 0,
+        "camera backpressure must not block keyframe feedback"
+    );
+    assert_eq!(feedback_rx.try_recv().unwrap().payload, compound);
+    assert_eq!(video_rx.try_recv().unwrap().payload, rr);
+    assert!(audio_rx.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -2021,7 +2053,7 @@ async fn relay_video_control_cannot_consume_partial_frame_or_audio_capacity() {
     assert_eq!(ingress.enqueue(vec![0x80, 111, 1, 2].into()), 0);
     assert_eq!(ingress.enqueue(video_packet(7, false, 1).into()), 0);
     let rr = vec![0x80, 201, 0, 1, 1, 2, 3, 4];
-    assert_eq!(ingress.enqueue_video_control(rr.clone().into()), 0);
+    assert_eq!(ingress.enqueue_video_control(rr.clone().into(), false), 0);
     assert_eq!(ingress.enqueue(video_packet(7, true, 2).into()), 0);
     assert_eq!(video_rx.try_recv().unwrap().packets, vec![rr]);
     assert_eq!(

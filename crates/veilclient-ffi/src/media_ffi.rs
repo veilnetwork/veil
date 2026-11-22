@@ -76,27 +76,38 @@ fn media_is_padding_only(packet: &[u8]) -> bool {
 }
 
 #[cfg(feature = "node-embedded")]
-fn media_is_rtcp(mut packet: &[u8]) -> bool {
+fn media_is_rtcp(packet: &[u8]) -> bool {
+    classify_rtcp(packet).is_some()
+}
+
+#[cfg(feature = "node-embedded")]
+/// Return whether the compound contains a picture-loss indication after
+/// validating the framing of every block.
+fn classify_rtcp(mut packet: &[u8]) -> Option<bool> {
     if packet.is_empty() {
-        return false;
+        return None;
     }
+    let mut picture_loss = false;
     while !packet.is_empty() {
         if packet.len() < 4 || packet[0] >> 6 != 2 || !(192..=223).contains(&packet[1]) {
-            return false;
+            return None;
         }
         let len = 4 * (usize::from(u16::from_be_bytes([packet[2], packet[3]])) + 1);
         if len > packet.len() {
-            return false;
+            return None;
         }
+        let mut content_len = len;
         if packet[0] & 0x20 != 0 {
             let padding = usize::from(packet[len - 1]);
             if len != packet.len() || padding == 0 || padding > len - 4 {
-                return false;
+                return None;
             }
+            content_len -= padding;
         }
+        picture_loss |= packet[1] == 206 && packet[0] & 31 == 1 && content_len == 12;
         packet = &packet[len..];
     }
-    true
+    Some(picture_loss)
 }
 
 // Local scheduling classification. This is computed before sealing and is
@@ -1492,9 +1503,9 @@ pub unsafe extern "C" fn veil_media_send_datagram(chan: u64, ptr: *const u8, len
     ingress.enqueue(payload)
 }
 
-/// Enqueue video-engine RTCP on the channel's independent local video source.
-/// Screen sharing selects its independent source instead. This is endpoint
-/// scheduling only: no media role or priority is added to relay framing.
+/// Enqueue video-engine RTCP. Small picture-loss requests use the independent
+/// feedback writer when installed. Other reports follow the camera or screen
+/// source. This scheduling choice is local to the endpoint.
 /// Compound RTCP is validated; RTP and malformed control return -1. Admission
 /// remains nonblocking (0 queued, 1 full/busy, -1 invalid/closed), with no
 /// fallback into the audio queue when the selected source is full.
@@ -1509,9 +1520,9 @@ pub unsafe extern "C" fn veil_media_send_video_control_datagram(
         return -1;
     }
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    if !media_is_rtcp(bytes) {
+    let Some(picture_loss) = classify_rtcp(bytes) else {
         return -1;
-    }
+    };
     let ingress = {
         let map = match MEDIA_CHANNELS.try_read() {
             Ok(map) => map,
@@ -1525,7 +1536,10 @@ pub unsafe extern "C" fn veil_media_send_video_control_datagram(
         };
         Arc::clone(&ch.ingress)
     };
-    ingress.enqueue_video_control(QueuedMediaPacket::from(bytes.to_vec()))
+    ingress.enqueue_video_control(
+        QueuedMediaPacket::from(bytes.to_vec()),
+        picture_loss && len <= COMPACT_RELAY_MEDIA_CELL_MAX,
+    )
 }
 
 /// Snapshot per-channel relay drain diagnostics. Direct/onion channels return
@@ -2050,24 +2064,21 @@ impl MediaIngress {
                 -1,
             );
         }
-        if media_is_rtcp(&payload.payload) {
-            let sender = match self.feedback_tx.try_read() {
-                Ok(sender) => sender,
-                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => return 1,
-            };
-            if let Some(tx) = sender.as_ref() {
-                // A full feedback source never spills back into the audio queue.
-                return Self::send_packet(tx, payload, false);
+        let payload = if media_is_rtcp(&payload.payload) {
+            match self.try_enqueue_feedback(payload) {
+                Ok(result) => return result,
+                Err(payload) => payload,
             }
-        }
+        } else {
+            payload
+        };
         if !media_is_vp8_rtp(&payload.payload) {
             return Self::send_packet(&self.tx_hi, payload, false);
         }
         if media_is_padding_only(&payload.payload) {
             // Probes have no image-frame boundary. Keep them out of the VP8
             // assembler and its contention/discard state, just like RTCP.
-            return self.enqueue_video_control(payload);
+            return self.enqueue_video_control(payload, false);
         }
         let screen_sharing = self.screen_sharing.load(Acquire);
         let source = if screen_sharing {
@@ -2146,11 +2157,19 @@ impl MediaIngress {
         }
     }
 
-    fn enqueue_video_control(&self, payload: QueuedMediaPacket) -> c_int {
+    fn enqueue_video_control(&self, payload: QueuedMediaPacket, picture_loss: bool) -> c_int {
         use std::sync::atomic::Ordering::Acquire;
         if self.closed.load(Acquire) {
             return refuse_ingress(IngressRefusal::IngressClosed, true, -1);
         }
+        let payload = if picture_loss {
+            match self.try_enqueue_feedback(payload) {
+                Ok(result) => return result,
+                Err(payload) => payload,
+            }
+        } else {
+            payload
+        };
         let source = if self.screen_sharing.load(Acquire) {
             match &self.screen {
                 Some(screen) => screen,
@@ -2183,6 +2202,20 @@ impl MediaIngress {
                     }
                 }
             }
+        }
+    }
+
+    /// A bound feedback queue owns its backpressure. Return the packet only
+    /// when the channel has no independent feedback writer.
+    fn try_enqueue_feedback(&self, payload: QueuedMediaPacket) -> Result<c_int, QueuedMediaPacket> {
+        let sender = match self.feedback_tx.try_read() {
+            Ok(sender) => sender,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(1),
+        };
+        match sender.as_ref() {
+            Some(tx) => Ok(Self::send_packet(tx, payload, false)),
+            None => Err(payload),
         }
     }
 
