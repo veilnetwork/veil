@@ -8,6 +8,7 @@ use std::{
 #[derive(Debug, Default)]
 struct Budget {
     limit: Option<AtomicU64>,
+    mtu_probe_wake: Option<Instant>,
     flight: AtomicU64,
     peak: AtomicU64,
     delivered: AtomicU64,
@@ -19,7 +20,10 @@ impl LocalSendBudget for Budget {
     fn acquire_transmit(&self, _: Instant) -> Option<Box<dyn Send>> {
         Some(Box::new(()))
     }
-    fn window(&self, _: Instant, _: u64, _: u16) -> u64 {
+    fn window(&self, _: Instant, path_flight: u64, mtu: u16) -> u64 {
+        if self.mtu_probe_wake.is_some() {
+            return path_flight + u64::from(mtu) + 1;
+        }
         self.limit
             .as_ref()
             .map_or(2401, |limit| limit.load(Ordering::SeqCst))
@@ -39,7 +43,7 @@ impl LocalSendBudget for Budget {
         self.routes.fetch_add(1, Ordering::SeqCst);
     }
     fn next_wakeup(&self, _: Instant) -> Option<Instant> {
-        None
+        self.mtu_probe_wake
     }
     fn register_waker(&self, _: &Waker) {}
     fn closed(&self) {
@@ -147,6 +151,57 @@ fn blocked_local_datagram_does_not_hold_a_due_ack() {
         pair.client_datagrams(client).recv().as_deref(),
         Some(message.as_slice())
     );
+}
+
+#[test]
+fn a_blocked_mtu_probe_cannot_postpone_an_eligible_datagram() {
+    let mut transport = TransportConfig::default();
+    transport.enable_segmentation_offload(false);
+    let mut congestion = crate::congestion::CubicConfig::default();
+    congestion.initial_window(1024 * 1024);
+    transport.congestion_controller_factory(Arc::new(congestion));
+    let mut config = client_config();
+    config.transport_config(Arc::new(transport));
+    let mut pair = Pair::default();
+    let (client, _server) = pair.connect_with(config);
+    pair.drive();
+
+    let now = pair.time;
+    let expires = now + Duration::from_millis(100);
+    let conn = pair.client_conn_mut(client);
+    conn.path_changed(now);
+    // After resetting the path, normal packets fit. The next MTU discovery
+    // probe is larger and the shared budget asks us to retry it much later.
+    assert!(conn.set_local_send_budget(Arc::new(Budget {
+        mtu_probe_wake: Some(now + Duration::from_secs(2)),
+        ..Default::default()
+    })));
+    for _ in 0..16 {
+        conn.datagrams()
+            .send_with_expiry_at(Bytes::from(vec![7; 1024]), false, expires, now)
+            .unwrap();
+    }
+    let before = conn.stats().frame_tx.datagram;
+    let mut buf = Vec::new();
+    let mut sent = 0;
+    while conn.poll_transmit(now, 1, &mut buf).is_some() {
+        sent += 1;
+        buf.clear();
+        assert!(sent < 16, "the native pacer should spend its burst credit");
+    }
+    assert!(sent > 0);
+    assert_eq!(conn.stats().frame_tx.datagram, before + sent);
+    let paced = conn.poll_timeout().unwrap();
+    assert!(paced > now);
+    conn.handle_timeout(paced);
+    assert_eq!(
+        conn.datagrams().expired_outgoing(),
+        0,
+        "the MTU probe must not make ordinary paced datagrams expire"
+    );
+    assert!(paced < expires);
+    assert!(conn.poll_transmit(paced, 1, &mut buf).is_some());
+    assert_eq!(conn.stats().frame_tx.datagram, before + sent + 1);
 }
 
 #[test]

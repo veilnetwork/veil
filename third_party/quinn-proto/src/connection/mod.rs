@@ -1426,6 +1426,7 @@ impl Connection {
                     self.path.challenge_pending = false;
                 }
                 Timer::Pacing => trace!("pacing timer expired"),
+                Timer::LocalSendBudget => trace!("local send budget timer expired"),
                 Timer::PushNewCid => {
                     // Update `retire_prior_to` field in NEW_CONNECTION_ID frame
                     let num_new_cid = self.local_cid_state.on_cid_timeout().into();
@@ -4008,7 +4009,9 @@ impl Connection {
                 budget.0.blocked(now);
             }
             if let Some(wake) = budget.0.next_wakeup(now) {
-                self.timers.set(Timer::Pacing, wake);
+                // An oversized MTU probe may be blocked by the shared budget
+                // after ordinary packets already arranged an earlier pacing wake.
+                self.timers.set(Timer::LocalSendBudget, wake);
             }
         }
     }
