@@ -59,6 +59,16 @@ pub(crate) fn peer_ad_binding_ok(
     {
         authorization.observe(&doc, now);
     }
+    delegated_ad_binding_ok(authorization, ad, now)
+}
+
+/// Verify using only the authorization already known locally. A provisional
+/// candidate may suppress retries but cannot update the document floor.
+pub(super) fn delegated_ad_binding_ok(
+    authorization: &crate::identity_document_floor::IdentityDocumentFloor,
+    ad: &RendezvousAd,
+    now: u64,
+) -> bool {
     let Some(doc) = authorization.current(&ad.receiver_node_id) else {
         return false;
     };

@@ -156,6 +156,84 @@ async fn cancelling_unknown_document_prefetch_releases_pending_queries() {
     check_unknown_document_prefetch(true).await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn cold_mailbox_recovers_ad_and_document_after_unanswered_queries() {
+    use super::super::anonymity_state::{RendezvousAdNamespace, RendezvousResolveCache};
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    let identity = IdentityFixture::new();
+    let receiver = identity.document.node_id;
+    let kem = [0x74; 32];
+    let ad = identity.ad_with_kem(receiver, &kem);
+    let ad_key = RendezvousAdNamespace::Mailbox.key(&receiver, 2);
+    let doc_key = IdentityDocument::dht_key(&receiver);
+    let document = identity.document.encode();
+    let me = [0x73; 32];
+    let dht = Arc::new(veil_dht::KademliaService::new(me));
+    let mut reg = veil_session::SessionTxRegistry::new();
+    let mut rx = reg.register([0xAA; 32]);
+    let registry = Arc::new(RwLock::new(reg));
+    let pending = Arc::new(Mutex::new(HashMap::<
+        [u8; 16],
+        veil_dispatcher::PendingRecursive,
+    >::new()));
+    let replies = tokio::spawn({
+        let pending = Arc::clone(&pending);
+        async move {
+            let mut dropped = HashMap::new();
+            let mut recovered = 0;
+            while let Some((_, frame)) = rx.recv().await {
+                let query =
+                    RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+                let reply = match query.target_key {
+                    key if key == ad_key => &ad,
+                    key if key == doc_key => &document,
+                    _ => {
+                        let waiter = lock!(pending).remove(&query.query_id).unwrap();
+                        let _ = waiter.tx.send(Vec::new());
+                        continue;
+                    }
+                };
+                match dropped.entry(query.target_key) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        // Model the relay's silent refusal before dedup/admission.
+                        entry.insert(frame);
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        assert_eq!(entry.get(), &frame, "reuse the original ID and body");
+                        let waiter = lock!(pending).remove(&query.query_id).unwrap();
+                        let _ = waiter.tx.send(reply.clone());
+                        recovered += 1;
+                        if recovered == 2 {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    let authorization = crate::identity_document_floor::IdentityDocumentFloor::ephemeral();
+    let ads = resolve_fresh_rendezvous_ads(
+        &dht,
+        &registry,
+        &pending,
+        me,
+        &Arc::new(RendezvousResolveCache::new()),
+        &Arc::new(veil_observability::NodeLogger::new_noop()),
+        receiver,
+        Duration::from_millis(3500),
+        ResolveMode::Mailbox,
+        &authorization,
+    )
+    .await;
+    assert_eq!(ads.len(), 1, "recover on the first outer mailbox lookup");
+    assert_eq!(ads[0].rendezvous_kem_pk, kem);
+    assert!(authorization.current(&receiver).is_some());
+    assert!(lock!(pending).is_empty());
+    replies.await.unwrap();
+}
+
 async fn check_unknown_document_prefetch(cancel: bool) {
     use std::future::Future;
     let identity = IdentityFixture::new();
@@ -302,6 +380,10 @@ impl IdentityFixture {
     }
 
     fn ad(&self, receiver: [u8; 32]) -> Vec<u8> {
+        self.ad_with_kem(receiver, &[])
+    }
+
+    fn ad_with_kem(&self, receiver: [u8; 32], kem: &[u8]) -> Vec<u8> {
         let now = veil_util::unix_secs_now_u64();
         sign_rendezvous_ad_v5(
             receiver,
@@ -314,7 +396,7 @@ impl IdentityFixture {
             &[],
             &[],
             0,
-            &[],
+            kem,
             &self.pk,
             &self.sk,
             veil_types::SignatureAlgorithm::Ed25519,

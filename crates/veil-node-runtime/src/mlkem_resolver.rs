@@ -36,6 +36,7 @@
 //! `NodeLogger` (debug level) — operators turn it on via
 //! `[global] log_level = "debug"`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -2027,34 +2028,6 @@ fn dht_opted_out(dht: &Arc<KademliaService>) -> std::collections::HashSet<[u8; 3
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn recursive_dht_get_candidates<F>(
-    dht: &Arc<KademliaService>,
-    session_tx_registry: &Arc<RwLock<SessionTxRegistry>>,
-    pending_recursive: &Arc<Mutex<std::collections::HashMap<[u8; 16], PendingRecursive>>>,
-    local_node_id: [u8; 32],
-    key: [u8; 32],
-    timeout: Duration,
-    max_peers: usize,
-    is_valid: F,
-) -> Vec<Vec<u8>>
-where
-    F: Fn(&[u8]) -> bool,
-{
-    recursive_dht_get_candidates_policy(
-        dht,
-        session_tx_registry,
-        pending_recursive,
-        local_node_id,
-        key,
-        timeout,
-        max_peers,
-        false,
-        is_valid,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn recursive_key_material_candidates<F>(
     dht: &Arc<KademliaService>,
     session_tx_registry: &Arc<RwLock<SessionTxRegistry>>,
@@ -2068,7 +2041,7 @@ async fn recursive_key_material_candidates<F>(
 where
     F: Fn(&[u8]) -> bool,
 {
-    recursive_dht_get_candidates_policy(
+    recursive_dht_get_candidates(
         dht,
         session_tx_registry,
         pending_recursive,
@@ -2076,14 +2049,33 @@ where
         key,
         timeout,
         max_peers,
-        true,
+        Some(CandidateRetry::staggered(0, None)),
         is_valid,
     )
     .await
 }
 
+const CANDIDATE_RETRY_JITTER_RANGE_MS: u16 = 251;
+
+#[derive(Clone, Copy)]
+pub(crate) struct CandidateRetry<'a> {
+    delay: Duration,
+    skip_when: Option<&'a AtomicBool>,
+}
+
+impl<'a> CandidateRetry<'a> {
+    pub(crate) fn staggered(step: u8, skip_when: Option<&'a AtomicBool>) -> Self {
+        Self {
+            delay: Duration::from_millis(
+                500 + u64::from(CANDIDATE_RETRY_JITTER_RANGE_MS) * u64::from(step),
+            ),
+            skip_when,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn recursive_dht_get_candidates_policy<F>(
+pub(crate) async fn recursive_dht_get_candidates<F>(
     dht: &Arc<KademliaService>,
     session_tx_registry: &Arc<RwLock<SessionTxRegistry>>,
     pending_recursive: &Arc<Mutex<std::collections::HashMap<[u8; 16], PendingRecursive>>>,
@@ -2091,7 +2083,7 @@ async fn recursive_dht_get_candidates_policy<F>(
     key: [u8; 32],
     timeout: Duration,
     max_peers: usize,
-    retry_once: bool,
+    retry: Option<CandidateRetry<'_>>,
     is_valid: F,
 ) -> Vec<Vec<u8>>
 where
@@ -2219,17 +2211,23 @@ where
                 // query token bucket is empty. Repeat once after refill time,
                 // with the SAME ID/TTL/body so its existing dedup entry suppresses
                 // another forward. Keep the original deadline.
-                let jitter_ms = u16::from_be_bytes([query.query_id[0], query.query_id[1]]) % 251;
-                let retry_at = tokio::time::Instant::now() + Duration::from_millis(500 + u64::from(jitter_ms));
+                let retry_at = retry.map(|policy| {
+                    let jitter_ms = u16::from_be_bytes([query.query_id[0], query.query_id[1]])
+                        % CANDIDATE_RETRY_JITTER_RANGE_MS;
+                    tokio::time::Instant::now() + policy.delay + Duration::from_millis(u64::from(jitter_ms))
+                });
                 let rx = query.rx;
                 tokio::pin!(rx);
-                if retry_once && retry_at < deadline {
+                if let Some(retry_at) = retry_at.filter(|at| *at < deadline) {
                     tokio::select! {
                         biased;
                         reply = &mut rx => return (query.peer, tag, walk_tag, Ok(reply)),
                         _ = tokio::time::sleep_until(retry_at) => {}
                     }
-                    if tokio::time::Instant::now() < deadline {
+                    if tokio::time::Instant::now() < deadline
+                        && !retry.and_then(|policy| policy.skip_when)
+                            .is_some_and(|seen| seen.load(Ordering::Relaxed))
+                    {
                         let outcome = {
                             let registry = rlock!(session_tx_registry);
                             match registry.queued_for(&query.peer) {
@@ -2836,6 +2834,7 @@ mod tests {
                 [0x73; 32],
                 std::time::Duration::from_secs(60),
                 1,
+                None,
                 |_| true,
             ));
             assert!(futures::poll!(lookup.as_mut()).is_pending());
@@ -3494,6 +3493,7 @@ mod tests {
             [3; 32],
             Duration::from_secs(3),
             1,
+            None,
             |_| false,
         ));
         assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
@@ -3502,7 +3502,7 @@ mod tests {
         assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
         assert!(
             rx.try_recv().is_err(),
-            "only key-material walks opt in to a repeat"
+            "background slot walks do not opt in to a repeat"
         );
         assert!(lookup.await.is_empty());
         assert_eq!(start.elapsed(), Duration::from_secs(3));
@@ -3629,6 +3629,38 @@ mod tests {
         assert!(lookup.await.is_empty());
         assert_eq!(start.elapsed(), Duration::from_secs(3));
         assert!(rx.try_recv().is_err());
+        assert!(lock!(resolver.pending_recursive).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn candidate_retry_stops_repetition_but_can_still_collect_the_original_reply() {
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        let mut rx = wlock!(resolver.session_tx_registry).register([2; 32]);
+        let seen = std::sync::atomic::AtomicBool::new(false);
+        let mut lookup = Box::pin(recursive_dht_get_candidates(
+            &resolver.dht,
+            &resolver.session_tx_registry,
+            &resolver.pending_recursive,
+            [1; 32],
+            [3; 32],
+            Duration::from_secs(3),
+            1,
+            Some(CandidateRetry::staggered(0, Some(&seen))),
+            |value| value == [4],
+        ));
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        let (_, first) = rx.try_recv().unwrap();
+        let query = RecursiveQueryPayload::decode(&first[veil_proto::HEADER_SIZE..]).unwrap();
+        seen.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        assert!(rx.try_recv().is_err());
+        let waiter = lock!(resolver.pending_recursive)
+            .remove(&query.query_id)
+            .unwrap();
+        waiter.tx.send(vec![4]).unwrap();
+        assert_eq!(lookup.await, vec![vec![4]]);
         assert!(lock!(resolver.pending_recursive).is_empty());
     }
 
@@ -5581,6 +5613,7 @@ mod tests {
             key,
             Duration::from_secs(1),
             2,
+            None,
             |_| true,
         )
         .await;

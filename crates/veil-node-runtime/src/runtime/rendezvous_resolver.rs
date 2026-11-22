@@ -22,6 +22,10 @@
 //! one place, and `test_rendezvous_ad` exists for nothing else.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use crate::mlkem_resolver::{CandidateRetry, recursive_dht_get_candidates};
 
 use veil_util::lock;
 
@@ -255,20 +259,20 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
 ) -> Vec<veil_anonymity::rendezvous::RendezvousAd> {
     use super::rendezvous_ad_binding::peer_ad_binding_ok;
     use veil_anonymity::rendezvous::{
-        MAX_RENDEZVOUS_AD_SLOTS, decode_rendezvous_ad, is_currently_valid,
+        MAX_RENDEZVOUS_AD_SLOTS, RENDEZVOUS_KEM_ALGO_X25519, decode_rendezvous_ad,
+        is_currently_valid,
     };
 
     use super::anonymity_state::RendezvousAdNamespace;
-    let namespace = if matches!(mode, ResolveMode::Mailbox) {
+    let mailbox = matches!(mode, ResolveMode::Mailbox);
+    let namespace = if mailbox {
         RendezvousAdNamespace::Mailbox
     } else {
         RendezvousAdNamespace::Live
     };
     let matches_receiver = |ad: &veil_anonymity::rendezvous::RendezvousAd| {
         ad.receiver_node_id == receiver_id
-            && (!matches!(mode, ResolveMode::Mailbox)
-                || !ad.rendezvous_kem_pk.is_empty()
-                || !ad.push_envelope.is_empty())
+            && (!mailbox || !ad.rendezvous_kem_pk.is_empty() || !ad.push_envelope.is_empty())
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -350,11 +354,17 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
                     .any(|key| key.device_id != receiver_id)
             }));
     let (document_hint, mut document_hint_rx) = tokio::sync::watch::channel(document_in_parallel);
+    let mailbox_ad_verified = &AtomicBool::new(false);
     let walks = (0..MAX_RENDEZVOUS_AD_SLOTS).map(move |idx| {
         let key = namespace.key(&receiver_id, idx);
         let hint = document_hint.clone();
         async move {
-            let candidates = crate::mlkem_resolver::recursive_dht_get_candidates(
+            // When a cold mailbox lookup arrives during a burst of live route
+            // traffic, the relay can silently refuse every initial slot. Spend
+            // reappearing tokens on consecutive slots rather than another burst.
+            // Stop repeating when there is an authenticated deposit target.
+            let retry = mailbox.then(|| CandidateRetry::staggered(idx, Some(mailbox_ad_verified)));
+            let candidates = recursive_dht_get_candidates(
                 dht,
                 session_tx_registry,
                 pending_recursive,
@@ -365,27 +375,44 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
                 // On the three-seed production topology this deliberately asks
                 // all three instead of accepting whichever seed replies first.
                 veil_proto::budget::DHT_REPLICATION_K,
+                retry,
                 move |bytes| {
                     let candidate = decode_rendezvous_ad(bytes)
                         .ok()
                         .filter(matches_receiver)
                         .filter(|ad| is_currently_valid(ad, now).is_ok());
-                    let already_needed = *hint.borrow();
-                    if !already_needed
-                        && candidate.as_ref().is_some_and(|ad| {
-                            veil_anonymity::rendezvous::verify_rendezvous_ad(ad).is_err()
-                        })
-                    {
-                        // An untrusted candidate may start a bounded read,
-                        // never authorize a route. Do not wait for unrelated
-                        // slot/replica deadlines to start the document walk.
-                        hint.send_if_modified(|needed| {
-                            let changed = !*needed;
-                            *needed = true;
-                            changed
-                        });
+                    let Some(ad) = candidate else {
+                        return false;
+                    };
+                    let check_document = !*hint.borrow();
+                    let check_mailbox = mailbox
+                        && ad.rendezvous_kem_algo == RENDEZVOUS_KEM_ALGO_X25519
+                        && ad.rendezvous_kem_pk.len() == 32
+                        && !mailbox_ad_verified.load(Ordering::Relaxed);
+                    if check_document || check_mailbox {
+                        let self_bound =
+                            veil_anonymity::rendezvous::verify_rendezvous_ad(&ad).is_ok();
+                        if check_document && !self_bound {
+                            // An untrusted candidate can start a bounded
+                            // document read before unrelated slots finish.
+                            hint.send_if_modified(|needed| {
+                                let changed = !*needed;
+                                *needed = true;
+                                changed
+                            });
+                        }
+                        if check_mailbox
+                            && (self_bound
+                                || super::rendezvous_ad_binding::delegated_ad_binding_ok(
+                                    authorization,
+                                    &ad,
+                                    now,
+                                ))
+                        {
+                            mailbox_ad_verified.store(true, Ordering::Relaxed);
+                        }
                     }
-                    candidate.is_some()
+                    true
                 },
             )
             .await;
@@ -429,6 +456,7 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
                 local_node_id,
                 receiver_id,
                 timeout,
+                mailbox,
             )
             .await,
         )
@@ -463,6 +491,7 @@ pub(super) async fn resolve_fresh_rendezvous_ads(
                     local_node_id,
                     receiver_id,
                     timeout,
+                    mailbox,
                 )
                 .await
             }
@@ -558,10 +587,11 @@ async fn lookup_receiver_documents(
     >,
     local_node_id: [u8; 32],
     receiver_id: [u8; 32],
-    timeout: std::time::Duration,
+    timeout: Duration,
+    mailbox: bool,
 ) -> Vec<Vec<u8>> {
     use veil_proto::identity_document::IdentityDocument;
-    crate::mlkem_resolver::recursive_dht_get_candidates(
+    recursive_dht_get_candidates(
         dht,
         registry,
         pending,
@@ -569,6 +599,7 @@ async fn lookup_receiver_documents(
         IdentityDocument::dht_key(&receiver_id),
         timeout,
         veil_proto::budget::DHT_REPLICATION_K,
+        mailbox.then(|| CandidateRetry::staggered(0, None)),
         |bytes| {
             IdentityDocument::decode(bytes).is_ok_and(|doc| {
                 doc.node_id == receiver_id
