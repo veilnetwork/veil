@@ -619,6 +619,7 @@ impl Connection {
             }
 
             let mut ack_only_under_local_budget = false;
+            let mut bypass_datagram_head = false;
             let mut ack_eliciting = !self.spaces[space_id].pending.is_empty(&self.streams)
                 || self.spaces[space_id].ping_pending
                 || self.spaces[space_id].immediate_ack_pending;
@@ -695,8 +696,8 @@ impl Connection {
                         && !self.config.pad_to_mtu
                         && self.path_responses.is_empty()
                     {
-                        let remaining = self
-                            .local_congestion_window(now)
+                        let local_window = self.local_congestion_window(now);
+                        let remaining = local_window
                             .saturating_sub(self.path.in_flight.bytes)
                             .saturating_sub(untracked_bytes)
                             .saturating_sub(1);
@@ -707,6 +708,13 @@ impl Connection {
                             let frame_space = next_datagram_limit
                                 .saturating_sub(self.predict_1rtt_overhead(Some(pn)));
                             can_send = self.space_can_send(space_id, frame_space);
+                            // Use already granted local credit for one small timed
+                            // datagram when the first packet would otherwise wait
+                            // behind the larger head. Keep later GSO segments FIFO.
+                            bypass_datagram_head = num_datagrams == 0
+                                && local_window < self.path.congestion.window()
+                                && self.datagrams.can_bypass_head(frame_space);
+                            can_send.other |= bypass_datagram_head;
                             // A whole DATAGRAM must fit. Retain an oversized
                             // one for ACK progress, keeping congestion state.
                             if can_send.is_empty() {
@@ -722,6 +730,7 @@ impl Connection {
                             ack_eliciting = !self.spaces[space_id].pending.is_empty(&self.streams)
                                 || self.spaces[space_id].ping_pending
                                 || self.spaces[space_id].immediate_ack_pending
+                                || bypass_datagram_head
                                 || self.can_send_1rtt(frame_space);
                         }
                     }
@@ -1044,7 +1053,14 @@ impl Connection {
                 );
                 sent
             } else {
-                self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number)
+                self.populate_packet(
+                    now,
+                    space_id,
+                    buf,
+                    builder.max_size,
+                    builder.exact_number,
+                    bypass_datagram_head,
+                )
             };
 
             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
@@ -3414,6 +3430,7 @@ impl Connection {
         buf: &mut Vec<u8>,
         max_size: usize,
         pn: u64,
+        bypass_datagram_head: bool,
     ) -> SentFrames {
         let mut sent = SentFrames::default();
         let space = &mut self.spaces[space_id];
@@ -3607,7 +3624,7 @@ impl Connection {
         // DATAGRAM
         let mut sent_datagrams = false;
         while buf.len() + Datagram::SIZE_BOUND < max_size && space_id == SpaceId::Data {
-            match self.datagrams.write(now, buf, max_size) {
+            match self.datagrams.write(now, buf, max_size, bypass_datagram_head) {
                 true => {
                     sent_datagrams = true;
                     sent.non_retransmits = true;

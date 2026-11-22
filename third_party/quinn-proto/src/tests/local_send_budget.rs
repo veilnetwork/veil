@@ -154,6 +154,80 @@ fn blocked_local_datagram_does_not_hold_a_due_ack() {
 }
 
 #[test]
+fn a_small_timed_datagram_can_use_residual_local_window_once() {
+    let mut pair = Pair::default();
+    let (client, server) = pair.connect();
+    pair.drive();
+    let now = pair.time;
+    let expires = now + Duration::from_secs(1);
+    let budget = Arc::new(Budget {
+        limit: Some(AtomicU64::new(650)),
+        ..Default::default()
+    });
+    assert!(pair
+        .client_conn_mut(client)
+        .set_local_send_budget(budget.clone()));
+    let large = Bytes::from(vec![1; 1024]);
+    let small = Bytes::from(vec![2; 240]);
+    let later = Bytes::from(vec![3; 220]);
+    for packet in [&large, &small, &later] {
+        pair.client_datagrams(client)
+            .send_with_expiry_at(packet.clone(), false, expires, now)
+            .unwrap();
+    }
+
+    pair.drive_client();
+    pair.drive_server();
+    assert_eq!(pair.server_datagrams(server).recv(), Some(small));
+    assert!(pair.server_datagrams(server).recv().is_none());
+    assert!(budget.peak.load(Ordering::SeqCst) < 650);
+
+    budget.limit.as_ref().unwrap().store(2401, Ordering::SeqCst);
+    pair.drive();
+    assert_eq!(pair.server_datagrams(server).recv(), Some(large));
+    assert_eq!(pair.server_datagrams(server).recv(), Some(later));
+    assert!(pair.server_datagrams(server).recv().is_none());
+    assert_eq!(pair.client_datagrams(client).expired_outgoing(), 0);
+}
+
+#[test]
+fn residual_local_window_preserves_fifo_when_either_datagram_is_untimed() {
+    for timed_head in [false, true] {
+        let mut pair = Pair::default();
+        let (client, server) = pair.connect();
+        pair.drive();
+        let now = pair.time;
+        let budget = Arc::new(Budget {
+            limit: Some(AtomicU64::new(650)),
+            ..Default::default()
+        });
+        assert!(pair
+            .client_conn_mut(client)
+            .set_local_send_budget(budget.clone()));
+        let large = Bytes::from(vec![1; 1024]);
+        let small = Bytes::from(vec![2; 240]);
+        for (packet, timed) in [(&large, timed_head), (&small, !timed_head)] {
+            let mut queue = pair.client_datagrams(client);
+            if timed {
+                queue
+                    .send_with_expiry_at(packet.clone(), false, now + Duration::from_secs(1), now)
+                    .unwrap();
+            } else {
+                queue.send(packet.clone(), false).unwrap();
+            }
+        }
+        pair.drive_client();
+        pair.drive_server();
+        assert!(pair.server_datagrams(server).recv().is_none());
+
+        budget.limit.as_ref().unwrap().store(2401, Ordering::SeqCst);
+        pair.drive();
+        assert_eq!(pair.server_datagrams(server).recv(), Some(large));
+        assert_eq!(pair.server_datagrams(server).recv(), Some(small));
+    }
+}
+
+#[test]
 fn a_blocked_mtu_probe_cannot_postpone_an_eligible_datagram() {
     let mut transport = TransportConfig::default();
     transport.enable_segmentation_offload(false);

@@ -100,6 +100,7 @@ impl Datagrams<'_> {
             datagram: Datagram { data },
             expires_at,
             queued_at,
+            bypassed: false,
         });
         if let Some(deadline) = expires_at {
             self.conn.datagrams.next_expiry = Some(
@@ -205,6 +206,7 @@ pub(super) struct QueuedDatagram {
     datagram: Datagram,
     expires_at: Option<Instant>,
     queued_at: Option<Instant>,
+    bypassed: bool,
 }
 
 impl std::ops::Deref for QueuedDatagram {
@@ -220,6 +222,7 @@ impl From<Datagram> for QueuedDatagram {
             datagram,
             expires_at: None,
             queued_at: None,
+            bypassed: false,
         }
     }
 }
@@ -345,22 +348,37 @@ impl DatagramState {
         dropped_any
     }
 
+    /// Permit one later timed frame while an earlier one cannot fit.
+    /// A blocked head cannot be bypassed again or reordered across untimed work.
+    pub(super) fn can_bypass_head(&self, max_size: usize) -> bool {
+        let queue = &self.outgoing.queue;
+        queue.front().is_some_and(|head| {
+            head.expires_at.is_some() && !head.bypassed && head.size(true) > max_size
+        }) && queue
+            .get(1)
+            .is_some_and(|next| next.expires_at.is_some() && next.size(true) <= max_size)
+    }
+
     /// Attempt to write a datagram frame into `buf`, consuming it from `self.outgoing`
     ///
     /// Returns whether a frame was written. At most `max_size` bytes will be written, including
     /// framing.
-    pub(super) fn write(&mut self, now: Instant, buf: &mut Vec<u8>, max_size: usize) -> bool {
-        let datagram = match self.outgoing.pop_front() {
-            Some(x) => x,
-            None => return false,
-        };
-
-        if buf.len() + datagram.size(true) > max_size {
-            // Future work: we could be more clever about cramming small datagrams into
-            // mostly-full packets when a larger one is queued first
-            self.outgoing.push_front(datagram);
+    pub(super) fn write(
+        &mut self,
+        now: Instant,
+        buf: &mut Vec<u8>,
+        max_size: usize,
+        bypass_head: bool,
+    ) -> bool {
+        let remaining = max_size.saturating_sub(buf.len());
+        let datagram = if self.outgoing.can_send_1rtt(remaining) {
+            self.outgoing.pop_front().unwrap()
+        } else if bypass_head && self.can_bypass_head(remaining) {
+            self.outgoing.queue.front_mut().unwrap().bypassed = true;
+            self.outgoing.remove(1).unwrap()
+        } else {
             return false;
-        }
+        };
 
         trace!(len = datagram.data.len(), "DATAGRAM");
         if let Some(queued_at) = datagram.queued_at {
@@ -404,9 +422,10 @@ impl<T: AsRef<Datagram>> DatagramBuffer<T> {
         Some(datagram)
     }
 
-    fn push_front(&mut self, datagram: T) {
-        self.payload_bytes += datagram.as_ref().data.len();
-        self.queue.push_front(datagram);
+    fn remove(&mut self, index: usize) -> Option<T> {
+        let datagram = self.queue.remove(index)?;
+        self.payload_bytes -= datagram.as_ref().data.len();
+        Some(datagram)
     }
 
     fn memory_used(&self) -> usize {
