@@ -1670,85 +1670,59 @@ impl DhtMlKemEkResolver {
         &self,
         target_node_id: [u8; 32],
     ) -> Option<veil_types::ResolvedRelayKey> {
-        // Relay-key resolves are the cold-restart hot path: the target IS the
-        // relay we're connected to and about to register a mailbox with, so steer
-        // BOTH the document and the relay-key lookups straight at it (it answers
-        // authoritatively from store_local) rather than walking a cold table.
         let doc = self
             .fetch_verified_document(target_node_id, Some(target_node_id))
             .await?;
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_secs();
+        let now = unix_now();
         let key = RelayKeyRecord::dht_key(&target_node_id);
-        let local = self
-            .dht
-            .get_local(&key)
-            .and_then(|bytes| RelayKeyRecord::decode(&bytes).ok())
-            .and_then(|record| verify_relay_key(&record, &doc, now_unix).ok());
-        // Match the recipient's mailbox renewal window. The ordinary local
-        // fast path would otherwise keep returning the old stamp right up
-        // to expiry, even when the relay has already republished.
+        let local = self.dht.get_local(&key);
+        // Match the recipient's mailbox renewal window. A successor record
+        // might be signed by a renewed delegation, so refresh the document
+        // along with a key nearing expiry.
         const RELAY_KEY_REFRESH_LEAD_SECS: u64 = 10 * 60;
-        let verified = match local {
-            Some(local)
-                if local.valid_until_unix
-                    > now_unix.saturating_add(RELAY_KEY_REFRESH_LEAD_SECS) =>
-            {
-                local
-            }
-            Some(_) => {
-                // The new relay record may depend on a renewed delegation.
-                // Compare documents and relay records without short-circuiting
-                // on a valid local value. Still-valid local records participate
-                // in both comparisons and cover a silent replica.
-                let doc = self.fetch_verified_document(target_node_id, None).await?;
-                let now = unix_now();
-                let record = self
-                    .dht_get_freshest(
-                        key,
-                        |bytes| {
-                            RelayKeyRecord::decode(bytes)
-                                .ok()
-                                .filter(|record| verify_relay_key(record, &doc, now).is_ok())
-                        },
-                        |record| (record.record_version, record.valid_from_unix),
-                    )
-                    .await?;
-                verify_relay_key(&record, &doc, unix_now()).ok()?
-            }
-            None => {
-                let bytes = self
-                    .dht_recursive_get(key, self.step_timeout, Some(target_node_id), |b| {
-                        RelayKeyRecord::decode(b)
-                            .is_ok_and(|record| verify_relay_key(&record, &doc, now_unix).is_ok())
-                    })
-                    .await
-                    .or_else(|| {
-                        self.log_dbg("relay_key_resolver.dht_miss", &target_node_id, "");
-                        None
-                    })?;
-                let record = RelayKeyRecord::decode(&bytes)
-                    .map_err(|e| {
-                        self.log_dbg(
-                            "relay_key_resolver.decode_failed",
-                            &target_node_id,
-                            &format!("{e}"),
-                        )
-                    })
-                    .ok()?;
-                verify_relay_key(&record, &doc, unix_now())
-                    .map_err(|e| {
-                        self.log_dbg(
-                            "relay_key_resolver.verify_failed",
-                            &target_node_id,
-                            &format!("{e}"),
-                        )
-                    })
-                    .ok()?
-            }
+        let renew_document = local
+            .as_deref()
+            .and_then(|bytes| RelayKeyRecord::decode(bytes).ok())
+            .and_then(|record| verify_relay_key(&record, &doc, now).ok())
+            .is_some_and(|entry| {
+                entry.valid_until_unix <= now.saturating_add(RELAY_KEY_REFRESH_LEAD_SECS)
+            });
+        let doc = if renew_document {
+            self.fetch_verified_document(target_node_id, None).await?
+        } else {
+            doc
         };
+        let now = unix_now();
+        let decode_verified = |bytes: &[u8]| {
+            RelayKeyRecord::decode(bytes)
+                .ok()
+                .filter(|record| verify_relay_key(record, &doc, now).is_ok())
+        };
+        let freshness = |record: &RelayKeyRecord| (record.record_version, record.valid_from_unix);
+        let connected = rlock!(self.session_tx_registry).has_session(&target_node_id);
+        let record = if connected && !renew_document {
+            // A restarted relay can rotate the key before its old record
+            // expires. Ask that connected holder directly, and compare with
+            // the local value instead of letting either side win by arrival.
+            let remote = self
+                .dht_recursive_get(key, self.step_timeout, Some(target_node_id), |_| false)
+                .await;
+            let candidates = local
+                .into_iter()
+                .chain(remote)
+                .chain(self.dht.get_local(&key))
+                .collect();
+            self.select_freshest_candidate(key, candidates, decode_verified, freshness)
+        } else {
+            // Off-session, compare reachable signed copies. An in-window
+            // local record remains a candidate on a silent network.
+            self.dht_get_freshest(key, decode_verified, freshness).await
+        };
+        let Some(record) = record else {
+            self.log_dbg("relay_key_resolver.dht_miss", &target_node_id, "");
+            return None;
+        };
+        let verified = verify_relay_key(&record, &doc, unix_now()).ok()?;
         self.logger.debug(
             "relay_key_resolver.resolved",
             format!(
@@ -3203,6 +3177,45 @@ mod tests {
             assert_eq!(got.valid_until_unix, expected.valid_until_unix);
             assert!(lock!(resolver.pending_recursive).is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn relay_key_lookup_can_replace_a_long_lived_key_after_rotation() {
+        use ed25519_dalek::SigningKey;
+        use veil_identity::{publish::sign_relay_key, signing_key::IdentitySigningKey};
+
+        let seed = 0x3a;
+        let doc = current_cert_signer(seed).doc;
+        let node = doc.node_id;
+        let now = unix_now();
+        let sk = IdentitySigningKey::Ed25519(SigningKey::from_bytes(&[seed ^ 0xff; 32]));
+        let old =
+            sign_relay_key(node, vec![0x31; 32], now - 30, now + 1800, 1, 0, &sk, &doc).unwrap();
+        let rotated =
+            sign_relay_key(node, vec![0x32; 32], now - 10, now + 1800, 1, 0, &sk, &doc).unwrap();
+
+        let dht = Arc::new(KademliaService::new([1; 32]));
+        let target = RelayKeyRecord::dht_key(&node);
+        dht.store_local(IdentityDocument::dht_key(&node), doc.encode());
+        dht.store_local(target, old.encode());
+        let resolver = make_test_resolver(Arc::clone(&dht));
+        let mut rx = wlock!(resolver.session_tx_registry).register(node);
+        let mut lookup = Box::pin(resolver.fetch_relay_x25519(node));
+        assert!(
+            poll_family_to_stall(lookup.as_mut()).is_pending(),
+            "an unexpired old key must not mask the connected relay's replacement"
+        );
+        let (_, frame) = rx.try_recv().unwrap();
+        let query = RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+        assert_eq!(query.target_key, target);
+        let waiter = lock!(resolver.pending_recursive)
+            .remove(&query.query_id)
+            .unwrap();
+        waiter.tx.send(rotated.encode()).unwrap();
+        let got = lookup.await.unwrap();
+        assert_eq!(got.pk, [0x32; 32]);
+        assert_eq!(dht.get_local(&target), Some(rotated.encode()));
+        assert!(lock!(resolver.pending_recursive).is_empty());
     }
 
     // Read the actual queued requests before answering either one. No elapsed
