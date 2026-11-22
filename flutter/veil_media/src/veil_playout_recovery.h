@@ -153,6 +153,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
       if (h.ssrc == registered_ssrc_ && h.payloadType < opus_payloads_.size() &&
           opus_payloads_[h.payloadType]) {
         if (rtp_lag_.Packet(h.ssrc, h.timestamp, received_us, h.sequenceNumber)) {
+          arrival_reserve_ms_ = 0;
           decoded_stamp_.reset();
           receiver_recovery_->SetLag(std::nullopt, 0);
         }
@@ -213,6 +214,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
  private:
   void ResetLag() {
     rtp_lag_.Reset();
+    arrival_reserve_ms_ = 0;
     decoded_stamp_.reset();
     receiver_recovery_->SetLag(std::nullopt, 0);
   }
@@ -250,7 +252,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
   // buffer and the 16-pull callback limit remain bounded independently.
   static constexpr int kMaximumAdaptiveTargetMs = 500;
   static constexpr int kRenderBlockMs = 10;
-  int JitterReserveMs(int64_t now_us) const {
+  int JitterReserveMs(int64_t now_us) {
     const int target = std::clamp(inner_->TargetDelayMs(), 0, kMaximumAdaptiveTargetMs);
     const int headroom_ms = 2 * frame_headroom_ms_;
     const int target_reserve_ms = target + headroom_ms;
@@ -266,9 +268,28 @@ class RecoveringNetEq final : public webrtc::NetEq {
     // arrival allowance separately from the two packets of decoder headroom.
     const int max_reserve_ms = ceiling_ms + 2 * headroom_ms;
     const int recent_ms = rtp_lag_.RecentArrivalVariationMs(now_us);
-    if (target_reserve_ms <= NominalRecoveryBudgetMs() && recent_ms > max_reserve_ms)
-      return target_reserve_ms;
-    return std::max(target_reserve_ms, std::min(recent_ms + headroom_ms, max_reserve_ms));
+    const bool adaptive = target_reserve_ms > NominalRecoveryBudgetMs();
+    const int measured_ms = !adaptive && recent_ms > max_reserve_ms
+        ? target_reserve_ms
+        : std::max(target_reserve_ms, std::min(recent_ms + headroom_ms, max_reserve_ms));
+    // The recent arrival maximum expires in 500-ms buckets. Removing the
+    // full allowance at that boundary can skip several speech blocks in
+    // one callback. Retire it at 200 ms of reserve per second so NetEq can
+    // time-scale available speech first. Smooth at most 100 ms of excess
+    // (500 ms of render time). New jitter takes effect at once, and low-target
+    // device-stall catch-up keeps its immediate budget.
+    constexpr int64_t kUsPerMsOfRetiredReserve = 5000;
+    constexpr int kMaximumRetiringReserveMs = 100;
+    if (adaptive && now_us >= arrival_reserve_at_us_) {
+      const int64_t retired_ms = (now_us - arrival_reserve_at_us_) /
+          kUsPerMsOfRetiredReserve;
+      const int64_t remaining_ms = std::min({max_reserve_ms, arrival_reserve_ms_,
+          measured_ms + kMaximumRetiringReserveMs}) - retired_ms;
+      if (remaining_ms > measured_ms) return static_cast<int>(remaining_ms);
+    }
+    arrival_reserve_ms_ = measured_ms;
+    arrival_reserve_at_us_ = now_us;
+    return measured_ms;
   }
   int NominalRecoveryBudgetMs() const {
     return std::clamp(80 + 2 * frame_headroom_ms_, 120, 200);
@@ -283,6 +304,8 @@ class RecoveringNetEq final : public webrtc::NetEq {
     return true;
   }
   int frame_headroom_ms_ = 20;
+  int arrival_reserve_ms_ = 0;
+  int64_t arrival_reserve_at_us_ = 0;
   int requested_maximum_delay_ms_ = 0;
   int applied_target_ceiling_ms_ = -1;
   // Outlives the controller and packet-buffer stopwatches inside inner_.

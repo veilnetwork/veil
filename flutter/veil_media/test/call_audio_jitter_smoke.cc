@@ -85,10 +85,12 @@ static std::vector<Packet> network(const std::vector<Packet>& encoded, int profi
     // the brief source lag overlaps the 550-ms network jitter measurement.
     if (profile == 8 && p.begin >= 10800) p.at += 50;
     if (profile == 8 && p.begin >= 18800) p.at += 40;
-    if ((profile == 7 || profile == 8 || profile == 9) && p.at >= 4000) {
+    // Profile 10 clears the same paced bottleneck after adaptation.
+    if (((profile >= 7 && profile <= 9) || (profile == 10 && p.at < 18000)) &&
+        p.at >= 4000) {
       p.at += std::max(0, 550 - p.at % 1000);
     }
-    if (profile == 9) {
+    if (profile == 9 || profile == 10) {
       // An open link drains the held packets at a finite rate, with other
       // opaque datagrams serialized ahead of individual audio packets.
       const int service_ms = 2 + static_cast<int>(rng() % 10);
@@ -102,6 +104,7 @@ static std::vector<Packet> network(const std::vector<Packet>& encoded, int profi
 }
 struct Metrics {
   uint64_t played_plc = 0, conceal = 0, discarded = 0, packet_discarded = 0, events = 0, accelerate = 0;
+  uint64_t max_discard_per_render = 0, recovery_queue_ms = 0;
   int max_gap = 0, q95 = 0, max_target = 0;
 };
 static Metrics run(const std::vector<Packet>& packets, bool custom,
@@ -128,6 +131,7 @@ static Metrics run(const std::vector<Packet>& packets, bool custom,
     std::vector<int> queues;
     webrtc::NetEqLifetimeStatistics base{};
     uint64_t discard_base = 0;
+    uint64_t previous_discarded = 0;
     uint64_t output_energy = 0;
     int gap = 0;
     for (int at = 0; at < 30000; at += 10) {
@@ -144,8 +148,11 @@ static Metrics run(const std::vector<Packet>& packets, bool custom,
       bool muted=false;
       need(neteq->GetAudio(&frame,&muted) == 0,"decode");
       need(frame.samples_per_channel_ == 480 && frame.num_channels_ == 1,"format");
-      if (at == sample_after_ms) { base=neteq->GetLifetimeStatistics(); discard_base=recovery->discarded_ms.load(); }
+      const auto discarded = recovery->discarded_ms.load();
+      if (at == sample_after_ms) { base=neteq->GetLifetimeStatistics(); discard_base=discarded; }
       if (at > sample_after_ms) {
+        result.max_discard_per_render = std::max(
+            result.max_discard_per_render, discarded - previous_discarded);
         for (size_t i = 0; i < frame.samples_per_channel_; ++i) {
           const int64_t sample = frame.data()[i];
           output_energy += static_cast<uint64_t>(sample * sample);
@@ -155,9 +162,12 @@ static Metrics run(const std::vector<Packet>& packets, bool custom,
         else gap = 0;
         result.max_gap=std::max(result.max_gap,gap);
         const auto state=neteq->GetOperationsAndState();
+        if (at == sample_after_ms + 2500)
+          result.recovery_queue_ms = state.current_buffer_size_ms;
         queues.push_back(state.current_buffer_size_ms);
         result.max_target=std::max(result.max_target,neteq->TargetDelayMs());
       }
+      previous_discarded = discarded;
       clock.AdvanceTimeMilliseconds(10);
     }
     const auto end=neteq->GetLifetimeStatistics();
@@ -251,6 +261,24 @@ int main(int argc,char**argv) {
     need(measured.discarded == 0, "paced bursts erased the jitter reserve");
     need(measured.played_plc == 0, "paced bursts caused repeated played concealment");
     for (auto& packet : serialized) ++packet.at;
+  }
+  auto recovering = network(encoded, 10, 197);
+  for (int phase = 0; phase < 10; ++phase) {
+    const auto measured = run(recovering, true, 18000);
+    std::printf("after serialized jitter at phase %d: hard_discard=%llu ms "
+                "max_per_render=%llu ms concealed=%llu ms recovery_queue=%llu ms\n",
+        phase, (unsigned long long)measured.discarded,
+        (unsigned long long)measured.max_discard_per_render,
+        (unsigned long long)measured.played_plc,
+        (unsigned long long)measured.recovery_queue_ms);
+    need(measured.max_target >= 300 && measured.max_target <= 500,
+         "recovery did not exercise the adaptive reserve");
+    need(measured.max_discard_per_render <= 20,
+         "retiring the arrival reserve removed a speech burst in one render");
+    need(measured.played_plc == 0 && measured.recovery_queue_ms > 0 &&
+             measured.recovery_queue_ms <= 510,
+         "recovery must drain the excess without adding concealment");
+    for (auto& packet : recovering) ++packet.at;
   }
   std::puts("PASS lossless jitter/reorder speech reserve across 20/40/60-ms Opus");
 }
