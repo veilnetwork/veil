@@ -653,18 +653,34 @@ impl AppSender {
         pressured: bool,
         sampled_at_unix_ms: u64,
     ) -> impl std::future::Future<Output = Result<bool, ClientError>> + Send + 'static + use<> {
-        // Own only the writer/app id. An FFI caller can release its primary
-        // AppSender lock before a full local queue makes this future wait.
+        use veilcore::proto::ipc::LocalSourceFeedbackKind;
+        let kind = if pressured {
+            LocalSourceFeedbackKind::Pressured
+        } else {
+            LocalSourceFeedbackKind::Healthy
+        };
+        self.report_local_source_feedback(kind, sampled_at_unix_ms)
+    }
+
+    /// Send an owned observation without holding the primary sender lock.
+    pub fn report_local_source_feedback(
+        &self,
+        kind: veilcore::proto::ipc::LocalSourceFeedbackKind,
+        sampled_at_unix_ms: u64,
+    ) -> impl std::future::Future<Output = Result<bool, ClientError>> + Send + 'static + use<> {
         let writer = self.writer.clone();
         let app_id = self.app_id;
         async move {
-            use veilcore::proto::ipc::LocalSourceFeedbackPayload;
-            if !writer.supports_local_source_feedback() {
+            use veilcore::proto::ipc::{LocalSourceFeedbackKind, LocalSourceFeedbackPayload};
+            if !writer.supports_local_source_feedback()
+                || (kind == LocalSourceFeedbackKind::RecoveryProbe
+                    && !writer.supports_local_source_recovery_probe())
+            {
                 return Ok(false);
             }
             let report = LocalSourceFeedbackPayload {
                 source_app_id: app_id,
-                pressured,
+                kind,
                 sampled_at_unix_ms,
             };
             let now = std::time::SystemTime::now()
@@ -1639,6 +1655,7 @@ mod tests {
 
     #[tokio::test]
     async fn source_feedback_requires_negotiation_and_retains_sampling_time() {
+        use veilcore::proto::ipc::LocalSourceFeedbackKind;
         let (tx, mut rx) = mpsc::channel(1);
         let mut sender = AppSender {
             app_id: [7; 32],
@@ -1679,7 +1696,14 @@ mod tests {
         .unwrap();
         assert_eq!(report.source_app_id, [7; 32]);
         assert_eq!(report.sampled_at_unix_ms, sampled_at);
-        assert!(report.pressured);
+        assert_eq!(report.kind, LocalSourceFeedbackKind::Pressured);
+        assert!(
+            !sender
+                .report_local_source_feedback(LocalSourceFeedbackKind::RecoveryProbe, sampled_at)
+                .await
+                .unwrap()
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

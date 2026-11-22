@@ -362,6 +362,10 @@ impl LocalSourceActivity {
         }
     }
 
+    pub(crate) fn note_recovery_probe(&self, sampled_at: Instant, received_at: Instant) {
+        self.flight.recovery_probe(sampled_at, received_at);
+    }
+
     /// Known current audio health with a bounded pause in source growth.
     /// Receipt freezes the achieved DATA ramp; sampling time bounds freshness.
     pub(crate) fn note_growth_hold(

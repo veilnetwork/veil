@@ -2286,6 +2286,11 @@ async fn handle_ipc_client(
         && session_tx_registry
             .as_ref()
             .is_some_and(|r| r.supports_local_source_growth_hold());
+    let local_source_recovery_probe = local_source_feedback
+        && hello.flags & veil_proto::ipc::IPC_CAP_LOCAL_SOURCE_RECOVERY_PROBE != 0
+        && session_tx_registry
+            .as_ref()
+            .is_some_and(|r| r.supports_local_source_recovery_probe());
     let mut hello_header =
         FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppHelloOk as u16);
     hello_header.body_len = AppIpcHelloOkPayload::WIRE_SIZE as u32;
@@ -2297,6 +2302,9 @@ async fn handle_ipc_client(
     }
     if local_source_growth_hold {
         hello_header.flags |= veil_proto::ipc::IPC_HELLO_OK_LOCAL_SOURCE_GROWTH_HOLD;
+    }
+    if local_source_recovery_probe {
+        hello_header.flags |= veil_proto::ipc::IPC_HELLO_OK_LOCAL_SOURCE_RECOVERY_PROBE;
     }
     let local_lossy_work = hello.flags & veil_proto::ipc::IPC_CAP_LOCAL_LOSSY_WORK != 0
         && session_tx_registry
@@ -3079,7 +3087,7 @@ async fn handle_ipc_client(
                     }
                     Ok(LocalAppMsg::LocalSourceFeedback) => {
                         crate::handlers::source_feedback::handle_local_source_feedback(
-                            &body, local_source_feedback,
+                            &body, local_source_feedback, local_source_recovery_probe,
                             |id| client_state.has_app_id(id),
                             session_tx_registry.as_deref(),
                             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)

@@ -530,6 +530,24 @@ int Function(Pointer<VeilApp>, int, int, Pointer<Pointer<Utf8>>)?
 final int Function(Pointer<VeilApp>, int, int, Pointer<Pointer<Utf8>>)?
     veilAppReportLocalSourcePressure = _lookupLocalSourcePressure();
 
+final int Function(Pointer<VeilApp>, int, Pointer<Pointer<Utf8>>)?
+    veilAppReportLocalSourceRecoveryProbe = _lookupLocalSourceRecoveryProbe();
+
+int Function(Pointer<VeilApp>, int, Pointer<Pointer<Utf8>>)?
+    _lookupLocalSourceRecoveryProbe() {
+  try {
+    return nativeLib
+        .lookup<
+                NativeFunction<
+                    Int32 Function(Pointer<VeilApp>, Uint64,
+                        Pointer<Pointer<Utf8>>)>>(
+            'veil_app_report_local_source_recovery_probe')
+        .asFunction();
+  } on ArgumentError {
+    return null;
+  }
+}
+
 int Function(Pointer<VeilApp>, int, int, Pointer<Pointer<Utf8>>)?
     _lookupLocalSourcePressure() {
   try {

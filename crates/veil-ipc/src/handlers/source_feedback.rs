@@ -1,11 +1,12 @@
 //! Trusted local observations only. This handler never sends network frames.
 use std::time::{Duration, Instant};
-use veil_proto::ipc::LocalSourceFeedbackPayload;
+use veil_proto::ipc::{LocalSourceFeedbackKind, LocalSourceFeedbackPayload};
 use veil_types::FrameBroadcaster;
 
 pub(crate) fn handle_local_source_feedback(
     body: &[u8],
     negotiated: bool,
+    recovery_probe_negotiated: bool,
     owns_app: impl FnOnce(&[u8; 32]) -> bool,
     registry: Option<&dyn FrameBroadcaster>,
     now_unix_ms: u64,
@@ -31,7 +32,12 @@ pub(crate) fn handle_local_source_feedback(
     let Some(sampled_at) = now.checked_sub(age) else {
         return false;
     };
-    registry.note_local_source_feedback(report.pressured, sampled_at)
+    match report.kind {
+        LocalSourceFeedbackKind::Healthy => registry.note_local_source_feedback(false, sampled_at),
+        LocalSourceFeedbackKind::Pressured => registry.note_local_source_feedback(true, sampled_at),
+        LocalSourceFeedbackKind::RecoveryProbe => recovery_probe_negotiated
+            && registry.note_local_source_recovery_probe(sampled_at, now),
+    }
 }
 
 /// Explicit hold is negotiated separately so old daemons retain old semantics.
@@ -183,13 +189,14 @@ mod tests {
         let sampled_at = Instant::now();
         let report = LocalSourceFeedbackPayload {
             source_app_id: [7; 32],
-            pressured: true,
+            kind: veil_proto::ipc::LocalSourceFeedbackKind::Pressured,
             sampled_at_unix_ms: 10_000,
         };
         for elapsed_ms in [0, 1200, LocalSourceFeedbackPayload::MAX_AGE_MS] {
             assert!(handle_local_source_feedback(
                 &report.encode(),
                 true,
+                false,
                 |id| *id == report.source_app_id,
                 Some(&registry),
                 10_000 + elapsed_ms,
@@ -204,6 +211,7 @@ mod tests {
         assert!(!handle_local_source_feedback(
             &report.encode(),
             true,
+            false,
             |_| true,
             Some(&registry),
             11_501,
@@ -218,12 +226,13 @@ mod tests {
         let received_at = Instant::now();
         let report = LocalSourceFeedbackPayload {
             source_app_id: [7; 32],
-            pressured: false,
+            kind: LocalSourceFeedbackKind::Healthy,
             sampled_at_unix_ms: 10_000 + LocalSourceFeedbackPayload::MAX_FUTURE_MS,
         };
         assert!(handle_local_source_feedback(
             &report.encode(),
             true,
+            false,
             |_| true,
             Some(&registry),
             10_000,
@@ -238,7 +247,7 @@ mod tests {
         let now = Instant::now();
         let report = LocalSourceFeedbackPayload {
             source_app_id: [7; 32],
-            pressured: true,
+            kind: veil_proto::ipc::LocalSourceFeedbackKind::Pressured,
             sampled_at_unix_ms: 10_000,
         };
         let body = report.encode();
@@ -246,6 +255,7 @@ mod tests {
         assert!(handle_local_source_feedback(
             &body,
             true,
+            false,
             owns,
             Some(&registry),
             10_000,
@@ -253,6 +263,7 @@ mod tests {
         ));
         assert!(!handle_local_source_feedback(
             &body,
+            false,
             false,
             owns,
             Some(&registry),
@@ -262,6 +273,7 @@ mod tests {
         assert!(!handle_local_source_feedback(
             &body,
             true,
+            false,
             |_| false,
             Some(&registry),
             10_000,
@@ -270,6 +282,7 @@ mod tests {
         assert!(!handle_local_source_feedback(
             &body,
             true,
+            false,
             owns,
             Some(&registry),
             11_501,
@@ -278,6 +291,7 @@ mod tests {
         assert!(!handle_local_source_feedback(
             &body,
             true,
+            false,
             owns,
             Some(&registry),
             9_749,
@@ -286,13 +300,14 @@ mod tests {
         assert!(!handle_local_source_feedback(
             &body[..40],
             true,
+            false,
             owns,
             Some(&registry),
             10_000,
             now
         ));
         assert!(!handle_local_source_feedback(
-            &body, true, owns, None, 10_000, now
+            &body, true, false, owns, None, 10_000, now
         ));
         assert_eq!(
             registry.0.load(Ordering::Relaxed),

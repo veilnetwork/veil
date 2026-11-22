@@ -49,6 +49,9 @@ pub const IPC_HELLO_OK_LOCAL_DATAGRAM_PREPARATION: u16 = 0x0400;
 pub const IPC_CAP_LOCAL_SOURCE_GROWTH_HOLD: u32 = 16;
 /// Local APP_HELLO_OK acknowledgment; never a peer priority flag.
 pub const IPC_HELLO_OK_LOCAL_SOURCE_GROWTH_HOLD: u16 = 0x0800;
+/// Permit a bounded local lossy probe during measured reserve confirmation.
+pub const IPC_CAP_LOCAL_SOURCE_RECOVERY_PROBE: u32 = 32;
+pub const IPC_HELLO_OK_LOCAL_SOURCE_RECOVERY_PROBE: u16 = 0x1000;
 
 /// No content or media role is sent over the network by this local request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,14 +160,23 @@ pub const IPC_STREAM_WRITE_WINDOW: u32 = 8 * 1024;
 /// producer of tiny writes cannot turn a byte bound into millions of jobs.
 pub const IPC_STREAM_WRITE_OVERHEAD: u32 = 128;
 
+/// A local source admission observation. The original pressure values are
+/// preserved. The third state requires its own negotiated capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LocalSourceFeedbackKind {
+    Healthy = 0,
+    Pressured = 1,
+    RecoveryProbe = 2,
+}
+
 /// Local-only pressure lease. The source must be bound on the reporting IPC
 /// connection. No destination, content type or remote priority is present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalSourceFeedbackPayload {
     /// Application owned by the local reporting client.
     pub source_app_id: [u8; 32],
-    /// Whether its latency-sensitive source currently observes pressure.
-    pub pressured: bool,
+    pub kind: LocalSourceFeedbackKind,
     /// Sampling time on this host, so IPC backlog cannot renew stale pressure.
     pub sampled_at_unix_ms: u64,
 }
@@ -181,7 +193,7 @@ impl LocalSourceFeedbackPayload {
     pub fn encode(&self) -> [u8; Self::WIRE_SIZE] {
         let mut bytes = [0; Self::WIRE_SIZE];
         bytes[..32].copy_from_slice(&self.source_app_id);
-        bytes[32] = u8::from(self.pressured);
+        bytes[32] = self.kind as u8;
         bytes[33..].copy_from_slice(&self.sampled_at_unix_ms.to_be_bytes());
         bytes
     }
@@ -199,16 +211,19 @@ impl LocalSourceFeedbackPayload {
                 trailing: bytes.len() - Self::WIRE_SIZE,
             });
         }
-        if bytes[32] > 1 {
-            return Err(ProtoError::ValueTooLarge {
+        let kind = match bytes[32] {
+            0 => LocalSourceFeedbackKind::Healthy,
+            1 => LocalSourceFeedbackKind::Pressured,
+            2 => LocalSourceFeedbackKind::RecoveryProbe,
+            value => return Err(ProtoError::ValueTooLarge {
                 field: "local_source_pressure",
-                value: bytes[32] as u64,
-                max: 1,
-            });
-        }
+                value: value as u64,
+                max: 2,
+            }),
+        };
         Ok(Self {
             source_app_id: bytes[..32].try_into().expect("checked length"),
-            pressured: bytes[32] == 1,
+            kind,
             sampled_at_unix_ms: u64::from_be_bytes(bytes[33..].try_into().expect("checked length")),
         })
     }
@@ -274,7 +289,7 @@ impl LocalSourceGrowthHoldPayload {
     pub fn is_fresh_at(&self, now: u64) -> bool {
         LocalSourceFeedbackPayload {
             source_app_id: self.source_app_id,
-            pressured: false,
+            kind: LocalSourceFeedbackKind::Healthy,
             sampled_at_unix_ms: self.sampled_at_unix_ms,
         }
         .is_fresh_at(now)
@@ -324,7 +339,7 @@ mod local_source_feedback_tests {
     fn exact_codec_and_sampling_freshness() {
         let report = LocalSourceFeedbackPayload {
             source_app_id: [7; 32],
-            pressured: true,
+            kind: LocalSourceFeedbackKind::Pressured,
             sampled_at_unix_ms: 10_000,
         };
         let bytes = report.encode();
@@ -332,7 +347,7 @@ mod local_source_feedback_tests {
         assert!(LocalSourceFeedbackPayload::decode(&bytes[..40]).is_err());
         assert!(LocalSourceFeedbackPayload::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
         let mut invalid = bytes;
-        invalid[32] = 2;
+        invalid[32] = 3;
         assert!(LocalSourceFeedbackPayload::decode(&invalid).is_err());
         assert!(report.is_fresh_at(11_500));
         assert!(!report.is_fresh_at(11_501));

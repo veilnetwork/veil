@@ -108,6 +108,19 @@ pub trait FrameBroadcaster: Send + Sync {
         false
     }
 
+    fn supports_local_source_recovery_probe(&self) -> bool {
+        false
+    }
+
+    /// A corroborated audio reserve permits a small local lossy trial only.
+    fn note_local_source_recovery_probe(
+        &self,
+        _sampled_at: std::time::Instant,
+        _received_at: std::time::Instant,
+    ) -> bool {
+        false
+    }
+
     /// Whether negotiated local growth holds reach this endpoint's admission.
     fn supports_local_source_growth_hold(&self) -> bool {
         false

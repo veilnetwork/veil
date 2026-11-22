@@ -108,6 +108,19 @@ impl veil_types::FrameBroadcaster for SessionTxBroadcaster {
         true
     }
 
+    fn supports_local_source_recovery_probe(&self) -> bool {
+        true
+    }
+
+    fn note_local_source_recovery_probe(
+        &self,
+        sampled_at: std::time::Instant,
+        received_at: std::time::Instant,
+    ) -> bool {
+        rlock!(self.inner).note_local_source_recovery_probe(sampled_at, received_at);
+        true
+    }
+
     fn supports_local_source_growth_hold(&self) -> bool {
         true
     }

@@ -153,6 +153,14 @@ impl SessionTxRegistry {
         self.source_activity.note_feedback(pressured, now);
     }
 
+    pub fn note_local_source_recovery_probe(
+        &self,
+        sampled_at: std::time::Instant,
+        received_at: std::time::Instant,
+    ) {
+        self.source_activity.note_recovery_probe(sampled_at, received_at);
+    }
+
     /// Freeze achieved source growth without contracting paid admission.
     /// The IPC caller validates ownership, original deadline and fresh health.
     pub fn note_local_source_growth_hold(

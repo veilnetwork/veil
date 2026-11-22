@@ -122,6 +122,7 @@ pub(crate) struct SharedWriter {
     next_request_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
     stream_credits: Option<SharedStreamCredits>,
     local_source_feedback: bool,
+    local_source_recovery_probe: bool,
     local_source_growth_hold: bool,
     local_lossy_work: bool,
     local_datagram_preparation: bool,
@@ -173,6 +174,7 @@ impl SharedWriter {
             next_request_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1)),
             stream_credits: None,
             local_source_feedback: false,
+            local_source_recovery_probe: false,
             local_source_growth_hold: false,
             local_lossy_work: false,
             local_datagram_preparation: false,
@@ -229,6 +231,15 @@ impl SharedWriter {
 
     pub(crate) fn supports_local_source_feedback(&self) -> bool {
         self.local_source_feedback
+    }
+
+    fn with_local_source_recovery_probe(mut self, enabled: bool) -> Self {
+        self.local_source_recovery_probe = enabled;
+        self
+    }
+
+    pub(crate) fn supports_local_source_recovery_probe(&self) -> bool {
+        self.local_source_recovery_probe
     }
 
     pub(crate) fn with_local_source_growth_hold(mut self, enabled: bool) -> Self {
@@ -1129,6 +1140,7 @@ impl VeilClient {
             flags: veilcore::proto::ipc::IPC_CAP_STREAM_WRITE_CREDIT
                 | veilcore::proto::ipc::IPC_CAP_LOCAL_SOURCE_FEEDBACK
                 | veilcore::proto::ipc::IPC_CAP_LOCAL_SOURCE_GROWTH_HOLD
+                | veilcore::proto::ipc::IPC_CAP_LOCAL_SOURCE_RECOVERY_PROBE
                 | veilcore::proto::ipc::IPC_CAP_LOCAL_LOSSY_WORK
                 | veilcore::proto::ipc::IPC_CAP_LOCAL_DATAGRAM_PREPARATION,
         };
@@ -1185,6 +1197,9 @@ impl VeilClient {
             )
             .with_local_source_feedback(
                 hdr.flags & veilcore::proto::ipc::IPC_HELLO_OK_LOCAL_SOURCE_FEEDBACK != 0,
+            )
+            .with_local_source_recovery_probe(
+                hdr.flags & veilcore::proto::ipc::IPC_HELLO_OK_LOCAL_SOURCE_RECOVERY_PROBE != 0,
             )
             .with_local_source_growth_hold(
                 hdr.flags & veilcore::proto::ipc::IPC_HELLO_OK_LOCAL_SOURCE_GROWTH_HOLD != 0,

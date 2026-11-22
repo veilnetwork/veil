@@ -1499,6 +1499,44 @@ pub unsafe extern "C" fn veil_app_report_local_source_pressure(
         }
         return VEIL_ERR_INVALID_ARG;
     }
+    use veil_proto::ipc::LocalSourceFeedbackKind;
+    let kind = if pressured == 1 {
+        LocalSourceFeedbackKind::Pressured
+    } else {
+        LocalSourceFeedbackKind::Healthy
+    };
+    unsafe { report_local_source_feedback(app, kind, sampled_at_unix_ms, err_out) }
+}
+
+/// Submit a fresh observation of a stable audio reserve for a bounded
+/// local lossy probe. Return 0 if queued or 1 if unsupported or expired.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn veil_app_report_local_source_recovery_probe(
+    app: *mut VeilApp,
+    sampled_at_unix_ms: u64,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if let Err(rc) = unsafe {
+        guard::ffi_prelude(err_out, "veil_app_report_local_source_recovery_probe")
+    } {
+        return rc;
+    }
+    unsafe {
+        report_local_source_feedback(
+            app,
+            veil_proto::ipc::LocalSourceFeedbackKind::RecoveryProbe,
+            sampled_at_unix_ms,
+            err_out,
+        )
+    }
+}
+
+unsafe fn report_local_source_feedback(
+    app: *mut VeilApp,
+    kind: veil_proto::ipc::LocalSourceFeedbackKind,
+    sampled_at_unix_ms: u64,
+    err_out: *mut *mut c_char,
+) -> c_int {
     null_check!(err_out, "app" => app);
     get_or_return!(
         app_ref,
@@ -1516,7 +1554,7 @@ pub unsafe extern "C" fn veil_app_report_local_source_pressure(
                 let Some(sender) = guard.as_ref() else {
                     return Err(ClientError::Protocol("app already closed".into()));
                 };
-                sender.report_local_source_pressure(pressured == 1, sampled_at_unix_ms)
+                sender.report_local_source_feedback(kind, sampled_at_unix_ms)
             };
             // A full feedback queue must not retain the primary sender lock.
             report.await

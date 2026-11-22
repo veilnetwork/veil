@@ -1117,11 +1117,24 @@ void _sendRealtimeWorker(int appAddr, Uint8List dstNodeId, Uint8List dstAppId,
 }
 
 bool _reportLocalSourcePressureWorker(
-    int appAddr, bool pressured, int sampledAtMs, int? growthHoldStartedAtMs) {
+    int appAddr, bool pressured, int sampledAtMs, int? growthHoldStartedAtMs,
+    bool recoveryProbe) {
   final report = ffi.veilAppReportLocalSourcePressure;
   if (report == null) return false;
   final errOut = calloc<Pointer<Utf8>>();
   try {
+    if (!pressured && recoveryProbe) {
+      final probe = ffi.veilAppReportLocalSourceRecoveryProbe;
+      if (probe == null) return false;
+      final rc =
+          probe(Pointer<ffi.VeilApp>.fromAddress(appAddr), sampledAtMs, errOut);
+      if (rc < 0) {
+        throw VeilException(
+            'local source recovery probe failed: ${_readErrAndFree(errOut)}',
+            code: rc);
+      }
+      return rc == ffi.veilOk;
+    }
     final hold = ffi.veilAppHoldLocalSourceGrowth;
     if (!pressured && growthHoldStartedAtMs != null && hold != null) {
       final rc = hold(Pointer<ffi.VeilApp>.fromAddress(appAddr), sampledAtMs,
@@ -2707,19 +2720,22 @@ class AppHandle implements Finalizable {
   /// Configured local endpoint id.
   int get endpointId => _endpointId;
 
-  /// Submit a fresh measurement to this host's producer admission. False means
+  /// Submit a fresh measurement to this host's producer admission.
+  /// [recoveryProbe] permits a limited lossy trial while growth stays held.
+  /// False means
   /// unsupported or expired; true means queued, not acknowledged by the daemon.
   Future<bool> reportLocalSourcePressure({
     required bool pressured,
     required DateTime sampledAt,
     DateTime? growthHoldStartedAt,
+    bool recoveryProbe = false,
   }) async {
     _ensureOpen();
     final appAddr = _app.address;
     final sampledAtMs = sampledAt.millisecondsSinceEpoch;
     final heldAtMs = growthHoldStartedAt?.millisecondsSinceEpoch;
     return Isolate.run(() => _reportLocalSourcePressureWorker(
-        appAddr, pressured, sampledAtMs, heldAtMs));
+        appAddr, pressured, sampledAtMs, heldAtMs, recoveryProbe));
   }
 
   /// Send a datagram to a remote peer.

@@ -62,6 +62,8 @@ struct State {
     healthy_until: Option<Instant>,
     pressure_until: Option<Instant>,
     transport_warning_at: Option<Instant>,
+    recovery_probe_at: Option<Instant>,
+    recovery_probe_not_before: Option<Instant>,
     growth_hold_until: Option<Instant>,
     // Retain, never enlarge, an already-permitted allowance through the
     // validated health sample's TTL, independently of the growth hold's end.
@@ -193,8 +195,16 @@ impl State {
             .map(|(_, limit)| limit)
     }
 
-    fn healthy_secondary_probe(&self, now: Instant) -> Option<u64> {
-        let limit = self.secondary_trial_limit(now)?;
+    fn secondary_probe_credit(&self, now: Instant) -> Option<u64> {
+        let limit = self.secondary_trial_limit(now).or_else(|| {
+            // A stable but still recovering receiver can afford a single
+            // shared trial. The ordinary first-hop controller and existing
+            // flight still apply. An actual pressure lease always wins.
+            self.recovery_probe_at
+                .filter(|at| now >= *at && now < *at + PRESSURE_GRACE)
+                .filter(|_| self.pressure_until.is_none_or(|until| now >= until))
+                .map(|_| u64::from(self.rows.values().map(|r| r.mtu).max().unwrap_or(1200)))
+        })?;
         let charged = self
             .rows
             .values()
@@ -229,6 +239,7 @@ impl SourceFlightPool {
                 s.healthy_until = None;
                 s.growth_hold_until = None;
                 s.held_secondary_trial = None;
+                s.recovery_probe_at = None;
                 for row in s.rows.values_mut() {
                     row.blocked_window = None;
                 }
@@ -246,6 +257,9 @@ impl SourceFlightPool {
             let mut s = lock!(self.0);
             if pressured {
                 s.pressure_until = s.pressure_until.max(Some(now + PRESSURE_GRACE));
+                if s.recovery_probe_at.is_some_and(|sampled| sampled <= now) {
+                    s.recovery_probe_at = None;
+                }
                 s.reduce_after_pressure(now);
             } else if s.transport_warning_at.is_none_or(|at| now > at) {
                 // A newer consumer sample can supersede a first-hop estimate.
@@ -254,6 +268,27 @@ impl SourceFlightPool {
                 s.transport_warning_at = None;
                 s.healthy_until = s.healthy_until.max(Some(now + IDLE_GRACE));
             }
+            s.wakers()
+        };
+        wake(wakers);
+    }
+
+    /// Reserve confirmation is not permission to grow or signal healthy DATA.
+    /// Only the dedicated lossy children can use this smaller shared probe.
+    pub(crate) fn recovery_probe(&self, sampled_at: Instant, received_at: Instant) {
+        if sampled_at > received_at || received_at >= sampled_at + PRESSURE_GRACE {
+            return;
+        }
+        let wakers = {
+            let mut s = lock!(self.0);
+            if !s.active(received_at)
+                || s.recovery_probe_not_before.is_some_and(|at| sampled_at <= at)
+                || s.pressure_until.is_some_and(|at| sampled_at + PRESSURE_GRACE <= at)
+                || s.recovery_probe_at.is_some_and(|at| sampled_at <= at)
+            {
+                return;
+            }
+            s.recovery_probe_at = Some(sampled_at);
             s.wakers()
         };
         wake(wakers);
@@ -519,7 +554,7 @@ impl LocalSendBudget for Binding {
         let mut available = limit.saturating_sub(s.total());
         if role == Role::Secondary {
             available = available.saturating_sub(s.reserve(now));
-            if let Some(probe) = s.healthy_secondary_probe(now) {
+            if let Some(probe) = s.secondary_probe_credit(now) {
                 available = available.max(probe);
             }
         } else if role == Role::Control {
@@ -550,7 +585,7 @@ impl LocalSendBudget for Binding {
                 self.id,
                 s.total(),
                 s.reserve(now),
-                s.healthy_secondary_probe(now).unwrap_or(0),
+                s.secondary_probe_credit(now).unwrap_or(0),
                 s.healthy_until.is_some_and(|t| now < t),
                 s.pressure_deadline().is_some_and(|t| now < t),
                 s.growth_hold_until.is_some_and(|t| now < t)
@@ -692,6 +727,8 @@ impl LocalSendBudget for Binding {
             s.healthy_until = None;
             s.growth_hold_until = None;
             s.held_secondary_trial = None;
+            s.recovery_probe_at = None;
+            s.recovery_probe_not_before = Some(Instant::now());
             s.last_growth = None;
             for row in s.rows.values_mut() {
                 row.blocked_window = None;
@@ -711,9 +748,19 @@ impl LocalSendBudget for Binding {
             .filter(|row| row.role == Role::Secondary && row.source_coupled)
             .and_then(|_| s.pressure_deadline().max(s.growth_hold_until))
             .filter(|until| s.healthy_until.is_some_and(|healthy| *until < healthy));
+        let recovery_resume = s
+            .rows
+            .get(&self.id)
+            .filter(|row| row.role == Role::Secondary && row.source_coupled)
+            .and_then(|_| s.pressure_until)
+            .filter(|until| {
+                s.recovery_probe_at
+                    .is_some_and(|at| *until < at + PRESSURE_GRACE)
+            });
         s.active_until
             .into_iter()
             .chain(secondary_resume)
+            .chain(recovery_resume)
             .chain(s.rows.values().filter_map(|r| r.closed_until))
             .filter(|at| *at > now)
             .min()
@@ -750,6 +797,50 @@ mod tests {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn measured_reserve_can_probe_without_renewing_transport_growth() {
+        let now = Instant::now();
+        let pool = Arc::new(SourceFlightPool::default());
+        let control = pool.binding(1, Role::Control, now).unwrap();
+        let primary = pool.binding(2, Role::Primary, now).unwrap();
+        let camera = pool.binding(3, Role::Secondary, now).unwrap();
+        let screen = pool.binding(4, Role::Secondary, now).unwrap();
+        control.update_flight(100_000);
+        pool.note_primary(now);
+        pool.feedback(true, now);
+        let sample = now + Duration::from_millis(500);
+        let resume = now + PRESSURE_GRACE;
+        assert!(pool.transport_pressure(sample));
+        assert_eq!(camera.window(resume, 0, 1200), 1);
+        pool.recovery_probe(sample, sample);
+        assert_eq!(camera.window(sample, 0, 1200), 1);
+        assert_eq!(camera.next_wakeup(sample), Some(resume));
+        assert_eq!(camera.window(resume, 0, 1200), 1201);
+        assert_eq!(primary.window(resume, 0, 1200), u64::MAX);
+        camera.update_flight(850);
+        assert_eq!(screen.window(resume, 0, 1200), 351);
+        camera.blocked(resume);
+        camera.delivered(resume, sample, 5000, Duration::from_millis(300));
+        assert_eq!(lock!(pool.0).delivered_credit, 0);
+        assert_eq!(screen.window(sample + PRESSURE_GRACE, 0, 1200), 1);
+        pool.feedback(true, resume);
+        pool.recovery_probe(sample, resume);
+        assert!(lock!(pool.0).recovery_probe_at.is_none());
+    }
+
+    #[test]
+    fn older_recovery_observation_cannot_cross_route_change() {
+        let sampled = Instant::now() - Duration::from_millis(50);
+        let pool = Arc::new(SourceFlightPool::default());
+        let video = pool.binding(1, Role::Secondary, sampled).unwrap();
+        pool.note_primary(sampled);
+        pool.recovery_probe(sampled, sampled);
+        assert!(lock!(pool.0).recovery_probe_at.is_some());
+        video.route_changed();
+        pool.recovery_probe(sampled, Instant::now());
+        assert!(lock!(pool.0).recovery_probe_at.is_none());
     }
 
     #[test]

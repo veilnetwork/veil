@@ -1151,6 +1151,16 @@ int veil_app_report_local_source_pressure(VeilApp *app,
 ;
 
 /**
+ * Submit a fresh observation of a stable audio reserve for a bounded
+ * local lossy probe. Return 0 if queued or 1 if unsupported or expired.
+ */
+
+int veil_app_report_local_source_recovery_probe(VeilApp *app,
+                                                uint64_t sampled_at_unix_ms,
+                                                char **err_out)
+;
+
+/**
  * Keep current local DATA admission while pausing source growth. The current
  * measurement and original hold event are separate host timestamps. Repeated
  * observations cannot extend the original three-second hold. Never forwarded.
@@ -3941,9 +3951,9 @@ uint64_t veil_media_open_relay_channel_with_preparation(VeilApp *app,
 
 #if defined(VEIL_FFI_NODE_EMBEDDED)
 /**
- * Enqueue video-engine RTCP on the channel's independent local video source.
- * Screen sharing selects its independent source instead. This is endpoint
- * scheduling only: no media role or priority is added to relay framing.
+ * Enqueue video-engine RTCP. Small picture-loss requests use the independent
+ * feedback writer when installed. Other reports follow the camera or screen
+ * source. This scheduling choice is local to the endpoint.
  * Compound RTCP is validated; RTP and malformed control return -1. Admission
  * remains nonblocking (0 queued, 1 full/busy, -1 invalid/closed), with no
  * fallback into the audio queue when the selected source is full.
