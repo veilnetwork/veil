@@ -436,7 +436,14 @@ impl Connection {
     /// - a call was made to `handle_timeout`
     #[must_use]
     pub fn poll_timeout(&mut self) -> Option<Instant> {
-        self.timers.next_timeout()
+        let transport = self.timers.next_timeout();
+        if self.state.is_closed() {
+            return transport;
+        }
+        transport
+            .into_iter()
+            .chain(self.datagrams.next_expiry())
+            .min()
     }
 
     /// Returns application-facing events
@@ -1340,6 +1347,9 @@ impl Connection {
     /// `Instant` that was output by `poll_timeout`; however spurious extra calls will simply
     /// no-op and therefore are safe.
     pub fn handle_timeout(&mut self, now: Instant) {
+        // Expiry releases queue capacity even while congestion prevents any
+        // transmissions and the peer has nothing to send us.
+        self.datagrams().expire(now);
         for &timer in &Timer::VALUES {
             if !self.timers.is_expired(timer, now) {
                 continue;

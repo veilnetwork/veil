@@ -235,6 +235,10 @@ impl AsRef<Datagram> for Datagram {
 }
 
 impl DatagramState {
+    pub(super) fn next_expiry(&self) -> Option<Instant> {
+        self.next_expiry.filter(|_| !self.outgoing.is_empty())
+    }
+
     pub(super) fn front_payload_len(&self) -> Option<usize> {
         self.outgoing.queue.front().map(|d| d.data.len())
     }

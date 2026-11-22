@@ -2853,6 +2853,36 @@ fn datagram_expiry_releases_capacity_and_unblocks_waiting_producers() {
 }
 
 #[test]
+fn datagram_expiry_wakes_a_blocked_producer_without_network_activity() {
+    let mut pair = Pair::default();
+    let mut config = client_config();
+    let mut transport = TransportConfig::default();
+    transport.datagram_send_buffer_size(100 + Datagrams::send_queue_charge(0));
+    config.transport_config(Arc::new(transport));
+    let (client_ch, _) = pair.connect_with(config);
+    let deadline = pair.time + Duration::from_millis(200);
+    let conn = pair.client_conn_mut(client_ch);
+    assert!(conn.poll_timeout().map_or(true, |at| at > deadline));
+    conn.datagrams()
+        .send_with_expiry(vec![1; 100].into(), false, deadline)
+        .unwrap();
+    assert_matches!(
+        conn.datagrams().send(b"next".as_slice().into(), false),
+        Err(SendDatagramError::Blocked(_))
+    );
+    assert_eq!(conn.poll_timeout(), Some(deadline));
+    // No ACK, new I/O, or transmit poll drives this expiry.
+    conn.handle_timeout(deadline);
+    assert_matches!(conn.poll(), Some(Event::DatagramsUnblocked));
+    assert_eq!(conn.datagrams().expired_outgoing(), 1);
+    assert_eq!(conn.datagrams().send_buffer_space(), 100);
+    assert!(conn.poll_timeout().map_or(true, |at| at > deadline));
+    conn.datagrams()
+        .send(b"next".as_slice().into(), false)
+        .unwrap();
+}
+
+#[test]
 fn datagram_recv_buffer_overflow() {
     let _guard = subscribe();
     const PAYLOAD_WINDOW: usize = 100;
