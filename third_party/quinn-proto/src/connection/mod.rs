@@ -779,7 +779,7 @@ impl Connection {
                         && buf.is_empty()
                     {
                         if let Some(size) = self
-                            .lone_timed_datagram_packet_size(pn)
+                            .timed_head_datagram_packet_size(pn)
                             .filter(|&size| size < next_datagram_limit)
                         {
                             next_datagram_limit = size;
@@ -4059,11 +4059,11 @@ impl Connection {
         )
     }
 
-    /// A single timed DATAGRAM can use a smaller packet when a full MTU
-    /// would have to wait for pacing credit. The builder is limited to the
-    /// same size. Due ACKs, other control frames and streams use normal sizing.
-    fn lone_timed_datagram_packet_size(&self, pn: u64) -> Option<usize> {
-        let size = self.datagrams.lone_timed_frame_size()?;
+    /// Size a packet for the timed FIFO head when a full MTU would wait for
+    /// pacing credit. The builder uses the same bound even with queued work
+    /// behind the head. Due ACKs, control frames and streams use normal sizing.
+    fn timed_head_datagram_packet_size(&self, pn: u64) -> Option<usize> {
+        let size = self.datagrams.timed_head_frame_size()?;
         let space = &self.spaces[SpaceId::Data];
         if !self.path.validated
             || self.path.challenge.is_some()

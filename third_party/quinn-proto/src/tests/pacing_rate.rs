@@ -67,6 +67,15 @@ fn controller_rate_reaches_the_real_encrypted_datagram_sender() {
 
 #[test]
 fn a_lone_timed_datagram_can_spend_less_than_a_full_mtu_of_pacing_credit() {
+    timed_head_can_spend_less_than_a_full_mtu_of_pacing_credit(false);
+}
+
+#[test]
+fn a_small_timed_head_can_use_pacing_credit_with_another_datagram_queued() {
+    timed_head_can_spend_less_than_a_full_mtu_of_pacing_credit(true);
+}
+
+fn timed_head_can_spend_less_than_a_full_mtu_of_pacing_credit(queue_both: bool) {
     let mut config = TransportConfig::default();
     config.congestion_controller_factory(Arc::new(RateFactory));
     config.enable_segmentation_offload(false);
@@ -99,6 +108,12 @@ fn a_lone_timed_datagram_can_spend_less_than_a_full_mtu_of_pacing_credit() {
             now,
         )
         .unwrap();
+    let next = Bytes::from(vec![3; 512]);
+    if queue_both {
+        conn.datagrams()
+            .send_with_expiry_at(next.clone(), false, now + Duration::from_millis(20), now)
+            .unwrap();
+    }
     let small = conn
         .poll_transmit(now, 1, &mut buf)
         .expect("remaining credit fits the timed packet");
@@ -106,14 +121,11 @@ fn a_lone_timed_datagram_can_spend_less_than_a_full_mtu_of_pacing_credit() {
     assert_eq!(conn.stats().frame_tx.datagram, before + 3);
     buf.clear();
 
-    conn.datagrams()
-        .send_with_expiry_at(
-            Bytes::from(vec![3; 512]),
-            false,
-            now + Duration::from_millis(20),
-            now,
-        )
-        .unwrap();
+    if !queue_both {
+        conn.datagrams()
+            .send_with_expiry_at(next, false, now + Duration::from_millis(20), now)
+            .unwrap();
+    }
     assert!(conn.poll_transmit(now, 1, &mut buf).is_none());
     let paced = conn.poll_timeout().unwrap();
     assert!(paced > now && paced < now + Duration::from_millis(20));
