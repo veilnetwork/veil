@@ -79,10 +79,14 @@ static std::vector<Packet> network(const std::vector<Packet>& encoded, int profi
     }
     // Reach the adaptive ceiling with real Opus and NetEq on a lossless path.
     if (profile == 6) p.at += rng()%551;
-    // Withhold the first 550 ms of each second, then deliver that entire
-    // burst in order. This still delivers every packet, including at onset.
-    if (profile == 7 && p.at >= 4000 && p.at % 1000 < 550)
-      p.at += 550 - p.at % 1000;
+    // Stall the source clock twice after adaptation, ahead of the next
+    // network holds. As in the relay capture, all packets still arrive and
+    // the brief source lag overlaps the 550-ms network jitter measurement.
+    if (profile == 8 && p.begin >= 10800) p.at += 50;
+    if (profile == 8 && p.begin >= 18800) p.at += 40;
+    if ((profile == 7 || profile == 8) && p.at >= 4000) {
+      p.at += std::max(0, 550 - p.at % 1000);
+    }
     result.push_back(std::move(p));
   }
   std::stable_sort(result.begin(),result.end(),[](auto& a, auto& b){return a.at<b.at;});
@@ -206,7 +210,13 @@ int main(int argc,char**argv) {
   }
   need(passed, "jitter reserve policy created extra played concealment on lossless traffic");
   need(strongest_jitter_target_ms == 500, "heavy jitter never reached the 500 ms adaptive ceiling");
-  const auto burst = network(encode(speech, 20), 7, 197);
+  const auto encoded = encode(speech, 20);
+  const auto burst = network(encoded, 7, 197);
+  const auto from_onset = run(burst, true);
+  std::printf("periodic 550-ms bursts from onset: concealed=%llu ms discarded=%llu ms\n",
+      (unsigned long long)from_onset.played_plc, (unsigned long long)from_onset.discarded);
+  need(from_onset.discarded == 0, "first bounded burst was trimmed before NetEq could adapt");
+  need(from_onset.played_plc <= 550, "first burst added concealment beyond the initial hold");
   const auto settled = run(burst, true, 10000);
   std::printf("periodic 550-ms bursts after setup: concealed=%llu ms discarded=%llu ms target=%d ms\n",
       (unsigned long long)settled.played_plc,
@@ -214,5 +224,12 @@ int main(int argc,char**argv) {
   need(settled.max_target >= 300 && settled.max_target <= 500, "burst did not exercise the adaptive reserve");
   need(settled.discarded == 0, "steady arrival bursts triggered destructive catch-up");
   need(settled.played_plc == 0, "steady arrival bursts caused repeated played concealment");
+  const auto spikes = run(network(encoded, 8, 197), true, 10000);
+  std::printf("adapted 550-ms bursts with source delays: concealed=%llu ms discarded=%llu ms target=%d ms\n",
+      (unsigned long long)spikes.played_plc, (unsigned long long)spikes.discarded,
+      spikes.max_target);
+  need(spikes.max_target >= 300 && spikes.max_target <= 500, "source delays did not exercise the adaptive reserve");
+  need(spikes.discarded == 0, "source delays erased the established jitter reserve");
+  need(spikes.played_plc <= 90, "source delays added concealment beyond the introduced gaps");
   std::puts("PASS lossless jitter/reorder speech reserve across 20/40/60-ms Opus");
 }

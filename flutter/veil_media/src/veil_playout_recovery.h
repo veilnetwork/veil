@@ -253,18 +253,19 @@ class RecoveringNetEq final : public webrtc::NetEq {
   int JitterReserveMs(int64_t now_us) const {
     const int target = std::clamp(inner_->TargetDelayMs(), 0, kMaximumAdaptiveTargetMs);
     const int headroom_ms = 2 * frame_headroom_ms_;
-    if (target + headroom_ms <= NominalRecoveryBudgetMs())
-      return target + headroom_ms;
-    // NetEq pursues a target below some recurring arrival gaps. An aggressive
-    // catch-up after each burst can discard the very speech needed before the
-    // next one. Bound suppression of extra pulls by recent packet evidence
-    // and by the configured target ceiling plus one encoded packet. NetEq's
-    // own target, packet limit and time stretching remain independent.
+    const int target_reserve_ms = target + headroom_ms;
+    // A late batch can already contain the speech needed to bridge the next
+    // arrival gap while NetEq still reports the old target. When the target
+    // is low, use that evidence only for a gap that fits the reserve. When
+    // NetEq is already using a large reserve, cap the extra headroom instead
+    // of dropping it abruptly on an even later arrival.
     const int ceiling_ms = applied_target_ceiling_ms_ > 0
         ? applied_target_ceiling_ms_ : kMaximumAdaptiveTargetMs;
-    const int recent_ms = std::min(rtp_lag_.RecentArrivalVariationMs(now_us),
-                                   ceiling_ms + frame_headroom_ms_);
-    return std::max(target, recent_ms) + headroom_ms;
+    const int max_reserve_ms = ceiling_ms + frame_headroom_ms_ + headroom_ms;
+    const int recent_ms = rtp_lag_.RecentArrivalVariationMs(now_us);
+    if (target_reserve_ms <= NominalRecoveryBudgetMs() && recent_ms > max_reserve_ms)
+      return target_reserve_ms;
+    return std::max(target_reserve_ms, std::min(recent_ms + headroom_ms, max_reserve_ms));
   }
   int NominalRecoveryBudgetMs() const {
     return std::clamp(80 + 2 * frame_headroom_ms_, 120, 200);
