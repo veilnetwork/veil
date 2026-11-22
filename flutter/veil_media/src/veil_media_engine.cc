@@ -4068,6 +4068,13 @@ int veil_media_engine_start_camera(VeilMediaEngine* engine, int width,
 int veil_media_engine_start_camera_device(VeilMediaEngine* engine,
                                           const char* device_id, int width,
                                           int height, int fps) {
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+  // In this stand the moving I420 source in start_video owns all frames.
+  if (const char* synthetic = std::getenv("XVEIL_E2E_SYNTHETIC_MEDIA");
+      synthetic && std::strcmp(synthetic, "1") == 0 && engine &&
+          std::getenv("VEIL_MEDIA_TEST_VIDEO") != nullptr)
+    return VEIL_MEDIA_OK;
+#endif
   if (engine == nullptr) return VEIL_MEDIA_ERR_ARG;
 #if defined(VEIL_MEDIA_HAVE_WEBRTC) && \
     (defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__)) || \

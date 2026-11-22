@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -448,6 +449,39 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
 
   // Rebuild engine run-state to match recording_/playing_. Runs on engine_queue_.
   void ReconfigureLocked() {
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+    // The process stand exercises the real codec and transport without
+    // opening a microphone or speaker. Only test-hook builds honour this.
+    if (const char* synthetic = std::getenv("XVEIL_E2E_SYNTHETIC_MEDIA");
+        synthetic && std::strcmp(synthetic, "1") == 0) {
+      if (!recording_.load() && !playing_.load()) {
+        StopStandToneLocked();
+        return;
+      }
+      if (stand_tone_ == nil) {
+        stand_tone_ = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                             engine_queue_);
+        dispatch_source_set_timer(stand_tone_, DISPATCH_TIME_NOW,
+                                  10 * NSEC_PER_MSEC, 1 * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(stand_tone_, ^{
+          int16_t pcm[480] = {};
+          if (recording_.load() && rec_fine_) {
+            for (int i = 0; i < 480; ++i)
+              pcm[i] = static_cast<int16_t>(7000 * std::sin(
+                  6.283185307179586 * 440 * (stand_samples_ + i) / 48000.0));
+            stand_samples_ += 480;
+            rec_fine_->DeliverRecordedData(std::span<const int16_t>(pcm), 0);
+            captured_frames_.fetch_add(480);
+          }
+          if (playing_.load() && play_fine_) {
+            play_fine_->GetPlayoutData(std::span<int16_t>(pcm), 0);
+          }
+        });
+        dispatch_resume(stand_tone_);
+      }
+      return;
+    }
+#endif
     EnsureEngineLocked();
     if (engine_ == nil) return;
     if (engine_.isRunning) [engine_ stop];
@@ -922,7 +956,20 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
     return noErr;
   }
 
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+  void StopStandToneLocked() {
+    if (stand_tone_ != nil) {
+      dispatch_source_set_event_handler(stand_tone_, nil);
+      dispatch_source_cancel(stand_tone_);
+      stand_tone_ = nil;
+    }
+  }
+#endif
+
   void TeardownEngineLocked() {
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+    StopStandToneLocked();
+#endif
     CancelMicAuthorizationTimerLocked();
     RemoveConfigurationObserverLocked();
     if (engine_ == nil) return;
@@ -971,6 +1018,10 @@ class VeilAvfAdm : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
   std::atomic<uint64_t> play_count_{0};
 #endif
 
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+  dispatch_source_t stand_tone_ = nil;
+  int64_t stand_samples_ = 0;
+#endif
   dispatch_queue_t engine_queue_ = nil;
   dispatch_source_t mic_auth_timer_ = nil;
   id configuration_observer_ = nil;
