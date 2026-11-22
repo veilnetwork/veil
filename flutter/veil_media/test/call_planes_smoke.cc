@@ -696,6 +696,7 @@ int main(int argc, char** argv) {
     report(160, 2, audio, 1, 0);  // 1/256 rounds below one percent
     const auto first = wait_stat("audio_loss_report_us", 0);
     assert(stat(e.get(), "audio_loss_report_fraction") == 1);
+    assert(stat(e.get(), "audio_previous_loss_report_us") == 0);
     assert(stat(e.get(), "tx_loss_pct") == 0);
     assert(stat(e.get(), "video_loss_report_us") == 0);
     for (int i = 0; i < 4; ++i) assert(stat(e.get(), "audio_loss_report_us") == first);
@@ -709,6 +710,7 @@ int main(int argc, char** argv) {
     assert(stat(e.get(), "video_feedback_loss_pct") == 0);
     inject_raw(160, report_packet(2, audio, 1, 0, true));
     const auto second = wait_stat("audio_loss_report_us", first);
+    assert(stat(e.get(), "audio_previous_loss_report_us") == first);
     assert(stat(e.get(), "video_loss_report_us") == video_loss);
 
     auto compound = report_packet(2, audio, 51, 0);  // Just under 20%.
@@ -718,14 +720,17 @@ int main(int argc, char** argv) {
     compound.insert(compound.end(), healthy.begin(), healthy.end());
     inject_raw(160, compound);
     const auto third = wait_stat("audio_loss_report_us", second);
+    assert(stat(e.get(), "audio_previous_loss_report_us") == second);
     assert(stat(e.get(), "tx_loss_pct") == 0);
     assert(stat(e.get(), "audio_loss_report_fraction") == 51);
     report(160, 2, audio, 0, 0);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     assert(stat(e.get(), "audio_loss_report_us") == third);
+    assert(stat(e.get(), "audio_previous_loss_report_us") == second);
     assert(stat(e.get(), "audio_loss_report_fraction") == 51);
     report(160, 2, audio, 2, 0);
     wait_stat("audio_loss_report_us", third);
+    assert(stat(e.get(), "audio_previous_loss_report_us") == third);
     assert(stat(e.get(), "audio_loss_report_fraction") == 2);
 
     std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> room(
@@ -755,6 +760,7 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_until(expiry);
     assert(stat(e.get(), "audio_loss_report_us") == 0);
     assert(stat(e.get(), "audio_loss_report_fraction") == 0);
+    assert(stat(e.get(), "audio_previous_loss_report_us") == 0);
     assert(stat(e.get(), "video_loss_report_us") == 0);
     assert(group_stat(room.get(), "audio_loss_report_us") == 0);
     assert(stat(e.get(), "audio_feedback_reports") == 1);

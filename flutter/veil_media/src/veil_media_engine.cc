@@ -4989,6 +4989,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
       }
       const auto audio_loss_report_us = audio_report.fresh_loss_report_us(loss_now_us);
       snapshot += ",\"audio_loss_report_us\":" + std::to_string(audio_loss_report_us);
+      snapshot += ",\"audio_previous_loss_report_us\":" +
+          std::to_string(audio_loss_report_us > 0 ? audio_report.previous_loss_report_us : 0);
       snapshot += ",\"audio_loss_report_fraction\":" +
           std::to_string(audio_loss_report_us > 0 ? audio_report.loss_report_fraction : 0);
       snapshot += ",\"audio_rtt_route_epoch\":" + std::to_string(audio_report.route_epoch);

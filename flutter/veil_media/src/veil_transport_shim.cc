@@ -846,7 +846,11 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
         candidate.arrived_us >= audio_feedback_.arrived_us) {
       candidate.route_epoch = rtcp_route_clock_.epoch();
       if (!rtcp_route_clock_.Accepts(candidate.last_sender_report)) candidate.rtt_ms = 0;
+      // Keep the last two distinct loss reports so slow stats polls do not
+      // mistake a burst for one event. A compound packet has one arrival time.
+      candidate.previous_loss_report_us = audio_feedback_.loss_report_us;
       if (candidate.loss_report_us <= audio_feedback_.loss_report_us) {
+        candidate.previous_loss_report_us = audio_feedback_.previous_loss_report_us;
         candidate.loss_report_fraction = std::max(
             candidate.loss_report_fraction, audio_feedback_.loss_report_fraction);
         candidate.loss_report_us = audio_feedback_.loss_report_us;

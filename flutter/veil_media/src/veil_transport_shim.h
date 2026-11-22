@@ -73,6 +73,7 @@ struct RtcpFeedbackSnapshot {
   // Local arrival time of the last nonzero fractional-loss report. Healthy
   // reports must not renew it, including reports from another room peer.
   int64_t loss_report_us = 0;
+  int64_t previous_loss_report_us = 0;
   int loss_report_fraction = 0;  // Exact RTCP fraction (units of 1/256).
   int32_t cumulative_lost = 0;
   uint32_t highest_sequence = 0;

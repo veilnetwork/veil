@@ -85,27 +85,32 @@ int main() {
     block.SetJitter(4800);
     rr.AddReportBlock(block);
     const auto loss = rr.Build();
-    const auto entered_us = webrtc::TimeMicros() - 2;
+    const auto entered_us = webrtc::TimeMicros() - 3;
     AudioRecoveryFeedbackTest::Observe(path, loss, entered_us);
     require(path.audio_feedback().loss_report_us == entered_us,
             "old path did not register the lossy report");
+    AudioRecoveryFeedbackTest::Observe(path, loss, entered_us + 1);
     require(path.RebindChannel(196, false) && !path.RebindChannel(0, false),
             "idempotent or invalid rebind changed route");
-    require(path.audio_feedback().loss_report_us == entered_us,
-            "unchanged route discarded existing audio loss");
+    const auto unchanged = path.audio_feedback();
+    require(unchanged.loss_report_us == entered_us + 1 &&
+                unchanged.previous_loss_report_us == entered_us,
+            "unchanged route discarded the audio loss pair");
     require(path.RebindChannel(197, true), "route rebind failed");
     const auto reset = path.audio_feedback();
     require(reset.route_epoch == 1 && reset.arrived_us == 0 &&
-                reset.loss_report_us == 0 && reset.loss_report_fraction == 0 &&
+                reset.loss_report_us == 0 && reset.previous_loss_report_us == 0 &&
+                reset.loss_report_fraction == 0 &&
                 reset.loss_pct == 0 && reset.jitter_ms == 0,
             "old path audio loss and jitter survived handover");
-    AudioRecoveryFeedbackTest::Observe(path, loss, entered_us + 1);
+    AudioRecoveryFeedbackTest::Observe(path, loss, entered_us + 2);
     require(path.audio_feedback().arrived_us == 0,
             "queued pre-handover report repopulated audio loss on the new path");
     const auto received_us = webrtc::TimeMicros() + 1;
     AudioRecoveryFeedbackTest::Observe(path, loss, received_us);
     const auto current = path.audio_feedback();
     require(current.route_epoch == 1 && current.loss_report_us == received_us &&
+                current.previous_loss_report_us == 0 &&
                 current.loss_report_fraction == 51 && current.jitter_ms == 100,
             "fresh loss on the new path was not measured");
     path.Stop();
