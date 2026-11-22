@@ -2615,6 +2615,47 @@ fn small_datagram_uses_residual_congestion_window_before_expiry() {
 }
 
 #[test]
+fn timed_datagram_survives_when_congestion_credit_returns_before_its_deadline() {
+    for (expiry_ms, delivered) in [(200, false), (450, true)] {
+        let (mut pair, client, server, controller) = residual_window_pair(false);
+        let now = pair.time;
+        let frame = Bytes::from(vec![3; 1_000]);
+        pair.client_datagrams(client)
+            .send_with_expiry(frame.clone(), false, now + Duration::from_millis(expiry_ms))
+            .unwrap();
+        assert!(pair
+            .client_conn_mut(client)
+            .poll_transmit(now, 1, &mut Vec::new())
+            .is_none());
+
+        // The first two packets remain in flight while the complete frame
+        // waits. Return send credit after the short deadline and before the
+        // long deadline, without sleeping or depending on an operating system.
+        pair.time = now + Duration::from_millis(300);
+        controller
+            .window
+            .store(12_000, std::sync::atomic::Ordering::Relaxed);
+        pair.drive();
+
+        for fill in [1u8, 2] {
+            assert_eq!(
+                pair.server_datagrams(server).recv().unwrap(),
+                vec![fill; 1_000]
+            );
+        }
+        assert_eq!(
+            pair.server_datagrams(server).recv(),
+            delivered.then_some(frame)
+        );
+        assert_eq!(pair.server_datagrams(server).recv(), None);
+        assert_eq!(
+            pair.client_datagrams(client).expired_outgoing(),
+            u64::from(!delivered)
+        );
+    }
+}
+
+#[test]
 fn due_ack_when_controller_window_is_full() {
     let (mut pair, client, server, controller) = residual_window_pair(false);
     let before = pair.client_conn_mut(client).stats();
@@ -2661,6 +2702,78 @@ fn due_ack_when_controller_window_is_full() {
         !controller.sent.lock().unwrap().is_empty(),
         "the resumed data transmission still supplies a congestion sample"
     );
+}
+
+#[test]
+fn due_ack_can_outgrow_residual_congestion_credit() {
+    let (mut pair, client, server, controller) = residual_window_pair(false);
+    let before = pair.client_conn_mut(client).stats();
+    let flight = before.path.in_flight_bytes;
+    let residual = 112;
+    controller
+        .window
+        .store(flight + residual + 1, std::sync::atomic::Ordering::Relaxed);
+    pair.client_datagrams(client)
+        .send(vec![3; 1_000].into(), false)
+        .unwrap();
+
+    // Feed a single observation containing many disjoint ACK ranges. Keep
+    // the client's outstanding packets on our side of the link until then.
+    let server_addr = pair.server.addr;
+    for n in 0..128 {
+        pair.time += Duration::from_millis(1);
+        let now = pair.time;
+        let mut buf = Vec::new();
+        let conn = pair.server_conn_mut(server);
+        conn.ping();
+        let tx = conn.poll_transmit(now, 1, &mut buf).unwrap();
+        if n % 2 == 0 {
+            let event = pair.client.endpoint.handle(
+                now,
+                server_addr,
+                None,
+                tx.ecn,
+                BytesMut::from(&buf[..]),
+                &mut Vec::new(),
+            );
+            let Some(DatagramEvent::ConnectionEvent(handle, event)) = event else {
+                panic!("established peer packet must be delivered");
+            };
+            assert_eq!(handle, client);
+            pair.client_conn_mut(client).handle_event(event);
+        }
+    }
+    controller.sent.lock().unwrap().clear();
+    let now = pair.time;
+    let mut ack_packet = Vec::new();
+    let tx = pair
+        .client_conn_mut(client)
+        .poll_transmit(now, 1, &mut ack_packet)
+        .unwrap();
+    let after = pair.client_conn_mut(client).stats();
+    assert_eq!(after.frame_tx.acks, before.frame_tx.acks + 1);
+    assert!(tx.size as u64 > residual);
+    assert_eq!(after.frame_tx.datagram, before.frame_tx.datagram);
+    assert_eq!(after.path.in_flight_bytes, flight);
+    assert!(controller.sent.lock().unwrap().is_empty());
+
+    let peer_before = pair.server_conn_mut(server).stats();
+    let event = pair.server.endpoint.handle(
+        now,
+        pair.client.addr,
+        None,
+        tx.ecn,
+        BytesMut::from(&ack_packet[..]),
+        &mut Vec::new(),
+    );
+    let Some(DatagramEvent::ConnectionEvent(handle, event)) = event else {
+        panic!("established peer must receive the ACK");
+    };
+    assert_eq!(handle, server);
+    pair.server_conn_mut(server).handle_event(event);
+    let peer_after = pair.server_conn_mut(server).stats();
+    assert_eq!(peer_after.frame_rx.acks, peer_before.frame_rx.acks + 1);
+    assert!(peer_after.path.in_flight_bytes < peer_before.path.in_flight_bytes);
 }
 
 #[test]

@@ -747,12 +747,17 @@ impl Connection {
                                 || self.spaces[space_id].immediate_ack_pending
                                 || bypass_datagram_head
                                 || self.can_send_1rtt(frame_space);
+                            // If only an ACK fits this decision, give it the
+                            // full packet space. A disjoint ACK range can
+                            // exceed the residual flight credit even though
+                            // the ACK itself does not consume that credit.
+                            ack_only = may_send_ack_only && !ack_eliciting;
                         }
                     }
 
                     let bytes_to_send = next_datagram_limit as u64 + untracked_bytes;
                     let local_window = self.local_congestion_window(now);
-                    if self.path.in_flight.bytes + bytes_to_send >= local_window {
+                    if !ack_only && self.path.in_flight.bytes + bytes_to_send >= local_window {
                         self.block_local_budget(now);
                         congestion_blocked = true;
                         if space_id == SpaceId::Data {
