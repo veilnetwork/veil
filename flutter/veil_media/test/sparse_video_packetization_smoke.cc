@@ -188,11 +188,18 @@ int main() {
   assert(veil_media_engine_set_video_send_paused(e, 1) == 0);
   drive(30, true); // Drain a frame already handed to the asynchronous encoder.
   const auto paused = metric(e, "video_tx_frames");
+  const auto paused_audio = metric(receiver.get(), "audio_rx_pkts");
   drive(150, true);
   assert(metric(e, "video_tx_frames") == paused);
+  assert(metric(receiver.get(), "audio_rx_pkts") > paused_audio);
+  const auto before_resume = metric(receiver.get(), "video_rx_deliver_frames");
   assert(veil_media_engine_set_video_send_paused(e, 0) == 0);
   drive(300, true);
   assert(metric(e, "video_tx_frames") >= paused + 2);
+  const auto after_resume = metric(receiver.get(), "video_rx_deliver_frames");
+  assert(after_resume >= before_resume + 2);
+  std::printf("decoded after the audio protection pause: %llu frames\n",
+              static_cast<unsigned long long>(after_resume - before_resume));
   assert(veil_media_engine_set_video_budget(e, 30, 3) == 0);
   drive(30, true);
   const auto higher = metric(e, "video_tx_frames");
