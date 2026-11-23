@@ -1,5 +1,6 @@
 #undef NDEBUG
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstdio>
 #include <map>
@@ -27,9 +28,10 @@ class Sender final : public webrtc::PacingController::PacketSender {
  public:
   explicit Sender(webrtc::SimulatedClock& clock) : clock_(clock) {}
   void SendPacket(std::unique_ptr<webrtc::RtpPacketToSend> packet,
-                  const webrtc::PacedPacketInfo&) override {
+                  const webrtc::PacedPacketInfo& info) override {
     bytes_at_ms[clock_.TimeInMilliseconds() - 1000] += packet->size();
     sequences.push_back(packet->SequenceNumber());
+    probe_ids.push_back(info.probe_cluster_id);
     const auto sequence = packet->SequenceNumber();
     assert(std::all_of(packet->payload().begin(), packet->payload().end(),
         [&](uint8_t value) { return value == uint8_t(sequence % 251); }));
@@ -38,13 +40,65 @@ class Sender final : public webrtc::PacingController::PacketSender {
   std::vector<std::unique_ptr<webrtc::RtpPacketToSend>> GeneratePadding(webrtc::DataSize) override { return {}; }
   std::map<int64_t, size_t> bytes_at_ms;
   std::vector<uint16_t> sequences;
+  std::vector<int> probe_ids;
  private:
   webrtc::SimulatedClock& clock_;
 };
 
 
+void SendAudioBetweenProbeBursts() {
+  using namespace webrtc;
+  constexpr int kProbeId = 42;
+  SimulatedClock clock(1'000'000);
+  Sender sender(clock);
+  Trials trials("");
+  PacingController pacer(&clock, &sender, trials);
+  pacer.SetPacerConfig(PacerConfig::Create(clock.CurrentTime(),
+      DataRate::BitsPerSec(48'000), DataRate::Zero()));
+  ProbeClusterConfig cluster;
+  cluster.at_time = clock.CurrentTime();
+  cluster.target_data_rate = DataRate::BitsPerSec(24'000);
+  cluster.target_duration = TimeDelta::Millis(300);
+  cluster.min_probe_delta = TimeDelta::Millis(1);
+  cluster.target_probe_count = 3;
+  cluster.id = kProbeId;
+  const std::array clusters{cluster};
+  pacer.CreateProbeClusters(clusters);
+
+  const auto enqueue_audio = [&](uint16_t sequence, size_t size) {
+    auto packet = std::make_unique<RtpPacketToSend>(nullptr);
+    packet->set_packet_type(RtpPacketMediaType::kAudio);
+    packet->SetSsrc(11);
+    packet->SetSequenceNumber(sequence);
+    packet->set_capture_time(clock.CurrentTime());
+    std::fill_n(packet->AllocatePayload(size), size, uint8_t(sequence % 251));
+    pacer.EnqueuePacket(std::move(packet));
+  };
+  enqueue_audio(0, 240);
+  pacer.ProcessPackets();
+  assert(sender.sequences == std::vector<uint16_t>{0});
+  assert(sender.probe_ids == std::vector<int>{kProbeId});
+  const Timestamp next_probe = pacer.NextSendTime();
+  assert(next_probe - clock.CurrentTime() >= TimeDelta::Millis(80));
+
+  clock.AdvanceTimeMilliseconds(10);
+  enqueue_audio(1, 80);
+  assert(pacer.NextSendTime() <= clock.CurrentTime());
+  pacer.ProcessPackets();
+  assert((sender.sequences == std::vector<uint16_t>{0, 1}));
+  assert(sender.probe_ids.back() == PacedPacketInfo::kNotAProbe);
+  assert(pacer.NextSendTime() == next_probe);
+
+  clock.AdvanceTimeMicroseconds((next_probe - clock.CurrentTime()).us());
+  enqueue_audio(2, 120);
+  pacer.ProcessPackets();
+  assert((sender.sequences == std::vector<uint16_t>{0, 1, 2}));
+  assert(sender.probe_ids.back() == kProbeId);
+}
+
 struct Case { const char* name; int before; int after; int initial; int queued; bool audio; bool account; };
 int main() {
+  SendAudioBetweenProbeBursts();
   bool bounded = true;
   for (const auto& c : std::vector<Case>{
       {"steady",900000,900000,14,0,false,false},

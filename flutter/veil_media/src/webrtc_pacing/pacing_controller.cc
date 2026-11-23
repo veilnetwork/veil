@@ -333,10 +333,15 @@ Timestamp PacingController::NextSendTime() const {
     return last_send_time_ + kPausedProcessInterval;
   }
 
-  // If probing is active, that always takes priority.
   if (prober_.is_probing() && !probing_send_failure_) {
-    Timestamp probe_time = prober_.NextProbeTime(now);
+    const Timestamp probe_time = prober_.NextProbeTime(now);
     if (!probe_time.IsPlusInfinity()) {
+      // Unpaced audio must keep flowing between the scheduled probe bursts.
+      if (!pace_audio_ && probe_time > now + kMaxEarlyProbeProcessing) {
+        const Timestamp audio_time =
+            packet_queue_.LeadingPacketEnqueueTime(RtpPacketMediaType::kAudio);
+        if (audio_time.IsFinite()) return audio_time;
+      }
       return probe_time.IsMinusInfinity() ? now : probe_time;
     }
   }
@@ -443,6 +448,14 @@ void PacingController::ProcessPackets() {
   PacedPacketInfo pacing_info;
   DataSize recommended_probe_size = DataSize::Zero();
   bool is_probing = prober_.is_probing();
+  if (is_probing && !pace_audio_) {
+    const Timestamp probe_time = prober_.NextProbeTime(now);
+    if (probe_time.IsFinite() && probe_time > now + kMaxEarlyProbeProcessing &&
+        packet_queue_.LeadingPacketEnqueueTime(RtpPacketMediaType::kAudio).IsFinite()) {
+      // Early audio is ordinary media, outside the probe's byte and time accounting.
+      is_probing = false;
+    }
+  }
   if (is_probing) {
     // Probe timing is sensitive, and handled explicitly by BitrateProber, so
     // use actual send time rather than target.
