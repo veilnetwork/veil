@@ -300,6 +300,14 @@ int main() {
     recovery(3, 86, now + 3'003'000);
     require(measured.peer_audio_soft_loss(now + 3'003'000).report_us == sustained.report_us,
             "real shim replay renewed significant loss");
+    const auto quiet = now + 5'600'000;
+    conceal(4, 10000 + 38*48, kUnknownRecoveryAge, quiet);
+    require(!measured.peer_audio_soft_loss(quiet).probe_samples,
+            "real shim qualified the short window with only one fresh counter");
+    recovery(4, 86, quiet);
+    const auto confirmed = measured.peer_audio_soft_loss(quiet);
+    require(confirmed.samples == 124*48 && confirmed.probe_samples == 48,
+            "real shim discarded the quiet interval between authenticated reports");
     measured.Stop();
   }
   receiver.SetLocalAudioPlayout(11, 1, 80, now);

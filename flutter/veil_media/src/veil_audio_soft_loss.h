@@ -51,8 +51,11 @@ class AudioSoftLossWindow {
     const bool contiguous = before.sequence && cumulative >= before.counter &&
         at_us - before.at_us < kWindowUs;
     const uint64_t delta = contiguous ? cumulative - before.counter : 0;
+    // A new unchanged cumulative counter proves no additional damage
+    // across a missing feedback tick. When it increased, retain the short
+    // interval limit: a long gap does not locate the damage within it.
     const bool probe_contiguous = contiguous && before.probe_since_us > 0 &&
-        at_us - before.at_us <= kProbeWindowUs && (fresh || delta == 0);
+        (delta == 0 || (fresh && at_us - before.at_us <= kProbeWindowUs));
     before = {sequence, cumulative, at_us,
               probe_contiguous ? before.probe_since_us : at_us};
     Prune(at_us);

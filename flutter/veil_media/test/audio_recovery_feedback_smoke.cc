@@ -45,6 +45,32 @@ int main() {
   }
   {
     using Kind = AudioSoftLossWindow::Kind;
+    // Reports arrive at a slower cadence than the playout observations.
+    // Waiting alone proves nothing. A new pair of unchanged cumulative
+    // counters can prove the quiet interval even after a missed report.
+    for (const auto gap : {3'750'000, 6'000'000}) {
+      for (const auto added : {0, 48}) {
+        AudioSoftLossWindow damage;
+        damage.Observe(Kind::Concealment, 1, 1, 0, true, false, 1'000'000);
+        damage.Observe(Kind::Catchup, 1, 1, 0, true, false, 1'000'000);
+        damage.Observe(Kind::Concealment, 1, 2, 400*48, true, true, 2'000'000);
+        damage.Observe(Kind::Catchup, 1, 2, 0, true, false, 2'000'000);
+        const int64_t next = 2'000'000 + gap;
+        require(!damage.ProbeSamples(next), "waiting authorized a quiet probe");
+        damage.Observe(Kind::Concealment, 1, 3, 400*48 + added, true, added > 0, next);
+        require(!damage.ProbeSamples(next), "a single cumulative report authorized a probe");
+        damage.Observe(Kind::Catchup, 1, 3, 0, true, false, next);
+        if (gap == 3'750'000 && added == 0) {
+          require(damage.Samples(next) == 400*48 && damage.ProbeSamples(next) == 0,
+                  "unchanged counters lost evidence across a feedback gap");
+        } else {
+          require(!damage.ProbeSamples(next), "unmeasured history authorized a probe");
+        }
+      }
+    }
+  }
+  {
+    using Kind = AudioSoftLossWindow::Kind;
     AudioSoftLossWindow damage;
     damage.Observe(Kind::Concealment, 1, 1, 100000, true, true, 1'000'000);
     require(damage.Samples(1'000'000) == 0, "startup damage became current");
