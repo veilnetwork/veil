@@ -44,6 +44,42 @@ struct Fixture {
 
 int main() {
   {
+    // Isolate the added hold by letting the ordinary histogram reflect the
+    // last sample. The non-default timer checks that limits are in ms.
+    webrtc::TickTimer clock(5);
+    webrtc::DelayManager::Config config(webrtc::CreateEnvironment().field_trials());
+    config.use_reorder_optimizer = false;
+    config.resample_interval_ms.reset();
+    config.forget_factor = 0;
+    veil_media::ConversationDelayManager delay(config, &clock);
+    auto late_then_prompt = [&](int ms) {
+      delay.Update(ms, true, {});
+      delay.Update(0, false, {});
+    };
+    late_then_prompt(250);
+    assert(delay.TargetDelayMs() < 160);
+    clock.Increment(39);
+    late_then_prompt(250);
+    assert(delay.TargetDelayMs() < 160);  // Still the same late batch.
+    clock.Increment(40);
+    late_then_prompt(250);
+    assert(delay.TargetDelayMs() == 250);
+    clock.Increment(300);
+    delay.Update(159, true, {});
+    delay.Update(0, false, {});
+    assert(delay.TargetDelayMs() == 250);
+    clock.Increment();
+    assert(delay.TargetDelayMs() < 160);  // A small late sample did not renew it.
+    late_then_prompt(250);
+    assert(delay.TargetDelayMs() < 160);
+    clock.Increment(40);
+    late_then_prompt(800);
+    assert(delay.TargetDelayMs() == veil_media::kCallNetEqMaximumTargetMs);
+    delay.Reset();
+    late_then_prompt(250);
+    assert(delay.TargetDelayMs() < 160);
+  }
+  {
     // A high adaptive target still needs a complete packet of headroom.
     // max(target, jitter + packet) omitted that packet when target dominated.
     Fixture f;

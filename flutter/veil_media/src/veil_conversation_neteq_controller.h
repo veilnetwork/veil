@@ -1,7 +1,10 @@
 // Endpoint conversation policy over the pinned WebRTC decision tree.
 #ifndef VEIL_CONVERSATION_NETEQ_CONTROLLER_H_
 #define VEIL_CONVERSATION_NETEQ_CONTROLLER_H_
+#include <algorithm>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include "api/environment/environment.h"
 #include "modules/audio_coding/neteq/buffer_level_filter.h"
 #include "modules/audio_coding/neteq/decision_logic.h"
@@ -11,6 +14,61 @@
 namespace veil_media {
 inline constexpr char kCallNetEqDelayManagerTrial[] =
     "forget_factor:0.90,reorder_forget_factor:0.95";
+inline constexpr int kCallNetEqMaximumTargetMs = 500;
+
+// WebRTC's reorder optimizer can lower the target on prompt packets between
+// two late batches. Keep the measured delay through those brief gaps after
+// separate batches establish a recurring pattern. PacketArrivalHistory
+// already filters duplicate and obsolete RTP timestamps before Update().
+class ConversationDelayManager final : public webrtc::DelayManager {
+ public:
+  ConversationDelayManager(const Config& config, const webrtc::TickTimer* clock)
+      : webrtc::DelayManager(config, clock), clock_(clock) {}
+
+  void Update(int delay_ms, bool reordered,
+              webrtc::NetEqController::PacketArrivedInfo info) override {
+    webrtc::DelayManager::Update(delay_ms, reordered, info);
+    if (!reordered || delay_ms < kLatePacketMs) return;
+    const int measured_ms = std::min(delay_ms, kCallNetEqMaximumTargetMs);
+    const uint64_t age_ms = LatePacketAgeMs();
+    if (age_ms >= kSeparateBatchMs) {
+      hold_ = age_ms <= kExpireMs;
+      held_delay_ms_ = measured_ms;
+    } else {
+      held_delay_ms_ = std::max(held_delay_ms_, measured_ms);
+    }
+    last_late_tick_ = clock_->ticks();
+  }
+
+  void Reset() override {
+    webrtc::DelayManager::Reset();
+    last_late_tick_.reset();
+    held_delay_ms_ = 0;
+    hold_ = false;
+  }
+
+  int TargetDelayMs() const override {
+    const int target_ms = webrtc::DelayManager::TargetDelayMs();
+    return hold_ && LatePacketAgeMs() <= kExpireMs
+        ? std::max(target_ms, held_delay_ms_) : target_ms;
+  }
+
+ private:
+  static constexpr int kLatePacketMs = 160;
+  static constexpr uint64_t kSeparateBatchMs = 200;
+  static constexpr uint64_t kExpireMs = 1500;
+
+  uint64_t LatePacketAgeMs() const {
+    return last_late_tick_
+        ? (clock_->ticks() - *last_late_tick_) * clock_->ms_per_tick()
+        : kExpireMs + 1;
+  }
+
+  const webrtc::TickTimer* clock_;
+  std::optional<uint64_t> last_late_tick_;
+  int held_delay_ms_ = 0;
+  bool hold_ = false;
+};
 
 class ConversationNetEqController final : public webrtc::DecisionLogic {
  public:
@@ -48,7 +106,6 @@ class ConversationNetEqController final : public webrtc::DecisionLogic {
     const auto operation = webrtc::DecisionLogic::GetDecision(status, reset);
     using Mode = webrtc::NetEq::Mode;
     using Op = webrtc::NetEq::Operation;
-    constexpr int kAdaptedTargetMs = 500;
     constexpr int kSpeechToResumeMs = 200;
     const auto& queue = status.packet_buffer_info;
     // After a fully muted underrun, the arrival span plus waiting time can
@@ -61,7 +118,7 @@ class ConversationNetEqController final : public webrtc::DecisionLogic {
         !status.next_packet->is_cng &&
         status.next_packet->timestamp == status.target_timestamp &&
         !queue.dtx_or_cng && queue.span_samples == queue.num_samples &&
-        khz_ > 0 && TargetLevelMs() == kAdaptedTargetMs &&
+        khz_ > 0 && TargetLevelMs() == kCallNetEqMaximumTargetMs &&
         queue.num_samples >= static_cast<size_t>(kSpeechToResumeMs * khz_)) {
       return Op::kNormal;
     }
@@ -143,7 +200,7 @@ inline std::unique_ptr<webrtc::NetEqController> MakeConversationNetEqController(
   auto history = std::make_unique<webrtc::PacketArrivalHistory>(config.tick_timer, 2000);
   auto* history_view = history.get();
   return std::make_unique<ConversationNetEqController>(config,
-      std::make_unique<webrtc::DelayManager>(
+      std::make_unique<ConversationDelayManager>(
           webrtc::DelayManager::Config(env.field_trials()), config.tick_timer),
       std::move(history), history_view);
 }

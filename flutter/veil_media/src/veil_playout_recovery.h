@@ -284,7 +284,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
   // The ceiling permits adaptation; it does not force a 500-ms target, change
   // packetization or relax a stricter caller-supplied maximum. The packet
   // buffer and the 16-pull callback limit remain bounded independently.
-  static constexpr int kMaximumAdaptiveTargetMs = 500;
+  static constexpr int kMaximumAdaptiveTargetMs = kCallNetEqMaximumTargetMs;
   static constexpr int kRenderBlockMs = 10;
   int JitterReserveMs(int64_t now_us, uint64_t queued_ms) {
     const int target = std::clamp(inner_->TargetDelayMs(), 0, kMaximumAdaptiveTargetMs);

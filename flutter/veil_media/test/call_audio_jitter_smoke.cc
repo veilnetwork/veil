@@ -260,6 +260,8 @@ int main(int argc,char**argv) {
   std::fflush(stdout);
   need(reorder_call.discarded == 0 && reorder_call.played_plc <= reorder_stock.played_plc,
        "periodic reorder made catch-up discard recoverable speech");
+  need(reorder_call.played_plc <= 600 && reorder_call.max_target <= 500,
+       "repeated late batches let the adaptive target collapse between arrivals");
   for (int seed : {197, 17, 41}) {
     const auto held = network(encoded_20ms, 12, seed);
     need(held.size() == encoded_20ms.size(), "overlap profile removed packets");
