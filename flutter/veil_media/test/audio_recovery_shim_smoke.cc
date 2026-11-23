@@ -309,6 +309,13 @@ int main() {
     require(confirmed.samples == 124*48 && confirmed.probe &&
                 confirmed.probe->start_us == quiet - 3'000'000 && confirmed.probe->samples == 48,
             "real shim discarded the quiet interval between authenticated reports");
+    const auto following = quiet + 3'750'000;
+    conceal(5, 10000 + 38*48, kUnknownRecoveryAge, following);
+    recovery(5, 91, following);
+    const auto bounded = measured.peer_audio_soft_loss(following);
+    require(bounded.probe && bounded.probe->samples == 5*48 &&
+                bounded.probe->start_us == following - 3'000'000,
+            "a fresh measured increment erased coverage across a feedback gap");
     measured.Stop();
   }
   {
