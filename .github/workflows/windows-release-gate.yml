@@ -54,15 +54,27 @@ jobs:
           CXX: clang-cl
         run: cargo build -p veilcore --lib --no-default-features
       - name: Run TCP admin integration tests
+        shell: pwsh
         env:
           CC: clang-cl
           CXX: clang-cl
-        run: cargo test -p veilcore --lib --no-default-features node::admin::tests::admin_tcp -- --ignored --test-threads=1
+        run: |
+          $out = cargo test -p veil-node-runtime --lib --no-default-features --features test-low-difficulty admin_tcp -- --ignored --test-threads=1 2>&1
+          $out | ForEach-Object { Write-Host $_ }
+          if ($LASTEXITCODE -ne 0 -or -not ($out -match 'test result: ok\. [1-9]')) {
+            throw 'TCP admin integration tests failed or none ran'
+          }
       - name: Run token-file helpers
+        shell: pwsh
         env:
           CC: clang-cl
           CXX: clang-cl
-        run: cargo test -p veilcore --lib --no-default-features node::admin_transport::tests -- --test-threads=1
+        run: |
+          $out = cargo test -p veil-node-runtime --lib --no-default-features --features test-low-difficulty admin_transport::tests -- --test-threads=1 2>&1
+          $out | ForEach-Object { Write-Host $_ }
+          if ($LASTEXITCODE -ne 0 -or -not ($out -match 'test result: ok\. [1-9]')) {
+            throw 'Token-file tests failed or none ran'
+          }
 
   embedded-node:
     name: Windows embedded node (veilclient-ffi)
@@ -215,7 +227,8 @@ jobs:
 
   release-build:
     name: Windows release build (${{ matrix.target }})
-    runs-on: windows-latest
+    # Match release.yml: the VS 2026 STL requires a newer clang-cl.
+    runs-on: windows-2022
     # Release binaries are a release concern, not a per-PR one — a PR that
     # only touches veil-local-transport needs the tests above, not two full
     # release builds. Keeps the new pull_request trigger cheap.
@@ -249,6 +262,21 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install the pinned NASM assembler for BoringSSL
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'nasm-2.16.03-win64.zip'
+          Invoke-WebRequest -Uri 'https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/win64/nasm-2.16.03-win64.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne '3ee4782247bcb874378d02f7eab4e294a84d3d15f3f6ee2de2f47a46aa7226e6') {
+            throw 'NASM archive checksum mismatch'
+          }
+          Expand-Archive -Path $archive -DestinationPath $env:RUNNER_TEMP
+          $bin = Join-Path $env:RUNNER_TEMP 'nasm-2.16.03'
+          & (Join-Path $bin 'nasm.exe') -v
+          if ($LASTEXITCODE -ne 0) { throw 'NASM did not run' }
+          $bin >> $env:GITHUB_PATH
+
       - name: Build production release binaries
         shell: bash
         env:
