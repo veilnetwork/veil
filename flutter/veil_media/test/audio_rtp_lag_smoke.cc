@@ -44,6 +44,18 @@ int main() {
     lag.Reset();
     assert(!lag.Output(stamp(65000), 66'390'000));
   }
+  {
+    AudioRtpLag lag;
+    for (uint16_t n = 0; n <= 5; ++n)
+      lag.Packet(7, stamp(n * 20), 1'000'000 + n * 20'000, n);
+    assert(lag.Output(stamp(80), 1'100'000) == 20);
+
+    // A duplicate can reach NetEq while the last decoded block is still
+    // queued. Its arrival cannot renew the age estimate for that block.
+    assert(!lag.Packet(7, stamp(100), 4'000'000, 5));
+    assert(!lag.Packet(7, stamp(80), 4'010'000, 4));
+    assert(!lag.Output(stamp(100), 4'110'000));
+  }
   for (int direction : {-1, 1}) {
     AudioRtpLag lag;
     for (int ms = 0; ms <= 1000; ms += 20) lag.Packet(7, stamp(ms), 2'000'000+ms*1000);

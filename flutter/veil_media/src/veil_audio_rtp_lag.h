@@ -23,8 +23,8 @@ class AudioRtpLag {
     const int16_t sequence_step = sequence_known
         ? static_cast<int16_t>(*sequence - *sequence_) : 0;
     bool restarted = false, advances_clock = false;
-    if (!ssrc_ || ssrc != ssrc_ || now_us < last_seen_us_ ||
-        now_us - last_seen_us_ > kHistoryUs ||
+    if (!ssrc_ || ssrc != ssrc_ || now_us < last_evidence_us_ ||
+        now_us - last_evidence_us_ > kHistoryUs ||
         std::abs(sequence_step) > 128) {
       Reset();
       restarted = true;
@@ -56,18 +56,20 @@ class AudioRtpLag {
       }
     }
     const bool fills_sequence_gap = ObserveSequence(sequence, sequence_step);
-    last_seen_us_ = now_us;
     const int32_t delta = static_cast<int32_t>(stamp - anchor_stamp_);
-    if (delta < -5 * kHz) return restarted;
     const bool recent_reorder = fills_sequence_gap && delta < 0 &&
         delta >= -kReorderSpanMs * kHz && now_us - anchor_us_ <= kReorderSpanMs * 1000;
+    // Only advancing media or a first arrival within the reorder window can
+    // keep the arrival clock fresh. Duplicates otherwise extend an RTP age
+    // estimate even though the receiver has stopped getting new speech.
+    if (!advances_clock && !recent_reorder) return restarted;
+    last_evidence_us_ = now_us;
     const int64_t intercept = now_us - TickUs(anchor_ticks_ + delta);
     const int64_t epoch = now_us / kBucketUs;
     auto& bucket = buckets_[epoch % buckets_.size()];
     if (bucket.epoch != epoch) bucket = {epoch, intercept};
     else bucket.minimum_us = std::min(bucket.minimum_us, intercept);
-    if (advances_clock || recent_reorder)
-      bucket.maximum_us = std::max(bucket.maximum_us, intercept);
+    bucket.maximum_us = std::max(bucket.maximum_us, intercept);
     return restarted;
   }
 
@@ -76,7 +78,7 @@ class AudioRtpLag {
   // packets and first arrivals that fill a recent sequence gap are evidence.
   // Duplicates and packets from before the observed stream never renew it.
   int RecentArrivalVariationMs(int64_t now_us) const {
-    if (distinct_packets_ < 3 || now_us < last_seen_us_) return 0;
+    if (distinct_packets_ < 3 || now_us < last_evidence_us_) return 0;
     const int64_t epoch = now_us / kBucketUs;
     int64_t earliest = INT64_MAX, latest = INT64_MIN;
     for (int64_t back = 0; back < 4 && back <= epoch; ++back) {
@@ -99,8 +101,8 @@ class AudioRtpLag {
   }
 
   std::optional<int> Output(uint32_t stamp, int64_t now_us) const {
-    if (!ssrc_ || distinct_packets_ < 3 || now_us < last_seen_us_ ||
-        now_us - last_seen_us_ > 3'000'000 || now_us - first_us_ < 100'000)
+    if (!ssrc_ || distinct_packets_ < 3 || now_us < last_evidence_us_ ||
+        now_us - last_evidence_us_ > 3'000'000 || now_us - first_us_ < 100'000)
       return std::nullopt;
     const int64_t epoch = now_us / kBucketUs;
     std::optional<int64_t> floor;
@@ -145,7 +147,7 @@ class AudioRtpLag {
   };
   std::array<Bucket, 60> buckets_{};
   uint32_t ssrc_ = 0, anchor_stamp_ = 0;
-  int64_t anchor_ticks_ = 0, anchor_us_ = 0, first_us_ = 0, last_seen_us_ = 0;
+  int64_t anchor_ticks_ = 0, anchor_us_ = 0, first_us_ = 0, last_evidence_us_ = 0;
   uint64_t distinct_packets_ = 0;
   std::optional<uint16_t> sequence_;
   // Mark pre-observation sequence numbers as unavailable until replaced by
