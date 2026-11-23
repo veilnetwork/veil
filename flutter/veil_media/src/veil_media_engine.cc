@@ -1184,35 +1184,8 @@ bool should_encode_video_frame(VideoState* ws) {
   if (ws->video_send_paused.load()) return false;
   if (ws->audio_packet_priority && ws->audio_packet_priority->VideoBlocked()) return false;
   const double fps = ws->video_max_fps.load(std::memory_order_relaxed);
-  if (fps <= 0) return true;
-  const int64_t now_us = webrtc::TimeMicros();
-  const int64_t min_interval_us = static_cast<int64_t>(std::ceil(1'000'000.0 / fps));
-  // Keep an ideal send timeline instead of storing the wall-clock time of the
-  // last accepted frame.  A plain `now - last >= interval` gate turns a 60 Hz
-  // source into 30 fps for every target between 31 and 59 because the first
-  // 16 ms frame misses the threshold and the next accepted frame restarts the
-  // interval. Advancing by exactly one interval preserves the fractional
-  // credit and converges on targets such as 45 or 18 fps without bursts.
-  const int64_t timing_tolerance_us =
-      std::min<int64_t>(2'000, min_interval_us / 20);
-  int64_t previous =
-      ws->video_last_encoded_frame_us.load(std::memory_order_relaxed);
-  for (;;) {
-    if (previous > 0 && now_us >= previous &&
-        now_us - previous + timing_tolerance_us < min_interval_us) {
-      return false;
-    }
-    int64_t next = now_us;
-    if (previous > 0 && now_us >= previous &&
-        now_us - previous <= min_interval_us * 4) {
-      next = previous + min_interval_us;
-    }
-    if (ws->video_last_encoded_frame_us.compare_exchange_weak(
-            previous, next, std::memory_order_relaxed,
-            std::memory_order_relaxed)) {
-      return true;
-    }
-  }
+  return veil_media::TryAdvanceVideoCadence(
+      ws->video_last_encoded_frame_us, fps, webrtc::TimeMicros());
 }
 
 struct GroupPeerState {

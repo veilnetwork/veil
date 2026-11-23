@@ -2,6 +2,10 @@
 #ifndef VEIL_ADAPTIVE_VIDEO_SOURCE_H_
 #define VEIL_ADAPTIVE_VIDEO_SOURCE_H_
 
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
 #include <limits>
 #include <mutex>
 #include <utility>
@@ -13,6 +17,36 @@
 #include "rtc_base/time_utils.h"
 
 namespace veil_media {
+
+inline bool TryAdvanceVideoCadence(std::atomic<int64_t>& last_slot_us,
+                                   double fps, int64_t now_us) {
+  if (fps <= 0) return true;
+  const int64_t min_interval_us = static_cast<int64_t>(std::ceil(1'000'000.0 / fps));
+  // Keep an ideal send timeline. A plain `now - last >= interval` gate turns a 60 Hz
+  // source into 30 fps for every target between 31 and 59 because the first
+  // 16 ms frame misses the threshold and the next accepted frame restarts the
+  // interval. Advancing by exactly one interval preserves the fractional
+  // credit and converges on targets such as 45 or 18 fps without bursts.
+  const int64_t timing_tolerance_us =
+      std::min<int64_t>(2'000, min_interval_us / 20);
+  int64_t previous = last_slot_us.load(std::memory_order_relaxed);
+  for (;;) {
+    int64_t next = now_us;
+    if (previous > 0) {
+      // An early frame can already own a slot slightly in the future.
+      const auto elapsed_us = now_us - previous + timing_tolerance_us;
+      if (elapsed_us < min_interval_us) return false;
+      // Once a full slot was missed, resume from this frame. Do not repay
+      // missed slots with a burst of old credit when capture recovers.
+      if (elapsed_us < min_interval_us * 2) next = previous + min_interval_us;
+    }
+    if (last_slot_us.compare_exchange_weak(
+            previous, next, std::memory_order_relaxed,
+            std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+}
 
 // Pushable camera/screen source. Preview owns the original capture separately.
 class AdaptiveVideoSource final : public webrtc::VideoBroadcaster {

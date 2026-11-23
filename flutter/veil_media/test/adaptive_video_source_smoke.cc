@@ -16,6 +16,28 @@ class Sink final : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
   int frames = 0;
 };
 int main() {
+  std::atomic<int64_t> slot{0};
+  const auto sparse = [&](int64_t at) {
+    return veil_media::TryAdvanceVideoCadence(slot, 1, at);
+  };
+  require(sparse(1'000'000) && sparse(1'999'000), "sparse timing tolerance changed");
+  const bool duplicate = sparse(1'999'500);
+  slot.store(0);
+  require(sparse(1'000'000) && sparse(3'500'000), "source did not resume after a stall");
+  const bool missed_slot_replayed = sparse(3'510'000);
+  require(!duplicate && !missed_slot_replayed,
+          "sparse capture can replay a slot after an early frame or a stall");
+  require(sparse(4'500'000), "normal cadence did not resume after the stall");
+
+  slot.store(0);
+  int fractional_frames = 0;
+  for (int tick = 0; tick < 600; ++tick) {
+    if (veil_media::TryAdvanceVideoCadence(slot, 45, 1'000'000 + tick * 1'000'000LL / 60))
+      ++fractional_frames;
+  }
+  require(fractional_frames >= 449 && fractional_frames <= 451,
+          "fractional cadence no longer reaches 45 fps on a 60 Hz source");
+
   auto input = webrtc::I420Buffer::Create(640, 480);
   std::memset(input->MutableDataY(), 90, input->StrideY() * input->height());
   std::memset(input->MutableDataU(), 128, input->StrideU() * input->ChromaHeight());
