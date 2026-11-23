@@ -34,6 +34,7 @@
 #include "modules/rtp_rtcp/source/rtp_util.h"  // webrtc::IsRtcpPacket
 #include "rtc_base/copy_on_write_buffer.h"
 #include "rtc_base/network/sent_packet.h"  // webrtc::SentPacketInfo
+#include "rtc_base/numerics/sequence_number_util.h"
 #include "rtc_base/time_utils.h"           // webrtc::TimeMillis
 
 // veilclient-ffi ABI (crates/veilclient-ffi/include/veil_media_abi.h). The
@@ -748,6 +749,7 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
   if (local == 0 && video == 0) return;
   RtcpFeedbackSnapshot candidate, video_candidate;
   AudioPlayoutSnapshot playout;
+  std::vector<std::pair<uint32_t, int>> audio_loss_intervals;
   std::vector<VideoPayloadLoss::Status> transport_statuses;
   bool transport_seen = false, transport_known = true;
   std::optional<VideoDeliveryReport> delivery;
@@ -758,16 +760,24 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
       const bool audio = local != 0 && block.source_ssrc() == local;
       if (!audio && (video == 0 || block.source_ssrc() != video)) continue;
       auto& sample = audio ? candidate : video_candidate;
+      const auto highest = block.extended_high_seq_num();
+      const int fraction = block.fraction_lost();
+      if (audio) {
+        if (fraction) audio_loss_intervals.emplace_back(highest, fraction);
+        if (sample.arrived_us &&
+            !webrtc::AheadOrAt(highest, sample.highest_sequence))
+          continue;
+      }
       sample.arrived_us = arrived_us;
-      sample.loss_pct = (int(block.fraction_lost()) * 100 + 128) / 256;
+      sample.loss_pct = (fraction * 100 + 128) / 256;
       sample.cumulative_lost = block.cumulative_lost();
-      sample.highest_sequence = block.extended_high_seq_num();
+      sample.highest_sequence = highest;
       // Preserve sub-one-percent loss and a lossy block followed by a healthy
       // block in the same valid compound packet.
-      if (block.fraction_lost() != 0) {
+      if (!audio && fraction) {
         sample.loss_report_us = arrived_us;
         sample.loss_report_fraction = std::max(
-            sample.loss_report_fraction, int(block.fraction_lost()));
+            sample.loss_report_fraction, fraction);
       }
       const uint32_t clock_rate = audio ? 48000 : 90000;
       sample.jitter_ms = static_cast<int>(uint64_t(block.jitter()) * 1000 / clock_rate);
@@ -873,12 +883,30 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
           concealment->origin, concealment->sequence, concealment->concealed_samples,
           concealment->known, concealment->age_ms != kUnknownRecoveryAge, arrived_us);
     }
+    const bool current_audio = audio_feedback_.fresh_at(candidate.arrived_us);
     if (candidate.arrived_us > route_feedback_after_us_ &&
-        candidate.arrived_us >= audio_feedback_.arrived_us) {
+        candidate.arrived_us >= audio_feedback_.arrived_us &&
+        (!current_audio ||
+         webrtc::AheadOrAt(candidate.highest_sequence,
+                           audio_feedback_.highest_sequence))) {
       candidate.route_epoch = rtcp_route_clock_.epoch();
       if (!rtcp_route_clock_.Accepts(candidate.last_sender_report)) candidate.rtt_ms = 0;
-      // Keep the last two distinct loss reports so slow stats polls do not
-      // mistake a burst for one event. A compound packet has one arrival time.
+      // A repeated or reordered report for already covered RTP cannot renew
+      // the loss event. Equal intervals can still refresh RTT or clear loss.
+      if (audio_feedback_.arrived_us &&
+          candidate.highest_sequence == audio_feedback_.highest_sequence) {
+        candidate.loss_pct = current_audio
+            ? std::min(candidate.loss_pct, audio_feedback_.loss_pct) : 0;
+      } else {
+        for (const auto& [highest, fraction] : audio_loss_intervals) {
+          if (!current_audio || webrtc::AheadOf(highest, audio_feedback_.highest_sequence))
+            candidate.loss_report_fraction =
+                std::max(candidate.loss_report_fraction, fraction);
+        }
+      }
+      if (candidate.loss_report_fraction) candidate.loss_report_us = arrived_us;
+      // Keep two distinct observations for slow stats polls. All blocks in a
+      // compound packet share one arrival time and can only yield one event.
       candidate.previous_loss_report_us = audio_feedback_.loss_report_us;
       if (candidate.loss_report_us <= audio_feedback_.loss_report_us) {
         candidate.previous_loss_report_us = audio_feedback_.previous_loss_report_us;

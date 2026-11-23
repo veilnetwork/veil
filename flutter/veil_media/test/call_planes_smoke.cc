@@ -268,7 +268,8 @@ static uint32_t group_ssrc(const uint8_t id[32], uint32_t domain = 0x47415544u) 
 }
 static std::vector<uint8_t> report_packet(uint32_t reporter, uint32_t source,
                                         uint8_t lost, uint32_t jitter,
-                                        bool sender_report = false) {
+                                        bool sender_report = false,
+                                        uint32_t highest = 100) {
   std::vector<uint8_t> packet(sender_report ? 52 : 32);
   packet[0] = 0x81; packet[1] = sender_report ? 200 : 201;
   packet[3] = sender_report ? 12 : 7;
@@ -277,12 +278,12 @@ static std::vector<uint8_t> report_packet(uint32_t reporter, uint32_t source,
   };
   const size_t block = sender_report ? 28 : 8;
   word(4, reporter); word(block, source); packet[block + 4] = lost;
-  word(block + 8, 100); word(block + 12, jitter);
+  word(block + 8, highest); word(block + 12, jitter);
   return packet;
 }
 static void report(uint64_t chan, uint32_t reporter, uint32_t source,
-                   uint8_t lost, uint32_t jitter) {
-  const auto packet = report_packet(reporter, source, lost, jitter);
+                   uint8_t lost, uint32_t jitter, uint32_t highest = 100) {
+  const auto packet = report_packet(reporter, source, lost, jitter, false, highest);
   Callback callback;
   { std::lock_guard lock(callback_mu); callback = callbacks.at(chan); }
   callback.fn(callback.ctx, packet.data(), packet.size());
@@ -741,14 +742,14 @@ int main(int argc, char** argv) {
     assert(stat(e.get(), "audio_feedback_age_ms") >= first_video_age);
     assert(stat(e.get(), "audio_loss_report_us") == first);
     assert(stat(e.get(), "video_feedback_loss_pct") == 0);
-    inject_raw(160, report_packet(2, audio, 1, 0, true));
+    inject_raw(160, report_packet(2, audio, 1, 0, true, 200));
     const auto second = wait_stat("audio_loss_report_us", first);
     assert(stat(e.get(), "audio_previous_loss_report_us") == first);
     assert(stat(e.get(), "video_loss_report_us") == video_loss);
 
-    auto compound = report_packet(2, audio, 51, 0);  // Just under 20%.
-    const auto less_loss = report_packet(2, audio, 1, 0);
-    const auto healthy = report_packet(2, audio, 0, 0);
+    auto compound = report_packet(2, audio, 51, 0, false, 300);  // Just under 20%.
+    const auto less_loss = report_packet(2, audio, 1, 0, false, 400);
+    const auto healthy = report_packet(2, audio, 0, 0, false, 500);
     compound.insert(compound.end(), less_loss.begin(), less_loss.end());
     compound.insert(compound.end(), healthy.begin(), healthy.end());
     inject_raw(160, compound);
@@ -756,12 +757,12 @@ int main(int argc, char** argv) {
     assert(stat(e.get(), "audio_previous_loss_report_us") == second);
     assert(stat(e.get(), "tx_loss_pct") == 0);
     assert(stat(e.get(), "audio_loss_report_fraction") == 51);
-    report(160, 2, audio, 0, 0);
+    report(160, 2, audio, 0, 0, 500);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     assert(stat(e.get(), "audio_loss_report_us") == third);
     assert(stat(e.get(), "audio_previous_loss_report_us") == second);
     assert(stat(e.get(), "audio_loss_report_fraction") == 51);
-    report(160, 2, audio, 2, 0);
+    report(160, 2, audio, 2, 0, 600);
     wait_stat("audio_loss_report_us", third);
     assert(stat(e.get(), "audio_previous_loss_report_us") == third);
     assert(stat(e.get(), "audio_loss_report_fraction") == 2);
@@ -789,7 +790,7 @@ int main(int argc, char** argv) {
     assert(group_stat(room.get(), "tx_loss_pct") == 0);
     // Healthy reports near expiry must not renew either peer's loss witness.
     std::this_thread::sleep_until(expiry - std::chrono::seconds(1));
-    report(160, 2, audio, 0, 0);
+    report(160, 2, audio, 0, 0, 600);
     report(180, group_ssrc(peer), group_ssrc(local), 0, 0);
     report(181, group_ssrc(other), group_ssrc(local), 0, 0);
     std::this_thread::sleep_until(expiry);

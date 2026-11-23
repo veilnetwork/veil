@@ -77,25 +77,51 @@ int main() {
     VeilTransportShim path(196, nullptr, nullptr, nullptr, nullptr);
     path.SetLocalAudioSsrc(11);
     path.Start();
-    webrtc::rtcp::ReceiverReport rr;
-    rr.SetSenderSsrc(22);
-    webrtc::rtcp::ReportBlock block;
-    block.SetMediaSsrc(11);
-    block.SetFractionLost(51);
-    block.SetJitter(4800);
-    rr.AddReportBlock(block);
-    const auto loss = rr.Build();
-    const auto entered_us = webrtc::TimeMicros() - 3;
+    const auto report = [](uint32_t highest, uint8_t fraction, uint32_t jitter) {
+      webrtc::rtcp::ReceiverReport rr;
+      rr.SetSenderSsrc(22);
+      webrtc::rtcp::ReportBlock block;
+      block.SetMediaSsrc(11);
+      block.SetExtHighestSeqNum(highest);
+      block.SetFractionLost(fraction);
+      block.SetJitter(jitter);
+      rr.AddReportBlock(block);
+      return rr.Build();
+    };
+    const auto loss = report(UINT32_MAX - 1, 1, 4800);
+    const auto entered_us = webrtc::TimeMicros() - 20;
     AudioRecoveryFeedbackTest::Observe(path, loss, entered_us);
     require(path.audio_feedback().loss_report_us == entered_us,
             "old path did not register the lossy report");
-    AudioRecoveryFeedbackTest::Observe(path, loss, entered_us + 1);
+    AudioRecoveryFeedbackTest::Observe(path, report(UINT32_MAX - 1, 0, 4800),
+                                       entered_us + 1);
+    require(path.audio_feedback().arrived_us == entered_us + 1,
+            "an equal healthy report did not refresh feedback");
+    AudioRecoveryFeedbackTest::Observe(path, loss, entered_us + 2);
+    require(path.audio_feedback().loss_report_us == entered_us &&
+                path.audio_feedback().previous_loss_report_us == 0,
+            "duplicate receiver interval manufactured repeated audio loss");
+    auto compound = report(UINT32_MAX, 0, 4800);
+    auto old = report(UINT32_MAX - 2, 51, 9600);
+    compound.AppendData(old.data(), old.size());
+    AudioRecoveryFeedbackTest::Observe(path, compound, entered_us + 3);
+    require(path.audio_feedback().highest_sequence == UINT32_MAX &&
+                path.audio_feedback().loss_report_us == entered_us &&
+                path.audio_feedback().loss_report_fraction == 1 &&
+                path.audio_feedback().jitter_ms == 100 &&
+                path.audio_feedback().loss_pct == 0,
+            "late loss inside a compound replaced the current audio interval");
+    AudioRecoveryFeedbackTest::Observe(path, old, entered_us + 4);
+    require(path.audio_feedback().arrived_us == entered_us + 3,
+            "older receiver interval replaced fresher audio feedback");
+    const auto next_loss = report(0, 51, 4800);
+    AudioRecoveryFeedbackTest::Observe(path, next_loss, entered_us + 5);
     require(path.RebindChannel(196, false) && !path.RebindChannel(0, false),
             "idempotent or invalid rebind changed route");
     const auto unchanged = path.audio_feedback();
-    require(unchanged.loss_report_us == entered_us + 1 &&
+    require(unchanged.loss_report_us == entered_us + 5 &&
                 unchanged.previous_loss_report_us == entered_us,
-            "unchanged route discarded the audio loss pair");
+            "unchanged route or sequence wrap discarded the audio loss pair");
     require(path.RebindChannel(197, true), "route rebind failed");
     const auto reset = path.audio_feedback();
     require(reset.route_epoch == 1 && reset.arrived_us == 0 &&
@@ -103,16 +129,27 @@ int main() {
                 reset.loss_report_fraction == 0 &&
                 reset.loss_pct == 0 && reset.jitter_ms == 0,
             "old path audio loss and jitter survived handover");
-    AudioRecoveryFeedbackTest::Observe(path, loss, entered_us + 2);
+    AudioRecoveryFeedbackTest::Observe(path, next_loss, entered_us + 6);
     require(path.audio_feedback().arrived_us == 0,
             "queued pre-handover report repopulated audio loss on the new path");
     const auto received_us = webrtc::TimeMicros() + 1;
-    AudioRecoveryFeedbackTest::Observe(path, loss, received_us);
+    AudioRecoveryFeedbackTest::Observe(path, next_loss, received_us);
     const auto current = path.audio_feedback();
     require(current.route_epoch == 1 && current.loss_report_us == received_us &&
                 current.previous_loss_report_us == 0 &&
                 current.loss_report_fraction == 51 && current.jitter_ms == 100,
             "fresh loss on the new path was not measured");
+    const auto resumed_us = received_us + 15'000'001;
+    AudioRecoveryFeedbackTest::Observe(path, report(UINT32_MAX, 0, 9600), resumed_us);
+    require(path.audio_feedback().fresh_at(resumed_us) &&
+                path.audio_feedback().jitter_ms == 200 &&
+                path.audio_feedback().fresh_loss_report_us(resumed_us) == 0,
+            "a fresh receiver baseline could not replace expired feedback");
+    const auto duplicate_us = resumed_us + 15'000'001;
+    AudioRecoveryFeedbackTest::Observe(path, report(UINT32_MAX, 51, 9600), duplicate_us);
+    require(path.audio_feedback().fresh_loss_report_us(duplicate_us) == 0 &&
+                path.audio_feedback().loss_pct == 0,
+            "expiration let an already observed interval renew audio loss");
     path.Stop();
   }
   {
