@@ -55,23 +55,26 @@ class AudioRtpLag {
         advances_clock = true;
       }
     }
-    if (sequence && (!sequence_ || sequence_step > 0))
-      sequence_ = sequence;
+    const bool fills_sequence_gap = ObserveSequence(sequence, sequence_step);
     last_seen_us_ = now_us;
     const int32_t delta = static_cast<int32_t>(stamp - anchor_stamp_);
     if (delta < -5 * kHz) return restarted;
+    const bool recent_reorder = fills_sequence_gap && delta < 0 &&
+        delta >= -kReorderSpanMs * kHz && now_us - anchor_us_ <= kReorderSpanMs * 1000;
     const int64_t intercept = now_us - TickUs(anchor_ticks_ + delta);
     const int64_t epoch = now_us / kBucketUs;
     auto& bucket = buckets_[epoch % buckets_.size()];
     if (bucket.epoch != epoch) bucket = {epoch, intercept};
     else bucket.minimum_us = std::min(bucket.minimum_us, intercept);
-    if (advances_clock) bucket.maximum_us = std::max(bucket.maximum_us, intercept);
+    if (advances_clock || recent_reorder)
+      bucket.maximum_us = std::max(bucket.maximum_us, intercept);
     return restarted;
   }
 
   // Preserve real arrival variation before dropping decoded audio. Use a
-  // short window so a single burst cannot lengthen later catch-up. Duplicates
-  // and older packets do not establish a new late-arrival bound.
+  // short window so a single burst cannot lengthen later catch-up. Ordered
+  // packets and first arrivals that fill a recent sequence gap are evidence.
+  // Duplicates and packets from before the observed stream never renew it.
   int RecentArrivalVariationMs(int64_t now_us) const {
     if (distinct_packets_ < 3 || now_us < last_seen_us_) return 0;
     const int64_t epoch = now_us / kBucketUs;
@@ -116,7 +119,24 @@ class AudioRtpLag {
 
  private:
   static constexpr int kHz = 48000;  // Opus RTP clock, independent of decoder output rate.
+  static constexpr int kSequenceWindow = 32;
+  static constexpr int kReorderSpanMs = 500;
   static constexpr int64_t kBucketUs = 500'000, kHistoryUs = 30'000'000;
+  bool ObserveSequence(std::optional<uint16_t> sequence, int16_t step) {
+    if (!sequence) return false;
+    if (!sequence_) {
+      sequence_ = sequence;
+    } else if (step > 0) {
+      sequence_window_ = step < kSequenceWindow ? (sequence_window_ << step) | 1u : 1u;
+      sequence_ = sequence;
+    } else if (step < 0 && -step < kSequenceWindow) {
+      const uint32_t bit = uint32_t{1} << -step;
+      const bool first = (sequence_window_ & bit) == 0;
+      sequence_window_ |= bit;
+      return first;
+    }
+    return false;
+  }
   static int64_t TickUs(int64_t ticks) {
     return (ticks / kHz) * 1'000'000 + (ticks % kHz) * 1'000'000 / kHz;
   }
@@ -128,5 +148,8 @@ class AudioRtpLag {
   int64_t anchor_ticks_ = 0, anchor_us_ = 0, first_us_ = 0, last_seen_us_ = 0;
   uint64_t distinct_packets_ = 0;
   std::optional<uint16_t> sequence_;
+  // Mark pre-observation sequence numbers as unavailable until replaced by
+  // an observed advance. Zero bits identify holes in this stream's history.
+  uint32_t sequence_window_ = UINT32_MAX;
 };
 }  // namespace veil_media

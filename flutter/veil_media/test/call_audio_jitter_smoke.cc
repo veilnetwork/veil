@@ -246,6 +246,20 @@ int main(int argc,char**argv) {
   for(size_t i=0;i<speech.size();++i) speech[i]=static_cast<int16_t>(
       static_cast<unsigned char>(bytes[2*i]) | (static_cast<unsigned char>(bytes[2*i+1])<<8));
   const auto encoded_20ms = encode(speech, 20);
+  // The production estimator treats reordered arrivals separately. A
+  // burst of unique late packets can leave an apparently flat ordered
+  // arrival history. Catch-up must keep that already received speech.
+  const auto reorder_trace = network(encoded_20ms, 4, 197);
+  const auto reorder_stock = run(reorder_trace, false, 1500, true);
+  const auto reorder_call = run(reorder_trace, true, 1500, true);
+  std::printf("production trials, periodic reorder: stock PLC=%llu ms, "
+              "call PLC=%llu ms, hard discard=%llu ms\n",
+      (unsigned long long)reorder_stock.played_plc,
+      (unsigned long long)reorder_call.played_plc,
+      (unsigned long long)reorder_call.discarded);
+  std::fflush(stdout);
+  need(reorder_call.discarded == 0 && reorder_call.played_plc <= reorder_stock.played_plc,
+       "periodic reorder made catch-up discard recoverable speech");
   for (int seed : {197, 17, 41}) {
     const auto held = network(encoded_20ms, 12, seed);
     need(held.size() == encoded_20ms.size(), "overlap profile removed packets");

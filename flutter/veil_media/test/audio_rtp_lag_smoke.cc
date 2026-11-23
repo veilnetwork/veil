@@ -95,6 +95,25 @@ int main() {
     assert(lag.RecentArrivalVariationMs(1'820'000) == 0);
   }
   {
+    AudioRtpLag lag;
+    for (uint16_t index = 0; index < 3; ++index)
+      lag.Packet(7, stamp(index * 20), 1'000'000 + index * 20'000,
+                 static_cast<uint16_t>(65532 + index));
+    lag.Packet(7, stamp(100), 1'100'000, 1);
+    assert(lag.RecentArrivalVariationMs(1'100'000) == 0);
+    // A genuinely missing packet can arrive late within the same stream,
+    // even if the sequence has already wrapped and advanced past it.
+    lag.Packet(7, stamp(60), 1'310'000, 65535);
+    assert(lag.RecentArrivalVariationMs(1'310'000) == 250);
+    lag.Packet(7, stamp(60), 1'500'000, 65535);
+    // Earlier than the first observed sequence: no known receive hole.
+    lag.Packet(7, stamp(-20), 1'510'000, 65531);
+    assert(lag.RecentArrivalVariationMs(1'510'000) == 250);
+    lag.Packet(7, stamp(80), 1'610'000, 0);
+    assert(lag.RecentArrivalVariationMs(1'610'000) == 250);
+    assert(lag.RecentArrivalVariationMs(3'000'000) == 0);
+  }
+  {
     veil_media::AudioRecoveryRegistry registry;
     auto stream = registry.NewStream(); registry.Attach(7, stream);
     stream->SetLag(269, 1'234'567);
