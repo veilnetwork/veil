@@ -466,6 +466,49 @@ int main() {
           "legacy report enabled decoded-loss feedback");
   receiver.SendVideoRtcp(original, {});
   require(sent == original, "recovery was appended to video RTCP");
+  {
+    VeilTransportShim reporter(191, nullptr, nullptr, nullptr, nullptr);
+    VeilTransportShim listener(192, nullptr, nullptr, nullptr, nullptr);
+    reporter.SetLocalAudioSsrc(12);
+    listener.SetLocalAudioSsrc(11);
+    reporter.Start();
+    listener.Start();
+    const auto measured_at = webrtc::TimeMicros();
+    reporter.SetLocalAudioPlayout(11, 1, 520, measured_at, 520, 500);
+    require(reporter.SendRtcp(original, {}), "measured playout report refused");
+    const auto filled = sent;
+    const size_t reserve_offset = original.size() + 28;
+    require(filled.size() == reserve_offset + 28, "missing bounded reserve report");
+    auto mismatched = filled;
+    mismatched[reserve_offset + 23] = 2;  // Reserve is for another sample.
+    AudioRecoveryFeedbackTest::Observe(listener, mismatched, measured_at + 1000);
+    require(listener.audio_playout_feedback().delay_ms == 520 &&
+            listener.audio_playout_feedback().reserve_ms == 0,
+            "unpaired credit altered the raw delay");
+    AudioRecoveryFeedbackTest::Observe(listener, filled, measured_at + 2000);
+    require(listener.audio_playout_feedback().reserve_ms == 0,
+            "replay retroactively applied credit");
+    reporter.SetLocalAudioPlayout(11, 2, 520, measured_at, 520, 500);
+    require(reporter.SendRtcp(original, {}), "second playout report refused");
+    AudioRecoveryFeedbackTest::Observe(listener, sent, measured_at + 3000);
+    require(listener.audio_playout_feedback().delay_ms == 520 &&
+            listener.audio_playout_feedback().reserve_ms == 420,
+            "paired credit lost or changed the raw delay");
+    reporter.SetLocalAudioPlayout(11, 3, 520, measured_at, 100, 500);
+    require(reporter.SendRtcp(original, {}), "unfilled playout report refused");
+    require(sent.size() == reserve_offset, "upstream age filled the local reserve");
+    AudioRecoveryFeedbackTest::Observe(listener, sent, measured_at + 4000);
+    require(listener.audio_playout_feedback().reserve_ms == 0,
+            "an older credit leaked into a new report");
+    reporter.SetLocalAudioPlayout(11, 4, 520, measured_at - 3'010'000, 520, 500);
+    require(reporter.SendRtcp(original, {}), "stale playout report refused");
+    require(sent.size() == reserve_offset, "stale sample sent credit");
+    AudioRecoveryFeedbackTest::Observe(listener, sent, measured_at + 5000);
+    require(!listener.audio_playout_feedback().fresh_at(measured_at + 5000),
+            "stale sample became fresh");
+    reporter.Stop();
+    listener.Stop();
+  }
   // Concealment has its own APP and witness; it never changes VAP2 counters.
   const auto before_baseline = sends;
   receiver.SetLocalAudioConcealment(11, 1, 9, 1000, 100, webrtc::TimeMicros());

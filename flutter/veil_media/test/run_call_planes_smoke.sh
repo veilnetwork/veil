@@ -19,6 +19,7 @@ if [ "$#" -eq 0 ]; then
   bash "$ROOT/test/run_video_payload_loss_smoke.sh"
   "$STAND_DIR/smoke" --group-rtcp-accounting
   "$STAND_DIR/smoke" --group-video-admission
+  "$STAND_DIR/smoke" --group-playout-reserve
   "$STAND_DIR/smoke" --group-remb-cadence
   "$STAND_DIR/smoke" --frame-sizing
   "$STAND_DIR/smoke" --audio-source-pixels

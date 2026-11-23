@@ -106,6 +106,7 @@ struct AudioPlayoutSnapshot {
   uint64_t sequence = 0;
   int64_t arrived_us = 0;
   int delay_ms = -1;
+  int reserve_ms = 0;
 
   bool fresh_at(int64_t now_us) const {
     return supported && delay_ms >= 0 && arrived_us > 0 &&
@@ -210,7 +211,8 @@ class VeilTransportShim : public webrtc::Transport {
   // Group receive-worker samples only. Setting an unknown sample still
   // advertises support; unicast uses its negotiated call-health feedback.
   void SetLocalAudioPlayout(uint32_t remote_audio_ssrc, uint64_t sequence,
-                           int delay_ms, int64_t sampled_us);
+                           int delay_ms, int64_t sampled_us,
+                           int buffered_ms = -1, int target_ms = -1);
   void SetLocalAudioRecovery(uint32_t remote_audio_ssrc, uint64_t sequence,
                             AudioRecoverySample sample, int64_t sampled_us);
   int64_t peer_audio_recovery_report_us(int64_t now_us) const;
@@ -389,6 +391,7 @@ class VeilTransportShim : public webrtc::Transport {
     uint64_t sequence = 0;
     int delay_ms = -1;
     int64_t sampled_us = 0;
+    int reserve_ms = 0;
   };
   LocalAudioPlayout local_audio_playout_;
   struct LocalAudioRecovery {

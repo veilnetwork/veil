@@ -294,16 +294,24 @@ static void inject_raw(uint64_t chan, const std::vector<uint8_t>& packet) {
   cb.fn(cb.ctx, packet.data(), packet.size());
 }
 static std::vector<uint8_t> playout_report(uint32_t target, uint64_t seq,
-                                          uint32_t delay) {
-  std::vector<uint8_t> p(36);
+                                          uint32_t delay, uint32_t reserve = 0) {
+  std::vector<uint8_t> p(8);
   p[0] = 0x80; p[1] = 201; p[3] = 1;  // original empty RR
-  p[8] = 0x80; p[9] = 204; p[11] = 6;
-  std::memcpy(p.data() + 16, "VAP1", 4);
   const auto word = [&](size_t at, uint32_t value) {
     for (int i = 0; i < 4; ++i) p[at + i] = value >> (24 - i * 8);
   };
-  word(20, target); word(24, static_cast<uint32_t>(seq >> 32));
-  word(28, static_cast<uint32_t>(seq)); word(32, delay);
+  const auto append = [&](const char* name, uint32_t value) {
+    const size_t at = p.size();
+    p.resize(at + 28);
+    p[at] = 0x80; p[at + 1] = 204; p[at + 3] = 6;
+    std::memcpy(p.data() + at + 8, name, 4);
+    word(at + 12, target);
+    word(at + 16, static_cast<uint32_t>(seq >> 32));
+    word(at + 20, static_cast<uint32_t>(seq));
+    word(at + 24, value);
+  };
+  append("VAP1", delay);
+  if (reserve) append("VAP4", reserve);
   return p;
 }
 static void wait_playout(VeilGroupMediaEngine* e, uint64_t reports, uint64_t delay) {
@@ -641,6 +649,30 @@ int main(int argc, char** argv) {
     assert(group_stat(e.get(),"video_rtcp_remb_coalesced_copies")==4);
     e.reset(); assert(callbacks.empty());
     std::puts("REMB cadence: video-only, immediate cuts/repair, partial fanout and membership OK");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--group-playout-reserve") == 0) {
+    uint8_t local[32] = {91}, alice[32] = {92}, bob[32] = {93};
+    std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> e(
+        veil_media_group_engine_create(local), veil_media_group_engine_destroy);
+    assert(e);
+    assert(veil_media_group_engine_set_mic_muted(e.get(), 1) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_add_peer(e.get(), 190, alice) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_add_peer(e.get(), 191, bob) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_start_audio(e.get()) == VEIL_MEDIA_OK);
+    const auto target = group_ssrc(local);
+    inject_raw(190, playout_report(target, 1, 520, 420));
+    wait_playout(e.get(), 1, 520);
+    assert(group_stat(e.get(), "audio_playout_pressure_ms") == 100);
+    inject_raw(191, playout_report(target, 1, 300));
+    wait_playout(e.get(), 2, 520);
+    assert(group_stat(e.get(), "audio_playout_pressure_ms") == 300);
+    assert(veil_media_group_engine_remove_peer(e.get(), alice) == VEIL_MEDIA_OK);
+    wait_playout(e.get(), 1, 300);
+    assert(group_stat(e.get(), "audio_playout_pressure_ms") == 300);
+    e.reset();
+    assert(callbacks.empty());
+    std::puts("Group playout reserve: raw reports kept, each peer's pressure counted separately");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--group-video-admission") == 0) {

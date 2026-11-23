@@ -52,7 +52,13 @@ namespace {
 constexpr uint8_t kVp8PayloadType = 96;
 constexpr int64_t kHoldThresholdNs = 75 * 1000 * 1000;
 constexpr uint32_t kAudioPlayoutAppName = 0x56415031u;  // "VAP1"
+constexpr uint32_t kAudioPlayoutReserveAppName = 0x56415034u;  // "VAP4"
 constexpr uint32_t kUnknownPlayout = 0xffffffffu;
+// Match CallAudioPlayoutReserve and the NetEq adaptive target limit.
+constexpr int kNominalPlayoutTargetMs = 80;
+constexpr int kMaximumPlayoutTargetMs = 500;
+constexpr int kMaximumPlayoutReserveMs =
+    kMaximumPlayoutTargetMs - kNominalPlayoutTargetMs;
 
 uint32_t read_be32(const uint8_t* p) {
   return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 |
@@ -439,24 +445,28 @@ bool VeilTransportShim::SendRtcpOnSource(std::span<const uint8_t> packet,
       compound.insert(compound.end(), app.begin(), app.end());
     }
     if (sample.enabled) {
-      const size_t at = compound.size();
-      compound.resize(at + 28);
-      auto* app = compound.data() + at;
-      app[0] = 0x80;
-      app[1] = 204;
-      app[2] = 0;
-      app[3] = 6;
-      write_be32(app + 4, local_audio_ssrc_.load(std::memory_order_relaxed));
-      write_be32(app + 8, kAudioPlayoutAppName);
-      write_be32(app + 12, sample.remote_ssrc);
-      write_be32(app + 16, static_cast<uint32_t>(sample.sequence >> 32));
-      write_be32(app + 20, static_cast<uint32_t>(sample.sequence));
+      const auto append_playout = [&](uint32_t name, uint32_t value) {
+        const size_t at = compound.size();
+        compound.resize(at + 28);
+        auto* app = compound.data() + at;
+        app[0] = 0x80;
+        app[1] = 204;
+        app[2] = 0;
+        app[3] = 6;
+        write_be32(app + 4, local_audio_ssrc_.load(std::memory_order_relaxed));
+        write_be32(app + 8, name);
+        write_be32(app + 12, sample.remote_ssrc);
+        write_be32(app + 16, static_cast<uint32_t>(sample.sequence >> 32));
+        write_be32(app + 20, static_cast<uint32_t>(sample.sequence));
+        write_be32(app + 24, value);
+      };
       const int64_t now_us = webrtc::TimeMicros();
       const bool fresh = sample.sampled_us > 0 && sample.sampled_us <= now_us &&
                          now_us - sample.sampled_us <= 3'000'000;
-      write_be32(app + 24, fresh && sample.delay_ms >= 0
-                               ? static_cast<uint32_t>(sample.delay_ms)
-                               : kUnknownPlayout);
+      append_playout(kAudioPlayoutAppName, fresh && sample.delay_ms >= 0
+          ? static_cast<uint32_t>(sample.delay_ms) : kUnknownPlayout);
+      if (fresh && sample.reserve_ms > 0)
+        append_playout(kAudioPlayoutReserveAppName, sample.reserve_ms);
     }
     if (recovery.enabled) {
       const auto app = EncodeAudioRecovery(
@@ -739,11 +749,16 @@ AudioSoftLossSnapshot VeilTransportShim::peer_audio_soft_loss(int64_t now_us) co
 
 void VeilTransportShim::SetLocalAudioPlayout(uint32_t remote_audio_ssrc,
                                             uint64_t sequence, int delay_ms,
-                                            int64_t sampled_us) {
+                                            int64_t sampled_us,
+                                            int buffered_ms, int target_ms) {
+  const int reserve = target_ms > kNominalPlayoutTargetMs &&
+      target_ms <= kMaximumPlayoutTargetMs && buffered_ms <= delay_ms &&
+      delay_ms <= 60000 && buffered_ms >= target_ms - kNominalPlayoutTargetMs
+      ? target_ms - kNominalPlayoutTargetMs : 0;
   std::lock_guard lock(audio_feedback_mu_);
   local_audio_playout_ = {true, remote_audio_ssrc, sequence,
                         delay_ms >= 0 && delay_ms <= 60000 ? delay_ms : -1,
-                        sampled_us};
+                        sampled_us, reserve};
 }
 
 void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
@@ -753,6 +768,8 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
   if (local == 0 && video == 0) return;
   RtcpFeedbackSnapshot candidate, video_candidate;
   AudioPlayoutSnapshot playout;
+  bool multiple_playout_delays = false;
+  std::optional<std::pair<uint64_t, int>> playout_reserve;
   std::vector<std::pair<uint32_t, int>> audio_loss_intervals;
   std::vector<VideoPayloadLoss::Status> transport_statuses;
   bool transport_seen = false, transport_known = true;
@@ -847,22 +864,39 @@ void VeilTransportShim::ObserveReceiverFeedback(std::span<const uint8_t> packet,
           {header.payload(), header.payload_size_bytes()}, header.count());
       if (!recovery) return;
     } else if (header.type() == 204 && header.payload_size_bytes() >= 8 &&
-               read_be32(header.payload() + 4) == kAudioPlayoutAppName) {
+               (read_be32(header.payload() + 4) == kAudioPlayoutAppName ||
+                read_be32(header.payload() + 4) == kAudioPlayoutReserveAppName)) {
       if (header.count() != 0 || header.payload_size_bytes() != 24) return;
       const auto* app = header.payload();
-      const uint32_t delay = read_be32(app + 20);
-      if (delay != kUnknownPlayout && delay > 60000) return;
+      const uint32_t value = read_be32(app + 20);
+      const bool reserve = read_be32(app + 4) == kAudioPlayoutReserveAppName;
+      if (reserve ? value == 0 || value > kMaximumPlayoutReserveMs
+                  : value != kUnknownPlayout && value > 60000) return;
       // The authenticated channel identifies the participant; the target
       // SSRC binds the measurement to OUR audio, independently of video.
       if (local != 0 && read_be32(app + 8) == local) {
         const uint64_t sequence = uint64_t(read_be32(app + 12)) << 32 |
                                   read_be32(app + 16);
-        if (!playout.supported || sequence > playout.sequence)
-          playout = {true, sequence, arrived_us,
-                     delay == kUnknownPlayout ? -1 : static_cast<int>(delay)};
+        if (reserve) {
+          if (playout_reserve) return;
+          playout_reserve.emplace(sequence, static_cast<int>(value));
+        } else {
+          multiple_playout_delays |= playout.supported;
+          if (!playout.supported || sequence > playout.sequence) {
+            playout = {true, sequence, arrived_us,
+                       value == kUnknownPlayout ? -1 : static_cast<int>(value)};
+          }
+        }
       }
     }
     offset += header.packet_size();
+  }
+  // Credit belongs to this exact authenticated VAP1 sample, not any earlier
+  // delay or another block in the same compound report.
+  if (playout.supported && !multiple_playout_delays && playout_reserve &&
+      playout.sequence == playout_reserve->first &&
+      playout.delay_ms >= playout_reserve->second) {
+    playout.reserve_ms = playout_reserve->second;
   }
   if (candidate.arrived_us > 0 || video_candidate.arrived_us > 0 ||
       playout.supported || recovery || concealment || delivery || transport_seen) {

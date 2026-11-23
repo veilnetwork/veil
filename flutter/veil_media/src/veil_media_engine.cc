@@ -2820,6 +2820,7 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   veil_media::AudioSoftLossSnapshot peer_soft_loss{!ws->peers.empty(), 0, 0};
   int peer_audio_recovery_peers = 0;
   int playout_peers = 0, playout_reports = 0, playout_ms = -1;
+  int playout_pressure_ms = -1;
   int64_t rtt = 0;
   uint64_t video_frames = 0;
   double fps = 0;
@@ -2856,6 +2857,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
     if (fresh) {
       ++playout_reports;
       playout_ms = std::max(playout_ms, playout.delay_ms);
+      playout_pressure_ms = std::max(playout_pressure_ms,
+                                    playout.delay_ms - playout.reserve_ms);
     }
     const auto video_report = entry.second->shim->video_feedback();
     video_loss_report_us = std::max(video_loss_report_us,
@@ -2916,7 +2919,9 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               std::max(sample.jitter_buffer_ms, static_cast<uint32_t>(std::max(0, rtp_lag_ms))),
               ws->adm.get());
           peer->shim->SetLocalAudioPlayout(peer->audio_ssrc, sample_sequence,
-              active ? static_cast<int>(pressure_delay_ms) : -1, now_us);
+              active ? static_cast<int>(pressure_delay_ms) : -1, now_us,
+              static_cast<int>(delay_ms),
+              static_cast<int>(sample.jitter_buffer_preferred_ms));
           const auto recovery = ws->recovery_stats->receivers.Snapshot(peer->audio_ssrc);
           peer->shim->SetLocalAudioRecovery(peer->audio_ssrc, sample_sequence,
               active ? recovery : veil_media::AudioRecoverySample{}, now_us);
@@ -3094,7 +3099,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   snapshot += ",\"audio_playout_peers\":" + std::to_string(playout_peers) +
               ",\"audio_playout_sequence\":" + std::to_string(ws->audio_playout_revision) +
               ",\"audio_playout_reports\":" + std::to_string(playout_reports) +
-              ",\"audio_playout_ms\":" + std::to_string(playout_ms);
+              ",\"audio_playout_ms\":" + std::to_string(playout_ms) +
+              ",\"audio_playout_pressure_ms\":" + std::to_string(playout_pressure_ms);
   snapshot += ",\"video_delivery_peers\":{";
   bool first_delivery = true;
   const auto delivery_source = ws->fanout->video_send_stats();
