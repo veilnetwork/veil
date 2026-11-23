@@ -45,6 +45,34 @@ int main() {
     assert(!lag.Output(stamp(65000), 66'390'000));
   }
   {
+    AudioRtpLag lag;
+    uint16_t sequence = 0;
+    for (int ms = 0; ms <= 1000; ms += 20)
+      lag.Packet(7, stamp(ms), 1'000'000 + ms * 1000, sequence++);
+    // Advancing RTP can be delivered in a short burst. The two arrivals at
+    // this early instant are not independent evidence of a faster path.
+    lag.Packet(7, stamp(1160), 2'060'000, sequence++);
+    lag.Packet(7, stamp(1200), 2'060'000, sequence++);
+    lag.Packet(7, stamp(1240), 2'240'000, sequence++);
+    int arrival_excess_ms = -1;
+    assert(lag.Output(stamp(1160), 2'240'000, &arrival_excess_ms) == 80);
+    assert(arrival_excess_ms == 0);
+    // Preserve actual arrival variation for the short jitter reserve.
+    assert(lag.RecentArrivalVariationMs(2'240'000) == 140);
+  }
+  {
+    AudioRtpLag lag;
+    uint16_t sequence = 0;
+    for (int ms = 0; ms <= 1000; ms += 20)
+      lag.Packet(7, stamp(ms), 1'140'000 + ms * 1000, sequence++);
+    lag.Packet(7, stamp(1200), 2'260'000, sequence++);
+    lag.Packet(7, stamp(1220), 2'280'000, sequence++);
+    // A sustained faster path still establishes a lower arrival floor.
+    int arrival_excess_ms = -1;
+    assert(lag.Output(stamp(1140), 2'280'000, &arrival_excess_ms) == 80);
+    assert(arrival_excess_ms == 0);
+  }
+  {
     AudioRtpLag late_arrival, late_playout;
     for (int ms = 0; ms <= 1000; ms += 20) {
       const auto now = 1'000'000 + ms * 1000;

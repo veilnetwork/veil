@@ -9,7 +9,7 @@
 namespace veil_media {
 // Serialized by the owning NetEq caller. All clocks are local monotonic time;
 // the sender contributes only its Opus RTP clock. No allocation or wire data.
-// The recent minimum arrival intercept removes constant path delay/clock offset.
+// A recent arrival floor removes constant path delay and clock offset.
 // Age still includes upstream excess delay, unlike NetEq's storage size. It is
 // not absolute one-way latency, an available-capacity estimate or a trim limit.
 class AudioRtpLag {
@@ -23,6 +23,7 @@ class AudioRtpLag {
     const int16_t sequence_step = sequence_known
         ? static_cast<int16_t>(*sequence - *sequence_) : 0;
     bool restarted = false, advances_clock = false;
+    int64_t supported_floor_us = INT64_MAX;
     if (!ssrc_ || ssrc != ssrc_ || now_us < last_evidence_us_ ||
         now_us - last_evidence_us_ > kHistoryUs ||
         std::abs(sequence_step) > 128) {
@@ -48,7 +49,19 @@ class AudioRtpLag {
         return true;
       }
       if (delta > 0) {
+        const int64_t media_step_us = TickUs(delta);
+        const int64_t arrival_step_us = now_us - anchor_us_;
+        const int64_t previous_intercept = anchor_us_ - TickUs(anchor_ticks_);
         anchor_ticks_ += delta;
+        // A dispatch batch or a stalled receive clock can tag RTP packets
+        // several media intervals apart with nearly the same receipt time.
+        // Lower the floor only to a value supported by two advancing
+        // arrivals with time between them on the receive clock.
+        if (arrival_step_us > 0 &&
+            arrival_step_us >= (media_step_us + 1) / 2) {
+          supported_floor_us = std::max(previous_intercept,
+                                        now_us - TickUs(anchor_ticks_));
+        }
         anchor_stamp_ = stamp;
         anchor_us_ = now_us;
         ++distinct_packets_;
@@ -70,6 +83,8 @@ class AudioRtpLag {
     if (bucket.epoch != epoch) bucket = {epoch, intercept};
     else bucket.minimum_us = std::min(bucket.minimum_us, intercept);
     bucket.maximum_us = std::max(bucket.maximum_us, intercept);
+    bucket.supported_floor_us = std::min(bucket.supported_floor_us,
+                                         supported_floor_us);
     return restarted;
   }
 
@@ -107,22 +122,30 @@ class AudioRtpLag {
         now_us - last_evidence_us_ > 3'000'000 || now_us - first_us_ < 100'000)
       return std::nullopt;
     const int64_t epoch = now_us / kBucketUs;
-    std::optional<int64_t> floor;
+    int64_t raw_floor_us = INT64_MAX;
+    int64_t supported_floor_us = INT64_MAX;
     for (const auto& bucket : buckets_) {
-      if (bucket.epoch >= 0 && bucket.epoch <= epoch &&
-          epoch - bucket.epoch < static_cast<int64_t>(buckets_.size()))
-        floor = floor ? std::min(*floor, bucket.minimum_us) : bucket.minimum_us;
+      if (bucket.epoch < 0 || bucket.epoch > epoch ||
+          epoch - bucket.epoch >= static_cast<int64_t>(buckets_.size())) {
+        continue;
+      }
+      raw_floor_us = std::min(raw_floor_us, bucket.minimum_us);
+      supported_floor_us = std::min(supported_floor_us,
+                                    bucket.supported_floor_us);
     }
-    if (!floor) return std::nullopt;
+    // Sparse or wholly batched input can have only raw observations.
+    const int64_t floor_us =
+        supported_floor_us == INT64_MAX ? raw_floor_us : supported_floor_us;
+    if (floor_us == INT64_MAX) return std::nullopt;
     const int32_t delta = static_cast<int32_t>(stamp - anchor_stamp_);
     if (delta > kHz || delta < -60 * kHz) return std::nullopt;
-    const int64_t age_us = now_us - TickUs(anchor_ticks_ + delta) - *floor;
+    const int64_t age_us = now_us - TickUs(anchor_ticks_ + delta) - floor_us;
     if (age_us < 0) return std::nullopt;
     if (arrival_excess_ms) {
       // Compare the latest advancing packet's arrival with the same arrival
       // floor. The remainder is media distance to that packet plus time
       // since its arrival, not a direct wall-time measurement of the queue.
-      const int64_t excess_us = anchor_us_ - TickUs(anchor_ticks_) - *floor;
+      const int64_t excess_us = anchor_us_ - TickUs(anchor_ticks_) - floor_us;
       if (excess_us >= 0 && excess_us <= age_us) {
         *arrival_excess_ms = static_cast<int>(
             std::min<int64_t>(60000, excess_us / 1000));
@@ -155,7 +178,10 @@ class AudioRtpLag {
     return (ticks / kHz) * 1'000'000 + (ticks % kHz) * 1'000'000 / kHz;
   }
   struct Bucket {
-    int64_t epoch = -1, minimum_us = 0, maximum_us = INT64_MIN;
+    int64_t epoch = -1;
+    int64_t minimum_us = 0;
+    int64_t maximum_us = INT64_MIN;
+    int64_t supported_floor_us = INT64_MAX;
   };
   std::array<Bucket, 60> buckets_{};
   uint32_t ssrc_ = 0, anchor_stamp_ = 0;
