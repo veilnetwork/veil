@@ -95,7 +95,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
         // local queue below NetEq's own jitter reserve: it will refill toward
         // that target and manufacture another catch-up event. Arrival/decoder
         // headroom must be the same for age-only and storage-driven catch-up.
-        const int jitter_reserve_ms = JitterReserveMs(now_us);
+        const int jitter_reserve_ms = JitterReserveMs(now_us, state.current_buffer_size_ms);
         const int recovery_budget_ms = std::max(
             NominalRecoveryBudgetMs(), jitter_reserve_ms);
         const int local_reserve_ms = std::max(frame_headroom_ms_ + 30, jitter_reserve_ms);
@@ -172,8 +172,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
       if (h.ssrc == registered_ssrc_ && h.payloadType < opus_payloads_.size() &&
           opus_payloads_[h.payloadType]) {
         if (rtp_lag_.Packet(h.ssrc, h.timestamp, received_us, h.sequenceNumber)) {
-          arrival_reserve_ms_ = 0;
-          last_render_underrun_us_ = 0;
+          ResetReserve();
           decoded_stamp_.reset();
           receiver_recovery_->SetLag(std::nullopt, 0);
         }
@@ -242,10 +241,16 @@ class RecoveringNetEq final : public webrtc::NetEq {
   }
   void ResetLag() {
     rtp_lag_.Reset();
-    arrival_reserve_ms_ = 0;
-    last_render_underrun_us_ = 0;
+    ResetReserve();
     decoded_stamp_.reset();
     receiver_recovery_->SetLag(std::nullopt, 0);
+  }
+  void ResetReserve() {
+    arrival_reserve_ms_ = 0;
+    last_render_underrun_us_ = 0;
+    last_reserve_render_us_ = 0;
+    last_target_ms_ = 0;
+    retiring_target_reserve_ms_ = 0;
   }
   void TrackCodec(int payload, const webrtc::SdpAudioFormat& f) {
     if (payload >= 0 && static_cast<size_t>(payload) < opus_payloads_.size())
@@ -281,7 +286,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
   // buffer and the 16-pull callback limit remain bounded independently.
   static constexpr int kMaximumAdaptiveTargetMs = 500;
   static constexpr int kRenderBlockMs = 10;
-  int JitterReserveMs(int64_t now_us) {
+  int JitterReserveMs(int64_t now_us, uint64_t queued_ms) {
     const int target = std::clamp(inner_->TargetDelayMs(), 0, kMaximumAdaptiveTargetMs);
     const int headroom_ms = 2 * frame_headroom_ms_;
     const int target_reserve_ms = target + headroom_ms;
@@ -323,9 +328,10 @@ class RecoveringNetEq final : public webrtc::NetEq {
     const bool refilling = ceiling_ms == kMaximumAdaptiveTargetMs &&
         last_render_underrun_us_ > 0 && now_us >= last_render_underrun_us_ &&
         now_us - last_render_underrun_us_ <= kRefillAfterUnderrunUs;
-    const int measured_ms = !adaptive && !refilling && recent_ms > max_onset_variation_ms
+    const int arrival_ms = !adaptive && !refilling && recent_ms > max_onset_variation_ms
         ? target_reserve_ms
         : std::max(target_reserve_ms, std::min(recent_ms + headroom_ms, max_reserve_ms));
+    const int retiring_target_ms = RetiringTargetReserveMs(now_us, target, queued_ms);
     // The recent arrival maximum expires in 500-ms buckets. Removing the
     // full allowance at that boundary can skip several speech blocks in
     // one callback. Retire it at 200 ms of reserve per second so NetEq can
@@ -338,12 +344,42 @@ class RecoveringNetEq final : public webrtc::NetEq {
       const int64_t retired_ms = (now_us - arrival_reserve_at_us_) /
           kUsPerMsOfRetiredReserve;
       const int64_t remaining_ms = std::min({max_reserve_ms, arrival_reserve_ms_,
-          measured_ms + kMaximumRetiringReserveMs}) - retired_ms;
-      if (remaining_ms > measured_ms) return static_cast<int>(remaining_ms);
+          arrival_ms + kMaximumRetiringReserveMs}) - retired_ms;
+      if (remaining_ms > arrival_ms)
+        return std::max(static_cast<int>(remaining_ms), retiring_target_ms);
     }
-    arrival_reserve_ms_ = measured_ms;
+    arrival_reserve_ms_ = arrival_ms;
     arrival_reserve_at_us_ = now_us;
-    return measured_ms;
+    return std::max(arrival_ms, retiring_target_ms);
+  }
+  int RetiringTargetReserveMs(int64_t now_us, int target, uint64_t queued_ms) {
+    // A quiet route can drop a full estimator target in one update. Keep
+    // only the speech already covered by that target, leaving the ordinary
+    // time scaler time to catch up before discarding decoded render blocks.
+    // This is a catch-up allowance, not a minimum jitter-buffer target.
+    constexpr int64_t kMaxContinuousRenderGapUs = 80'000;
+    constexpr int kLargeTargetDropMs = 160;
+    constexpr int kHighTargetMs = 300;
+    constexpr int64_t kUsPerMsOfRetiredTarget = 8000;
+    if (last_reserve_render_us_ <= 0 || now_us < last_reserve_render_us_ ||
+        now_us - last_reserve_render_us_ > kMaxContinuousRenderGapUs) {
+      retiring_target_reserve_ms_ = 0;
+    } else if (last_target_ms_ >= kHighTargetMs &&
+               last_target_ms_ - target >= kLargeTargetDropMs) {
+      retiring_target_reserve_ms_ = static_cast<int>(std::min<uint64_t>(
+          queued_ms, last_target_ms_ + 2 * frame_headroom_ms_));
+      target_retirement_started_us_ = now_us;
+    }
+    last_reserve_render_us_ = now_us;
+    last_target_ms_ = target;
+    if (retiring_target_reserve_ms_ == 0) return 0;
+    const int64_t released_ms = (now_us - target_retirement_started_us_) /
+        kUsPerMsOfRetiredTarget;
+    const int64_t remaining_ms = retiring_target_reserve_ms_ - released_ms;
+    if (remaining_ms > target + 2 * frame_headroom_ms_)
+      return static_cast<int>(remaining_ms);
+    retiring_target_reserve_ms_ = 0;
+    return 0;
   }
   int NominalRecoveryBudgetMs() const {
     return std::clamp(80 + 2 * frame_headroom_ms_, 120, 200);
@@ -355,12 +391,18 @@ class RecoveringNetEq final : public webrtc::NetEq {
     if (ceiling == applied_target_ceiling_ms_) return true;
     if (!inner_->SetMaximumDelay(ceiling)) return false;
     applied_target_ceiling_ms_ = ceiling;
+    last_target_ms_ = 0;
+    retiring_target_reserve_ms_ = 0;
     return true;
   }
   int frame_headroom_ms_ = 20;
   int arrival_reserve_ms_ = 0;
+  int last_target_ms_ = 0;
+  int retiring_target_reserve_ms_ = 0;
   int64_t last_render_underrun_us_ = 0;
   int64_t arrival_reserve_at_us_ = 0;
+  int64_t last_reserve_render_us_ = 0;
+  int64_t target_retirement_started_us_ = 0;
   int requested_maximum_delay_ms_ = 0;
   int applied_target_ceiling_ms_ = -1;
   // Outlives the controller and packet-buffer stopwatches inside inner_.

@@ -39,7 +39,8 @@ struct Packet {
   uint16_t sequence;
   std::vector<uint8_t> bytes;
 };
-static std::vector<Packet> encode(const std::vector<int16_t>& speech, int ms) {
+static std::vector<Packet> encode(const std::vector<int16_t>& speech, int ms,
+                                  int duration_ms = 33000) {
   int error = 0;
   std::unique_ptr<OpusEncoder, decltype(&opus_encoder_destroy)> enc(
       opus_encoder_create(48000, 1, OPUS_APPLICATION_VOIP, &error), opus_encoder_destroy);
@@ -51,7 +52,7 @@ static std::vector<Packet> encode(const std::vector<int16_t>& speech, int ms) {
   std::vector<Packet> result;
   std::vector<int16_t> pcm(ms*48);
   std::array<uint8_t, 1500> data{};
-  for (int at = 0; at < 33000; at += ms) {
+  for (int at = 0; at < duration_ms; at += ms) {
     // Sample-and-hold 16 -> 48 kHz, identical for every receiver. This is a
     // packet/decoder regression, not a resampler or speech-quality benchmark.
     for (int i = 0; i < ms*48; ++i) pcm[i] = speech[((at*48+i)/3) % speech.size()];
@@ -128,6 +129,8 @@ struct Metrics {
   uint64_t max_discard_per_render = 0, recovery_queue_ms = 0;
   uint64_t packet_flushes = 0;
   uint64_t first_release_discarded_ms = 0;
+  uint64_t final_queue_ms = 0;
+  int final_target_ms = 0;
   int max_gap = 0, q95 = 0, max_target = 0, recovery_target_ms = 0;
 };
 class CallDelayTrials final : public webrtc::FieldTrialsView {
@@ -143,7 +146,8 @@ class CallDelayTrials final : public webrtc::FieldTrialsView {
 };
 
 static Metrics run(const std::vector<Packet>& packets, bool custom,
-                   int sample_after_ms = 1500, bool call_delay_trials = false) {
+                   int sample_after_ms = 1500, bool call_delay_trials = false,
+                   int duration_ms = 30000) {
   Wall wall;
   auto* prior = webrtc::SetClockForTesting(&wall);
   Metrics result;
@@ -172,7 +176,7 @@ static Metrics run(const std::vector<Packet>& packets, bool custom,
     uint64_t previous_discarded = 0;
     uint64_t output_energy = 0;
     int gap = 0;
-    for (int at = 0; at < 30000; at += 10) {
+    for (int at = 0; at < duration_ms; at += 10) {
       wall.us = 1000000 + at*1000;
       while (index < packets.size() && packets[index].at <= at) {
         const auto& p = packets[index++];
@@ -217,6 +221,8 @@ static Metrics run(const std::vector<Packet>& packets, bool custom,
       clock.AdvanceTimeMilliseconds(10);
     }
     const auto end=neteq->GetLifetimeStatistics();
+    result.final_queue_ms = neteq->GetOperationsAndState().current_buffer_size_ms;
+    result.final_target_ms = neteq->TargetDelayMs();
     need(index > 300 && output_energy > 0 && queues.size() > 1000,
          "missing packet/PCM/render witnesses");
     result.conceal=(end.concealed_samples-base.concealed_samples)/48;
@@ -376,15 +382,19 @@ int main(int argc,char**argv) {
     need(measured.played_plc == 0, "paced bursts caused repeated played concealment");
     for (auto& packet : serialized) ++packet.at;
   }
-  auto recovering = network(encoded_20ms, 10, 197);
+  // Keep receiving after the old histogram target expires. Measuring only
+  // the first seconds after the path settles misses the later target drop.
+  auto recovering = network(encode(speech, 20, 43000), 10, 197);
   for (int phase = 0; phase < 10; ++phase) {
-    const auto measured = run(recovering, true, 18000);
+    const auto measured = run(recovering, true, 18000, true, 42000);
     std::printf("after serialized jitter at phase %d: hard_discard=%llu ms "
-                "max_per_render=%llu ms concealed=%llu ms recovery_queue=%llu ms target=%d ms\n",
+                "max_per_render=%llu ms concealed=%llu ms recovery_queue=%llu ms target=%d ms "
+                "final_queue=%llu ms target=%d ms\n",
         phase, (unsigned long long)measured.discarded,
         (unsigned long long)measured.max_discard_per_render,
         (unsigned long long)measured.played_plc,
-        (unsigned long long)measured.recovery_queue_ms, measured.recovery_target_ms);
+        (unsigned long long)measured.recovery_queue_ms, measured.recovery_target_ms,
+        (unsigned long long)measured.final_queue_ms, measured.final_target_ms);
     need(measured.max_target >= 300 && measured.max_target <= 500,
          "recovery did not exercise the adaptive reserve");
     need(measured.max_discard_per_render <= 20,
@@ -393,6 +403,8 @@ int main(int argc,char**argv) {
     need(measured.played_plc == 0 && measured.recovery_queue_ms > 0 &&
              measured.recovery_queue_ms <= recovery_queue_limit_ms,
          "recovery must drain the excess without adding concealment");
+    need(measured.final_target_ms <= 80 && measured.final_queue_ms <= 120,
+         "retiring the estimator target kept a large queue on the recovered path");
     for (auto& packet : recovering) ++packet.at;
   }
   std::puts("PASS lossless jitter/reorder speech reserve across 20/40/60-ms Opus");

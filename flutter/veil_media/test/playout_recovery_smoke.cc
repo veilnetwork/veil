@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 #include <unistd.h>
 
@@ -381,6 +382,34 @@ int main() {
     observed->buffer_ms_override += 10;
     assert(recovering.GetAudio(&frame, nullptr, nullptr, std::nullopt) == 0);
     assert(observed->pulls == 18 && stats->discarded_ms == 160);
+  }
+  // When a live estimator drops its target after a clean route transition,
+  // leave time for NetEq's speech acceleration before trimming the reserve.
+  // A stopped renderer or an explicit lower cap still drains immediately.
+  for (const auto& [render_gap_us, ceiling_ms] :
+       {std::pair{10'000, 500}, std::pair{250'000, 500}, std::pair{10'000, 40}}) {
+    RenderClock wall;
+    auto* previous = webrtc::SetClockForTesting(&wall);
+    auto decoder = std::make_unique<Decoder>();
+    auto* observed = decoder.get();
+    observed->mode = 5;
+    observed->frame_ms = 20;
+    observed->target_ms = 500;
+    observed->buffer_ms_override = 540;
+    auto stats = std::make_shared<veil_media::PlayoutRecoveryStats>();
+    veil_media::RecoveringNetEq recovering(std::move(decoder), stats);
+    webrtc::AudioFrame frame;
+    wall.us = 1'000'000;
+    assert(recovering.GetAudio(&frame, nullptr, nullptr, std::nullopt) == 0);
+    assert(stats->discarded_ms == 0);
+    wall.us += render_gap_us;
+    if (ceiling_ms == 40) assert(recovering.SetMaximumDelay(ceiling_ms));
+    observed->target_ms = 40;
+    assert(recovering.GetAudio(&frame, nullptr, nullptr, std::nullopt) == 0);
+    assert(recovering.TargetDelayMs() == 40 && observed->maximum_delay == ceiling_ms);
+    const bool smooth = render_gap_us == 10'000 && ceiling_ms == 500;
+    assert(stats->discarded_ms == (smooth ? 0u : 160u));
+    webrtc::SetClockForTesting(previous);
   }
   // The same late RTP batch can follow either a receiver pause or an
   // actively rendered underrun. Only fresh concealment with empty storage
