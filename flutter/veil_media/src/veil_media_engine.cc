@@ -3067,6 +3067,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   snapshot += ",\"video_rtcp_remb_coalesced_copies\":" +
               std::to_string(rtcp_send.video_remb_coalesced_copies);
   snapshot += ",\"audio_loss_report_us\":" + std::to_string(audio_loss_report_us) +
+              ",\"audio_loss_report_age_ms\":" + std::to_string(
+                  audio_loss_report_us > 0 ? (now_us - audio_loss_report_us) / 1000 : -1) +
               ",\"video_loss_report_us\":" + std::to_string(video_loss_report_us);
   snapshot += ",\"audio_local_concealment_report_us\":" +
               std::to_string(local_audio_concealment_report_us);
@@ -4975,6 +4977,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
       }
       const auto audio_loss_report_us = audio_report.fresh_loss_report_us(loss_now_us);
       snapshot += ",\"audio_loss_report_us\":" + std::to_string(audio_loss_report_us);
+      snapshot += ",\"audio_loss_report_age_ms\":" + std::to_string(
+          audio_loss_report_us > 0 ? (loss_now_us - audio_loss_report_us) / 1000 : -1);
       snapshot += ",\"audio_previous_loss_report_us\":" +
           std::to_string(audio_loss_report_us > 0 ? audio_report.previous_loss_report_us : 0);
       snapshot += ",\"audio_loss_report_fraction\":" +

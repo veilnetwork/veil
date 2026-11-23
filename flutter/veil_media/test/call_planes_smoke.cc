@@ -99,13 +99,16 @@ extern "C" int veil_media_set_recv_callback(
   else callbacks.erase(chan);
   return 0;
 }
-static uint64_t stat(VeilMediaEngine* engine, const char* name) {
-  char* json = veil_media_engine_get_stats(engine);
+static uint64_t stat_in_json(const char* json, const char* name) {
   assert(json);
   const std::string key = std::string("\"") + name + "\":";
   const char* at = std::strstr(json, key.c_str());
   assert(at);
-  const uint64_t value = std::strtoull(at + key.size(), nullptr, 10);
+  return std::strtoull(at + key.size(), nullptr, 10);
+}
+static uint64_t stat(VeilMediaEngine* engine, const char* name) {
+  char* json = veil_media_engine_get_stats(engine);
+  const auto value = stat_in_json(json, name);
   std::free(json);
   return value;
 }
@@ -166,11 +169,7 @@ static int check_blocked_audio_stats(void* ctx, uint64_t, uint32_t, uint32_t) {
 
 static uint64_t group_stat(VeilGroupMediaEngine* engine, const char* name) {
   char* json = veil_media_group_engine_get_stats(engine);
-  assert(json);
-  const std::string key = std::string("\"") + name + "\":";
-  const char* at = std::strstr(json, key.c_str());
-  assert(at);
-  const uint64_t value = std::strtoull(at + key.size(), nullptr, 10);
+  const auto value = stat_in_json(json, name);
   veil_media_free_string(json);
   return value;
 }
@@ -707,6 +706,7 @@ int main(int argc, char** argv) {
       return stat(e.get(), key);
     };
     assert(stat(e.get(), "audio_loss_report_us") == 0);
+    assert(stat(e.get(), "audio_loss_report_age_ms") == UINT64_MAX);
     assert(stat(e.get(), "audio_feedback_age_ms") == UINT64_MAX);
     assert(stat(e.get(), "video_feedback_age_ms") == UINT64_MAX);
     report(160, 2, audio ^ 0x100, 255, 0);  // foreign SSRC
@@ -725,9 +725,14 @@ int main(int argc, char** argv) {
     assert(stat(e.get(), "tx_loss_pct") == 0);
     assert(stat(e.get(), "video_loss_report_us") == 0);
     for (int i = 0; i < 4; ++i) assert(stat(e.get(), "audio_loss_report_us") == first);
-    report(160, 2, audio, 0, 0);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    assert(stat(e.get(), "audio_loss_report_us") == first);
+    wait_stat("audio_loss_report_age_ms", 0);
+    report(160, 2, audio, 0, 480);
+    wait_stat("tx_jitter_ms", 0);
+    char* after_healthy = veil_media_engine_get_stats(e.get());
+    assert(stat_in_json(after_healthy, "audio_loss_report_us") == first);
+    assert(stat_in_json(after_healthy, "audio_loss_report_age_ms") >
+           stat_in_json(after_healthy, "audio_feedback_age_ms"));
+    veil_media_free_string(after_healthy);
     // SR report blocks carry the same loss evidence as standalone RR.
     inject_raw(160, report_packet(2, video, 1, 0, true));
     const auto video_loss = wait_stat("video_loss_report_us", 0);
@@ -768,6 +773,7 @@ int main(int argc, char** argv) {
     assert(veil_media_group_engine_add_peer(room.get(), 180, peer) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_add_peer(room.get(), 181, other) == VEIL_MEDIA_OK);
     assert(veil_media_group_engine_start_audio(room.get()) == VEIL_MEDIA_OK);
+    assert(group_stat(room.get(), "audio_loss_report_age_ms") == UINT64_MAX);
     report(180, group_ssrc(peer), group_ssrc(local), 1, 0);
     const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (group_stat(room.get(), "audio_loss_report_us") == 0 &&
@@ -775,6 +781,7 @@ int main(int argc, char** argv) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     const auto room_loss = group_stat(room.get(), "audio_loss_report_us");
     assert(room_loss > 0);
+    assert(group_stat(room.get(), "audio_loss_report_age_ms") != UINT64_MAX);
     const auto expiry = std::chrono::steady_clock::now() + std::chrono::milliseconds(15500);
     report(181, group_ssrc(other), group_ssrc(local), 0, 0);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -787,11 +794,13 @@ int main(int argc, char** argv) {
     report(181, group_ssrc(other), group_ssrc(local), 0, 0);
     std::this_thread::sleep_until(expiry);
     assert(stat(e.get(), "audio_loss_report_us") == 0);
+    assert(stat(e.get(), "audio_loss_report_age_ms") == UINT64_MAX);
     assert(stat(e.get(), "audio_loss_report_fraction") == 0);
     assert(stat(e.get(), "audio_previous_loss_report_us") == 0);
     assert(stat(e.get(), "video_loss_report_us") == 0);
     assert(stat(e.get(), "video_feedback_age_ms") == UINT64_MAX);
     assert(group_stat(room.get(), "audio_loss_report_us") == 0);
+    assert(group_stat(room.get(), "audio_loss_report_age_ms") == UINT64_MAX);
     assert(stat(e.get(), "audio_feedback_reports") == 1);
     assert(group_stat(room.get(), "audio_feedback_reports") == 2);
     assert(second > first);
