@@ -636,6 +636,10 @@ extern "C" int veil_media_test_group_fanout_packet(VeilGroupMediaEngine* e,
                                   : group_audio_ssrc_of(e->local);
   for (int i = 0; i < 4; ++i) packet[8+i] = ssrc >> (24-i*8);
   webrtc::PacketOptions options;
+  if (secondary == 9 || secondary == 10) {
+    packet[1] |= 0x80;
+    options.is_media = secondary == 9;
+  }
   return e->ws->fanout->SendRtp(packet, options) ? 0 : 1;
 }
 

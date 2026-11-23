@@ -436,16 +436,20 @@ class GroupFanoutTransport : public webrtc::Transport {
     const auto channels = Snapshot();
     veil_media::RememberVideoLossPacket(*video_history_, packet, video_ssrc_, webrtc::TimeMicros());
     bool any = false;
+    bool admitted_frame_marker = false;
     for (const uint64_t chan : channels) {
       const int64_t began_ns = webrtc::TimeMicros() * 1000;
       const bool video = video_stats_.mark_attempt(packet, video_ssrc_, began_ns, 96);
       const int rc = veil_media_send_datagram(chan, packet.data(), packet.size());
       const bool sent = rc == 0;
-      if (video)
+      if (video) {
         video_stats_.mark_result(began_ns, webrtc::TimeMicros() * 1000,
                                  sent, options.is_media);
-      if (video)
+        if (sent && options.is_media && (packet[1] & 0x80)) {
+          admitted_frame_marker = true;
+        }
         video_send_trace_.Rtp(packet, video_ssrc_, 's', began_ns / 1000, rc, chan);
+      }
       if (audio_send_trace_.enabled())
         audio_send_trace_.Record(chan, packet, began_ns / 1000,
                                  webrtc::TimeMicros(), sent);
@@ -453,6 +457,9 @@ class GroupFanoutTransport : public webrtc::Transport {
         audio_drops_.fetch_add(1, std::memory_order_relaxed);
       any = sent || any;
     }
+    // Each original marker counts once, regardless of how many peers accepted it.
+    if (admitted_frame_marker)
+      video_admitted_frame_markers_.fetch_add(1, std::memory_order_relaxed);
     if (any && options.packet_id != -1) {
       (veil_media::IsSecondaryInboundRtp(packet) ? video_call_ : call_)->OnSentPacket(
           webrtc::SentPacketInfo(options.packet_id, webrtc::TimeMillis()));
@@ -509,6 +516,9 @@ class GroupFanoutTransport : public webrtc::Transport {
   veil_media::RtpSendSnapshot video_send_stats() const {
     return video_stats_.snapshot(webrtc::TimeMicros() * 1000);
   }
+  uint64_t video_admitted_frame_markers() const {
+    return video_admitted_frame_markers_.load(std::memory_order_relaxed);
+  }
 
  private:
   veil_media::VideoControlTransport<GroupFanoutTransport> video_transport_{*this};
@@ -519,6 +529,7 @@ class GroupFanoutTransport : public webrtc::Transport {
     return channels_;
   }
   std::atomic<uint64_t> audio_drops_{0};
+  std::atomic<uint64_t> video_admitted_frame_markers_{0};
   const uint32_t video_ssrc_;
   const std::shared_ptr<veil_media::VideoPacketHistory> video_history_;
   veil_media::RtpSendStats video_stats_;
@@ -3107,6 +3118,8 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   snapshot += "}";
   snapshot += ",\"video_send_paused\":" + std::to_string(ws->video_send_paused.load() ? 1 : 0);
   const auto video_send = ws->fanout->video_send_stats();
+  snapshot += ",\"video_tx_admitted_frame_markers\":" +
+              std::to_string(ws->fanout->video_admitted_frame_markers());
   // Per-peer attempted copies, unlike video_tx_frames (one logical encoder).
   // Includes payload, padding and rejected copies; no media role leaves host.
   snapshot += ",\"video_tx_rtp_attempts\":" + std::to_string(video_send.attempts) +
@@ -5014,6 +5027,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
       snapshot += ",\"audio_output_duration_ms\":" + std::to_string(audio_output_duration_ms);
       snapshot += ",\"audio_tx_rtp_drops\":" + std::to_string(tx_audio.dropped);
       const auto video_send = ws->shim->video_send_stats();
+      snapshot += ",\"video_tx_admitted_frame_markers\":" +
+          std::to_string(ws->shim->video_admitted_frame_markers());
       snapshot += ",\"video_packet_overhead_bytes\":" +
           std::to_string(ws->video_packet_overhead.load());
       snapshot += ",\"video_tx_rtp_attempts\":" + std::to_string(video_send.attempts);

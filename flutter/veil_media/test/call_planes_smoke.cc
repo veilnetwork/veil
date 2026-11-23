@@ -570,6 +570,7 @@ int main(int argc, char** argv) {
                      : veil_media_engine_push_video_frame(one.get(), y.data(), uv.data(), uv.data(),
                     width, height, width, width / 2, width / 2, 0)) == VEIL_MEDIA_OK);
         if (metric("video_frame_oversize_count") &&
+            metric("video_tx_admitted_frame_markers") > 0 &&
             metric("video_frame_encoded_pixels") <= metric("video_frame_pixel_cap")) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(35));
       }
@@ -581,6 +582,7 @@ int main(int argc, char** argv) {
       // Local preview retains the original capture rather than the source's
       // smaller encoder input. Every encoded image still reaches packetization.
       assert(metric("video_tx_frames") > 0);
+      assert(metric("video_tx_admitted_frame_markers") > 0);
       std::vector<uint8_t> rgba(width * height * 4);
       int w = 0, h = 0;
       const int preview = room
@@ -639,6 +641,32 @@ int main(int argc, char** argv) {
     assert(group_stat(e.get(),"video_rtcp_remb_coalesced_copies")==4);
     e.reset(); assert(callbacks.empty());
     std::puts("REMB cadence: video-only, immediate cuts/repair, partial fanout and membership OK");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--group-video-admission") == 0) {
+    uint8_t local[32] = {91}, alice[32] = {92}, bob[32] = {93};
+    std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> e(
+        veil_media_group_engine_create(local), veil_media_group_engine_destroy);
+    assert(e);
+    assert(veil_media_group_engine_add_peer(e.get(), 190, alice) == VEIL_MEDIA_OK);
+    assert(veil_media_group_engine_add_peer(e.get(), 191, bob) == VEIL_MEDIA_OK);
+    const auto markers = [&] {
+      return group_stat(e.get(), "video_tx_admitted_frame_markers");
+    };
+    assert(markers() == 0);
+    assert(veil_media_test_group_fanout_packet(e.get(), 9) == 0);
+    assert(markers() == 1);  // Both peers accepted the same logical marker.
+    { std::lock_guard lock(callback_mu); rejected_channels.insert(190); }
+    assert(veil_media_test_group_fanout_packet(e.get(), 9) == 0);
+    assert(veil_media_test_group_fanout_packet(e.get(), 10) == 0);
+    assert(markers() == 2);  // Partial admission counts. Repair does not.
+    { std::lock_guard lock(callback_mu); rejected_channels.insert(191); }
+    assert(veil_media_test_group_fanout_packet(e.get(), 9) != 0);
+    assert(markers() == 2);
+    { std::lock_guard lock(callback_mu); rejected_channels.clear(); }
+    e.reset();
+    assert(callbacks.empty());
+    std::puts("Group video admission: one per original marker accepted by any peer");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--group-rtcp-accounting") == 0) {

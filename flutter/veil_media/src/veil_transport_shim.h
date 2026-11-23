@@ -271,6 +271,9 @@ class VeilTransportShim : public webrtc::Transport {
   VideoCadenceSnapshot delivered_video_cadence() const;
   AudioSendSnapshot audio_send_stats() const;
   RtpSendSnapshot video_send_stats() const;
+  uint64_t video_admitted_frame_markers() const {
+    return video_admitted_frame_markers_.load(std::memory_order_relaxed);
+  }
   uint64_t foreign_remb_blocks(bool video) const {
     return foreign_remb_blocks_[video ? 1 : 0].load(std::memory_order_relaxed);
   }
@@ -416,6 +419,7 @@ class VeilTransportShim : public webrtc::Transport {
   std::atomic<uint64_t> outbound_video_rtcp_packet_count_{0}, outbound_video_rtcp_byte_count_{0};
   std::atomic<uint64_t> outbound_byte_count_{0};
   std::atomic<uint64_t> outbound_dropped_count_{0};
+  std::atomic<uint64_t> video_admitted_frame_markers_{0};
   AtomicVideoCadence outbound_video_cadence_;
   AtomicVideoCadence inbound_video_cadence_;
   AtomicVideoCadence delivered_video_cadence_;

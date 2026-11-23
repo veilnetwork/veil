@@ -58,8 +58,15 @@ int main() {
     webrtc::PacketOptions options;
     options.is_media = true;
     require(source.SendRtp(rtp, options), "original RTP not admitted");
-    send_result = 1;
+    require(source.video_admitted_frame_markers() == 0,
+            "packet without marker counted as a frame");
+    rtp[1] |= 0x80;
+    require(source.SendRtp(rtp, options), "original frame marker not admitted");
+    require(source.video_admitted_frame_markers() == 1,
+            "original frame marker not counted");
     options.is_media = false;  // Real WebRTC excludes NACK repair and padding.
+    require(source.SendRtp(rtp, options), "repair RTP not admitted");
+    send_result = 1;
     require(!source.SendRtp(rtp, options), "repair admission failure hidden");
     auto snapshot = source.video_send_stats();
     require(snapshot.dropped == 1 && snapshot.source_dropped == 0,
@@ -70,6 +77,9 @@ int main() {
     snapshot = source.video_send_stats();
     require(snapshot.dropped == 2 && snapshot.source_dropped == 1,
             "original admission failure not distinguished");
+    require(source.outbound_video_cadence().frames == 4 &&
+                source.video_admitted_frame_markers() == 1,
+            "rejected or repair marker counted as admitted original video");
     send_result = 0;
     source.Stop();
   }
