@@ -671,7 +671,7 @@ AudioRecoveryCursor VeilTransportShim::peer_audio_recovery_snapshot() const {
 void VeilTransportShim::SetLocalAudioConcealment(
     uint32_t remote_audio_ssrc, uint64_t sequence, uint64_t origin,
     uint64_t concealed_samples, uint64_t silent_concealed_samples,
-    int64_t sampled_us) {
+    int64_t sampled_us, bool advertise_recovery) {
   const auto now_us = webrtc::TimeMicros();
   bool notify = false;
   {
@@ -683,13 +683,26 @@ void VeilTransportShim::SetLocalAudioConcealment(
     local_audio_soft_loss_.Observe(AudioSoftLossWindow::Kind::Concealment,
         counters.origin, counters.sequence, counters.concealed_samples,
         counters.known, event, sampled_us);
-    // Normal RTCP can be several seconds apart. A fresh event gets a bounded
-    // supplemental empty RR + APP compound instead of waiting for that timer.
-    // It contains no invented loss/RTT/report block and uses the same encrypted
-    // endpoint channel. Regular reports also carry the latest cursor.
-    notify = event && started_.load(std::memory_order_acquire) &&
-        sampled_us <= now_us && now_us - sampled_us <= 3'000'000 &&
-        (concealment_sent_us_ == 0 || now_us - concealment_sent_us_ >= 1'000'000);
+    // Use the same bounded empty RR + APP path for fresh damage and for one
+    // confirmed quiet interval while the longer damage window is still high.
+    // Normal RTCP also carries these counters, but can be several seconds away.
+    if (!started_.load(std::memory_order_acquire) || sampled_us <= 0 ||
+        sampled_us > now_us || now_us - sampled_us > 3'000'000 ||
+        (concealment_sent_us_ != 0 && now_us - concealment_sent_us_ < 1'000'000)) {
+      return;
+    }
+    const auto& recovery = local_audio_recovery_;
+    const bool paired = advertise_recovery && counters.known &&
+        counters.sequence == sequence && recovery.sample.known &&
+        recovery.remote_ssrc == remote_audio_ssrc &&
+        recovery.sequence == sequence && recovery.sampled_us == sampled_us &&
+        recovery.sample.origin == counters.origin;
+    const auto damage = paired ? local_audio_soft_loss_.FreshReportUs(sampled_us) : 0;
+    const auto recent = damage > last_confirmed_audio_damage_us_
+        ? local_audio_soft_loss_.ProbeSamples(sampled_us) : std::nullopt;
+    const bool confirm_recovery = recent && *recent < AudioSoftLossWindow::kProbeThresholdSamples;
+    if (confirm_recovery) last_confirmed_audio_damage_us_ = damage;
+    notify = event || confirm_recovery;
     if (notify) concealment_sent_us_ = now_us;
   }
   if (notify) {

@@ -310,6 +310,51 @@ int main() {
             "real shim discarded the quiet interval between authenticated reports");
     measured.Stop();
   }
+  {
+    class SampleClock final : public webrtc::ClockInterface {
+     public:
+      int64_t now_us = 1'000'000;
+      int64_t TimeNanos() const override { return now_us * 1000; }
+    } clock;
+    auto* old_clock = webrtc::SetClockForTesting(&clock);
+    VeilTransportShim source(93, nullptr, nullptr, nullptr, nullptr);
+    VeilTransportShim observer(94, nullptr, nullptr, nullptr, nullptr);
+    source.SetLocalAudioSsrc(22);
+    observer.SetLocalAudioSsrc(11);
+    source.Start();
+    observer.Start();
+    const auto update = [&](uint64_t sequence, uint64_t damaged_ms) {
+      clock.now_us = static_cast<int64_t>(sequence) * 1'000'000;
+      source.SetLocalAudioRecovery(11, sequence, {true, 1, 0, 0}, clock.now_us);
+      source.SetLocalAudioConcealment(11, sequence, 1, damaged_ms * 48, 0,
+                                      clock.now_us, true);
+    };
+    const auto before = sends;
+    update(1, 0);
+    require(sends == before, "healthy audio sent supplemental recovery");
+    require(source.SendRtcp(original, {}), "ordinary report was refused");
+    AudioRecoveryFeedbackTest::Observe(observer, sent, clock.now_us);
+    update(2, 400);
+    require(sends == before + 2, "damage was not announced");
+    AudioRecoveryFeedbackTest::Observe(observer, sent, clock.now_us);
+    require(!observer.peer_audio_soft_loss(clock.now_us).probe_samples,
+            "outage qualified as recovered");
+    update(3, 400);
+    update(4, 400);
+    require(sends == before + 2, "recovery sent before the quiet interval");
+    update(5, 400);
+    require(sends == before + 3, "measured recovery waited for periodic RTCP");
+    AudioRecoveryFeedbackTest::Observe(observer, sent, clock.now_us);
+    const auto damage = observer.peer_audio_soft_loss(clock.now_us);
+    require(damage.samples == 400*48 && damage.probe_samples == 0,
+            "supplemental report did not confirm the quiet interval");
+    update(6, 400);
+    update(7, 400);
+    require(sends == before + 3, "one outage sent repeated recovery reports");
+    source.Stop();
+    observer.Stop();
+    webrtc::SetClockForTesting(old_clock);
+  }
   receiver.SetLocalAudioPlayout(11, 1, 80, now);
   receiver.SetLocalAudioRecovery(11, 1, {true, 1, 20, now}, now);
   require(receiver.SendRtcp(original, {}), "source RTCP refused");

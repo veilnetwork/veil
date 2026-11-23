@@ -219,7 +219,7 @@ class VeilTransportShim : public webrtc::Transport {
   void SetLocalAudioConcealment(uint32_t remote_audio_ssrc, uint64_t sequence,
                                uint64_t origin, uint64_t concealed_samples,
                                uint64_t silent_concealed_samples,
-                               int64_t sampled_us);
+                                int64_t sampled_us, bool advertise_recovery = false);
   int64_t peer_audio_concealment_report_us(int64_t now_us) const;
   int64_t local_audio_concealment_report_us(int64_t now_us) const;
   AudioSoftLossSnapshot local_audio_soft_loss(int64_t now_us) const;
@@ -401,6 +401,7 @@ class VeilTransportShim : public webrtc::Transport {
   AudioConcealmentCursor peer_audio_concealment_;
   AudioSoftLossWindow local_audio_soft_loss_, peer_audio_soft_loss_;
   int64_t concealment_sent_us_ = 0;
+  int64_t last_confirmed_audio_damage_us_ = 0;
   std::atomic<bool> independent_transport_feedback_{false};
   std::atomic<bool> started_{false};
   InboundPacketQueue inbound_queue_;

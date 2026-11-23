@@ -25,6 +25,7 @@ class AudioSoftLossWindow {
   // burst holds growth unless it reaches 4% of this six-second window.
   // RTP loss, interruption and sustained buffer guards remain independent.
   static constexpr uint64_t kThresholdSamples = 120 * 48;
+  static constexpr uint64_t kProbeThresholdSamples = 60 * 48;
   static constexpr uint64_t kBurstThresholdSamples = 240 * 48;
   static constexpr int64_t kSustainedUs = 3'000'000;
   static constexpr uint64_t kMaximumSamples = 6000 * 48;

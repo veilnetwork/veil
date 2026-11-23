@@ -4647,7 +4647,8 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
                                        receiver_recovery, recovery_sampled_us);
         ws->shim->SetLocalAudioConcealment(remote_ssrc, recovery_sequence,
             receiver_recovery.known ? receiver_recovery.origin : 0,
-            r.concealed_samples, r.silent_concealed_samples, recovery_sampled_us);
+            r.concealed_samples, r.silent_concealed_samples, recovery_sampled_us,
+            /*advertise_recovery=*/true);
         audio_concealed_samples = r.concealed_samples;
         audio_silent_concealed_samples = r.silent_concealed_samples;
         // Lifetime sample counters distinguish delivery jitter from a slow
