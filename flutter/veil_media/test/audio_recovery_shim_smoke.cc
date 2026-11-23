@@ -302,11 +302,12 @@ int main() {
             "real shim replay renewed significant loss");
     const auto quiet = now + 5'600'000;
     conceal(4, 10000 + 38*48, kUnknownRecoveryAge, quiet);
-    require(!measured.peer_audio_soft_loss(quiet).probe_samples,
+    require(!measured.peer_audio_soft_loss(quiet).probe,
             "real shim qualified the short window with only one fresh counter");
     recovery(4, 86, quiet);
     const auto confirmed = measured.peer_audio_soft_loss(quiet);
-    require(confirmed.samples == 124*48 && confirmed.probe_samples == 48,
+    require(confirmed.samples == 124*48 && confirmed.probe &&
+                confirmed.probe->start_us == quiet - 3'000'000 && confirmed.probe->samples == 48,
             "real shim discarded the quiet interval between authenticated reports");
     measured.Stop();
   }
@@ -337,7 +338,7 @@ int main() {
     update(2, 400);
     require(sends == before + 2, "damage was not announced");
     AudioRecoveryFeedbackTest::Observe(observer, sent, clock.now_us);
-    require(!observer.peer_audio_soft_loss(clock.now_us).probe_samples,
+    require(!observer.peer_audio_soft_loss(clock.now_us).probe,
             "outage qualified as recovered");
     update(3, 400);
     update(4, 400);
@@ -346,7 +347,7 @@ int main() {
     require(sends == before + 3, "measured recovery waited for periodic RTCP");
     AudioRecoveryFeedbackTest::Observe(observer, sent, clock.now_us);
     const auto damage = observer.peer_audio_soft_loss(clock.now_us);
-    require(damage.samples == 400*48 && damage.probe_samples == 0,
+    require(damage.samples == 400*48 && damage.probe && damage.probe->samples == 0,
             "supplemental report did not confirm the quiet interval");
     update(6, 400);
     update(7, 400);

@@ -96,7 +96,11 @@ class AudioSoftLossWindow {
   }
   // A quiet period must be witnessed by fresh cumulative reports covering
   // both counters. Polling a retained report does not retire its own damage.
-  std::optional<uint64_t> ProbeSamples(int64_t now_us) const {
+  struct ProbeWindow {
+    uint64_t samples;
+    int64_t start_us;
+  };
+  std::optional<ProbeWindow> Probe(int64_t now_us) const {
     const auto common_us = std::min(baselines_[0].at_us, baselines_[1].at_us);
     const auto start_us = common_us - kProbeWindowUs;
     for (const auto& sample : baselines_) {
@@ -106,7 +110,11 @@ class AudioSoftLossWindow {
         return std::nullopt;
       }
     }
-    return SamplesAfter(start_us, now_us);
+    return ProbeWindow{SamplesAfter(start_us, now_us), start_us};
+  }
+  std::optional<uint64_t> ProbeSamples(int64_t now_us) const {
+    const auto window = Probe(now_us);
+    return window ? std::optional{window->samples} : std::nullopt;
   }
   int64_t FreshReportUs(int64_t now_us) const {
     return qualified_at_us_ > 0 && qualified_at_us_ <= now_us &&
@@ -147,7 +155,7 @@ struct AudioSoftLossSnapshot {
   bool supported = false;
   uint64_t samples = 0;
   int64_t report_us = 0;
-  std::optional<uint64_t> probe_samples;
+  std::optional<AudioSoftLossWindow::ProbeWindow> probe;
 };
 }  // namespace veil_media
 #endif

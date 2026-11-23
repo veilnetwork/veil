@@ -723,13 +723,13 @@ AudioSoftLossSnapshot VeilTransportShim::local_audio_soft_loss(int64_t now_us) c
   std::lock_guard lock(audio_feedback_mu_);
   return {local_audio_soft_loss_.FreshAt(now_us), local_audio_soft_loss_.Samples(now_us),
           local_audio_soft_loss_.FreshReportUs(now_us),
-          local_audio_soft_loss_.ProbeSamples(now_us)};
+          local_audio_soft_loss_.Probe(now_us)};
 }
 AudioSoftLossSnapshot VeilTransportShim::peer_audio_soft_loss(int64_t now_us) const {
   std::lock_guard lock(audio_feedback_mu_);
   return {peer_audio_soft_loss_.FreshAt(now_us), peer_audio_soft_loss_.Samples(now_us),
           peer_audio_soft_loss_.FreshReportUs(now_us),
-          peer_audio_soft_loss_.ProbeSamples(now_us)};
+          peer_audio_soft_loss_.Probe(now_us)};
 }
 
 void VeilTransportShim::SetLocalAudioPlayout(uint32_t remote_audio_ssrc,

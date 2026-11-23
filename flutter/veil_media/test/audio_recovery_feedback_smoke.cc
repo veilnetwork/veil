@@ -22,14 +22,16 @@ int main() {
       damage.Observe(Kind::Concealment, 1, i, i >= 2 ? 400*48 : 0,
                      true, true, at);
       if (i == 5) {
-        require(damage.ProbeSamples(at) == 400*48,
+        const auto probe = damage.Probe(at);
+        require(probe && probe->start_us == 1'000'000 && probe->samples == 400*48,
                 "a cached catch-up report retired its own damage");
       }
       damage.Observe(Kind::Catchup, 1, i, 0, true, false, at);
       if (i < 4) require(!damage.ProbeSamples(at), "partial window qualified");
     }
-    require(damage.Samples(5'000'000) == 400*48 &&
-                damage.ProbeSamples(5'000'000) == 0,
+    const auto probe = damage.Probe(5'000'000);
+    require(damage.Samples(5'000'000) == 400*48 && probe &&
+                probe->start_us == 2'000'000 && probe->samples == 0,
             "old damage withheld a measured recent probe");
     require(!damage.ProbeSamples(7'000'000), "an expired sample qualified");
     damage.Observe(Kind::Concealment, 1, 6, 400*48, true, true, 6'000'000);

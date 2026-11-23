@@ -4959,11 +4959,17 @@ char* veil_media_engine_get_stats(VeilMediaEngine* engine) {
           ",\"audio_peer_soft_loss_report_us\":" + std::to_string(peer_soft_loss.report_us) +
           ",\"audio_local_soft_loss_window_ms\":" + std::to_string(local_soft_loss.samples / 48.0) +
           ",\"audio_peer_soft_loss_window_ms\":" + std::to_string(peer_soft_loss.samples / 48.0);
-      if (local_soft_loss.probe_samples && peer_soft_loss.probe_samples) {
+      if (local_soft_loss.probe && peer_soft_loss.probe) {
+        const int64_t start_us = std::min(local_soft_loss.probe->start_us,
+                                         peer_soft_loss.probe->start_us);
+        // Round up so a whole-ms loss age rounded down cannot move a loss
+        // from inside the newer evidence to before both measured windows.
         snapshot += ",\"audio_local_soft_loss_probe_ms\":" +
-            std::to_string(*local_soft_loss.probe_samples / 48.0) +
+            std::to_string(local_soft_loss.probe->samples / 48.0) +
             ",\"audio_peer_soft_loss_probe_ms\":" +
-            std::to_string(*peer_soft_loss.probe_samples / 48.0);
+            std::to_string(peer_soft_loss.probe->samples / 48.0) +
+            ",\"audio_soft_loss_probe_start_age_ms\":" +
+            std::to_string((loss_now_us - start_us + 999) / 1000);
       }
       // Event identity shared by native RTCP and encrypted call-health feedback.
       // These are local JSON stats, not additional RTCP or relay header fields.
