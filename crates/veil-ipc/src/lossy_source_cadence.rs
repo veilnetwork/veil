@@ -27,15 +27,25 @@ pub(crate) struct SourceSchedule {
 
 #[derive(Default)]
 pub(crate) struct SourceCadence {
-    entries: VecDeque<(Key, Instant, Option<Duration>)>,
+    entries: VecDeque<Observation>,
+}
+
+struct Observation {
+    key: Key,
+    at: Instant,
+    interval: Option<Duration>,
+    compact_resume: bool,
 }
 
 impl SourceCadence {
     pub(crate) fn observe(&mut self, key: Key, now: Instant, cells: usize) -> SourceSchedule {
         let mut interval = None;
         let mut max_age = veil_types::local_lossy_work::SOURCE_WORK_MAX_AGE;
-        if let Some(index) = self.entries.iter().position(|entry| entry.0 == key) {
-            let (_, previous, last_interval) = self.entries.remove(index).unwrap();
+        let mut compact_resume = false;
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            let last = self.entries.remove(index).unwrap();
+            let previous = last.at;
+            let last_interval = last.interval;
             let elapsed = now.saturating_duration_since(previous);
             interval = if now < previous || elapsed >= IDLE {
                 None
@@ -51,21 +61,32 @@ impl SourceCadence {
             // Startup, bursts and screen work keep the ordinary lifetime.
             let sparse = SPARSE_MIN_INTERVAL..=SPARSE_MAX_INTERVAL;
             let previous_sparse = last_interval.is_some_and(|last| sparse.contains(&last));
+            // The pause itself is not a frame interval. A second compact
+            // frame at the expected cadence revalidates the earlier history.
+            let compact_continuation = cells == 1 && last.compact_resume;
             let sparse_frame = sparse.contains(&elapsed)
-                && last_interval.is_some_and(|last| {
-                    sparse.contains(&last) || (cells == 1 && last < SPARSE_MIN_INTERVAL)
-                });
-            let compact_resume = cells == 1
+                && (compact_continuation
+                    || last_interval.is_some_and(|last| {
+                        sparse.contains(&last) || (cells == 1 && last < SPARSE_MIN_INTERVAL)
+                    }));
+            let camera = key.lane == veil_proto::priority::BULK;
+            compact_resume = camera
+                && cells == 1
                 && previous_sparse
                 && elapsed > SPARSE_MAX_INTERVAL
                 && elapsed <= SPARSE_RESUME_MAX_GAP;
-            if key.lane == veil_proto::priority::BULK && (sparse_frame || compact_resume) {
+            if camera && (sparse_frame || compact_resume) {
                 max_age = SPARSE_CAMERA_MAX_AGE;
             }
         } else if self.entries.len() == CAPACITY {
             self.entries.pop_front();
         }
-        self.entries.push_back((key, now, interval));
+        self.entries.push_back(Observation {
+            key,
+            at: now,
+            interval,
+            compact_resume,
+        });
         SourceSchedule {
             span: interval
                 .unwrap_or(INITIAL)
@@ -250,6 +271,35 @@ mod tests {
                     .max_age,
                 SOURCE_WORK_MAX_AGE,
             );
+        }
+    }
+
+    #[test]
+    fn second_compact_frame_confirms_sparse_cadence_after_a_pause() {
+        use veil_types::local_lossy_work::SOURCE_WORK_MAX_AGE;
+
+        let now = Instant::now();
+        let camera = key(3, veil_proto::priority::BULK);
+        let screen = key(3, veil_proto::priority::BACKGROUND);
+        for (plane, gap_ms, first_cells, next_ms, next_cells, expected) in [
+            (camera, 10_928, 1, 1_026, 1, SPARSE_CAMERA_MAX_AGE),
+            (camera, 9_999, 1, 500, 1, SPARSE_CAMERA_MAX_AGE),
+            (camera, 10_928, 1, 2_000, 1, SPARSE_CAMERA_MAX_AGE),
+            (camera, 10_928, 1, 499, 1, SOURCE_WORK_MAX_AGE),
+            (camera, 10_928, 1, 2_001, 1, SOURCE_WORK_MAX_AGE),
+            (camera, 10_928, 1, 1_026, 2, SOURCE_WORK_MAX_AGE),
+            (camera, 10_928, 2, 1_026, 1, SOURCE_WORK_MAX_AGE),
+            (camera, 20_001, 1, 1_026, 1, SOURCE_WORK_MAX_AGE),
+            (screen, 10_928, 1, 1_026, 1, SOURCE_WORK_MAX_AGE),
+        ] {
+            let mut tracker = SourceCadence::default();
+            tracker.observe(plane, now, 1);
+            let before_pause = now + Duration::from_millis(997);
+            tracker.observe(plane, before_pause, 1);
+            let resumed = before_pause + Duration::from_millis(gap_ms);
+            tracker.observe(plane, resumed, first_cells);
+            let next = resumed + Duration::from_millis(next_ms);
+            assert_eq!(tracker.observe(plane, next, next_cells).max_age, expected);
         }
     }
 }
