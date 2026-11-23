@@ -2359,24 +2359,9 @@ int veil_media_group_engine_start_audio(VeilGroupMediaEngine* engine) {
   // Discarded: `ws->send_stream == nullptr` below is the stricter check — a
   // queue that never scheduled leaves it null.
   (void)run_on(ws->worker_tq.get(), [&]() {
-    // AudioState can start the ADM implicitly from AudioSendStream::Start.
-    // Disable that path before registering an already-muted sender.
-    if (ws->audio_state && ws->adm)
-      ws->audio_state->SetRecording(!engine->mic_muted);
     ws->call->SignalChannelNetworkState(webrtc::MediaType::AUDIO,
                                         webrtc::kNetworkUp);
-    if (ws->send_stream == nullptr) {
-#if defined(VEIL_MEDIA_TEST_HOOKS)
-      if (test_ptime) ws->audio_packet_ms = std::atoi(test_ptime);
-#endif
-      auto sc = group_audio_send_config(ws, local_ssrc,
-          ws->audio_packet_ms, ws->audio_payload_bps);
-      ws->send_stream = ws->call->CreateAudioSendStream(sc);
-      if (ws->send_stream) {
-        ws->send_stream->SetMuted(engine->mic_muted);
-        ws->send_stream->Start();
-      }
-    }
+    // Open playout before the sender starts capturing on this worker.
     for (auto& entry : ws->peers) {
       GroupPeerState* peer = entry.second.get();
       if (peer->recv_stream) continue;
@@ -2389,6 +2374,22 @@ int veil_media_group_engine_start_audio(VeilGroupMediaEngine* engine) {
                              webrtc::SdpAudioFormat("opus", 48000, 2));
       peer->recv_stream = ws->call->CreateAudioReceiveStream(rc);
       if (peer->recv_stream) peer->recv_stream->Start();
+    }
+    // AudioState can start the ADM implicitly from AudioSendStream::Start.
+    // Disable that path before registering an already-muted sender.
+    if (ws->audio_state && ws->adm)
+      ws->audio_state->SetRecording(!engine->mic_muted);
+    if (ws->send_stream == nullptr) {
+#if defined(VEIL_MEDIA_TEST_HOOKS)
+      if (test_ptime) ws->audio_packet_ms = std::atoi(test_ptime);
+#endif
+      auto sc = group_audio_send_config(ws, local_ssrc,
+          ws->audio_packet_ms, ws->audio_payload_bps);
+      ws->send_stream = ws->call->CreateAudioSendStream(sc);
+      if (ws->send_stream) {
+        ws->send_stream->SetMuted(engine->mic_muted);
+        ws->send_stream->Start();
+      }
     }
   });
   if (ws->send_stream == nullptr) return VEIL_MEDIA_ERR_STATE;
@@ -3434,13 +3435,27 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
   // Streams must be created on the Call's worker queue.
   const bool created = run_on(ws->worker_tq.get(), [&]() {
     ws->audio_packet_priority->SetAudioSending(send && !engine->mic_muted);
-    if (ws->audio_state && ws->adm)
-      ws->audio_state->SetRecording(!engine->mic_muted);
     // The Call's audio network state defaults to kNetworkDown, which makes the
     // send transport hold every RTP packet in the pacer (only RTCP leaks out on
     // its own path). Bring the audio channel up so mic audio actually flows.
     ws->call->SignalChannelNetworkState(webrtc::MediaType::AUDIO,
                                         webrtc::kNetworkUp);
+    // AudioState opens the output synchronously on this worker. Start it
+    // before the encoder begins posting packets to the same queue.
+    if (recv && ws->recv_stream == nullptr) {
+      webrtc::AudioReceiveStreamInterface::Config rc;
+      configure_call_audio_receive(rc);
+      rc.rtp.remote_ssrc = remote_ssrc;
+      rc.rtcp_send_transport = ws->shim.get();
+      rc.decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
+      // SdpAudioFormat has no default ctor, so operator[] won't work — emplace.
+      rc.decoder_map.emplace(kOpusPayloadType,
+                             webrtc::SdpAudioFormat("opus", 48000, 2));
+      ws->recv_stream = ws->call->CreateAudioReceiveStream(rc);
+      if (ws->recv_stream) ws->recv_stream->Start();
+    }
+    if (ws->audio_state && ws->adm)
+      ws->audio_state->SetRecording(!engine->mic_muted);
     if (send && ws->send_stream == nullptr) {
       ws->audio_packet_duration->store(0, std::memory_order_relaxed);
       webrtc::AudioSendStream::Config sc(ws->shim.get());  // sets send_transport
@@ -3467,18 +3482,6 @@ int veil_media_engine_start_audio(VeilMediaEngine* engine, int send, int recv) {
         ws->send_stream->SetMuted(engine->mic_muted);
         ws->send_stream->Start();
       }
-    }
-    if (recv && ws->recv_stream == nullptr) {
-      webrtc::AudioReceiveStreamInterface::Config rc;
-      configure_call_audio_receive(rc);
-      rc.rtp.remote_ssrc = remote_ssrc;
-      rc.rtcp_send_transport = ws->shim.get();
-      rc.decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
-      // SdpAudioFormat has no default ctor, so operator[] won't work — emplace.
-      rc.decoder_map.emplace(kOpusPayloadType,
-                             webrtc::SdpAudioFormat("opus", 48000, 2));
-      ws->recv_stream = ws->call->CreateAudioReceiveStream(rc);
-      if (ws->recv_stream) ws->recv_stream->Start();
     }
   });
   if (!created) {

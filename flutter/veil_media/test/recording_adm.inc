@@ -39,7 +39,10 @@ class StandRecordingAdm : public webrtc::AudioDeviceModuleImpl {
   }
   int32_t StopRecording() override { recording_.store(false); return 0; }
   bool Recording() const override { return recording_.load(); }
-  int32_t StartPlayout() override { playing_.store(true); return 0; }
+  int32_t StartPlayout() override {
+    if (!playing_.exchange(true) && Recording()) recording_at_playout_start.store(true);
+    return 0;
+  }
   int32_t StopPlayout() override { playing_.store(false); return 0; }
   bool Playing() const override { return playing_.load(); }
   void CaptureTone(int frequency_hz) {
@@ -76,6 +79,7 @@ class StandRecordingAdm : public webrtc::AudioDeviceModuleImpl {
     }
   }
   std::atomic<int> recording_starts{0};
+  std::atomic<bool> recording_at_playout_start{false};
  private:
   std::atomic<bool> recording_{false};
   std::atomic<bool> playing_{false};

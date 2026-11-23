@@ -460,6 +460,38 @@ extern "C" int veil_media_test_missing_audio_device() {
   return 0;
 }
 
+// Start both real Call streams against the same ADM. Opening the output can
+// block the worker that the encoder posts send tasks to.
+extern "C" int veil_media_test_audio_start_order() {
+  struct CountingFactory {
+    bool prior = g_call_plane_recording_adm;
+    CountingFactory() { g_call_plane_recording_adm = true; }
+    ~CountingFactory() { g_call_plane_recording_adm = prior; }
+  } counting;
+  uint8_t local[32] = {0x61}, peer[32] = {0x62};
+  int result = 0;
+  {
+    std::unique_ptr<VeilMediaEngine, decltype(&veil_media_engine_destroy)> engine(
+        veil_media_engine_create(82, local, peer), veil_media_engine_destroy);
+    if (!engine || veil_media_engine_start_audio(engine.get(), 1, 1) != VEIL_MEDIA_OK)
+      return 1;
+    auto* device = static_cast<StandRecordingAdm*>(engine->ws->adm.get());
+    if (!device->Recording() || !device->Playing()) return 2;
+    if (device->recording_at_playout_start.load()) result |= 4;
+  }
+  {
+    std::unique_ptr<VeilGroupMediaEngine, decltype(&veil_media_group_engine_destroy)> engine(
+        veil_media_group_engine_create(local), veil_media_group_engine_destroy);
+    if (!engine || veil_media_group_engine_add_peer(engine.get(), 83, peer) != VEIL_MEDIA_OK ||
+        veil_media_group_engine_start_audio(engine.get()) != VEIL_MEDIA_OK)
+      return 8;
+    auto* device = static_cast<StandRecordingAdm*>(engine->ws->adm.get());
+    if (!device->Recording() || !device->Playing()) return 16;
+    if (device->recording_at_playout_start.load()) result |= 32;
+  }
+  return result;
+}
+
 // Two engine generations reproduce starting/rebuilding an already-muted call.
 // The real AudioState, stream and Opus encoder run against a counting ADM.
 extern "C" int veil_media_test_muted_capture_lifecycle() {

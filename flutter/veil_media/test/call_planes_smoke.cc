@@ -23,6 +23,7 @@ extern "C" int veil_media_test_with_held_video_worker(VeilMediaEngine*, int (*)(
 extern "C" int veil_media_test_group_with_held_video(VeilGroupMediaEngine*, int (*)(void*), void*);
 extern "C" int veil_media_test_direct_call_planes(VeilMediaEngine*, Injector, void*);
 extern "C" int veil_media_test_blocked_audio_stats(VeilMediaEngine*, Injector, void*);
+extern "C" int veil_media_test_audio_start_order();
 extern "C" int veil_media_test_muted_capture_lifecycle();
 extern "C" int veil_media_test_missing_audio_device();
 extern "C" int veil_media_test_audio_probe_budget();
@@ -325,6 +326,11 @@ static void wait_playout(VeilGroupMediaEngine* e, uint64_t reports, uint64_t del
 }
 extern "C" int veil_media_test_audio_processing_controls();
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--audio-start-order") == 0) {
+    const int result = veil_media_test_audio_start_order();
+    if (result != 0) std::fprintf(stderr, "audio startup order failed: %d\n", result);
+    return result == 0 ? 0 : 1;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--audio-processing") == 0) {
     const int rc = veil_media_test_audio_processing_controls();
     if (rc != 0) { std::fprintf(stderr, "audio processing controls failed: %d\n", rc); return 1; }
@@ -995,6 +1001,11 @@ int main(int argc, char** argv) {
   const int budget_result = veil_media_test_audio_probe_budget();
   if (budget_result != 0) {
     std::fprintf(stderr, "audio probe budget failed: %d\n", budget_result);
+    return 1;
+  }
+  const int startup_result = veil_media_test_audio_start_order();
+  if (startup_result != 0) {
+    std::fprintf(stderr, "audio startup order failed: %d\n", startup_result);
     return 1;
   }
   const int capture_result = veil_media_test_muted_capture_lifecycle();
