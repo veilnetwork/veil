@@ -533,7 +533,12 @@ void PacingController::ProcessPackets() {
         pacing_info.probe_cluster_bytes_sent += packet_size.bytes();
         // If we are currently probing, we need to stop the send loop when we
         // have reached the send target.
-        if (data_sent >= recommended_probe_size) {
+        // Probe-start padding can meet the byte target by itself when
+        // transport overhead is included. Send the ready audio in this burst.
+        const bool ready_audio_after_padding = !pace_audio_ &&
+            packet_type == RtpPacketMediaType::kPadding &&
+            packet_queue_.LeadingPacketEnqueueTime(RtpPacketMediaType::kAudio).IsFinite();
+        if (data_sent >= recommended_probe_size && !ready_audio_after_padding) {
           break;
         }
       }

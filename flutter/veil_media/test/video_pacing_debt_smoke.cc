@@ -30,6 +30,10 @@ class Sender final : public webrtc::PacingController::PacketSender {
   void SendPacket(std::unique_ptr<webrtc::RtpPacketToSend> packet,
                   const webrtc::PacedPacketInfo& info) override {
     bytes_at_ms[clock_.TimeInMilliseconds() - 1000] += packet->size();
+    if (packet->packet_type() == webrtc::RtpPacketMediaType::kPadding) {
+      ++padding_packets;
+      return;
+    }
     sequences.push_back(packet->SequenceNumber());
     probe_ids.push_back(info.probe_cluster_id);
     const auto sequence = packet->SequenceNumber();
@@ -37,7 +41,19 @@ class Sender final : public webrtc::PacingController::PacketSender {
         [&](uint8_t value) { return value == uint8_t(sequence % 251); }));
   }
   std::vector<std::unique_ptr<webrtc::RtpPacketToSend>> FetchFec() override { return {}; }
-  std::vector<std::unique_ptr<webrtc::RtpPacketToSend>> GeneratePadding(webrtc::DataSize) override { return {}; }
+  std::vector<std::unique_ptr<webrtc::RtpPacketToSend>> GeneratePadding(webrtc::DataSize size) override {
+    if (!probe_padding || size.bytes() != 1) return {};
+    auto packet = std::make_unique<webrtc::RtpPacketToSend>(nullptr);
+    packet->set_packet_type(webrtc::RtpPacketMediaType::kPadding);
+    packet->SetSsrc(11);
+    packet->set_capture_time(clock_.CurrentTime());
+    assert(packet->SetPadding(1));
+    std::vector<std::unique_ptr<webrtc::RtpPacketToSend>> packets;
+    packets.push_back(std::move(packet));
+    return packets;
+  }
+  bool probe_padding = false;
+  int padding_packets = 0;
   std::map<int64_t, size_t> bytes_at_ms;
   std::vector<uint16_t> sequences;
   std::vector<int> probe_ids;
@@ -46,13 +62,18 @@ class Sender final : public webrtc::PacingController::PacketSender {
 };
 
 
-void SendAudioBetweenProbeBursts() {
+void SendAudioAtAndBetweenProbeBursts(bool padding) {
   using namespace webrtc;
   constexpr int kProbeId = 42;
   SimulatedClock clock(1'000'000);
   Sender sender(clock);
   Trials trials("");
   PacingController pacer(&clock, &sender, trials);
+  if (padding) {
+    sender.probe_padding = true;
+    pacer.SetIncludeOverhead();
+    pacer.SetTransportOverhead(DataSize::Bytes(209));
+  }
   pacer.SetPacerConfig(PacerConfig::Create(clock.CurrentTime(),
       DataRate::BitsPerSec(48'000), DataRate::Zero()));
   ProbeClusterConfig cluster;
@@ -78,6 +99,7 @@ void SendAudioBetweenProbeBursts() {
   pacer.ProcessPackets();
   assert(sender.sequences == std::vector<uint16_t>{0});
   assert(sender.probe_ids == std::vector<int>{kProbeId});
+  assert(sender.padding_packets == int(padding));
   const Timestamp next_probe = pacer.NextSendTime();
   assert(next_probe - clock.CurrentTime() >= TimeDelta::Millis(80));
 
@@ -98,7 +120,8 @@ void SendAudioBetweenProbeBursts() {
 
 struct Case { const char* name; int before; int after; int initial; int queued; bool audio; bool account; };
 int main() {
-  SendAudioBetweenProbeBursts();
+  SendAudioAtAndBetweenProbeBursts(false);
+  SendAudioAtAndBetweenProbeBursts(true);
   bool bounded = true;
   for (const auto& c : std::vector<Case>{
       {"steady",900000,900000,14,0,false,false},
