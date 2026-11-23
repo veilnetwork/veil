@@ -12,8 +12,9 @@ struct Fixture {
   std::unique_ptr<webrtc::NetEqController> controller;
   webrtc::NetEqController::NetEqStatus status{};
   bool reset = false;
-  explicit Fixture(bool conversation = true, int hz = 48000, bool stretch = true) {
-    webrtc::NetEqController::Config config{stretch, false, 30, 0, &clock};
+  explicit Fixture(bool conversation = true, int hz = 48000, bool stretch = true,
+                   int capacity = 30) {
+    webrtc::NetEqController::Config config{stretch, false, capacity, 0, &clock};
     if (conversation) {
       veil_media::ArrivalClockControllerFactory factory(&clock);
       controller = factory.Create(env, config);
@@ -76,6 +77,35 @@ int main() {
       if (kind == 6) f->status.last_mode = Mode::kCodecPlc;
     }
     assert(stock.decide() == conversation.decide());
+  }
+  for (int kind = 0; kind < 9; ++kind) {
+    Fixture stock(false, 48000, kind != 8, veil_media::kCallAudioPacketCapacity);
+    Fixture conversation(true, 48000, kind != 8, veil_media::kCallAudioPacketCapacity);
+    for (auto* f : {&stock, &conversation}) {
+      const int target = kind == 7 ? 480 : 500;
+      assert(f->controller->SetMinimumDelay(target));
+      assert(f->controller->TargetLevelMs() == target);
+      f->status.last_mode = Mode::kExpand;
+      f->status.expand_mutefactor = 0;
+      f->status.packet_buffer_info = {false, 9600, 9600, 8160, 5};
+      if (kind == 1) ++f->status.expand_mutefactor;
+      if (kind == 2) f->status.next_packet->timestamp += 960;
+      if (kind == 3) f->status.packet_buffer_info.span_samples += 960;
+      if (kind == 4) f->status.packet_buffer_info = {false, 9120, 9120, 8160, 5};
+      if (kind == 5) {
+        f->status.packet_buffer_info.dtx_or_cng = true;
+        f->status.next_packet->is_dtx = true;
+      }
+      if (kind == 6) f->status.play_dtmf = true;
+    }
+    if (kind == 0) {
+      // Five contiguous 40-ms packets already arrived. The timestamp span
+      // plus waiting time is shorter because it omits the tail of the burst.
+      assert(stock.decide() == Op::kExpand);
+      assert(conversation.decide() == Op::kNormal);
+    } else {
+      assert(conversation.decide() == stock.decide());
+    }
   }
   {
     Fixture disabled(true, 48000, false);

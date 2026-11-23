@@ -45,7 +45,27 @@ class ConversationNetEqController final : public webrtc::DecisionLogic {
     if (previous_scale_ && IsScale(status.last_mode))
       countdown_ = clock_->GetNewCountdown(5);
     previous_scale_ = false;
-    return webrtc::DecisionLogic::GetDecision(status, reset);
+    const auto operation = webrtc::DecisionLogic::GetDecision(status, reset);
+    using Mode = webrtc::NetEq::Mode;
+    using Op = webrtc::NetEq::Operation;
+    constexpr int kAdaptedTargetMs = 500;
+    constexpr int kSpeechToResumeMs = 200;
+    const auto& queue = status.packet_buffer_info;
+    // After a fully muted underrun, the arrival span plus waiting time can
+    // postpone speech while the trailing packet is already available. At
+    // the adapted target, start decoding the expected speech once there are
+    // 200 ms of contiguous samples. Keep the target and original timeline.
+    if (stretching_ && operation == Op::kExpand &&
+        status.last_mode == Mode::kExpand && status.expand_mutefactor == 0 &&
+        !status.play_dtmf && status.next_packet && !status.next_packet->is_dtx &&
+        !status.next_packet->is_cng &&
+        status.next_packet->timestamp == status.target_timestamp &&
+        !queue.dtx_or_cng && queue.span_samples == queue.num_samples &&
+        khz_ > 0 && TargetLevelMs() == kAdaptedTargetMs &&
+        queue.num_samples >= static_cast<size_t>(kSpeechToResumeMs * khz_)) {
+      return Op::kNormal;
+    }
+    return operation;
   }
 
  private:
