@@ -102,6 +102,10 @@ struct RtcpFeedbackSnapshot {
 // Unknown/stale playout is not a zero delay. Receipt time is local and replay
 // cannot renew it; support remains known until this peer channel is replaced.
 struct AudioPlayoutSnapshot {
+  static constexpr int kMaximumTargetMs = 500;
+  static constexpr int kNominalTargetMs = 80;
+  static constexpr int kMaximumReserveMs = kMaximumTargetMs - kNominalTargetMs;
+
   bool supported = false;
   uint64_t sequence = 0;
   int64_t arrived_us = 0;

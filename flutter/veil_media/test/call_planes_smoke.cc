@@ -664,12 +664,15 @@ int main(int argc, char** argv) {
     inject_raw(190, playout_report(target, 1, 520, 420));
     wait_playout(e.get(), 1, 520);
     assert(group_stat(e.get(), "audio_playout_pressure_ms") == 100);
+    assert(group_stat(e.get(), "audio_playout_unreserved_pressure_ms") == 0);
     inject_raw(191, playout_report(target, 1, 300));
     wait_playout(e.get(), 2, 520);
     assert(group_stat(e.get(), "audio_playout_pressure_ms") == 300);
+    assert(group_stat(e.get(), "audio_playout_unreserved_pressure_ms") == 300);
     assert(veil_media_group_engine_remove_peer(e.get(), alice) == VEIL_MEDIA_OK);
     wait_playout(e.get(), 1, 300);
     assert(group_stat(e.get(), "audio_playout_pressure_ms") == 300);
+    assert(group_stat(e.get(), "audio_playout_unreserved_pressure_ms") == 300);
     e.reset();
     assert(callbacks.empty());
     std::puts("Group playout reserve: raw reports kept, each peer's pressure counted separately");

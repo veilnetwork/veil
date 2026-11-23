@@ -2821,6 +2821,7 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
   int peer_audio_recovery_peers = 0;
   int playout_peers = 0, playout_reports = 0, playout_ms = -1;
   int playout_pressure_ms = -1;
+  int playout_unreserved_pressure_ms = -1;
   int64_t rtt = 0;
   uint64_t video_frames = 0;
   double fps = 0;
@@ -2857,8 +2858,13 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
     if (fresh) {
       ++playout_reports;
       playout_ms = std::max(playout_ms, playout.delay_ms);
-      playout_pressure_ms = std::max(playout_pressure_ms,
-                                    playout.delay_ms - playout.reserve_ms);
+      const int pressure = playout.delay_ms - playout.reserve_ms;
+      playout_pressure_ms = std::max(playout_pressure_ms, pressure);
+      // A receiver with a full reserve must not qualify a different
+      // listener for a wider pressure limit during a sparse video trial.
+      playout_unreserved_pressure_ms = std::max(playout_unreserved_pressure_ms,
+          playout.reserve_ms == veil_media::AudioPlayoutSnapshot::kMaximumReserveMs
+              ? 0 : pressure);
     }
     const auto video_report = entry.second->shim->video_feedback();
     video_loss_report_us = std::max(video_loss_report_us,
@@ -3100,7 +3106,9 @@ char* veil_media_group_engine_get_stats(VeilGroupMediaEngine* engine) {
               ",\"audio_playout_sequence\":" + std::to_string(ws->audio_playout_revision) +
               ",\"audio_playout_reports\":" + std::to_string(playout_reports) +
               ",\"audio_playout_ms\":" + std::to_string(playout_ms) +
-              ",\"audio_playout_pressure_ms\":" + std::to_string(playout_pressure_ms);
+              ",\"audio_playout_pressure_ms\":" + std::to_string(playout_pressure_ms) +
+              ",\"audio_playout_unreserved_pressure_ms\":" +
+              std::to_string(playout_unreserved_pressure_ms);
   snapshot += ",\"video_delivery_peers\":{";
   bool first_delivery = true;
   const auto delivery_source = ws->fanout->video_send_stats();

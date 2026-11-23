@@ -55,10 +55,9 @@ constexpr uint32_t kAudioPlayoutAppName = 0x56415031u;  // "VAP1"
 constexpr uint32_t kAudioPlayoutReserveAppName = 0x56415034u;  // "VAP4"
 constexpr uint32_t kUnknownPlayout = 0xffffffffu;
 // Match CallAudioPlayoutReserve and the NetEq adaptive target limit.
-constexpr int kNominalPlayoutTargetMs = 80;
-constexpr int kMaximumPlayoutTargetMs = 500;
-constexpr int kMaximumPlayoutReserveMs =
-    kMaximumPlayoutTargetMs - kNominalPlayoutTargetMs;
+constexpr int kNominalPlayoutTargetMs = AudioPlayoutSnapshot::kNominalTargetMs;
+constexpr int kMaximumPlayoutTargetMs = AudioPlayoutSnapshot::kMaximumTargetMs;
+constexpr int kMaximumPlayoutReserveMs = AudioPlayoutSnapshot::kMaximumReserveMs;
 
 uint32_t read_be32(const uint8_t* p) {
   return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 |
