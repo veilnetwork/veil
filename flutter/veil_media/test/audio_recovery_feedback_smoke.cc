@@ -17,6 +17,35 @@ int main() {
   {
     using Kind = AudioSoftLossWindow::Kind;
     AudioSoftLossWindow damage;
+    for (uint64_t i = 1; i <= 5; ++i) {
+      const int64_t at = i * 1'000'000;
+      damage.Observe(Kind::Concealment, 1, i, i >= 2 ? 400*48 : 0,
+                     true, true, at);
+      if (i == 5) {
+        require(damage.ProbeSamples(at) == 400*48,
+                "a cached catch-up report retired its own damage");
+      }
+      damage.Observe(Kind::Catchup, 1, i, 0, true, false, at);
+      if (i < 4) require(!damage.ProbeSamples(at), "partial window qualified");
+    }
+    require(damage.Samples(5'000'000) == 400*48 &&
+                damage.ProbeSamples(5'000'000) == 0,
+            "old damage withheld a measured recent probe");
+    require(!damage.ProbeSamples(7'000'000), "an expired sample qualified");
+    damage.Observe(Kind::Concealment, 1, 6, 400*48, true, true, 6'000'000);
+    damage.Observe(Kind::Catchup, 1, 6, 70*48, true, true, 6'000'000);
+    require(damage.ProbeSamples(6'000'000) == 70*48,
+            "newly discarded speech disappeared from the probe window");
+    damage.Observe(Kind::Catchup, 1, 7, 0, true, true, 6'001'000);
+    require(!damage.ProbeSamples(6'001'000), "counter rollback qualified a probe");
+    damage.Observe(Kind::Catchup, 1, 8, 70*48, true, false, 7'000'000);
+    require(!damage.ProbeSamples(7'000'000), "counter rollback kept coverage");
+    damage.Observe(Kind::Concealment, 2, 1, 0, true, false, 7'001'000);
+    require(!damage.ProbeSamples(7'001'000), "new decoder inherited coverage");
+  }
+  {
+    using Kind = AudioSoftLossWindow::Kind;
+    AudioSoftLossWindow damage;
     damage.Observe(Kind::Concealment, 1, 1, 100000, true, true, 1'000'000);
     require(damage.Samples(1'000'000) == 0, "startup damage became current");
     damage.Observe(Kind::Concealment, 1, 2, 100000 + 11*48, true, true, 2'000'000);

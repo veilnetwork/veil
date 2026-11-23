@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <deque>
 #include <limits>
+#include <optional>
 
 namespace veil_media {
 // Endpoint-only damage accounting. Both native receive counters and the
@@ -18,6 +19,8 @@ class AudioSoftLossWindow {
  public:
   enum class Kind { Concealment, Catchup };
   static constexpr int64_t kWindowUs = 6'000'000;
+  static constexpr int64_t kProbeWindowUs = 3'000'000;
+  static constexpr int64_t kProbeSampleLifetimeUs = 2'000'000;
   // Moderate damage needs fresh losses spanning three seconds. A shorter
   // burst holds growth unless it reaches 4% of this six-second window.
   // RTP loss, interruption and sustained buffer guards remain independent.
@@ -42,12 +45,16 @@ class AudioSoftLossWindow {
       // Retain the counter and sequence high water: a lower report followed
       // by the previous value must not manufacture another increment.
       before.sequence = sequence;
+      before.probe_since_us = 0;
       return;
     }
     const bool contiguous = before.sequence && cumulative >= before.counter &&
         at_us - before.at_us < kWindowUs;
     const uint64_t delta = contiguous ? cumulative - before.counter : 0;
-    before = {sequence, cumulative, at_us};
+    const bool probe_contiguous = contiguous && before.probe_since_us > 0 &&
+        at_us - before.at_us <= kProbeWindowUs && (fresh || delta == 0);
+    before = {sequence, cumulative, at_us,
+              probe_contiguous ? before.probe_since_us : at_us};
     Prune(at_us);
     // A startup/replacement/gap baseline and old newly observed counters are
     // consumed without assigning their history to the current window.
@@ -81,12 +88,21 @@ class AudioSoftLossWindow {
     });
   }
   uint64_t Samples(int64_t now_us) const {
-    uint64_t total = 0;
-    for (const auto& event : events_) {
-      if (event.at_us <= now_us && now_us - event.at_us < kWindowUs)
-        total = std::min(kMaximumSamples, total + event.samples);
+    return now_us > 0 ? SamplesAfter(now_us - kWindowUs, now_us) : 0;
+  }
+  // A quiet period must be witnessed by fresh cumulative reports covering
+  // both counters. Polling a retained report does not retire its own damage.
+  std::optional<uint64_t> ProbeSamples(int64_t now_us) const {
+    const auto common_us = std::min(baselines_[0].at_us, baselines_[1].at_us);
+    const auto start_us = common_us - kProbeWindowUs;
+    for (const auto& sample : baselines_) {
+      if (!sample.sequence || !sample.probe_since_us ||
+          sample.probe_since_us > start_us || sample.at_us > now_us ||
+          now_us - sample.at_us >= kProbeSampleLifetimeUs) {
+        return std::nullopt;
+      }
     }
-    return total;
+    return SamplesAfter(start_us, now_us);
   }
   int64_t FreshReportUs(int64_t now_us) const {
     return qualified_at_us_ > 0 && qualified_at_us_ <= now_us &&
@@ -99,7 +115,18 @@ class AudioSoftLossWindow {
     return ms > max / 48 ? max : ms * 48;
   }
  private:
-  struct Baseline { uint64_t sequence = 0, counter = 0; int64_t at_us = 0; };
+  uint64_t SamplesAfter(int64_t start_us, int64_t now_us) const {
+    uint64_t total = 0;
+    for (const auto& event : events_) {
+      if (event.at_us <= now_us && event.at_us > start_us)
+        total = std::min(kMaximumSamples, total + event.samples);
+    }
+    return total;
+  }
+  struct Baseline {
+    uint64_t sequence = 0, counter = 0;
+    int64_t at_us = 0, probe_since_us = 0;
+  };
   struct Event { int64_t at_us; uint64_t samples; bool reported = false; };
   void Prune(int64_t now_us) {
     while (!events_.empty() && now_us - events_.front().at_us >= kWindowUs)
@@ -116,6 +143,7 @@ struct AudioSoftLossSnapshot {
   bool supported = false;
   uint64_t samples = 0;
   int64_t report_us = 0;
+  std::optional<uint64_t> probe_samples;
 };
 }  // namespace veil_media
 #endif
