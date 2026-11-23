@@ -100,7 +100,9 @@ class AudioRtpLag {
         std::llabs(static_cast<int32_t>(stamp - anchor_stamp_)) <= 5 * kHz;
   }
 
-  std::optional<int> Output(uint32_t stamp, int64_t now_us) const {
+  std::optional<int> Output(uint32_t stamp, int64_t now_us,
+                            int* arrival_excess_ms = nullptr) const {
+    if (arrival_excess_ms) *arrival_excess_ms = -1;
     if (!ssrc_ || distinct_packets_ < 3 || now_us < last_evidence_us_ ||
         now_us - last_evidence_us_ > 3'000'000 || now_us - first_us_ < 100'000)
       return std::nullopt;
@@ -116,6 +118,16 @@ class AudioRtpLag {
     if (delta > kHz || delta < -60 * kHz) return std::nullopt;
     const int64_t age_us = now_us - TickUs(anchor_ticks_ + delta) - *floor;
     if (age_us < 0) return std::nullopt;
+    if (arrival_excess_ms) {
+      // Compare the latest advancing packet's arrival with the same arrival
+      // floor. The remainder is media distance to that packet plus time
+      // since its arrival, not a direct wall-time measurement of the queue.
+      const int64_t excess_us = anchor_us_ - TickUs(anchor_ticks_) - *floor;
+      if (excess_us >= 0 && excess_us <= age_us) {
+        *arrival_excess_ms = static_cast<int>(
+            std::min<int64_t>(60000, excess_us / 1000));
+      }
+    }
     return static_cast<int>(std::min<int64_t>(60000, age_us / 1000));
   }
 

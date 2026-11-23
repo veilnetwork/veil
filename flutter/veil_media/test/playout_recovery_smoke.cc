@@ -143,7 +143,10 @@ void DecodedAgeRegression(int mode = 0, int queued_ms = 90,
     assert(frame.speech_type_ == webrtc::AudioFrame::kNormalSpeech);
     assert(frame.packet_infos_.empty());
     assert(stats->fallback_frames == (attempt && (mode == 1 || mode == 2) ? 1u : 0u));
-    if (preceding_failure) assert(stats->receivers.LagMs(header.ssrc, wall.us) == -1);
+    if (preceding_failure) {
+      const auto lag = stats->receivers.Lag(header.ssrc, wall.us);
+      assert(lag.age_ms == -1 && lag.arrival_excess_ms == -1);
+    }
   }
   webrtc::SetClockForTesting(previous);
 }

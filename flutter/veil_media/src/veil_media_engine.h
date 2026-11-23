@@ -184,6 +184,9 @@ int veil_media_group_engine_hold_source_growth(VeilGroupMediaEngine *engine, uin
  * native `audio_delay_ms` (current queued samples + reported ADM delay).
  * `audio_rtp_lag_ms` is recent relative RTP-clock age (-1 when unknown),
  * including upstream excess delay without assuming synchronized sender time.
+ * `audio_rtp_arrival_excess_ms` is the part already present at NetEq input
+ * relative to the recent best arrival. It includes sender pacing and path
+ * delay variation, and uses -1 when no aligned breakdown is available.
  * `audio_pressure_delay_ms` includes the larger of that age and queue plus
  * ADM delay. It drives endpoint playout feedback; it is not absolute latency.
  * `audio_filtered_delay_ms` retains WebRTC's RTP-span estimate for diagnostics;

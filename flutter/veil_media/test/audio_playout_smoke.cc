@@ -206,12 +206,16 @@ static void deliver() {
     if (target.fn) target.fn(target.ctx, p.bytes.data(), p.bytes.size());
   }
 }
-static uint64_t metric(VeilMediaEngine* e, const char* name) {
-  char* json = veil_media_engine_get_stats(e); assert(json);
+static uint64_t metric(const char* json, const char* name) {
   const auto key = std::string("\"") + name + "\":";
   const auto* at = std::strstr(json, key.c_str()); assert(at);
-  const auto value = std::strtoull(at + key.size(), nullptr, 10);
-  veil_media_free_string(json); return value;
+  return std::strtoull(at + key.size(), nullptr, 10);
+}
+static uint64_t metric(VeilMediaEngine* e, const char* name) {
+  std::unique_ptr<char, decltype(&veil_media_free_string)> json(
+      veil_media_engine_get_stats(e), veil_media_free_string);
+  assert(json);
+  return metric(json.get(), name);
 }
 
 static void verify_live_framing(bool handover = false) {
@@ -478,7 +482,7 @@ static void verify_sender_restart() {
     std::array<int16_t, 480> pcm{};
     std::vector<double> source_edges, rendered_edges;
     uint64_t max_delay = 0, max_buffer = 0, max_rtp_lag = 0;
-    size_t known_rtp_lag = 0;
+    size_t known_rtp_lag = 0, known_arrival_excess = 0;
     size_t nonsilent_ticks = 0;
     bool was_high = false;
     for (int tick = 0; tick < 1200; ++tick) {
@@ -508,7 +512,21 @@ static void verify_sender_restart() {
       if (tick % 10 == 0) {
         max_delay = std::max(max_delay, metric(receiver.get(), "audio_delay_ms"));
         max_buffer = std::max(max_buffer, metric(receiver.get(), "audio_jb_ms"));
-        const auto lag = metric(receiver.get(), "audio_rtp_lag_ms");
+        std::unique_ptr<char, decltype(&veil_media_free_string)> snapshot(
+            veil_media_engine_get_stats(receiver.get()), veil_media_free_string);
+        assert(snapshot);
+        const auto lag = metric(snapshot.get(), "audio_rtp_lag_ms");
+        const auto arrival = metric(snapshot.get(), "audio_rtp_arrival_excess_ms");
+        const auto local_delay = metric(snapshot.get(), "audio_delay_ms");
+        const auto queued = metric(snapshot.get(), "audio_jb_ms");
+        const auto pressure = metric(snapshot.get(), "audio_pressure_delay_ms");
+        const auto relative_age = lag == static_cast<uint64_t>(-1) ? 0 : lag;
+        assert(local_delay >= queued);
+        assert(pressure == local_delay - queued + std::max(queued, relative_age));
+        if (arrival != static_cast<uint64_t>(-1)) {
+          assert(lag != static_cast<uint64_t>(-1) && arrival <= lag);
+          ++known_arrival_excess;
+        }
         if (tick == 100 || tick == 400 || tick == 800)
           std::printf("sender lag sample tick=%d lag=%lld native_age=%lld pressure=%lld origin=%llu\n",
               tick, static_cast<long long>(lag),
@@ -525,7 +543,7 @@ static void verify_sender_restart() {
     // After a sender rebuild NetEq may retain its old output RTP origin.
     // Unknown is required then; prompt PCM cannot license a guessed offset.
     // Before any rebuild this same real Opus path must supply measurements.
-    assert(known_rtp_lag > 20);
+    assert(known_rtp_lag > 20 && known_arrival_excess > 20);
     std::printf("sender RTP lag: known=%zu max_ms=%llu\n", known_rtp_lag,
                 static_cast<unsigned long long>(max_rtp_lag));
     std::printf("sender rebuilds: nonsilent=%zu/1200 delay_max=%llu buffer_max=%llu marker_latency_ms=[",

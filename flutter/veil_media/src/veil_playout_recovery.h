@@ -141,10 +141,12 @@ class RecoveringNetEq final : public webrtc::NetEq {
     // A failed or synthetic block can still carry packet metadata. It does
     // not extend the timestamp witness to the next block without metadata.
     if (!normal_speech) decoded_stamp_.reset();
-    receiver_recovery_->SetLag(
-        normal_speech && UpdateDecodedClock(*frame)
-            ? rtp_lag_.Output(frame->timestamp_, webrtc::TimeMicros()) : std::nullopt,
-        webrtc::TimeMicros());
+    const int64_t rendered_us = webrtc::TimeMicros();
+    int arrival_excess_ms = -1;
+    const auto lag = normal_speech && UpdateDecodedClock(*frame)
+        ? rtp_lag_.Output(frame->timestamp_, rendered_us, &arrival_excess_ms)
+        : std::nullopt;
+    receiver_recovery_->SetLag(lag, rendered_us, arrival_excess_ms);
     if (muted) *muted = silent;
     if (rate) *rate = sample_rate;
     if (trace_.enabled()) {

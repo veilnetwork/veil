@@ -16,6 +16,11 @@ struct AudioRecoverySample {
   int64_t last_discard_us = 0;
 };
 
+struct AudioRtpLagSample {
+  int age_ms = -1;
+  int arrival_excess_ms = -1;
+};
+
 // One writer: this NetEq's render callback. No allocation or registry lock is
 // taken while dropping decoded speech. Publish time before the counter so an
 // acquiring reader never sees a new count with an older event timestamp.
@@ -34,18 +39,37 @@ class StreamAudioRecovery {
   }
   // One packed atomic snapshot: readers cannot pair an old lag with a newer
   // render time. Only actual normal speech publishes a known sample.
-  void SetLag(std::optional<int> lag_ms, int64_t now_us) {
+  void SetLag(std::optional<int> lag_ms, int64_t now_us,
+              int arrival_excess_ms = -1) {
     const uint64_t at_ms = now_us > 0 ? static_cast<uint64_t>(now_us / 1000) : 0;
     const uint64_t packed = lag_ms && *lag_ms >= 0 && *lag_ms <= 60000 &&
         at_ms > 0 && at_ms < (uint64_t{1} << 48)
         ? (at_ms << 16) | static_cast<uint64_t>(*lag_ms) : 0;
+    const uint64_t breakdown = packed && arrival_excess_ms >= 0 &&
+            arrival_excess_ms <= *lag_ms
+        ? (uint64_t{static_cast<uint32_t>(at_ms)} << 32) |
+            (uint64_t{static_cast<uint16_t>(*lag_ms)} << 16) |
+            static_cast<uint16_t>(arrival_excess_ms + 1)
+        : 0;
+    arrival_.store(breakdown, std::memory_order_relaxed);
     lag_.store(packed, std::memory_order_release);
   }
-  int LagMs(int64_t now_us) const {
+  AudioRtpLagSample Lag(int64_t now_us) const {
     const auto packed = lag_.load(std::memory_order_acquire);
-    const int64_t sampled_us = static_cast<int64_t>(packed >> 16) * 1000;
-    return sampled_us > 0 && sampled_us <= now_us && now_us-sampled_us <= 3'000'000
-        ? static_cast<int>(packed & 0xffff) : -1;
+    const auto sampled_ms = packed >> 16;
+    const int64_t sampled_us = static_cast<int64_t>(sampled_ms) * 1000;
+    if (!sampled_us || sampled_us > now_us || now_us - sampled_us > 3'000'000)
+      return {};
+    AudioRtpLagSample sample{static_cast<int>(packed & 0xffff), -1};
+    const auto arrival = arrival_.load(std::memory_order_relaxed);
+    // The full publication time still gates the age. A concurrent write may
+    // expose a newer breakdown, so accept it only for this age and millisecond.
+    const uint64_t tag = (uint64_t{static_cast<uint32_t>(sampled_ms)} << 16) |
+                         static_cast<uint16_t>(sample.age_ms);
+    if ((arrival >> 16) == tag) {
+      sample.arrival_excess_ms = static_cast<int>(arrival & 0xffff) - 1;
+    }
+    return sample;
   }
 
  private:
@@ -53,6 +77,7 @@ class StreamAudioRecovery {
   std::atomic<uint64_t> discarded_ms_{0};
   std::atomic<int64_t> last_discard_us_{0};
   std::atomic<uint64_t> lag_{0};
+  std::atomic<uint64_t> arrival_{0};
 };
 
 // A call's configured receive streams, keyed after their first accepted RTP
@@ -87,14 +112,14 @@ class AudioRecoveryRegistry {
     }
     return stream ? stream->Snapshot() : AudioRecoverySample{};
   }
-  int LagMs(uint32_t ssrc, int64_t now_us) const {
+  AudioRtpLagSample Lag(uint32_t ssrc, int64_t now_us) const {
     std::shared_ptr<StreamAudioRecovery> stream;
     {
       std::lock_guard lock(mutex_);
       const auto it = streams_.find(ssrc);
       if (it != streams_.end()) stream = it->second.lock();
     }
-    return stream ? stream->LagMs(now_us) : -1;
+    return stream ? stream->Lag(now_us) : AudioRtpLagSample{};
   }
 
  private:

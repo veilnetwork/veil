@@ -23,6 +23,9 @@ expected = {prefix + '00' * 28 for prefix in ['02225cff', '03225cff']}
 assert set(peers) == expected
 assert all(re.fullmatch('[0-9a-f]{64}', key) for key in peers)
 assert set(stats['audio_receivers']) == expected
+for receiver in stats['audio_receivers'].values():
+    assert -1 <= receiver['audio_rtp_arrival_excess_ms'] <= receiver['audio_rtp_lag_ms']
+    assert receiver['audio_pressure_delay_ms'] >= receiver['audio_delay_ms']
 for name in ['audio_latency_recovery_count', 'audio_latency_discarded_ms',
              'audio_latency_fallback_frames']:
     assert isinstance(stats[name], int)

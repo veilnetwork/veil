@@ -45,6 +45,28 @@ int main() {
     assert(!lag.Output(stamp(65000), 66'390'000));
   }
   {
+    AudioRtpLag late_arrival, late_playout;
+    for (int ms = 0; ms <= 1000; ms += 20) {
+      const auto now = 1'000'000 + ms * 1000;
+      late_arrival.Packet(7, stamp(ms), now);
+      late_playout.Packet(7, stamp(ms), now);
+    }
+    late_arrival.Packet(7, stamp(1020), 2'210'000);
+    late_playout.Packet(7, stamp(1020), 2'020'000);
+    // Identical relative age, with the delay on different sides of arrival.
+    int arrival_excess_ms = -1;
+    assert(late_arrival.Output(stamp(930), 2'210'000, &arrival_excess_ms) == 280);
+    assert(arrival_excess_ms == 190);
+    assert(late_playout.Output(stamp(740), 2'020'000, &arrival_excess_ms) == 280);
+    assert(arrival_excess_ms == 0);
+    // A short cursor advance beyond the last observed RTP stamp is usable
+    // for age, but cannot support a non-negative breakdown at that instant.
+    assert(late_arrival.Output(stamp(1021), 2'210'000, &arrival_excess_ms) == 189);
+    assert(arrival_excess_ms == -1);
+    assert(!late_arrival.Output(stamp(930), 5'220'000, &arrival_excess_ms));
+    assert(arrival_excess_ms == -1);
+  }
+  {
     AudioRtpLag lag;
     for (uint16_t n = 0; n <= 5; ++n)
       lag.Packet(7, stamp(n * 20), 1'000'000 + n * 20'000, n);
@@ -128,15 +150,25 @@ int main() {
   {
     veil_media::AudioRecoveryRegistry registry;
     auto stream = registry.NewStream(); registry.Attach(7, stream);
-    stream->SetLag(269, 1'234'567);
-    assert(registry.LagMs(7, 1'235'000) == 269);
-    assert(registry.LagMs(8, 1'235'000) == -1);
-    assert(registry.LagMs(7, 1'233'000) == -1);
-    assert(registry.LagMs(7, 4'235'000) == -1);
+    stream->SetLag(269, 1'234'567, 180);
+    assert(registry.Lag(7, 1'235'000).age_ms == 269);
+    assert(registry.Lag(7, 1'235'000).arrival_excess_ms == 180);
+    assert(registry.Lag(8, 1'235'000).age_ms == -1);
+    assert(registry.Lag(7, 1'233'000).age_ms == -1);
+    assert(registry.Lag(7, 4'235'000).age_ms == -1);
+    assert(registry.Lag(7, 4'235'000).arrival_excess_ms == -1);
     stream->SetLag(std::nullopt, 1'240'000);
-    assert(registry.LagMs(7, 1'241'000) == -1);
+    assert(registry.Lag(7, 1'241'000).age_ms == -1);
+    // The diagnostic tag can wrap while the full observed time stays fresh.
+    constexpr int64_t kLongUptime = (int64_t{1} << 32) * 1000;
+    stream->SetLag(0, kLongUptime, 0);
+    assert(registry.Lag(7, kLongUptime).arrival_excess_ms == 0);
+    assert(registry.Lag(7, kLongUptime + 3'001'000).arrival_excess_ms == -1);
+    stream->SetLag(20, kLongUptime, 50);
+    assert(registry.Lag(7, kLongUptime).age_ms == 20);
+    assert(registry.Lag(7, kLongUptime).arrival_excess_ms == -1);
     stream->SetLag(60, 1'250'000); stream.reset();
-    assert(registry.LagMs(7, 1'251'000) == -1);
+    assert(registry.Lag(7, 1'251'000).age_ms == -1);
   }
   std::puts("RTP lag: constant high delay, wrap, reorder, upstream queue, floor expiry, silence, reset and fresh publication verified");
 }
