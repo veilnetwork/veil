@@ -100,7 +100,14 @@ static std::vector<Packet> network(const std::vector<Packet>& encoded, int profi
     if (profile == 12 && p.at >= 4000) {
       p.at += std::max(0, 670 - p.at % 1000);
     }
-    if (profile >= 9 && profile <= 12) {
+    if (profile == 13 && p.at >= 4000) {
+      // The first release is limited by the upstream flight. The rest of
+      // that second's packets wait for the next release with newer speech.
+      if (p.at >= 4600 && p.at < 5000) p.at = 5000;
+      const int hold_ms = p.at < 7000 ? 900 : 625;
+      p.at += std::max(0, hold_ms - p.at % 1000);
+    }
+    if (profile >= 9 && profile <= 13) {
       // An open link drains the held packets at a finite rate, with other
       // opaque datagrams serialized ahead of individual audio packets.
       int service_ms = 2 + static_cast<int>(rng() % 10);
@@ -120,6 +127,7 @@ struct Metrics {
   uint64_t played_plc = 0, conceal = 0, discarded = 0, packet_discarded = 0, events = 0, accelerate = 0;
   uint64_t max_discard_per_render = 0, recovery_queue_ms = 0;
   uint64_t packet_flushes = 0;
+  uint64_t first_release_discarded_ms = 0;
   int max_gap = 0, q95 = 0, max_target = 0, recovery_target_ms = 0;
 };
 class CallDelayTrials final : public webrtc::FieldTrialsView {
@@ -185,6 +193,8 @@ static Metrics run(const std::vector<Packet>& packets, bool custom,
         flush_base = neteq->GetOperationsAndState().packet_buffer_flushes;
       }
       if (at > sample_after_ms) {
+        if (at < sample_after_ms + 1500)
+          result.first_release_discarded_ms = discarded - discard_base;
         result.max_discard_per_render = std::max(
             result.max_discard_per_render, discarded - previous_discarded);
         for (size_t i = 0; i < frame.samples_per_channel_; ++i) {
@@ -244,6 +254,18 @@ int main(int argc,char**argv) {
     need(sustained.played_plc <= 150, "overlap caused repeated audio gaps");
   }
   const auto encoded_40ms = encode(speech, 40);
+  const auto long_onset = network(encoded_40ms, 13, 197);
+  need(long_onset.size() == encoded_40ms.size(), "long onset removed packets");
+  const auto refilling = run(long_onset, true, 4000, true);
+  std::printf("900-ms onset: discarded during first release=%llu ms "
+              "concealed=%llu ms target=%d ms\n",
+      (unsigned long long)refilling.first_release_discarded_ms,
+      (unsigned long long)refilling.played_plc, refilling.max_target);
+  std::fflush(stdout);
+  need(refilling.first_release_discarded_ms == 0,
+       "first lossless release was cut before NetEq adapted");
+  need(refilling.max_target == 500 && refilling.packet_flushes == 0,
+       "onset must preserve the target cap and packet capacity");
   for (int seed : {197, 17, 41}) {
     const auto held = network(encoded_40ms, 12, seed);
     need(held.size() == encoded_40ms.size(), "40-ms overlap removed packets");

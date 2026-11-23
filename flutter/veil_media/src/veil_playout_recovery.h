@@ -55,16 +55,23 @@ class RecoveringNetEq final : public webrtc::NetEq {
     // the backlog we just removed, including across an Opus DTX interval.
     if (arrival_clock_) arrival_clock_->Increment();
     const int result = inner_->GetAudio(frame, &silent, &sample_rate, action);
-    const auto flushes = inner_->GetOperationsAndState().packet_buffer_flushes;
+    const auto state_after_render = inner_->GetOperationsAndState();
+    const auto flushes = state_after_render.packet_buffer_flushes;
     if (flushes != packet_buffer_flushes_) {
       ResetLag();
       packet_buffer_flushes_ = flushes;
     }
     const bool normal_speech = result == kOK && !silent &&
         frame->speech_type_ == webrtc::AudioFrame::kNormalSpeech;
+    if (result == kOK && !action &&
+        (frame->speech_type_ == webrtc::AudioFrame::kPLC ||
+         frame->speech_type_ == webrtc::AudioFrame::kPLCCNG) &&
+        state_after_render.current_buffer_size_ms <= kRenderBlockMs) {
+      last_render_underrun_us_ = webrtc::TimeMicros();
+    }
     if (normal_speech) {
       // PLC/CNG/muted output does not establish a new encoded packet size.
-      const int frame_ms = inner_->GetOperationsAndState().current_frame_size_ms;
+      const int frame_ms = state_after_render.current_frame_size_ms;
       if (frame_ms > 0) {
         frame_headroom_ms_ = std::clamp(frame_ms, 10, 100);
         ApplyTargetCeiling();
@@ -166,6 +173,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
           opus_payloads_[h.payloadType]) {
         if (rtp_lag_.Packet(h.ssrc, h.timestamp, received_us, h.sequenceNumber)) {
           arrival_reserve_ms_ = 0;
+          last_render_underrun_us_ = 0;
           decoded_stamp_.reset();
           receiver_recovery_->SetLag(std::nullopt, 0);
         }
@@ -235,6 +243,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
   void ResetLag() {
     rtp_lag_.Reset();
     arrival_reserve_ms_ = 0;
+    last_render_underrun_us_ = 0;
     decoded_stamp_.reset();
     receiver_recovery_->SetLag(std::nullopt, 0);
   }
@@ -307,7 +316,14 @@ class RecoveringNetEq final : public webrtc::NetEq {
     // retain. Allow a bounded overshoot to inform the first reserve without
     // retaining that overshoot or treating long stalls as sustained jitter.
     const int max_onset_variation_ms = max_reserve_ms + 2 * headroom_ms;
-    const int measured_ms = !adaptive && recent_ms > max_onset_variation_ms
+    // A real underrun can precede an oversized late batch while the target
+    // still reflects the old route. Keep the bounded refill for one second
+    // while NetEq learns it. A stopped render loop has no such witness.
+    constexpr int64_t kRefillAfterUnderrunUs = 1'000'000;
+    const bool refilling = ceiling_ms == kMaximumAdaptiveTargetMs &&
+        last_render_underrun_us_ > 0 && now_us >= last_render_underrun_us_ &&
+        now_us - last_render_underrun_us_ <= kRefillAfterUnderrunUs;
+    const int measured_ms = !adaptive && !refilling && recent_ms > max_onset_variation_ms
         ? target_reserve_ms
         : std::max(target_reserve_ms, std::min(recent_ms + headroom_ms, max_reserve_ms));
     // The recent arrival maximum expires in 500-ms buckets. Removing the
@@ -343,6 +359,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
   }
   int frame_headroom_ms_ = 20;
   int arrival_reserve_ms_ = 0;
+  int64_t last_render_underrun_us_ = 0;
   int64_t arrival_reserve_at_us_ = 0;
   int requested_maximum_delay_ms_ = 0;
   int applied_target_ceiling_ms_ = -1;

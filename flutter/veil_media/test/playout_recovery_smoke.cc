@@ -382,6 +382,51 @@ int main() {
     assert(recovering.GetAudio(&frame, nullptr, nullptr, std::nullopt) == 0);
     assert(observed->pulls == 18 && stats->discarded_ms == 160);
   }
+  // The same late RTP batch can follow either a receiver pause or an
+  // actively rendered underrun. Only fresh concealment with empty storage
+  // can preserve the refill while the measured target is still low.
+  for (const int underrun_age_us : {0, 10'000, 1'050'000}) {
+    RenderClock wall;
+    auto* previous = webrtc::SetClockForTesting(&wall);
+    auto decoder = std::make_unique<Decoder>();
+    auto* observed = decoder.get();
+    observed->frame_ms = 40;
+    observed->target_ms = 60;
+    auto stats = std::make_shared<veil_media::PlayoutRecoveryStats>();
+    veil_media::RecoveringNetEq recovering(std::move(decoder), stats);
+    assert(recovering.RegisterPayloadType(111, webrtc::SdpAudioFormat("opus", 48000, 2)));
+    webrtc::RTPHeader header{};
+    header.ssrc = 11;
+    header.payloadType = 111;
+    const uint8_t payload[] = {1};
+    auto insert = [&](int index) {
+      header.timestamp = index * 1920;
+      header.sequenceNumber = 20 + index;
+      assert(recovering.InsertPacket(header, payload,
+          webrtc::RtpPacketInfo(header, webrtc::Timestamp::Micros(wall.us))) == 0);
+    };
+    for (int i = 0; i < 4; ++i) {
+      wall.us = 1'000'000 + i * 40'000;
+      insert(i);
+    }
+    webrtc::AudioFrame frame;
+    if (underrun_age_us > 0) {
+      wall.us = 2'250'000 - underrun_age_us;
+      observed->mode = 1;
+      observed->fault_after = 0;
+      observed->buffer_ms_override = 10;
+      assert(recovering.GetAudio(&frame, nullptr, nullptr, std::nullopt) == 0);
+      assert(frame.speech_type_ == webrtc::AudioFrame::kPLC);
+    }
+    wall.us = 2'250'000;
+    insert(4);
+    observed->mode = 5;
+    observed->buffer_ms_override = 600;
+    assert(recovering.GetAudio(&frame, nullptr, nullptr, std::nullopt) == 0);
+    assert(recovering.TargetDelayMs() == 60 && observed->maximum_delay == 500);
+    assert(stats->discarded_ms == (underrun_age_us == 10'000 ? 0u : 160u));
+    webrtc::SetClockForTesting(previous);
+  }
   // PLC/mute/unknown duration cannot shrink the known speech-packet reserve.
   for (const int kind : {0, 1, 2}) {
     auto decoder = std::make_unique<Decoder>();
