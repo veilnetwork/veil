@@ -158,7 +158,8 @@ impl SessionTxRegistry {
         sampled_at: std::time::Instant,
         received_at: std::time::Instant,
     ) {
-        self.source_activity.note_recovery_probe(sampled_at, received_at);
+        self.source_activity
+            .note_recovery_probe(sampled_at, received_at);
     }
 
     /// Freeze achieved source growth without contracting paid admission.

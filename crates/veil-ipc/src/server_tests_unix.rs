@@ -337,11 +337,21 @@ async fn local_source_feedback_is_bound_fresh_negotiated_and_never_forwarded() {
     report.kind = LocalSourceFeedbackKind::RecoveryProbe;
     report.sampled_at_unix_ms = now_ms();
     for other in [&mut stranger, &mut legacy] {
-        send_ipc_frame(other, LocalAppMsg::LocalSourceFeedback as u16, &report.encode()).await;
+        send_ipc_frame(
+            other,
+            LocalAppMsg::LocalSourceFeedback as u16,
+            &report.encode(),
+        )
+        .await;
         barrier(other).await;
     }
     assert_eq!(observer.2.load(Ordering::SeqCst), 0);
-    send_ipc_frame(&mut client, LocalAppMsg::LocalSourceFeedback as u16, &report.encode()).await;
+    send_ipc_frame(
+        &mut client,
+        LocalAppMsg::LocalSourceFeedback as u16,
+        &report.encode(),
+    )
+    .await;
     barrier(&mut client).await;
     assert_eq!(observer.2.load(Ordering::SeqCst), 1);
     assert_eq!(observer.0.load(Ordering::SeqCst), 101);

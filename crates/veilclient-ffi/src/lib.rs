@@ -1516,9 +1516,9 @@ pub unsafe extern "C" fn veil_app_report_local_source_recovery_probe(
     sampled_at_unix_ms: u64,
     err_out: *mut *mut c_char,
 ) -> c_int {
-    if let Err(rc) = unsafe {
-        guard::ffi_prelude(err_out, "veil_app_report_local_source_recovery_probe")
-    } {
+    if let Err(rc) =
+        unsafe { guard::ffi_prelude(err_out, "veil_app_report_local_source_recovery_probe") }
+    {
         return rc;
     }
     unsafe {

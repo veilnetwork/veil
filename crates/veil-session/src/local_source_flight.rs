@@ -282,8 +282,10 @@ impl SourceFlightPool {
         let wakers = {
             let mut s = lock!(self.0);
             if !s.active(received_at)
-                || s.recovery_probe_not_before.is_some_and(|at| sampled_at <= at)
-                || s.pressure_until.is_some_and(|at| sampled_at + PRESSURE_GRACE <= at)
+                || s.recovery_probe_not_before
+                    .is_some_and(|at| sampled_at <= at)
+                || s.pressure_until
+                    .is_some_and(|at| sampled_at + PRESSURE_GRACE <= at)
                 || s.recovery_probe_at.is_some_and(|at| sampled_at <= at)
             {
                 return;

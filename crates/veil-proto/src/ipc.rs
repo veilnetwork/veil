@@ -215,11 +215,13 @@ impl LocalSourceFeedbackPayload {
             0 => LocalSourceFeedbackKind::Healthy,
             1 => LocalSourceFeedbackKind::Pressured,
             2 => LocalSourceFeedbackKind::RecoveryProbe,
-            value => return Err(ProtoError::ValueTooLarge {
-                field: "local_source_pressure",
-                value: value as u64,
-                max: 2,
-            }),
+            value => {
+                return Err(ProtoError::ValueTooLarge {
+                    field: "local_source_pressure",
+                    value: value as u64,
+                    max: 2,
+                });
+            }
         };
         Ok(Self {
             source_app_id: bytes[..32].try_into().expect("checked length"),

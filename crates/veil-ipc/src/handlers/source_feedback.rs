@@ -35,8 +35,9 @@ pub(crate) fn handle_local_source_feedback(
     match report.kind {
         LocalSourceFeedbackKind::Healthy => registry.note_local_source_feedback(false, sampled_at),
         LocalSourceFeedbackKind::Pressured => registry.note_local_source_feedback(true, sampled_at),
-        LocalSourceFeedbackKind::RecoveryProbe => recovery_probe_negotiated
-            && registry.note_local_source_recovery_probe(sampled_at, now),
+        LocalSourceFeedbackKind::RecoveryProbe => {
+            recovery_probe_negotiated && registry.note_local_source_recovery_probe(sampled_at, now)
+        }
     }
 }
 
