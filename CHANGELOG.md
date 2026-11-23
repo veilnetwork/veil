@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## v0.11.58 — 2026-11-22
+
+### Fixed
+
+- Keep transport parameters when sharing and importing bootstrap nodes.
+- Try the next address for the same bootstrap node when the first
+  connection fails.
+- Reset audio timing after RTP timestamp or decoder discontinuities.
+  Audio due to a loss or a decoder reset no longer raises video pressure.
+
+### Diagnostics
+
+- Report the duration of audio supplied before encoding when the media
+  engine exposes it.
+
 ## v0.11.57 — 2026-11-21
 
 ### Fixed

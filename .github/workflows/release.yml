@@ -113,13 +113,16 @@ jobs:
             cross_linker: aarch64-linux-gnu-gcc
           - triple: aarch64-apple-darwin
             runner: macos-15
+          # The VS 2026 headers on windows-latest require Clang 22,
+          # ahead of the installed clang-cl. Use the VS 2022 image
+          # with its compatible compiler and headers for both targets.
           - triple: x86_64-pc-windows-msvc
-            runner: windows-latest
+            runner: windows-2022
             is_windows: true
           # Native Windows on ARM64. Cross-compiled from the x64 runner with
           # clang-cl --target=aarch64-pc-windows-msvc.
           - triple: aarch64-pc-windows-msvc
-            runner: windows-latest
+            runner: windows-2022
             is_windows: true
 
     runs-on: ${{ matrix.runner }}
@@ -251,6 +254,21 @@ jobs:
           ./scripts/build-release.sh \
             --target ${{ matrix.triple }} \
             --source-date-epoch ${{ steps.epoch.outputs.value }}
+
+      - name: Install the pinned NASM assembler for BoringSSL
+        if: matrix.triple == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'nasm-2.16.03-win64.zip'
+          Invoke-WebRequest -Uri 'https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/win64/nasm-2.16.03-win64.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne '3ee4782247bcb874378d02f7eab4e294a84d3d15f3f6ee2de2f47a46aa7226e6') {
+            throw 'NASM archive checksum mismatch'
+          }
+          Expand-Archive -Path $archive -DestinationPath $env:RUNNER_TEMP
+          $bin = Join-Path $env:RUNNER_TEMP 'nasm-2.16.03'
+          & (Join-Path $bin 'nasm.exe') -v
+          if ($LASTEXITCODE -ne 0) { throw 'NASM did not run' }
+          $bin >> $env:GITHUB_PATH
 
       - name: Build release binaries (Windows)
         if: matrix.is_windows == true
