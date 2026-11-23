@@ -182,6 +182,42 @@ int main() {
       assert(neteq->GetOperationsAndState().last_waiting_time_ms == renders * 10);
     }
   }
+  // A late packet is still in time for ordinary playback. The buffered
+  // suffix behind it must not be used to justify dropping the prefix.
+  {
+    auto stats = std::make_shared<veil_media::PlayoutRecoveryStats>();
+    veil_media::RecoveringNetEqFactory factory(stats);
+    webrtc::SimulatedClock clock(1000000);
+    webrtc::NetEq::Config config;
+    config.sample_rate_hz = 8000;
+    auto neteq = factory.Create(webrtc::CreateEnvironment(&clock), config,
+                                webrtc::CreateBuiltinAudioDecoderFactory());
+    assert(neteq->RegisterPayloadType(0, webrtc::SdpAudioFormat("PCMU", 8000, 1)));
+    webrtc::RTPHeader header{};
+    header.ssrc = 100;
+    header.payloadType = 0;
+    const std::vector<uint8_t> payload(160, 0x58);
+    const auto insert = [&](int i) {
+      header.sequenceNumber = i;
+      header.timestamp = i * 160;
+      assert(neteq->InsertPacket(header, payload, webrtc::RtpPacketInfo(
+          header, clock.CurrentTime())) == 0);
+    };
+    for (int i = 0; i < 25; ++i) {
+      if (i != 5) insert(i);
+    }
+    webrtc::AudioFrame frame;
+    for (int render = 0; render < 7; ++render) {
+      assert(neteq->GetAudio(&frame) == 0);
+      assert(frame.speech_type_ == webrtc::AudioFrame::kNormalSpeech);
+      clock.AdvanceTimeMilliseconds(10);
+    }
+    assert(stats->discarded_ms == 0);
+    insert(5);
+    assert(neteq->GetAudio(&frame) == 0);
+    assert(frame.speech_type_ == webrtc::AudioFrame::kNormalSpeech);
+    assert(stats->discarded_ms > 0);
+  }
   DecodedAgeRegression();
   // Physical render trace: RTP age initiated a trim with only 84 ms stored,
   // below the adaptive 120-ms target. The decoder then refilled that target,

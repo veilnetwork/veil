@@ -34,9 +34,11 @@ class RecoveringNetEq final : public webrtc::NetEq {
   RecoveringNetEq(std::unique_ptr<webrtc::NetEq> inner,
                  std::shared_ptr<PlayoutRecoveryStats> stats,
                  std::unique_ptr<webrtc::TickTimer> arrival_clock = nullptr,
-                 int requested_maximum_delay_ms = 0)
+                 int requested_maximum_delay_ms = 0,
+                 const webrtc::PacketBuffer* packet_buffer = nullptr)
       : requested_maximum_delay_ms_(std::max(0, requested_maximum_delay_ms)),
         arrival_clock_(std::move(arrival_clock)), inner_(std::move(inner)),
+        packet_buffer_(packet_buffer),
         stats_(std::move(stats)), receiver_recovery_(stats_->receivers.NewStream()) {
     ApplyTargetCeiling();
   }
@@ -99,6 +101,11 @@ class RecoveringNetEq final : public webrtc::NetEq {
         if ((!age_excess && !storage_excess) ||
             (inner_->SyncBufferSizeMs() < 20 && !state.next_packet_available))
           break;
+        // Packets beyond a hole count toward total storage. Dropping speech
+        // before that hole can reach it before a reordered packet arrives.
+        // Inspect the queue once, immediately before the first extra pull.
+        // The decoder owns it and no packets are inserted during GetAudio.
+        if (!skipped && HasQueuedGap(state, sample_rate)) break;
         bool next_muted = false;
         int next_rate = 0;
         if (inner_->GetAudio(&scratch_, &next_muted, &next_rate) != kOK) break;
@@ -217,6 +224,14 @@ class RecoveringNetEq final : public webrtc::NetEq {
   void FlushBuffers() override { inner_->FlushBuffers(); ResetLag(); }
   int SyncBufferSizeMs() const override { return inner_->SyncBufferSizeMs(); }
  private:
+  bool HasQueuedGap(const webrtc::NetEqOperationsAndState& state,
+                    int sample_rate) const {
+    if (!packet_buffer_ || packet_buffer_->Empty()) return false;
+    const size_t frame_samples = state.current_frame_size_ms * (sample_rate / 1000);
+    return !state.next_packet_available ||
+        packet_buffer_->GetSpanSamples(frame_samples, sample_rate, false) !=
+            packet_buffer_->NumSamplesInBuffer(frame_samples);
+  }
   void ResetLag() {
     rtp_lag_.Reset();
     arrival_reserve_ms_ = 0;
@@ -335,6 +350,7 @@ class RecoveringNetEq final : public webrtc::NetEq {
   // The decoder's own timer still counts all decoded blocks.
   std::unique_ptr<webrtc::TickTimer> arrival_clock_;
   std::unique_ptr<webrtc::NetEq> inner_;
+  const webrtc::PacketBuffer* packet_buffer_;  // Owned by inner_.
   std::shared_ptr<PlayoutRecoveryStats> stats_;
   std::shared_ptr<StreamAudioRecovery> receiver_recovery_;
   uint32_t registered_ssrc_ = 0;
@@ -373,9 +389,10 @@ class RecoveringNetEqFactory final : public webrtc::NetEqFactory {
     // the controller. Use the same render clock as packet-arrival history.
     deps.packet_buffer = std::make_unique<webrtc::PacketBuffer>(
         env.field_trials(), config.max_packets_in_buffer, clock.get(), deps.stats.get());
+    const auto* packet_buffer = deps.packet_buffer.get();
     auto inner = std::make_unique<webrtc::NetEqImpl>(config, std::move(deps));
     return std::make_unique<RecoveringNetEq>(
-        std::move(inner), stats_, std::move(clock), config.max_delay_ms);
+        std::move(inner), stats_, std::move(clock), config.max_delay_ms, packet_buffer);
   }
  private:
   std::shared_ptr<PlayoutRecoveryStats> stats_;
