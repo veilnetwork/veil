@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## v0.11.59 — 2026-11-24
+
+### Fixed
+
+- Open audio playout before starting microphone capture. Maintain a bounded
+  receive-side reserve during recurring late audio and recover video once
+  current playout and transport measurements agree.
+- Separate audio packet arrival delay from receive-side playout age. Expire
+  stale pressure and avoid counting repeated RTCP loss reports twice.
+- Preserve paced camera fragments across short transport stalls and expire
+  queued QUIC datagrams on schedule.
+- Recover cold mailbox lookups and refresh signed relay and replica keys
+  before retrying delivery.
+
 ## v0.11.58 — 2026-11-22
 
 ### Fixed
