@@ -16,6 +16,10 @@
 - Recover cold mailbox lookups and refresh signed relay and replica keys
   before retrying delivery.
 
+### Security
+
+- Update `url` to 2.5.9 to address RUSTSEC-2026-0592.
+
 ## v0.11.58 — 2026-11-22
 
 ### Fixed
