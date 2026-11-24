@@ -203,6 +203,22 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   All 22 retries succeeded and all routes stayed installed with the
   change. The earlier UDP loss spike did not recur in either comparison.
   Its exact cause remains open.
+- On a new batch-capable status connection, ogate uses the bounded IPC
+  session list to put live peers first in large admission sweeps. Every
+  configured entry stays in the sweep and still requires its own positive
+  P-Net admission result. A missing list leaves the current sweep order
+  in use.
+- On the same 48 authenticated sessions, 24 gateways checked disjoint
+  4,096-entry tables with both live peers at the end of each table. All
+  routes appeared 2.56 s after launching the updated gateways, compared
+  with 24.19 s with the previous ogate. A second launch of the updated
+  gateways took 0.84 s. The three samples used the same running daemon.
+  During the following 164 s of traffic, the gateways logged no failed
+  admission batches and kept all unaffected routes. The probes received
+  all 15,719 ICMP replies, and the two UDP flows delivered 596,195 of
+  596,215 datagrams. Under this load, route withdrawal still took
+  14.62–18.78 s after the daemon reported the session loss, and one
+  recovery took 21.23 s. Session changes still wait for a sweep boundary.
 - On two Linux ARM64 nodes with real TUN interfaces and one live certified
   peer at the end of each configured list, the routes appeared within
   0.22 s for 34 entries, 0.66 s for 256, and 2.17 s for 1,024 after

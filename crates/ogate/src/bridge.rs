@@ -17,7 +17,7 @@
 //!
 //! On `ctrl_c` / `SIGTERM` all tasks exit and the function returns.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::ops::Bound::{Excluded, Unbounded};
 use std::path::{Path, PathBuf};
@@ -232,6 +232,7 @@ const PNET_QUERY_SPACING: Duration = Duration::from_millis(125);
 const PNET_RETRY_PERIOD: Duration = Duration::from_secs(1);
 const PNET_RECENT_WINDOW: Duration = Duration::from_secs(30);
 const PNET_SESSION_COALESCE: Duration = Duration::from_millis(100);
+const PNET_PEER_HINT_TIMEOUT: Duration = Duration::from_millis(250);
 
 fn pnet_session_refresh_spacing(peer_count: usize) -> Duration {
     let batches = peer_count.div_ceil(veilclient::PNET_ADMISSION_BATCH_MAX_PEERS);
@@ -327,6 +328,37 @@ async fn connect_pnet_status(
             None
         }
     }
+}
+
+async fn prioritize_live_peers(
+    client: &VeilClient,
+    order: &[(NodeId, [u8; 32])],
+    pace: &mut tokio::time::Interval,
+) -> Option<Vec<(NodeId, [u8; 32])>> {
+    if order.len() <= veilclient::PNET_ADMISSION_BATCH_MAX_PEERS {
+        return None;
+    }
+    pace.tick().await;
+    let Ok(Ok(peers)) = tokio::time::timeout(PNET_PEER_HINT_TIMEOUT, client.peers()).await else {
+        return None;
+    };
+    let live: HashSet<_> = peers
+        .into_iter()
+        .filter(|entry| entry.state == veil_proto::peer_state::ACTIVE)
+        .map(|entry| entry.node_id)
+        .collect();
+    if live.is_empty() {
+        return None;
+    }
+    // The session list is a bounded scheduling hint. Keep every configured
+    // peer in the sweep and require the same admission reply for all peers.
+    let mut prioritized = Vec::with_capacity(order.len());
+    prioritized.extend(order.iter().copied().filter(|(id, _)| live.contains(id)));
+    if prioritized.is_empty() {
+        return None;
+    }
+    prioritized.extend(order.iter().copied().filter(|(id, _)| !live.contains(id)));
+    Some(prioritized)
 }
 
 async fn query_pnet_batch(
@@ -1342,6 +1374,7 @@ async fn maintain_routes(
                 accepted.send_replace(new.clone());
                 config = new;
                 next_peer = 0;
+                admission_order = None;
                 if !config.pnet_required {
                     admitted.clear();
                     connection = None;
@@ -1428,14 +1461,12 @@ async fn maintain_routes(
             }
         }
 
-        let order = admission_order
-            .as_deref()
-            .unwrap_or(&configured.peer_app_ids);
-        if order.is_empty() {
+        if configured.peer_app_ids.is_empty() {
             continue;
         }
         if wake == Wake::SessionSweep {
-            next_session_sweep = Instant::now() + pnet_session_refresh_spacing(order.len());
+            next_session_sweep =
+                Instant::now() + pnet_session_refresh_spacing(configured.peer_app_ids.len());
             refresh.reset();
         }
         if connection.is_none() {
@@ -1450,8 +1481,19 @@ async fn maintain_routes(
                     events: client.events().await,
                     pending: None,
                 });
+                let order = admission_order
+                    .as_deref()
+                    .unwrap_or(&configured.peer_app_ids);
+                if next_peer == 0
+                    && let Some(prioritized) = prioritize_live_peers(client, order, &mut pace).await
+                {
+                    admission_order = Some(prioritized);
+                }
             }
         }
+        let order = admission_order
+            .as_deref()
+            .unwrap_or(&configured.peer_app_ids);
         if let Some(client) = &connection
             && binding.signed.is_some()
             && Instant::now() >= retry_due
@@ -2016,32 +2058,55 @@ mod tests {
     #[tokio::test]
     async fn pnet_routes_follow_daemon_admission_without_reload() {
         tokio::join!(
-            exercise_pnet_sweep(34, false),
-            exercise_pnet_sweep(256, false),
-            exercise_pnet_sweep(1024, false),
+            exercise_pnet_sweep(34, false, false),
+            exercise_pnet_sweep(256, false, false),
+            exercise_pnet_sweep(1024, false, false),
         );
     }
 
     #[tokio::test]
     async fn pnet_session_events_accelerate_route_withdrawal() {
         tokio::join!(
-            exercise_pnet_sweep(34, true),
-            exercise_pnet_sweep(1024, true)
+            exercise_pnet_sweep(34, true, false),
+            exercise_pnet_sweep(1024, true, false)
         );
     }
 
-    async fn exercise_pnet_sweep(peer_count: u16, publish_session_events: bool) {
+    #[tokio::test]
+    async fn pnet_snapshot_prioritizes_live_peers_and_checks_unlisted_routes() {
+        exercise_pnet_sweep(1024, true, true).await;
+    }
+
+    async fn exercise_pnet_sweep(peer_count: u16, publish_session_events: bool, hint_live: bool) {
         use std::sync::atomic::{AtomicBool, Ordering};
-        use veil_ipc::{EventBus, IpcEndpoint, IpcServer, PnetStatusProvider};
-        use veil_proto::{EventPayload, PnetStatusResultPayload};
+        use veil_ipc::{EventBus, IpcEndpoint, IpcServer, PeerListProvider, PnetStatusProvider};
+        use veil_proto::{EventPayload, PeersListEntry, PeersListPayload, PnetStatusResultPayload};
+
+        struct LivePeerHint;
+
+        impl PeerListProvider for LivePeerHint {
+            fn list_peers(&self) -> PeersListPayload {
+                PeersListPayload {
+                    peers: vec![PeersListEntry {
+                        node_id: [0xaa; 32],
+                        state: veil_proto::peer_state::ACTIVE,
+                        direction: veil_proto::peer_direction::INBOUND,
+                        transport: vec![],
+                        caps: None,
+                    }],
+                }
+            }
+        }
 
         struct Admission {
             live: AtomicBool,
             wrong_peer: AtomicBool,
+            first: SyncMutex<Option<NodeId>>,
         }
 
         impl PnetStatusProvider for Admission {
             fn peer_status(&self, peer: &NodeId) -> PnetStatusResultPayload {
+                self.first.lock().unwrap().get_or_insert(*peer);
                 PnetStatusResultPayload {
                     admitted: self.live.load(Ordering::Relaxed),
                     has_cert: true,
@@ -2062,6 +2127,7 @@ mod tests {
         let admission = Arc::new(Admission {
             live: AtomicBool::new(false),
             wrong_peer: AtomicBool::new(false),
+            first: SyncMutex::new(None),
         });
         let events = Arc::new(EventBus::new());
         let (stop, shutdown) = tokio::sync::watch::channel(false);
@@ -2073,6 +2139,9 @@ mod tests {
         )
         .with_pnet_status_provider(admission.clone())
         .with_event_bus(events.clone());
+        if hint_live {
+            server = server.with_peer_list_provider(Arc::new(LivePeerHint));
+        }
         let server = tokio::spawn(async move { server.run().await.unwrap() });
 
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -2131,6 +2200,9 @@ mod tests {
         })
         .await
         .expect("admission batches did not converge within the local query quota");
+        if hint_live {
+            assert_eq!(*admission.first.lock().unwrap(), Some(peer));
+        }
         let admission_elapsed = started.elapsed();
         assert_eq!(
             state.load().table.lookup_egress(address),
