@@ -277,6 +277,23 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   attribution at IPC admission and during the bounded credit wait.
   A separate two-node mixed-version run passed traffic both ways and
   withdrew the route after the pre-batch peer disconnected.
+- A second 34 s A/B run added a bidirectional Veil SDK chat to one of
+  the sessions carrying the two 16 Mb/s UDP flows. Each chat endpoint
+  submitted 155 direct 96-byte messages at five per second. The control
+  delivered 308 of 310 and the credit-wait build delivered all 310,
+  with no duplicates in either run. From hub to spoke, p95 went from
+  44.8 to 63.5 ms and p99 from 106.4 to 101.0 ms. From spoke to hub,
+  p95 went from 33.4 to 100.9 ms and p99 from 86.9 to 212.6 ms. This
+  single comparison covers the direct SDK path under contention.
+- A lab-only sequence trace in the credit-wait build accounted for all
+  122,581 UDP datagrams. The source daemons read every datagram from IPC.
+  On one spoke the daemon returned `SERVER_BUSY` before starting the
+  send job for all 413 missing datagrams, in the fourth and fifth seconds
+  of the run. All admitted datagrams entered the handler, obtained
+  direct session credit, and reached the destination socket. Both TUN
+  captures and the receive sockets reported zero observation drops.
+  Further work on cold-start loss should therefore measure the pending
+  IPC job budget separately from the first-hop credit wait.
 - A separate cold start ran the first end-to-end probes in groups of
   four before opening the UDP flows. All 24 paths answered in 12.52 s.
   The following 38 s sample lost 76 of 137,175 UDP datagrams, with one
