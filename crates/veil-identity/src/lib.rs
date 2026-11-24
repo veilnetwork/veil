@@ -45,6 +45,9 @@ pub mod mlkem_fanout;
 pub mod network_access;
 pub mod network_ban;
 pub mod network_cert;
+pub mod network_policy;
+#[cfg(unix)]
+pub mod network_policy_store;
 pub mod pair_runtime;
 pub mod pair_transport;
 pub mod publish;

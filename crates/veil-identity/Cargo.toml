@@ -26,6 +26,7 @@ bip39 = { version = "2", default-features = false, features = ["std"] }
 blake3 = "1.5"
 chacha20poly1305 = "0.10"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+ipnet = { version = "2.12", features = ["serde"] }
 log = "0.4"
 pqcrypto-falcon = { version = "0.4", default-features = false, features = ["std"] }
 pqcrypto-traits = "0.3"
@@ -37,7 +38,11 @@ tokio = { version = "1.42", features = ["sync", "rt", "macros", "time", "io-util
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 zeroize = "1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
+tempfile = "3"
 # Enable the test-low-difficulty feature for our own #[cfg(test)] runs
 # so resolver / sovereign tests don't have to wait for production-tier
 # PoW mining.

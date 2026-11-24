@@ -280,6 +280,51 @@ sudo systemctl restart oproxy-server
 #    → Denied + log entry.
 ```
 
+### Prepare a signed address policy
+
+Use the existing P-Net owner key to sign a complete address snapshot.
+Set the network ID, a positive revision, and the validity window in Unix
+seconds. Use the same owner algorithm as for membership certificates.
+For example, an unsigned TOML source has this shape. Replace the IDs and
+timestamps for your network.
+
+```toml
+network_id = "0000000000000000000000000000000000000000000000000000000000000001"
+revision = 1
+valid_from_unix = 1795530000
+valid_until_unix = 1795616400
+ipv4_range = "10.99.0.0/24"
+ipv6_range = "fd84:99::/64"
+
+[[members]]
+node_id = "0000000000000000000000000000000000000000000000000000000000000002"
+addr_v4 = "10.99.0.2"
+addr_v6 = "fd84:99::2"
+```
+
+```sh
+veil-cli network route-policy sign --input policy.toml --out policy.bin \
+  --owner-pub owner.pub --owner-priv owner.key --network-id "$NETWORK_ID"
+veil-cli network route-policy verify --policy policy.bin \
+  --owner-pub owner.pub --network-id "$NETWORK_ID"
+veil-cli network route-policy install --policy policy.bin \
+  --owner-pub owner.pub --network-id "$NETWORK_ID" --state-dir "$STATE_DIR" --initialize
+veil-cli network route-policy status --owner-pub owner.pub \
+  --network-id "$NETWORK_ID" --state-dir "$STATE_DIR"
+```
+
+Keep the signing key offline. On the receiving node, obtain the expected
+network ID and public key through the existing P-Net trust configuration.
+Use an existing absolute state directory owned by the service account
+with mode `0700` and protected ancestry on durable local storage. Use
+`--initialize` for the first installation. Subsequent installations use
+the existing state to reject a lower revision or conflicting contents
+at the accepted revision. Expiry leaves that revision floor intact.
+
+These commands prepare and store snapshots. Route activation in ogate
+will also require confirmation that the running daemon uses the same
+P-Net authority.
+
 ## What gets rejected
 
 | Scenario | Error message at handshake |

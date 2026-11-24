@@ -116,3 +116,20 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   Apply the same signature, revision, and address checks as local delivery.
   Define owner-key rotation and recovery on the configured trust anchor
   before automatic rollout.
+
+### Signed snapshot implementation and checks
+
+- `veil-cli network route-policy` signs TOML input, verifies the current
+  snapshot, and installs or reports the revision in an owner-only Unix
+  state directory. The store is serialized across processes. Acceptance
+  waits for both the snapshot and directory to be synced.
+- macOS CLI processes exercised real signatures, authorization to the
+  pinned network and owner, tampering, revision conflicts, and rollback
+  after expiry and reopening. The store refused a macOS extended ACL
+  grant on an otherwise owner-only directory. Linux and macOS unit tests
+  cover the same signed format, concurrent updates, and unsafe state.
+- Before activating signed routes, require a local IPC witness derived
+  from the daemon's active private gate. Bind it to the expected network
+  ID, owner algorithm and public-key fingerprint, and recheck it on
+  reconnect. Apply the shorter of policy validity and membership validity
+  on the packet path. Preserve the current manual mode for older peers.

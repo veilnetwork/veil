@@ -11,6 +11,7 @@ mod invite_cmd;
 mod listen_cmd;
 mod mobile_cmd;
 mod network_cmd;
+mod network_policy_cmd;
 mod node_cmd;
 mod output;
 mod peers_cmd;

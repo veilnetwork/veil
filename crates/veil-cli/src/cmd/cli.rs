@@ -2138,6 +2138,11 @@ pub enum NetworkCommand {
         #[arg(long, value_name = "HEX64")]
         network_id: String,
     },
+    /// Sign, verify and install owner-authorized virtual address policies.
+    RoutePolicy {
+        #[command(subcommand)]
+        command: RoutePolicyCommand,
+    },
     /// Ban a node across the whole private network.
     ///
     /// Issues a DHT-replicated ban through the running daemon's admin socket.
@@ -2156,6 +2161,63 @@ pub enum NetworkCommand {
         /// `"admin ban"` when omitted.
         #[arg(long, value_name = "TEXT")]
         reason: Option<String>,
+    },
+}
+
+#[derive(Debug, clap::Args)]
+pub struct RoutePolicyTrust {
+    /// Network owner's public key file in base64.
+    #[arg(long)]
+    pub owner_pub: PathBuf,
+    /// Network owner's signature algorithm.
+    #[arg(long, value_enum, default_value_t = SignatureAlgorithmArg::Ed25519)]
+    pub algo: SignatureAlgorithmArg,
+    /// Expected P-Net network ID as 64 hexadecimal digits.
+    #[arg(long)]
+    pub network_id: String,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RoutePolicyCommand {
+    /// Sign an address policy TOML file using the offline owner key.
+    Sign {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        owner_priv: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[command(flatten)]
+        trust: RoutePolicyTrust,
+    },
+    /// Verify that a signed snapshot is authentic and currently valid.
+    Verify {
+        #[arg(long)]
+        policy: PathBuf,
+        #[command(flatten)]
+        trust: RoutePolicyTrust,
+    },
+    /// Accept a current snapshot in the node's durable policy store.
+    #[cfg(unix)]
+    Install {
+        #[arg(long)]
+        policy: PathBuf,
+        /// Existing private directory dedicated to this P-Net's policy.
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Initialize an empty store on first installation.
+        #[arg(long)]
+        initialize: bool,
+        #[command(flatten)]
+        trust: RoutePolicyTrust,
+    },
+    /// Display the stored revision and its validity window.
+    #[cfg(unix)]
+    Status {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[command(flatten)]
+        trust: RoutePolicyTrust,
     },
 }
 

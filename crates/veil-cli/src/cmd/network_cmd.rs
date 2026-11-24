@@ -69,6 +69,7 @@ pub fn handle_network_command<I: CommandIo>(
             algo,
             network_id,
         } => verify_cert(context, &cert, &owner_pub, algo.into(), &network_id),
+        NetworkCommand::RoutePolicy { command } => super::network_policy_cmd::run(context, command),
         NetworkCommand::Ban { node_id, reason } => ban(context, node_id, reason),
     }
 }
