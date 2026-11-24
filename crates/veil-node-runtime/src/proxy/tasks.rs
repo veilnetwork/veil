@@ -195,10 +195,8 @@ pub(crate) fn spawn_exit_proxy(ctx: ExitProxySpawnCtx<'_>) -> Option<JoinHandle<
         // Keep the endpoint handle alive for the lifetime of the loop.
         let _ep_handle = ep_handle;
         // Per-stream data channels: stream_id → sender.
-        let mut stream_data_txs: std::collections::HashMap<
-            u32,
-            tokio::sync::mpsc::Sender<Vec<u8>>,
-        > = std::collections::HashMap::new();
+        let mut stream_data_txs =
+            std::collections::HashMap::<_, tokio::sync::mpsc::Sender<Vec<u8>>>::new();
 
         /// Maximum concurrent exit-proxy streams (prevents resource exhaustion).
         const MAX_EXIT_STREAMS: usize = 1024;
@@ -208,8 +206,12 @@ pub(crate) fn spawn_exit_proxy(ctx: ExitProxySpawnCtx<'_>) -> Option<JoinHandle<
                 AppMessage::StreamOpen {
                     stream_id,
                     src_node_id,
+                    provenance,
                     ..
                 } => {
+                    let peer = (provenance != veil_proto::SenderProvenance::LocalIpc)
+                        .then_some(src_node_id);
+                    let key = (peer, stream_id);
                     // Prune stale entries (closed channels) before cap check.
                     stream_data_txs.retain(|_, tx| !tx.is_closed());
                     if stream_data_txs.len() >= MAX_EXIT_STREAMS {
@@ -225,7 +227,7 @@ pub(crate) fn spawn_exit_proxy(ctx: ExitProxySpawnCtx<'_>) -> Option<JoinHandle<
                     let (data_tx, data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(
                         veil_proto::budget::PROXY_STREAM_CHANNEL_CAP,
                     );
-                    stream_data_txs.insert(stream_id, data_tx);
+                    stream_data_txs.insert(key, data_tx);
 
                     // Inner duplex pipe: bridge task ↔ proxy handler.
                     let (client_half, server_half) = tokio::io::duplex(256 * 1024);
@@ -259,8 +261,13 @@ pub(crate) fn spawn_exit_proxy(ctx: ExitProxySpawnCtx<'_>) -> Option<JoinHandle<
                         .await
                     });
                 }
-                AppMessage::StreamData { stream_id, data } => {
-                    if let Some(tx) = stream_data_txs.get(&stream_id) {
+                AppMessage::StreamData {
+                    stream_id,
+                    remote_peer,
+                    data,
+                } => {
+                    let key = (remote_peer, stream_id);
+                    if let Some(tx) = stream_data_txs.get(&key) {
                         match tx.try_send(data) {
                             Ok(()) => {}
                             // Channel full: SOCKS5 egress can't keep up.
@@ -268,13 +275,16 @@ pub(crate) fn spawn_exit_proxy(ctx: ExitProxySpawnCtx<'_>) -> Option<JoinHandle<
                             // receiver closure and sends APP_CLOSE back.
                             Err(tokio::sync::mpsc::error::TrySendError::Full(_))
                             | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                stream_data_txs.remove(&stream_id);
+                                stream_data_txs.remove(&key);
                             }
                         }
                     }
                 }
-                AppMessage::StreamClose { stream_id } => {
-                    stream_data_txs.remove(&stream_id);
+                AppMessage::StreamClose {
+                    stream_id,
+                    remote_peer,
+                } => {
+                    stream_data_txs.remove(&(remote_peer, stream_id));
                 }
                 _ => {}
             }

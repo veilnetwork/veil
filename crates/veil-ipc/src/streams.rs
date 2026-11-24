@@ -141,6 +141,13 @@ struct IpcStreamTableInner {
     next_id: u32,
 }
 
+// The upper half of the local IPC ID space is reserved for incoming wire streams.
+pub(crate) const REMOTE_ACCEPTOR_ID_BIT: u32 = 1 << 31;
+
+fn next_opener_id(current: u32) -> u32 {
+    (current.wrapping_add(1) & !REMOTE_ACCEPTOR_ID_BIT).max(1)
+}
+
 impl IpcStreamTable {
     pub fn new() -> Self {
         Self::default()
@@ -185,7 +192,7 @@ impl IpcStreamTable {
         // instead of silently overwriting an existing entry (which the
         // earlier `attempts < 1000` cutoff did when the table was packed
         // around `next_id`).
-        let mut stream_id = inner.next_id.wrapping_add(1);
+        let mut stream_id = next_opener_id(inner.next_id);
         let mut attempts = 0usize;
         let max_attempts = veil_proto::budget::MAX_TOTAL_STREAMS + 1;
         while inner.streams.contains_key(&stream_id)
@@ -194,7 +201,7 @@ impl IpcStreamTable {
             if attempts >= max_attempts {
                 return None;
             }
-            stream_id = stream_id.wrapping_add(1);
+            stream_id = next_opener_id(stream_id);
             attempts += 1;
         }
         inner.next_id = stream_id;
@@ -255,7 +262,7 @@ impl IpcStreamTable {
         {
             return None;
         }
-        let mut stream_id = inner.next_id.wrapping_add(1);
+        let mut stream_id = next_opener_id(inner.next_id);
         let mut attempts = 0usize;
         let max_attempts = veil_proto::budget::MAX_TOTAL_STREAMS + 1;
         while inner.streams.contains_key(&stream_id)
@@ -264,7 +271,7 @@ impl IpcStreamTable {
             if attempts >= max_attempts {
                 return None;
             }
-            stream_id = stream_id.wrapping_add(1);
+            stream_id = next_opener_id(stream_id);
             attempts += 1;
         }
         inner.next_id = stream_id;
@@ -325,7 +332,11 @@ impl IpcStreamTable {
         }
         entry.window_a_to_b -= len;
         entry.last_activity = Instant::now();
-        let msg = AppMessage::StreamData { stream_id, data };
+        let msg = AppMessage::StreamData {
+            stream_id,
+            remote_peer: None,
+            data,
+        };
         match entry.b_endpoint_tx.try_send(msg) {
             Ok(()) => RouteOutcome::Sent,
             Err(_) => {
@@ -462,9 +473,10 @@ impl IpcStreamTable {
             return;
         };
         // Notify B via registry message.
-        let _ = entry
-            .b_endpoint_tx
-            .try_send(AppMessage::StreamClose { stream_id });
+        let _ = entry.b_endpoint_tx.try_send(AppMessage::StreamClose {
+            stream_id,
+            remote_peer: None,
+        });
         // Notify A via pre-encoded frame.
         let frame = encode_stream_close(stream_id);
         let _ = entry.a_delivery_tx.try_send(frame);

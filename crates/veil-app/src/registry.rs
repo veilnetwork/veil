@@ -132,11 +132,14 @@ pub enum AppMessage {
     /// Incoming stream data segment.
     StreamData {
         stream_id: u32,
+        /// Physical session peer for a remotely opened stream. Local IPC pairs have no peer.
+        remote_peer: Option<[u8; 32]>,
         data: Vec<u8>,
     },
     /// Stream was closed by the other side.
     StreamClose {
         stream_id: u32,
+        remote_peer: Option<[u8; 32]>,
     },
 }
 
@@ -646,23 +649,43 @@ impl AppEndpointRegistry {
         app_id: [u8; 32],
         endpoint_id: u32,
         stream_id: u32,
+        remote_peer: [u8; 32],
         data: Vec<u8>,
     ) -> bool {
         let key = EndpointKey {
             app_id,
             endpoint_id,
         };
-        self.send_to(key, AppMessage::StreamData { stream_id, data })
+        self.send_to(
+            key,
+            AppMessage::StreamData {
+                stream_id,
+                remote_peer: Some(remote_peer),
+                data,
+            },
+        )
     }
 
     /// Route an `APP_CLOSE` event to a registered endpoint as
     /// `AppMessage::StreamClose`.
-    pub fn route_stream_close(&self, app_id: [u8; 32], endpoint_id: u32, stream_id: u32) -> bool {
+    pub fn route_stream_close(
+        &self,
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        stream_id: u32,
+        remote_peer: [u8; 32],
+    ) -> bool {
         let key = EndpointKey {
             app_id,
             endpoint_id,
         };
-        self.send_to(key, AppMessage::StreamClose { stream_id })
+        self.send_to(
+            key,
+            AppMessage::StreamClose {
+                stream_id,
+                remote_peer: Some(remote_peer),
+            },
+        )
     }
 
     /// Deliver an epidemic broadcast to **all** registered endpoints.

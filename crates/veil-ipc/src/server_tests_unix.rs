@@ -1244,16 +1244,22 @@ async fn failed_remote_acceptor_send_notifies_its_sdk_and_releases_ownership() {
         veil_proto::SenderProvenance::Claimed,
         STREAM_INITIAL_WINDOW,
     ));
-    let (hdr, _) = recv_ipc_frame(&mut client).await;
+    let (hdr, open) = recv_ipc_frame(&mut client).await;
     assert_eq!(hdr.msg_type, LocalAppMsg::StreamOpenInbound as u16);
+    let stream_id = veil_proto::StreamOpenInboundPayload::decode(&open)
+        .unwrap()
+        .stream_id;
     let data = StreamDataPayload {
-        stream_id: 41,
+        stream_id,
         data: b"cannot vanish".to_vec(),
     };
     send_ipc_frame(&mut client, LocalAppMsg::StreamData as u16, &data.encode()).await;
     let (hdr, body) = recv_ipc_frame(&mut client).await;
     assert_eq!(hdr.msg_type, LocalAppMsg::StreamClose as u16);
-    assert_eq!(StreamClosePayload::decode(&body).unwrap().stream_id, 41);
+    assert_eq!(
+        StreamClosePayload::decode(&body).unwrap().stream_id,
+        stream_id
+    );
     // A queued write after failure no longer owns the route and cannot emit
     // another close or route bytes into a future stream with this id.
     send_ipc_frame(&mut client, LocalAppMsg::StreamData as u16, &data.encode()).await;
@@ -2089,8 +2095,7 @@ async fn full_delivery_channel_drops_frame_and_increments_counter() {
         // test, which never touches StreamOpen/StreamClose.
         let acceptor_streams =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-        let acceptor_routes =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let acceptor_routes = SharedAcceptorRoutes::default();
         forward_endpoint(
             app_rx,
             delivery_tx,
@@ -3483,7 +3488,7 @@ async fn a_delivery_names_its_origin_device_to_the_client() {
             0,
             None,
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            SharedAcceptorRoutes::default(),
         )
         .await;
     });
@@ -3587,21 +3592,18 @@ async fn remote_file_backpressure_does_not_hold_shared_ipc_loop() {
         veil_proto::SenderProvenance::Claimed,
         STREAM_INITIAL_WINDOW
     ));
-    assert_eq!(
-        recv_ipc_frame(&mut client).await.0.msg_type,
-        LocalAppMsg::StreamOpenInbound as u16
-    );
+    let (header, open) = recv_ipc_frame(&mut client).await;
+    assert_eq!(header.msg_type, LocalAppMsg::StreamOpenInbound as u16);
+    let stream_id = veil_proto::StreamOpenInboundPayload::decode(&open)
+        .unwrap()
+        .stream_id;
     // Commit one segment, then block in the middle of a single large write.
     let first: Vec<u8> = (0..6000).map(|n| (n % 251) as u8).collect();
     for data in [first.clone(), b"second".to_vec()] {
         send_ipc_frame(
             &mut client,
             LocalAppMsg::StreamData as u16,
-            &StreamDataPayload {
-                stream_id: 41,
-                data,
-            }
-            .encode(),
+            &StreamDataPayload { stream_id, data }.encode(),
         )
         .await;
     }
@@ -3620,7 +3622,7 @@ async fn remote_file_backpressure_does_not_hold_shared_ipc_loop() {
     send_ipc_frame(
         &mut client,
         LocalAppMsg::StreamClose as u16,
-        &StreamClosePayload { stream_id: 41 }.encode(),
+        &StreamClosePayload { stream_id }.encode(),
     )
     .await;
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -3723,7 +3725,7 @@ async fn blocked_remote_stream_keeps_independent_ipc_stream_credit_flowing() {
     let (_, body) = recv_ipc_frame(&mut client).await;
     let app = AppBindOkPayload::decode(&body).unwrap().app_id;
     let mut ids = Vec::new();
-    for (wire, peer) in [(41, [0xee; 32]), (42, [0xdd; 32])] {
+    for (wire, peer) in [(41, [0xee; 32]), (41, [0xdd; 32])] {
         assert!(registry.route_stream_open(
             app,
             9,
@@ -3739,6 +3741,20 @@ async fn blocked_remote_stream_keeps_independent_ipc_stream_credit_flowing() {
                 .unwrap()
                 .stream_id,
         );
+    }
+    assert_ne!(ids[0], ids[1]);
+    assert!(registry.route_stream_data(app, 9, 41, [0xee; 32], b"from first".to_vec()));
+    assert!(registry.route_stream_data(app, 9, 41, [0xdd; 32], b"from second".to_vec()));
+    for (id, data) in ids
+        .iter()
+        .copied()
+        .zip([b"from first".as_slice(), b"from second"])
+    {
+        let (header, body) = recv_ipc_frame(&mut client).await;
+        assert_eq!(header.msg_type, LocalAppMsg::StreamData as u16);
+        let segment = StreamDataPayload::decode(&body).unwrap();
+        assert_eq!(segment.stream_id, id);
+        assert_eq!(segment.data, data);
     }
     send_ipc_frame(
         &mut client,
@@ -3769,7 +3785,14 @@ async fn blocked_remote_stream_keeps_independent_ipc_stream_credit_flowing() {
         (accepted, credit)
     })
     .await;
-    // The negative baseline also terminates the server and its owned awaits.
+    assert!(registry.route_stream_close(app, 9, 41, [0xee; 32]));
+    let (header, body) = recv_ipc_frame(&mut client).await;
+    assert_eq!(header.msg_type, LocalAppMsg::StreamClose as u16);
+    assert_eq!(StreamClosePayload::decode(&body).unwrap().stream_id, ids[0]);
+    assert!(registry.route_stream_data(app, 9, 41, [0xdd; 32], b"still live".to_vec()));
+    let (header, body) = recv_ipc_frame(&mut client).await;
+    assert_eq!(header.msg_type, LocalAppMsg::StreamData as u16);
+    assert_eq!(StreamDataPayload::decode(&body).unwrap().stream_id, ids[1]);
     drop(client);
     let _ = shutdown.send(true);
     task.await.unwrap().unwrap();
@@ -3777,6 +3800,7 @@ async fn blocked_remote_stream_keeps_independent_ipc_stream_credit_flowing() {
         independent.expect("blocked stream held another IPC stream's credit");
     assert_eq!(peer, [0xdd; 32]);
     let wire_header = codec::decode_header(&bytes).unwrap();
+    assert_eq!(wire_header.stream_id, 41);
     assert_eq!(wire_header.priority(), veil_proto::priority::INTERACTIVE);
     assert_eq!(wire_header.msg_type, veil_proto::AppMsg::AppData as u16);
     assert_eq!(
@@ -3855,9 +3879,12 @@ async fn remote_stream_credit_violation_cancels_file_without_closing_ipc() {
         veil_proto::SenderProvenance::SessionPeer,
         STREAM_INITIAL_WINDOW
     ));
-    recv_ipc_frame(&mut client).await;
+    let (_, open) = recv_ipc_frame(&mut client).await;
+    let stream_id = veil_proto::StreamOpenInboundPayload::decode(&open)
+        .unwrap()
+        .stream_id;
     let chunk = StreamDataPayload {
-        stream_id: 41,
+        stream_id,
         data: vec![1; 2048],
     };
     send_ipc_frame(&mut client, LocalAppMsg::StreamData as u16, &chunk.encode()).await;
@@ -3871,7 +3898,7 @@ async fn remote_stream_credit_violation_cancels_file_without_closing_ipc() {
     send_ipc_frame(
         &mut stranger,
         LocalAppMsg::StreamClose as u16,
-        &StreamClosePayload { stream_id: 41 }.encode(),
+        &StreamClosePayload { stream_id }.encode(),
     )
     .await;
     send_ipc_frame(
@@ -3898,7 +3925,10 @@ async fn remote_stream_credit_violation_cancels_file_without_closing_ipc() {
             .await
             .unwrap();
     assert_eq!(header.msg_type, LocalAppMsg::StreamClose as u16);
-    assert_eq!(StreamClosePayload::decode(&body).unwrap().stream_id, 41);
+    assert_eq!(
+        StreamClosePayload::decode(&body).unwrap().stream_id,
+        stream_id
+    );
     assert_eq!(
         gate.dropped.load(Ordering::SeqCst),
         1,
@@ -3918,12 +3948,15 @@ async fn remote_stream_credit_violation_cancels_file_without_closing_ipc() {
         veil_proto::SenderProvenance::SessionPeer,
         STREAM_INITIAL_WINDOW
     ));
-    recv_ipc_frame(&mut client).await;
+    let (_, open) = recv_ipc_frame(&mut client).await;
+    let another_stream = veil_proto::StreamOpenInboundPayload::decode(&open)
+        .unwrap()
+        .stream_id;
     send_ipc_frame(
         &mut client,
         LocalAppMsg::StreamData as u16,
         &StreamDataPayload {
-            stream_id: 42,
+            stream_id: another_stream,
             data: vec![2; 2048],
         }
         .encode(),

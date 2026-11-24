@@ -306,15 +306,51 @@ where
 /// Lets the acceptor's outbound STREAM_DATA / STREAM_CLOSE be forwarded to the
 /// opener's node as wire AppData / AppClose (the opener's node already has the
 /// inbound bridge to deliver them to its IPC client).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct AcceptorRemoteRoute {
     /// The opener's node_id — destination for our outbound wire frames.
     opener_node_id: [u8; 32],
+    wire_stream_id: u32,
     /// Bound endpoint's app_id (echoed in the wire AppData / AppClose).
     app_id: [u8; 32],
     /// Bound endpoint id.
     endpoint_id: u32,
 }
+
+#[derive(Default)]
+struct AcceptorRemoteRoutes {
+    by_ipc: std::collections::HashMap<u32, AcceptorRemoteRoute>,
+    by_wire: std::collections::HashMap<AcceptorRemoteRoute, u32>,
+    next: u32,
+}
+
+impl AcceptorRemoteRoutes {
+    fn open(&mut self, route: AcceptorRemoteRoute) -> Option<u32> {
+        if self.by_ipc.len() >= veil_proto::budget::MAX_TOTAL_STREAMS
+            || self.by_wire.contains_key(&route)
+        {
+            return None;
+        }
+        // An opener picks its wire ID independently of other nodes. Allocate a
+        // connection-local opaque handle in the half reserved for remote opens.
+        loop {
+            self.next = self.next.wrapping_add(1) | crate::streams::REMOTE_ACCEPTOR_ID_BIT;
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.by_ipc.entry(self.next) {
+                entry.insert(route);
+                self.by_wire.insert(route, self.next);
+                return Some(self.next);
+            }
+        }
+    }
+
+    fn remove(&mut self, ipc_id: u32) {
+        if let Some(route) = self.by_ipc.remove(&ipc_id) {
+            self.by_wire.remove(&route);
+        }
+    }
+}
+
+type SharedAcceptorRoutes = Arc<std::sync::Mutex<AcceptorRemoteRoutes>>;
 
 pub struct IpcClientState {
     /// RAII guards paired with optional per-app socket paths.
@@ -380,8 +416,7 @@ pub struct IpcClientState {
     /// cross-node bidirectional stream is a one-way pipe — the acceptor's
     /// replies hit `route_data_from_b`'s local-only lookup and are silently
     /// dropped (the cross-node analogue of the same-node HIGH-1 fix above).
-    owned_streams_acceptor_routes:
-        Arc<std::sync::Mutex<std::collections::HashMap<u32, AcceptorRemoteRoute>>>,
+    owned_streams_acceptor_routes: SharedAcceptorRoutes,
     /// rolling token-bucket rate
     /// limiter for the cheap-but-info-leaky read-only IPC queries
     /// (GetPeers, GetNodeIdentity, GetMobileStatus, JoinBootstrapUri).
@@ -425,9 +460,7 @@ impl IpcClientState {
             owned_streams_acceptor: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
-            owned_streams_acceptor_routes: Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            owned_streams_acceptor_routes: SharedAcceptorRoutes::default(),
             query_tokens: IPC_QUERY_BURST as f32,
             query_last_refill: std::time::Instant::now(),
             put_tokens: IPC_PUT_BURST as f32,
@@ -540,7 +573,7 @@ impl IpcClientState {
         self.owned_streams_acceptor_routes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .remove(&stream_id);
+            .remove(stream_id);
     }
 
     /// For an acceptor stream whose opener is on a REMOTE node, the wire route
@@ -551,15 +584,14 @@ impl IpcClientState {
         self.owned_streams_acceptor_routes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .by_ipc
             .get(&stream_id)
             .copied()
     }
 
     /// Clone the acceptor-side remote-route handle for a forwarder task (it
     /// records the route when translating a remote-opened `AppMessage::StreamOpen`).
-    pub(crate) fn acceptor_routes_handle(
-        &self,
-    ) -> Arc<std::sync::Mutex<std::collections::HashMap<u32, AcceptorRemoteRoute>>> {
+    fn acceptor_routes_handle(&self) -> SharedAcceptorRoutes {
         Arc::clone(&self.owned_streams_acceptor_routes)
     }
 
@@ -718,8 +750,32 @@ impl Drop for IpcClientState {
     }
 }
 
-/// Forwarder task: receives AppMessage from the endpoint channel, encodes as
-/// the appropriate IPC frame, pushes to the per-client delivery channel.
+fn resolve_acceptor_id(
+    routes: &SharedAcceptorRoutes,
+    app_id: [u8; 32],
+    endpoint_id: u32,
+    wire_stream_id: u32,
+    remote_peer: Option<[u8; 32]>,
+    close: bool,
+) -> Option<u32> {
+    let Some(opener_node_id) = remote_peer else {
+        return Some(wire_stream_id);
+    };
+    let route = AcceptorRemoteRoute {
+        opener_node_id,
+        wire_stream_id,
+        app_id,
+        endpoint_id,
+    };
+    let mut routes = routes.lock().unwrap_or_else(|p| p.into_inner());
+    let id = *routes.by_wire.get(&route)?;
+    if close {
+        routes.remove(id);
+    }
+    Some(id)
+}
+
+/// Forward endpoint messages to the owning IPC connection.
 #[allow(clippy::too_many_arguments)]
 async fn forward_endpoint(
     mut rx: mpsc::Receiver<AppMessage>,
@@ -736,7 +792,7 @@ async fn forward_endpoint(
     // [lock-acquire] block here.
     acceptor_streams: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
     // Same lock discipline as `acceptor_streams` above (pure-sync insert/remove).
-    acceptor_routes: Arc<std::sync::Mutex<std::collections::HashMap<u32, AcceptorRemoteRoute>>>,
+    acceptor_routes: SharedAcceptorRoutes,
 ) {
     let tx = tx.into();
     while let Some(msg) = rx.recv().await {
@@ -817,36 +873,30 @@ async fn forward_endpoint(
                 // reply-to-outbound semantic and caused SDK clients to
                 // silently drop inbound streams.
                 //
-                // Claim acceptor-side ownership BEFORE writing the wire
-                // frame.  The SDK may pipeline a STREAM_DATA reply on the
-                // very same IPC socket; if it raced ahead of this insert,
-                // the read loop's authorisation check would reject the
-                // first acceptor STREAM_DATA frame.  Set-then-write ensures
-                // ownership is visible to the read loop in this connection
-                // before the SDK can even see the stream_id.
+                let stream_id = if src_node_id == local_node_id {
+                    stream_id
+                } else {
+                    let route = AcceptorRemoteRoute {
+                        opener_node_id: src_node_id,
+                        wire_stream_id: stream_id,
+                        app_id: endpoint_app_id,
+                        endpoint_id,
+                    };
+                    let Some(id) = acceptor_routes
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .open(route)
+                    else {
+                        continue;
+                    };
+                    id
+                };
+                // Commit ownership and the reverse route before the SDK can
+                // reply to the inbound notification on this connection.
                 acceptor_streams
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .insert(stream_id);
-                // When the opener is on a REMOTE node, record the wire route so
-                // this client's outbound STREAM_DATA / STREAM_CLOSE can be
-                // forwarded back to it (else a cross-node bidirectional stream
-                // is a one-way pipe — the acceptor's replies would hit the
-                // local-only `route_data_from_b` and vanish). Same-node opens
-                // keep no route and route through the local stream table.
-                if src_node_id != local_node_id {
-                    acceptor_routes
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .insert(
-                            stream_id,
-                            AcceptorRemoteRoute {
-                                opener_node_id: src_node_id,
-                                app_id: endpoint_app_id,
-                                endpoint_id,
-                            },
-                        );
-                }
                 let payload = veil_proto::StreamOpenInboundPayload {
                     stream_id,
                     app_id: endpoint_app_id,
@@ -867,20 +917,39 @@ async fn forward_endpoint(
                 };
                 encode_ipc_frame(LocalAppMsg::StreamOpenInbound as u16, &payload.encode())
             }
-            AppMessage::StreamData { stream_id, data } => {
+            AppMessage::StreamData {
+                stream_id,
+                remote_peer,
+                data,
+            } => {
+                let Some(stream_id) = resolve_acceptor_id(
+                    &acceptor_routes,
+                    endpoint_app_id,
+                    endpoint_id,
+                    stream_id,
+                    remote_peer,
+                    false,
+                ) else {
+                    continue;
+                };
                 let payload = StreamDataPayload { stream_id, data };
                 encode_ipc_frame(LocalAppMsg::StreamData as u16, &payload.encode())
             }
-            AppMessage::StreamClose { stream_id } => {
-                // Drop acceptor-side ownership so a later STREAM_DATA with
-                // this id (e.g. a racy SDK send after the close) cannot
-                // mis-route into a brand-new stream that happens to re-use
-                // the same id later.
+            AppMessage::StreamClose {
+                stream_id,
+                remote_peer,
+            } => {
+                let Some(stream_id) = resolve_acceptor_id(
+                    &acceptor_routes,
+                    endpoint_app_id,
+                    endpoint_id,
+                    stream_id,
+                    remote_peer,
+                    true,
+                ) else {
+                    continue;
+                };
                 acceptor_streams
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(&stream_id);
-                acceptor_routes
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .remove(&stream_id);
@@ -2109,7 +2178,7 @@ fn owned_stream_ids_of(
 pub(crate) struct ClientStreamCleanup {
     opener: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
     acceptor: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
-    acceptor_routes: Arc<std::sync::Mutex<std::collections::HashMap<u32, AcceptorRemoteRoute>>>,
+    acceptor_routes: SharedAcceptorRoutes,
     stream_table: Arc<IpcStreamTable>,
     session_tx_registry: Option<Arc<dyn FrameBroadcaster>>,
     stream_bridge: Option<crate::bridge::IpcStreamBridge>,
@@ -2133,6 +2202,7 @@ impl Drop for ClientStreamCleanup {
                 .acceptor_routes
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
+                .by_ipc
                 .get(&stream_id)
                 .copied();
             if let Some(route) = route
@@ -2141,7 +2211,7 @@ impl Drop for ClientStreamCleanup {
                 crate::handlers::stream::send_app_close(
                     b,
                     &route.opener_node_id,
-                    stream_id,
+                    route.wire_stream_id,
                     route.app_id,
                     route.endpoint_id,
                 );
@@ -2797,7 +2867,7 @@ async fn handle_ipc_client(
                                     })
                                 } else if client_state.owns_stream_as_acceptor(p.stream_id) {
                                     client_state.acceptor_remote_route(p.stream_id).map(|r| crate::remote_stream_writer::Route {
-                                        peer: r.opener_node_id, wire_id: p.stream_id, app: r.app_id, endpoint: r.endpoint_id,
+                                        peer: r.opener_node_id, wire_id: r.wire_stream_id, app: r.app_id, endpoint: r.endpoint_id,
                                     })
                                 } else { None };
                                 if let Some(route) = route {
@@ -2912,13 +2982,12 @@ async fn handle_ipc_client(
                                     // Opener is on a REMOTE node: forward the reply
                                     // as a wire AppData frame to it (its node holds
                                     // the inbound bridge that delivers to its IPC
-                                    // client). p.stream_id IS the wire stream id
-                                    // (the acceptor saw it in STREAM_OPEN_INBOUND).
+                                    // client). The SDK sees only the local handle.
                                     let sent = if let Some(b) = session_tx_registry.as_deref() {
                                         crate::handlers::stream::send_app_data(
                                             b,
                                             &route.opener_node_id,
-                                            p.stream_id,
+                                            route.wire_stream_id,
                                             route.app_id,
                                             route.endpoint_id,
                                             p.data,
@@ -2932,7 +3001,7 @@ async fn handle_ipc_client(
                                         // that table would never notify this SDK.
                                         if let Some(b) = session_tx_registry.as_deref() {
                                             crate::handlers::stream::send_app_close(
-                                                b, &route.opener_node_id, p.stream_id,
+                                                b, &route.opener_node_id, route.wire_stream_id,
                                                 route.app_id, route.endpoint_id,
                                             );
                                         }
@@ -2975,7 +3044,7 @@ async fn handle_ipc_client(
                                 let route = stream_table.remote_route(p.stream_id).map(|t| crate::remote_stream_writer::Route {
                                     peer: t.dst_node_id, wire_id: t.wire_stream_id, app: t.app_id, endpoint: t.endpoint_id,
                                 }).or_else(|| client_state.acceptor_remote_route(p.stream_id).map(|r| crate::remote_stream_writer::Route {
-                                    peer: r.opener_node_id, wire_id: p.stream_id, app: r.app_id, endpoint: r.endpoint_id,
+                                    peer: r.opener_node_id, wire_id: r.wire_stream_id, app: r.app_id, endpoint: r.endpoint_id,
                                 }));
                                 if let Some(route) = route {
                                     // Keep ownership and the wire lease until ordered close
@@ -3007,7 +3076,7 @@ async fn handle_ipc_client(
                                 crate::handlers::stream::send_app_close_wait(
                                     b,
                                     &route.opener_node_id,
-                                    p.stream_id,
+                                    route.wire_stream_id,
                                     route.app_id,
                                     route.endpoint_id,
                                 ).await;

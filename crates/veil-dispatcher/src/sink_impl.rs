@@ -29,7 +29,8 @@ impl DispatcherSink for FrameDispatcher {
         notify: bool,
     ) {
         if notify {
-            self.app_registry.route_stream_close(app, endpoint, stream);
+            self.app_registry
+                .route_stream_close(app, endpoint, stream, peer);
         }
         self.stream_table.close(&peer, stream);
         self.veil_stream_rx

@@ -367,12 +367,12 @@ async fn run_reliable(abort: bool, rotate: bool, slow_ipc: bool) {
             "full reader must close after its completed tail"
         );
         assert!(
-            matches!(receivers[1].recv().await.unwrap(),AppMessage::StreamClose {stream_id} if stream_id==id)
+            matches!(receivers[1].recv().await.unwrap(),AppMessage::StreamClose {stream_id,..} if stream_id==id)
         );
         tasks.0[1].abort();
         assert!(
             matches!(tokio::time::timeout(Duration::from_secs(1),receivers[0].recv()).await.unwrap().unwrap(),
-            AppMessage::StreamClose {stream_id} if stream_id==streams[1]),
+            AppMessage::StreamClose {stream_id,..} if stream_id==streams[1]),
             "only the still-active stream may notify on retirement"
         );
         assert!(
@@ -405,6 +405,7 @@ async fn run_reliable(abort: bool, rotate: bool, slow_ipc: bool) {
                 AppMessage::StreamData {
                     stream_id,
                     data: received,
+                    ..
                 } => {
                     assert_eq!(stream_id, streams[direction]);
                     assert_eq!(received, data);
@@ -479,7 +480,7 @@ async fn run_reliable(abort: bool, rotate: bool, slow_ipc: bool) {
             tokio::time::timeout(Duration::from_secs(2), async {
                 while !closed.contains(&streams[0]) || !closed.contains(&streams[1]) {
                     match receiver.recv().await.unwrap() {
-                        AppMessage::StreamClose { stream_id } => {
+                        AppMessage::StreamClose { stream_id, .. } => {
                             assert!(closed.insert(stream_id));
                         }
                         other => panic!("unexpected rekey event {other:?}"),
@@ -504,7 +505,7 @@ async fn run_reliable(abort: bool, rotate: bool, slow_ipc: bool) {
                     assert!(matches!(receivers[1-direction].recv().await.unwrap(),AppMessage::StreamOpen {stream_id,..} if stream_id==id));
                     if diagnostics[direction].reliable_frames_sent()>before { return id; }
                     send_app(&senders[direction],id,AppMsg::AppClose,&AppClosePayload{app_id,endpoint_id:1,reason:0}.encode()).await;
-                    assert!(matches!(receivers[1-direction].recv().await.unwrap(),AppMessage::StreamClose {stream_id} if stream_id==id));
+                    assert!(matches!(receivers[1-direction].recv().await.unwrap(),AppMessage::StreamClose {stream_id,..} if stream_id==id));
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 panic!("new reliable generation did not admit a stream");
@@ -532,7 +533,9 @@ async fn run_reliable(abort: bool, rotate: bool, slow_ipc: bool) {
                 .unwrap()
                 .unwrap()
             {
-                AppMessage::StreamData { stream_id, data } => {
+                AppMessage::StreamData {
+                    stream_id, data, ..
+                } => {
                     assert_eq!(stream_id, new_id);
                     assert_eq!(data, vec![0x77; 2048]);
                 }
@@ -589,7 +592,7 @@ async fn run_reliable(abort: bool, rotate: bool, slow_ipc: bool) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while !closed.contains(&streams[0]) || !closed.contains(&streams[1]) {
                 match receivers[0].recv().await.unwrap() {
-                    AppMessage::StreamClose { stream_id } => {
+                    AppMessage::StreamClose { stream_id, .. } => {
                         assert!(closed.insert(stream_id), "duplicate abort notification");
                     }
                     other => panic!("unexpected abort {other:?}"),
@@ -615,7 +618,7 @@ async fn run_reliable(abort: bool, rotate: bool, slow_ipc: bool) {
         .await;
         assert!(
             matches!(tokio::time::timeout(Duration::from_secs(2),receivers[1-direction].recv()).await.unwrap().unwrap(),
-            AppMessage::StreamClose { stream_id } if stream_id == streams[direction])
+            AppMessage::StreamClose { stream_id, .. } if stream_id == streams[direction])
         );
         assert!(
             receivers[1 - direction].try_recv().is_err(),

@@ -332,21 +332,17 @@ impl FrameDispatcher {
                         ));
                     }
                 }
-                // If this stream_id is tracked in the stream_table (opened via APP_OPEN)
-                // route as StreamData so the endpoint can correlate data to the correct stream.
-                if self
-                    .stream_table
-                    .get(node_id.as_bytes(), header.stream_id)
-                    .is_some()
+                if let Some(stream) = self.stream_table.get(node_id.as_bytes(), header.stream_id)
+                    && stream.app_id == payload.app_id
+                    && stream.endpoint_id == payload.endpoint_id
                 {
                     self.app_registry.route_stream_data(
-                        payload.app_id,
-                        payload.endpoint_id,
+                        stream.app_id,
+                        stream.endpoint_id,
                         header.stream_id,
+                        *node_id.as_bytes(),
                         payload.data,
                     );
-                } else {
-                    self.app_registry.route_data(payload);
                 }
                 DispatchResult::NoResponse
             }
@@ -713,14 +709,23 @@ impl FrameDispatcher {
                     Ok(p) => p,
                     Err(e) => return DispatchResult::Violation(format!("bad AppClose: {e}")),
                 };
-                // Notify the endpoint that the remote side closed the stream.
-                self.app_registry.route_stream_close(
-                    payload.app_id,
-                    payload.endpoint_id,
-                    header.stream_id,
-                );
-                self.stream_table
-                    .close(node_id.as_bytes(), header.stream_id);
+                if let Some(stream) = self.stream_table.get(node_id.as_bytes(), header.stream_id) {
+                    if stream.app_id != payload.app_id || stream.endpoint_id != payload.endpoint_id
+                    {
+                        return DispatchResult::NoResponse;
+                    }
+                    if self
+                        .stream_table
+                        .close(node_id.as_bytes(), header.stream_id)
+                    {
+                        self.app_registry.route_stream_close(
+                            stream.app_id,
+                            stream.endpoint_id,
+                            header.stream_id,
+                            *node_id.as_bytes(),
+                        );
+                    }
+                }
                 // A locally-initiated veil/IPC stream (VeilConnector or the
                 // IPC remote-stream bridge) registers its inbound channel in
                 // `veil_stream_rx`. Drop it on remote close so the bridge
