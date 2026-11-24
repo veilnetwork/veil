@@ -235,7 +235,9 @@ traffic at its expiry even between checks.
 
 The refresh starts every five seconds when the previous sweep has
 finished. Larger peer lists update in groups so IPC requests stay
-within the daemon's query budget.
+within the daemon's query budget. Status checks use their own local IPC
+connection. ogate replaces that connection after a failed or mismatched
+reply on it.
 
 With `pnet_required = true`, both access modes require a configured,
 admitted peer. Use `mode = "authorized"` to also enforce the configured

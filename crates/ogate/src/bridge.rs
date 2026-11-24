@@ -18,7 +18,7 @@
 //! On `ctrl_c` / `SIGTERM` all tasks exit and the function returns.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -179,9 +179,29 @@ fn pnet_status_admits(peer: &NodeId, status: &PnetStatus, now: u64) -> bool {
 
 async fn pnet_admissions(
     peers: &[(NodeId, [u8; 32])],
-    client: &Arc<VeilClient>,
+    socket: &Path,
+    connection: &mut Option<Arc<VeilClient>>,
     pace: &mut tokio::time::Interval,
 ) -> HashMap<NodeId, u64> {
+    if peers.is_empty() {
+        return HashMap::new();
+    }
+    if connection.is_none() {
+        pace.tick().await;
+        match tokio::time::timeout(PNET_QUERY_TIMEOUT, VeilClient::connect(socket)).await {
+            Ok(Ok(client)) => *connection = Some(Arc::new(client)),
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "P-Net status connection failed");
+                return HashMap::new();
+            }
+            Err(_) => {
+                tracing::debug!("P-Net status connection timed out");
+                return HashMap::new();
+            }
+        }
+    }
+
+    let client = connection.as_ref().expect("status connection established");
     let mut queries = tokio::task::JoinSet::new();
     for &(peer, _) in peers {
         pace.tick().await;
@@ -194,8 +214,13 @@ async fn pnet_admissions(
     }
 
     let mut admitted = HashMap::new();
+    let mut uncertain = false;
     while let Some(result) = queries.join_next().await {
         match result {
+            Ok((peer, Ok(Ok(status)))) if status.peer_node_id != peer => {
+                uncertain = true;
+                tracing::warn!("P-Net status reply did not match the requested peer");
+            }
             Ok((peer, Ok(Ok(status))))
                 if pnet_status_admits(&peer, &status, unix_secs_now_u64()) =>
             {
@@ -206,13 +231,24 @@ async fn pnet_admissions(
                     has_cert = status.has_cert, "peer has no current P-Net admission");
             }
             Ok((peer, Ok(Err(error)))) => {
+                uncertain = true;
                 tracing::debug!(peer = %hex::encode(peer), %error, "P-Net status query failed");
             }
             Ok((peer, Err(_))) => {
+                uncertain = true;
                 tracing::debug!(peer = %hex::encode(peer), "P-Net status query timed out");
             }
-            Err(error) => tracing::warn!(%error, "P-Net status task failed"),
+            Err(error) => {
+                uncertain = true;
+                tracing::warn!(%error, "P-Net status task failed");
+            }
         }
+    }
+    // Some daemons send zero request IDs for this query and the SDK then
+    // dispatches replies in order. Never let an abandoned reply on that
+    // connection answer a later sweep for the same peer.
+    if uncertain {
+        *connection = None;
     }
     admitted
 }
@@ -273,11 +309,9 @@ pub fn validate_reload(old: &OgateConfig, new: &OgateConfig) -> Result<(), &'sta
 /// that path.
 pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeError> {
     tracing::info!(socket = %cfg.socket_path.display(), "connecting to veil daemon");
-    let client = Arc::new(
-        VeilClient::connect(&cfg.socket_path)
-            .await
-            .map_err(BridgeError::client)?,
-    );
+    let client = VeilClient::connect(&cfg.socket_path)
+        .await
+        .map_err(BridgeError::client)?;
 
     // Validate peer identities and address conflicts across the full
     // configuration, including peers that may be offline for the first sweep.
@@ -771,7 +805,6 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
         config_path,
         cfg,
         configured,
-        client,
         Arc::clone(&state),
         route_changes,
     ));
@@ -796,7 +829,6 @@ async fn maintain_routes(
     config_path: PathBuf,
     mut config: OgateConfig,
     mut configured: SharedState,
-    client: Arc<VeilClient>,
     state: Arc<ArcSwap<SharedState>>,
     route_changes: Arc<Notify>,
 ) {
@@ -809,6 +841,7 @@ async fn maintain_routes(
         }
     };
     let mut admitted = HashMap::new();
+    let mut connection = None;
     let mut next_peer = 0;
     let mut refresh = tokio::time::interval(PNET_REFRESH_PERIOD);
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -851,6 +884,7 @@ async fn maintain_routes(
             next_peer = 0;
             if !config.pnet_required {
                 admitted.clear();
+                connection = None;
                 publish_routes(configured.clone(), &state, &route_changes);
                 continue;
             }
@@ -865,7 +899,8 @@ async fn maintain_routes(
 
         let end = (next_peer + PNET_QUERY_BATCH).min(configured.peer_app_ids.len());
         let group = &configured.peer_app_ids[next_peer..end];
-        let mut results = pnet_admissions(group, &client, &mut pace).await;
+        let mut results =
+            pnet_admissions(group, &config.socket_path, &mut connection, &mut pace).await;
         let mut changed = false;
         for (peer, _) in group {
             match results.remove(peer) {
@@ -1122,24 +1157,34 @@ mod tests {
         use veil_ipc::{IpcEndpoint, IpcServer, PnetStatusProvider};
         use veil_proto::PnetStatusResultPayload;
 
-        struct Admission(AtomicBool);
+        struct Admission {
+            live: AtomicBool,
+            wrong_peer: AtomicBool,
+        }
 
         impl PnetStatusProvider for Admission {
             fn peer_status(&self, peer: &NodeId) -> PnetStatusResultPayload {
                 PnetStatusResultPayload {
-                    admitted: self.0.load(Ordering::Relaxed),
+                    admitted: self.live.load(Ordering::Relaxed),
                     has_cert: true,
                     admin: false,
                     valid_until_unix: 0,
                     network_id: [0x01; 32],
-                    peer_node_id: *peer,
+                    peer_node_id: if self.wrong_peer.load(Ordering::Relaxed) {
+                        [0x77; 32]
+                    } else {
+                        *peer
+                    },
                 }
             }
         }
 
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("ipc");
-        let admission = Arc::new(Admission(AtomicBool::new(false)));
+        let admission = Arc::new(Admission {
+            live: AtomicBool::new(false),
+            wrong_peer: AtomicBool::new(false),
+        });
         let (stop, shutdown) = tokio::sync::watch::channel(false);
         let mut server = IpcServer::new(
             IpcEndpoint::Unix(socket.clone()),
@@ -1157,9 +1202,8 @@ mod tests {
         })
         .await
         .expect("IPC server did not start");
-        let client = Arc::new(VeilClient::connect(socket).await.unwrap());
-
         let mut config = cfg();
+        config.socket_path = socket.clone();
         config.mode = AccessMode::Open;
         config.pnet_required = true;
         // Exceed the daemon's 30-query burst cap. All configured peers
@@ -1185,12 +1229,11 @@ mod tests {
             directory.path().join("unused.toml"),
             config,
             configured,
-            Arc::clone(&client),
             Arc::clone(&state),
             Arc::clone(&changed),
         ));
 
-        admission.0.store(true, Ordering::Relaxed);
+        admission.live.store(true, Ordering::Relaxed);
         tokio::time::timeout(Duration::from_secs(12), async {
             while state.load().table.peer_count() != peer_count {
                 changed.notified().await;
@@ -1207,7 +1250,7 @@ mod tests {
             Decision::Forward(peer)
         );
 
-        admission.0.store(false, Ordering::Relaxed);
+        admission.live.store(false, Ordering::Relaxed);
         tokio::time::timeout(Duration::from_secs(12), async {
             while state.load().table.peer_count() != 0 {
                 changed.notified().await;
@@ -1223,7 +1266,24 @@ mod tests {
 
         updates.abort();
         assert!(updates.await.unwrap_err().is_cancelled());
-        drop(client);
+
+        // A legacy reply can have no request ID. A reply for the wrong peer
+        // must close the query connection before it can be reused.
+        let group = [(peer, [0u8; 32])];
+        let mut connection = None;
+        let mut pace = tokio::time::interval(PNET_QUERY_SPACING);
+        admission.live.store(true, Ordering::Relaxed);
+        admission.wrong_peer.store(true, Ordering::Relaxed);
+        let mismatched = pnet_admissions(&group, &socket, &mut connection, &mut pace).await;
+        assert!(mismatched.is_empty());
+        assert!(connection.is_none());
+
+        admission.wrong_peer.store(false, Ordering::Relaxed);
+        let fresh = pnet_admissions(&group, &socket, &mut connection, &mut pace).await;
+        assert_eq!(fresh.get(&peer), Some(&0));
+        assert!(connection.is_some());
+
+        drop(connection);
         stop.send(true).unwrap();
         server.await.unwrap();
     }
