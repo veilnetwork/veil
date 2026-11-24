@@ -10,6 +10,7 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   Keep the full configured peer list so a late peer can gain a route.
 - Require a verified live session for a private route. Enforce certificate
   expiry on the packet path and remove a peer's route on a query timeout.
+  Treat a banned peer as denied even if its transport is still open.
 - Pace and group requests within the existing daemon quota. Exercise late
   admission and loss of session over local IPC with a list larger than the
   daemon's burst allowance. Verify that
@@ -19,6 +20,9 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 
 - Run a private stand with the current daemon and the previous release.
   Exercise late join, disconnect, expiry, a banned peer, and daemon recovery.
+- Review private-node discovery on the stand. Default meeting points
+  can contact public rendezvous relays even in private mode. Exercise
+  both isolated and explicitly configured discovery before changing defaults.
 - Run public chat delivery on the same stand. Compare control-plane CPU,
   query rates, route convergence, throughput, and p95/p99 packet latency
   as the peer list grows. Include a slow daemon and a busy data path.

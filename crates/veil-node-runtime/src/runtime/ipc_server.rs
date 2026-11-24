@@ -534,13 +534,13 @@ impl NodeRuntime {
         // to IPC consumers (ogate / oproxy) for app-layer admission
         // decisions.  Empty cache (public-mode daemon) ⇒ all queries
         // reply has_cert=false; strict-p_net apps reject downstream.
-        let pnet_status: Arc<dyn veil_ipc::PnetStatusProvider> =
-            Arc::new(crate::pnet_status_provider::DaemonPnetStatus::new(
-                Arc::clone(&self.verified_peer_certs),
-                Arc::clone(&self.session_registry),
-                Arc::clone(&self.session_tx_registry),
-            ));
-        server = server.with_pnet_status_provider(pnet_status);
+        let pnet_status = crate::pnet_status_provider::DaemonPnetStatus::new(
+            Arc::clone(&self.verified_peer_certs),
+            Arc::clone(&self.session_registry),
+            Arc::clone(&self.session_tx_registry),
+        )
+        .with_bans(Arc::clone(&self.ban_list));
+        server = server.with_pnet_status_provider(Arc::new(pnet_status));
         // Listen-transports provider — surfaces the dispatcher's listener
         // snapshot (wildcard hosts rewritten to the observed external IP
         // after a server-reflexive NAT probe) so apps can mine their own

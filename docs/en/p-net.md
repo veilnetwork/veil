@@ -169,6 +169,8 @@ daemon) as an `AdminCommand::PNetBan`. The daemon signs a `BanEntry`
 with the node's identity key, applies it locally, and fans it out over
 the DHT to the K closest peers. Every other member picks the ban up on
 its next `p_net_ban_sync` tick, roughly every 60 s.
+After applying a ban, the daemon reports the peer as denied over IPC
+even while its established session is still closing.
 
 Confirm it landed on the receiving nodes:
 ```bash

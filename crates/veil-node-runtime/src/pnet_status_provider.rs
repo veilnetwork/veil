@@ -7,22 +7,25 @@
 //!
 //! `admitted` requires a completed handshake and its current TX owner. The
 //! sender can be retired before the runner finishes tearing down, or reserved
-//! before the successor commits its handshake.
+//! before the successor commits its handshake. A P-Net certificate also
+//! has to remain current, and a ban overrides a live private session.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
+use veil_abuse::BanList;
 use veil_cfg::NodeId;
 use veil_ipc::PnetStatusProvider;
 use veil_proto::PnetStatusResultPayload;
 use veil_session::{SessionEntry, SessionRegistry, SessionTxRegistry};
 use veil_types::MembershipCert;
-use veil_util::{lock, rlock};
+use veil_util::{lock, rlock, unix_secs_now_u64};
 
 pub struct DaemonPnetStatus {
     verified_peer_certs: Arc<RwLock<HashMap<[u8; 32], MembershipCert>>>,
     sessions: Arc<Mutex<SessionRegistry>>,
     tx: Arc<RwLock<SessionTxRegistry>>,
+    bans: Option<Arc<Mutex<BanList>>>,
 }
 
 impl DaemonPnetStatus {
@@ -35,7 +38,13 @@ impl DaemonPnetStatus {
             verified_peer_certs,
             sessions,
             tx,
+            bans: None,
         }
+    }
+
+    pub(crate) fn with_bans(mut self, bans: Arc<Mutex<BanList>>) -> Self {
+        self.bans = Some(bans);
+        self
     }
 
     pub(crate) fn is_admitted(&self, peer_node_id: &[u8; 32]) -> bool {
@@ -54,20 +63,28 @@ impl DaemonPnetStatus {
 impl PnetStatusProvider for DaemonPnetStatus {
     fn peer_status(&self, peer_node_id: &[u8; 32]) -> PnetStatusResultPayload {
         let admitted = self.is_admitted(peer_node_id);
-        let cert_opt = self
-            .verified_peer_certs
-            .read()
-            .ok()
-            .and_then(|g| g.get(peer_node_id).cloned());
-        match cert_opt {
-            Some(cert) => PnetStatusResultPayload {
-                admitted,
-                has_cert: true,
-                admin: cert.admin,
-                valid_until_unix: cert.valid_until_unix,
-                network_id: cert.network_id,
-                peer_node_id: *peer_node_id,
-            },
+        let cert = self.verified_peer_certs.read().ok().and_then(|cached| {
+            cached
+                .get(peer_node_id)
+                .map(|cert| (cert.admin, cert.valid_until_unix, cert.network_id))
+        });
+        match cert {
+            Some((admin, valid_until_unix, network_id)) => {
+                let now = unix_secs_now_u64();
+                let current = valid_until_unix == 0 || (now != 0 && now < valid_until_unix);
+                let banned = self
+                    .bans
+                    .as_ref()
+                    .is_some_and(|bans| lock!(bans).is_banned(peer_node_id));
+                PnetStatusResultPayload {
+                    admitted: admitted && current && !banned,
+                    has_cert: true,
+                    admin,
+                    valid_until_unix,
+                    network_id,
+                    peer_node_id: *peer_node_id,
+                }
+            }
             None => PnetStatusResultPayload {
                 admitted,
                 has_cert: false,
@@ -186,6 +203,52 @@ mod tests {
             !p.is_admitted(&IDENTITY),
             "without a proof the identity has nothing to be admitted by",
         );
+    }
+
+    fn cache_cert(status: &DaemonPnetStatus, valid_until_unix: u64) {
+        status.verified_peer_certs.write().unwrap().insert(
+            DEVICE,
+            MembershipCert {
+                version: veil_types::MEMBERSHIP_CERT_VERSION,
+                network_id: [3; 32],
+                member_node_id: DEVICE,
+                issued_at_unix: 0,
+                valid_until_unix,
+                admin: false,
+                algo: veil_types::SignatureAlgorithm::Ed25519,
+                owner_signature: vec![],
+            },
+        );
+    }
+
+    #[test]
+    fn pnet_ban_overrides_a_live_committed_session() {
+        let (status, _outbox) = provider(DEVICE, None);
+        let bans = Arc::new(Mutex::new(BanList::new()));
+        let status = status.with_bans(Arc::clone(&bans));
+        cache_cert(&status, 0);
+        assert!(status.peer_status(&DEVICE).admitted);
+
+        bans.lock().unwrap().ban_manual(DEVICE, "test ban");
+        let banned = status.peer_status(&DEVICE);
+        assert!(banned.has_cert);
+        assert!(!banned.admitted);
+        assert!(status.is_admitted(&DEVICE));
+
+        bans.lock().unwrap().unban(&DEVICE);
+        assert!(status.peer_status(&DEVICE).admitted);
+    }
+
+    #[test]
+    fn expiry_disables_pnet_admission_and_keeps_cert_metadata() {
+        let (status, _outbox) = provider(DEVICE, None);
+        assert!(status.peer_status(&DEVICE).admitted);
+
+        cache_cert(&status, 1);
+        let expired = status.peer_status(&DEVICE);
+        assert!(expired.has_cert);
+        assert_eq!(expired.valid_until_unix, 1);
+        assert!(!expired.admitted);
     }
 
     #[test]
