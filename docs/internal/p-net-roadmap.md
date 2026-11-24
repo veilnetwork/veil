@@ -361,6 +361,33 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   reversed. IPC attributed 592 versus 723 UDP refusals in the short
   pair and 2,443 versus 4,083 in the longer pair. Cold ordered-transport
   contention remains even with the cheaper identity refresh.
+- A Linux TCP socket trace sampled both ends of the two tunnel flows
+  every 125 ms. The 24-gateway cold run passed all 82,799 datagrams at
+  16 Mb/s per flow. At 32 Mb/s per flow it refused 2,959 of 166,984 at
+  source IPC. Across the ten metrics intervals with job refusals, the
+  sender's receive-window-limited time increased every time and its
+  send-buffer-limited time did not increase. Unread bytes in the two
+  matching hub TCP sockets peaked at 4.0 MB and 1.15 MB in those windows.
+  The destination UDP sockets dropped another 310 datagrams locally.
+- The warm 32 Mb/s repeat used the same established TCP sessions. It
+  delivered all 167,274 datagrams and added no receive-window-limited
+  time on either sender. The corresponding hub receive queues peaked
+  at 14,412 and 11,331 bytes. The hub daemon's Tokio threads accumulated
+  7.06 s of runnable wait in the first 11 cold seconds versus 2.26 s over
+  the entire 23 s warm sample. These samples include competition from
+  the other daemons and gateway processes sharing the two-vCPU host.
+- In a separate cold pair at 32 Mb/s per flow, switching the 24 hub
+  ogate processes to the existing single-thread runtime moved refusals
+  from 4,688 and 4,617 datagrams to 5,883 and 2,070 on the two flows.
+  Both runs delivered all 200 SDK chat messages, with spoke-to-hub p99
+  rising from 573 to 782 ms. Both TCP senders still encountered
+  receive-window pressure. The default runtime stays in place.
+- Outbound IPC route selection uses indexed TX liveness lookups for the
+  target devices. It no longer builds the full list of active sessions
+  on each check. The live registry excludes closed sender channels even
+  when their entries are still awaiting cleanup. A macOS mixed-version
+  run delivered 1,000 SDK messages in each direction in public mode and
+  repeated the same delivery count with private membership enabled.
 - A separate cold start ran the first end-to-end probes in groups of
   four before opening the UDP flows. All 24 paths answered in 12.52 s.
   The following 38 s sample lost 76 of 137,175 UDP datagrams, with one

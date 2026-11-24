@@ -254,6 +254,10 @@ impl veil_types::FrameBroadcaster for SessionTxBroadcaster {
     fn active_node_ids(&self) -> Vec<[u8; 32]> {
         rlock!(self.inner).active_node_ids().into_iter().collect()
     }
+
+    fn has_active_session(&self, peer: &[u8; 32]) -> bool {
+        rlock!(self.inner).has_session(peer)
+    }
 }
 
 /// Adapter exposing [`SessionRegistry`](crate::manager::SessionRegistry) as
@@ -314,6 +318,20 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use veil_types::FrameBroadcaster;
+
+    #[test]
+    fn active_session_check_skips_closed_and_replaced_registrations() {
+        let registry = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let adapter = SessionTxBroadcaster::new(registry.clone());
+        assert!(!adapter.has_active_session(&DEVICE_A));
+        let old = registry.write().unwrap().register_owned(DEVICE_A, [1; 32]);
+        assert!(adapter.has_active_session(&DEVICE_A));
+        let new = registry.write().unwrap().register_owned(DEVICE_A, [2; 32]);
+        drop(old);
+        assert!(adapter.has_active_session(&DEVICE_A));
+        drop(new);
+        assert!(!adapter.has_active_session(&DEVICE_A));
+    }
 
     #[test]
     fn local_source_readiness_is_read_only_and_bound_to_live_runner_generation() {

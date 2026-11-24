@@ -233,6 +233,12 @@ pub trait FrameBroadcaster: Send + Sync {
     /// peers without importing veilcore's `SessionTxRegistry` concretely.
     fn active_node_ids(&self) -> Vec<[u8; 32]>;
 
+    /// Whether this device currently has a live TX registration. Route
+    /// selection can check one device without listing all connected peers.
+    fn has_active_session(&self, peer: &[u8; 32]) -> bool {
+        self.active_node_ids().contains(peer)
+    }
+
     /// Endpoint-local witness for newly admitted first-hop sessions. An
     /// adapter without a registration registry can leave this unspecified.
     fn latest_tx_registration(&self) -> Option<u64> {

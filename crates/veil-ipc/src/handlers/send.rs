@@ -1842,12 +1842,11 @@ async fn handle_ipc_send_inner(
     let direct_live = remote
         && !relay_realtime
         && session_tx_registry.is_some_and(|reg| {
-            let active = reg.active_node_ids();
             let devices = reg.devices_of(&send.dst_node_id);
             if devices.is_empty() {
-                active.contains(&send.dst_node_id)
+                reg.has_active_session(&send.dst_node_id)
             } else {
-                devices.iter().any(|device| active.contains(device))
+                devices.iter().any(|device| reg.has_active_session(device))
             }
         });
     timing
@@ -1915,14 +1914,11 @@ async fn handle_ipc_send_inner(
                     .as_deref()
                     .and_then(|lookup| lookup.own_device_pairing(&send.dst_node_id))
                     .is_none()
-                && {
-                    let active = reg.active_node_ids();
-                    !active.contains(&send.dst_node_id)
-                        && !reg
-                            .devices_of(&send.dst_node_id)
-                            .iter()
-                            .any(|device| active.contains(device))
-                })
+                && !reg.has_active_session(&send.dst_node_id)
+                && !reg
+                    .devices_of(&send.dst_node_id)
+                    .iter()
+                    .any(|device| reg.has_active_session(device)))
     {
         let family_deadline = if relay_control_compat {
             control_source_deadline
@@ -1985,17 +1981,13 @@ async fn handle_ipc_send_inner(
         && ctx.ratchet.is_some()
         && let Some(reg) = session_tx_registry
     {
-        let active = reg.active_node_ids();
-        let mut devices: Vec<[u8; 32]> = reg
-            .devices_of(&send.dst_node_id)
-            .into_iter()
-            .filter(|d| active.contains(d))
-            .collect();
+        let mut devices = reg.devices_of(&send.dst_node_id);
+        devices.retain(|device| reg.has_active_session(device));
         if !delegated_device
             && !send.my_other_devices
             && !send.require_ack
             && !relay_control_compat
-            && active.contains(&send.dst_node_id)
+            && reg.has_active_session(&send.dst_node_id)
             && device_matches_identity(ctx, &send.dst_node_id, &send.dst_node_id)
             && !devices.contains(&send.dst_node_id)
             && ctx
