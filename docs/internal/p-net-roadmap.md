@@ -27,9 +27,8 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   query rates, route convergence, throughput, and p95/p99 packet latency
   as the peer list grows. Include a slow daemon and a busy data path.
   Measure the time to remove a route as well as the time to add it.
-- Measure how much the existing local session notifications shorten
-  admission checks under sustained session churn and with multiple ogate
-  instances sharing a daemon.
+- Extend shared-daemon qualification to long contention runs, disjoint
+  route tables, and many simultaneous live peers.
 - At the legacy query pace, 1,024 configured peers take about 128 s to
   sweep. Negotiated IPC groups use the same admission checks with a
   per-connection request quota and a daemon-wide lookup budget. Extend
@@ -101,6 +100,24 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   and from 3.25 to 3.98 ms with the previous bridge. One of 87,170 UDP
   datagrams was lost with the change. The previous bridge delivered
   all 87,276 datagrams.
+- A daemon that reaches its shared admission-lookup quota now allows
+  batches to wait for refill off the IPC connection loop. The daemon
+  holds at most 32 outstanding batches for lookup and each may wait up
+  to 250 ms. The lookup budget still allows a burst of 1,024 checks and
+  refills at 4,096 checks/s. The daemon reads current admission after the
+  wait and replies using the original request ID and frame format.
+- An isolated 85 s Linux ARM64 A/B run used twelve ogate instances sharing
+  one daemon, 1,024 configured routes per instance, one flapping member
+  and one stable member offering UDP at 32 Mb/s. Both runs used the same
+  ogate binary and test-only identity difficulty. With the old daemon the
+  gateways logged 57 failed batch queries and every gateway dropped the
+  stable member's route at least once. With the queue all eight session
+  changes converged in 2.55–3.35 s after the daemon reported the transition.
+  The gateways logged zero failed queries and all kept the stable
+  member's route. The stable link delivered 309,092 of 309,092 UDP
+  datagrams and 1,054 of 1,054 ping replies. Previously it delivered
+  265,236 of 308,901 UDP datagrams and 905 of 1,041 ping replies.
+  Ping p99 was 5.27 ms with the queue and 5.02 ms before the change.
 - On two Linux ARM64 nodes with real TUN interfaces and one live certified
   peer at the end of each configured list, the routes appeared within
   0.22 s for 34 entries, 0.66 s for 256, and 2.17 s for 1,024 after

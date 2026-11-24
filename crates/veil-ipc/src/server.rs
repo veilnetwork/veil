@@ -3677,7 +3677,9 @@ async fn handle_ipc_client(
                     }
                     Ok(LocalAppMsg::PnetAdmissionBatchQuery) if pnet_admission_batch => {
                         if let Some(queries) = &pnet_status_queries {
-                            queries.reply_admission_batch(&mut wh, hdr.request_id, &body, &mut client_state).await?;
+                            queries.queue_admission_batch(
+                                hdr.request_id, &body, &mut client_state, &spawn_sem, &reply_tx,
+                            );
                         }
                     }
                     Ok(LocalAppMsg::ListenTransportsQuery) => {

@@ -11,8 +11,11 @@
 //! default (empty list / zero-state payload / `INTERNAL_ERROR`) so apps
 //! see "feature off" cleanly rather than a protocol error.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 
+use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::time::Instant;
 use veil_abuse::rate_limiter::TokenBucket;
 use veil_proto::ipc::{PNET_ADMISSION_BATCH_MAX_PEERS, PnetAdmission};
 use veil_proto::{
@@ -29,8 +32,8 @@ use veil_proto::{
     pair_source_status, pair_target_status,
 };
 
-use crate::frame_io::{write_frame_wh, write_frame_wh_id};
-use crate::server::IpcClientState;
+use crate::frame_io::{encode_reply_frame_id, write_frame_wh};
+use crate::server::{IpcClientState, LoopReply};
 use crate::transport::IpcWriteHalf;
 use crate::{
     BootstrapInviteCreateOutcome, BootstrapInviteCreateSink, BootstrapJoinOutcome,
@@ -202,9 +205,15 @@ pub(crate) async fn handle_listen_transports_query(
     .await
 }
 
+const PNET_BATCH_BURST: f64 = 1_024.0;
+const PNET_BATCH_LOOKUPS_PER_SEC: f64 = 4_096.0;
+const PNET_BATCH_MAX_IN_FLIGHT: usize = 32;
+const PNET_BATCH_MAX_WAIT: Duration = Duration::from_millis(250);
+
 pub(crate) struct PnetStatusQueries {
     provider: Arc<dyn PnetStatusProvider>,
     batch_budget: Mutex<TokenBucket>,
+    batch_slots: Arc<Semaphore>,
 }
 
 impl PnetStatusQueries {
@@ -213,7 +222,11 @@ impl PnetStatusQueries {
             provider,
             // Independent of older IPC operations. Count peer lookups across
             // all clients so opening more connections cannot multiply work.
-            batch_budget: Mutex::new(TokenBucket::new(1_024.0, 4_096.0)),
+            batch_budget: Mutex::new(TokenBucket::new(
+                PNET_BATCH_BURST,
+                PNET_BATCH_LOOKUPS_PER_SEC,
+            )),
+            batch_slots: Arc::new(Semaphore::new(PNET_BATCH_MAX_IN_FLIGHT)),
         }
     }
 
@@ -221,24 +234,76 @@ impl PnetStatusQueries {
         self.provider.authority()
     }
 
-    pub(crate) async fn reply_admission_batch(
-        &self,
-        wh: &mut IpcWriteHalf,
+    async fn wait_for_batch_budget(&self, peers: usize) -> bool {
+        tokio::time::timeout(PNET_BATCH_MAX_WAIT, async {
+            // Tokio grants the lock in FIFO order. Wait for refill at the
+            // head of the queue so another connection cannot take its turn.
+            let mut budget = self.batch_budget.lock().await;
+            let cost = peers as f64;
+            loop {
+                let now = Instant::now();
+                if budget.allow_n_at(cost, now.into_std()) {
+                    break;
+                }
+                let wait =
+                    Duration::from_secs_f64((cost - budget.tokens()) / PNET_BATCH_LOOKUPS_PER_SEC);
+                tokio::time::sleep_until(now + wait.max(Duration::from_nanos(1))).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    pub(crate) fn queue_admission_batch(
+        self: &Arc<Self>,
         request_id: u32,
         body: &[u8],
         client_state: &mut IpcClientState,
-    ) -> std::io::Result<()> {
+        spawn_sem: &Arc<Semaphore>,
+        reply_tx: &mpsc::Sender<LoopReply>,
+    ) {
         let (peers, remainder) = body.as_chunks::<32>();
         if request_id == 0
             || !remainder.is_empty()
             || peers.is_empty()
             || peers.len() > PNET_ADMISSION_BATCH_MAX_PEERS
             || !client_state.allow_query()
-            || !veil_util::lock!(self.batch_budget)
-                .allow_n_at(peers.len() as f64, std::time::Instant::now())
         {
-            return Ok(());
+            return;
         }
+        let Ok(task_slot) = Arc::clone(spawn_sem).try_acquire_owned() else {
+            return;
+        };
+        let Ok(batch_slot) = Arc::clone(&self.batch_slots).try_acquire_owned() else {
+            return;
+        };
+        let queries = Arc::clone(self);
+        let peers = peers.to_vec();
+        let reply_tx = reply_tx.clone();
+        tokio::spawn(async move {
+            let _task_slot = task_slot;
+            let admitted = tokio::select! {
+                biased;
+                _ = reply_tx.closed() => return,
+                ready = queries.wait_for_batch_budget(peers.len()) => ready,
+            };
+            if admitted {
+                let body = queries.batch_reply_body(&peers);
+                // A slow IPC reader may delay its own reply. Release the
+                // daemon-wide slot before handing off to that connection.
+                drop(batch_slot);
+                let _ = reply_tx
+                    .send(LoopReply::Frame(encode_reply_frame_id(
+                        LocalAppMsg::PnetAdmissionBatchResult as u16,
+                        request_id,
+                        &body,
+                    )))
+                    .await;
+            }
+        });
+    }
+
+    fn batch_reply_body(&self, peers: &[[u8; 32]]) -> Vec<u8> {
         let now = veil_util::unix_secs_now_u64();
         let mut reply = Vec::with_capacity(peers.len() * PnetAdmission::WIRE_SIZE);
         for peer in peers {
@@ -253,14 +318,48 @@ impl PnetStatusQueries {
             };
             reply.extend_from_slice(&entry.encode());
         }
-        write_frame_wh_id(
-            wh,
-            FrameFamily::LocalApp as u8,
-            LocalAppMsg::PnetAdmissionBatchResult as u16,
-            request_id,
-            &reply,
-        )
-        .await
+        reply
+    }
+}
+
+#[cfg(test)]
+mod pnet_batch_tests {
+    use super::*;
+
+    struct UnusedProvider;
+
+    impl PnetStatusProvider for UnusedProvider {
+        fn peer_status(&self, _: &[u8; 32]) -> veil_proto::PnetStatusResultPayload {
+            unreachable!("this test only exercises the lookup budget")
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pnet_batch_waits_for_refill_in_order_and_times_out() {
+        let queries = PnetStatusQueries::new(Arc::new(UnusedProvider));
+        let batch_size = PNET_ADMISSION_BATCH_MAX_PEERS;
+        let started = Instant::now();
+        for _ in 0..16 {
+            assert!(queries.wait_for_batch_budget(batch_size).await);
+        }
+        assert_eq!(started.elapsed(), Duration::ZERO);
+
+        let batch_period = Duration::from_secs_f64(batch_size as f64 / PNET_BATCH_LOOKUPS_PER_SEC);
+        let wait_for_turn = || async {
+            assert!(queries.wait_for_batch_budget(batch_size).await);
+            started.elapsed()
+        };
+        let (first, second) = tokio::join!(biased; wait_for_turn(), wait_for_turn());
+        assert!(first >= batch_period);
+        assert!(second >= batch_period * 2);
+        assert!(second > first);
+
+        let guard = queries.batch_budget.lock().await;
+        let started = Instant::now();
+        assert!(!queries.wait_for_batch_budget(batch_size).await);
+        assert_eq!(started.elapsed(), PNET_BATCH_MAX_WAIT);
+        drop(guard);
+        assert!(queries.wait_for_batch_budget(batch_size).await);
     }
 }
 
