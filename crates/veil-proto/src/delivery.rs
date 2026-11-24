@@ -515,6 +515,9 @@ pub mod delivery_status {
     pub const FETCHED: u8 = 6;
     /// Recipient application explicitly acknowledged the delivery via IPC.
     pub const APP_ACKED: u8 = 7;
+    /// P-Net receipt on the reverse Forward path. Translated to DELIVERED for IPC.
+    /// Legacy peers ignore this wire-only status.
+    pub const RELAYED_DELIVERED: u8 = 8;
 }
 
 /// Delivery status report (transport or logical acknowledgment).
@@ -537,6 +540,7 @@ pub struct DeliveryStatusPayload {
     /// actual recipient, not an on-path relay (a relay never learns the shared
     /// secret). All-zero when no ACK key was established (non-E2E / legacy):
     /// the originator then clears the pending entry but credits NO reputation.
+    /// `RELAYED_DELIVERED` uses a separate MAC domain and requires an ACK key.
     pub mac: [u8; 32],
 }
 
@@ -646,6 +650,15 @@ impl ChunkedEnvelopePayload {
     /// Size of the fixed-width header (before `data`).
     pub const HEADER_SIZE: usize = 1 + 16 + 4 + 4 + 4 + 32 + 1; // 62
 
+    /// Read the whole-message ACK key for routing without copying chunk data.
+    pub fn acknowledged_transfer(buf: &[u8]) -> Option<([u8; 32], TransferId)> {
+        if buf.get(61)? & CHUNKED_ENVELOPE_FLAG_REQUIRE_ACK == 0 {
+            return None;
+        }
+        let header = Self::decode_header(buf).ok()?;
+        Some((header.orig_content_id, header.transfer_id))
+    }
+
     /// Encode to wire bytes (marker-prefixed).
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::HEADER_SIZE + self.data.len());
@@ -669,6 +682,12 @@ impl ChunkedEnvelopePayload {
     /// `total_size ≤ MAX_REASSEMBLY_BYTES`, `data ≤ MAX_CHUNK_PAYLOAD`) so a
     /// malformed or non-chunk payload is rejected before reassembly.
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        let mut header = Self::decode_header(buf)?;
+        header.data = buf[Self::HEADER_SIZE..].to_vec();
+        Ok(header)
+    }
+
+    fn decode_header(buf: &[u8]) -> Result<Self, ProtoError> {
         if buf.len() < Self::HEADER_SIZE {
             return Err(ProtoError::BufferTooShort {
                 need: Self::HEADER_SIZE,
@@ -694,8 +713,7 @@ impl ChunkedEnvelopePayload {
                 "total_size exceeds reassembly cap".into(),
             ));
         }
-        let data = buf[Self::HEADER_SIZE..].to_vec();
-        if data.len() > super::budget::MAX_CHUNK_PAYLOAD {
+        if buf.len() - Self::HEADER_SIZE > super::budget::MAX_CHUNK_PAYLOAD {
             return Err(ProtoError::Malformed(
                 "chunk data exceeds MAX_CHUNK_PAYLOAD".into(),
             ));
@@ -707,7 +725,7 @@ impl ChunkedEnvelopePayload {
             total_size,
             orig_content_id: super::read_array::<32>(buf, 29)?,
             require_ack: buf[61] & CHUNKED_ENVELOPE_FLAG_REQUIRE_ACK != 0,
-            data,
+            data: Vec::new(),
         })
     }
 }

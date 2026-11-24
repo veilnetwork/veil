@@ -347,6 +347,11 @@ impl PendingAckTracker {
             .map(|e| (e.next_hop, e.src_app_id, e.ack_key))
     }
 
+    /// Final recipient of an in-flight acknowledged message.
+    pub fn recipient(&self, content_id: &[u8; 32]) -> Option<[u8; 32]> {
+        self.pending.get(content_id).map(|entry| entry.dst_node_id)
+    }
+
     /// Admission must stop if an ACK cleared this message, a new registration
     /// replaced the attempt or the recipient was revoked while it waited.
     pub fn retry_is_current(&self, content_id: &[u8; 32], attempt: u32) -> bool {

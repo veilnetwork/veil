@@ -62,6 +62,7 @@ mod identity_document_store;
 #[cfg(test)]
 mod identity_document_store_tests;
 pub mod pending_ack;
+mod relay_delivery_ack;
 pub mod routing;
 pub mod service_budget;
 pub mod session;
@@ -642,9 +643,18 @@ impl<K: Hash + Eq + Copy + Ord, V> ExpiryMap<K, V> {
     }
 }
 
-/// Shared terminal-delivery ACK-replay cache: `content_id → (sender, ack_key)`
-/// (audit cycle-8 H8). Type alias to keep the dispatcher field readable.
-pub type TerminalAckReplay = Arc<Mutex<ExpiryMap<[u8; 32], ([u8; 32], [u8; 32])>>>;
+/// Evidence retained by the recipient to re-issue a lost delivery ACK.
+#[derive(Clone, Copy)]
+pub struct TerminalDeliveryAck {
+    sender: NodeIdBytes,
+    key: [u8; 32],
+    reverse_peer: Option<NodeIdBytes>,
+    envelope_hash: Option<blake3::Hash>,
+}
+
+pub type TerminalAckReplay = Arc<Mutex<ExpiryMap<[u8; 32], TerminalDeliveryAck>>>;
+
+pub use relay_delivery_ack::RelayDeliveryAcks;
 
 /// One short-lived allowance for a matching lossy copy from a different
 /// ingress after a failed forwarding pass. Consumed allowances keep their
@@ -1175,6 +1185,8 @@ pub struct FrameDispatcher {
     /// recoverable WITHOUT re-decrypting the payload (cheap + replay-safe).
     /// Same TTL/cap window as `forward_seen_set`.
     pub terminal_ack_replay: TerminalAckReplay,
+    /// Ephemeral receipt routes for ordinary P-Net forwarding.
+    pub relay_delivery_acks: Option<Arc<Mutex<RelayDeliveryAcks>>>,
 
     /// Recursive query dedup: prevents loops in recursive DHT routing.
     pub recursive_query_seen: Arc<Mutex<ExpiryCache<[u8; 16]>>>,
@@ -2169,6 +2181,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
             Duration::from_secs(veil_proto::budget::FORWARD_SEEN_SET_TTL_SECS),
             veil_proto::budget::MAX_FORWARD_SEEN_SET_SIZE,
         ))),
+        relay_delivery_acks: None,
         recursive_query_seen: Arc::new(Mutex::new(ExpiryCache::new(
             Duration::from_secs(30),
             65536,
@@ -3045,6 +3058,7 @@ mod tests {
                 Duration::from_secs(30),
                 10_000,
             ))),
+            relay_delivery_acks: None,
             recursive_query_seen: Arc::new(Mutex::new(ExpiryCache::new(
                 Duration::from_secs(30),
                 65536,

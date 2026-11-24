@@ -1279,6 +1279,7 @@ impl NodeRuntime {
             forward_seen_content: Arc::clone(&self.dispatcher.forward_seen_content),
             lossy_forward_retries: Arc::clone(&self.dispatcher.lossy_forward_retries),
             terminal_ack_replay: Arc::clone(&self.dispatcher.terminal_ack_replay),
+            relay_delivery_acks: self.dispatcher.relay_delivery_acks.clone(),
             recursive_query_seen: Arc::clone(&self.dispatcher.recursive_query_seen),
             pending_recursive: Arc::clone(&self.dispatcher.pending_recursive),
             recursive_reverse_path: Arc::clone(&self.dispatcher.recursive_reverse_path),

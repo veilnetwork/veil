@@ -284,11 +284,34 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   the application received two failure notifications 0.79 s after it
   began the sends. The sender recorded zero retries through the
   original five-second timeout and retained its session with the relay.
-- In a separate healthy relay run, the destination received the
-  datagram once while the sender received no delivery receipt and
-  retried after the normal timeout. The current delivery receipt
-  sender looks for a direct session to the origin. Returning receipts
-  through intermediate nodes remains open.
+- A healthy relay run exposed a delivery receipt gap. The destination
+  received the datagram once and the sender retried after five seconds
+  because the destination had no direct session back to it.
+
+#### Returning delivery receipts through P-Net relays
+
+- Encrypted acknowledged `Forward` messages can return receipts through
+  the ordinary authenticated private-network sessions used on the way
+  out. Relays retain the content ID, admitted downstream peer and previous
+  peer for at most 30 seconds in a cache capped at 4,096 entries per node.
+  A valid carrier chunk uses the original message ID. Revoked peers and
+  expired envelopes are ineligible for receipt return.
+- Direct confirmations keep their existing format. The relayed status
+  uses its own MAC domain and stays within the existing `DeliveryStatus`
+  frame. The origin checks the recipient's MAC, consumes the pending entry
+  once and reports the usual `DELIVERED` IPC stage. Legacy peers ignore
+  the new status. Returning a receipt across the entire path requires
+  upgraded participants when no direct return session is available.
+- On separate Linux bridge networks, 32-byte and 150,000-byte payloads
+  reached the recipient once and both receipts returned through one and
+  two relays. The larger message was reassembled from carrier chunks.
+  The sender logged zero retransmits after the five-second timeout.
+- Deployments with a previous daemon at the origin or at the relay
+  continued to deliver application messages. A mixed-version macOS SDK
+  chat session delivered 1,000 messages in each direction.
+- A completed chunk transfer can re-issue its cached receipt through
+  its recorded previous hop. Replaying the receipt when the retry reaches
+  the recipient through a different last hop remains open.
 
 ## 3. Distribute owner-authorized peer policy
 

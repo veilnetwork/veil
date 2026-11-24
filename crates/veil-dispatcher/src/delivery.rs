@@ -1,14 +1,29 @@
-use super::{DispatchResult, FrameDispatcher};
+use super::{
+    DispatchResult, FrameDispatcher, TerminalDeliveryAck,
+    relay_delivery_ack::{ForwardAck, receipt_mac},
+};
 use veil_app::registry::SenderProvenance;
 use veil_cfg::NodeId;
 use veil_proto::{
     codec::encode_header,
-    delivery::{DeliveryEnvelope, ForwardPayload, RecursiveRelayPayload},
+    delivery::{
+        DeliveryEnvelope, DeliveryStatusPayload, ForwardPayload, RecursiveRelayPayload,
+        delivery_status,
+    },
     family::{DeliveryMsg, FrameFamily},
     header::FrameHeader,
 };
 use veil_types::NodeIdBytes;
 use veil_util::{lock, rlock, wlock};
+
+fn delivery_status_frame(status: &DeliveryStatusPayload) -> Vec<u8> {
+    let mut header = FrameHeader::new(
+        FrameFamily::Delivery as u8,
+        DeliveryMsg::DeliveryStatus as u16,
+    );
+    header.body_len = DeliveryStatusPayload::WIRE_SIZE as u32;
+    veil_proto::codec::encode_frame(&header, &status.encode())
+}
 
 /// produce a u64 randomness seed for `pick_weighted` from a
 /// `trace_id` (already random per-frame) folded with the current monotonic
@@ -169,23 +184,45 @@ pub struct HopAttrs {
     pub relay_attempts: u32,
 }
 
-/// Preserve authenticated incoming connection ownership in the same ordinary
-/// queue. This changes no wire field, admission, FIFO position or service cost.
-fn send_forward_on_ingress(
-    registry: &veil_session::SessionTxRegistry,
-    peer: &[u8; 32],
-    priority: u8,
-    frame: Vec<u8>,
-    carrier: Option<&veil_anonymity::circuit_carrier::Carrier>,
-) -> Result<(), veil_session::SendToError> {
-    if let Some(carrier) = carrier {
-        registry.send_to_on_carrier_result(peer, frame, carrier.clone())
-    } else {
+impl FrameDispatcher {
+    fn forward_ack(
+        &self,
+        payload: &ForwardPayload,
+        peer: NodeId,
+        carrier: Option<&veil_anonymity::circuit_carrier::Carrier>,
+    ) -> Option<ForwardAck> {
+        if self.relay_delivery_acks.is_some() && carrier.is_none() {
+            ForwardAck::from_forward(payload, *peer.as_bytes())
+        } else {
+            None
+        }
+    }
+
+    fn send_forward_on_ingress(
+        &self,
+        registry: &veil_session::SessionTxRegistry,
+        peer: &NodeIdBytes,
+        priority: u8,
+        frame: Vec<u8>,
+        carrier: Option<&veil_anonymity::circuit_carrier::Carrier>,
+        ack: Option<ForwardAck>,
+    ) -> Result<(), veil_session::SendToError> {
+        if let Some(carrier) = carrier {
+            return registry.send_to_on_carrier_result(peer, frame, carrier.clone());
+        }
+        if let (Some(routes), Some(ack)) = (&self.relay_delivery_acks, ack)
+            && &ack.previous != peer
+        {
+            // A fast receipt cannot race ahead of recording successful admission.
+            // Both directions lock the TX registry before the receipt routes.
+            let mut routes = lock!(routes);
+            registry.send_to_result(peer, priority, frame)?;
+            routes.record_admission(*peer, ack);
+            return Ok(());
+        }
         registry.send_to_result(peer, priority, frame)
     }
-}
 
-impl FrameDispatcher {
     fn is_local_delivery_recipient(&self, recipient: &veil_proto::recipient::Recipient) -> bool {
         use veil_proto::recipient::InstanceTag;
         let sovereign = self.local_recipient.as_ref().and_then(|current| current());
@@ -294,6 +331,7 @@ impl FrameDispatcher {
         let body_len = 32 + envelope_bytes.len() + suffix.len();
         let total_wire_len = veil_proto::header::HEADER_SIZE + body_len;
 
+        let ack = self.forward_ack(payload, sender_peer_id, carrier);
         let reg_guard = rlock!(reg);
         for target in targets {
             // Split-horizon + self-loop filtering (mirrors the same
@@ -312,7 +350,10 @@ impl FrameDispatcher {
             frame.extend_from_slice(&envelope_bytes);
             frame.extend_from_slice(&suffix);
 
-            if send_forward_on_ingress(&reg_guard, &target, traffic_class, frame, carrier).is_ok() {
+            if self
+                .send_forward_on_ingress(&reg_guard, &target, traffic_class, frame, carrier, ack)
+                .is_ok()
+            {
                 // Direct-forward counter would land here on a future
                 // operator-dashboard milestone (was closed
                 // without the metric; not critical to session correctness).
@@ -350,7 +391,9 @@ impl FrameDispatcher {
 
         match msg {
             DeliveryMsg::Forward => self.handle_delivery_forward(header, body, peer_id, carrier),
-            DeliveryMsg::DeliveryStatus => self.handle_delivery_status(body),
+            DeliveryMsg::DeliveryStatus => {
+                self.handle_delivery_status(body, peer_id, carrier.is_none())
+            }
             DeliveryMsg::ChunkManifest => self.handle_chunk_manifest(body),
             DeliveryMsg::Chunk => self.handle_chunk(body, peer_id),
             DeliveryMsg::Transit => self.handle_transit(body, peer_id),
@@ -1053,7 +1096,9 @@ impl FrameDispatcher {
         frame.extend_from_slice(&gw);
         frame.extend_from_slice(&envelope_bytes);
         frame.extend_from_slice(&gw_suffix);
-        send_forward_on_ingress(&rlock!(reg), &gw, traffic_class, frame, carrier).is_ok()
+        let ack = self.forward_ack(payload, peer_id, carrier);
+        self.send_forward_on_ingress(&rlock!(reg), &gw, traffic_class, frame, carrier, ack)
+            .is_ok()
     }
 
     /// DHT recursive-relay fallback: when neither route_cache nor a gateway
@@ -1302,12 +1347,15 @@ impl FrameDispatcher {
             };
 
             // ── Acquire reg_guard only for the send window ────────────────────
+            let ack = self.forward_ack(payload, peer_id, carrier);
             let reg_guard = rlock!(reg);
 
             // Forward to a directly connected recipient with the same neutral
             // scheduling class as any other relay hop.
             let fwd_frame = make_fwd_frame(dst);
-            if send_forward_on_ingress(&reg_guard, &dst, traffic_class, fwd_frame, carrier).is_ok()
+            if self
+                .send_forward_on_ingress(&reg_guard, &dst, traffic_class, fwd_frame, carrier, ack)
+                .is_ok()
             {
                 return true;
             }
@@ -1315,7 +1363,14 @@ impl FrameDispatcher {
             let mut failed_hops = Vec::new();
             let mut try_hop = |hop| {
                 let frame = make_fwd_frame(hop);
-                match send_forward_on_ingress(&reg_guard, &hop, traffic_class, frame, carrier) {
+                match self.send_forward_on_ingress(
+                    &reg_guard,
+                    &hop,
+                    traffic_class,
+                    frame,
+                    carrier,
+                    ack,
+                ) {
                     Ok(()) => true,
                     Err(error) => {
                         failed_hops.push((hop, error));
@@ -1495,42 +1550,44 @@ impl FrameDispatcher {
     ///
     /// Best-effort: if we cannot route to the sender right now, the sender
     /// will time out and retransmit; the terminal-delivery `content_id` dedup
-    /// in `deliver_forward_locally` (forward_seen_set) drops the duplicate at
+    /// in `terminal_deliver` drops the duplicate at
     /// the recipient, so a retransmit re-delivers at most once per TTL window.
-    fn send_delivery_ack(&self, sender: [u8; 32], content_id: [u8; 32], ack_key: [u8; 32]) {
+    fn send_delivery_ack(
+        &self,
+        sender: NodeIdBytes,
+        content_id: [u8; 32],
+        ack_key: [u8; 32],
+        reverse_peer: Option<NodeIdBytes>,
+    ) {
         if self.app_registry.is_peer_revoked(&sender) {
             return;
         }
-        use veil_proto::{
-            delivery::{DeliveryStatusPayload, delivery_status},
-            family::{DeliveryMsg, FrameFamily},
-            header::FrameHeader,
+        let frame = |relayed| {
+            delivery_status_frame(&DeliveryStatusPayload {
+                content_id,
+                status: if relayed {
+                    delivery_status::RELAYED_DELIVERED
+                } else {
+                    delivery_status::DELIVERED
+                },
+                mac: *receipt_mac(&ack_key, &content_id, relayed).as_bytes(),
+            })
         };
-
-        // C-09: MAC content_id with the per-message ACK key so the originator
-        // can confirm this DELIVERED came from the actual recipient, not an
-        // on-path relay (only the recipient + originator can derive the key).
-        // A zero ack_key (meta-E2E / non-E2E) yields a MAC a relay could
-        // reproduce, so the originator credits no reputation for those.
-        let mac = *blake3::keyed_hash(&ack_key, &content_id).as_bytes();
-        let status_payload = DeliveryStatusPayload {
-            content_id,
-            status: delivery_status::DELIVERED,
-            mac,
-        };
-        let body = status_payload.encode();
-
-        let mut hdr = FrameHeader::new(
-            FrameFamily::Delivery as u8,
-            DeliveryMsg::DeliveryStatus as u16,
-        );
-        hdr.body_len = body.len() as u32;
-        // single-allocation frame assembly.
-        let frame = veil_proto::codec::encode_frame(&hdr, &body);
 
         if let Some(reg) = &self.session_tx_registry {
             let guard = rlock!(reg);
-            guard.send_to(&sender, veil_proto::header::priority::INTERACTIVE, frame);
+            let priority = veil_proto::priority::INTERACTIVE;
+            if let Some(previous) = reverse_peer
+                && ack_key != [0; 32]
+                && previous != sender
+                && !self.app_registry.is_peer_revoked(&previous)
+            {
+                if !guard.has_session(&sender) || !guard.send_to(&sender, priority, frame(false)) {
+                    guard.send_to(&previous, priority, frame(true));
+                }
+            } else {
+                guard.send_to(&sender, priority, frame(false));
+            }
         }
     }
 
@@ -1572,7 +1629,9 @@ impl FrameDispatcher {
         }
 
         if self.is_local_delivery_recipient(&payload.envelope.recipient) {
-            self.deliver_forward_locally(payload, peer_id);
+            let reverse_peer = (carrier.is_none() && self.relay_delivery_acks.is_some())
+                .then_some(*peer_id.as_bytes());
+            self.terminal_deliver(payload.envelope, peer_id, reverse_peer);
             return DispatchResult::NoResponse;
         }
 
@@ -1626,26 +1685,24 @@ impl FrameDispatcher {
         expired
     }
 
-    /// Terminal delivery: decrypt E2E/meta-E2E payload (if marked), cache the
-    /// reverse route, dispatch to the local app registry, and emit an ACK
-    /// back to the original sender when `require_ack` is set.
-    fn deliver_forward_locally(&self, payload: ForwardPayload, peer_id: NodeId) {
-        self.terminal_deliver(payload.envelope, peer_id);
-    }
-
     /// Terminal delivery of a `DeliveryEnvelope` addressed to this node. Handles
     /// (a) relay-chunked envelopes — accumulated in the reassembler until the
     /// whole message arrives, then re-entered here as the reconstructed original
     /// envelope — and (b) ordinary envelopes — deduped, E2E-decrypted, delivered
-    /// to the addressed app, and ACKed. Called both from `deliver_forward_locally`
+    /// to the addressed app, and ACKed. Called both from `handle_delivery_forward`
     /// (a Forward addressed to us) and from chunk reassembly on completion.
-    fn terminal_deliver(&self, envelope: DeliveryEnvelope, peer_id: NodeId) {
+    fn terminal_deliver(
+        &self,
+        envelope: DeliveryEnvelope,
+        peer_id: NodeId,
+        reverse_peer: Option<NodeIdBytes>,
+    ) {
         // Relay-chunked piece? Divert to reassembly. Only the reassembled
         // ORIGINAL envelope (payload no longer chunk-marked) proceeds below, so
         // app_id/endpoint_id/E2E/ACK semantics are preserved instead of being
         // flattened into an epidemic broadcast.
         if envelope.payload.first() == Some(&veil_proto::delivery::CHUNKED_ENVELOPE_MARKER) {
-            self.handle_chunk_envelope(envelope, peer_id);
+            self.handle_chunk_envelope(envelope, peer_id, reverse_peer);
             return;
         }
 
@@ -1668,10 +1725,14 @@ impl FrameDispatcher {
             // replay-safe). Without this the originator burns all retransmits and
             // reports AppSendFailed for a message that WAS delivered, and the
             // loss_tracker is poisoned against a healthy hop.
-            if let Some((sender, ack_key)) =
-                lock!(self.terminal_ack_replay).get(&content_id).copied()
-            {
-                self.send_delivery_ack(sender, content_id, ack_key);
+            let replay = lock!(self.terminal_ack_replay).get(&content_id).copied();
+            if let Some(ack) = replay {
+                let previous = reverse_peer.filter(|_| {
+                    envelope.require_ack
+                        && ack.sender == envelope.sender_node_id()
+                        && ack.envelope_hash == Some(blake3::hash(&envelope.payload))
+                });
+                self.send_delivery_ack(ack.sender, content_id, ack.key, previous);
             }
             return;
         }
@@ -1778,7 +1839,7 @@ impl FrameDispatcher {
         // The comment that used to sit here claimed this was already the case.
         // It was not: the whole binding check lived in `check_relay_preconditions`,
         // which only ever runs on the RELAY path — a Forward addressed to us
-        // goes straight to `deliver_forward_locally` and never touches it. So
+        // goes straight to `terminal_deliver` and never touches it. So
         // any peer could hand us a frame naming any third party and have us
         // record `third_party → that peer`, redirecting our later traffic for
         // that node id through it (X/V-01; the meta-E2E half of the reasoning,
@@ -1825,14 +1886,20 @@ impl FrameDispatcher {
         // send E2E delivery ACK back to the original sender, MAC'd with the
         // per-message ACK key (C-09) so a relay cannot forge it.
         if envelope.require_ack {
-            self.send_delivery_ack(deliver_sender_node_id, envelope.content_id, ack_key);
-            // audit cycle-8 H8: cache (sender, ack_key) keyed by content_id so a
-            // retransmit (sent when this ACK is lost) can be re-ACK'd from the
-            // duplicate path above without re-decrypting the payload.
-            if envelope.content_id != [0u8; 32] {
-                lock!(self.terminal_ack_replay)
-                    .insert(envelope.content_id, (deliver_sender_node_id, ack_key));
+            let reverse_peer = reverse_peer.filter(|_| ack_key != [0; 32]);
+            // Cache before sending so a fast retry can reuse the same evidence.
+            if content_id != [0; 32] {
+                lock!(self.terminal_ack_replay).insert(
+                    content_id,
+                    TerminalDeliveryAck {
+                        sender: deliver_sender_node_id,
+                        key: ack_key,
+                        reverse_peer,
+                        envelope_hash: reverse_peer.map(|_| blake3::hash(&envelope.payload)),
+                    },
+                );
             }
+            self.send_delivery_ack(deliver_sender_node_id, content_id, ack_key, reverse_peer);
         }
     }
 
@@ -1841,7 +1908,12 @@ impl FrameDispatcher {
     /// reassembler joins them by `transfer_id`, and on completion we re-enter
     /// [`Self::terminal_deliver`] with the reconstructed ORIGINAL envelope so the
     /// standard E2E-decrypt + addressed-delivery + ACK path runs unchanged.
-    fn handle_chunk_envelope(&self, envelope: DeliveryEnvelope, peer_id: NodeId) {
+    fn handle_chunk_envelope(
+        &self,
+        envelope: DeliveryEnvelope,
+        peer_id: NodeId,
+        reverse_peer: Option<NodeIdBytes>,
+    ) {
         use crate::envelope_chunks::AddChunkResult;
         use veil_proto::delivery::ChunkedEnvelopePayload;
         let chunk = match ChunkedEnvelopePayload::decode(&envelope.payload) {
@@ -1869,7 +1941,7 @@ impl FrameDispatcher {
                 );
                 // Re-enter terminal delivery; the reassembled payload is no
                 // longer chunk-marked, so it takes the normal decrypt+deliver path.
-                self.terminal_deliver(*reassembled, peer_id);
+                self.terminal_deliver(*reassembled, peer_id, reverse_peer);
             }
             AddChunkResult::CompletedReplay(orig_content_id) => {
                 let replay = {
@@ -1877,8 +1949,11 @@ impl FrameDispatcher {
                         .get(&orig_content_id)
                         .copied()
                 };
-                if let Some((sender, ack_key)) = replay {
-                    self.send_delivery_ack(sender, orig_content_id, ack_key);
+                if let Some(ack) = replay {
+                    let previous = reverse_peer.filter(|_| {
+                        reverse_peer == ack.reverse_peer && ack.sender == envelope.sender_node_id()
+                    });
+                    self.send_delivery_ack(ack.sender, orig_content_id, ack.key, previous);
                 }
             }
             AddChunkResult::Pending => {}
@@ -2140,76 +2215,119 @@ impl FrameDispatcher {
         ))
     }
 
-    /// originating IPC app of the delivery-stage transition.
-    fn handle_delivery_status(&self, body: &[u8]) -> DispatchResult {
-        let Ok(status) = veil_proto::delivery::DeliveryStatusPayload::decode(body) else {
+    fn handle_delivery_status(
+        &self,
+        body: &[u8],
+        peer: NodeId,
+        ordinary_session: bool,
+    ) -> DispatchResult {
+        let Ok(status) = DeliveryStatusPayload::decode(body) else {
             return DispatchResult::NoResponse;
         };
-        // Match-shape (rather than `if status == DELIVERED`) is intentional —
-        // future /221 work will add additional status arms (LOST
-        // QUEUED, RETRYING etc); the match's `_ => {}` arm is the natural
-        // place to add them. Switching to `if`-form would require a bigger
-        // refactor when the next status code arrives.
-        #[allow(clippy::single_match)]
-        match status.status {
-            // DELIVERED ACK clears the pending entry and (only when
-            // authenticated) credits the relay.
-            veil_proto::delivery::delivery_status::DELIVERED => {
-                // C-09: PEEK the stored ACK key without clearing the entry, so a
-                // forged DELIVERED whose MAC we cannot reproduce leaves the
-                // pending entry intact (retransmit continues) and earns nothing.
-                if let Some((_, _, ack_key)) =
-                    lock!(self.pending_ack).peek_ack_info(&status.content_id)
-                {
-                    // A non-zero ACK key means this was an E2E send: require a
-                    // valid recipient MAC over content_id. Only the recipient
-                    // and the originator can derive the key (from the ML-KEM
-                    // shared secret); an on-path relay cannot, so it cannot forge
-                    // this. `blake3::Hash` equality is constant-time.
-                    let expected = blake3::keyed_hash(&ack_key, &status.content_id);
-                    let is_e2e = ack_key != [0u8; 32];
-                    let authenticated = is_e2e && expected == blake3::Hash::from(status.mac);
-
-                    if is_e2e && !authenticated {
-                        // E2E message with a bad/forged MAC: ignore it — keep the
-                        // pending entry so the legitimate ACK (or a retransmit)
-                        // still resolves delivery, and credit nothing.
-                    } else if let Some((hop, src_app_id)) =
-                        // Authenticated E2E ACK, OR an unauthenticated zero-key
-                        // path (meta-E2E / non-E2E): atomically remove the entry.
-                        // Using ack_and_get_info (not ack) means only the thread
-                        // that actually removes the entry proceeds — preventing a
-                        // double-credit if a relay replays the valid ACK.
-                        lock!(self.pending_ack).ack_and_get_info(&status.content_id)
-                    {
-                        // Credit relay reputation ONLY for an authenticated ACK.
-                        // A zero-key (unauthenticated) DELIVERED — which a relay
-                        // could forge — clears the entry but earns no reputation,
-                        // closing the "forge DELIVERED for free reputation" path
-                        // (462.18 ACK-gating is now MAC-gated, C-09).
-                        if authenticated {
-                            lock!(self.control_plane.rtt_table()).record_relay_success(hop);
-                            self.loss_tracker.record_success(hop);
-                            if let Some(ref rep) = self.reputation {
-                                let identity_for_rep = self
-                                    .session_registry
-                                    .as_ref()
-                                    .and_then(|sr| lock!(sr).node_id_for_peer(&hop.into()))
-                                    .unwrap_or(hop);
-                                lock!(rep).record_relay_success(identity_for_rep.into());
-                            }
-                        }
-                        self.app_registry.route_delivery_stage(
-                            src_app_id,
-                            status.content_id,
-                            veil_proto::delivery::delivery_status::DELIVERED,
-                        );
-                    }
-                }
+        let private = self.relay_delivery_acks.is_some();
+        let relayed = status.status == delivery_status::RELAYED_DELIVERED;
+        if relayed {
+            if !private || !ordinary_session || body.len() != DeliveryStatusPayload::WIRE_SIZE {
+                return DispatchResult::NoResponse;
             }
-            _ => {}
+        } else if status.status != delivery_status::DELIVERED {
+            return DispatchResult::NoResponse;
         }
+
+        let peer_id = *peer.as_bytes();
+        let peer_identity = if private {
+            crate::app::sovereign_sender_of(self.session_registry.as_deref(), &peer)
+        } else {
+            peer_id
+        };
+        if private
+            && (self.app_registry.is_peer_revoked(&peer_id)
+                || self.app_registry.is_peer_revoked(&peer_identity))
+        {
+            return DispatchResult::NoResponse;
+        }
+
+        let (hop, src_app_id, authenticated) = {
+            let mut pending = lock!(self.pending_ack);
+            let Some((_, _, key)) = pending.peek_ack_info(&status.content_id) else {
+                drop(pending);
+                if relayed {
+                    self.return_relay_delivery_ack(&status, peer_id);
+                }
+                return DispatchResult::NoResponse;
+            };
+            let authenticated = key != [0; 32];
+            // Relayed receipts use a separate MAC domain so a wire-status
+            // rewrite cannot turn them into a legacy direct confirmation.
+            if (relayed && !authenticated)
+                || (authenticated
+                    && receipt_mac(&key, &status.content_id, relayed)
+                        != blake3::Hash::from(status.mac))
+            {
+                return DispatchResult::NoResponse;
+            }
+            if private
+                && let Some(recipient) = pending.recipient(&status.content_id)
+                && (self.app_registry.is_peer_revoked(&recipient)
+                    || (!authenticated && recipient != peer_id && recipient != peer_identity))
+            {
+                return DispatchResult::NoResponse;
+            }
+            // Verify and consume under one lock. A duplicate receipt cannot
+            // clear a newer registration or credit the relay twice.
+            let Some((hop, src_app_id)) = pending.ack_and_get_info(&status.content_id) else {
+                return DispatchResult::NoResponse;
+            };
+            (hop, src_app_id, authenticated)
+        };
+
+        // A valid delayed ACK may come back along an earlier attempt's path.
+        // Only give P-Net relay credit when it arrived via the tracked hop.
+        if authenticated && (!private || hop == peer_id || hop == peer_identity) {
+            lock!(self.control_plane.rtt_table()).record_relay_success(hop);
+            self.loss_tracker.record_success(hop);
+            if let Some(ref rep) = self.reputation {
+                let identity_for_rep = self
+                    .session_registry
+                    .as_ref()
+                    .and_then(|sr| lock!(sr).node_id_for_peer(&hop.into()))
+                    .unwrap_or(hop);
+                lock!(rep).record_relay_success(identity_for_rep.into());
+            }
+        }
+        self.app_registry.route_delivery_stage(
+            src_app_id,
+            status.content_id,
+            delivery_status::DELIVERED,
+        );
         DispatchResult::NoResponse
+    }
+
+    fn return_relay_delivery_ack(
+        &self,
+        status: &veil_proto::delivery::DeliveryStatusPayload,
+        peer: NodeIdBytes,
+    ) {
+        let (Some(routes), Some(registry)) = (&self.relay_delivery_acks, &self.session_tx_registry)
+        else {
+            return;
+        };
+        let registry = rlock!(registry);
+        lock!(routes).return_ack(
+            status.content_id,
+            peer,
+            veil_util::unix_secs_now_u64(),
+            |route| {
+                if route.is_revoked(&self.app_registry) {
+                    return false;
+                }
+                registry.send_to(
+                    &route.previous,
+                    veil_proto::priority::INTERACTIVE,
+                    delivery_status_frame(status),
+                )
+            },
+        );
     }
 
     /// 289: register the reassembly manifest for an upcoming chunk set.
@@ -2574,6 +2692,165 @@ mod tests {
     use super::HopAttrs;
     use veil_cfg::NodeId;
     use veil_util::rlock;
+
+    #[test]
+    fn private_relay_ack_follows_the_admitted_neighbor_and_rearms_on_retry() {
+        use crate::make_test_dispatcher;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, RwLock};
+        use veil_proto::delivery::{
+            DeliveryEnvelope, DeliveryStatusPayload, ForwardPayload, delivery_status,
+        };
+        use veil_proto::family::{DeliveryMsg, FrameFamily};
+        use veil_proto::header::{FrameHeader, HEADER_SIZE};
+        use veil_proto::recipient::Recipient;
+        use veil_session::SessionTxRegistry;
+        use veil_util::wlock;
+
+        const SENDER: [u8; 32] = [0xA1; 32];
+        const DST: [u8; 32] = [0xB1; 32];
+        const CONTENT: [u8; 32] = [0xC1; 32];
+        const HOP: [u8; 32] = [0xD1; 32];
+        const OTHER: [u8; 32] = [0xD2; 32];
+        let mut dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+        dispatcher.local_node_id = [0xDD; 32];
+        dispatcher.relay_delivery_acks = Some(Default::default());
+        let revoked = Arc::new(AtomicBool::new(false));
+        let check = Arc::clone(&revoked);
+        dispatcher.app_registry = Arc::new(
+            veil_app::AppEndpointRegistry::new().with_peer_revocation_check(move |peer| {
+                peer == &DST && check.load(Ordering::Relaxed)
+            }),
+        );
+        let registry = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let mut upstream = wlock!(registry).register(SENDER);
+        let mut downstream = wlock!(registry).register(HOP);
+        let _other = wlock!(registry).register(OTHER);
+        dispatcher.session_tx_registry = Some(registry);
+        wlock!(dispatcher.route_cache).insert(DST, HOP, 100, 2);
+
+        let mut forward = ForwardPayload {
+            next_hop_node_id: dispatcher.local_node_id,
+            envelope: DeliveryEnvelope {
+                recipient: Recipient::any(DST),
+                sender_node_id: SENDER,
+                src_app_id: [0xA2; 32],
+                app_id: [0xB2; 32],
+                endpoint_id: 1,
+                content_id: CONTENT,
+                created_at: veil_util::unix_secs_now_u64(),
+                ttl_secs: 30,
+                payload: vec![veil_proto::E2E_MARKER, 1],
+                trace_id: 0,
+                require_ack: true,
+            },
+            relay_hops: 0,
+            delivery_attempt: Some(1),
+            traffic_class: None,
+        };
+        let send_forward = |forward: &ForwardPayload| {
+            let body = forward.encode();
+            let mut header =
+                FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+            header.body_len = body.len() as u32;
+            dispatcher.dispatch(&header, &body, SENDER);
+        };
+        let ack = DeliveryStatusPayload {
+            content_id: CONTENT,
+            status: delivery_status::RELAYED_DELIVERED,
+            mac: [9; 32],
+        }
+        .encode();
+        let send_ack = |peer| {
+            let mut header = FrameHeader::new(
+                FrameFamily::Delivery as u8,
+                DeliveryMsg::DeliveryStatus as u16,
+            );
+            header.body_len = ack.len() as u32;
+            dispatcher.dispatch(&header, &ack, peer);
+        };
+        send_ack(HOP);
+        assert!(upstream.try_recv().is_err());
+        send_forward(&forward);
+        assert!(downstream.try_recv().is_ok());
+        send_ack(OTHER);
+        assert!(upstream.try_recv().is_err());
+        send_ack(HOP);
+        assert_eq!(&upstream.try_recv().unwrap().1[HEADER_SIZE..], &ack);
+        send_ack(HOP);
+        assert!(upstream.try_recv().is_err());
+
+        forward.delivery_attempt = Some(2);
+        send_forward(&forward);
+        assert!(downstream.try_recv().is_ok());
+        revoked.store(true, Ordering::Relaxed);
+        send_ack(HOP);
+        assert!(upstream.try_recv().is_err());
+        revoked.store(false, Ordering::Relaxed);
+        send_ack(HOP);
+        assert_eq!(&upstream.try_recv().unwrap().1[HEADER_SIZE..], &ack);
+    }
+
+    #[test]
+    fn private_origin_accepts_a_keyed_receipt_once_and_limits_legacy_receipts_to_the_recipient() {
+        use crate::make_test_dispatcher;
+        use std::sync::Arc;
+        use veil_app::registry::AppMessage;
+        use veil_proto::delivery::{DeliveryStatusPayload, delivery_status};
+        use veil_util::lock;
+
+        let mut dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+        dispatcher.relay_delivery_acks = Some(Default::default());
+        let hop = [5; 32];
+        let recipient = [6; 32];
+        let app_id = [7; 32];
+        let content_id = [8; 32];
+        let key = [9; 32];
+        let (_app, mut notices) = dispatcher.app_registry.register(app_id, 1, 8);
+        let register = |key| {
+            assert!(lock!(dispatcher.pending_ack).register(
+                content_id,
+                hop,
+                recipient,
+                app_id,
+                key,
+                Arc::<[u8]>::from([1u8; 8]),
+            ))
+        };
+        let receipt = |peer, status, mac| {
+            let wire = DeliveryStatusPayload {
+                content_id,
+                status,
+                mac,
+            }
+            .encode();
+            dispatcher.handle_delivery_status(&wire, NodeId::from(peer), true);
+        };
+
+        register(key);
+        let relayed = delivery_status::RELAYED_DELIVERED;
+        let direct = delivery_status::DELIVERED;
+        let mac = *crate::relay_delivery_ack::receipt_mac(&key, &content_id, true).as_bytes();
+        receipt(hop, relayed, [0; 32]);
+        receipt(hop, direct, mac);
+        assert!(notices.try_recv().is_err());
+        receipt(hop, relayed, mac);
+        assert!(
+            matches!(notices.try_recv(), Ok(AppMessage::DeliveryStage { content_id: id, stage: delivery_status::DELIVERED }) if id == content_id)
+        );
+        receipt(hop, relayed, mac);
+        assert!(notices.try_recv().is_err());
+
+        register([0; 32]);
+        receipt(recipient, relayed, [0; 32]);
+        receipt(hop, direct, [0; 32]);
+        assert!(notices.try_recv().is_err());
+        receipt(recipient, direct, [0; 32]);
+        assert!(matches!(
+            notices.try_recv(),
+            Ok(AppMessage::DeliveryStage { .. })
+        ));
+    }
 
     #[test]
     fn forwarding_keeps_full_queues_in_the_route_cache_and_checks_revocation() {
@@ -3167,7 +3444,7 @@ mod tests {
     /// Terminal DELIVERY_FORWARD replay guard: two identical terminal Forward
     /// frames (same non-zero `content_id`) addressed to the local node must
     /// result in exactly ONE app delivery — the second is silently dropped by
-    /// the content_id dedup added at the top of `deliver_forward_locally`.
+    /// the content_id dedup at the start of `terminal_deliver`.
     #[test]
     fn terminal_forward_deduplicates_replayed_frame() {
         use crate::DispatchResult;
