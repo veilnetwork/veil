@@ -167,6 +167,26 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   The UDP flows missed 22 of 218,184 packets, previously 124 of 218,025.
   Both runs converged on all four session transitions without failed
   admission queries.
+- Repeating the 110 s run with 24 gateways, disjoint 1,024-entry tables,
+  and 48 authenticated members on the newer resolver reached all initial
+  routes in 5.93 s. All eight transitions converged in 1.03–5.06 s. No
+  batch query failed or caused a route withdrawal for a live member.
+  ICMP delivery was 10,536 of 10,536 with a worst per-probe p99 of
+  13.5 ms. The two UDP flows delivered 399,664 of 399,704 packets.
+- ogate retries a batch once after two seconds without a reply. The
+  replacement uses a fresh IPC request ID and the existing query pace.
+  It shares the original five-second deadline. A late approval for
+  the first request cannot override a denial for the replacement.
+- A 40 s Linux ARM64 A/B run used 24 gateways, 48 authenticated
+  members, and an identical daemon binary. A local IPC proxy dropped
+  one status-batch reply at each of 22 gateways. Previously all 22
+  cleared their routes. All 22 retries succeeded and no routes were
+  cleared with the change. ICMP delivery rose from 3,364 of 3,831
+  replies to 3,839 of 3,840. The longest reply gap fell from 6.15 s
+  to 0.64 s. The two unproxied UDP flows delivered 144,865 of 145,413
+  packets with the change, compared with 144,993 of 145,018 in the
+  control run. A socket regression test also verifies that two missing
+  replies exhaust the original deadline and yield no admission result.
 - On two Linux ARM64 nodes with real TUN interfaces and one live certified
   peer at the end of each configured list, the routes appeared within
   0.22 s for 34 entries, 0.66 s for 256, and 2.17 s for 1,024 after

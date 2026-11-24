@@ -224,6 +224,7 @@ impl SharedState {
 
 const PNET_REFRESH_PERIOD: Duration = Duration::from_secs(5);
 const PNET_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const PNET_BATCH_RETRY_AFTER: Duration = Duration::from_secs(2);
 const PNET_LEGACY_QUERY_GROUP: usize = 16;
 // Daemons admit 10 local queries per second per IPC client. Leave room for
 // other local queries and avoid consuming the burst quota at startup.
@@ -335,7 +336,23 @@ async fn query_pnet_batch(
 ) -> Option<HashMap<NodeId, u64>> {
     let ids: Vec<_> = peers.iter().map(|(node_id, _)| *node_id).collect();
     pace.tick().await;
-    let reply = tokio::time::timeout(PNET_QUERY_TIMEOUT, client.peer_pnet_admissions(&ids)).await;
+    let deadline = Instant::now() + PNET_QUERY_TIMEOUT;
+    let first =
+        tokio::time::timeout(PNET_BATCH_RETRY_AFTER, client.peer_pnet_admissions(&ids)).await;
+    let reply = match first {
+        Ok(reply) => Ok(reply),
+        Err(_) => {
+            // The daemon can silently drop an overloaded batch. Retry once
+            // at the same pace, without extending the fail-closed deadline.
+            // The SDK assigns a new ID and ignores a late first reply.
+            tracing::debug!("retrying P-Net admission batch after missing reply");
+            tokio::time::timeout_at(deadline, async {
+                pace.tick().await;
+                client.peer_pnet_admissions(&ids).await
+            })
+            .await
+        }
+    };
     match reply {
         Ok(Ok(entries)) => {
             let now = unix_secs_now_u64();
@@ -1897,6 +1914,103 @@ mod tests {
         assert_eq!(recent.retry_group(&peers, &live, now)[0].0, [67; 32]);
         assert!(!recent.seen.contains_key(&[2; 32]));
         assert!(!recent.seen.contains_key(&[68; 32]));
+    }
+
+    #[tokio::test]
+    async fn pnet_batch_retries_a_missing_reply_and_keeps_the_original_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{UnixListener, UnixStream};
+        use veil_proto::ipc::IPC_HELLO_OK_PNET_ADMISSION_BATCH;
+        use veil_proto::{
+            AppIpcHelloOkPayload, FrameFamily, FrameHeader, HEADER_SIZE, IPC_PROTOCOL_VERSION,
+            LocalAppMsg, codec,
+        };
+        use veilclient::PnetAdmission;
+
+        async fn read_frame(stream: &mut UnixStream) -> (FrameHeader, Vec<u8>) {
+            let mut bytes = [0; HEADER_SIZE];
+            stream.read_exact(&mut bytes).await.unwrap();
+            let header = codec::decode_header(&bytes).unwrap();
+            let mut body = vec![0; header.body_len as usize];
+            stream.read_exact(&mut body).await.unwrap();
+            (header, body)
+        }
+
+        async fn write_frame(stream: &mut UnixStream, mut header: FrameHeader, body: &[u8]) {
+            header.body_len = body.len() as u32;
+            stream
+                .write_all(&codec::encode_header(&header))
+                .await
+                .unwrap();
+            stream.write_all(body).await.unwrap();
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("ipc");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let peer = [0xaa; 32];
+        let daemon = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (hello, _) = read_frame(&mut stream).await;
+            assert_eq!(hello.msg_type, LocalAppMsg::AppHello as u16);
+            let mut header =
+                FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppHelloOk as u16);
+            header.flags = IPC_HELLO_OK_PNET_ADMISSION_BATCH;
+            let body = AppIpcHelloOkPayload {
+                version: IPC_PROTOCOL_VERSION,
+                client_token: [0; 16],
+            };
+            write_frame(&mut stream, header, &body.encode()).await;
+
+            let mut previous = 0;
+            for query in 0..4 {
+                let (request, body) = read_frame(&mut stream).await;
+                assert_eq!(
+                    request.msg_type,
+                    LocalAppMsg::PnetAdmissionBatchQuery as u16
+                );
+                assert_eq!(body, peer);
+                assert_ne!(request.request_id, 0);
+                assert_ne!(request.request_id, previous);
+                if query == 1 {
+                    // Old approval appears after the retry was sent. Only the
+                    // retry's denial is valid for this round.
+                    for (request_id, expiry) in [(previous, Some(0)), (request.request_id, None)] {
+                        let mut header = FrameHeader::new(
+                            FrameFamily::LocalApp as u8,
+                            LocalAppMsg::PnetAdmissionBatchResult as u16,
+                        );
+                        header.request_id = request_id;
+                        let entry = PnetAdmission {
+                            peer_node_id: peer,
+                            valid_until_unix: expiry,
+                        };
+                        write_frame(&mut stream, header, &entry.encode()).await;
+                    }
+                }
+                previous = request.request_id;
+            }
+            assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+        });
+
+        let client = VeilClient::connect(&socket).await.unwrap();
+        let group = [(peer, [0; 32])];
+        let mut pace = tokio::time::interval(PNET_QUERY_SPACING);
+        assert_eq!(
+            query_pnet_batch(&client, &group, &mut pace).await,
+            Some(HashMap::new())
+        );
+        let started = Instant::now();
+        assert!(query_pnet_batch(&client, &group, &mut pace).await.is_none());
+        assert!(
+            (PNET_QUERY_TIMEOUT..PNET_QUERY_TIMEOUT + PNET_BATCH_RETRY_AFTER)
+                .contains(&started.elapsed())
+        );
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(2), daemon)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
