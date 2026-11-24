@@ -218,7 +218,20 @@ impl FrameDispatcher {
             // Both directions lock the TX registry before the receipt routes.
             let mut routes = lock!(routes);
             registry.send_to_result(peer, priority, frame)?;
-            routes.record_admission(*peer, ack);
+            if let Some(mac) = routes.record_admission(*peer, ack) {
+                let status = DeliveryStatusPayload {
+                    content_id: ack.content_id,
+                    status: delivery_status::RELAYED_DELIVERED,
+                    mac,
+                };
+                routes.return_ack(
+                    ack.content_id,
+                    *peer,
+                    mac,
+                    veil_util::unix_secs_now_u64(),
+                    |route| self.enqueue_relay_delivery_ack(registry, route, &status),
+                );
+            }
             return Ok(());
         }
         registry.send_to_result(peer, priority, frame)
@@ -2333,18 +2346,24 @@ impl FrameDispatcher {
         lock!(routes).return_ack(
             status.content_id,
             peer,
+            status.mac,
             veil_util::unix_secs_now_u64(),
-            |route| {
-                if route.is_revoked(&self.app_registry) {
-                    return false;
-                }
-                registry.send_to(
-                    &route.previous,
-                    veil_proto::priority::INTERACTIVE,
-                    delivery_status_frame(status),
-                )
-            },
+            |route| self.enqueue_relay_delivery_ack(&registry, route, status),
         );
+    }
+
+    fn enqueue_relay_delivery_ack(
+        &self,
+        registry: &veil_session::SessionTxRegistry,
+        route: &ForwardAck,
+        status: &DeliveryStatusPayload,
+    ) -> bool {
+        !route.is_revoked(&self.app_registry)
+            && registry.send_to(
+                &route.previous,
+                veil_proto::priority::INTERACTIVE,
+                delivery_status_frame(status),
+            )
     }
 
     /// 289: register the reassembly manifest for an upcoming chunk set.

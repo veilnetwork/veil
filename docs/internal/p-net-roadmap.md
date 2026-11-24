@@ -320,10 +320,29 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   receipt through a backup relay after one retry, 5.8 seconds after the
   send. The application received the payload once. The previous daemon
   also delivered the payload once and made two retries without a receipt.
-- Routes that converge on the same downstream link still need separate
-  coverage. A relay with an outstanding receipt can retain the previous
-  upstream peer when the same chunked transfer re-enters through another
-  neighbor.
+- On a shared downstream link, a relay can change the return path after
+  a new authenticated upstream admits the same complete indexed batch.
+  The relay compares a digest of the forwarded ciphertext and framing.
+  It retains one receipt from the matched downstream, two candidate
+  upstreams and up to eight out-of-order chunk digests per tracked pass.
+  A matching batch can return the retained receipt even when the old
+  local queue accepted it and the return path failed farther upstream.
+- In a five-node Linux test, a 150,000-byte message crossed the same final
+  link before and after failover. The previous daemon delivered the data
+  once and made two retries without a receipt. The updated relay returned
+  the receipt on the first retry after about 5.7 seconds. In a second run,
+  the old relay stayed connected to the shared relay and lost its link to
+  the origin. The shared relay returned the original receipt after the
+  same batch arrived through the backup. Packet filtering blocked fresh
+  receipts during the retry, and frame fingerprints confirmed the reuse.
+- A mixed-version run confirmed the receipt on the first retry with
+  only the shared relay upgraded. In a separate run the old sender's
+  retry tracker kept the failed first hop for both retries while ordinary
+  datagrams already passed through the backup. Sender-side selection of
+  the first hop on retry remains an independent recovery case.
+- A shared link that saw only part of the original batch still needs
+  coverage. A new upstream needs a complete matching batch on that link
+  before taking over its return path.
 
 ## 3. Distribute owner-authorized peer policy
 

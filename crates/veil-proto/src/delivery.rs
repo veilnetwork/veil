@@ -652,11 +652,16 @@ impl ChunkedEnvelopePayload {
 
     /// Read the whole-message ACK key for routing without copying chunk data.
     pub fn acknowledged_transfer(buf: &[u8]) -> Option<([u8; 32], TransferId)> {
+        let header = Self::acknowledged_chunk_header(buf)?;
+        Some((header.orig_content_id, header.transfer_id))
+    }
+
+    /// Validate an acknowledged chunk's header and leave `data` empty.
+    pub fn acknowledged_chunk_header(buf: &[u8]) -> Option<Self> {
         if buf.get(61)? & CHUNKED_ENVELOPE_FLAG_REQUIRE_ACK == 0 {
             return None;
         }
-        let header = Self::decode_header(buf).ok()?;
-        Some((header.orig_content_id, header.transfer_id))
+        Self::decode_header(buf).ok()
     }
 
     /// Encode to wire bytes (marker-prefixed).
