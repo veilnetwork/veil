@@ -227,19 +227,20 @@ node_id = "deadbeef..."
 addr_v4 = "10.99.0.2"
 ```
 
-What happens at startup, and again on a SIGHUP reload (the signal that
-tells ogate to re-read its config):
+ogate rechecks admission at startup, on SIGHUP, and periodically. A
+configured peer gains a route once the daemon reports a live,
+certificate-verified session. The route is removed when that peer's
+next check fails or times out. A finite certificate stops allowing
+traffic at its expiry even between checks.
 
-1. ogate connects to the daemon.
-2. It walks the `[[peers]]` list and calls `peer_pnet_status` for each
-   entry.
-3. It drops any peer that isn't both cert-bearing and admitted
-   (`has_cert && admitted`), logging a warning for each one dropped.
-4. It builds its routing table from the peers that survived.
+The refresh starts every five seconds when the previous sweep has
+finished. Larger peer lists update in groups so IPC requests stay
+within the daemon's query budget.
 
-Pair this with `mode = "authorized"` for defence in depth — two
-independent checks instead of one. A peer must both carry a verified
-cert and appear in the `[[peers]]` list.
+With `pnet_required = true`, both access modes require a configured,
+admitted peer. Use `mode = "authorized"` to also enforce the configured
+source IP. The daemon still establishes sessions through its own discovery
+and connection mechanisms.
 
 ### Operator flow
 

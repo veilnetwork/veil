@@ -78,5 +78,10 @@ tun = { version = "0.6", features = ["async"] }
 nix = { version = "0.29", features = ["fs", "ioctl", "net", "socket"] }
 libc = "0.2"
 
+[target.'cfg(unix)'.dev-dependencies]
+tempfile = "3"
+veil-ipc = { path = "../veil-ipc" }
+veil-proto = { path = "../veil-proto" }
+
 [lints]
 workspace = true

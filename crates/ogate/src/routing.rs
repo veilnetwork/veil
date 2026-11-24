@@ -10,7 +10,7 @@
 //!
 //! Authorized mode additionally maintains an allowlist of `node_id`s
 //! (= the keys of the peer table). Open mode skips the membership check
-//! but still uses the table to resolve egress destinations; an unknown
+//! unless P-Net admission is required, but still resolves egress destinations; an unknown
 //! destination IP is dropped (no flooding).
 
 use std::collections::HashMap;
@@ -37,6 +37,7 @@ pub enum Decision {
 #[derive(Debug, Clone)]
 pub struct RoutingTable {
     mode: AccessMode,
+    pnet_required: bool,
     v4: HashMap<Ipv4Addr, NodeId>,
     v6: HashMap<Ipv6Addr, NodeId>,
     /// node_id → set of expected virtual IPs (for ingress spoofing check).
@@ -77,6 +78,7 @@ impl RoutingTable {
         }
         Ok(Self {
             mode: cfg.mode,
+            pnet_required: cfg.pnet_required,
             v4,
             v6,
             by_peer,
@@ -95,6 +97,13 @@ impl RoutingTable {
         self.by_peer.keys()
     }
 
+    #[cfg(unix)]
+    pub(crate) fn retain_peers(&mut self, mut keep: impl FnMut(&NodeId) -> bool) {
+        self.by_peer.retain(|peer, _| keep(peer));
+        self.v4.retain(|_, peer| self.by_peer.contains_key(peer));
+        self.v6.retain(|_, peer| self.by_peer.contains_key(peer));
+    }
+
     /// Resolve an outbound packet's destination IP to a peer `node_id`.
     pub fn lookup_egress(&self, dst: IpAddr) -> Decision {
         let nid = match dst {
@@ -110,8 +119,9 @@ impl RoutingTable {
     /// Decide what to do with an inbound packet given the veil sender's
     /// `node_id` and the packet's claimed source IP.
     ///
-    /// * `open` mode: accept any peer in the network namespace, **but**
-    ///   packet must still parse as a valid IP header (post-audit: was
+    /// * `open` mode: accept a namespace peer, subject to the P-Net allowlist
+    ///   when required. In both cases the
+    ///   packet must parse as a valid IP header (post-audit: was
     ///   accepting malformed packets unconditionally, which let a
     ///   namespace-peer inject garbage into the TUN interface).
     /// * `authorized` mode: accept only if `src_node_id` is in the peer
@@ -125,7 +135,11 @@ impl RoutingTable {
             return Decision::SpoofedSourceIp;
         }
         if self.mode == AccessMode::Open {
-            return Decision::Forward(*src_node_id);
+            return if !self.pnet_required || self.by_peer.contains_key(src_node_id) {
+                Decision::Forward(*src_node_id)
+            } else {
+                Decision::Unauthorized
+            };
         }
         let Some(peer) = self.by_peer.get(src_node_id) else {
             return Decision::Unauthorized;
@@ -295,6 +309,27 @@ mod tests {
         let t = RoutingTable::from_config(&cfg).unwrap();
         let r = t.lookup_ingress(&[0xff; 32], Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
         assert!(matches!(r, Decision::Forward(_)));
+    }
+
+    #[test]
+    fn ingress_open_mode_requires_admitted_peer_when_pnet_is_enabled() {
+        let mut cfg = cfg_with_peer(
+            AccessMode::Open,
+            PEER_HEX,
+            Some(Ipv4Addr::new(10, 99, 0, 2)),
+        );
+        cfg.pnet_required = true;
+        let table = RoutingTable::from_config(&cfg).unwrap();
+        let peer = decode_node_id(PEER_HEX).unwrap();
+        let source = Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(table.lookup_ingress(&peer, source), Decision::Forward(peer));
+        assert_eq!(
+            table.lookup_ingress(&[0xff; 32], source),
+            Decision::Unauthorized
+        );
+        cfg.peers.clear();
+        let empty = RoutingTable::from_config(&cfg).unwrap();
+        assert_eq!(empty.lookup_ingress(&peer, source), Decision::Unauthorized);
     }
 
     #[test]

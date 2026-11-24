@@ -44,12 +44,12 @@ pub struct OgateConfig {
     #[serde(default)]
     pub mode: AccessMode,
 
-    /// **P-Net admission gate**.  When `true`, ogate queries the daemon's
-    /// verified-cert cache (cf. [`veil_identity::network_access`])
-    /// at startup and on SIGHUP, and filters out any `[[peers]]` entry whose
-    /// peer hasn't presented a valid `MembershipCert`.  Combine with
-    /// `mode = "authorized"` for defence-in-depth: peer must BOTH
-    /// have a verified cert AND be in the configured `[[peers]]` list.
+    /// **P-Net admission gate**. When `true`, only configured peers with a
+    /// live, certificate-verified daemon session may pass traffic. ogate
+    /// refreshes those routes at startup, on SIGHUP and periodically within
+    /// the daemon's IPC query budget.
+    /// `mode = "authorized"` also checks the source IP against the peer's
+    /// configured virtual address.
     ///
     /// Default `false` — backward-compatible with pre-P-Net deployments
     /// where the operator gates statically.
