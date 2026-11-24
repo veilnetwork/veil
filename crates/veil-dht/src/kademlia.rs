@@ -990,10 +990,16 @@ impl KademliaService {
             // eviction under store pressure — that residual is bounded by
             // periodic DHT republish of live ban records (and replication
             // across the key's shard), not a reserved sticky partition.
-            let mut inner = lock!(self.inner);
-            inner.store_insert(payload.key, payload.value);
-            if let Some(m) = &self.metrics {
-                m.inc_dht_store();
+            let accepted = lock!(self.inner).store_insert_with_origin(
+                payload.key,
+                payload.value.clone(),
+                super::store::ORIGIN_INTERNAL,
+            );
+            if accepted {
+                gate.ban_stored(&payload.value);
+                if let Some(m) = &self.metrics {
+                    m.inc_dht_store();
+                }
             }
             return Ok(());
         }

@@ -68,6 +68,10 @@ pub trait NetworkAuthGate: Send + Sync {
     /// `key` is the DHT key (must derive of the ban target); `value` is
     /// the encoded ban blob (including the magic prefix).
     fn verify_ban_record(&self, key: &[u8; 32], value: &[u8]) -> bool;
+
+    /// Called after an incoming ban has been verified and accepted into the
+    /// store. The DHT lock is released before this call.
+    fn ban_stored(&self, _value: &[u8]) {}
 }
 
 /// Subset of `cfg::DhtConfig` consumed by the DHT internals. Mirror

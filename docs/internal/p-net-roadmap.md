@@ -223,6 +223,32 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   of resume, with p95 of 0.902 s. The publisher verified requests in
   groups of 1 and 31. Subsequent TUN probes succeeded for all 32.
 
+#### Applying a received revocation
+
+- A private node applies a signed ban when its DHT accepts the record
+  after verifying the owner, administrator and ban key. Startup and
+  periodic scans also apply verified records from the local store.
+  The publisher and receiver retire active session senders. Session
+  registration checks the same ban list under the registry lock.
+  An authorized permanent revocation replaces a temporary ban and
+  subsequent automatic bans preserve the permanent entry.
+- The three-node emulated WAN used the previous daemon at the
+  publisher and the revoked node. With TCP, the control receiver
+  applied the revocation 48.83 s after publication began and the
+  revoked peer received UDP traffic for 4.34 s after that event.
+  Applying the record on receipt alone reduced the first delay to
+  0.37 s and exposed a 4.94 s residual egress window. With retirement
+  enabled, the receiver applied the ban in 0.35 s and the last UDP
+  delivery in either direction preceded the event by about 13 ms.
+  The unrevoked inter-site path remained reachable. A restart restored
+  the signed revocation from the DHT snapshot.
+- With obfs4 on the inter-site hop, the receiver applied the signed
+  ban in 0.22 s after a daemon configuration reload. The last UDP
+  delivery in either direction preceded the event by about 4 ms.
+  The receiver restored the revocation again after a restart.
+  A separate public-mode macOS loopback test with the previous daemon
+  delivered 1,000 SDK chat messages in each direction.
+
 ## 3. Distribute owner-authorized peer policy
 
 - Sign a versioned snapshot of virtual address assignments with the

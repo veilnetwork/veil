@@ -63,12 +63,20 @@ impl BanList {
         self.ban_inner(peer_id, reason, None, true);
     }
 
+    /// Apply an automatic ban while preserving an existing permanent manual ban.
     pub fn ban(
         &mut self,
         peer_id: [u8; 32],
         reason: impl Into<String>,
         duration: Option<Duration>,
     ) {
+        if self
+            .entries
+            .get(&peer_id)
+            .is_some_and(|ban| ban.manual && ban.banned_until.is_none())
+        {
+            return;
+        }
         self.ban_inner(peer_id, reason, duration, false);
     }
 

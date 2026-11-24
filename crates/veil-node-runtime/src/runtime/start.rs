@@ -425,6 +425,16 @@ impl NodeRuntime {
                 "using configured entry points and discovery through private sessions",
             );
         }
+        let ban_list = Arc::new(Mutex::new(BanList::new()));
+        persistence::load_bans(&ban_list, &config_path);
+        let shared_session_tx_registry = Arc::new(RwLock::new(if let Some(m) = &metrics {
+            veil_session::SessionTxRegistry::with_capacity_and_drop_counter(
+                config.session.tx_queue_depth,
+                m.session_tx_drops_counter(),
+            )
+        } else {
+            veil_session::SessionTxRegistry::with_capacity(config.session.tx_queue_depth)
+        }));
         let dht = {
             let mut dht_cfg = config.dht.clone();
             if role == veil_cfg::NodeRole::Core && dht_cfg.k == veil_cfg::DhtConfig::default().k {
@@ -451,7 +461,13 @@ impl NodeRuntime {
                 svc.set_metrics(Arc::clone(m) as Arc<dyn veil_dht::DhtMetrics>);
             }
             if let Some(ref gate) = network_gate_arc {
-                svc.set_network_auth_gate(Arc::clone(gate) as Arc<dyn veil_dht::NetworkAuthGate>);
+                super::p_net_ban_sync::configure_p_net_bans(
+                    &mut svc,
+                    gate,
+                    &ban_list,
+                    &shared_session_tx_registry,
+                    &logger,
+                );
             }
             Arc::new(svc)
         };
@@ -525,8 +541,6 @@ impl NodeRuntime {
             }
             Arc::new(Mutex::new(limiter))
         };
-        let ban_list = Arc::new(Mutex::new(BanList::new()));
-        persistence::load_bans(&ban_list, &config_path);
         let violation_tracker = Arc::new(Mutex::new(
             // `.max(1)` makes the threshold provably ≥ 1, which is the
             // only failure precondition of `ViolationTracker::new`
@@ -683,14 +697,6 @@ impl NodeRuntime {
             )
             .await;
         }
-        let shared_session_tx_registry = Arc::new(RwLock::new(if let Some(m) = &metrics {
-            veil_session::SessionTxRegistry::with_capacity_and_drop_counter(
-                config.session.tx_queue_depth,
-                m.session_tx_drops_counter(),
-            )
-        } else {
-            veil_session::SessionTxRegistry::with_capacity(config.session.tx_queue_depth)
-        }));
         // create congestion monitor once; shared with dispatcher and runtime.
         let shared_congestion_monitor = Arc::new(veil_congestion::CongestionMonitor::new(
             config.capacity.clone(),

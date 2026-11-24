@@ -749,7 +749,13 @@ impl NodeRuntime {
                 )));
             }
             if let Some(gate) = &self.network_gate {
-                svc.set_network_auth_gate(Arc::clone(gate) as Arc<dyn veil_dht::NetworkAuthGate>);
+                super::p_net_ban_sync::configure_p_net_bans(
+                    &mut svc,
+                    gate,
+                    &self.ban_list,
+                    &self.session_tx_registry,
+                    &self.logger,
+                );
             }
             Arc::new(svc)
         };

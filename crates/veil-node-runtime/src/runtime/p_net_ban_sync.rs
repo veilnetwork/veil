@@ -2,22 +2,26 @@
 //!
 //! In a private veil network (`[network].mode = "private"`) admin
 //! nodes publish signed `BanEntry` records to the DHT at ban time.
-//! Every member periodically polls its local DHT store for ban entries
-//! and applies them to the in-memory `BanList`, so an admin's decision
-//! propagates network-wide regardless of which node typed the
-//! command.
+//! Each upgraded recipient applies verified STOREs to its in-memory
+//! `BanList` as they arrive. Startup and periodic scans also check the
+//! local DHT store for revocations.
 //!
 //! Public-mode nodes never construct this task (gate is `None`), so
 //! their bans stay node-local — preserving the user's explicit
 //! "publish-only-as-owner" constraint in open networks.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 
+use veil_abuse::BanList;
+use veil_dht::{KademliaService, NetworkAuthGate};
+use veil_identity::network_access::NetworkAccessGate;
 use veil_identity::network_ban::{
     BAN_BLOB_MAGIC, ban_dht_key, decode_ban_blob, encode_ban_blob, verify_ban_entry,
 };
+use veil_observability::NodeLogger;
+use veil_session::SessionTxRegistry;
 use veil_types::{BAN_ENTRY_VERSION, BanEntry};
-use veil_util::lock;
+use veil_util::{lock, wlock};
 
 use super::{NodeRuntime, lock_tasks, supervised_spawn};
 
@@ -31,6 +35,41 @@ pub const MAX_PUBLISH_REASON_LEN: usize = veil_types::MAX_BAN_REASON_LEN;
 /// O(|stored entries|) + small fixed verifies. 60 s strikes a balance
 /// between propagation lag and CPU spend on idle clusters.
 pub const APPLY_INTERVAL_SECS: u64 = 60;
+
+struct BanStoreGate {
+    gate: Arc<NetworkAccessGate>,
+    ban_list: Arc<Mutex<BanList>>,
+    sessions: Arc<RwLock<SessionTxRegistry>>,
+    logger: Arc<NodeLogger>,
+}
+
+impl NetworkAuthGate for BanStoreGate {
+    fn verify_ban_record(&self, key: &[u8; 32], value: &[u8]) -> bool {
+        self.gate.verify_ban_record(key, value)
+    }
+
+    fn ban_stored(&self, value: &[u8]) {
+        if apply_verified_ban(value, &self.ban_list, &self.sessions) {
+            self.logger
+                .info("network.ban.applied", "applied=1 source=store");
+        }
+    }
+}
+
+pub(super) fn configure_p_net_bans(
+    dht: &mut KademliaService,
+    gate: &Arc<NetworkAccessGate>,
+    ban_list: &Arc<Mutex<BanList>>,
+    sessions: &Arc<RwLock<SessionTxRegistry>>,
+    logger: &Arc<NodeLogger>,
+) {
+    dht.set_network_auth_gate(Arc::new(BanStoreGate {
+        gate: Arc::clone(gate),
+        ban_list: Arc::clone(ban_list),
+        sessions: Arc::clone(sessions),
+        logger: Arc::clone(logger),
+    }));
+}
 
 /// Errors returned by [`NodeRuntime::publish_p_net_ban`].
 #[derive(Debug, thiserror::Error)]
@@ -162,18 +201,15 @@ impl NodeRuntime {
         let blob = encode_ban_blob(&entry);
         let key = ban_dht_key(&gate.expected_network_id, &banned_node_id);
 
-        // Apply locally immediately. Don't wait for the DHT scanner —
-        // the admin's own session set should reflect the ban in the next
-        // dispatch step.
+        // Apply at the publisher before any network replication.
         {
             let mut bl = lock!(self.ban_list);
             bl.ban_manual(banned_node_id, reason.clone());
         }
+        wlock!(self.session_tx_registry).unregister(&banned_node_id);
 
         // The async fan-out lives in `PreparedBan::replicate` so the caller can
-        // drop the NodeRuntime lock first. Our gate accepts the PBAN value at
-        // `handle_store` time on every receiver, so remote nodes ingest and (on
-        // their next apply tick) push to their own `BanList`.
+        // drop the NodeRuntime lock first.
         Ok(PreparedBan {
             dht: Arc::clone(&self.dht),
             session_outbox: Arc::clone(&self.session_outbox),
@@ -205,7 +241,13 @@ impl NodeRuntime {
     ///
     pub(super) fn apply_stored_p_net_bans(&self) {
         if let Some(gate) = &self.network_gate {
-            apply_stored_bans(&self.dht, gate, &self.ban_list, &self.logger);
+            apply_stored_bans(
+                &self.dht,
+                gate,
+                &self.ban_list,
+                &self.session_tx_registry,
+                &self.logger,
+            );
         }
     }
 
@@ -221,6 +263,7 @@ impl NodeRuntime {
         let mut shutdown_rx = shutdown_tx.subscribe();
         let dht = Arc::clone(&self.dht);
         let ban_list = Arc::clone(&self.ban_list);
+        let sessions = Arc::clone(&self.session_tx_registry);
         let logger = Arc::clone(&self.logger);
         let handle = supervised_spawn(Arc::clone(&self.logger), "p_net_ban_sync", async move {
             let mut tick =
@@ -232,7 +275,7 @@ impl NodeRuntime {
                         if *shutdown_rx.borrow() { break; }
                     }
                     _ = tick.tick() => {
-                        apply_stored_bans(&dht, &gate, &ban_list, &logger);
+                        apply_stored_bans(&dht, &gate, &ban_list, &sessions, &logger);
                     }
                 }
             }
@@ -242,12 +285,12 @@ impl NodeRuntime {
 }
 
 fn apply_stored_bans(
-    dht: &veil_dht::KademliaService,
-    gate: &veil_identity::network_access::NetworkAccessGate,
-    ban_list: &std::sync::Mutex<veil_abuse::BanList>,
-    logger: &veil_observability::NodeLogger,
+    dht: &KademliaService,
+    gate: &NetworkAccessGate,
+    ban_list: &Mutex<BanList>,
+    sessions: &RwLock<SessionTxRegistry>,
+    logger: &NodeLogger,
 ) {
-    use veil_dht::NetworkAuthGate as _;
     let mut applied = 0;
     // Fetch values individually without promoting cold entries into memory.
     for key in dht.stored_key_ids() {
@@ -257,15 +300,135 @@ fn apply_stored_bans(
         if !value.starts_with(BAN_BLOB_MAGIC) || !gate.verify_ban_record(&key, &value) {
             continue;
         }
-        if let Ok(entry) = decode_ban_blob(&value) {
-            let mut bl = lock!(ban_list);
-            if !bl.is_banned(&entry.banned_node_id) {
-                bl.ban_manual(entry.banned_node_id, entry.reason);
-                applied += 1;
-            }
-        }
+        applied += usize::from(apply_verified_ban(&value, ban_list, sessions));
     }
     if applied > 0 {
         logger.info("network.ban.applied", format!("applied={applied}"));
+    }
+}
+
+fn apply_verified_ban(
+    value: &[u8],
+    ban_list: &Mutex<BanList>,
+    sessions: &RwLock<SessionTxRegistry>,
+) -> bool {
+    let Ok(entry) = decode_ban_blob(value) else {
+        return false;
+    };
+    let mut bans = lock!(ban_list);
+    if bans
+        .get(&entry.banned_node_id)
+        .is_some_and(|ban| ban.manual && ban.banned_until.is_none())
+    {
+        return false;
+    }
+    bans.ban_manual(entry.banned_node_id, entry.reason);
+    // Registration checks the ban while holding the session registry lock.
+    // Release the ban list lock before attempting to retire the sender.
+    drop(bans);
+    wlock!(sessions).unregister(&entry.banned_node_id);
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use veil_identity::network_cert::{canonical_cert_body, encode_cert_blob};
+    use veil_proto::discovery::StorePayload;
+    use veil_types::{MEMBERSHIP_CERT_VERSION, MembershipCert, SignatureAlgorithm};
+
+    #[test]
+    fn incoming_ban_retires_the_sender_only_after_verification_and_storage() {
+        let owner = SigningKey::from_bytes(&[1; 32]);
+        let admin = SigningKey::from_bytes(&[2; 32]);
+        let admin_pubkey = admin.verifying_key().to_bytes().to_vec();
+        let admin_node_id = *blake3::hash(&admin_pubkey).as_bytes();
+        let network_id = [3; 32];
+        let target = [4; 32];
+        let now = veil_util::unix_secs_now_u64();
+        let mut cert = MembershipCert {
+            version: MEMBERSHIP_CERT_VERSION,
+            network_id,
+            member_node_id: admin_node_id,
+            issued_at_unix: now.saturating_sub(1),
+            valid_until_unix: now + 3600,
+            admin: true,
+            algo: SignatureAlgorithm::Ed25519,
+            owner_signature: Vec::new(),
+        };
+        cert.owner_signature = owner.sign(&canonical_cert_body(&cert)).to_bytes().to_vec();
+        let mut entry = BanEntry {
+            version: BAN_ENTRY_VERSION,
+            network_id,
+            banned_node_id: target,
+            reason: "admin revocation".into(),
+            issued_at_unix: now,
+            admin_node_id,
+            admin_cert_blob: encode_cert_blob(&cert),
+            admin_pubkey,
+            admin_signature: Vec::new(),
+        };
+        let key = ban_dht_key(&network_id, &target);
+        let gate = Arc::new(NetworkAccessGate {
+            local_cert_blob: Vec::new(),
+            expected_network_id: network_id,
+            owner_algo: SignatureAlgorithm::Ed25519,
+            owner_pubkey_bytes: owner.verifying_key().to_bytes().to_vec(),
+            admin_node_ids: [admin_node_id].into(),
+        });
+        let logger = Arc::new(NodeLogger::new_noop());
+        let bans = Arc::new(Mutex::new(BanList::new()));
+        lock!(bans).ban(
+            target,
+            "temporary",
+            Some(std::time::Duration::from_secs(90)),
+        );
+        let sessions = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let _outbox = wlock!(sessions).register(target);
+        let mut dht = KademliaService::new([5; 32]);
+        configure_p_net_bans(&mut dht, &gate, &bans, &sessions, &logger);
+        entry.admin_signature = admin
+            .sign(&veil_identity::network_ban::canonical_ban_body(&entry))
+            .to_bytes()
+            .to_vec();
+        let value = encode_ban_blob(&entry);
+
+        entry.admin_signature[0] ^= 1;
+        assert!(
+            dht.handle_store(StorePayload::unsigned(key, encode_ban_blob(&entry)))
+                .is_err()
+        );
+        assert!(dht.peek_value(&key).is_none());
+        assert!(!lock!(bans).get(&target).unwrap().manual);
+
+        let mut small = KademliaService::with_config(
+            [5; 32],
+            veil_dht::DhtRuntimeConfig {
+                max_store_bytes: Some(1),
+                ..Default::default()
+            },
+        );
+        configure_p_net_bans(&mut small, &gate, &bans, &sessions, &logger);
+        small
+            .handle_store(StorePayload::unsigned(key, value.clone()))
+            .unwrap();
+        assert!(small.peek_value(&key).is_none());
+        assert!(!lock!(bans).get(&target).unwrap().manual);
+        assert!(veil_util::rlock!(sessions).has_session(&target));
+
+        dht.handle_store(StorePayload::unsigned(key, value.clone()))
+            .unwrap();
+        assert_eq!(dht.peek_value(&key), Some(value));
+        assert!(!veil_util::rlock!(sessions).has_session(&target));
+        let mut bans = lock!(bans);
+        bans.ban(
+            target,
+            "late temporary ban",
+            Some(std::time::Duration::from_secs(30)),
+        );
+        let ban = bans.get(&target).unwrap();
+        assert!(ban.manual && ban.banned_until.is_none());
+        assert_eq!(ban.reason, "admin revocation");
     }
 }

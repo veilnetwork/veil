@@ -1369,6 +1369,15 @@ pub async fn register_connection_session(
                 .session_tx_registry
                 .write()
                 .unwrap_or_else(|p| p.into_inner());
+            // A revocation can arrive after the earlier handshake check.
+            // Check again under the registry lock used to retire senders.
+            if lock!(runtime.dispatcher.abuse.ban_list).is_banned(&remote_nid) {
+                return Err(NodeError::Handshake(format!(
+                    "banned peer {} — rejected link_id={}",
+                    veil_util::hex_short(&remote_nid),
+                    link_id,
+                )));
+            }
             // A one-sided mobile Leaf is normally absent from a Core's dial
             // rows. Its old half-open link used to reject even an authenticated
             // resume until the reaper noticed it. The verified ticket may

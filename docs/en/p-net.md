@@ -166,11 +166,13 @@ veil-cli network ban <NODE_ID_HEX> --reason "spam"
 Here is what that command sets in motion. It travels over the local
 admin IPC socket (the private channel between the CLI and the running
 daemon) as an `AdminCommand::PNetBan`. The daemon signs a `BanEntry`
-with the node's identity key, applies it locally, and fans it out over
-the DHT to the K closest peers. Every other member picks the ban up on
-its next `p_net_ban_sync` tick, roughly every 60 s.
-After applying a ban, the daemon reports the peer as denied over IPC
-even while its established session is still closing.
+with the node's identity key, applies it locally, and replicates it over
+the DHT to the K closest peers. A receiving daemon applies the ban as
+soon as it verifies and stores the record. Startup and periodic checks
+also apply records from the local store. Older daemons use those checks
+and may take until their next 60 s scan. Applying a ban retires the
+peer's active sender, blocks subsequent session registration and
+reports the peer as denied over IPC.
 
 Confirm it landed on the receiving nodes:
 ```bash
