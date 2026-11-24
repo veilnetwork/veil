@@ -606,7 +606,7 @@ fn device_matches_identity(ctx: &IpcSendContext, device: &[u8; 32], identity: &[
 // Keep verified device/instance values distinct from sender and routing policy.
 #[allow(clippy::too_many_arguments)]
 async fn forward_ordinary_family_copy(
-    reg: &dyn FrameBroadcaster,
+    ctx: &IpcSendContext,
     send: &AppIpcSendPayload,
     sender: [u8; 32],
     device: [u8; 32],
@@ -618,6 +618,9 @@ async fn forward_ordinary_family_copy(
     use veil_proto::delivery::DeliveryEnvelope;
     use veil_proto::family::DeliveryMsg;
     use veil_proto::recipient::Recipient;
+    let Some(reg) = ctx.session_tx_registry.as_deref() else {
+        return DirectAdmission::Missing;
+    };
     let now = veil_util::unix_secs_now_u64();
     let envelope = DeliveryEnvelope {
         // `device` came from the verified identity/instance registry. Transit
@@ -671,16 +674,21 @@ async fn forward_ordinary_family_copy(
         };
         let admitted = tokio::time::timeout_at(family_deadline, async {
             for frame in frames {
+                if ctx.app_registry.is_peer_revoked(&device)
+                    || ctx.app_registry.is_peer_revoked(&send.dst_node_id)
+                {
+                    return DirectAdmission::Rejected;
+                }
                 if !reg.send_reliable_to(&hop, frame).await {
-                    return false;
+                    return DirectAdmission::Missing;
                 }
             }
-            true
+            DirectAdmission::Accepted
         })
         .await;
         match admitted {
-            Ok(true) => return DirectAdmission::Accepted,
-            Ok(false) => {} // a closed hop may use an alternate path
+            Ok(DirectAdmission::Missing) => {} // a closed hop may use an alternate path
+            Ok(result) => return result,
             Err(_) => return DirectAdmission::TimedOut, // source pressure keeps the same deadline
         }
     }
@@ -781,6 +789,11 @@ async fn send_family_relay_copies(
             timing.evidence.filtered_local += 1;
             continue;
         }
+        if ctx.app_registry.is_peer_revoked(&device)
+            || ctx.app_registry.is_peer_revoked(&send.dst_node_id)
+        {
+            continue;
+        }
         if cert.node_id != send.dst_node_id {
             timing.evidence.filtered_identity += 1;
             continue;
@@ -858,7 +871,7 @@ async fn send_family_relay_copies(
             let admission_started = std::time::Instant::now();
             timing.evidence.source_attempts += 1;
             let outcome = forward_ordinary_family_copy(
-                reg,
+                ctx,
                 send,
                 me.local_node_id,
                 device,
@@ -1619,6 +1632,11 @@ async fn handle_ipc_send_inner(
         Ok(s) => s,
         Err(_) => return Ok(()), // drop malformed
     };
+    let recipient_revoked =
+        || send.dst_node_id != *local_node_id && app_registry.is_peer_revoked(&send.dst_node_id);
+    if !send.is_reply && recipient_revoked() {
+        return app_send_error(sink, ipc_send_err::NO_ROUTE).await;
+    }
     timing.bytes.set(send.data.len());
 
     if short_control
@@ -2004,7 +2022,9 @@ async fn handle_ipc_send_inner(
         let mut copies = stream::iter(devices)
             .map(|device| async move {
                 let device = &device;
-                if !device_matches_identity(ctx, device, &request.dst_node_id) {
+                if !device_matches_identity(ctx, device, &request.dst_node_id)
+                    || ctx.app_registry.is_peer_revoked(device)
+                {
                     return (*device, false, ipc_send_err::NO_ROUTE, 0);
                 }
                 let seal_started = std::time::Instant::now();
@@ -2036,6 +2056,11 @@ async fn handle_ipc_send_inner(
                         veil_util::bytes_to_hex(&device[..4]),
                     );
                     return (*device, false, 0, seal_ms);
+                }
+                if ctx.app_registry.is_peer_revoked(device)
+                    || ctx.app_registry.is_peer_revoked(&request.dst_node_id)
+                {
+                    return (*device, false, ipc_send_err::NO_ROUTE, seal_ms);
                 }
                 let mut outcome = if let Some((payload, _, _)) = &sealed
                     && payload.len() > veil_proto::budget::LOCAL_ENVELOPE_SEGMENT_DATA_BYTES
@@ -2073,7 +2098,7 @@ async fn handle_ipc_send_inner(
                     hops.retain(|hop| hop != device);
                     hops.sort_by_key(|hop| direct_family.devices.contains(hop));
                     let forwarded = forward_ordinary_family_copy(
-                        reg,
+                        ctx,
                         request,
                         *sender,
                         *device,
@@ -2183,6 +2208,9 @@ async fn handle_ipc_send_inner(
     } else {
         None
     };
+    if recipient_revoked() {
+        return app_send_error(sink, ipc_send_err::NO_ROUTE).await;
+    }
     if delegated_device && sealed.is_none() {
         return app_send_error(sink, ipc_send_err::NO_E2E_KEY).await;
     }
@@ -2626,6 +2654,9 @@ async fn handle_ipc_send_inner(
                 };
 
                 // ── Relay send (always happens when a hop is found) ──────────
+                if recipient_revoked() {
+                    return app_send_error(sink, ipc_send_err::NO_ROUTE).await;
+                }
                 // content_id = BLAKE3(rand32 || sender_node_id || dst_node_id || payload)
                 // Unique per message; used by relays for dedup/replay prevention.
                 let content_id: [u8; 32] = {
@@ -2755,6 +2786,9 @@ async fn handle_ipc_send_inner(
                         // an alternative, using the same indexed transfer.
                         let admitted = tokio::time::timeout_at(admission_deadline, async {
                             for frame in &frames {
+                                if recipient_revoked() {
+                                    return false;
+                                }
                                 let accepted = if relay_realtime {
                                     reg.send_to(next_hop, local_priority, frame.clone())
                                 } else {
@@ -2890,6 +2924,9 @@ async fn handle_ipc_send_inner(
                     None
                 };
                 for (compat_attempts, next_hop) in hops_to_try.into_iter().enumerate() {
+                    if recipient_revoked() {
+                        return app_send_error(sink, ipc_send_err::NO_ROUTE).await;
+                    }
                     if relay_control_compat && compat_attempts >= 3 {
                         break;
                     }
@@ -6487,6 +6524,45 @@ mod ratchet_send_tests {
         Box::leak(Box::new(b));
         let (_r, w) = a.into_split();
         veil_local_transport::LocalWriteHalf::Unix(w)
+    }
+
+    #[tokio::test]
+    async fn a_revoked_recipient_cannot_keep_using_an_active_relay() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fx = fixture(vec![RELAY]);
+        let revoked = Arc::new(AtomicBool::new(false));
+        let check = Arc::clone(&revoked);
+        let mut ctx = fx.ctx(true);
+        ctx.app_registry = Arc::new(AppEndpointRegistry::new().with_peer_revocation_check(
+            move |peer| peer == &PEER && check.load(Ordering::Relaxed),
+        ));
+        let mut wh = sink().await;
+        let data = payload(false, b"private application datagram");
+        handle_ipc_send(&mut SendReply::Inline(&mut wh), &data, &ctx)
+            .await
+            .unwrap();
+        let sent = fx.taken();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, RELAY);
+
+        revoked.store(true, Ordering::Relaxed);
+        let (a, mut reply) = tokio::net::UnixStream::pair().unwrap();
+        let (_r, w) = a.into_split();
+        let mut wh = veil_local_transport::LocalWriteHalf::Unix(w);
+        handle_ipc_send(&mut SendReply::Inline(&mut wh), &data, &ctx)
+            .await
+            .unwrap();
+        let mut response = [0; veil_proto::HEADER_SIZE + 2];
+        tokio::io::AsyncReadExt::read_exact(&mut reply, &mut response)
+            .await
+            .unwrap();
+        let (header, code) = response.split_at(veil_proto::HEADER_SIZE);
+        assert_eq!(
+            codec::decode_header(header).unwrap().msg_type,
+            LocalAppMsg::AppSendFailed as u16
+        );
+        assert_eq!(code, ipc_send_err::NO_ROUTE.to_be_bytes());
+        assert!(fx.taken().is_empty());
     }
 
     /// A SEND ADDRESSED TO A DEVICE STILL FINDS ITS CERTIFICATE.

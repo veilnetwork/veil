@@ -197,7 +197,10 @@ pub struct AppEndpointRegistry {
     inner: Arc<Mutex<RegistryInner>>,
     metrics: Option<std::sync::Arc<dyn AppMetrics>>,
     publisher: Option<Arc<AutoPublisher>>,
+    peer_revocation_check: Option<Arc<PeerRevocationCheck>>,
 }
+
+type PeerRevocationCheck = dyn Fn(&[u8; 32]) -> bool + Send + Sync;
 
 /// each endpoint registration is
 /// stamped with a monotonically-increasing generation counter.
@@ -239,6 +242,22 @@ impl AppEndpointRegistry {
     pub fn with_metrics(mut self, metrics: std::sync::Arc<dyn AppMetrics>) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    /// Install the private network's check for explicitly revoked peers.
+    pub fn with_peer_revocation_check(
+        mut self,
+        check: impl Fn(&[u8; 32]) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.peer_revocation_check = Some(Arc::new(check));
+        self
+    }
+
+    /// Check a peer ID before routing an application datagram.
+    pub fn is_peer_revoked(&self, peer: &[u8; 32]) -> bool {
+        self.peer_revocation_check
+            .as_ref()
+            .is_some_and(|check| check(peer))
     }
 
     /// Wire in auto-publish so every `register` / `try_register` call
@@ -490,6 +509,12 @@ impl AppEndpointRegistry {
         data: veil_bufpool::PooledShared,
         reply_id: u64,
     ) -> bool {
+        if provenance != SenderProvenance::LocalIpc
+            && (self.is_peer_revoked(&src_node_id)
+                || sender_device_id.is_some_and(|device| self.is_peer_revoked(&device)))
+        {
+            return false;
+        }
         let key = EndpointKey {
             app_id,
             endpoint_id,
@@ -814,6 +839,36 @@ mod tests {
 
     fn sample_app_id() -> [u8; 32] {
         [0x55u8; 32]
+    }
+
+    #[test]
+    fn private_datagram_delivery_checks_the_sender_and_verified_signing_device() {
+        let revoked = [7; 32];
+        let admitted = [8; 32];
+        let app = sample_app_id();
+        let registry =
+            AppEndpointRegistry::new().with_peer_revocation_check(move |peer| *peer == revoked);
+        let (_handle, mut rx) = registry.register(app, 1, 8);
+        let deliver = |sender, device, provenance| {
+            registry.route_ipc_deliver_with_reply(
+                sender,
+                provenance,
+                device,
+                None,
+                [0; 32],
+                app,
+                1,
+                veil_bufpool::pooled_shared_from_vec(b"private data".to_vec()),
+                0,
+            )
+        };
+        assert!(!deliver(revoked, None, SenderProvenance::Signed));
+        assert!(!deliver(admitted, Some(revoked), SenderProvenance::Signed));
+        assert!(deliver(admitted, None, SenderProvenance::Signed));
+        assert!(deliver(revoked, None, SenderProvenance::LocalIpc));
+        assert!(matches!(rx.try_recv(), Ok(AppMessage::Deliver { .. })));
+        assert!(matches!(rx.try_recv(), Ok(AppMessage::Deliver { .. })));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

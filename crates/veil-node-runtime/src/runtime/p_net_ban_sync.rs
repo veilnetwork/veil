@@ -13,6 +13,7 @@
 use std::sync::{Arc, Mutex, RwLock};
 
 use veil_abuse::BanList;
+use veil_app::AppEndpointRegistry;
 use veil_dht::{KademliaService, NetworkAuthGate};
 use veil_identity::network_access::NetworkAccessGate;
 use veil_identity::network_ban::{
@@ -69,6 +70,14 @@ pub(super) fn configure_p_net_bans(
         sessions: Arc::clone(sessions),
         logger: Arc::clone(logger),
     }));
+}
+
+pub(super) fn guard_private_app_datagrams(
+    registry: AppEndpointRegistry,
+    ban_list: &Arc<Mutex<BanList>>,
+) -> AppEndpointRegistry {
+    let bans = Arc::clone(ban_list);
+    registry.with_peer_revocation_check(move |peer| lock!(bans).is_banned(peer))
 }
 
 /// Errors returned by [`NodeRuntime::publish_p_net_ban`].

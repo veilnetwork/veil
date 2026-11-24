@@ -249,6 +249,23 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   A separate public-mode macOS loopback test with the previous daemon
   delivered 1,000 SDK chat messages in each direction.
 
+#### Enforcing revocations on relayed application datagrams
+
+- A private node consults its local revocation list before routing a
+  new addressed application datagram and after asynchronous route or
+  key resolution. Relays check the addressed recipient. At the
+  destination, delivery checks the sender and any verified signing
+  device before handing the datagram to the application.
+- Nodes on separate isolated Linux bridge networks exchanged SDK
+  messages through a common relay in both directions. After the
+  publisher revoked one endpoint and the sending site applied the
+  record, the revoked endpoint received none of the three new probe
+  datagrams. In a four-node repeat, the two unrevoked endpoints
+  continued to exchange messages across the same relay after the ban.
+  A separate WAN check retained direct-session retirement and
+  restored the signed revocation after restart. The macOS SDK chat test
+  with the previous daemon again delivered 1,000 messages each way.
+
 ## 3. Distribute owner-authorized peer policy
 
 - Sign a versioned snapshot of virtual address assignments with the

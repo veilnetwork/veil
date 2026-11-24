@@ -172,7 +172,10 @@ soon as it verifies and stores the record. Startup and periodic checks
 also apply records from the local store. Older daemons use those checks
 and may take until their next 60 s scan. Applying a ban retires the
 peer's active sender, blocks subsequent session registration and
-reports the peer as denied over IPC.
+reports the peer as denied over IPC. A private daemon that knows the
+ban also rejects new addressed application datagrams to that peer
+before route selection. It checks relayed datagram destinations when
+forwarding and checks the sender again before local delivery.
 
 Confirm it landed on the receiving nodes:
 ```bash

@@ -501,11 +501,14 @@ impl NodeRuntime {
             Arc::new(svc)
         };
         let app_registry = Arc::new({
-            let r = AppEndpointRegistry::new().with_auto_publish(
+            let mut r = AppEndpointRegistry::new().with_auto_publish(
                 local_node_id,
                 Arc::clone(&discovery),
                 300,
             );
+            if network_gate_arc.is_some() {
+                r = super::p_net_ban_sync::guard_private_app_datagrams(r, &ban_list);
+            }
             if let Some(m) = &metrics {
                 r.with_metrics(Arc::clone(m) as Arc<dyn veil_app::AppMetrics>)
             } else {

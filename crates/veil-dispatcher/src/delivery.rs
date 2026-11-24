@@ -385,6 +385,13 @@ impl FrameDispatcher {
             Ok(p) => p,
             Err(e) => return DispatchResult::Violation(format!("bad RelayPath: {e}")),
         };
+        if payload
+            .path
+            .last()
+            .is_some_and(|recipient| self.app_registry.is_peer_revoked(recipient))
+        {
+            return DispatchResult::NoResponse;
+        }
 
         // Defence-in-depth: verify the recipient slot really points at us.
         let current = match payload.current_recipient() {
@@ -1182,6 +1189,12 @@ impl FrameDispatcher {
         carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
         lossy_retry: bool,
     ) -> DispatchResult {
+        if self
+            .app_registry
+            .is_peer_revoked(&payload.envelope.recipient_node_id())
+        {
+            return DispatchResult::NoResponse;
+        }
         let (relay_hops_out, may_retry) =
             match self.check_relay_preconditions(&payload, peer_id, lossy_retry) {
                 Ok(pass) => pass,
@@ -1485,6 +1498,9 @@ impl FrameDispatcher {
     /// in `deliver_forward_locally` (forward_seen_set) drops the duplicate at
     /// the recipient, so a retransmit re-delivers at most once per TTL window.
     fn send_delivery_ack(&self, sender: [u8; 32], content_id: [u8; 32], ack_key: [u8; 32]) {
+        if self.app_registry.is_peer_revoked(&sender) {
+            return;
+        }
         use veil_proto::{
             delivery::{DeliveryStatusPayload, delivery_status},
             family::{DeliveryMsg, FrameFamily},
@@ -1719,6 +1735,14 @@ impl FrameDispatcher {
             return; // decrypt failed — metric already incremented.
         };
         let decrypted_app_sender = decrypted.app_sender;
+        let sender = decrypted_app_sender.unwrap_or(deliver_sender_node_id);
+        if self.app_registry.is_peer_revoked(&sender)
+            || decrypted
+                .sender_device_id
+                .is_some_and(|device| self.app_registry.is_peer_revoked(&device))
+        {
+            return;
+        }
         let (app_payload, ack_key) = (decrypted.payload, decrypted.ack_key);
 
         // What do we actually know about the sender we are about to name to the
@@ -1787,7 +1811,7 @@ impl FrameDispatcher {
         // teaching the app an attacker-selected device/identity association.
         let origin_device = decrypted.sender_device_id;
         self.app_registry.route_ipc_deliver_with_reply(
-            decrypted_app_sender.unwrap_or(deliver_sender_node_id),
+            sender,
             provenance,
             None,
             origin_device,
@@ -2259,7 +2283,7 @@ impl FrameDispatcher {
             }
             return DispatchResult::NoResponse;
         }
-        if tf.ttl == 0 {
+        if tf.ttl == 0 || self.app_registry.is_peer_revoked(&tf.dst_node_id) {
             return DispatchResult::NoResponse;
         }
 
@@ -2329,6 +2353,9 @@ impl FrameDispatcher {
             Ok(f) => f,
             Err(e) => return DispatchResult::Violation(format!("bad RecursiveRelay: {e}")),
         };
+        if self.app_registry.is_peer_revoked(&rr.dst_node_id) {
+            return DispatchResult::NoResponse;
+        }
 
         // 439.2 / 461.8: dedup by (query_id, dst_node_id
         // originator_pseudonym) to prevent amplification loops. Including
@@ -2549,8 +2576,9 @@ mod tests {
     use veil_util::rlock;
 
     #[test]
-    fn forwarding_keeps_full_queues_in_the_route_cache() {
+    fn forwarding_keeps_full_queues_in_the_route_cache_and_checks_revocation() {
         use crate::{DispatchResult, make_test_dispatcher};
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, RwLock};
         use veil_proto::delivery::{DeliveryEnvelope, ForwardPayload};
         use veil_proto::family::{DeliveryMsg, FrameFamily};
@@ -2565,6 +2593,13 @@ mod tests {
         const HOP_B: [u8; 32] = [0xD2; 32];
         for (multi_path, redundant) in [(false, false), (true, false), (false, true)] {
             let mut dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+            let revoked = Arc::new(AtomicBool::new(false));
+            let check = Arc::clone(&revoked);
+            dispatcher.app_registry = Arc::new(
+                veil_app::AppEndpointRegistry::new().with_peer_revocation_check(move |peer| {
+                    peer == &DST && check.load(Ordering::Relaxed)
+                }),
+            );
             dispatcher.local_node_id = [0xDD; 32];
             dispatcher.multi_path_enabled = multi_path;
             dispatcher.multi_path_min_priority = INTERACTIVE;
@@ -2647,6 +2682,9 @@ mod tests {
             let decoded = ForwardPayload::decode(&routed[HEADER_SIZE..]).unwrap();
             assert_eq!(decoded.next_hop_node_id, HOP_A);
             assert_eq!(decoded.envelope.content_id, [3; 32]);
+            revoked.store(true, Ordering::Relaxed);
+            send(4);
+            assert!(a.try_recv().is_err());
         }
     }
 

@@ -713,11 +713,14 @@ impl NodeRuntime {
             .unwrap_or_default();
         // Clear the app endpoint registry — all local app registrations are re-established on startup.
         self.app_registry = Arc::new({
-            let r = AppEndpointRegistry::new().with_auto_publish(
+            let mut r = AppEndpointRegistry::new().with_auto_publish(
                 self.dispatcher.local_node_id,
                 Arc::clone(&self.discovery),
                 300,
             );
+            if self.network_gate.is_some() {
+                r = super::p_net_ban_sync::guard_private_app_datagrams(r, &self.ban_list);
+            }
             if let Some(m) = &self.metrics {
                 r.with_metrics(Arc::clone(m) as Arc<dyn veil_app::AppMetrics>)
             } else {
