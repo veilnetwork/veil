@@ -2,6 +2,7 @@ use super::{
     DispatchResult, FrameDispatcher, TerminalDeliveryAck,
     relay_delivery_ack::{ForwardAck, receipt_mac},
 };
+use crate::chunk_receipt::ChunkReceiptBinding;
 use veil_app::registry::SenderProvenance;
 use veil_cfg::NodeId;
 use veil_proto::{
@@ -1631,7 +1632,7 @@ impl FrameDispatcher {
         if self.is_local_delivery_recipient(&payload.envelope.recipient) {
             let reverse_peer = (carrier.is_none() && self.relay_delivery_acks.is_some())
                 .then_some(*peer_id.as_bytes());
-            self.terminal_deliver(payload.envelope, peer_id, reverse_peer);
+            self.terminal_deliver(payload.envelope, peer_id, reverse_peer, None);
             return DispatchResult::NoResponse;
         }
 
@@ -1696,6 +1697,7 @@ impl FrameDispatcher {
         envelope: DeliveryEnvelope,
         peer_id: NodeId,
         reverse_peer: Option<NodeIdBytes>,
+        chunk_receipt: Option<ChunkReceiptBinding>,
     ) {
         // Relay-chunked piece? Divert to reassembly. Only the reassembled
         // ORIGINAL envelope (payload no longer chunk-marked) proceeds below, so
@@ -1725,14 +1727,16 @@ impl FrameDispatcher {
             // replay-safe). Without this the originator burns all retransmits and
             // reports AppSendFailed for a message that WAS delivered, and the
             // loss_tracker is poisoned against a healthy hop.
-            let replay = lock!(self.terminal_ack_replay).get(&content_id).copied();
-            if let Some(ack) = replay {
+            let replay = lock!(self.terminal_ack_replay).get(&content_id).map(|ack| {
                 let previous = reverse_peer.filter(|_| {
                     envelope.require_ack
                         && ack.sender == envelope.sender_node_id()
                         && ack.envelope_hash == Some(blake3::hash(&envelope.payload))
                 });
-                self.send_delivery_ack(ack.sender, content_id, ack.key, previous);
+                (ack.sender, ack.key, previous)
+            });
+            if let Some((sender, key, previous)) = replay {
+                self.send_delivery_ack(sender, content_id, key, previous);
             }
             return;
         }
@@ -1896,6 +1900,7 @@ impl FrameDispatcher {
                         key: ack_key,
                         reverse_peer,
                         envelope_hash: reverse_peer.map(|_| blake3::hash(&envelope.payload)),
+                        chunk_receipt: reverse_peer.and(chunk_receipt),
                     },
                 );
             }
@@ -1925,7 +1930,13 @@ impl FrameDispatcher {
             }
         };
         let now = veil_util::unix_secs_now_u64();
-        let result = lock!(self.chunk_reassembler).add(&envelope, *peer_id.as_bytes(), chunk, now);
+        let (result, receipt) = lock!(self.chunk_reassembler).add_forward(
+            &envelope,
+            *peer_id.as_bytes(),
+            chunk,
+            now,
+            reverse_peer.is_some(),
+        );
         match result {
             AddChunkResult::Complete(reassembled) => {
                 if let Some(m) = &self.metrics {
@@ -1941,19 +1952,25 @@ impl FrameDispatcher {
                 );
                 // Re-enter terminal delivery; the reassembled payload is no
                 // longer chunk-marked, so it takes the normal decrypt+deliver path.
-                self.terminal_deliver(*reassembled, peer_id, reverse_peer);
+                self.terminal_deliver(*reassembled, peer_id, reverse_peer, receipt);
             }
             AddChunkResult::CompletedReplay(orig_content_id) => {
-                let replay = {
-                    lock!(self.terminal_ack_replay)
-                        .get(&orig_content_id)
-                        .copied()
-                };
-                if let Some(ack) = replay {
-                    let previous = reverse_peer.filter(|_| {
-                        reverse_peer == ack.reverse_peer && ack.sender == envelope.sender_node_id()
+                let replay = lock!(self.terminal_ack_replay)
+                    .get(&orig_content_id)
+                    .map(|ack| {
+                        let previous = reverse_peer.filter(|peer| {
+                            ack.sender == envelope.sender_node_id()
+                                && (Some(*peer) == ack.reverse_peer
+                                    || ack
+                                        .chunk_receipt
+                                        .as_ref()
+                                        .zip(receipt.as_ref())
+                                        .is_some_and(|(saved, observed)| saved.matches(observed)))
+                        });
+                        (ack.sender, ack.key, previous)
                     });
-                    self.send_delivery_ack(ack.sender, orig_content_id, ack.key, previous);
+                if let Some((sender, key, previous)) = replay {
+                    self.send_delivery_ack(sender, orig_content_id, key, previous);
                 }
             }
             AddChunkResult::Pending => {}
@@ -2692,6 +2709,119 @@ mod tests {
     use super::HopAttrs;
     use veil_cfg::NodeId;
     use veil_util::rlock;
+
+    #[test]
+    fn completed_chunks_return_an_ack_on_a_new_path_only_after_matching_the_tag() {
+        use crate::{CryptoContext, make_test_dispatcher};
+        use std::sync::{Arc, RwLock};
+        use veil_proto::delivery::{
+            ChunkedEnvelopePayload, DeliveryEnvelope, DeliveryStatusPayload, ForwardPayload,
+            delivery_status,
+        };
+        use veil_proto::family::{DeliveryMsg, FrameFamily};
+        use veil_proto::header::{FrameHeader, HEADER_SIZE};
+        use veil_proto::recipient::Recipient;
+        use veil_session::SessionTxRegistry;
+        use veil_util::wlock;
+
+        let (sender, destination, app, content) = ([1; 32], [2; 32], [3; 32], [4; 32]);
+        let (old_hop, new_hop, other_hop) = ([5; 32], [6; 32], [7; 32]);
+        let mut dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+        dispatcher.local_node_id = destination;
+        dispatcher.relay_delivery_acks = Some(Default::default());
+        let registry = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let mut old_rx = wlock!(registry).register(old_hop);
+        let mut new_rx = wlock!(registry).register(new_hop);
+        let mut other_rx = wlock!(registry).register(other_hop);
+        dispatcher.session_tx_registry = Some(registry);
+        let (_app, mut deliveries) = dispatcher.app_registry.register(app, 1, 8);
+
+        let (ek, dk) = veil_e2e::generate_keypair();
+        let plain = vec![0xA9; 4096];
+        let (encoded, key) =
+            veil_e2e::encrypt_with_ack(&ek, &sender, &destination, &plain).unwrap();
+        dispatcher.crypto = Arc::new(CryptoContext {
+            mlkem_keys: Arc::new(veil_e2e::MlKemSeedRing::new(0, dk, ek)),
+            ..(*dispatcher.crypto).clone()
+        });
+        let mut sealed = vec![veil_proto::E2E_MARKER];
+        sealed.extend(encoded.encode());
+        let boundary = sealed.len() - 5;
+        sealed.extend([0; 16]); // Legacy E2E may carry trailing padding past the tag.
+        let chunks = [&sealed[..boundary], &sealed[boundary..]];
+        let now = veil_util::unix_secs_now_u64();
+        let send = |peer, transfer, index: usize, bytes: &[u8], endpoint_id| {
+            let chunk = ChunkedEnvelopePayload {
+                transfer_id: [transfer; 16],
+                chunk_index: index as u32,
+                chunk_count: 2,
+                total_size: sealed.len() as u32,
+                orig_content_id: content,
+                require_ack: true,
+                data: bytes.to_vec(),
+            };
+            let body = ForwardPayload {
+                next_hop_node_id: destination,
+                envelope: DeliveryEnvelope {
+                    recipient: Recipient::any(destination),
+                    sender_node_id: sender,
+                    src_app_id: [9; 32],
+                    app_id: app,
+                    endpoint_id,
+                    content_id: [0x20 + index as u8; 32],
+                    created_at: now,
+                    ttl_secs: 30,
+                    payload: chunk.encode(),
+                    trace_id: 0,
+                    require_ack: false,
+                },
+                relay_hops: 1,
+                delivery_attempt: None,
+                traffic_class: None,
+            }
+            .encode();
+            let mut header =
+                FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+            header.body_len = body.len() as u32;
+            dispatcher.dispatch(&header, &body, peer);
+        };
+        send(old_hop, 1, 0, chunks[0], 1);
+        send(old_hop, 1, 1, chunks[1], 1);
+        assert!(
+            matches!(deliveries.try_recv(), Ok(veil_app::registry::AppMessage::Deliver { data, .. }) if *data == plain)
+        );
+        let original = old_rx.try_recv().unwrap().1;
+        let receipt = DeliveryStatusPayload::decode(&original[HEADER_SIZE..]).unwrap();
+        assert_eq!(receipt.status, delivery_status::RELAYED_DELIVERED);
+        assert_eq!(receipt.content_id, content);
+        assert_eq!(
+            receipt.mac,
+            *crate::relay_delivery_ack::receipt_mac(&key, &content, true).as_bytes()
+        );
+
+        send(new_hop, 1, 0, chunks[0], 1);
+        send(other_hop, 1, 1, chunks[1], 1);
+        send(new_hop, 1, 1, chunks[1], 2);
+        assert!(new_rx.try_recv().is_err());
+        assert!(other_rx.try_recv().is_err());
+        let mut altered = chunks[1].to_vec();
+        altered[0] ^= 1;
+        send(new_hop, 1, 1, &altered, 1);
+        assert!(new_rx.try_recv().is_err());
+
+        // Reassembly alone cannot mint a proof for an older receipt's ID.
+        send(other_hop, 2, 0, chunks[0], 1);
+        send(other_hop, 2, 1, &altered, 1);
+        send(new_hop, 2, 0, chunks[0], 1);
+        send(new_hop, 2, 1, &altered, 1);
+        assert!(new_rx.try_recv().is_err());
+        assert!(other_rx.try_recv().is_err());
+
+        send(new_hop, 1, 1, chunks[1], 1);
+        send(new_hop, 1, 0, chunks[0], 1);
+        assert_eq!(&*new_rx.try_recv().unwrap().1, &*original);
+        assert!(deliveries.try_recv().is_err());
+    }
 
     #[test]
     fn private_relay_ack_follows_the_admitted_neighbor_and_rearms_on_retry() {

@@ -53,6 +53,7 @@ use veil_session::tx_registry::SessionTxRegistry;
 pub mod anonymity;
 pub mod app;
 pub mod auth_trace;
+pub mod chunk_receipt;
 pub mod control;
 pub mod delivery;
 pub mod diag;
@@ -644,12 +645,12 @@ impl<K: Hash + Eq + Copy + Ord, V> ExpiryMap<K, V> {
 }
 
 /// Evidence retained by the recipient to re-issue a lost delivery ACK.
-#[derive(Clone, Copy)]
 pub struct TerminalDeliveryAck {
     sender: NodeIdBytes,
     key: [u8; 32],
     reverse_peer: Option<NodeIdBytes>,
     envelope_hash: Option<blake3::Hash>,
+    chunk_receipt: Option<chunk_receipt::ChunkReceiptBinding>,
 }
 
 pub type TerminalAckReplay = Arc<Mutex<ExpiryMap<[u8; 32], TerminalDeliveryAck>>>;

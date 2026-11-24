@@ -309,9 +309,21 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 - Deployments with a previous daemon at the origin or at the relay
   continued to deliver application messages. A mixed-version macOS SDK
   chat session delivered 1,000 messages in each direction.
-- A completed chunk transfer can re-issue its cached receipt through
-  its recorded previous hop. Replaying the receipt when the retry reaches
-  the recipient through a different last hop remains open.
+- A new last hop can return a cached receipt for a completed chunked
+  transfer after carrying the original 16-byte authentication tag. When
+  the tag spans several chunks, all pieces must arrive from the same
+  authenticated neighbor. The recipient matches the proof to the transfer
+  it already decrypted. It retains a tag hash and bounded partial tags
+  for this check. Retries use the existing wire format.
+- On a four-node Linux stand, the first receipt for a 150,000-byte message
+  was blocked and the original relay stopped. The sender received the
+  receipt through a backup relay after one retry, 5.8 seconds after the
+  send. The application received the payload once. The previous daemon
+  also delivered the payload once and made two retries without a receipt.
+- Routes that converge on the same downstream link still need separate
+  coverage. A relay with an outstanding receipt can retain the previous
+  upstream peer when the same chunked transfer re-enters through another
+  neighbor.
 
 ## 3. Distribute owner-authorized peer policy
 

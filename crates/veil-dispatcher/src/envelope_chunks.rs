@@ -20,6 +20,8 @@ use std::collections::HashMap;
 use veil_proto::budget::{CHUNK_REASSEMBLY_TTL_SECS, MAX_REASSEMBLY_BYTES};
 use veil_proto::delivery::{ChunkedEnvelopePayload, DeliveryEnvelope, TransferId};
 
+use crate::chunk_receipt::{ChunkReceiptBinding, ChunkReceiptReplay};
+
 /// Cap on simultaneously-tracked chunked transfers. Bounds the reassembler's
 /// HashMap so a flood of distinct `transfer_id`s with a single chunk each cannot
 /// grow memory without bound. New transfers beyond this are dropped until an
@@ -102,6 +104,7 @@ struct TransferState {
 struct CompletedTransfer {
     orig_content_id: [u8; 32],
     deadline: u64,
+    receipt: Option<Box<ChunkReceiptReplay>>,
 }
 
 // Reliable direct application data and encrypted delivery envelopes must not
@@ -145,7 +148,18 @@ impl EnvelopeChunkReassembler {
         chunk: ChunkedEnvelopePayload,
         now: u64,
     ) -> AddChunkResult {
-        self.add_scoped(envelope, peer_id, chunk, now, None)
+        self.add_forward(envelope, peer_id, chunk, now, false).0
+    }
+
+    pub(crate) fn add_forward(
+        &mut self,
+        envelope: &DeliveryEnvelope,
+        peer_id: [u8; 32],
+        chunk: ChunkedEnvelopePayload,
+        now: u64,
+        track_receipt: bool,
+    ) -> (AddChunkResult, Option<ChunkReceiptBinding>) {
+        self.add_scoped(envelope, peer_id, chunk, now, None, track_receipt)
     }
 
     /// Typed direct AppSend bytes: scoped to the authenticated device and never
@@ -157,7 +171,8 @@ impl EnvelopeChunkReassembler {
         chunk: ChunkedEnvelopePayload,
         now: u64,
     ) -> AddChunkResult {
-        self.add_scoped(envelope, peer_id, chunk, now, Some(peer_id))
+        self.add_scoped(envelope, peer_id, chunk, now, Some(peer_id), false)
+            .0
     }
 
     fn add_scoped(
@@ -167,7 +182,8 @@ impl EnvelopeChunkReassembler {
         chunk: ChunkedEnvelopePayload,
         now: u64,
         direct_peer: Option<[u8; 32]>,
-    ) -> AddChunkResult {
+        track_receipt: bool,
+    ) -> (AddChunkResult, Option<ChunkReceiptBinding>) {
         let key = (direct_peer, chunk.transfer_id);
         // Opportunistic eviction of timed-out partials on each add.
         self.evict_expired(now);
@@ -182,18 +198,31 @@ impl EnvelopeChunkReassembler {
                 .created_at
                 .saturating_add(u64::from(envelope.ttl_secs));
             if now > expires_at {
-                return AddChunkResult::Rejected("expired chunk envelope");
+                return (AddChunkResult::Rejected("expired chunk envelope"), None);
             }
             replay_deadline.min(expires_at)
         } else {
             replay_deadline
         };
 
-        if let Some(done) = self.completed.get(&key) {
+        if let Some(done) = self.completed.get_mut(&key) {
             return if done.orig_content_id == chunk.orig_content_id {
-                AddChunkResult::CompletedReplay(done.orig_content_id)
+                let binding = if track_receipt {
+                    done.receipt
+                        .as_mut()
+                        .and_then(|receipt| receipt.observe(envelope, &chunk, peer_id, now))
+                } else {
+                    None
+                };
+                (
+                    AddChunkResult::CompletedReplay(done.orig_content_id),
+                    binding,
+                )
             } else {
-                AddChunkResult::Rejected("completed transfer metadata mismatch")
+                (
+                    AddChunkResult::Rejected("completed transfer metadata mismatch"),
+                    None,
+                )
             };
         }
 
@@ -201,13 +230,19 @@ impl EnvelopeChunkReassembler {
             // New transfer — enforce concurrency + global byte caps before
             // allocating the per-chunk vector.
             if self.transfers.len() >= MAX_CONCURRENT_TRANSFERS {
-                return AddChunkResult::Rejected("too many concurrent transfers");
+                return (
+                    AddChunkResult::Rejected("too many concurrent transfers"),
+                    None,
+                );
             }
             // `decode` already validated chunk_count (1..=MAX_TRANSFER_CHUNKS),
             // chunk_index < chunk_count, total_size <= MAX_REASSEMBLY_BYTES, and
             // data.len() <= MAX_CHUNK_PAYLOAD.
             if self.total_buffered.saturating_add(chunk.data.len()) > MAX_REASSEMBLY_BYTES {
-                return AddChunkResult::Rejected("global reassembly budget exceeded");
+                return (
+                    AddChunkResult::Rejected("global reassembly budget exceeded"),
+                    None,
+                );
             }
             // Per-sender sub-quota (fairness / partial-DoS): one peer must not be
             // able to occupy all global slots/bytes and starve reassembly for
@@ -216,17 +251,29 @@ impl EnvelopeChunkReassembler {
             let sender = envelope.sender_node_id;
             let (sender_transfers, sender_bytes) = self.usage(|s| s.sender_node_id == sender);
             if sender_transfers >= MAX_TRANSFERS_PER_SENDER {
-                return AddChunkResult::Rejected("per-sender transfer quota exceeded");
+                return (
+                    AddChunkResult::Rejected("per-sender transfer quota exceeded"),
+                    None,
+                );
             }
             if sender_bytes.saturating_add(chunk.data.len()) > MAX_REASSEMBLY_BYTES_PER_SENDER {
-                return AddChunkResult::Rejected("per-sender reassembly byte quota exceeded");
+                return (
+                    AddChunkResult::Rejected("per-sender reassembly byte quota exceeded"),
+                    None,
+                );
             }
             let (peer_transfers, peer_bytes) = self.usage(|s| s.peer_id == peer_id);
             if peer_transfers >= MAX_TRANSFERS_PER_PEER {
-                return AddChunkResult::Rejected("per-peer transfer quota exceeded");
+                return (
+                    AddChunkResult::Rejected("per-peer transfer quota exceeded"),
+                    None,
+                );
             }
             if peer_bytes.saturating_add(chunk.data.len()) > MAX_REASSEMBLY_BYTES_PER_PEER {
-                return AddChunkResult::Rejected("per-peer reassembly byte quota exceeded");
+                return (
+                    AddChunkResult::Rejected("per-peer reassembly byte quota exceeded"),
+                    None,
+                );
             }
             let mut received = vec![None; chunk.chunk_count as usize];
             let data_len = chunk.data.len();
@@ -253,7 +300,7 @@ impl EnvelopeChunkReassembler {
                 },
             );
             // A 1-chunk transfer completes immediately.
-            return self.try_complete(&key);
+            return self.try_complete(&key, track_receipt);
         }
 
         let state = self.transfers.get(&key).expect("checked present above");
@@ -269,17 +316,23 @@ impl EnvelopeChunkReassembler {
             || envelope.app_id != state.app_id
             || envelope.endpoint_id != state.endpoint_id
         {
-            return AddChunkResult::Rejected("inconsistent chunk metadata");
+            return (
+                AddChunkResult::Rejected("inconsistent chunk metadata"),
+                None,
+            );
         }
         let idx = chunk.chunk_index as usize;
         if idx >= state.received.len() {
-            return AddChunkResult::Rejected("chunk_index out of range");
+            return (AddChunkResult::Rejected("chunk_index out of range"), None);
         }
         if state.received[idx].is_some() {
-            return AddChunkResult::Rejected("duplicate chunk");
+            return (AddChunkResult::Rejected("duplicate chunk"), None);
         }
         if self.total_buffered.saturating_add(chunk.data.len()) > MAX_REASSEMBLY_BYTES {
-            return AddChunkResult::Rejected("global reassembly budget exceeded");
+            return (
+                AddChunkResult::Rejected("global reassembly budget exceeded"),
+                None,
+            );
         }
         // The per-sender and per-peer byte quotas have to hold on EVERY
         // insertion, not just the one that creates the transfer. Checking them
@@ -295,18 +348,24 @@ impl EnvelopeChunkReassembler {
         let data_len = chunk.data.len();
         let (_, sender_bytes) = self.usage(|s| s.sender_node_id == owner.0);
         if sender_bytes.saturating_add(data_len) > MAX_REASSEMBLY_BYTES_PER_SENDER {
-            return AddChunkResult::Rejected("per-sender reassembly byte quota exceeded");
+            return (
+                AddChunkResult::Rejected("per-sender reassembly byte quota exceeded"),
+                None,
+            );
         }
         let (_, peer_bytes) = self.usage(|s| s.peer_id == owner.1);
         if peer_bytes.saturating_add(data_len) > MAX_REASSEMBLY_BYTES_PER_PEER {
-            return AddChunkResult::Rejected("per-peer reassembly byte quota exceeded");
+            return (
+                AddChunkResult::Rejected("per-peer reassembly byte quota exceeded"),
+                None,
+            );
         }
         let state = self.transfers.get_mut(&key).expect("checked present above");
         state.received[idx] = Some(chunk.data);
         state.received_count += 1;
         state.received_bytes += data_len;
         self.total_buffered += data_len;
-        self.try_complete(&key)
+        self.try_complete(&key, track_receipt)
     }
 
     /// Test shim for the same-hop case where the carrying peer IS the sender,
@@ -336,27 +395,41 @@ impl EnvelopeChunkReassembler {
 
     /// If `transfer_id` has all chunks, concatenate them, validate the total
     /// size, remove the state, and return the reconstructed original envelope.
-    fn try_complete(&mut self, transfer_id: &TransferKey) -> AddChunkResult {
+    fn try_complete(
+        &mut self,
+        transfer_id: &TransferKey,
+        track_receipt: bool,
+    ) -> (AddChunkResult, Option<ChunkReceiptBinding>) {
         let Some(state) = self.transfers.get(transfer_id) else {
-            return AddChunkResult::Pending;
+            return (AddChunkResult::Pending, None);
         };
         if state.received_count != state.chunk_count {
-            return AddChunkResult::Pending;
+            return (AddChunkResult::Pending, None);
         }
         if state.received_bytes != state.total_size as usize {
             // Reassembled size disagrees with the advertised total — drop it.
             let removed = self.transfers.remove(transfer_id).expect("present");
             self.total_buffered = self.total_buffered.saturating_sub(removed.received_bytes);
-            return AddChunkResult::Rejected("reassembled size != total_size");
+            return (
+                AddChunkResult::Rejected("reassembled size != total_size"),
+                None,
+            );
         }
         let state = self.transfers.remove(transfer_id).expect("present");
         self.total_buffered = self.total_buffered.saturating_sub(state.received_bytes);
         let completion_deadline = state.replay_deadline;
 
+        let mut chunk_lengths =
+            (track_receipt && state.require_ack && state.orig_content_id != [0; 32])
+                .then(|| Vec::with_capacity(state.received.len()));
         let mut payload = Vec::with_capacity(state.total_size as usize);
         for piece in state.received.into_iter() {
             // All Some: received_count == chunk_count == received.len().
-            payload.extend_from_slice(&piece.expect("all chunks present"));
+            let piece = piece.expect("all chunks present");
+            if let Some(lengths) = &mut chunk_lengths {
+                lengths.push(piece.len());
+            }
+            payload.extend_from_slice(&piece);
         }
 
         let orig_content_id = state.orig_content_id;
@@ -373,6 +446,10 @@ impl EnvelopeChunkReassembler {
             trace_id: 0,
             require_ack: state.require_ack,
         };
+        let receipt = chunk_lengths.and_then(|lengths| {
+            ChunkReceiptReplay::new(&envelope, &lengths, state.deadline).map(Box::new)
+        });
+        let receipt_binding = receipt.as_ref().map(|receipt| receipt.binding.clone());
         if self.completed.len() >= MAX_COMPLETED_TRANSFERS
             && let Some(oldest) = self
                 .completed
@@ -387,9 +464,13 @@ impl EnvelopeChunkReassembler {
             CompletedTransfer {
                 orig_content_id,
                 deadline: completion_deadline,
+                receipt,
             },
         );
-        AddChunkResult::Complete(Box::new(envelope))
+        (
+            AddChunkResult::Complete(Box::new(envelope)),
+            receipt_binding,
+        )
     }
 
     /// Drop-in eviction sweep using the current wall clock — called from the
