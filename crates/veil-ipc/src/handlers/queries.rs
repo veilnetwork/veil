@@ -11,8 +11,10 @@
 //! default (empty list / zero-state payload / `INTERNAL_ERROR`) so apps
 //! see "feature off" cleanly rather than a protocol error.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use veil_abuse::rate_limiter::TokenBucket;
+use veil_proto::ipc::{PNET_ADMISSION_BATCH_MAX_PEERS, PnetAdmission};
 use veil_proto::{
     CreateBootstrapInvitePayload, CreateBootstrapInviteResultPayload, FrameFamily,
     JoinBootstrapPayload, JoinBootstrapResultPayload, LocalAppMsg, LookupRelayKeyPayload,
@@ -27,7 +29,7 @@ use veil_proto::{
     pair_source_status, pair_target_status,
 };
 
-use crate::frame_io::write_frame_wh;
+use crate::frame_io::{write_frame_wh, write_frame_wh_id};
 use crate::server::IpcClientState;
 use crate::transport::IpcWriteHalf;
 use crate::{
@@ -200,11 +202,69 @@ pub(crate) async fn handle_listen_transports_query(
     .await
 }
 
+pub(crate) struct PnetStatusQueries {
+    provider: Arc<dyn PnetStatusProvider>,
+    batch_budget: Mutex<TokenBucket>,
+}
+
+impl PnetStatusQueries {
+    pub(crate) fn new(provider: Arc<dyn PnetStatusProvider>) -> Self {
+        Self {
+            provider,
+            // Independent of older IPC operations. Count peer lookups across
+            // all clients so opening more connections cannot multiply work.
+            batch_budget: Mutex::new(TokenBucket::new(1_024.0, 4_096.0)),
+        }
+    }
+
+    pub(crate) async fn reply_admission_batch(
+        &self,
+        wh: &mut IpcWriteHalf,
+        request_id: u32,
+        body: &[u8],
+        client_state: &mut IpcClientState,
+    ) -> std::io::Result<()> {
+        let (peers, remainder) = body.as_chunks::<32>();
+        if request_id == 0
+            || !remainder.is_empty()
+            || peers.is_empty()
+            || peers.len() > PNET_ADMISSION_BATCH_MAX_PEERS
+            || !client_state.allow_query()
+            || !veil_util::lock!(self.batch_budget)
+                .allow_n_at(peers.len() as f64, std::time::Instant::now())
+        {
+            return Ok(());
+        }
+        let now = veil_util::unix_secs_now_u64();
+        let mut reply = Vec::with_capacity(peers.len() * PnetAdmission::WIRE_SIZE);
+        for peer in peers {
+            let status = self.provider.peer_status(peer);
+            let admitted = status.peer_node_id == *peer
+                && status.has_cert
+                && status.admitted
+                && (status.valid_until_unix == 0 || (now != 0 && now < status.valid_until_unix));
+            let entry = PnetAdmission {
+                peer_node_id: *peer,
+                valid_until_unix: admitted.then_some(status.valid_until_unix),
+            };
+            reply.extend_from_slice(&entry.encode());
+        }
+        write_frame_wh_id(
+            wh,
+            FrameFamily::LocalApp as u8,
+            LocalAppMsg::PnetAdmissionBatchResult as u16,
+            request_id,
+            &reply,
+        )
+        .await
+    }
+}
+
 pub(crate) async fn handle_pnet_status_query(
     wh: &mut IpcWriteHalf,
     body: &[u8],
     client_state: &mut IpcClientState,
-    pnet_status_provider: Option<&Arc<dyn PnetStatusProvider>>,
+    pnet_status_queries: Option<&PnetStatusQueries>,
 ) -> std::io::Result<()> {
     if !client_state.allow_query() {
         return Ok(());
@@ -215,8 +275,8 @@ pub(crate) async fn handle_pnet_status_query(
     let peer_node_id: [u8; 32] = body.try_into().unwrap_or_default();
     // Without a provider, all queries reply admitted=false / has_cert=false.
     // Apps in strict p_net mode treat this as "no daemon support" → reject.
-    let payload = pnet_status_provider
-        .map(|p| p.peer_status(&peer_node_id))
+    let payload = pnet_status_queries
+        .map(|queries| queries.provider.peer_status(&peer_node_id))
         .unwrap_or_else(|| veil_proto::PnetStatusResultPayload {
             admitted: false,
             has_cert: false,

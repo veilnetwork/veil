@@ -175,7 +175,7 @@ impl SharedState {
 
 const PNET_REFRESH_PERIOD: Duration = Duration::from_secs(5);
 const PNET_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
-const PNET_QUERY_BATCH: usize = 16;
+const PNET_LEGACY_QUERY_GROUP: usize = 16;
 // Daemons admit 10 local queries per second per IPC client. Leave room for
 // other local queries and avoid consuming the burst quota at startup.
 const PNET_QUERY_SPACING: Duration = Duration::from_millis(125);
@@ -187,42 +187,73 @@ fn pnet_status_admits(peer: &NodeId, status: &PnetStatus, now: u64) -> bool {
         && (status.valid_until_unix == 0 || (now != 0 && now < status.valid_until_unix))
 }
 
-async fn pnet_admissions(
-    peers: &[(NodeId, [u8; 32])],
+async fn connect_pnet_status(
     socket: &Path,
     expected_node: NodeId,
-    connection: &mut Option<Arc<VeilClient>>,
     pace: &mut tokio::time::Interval,
-) -> HashMap<NodeId, u64> {
-    if peers.is_empty() {
-        return HashMap::new();
-    }
-    if connection.is_none() {
-        pace.tick().await;
-        let connect = async {
-            let client = VeilClient::connect(socket)
-                .await
-                .map_err(BridgeError::client)?;
-            let identity = client.node_identity().await.map_err(BridgeError::client)?;
-            if identity.node_id != expected_node {
-                return Err(BridgeError::IdentityChanged);
-            }
-            Ok(client)
-        };
-        match tokio::time::timeout(PNET_QUERY_TIMEOUT, connect).await {
-            Ok(Ok(client)) => *connection = Some(Arc::new(client)),
-            Ok(Err(error)) => {
-                tracing::debug!(%error, "P-Net status connection failed");
-                return HashMap::new();
-            }
-            Err(_) => {
-                tracing::debug!("P-Net status connection timed out");
-                return HashMap::new();
-            }
+) -> Option<Arc<VeilClient>> {
+    pace.tick().await;
+    let connect = async {
+        let client = VeilClient::connect(socket)
+            .await
+            .map_err(BridgeError::client)?;
+        let identity = client.node_identity().await.map_err(BridgeError::client)?;
+        if identity.node_id != expected_node {
+            return Err(BridgeError::IdentityChanged);
+        }
+        Ok(client)
+    };
+    match tokio::time::timeout(PNET_QUERY_TIMEOUT, connect).await {
+        Ok(Ok(client)) => Some(Arc::new(client)),
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "P-Net status connection failed");
+            None
+        }
+        Err(_) => {
+            tracing::debug!("P-Net status connection timed out");
+            None
         }
     }
+}
 
-    let client = connection.as_ref().expect("status connection established");
+async fn query_pnet_batch(
+    client: &VeilClient,
+    peers: &[(NodeId, [u8; 32])],
+    pace: &mut tokio::time::Interval,
+) -> Option<HashMap<NodeId, u64>> {
+    let ids: Vec<_> = peers.iter().map(|(node_id, _)| *node_id).collect();
+    pace.tick().await;
+    let reply = tokio::time::timeout(PNET_QUERY_TIMEOUT, client.peer_pnet_admissions(&ids)).await;
+    match reply {
+        Ok(Ok(entries)) => {
+            let now = unix_secs_now_u64();
+            Some(
+                entries
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let expiry = entry.valid_until_unix?;
+                        (expiry == 0 || (now != 0 && now < expiry))
+                            .then_some((entry.peer_node_id, expiry))
+                    })
+                    .collect(),
+            )
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "P-Net admission batch failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("P-Net admission batch timed out");
+            None
+        }
+    }
+}
+
+async fn query_pnet_legacy(
+    client: &Arc<VeilClient>,
+    peers: &[(NodeId, [u8; 32])],
+    pace: &mut tokio::time::Interval,
+) -> (HashMap<NodeId, u64>, bool) {
     let mut queries = tokio::task::JoinSet::new();
     for &(peer, _) in peers {
         pace.tick().await;
@@ -265,13 +296,9 @@ async fn pnet_admissions(
             }
         }
     }
-    // Some daemons send zero request IDs for this query and the SDK then
-    // dispatches replies in order. Never let an abandoned reply on that
-    // connection answer a later sweep for the same peer.
-    if uncertain {
-        *connection = None;
-    }
-    admitted
+    // The caller resets this connection on failure. Some daemons send zero
+    // IDs here, so an abandoned reply must never answer a later sweep.
+    (admitted, uncertain)
 }
 
 fn publish_routes(candidate: SharedState, state: &ArcSwap<SharedState>, route_changes: &Notify) {
@@ -986,16 +1013,49 @@ async fn maintain_routes(
             refresh.reset();
         }
 
-        let end = (next_peer + PNET_QUERY_BATCH).min(configured.peer_app_ids.len());
+        if configured.peer_app_ids.is_empty() {
+            continue;
+        }
+        if connection.is_none() {
+            connection = connect_pnet_status(&config.socket_path, expected_node, &mut pace).await;
+        }
+        let end;
+        let results;
+        if let Some(client) = &connection {
+            if client.supports_pnet_admission_batch() {
+                end = (next_peer + veilclient::PNET_ADMISSION_BATCH_MAX_PEERS)
+                    .min(configured.peer_app_ids.len());
+                results =
+                    query_pnet_batch(client, &configured.peer_app_ids[next_peer..end], &mut pace)
+                        .await;
+            } else {
+                end = (next_peer + PNET_LEGACY_QUERY_GROUP).min(configured.peer_app_ids.len());
+                let (legacy_results, uncertain) =
+                    query_pnet_legacy(client, &configured.peer_app_ids[next_peer..end], &mut pace)
+                        .await;
+                if uncertain {
+                    connection = None;
+                }
+                results = Some(legacy_results);
+            }
+        } else {
+            end = 0;
+            results = None;
+        }
+        let Some(mut results) = results else {
+            connection = None;
+            next_peer = 0;
+            if !admitted.is_empty() {
+                admitted.clear();
+                publish_routes(
+                    configured.with_pnet_admissions(&admitted),
+                    &state,
+                    &route_changes,
+                );
+            }
+            continue;
+        };
         let group = &configured.peer_app_ids[next_peer..end];
-        let mut results = pnet_admissions(
-            group,
-            &config.socket_path,
-            expected_node,
-            &mut connection,
-            &mut pace,
-        )
-        .await;
         let mut changed = false;
         for (peer, _) in group {
             match results.remove(peer) {
@@ -1275,6 +1335,14 @@ mod tests {
 
     #[tokio::test]
     async fn pnet_routes_follow_daemon_admission_without_reload() {
+        tokio::join!(
+            exercise_pnet_sweep(34),
+            exercise_pnet_sweep(256),
+            exercise_pnet_sweep(1024),
+        );
+    }
+
+    async fn exercise_pnet_sweep(peer_count: u16) {
         use std::sync::atomic::{AtomicBool, Ordering};
         use veil_ipc::{IpcEndpoint, IpcServer, PnetStatusProvider};
         use veil_proto::PnetStatusResultPayload;
@@ -1328,17 +1396,20 @@ mod tests {
         config.socket_path = socket.clone();
         config.mode = AccessMode::Open;
         config.pnet_required = true;
-        // Exceed the daemon's 30-query burst cap. All configured peers
-        // must converge through one IPC connection.
-        for host in 3..=35 {
+        config.prefix_v4 = 16;
+        for host in 3..=peer_count + 1 {
+            let [hi, lo] = host.to_be_bytes();
+            let mut id = [0; 32];
+            id[..2].copy_from_slice(&[hi, lo]);
             config.peers.push(PeerEntry {
-                node_id: hex::encode([host; 32]),
-                addr_v4: Some(Ipv4Addr::new(10, 99, 0, host)),
+                node_id: hex::encode(id),
+                addr_v4: Some(Ipv4Addr::new(10, 99, hi, lo)),
                 addr_v6: None,
                 name: None,
             });
         }
-        let peer_count = config.peers.len();
+        let peer_count = usize::from(peer_count);
+        assert_eq!(config.peers.len(), peer_count);
         let configured = SharedState::build(&config).unwrap();
         let initial = configured.with_pnet_admissions(&HashMap::new());
         let state = Arc::new(ArcSwap::from_pointee(initial));
@@ -1357,14 +1428,16 @@ mod tests {
             Arc::clone(&changed),
         ));
 
+        let started = std::time::Instant::now();
         admission.live.store(true, Ordering::Relaxed);
-        tokio::time::timeout(Duration::from_secs(12), async {
+        tokio::time::timeout(Duration::from_secs(4), async {
             while state.load().table.peer_count() != peer_count {
                 changed.notified().await;
             }
         })
         .await
-        .expect("configured peers did not converge within the existing IPC quota");
+        .expect("admission batches did not converge within the local query quota");
+        let admission_elapsed = started.elapsed();
         assert_eq!(
             state.load().table.lookup_egress(address),
             Decision::Forward(peer)
@@ -1374,14 +1447,19 @@ mod tests {
             Decision::Forward(peer)
         );
 
+        let revoked = std::time::Instant::now();
         admission.live.store(false, Ordering::Relaxed);
-        tokio::time::timeout(Duration::from_secs(12), async {
+        tokio::time::timeout(Duration::from_secs(8), async {
             while state.load().table.peer_count() != 0 {
                 changed.notified().await;
             }
         })
         .await
         .expect("peer routes survived loss of session");
+        eprintln!(
+            "{peer_count} peers: admitted in {admission_elapsed:.3?}, withdrawn in {:.3?}",
+            revoked.elapsed()
+        );
         assert_eq!(state.load().table.lookup_egress(address), Decision::NoRoute);
         assert_eq!(
             state.load().table.lookup_ingress(&peer, Some(address)),
@@ -1391,24 +1469,33 @@ mod tests {
         updates.abort();
         assert!(updates.await.unwrap_err().is_cancelled());
 
-        // A legacy reply can have no request ID. A reply for the wrong peer
-        // must close the query connection before it can be reused.
         let group = [(peer, [0u8; 32])];
-        let mut connection = None;
         let mut pace = tokio::time::interval(PNET_QUERY_SPACING);
+        let client = connect_pnet_status(&socket, [0x01; 32], &mut pace)
+            .await
+            .unwrap();
+        assert!(client.supports_pnet_admission_batch());
         admission.live.store(true, Ordering::Relaxed);
         admission.wrong_peer.store(true, Ordering::Relaxed);
-        let mismatched =
-            pnet_admissions(&group, &socket, [0x01; 32], &mut connection, &mut pace).await;
-        assert!(mismatched.is_empty());
-        assert!(connection.is_none());
+        // A provider mismatch cannot authorize the wrong peer on either path.
+        assert!(
+            query_pnet_batch(&client, &group, &mut pace)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let (legacy, uncertain) = query_pnet_legacy(&client, &group, &mut pace).await;
+        assert!(legacy.is_empty() && uncertain);
+        drop(client);
 
         admission.wrong_peer.store(false, Ordering::Relaxed);
-        let fresh = pnet_admissions(&group, &socket, [0x01; 32], &mut connection, &mut pace).await;
+        let client = connect_pnet_status(&socket, [0x01; 32], &mut pace)
+            .await
+            .unwrap();
+        let fresh = query_pnet_batch(&client, &group, &mut pace).await.unwrap();
         assert_eq!(fresh.get(&peer), Some(&0));
-        assert!(connection.is_some());
 
-        drop(connection);
+        drop(client);
         stop.send(true).unwrap();
         server.await.unwrap();
     }

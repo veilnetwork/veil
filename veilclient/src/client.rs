@@ -818,7 +818,13 @@ pub(crate) async fn run_writer_task<W: tokio::io::AsyncWrite + Unpin>(
 /// the verified key together with the moment it stops being the relay's.
 pub type PendingRelayKey = (u32, tokio::sync::oneshot::Sender<Option<([u8; 32], u64)>>);
 
+type PendingPnetAdmissionBatch = (
+    u32,
+    tokio::sync::oneshot::Sender<Result<Vec<crate::PnetAdmission>, ClientError>>,
+);
+
 pub struct VeilClient {
+    pnet_admission_batch: bool,
     /// Shared write half — cloned by each `AppHandle`.
     pub(crate) writer: SharedWriter,
     /// Dispatch table: `endpoint_id` → message sender.
@@ -880,6 +886,7 @@ pub(crate) struct DispatchTable {
     /// S2.A: pending oneshot replies for `PnetStatusQuery`.
     pub pending_pnet_status:
         std::collections::VecDeque<(u32, tokio::sync::oneshot::Sender<PnetStatus>)>,
+    pending_pnet_admission_batches: std::collections::VecDeque<PendingPnetAdmissionBatch>,
     pub pending_local_preparation: std::collections::VecDeque<(
         u32,
         tokio::sync::oneshot::Sender<Option<veil_proto::ipc::LocalDatagramChannelState>>,
@@ -1074,6 +1081,7 @@ impl DispatchTable {
             pending_node_identity: std::collections::VecDeque::new(),
             pending_peers_list: std::collections::VecDeque::new(),
             pending_pnet_status: std::collections::VecDeque::new(),
+            pending_pnet_admission_batches: std::collections::VecDeque::new(),
             pending_local_preparation: std::collections::VecDeque::new(),
             pending_listen_transports: std::collections::VecDeque::new(),
             pending_attempt_hole_punch: std::collections::VecDeque::new(),
@@ -1149,7 +1157,8 @@ impl VeilClient {
                 | veilcore::proto::ipc::IPC_CAP_LOCAL_SOURCE_GROWTH_HOLD
                 | veilcore::proto::ipc::IPC_CAP_LOCAL_SOURCE_RECOVERY_PROBE
                 | veilcore::proto::ipc::IPC_CAP_LOCAL_LOSSY_WORK
-                | veilcore::proto::ipc::IPC_CAP_LOCAL_DATAGRAM_PREPARATION,
+                | veilcore::proto::ipc::IPC_CAP_LOCAL_DATAGRAM_PREPARATION
+                | veil_proto::ipc::IPC_CAP_PNET_ADMISSION_BATCH,
         };
         tokio::time::timeout(
             timeout,
@@ -1230,6 +1239,8 @@ impl VeilClient {
             writer,
             dispatch,
             client_token: ok.client_token,
+            pnet_admission_batch: hdr.flags & veil_proto::ipc::IPC_HELLO_OK_PNET_ADMISSION_BATCH
+                != 0,
             reader_task: Some(reader_task_handle),
         })
     }
@@ -2370,6 +2381,62 @@ impl VeilClient {
         await_rpc_reply(rx, "pnet_status reply").await
     }
 
+    /// Whether this IPC connection negotiated private admission batches.
+    pub fn supports_pnet_admission_batch(&self) -> bool {
+        self.pnet_admission_batch
+    }
+
+    /// Check private admissions in order for a bounded list of explicit peer IDs.
+    /// Results carry only membership admission and expiry. Legacy nodes can
+    /// still be queried with [`Self::peer_pnet_status`].
+    pub async fn peer_pnet_admissions(
+        &self,
+        peers: &[[u8; 32]],
+    ) -> Result<Vec<crate::PnetAdmission>, ClientError> {
+        if !self.supports_pnet_admission_batch() {
+            return Err(ClientError::Protocol(
+                "P-Net admission batches were not negotiated".into(),
+            ));
+        }
+        if peers.is_empty() || peers.len() > crate::PNET_ADMISSION_BATCH_MAX_PEERS {
+            return Err(ClientError::Protocol(
+                "invalid P-Net admission batch size".into(),
+            ));
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = self.writer.alloc_request_id();
+        {
+            let mut dispatch = self.dispatch.lock().await;
+            let pending = &mut dispatch.pending_pnet_admission_batches;
+            prune_closed(pending);
+            if pending.len() >= MAX_PENDING_OPS {
+                return Err(ClientError::Protocol(
+                    "P-Net admission batch queue is full".into(),
+                ));
+            }
+            pending.push_back((request_id, tx));
+        }
+        self.writer
+            .write_request_frame(
+                LocalAppMsg::PnetAdmissionBatchQuery as u16,
+                request_id,
+                peers.as_flattened(),
+            )
+            .await?;
+        let reply = await_rpc_reply(rx, "P-Net admission batch reply").await??;
+        if reply.len() != peers.len()
+            || reply
+                .iter()
+                .zip(peers)
+                .any(|(entry, peer)| &entry.peer_node_id != peer)
+        {
+            return Err(ClientError::Protocol(
+                "P-Net admission batch did not match the request".into(),
+            ));
+        }
+        Ok(reply)
+    }
+
     /// Prepare an owned local producer without sending application data.
     /// None means the node's local query quota asks the caller to retry.
     /// Unsupported also covers legacy nodes/links; it must not imply readiness.
@@ -3204,6 +3271,25 @@ pub struct NodeIdentity {
 
 // ── Reader task ───────────────────────────────────────────────────────────────
 
+fn decode_pnet_admission_batch(body: &[u8]) -> Result<Vec<crate::PnetAdmission>, ClientError> {
+    use crate::{PNET_ADMISSION_BATCH_MAX_PEERS, PnetAdmission};
+    let (entries, remainder) = body.as_chunks::<{ PnetAdmission::WIRE_SIZE }>();
+    if !remainder.is_empty() || entries.is_empty() || entries.len() > PNET_ADMISSION_BATCH_MAX_PEERS
+    {
+        return Err(ClientError::Protocol(
+            "invalid P-Net admission response size".into(),
+        ));
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            PnetAdmission::decode(entry).ok_or_else(|| {
+                ClientError::Protocol("invalid P-Net admission response entry".into())
+            })
+        })
+        .collect()
+}
+
 async fn reader_task(
     mut rh: IpcReadHalf,
     dispatch: Arc<Mutex<DispatchTable>>,
@@ -3502,6 +3588,17 @@ async fn reader_task(
                     if let Some(tx) = take_pending(&mut d.pending_pnet_status, hdr.request_id) {
                         let _ = tx.send(status);
                     }
+                }
+            }
+            LocalAppMsg::PnetAdmissionBatchResult
+                if hdr.family == FrameFamily::LocalApp as u8 && hdr.request_id != 0 =>
+            {
+                let waiter = {
+                    let mut dispatch = dispatch.lock().await;
+                    take_pending(&mut dispatch.pending_pnet_admission_batches, hdr.request_id)
+                };
+                if let Some(tx) = waiter {
+                    let _ = tx.send(decode_pnet_admission_batch(&body));
                 }
             }
             LocalAppMsg::ListenTransportsResult => {
@@ -4096,6 +4193,57 @@ pub async fn connect_ipc_any(anchor: &Path) -> Result<IpcStream, ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pnet_admission_batch_rejects_response_for_other_peers() {
+        let (tx, mut outgoing) = mpsc::channel(1);
+        let client = VeilClient {
+            writer: SharedWriter::new(tx),
+            dispatch: Arc::new(Mutex::new(DispatchTable::new())),
+            client_token: [0; 16],
+            reader_task: None,
+            pnet_admission_batch: true,
+        };
+        let peers = [[1; 32], [2; 32]];
+        let respond = async {
+            let frame = outgoing.recv().await.unwrap();
+            let header = codec::decode_header(&frame).unwrap();
+            assert_eq!(header.msg_type, LocalAppMsg::PnetAdmissionBatchQuery as u16);
+            assert_ne!(header.request_id, 0);
+            assert_eq!(&frame[veil_proto::HEADER_SIZE..], peers.as_flattened());
+            let mut dispatch = client.dispatch.lock().await;
+            let reply = take_pending(
+                &mut dispatch.pending_pnet_admission_batches,
+                header.request_id,
+            )
+            .unwrap();
+            let entries = [peers[1], peers[0]]
+                .map(|peer_node_id| crate::PnetAdmission {
+                    peer_node_id,
+                    valid_until_unix: Some(0),
+                })
+                .to_vec();
+            reply.send(Ok(entries)).unwrap();
+        };
+        let (result, ()) = tokio::join!(client.peer_pnet_admissions(&peers), respond);
+        assert!(matches!(result, Err(ClientError::Protocol(_))));
+    }
+
+    #[test]
+    fn invalid_pnet_admission_records_fail_as_a_batch() {
+        let mut reply = crate::PnetAdmission {
+            peer_node_id: [3; 32],
+            valid_until_unix: Some(123),
+        }
+        .encode();
+        assert_eq!(
+            decode_pnet_admission_batch(&reply).unwrap()[0].valid_until_unix,
+            Some(123)
+        );
+        assert!(decode_pnet_admission_batch(&reply[..40]).is_err());
+        reply[32] = 2;
+        assert!(decode_pnet_admission_batch(&reply).is_err());
+    }
 
     #[tokio::test]
     async fn prepared_recoverable_matches_the_ordinary_send_encoder() {

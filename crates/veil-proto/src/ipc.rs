@@ -52,6 +52,10 @@ pub const IPC_HELLO_OK_LOCAL_SOURCE_GROWTH_HOLD: u16 = 0x0800;
 /// Permit a bounded local lossy probe during measured reserve confirmation.
 pub const IPC_CAP_LOCAL_SOURCE_RECOVERY_PROBE: u32 = 32;
 pub const IPC_HELLO_OK_LOCAL_SOURCE_RECOVERY_PROBE: u16 = 0x1000;
+/// Request bounded, private admission polling on local IPC.
+pub const IPC_CAP_PNET_ADMISSION_BATCH: u32 = 64;
+/// The server accepts the local batch admission query.
+pub const IPC_HELLO_OK_PNET_ADMISSION_BATCH: u16 = 0x2000;
 
 /// No content or media role is sent over the network by this local request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6322,7 +6326,7 @@ impl EventPayload {
 /// reports whether the OVL1 session was admitted under a valid
 /// `MembershipCert`.
 ///
-/// Wire layout (fixed 74 bytes):
+/// Wire layout (fixed 75 bytes):
 /// ```text
 /// [0]        admitted        u8 (0 = no, 1 = yes)
 /// [1]        has_cert        u8 (0 = no, 1 = yes — daemon cached a cert)
@@ -6392,6 +6396,46 @@ impl PnetStatusResultPayload {
             valid_until_unix: u64::from_be_bytes(valid_until_bytes),
             network_id,
             peer_node_id,
+        })
+    }
+}
+
+/// Maximum peer IDs in a local P-Net admission query.
+pub const PNET_ADMISSION_BATCH_MAX_PEERS: usize = 64;
+
+/// A requested peer's private admission. A public session, a missing cert
+/// and a revoked peer all yield `None`. `Some(0)` denotes a live admission
+/// with a non-expiring membership certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PnetAdmission {
+    pub peer_node_id: [u8; 32],
+    pub valid_until_unix: Option<u64>,
+}
+
+impl PnetAdmission {
+    /// Node ID, one admission byte, and the expiry in big-endian order.
+    pub const WIRE_SIZE: usize = 41;
+
+    pub fn encode(self) -> [u8; Self::WIRE_SIZE] {
+        let mut bytes = [0; Self::WIRE_SIZE];
+        bytes[..32].copy_from_slice(&self.peer_node_id);
+        if let Some(expiry) = self.valid_until_unix {
+            bytes[32] = 1;
+            bytes[33..].copy_from_slice(&expiry.to_be_bytes());
+        }
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8; Self::WIRE_SIZE]) -> Option<Self> {
+        let expiry = u64::from_be_bytes(bytes[33..].try_into().ok()?);
+        let valid_until_unix = match bytes[32] {
+            0 if expiry == 0 => None,
+            1 => Some(expiry),
+            _ => return None,
+        };
+        Some(Self {
+            peer_node_id: bytes[..32].try_into().ok()?,
+            valid_until_unix,
         })
     }
 }

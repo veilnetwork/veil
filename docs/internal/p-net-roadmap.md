@@ -30,12 +30,10 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 - Use the results to decide whether the daemon needs an optional local
   admission-change subscription. Keep the existing status query available
   to earlier IPC clients.
-- At the legacy query pace, 1,024 configured peers take about 128 s
-  to sweep. Qualify a negotiated IPC status query for bounded groups of
-  configured peer IDs. Reuse the same live-session, membership, ban,
-  and expiry checks and bound the work per connection. Measure sweep
-  CPU and worst-case admission and revocation delay at 34, 256, and
-  1,024 peers, including while packets are flowing.
+- At the legacy query pace, 1,024 configured peers take about 128 s to
+  sweep. Negotiated IPC groups use the same admission checks with a
+  per-connection request quota and a daemon-wide lookup budget. Extend
+  qualification to many simultaneous live sessions and a slow daemon.
 
 ### Qualification results
 
@@ -77,13 +75,44 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 - A short-lived signed member certificate passed traffic before expiry.
   At expiry, probes failed in both directions while the TCP session
   and TUN interface were still present.
+- With the real IPC server and a synthetic admission provider, complete
+  route installation for 34, 256, and 1,024 configured peers took about
+  0.13 s, 0.50 s, and 2.00 s respectively. Full withdrawal took about
+  4.88 s in each case, including the wait for the next sweep. The 1,024
+  entries went through 16 IPC requests per sweep.
+- On two Linux ARM64 nodes with real TUN interfaces and one live certified
+  peer at the end of each configured list, the routes appeared within
+  0.22 s for 34 entries, 0.66 s for 256, and 2.17 s for 1,024 after
+  starting ogate against established daemon sessions. In the 1,024-entry
+  run ogate used about 0.1% of one CPU core when idle and at most 0.72%
+  with bidirectional pings. These are short process CPU samples.
+- In the mixed Linux run with 34 entries and the same new ogate on
+  both nodes, startup took 4.36 s with the pre-batch daemon
+  (`7f30dbd3`) and 0.20 s with the new daemon. The nodes passed TUN
+  traffic both ways. The old daemon still served the single-peer query.
+- With 1,024 entries and 62.6 Mb/s offered UDP traffic on the Linux
+  stand, a ban withdrew the route in 4.78 s. While the sender kept
+  running, the receiver's TUN counter stopped advancing after withdrawal.
 
 ## 3. Distribute owner-authorized peer policy
 
-- Specify a signed policy for membership and virtual address allocations.
-  Bind it to the network ID and owner, persist the newest accepted revision,
-  and define behavior for expired policy, replay, conflicting addresses,
-  and a disconnected node rejoining the network.
-- Stage adoption in parallel with locally configured peers. Define migration,
-  revocation and owner-key rotation before deploying automatic policy
-  updates. Keep private traffic gated on verified membership throughout.
+- Sign a versioned snapshot of virtual address assignments with the
+  configured network owner key. Give the canonical bytes a policy-specific
+  signature domain and bind them to the network ID, revision, validity
+  window, address ranges, and member Node IDs.
+  Validate the signature and the whole address map before publishing it.
+  Require unique addresses and reject assignments outside the signed ranges.
+- Persist the accepted snapshot together with its revision in one durable
+  update. After restart, keep the revision floor even if the last policy
+  has expired. Accept an equal revision only for an identical snapshot.
+  A disconnected node can resume with its cached policy until expiry.
+  An expired snapshot contributes zero routes.
+- Start with opt-in distribution through local policy files and qualify
+  restart, expiry, and rollback behavior. Preserve the existing manual
+  peer list for deployments that have yet to adopt signed policy.
+  In signed mode require both a current assignment and current admission
+  from the daemon on the same private network. A ban still withdraws access.
+- Qualify automatic delivery over authenticated private Veil sessions.
+  Apply the same signature, revision, and address checks as local delivery.
+  Define owner-key rotation and recovery on the configured trust anchor
+  before automatic rollout.

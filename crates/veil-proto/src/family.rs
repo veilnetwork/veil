@@ -941,6 +941,10 @@ pub enum LocalAppMsg {
     /// Current local health with a bounded growth hold. Never forwarded.
     /// Body: [`crate::ipc::LocalSourceGrowthHoldPayload`].
     LocalSourceGrowthHold = 97,
+    /// App → daemon. A bounded array of explicit peer Node IDs (32 bytes each).
+    PnetAdmissionBatchQuery = 98,
+    /// Daemon → app. Correlated private admission records in request order.
+    PnetAdmissionBatchResult = 99,
 }
 
 impl TryFrom<u16> for LocalAppMsg {
@@ -1045,6 +1049,8 @@ impl TryFrom<u16> for LocalAppMsg {
             95 => Ok(LocalAppMsg::PrepareLocalDatagram),
             96 => Ok(LocalAppMsg::PrepareLocalDatagramResult),
             97 => Ok(LocalAppMsg::LocalSourceGrowthHold),
+            98 => Ok(LocalAppMsg::PnetAdmissionBatchQuery),
+            99 => Ok(LocalAppMsg::PnetAdmissionBatchResult),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::LocalApp as u8,
                 msg_type: v,

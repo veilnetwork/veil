@@ -1115,7 +1115,7 @@ pub struct IpcServer {
     /// keeping a separate static `allowed_node_ids` list.  Without it,
     /// the handler replies `admitted=false / has_cert=false` so strict-
     /// p_net apps fall back to their secondary admission path.
-    pnet_status_provider: Option<Arc<dyn crate::PnetStatusProvider>>,
+    pnet_status_queries: Option<Arc<crate::handlers::queries::PnetStatusQueries>>,
     /// Listen-transports provider — answers
     /// `LocalAppMsg::ListenTransportsQuery` with the dispatcher's current
     /// listener URI snapshot (wildcards rewritten to the observed external
@@ -1268,7 +1268,7 @@ impl IpcServer {
             local_identity_pubkey: Vec::new(),
             local_relay_x25519_pubkey: None,
             peer_list_provider: None,
-            pnet_status_provider: None,
+            pnet_status_queries: None,
             listen_transports_provider: None,
             hole_punch_driver: None,
             bootstrap_join_sink: None,
@@ -1580,7 +1580,9 @@ impl IpcServer {
         mut self,
         provider: Arc<dyn crate::PnetStatusProvider>,
     ) -> Self {
-        self.pnet_status_provider = Some(provider);
+        self.pnet_status_queries = Some(Arc::new(
+            crate::handlers::queries::PnetStatusQueries::new(provider),
+        ));
         self
     }
 
@@ -1923,7 +1925,7 @@ impl IpcServer {
                         let local_identity_pubkey = self.local_identity_pubkey.clone();
                         let local_relay_x25519_pubkey = self.local_relay_x25519_pubkey;
                         let peer_list_provider = self.peer_list_provider.clone();
-                        let pnet_status_provider = self.pnet_status_provider.clone();
+                        let pnet_status_queries = self.pnet_status_queries.clone();
                         let listen_transports_provider = self.listen_transports_provider.clone();
                         let hole_punch_driver = self.hole_punch_driver.clone();
                         let bootstrap_join_sink = self.bootstrap_join_sink.clone();
@@ -1972,7 +1974,7 @@ impl IpcServer {
                             // operators can diagnose IPC disconnects without
                             // strace. Tracing is wired in at log-level WARN
                             // by the daemon binary.
-                            if let Err(e) = handle_ipc_client(stream, registry, streams, node_id, bind_node_id, max_rate, tx_reg, route_cache, route_updated, peer_mlkem_keys, mlkem_ek_resolver, session_instance_lookup, ratchet, anon_onion_sender, capture_tx, trace_sample_rate, pending_ack, pending_recursive, app_socket_dir, metrics, anycast_service, hint_registry, mobile_event_sink, local_identity_algo, local_identity_pubkey, local_relay_x25519_pubkey, peer_list_provider, bootstrap_join_sink, mobile_status_provider, event_bus, push_envelope_sink, mailbox_backend, mailbox_crypto_sink, outbox_backend, rendezvous_resolver, relay_key_resolver, bootstrap_invite_create_sink, pair_source_sink, pair_target_sink, pnet_status_provider, listen_transports_provider, hole_punch_driver, stream_bridge).await {
+                            if let Err(e) = handle_ipc_client(stream, registry, streams, node_id, bind_node_id, max_rate, tx_reg, route_cache, route_updated, peer_mlkem_keys, mlkem_ek_resolver, session_instance_lookup, ratchet, anon_onion_sender, capture_tx, trace_sample_rate, pending_ack, pending_recursive, app_socket_dir, metrics, anycast_service, hint_registry, mobile_event_sink, local_identity_algo, local_identity_pubkey, local_relay_x25519_pubkey, peer_list_provider, bootstrap_join_sink, mobile_status_provider, event_bus, push_envelope_sink, mailbox_backend, mailbox_crypto_sink, outbox_backend, rendezvous_resolver, relay_key_resolver, bootstrap_invite_create_sink, pair_source_sink, pair_target_sink, pnet_status_queries, listen_transports_provider, hole_punch_driver, stream_bridge).await {
                                 eprintln!("[veil-ipc] client disconnected: {e} (kind={:?})", e.kind());
                             }
                             };
@@ -2198,7 +2200,7 @@ async fn handle_ipc_client(
     bootstrap_invite_create_sink: Option<Arc<dyn crate::BootstrapInviteCreateSink>>,
     pair_source_sink: Option<Arc<dyn crate::PairSourceSink>>,
     pair_target_sink: Option<Arc<dyn crate::PairTargetSink>>,
-    pnet_status_provider: Option<Arc<dyn crate::PnetStatusProvider>>,
+    pnet_status_queries: Option<Arc<crate::handlers::queries::PnetStatusQueries>>,
     listen_transports_provider: Option<Arc<dyn crate::ListenTransportsProvider>>,
     hole_punch_driver: Option<Arc<dyn crate::HolePunchDriver>>,
     stream_bridge: Option<crate::bridge::IpcStreamBridge>,
@@ -2291,9 +2293,14 @@ async fn handle_ipc_client(
         && session_tx_registry
             .as_ref()
             .is_some_and(|r| r.supports_local_source_recovery_probe());
+    let pnet_admission_batch = hello.flags & veil_proto::ipc::IPC_CAP_PNET_ADMISSION_BATCH != 0
+        && pnet_status_queries.is_some();
     let mut hello_header =
         FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppHelloOk as u16);
     hello_header.body_len = AppIpcHelloOkPayload::WIRE_SIZE as u32;
+    if pnet_admission_batch {
+        hello_header.flags |= veil_proto::ipc::IPC_HELLO_OK_PNET_ADMISSION_BATCH;
+    }
     if stream_write_credit {
         hello_header.flags |= veil_proto::ipc::IPC_HELLO_OK_STREAM_WRITE_CREDIT;
     }
@@ -3556,9 +3563,14 @@ async fn handle_ipc_client(
                             &mut wh,
                             &body,
                             &mut client_state,
-                            pnet_status_provider.as_ref(),
+                            pnet_status_queries.as_deref(),
                         )
                         .await?;
+                    }
+                    Ok(LocalAppMsg::PnetAdmissionBatchQuery) if pnet_admission_batch => {
+                        if let Some(queries) = &pnet_status_queries {
+                            queries.reply_admission_batch(&mut wh, hdr.request_id, &body, &mut client_state).await?;
+                        }
                     }
                     Ok(LocalAppMsg::ListenTransportsQuery) => {
                         crate::handlers::queries::handle_listen_transports_query(

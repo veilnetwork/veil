@@ -153,6 +153,10 @@ async fn connect_with_flags(sock: &PathBuf, flags: u32) -> UnixStream {
             veil_proto::ipc::IPC_HELLO_OK_LOCAL_SOURCE_RECOVERY_PROBE
         } else {
             0
+        }) | (if flags & veil_proto::ipc::IPC_CAP_PNET_ADMISSION_BATCH != 0 {
+            veil_proto::ipc::IPC_HELLO_OK_PNET_ADMISSION_BATCH
+        } else {
+            0
         })
     );
     let mut body = vec![0u8; hdr.body_len as usize];
@@ -160,6 +164,90 @@ async fn connect_with_flags(sock: &PathBuf, flags: u32) -> UnixStream {
         client.read_exact(&mut body).await.unwrap();
     }
     client
+}
+
+#[tokio::test]
+async fn private_admission_batch_is_negotiated_bounded_and_correlated() {
+    use veil_proto::ipc::{
+        IPC_CAP_PNET_ADMISSION_BATCH, PNET_ADMISSION_BATCH_MAX_PEERS, PnetAdmission,
+        PnetStatusResultPayload,
+    };
+
+    struct Admission;
+    impl crate::PnetStatusProvider for Admission {
+        fn peer_status(&self, peer: &[u8; 32]) -> PnetStatusResultPayload {
+            PnetStatusResultPayload {
+                admitted: *peer != [4; 32],
+                has_cert: *peer != [2; 32],
+                admin: false,
+                valid_until_unix: u64::from(*peer == [3; 32]),
+                network_id: [5; 32],
+                peer_node_id: *peer,
+            }
+        }
+    }
+
+    let path = temp_socket_path();
+    let (server, stop, _) = make_server(path.clone());
+    let mut server = server.with_pnet_status_provider(Arc::new(Admission));
+    let task = tokio::spawn(async move { server.run().await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !path.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let query = LocalAppMsg::PnetAdmissionBatchQuery as u16;
+    let peers = [[1; 32], [2; 32], [3; 32], [4; 32]];
+    let mut old_client = connect_and_hello(&path).await;
+    send_ipc_frame_id(&mut old_client, query, 1, peers.as_flattened()).await;
+    send_ipc_frame(
+        &mut old_client,
+        LocalAppMsg::PnetStatusQuery as u16,
+        &peers[1],
+    )
+    .await;
+    let (header, body) =
+        tokio::time::timeout(Duration::from_secs(2), recv_ipc_frame(&mut old_client))
+            .await
+            .unwrap();
+    assert_eq!(header.msg_type, LocalAppMsg::PnetStatusResult as u16);
+    let legacy = PnetStatusResultPayload::decode(&body).unwrap();
+    assert!(legacy.admitted && !legacy.has_cert);
+    drop(old_client);
+
+    let mut client = connect_with_flags(&path, IPC_CAP_PNET_ADMISSION_BATCH).await;
+    send_ipc_frame_id(&mut client, query, 0, peers.as_flattened()).await;
+    send_ipc_frame_id(&mut client, query, 2, &[0; 33]).await;
+    send_ipc_frame_id(
+        &mut client,
+        query,
+        3,
+        [[1; 32]; PNET_ADMISSION_BATCH_MAX_PEERS + 1].as_flattened(),
+    )
+    .await;
+    send_ipc_frame_id(&mut client, query, 19, peers.as_flattened()).await;
+    let (header, body) = tokio::time::timeout(Duration::from_secs(2), recv_ipc_frame(&mut client))
+        .await
+        .unwrap();
+    assert_eq!(
+        header.msg_type,
+        LocalAppMsg::PnetAdmissionBatchResult as u16
+    );
+    assert_eq!(header.request_id, 19);
+    let (entries, extra) = body.as_chunks::<{ PnetAdmission::WIRE_SIZE }>();
+    assert!(extra.is_empty());
+    assert_eq!(entries.len(), peers.len());
+    for (index, record) in entries.iter().enumerate() {
+        let result = PnetAdmission::decode(record).unwrap();
+        assert_eq!(result.peer_node_id, peers[index]);
+        assert_eq!(result.valid_until_unix, (index == 0).then_some(0));
+    }
+    drop(client);
+    stop.send(true).unwrap();
+    task.await.unwrap();
 }
 
 async fn send_ipc_frame(client: &mut UnixStream, msg_type: u16, body: &[u8]) {
