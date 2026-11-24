@@ -691,8 +691,30 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   the test. They resumed bidirectional TUN traffic with the same
   addresses and accepted another new-owner policy. The old member's
   certificate and a higher revision signed by the old owner were refused.
-- The operator-managed procedure requires a maintenance window. Qualify a
-  longer multi-node run with packet traffic and policy changes.
+- The operator-managed procedure requires a maintenance window. A staged
+  rollout splits the network at the owner pin until both sides have
+  installed the new trust settings and re-established their authenticated
+  sessions. Configured peers can be waiting in their normal reconnect
+  backoff when the second wave comes up.
+- An isolated Linux ARM64 stand ran eight TUN gateways, one using the
+  previous daemon, with 2,048 entries per signed policy and a signer
+  outside the test network. The previous signing key was removed before
+  preflight. After the first four gateways rotated, peers under different
+  pins refused each other's certificates. The four rotated gateways
+  applied a signed address withdrawal and restoration through their
+  mirror while the second group kept the previous policy. A 92 s,
+  16 Mb/s UDP stream within that group delivered every datagram across
+  the first wave in two runs (167,244 and 167,188 datagrams).
+- After the second wave restarted, bidirectional probes between the old
+  daemon build and a first-wave peer succeeded within 6.20 s. The path
+  between the two mirrors recovered in 46.49 s on its next scheduled
+  dial. A separate run exceeded the initial 25 s probe deadline.
+- The second mirror distributed revision 13 to all eight gateways. With
+  its ogate stopped, the first mirror distributed revision 14 to all
+  seven running instances in 15.04 s. The returning gateway caught up
+  in 4.78 s and distributed revision 15 to all eight in 13.91 s. One
+  TCP connection between first-wave gateways carried 239,976,448 bytes
+  in 240 s across the second wave and the mirror outage.
 
 ## 6. Recover after owner compromise
 

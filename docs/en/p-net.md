@@ -480,6 +480,11 @@ veil-cli network route-policy rotate-owner --check --policy next.bin \
 4. Republish any required network-wide bans from admins authorized by
    the new key. Existing locally applied bans may remain in effect.
 
+For a staged rollout, allow time for scheduled reconnect retries after
+the last wave. Before ending maintenance, check private reachability
+between nodes in different waves and confirm the current policy revision
+on mirrors and subscribers.
+
 Remote mirrors can distribute address snapshots under the configured key.
 Only the operator can change the owner pin. Revise daemon trust only on
 nodes you can authenticate and manage independently if the owner key is
