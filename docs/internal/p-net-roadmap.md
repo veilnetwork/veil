@@ -27,9 +27,9 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   query rates, route convergence, throughput, and p95/p99 packet latency
   as the peer list grows. Include a slow daemon and a busy data path.
   Measure the time to remove a route as well as the time to add it.
-- Use the results to decide whether the daemon needs an optional local
-  admission-change subscription. Keep the existing status query available
-  to earlier IPC clients.
+- Measure how much the existing local session notifications shorten
+  admission checks under sustained session churn and with multiple ogate
+  instances sharing a daemon.
 - At the legacy query pace, 1,024 configured peers take about 128 s to
   sweep. Negotiated IPC groups use the same admission checks with a
   per-connection request quota and a daemon-wide lookup budget. Extend
@@ -80,6 +80,27 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   0.13 s, 0.50 s, and 2.00 s respectively. Full withdrawal took about
   4.88 s in each case, including the wait for the next sweep. The 1,024
   entries went through 16 IPC requests per sweep.
+- ogate uses the daemon's existing local session events to start admission
+  sweeps earlier when it negotiates batch queries. It coalesces events
+  for 100 ms, lets any active sweep finish, and paces early sweeps based on
+  table size. The periodic sweep covers missed events and changes that
+  leave a session open. Route decisions still use the daemon's admission
+  query. In the same IPC test, a burst of 64 events took about 0.13 s to
+  withdraw 34 routes and 2.00 s to withdraw 1,024 routes. On Linux ARM64
+  with a real TUN and the live peer last in a list of 1,024, route
+  installation after admission took 2.12 s (previously 4.34 s). Route
+  withdrawal after disconnect took 1.82 s (previously 4.34 s). The
+  mixed-version run with a pre-batch daemon used the single-peer queries,
+  passed traffic in both directions, and withdrew the disconnected
+  peer's route.
+- On three Linux ARM64 nodes with 1,024 routes per node and 32 Mb/s of
+  offered UDP on the surviving link, three A/B runs measured route
+  withdrawal of 1.72–1.94 s with session events and 3.75–3.78 s with the
+  previous bridge. The surviving link returned all 100 pings per run.
+  Across the short runs, ping p99 ranged from 3.13 to 6.42 ms with events
+  and from 3.25 to 3.98 ms with the previous bridge. One of 87,170 UDP
+  datagrams was lost with the change. The previous bridge delivered
+  all 87,276 datagrams.
 - On two Linux ARM64 nodes with real TUN interfaces and one live certified
   peer at the end of each configured list, the routes appeared within
   0.22 s for 34 entries, 0.66 s for 256, and 2.17 s for 1,024 after

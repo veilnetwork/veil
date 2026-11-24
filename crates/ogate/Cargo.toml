@@ -34,6 +34,7 @@ veilclient = { path = "../../veilclient" }
 veil-app   = { path = "../veil-app" }
 veil-cfg   = { path = "../veil-cfg" }
 veil-identity = { path = "../veil-identity" }
+veil-proto = { path = "../veil-proto" }
 veil-types = { path = "../veil-types" }
 veil-util  = { path = "../veil-util" }
 anyhow = "1"
@@ -81,7 +82,6 @@ libc = "0.2"
 [target.'cfg(unix)'.dev-dependencies]
 tempfile = "3"
 veil-ipc = { path = "../veil-ipc" }
-veil-proto = { path = "../veil-proto" }
 
 [lints]
 workspace = true

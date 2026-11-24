@@ -27,12 +27,13 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio::signal::unix::{Signal, SignalKind, signal};
-use tokio::sync::{Mutex, Notify, watch};
+use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::time::Instant;
 use veil_identity::network_policy::VerifiedRoutePolicy;
+use veil_proto::event_kind::SESSIONS_CHANGED;
 use veil_util::unix_secs_now_u64;
 use veilclient::client::PnetStatus;
-use veilclient::{APP_IPC_SEND_PREFIX_BYTES, AppHandle, PnetAuthority, VeilClient};
+use veilclient::{APP_IPC_SEND_PREFIX_BYTES, AppHandle, PnetAuthority, VeilClient, VeilEvent};
 
 use crate::app_id::{derive_app_id, namespace_for};
 use crate::batch::{BatchIter, EgressBatches, is_batch_envelope};
@@ -229,6 +230,22 @@ const PNET_LEGACY_QUERY_GROUP: usize = 16;
 const PNET_QUERY_SPACING: Duration = Duration::from_millis(125);
 const PNET_RETRY_PERIOD: Duration = Duration::from_secs(1);
 const PNET_RECENT_WINDOW: Duration = Duration::from_secs(30);
+const PNET_SESSION_COALESCE: Duration = Duration::from_millis(100);
+
+fn pnet_session_refresh_spacing(peer_count: usize) -> Duration {
+    let batches = peer_count.div_ceil(veilclient::PNET_ADMISSION_BATCH_MAX_PEERS);
+    // Limit the extra work under continuous churn. Once a table needs half or
+    // more of the regular sweep window, use the regular cadence.
+    let batches = u32::try_from(batches).unwrap_or(u32::MAX);
+    (PNET_QUERY_SPACING * batches * 2)
+        .max(PNET_RETRY_PERIOD)
+        .min(PNET_REFRESH_PERIOD)
+}
+
+struct SessionRefresh {
+    events: mpsc::Receiver<VeilEvent>,
+    pending: Option<Instant>,
+}
 
 /// Scheduling hints from the previous authenticated checks. They survive an
 /// IPC rebind, while the route table starts with no admissions on each bind.
@@ -1203,6 +1220,8 @@ async fn maintain_routes(
     let mut hup = hup.lock().await;
     let mut admitted = HashMap::new();
     let mut connection: Option<Arc<VeilClient>> = None;
+    let mut session_refresh: Option<SessionRefresh> = None;
+    let mut next_session_sweep = Instant::now();
     let mut active_policy = None;
     let mut policy_updates = binding.signed.as_ref().map(|(policy, _)| policy.updates());
     let mut admission_order = None;
@@ -1217,14 +1236,29 @@ async fn maintain_routes(
         Sweep,
         Reload,
         Policy,
+        SessionEvent(Option<VeilEvent>),
+        SessionSweep,
     }
     loop {
+        let session_due = session_refresh.as_ref().and_then(|refresh| refresh.pending);
         let wake = tokio::select! {
             _ = async {
                 if next_peer == 0 {
                     refresh.tick().await;
                 }
             }, if config.pnet_required => Wake::Sweep,
+            event = async {
+                match session_refresh.as_mut() {
+                    Some(refresh) => refresh.events.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => Wake::SessionEvent(event),
+            _ = async {
+                match session_due {
+                    Some(due) => tokio::time::sleep_until(due.max(next_session_sweep)).await,
+                    None => std::future::pending().await,
+                }
+            }, if next_peer == 0 => Wake::SessionSweep,
             _ = async {
                 match hup.as_mut() {
                     Some(hup) => hup.recv().await,
@@ -1238,6 +1272,26 @@ async fn maintain_routes(
                 }
             } => Wake::Policy,
         };
+        if let Wake::SessionEvent(event) = wake {
+            match event {
+                Some(event) if event.kind == SESSIONS_CHANGED => {
+                    if let Some(refresh) = session_refresh.as_mut() {
+                        refresh
+                            .pending
+                            .get_or_insert_with(|| Instant::now() + PNET_SESSION_COALESCE);
+                    }
+                }
+                Some(_) => {}
+                None => session_refresh = None,
+            }
+            continue;
+        }
+        if next_peer == 0
+            && session_due.is_some_and(|due| due <= Instant::now())
+            && let Some(refresh) = session_refresh.as_mut()
+        {
+            refresh.pending = None;
+        }
         if wake == Wake::Reload {
             let new = match OgateConfig::from_path(&config_path) {
                 Ok(new) => new,
@@ -1274,6 +1328,7 @@ async fn maintain_routes(
                 if !config.pnet_required {
                     admitted.clear();
                     connection = None;
+                    session_refresh = None;
                     publish_routes(configured.clone(), &state, &route_changes);
                     continue;
                 }
@@ -1312,6 +1367,7 @@ async fn maintain_routes(
                     } else {
                         admitted.clear();
                         connection = None;
+                        session_refresh = None;
                     }
                     admission_order = prioritize_signed_admissions(
                         admission_order
@@ -1361,11 +1417,23 @@ async fn maintain_routes(
         if order.is_empty() {
             continue;
         }
+        if wake == Wake::SessionSweep {
+            next_session_sweep = Instant::now() + pnet_session_refresh_spacing(order.len());
+            refresh.reset();
+        }
         if connection.is_none() {
             let authority = binding.signed.as_ref().map(|(_, authority)| *authority);
             connection =
                 connect_pnet_status(&config.socket_path, binding.node_id, authority, &mut pace)
                     .await;
+            if let Some(client) = &connection
+                && client.supports_pnet_admission_batch()
+            {
+                session_refresh = Some(SessionRefresh {
+                    events: client.events().await,
+                    pending: None,
+                });
+            }
         }
         if let Some(client) = &connection
             && binding.signed.is_some()
@@ -1414,6 +1482,7 @@ async fn maintain_routes(
         }
         let Some(results) = results else {
             connection = None;
+            session_refresh = None;
             next_peer = 0;
             if !admitted.is_empty() {
                 admitted.clear();
@@ -1833,16 +1902,24 @@ mod tests {
     #[tokio::test]
     async fn pnet_routes_follow_daemon_admission_without_reload() {
         tokio::join!(
-            exercise_pnet_sweep(34),
-            exercise_pnet_sweep(256),
-            exercise_pnet_sweep(1024),
+            exercise_pnet_sweep(34, false),
+            exercise_pnet_sweep(256, false),
+            exercise_pnet_sweep(1024, false),
         );
     }
 
-    async fn exercise_pnet_sweep(peer_count: u16) {
+    #[tokio::test]
+    async fn pnet_session_events_accelerate_route_withdrawal() {
+        tokio::join!(
+            exercise_pnet_sweep(34, true),
+            exercise_pnet_sweep(1024, true)
+        );
+    }
+
+    async fn exercise_pnet_sweep(peer_count: u16, publish_session_events: bool) {
         use std::sync::atomic::{AtomicBool, Ordering};
-        use veil_ipc::{IpcEndpoint, IpcServer, PnetStatusProvider};
-        use veil_proto::PnetStatusResultPayload;
+        use veil_ipc::{EventBus, IpcEndpoint, IpcServer, PnetStatusProvider};
+        use veil_proto::{EventPayload, PnetStatusResultPayload};
 
         struct Admission {
             live: AtomicBool,
@@ -1872,6 +1949,7 @@ mod tests {
             live: AtomicBool::new(false),
             wrong_peer: AtomicBool::new(false),
         });
+        let events = Arc::new(EventBus::new());
         let (stop, shutdown) = tokio::sync::watch::channel(false);
         let mut server = IpcServer::new(
             IpcEndpoint::Unix(socket.clone()),
@@ -1879,7 +1957,8 @@ mod tests {
             Arc::new(veil_app::AppEndpointRegistry::new()),
             [0x01; 32],
         )
-        .with_pnet_status_provider(admission.clone());
+        .with_pnet_status_provider(admission.clone())
+        .with_event_bus(events.clone());
         let server = tokio::spawn(async move { server.run().await.unwrap() });
 
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -1950,7 +2029,21 @@ mod tests {
 
         let revoked = std::time::Instant::now();
         admission.live.store(false, Ordering::Relaxed);
-        tokio::time::timeout(Duration::from_secs(8), async {
+        let deadline = if publish_session_events {
+            for _ in 0..64 {
+                assert_ne!(
+                    events.publish(EventPayload {
+                        kind: SESSIONS_CHANGED,
+                        payload: vec![0, 1],
+                    }),
+                    0
+                );
+            }
+            Duration::from_secs(4)
+        } else {
+            Duration::from_secs(8)
+        };
+        tokio::time::timeout(deadline, async {
             while state.load().table.peer_count() != 0 {
                 changed.notified().await;
             }
@@ -1958,7 +2051,7 @@ mod tests {
         .await
         .expect("peer routes survived loss of session");
         eprintln!(
-            "{peer_count} peers: admitted in {admission_elapsed:.3?}, withdrawn in {:.3?}",
+            "{peer_count} peers (session events {publish_session_events}): admitted in {admission_elapsed:.3?}, withdrawn in {:.3?}",
             revoked.elapsed()
         );
         assert_eq!(state.load().table.lookup_egress(address), Decision::NoRoute);
