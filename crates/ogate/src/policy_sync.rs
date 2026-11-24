@@ -6,13 +6,14 @@ use std::time::Duration;
 
 use anyhow::{Context as _, ensure};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
-use tokio::time::{Instant, Interval, MissedTickBehavior, interval, interval_at, timeout};
+use tokio::time::{Instant, MissedTickBehavior, interval, interval_at, timeout};
 use veil_identity::network_policy::{MAX_SIGNED_ROUTE_POLICY_BYTES, VerifiedRoutePolicy};
 use veil_util::unix_secs_now_u64;
 use veilclient::{
-    AppHandle, IncomingStream, PnetAdmission, PnetAuthority, SenderProvenance, VeilClient,
+    AppHandle, PNET_ADMISSION_BATCH_MAX_PEERS, PnetAdmission, PnetAuthority, SenderProvenance,
+    VeilClient, VeilStream,
 };
 
 use crate::routing::NodeId;
@@ -24,7 +25,9 @@ const ENDPOINT: u32 = 1;
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(12);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
-const MAX_SERVING: usize = 8;
+const MAX_SERVING: usize = PNET_ADMISSION_BATCH_MAX_PEERS;
+// Leave headroom in the daemon's per-connection query budget.
+const ADMISSION_SPACING: Duration = Duration::from_millis(150);
 
 pub(crate) async fn run(
     policy: Arc<SignedRoutes>,
@@ -94,15 +97,14 @@ async fn serve_mirror(
         .await?;
     let mut requests = JoinSet::new();
     let mut in_flight = Vec::with_capacity(MAX_SERVING);
-    // Leave headroom in the daemon's per-connection query limit.
-    let mut query_pace = interval(Duration::from_millis(150));
-    query_pace.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let query_pace = Arc::new(Mutex::new(query_pace));
     let mut health = interval(Duration::from_secs(1));
     let authority = distribution.authority;
+    let (ready, waiting) = mpsc::channel(MAX_SERVING);
+    let mut dispatcher = std::pin::pin!(dispatch_requests(&client, policy, authority, waiting));
     tracing::info!("serving owner-signed P-Net route policies");
     loop {
         tokio::select! {
+            _ = &mut dispatcher => return Ok(()),
             _ = health.tick() => {
                 if client.is_disconnected() || !authority.is_current(unix_secs_now_u64()) {
                     return Ok(());
@@ -126,12 +128,11 @@ async fn serve_mirror(
                     continue;
                 }
                 let client = Arc::clone(&client);
-                let policy = Arc::clone(policy);
-                let query_pace = Arc::clone(&query_pace);
+                let ready = ready.clone();
                 let task = requests.spawn(async move {
                     let _ = timeout(
                         TRANSFER_TIMEOUT,
-                        reply_to_member(client, policy, authority, query_pace, incoming),
+                        reply_to_member(&client, authority, &ready, source, incoming.stream),
                     ).await;
                 });
                 in_flight.push((task.id(), source));
@@ -140,16 +141,94 @@ async fn serve_mirror(
     }
 }
 
-async fn reply_to_member(
-    client: Arc<VeilClient>,
-    policy: Arc<SignedRoutes>,
+struct WaitingRequest {
+    source: NodeId,
+    reply: oneshot::Sender<AuthorizedSnapshot>,
+}
+
+struct PublishedSnapshot {
+    policy: Arc<VerifiedRoutePolicy>,
+    bytes: Vec<u8>,
+}
+
+struct AuthorizedSnapshot {
+    admission: PnetAdmission,
+    snapshot: Arc<PublishedSnapshot>,
+}
+
+async fn dispatch_requests(
+    client: &VeilClient,
+    policy: &Arc<SignedRoutes>,
     authority: PnetAuthority,
-    query_pace: Arc<Mutex<Interval>>,
-    IncomingStream {
-        mut stream,
-        src_node_id,
-        ..
-    }: IncomingStream,
+    mut waiting: mpsc::Receiver<WaitingRequest>,
+) {
+    let mut pace = interval(ADMISSION_SPACING);
+    pace.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut batch = Vec::with_capacity(MAX_SERVING);
+    while let Some(first) = waiting.recv().await {
+        pace.tick().await;
+        batch.push(first);
+        while batch.len() < MAX_SERVING
+            && let Ok(request) = waiting.try_recv()
+        {
+            batch.push(request);
+        }
+        batch.retain(|request| !request.reply.is_closed());
+        if let Err(error) = authorize_batch(client, policy, authority, &mut batch).await {
+            tracing::debug!(%error, "P-Net policy mirror request batch failed");
+        }
+        batch.clear();
+    }
+}
+
+async fn authorize_batch(
+    client: &VeilClient,
+    policy: &Arc<SignedRoutes>,
+    authority: PnetAuthority,
+    batch: &mut Vec<WaitingRequest>,
+) -> anyhow::Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let peers: Vec<_> = batch.iter().map(|request| request.source).collect();
+    let admissions = client.peer_pnet_admissions(&peers).await?;
+    let now = unix_secs_now_u64();
+    let admitted: Vec<_> = batch
+        .drain(..)
+        .zip(admissions)
+        .filter(|(request, admission)| {
+            authorized(authority, *admission, now) && !request.reply.is_closed()
+        })
+        .collect();
+    if admitted.is_empty() {
+        return Ok(());
+    }
+
+    // Read the protected store once for the group. Each requester gets the
+    // same verified bytes and still checks its own membership before writing.
+    let policy = Arc::clone(policy);
+    let (policy, bytes) = tokio::task::spawn_blocking(move || policy.installed_bytes()).await??;
+    let snapshot = Arc::new(PublishedSnapshot { policy, bytes });
+    tracing::trace!(
+        requests = peers.len(),
+        admitted = admitted.len(),
+        "loaded P-Net policy for mirror requests"
+    );
+    for (request, admission) in admitted {
+        let _ = request.reply.send(AuthorizedSnapshot {
+            admission,
+            snapshot: Arc::clone(&snapshot),
+        });
+    }
+    Ok(())
+}
+
+async fn reply_to_member(
+    client: &VeilClient,
+    authority: PnetAuthority,
+    ready: &mpsc::Sender<WaitingRequest>,
+    source: NodeId,
+    mut stream: VeilStream,
 ) -> anyhow::Result<()> {
     let mut request = [0; 12];
     timeout(REQUEST_TIMEOUT, stream.read_exact(&mut request)).await??;
@@ -159,21 +238,22 @@ async fn reply_to_member(
     );
     let revision = u64::from_be_bytes(request[4..].try_into()?);
 
-    query_pace.lock().await.tick().await;
-    let admission = query_peer(&client, src_node_id).await?;
-    ensure!(
-        authorized(authority, admission, unix_secs_now_u64()),
-        "requester lacks current P-Net membership"
-    );
-    let (snapshot, bytes) = tokio::task::spawn_blocking(move || policy.installed_bytes()).await??;
+    let (reply, authorization) = oneshot::channel();
+    ready
+        .try_send(WaitingRequest { source, reply })
+        .map_err(|_| anyhow::anyhow!("P-Net policy mirror request queue unavailable"))?;
+    let AuthorizedSnapshot {
+        admission,
+        snapshot,
+    } = authorization.await?;
     let now = unix_secs_now_u64();
     ensure!(
         !client.is_disconnected() && authorized(authority, admission, now),
         "requester's P-Net admission expired during snapshot lookup"
     );
-    if snapshot.revision > revision && snapshot.check_current(now).is_ok() {
-        stream.write_u32(bytes.len().try_into()?).await?;
-        stream.write_all(&bytes).await?;
+    if snapshot.policy.revision > revision && snapshot.policy.check_current(now).is_ok() {
+        stream.write_u32(snapshot.bytes.len().try_into()?).await?;
+        stream.write_all(&snapshot.bytes).await?;
     } else {
         stream.write_u32(0).await?;
     }
@@ -385,10 +465,6 @@ async fn read_snapshot(mut stream: impl AsyncRead + Unpin) -> anyhow::Result<Opt
         .await
         .context("incomplete P-Net policy response")?;
     Ok(Some(bytes))
-}
-
-async fn query_peer(client: &VeilClient, peer: NodeId) -> anyhow::Result<PnetAdmission> {
-    Ok(client.peer_pnet_admissions(&[peer]).await?[0])
 }
 
 fn authorized(authority: PnetAuthority, admission: PnetAdmission, now: u64) -> bool {

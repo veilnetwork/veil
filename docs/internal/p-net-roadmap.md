@@ -179,3 +179,29 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   stayed on its existing revision. A separate obfs4 run delivered the same
   maximum-size Ed25519 policy and restored TUN traffic after expiry.
 - The final bridge also passed manual-mode TUN tests with an older daemon.
+
+### Concurrent mirror requests
+
+- A mirror batches admission queries for up to 64 outstanding requests. It
+  loads and verifies the protected snapshot once per admitted group. Each
+  stream checks its own admission deadline before writing.
+- Incoming remote application streams use distinct local IPC handles.
+  The daemon resolves data and closes by authenticated device, wire
+  stream ID and endpoint. Replies keep the original wire ID. The internal
+  exit proxy also keeps stream state per physical opener.
+- On an isolated two-vCPU Linux stand with 20 concurrently resuming
+  subscribers, the earlier implementation failed to install revision 2
+  within 56 seconds. After fixing stream routing and batching admissions,
+  all 20 installed the 217,260-byte policy with 4,096 assignments in
+  0.54 seconds. The mirror processed groups of one and nineteen.
+- The final build installed identical signed bytes on all 32 simultaneously
+  active subscribers in 0.763 seconds. The mirror processed those requests
+  in groups of one and thirty-one.
+- A subscriber on the previous build fetched the same maximum-size
+  policy from the new mirror over obfs4 after its earlier snapshot expired.
+  It kept the installed revision after the mirror banned its device.
+- Applying the larger snapshot still cleared the active routes for about
+  eight seconds while ogate rechecked admissions. In the 32-subscriber
+  run the paced TCP probe averaged 7.92 Mb/s and the ICMP probe received
+  337 of 413 replies. Preserve unaffected routes through policy transitions
+  while rechecking live admissions and enforcing the original deadlines.
