@@ -143,6 +143,35 @@ pub struct SignedPolicyConfig {
     pub network_id: String,
     pub owner_pubkey: String,
     pub owner_algo: veil_types::SignatureAlgorithm,
+    /// Serve installed signed snapshots to current private-network members.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub publish: bool,
+    /// Exact daemon Node IDs of trusted distribution endpoints.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirrors: Vec<String>,
+}
+
+impl SignedPolicyConfig {
+    pub(crate) fn mirror_ids(&self) -> Result<Vec<[u8; 32]>, ConfigError> {
+        if self.mirrors.len() > 8 {
+            return Err(ConfigError::Field(
+                "signed_policy.mirrors accepts up to eight Node IDs",
+            ));
+        }
+        let mut result = Vec::with_capacity(self.mirrors.len());
+        for mirror in &self.mirrors {
+            let id = veil_util::hex_to_array(mirror).map_err(|_| {
+                ConfigError::Field("signed_policy.mirrors needs 64-digit hexadecimal Node IDs")
+            })?;
+            if id == [0; 32] || result.contains(&id) {
+                return Err(ConfigError::Field(
+                    "signed_policy.mirrors needs unique, nonzero Node IDs",
+                ));
+            }
+            result.push(id);
+        }
+        Ok(result)
+    }
 }
 
 /// Logging configuration for the `ogate` binary.  Translates to
@@ -310,6 +339,7 @@ impl OgateConfig {
             return Err(ConfigError::Field("`app` must not be empty"));
         }
         if let Some(policy) = &self.signed_policy {
+            policy.mirror_ids()?;
             if !self.pnet_required || self.mode != AccessMode::Authorized || !self.peers.is_empty()
             {
                 return Err(ConfigError::Field(

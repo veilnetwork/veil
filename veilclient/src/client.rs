@@ -1290,6 +1290,14 @@ impl VeilClient {
         }
     }
 
+    /// Whether either half of the local IPC connection has stopped.
+    pub fn is_disconnected(&self) -> bool {
+        self.reader_task
+            .as_ref()
+            .is_none_or(|reader| reader.is_finished())
+            || self.writer.tx.is_closed()
+    }
+
     /// Bind a local application endpoint and return an [`AppHandle`].
     ///
     /// Bind an endpoint in **ephemeral** mode (default for most applications).

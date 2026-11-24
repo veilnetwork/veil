@@ -948,6 +948,16 @@ async fn serve_link(
         })
     };
 
+    let policy_sync = signed.as_ref().and_then(|(policy, authority)| {
+        (policy.publish || !policy.mirrors.is_empty()).then(|| {
+            let policy = Arc::clone(policy);
+            let socket = cfg.socket_path.clone();
+            let authority = *authority;
+            tokio::spawn(async move {
+                crate::policy_sync::run(policy, &socket, binding.node_id, authority).await;
+            })
+        })
+    });
     let routes = tokio::spawn(maintain_routes(
         bridge.config_path.clone(),
         bridge.accepted.clone(),
@@ -976,6 +986,10 @@ async fn serve_link(
         ),
     };
 
+    if let Some(task) = policy_sync {
+        task.abort();
+        let _ = task.await;
+    }
     routes.abort();
     let _ = routes.await;
     if let Some(task) = cert_broadcast_task {

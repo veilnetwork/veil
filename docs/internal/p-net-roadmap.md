@@ -114,8 +114,9 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   from the daemon on the same private network. A ban still withdraws access.
 - Qualify automatic delivery over authenticated private Veil sessions.
   Apply the same signature, revision, and address checks as local delivery.
-  Define owner-key rotation and recovery on the configured trust anchor
-  before automatic rollout.
+- Measure update convergence and tunnel throughput with many simultaneously
+  active subscribers. Define owner-key rotation and recovery on the configured
+  trust anchor before broader rollout.
 
 ### Signed snapshot implementation and checks
 
@@ -150,3 +151,31 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 - The same bridge binary also passed bidirectional manual-mode TUN
   traffic with mixed old and new daemons. The FreeBSD ogate cross-check
   passed; signed-mode packet forwarding was qualified on Linux.
+
+### Automatic delivery implementation
+
+- Explicitly configured mirror devices serve installed snapshots over direct
+  private Veil application streams. First installation still uses the local
+  CLI with the pinned owner. Publishers need only the signed snapshot.
+- Both sides check live P-Net admission. The receiver verifies the signed
+  bytes and installs through the same persistent revision floor as the CLI.
+  A current member whose virtual address was withdrawn can receive the
+  withdrawal and later renewals. Receivers with expired snapshots can
+  recover while their daemon membership is current.
+- Receivers stagger their polls and check all configured active mirrors.
+  Equal highest revisions with differing valid contents in one poll leave
+  the installed revision in force. Unchanged snapshots send only a length
+  frame; large downloads and simultaneous requests have fixed bounds.
+
+- An isolated Linux pair recovered bidirectional TUN traffic after the
+  subscriber's original snapshot expired. It fetched the full 217,260-byte
+  signed snapshot with 4,096 assignments and stored the exact signed bytes.
+- An isolated three-node run refused conflicting snapshots at the highest
+  revision, accepted a later revision, and continued receiving updates through
+  the secondary mirror after the primary stopped.
+
+- In the paired run the mirror propagated address removal, restored access on
+  the same TUN, and resumed serving after a daemon restart. A banned member
+  stayed on its existing revision. A separate obfs4 run delivered the same
+  maximum-size Ed25519 policy and restored TUN traffic after expiry.
+- The final bridge also passed manual-mode TUN tests with an older daemon.

@@ -45,6 +45,8 @@ pub mod cert_message;
 pub mod cli;
 pub mod config;
 pub mod config_template;
+#[cfg(unix)]
+mod policy_sync;
 pub mod routing;
 #[cfg(unix)]
 mod signed_policy;

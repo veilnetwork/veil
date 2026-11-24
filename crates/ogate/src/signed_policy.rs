@@ -1,8 +1,11 @@
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
-use veil_identity::network_policy::{RoutePolicyAuthority, VerifiedRoutePolicy};
-use veil_identity::network_policy_store::RoutePolicyStore;
+use veil_identity::network_policy::{
+    RoutePolicyAuthority, VerifiedRoutePolicy, verify_route_policy,
+};
+use veil_identity::network_policy_store::{RoutePolicyStore, StoreError};
+use veil_util::unix_secs_now_u64;
 use veilclient::{PnetAuthority, PnetTrustRoot};
 
 use crate::config::{OgateConfig, PeerEntry, SignedPolicyConfig};
@@ -13,6 +16,8 @@ use crate::routing::NodeId;
 pub(crate) struct SignedRoutes {
     config: SignedPolicyConfig,
     last: Mutex<Option<Arc<VerifiedRoutePolicy>>>,
+    pub mirrors: Vec<NodeId>,
+    pub publish: bool,
     pub root: PnetTrustRoot,
 }
 
@@ -24,6 +29,8 @@ impl SignedRoutes {
         let key = base64::engine::general_purpose::STANDARD.decode(&config.owner_pubkey)?;
         let routes = Self {
             root: PnetTrustRoot::from_owner(id, config.owner_algo, &key),
+            mirrors: config.mirror_ids()?,
+            publish: config.publish,
             config,
             last: Mutex::new(None),
         };
@@ -31,34 +38,55 @@ impl SignedRoutes {
         Ok(routes)
     }
 
-    pub fn refresh(&self) -> anyhow::Result<Arc<VerifiedRoutePolicy>> {
-        let authority = RoutePolicyAuthority {
+    fn policy_authority(&self) -> RoutePolicyAuthority<'_> {
+        RoutePolicyAuthority {
             network_id: self.root.network_id,
             algorithm: self.root.owner_algorithm,
             public_key: &self.config.owner_pubkey,
-        };
+        }
+    }
+
+    pub fn refresh(&self) -> anyhow::Result<Arc<VerifiedRoutePolicy>> {
+        let mut last = self
+            .last
+            .lock()
+            .map_err(|_| anyhow::anyhow!("signed policy state lock failed"))?;
         let store = RoutePolicyStore::open(&self.config.state_dir)?;
-        let offered = store.try_load(&authority)?;
+        match store.try_load(&self.policy_authority()) {
+            Ok(offered) => observe(&mut last, offered),
+            Err(StoreError::Busy) => last.clone().ok_or_else(|| StoreError::Busy.into()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn installed_bytes(&self) -> anyhow::Result<(Arc<VerifiedRoutePolicy>, Vec<u8>)> {
+        let mut last = self
+            .last
+            .lock()
+            .map_err(|_| anyhow::anyhow!("signed policy state lock failed"))?;
+        let store = RoutePolicyStore::open(&self.config.state_dir)?;
+        let (offered, bytes) = store.try_load_signed(&self.policy_authority())?;
+        Ok((observe(&mut last, offered)?, bytes))
+    }
+
+    pub fn verify_offer(&self, bytes: &[u8]) -> anyhow::Result<VerifiedRoutePolicy> {
+        let offered = verify_route_policy(bytes, &self.policy_authority())?;
+        offered.check_current(unix_secs_now_u64())?;
+        Ok(offered)
+    }
+
+    pub fn install_offer(&self, bytes: &[u8]) -> anyhow::Result<u64> {
+        let verified = self.verify_offer(bytes)?;
         let mut last = self
             .last
             .lock()
             .map_err(|_| anyhow::anyhow!("signed policy state lock failed"))?;
         if let Some(accepted) = last.as_ref() {
-            anyhow::ensure!(
-                offered.revision >= accepted.revision,
-                "signed policy revision went backwards"
-            );
-            if offered.revision == accepted.revision {
-                anyhow::ensure!(
-                    offered == **accepted,
-                    "signed policy revision has conflicting contents"
-                );
-                return Ok(Arc::clone(accepted));
-            }
+            require_monotonic(accepted, &verified)?;
         }
-        let offered = Arc::new(offered);
-        *last = Some(Arc::clone(&offered));
-        Ok(offered)
+        let store = RoutePolicyStore::open(&self.config.state_dir)?;
+        let accepted = store.try_accept(bytes, &self.policy_authority())?;
+        Ok(observe(&mut last, accepted)?.revision)
     }
 
     pub fn authenticate(
@@ -79,6 +107,36 @@ impl SignedRoutes {
         );
         Ok(authority)
     }
+}
+
+fn require_monotonic(
+    accepted: &VerifiedRoutePolicy,
+    offered: &VerifiedRoutePolicy,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        offered.revision >= accepted.revision,
+        "signed policy revision went backwards"
+    );
+    anyhow::ensure!(
+        offered.revision != accepted.revision || offered == accepted,
+        "signed policy revision has conflicting contents"
+    );
+    Ok(())
+}
+
+fn observe(
+    last: &mut Option<Arc<VerifiedRoutePolicy>>,
+    offered: VerifiedRoutePolicy,
+) -> anyhow::Result<Arc<VerifiedRoutePolicy>> {
+    if let Some(accepted) = last.as_ref() {
+        require_monotonic(accepted, &offered)?;
+        if offered.revision == accepted.revision {
+            return Ok(Arc::clone(accepted));
+        }
+    }
+    let offered = Arc::new(offered);
+    *last = Some(Arc::clone(&offered));
+    Ok(offered)
 }
 
 pub(crate) fn assigned_peers(

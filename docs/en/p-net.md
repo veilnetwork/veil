@@ -352,6 +352,38 @@ Changes to the local TUN addresses or prefixes require updating the
 configuration and restarting ogate. When the policy or a membership
 expires, the corresponding traffic stops at that deadline.
 
+### Automatic snapshot delivery
+
+Keep the first installation explicit on every node. To let a node
+distribute later revisions, set `publish = true` in its
+`[signed_policy]` section. On receiving nodes, list up to eight publisher
+device Node IDs under `mirrors` in the same section. This example uses
+one publisher.
+
+```toml
+mirrors = ["0000000000000000000000000000000000000000000000000000000000000002"]
+```
+
+Install new owner-signed snapshots on the publishers. Keep the signing
+key offline. Receivers check for a higher revision every 15 seconds
+over direct, authenticated P-Net sessions with the configured
+publishers. The first check is staggered across receivers. Each side
+requires current daemon-certified membership, and a receiver verifies
+the owner's signature and checks expiry and revision before storing
+the snapshot. An expired snapshot keeps its revision floor, and the
+receiver can still fetch a newer one while its daemon membership is
+current.
+
+Ensure the publishers are reachable over the existing private
+transport. A publisher shares the entire signed address map with
+current members, including members without a virtual address; route
+activation still requires an address assignment and current membership.
+If different snapshots at the same highest revision arrive in one
+poll, ogate reports the conflict and leaves the installed revision in
+place. If the mirrors are unavailable, the cached policy remains
+effective until expiry. Restart ogate after changing distribution
+settings. With the defaults, distribution is disabled.
+
 ## What gets rejected
 
 | Scenario | Error message at handshake |

@@ -24,6 +24,8 @@ pub enum StoreError {
     AlreadyInitialized,
     #[error("route policy state is missing; initialize it explicitly on first installation")]
     Uninitialized,
+    #[error("route policy state is busy")]
+    Busy,
     #[error("route policy revision {offered} is older than accepted revision {accepted}")]
     Rollback { offered: u64, accepted: u64 },
     #[error("route policy revision {0} has conflicting contents")]
@@ -68,7 +70,7 @@ impl RoutePolicyStore {
         authority: &RoutePolicyAuthority<'_>,
     ) -> Result<VerifiedRoutePolicy, StoreError> {
         let _lock = self.lock(false)?;
-        self.load_synced(authority)
+        self.load_synced(authority).map(|(policy, _)| policy)
     }
 
     /// Load for a running service without waiting on another local installer.
@@ -76,15 +78,22 @@ impl RoutePolicyStore {
         &self,
         authority: &RoutePolicyAuthority<'_>,
     ) -> Result<VerifiedRoutePolicy, StoreError> {
-        let lock = self.open_lock(false)?;
-        lock.try_lock().map_err(io::Error::other)?;
+        self.try_load_signed(authority).map(|(policy, _)| policy)
+    }
+
+    /// Read the verified snapshot and its original signed bytes.
+    pub fn try_load_signed(
+        &self,
+        authority: &RoutePolicyAuthority<'_>,
+    ) -> Result<(VerifiedRoutePolicy, Vec<u8>), StoreError> {
+        let _lock = self.try_lock()?;
         self.load_synced(authority)
     }
 
     fn load_synced(
         &self,
         authority: &RoutePolicyAuthority<'_>,
-    ) -> Result<VerifiedRoutePolicy, StoreError> {
+    ) -> Result<(VerifiedRoutePolicy, Vec<u8>), StoreError> {
         let policy = self.load_locked(authority)?;
         self.directory.sync_all()?;
         Ok(policy)
@@ -101,6 +110,23 @@ impl RoutePolicyStore {
         self.accept_with_clock(blob, authority, initialize, veil_util::unix_secs_now_u64)
     }
 
+    /// Accept an update in an initialized store without waiting for its lock.
+    pub fn try_accept(
+        &self,
+        blob: &[u8],
+        authority: &RoutePolicyAuthority<'_>,
+    ) -> Result<VerifiedRoutePolicy, StoreError> {
+        let offered = verify_route_policy(blob, authority)?;
+        let _lock = self.try_lock()?;
+        self.accept_locked(
+            blob,
+            authority,
+            offered,
+            false,
+            veil_util::unix_secs_now_u64(),
+        )
+    }
+
     fn accept_with_clock(
         &self,
         blob: &[u8],
@@ -110,7 +136,18 @@ impl RoutePolicyStore {
     ) -> Result<VerifiedRoutePolicy, StoreError> {
         let offered = verify_route_policy(blob, authority)?;
         let _lock = self.lock(initialize)?;
-        offered.check_current(clock())?;
+        self.accept_locked(blob, authority, offered, initialize, clock())
+    }
+
+    fn accept_locked(
+        &self,
+        blob: &[u8],
+        authority: &RoutePolicyAuthority<'_>,
+        offered: VerifiedRoutePolicy,
+        initialize: bool,
+        now: u64,
+    ) -> Result<VerifiedRoutePolicy, StoreError> {
+        offered.check_current(now)?;
         let path = self.root.join(SNAPSHOT_FILE);
         if initialize {
             match fs::symlink_metadata(&path) {
@@ -119,7 +156,7 @@ impl RoutePolicyStore {
                 Err(error) => return Err(error.into()),
             }
         } else {
-            let accepted = self.load_locked(authority)?;
+            let (accepted, _) = self.load_locked(authority)?;
             match offered.revision.cmp(&accepted.revision) {
                 std::cmp::Ordering::Less => {
                     return Err(StoreError::Rollback {
@@ -150,6 +187,15 @@ impl RoutePolicyStore {
         Ok(lock)
     }
 
+    fn try_lock(&self) -> Result<File, StoreError> {
+        let lock = self.open_lock(false)?;
+        match lock.try_lock() {
+            Ok(()) => Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) => Err(StoreError::Busy),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
     fn open_lock(&self, initialize: bool) -> Result<File, StoreError> {
         let path = self.root.join(LOCK_FILE);
         let lock = match open_state_file(&path, true, initialize) {
@@ -165,7 +211,7 @@ impl RoutePolicyStore {
     fn load_locked(
         &self,
         authority: &RoutePolicyAuthority<'_>,
-    ) -> Result<VerifiedRoutePolicy, StoreError> {
+    ) -> Result<(VerifiedRoutePolicy, Vec<u8>), StoreError> {
         let path = self.root.join(SNAPSHOT_FILE);
         let file = match open_state_file(&path, false, false) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -177,7 +223,7 @@ impl RoutePolicyStore {
         let mut blob = Vec::new();
         file.take((MAX_SIGNED_ROUTE_POLICY_BYTES + 1) as u64)
             .read_to_end(&mut blob)?;
-        Ok(verify_route_policy(&blob, authority)?)
+        Ok((verify_route_policy(&blob, authority)?, blob))
     }
 
     fn require_owner_file(&self, file: &File, path: &Path) -> Result<(), StoreError> {
@@ -447,6 +493,41 @@ mod tests {
             .accept_with_clock(&latest, &authority, false, || 102)
             .unwrap();
         assert_eq!(store.load(&authority).unwrap().revision, 10);
+    }
+
+    #[test]
+    fn automatic_updates_require_an_initialized_and_unlocked_store() {
+        let dir = directory();
+        let path = dir.path().canonicalize().unwrap();
+        let key = veil_crypto::generate_keypair(ALGORITHM);
+        let authority = RoutePolicyAuthority {
+            network_id: NETWORK,
+            algorithm: ALGORITHM,
+            public_key: &key.public_key,
+        };
+        let expiry = veil_util::unix_secs_now_u64() + 600;
+        let policy = signed(&key, 1, expiry, 2);
+        let store = RoutePolicyStore::open(&path).unwrap();
+        assert!(matches!(
+            store.try_accept(&policy, &authority),
+            Err(StoreError::Uninitialized)
+        ));
+        store.accept(&policy, &authority, true).unwrap();
+        let next = signed(&key, 2, expiry, 3);
+        let lock = store.lock(false).unwrap();
+        assert!(matches!(
+            store.try_accept(&next, &authority),
+            Err(StoreError::Busy)
+        ));
+        assert!(matches!(
+            store.try_load_signed(&authority),
+            Err(StoreError::Busy)
+        ));
+        drop(lock);
+        assert_eq!(store.try_accept(&next, &authority).unwrap().revision, 2);
+        let (accepted, bytes) = store.try_load_signed(&authority).unwrap();
+        assert_eq!(accepted.revision, 2);
+        assert_eq!(bytes, next);
     }
 
     #[test]
