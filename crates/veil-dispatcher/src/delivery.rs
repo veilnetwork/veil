@@ -108,6 +108,11 @@ pub(crate) struct DecryptedForward {
     pub(crate) app_sender: Option<[u8; 32]>,
 }
 
+enum TerminalAdmission {
+    Complete,
+    RetryWhenReady,
+}
+
 impl DecryptedForward {
     /// A payload whose sender is a claim as far as the ciphertext is concerned.
     /// The caller may still know something about it from the transport.
@@ -1710,15 +1715,15 @@ impl FrameDispatcher {
         envelope: DeliveryEnvelope,
         peer_id: NodeId,
         reverse_peer: Option<NodeIdBytes>,
-        chunk_receipt: Option<ChunkReceiptBinding>,
-    ) {
+        chunk_receipt: Option<&ChunkReceiptBinding>,
+    ) -> TerminalAdmission {
         // Relay-chunked piece? Divert to reassembly. Only the reassembled
         // ORIGINAL envelope (payload no longer chunk-marked) proceeds below, so
         // app_id/endpoint_id/E2E/ACK semantics are preserved instead of being
         // flattened into an epidemic broadcast.
         if envelope.payload.first() == Some(&veil_proto::delivery::CHUNKED_ENVELOPE_MARKER) {
             self.handle_chunk_envelope(envelope, peer_id, reverse_peer);
-            return;
+            return TerminalAdmission::Complete;
         }
 
         // Terminal replay guard: the same envelope can arrive here twice (a
@@ -1729,7 +1734,32 @@ impl FrameDispatcher {
         // sentinel — never dedup it (that would collapse every zero-id frame
         // into one); just deliver.
         let content_id = envelope.content_id;
-        if content_id != [0u8; 32] && lock!(self.forward_seen_content).check_and_insert(content_id)
+        let first_byte = envelope.payload.first().copied();
+        let require_admission = reverse_peer.is_some()
+            && envelope.require_ack
+            && matches!(
+                first_byte,
+                Some(veil_proto::E2E_MARKER | veil_proto::RATCHET_E2E_MARKER)
+            );
+        let already_delivering = require_admission
+            && content_id != [0; 32]
+            && lock!(self.forward_seen_content).contains_live(&content_id);
+        let reservation = if require_admission && !already_delivering {
+            // Reserve before touching the ratchet. A postponed message stays
+            // decryptable on retry and leaves no plaintext in a pending queue.
+            let Some(slot) = self
+                .app_registry
+                .reserve_delivery(envelope.app_id, envelope.endpoint_id)
+            else {
+                return TerminalAdmission::RetryWhenReady;
+            };
+            Some(slot)
+        } else {
+            None
+        };
+        if already_delivering
+            || (content_id != [0u8; 32]
+                && lock!(self.forward_seen_content).check_and_insert(content_id))
         {
             // Duplicate terminal arrival (audit cycle-8 H8): a retransmit because
             // our original DELIVERED ACK was lost (the retransmit window 15 s is
@@ -1751,16 +1781,15 @@ impl FrameDispatcher {
             if let Some((sender, key, previous)) = replay {
                 self.send_delivery_ack(sender, content_id, key, previous);
             }
-            return;
+            return TerminalAdmission::Complete;
         }
         // A signed "cannot open" reply is for the ratchet, never for an app.
         // Only the runtime can check its signature (it needs the replier's
         // identity document), so it goes to the verify task and nowhere else.
         if envelope.app_id == veil_proto::RATCHET_UNOPENABLE_APP_ID {
             self.enqueue_relayed_unopenable(&envelope.payload);
-            return;
+            return TerminalAdmission::Complete;
         }
-        let first_byte = envelope.payload.first().copied();
 
         // Every decapsulation seed this envelope could legitimately be sealed
         // to, in descending likelihood: the per-session ephemeral seed
@@ -1810,7 +1839,7 @@ impl FrameDispatcher {
             &mut deliver_endpoint_id,
             peer_id,
         ) else {
-            return; // decrypt failed — metric already incremented.
+            return TerminalAdmission::Complete; // decrypt failure is counted in the opener.
         };
         let decrypted_app_sender = decrypted.app_sender;
         let sender = decrypted_app_sender.unwrap_or(deliver_sender_node_id);
@@ -1819,7 +1848,7 @@ impl FrameDispatcher {
                 .sender_device_id
                 .is_some_and(|device| self.app_registry.is_peer_revoked(&device))
         {
-            return;
+            return TerminalAdmission::Complete;
         }
         let (app_payload, ack_key) = (decrypted.payload, decrypted.ack_key);
 
@@ -1887,22 +1916,24 @@ impl FrameDispatcher {
         // device to an IPC consumer that uses that pair for authorization.
         // Without current certificate evidence, omit the device rather than
         // teaching the app an attacker-selected device/identity association.
-        let origin_device = decrypted.sender_device_id;
-        self.app_registry.route_ipc_deliver_with_reply(
-            sender,
-            provenance,
-            None,
-            origin_device,
-            deliver_src_app_id,
-            deliver_app_id,
-            deliver_endpoint_id,
-            veil_bufpool::pooled_shared_from_vec(app_payload),
-            0,
+        let delivered = self.app_registry.route_delivery(
+            veil_app::registry::AppMessage::Deliver {
+                src_node_id: sender,
+                provenance,
+                sender_device_id: None,
+                origin_device: decrypted.sender_device_id,
+                src_app_id: deliver_src_app_id,
+                app_id: deliver_app_id,
+                endpoint_id: deliver_endpoint_id,
+                data: veil_bufpool::pooled_shared_from_vec(app_payload),
+                reply_id: 0,
+            },
+            reservation,
         );
 
         // send E2E delivery ACK back to the original sender, MAC'd with the
         // per-message ACK key (C-09) so a relay cannot forge it.
-        if envelope.require_ack {
+        if envelope.require_ack && (delivered || !require_admission) {
             let reverse_peer = reverse_peer.filter(|_| ack_key != [0; 32]);
             // Cache before sending so a fast retry can reuse the same evidence.
             if content_id != [0; 32] {
@@ -1913,12 +1944,13 @@ impl FrameDispatcher {
                         key: ack_key,
                         reverse_peer,
                         envelope_hash: reverse_peer.map(|_| blake3::hash(&envelope.payload)),
-                        chunk_receipt: reverse_peer.and(chunk_receipt),
+                        chunk_receipt: reverse_peer.and_then(|_| chunk_receipt.cloned()),
                     },
                 );
             }
             self.send_delivery_ack(deliver_sender_node_id, content_id, ack_key, reverse_peer);
         }
+        TerminalAdmission::Complete
     }
 
     /// Accumulate one relay-chunked envelope. Each chunk is an ordinary Forward
@@ -1942,6 +1974,7 @@ impl FrameDispatcher {
                 return;
             }
         };
+        let transfer_id = chunk.transfer_id;
         let now = veil_util::unix_secs_now_u64();
         let (result, receipt) = lock!(self.chunk_reassembler).add_forward(
             &envelope,
@@ -1965,7 +1998,12 @@ impl FrameDispatcher {
                 );
                 // Re-enter terminal delivery; the reassembled payload is no
                 // longer chunk-marked, so it takes the normal decrypt+deliver path.
-                self.terminal_deliver(*reassembled, peer_id, reverse_peer, receipt);
+                if let TerminalAdmission::RetryWhenReady =
+                    self.terminal_deliver(*reassembled, peer_id, reverse_peer, receipt.as_ref())
+                    && let Some(binding) = receipt
+                {
+                    lock!(self.chunk_reassembler).reopen_deferred(transfer_id, &binding);
+                }
             }
             AddChunkResult::CompletedReplay(orig_content_id) => {
                 let replay = lock!(self.terminal_ack_replay)
@@ -5431,6 +5469,106 @@ mod ratchet_terminal_tests {
             }) => Some((src_node_id, provenance, data.as_ref().to_vec())),
             Ok(other) => panic!("expected a Deliver, got {other:?}"),
             Err(_) => None,
+        }
+    }
+
+    #[test]
+    fn private_full_app_queue_leaves_single_and_chunked_ratchet_retries_openable() {
+        use veil_proto::delivery::{ChunkContentCommitment, ChunkedEnvelopePayload};
+        use veil_proto::header::HEADER_SIZE;
+        use veil_session::SessionTxRegistry;
+
+        for chunked in [false, true] {
+            let (alice, bob) = (party(ALICE, 0xA1), party(BOB, 0xB1));
+            learn(&bob, &alice);
+            let plaintext = b"only acknowledge after application admission";
+            let sealed = seal(&alice, &bob, plaintext);
+            let (mut disp, endpoint, _) = dispatcher_for(&bob);
+            drop(endpoint);
+            disp.relay_delivery_acks = Some(Default::default());
+            let sessions = Arc::new(RwLock::new(SessionTxRegistry::new()));
+            let mut notices = wlock!(sessions).register(RELAY);
+            disp.session_tx_registry = Some(sessions);
+            let (_endpoint, mut app) = disp.app_registry.register(APP, ENDPOINT, 1);
+            assert!(disp.app_registry.route_ipc_deliver_with_reply(
+                ALICE,
+                SenderProvenance::LocalIpc,
+                None,
+                None,
+                [0; 32],
+                APP,
+                ENDPOINT,
+                veil_bufpool::pooled_shared_from_vec(b"fill".to_vec()),
+                0,
+            ));
+
+            let (template, body) = forward_frame([0x91; 32], sealed.clone());
+            let mut forward = ForwardPayload::decode(&body).unwrap();
+            let (id, frames) = if chunked {
+                let transfer = [0x51; 16];
+                let parts = sealed.chunks(sealed.len().div_ceil(2)).collect::<Vec<_>>();
+                let mut commitment = ChunkContentCommitment::new(
+                    &forward.envelope,
+                    transfer,
+                    2,
+                    sealed.len() as u32,
+                );
+                for part in &parts {
+                    commitment.append(ChunkContentCommitment::leaf(part));
+                }
+                let id = commitment.content_id();
+                let frames = parts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, part)| {
+                        forward.envelope.content_id = [index as u8 + 1; 32];
+                        forward.envelope.payload = ChunkedEnvelopePayload {
+                            transfer_id: transfer,
+                            chunk_index: index as u32,
+                            chunk_count: 2,
+                            total_size: sealed.len() as u32,
+                            orig_content_id: id,
+                            require_ack: true,
+                            data: part.to_vec(),
+                        }
+                        .encode_committed();
+                        forward.encode()
+                    })
+                    .collect::<Vec<_>>();
+                (id, frames)
+            } else {
+                forward.envelope.require_ack = true;
+                (forward.envelope.content_id, vec![forward.encode()])
+            };
+            let dispatch = || {
+                for frame in &frames {
+                    let mut header = template.clone();
+                    header.body_len = frame.len() as u32;
+                    disp.dispatch(&header, frame, NodeId::from(RELAY));
+                }
+            };
+
+            let version = bob.runtime.store.version();
+            dispatch();
+            assert_eq!(
+                bob.runtime.store.version(),
+                version,
+                "a full app queue must not advance the ratchet"
+            );
+            assert!(notices.try_recv().is_err());
+            assert_eq!(take(&mut app).unwrap().2, b"fill");
+
+            dispatch();
+            let original = notices.try_recv().unwrap().1;
+            let ack = DeliveryStatusPayload::decode(&original[HEADER_SIZE..]).unwrap();
+            assert_eq!(ack.content_id, id);
+            assert_eq!(ack.status, delivery_status::RELAYED_DELIVERED);
+            let after_delivery = bob.runtime.store.version();
+            dispatch(); // replay the receipt even while the accepted delivery occupies the slot
+            assert_eq!(&*notices.try_recv().unwrap().1, &*original);
+            assert_eq!(bob.runtime.store.version(), after_delivery);
+            assert_eq!(take(&mut app).unwrap().2, plaintext);
+            assert!(take(&mut app).is_none());
         }
     }
 

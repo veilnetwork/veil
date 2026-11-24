@@ -217,6 +217,14 @@ struct EndpointSlot {
     generation: EndpointGen,
 }
 
+/// A queue slot reserved against one specific endpoint registration.
+pub struct AppDeliveryPermit {
+    key: EndpointKey,
+    generation: EndpointGen,
+    registry: Arc<Mutex<RegistryInner>>,
+    permit: mpsc::OwnedPermit<AppMessage>,
+}
+
 #[derive(Debug, Default)]
 struct RegistryInner {
     endpoints: HashMap<EndpointKey, EndpointSlot>,
@@ -514,18 +522,7 @@ impl AppEndpointRegistry {
         data: veil_bufpool::PooledShared,
         reply_id: u64,
     ) -> bool {
-        if provenance != SenderProvenance::LocalIpc
-            && (self.is_peer_revoked(&src_node_id)
-                || sender_device_id.is_some_and(|device| self.is_peer_revoked(&device)))
-        {
-            return false;
-        }
-        let key = EndpointKey {
-            app_id,
-            endpoint_id,
-        };
-        self.send_to(
-            key,
+        self.route_delivery(
             AppMessage::Deliver {
                 src_node_id,
                 provenance,
@@ -537,7 +534,89 @@ impl AppEndpointRegistry {
                 data,
                 reply_id,
             },
+            None,
         )
+    }
+
+    /// Reserve one local queue slot before opening a retryable ciphertext.
+    pub fn reserve_delivery(
+        &self,
+        app_id: [u8; 32],
+        endpoint_id: u32,
+    ) -> Option<AppDeliveryPermit> {
+        let key = EndpointKey {
+            app_id,
+            endpoint_id,
+        };
+        let inner = lock!(self.inner);
+        let slot = inner.endpoints.get(&key)?;
+        let permit = match slot.sender.clone().try_reserve_owned() {
+            Ok(permit) => permit,
+            Err(error) => {
+                if let Some(metrics) = &self.metrics {
+                    match error {
+                        mpsc::error::TrySendError::Full(_) => metrics.inc_app_msg_channel_full(),
+                        mpsc::error::TrySendError::Closed(_) => {
+                            metrics.inc_app_msg_channel_closed()
+                        }
+                    }
+                }
+                return None;
+            }
+        };
+        Some(AppDeliveryPermit {
+            key,
+            generation: slot.generation,
+            registry: Arc::clone(&self.inner),
+            permit,
+        })
+    }
+
+    /// Admit a delivery event to the current endpoint. A reservation must
+    /// still name the same live registration when the message is ready.
+    pub fn route_delivery(
+        &self,
+        message: AppMessage,
+        reservation: Option<AppDeliveryPermit>,
+    ) -> bool {
+        let AppMessage::Deliver {
+            src_node_id,
+            provenance,
+            sender_device_id,
+            origin_device,
+            app_id,
+            endpoint_id,
+            ..
+        } = &message
+        else {
+            return false;
+        };
+        if *provenance != SenderProvenance::LocalIpc
+            && (self.is_peer_revoked(src_node_id)
+                || sender_device_id.is_some_and(|device| self.is_peer_revoked(&device))
+                || (reservation.is_some()
+                    && origin_device.is_some_and(|device| self.is_peer_revoked(&device))))
+        {
+            return false;
+        }
+        let key = EndpointKey {
+            app_id: *app_id,
+            endpoint_id: *endpoint_id,
+        };
+        let Some(reservation) = reservation else {
+            return self.send_to(key, message);
+        };
+        let inner = lock!(self.inner);
+        if reservation.key != key
+            || !Arc::ptr_eq(&reservation.registry, &self.inner)
+            || !inner.endpoints.get(&key).is_some_and(|slot| {
+                slot.generation == reservation.generation && !slot.sender.is_closed()
+            })
+        {
+            return false;
+        }
+        drop(reservation.permit.send(message));
+        true
     }
 
     /// Get a clone of the sender for an endpoint, if it exists and is live.
@@ -841,6 +920,33 @@ impl Drop for EndpointHandle {
 mod tests {
     use super::*;
     use veil_proto::app::{AppDataPayload, AppSendPayload};
+
+    #[test]
+    fn delivery_reservation_requires_the_same_endpoint_generation() {
+        let registry = AppEndpointRegistry::new();
+        let app_id = [0xB1; 32];
+        let (_first, mut old_rx) = registry.register(app_id, 7, 1);
+        let stale = registry.reserve_delivery(app_id, 7).unwrap();
+        assert!(registry.reserve_delivery(app_id, 7).is_none());
+        let (_current, mut new_rx) = registry.register(app_id, 7, 1);
+        let deliver = || AppMessage::Deliver {
+            src_node_id: [0xA1; 32],
+            provenance: SenderProvenance::SessionPeer,
+            sender_device_id: None,
+            origin_device: None,
+            src_app_id: [0; 32],
+            app_id,
+            endpoint_id: 7,
+            data: veil_bufpool::pooled_shared_from_vec(vec![1]),
+            reply_id: 0,
+        };
+        assert!(!registry.route_delivery(deliver(), Some(stale)));
+        assert!(old_rx.try_recv().is_err());
+        assert!(new_rx.try_recv().is_err());
+        let current = registry.reserve_delivery(app_id, 7).unwrap();
+        assert!(registry.route_delivery(deliver(), Some(current)));
+        assert!(matches!(new_rx.try_recv(), Ok(AppMessage::Deliver { .. })));
+    }
 
     fn sample_app_id() -> [u8; 32] {
         [0x55u8; 32]

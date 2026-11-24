@@ -377,6 +377,26 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   confirmed both sizes on their first retries after about 5.8 seconds.
   The destination delivered each message to the application once.
 
+#### Confirming local application admission
+
+- An acknowledged, encrypted P-Net Forward reserves a slot in the
+  destination application queue before opening the ciphertext. A busy or
+  absent endpoint leaves the ratchet unchanged and allows the sender's
+  existing retry to try again. Completed chunk reassembly can reopen for
+  that retry without retaining plaintext.
+- The recipient creates a delivery receipt only after enqueueing to the
+  same live endpoint registration. That receipt confirms queue admission.
+  A registration that closes during decryption causes a delivery failure
+  with no receipt. The receiver can still replay a cached receipt for an
+  already admitted message while its application queue is full.
+- On the Linux IPC stand, an application unbound its endpoint before a
+  150,000-byte send and rebound it after the first arrival. The previous
+  daemon returned a receipt in 5 ms, with zero application deliveries.
+  The updated recipient delivered once after rebinding and confirmed the
+  first retry after 5.5 to 5.8 seconds. The mixed run upgraded only the
+  recipient. A dispatcher test also covered a full queue with single and
+  chunked ratchet ciphertexts.
+
 ## 3. Distribute owner-authorized peer policy
 
 - Sign a versioned snapshot of virtual address assignments with the

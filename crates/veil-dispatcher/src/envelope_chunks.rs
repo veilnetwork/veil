@@ -139,6 +139,24 @@ impl EnvelopeChunkReassembler {
         self.total_buffered
     }
 
+    /// Allow a sender retry after a completed encrypted transfer could not
+    /// reserve local app capacity. A stale caller cannot reopen a newer transfer.
+    pub(crate) fn reopen_deferred(
+        &mut self,
+        transfer_id: TransferId,
+        binding: &ChunkReceiptBinding,
+    ) {
+        let key = (None, transfer_id);
+        if self
+            .completed
+            .get(&key)
+            .and_then(|done| done.receipt.as_ref())
+            .is_some_and(|receipt| receipt.binding.matches(binding))
+        {
+            self.completed.remove(&key);
+        }
+    }
+
     /// Feed one chunk (already decoded from the chunk-envelope's payload). The
     /// `envelope` is the carrier chunk-envelope — its addressing fields are
     /// snapshotted on first sight and used to rebuild the original message.

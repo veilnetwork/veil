@@ -771,6 +771,10 @@ impl ForwardSeenSet {
         Self(ExpiryCache::new(ttl, max_size))
     }
 
+    pub(crate) fn contains_live(&self, content_id: &[u8; 32]) -> bool {
+        self.0.contains_live(content_id)
+    }
+
     /// Returns `true` if `content_id` was already seen (duplicate → drop).
     /// Returns `false` and records it if it's new.
     pub fn check_and_insert(&mut self, content_id: [u8; 32]) -> bool {
