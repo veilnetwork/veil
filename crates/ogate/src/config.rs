@@ -250,11 +250,25 @@ pub struct BatchConfig {
     /// deployments).
     #[serde(default = "BatchConfig::default_enabled")]
     pub enabled: bool,
+    /// Time budget for collecting packets for the same peer before flushing.
+    #[serde(
+        default = "BatchConfig::default_flush_after_us",
+        skip_serializing_if = "BatchConfig::is_default_flush_after_us"
+    )]
+    pub flush_after_us: u32,
 }
 
 impl BatchConfig {
     fn default_enabled() -> bool {
         true
+    }
+
+    fn default_flush_after_us() -> u32 {
+        200
+    }
+
+    fn is_default_flush_after_us(value: &u32) -> bool {
+        *value == Self::default_flush_after_us()
     }
 }
 
@@ -262,6 +276,7 @@ impl Default for BatchConfig {
     fn default() -> Self {
         Self {
             enabled: Self::default_enabled(),
+            flush_after_us: Self::default_flush_after_us(),
         }
     }
 }
@@ -337,6 +352,11 @@ impl OgateConfig {
         }
         if self.app.is_empty() {
             return Err(ConfigError::Field("`app` must not be empty"));
+        }
+        if !(1..=32_000).contains(&self.batch.flush_after_us) {
+            return Err(ConfigError::Field(
+                "`batch.flush_after_us` must be in 1..=32000",
+            ));
         }
         if let Some(policy) = &self.signed_policy {
             policy.mirror_ids()?;
@@ -546,6 +566,12 @@ owner_algo = "ed25519"
         assert!(cfg.peers.is_empty());
         // Audit batch 2026-05-24 (M13): batching defaults to enabled.
         assert!(cfg.batch.enabled);
+        assert_eq!(cfg.batch.flush_after_us, 200);
+        assert!(
+            !toml::to_string(&cfg.batch)
+                .unwrap()
+                .contains("flush_after_us")
+        );
     }
 
     #[test]
@@ -559,6 +585,31 @@ owner_algo = "ed25519"
         "#;
         let cfg: OgateConfig = toml::from_str(toml).unwrap();
         assert!(!cfg.batch.enabled);
+    }
+
+    #[test]
+    fn batch_flush_interval_is_bounded() {
+        let toml = r#"
+            network = "homenet"
+            local_addr_v4 = "10.99.0.1"
+
+            [batch]
+            flush_after_us = 20000
+        "#;
+        let mut cfg: OgateConfig = toml::from_str(toml).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.batch.enabled);
+        assert_eq!(cfg.batch.flush_after_us, 20_000);
+
+        for interval in [0, 32_001] {
+            cfg.batch.flush_after_us = interval;
+            assert!(
+                cfg.validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("batch.flush_after_us")
+            );
+        }
     }
 
     #[test]

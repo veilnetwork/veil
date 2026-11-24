@@ -148,6 +148,50 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   loopback run of the final daemon and Veil v0.11.59 delivered 1,000
   SDK chat messages in each direction.
 
+### Emulated inter-site link
+
+- Three nodes spanned two emulated sites on one Linux ARM64 host. The
+  link between sites had 2 Mb/s in each direction, 60 ms one-way delay
+  with 5 ms variation, and 0.3% packet loss. The last subscriber ran the
+  previous daemon. Median tunnel RTT was 151 ms across sites and
+  6.24 ms within a site with TCP, and 153 ms and 6.36 ms with obfs4 on
+  the inter-site hop.
+- Under a paced 1 Mb/s UDP flow, the 217,260-byte signed snapshot with
+  4,096 assignments reached both subscribers in 16.83 s over TCP and
+  21.58 s with obfs4. The local path stayed usable during the partition
+  until the signed policy expired. At expiry both directions were
+  blocked while the local transport session remained established.
+- Restoring the link left the expired routes disabled. A newer signed
+  revision restored the original tunnels 30.48 s after publication
+  over TCP and 28.85 s with obfs4. The revision floor rejected an older
+  signed snapshot that was still within its original validity period.
+  An owner-authorized ban crossed the WAN and blocked the local pair in
+  both directions by the 33.16 s and 32.83 s probes respectively.
+- A separate two-node baseline at 1 Mb/s offered UDP delivered 1,699 of
+  1,706 raw datagrams and 950 of 1,706 tunneled datagrams. The tunnel
+  reported 1,553 session send queue refusals and zero kernel TUN drops.
+  The 0.5 Mb/s run delivered 826 of 854 tunneled datagrams. With emulated
+  loss set to zero the 1 Mb/s tunnel still delivered only 953 of 1,706.
+- At 0.25 Mb/s, the writer admitted one 3,627-byte `APP_SEND_SEALED`
+  frame per 1,100-byte UDP payload in all 115 samples. That length
+  matches the existing ratchet format with both ML-KEM fields present
+  (1,184 and 1,088 bytes), before the session AEAD tag.
+- ogate now accepts a local `[batch].flush_after_us` setting and defaults
+  to the original 200 µs interval. With TCP and a receiver on the
+  previous ogate, increasing the sender's interval to 24 ms raised
+  delivery from 940 to 1,706 of 1,706 datagrams on the same 1 Mb/s
+  workload. Session send queue refusals fell from 1,500 to zero, and
+  measured session bytes per delivered datagram fell from about 3,646
+  to 2,144. Median idle RTT rose from 152.5 ms to 177 ms. The batch
+  wire format is unchanged and queued packets still pass the current
+  route and admission checks before submission.
+- With obfs4, delivery increased from 738 of 1,703 datagrams to all
+  1,706, and session send queue refusals fell from 1,878 to zero.
+  Median idle RTT rose from 152 ms to 178.5 ms.
+- A joiner with the greater node ID established a direct private
+  session and delivered 10 of 10 tunnel probes through an inbound-only
+  entry point listed solely in `[[bootstrap_peers]]`.
+
 ## 3. Distribute owner-authorized peer policy
 
 - Sign a versioned snapshot of virtual address assignments with the

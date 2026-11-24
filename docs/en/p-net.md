@@ -181,10 +181,15 @@ veil-cli peers banned
 
 Set `[network].mode = "private_configured"` to start from entry points
 supplied by the operator. Use the same network ID, owner key and
-membership certificate as for `private`. Add a provisioned entry point
-as a `[[peers]]`, `[[bootstrap_peers]]` or `[[pinned_relays]]` row with
-its expected public key and transport address. An inbound-only node
-can leave those lists empty.
+membership certificate as for `private`. Each provisioned entry needs
+its expected public key and transport address.
+
+- For permanent neighbors, add a reciprocal `[[peers]]` entry on each
+  node. Veil chooses the dialer based on the two node IDs.
+- To join through an inbound-only entry point, add it to
+  `[[bootstrap_peers]]` on the joining node. The entry point can leave
+  its peer lists empty. Keep the entry in one list on the joining node.
+- For a provisioned relay, use `[[pinned_relays]]`.
 
 This profile skips public rendezvous, automatic LAN and mesh discovery,
 built-in seeds, DNS and HTTPS seed discovery, and remembered or cached
@@ -280,6 +285,14 @@ after binding to the same node and named endpoint. P-Net routes are
 verified again and ogate discards its pending packet batches from the
 old binding. Restart ogate after an intentional change to the local
 node identity.
+
+On a bandwidth-limited link, ogate can collect packets for the same peer
+for a little longer to reduce the number of Veil frames. Set
+`[batch].flush_after_us` in the sending node's `ogate.toml` and restart
+ogate. The default is 200 µs and the accepted range is 1–32,000 µs.
+Increasing the interval adds delay to sparse traffic. The existing
+batch size and packet count limits still trigger an immediate flush.
+Add the setting only to nodes whose ogate version supports it.
 
 ### Operator flow
 

@@ -92,12 +92,6 @@ fn egress_flush_bytes() -> usize {
 // Audit batch 2026-05-24 (M13): rolling upgrade safety — operators can
 // flip off batching during mixed-version rollouts without re-compile.
 
-/// Egress max-batch-age before forced flush.  Tradeoff: smaller = lower latency,
-/// larger = better coalescing.  200 µs picks the same order-of-magnitude as the
-/// tokio scheduling jitter we see in production traces, so coalescing aggregates
-/// "what naturally arrives between schedules" without adding visible latency.
-const EGRESS_FLUSH_AFTER: Duration = Duration::from_micros(200);
-
 /// Hot-swappable state: peer routing decisions + peer app_id lookup.
 ///
 /// Egress and ingress tasks `.load()` this on every packet. SIGHUP swaps
@@ -448,6 +442,9 @@ pub fn validate_reload(old: &OgateConfig, new: &OgateConfig) -> Result<(), &'sta
     if old.signed_policy != new.signed_policy {
         return Err("signed_policy");
     }
+    if old.batch.flush_after_us != new.batch.flush_after_us {
+        return Err("batch.flush_after_us");
+    }
     // `mode` and `peers` are intentionally reloadable.
     Ok(())
 }
@@ -731,7 +728,7 @@ async fn serve_link(
     // + N × (u16 len, ip-packet)).  Flush triggers:
     //   * a batch hits `EGRESS_FLUSH_BYTES` (size cap)
     //   * a batch hits 255 packets (count cap, enforced by `should_flush`)
-    //   * `EGRESS_FLUSH_AFTER` elapses since the batch's first push
+    //   * the configured flush interval elapses since the batch's first push
     //
     // Legacy peers parse the envelope's first byte as `version|IHL`, fail
     // both IPv4 (0x4N) and IPv6 (0x6N) checks, and silently drop. Upgraded
@@ -747,8 +744,10 @@ async fn serve_link(
 
     // Audit batch 2026-05-24 (M13): config-driven kill-switch.
     let batching_enabled = bridge.batching_enabled;
+    let flush_after = Duration::from_micros(u64::from(cfg.batch.flush_after_us));
     tracing::info!(
         batching_enabled,
+        flush_after_us = cfg.batch.flush_after_us,
         "egress batching state — set [batch] enabled = false for rolling-upgrade safety"
     );
 
@@ -786,9 +785,7 @@ async fn serve_link(
                 // for the oldest pending batch.  `tokio::time::sleep_until` requires
                 // a concrete Instant; if no batch is open, just sleep "forever"
                 // (the TUN read will wake us first).
-                let deadline = batches
-                    .earliest_deadline()
-                    .map(|first| first + EGRESS_FLUSH_AFTER);
+                let deadline = batches.earliest_deadline().map(|first| first + flush_after);
                 let timer = async {
                     match deadline {
                         Some(d) => tokio::time::sleep_until(d.into()).await,
@@ -805,7 +802,7 @@ async fn serve_link(
                     }
                     _ = timer => {
                         // Timer fired: flush every batch whose deadline has expired.
-                        let cutoff = std::time::Instant::now() - EGRESS_FLUSH_AFTER;
+                        let cutoff = std::time::Instant::now() - flush_after;
                         for (peer_nid, envelope, peer_app_id) in batches.drain_expired(cutoff) {
                             enqueue(&routing_config, peer_nid, peer_app_id, envelope, true).await;
                         }
