@@ -347,6 +347,20 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   and chat tail latency still vary when the ordered transport is loaded.
   The production change also passed TUN traffic in both directions with
   a pre-batch daemon and withdrew the route 0.88 s after its session closed.
+- On the message path, a resolver can skip cloning and parsing the same
+  document when the shared authorization floor matches its applied digest
+  and the local DHT copy is absent or has the same digest. The floor check
+  still applies expiry and retries pending file writes. Changes in either
+  source go through the usual validation and key retirement path.
+- A 23 s paired stand run sampled thread CPU time inside the document
+  refresh on the hub, once per 64 calls. In 621 control and 606 changed
+  samples, median CPU time fell from 3.38 to 1.29 µs and p95 from 5.92
+  to 2.04 µs. Both variants delivered all 200 SDK chat messages. The
+  spoke-to-hub chat p99 fell from 441 to 261 ms in this pair and rose
+  from 386 to 420 ms in the earlier 34 s pair with the build order
+  reversed. IPC attributed 592 versus 723 UDP refusals in the short
+  pair and 2,443 versus 4,083 in the longer pair. Cold ordered-transport
+  contention remains even with the cheaper identity refresh.
 - A separate cold start ran the first end-to-end probes in groups of
   four before opening the UDP flows. All 24 paths answered in 12.52 s.
   The following 38 s sample lost 76 of 137,175 UDP datagrams, with one

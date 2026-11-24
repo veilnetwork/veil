@@ -568,14 +568,27 @@ impl DhtMlKemEkResolver {
     }
 
     pub(crate) fn refresh_local_document(&self, peer: NodeIdBytes) {
+        let floor = &self.cert_store.document_floor;
+        let key = IdentityDocument::dht_key(&peer);
+        let checked = lock!(self.checked_documents)
+            .get(&peer)
+            .map(|row| row.digest);
+        if let Some(digest) = checked
+            // Compare the actual local record, so a new local revocation
+            // always reaches the full path before the caller uses a key.
+            && self.dht.get_local(&key).is_none_or(|bytes| blake3::hash(&bytes).as_bytes() == &digest)
+            && floor.touch_if_current(&peer, &digest, unix_now())
+        {
+            return;
+        }
         // A sibling resolver may have seen a revocation that the local DHT
         // replica no longer serves. Apply that shared floor to warm caches too.
-        if let Some(doc) = self.cert_store.document_floor.current(&peer) {
+        if let Some(doc) = floor.current(&peer) {
             self.observe_document(&doc);
         }
         if let Some(doc) = self
             .dht
-            .get_local(&IdentityDocument::dht_key(&peer))
+            .get_local(&key)
             .and_then(|bytes| IdentityDocument::decode(&bytes).ok())
             .filter(|doc| doc.node_id == peer)
         {
@@ -4423,6 +4436,10 @@ mod tests {
         sign_doc(&mut current, &a_sk);
         assert!(verify_identity_document(&current, now).is_ok());
         dht.store_local(IdentityDocument::dht_key(&target), current.encode());
+        // The synchronous receive path must retire the key immediately,
+        // even when its last refresh matched the entire local document.
+        resolver.refresh_local_document(target);
+        assert!(!rlock!(resolver.peer_ratchet_keys)[&target].names_instance(&b_instance, now));
         assert!(
             resolver
                 .resolve_cert_for_instance_cached(target, b_instance)
@@ -4467,6 +4484,8 @@ mod tests {
             .cert_store
             .restore_peer_authorization(&baseline, now)
             .unwrap();
+        embedded_boot.refresh_local_document(target);
+        assert!(!rlock!(embedded_boot.peer_ratchet_keys)[&target].names_instance(&b_instance, now));
         assert!(
             embedded_boot
                 .resolve_cert_for_instance_cached(target, b_instance)

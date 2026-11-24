@@ -233,6 +233,22 @@ impl IdentityDocumentFloor {
             .map(|floor| floor.document.clone())
     }
 
+    /// Touch an already applied document by digest while checking the shared
+    /// floor under its lock. Like an ordinary repeat observation, this can
+    /// retry a pending on-disk write. It does not settle host durability.
+    pub(crate) fn touch_if_current(&self, peer: &[u8; 32], digest: &[u8; 32], now: u64) -> bool {
+        let mut state = lock!(self.state);
+        if state.unreadable
+            || !state.rows.get(peer).is_some_and(|floor| {
+                &floor.digest == digest && now <= floor.document.valid_until_unix
+            })
+        {
+            return false;
+        }
+        self.touch(&mut state, peer);
+        true
+    }
+
     /// A cold sender may know the identity before its certificate caches have
     /// been rebuilt. This is only a lookup hint: the resolver must revalidate
     /// the current document, registry and exact device certificate afterwards.
@@ -440,10 +456,7 @@ impl IdentityDocumentFloor {
                 return false;
             }
             if previous.digest == digest {
-                state.clock = state.clock.saturating_add(1);
-                let touched = state.clock;
-                state.rows.get_mut(&doc.node_id).unwrap().touched = touched;
-                self.flush(state);
+                self.touch(state, &doc.node_id);
                 return true;
             }
         }
@@ -484,6 +497,16 @@ impl IdentityDocumentFloor {
         state.revision = revision;
         self.flush(state);
         true
+    }
+
+    fn touch(&self, state: &mut State, peer: &[u8; 32]) {
+        state.clock = state.clock.saturating_add(1);
+        state
+            .rows
+            .get_mut(peer)
+            .expect("observed floor row")
+            .touched = state.clock;
+        self.flush(state);
     }
 
     fn flush(&self, state: &mut State) {
@@ -539,6 +562,11 @@ mod tests {
             .unwrap();
         assert_eq!(wakes.load(Ordering::SeqCst), 1);
         assert!(store.is_pending(&doc.node_id));
+        let digest = *blake3::hash(&doc.encode()).as_bytes();
+        assert!(store.touch_if_current(&doc.node_id, &digest, 1000));
+        assert!(store.is_pending(&doc.node_id));
+        assert!(!store.is_durable(&doc.node_id));
+        assert!(!store.touch_if_current(&doc.node_id, &digest, doc.valid_until_unix + 1));
         let revision = store.revision();
         store.acknowledge_host(revision).unwrap();
         assert!(store.is_durable(&doc.node_id));
@@ -550,6 +578,7 @@ mod tests {
         assert!(!store.observe(&invalid, 1001));
         assert_eq!(wakes.load(Ordering::SeqCst), 1);
         assert!(store.observe(&document(17, 1001, true), 1001));
+        assert!(!store.touch_if_current(&doc.node_id, &digest, 1001));
         assert_eq!(wakes.load(Ordering::SeqCst), 2);
         store.acknowledge_host(revision).unwrap();
         assert!(!store.is_durable(&doc.node_id)); // Wake and old ACK grant nothing.
