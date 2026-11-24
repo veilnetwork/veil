@@ -106,6 +106,8 @@ pub struct SharedState {
     pub peer_app_ids: Vec<(NodeId, [u8; 32])>,
     // Only finite deadlines need a wall-clock read on the packet path.
     pnet_expiries: HashMap<NodeId, u64>,
+    // Admission sweeps keep this marker. Reloaded address allocations get a new one.
+    routing_config: Arc<()>,
     /// Configured virtual-iface MTU. Used by the ingress task to drop
     /// oversize packets BEFORE writing to TUN — a compromised peer cannot
     /// inject larger-than-expected frames that would either fragment
@@ -125,6 +127,7 @@ impl SharedState {
             table,
             peer_app_ids,
             pnet_expiries: HashMap::new(),
+            routing_config: Arc::new(()),
             mtu: cfg.mtu,
         })
     }
@@ -156,6 +159,10 @@ impl SharedState {
             .binary_search_by_key(peer, |(node_id, _)| *node_id)
             .ok()
             .map(|index| self.peer_app_ids[index].1)
+    }
+
+    fn permits_queued_egress(&self, config: &Arc<()>, peer: &NodeId, app_id: [u8; 32]) -> bool {
+        Arc::ptr_eq(config, &self.routing_config) && self.app_id_for(peer) == Some(app_id)
     }
 
     fn cert_is_current(&self, peer: &NodeId) -> bool {
@@ -580,7 +587,28 @@ async fn serve_link(
         let app_sender = Arc::clone(&app_sender);
         tokio::spawn(async move {
             let mut tun_r = tun_r.lock().await;
-            let mut batches = EgressBatches::new();
+            let mut batches = EgressBatches::with_ipc_prefix();
+            let mut routing_config = Arc::clone(&state.load().routing_config);
+            let enqueue = async |config: &Arc<()>, peer_nid, peer_app_id, buf, is_batch| {
+                if !state
+                    .load()
+                    .permits_queued_egress(config, &peer_nid, peer_app_id)
+                {
+                    return;
+                }
+                let result = if is_batch {
+                    app_sender
+                        .send_prepared_recoverable(peer_nid, peer_app_id, endpoint_id, buf)
+                        .await
+                } else {
+                    app_sender
+                        .send_prepared(peer_nid, peer_app_id, endpoint_id, buf)
+                        .await
+                };
+                if let Err(error) = result {
+                    tracing::warn!(%error, "ogate egress send failed");
+                }
+            };
             loop {
                 // Pick wake-up source: either the TUN reader OR a deadline timer
                 // for the oldest pending batch.  `tokio::time::sleep_until` requires
@@ -599,12 +627,7 @@ async fn serve_link(
                     _ = shutdown.changed() => {
                         // Best-effort flush on graceful shutdown.
                         for (peer_nid, envelope, peer_app_id) in batches.drain_all() {
-                            if state.load().app_id_for(&peer_nid) != Some(peer_app_id) {
-                                continue;
-                            }
-                            let _ = app_sender
-                                .send_owned(peer_nid, peer_app_id, endpoint_id, envelope)
-                                .await;
+                            enqueue(&routing_config, peer_nid, peer_app_id, envelope, true).await;
                         }
                         break;
                     }
@@ -612,15 +635,7 @@ async fn serve_link(
                         // Timer fired: flush every batch whose deadline has expired.
                         let cutoff = std::time::Instant::now() - EGRESS_FLUSH_AFTER;
                         for (peer_nid, envelope, peer_app_id) in batches.drain_expired(cutoff) {
-                            if state.load().app_id_for(&peer_nid) != Some(peer_app_id) {
-                                continue;
-                            }
-                            if let Err(e) = app_sender
-                                .send_owned(peer_nid, peer_app_id, endpoint_id, envelope)
-                                .await
-                            {
-                                tracing::warn!(error = %e, "egress: batch send failed");
-                            }
+                            enqueue(&routing_config, peer_nid, peer_app_id, envelope, true).await;
                         }
                     }
                     res = tun_r.read_packet_with_prefix(APP_IPC_SEND_PREFIX_BYTES) => match res {
@@ -628,7 +643,7 @@ async fn serve_link(
                             return Err(BridgeError::Tun(e.into()));
                         }
                         Ok(buf) => {
-                            // `buf` layout: [PREFIX uninit][IP packet bytes].
+                            // `buf` layout: [reserved prefix][IP packet bytes].
                             // The PREFIX region is filled in-place by the SDK's
                             // `send_prepared` when we forward `buf` verbatim
                             // (solo-ship and raw paths) — zero memcpy of the
@@ -658,6 +673,10 @@ async fn serve_link(
                                 tracing::trace!("egress: peer route unavailable");
                                 continue;
                             };
+                            if !Arc::ptr_eq(&routing_config, &snap.routing_config) {
+                                batches = EgressBatches::with_ipc_prefix();
+                                routing_config = Arc::clone(&snap.routing_config);
+                            }
                             // Drop the snap before await — `ArcSwap::load` returns
                             // a guard that should be short-lived.
                             drop(snap);
@@ -696,69 +715,33 @@ async fn serve_link(
                                     // handles packets within the obfs4 ceiling.)
                                     // Flush any pending batch first to preserve
                                     // ordering relative to this big packet.
-                                    if let Some(pb) = batches.peek_mut(&peer_nid)
-                                        && !pb.is_empty()
-                                    {
-                                        let envelope = pb.take();
-                                        let _ = app_sender
-                                            .send_owned(peer_nid, peer_app_id, endpoint_id, envelope)
-                                            .await;
+                                    if let Some(envelope) = batches.take_peer(&peer_nid) {
+                                        enqueue(&routing_config, peer_nid, peer_app_id, envelope, true).await;
                                     }
-                                    if state.load().app_id_for(&peer_nid) != Some(peer_app_id) {
-                                        continue;
-                                    }
-                                    // Zero-data-copy: SDK fills the PREFIX bytes
-                                    // in `buf` in place and forwards the whole Vec.
-                                    if let Err(e) = app_sender
-                                        .send_prepared(peer_nid, peer_app_id, endpoint_id, buf)
-                                        .await
-                                    {
-                                        tracing::warn!(error = %e, "egress: solo send failed");
-                                    }
+                                    enqueue(&routing_config, peer_nid, peer_app_id, buf, false).await;
                                 } else {
                                     // Pre-flush: if appending would cross the
                                     // threshold, flush the current batch FIRST,
                                     // then start a fresh batch with this packet.
-                                    let pb = batches.get_or_create(peer_nid, peer_app_id);
-                                    if !pb.is_empty()
-                                        && pb.len() + record_size > egress_flush_bytes
+                                    if batches.peek_mut(&peer_nid)
+                                        .is_some_and(|batch| batch.len() + record_size > egress_flush_bytes)
+                                        && let Some(envelope) = batches.take_peer(&peer_nid)
                                     {
-                                        let envelope = pb.take();
-                                        if let Err(e) = app_sender
-                                            .send_owned(peer_nid, peer_app_id, endpoint_id, envelope)
-                                            .await
-                                        {
-                                            tracing::warn!(error = %e, "egress: pre-flush failed");
-                                        }
+                                        enqueue(&routing_config, peer_nid, peer_app_id, envelope, true).await;
                                     }
-                                    // Re-borrow (take() may have made `pb` stale).
                                     let pb = batches.get_or_create(peer_nid, peer_app_id);
                                     pb.push(pkt);
-                                    if pb.should_flush(egress_flush_bytes) {
-                                        let envelope = pb.take();
-                                        if state.load().app_id_for(&peer_nid) != Some(peer_app_id) {
-                                            continue;
-                                        }
-                                        if let Err(e) = app_sender
-                                            .send_owned(peer_nid, peer_app_id, endpoint_id, envelope)
-                                            .await
-                                        {
-                                            tracing::warn!(error = %e, "egress: batch send failed");
-                                        }
+                                    if pb.should_flush(egress_flush_bytes)
+                                        && let Some(envelope) = batches.take_peer(&peer_nid)
+                                    {
+                                        enqueue(&routing_config, peer_nid, peer_app_id, envelope, true).await;
                                     }
                                 }
                             } else {
                                 // Raw mode (E27 kill-switch off): preserve E26
                                 // wire-byte compatibility.  Zero-copy: SDK fills
                                 // PREFIX inside `buf` and forwards as-is.
-                                let _ = &mut batches;
-                                let _ = pkt;
-                                if let Err(e) = app_sender
-                                    .send_prepared(peer_nid, peer_app_id, endpoint_id, buf)
-                                    .await
-                                {
-                                    tracing::warn!(error = %e, "egress: raw send failed");
-                                }
+                                enqueue(&routing_config, peer_nid, peer_app_id, buf, false).await;
                             }
                         }
                     }
@@ -1263,6 +1246,31 @@ mod tests {
         let retired = configured.with_pnet_admissions(&HashMap::new());
         assert_eq!(retired.table.lookup_egress(address), Decision::NoRoute);
         assert_eq!(retired.app_id_for(&peer), None);
+    }
+
+    #[test]
+    fn queued_packets_follow_current_admission_and_address_assignment() {
+        let mut config = cfg();
+        let peer = [0xaa; 32];
+        let state = SharedState::build(&config).unwrap();
+        let address_assignment = &state.routing_config;
+        let app_id = state.app_id_for(&peer).unwrap();
+        let connected = state.with_pnet_admissions(&HashMap::from([(peer, 0)]));
+        assert!(connected.permits_queued_egress(address_assignment, &peer, app_id));
+        let revoked = state.with_pnet_admissions(&HashMap::new());
+        assert!(!revoked.permits_queued_egress(address_assignment, &peer, app_id));
+
+        let old_address = config.peers[0].addr_v4;
+        config.peers[0].addr_v4 = Some(Ipv4Addr::new(10, 99, 0, 3));
+        config.peers.push(PeerEntry {
+            node_id: "bb".repeat(32),
+            addr_v4: old_address,
+            addr_v6: None,
+            name: None,
+        });
+        let reassigned = SharedState::build(&config).unwrap();
+        assert_eq!(reassigned.app_id_for(&peer), Some(app_id));
+        assert!(!reassigned.permits_queued_egress(address_assignment, &peer, app_id));
     }
 
     #[tokio::test]

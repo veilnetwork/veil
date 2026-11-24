@@ -1511,7 +1511,7 @@ impl AppSender {
     }
 
     /// Zero-DATA-copy send: caller supplies a `Vec<u8>` that already has
-    /// [`crate::APP_IPC_SEND_PREFIX_BYTES`] uninit bytes reserved at the
+    /// [`crate::APP_IPC_SEND_PREFIX_BYTES`] initialized bytes reserved at the
     /// FRONT, then the datagram payload contiguous behind it.  SDK fills
     /// the prefix in place with FrameHeader + AppIpcSendPayload fixed fields
     /// and forwards the whole `buf` to the IPC writer task — no payload
@@ -1534,7 +1534,29 @@ impl AppSender {
                 &self.app_id,
                 &dst_app_id,
                 dst_endpoint_id,
-                0,
+                false,
+            )
+            .await
+    }
+
+    /// Send a prefixed datagram with the local scheduling of [`Self::send_owned`].
+    ///
+    /// The buffer has the same layout as in [`Self::send_prepared`].
+    pub async fn send_prepared_recoverable(
+        &self,
+        dst_node_id: [u8; 32],
+        dst_app_id: [u8; 32],
+        dst_endpoint_id: u32,
+        buf: Vec<u8>,
+    ) -> Result<(), ClientError> {
+        self.writer
+            .send_prepared_app_ipc_send(
+                buf,
+                &dst_node_id,
+                &self.app_id,
+                &dst_app_id,
+                dst_endpoint_id,
+                true,
             )
             .await
     }

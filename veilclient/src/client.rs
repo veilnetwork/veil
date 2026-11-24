@@ -440,7 +440,7 @@ impl SharedWriter {
     }
 
     /// Zero-data-copy variant: caller supplies a `Vec<u8>` that already
-    /// has [`APP_IPC_SEND_PREFIX_BYTES`] uninit bytes reserved at the
+    /// has [`APP_IPC_SEND_PREFIX_BYTES`] initialized bytes reserved at the
     /// FRONT, followed by the IP packet (or other datagram payload).
     /// This method fills the prefix region in-place with FrameHeader +
     /// AppIpcSendPayload fixed fields, then moves the whole `buf` to the
@@ -455,7 +455,7 @@ impl SharedWriter {
         src_app_id: &[u8; 32],
         dst_app_id: &[u8; 32],
         endpoint_id: u32,
-        flags: u32,
+        recoverable: bool,
     ) -> Result<(), ClientError> {
         use veil_proto::header::HEADER_SIZE;
         const FIXED_SIZE: usize = 32 + 32 + 32 + 4 + 4 + 4; // matches AppIpcSendPayload::FIXED_SIZE
@@ -469,6 +469,13 @@ impl SharedWriter {
         // FrameHeader at [0..HEADER_SIZE].
         let mut hdr = FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppIpcSend as u16);
         hdr.body_len = body_len as u32;
+        if recoverable {
+            veil_proto::ipc::set_ipc_local_source_lane(
+                &mut hdr,
+                veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE,
+                true,
+            );
+        }
         buf[..HEADER_SIZE].copy_from_slice(&codec::encode_header(&hdr));
 
         // AppIpcSendPayload fixed fields at [HEADER_SIZE..APP_IPC_SEND_PREFIX_BYTES].
@@ -481,7 +488,7 @@ impl SharedWriter {
         p += 32;
         buf[p..p + 4].copy_from_slice(&endpoint_id.to_be_bytes());
         p += 4;
-        buf[p..p + 4].copy_from_slice(&flags.to_be_bytes());
+        buf[p..p + 4].fill(0);
         p += 4;
         buf[p..p + 4].copy_from_slice(&(data_len as u32).to_be_bytes());
 
@@ -4089,6 +4096,28 @@ pub async fn connect_ipc_any(anchor: &Path) -> Result<IpcStream, ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn prepared_recoverable_matches_the_ordinary_send_encoder() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let writer = SharedWriter::new(tx);
+        let data = b"tunnel batch";
+        let mut prefixed = vec![0; APP_IPC_SEND_PREFIX_BYTES];
+        prefixed.extend_from_slice(data);
+        let buffer = prefixed.as_ptr();
+        writer
+            .send_prepared_app_ipc_send(prefixed, &[1; 32], &[2; 32], &[3; 32], 13, true)
+            .await
+            .unwrap();
+        writer
+            .write_app_ipc_send_owned(&[1; 32], &[2; 32], &[3; 32], 13, 0, data)
+            .await
+            .unwrap();
+        let prepared = rx.recv().await.unwrap().bytes;
+        assert_eq!(prepared.as_ptr(), buffer);
+        assert_eq!(prepared, rx.recv().await.unwrap().bytes);
+    }
+
     #[tokio::test]
     async fn local_lane_encoding_keeps_the_application_body_unchanged() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);

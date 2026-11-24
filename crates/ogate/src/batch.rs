@@ -34,11 +34,12 @@ pub fn is_batch_envelope(data: &[u8]) -> bool {
 
 /// Per-peer outgoing batch buffer.
 ///
-/// `bridge::run` keeps one of these per active peer so packets for different
+/// `bridge::run` keeps one of these per pending destination so packets for different
 /// destinations don't head-of-line block each other.
 #[derive(Debug)]
 pub struct PeerBatch {
     buf: Vec<u8>,
+    prefix: usize,
     count: u8,
     /// Cached at first-push time.  Flush task uses this to find the oldest
     /// pending batch when its deadline expires.
@@ -50,11 +51,13 @@ pub struct PeerBatch {
 
 impl PeerBatch {
     pub fn new(app_id: [u8; 32]) -> Self {
-        let mut buf = Vec::with_capacity(65_536);
-        buf.push(BATCH_MAGIC);
-        buf.push(0); // count placeholder
+        Self::with_prefix(app_id, 0)
+    }
+
+    fn with_prefix(app_id: [u8; 32], prefix: usize) -> Self {
         Self {
-            buf,
+            buf: Vec::new(),
+            prefix,
             count: 0,
             first_push: None,
             app_id,
@@ -66,7 +69,11 @@ impl PeerBatch {
     }
 
     pub fn len(&self) -> usize {
-        self.buf.len()
+        if self.is_empty() {
+            2
+        } else {
+            self.buf.len() - self.prefix
+        }
     }
 
     pub fn count(&self) -> u8 {
@@ -96,32 +103,34 @@ impl PeerBatch {
             "BatchBuilder::push past 255"
         );
         if self.count == 0 {
+            self.buf.reserve(self.prefix + 2 + 2 + pkt.len());
+            self.buf.resize(self.prefix, 0);
+            self.buf.extend_from_slice(&[BATCH_MAGIC, 0]);
             self.first_push = Some(Instant::now());
         }
         self.buf
             .extend_from_slice(&(pkt.len() as u16).to_be_bytes());
         self.buf.extend_from_slice(pkt);
         self.count = self.count.saturating_add(1);
-        self.buf[1] = self.count;
+        self.buf[self.prefix + 1] = self.count;
     }
 
     /// Should the batch be flushed on size/count grounds RIGHT NOW
     /// (timer-independent)?
     pub fn should_flush(&self, byte_threshold: usize) -> bool {
-        self.count as usize >= BATCH_MAX_COUNT || self.buf.len() >= byte_threshold
+        self.count as usize >= BATCH_MAX_COUNT || self.len() >= byte_threshold
     }
 
-    /// Drain the batch into a Vec<u8>, ready to hand off to `AppSender::send_owned`.
-    /// Leaves an empty (header-only) batch behind so the slot can be reused.
+    /// Move the envelope out, leaving an empty batch.
     pub fn take(&mut self) -> Vec<u8> {
-        // Take the full envelope by swap; reinitialize header in place.
-        let mut out = Vec::with_capacity(self.buf.capacity());
-        out.push(BATCH_MAGIC);
-        out.push(0);
-        std::mem::swap(&mut self.buf, &mut out);
+        if self.is_empty() {
+            let mut header = vec![0; self.prefix];
+            header.extend_from_slice(&[BATCH_MAGIC, 0]);
+            return header;
+        }
         self.count = 0;
         self.first_push = None;
-        out
+        std::mem::take(&mut self.buf)
     }
 }
 
@@ -180,6 +189,7 @@ impl<'a> Iterator for BatchIter<'a> {
 #[derive(Default)]
 pub struct EgressBatches {
     by_peer: std::collections::HashMap<NodeId, PeerBatch>,
+    prefix: usize,
 }
 
 impl EgressBatches {
@@ -187,12 +197,20 @@ impl EgressBatches {
         Self::default()
     }
 
+    #[cfg(unix)]
+    pub(crate) fn with_ipc_prefix() -> Self {
+        Self {
+            prefix: veilclient::APP_IPC_SEND_PREFIX_BYTES,
+            ..Self::default()
+        }
+    }
+
     /// Returns a `&mut PeerBatch` for `peer`, creating it lazily.  Caller
     /// supplies the precomputed `app_id` so the batch envelope carries it.
     pub fn get_or_create(&mut self, peer: NodeId, app_id: [u8; 32]) -> &mut PeerBatch {
         self.by_peer
             .entry(peer)
-            .or_insert_with(|| PeerBatch::new(app_id))
+            .or_insert_with(|| PeerBatch::with_prefix(app_id, self.prefix))
     }
 
     /// Mutable access to the per-peer batch without implicit creation. Caller uses
@@ -202,6 +220,12 @@ impl EgressBatches {
         self.by_peer.get_mut(peer)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn take_peer(&mut self, peer: &NodeId) -> Option<Vec<u8>> {
+        let mut batch = self.by_peer.remove(peer)?;
+        (!batch.is_empty()).then(|| batch.take())
+    }
+
     /// Find the earliest `first_push` across non-empty batches.
     pub fn earliest_deadline(&self) -> Option<Instant> {
         self.by_peer.values().filter_map(|b| b.first_push()).min()
@@ -209,29 +233,19 @@ impl EgressBatches {
 
     /// For each non-empty batch whose `first_push <= cutoff`, yield (peer, drained_buf, app_id).
     pub fn drain_expired(&mut self, cutoff: Instant) -> Vec<(NodeId, Vec<u8>, [u8; 32])> {
-        let mut out = Vec::new();
-        for (peer, b) in self.by_peer.iter_mut() {
-            if let Some(first) = b.first_push()
-                && first <= cutoff
-                && !b.is_empty()
-            {
-                let app_id = *b.app_id();
-                out.push((*peer, b.take(), app_id));
-            }
-        }
-        out
+        self.by_peer
+            .extract_if(|_, batch| batch.first_push().is_some_and(|first| first <= cutoff))
+            .map(|(peer, mut batch)| (peer, batch.take(), *batch.app_id()))
+            .collect()
     }
 
     /// Drain every non-empty batch (used on shutdown).
     pub fn drain_all(&mut self) -> Vec<(NodeId, Vec<u8>, [u8; 32])> {
-        let mut out = Vec::new();
-        for (peer, b) in self.by_peer.iter_mut() {
-            if !b.is_empty() {
-                let app_id = *b.app_id();
-                out.push((*peer, b.take(), app_id));
-            }
-        }
-        out
+        self.by_peer
+            .drain()
+            .filter(|(_, batch)| !batch.is_empty())
+            .map(|(peer, mut batch)| (peer, batch.take(), *batch.app_id()))
+            .collect()
     }
 }
 
@@ -328,5 +342,24 @@ mod tests {
         let expired = batches.drain_expired(mid);
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].0, nid_a);
+        assert!(batches.peek_mut(&nid_a).is_none());
+        assert!(batches.peek_mut(&nid_b).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_prefix_is_reserved_without_changing_envelope_size_or_bytes() {
+        let mut batches = EgressBatches::with_ipc_prefix();
+        let peer = [1; 32];
+        let batch = batches.get_or_create(peer, [2; 32]);
+        let packet = [0x45, 1, 2, 3];
+        batch.push(&packet);
+        assert_eq!(batch.len(), packet.len() + 4);
+        assert!(!batch.should_flush(packet.len() + 5));
+        let buf = batches.take_peer(&peer).unwrap();
+        let (prefix, envelope) = buf.split_at(veilclient::APP_IPC_SEND_PREFIX_BYTES);
+        assert!(prefix.iter().all(|byte| *byte == 0));
+        assert!(BatchIter::new(envelope).eq([packet.as_slice()]));
+        assert!(batches.earliest_deadline().is_none());
     }
 }

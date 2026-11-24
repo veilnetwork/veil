@@ -30,6 +30,12 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 - Use the results to decide whether the daemon needs an optional local
   admission-change subscription. Keep the existing status query available
   to earlier IPC clients.
+- At the legacy query pace, 1,024 configured peers take about 128 s
+  to sweep. Qualify a negotiated IPC status query for bounded groups of
+  configured peer IDs. Reuse the same live-session, membership, ban,
+  and expiry checks and bound the work per connection. Measure sweep
+  CPU and worst-case admission and revocation delay at 34, 256, and
+  1,024 peers, including while packets are flowing.
 
 ### Qualification results
 
@@ -48,9 +54,29 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   stopped 1.04 s after a ban. Idle ping p95 was 30.8 ms before the restart
   and 32.4 ms afterward (30 replies per sample).
 - In the same Linux development build, a saturated TCP flow reached
-  28.45 Mb/s and only 18 of 30 pings received a reply. Repeat with release
-  builds and stepped load, record loss and latency in both directions,
-  and locate the queue or drop point before setting performance targets.
+  28.45 Mb/s and only 18 of 30 pings received a reply. A follow-up
+  development run counted 1,049 drops at the sending TUN device and
+  108 transmit-admission refusals across the session transmitters.
+- An optimized Linux ARM64 A/B run used the same daemon binary in both
+  cases, real TUN interfaces, MTU 1280, 1,100-byte UDP payloads, and
+  isolated single-direction loads of 4, 16, 32, 64, and 128 Mb/s.
+  The build used the release profile with LTO disabled and 16 codegen
+  units to fit the stand. At 128 Mb/s the baseline missed 2 of 101,818
+  datagrams across both directions. The copy-free batch send missed
+  none in its run. At that step each build received all 120 ping
+  replies, with worst per-probe p99 of 3.68 ms and 4.08 ms respectively.
+- Over three saturated TCP runs the baseline reached 505–547 Mb/s
+  with 78 of 90 ping replies. The change reached 498–531 Mb/s with
+  85 of 90 replies. This short stand comparison establishes no
+  throughput gain. Session transmit-admission refusals remain.
+- The optimized bridge recovered after daemon restart with the same
+  process and TUN interface, and blocked a banned peer, with and
+  without packet batching. The prepared batch encoder emits exactly
+  the prior IPC bytes, including the local scheduling lane. Pending
+  batches also check the active address assignment before submission.
+- A short-lived signed member certificate passed traffic before expiry.
+  At expiry, probes failed in both directions while the TCP session
+  and TUN interface were still present.
 
 ## 3. Distribute owner-authorized peer policy
 
