@@ -338,11 +338,27 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 - A mixed-version run confirmed the receipt on the first retry with
   only the shared relay upgraded. In a separate run the old sender's
   retry tracker kept the failed first hop for both retries while ordinary
-  datagrams already passed through the backup. Sender-side selection of
-  the first hop on retry remains an independent recovery case.
+  datagrams already passed through the backup.
 - A shared link that saw only part of the original batch still needs
   coverage. A new upstream needs a complete matching batch on that link
   before taking over its return path.
+
+#### Recovering acknowledged sends after the first hop disappears
+
+- A P-Net sender checks live sessions when the original first hop cannot
+  take the retry. A send with an end-to-end receipt key can use the same
+  live relay candidates as an ordinary sealed send, even when its route
+  cache has no backup. Retries without that key stay on known routes.
+- Admission rechecks recipient and relay revocations, including after a
+  chunk batch has waited for capacity. It respects the destination's
+  pinned instance. A chunk batch still waits for credits on a full queue.
+  Legacy public retries retain their cached path.
+- On a four-node Linux stand, the original relay stopped and an
+  authenticated backup session became available. The sender's cache had
+  no route through the backup. The old daemon failed to receive a receipt
+  after two retries for either 32 or 150,000 bytes. The updated sender
+  confirmed both sizes on their first retries after about 5.8 seconds.
+  The destination delivered each message to the application once.
 
 ## 3. Distribute owner-authorized peer policy
 

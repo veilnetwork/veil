@@ -1699,12 +1699,15 @@ impl NodeRuntime {
     }
 
     pub fn spawn_pending_ack_tick(&mut self) {
-        use ack_chunk_retry::{ChunkRetry, admit_chunk_retry, try_admit_single_retry};
+        use ack_chunk_retry::{
+            ChunkRetry, PrivateRetryPaths, admit_chunk_retry, retry_hops, try_admit_single_retry,
+        };
         use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
         use veil_dispatcher::pending_ack::AckTickOutcome;
         use veil_proto::budget::DELIVERY_ACK_CHECK_INTERVAL_MS;
 
         let pending_ack = Arc::clone(&self.dispatcher.pending_ack);
+        let private_paths = PrivateRetryPaths::for_runtime(self);
         let session_tx_registry = Arc::clone(&self.session_tx_registry);
         let route_cache = Arc::clone(&self.routing.route_cache);
         let app_registry = Arc::clone(&self.app_registry);
@@ -1810,18 +1813,21 @@ impl NodeRuntime {
                 // dropped before `reg` is acquired, so the two never coexist —
                 // the previous code held `reg` across the per-outcome route_cache
                 // read (the inverted order the workspace was audited to avoid).
-                let reroute_hops: std::collections::HashMap<[u8; 32], [u8; 32]> = {
-                    let rc = rlock!(route_cache);
-                    outcomes
-                        .iter()
-                        .filter_map(|o| match o {
-                            AckTickOutcome::Retransmit { dst_node_id, .. } => {
-                                rc.lookup(dst_node_id).map(|hop| (*dst_node_id, hop))
-                            }
-                            _ => None,
-                        })
-                        .collect()
-                };
+                let reroute_hops: std::collections::HashMap<[u8; 32], [u8; 32]> =
+                    if private_paths.is_none() {
+                        let rc = rlock!(route_cache);
+                        outcomes
+                            .iter()
+                            .filter_map(|o| match o {
+                                AckTickOutcome::Retransmit { dst_node_id, .. } => {
+                                    rc.lookup(dst_node_id).map(|hop| (*dst_node_id, hop))
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    } else {
+                        Default::default()
+                    };
 
                 for outcome in outcomes {
                     match outcome {
@@ -1832,9 +1838,16 @@ impl NodeRuntime {
                             content_id,
                             attempt,
                         } => {
-                            if !lock!(pending_ack).retry_is_current(&content_id, attempt) {
-                                continue;
-                            }
+                            let sealed = {
+                                let pending = lock!(pending_ack);
+                                if !pending.retry_is_current(&content_id, attempt) {
+                                    continue;
+                                }
+                                private_paths.is_some()
+                                    && pending
+                                        .peek_ack_info(&content_id)
+                                        .is_some_and(|(_, _, key)| key != [0; 32])
+                            };
                             // this attempt timed out without DELIVERY_ACK —
                             // count it as a loss against the in-flight next_hop so the
                             // periodic eval sees fresh data.
@@ -1860,6 +1873,7 @@ impl NodeRuntime {
                                 in_flight.insert(content_id);
                                 let sender = broadcaster.clone();
                                 let tracker = pending_ack.clone();
+                                let private = private_paths.clone();
                                 let retry = ChunkRetry {
                                     content_id,
                                     next_hop,
@@ -1869,35 +1883,75 @@ impl NodeRuntime {
                                 };
                                 retries.push(
                                     async move {
-                                        let accepted_hop =
-                                            admit_chunk_retry(sender.as_ref(), &tracker, retry)
-                                                .await;
+                                        let accepted_hop = admit_chunk_retry(
+                                            sender.as_ref(),
+                                            &tracker,
+                                            retry,
+                                            private.as_deref(),
+                                            sealed,
+                                        )
+                                        .await;
                                         (content_id, attempt, accepted_hop)
                                     }
                                     .boxed(),
                                 );
                                 continue;
                             }
-                            let reg = rlock!(session_tx_registry);
-                            let send_single = |hop: [u8; 32]| -> bool {
-                                let current =
-                                    lock!(pending_ack).retry_is_current(&content_id, attempt);
-                                current
-                                    && frames.first().is_some_and(|frame| {
-                                        try_admit_single_retry(&reg, hop, frame, attempt)
-                                    })
+                            let Some(frame) = frames.first() else {
+                                continue;
                             };
-                            // Try original hop first.
-                            let sent = send_single(next_hop);
-                            if !sent {
-                                // Original hop dead — re-route via the
-                                // pre-computed route-cache hop (looked up above,
-                                // before the registry guard was taken).
-                                if let Some(new_hop) = reroute_hops.get(&dst_node_id).copied()
-                                    && send_single(new_hop)
+                            let recipient = if private_paths.is_some() {
+                                let Some(envelope) = frame
+                                    .get(veil_proto::HEADER_SIZE..)
+                                    .and_then(|body| {
+                                        veil_proto::delivery::ForwardPayload::decode(body).ok()
+                                    })
+                                    .map(|forward| forward.envelope)
+                                else {
+                                    continue;
+                                };
+                                if veil_util::unix_secs_now_u64()
+                                    > envelope
+                                        .created_at
+                                        .saturating_add(u64::from(envelope.ttl_secs))
                                 {
-                                    // Update stored next_hop for future retransmits.
-                                    lock!(pending_ack).update_next_hop(&content_id, new_hop);
+                                    continue;
+                                }
+                                envelope.recipient
+                            } else {
+                                veil_proto::recipient::Recipient::any(dst_node_id)
+                            };
+                            for hop in retry_hops(
+                                next_hop,
+                                reroute_hops.get(&dst_node_id).copied(),
+                                private_paths.as_deref(),
+                                broadcaster.as_ref(),
+                                recipient,
+                                sealed,
+                            ) {
+                                if !lock!(pending_ack).retry_is_current(&content_id, attempt) {
+                                    break;
+                                }
+                                if private_paths
+                                    .as_ref()
+                                    .is_some_and(|policy| !policy.allows(recipient, &hop))
+                                {
+                                    continue;
+                                }
+                                let sent = try_admit_single_retry(
+                                    &rlock!(session_tx_registry),
+                                    hop,
+                                    frame,
+                                    attempt,
+                                );
+                                if sent {
+                                    if hop != next_hop {
+                                        let mut pending = lock!(pending_ack);
+                                        if pending.retry_is_current(&content_id, attempt) {
+                                            pending.update_next_hop(&content_id, hop);
+                                        }
+                                    }
+                                    break;
                                 }
                             }
                         }

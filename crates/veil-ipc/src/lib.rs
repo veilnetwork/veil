@@ -38,6 +38,7 @@ pub mod source_paths;
 pub mod streams;
 pub mod transport;
 
+pub use handlers::send::relay_hops_to_try as live_source_relay_hops;
 pub use path::IpcEndpoint;
 pub use server::IpcServer;
 pub use streams::IpcStreamTable;

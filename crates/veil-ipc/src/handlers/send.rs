@@ -517,7 +517,7 @@ async fn discover_route(
 /// discovery has only learned the direct peer (or has not populated the cache
 /// yet), any other live overlay session is already a valid first relay hop.
 /// This avoids putting the 500 ms reactive-discovery wait on every RTP packet.
-pub(crate) fn relay_hops_to_try(
+pub fn relay_hops_to_try(
     dst: &[u8; 32],
     route_cache: Option<&RwLock<veil_routing::RouteCache>>,
     session_tx_registry: &dyn FrameBroadcaster,

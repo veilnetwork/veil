@@ -1,12 +1,129 @@
 //! Endpoint-owned acknowledged retries. Relay forwarding never uses this.
 
 use std::future::poll_fn;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::Poll;
 use std::time::Duration;
-use veil_dispatcher::pending_ack::PendingAckTracker;
-use veil_types::FrameBroadcaster;
-use veil_util::lock;
+use veil_dispatcher::{SenderIdentityLookup, pending_ack::PendingAckTracker};
+use veil_proto::recipient::{InstanceTag, Recipient};
+use veil_session::{SessionRegistry, SessionTxRegistry};
+use veil_types::{FrameBroadcaster, NodeIdBytes};
+use veil_util::{lock, rlock};
+
+pub(super) struct PrivateRetryPaths {
+    local_node_id: NodeIdBytes,
+    sessions: Arc<Mutex<SessionRegistry>>,
+    tx: Arc<RwLock<SessionTxRegistry>>,
+    routes: Arc<RwLock<veil_routing::RouteCache>>,
+    apps: Arc<veil_app::AppEndpointRegistry>,
+    identities: SenderIdentityLookup,
+}
+
+impl PrivateRetryPaths {
+    pub(super) fn for_runtime(runtime: &super::NodeRuntime) -> Option<Arc<Self>> {
+        runtime.network_gate.as_ref()?;
+        Some(Arc::new(Self {
+            local_node_id: runtime.dispatcher.local_node_id,
+            sessions: Arc::clone(&runtime.session_registry),
+            tx: Arc::clone(&runtime.session_tx_registry),
+            routes: Arc::clone(&runtime.routing.route_cache),
+            apps: Arc::clone(&runtime.app_registry),
+            identities: Arc::clone(&runtime.dispatcher.sender_identity_lookup),
+        }))
+    }
+
+    pub(super) fn allows(&self, recipient: Recipient, hop: &NodeIdBytes) -> bool {
+        if hop == &self.local_node_id || self.apps.is_peer_revoked(hop) {
+            return false;
+        }
+        let pairing = lock!(self.sessions)
+            .get_by_peer_id(&veil_cfg::NodeId::from(*hop))
+            .and_then(|session| session.validated_sovereign_identity.as_ref())
+            .map(|identity| (identity.node_id, identity.active_instance_id));
+        if pairing.is_some_and(|(identity, _)| self.apps.is_peer_revoked(&identity)) {
+            return false;
+        }
+        let is_recipient = *hop == recipient.node_id
+            || pairing.is_some_and(|(identity, _)| identity == recipient.node_id);
+        if !is_recipient {
+            return true;
+        }
+        if let InstanceTag::Specific(expected) = recipient.instance_tag {
+            let actual = pairing.map_or_else(
+                || hop[..16].try_into().expect("16-byte instance prefix"),
+                |(_, instance)| instance,
+            );
+            if actual != expected {
+                return false;
+            }
+        }
+        let lookup = rlock!(self.identities).clone();
+        lookup.is_none_or(|lookup| {
+            let identity = pairing.map_or(recipient.node_id, |(identity, _)| identity);
+            lookup.application_device_allowed(&identity, hop)
+        })
+    }
+
+    fn alternatives(
+        &self,
+        sender: &dyn FrameBroadcaster,
+        recipient: Recipient,
+        previous: NodeIdBytes,
+        sealed: bool,
+    ) -> Vec<NodeIdBytes> {
+        const MAX_ALTERNATES: usize = 3;
+        let previous_live = rlock!(self.tx).has_session(&previous);
+        let lost_path = !previous_live || !self.allows(recipient, &previous);
+        let candidates = if sealed && lost_path {
+            let mut direct = lock!(self.sessions).resolve_recipient(&recipient);
+            if !direct.contains(&recipient.node_id) {
+                direct.push(recipient.node_id);
+            }
+            direct.extend(veil_ipc::live_source_relay_hops(
+                &recipient.node_id,
+                Some(&self.routes),
+                sender,
+            ));
+            direct
+        } else {
+            rlock!(self.routes).lookup_all(&recipient.node_id)
+        };
+
+        let mut eligible = Vec::with_capacity(MAX_ALTERNATES);
+        for hop in candidates {
+            // Look up session proofs and revocations after releasing the TX guard.
+            let live = rlock!(self.tx).has_session(&hop);
+            if hop != previous && !eligible.contains(&hop) && live && self.allows(recipient, &hop) {
+                eligible.push(hop);
+                if eligible.len() == MAX_ALTERNATES {
+                    break;
+                }
+            }
+        }
+        eligible
+    }
+}
+
+/// Evaluate the fallback only after admission on the previous hop fails.
+pub(super) fn retry_hops<'a>(
+    previous: NodeIdBytes,
+    cached: Option<NodeIdBytes>,
+    private: Option<&'a PrivateRetryPaths>,
+    sender: &'a dyn FrameBroadcaster,
+    recipient: Recipient,
+    sealed: bool,
+) -> impl Iterator<Item = NodeIdBytes> + 'a {
+    std::iter::once(previous).chain(
+        std::iter::once_with(move || {
+            if let Some(private) = private {
+                private.alternatives(sender, recipient, previous, sealed)
+            } else {
+                cached.filter(|hop| *hop != previous).into_iter().collect()
+            }
+        })
+        .flatten(),
+    )
+}
 
 pub(super) struct ChunkRetry {
     pub content_id: [u8; 32],
@@ -40,6 +157,8 @@ pub(super) async fn admit_chunk_retry(
     sender: &dyn FrameBroadcaster,
     tracker: &Mutex<PendingAckTracker>,
     retry: ChunkRetry,
+    private: Option<&PrivateRetryPaths>,
+    sealed: bool,
 ) -> Option<[u8; 32]> {
     let first = retry.frames.first()?.get(veil_proto::HEADER_SIZE..)?;
     let envelope = veil_proto::delivery::ForwardPayload::decode(first)
@@ -55,8 +174,19 @@ pub(super) async fn admit_chunk_retry(
     }
     let can_retry = || lock!(tracker).retry_is_current(&retry.content_id, retry.attempt);
     tokio::time::timeout(Duration::from_secs(remaining), async {
-        let alternative = retry.alternative_hop.filter(|hop| *hop != retry.next_hop);
-        for hop in std::iter::once(retry.next_hop).chain(alternative) {
+        for hop in retry_hops(
+            retry.next_hop,
+            retry.alternative_hop,
+            private,
+            sender,
+            envelope.recipient,
+            sealed,
+        ) {
+            let hop_allowed =
+                || private.is_none_or(|policy| policy.allows(envelope.recipient, &hop));
+            if !hop_allowed() {
+                continue;
+            }
             let mut complete = true;
             for frame in retry.frames.iter() {
                 if !can_retry() {
@@ -70,6 +200,9 @@ pub(super) async fn admit_chunk_retry(
                     if !can_retry() {
                         return Poll::Ready(None);
                     }
+                    if !hop_allowed() {
+                        return Poll::Ready(Some(false));
+                    }
                     admission.as_mut().poll(cx).map(Some)
                 }));
                 let accepted = loop {
@@ -78,6 +211,9 @@ pub(super) async fn admit_chunk_retry(
                         _ = tokio::time::sleep(Duration::from_millis(100)) => {
                             if !can_retry() {
                                 return None;
+                            }
+                            if !hop_allowed() {
+                                break false;
                             }
                         }
                     }
@@ -286,6 +422,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn private_retry_recovers_from_a_stale_cache_only_for_a_keyed_transfer() {
+        let (retry, _, _) = sealed_batch();
+        let original = retry.frames.clone();
+        let tracker = tracked(&retry);
+        let old = retry.next_hop;
+        let destination = [2; 32];
+        let revoked = [3; 32];
+        let local = [4; 32];
+        let backup = [11; 32];
+        let tx = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let mut revoked_rx = veil_util::wlock!(tx).register(revoked);
+        let mut local_rx = veil_util::wlock!(tx).register(local);
+        let mut backup_rx = veil_util::wlock!(tx).register(backup);
+        let mut routes = veil_routing::RouteCache::new(Duration::from_secs(60));
+        routes.insert(destination, old, 1, 2);
+        let policy = PrivateRetryPaths {
+            local_node_id: local,
+            sessions: Arc::new(Mutex::new(SessionRegistry::new())),
+            tx: Arc::clone(&tx),
+            routes: Arc::new(RwLock::new(routes)),
+            apps: Arc::new(
+                veil_app::AppEndpointRegistry::new()
+                    .with_peer_revocation_check(move |peer| *peer == revoked),
+            ),
+            identities: Default::default(),
+        };
+        let sender = veil_session::glue::SessionTxBroadcaster::new(tx);
+        assert_eq!(
+            retry_hops(
+                old,
+                Some(old),
+                Some(&policy),
+                &sender,
+                Recipient::any(destination),
+                false
+            )
+            .collect::<Vec<_>>(),
+            vec![old]
+        );
+
+        let receive = async {
+            for original in original.iter() {
+                let wrapped = backup_rx.recv().await.unwrap().1;
+                let first = ForwardPayload::decode(&original[HEADER_SIZE..]).unwrap();
+                let resent = ForwardPayload::decode(&wrapped[HEADER_SIZE..]).unwrap();
+                assert_eq!(resent.next_hop_node_id, backup);
+                assert_eq!(resent.envelope.recipient, first.envelope.recipient);
+                assert_eq!(resent.envelope.payload, first.envelope.payload);
+            }
+        };
+        let (accepted, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                admit_chunk_retry(&sender, &tracker, retry, Some(&policy), true),
+                receive
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(accepted, Some(backup));
+        assert!(revoked_rx.try_recv().is_err());
+        assert!(local_rx.try_recv().is_err());
+        assert!(backup_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn chunk_retry_waits_for_credit_keeps_primary_live_and_reassembles_partial_retry_once() {
         for original_live in [true, false] {
             let (retry, data, dk) = sealed_batch();
@@ -302,7 +503,7 @@ mod tests {
                 veil_proto::priority::BACKGROUND,
                 vec![0]
             ));
-            let mut admission = Box::pin(admit_chunk_retry(&sender, &tracker, retry));
+            let mut admission = Box::pin(admit_chunk_retry(&sender, &tracker, retry, None, false));
             assert!(
                 tokio::time::timeout(Duration::from_millis(20), &mut admission)
                     .await
@@ -416,7 +617,10 @@ mod tests {
             .collect::<Vec<_>>();
         retry.frames = frames.into();
         let tracker = tracked(&retry);
-        assert_eq!(admit_chunk_retry(&MustNotSend, &tracker, retry).await, None);
+        assert_eq!(
+            admit_chunk_retry(&MustNotSend, &tracker, retry, None, false).await,
+            None
+        );
         assert_eq!(lock!(tracker).len(), 1, "expiry does not forge an ACK");
     }
 
@@ -434,7 +638,7 @@ mod tests {
             veil_proto::priority::BACKGROUND,
             vec![0]
         ));
-        let mut admission = Box::pin(admit_chunk_retry(&sender, &tracker, retry));
+        let mut admission = Box::pin(admit_chunk_retry(&sender, &tracker, retry, None, false));
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut admission)
                 .await
@@ -479,7 +683,7 @@ mod tests {
             veil_proto::priority::BACKGROUND,
             vec![0]
         ));
-        let mut admission = Box::pin(admit_chunk_retry(&sender, &tracker, retry));
+        let mut admission = Box::pin(admit_chunk_retry(&sender, &tracker, retry, None, false));
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut admission)
                 .await
