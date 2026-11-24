@@ -30,7 +30,7 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::time::Instant;
 use veil_identity::network_policy::VerifiedRoutePolicy;
-use veil_proto::event_kind::SESSIONS_CHANGED;
+use veil_proto::event_kind::{SESSION_ADMITTED, SESSIONS_CHANGED};
 use veil_util::unix_secs_now_u64;
 use veilclient::client::PnetStatus;
 use veilclient::{APP_IPC_SEND_PREFIX_BYTES, AppHandle, PnetAuthority, VeilClient, VeilEvent};
@@ -330,23 +330,64 @@ async fn connect_pnet_status(
     }
 }
 
-async fn prioritize_live_peers(
-    client: &VeilClient,
-    order: &[(NodeId, [u8; 32])],
-    pace: &mut tokio::time::Interval,
-) -> Option<Vec<(NodeId, [u8; 32])>> {
-    if order.len() <= veilclient::PNET_ADMISSION_BATCH_MAX_PEERS {
-        return None;
+struct LivePeerHints {
+    ids: HashSet<NodeId>,
+    at_capacity: bool,
+}
+
+impl LivePeerHints {
+    fn changed_peers(
+        &self,
+        configured: &[(NodeId, [u8; 32])],
+        admitted: &HashMap<NodeId, u64>,
+    ) -> Vec<(NodeId, [u8; 32])> {
+        configured
+            .iter()
+            .copied()
+            .filter(
+                |(id, _)| match (self.ids.contains(id), admitted.contains_key(id)) {
+                    (true, false) => true,
+                    // A full snapshot may have omitted live peers. Let the
+                    // ordinary sweep check them without crowding out new joins.
+                    (false, true) => !self.at_capacity,
+                    _ => false,
+                },
+            )
+            .take(veilclient::PNET_ADMISSION_BATCH_MAX_PEERS)
+            .collect()
     }
+}
+
+async fn live_peer_hints(
+    client: &VeilClient,
+    pace: &mut tokio::time::Interval,
+) -> Option<LivePeerHints> {
     pace.tick().await;
-    let Ok(Ok(peers)) = tokio::time::timeout(PNET_PEER_HINT_TIMEOUT, client.peers()).await else {
-        return None;
+    let peers = match tokio::time::timeout(PNET_PEER_HINT_TIMEOUT, client.peers()).await {
+        Ok(Ok(peers)) => peers,
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "P-Net session hint query failed");
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!("P-Net session hint query timed out");
+            return None;
+        }
     };
-    let live: HashSet<_> = peers
-        .into_iter()
-        .filter(|entry| entry.state == veil_proto::peer_state::ACTIVE)
-        .map(|entry| entry.node_id)
-        .collect();
+    Some(LivePeerHints {
+        at_capacity: peers.len() >= veil_proto::MAX_PEERS_LIST_ENTRIES,
+        ids: peers
+            .into_iter()
+            .filter(|entry| entry.state == veil_proto::peer_state::ACTIVE)
+            .map(|entry| entry.node_id)
+            .collect(),
+    })
+}
+
+fn prioritize_live_peers(
+    order: &[(NodeId, [u8; 32])],
+    live: &HashSet<NodeId>,
+) -> Option<Vec<(NodeId, [u8; 32])>> {
     if live.is_empty() {
         return None;
     }
@@ -1290,6 +1331,8 @@ async fn maintain_routes(
     }
     loop {
         let session_due = session_refresh.as_ref().and_then(|refresh| refresh.pending);
+        let multiple_batches =
+            configured.peer_app_ids.len() > veilclient::PNET_ADMISSION_BATCH_MAX_PEERS;
         let wake = tokio::select! {
             _ = async {
                 if next_peer == 0 {
@@ -1307,7 +1350,7 @@ async fn maintain_routes(
                     Some(due) => tokio::time::sleep_until(due.max(next_session_sweep)).await,
                     None => std::future::pending().await,
                 }
-            }, if next_peer == 0 => Wake::SessionSweep,
+            }, if multiple_batches || next_peer == 0 => Wake::SessionSweep,
             _ = async {
                 match hup.as_mut() {
                     Some(hup) => hup.recv().await,
@@ -1323,7 +1366,7 @@ async fn maintain_routes(
         };
         if let Wake::SessionEvent(event) = wake {
             match event {
-                Some(event) if event.kind == SESSIONS_CHANGED => {
+                Some(event) if matches!(event.kind, SESSIONS_CHANGED | SESSION_ADMITTED) => {
                     if let Some(refresh) = session_refresh.as_mut() {
                         refresh
                             .pending
@@ -1335,8 +1378,8 @@ async fn maintain_routes(
             }
             continue;
         }
-        if next_peer == 0
-            && session_due.is_some_and(|due| due <= Instant::now())
+        if (wake == Wake::SessionSweep
+            || !multiple_batches && session_due.is_some_and(|due| due <= Instant::now()))
             && let Some(refresh) = session_refresh.as_mut()
         {
             refresh.pending = None;
@@ -1467,7 +1510,9 @@ async fn maintain_routes(
         if wake == Wake::SessionSweep {
             next_session_sweep =
                 Instant::now() + pnet_session_refresh_spacing(configured.peer_app_ids.len());
-            refresh.reset();
+            if next_peer == 0 {
+                refresh.reset();
+            }
         }
         if connection.is_none() {
             let authority = binding.signed.as_ref().map(|(_, authority)| *authority);
@@ -1485,7 +1530,9 @@ async fn maintain_routes(
                     .as_deref()
                     .unwrap_or(&configured.peer_app_ids);
                 if next_peer == 0
-                    && let Some(prioritized) = prioritize_live_peers(client, order, &mut pace).await
+                    && order.len() > veilclient::PNET_ADMISSION_BATCH_MAX_PEERS
+                    && let Some(live) = live_peer_hints(client, &mut pace).await
+                    && let Some(prioritized) = prioritize_live_peers(order, &live.ids)
                 {
                     admission_order = Some(prioritized);
                 }
@@ -1494,30 +1541,44 @@ async fn maintain_routes(
         let order = admission_order
             .as_deref()
             .unwrap_or(&configured.peer_app_ids);
-        if let Some(client) = &connection
+        // Recheck one batch of likely session changes, then resume the full
+        // sweep at the same cursor. The snapshot never changes admission.
+        let mut retry = if wake == Wake::SessionSweep
+            && multiple_batches
+            && let Some(client) = &connection
+            && let Some(live) = live_peer_hints(client, &mut pace).await
+        {
+            live.changed_peers(&configured.peer_app_ids, &admitted)
+        } else {
+            Vec::new()
+        };
+        if retry.is_empty()
+            && connection.is_some()
             && binding.signed.is_some()
             && Instant::now() >= retry_due
         {
             let now = Instant::now();
             retry_due = now + PNET_RETRY_PERIOD;
-            let retry = binding
+            retry = binding
                 .recent
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .retry_group(&configured.peer_app_ids, &admitted, now);
-            if !retry.is_empty() {
-                match query_pnet_batch(client, &retry, &mut pace).await {
-                    Some(results) => {
-                        if apply_admissions(&retry, results, &mut admitted, &binding) {
-                            publish_routes(
-                                configured.with_pnet_admissions(&admitted),
-                                &state,
-                                &route_changes,
-                            );
-                        }
+        }
+        if !retry.is_empty()
+            && let Some(client) = &connection
+        {
+            match query_pnet_batch(client, &retry, &mut pace).await {
+                Some(results) => {
+                    if apply_admissions(&retry, results, &mut admitted, &binding) {
+                        publish_routes(
+                            configured.with_pnet_admissions(&admitted),
+                            &state,
+                            &route_changes,
+                        );
                     }
-                    None => connection = None,
                 }
+                None => connection = None,
             }
         }
         let end;
@@ -2077,6 +2138,166 @@ mod tests {
         exercise_pnet_sweep(1024, true, true).await;
     }
 
+    fn pnet_sweep_config(socket: &Path, peer_count: u16) -> OgateConfig {
+        let mut config = cfg();
+        config.socket_path = socket.to_owned();
+        config.mode = AccessMode::Open;
+        config.pnet_required = true;
+        config.prefix_v4 = 16;
+        for host in 3..=peer_count + 1 {
+            let [hi, lo] = host.to_be_bytes();
+            let mut id = [0; 32];
+            id[..2].copy_from_slice(&[hi, lo]);
+            config.peers.push(PeerEntry {
+                node_id: hex::encode(id),
+                addr_v4: Some(Ipv4Addr::new(10, 99, hi, lo)),
+                addr_v6: None,
+                name: None,
+            });
+        }
+        config
+    }
+
+    #[tokio::test]
+    async fn pnet_session_changes_recheck_routes_before_a_large_sweep_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use veil_ipc::{EventBus, IpcEndpoint, IpcServer, PeerListProvider, PnetStatusProvider};
+        use veil_proto::{EventPayload, PeersListEntry, PeersListPayload, PnetStatusResultPayload};
+
+        const PEER: NodeId = [0xaa; 32];
+        struct Session {
+            active: AtomicBool,
+            past_first_batch: Notify,
+        }
+        impl PeerListProvider for Session {
+            fn list_peers(&self) -> PeersListPayload {
+                let peers = self
+                    .active
+                    .load(Ordering::Relaxed)
+                    .then(|| PeersListEntry {
+                        node_id: PEER,
+                        state: veil_proto::peer_state::ACTIVE,
+                        direction: veil_proto::peer_direction::INBOUND,
+                        transport: Vec::new(),
+                        caps: None,
+                    })
+                    .into_iter()
+                    .collect();
+                PeersListPayload { peers }
+            }
+        }
+        impl PnetStatusProvider for Session {
+            fn peer_status(&self, peer: &NodeId) -> PnetStatusResultPayload {
+                if peer[..2] == 128_u16.to_be_bytes() {
+                    self.past_first_batch.notify_one();
+                }
+                PnetStatusResultPayload {
+                    admitted: *peer == PEER && self.active.load(Ordering::Relaxed),
+                    has_cert: *peer == PEER,
+                    admin: false,
+                    valid_until_unix: 0,
+                    network_id: [0x01; 32],
+                    peer_node_id: *peer,
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("ipc");
+        let session = Arc::new(Session {
+            active: AtomicBool::new(true),
+            past_first_batch: Notify::new(),
+        });
+        let events = Arc::new(EventBus::new());
+        let (stop, shutdown) = watch::channel(false);
+        let mut server = IpcServer::new(
+            IpcEndpoint::Unix(socket.clone()),
+            shutdown,
+            Arc::new(veil_app::AppEndpointRegistry::new()),
+            [0x01; 32],
+        )
+        .with_pnet_status_provider(session.clone())
+        .with_peer_list_provider(session.clone())
+        .with_event_bus(events.clone());
+        let server = tokio::spawn(async move { server.run().await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !socket.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("IPC server did not start");
+
+        let config = pnet_sweep_config(&socket, 4096);
+        let configured = SharedState::build(&config).unwrap();
+        let state = Arc::new(ArcSwap::from_pointee(
+            configured.with_pnet_admissions(&HashMap::new()),
+        ));
+        let changes = Arc::new(Notify::new());
+        let updates = tokio::spawn(maintain_routes(
+            directory.path().join("unused.toml"),
+            watch::channel(config).0,
+            Arc::new(Mutex::new(None)),
+            RouteBinding {
+                node_id: [0x01; 32],
+                signed: None,
+                recent: Arc::default(),
+            },
+            configured,
+            Arc::clone(&state),
+            Arc::clone(&changes),
+        ));
+        tokio::time::timeout(Duration::from_secs(3), session.past_first_batch.notified())
+            .await
+            .expect("the large sweep did not start");
+        let address = Ipv4Addr::new(10, 99, 0, 2).into();
+        assert_eq!(
+            state.load().table.lookup_egress(address),
+            Decision::Forward(PEER)
+        );
+
+        session.active.store(false, Ordering::Relaxed);
+        assert_ne!(
+            events.publish(EventPayload {
+                kind: SESSIONS_CHANGED,
+                payload: vec![0, 0],
+            }),
+            0
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.load().table.lookup_egress(address) != Decision::NoRoute {
+                changes.notified().await;
+            }
+        })
+        .await
+        .expect("route withdrawal waited for the full admission sweep");
+        assert_eq!(
+            state.load().table.lookup_ingress(&PEER, Some(address)),
+            Decision::Unauthorized
+        );
+
+        session.active.store(true, Ordering::Relaxed);
+        assert_ne!(
+            events.publish(EventPayload {
+                kind: SESSION_ADMITTED,
+                payload: Vec::new(),
+            }),
+            0
+        );
+        tokio::time::timeout(PNET_REFRESH_PERIOD + Duration::from_secs(1), async {
+            while state.load().table.lookup_egress(address) != Decision::Forward(PEER) {
+                changes.notified().await;
+            }
+        })
+        .await
+        .expect("route restoration did not use the session admission event");
+
+        updates.abort();
+        assert!(updates.await.unwrap_err().is_cancelled());
+        stop.send(true).unwrap();
+        server.await.unwrap();
+    }
+
     async fn exercise_pnet_sweep(peer_count: u16, publish_session_events: bool, hint_live: bool) {
         use std::sync::atomic::{AtomicBool, Ordering};
         use veil_ipc::{EventBus, IpcEndpoint, IpcServer, PeerListProvider, PnetStatusProvider};
@@ -2151,22 +2372,7 @@ mod tests {
         })
         .await
         .expect("IPC server did not start");
-        let mut config = cfg();
-        config.socket_path = socket.clone();
-        config.mode = AccessMode::Open;
-        config.pnet_required = true;
-        config.prefix_v4 = 16;
-        for host in 3..=peer_count + 1 {
-            let [hi, lo] = host.to_be_bytes();
-            let mut id = [0; 32];
-            id[..2].copy_from_slice(&[hi, lo]);
-            config.peers.push(PeerEntry {
-                node_id: hex::encode(id),
-                addr_v4: Some(Ipv4Addr::new(10, 99, hi, lo)),
-                addr_v6: None,
-                name: None,
-            });
-        }
+        let config = pnet_sweep_config(&socket, peer_count);
         let peer_count = usize::from(peer_count);
         assert_eq!(config.peers.len(), peer_count);
         let configured = SharedState::build(&config).unwrap();

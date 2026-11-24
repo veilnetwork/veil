@@ -218,7 +218,32 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   all 15,719 ICMP replies, and the two UDP flows delivered 596,195 of
   596,215 datagrams. Under this load, route withdrawal still took
   14.62–18.78 s after the daemon reported the session loss, and one
-  recovery took 21.23 s. Session changes still wait for a sweep boundary.
+  recovery took 21.23 s. In that build, session changes waited for a
+  sweep boundary.
+- A session count change or committed session event can now schedule one
+  admission batch during a large sweep. ogate compares the bounded IPC
+  session list with its admitted routes, checks likely joins and
+  departures, then resumes the sweep at the same cursor. The batch uses
+  the existing query pace and retry deadline. At the session list's cap,
+  the full sweep continues to check peers missing from the list.
+- A matched Linux run reused the daemon, 48 authenticated identities and
+  24 disjoint tables of 4,096 entries. Spokes initiated the sessions so
+  their restarts could exercise route recovery without waiting for the
+  hub's reconnect schedule. Measured from the daemon's admission change,
+  the two withdrawals took 5.71 and 1.81 s, previously 12.95 and 20.74 s.
+  The two restorations took 5.96 and 1.78 s, previously 4.94 and 12.92 s.
+  Both affected paths answered ICMP after each restoration. A separate
+  run timed out waiting for session establishment before it could
+  measure route recovery.
+- During both 132 s traffic samples, no batch failed and every
+  unaffected route stayed installed. The updated gateways received all
+  12,648 ICMP replies and 479,740 of 479,766 UDP datagrams. The control
+  received 12,646 of 12,648 replies and 478,167 of 478,742 datagrams.
+  One control flow missed 567 datagrams with zero kernel TUN drops and
+  its route still installed. The source of that loss remains open.
+- With a pre-batch daemon and a 34-entry table, the new bridge passed
+  traffic in both directions and withdrew the route 4.33 s after the
+  old daemon reported the disconnect through its single-peer query.
 - On two Linux ARM64 nodes with real TUN interfaces and one live certified
   peer at the end of each configured list, the routes appeared within
   0.22 s for 34 entries, 0.66 s for 256, and 2.17 s for 1,024 after
