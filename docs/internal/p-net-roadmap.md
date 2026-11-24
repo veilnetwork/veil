@@ -149,6 +149,24 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   13.8 ms. The central TUN counters reported zero kernel drops. The
   startup delay and the remaining failed admission queries need
   separate investigation.
+- The startup log traced multi-second sends to device-certificate
+  discovery. A live recipient's identity document and instance registry
+  can now arrive in parallel. Other recipients must establish a verified
+  document before the registry query starts. Overlapping requests share
+  registry and certificate candidate bytes, including the direct
+  instance certificate walk. Every caller verifies signatures, compares
+  freshness, and checks the current authorization before using a key.
+- With a silent replica, the maximum-size family fixture resolved in
+  15 s, compared with 18 s when the two metadata waits ran in sequence.
+  A cold 60 s Linux ARM64 A/B run with 16 gateways, 32 authenticated
+  members and two 16 Mb/s UDP flows used the same bridge binary and
+  test-only identity difficulty. The longest logged family resolution
+  dropped from 9.00 to 6.01 s. The worst per-probe ICMP p99 dropped from
+  7.50 s to 18.1 ms. Replies taking at least a second fell from 85 to
+  seven. ICMP delivery was 3,840 of 3,840 compared with 3,735 of 3,834.
+  The UDP flows missed 22 of 218,184 packets, previously 124 of 218,025.
+  Both runs converged on all four session transitions without failed
+  admission queries.
 - On two Linux ARM64 nodes with real TUN interfaces and one live certified
   peer at the end of each configured list, the routes appeared within
   0.22 s for 34 entries, 0.66 s for 256, and 2.17 s for 1,024 after

@@ -265,7 +265,10 @@ pub struct DhtMlKemEkResolver {
     checked_documents: Mutex<std::collections::HashMap<NodeIdBytes, CheckedDocument>>,
     /// Only overlapping full-document requests share a replica walk. Every
     /// caller independently verifies the candidates and its durable host floor.
-    document_walks: Mutex<DocumentWalks>,
+    document_walks: Mutex<ReplicaWalks>,
+    /// Registry and certificate lookups share structurally decoded bytes
+    /// while a replica walk is active. Verification is per caller.
+    record_walks: Mutex<ReplicaWalks>,
     /// One walk per device at a time: callers asking for the same device while
     /// a walk is running wait for it and read what it found.
     instance_walk_gates: Arc<Mutex<InstanceWalkGates>>,
@@ -292,10 +295,10 @@ struct CheckedDocument {
 type InstanceKey = ([u8; 32], Option<[u8; 16]>);
 type InstanceWalkGates = std::collections::HashMap<InstanceKey, Arc<tokio::sync::Mutex<()>>>;
 
-const MAX_DOCUMENT_WALKS: usize = 64;
-type DocumentWalks = std::collections::HashMap<NodeIdBytes, Arc<DocumentWalk>>;
+const MAX_SHARED_REPLICA_WALKS: usize = 64;
+type ReplicaWalks = std::collections::HashMap<NodeIdBytes, Arc<ReplicaWalk>>;
 
-struct DocumentWalk {
+struct ReplicaWalk {
     deadline: tokio::time::Instant,
     candidates: tokio::sync::OnceCell<Vec<Vec<u8>>>,
 }
@@ -303,15 +306,15 @@ struct DocumentWalk {
 /// Keep the wave alive through authorization, then discard the last result.
 /// OnceCell cancellation lets a remaining caller replace the initializer;
 /// retries retain the first wave's deadline, never restart its replica window.
-struct DocumentWalkLease<'a> {
-    walks: &'a Mutex<DocumentWalks>,
+struct ReplicaWalkLease<'a> {
+    walks: &'a Mutex<ReplicaWalks>,
     target: NodeIdBytes,
-    walk: Arc<DocumentWalk>,
+    walk: Arc<ReplicaWalk>,
 }
 
-impl<'a> DocumentWalkLease<'a> {
+impl<'a> ReplicaWalkLease<'a> {
     fn try_new(
-        walks: &'a Mutex<DocumentWalks>,
+        walks: &'a Mutex<ReplicaWalks>,
         target: NodeIdBytes,
         timeout: Duration,
     ) -> Option<Self> {
@@ -320,10 +323,10 @@ impl<'a> DocumentWalkLease<'a> {
             Arc::clone(walk)
         } else {
             // Saturation only disables coalescing for a new key, never lookup.
-            if entries.len() >= MAX_DOCUMENT_WALKS {
+            if entries.len() >= MAX_SHARED_REPLICA_WALKS {
                 return None;
             }
-            let walk = Arc::new(DocumentWalk {
+            let walk = Arc::new(ReplicaWalk {
                 deadline: tokio::time::Instant::now() + timeout,
                 candidates: tokio::sync::OnceCell::new(),
             });
@@ -338,7 +341,7 @@ impl<'a> DocumentWalkLease<'a> {
     }
 }
 
-impl Drop for DocumentWalkLease<'_> {
+impl Drop for ReplicaWalkLease<'_> {
     fn drop(&mut self) {
         let mut entries = lock!(self.walks);
         if Arc::strong_count(&self.walk) == 2
@@ -629,7 +632,8 @@ impl DhtMlKemEkResolver {
             step_timeout: DEFAULT_STEP_TIMEOUT,
             cert_ttl: CERT_CACHE_TTL,
             checked_documents: Mutex::new(std::collections::HashMap::new()),
-            document_walks: Mutex::new(DocumentWalks::new()),
+            document_walks: Mutex::new(ReplicaWalks::new()),
+            record_walks: Mutex::new(ReplicaWalks::new()),
             instance_walk_gates: Arc::new(Mutex::new(std::collections::HashMap::new())),
             instance_walk_misses: Arc::new(RwLock::new(std::collections::HashMap::new())),
             instance_miss_ttl: INSTANCE_MISS_TTL,
@@ -792,23 +796,26 @@ impl DhtMlKemEkResolver {
         if direct_peer.is_none() {
             let started = veil_session::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
             let wave =
-                DocumentWalkLease::try_new(&self.document_walks, target_node_id, self.step_timeout);
+                ReplicaWalkLease::try_new(&self.document_walks, target_node_id, self.step_timeout);
             let mut candidates = if let Some(wave) = &wave {
                 wave.walk
                     .candidates
                     .get_or_init(|| {
-                        self.collect_document_candidates(
+                        self.collect_replica_candidates(
                             doc_key,
                             wave.walk
                                 .deadline
                                 .saturating_duration_since(tokio::time::Instant::now()),
+                            |bytes| IdentityDocument::decode(bytes).is_ok(),
                         )
                     })
                     .await
                     .clone()
             } else {
-                self.collect_document_candidates(doc_key, self.step_timeout)
-                    .await
+                self.collect_replica_candidates(doc_key, self.step_timeout, |bytes| {
+                    IdentityDocument::decode(bytes).is_ok()
+                })
+                .await
             };
             // Shared bytes are candidates only. No caller may repair the mirror
             // or authorize from another caller's decode, clock or host barrier.
@@ -905,14 +912,19 @@ impl DhtMlKemEkResolver {
         self.observe_document_ready(&doc).await.then_some(doc)
     }
 
-    async fn collect_document_candidates(&self, key: [u8; 32], timeout: Duration) -> Vec<Vec<u8>> {
+    async fn collect_replica_candidates(
+        &self,
+        key: [u8; 32],
+        timeout: Duration,
+        decodes: impl Fn(&[u8]) -> bool,
+    ) -> Vec<Vec<u8>> {
         if timeout.is_zero() {
             // A replacement initializer inherits an already-expired wave.
             // Preserve its local candidate without issuing already-late queries.
             return self
                 .dht
                 .get_local(&key)
-                .filter(|b| IdentityDocument::decode(b).is_ok())
+                .filter(|bytes| decodes(bytes))
                 .into_iter()
                 .collect();
         }
@@ -924,9 +936,35 @@ impl DhtMlKemEkResolver {
             key,
             timeout,
             veil_proto::budget::DHT_REPLICATION_K,
-            |b| IdentityDocument::decode(b).is_ok(),
+            decodes,
         )
         .await
+    }
+
+    async fn shared_record_candidates(
+        &self,
+        key: [u8; 32],
+        decodes: impl Fn(&[u8]) -> bool,
+    ) -> Vec<Vec<u8>> {
+        let wave = ReplicaWalkLease::try_new(&self.record_walks, key, self.step_timeout);
+        if let Some(wave) = &wave {
+            wave.walk
+                .candidates
+                .get_or_init(|| {
+                    self.collect_replica_candidates(
+                        key,
+                        wave.walk
+                            .deadline
+                            .saturating_duration_since(tokio::time::Instant::now()),
+                        &decodes,
+                    )
+                })
+                .await
+                .clone()
+        } else {
+            self.collect_replica_candidates(key, self.step_timeout, &decodes)
+                .await
+        }
     }
 
     /// Resolve + verify the recipient's current ML-KEM cert — the full
@@ -1315,16 +1353,9 @@ impl DhtMlKemEkResolver {
             },
             async {
                 Ok::<_, ()>(
-                    recursive_key_material_candidates(
-                        &self.dht,
-                        &self.session_tx_registry,
-                        &self.pending_recursive,
-                        self.local_node_id,
-                        cert_key,
-                        self.step_timeout,
-                        veil_proto::budget::DHT_REPLICATION_K,
-                        |bytes| MlKemKeyCert::decode(bytes).is_ok(),
-                    )
+                    self.shared_record_candidates(cert_key, |bytes| {
+                        MlKemKeyCert::decode(bytes).is_ok()
+                    })
                     .await,
                 )
             },
@@ -1501,39 +1532,70 @@ impl DhtMlKemEkResolver {
     /// send — it may never have come online since it was admitted — so this
     /// returns the ones that verified, and empty only when none did.
     pub async fn fetch_verified_certs(&self, target_node_id: [u8; 32]) -> ResolvedCerts {
-        let started = veil_session::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
-        let Some(doc) = self.fetch_verified_document(target_node_id, None).await else {
-            self.trace_resolve_stage(&target_node_id, "family_document", started, false, 0);
+        let reg_key = InstanceRegistry::dht_key(&target_node_id);
+        let document = async {
+            let started = veil_session::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
+            let doc = self.fetch_verified_document(target_node_id, None).await;
+            self.trace_resolve_stage(
+                &target_node_id,
+                "family_document",
+                started,
+                doc.is_some(),
+                usize::from(doc.is_some()),
+            );
+            doc.ok_or(())
+        };
+        let registry = async {
+            let started = veil_session::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
+            let candidates = self
+                .shared_record_candidates(reg_key, |bytes| InstanceRegistry::decode(bytes).is_ok())
+                .await;
+            Ok((started, candidates))
+        };
+        // Only a live recipient can start both walks. A lookup for an
+        // arbitrary identity must establish a verified document before it
+        // spends registry-query work. Prefetched bytes are still only candidates.
+        let direct = rlock!(self.session_tx_registry).has_session(&target_node_id);
+        let resolved = if direct {
+            tokio::try_join!(document, registry)
+        } else {
+            match document.await {
+                Ok(doc) => registry.await.map(|candidates| (doc, candidates)),
+                Err(()) => Err(()),
+            }
+        };
+        let Ok((doc, (registry_started, registry_candidates))) = resolved else {
             return ResolvedCerts::stopped_at(ResolveStage::DocumentUnresolved);
         };
-        self.trace_resolve_stage(&target_node_id, "family_document", started, true, 1);
         let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
             return ResolvedCerts::default();
         };
         let now_unix = now.as_secs();
-
-        let reg_key = InstanceRegistry::dht_key(&target_node_id);
-        let started = veil_session::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
-        let Some(reg) = self
-            .dht_get_freshest(
-                reg_key,
-                |b| {
-                    InstanceRegistry::decode(b).ok().filter(|r| {
-                        r.node_id == target_node_id && verify_instance_registry_sig(r, &doc)
-                    })
-                },
-                registry_freshness,
-            )
-            .await
-        else {
-            self.trace_resolve_stage(&target_node_id, "family_registry", started, false, 0);
+        let Some(reg) = self.select_freshest_candidate(
+            reg_key,
+            registry_candidates,
+            |bytes| {
+                InstanceRegistry::decode(bytes).ok().filter(|registry| {
+                    registry.node_id == target_node_id
+                        && verify_instance_registry_sig(registry, &doc)
+                })
+            },
+            registry_freshness,
+        ) else {
+            self.trace_resolve_stage(
+                &target_node_id,
+                "family_registry",
+                registry_started,
+                false,
+                0,
+            );
             self.log_dbg("mlkem_resolver.registry.dht_miss", &target_node_id, "");
             return ResolvedCerts::stopped_at(ResolveStage::RegistryUnresolved);
         };
         self.trace_resolve_stage(
             &target_node_id,
             "family_registry",
-            started,
+            registry_started,
             true,
             reg.instances.len(),
         );
@@ -1586,18 +1648,22 @@ impl DhtMlKemEkResolver {
                 let instance_id = instances[index].instance_id;
                 async move {
                     let cert_key = MlKemKeyCert::dht_key(&target_node_id, &instance_id);
-                    let fetched = self
-                        .dht_get_freshest(
-                            cert_key,
-                            |b| {
-                                MlKemKeyCert::decode(b).ok().filter(|c| {
-                                    cert_addresses_instance(c, &target_node_id, &instance_id)
-                                        && verify_mlkem_cert(c, doc, now_unix).is_ok()
-                                })
-                            },
-                            |c| (c.cert_version, c.valid_from_unix),
-                        )
+                    let candidates = self
+                        .shared_record_candidates(cert_key, |bytes| {
+                            MlKemKeyCert::decode(bytes).is_ok()
+                        })
                         .await;
+                    let fetched = self.select_freshest_candidate(
+                        cert_key,
+                        candidates,
+                        |bytes| {
+                            MlKemKeyCert::decode(bytes).ok().filter(|cert| {
+                                cert_addresses_instance(cert, &target_node_id, &instance_id)
+                                    && verify_mlkem_cert(cert, doc, now_unix).is_ok()
+                            })
+                        },
+                        |cert| (cert.cert_version, cert.valid_from_unix),
+                    );
                     (instance_id, fetched)
                 }
             })
@@ -1792,10 +1858,17 @@ impl DhtMlKemEkResolver {
     fn select_freshest_candidate<T>(
         &self,
         key: [u8; 32],
-        candidates: Vec<Vec<u8>>,
+        mut candidates: Vec<Vec<u8>>,
         decode_verify: impl Fn(&[u8]) -> Option<T>,
         freshness: impl Fn(&T) -> (u64, u64),
     ) -> Option<T> {
+        // The local mirror can change while a replica walk or a separate
+        // authorization step is pending. Verify and compare its latest value too.
+        if let Some(bytes) = self.dht.get_local(&key)
+            && !candidates.contains(&bytes)
+        {
+            candidates.push(bytes);
+        }
         let mut decoded: Vec<(T, Vec<u8>)> = candidates
             .into_iter()
             .filter_map(|bytes| decode_verify(&bytes).map(|v| (v, bytes)))
@@ -3599,15 +3672,18 @@ mod tests {
         let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
         let _rx = wlock!(resolver.session_tx_registry).register([2; 32]);
         let mut lookups = Vec::new();
-        for index in 0..=MAX_DOCUMENT_WALKS {
+        for index in 0..=MAX_SHARED_REPLICA_WALKS {
             let mut future = Box::pin(resolver.fetch_verified_document([index as u8; 32], None));
             assert!(poll_family_to_stall(future.as_mut()).is_pending());
             lookups.push(future);
         }
-        assert_eq!(lock!(resolver.document_walks).len(), MAX_DOCUMENT_WALKS);
+        assert_eq!(
+            lock!(resolver.document_walks).len(),
+            MAX_SHARED_REPLICA_WALKS
+        );
         assert_eq!(
             lock!(resolver.pending_recursive).len(),
-            MAX_DOCUMENT_WALKS + 1
+            MAX_SHARED_REPLICA_WALKS + 1
         );
         drop(lookups);
         assert!(lock!(resolver.document_walks).is_empty());
@@ -4661,6 +4737,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_family_lookups_share_registry_and_certificate_requests() {
+        let (resolver, doc, _, certs) = family_walk_fixture(1);
+        let cert = &certs[0];
+        let doc_key = IdentityDocument::dht_key(&doc.node_id);
+        let registry_key = InstanceRegistry::dht_key(&doc.node_id);
+        let cert_key = MlKemKeyCert::dht_key(&doc.node_id, &cert.instance_id);
+        let mut rx = wlock!(resolver.session_tx_registry).register(doc.node_id);
+        let mut first = Box::pin(resolver.fetch_verified_certs(doc.node_id));
+        let mut second = Box::pin(resolver.fetch_verified_certs(doc.node_id));
+        assert!(poll_family_to_stall(first.as_mut()).is_pending());
+        assert!(poll_family_to_stall(second.as_mut()).is_pending());
+        let mut keys = Vec::new();
+        for query in instance_requests(&mut rx) {
+            keys.push(query.target_key);
+            let value = resolver.dht.get_local(&query.target_key).unwrap();
+            lock!(resolver.pending_recursive)
+                .remove(&query.query_id)
+                .unwrap()
+                .tx
+                .send(value)
+                .unwrap();
+        }
+        keys.sort_unstable();
+        let mut expected = [doc_key, registry_key];
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
+        assert!(rx.try_recv().is_err());
+
+        assert!(poll_family_to_stall(first.as_mut()).is_pending());
+        assert!(poll_family_to_stall(second.as_mut()).is_pending());
+        let (_, frame) = rx.try_recv().unwrap();
+        let query = RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+        assert_eq!(query.target_key, cert_key);
+        assert!(rx.try_recv().is_err());
+        // A cancelled initializer releases the query. A remaining caller can
+        // continue the shared walk and must still verify the returned value.
+        drop(first);
+        assert!(lock!(resolver.pending_recursive).is_empty());
+        assert!(poll_family_to_stall(second.as_mut()).is_pending());
+        let (_, frame) = rx.try_recv().unwrap();
+        let query = RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+        assert_eq!(query.target_key, cert_key);
+        assert!(rx.try_recv().is_err());
+        lock!(resolver.pending_recursive)
+            .remove(&query.query_id)
+            .unwrap()
+            .tx
+            .send(cert.encode())
+            .unwrap();
+        let result = second.await;
+        assert_eq!(result.certs.len(), 1);
+        assert_eq!(result.certs[0].cert_version, 2);
+        assert!(lock!(resolver.record_walks).is_empty());
+        assert!(lock!(resolver.pending_recursive).is_empty());
+    }
+
+    #[tokio::test]
+    async fn prefetched_registry_cannot_authorize_an_invalid_document() {
+        let (fixture, mut doc, _, _) = family_walk_fixture(1);
+        let registry_key = InstanceRegistry::dht_key(&doc.node_id);
+        let registry = fixture.dht.get_local(&registry_key).unwrap();
+        doc.document_sig[0] ^= 1;
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        let mut rx = wlock!(resolver.session_tx_registry).register(doc.node_id);
+        let mut lookup = Box::pin(resolver.fetch_verified_certs(doc.node_id));
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        let queries = instance_requests(&mut rx);
+        assert_eq!(queries.len(), 2);
+        let early = queries
+            .iter()
+            .find(|q| q.target_key == registry_key)
+            .unwrap();
+        lock!(resolver.pending_recursive)
+            .remove(&early.query_id)
+            .unwrap()
+            .tx
+            .send(registry)
+            .unwrap();
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        assert!(resolver.dht.get_local(&registry_key).is_none());
+        let document = queries
+            .iter()
+            .find(|q| q.target_key != registry_key)
+            .unwrap();
+        lock!(resolver.pending_recursive)
+            .remove(&document.query_id)
+            .unwrap()
+            .tx
+            .send(doc.encode())
+            .unwrap();
+        assert!(lookup.await.certs.is_empty());
+        assert!(resolver.dht.get_local(&registry_key).is_none());
+        assert!(resolver.cert_store.is_empty());
+        assert!(lock!(resolver.pending_recursive).is_empty());
+        assert!(lock!(resolver.record_walks).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unconnected_identity_with_an_invalid_document_never_queries_its_registry() {
+        let (_, mut doc, _, _) = family_walk_fixture(1);
+        doc.document_sig[0] ^= 1;
+        let resolver = make_test_resolver(Arc::new(KademliaService::new([1; 32])));
+        let mut rx = wlock!(resolver.session_tx_registry).register([0x91; 32]);
+        let mut lookup = Box::pin(resolver.fetch_verified_certs(doc.node_id));
+        assert!(poll_family_to_stall(lookup.as_mut()).is_pending());
+        let (_, frame) = rx.try_recv().unwrap();
+        let query = RecursiveQueryPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+        assert_eq!(query.target_key, IdentityDocument::dht_key(&doc.node_id));
+        assert!(rx.try_recv().is_err());
+        lock!(resolver.pending_recursive)
+            .remove(&query.query_id)
+            .unwrap()
+            .tx
+            .send(doc.encode())
+            .unwrap();
+        assert!(lookup.await.certs.is_empty());
+        assert!(rx.try_recv().is_err());
+        assert!(lock!(resolver.pending_recursive).is_empty());
+        assert!(lock!(resolver.record_walks).is_empty());
+        assert!(resolver.cert_store.is_empty());
+    }
+
+    #[tokio::test]
     async fn family_walk_cancellation_releases_every_pending_slot() {
         let (resolver, doc, instances, _) = family_walk_fixture(6);
         let _rx = wlock!(resolver.session_tx_registry).register([0x91; 32]);
@@ -4681,7 +4880,7 @@ mod tests {
     async fn family_walk_silent_replica_fits_the_ordinary_source_budget() {
         let count = veil_proto::instance_registry::MAX_INSTANCES as u8;
         let (resolver, doc, instances, _) = family_walk_fixture(count);
-        let _rx = wlock!(resolver.session_tx_registry).register([0x91; 32]);
+        let _rx = wlock!(resolver.session_tx_registry).register(doc.node_id);
         let start = tokio::time::Instant::now();
         let got = tokio::time::timeout(
             Duration::from_secs(30),
@@ -4693,8 +4892,8 @@ mod tests {
         assert_eq!(got.certs.len(), instances.len());
         assert_eq!(got.unknown_devices, 0);
         assert_eq!(got.expired_devices, 0);
-        // Two metadata windows + four waves of four certificate windows.
-        assert_eq!(start.elapsed(), Duration::from_secs(18));
+        // One overlapping metadata window + four waves of certificate windows.
+        assert_eq!(start.elapsed(), Duration::from_secs(15));
         for (cert, instance) in got.certs.iter().zip(instances) {
             assert_eq!(cert.instance_id, instance.instance_id);
             assert_eq!(cert.cert_version, 1);
