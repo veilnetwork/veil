@@ -322,6 +322,9 @@ pub struct NodeMetrics {
     // ── IPC delivery backpressure ──────────────────────────────────
     /// Frames dropped because the per-IPC-client delivery channel was full.
     ipc_delivery_drops_total: Arc<AtomicU64>,
+    ipc_send_admission_jobs_rejected_total: Arc<AtomicU64>,
+    ipc_send_admission_connection_bytes_rejected_total: Arc<AtomicU64>,
+    ipc_send_admission_global_bytes_rejected_total: Arc<AtomicU64>,
     // ── Multi-path delivery ───────────────────────────────────────
     /// Total number of parallel path sends triggered by multi-path delivery.
     multi_path_sends_total: Arc<AtomicU64>,
@@ -500,6 +503,9 @@ pub struct MetricsSnapshot {
     pub session_outbox_drops_total: u64,
     // IPC delivery backpressure
     pub ipc_delivery_drops_total: u64,
+    pub ipc_send_admission_jobs_rejected_total: u64,
+    pub ipc_send_admission_connection_bytes_rejected_total: u64,
+    pub ipc_send_admission_global_bytes_rejected_total: u64,
     // Multi-path delivery
     pub multi_path_sends_total: u64,
     // Chunked transfer
@@ -790,6 +796,9 @@ impl NodeMetrics {
             session_outbox_drops_total: counter!(),
             priority_queue_drops_total: counter!(),
             ipc_delivery_drops_total: counter!(),
+            ipc_send_admission_jobs_rejected_total: counter!(),
+            ipc_send_admission_connection_bytes_rejected_total: counter!(),
+            ipc_send_admission_global_bytes_rejected_total: counter!(),
             multi_path_sends_total: counter!(),
             chunks_reassembled_total: counter!(),
             sleep_advertisements_accepted_total: counter!(),
@@ -1486,6 +1495,13 @@ impl NodeMetrics {
             session_outbox_drops_total: load!(session_outbox_drops_total),
             priority_queue_drops_total: load!(priority_queue_drops_total),
             ipc_delivery_drops_total: load!(ipc_delivery_drops_total),
+            ipc_send_admission_jobs_rejected_total: load!(ipc_send_admission_jobs_rejected_total),
+            ipc_send_admission_connection_bytes_rejected_total: load!(
+                ipc_send_admission_connection_bytes_rejected_total
+            ),
+            ipc_send_admission_global_bytes_rejected_total: load!(
+                ipc_send_admission_global_bytes_rejected_total
+            ),
             multi_path_sends_total: load!(multi_path_sends_total),
             chunks_reassembled_total: load!(chunks_reassembled_total),
             sleep_advertisements_accepted_total: load!(sleep_advertisements_accepted_total),
@@ -1713,6 +1729,18 @@ impl NodeMetrics {
         );
         // IPC delivery backpressure
         counter!("veil_ipc_delivery_drops_total", s.ipc_delivery_drops_total);
+        counter!(
+            "veil_ipc_send_admission_jobs_rejected_total",
+            s.ipc_send_admission_jobs_rejected_total
+        );
+        counter!(
+            "veil_ipc_send_admission_connection_bytes_rejected_total",
+            s.ipc_send_admission_connection_bytes_rejected_total
+        );
+        counter!(
+            "veil_ipc_send_admission_global_bytes_rejected_total",
+            s.ipc_send_admission_global_bytes_rejected_total
+        );
         // Multi-path delivery
         counter!("veil_multi_path_sends_total", s.multi_path_sends_total);
         // Chunked transfer
@@ -1971,6 +1999,19 @@ impl veil_routing::RoutingMetrics for NodeMetrics {
 impl veil_ipc::IpcMetrics for NodeMetrics {
     fn inc_ipc_delivery_drops(&self) {
         NodeMetrics::inc_ipc_delivery_drops(self)
+    }
+    fn inc_ipc_send_admission_rejected(&self, limit: veil_ipc::IpcSendAdmissionLimit) {
+        use veil_ipc::IpcSendAdmissionLimit;
+        let counter = match limit {
+            IpcSendAdmissionLimit::QueuedJobs => &self.ipc_send_admission_jobs_rejected_total,
+            IpcSendAdmissionLimit::ConnectionBytes => {
+                &self.ipc_send_admission_connection_bytes_rejected_total
+            }
+            IpcSendAdmissionLimit::GlobalBytes => {
+                &self.ipc_send_admission_global_bytes_rejected_total
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
     fn inc_rt_frames_tx(&self) {
         NodeMetrics::inc_rt_frames_tx(self)

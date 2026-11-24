@@ -294,6 +294,25 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   captures and the receive sockets reported zero observation drops.
   Further work on cold-start loss should therefore measure the pending
   IPC job budget separately from the first-hop credit wait.
+- The daemon exports separate `SERVER_BUSY` counters for the outstanding
+  job limit, the per-connection byte limit, and the shared byte limit.
+  A second trace with 24 gateways found 603 and 521 job refusals on the
+  two senders with the default 200 µs batching window. Both byte-limit
+  counters stayed at zero. At peak saturation, four jobs were waiting
+  on direct session admission and 124 had yet to enter the handler on
+  each affected connection. The p99 seal times were under 0.1 ms on
+  both senders. All 3,821 datagrams missing between the TUN taps matched
+  refused jobs. The receive socket dropped another 28 datagrams locally.
+- With the same binaries and peer identities, setting the existing
+  `batch.flush_after_us` to `1600` on the two UDP senders reduced the
+  number of UDP requests sampled in the first 22,000 datagrams per flow
+  from 15,613 to 8,225. Job refusals fell from 1,124 to 100 and the
+  number of datagrams refused by those jobs fell from 3,821 to 511.
+  The destination tap and socket each reported five capture or receive
+  drops on one flow. Both configurations delivered all 310 direct SDK
+  chat messages. The spoke-to-hub chat p99 rose from 410 to 574 ms and
+  the hub-to-spoke p99 rose from 211 to 226 ms. The default stays at
+  200 µs. These are two cold trials on a two-vCPU Linux ARM64 stand.
 - A separate cold start ran the first end-to-end probes in groups of
   four before opening the UDP flows. All 24 paths answered in 12.52 s.
   The following 38 s sample lost 76 of 137,175 UDP datagrams, with one

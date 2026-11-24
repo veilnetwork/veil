@@ -45,12 +45,22 @@ pub use streams::IpcStreamTable;
 
 // ── Metrics surface ──────────────────────────────────────────────────────────
 
+/// The budget that refused a local send before its handler could start.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IpcSendAdmissionLimit {
+    QueuedJobs,
+    ConnectionBytes,
+    GlobalBytes,
+}
+
 /// Subset of `NodeMetrics` that the IPC server actually calls. Production
 /// runtime implements this for `Arc<NodeMetrics>` over in
 /// `veil-observability`; tests use an in-process `NoopMetrics` shim.
 pub trait IpcMetrics: Send + Sync {
     /// Bump the IPC-frame-delivery drop counter on backpressure.
     fn inc_ipc_delivery_drops(&self);
+    /// Count the first exhausted budget for a local `SERVER_BUSY` response.
+    fn inc_ipc_send_admission_rejected(&self, _limit: IpcSendAdmissionLimit) {}
     /// Bump the realtime-frames-transmitted counter.
     fn inc_rt_frames_tx(&self);
 }
@@ -60,6 +70,9 @@ pub trait IpcMetrics: Send + Sync {
 impl<T: IpcMetrics + ?Sized> IpcMetrics for std::sync::Arc<T> {
     fn inc_ipc_delivery_drops(&self) {
         (**self).inc_ipc_delivery_drops()
+    }
+    fn inc_ipc_send_admission_rejected(&self, limit: IpcSendAdmissionLimit) {
+        (**self).inc_ipc_send_admission_rejected(limit)
     }
     fn inc_rt_frames_tx(&self) {
         (**self).inc_rt_frames_tx()

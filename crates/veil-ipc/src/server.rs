@@ -369,7 +369,7 @@ pub struct IpcClientState {
     handles: Vec<(EndpointHandle, Option<PathBuf>)>,
     /// Sender side of the delivery channel (cloned per forwarder task).
     delivery_tx: DeliveryQueueTx,
-    /// Metrics handle for counting dropped IPC frames.
+    /// Metrics handle for IPC delivery and send admission.
     metrics: Option<Arc<dyn IpcMetrics>>,
     /// Local node identity, needed by forwarder to encode APP_DELIVER frames.
     node_id: [u8; 32],
@@ -2807,13 +2807,19 @@ async fn handle_ipc_client(
                                     .map_or(0, |(bodies, _, _)| bodies.iter().map(Vec::len).sum()));
                                 let admission = crate::send_gates::admit_queued_send(
                                     &queued_sends, send_bytes, &connection_send_bytes, retained);
-                                let Some(admission) = admission else {
-                                    crate::frame_io::write_frame_wh_id(
-                                        &mut wh, FrameFamily::LocalApp as u8,
-                                        LocalAppMsg::AppSendFailed as u16, hdr.request_id,
-                                        &veil_proto::ipc::ipc_send_err::SERVER_BUSY.to_be_bytes(),
-                                    ).await?;
-                                    continue;
+                                let admission = match admission {
+                                    Ok(admission) => admission,
+                                    Err(limit) => {
+                                        if let Some(metrics) = &client_state.metrics {
+                                            metrics.inc_ipc_send_admission_rejected(limit);
+                                        }
+                                        crate::frame_io::write_frame_wh_id(
+                                            &mut wh, FrameFamily::LocalApp as u8,
+                                            LocalAppMsg::AppSendFailed as u16, hdr.request_id,
+                                            &veil_proto::ipc::ipc_send_err::SERVER_BUSY.to_be_bytes(),
+                                        ).await?;
+                                        continue;
+                                    }
                                 };
                                 let body_owned = body;
                                 // Only an authenticated, rate-accepted local source may

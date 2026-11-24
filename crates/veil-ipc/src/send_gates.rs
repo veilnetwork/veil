@@ -18,6 +18,8 @@ use std::{collections::HashMap, future::Future};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::IpcSendAdmissionLimit;
+
 /// Sends to one destination in progress at once. Small next to the pool, so
 /// several stuck destinations together still leave room for a live one.
 pub(crate) const MAX_SENDS_PER_DESTINATION: usize = 4;
@@ -41,18 +43,26 @@ pub(crate) fn admit_queued_send(
     bytes: &Arc<Semaphore>,
     connection_bytes: &Arc<Semaphore>,
     retained: usize,
-) -> Option<(
-    OwnedSemaphorePermit,
-    OwnedSemaphorePermit,
-    OwnedSemaphorePermit,
-)> {
-    let count = Arc::clone(jobs).try_acquire_owned().ok()?;
-    let cost = u32::try_from(retained.max(1)).ok()?;
+) -> Result<
+    (
+        OwnedSemaphorePermit,
+        OwnedSemaphorePermit,
+        OwnedSemaphorePermit,
+    ),
+    IpcSendAdmissionLimit,
+> {
+    let count = Arc::clone(jobs)
+        .try_acquire_owned()
+        .map_err(|_| IpcSendAdmissionLimit::QueuedJobs)?;
+    let cost =
+        u32::try_from(retained.max(1)).map_err(|_| IpcSendAdmissionLimit::ConnectionBytes)?;
     let local = Arc::clone(connection_bytes)
         .try_acquire_many_owned(cost)
-        .ok()?;
-    let memory = Arc::clone(bytes).try_acquire_many_owned(cost).ok()?;
-    Some((count, local, memory))
+        .map_err(|_| IpcSendAdmissionLimit::ConnectionBytes)?;
+    let memory = Arc::clone(bytes)
+        .try_acquire_many_owned(cost)
+        .map_err(|_| IpcSendAdmissionLimit::GlobalBytes)?;
+    Ok((count, local, memory))
 }
 
 /// The gates of one IPC connection, created with it.
@@ -181,15 +191,24 @@ mod tests {
         let bytes = Arc::new(Semaphore::new(100));
         let local = Arc::new(Semaphore::new(100));
         let one = admit_queued_send(&jobs, &bytes, &local, 60).unwrap();
-        assert!(admit_queued_send(&jobs, &bytes, &local, 41).is_none());
+        assert_eq!(
+            admit_queued_send(&jobs, &bytes, &local, 41).unwrap_err(),
+            IpcSendAdmissionLimit::ConnectionBytes
+        );
         assert_eq!(jobs.available_permits(), 1); // failed byte admission rolls back
         let two = admit_queued_send(&jobs, &bytes, &local, 1).unwrap();
-        assert!(admit_queued_send(&jobs, &bytes, &local, 1).is_none());
+        assert_eq!(
+            admit_queued_send(&jobs, &bytes, &local, 1).unwrap_err(),
+            IpcSendAdmissionLimit::QueuedJobs
+        );
         drop((one, two));
         assert_eq!(jobs.available_permits(), 2);
         assert_eq!(bytes.available_permits(), 100);
         assert_eq!(local.available_permits(), 100);
-        assert!(admit_queued_send(&jobs, &bytes, &local, usize::MAX).is_none());
+        assert_eq!(
+            admit_queued_send(&jobs, &bytes, &local, usize::MAX).unwrap_err(),
+            IpcSendAdmissionLimit::ConnectionBytes
+        );
     }
 
     #[test]
@@ -202,7 +221,10 @@ mod tests {
         let frame = 16 * 1024 * 1024;
         let a1 = admit_queued_send(&jobs_a, &shared, &bytes_a, frame).unwrap();
         let a2 = admit_queued_send(&jobs_a, &shared, &bytes_a, frame).unwrap();
-        assert!(admit_queued_send(&jobs_a, &shared, &bytes_a, frame).is_none());
+        assert_eq!(
+            admit_queued_send(&jobs_a, &shared, &bytes_a, frame).unwrap_err(),
+            IpcSendAdmissionLimit::ConnectionBytes
+        );
         assert_eq!(jobs_a.available_permits(), 126);
         let b = admit_queued_send(&jobs_b, &shared, &bytes_b, 512).unwrap();
         drop((a1, a2, b));
@@ -215,7 +237,10 @@ mod tests {
             .clone()
             .try_acquire_many_owned(64 * 1024 * 1024)
             .unwrap();
-        assert!(admit_queued_send(&jobs_a, &shared, &bytes_a, frame).is_none());
+        assert_eq!(
+            admit_queued_send(&jobs_a, &shared, &bytes_a, frame).unwrap_err(),
+            IpcSendAdmissionLimit::GlobalBytes
+        );
         assert_eq!(bytes_a.available_permits(), CONNECTION_SEND_BYTES);
         assert_eq!(jobs_a.available_permits(), 128);
         drop(held);

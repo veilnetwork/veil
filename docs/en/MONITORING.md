@@ -112,6 +112,12 @@ handed over once they reconnect.
 | `veil_session_tx_drops_total` | counter | Outbound frames dropped (TX queue full) | `> 50/s` for 5 m = overload |
 | `veil_session_outbox_drops_total` | counter | Outbox channel saturation drops | similar |
 | `veil_ipc_delivery_drops_total` | counter | Local-app channel saturation | app not draining its IPC |
+| `veil_ipc_send_admission_jobs_rejected_total` | counter | Local send requests refused because the client's outstanding-job limit was reached | Sustained growth indicates that send jobs are arriving faster than they finish |
+| `veil_ipc_send_admission_connection_bytes_rejected_total` | counter | Local send requests refused by the connection's retained-byte limit | Check for large or concurrent sends on one connection |
+| `veil_ipc_send_admission_global_bytes_rejected_total` | counter | Local send requests refused by the daemon's shared retained-byte limit | Check send pressure across IPC connections |
+
+The three send admission counters count requests rejected with `SERVER_BUSY`
+before a job starts. A request containing multiple datagrams counts once.
 
 ### E2E / crypto
 
