@@ -265,7 +265,32 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   the test. They resumed bidirectional TUN traffic with the same
   addresses and accepted another new-owner policy. The old member's
   certificate and a higher revision signed by the old owner were refused.
-- The operator-managed procedure requires a maintenance window. Further
-  work includes a separately provisioned recovery authority and handling
-  of a compromised owner's maximum policy revision. Qualify a longer
-  multi-node run with packet traffic and policy changes.
+- The operator-managed procedure requires a maintenance window. Qualify a
+  longer multi-node run with packet traffic and policy changes.
+
+## 6. Recover after owner compromise
+
+- Operators can enroll an independent offline recovery public key in an
+  existing protected route policy store. The opt-in store records the
+  recovery pin and retired owner fingerprints alongside the signed
+  policy and commits them in one atomic update under the store lock.
+- Recovery verifies the pre-pinned key's authorization for the exact
+  replacement snapshot, current owner, successor and network. A fresh
+  owner can start its revision sequence at 1. Subsequent normal updates
+  under that owner still require nondecreasing revisions. Neither normal
+  rotation nor recovery can reinstate an owner retired since enrollment.
+- The policy mirror continues sending the signed snapshot without local
+  recovery metadata. The daemon uses the same membership certificate
+  format and operator-configured pin. Local CLI and ogate must support
+  the enrolled store format, and daemon trust changes still require
+  an independent management channel and a restart.
+- A store test verifies recovery from the maximum unsigned 64-bit
+  revision, an expired prior snapshot, input substitution, retry after
+  reopening, rejection of a retired owner, and subsequent normal updates.
+- On an isolated three-node Linux stand, two enrolled stores moved from
+  revision 9,223,372,036,854,775,807 to a fresh owner's revision 1.
+  They resumed TUN traffic with the same addresses, rejected the old
+  owner and certificate, and accepted revision 2 through the existing
+  mirror protocol. The original authorization could no longer replace
+  revision 2. A node on the older daemon rejoined after receiving a
+  certificate under the new owner.

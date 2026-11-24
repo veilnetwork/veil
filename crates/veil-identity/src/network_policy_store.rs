@@ -10,9 +10,17 @@ use crate::network_policy::{
     MAX_SIGNED_ROUTE_POLICY_BYTES, RoutePolicyAuthority, RoutePolicyError, VerifiedRoutePolicy,
     verify_route_policy,
 };
+use crate::network_recovery::{
+    OwnerRecovery, OwnerRecoveryError, owner_key_id, verify_owner_recovery,
+};
 
 const SNAPSHOT_FILE: &str = "route-policy.bin";
 const LOCK_FILE: &str = "route-policy.lock";
+const ENROLLED_MAGIC: &[u8] = b"veil/p-net/recovery-state/v1\0";
+const MAX_RETIRED_OWNERS: usize = u16::MAX as usize;
+const RECOVERY_HEADER_BYTES: usize = ENROLLED_MAGIC.len() + 32 + 2;
+const MAX_STORED_POLICY_BYTES: usize =
+    MAX_SIGNED_ROUTE_POLICY_BYTES + RECOVERY_HEADER_BYTES + MAX_RETIRED_OWNERS * 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -38,6 +46,22 @@ pub enum StoreError {
     RotationCurrent(#[source] RoutePolicyError),
     #[error("replacement policy did not verify against the successor: {0}")]
     RotationSuccessor(#[source] RoutePolicyError),
+    #[error("a different recovery key is already pinned for this policy store")]
+    RecoveryAlreadyPinned,
+    #[error("no recovery key is pinned for this policy store")]
+    RecoveryNotPinned,
+    #[error("the supplied recovery key does not match the pinned key")]
+    RecoveryKeyMismatch,
+    #[error("the recovery key cannot become the network owner")]
+    RecoveryKeyAsOwner,
+    #[error("a retired owner key cannot be used again")]
+    RetiredOwner,
+    #[error("route policy state has an invalid recovery header")]
+    InvalidRecoveryState,
+    #[error("route policy state has reached its retired-owner limit")]
+    TooManyRetiredOwners,
+    #[error(transparent)]
+    Recovery(#[from] OwnerRecoveryError),
     #[error(transparent)]
     Policy(#[from] RoutePolicyError),
     #[error(transparent)]
@@ -48,6 +72,46 @@ pub struct RoutePolicyStore {
     root: PathBuf,
     directory: File,
     owner: u32,
+}
+
+struct StoredPolicy {
+    signed: Vec<u8>,
+    recovery: Option<RecoveryState>,
+}
+
+struct RecoveryState {
+    key: [u8; 32],
+    retired: Vec<[u8; 32]>,
+}
+
+impl StoredPolicy {
+    fn decode(mut bytes: Vec<u8>) -> Result<Self, StoreError> {
+        let mut recovery = None;
+        if let Some(header) = bytes.strip_prefix(ENROLLED_MAGIC) {
+            let (key, header) = header
+                .split_first_chunk::<32>()
+                .ok_or(StoreError::InvalidRecoveryState)?;
+            let (count, tail) = header
+                .split_first_chunk::<2>()
+                .ok_or(StoreError::InvalidRecoveryState)?;
+            let history_bytes = usize::from(u16::from_be_bytes(*count)) * 32;
+            let history = tail
+                .get(..history_bytes)
+                .ok_or(StoreError::InvalidRecoveryState)?;
+            recovery = Some(RecoveryState {
+                key: *key,
+                retired: history.as_chunks::<32>().0.to_vec(),
+            });
+            bytes.drain(..RECOVERY_HEADER_BYTES + history_bytes);
+        }
+        if bytes.len() > MAX_SIGNED_ROUTE_POLICY_BYTES {
+            return Err(RoutePolicyError::Format.into());
+        }
+        Ok(Self {
+            signed: bytes,
+            recovery,
+        })
+    }
 }
 
 impl RoutePolicyStore {
@@ -154,12 +218,77 @@ impl RoutePolicyStore {
         )
     }
 
+    /// Enroll a separate public key before an emergency. This operation
+    /// preserves the current signed policy and cannot replace an existing pin.
+    pub fn pin_recovery(
+        &self,
+        current: &RoutePolicyAuthority<'_>,
+        recovery: &RoutePolicyAuthority<'_>,
+    ) -> Result<(), StoreError> {
+        if current.network_id != recovery.network_id {
+            return Err(OwnerRecoveryError::WrongNetwork.into());
+        }
+        let key = owner_key_id(recovery)?;
+        if key == owner_key_id(current)? {
+            return Err(OwnerRecoveryError::RepeatedKey.into());
+        }
+        let _lock = self.lock(false)?;
+        let stored = self.read_locked()?;
+        verify_route_policy(&stored.signed, current)?;
+        if let Some(existing) = stored.recovery {
+            if key != existing.key {
+                return Err(StoreError::RecoveryAlreadyPinned);
+            }
+            self.directory.sync_all()?;
+            return Ok(());
+        }
+        self.persist_locked(
+            &stored.signed,
+            Some(&RecoveryState {
+                key,
+                retired: Vec::new(),
+            }),
+        )
+    }
+
+    /// Recover into a fresh owner using an exact snapshot authorized by the
+    /// enrolled key. The replacement starts its own policy revision history.
+    pub fn recover_owner(
+        &self,
+        blob: &[u8],
+        current: &RoutePolicyAuthority<'_>,
+        successor: &RoutePolicyAuthority<'_>,
+        recovery: &OwnerRecovery<'_>,
+        check_only: bool,
+    ) -> Result<VerifiedRoutePolicy, StoreError> {
+        self.change_owner(
+            blob,
+            current,
+            successor,
+            check_only,
+            Some(recovery),
+            veil_util::unix_secs_now_u64,
+        )
+    }
+
     fn replace_owner_with_clock(
         &self,
         blob: &[u8],
         current: &RoutePolicyAuthority<'_>,
         successor: &RoutePolicyAuthority<'_>,
         check_only: bool,
+        clock: impl FnOnce() -> u64,
+    ) -> Result<VerifiedRoutePolicy, StoreError> {
+        self.change_owner(blob, current, successor, check_only, None, clock)
+    }
+
+    fn change_owner(
+        &self,
+        blob: &[u8],
+        current: &RoutePolicyAuthority<'_>,
+        successor: &RoutePolicyAuthority<'_>,
+        check_only: bool,
+        recovery: Option<&OwnerRecovery<'_>>,
         clock: impl FnOnce() -> u64,
     ) -> Result<VerifiedRoutePolicy, StoreError> {
         if current.network_id != successor.network_id {
@@ -172,8 +301,14 @@ impl RoutePolicyStore {
             verify_route_policy(blob, successor).map_err(StoreError::RotationSuccessor)?;
         let _lock = self.lock(false)?;
         offered.check_current(clock())?;
-        let accepted_bytes = self.read_locked()?;
-        if accepted_bytes == blob {
+        let mut stored = self.read_locked()?;
+        let current_key = Self::check_owner_change(&stored, blob, current, successor, recovery)?;
+        if stored.signed == blob
+            && stored
+                .recovery
+                .as_ref()
+                .is_none_or(|state| state.retired.last() == current_key.as_ref())
+        {
             // An identical, currently valid successor snapshot means the
             // replacement was already applied. Repeat the durability barrier
             // in case the prior caller was interrupted after the rename.
@@ -183,17 +318,53 @@ impl RoutePolicyStore {
             return Ok(offered);
         }
         let accepted =
-            verify_route_policy(&accepted_bytes, current).map_err(StoreError::RotationCurrent)?;
-        if offered.revision <= accepted.revision {
+            verify_route_policy(&stored.signed, current).map_err(StoreError::RotationCurrent)?;
+        if recovery.is_none() && offered.revision <= accepted.revision {
             return Err(StoreError::RotationRevision {
                 offered: offered.revision,
                 accepted: accepted.revision,
             });
         }
+        if let Some((state, retired_key)) = stored.recovery.as_mut().zip(current_key) {
+            if state.retired.len() == MAX_RETIRED_OWNERS {
+                return Err(StoreError::TooManyRetiredOwners);
+            }
+            state.retired.push(retired_key);
+        }
         if !check_only {
-            self.persist_locked(blob)?;
+            self.persist_locked(blob, stored.recovery.as_ref())?;
         }
         Ok(offered)
+    }
+
+    fn check_owner_change(
+        stored: &StoredPolicy,
+        blob: &[u8],
+        current: &RoutePolicyAuthority<'_>,
+        successor: &RoutePolicyAuthority<'_>,
+        recovery: Option<&OwnerRecovery<'_>>,
+    ) -> Result<Option<[u8; 32]>, StoreError> {
+        let Some(state) = &stored.recovery else {
+            return if recovery.is_some() {
+                Err(StoreError::RecoveryNotPinned)
+            } else {
+                Ok(None)
+            };
+        };
+        let next_key = owner_key_id(successor)?;
+        if next_key == state.key {
+            return Err(StoreError::RecoveryKeyAsOwner);
+        }
+        if state.retired.contains(&next_key) {
+            return Err(StoreError::RetiredOwner);
+        }
+        if let Some(recovery) = recovery {
+            if owner_key_id(recovery.authority)? != state.key {
+                return Err(StoreError::RecoveryKeyMismatch);
+            }
+            verify_owner_recovery(blob, current, successor, recovery)?;
+        }
+        Ok(Some(owner_key_id(current)?))
     }
 
     fn accept_with_clock(
@@ -217,15 +388,17 @@ impl RoutePolicyStore {
         now: u64,
     ) -> Result<VerifiedRoutePolicy, StoreError> {
         offered.check_current(now)?;
-        if initialize {
+        let recovery = if initialize {
             let path = self.root.join(SNAPSHOT_FILE);
             match fs::symlink_metadata(&path) {
                 Ok(_) => return Err(StoreError::AlreadyInitialized),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
+            None
         } else {
-            let (accepted, _) = self.load_locked(authority)?;
+            let stored = self.read_locked()?;
+            let accepted = verify_route_policy(&stored.signed, authority)?;
             match offered.revision.cmp(&accepted.revision) {
                 std::cmp::Ordering::Less => {
                     return Err(StoreError::Rollback {
@@ -242,13 +415,34 @@ impl RoutePolicyStore {
                 }
                 std::cmp::Ordering::Greater => {}
             }
-        }
-        self.persist_locked(blob)?;
+            stored.recovery
+        };
+        self.persist_locked(blob, recovery.as_ref())?;
         Ok(offered)
     }
 
-    fn persist_locked(&self, blob: &[u8]) -> Result<(), StoreError> {
-        veil_util::atomic_write_owner_only(&self.root.join(SNAPSHOT_FILE), blob)?;
+    fn persist_locked(
+        &self,
+        blob: &[u8],
+        recovery: Option<&RecoveryState>,
+    ) -> Result<(), StoreError> {
+        let wrapped;
+        let bytes = if let Some(state) = recovery {
+            let count =
+                u16::try_from(state.retired.len()).map_err(|_| StoreError::TooManyRetiredOwners)?;
+            wrapped = [
+                ENROLLED_MAGIC,
+                state.key.as_slice(),
+                &count.to_be_bytes(),
+                state.retired.as_flattened(),
+                blob,
+            ]
+            .concat();
+            wrapped.as_slice()
+        } else {
+            blob
+        };
+        veil_util::atomic_write_owner_only(&self.root.join(SNAPSHOT_FILE), bytes)?;
         // Require the directory barrier as well as the snapshot's file fsync
         // before acknowledging a new accepted revision.
         self.directory.sync_all()?;
@@ -286,11 +480,14 @@ impl RoutePolicyStore {
         &self,
         authority: &RoutePolicyAuthority<'_>,
     ) -> Result<(VerifiedRoutePolicy, Vec<u8>), StoreError> {
-        let blob = self.read_locked()?;
-        Ok((verify_route_policy(&blob, authority)?, blob))
+        let stored = self.read_locked()?;
+        Ok((
+            verify_route_policy(&stored.signed, authority)?,
+            stored.signed,
+        ))
     }
 
-    fn read_locked(&self) -> Result<Vec<u8>, StoreError> {
+    fn read_locked(&self) -> Result<StoredPolicy, StoreError> {
         let path = self.root.join(SNAPSHOT_FILE);
         let file = match open_state_file(&path, false, false) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -300,9 +497,9 @@ impl RoutePolicyStore {
         };
         self.require_owner_file(&file, &path)?;
         let mut blob = Vec::new();
-        file.take((MAX_SIGNED_ROUTE_POLICY_BYTES + 1) as u64)
+        file.take((MAX_STORED_POLICY_BYTES + 1) as u64)
             .read_to_end(&mut blob)?;
-        Ok(blob)
+        StoredPolicy::decode(blob)
     }
 
     fn require_owner_file(&self, file: &File, path: &Path) -> Result<(), StoreError> {
@@ -703,6 +900,119 @@ mod tests {
             .accept_with_clock(&update, &successor, false, || 120)
             .unwrap();
         assert_eq!(store.try_load_signed(&successor).unwrap().1, update);
+    }
+
+    #[test]
+    fn enrolled_recovery_survives_maximum_revision_and_retires_the_previous_key() {
+        use crate::network_recovery::sign_owner_recovery;
+
+        let dir = directory();
+        let path = dir.path().canonicalize().unwrap();
+        let old_key = veil_crypto::generate_keypair(ALGORITHM);
+        let new_key = veil_crypto::generate_keypair(ALGORITHM);
+        let recovery_key = veil_crypto::generate_keypair(ALGORITHM);
+        let other_key = veil_crypto::generate_keypair(ALGORITHM);
+        let pins =
+            [&old_key, &new_key, &recovery_key, &other_key].map(|key| RoutePolicyAuthority {
+                network_id: NETWORK,
+                algorithm: ALGORITHM,
+                public_key: &key.public_key,
+            });
+        let [old, next, recovery, other] = &pins;
+        let replacement = signed(&new_key, 1, 500, 3);
+        let old_snapshot = signed(&old_key, u64::MAX, 400, 2);
+        let proof =
+            sign_owner_recovery(&replacement, old, next, recovery, &recovery_key.private_key)
+                .unwrap();
+        let auth = OwnerRecovery {
+            authority: recovery,
+            signature: &proof,
+        };
+        let store = RoutePolicyStore::open(&path).unwrap();
+        store
+            .accept_with_clock(&old_snapshot, old, true, || 50)
+            .unwrap();
+        assert!(matches!(
+            store.change_owner(&replacement, old, next, false, Some(&auth), || 60),
+            Err(StoreError::RecoveryNotPinned)
+        ));
+        assert!(store.pin_recovery(old, old).is_err());
+        let weak = RoutePolicyAuthority {
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            ..*recovery
+        };
+        assert!(matches!(
+            store.pin_recovery(old, &weak),
+            Err(StoreError::Recovery(OwnerRecoveryError::WeakEd25519Key))
+        ));
+        store.pin_recovery(old, recovery).unwrap();
+        store.pin_recovery(old, recovery).unwrap();
+        assert!(matches!(
+            store.pin_recovery(old, other),
+            Err(StoreError::RecoveryAlreadyPinned)
+        ));
+        assert!(matches!(
+            store.replace_owner_with_clock(&replacement, old, next, false, || 60),
+            Err(StoreError::RotationRevision {
+                offered: 1,
+                accepted: u64::MAX,
+            })
+        ));
+        let mismatched_pin = OwnerRecovery {
+            authority: other,
+            signature: &proof,
+        };
+        assert!(matches!(
+            store.change_owner(&replacement, old, next, false, Some(&mismatched_pin), || 60),
+            Err(StoreError::RecoveryKeyMismatch)
+        ));
+        let other_policy = signed(&new_key, 2, 500, 4);
+        assert!(matches!(
+            store.change_owner(&other_policy, old, next, false, Some(&auth), || 60),
+            Err(StoreError::Recovery(OwnerRecoveryError::Signature(_)))
+        ));
+        store
+            .change_owner(&replacement, old, next, true, Some(&auth), || 60)
+            .unwrap();
+        assert_eq!(store.try_load_signed(old).unwrap().1, old_snapshot);
+        store
+            .change_owner(&replacement, old, next, false, Some(&auth), || 450)
+            .unwrap();
+        drop(store);
+        let store = RoutePolicyStore::open(&path).unwrap();
+        store
+            .change_owner(&replacement, old, next, false, Some(&auth), || 451)
+            .unwrap();
+        assert_eq!(store.try_load_signed(next).unwrap().1, replacement);
+        assert!(store.load(old).is_err());
+
+        store
+            .accept_with_clock(&other_policy, next, false, || 451)
+            .unwrap();
+        assert!(matches!(
+            store.change_owner(&replacement, old, next, false, Some(&auth), || 452),
+            Err(StoreError::RotationCurrent(RoutePolicyError::Signature(_)))
+        ));
+        let retired_offer = signed(&old_key, 3, 600, 4);
+        assert!(matches!(
+            store.replace_owner_with_clock(&retired_offer, next, old, false, || 452),
+            Err(StoreError::RetiredOwner)
+        ));
+        let recovery_offer = signed(&recovery_key, 3, 600, 4);
+        assert!(matches!(
+            store.replace_owner_with_clock(&recovery_offer, next, recovery, false, || 452),
+            Err(StoreError::RecoveryKeyAsOwner)
+        ));
+        assert_eq!(store.try_load_signed(next).unwrap().1, other_policy);
+        let later = signed(&other_key, 3, 600, 4);
+        store
+            .replace_owner_with_clock(&later, next, other, false, || 452)
+            .unwrap();
+        assert!(matches!(
+            store.replace_owner_with_clock(&other_policy, other, next, false, || 453),
+            Err(StoreError::RetiredOwner)
+        ));
+        assert_eq!(store.try_load_signed(other).unwrap().1, later);
     }
 
     #[test]

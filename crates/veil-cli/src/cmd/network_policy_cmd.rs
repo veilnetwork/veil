@@ -7,6 +7,12 @@ use veil_identity::network_policy::{
     MAX_SIGNED_ROUTE_POLICY_BYTES, RoutePolicy, RoutePolicyAuthority, sign_route_policy,
     verify_route_policy,
 };
+#[cfg(unix)]
+use veil_identity::network_policy_store::RoutePolicyStore;
+use veil_identity::network_recovery::sign_owner_recovery;
+#[cfg(unix)]
+use veil_identity::network_recovery::{MAX_OWNER_RECOVERY_BYTES, OwnerRecovery};
+use veil_types::SignatureAlgorithm;
 use zeroize::Zeroizing;
 
 use super::{
@@ -23,10 +29,14 @@ pub(super) fn run<I: CommandIo>(
     command: RoutePolicyCommand,
 ) -> Result<()> {
     let trust = match &command {
-        RoutePolicyCommand::Sign { trust, .. } | RoutePolicyCommand::Verify { trust, .. } => trust,
+        RoutePolicyCommand::Sign { trust, .. }
+        | RoutePolicyCommand::Verify { trust, .. }
+        | RoutePolicyCommand::SignRecovery { trust, .. } => trust,
         #[cfg(unix)]
         RoutePolicyCommand::Install { trust, .. }
         | RoutePolicyCommand::RotateOwner { trust, .. }
+        | RoutePolicyCommand::PinRecovery { trust, .. }
+        | RoutePolicyCommand::RecoverOwner { trust, .. }
         | RoutePolicyCommand::Status { trust, .. } => trust,
     };
     let owner_key = read_bounded(&trust.owner_pub, MAX_OWNER_KEY_BYTES)?;
@@ -81,12 +91,8 @@ pub(super) fn run<I: CommandIo>(
             initialize,
             ..
         } => {
-            use veil_identity::network_policy_store::RoutePolicyStore;
-
             let blob = read_bounded(&policy, MAX_SIGNED_ROUTE_POLICY_BYTES)?;
-            let store = RoutePolicyStore::open(&state_dir)
-                .map_err(|error| invalid(format!("open {}: {error}", state_dir.display())))?;
-            let accepted = store
+            let accepted = open_store(&state_dir)?
                 .accept(&blob, &authority, initialize)
                 .map_err(invalid)?;
             context
@@ -97,24 +103,19 @@ pub(super) fn run<I: CommandIo>(
         RoutePolicyCommand::RotateOwner {
             policy,
             state_dir,
-            next_owner_pub,
-            next_algo,
+            next,
             check,
             ..
         } => {
-            use veil_identity::network_policy_store::RoutePolicyStore;
-
-            let next_key = read_bounded(&next_owner_pub, MAX_OWNER_KEY_BYTES)?;
-            let successor = RoutePolicyAuthority {
-                network_id: authority.network_id,
-                algorithm: next_algo.map_or(authority.algorithm, Into::into),
-                public_key: read_text(&next_owner_pub, &next_key)?.trim(),
-            };
+            let next_key = PublicKeyFile::next(&next, &authority)?;
             let blob = read_bounded(&policy, MAX_SIGNED_ROUTE_POLICY_BYTES)?;
-            let store = RoutePolicyStore::open(&state_dir)
-                .map_err(|error| invalid(format!("open {}: {error}", state_dir.display())))?;
-            let replacement = store
-                .replace_owner(&blob, &authority, &successor, check)
+            let replacement = open_store(&state_dir)?
+                .replace_owner(
+                    &blob,
+                    &authority,
+                    &next_key.authority(authority.network_id),
+                    check,
+                )
                 .map_err(invalid)?;
             let action = if check {
                 "Checked successor"
@@ -126,12 +127,84 @@ pub(super) fn run<I: CommandIo>(
                 .emit(OutputEvent::message(summary(action, &replacement)));
         }
         #[cfg(unix)]
+        RoutePolicyCommand::PinRecovery {
+            state_dir,
+            recovery,
+            ..
+        } => {
+            let recovery_key = PublicKeyFile::recovery(&recovery)?;
+            open_store(&state_dir)?
+                .pin_recovery(&authority, &recovery_key.authority(authority.network_id))
+                .map_err(invalid)?;
+            context
+                .io
+                .emit(OutputEvent::message("Pinned P-Net recovery key"));
+        }
+        RoutePolicyCommand::SignRecovery {
+            policy,
+            recovery_priv,
+            out,
+            next,
+            recovery,
+            ..
+        } => {
+            let next_key = PublicKeyFile::next(&next, &authority)?;
+            let recovery_key = PublicKeyFile::recovery(&recovery)?;
+            let private_key = read_bounded(&recovery_priv, MAX_OWNER_KEY_BYTES)?;
+            let blob = read_bounded(&policy, MAX_SIGNED_ROUTE_POLICY_BYTES)?;
+            let signature = sign_owner_recovery(
+                &blob,
+                &authority,
+                &next_key.authority(authority.network_id),
+                &recovery_key.authority(authority.network_id),
+                read_text(&recovery_priv, &private_key)?.trim(),
+            )
+            .map_err(invalid)?;
+            veil_util::write_new_owner_only(&out, &signature)
+                .map_err(|error| invalid(format!("write {}: {error}", out.display())))?;
+            context.io.emit(OutputEvent::message(format!(
+                "Signed owner recovery authorization written to {}",
+                out.display()
+            )));
+        }
+        #[cfg(unix)]
+        RoutePolicyCommand::RecoverOwner {
+            policy,
+            authorization,
+            state_dir,
+            check,
+            next,
+            recovery,
+            ..
+        } => {
+            let next_key = PublicKeyFile::next(&next, &authority)?;
+            let recovery_key = PublicKeyFile::recovery(&recovery)?;
+            let blob = read_bounded(&policy, MAX_SIGNED_ROUTE_POLICY_BYTES)?;
+            let signature = read_bounded(&authorization, MAX_OWNER_RECOVERY_BYTES)?;
+            let replacement = open_store(&state_dir)?
+                .recover_owner(
+                    &blob,
+                    &authority,
+                    &next_key.authority(authority.network_id),
+                    &OwnerRecovery {
+                        authority: &recovery_key.authority(authority.network_id),
+                        signature: &signature,
+                    },
+                    check,
+                )
+                .map_err(invalid)?;
+            let action = if check {
+                "Checked recovery"
+            } else {
+                "Recovered"
+            };
+            context
+                .io
+                .emit(OutputEvent::message(summary(action, &replacement)));
+        }
+        #[cfg(unix)]
         RoutePolicyCommand::Status { state_dir, .. } => {
-            use veil_identity::network_policy_store::RoutePolicyStore;
-
-            let store = RoutePolicyStore::open(&state_dir)
-                .map_err(|error| invalid(format!("open {}: {error}", state_dir.display())))?;
-            let saved = store.load(&authority).map_err(invalid)?;
+            let saved = open_store(&state_dir)?.load(&authority).map_err(invalid)?;
             let state = match saved.check_current(veil_util::unix_secs_now_u64()) {
                 Ok(()) => "Current".to_owned(),
                 Err(error) => error.to_string(),
@@ -143,6 +216,49 @@ pub(super) fn run<I: CommandIo>(
         }
     }
     Ok(())
+}
+
+struct PublicKeyFile {
+    algorithm: SignatureAlgorithm,
+    text: String,
+}
+
+impl PublicKeyFile {
+    fn read(path: &Path, algorithm: SignatureAlgorithm) -> Result<Self> {
+        let bytes = read_bounded(path, MAX_OWNER_KEY_BYTES)?;
+        Ok(Self {
+            algorithm,
+            text: read_text(path, &bytes)?.trim().to_owned(),
+        })
+    }
+
+    fn next(
+        args: &super::cli::RoutePolicySuccessor,
+        current: &RoutePolicyAuthority<'_>,
+    ) -> Result<Self> {
+        Self::read(
+            &args.next_owner_pub,
+            args.next_algo.map_or(current.algorithm, Into::into),
+        )
+    }
+
+    fn recovery(args: &super::cli::RoutePolicyRecoveryKey) -> Result<Self> {
+        Self::read(&args.recovery_pub, args.recovery_algo.into())
+    }
+
+    fn authority(&self, network_id: [u8; 32]) -> RoutePolicyAuthority<'_> {
+        RoutePolicyAuthority {
+            network_id,
+            algorithm: self.algorithm,
+            public_key: &self.text,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_store(path: &Path) -> Result<RoutePolicyStore> {
+    RoutePolicyStore::open(path)
+        .map_err(|error| invalid(format!("open {}: {error}", path.display())))
 }
 
 fn read_bounded(path: &Path, maximum: usize) -> Result<Zeroizing<Vec<u8>>> {

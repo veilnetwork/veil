@@ -2180,6 +2180,26 @@ pub struct RoutePolicyTrust {
     pub network_id: String,
 }
 
+#[derive(Debug, clap::Args)]
+pub struct RoutePolicySuccessor {
+    /// Independently authenticated successor public key file in base64.
+    #[arg(long)]
+    pub next_owner_pub: PathBuf,
+    /// Successor signing algorithm. Defaults to the current algorithm.
+    #[arg(long, value_enum)]
+    pub next_algo: Option<SignatureAlgorithmArg>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct RoutePolicyRecoveryKey {
+    /// Independently generated recovery public key file in base64.
+    #[arg(long)]
+    pub recovery_pub: PathBuf,
+    /// Recovery signing algorithm.
+    #[arg(long, value_enum, default_value_t = SignatureAlgorithmArg::Ed25519)]
+    pub recovery_algo: SignatureAlgorithmArg,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum RoutePolicyCommand {
     /// Sign an address policy TOML file using the offline owner key.
@@ -2227,15 +2247,58 @@ pub enum RoutePolicyCommand {
         /// Existing private policy state directory for this P-Net.
         #[arg(long)]
         state_dir: PathBuf,
-        /// Independently authenticated successor public key file in base64.
-        #[arg(long)]
-        next_owner_pub: PathBuf,
-        /// Successor signing algorithm. Defaults to the current algorithm.
-        #[arg(long, value_enum)]
-        next_algo: Option<SignatureAlgorithmArg>,
         /// Check both pins, validity and revision without changing the store.
         #[arg(long)]
         check: bool,
+        #[command(flatten)]
+        next: RoutePolicySuccessor,
+        #[command(flatten)]
+        trust: RoutePolicyTrust,
+    },
+    /// Pin an independent recovery key before an emergency.
+    #[cfg(unix)]
+    PinRecovery {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[command(flatten)]
+        recovery: RoutePolicyRecoveryKey,
+        #[command(flatten)]
+        trust: RoutePolicyTrust,
+    },
+    /// Authorize one exact successor policy using the offline recovery key.
+    SignRecovery {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        recovery_priv: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[command(flatten)]
+        next: RoutePolicySuccessor,
+        #[command(flatten)]
+        recovery: RoutePolicyRecoveryKey,
+        #[command(flatten)]
+        trust: RoutePolicyTrust,
+    },
+    /// Change owners using an authorization from the pre-pinned recovery key.
+    ///
+    /// Stop ogate before applying. The successor must use a fresh key and may
+    /// start at a lower revision. Use independently authenticated public pins.
+    #[cfg(unix)]
+    RecoverOwner {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        authorization: PathBuf,
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Check the recovery signature and policy without changing the store.
+        #[arg(long)]
+        check: bool,
+        #[command(flatten)]
+        next: RoutePolicySuccessor,
+        #[command(flatten)]
+        recovery: RoutePolicyRecoveryKey,
         #[command(flatten)]
         trust: RoutePolicyTrust,
     },

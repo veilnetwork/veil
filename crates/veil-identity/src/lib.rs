@@ -48,6 +48,7 @@ pub mod network_cert;
 pub mod network_policy;
 #[cfg(unix)]
 pub mod network_policy_store;
+pub mod network_recovery;
 pub mod pair_runtime;
 pub mod pair_transport;
 pub mod publish;

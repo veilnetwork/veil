@@ -460,6 +460,45 @@ Only the operator can change the owner pin. Revise daemon trust only on
 nodes you can authenticate and manage independently if the owner key is
 lost or suspected of compromise.
 
+### Prepare for emergency recovery
+
+Generate a separate recovery key and keep its private half offline,
+independent of the owner key. On each Unix node with signed ogate routes,
+upgrade the local CLI and ogate to versions that support recovery before
+pinning the recovery public key. Pinning records it alongside the policy
+in the same protected store. Earlier ogate binaries cannot open an
+enrolled store. Membership certificates and peer connections retain
+their existing formats.
+
+```sh
+veil-cli network route-policy pin-recovery --owner-pub current.pub \
+  --recovery-pub recovery.pub --network-id "$NETWORK_ID" --state-dir "$STATE_DIR"
+```
+
+In an emergency, generate a fresh owner key and issue new membership
+certificates for approved nodes. Sign the initial address policy with
+the new owner. It may start at revision 1, even if the old owner reached
+the maximum revision. Sign the exact replacement file offline with the
+recovery key. Use the existing protected state directory on every node.
+
+```sh
+veil-cli network route-policy sign-recovery --policy next.bin \
+  --owner-pub current.pub --next-owner-pub next.pub --network-id "$NETWORK_ID" \
+  --recovery-pub recovery.pub --recovery-priv recovery.key --out recovery.sig
+veil-cli network route-policy recover-owner --check --policy next.bin \
+  --owner-pub current.pub --next-owner-pub next.pub --network-id "$NETWORK_ID" \
+  --recovery-pub recovery.pub --authorization recovery.sig --state-dir "$STATE_DIR"
+```
+
+Once the checks pass, follow the owner replacement procedure above.
+Use `recover-owner` without `--check` in place of `rotate-owner`. Keep the
+state and its owner history across restart and subsequent updates. After
+enrollment, every owner change retires the previous key. The store cannot
+reuse retired owner keys or use the recovery key as an owner. The pinned
+recovery key itself stays fixed. Only the old owner's public key is
+required. Changes to the P-Net trust pin and member certificates still use
+an independent management channel.
+
 ## What gets rejected
 
 | Scenario | Error message at handshake |
@@ -534,9 +573,8 @@ ansible-playbook -i inventory.yml revert-pnet.yml
   keypair and redistribute.
 * **Recovery currently requires management access**. A compromised
   owner key can issue admin certificates until nodes change their pin.
-  An installed policy at the maximum revision also precludes an in-place
-  policy rotation. The standard procedure assumes a successor policy
-  can use a higher revision.
+  Normal rotation requires a higher revision. An enrolled recovery key
+  can authorize a fresh owner even at the maximum revision.
 * **No bridging between networks**: an admin on Network A cannot reach
   into Network B. Each network is its own separate trust domain, with no
   overlap.
