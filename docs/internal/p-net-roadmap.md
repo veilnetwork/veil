@@ -313,6 +313,40 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   chat messages. The spoke-to-hub chat p99 rose from 410 to 574 ms and
   the hub-to-spoke p99 rose from 211 to 226 ms. The default stays at
   200 µs. These are two cold trials on a two-vCPU Linux ARM64 stand.
+- On a cold repeat using the existing session trace, the two transmitting
+  spokes logged 56 and 74 TCP writes taking at least 25 ms, peaking at
+  271 and 132 ms. The write delays overlapped the measured IPC refusals.
+  The sessions used the canonical ordered writer, with neither a parallel
+  transport nor an active primary media producer. The hub made 24
+  cold recipient-certificate walks and logged 21 slow inbound dispatches.
+  The destination TUN probes dropped 17 and 46 observations, and one
+  receive socket reported 27 drops. The write and IPC observations are
+  taken at the sender and do not depend on the destination captures.
+- For an active private member, the node sends an existing Discovery
+  `Store` with its current signed instance certificate after the identity
+  document notice. It validates the locally published certificate against
+  the current device, key material, delegation, and expiration. It checks
+  membership expiry, ban status, and TX ownership on the admitting
+  session. The receiver uses the normal DHT store quotas and certificate
+  verification on resolution. Normal discovery still serves cache misses.
+- In the initial controlled test of the notice, hub instance-certificate
+  walks fell from 17 to zero. Sender IPC refusals fell from 114 requests
+  covering 330 UDP datagrams to zero. Both trial variants delivered all
+  310 direct chat messages. Spoke-to-hub chat p99 fell from 246 to 108 ms.
+  The same two senders logged 65 slow TCP writes without the notice and
+  32 with it. The 121,904 datagrams in the notice run all reached the
+  receiver socket, with zero TUN capture or socket drops.
+- A repeat ran the production change first and the control second. Hub
+  certificate walks were zero and 16 respectively. Slow TCP writes from
+  the two senders were 40 with the change and 63 in the control. IPC still
+  refused 1,568 datagrams with the change and 1,267 in the control. The
+  changed run also recorded 80 drops across the destination UDP sockets.
+  Both runs delivered all 310 direct SDK messages. The hub-to-spoke p99
+  changed from 202 to 149 ms and the spoke-to-hub p99 from 311 to 400 ms.
+  The repeated result is removal of the cold certificate walks. UDP loss
+  and chat tail latency still vary when the ordered transport is loaded.
+  The production change also passed TUN traffic in both directions with
+  a pre-batch daemon and withdrew the route 0.88 s after its session closed.
 - A separate cold start ran the first end-to-end probes in groups of
   four before opening the UDP flows. All 24 paths answered in 12.52 s.
   The following 38 s sample lost 76 of 137,175 UDP datagrams, with one

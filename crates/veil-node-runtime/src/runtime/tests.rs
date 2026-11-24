@@ -7033,6 +7033,62 @@ async fn isolated_identity_republisher() -> (NodeRuntime, tempfile::TempDir) {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn private_certificate_notice_requires_current_signed_instance_keys() {
+    use crate::identity_local::publisher_dht::local_instance_certificate_notice;
+    use veil_proto::{discovery::StorePayload, mlkem_cert::MlKemKeyCert};
+
+    let (mut runtime, _dir) = isolated_identity_republisher().await;
+    let identity = runtime.identity.sovereign_identity.get().unwrap();
+    let ratchet = runtime
+        .dispatcher
+        .crypto
+        .ratchet
+        .as_ref()
+        .unwrap()
+        .identity()
+        .unwrap();
+    let now = veil_util::unix_secs_now_u64();
+    let key = MlKemKeyCert::dht_key(identity.node_id(), &identity.active_instance_id());
+    let value = runtime.dht.get_local(&key).unwrap();
+    let cert = MlKemKeyCert::decode(&value).unwrap();
+    let notice = || local_instance_certificate_notice(&runtime.dht, &identity, &ratchet, now);
+
+    let frame = notice().expect("current local certificate is publishable");
+    let payload = StorePayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+    assert_eq!(payload.key, key);
+    assert_eq!(payload.value, value);
+    assert!(
+        local_instance_certificate_notice(
+            &runtime.dht,
+            &identity,
+            &ratchet,
+            cert.valid_until_unix + 1
+        )
+        .is_none()
+    );
+
+    let mut invalid = cert.clone();
+    invalid.sig[0] ^= 1;
+    runtime.dht.store_local(key, invalid.encode());
+    assert!(notice().is_none());
+
+    let mut wrong_ek = cert.mlkem_pubkey;
+    wrong_ek[0] ^= 1;
+    let signed = identity
+        .sign_mlkem_cert(
+            wrong_ek,
+            cert.ratchet_x25519_pubkey,
+            cert.valid_from_unix,
+            cert.valid_until_unix,
+            cert.cert_version,
+        )
+        .unwrap();
+    runtime.dht.store_local(key, signed.encode());
+    assert!(notice().is_none());
+    runtime.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn first_session_event_publishes_without_the_five_second_poll() {
     let (mut rt, _dir) = isolated_identity_republisher().await;
     tokio::time::pause();

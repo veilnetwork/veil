@@ -328,11 +328,56 @@ pub(crate) fn notify_new_identity_verifier(
 }
 
 fn identity_document_notice(document: &veil_proto::identity_document::IdentityDocument) -> Vec<u8> {
-    let body = veil_proto::discovery::StorePayload::unsigned(
+    discovery_store_notice(
         veil_proto::identity_document::IdentityDocument::dht_key(&document.node_id),
         document.encode(),
     )
-    .encode();
+}
+
+/// Reuse the signed certificate already published for the current device.
+/// The DHT mirror can also contain records learned from peers, so check the
+/// signature and the current local keys before handing one to a neighbor.
+pub(crate) fn local_instance_certificate_notice(
+    dht: &KademliaService,
+    identity: &veil_identity::sovereign::SovereignIdentity,
+    ratchet: &veil_e2e::RatchetIdentity,
+    now: u64,
+) -> Option<Vec<u8>> {
+    use veil_proto::mlkem_cert::MlKemKeyCert;
+
+    let instance = identity.active_instance_id();
+    if ratchet.local_node_id != *identity.node_id() || ratchet.local_instance_id != instance {
+        return None;
+    }
+    let key = MlKemKeyCert::dht_key(identity.node_id(), &instance);
+    let value = dht.get_local(&key)?;
+    let cert = MlKemKeyCert::decode(&value).ok()?;
+    let epoch = ratchet.seed_ring.epoch();
+    if cert.node_id != *identity.node_id()
+        || cert.instance_id != instance
+        || cert.mlkem_pubkey != ratchet.seed_ring.current_ek()
+        || cert.ratchet_x25519_pubkey != ratchet.seed_ring.current_ratchet_pk()
+    {
+        return None;
+    }
+    let verified =
+        veil_identity::mlkem_fanout::verify_mlkem_cert(&cert, &identity.document, now).ok()?;
+    let device = identity.active_device_id();
+    if verified.device_id != Some(device)
+        || identity
+            .document
+            .revoked_devices
+            .iter()
+            .any(|entry| entry.device_id == device)
+        || ratchet.seed_ring.epoch() != epoch
+    {
+        return None;
+    }
+    Some(discovery_store_notice(key, value))
+}
+
+fn discovery_store_notice(key: [u8; 32], value: Vec<u8>) -> Vec<u8> {
+    let body = veil_proto::discovery::StorePayload::unsigned(key, value).encode();
     let mut header = veil_proto::header::FrameHeader::new(
         veil_proto::family::FrameFamily::Discovery as u8,
         veil_proto::family::DiscoveryMsg::Store as u16,

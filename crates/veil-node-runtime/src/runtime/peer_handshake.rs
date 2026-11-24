@@ -1530,6 +1530,12 @@ pub async fn register_connection_session(
     // `pending_peer_state` without committing, so a rejected peer leaves no
     // trace in the per-peer caches and evicts nothing from them. The matching
     // SessionGuard below removes the registry entry on session end.
+    let peer_node_id = remote_identity.node_id.as_bytes();
+    let membership_expires = pending_peer_state
+        .membership_cert
+        .as_ref()
+        .filter(|cert| cert.member_node_id == *peer_node_id)
+        .map(|cert| cert.valid_until_unix);
     let session_entry = pending_peer_state.commit(&runtime);
     // Which DEVICE of the peer this session ends at, for the resumption ticket
     // the inbound spawner is about to mint. Read before the entry moves into
@@ -1566,9 +1572,44 @@ pub async fn register_connection_session(
     if let Some(identity) = runtime.identity.sovereign_identity.get() {
         crate::identity_local::publisher_dht::notify_new_identity_verifier(
             &runtime.session_tx_registry,
-            remote_identity.node_id.as_bytes(),
+            peer_node_id,
             &identity.document,
         );
+        // Private peers commonly start exchanging tunnel traffic as soon as
+        // the session is admitted. Supply the published key beside the
+        // document so the receiver can resolve the exact instance locally.
+        // Both records go through the receiver's existing DHT and cert checks.
+        if runtime.network_gate.is_some()
+            && session_state == SessionState::Active
+            && !referral_session
+            && let Some(expires) = membership_expires
+            && let Some(ratchet) = runtime
+                .dispatcher
+                .crypto
+                .ratchet
+                .as_ref()
+                .and_then(|runtime| runtime.identity())
+            && let Some(frame) =
+                crate::identity_local::publisher_dht::local_instance_certificate_notice(
+                    &runtime.dispatcher.dht,
+                    &identity,
+                    &ratchet,
+                    veil_util::unix_secs_now_u64(),
+                )
+        {
+            let registry = rlock!(runtime.session_tx_registry);
+            let bans = lock!(runtime.dispatcher.abuse.ban_list);
+            if (expires == 0 || veil_util::unix_secs_now_u64() < expires)
+                && !bans.is_banned(peer_node_id)
+            {
+                let _ = registry.send_to_owned_result(
+                    peer_node_id,
+                    &remote_identity.session_keys.session_id,
+                    veil_proto::priority::INTERACTIVE,
+                    frame,
+                );
+            }
+        }
     }
     runtime.logger.info(
         "session.open",
