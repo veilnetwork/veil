@@ -233,6 +233,60 @@ pub(super) enum DirectAdmission {
     Rejected,
 }
 
+/// Retain a small private-network frame briefly when the existing source
+/// credits are busy. Recheck admission before every poll that may queue it.
+pub(super) async fn admit_direct_recoverable(
+    ctx: &super::IpcSendContext,
+    recipient: &[u8; 32],
+    device: &[u8; 32],
+    instance: [u8; 16],
+    frame: Vec<u8>,
+    deadline: tokio::time::Instant,
+) -> DirectAdmission {
+    use std::task::Poll;
+    let (Some(reg), Some(admission)) = (
+        ctx.session_tx_registry.as_deref(),
+        ctx.pnet_admission.as_deref(),
+    ) else {
+        return DirectAdmission::Missing;
+    };
+    let deadline =
+        deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(250));
+    let mut pending =
+        reg.send_local_source_to(device, veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE, frame);
+    let mut waited_for_credit = false;
+    let result = std::future::poll_fn(|cx| {
+        if tokio::time::Instant::now() >= deadline {
+            return Poll::Ready(DirectAdmission::TimedOut);
+        }
+        if ctx.app_registry.is_peer_revoked(device)
+            || ctx.app_registry.is_peer_revoked(recipient)
+            || !super::device_matches_identity(ctx, device, recipient)
+        {
+            return Poll::Ready(DirectAdmission::Rejected);
+        }
+        match super::session_proven_instance(ctx, device) {
+            Some(current) if current == instance => {}
+            Some(_) => return Poll::Ready(DirectAdmission::Rejected),
+            None => return Poll::Ready(DirectAdmission::Missing),
+        }
+        if waited_for_credit && !admission.admits(device) {
+            return Poll::Ready(DirectAdmission::Rejected);
+        }
+        waited_for_credit = true;
+        pending.as_mut().poll(cx).map(|queued| {
+            if queued {
+                DirectAdmission::Accepted
+            } else {
+                DirectAdmission::Missing
+            }
+        })
+    });
+    tokio::time::timeout_at(deadline, result)
+        .await
+        .unwrap_or(DirectAdmission::TimedOut)
+}
+
 /// The caller has already verified which device the ciphertext is keyed to.
 /// Use existing Forward/chunk framing on that very session, not a third party.
 /// Direct sends retain their existing source-admission reply semantics; they

@@ -2750,6 +2750,14 @@ async fn handle_ipc_client(
                             // leave this loop instead of holding it for the
                             // length of a DHT key resolve.
                             let mut ctx = IpcSendContext {
+                                pnet_admission: if veil_proto::ipc::ipc_local_source_lane(&hdr)
+                                    == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
+                                    && app_registry.peer_revocations_enabled()
+                                {
+                                    pnet_status_queries.clone()
+                                } else {
+                                    None
+                                },
                                 source_received_at: std::time::Instant::now(),
                                 local_work: None,
                                 local_priority: veil_proto::ipc::ipc_local_source_lane(&hdr),

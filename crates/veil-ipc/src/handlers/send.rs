@@ -39,8 +39,8 @@ use crate::IpcMetrics;
 #[path = "source_envelope.rs"]
 mod source_envelope;
 use source_envelope::{
-    DirectAdmission, EnvelopeChunks, admit_direct_plain, admit_direct_sealed,
-    send_packetized_control, source_segment_bytes,
+    DirectAdmission, EnvelopeChunks, admit_direct_plain, admit_direct_recoverable,
+    admit_direct_sealed, send_packetized_control, source_segment_bytes,
 };
 
 /// How long a discovery that found no route is believed.
@@ -577,19 +577,19 @@ type PlannedRelay = (Option<[u8; 32]>, Vec<[u8; 32]>);
 /// named one; otherwise the one its id derives
 /// (`SovereignIdentity::active_instance_id`: the first sixteen bytes).
 fn device_instance(ctx: &IpcSendContext, device: &[u8; 32]) -> [u8; 16] {
-    ctx.session_instance_lookup
-        .as_deref()
-        .and_then(|lookup| {
-            lookup
-                .session_pairing(device)
-                .map(|p| p.instance)
-                .or_else(|| lookup.session_instance(device))
-        })
-        .unwrap_or_else(|| {
-            let mut prefix = [0u8; 16];
-            prefix.copy_from_slice(&device[..16]);
-            prefix
-        })
+    session_proven_instance(ctx, device).unwrap_or_else(|| {
+        let mut prefix = [0u8; 16];
+        prefix.copy_from_slice(&device[..16]);
+        prefix
+    })
+}
+
+fn session_proven_instance(ctx: &IpcSendContext, device: &[u8; 32]) -> Option<[u8; 16]> {
+    let lookup = ctx.session_instance_lookup.as_deref()?;
+    lookup
+        .session_pairing(device)
+        .map(|p| p.instance)
+        .or_else(|| lookup.session_instance(device))
 }
 
 /// A resolved family slot must still belong to the identity being addressed.
@@ -1153,6 +1153,7 @@ pub(crate) async fn rate_limited(
 /// Every field was ALREADY an `Arc` where the server keeps it, so this costs
 /// a refcount bump per send, not a copy of anything.
 pub(crate) struct IpcSendContext {
+    pub pnet_admission: Option<Arc<crate::handlers::queries::PnetStatusQueries>>,
     pub(crate) source_received_at: std::time::Instant,
     /// Sender scheduling only; never copied into a network header or payload.
     pub local_priority: u8,
@@ -1627,6 +1628,10 @@ async fn handle_ipc_send_inner(
     } else {
         ctx.local_priority
     };
+    let private_recoverable = raw_flags == 0
+        && local_priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
+        && app_registry.peer_revocations_enabled()
+        && ctx.pnet_admission.is_some();
     let relay_media_sealed = raw_flags & veil_proto::ipc::IPC_SEND_FLAG_RELAY_MEDIA_SEALED != 0;
     let send = match AppIpcSendPayload::decode(body) {
         Ok(s) => s,
@@ -2074,14 +2079,27 @@ async fn handle_ipc_send_inner(
                         .is_some_and(|lookup| lookup.supports_direct_app_chunks(device))
                 {
                     admit_direct_plain(ctx, request, *device, deadline).await
-                } else if reg.send_to(
-                    device,
-                    local_priority,
-                    app_send_frame(request, sealed.as_ref().map(|(p, _, _)| p.as_slice())),
-                ) {
-                    DirectAdmission::Accepted
                 } else {
-                    DirectAdmission::Missing
+                    let frame =
+                        app_send_frame(request, sealed.as_ref().map(|(p, _, _)| p.as_slice()));
+                    if private_recoverable
+                        && let Some(instance) = copy_for
+                        && session_proven_instance(ctx, device) == Some(instance)
+                    {
+                        admit_direct_recoverable(
+                            ctx,
+                            &request.dst_node_id,
+                            device,
+                            instance,
+                            frame,
+                            deadline,
+                        )
+                        .await
+                    } else if reg.send_to(device, local_priority, frame) {
+                        DirectAdmission::Accepted
+                    } else {
+                        DirectAdmission::Missing
+                    }
                 };
                 if outcome == DirectAdmission::Missing
                     && !relay_control_compat
@@ -2297,9 +2315,14 @@ async fn handle_ipc_send_inner(
         // is the opposite of where the traffic is.
         let mut direct_admission_failed = false;
         let direct_started = std::time::Instant::now();
+        let needs_chunks = !relay_realtime
+            && sealed.as_ref().is_some_and(|(payload, _, _)| {
+                payload.len() > source_segment_bytes(reg, payload.len())
+            });
+        let recoverable_instance = sealed_for.filter(|_| private_recoverable);
         let sent = if !relay_realtime
             && let Some((payload, _, _)) = &sealed
-            && payload.len() > source_segment_bytes(reg, payload.len())
+            && (needs_chunks || recoverable_instance.is_some())
         {
             let devices = reg.devices_of(&send.dst_node_id);
             let selected = if devices.is_empty() {
@@ -2310,15 +2333,34 @@ async fn handle_ipc_send_inner(
                     .find(|device| sealed_for == Some(device_instance(ctx, device)))
             };
             if let Some(device) = selected {
-                match admit_direct_sealed(
-                    ctx,
-                    &send,
-                    device,
-                    payload,
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(30),
-                )
-                .await
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                let outcome = if needs_chunks {
+                    admit_direct_sealed(ctx, &send, device, payload, deadline).await
+                } else if let Some(instance) = recoverable_instance
+                    && session_proven_instance(ctx, &device) == Some(instance)
                 {
+                    admit_direct_recoverable(
+                        ctx,
+                        &send.dst_node_id,
+                        &device,
+                        instance,
+                        app_send_frame(&send, Some(payload)),
+                        deadline,
+                    )
+                    .await
+                } else if hand_to_sealed_device(
+                    reg,
+                    &send.dst_node_id,
+                    sealed_for,
+                    &|device| device_instance(ctx, device),
+                    local_priority,
+                    app_send_frame(&send, Some(payload)),
+                ) {
+                    DirectAdmission::Accepted
+                } else {
+                    DirectAdmission::Missing
+                };
+                match outcome {
                     DirectAdmission::Accepted => true,
                     DirectAdmission::Missing => false,
                     DirectAdmission::TimedOut | DirectAdmission::Rejected => {
@@ -6484,6 +6526,7 @@ mod ratchet_send_tests {
     impl Fixture {
         fn ctx(&self, with_ratchet: bool) -> IpcSendContext {
             IpcSendContext {
+                pnet_admission: None,
                 source_received_at: std::time::Instant::now(),
                 local_work: None,
                 local_priority: veil_proto::priority::INTERACTIVE,
@@ -8100,6 +8143,124 @@ mod ratchet_send_tests {
                 .unwrap();
             assert!(opened.authenticated);
             assert_eq!(opened.plaintext, b"small authored message");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn small_private_send_waits_for_credit_and_rechecks_revocation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct HeldSource {
+            frames: tokio::sync::mpsc::Sender<Vec<u8>>,
+            waiting: AtomicBool,
+        }
+        impl FrameBroadcaster for HeldSource {
+            fn send_to(&self, _: &[u8; 32], _: u8, _: Vec<u8>) -> bool {
+                panic!("congestion on the admitted direct session must preserve its route");
+            }
+            fn send_local_source_to<'a>(
+                &'a self,
+                peer: &'a [u8; 32],
+                lane: u8,
+                frame: Vec<u8>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
+            {
+                assert_eq!(*peer, PEER);
+                assert_eq!(lane, veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE);
+                self.waiting.store(true, Ordering::Relaxed);
+                Box::pin(async move { self.frames.send(frame).await.is_ok() })
+            }
+            fn send_to_all_with_priority(&self, _: u8, _: Arc<[u8]>) {
+                panic!("congestion must not initiate a route search");
+            }
+            fn active_node_ids(&self) -> Vec<[u8; 32]> {
+                vec![PEER]
+            }
+        }
+
+        #[derive(Default)]
+        struct Membership {
+            expired: AtomicBool,
+        }
+        impl crate::PnetStatusProvider for Membership {
+            fn peer_status(&self, peer: &[u8; 32]) -> veil_proto::PnetStatusResultPayload {
+                veil_proto::PnetStatusResultPayload {
+                    admitted: true,
+                    has_cert: true,
+                    admin: false,
+                    valid_until_unix: if self.expired.load(Ordering::Relaxed) {
+                        1
+                    } else {
+                        0
+                    },
+                    network_id: [1; 32],
+                    peer_node_id: *peer,
+                }
+            }
+        }
+
+        for (revoke, expire_wait, expire_cert) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let mut fx = fixture(vec![PEER]);
+            fx.session_instance = Some(PEER_INSTANCE);
+            let revoked = Arc::new(AtomicBool::new(false));
+            let banned = Arc::clone(&revoked);
+            let (frames, mut queued) = tokio::sync::mpsc::channel(1);
+            frames.try_send(Vec::new()).unwrap();
+            let source = Arc::new(HeldSource {
+                frames,
+                waiting: AtomicBool::new(false),
+            });
+            let mut ctx = fx.ctx(true);
+            ctx.local_priority = veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE;
+            let membership = Arc::new(Membership::default());
+            ctx.pnet_admission = Some(Arc::new(crate::handlers::queries::PnetStatusQueries::new(
+                membership.clone(),
+            )));
+            ctx.app_registry = Arc::new(
+                veil_app::AppEndpointRegistry::new().with_peer_revocation_check(move |peer| {
+                    *peer == PEER && banned.load(Ordering::Relaxed)
+                }),
+            );
+            ctx.session_tx_registry = Some(source.clone());
+            let mut wh = sink().await;
+            let mut reply = SendReply::Inline(&mut wh);
+            let body = payload(false, b"admitted private payload");
+            let mut send = Box::pin(handle_ipc_send(&mut reply, &body, &ctx));
+            assert!(futures::poll!(&mut send).is_pending());
+            assert!(source.waiting.load(Ordering::Relaxed));
+            revoked.store(revoke, Ordering::Relaxed);
+            membership.expired.store(expire_cert, Ordering::Relaxed);
+            if expire_wait {
+                tokio::time::advance(std::time::Duration::from_millis(251)).await;
+            }
+            assert_eq!(queued.try_recv().unwrap(), Vec::<u8>::new());
+            send.await.unwrap();
+            if revoke || expire_wait || expire_cert {
+                assert!(queued.try_recv().is_err());
+                continue;
+            }
+
+            let frame = queued.try_recv().unwrap();
+            let header = codec::decode_header(&frame).unwrap();
+            assert_eq!(
+                header.msg_type,
+                veil_proto::family::AppMsg::AppSendSealed as u16
+            );
+            assert_eq!(header.flags, 0);
+            let body =
+                veil_proto::app::AppSendPayload::decode(&frame[veil_proto::HEADER_SIZE..]).unwrap();
+            let opened = fx
+                .peer
+                .open_payload(&ME, &body.data, veil_util::unix_secs_now_u64())
+                .unwrap();
+            assert!(opened.authenticated);
+            assert_eq!(opened.plaintext, b"admitted private payload");
+            assert!(queued.try_recv().is_err());
         }
     }
 

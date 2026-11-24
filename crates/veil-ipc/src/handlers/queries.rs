@@ -236,6 +236,15 @@ impl PnetStatusQueries {
         self.provider.authority()
     }
 
+    pub(crate) fn admits(&self, peer: &[u8; 32]) -> bool {
+        let status = self.provider.peer_status(peer);
+        let now = veil_util::unix_secs_now_u64();
+        status.peer_node_id == *peer
+            && status.admitted
+            && status.has_cert
+            && (status.valid_until_unix == 0 || now != 0 && now < status.valid_until_unix)
+    }
+
     async fn wait_for_batch_budget(&self, peers: usize, deadline: Instant) -> bool {
         tokio::time::timeout_at(deadline, async {
             // Tokio grants the lock in FIFO order. Wait for refill at the

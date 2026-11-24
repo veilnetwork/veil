@@ -258,6 +258,25 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   receiving application and IPC delivery drop counters stayed at zero.
   Frame counts alone cannot determine the contribution of each traffic
   class to the missing datagrams.
+- A follow-up traced frame metadata at the sending queue. Of 711 logged
+  admission refusals on the two measured spokes, 690 were
+  `AppSendSealed` frames on the local recoverable lane, mostly around
+  3.6 KB. The other 21 were `Forward` frames on the same lane. The
+  trace observed the existing queue result and recorded no payloads.
+- Small sealed private-network sends on this lane can wait up to 250 ms
+  for the existing source credits. A resumed send rechecks its proven
+  session instance, revocation status and membership expiry. Expiration
+  ends the admission attempt without a relay retry. The existing
+  `AppSendSealed` frame and source queue budget apply.
+- A 34 s cold A/B run reused 48 identities and 24 gateways. The two
+  senders' immediate session TX refusals went from 175 to zero. UDP loss
+  was 2,606 of 121,137 datagrams with the change and 3,670 of 123,513 in
+  the control. The two flows changed from 9 and 3,661 losses to 626 and
+  1,980 respectively. TUN captures and UDP receive sockets reported
+  zero observation drops. Loss between the TUN taps still needs
+  attribution at IPC admission and during the bounded credit wait.
+  A separate two-node mixed-version run passed traffic both ways and
+  withdrew the route after the pre-batch peer disconnected.
 - A separate cold start ran the first end-to-end probes in groups of
   four before opening the UDP flows. All 24 paths answered in 12.52 s.
   The following 38 s sample lost 76 of 137,175 UDP datagrams, with one
