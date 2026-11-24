@@ -96,7 +96,7 @@ const EGRESS_FLUSH_AFTER: Duration = Duration::from_micros(200);
 pub struct SharedState {
     pub table: RoutingTable,
     /// Same peer set as the table, materialized as `(node_id, app_id)`
-    /// to avoid recomputing BLAKE3 on every egress packet.
+    /// and sorted by node_id at build time for binary lookup on egress.
     pub peer_app_ids: Vec<(NodeId, [u8; 32])>,
     /// Configured virtual-iface MTU. Used by the ingress task to drop
     /// oversize packets BEFORE writing to TUN — a compromised peer cannot
@@ -108,10 +108,11 @@ pub struct SharedState {
 impl SharedState {
     pub fn build(cfg: &OgateConfig) -> Result<Self, BridgeError> {
         let table = RoutingTable::from_config(cfg).map_err(|e| BridgeError::Routing(e.into()))?;
-        let peer_app_ids = table
+        let mut peer_app_ids: Vec<_> = table
             .peer_node_ids()
             .map(|nid| (*nid, derive_app_id(nid, &cfg.network, &cfg.app)))
             .collect();
+        peer_app_ids.sort_unstable_by_key(|(node_id, _)| *node_id);
         Ok(Self {
             table,
             peer_app_ids,
@@ -121,9 +122,9 @@ impl SharedState {
 
     fn app_id_for(&self, peer: &NodeId) -> Option<[u8; 32]> {
         self.peer_app_ids
-            .iter()
-            .find(|(n, _)| n == peer)
-            .map(|(_, a)| *a)
+            .binary_search_by_key(peer, |(node_id, _)| *node_id)
+            .ok()
+            .map(|index| self.peer_app_ids[index].1)
     }
 }
 
@@ -352,14 +353,11 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                     loop {
                         // Snapshot the current peer list (changes on SIGHUP reload).
                         let snap = state_for_cert.load();
-                        for peer_node_id in snap.table.peer_node_ids() {
-                            let app_id = snap.app_id_for(peer_node_id);
-                            if let Some(app_id) = app_id {
-                                let payload = (*msg_bytes).clone();
-                                let _ = app_sender_for_cert
-                                    .send_owned(*peer_node_id, app_id, endpoint_id, payload)
-                                    .await;
-                            }
+                        for &(peer_node_id, app_id) in &snap.peer_app_ids {
+                            let payload = (*msg_bytes).clone();
+                            let _ = app_sender_for_cert
+                                .send_owned(peer_node_id, app_id, endpoint_id, payload)
+                                .await;
                         }
                         // Wait 5 min or until shutdown.
                         tokio::select! {
@@ -938,13 +936,30 @@ mod tests {
 
     #[test]
     fn shared_state_builds_with_app_ids() {
-        let c = cfg();
-        let s = SharedState::build(&c).unwrap();
-        assert_eq!(s.peer_app_ids.len(), 1);
-        // app_id matches BLAKE3(peer_node_id || "ogate.test" || "ogate")
-        let nid = [0xaau8; 32];
-        let expected = derive_app_id(&nid, &c.network, &c.app);
-        assert_eq!(s.app_id_for(&nid), Some(expected));
+        let mut c = cfg();
+        for (byte, host) in [(0xcc, 3), (0x88, 4)] {
+            c.peers.push(PeerEntry {
+                node_id: hex::encode([byte; 32]),
+                addr_v4: Some(Ipv4Addr::new(10, 99, 0, host)),
+                addr_v6: None,
+                name: None,
+            });
+        }
+        let state = SharedState::build(&c).unwrap();
+        assert_eq!(state.peer_app_ids.len(), 3);
+        for (byte, host) in [(0xaa, 2), (0xcc, 3), (0x88, 4)] {
+            let node_id = [byte; 32];
+            let address = Ipv4Addr::new(10, 99, 0, host).into();
+            assert_eq!(
+                state.table.lookup_egress(address),
+                Decision::Forward(node_id)
+            );
+            assert_eq!(
+                state.app_id_for(&node_id),
+                Some(derive_app_id(&node_id, &c.network, &c.app))
+            );
+        }
+        assert_eq!(state.app_id_for(&[0xbb; 32]), None);
     }
 
     #[test]
