@@ -128,6 +128,8 @@ pub enum AppMessage {
         /// sender did, so it carries the same label.
         provenance: SenderProvenance,
         initial_window: u32,
+        /// Owns the dispatcher slot for an authenticated network open.
+        lease: Option<crate::streams::AppStreamLease>,
     },
     /// Incoming stream data segment.
     StreamData {
@@ -626,6 +628,31 @@ impl AppEndpointRegistry {
         provenance: SenderProvenance,
         initial_window: u32,
     ) -> bool {
+        self.route_stream_open_with_lease(
+            app_id,
+            endpoint_id,
+            stream_id,
+            src_node_id,
+            src_identity,
+            provenance,
+            initial_window,
+            None,
+        )
+    }
+
+    /// Hand over a dispatcher slot together with the authenticated open.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_stream_open_with_lease(
+        &self,
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        stream_id: u32,
+        src_node_id: [u8; 32],
+        src_identity: [u8; 32],
+        provenance: SenderProvenance,
+        initial_window: u32,
+        lease: Option<crate::streams::AppStreamLease>,
+    ) -> bool {
         let key = EndpointKey {
             app_id,
             endpoint_id,
@@ -638,6 +665,7 @@ impl AppEndpointRegistry {
                 src_identity,
                 provenance,
                 initial_window,
+                lease,
             },
         )
     }

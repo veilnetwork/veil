@@ -250,6 +250,7 @@ async fn run_reliable(abort: bool, rotate: bool, slow_ipc: bool) {
     let mut streams = [0u32; 2];
     // A pre-ready Open is permanently canonical. Use a fresh ID for each
     // attempt; receipt delivery proves both directions use the ready child.
+    let mut accepted_streams = Vec::new();
     for direction in 0..2 {
         tokio::time::timeout(Duration::from_secs(8), async {
             for attempt in 0..100u32 {
@@ -303,10 +304,12 @@ async fn run_reliable(abort: bool, rotate: bool, slow_ipc: bool) {
             AppMessage::StreamOpen {
                 stream_id,
                 src_node_id,
+                lease,
                 ..
             } => {
                 assert_eq!(stream_id, streams[direction]);
                 assert_eq!(src_node_id, [direction as u8 + 1; 32]);
+                accepted_streams.push(lease);
             }
             other => panic!("unexpected Open {other:?}"),
         }
@@ -502,8 +505,14 @@ async fn run_reliable(abort: bool, rotate: bool, slow_ipc: bool) {
                     dispatchers[direction].pending_stream_receipts.lock().unwrap().insert((peer,id),tx);
                     send_app(&senders[direction],id,AppMsg::AppOpen,&AppOpenPayload{app_id,endpoint_id:1,flags:0}.encode()).await;
                     assert_eq!(tokio::time::timeout(Duration::from_secs(1),rx).await.unwrap().unwrap(),receipt_status::ACCEPTED);
-                    assert!(matches!(receivers[1-direction].recv().await.unwrap(),AppMessage::StreamOpen {stream_id,..} if stream_id==id));
-                    if diagnostics[direction].reliable_frames_sent()>before { return id; }
+                    let AppMessage::StreamOpen { stream_id, lease, .. } =
+                        receivers[1-direction].recv().await.unwrap()
+                    else { panic!("expected inbound stream") };
+                    assert_eq!(stream_id,id);
+                    if diagnostics[direction].reliable_frames_sent()>before {
+                        accepted_streams.push(lease);
+                        return id;
+                    }
                     send_app(&senders[direction],id,AppMsg::AppClose,&AppClosePayload{app_id,endpoint_id:1,reason:0}.encode()).await;
                     assert!(matches!(receivers[1-direction].recv().await.unwrap(),AppMessage::StreamClose {stream_id,..} if stream_id==id));
                     tokio::time::sleep(Duration::from_millis(10)).await;

@@ -117,6 +117,36 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   repeatedly refused after the restart, while the other 12 subscribers
   installed the revision. This run isolated a separate APP stream
   teardown problem.
+- A ten-minute run with route retries reproduced nine refused mirror
+  opens on the restarted daemon. It missed revisions 4 and 5 and
+  received revision 6. Address withdrawal, restoration, and the ban
+  checks still ran. The unaffected TCP flow stayed connected and
+  delivered 599.9 MB at 8.00 Mb/s.
+- An inbound APP stream's accepting endpoint now owns its dispatcher
+  entry. The entry is released after local close or if the endpoint
+  cannot accept the open. A delayed cleanup can release only its own
+  entry, even if the same peer reuses the wire ID after restarting.
+  OVL1 and IPC frame formats are unchanged.
+- With both fixes, all seven rollouts reached the eligible subscribers
+  in at most 14.97 s. They included withdrawal and restoration of a
+  virtual address, verified end to end after 17.20 s and 17.36 s from
+  publication. The restarted daemon's tunnel answered 1.47 s after
+  launch and its next mirror update succeeded. After a separate daemon
+  stall the tunnel answered 0.14 s after resume. The ban blocked both
+  directions by the 2.15 s probe and held through two later revisions.
+- The final run lasted 600 s. The restarted subscriber recorded zero
+  refused mirror opens. The unaffected TCP connection delivered 600 MB
+  at 8.00 Mb/s. The two UDP flows sent about 15.99 Mb/s each and lost
+  412 of 1,090,463 packets and 77 of 1,090,501 packets respectively.
+  The independent ICMP probe received 5,953 of 5,960 replies, with
+  p95 of 5.25 ms and p99 of 6.32 ms. The four measured TUN interfaces
+  reported zero kernel drops.
+- The containers used about 81–101% of one CPU core and 340–384 MiB in
+  the samples, including the traffic generators. The publisher's ogate
+  and daemon averaged 6.05% and 29.80% of one core over the process
+  sampling interval, including their data traffic. A separate macOS
+  loopback run of the final daemon and Veil v0.11.59 delivered 1,000
+  SDK chat messages in each direction.
 
 ## 3. Distribute owner-authorized peer policy
 

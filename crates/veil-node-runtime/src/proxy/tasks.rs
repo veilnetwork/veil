@@ -207,6 +207,7 @@ pub(crate) fn spawn_exit_proxy(ctx: ExitProxySpawnCtx<'_>) -> Option<JoinHandle<
                     stream_id,
                     src_node_id,
                     provenance,
+                    lease,
                     ..
                 } => {
                     let peer = (provenance != veil_proto::SenderProvenance::LocalIpc)
@@ -236,13 +237,18 @@ pub(crate) fn spawn_exit_proxy(ctx: ExitProxySpawnCtx<'_>) -> Option<JoinHandle<
                     // dropped intentionally — the proxy-bridge lifecycle
                     // follows the stream, and the detached task exits when
                     // the pipe closes.
-                    let _bridge = tokio::spawn(run_server_bridge(
-                        server_half,
-                        data_rx,
-                        src_node_id,
-                        stream_id,
-                        Arc::clone(&broadcaster),
-                    ));
+                    let stream_broadcaster = Arc::clone(&broadcaster);
+                    let _bridge = tokio::spawn(async move {
+                        let _lease = lease;
+                        run_server_bridge(
+                            server_half,
+                            data_rx,
+                            src_node_id,
+                            stream_id,
+                            stream_broadcaster,
+                        )
+                        .await
+                    });
 
                     // Exit handler: client_half ↔ TCP. Same
                     // lifecycle rule as above.

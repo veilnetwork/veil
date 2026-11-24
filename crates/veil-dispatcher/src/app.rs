@@ -654,42 +654,27 @@ impl FrameDispatcher {
                     Err(e) => return DispatchResult::Violation(format!("bad AppOpen: {e}")),
                 };
                 let stream_id = header.stream_id;
-                let status = match self.stream_table.open(
+                let status = if let Ok(lease) = self.stream_table.open_for_endpoint(
                     *node_id.as_bytes(),
                     stream_id,
                     payload.app_id,
                     payload.endpoint_id,
-                ) {
-                    veil_app::OpenResult::Opened => receipt_status::ACCEPTED,
-                    veil_app::OpenResult::AlreadyOpen | veil_app::OpenResult::CapacityReached => {
-                        // Stream already exists or global/per-peer capacity reached — reject.
-                        let receipt = AppReceiptPayload {
-                            app_id: payload.app_id,
-                            endpoint_id: payload.endpoint_id,
-                            seq: 0,
-                            status: receipt_status::REJECTED,
-                        };
-                        return DispatchResult::Response(encode_response(
-                            header,
-                            FrameFamily::App as u8,
-                            veil_proto::family::AppMsg::AppReceipt as u16,
-                            &receipt.encode(),
-                        ));
-                    }
-                };
-                // Notify the registered endpoint that a new stream was opened.
-                self.app_registry.route_stream_open_from_identity(
+                ) && self.app_registry.route_stream_open_with_lease(
                     payload.app_id,
                     payload.endpoint_id,
                     stream_id,
-                    // The opener is the authenticated OVL1 session peer this
-                    // APP_OPEN arrived on. Keep that device as the return route;
-                    // `sender` carries its session-proved identity for app policy.
+                    // Replies use the authenticated physical opener. Applications
+                    // still receive its session-proved identity for policy.
                     *node_id.as_bytes(),
                     sender,
                     veil_app::registry::SenderProvenance::SessionPeer,
                     veil_app::APP_STREAM_INITIAL_WINDOW,
-                );
+                    Some(lease),
+                ) {
+                    receipt_status::ACCEPTED
+                } else {
+                    receipt_status::REJECTED
+                };
                 let receipt = AppReceiptPayload {
                     app_id: payload.app_id,
                     endpoint_id: payload.endpoint_id,

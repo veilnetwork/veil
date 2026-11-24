@@ -28,11 +28,8 @@ use veil_util::lock;
 /// A one-shot close notification that fires when the owning `AppStreamState`
 /// is dropped without an explicit [`AppStreamTable::close`] call.
 ///
-/// Wrapping in `Arc<Mutex<Option<_>>>` lets `AppStreamState` derive `Clone`
-/// while ensuring the callback fires at most once (the first `Drop` to
-/// succeed in `take` owns it). Callers that hold a clone from
-/// [`AppStreamTable::get`] (which returns an `AppStreamSnapshot`, not the
-/// state itself) will never observe the callback.
+/// The shared allocation also identifies the exact stream instance to its
+/// endpoint lease. Only the stream state runs the optional callback.
 type CloseNotifyFn = Box<dyn FnOnce() + Send>;
 type CloseNotify = Arc<Mutex<Option<CloseNotifyFn>>>;
 
@@ -152,6 +149,26 @@ struct StreamKey {
     stream_id: u32,
 }
 
+/// The accepting endpoint owns the particular wire stream it received.
+/// Dropping it releases the slot even if the opener never sends APP_CLOSE.
+pub struct AppStreamLease {
+    table: AppStreamTable,
+    key: StreamKey,
+    generation: CloseNotify,
+}
+
+impl std::fmt::Debug for AppStreamLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppStreamLease").finish_non_exhaustive()
+    }
+}
+
+impl Drop for AppStreamLease {
+    fn drop(&mut self) {
+        self.table.close_matching(self.key, Some(&self.generation));
+    }
+}
+
 /// Result of attempting to open a stream.
 #[derive(Debug, PartialEq, Eq)]
 pub enum OpenResult {
@@ -212,20 +229,63 @@ impl AppStreamTable {
         initial_send_window: u32,
         initial_recv_window: u32,
     ) -> OpenResult {
+        match self.insert(
+            StreamKey { peer_id, stream_id },
+            app_id,
+            endpoint_id,
+            initial_send_window,
+            initial_recv_window,
+        ) {
+            Ok(_) => OpenResult::Opened,
+            Err(reason) => reason,
+        }
+    }
+
+    /// Open a dispatcher stream owned by the endpoint that accepts it.
+    pub fn open_for_endpoint(
+        &self,
+        peer_id: [u8; 32],
+        stream_id: u32,
+        app_id: [u8; 32],
+        endpoint_id: u32,
+    ) -> Result<AppStreamLease, OpenResult> {
         let key = StreamKey { peer_id, stream_id };
+        let generation = self.insert(
+            key,
+            app_id,
+            endpoint_id,
+            APP_STREAM_INITIAL_WINDOW,
+            APP_STREAM_INITIAL_WINDOW,
+        )?;
+        Ok(AppStreamLease {
+            table: self.clone(),
+            key,
+            generation,
+        })
+    }
+
+    fn insert(
+        &self,
+        key: StreamKey,
+        app_id: [u8; 32],
+        endpoint_id: u32,
+        initial_send_window: u32,
+        initial_recv_window: u32,
+    ) -> Result<CloseNotify, OpenResult> {
         let mut inner = lock!(self.inner);
         if inner.streams.contains_key(&key) {
-            return OpenResult::AlreadyOpen;
+            return Err(OpenResult::AlreadyOpen);
         }
         // Global capacity check.
         if inner.streams.len() >= MAX_TOTAL_STREAMS {
-            return OpenResult::CapacityReached;
+            return Err(OpenResult::CapacityReached);
         }
         // Per-peer capacity check.
-        let peer_count = inner.per_peer.get(&peer_id).copied().unwrap_or(0);
+        let peer_count = inner.per_peer.get(&key.peer_id).copied().unwrap_or(0);
         if peer_count >= MAX_STREAMS_PER_PEER {
-            return OpenResult::CapacityReached;
+            return Err(OpenResult::CapacityReached);
         }
+        let generation = Arc::new(Mutex::new(None));
         inner.streams.insert(
             key,
             AppStreamState {
@@ -234,11 +294,11 @@ impl AppStreamTable {
                 opened_at: Instant::now(),
                 send_window: initial_send_window.min(MAX_STREAM_SEND_WINDOW),
                 recv_window: initial_recv_window.min(MAX_STREAM_RECV_WINDOW),
-                close_notify: Arc::new(Mutex::new(None)),
+                close_notify: Arc::clone(&generation),
             },
         );
-        *inner.per_peer.entry(peer_id).or_insert(0) += 1;
-        OpenResult::Opened
+        *inner.per_peer.entry(key.peer_id).or_insert(0) += 1;
+        Ok(generation)
     }
 
     /// Record that we received `byte_count` bytes of APP_DATA from the peer.
@@ -355,28 +415,36 @@ impl AppStreamTable {
     /// `Drop` — only implicitly closed streams (removed without calling this
     /// method) trigger the notification.
     pub fn close(&self, peer_id: &[u8; 32], stream_id: u32) -> bool {
-        let key = StreamKey {
-            peer_id: *peer_id,
-            stream_id,
-        };
+        self.close_matching(
+            StreamKey {
+                peer_id: *peer_id,
+                stream_id,
+            },
+            None,
+        )
+    }
+
+    fn close_matching(&self, key: StreamKey, generation: Option<&CloseNotify>) -> bool {
+        use std::collections::hash_map::Entry;
+
         let mut inner = lock!(self.inner);
-        if let Some(state) = inner.streams.remove(&key) {
-            // Disarm close-notify before drop so it is not treated as implicit.
-            lock!(state.close_notify).take();
-            // Decrement per-peer counter; remove entry when it reaches zero.
-            if let std::collections::hash_map::Entry::Occupied(mut e) =
-                inner.per_peer.entry(*peer_id)
-            {
-                if *e.get() <= 1 {
-                    e.remove();
-                } else {
-                    *e.get_mut() -= 1;
-                }
-            }
-            true
-        } else {
-            false
+        let Entry::Occupied(entry) = inner.streams.entry(key) else {
+            return false;
+        };
+        if generation.is_some_and(|token| !Arc::ptr_eq(token, &entry.get().close_notify)) {
+            // This IPC handle outlived an APP_CLOSE and a later reuse of the ID.
+            return false;
         }
+        let removed = entry.remove();
+        lock!(removed.close_notify).take();
+        if let Entry::Occupied(mut count) = inner.per_peer.entry(key.peer_id) {
+            if *count.get() <= 1 {
+                count.remove();
+            } else {
+                *count.get_mut() -= 1;
+            }
+        }
+        true
     }
 
     /// Register a callback that fires when the stream is implicitly closed
@@ -480,6 +548,18 @@ mod tests {
         assert!(removed);
         assert!(!t.is_open(&PEER, 1));
         assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn endpoint_lease_releases_only_its_stream_instance() {
+        let table = AppStreamTable::new();
+        let first = table.open_for_endpoint(PEER, 7, APP, 1).unwrap();
+        assert!(table.close(&PEER, 7));
+        let second = table.open_for_endpoint(PEER, 7, APP, 1).unwrap();
+        drop(first);
+        assert!(table.is_open(&PEER, 7));
+        drop(second);
+        assert!(table.is_empty());
     }
 
     #[test]

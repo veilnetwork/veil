@@ -221,6 +221,7 @@ impl IpcStreamTable {
                 // itself (X/V-01).
                 provenance: veil_proto::SenderProvenance::LocalIpc,
                 initial_window,
+                lease: None,
             })
             .is_err()
         {

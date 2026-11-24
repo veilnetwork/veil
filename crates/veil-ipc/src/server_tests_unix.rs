@@ -4005,7 +4005,11 @@ async fn stream_identity_authorization_preserves_device_return_route() {
         send_ipc_frame(&mut client, LocalAppMsg::AppBind as u16, &bind.encode()).await;
         let (_, body) = recv_ipc_frame(&mut client).await;
         let app = AppBindOkPayload::decode(&body).unwrap().app_id;
-        assert!(registry.route_stream_open_from_identity(
+        let wire_streams = veil_app::AppStreamTable::new();
+        let lease = wire_streams
+            .open_for_endpoint(physical, 41, app, 9)
+            .unwrap();
+        assert!(registry.route_stream_open_with_lease(
             app,
             9,
             41,
@@ -4013,6 +4017,7 @@ async fn stream_identity_authorization_preserves_device_return_route() {
             identity,
             provenance,
             STREAM_INITIAL_WINDOW,
+            Some(lease),
         ));
         let (header, body) = recv_ipc_frame(&mut client).await;
         assert_eq!(header.msg_type, LocalAppMsg::StreamOpenInbound as u16);
@@ -4036,6 +4041,23 @@ async fn stream_identity_authorization_preserves_device_return_route() {
         )
         .await;
         let captured = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
+        send_ipc_frame(
+            &mut client,
+            LocalAppMsg::StreamClose as u16,
+            &veil_proto::StreamClosePayload {
+                stream_id: inbound.stream_id,
+            }
+            .encode(),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while wire_streams.is_open(&physical, 41) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("local close must release the dispatcher's slot without a peer close");
+        assert!(wire_streams.open_for_endpoint(physical, 41, app, 9).is_ok());
         drop(client);
         let _ = shutdown.send(true);
         task.await.unwrap().unwrap();

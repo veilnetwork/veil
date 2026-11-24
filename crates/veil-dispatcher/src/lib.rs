@@ -2502,6 +2502,7 @@ mod tests {
         let d = make_test_dispatcher(NodeRole::Core);
         let app_id = [0xAAu8; 32];
         let peer = [0x01u8; 32];
+        let (_handle, _rx) = d.app_registry.register(app_id, 1, 4);
         let (hdr, body) = make_app_open_frame(app_id, 1, 100);
         let result = d.dispatch(&hdr, &body, peer);
         match result {
@@ -2525,6 +2526,7 @@ mod tests {
         let d = make_test_dispatcher(NodeRole::Core);
         let app_id = [0xAAu8; 32];
         let peer = [0x01u8; 32];
+        let (_handle, _rx) = d.app_registry.register(app_id, 1, 4);
         let (hdr, body) = make_app_open_frame(app_id, 1, 100);
         d.dispatch(&hdr, &body, peer); // first open
         let result = d.dispatch(&hdr, &body, peer); // duplicate
@@ -2547,6 +2549,7 @@ mod tests {
         let d = make_test_dispatcher(NodeRole::Core);
         let app_id = [0xAAu8; 32];
         let peer = [0x01u8; 32];
+        let (_handle, _rx) = d.app_registry.register(app_id, 1, 4);
 
         // Open first.
         let (open_hdr, open_body) = make_app_open_frame(app_id, 1, 200);

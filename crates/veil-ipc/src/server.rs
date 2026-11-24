@@ -317,15 +317,24 @@ pub(crate) struct AcceptorRemoteRoute {
     endpoint_id: u32,
 }
 
+struct OwnedAcceptorRoute {
+    route: AcceptorRemoteRoute,
+    _lease: Option<veil_app::streams::AppStreamLease>,
+}
+
 #[derive(Default)]
 struct AcceptorRemoteRoutes {
-    by_ipc: std::collections::HashMap<u32, AcceptorRemoteRoute>,
+    by_ipc: std::collections::HashMap<u32, OwnedAcceptorRoute>,
     by_wire: std::collections::HashMap<AcceptorRemoteRoute, u32>,
     next: u32,
 }
 
 impl AcceptorRemoteRoutes {
-    fn open(&mut self, route: AcceptorRemoteRoute) -> Option<u32> {
+    fn open(
+        &mut self,
+        route: AcceptorRemoteRoute,
+        lease: Option<veil_app::streams::AppStreamLease>,
+    ) -> Option<u32> {
         if self.by_ipc.len() >= veil_proto::budget::MAX_TOTAL_STREAMS
             || self.by_wire.contains_key(&route)
         {
@@ -336,7 +345,10 @@ impl AcceptorRemoteRoutes {
         loop {
             self.next = self.next.wrapping_add(1) | crate::streams::REMOTE_ACCEPTOR_ID_BIT;
             if let std::collections::hash_map::Entry::Vacant(entry) = self.by_ipc.entry(self.next) {
-                entry.insert(route);
+                entry.insert(OwnedAcceptorRoute {
+                    route,
+                    _lease: lease,
+                });
                 self.by_wire.insert(route, self.next);
                 return Some(self.next);
             }
@@ -344,8 +356,8 @@ impl AcceptorRemoteRoutes {
     }
 
     fn remove(&mut self, ipc_id: u32) {
-        if let Some(route) = self.by_ipc.remove(&ipc_id) {
-            self.by_wire.remove(&route);
+        if let Some(owned) = self.by_ipc.remove(&ipc_id) {
+            self.by_wire.remove(&owned.route);
         }
     }
 }
@@ -586,7 +598,7 @@ impl IpcClientState {
             .unwrap_or_else(|p| p.into_inner())
             .by_ipc
             .get(&stream_id)
-            .copied()
+            .map(|entry| entry.route)
     }
 
     /// Clone the acceptor-side remote-route handle for a forwarder task (it
@@ -796,6 +808,7 @@ async fn forward_endpoint(
 ) {
     let tx = tx.into();
     while let Some(msg) = rx.recv().await {
+        let mut remote_open = None;
         let frame = match msg {
             AppMessage::Send(p) => {
                 let deliver = AppDeliverPayload {
@@ -865,6 +878,7 @@ async fn forward_endpoint(
                 src_identity,
                 provenance,
                 initial_window,
+                lease,
             } => {
                 // Notify the bound app that a remote peer opened a stream to
                 // it.  Uses the dedicated `StreamOpenInbound` variant
@@ -885,10 +899,11 @@ async fn forward_endpoint(
                     let Some(id) = acceptor_routes
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .open(route)
+                        .open(route, lease)
                     else {
                         continue;
                     };
+                    remote_open = Some(id);
                     id
                 };
                 // Commit ownership and the reverse route before the SDK can
@@ -1008,14 +1023,24 @@ async fn forward_endpoint(
         };
 
         // Bounded delivery: drop frame silently on backpressure, count it.
-        match tx.try_send(frame) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                if let Some(ref m) = metrics {
-                    m.inc_ipc_delivery_drops();
-                }
+        if let Err(error) = tx.try_send(frame) {
+            if let Some(id) = remote_open {
+                // The app never received this handle. Release its wire slot.
+                acceptor_streams
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&id);
+                acceptor_routes
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(id);
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => break,
+            if matches!(error, mpsc::error::TrySendError::Closed(_)) {
+                break;
+            }
+            if let Some(ref m) = metrics {
+                m.inc_ipc_delivery_drops();
+            }
         }
     }
 }
@@ -2204,7 +2229,7 @@ impl Drop for ClientStreamCleanup {
                 .unwrap_or_else(|p| p.into_inner())
                 .by_ipc
                 .get(&stream_id)
-                .copied();
+                .map(|entry| entry.route);
             if let Some(route) = route
                 && let Some(b) = self.session_tx_registry.as_deref()
             {
@@ -3930,6 +3955,45 @@ mod remote_stream_open_tests {
     use tokio::net::UnixStream;
     use veil_proto::app::receipt_status;
     use veil_proto::{StreamOpenPayload, family::AppMsg};
+
+    #[tokio::test]
+    async fn dropped_ipc_open_releases_the_wire_slot() {
+        let peer = [2; 32];
+        let app = [3; 32];
+        let table = veil_app::AppStreamTable::new();
+        let lease = table.open_for_endpoint(peer, 7, app, 1).unwrap();
+        let (endpoint, rx) = mpsc::channel(1);
+        endpoint
+            .try_send(AppMessage::StreamOpen {
+                stream_id: 7,
+                src_node_id: peer,
+                src_identity: peer,
+                provenance: veil_proto::SenderProvenance::SessionPeer,
+                initial_window: veil_app::APP_STREAM_INITIAL_WINDOW,
+                lease: Some(lease),
+            })
+            .unwrap();
+        drop(endpoint);
+        let (delivery, _receiver, _) = delivery_queue(1, 4096);
+        delivery
+            .try_send(veil_bufpool::pooled_shared_from_vec(vec![0]))
+            .unwrap();
+        let owned = Arc::new(StdMutex::new(std::collections::HashSet::new()));
+        let routes = Arc::new(StdMutex::new(AcceptorRemoteRoutes::default()));
+        forward_endpoint(
+            rx,
+            delivery,
+            [1; 32],
+            app,
+            1,
+            None,
+            Arc::clone(&owned),
+            routes,
+        )
+        .await;
+        assert!(table.is_empty());
+        assert!(owned.lock().unwrap().is_empty());
+    }
 
     /// FrameBroadcaster that records every `send_to` so the test can inspect the
     /// `AppOpen` (and verify nothing else) the handler emits.
