@@ -223,3 +223,25 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   admission restored it on the same TUN, and a ban still removed it.
 - The final bridge passed the 34-peer manual-mode TUN fixture with the
   daemon that predates admission batches.
+
+## 4. Provision private entry points
+
+- The opt-in `private_configured` mode uses explicitly configured peers,
+  bootstrap peers, and pinned relays for first contact. It verifies the
+  local membership certificate before starting network services.
+  Public rendezvous, automatic seeds, and caches without a bound network
+  authority are skipped. Authenticated private sessions can still use
+  DHT and peer exchange to discover additional members.
+- Existing configurations retain their discovery behavior. Older daemons
+  reject the new configuration enum and can still join the same network
+  in their existing `private` mode. Changing the running node's mode or
+  trust settings requires a restart.
+- On an isolated Linux stand, an unavailable configured entry point left
+  the new node waiting without contacting the instrumented fallback
+  endpoints. Once the entry point came up, the new node discovered a member
+  on the previous daemon through peer exchange and established a direct
+  TUN route. A rejected trust change left this route available.
+- A separate Linux run placed a signed revocation and an unrelated value
+  in the persisted DHT snapshot. The daemon restored the revocation before
+  listening and refused the revoked member both after restart and after
+  reloading the same trust settings.

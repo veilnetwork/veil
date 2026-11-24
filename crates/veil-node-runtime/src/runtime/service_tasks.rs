@@ -3000,6 +3000,9 @@ pub fn resolve_bootstrap_candidates_from(
     my_pubkey: &str,
     seeds: Vec<veil_cfg::BootstrapPeer>,
 ) -> Vec<veil_cfg::BootstrapPeer> {
+    if config.configured_private_network().is_some() {
+        return filter_self_seeds(config.bootstrap_peers.clone(), my_pubkey);
+    }
     let contributed = builtin_seed_contribution(
         config.global.builtin_seed_policy,
         config.bootstrap_peers.is_empty() && config.peers.is_empty(),
@@ -3049,7 +3052,10 @@ pub fn resolve_bootstrap_candidates_from(
 /// supported deployment. Nothing is acquired here that the operator did not
 /// name, so the refusal stays honest either way.
 pub fn dns_seed_discovery_domain(config: &veil_cfg::Config) -> Option<String> {
-    if !config.bootstrap_peers.is_empty() || !config.peers.is_empty() {
+    if config.configured_private_network().is_some()
+        || !config.bootstrap_peers.is_empty()
+        || !config.peers.is_empty()
+    {
         return None;
     }
     config.global.bootstrap_dns_domain.clone()

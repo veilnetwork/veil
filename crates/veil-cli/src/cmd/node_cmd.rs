@@ -832,6 +832,19 @@ fn fmt_age(secs: u64) -> String {
 /// even when a layer is empty — the empty row IS the diagnostic
 /// signal we want to surface.
 fn render_bootstrap_status(s: &node::AdminBootstrapStatus) -> String {
+    if s.configured_private_bootstrap {
+        let provisioned = if s.config_peers == 0 {
+            "No provisioned entry points. Waiting for a private peer to connect.".to_owned()
+        } else {
+            format!(
+                "The configuration lists {} provisioned entry point(s).",
+                s.config_peers
+            )
+        };
+        return format!(
+            "PRIVATE BOOTSTRAP\n\n{provisioned}\nOther automatic bootstrap sources are disabled."
+        );
+    }
     let freshness = match (
         s.discovered_cache.freshest_secs_ago,
         s.discovered_cache.oldest_secs_ago,
@@ -1230,6 +1243,7 @@ mod tests {
             + dns.is_some() as u8
             + (cache_entries > 0) as u8;
         node::AdminBootstrapStatus {
+            configured_private_bootstrap: false,
             meeting_points: "all".to_owned(),
             meeting_points_enabled: 2,
             meeting_policy: "fallback".to_owned(),

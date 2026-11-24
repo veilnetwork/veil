@@ -177,6 +177,33 @@ Confirm it landed on the receiving nodes:
 veil-cli peers banned
 ```
 
+## Bootstrap from provisioned peers
+
+Set `[network].mode = "private_configured"` to start from entry points
+supplied by the operator. Use the same network ID, owner key and
+membership certificate as for `private`. Add a provisioned entry point
+as a `[[peers]]`, `[[bootstrap_peers]]` or `[[pinned_relays]]` row with
+its expected public key and transport address. An inbound-only node
+can leave those lists empty.
+
+This profile skips public rendezvous, automatic LAN and mesh discovery,
+built-in seeds, DNS and HTTPS seed discovery, and remembered or cached
+peers on startup. Hosts named in configured transport addresses still
+use normal name resolution. Authenticated private sessions can exchange
+DHT and PEX information as they do in `private`. Use more than one
+provisioned entry point where the deployment needs independent paths in.
+
+The local membership certificate must pass validation before network
+services start. The daemon keeps signed revocations from the current
+owner when restoring its configured DHT values snapshot. The legacy DHT
+cold database and learned endpoint snapshots stay out of bootstrap.
+`veil-cli node bootstrap-status` shows the effective discovery sources.
+
+Use a full daemon restart to change this profile, its local identity or
+the configured owner and membership settings. Older binaries require
+their existing `private` configuration. A node on such a binary can
+join the same network with a valid certificate from the same owner.
+
 ## App-layer admission (ogate / oproxy)
 
 The daemon's P-Net gate decides whether a peer may open an OVL1 session

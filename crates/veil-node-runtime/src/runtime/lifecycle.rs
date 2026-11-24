@@ -363,10 +363,33 @@ impl NodeRuntime {
         Ok(())
     }
 
+    pub(crate) fn validate_configured_private_reload(
+        &self,
+        config: &veil_cfg::Config,
+    ) -> Result<()> {
+        if config.configured_private_network() != self.configured_private_network.as_ref() {
+            return Err(NodeError::Config(veil_cfg::ConfigError::ValidationFailed(
+                "restart the daemon to change the configured private network or its trust settings"
+                    .into(),
+            )));
+        }
+        if self.configured_private_network.is_some()
+            && HandshakeIdentity::from_config(config)?.node_id
+                != self.identity.local_identity.node_id
+        {
+            return Err(NodeError::Config(veil_cfg::ConfigError::ValidationFailed(
+                "restart the daemon to change the configured private network's local identity"
+                    .into(),
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn reload(&mut self) -> Result<()> {
         // validate config BEFORE stopping tasks. If the config is invalid or
         // can't be fully reconstructed, return Err without disrupting the node.
         let config = veil_cfg::load_config(&self.config_path)?;
+        self.validate_configured_private_reload(&config)?;
         Self::validate_reloadable_config(&config)?;
         let stop_ctx = self.take_stop_tasks_context();
         Self::do_stop_tasks(stop_ctx).await;
@@ -376,6 +399,7 @@ impl NodeRuntime {
     /// Apply new config and restart all tasks after `do_stop_tasks` has torn down
     /// the old ones. Called by both `reload` and `reload_via_arc`.
     pub async fn apply_reload_after_stop(&mut self, config: veil_cfg::Config) -> Result<()> {
+        self.validate_configured_private_reload(&config)?;
         self.transport_ctx = Arc::new(veil_cfg::transport_glue::context_from_config(&config)?);
         // Δ2-a: the `[anonymity]` section is NOT re-applied on reload — the live
         // AnonymityState (relay_capable, advertised_bps, onion_service, x25519
@@ -709,7 +733,10 @@ impl NodeRuntime {
         self.dht = {
             let mut svc = KademliaService::with_config(
                 *self.identity.local_identity.node_id.as_bytes(),
-                crate::dht_glue::runtime_config_from(&config.dht),
+                crate::dht_glue::runtime_config_from(
+                    &config.dht,
+                    self.configured_private_network.is_some(),
+                ),
             );
             svc.set_rtt_table(Arc::new(crate::dht_glue::RttHintAdapter::new(Arc::clone(
                 &self.routing.rtt_table,
@@ -720,6 +747,9 @@ impl NodeRuntime {
                     Arc::clone(local_v),
                     Arc::clone(&self.dispatcher.peer_vivaldi),
                 )));
+            }
+            if let Some(gate) = &self.network_gate {
+                svc.set_network_auth_gate(Arc::clone(gate) as Arc<dyn veil_dht::NetworkAuthGate>);
             }
             Arc::new(svc)
         };
@@ -824,7 +854,16 @@ impl NodeRuntime {
         // ban list must likewise survive a reload. `persist_bans` only writes
         // manual bans, so this restores those; auto-bans re-accumulate via the
         // freshly-rebuilt violation tracker below.
-        *lock!(self.ban_list) = BanList::new();
+        if self.configured_private_network.is_none() {
+            *lock!(self.ban_list) = BanList::new();
+        } else {
+            // The configured private trust root is pinned across reload.
+            // Keep its live bans while repopulating the new DHT.
+            if config.persist_enabled {
+                self.restore_dht_values_snapshot(&config);
+            }
+            self.apply_stored_p_net_bans();
+        }
         super::persistence::load_bans(&self.ban_list, &self.config_path);
         // `.max(1)` clamp makes the `.expect` unreachable here (same
         // invariant as in `runtime/mod.rs` — see commentary there).

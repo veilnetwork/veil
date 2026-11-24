@@ -221,7 +221,7 @@ impl NodeRuntime {
             S::Listeners => {
                 self.spawn_listeners().await?;
             }
-            S::OutboundPeers => self.spawn_outbound_peers(),
+            S::OutboundPeers => self.spawn_outbound_peers(config),
             S::PinnedRelays => self.spawn_pinned_relays(config),
 
             // ── Observability / health ────────────────────────────────────
@@ -651,7 +651,17 @@ impl NodeRuntime {
     /// reload path still performs that mutation inline. Start-up sets up the
     /// gateway list before calling this function for the same reason.
     pub async fn spawn_all_services(&mut self, config: &veil_cfg::Config) -> Result<()> {
-        for &service in crate::task_registry::RuntimeService::ALL {
+        use crate::task_registry::RuntimeService as S;
+        let configured_only = config.configured_private_network().is_some();
+        for &service in S::ALL {
+            if configured_only
+                && matches!(
+                    service,
+                    S::LanDiscovery | S::RememberedPeers | S::MainlineDiscovery | S::NostrDiscovery
+                )
+            {
+                continue;
+            }
             self.spawn_service(service, config).await?;
         }
         Ok(())
@@ -667,6 +677,7 @@ impl NodeRuntime {
         let (config, stop_ctx) = {
             let mut s = rt.lock().await;
             let config = veil_cfg::load_config(&s.config_path)?;
+            s.validate_configured_private_reload(&config)?;
             // Dry-run the fallible reconstruction BEFORE tearing down tasks
             // (audit cycle-9 reload-zombie) — `?` returns here with the running
             // node fully intact if the new config can't be applied.
@@ -732,6 +743,9 @@ impl NodeRuntime {
         // config's flag, matching `load_config`).
         let config_path = rt.lock().await.config_path.clone();
         let config = veil_cfg::load_config_str(toml_content, &config_path)?;
+        rt.lock()
+            .await
+            .validate_configured_private_reload(&config)?;
         let validation = veil_cfg::validate(&config);
         if !validation.is_valid() {
             return Err(crate::error::NodeError::Config(
@@ -1637,6 +1651,9 @@ impl NodeRuntime {
 
     /// Initialize the optional UDP mesh realm from config.
     pub async fn init_mesh_realm(config: &veil_cfg::Config) -> Option<Arc<UdpRealm>> {
+        if config.configured_private_network().is_some() {
+            return None;
+        }
         let mesh_cfg = config.mesh.as_ref()?;
         let addr: std::net::SocketAddr = mesh_cfg.bind_addr.parse().ok()?;
         let s = mesh_cfg.realm_id.trim();

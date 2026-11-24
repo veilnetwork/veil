@@ -169,6 +169,13 @@ pub struct Config {
 }
 
 impl Config {
+    /// The explicitly provisioned private network, when configured.
+    pub fn configured_private_network(&self) -> Option<&NetworkConfig> {
+        self.network
+            .as_ref()
+            .filter(|network| network.mode == NetworkMode::PrivateConfigured)
+    }
+
     /// Where this node's identity material lives: `[global] identity_dir` when
     /// the operator (or an embedding host) named one, otherwise the directory
     /// holding the config file, which is what it has always been.

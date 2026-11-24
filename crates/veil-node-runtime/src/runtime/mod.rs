@@ -914,6 +914,8 @@ pub struct NodeRuntime {
     /// from `[network]` config at startup. `Some` → handshake-time
     /// cert exchange + verification; `None` → public-mode behaviour.
     pub network_gate: Option<Arc<veil_identity::network_access::NetworkAccessGate>>,
+    /// Startup trust configuration for the configured private bootstrap profile.
+    configured_private_network: Option<veil_cfg::NetworkConfig>,
     /// Per-peer verified MembershipCert cache.  Populated at OVL1
     /// handshake-time when `network_gate.verify_peer()` succeeds,
     /// read by `PnetStatusProvider` for IPC consumer queries.
@@ -1365,19 +1367,21 @@ impl NodeRuntime {
         lock_tasks(&self.tasks).background.push(handle);
     }
 
-    fn spawn_outbound_peers(&mut self) {
+    fn spawn_outbound_peers(&mut self, config: &veil_cfg::Config) {
         let Some(shutdown_tx) = &self.shutdown_tx else {
             return;
         };
         self.access()
             .spawn_owned_outbound_peers(self.peers(), shutdown_tx);
         // Load previously-discovered peers from disk.
-        persistence::load_discovered_peers(
-            &self.config_path,
-            &self.state,
-            &self.access(),
-            shutdown_tx,
-        );
+        if config.configured_private_network().is_none() {
+            persistence::load_discovered_peers(
+                &self.config_path,
+                &self.state,
+                &self.access(),
+                shutdown_tx,
+            );
+        }
     }
 
     /// Spawn persistent connections to all pinned relay nodes.
@@ -2643,6 +2647,7 @@ impl NodeRuntime {
     pub fn bootstrap_status(&self) -> crate::admin::AdminBootstrapStatus {
         use crate::admin::{AdminBootstrapStatus, AdminDiscoveredCacheStatus};
 
+        let configured_private_bootstrap = self.configured_private_network.is_some();
         let (
             config_peers,
             dns_domain,
@@ -2651,6 +2656,14 @@ impl NodeRuntime {
             meeting_points,
             meeting_policy,
         ) = match veil_cfg::load_config(&self.config_path) {
+            Ok(c) if configured_private_bootstrap => (
+                c.bootstrap_peers.len() + c.peers.len() + c.pinned_relays.len(),
+                None,
+                0,
+                false,
+                veil_cfg::MeetingPoints::Preset(veil_cfg::MeetingPointsPreset::Off),
+                c.global.meeting_policy,
+            ),
             Ok(c) => (
                 c.bootstrap_peers.len(),
                 c.global
@@ -2684,7 +2697,11 @@ impl NodeRuntime {
             }
         };
 
-        let builtin_seeds = veil_bootstrap::builtin_seeds().len();
+        let builtin_seeds = if configured_private_bootstrap {
+            0
+        } else {
+            veil_bootstrap::builtin_seeds().len()
+        };
 
         let cache_guard = lock!(self.discovered_peers_cache);
         let cache_path_str = {
@@ -2723,17 +2740,22 @@ impl NodeRuntime {
             + (builtin_seeds > 0) as u8
             + (https_urls > 0) as u8
             + dns_domain.is_some() as u8
-            + (discovered_cache.entries > 0) as u8
+            + (discovered_cache.entries > 0 && !configured_private_bootstrap) as u8
             + meeting_points.enabled().len() as u8;
 
         AdminBootstrapStatus {
+            configured_private_bootstrap,
             config_peers,
             builtin_seeds,
             https_urls,
             dns_domain,
             discovered_cache,
             healthy_layers,
-            total_layers: 5 + veil_cfg::MeetingPoint::ALL.len() as u8,
+            total_layers: if configured_private_bootstrap {
+                1
+            } else {
+                5 + veil_cfg::MeetingPoint::ALL.len() as u8
+            },
             announces_publicly,
             meeting_points_enabled: meeting_points.enabled().len() as u8,
             meeting_points: meeting_points.to_string(),
@@ -3074,7 +3096,7 @@ pub fn build_state(
         })
         .collect::<Vec<_>>();
 
-    Ok(NodeState::new(
+    let mut state = NodeState::new(
         node_id,
         role,
         config_path,
@@ -3084,7 +3106,9 @@ pub fn build_state(
         metrics_endpoint,
         peers,
         listens,
-    ))
+    );
+    state.configured_private_bootstrap = config.configured_private_network().is_some();
+    Ok(state)
 }
 
 pub fn spawn_inbound_session(

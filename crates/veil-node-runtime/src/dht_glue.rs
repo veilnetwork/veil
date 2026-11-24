@@ -78,7 +78,10 @@ impl veil_dht::CoordinateOracle for VivaldiOracle {
 
 /// Drop the persistence-path fields and pass the runtime knobs through
 /// to veil-dht.
-pub fn runtime_config_from(cfg: &veil_cfg::DhtConfig) -> veil_dht::DhtRuntimeConfig {
+pub fn runtime_config_from(
+    cfg: &veil_cfg::DhtConfig,
+    configured_private_bootstrap: bool,
+) -> veil_dht::DhtRuntimeConfig {
     veil_dht::DhtRuntimeConfig {
         republish_interval_secs: cfg.republish_interval_secs,
         cleanup_interval_secs: cfg.cleanup_interval_secs,
@@ -91,7 +94,13 @@ pub fn runtime_config_from(cfg: &veil_cfg::DhtConfig) -> veil_dht::DhtRuntimeCon
         max_store_entries: cfg.max_store_entries,
         max_store_bytes: cfg.max_store_bytes,
         per_origin_max_bytes: cfg.per_origin_max_bytes,
-        cold_store_path: cfg.cold_store_path.clone(),
+        // A legacy cold database may contain endpoints from another network.
+        // Configured private nodes recover saved revocations separately.
+        cold_store_path: if configured_private_bootstrap {
+            None
+        } else {
+            cfg.cold_store_path.clone()
+        },
         shard_filtering: cfg.shard_filtering,
         allow_unsigned_store: cfg.allow_unsigned_store,
     }

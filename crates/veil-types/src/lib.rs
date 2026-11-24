@@ -1268,6 +1268,15 @@ pub enum NetworkMode {
     /// Private network. Handshake requires a valid membership cert;
     /// admin bans propagate via DHT.
     Private,
+    /// Private network whose initial entry points must be configured by the operator.
+    #[serde(rename = "private_configured")]
+    PrivateConfigured,
+}
+
+impl NetworkMode {
+    pub fn is_private(self) -> bool {
+        matches!(self, Self::Private | Self::PrivateConfigured)
+    }
 }
 
 /// Membership certificate issued by the network owner.

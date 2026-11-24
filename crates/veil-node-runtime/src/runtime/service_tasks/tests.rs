@@ -2566,6 +2566,38 @@ fn config_with(
 }
 
 #[test]
+fn configured_private_bootstrap_uses_only_pinned_bootstrap_peers() {
+    let mut cfg = config_with(
+        vec![peer("SELF"), peer("PIN")],
+        veil_cfg::BuiltinSeedPolicy::Always,
+    );
+    cfg.network = Some(veil_cfg::NetworkConfig {
+        mode: veil_cfg::NetworkMode::PrivateConfigured,
+        ..Default::default()
+    });
+    cfg.global.bootstrap_dns_domain = Some("seeds.example.invalid".to_owned());
+
+    let seeds = vec![peer("BUILTIN")];
+    assert_eq!(
+        resolve_bootstrap_candidates_from(&cfg, "SELF", seeds.clone()),
+        vec![peer("PIN")]
+    );
+    cfg.bootstrap_peers.clear();
+    assert!(resolve_bootstrap_candidates_from(&cfg, "SELF", seeds.clone()).is_empty());
+    assert_eq!(dns_seed_discovery_domain(&cfg), None);
+
+    cfg.network.as_mut().unwrap().mode = veil_cfg::NetworkMode::Private;
+    assert_eq!(
+        resolve_bootstrap_candidates_from(&cfg, "SELF", seeds.clone()),
+        seeds
+    );
+    assert_eq!(
+        dns_seed_discovery_domain(&cfg),
+        cfg.global.bootstrap_dns_domain
+    );
+}
+
+#[test]
 fn auto_keeps_the_historical_either_or() {
     let builtin = vec![peer("SEED1"), peer("SEED2")];
     // Nothing configured → seeds contribute.

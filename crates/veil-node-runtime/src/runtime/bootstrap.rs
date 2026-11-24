@@ -50,6 +50,7 @@ impl NodeRuntime {
         // normal state for seed deployments). Compare base64 pubkeys — same
         // encoding used in IdentityConfig and BootstrapPeer.
         let my_pubkey = self.identity.local_identity.public_key.clone();
+        let configured_only = config.configured_private_network().is_some();
 
         // 4th bootstrap fallback — peers we've personally
         // handshaken in a prior run. Loaded from disk into
@@ -58,7 +59,11 @@ impl NodeRuntime {
         // builtin-seeds / DNS fallbacks run. Censor that takes down
         // (1) operator config + (2) builtin seeds + (3) DNS still
         // can't invalidate (4) without per-user blocking.
-        let cached = filter_self_seeds(lock!(self.discovered_peers_cache).snapshot(), &my_pubkey);
+        let cached = if configured_only {
+            Vec::new()
+        } else {
+            filter_self_seeds(lock!(self.discovered_peers_cache).snapshot(), &my_pubkey)
+        };
         if !cached.is_empty() {
             let mut patched = config.clone();
             // Dedup against the operator-curated list using the same
@@ -99,7 +104,7 @@ impl NodeRuntime {
         // (production → trusted_bundle_issuer_pubkey; dev/testnet →
         // allow_unpinned_signed_bootstrap). A signed envelope is always
         // required; the knob that accepted raw JSON is gone.
-        let https_urls_present = !config.global.bootstrap_https_urls.is_empty();
+        let https_urls_present = !configured_only && !config.global.bootstrap_https_urls.is_empty();
         let https_pinned_or_opted_in = config.global.trusted_bundle_issuer_pubkey.is_some()
             || config.global.allow_unpinned_signed_bootstrap;
         if https_urls_present && !https_pinned_or_opted_in {
@@ -436,6 +441,15 @@ impl NodeRuntime {
             return;
         }
         if config.bootstrap_peers.is_empty() {
+            if configured_only {
+                if config.peers.is_empty() && config.pinned_relays.is_empty() {
+                    self.logger.info(
+                        "bootstrap.none",
+                        "no provisioned entry points; waiting for a private peer to connect",
+                    );
+                }
+                return;
+            }
             // Nothing to dial and nothing to discover. This is a legitimate
             // resting state — a node whose owner declined the builtin seeds
             // and named no entry points of its own is meant to come up

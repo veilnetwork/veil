@@ -362,28 +362,28 @@ pub const VALIDATION_RULES: &[ValidationRule] = &[
     ValidationRule {
         code: "network_private_requires_network_id",
         key: "network.network_id",
-        message: "must be set when network.mode = \"private\" — a private veil must have a stable identifier the membership cert binds to",
+        message: "must be set for a private network — a private veil must have a stable identifier the membership cert binds to",
         check: network_private_missing_network_id,
         fix: None,
     },
     ValidationRule {
         code: "network_private_requires_owner_pubkey",
         key: "network.owner_pubkey",
-        message: "must be set when network.mode = \"private\" — the membership cert is verified against this public key",
+        message: "must be set for a private network — the membership cert is verified against this public key",
         check: network_private_missing_owner_pubkey,
         fix: None,
     },
     ValidationRule {
         code: "network_private_requires_owner_algo",
         key: "network.owner_algo",
-        message: "must be set when network.mode = \"private\" — signature dispatch needs to know the owner's algorithm",
+        message: "must be set for a private network — signature dispatch needs to know the owner's algorithm",
         check: network_private_missing_owner_algo,
         fix: None,
     },
     ValidationRule {
         code: "network_private_requires_membership_cert",
         key: "network.membership_cert",
-        message: "must be set when network.mode = \"private\" — node needs its own membership cert to present at handshake time",
+        message: "must be set for a private network — node needs its own membership cert to present at handshake time",
         check: network_private_missing_membership_cert,
         fix: None,
     },
@@ -934,10 +934,10 @@ fn abuse_per_peer_bytes_per_sec_too_low(config: &Config) -> bool {
 // ── P-Net Phase 1c: private-network config validation ──────────────
 
 fn is_private(config: &Config) -> bool {
-    matches!(
-        config.network.as_ref().map(|n| n.mode),
-        Some(veil_types::NetworkMode::Private)
-    )
+    config
+        .network
+        .as_ref()
+        .is_some_and(|network| network.mode.is_private())
 }
 
 fn network_private_missing_network_id(config: &Config) -> bool {

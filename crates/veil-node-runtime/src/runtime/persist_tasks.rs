@@ -488,7 +488,20 @@ impl NodeRuntime {
     }
 
     pub fn restore_dht_values_snapshot(&self, config: &veil_cfg::Config) {
-        let entries = Self::load_dht_values_snapshot(config, &self.logger);
+        let mut entries = Self::load_dht_values_snapshot(config, &self.logger);
+        if self.configured_private_network.is_some() {
+            // Keep revocations from the current owner. Other persisted DHT
+            // records can carry endpoint hints from a different network.
+            entries.retain(|entry| {
+                self.network_gate.as_ref().is_some_and(|gate| {
+                    use veil_dht::NetworkAuthGate as _;
+                    entry
+                        .value
+                        .starts_with(veil_identity::network_ban::BAN_BLOB_MAGIC)
+                        && gate.verify_ban_record(&entry.key, &entry.value)
+                })
+            });
+        }
         if entries.is_empty() {
             return;
         }

@@ -106,7 +106,7 @@ impl NetworkAccessGate {
     /// `unwrap`s on `Option::as_ref` are safe here — we re-check defensively
     /// in case the gate is constructed without going through validation.
     pub fn from_config(cfg: &veil_types::NetworkConfig) -> Result<Option<Self>, GateLoadError> {
-        if !matches!(cfg.mode, veil_types::NetworkMode::Private) {
+        if !cfg.mode.is_private() {
             return Ok(None);
         }
         let network_id_hex = cfg

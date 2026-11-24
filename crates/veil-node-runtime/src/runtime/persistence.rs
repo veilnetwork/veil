@@ -239,6 +239,11 @@ pub fn persist_discovered_peers(
         let tracked: std::collections::HashSet<[u8; 32]> =
             st.peers.values().map(|e| *e.node_id.as_bytes()).collect();
         st.handshaked.retain(|id| tracked.contains(id));
+        if st.configured_private_bootstrap {
+            return PersistOutcome::Volatile {
+                reason: "configured private bootstrap keeps discovered peers in memory".into(),
+            };
+        }
         let st = st;
         // Same gate as the wildcard filter beside it, and for the same reason
         // spelled out there: a snapshot must not seed the next startup with

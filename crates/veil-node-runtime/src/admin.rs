@@ -1003,7 +1003,11 @@ pub struct AdminMeshGatewayEntry {
 /// configured-but-empty, which is itself useful diagnostic signal.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AdminBootstrapStatus {
-    /// Layer 1: operator-curated `[[bootstrap_peers]]` array.
+    /// Cold bootstrap uses only operator-provisioned entry points.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub configured_private_bootstrap: bool,
+    /// Operator-curated entry point count. The configured private profile
+    /// includes regular peers and pinned relays as well as bootstrap peers.
     pub config_peers: usize,
     /// Layer 2: compile-time `node::bootstrap::builtin_seeds` count.
     pub builtin_seeds: usize,

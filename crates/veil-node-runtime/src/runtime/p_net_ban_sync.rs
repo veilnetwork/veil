@@ -203,6 +203,12 @@ impl NodeRuntime {
     /// and apply to `BanList`. Idempotent — re-running on already-banned
     /// node IDs is a cheap `is_banned` check.
     ///
+    pub(super) fn apply_stored_p_net_bans(&self) {
+        if let Some(gate) = &self.network_gate {
+            apply_stored_bans(&self.dht, gate, &self.ban_list, &self.logger);
+        }
+    }
+
     /// Spawned only when the network gate is wired (private mode);
     /// public-mode nodes don't have ban records to sync.
     pub fn spawn_p_net_ban_sync_task(&mut self) {
@@ -226,71 +232,40 @@ impl NodeRuntime {
                         if *shutdown_rx.borrow() { break; }
                     }
                     _ = tick.tick() => {
-                        // Stream keys and fetch each value on demand (`peek` =
-                        // no cold-tier promotion) instead of materializing the
-                        // ENTIRE store — including a RocksDB cold tier — into
-                        // RAM every tick. At most one value is resident at a
-                        // time; non-ban records are skipped after a 4-byte
-                        // magic check. (Was: `dht.stored_entries()`, an O(store)
-                        // RAM spike on large private-mode deployments.)
-                        let keys = dht.stored_key_ids();
-                        let now_unix = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let mut applied = 0usize;
-                        for key in keys {
-                            let Some(value) = dht.peek_value(&key) else {
-                                continue;
-                            };
-                            if value.len() < 4 || &value[..4] != BAN_BLOB_MAGIC {
-                                continue;
-                            }
-                            let Ok(entry) = decode_ban_blob(&value) else {
-                                continue;
-                            };
-                            // Wrong-network records can't legitimately
-                            // exist on this node (gate verified at ingest),
-                            // but defence-in-depth: re-check before applying.
-                            let derived = ban_dht_key(&gate.expected_network_id, &entry.banned_node_id);
-                            if derived != key {
-                                continue;
-                            }
-                            if verify_ban_entry(
-                                &entry,
-                                &gate.expected_network_id,
-                                gate.owner_algo,
-                                &gate.owner_pubkey_bytes,
-                                now_unix,
-                            ).is_err() {
-                                continue;
-                            }
-                            // Skip if the admin cert isn't trusted by our
-                            // allowlist (defence-in-depth — gate already
-                            // applied this at ingest, but the admin set
-                            // may have changed at config reload).
-                            let Ok(admin_cert) = veil_identity::network_cert::decode_cert_blob(
-                                &entry.admin_cert_blob,
-                            ) else { continue };
-                            if !gate.is_admin(&admin_cert) {
-                                continue;
-                            }
-                            let mut bl = lock!(ban_list);
-                            if !bl.is_banned(&entry.banned_node_id) {
-                                bl.ban_manual(entry.banned_node_id, entry.reason.clone());
-                                applied += 1;
-                            }
-                        }
-                        if applied > 0 {
-                            logger.info(
-                                "network.ban.applied",
-                                format!("applied={applied}"),
-                            );
-                        }
+                        apply_stored_bans(&dht, &gate, &ban_list, &logger);
                     }
                 }
             }
         });
         lock_tasks(&self.tasks).sessions.push(handle);
+    }
+}
+
+fn apply_stored_bans(
+    dht: &veil_dht::KademliaService,
+    gate: &veil_identity::network_access::NetworkAccessGate,
+    ban_list: &std::sync::Mutex<veil_abuse::BanList>,
+    logger: &veil_observability::NodeLogger,
+) {
+    use veil_dht::NetworkAuthGate as _;
+    let mut applied = 0;
+    // Fetch values individually without promoting cold entries into memory.
+    for key in dht.stored_key_ids() {
+        let Some(value) = dht.peek_value(&key) else {
+            continue;
+        };
+        if !value.starts_with(BAN_BLOB_MAGIC) || !gate.verify_ban_record(&key, &value) {
+            continue;
+        }
+        if let Ok(entry) = decode_ban_blob(&value) {
+            let mut bl = lock!(ban_list);
+            if !bl.is_banned(&entry.banned_node_id) {
+                bl.ban_manual(entry.banned_node_id, entry.reason);
+                applied += 1;
+            }
+        }
+    }
+    if applied > 0 {
+        logger.info("network.ban.applied", format!("applied={applied}"));
     }
 }

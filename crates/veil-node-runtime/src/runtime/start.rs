@@ -403,6 +403,28 @@ impl NodeRuntime {
             } else {
                 None
             };
+        let configured_private_network = config.configured_private_network().cloned();
+        if configured_private_network.is_some() {
+            let gate = network_gate_arc.as_ref().ok_or_else(|| {
+                NodeError::Config(veil_cfg::ConfigError::ValidationFailed(
+                    "configured private bootstrap requires a membership gate".into(),
+                ))
+            })?;
+            gate.verify_peer(
+                Some(&gate.local_cert_blob),
+                &local_node_id,
+                veil_util::unix_secs_now_u64(),
+            )
+            .map_err(|error| {
+                NodeError::Config(veil_cfg::ConfigError::ValidationFailed(format!(
+                    "[network] local membership certificate: {error}"
+                )))
+            })?;
+            logger.info(
+                "network.private_configured",
+                "using configured entry points and discovery through private sessions",
+            );
+        }
         let dht = {
             let mut dht_cfg = config.dht.clone();
             if role == veil_cfg::NodeRole::Core && dht_cfg.k == veil_cfg::DhtConfig::default().k {
@@ -410,7 +432,10 @@ impl NodeRuntime {
             }
             let mut svc = KademliaService::with_config(
                 local_node_id,
-                crate::dht_glue::runtime_config_from(&dht_cfg),
+                crate::dht_glue::runtime_config_from(
+                    &dht_cfg,
+                    configured_private_network.is_some(),
+                ),
             );
             if role == veil_cfg::NodeRole::Core {
                 svc.set_sketch_threshold(128);
@@ -1278,6 +1303,7 @@ impl NodeRuntime {
                     .global
                     .discovered_peers_cache_path
                     .as_ref()
+                    .filter(|_| configured_private_network.is_none())
                     .map(std::path::PathBuf::from);
                 let key_dir = cache_path
                     .as_ref()
@@ -1505,6 +1531,7 @@ impl NodeRuntime {
             // the same Arc here so the rest of the runtime (handshake,
             // ban-sync) sees the same gate instance.
             network_gate: network_gate_arc.clone(),
+            configured_private_network,
             // S2.A part 3: per-peer verified-cert cache. Filled by
             // handshake on successful verify_peer; read by PnetStatusProvider
             // when an IPC consumer (ogate/oproxy) queries a peer's
@@ -1574,7 +1601,8 @@ impl NodeRuntime {
         // Pre-cleanup, this block replaced a throwaway placeholder
         // controller; the placeholder is gone, this block with it.
         // –164: restore snapshots only when persistence is globally enabled.
-        if config.persist_enabled {
+        if config.persist_enabled && runtime.configured_private_network.is_none() {
+            // These snapshots do not carry a private-network trust root.
             // restore route cache from snapshot before accepting connections.
             runtime.restore_route_cache_snapshot(&config);
             // restore RTT table from snapshot.
@@ -1583,8 +1611,6 @@ impl NodeRuntime {
             runtime.restore_vivaldi_snapshot(&config);
             // restore DHT routing table contacts.
             runtime.restore_dht_routing_snapshot(&config);
-            // restore DHT stored values.
-            runtime.restore_dht_values_snapshot(&config);
             // restore autodiscovered peers.
             runtime.restore_autodiscover_snapshot(&config);
             // restore gateway list; then rebuild from config (config entries take precedence).
@@ -1593,7 +1619,13 @@ impl NodeRuntime {
             runtime.restore_peer_pubkeys_snapshot(&config);
             //restore peer transport announcements.
             runtime.restore_transport_announcements_snapshot(&config);
-        } // end if config.persist_enabled
+        }
+        if config.persist_enabled {
+            runtime.restore_dht_values_snapshot(&config);
+        }
+        if runtime.configured_private_network.is_some() {
+            runtime.apply_stored_p_net_bans();
+        }
         // populate gateway list from configured peers (always, regardless of persist).
         runtime.rebuild_gateway_list_from_state();
         runtime.logger.info(
