@@ -187,6 +187,22 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   packets with the change, compared with 144,993 of 145,018 in the
   control run. A socket regression test also verifies that two missing
   replies exhaust the original deadline and yield no admission result.
+- In that first fault run, 535 of the 548 missing UDP datagrams were
+  from one unproxied tunnel. Its routes stayed installed, its bridge
+  logged no admission retries or failures, and its receiving TUN recorded
+  zero kernel drops. The two runs had different session directions and
+  reconnect counts.
+- Two controlled repeats reused the same 48 identities and daemon
+  binary with 24 gateways. In the 42 s run with the spokes dialing the
+  hub and no fault injection, loss across the two UDP flows was
+  19 of 152,670 with the previous bridge and 12 of 152,347 with the retry
+  change. All four senders began after their routes were installed.
+  In the 36 s repeat with the hub dialing, both flows exchanged packets
+  before sampling and the proxy dropped 22 status replies on other
+  gateways. Loss was 3 of 130,824 and 9 of 130,912 respectively.
+  All 22 retries succeeded and all routes stayed installed with the
+  change. The earlier UDP loss spike did not recur in either comparison.
+  Its exact cause remains open.
 - On two Linux ARM64 nodes with real TUN interfaces and one live certified
   peer at the end of each configured list, the routes appeared within
   0.22 s for 34 entries, 0.66 s for 256, and 2.17 s for 1,024 after
