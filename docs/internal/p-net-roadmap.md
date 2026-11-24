@@ -240,7 +240,30 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   12,648 ICMP replies and 479,740 of 479,766 UDP datagrams. The control
   received 12,646 of 12,648 replies and 478,167 of 478,742 datagrams.
   One control flow missed 567 datagrams with zero kernel TUN drops and
-  its route still installed. The source of that loss remains open.
+  its route still installed. Its first ICMP replies saw up to 3.24 s
+  of delay. Later probes returned to the usual latency.
+- Packet sequence probes at both TUN interfaces and the receiver socket
+  reproduced a burst on a two-vCPU Linux stand with the same daemon and
+  ogate builds. Twenty-four gateways started ICMP probes alongside two
+  16 Mb/s UDP flows. The first 38 s sample lost 4,100 of 135,287 UDP
+  datagrams, mostly in its first eight seconds. The warm repeat lost
+  three of 138,184. The sending TUN taps saw every datagram. The receiving
+  tap and UDP socket saw the same packets. Capture and UDP socket drops
+  were zero. Device-certificate walks overlapped the early losses.
+- A fresh repeat warmed the two measured paths before offering traffic
+  and left the other gateways cold. One flow missed 1,039 datagrams,
+  including 1,028 in the first two seconds. Its sending daemon logged a
+  full session TX channel during that interval. The TX drop counter rose
+  by 122 frames in the first 1.35 s and by 146 over the sample. The
+  receiving application and IPC delivery drop counters stayed at zero.
+  Frame counts alone cannot determine the contribution of each traffic
+  class to the missing datagrams.
+- A separate cold start ran the first end-to-end probes in groups of
+  four before opening the UDP flows. All 24 paths answered in 12.52 s.
+  The following 38 s sample lost 76 of 137,175 UDP datagrams, with one
+  loss in the first eight seconds. Session TX drops still occurred,
+  including during periods with little UDP loss. Both TUN taps and the
+  receive socket again recorded zero capture or socket drops.
 - With a pre-batch daemon and a 34-entry table, the new bridge passed
   traffic in both directions and withdrew the route 4.33 s after the
   old daemon reported the disconnect through its single-peer query.

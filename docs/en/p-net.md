@@ -294,6 +294,11 @@ verified again and ogate discards its pending packet batches from the
 old binding. Restart ogate after an intentional change to the local
 node identity.
 
+When many gateways start against a freshly started daemon, stagger the
+first end-to-end probes in small groups before ramping up UDP traffic.
+Concurrent cold peer-key lookups and application traffic can put
+pressure on session transmit queues even after routes appear.
+
 On a bandwidth-limited link, ogate can collect packets for the same peer
 for a little longer to reduce the number of Veil frames. Set
 `[batch].flush_after_us` in the sending node's `ogate.toml` and restart
