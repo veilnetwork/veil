@@ -352,6 +352,13 @@ Changes to the local TUN addresses or prefixes require updating the
 configuration and restarting ogate. When the policy or a membership
 expires, the corresponding traffic stops at that deadline.
 
+When a new snapshot applies, addresses removed or reassigned by the
+owner lose their previous routes. Routes with the same peer and
+addresses can keep their current admission through the transition.
+ogate rechecks those peers first. Each existing admission remains
+bounded by the previous policy and membership deadlines until the daemon
+confirms it again.
+
 ### Automatic snapshot delivery
 
 Keep the first installation explicit on every node. To let a node

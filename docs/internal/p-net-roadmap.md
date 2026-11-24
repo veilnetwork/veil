@@ -200,8 +200,26 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 - A subscriber on the previous build fetched the same maximum-size
   policy from the new mirror over obfs4 after its earlier snapshot expired.
   It kept the installed revision after the mirror banned its device.
-- Applying the larger snapshot still cleared the active routes for about
-  eight seconds while ogate rechecked admissions. In the 32-subscriber
-  run the paced TCP probe averaged 7.92 Mb/s and the ICMP probe received
-  337 of 413 replies. Preserve unaffected routes through policy transitions
-  while rechecking live admissions and enforcing the original deadlines.
+- Before preserving unchanged routes, applying the larger snapshot cleared
+  active routes for about eight seconds while ogate rechecked admissions.
+  The paced TCP probe averaged 7.92 Mb/s and the ICMP probe received 337 of
+  413 replies in the 32-subscriber run.
+
+### Signed policy activation
+
+- On a verified policy change, ogate immediately discards routes with
+  removed or changed peer addresses. It keeps admissions for identical
+  assignments on the same daemon connection until rechecked. Those
+  admissions remain subject to the earlier policy and membership deadlines.
+  The next sweep rechecks them first in their previous relative order.
+- In a repeat of the 32-subscriber Linux test, the existing TUN probe
+  received 415 of 416 replies, with a maximum gap of 234 ms at a 100 ms
+  probe interval. The paced TCP flow averaged 10.12 Mb/s. The new
+  4,096-entry snapshot was installed on all subscribers within 0.87 s.
+- A paired Linux test kept one TCP connection open through policy
+  expansion on both ends and SIGHUP during the admission sweep. It
+  completed 490 round trips with a maximum reply gap of 55 ms. A later
+  withdrawal removed the route while the carrier stayed up. Fresh
+  admission restored it on the same TUN, and a ban still removed it.
+- The final bridge passed the 34-peer manual-mode TUN fixture with the
+  daemon that predates admission batches.

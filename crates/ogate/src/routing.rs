@@ -44,7 +44,7 @@ pub struct RoutingTable {
     by_peer: HashMap<NodeId, PeerAddrs>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PeerAddrs {
     v4: Option<Ipv4Addr>,
     v6: Option<Ipv6Addr>,
@@ -95,6 +95,13 @@ impl RoutingTable {
 
     pub fn peer_node_ids(&self) -> impl Iterator<Item = &NodeId> {
         self.by_peer.keys()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn same_peer_addresses(&self, other: &Self, peer: &NodeId) -> bool {
+        self.by_peer
+            .get(peer)
+            .is_some_and(|addresses| other.by_peer.get(peer) == Some(addresses))
     }
 
     #[cfg(unix)]

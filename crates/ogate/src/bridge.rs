@@ -155,6 +155,48 @@ impl SharedState {
         state
     }
 
+    fn preserve_signed_admissions(
+        &mut self,
+        previous: &SharedState,
+        admitted: &mut HashMap<NodeId, u64>,
+        now: u64,
+    ) {
+        let Some((from, until)) = previous.policy_window else {
+            admitted.clear();
+            return;
+        };
+        if now == 0 || now < from || now >= until {
+            admitted.clear();
+            return;
+        }
+
+        // Only an unchanged route can use a previous admission. Keep the
+        // earlier policy and certificate deadline until the daemon rechecks it.
+        admitted.retain(|peer, expiry| {
+            let deadline = if *expiry == 0 {
+                until
+            } else {
+                (*expiry).min(until)
+            };
+            if now >= deadline || !self.table.same_peer_addresses(&previous.table, peer) {
+                return false;
+            }
+            *expiry = deadline;
+            true
+        });
+
+        if !admitted.is_empty()
+            && previous
+                .peer_app_ids
+                .iter()
+                .all(|(peer, _)| self.table.same_peer_addresses(&previous.table, peer))
+        {
+            // Include peers currently denied admission: a packet could have
+            // been queued before they were denied within the previous policy.
+            self.routing_config = Arc::clone(&previous.routing_config);
+        }
+    }
+
     fn app_id_for(&self, peer: &NodeId) -> Option<[u8; 32]> {
         if !self.cert_is_current(peer) {
             return None;
@@ -1049,6 +1091,33 @@ async fn build_signed_update(
     Ok(Some((snapshot, state)))
 }
 
+fn prioritize_signed_admissions(
+    previous_order: &[(NodeId, [u8; 32])],
+    configured: &SharedState,
+    admitted: &HashMap<NodeId, u64>,
+) -> Option<Vec<(NodeId, [u8; 32])>> {
+    if admitted.is_empty() {
+        return None;
+    }
+    let mut order = Vec::with_capacity(configured.peer_app_ids.len());
+    // Preserve the relative check order of carried admissions, so adding
+    // addresses before them cannot delay their next check.
+    order.extend(
+        previous_order
+            .iter()
+            .copied()
+            .filter(|(peer, _)| admitted.contains_key(peer)),
+    );
+    order.extend(
+        configured
+            .peer_app_ids
+            .iter()
+            .copied()
+            .filter(|(peer, _)| !admitted.contains_key(peer)),
+    );
+    Some(order)
+}
+
 async fn maintain_routes(
     config_path: PathBuf,
     accepted: watch::Sender<OgateConfig>,
@@ -1061,8 +1130,9 @@ async fn maintain_routes(
     let mut config = accepted.borrow().clone();
     let mut hup = hup.lock().await;
     let mut admitted = HashMap::new();
-    let mut connection = None;
+    let mut connection: Option<Arc<VeilClient>> = None;
     let mut active_policy = None;
+    let mut admission_order = None;
     let mut next_peer = 0;
     let mut refresh = tokio::time::interval(PNET_REFRESH_PERIOD);
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1094,30 +1164,41 @@ async fn maintain_routes(
                 tracing::warn!(field, "config change requires an ogate restart");
                 continue;
             }
-            configured = match SharedState::build(&new) {
-                Ok(full) => full,
-                Err(error) => {
-                    tracing::warn!(%error, "could not build ogate routes");
+            if binding.signed.is_some() {
+                accepted.send_replace(new.clone());
+                config = new;
+                // Request a policy check at the next sweep boundary without
+                // restarting the current sweep or emptying its active routes.
+                if next_peer == 0 {
+                    refresh.reset();
+                } else {
+                    refresh.reset_immediately();
+                }
+            } else {
+                configured = match SharedState::build(&new) {
+                    Ok(full) => full,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not build ogate routes");
+                        continue;
+                    }
+                };
+                accepted.send_replace(new.clone());
+                config = new;
+                next_peer = 0;
+                if !config.pnet_required {
+                    admitted.clear();
+                    connection = None;
+                    publish_routes(configured.clone(), &state, &route_changes);
                     continue;
                 }
-            };
-            accepted.send_replace(new.clone());
-            config = new;
-            active_policy = None;
-            next_peer = 0;
-            if !config.pnet_required {
-                admitted.clear();
-                connection = None;
-                publish_routes(configured.clone(), &state, &route_changes);
-                continue;
+                admitted.retain(|peer, _| configured.app_id_for(peer).is_some());
+                publish_routes(
+                    configured.with_pnet_admissions(&admitted),
+                    &state,
+                    &route_changes,
+                );
+                refresh.reset();
             }
-            admitted.retain(|peer, _| configured.app_id_for(peer).is_some());
-            publish_routes(
-                configured.with_pnet_admissions(&admitted),
-                &state,
-                &route_changes,
-            );
-            refresh.reset();
         }
 
         if let Some((policy, authority)) = &binding.signed
@@ -1132,7 +1213,27 @@ async fn maintain_routes(
             )
             .await;
             let changed = match update {
-                Ok(Some((snapshot, routes))) => {
+                Ok(Some((snapshot, mut routes))) => {
+                    if connection
+                        .as_ref()
+                        .is_some_and(|client| !client.is_disconnected())
+                    {
+                        routes.preserve_signed_admissions(
+                            &configured,
+                            &mut admitted,
+                            unix_secs_now_u64(),
+                        );
+                    } else {
+                        admitted.clear();
+                        connection = None;
+                    }
+                    admission_order = prioritize_signed_admissions(
+                        admission_order
+                            .as_deref()
+                            .unwrap_or(&configured.peer_app_ids),
+                        &routes,
+                        &admitted,
+                    );
                     tracing::info!(revision = snapshot.revision, "loaded signed P-Net policy");
                     active_policy = Some(snapshot);
                     configured = routes;
@@ -1144,6 +1245,8 @@ async fn maintain_routes(
                     if active_policy.take().is_none() {
                         continue;
                     }
+                    admitted.clear();
+                    admission_order = None;
                     // Signed mode validates the base config with no manual
                     // peers. Reuse its empty route table on any policy error.
                     match SharedState::build(&config) {
@@ -1157,7 +1260,6 @@ async fn maintain_routes(
                 }
             };
             if changed {
-                admitted.clear();
                 publish_routes(
                     configured.with_pnet_admissions(&admitted),
                     &state,
@@ -1166,7 +1268,10 @@ async fn maintain_routes(
             }
         }
 
-        if configured.peer_app_ids.is_empty() {
+        let order = admission_order
+            .as_deref()
+            .unwrap_or(&configured.peer_app_ids);
+        if order.is_empty() {
             continue;
         }
         if connection.is_none() {
@@ -1179,16 +1284,12 @@ async fn maintain_routes(
         let results;
         if let Some(client) = &connection {
             if client.supports_pnet_admission_batch() {
-                end = (next_peer + veilclient::PNET_ADMISSION_BATCH_MAX_PEERS)
-                    .min(configured.peer_app_ids.len());
-                results =
-                    query_pnet_batch(client, &configured.peer_app_ids[next_peer..end], &mut pace)
-                        .await;
+                end = (next_peer + veilclient::PNET_ADMISSION_BATCH_MAX_PEERS).min(order.len());
+                results = query_pnet_batch(client, &order[next_peer..end], &mut pace).await;
             } else {
-                end = (next_peer + PNET_LEGACY_QUERY_GROUP).min(configured.peer_app_ids.len());
+                end = (next_peer + PNET_LEGACY_QUERY_GROUP).min(order.len());
                 let (legacy_results, uncertain) =
-                    query_pnet_legacy(client, &configured.peer_app_ids[next_peer..end], &mut pace)
-                        .await;
+                    query_pnet_legacy(client, &order[next_peer..end], &mut pace).await;
                 if uncertain {
                     connection = None;
                 }
@@ -1211,7 +1312,7 @@ async fn maintain_routes(
             }
             continue;
         };
-        let group = &configured.peer_app_ids[next_peer..end];
+        let group = &order[next_peer..end];
         let mut changed = false;
         for (peer, _) in group {
             match results.remove(peer) {
@@ -1226,11 +1327,7 @@ async fn maintain_routes(
                 &route_changes,
             );
         }
-        next_peer = if end == configured.peer_app_ids.len() {
-            0
-        } else {
-            end
-        };
+        next_peer = if end == order.len() { 0 } else { end };
     }
 }
 
@@ -1510,6 +1607,101 @@ mod tests {
         state.policy_window = Some((1, now + 60));
         state.pnet_expiries.insert(peer, now);
         assert!(!state.cert_is_current(&peer));
+    }
+
+    #[test]
+    fn signed_update_carries_only_current_unchanged_admissions_in_check_order() {
+        let mut config = cfg();
+        config.pnet_required = true;
+        for (byte, host) in [(0xa0, 3), (0xab, 4), (0xac, 5), (0xad, 6)] {
+            config.peers.push(PeerEntry {
+                node_id: hex::encode([byte; 32]),
+                addr_v4: Some(Ipv4Addr::new(10, 99, 0, host)),
+                addr_v6: Some(format!("fd00::{host}").parse().unwrap()),
+                name: None,
+            });
+        }
+        let mut previous = SharedState::build(&config).unwrap();
+        previous.policy_window = Some((10, 120));
+        let mut admissions = HashMap::from([
+            ([0xaa; 32], 106),
+            ([0xa0; 32], 0),
+            ([0xab; 32], 0),
+            ([0xac; 32], 140),
+            ([0xad; 32], 100),
+        ]);
+        config.peers[2].addr_v6 = Some("fd00::99".parse().unwrap());
+        config.peers[3].node_id = hex::encode([0x10; 32]);
+        let mut next = SharedState::build(&config).unwrap();
+        next.policy_window = Some((10, 200));
+        next.preserve_signed_admissions(&previous, &mut admissions, 100);
+        assert_eq!(
+            admissions,
+            HashMap::from([([0xaa; 32], 106), ([0xa0; 32], 120)])
+        );
+
+        let mut previous_order = previous.peer_app_ids.clone();
+        previous_order.swap(0, 1);
+        let order = prioritize_signed_admissions(&previous_order, &next, &admissions).unwrap();
+        assert_eq!(
+            order.iter().map(|entry| entry.0[0]).collect::<Vec<_>>(),
+            [0xaa, 0xa0, 0x10, 0xab, 0xad]
+        );
+
+        let active = next.with_pnet_admissions(&admissions);
+        assert_eq!(
+            active
+                .table
+                .lookup_egress(Ipv4Addr::new(10, 99, 0, 2).into()),
+            Decision::Forward([0xaa; 32])
+        );
+        for host in 4..=6 {
+            assert_eq!(
+                active
+                    .table
+                    .lookup_egress(Ipv4Addr::new(10, 99, 0, host).into()),
+                Decision::NoRoute
+            );
+        }
+
+        let mut expired_admissions = HashMap::from([([0xa0; 32], 0)]);
+        next.preserve_signed_admissions(&previous, &mut expired_admissions, 120);
+        assert!(expired_admissions.is_empty());
+    }
+
+    #[test]
+    fn signed_update_keeps_packet_batches_only_for_unchanged_assignments() {
+        let mut config = cfg();
+        config.peers.push(PeerEntry {
+            node_id: hex::encode([0xbb; 32]),
+            addr_v4: Some(Ipv4Addr::new(10, 99, 0, 3)),
+            addr_v6: None,
+            name: None,
+        });
+        let mut previous = SharedState::build(&config).unwrap();
+        previous.policy_window = Some((10, 120));
+        let mut admitted = HashMap::from([([0xaa; 32], 0)]);
+        config.peers.push(PeerEntry {
+            node_id: hex::encode([0xcc; 32]),
+            addr_v4: Some(Ipv4Addr::new(10, 99, 0, 4)),
+            addr_v6: None,
+            name: None,
+        });
+        let mut expanded = SharedState::build(&config).unwrap();
+        expanded.preserve_signed_admissions(&previous, &mut admitted, 100);
+        assert!(Arc::ptr_eq(
+            &expanded.routing_config,
+            &previous.routing_config
+        ));
+
+        config.peers[1].addr_v4 = Some(Ipv4Addr::new(10, 99, 0, 5));
+        let mut reassigned = SharedState::build(&config).unwrap();
+        reassigned.preserve_signed_admissions(&previous, &mut admitted, 100);
+        assert_eq!(admitted, HashMap::from([([0xaa; 32], 120)]));
+        assert!(!Arc::ptr_eq(
+            &reassigned.routing_config,
+            &previous.routing_config
+        ));
     }
 
     #[tokio::test]
