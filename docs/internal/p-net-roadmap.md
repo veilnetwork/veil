@@ -715,6 +715,16 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   in 4.78 s and distributed revision 15 to all eight in 13.91 s. One
   TCP connection between first-wave gateways carried 239,976,448 bytes
   in 240 s across the second wave and the mirror outage.
+- A matched comparison reused the same eight identities, reciprocal
+  peer topology and daemon builds, including one previous build. Each
+  trial waited 75 s between the starts of the two four-node waves. All
+  16 bidirectional paths between waves recovered in 53.85 s when the
+  lower node IDs rotated first and 4.40 s when the higher IDs rotated
+  first. Timing began once the last daemon in the second wave became
+  ready and its ogate was launched. Both trials rejected certificates
+  under the other owner and delivered all 100,001 UDP datagrams on an
+  unaffected path during the first wave. The order follows the existing
+  dialing rule for reciprocal configured peers.
 
 ## 6. Recover after owner compromise
 
