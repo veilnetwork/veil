@@ -69,6 +69,56 @@ async fn start_server(sock: PathBuf) -> (watch::Sender<bool>, tokio::task::JoinH
     (shutdown_tx, handle)
 }
 
+#[tokio::test]
+async fn pnet_authority_is_available_only_on_an_opt_in_ipc_connection() {
+    struct Provider(veilclient::PnetAuthority);
+    impl veil_ipc::PnetStatusProvider for Provider {
+        fn authority(&self) -> Option<veilclient::PnetAuthority> {
+            Some(self.0)
+        }
+
+        fn peer_status(&self, _: &[u8; 32]) -> veil_proto::PnetStatusResultPayload {
+            panic!("HELLO must not perform peer admission lookups")
+        }
+    }
+
+    let witness = veilclient::PnetAuthority {
+        root: veilclient::PnetTrustRoot::from_owner(
+            [1; 32],
+            veil_types::SignatureAlgorithm::Ed25519,
+            &[2; 32],
+        ),
+        local_valid_until_unix: 0,
+    };
+    let socket = temp_socket();
+    let (stop, shutdown) = watch::channel(false);
+    let mut server = IpcServer::new(
+        IpcEndpoint::Unix(socket.clone()),
+        shutdown,
+        Arc::new(AppEndpointRegistry::new()),
+        node_id(),
+    )
+    .with_pnet_status_provider(Arc::new(Provider(witness)));
+    let task = tokio::spawn(async move { server.run().await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !socket.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let ordinary = veilclient::VeilClient::connect(&socket).await.unwrap();
+    assert_eq!(ordinary.pnet_authority(), None);
+    let opted = veilclient::VeilClient::connect_with_pnet_authority(&socket)
+        .await
+        .unwrap();
+    assert_eq!(opted.pnet_authority(), Some(witness));
+    assert!(opted.supports_pnet_admission_batch());
+    drop((ordinary, opted));
+    stop.send(true).unwrap();
+    task.await.unwrap();
+}
+
 // ── 35.6: echo server + client, single datagram round-trip ───────────────────
 
 #[tokio::test]

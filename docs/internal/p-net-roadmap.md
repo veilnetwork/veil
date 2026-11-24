@@ -128,8 +128,25 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   after expiry and reopening. The store refused a macOS extended ACL
   grant on an otherwise owner-only directory. Linux and macOS unit tests
   cover the same signed format, concurrent updates, and unsafe state.
-- Before activating signed routes, require a local IPC witness derived
-  from the daemon's active private gate. Bind it to the expected network
-  ID, owner algorithm and public-key fingerprint, and recheck it on
-  reconnect. Apply the shorter of policy validity and membership validity
-  on the packet path. Preserve the current manual mode for older peers.
+- Signed-mode ogate obtains a local IPC witness from the daemon's active
+  private gate. The daemon verifies its local membership before
+  advertising the network ID, owner algorithm and public-key fingerprint.
+  The data and status connections must confirm the same authority; the
+  packet path enforces policy and membership deadlines. Ordinary SDK
+  clients retain their existing HELLO body and manual mode remains available.
+- An isolated Linux TUN pair passed traffic with an installed signed
+  snapshot and empty manual peer lists. Installation of a higher
+  revision removed a peer in both directions and a later revision
+  restored traffic. An older daemon was refused before TUN creation
+  in signed mode.
+- The same-ID daemon with another owner was refused on reconnect.
+  Restarting the original daemon restored traffic through the same
+  ogate process and TUN interface. At policy expiry traffic stopped
+  while the TCP session was still established.
+- A higher revision with a changed local TUN address withdrew the
+  previous routes until a matching revision was installed. After an
+  admin ban removed the route, a newer owner-signed assignment still
+  could not readmit the banned peer.
+- The same bridge binary also passed bidirectional manual-mode TUN
+  traffic with mixed old and new daemons. The FreeBSD ogate cross-check
+  passed; signed-mode packet forwarding was qualified on Linux.

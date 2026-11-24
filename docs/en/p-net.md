@@ -321,9 +321,36 @@ with mode `0700` and protected ancestry on durable local storage. Use
 the existing state to reject a lower revision or conflicting contents
 at the accepted revision. Expiry leaves that revision floor intact.
 
-These commands prepare and store snapshots. Route activation in ogate
-will also require confirmation that the running daemon uses the same
-P-Net authority.
+To activate the installed snapshot, use an ogate configuration such as
+this one. Use the physical, protected paths for the configuration file
+and the state directory.
+
+```toml
+network = "engineering"
+mode = "authorized"
+pnet_required = true
+local_addr_v4 = "10.99.0.2"
+prefix_v4 = 24
+local_addr_v6 = "fd84:99::2"
+prefix_v6 = 64
+
+[signed_policy]
+state_dir = "/var/lib/ogate/policy"
+network_id = "0000000000000000000000000000000000000000000000000000000000000001"
+owner_pubkey = "<base64 owner public key>"
+owner_algo = "ed25519"
+```
+
+Start ogate with this file and an empty manual peer list. Its local
+addresses and prefixes must match the node's signed assignment. The
+local daemon must support the authority check. After each IPC
+connection, ogate verifies the network, owner key, and local membership
+before querying private admissions.
+
+Installed revisions are picked up on the next sweep or after SIGHUP.
+Changes to the local TUN addresses or prefixes require updating the
+configuration and restarting ogate. When the policy or a membership
+expires, the corresponding traffic stops at that deadline.
 
 ## What gets rejected
 

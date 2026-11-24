@@ -27,14 +27,16 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Mutex, Notify, watch};
+use veil_identity::network_policy::VerifiedRoutePolicy;
 use veil_util::unix_secs_now_u64;
 use veilclient::client::PnetStatus;
-use veilclient::{APP_IPC_SEND_PREFIX_BYTES, AppHandle, VeilClient};
+use veilclient::{APP_IPC_SEND_PREFIX_BYTES, AppHandle, PnetAuthority, VeilClient};
 
 use crate::app_id::{derive_app_id, namespace_for};
 use crate::batch::{BatchIter, EgressBatches, is_batch_envelope};
 use crate::config::OgateConfig;
 use crate::routing::{Decision, NodeId, RoutingTable, parse_ip_endpoints};
+use crate::signed_policy::{SignedRoutes, assigned_peers};
 use crate::tun::{Device, Reader, Writer};
 
 /// Egress flush threshold (bytes).  When a per-peer batch crosses this size,
@@ -106,6 +108,7 @@ pub struct SharedState {
     pub peer_app_ids: Vec<(NodeId, [u8; 32])>,
     // Only finite deadlines need a wall-clock read on the packet path.
     pnet_expiries: HashMap<NodeId, u64>,
+    policy_window: Option<(u64, u64)>,
     // Admission sweeps keep this marker. Reloaded address allocations get a new one.
     routing_config: Arc<()>,
     /// Configured virtual-iface MTU. Used by the ingress task to drop
@@ -127,6 +130,7 @@ impl SharedState {
             table,
             peer_app_ids,
             pnet_expiries: HashMap::new(),
+            policy_window: None,
             routing_config: Arc::new(()),
             mtu: cfg.mtu,
         })
@@ -166,10 +170,16 @@ impl SharedState {
     }
 
     fn cert_is_current(&self, peer: &NodeId) -> bool {
-        self.pnet_expiries.get(peer).is_none_or(|expires| {
-            let now = unix_secs_now_u64();
-            now != 0 && now < *expires
-        })
+        let expiry = self.pnet_expiries.get(peer).copied();
+        if expiry.is_none() && self.policy_window.is_none() {
+            return true;
+        }
+        let now = unix_secs_now_u64();
+        now != 0
+            && expiry.is_none_or(|until| now < until)
+            && self
+                .policy_window
+                .is_none_or(|(from, until)| now >= from && now < until)
     }
 }
 
@@ -190,13 +200,19 @@ fn pnet_status_admits(peer: &NodeId, status: &PnetStatus, now: u64) -> bool {
 async fn connect_pnet_status(
     socket: &Path,
     expected_node: NodeId,
+    authority: Option<PnetAuthority>,
     pace: &mut tokio::time::Interval,
 ) -> Option<Arc<VeilClient>> {
     pace.tick().await;
     let connect = async {
-        let client = VeilClient::connect(socket)
-            .await
-            .map_err(BridgeError::client)?;
+        let client = connect_for_routes(socket, authority.is_some()).await?;
+        if authority.is_some_and(|expected| {
+            client.pnet_authority() != Some(expected) || !client.supports_pnet_admission_batch()
+        }) {
+            return Err(BridgeError::Cfg(
+                "status IPC did not confirm the data connection's P-Net authority".into(),
+            ));
+        }
         let identity = client.node_identity().await.map_err(BridgeError::client)?;
         if identity.node_id != expected_node {
             return Err(BridgeError::IdentityChanged);
@@ -344,6 +360,9 @@ pub fn validate_reload(old: &OgateConfig, new: &OgateConfig) -> Result<(), &'sta
     if old.socket_path != new.socket_path {
         return Err("socket_path");
     }
+    if old.signed_policy != new.signed_policy {
+        return Err("signed_policy");
+    }
     // `mode` and `peers` are intentionally reloadable.
     Ok(())
 }
@@ -358,23 +377,31 @@ struct BoundIpc {
     client: VeilClient,
     handle: AppHandle,
     binding: Binding,
+    authority: Option<PnetAuthority>,
 }
 
 const REBIND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REBIND_DELAY: Duration = Duration::from_secs(5);
 
-async fn bind_ipc(cfg: &OgateConfig, expected: Option<Binding>) -> Result<BoundIpc, BridgeError> {
-    let client = VeilClient::connect(&cfg.socket_path)
-        .await
-        .map_err(BridgeError::client)?;
-    bind_client(client, cfg, expected).await
+async fn connect_for_routes(socket: &Path, signed: bool) -> Result<VeilClient, BridgeError> {
+    if signed {
+        VeilClient::connect_with_pnet_authority(socket).await
+    } else {
+        VeilClient::connect(socket).await
+    }
+    .map_err(BridgeError::client)
 }
 
-async fn bind_client(
-    client: VeilClient,
+async fn bind_ipc(
     cfg: &OgateConfig,
     expected: Option<Binding>,
+    signed: Option<&SignedRoutes>,
 ) -> Result<BoundIpc, BridgeError> {
+    let client = connect_for_routes(&cfg.socket_path, signed.is_some()).await?;
+    let authority = signed
+        .map(|policy| policy.authenticate(client.pnet_authority(), unix_secs_now_u64()))
+        .transpose()
+        .map_err(BridgeError::Policy)?;
     let node_id = client
         .node_identity()
         .await
@@ -404,14 +431,19 @@ async fn bind_client(
         client,
         handle,
         binding,
+        authority,
     })
 }
 
-async fn reconnect_ipc(cfg: &OgateConfig, expected: Binding) -> BoundIpc {
+async fn reconnect_ipc(
+    cfg: &OgateConfig,
+    expected: Binding,
+    signed: Option<&SignedRoutes>,
+) -> BoundIpc {
     let mut delay = Duration::from_millis(250);
     loop {
         tokio::time::sleep(delay).await;
-        match tokio::time::timeout(REBIND_TIMEOUT, bind_ipc(cfg, Some(expected))).await {
+        match tokio::time::timeout(REBIND_TIMEOUT, bind_ipc(cfg, Some(expected), signed)).await {
             Ok(Ok(link)) => return link,
             Ok(Err(error)) => tracing::warn!(%error, "ogate IPC rebind failed"),
             Err(_) => tracing::warn!("ogate IPC rebind timed out"),
@@ -429,6 +461,12 @@ struct Bridge {
     cert_gate: Option<Arc<crate::app_cert_gate::AppCertGate>>,
     cert_message: Option<Arc<Vec<u8>>>,
     batching_enabled: bool,
+    signed: Option<Arc<SignedRoutes>>,
+}
+
+struct RouteBinding {
+    node_id: NodeId,
+    signed: Option<(Arc<SignedRoutes>, PnetAuthority)>,
 }
 
 enum LinkExit {
@@ -448,9 +486,18 @@ fn reload_signal() -> Option<Signal> {
 
 /// Run the bridge with one TUN interface across daemon reconnects.
 pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeError> {
+    cfg.validate()
+        .map_err(|error| BridgeError::Cfg(error.to_string().into()))?;
     SharedState::build(&cfg)?;
+    let signed = cfg
+        .signed_policy
+        .clone()
+        .map(SignedRoutes::open)
+        .transpose()
+        .map_err(BridgeError::Policy)?
+        .map(Arc::new);
     tracing::info!(socket = %cfg.socket_path.display(), "connecting to veil daemon");
-    let mut link = bind_ipc(&cfg, None).await?;
+    let mut link = bind_ipc(&cfg, None, signed.as_deref()).await?;
     let expected = link.binding;
     // ── S2.B app-cert authority (optional) ──────────────────────────────
     let app_cert_gate: Option<Arc<crate::app_cert_gate::AppCertGate>> = match (
@@ -508,6 +555,7 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
         cert_gate: app_cert_gate,
         cert_message,
         batching_enabled,
+        signed,
     };
     let mut stopping = std::pin::pin!(wait_for_shutdown());
 
@@ -519,7 +567,7 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
         let cfg = bridge.accepted.borrow().clone();
         link = tokio::select! {
             _ = stopping.as_mut() => return Ok(()),
-            link = reconnect_ipc(&cfg, expected) => link,
+            link = reconnect_ipc(&cfg, expected, bridge.signed.as_deref()) => link,
         };
     }
 }
@@ -533,7 +581,16 @@ async fn serve_link(
         mut client,
         handle,
         binding,
+        authority,
     } = link;
+    let signed = match &bridge.signed {
+        Some(signed) => Some((
+            Arc::clone(signed),
+            authority
+                .ok_or_else(|| BridgeError::Cfg("signed policy authority is missing".into()))?,
+        )),
+        None => None,
+    };
     let cfg = bridge.accepted.borrow().clone();
     let configured = SharedState::build(&cfg)?;
     let initial_state = if cfg.pnet_required {
@@ -895,7 +952,10 @@ async fn serve_link(
         bridge.config_path.clone(),
         bridge.accepted.clone(),
         Arc::clone(&bridge.hup),
-        binding.node_id,
+        RouteBinding {
+            node_id: binding.node_id,
+            signed,
+        },
         configured,
         Arc::clone(&state),
         route_changes,
@@ -944,11 +1004,42 @@ async fn serve_link(
     outcome
 }
 
+async fn build_signed_update(
+    policy: Arc<SignedRoutes>,
+    authority: PnetAuthority,
+    config: &OgateConfig,
+    node: &NodeId,
+    active: Option<&Arc<VerifiedRoutePolicy>>,
+) -> anyhow::Result<Option<(Arc<VerifiedRoutePolicy>, SharedState)>> {
+    let snapshot = tokio::task::spawn_blocking(move || policy.refresh()).await??;
+    let now = unix_secs_now_u64();
+    snapshot.check_current(now)?;
+    anyhow::ensure!(
+        authority.is_current(now),
+        "daemon local P-Net membership has expired"
+    );
+    if active.is_some_and(|active| Arc::ptr_eq(active, &snapshot)) {
+        return Ok(None);
+    }
+    let mut routes = config.clone();
+    routes.peers = assigned_peers(&snapshot, config, node)?;
+    let mut state = SharedState::build(&routes)?;
+    let until = if authority.local_valid_until_unix == 0 {
+        snapshot.valid_until_unix
+    } else {
+        snapshot
+            .valid_until_unix
+            .min(authority.local_valid_until_unix)
+    };
+    state.policy_window = Some((snapshot.valid_from_unix, until));
+    Ok(Some((snapshot, state)))
+}
+
 async fn maintain_routes(
     config_path: PathBuf,
     accepted: watch::Sender<OgateConfig>,
     hup: Arc<Mutex<Option<Signal>>>,
-    expected_node: NodeId,
+    binding: RouteBinding,
     mut configured: SharedState,
     state: Arc<ArcSwap<SharedState>>,
     route_changes: Arc<Notify>,
@@ -957,6 +1048,7 @@ async fn maintain_routes(
     let mut hup = hup.lock().await;
     let mut admitted = HashMap::new();
     let mut connection = None;
+    let mut active_policy = None;
     let mut next_peer = 0;
     let mut refresh = tokio::time::interval(PNET_REFRESH_PERIOD);
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -997,6 +1089,7 @@ async fn maintain_routes(
             };
             accepted.send_replace(new.clone());
             config = new;
+            active_policy = None;
             next_peer = 0;
             if !config.pnet_required {
                 admitted.clear();
@@ -1013,11 +1106,60 @@ async fn maintain_routes(
             refresh.reset();
         }
 
+        if let Some((policy, authority)) = &binding.signed
+            && next_peer == 0
+        {
+            let update = build_signed_update(
+                Arc::clone(policy),
+                *authority,
+                &config,
+                &binding.node_id,
+                active_policy.as_ref(),
+            )
+            .await;
+            let changed = match update {
+                Ok(Some((snapshot, routes))) => {
+                    tracing::info!(revision = snapshot.revision, "loaded signed P-Net policy");
+                    active_policy = Some(snapshot);
+                    configured = routes;
+                    true
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    tracing::warn!(%error, "signed P-Net policy unavailable");
+                    if active_policy.take().is_none() {
+                        continue;
+                    }
+                    // Signed mode validates the base config with no manual
+                    // peers. Reuse its empty route table on any policy error.
+                    match SharedState::build(&config) {
+                        Ok(empty) => configured = empty,
+                        Err(error) => {
+                            tracing::error!(%error, "could not rebuild empty signed policy routes");
+                            configured = configured.with_pnet_admissions(&HashMap::new());
+                        }
+                    }
+                    true
+                }
+            };
+            if changed {
+                admitted.clear();
+                publish_routes(
+                    configured.with_pnet_admissions(&admitted),
+                    &state,
+                    &route_changes,
+                );
+            }
+        }
+
         if configured.peer_app_ids.is_empty() {
             continue;
         }
         if connection.is_none() {
-            connection = connect_pnet_status(&config.socket_path, expected_node, &mut pace).await;
+            let authority = binding.signed.as_ref().map(|(_, authority)| *authority);
+            connection =
+                connect_pnet_status(&config.socket_path, binding.node_id, authority, &mut pace)
+                    .await;
         }
         let end;
         let results;
@@ -1171,6 +1313,8 @@ pub enum BridgeError {
     Routing(String),
     #[error("config: {0}")]
     Cfg(Box<str>),
+    #[error("signed policy: {0}")]
+    Policy(anyhow::Error),
 }
 
 impl BridgeError {
@@ -1208,6 +1352,8 @@ mod tests {
             logging: Default::default(),
             batch: Default::default(),
             pnet_required: false,
+            signed_policy: None,
+
             app_cert_trusted_owner_pubkey: None,
             app_cert_owner_algo: None,
             app_cert_network_id: None,
@@ -1333,6 +1479,25 @@ mod tests {
         assert!(!reassigned.permits_queued_egress(address_assignment, &peer, app_id));
     }
 
+    #[test]
+    fn policy_and_peer_validity_each_gate_packet_dispatch() {
+        let mut state = SharedState::build(&cfg()).unwrap();
+        let peer = [0xaa; 32];
+        let app_id = state.app_id_for(&peer).unwrap();
+        let generation = Arc::clone(&state.routing_config);
+        let now = unix_secs_now_u64();
+        state.policy_window = Some((1, now + 60));
+        state.pnet_expiries.insert(peer, now + 60);
+        assert!(state.permits_queued_egress(&generation, &peer, app_id));
+        state.policy_window = Some((now + 30, now + 60));
+        assert!(!state.cert_is_current(&peer));
+        state.policy_window = Some((1, now));
+        assert!(!state.permits_queued_egress(&generation, &peer, app_id));
+        state.policy_window = Some((1, now + 60));
+        state.pnet_expiries.insert(peer, now);
+        assert!(!state.cert_is_current(&peer));
+    }
+
     #[tokio::test]
     async fn pnet_routes_follow_daemon_admission_without_reload() {
         tokio::join!(
@@ -1422,7 +1587,10 @@ mod tests {
             directory.path().join("unused.toml"),
             watch::channel(config).0,
             Arc::new(Mutex::new(None)),
-            [0x01; 32],
+            RouteBinding {
+                node_id: [0x01; 32],
+                signed: None,
+            },
             configured,
             Arc::clone(&state),
             Arc::clone(&changed),
@@ -1471,7 +1639,7 @@ mod tests {
 
         let group = [(peer, [0u8; 32])];
         let mut pace = tokio::time::interval(PNET_QUERY_SPACING);
-        let client = connect_pnet_status(&socket, [0x01; 32], &mut pace)
+        let client = connect_pnet_status(&socket, [0x01; 32], None, &mut pace)
             .await
             .unwrap();
         assert!(client.supports_pnet_admission_batch());
@@ -1489,7 +1657,7 @@ mod tests {
         drop(client);
 
         admission.wrong_peer.store(false, Ordering::Relaxed);
-        let client = connect_pnet_status(&socket, [0x01; 32], &mut pace)
+        let client = connect_pnet_status(&socket, [0x01; 32], None, &mut pace)
             .await
             .unwrap();
         let fresh = query_pnet_batch(&client, &group, &mut pace).await.unwrap();
@@ -1535,7 +1703,8 @@ mod tests {
             mut client,
             handle,
             binding,
-        } = bind_ipc(&config, None).await.unwrap();
+            ..
+        } = bind_ipc(&config, None, None).await.unwrap();
         let (_sender, _receiver) = handle.into_split();
         assert!(
             tokio::time::timeout(Duration::from_millis(30), client.wait_disconnected())
@@ -1551,17 +1720,19 @@ mod tests {
 
         let (stop, daemon) = start(&config.socket_path, [0xb2; 32]).await;
         assert!(matches!(
-            bind_ipc(&config, Some(binding)).await,
+            bind_ipc(&config, Some(binding), None).await,
             Err(BridgeError::IdentityChanged)
         ));
         stop.send(true).unwrap();
         daemon.await.unwrap();
 
         let (stop, daemon) = start(&config.socket_path, node).await;
-        let restored =
-            tokio::time::timeout(Duration::from_secs(3), reconnect_ipc(&config, binding))
-                .await
-                .expect("ogate did not rebind after restarting the original daemon");
+        let restored = tokio::time::timeout(
+            Duration::from_secs(3),
+            reconnect_ipc(&config, binding, None),
+        )
+        .await
+        .expect("ogate did not rebind after restarting the original daemon");
         assert!(restored.binding == binding);
         drop(restored);
         stop.send(true).unwrap();

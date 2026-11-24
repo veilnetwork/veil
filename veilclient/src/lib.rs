@@ -133,7 +133,9 @@ pub use veilcore::proto::SenderProvenance;
 /// [`VeilClient::set_mobile_background_mode`].
 pub use veilcore::proto::MobileBackgroundMode;
 
-pub use veil_proto::ipc::{PNET_ADMISSION_BATCH_MAX_PEERS, PnetAdmission};
+pub use veil_proto::ipc::{
+    PNET_ADMISSION_BATCH_MAX_PEERS, PnetAdmission, PnetAuthority, PnetTrustRoot,
+};
 /// Coarse network classification reported via
 /// [`VeilClient::notify_network_changed`].
 pub use veilcore::proto::NetworkKind;

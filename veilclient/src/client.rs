@@ -825,6 +825,7 @@ type PendingPnetAdmissionBatch = (
 
 pub struct VeilClient {
     pnet_admission_batch: bool,
+    pnet_authority: Option<crate::PnetAuthority>,
     /// Shared write half — cloned by each `AppHandle`.
     pub(crate) writer: SharedWriter,
     /// Dispatch table: `endpoint_id` → message sender.
@@ -1132,6 +1133,26 @@ impl VeilClient {
     /// Returns [`ClientError::Handshake`] if the node rejects the connection
     /// (e.g. protocol version mismatch or the node is shutting down).
     pub async fn connect(socket_path: impl AsRef<Path>) -> Result<Self, ClientError> {
+        Self::connect_inner(socket_path.as_ref(), 0).await
+    }
+
+    /// Connect and request the local daemon's active private-network authority.
+    /// Older or public daemons can still connect without returning a witness.
+    pub async fn connect_with_pnet_authority(
+        socket_path: impl AsRef<Path>,
+    ) -> Result<Self, ClientError> {
+        Self::connect_inner(
+            socket_path.as_ref(),
+            veil_proto::ipc::IPC_CAP_PNET_AUTHORITY,
+        )
+        .await
+    }
+
+    pub fn pnet_authority(&self) -> Option<crate::PnetAuthority> {
+        self.pnet_authority
+    }
+
+    async fn connect_inner(socket_path: &Path, extra_flags: u32) -> Result<Self, ClientError> {
         // hello-handshake timeout. Without this, a daemon
         // that accepted the connection but failed to register a Hello
         // handler (e.g. silent IPC server bind-failure path) leaves the
@@ -1141,7 +1162,7 @@ impl VeilClient {
         const HELLO_TIMEOUT_SECS: u64 = 5;
         let timeout = std::time::Duration::from_secs(HELLO_TIMEOUT_SECS);
 
-        let mut stream = tokio::time::timeout(timeout, connect_ipc_any(socket_path.as_ref()))
+        let mut stream = tokio::time::timeout(timeout, connect_ipc_any(socket_path))
             .await
             .map_err(|_| {
                 ClientError::Protocol(format!(
@@ -1158,7 +1179,8 @@ impl VeilClient {
                 | veilcore::proto::ipc::IPC_CAP_LOCAL_SOURCE_RECOVERY_PROBE
                 | veilcore::proto::ipc::IPC_CAP_LOCAL_LOSSY_WORK
                 | veilcore::proto::ipc::IPC_CAP_LOCAL_DATAGRAM_PREPARATION
-                | veil_proto::ipc::IPC_CAP_PNET_ADMISSION_BATCH,
+                | veil_proto::ipc::IPC_CAP_PNET_ADMISSION_BATCH
+                | extra_flags,
         };
         tokio::time::timeout(
             timeout,
@@ -1202,6 +1224,15 @@ impl VeilClient {
         }
         let ok = AppIpcHelloOkPayload::decode(&body)
             .map_err(|e| ClientError::Protocol(e.to_string()))?;
+        let pnet_authority = if extra_flags & veil_proto::ipc::IPC_CAP_PNET_AUTHORITY != 0
+            && hdr.flags & veil_proto::ipc::IPC_HELLO_OK_PNET_AUTHORITY != 0
+        {
+            let authority = crate::PnetAuthority::decode(&body[AppIpcHelloOkPayload::WIRE_SIZE..])
+                .ok_or_else(|| ClientError::Protocol("invalid P-Net authority trailer".into()))?;
+            Some(authority)
+        } else {
+            None
+        };
 
         // ── Split socket ─────────────────────────────────────────────────
         let (rh, wh) = stream.into_split();
@@ -1241,6 +1272,7 @@ impl VeilClient {
             client_token: ok.client_token,
             pnet_admission_batch: hdr.flags & veil_proto::ipc::IPC_HELLO_OK_PNET_ADMISSION_BATCH
                 != 0,
+            pnet_authority,
             reader_task: Some(reader_task_handle),
         })
     }
@@ -4203,6 +4235,7 @@ mod tests {
             client_token: [0; 16],
             reader_task: None,
             pnet_admission_batch: true,
+            pnet_authority: None,
         };
         let peers = [[1; 32], [2; 32]];
         let respond = async {

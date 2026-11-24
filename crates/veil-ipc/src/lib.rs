@@ -568,6 +568,11 @@ impl<T: PeerListProvider + ?Sized> PeerListProvider for std::sync::Arc<T> {
 /// avoid blocking; the typical pattern is a brief lock against the
 /// per-session cert map.
 pub trait PnetStatusProvider: Send + Sync {
+    /// Active private-network authority, when a local membership was verified.
+    fn authority(&self) -> Option<veil_proto::ipc::PnetAuthority> {
+        None
+    }
+
     /// Look up the P-Net admission status for a given peer.
     /// Implementation contract:
     /// * Echo `peer_node_id` back in the result for IPC pipeline-safety.
@@ -583,6 +588,10 @@ pub trait PnetStatusProvider: Send + Sync {
 
 /// `Arc<T>` proxy [`PnetStatusProvider`].
 impl<T: PnetStatusProvider + ?Sized> PnetStatusProvider for std::sync::Arc<T> {
+    fn authority(&self) -> Option<veil_proto::ipc::PnetAuthority> {
+        (**self).authority()
+    }
+
     fn peer_status(&self, peer_node_id: &[u8; 32]) -> veil_proto::PnetStatusResultPayload {
         (**self).peer_status(peer_node_id)
     }

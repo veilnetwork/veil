@@ -534,12 +534,28 @@ impl NodeRuntime {
         // to IPC consumers (ogate / oproxy) for app-layer admission
         // decisions.  Empty cache (public-mode daemon) ⇒ all queries
         // reply has_cert=false; strict-p_net apps reject downstream.
+        let authority = self.network_gate.as_ref().and_then(|gate| {
+            use veil_proto::ipc::{PnetAuthority, PnetTrustRoot};
+            let now = veil_util::unix_secs_now_u64();
+            let cert = gate
+                .verify_peer(Some(&gate.local_cert_blob), &node_id, now)
+                .ok()?;
+            Some(PnetAuthority {
+                root: PnetTrustRoot::from_owner(
+                    gate.expected_network_id,
+                    gate.owner_algo,
+                    &gate.owner_pubkey_bytes,
+                ),
+                local_valid_until_unix: cert.valid_until_unix,
+            })
+        });
         let pnet_status = crate::pnet_status_provider::DaemonPnetStatus::new(
             Arc::clone(&self.verified_peer_certs),
             Arc::clone(&self.session_registry),
             Arc::clone(&self.session_tx_registry),
         )
-        .with_bans(Arc::clone(&self.ban_list));
+        .with_bans(Arc::clone(&self.ban_list))
+        .with_authority(authority);
         server = server.with_pnet_status_provider(Arc::new(pnet_status));
         // Listen-transports provider — surfaces the dispatcher's listener
         // snapshot (wildcard hosts rewritten to the observed external IP

@@ -56,6 +56,73 @@ pub const IPC_HELLO_OK_LOCAL_SOURCE_RECOVERY_PROBE: u16 = 0x1000;
 pub const IPC_CAP_PNET_ADMISSION_BATCH: u32 = 64;
 /// The server accepts the local batch admission query.
 pub const IPC_HELLO_OK_PNET_ADMISSION_BATCH: u16 = 0x2000;
+/// Request the active private-network authority on local IPC only.
+pub const IPC_CAP_PNET_AUTHORITY: u32 = 128;
+/// A fixed-size authority trailer follows the ordinary HELLO_OK body.
+pub const IPC_HELLO_OK_PNET_AUTHORITY: u16 = 0x4000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PnetTrustRoot {
+    pub network_id: [u8; 32],
+    pub owner_algorithm: veil_types::SignatureAlgorithm,
+    pub owner_fingerprint: [u8; 32],
+}
+
+impl PnetTrustRoot {
+    pub fn from_owner(
+        network_id: [u8; 32],
+        owner_algorithm: veil_types::SignatureAlgorithm,
+        owner_public_key: &[u8],
+    ) -> Self {
+        Self {
+            network_id,
+            owner_algorithm,
+            owner_fingerprint: blake3::derive_key(
+                "veil/p-net/owner-public-key/v1",
+                owner_public_key,
+            ),
+        }
+    }
+}
+
+/// Authority of the running daemon's verified local membership. Zero expiry
+/// represents the same owner-issued non-expiring cert as in peer admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PnetAuthority {
+    pub root: PnetTrustRoot,
+    pub local_valid_until_unix: u64,
+}
+
+impl PnetAuthority {
+    pub const WIRE_SIZE: usize = 32 + 1 + 32 + 8;
+
+    pub fn encode(self) -> [u8; Self::WIRE_SIZE] {
+        let mut wire = [0; Self::WIRE_SIZE];
+        wire[..32].copy_from_slice(&self.root.network_id);
+        wire[32] = self.root.owner_algorithm.wire_byte();
+        wire[33..65].copy_from_slice(&self.root.owner_fingerprint);
+        wire[65..].copy_from_slice(&self.local_valid_until_unix.to_be_bytes());
+        wire
+    }
+
+    pub fn decode(wire: &[u8]) -> Option<Self> {
+        if wire.len() != Self::WIRE_SIZE || wire[32] == 0 {
+            return None;
+        }
+        Some(Self {
+            root: PnetTrustRoot {
+                network_id: wire[..32].try_into().ok()?,
+                owner_algorithm: veil_types::SignatureAlgorithm::from_wire_byte(wire[32])?,
+                owner_fingerprint: wire[33..65].try_into().ok()?,
+            },
+            local_valid_until_unix: u64::from_be_bytes(wire[65..].try_into().ok()?),
+        })
+    }
+
+    pub fn is_current(self, now: u64) -> bool {
+        now != 0 && (self.local_valid_until_unix == 0 || now < self.local_valid_until_unix)
+    }
+}
 
 /// No content or media role is sent over the network by this local request.
 #[derive(Clone, Debug, PartialEq, Eq)]

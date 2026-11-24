@@ -46,6 +46,8 @@ pub mod cli;
 pub mod config;
 pub mod config_template;
 pub mod routing;
+#[cfg(unix)]
+mod signed_policy;
 pub mod tun;
 
 pub use app_id::{derive_app_id, namespace_for};

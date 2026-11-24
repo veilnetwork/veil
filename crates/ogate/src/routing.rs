@@ -266,6 +266,8 @@ mod tests {
             logging: Default::default(),
             batch: Default::default(),
             pnet_required: false,
+            signed_policy: None,
+
             app_cert_trusted_owner_pubkey: None,
             app_cert_owner_algo: None,
             app_cert_network_id: None,

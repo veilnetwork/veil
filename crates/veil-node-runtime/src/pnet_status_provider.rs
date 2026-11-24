@@ -26,6 +26,7 @@ pub struct DaemonPnetStatus {
     sessions: Arc<Mutex<SessionRegistry>>,
     tx: Arc<RwLock<SessionTxRegistry>>,
     bans: Option<Arc<Mutex<BanList>>>,
+    authority: Option<veil_proto::ipc::PnetAuthority>,
 }
 
 impl DaemonPnetStatus {
@@ -39,11 +40,20 @@ impl DaemonPnetStatus {
             sessions,
             tx,
             bans: None,
+            authority: None,
         }
     }
 
     pub(crate) fn with_bans(mut self, bans: Arc<Mutex<BanList>>) -> Self {
         self.bans = Some(bans);
+        self
+    }
+
+    pub(crate) fn with_authority(
+        mut self,
+        authority: Option<veil_proto::ipc::PnetAuthority>,
+    ) -> Self {
+        self.authority = authority;
         self
     }
 
@@ -61,6 +71,10 @@ impl DaemonPnetStatus {
 }
 
 impl PnetStatusProvider for DaemonPnetStatus {
+    fn authority(&self) -> Option<veil_proto::ipc::PnetAuthority> {
+        self.authority
+    }
+
     fn peer_status(&self, peer_node_id: &[u8; 32]) -> PnetStatusResultPayload {
         let admitted = self.is_admitted(peer_node_id);
         let cert = self.verified_peer_certs.read().ok().and_then(|cached| {

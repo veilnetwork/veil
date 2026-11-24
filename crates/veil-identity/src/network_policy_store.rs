@@ -53,33 +53,10 @@ impl RoutePolicyStore {
         let root: PathBuf = root.components().collect();
         // SAFETY: geteuid has no arguments or side effects.
         let owner = unsafe { libc::geteuid() };
-        let ancestors: Vec<_> = root.ancestors().collect();
-        let mut directory = None;
-        for path in ancestors.into_iter().rev() {
-            let dir = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-                .open(path)
-                .map_err(|error| match error.raw_os_error() {
-                    Some(libc::ELOOP | libc::ENOTDIR) => {
-                        StoreError::UnsafeDirectory(path.to_owned())
-                    }
-                    _ => StoreError::Io(error),
-                })?;
-            let meta = dir.metadata()?;
-            let sticky = meta.mode() & 0o1000 != 0;
-            if (meta.uid() != 0 && meta.uid() != owner)
-                || (meta.mode() & 0o022 != 0 && !sticky)
-                || (path == root && (meta.uid() != owner || meta.mode() & 0o077 != 0))
-                || !safe_acl(&dir)
-            {
-                return Err(StoreError::UnsafeDirectory(path.to_owned()));
-            }
-            directory = Some(dir);
-        }
+        let directory = open_trusted_directory(&root, owner, true)?;
         Ok(Self {
-            root: root.to_owned(),
-            directory: directory.ok_or_else(|| StoreError::UnsafeDirectory(root.to_owned()))?,
+            root,
+            directory,
             owner,
         })
     }
@@ -91,6 +68,23 @@ impl RoutePolicyStore {
         authority: &RoutePolicyAuthority<'_>,
     ) -> Result<VerifiedRoutePolicy, StoreError> {
         let _lock = self.lock(false)?;
+        self.load_synced(authority)
+    }
+
+    /// Load for a running service without waiting on another local installer.
+    pub fn try_load(
+        &self,
+        authority: &RoutePolicyAuthority<'_>,
+    ) -> Result<VerifiedRoutePolicy, StoreError> {
+        let lock = self.open_lock(false)?;
+        lock.try_lock().map_err(io::Error::other)?;
+        self.load_synced(authority)
+    }
+
+    fn load_synced(
+        &self,
+        authority: &RoutePolicyAuthority<'_>,
+    ) -> Result<VerifiedRoutePolicy, StoreError> {
         let policy = self.load_locked(authority)?;
         self.directory.sync_all()?;
         Ok(policy)
@@ -151,6 +145,12 @@ impl RoutePolicyStore {
     }
 
     fn lock(&self, initialize: bool) -> Result<File, StoreError> {
+        let lock = self.open_lock(initialize)?;
+        lock.lock()?;
+        Ok(lock)
+    }
+
+    fn open_lock(&self, initialize: bool) -> Result<File, StoreError> {
         let path = self.root.join(LOCK_FILE);
         let lock = match open_state_file(&path, true, initialize) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -159,7 +159,6 @@ impl RoutePolicyStore {
             result => result?,
         };
         self.require_owner_file(&lock, &path)?;
-        lock.lock()?;
         Ok(lock)
     }
 
@@ -193,6 +192,69 @@ impl RoutePolicyStore {
         }
         Ok(())
     }
+}
+
+// Signed route configuration supplies the pinned owner. Check the bytes
+// that were parsed through a protected path before trusting that pin.
+pub fn verify_policy_configuration(path: &Path, parsed: &[u8]) -> Result<(), StoreError> {
+    let absolute = std::path::absolute(path)?;
+    if absolute
+        .components()
+        .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err(StoreError::UnsafeFile(absolute));
+    }
+    let path: PathBuf = absolute.components().collect();
+    let parent = path
+        .parent()
+        .ok_or_else(|| StoreError::UnsafeFile(path.clone()))?;
+    // SAFETY: geteuid has no arguments or side effects.
+    let owner = unsafe { libc::geteuid() };
+    let _directory = open_trusted_directory(parent, owner, false)?;
+    let file = open_state_file(&path, false, false)?;
+    let meta = file.metadata()?;
+    if !meta.is_file()
+        || (meta.uid() != owner && meta.uid() != 0)
+        || meta.mode() & 0o022 != 0
+        || !safe_acl(&file)
+    {
+        return Err(StoreError::UnsafeFile(path));
+    }
+    let mut actual = Vec::new();
+    file.take(parsed.len() as u64 + 1)
+        .read_to_end(&mut actual)?;
+    if actual != parsed {
+        return Err(
+            io::Error::other("signed policy configuration changed while opening it").into(),
+        );
+    }
+    Ok(())
+}
+
+fn open_trusted_directory(root: &Path, owner: u32, private_leaf: bool) -> Result<File, StoreError> {
+    let ancestors: Vec<_> = root.ancestors().collect();
+    let mut directory = None;
+    for path in ancestors.into_iter().rev() {
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| match error.raw_os_error() {
+                Some(libc::ELOOP | libc::ENOTDIR) => StoreError::UnsafeDirectory(path.to_owned()),
+                _ => StoreError::Io(error),
+            })?;
+        let meta = dir.metadata()?;
+        let sticky = meta.mode() & 0o1000 != 0;
+        if (meta.uid() != 0 && meta.uid() != owner)
+            || (meta.mode() & 0o022 != 0 && !sticky)
+            || (private_leaf && path == root && (meta.uid() != owner || meta.mode() & 0o077 != 0))
+            || !safe_acl(&dir)
+        {
+            return Err(StoreError::UnsafeDirectory(path.to_owned()));
+        }
+        directory = Some(dir);
+    }
+    directory.ok_or_else(|| StoreError::UnsafeDirectory(root.to_owned()))
 }
 
 fn open_state_file(path: &Path, write: bool, create: bool) -> io::Result<File> {

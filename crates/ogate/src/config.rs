@@ -56,6 +56,10 @@ pub struct OgateConfig {
     #[serde(default)]
     pub pnet_required: bool,
 
+    /// Opt-in use of an installed owner-signed address snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_policy: Option<SignedPolicyConfig>,
+
     /// S2.B **app-layer cert authority** (server side).  Independent from
     /// daemon's P-Net.  When all three fields are set, ogate's ingress
     /// path drops packets from peers that haven't presented a valid
@@ -130,6 +134,15 @@ pub struct OgateConfig {
     /// `RUST_LOG` env var with default `info`.
     #[serde(default)]
     pub logging: LoggingConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SignedPolicyConfig {
+    pub state_dir: PathBuf,
+    pub network_id: String,
+    pub owner_pubkey: String,
+    pub owner_algo: veil_types::SignatureAlgorithm,
 }
 
 /// Logging configuration for the `ogate` binary.  Translates to
@@ -272,6 +285,18 @@ impl OgateConfig {
             source: e,
         })?;
         let cfg: Self = toml::from_str(&bytes).map_err(ConfigError::Parse)?;
+        #[cfg(unix)]
+        if cfg.signed_policy.is_some() {
+            veil_identity::network_policy_store::verify_policy_configuration(
+                path_ref,
+                bytes.as_bytes(),
+            )
+            .map_err(|error| ConfigError::Io {
+                path: path_ref.display().to_string(),
+                source: std::io::Error::other(error),
+            })?;
+        }
+
         cfg.validate()?;
         Ok(cfg)
     }
@@ -283,6 +308,19 @@ impl OgateConfig {
         }
         if self.app.is_empty() {
             return Err(ConfigError::Field("`app` must not be empty"));
+        }
+        if let Some(policy) = &self.signed_policy {
+            if !self.pnet_required || self.mode != AccessMode::Authorized || !self.peers.is_empty()
+            {
+                return Err(ConfigError::Field(
+                    "signed_policy requires pnet_required = true, authorized mode, and no manual peers",
+                ));
+            }
+            if !policy.state_dir.is_absolute() {
+                return Err(ConfigError::Field(
+                    "signed_policy.state_dir must be absolute",
+                ));
+            }
         }
         if self.local_addr_v4.is_none() {
             // `tun::standard::Device::new` requires `local_addr_v4` for
@@ -423,6 +461,42 @@ fn warn_loose_config_perms(_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn signed_config_requires_a_protected_pin_and_strict_routing() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let directory = dir.path().canonicalize().unwrap();
+        let path = directory.join("ogate.toml");
+        let signed = r#"
+network = "test"
+mode = "authorized"
+pnet_required = true
+local_addr_v4 = "10.99.0.1"
+
+[signed_policy]
+state_dir = "/var/lib/ogate/policy"
+network_id = "test"
+owner_pubkey = "test"
+owner_algo = "ed25519"
+"#;
+        std::fs::write(&path, signed).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(OgateConfig::from_path(&path).is_ok());
+        let unsafe_modes = [
+            signed.replace("pnet_required = true", "pnet_required = false"),
+            signed.replace("mode = \"authorized\"", "mode = \"open\""),
+        ];
+        for config in unsafe_modes {
+            std::fs::write(&path, config).unwrap();
+            assert!(OgateConfig::from_path(&path).is_err());
+        }
+        std::fs::write(&path, signed).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(OgateConfig::from_path(&path).is_err());
+    }
 
     /// Minimal config parses and applies fail-closed default (`Authorized`).
     /// Audit batch 2026-05-24 (L8): name pre-dates the default flip;

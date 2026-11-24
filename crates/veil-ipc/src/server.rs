@@ -2298,6 +2298,17 @@ async fn handle_ipc_client(
     let mut hello_header =
         FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppHelloOk as u16);
     hello_header.body_len = AppIpcHelloOkPayload::WIRE_SIZE as u32;
+    let mut authority = None;
+    if hello.flags & veil_proto::ipc::IPC_CAP_PNET_AUTHORITY != 0 {
+        authority = pnet_status_queries
+            .as_ref()
+            .and_then(|queries| queries.authority())
+            .filter(|authority| authority.is_current(veil_util::unix_secs_now_u64()));
+        if authority.is_some() {
+            hello_header.flags |= veil_proto::ipc::IPC_HELLO_OK_PNET_AUTHORITY;
+            hello_header.body_len += veil_proto::ipc::PnetAuthority::WIRE_SIZE as u32;
+        }
+    }
     if pnet_admission_batch {
         hello_header.flags |= veil_proto::ipc::IPC_HELLO_OK_PNET_ADMISSION_BATCH;
     }
@@ -2333,6 +2344,9 @@ async fn handle_ipc_client(
         .write_all(&codec::encode_header(&hello_header))
         .await?;
     stream.write_all(&ok.encode()).await?;
+    if let Some(authority) = authority {
+        stream.write_all(&authority.encode()).await?;
+    }
 
     // ── Step 4: split socket + bidirectional message loop ───────────────
     let (mut rh, mut wh) = stream.into_split();

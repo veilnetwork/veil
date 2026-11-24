@@ -217,6 +217,10 @@ impl PnetStatusQueries {
         }
     }
 
+    pub(crate) fn authority(&self) -> Option<veil_proto::ipc::PnetAuthority> {
+        self.provider.authority()
+    }
+
     pub(crate) async fn reply_admission_batch(
         &self,
         wh: &mut IpcWriteHalf,
