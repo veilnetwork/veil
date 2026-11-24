@@ -31,6 +31,27 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   admission-change subscription. Keep the existing status query available
   to earlier IPC clients.
 
+### Qualification results
+
+- A loopback stand paired Veil v0.11.59 (`6625b9ea`) with the current
+  daemon. A late peer with the correct membership was admitted, a peer
+  with a wrong-network certificate was rejected after disconnecting, and
+  the pair resumed after upgrading the old daemon and restarting the
+  other one. A ban removed admission while certificate metadata remained
+  readable. The stand used static peers with external discovery disabled.
+- The public configuration of the same version pair admitted peers
+  without private certificates. The Veil SDK chat sample delivered at
+  least 1,000 messages in each direction.
+- Two isolated Linux ARM64 containers passed traffic through real TUN
+  interfaces. In one run the tunnel resumed 1.34 s after the daemon
+  restart, using the same ogate process and TUN interface. Tunnel traffic
+  stopped 1.04 s after a ban. Idle ping p95 was 30.8 ms before the restart
+  and 32.4 ms afterward (30 replies per sample).
+- In the same Linux development build, a saturated TCP flow reached
+  28.45 Mb/s and only 18 of 30 pings received a reply. Repeat with release
+  builds and stepped load, record loss and latency in both directions,
+  and locate the queue or drop point before setting performance targets.
+
 ## 3. Distribute owner-authorized peer policy
 
 - Specify a signed policy for membership and virtual address allocations.

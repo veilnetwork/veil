@@ -246,6 +246,13 @@ admitted peer. Use `mode = "authorized"` to also enforce the configured
 source IP. The daemon still establishes sessions through its own discovery
 and connection mechanisms.
 
+If the daemon disconnects while ogate is running, ogate keeps its TUN
+interface and retries the IPC binding with backoff. It resumes forwarding
+after binding to the same node and named endpoint. P-Net routes are
+verified again and ogate discards its pending packet batches from the
+old binding. Restart ogate after an intentional change to the local
+node identity.
+
 ### Operator flow
 
 ```bash

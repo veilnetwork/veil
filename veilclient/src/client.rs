@@ -1227,6 +1227,19 @@ impl VeilClient {
         })
     }
 
+    /// Wait for either half of the local IPC connection to stop.
+    ///
+    /// This also works when split application handles keep their dispatch
+    /// channels alive. Cancelling the wait leaves the connection in place.
+    pub async fn wait_disconnected(&mut self) {
+        if let Some(reader) = self.reader_task.as_mut() {
+            tokio::select! {
+                _ = reader => self.reader_task = None,
+                _ = self.writer.tx.closed() => {},
+            }
+        }
+    }
+
     /// Bind a local application endpoint and return an [`AppHandle`].
     ///
     /// Bind an endpoint in **ephemeral** mode (default for most applications).

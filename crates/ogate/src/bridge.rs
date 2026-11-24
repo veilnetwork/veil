@@ -18,21 +18,24 @@
 //! On `ctrl_c` / `SIGTERM` all tasks exit and the function returns.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use tokio::sync::Notify;
+use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::sync::{Mutex, Notify, watch};
 use veil_util::unix_secs_now_u64;
 use veilclient::client::PnetStatus;
-use veilclient::{APP_IPC_SEND_PREFIX_BYTES, VeilClient};
+use veilclient::{APP_IPC_SEND_PREFIX_BYTES, AppHandle, VeilClient};
 
 use crate::app_id::{derive_app_id, namespace_for};
 use crate::batch::{BatchIter, EgressBatches, is_batch_envelope};
 use crate::config::OgateConfig;
 use crate::routing::{Decision, NodeId, RoutingTable, parse_ip_endpoints};
-use crate::tun::Device;
+use crate::tun::{Device, Reader, Writer};
 
 /// Egress flush threshold (bytes).  When a per-peer batch crosses this size,
 /// or the NEXT push would push it over, we ship the batch immediately.
@@ -180,6 +183,7 @@ fn pnet_status_admits(peer: &NodeId, status: &PnetStatus, now: u64) -> bool {
 async fn pnet_admissions(
     peers: &[(NodeId, [u8; 32])],
     socket: &Path,
+    expected_node: NodeId,
     connection: &mut Option<Arc<VeilClient>>,
     pace: &mut tokio::time::Interval,
 ) -> HashMap<NodeId, u64> {
@@ -188,7 +192,17 @@ async fn pnet_admissions(
     }
     if connection.is_none() {
         pace.tick().await;
-        match tokio::time::timeout(PNET_QUERY_TIMEOUT, VeilClient::connect(socket)).await {
+        let connect = async {
+            let client = VeilClient::connect(socket)
+                .await
+                .map_err(BridgeError::client)?;
+            let identity = client.node_identity().await.map_err(BridgeError::client)?;
+            if identity.node_id != expected_node {
+                return Err(BridgeError::IdentityChanged);
+            }
+            Ok(client)
+        };
+        match tokio::time::timeout(PNET_QUERY_TIMEOUT, connect).await {
             Ok(Ok(client)) => *connection = Some(Arc::new(client)),
             Ok(Err(error)) => {
                 tracing::debug!(%error, "P-Net status connection failed");
@@ -300,63 +314,110 @@ pub fn validate_reload(old: &OgateConfig, new: &OgateConfig) -> Result<(), &'sta
     Ok(())
 }
 
-/// Bring up the device + open the IPC handle + run the bridge loop.
-///
-/// Returns when all tasks exit (typically after SIGINT/SIGTERM).
-///
-/// `config_path` is held for the lifetime of the bridge so SIGHUP can
-/// re-read the same file. The initial `cfg` must have been parsed from
-/// that path.
-pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeError> {
-    tracing::info!(socket = %cfg.socket_path.display(), "connecting to veil daemon");
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Binding {
+    node_id: NodeId,
+    app_id: [u8; 32],
+}
+
+struct BoundIpc {
+    client: VeilClient,
+    handle: AppHandle,
+    binding: Binding,
+}
+
+const REBIND_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_REBIND_DELAY: Duration = Duration::from_secs(5);
+
+async fn bind_ipc(cfg: &OgateConfig, expected: Option<Binding>) -> Result<BoundIpc, BridgeError> {
     let client = VeilClient::connect(&cfg.socket_path)
         .await
         .map_err(BridgeError::client)?;
+    bind_client(client, cfg, expected).await
+}
 
-    // Validate peer identities and address conflicts across the full
-    // configuration, including peers that may be offline for the first sweep.
-    let configured = SharedState::build(&cfg)?;
-    let initial_state = if cfg.pnet_required {
-        configured.with_pnet_admissions(&HashMap::new())
-    } else {
-        configured.clone()
-    };
-    tracing::info!(
-        mode = ?initial_state.table.mode(),
-        peers = initial_state.table.peer_count(),
-        pnet_required = cfg.pnet_required,
-        "initial routing state ready"
-    );
-    let state: Arc<ArcSwap<SharedState>> = Arc::new(ArcSwap::from_pointee(initial_state));
-    let identity = client.node_identity().await.map_err(BridgeError::client)?;
-    tracing::info!(node_id = %hex::encode(identity.node_id), "got local node identity");
-
-    let ns = namespace_for(&cfg.network);
+async fn bind_client(
+    client: VeilClient,
+    cfg: &OgateConfig,
+    expected: Option<Binding>,
+) -> Result<BoundIpc, BridgeError> {
+    let node_id = client
+        .node_identity()
+        .await
+        .map_err(BridgeError::client)?
+        .node_id;
+    if expected.is_some_and(|binding| binding.node_id != node_id) {
+        return Err(BridgeError::IdentityChanged);
+    }
+    let namespace = namespace_for(&cfg.network);
     let handle = client
-        .bind_named(&ns, &cfg.app, cfg.endpoint_id)
+        .bind_named(&namespace, &cfg.app, cfg.endpoint_id)
         .await
         .map_err(BridgeError::client)?;
-    let my_app_id = *handle.app_id();
+    let binding = Binding {
+        node_id,
+        app_id: *handle.app_id(),
+    };
+    if expected.is_some_and(|expected| binding != expected) {
+        return Err(BridgeError::IdentityChanged);
+    }
     tracing::info!(
-        namespace = %ns,
-        name = %cfg.app,
+        namespace,
         endpoint = cfg.endpoint_id,
-        app_id = %hex::encode(my_app_id),
-        "bound IPC endpoint"
+        "bound ogate IPC endpoint"
     );
+    Ok(BoundIpc {
+        client,
+        handle,
+        binding,
+    })
+}
 
-    // ── TUN device ──────────────────────────────────────────────────────
-    let dev = Device::new(&cfg).await.map_err(BridgeError::Tun)?;
-    tracing::info!(iface = %dev.name(), "TUN device up");
-    let (mut tun_r, mut tun_w) = dev.split();
+async fn reconnect_ipc(cfg: &OgateConfig, expected: Binding) -> BoundIpc {
+    let mut delay = Duration::from_millis(250);
+    loop {
+        tokio::time::sleep(delay).await;
+        match tokio::time::timeout(REBIND_TIMEOUT, bind_ipc(cfg, Some(expected))).await {
+            Ok(Ok(link)) => return link,
+            Ok(Err(error)) => tracing::warn!(%error, "ogate IPC rebind failed"),
+            Err(_) => tracing::warn!("ogate IPC rebind timed out"),
+        }
+        delay = (delay * 2).min(MAX_REBIND_DELAY);
+    }
+}
 
-    let endpoint_id = cfg.endpoint_id;
-    let (app_sender, mut app_receiver) = handle.into_split();
-    // Arc-wrap the sender so the cert-broadcast task can share it with
-    // the egress task without uncoordinated moves.  `send_*` methods take
-    // `&self`, so Arc-deref works transparently.
-    let app_sender = Arc::new(app_sender);
+struct Bridge {
+    config_path: PathBuf,
+    accepted: watch::Sender<OgateConfig>,
+    hup: Arc<Mutex<Option<Signal>>>,
+    reader: Arc<Mutex<Reader>>,
+    writer: Arc<Mutex<Writer>>,
+    cert_gate: Option<Arc<crate::app_cert_gate::AppCertGate>>,
+    cert_message: Option<Arc<Vec<u8>>>,
+    batching_enabled: bool,
+}
 
+enum LinkExit {
+    Shutdown,
+    DaemonDisconnected,
+}
+
+fn reload_signal() -> Option<Signal> {
+    match signal(SignalKind::hangup()) {
+        Ok(signal) => Some(signal),
+        Err(error) => {
+            tracing::warn!(%error, "SIGHUP handler install failed; reload disabled");
+            None
+        }
+    }
+}
+
+/// Run the bridge with one TUN interface across daemon reconnects.
+pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeError> {
+    SharedState::build(&cfg)?;
+    tracing::info!(socket = %cfg.socket_path.display(), "connecting to veil daemon");
+    let mut link = bind_ipc(&cfg, None).await?;
+    let expected = link.binding;
     // ── S2.B app-cert authority (optional) ──────────────────────────────
     let app_cert_gate: Option<Arc<crate::app_cert_gate::AppCertGate>> = match (
         &cfg.app_cert_trusted_owner_pubkey,
@@ -392,15 +453,67 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
         }
         None => None,
     };
-    // Per-peer verified-cert cache: node_id → valid_until_unix.
-    // Sentinel `0` ⇒ no expiry; positive value ⇒ unix-second expiry.
-    let verified_peers: Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], u64>>> =
-        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cert_message = own_cert_blob.as_deref().and_then(|blob| {
+        let msg = crate::cert_message::encode_cert_message(blob);
+        if msg.is_none() {
+            tracing::error!("app certificate too large or empty");
+        }
+        msg.map(Arc::new)
+    });
+    let device = Device::new(&cfg).await.map_err(BridgeError::Tun)?;
+    tracing::info!(iface = %device.name(), "TUN device up");
+    let (reader, writer) = device.split();
+    let batching_enabled = cfg.batch.enabled;
+    let (accepted, _) = watch::channel(cfg);
+    let bridge = Bridge {
+        config_path,
+        accepted,
+        hup: Arc::new(Mutex::new(reload_signal())),
+        reader: Arc::new(Mutex::new(reader)),
+        writer: Arc::new(Mutex::new(writer)),
+        cert_gate: app_cert_gate,
+        cert_message,
+        batching_enabled,
+    };
+    let mut stopping = std::pin::pin!(wait_for_shutdown());
 
-    // Notify shared with all background tasks for clean shutdown.  Moved
-    // earlier than its original position so the cert-broadcast task can
-    // reference it during initialisation.
-    let shutdown = Arc::new(Notify::new());
+    loop {
+        match serve_link(&bridge, link, stopping.as_mut()).await? {
+            LinkExit::Shutdown => return Ok(()),
+            LinkExit::DaemonDisconnected => tracing::warn!("ogate IPC disconnected; rebinding"),
+        }
+        let cfg = bridge.accepted.borrow().clone();
+        link = tokio::select! {
+            _ = stopping.as_mut() => return Ok(()),
+            link = reconnect_ipc(&cfg, expected) => link,
+        };
+    }
+}
+
+async fn serve_link(
+    bridge: &Bridge,
+    link: BoundIpc,
+    mut stopping: Pin<&mut impl Future<Output = ()>>,
+) -> Result<LinkExit, BridgeError> {
+    let BoundIpc {
+        mut client,
+        handle,
+        binding,
+    } = link;
+    let cfg = bridge.accepted.borrow().clone();
+    let configured = SharedState::build(&cfg)?;
+    let initial_state = if cfg.pnet_required {
+        configured.with_pnet_admissions(&HashMap::new())
+    } else {
+        configured.clone()
+    };
+    let state = Arc::new(ArcSwap::from_pointee(initial_state));
+    let endpoint_id = cfg.endpoint_id;
+    let (app_sender, mut app_receiver) = handle.into_split();
+    let app_sender = Arc::new(app_sender);
+
+    // Keep a retained shutdown notification for egress even while it is writing.
+    let (shutdown, shutdown_rx) = watch::channel(false);
 
     // ── S2.B sender-side: periodic cert broadcast ──────────────────────
     // When `app_cert_path` is set, ogate emits its cert to every
@@ -408,46 +521,29 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
     // before regular packets arrive) and then every 5 min thereafter (so
     // peers that came online late or restarted still get the cert).
     let route_changes = Arc::new(Notify::new());
-    let cert_broadcast_task: Option<tokio::task::JoinHandle<()>> = if let Some(blob) =
-        own_cert_blob.as_ref()
-    {
-        let msg = crate::cert_message::encode_cert_message(blob);
-        match msg {
-            Some(msg_bytes) => {
-                let msg_bytes = Arc::new(msg_bytes);
-                let app_sender_for_cert = Arc::clone(&app_sender);
-                let state_for_cert = Arc::clone(&state);
-                let route_changes = Arc::clone(&route_changes);
-                Some(tokio::spawn(async move {
-                    // Wait a brief moment so peers' ingress tasks are listening.
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    loop {
-                        let snap = state_for_cert.load_full();
-                        for &(peer_node_id, app_id) in &snap.peer_app_ids {
-                            if state_for_cert.load().app_id_for(&peer_node_id) != Some(app_id) {
-                                continue;
-                            }
-                            let payload = (*msg_bytes).clone();
-                            let _ = app_sender_for_cert
-                                .send_owned(peer_node_id, app_id, endpoint_id, payload)
-                                .await;
-                        }
-                        // Newly admitted routes need the certificate right away.
-                        tokio::select! {
-                            _ = route_changes.notified() => {},
-                            _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {},
-                        }
+    let cert_broadcast_task = bridge.cert_message.as_ref().map(|msg_bytes| {
+        let msg_bytes = Arc::clone(msg_bytes);
+        let app_sender = Arc::clone(&app_sender);
+        let state = Arc::clone(&state);
+        let route_changes = Arc::clone(&route_changes);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            loop {
+                let snap = state.load_full();
+                for &(peer_node_id, app_id) in &snap.peer_app_ids {
+                    if state.load().app_id_for(&peer_node_id) == Some(app_id) {
+                        let _ = app_sender
+                            .send_owned(peer_node_id, app_id, endpoint_id, (*msg_bytes).clone())
+                            .await;
                     }
-                }))
+                }
+                tokio::select! {
+                    _ = route_changes.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_secs(300)) => {},
+                }
             }
-            None => {
-                tracing::error!("encode_cert_message returned None — cert blob too large or empty");
-                None
-            }
-        }
-    } else {
-        None
-    };
+        })
+    });
 
     // ── Egress: TUN → veil (batched) ─────────────────────────────────
     //
@@ -471,17 +567,19 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
     }
 
     // Audit batch 2026-05-24 (M13): config-driven kill-switch.
-    let batching_enabled = cfg.batch.enabled;
+    let batching_enabled = bridge.batching_enabled;
     tracing::info!(
         batching_enabled,
         "egress batching state — set [batch] enabled = false for rolling-upgrade safety"
     );
 
-    let egress = {
+    let mut egress = {
         let state = Arc::clone(&state);
-        let shutdown = Arc::clone(&shutdown);
+        let tun_r = Arc::clone(&bridge.reader);
+        let mut shutdown = shutdown_rx;
         let app_sender = Arc::clone(&app_sender);
         tokio::spawn(async move {
+            let mut tun_r = tun_r.lock().await;
             let mut batches = EgressBatches::new();
             loop {
                 // Pick wake-up source: either the TUN reader OR a deadline timer
@@ -498,7 +596,7 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                     }
                 };
                 tokio::select! {
-                    _ = shutdown.notified() => {
+                    _ = shutdown.changed() => {
                         // Best-effort flush on graceful shutdown.
                         for (peer_nid, envelope, peer_app_id) in batches.drain_all() {
                             if state.load().app_id_for(&peer_nid) != Some(peer_app_id) {
@@ -527,8 +625,7 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                     }
                     res = tun_r.read_packet_with_prefix(APP_IPC_SEND_PREFIX_BYTES) => match res {
                         Err(e) => {
-                            tracing::error!(error = %e, "TUN read failed; egress task exiting");
-                            break;
+                            return Err(BridgeError::Tun(e.into()));
                         }
                         Ok(buf) => {
                             // `buf` layout: [PREFIX uninit][IP packet bytes].
@@ -667,133 +764,116 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
                     }
                 }
             }
+            Ok::<(), BridgeError>(())
         })
     };
 
     // ── Ingress: veil → TUN ──────────────────────────────────────────
-    let ingress = {
+    let mut ingress = {
         let state = Arc::clone(&state);
-        let shutdown = Arc::clone(&shutdown);
-        let app_cert_gate_for_ingress = app_cert_gate.as_ref().map(Arc::clone);
-        let verified_peers_for_ingress = Arc::clone(&verified_peers);
+        let tun_w = Arc::clone(&bridge.writer);
+        let app_cert_gate_for_ingress = bridge.cert_gate.clone();
         tokio::spawn(async move {
+            let mut tun_w = tun_w.lock().await;
+            let mut verified_peers = HashMap::new();
             loop {
-                tokio::select! {
-                    _ = shutdown.notified() => break,
-                    msg = app_receiver.recv() => match msg {
-                        Err(e) => {
-                            tracing::error!(error = %e, "AppReceiver error; ingress task exiting");
-                            break;
-                        }
-                        Ok(None) => {
-                            tracing::warn!("AppReceiver closed; ingress task exiting");
-                            break;
-                        }
-                        Ok(Some(im)) => {
-                            // S2.B: cert message intercept BEFORE any IP-packet
-                            // dispatch.  Marker 0xC0 is outside IPv4/IPv6 version
-                            // nibbles + distinct from batch envelope (0xB1).
-                            if crate::cert_message::is_cert_message(&im.data) {
-                                match crate::cert_message::decode_cert_message(&im.data) {
-                                    Ok(blob) => {
-                                        if let Some(gate) = app_cert_gate_for_ingress.as_ref() {
-                                            match gate.verify(&blob, &im.src_node_id) {
-                                                Ok(valid_until) => {
-                                                    let mut g = verified_peers_for_ingress
-                                                        .lock()
-                                                        .unwrap_or_else(|p| p.into_inner());
-                                                    g.insert(im.src_node_id, valid_until);
-                                                    tracing::info!(
-                                                        src = %hex::encode(im.src_node_id),
-                                                        valid_until,
-                                                        "app-cert verified for peer"
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        src = %hex::encode(im.src_node_id),
-                                                        error = %e,
-                                                        "app-cert verify failed; ignoring"
-                                                    );
-                                                }
+                match app_receiver.recv().await {
+                    Err(e) => {
+                        tracing::error!(error = %e, "AppReceiver error; ingress task exiting");
+                        break;
+                    }
+                    Ok(None) => {
+                        tracing::warn!("AppReceiver closed; ingress task exiting");
+                        break;
+                    }
+                    Ok(Some(im)) => {
+                        // S2.B: cert message intercept BEFORE any IP-packet
+                        // dispatch.  Marker 0xC0 is outside IPv4/IPv6 version
+                        // nibbles + distinct from batch envelope (0xB1).
+                        if crate::cert_message::is_cert_message(&im.data) {
+                            match crate::cert_message::decode_cert_message(&im.data) {
+                                Ok(blob) => {
+                                    if let Some(gate) = app_cert_gate_for_ingress.as_ref() {
+                                        match gate.verify(&blob, &im.src_node_id) {
+                                            Ok(valid_until) => {
+                                                verified_peers.insert(im.src_node_id, valid_until);
+                                                tracing::info!(
+                                                    src = %hex::encode(im.src_node_id),
+                                                    valid_until,
+                                                    "app-cert verified for peer"
+                                                );
                                             }
-                                        } else {
-                                            // Gate not configured — silently swallow the
-                                            // cert message (wire-compat for mixed deployment).
-                                            tracing::debug!(
-                                                src = %hex::encode(im.src_node_id),
-                                                "ignoring unsolicited cert (gate not configured)"
-                                            );
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    src = %hex::encode(im.src_node_id),
+                                                    error = %e,
+                                                    "app-cert verify failed; ignoring"
+                                                );
+                                            }
                                         }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
+                                    } else {
+                                        // Gate not configured — silently swallow the
+                                        // cert message (wire-compat for mixed deployment).
+                                        tracing::debug!(
                                             src = %hex::encode(im.src_node_id),
-                                            error = e,
-                                            "malformed cert message"
+                                            "ignoring unsolicited cert (gate not configured)"
                                         );
                                     }
                                 }
-                                continue; // Don't touch TUN-write path.
-                            }
-                            // S2.B admission gate: if app-cert authority configured,
-                            // packets from unverified peers are dropped.
-                            if app_cert_gate_for_ingress.is_some() {
-                                let admitted = {
-                                    let g = verified_peers_for_ingress
-                                        .lock()
-                                        .unwrap_or_else(|p| p.into_inner());
-                                    let now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_secs())
-                                        .unwrap_or(0);
-                                    match g.get(&im.src_node_id) {
-                                        Some(0) => true, // sentinel: no expiry
-                                        Some(&exp) if exp > now => true,
-                                        _ => false,
-                                    }
-                                };
-                                if !admitted {
-                                    tracing::debug!(
+                                Err(e) => {
+                                    tracing::warn!(
                                         src = %hex::encode(im.src_node_id),
-                                        "app-cert gate: dropping packet from unverified peer"
+                                        error = e,
+                                        "malformed cert message"
                                     );
-                                    continue;
                                 }
                             }
-                            if is_batch_envelope(&im.data) {
-                                // Phase E27: batched envelope.  Per-sub-packet
-                                // MTU/route check; envelope-level MTU cap is NOT
-                                // applied — batch buffer is naturally >MTU.
-                                for pkt in BatchIter::new(&im.data) {
-                                    deliver_one(
-                                        &mut tun_w,
-                                        &state,
-                                        &im.src_node_id,
-                                        pkt,
-                                    ).await;
+                            continue; // Don't touch TUN-write path.
+                        }
+                        // S2.B admission gate: if app-cert authority configured,
+                        // packets from unverified peers are dropped.
+                        if app_cert_gate_for_ingress.is_some() {
+                            let admitted = {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                match verified_peers.get(&im.src_node_id) {
+                                    Some(0) => true, // sentinel: no expiry
+                                    Some(&exp) if exp > now => true,
+                                    _ => false,
                                 }
-                            } else {
-                                // Legacy single-packet envelope.  Keep the
-                                // pre-E27 MTU guard at envelope level (a compromised
-                                // peer cannot inject a larger-than-MTU frame).
-                                let mtu = state.load().mtu;
-                                if im.data.len() > mtu as usize {
-                                    tracing::debug!(
-                                        src = %hex::encode(im.src_node_id),
-                                        len = im.data.len(),
-                                        mtu,
-                                        "ingress: dropping oversize packet",
-                                    );
-                                    continue;
-                                }
-                                deliver_one(
-                                    &mut tun_w,
-                                    &state,
-                                    &im.src_node_id,
-                                    &im.data,
-                                ).await;
+                            };
+                            if !admitted {
+                                tracing::debug!(
+                                    src = %hex::encode(im.src_node_id),
+                                    "app-cert gate: dropping packet from unverified peer"
+                                );
+                                continue;
                             }
+                        }
+                        if is_batch_envelope(&im.data) {
+                            // Phase E27: batched envelope.  Per-sub-packet
+                            // MTU/route check; envelope-level MTU cap is NOT
+                            // applied — batch buffer is naturally >MTU.
+                            for pkt in BatchIter::new(&im.data) {
+                                deliver_one(&mut tun_w, &state, &im.src_node_id, pkt).await;
+                            }
+                        } else {
+                            // Legacy single-packet envelope.  Keep the
+                            // pre-E27 MTU guard at envelope level (a compromised
+                            // peer cannot inject a larger-than-MTU frame).
+                            let mtu = state.load().mtu;
+                            if im.data.len() > mtu as usize {
+                                tracing::debug!(
+                                    src = %hex::encode(im.src_node_id),
+                                    len = im.data.len(),
+                                    mtu,
+                                    "ingress: dropping oversize packet",
+                                );
+                                continue;
+                            }
+                            deliver_one(&mut tun_w, &state, &im.src_node_id, &im.data).await;
                         }
                     }
                 }
@@ -801,45 +881,70 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
         })
     };
 
-    let route_updates = tokio::spawn(maintain_routes(
-        config_path,
-        cfg,
+    let routes = tokio::spawn(maintain_routes(
+        bridge.config_path.clone(),
+        bridge.accepted.clone(),
+        Arc::clone(&bridge.hup),
+        binding.node_id,
         configured,
         Arc::clone(&state),
         route_changes,
     ));
+    let (outcome, ingress_finished, egress_finished) = tokio::select! {
+        _ = stopping.as_mut() => (Ok(LinkExit::Shutdown), false, false),
+        _ = client.wait_disconnected() => (Ok(LinkExit::DaemonDisconnected), false, false),
+        result = &mut ingress => (
+            result.map(|_| LinkExit::DaemonDisconnected).map_err(BridgeError::client),
+            true,
+            false,
+        ),
+        result = &mut egress => (
+            result.map_err(BridgeError::client).and_then(|result| result)
+                .map(|_| LinkExit::DaemonDisconnected),
+            false,
+            true,
+        ),
+    };
 
-    // ── Wait for shutdown signal ────────────────────────────────────────
-    wait_for_shutdown().await;
-    tracing::info!("shutdown signal received");
-    route_updates.abort();
-    let _ = route_updates.await;
-    shutdown.notify_waiters();
-
-    let _ = egress.await;
-    let _ = ingress.await;
+    routes.abort();
+    let _ = routes.await;
     if let Some(task) = cert_broadcast_task {
         task.abort();
         let _ = task.await;
     }
-    Ok(())
+    if !ingress_finished {
+        ingress.abort();
+        let _ = ingress.await;
+    }
+    if !egress_finished {
+        if matches!(outcome, Ok(LinkExit::Shutdown)) {
+            let _ = shutdown.send(true);
+            if tokio::time::timeout(Duration::from_secs(1), &mut egress)
+                .await
+                .is_ok()
+            {
+                return outcome;
+            }
+        }
+        // Pending packets belong to this binding, including its admission
+        // snapshot. Never flush them into a replacement daemon.
+        egress.abort();
+        let _ = egress.await;
+    }
+    outcome
 }
 
 async fn maintain_routes(
     config_path: PathBuf,
-    mut config: OgateConfig,
+    accepted: watch::Sender<OgateConfig>,
+    hup: Arc<Mutex<Option<Signal>>>,
+    expected_node: NodeId,
     mut configured: SharedState,
     state: Arc<ArcSwap<SharedState>>,
     route_changes: Arc<Notify>,
 ) {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut hup = match signal(SignalKind::hangup()) {
-        Ok(signal) => Some(signal),
-        Err(error) => {
-            tracing::warn!(%error, "SIGHUP handler install failed; reload disabled");
-            None
-        }
-    };
+    let mut config = accepted.borrow().clone();
+    let mut hup = hup.lock().await;
     let mut admitted = HashMap::new();
     let mut connection = None;
     let mut next_peer = 0;
@@ -880,6 +985,7 @@ async fn maintain_routes(
                     continue;
                 }
             };
+            accepted.send_replace(new.clone());
             config = new;
             next_peer = 0;
             if !config.pnet_required {
@@ -899,8 +1005,14 @@ async fn maintain_routes(
 
         let end = (next_peer + PNET_QUERY_BATCH).min(configured.peer_app_ids.len());
         let group = &configured.peer_app_ids[next_peer..end];
-        let mut results =
-            pnet_admissions(group, &config.socket_path, &mut connection, &mut pace).await;
+        let mut results = pnet_admissions(
+            group,
+            &config.socket_path,
+            expected_node,
+            &mut connection,
+            &mut pace,
+        )
+        .await;
         let mut changed = false;
         for (peer, _) in group {
             match results.remove(peer) {
@@ -1008,6 +1120,8 @@ async fn wait_for_shutdown() {
 pub enum BridgeError {
     #[error("ipc client: {0}")]
     Client(String),
+    #[error("daemon identity or named endpoint changed")]
+    IdentityChanged,
     #[error("tun: {0}")]
     Tun(#[from] crate::tun::TunError),
     #[error("routing: {0}")]
@@ -1227,7 +1341,9 @@ mod tests {
 
         let updates = tokio::spawn(maintain_routes(
             directory.path().join("unused.toml"),
-            config,
+            watch::channel(config).0,
+            Arc::new(Mutex::new(None)),
+            [0x01; 32],
             configured,
             Arc::clone(&state),
             Arc::clone(&changed),
@@ -1274,18 +1390,87 @@ mod tests {
         let mut pace = tokio::time::interval(PNET_QUERY_SPACING);
         admission.live.store(true, Ordering::Relaxed);
         admission.wrong_peer.store(true, Ordering::Relaxed);
-        let mismatched = pnet_admissions(&group, &socket, &mut connection, &mut pace).await;
+        let mismatched =
+            pnet_admissions(&group, &socket, [0x01; 32], &mut connection, &mut pace).await;
         assert!(mismatched.is_empty());
         assert!(connection.is_none());
 
         admission.wrong_peer.store(false, Ordering::Relaxed);
-        let fresh = pnet_admissions(&group, &socket, &mut connection, &mut pace).await;
+        let fresh = pnet_admissions(&group, &socket, [0x01; 32], &mut connection, &mut pace).await;
         assert_eq!(fresh.get(&peer), Some(&0));
         assert!(connection.is_some());
 
         drop(connection);
         stop.send(true).unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn binding_recovers_after_daemon_restart_without_accepting_another_identity() {
+        use veil_ipc::{IpcEndpoint, IpcServer};
+
+        async fn start(
+            socket: &Path,
+            node: NodeId,
+        ) -> (watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+            let (stop, shutdown) = watch::channel(false);
+            let mut server = IpcServer::new(
+                IpcEndpoint::Unix(socket.to_path_buf()),
+                shutdown,
+                Arc::new(veil_app::AppEndpointRegistry::new()),
+                node,
+            );
+            let task = tokio::spawn(async move { server.run().await.unwrap() });
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !socket.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            (stop, task)
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = cfg();
+        config.socket_path = directory.path().join("ipc");
+        let node = [0xa1; 32];
+        let (stop, daemon) = start(&config.socket_path, node).await;
+        let BoundIpc {
+            mut client,
+            handle,
+            binding,
+        } = bind_ipc(&config, None).await.unwrap();
+        let (_sender, _receiver) = handle.into_split();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), client.wait_disconnected())
+                .await
+                .is_err()
+        );
+
+        stop.send(true).unwrap();
+        daemon.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), client.wait_disconnected())
+            .await
+            .expect("connection close must be observable with split handles alive");
+
+        let (stop, daemon) = start(&config.socket_path, [0xb2; 32]).await;
+        assert!(matches!(
+            bind_ipc(&config, Some(binding)).await,
+            Err(BridgeError::IdentityChanged)
+        ));
+        stop.send(true).unwrap();
+        daemon.await.unwrap();
+
+        let (stop, daemon) = start(&config.socket_path, node).await;
+        let restored =
+            tokio::time::timeout(Duration::from_secs(3), reconnect_ipc(&config, binding))
+                .await
+                .expect("ogate did not rebind after restarting the original daemon");
+        assert!(restored.binding == binding);
+        drop(restored);
+        stop.send(true).unwrap();
+        daemon.await.unwrap();
     }
 
     #[test]
