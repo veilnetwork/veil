@@ -208,7 +208,9 @@ pub(crate) async fn handle_listen_transports_query(
 const PNET_BATCH_BURST: f64 = 1_024.0;
 const PNET_BATCH_LOOKUPS_PER_SEC: f64 = 4_096.0;
 const PNET_BATCH_MAX_IN_FLIGHT: usize = 32;
-const PNET_BATCH_MAX_WAIT: Duration = Duration::from_millis(250);
+// Refill covers 32 full batches in 500 ms from an empty budget. Leave
+// 50 ms for timer granularity and dispatching the queued jobs.
+const PNET_BATCH_MAX_WAIT: Duration = Duration::from_millis(550);
 
 pub(crate) struct PnetStatusQueries {
     provider: Arc<dyn PnetStatusProvider>,
@@ -234,16 +236,19 @@ impl PnetStatusQueries {
         self.provider.authority()
     }
 
-    async fn wait_for_batch_budget(&self, peers: usize) -> bool {
-        tokio::time::timeout(PNET_BATCH_MAX_WAIT, async {
+    async fn wait_for_batch_budget(&self, peers: usize, deadline: Instant) -> bool {
+        tokio::time::timeout_at(deadline, async {
             // Tokio grants the lock in FIFO order. Wait for refill at the
             // head of the queue so another connection cannot take its turn.
             let mut budget = self.batch_budget.lock().await;
             let cost = peers as f64;
             loop {
                 let now = Instant::now();
+                if now >= deadline {
+                    return false;
+                }
                 if budget.allow_n_at(cost, now.into_std()) {
-                    break;
+                    return true;
                 }
                 let wait =
                     Duration::from_secs_f64((cost - budget.tokens()) / PNET_BATCH_LOOKUPS_PER_SEC);
@@ -251,7 +256,7 @@ impl PnetStatusQueries {
             }
         })
         .await
-        .is_ok()
+        .unwrap_or(false)
     }
 
     pub(crate) fn queue_admission_batch(
@@ -280,12 +285,13 @@ impl PnetStatusQueries {
         let queries = Arc::clone(self);
         let peers = peers.to_vec();
         let reply_tx = reply_tx.clone();
+        let deadline = Instant::now() + PNET_BATCH_MAX_WAIT;
         tokio::spawn(async move {
             let _task_slot = task_slot;
             let admitted = tokio::select! {
                 biased;
                 _ = reply_tx.closed() => return,
-                ready = queries.wait_for_batch_budget(peers.len()) => ready,
+                ready = queries.wait_for_batch_budget(peers.len(), deadline) => ready,
             };
             if admitted {
                 let body = queries.batch_reply_body(&peers);
@@ -335,18 +341,47 @@ mod pnet_batch_tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn empty_budget_serves_all_queued_full_batches_at_the_configured_rate() {
+        let queries = PnetStatusQueries::new(Arc::new(UnusedProvider));
+        assert!(
+            queries
+                .batch_budget
+                .lock()
+                .await
+                .allow_n_at(PNET_BATCH_BURST, Instant::now().into_std())
+        );
+
+        let started = Instant::now();
+        let deadline = started + PNET_BATCH_MAX_WAIT;
+        let replies = futures::future::join_all(
+            (0..PNET_BATCH_MAX_IN_FLIGHT)
+                .map(|_| queries.wait_for_batch_budget(PNET_ADMISSION_BATCH_MAX_PEERS, deadline)),
+        )
+        .await;
+        assert_eq!(
+            replies.iter().filter(|&&ready| ready).count(),
+            PNET_BATCH_MAX_IN_FLIGHT,
+        );
+        let lookups = PNET_BATCH_MAX_IN_FLIGHT * PNET_ADMISSION_BATCH_MAX_PEERS;
+        let minimum = Duration::from_secs_f64(lookups as f64 / PNET_BATCH_LOOKUPS_PER_SEC);
+        assert!(started.elapsed() >= minimum);
+        assert!(started.elapsed() <= PNET_BATCH_MAX_WAIT);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn pnet_batch_waits_for_refill_in_order_and_times_out() {
         let queries = PnetStatusQueries::new(Arc::new(UnusedProvider));
         let batch_size = PNET_ADMISSION_BATCH_MAX_PEERS;
         let started = Instant::now();
+        let deadline = started + PNET_BATCH_MAX_WAIT;
         for _ in 0..16 {
-            assert!(queries.wait_for_batch_budget(batch_size).await);
+            assert!(queries.wait_for_batch_budget(batch_size, deadline).await);
         }
         assert_eq!(started.elapsed(), Duration::ZERO);
 
         let batch_period = Duration::from_secs_f64(batch_size as f64 / PNET_BATCH_LOOKUPS_PER_SEC);
         let wait_for_turn = || async {
-            assert!(queries.wait_for_batch_budget(batch_size).await);
+            assert!(queries.wait_for_batch_budget(batch_size, deadline).await);
             started.elapsed()
         };
         let (first, second) = tokio::join!(biased; wait_for_turn(), wait_for_turn());
@@ -356,10 +391,16 @@ mod pnet_batch_tests {
 
         let guard = queries.batch_budget.lock().await;
         let started = Instant::now();
-        assert!(!queries.wait_for_batch_budget(batch_size).await);
+        let deadline = started + PNET_BATCH_MAX_WAIT;
+        assert!(!queries.wait_for_batch_budget(batch_size, deadline).await);
         assert_eq!(started.elapsed(), PNET_BATCH_MAX_WAIT);
         drop(guard);
-        assert!(queries.wait_for_batch_budget(batch_size).await);
+        assert!(!queries.wait_for_batch_budget(batch_size, deadline).await);
+        assert!(
+            queries
+                .wait_for_batch_budget(batch_size, Instant::now() + PNET_BATCH_MAX_WAIT)
+                .await
+        );
     }
 }
 

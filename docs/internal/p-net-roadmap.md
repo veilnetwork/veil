@@ -103,9 +103,14 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 - A daemon that reaches its shared admission-lookup quota now allows
   batches to wait for refill off the IPC connection loop. The daemon
   holds at most 32 outstanding batches for lookup and each may wait up
-  to 250 ms. The lookup budget still allows a burst of 1,024 checks and
-  refills at 4,096 checks/s. The daemon reads current admission after the
-  wait and replies using the original request ID and frame format.
+  to 550 ms from enqueue. A full queue of 64-peer batches needs 500 ms
+  of refill from an empty budget, with 50 ms allowed for timer and
+  dispatch overhead. The lookup budget allows a burst of 1,024 checks
+  and refills at 4,096 checks/s. The daemon reads current admission after
+  the wait and replies using the original request ID and frame format.
+  With the earlier 250 ms deadline, only 16 of 32 queued full batches
+  completed in a paused-clock test. All 32 complete with the new deadline
+  at the same refill rate.
 - An isolated 85 s Linux ARM64 A/B run used twelve ogate instances sharing
   one daemon, 1,024 configured routes per instance, one flapping member
   and one stable member offering UDP at 32 Mb/s. Both runs used the same
@@ -118,6 +123,32 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   datagrams and 1,054 of 1,054 ping replies. Previously it delivered
   265,236 of 308,901 UDP datagrams and 905 of 1,041 ping replies.
   Ping p99 was 5.27 ms with the queue and 5.02 ms before the change.
+- A 180 s Linux ARM64 run with 16 disjoint tables of 1,024 entries and
+  32 authenticated members used the original 250 ms queue. All 14
+  transitions converged within 4.05 s after the daemon confirmed the
+  session change. No gateway lost the stable member's route or logged
+  a failed batch query. Two 16 Mb/s UDP flows delivered 654,300 of
+  654,363 datagrams. The 16 ICMP probes received 11,321 of 11,489 replies.
+  Some probes still saw seconds of delay. The worst per-probe p99 was
+  5.21 s and the longest gap between replies was 8.27 s. The cause of
+  these delays is still open.
+- The next 110 s Linux ARM64 A/B run used 24 disjoint tables of 1,024
+  entries and 48 authenticated members. Both runs used the same ogate
+  binary and test-only identity difficulty. At 250 ms the 24 gateways
+  did not finish setting up all routes within 22 s. One of eight paired
+  session transitions converged within the 9 s measurement window.
+  With the 550 ms deadline, setup finished in 6.10 s and all eight
+  transitions converged in 0.33–7.11 s. Failed batch queries fell from
+  185 to nine. Nine gateways briefly lost the unaffected member's route,
+  down from 24. The two 16 Mb/s UDP flows delivered 383,149 of 394,993
+  datagrams, up from 305,002 of 400,002.
+- That run also recorded multi-second ICMP latency on nine gateways
+  whose routes stayed installed. On the new daemon, all 245 ICMP
+  replies taking at least a second arrived within the first 9.53 s of
+  the traffic sample. The worst per-probe p99 after the first 15 s was
+  13.8 ms. The central TUN counters reported zero kernel drops. The
+  startup delay and the remaining failed admission queries need
+  separate investigation.
 - On two Linux ARM64 nodes with real TUN interfaces and one live certified
   peer at the end of each configured list, the routes appeared within
   0.22 s for 34 entries, 0.66 s for 256, and 2.17 s for 1,024 after
