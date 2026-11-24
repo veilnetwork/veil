@@ -1114,9 +1114,15 @@ impl NodeRuntime {
             trace_buffer: Arc::new(Mutex::new(veil_dispatcher::TraceBuffer::new(
                 config.routing.trace_buffer_size,
             ))),
-            pending_ack: Arc::new(Mutex::new(
-                veil_dispatcher::pending_ack::PendingAckTracker::new(),
-            )),
+            pending_ack: Arc::new(Mutex::new({
+                let tracker = veil_dispatcher::pending_ack::PendingAckTracker::new();
+                if network_gate_arc.is_some() {
+                    let bans = Arc::clone(&ban_list);
+                    tracker.with_recipient_revocation_check(move |peer| lock!(bans).is_banned(peer))
+                } else {
+                    tracker
+                }
+            })),
             // in-line packet loss tracker.
             loss_tracker: Arc::new(veil_routing::loss_tracker::LossTracker::new()),
             // per-origin sequence monotonicity cache.

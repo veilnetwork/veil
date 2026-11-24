@@ -86,7 +86,15 @@ pub enum AckTickOutcome {
         /// doesn't blame a node for a peer being offline (audit cycle-10).
         dst_node_id: [u8; 32],
     },
+    /// The recipient is no longer authorized. Report failure without
+    /// assigning a loss to the relay.
+    Revoked {
+        content_id: [u8; 32],
+        src_app_id: [u8; 32],
+    },
 }
+
+type RecipientRevocationCheck = dyn Fn(&[u8; 32]) -> bool + Send + Sync;
 
 /// Tracks in-flight envelopes that require an end-to-end ACK.
 #[derive(Default)]
@@ -99,6 +107,7 @@ pub struct PendingAckTracker {
     total_bytes: usize,
     per_peer_bytes: HashMap<[u8; 32], usize>,
     limits: TrackerLimits,
+    recipient_revocation_check: Option<Arc<RecipientRevocationCheck>>,
 }
 
 #[derive(Clone, Copy)]
@@ -123,6 +132,16 @@ impl Default for TrackerLimits {
 impl PendingAckTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Read the private network's current revocation state when admitting
+    /// retries or processing the pending queue.
+    pub fn with_recipient_revocation_check(
+        mut self,
+        check: impl Fn(&[u8; 32]) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.recipient_revocation_check = Some(Arc::new(check));
+        self
     }
 
     /// Register a newly sent envelope.
@@ -328,12 +347,16 @@ impl PendingAckTracker {
             .map(|e| (e.next_hop, e.src_app_id, e.ack_key))
     }
 
-    /// Admission must stop if an ACK cleared this message or a new registration
-    /// replaced the attempt while it waited for source capacity.
+    /// Admission must stop if an ACK cleared this message, a new registration
+    /// replaced the attempt or the recipient was revoked while it waited.
     pub fn retry_is_current(&self, content_id: &[u8; 32], attempt: u32) -> bool {
-        self.pending
-            .get(content_id)
-            .is_some_and(|entry| entry.attempts == attempt)
+        self.pending.get(content_id).is_some_and(|entry| {
+            entry.attempts == attempt
+                && !self
+                    .recipient_revocation_check
+                    .as_ref()
+                    .is_some_and(|check| check(&entry.dst_node_id))
+        })
     }
 
     // cleanup: `peek_src_app_id` removed — ended up
@@ -365,19 +388,27 @@ impl PendingAckTracker {
         let per_peer = &mut self.per_peer;
         let per_peer_bytes = &mut self.per_peer_bytes;
         let total_bytes = &mut self.total_bytes;
+        let revocation_check = self.recipient_revocation_check.as_deref();
 
         self.pending.retain(|&content_id, entry| {
-            if now < entry.deadline || in_flight.contains(&content_id) {
+            let revoked = revocation_check.is_some_and(|check| check(&entry.dst_node_id));
+            if !revoked && (now < entry.deadline || in_flight.contains(&content_id)) {
                 return true;
             }
-            if entry.attempts >= MAX_DELIVERY_ATTEMPTS {
-                outcomes.push(AckTickOutcome::Failed {
-                    content_id,
-                    src_app_id: entry.src_app_id,
-                    next_hop: entry.next_hop,
-                    dst_node_id: entry.dst_node_id,
+            if revoked || entry.attempts >= MAX_DELIVERY_ATTEMPTS {
+                outcomes.push(if revoked {
+                    AckTickOutcome::Revoked {
+                        content_id,
+                        src_app_id: entry.src_app_id,
+                    }
+                } else {
+                    AckTickOutcome::Failed {
+                        content_id,
+                        src_app_id: entry.src_app_id,
+                        next_hop: entry.next_hop,
+                        dst_node_id: entry.dst_node_id,
+                    }
                 });
-                // decrement per-peer counter on failure.
                 decrement_peer(per_peer, &entry.dst_node_id);
                 decrement_peer_bytes(per_peer_bytes, &entry.dst_node_id, entry.frame_bytes_len);
                 *total_bytes = total_bytes.saturating_sub(entry.frame_bytes_len);
@@ -504,6 +535,53 @@ mod tests {
         t.register(cid(2), hop(), dst(), src(), [0u8; 32], vec![]);
         assert!(t.tick().is_empty());
         assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn revocation_discards_pending_and_in_flight_entries_and_releases_budget() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let revoked = Arc::new(AtomicBool::new(false));
+        let check = Arc::clone(&revoked);
+        let mut tracker = PendingAckTracker::new().with_recipient_revocation_check(move |peer| {
+            *peer == dst() && check.load(Ordering::Relaxed)
+        });
+        assert!(tracker.register(cid(1), hop(), dst(), src(), [0; 32], vec![1; 64]));
+        assert!(tracker.register_batch(
+            cid(2),
+            hop(),
+            dst(),
+            src(),
+            [0; 32],
+            vec![vec![2; 32], vec![3; 32]],
+        ));
+        let allowed = [0x44; 32];
+        assert!(tracker.register(cid(3), hop(), allowed, src(), [0; 32], vec![3; 16]));
+        let in_flight = HashSet::from([cid(2)]);
+        assert!(tracker.tick_with_batch_admission(&in_flight, 0).is_empty());
+
+        revoked.store(true, Ordering::Relaxed);
+        assert!(!tracker.retry_is_current(&cid(1), 1));
+        let outcomes = tracker.tick_with_batch_admission(&in_flight, 0);
+        let removed: HashSet<_> = outcomes
+            .into_iter()
+            .map(|outcome| match outcome {
+                AckTickOutcome::Revoked {
+                    content_id,
+                    src_app_id,
+                } => {
+                    assert_eq!(src_app_id, src());
+                    content_id
+                }
+                other => panic!("expected revocation, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(removed, HashSet::from([cid(1), cid(2)]));
+        assert_eq!(tracker.total_bytes, 16);
+        assert!(!tracker.per_peer.contains_key(&dst()));
+        assert!(!tracker.per_peer_bytes.contains_key(&dst()));
+        assert!(tracker.retry_is_current(&cid(3), 1));
+        assert!(tracker.tick().is_empty());
     }
 
     #[test]

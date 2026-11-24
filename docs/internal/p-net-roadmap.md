@@ -266,6 +266,30 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   restored the signed revocation after restart. The macOS SDK chat test
   with the previous daemon again delivered 1,000 messages each way.
 
+#### Cancelling acknowledged retries after revocation
+
+- The pending ACK tracker uses the private network's current ban list.
+  It releases the revoked recipient's entries and byte budget on the
+  next tick, including batches already waiting on relay capacity. The
+  origin receives the existing IPC delivery-failure event. A local
+  revocation contributes zero losses to the relay's score.
+- Both single-frame and batch retries recheck admission before sending.
+  A batch also checks immediately before polling asynchronous queue
+  admission. A regression test releases relay capacity just after
+  revocation and before the timer has removed the pending entry. The
+  retry sends zero frames and the relay can accept unrelated traffic.
+- On a three-node Linux stand with separate bridge networks, the
+  relay accepted two acknowledged sends while its egress to the
+  destination was held. The sender learned a signed revocation and
+  the application received two failure notifications 0.79 s after it
+  began the sends. The sender recorded zero retries through the
+  original five-second timeout and retained its session with the relay.
+- In a separate healthy relay run, the destination received the
+  datagram once while the sender received no delivery receipt and
+  retried after the normal timeout. The current delivery receipt
+  sender looks for a direct session to the origin. Returning receipts
+  through intermediate nodes remains open.
+
 ## 3. Distribute owner-authorized peer policy
 
 - Sign a versioned snapshot of virtual address assignments with the

@@ -1832,6 +1832,9 @@ impl NodeRuntime {
                             content_id,
                             attempt,
                         } => {
+                            if !lock!(pending_ack).retry_is_current(&content_id, attempt) {
+                                continue;
+                            }
                             // this attempt timed out without DELIVERY_ACK —
                             // count it as a loss against the in-flight next_hop so the
                             // periodic eval sees fresh data.
@@ -1877,9 +1880,12 @@ impl NodeRuntime {
                             }
                             let reg = rlock!(session_tx_registry);
                             let send_single = |hop: [u8; 32]| -> bool {
-                                frames.first().is_some_and(|frame| {
-                                    try_admit_single_retry(&reg, hop, frame, attempt)
-                                })
+                                let current =
+                                    lock!(pending_ack).retry_is_current(&content_id, attempt);
+                                current
+                                    && frames.first().is_some_and(|frame| {
+                                        try_admit_single_retry(&reg, hop, frame, attempt)
+                                    })
                             };
                             // Try original hop first.
                             let sent = send_single(next_hop);
@@ -1920,6 +1926,12 @@ impl NodeRuntime {
                             // retransmit attempts for this message have been
                             // exhausted. The app receives AppSendFailed on its
                             // IPC stream and can surface a delivery-failure event.
+                            app_registry.route_delivery_failed(src_app_id, content_id);
+                        }
+                        AckTickOutcome::Revoked {
+                            content_id,
+                            src_app_id,
+                        } => {
                             app_registry.route_delivery_failed(src_app_id, content_id);
                         }
                     }

@@ -176,6 +176,9 @@ reports the peer as denied over IPC. A private daemon that knows the
 ban also rejects new addressed application datagrams to that peer
 before route selection. It checks relayed datagram destinations when
 forwarding and checks the sender again before local delivery.
+Pending acknowledged datagrams to a revoked recipient stop retrying,
+including retries that are waiting for relay queue capacity. The
+originating application receives a delivery failure.
 
 Confirm it landed on the receiving nodes:
 ```bash

@@ -1,6 +1,8 @@
 //! Endpoint-owned acknowledged retries. Relay forwarding never uses this.
 
+use std::future::poll_fn;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 use veil_dispatcher::pending_ack::PendingAckTracker;
 use veil_types::FrameBroadcaster;
@@ -32,7 +34,8 @@ pub(super) fn try_admit_single_retry(
 /// Wait for source credits with one admission deadline. A closed original hop
 /// can retry the complete indexed batch on a different hop; a full queue waits
 /// and an admission timeout never sprays a second copy. An authenticated ACK
-/// cancels remaining pieces, including a currently blocked source admission.
+/// or a recipient revocation cancels remaining pieces, including a blocked
+/// source admission.
 pub(super) async fn admit_chunk_retry(
     sender: &dyn FrameBroadcaster,
     tracker: &Mutex<PendingAckTracker>,
@@ -50,21 +53,30 @@ pub(super) async fn admit_chunk_retry(
     if remaining == 0 {
         return None;
     }
+    let can_retry = || lock!(tracker).retry_is_current(&retry.content_id, retry.attempt);
     tokio::time::timeout(Duration::from_secs(remaining), async {
         let alternative = retry.alternative_hop.filter(|hop| *hop != retry.next_hop);
         for hop in std::iter::once(retry.next_hop).chain(alternative) {
             let mut complete = true;
             for frame in retry.frames.iter() {
-                if !lock!(tracker).retry_is_current(&retry.content_id, retry.attempt) {
+                if !can_retry() {
                     return None;
                 }
                 let prepared = super::prepare_ack_retransmit_frame(frame, hop, retry.attempt)?;
                 let mut admission = sender.send_reliable_to(&hop, prepared);
+                let mut guarded = std::pin::pin!(poll_fn(|cx| {
+                    // Capacity can become available before the next timer tick.
+                    // Recheck before polling the future that can consume it.
+                    if !can_retry() {
+                        return Poll::Ready(None);
+                    }
+                    admission.as_mut().poll(cx).map(Some)
+                }));
                 let accepted = loop {
                     tokio::select! {
-                        accepted = &mut admission => { break accepted; }
+                        accepted = &mut guarded => { break accepted?; }
                         _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                            if !lock!(tracker).retry_is_current(&retry.content_id, retry.attempt) {
+                            if !can_retry() {
                                 return None;
                             }
                         }
@@ -436,6 +448,52 @@ mod tests {
             None
         );
         assert_eq!(&*outbox.recv().await.unwrap().1, [0]);
+        assert!(outbox.try_recv().is_err());
+        assert!(sender.send_reliable_to(&[8; 32], vec![2]).await);
+        assert_eq!(&*outbox.recv().await.unwrap().1, [2]);
+    }
+
+    #[tokio::test]
+    async fn revoked_recipient_cannot_consume_new_relay_capacity() {
+        use futures::FutureExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (retry, _, _) = sealed_batch();
+        let revoked = Arc::new(AtomicBool::new(false));
+        let check = Arc::clone(&revoked);
+        let tracker = Mutex::new(
+            tracked(&retry)
+                .into_inner()
+                .unwrap()
+                .with_recipient_revocation_check(move |peer| {
+                    *peer == [2; 32] && check.load(Ordering::Relaxed)
+                }),
+        );
+        let registry = Arc::new(RwLock::new(veil_session::SessionTxRegistry::with_capacity(
+            1,
+        )));
+        let mut outbox = registry.write().unwrap().register([8; 32]);
+        let sender = veil_session::glue::SessionTxBroadcaster::new(registry.clone());
+        assert!(registry.read().unwrap().send_to(
+            &[8; 32],
+            veil_proto::priority::BACKGROUND,
+            vec![0]
+        ));
+        let mut admission = Box::pin(admit_chunk_retry(&sender, &tracker, retry));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut admission)
+                .await
+                .is_err()
+        );
+
+        revoked.store(true, Ordering::Relaxed);
+        assert_eq!(
+            lock!(tracker).len(),
+            1,
+            "the timer has yet to remove the entry"
+        );
+        assert_eq!(&*outbox.recv().await.unwrap().1, [0]);
+        assert_eq!(admission.now_or_never(), Some(None));
         assert!(outbox.try_recv().is_err());
         assert!(sender.send_reliable_to(&[8; 32], vec![2]).await);
         assert_eq!(&*outbox.recv().await.unwrap().1, [2]);
