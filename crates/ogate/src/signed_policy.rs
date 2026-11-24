@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
+use tokio::sync::watch;
 use veil_identity::network_policy::{
     RoutePolicyAuthority, VerifiedRoutePolicy, verify_route_policy,
 };
@@ -16,6 +17,7 @@ use crate::routing::NodeId;
 pub(crate) struct SignedRoutes {
     config: SignedPolicyConfig,
     last: Mutex<Option<Arc<VerifiedRoutePolicy>>>,
+    updates: watch::Sender<u64>,
     pub mirrors: Vec<NodeId>,
     pub publish: bool,
     pub root: PnetTrustRoot,
@@ -33,6 +35,7 @@ impl SignedRoutes {
             publish: config.publish,
             config,
             last: Mutex::new(None),
+            updates: watch::channel(0).0,
         };
         routes.refresh()?;
         Ok(routes)
@@ -53,7 +56,7 @@ impl SignedRoutes {
             .map_err(|_| anyhow::anyhow!("signed policy state lock failed"))?;
         let store = RoutePolicyStore::open(&self.config.state_dir)?;
         match store.try_load(&self.policy_authority()) {
-            Ok(offered) => observe(&mut last, offered),
+            Ok(offered) => self.observe(&mut last, offered),
             Err(StoreError::Busy) => last.clone().ok_or_else(|| StoreError::Busy.into()),
             Err(error) => Err(error.into()),
         }
@@ -66,7 +69,7 @@ impl SignedRoutes {
             .map_err(|_| anyhow::anyhow!("signed policy state lock failed"))?;
         let store = RoutePolicyStore::open(&self.config.state_dir)?;
         let (offered, bytes) = store.try_load_signed(&self.policy_authority())?;
-        Ok((observe(&mut last, offered)?, bytes))
+        Ok((self.observe(&mut last, offered)?, bytes))
     }
 
     pub fn verify_offer(&self, bytes: &[u8]) -> anyhow::Result<VerifiedRoutePolicy> {
@@ -86,7 +89,30 @@ impl SignedRoutes {
         }
         let store = RoutePolicyStore::open(&self.config.state_dir)?;
         let accepted = store.try_accept(bytes, &self.policy_authority())?;
-        Ok(observe(&mut last, accepted)?.revision)
+        Ok(self.observe(&mut last, accepted)?.revision)
+    }
+
+    pub fn updates(&self) -> watch::Receiver<u64> {
+        self.updates.subscribe()
+    }
+
+    fn observe(
+        &self,
+        last: &mut Option<Arc<VerifiedRoutePolicy>>,
+        offered: VerifiedRoutePolicy,
+    ) -> anyhow::Result<Arc<VerifiedRoutePolicy>> {
+        if let Some(accepted) = last.as_ref() {
+            require_monotonic(accepted, &offered)?;
+            if offered.revision == accepted.revision {
+                return Ok(Arc::clone(accepted));
+            }
+        }
+        let offered = Arc::new(offered);
+        *last = Some(Arc::clone(&offered));
+        // This notification carries only the expiry of a verified, durable
+        // snapshot. The route task still reloads the protected store.
+        self.updates.send_replace(offered.valid_until_unix);
+        Ok(offered)
     }
 
     pub fn authenticate(
@@ -122,21 +148,6 @@ fn require_monotonic(
         "signed policy revision has conflicting contents"
     );
     Ok(())
-}
-
-fn observe(
-    last: &mut Option<Arc<VerifiedRoutePolicy>>,
-    offered: VerifiedRoutePolicy,
-) -> anyhow::Result<Arc<VerifiedRoutePolicy>> {
-    if let Some(accepted) = last.as_ref() {
-        require_monotonic(accepted, &offered)?;
-        if offered.revision == accepted.revision {
-            return Ok(Arc::clone(accepted));
-        }
-    }
-    let offered = Arc::new(offered);
-    *last = Some(Arc::clone(&offered));
-    Ok(offered)
 }
 
 pub(crate) fn assigned_peers(

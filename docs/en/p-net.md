@@ -412,14 +412,18 @@ mirrors = ["0000000000000000000000000000000000000000000000000000000000000002"]
 ```
 
 Install new owner-signed snapshots on the publishers. Keep the signing
-key offline. Receivers check for a higher revision every 15 seconds
-over direct, authenticated P-Net sessions with the configured
-publishers. The first check is staggered across receivers. Each side
-requires current daemon-certified membership, and a receiver verifies
-the owner's signature and checks expiry and revision before storing
-the snapshot. An expired snapshot keeps its revision floor, and the
-receiver can still fetch a newer one while its daemon membership is
-current.
+key offline. Receivers normally check for a higher revision every 15
+seconds over direct, authenticated P-Net sessions with the configured
+publishers. The first check is staggered across receivers. As the
+installed policy expires, receivers move toward staggered 4–6 second
+checks. Each receiver runs one round at a time.
+
+Each side requires current daemon-certified membership. A receiver
+verifies the owner's signature, validity and revision before storing
+the snapshot. After storage, ogate wakes the route updater so it can
+read the verified snapshot and recheck route admissions. An expired
+snapshot contributes zero routes and keeps its revision floor. While
+its daemon membership is current, a receiver can fetch a newer snapshot.
 
 Ensure the publishers are reachable over the existing private
 transport. A publisher shares the entire signed address map with

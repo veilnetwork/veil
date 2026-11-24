@@ -192,6 +192,37 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   session and delivered 10 of 10 tunnel probes through an inbound-only
   entry point listed solely in `[[bootstrap_peers]]`.
 
+#### Faster recovery after policy expiry
+
+- Subscribers keep the staggered 15 s cadence while a snapshot has ample
+  validity. After expiry, they use a 4–6 s interval with a
+  per-node offset and a single in-flight round. After a higher
+  authenticated revision has reached durable storage, a local
+  notification wakes the route updater between admission groups. The
+  updater reads the protected store and checks the policy and admissions.
+- The same three nodes ran two control and two candidate trials, with
+  the previous daemon at the last subscriber. The TCP link between
+  sites retained its 2 Mb/s, 60 ms one-way delay and 0.3% loss settings.
+  The last subscriber received the 217,260-byte policy after 23.84 s
+  and 24.07 s with the control and after 8.49 s and 8.55 s with the
+  candidate. All tunnel probes recovered after 27.74 s and 27.68 s
+  with the control and after 9.12 s and 9.13 s with the candidate.
+  Each trial blocked expired routes while the transport was connected.
+  The new revision restored the existing ogate processes and TUN
+  interfaces, and the durable revision floor rejected rollback.
+- In the obfs4 partition run, the last subscriber stored the signed
+  policy after 18.35 s while the inter-site link carried UDP load.
+  The local pair forwarded from the cached policy during the outage
+  until expiry. Link restoration left the expired routes closed.
+  Publishing a current revision restored the original interfaces in
+  17.80 s. The later remote ban blocked the local pair in both
+  directions by the 24.39 s probe.
+- On a separate two-vCPU Linux stand, 32 subscribers resumed
+  simultaneously with expired snapshots and existing daemon sessions.
+  All installed the identical 217,260-byte revision within 0.917 s
+  of resume, with p95 of 0.902 s. The publisher verified requests in
+  groups of 1 and 31. Subsequent TUN probes succeeded for all 32.
+
 ## 3. Distribute owner-authorized peer policy
 
 - Sign a versioned snapshot of virtual address assignments with the

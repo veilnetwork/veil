@@ -1204,6 +1204,7 @@ async fn maintain_routes(
     let mut admitted = HashMap::new();
     let mut connection: Option<Arc<VeilClient>> = None;
     let mut active_policy = None;
+    let mut policy_updates = binding.signed.as_ref().map(|(policy, _)| policy.updates());
     let mut admission_order = None;
     let mut next_peer = 0;
     let mut refresh = tokio::time::interval(PNET_REFRESH_PERIOD);
@@ -1211,21 +1212,33 @@ async fn maintain_routes(
     let mut pace = tokio::time::interval(PNET_QUERY_SPACING);
     pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut retry_due = Instant::now();
+    #[derive(PartialEq, Eq)]
+    enum Wake {
+        Sweep,
+        Reload,
+        Policy,
+    }
     loop {
-        let reload = tokio::select! {
+        let wake = tokio::select! {
             _ = async {
                 if next_peer == 0 {
                     refresh.tick().await;
                 }
-            }, if config.pnet_required => false,
+            }, if config.pnet_required => Wake::Sweep,
             _ = async {
                 match hup.as_mut() {
                     Some(hup) => hup.recv().await,
                     None => std::future::pending().await,
                 }
-            } => true,
+            } => Wake::Reload,
+            _ = async {
+                match policy_updates.as_mut() {
+                    Some(updates) => { let _ = updates.changed().await; }
+                    None => std::future::pending().await,
+                }
+            } => Wake::Policy,
         };
-        if reload {
+        if wake == Wake::Reload {
             let new = match OgateConfig::from_path(&config_path) {
                 Ok(new) => new,
                 Err(error) => {
@@ -1275,7 +1288,7 @@ async fn maintain_routes(
         }
 
         if let Some((policy, authority)) = &binding.signed
-            && next_peer == 0
+            && (next_peer == 0 || wake == Wake::Policy)
         {
             let update = build_signed_update(
                 Arc::clone(policy),
@@ -1333,6 +1346,7 @@ async fn maintain_routes(
                 }
             };
             if changed {
+                next_peer = 0;
                 publish_routes(
                     configured.with_pnet_admissions(&admitted),
                     &state,

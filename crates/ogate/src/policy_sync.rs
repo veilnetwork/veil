@@ -8,7 +8,7 @@ use anyhow::{Context as _, ensure};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
-use tokio::time::{Instant, MissedTickBehavior, interval, interval_at, timeout};
+use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout};
 use veil_identity::network_policy::{MAX_SIGNED_ROUTE_POLICY_BYTES, VerifiedRoutePolicy};
 use veil_util::unix_secs_now_u64;
 use veilclient::{
@@ -23,6 +23,8 @@ const REQUEST_MAGIC: [u8; 4] = *b"PNP1";
 const SERVICE: &str = "route-policy-v1";
 const ENDPOINT: u32 = 1;
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
+const RECOVERY_POLL_MIN_MS: u64 = 4_000;
+const RECOVERY_POLL_JITTER_MS: u64 = 2_000;
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(12);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_SERVING: usize = PNET_ADMISSION_BATCH_MAX_PEERS;
@@ -272,23 +274,40 @@ async fn subscribe(policy: &Arc<SignedRoutes>, distribution: &Distribution<'_>) 
         return;
     }
 
-    let jitter = Duration::from_millis(
-        u64::from(u16::from_be_bytes([
-            distribution.node[0],
-            distribution.node[1],
-        ])) % 15_000,
-    );
-    let mut polls = interval_at(Instant::now() + jitter, POLL_INTERVAL);
-    polls.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let expiry = policy.updates();
+    let phase = u64::from(u16::from_be_bytes([
+        distribution.node[0],
+        distribution.node[1],
+    ]));
+    let window = poll_interval(*expiry.borrow(), unix_secs_now_u64(), phase);
+    let jitter = Duration::from_millis(phase % window.as_millis() as u64);
+    let mut next = Instant::now() + jitter;
     loop {
-        polls.tick().await;
+        sleep_until(next).await;
+        let started = Instant::now();
         if !distribution.authority.is_current(unix_secs_now_u64()) {
             return;
         }
         if let Err(error) = poll_mirrors(policy, distribution, &mirrors).await {
             tracing::debug!(%error, "P-Net policy refresh failed");
         }
+        let delay = poll_interval(*expiry.borrow(), unix_secs_now_u64(), phase);
+        let now = Instant::now();
+        next = started + delay;
+        if next <= now {
+            next = now + delay;
+        }
     }
+}
+
+fn poll_interval(valid_until: u64, now: u64, phase: u64) -> Duration {
+    if now == 0 {
+        return POLL_INTERVAL;
+    }
+    let remaining = Duration::from_secs(valid_until.saturating_sub(now));
+    let recovery = Duration::from_millis(RECOVERY_POLL_MIN_MS + phase % RECOVERY_POLL_JITTER_MS);
+    // Start the recovery cadence near expiry and spread the load across nodes.
+    POLL_INTERVAL.min(remaining.saturating_add(recovery))
 }
 
 struct Offer {
@@ -477,6 +496,15 @@ fn authorized(authority: PnetAuthority, admission: PnetAdmission, now: u64) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_polling_is_staggered_and_bounded() {
+        assert_eq!(poll_interval(90, 0, 0), POLL_INTERVAL);
+        assert_eq!(poll_interval(120, 100, 0), POLL_INTERVAL);
+        assert_eq!(poll_interval(102, 100, 0), Duration::from_secs(6));
+        assert_eq!(poll_interval(100, 100, 0), Duration::from_secs(4));
+        assert_eq!(poll_interval(90, 100, 1_999), Duration::from_millis(5_999));
+    }
 
     #[test]
     fn distribution_requires_both_memberships_to_be_current() {
