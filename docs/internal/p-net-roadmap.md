@@ -94,6 +94,30 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   stand, a ban withdrew the route in 4.78 s. While the sender kept
   running, the receiver's TUN counter stopped advancing after withdrawal.
 
+### Sustained Linux load
+
+- The stand uses two Linux ARM64 vCPUs, 14 nodes, and a 217,260-byte
+  signed policy with 4,096 assignments. One node runs the previous
+  daemon, and three policy stores have recovery enrolled. Two paced UDP
+  flows offer 16 Mb/s each, with one persistent TCP flow offering about
+  8 Mb/s. Mirrors poll normally during the load.
+- In the first run, the 13 subscribers installed revisions 2 and 3
+  within 14.06 s and 13.35 s respectively. After restarting one
+  subscriber's daemon, the restarted daemon opened a private session
+  about 5 s after launch. The two ogate processes needed subsequent
+  full admission sweeps, and the tunnel missed the 18 s recovery probe.
+- Signed mode now remembers recently verified peer IDs as query hints
+  for 30 s, including across a daemon reconnect. A bounded round-robin
+  retry uses the existing per-connection pace at most once per second
+  while the normal sweep continues. A new binding still starts with
+  no admitted routes. Each retry requires a fresh positive daemon reply.
+- In the next run, the restarted daemon's tunnel answered 1.47 s after
+  launch with the original ogate process and TUN interface. The same
+  node then missed the next policy update. Its mirror stream opens were
+  repeatedly refused after the restart, while the other 12 subscribers
+  installed the revision. This run isolated a separate APP stream
+  teardown problem.
+
 ## 3. Distribute owner-authorized peer policy
 
 - Sign a versioned snapshot of virtual address assignments with the

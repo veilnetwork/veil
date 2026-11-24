@@ -17,16 +17,18 @@
 //!
 //! On `ctrl_c` / `SIGTERM` all tasks exit and the function returns.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::ops::Bound::{Excluded, Unbounded};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Mutex, Notify, watch};
+use tokio::time::Instant;
 use veil_identity::network_policy::VerifiedRoutePolicy;
 use veil_util::unix_secs_now_u64;
 use veilclient::client::PnetStatus;
@@ -231,6 +233,47 @@ const PNET_LEGACY_QUERY_GROUP: usize = 16;
 // Daemons admit 10 local queries per second per IPC client. Leave room for
 // other local queries and avoid consuming the burst quota at startup.
 const PNET_QUERY_SPACING: Duration = Duration::from_millis(125);
+const PNET_RETRY_PERIOD: Duration = Duration::from_secs(1);
+const PNET_RECENT_WINDOW: Duration = Duration::from_secs(30);
+
+/// Scheduling hints from the previous authenticated checks. They survive an
+/// IPC rebind, while the route table starts with no admissions on each bind.
+#[derive(Default)]
+struct RecentAdmissions {
+    seen: BTreeMap<NodeId, Instant>,
+    cursor: NodeId,
+}
+
+impl RecentAdmissions {
+    fn retry_group(
+        &mut self,
+        peers: &[(NodeId, [u8; 32])],
+        admitted: &HashMap<NodeId, u64>,
+        now: Instant,
+    ) -> Vec<(NodeId, [u8; 32])> {
+        self.seen.retain(|peer, seen| {
+            now.duration_since(*seen) < PNET_RECENT_WINDOW
+                && peers.binary_search_by_key(peer, |(id, _)| *id).is_ok()
+        });
+        let group: Vec<_> = self
+            .seen
+            .range((Excluded(self.cursor), Unbounded))
+            .chain(self.seen.range(..=self.cursor))
+            .filter(|(peer, _)| !admitted.contains_key(*peer))
+            .filter_map(|(peer, _)| {
+                peers
+                    .binary_search_by_key(peer, |(id, _)| *id)
+                    .ok()
+                    .map(|index| peers[index])
+            })
+            .take(veilclient::PNET_ADMISSION_BATCH_MAX_PEERS)
+            .collect();
+        if let Some((peer, _)) = group.last() {
+            self.cursor = *peer;
+        }
+        group
+    }
+}
 
 fn pnet_status_admits(peer: &NodeId, status: &PnetStatus, now: u64) -> bool {
     status.peer_node_id == *peer
@@ -509,6 +552,7 @@ struct Bridge {
 struct RouteBinding {
     node_id: NodeId,
     signed: Option<(Arc<SignedRoutes>, PnetAuthority)>,
+    recent: Arc<SyncMutex<RecentAdmissions>>,
 }
 
 enum LinkExit {
@@ -600,9 +644,10 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
         signed,
     };
     let mut stopping = std::pin::pin!(wait_for_shutdown());
+    let recent = Arc::new(SyncMutex::new(RecentAdmissions::default()));
 
     loop {
-        match serve_link(&bridge, link, stopping.as_mut()).await? {
+        match serve_link(&bridge, link, Arc::clone(&recent), stopping.as_mut()).await? {
             LinkExit::Shutdown => return Ok(()),
             LinkExit::DaemonDisconnected => tracing::warn!("ogate IPC disconnected; rebinding"),
         }
@@ -617,6 +662,7 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
 async fn serve_link(
     bridge: &Bridge,
     link: BoundIpc,
+    recent: Arc<SyncMutex<RecentAdmissions>>,
     mut stopping: Pin<&mut impl Future<Output = ()>>,
 ) -> Result<LinkExit, BridgeError> {
     let BoundIpc {
@@ -1007,6 +1053,7 @@ async fn serve_link(
         RouteBinding {
             node_id: binding.node_id,
             signed,
+            recent,
         },
         configured,
         Arc::clone(&state),
@@ -1118,6 +1165,34 @@ fn prioritize_signed_admissions(
     Some(order)
 }
 
+fn apply_admissions(
+    group: &[(NodeId, [u8; 32])],
+    mut results: HashMap<NodeId, u64>,
+    admitted: &mut HashMap<NodeId, u64>,
+    binding: &RouteBinding,
+) -> bool {
+    let mut recent = binding.signed.as_ref().map(|_| {
+        binding
+            .recent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
+    let now = Instant::now();
+    let mut changed = false;
+    for (peer, _) in group {
+        match results.remove(peer) {
+            Some(expiry) => {
+                if let Some(recent) = recent.as_mut() {
+                    recent.seen.insert(*peer, now);
+                }
+                changed |= admitted.insert(*peer, expiry) != Some(expiry);
+            }
+            None => changed |= admitted.remove(peer).is_some(),
+        }
+    }
+    changed
+}
+
 async fn maintain_routes(
     config_path: PathBuf,
     accepted: watch::Sender<OgateConfig>,
@@ -1138,6 +1213,7 @@ async fn maintain_routes(
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pace = tokio::time::interval(PNET_QUERY_SPACING);
     pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut retry_due = Instant::now();
     loop {
         let reload = tokio::select! {
             _ = async {
@@ -1280,6 +1356,32 @@ async fn maintain_routes(
                 connect_pnet_status(&config.socket_path, binding.node_id, authority, &mut pace)
                     .await;
         }
+        if let Some(client) = &connection
+            && binding.signed.is_some()
+            && Instant::now() >= retry_due
+        {
+            let now = Instant::now();
+            retry_due = now + PNET_RETRY_PERIOD;
+            let retry = binding
+                .recent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retry_group(&configured.peer_app_ids, &admitted, now);
+            if !retry.is_empty() {
+                match query_pnet_batch(client, &retry, &mut pace).await {
+                    Some(results) => {
+                        if apply_admissions(&retry, results, &mut admitted, &binding) {
+                            publish_routes(
+                                configured.with_pnet_admissions(&admitted),
+                                &state,
+                                &route_changes,
+                            );
+                        }
+                    }
+                    None => connection = None,
+                }
+            }
+        }
         let end;
         let results;
         if let Some(client) = &connection {
@@ -1299,7 +1401,7 @@ async fn maintain_routes(
             end = 0;
             results = None;
         }
-        let Some(mut results) = results else {
+        let Some(results) = results else {
             connection = None;
             next_peer = 0;
             if !admitted.is_empty() {
@@ -1313,14 +1415,7 @@ async fn maintain_routes(
             continue;
         };
         let group = &order[next_peer..end];
-        let mut changed = false;
-        for (peer, _) in group {
-            match results.remove(peer) {
-                Some(expiry) => changed |= admitted.insert(*peer, expiry) != Some(expiry),
-                None => changed |= admitted.remove(peer).is_some(),
-            }
-        }
-        if changed {
+        if apply_admissions(group, results, &mut admitted, &binding) {
             publish_routes(
                 configured.with_pnet_admissions(&admitted),
                 &state,
@@ -1704,6 +1799,26 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn signed_retry_uses_bounded_round_robin_and_prunes_old_candidates() {
+        let now = Instant::now();
+        let peers: Vec<_> = (1..=67).map(|id| ([id; 32], [0; 32])).collect();
+        let mut recent = RecentAdmissions {
+            seen: (1..=68).map(|id| ([id; 32], now)).collect(),
+            cursor: [0; 32],
+        };
+        recent.seen.insert([2; 32], now - PNET_RECENT_WINDOW);
+        let live = HashMap::from([([1; 32], 0)]);
+
+        let batch = recent.retry_group(&peers, &live, now);
+        assert_eq!(batch.len(), veilclient::PNET_ADMISSION_BATCH_MAX_PEERS);
+        assert_eq!(batch[0].0, [3; 32]);
+        assert_eq!(batch.last().unwrap().0, [66; 32]);
+        assert_eq!(recent.retry_group(&peers, &live, now)[0].0, [67; 32]);
+        assert!(!recent.seen.contains_key(&[2; 32]));
+        assert!(!recent.seen.contains_key(&[68; 32]));
+    }
+
     #[tokio::test]
     async fn pnet_routes_follow_daemon_admission_without_reload() {
         tokio::join!(
@@ -1796,6 +1911,7 @@ mod tests {
             RouteBinding {
                 node_id: [0x01; 32],
                 signed: None,
+                recent: Arc::default(),
             },
             configured,
             Arc::clone(&state),
