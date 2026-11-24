@@ -260,6 +260,11 @@ impl AppEndpointRegistry {
             .is_some_and(|check| check(peer))
     }
 
+    /// The runtime dispatches datagrams under a private-network policy.
+    pub fn peer_revocations_enabled(&self) -> bool {
+        self.peer_revocation_check.is_some()
+    }
+
     /// Wire in auto-publish so every `register` / `try_register` call
     /// announces the endpoint to the discovery service.
     ///

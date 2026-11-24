@@ -2730,6 +2730,137 @@ mod tests {
     use veil_util::rlock;
 
     #[test]
+    fn partial_shared_link_returns_the_original_keyed_receipt_after_failover() {
+        use crate::{CryptoContext, FrameDispatcher, make_test_dispatcher};
+        use std::sync::{Arc, RwLock};
+        use veil_proto::delivery::{
+            ChunkContentCommitment, ChunkedEnvelopePayload, DeliveryEnvelope,
+            DeliveryStatusPayload, ForwardPayload,
+        };
+        use veil_proto::family::{DeliveryMsg, FrameFamily};
+        use veil_proto::header::{FrameHeader, HEADER_SIZE};
+        use veil_proto::recipient::Recipient;
+        use veil_session::SessionTxRegistry;
+        use veil_util::wlock;
+
+        let (source, destination, app) = ([1; 32], [2; 32], [3; 32]);
+        let (shared, previous, alternate, other) = ([4; 32], [5; 32], [6; 32], [7; 32]);
+        let mut relay = make_test_dispatcher(veil_cfg::NodeRole::Core);
+        relay.local_node_id = shared;
+        relay.relay_delivery_acks = Some(Default::default());
+        let routes = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let prior_rx = wlock!(routes).register(previous);
+        let mut onward_rx = wlock!(routes).register(destination);
+        let mut alternate_rx = wlock!(routes).register(alternate);
+        relay.session_tx_registry = Some(routes);
+
+        let mut terminal = make_test_dispatcher(veil_cfg::NodeRole::Core);
+        terminal.local_node_id = destination;
+        terminal.relay_delivery_acks = Some(Default::default());
+        let routes = Arc::new(RwLock::new(SessionTxRegistry::new()));
+        let mut receipt_rx = wlock!(routes).register(shared);
+        terminal.session_tx_registry = Some(routes);
+        let (_endpoint, mut delivered) = terminal.app_registry.register(app, 1, 8);
+
+        let (ek, dk) = veil_e2e::generate_keypair();
+        let plaintext = vec![0x3A; 4096];
+        let (ciphertext, ack_key) =
+            veil_e2e::encrypt_with_ack(&ek, &source, &destination, &plaintext).unwrap();
+        terminal.crypto = Arc::new(CryptoContext {
+            mlkem_keys: Arc::new(veil_e2e::MlKemSeedRing::new(0, dk, ek)),
+            ..(*terminal.crypto).clone()
+        });
+        let mut sealed = vec![veil_proto::E2E_MARKER];
+        sealed.extend(ciphertext.encode());
+        let transfer_id = [8; 16];
+        let envelope = DeliveryEnvelope {
+            recipient: Recipient::any(destination),
+            sender_node_id: source,
+            src_app_id: [9; 32],
+            app_id: app,
+            endpoint_id: 1,
+            content_id: [0; 32],
+            created_at: veil_util::unix_secs_now_u64(),
+            ttl_secs: 30,
+            payload: Vec::new(),
+            trace_id: 0,
+            require_ack: false,
+        };
+        let parts = sealed.chunks(2000).collect::<Vec<_>>();
+        assert_eq!(parts.len(), 3);
+        let mut commitment =
+            ChunkContentCommitment::new(&envelope, transfer_id, 3, sealed.len() as u32);
+        for part in &parts {
+            commitment.append(ChunkContentCommitment::leaf(part));
+        }
+        let content_id = commitment.content_id();
+        let send = |dispatcher: &FrameDispatcher, peer, index: usize, carrier_id| {
+            let payload = ChunkedEnvelopePayload {
+                transfer_id,
+                chunk_index: index as u32,
+                chunk_count: 3,
+                total_size: sealed.len() as u32,
+                orig_content_id: content_id,
+                require_ack: true,
+                data: parts[index].to_vec(),
+            }
+            .encode_committed();
+            let body = ForwardPayload {
+                next_hop_node_id: dispatcher.local_node_id,
+                envelope: DeliveryEnvelope {
+                    payload,
+                    content_id: [carrier_id; 32],
+                    ..envelope.clone()
+                },
+                relay_hops: 1,
+                delivery_attempt: None,
+                traffic_class: None,
+            }
+            .encode();
+            let mut header =
+                FrameHeader::new(FrameFamily::Delivery as u8, DeliveryMsg::Forward as u16);
+            header.body_len = body.len() as u32;
+            dispatcher.dispatch(&header, &body, peer);
+        };
+        let dispatch_wire = |dispatcher: &FrameDispatcher, peer, frame: &[u8]| {
+            dispatcher.dispatch(
+                &veil_proto::codec::decode_header(frame).unwrap(),
+                &frame[HEADER_SIZE..],
+                peer,
+            );
+        };
+
+        // The shared relay only forwarded the tail on the original pass.
+        send(&terminal, other, 0, 10);
+        send(&terminal, other, 1, 11);
+        send(&relay, previous, 2, 12);
+        dispatch_wire(&terminal, shared, &onward_rx.try_recv().unwrap().1);
+        assert!(
+            matches!(delivered.try_recv(), Ok(veil_app::registry::AppMessage::Deliver { data, .. }) if *data == plaintext)
+        );
+        let initial_receipt = receipt_rx.try_recv().unwrap().1;
+        drop(prior_rx);
+        dispatch_wire(&relay, destination, &initial_receipt);
+        assert!(alternate_rx.try_recv().is_err());
+
+        for index in 0..3 {
+            send(&relay, alternate, index, 20 + index as u8);
+            dispatch_wire(&terminal, shared, &onward_rx.try_recv().unwrap().1);
+        }
+        // Leave fresh receipts in the terminal queue. Only the stored
+        // authenticated downstream response can reach the new upstream here.
+        let returned = alternate_rx.try_recv().unwrap().1;
+        assert_eq!(&*returned, &*initial_receipt);
+        let receipt = DeliveryStatusPayload::decode(&returned[HEADER_SIZE..]).unwrap();
+        assert_eq!(receipt.content_id, content_id);
+        assert_eq!(
+            receipt.mac,
+            *crate::relay_delivery_ack::receipt_mac(&ack_key, &content_id, true).as_bytes()
+        );
+        assert!(delivered.try_recv().is_err());
+    }
+
+    #[test]
     fn completed_chunks_return_an_ack_on_a_new_path_only_after_matching_the_tag() {
         use crate::{CryptoContext, make_test_dispatcher};
         use std::sync::{Arc, RwLock};

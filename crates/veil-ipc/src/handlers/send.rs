@@ -2657,9 +2657,21 @@ async fn handle_ipc_send_inner(
                 if recipient_revoked() {
                     return app_send_error(sink, ipc_send_err::NO_ROUTE).await;
                 }
-                // content_id = BLAKE3(rand32 || sender_node_id || dst_node_id || payload)
-                // Unique per message; used by relays for dedup/replay prevention.
-                let content_id: [u8; 32] = {
+                let segment_size = if relay_realtime {
+                    veil_proto::budget::MAX_CHUNK_PAYLOAD
+                } else {
+                    source_segment_bytes(reg, final_payload.len())
+                };
+                let use_chunks = (!relay_realtime && final_payload.len() > segment_size)
+                    || final_payload.len() > veil_proto::delivery::ENVELOPE_CHUNKING_THRESHOLD;
+                let commit_chunks = use_chunks
+                    && send.require_ack
+                    && ack_key != [0; 32]
+                    && ctx.app_registry.peer_revocations_enabled();
+                // The chunk encoder assigns its own ID after indexing the ciphertext.
+                let content_id: [u8; 32] = if commit_chunks {
+                    [0; 32]
+                } else {
                     use rand_core::RngCore;
                     let mut nonce = [0u8; 32];
                     rand_core::OsRng.fill_bytes(&mut nonce);
@@ -2746,22 +2758,19 @@ async fn handle_ipc_send_inner(
                 // NO_ROUTE on the relay path) and reassembled via a metadata-
                 // losing epidemic broadcast.
                 //
-                if (!relay_realtime
-                    && envelope.payload.len() > source_segment_bytes(reg, envelope.payload.len()))
-                    || envelope.payload.len() > veil_proto::delivery::ENVELOPE_CHUNKING_THRESHOLD
-                {
-                    let segment_size = if relay_realtime {
-                        veil_proto::budget::MAX_CHUNK_PAYLOAD
-                    } else {
-                        source_segment_bytes(reg, envelope.payload.len())
-                    };
+                if use_chunks {
                     let want_ack = send.require_ack;
-                    let orig_content_id = envelope.content_id;
                     let Some(chunks) = EnvelopeChunks::new(&envelope, want_ack, segment_size)
                     else {
                         timing.relay_status.set("invalid");
                         return app_send_error(sink, ipc_send_err::NO_ROUTE).await;
                     };
+                    let chunks = if commit_chunks {
+                        chunks.with_content_commitment()
+                    } else {
+                        chunks
+                    };
+                    let orig_content_id = chunks.content_id();
                     let hops_to_try = forced_relay_hops.clone();
 
                     // Stream every chunk to the first hop that accepts them all.
@@ -3967,10 +3976,16 @@ mod ratchet_send_tests {
 
     #[tokio::test]
     async fn routed_envelope_segments_keep_crypto_metadata_ack_and_wire_bound() {
-        for size in [12_000, 100_000] {
+        use veil_proto::delivery::{ChunkContentCommitment, ChunkedEnvelopePayload};
+
+        for (size, private_network) in [(12_000, false), (100_000, false), (12_000, true)] {
             let fx = fixture(vec![RELAY]);
             let capture = Arc::new(LaneCapture::default());
             let mut ctx = fx.ctx(true);
+            if private_network {
+                ctx.app_registry =
+                    Arc::new(AppEndpointRegistry::new().with_peer_revocation_check(|_| false));
+            }
             ctx.session_tx_registry = Some(capture.clone());
             let tracker = Arc::new(Mutex::new(veil_pending_ack::PendingAckTracker::default()));
             ctx.pending_ack = Some(tracker.clone());
@@ -3988,6 +4003,7 @@ mod ratchet_send_tests {
             );
             let mut joined = Vec::new();
             let mut transfer = None;
+            let mut commitment = None;
             let mut cids = std::collections::HashSet::new();
             for (index, (lane, frame)) in frames.iter().enumerate() {
                 assert_eq!(*lane, veil_proto::priority::BACKGROUND);
@@ -4011,17 +4027,34 @@ mod ratchet_send_tests {
                 assert_eq!(f.envelope.endpoint_id, request.endpoint_id);
                 assert!(!f.envelope.require_ack);
                 assert!(cids.insert(f.envelope.content_id));
-                let chunk =
-                    veil_proto::delivery::ChunkedEnvelopePayload::decode(&f.envelope.payload)
-                        .unwrap();
+                assert_eq!(
+                    ChunkedEnvelopePayload::commits_content(&f.envelope.payload),
+                    private_network
+                );
+                let chunk = ChunkedEnvelopePayload::decode(&f.envelope.payload).unwrap();
                 assert_eq!(chunk.chunk_index, index as u32);
                 assert_eq!(chunk.chunk_count as usize, frames.len());
                 assert!(chunk.require_ack);
                 let identity = (chunk.transfer_id, chunk.orig_content_id, chunk.total_size);
                 assert_eq!(*transfer.get_or_insert(identity), identity);
+                if private_network {
+                    commitment
+                        .get_or_insert_with(|| {
+                            ChunkContentCommitment::new(
+                                &f.envelope,
+                                chunk.transfer_id,
+                                chunk.chunk_count,
+                                chunk.total_size,
+                            )
+                        })
+                        .append(ChunkContentCommitment::leaf(&chunk.data));
+                }
                 joined.extend(chunk.data);
             }
             let (_, original, total) = transfer.unwrap();
+            if let Some(commitment) = commitment {
+                assert_eq!(original, commitment.content_id());
+            }
             assert_eq!(joined.len(), total as usize);
             assert_eq!(
                 lock!(tracker).tracked_frame_count(&original),

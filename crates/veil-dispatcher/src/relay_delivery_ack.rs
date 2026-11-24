@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use veil_proto::delivery::{CHUNKED_ENVELOPE_MARKER, ChunkedEnvelopePayload, ForwardPayload};
+use veil_proto::delivery::{
+    CHUNKED_ENVELOPE_MARKER, ChunkContentCommitment, ChunkedEnvelopePayload, ForwardPayload,
+};
 use veil_types::NodeIdBytes;
 
 use crate::ExpiryMap;
@@ -22,10 +24,9 @@ pub(crate) fn receipt_mac(key: &[u8; 32], content_id: &[u8; 32], relayed: bool) 
 enum MessageBinding {
     Sealed(blake3::Hash),
     Chunked {
-        transfer_id: [u8; 16],
+        seed: ChunkContentCommitment,
         count: u32,
-        size: u32,
-        addressing: blake3::Hash,
+        committed: bool,
     },
 }
 
@@ -62,19 +63,28 @@ impl ForwardAck {
             ),
             CHUNKED_ENVELOPE_MARKER => {
                 let header = ChunkedEnvelopePayload::acknowledged_chunk_header(&envelope.payload)?;
+                let committed = ChunkedEnvelopePayload::commits_content(&envelope.payload);
                 (
                     header.orig_content_id,
                     MessageBinding::Chunked {
-                        transfer_id: header.transfer_id,
+                        seed: ChunkContentCommitment::new(
+                            envelope,
+                            header.transfer_id,
+                            header.chunk_count,
+                            header.total_size,
+                        ),
                         count: header.chunk_count,
-                        size: header.total_size,
-                        addressing: crate::chunk_receipt::addressing(envelope),
+                        committed,
                     },
                     Some(ChunkAdmission {
                         index: header.chunk_index,
                         // The outer carrier ID changes on retry. The indexed
                         // chunk header and ciphertext it encloses do not.
-                        hash: blake3::hash(&envelope.payload),
+                        hash: ChunkContentCommitment::leaf(if committed {
+                            &envelope.payload[ChunkedEnvelopePayload::HEADER_SIZE..]
+                        } else {
+                            &envelope.payload
+                        }),
                     }),
                 )
             }
@@ -122,21 +132,21 @@ const MAX_ALTERNATE_PASSES: usize = 2;
 struct ChunkPass {
     previous: NodeIdBytes,
     next_index: u32,
-    digest: blake3::Hash,
+    digest: ChunkContentCommitment,
     reordered: Vec<ChunkAdmission>,
 }
 
 impl ChunkPass {
-    fn new(previous: NodeIdBytes) -> Self {
+    fn new(previous: NodeIdBytes, seed: ChunkContentCommitment) -> Self {
         Self {
             previous,
             next_index: 0,
-            digest: blake3::hash(b"veil/pnet/relay-chunk-pass/v1"),
+            digest: seed,
             reordered: Vec::new(),
         }
     }
 
-    fn observe(&mut self, chunk: ChunkAdmission, count: u32) -> Option<blake3::Hash> {
+    fn observe(&mut self, chunk: ChunkAdmission, count: u32) -> Option<[u8; 32]> {
         if chunk.index > self.next_index {
             if self.reordered.len() < MAX_REORDERED_CHUNKS
                 && !self.reordered.iter().any(|seen| seen.index == chunk.index)
@@ -157,40 +167,54 @@ impl ChunkPass {
             let next = self.reordered.swap_remove(position);
             self.append(next.hash);
         }
-        (self.next_index == count).then_some(self.digest)
+        (self.next_index == count).then(|| self.digest.content_id())
     }
 
     fn append(&mut self, hash: blake3::Hash) {
-        // Hash a fixed-size node with the prefix for internal nodes. A leaf
-        // starts with the chunk wire marker and includes its index.
-        let mut node = [1; 65];
-        node[1..33].copy_from_slice(self.digest.as_bytes());
-        node[33..].copy_from_slice(hash.as_bytes());
-        self.digest = blake3::hash(&node);
+        self.digest.append(hash);
         self.next_index += 1;
     }
 }
 
 struct ChunkRoute {
-    original: ChunkPass,
-    commitment: Option<blake3::Hash>,
+    original: Option<ChunkPass>,
+    commitment: Option<[u8; 32]>,
     alternates: Vec<ChunkPass>,
     fallback: Option<NodeIdBytes>,
     last_receipt: Option<[u8; 32]>,
 }
 
 impl ChunkRoute {
-    fn new(previous: NodeIdBytes) -> Self {
+    fn new(
+        previous: NodeIdBytes,
+        seed: ChunkContentCommitment,
+        commitment: Option<[u8; 32]>,
+    ) -> Self {
         Self {
-            original: ChunkPass::new(previous),
-            commitment: None,
+            original: commitment.is_none().then(|| ChunkPass::new(previous, seed)),
+            commitment,
             alternates: Vec::new(),
             fallback: None,
             last_receipt: None,
         }
     }
 
-    fn matches_replay(&mut self, previous: NodeIdBytes, chunk: ChunkAdmission, count: u32) -> bool {
+    fn observe_original(&mut self, chunk: ChunkAdmission, count: u32) {
+        if let Some(pass) = &mut self.original
+            && let Some(commitment) = pass.observe(chunk, count)
+        {
+            self.commitment = Some(commitment);
+            self.original = None;
+        }
+    }
+
+    fn matches_replay(
+        &mut self,
+        previous: NodeIdBytes,
+        chunk: ChunkAdmission,
+        count: u32,
+        seed: ChunkContentCommitment,
+    ) -> bool {
         let Some(commitment) = self.commitment else {
             return false;
         };
@@ -206,7 +230,7 @@ impl ChunkRoute {
             None if chunk.index < MAX_REORDERED_CHUNKS as u32
                 && self.alternates.len() < MAX_ALTERNATE_PASSES =>
             {
-                self.alternates.push(ChunkPass::new(previous));
+                self.alternates.push(ChunkPass::new(previous, seed));
                 self.alternates.len() - 1
             }
             None => return false,
@@ -241,11 +265,21 @@ impl RelayDeliveryAcks {
     ) -> Option<[u8; 32]> {
         let key = (forward.content_id, downstream);
         let Some(route) = self.0.get_mut(&key) else {
-            let chunks = if let (MessageBinding::Chunked { count, .. }, Some(chunk)) =
-                (forward.binding, forward.chunk)
+            let chunks = if let (
+                MessageBinding::Chunked {
+                    count,
+                    seed,
+                    committed,
+                },
+                Some(chunk),
+            ) = (forward.binding, forward.chunk)
             {
-                let mut state = ChunkRoute::new(forward.previous);
-                state.commitment = state.original.observe(chunk, count);
+                let mut state = ChunkRoute::new(
+                    forward.previous,
+                    seed,
+                    committed.then_some(forward.content_id),
+                );
+                state.observe_original(chunk, count);
                 Some(Box::new(state))
             } else {
                 None
@@ -263,15 +297,13 @@ impl RelayDeliveryAcks {
         if !route.forward.same_message(&forward) {
             return None;
         }
-        if let (MessageBinding::Chunked { count, .. }, Some(chunk), Some(chunks)) =
+        if let (MessageBinding::Chunked { count, seed, .. }, Some(chunk), Some(chunks)) =
             (forward.binding, forward.chunk, &mut route.chunks)
         {
             if forward.previous == route.forward.previous {
-                if chunks.commitment.is_none() {
-                    chunks.commitment = chunks.original.observe(chunk, count);
-                }
+                chunks.observe_original(chunk, count);
                 route.returned = false;
-            } else if chunks.matches_replay(forward.previous, chunk, count) {
+            } else if chunks.matches_replay(forward.previous, chunk, count, seed) {
                 chunks.fallback = Some(route.forward.previous);
                 route.forward = forward;
                 route.returned = false;
@@ -330,16 +362,21 @@ mod tests {
     const MAC: [u8; 32] = [6; 32];
 
     fn chunk(previous: NodeIdBytes, index: u32, data: u8) -> ForwardAck {
-        let payload = ChunkedEnvelopePayload {
+        let forward = chunk_forward(index, data, None);
+        ForwardAck::from_forward(&forward, previous).unwrap()
+    }
+
+    fn chunk_forward(index: u32, data: u8, commitment: Option<[u8; 32]>) -> ForwardPayload {
+        let chunk = ChunkedEnvelopePayload {
             transfer_id: [8; 16],
             chunk_index: index,
             chunk_count: 3,
             total_size: 96,
-            orig_content_id: CONTENT,
+            orig_content_id: commitment.unwrap_or(CONTENT),
             require_ack: true,
             data: vec![data; 32],
         };
-        let forward = ForwardPayload {
+        ForwardPayload {
             next_hop_node_id: DOWNSTREAM,
             envelope: DeliveryEnvelope {
                 recipient: Recipient::any(DOWNSTREAM),
@@ -350,15 +387,53 @@ mod tests {
                 content_id: [data; 32],
                 created_at: 10,
                 ttl_secs: 30,
-                payload: payload.encode(),
+                payload: if commitment.is_some() {
+                    chunk.encode_committed()
+                } else {
+                    chunk.encode()
+                },
                 trace_id: 0,
                 require_ack: false,
             },
             relay_hops: 1,
             delivery_attempt: None,
             traffic_class: None,
+        }
+    }
+
+    #[test]
+    fn committed_retry_can_replace_a_partial_original_on_the_same_link() {
+        let template = chunk_forward(0, 0, None);
+        let mut commitment = ChunkContentCommitment::new(&template.envelope, [8; 16], 3, 96);
+        for value in 0..3 {
+            commitment.append(ChunkContentCommitment::leaf(&[value; 32]));
+        }
+        let content = commitment.content_id();
+        let mut routes = RelayDeliveryAcks::default();
+        let record = |routes: &mut RelayDeliveryAcks, previous, index, data| {
+            let forward = chunk_forward(index, data, Some(content));
+            routes.record_admission(
+                DOWNSTREAM,
+                ForwardAck::from_forward(&forward, previous).unwrap(),
+            )
         };
-        ForwardAck::from_forward(&forward, previous).unwrap()
+        assert_eq!(record(&mut routes, ORIGINAL, 2, 2), None);
+        for (index, value) in [(0, 0), (1, 99), (2, 2)] {
+            assert_eq!(record(&mut routes, BACKUP, index, value), None);
+        }
+        routes.return_ack(content, DOWNSTREAM, MAC, 15, |route| {
+            assert_eq!(route.previous, ORIGINAL);
+            false
+        });
+
+        assert_eq!(record(&mut routes, BACKUP, 1, 1), None);
+        assert_eq!(record(&mut routes, OTHER, 0, 0), None);
+        assert_eq!(record(&mut routes, BACKUP, 2, 2), None);
+        assert_eq!(record(&mut routes, BACKUP, 0, 0), Some(MAC));
+        routes.return_ack(content, DOWNSTREAM, MAC, 16, |route| {
+            assert_eq!(route.previous, BACKUP);
+            true
+        });
     }
 
     #[test]

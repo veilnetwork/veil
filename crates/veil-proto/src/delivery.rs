@@ -612,6 +612,51 @@ pub const CHUNKED_ENVELOPE_MARKER: u8 = 0xE4;
 /// per-chunk envelopes themselves never set `DeliveryEnvelope::require_ack`
 /// (they are not individually acked).
 pub const CHUNKED_ENVELOPE_FLAG_REQUIRE_ACK: u8 = 0x01;
+const CHUNKED_ENVELOPE_FLAG_COMMITTED: u8 = 0x02;
+
+/// Indexed ciphertext digest carried in the original content ID of an
+/// acknowledged transfer. Old chunk decoders ignore the commitment flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkContentCommitment(blake3::Hash);
+
+impl ChunkContentCommitment {
+    pub fn new(envelope: &DeliveryEnvelope, transfer: TransferId, count: u32, size: u32) -> Self {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"\x02veil/pnet/chunk-content/v1");
+        hash.update(&transfer);
+        hash.update(&count.to_be_bytes());
+        hash.update(&size.to_be_bytes());
+        hash.update(&envelope.sender_node_id);
+        hash.update(&envelope.recipient.node_id);
+        hash.update(&[envelope.recipient.instance_tag.byte()]);
+        if let crate::recipient::InstanceTag::Specific(instance) = envelope.recipient.instance_tag {
+            hash.update(&instance);
+        }
+        hash.update(&envelope.src_app_id);
+        hash.update(&envelope.app_id);
+        hash.update(&envelope.endpoint_id.to_be_bytes());
+        Self(hash.finalize())
+    }
+
+    pub fn leaf(bytes: &[u8]) -> blake3::Hash {
+        let mut hash = blake3::Hasher::new();
+        hash.update(&[0]);
+        hash.update(bytes);
+        hash.finalize()
+    }
+
+    /// Append a leaf in increasing chunk-index order.
+    pub fn append(&mut self, leaf: blake3::Hash) {
+        let mut node = [1; 65];
+        node[1..33].copy_from_slice(self.0.as_bytes());
+        node[33..].copy_from_slice(leaf.as_bytes());
+        self.0 = blake3::hash(&node);
+    }
+
+    pub fn content_id(self) -> [u8; 32] {
+        *self.0.as_bytes()
+    }
+}
 
 /// One chunk of an oversized `DeliveryEnvelope`, carried inside the payload of a
 /// normal relayable envelope.
@@ -624,7 +669,7 @@ pub const CHUNKED_ENVELOPE_FLAG_REQUIRE_ACK: u8 = 0x01;
 /// [21..25] chunk_count u32 BE (1..=MAX_TRANSFER_CHUNKS)
 /// [25..29] total_size u32 BE (reassembled payload bytes, ≤ MAX_REASSEMBLY_BYTES)
 /// [29..61] orig_content_id [u8; 32] (content_id of the WHOLE message, for ACK + terminal dedup)
-/// [61]     flags u8 (bit0 = original require_ack)
+/// [61]     flags u8 (bit0 = original require_ack, bit1 = committed original content id)
 /// [62..]   data (this chunk's slice of the original payload, ≤ MAX_CHUNK_PAYLOAD)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -649,6 +694,21 @@ pub struct ChunkedEnvelopePayload {
 impl ChunkedEnvelopePayload {
     /// Size of the fixed-width header (before `data`).
     pub const HEADER_SIZE: usize = 1 + 16 + 4 + 4 + 4 + 32 + 1; // 62
+
+    /// Check the commitment flag on a validated chunk carrier.
+    pub fn commits_content(buf: &[u8]) -> bool {
+        let flags = CHUNKED_ENVELOPE_FLAG_REQUIRE_ACK | CHUNKED_ENVELOPE_FLAG_COMMITTED;
+        buf.get(Self::HEADER_SIZE - 1)
+            .is_some_and(|byte| byte & flags == flags)
+    }
+
+    /// Encode a carrier whose original ID is a [`ChunkContentCommitment`].
+    pub fn encode_committed(&self) -> Vec<u8> {
+        debug_assert!(self.require_ack);
+        let mut bytes = self.encode();
+        bytes[Self::HEADER_SIZE - 1] |= CHUNKED_ENVELOPE_FLAG_COMMITTED;
+        bytes
+    }
 
     /// Read the whole-message ACK key for routing without copying chunk data.
     pub fn acknowledged_transfer(buf: &[u8]) -> Option<([u8; 32], TransferId)> {

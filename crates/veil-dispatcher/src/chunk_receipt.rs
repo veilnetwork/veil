@@ -144,7 +144,7 @@ impl ChunkReceiptReplay {
     }
 }
 
-pub(crate) fn addressing(envelope: &DeliveryEnvelope) -> blake3::Hash {
+fn addressing(envelope: &DeliveryEnvelope) -> blake3::Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&envelope.recipient.node_id);
     hasher.update(&[envelope.recipient.instance_tag.byte()]);

@@ -1,7 +1,9 @@
 //! Packetization of endpoint-owned envelopes. Never used by relay forwarding.
 
 use rand_core::RngCore;
-use veil_proto::delivery::{ChunkedEnvelopePayload, DeliveryEnvelope, ForwardPayload};
+use veil_proto::delivery::{
+    ChunkContentCommitment, ChunkedEnvelopePayload, DeliveryEnvelope, ForwardPayload,
+};
 use veil_proto::family::{DeliveryMsg, FrameFamily};
 use veil_proto::{FrameHeader, codec};
 
@@ -27,6 +29,7 @@ pub(super) struct EnvelopeChunks<'a> {
     require_ack: bool,
     segment_size: usize,
     chunk_count: u32,
+    committed_id: Option<[u8; 32]>,
 }
 
 impl<'a> EnvelopeChunks<'a> {
@@ -68,7 +71,26 @@ impl<'a> EnvelopeChunks<'a> {
             require_ack,
             segment_size,
             chunk_count: count as u32,
+            committed_id: None,
         })
+    }
+
+    pub(super) fn with_content_commitment(mut self) -> Self {
+        let mut commitment = ChunkContentCommitment::new(
+            self.envelope,
+            self.transfer_id,
+            self.chunk_count,
+            self.envelope.payload.len() as u32,
+        );
+        for data in self.envelope.payload.chunks(self.segment_size) {
+            commitment.append(ChunkContentCommitment::leaf(data));
+        }
+        self.committed_id = Some(commitment.content_id());
+        self
+    }
+
+    pub(super) fn content_id(&self) -> [u8; 32] {
+        self.committed_id.unwrap_or(self.envelope.content_id)
     }
 
     pub(super) fn direct_app_frames(&self) -> impl Iterator<Item = Vec<u8>> + '_ {
@@ -97,16 +119,20 @@ impl<'a> EnvelopeChunks<'a> {
     }
 
     fn chunk_payload(&self, index: usize, data: &[u8]) -> Vec<u8> {
-        ChunkedEnvelopePayload {
+        let chunk = ChunkedEnvelopePayload {
             transfer_id: self.transfer_id,
             chunk_index: index as u32,
             chunk_count: self.chunk_count,
             total_size: self.envelope.payload.len() as u32,
-            orig_content_id: self.envelope.content_id,
+            orig_content_id: self.content_id(),
             require_ack: self.require_ack,
             data: data.to_vec(),
+        };
+        if self.committed_id.is_some() {
+            chunk.encode_committed()
+        } else {
+            chunk.encode()
         }
-        .encode()
     }
 
     pub(super) fn frames_for(&self, next_hop: [u8; 32]) -> impl Iterator<Item = Vec<u8>> + '_ {

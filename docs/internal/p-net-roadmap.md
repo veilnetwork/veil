@@ -339,9 +339,26 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   only the shared relay upgraded. In a separate run the old sender's
   retry tracker kept the failed first hop for both retries while ordinary
   datagrams already passed through the backup.
-- A shared link that saw only part of the original batch still needs
-  coverage. A new upstream needs a complete matching batch on that link
-  before taking over its return path.
+- A private sender with a keyed receipt now derives the original content
+  ID from the indexed ciphertext, its addressing and a random transfer ID.
+  A chunk header flag advertises this use of the existing ID. A shared
+  relay can check a complete retry against the ID even if it initially
+  forwarded just one chunk. On first reassembly the upgraded terminal
+  checks the commitment before opening the ciphertext and creating a
+  receipt. The origin still checks the receiver's end-to-end receipt MAC.
+- Older receivers ignore the new flag and still reassemble the same frame
+  layout. With an older sender's random content ID, the relay continues to
+  use its original full-batch comparison. The partial-link recovery needs
+  an updated sender and shared relay.
+- A deterministic dispatcher test delivered the earlier chunks through a
+  second path and only the final chunk over the shared link. On a complete
+  retry, the shared relay returned the original keyed receipt through the
+  new upstream and the application saw one delivery. Altered retries and
+  fragments supplied by different peers could not move the return path.
+- A four-node Linux stand confirmed 150,000-byte sends through a backup
+  relay on the first retry in about 5.6 to 5.8 seconds. Each run delivered
+  once. The stand covered all updated nodes, an updated sender with old
+  relays and receiver, and an old sender with updated relays and receiver.
 
 #### Recovering acknowledged sends after the first hop disappears
 

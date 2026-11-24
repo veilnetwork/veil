@@ -18,7 +18,9 @@
 use std::collections::HashMap;
 
 use veil_proto::budget::{CHUNK_REASSEMBLY_TTL_SECS, MAX_REASSEMBLY_BYTES};
-use veil_proto::delivery::{ChunkedEnvelopePayload, DeliveryEnvelope, TransferId};
+use veil_proto::delivery::{
+    ChunkContentCommitment, ChunkedEnvelopePayload, DeliveryEnvelope, TransferId,
+};
 
 use crate::chunk_receipt::{ChunkReceiptBinding, ChunkReceiptReplay};
 
@@ -81,6 +83,7 @@ struct TransferState {
     total_size: u32,
     orig_content_id: [u8; 32],
     require_ack: bool,
+    commitment: Option<ChunkContentCommitment>,
     // Addressing metadata snapshot from the first chunk's envelope — identical
     // across all chunks of one transfer; used to rebuild the original envelope.
     recipient: veil_proto::recipient::Recipient,
@@ -185,6 +188,8 @@ impl EnvelopeChunkReassembler {
         track_receipt: bool,
     ) -> (AddChunkResult, Option<ChunkReceiptBinding>) {
         let key = (direct_peer, chunk.transfer_id);
+        let committed =
+            direct_peer.is_none() && ChunkedEnvelopePayload::commits_content(&envelope.payload);
         // Opportunistic eviction of timed-out partials on each add.
         self.evict_expired(now);
 
@@ -286,6 +291,14 @@ impl EnvelopeChunkReassembler {
                     total_size: chunk.total_size,
                     orig_content_id: chunk.orig_content_id,
                     require_ack: chunk.require_ack,
+                    commitment: committed.then(|| {
+                        ChunkContentCommitment::new(
+                            envelope,
+                            chunk.transfer_id,
+                            chunk.chunk_count,
+                            chunk.total_size,
+                        )
+                    }),
                     recipient: envelope.recipient,
                     sender_node_id: envelope.sender_node_id,
                     peer_id,
@@ -310,6 +323,7 @@ impl EnvelopeChunkReassembler {
             || chunk.total_size != state.total_size
             || chunk.orig_content_id != state.orig_content_id
             || chunk.require_ack != state.require_ack
+            || committed != state.commitment.is_some()
             || envelope.recipient != state.recipient
             || envelope.sender_node_id != state.sender_node_id
             || envelope.src_app_id != state.src_app_id
@@ -423,13 +437,30 @@ impl EnvelopeChunkReassembler {
             (track_receipt && state.require_ack && state.orig_content_id != [0; 32])
                 .then(|| Vec::with_capacity(state.received.len()));
         let mut payload = Vec::with_capacity(state.total_size as usize);
+        let mut commitment = state.commitment;
         for piece in state.received.into_iter() {
             // All Some: received_count == chunk_count == received.len().
             let piece = piece.expect("all chunks present");
             if let Some(lengths) = &mut chunk_lengths {
                 lengths.push(piece.len());
             }
+            if let Some(commitment) = &mut commitment {
+                commitment.append(ChunkContentCommitment::leaf(&piece));
+            }
             payload.extend_from_slice(&piece);
+        }
+
+        if let Some(commitment) = commitment
+            && (commitment.content_id() != state.orig_content_id
+                || !matches!(
+                    payload.first().copied(),
+                    Some(veil_proto::E2E_MARKER | veil_proto::RATCHET_E2E_MARKER)
+                ))
+        {
+            return (
+                AddChunkResult::Rejected("chunk content commitment mismatch"),
+                None,
+            );
         }
 
         let orig_content_id = state.orig_content_id;
@@ -542,6 +573,54 @@ mod tests {
             require_ack: true,
             data,
         }
+    }
+
+    #[test]
+    fn committed_chunks_require_the_original_ciphertext_and_indexing() {
+        let mut r = EnvelopeChunkReassembler::new();
+        let mut envelope = carrier([1; 32]);
+        let tid = [7; 16];
+        let parts = [vec![veil_proto::E2E_MARKER, 1], vec![2, 3, 4]];
+        let mut commitment = ChunkContentCommitment::new(&envelope, tid, 2, 5);
+        for part in &parts {
+            commitment.append(ChunkContentCommitment::leaf(part));
+        }
+        let content_id = commitment.content_id();
+        let mut add = |index: u32, data: Vec<u8>, committed: bool| {
+            let mut chunk = chunk(tid, index, 2, 5, data);
+            chunk.orig_content_id = content_id;
+            envelope.payload = if committed {
+                chunk.encode_committed()
+            } else {
+                chunk.encode()
+            };
+            r.add_direct(&envelope, chunk, 1)
+        };
+
+        assert!(matches!(
+            add(1, parts[1].clone(), true),
+            AddChunkResult::Pending
+        ));
+        assert!(matches!(
+            add(0, parts[0].clone(), false),
+            AddChunkResult::Rejected("inconsistent chunk metadata")
+        ));
+        assert!(matches!(
+            add(0, vec![veil_proto::E2E_MARKER, 9], true),
+            AddChunkResult::Rejected("chunk content commitment mismatch")
+        ));
+
+        // The failed proof released the transfer slot and made no tombstone.
+        assert!(matches!(
+            add(1, parts[1].clone(), true),
+            AddChunkResult::Pending
+        ));
+        let AddChunkResult::Complete(reassembled) = add(0, parts[0].clone(), true) else {
+            panic!("matching commitment must complete");
+        };
+        assert_eq!(reassembled.content_id, content_id);
+        assert_eq!(reassembled.payload, parts.concat());
+        assert_eq!(r.buffered_bytes(), 0);
     }
 
     #[test]
