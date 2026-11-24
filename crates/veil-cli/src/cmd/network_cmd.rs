@@ -68,7 +68,15 @@ pub fn handle_network_command<I: CommandIo>(
             owner_pub,
             algo,
             network_id,
-        } => verify_cert(context, &cert, &owner_pub, algo.into(), &network_id),
+            member_node_id,
+        } => verify_cert(
+            context,
+            &cert,
+            &owner_pub,
+            algo.into(),
+            &network_id,
+            member_node_id.as_deref(),
+        ),
         NetworkCommand::RoutePolicy { command } => super::network_policy_cmd::run(context, command),
         NetworkCommand::Ban { node_id, reason } => ban(context, node_id, reason),
     }
@@ -248,6 +256,7 @@ fn verify_cert<I: CommandIo>(
     owner_pub_path: &Path,
     algo: SignatureAlgorithm,
     network_id_hex: &str,
+    expected_member_hex: Option<&str>,
 ) -> veil_cfg::Result<()> {
     let blob = fs::read(cert_path)
         .map_err(|e| veil_cfg::ConfigError::ValidationFailed(format!("read cert: {e}")))?;
@@ -266,6 +275,16 @@ fn verify_cert<I: CommandIo>(
         .unwrap_or(0);
     match verify_membership_cert(&cert, &network_id, algo, &owner_pubkey_bytes, now_unix) {
         Ok(()) => {
+            if let Some(expected_id) = expected_member_hex {
+                let expected_id = decode_hex_32(expected_id).map_err(|e| {
+                    veil_cfg::ConfigError::ValidationFailed(format!("member_node_id: {e}"))
+                })?;
+                if cert.member_node_id != expected_id {
+                    return Err(veil_cfg::ConfigError::ValidationFailed(
+                        "certificate is signed for a different member node ID".into(),
+                    ));
+                }
+            }
             let valid_until_descr = if cert.valid_until_unix == 0 {
                 "NEVER (sentinel — revoke via DHT ban or owner-key rotation)".to_owned()
             } else {
@@ -432,9 +451,24 @@ mod tests {
             &pub_path,
             SignatureAlgorithm::Ed25519,
             &nid,
+            Some(&mid),
         )
         .expect("verify ok");
         assert!(c_ver.io.output.contains("Cert verified"));
+        let wrong_member = verify_cert(
+            &mut ctx(),
+            &cert_path,
+            &pub_path,
+            SignatureAlgorithm::Ed25519,
+            &nid,
+            Some(&"33".repeat(32)),
+        )
+        .unwrap_err();
+        assert!(
+            wrong_member
+                .to_string()
+                .contains("different member node ID")
+        );
     }
 
     #[test]
@@ -473,6 +507,7 @@ mod tests {
             &pub_path,
             SignatureAlgorithm::Ed25519,
             &wrong_nid,
+            None,
         )
         .unwrap_err();
         let msg = err.to_string();

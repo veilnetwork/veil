@@ -2137,6 +2137,9 @@ pub enum NetworkCommand {
         /// Expected `network_id` (64-char hex).
         #[arg(long, value_name = "HEX64")]
         network_id: String,
+        /// Expected recipient's node ID, to preflight a replacement cert.
+        #[arg(long, value_name = "HEX64")]
+        member_node_id: Option<String>,
     },
     /// Sign, verify and install owner-authorized virtual address policies.
     RoutePolicy {
@@ -2208,6 +2211,31 @@ pub enum RoutePolicyCommand {
         /// Initialize an empty store on first installation.
         #[arg(long)]
         initialize: bool,
+        #[command(flatten)]
+        trust: RoutePolicyTrust,
+    },
+    /// Replace the stored policy with one signed by a separately trusted successor.
+    ///
+    /// Stop ogate before applying. The new policy must have a strictly higher
+    /// revision. Use the existing owner pin and obtain the successor public key
+    /// through a trusted management channel. Only public keys are required.
+    #[cfg(unix)]
+    RotateOwner {
+        /// Current policy signed by the successor.
+        #[arg(long)]
+        policy: PathBuf,
+        /// Existing private policy state directory for this P-Net.
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Independently authenticated successor public key file in base64.
+        #[arg(long)]
+        next_owner_pub: PathBuf,
+        /// Successor signing algorithm. Defaults to the current algorithm.
+        #[arg(long, value_enum)]
+        next_algo: Option<SignatureAlgorithmArg>,
+        /// Check both pins, validity and revision without changing the store.
+        #[arg(long)]
+        check: bool,
         #[command(flatten)]
         trust: RoutePolicyTrust,
     },

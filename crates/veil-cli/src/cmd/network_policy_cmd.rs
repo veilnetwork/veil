@@ -25,9 +25,9 @@ pub(super) fn run<I: CommandIo>(
     let trust = match &command {
         RoutePolicyCommand::Sign { trust, .. } | RoutePolicyCommand::Verify { trust, .. } => trust,
         #[cfg(unix)]
-        RoutePolicyCommand::Install { trust, .. } | RoutePolicyCommand::Status { trust, .. } => {
-            trust
-        }
+        RoutePolicyCommand::Install { trust, .. }
+        | RoutePolicyCommand::RotateOwner { trust, .. }
+        | RoutePolicyCommand::Status { trust, .. } => trust,
     };
     let owner_key = read_bounded(&trust.owner_pub, MAX_OWNER_KEY_BYTES)?;
     let public_key = read_text(&trust.owner_pub, &owner_key)?.trim();
@@ -92,6 +92,38 @@ pub(super) fn run<I: CommandIo>(
             context
                 .io
                 .emit(OutputEvent::message(summary("Stored", &accepted)));
+        }
+        #[cfg(unix)]
+        RoutePolicyCommand::RotateOwner {
+            policy,
+            state_dir,
+            next_owner_pub,
+            next_algo,
+            check,
+            ..
+        } => {
+            use veil_identity::network_policy_store::RoutePolicyStore;
+
+            let next_key = read_bounded(&next_owner_pub, MAX_OWNER_KEY_BYTES)?;
+            let successor = RoutePolicyAuthority {
+                network_id: authority.network_id,
+                algorithm: next_algo.map_or(authority.algorithm, Into::into),
+                public_key: read_text(&next_owner_pub, &next_key)?.trim(),
+            };
+            let blob = read_bounded(&policy, MAX_SIGNED_ROUTE_POLICY_BYTES)?;
+            let store = RoutePolicyStore::open(&state_dir)
+                .map_err(|error| invalid(format!("open {}: {error}", state_dir.display())))?;
+            let replacement = store
+                .replace_owner(&blob, &authority, &successor, check)
+                .map_err(invalid)?;
+            let action = if check {
+                "Checked successor"
+            } else {
+                "Stored successor"
+            };
+            context
+                .io
+                .emit(OutputEvent::message(summary(action, &replacement)));
         }
         #[cfg(unix)]
         RoutePolicyCommand::Status { state_dir, .. } => {

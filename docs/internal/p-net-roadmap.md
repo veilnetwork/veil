@@ -245,3 +245,27 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   in the persisted DHT snapshot. The daemon restored the revocation before
   listening and refused the revoked member both after restart and after
   reloading the same trust settings.
+
+## 5. Replace the owner key
+
+- The operator obtains the next owner pin through an independent
+  management channel, issues replacement membership certificates, and
+  coordinates a restart of the daemon and ogate. The network ID and the
+  device identities stay stable. Each daemon verifies certificates
+  against one configured owner.
+- The policy preflight checks the successor's signature and validity
+  window and authenticates the installed snapshot under the current pin.
+  Under the existing state lock, the install checks the revision again
+  and atomically replaces the snapshot with a newer one. An identical
+  retried install succeeds. An expired installed snapshot still supplies
+  the revision floor. Only the old public key is required.
+- On an isolated three-node Linux stand, all nodes initially passed TUN
+  traffic, including a member on the previous daemon. Two nodes rotated
+  their pins and certificates after removing the old signing key from
+  the test. They resumed bidirectional TUN traffic with the same
+  addresses and accepted another new-owner policy. The old member's
+  certificate and a higher revision signed by the old owner were refused.
+- The operator-managed procedure requires a maintenance window. Further
+  work includes a separately provisioned recovery authority and handling
+  of a compromised owner's maximum policy revision. Qualify a longer
+  multi-node run with packet traffic and policy changes.

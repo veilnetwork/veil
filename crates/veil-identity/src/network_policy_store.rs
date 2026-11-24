@@ -30,6 +30,14 @@ pub enum StoreError {
     Rollback { offered: u64, accepted: u64 },
     #[error("route policy revision {0} has conflicting contents")]
     Conflict(u64),
+    #[error("owner rotation requires a different owner key")]
+    SameOwner,
+    #[error("owner rotation requires a revision newer than {accepted}, offered {offered}")]
+    RotationRevision { offered: u64, accepted: u64 },
+    #[error("stored policy did not verify against the current owner: {0}")]
+    RotationCurrent(#[source] RoutePolicyError),
+    #[error("replacement policy did not verify against the successor: {0}")]
+    RotationSuccessor(#[source] RoutePolicyError),
     #[error(transparent)]
     Policy(#[from] RoutePolicyError),
     #[error(transparent)]
@@ -127,6 +135,67 @@ impl RoutePolicyStore {
         )
     }
 
+    /// Replace the policy using a separately authenticated successor pin.
+    /// Only a local operator can select a successor. Network updates still
+    /// require the same owner on both the offered and persisted snapshots.
+    pub fn replace_owner(
+        &self,
+        blob: &[u8],
+        current: &RoutePolicyAuthority<'_>,
+        successor: &RoutePolicyAuthority<'_>,
+        check_only: bool,
+    ) -> Result<VerifiedRoutePolicy, StoreError> {
+        self.replace_owner_with_clock(
+            blob,
+            current,
+            successor,
+            check_only,
+            veil_util::unix_secs_now_u64,
+        )
+    }
+
+    fn replace_owner_with_clock(
+        &self,
+        blob: &[u8],
+        current: &RoutePolicyAuthority<'_>,
+        successor: &RoutePolicyAuthority<'_>,
+        check_only: bool,
+        clock: impl FnOnce() -> u64,
+    ) -> Result<VerifiedRoutePolicy, StoreError> {
+        if current.network_id != successor.network_id {
+            return Err(RoutePolicyError::WrongNetwork.into());
+        }
+        if current.algorithm == successor.algorithm && current.public_key == successor.public_key {
+            return Err(StoreError::SameOwner);
+        }
+        let offered =
+            verify_route_policy(blob, successor).map_err(StoreError::RotationSuccessor)?;
+        let _lock = self.lock(false)?;
+        offered.check_current(clock())?;
+        let accepted_bytes = self.read_locked()?;
+        if accepted_bytes == blob {
+            // An identical, currently valid successor snapshot means the
+            // replacement was already applied. Repeat the durability barrier
+            // in case the prior caller was interrupted after the rename.
+            if !check_only {
+                self.directory.sync_all()?;
+            }
+            return Ok(offered);
+        }
+        let accepted =
+            verify_route_policy(&accepted_bytes, current).map_err(StoreError::RotationCurrent)?;
+        if offered.revision <= accepted.revision {
+            return Err(StoreError::RotationRevision {
+                offered: offered.revision,
+                accepted: accepted.revision,
+            });
+        }
+        if !check_only {
+            self.persist_locked(blob)?;
+        }
+        Ok(offered)
+    }
+
     fn accept_with_clock(
         &self,
         blob: &[u8],
@@ -148,8 +217,8 @@ impl RoutePolicyStore {
         now: u64,
     ) -> Result<VerifiedRoutePolicy, StoreError> {
         offered.check_current(now)?;
-        let path = self.root.join(SNAPSHOT_FILE);
         if initialize {
+            let path = self.root.join(SNAPSHOT_FILE);
             match fs::symlink_metadata(&path) {
                 Ok(_) => return Err(StoreError::AlreadyInitialized),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -174,11 +243,16 @@ impl RoutePolicyStore {
                 std::cmp::Ordering::Greater => {}
             }
         }
-        veil_util::atomic_write_owner_only(&path, blob)?;
+        self.persist_locked(blob)?;
+        Ok(offered)
+    }
+
+    fn persist_locked(&self, blob: &[u8]) -> Result<(), StoreError> {
+        veil_util::atomic_write_owner_only(&self.root.join(SNAPSHOT_FILE), blob)?;
         // Require the directory barrier as well as the snapshot's file fsync
         // before acknowledging a new accepted revision.
         self.directory.sync_all()?;
-        Ok(offered)
+        Ok(())
     }
 
     fn lock(&self, initialize: bool) -> Result<File, StoreError> {
@@ -212,6 +286,11 @@ impl RoutePolicyStore {
         &self,
         authority: &RoutePolicyAuthority<'_>,
     ) -> Result<(VerifiedRoutePolicy, Vec<u8>), StoreError> {
+        let blob = self.read_locked()?;
+        Ok((verify_route_policy(&blob, authority)?, blob))
+    }
+
+    fn read_locked(&self) -> Result<Vec<u8>, StoreError> {
         let path = self.root.join(SNAPSHOT_FILE);
         let file = match open_state_file(&path, false, false) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -223,7 +302,7 @@ impl RoutePolicyStore {
         let mut blob = Vec::new();
         file.take((MAX_SIGNED_ROUTE_POLICY_BYTES + 1) as u64)
             .read_to_end(&mut blob)?;
-        Ok((verify_route_policy(&blob, authority)?, blob))
+        Ok(blob)
     }
 
     fn require_owner_file(&self, file: &File, path: &Path) -> Result<(), StoreError> {
@@ -528,6 +607,102 @@ mod tests {
         let (accepted, bytes) = store.try_load_signed(&authority).unwrap();
         assert_eq!(accepted.revision, 2);
         assert_eq!(bytes, next);
+    }
+
+    #[test]
+    fn owner_rotation_preserves_the_revision_floor_and_requires_explicit_pins() {
+        let dir = directory();
+        let path = dir.path().canonicalize().unwrap();
+        let old_key = veil_crypto::generate_keypair(ALGORITHM);
+        let new_key = veil_crypto::generate_keypair(ALGORITHM);
+        let other_key = veil_crypto::generate_keypair(ALGORITHM);
+        let previous = RoutePolicyAuthority {
+            network_id: NETWORK,
+            algorithm: ALGORITHM,
+            public_key: &old_key.public_key,
+        };
+        let successor = RoutePolicyAuthority {
+            public_key: &new_key.public_key,
+            ..previous
+        };
+        let other = RoutePolicyAuthority {
+            public_key: &other_key.public_key,
+            ..previous
+        };
+        let store = RoutePolicyStore::open(&path).unwrap();
+        let original = signed(&old_key, 8, 100, 2);
+        let replacement = signed(&new_key, 9, 200, 3);
+        assert!(matches!(
+            store.replace_owner_with_clock(&replacement, &previous, &successor, false, || 50),
+            Err(StoreError::Uninitialized)
+        ));
+        store
+            .accept_with_clock(&original, &previous, true, || 50)
+            .unwrap();
+
+        let stale = signed(&new_key, 8, 200, 3);
+        assert!(matches!(
+            store.replace_owner_with_clock(&stale, &previous, &successor, false, || 110),
+            Err(StoreError::RotationRevision {
+                offered: 8,
+                accepted: 8
+            })
+        ));
+        assert!(matches!(
+            store.replace_owner_with_clock(&replacement, &previous, &successor, false, || 200),
+            Err(StoreError::Policy(RoutePolicyError::Expired(200)))
+        ));
+        assert!(matches!(
+            store.replace_owner_with_clock(&replacement, &successor, &successor, false, || 110),
+            Err(StoreError::SameOwner)
+        ));
+        assert!(matches!(
+            store.replace_owner_with_clock(&replacement, &previous, &other, false, || 110),
+            Err(StoreError::RotationSuccessor(RoutePolicyError::Signature(
+                _
+            )))
+        ));
+        assert!(matches!(
+            store.replace_owner_with_clock(&replacement, &other, &successor, false, || 110),
+            Err(StoreError::RotationCurrent(RoutePolicyError::Signature(_)))
+        ));
+        assert_eq!(
+            store
+                .replace_owner_with_clock(&replacement, &previous, &successor, true, || 110)
+                .unwrap()
+                .revision,
+            9
+        );
+        assert_eq!(store.try_load_signed(&previous).unwrap().1, original);
+        assert!(store.load(&successor).is_err());
+
+        store
+            .replace_owner_with_clock(&replacement, &previous, &successor, false, || 110)
+            .unwrap();
+        drop(store);
+        let store = RoutePolicyStore::open(&path).unwrap();
+        assert_eq!(store.try_load_signed(&successor).unwrap().1, replacement);
+        assert!(store.load(&previous).is_err());
+        store
+            .replace_owner_with_clock(&replacement, &previous, &successor, false, || 120)
+            .unwrap();
+        let old_update = signed(&old_key, 100, 300, 4);
+        assert!(matches!(
+            store.accept_with_clock(&old_update, &previous, false, || 120),
+            Err(StoreError::Policy(RoutePolicyError::Signature(_)))
+        ));
+        assert!(matches!(
+            store.accept_with_clock(&stale, &successor, false, || 120),
+            Err(StoreError::Rollback {
+                offered: 8,
+                accepted: 9
+            })
+        ));
+        let update = signed(&new_key, 10, 300, 4);
+        store
+            .accept_with_clock(&update, &successor, false, || 120)
+            .unwrap();
+        assert_eq!(store.try_load_signed(&successor).unwrap().1, update);
     }
 
     #[test]

@@ -418,6 +418,48 @@ place. If the mirrors are unavailable, the cached policy remains
 effective until expiry. Restart ogate after changing distribution
 settings. With the defaults, distribution is disabled.
 
+## Replace the owner key
+
+Use an authenticated management channel independent of P-Net to
+distribute the new public key and its algorithm. Keep the network ID and
+the member node IDs. Sign new certificates offline for the devices that
+should still have access. Review the admin allowlist and prior revocations
+before issuing replacements. For signed ogate routes, sign a current
+snapshot with the new owner key at a revision above the highest installed
+revision across the fleet.
+
+On a node, check the replacement certificate against its local node ID
+and preflight the policy as the account that owns the policy directory.
+Use `--algo` for a current owner algorithm other than Ed25519 and
+`--next-algo` if the successor uses a different algorithm.
+For certificate verification, `--algo` selects the successor's algorithm.
+
+```sh
+veil-cli network verify-cert next.cert --owner-pub next.pub \
+  --network-id "$NETWORK_ID" --member-node-id "$LOCAL_NODE_ID"
+veil-cli network route-policy rotate-owner --check --policy next.bin \
+  --owner-pub current.pub --next-owner-pub next.pub \
+  --network-id "$NETWORK_ID" --state-dir "$STATE_DIR"
+```
+
+1. Schedule a maintenance window and stop ogate and the daemon. Nodes
+   with different configured owners cannot authenticate each other.
+2. Run the same `rotate-owner` command without `--check`. It replaces the
+   snapshot in the existing store and preserves the revision floor. It
+   needs only the public key of the previous owner, even if the stored
+   policy has expired. Repeat the same command if its result was lost.
+3. Configure the new public key and algorithm in `[network]` and
+   `[signed_policy]`, and set `[network].membership_cert` to the replacement
+   certificate. Restart the daemon, then ogate. Confirm `route-policy
+   status` with `--owner-pub next.pub` and verify private reachability.
+4. Republish any required network-wide bans from admins authorized by
+   the new key. Existing locally applied bans may remain in effect.
+
+Remote mirrors can distribute address snapshots under the configured key.
+Only the operator can change the owner pin. Revise daemon trust only on
+nodes you can authenticate and manage independently if the owner key is
+lost or suspected of compromise.
+
 ## What gets rejected
 
 | Scenario | Error message at handshake |
@@ -490,11 +532,11 @@ ansible-playbook -i inventory.yml revert-pnet.yml
   demand. A stolen admin cert stays valid until its `valid_until_unix`
   passes. To retire admin certs early, re-issue them under a new admin
   keypair and redistribute.
-* **Losing the owner key is catastrophic**: whoever holds the owner
-  private key can mint admin certs that pass the gate anywhere. Guard it
-  like a root CA key — the master key of a certificate authority — kept
-  air-gapped, in an HSM (a tamper-resistant key device), or on a paper
-  backup.
+* **Recovery currently requires management access**. A compromised
+  owner key can issue admin certificates until nodes change their pin.
+  An installed policy at the maximum revision also precludes an in-place
+  policy rotation. The standard procedure assumes a successor policy
+  can use a higher revision.
 * **No bridging between networks**: an admin on Network A cannot reach
   into Network B. Each network is its own separate trust domain, with no
   overlap.
