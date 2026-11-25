@@ -1021,6 +1021,38 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   timed runs. Prefix reuse warrants a daemon-level experiment with
   the same proof threshold and responder validation.
 
+#### Reusing the ResolveTransport proof prefix
+
+- The solver now processes the fixed domain tag, requester, target
+  and time bucket once per search. It clones that BLAKE3 state for
+  each nonce. The verifier builds the same canonical input and the
+  same threshold applies to both paths. Tests compare the wire input
+  against a one-shot digest and check the first valid nonce and its
+  attempt limit against a reference search.
+- Two alternating pairs on the two-vCPU Linux ARM64 stand used 48
+  authenticated TCP sessions and two 32 Mb/s flows over 23 s. Both
+  versions offered 167,272 datagrams per run. Each flow offered
+  7,266–7,273 in its first two seconds. The 46 other peer containers
+  used 15.44 and 16.52 CPU-seconds from daemon startup to the end of
+  the first ten seconds of traffic. The updated build used 12.09
+  and 12.08 CPU-seconds. Hub runnable wait fell from 19.63 and 19.03 s
+  to 15.17 and 14.57 s. UDP losses fell from 30,491 to 12,364 and
+  from 32,285 to 15,729.
+- All 200 SDK messages arrived without duplicates in every run.
+  In both pairs, the number of messages towards the hub that took
+  more than 100 ms fell from 35 to 21. Return p99 fell from 145 to
+  93 ms and from 141 to 84 ms. Towards the hub, p99 rose from 721 to
+  1,496 ms in the first pair and fell from 1,292 to 414 ms in the
+  reverse pair. During the two slowest messages in the first updated
+  run, the receiving TCP queue on their shared connection reached
+  3.39 MB. In the corresponding control the queue reached 1.18 MB
+  during its slowest messages. Cold TCP queueing remains open.
+- A mixed-version Linux ARM64 pair used the pre-batch daemon with
+  34 configured routes. It delivered all 48 SDK messages exactly
+  once. The bridge withdrew the route 0.859 s after disconnect and
+  passed bidirectional TUN probes 0.586 s after readmission on the
+  same interfaces.
+
 #### xVeil text delivery on a shared gateway
 
 - A two-vCPU Linux ARM64 hub served 24 gateways with disjoint 4,096-entry

@@ -986,21 +986,34 @@ pub const RESOLVE_POW_DOMAIN_TAG: &[u8] = b"epic475.4b/resolve_pow/v1";
 /// `BLAKE3( DOMAIN_TAG || requester_node_id || target_node_id ||
 /// time_bucket_be || pow_nonce)`.
 ///
-/// Both the requester (mining) and the responder (verifying) call this
-/// helper so the format stays in lock-step.
+/// The requester and responder share the same prefix construction.
 pub fn compute_resolve_pow(
     requester_node_id: &[u8; 32],
     target_node_id: &[u8; 32],
     time_bucket: u32,
     pow_nonce: &[u8; 16],
 ) -> [u8; 32] {
+    *resolve_pow_prefix(requester_node_id, target_node_id, time_bucket)
+        .update(pow_nonce)
+        .finalize()
+        .as_bytes()
+}
+
+fn resolve_pow_prefix(
+    requester_node_id: &[u8; 32],
+    target_node_id: &[u8; 32],
+    time_bucket: u32,
+) -> blake3::Hasher {
     let mut h = blake3::Hasher::new();
     h.update(RESOLVE_POW_DOMAIN_TAG);
     h.update(requester_node_id);
     h.update(target_node_id);
     h.update(&time_bucket.to_be_bytes());
-    h.update(pow_nonce);
-    *h.finalize().as_bytes()
+    h
+}
+
+fn meets_resolve_pow_difficulty(hash: &[u8; 32]) -> bool {
+    veil_util::leading_zero_bits(hash) >= RESOLVE_POW_DIFFICULTY
 }
 
 /// b: verify a `ResolveTransport` PoW solution.
@@ -1016,7 +1029,7 @@ pub fn verify_resolve_pow(
     pow_nonce: &[u8; 16],
 ) -> bool {
     let hash = compute_resolve_pow(requester_node_id, target_node_id, time_bucket, pow_nonce);
-    veil_util::leading_zero_bits(&hash) >= RESOLVE_POW_DIFFICULTY
+    meets_resolve_pow_difficulty(&hash)
 }
 
 /// b: client-side PoW solver.
@@ -1037,10 +1050,13 @@ pub fn mine_resolve_pow(
     time_bucket: u32,
     max_attempts: u64,
 ) -> Option<[u8; 16]> {
+    // The requester, target and bucket are fixed throughout this search.
+    let prefix = resolve_pow_prefix(requester_node_id, target_node_id, time_bucket);
     let mut nonce = [0u8; 16];
     for attempt in 0..max_attempts {
         nonce[..8].copy_from_slice(&attempt.to_be_bytes());
-        if verify_resolve_pow(requester_node_id, target_node_id, time_bucket, &nonce) {
+        let hash = prefix.clone().update(&nonce).finalize();
+        if meets_resolve_pow_difficulty(hash.as_bytes()) {
             return Some(nonce);
         }
     }
@@ -2455,9 +2471,19 @@ mod tests {
         let req = [0xAAu8; 32];
         let tgt = [0xBBu8; 32];
         let nonce = [0x77u8; 16];
-        let h1 = compute_resolve_pow(&req, &tgt, 100, &nonce);
-        let h2 = compute_resolve_pow(&req, &tgt, 100, &nonce);
-        assert_eq!(h1, h2);
+        let bucket = 0x0102_0304u32;
+        let wire_input = [
+            &b"epic475.4b/resolve_pow/v1"[..],
+            &req,
+            &tgt,
+            &[1, 2, 3, 4],
+            &nonce,
+        ]
+        .concat();
+        assert_eq!(
+            compute_resolve_pow(&req, &tgt, bucket, &nonce),
+            *blake3::hash(&wire_input).as_bytes()
+        );
     }
 
     /// b: domain separation — same nonce/bucket but different
@@ -2488,8 +2514,16 @@ mod tests {
         let req = [0xAAu8; 32];
         let tgt = [0xBBu8; 32];
         let bucket = 12345u32;
-        let nonce = mine_resolve_pow(&req, &tgt, bucket, 1_000_000)
-            .expect("mining must succeed at default difficulty within 1M attempts");
+        let mut reference_nonce = [0; 16];
+        let first = (0..1_000_000u64)
+            .find(|attempt| {
+                reference_nonce[..8].copy_from_slice(&attempt.to_be_bytes());
+                verify_resolve_pow(&req, &tgt, bucket, &reference_nonce)
+            })
+            .expect("reference search has a valid nonce within the attempt limit");
+        assert_eq!(mine_resolve_pow(&req, &tgt, bucket, first), None);
+        let nonce = mine_resolve_pow(&req, &tgt, bucket, first + 1).unwrap();
+        assert_eq!(nonce, reference_nonce);
         assert!(
             verify_resolve_pow(&req, &tgt, bucket, &nonce),
             "mined nonce must verify"
