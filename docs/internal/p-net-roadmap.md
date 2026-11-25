@@ -105,6 +105,14 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   table with 4,096 entries and passed with both changes. The peer list
   schedules queries. Route admission still requires a current positive
   membership result.
+- Startup now retries one timed-out peer-list query on a connection
+  that negotiated batch admission. A Unix IPC regression with 4,096
+  configured routes delayed the first reply beyond its 250 ms timeout.
+  The previous bridge missed the two-second deadline for the live route.
+  The updated bridge requested a second list and installed the route
+  after its positive admission response. The same test withdrew the
+  route when the daemon denied admission and restored it after readmission.
+  A legacy connection still sends one startup peer-list query.
 - On two Linux ARM64 peers with real TUN interfaces, an IPC proxy
   dropped the first peer-list reply after reconnect in each trial.
   With 4,096 configured entries, route restoration after the daemon
@@ -913,6 +921,35 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   end of the run. Deferring those daemons also reduced runnable peer
   processes on the shared VM during the sample. The check after their
   join exercised route convergence and TUN connectivity.
+
+#### CPU pressure just after peer admission
+
+- Two alternating pairs kept all 48 authenticated TCP sessions on the
+  same two-vCPU Linux ARM64 VM. They ran the same binaries, two active
+  tunnels at 32 Mb/s each, and the same container CPU assignments.
+  Traffic started 2.83–2.90 s after full admission in the early trials
+  and 17.57–17.58 s after admission in the delayed trials. The other
+  gateways started after the traffic window in all four trials.
+- The 46 other peer containers consumed 12.54 and 13.26 CPU-seconds in
+  the first ten seconds of early traffic. About 99% was user CPU time.
+  They used 1.13 and 1.55 CPU-seconds in the same window of the delayed
+  trials. The early trials' next ten seconds consumed 1.02 and 0.95
+  CPU-seconds in that group. The measured senders each offered 7,273
+  datagrams in the first two seconds in all four trials.
+- The early trials lost 30,790 and 34,185 of 167,272 datagrams. Both
+  delayed trials delivered every datagram. Hub runnable wait fell from
+  19.34–21.51 s to 3.59–3.96 s. Chat p99 towards the hub fell from
+  1,080–2,138 ms to 2.08–3.02 ms. The return direction fell from
+  152–157 ms to 3.03–3.66 ms. All four trials delivered 200 SDK chat
+  messages without duplicates, and all 24 tunnels later passed
+  bidirectional probes. This measures CPU contention after simultaneous
+  joins on the shared stand.
+- A separate diagnostic run sampled process CPU on three of those other
+  peers. In the first ten seconds of traffic, 907 of 1,030 sampled
+  instruction addresses were inside BLAKE3 functions. The sample also
+  hit `verify_resolve_pow` 14 times and `mine_resolve_pow_now` once. This
+  places transport resolution proof-of-work among the active paths. The
+  sample counts instruction addresses in the executing functions.
 
 #### xVeil text delivery on a shared gateway
 

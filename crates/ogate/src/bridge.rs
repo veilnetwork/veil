@@ -745,9 +745,8 @@ async fn live_peer_hints(
                 return None;
             }
             Err(_) if retry_after_timeout && !retried => {
-                // A missed hint after a session event can leave a rejoining
-                // peer waiting for the next full sweep. Repeat the hint at the
-                // existing query pace before resuming that sweep.
+                // A missed hint can leave a live peer waiting for the full
+                // sweep. Retry at the existing query pace.
                 retried = true;
                 tracing::debug!("retrying P-Net session hint after timeout");
             }
@@ -2326,9 +2325,10 @@ async fn maintain_routes(
                     } else {
                         HashSet::new()
                     };
-                    // PEERS predates batch admission. Try it once on the new
-                    // status connection and use the result only for ordering.
-                    let live = live_peer_hints(client, &mut pace, false).await;
+                    // PEERS predates batch admission. Batch-aware daemons
+                    // can retry a timed-out hint at the normal query pace.
+                    // Use the result only to order admission checks.
+                    let live = live_peer_hints(client, &mut pace, batched_admission).await;
                     for hints in std::iter::once(&recent).chain(live.as_ref().map(|live| &live.ids))
                     {
                         let order = admission_order
@@ -3534,6 +3534,11 @@ mod tests {
         exercise_pnet_session_rejoin(SessionHintScenario::Delayed).await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pnet_startup_retries_a_delayed_peer_list_before_the_full_sweep() {
+        exercise_pnet_session_rejoin(SessionHintScenario::DelayedStartup).await;
+    }
+
     #[tokio::test]
     async fn pnet_rechecks_recently_withdrawn_route_omitted_from_the_peer_list() {
         exercise_pnet_session_rejoin(SessionHintScenario::Capped).await;
@@ -3601,6 +3606,7 @@ mod tests {
 
     enum SessionHintScenario {
         Delayed,
+        DelayedStartup,
         Capped,
         JoinBurst,
         RapidWithdrawal,
@@ -3740,12 +3746,13 @@ mod tests {
             0
         };
         let first_admission = matches!(scenario, SessionHintScenario::CappedFirstAdmission);
+        let delayed_startup = matches!(scenario, SessionHintScenario::DelayedStartup);
         let session = Arc::new(Session {
             active: AtomicBool::new(!first_admission),
             peer_checks: AtomicUsize::new(0),
             other_admitted,
             hints: AtomicUsize::new(0),
-            delay_next_hint: AtomicBool::new(false),
+            delay_next_hint: AtomicBool::new(delayed_startup),
             capped_list: AtomicBool::new(first_admission),
             list_stale_peer: targeted_withdrawal,
             join_burst: AtomicBool::new(false),
@@ -3862,6 +3869,9 @@ mod tests {
             state.load().table.lookup_egress(address),
             Decision::Forward(PEER)
         );
+        if delayed_startup {
+            assert_eq!(session.hints.load(Ordering::Relaxed), 2);
+        }
 
         if matches!(
             scenario,
