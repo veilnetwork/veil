@@ -126,6 +126,13 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   2.25 s in the two trials. Both passed encrypted traffic in both
   directions after rejoin. The socket regression test also checks that
   a configured peer listed as active without admission has no route.
+- When a peer list is below its cap, the event-triggered batch now checks
+  open routes whose peers disappeared before checking new joins. The
+  ordinary sweep and the 64-entry batch limit are unchanged. In the
+  Unix IPC test with 4,096 configured routes and 64 simultaneous joins,
+  the previous bridge missed a two-second withdrawal deadline. The
+  update checked the departing peer first and removed its route within
+  the deadline. A joining peer without admission remained unroutable.
 - On three Linux ARM64 nodes with 1,024 routes per node and 32 Mb/s of
   offered UDP on the surviving link, three A/B runs measured route
   withdrawal of 1.72–1.94 s with session events and 3.75–3.78 s with the

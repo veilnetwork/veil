@@ -353,20 +353,27 @@ impl LivePeerHints {
         configured: &[(NodeId, [u8; 32])],
         admitted: &HashMap<NodeId, u64>,
     ) -> Vec<(NodeId, [u8; 32])> {
-        configured
-            .iter()
-            .copied()
-            .filter(
-                |(id, _)| match (self.ids.contains(id), admitted.contains_key(id)) {
-                    (true, false) => true,
-                    // A full snapshot may have omitted live peers. Let the
-                    // ordinary sweep check them without crowding out new joins.
-                    (false, true) => !self.at_capacity,
-                    _ => false,
-                },
-            )
-            .take(veilclient::PNET_ADMISSION_BATCH_MAX_PEERS)
-            .collect()
+        let limit = veilclient::PNET_ADMISSION_BATCH_MAX_PEERS;
+        let mut changed = Vec::new();
+        // Recheck potentially stale routes ahead of new joins. A full
+        // snapshot can omit live peers, so leave those absences to the sweep.
+        if !self.at_capacity && !admitted.is_empty() {
+            changed.extend(
+                configured
+                    .iter()
+                    .copied()
+                    .filter(|(id, _)| admitted.contains_key(id) && !self.ids.contains(id))
+                    .take(limit),
+            );
+        }
+        changed.extend(
+            configured
+                .iter()
+                .copied()
+                .filter(|(id, _)| self.ids.contains(id) && !admitted.contains_key(id))
+                .take(limit - changed.len()),
+        );
+        changed
     }
 }
 
@@ -2205,24 +2212,39 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pnet_session_changes_recheck_routes_before_a_large_sweep_finishes() {
-        exercise_pnet_session_rejoin(false).await;
+        exercise_pnet_session_rejoin(SessionHintScenario::Delayed).await;
     }
 
     #[tokio::test]
     async fn pnet_rechecks_recently_withdrawn_route_omitted_from_the_peer_list() {
-        exercise_pnet_session_rejoin(true).await;
+        exercise_pnet_session_rejoin(SessionHintScenario::Capped).await;
     }
 
-    async fn exercise_pnet_session_rejoin(capped_list: bool) {
+    #[tokio::test]
+    async fn pnet_session_withdrawal_precedes_a_full_batch_of_joins() {
+        exercise_pnet_session_rejoin(SessionHintScenario::JoinBurst).await;
+    }
+
+    enum SessionHintScenario {
+        Delayed,
+        Capped,
+        JoinBurst,
+    }
+
+    async fn exercise_pnet_session_rejoin(scenario: SessionHintScenario) {
         use std::sync::atomic::{AtomicBool, Ordering};
         use veil_ipc::{EventBus, IpcEndpoint, IpcServer, PeerListProvider, PnetStatusProvider};
         use veil_proto::{EventPayload, PeersListEntry, PeersListPayload, PnetStatusResultPayload};
 
         const PEER: NodeId = [0xaa; 32];
+        const FIRST_JOIN: u16 = 3600;
+        const END_JOINS: u16 = FIRST_JOIN + veilclient::PNET_ADMISSION_BATCH_MAX_PEERS as u16;
         struct Session {
             active: AtomicBool,
             delay_next_hint: AtomicBool,
             capped_list: AtomicBool,
+            join_burst: AtomicBool,
+            first_changed: SyncMutex<Option<NodeId>>,
             past_first_batch: Notify,
         }
         impl PeerListProvider for Session {
@@ -2251,7 +2273,7 @@ mod tests {
                         .collect();
                     return PeersListPayload { peers };
                 }
-                let peers = self
+                let mut peers: Vec<_> = self
                     .active
                     .load(Ordering::Relaxed)
                     .then(|| PeersListEntry {
@@ -2263,6 +2285,19 @@ mod tests {
                     })
                     .into_iter()
                     .collect();
+                if self.join_burst.load(Ordering::Relaxed) {
+                    peers.extend((FIRST_JOIN..END_JOINS).map(|host| {
+                        let mut node_id = [0; 32];
+                        node_id[..2].copy_from_slice(&host.to_be_bytes());
+                        PeersListEntry {
+                            node_id,
+                            state: veil_proto::peer_state::ACTIVE,
+                            direction: veil_proto::peer_direction::INBOUND,
+                            transport: Vec::new(),
+                            caps: None,
+                        }
+                    }));
+                }
                 PeersListPayload { peers }
             }
         }
@@ -2271,9 +2306,17 @@ mod tests {
                 if peer[..2] == 128_u16.to_be_bytes() {
                     self.past_first_batch.notify_one();
                 }
+                // Only the first join lacks admission, even though all of
+                // them have live sessions according to the snapshot.
+                let joining = self.join_burst.load(Ordering::Relaxed)
+                    && (FIRST_JOIN + 1..END_JOINS)
+                        .contains(&u16::from_be_bytes([peer[0], peer[1]]));
+                if self.join_burst.load(Ordering::Relaxed) && (*peer == PEER || joining) {
+                    self.first_changed.lock().unwrap().get_or_insert(*peer);
+                }
                 PnetStatusResultPayload {
-                    admitted: *peer == PEER && self.active.load(Ordering::Relaxed),
-                    has_cert: *peer == PEER,
+                    admitted: joining || *peer == PEER && self.active.load(Ordering::Relaxed),
+                    has_cert: joining || *peer == PEER,
                     admin: false,
                     valid_until_unix: 0,
                     network_id: [0x01; 32],
@@ -2288,6 +2331,8 @@ mod tests {
             active: AtomicBool::new(true),
             delay_next_hint: AtomicBool::new(false),
             capped_list: AtomicBool::new(false),
+            join_burst: AtomicBool::new(false),
+            first_changed: SyncMutex::new(None),
             past_first_batch: Notify::new(),
         });
         let events = Arc::new(EventBus::new());
@@ -2339,6 +2384,10 @@ mod tests {
         );
 
         session.active.store(false, Ordering::Relaxed);
+        session.join_burst.store(
+            matches!(scenario, SessionHintScenario::JoinBurst),
+            Ordering::Relaxed,
+        );
         assert_ne!(
             events.publish(EventPayload {
                 kind: SESSIONS_CHANGED,
@@ -2357,12 +2406,37 @@ mod tests {
             state.load().table.lookup_ingress(&PEER, Some(address)),
             Decision::Unauthorized
         );
+        if matches!(scenario, SessionHintScenario::JoinBurst) {
+            assert_eq!(*session.first_changed.lock().unwrap(), Some(PEER));
+            let [hi, lo] = FIRST_JOIN.to_be_bytes();
+            assert_eq!(
+                state
+                    .load()
+                    .table
+                    .lookup_egress(Ipv4Addr::new(10, 99, hi, lo).into()),
+                Decision::NoRoute
+            );
+            let [hi, lo] = (FIRST_JOIN + 1).to_be_bytes();
+            let mut node_id = [0; 32];
+            node_id[..2].copy_from_slice(&[hi, lo]);
+            assert_eq!(
+                state
+                    .load()
+                    .table
+                    .lookup_egress(Ipv4Addr::new(10, 99, hi, lo).into()),
+                Decision::Forward(node_id)
+            );
+        }
 
         session.active.store(true, Ordering::Relaxed);
-        session.capped_list.store(capped_list, Ordering::Relaxed);
-        session
-            .delay_next_hint
-            .store(!capped_list, Ordering::Relaxed);
+        session.capped_list.store(
+            matches!(scenario, SessionHintScenario::Capped),
+            Ordering::Relaxed,
+        );
+        session.delay_next_hint.store(
+            matches!(scenario, SessionHintScenario::Delayed),
+            Ordering::Relaxed,
+        );
         assert_ne!(
             events.publish(EventPayload {
                 kind: SESSION_ADMITTED,
