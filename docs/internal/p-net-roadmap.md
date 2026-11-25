@@ -1302,6 +1302,15 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   admission restored it on the same TUN, and a ban still removed it.
 - The final bridge passed the 34-peer manual-mode TUN fixture with the
   daemon that predates admission batches.
+- An accepted SIGHUP checks the protected signed policy between
+  admission batches. An unchanged policy keeps the sweep cursor. In
+  two pairs of Linux trials, the operator installed a 4,096-entry
+  snapshot withdrawing one live peer's address during a sweep. The
+  updated gateway published the withdrawal 0.43–0.69 s after the reload
+  request, compared with 6.32–6.48 s before. All runs blocked tunnel
+  probes in both directions while the private session stayed admitted.
+  A second peer completed all 160 round trips over one TCP connection
+  in each run, and the TUN interface stayed up.
 
 ## 4. Provision private entry points
 

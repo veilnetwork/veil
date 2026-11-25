@@ -1547,12 +1547,10 @@ async fn maintain_routes(
             if binding.signed.is_some() {
                 accepted.send_replace(new.clone());
                 config = new;
-                // Request a policy check at the next sweep boundary without
-                // restarting the current sweep or emptying its active routes.
+                // Check the protected policy below. Keep the current sweep
+                // cursor when the installed policy has not changed.
                 if next_peer == 0 {
                     refresh.reset();
-                } else {
-                    refresh.reset_immediately();
                 }
             } else {
                 // A timing change alone does not invalidate queued packets.
@@ -1598,7 +1596,7 @@ async fn maintain_routes(
         }
 
         if let Some((policy, authority)) = &binding.signed
-            && (next_peer == 0 || wake == Wake::Policy)
+            && (next_peer == 0 || matches!(wake, Wake::Reload | Wake::Policy))
         {
             let update = build_signed_update(
                 Arc::clone(policy),

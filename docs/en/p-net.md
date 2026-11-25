@@ -438,7 +438,9 @@ local daemon must support the authority check. After each IPC
 connection, ogate verifies the network, owner key, and local membership
 before querying private admissions.
 
-Installed revisions are picked up on the next sweep or after SIGHUP.
+Installed revisions are picked up on the next sweep. Use
+`ogate reload --pid PID` to request a policy check between admission
+batches during a sweep.
 Changes to the local TUN addresses or prefixes require updating the
 configuration and restarting ogate. When the policy or a membership
 expires, the corresponding traffic stops at that deadline.
