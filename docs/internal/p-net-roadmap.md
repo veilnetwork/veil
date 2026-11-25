@@ -1123,6 +1123,17 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   and 4–6 s minimum spacing. It leaves the ordinary deadline in place
   and permits a single in-flight round. Each poll checks all configured
   mirrors and revalidates their admission and the signed offers.
+- Failed subscriber IPC connections retry on the same staggered 4–6 s
+  cadence. Reconnecting can trigger one early poll under the same
+  spacing rule, including when the daemon admitted a mirror while the
+  subscriber was disconnected.
+- In two pairs of Linux trials, an IPC proxy refused new local connections
+  after the initial poll. The private daemon admitted the secondary mirror
+  while the subscriber could not reconnect. Once the proxy allowed new
+  connections, the previous subscriber installed the 4,096-entry policy
+  after 14.66 and 14.85 s. The updated subscriber installed it after 6.40
+  and 6.34 s. All runs passed traffic both ways on the original TUN while
+  the primary mirror stayed offline.
 
 - An isolated Linux pair recovered bidirectional TUN traffic after the
   subscriber's original snapshot expired. It fetched the full 217,260-byte

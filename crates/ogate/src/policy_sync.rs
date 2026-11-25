@@ -289,6 +289,7 @@ async fn subscribe(policy: &Arc<SignedRoutes>, distribution: &Distribution<'_>) 
     let event_delay = Duration::from_millis(SESSION_POLL_DELAY_MS + phase % SESSION_POLL_DELAY_MS);
     let mut earliest = Instant::now();
     let mut next = earliest + jitter;
+    let mut reconnecting = false;
     while distribution.authority.is_current(unix_secs_now_u64()) {
         // Watch on the same connection that will run the poll. Discard it
         // after the round along with any unfinished mirror streams.
@@ -296,30 +297,46 @@ async fn subscribe(policy: &Arc<SignedRoutes>, distribution: &Distribution<'_>) 
             Ok(client) => client,
             Err(error) => {
                 tracing::debug!(%error, "P-Net policy subscriber IPC unavailable");
-                sleep_until(next.max(Instant::now() + recovery)).await;
+                reconnecting = true;
+                tokio::time::sleep(recovery).await;
                 continue;
             }
         };
-        let periodic =
-            match wait_for_policy_poll(&mut client, next, earliest, recovery, event_delay).await {
-                PollWake::Periodic => true,
-                PollWake::SessionAdmitted => false,
-                PollWake::Disconnected => {
-                    tokio::time::sleep(recovery).await;
-                    continue;
-                }
-            };
+        let periodic = match wait_for_policy_poll(
+            &mut client,
+            next,
+            earliest,
+            recovery,
+            event_delay,
+            reconnecting,
+        )
+        .await
+        {
+            PollWake::Periodic => true,
+            PollWake::Expedited => false,
+            PollWake::Disconnected => {
+                reconnecting = true;
+                tokio::time::sleep(recovery).await;
+                continue;
+            }
+        };
         let started = Instant::now();
         if !distribution.authority.is_current(unix_secs_now_u64()) {
             return;
         }
         if !periodic {
-            tracing::debug!("P-Net session admission expedited mirror polling");
+            if reconnecting {
+                tracing::debug!("P-Net subscriber IPC recovery expedited mirror polling");
+            } else {
+                tracing::debug!("P-Net session admission expedited mirror polling");
+            }
         }
         earliest = started + recovery;
-        if let Err(error) = poll_mirrors(policy, distribution, &mirrors, client).await {
+        let client = Arc::new(client);
+        if let Err(error) = poll_mirrors(policy, distribution, &mirrors, &client).await {
             tracing::debug!(%error, "P-Net policy refresh failed");
         }
+        reconnecting = client.is_disconnected();
         if periodic {
             let delay = poll_interval(*expiry.borrow(), unix_secs_now_u64(), phase);
             let now = Instant::now();
@@ -333,7 +350,7 @@ async fn subscribe(policy: &Arc<SignedRoutes>, distribution: &Distribution<'_>) 
 
 enum PollWake {
     Periodic,
-    SessionAdmitted,
+    Expedited,
     Disconnected,
 }
 
@@ -343,10 +360,19 @@ async fn wait_for_policy_poll(
     earliest: Instant,
     recovery: Duration,
     event_delay: Duration,
+    reconnecting: bool,
 ) -> PollWake {
     let mut events = client.events().await;
     let periodic = next.max(earliest);
     let mut due = periodic;
+    // A mirror may have been admitted before the reconnected subscriber
+    // could listen. Treat IPC recovery like an admission wake hint.
+    if reconnecting
+        && let Some(early) =
+            expedited_poll(Instant::now() + event_delay, earliest, periodic, recovery)
+    {
+        due = early;
+    }
     let mut listen = true;
     loop {
         tokio::select! {
@@ -354,7 +380,7 @@ async fn wait_for_policy_poll(
             _ = sleep_until(due) => return if due == periodic {
                 PollWake::Periodic
             } else {
-                PollWake::SessionAdmitted
+                PollWake::Expedited
             },
             event = events.recv(), if listen => match event {
                 Some(event) if event.kind == SESSION_ADMITTED => {
@@ -427,7 +453,7 @@ async fn poll_mirrors(
     policy: &Arc<SignedRoutes>,
     distribution: &Distribution<'_>,
     mirrors: &[NodeId],
-    client: VeilClient,
+    client: &Arc<VeilClient>,
 ) -> anyhow::Result<()> {
     let revision = {
         let policy = Arc::clone(policy);
@@ -498,6 +524,7 @@ async fn poll_mirrors(
             .into_iter()
             .find(|entry| entry.peer_node_id == offer.source)
             .context("selected mirror's P-Net admission is missing")?;
+        let client = Arc::clone(client);
         let revision = tokio::task::spawn_blocking(move || {
             ensure!(
                 !client.is_disconnected() && authorized(authority, admission, unix_secs_now_u64()),
