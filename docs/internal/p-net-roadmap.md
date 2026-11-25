@@ -1628,6 +1628,26 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   the publisher also logged an early replication. The receiver enforced
   the ban after 57.0 s via its periodic local scan. The remaining nodes
   again delivered all 48 SDK messages exactly once.
+- A 49-node Linux ARM64 stand used one issuer, one target and 47 peers
+  that could connect to both. All 47 admitted the target before the
+  issuer reconnected. With the early DHT walk, 39 peers applied the ban
+  and eight still admitted the target 47.0 s after the issuer connected.
+- Early delivery now uses the authenticated registrations that joined
+  or replaced a session. It queues at most eight background STOREs
+  per tick, verifies each batch and checks that every target session
+  still owns its outbox. Peers that decline DHT service are skipped.
+  Ordinary DHT republication handles the routed replica set on its
+  own schedule.
+- With direct delivery on the same 49-node topology, 44 of 47 observers
+  had withdrawn admission at the 7.0 s sample. All 47 had the record and
+  denied admission by the 14.1 s sample. The issuer queued five groups
+  of eight and one of seven. A TUN path to the revoked node stopped in
+  both directions with the interfaces present. Another TUN path between
+  unrevoked nodes passed in both directions, and they also received all
+  48 SDK messages exactly once.
+- In the three-node mixed-version stand, the previous receiver accepted
+  the direct background STORE and enforced the ban at its local scan
+  57.2 s after reconnecting. All 48 SDK messages arrived exactly once.
 
 #### Enforcing revocations on relayed application datagrams
 

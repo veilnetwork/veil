@@ -85,14 +85,6 @@ impl RepublishScheduler {
         }
     }
 
-    /// Schedule the ordinary refresh after publishing a key early.
-    pub fn defer_after_publish(&mut self, key: [u8; 32], interval: Duration) {
-        self.schedule.insert(
-            key,
-            Instant::now() + interval + self.jitter_for(key, interval),
-        );
-    }
-
     /// Remove a key from the schedule (e.g. after it is deleted from the store).
     pub fn remove(&mut self, key: &[u8; 32]) {
         self.schedule.remove(key);

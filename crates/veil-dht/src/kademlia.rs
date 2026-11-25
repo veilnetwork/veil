@@ -1981,17 +1981,7 @@ impl KademliaService {
             }
             let mut sent_to_peer = false;
             for value in &values {
-                let request_id = self.store_req_id.fetch_add(1, Ordering::Relaxed);
-                let payload = StorePayload::unsigned(key, value.clone());
-                let body = payload.encode();
-                let mut hdr = veil_proto::header::FrameHeader::new(
-                    veil_proto::family::FrameFamily::Discovery as u8,
-                    veil_proto::family::DiscoveryMsg::Store as u16,
-                );
-                hdr.body_len = body.len() as u32;
-                hdr.request_id = request_id;
-                let mut frame = veil_proto::codec::encode_header(&hdr).to_vec();
-                frame.extend_from_slice(&body);
+                let (request_id, frame) = self.store_replica_frame(key, value.clone(), None);
                 // Fire-and-forget: drop the response channel (we don't wait for an ack).
                 // `send_request` returns Some(receiver) when the frame was accepted
                 // onto the outbox; None when there is no live session for the peer
@@ -2009,6 +1999,48 @@ impl KademliaService {
         }
 
         Ok(sent)
+    }
+
+    /// Build a regular STORE for a verified ban sent on an existing private
+    /// session. The receiver still validates the record and its storage quota.
+    pub fn build_private_ban_replica(
+        &self,
+        key: [u8; 32],
+        value: Vec<u8>,
+    ) -> Result<Vec<u8>, KademliaError> {
+        if !value.starts_with(b"PBAN")
+            || !self
+                .network_auth_gate
+                .as_ref()
+                .is_some_and(|gate| gate.verify_ban_record(&key, &value))
+        {
+            return Err(KademliaError::InvalidNetworkRecord);
+        }
+        Ok(self
+            .store_replica_frame(key, value, Some(veil_proto::priority::BACKGROUND))
+            .1)
+    }
+
+    fn store_replica_frame(
+        &self,
+        key: [u8; 32],
+        value: Vec<u8>,
+        priority: Option<u8>,
+    ) -> (u32, Vec<u8>) {
+        let request_id = self.store_req_id.fetch_add(1, Ordering::Relaxed);
+        let body = StorePayload::unsigned(key, value).encode();
+        let mut header = veil_proto::header::FrameHeader::new(
+            veil_proto::family::FrameFamily::Discovery as u8,
+            veil_proto::family::DiscoveryMsg::Store as u16,
+        );
+        header.body_len = body.len() as u32;
+        header.request_id = request_id;
+        if let Some(priority) = priority {
+            header.set_priority(priority);
+        }
+        let mut frame = veil_proto::codec::encode_header(&header).to_vec();
+        frame.extend_from_slice(&body);
+        (request_id, frame)
     }
 }
 

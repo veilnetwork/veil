@@ -3,7 +3,7 @@
 //!
 //! Extracted from `runtime/mod.rs` during refactor.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,19 +13,29 @@ use veil_dht::KademliaService;
 use veil_identity::network_access::NetworkAccessGate;
 use veil_identity::network_ban::{BAN_BLOB_MAGIC, ban_dht_key};
 use veil_session::SessionOutbox;
-use veil_util::lock;
+use veil_util::{lock, rlock};
 
 use super::{NodeRuntime, lock_tasks, supervised_spawn};
 
 const BAN_CATCH_UP_COOLDOWN: Duration = Duration::from_secs(15);
 const BAN_CATCH_UP_MAX_CHECKS: usize = 32;
+const BAN_CATCH_UP_MAX_RECIPIENTS: usize = 8;
+
+type SessionRegistration = ([u8; 32], [u8; 32]);
+
+struct BanReplicaBatch<'a> {
+    frame: Vec<u8>,
+    recipients: &'a [SessionRegistration],
+}
 
 #[derive(Default)]
 struct BanCatchUp {
-    sessions: Vec<([u8; 32], [u8; 32])>,
-    pending: bool,
+    sessions: Vec<SessionRegistration>,
+    pending: BTreeSet<SessionRegistration>,
     next_scan: Option<Instant>,
     keys: VecDeque<[u8; 32]>,
+    recipients: Vec<SessionRegistration>,
+    next_recipient: usize,
 }
 
 impl BanCatchUp {
@@ -38,46 +48,60 @@ impl BanCatchUp {
     ) {
         let current = outbox.live_owned_registrations();
         if current.is_empty() {
-            self.pending = false;
+            self.pending.clear();
             self.keys.clear();
-        } else if current
-            .iter()
-            .any(|peer| self.sessions.binary_search(peer).is_err())
-        {
-            self.pending = true;
+        } else if self.sessions != current {
+            self.pending
+                .retain(|registration| current.binary_search(registration).is_ok());
+            self.pending.extend(
+                current
+                    .iter()
+                    .copied()
+                    .filter(|registration| self.sessions.binary_search(registration).is_err()),
+            );
         }
         self.sessions = current;
-        if !self.pending || !self.keys.is_empty() || self.next_scan.is_some_and(|due| now < due) {
+        if self.pending.is_empty()
+            || !self.keys.is_empty()
+            || self.next_scan.is_some_and(|due| now < due)
+        {
             return;
         }
-        self.pending = false;
         self.next_scan = Some(now + BAN_CATCH_UP_COOLDOWN);
+        self.recipients = std::mem::take(&mut self.pending).into_iter().collect();
+        self.next_recipient = 0;
         // Each accepted signed record creates a permanent local ban. Use
         // those IDs to address records without scanning unrelated DHT values.
         let targets: Vec<_> = lock!(bans)
-            .active_bans()
+            .manual_bans()
             .into_iter()
-            .filter(|ban| ban.manual && ban.banned_until.is_none())
+            .filter(|ban| ban.banned_until.is_none())
             .map(|ban| ban.peer_id)
             .collect();
         self.keys
             .extend(targets.into_iter().map(|id| ban_dht_key(network_id, &id)));
     }
 
-    fn next_record(
-        &mut self,
-        dht: &KademliaService,
-        gate: &NetworkAccessGate,
-        now_unix: u64,
-    ) -> Option<([u8; 32], Vec<u8>)> {
+    fn next_batch(&mut self, dht: &KademliaService) -> Option<BanReplicaBatch<'_>> {
         for _ in 0..BAN_CATCH_UP_MAX_CHECKS {
-            let key = self.keys.pop_front()?;
+            let key = *self.keys.front()?;
             if let Some(value) = dht.peek_value(&key)
-                && value.starts_with(BAN_BLOB_MAGIC)
-                && gate.verify_ban_record_at(&key, &value, now_unix)
+                && let Ok(frame) = dht.build_private_ban_replica(key, value)
             {
-                return Some((key, value));
+                let start = self.next_recipient;
+                let end = (start + BAN_CATCH_UP_MAX_RECIPIENTS).min(self.recipients.len());
+                self.next_recipient = end;
+                if end == self.recipients.len() {
+                    self.keys.pop_front();
+                    self.next_recipient = 0;
+                }
+                return Some(BanReplicaBatch {
+                    frame,
+                    recipients: &self.recipients[start..end],
+                });
             }
+            self.keys.pop_front();
+            self.next_recipient = 0;
         }
         None
     }
@@ -263,6 +287,7 @@ impl NodeRuntime {
         let network_gate = self.network_gate.clone();
         let bans = Arc::clone(&self.ban_list);
         let session_outbox = Arc::clone(&self.session_outbox);
+        let session_senders = Arc::clone(&self.session_tx_registry);
         let metrics = self.metrics.clone();
         let logger = Arc::clone(&self.logger);
         // Poked by the suspension detector — see the select arm below.
@@ -296,20 +321,26 @@ impl NodeRuntime {
                             ban_catch_up.observe_sessions(
                                 &session_outbox, &bans, &gate.expected_network_id, Instant::now(),
                             );
-                            if let Some((key, value)) = ban_catch_up.next_record(&dht, gate, veil_util::unix_secs_now_u64()) {
-                                match dht.store_replicated(
-                                    key, value,
-                                    Arc::clone(&session_outbox) as Arc<dyn veil_dht::FrameRouter>,
-                                ).await {
-                                    Ok(sent) if sent > 0 => {
-                                        scheduler.defer_after_publish(key, interval);
-                                        if let Some(m) = &metrics {
-                                            m.add_replicas_published(sent as u64);
-                                        }
-                                        logger.info("network.ban.catch_up", format!("replicas_sent={sent}"));
+                            if let Some(batch) = ban_catch_up.next_batch(&dht) {
+                                let mut sent = 0;
+                                for (peer, owner) in batch.recipients {
+                                    if !dht.peer_serves_dht(peer) {
+                                        continue;
                                     }
-                                    Ok(_) => {},
-                                    Err(err) => logger.warn("network.ban.catch_up.failed", err.to_string()),
+                                    let senders = rlock!(session_senders);
+                                    if !lock!(bans).is_banned(peer)
+                                        && senders.send_to_owned_result(
+                                            peer, owner, veil_proto::priority::BACKGROUND, batch.frame.clone(),
+                                        ).is_ok()
+                                    {
+                                        sent += 1;
+                                    }
+                                }
+                                if sent > 0 {
+                                    if let Some(m) = &metrics {
+                                        m.add_replicas_published(sent);
+                                    }
+                                    logger.info("network.ban.catch_up", format!("replicas_sent={sent}"));
                                 }
                             }
                         }
@@ -435,18 +466,61 @@ mod tests {
         assert_eq!(catch_up.keys.pop_front(), Some(key));
         assert!(catch_up.keys.is_empty());
         catch_up.observe_sessions(&outbox, &bans, &network, start + Duration::from_secs(1));
-        assert!(!catch_up.pending);
+        assert!(catch_up.pending.is_empty());
 
         let second = outbox.register_owned([5; 32], [7; 32]);
         catch_up.observe_sessions(&outbox, &bans, &network, start + Duration::from_secs(2));
-        assert!(catch_up.pending && catch_up.keys.is_empty());
+        assert!(!catch_up.pending.is_empty() && catch_up.keys.is_empty());
         catch_up.observe_sessions(&outbox, &bans, &network, start + BAN_CATCH_UP_COOLDOWN);
-        assert!(!catch_up.pending);
+        assert!(catch_up.pending.is_empty());
         assert_eq!(catch_up.keys.pop_front(), Some(key));
+        assert_eq!(catch_up.recipients, vec![([5; 32], [7; 32])]);
 
         drop(second);
         catch_up.observe_sessions(&outbox, &bans, &network, start + 2 * BAN_CATCH_UP_COOLDOWN);
         assert!(catch_up.sessions.is_empty() && catch_up.keys.is_empty());
+    }
+
+    #[test]
+    fn ban_catch_up_batches_all_new_peers_with_a_fixed_send_budget() {
+        use veil_dht::{KademliaService, NetworkAuthGate};
+
+        struct TestGate;
+        impl NetworkAuthGate for TestGate {
+            fn verify_ban_record(&self, _key: &[u8; 32], value: &[u8]) -> bool {
+                value == b"PBAN-verified"
+            }
+        }
+
+        let network = [1; 32];
+        let target = [2; 32];
+        let key = ban_dht_key(&network, &target);
+        let mut dht = KademliaService::new([100; 32]);
+        dht.set_network_auth_gate(std::sync::Arc::new(TestGate));
+        dht.store_local(key, b"PBAN-verified".to_vec());
+        let mut bans = BanList::new();
+        bans.ban_manual(target, "signed record candidate");
+        let outbox = SessionOutbox::new();
+        let receivers: Vec<_> = (10..29)
+            .map(|peer| outbox.register_owned([peer; 32], [peer + 1; 32]))
+            .collect();
+        let mut catch_up = BanCatchUp::default();
+        catch_up.observe_sessions(&outbox, &Mutex::new(bans), &network, Instant::now());
+        let mut delivered = Vec::new();
+        for expected in [8, 8, 3] {
+            let batch = catch_up.next_batch(&dht).unwrap();
+            assert_eq!(batch.recipients.len(), expected);
+            let header = veil_proto::codec::decode_header(&batch.frame).unwrap();
+            assert_eq!(header.priority(), veil_proto::priority::BACKGROUND);
+            assert_eq!(
+                header.msg_type,
+                veil_proto::family::DiscoveryMsg::Store as u16
+            );
+            delivered.extend(batch.recipients.iter().map(|(peer, _)| peer[0]));
+        }
+        assert_eq!(delivered, (10..29).collect::<Vec<_>>());
+        assert!(catch_up.next_batch(&dht).is_none());
+        drop(receivers);
     }
 
     #[test]
