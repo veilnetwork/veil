@@ -307,6 +307,19 @@ Increasing the interval adds delay to sparse traffic. The existing
 batch size and packet count limits still trigger an immediate flush.
 Add the setting only to nodes whose ogate version supports it.
 
+### Diagnose a P-Net gateway
+
+Run `ogate check --config /etc/ogate/ogate.toml` as the ogate service
+user. It validates the configured routes and queries the local Veil
+daemon over IPC. In signed mode it also checks the
+protected policy store, expiry, daemon trust pin, and local address
+assignment. You can run it alongside an existing gateway.
+
+Add `--peer NODE_ID` to check the local daemon's current admission for
+one route peer or configured mirror. An error prints the reason and
+returns a nonzero exit status. Use a tunnel probe to verify packet
+delivery and the mirror logs to check snapshot serving.
+
 ### Operator flow
 
 ```bash

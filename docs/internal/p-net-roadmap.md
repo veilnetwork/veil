@@ -1327,3 +1327,17 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   mirror protocol. The original authorization could no longer replace
   revision 2. A node on the older daemon rejoined after receiving a
   certificate under the new owner.
+
+## 7. Diagnose gateway admission
+
+- `ogate check` reads local configuration, the protected signed policy
+  when enabled, and the daemon's IPC status. An optional peer Node ID
+  checks admission for one route or mirror. The diagnostic uses the
+  normal owner, network, and local address checks.
+- An isolated Linux stand confirmed admission both before and during
+  normal TUN operation. The check identified a missing daemon socket,
+  absent peer certificate, missing local assignment, expired policy,
+  unsafe policy file, mismatched network or owner, and TUN address or
+  prefix mismatch. An admitted mirror with zero route assignments
+  returned a successful admission. The manual mode check also worked
+  against the pre-batch daemon while SDK traffic continued to work.

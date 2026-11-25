@@ -4,6 +4,8 @@
 //! * `up    --config <path>` — bring up the TUN bridge and run until SIGINT/SIGTERM.
 //! * `show  --config <path>` — print resolved config (computed app_ids, peer table)
 //!   without opening any device. Useful for debugging.
+//! * `check --config <path> [--peer <hex>]` — check the P-Net policy and
+//!   daemon admission without starting a bridge.
 //! * `app-id --network <net> [--app <app>] --node-id <hex>` —
 //!   compute one peer's app_id without touching the daemon
 //!   (handy when bootstrapping config files).
@@ -40,6 +42,16 @@ pub enum Command {
     Show {
         #[arg(short, long, default_value = "/etc/ogate/ogate.toml")]
         config: PathBuf,
+    },
+
+    /// Check P-Net configuration, installed policy and local daemon admission.
+    #[cfg(unix)]
+    Check {
+        #[arg(short, long, default_value = "/etc/ogate/ogate.toml")]
+        config: PathBuf,
+        /// Also check current admission for one route peer or configured mirror.
+        #[arg(long, value_name = "NODE_ID")]
+        peer: Option<String>,
     },
 
     /// Trigger a hot reload of the peer table in the running ogate
@@ -83,7 +95,7 @@ pub enum Command {
 /// Execute the parsed CLI.
 ///
 /// `preloaded_cfg` carries the OgateConfig already parsed by `main` for
-/// commands that need one (`Up`/`Show`).  Other commands ignore it.
+/// commands that need one (`Up`, `Show`, and `Check`). Other commands ignore it.
 /// Reusing the parse avoids reading the file twice (once for tokio
 /// runtime knobs in main, once here).
 pub async fn run(
@@ -113,6 +125,13 @@ pub async fn run(
                     "internal: Show without preloaded config".into()
                 })?;
             show(&cfg);
+        }
+        #[cfg(unix)]
+        Command::Check { peer, .. } => {
+            let cfg = preloaded_cfg.ok_or("internal: Check without preloaded config")?;
+            crate::pnet_check::run(cfg, peer.as_deref())
+                .await
+                .map_err(|error| format!("{error:#}"))?;
         }
         Command::Reload { pid } => {
             send_sighup(pid)?;

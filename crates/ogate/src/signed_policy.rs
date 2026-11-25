@@ -140,8 +140,16 @@ impl SignedRoutes {
             "signed policy requires a daemon with a verified local membership and P-Net authority support"
         ))?;
         anyhow::ensure!(
+            authority.root.network_id == self.root.network_id,
+            "daemon P-Net network ID differs from signed_policy.network_id"
+        );
+        anyhow::ensure!(
+            authority.root.owner_algorithm == self.root.owner_algorithm,
+            "daemon P-Net owner algorithm differs from signed_policy.owner_algo"
+        );
+        anyhow::ensure!(
             authority.root == self.root,
-            "daemon P-Net network or owner does not match signed_policy"
+            "daemon P-Net owner key differs from signed_policy.owner_pubkey"
         );
         anyhow::ensure!(
             authority.is_current(now),

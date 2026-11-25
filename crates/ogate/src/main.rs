@@ -9,15 +9,21 @@ fn main() -> std::process::ExitCode {
     // Load config eagerly for commands that have one so we can use
     // its [runtime] + [logging] sections.  Commands without a config
     // (`reload`, `app-id`) fall back to defaults.
-    let cfg_for_runtime: Option<OgateConfig> = match &cli.command {
-        Command::Up { config } | Command::Show { config } => match OgateConfig::from_path(config) {
+    let config_path = match &cli.command {
+        Command::Up { config } | Command::Show { config } => Some(config),
+        #[cfg(unix)]
+        Command::Check { config, .. } => Some(config),
+        Command::Reload { .. } | Command::AppId { .. } | Command::GenConfig { .. } => None,
+    };
+    let cfg_for_runtime = match config_path {
+        Some(config) => match OgateConfig::from_path(config) {
             Ok(c) => Some(c),
             Err(e) => {
                 eprintln!("ogate: failed to load config {}: {e}", config.display());
                 return std::process::ExitCode::FAILURE;
             }
         },
-        Command::Reload { .. } | Command::AppId { .. } | Command::GenConfig { .. } => None,
+        None => None,
     };
 
     // Build the tokio runtime:
