@@ -295,9 +295,15 @@ falls to eight frames or one quarter of the outbox, whichever is
 smaller. The ordinary route order remains the fallback when every
 candidate is under pressure.
 
-This uses local queue occupancy. It does not estimate end-to-end
-capacity. ogate still requires an admitted live session with the
-destination for its virtual IP route.
+Ordered application forwards also consider an active data write or
+flush that has remained pending for at least 150 ms. This can expose
+pressure after the ordinary outbox has drained. The observation ends
+when the write completes or its writer exits. Loss-tolerant datagrams
+continue to use the ordinary outbox signal.
+
+Both observations describe the local hop. An end-to-end capacity
+estimate would require measurements across the path. ogate requires
+an admitted live session with the destination for its virtual IP route.
 
 ## App-layer admission (ogate / oproxy)
 

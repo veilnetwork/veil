@@ -1727,6 +1727,7 @@ async fn writer_task<B: Into<WireBlob>>(
     mut wire_rx: mpsc::Receiver<B>,
     admission: Option<Arc<local_reliable_admission::ReliableWriteAdmission>>,
     source: Option<Arc<local_primary_write::PrimaryWriteState>>,
+    relay_status: Option<Arc<crate::local_datagram_status::LocalDatagramStatus>>,
     metrics: Option<Arc<NodeMetrics>>,
     logger: Arc<NodeLogger>,
     peer_id_short: String,
@@ -1745,14 +1746,20 @@ async fn writer_task<B: Into<WireBlob>>(
         let tracing = crate::rt_trace::rt_trace_enabled();
         let queued_behind = wire_rx.len();
         let pressure_before = source.as_ref().map_or(0, |s| s.observations());
-        match write_with_source_feedback(
-            &mut write_half,
-            &bytes,
-            WRITE_PROGRESS_TIMEOUT,
-            source.as_deref(),
-        )
-        .await
-        {
+        let result = {
+            let _pending_relay_write = relay_status
+                .as_ref()
+                .filter(|_| !blob.control)
+                .map(|status| status.begin_ordered_write(write_started));
+            write_with_source_feedback(
+                &mut write_half,
+                &bytes,
+                WRITE_PROGRESS_TIMEOUT,
+                source.as_deref(),
+            )
+            .await
+        };
+        match result {
             Ok(Ok(())) => {
                 if tracing {
                     let elapsed = write_started.elapsed();
@@ -1935,6 +1942,7 @@ pub fn spawn_writer_task(
     tokio::spawn(writer_task(
         write_half,
         wire_rx,
+        None,
         None,
         None,
         metrics,
@@ -4302,6 +4310,9 @@ impl SessionRunner {
         let local_datagram_status = outbox
             .as_ref()
             .and_then(|outbox| outbox.local_datagram_status());
+        let relay_status = local_datagram_status
+            .as_ref()
+            .filter(|_| self.dispatcher.observe_private_relay_pressure());
         let mut rpc_outbox = self.rpc_outbox.take();
         // hot-standby swap inbox, taken out for the same reason.
         let mut swap_rx = self.hot_standby.swap_rx.take();
@@ -4537,6 +4548,7 @@ impl SessionRunner {
                     .map(|feedback| feedback.writer_admission())
             }),
             writer_source.clone(),
+            relay_status.cloned(),
             self.metrics.clone(),
             Arc::clone(&self.logger),
             hex_short(&self.peer_id),
@@ -6632,7 +6644,13 @@ impl SessionRunner {
                             local_primary_write::PrimaryWriteState::new(outbox.shared_source_activity())
                         });
                         let (new_read, new_tx, new_handle) = self
-                            .swap_transport_plumbing(new_stream, wire_tx, writer_handle, new_source.clone())
+                            .swap_transport_plumbing(
+                                new_stream,
+                                wire_tx,
+                                writer_handle,
+                                new_source.clone(),
+                                relay_status.cloned(),
+                            )
                             .await;
                         read_half = new_read;
                         wire_tx = new_tx;
@@ -7201,6 +7219,7 @@ impl SessionRunner {
         old_wire_tx: mpsc::Sender<WireBlob>,
         mut old_writer_handle: OwnedWriter,
         source: Option<Arc<local_primary_write::PrimaryWriteState>>,
+        relay_status: Option<Arc<crate::local_datagram_status::LocalDatagramStatus>>,
     ) -> (
         tokio::io::ReadHalf<veil_transport::BoxIoStream>,
         mpsc::Sender<WireBlob>,
@@ -7223,6 +7242,7 @@ impl SessionRunner {
             new_rx,
             None,
             source,
+            relay_status,
             self.metrics.clone(),
             Arc::clone(&self.logger),
             hex_short(&self.peer_id),

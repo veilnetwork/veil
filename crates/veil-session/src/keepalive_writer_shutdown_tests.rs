@@ -198,6 +198,7 @@ async fn ordinary_writer_shutdown_still_drains_the_accepted_blob() {
         None,
         None,
         None,
+        None,
         Arc::new(veil_observability::NodeLogger::new_noop()),
         "fixture".into(),
     )));

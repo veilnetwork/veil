@@ -72,6 +72,10 @@ impl DispatcherSink for FrameDispatcher {
         &self.logger
     }
 
+    fn observe_private_relay_pressure(&self) -> bool {
+        self.app_registry.peer_revocations_enabled()
+    }
+
     fn session_tx_registry(&self) -> Option<Arc<RwLock<SessionTxRegistry>>> {
         self.session_tx_registry.clone()
     }

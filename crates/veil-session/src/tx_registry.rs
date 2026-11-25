@@ -1045,7 +1045,7 @@ impl SessionTxRegistry {
         self.senders.get(peer).map(|entry| entry.tx.queued())
     }
 
-    fn ordinary_queue_pressured(&self, peer: &NodeIdBytes) -> Option<bool> {
+    fn relay_pressured(&self, peer: &NodeIdBytes, ordered: bool) -> Option<bool> {
         let entry = self.senders.get(peer)?;
         let (queued, capacity) = entry.tx.ordinary_queue_occupancy()?;
         let high = (capacity - capacity / 4).min(RELAY_PRESSURE_HIGH_FRAMES);
@@ -1061,22 +1061,26 @@ impl SessionTxRegistry {
                 .ordinary_queue_pressured
                 .store(pressured, Ordering::Relaxed);
         }
-        Some(pressured)
+        Some(pressured || (ordered && entry.tx.ordered_writer_pressured()))
     }
 
-    /// Return a live fallback's index only when the preferred ordinary
-    /// outbox is congested. The caller retains its eligible routes and send
-    /// admission policy. Reserved and control queues do not enter this choice.
-    pub fn unpressured_relay_alternative(&self, ordered_hops: &[NodeIdBytes]) -> Option<usize> {
+    /// Return a live fallback's index when the preferred hop has local
+    /// outbound pressure. The caller retains its eligible routes and send
+    /// admission policy. An ordered send also considers its current writer.
+    pub fn unpressured_relay_alternative(
+        &self,
+        ordered_hops: &[NodeIdBytes],
+        ordered: bool,
+    ) -> Option<usize> {
         let [preferred, fallbacks @ ..] = ordered_hops else {
             return None;
         };
-        if fallbacks.is_empty() || self.ordinary_queue_pressured(preferred) != Some(true) {
+        if fallbacks.is_empty() || self.relay_pressured(preferred, ordered) != Some(true) {
             return None;
         }
         fallbacks
             .iter()
-            .position(|peer| self.ordinary_queue_pressured(peer) == Some(false))
+            .position(|peer| self.relay_pressured(peer, ordered) == Some(false))
             .map(|index| index + 1)
     }
 
@@ -1428,15 +1432,23 @@ mod tests {
         for _ in 0..8 {
             assert!(registry.send_to(&preferred, veil_proto::priority::REALTIME, vec![7]));
         }
-        assert!(registry.unpressured_relay_alternative(&hops).is_none());
+        assert!(
+            registry
+                .unpressured_relay_alternative(&hops, true)
+                .is_none()
+        );
         for _ in 0..6 {
             assert!(registry.send_to(&preferred, INTERACTIVE, vec![7]));
         }
-        assert_eq!(registry.unpressured_relay_alternative(&hops), Some(2));
+        assert_eq!(registry.unpressured_relay_alternative(&hops, true), Some(2));
         for _ in 0..6 {
             assert!(registry.send_to(&alternate, INTERACTIVE, vec![7]));
         }
-        assert!(registry.unpressured_relay_alternative(&hops).is_none());
+        assert!(
+            registry
+                .unpressured_relay_alternative(&hops, true)
+                .is_none()
+        );
     }
 
     /// A full queue is load, and the caller can tell it from a dead session.

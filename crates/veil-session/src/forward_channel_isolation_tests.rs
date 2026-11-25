@@ -157,6 +157,7 @@ async fn own_keepalive_does_not_hold_neutral_forward_behind_a_full_canonical_wri
         None,
         None,
         None,
+        None,
         Arc::new(veil_observability::NodeLogger::new_noop()),
         "fixture".into(),
     )));

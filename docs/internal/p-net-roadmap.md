@@ -1819,6 +1819,17 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   returns to the pin after recovery. An IPC test verifies the same
   choice for an ordinary private application send and preserves the
   established public send order.
+- Ordinary private forwards also consider the canonical writer
+  once an active data write or flush has been pending for 150 ms.
+  It publishes only a local timestamp while that operation is in
+  progress. Completion, cancellation and transport replacement
+  release the observation. Loss-tolerant forwards keep using the
+  ordinary outbox signal to avoid interpreting unrelated ordered
+  traffic as datagram congestion.
+- The writer test blocks a buffered flush on a bounded duplex
+  stream. The alternative becomes eligible with zero frames in
+  both ordinary outboxes. Draining or cancelling the write removes
+  that preference. A write marked as control leaves it unchanged.
 
 #### Cancelling acknowledged retries after revocation
 

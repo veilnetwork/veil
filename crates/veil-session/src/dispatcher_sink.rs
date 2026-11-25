@@ -153,6 +153,11 @@ pub trait DispatcherSink: Send + Sync {
 
     // ── Setup / rare-event accessors ──────────────────────────────
 
+    /// Observe ordered write delays for local private relay selection.
+    fn observe_private_relay_pressure(&self) -> bool {
+        false
+    }
+
     /// Session-TX registry handle.  `None` for test fixtures that
     /// stand up a dispatcher without cross-session routing infrastructure.
     fn session_tx_registry(&self) -> Option<Arc<RwLock<SessionTxRegistry>>>;

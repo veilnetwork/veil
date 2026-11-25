@@ -2215,6 +2215,7 @@ async fn independent_primary_expiry_keeps_parent_control_admission() {
         Some(admission.writer_admission()),
         None,
         None,
+        None,
         Arc::new(veil_observability::NodeLogger::new_noop()),
         "control-gate".into(),
     ));

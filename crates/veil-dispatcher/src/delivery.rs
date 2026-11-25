@@ -1270,6 +1270,7 @@ impl FrameDispatcher {
             traffic_class,
             carrier.as_ref(),
             relay_hops_out,
+            !lossy_retry,
         ) && may_retry
         {
             let envelope_hash = blake3::hash(&payload.envelope.encode());
@@ -1288,6 +1289,7 @@ impl FrameDispatcher {
         traffic_class: u8,
         carrier: Option<&veil_anonymity::circuit_carrier::Carrier>,
         relay_hops_out: u8,
+        ordered: bool,
     ) -> bool {
         // sovereign fast-path. If a live, authenticated
         // session exists to the recipient's identity, forward directly
@@ -1478,7 +1480,7 @@ impl FrameDispatcher {
             // acquired while session_tx_registry is held).
             let mut sent_hop: Option<[u8; 32]> = None;
             let alternative = if carrier.is_none() && self.app_registry.peer_revocations_enabled() {
-                reg_guard.unpressured_relay_alternative(&candidates)
+                reg_guard.unpressured_relay_alternative(&candidates, ordered)
             } else {
                 None
             };

@@ -69,6 +69,7 @@ async fn failed_writer_releases_without_shutdown(fail_flush: bool) {
         None,
         None,
         None,
+        None,
         Arc::new(veil_observability::NodeLogger::new_noop()),
         "fixture".into(),
     ));
@@ -175,6 +176,90 @@ fn remote_priority_cannot_select_local_control_admission() {
 }
 
 #[tokio::test]
+async fn ordered_writer_pressure_guides_private_relays_with_empty_outboxes() {
+    use super::{WireBlob, writer_task};
+    use crate::SessionTxRegistry;
+    use std::sync::Arc;
+
+    let mut registry = SessionTxRegistry::with_capacity(8);
+    let preferred = [1; 32];
+    let alternate = [2; 32];
+    let preferred_queue = registry.register(preferred);
+    let _alternate_queue = registry.register(alternate);
+    let relay_status = preferred_queue.local_datagram_status().unwrap();
+    let hops = [preferred, alternate];
+    let (stream, mut peer) = tokio::io::duplex(1);
+    let stream: veil_transport::BoxIoStream =
+        Box::new(tokio::io::BufWriter::with_capacity(1024, stream));
+    let (_read, write) = tokio::io::split(stream);
+    let (tx, rx) = tokio::sync::mpsc::channel::<WireBlob>(1);
+    let mut writer = super::OwnedWriter(tokio::spawn(writer_task(
+        write,
+        rx,
+        None,
+        None,
+        Some(Arc::clone(&relay_status)),
+        None,
+        Arc::new(veil_observability::NodeLogger::new_noop()),
+        "private-relay-fixture".into(),
+    )));
+    let send = |control| {
+        tx.try_send(WireBlob {
+            bytes: veil_bufpool::pooled_shared_from_vec(b"data".to_vec()),
+            control,
+            primary_feedback: None,
+        })
+        .unwrap();
+    };
+    assert_eq!(registry.unpressured_relay_alternative(&hops, true), None);
+
+    // Pure control writes cannot move application routes even if their
+    // buffered flush is held. Wait until the writer has attempted the flush.
+    send(true);
+    let mut first = [0];
+    peer.read_exact(&mut first).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(registry.unpressured_relay_alternative(&hops, true), None);
+    let mut tail = [0; 3];
+    peer.read_exact(&mut tail).await.unwrap();
+    assert_eq!(&tail, b"ata");
+
+    send(false);
+    peer.read_exact(&mut first).await.unwrap();
+    let wait_for_pressure = || async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while registry.unpressured_relay_alternative(&hops, true) != Some(1) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a pending ordered write should expose transport pressure");
+    };
+    wait_for_pressure().await;
+    assert_eq!(registry.queued_for(&preferred), Some(0));
+    assert_eq!(registry.queued_for(&alternate), Some(0));
+    assert_eq!(registry.unpressured_relay_alternative(&hops, false), None);
+
+    peer.read_exact(&mut tail).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while registry
+            .unpressured_relay_alternative(&hops, true)
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    send(false);
+    wait_for_pressure().await;
+    writer.0.abort();
+    assert!((&mut writer).await.unwrap_err().is_cancelled());
+    assert_eq!(registry.unpressured_relay_alternative(&hops, true), None);
+}
+
+#[tokio::test]
 async fn stalled_stream_primary_holds_other_producers_without_losing_bytes() {
     stalled_primary_preserves_bytes(false).await;
 }
@@ -205,6 +290,7 @@ async fn stalled_primary_preserves_bytes(buffered: bool) {
         rx,
         None,
         Some(Arc::clone(&source)),
+        None,
         None,
         Arc::new(veil_observability::NodeLogger::new_noop()),
         "fixture".into(),
@@ -286,6 +372,7 @@ async fn stalled_neutral_writer_does_not_claim_primary_pressure() {
         rx,
         None,
         Some(Arc::clone(&source)),
+        None,
         None,
         Arc::new(veil_observability::NodeLogger::new_noop()),
         "fixture".into(),

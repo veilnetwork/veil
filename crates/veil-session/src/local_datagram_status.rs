@@ -1,7 +1,13 @@
 //! Endpoint-local readiness. Nothing here is encoded on the wire or requested
 //! from a relay. A lease belongs to one canonical runner credential generation.
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{
+    Arc, Mutex, OnceLock, Weak,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::Instant;
 use veil_util::lock;
+
+const ORDERED_WRITE_PRESSURE_MS: u64 = 150;
 
 pub(crate) const LOCAL_DATAGRAM_PRIORITIES: [u8; 5] = [
     veil_proto::priority::REALTIME,
@@ -28,6 +34,23 @@ pub use veil_types::LocalDatagramChannelState;
 pub(crate) struct LocalDatagramStatus {
     state: Mutex<State>,
     notify: tokio::sync::Notify,
+    ordered_write_started: AtomicU64,
+}
+
+fn monotonic_ms(now: Instant) -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = now.saturating_duration_since(*START.get_or_init(|| now));
+    u64::try_from(elapsed.as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
+}
+
+pub(crate) struct PendingOrderedWrite<'a>(&'a AtomicU64);
+
+impl Drop for PendingOrderedWrite<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -50,6 +73,20 @@ fn bit(local_lane: u8) -> Option<u8> {
 }
 
 impl LocalDatagramStatus {
+    // One ordered writer owns an outbox at a time. Transport swap awaits
+    // the old writer before the replacement publishes through this slot.
+    pub(crate) fn begin_ordered_write(&self, now: Instant) -> PendingOrderedWrite<'_> {
+        self.ordered_write_started
+            .store(monotonic_ms(now), Ordering::Relaxed);
+        PendingOrderedWrite(&self.ordered_write_started)
+    }
+
+    pub(crate) fn ordered_writer_pressured(&self) -> bool {
+        let started = self.ordered_write_started.load(Ordering::Relaxed);
+        started != 0
+            && monotonic_ms(Instant::now()).saturating_sub(started) >= ORDERED_WRITE_PRESSURE_MS
+    }
+
     pub(crate) fn set_runner_starting(&self, starting: bool) {
         lock!(self.state).runner_starting = starting;
     }

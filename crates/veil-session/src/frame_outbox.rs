@@ -406,6 +406,10 @@ impl FrameSender {
         })
     }
 
+    pub(crate) fn ordered_writer_pressured(&self) -> bool {
+        self.status.ordered_writer_pressured()
+    }
+
     pub fn capacity(&self) -> usize {
         self.ordinary.capacity() + self.reserved.capacity() + self.network_control.capacity()
     }
