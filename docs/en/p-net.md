@@ -540,6 +540,13 @@ ogate rechecks those peers first. Each existing admission remains
 bounded by the previous policy and membership deadlines until the daemon
 confirms it again.
 
+Gateways with an installed policy can also enable `pnet_routed = true` and
+set `routed_membership_cert` to their local membership certificate. A
+signed assignment then becomes eligible for relayed IP traffic after a
+fresh authenticated round trip. Removed and reassigned addresses lose
+their prior proof, and the current policy deadline still applies to every
+packet.
+
 ### Automatic snapshot delivery
 
 Keep the first installation explicit on every node. To let a node

@@ -35,19 +35,78 @@ const ROUTE_LIFETIME: Duration = Duration::from_secs(18);
 const LOCAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const RETRY_AFTER: Duration = Duration::from_secs(5);
 
+type Assignment = Arc<AtomicBool>;
+
+/// Only the route task publishes eligible peers, after resolving the address
+/// policy. Each assignment remains valid across continuous, unchanged grants.
+#[derive(Default)]
+pub(crate) struct ProbeRoster {
+    peers: BTreeMap<NodeId, Assignment>,
+    policy_window: Option<(u64, u64)>,
+}
+
+fn policy_current(window: Option<(u64, u64)>, unix: u64) -> bool {
+    unix != 0 && window.is_none_or(|(from, until)| unix >= from && unix < until)
+}
+
+impl ProbeRoster {
+    pub(crate) fn updated(
+        &self,
+        peers: impl Iterator<Item = NodeId>,
+        policy_window: Option<(u64, u64)>,
+        same_addresses: impl Fn(&NodeId) -> bool,
+    ) -> Self {
+        let unix = unix_secs_now_u64();
+        let preserve =
+            policy_current(self.policy_window, unix) && policy_current(policy_window, unix);
+        let mut assignments = BTreeMap::new();
+        for peer in peers {
+            let previous = self
+                .peers
+                .get(&peer)
+                .filter(|_| preserve && same_addresses(&peer));
+            let assignment = previous
+                .cloned()
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
+            assignments.insert(peer, assignment);
+        }
+        for (peer, previous) in &self.peers {
+            if !assignments
+                .get(peer)
+                .is_some_and(|current| Arc::ptr_eq(current, previous))
+            {
+                previous.store(false, Ordering::Release);
+            }
+        }
+        Self {
+            peers: assignments,
+            policy_window,
+        }
+    }
+
+    pub(crate) fn matches(&self, peer: &NodeId, proof: &RouteProof) -> bool {
+        self.peers
+            .get(peer)
+            .is_some_and(|assignment| Arc::ptr_eq(assignment, &proof.assignment))
+    }
+}
+
 /// An old route snapshot cannot outlive withdrawal of its proof.
 #[derive(Clone)]
 pub(crate) struct RouteProof {
     valid: Arc<AtomicBool>,
     lease_until: Instant,
     cert_until: u64,
+    assignment: Assignment,
+    policy_window: Option<(u64, u64)>,
 }
 
 impl RouteProof {
     pub(crate) fn allows_at(&self, now: Instant, unix: u64) -> bool {
         self.valid.load(Ordering::Acquire)
+            && self.assignment.load(Ordering::Acquire)
             && now < self.lease_until
-            && unix != 0
+            && policy_current(self.policy_window, unix)
             && (self.cert_until == 0 || unix < self.cert_until)
     }
 
@@ -70,14 +129,20 @@ impl RouteLeases<'_> {
         }
     }
 
-    fn renew(&mut self, peer: NodeId, cert_until: u64) {
+    fn renew(
+        &mut self,
+        peer: NodeId,
+        cert_until: u64,
+        assignment: &Assignment,
+        policy_window: Option<(u64, u64)>,
+    ) {
         if self.report.is_none() {
             return;
         }
         let now = Instant::now();
         let unix = unix_secs_now_u64();
         let valid = self.active.get(&peer).and_then(|previous| {
-            if previous.allows_at(now, unix) {
+            if previous.allows_at(now, unix) && Arc::ptr_eq(&previous.assignment, assignment) {
                 Some(Arc::clone(&previous.valid))
             } else {
                 previous.revoke();
@@ -90,6 +155,8 @@ impl RouteLeases<'_> {
                 valid: valid.unwrap_or_else(|| Arc::new(AtomicBool::new(true))),
                 lease_until: now + ROUTE_LIFETIME,
                 cert_until,
+                assignment: Arc::clone(assignment),
+                policy_window,
             },
         );
         self.publish();
@@ -188,15 +255,17 @@ struct Challenge {
 
 struct Peer {
     app_id: AppId,
+    assignment: Assignment,
     pending: Option<Challenge>,
     probe_after: Instant,
     answer_after: Instant,
 }
 
 impl Peer {
-    fn new(app_id: AppId, now: Instant) -> Self {
+    fn new(app_id: AppId, assignment: Assignment, now: Instant) -> Self {
         Self {
             app_id,
+            assignment,
             pending: None,
             probe_after: now,
             answer_after: now,
@@ -223,6 +292,7 @@ struct Gateway {
     node: NodeId,
     namespace: String,
     name: String,
+    socket: PathBuf,
     authority: PnetAuthority,
 }
 
@@ -238,6 +308,7 @@ impl Gateway {
             node,
             namespace,
             name,
+            socket: cfg.socket_path.clone(),
             authority,
         }
     }
@@ -246,17 +317,20 @@ impl Gateway {
         veil_app::address::app_id(peer, &self.namespace, &self.name)
     }
 
-    fn reconcile(&self, cfg: &OgateConfig, peers: &mut BTreeMap<NodeId, Peer>) {
+    fn reconcile(&self, roster: &ProbeRoster, peers: &mut BTreeMap<NodeId, Peer>) {
         let mut updated = BTreeMap::new();
         let now = Instant::now();
-        for entry in &cfg.peers {
-            let mut node = NodeId::default();
-            if hex::decode_to_slice(&entry.node_id, &mut node).is_ok() && node != self.node {
-                updated.entry(node).or_insert_with(|| {
-                    peers
-                        .remove(&node)
-                        .unwrap_or_else(|| Peer::new(self.app_id(&node), now))
-                });
+        for (&node, assignment) in &roster.peers {
+            if node != self.node {
+                let peer = peers
+                    .remove(&node)
+                    .filter(|peer| Arc::ptr_eq(&peer.assignment, assignment));
+                updated.insert(
+                    node,
+                    peer.unwrap_or_else(|| {
+                        Peer::new(self.app_id(&node), Arc::clone(assignment), now)
+                    }),
+                );
             }
         }
         *peers = updated;
@@ -264,16 +338,17 @@ impl Gateway {
 }
 
 pub(crate) async fn run(
-    mut config: watch::Receiver<OgateConfig>,
+    gateway_config: OgateConfig,
+    mut roster: watch::Receiver<Arc<ProbeRoster>>,
     certificate_path: PathBuf,
     node: NodeId,
     authority: PnetAuthority,
     report: Option<watch::Sender<Arc<RouteProofs>>>,
 ) {
-    let gateway = Gateway::new(&config.borrow(), node, authority);
+    let gateway = Gateway::new(&gateway_config, node, authority);
     let mut first_failure = true;
-    while authority.is_current(unix_secs_now_u64()) && config.has_changed().is_ok() {
-        match serve(&gateway, &certificate_path, &mut config, report.as_ref()).await {
+    while authority.is_current(unix_secs_now_u64()) && roster.has_changed().is_ok() {
+        match serve(&gateway, &certificate_path, &mut roster, report.as_ref()).await {
             Ok(()) => return,
             Err(error) if first_failure => {
                 tracing::warn!(%error, "routed P-Net checks unavailable");
@@ -324,14 +399,13 @@ async fn verified_expiry(
 async fn serve(
     gateway: &Gateway,
     certificate_path: &Path,
-    config: &mut watch::Receiver<OgateConfig>,
+    roster: &mut watch::Receiver<Arc<ProbeRoster>>,
     report: Option<&watch::Sender<Arc<RouteProofs>>>,
 ) -> anyhow::Result<()> {
-    let socket = config.borrow().socket_path.clone();
     let certificate = read_certificate(certificate_path)
         .await
         .context("read the local routed membership certificate")?;
-    let client = VeilClient::connect_for_pnet_status(socket, true).await?;
+    let client = VeilClient::connect_for_pnet_status(&gateway.socket, true).await?;
     ensure!(
         client.pnet_authority() == Some(gateway.authority)
             && gateway.authority.is_current(unix_secs_now_u64())
@@ -375,7 +449,11 @@ async fn serve(
         },
     };
     let mut peers = BTreeMap::new();
-    gateway.reconcile(&config.borrow_and_update(), &mut peers);
+    let mut policy_window = {
+        let configured = roster.borrow_and_update();
+        gateway.reconcile(&configured, &mut peers);
+        configured.policy_window
+    };
     let mut cursor = None;
     let mut pace = interval(PROBE_SPACING);
     pace.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -406,14 +484,26 @@ async fn serve(
                     Ok(_) => {}
                 }
             }
-            changed = config.changed() => {
+            changed = roster.changed() => {
                 if changed.is_err() {
                     return Ok(());
                 }
-                gateway.reconcile(&config.borrow_and_update(), &mut peers);
-                exchange.leases.retain(|node, _| peers.contains_key(node));
+                let configured = Arc::clone(&roster.borrow_and_update());
+                gateway.reconcile(&configured, &mut peers);
+                exchange.leases.retain(|node, proof| configured.matches(node, proof));
+                if configured.policy_window != policy_window {
+                    policy_window = configured.policy_window;
+                    // Give carried routes a chance to renew before the earlier
+                    // policy's deadline. Keep challenges already in flight.
+                    let now = Instant::now();
+                    for (node, peer) in &mut peers {
+                        if peer.pending.is_none() && exchange.leases.active.contains_key(node) {
+                            peer.probe_after = now;
+                        }
+                    }
+                }
             }
-            _ = pace.tick() => {
+            _ = pace.tick(), if !peers.is_empty() => {
                 if !exchange.leases.active.is_empty() {
                     let now = Instant::now();
                     let unix = unix_secs_now_u64();
@@ -426,7 +516,7 @@ async fn serve(
                 if let Some(node) = next {
                     cursor = Some(node);
                     let peer = peers.get_mut(&node).expect("selected configured peer");
-                    if !config.has_changed().unwrap_or(true) {
+                    if current_roster(roster, &node, peer).is_some() {
                         exchange.probe(node, peer).await?;
                     }
                 }
@@ -434,11 +524,26 @@ async fn serve(
             message = receiver.recv() => {
                 let message = message?.context("routed check endpoint closed")?;
                 if let Some(peer) = peers.get_mut(&message.src_node_id) {
-                    exchange.receive(&message, peer, config).await?;
+                    exchange.receive(&message, peer, roster).await?;
                 }
             }
         }
     }
+}
+
+fn current_roster(
+    roster: &watch::Receiver<Arc<ProbeRoster>>,
+    node: &NodeId,
+    peer: &Peer,
+) -> Option<Arc<ProbeRoster>> {
+    let roster = roster.borrow();
+    (roster
+        .peers
+        .get(node)
+        .is_some_and(|assignment| Arc::ptr_eq(assignment, &peer.assignment))
+        && peer.assignment.load(Ordering::Acquire)
+        && policy_current(roster.policy_window, unix_secs_now_u64()))
+    .then(|| Arc::clone(&roster))
 }
 
 struct Exchange<'a> {
@@ -493,12 +598,13 @@ impl Exchange<'_> {
         &mut self,
         message: &IncomingMessage,
         peer: &mut Peer,
-        config: &watch::Receiver<OgateConfig>,
+        roster: &watch::Receiver<Arc<ProbeRoster>>,
     ) -> anyhow::Result<()> {
         let Some(proof) = Proof::from_message(message, peer.app_id, self.local_app) else {
             return Ok(());
         };
-        if config.has_changed().unwrap_or(true) || !current(self.local_expiry) {
+        let node = message.src_node_id;
+        if current_roster(roster, &node, peer).is_none() || !current(self.local_expiry) {
             return Ok(());
         }
         let now = Instant::now();
@@ -513,7 +619,6 @@ impl Exchange<'_> {
             Kind::Answer if !peer.expects(&proof.nonce, now) => return Ok(()),
             Kind::Answer => {}
         }
-        let node = message.src_node_id;
         let expiry = match verified_expiry(self.client, &node, proof.certificate).await {
             Ok(Some(expiry)) => expiry,
             Ok(None) => {
@@ -526,7 +631,10 @@ impl Exchange<'_> {
                 return Ok(());
             }
         };
-        if config.has_changed().unwrap_or(true) || !current(self.local_expiry) || !current(expiry) {
+        let Some(configured) = current_roster(roster, &node, peer) else {
+            return Ok(());
+        };
+        if !current(self.local_expiry) || !current(expiry) {
             return Ok(());
         }
         match proof.kind {
@@ -539,7 +647,8 @@ impl Exchange<'_> {
                     (0, until) | (until, 0) => until,
                     (local, remote) => local.min(remote),
                 };
-                self.leases.renew(node, cert_until);
+                self.leases
+                    .renew(node, cert_until, &peer.assignment, configured.policy_window);
                 tracing::debug!(
                     peer = %hex::encode(node),
                     provenance = ?message.provenance,
@@ -591,7 +700,7 @@ mod tests {
     #[test]
     fn answer_consumes_only_a_matching_unexpired_challenge() {
         let now = Instant::now();
-        let mut peer = Peer::new([1; 32], now);
+        let mut peer = Peer::new([1; 32], Arc::new(AtomicBool::new(true)), now);
         let nonce = [2; 32];
         let deadline = now + CHALLENGE_LIFETIME;
         peer.pending = Some(Challenge { nonce, deadline });
@@ -609,24 +718,68 @@ mod tests {
             report: Some(&report),
         };
         let member = [7; 32];
-        leases.renew(member, 0);
+        let assignment = Arc::new(AtomicBool::new(true));
+        leases.renew(member, 0, &assignment, None);
         let first = snapshot.borrow()[&member].clone();
         let now = Instant::now();
         let unix = unix_secs_now_u64();
         assert!(first.allows_at(now, unix));
         assert!(!first.allows_at(first.lease_until, unix));
 
-        leases.renew(member, unix + 5);
+        leases.renew(member, unix + 5, &assignment, None);
         let second = snapshot.borrow()[&member].clone();
         assert!(!second.allows_at(now, unix + 5));
         leases.revoke(&member);
         assert!(!first.allows_at(now, unix));
         assert!(!second.allows_at(now, unix));
 
-        leases.renew(member, 0);
+        leases.renew(member, 0, &assignment, None);
         let third = snapshot.borrow()[&member].clone();
         assert!(third.allows_at(now, unix));
         drop(leases);
         assert!(!third.allows_at(now, unix));
+    }
+
+    #[test]
+    fn policy_replacement_carries_only_continuous_address_assignments() {
+        let unix = unix_secs_now_u64();
+        let old_window = Some((unix - 1, unix + 10));
+        let renewed_window = Some((unix - 1, unix + 60));
+        let unchanged = [1; 32];
+        let reassigned = [2; 32];
+        let deleted = [3; 32];
+        let original = ProbeRoster::default().updated(
+            [unchanged, reassigned, deleted].into_iter(),
+            old_window,
+            |_| false,
+        );
+        let (report, snapshot) = watch::channel(Arc::new(RouteProofs::new()));
+        let mut leases = RouteLeases {
+            active: RouteProofs::new(),
+            report: Some(&report),
+        };
+        for (&node, assignment) in &original.peers {
+            leases.renew(node, 0, assignment, old_window);
+        }
+        let issued = Arc::clone(&snapshot.borrow());
+        let replacement = original.updated(
+            [unchanged, reassigned].into_iter(),
+            renewed_window,
+            |node| *node == unchanged,
+        );
+        let now = Instant::now();
+        assert!(replacement.matches(&unchanged, &issued[&unchanged]));
+        assert!(issued[&unchanged].allows_at(now, unix));
+        assert!(!issued[&unchanged].allows_at(now, unix + 10));
+        for node in [reassigned, deleted] {
+            assert!(!replacement.matches(&node, &issued[&node]));
+            assert!(!issued[&node].allows_at(now, unix));
+        }
+        let restored = replacement.updated(
+            [unchanged, reassigned, deleted].into_iter(),
+            renewed_window,
+            |_| true,
+        );
+        assert!(!restored.matches(&deleted, &issued[&deleted]));
     }
 }

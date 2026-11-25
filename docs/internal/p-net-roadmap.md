@@ -46,8 +46,11 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   up to 18 seconds after each verified reply, bounded by both certificate
   deadlines. Direct admission retains precedence. The packet path checks
   the current route lease, authenticated origin, peer app ID, and virtual
-  source address. Routed admission from an owner-signed address policy
-  remains to be integrated.
+  source address. With `[signed_policy]`, the probe roster comes from the
+  same verified assignments as the packet path. Address removal or
+  reassignment invalidates previous leases and outstanding probes.
+  Unchanged assignments can carry leases through a policy update, with
+  the old policy deadline still in effect until a fresh proof arrives.
 - The daemon enforces bans at app send and delivery and publishes newly
   active bans to local clients that requested membership verification.
   `ogate` invalidates the affected route and outstanding challenge on
@@ -74,6 +77,17 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   replies, and a checked 64 KiB TCP transfer. All 48 SDK test datagrams
   arrived while routed admission was enabled. A direct link with a
   daemon that lacks certificate verification returned ten ICMP replies.
+- On the same cross-link with an owner-signed policy and mixed relay
+  daemons, both address families reached their assigned peers. A gateway
+  installed an additive revision from its authenticated mirror during
+  690 IPv4 pings, with zero loss on the unchanged assignments. The stand
+  used the maximum 32 ms batch window. An older revision was rejected.
+  Reassigning a gateway's address withdrew its old route, and restoring
+  the assignment required a fresh proof. A peer removed from an active
+  policy lost both address families while its membership and relay links
+  remained active. A short successor policy carried live traffic before
+  expiry and denied both families afterwards over the same links. All
+  48 SDK datagrams arrived.
 
 ## 2. Qualify mixed versions and load
 

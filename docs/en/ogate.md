@@ -45,9 +45,9 @@ If untrusted peers might be on the Veil network, use `authorized`.
 
 ### IP routes through P-Net relays
 
-On Linux, macOS and FreeBSD, gateways with `pnet_required = true` and an
-explicit `peers` table can set `routed_membership_cert` to the path of their
-own Veil daemon's owner-signed membership certificate. Both gateways need
+On Linux, macOS and FreeBSD, gateways with `pnet_required = true` can set
+`routed_membership_cert` to the path of their own Veil daemon's owner-signed
+membership certificate. Both gateways need
 the setting, `mode = "authorized"`, and a daemon that supports membership
 verification over local IPC. Restart the gateway after changing the path.
 
@@ -57,6 +57,12 @@ default and requires a restart. Route leases last at most 18 seconds
 without a fresh response and expire earlier if either certificate expires.
 The local daemon enforces active bans on packets and notifies the gateway to
 withdraw the route. Directly admitted peers keep their existing IP paths.
+
+Peers can come from `peers` or an installed `[signed_policy]` snapshot. A
+signed assignment also bounds the route by its policy deadline. Removing
+or reassigning an address revokes the corresponding lease. An unchanged
+assignment can carry its lease until the original deadline while a fresh
+probe runs under the new policy.
 
 At debug log level (`ogate -v up`), `verified routed P-Net reachability`
 records a fresh round trip authenticated as the configured peer. Each

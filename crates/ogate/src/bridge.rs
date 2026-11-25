@@ -45,6 +45,7 @@ use crate::app_id::{derive_app_id, namespace_for};
 use crate::batch::{BatchIter, EgressBatches, is_batch_envelope};
 use crate::config::OgateConfig;
 use crate::packet_drops::{DropReason, PacketDrops, record_one};
+use crate::routed_proofs::{ProbeRoster, RouteProofs};
 use crate::routing::{Decision, NodeId, RoutingTable, parse_ip_endpoints};
 use crate::signed_policy::{SignedRoutes, assigned_peers};
 use crate::tun::{Device, Reader, Writer};
@@ -112,7 +113,7 @@ pub struct SharedState {
     pub peer_app_ids: Vec<(NodeId, [u8; 32])>,
     // Only finite deadlines need a wall-clock read on the packet path.
     pnet_expiries: HashMap<NodeId, u64>,
-    routed_proofs: crate::routed_proofs::RouteProofs,
+    routed_proofs: RouteProofs,
     policy_window: Option<(u64, u64)>,
     policy_revision: Option<u64>,
     configured_peers: usize,
@@ -194,14 +195,10 @@ impl SharedState {
         }
     }
 
-    fn with_routed_admissions(
-        &self,
-        direct: &HashMap<NodeId, u64>,
-        proofs: &crate::routed_proofs::RouteProofs,
-    ) -> Self {
+    fn with_routed_admissions(&self, direct: &HashMap<NodeId, u64>, proofs: &RouteProofs) -> Self {
         let now = tokio::time::Instant::now();
         let unix = unix_secs_now_u64();
-        let routed_proofs: crate::routed_proofs::RouteProofs = proofs
+        let routed_proofs: RouteProofs = proofs
             .iter()
             .filter(|(peer, proof)| {
                 !direct.contains_key(*peer)
@@ -224,6 +221,7 @@ impl SharedState {
         &mut self,
         previous: &SharedState,
         admitted: &mut HashMap<NodeId, u64>,
+        routed_in_use: bool,
         now: u64,
     ) {
         let Some((from, until)) = previous.policy_window else {
@@ -250,7 +248,7 @@ impl SharedState {
             true
         });
 
-        if !admitted.is_empty()
+        if (routed_in_use || !admitted.is_empty())
             && previous
                 .peer_app_ids
                 .iter()
@@ -278,7 +276,8 @@ impl SharedState {
 
     fn cert_is_current(&self, peer: &NodeId) -> bool {
         if let Some(proof) = self.routed_proofs.get(peer) {
-            return proof.allows_at(tokio::time::Instant::now(), unix_secs_now_u64());
+            let now = unix_secs_now_u64();
+            return self.policy_allows_at(now) && proof.allows_at(Instant::now(), now);
         }
         let expiry = self.pnet_expiries.get(peer).copied();
         if expiry.is_none() && self.policy_window.is_none() {
@@ -1210,14 +1209,30 @@ struct RouteBinding {
     signed: Option<(Arc<SignedRoutes>, PnetAuthority)>,
     recent: Arc<SyncMutex<RecentAdmissions>>,
     admission_ipc: Option<watch::Sender<AdmissionIpcState>>,
-    routed: Option<watch::Receiver<Arc<crate::routed_proofs::RouteProofs>>>,
+    routed: Option<watch::Receiver<Arc<RouteProofs>>>,
+    probe_roster: Option<watch::Sender<Arc<ProbeRoster>>>,
 }
 
 impl RouteBinding {
     fn routes(&self, configured: &SharedState, direct: &HashMap<NodeId, u64>) -> SharedState {
         match &self.routed {
-            Some(routed) => configured.with_routed_admissions(direct, &routed.borrow()),
+            Some(routed) => {
+                let proofs = Arc::clone(&routed.borrow());
+                configured.with_routed_admissions(direct, &proofs)
+            }
             None => configured.with_pnet_admissions(direct),
+        }
+    }
+
+    fn update_probe_roster(&self, previous: &SharedState, configured: &SharedState) {
+        if let Some(report) = &self.probe_roster {
+            let roster = Arc::clone(&report.borrow());
+            let updated = roster.updated(
+                configured.peer_app_ids.iter().map(|(peer, _)| *peer),
+                configured.policy_window,
+                |peer| configured.table.same_peer_addresses(&previous.table, peer),
+            );
+            report.send_replace(Arc::new(updated));
         }
     }
 
@@ -1849,8 +1864,32 @@ async fn serve_link(
         })
     });
     let (proof_report, routed) = if cfg.pnet_routed {
-        let (report, routed) = watch::channel(Arc::new(crate::routed_proofs::RouteProofs::new()));
+        let (report, routed) = watch::channel(Arc::new(RouteProofs::new()));
         (Some(report), Some(routed))
+    } else {
+        (None, None)
+    };
+    let (probe_roster, routed_proofs) = if let Some(certificate) = &cfg.routed_membership_cert {
+        if let Some(authority) = authority.filter(|_| client.supports_pnet_member_verification()) {
+            let initial = ProbeRoster::default().updated(
+                configured.peer_app_ids.iter().map(|(peer, _)| *peer),
+                configured.policy_window,
+                |_| false,
+            );
+            let (report, roster) = watch::channel(Arc::new(initial));
+            let task = tokio::spawn(crate::routed_proofs::run(
+                cfg.clone(),
+                roster,
+                certificate.clone(),
+                binding.node_id,
+                authority,
+                proof_report,
+            ));
+            (Some(report), Some(task))
+        } else {
+            tracing::warn!("routed P-Net checks require membership verification from the daemon");
+            (None, None)
+        }
     } else {
         (None, None)
     };
@@ -1864,25 +1903,12 @@ async fn serve_link(
             recent: Arc::clone(&recent),
             admission_ipc,
             routed,
+            probe_roster,
         },
         configured,
         Arc::clone(&state),
         route_changes,
     ));
-    let routed_proofs = cfg.routed_membership_cert.as_ref().and_then(|certificate| {
-        if let Some(authority) = authority.filter(|_| client.supports_pnet_member_verification()) {
-            Some(tokio::spawn(crate::routed_proofs::run(
-                bridge.accepted.subscribe(),
-                certificate.clone(),
-                binding.node_id,
-                authority,
-                proof_report,
-            )))
-        } else {
-            tracing::warn!("routed P-Net checks require membership verification from the daemon");
-            None
-        }
-    });
     let (outcome, ingress_finished, egress_finished) = tokio::select! {
         _ = stopping.as_mut() => (Ok(LinkExit::Shutdown), false, false),
         _ = client.wait_disconnected() => (Ok(LinkExit::DaemonDisconnected), false, false),
@@ -2284,13 +2310,15 @@ async fn maintain_routes(
                     || new.pnet_required != config.pnet_required
                     || new.peers != config.peers
                 {
-                    configured = match SharedState::build(&new) {
+                    let routes = match SharedState::build(&new) {
                         Ok(full) => full,
                         Err(error) => {
                             tracing::warn!(%error, "could not build ogate routes");
                             continue;
                         }
                     };
+                    binding.update_probe_roster(&configured, &routes);
+                    configured = routes;
                 }
                 config = new;
                 next_peer = 0;
@@ -2335,18 +2363,18 @@ async fn maintain_routes(
                 Ok(Some((snapshot, mut routes))) => {
                     if connection
                         .as_ref()
-                        .is_some_and(|client| !client.is_disconnected())
+                        .is_none_or(|client| client.is_disconnected())
                     {
-                        routes.preserve_signed_admissions(
-                            &configured,
-                            &mut admitted,
-                            unix_secs_now_u64(),
-                        );
-                    } else {
                         admitted.clear();
                         connection = None;
                         session_refresh = None;
                     }
+                    routes.preserve_signed_admissions(
+                        &configured,
+                        &mut admitted,
+                        !state.load().routed_proofs.is_empty(),
+                        unix_secs_now_u64(),
+                    );
                     admission_order = prioritize_signed_admissions(
                         admission_order
                             .as_deref()
@@ -2356,6 +2384,7 @@ async fn maintain_routes(
                     );
                     tracing::info!(revision = snapshot.revision, "loaded signed P-Net policy");
                     active_policy = Some(snapshot);
+                    binding.update_probe_roster(&configured, &routes);
                     configured = routes;
                     true
                 }
@@ -2369,13 +2398,15 @@ async fn maintain_routes(
                     admission_order = None;
                     // Signed mode validates the base config with no manual
                     // peers. Reuse its empty route table on any policy error.
-                    match SharedState::build(&config) {
-                        Ok(empty) => configured = empty,
+                    let empty = match SharedState::build(&config) {
+                        Ok(empty) => empty,
                         Err(error) => {
                             tracing::error!(%error, "could not rebuild empty signed policy routes");
-                            configured = configured.with_pnet_admissions(&HashMap::new());
+                            configured.with_pnet_admissions(&HashMap::new())
                         }
-                    }
+                    };
+                    binding.update_probe_roster(&configured, &empty);
+                    configured = empty;
                     true
                 }
             };
@@ -3094,7 +3125,7 @@ mod tests {
         config.peers[3].node_id = hex::encode([0x10; 32]);
         let mut next = SharedState::build(&config).unwrap();
         next.policy_window = Some((10, 200));
-        next.preserve_signed_admissions(&previous, &mut admissions, 100);
+        next.preserve_signed_admissions(&previous, &mut admissions, false, 100);
         assert_eq!(
             admissions,
             HashMap::from([([0xaa; 32], 106), ([0xa0; 32], 120)])
@@ -3125,7 +3156,7 @@ mod tests {
         }
 
         let mut expired_admissions = HashMap::from([([0xa0; 32], 0)]);
-        next.preserve_signed_admissions(&previous, &mut expired_admissions, 120);
+        next.preserve_signed_admissions(&previous, &mut expired_admissions, false, 120);
         assert!(expired_admissions.is_empty());
     }
 
@@ -3148,15 +3179,21 @@ mod tests {
             name: None,
         });
         let mut expanded = SharedState::build(&config).unwrap();
-        expanded.preserve_signed_admissions(&previous, &mut admitted, 100);
+        expanded.preserve_signed_admissions(&previous, &mut admitted, false, 100);
         assert!(Arc::ptr_eq(
             &expanded.routing_config,
+            &previous.routing_config
+        ));
+        let mut routed_only = SharedState::build(&config).unwrap();
+        routed_only.preserve_signed_admissions(&previous, &mut HashMap::new(), true, 100);
+        assert!(Arc::ptr_eq(
+            &routed_only.routing_config,
             &previous.routing_config
         ));
 
         config.peers[1].addr_v4 = Some(Ipv4Addr::new(10, 99, 0, 5));
         let mut reassigned = SharedState::build(&config).unwrap();
-        reassigned.preserve_signed_admissions(&previous, &mut admitted, 100);
+        reassigned.preserve_signed_admissions(&previous, &mut admitted, true, 100);
         assert_eq!(admitted, HashMap::from([([0xaa; 32], 120)]));
         assert!(!Arc::ptr_eq(
             &reassigned.routing_config,
@@ -3580,6 +3617,7 @@ mod tests {
                 recent: Arc::new(SyncMutex::new(RecentAdmissions::default())),
                 admission_ipc: Some(admission_ipc),
                 routed: None,
+                probe_roster: None,
             },
             configured,
             Arc::clone(&state),
@@ -3958,6 +3996,7 @@ mod tests {
                 recent: Arc::clone(&recent),
                 admission_ipc: None,
                 routed: None,
+                probe_roster: None,
             },
             configured,
             Arc::clone(&state),
@@ -4300,6 +4339,7 @@ mod tests {
                 recent: Arc::new(SyncMutex::new(recent)),
                 admission_ipc: None,
                 routed: None,
+                probe_roster: None,
             },
             configured,
             Arc::clone(&state),

@@ -377,12 +377,10 @@ impl OgateConfig {
             ));
         }
         if self.routed_membership_cert.is_some()
-            && (!self.pnet_required
-                || self.mode != AccessMode::Authorized
-                || self.signed_policy.is_some())
+            && (!self.pnet_required || self.mode != AccessMode::Authorized)
         {
             return Err(ConfigError::Field(
-                "routed_membership_cert requires pnet_required and authorized mode without a signed policy",
+                "routed_membership_cert requires pnet_required and authorized mode",
             ));
         }
         if self.pnet_routed && self.routed_membership_cert.is_none() {
