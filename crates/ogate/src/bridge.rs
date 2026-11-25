@@ -134,22 +134,47 @@ impl SharedState {
     }
 
     fn with_pnet_admissions(&self, admissions: &HashMap<NodeId, u64>) -> Self {
-        let mut state = self.clone();
-        state
-            .table
-            .retain_peers(|peer| admissions.contains_key(peer));
-        state
-            .peer_app_ids
-            .retain(|(peer, _)| admissions.contains_key(peer));
-        state.pnet_expiries = state
-            .peer_app_ids
+        let (table, peer_app_ids) = if admissions.len() <= self.peer_app_ids.len() / 8 {
+            // For sparse admission, look up the admitted peers instead of
+            // copying the configured table and discarding most of it.
+            let mut peer_app_ids: Vec<_> = admissions
+                .keys()
+                .filter_map(|peer| {
+                    self.peer_app_ids
+                        .binary_search_by(|(node_id, _)| node_id.cmp(peer))
+                        .ok()
+                        .map(|index| self.peer_app_ids[index])
+                })
+                .collect();
+            peer_app_ids.sort_unstable_by_key(|(peer, _)| *peer);
+            let table = self
+                .table
+                .select_peers(peer_app_ids.iter().map(|(peer, _)| peer));
+            (table, peer_app_ids)
+        } else {
+            // Dense admission favors scanning the sorted configuration
+            // once over doing an indexed lookup for every admitted peer.
+            let mut table = self.table.clone();
+            table.retain_peers(|peer| admissions.contains_key(peer));
+            let mut peer_app_ids = self.peer_app_ids.clone();
+            peer_app_ids.retain(|(peer, _)| admissions.contains_key(peer));
+            (table, peer_app_ids)
+        };
+        let pnet_expiries = peer_app_ids
             .iter()
             .filter_map(|(peer, _)| {
                 let expires = admissions[peer];
                 (expires != 0).then_some((*peer, expires))
             })
             .collect();
-        state
+        Self {
+            table,
+            peer_app_ids,
+            pnet_expiries,
+            policy_window: self.policy_window,
+            routing_config: Arc::clone(&self.routing_config),
+            mtu: self.mtu,
+        }
     }
 
     fn preserve_signed_admissions(
@@ -1910,6 +1935,51 @@ mod tests {
         let retired = configured.with_pnet_admissions(&HashMap::new());
         assert_eq!(retired.table.lookup_egress(address), Decision::NoRoute);
         assert_eq!(retired.app_id_for(&peer), None);
+    }
+
+    #[test]
+    fn sparse_pnet_routes_keep_dual_stack_admission_and_source_checks() {
+        let mut config = pnet_sweep_config(Path::new("unused"), 4096);
+        config.mode = AccessMode::Authorized;
+        config.peers[0].addr_v6 = Some("fd00::2".parse().unwrap());
+        let configured = SharedState::build(&config).unwrap();
+        let peer = [0xaa; 32];
+        let stranger = [0xbb; 32];
+        let mut expired = [0; 32];
+        expired[1] = 3;
+        let active = configured.with_pnet_admissions(&HashMap::from([
+            (stranger, 0),
+            (peer, 0),
+            (expired, 1),
+        ]));
+
+        assert_eq!(active.table.peer_count(), 2);
+        assert_eq!(active.peer_app_ids[0].0, expired);
+        assert_eq!(active.peer_app_ids[1].0, peer);
+        assert_eq!(active.app_id_for(&peer), configured.app_id_for(&peer));
+        assert_eq!(active.app_id_for(&expired), None);
+        assert_eq!(active.app_id_for(&stranger), None);
+        let generation = &configured.routing_config;
+        assert!(active.permits_queued_egress(generation, &peer, active.app_id_for(&peer).unwrap()));
+
+        for ip in ["10.99.0.2", "fd00::2"] {
+            let ip = ip.parse().unwrap();
+            assert_eq!(active.table.lookup_egress(ip), Decision::Forward(peer));
+            assert_eq!(
+                active.table.lookup_ingress(&peer, Some(ip)),
+                Decision::Forward(peer)
+            );
+            assert_eq!(
+                active.table.lookup_ingress(&stranger, Some(ip)),
+                Decision::Unauthorized
+            );
+        }
+        let unassigned = "10.99.0.4".parse().unwrap();
+        assert_eq!(active.table.lookup_egress(unassigned), Decision::NoRoute);
+        assert_eq!(
+            active.table.lookup_ingress(&peer, Some(unassigned)),
+            Decision::SpoofedSourceIp
+        );
     }
 
     #[test]

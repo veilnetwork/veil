@@ -133,6 +133,21 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   the previous bridge missed a two-second withdrawal deadline. The
   update checked the departing peer first and removed its route within
   the deadline. A joining peer without admission remained unroutable.
+- When at most one eighth of configured peers have admission, ogate
+  builds the published route table from their existing assignments.
+  It uses the full-table filter for denser admission. A macOS ARM64
+  process-local comparison used 4,096 dual-stack assignments. Median
+  projection time went from 242.32 to 0.32 µs for two admitted peers
+  and from 251.72 to 11.40 µs for 64. With all 4,096 peers admitted,
+  both paths took about 471 µs. This measures construction and drop of
+  the routing snapshot. Each projection kept the same peer app IDs
+  and expiry values.
+- A Linux ARM64 QUIC pair with real TUN interfaces and 4,096 configured
+  routes passed traffic in both directions and delivered all 48 SDK
+  chat messages exactly once. The tunnel route was gone 2.23 s after
+  loss of daemon admission. A mixed run with a pre-batch daemon,
+  34 routes and raw TUN packets passed the same checks and withdrew the
+  route in 1.13 s.
 - On three Linux ARM64 nodes with 1,024 routes per node and 32 Mb/s of
   offered UDP on the surviving link, three A/B runs measured route
   withdrawal of 1.72–1.94 s with session events and 3.75–3.78 s with the

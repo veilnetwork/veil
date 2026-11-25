@@ -105,6 +105,32 @@ impl RoutingTable {
     }
 
     #[cfg(unix)]
+    pub(crate) fn select_peers<'a>(
+        &self,
+        peers: impl ExactSizeIterator<Item = &'a NodeId>,
+    ) -> Self {
+        let mut selected = Self {
+            mode: self.mode,
+            pnet_required: self.pnet_required,
+            v4: HashMap::new(),
+            v6: HashMap::new(),
+            by_peer: HashMap::with_capacity(peers.len()),
+        };
+        for peer in peers {
+            if let Some(addresses) = self.by_peer.get(peer) {
+                if let Some(ip) = addresses.v4 {
+                    selected.v4.insert(ip, *peer);
+                }
+                if let Some(ip) = addresses.v6 {
+                    selected.v6.insert(ip, *peer);
+                }
+                selected.by_peer.insert(*peer, addresses.clone());
+            }
+        }
+        selected
+    }
+
+    #[cfg(unix)]
     pub(crate) fn retain_peers(&mut self, mut keep: impl FnMut(&NodeId) -> bool) {
         self.by_peer.retain(|peer, _| keep(peer));
         self.v4.retain(|_, peer| self.by_peer.contains_key(peer));
