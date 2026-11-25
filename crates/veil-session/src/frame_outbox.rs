@@ -398,6 +398,14 @@ impl FrameSender {
         self.ordinary.is_closed() && self.reserved.is_closed() && self.network_control.is_closed()
     }
 
+    pub(crate) fn ordinary_queue_occupancy(&self) -> Option<(usize, usize)> {
+        let queue = &self.ordinary;
+        (!queue.is_closed()).then(|| {
+            let capacity = queue.max_capacity();
+            (capacity.saturating_sub(queue.capacity()), capacity)
+        })
+    }
+
     pub fn capacity(&self) -> usize {
         self.ordinary.capacity() + self.reserved.capacity() + self.network_control.capacity()
     }

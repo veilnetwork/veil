@@ -39,7 +39,7 @@
 use std::collections::HashMap;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -56,6 +56,11 @@ use crate::frame_outbox::{
 // A recreated registry for the same node must not reuse the witness of a
 // prior route lookup that is still in the endpoint's short-lived cache.
 static NEXT_TX_REGISTRATION: AtomicU64 = AtomicU64::new(1);
+
+// Large outboxes can hide substantial queueing delay well before reaching
+// their configured limit. Bound the watermarks by both size and frame count.
+const RELAY_PRESSURE_HIGH_FRAMES: usize = 32;
+const RELAY_PRESSURE_LOW_FRAMES: usize = 8;
 
 /// A priority-tagged frame: `(priority, frame_bytes)`.
 ///
@@ -84,6 +89,7 @@ struct SessionTxEntry {
     tx: FrameSender,
     owner: Option<SessionTxOwner>,
     direct_app_chunks: bool,
+    ordinary_queue_pressured: AtomicBool,
     /// Local registration witness, including replacements under the same peer.
     registration: u64,
 }
@@ -278,6 +284,7 @@ impl SessionTxRegistry {
                 tx,
                 owner: None,
                 direct_app_chunks: false,
+                ordinary_queue_pressured: AtomicBool::new(false),
                 registration: self.latest_registration,
             },
         );
@@ -304,6 +311,7 @@ impl SessionTxRegistry {
                 tx,
                 owner: Some(owner),
                 direct_app_chunks: false,
+                ordinary_queue_pressured: AtomicBool::new(false),
                 registration: self.latest_registration,
             },
         );
@@ -337,6 +345,7 @@ impl SessionTxRegistry {
                 tx,
                 owner: None,
                 direct_app_chunks: false,
+                ordinary_queue_pressured: AtomicBool::new(false),
                 registration: self.latest_registration,
             },
         );
@@ -441,6 +450,7 @@ impl SessionTxRegistry {
                 tx,
                 owner: Some(owner),
                 direct_app_chunks: false,
+                ordinary_queue_pressured: AtomicBool::new(false),
                 registration: self.latest_registration,
             },
         );
@@ -1035,6 +1045,41 @@ impl SessionTxRegistry {
         self.senders.get(peer).map(|entry| entry.tx.queued())
     }
 
+    fn ordinary_queue_pressured(&self, peer: &NodeIdBytes) -> Option<bool> {
+        let entry = self.senders.get(peer)?;
+        let (queued, capacity) = entry.tx.ordinary_queue_occupancy()?;
+        let high = (capacity - capacity / 4).min(RELAY_PRESSURE_HIGH_FRAMES);
+        let low = (capacity / 4).min(RELAY_PRESSURE_LOW_FRAMES);
+        let was_pressured = entry.ordinary_queue_pressured.load(Ordering::Relaxed);
+        let pressured = if was_pressured {
+            queued > low
+        } else {
+            queued >= high
+        };
+        if pressured != was_pressured {
+            entry
+                .ordinary_queue_pressured
+                .store(pressured, Ordering::Relaxed);
+        }
+        Some(pressured)
+    }
+
+    /// Return a live fallback's index only when the preferred ordinary
+    /// outbox is congested. The caller retains its eligible routes and send
+    /// admission policy. Reserved and control queues do not enter this choice.
+    pub fn unpressured_relay_alternative(&self, ordered_hops: &[NodeIdBytes]) -> Option<usize> {
+        let [preferred, fallbacks @ ..] = ordered_hops else {
+            return None;
+        };
+        if fallbacks.is_empty() || self.ordinary_queue_pressured(preferred) != Some(true) {
+            return None;
+        }
+        fallbacks
+            .iter()
+            .position(|peer| self.ordinary_queue_pressured(peer) == Some(false))
+            .map(|index| index + 1)
+    }
+
     /// Evict the `n` least-recently-active sessions to free memory.
     /// Drops the mpsc sender for the oldest sessions. Reads timestamps
     /// via `AtomicU64::load` so it observes whatever the hot send path
@@ -1367,6 +1412,31 @@ mod tests {
                 .is_ok()
         );
         assert!(new_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn relay_queue_selection_ignores_the_reserve_and_closed_fallbacks() {
+        let preferred = [1; 32];
+        let closed = [2; 32];
+        let alternate = [3; 32];
+        let mut registry = SessionTxRegistry::with_capacity(8);
+        let _preferred_queue = registry.register(preferred);
+        let _alternate_queue = registry.register(alternate);
+        drop(registry.register(closed));
+        let hops = [preferred, closed, alternate];
+
+        for _ in 0..8 {
+            assert!(registry.send_to(&preferred, veil_proto::priority::REALTIME, vec![7]));
+        }
+        assert!(registry.unpressured_relay_alternative(&hops).is_none());
+        for _ in 0..6 {
+            assert!(registry.send_to(&preferred, INTERACTIVE, vec![7]));
+        }
+        assert_eq!(registry.unpressured_relay_alternative(&hops), Some(2));
+        for _ in 0..6 {
+            assert!(registry.send_to(&alternate, INTERACTIVE, vec![7]));
+        }
+        assert!(registry.unpressured_relay_alternative(&hops).is_none());
     }
 
     /// A full queue is load, and the caller can tell it from a dead session.

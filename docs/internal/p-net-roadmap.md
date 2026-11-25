@@ -1805,6 +1805,21 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   restored the signed revocation after restart. The macOS SDK chat test
   with the previous daemon again delivered 1,000 messages each way.
 
+#### Selecting a relay before its outgoing queue fills
+
+- An ordinary private application send can move a live fallback ahead
+  of its congested first hop. A private relay can do the same for a
+  single-path forward after ECMP pinning. Both use the live session's
+  ordinary outbox with separate pressure and recovery thresholds.
+  Moving a route later in the list preserves its eligibility and cached
+  entry. This selection needs no new frames or negotiation.
+- A dispatcher regression test queues six of eight frames on an
+  equally scored pinned hop. The old ordering stays on that hop. The
+  new ordering uses the other hop while the first one drains and
+  returns to the pin after recovery. An IPC test verifies the same
+  choice for an ordinary private application send and preserves the
+  established public send order.
+
 #### Cancelling acknowledged retries after revocation
 
 - The pending ACK tracker uses the private network's current ban list.

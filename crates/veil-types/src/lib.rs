@@ -58,6 +58,13 @@ use std::sync::Arc;
 /// `Arc<Mutex<node::session::tx_registry::SessionTxRegistry>>` via a small
 /// adapter newtype in `node::session_glue`.
 pub trait FrameBroadcaster: Send + Sync {
+    /// Prefer a live fallback with ordinary outbox headroom when the first
+    /// eligible relay is under local queue pressure. The index refers to
+    /// the caller's route list.
+    fn unpressured_relay_alternative(&self, _ordered_hops: &[[u8; 32]]) -> Option<usize> {
+        None
+    }
+
     /// Read-only endpoint readiness; never opens a connection or changes a
     /// remote service policy. Unsupported retains legacy route compatibility.
     fn local_datagram_channel_state(

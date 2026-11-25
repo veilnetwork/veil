@@ -2502,6 +2502,13 @@ async fn handle_ipc_send_inner(
                 if let Some(sample) = &candidates {
                     sample.record("source_ready", &forced_relay_hops);
                 }
+            } else if !relay_realtime
+                && ctx.app_registry.peer_revocations_enabled()
+                && forced_relay_hops.len() > 1
+                && let Some(alternative) = reg.unpressured_relay_alternative(&forced_relay_hops)
+                && let Some(prefix) = forced_relay_hops.get_mut(..=alternative)
+            {
+                prefix.rotate_right(1);
             }
             if !forced_relay_hops.is_empty() {
                 use veil_proto::delivery::DeliveryEnvelope;
@@ -3992,6 +3999,54 @@ mod ratchet_send_tests {
                     );
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn private_app_send_tries_a_less_loaded_first_hop() {
+        use veil_session::{SessionTxRegistry, glue::SessionTxBroadcaster};
+
+        let backup = [0x4d; 32];
+        for private in [true, false] {
+            let fx = fixture(vec![RELAY, backup]);
+            wlock!(fx.route_cache).insert(PEER, backup, 20_000, 2);
+            let mut ctx = fx.ctx(true);
+            if private {
+                ctx.app_registry =
+                    Arc::new(AppEndpointRegistry::new().with_peer_revocation_check(|_| false));
+            }
+            let tx = Arc::new(RwLock::new(SessionTxRegistry::with_capacity(8)));
+            let mut preferred = wlock!(tx).register(RELAY);
+            let mut alternate = wlock!(tx).register(backup);
+            ctx.session_tx_registry = Some(Arc::new(SessionTxBroadcaster::new(Arc::clone(&tx))));
+            for _ in 0..6 {
+                assert!(rlock!(tx).send_to(&RELAY, veil_proto::priority::INTERACTIVE, vec![7]));
+            }
+
+            let mut wh = sink().await;
+            handle_ipc_send(
+                &mut SendReply::Inline(&mut wh),
+                &payload(false, b"message through the overlay"),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+            for _ in 0..6 {
+                assert_eq!(&*preferred.try_recv().unwrap().1, &[7]);
+            }
+            let (chosen, frame) = if private {
+                assert!(preferred.try_recv().is_err());
+                (backup, alternate.try_recv().unwrap().1)
+            } else {
+                assert!(alternate.try_recv().is_err());
+                (RELAY, preferred.try_recv().unwrap().1)
+            };
+            let forward =
+                veil_proto::delivery::ForwardPayload::decode(&frame[veil_proto::HEADER_SIZE..])
+                    .unwrap();
+            assert_eq!(forward.next_hop_node_id, chosen);
+            assert_eq!(forward.envelope.recipient.node_id, PEER);
         }
     }
 

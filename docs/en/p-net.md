@@ -285,6 +285,20 @@ preflight leaves configuration and certificate files untouched. Use
 certificate without expiry. Check live peer admission and reachability
 after the restart with `ogate check`.
 
+## Relay selection under load
+
+For private application datagrams, the sender and single-path relays
+can try a live alternative before the preferred session's ordinary
+outbox fills. Pressure starts at 32 queued frames or three quarters of
+the outbox, whichever is smaller. The preference returns once the queue
+falls to eight frames or one quarter of the outbox, whichever is
+smaller. The ordinary route order remains the fallback when every
+candidate is under pressure.
+
+This uses local queue occupancy. It does not estimate end-to-end
+capacity. ogate still requires an admitted live session with the
+destination for its virtual IP route.
+
 ## App-layer admission (ogate / oproxy)
 
 The daemon's P-Net gate decides whether a peer may open an OVL1 session

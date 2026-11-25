@@ -1477,7 +1477,16 @@ impl FrameDispatcher {
             // AFTER releasing reg_guard (lock ordering: rtt_table must not be
             // acquired while session_tx_registry is held).
             let mut sent_hop: Option<[u8; 32]> = None;
-            for (idx, &hop) in candidates.iter().enumerate() {
+            let alternative = if carrier.is_none() && self.app_registry.peer_revocations_enabled() {
+                reg_guard.unpressured_relay_alternative(&candidates)
+            } else {
+                None
+            };
+            let order = alternative
+                .into_iter()
+                .chain((0..candidates.len()).filter(|index| Some(*index) != alternative));
+            for idx in order {
+                let hop = candidates[idx];
                 if try_hop(hop) {
                     // record RTT of the selected route (pre-snapshotted above).
                     let rtt_ms = hop_attrs[idx].rtt_ms;
@@ -3168,6 +3177,93 @@ mod tests {
             notices.try_recv(),
             Ok(AppMessage::DeliveryStage { .. })
         ));
+    }
+
+    #[test]
+    fn private_forward_uses_a_clear_relay_before_the_preferred_queue_is_full() {
+        use crate::make_test_dispatcher;
+        use std::sync::{Arc, RwLock};
+        use veil_proto::delivery::{DeliveryEnvelope, ForwardPayload};
+        use veil_proto::header::{HEADER_SIZE, priority::INTERACTIVE};
+        use veil_proto::recipient::Recipient;
+        use veil_session::SessionTxRegistry;
+        use veil_util::wlock;
+
+        const SENDER: [u8; 32] = [0xA1; 32];
+        const DST: [u8; 32] = [0xC1; 32];
+        const A: [u8; 32] = [0xD1; 32];
+        const B: [u8; 32] = [0xD2; 32];
+        let mut dispatcher = make_test_dispatcher(veil_cfg::NodeRole::Core);
+        dispatcher.app_registry =
+            Arc::new(veil_app::AppEndpointRegistry::new().with_peer_revocation_check(|_| false));
+        dispatcher.local_node_id = [0xDD; 32];
+        dispatcher.multi_path_enabled = false;
+        dispatcher.redundant_send = false;
+        let registry = Arc::new(RwLock::new(SessionTxRegistry::with_capacity(8)));
+        let a = wlock!(registry).register(A);
+        let b = wlock!(registry).register(B);
+        dispatcher.session_tx_registry = Some(registry.clone());
+        {
+            let mut cache = wlock!(dispatcher.route_cache);
+            cache.insert(DST, A, 100, 2);
+            cache.insert(DST, B, 100, 2);
+        }
+        let sender = SENDER.into();
+        let (mut hops, mut attrs, scores) = dispatcher.gather_relay_candidates(DST, sender);
+        assert_eq!(
+            dispatcher.apply_ecmp_pinning(&mut hops, &mut attrs, &scores, SENDER, DST),
+            2
+        );
+        let (preferred, mut busy, mut clear) = if hops[0] == A { (A, a, b) } else { (B, b, a) };
+        for _ in 0..6 {
+            assert!(rlock!(registry).send_to(&preferred, INTERACTIVE, vec![7]));
+        }
+        let forward = |id| {
+            dispatcher.relay_forward(
+                ForwardPayload {
+                    next_hop_node_id: dispatcher.local_node_id,
+                    envelope: DeliveryEnvelope {
+                        recipient: Recipient::any(DST),
+                        sender_node_id: SENDER,
+                        src_app_id: [0xA2; 32],
+                        app_id: [0xA3; 32],
+                        endpoint_id: 0,
+                        content_id: [id; 32],
+                        created_at: veil_util::unix_secs_now_u64(),
+                        ttl_secs: 30,
+                        payload: vec![0x21; 64],
+                        trace_id: 0,
+                        require_ack: false,
+                    },
+                    relay_hops: 0,
+                    delivery_attempt: None,
+                    traffic_class: Some(INTERACTIVE),
+                },
+                sender,
+                INTERACTIVE,
+            );
+        };
+        let content_id = |frame: veil_session::PriorityFrame| {
+            ForwardPayload::decode(&frame.1[HEADER_SIZE..])
+                .unwrap()
+                .envelope
+                .content_id
+        };
+
+        forward(1);
+        assert_eq!(content_id(clear.try_recv().unwrap()), [1; 32]);
+        for _ in 0..3 {
+            assert_eq!(&*busy.try_recv().unwrap().1, &[7]);
+        }
+        forward(2);
+        assert_eq!(content_id(clear.try_recv().unwrap()), [2; 32]);
+        for _ in 0..3 {
+            assert_eq!(&*busy.try_recv().unwrap().1, &[7]);
+        }
+        forward(3);
+        assert_eq!(content_id(busy.try_recv().unwrap()), [3; 32]);
+        assert!(clear.try_recv().is_err());
+        assert_eq!(rlock!(dispatcher.route_cache).lookup_all(&DST), [A, B]);
     }
 
     #[test]
