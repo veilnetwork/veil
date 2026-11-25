@@ -1607,10 +1607,27 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   reporting admission denied. The other two nodes delivered all 48
   SDK messages exactly once after the ban took effect. A control with
   the default schedule kept the peer admitted for the full 12-second
-  observation window. Fast revocation catch-up on rejoin remains open.
+  observation window.
 - With the pre-batch daemon as receiver, the same stand enforced the
   ban after 56.1 s via its periodic local scan. The remaining peers
   delivered all 48 SDK messages exactly once in that mixed-version run.
+- The republish task now observes live authenticated RPC registrations
+  in private mode. A join or a replacement session schedules known
+  bans for early publication. It derives candidate keys from permanent
+  local bans, coalesces scans over 15 seconds, checks at most 32 keys
+  per tick and publishes at most one record early per tick. Recipient
+  selection uses the existing DHT walk. The publisher verifies the
+  record before local storage and again after the walk, before enqueueing.
+- With the default 1,800-second schedule on the same three-node stand,
+  the administrator again created the ban offline with zero replicas.
+  The receiver first admitted the target. The publisher logged an
+  early replication after connecting to the receiver, which withdrew
+  admission 0.714 s after the connection was observed. The two remaining
+  nodes delivered all 48 SDK messages exactly once.
+- With the previous daemon as receiver and the same default schedule,
+  the publisher also logged an early replication. The receiver enforced
+  the ban after 57.0 s via its periodic local scan. The remaining nodes
+  again delivered all 48 SDK messages exactly once.
 
 #### Enforcing revocations on relayed application datagrams
 

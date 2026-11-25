@@ -185,10 +185,12 @@ Pending acknowledged datagrams to a revoked recipient stop retrying,
 including retries that are waiting for relay queue capacity. The
 originating application receives a delivery failure.
 
-An offline node learns about a missed ban when it receives the signed
-record in a later DHT publication. Reconnecting alone does not confirm
-receipt. A holder rechecks the owner's key, the administrator's
-certificate and signature, and the local allowlist before republishing.
+After a private session connects, holders can republish known signed
+bans ahead of the regular DHT schedule. They pace these publications
+and use the usual DHT replica selection. The publisher rechecks the
+owner's key, the administrator's certificate and signature, and the
+local allowlist. `replicas_sent` counts records queued for transmission.
+Verify receipt on the nodes that enforce access.
 
 Confirm it landed on the receiving nodes:
 ```bash

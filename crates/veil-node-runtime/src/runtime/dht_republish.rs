@@ -3,12 +3,85 @@
 //!
 //! Extracted from `runtime/mod.rs` during refactor.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use tokio::time::Instant;
+use veil_abuse::BanList;
+use veil_dht::KademliaService;
 use veil_identity::network_access::NetworkAccessGate;
-use veil_identity::network_ban::BAN_BLOB_MAGIC;
+use veil_identity::network_ban::{BAN_BLOB_MAGIC, ban_dht_key};
+use veil_session::SessionOutbox;
+use veil_util::lock;
 
 use super::{NodeRuntime, lock_tasks, supervised_spawn};
+
+const BAN_CATCH_UP_COOLDOWN: Duration = Duration::from_secs(15);
+const BAN_CATCH_UP_MAX_CHECKS: usize = 32;
+
+#[derive(Default)]
+struct BanCatchUp {
+    sessions: Vec<([u8; 32], [u8; 32])>,
+    pending: bool,
+    next_scan: Option<Instant>,
+    keys: VecDeque<[u8; 32]>,
+}
+
+impl BanCatchUp {
+    fn observe_sessions(
+        &mut self,
+        outbox: &SessionOutbox,
+        bans: &Mutex<BanList>,
+        network_id: &[u8; 32],
+        now: Instant,
+    ) {
+        let current = outbox.live_owned_registrations();
+        if current.is_empty() {
+            self.pending = false;
+            self.keys.clear();
+        } else if current
+            .iter()
+            .any(|peer| self.sessions.binary_search(peer).is_err())
+        {
+            self.pending = true;
+        }
+        self.sessions = current;
+        if !self.pending || !self.keys.is_empty() || self.next_scan.is_some_and(|due| now < due) {
+            return;
+        }
+        self.pending = false;
+        self.next_scan = Some(now + BAN_CATCH_UP_COOLDOWN);
+        // Each accepted signed record creates a permanent local ban. Use
+        // those IDs to address records without scanning unrelated DHT values.
+        let targets: Vec<_> = lock!(bans)
+            .active_bans()
+            .into_iter()
+            .filter(|ban| ban.manual && ban.banned_until.is_none())
+            .map(|ban| ban.peer_id)
+            .collect();
+        self.keys
+            .extend(targets.into_iter().map(|id| ban_dht_key(network_id, &id)));
+    }
+
+    fn next_record(
+        &mut self,
+        dht: &KademliaService,
+        gate: &NetworkAccessGate,
+        now_unix: u64,
+    ) -> Option<([u8; 32], Vec<u8>)> {
+        for _ in 0..BAN_CATCH_UP_MAX_CHECKS {
+            let key = self.keys.pop_front()?;
+            if let Some(value) = dht.peek_value(&key)
+                && value.starts_with(BAN_BLOB_MAGIC)
+                && gate.verify_ban_record_at(&key, &value, now_unix)
+            {
+                return Some((key, value));
+            }
+        }
+        None
+    }
+}
 
 fn republishable_record_at(
     network_gate: Option<&NetworkAccessGate>,
@@ -188,6 +261,7 @@ impl NodeRuntime {
         let mut shutdown_rx = shutdown_tx.subscribe();
         let dht = Arc::clone(&self.dht);
         let network_gate = self.network_gate.clone();
+        let bans = Arc::clone(&self.ban_list);
         let session_outbox = Arc::clone(&self.session_outbox);
         let metrics = self.metrics.clone();
         let logger = Arc::clone(&self.logger);
@@ -196,6 +270,7 @@ impl NodeRuntime {
         let handle = supervised_spawn(Arc::clone(&self.logger), "dht_republish", async move {
             let interval = republish_interval;
             let mut scheduler = veil_dht::republish::RepublishScheduler::new();
+            let mut ban_catch_up = BanCatchUp::default();
             let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(1));
             tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -217,6 +292,27 @@ impl NodeRuntime {
                         scheduler = veil_dht::republish::RepublishScheduler::new();
                     }
                     _ = tick_interval.tick() => {
+                        if let Some(gate) = &network_gate {
+                            ban_catch_up.observe_sessions(
+                                &session_outbox, &bans, &gate.expected_network_id, Instant::now(),
+                            );
+                            if let Some((key, value)) = ban_catch_up.next_record(&dht, gate, veil_util::unix_secs_now_u64()) {
+                                match dht.store_replicated(
+                                    key, value,
+                                    Arc::clone(&session_outbox) as Arc<dyn veil_dht::FrameRouter>,
+                                ).await {
+                                    Ok(sent) if sent > 0 => {
+                                        scheduler.defer_after_publish(key, interval);
+                                        if let Some(m) = &metrics {
+                                            m.add_replicas_published(sent as u64);
+                                        }
+                                        logger.info("network.ban.catch_up", format!("replicas_sent={sent}"));
+                                    }
+                                    Ok(_) => {},
+                                    Err(err) => logger.warn("network.ban.catch_up.failed", err.to_string()),
+                                }
+                            }
+                        }
                         // audit cycle-7 M4: enumerate KEYS only (32 B each) and
                         // fetch values lazily for the few keys actually due
                         // this tick. The previous `stored_entries()` pulled
@@ -313,7 +409,45 @@ mod tests {
         BAN_ENTRY_VERSION, BanEntry, MEMBERSHIP_CERT_VERSION, MembershipCert, SignatureAlgorithm,
     };
 
-    use super::{NetworkAccessGate, NodeRuntime, republishable_record_at};
+    use super::{
+        BAN_CATCH_UP_COOLDOWN, BanCatchUp, BanList, Duration, Instant, Mutex, NetworkAccessGate,
+        NodeRuntime, SessionOutbox, republishable_record_at,
+    };
+
+    #[test]
+    fn ban_catch_up_uses_new_authenticated_registrations_and_coalesces_flaps() {
+        let network = [1; 32];
+        let target = [2; 32];
+        let key = ban_dht_key(&network, &target);
+        let mut bans = BanList::new();
+        bans.ban_manual(target, "signed record candidate");
+        bans.ban([3; 32], "temporary", Some(Duration::from_secs(600)));
+        let bans = Mutex::new(bans);
+        let outbox = SessionOutbox::new();
+        let _unowned = outbox.register([4; 32]);
+        let mut catch_up = BanCatchUp::default();
+        let start = Instant::now();
+
+        catch_up.observe_sessions(&outbox, &bans, &network, start);
+        assert!(catch_up.keys.is_empty());
+        let _first = outbox.register_owned([5; 32], [6; 32]);
+        catch_up.observe_sessions(&outbox, &bans, &network, start);
+        assert_eq!(catch_up.keys.pop_front(), Some(key));
+        assert!(catch_up.keys.is_empty());
+        catch_up.observe_sessions(&outbox, &bans, &network, start + Duration::from_secs(1));
+        assert!(!catch_up.pending);
+
+        let second = outbox.register_owned([5; 32], [7; 32]);
+        catch_up.observe_sessions(&outbox, &bans, &network, start + Duration::from_secs(2));
+        assert!(catch_up.pending && catch_up.keys.is_empty());
+        catch_up.observe_sessions(&outbox, &bans, &network, start + BAN_CATCH_UP_COOLDOWN);
+        assert!(!catch_up.pending);
+        assert_eq!(catch_up.keys.pop_front(), Some(key));
+
+        drop(second);
+        catch_up.observe_sessions(&outbox, &bans, &network, start + 2 * BAN_CATCH_UP_COOLDOWN);
+        assert!(catch_up.sessions.is_empty() && catch_up.keys.is_empty());
+    }
 
     #[test]
     fn p_net_ban_republish_rechecks_the_network_authority() {

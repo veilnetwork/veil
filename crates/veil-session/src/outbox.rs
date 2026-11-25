@@ -254,6 +254,18 @@ impl SessionOutbox {
     pub fn peer_ids(&self) -> Vec<[u8; 32]> {
         lock!(self.senders).keys().copied().collect()
     }
+
+    /// Sorted live RPC registrations, including the authenticated session
+    /// owner so a reconnect to the same peer can be distinguished.
+    pub fn live_owned_registrations(&self) -> Vec<([u8; 32], [u8; 32])> {
+        let mut registrations: Vec<_> = lock!(self.senders)
+            .iter()
+            .filter(|(_, entry)| !entry.tx.is_closed())
+            .filter_map(|(&peer, entry)| entry.owner.map(|owner| (peer, owner)))
+            .collect();
+        registrations.sort_unstable();
+        registrations
+    }
 }
 
 // ── FrameRouter trait impl ───────────────────────────────────────────────────

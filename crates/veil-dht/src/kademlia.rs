@@ -1906,6 +1906,14 @@ impl KademliaService {
         outbox: Arc<dyn FrameRouter>,
     ) -> Result<usize, KademliaError> {
         let is_p_net_ban = value.starts_with(b"PBAN");
+        let verify_ban = |value: &[u8]| {
+            self.network_auth_gate
+                .as_ref()
+                .is_some_and(|gate| gate.verify_ban_record(&key, value))
+        };
+        if is_p_net_ban && !verify_ban(&value) {
+            return Err(KademliaError::InvalidNetworkRecord);
+        }
         let values = if value.get(..2)
             == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_SAMPLES_MAGIC[..])
         {
@@ -1942,6 +1950,11 @@ impl KademliaService {
             self.find_node_iterative_network(key, Arc::clone(&outbox))
                 .await
         };
+        // A certificate can expire during the asynchronous walk. Validate
+        // again before handing the ban to any session outbox.
+        if is_p_net_ban && !closest.is_empty() && !verify_ban(&values[0]) {
+            return Err(KademliaError::InvalidNetworkRecord);
+        }
 
         // Send STORE to each of them via the outbox. Count successes for the
         // observability return value (operator-visible "did the fan-out actually
@@ -2656,9 +2669,18 @@ mod tests {
 
     #[tokio::test]
     async fn ban_replication_finds_a_peer_after_an_empty_lookup() {
+        struct TestGate(std::sync::atomic::AtomicBool);
+        impl crate::NetworkAuthGate for TestGate {
+            fn verify_ban_record(&self, _key: &[u8; 32], value: &[u8]) -> bool {
+                value == b"PBAN-live-test-record"
+                    || (value == b"PBAN-expiring-test-record"
+                        && self.0.swap(false, std::sync::atomic::Ordering::Relaxed))
+            }
+        }
         let key = [0x42; 32];
         let peer = [0x33; 32];
-        let svc = make_test_kademlia_service([0x0A; 32]);
+        let mut svc = make_test_kademlia_service([0x0A; 32]);
+        svc.set_network_auth_gate(Arc::new(TestGate(true.into())));
         let offline = Arc::new(SilentRouter(Vec::new()));
         assert!(
             svc.find_node_iterative_network(key, offline)
@@ -2671,13 +2693,30 @@ mod tests {
             seen: std::sync::Mutex::new(Vec::new()),
         });
         assert_eq!(
-            svc.store_replicated(key, b"PBAN-test-record".to_vec(), online.clone())
+            svc.store_replicated(key, b"PBAN-live-test-record".to_vec(), online.clone())
                 .await
                 .unwrap(),
             1
         );
         let store = veil_proto::family::DiscoveryMsg::Store as u16;
         assert!(online.seen.lock().unwrap().contains(&(peer, store)));
+        online.seen.lock().unwrap().clear();
+        assert!(matches!(
+            svc.store_replicated(key, b"PBAN-expired-test-record".to_vec(), online.clone())
+                .await,
+            Err(KademliaError::InvalidNetworkRecord)
+        ));
+        assert!(!online.seen.lock().unwrap().contains(&(peer, store)));
+        assert_eq!(
+            svc.peek_value(&key).as_deref(),
+            Some(&b"PBAN-live-test-record"[..])
+        );
+        assert!(matches!(
+            svc.store_replicated(key, b"PBAN-expiring-test-record".to_vec(), online.clone())
+                .await,
+            Err(KademliaError::InvalidNetworkRecord)
+        ));
+        assert!(!online.seen.lock().unwrap().contains(&(peer, store)));
     }
 
     /// The replica fan-out must NOT overreach. A peer the table has never heard
