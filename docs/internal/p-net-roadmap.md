@@ -1542,6 +1542,10 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   recoveries used a fresh connection, fresh binding and admission checks.
   The original gateways and TUN interfaces kept forwarding, with SDK
   traffic in both directions.
+  A follow-up with an offered SDK load of 60 Mb/s per node installed six
+  exact snapshots with one subscriber IPC and bind. The control used six
+  of each. The slowest measured update after publishing the next revision
+  was 15.99 s with reuse and 15.13 s on the control, on a 15 s poll cadence.
 - A paired three-node Linux ARM64 run admitted an ordinary private
   member after the first poll. The control ran one extra poll before
   the regular deadline. The candidate ran zero. After the configured
