@@ -1091,6 +1091,11 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   Equal highest revisions with differing valid contents in one poll leave
   the installed revision in force. Unchanged snapshots send only a length
   frame; large downloads and simultaneous requests have fixed bounds.
+- A subscriber watches for admitted-session events on its local polling
+  connection. An event can advance the next poll, with a per-node delay
+  and 4–6 s minimum spacing. It leaves the ordinary deadline in place
+  and permits a single in-flight round. Each poll checks all configured
+  mirrors and revalidates their admission and the signed offers.
 
 - An isolated Linux pair recovered bidirectional TUN traffic after the
   subscriber's original snapshot expired. It fetched the full 217,260-byte
@@ -1098,6 +1103,18 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 - An isolated three-node run refused conflicting snapshots at the highest
   revision, accepted a later revision, and continued receiving updates through
   the secondary mirror after the primary stopped.
+- In a three-node Linux comparison, the primary mirror stayed offline
+  and the secondary joined just after the subscriber's first poll. On
+  the same daemon build, the subscriber installed the 4,096-assignment
+  snapshot 14.82 s after session admission with periodic polling and
+  4.18 s with the session event. Both passed TUN traffic in both
+  directions. The updated gateway also installed a subsequent revision
+  and restored traffic on the same TUN interface in 8.50 s after its
+  local daemon restarted.
+- The updated gateway repeated the conflicting-revision and secondary
+  fallback checks. In manual mode with the pre-batch daemon it passed
+  raw TUN traffic both ways, delivered all 48 SDK messages exactly once
+  and withdrew the route 0.88 s after the daemon reported disconnect.
 
 - In the paired run the mirror propagated address removal, restored access on
   the same TUN, and resumed serving after a daemon restart. A banned member

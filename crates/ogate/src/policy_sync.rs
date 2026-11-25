@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout};
 use veil_identity::network_policy::{MAX_SIGNED_ROUTE_POLICY_BYTES, VerifiedRoutePolicy};
+use veil_proto::event_kind::SESSION_ADMITTED;
 use veil_util::unix_secs_now_u64;
 use veilclient::{
     AppHandle, PNET_ADMISSION_BATCH_MAX_PEERS, PnetAdmission, PnetAuthority, SenderProvenance,
@@ -25,6 +26,7 @@ const ENDPOINT: u32 = 1;
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
 const RECOVERY_POLL_MIN_MS: u64 = 4_000;
 const RECOVERY_POLL_JITTER_MS: u64 = 2_000;
+const SESSION_POLL_DELAY_MS: u64 = 500;
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(12);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_SERVING: usize = PNET_ADMISSION_BATCH_MAX_PEERS;
@@ -281,23 +283,104 @@ async fn subscribe(policy: &Arc<SignedRoutes>, distribution: &Distribution<'_>) 
     ]));
     let window = poll_interval(*expiry.borrow(), unix_secs_now_u64(), phase);
     let jitter = Duration::from_millis(phase % window.as_millis() as u64);
-    let mut next = Instant::now() + jitter;
-    loop {
-        sleep_until(next).await;
+    let recovery = recovery_interval(phase);
+    let event_delay = Duration::from_millis(SESSION_POLL_DELAY_MS + phase % SESSION_POLL_DELAY_MS);
+    let mut earliest = Instant::now();
+    let mut next = earliest + jitter;
+    while distribution.authority.is_current(unix_secs_now_u64()) {
+        // Watch on the same connection that will run the poll. Discard it
+        // after the round along with any unfinished mirror streams.
+        let mut client = match distribution.connect().await {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::debug!(%error, "P-Net policy subscriber IPC unavailable");
+                sleep_until(next.max(Instant::now() + recovery)).await;
+                continue;
+            }
+        };
+        let periodic =
+            match wait_for_policy_poll(&mut client, next, earliest, recovery, event_delay).await {
+                PollWake::Periodic => true,
+                PollWake::SessionAdmitted => false,
+                PollWake::Disconnected => {
+                    tokio::time::sleep(recovery).await;
+                    continue;
+                }
+            };
         let started = Instant::now();
         if !distribution.authority.is_current(unix_secs_now_u64()) {
             return;
         }
-        if let Err(error) = poll_mirrors(policy, distribution, &mirrors).await {
+        if !periodic {
+            tracing::debug!("P-Net session admission expedited mirror polling");
+        }
+        earliest = started + recovery;
+        if let Err(error) = poll_mirrors(policy, distribution, &mirrors, client).await {
             tracing::debug!(%error, "P-Net policy refresh failed");
         }
-        let delay = poll_interval(*expiry.borrow(), unix_secs_now_u64(), phase);
-        let now = Instant::now();
-        next = started + delay;
-        if next <= now {
-            next = now + delay;
+        if periodic {
+            let delay = poll_interval(*expiry.borrow(), unix_secs_now_u64(), phase);
+            let now = Instant::now();
+            next = started + delay;
+            if next <= now {
+                next = now + delay;
+            }
         }
     }
+}
+
+enum PollWake {
+    Periodic,
+    SessionAdmitted,
+    Disconnected,
+}
+
+async fn wait_for_policy_poll(
+    client: &mut VeilClient,
+    next: Instant,
+    earliest: Instant,
+    recovery: Duration,
+    event_delay: Duration,
+) -> PollWake {
+    let mut events = client.events().await;
+    let periodic = next.max(earliest);
+    let mut due = periodic;
+    let mut listen = true;
+    loop {
+        tokio::select! {
+            _ = client.wait_disconnected() => return PollWake::Disconnected,
+            _ = sleep_until(due) => return if due == periodic {
+                PollWake::Periodic
+            } else {
+                PollWake::SessionAdmitted
+            },
+            event = events.recv(), if listen => match event {
+                Some(event) if event.kind == SESSION_ADMITTED => {
+                    if let Some(early) = expedited_poll(Instant::now() + event_delay, earliest, periodic, recovery) {
+                        due = due.min(early);
+                    }
+                }
+                Some(_) => {},
+                None => listen = false,
+            },
+        }
+    }
+}
+
+fn expedited_poll(
+    requested: Instant,
+    earliest: Instant,
+    periodic: Instant,
+    recovery: Duration,
+) -> Option<Instant> {
+    let early = requested.max(earliest);
+    // Leave room for the ordinary timer even if the mirror has a session
+    // but has not started serving policies yet.
+    (early + recovery <= periodic).then_some(early)
+}
+
+fn recovery_interval(phase: u64) -> Duration {
+    Duration::from_millis(RECOVERY_POLL_MIN_MS + phase % RECOVERY_POLL_JITTER_MS)
 }
 
 fn poll_interval(valid_until: u64, now: u64, phase: u64) -> Duration {
@@ -305,9 +388,8 @@ fn poll_interval(valid_until: u64, now: u64, phase: u64) -> Duration {
         return POLL_INTERVAL;
     }
     let remaining = Duration::from_secs(valid_until.saturating_sub(now));
-    let recovery = Duration::from_millis(RECOVERY_POLL_MIN_MS + phase % RECOVERY_POLL_JITTER_MS);
     // Start the recovery cadence near expiry and spread the load across nodes.
-    POLL_INTERVAL.min(remaining.saturating_add(recovery))
+    POLL_INTERVAL.min(remaining.saturating_add(recovery_interval(phase)))
 }
 
 struct Offer {
@@ -342,6 +424,7 @@ async fn poll_mirrors(
     policy: &Arc<SignedRoutes>,
     distribution: &Distribution<'_>,
     mirrors: &[NodeId],
+    client: VeilClient,
 ) -> anyhow::Result<()> {
     let revision = {
         let policy = Arc::clone(policy);
@@ -349,7 +432,6 @@ async fn poll_mirrors(
             .await??
             .revision
     };
-    let client = distribution.connect().await?;
     let admissions = client.peer_pnet_admissions(mirrors).await?;
     let now = unix_secs_now_u64();
     let active: Vec<_> = admissions
@@ -504,6 +586,31 @@ mod tests {
         assert_eq!(poll_interval(102, 100, 0), Duration::from_secs(6));
         assert_eq!(poll_interval(100, 100, 0), Duration::from_secs(4));
         assert_eq!(poll_interval(90, 100, 1_999), Duration::from_millis(5_999));
+    }
+
+    #[test]
+    fn admitted_sessions_advance_polls_with_room_for_the_periodic_retry() {
+        let now = Instant::now();
+        let recovery = recovery_interval(0);
+        let earliest = now + recovery;
+        let periodic = now + POLL_INTERVAL;
+        assert_eq!(
+            expedited_poll(now + Duration::from_secs(2), earliest, periodic, recovery),
+            Some(earliest)
+        );
+        assert_eq!(
+            expedited_poll(periodic - recovery, earliest, periodic, recovery),
+            Some(periodic - recovery)
+        );
+        assert_eq!(
+            expedited_poll(
+                periodic - Duration::from_secs(2),
+                earliest,
+                periodic,
+                recovery
+            ),
+            None
+        );
     }
 
     #[test]
