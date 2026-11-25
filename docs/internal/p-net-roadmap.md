@@ -1003,7 +1003,11 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   admitted routes. Each priority round checks up to four peers through
   the existing single-peer admission query, paced at 125 ms per
   request. Installing a route still requires confirmed admission.
-  The ordinary sweep resumes from its previous position.
+  The ordinary sweep resumes from its previous position. When a
+  snapshot has more candidates than fit in a group and rechecking that
+  group changes the routes, the gateway takes another snapshot after
+  an ordinary sweep group and at least one second after the previous
+  priority group completes.
 - In alternating Linux ARM64 runs with 128 configured peers and one
   late-joining peer, the updated gateway installed the route in
   4.13–4.17 s, withdrew it in 0.04–2.26 s, and restored it in
@@ -1016,6 +1020,22 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   All six runs restored bidirectional traffic on the same gateway and
   TUN interfaces. Every run delivered its 48 SDK chat messages exactly
   once before the remote disconnect.
+- A Linux ARM64 comparison used 24 authenticated spokes and a
+  pre-batch daemon at the gateway. A coordinated restart of 12 spokes
+  exercised route removal and restoration. With 4,096 configured routes,
+  two runs with the updated gateway took 8.42 and 8.60 s to withdraw
+  the affected routes and 8.67 and 8.60 s to restore them. Two runs with
+  the control from `528938e8` took 8.62 and 8.63 s to withdraw the
+  routes and 8.20 and 6.29 s to restore them. Times start when the
+  stand observes the daemon admission state for all 12 spokes.
+- With 128 configured routes, the updated gateway withdrew the routes
+  in 8.51 s and restored them in 5.76 s. The control took 12.57 and
+  10.42 s. All six runs verified the gateway's egress decision for
+  every affected address at both transitions and passed bidirectional
+  TUN probes on two recovered routes. The original TUN interfaces and
+  gateway process stayed up. Two independent UDP streams at 12 Mb/s
+  each delivered all 621,832 datagrams across the six runs, and SDK
+  chat delivered all 576 messages exactly once.
 
 ### Emulated inter-site link
 

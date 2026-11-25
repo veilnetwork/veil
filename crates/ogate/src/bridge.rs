@@ -2014,11 +2014,12 @@ async fn maintain_routes(
             group
         } else {
             live.as_ref().map_or_else(Vec::new, |live| {
-                let mut candidates = live.changed_peers(&configured.peer_app_ids, &admitted);
-                candidates.truncate(priority_size);
-                candidates
+                live.changed_peers(&configured.peer_app_ids, &admitted)
             })
         };
+        let legacy_snapshot_backlog =
+            recheck_sessions && !batched_admission && retry.len() > priority_size;
+        retry.truncate(priority_size);
         let readmission = priority == Some(PriorityCheck::Readmission);
         let signed_retry = binding.signed.is_some()
             && priority.is_none()
@@ -2078,6 +2079,16 @@ async fn maintain_routes(
                             &state,
                             &route_changes,
                         );
+                        // Give the ordinary sweep a group between snapshots.
+                        // Require progress before scheduling another snapshot:
+                        // active but denied peers can stay listed.
+                        if legacy_snapshot_backlog
+                            && !reconnect_legacy
+                            && let Some(refresh) = session_refresh.as_mut()
+                        {
+                            next_session_sweep = Instant::now() + PNET_PRIORITY_RECHECK_SPACING;
+                            refresh.pending.get_or_insert(next_session_sweep);
+                        }
                     }
                 }
                 None => connection = None,
