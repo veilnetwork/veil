@@ -20,6 +20,7 @@
 //! `DiscoveryService`). `Leaf` and `Relay` cannot store.
 
 use std::{
+    collections::BTreeSet,
     sync::atomic::{AtomicU32, Ordering},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -285,6 +286,8 @@ pub struct KademliaService {
     /// which rejects all PBAN-prefixed STOREs as
     /// `KademliaError::InvalidNetworkRecord`.
     network_auth_gate: Option<Arc<dyn super::traits::NetworkAuthGate>>,
+    /// Newly stored verified bans for the private-session replication task.
+    new_network_bans: Arc<Mutex<BTreeSet<[u8; 32]>>>,
     /// Guard-rail counter for [`Self::stored_entries`] — see
     /// [`Self::full_store_materializations`]. `Arc` so a cloned handle counts
     /// into the same place as the service it was cloned from.
@@ -463,6 +466,7 @@ impl KademliaService {
             local_announcement: Arc::new(Mutex::new(None)),
             local_announcement_source: Arc::new(Mutex::new(None)),
             network_auth_gate: None,
+            new_network_bans: Arc::new(Mutex::new(BTreeSet::new())),
             full_store_materializations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -473,6 +477,26 @@ impl KademliaService {
     /// begins with `PBAN`.
     pub fn set_network_auth_gate(&mut self, gate: Arc<dyn super::traits::NetworkAuthGate>) {
         self.network_auth_gate = Some(gate);
+    }
+
+    /// Take the keys of newly stored, verified P-Net bans. Duplicate STOREs
+    /// for a key already present do not schedule another relay pass.
+    pub fn take_new_network_bans(&self) -> BTreeSet<[u8; 32]> {
+        std::mem::take(&mut *lock!(self.new_network_bans))
+    }
+
+    fn queue_new_network_ban(&self, key: [u8; 32]) {
+        let mut pending = lock!(self.new_network_bans);
+        if pending.len() < veil_proto::budget::MAX_BAN_LIST_SIZE {
+            pending.insert(key);
+        }
+    }
+
+    fn store_verified_network_ban(&self, key: [u8; 32], value: Vec<u8>) -> (bool, bool) {
+        let mut inner = lock!(self.inner);
+        let is_new = !inner.store.contains(&key);
+        let accepted = inner.store_insert_with_origin(key, value, super::store::ORIGIN_INTERNAL);
+        (accepted, is_new)
     }
 
     /// Set whether this node accepts STORE / DELETE operations.
@@ -990,13 +1014,13 @@ impl KademliaService {
             // eviction under store pressure — that residual is bounded by
             // periodic DHT republish of live ban records (and replication
             // across the key's shard), not a reserved sticky partition.
-            let accepted = lock!(self.inner).store_insert_with_origin(
-                payload.key,
-                payload.value.clone(),
-                super::store::ORIGIN_INTERNAL,
-            );
+            let (accepted, is_new) =
+                self.store_verified_network_ban(payload.key, payload.value.clone());
             if accepted {
                 gate.ban_stored(&payload.value);
+                if is_new {
+                    self.queue_new_network_ban(payload.key);
+                }
                 if let Some(m) = &self.metrics {
                     m.inc_dht_store();
                 }
@@ -1930,7 +1954,16 @@ impl KademliaService {
             vec![value]
         };
         for value in &values {
-            if value.get(..2) == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_DHT_MAGIC[..])
+            if is_p_net_ban {
+                let (accepted, is_new) = self.store_verified_network_ban(key, value.clone());
+                if accepted && is_new {
+                    self.queue_new_network_ban(key);
+                }
+                if let Some(m) = &self.metrics {
+                    m.inc_dht_store();
+                }
+            } else if value.get(..2)
+                == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_DHT_MAGIC[..])
             {
                 self.store_space_discovery_sample(key, value, super::store::ORIGIN_INTERNAL);
             } else {
@@ -2732,6 +2765,22 @@ mod tests {
         );
         let store = veil_proto::family::DiscoveryMsg::Store as u16;
         assert!(online.seen.lock().unwrap().contains(&(peer, store)));
+        assert_eq!(svc.take_new_network_bans(), [key].into());
+        svc.handle_store(StorePayload::unsigned(
+            key,
+            b"PBAN-live-test-record".to_vec(),
+        ))
+        .unwrap();
+        assert!(svc.take_new_network_bans().is_empty());
+        let received_key = [0x43; 32];
+        for _ in 0..2 {
+            svc.handle_store(StorePayload::unsigned(
+                received_key,
+                b"PBAN-live-test-record".to_vec(),
+            ))
+            .unwrap();
+        }
+        assert_eq!(svc.take_new_network_bans(), [received_key].into());
         online.seen.lock().unwrap().clear();
         assert!(matches!(
             svc.store_replicated(key, b"PBAN-expired-test-record".to_vec(), online.clone())

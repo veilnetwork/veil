@@ -185,13 +185,15 @@ Pending acknowledged datagrams to a revoked recipient stop retrying,
 including retries that are waiting for relay queue capacity. The
 originating application receives a delivery failure.
 
-After a private session connects, the holders of known signed bans
-can send them directly to the new peer if it accepts DHT records.
-These background sends are paced. Regular DHT replication continues
-between nodes that do not share a session. The sender rechecks the
-owner's key, the administrator's certificate and signature, and the
-local allowlist. `replicas_sent` counts peers for which a copy was
-queued. Verify receipt on the nodes that enforce access.
+When a private node first stores a verified signed ban, it schedules a
+background copy for its connected neighbors that accept DHT records.
+A newly connected neighbor can also receive bans already held by the
+node. Both paths share the same send budget, and duplicate copies for a
+stored key do not schedule another pass. The sender rechecks the owner's
+key, the administrator's certificate and signature, and the local
+allowlist. Regular DHT replication continues on its own schedule.
+`replicas_sent` counts peers for which a copy was queued. Verify receipt
+on the nodes that enforce access.
 
 Confirm it landed on the receiving nodes:
 ```bash

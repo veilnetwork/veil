@@ -29,27 +29,39 @@ struct BanReplicaBatch<'a> {
 }
 
 #[derive(Default)]
-struct BanCatchUp {
-    sessions: Vec<SessionRegistration>,
-    pending: BTreeSet<SessionRegistration>,
-    next_scan: Option<Instant>,
+struct BanReplicaQueue {
     keys: VecDeque<[u8; 32]>,
     recipients: Vec<SessionRegistration>,
     next_recipient: usize,
 }
 
+#[derive(Default)]
+struct BanCatchUp {
+    sessions: Vec<SessionRegistration>,
+    pending: BTreeSet<SessionRegistration>,
+    next_scan: Option<Instant>,
+    reconnect: BanReplicaQueue,
+    fresh: BanReplicaQueue,
+    pending_fresh: BTreeSet<[u8; 32]>,
+    prefer_reconnect: bool,
+}
+
 impl BanCatchUp {
     fn observe_sessions(
         &mut self,
+        dht: &KademliaService,
         outbox: &SessionOutbox,
         bans: &Mutex<BanList>,
         network_id: &[u8; 32],
         now: Instant,
     ) {
         let current = outbox.live_owned_registrations();
+        let added_bans = dht.take_new_network_bans();
         if current.is_empty() {
             self.pending.clear();
-            self.keys.clear();
+            self.pending_fresh.clear();
+            self.reconnect = BanReplicaQueue::default();
+            self.fresh = BanReplicaQueue::default();
         } else if self.sessions != current {
             self.pending
                 .retain(|registration| current.binary_search(registration).is_ok());
@@ -61,15 +73,31 @@ impl BanCatchUp {
             );
         }
         self.sessions = current;
+        if !self.sessions.is_empty() {
+            for key in added_bans {
+                if self.pending_fresh.len() >= veil_proto::budget::MAX_BAN_LIST_SIZE {
+                    break;
+                }
+                self.pending_fresh.insert(key);
+            }
+        }
+        if self.fresh.keys.is_empty() && !self.pending_fresh.is_empty() {
+            self.fresh = BanReplicaQueue {
+                keys: std::mem::take(&mut self.pending_fresh)
+                    .into_iter()
+                    .collect(),
+                recipients: self.sessions.clone(),
+                next_recipient: 0,
+            };
+        }
         if self.pending.is_empty()
-            || !self.keys.is_empty()
+            || !self.reconnect.keys.is_empty()
             || self.next_scan.is_some_and(|due| now < due)
         {
             return;
         }
         self.next_scan = Some(now + BAN_CATCH_UP_COOLDOWN);
-        self.recipients = std::mem::take(&mut self.pending).into_iter().collect();
-        self.next_recipient = 0;
+        let recipients = std::mem::take(&mut self.pending).into_iter().collect();
         // Each accepted signed record creates a permanent local ban. Use
         // those IDs to address records without scanning unrelated DHT values.
         let targets: Vec<_> = lock!(bans)
@@ -78,10 +106,34 @@ impl BanCatchUp {
             .filter(|ban| ban.banned_until.is_none())
             .map(|ban| ban.peer_id)
             .collect();
-        self.keys
-            .extend(targets.into_iter().map(|id| ban_dht_key(network_id, &id)));
+        self.reconnect = BanReplicaQueue {
+            keys: targets
+                .into_iter()
+                .map(|id| ban_dht_key(network_id, &id))
+                .collect(),
+            recipients,
+            next_recipient: 0,
+        };
     }
 
+    fn next_batch(&mut self, dht: &KademliaService) -> Option<(&'static str, BanReplicaBatch<'_>)> {
+        let reconnect = (&mut self.reconnect, "network.ban.catch_up");
+        let fresh = (&mut self.fresh, "network.ban.forwarded");
+        let (first, second) = if self.prefer_reconnect {
+            (reconnect, fresh)
+        } else {
+            (fresh, reconnect)
+        };
+        self.prefer_reconnect = !self.prefer_reconnect;
+        first
+            .0
+            .next_batch(dht)
+            .map(|batch| (first.1, batch))
+            .or_else(|| second.0.next_batch(dht).map(|batch| (second.1, batch)))
+    }
+}
+
+impl BanReplicaQueue {
     fn next_batch(&mut self, dht: &KademliaService) -> Option<BanReplicaBatch<'_>> {
         for _ in 0..BAN_CATCH_UP_MAX_CHECKS {
             let key = *self.keys.front()?;
@@ -319,9 +371,9 @@ impl NodeRuntime {
                     _ = tick_interval.tick() => {
                         if let Some(gate) = &network_gate {
                             ban_catch_up.observe_sessions(
-                                &session_outbox, &bans, &gate.expected_network_id, Instant::now(),
+                                &dht, &session_outbox, &bans, &gate.expected_network_id, Instant::now(),
                             );
-                            if let Some(batch) = ban_catch_up.next_batch(&dht) {
+                            if let Some((event, batch)) = ban_catch_up.next_batch(&dht) {
                                 let mut sent = 0;
                                 for (peer, owner) in batch.recipients {
                                     if !dht.peer_serves_dht(peer) {
@@ -340,7 +392,7 @@ impl NodeRuntime {
                                     if let Some(m) = &metrics {
                                         m.add_replicas_published(sent);
                                     }
-                                    logger.info("network.ban.catch_up", format!("replicas_sent={sent}"));
+                                    logger.info(event, format!("replicas_sent={sent}"));
                                 }
                             }
                         }
@@ -441,8 +493,8 @@ mod tests {
     };
 
     use super::{
-        BAN_CATCH_UP_COOLDOWN, BanCatchUp, BanList, Duration, Instant, Mutex, NetworkAccessGate,
-        NodeRuntime, SessionOutbox, republishable_record_at,
+        BAN_CATCH_UP_COOLDOWN, BanCatchUp, BanList, Duration, Instant, KademliaService, Mutex,
+        NetworkAccessGate, NodeRuntime, SessionOutbox, republishable_record_at,
     };
 
     #[test]
@@ -455,30 +507,55 @@ mod tests {
         bans.ban([3; 32], "temporary", Some(Duration::from_secs(600)));
         let bans = Mutex::new(bans);
         let outbox = SessionOutbox::new();
+        let dht = KademliaService::new([100; 32]);
         let _unowned = outbox.register([4; 32]);
         let mut catch_up = BanCatchUp::default();
         let start = Instant::now();
 
-        catch_up.observe_sessions(&outbox, &bans, &network, start);
-        assert!(catch_up.keys.is_empty());
+        catch_up.observe_sessions(&dht, &outbox, &bans, &network, start);
+        assert!(catch_up.reconnect.keys.is_empty());
         let _first = outbox.register_owned([5; 32], [6; 32]);
-        catch_up.observe_sessions(&outbox, &bans, &network, start);
-        assert_eq!(catch_up.keys.pop_front(), Some(key));
-        assert!(catch_up.keys.is_empty());
-        catch_up.observe_sessions(&outbox, &bans, &network, start + Duration::from_secs(1));
+        catch_up.observe_sessions(&dht, &outbox, &bans, &network, start);
+        assert_eq!(catch_up.reconnect.keys.pop_front(), Some(key));
+        assert!(catch_up.reconnect.keys.is_empty());
+        catch_up.observe_sessions(
+            &dht,
+            &outbox,
+            &bans,
+            &network,
+            start + Duration::from_secs(1),
+        );
         assert!(catch_up.pending.is_empty());
 
         let second = outbox.register_owned([5; 32], [7; 32]);
-        catch_up.observe_sessions(&outbox, &bans, &network, start + Duration::from_secs(2));
-        assert!(!catch_up.pending.is_empty() && catch_up.keys.is_empty());
-        catch_up.observe_sessions(&outbox, &bans, &network, start + BAN_CATCH_UP_COOLDOWN);
+        catch_up.observe_sessions(
+            &dht,
+            &outbox,
+            &bans,
+            &network,
+            start + Duration::from_secs(2),
+        );
+        assert!(!catch_up.pending.is_empty() && catch_up.reconnect.keys.is_empty());
+        catch_up.observe_sessions(
+            &dht,
+            &outbox,
+            &bans,
+            &network,
+            start + BAN_CATCH_UP_COOLDOWN,
+        );
         assert!(catch_up.pending.is_empty());
-        assert_eq!(catch_up.keys.pop_front(), Some(key));
-        assert_eq!(catch_up.recipients, vec![([5; 32], [7; 32])]);
+        assert_eq!(catch_up.reconnect.keys.pop_front(), Some(key));
+        assert_eq!(catch_up.reconnect.recipients, vec![([5; 32], [7; 32])]);
 
         drop(second);
-        catch_up.observe_sessions(&outbox, &bans, &network, start + 2 * BAN_CATCH_UP_COOLDOWN);
-        assert!(catch_up.sessions.is_empty() && catch_up.keys.is_empty());
+        catch_up.observe_sessions(
+            &dht,
+            &outbox,
+            &bans,
+            &network,
+            start + 2 * BAN_CATCH_UP_COOLDOWN,
+        );
+        assert!(catch_up.sessions.is_empty() && catch_up.reconnect.keys.is_empty());
     }
 
     #[test]
@@ -505,10 +582,11 @@ mod tests {
             .map(|peer| outbox.register_owned([peer; 32], [peer + 1; 32]))
             .collect();
         let mut catch_up = BanCatchUp::default();
-        catch_up.observe_sessions(&outbox, &Mutex::new(bans), &network, Instant::now());
+        catch_up.observe_sessions(&dht, &outbox, &Mutex::new(bans), &network, Instant::now());
         let mut delivered = Vec::new();
         for expected in [8, 8, 3] {
-            let batch = catch_up.next_batch(&dht).unwrap();
+            let (event, batch) = catch_up.next_batch(&dht).unwrap();
+            assert_eq!(event, "network.ban.catch_up");
             assert_eq!(batch.recipients.len(), expected);
             let header = veil_proto::codec::decode_header(&batch.frame).unwrap();
             assert_eq!(header.priority(), veil_proto::priority::BACKGROUND);

@@ -1648,6 +1648,29 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 - In the three-node mixed-version stand, the previous receiver accepted
   the direct background STORE and enforced the ban at its local scan
   57.2 s after reconnecting. All 48 SDK messages arrived exactly once.
+- A five-node Linux ARM64 chain with stable sessions and the default
+  DHT schedule had the issuer connected only to its immediate neighbor.
+  With join-triggered delivery alone, only the first two nodes held the
+  ban at 35.2 s. The enforcement node three sessions from the issuer
+  still admitted the target.
+- The DHT now signals the first successful storage of a verified ban
+  key. The private replication task shares the existing eight-send
+  budget between newly stored bans and reconnect catch-up. Each hop
+  verifies the stored record again. A duplicate STORE for a key still
+  present in the DHT does not schedule another forwarding pass.
+- On the same five-node chain, the ban crossed three established
+  sessions and the enforcement node denied the target by the 3.23 s
+  sample. A TUN path to the target stopped in both directions with its
+  interfaces present. The neighboring TUN path passed both ways, and
+  those two nodes delivered all 48 SDK messages once.
+  The issuer and three forwarders each logged a single forwarding pass,
+  including after the issuer published the same target again.
+- A repeat of the 49-node reconnect stand with forwarding enabled found
+  all 47 observers had the record and denied admission at the 7.97 s
+  sample. The issuer queued the same six batches of eight or fewer via
+  reconnect catch-up. The revoked TUN path stopped in both directions,
+  the unrevoked path stayed available, and all 48 SDK messages arrived
+  exactly once.
 
 #### Enforcing revocations on relayed application datagrams
 
