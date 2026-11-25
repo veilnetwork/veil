@@ -1428,10 +1428,12 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   the installed revision in force. Unchanged snapshots send only a length
   frame; large downloads and simultaneous requests have fixed bounds.
 - A subscriber watches for admitted-session events on its local polling
-  connection. An event can advance the next poll, with a per-node delay
-  and 4–6 s minimum spacing. It leaves the ordinary deadline in place
-  and permits a single in-flight round. Each poll checks all configured
-  mirrors and revalidates their admission and the signed offers.
+  connection. An event or a reported gap can advance the next poll,
+  with a per-node delay and 4–6 s minimum spacing. It leaves the
+  ordinary deadline in place and permits a single in-flight round.
+  A hint received during that round can also request the next poll.
+  Each poll checks all configured mirrors and revalidates their
+  admission and the signed offers.
 - Failed subscriber IPC connections retry on the same staggered 4–6 s
   cadence. Reconnecting can trigger one early poll under the same
   spacing rule, including when the daemon admitted a mirror while the
@@ -1443,6 +1445,18 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   after 14.66 and 14.85 s. The updated subscriber installed it after 6.40
   and 6.34 s. All runs passed traffic both ways on the original TUN while
   the primary mirror stayed offline.
+- A Linux ARM64 stand replaced the admission event with a gap notice
+  after the subscriber's first poll. With the primary mirror offline,
+  the secondary supplied a signed policy with 4,096 assignments.
+  Two runs with the updated subscriber installed it 4.99 s after
+  observed admission. Controls from `cdd4e7e9` took 14.59 and 14.36 s.
+- In a separate pair, the stand delivered the admission event only
+  while the first poll still had a pending reply from the daemon.
+  The updated subscriber installed the snapshot after 4.74 s and
+  the control took 14.62 s. All six runs stored the exact signed
+  bytes, passed bidirectional traffic on the original subscriber
+  gateway and TUN interface, and delivered all 288 SDK chat messages
+  exactly once.
 
 - An isolated Linux pair recovered bidirectional TUN traffic after the
   subscriber's original snapshot expired. It fetched the full 217,260-byte
