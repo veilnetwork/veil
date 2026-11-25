@@ -328,6 +328,23 @@ compares it with the installed revision in read-only mode. It also works
 when the local snapshot has expired or omits the local device's virtual
 address. A successful check prints both revisions and the offered expiry.
 
+To count local packet drops by reason, add the following to the gateway's
+`ogate.toml` before starting it. The gateway writes `ogate packet drops`
+events at info level for reasons that occurred since the previous report.
+
+```toml
+[logging]
+format = "json"
+packet_drop_report_secs = 10
+```
+
+Each event has a `reason` and a `count`. For example,
+`egress_no_active_route` counts packets without an active route and
+`ingress_oversize` counts packets larger than the receiving TUN's MTU.
+Reasons ending in `_frames` count whole IPC frames. For drops after the
+gateway submits traffic to the daemon, check the daemon's IPC admission
+and session counters.
+
 ### Operator flow
 
 ```bash

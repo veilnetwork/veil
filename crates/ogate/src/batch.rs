@@ -249,6 +249,14 @@ impl EgressBatches {
     }
 
     #[cfg(unix)]
+    pub(crate) fn pending_packet_count(&self) -> u64 {
+        self.by_peer
+            .values()
+            .map(|batch| u64::from(batch.count()))
+            .sum()
+    }
+
+    #[cfg(unix)]
     pub(crate) fn push_packet(
         &mut self,
         peer: NodeId,

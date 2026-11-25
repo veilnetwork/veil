@@ -197,6 +197,10 @@ pub struct LoggingConfig {
     /// JSON-formatted log file for shipping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<std::path::PathBuf>,
+
+    /// Emit reports for locally discarded packets at this cadence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_drop_report_secs: Option<std::num::NonZeroU16>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]

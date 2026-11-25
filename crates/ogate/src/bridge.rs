@@ -38,6 +38,7 @@ use veilclient::{APP_IPC_SEND_PREFIX_BYTES, AppHandle, PnetAuthority, VeilClient
 use crate::app_id::{derive_app_id, namespace_for};
 use crate::batch::{BatchIter, EgressBatches, is_batch_envelope};
 use crate::config::OgateConfig;
+use crate::packet_drops::{DropReason, PacketDrops, record_one};
 use crate::routing::{Decision, NodeId, RoutingTable, parse_ip_endpoints};
 use crate::signed_policy::{SignedRoutes, assigned_peers};
 use crate::tun::{Device, Reader, Writer};
@@ -711,6 +712,7 @@ struct Bridge {
     cert_gate: Option<Arc<crate::app_cert_gate::AppCertGate>>,
     cert_message: Option<Arc<Vec<u8>>>,
     batching_enabled: bool,
+    packet_drops: Option<Arc<PacketDrops>>,
     signed: Option<Arc<SignedRoutes>>,
 }
 
@@ -796,6 +798,17 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
     tracing::info!(iface = %device.name(), "TUN device up");
     let (reader, writer) = device.split();
     let batching_enabled = cfg.batch.enabled;
+    let mut drop_reporter = tokio::task::JoinSet::new();
+    let packet_drops = cfg.logging.packet_drop_report_secs.map(|seconds| {
+        let counters = Arc::new(PacketDrops::default());
+        let reporting = Arc::clone(&counters);
+        drop_reporter.spawn(async move {
+            reporting
+                .report_every(Duration::from_secs(u64::from(seconds.get())))
+                .await;
+        });
+        counters
+    });
     let (accepted, _) = watch::channel(cfg);
     let bridge = Bridge {
         config_path,
@@ -806,6 +819,7 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
         cert_gate: app_cert_gate,
         cert_message,
         batching_enabled,
+        packet_drops,
         signed,
     };
     let mut stopping = std::pin::pin!(wait_for_shutdown());
@@ -925,32 +939,46 @@ async fn serve_link(
         let tun_r = Arc::clone(&bridge.reader);
         let mut shutdown = shutdown_rx;
         let app_sender = Arc::clone(&app_sender);
+        let packet_drops = bridge.packet_drops.clone();
         tokio::spawn(async move {
             let mut tun_r = tun_r.lock().await;
             let mut batches = EgressBatches::with_ipc_prefix();
             let mut buf = Vec::new();
             let mut flush_after = flush_after;
             let mut routing_config = Arc::clone(&state.load().routing_config);
-            let enqueue = async |config: &Arc<()>, peer_nid, peer_app_id, buf, is_batch| {
-                if !state
-                    .load()
-                    .permits_queued_egress(config, &peer_nid, peer_app_id)
-                {
-                    return;
-                }
-                let result = if is_batch {
-                    app_sender
-                        .send_prepared_recoverable(peer_nid, peer_app_id, endpoint_id, buf)
-                        .await
-                } else {
-                    app_sender
-                        .send_prepared(peer_nid, peer_app_id, endpoint_id, buf)
-                        .await
+            let enqueue =
+                async |config: &Arc<()>, peer_nid, peer_app_id, buf: Vec<u8>, is_batch| {
+                    if !state
+                        .load()
+                        .permits_queued_egress(config, &peer_nid, peer_app_id)
+                    {
+                        if let Some(counters) = &packet_drops {
+                            // All queued batch envelopes are constructed locally.
+                            let count = if is_batch {
+                                buf.get(APP_IPC_SEND_PREFIX_BYTES + 1)
+                                    .copied()
+                                    .map_or(0, u64::from)
+                            } else {
+                                1
+                            };
+                            counters.record(DropReason::EgressQueuedRoute, count);
+                        }
+                        return;
+                    }
+                    let result = if is_batch {
+                        app_sender
+                            .send_prepared_recoverable(peer_nid, peer_app_id, endpoint_id, buf)
+                            .await
+                    } else {
+                        app_sender
+                            .send_prepared(peer_nid, peer_app_id, endpoint_id, buf)
+                            .await
+                    };
+                    if let Err(error) = result {
+                        record_one(packet_drops.as_deref(), DropReason::EgressIpcFrame);
+                        tracing::warn!(%error, "ogate egress send failed");
+                    }
                 };
-                if let Err(error) = result {
-                    tracing::warn!(%error, "ogate egress send failed");
-                }
-            };
             loop {
                 // Pick wake-up source: either the TUN reader OR a deadline timer
                 // for the oldest pending batch.  `tokio::time::sleep_until` requires
@@ -988,9 +1016,13 @@ async fn serve_link(
                             // `send_prepared` when we forward `buf` verbatim
                             // (solo-ship and raw paths) — zero memcpy of the
                             // packet body downstream.
-                            if buf.len() <= APP_IPC_SEND_PREFIX_BYTES { continue; }
+                            if buf.len() <= APP_IPC_SEND_PREFIX_BYTES {
+                                record_one(packet_drops.as_deref(), DropReason::EgressInvalidIp);
+                                continue;
+                            }
                             let pkt = &buf[APP_IPC_SEND_PREFIX_BYTES..];
                             let Some((_src, dst)) = parse_ip_endpoints(pkt) else {
+                                record_one(packet_drops.as_deref(), DropReason::EgressInvalidIp);
                                 tracing::trace!("dropping non-ip packet from tun");
                                 continue;
                             };
@@ -1001,6 +1033,7 @@ async fn serve_link(
                                     n
                                 }
                                 Decision::NoRoute => {
+                                    record_one(packet_drops.as_deref(), DropReason::EgressNoRoute);
                                     tracing::trace!(?dst, "egress: no peer for dst, dropping");
                                     continue;
                                 }
@@ -1010,10 +1043,14 @@ async fn serve_link(
                                 }
                             };
                             let Some(peer_app_id) = snap.app_id_for(&peer_nid) else {
+                                record_one(packet_drops.as_deref(), DropReason::EgressAdmission);
                                 tracing::trace!("egress: peer route unavailable");
                                 continue;
                             };
                             if !Arc::ptr_eq(&routing_config, &snap.routing_config) {
+                                if let Some(counters) = &packet_drops {
+                                    counters.record(DropReason::EgressQueuedRoute, batches.pending_packet_count());
+                                }
                                 batches = EgressBatches::with_ipc_prefix();
                                 routing_config = Arc::clone(&snap.routing_config);
                             }
@@ -1031,6 +1068,7 @@ async fn serve_link(
                             // tore the session down. Drop just this packet; the peer
                             // retransmits at a smaller PMTU. Keep tunnel MTU ≤ the ceiling.
                             if pkt.len() > MAX_OBFS4_SOLO_PAYLOAD_BYTES {
+                                record_one(packet_drops.as_deref(), DropReason::EgressOversize);
                                 tracing::warn!(
                                     peer = %hex::encode(peer_nid),
                                     len = pkt.len(),
@@ -1102,6 +1140,7 @@ async fn serve_link(
         let state = Arc::clone(&state);
         let tun_w = Arc::clone(&bridge.writer);
         let app_cert_gate_for_ingress = bridge.cert_gate.clone();
+        let packet_drops = bridge.packet_drops.clone();
         tokio::spawn(async move {
             let mut tun_w = tun_w.lock().await;
             let mut verified_peers = HashMap::new();
@@ -1174,6 +1213,10 @@ async fn serve_link(
                                 }
                             };
                             if !admitted {
+                                record_one(
+                                    packet_drops.as_deref(),
+                                    DropReason::IngressAppCertFrame,
+                                );
                                 tracing::debug!(
                                     src = %hex::encode(im.src_node_id),
                                     "app-cert gate: dropping packet from unverified peer"
@@ -1186,7 +1229,14 @@ async fn serve_link(
                             // MTU/route check; envelope-level MTU cap is NOT
                             // applied — batch buffer is naturally >MTU.
                             for pkt in BatchIter::new(&im.data) {
-                                deliver_one(&mut tun_w, &state, &im.src_node_id, pkt).await;
+                                deliver_one(
+                                    &mut tun_w,
+                                    &state,
+                                    &im.src_node_id,
+                                    pkt,
+                                    packet_drops.as_deref(),
+                                )
+                                .await;
                             }
                         } else {
                             // Legacy single-packet envelope.  Keep the
@@ -1194,6 +1244,7 @@ async fn serve_link(
                             // peer cannot inject a larger-than-MTU frame).
                             let mtu = state.load().mtu;
                             if im.data.len() > mtu as usize {
+                                record_one(packet_drops.as_deref(), DropReason::IngressOversize);
                                 tracing::debug!(
                                     src = %hex::encode(im.src_node_id),
                                     len = im.data.len(),
@@ -1202,7 +1253,14 @@ async fn serve_link(
                                 );
                                 continue;
                             }
-                            deliver_one(&mut tun_w, &state, &im.src_node_id, &im.data).await;
+                            deliver_one(
+                                &mut tun_w,
+                                &state,
+                                &im.src_node_id,
+                                &im.data,
+                                packet_drops.as_deref(),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -1751,9 +1809,11 @@ async fn deliver_one(
     state: &ArcSwap<SharedState>,
     src_node_id: &NodeId,
     pkt: &[u8],
+    packet_drops: Option<&PacketDrops>,
 ) {
     let snap = state.load();
     if pkt.len() > snap.mtu as usize {
+        record_one(packet_drops, DropReason::IngressOversize);
         tracing::debug!(
             src = %hex::encode(src_node_id),
             len = pkt.len(),
@@ -1763,6 +1823,7 @@ async fn deliver_one(
         return;
     }
     if !snap.cert_is_current(src_node_id) {
+        record_one(packet_drops, DropReason::IngressExpired);
         tracing::debug!("ingress: dropping peer with expired P-Net certificate");
         return;
     }
@@ -1772,16 +1833,19 @@ async fn deliver_one(
     match decision {
         Decision::Forward(_) => {
             if let Err(e) = tun_w.write_packet(pkt).await {
+                record_one(packet_drops, DropReason::IngressTunWrite);
                 tracing::warn!(error = %e, "TUN write failed");
             }
         }
         Decision::Unauthorized => {
+            record_one(packet_drops, DropReason::IngressUnauthorized);
             tracing::debug!(
                 src = %hex::encode(src_node_id),
                 "ingress: dropping unauthorized peer",
             );
         }
         Decision::SpoofedSourceIp => {
+            record_one(packet_drops, DropReason::IngressBadSource);
             tracing::debug!(
                 src = %hex::encode(src_node_id),
                 "ingress: dropping spoofed source IP",

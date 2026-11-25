@@ -46,6 +46,8 @@ pub mod cli;
 pub mod config;
 pub mod config_template;
 #[cfg(unix)]
+mod packet_drops;
+#[cfg(unix)]
 mod pnet_check;
 #[cfg(unix)]
 mod policy_sync;

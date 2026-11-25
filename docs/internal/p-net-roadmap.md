@@ -1430,3 +1430,9 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 - In a separate run of the automatic subscriber, the secondary mirror
   restored bidirectional TUN traffic 5.04 s after policy expiry. A mixed
   run with the pre-batch daemon delivered all 48 SDK messages once.
+- An optional `[logging].packet_drop_report_secs` setting reports local
+  drops by reason with interval counts. On Linux, the aggregated missing
+  route counts matched individual packet traces before and after a
+  daemon restart on the same TUN. The receiving gateway counted four
+  oversized sub-packets individually. A gateway with reporting disabled
+  emitted no summary while discarding packets without a route.
