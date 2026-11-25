@@ -1058,6 +1058,21 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   to another member. The regression test supplies both session endpoints
   as referrals and confirms that a third, cached contact still returns
   without any `ResolveTransport` requests.
+- Two alternating Linux ARM64 pairs compared that change against
+  `d573beec` with the same 48 admitted TCP sessions and 167,272 offered
+  datagrams per run. Traffic started 2.50–2.85 s after admission. Each
+  sender offered 7,273 datagrams in the first two seconds. One control
+  had 13 sends at least 15 ms late. All four runs delivered all 200 SDK
+  messages and passed bidirectional probes on all 24 TUN pairs.
+- UDP losses went from 17,912 to 14,800 and from 21,903 to 17,036.
+  SDK p99 towards the hub went from 289 to 510 ms and from 618 to
+  386 ms. Return p99 went from 116 to 101 ms and from 144 to 116 ms.
+  The other 46 containers used approximately 12 CPU-s in every run
+  from daemon startup to the end of the first ten seconds of traffic.
+- A mixed-version QUIC pair with 34 configured routes delivered all
+  48 SDK messages exactly once. The updated side withdrew the route
+  0.819 s after disconnecting the pre-batch daemon. Bidirectional TUN
+  traffic resumed 0.599 s after readmission on the same interfaces.
 
 #### TCP receive queues during cold bulk traffic
 
