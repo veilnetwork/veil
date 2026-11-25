@@ -275,11 +275,27 @@ impl NodeRuntime {
         self.logger.info("node.stop", "runtime stopped");
     }
 
+    fn pending_received_ban_flush(&self) -> Option<impl Future<Output = ()> + use<>> {
+        if self.shutdown_tx.is_none() {
+            return None;
+        }
+        let storage = self.received_ban_storage.as_ref()?;
+        Some(storage.flush_at_stop(
+            Arc::clone(&self.dht),
+            Arc::clone(self.network_gate.as_ref()?),
+            Arc::clone(&self.logger),
+        ))
+    }
+
     pub async fn stop(&mut self) -> Result<()> {
+        let ban_flush = self.pending_received_ban_flush();
         let flush_ctx = self.collect_stop_flush_context();
         let stop_ctx = self.take_stop_tasks_context();
         Self::do_stop_flushes(flush_ctx).await;
         Self::do_stop_tasks(stop_ctx).await;
+        if let Some(flush) = ban_flush {
+            flush.await;
+        }
         self.finalize_stop_state();
         Self::flush_console_at_stop().await;
         Ok(())
@@ -291,12 +307,20 @@ impl NodeRuntime {
     /// Prefer this over `stop` when the runtime is behind an `Arc<Mutex<…>>`
     /// so that concurrent admin commands are not starved.
     pub async fn stop_via_arc(rt: Arc<tokio::sync::Mutex<NodeRuntime>>) -> Result<()> {
-        let (flush_ctx, stop_ctx) = {
+        let (flush_ctx, stop_ctx, ban_flush) = {
             let mut s = rt.lock().await;
-            (s.collect_stop_flush_context(), s.take_stop_tasks_context())
+            let ban_flush = s.pending_received_ban_flush();
+            (
+                s.collect_stop_flush_context(),
+                s.take_stop_tasks_context(),
+                ban_flush,
+            )
         };
         Self::do_stop_flushes(flush_ctx).await;
         Self::do_stop_tasks(stop_ctx).await;
+        if let Some(flush) = ban_flush {
+            flush.await;
+        }
         rt.lock().await.finalize_stop_state();
         Self::flush_console_at_stop().await;
         Ok(())

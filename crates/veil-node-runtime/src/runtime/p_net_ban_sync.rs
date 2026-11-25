@@ -959,6 +959,63 @@ mod tests {
         assert_eq!(&bytes[12..], record.as_slice());
     }
 
+    #[tokio::test]
+    async fn graceful_stop_saves_pending_received_bans_without_a_dht_snapshot() {
+        use std::time::Duration;
+
+        let (dir, mut config) = admin_fixture(veil_cfg::NetworkMode::PrivateConfigured);
+        let config_path = dir.path().join("node.toml");
+        let log_file = dir.path().join("daemon.log");
+        let snapshot = dir.path().join("dht-values.json");
+        config.global.logs = veil_cfg::LogsConfig::File;
+        config.global.log_file = Some(log_file.to_string_lossy().into_owned());
+        config.persist_enabled = true;
+        config.dht.values_persist_path = Some(snapshot.to_string_lossy().into_owned());
+        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        std::fs::create_dir(&snapshot).unwrap();
+        let store = super::super::received_bans::storage_dir(&config).unwrap();
+        let target = [23; 32];
+        let (entry, _) = signed_ban_fixture(target);
+        let key = ban_dht_key(&TEST_NETWORK_ID, &target);
+        let record = encode_ban_blob(&entry);
+        let receipt = store.join(format!("{}.pban", veil_util::bytes_to_hex(&key)));
+        let mut runtime = NodeRuntime::start(&config_path, true).await.unwrap();
+        std::fs::write(&store, b"temporary storage collision").unwrap();
+
+        let earliest = veil_util::unix_secs_now_u64();
+        runtime
+            .dht
+            .handle_store(StorePayload::unsigned(key, record.clone()))
+            .unwrap();
+        let latest = veil_util::unix_secs_now_u64();
+        assert!(lock!(runtime.ban_list).is_banned(&target));
+        tokio::time::timeout(Duration::from_secs(6), async {
+            while std::fs::read_to_string(&log_file)
+                .unwrap()
+                .matches("network.ban.received_storage.failed")
+                .count()
+                < 3
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the writer should be waiting for its next retry");
+
+        std::fs::remove_file(&store).unwrap();
+        runtime.stop().await.unwrap();
+        assert!(snapshot.is_dir());
+        let bytes = std::fs::read(receipt).expect("stop should save the pending received ban");
+        let received_at = u64::from_be_bytes(bytes[4..12].try_into().unwrap());
+        assert!((earliest..=latest).contains(&received_at));
+        assert_eq!(&bytes[12..], record.as_slice());
+        drop(runtime);
+
+        let mut runtime = NodeRuntime::start(&config_path, true).await.unwrap();
+        assert!(lock!(runtime.ban_list).is_banned(&target));
+        runtime.stop().await.unwrap();
+    }
+
     #[test]
     fn incoming_ban_retires_the_sender_only_after_verification_and_storage() {
         let target = [4; 32];

@@ -26,6 +26,7 @@ const BATCH_SIZE: usize = 32;
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(120);
 const FIRST_RETRY: Duration = Duration::from_secs(1);
 const MAX_RETRY: Duration = Duration::from_secs(30);
+const STOP_FLUSH_BUDGET: Duration = Duration::from_secs(1);
 const RECEIVED_MAGIC: &[u8; 4] = b"PBR1";
 const TIMESTAMP_LEN: usize = 8;
 const FILE_LIMIT: usize = RECEIVED_MAGIC.len() + TIMESTAMP_LEN + MAX_BAN_BLOB_SIZE;
@@ -42,6 +43,7 @@ struct Receipt {
     next_backoff: Duration,
 }
 
+#[derive(Clone, Copy)]
 struct RetryRequest {
     key: [u8; 32],
     stamp: ReceiptStamp,
@@ -135,6 +137,25 @@ impl QueueState {
             });
         }
         ready
+    }
+
+    fn take_for_stop(&mut self, unix_now: u64) -> Vec<RetryRequest> {
+        self.expire(unix_now);
+        self.scheduled.clear();
+        let mut pending = Vec::new();
+        for (&key, tracked) in &mut self.known {
+            if matches!(tracked.status, StorageStatus::Saved) {
+                continue;
+            }
+            tracked.status = StorageStatus::Queued;
+            pending.push(RetryRequest {
+                key,
+                stamp: tracked.stamp,
+                next_backoff: FIRST_RETRY,
+            });
+        }
+        pending.sort_unstable_by_key(|request| (request.stamp.received_at, request.key));
+        pending
     }
 }
 
@@ -267,6 +288,60 @@ impl ReceivedBanStorage {
             state.track(key, tracked.stamp, status);
         }
     }
+
+    /// Capture the current storage and DHT before teardown. The future runs
+    /// after session tasks have stopped, so their last accepted receipts are
+    /// included and the flush does not compete with live packet dispatch.
+    pub(super) fn flush_at_stop(
+        &self,
+        dht: Arc<KademliaService>,
+        gate: Arc<NetworkAccessGate>,
+        logger: Arc<NodeLogger>,
+    ) -> impl Future<Output = ()> + use<> {
+        let dir = self.dir.clone();
+        let state = Arc::clone(&self.state);
+        async move {
+            let pending = lock!(state).take_for_stop(unix_secs_now_u64());
+            if pending.is_empty() {
+                return;
+            }
+            let write_logger = Arc::clone(&logger);
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                let deadline = std::time::Instant::now() + STOP_FLUSH_BUDGET;
+                let mut attempted = 0;
+                let mut saved = 0;
+                for requests in pending.chunks(BATCH_SIZE) {
+                    // Let an in-progress filesystem batch finish. Do not
+                    // start another batch after the stop budget is reached.
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    let receipts = load_retry_batch(&dht, &gate, &state, &write_logger, requests);
+                    saved += save_tracked_batch(&dir, &gate, &state, &write_logger, &receipts);
+                    attempted += requests.len();
+                }
+                if saved > 0 {
+                    write_logger.info(
+                        "network.ban.received_storage.saved",
+                        format!("phase=stop records={saved}"),
+                    );
+                }
+                if attempted < pending.len() {
+                    write_logger.warn(
+                        "network.ban.received_storage.stop_incomplete",
+                        format!("remaining={}", pending.len() - attempted),
+                    );
+                }
+            })
+            .await
+            {
+                logger.warn(
+                    "network.ban.received_storage.failed",
+                    format!("phase=stop error={error}"),
+                );
+            }
+        }
+    }
 }
 
 pub(super) struct ReceivedBanWriter {
@@ -330,51 +405,10 @@ impl ReceivedBanWriter {
                 let batch = match batch {
                     WriteBatch::Incoming(batch) => batch,
                     WriteBatch::Retry(ready) => {
-                        load_retry_batch(&dht, &gate, &state, &logger, ready)
+                        load_retry_batch(&dht, &gate, &state, &logger, &ready)
                     }
                 };
-                if batch.is_empty() {
-                    return 0;
-                }
-                let mut saved = 0;
-                let mut failed = 0;
-                let mut first_error = None;
-                let results = save_batch(&dir, &gate, &batch);
-                let mut state = lock!(state);
-                for (receipt, result) in batch.iter().zip(results) {
-                    match result {
-                        Ok(written) => {
-                            saved += usize::from(written);
-                            if let Some(tracked) = state.for_receipt(receipt) {
-                                tracked.status = StorageStatus::Saved;
-                            }
-                        }
-                        Err(error) => {
-                            failed += 1;
-                            if first_error.is_none() {
-                                first_error = Some(error);
-                            }
-                            if state.for_receipt(receipt).is_some() {
-                                state.track(
-                                    receipt.key,
-                                    receipt.stamp,
-                                    StorageStatus::Deferred {
-                                        due: Instant::now() + receipt.next_backoff,
-                                        backoff: receipt.next_backoff,
-                                    },
-                                );
-                            }
-                        }
-                    }
-                }
-                drop(state);
-                if let Some(error) = first_error {
-                    logger.warn(
-                        "network.ban.received_storage.failed",
-                        format!("records={failed} error={error}"),
-                    );
-                }
-                saved
+                save_tracked_batch(&dir, &gate, &state, &logger, &batch)
             })
             .await;
             match saved {
@@ -396,11 +430,11 @@ fn load_retry_batch(
     gate: &NetworkAccessGate,
     state: &Mutex<QueueState>,
     logger: &NodeLogger,
-    ready: Vec<RetryRequest>,
+    ready: &[RetryRequest],
 ) -> Vec<Receipt> {
     let mut batch = Vec::with_capacity(ready.len());
     let mut missing = 0;
-    for RetryRequest {
+    for &RetryRequest {
         key,
         stamp,
         next_backoff,
@@ -435,6 +469,60 @@ fn load_retry_batch(
         );
     }
     batch
+}
+
+fn save_tracked_batch(
+    dir: &Path,
+    gate: &NetworkAccessGate,
+    state: &Mutex<QueueState>,
+    logger: &NodeLogger,
+    batch: &[Receipt],
+) -> usize {
+    if batch.is_empty() {
+        return 0;
+    }
+    let mut saved = 0;
+    let mut failed = 0;
+    let mut first_error = None;
+    let results = save_batch(dir, gate, batch);
+    let mut state = lock!(state);
+    for (receipt, result) in batch.iter().zip(results) {
+        match result {
+            Ok(written) => {
+                saved += usize::from(written);
+                if state.for_receipt(receipt).is_some() {
+                    state.track(receipt.key, receipt.stamp, StorageStatus::Saved);
+                }
+            }
+            Err(error) => {
+                failed += 1;
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                if state
+                    .for_receipt(receipt)
+                    .is_some_and(|tracked| matches!(tracked.status, StorageStatus::Queued))
+                {
+                    state.track(
+                        receipt.key,
+                        receipt.stamp,
+                        StorageStatus::Deferred {
+                            due: Instant::now() + receipt.next_backoff,
+                            backoff: receipt.next_backoff,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    drop(state);
+    if let Some(error) = first_error {
+        logger.warn(
+            "network.ban.received_storage.failed",
+            format!("records={failed} error={error}"),
+        );
+    }
+    saved
 }
 
 fn receipt_parts(bytes: &[u8]) -> Option<(u64, &[u8])> {

@@ -221,6 +221,11 @@ DHT in memory. It preserves their original DHT lifetime. If received-ban
 persistence stays enabled, the replacement background writer resumes
 unfinished writes using the original receipt times.
 
+During graceful shutdown the receiver makes a final pass over pending
+writes. It uses matching signed copies from its local DHT and checks the
+shutdown budget before starting each batch. This also works when the
+ordinary DHT snapshot cannot be written.
+
 Confirm it landed on the receiving nodes:
 ```bash
 veil-cli peers banned

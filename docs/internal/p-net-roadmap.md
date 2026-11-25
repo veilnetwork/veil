@@ -1772,6 +1772,21 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   reload, lost the pending write, and re-admitted the peer after
   restart. Each run delivered 200 TUN probes and 48 SDK messages
   between unaffected participants.
+- Graceful stop retries unfinished received-ban writes after the
+  session tasks stop. It keeps the original receipt times and
+  rechecks matching local DHT copies against the network authority.
+  The writer checks a one-second budget before starting each batch
+  and allows an in-progress filesystem batch to finish.
+- In the five-node Linux ARM64 stand, both builds applied the ban
+  while the received-ban journal and the DHT snapshot could not
+  be written. The test disconnected the receiver's source, restored
+  only the journal path, then used `veil-cli node stop` during retry
+  backoff. The updated receiver saved the original record and
+  exited by the 0.57 s sample. After restart both tunnel directions
+  stayed blocked. The `d45b1816` receiver exited by the 0.56 s
+  sample without the receipt and re-admitted the peer on restart.
+  Each run delivered 200 probes and 48 SDK messages on the
+  unaffected path.
 
 #### Enforcing revocations on relayed application datagrams
 
