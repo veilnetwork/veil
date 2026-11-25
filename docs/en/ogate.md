@@ -309,11 +309,14 @@ The active count respects certificate and signed-policy deadlines even
 between admission sweeps. For signed mode, `policy_state` reports
 `current`, `outside_validity_window` or `unavailable`. The event includes
 the loaded revision and the effective route deadline when available.
-During data IPC rebind, it reports zero active peers. P-Net uses a
-separate status connection for admission. While that connection recovers,
-the data IPC link can report connected with zero active peers. These
-local reports contain only aggregates and policy metadata. Start ogate
-again to change the reporting interval.
+During data IPC rebind, it reports zero active peers. In P-Net mode,
+`admission_ipc_state` describes the separate status connection.
+`unavailable` means establishing or recovering the connection is pending.
+`checking` means the gateway checked the daemon identity and is
+waiting for its first complete admission reply. `ready` means a complete
+reply arrived on that connection. A ready channel can report zero active
+peers. These local reports contain only aggregates and policy metadata.
+Start ogate again to change the reporting interval.
 
 **Which setting wins** (highest to lowest):
 

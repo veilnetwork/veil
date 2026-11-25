@@ -1809,6 +1809,13 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   their respective runs. The peer with reporting disabled emitted no
   status events. The SDK received 1,000 messages in each direction during
   the manual routing run.
+- The periodic report distinguishes the data IPC link from the P-Net
+  admission connection. On Linux, a proxy closed status IPC and held
+  the first reply after reconnect. Manual and signed gateways reported
+  `unavailable`, `checking`, and `ready` on the same data link and TUN.
+  Disconnecting the remote daemon reduced active routes to zero with
+  admission IPC still `ready`. Disconnecting the local daemon reported
+  both connections unavailable. A non-P-Net report omitted the field.
 
 ## 8. Check the fleet before a rolling deployment
 

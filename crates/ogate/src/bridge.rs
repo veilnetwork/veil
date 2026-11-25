@@ -569,10 +569,12 @@ impl StatusReconnect {
         self.delay = (self.delay * 2).min(PNET_REFRESH_PERIOD);
     }
 
-    fn confirmed(&mut self) {
-        if self.delay != PNET_STATUS_RETRY_INITIAL {
-            *self = Self::default();
+    fn confirmed(&mut self) -> bool {
+        if self.delay == PNET_STATUS_RETRY_INITIAL {
+            return false;
         }
+        *self = Self::default();
+        true
     }
 }
 
@@ -1101,6 +1103,29 @@ async fn reconnect_ipc(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdmissionIpcState {
+    Unavailable,
+    Checking,
+    Ready,
+}
+
+impl AdmissionIpcState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Checking => "checking",
+            Self::Ready => "ready",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ReportedRoutes {
+    table: Arc<ArcSwap<SharedState>>,
+    admission_ipc: watch::Receiver<AdmissionIpcState>,
+}
+
 struct Bridge {
     config_path: PathBuf,
     accepted: watch::Sender<OgateConfig>,
@@ -1111,7 +1136,7 @@ struct Bridge {
     cert_message: Option<Arc<Vec<u8>>>,
     batching_enabled: bool,
     packet_drops: Option<Arc<PacketDrops>>,
-    route_status: Option<watch::Sender<Option<Arc<ArcSwap<SharedState>>>>>,
+    route_status: Option<watch::Sender<Option<ReportedRoutes>>>,
     signed: Option<Arc<SignedRoutes>>,
 }
 
@@ -1119,6 +1144,19 @@ struct RouteBinding {
     node_id: NodeId,
     signed: Option<(Arc<SignedRoutes>, PnetAuthority)>,
     recent: Arc<SyncMutex<RecentAdmissions>>,
+    admission_ipc: Option<watch::Sender<AdmissionIpcState>>,
+}
+
+impl RouteBinding {
+    fn report_admission_ipc(&self, state: AdmissionIpcState) {
+        if let Some(report) = &self.admission_ipc {
+            report.send_if_modified(|published| {
+                let changed = *published != state;
+                *published = state;
+                changed
+            });
+        }
+    }
 }
 
 enum LinkExit {
@@ -1139,7 +1177,7 @@ fn reload_signal() -> Option<Signal> {
 async fn report_route_status(
     period: Duration,
     config: watch::Receiver<OgateConfig>,
-    state: watch::Receiver<Option<Arc<ArcSwap<SharedState>>>>,
+    state: watch::Receiver<Option<ReportedRoutes>>,
 ) {
     let mut ticks = tokio::time::interval(period);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1156,11 +1194,13 @@ async fn report_route_status(
         };
         let Some(state) = state.borrow().clone() else {
             tracing::info!(target: "ogate::status", ipc_connected = false, pnet_required,
+                admission_ipc_state = pnet_required.then_some("unavailable"),
                 active_peers = 0, "ogate route status");
             continue;
         };
-        let routes = state.load();
+        let routes = state.table.load();
         let now = unix_secs_now_u64();
+        let admission_ipc_state = pnet_required.then(|| state.admission_ipc.borrow().as_str());
         let policy_state = if !signed_policy {
             None
         } else if routes.policy_window.is_none() {
@@ -1171,6 +1211,7 @@ async fn report_route_status(
             Some("outside_validity_window")
         };
         tracing::info!(target: "ogate::status", ipc_connected = true, pnet_required,
+            admission_ipc_state,
             configured_peers = routes.configured_peers,
             published_peers = routes.peer_app_ids.len(),
             active_peers = routes.active_peers_at(now),
@@ -1321,9 +1362,14 @@ async fn serve_link(
         configured.clone()
     };
     let state = Arc::new(ArcSwap::from_pointee(initial_state));
-    if let Some(status) = &bridge.route_status {
-        status.send_replace(Some(Arc::clone(&state)));
-    }
+    let admission_ipc = bridge.route_status.as_ref().map(|status| {
+        let (report, admission_ipc) = watch::channel(AdmissionIpcState::Unavailable);
+        status.send_replace(Some(ReportedRoutes {
+            table: Arc::clone(&state),
+            admission_ipc,
+        }));
+        report
+    });
     let endpoint_id = cfg.endpoint_id;
     let (app_sender, mut app_receiver) = handle.into_split();
     let app_sender = Arc::new(app_sender);
@@ -1744,6 +1790,7 @@ async fn serve_link(
             node_id: binding.node_id,
             signed,
             recent: Arc::clone(&recent),
+            admission_ipc,
         },
         configured,
         Arc::clone(&state),
@@ -1980,6 +2027,9 @@ async fn maintain_routes(
             session_refresh = None;
             next_peer = 0;
             next_session_sweep = Instant::now();
+        }
+        if connection.is_none() {
+            binding.report_admission_ipc(AdmissionIpcState::Unavailable);
         }
         // Read a bounded group of buffered events before the next paced
         // query. One event per query can delay a hint behind busy sessions.
@@ -2257,6 +2307,7 @@ async fn maintain_routes(
             // Back off until a complete query confirms this connection.
             status_reconnect.attempted(Instant::now());
             if let Some(client) = &connection {
+                binding.report_admission_ipc(AdmissionIpcState::Checking);
                 refresh.reset();
                 let batched_admission = client.supports_pnet_admission_batch();
                 session_refresh = Some(SessionRefresh::new(client.events_with_lag().await));
@@ -2424,8 +2475,8 @@ async fn maintain_routes(
             if client.is_disconnected() {
                 continue;
             }
-            if response.is_some() && !reconnect_legacy {
-                status_reconnect.confirmed();
+            if response.is_some() && !reconnect_legacy && status_reconnect.confirmed() {
+                binding.report_admission_ipc(AdmissionIpcState::Ready);
             }
             match response {
                 Some(results) => {
@@ -2477,8 +2528,8 @@ async fn maintain_routes(
             if reconnect_legacy {
                 connection = None;
                 session_refresh = None;
-            } else if response.is_some() {
-                status_reconnect.confirmed();
+            } else if response.is_some() && status_reconnect.confirmed() {
+                binding.report_admission_ipc(AdmissionIpcState::Ready);
             }
             results = response;
         } else {
@@ -3081,7 +3132,7 @@ mod tests {
             assert_eq!(retry.next_attempt, now + Duration::from_millis(delay));
         }
 
-        retry.confirmed();
+        assert!(retry.confirmed());
         let now = Instant::now();
         assert!(retry.next_attempt <= now);
         retry.attempted(now);
@@ -3321,6 +3372,7 @@ mod tests {
         let listener = UnixListener::bind(&proxy_socket).unwrap();
         let held_reply = Arc::new(Notify::new());
         let held = Arc::clone(&held_reply);
+        let (release_first, first_reply) = oneshot::channel::<()>();
         let (close, closing) = oneshot::channel::<()>();
         let proxy = tokio::spawn(async move {
             let (front, _) = listener.accept().await.unwrap();
@@ -3329,6 +3381,7 @@ mod tests {
             let (mut back_rx, mut back_tx) = backend.into_split();
             let replies = async {
                 let mut admission_replies = 0;
+                let mut first_reply = Some(first_reply);
                 loop {
                     let mut bytes = [0; HEADER_SIZE];
                     back_rx.read_exact(&mut bytes).await.unwrap();
@@ -3337,6 +3390,9 @@ mod tests {
                     back_rx.read_exact(&mut body).await.unwrap();
                     if header.msg_type == LocalAppMsg::PnetAdmissionBatchResult as u16 {
                         admission_replies += 1;
+                        if let Some(release) = first_reply.take() {
+                            release.await.unwrap();
+                        }
                         if hold_reply && admission_replies == 2 {
                             held.notify_one();
                             std::future::pending::<()>().await;
@@ -3360,6 +3416,7 @@ mod tests {
             configured.with_pnet_admissions(&HashMap::new()),
         ));
         let changed = Arc::new(Notify::new());
+        let (admission_ipc, mut observed) = watch::channel(AdmissionIpcState::Unavailable);
         let updates = tokio::spawn(maintain_routes(
             directory.path().join("unused.toml"),
             watch::channel(config).0,
@@ -3368,6 +3425,7 @@ mod tests {
                 node_id,
                 signed: None,
                 recent: Arc::new(SyncMutex::new(RecentAdmissions::default())),
+                admission_ipc: Some(admission_ipc),
             },
             configured,
             Arc::clone(&state),
@@ -3381,9 +3439,19 @@ mod tests {
                 }
             }
         };
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            observed.wait_for(|state| *state == AdmissionIpcState::Checking),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(state.load().table.peer_count(), 0);
+        release_first.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(2), wait_for_route_count(2))
             .await
             .unwrap();
+        assert!(*observed.borrow() == AdmissionIpcState::Ready);
         if hold_reply {
             assert_ne!(
                 events.publish(EventPayload {
@@ -3402,6 +3470,13 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), wait_for_route_count(0))
             .await
             .expect("routes stayed published after the status IPC closed");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            observed.wait_for(|state| *state == AdmissionIpcState::Unavailable),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let recovered_proxy = if hold_reply {
             None
         } else {
@@ -3720,6 +3795,7 @@ mod tests {
                 node_id: [0x01; 32],
                 signed: None,
                 recent: Arc::clone(&recent),
+                admission_ipc: None,
             },
             configured,
             Arc::clone(&state),
@@ -4057,6 +4133,7 @@ mod tests {
                 node_id: [0x01; 32],
                 signed: None,
                 recent: Arc::new(SyncMutex::new(recent)),
+                admission_ipc: None,
             },
             configured,
             Arc::clone(&state),
