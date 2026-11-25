@@ -449,6 +449,35 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   single-peer admission query and passed real TUN traffic both ways.
   Both directions delivered all 24 SDK chat messages. The current side
   withdrew the route 1.404 s after the legacy session disconnected.
+- Another pair began with 23 seconds at the same UDP rates with no
+  CPU quota on the hub. TCP lost 6,438 of 164,784 datagrams and QUIC
+  2,159 of 162,467. The missing sequences matched 6,166 and 2,042 IPC
+  refusals, with the respective remaining 272 and 117 counted by local
+  UDP receive sockets. Towards the hub chat p99 was 639 ms on TCP and
+  1,696 ms on QUIC, with the largest waits beginning five to seven
+  seconds into the load. Both runs delivered all 200 chat messages.
+- On the same established sessions, a second 23-second sample put the
+  hub container, the 24 gateways and the receive probes under a combined
+  quota of 50 ms CPU per 100 ms. Both transports delivered every UDP
+  datagram and chat message. Hub use averaged 0.34 CPU on TCP and 0.33 on
+  QUIC. Linux reported zero throttled periods, and chat p99 in either
+  direction stayed below 2 ms on both transports.
+- The reverse-order pair used a tighter quota of 28 ms per 100 ms for
+  the second sample. Linux throttled the hub in 166 of 229 periods on TCP
+  and 227 of 229 on QUIC. Each sample delivered all 167,276 UDP datagrams
+  and 200 chat messages. Chat p99 towards the hub was 2.67 ms on TCP and
+  2.40 ms on QUIC, with 1.57 and 1.55 ms in the other direction. The
+  sustained quota exercise left startup contention as a separate issue.
+- In the first samples of that pair, before setting the quota, TCP lost
+  3,892 of 166,614 UDP datagrams and QUIC lost 6,900 of 162,282. The IPC
+  refusal sequences accounted for 3,806 and 6,842, and receiving UDP
+  sockets counted 86 and 57 drops respectively. One lost QUIC datagram
+  remains unattributed. TCP delivered all 200 chat probes, with p99 of
+  209 ms towards the hub. On QUIC the hub received 96 of 100 probes with
+  p99 of 2,255 ms among those received. The other endpoint received all
+  100. These probes used `AppSender::send` without an end-to-end receipt.
+  The xVeil text outbox uses peer receipts and retries, which need a
+  separate workload to measure.
 - A separate cold start ran the first end-to-end probes in groups of
   four before opening the UDP flows. All 24 paths answered in 12.52 s.
   The following 38 s sample lost 76 of 137,175 UDP datagrams, with one
