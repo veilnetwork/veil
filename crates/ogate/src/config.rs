@@ -61,6 +61,10 @@ pub struct OgateConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routed_membership_cert: Option<PathBuf>,
 
+    /// Admit configured IP routes after an authenticated P-Net round trip.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pnet_routed: bool,
+
     /// Opt-in use of an installed owner-signed address snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_policy: Option<SignedPolicyConfig>,
@@ -379,6 +383,11 @@ impl OgateConfig {
         {
             return Err(ConfigError::Field(
                 "routed_membership_cert requires pnet_required and authorized mode without a signed policy",
+            ));
+        }
+        if self.pnet_routed && self.routed_membership_cert.is_none() {
+            return Err(ConfigError::Field(
+                "pnet_routed requires routed_membership_cert",
             ));
         }
         if let Some(policy) = &self.signed_policy {

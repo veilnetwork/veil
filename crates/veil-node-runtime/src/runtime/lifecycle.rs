@@ -31,7 +31,7 @@ use crate::error::{NodeError, Result};
 use crate::listener_supervisor::lock_waiters;
 use crate::local_identity::HandshakeIdentity;
 use crate::metrics_http::RuntimeSummary;
-use veil_abuse::{BanList, PerPeerLimiter, ViolationTracker};
+use veil_abuse::{PerPeerLimiter, ViolationTracker};
 use veil_app::AppEndpointRegistry;
 use veil_dht::KademliaService;
 use veil_discovery::DiscoveryService;
@@ -904,7 +904,7 @@ impl NodeRuntime {
         // manual bans, so this restores those; auto-bans re-accumulate via the
         // freshly-rebuilt violation tracker below.
         if self.configured_private_network.is_none() {
-            *lock!(self.ban_list) = BanList::new();
+            lock!(self.ban_list).clear();
         } else if config.persist_enabled {
             // Verified live records already occupy the new DHT. Restore
             // additional bans from the snapshot under the pinned trust root.

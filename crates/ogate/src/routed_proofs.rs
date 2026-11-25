@@ -1,15 +1,18 @@
 //! Prove that a configured gateway can be reached over Veil's app path.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, ensure};
 use tokio::io::AsyncReadExt as _;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout};
 use veil_proto::budget::MAX_MEMBERSHIP_CERT_SIZE;
+use veil_proto::event_kind;
 use veil_util::unix_secs_now_u64;
 use veilclient::{AppSender, IncomingMessage, PnetAuthority, SenderProvenance, VeilClient};
 
@@ -28,8 +31,97 @@ const CHALLENGE_SPACING: Duration = Duration::from_millis(200);
 const PEER_ANSWER_SPACING: Duration = Duration::from_secs(1);
 const CHALLENGE_LIFETIME: Duration = Duration::from_secs(10);
 const RENEW_AFTER: Duration = Duration::from_secs(12);
+const ROUTE_LIFETIME: Duration = Duration::from_secs(18);
 const LOCAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const RETRY_AFTER: Duration = Duration::from_secs(5);
+
+/// An old route snapshot cannot outlive withdrawal of its proof.
+#[derive(Clone)]
+pub(crate) struct RouteProof {
+    valid: Arc<AtomicBool>,
+    lease_until: Instant,
+    cert_until: u64,
+}
+
+impl RouteProof {
+    pub(crate) fn allows_at(&self, now: Instant, unix: u64) -> bool {
+        self.valid.load(Ordering::Acquire)
+            && now < self.lease_until
+            && unix != 0
+            && (self.cert_until == 0 || unix < self.cert_until)
+    }
+
+    fn revoke(&self) {
+        self.valid.store(false, Ordering::Release);
+    }
+}
+
+pub(crate) type RouteProofs = HashMap<NodeId, RouteProof>;
+
+struct RouteLeases<'a> {
+    active: RouteProofs,
+    report: Option<&'a watch::Sender<Arc<RouteProofs>>>,
+}
+
+impl RouteLeases<'_> {
+    fn publish(&self) {
+        if let Some(report) = self.report {
+            report.send_replace(Arc::new(self.active.clone()));
+        }
+    }
+
+    fn renew(&mut self, peer: NodeId, cert_until: u64) {
+        if self.report.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        let unix = unix_secs_now_u64();
+        let valid = self.active.get(&peer).and_then(|previous| {
+            if previous.allows_at(now, unix) {
+                Some(Arc::clone(&previous.valid))
+            } else {
+                previous.revoke();
+                None
+            }
+        });
+        self.active.insert(
+            peer,
+            RouteProof {
+                valid: valid.unwrap_or_else(|| Arc::new(AtomicBool::new(true))),
+                lease_until: now + ROUTE_LIFETIME,
+                cert_until,
+            },
+        );
+        self.publish();
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&NodeId, &RouteProof) -> bool) {
+        let old_count = self.active.len();
+        self.active.retain(|peer, proof| {
+            if keep(peer, proof) {
+                return true;
+            }
+            proof.revoke();
+            false
+        });
+        if self.active.len() != old_count {
+            self.publish();
+        }
+    }
+
+    fn revoke(&mut self, peer: &NodeId) {
+        if let Some(proof) = self.active.remove(peer) {
+            proof.revoke();
+            self.publish();
+        }
+    }
+}
+
+impl Drop for RouteLeases<'_> {
+    fn drop(&mut self) {
+        self.retain(|_, _| false);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -176,11 +268,12 @@ pub(crate) async fn run(
     certificate_path: PathBuf,
     node: NodeId,
     authority: PnetAuthority,
+    report: Option<watch::Sender<Arc<RouteProofs>>>,
 ) {
     let gateway = Gateway::new(&config.borrow(), node, authority);
     let mut first_failure = true;
     while authority.is_current(unix_secs_now_u64()) && config.has_changed().is_ok() {
-        match serve(&gateway, &certificate_path, &mut config).await {
+        match serve(&gateway, &certificate_path, &mut config, report.as_ref()).await {
             Ok(()) => return,
             Err(error) if first_failure => {
                 tracing::warn!(%error, "routed P-Net checks unavailable");
@@ -232,6 +325,7 @@ async fn serve(
     gateway: &Gateway,
     certificate_path: &Path,
     config: &mut watch::Receiver<OgateConfig>,
+    report: Option<&watch::Sender<Arc<RouteProofs>>>,
 ) -> anyhow::Result<()> {
     let socket = config.borrow().socket_path.clone();
     let certificate = read_certificate(certificate_path)
@@ -251,6 +345,7 @@ async fn serve(
             == gateway.node,
         "routed check IPC has a different daemon identity"
     );
+    let mut events = client.events_with_lag().await;
     let local_expiry = verified_expiry(&client, &gateway.node, &certificate)
         .await?
         .context("daemon rejected the local routed membership certificate")?;
@@ -274,6 +369,10 @@ async fn serve(
         local_app,
         local_expiry,
         challenge_after: Instant::now(),
+        leases: RouteLeases {
+            active: RouteProofs::new(),
+            report,
+        },
     };
     let mut peers = BTreeMap::new();
     gateway.reconcile(&config.borrow_and_update(), &mut peers);
@@ -285,13 +384,41 @@ async fn serve(
         ensure!(current(local_expiry), "local routed membership expired");
         tokio::select! {
             _ = &mut disconnected => anyhow::bail!("routed check IPC disconnected"),
+            event = events.recv(), if report.is_some() => {
+                match event {
+                    Ok(event) if event.kind == event_kind::PNET_MEMBER_REVOKED => {
+                        if let Ok(node) = NodeId::try_from(event.payload.as_slice()) {
+                            ensure!(node != gateway.node, "local routed membership revoked");
+                            exchange.leases.revoke(&node);
+                            if let Some(peer) = peers.get_mut(&node) {
+                                peer.pending = None;
+                                peer.probe_after = Instant::now() + RETRY_AFTER;
+                            }
+                        }
+                    }
+                    Ok(event) if event.kind == event_kind::EVENTS_LAGGED => {
+                        anyhow::bail!("daemon missed routed admission events");
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        anyhow::bail!("routed admission events lagged");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => anyhow::bail!("routed event stream closed"),
+                    Ok(_) => {}
+                }
+            }
             changed = config.changed() => {
                 if changed.is_err() {
                     return Ok(());
                 }
                 gateway.reconcile(&config.borrow_and_update(), &mut peers);
+                exchange.leases.retain(|node, _| peers.contains_key(node));
             }
             _ = pace.tick() => {
+                if !exchange.leases.active.is_empty() {
+                    let now = Instant::now();
+                    let unix = unix_secs_now_u64();
+                    exchange.leases.retain(|_, proof| proof.allows_at(now, unix));
+                }
                 let next = cursor
                     .and_then(|node| peers.range((Excluded(node), Unbounded)).next())
                     .map(|(&node, _)| node)
@@ -321,6 +448,7 @@ struct Exchange<'a> {
     local_app: AppId,
     local_expiry: u64,
     challenge_after: Instant,
+    leases: RouteLeases<'a>,
 }
 
 impl Exchange<'_> {
@@ -388,8 +516,12 @@ impl Exchange<'_> {
         let node = message.src_node_id;
         let expiry = match verified_expiry(self.client, &node, proof.certificate).await {
             Ok(Some(expiry)) => expiry,
-            Ok(None) => return Ok(()),
+            Ok(None) => {
+                self.leases.revoke(&node);
+                return Ok(());
+            }
             Err(error) => {
+                self.leases.revoke(&node);
                 tracing::debug!(%error, "could not verify routed P-Net certificate");
                 return Ok(());
             }
@@ -403,6 +535,11 @@ impl Exchange<'_> {
                     .await?
             }
             Kind::Answer if peer.accept_answer(&proof.nonce, Instant::now()) => {
+                let cert_until = match (self.local_expiry, expiry) {
+                    (0, until) | (until, 0) => until,
+                    (local, remote) => local.min(remote),
+                };
+                self.leases.renew(node, cert_until);
                 tracing::debug!(
                     peer = %hex::encode(node),
                     provenance = ?message.provenance,
@@ -462,5 +599,34 @@ mod tests {
         assert!(!peer.accept_answer(&nonce, deadline));
         assert!(peer.accept_answer(&nonce, now));
         assert!(!peer.accept_answer(&nonce, now));
+    }
+
+    #[test]
+    fn renewal_shares_revocation_with_already_published_routes() {
+        let (report, snapshot) = watch::channel(Arc::new(RouteProofs::new()));
+        let mut leases = RouteLeases {
+            active: RouteProofs::new(),
+            report: Some(&report),
+        };
+        let member = [7; 32];
+        leases.renew(member, 0);
+        let first = snapshot.borrow()[&member].clone();
+        let now = Instant::now();
+        let unix = unix_secs_now_u64();
+        assert!(first.allows_at(now, unix));
+        assert!(!first.allows_at(first.lease_until, unix));
+
+        leases.renew(member, unix + 5);
+        let second = snapshot.borrow()[&member].clone();
+        assert!(!second.allows_at(now, unix + 5));
+        leases.revoke(&member);
+        assert!(!first.allows_at(now, unix));
+        assert!(!second.allows_at(now, unix));
+
+        leases.renew(member, 0);
+        let third = snapshot.borrow()[&member].clone();
+        assert!(third.allows_at(now, unix));
+        drop(leases);
+        assert!(!third.allows_at(now, unix));
     }
 }

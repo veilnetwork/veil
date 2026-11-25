@@ -425,7 +425,19 @@ impl NodeRuntime {
                 "using configured entry points and discovery through private sessions",
             );
         }
-        let ban_list = Arc::new(Mutex::new(BanList::new()));
+        let event_bus = Arc::new(veil_ipc::EventBus::new());
+        let bans = if network_gate_arc.is_some() {
+            let bus = Arc::clone(&event_bus);
+            BanList::new().with_ban_observer(move |peer| {
+                bus.publish(veil_proto::EventPayload {
+                    kind: veil_proto::event_kind::PNET_MEMBER_REVOKED,
+                    payload: peer.to_vec(),
+                });
+            })
+        } else {
+            BanList::new()
+        };
+        let ban_list = Arc::new(Mutex::new(bans));
         persistence::load_bans(&ban_list, &config_path);
         let shared_session_tx_registry = Arc::new(RwLock::new(if let Some(m) = &metrics {
             veil_session::SessionTxRegistry::with_capacity_and_drop_counter(
@@ -1306,7 +1318,7 @@ impl NodeRuntime {
             // pathologically slow consumers (Flutter UI mid-paint) ever
             // hit the lag boundary, and they get a one-frame skip
             // rather than a stalled publisher.
-            event_bus: Arc::new(veil_ipc::EventBus::new()),
+            event_bus,
             // empty registry of node_ids with active
             // outbound-connector tasks; populated atomically inside
             // `spawn_outbound_peers`.

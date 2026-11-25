@@ -300,6 +300,7 @@ mod tests {
             batch: Default::default(),
             pnet_required: false,
             routed_membership_cert: None,
+            pnet_routed: false,
             signed_policy: None,
 
             app_cert_trusted_owner_pubkey: None,

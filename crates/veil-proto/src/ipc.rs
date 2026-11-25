@@ -6321,6 +6321,10 @@ pub mod event_kind {
     /// Payload: `[u8; 32] peer_node_id`. A replacement session can still
     /// admit this peer, so consumers query admission before changing routes.
     pub const PNET_SESSION_ENDED: u8 = 10;
+    /// Newly active ban, including members without a direct session.
+    /// Sent only to local clients that negotiated membership verification.
+    /// Payload: `[u8; 32] peer_node_id`.
+    pub const PNET_MEMBER_REVOKED: u8 = 11;
 }
 
 /// Payload [`crate::family::LocalAppMsg::Event`].

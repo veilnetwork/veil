@@ -2650,6 +2650,11 @@ async fn handle_ipc_client(
                     }
                 };
                 if let Some(mut event) = event {
+                    if event.kind == veil_proto::event_kind::PNET_MEMBER_REVOKED
+                        && !pnet_member_verification
+                    {
+                        continue;
+                    }
                     if hello.flags & veil_proto::ipc::IPC_CAP_PNET_SESSION_HINTS == 0 {
                         match event.kind {
                             veil_proto::event_kind::PNET_SESSION_ENDED => continue,

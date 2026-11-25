@@ -37,7 +37,8 @@ use veil_proto::event_kind::{
 use veil_util::unix_secs_now_u64;
 use veilclient::client::PnetStatus;
 use veilclient::{
-    APP_IPC_SEND_PREFIX_BYTES, AppHandle, IncomingMessage, PnetAuthority, VeilClient, VeilEvent,
+    APP_IPC_SEND_PREFIX_BYTES, AppHandle, IncomingMessage, PnetAuthority, SenderProvenance,
+    VeilClient, VeilEvent,
 };
 
 use crate::app_id::{derive_app_id, namespace_for};
@@ -111,6 +112,7 @@ pub struct SharedState {
     pub peer_app_ids: Vec<(NodeId, [u8; 32])>,
     // Only finite deadlines need a wall-clock read on the packet path.
     pnet_expiries: HashMap<NodeId, u64>,
+    routed_proofs: crate::routed_proofs::RouteProofs,
     policy_window: Option<(u64, u64)>,
     policy_revision: Option<u64>,
     configured_peers: usize,
@@ -136,6 +138,7 @@ impl SharedState {
             table,
             peer_app_ids,
             pnet_expiries: HashMap::new(),
+            routed_proofs: Default::default(),
             policy_window: None,
             policy_revision: None,
             configured_peers,
@@ -182,12 +185,39 @@ impl SharedState {
             table,
             peer_app_ids,
             pnet_expiries,
+            routed_proofs: Default::default(),
             policy_window: self.policy_window,
             policy_revision: self.policy_revision,
             configured_peers: self.configured_peers,
             routing_config: Arc::clone(&self.routing_config),
             mtu: self.mtu,
         }
+    }
+
+    fn with_routed_admissions(
+        &self,
+        direct: &HashMap<NodeId, u64>,
+        proofs: &crate::routed_proofs::RouteProofs,
+    ) -> Self {
+        let now = tokio::time::Instant::now();
+        let unix = unix_secs_now_u64();
+        let routed_proofs: crate::routed_proofs::RouteProofs = proofs
+            .iter()
+            .filter(|(peer, proof)| {
+                !direct.contains_key(*peer)
+                    && self.app_id_for(peer).is_some()
+                    && proof.allows_at(now, unix)
+            })
+            .map(|(peer, proof)| (*peer, proof.clone()))
+            .collect();
+        if routed_proofs.is_empty() {
+            return self.with_pnet_admissions(direct);
+        }
+        let mut combined = direct.clone();
+        combined.extend(routed_proofs.keys().map(|&peer| (peer, 0)));
+        let mut routes = self.with_pnet_admissions(&combined);
+        routes.routed_proofs = routed_proofs;
+        routes
     }
 
     fn preserve_signed_admissions(
@@ -247,12 +277,24 @@ impl SharedState {
     }
 
     fn cert_is_current(&self, peer: &NodeId) -> bool {
+        if let Some(proof) = self.routed_proofs.get(peer) {
+            return proof.allows_at(tokio::time::Instant::now(), unix_secs_now_u64());
+        }
         let expiry = self.pnet_expiries.get(peer).copied();
         if expiry.is_none() && self.policy_window.is_none() {
             return true;
         }
         let now = unix_secs_now_u64();
         now != 0 && expiry.is_none_or(|until| now < until) && self.policy_allows_at(now)
+    }
+
+    fn allows_ingress_provenance(&self, message: &IncomingMessage) -> bool {
+        let peer = &message.src_node_id;
+        !self.routed_proofs.contains_key(peer)
+            || matches!(
+                message.provenance,
+                SenderProvenance::Signed | SenderProvenance::SessionPeer
+            ) && self.app_id_for(peer) == Some(message.src_app_id)
     }
 
     fn policy_allows_at(&self, now: u64) -> bool {
@@ -269,7 +311,13 @@ impl SharedState {
             .values()
             .filter(|&&until| now == 0 || now >= until)
             .count();
-        self.peer_app_ids.len() - inactive
+        let instant = tokio::time::Instant::now();
+        let inactive_routed = self
+            .routed_proofs
+            .values()
+            .filter(|proof| !proof.allows_at(instant, now))
+            .count();
+        self.peer_app_ids.len() - inactive - inactive_routed
     }
 }
 
@@ -936,7 +984,9 @@ async fn query_status_connection(
 
 fn publish_routes(candidate: SharedState, state: &ArcSwap<SharedState>, route_changes: &Notify) {
     let peers_changed = candidate.peer_app_ids != state.load().peer_app_ids;
-    tracing::info!(peers = candidate.table.peer_count(), "updated ogate routes");
+    if peers_changed {
+        tracing::info!(peers = candidate.table.peer_count(), "updated ogate routes");
+    }
     state.store(Arc::new(candidate));
     if peers_changed {
         route_changes.notify_one();
@@ -982,6 +1032,9 @@ pub fn validate_reload(old: &OgateConfig, new: &OgateConfig) -> Result<(), &'sta
     }
     if old.routed_membership_cert != new.routed_membership_cert {
         return Err("routed_membership_cert");
+    }
+    if old.pnet_routed != new.pnet_routed {
+        return Err("pnet_routed");
     }
     // Routing and the batch flush window are intentionally reloadable.
     Ok(())
@@ -1157,9 +1210,17 @@ struct RouteBinding {
     signed: Option<(Arc<SignedRoutes>, PnetAuthority)>,
     recent: Arc<SyncMutex<RecentAdmissions>>,
     admission_ipc: Option<watch::Sender<AdmissionIpcState>>,
+    routed: Option<watch::Receiver<Arc<crate::routed_proofs::RouteProofs>>>,
 }
 
 impl RouteBinding {
+    fn routes(&self, configured: &SharedState, direct: &HashMap<NodeId, u64>) -> SharedState {
+        match &self.routed {
+            Some(routed) => configured.with_routed_admissions(direct, &routed.borrow()),
+            None => configured.with_pnet_admissions(direct),
+        }
+    }
+
     fn report_admission_ipc(&self, state: AdmissionIpcState) {
         if let Some(report) = &self.admission_ipc {
             report.send_if_modified(|published| {
@@ -1750,14 +1811,8 @@ async fn serve_link(
                             // MTU/route check; envelope-level MTU cap is NOT
                             // applied — batch buffer is naturally >MTU.
                             for pkt in BatchIter::new(&im.data) {
-                                deliver_one(
-                                    &mut tun_w,
-                                    &state,
-                                    sender,
-                                    pkt,
-                                    packet_drops.as_deref(),
-                                )
-                                .await;
+                                deliver_one(&mut tun_w, &state, &im, pkt, packet_drops.as_deref())
+                                    .await;
                             }
                         } else {
                             // Legacy single-packet envelope.  Keep the
@@ -1774,14 +1829,8 @@ async fn serve_link(
                                 );
                                 continue;
                             }
-                            deliver_one(
-                                &mut tun_w,
-                                &state,
-                                sender,
-                                &im.data,
-                                packet_drops.as_deref(),
-                            )
-                            .await;
+                            deliver_one(&mut tun_w, &state, &im, &im.data, packet_drops.as_deref())
+                                .await;
                         }
                     }
                 }
@@ -1799,6 +1848,12 @@ async fn serve_link(
             })
         })
     });
+    let (proof_report, routed) = if cfg.pnet_routed {
+        let (report, routed) = watch::channel(Arc::new(crate::routed_proofs::RouteProofs::new()));
+        (Some(report), Some(routed))
+    } else {
+        (None, None)
+    };
     let routes = tokio::spawn(maintain_routes(
         bridge.config_path.clone(),
         bridge.accepted.clone(),
@@ -1808,6 +1863,7 @@ async fn serve_link(
             signed,
             recent: Arc::clone(&recent),
             admission_ipc,
+            routed,
         },
         configured,
         Arc::clone(&state),
@@ -1820,6 +1876,7 @@ async fn serve_link(
                 certificate.clone(),
                 binding.node_id,
                 authority,
+                proof_report,
             )))
         } else {
             tracing::warn!("routed P-Net checks require membership verification from the daemon");
@@ -2009,18 +2066,14 @@ fn clear_admissions(
             .remember_peers(admitted.keys().copied(), Instant::now());
     }
     admitted.clear();
-    publish_routes(
-        configured.with_pnet_admissions(admitted),
-        state,
-        route_changes,
-    );
+    publish_routes(binding.routes(configured, admitted), state, route_changes);
 }
 
 async fn maintain_routes(
     config_path: PathBuf,
     accepted: watch::Sender<OgateConfig>,
     hup: Arc<Mutex<Option<Signal>>>,
-    binding: RouteBinding,
+    mut binding: RouteBinding,
     mut configured: SharedState,
     state: Arc<ArcSwap<SharedState>>,
     route_changes: Arc<Notify>,
@@ -2050,6 +2103,7 @@ async fn maintain_routes(
         SessionSweep,
         PrioritySweep,
         StatusDisconnected,
+        Routed(bool),
     }
     loop {
         if connection
@@ -2106,6 +2160,12 @@ async fn maintain_routes(
         let next_status_attempt = (connection.is_none() && !configured.peer_app_ids.is_empty())
             .then_some(status_reconnect.next_attempt);
         let wake = tokio::select! {
+            changed = async {
+                match binding.routed.as_mut() {
+                    Some(routed) => routed.changed().await.is_ok(),
+                    None => std::future::pending().await,
+                }
+            } => Wake::Routed(changed),
             _ = wait_status_disconnect(connection.as_deref()) => Wake::StatusDisconnected,
             _ = async {
                 if let Some(due) = next_status_attempt {
@@ -2145,6 +2205,17 @@ async fn maintain_routes(
                 }
             } => Wake::Policy,
         };
+        if let Wake::Routed(changed) = wake {
+            if !changed {
+                binding.routed = None;
+            }
+            publish_routes(
+                binding.routes(&configured, &admitted),
+                &state,
+                &route_changes,
+            );
+            continue;
+        }
         if wake == Wake::StatusDisconnected {
             continue;
         }
@@ -2227,7 +2298,7 @@ async fn maintain_routes(
                 let routes = if config.pnet_required {
                     admitted.retain(|peer, _| configured.app_id_for(peer).is_some());
                     refresh.reset();
-                    configured.with_pnet_admissions(&admitted)
+                    binding.routes(&configured, &admitted)
                 } else {
                     admitted.clear();
                     connection = None;
@@ -2311,7 +2382,7 @@ async fn maintain_routes(
             if changed {
                 next_peer = 0;
                 publish_routes(
-                    configured.with_pnet_admissions(&admitted),
+                    binding.routes(&configured, &admitted),
                     &state,
                     &route_changes,
                 );
@@ -2517,7 +2588,7 @@ async fn maintain_routes(
                 Some(results) => {
                     if apply_admissions(&retry, results, &mut admitted, &binding) {
                         publish_routes(
-                            configured.with_pnet_admissions(&admitted),
+                            binding.routes(&configured, &admitted),
                             &state,
                             &route_changes,
                         );
@@ -2581,7 +2652,7 @@ async fn maintain_routes(
         let group = &order[next_peer..end];
         if apply_admissions(group, results, &mut admitted, &binding) {
             publish_routes(
-                configured.with_pnet_admissions(&admitted),
+                binding.routes(&configured, &admitted),
                 &state,
                 &route_changes,
             );
@@ -2612,10 +2683,11 @@ fn authenticated_ingress_sender<'a>(
 async fn deliver_one(
     tun_w: &mut crate::tun::Writer,
     state: &ArcSwap<SharedState>,
-    src_node_id: &NodeId,
+    message: &IncomingMessage,
     pkt: &[u8],
     packet_drops: Option<&PacketDrops>,
 ) {
+    let src_node_id = &message.src_node_id;
     let snap = state.load();
     if pkt.len() > snap.mtu as usize {
         record_one(packet_drops, DropReason::IngressOversize);
@@ -2630,6 +2702,10 @@ async fn deliver_one(
     if !snap.cert_is_current(src_node_id) {
         record_one(packet_drops, DropReason::IngressExpired);
         tracing::debug!("ingress: dropping peer with expired P-Net certificate");
+        return;
+    }
+    if !snap.allows_ingress_provenance(message) {
+        record_one(packet_drops, DropReason::IngressUnauthenticatedFrame);
         return;
     }
     let src_ip = parse_ip_endpoints(pkt).map(|(s, _)| s);
@@ -2769,6 +2845,7 @@ mod tests {
             batch: Default::default(),
             pnet_required: false,
             routed_membership_cert: None,
+            pnet_routed: false,
             signed_policy: None,
 
             app_cert_trusted_owner_pubkey: None,
@@ -3502,6 +3579,7 @@ mod tests {
                 signed: None,
                 recent: Arc::new(SyncMutex::new(RecentAdmissions::default())),
                 admission_ipc: Some(admission_ipc),
+                routed: None,
             },
             configured,
             Arc::clone(&state),
@@ -3879,6 +3957,7 @@ mod tests {
                 signed: None,
                 recent: Arc::clone(&recent),
                 admission_ipc: None,
+                routed: None,
             },
             configured,
             Arc::clone(&state),
@@ -4220,6 +4299,7 @@ mod tests {
                 signed: None,
                 recent: Arc::new(SyncMutex::new(recent)),
                 admission_ipc: None,
+                routed: None,
             },
             configured,
             Arc::clone(&state),

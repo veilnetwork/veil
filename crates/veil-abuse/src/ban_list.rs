@@ -7,6 +7,8 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    fmt,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -37,6 +39,15 @@ impl BanEntry {
 
 // ── BanList ───────────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
+struct BanObserver(Arc<dyn Fn([u8; 32]) + Send + Sync>);
+
+impl fmt::Debug for BanObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BanObserver")
+    }
+}
+
 /// Registry of banned peers.
 #[derive(Debug, Default, Clone)]
 pub struct BanList {
@@ -45,11 +56,25 @@ pub struct BanList {
     /// Enables O(log n) eviction instead of O(n) scan.
     eviction_order: BTreeMap<u64, [u8; 32]>,
     next_seq: u64,
+    observer: Option<BanObserver>,
 }
 
 impl BanList {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Publish newly active bans. The observer runs under the caller's lock.
+    pub fn with_ban_observer(mut self, observe: impl Fn([u8; 32]) + Send + Sync + 'static) -> Self {
+        self.observer = Some(BanObserver(Arc::new(observe)));
+        self
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self {
+            observer: self.observer.take(),
+            ..Self::default()
+        };
     }
 
     /// Ban `peer_id` for `duration` (or permanently if `None`).
@@ -88,6 +113,12 @@ impl BanList {
         manual: bool,
     ) {
         let now = Instant::now();
+        let newly_banned = self.observer.is_some()
+            && duration.is_none_or(|duration| !duration.is_zero())
+            && self
+                .entries
+                .get(&peer_id)
+                .is_none_or(|entry| entry.is_expired(now));
         // Remove the old eviction_order entry if re-banning an existing peer
         // otherwise ghosts accumulate and capacity eviction may unban a peer
         // whose ban was recently refreshed.
@@ -132,6 +163,9 @@ impl BanList {
                 banned_at: Some(std::time::SystemTime::now()),
             },
         );
+        if newly_banned && let Some(observer) = &self.observer {
+            (observer.0)(peer_id);
+        }
     }
 
     /// Returns `true` if `peer_id` is currently banned (and ban has not expired).

@@ -42,9 +42,18 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 - An opt-in gateway control endpoint exchanges fresh challenges with
   configured peers. It checks the authenticated sender, both endpoint IDs,
   the live nonce, and the current P-Net certificate before recording a
-  round trip. The next step is to bind IP route admission to that evidence
-  and withdraw it on expiry or loss of admission. Existing gateways use
-  the direct status query for IP routes.
+  round trip. `pnet_routed` admits an IP route for a configured peer for
+  up to 18 seconds after each verified reply, bounded by both certificate
+  deadlines. Direct admission retains precedence. The packet path checks
+  the current route lease, authenticated origin, peer app ID, and virtual
+  source address. Routed admission from an owner-signed address policy
+  remains to be integrated.
+- The daemon enforces bans at app send and delivery and publishes newly
+  active bans to local clients that requested membership verification.
+  `ogate` invalidates the affected route and outstanding challenge on
+  revocation. Event loss or control connection termination invalidates
+  every lease on that connection, including leases held by readers of
+  previous route snapshots.
 - In the isolated eight-node Linux ARM64 topology, A and B confirmed
   reachability without a direct session with R1.1 and R2.3 down. A cold
   run rejected a certificate for the wrong endpoint and a live ban
@@ -53,6 +62,18 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   were withdrawn. The two gateways exchanged 48 SDK datagrams alongside
   the probes. A current gateway paired with an older daemon continued
   to pass direct TUN traffic, with five ICMP replies in each direction.
+- With routed IP admission enabled on the same Linux topology, both
+  address families passed through TUN with R1.1 and R2.3 down and no
+  direct A–B session. With batching enabled, the two endpoints returned
+  16 IPv4 and 16 IPv6 ICMP replies in each probe round. A ban removed its
+  local route in 70 ms. After the last surviving path was cut, both
+  routes expired within 15.4 s of the cut.
+- With older relay daemons and raw IP frames, a live double outage was
+  followed by a verified round trip within 8.825 s of the neighbor
+  withdrawal. The surviving cross-link carried 16 IPv4 replies, 16 IPv6
+  replies, and a checked 64 KiB TCP transfer. All 48 SDK test datagrams
+  arrived while routed admission was enabled. A direct link with a
+  daemon that lacks certificate verification returned ten ICMP replies.
 
 ## 2. Qualify mixed versions and load
 
