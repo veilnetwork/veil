@@ -660,6 +660,39 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   p99 of 20 and 26 ms versus about 3 ms in both directions at the lower
   rate. These samples leave the chat latency cost at equal offered load
   open.
+- Another pair fixed the offer at 83,636 datagrams per flow over 23 s.
+  Both runs delivered all 167,272 UDP datagrams and all 200 SDK chat
+  messages. In aligned one-second windows the send counts differed by
+  at most two packets per flow. At 100 ms resolution the largest gap
+  was 74 packets. CPU weight 532 moved the hub's runnable
+  wait from 5.77 to 2.65 s and peak TCP receive queue from 33 to 11 kB.
+  Chat p99 fell from 7.59 to 1.02 ms towards the hub and from 6.59 to
+  2.03 ms in the other direction.
+- An equal-count repeat in reverse order exposed a traffic-generator
+  mismatch. One sender in the weighted run started 205 ms after the
+  scheduled epoch and caught up with up to 828 packets per 100 ms. The
+  same flow peaked at 376 packets per 100 ms in the control. The two
+  weighted flows sent 9,867 packets at least 15 ms late, compared with
+  zero in the control.
+  The weighted run lost 8,197 datagrams, of which 7,603 matched IPC
+  refusals. The control delivered all datagrams. These measurements
+  capture source scheduling pressure and unequal burst timing.
+- A separate pair waited for both senders to arm and launched an
+  additional CPU worker at the common start. It stayed runnable for
+  eight seconds with the same 0.70 CPU quota in both runs and received
+  3.54 CPU-seconds at hub weight 100 and 2.92 at weight 532. Both
+  sender pairs started within 0.06 ms of each other and sent exactly
+  167,272 datagrams in 23 s. UDP losses fell from 23,945 to 17,611,
+  with 23,927 and 17,553 matching IPC refusals. The hub's runnable wait
+  fell from 18.71 to 5.25 s and its peak TCP receive queue from 985 to
+  82 kB. All 200 SDK messages arrived in each trial. Chat p99 fell
+  from 283 to 86 ms towards the hub and from 171 to 41 ms in return.
+- Higher hub weight increased sender lateness in the CPU contention
+  pair. For the two flows combined, the number of datagrams sent at
+  least 15 ms after their schedule rose from 1,349 to 16,579. The
+  largest per-flow 100 ms count went from 418 to 531. This confirms
+  the need to measure sender timing as well as the hub receive queue
+  when qualifying scheduler weights on a shared host.
 - A separate cold start ran the first end-to-end probes in groups of
   four before opening the UDP flows. All 24 paths answered in 12.52 s.
   The following 38 s sample lost 76 of 137,175 UDP datagrams, with one
