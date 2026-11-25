@@ -2023,6 +2023,44 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   25-to-33-second window after release. The longest delay was
   8.02 seconds, near the first saturation advisory.
 
+#### Measuring the first capacity drop
+
+- With `c8c66d31` on the eight-node Linux stand, the clock in the
+  shaping namespace marked the start of the 256 kbit/s cap. At
+  42 ms the final socket's send queue held 40,975 bytes and the
+  queue discipline had dropped seven packets. At 87 ms the socket held
+  78,225 bytes including 61,271 not yet sent.
+- Of the 125 application packets sent in the first 250 ms, 57 took
+  longer than 100 ms. All arrived, with a maximum delay of 6.80 s.
+  The next 375 packets, sent between 250 ms and one second, all
+  arrived within 6 ms. The first branch switch protected new traffic
+  while the ordered TCP connection continued draining committed bytes.
+
+#### Recovering a branch reached through the cross-link
+
+- When `A` preferred `R2.1`, a cap on `R1.3→B` produced a
+  two-hop advisory from `R1.3` through `R1.2` to `R2.2`.
+  The `c8c66d31` control had fresh notices at the final relay at
+  offsets 0 and 5 seconds. The middle relay sent additional notices
+  at 15, 35 and 55 seconds when upstream trials arrived. In the
+  eight-second window starting 25 seconds after the cap was removed,
+  the recovered final link carried 4,904 bytes and the alternate
+  carried 14.52 MB.
+- A relay now uses observations of its own egress and downstream
+  reports received within the last second when deciding whether
+  to notify its ingress. The longer local recovery schedule can
+  continue to guide path selection until a paced trial is due.
+  Once the receiver of the propagated report starts its own trial,
+  pressure on the downstream link can renew it through a new report.
+- The corrected daemon was tested with the mirror topology, where
+  `A` preferred `R1.1` and `R2.3→B` was capped. Three advisories
+  from the final relay led to three advisories from its middle
+  relay. In the 25-to-33-second window after removing the cap, the
+  recovered path carried 7.11 MB and the alternate carried 7.54 MB.
+  All 7,050 late-window datagrams eventually arrived and 7,045
+  arrived before the window closed. The endpoints exchanged all
+  48 SDK messages during the cap and again after it.
+
 #### Withdrawing a failed downstream route
 
 - The Linux ARM64 stand used two paths from `A` to `B`, each with three

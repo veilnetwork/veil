@@ -1123,6 +1123,21 @@ impl SessionTxRegistry {
         Some(pressured || (ordered && entry.tx.ordered_writer_pressured()))
     }
 
+    /// An upstream advisory represents present pressure. A downstream report
+    /// may be passed on while fresh. The longer local recovery schedule must
+    /// not turn a paced trial at an upstream relay into repeated feedback.
+    pub fn relay_notice_pressured(&self, peer: &NodeIdBytes, dst: &NodeIdBytes) -> bool {
+        self.relay_pressured(peer, true, None) == Some(true)
+            || self
+                .senders
+                .get(peer)
+                .filter(|entry| !entry.tx.is_closed())
+                .and_then(|entry| entry.route_pressure.as_deref())
+                .is_some_and(|pressure| {
+                    veil_util::lock!(pressure).recently_reported(dst, Instant::now())
+                })
+    }
+
     /// Return a clear fallback's index when the preferred hop has outbound
     /// pressure. Ordered sends can account for both the current writer and
     /// a downstream advisory for the destination.

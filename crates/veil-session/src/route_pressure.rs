@@ -125,6 +125,12 @@ impl RoutePressure {
             .is_some_and(|state| state.active(now))
     }
 
+    pub(crate) fn recently_reported(&self, dst: &NodeIdBytes, now: Instant) -> bool {
+        self.received
+            .get(dst)
+            .is_some_and(|state| now.duration_since(state.last_notice) < NOTICE_INTERVAL)
+    }
+
     pub(crate) fn reserve_trial(
         &mut self,
         dst: &NodeIdBytes,
@@ -168,6 +174,21 @@ mod tests {
         assert!(pressure.reserve_notice(extra, renewed));
         assert!(pressure.receive(extra, now + RECOVERY_EXPIRY));
         assert_eq!(pressure.received.len(), 2);
+    }
+
+    #[test]
+    fn a_recovery_hold_cannot_refresh_upstream_pressure() {
+        let mut pressure = RoutePressure::default();
+        let now = Instant::now();
+        let dst = [1; 32];
+        assert!(pressure.receive(dst, now));
+        assert!(pressure.recently_reported(&dst, now));
+        assert!(!pressure.recently_reported(&dst, now + NOTICE_INTERVAL));
+        let upstream_trial = now + INITIAL_HOLD;
+        assert!(pressure.is_pressured(&dst, upstream_trial));
+        assert!(!pressure.recently_reported(&dst, upstream_trial));
+        assert!(pressure.receive(dst, upstream_trial));
+        assert!(pressure.recently_reported(&dst, upstream_trial));
     }
 
     #[test]

@@ -1563,8 +1563,7 @@ impl FrameDispatcher {
             }
             if private_ordered {
                 let pressured = if let Some(hop) = sent_hop {
-                    !paced_trial_sent
-                        && reg_guard.relay_pressured(&hop, true, Some(&dst)) == Some(true)
+                    !paced_trial_sent && reg_guard.relay_notice_pressured(&hop, &dst)
                 } else {
                     use veil_session::SendToError::Full;
                     let queue_full =
