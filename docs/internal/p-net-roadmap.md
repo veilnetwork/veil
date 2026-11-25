@@ -941,6 +941,22 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   loopback run of the final daemon and Veil v0.11.59 delivered 1,000
   SDK chat messages in each direction.
 
+### Local IPC rebinding after daemon restart
+
+- The Unix gateway checks for a new local socket every 250 ms while
+  waiting to rebind. A replacement can advance the attempt. An
+  unchanged socket still uses exponential backoff. Rebinding checks
+  the daemon identity, app endpoint, and configured policy authority
+  before route reconciliation starts.
+- A three-node Linux ARM64 comparison used 4,096 configured routes,
+  the same daemon binaries, and an outage of at least 4.4 s. With
+  controls based on `a5b28165`, rebinding took 1.37 and 1.42 s from
+  the stand's observation of the ready socket. The updated gateway
+  took 0.305 and 0.303 s. All four runs restored bidirectional traffic
+  on the original gateway processes and TUN interfaces. Each run and
+  a separate run with a pre-batch daemon delivered all 48 SDK chat
+  messages sent before the restart.
+
 ### Emulated inter-site link
 
 - Three nodes spanned two emulated sites on one Linux ARM64 host. The

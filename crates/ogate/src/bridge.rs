@@ -20,6 +20,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::ops::Bound::{Excluded, Unbounded};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as SyncMutex};
@@ -749,7 +750,41 @@ struct BoundIpc {
 }
 
 const REBIND_TIMEOUT: Duration = Duration::from_secs(5);
+const REBIND_SOCKET_POLL: Duration = Duration::from_millis(250);
 const MAX_REBIND_DELAY: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
+    changed: (i64, i64),
+}
+
+async fn socket_identity(path: &Path) -> Option<SocketIdentity> {
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    meta.file_type().is_socket().then(|| SocketIdentity {
+        device: meta.dev(),
+        inode: meta.ino(),
+        changed: (meta.ctime(), meta.ctime_nsec()),
+    })
+}
+
+async fn wait_to_rebind(
+    path: &Path,
+    previous: Option<SocketIdentity>,
+    delay: Duration,
+) -> Option<SocketIdentity> {
+    let deadline = Instant::now() + delay;
+    loop {
+        tokio::time::sleep_until(deadline.min(Instant::now() + REBIND_SOCKET_POLL)).await;
+        let current = socket_identity(path).await;
+        // An endpoint replacement can wake the retry earlier. The ordinary
+        // deadline still retries a socket whose metadata did not change.
+        if current.is_some_and(|socket| Some(socket) != previous) || Instant::now() >= deadline {
+            return current;
+        }
+    }
+}
 
 async fn connect_for_routes(socket: &Path, signed: bool) -> Result<VeilClient, BridgeError> {
     if signed {
@@ -808,9 +843,10 @@ async fn reconnect_ipc(
     expected: Binding,
     signed: Option<&SignedRoutes>,
 ) -> BoundIpc {
-    let mut delay = Duration::from_millis(250);
+    let mut delay = REBIND_SOCKET_POLL;
+    let mut endpoint = socket_identity(&cfg.socket_path).await;
     loop {
-        tokio::time::sleep(delay).await;
+        endpoint = wait_to_rebind(&cfg.socket_path, endpoint, delay).await;
         match tokio::time::timeout(REBIND_TIMEOUT, bind_ipc(cfg, Some(expected), signed)).await {
             Ok(Ok(link)) => return link,
             Ok(Err(error)) => tracing::warn!(%error, "ogate IPC rebind failed"),
@@ -3187,6 +3223,42 @@ mod tests {
         drop(client);
         stop.send(true).unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_ipc_socket_interrupts_rebind_backoff() {
+        use tokio::net::UnixListener;
+
+        for stale in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("ipc");
+            let old_listener = stale.then(|| UnixListener::bind(&path).unwrap());
+            let previous = socket_identity(&path).await;
+            assert_eq!(previous.is_some(), stale);
+
+            let wait_path = path.clone();
+            let mut retry = tokio::spawn(async move {
+                wait_to_rebind(&wait_path, previous, MAX_REBIND_DELAY).await
+            });
+            if old_listener.is_some() {
+                std::fs::remove_file(&path).unwrap();
+            }
+            std::fs::write(&path, b"not a socket").unwrap();
+            assert!(
+                tokio::time::timeout(REBIND_SOCKET_POLL * 2, &mut retry)
+                    .await
+                    .is_err()
+            );
+
+            std::fs::remove_file(&path).unwrap();
+            let _new_listener = UnixListener::bind(&path).unwrap();
+            let observed = tokio::time::timeout(Duration::from_secs(2), retry)
+                .await
+                .expect("new socket did not advance the retry")
+                .unwrap();
+            assert!(observed.is_some());
+            assert_ne!(observed, previous);
+        }
     }
 
     #[tokio::test]
