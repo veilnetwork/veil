@@ -301,11 +301,12 @@ pressure on session transmit queues even after routes appear.
 
 On a bandwidth-limited link, ogate can collect packets for the same peer
 for a little longer to reduce the number of Veil frames. Set
-`[batch].flush_after_us` in the sending node's `ogate.toml` and restart
-ogate. The default is 200 µs and the accepted range is 1–32,000 µs.
-Increasing the interval adds delay to sparse traffic. The existing
-batch size and packet count limits still trigger an immediate flush.
-Add the setting only to nodes whose ogate version supports it.
+`[batch].flush_after_us` in the sending node's `ogate.toml` and apply it
+with `ogate reload --pid PID`. New batches use the new window and open
+batches keep their original deadlines. The default is 200 µs and the
+accepted range is 1–32,000 µs. Increasing the interval adds delay to
+sparse traffic. Size and packet count limits still trigger an immediate
+flush. Older ogate versions that support the setting apply it on restart.
 
 ### Diagnose a P-Net gateway
 

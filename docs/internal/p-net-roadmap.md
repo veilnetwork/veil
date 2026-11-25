@@ -765,6 +765,17 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   paths ranged from 4.44 to 7.35 ms at 200 µs and 5.87 to 6.90 ms at
   1,600 µs. Under load, the larger window raised ping p95 on both paths
   in the first pair and lowered it on both paths in the reverse pair.
+- The gateway now reloads `batch.flush_after_us` on SIGHUP. Each open
+  batch keeps the deadline assigned to its first packet. Before sending
+  it, ogate still checks the current route and admission. On Linux, a
+  signed gateway and a manual gateway with a pre-batch daemon peer both
+  switched from 200 to 32,000 µs and back on the same TUN and TCP
+  connection. Each completed 160 numbered round trips. An out-of-range
+  value left the previous window active. Applying a manual route removal
+  together with a window change withdrew the route on the same TUN.
+- A further signed run used `ogate reload --pid` during the tunnel
+  exchange and an SDK chat on the same daemon sessions. All 160 TCP
+  round trips and all 96 SDK messages arrived without duplicates.
 
 ### Sustained Linux load
 

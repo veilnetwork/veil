@@ -16,7 +16,7 @@
 //! is required: a node that has been upgraded sends batches by default; an
 //! un-upgraded receiver drops them; an upgraded receiver decodes them.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::routing::NodeId;
 
@@ -41,12 +41,16 @@ pub struct PeerBatch {
     buf: Vec<u8>,
     prefix: usize,
     count: u8,
-    /// Cached at first-push time.  Flush task uses this to find the oldest
-    /// pending batch when its deadline expires.
-    first_push: Option<Instant>,
+    timing: Option<BatchTiming>,
     /// Cached peer app_id at first-push time so flush doesn't have to
     /// re-resolve it against (possibly hot-swapped) routing state.
     app_id: [u8; 32],
+}
+
+#[derive(Debug)]
+struct BatchTiming {
+    first_push: Instant,
+    flush_at: Instant,
 }
 
 impl PeerBatch {
@@ -59,7 +63,7 @@ impl PeerBatch {
             buf: Vec::new(),
             prefix,
             count: 0,
-            first_push: None,
+            timing: None,
             app_id,
         }
     }
@@ -81,7 +85,11 @@ impl PeerBatch {
     }
 
     pub fn first_push(&self) -> Option<Instant> {
-        self.first_push
+        self.timing.as_ref().map(|timing| timing.first_push)
+    }
+
+    fn flush_at(&self) -> Option<Instant> {
+        self.timing.as_ref().map(|timing| timing.flush_at)
     }
 
     pub fn app_id(&self) -> &[u8; 32] {
@@ -94,6 +102,11 @@ impl PeerBatch {
     /// returns true OR when the deadline (from `first_push + flush_after`)
     /// expires.
     pub fn push(&mut self, pkt: &[u8]) {
+        self.push_with_window(pkt, Duration::ZERO);
+    }
+
+    /// Pin the window when this batch receives its first packet.
+    pub(crate) fn push_with_window(&mut self, pkt: &[u8], window: Duration) {
         debug_assert!(
             pkt.len() <= u16::MAX as usize,
             "ip pkt > 64 KiB cannot fit a batch slot"
@@ -106,7 +119,11 @@ impl PeerBatch {
             self.buf.reserve(self.prefix + 2 + 2 + pkt.len());
             self.buf.resize(self.prefix, 0);
             self.buf.extend_from_slice(&[BATCH_MAGIC, 0]);
-            self.first_push = Some(Instant::now());
+            let first_push = Instant::now();
+            self.timing = Some(BatchTiming {
+                first_push,
+                flush_at: first_push + window,
+            });
         }
         self.buf
             .extend_from_slice(&(pkt.len() as u16).to_be_bytes());
@@ -129,7 +146,7 @@ impl PeerBatch {
             return header;
         }
         self.count = 0;
-        self.first_push = None;
+        self.timing = None;
         std::mem::take(&mut self.buf)
     }
 }
@@ -226,15 +243,15 @@ impl EgressBatches {
         (!batch.is_empty()).then(|| batch.take())
     }
 
-    /// Find the earliest `first_push` across non-empty batches.
+    /// Find the earliest flush time across non-empty batches.
     pub fn earliest_deadline(&self) -> Option<Instant> {
-        self.by_peer.values().filter_map(|b| b.first_push()).min()
+        self.by_peer.values().filter_map(PeerBatch::flush_at).min()
     }
 
-    /// For each non-empty batch whose `first_push <= cutoff`, yield (peer, drained_buf, app_id).
+    /// Yield (peer, drained_buf, app_id) for batches due by `cutoff`.
     pub fn drain_expired(&mut self, cutoff: Instant) -> Vec<(NodeId, Vec<u8>, [u8; 32])> {
         self.by_peer
-            .extract_if(|_, batch| batch.first_push().is_some_and(|first| first <= cutoff))
+            .extract_if(|_, batch| batch.flush_at().is_some_and(|flush_at| flush_at <= cutoff))
             .map(|(peer, mut batch)| (peer, batch.take(), *batch.app_id()))
             .collect()
     }
@@ -344,6 +361,38 @@ mod tests {
         assert_eq!(expired[0].0, nid_a);
         assert!(batches.peek_mut(&nid_a).is_none());
         assert!(batches.peek_mut(&nid_b).is_some());
+    }
+
+    #[test]
+    fn a_window_change_applies_only_to_new_batches() {
+        let mut batches = EgressBatches::new();
+        let first = [1; 32];
+        let second = [2; 32];
+        let packet = [0x45, 0, 0, 0];
+        let old_window = Duration::from_secs(60);
+        batches
+            .get_or_create(first, first)
+            .push_with_window(&packet, old_window);
+        let original_deadline = batches.earliest_deadline().unwrap();
+
+        batches
+            .get_or_create(first, first)
+            .push_with_window(&packet, Duration::ZERO);
+        assert_eq!(batches.earliest_deadline(), Some(original_deadline));
+        batches
+            .get_or_create(second, second)
+            .push_with_window(&packet, Duration::ZERO);
+        let next = batches.earliest_deadline().unwrap();
+        assert!(next < original_deadline);
+        let drained = batches.drain_expired(next);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, second);
+
+        let drained = batches.drain_expired(original_deadline);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, first);
+        assert_eq!(BatchIter::new(&drained[0].1).count(), 2);
+        assert!(batches.earliest_deadline().is_none());
     }
 
     #[cfg(unix)]

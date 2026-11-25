@@ -251,6 +251,7 @@ pub struct BatchConfig {
     #[serde(default = "BatchConfig::default_enabled")]
     pub enabled: bool,
     /// Time budget for collecting packets for the same peer before flushing.
+    /// Reloading applies the window to batches opened after the change.
     #[serde(
         default = "BatchConfig::default_flush_after_us",
         skip_serializing_if = "BatchConfig::is_default_flush_after_us"
@@ -282,7 +283,7 @@ impl Default for BatchConfig {
 }
 
 /// One peer in the network: which `node_id` maps to which virtual IP.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PeerEntry {
     /// 64-char hex of the peer's veil `node_id` (= BLAKE3 of pubkey).
     pub node_id: String,

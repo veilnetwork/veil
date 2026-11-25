@@ -613,10 +613,7 @@ pub fn validate_reload(old: &OgateConfig, new: &OgateConfig) -> Result<(), &'sta
     if old.signed_policy != new.signed_policy {
         return Err("signed_policy");
     }
-    if old.batch.flush_after_us != new.batch.flush_after_us {
-        return Err("batch.flush_after_us");
-    }
-    // `mode` and `peers` are intentionally reloadable.
+    // Routing and the batch flush window are intentionally reloadable.
     Ok(())
 }
 
@@ -916,6 +913,7 @@ async fn serve_link(
     // Audit batch 2026-05-24 (M13): config-driven kill-switch.
     let batching_enabled = bridge.batching_enabled;
     let flush_after = Duration::from_micros(u64::from(cfg.batch.flush_after_us));
+    let mut batch_config = bridge.accepted.subscribe();
     tracing::info!(
         batching_enabled,
         flush_after_us = cfg.batch.flush_after_us,
@@ -931,6 +929,7 @@ async fn serve_link(
             let mut tun_r = tun_r.lock().await;
             let mut batches = EgressBatches::with_ipc_prefix();
             let mut buf = Vec::new();
+            let mut flush_after = flush_after;
             let mut routing_config = Arc::clone(&state.load().routing_config);
             let enqueue = async |config: &Arc<()>, peer_nid, peer_app_id, buf, is_batch| {
                 if !state
@@ -957,7 +956,7 @@ async fn serve_link(
                 // for the oldest pending batch.  `tokio::time::sleep_until` requires
                 // a concrete Instant; if no batch is open, just sleep "forever"
                 // (the TUN read will wake us first).
-                let deadline = batches.earliest_deadline().map(|first| first + flush_after);
+                let deadline = batches.earliest_deadline();
                 let timer = async {
                     match deadline {
                         Some(d) => tokio::time::sleep_until(d.into()).await,
@@ -974,7 +973,7 @@ async fn serve_link(
                     }
                     _ = timer => {
                         // Timer fired: flush every batch whose deadline has expired.
-                        let cutoff = std::time::Instant::now() - flush_after;
+                        let cutoff = std::time::Instant::now();
                         for (peer_nid, envelope, peer_app_id) in batches.drain_expired(cutoff) {
                             enqueue(&routing_config, peer_nid, peer_app_id, envelope, true).await;
                         }
@@ -1071,7 +1070,12 @@ async fn serve_link(
                                         enqueue(&routing_config, peer_nid, peer_app_id, envelope, true).await;
                                     }
                                     let pb = batches.get_or_create(peer_nid, peer_app_id);
-                                    pb.push(pkt);
+                                    if pb.is_empty() && batch_config.has_changed().unwrap_or(false) {
+                                        flush_after = Duration::from_micros(u64::from(
+                                            batch_config.borrow_and_update().batch.flush_after_us,
+                                        ));
+                                    }
+                                    pb.push_with_window(pkt, flush_after);
                                     if pb.should_flush(egress_flush_bytes)
                                         && let Some(envelope) = batches.take_peer(&peer_nid)
                                     {
@@ -1480,6 +1484,7 @@ async fn maintain_routes(
                 tracing::warn!(field, "config change requires an ogate restart");
                 continue;
             }
+            let window_changed = new.batch.flush_after_us != config.batch.flush_after_us;
             if binding.signed.is_some() {
                 accepted.send_replace(new.clone());
                 config = new;
@@ -1491,31 +1496,45 @@ async fn maintain_routes(
                     refresh.reset_immediately();
                 }
             } else {
-                configured = match SharedState::build(&new) {
-                    Ok(full) => full,
-                    Err(error) => {
-                        tracing::warn!(%error, "could not build ogate routes");
-                        continue;
-                    }
-                };
-                accepted.send_replace(new.clone());
+                // A timing change alone does not invalidate queued packets.
+                // Changes to routing keep the existing new-state check.
+                if !window_changed
+                    || new.mode != config.mode
+                    || new.pnet_required != config.pnet_required
+                    || new.peers != config.peers
+                {
+                    configured = match SharedState::build(&new) {
+                        Ok(full) => full,
+                        Err(error) => {
+                            tracing::warn!(%error, "could not build ogate routes");
+                            continue;
+                        }
+                    };
+                }
                 config = new;
                 next_peer = 0;
                 admission_order = None;
-                if !config.pnet_required {
+                let routes = if config.pnet_required {
+                    admitted.retain(|peer, _| configured.app_id_for(peer).is_some());
+                    refresh.reset();
+                    configured.with_pnet_admissions(&admitted)
+                } else {
                     admitted.clear();
                     connection = None;
                     session_refresh = None;
-                    publish_routes(configured.clone(), &state, &route_changes);
-                    continue;
-                }
-                admitted.retain(|peer, _| configured.app_id_for(peer).is_some());
-                publish_routes(
-                    configured.with_pnet_admissions(&admitted),
-                    &state,
-                    &route_changes,
+                    configured.clone()
+                };
+                publish_routes(routes, &state, &route_changes);
+                accepted.send_replace(config.clone());
+            }
+            if window_changed {
+                tracing::info!(
+                    flush_after_us = config.batch.flush_after_us,
+                    "accepted ogate batch flush interval"
                 );
-                refresh.reset();
+            }
+            if !config.pnet_required {
+                continue;
             }
         }
 
@@ -2831,6 +2850,14 @@ mod tests {
         let old = cfg();
         let mut new = cfg();
         new.mode = AccessMode::Open;
+        assert!(validate_reload(&old, &new).is_ok());
+    }
+
+    #[test]
+    fn reload_accepts_batch_window_change() {
+        let old = cfg();
+        let mut new = old.clone();
+        new.batch.flush_after_us = 1_600;
         assert!(validate_reload(&old, &new).is_ok());
     }
 
