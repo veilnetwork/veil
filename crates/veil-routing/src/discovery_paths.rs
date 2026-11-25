@@ -92,6 +92,12 @@ impl DiscoveryPaths {
         }
         Some(held.reply)
     }
+    pub fn local_request_started(&mut self, key: RequestKey, now: Instant) -> Option<Instant> {
+        if self.request_path(key, now)? != ReplyTo::Local {
+            return None;
+        }
+        self.requests.get(&key).map(|held| held.at)
+    }
     pub fn remember_challenge(
         &mut self,
         key: ChallengeKey,

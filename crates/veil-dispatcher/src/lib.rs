@@ -63,6 +63,8 @@ mod identity_document_store;
 #[cfg(test)]
 mod identity_document_store_tests;
 pub mod pending_ack;
+mod private_forward_recovery;
+pub use private_forward_recovery::PrivateForwardRecovery;
 mod relay_delivery_ack;
 pub mod routing;
 pub mod service_budget;
@@ -1146,6 +1148,7 @@ pub struct FrameDispatcher {
     /// channel item gained the traffic_class byte so the iterative-DHT
     /// fallback can pick a priority-aware timeout budget.
     pub route_miss_tx: Arc<Mutex<Option<RouteMissTx>>>,
+    pub private_forward_recovery: Arc<PrivateForwardRecovery>,
 
     // ── Authenticated anonymous delivery (Epic 482 v1) ──────────────
     /// Sender side of the authenticated-onion final-hop channel. When a
@@ -2174,6 +2177,7 @@ pub fn make_test_dispatcher(role: NodeRole) -> FrameDispatcher {
         capture_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         capture_rate_limit: Arc::new(veil_dispatcher_state::CaptureRateLimiter::new()),
         route_miss_tx: Arc::new(Mutex::new(None)),
+        private_forward_recovery: Default::default(),
         auth_deliver_tx: Arc::new(Mutex::new(None)),
         neighbor_scorer: Arc::new(Mutex::new(NeighborScorer::with_alphas(0.5, 0.1))),
         local_vivaldi: None,
@@ -3054,6 +3058,7 @@ mod tests {
             capture_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capture_rate_limit: Arc::new(veil_dispatcher_state::CaptureRateLimiter::new()),
             route_miss_tx: Arc::new(Mutex::new(None)),
+            private_forward_recovery: Default::default(),
             auth_deliver_tx: Arc::new(Mutex::new(None)),
             neighbor_scorer: Arc::new(Mutex::new(NeighborScorer::with_alphas(0.5, 0.1))),
             local_vivaldi: None,

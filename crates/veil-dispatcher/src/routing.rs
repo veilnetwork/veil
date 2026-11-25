@@ -933,6 +933,23 @@ impl FrameDispatcher {
                     ),
                 );
             }
+            // A short-held private frame needs evidence of our own recent
+            // request, in addition to the target signature verified above.
+            if self.app_registry.peer_revocations_enabled() {
+                let now = Instant::now();
+                let request = RequestKey {
+                    requester: p.requester_node_id,
+                    target: p.target_node_id,
+                    id: p.request_id,
+                };
+                let started = lock!(self.discovery_paths).local_request_started(request, now);
+                if started.is_some_and(|at| {
+                    now.saturating_duration_since(at)
+                        < crate::private_forward_recovery::PRIVATE_FORWARD_WAIT
+                }) {
+                    self.resume_private_forward(p.target_node_id, peer_id);
+                }
+            }
             // Wake up any IPC send that is waiting for this route.
             self.route_updated.notify_waiters();
         } else {

@@ -1243,7 +1243,13 @@ impl NodeRuntime {
             },
         };
         let handle = veil_routing::miss_handler::spawn(ctx);
-        lock_tasks(&self.tasks).sessions.push(handle);
+        let mut tasks = lock_tasks(&self.tasks);
+        tasks.sessions.push(handle);
+        if self.dispatcher.app_registry.peer_revocations_enabled() {
+            tasks.sessions.push(tokio::spawn(
+                Arc::clone(&self.dispatcher).expire_private_forwards(shutdown_tx.subscribe()),
+            ));
+        }
     }
 
     /// Spawn the authenticated-onion final-hop verify+deliver handler

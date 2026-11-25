@@ -1027,6 +1027,7 @@ impl NodeRuntime {
                     .unwrap_or(veil_dispatcher_state::CAPTURE_PER_PEER_EVENTS_PER_SEC),
             )),
             route_miss_tx: Arc::new(Mutex::new(None)),
+            private_forward_recovery: Default::default(),
             // Wired post-construction by `spawn_auth_deliver_handler`.
             auth_deliver_tx: Arc::new(Mutex::new(None)),
             neighbor_scorer: Arc::clone(&shared_neighbor_scorer),

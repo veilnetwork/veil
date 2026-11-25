@@ -1314,6 +1314,7 @@ impl NodeRuntime {
             capture_active: Arc::clone(&self.dispatcher.capture_active),
             capture_rate_limit: Arc::clone(&self.dispatcher.capture_rate_limit),
             route_miss_tx: Arc::clone(&self.dispatcher.route_miss_tx),
+            private_forward_recovery: Default::default(),
             auth_deliver_tx: Arc::clone(&self.dispatcher.auth_deliver_tx),
             neighbor_scorer: Arc::clone(&self.routing.neighbor_scorer),
             local_vivaldi: self.dispatcher.local_vivaldi.clone(),

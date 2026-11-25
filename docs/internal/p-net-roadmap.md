@@ -1868,6 +1868,30 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   measurements exercise Veil SDK delivery. A routed logical IP session
   through `ogate` remains a separate qualification item.
 
+#### Delivering the first datagram during private route discovery
+
+- Recursive transit checks its existing reputation threshold. Fresh links
+  can take the signed route-discovery path while the first datagram would
+  still fail on speculative recursive routing.
+- On a genuine downstream miss, an ordered private relay can keep one
+  small unacknowledged sealed envelope per destination in memory for up to
+  one second. The relay holds at most 32 envelopes and two from one
+  ingress peer. It continues to use the existing discovery job and its
+  limits. A fresh signed answer to a local request can release the envelope
+  over the proven next hop. Release checks split horizon, revocation, the
+  envelope's expiry and the current ingress registration. A hold that
+  expires can still use the existing recursive fallback.
+- On Linux ARM64 with `R1.1` and `R2.3` absent from startup, all three
+  runs delivered 24 SDK datagrams in each direction, including the first
+  one from `B`. One run upgraded just `R1.3`; the other relays and both
+  endpoints used the previous build. The first datagram spent 2.6–20 ms
+  at `R1.3` and reached `A` as a normal forward across the cross-link.
+  First arrivals at either endpoint took 0.68–0.74 s from the start of
+  the probe, including key discovery and application scheduling.
+- After a warm-up exchange, a separate `R1.1` outage and a double outage
+  of `R1.1` and `R2.3` each delivered all 24 SDK datagrams in both
+  directions on that build.
+
 #### Cancelling acknowledged retries after revocation
 
 - The pending ACK tracker uses the private network's current ban list.

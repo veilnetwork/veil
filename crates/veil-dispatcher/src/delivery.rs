@@ -1130,11 +1130,26 @@ impl FrameDispatcher {
         peer_id: NodeId,
         fwd_dst: NodeIdBytes,
     ) -> bool {
+        self.try_recursive_relay_with_ingress(payload, peer_id, fwd_dst, None)
+    }
+
+    pub(crate) fn try_recursive_relay_with_ingress(
+        &self,
+        payload: &ForwardPayload,
+        peer_id: NodeId,
+        fwd_dst: NodeIdBytes,
+        ingress_registration: Option<u64>,
+    ) -> bool {
         let closest = self.dht.find_closest_nodes(&fwd_dst, 3);
         let Some(reg) = &self.session_tx_registry else {
             return false;
         };
         let reg_guard = rlock!(reg);
+        if let Some(registration) = ingress_registration
+            && reg_guard.live_registration(peer_id.as_bytes()) != Some(registration)
+        {
+            return false;
+        }
         let mut frame = None;
         for next in &closest {
             if next == peer_id.as_bytes()
@@ -1567,41 +1582,36 @@ impl FrameDispatcher {
         // though our own downstream path disappeared. Tell just that hop,
         // which already knows the destination. A full queue is not a route
         // failure, including a live sovereign recipient with a full queue.
-        if missing_downstream
+        let missing_downstream = missing_downstream
             && !self
                 .resolve_sovereign_delivery_targets(&payload.envelope.recipient)
                 .is_some_and(|targets| {
                     targets
                         .iter()
                         .any(|target| *target != self.local_node_id && target != peer_id.as_bytes())
-                })
-        {
+                });
+        if missing_downstream {
             self.withdraw_private_route_from(fwd_dst, *peer_id.as_bytes());
         }
 
-        // Route miss — trigger on-demand discovery so the message can
-        // be re-forwarded once a route is learned.
-
-        {
-            // Clone the sender while holding the lock, then release the lock
-            // before calling try_send so we don't hold a Mutex across a channel
-            // operation. mpsc::Sender::clone is O(1) (Arc increment).
-            let tx_opt = lock!(self.route_miss_tx).as_ref().cloned();
-            if let Some(tx) = tx_opt {
-                // try_send — route-miss signals are best-effort;
-                // drop silently when the channel is full (consumer is busy).
-                // pair `fwd_dst` with `traffic_class`
-                // so the fallback's per-priority timeout multiplier picks
-                // the right budget (INTERACTIVE = fast-fail
-                // BACKGROUND = tolerant).
-                let _ = tx.try_send((fwd_dst, traffic_class));
+        // Use the existing bounded signed discovery service. When it can
+        // take the lookup, keep the first eligible private forward until a
+        // signed response arrives or the short hold expires.
+        let route_miss = lock!(self.route_miss_tx).clone();
+        let held = route_miss.is_some_and(|tx| {
+            if missing_downstream
+                && self.hold_private_forward(payload, peer_id, relay_hops_out, traffic_class, &tx)
+            {
+                return true;
             }
-        }
+            let _ = tx.try_send((fwd_dst, traffic_class));
+            false
+        });
         if let Some(m) = &self.metrics {
             m.inc_route_miss();
         }
 
-        self.try_recursive_relay_via_dht(payload, peer_id, fwd_dst)
+        held || self.try_recursive_relay_via_dht(payload, peer_id, fwd_dst)
     }
 
     /// Build and fire a `DeliveryStatus(DELIVERED)` frame toward `sender`.
