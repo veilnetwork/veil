@@ -1896,6 +1896,18 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   before any changes. It also refused a later host that passed fleet
   preflight but fell below the configured minimum before publication.
   The later host kept its files and service invocations.
+- Before continuing, the playbook checks the installed configuration and
+  certificate against their verified fingerprints and checks that the same
+  systemd invocation stayed active through readiness. In a two-node
+  Linux ARM64 stand, the control advanced to the second host when the
+  first host's configuration changed after `/metrics` responded. The
+  updated playbook stopped at the first host. It also stopped when the
+  certificate changed on a repeat or systemd restarted the first daemon
+  during readiness. A clean retry restored the affected host and preserved
+  the other daemon, both TUN interfaces, and bidirectional SDK traffic.
+  A separate deployment with one v0.11.59 daemon passed the same readiness
+  gate. Its repeat reported zero changes, preserved the running services
+  and TUN interfaces, and forwarded tunnel and SDK traffic in both directions.
 
 ## 9. Verify the packet path after rollout
 

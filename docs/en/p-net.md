@@ -642,6 +642,11 @@ and activates it one host at a time. The certificate is installed under
 a name containing its SHA-256 before the config points to it. Older
 certificate files can remain on disk.
 
+Before continuing to the next host, the playbook confirms that the same
+systemd invocation is still running and that the installed configuration and
+certificate still match the verified fingerprints. A change during the
+readiness check stops the rollout on that host.
+
 Set `pnet_min_membership_remaining_secs` in the inventory to reserve
 time on expiring membership certificates for the rollout. The default
 `0` checks current validity. For a positive value, the playbook uses

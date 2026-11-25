@@ -230,6 +230,12 @@
                 name: veil.service
                 state: restarted
 
+            - name: Identify the restarted Veil invocation
+              ansible.builtin.command:
+                argv: "{{ pnet_service_query }}"
+              register: pnet_restarted_service
+              changed_when: false
+
             - name: Wait for Veil readiness before the next host
               ansible.builtin.uri:
                 url: "{{ pnet_metrics_url }}"
@@ -247,34 +253,54 @@
                 state: restarted
               failed_when: false
 
-            - name: Identify the ready Veil invocation
-              ansible.builtin.command:
-                argv: "{{ pnet_service_query }}"
-              register: pnet_activated_service
-              changed_when: false
+        - name: Check the active configuration and certificate before moving on
+          ansible.builtin.stat:
+            path: "{{ item }}"
+            checksum_algorithm: sha256
+          loop:
+            - "{{ pnet_config }}"
+            - "{{ pnet_verified.certificate_path }}"
+          register: pnet_active_files
 
-            - name: Confirm the configuration still matches the activated candidate
-              ansible.builtin.stat:
-                path: "{{ pnet_config }}"
-                checksum_algorithm: sha256
-              register: pnet_activated_config
+        - name: Identify the Veil invocation after the readiness check
+          ansible.builtin.command:
+            argv: "{{ pnet_service_query }}"
+          register: pnet_activated_service
+          changed_when: false
 
-            - name: Record the successful activation for later runs
-              vars:
-                invocation: >-
-                  {{ pnet_activated_service.stdout | regex_findall('(?m)^InvocationID=([a-f0-9]{32})$') | first | default('') }}
-              ansible.builtin.copy:
-                dest: "{{ pnet_receipt_path }}"
-                content: "{{ invocation }} {{ pnet_verified.candidate }}\n"
-                owner: root
-                group: root
-                mode: "0600"
-              diff: false
-              when:
-                - "'ActiveState=active' in pnet_activated_service.stdout_lines"
-                - "'SubState=running' in pnet_activated_service.stdout_lines"
-                - invocation | length > 0
-                - pnet_activated_config.stat.checksum | default('') == pnet_verified.candidate
+        - name: Confirm readiness stayed with the verified files and Veil invocation
+          vars:
+            before_health: "{{ pnet_restarted_service.stdout | default(pnet_running_service.stdout) }}"
+            expected_invocation: >-
+              {{ before_health | regex_findall('(?m)^InvocationID=([a-f0-9]{32})$') | first | default('') }}
+            ready_invocation: >-
+              {{ pnet_activated_service.stdout | regex_findall('(?m)^InvocationID=([a-f0-9]{32})$') | first | default('') }}
+          ansible.builtin.assert:
+            that:
+              - "'ActiveState=active' in pnet_activated_service.stdout_lines"
+              - "'SubState=running' in pnet_activated_service.stdout_lines"
+              - expected_invocation | length > 0
+              - expected_invocation != '00000000000000000000000000000000'
+              - ready_invocation == expected_invocation
+              - pnet_active_files.results[0].stat.checksum | default('') == pnet_verified.candidate
+              - pnet_active_files.results[1].stat.checksum | default('') == pnet_verified.certificate
+            fail_msg: >-
+              Veil's running invocation or its verified files changed during readiness on
+              {{ inventory_hostname }}. Check the service and run the playbook again.
+            quiet: true
+
+        - name: Record the successful activation for later runs
+          when: pnet_running_health.status | default(-1) != 200
+          vars:
+            invocation: >-
+              {{ pnet_activated_service.stdout | regex_findall('(?m)^InvocationID=([a-f0-9]{32})$') | first }}
+          ansible.builtin.copy:
+            dest: "{{ pnet_receipt_path }}"
+            content: "{{ invocation }} {{ pnet_verified.candidate }}\n"
+            owner: root
+            group: root
+            mode: "0600"
+          diff: false
   rescue:
     - name: Record stage failure after which the rollout must halt
       ansible.builtin.set_fact:
