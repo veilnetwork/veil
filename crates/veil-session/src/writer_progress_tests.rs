@@ -211,7 +211,10 @@ async fn ordered_writer_pressure_guides_private_relays_with_empty_outboxes() {
         })
         .unwrap();
     };
-    assert_eq!(registry.unpressured_relay_alternative(&hops, true), None);
+    assert_eq!(
+        registry.unpressured_relay_alternative(&hops, true, None),
+        None
+    );
 
     // Pure control writes cannot move application routes even if their
     // buffered flush is held. Wait until the writer has attempted the flush.
@@ -219,7 +222,10 @@ async fn ordered_writer_pressure_guides_private_relays_with_empty_outboxes() {
     let mut first = [0];
     peer.read_exact(&mut first).await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(registry.unpressured_relay_alternative(&hops, true), None);
+    assert_eq!(
+        registry.unpressured_relay_alternative(&hops, true, None),
+        None
+    );
     let mut tail = [0; 3];
     peer.read_exact(&mut tail).await.unwrap();
     assert_eq!(&tail, b"ata");
@@ -228,7 +234,7 @@ async fn ordered_writer_pressure_guides_private_relays_with_empty_outboxes() {
     peer.read_exact(&mut first).await.unwrap();
     let wait_for_pressure = || async {
         tokio::time::timeout(Duration::from_secs(2), async {
-            while registry.unpressured_relay_alternative(&hops, true) != Some(1) {
+            while registry.unpressured_relay_alternative(&hops, true, None) != Some(1) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -238,12 +244,15 @@ async fn ordered_writer_pressure_guides_private_relays_with_empty_outboxes() {
     wait_for_pressure().await;
     assert_eq!(registry.queued_for(&preferred), Some(0));
     assert_eq!(registry.queued_for(&alternate), Some(0));
-    assert_eq!(registry.unpressured_relay_alternative(&hops, false), None);
+    assert_eq!(
+        registry.unpressured_relay_alternative(&hops, false, None),
+        None
+    );
 
     peer.read_exact(&mut tail).await.unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         while registry
-            .unpressured_relay_alternative(&hops, true)
+            .unpressured_relay_alternative(&hops, true, None)
             .is_some()
         {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -256,7 +265,10 @@ async fn ordered_writer_pressure_guides_private_relays_with_empty_outboxes() {
     wait_for_pressure().await;
     writer.0.abort();
     assert!((&mut writer).await.unwrap_err().is_cancelled());
-    assert_eq!(registry.unpressured_relay_alternative(&hops, true), None);
+    assert_eq!(
+        registry.unpressured_relay_alternative(&hops, true, None),
+        None
+    );
 }
 
 #[tokio::test]

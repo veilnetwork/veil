@@ -50,6 +50,16 @@ impl DispatcherSink for FrameDispatcher {
         FrameDispatcher::dispatch(self, header, body, peer_id)
     }
 
+    fn dispatch_on_session(
+        &self,
+        header: &FrameHeader,
+        body: &[u8],
+        peer_id: NodeIdBytes,
+        owner: &veil_session::tx_registry::SessionTxOwner,
+    ) -> DispatchResult {
+        self.dispatch_with_ingress(header, body, peer_id.into(), None, Some(owner))
+    }
+
     fn dispatch_with_carrier(
         &self,
         header: &FrameHeader,

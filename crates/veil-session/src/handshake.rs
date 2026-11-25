@@ -1252,6 +1252,7 @@ fn local_capabilities(
     caps.extra_flags2 |= veil_proto::session::cap_extra_flags2::SUPPORTS_AUXILIARY_RECORDS;
     caps.extra_flags2 |= veil_proto::session::cap_extra_flags2::SUPPORTS_AUXILIARY_APP_STREAMS;
     caps.extra_flags2 |= veil_proto::session::cap_extra_flags2::SUPPORTS_AUXILIARY_ONLY;
+    caps.extra_flags2 |= veil_proto::session::cap_extra_flags2::SUPPORTS_PNET_ROUTE_PRESSURE;
     caps
 }
 

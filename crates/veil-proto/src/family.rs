@@ -1101,6 +1101,8 @@ pub enum RoutingMsg {
     // route-gossip plane. Removed (report6 V-H2): they duplicated
     // RouteAnnounce / RouteWithdraw, which are emitted in the same code blocks,
     // while carrying none of that plane's protections. Do not reuse the codes.
+    /// One-hop advisory carrying the 32-byte destination of a congested route.
+    RoutePressure = 0x14,
 }
 
 impl RoutingMsg {
@@ -1121,6 +1123,7 @@ impl RoutingMsg {
             RoutingMsg::RouteDiscoverOffer => "route_discover_offer",
             RoutingMsg::RecursiveQuery => "recursive_query",
             RoutingMsg::RecursiveResponse => "recursive_response",
+            RoutingMsg::RoutePressure => "route_pressure",
         }
     }
 }
@@ -1142,6 +1145,7 @@ impl TryFrom<u16> for RoutingMsg {
             10 => Ok(RoutingMsg::RouteDiscoverOffer),
             0x10 => Ok(RoutingMsg::RecursiveQuery),
             0x11 => Ok(RoutingMsg::RecursiveResponse),
+            0x14 => Ok(RoutingMsg::RoutePressure),
             _ => Err(ProtoError::UnknownMsgType {
                 family: FrameFamily::Routing as u8,
                 msg_type: v,

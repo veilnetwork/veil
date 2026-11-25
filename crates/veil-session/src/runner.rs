@@ -1384,6 +1384,8 @@ pub(crate) fn is_liveness_frame(family: u8, msg_type: u16) -> bool {
         msg_type == ControlMsg::Keepalive as u16 || msg_type == ControlMsg::KeepaliveAck as u16
     } else if family == FrameFamily::Session as u8 {
         msg_type == SessionMsg::Keepalive as u16 || msg_type == SessionMsg::Padding as u16
+    } else if family == FrameFamily::Routing as u8 {
+        msg_type == veil_proto::family::RoutingMsg::RoutePressure as u16
     } else {
         false
     }
@@ -4279,6 +4281,8 @@ impl SessionRunner {
     /// runtime (e.g. periodic ROUTE_PROBEs) are written directly to the peer.
     /// Returns when the stream is closed or an I/O error occurs.
     pub async fn run(&mut self) {
+        // Keep the registry's handshake witness across in-place rekeys.
+        let session_owner = self.session_id;
         let mut frame_reader = ordered_reader::Reader::default();
         // WRR priority queue for outgoing frames from the runtime outbox.
         // Weights are configurable via SessionConfig.qos_weights.
@@ -7092,7 +7096,15 @@ impl SessionRunner {
             // call-RTT-spike investigation); off = one relaxed load.
             let rt_trace_t0 = crate::rt_trace::rt_trace_enabled().then(std::time::Instant::now);
             let rt_trace_body_len = body.len();
-            let result = self.dispatcher.dispatch(&header, body, self.peer_id);
+            let result = if header.family == FrameFamily::Routing as u8
+                && header.msg_type == veil_proto::family::RoutingMsg::RoutePressure as u16
+                && self.crypto.rx_cipher.is_some()
+            {
+                self.dispatcher
+                    .dispatch_on_session(&header, body, self.peer_id, &session_owner)
+            } else {
+                self.dispatcher.dispatch(&header, body, self.peer_id)
+            };
             // A node going down sends this before dropping its transports.
             // Gateway detach alone left its sender live until keepalive/EOF,
             // so a quick restart could have replies queued to the old runner.

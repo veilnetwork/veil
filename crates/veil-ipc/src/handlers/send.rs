@@ -647,7 +647,17 @@ async fn forward_ordinary_family_copy(
     // Use the normal reliable source and shared deadline for all
     // chunks, never the call-control datagram lane. The encrypted
     // envelope has no media/application priority visible to relays.
-    for hop in hops.into_iter().take(3) {
+    let eligible = hops.get(..3).unwrap_or(&hops);
+    let alternative = if ctx.app_registry.peer_revocations_enabled() {
+        reg.unpressured_relay_alternative(eligible, &device)
+    } else {
+        None
+    };
+    let order = alternative
+        .into_iter()
+        .chain((0..eligible.len()).filter(|index| Some(*index) != alternative));
+    for index in order {
+        let hop = eligible[index];
         if tokio::time::Instant::now() >= family_deadline {
             return DirectAdmission::TimedOut;
         }
@@ -2505,7 +2515,8 @@ async fn handle_ipc_send_inner(
             } else if !relay_realtime
                 && ctx.app_registry.peer_revocations_enabled()
                 && forced_relay_hops.len() > 1
-                && let Some(alternative) = reg.unpressured_relay_alternative(&forced_relay_hops)
+                && let Some(alternative) =
+                    reg.unpressured_relay_alternative(&forced_relay_hops, &send.dst_node_id)
                 && let Some(prefix) = forced_relay_hops.get_mut(..=alternative)
             {
                 prefix.rotate_right(1);

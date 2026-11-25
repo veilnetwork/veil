@@ -319,6 +319,7 @@ impl FrameDispatcher {
             traffic_class,
             relay_hops_out,
             None,
+            false,
         )
     }
 
@@ -329,6 +330,7 @@ impl FrameDispatcher {
         traffic_class: u8,
         relay_hops_out: u8,
         carrier: Option<&veil_anonymity::circuit_carrier::Carrier>,
+        private_ordered: bool,
     ) -> bool {
         let Some(targets) = self.resolve_sovereign_delivery_targets(&payload.envelope.recipient)
         else {
@@ -373,9 +375,13 @@ impl FrameDispatcher {
                 .send_forward_on_ingress(&reg_guard, &target, traffic_class, frame, carrier, ack)
                 .is_ok()
             {
-                // Direct-forward counter would land here on a future
-                // operator-dashboard milestone (was closed
-                // without the metric; not critical to session correctness).
+                if private_ordered && reg_guard.relay_pressured(&target, true, None) == Some(true) {
+                    self.send_route_pressure(
+                        &reg_guard,
+                        sender_peer_id.as_bytes(),
+                        payload.envelope.recipient_node_id(),
+                    );
+                }
                 return true;
             }
         }
@@ -1306,6 +1312,8 @@ impl FrameDispatcher {
         relay_hops_out: u8,
         ordered: bool,
     ) -> bool {
+        let private_ordered =
+            ordered && carrier.is_none() && self.app_registry.peer_revocations_enabled();
         // sovereign fast-path. If a live, authenticated
         // session exists to the recipient's identity, forward directly
         // via that session — a 1-hop authenticated session is always
@@ -1319,6 +1327,7 @@ impl FrameDispatcher {
             traffic_class,
             relay_hops_out,
             carrier,
+            private_ordered,
         ) {
             return true;
         }
@@ -1327,8 +1336,6 @@ impl FrameDispatcher {
         // sender_node_id is preserved through the full relay chain.
         let fwd_dst = payload.envelope.recipient_node_id();
         let sender_node_id = payload.envelope.sender_node_id();
-        let private_ordered =
-            ordered && carrier.is_none() && self.app_registry.peer_revocations_enabled();
         let mut missing_downstream = false;
         if let Some(reg) = &self.session_tx_registry {
             let dst = fwd_dst;
@@ -1391,11 +1398,18 @@ impl FrameDispatcher {
 
             // Forward to a directly connected recipient with the same neutral
             // scheduling class as any other relay hop.
-            let fwd_frame = make_fwd_frame(dst);
-            if self
-                .send_forward_on_ingress(&reg_guard, &dst, traffic_class, fwd_frame, carrier, ack)
-                .is_ok()
-            {
+            let direct = self.send_forward_on_ingress(
+                &reg_guard,
+                &dst,
+                traffic_class,
+                make_fwd_frame(dst),
+                carrier,
+                ack,
+            );
+            if direct.is_ok() {
+                if private_ordered && reg_guard.relay_pressured(&dst, true, None) == Some(true) {
+                    self.send_route_pressure(&reg_guard, peer_id.as_bytes(), dst);
+                }
                 return true;
             }
 
@@ -1498,7 +1512,11 @@ impl FrameDispatcher {
             // acquired while session_tx_registry is held).
             let mut sent_hop: Option<[u8; 32]> = None;
             let alternative = if carrier.is_none() && self.app_registry.peer_revocations_enabled() {
-                reg_guard.unpressured_relay_alternative(&candidates, ordered)
+                reg_guard.unpressured_relay_alternative(
+                    &candidates,
+                    ordered,
+                    private_ordered.then_some(&dst),
+                )
             } else {
                 None
             };
@@ -1543,14 +1561,19 @@ impl FrameDispatcher {
                     break;
                 }
             }
-            if sent_hop.is_none() && private_ordered {
-                missing_downstream = !reg_guard.has_session(&dst)
-                    && failed_hops.iter().all(|(_, error)| {
-                        matches!(
-                            error,
-                            veil_session::SendToError::Missing | veil_session::SendToError::Closed
-                        )
-                    });
+            if private_ordered {
+                let pressured = if let Some(hop) = sent_hop {
+                    reg_guard.relay_pressured(&hop, true, Some(&dst)) == Some(true)
+                } else {
+                    use veil_session::SendToError::Full;
+                    let queue_full =
+                        direct == Err(Full) || failed_hops.iter().any(|(_, error)| *error == Full);
+                    missing_downstream = !queue_full && !reg_guard.has_session(&dst);
+                    queue_full
+                };
+                if pressured {
+                    self.send_route_pressure(&reg_guard, peer_id.as_bytes(), dst);
+                }
             }
             drop(reg_guard);
             invalidate_unavailable(failed_hops);
@@ -3313,6 +3336,46 @@ mod tests {
             outgoing.try_recv().is_err(),
             "the withdrawal stops at one hop"
         );
+    }
+
+    #[test]
+    fn upstream_pressure_requires_authenticated_ingress_and_an_existing_route() {
+        use std::sync::{Arc, RwLock};
+        use veil_proto::family::{FrameFamily, RoutingMsg};
+        use veil_proto::header::FrameHeader;
+        use veil_session::dispatcher_sink::DispatcherSink;
+        use veil_util::wlock;
+
+        let (peer, alternate, dst) = ([1; 32], [2; 32], [3; 32]);
+        let owner = [11; 32];
+        let mut registry = veil_session::SessionTxRegistry::new();
+        let mut peer_rx = registry.register_owned(peer, owner);
+        let mut alternate_rx = registry.register(alternate);
+        registry.enable_route_pressure_owned(&peer, &owner);
+        let registry = Arc::new(RwLock::new(registry));
+        let mut relay = crate::make_test_dispatcher(veil_cfg::NodeRole::Core);
+        relay.app_registry =
+            Arc::new(veil_app::AppEndpointRegistry::new().with_peer_revocation_check(|_| false));
+        relay.session_tx_registry = Some(Arc::clone(&registry));
+
+        let mut header =
+            FrameHeader::new(FrameFamily::Routing as u8, RoutingMsg::RoutePressure as u16);
+        header.body_len = dst.len() as u32;
+        let hops = [peer, alternate];
+        let selection = || rlock!(registry).unpressured_relay_alternative(&hops, true, Some(&dst));
+        DispatcherSink::dispatch_on_session(&relay, &header, &dst, peer, &owner);
+        assert_eq!(selection(), None);
+        wlock!(relay.route_cache).insert(dst, peer, 100, 2);
+        wlock!(relay.route_cache).insert(dst, alternate, 200, 2);
+        relay.dispatch(&header, &dst, peer);
+        DispatcherSink::dispatch_on_session(&relay, &header, &dst, peer, &[12; 32]);
+        DispatcherSink::dispatch_on_session(&relay, &header, &dst[..31], peer, &owner);
+        assert_eq!(selection(), None);
+        DispatcherSink::dispatch_on_session(&relay, &header, &dst, peer, &owner);
+        assert_eq!(selection(), Some(1));
+        assert_eq!(rlock!(relay.route_cache).lookup_all(&dst), hops);
+        assert!(peer_rx.try_recv().is_err());
+        assert!(alternate_rx.try_recv().is_err());
     }
 
     #[test]

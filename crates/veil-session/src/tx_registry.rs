@@ -38,10 +38,10 @@
 
 use std::collections::HashMap;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 
@@ -61,6 +61,39 @@ static NEXT_TX_REGISTRATION: AtomicU64 = AtomicU64::new(1);
 // their configured limit. Bound the watermarks by both size and frame count.
 const RELAY_PRESSURE_HIGH_FRAMES: usize = 32;
 const RELAY_PRESSURE_LOW_FRAMES: usize = 8;
+const ROUTE_PRESSURE_LIFETIME: Duration = Duration::from_secs(5);
+const ROUTE_PRESSURE_INTERVAL: Duration = Duration::from_secs(1);
+const ROUTE_PRESSURE_DESTINATIONS: usize = 64;
+
+#[derive(Debug, Default)]
+struct RoutePressure {
+    received: HashMap<NodeIdBytes, Instant>,
+    sent: HashMap<NodeIdBytes, Instant>,
+}
+
+fn record_pressure(
+    deadlines: &mut HashMap<NodeIdBytes, Instant>,
+    dst: NodeIdBytes,
+    now: Instant,
+    lifetime: Duration,
+) -> bool {
+    let until = now + lifetime;
+    if let Some(deadline) = deadlines.get_mut(&dst) {
+        if until.saturating_duration_since(*deadline) < ROUTE_PRESSURE_INTERVAL {
+            return false;
+        }
+        *deadline = until;
+        return true;
+    }
+    if deadlines.len() == ROUTE_PRESSURE_DESTINATIONS {
+        deadlines.retain(|_, deadline| *deadline > now);
+        if deadlines.len() == ROUTE_PRESSURE_DESTINATIONS {
+            return false;
+        }
+    }
+    deadlines.insert(dst, until);
+    true
+}
 
 /// A priority-tagged frame: `(priority, frame_bytes)`.
 ///
@@ -90,6 +123,7 @@ struct SessionTxEntry {
     owner: Option<SessionTxOwner>,
     direct_app_chunks: bool,
     ordinary_queue_pressured: AtomicBool,
+    route_pressure: Option<Box<Mutex<RoutePressure>>>,
     /// Local registration witness, including replacements under the same peer.
     registration: u64,
 }
@@ -285,6 +319,7 @@ impl SessionTxRegistry {
                 owner: None,
                 direct_app_chunks: false,
                 ordinary_queue_pressured: AtomicBool::new(false),
+                route_pressure: None,
                 registration: self.latest_registration,
             },
         );
@@ -312,6 +347,7 @@ impl SessionTxRegistry {
                 owner: Some(owner),
                 direct_app_chunks: false,
                 ordinary_queue_pressured: AtomicBool::new(false),
+                route_pressure: None,
                 registration: self.latest_registration,
             },
         );
@@ -346,6 +382,7 @@ impl SessionTxRegistry {
                 owner: None,
                 direct_app_chunks: false,
                 ordinary_queue_pressured: AtomicBool::new(false),
+                route_pressure: None,
                 registration: self.latest_registration,
             },
         );
@@ -451,6 +488,7 @@ impl SessionTxRegistry {
                 owner: Some(owner),
                 direct_app_chunks: false,
                 ordinary_queue_pressured: AtomicBool::new(false),
+                route_pressure: None,
                 registration: self.latest_registration,
             },
         );
@@ -511,6 +549,57 @@ impl SessionTxRegistry {
         }
         entry.direct_app_chunks = enabled;
         true
+    }
+
+    /// Enable pressure advisories on the exact private session whose authenticated
+    /// capabilities advertised support. Replacing the session discards its state.
+    pub fn enable_route_pressure_owned(&mut self, peer: &NodeIdBytes, owner: &SessionTxOwner) {
+        if let Some(entry) = self.senders.get_mut(peer)
+            && entry.owner.as_ref() == Some(owner)
+        {
+            entry.route_pressure.get_or_insert_with(Box::default);
+        }
+    }
+
+    pub fn record_route_pressure(
+        &self,
+        peer: &NodeIdBytes,
+        owner: &SessionTxOwner,
+        dst: NodeIdBytes,
+    ) -> bool {
+        let Some(pressure) = self
+            .senders
+            .get(peer)
+            .filter(|entry| entry.owner.as_ref() == Some(owner) && !entry.tx.is_closed())
+            .and_then(|entry| entry.route_pressure.as_deref())
+        else {
+            return false;
+        };
+        record_pressure(
+            &mut veil_util::lock!(pressure).received,
+            dst,
+            Instant::now(),
+            ROUTE_PRESSURE_LIFETIME,
+        )
+    }
+
+    /// Reserve the next advisory slot for this peer and destination. The caller
+    /// holds the registry read lock across reservation and best-effort send.
+    pub fn reserve_route_pressure_notice(&self, peer: &NodeIdBytes, dst: NodeIdBytes) -> bool {
+        let Some(pressure) = self
+            .senders
+            .get(peer)
+            .filter(|entry| !entry.tx.is_closed())
+            .and_then(|entry| entry.route_pressure.as_deref())
+        else {
+            return false;
+        };
+        record_pressure(
+            &mut veil_util::lock!(pressure).sent,
+            dst,
+            Instant::now(),
+            ROUTE_PRESSURE_INTERVAL,
+        )
     }
 
     /// Capability and sender are read in one registry snapshot.
@@ -1045,8 +1134,22 @@ impl SessionTxRegistry {
         self.senders.get(peer).map(|entry| entry.tx.queued())
     }
 
-    fn relay_pressured(&self, peer: &NodeIdBytes, ordered: bool) -> Option<bool> {
+    pub fn relay_pressured(
+        &self,
+        peer: &NodeIdBytes,
+        ordered: bool,
+        dst: Option<&NodeIdBytes>,
+    ) -> Option<bool> {
         let entry = self.senders.get(peer)?;
+        if let (Some(pressure), Some(dst)) = (entry.route_pressure.as_deref(), dst)
+            && !entry.tx.is_closed()
+            && veil_util::lock!(pressure)
+                .received
+                .get(dst)
+                .is_some_and(|deadline| *deadline > Instant::now())
+        {
+            return Some(true);
+        }
         let (queued, capacity) = entry.tx.ordinary_queue_occupancy()?;
         let high = (capacity - capacity / 4).min(RELAY_PRESSURE_HIGH_FRAMES);
         let low = (capacity / 4).min(RELAY_PRESSURE_LOW_FRAMES);
@@ -1071,16 +1174,17 @@ impl SessionTxRegistry {
         &self,
         ordered_hops: &[NodeIdBytes],
         ordered: bool,
+        dst: Option<&NodeIdBytes>,
     ) -> Option<usize> {
         let [preferred, fallbacks @ ..] = ordered_hops else {
             return None;
         };
-        if fallbacks.is_empty() || self.relay_pressured(preferred, ordered) != Some(true) {
+        if fallbacks.is_empty() || self.relay_pressured(preferred, ordered, dst) != Some(true) {
             return None;
         }
         fallbacks
             .iter()
-            .position(|peer| self.relay_pressured(peer, ordered) == Some(false))
+            .position(|peer| self.relay_pressured(peer, ordered, dst) == Some(false))
             .map(|index| index + 1)
     }
 
@@ -1434,21 +1538,107 @@ mod tests {
         }
         assert!(
             registry
-                .unpressured_relay_alternative(&hops, true)
+                .unpressured_relay_alternative(&hops, true, None)
                 .is_none()
         );
         for _ in 0..6 {
             assert!(registry.send_to(&preferred, INTERACTIVE, vec![7]));
         }
-        assert_eq!(registry.unpressured_relay_alternative(&hops, true), Some(2));
+        assert_eq!(
+            registry.unpressured_relay_alternative(&hops, true, None),
+            Some(2)
+        );
         for _ in 0..6 {
             assert!(registry.send_to(&alternate, INTERACTIVE, vec![7]));
         }
         assert!(
             registry
-                .unpressured_relay_alternative(&hops, true)
+                .unpressured_relay_alternative(&hops, true, None)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn pressure_is_scoped_to_the_session_and_destination() {
+        let (preferred, alternate, dst) = ([1; 32], [2; 32], [3; 32]);
+        let (owner, replacement) = ([11; 32], [12; 32]);
+        let mut registry = SessionTxRegistry::new();
+        let _preferred = registry.register_owned(preferred, owner);
+        let _alternate = registry.register(alternate);
+        let hops = [preferred, alternate];
+        assert!(!registry.reserve_route_pressure_notice(&preferred, dst));
+        assert!(!registry.record_route_pressure(&preferred, &owner, dst));
+        registry.enable_route_pressure_owned(&preferred, &replacement);
+        assert!(!registry.record_route_pressure(&preferred, &owner, dst));
+        registry.enable_route_pressure_owned(&preferred, &owner);
+        assert!(registry.reserve_route_pressure_notice(&preferred, dst));
+        assert!(!registry.reserve_route_pressure_notice(&preferred, dst));
+        assert!(registry.record_route_pressure(&preferred, &owner, dst));
+        assert_eq!(
+            registry.unpressured_relay_alternative(&hops, true, Some(&dst)),
+            Some(1)
+        );
+        assert_eq!(
+            registry.unpressured_relay_alternative(&hops, true, Some(&[4; 32])),
+            None
+        );
+        assert_eq!(
+            registry.unpressured_relay_alternative(&hops[..1], true, Some(&dst)),
+            None
+        );
+
+        let _replacement = registry.register_owned(preferred, replacement);
+        registry.enable_route_pressure_owned(&preferred, &replacement);
+        assert!(!registry.record_route_pressure(&preferred, &owner, dst));
+        assert_eq!(
+            registry.unpressured_relay_alternative(&hops, true, Some(&dst)),
+            None
+        );
+    }
+
+    #[test]
+    fn pressure_deadlines_are_bounded_and_renew_only_at_the_notice_interval() {
+        let mut deadlines = HashMap::new();
+        let now = Instant::now();
+        for index in 0..ROUTE_PRESSURE_DESTINATIONS {
+            assert!(record_pressure(
+                &mut deadlines,
+                [index as u8; 32],
+                now,
+                ROUTE_PRESSURE_LIFETIME
+            ));
+        }
+        let dst = [0; 32];
+        let extra = [255; 32];
+        let soon = now + ROUTE_PRESSURE_INTERVAL / 2;
+        assert!(!record_pressure(
+            &mut deadlines,
+            dst,
+            soon,
+            ROUTE_PRESSURE_LIFETIME
+        ));
+        assert!(!record_pressure(
+            &mut deadlines,
+            extra,
+            soon,
+            ROUTE_PRESSURE_LIFETIME
+        ));
+        assert_eq!(deadlines[&dst], now + ROUTE_PRESSURE_LIFETIME);
+        let renewed = now + ROUTE_PRESSURE_INTERVAL;
+        assert!(record_pressure(
+            &mut deadlines,
+            dst,
+            renewed,
+            ROUTE_PRESSURE_LIFETIME
+        ));
+        assert!(record_pressure(
+            &mut deadlines,
+            extra,
+            now + ROUTE_PRESSURE_LIFETIME,
+            ROUTE_PRESSURE_LIFETIME,
+        ));
+        assert_eq!(deadlines.len(), 2);
+        assert_eq!(deadlines[&dst], renewed + ROUTE_PRESSURE_LIFETIME);
     }
 
     /// A full queue is load, and the caller can tell it from a dead session.

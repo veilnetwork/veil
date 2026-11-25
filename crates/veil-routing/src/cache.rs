@@ -586,6 +586,16 @@ impl RouteCache {
             .collect()
     }
 
+    /// Check a hop without refreshing cache recency.
+    pub fn has_live_hop(&self, dst: &[u8; 32], hop: &[u8; 32]) -> bool {
+        self.entries.get(dst).is_some_and(|bucket| {
+            let now = Instant::now();
+            bucket
+                .iter()
+                .any(|entry| entry.next_hop == *hop && !entry.is_expired(now))
+        })
+    }
+
     /// Combined lookup returning `(next_hop, score, hop_count)` triples in a
     /// single call — avoids acquiring the route-cache lock twice when both
     /// the raw score (for ECMP grouping) and the hop count (for penalty) are

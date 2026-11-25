@@ -418,6 +418,8 @@ pub mod cap_extra_flags2 {
     /// All auxiliary record types are available without a mixed reliable
     /// child. Allows each endpoint to spend that connection slot locally.
     pub const SUPPORTS_AUXILIARY_ONLY: u8 = 1 << 4;
+    /// Hop-local congestion advisories on authenticated private sessions.
+    pub const SUPPORTS_PNET_ROUTE_PRESSURE: u8 = 1 << 5;
 }
 
 #[cfg(test)]
@@ -611,6 +613,10 @@ impl CapabilitiesPayload {
         self.supports_auxiliary_records()
             && self.supports_reliable_parallel()
             && self.extra_flags2 & cap_extra_flags2::SUPPORTS_AUXILIARY_APP_STREAMS != 0
+    }
+
+    pub fn supports_pnet_route_pressure(&self) -> bool {
+        self.extra_flags2 & cap_extra_flags2::SUPPORTS_PNET_ROUTE_PRESSURE != 0
     }
 
     pub fn supports_auxiliary_only(&self) -> bool {

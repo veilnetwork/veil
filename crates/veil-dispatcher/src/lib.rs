@@ -1764,17 +1764,22 @@ impl FrameDispatcher {
         peer_id: impl Into<NodeId>,
         carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
     ) -> DispatchResult {
+        self.dispatch_with_ingress(header, body, peer_id.into(), carrier, None)
+    }
+
+    fn dispatch_with_ingress(
+        &self,
+        header: &FrameHeader,
+        body: &[u8],
+        peer_id: NodeId,
+        carrier: Option<veil_anonymity::circuit_carrier::Carrier>,
+        owner: Option<&veil_session::tx_registry::SessionTxOwner>,
+    ) -> DispatchResult {
         // Anchor for `BAN_DROP_PAD` (see const docstring) — measured at
         // the same entry point as non-banned frames so the constant-time
         // pad covers the full dispatch envelope, not just the tail after
         // the ban-check.
         let dispatch_start = std::time::Instant::now();
-        // H9 ergonomic accept: take `impl Into<NodeId>` rather
-        // than `NodeId` directly so callers with raw `[u8; 32]` (session
-        // runner, tests) don't need an explicit `.into()` at every
-        // call site. The conversion happens once here at the top
-        // of the body; the rest of the fn works with the typed `NodeId`.
-        let peer_id: NodeId = peer_id.into();
         let _opaque_trace = veil_session::opaque_forward_trace::receive(
             &self.local_node_id,
             peer_id.as_bytes(),
@@ -1873,6 +1878,12 @@ impl FrameDispatcher {
                 // was disabled; return Violation so operators can see it.
                 let _ = (peer_id, body);
                 DispatchResult::Violation("Tunnel frames not accepted at dispatcher".to_owned())
+            }
+            FrameFamily::Routing if header.msg_type == RoutingMsg::RoutePressure as u16 => {
+                if let Some(owner) = owner {
+                    self.handle_route_pressure(body, peer_id, owner);
+                }
+                DispatchResult::NoResponse
             }
             FrameFamily::Routing => self.dispatch_routing(header, body, peer_id),
             FrameFamily::Diag => self.dispatch_diag(header, body, peer_id),

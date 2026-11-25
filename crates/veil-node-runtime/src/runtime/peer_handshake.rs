@@ -1413,6 +1413,14 @@ pub async fn register_connection_session(
                         .remote_capabilities
                         .supports_direct_app_chunks(),
                 );
+                if runtime.dispatcher.app_registry.peer_revocations_enabled()
+                    && pending_peer_state
+                        .entry
+                        .remote_capabilities
+                        .supports_pnet_route_pressure()
+                {
+                    reg.enable_route_pressure_owned(&remote_nid, &session_owner);
+                }
             }
             if evicted_open && rx.is_some() {
                 let (event, reason) = if resumed_predecessor {

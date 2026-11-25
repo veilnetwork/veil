@@ -61,7 +61,11 @@ pub trait FrameBroadcaster: Send + Sync {
     /// Prefer a live fallback with ordinary outbox headroom when the first
     /// eligible relay is under local queue pressure. The index refers to
     /// the caller's route list.
-    fn unpressured_relay_alternative(&self, _ordered_hops: &[[u8; 32]]) -> Option<usize> {
+    fn unpressured_relay_alternative(
+        &self,
+        _ordered_hops: &[[u8; 32]],
+        _destination: &[u8; 32],
+    ) -> Option<usize> {
         None
     }
 

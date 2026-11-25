@@ -193,6 +193,51 @@ impl FrameDispatcher {
             // recursive DHT routing
             RoutingMsg::RecursiveQuery => self.handle_recursive_query(body, peer_id),
             RoutingMsg::RecursiveResponse => self.handle_recursive_response(body, peer_id),
+            RoutingMsg::RoutePressure => DispatchResult::NoResponse,
+        }
+    }
+
+    pub(super) fn send_route_pressure(
+        &self,
+        reg: &veil_session::SessionTxRegistry,
+        upstream: &NodeIdBytes,
+        dst: NodeIdBytes,
+    ) {
+        if upstream != &dst
+            && reg.reserve_route_pressure_notice(upstream, dst)
+            && reg.send_to(
+                upstream,
+                veil_proto::priority::INTERACTIVE,
+                encode_routing_frame(RoutingMsg::RoutePressure, &dst),
+            )
+        {
+            log::debug!("pnet.route_pressure.sent");
+        }
+    }
+
+    pub(super) fn handle_route_pressure(
+        &self,
+        body: &[u8],
+        peer: NodeId,
+        owner: &veil_session::tx_registry::SessionTxOwner,
+    ) {
+        let Ok(dst) = NodeIdBytes::try_from(body) else {
+            return;
+        };
+        let peer = peer.as_bytes();
+        if !self.app_registry.peer_revocations_enabled()
+            || dst == self.local_node_id
+            || &dst == peer
+            || self.app_registry.is_peer_revoked(peer)
+            || self.app_registry.is_peer_revoked(&dst)
+            || !rlock!(self.route_cache).has_live_hop(&dst, peer)
+        {
+            return;
+        }
+        if let Some(reg) = &self.session_tx_registry
+            && rlock!(reg).record_route_pressure(peer, owner, dst)
+        {
+            log::debug!("pnet.route_pressure.received");
         }
     }
 

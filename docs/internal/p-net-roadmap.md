@@ -1945,13 +1945,48 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   with 14.96 s p95 for delivered packets. The receiver reported no full
   ratchet bank. After restoring capacity, the first measured window
   delivered 3,482 of 4,012 packets and the following window delivered
-  all 3,608 packets at 2.91 ms p95. All 48 SDK datagrams arrived. Choosing
-  a healthier route during the cap remains open.
+  all 3,608 packets at 2.91 ms p95. All 48 SDK datagrams arrived.
 - With only the receiver's daemon updated, the equivalent `R2.3→B` cap
   still left all nine sessions established and produced no receiver bank
   overflow. The first measured window after releasing the cap delivered
   all 4,050 packets at 3.53 ms p95. The following window delivered all
   3,606 packets. All 48 SDK datagrams arrived across the mixed versions.
+
+#### Steering away from a congested downstream hop
+
+- An ordered private forward can cause a congestion advisory back to its
+  authenticated ingress neighbor. Two neighbors exchange advisories only
+  when their sessions support the extension. The receiving node accepts
+  them from the canonical live session and only for an existing route
+  through that peer. Each advisory carries a destination and applies to
+  that hop for five seconds. Updates are bounded per session and per
+  destination. Reconnecting discards the old session's advisories.
+- The relay and ordinary private IPC sender can move a clear candidate
+  ahead of the pressured one. They retain the original candidates and
+  retry them in their existing order when no clear candidate succeeds.
+  The next packets can use the original preference again when the
+  advisory expires. Receive admission, signed route proofs, revocation
+  and routed address policy continue to apply.
+- With the 256 kbit/s cap on `R1.3→B`, `R1.3` sent five advisories
+  and `R1.2` accepted all five. In the first seven seconds `R1.2`
+  sent 12.56 MB across the cross-link and 0.21 MB toward `R1.3`.
+  `A` still sent its traffic through `R1.1`. In the late shaped
+  window 7,006 of 7,047 UDP datagrams arrived before the window closed,
+  and 6,915 arrived within 100 ms. All 7,047 ultimately arrived.
+  The latency of packets sent in that window was 3.54 ms at p95
+  and 3.25 s at p99. Signed admission was active at both endpoints
+  when the cap was about to be removed. After release, all 4,052
+  packets in the first measured window arrived at 2.46 ms p95.
+- With both endpoints and the three relays on the alternate branch still
+  on `4155511f`, the same cap and unbatched TUN traffic used the
+  updated pair's advisory. All 7,013 datagrams in the late shaped window
+  arrived during the window, including 6,911 within 100 ms. The mixed
+  nodes then exchanged all 48 SDK messages. The late shaped p99 of
+  2.60 s still leaves room to improve how a congested branch is retried.
+- A separate run started bidirectional SDK chat seven seconds into the
+  same cap, while the 500 packets/s TUN load continued. Both sides
+  received all 24 messages each within 4.72 seconds. The shaped queue
+  and all nine sessions were still active after the exchange.
 
 #### Withdrawing a failed downstream route
 

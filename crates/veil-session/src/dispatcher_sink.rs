@@ -123,6 +123,17 @@ pub trait DispatcherSink: Send + Sync {
     /// response / violation / etc.).
     fn dispatch(&self, header: &FrameHeader, body: &[u8], peer_id: NodeIdBytes) -> DispatchResult;
 
+    /// Dispatch a frame whose canonical session owner affects admission.
+    fn dispatch_on_session(
+        &self,
+        header: &FrameHeader,
+        body: &[u8],
+        peer_id: NodeIdBytes,
+        _owner: &crate::tx_registry::SessionTxOwner,
+    ) -> DispatchResult {
+        self.dispatch(header, body, peer_id)
+    }
+
     /// Authenticated ingress transport metadata, with the same admission and
     /// service checks as ordinary dispatch. No producer class comes from it.
     fn dispatch_with_carrier(
