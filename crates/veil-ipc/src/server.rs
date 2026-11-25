@@ -2744,38 +2744,8 @@ async fn handle_ipc_client(
                             frame.extend_from_slice(&ipc_send_err::SPOOFED_SRC.to_be_bytes());
                             wh.write_all(&frame).await?;
                         } else {
-                            // Cloned, not borrowed: every field is an `Arc`
-                            // where the server keeps it, so this is a handful
-                            // of refcount bumps — and it is what lets the send
-                            // leave this loop instead of holding it for the
-                            // length of a DHT key resolve.
-                            let mut ctx = IpcSendContext {
-                                pnet_admission: if veil_proto::ipc::ipc_local_source_lane(&hdr)
-                                    == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
-                                    && app_registry.peer_revocations_enabled()
-                                {
-                                    pnet_status_queries.clone()
-                                } else {
-                                    None
-                                },
-                                source_received_at: std::time::Instant::now(),
-                                local_work: None,
-                                local_priority: veil_proto::ipc::ipc_local_source_lane(&hdr),
-                                app_registry:        Arc::clone(&app_registry),
-                                local_node_id:       node_id,
-                                session_tx_registry: session_tx_registry.clone(),
-                                route_cache:         route_cache.clone(),
-                                route_updated:       route_updated.clone(),
-                                peer_mlkem_keys:     peer_mlkem_keys.clone(),
-                                mlkem_ek_resolver:   mlkem_ek_resolver.clone(),
-                                session_instance_lookup: session_instance_lookup.clone(),
-                                ratchet:             ratchet.clone(),
-                                anon_onion_sender:   anon_onion_sender.clone(),
-                                capture_tx:          capture_tx.clone(),
-                                pending_recursive:   pending_recursive.clone(),
-                                trace_sample_rate,
-                                pending_ack:         pending_ack.clone(),
-                            };
+                            let source_received_at = std::time::Instant::now();
+                            let local_priority = veil_proto::ipc::ipc_local_source_lane(&hdr);
                             // The rate check stays ON the loop — it is a
                             // counter, and refusing has to be immediate.
                             let send_count = batch.as_ref().map_or(1, |(bodies, _, _)| bodies.len());
@@ -2820,6 +2790,34 @@ async fn handle_ipc_client(
                                         ).await?;
                                         continue;
                                     }
+                                };
+                                // The spawned handler owns its context. Clone it only
+                                // after the request has passed the rate and queue limits.
+                                let mut ctx = IpcSendContext {
+                                    pnet_admission: if local_priority == veil_proto::ipc::LOCAL_RECOVERABLE_DATA_LANE
+                                        && app_registry.peer_revocations_enabled()
+                                    {
+                                        pnet_status_queries.clone()
+                                    } else {
+                                        None
+                                    },
+                                    source_received_at,
+                                    local_work: None,
+                                    local_priority,
+                                    app_registry:        Arc::clone(&app_registry),
+                                    local_node_id:       node_id,
+                                    session_tx_registry: session_tx_registry.clone(),
+                                    route_cache:         route_cache.clone(),
+                                    route_updated:       route_updated.clone(),
+                                    peer_mlkem_keys:     peer_mlkem_keys.clone(),
+                                    mlkem_ek_resolver:   mlkem_ek_resolver.clone(),
+                                    session_instance_lookup: session_instance_lookup.clone(),
+                                    ratchet:             ratchet.clone(),
+                                    anon_onion_sender:   anon_onion_sender.clone(),
+                                    capture_tx:          capture_tx.clone(),
+                                    pending_recursive:   pending_recursive.clone(),
+                                    trace_sample_rate,
+                                    pending_ack:         pending_ack.clone(),
                                 };
                                 let body_owned = body;
                                 // Only an authenticated, rate-accepted local source may
@@ -2882,7 +2880,7 @@ async fn handle_ipc_client(
                                 });
                             } else {
                                 crate::route_trace::sealed_local_sample(
-                                    "rate_refused", ctx.local_priority, &body,
+                                    "rate_refused", local_priority, &body,
                                 );
                             }
                         }

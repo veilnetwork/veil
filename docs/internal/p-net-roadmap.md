@@ -511,6 +511,20 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 - The same ogate passed real TUN traffic both ways with an older daemon
   and batching disabled. The current daemon's gateway withdrew the
   route 0.878 s after the old daemon disconnected.
+- Two experiments gave ready TUN reads priority for up to eight packets
+  after a batch deadline. With an immediate timer at the nominal
+  deadline, IPC requests for the first 40,000 UDP datagrams grew from
+  7,416 to 13,016 and job refusals from 2,992 to 3,827. Both runs used
+  the same 200 µs setting, 24 gateways and two 32 Mb/s TCP-backed flows.
+- With the existing timer, it took 6,322 IPC requests versus 6,925 in
+  the paired control for the same first 40,000 datagrams. Cold UDP loss
+  rose from 8,704 of 164,778 to 15,889 of 162,226. Chat p99 towards the
+  hub rose from 533 to 768 ms, with all 200 messages delivered in both
+  runs. The bridge retains its original scheduling.
+- The IPC loop constructs and clones the send-handler context after
+  accepting its rate, job and byte budgets. Rejected sends skip these
+  clones. The handler still uses the timestamp captured before the
+  budget checks to calculate its deadline.
 - A separate cold start ran the first end-to-end probes in groups of
   four before opening the UDP flows. All 24 paths answered in 12.52 s.
   The following 38 s sample lost 76 of 137,175 UDP datagrams, with one
