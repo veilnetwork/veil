@@ -1053,6 +1053,47 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   passed bidirectional TUN probes 0.586 s after readmission on the
   same interfaces.
 
+#### TCP receive queues during cold bulk traffic
+
+- Two alternating Linux ARM64 pairs used the same binaries, two vCPUs,
+  48 admitted sessions and two 32 Mb/s tunnel flows. Each run offered
+  167,272 datagrams. In one variant only the hub's network namespace
+  had its `tcp_rmem` autotuning ceiling lowered from 6 MiB to 512 KiB.
+  The socket trace confirmed that both measured receive buffers topped
+  out at 512 KiB. The peak unread queue across those sockets fell from
+  2.65 and 3.68 MB to 0.50 and 0.49 MB in the two pairs.
+- Chat p99 towards the hub fell from 658 to 345 ms and from 604 to
+  270 ms. In the opposite direction it changed from 62 to 132 ms and
+  from 147 to 81 ms. All 200 SDK messages arrived once in each run.
+  UDP losses changed from 4,195 to 17,561 and from 19,306 to 14,384.
+  In the first pair, the two senders' receive-window-limited time rose
+  from 1.68 and 1.21 s to 4.59 and 4.51 s. The smaller cap is a local
+  latency and throughput tradeoff on this stand.
+- In a separate experiment with the default receiver ceiling, both
+  transmitting spokes used a 64 Mb/s outer-link shaper with a 32 KiB
+  burst and an 80 ms queue limit. The observed steady TCP rate before
+  shaping was about 58 Mb/s per flow for 32 Mb/s of tunnel UDP. The
+  shapers deferred packets and reported zero queue drops. At the same
+  offer of 167,272 datagrams, UDP losses fell from 21,735 to 18,362
+  and from 15,809 to 13,733. Each trial delivered all 200 SDK messages.
+  p99 towards the hub changed from 378 to 643 ms and from 284 to
+  239 ms. Return p99 changed from 121 to 123 ms and from 92 to 84 ms.
+- Two further pairs moved only the measured links to QUIC. The hub
+  kept 46 established TCP sessions and admitted the same 48 peers.
+  At 167,272 offered datagrams per trial, UDP losses fell from 15,863
+  to 12,250 and from 16,567 to 11,318. Hub runnable wait rose from
+  13.79 to 18.04 s and from 15.61 to 18.80 s. Towards the hub, p99
+  among received SDK messages was 371 and 574 ms on TCP and 2,805
+  and 2,378 ms on QUIC.
+- Every SDK endpoint submitted all 100 messages through `AppSender::send`.
+  The hub received 95 and 97 with the mixed transport, compared with
+  100 in each all-TCP control. The missing sequences were sent
+  2.99–4.80 s after UDP traffic started. All 100 return messages
+  arrived in each run, and the test found no duplicate messages. The
+  SDK probe collects messages for four seconds after its last send
+  and does not use an end-to-end acknowledgement. This configuration
+  failed the cold-load SDK delivery gate.
+
 #### xVeil text delivery on a shared gateway
 
 - A two-vCPU Linux ARM64 hub served 24 gateways with disjoint 4,096-entry
