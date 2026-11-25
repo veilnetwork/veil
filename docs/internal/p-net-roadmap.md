@@ -112,6 +112,20 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 - A separate mixed run used a pre-batch daemon with 34 configured
   entries. The tunnel passed traffic in both directions, and the new
   bridge removed the route 0.879 s after disconnect.
+- For manually configured routes, ogate remembers up to 256 recent
+  withdrawals confirmed by the daemon. If the peer list requested after
+  an event is full or unavailable, free slots in the priority batch can
+  recheck those peers for up to 30 s after withdrawal. The bridge avoids
+  duplicate queries for peers selected from the list. Newly installed
+  routes still require a positive admission response.
+- On Linux with real TUN interfaces, a proxy replaced the post-rejoin
+  peer list with 256 entries that omitted the rejoining peer. With 4,096
+  configured routes, the earlier bridge restored the route after 6.12 s
+  using a 64-entry sweep batch. The updated bridge restored it after
+  3.40 s using a two-entry priority batch. Withdrawal took 1.70 s and
+  2.25 s in the two trials. Both passed encrypted traffic in both
+  directions after rejoin. The socket regression test also checks that
+  a configured peer listed as active without admission has no route.
 - On three Linux ARM64 nodes with 1,024 routes per node and 32 Mb/s of
   offered UDP on the surviving link, three A/B runs measured route
   withdrawal of 1.72–1.94 s with session events and 3.75–3.78 s with the

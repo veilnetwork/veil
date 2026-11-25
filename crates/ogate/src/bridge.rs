@@ -258,11 +258,22 @@ struct RecentAdmissions {
 }
 
 impl RecentAdmissions {
+    fn remember_withdrawal(&mut self, peer: NodeId, now: Instant) {
+        self.seen.insert(peer, now);
+        if self.seen.len() > veil_proto::MAX_PEERS_LIST_ENTRIES
+            && let Some(oldest) = self.seen.iter().min_by_key(|(_, when)| **when)
+        {
+            let oldest_peer = *oldest.0;
+            self.seen.remove(&oldest_peer);
+        }
+    }
+
     fn retry_group(
         &mut self,
         peers: &[(NodeId, [u8; 32])],
         admitted: &HashMap<NodeId, u64>,
         now: Instant,
+        selected: &[(NodeId, [u8; 32])],
     ) -> Vec<(NodeId, [u8; 32])> {
         self.seen.retain(|peer, seen| {
             now.duration_since(*seen) < PNET_RECENT_WINDOW
@@ -273,13 +284,14 @@ impl RecentAdmissions {
             .range((Excluded(self.cursor), Unbounded))
             .chain(self.seen.range(..=self.cursor))
             .filter(|(peer, _)| !admitted.contains_key(*peer))
+            .filter(|(peer, _)| !selected.iter().any(|(selected, _)| selected == *peer))
             .filter_map(|(peer, _)| {
                 peers
                     .binary_search_by_key(peer, |(id, _)| *id)
                     .ok()
                     .map(|index| peers[index])
             })
-            .take(veilclient::PNET_ADMISSION_BATCH_MAX_PEERS)
+            .take(veilclient::PNET_ADMISSION_BATCH_MAX_PEERS.saturating_sub(selected.len()))
             .collect();
         if let Some((peer, _)) = group.last() {
             self.cursor = *peer;
@@ -1287,23 +1299,33 @@ fn apply_admissions(
     admitted: &mut HashMap<NodeId, u64>,
     binding: &RouteBinding,
 ) -> bool {
-    let mut recent = binding.signed.as_ref().map(|_| {
+    let signed = binding.signed.is_some();
+    let lock_recent = || {
         binding
             .recent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-    });
+    };
+    let mut recent = signed.then(&lock_recent);
     let now = Instant::now();
     let mut changed = false;
     for (peer, _) in group {
         match results.remove(peer) {
             Some(expiry) => {
-                if let Some(recent) = recent.as_mut() {
+                if signed && let Some(recent) = recent.as_mut() {
                     recent.seen.insert(*peer, now);
                 }
                 changed |= admitted.insert(*peer, expiry) != Some(expiry);
             }
-            None => changed |= admitted.remove(peer).is_some(),
+            None if admitted.remove(peer).is_some() => {
+                if !signed {
+                    recent
+                        .get_or_insert_with(&lock_recent)
+                        .remember_withdrawal(*peer, now);
+                }
+                changed = true;
+            }
+            None => {}
         }
     }
     changed
@@ -1555,27 +1577,38 @@ async fn maintain_routes(
             .unwrap_or(&configured.peer_app_ids);
         // Recheck one batch of likely session changes, then resume the full
         // sweep at the same cursor. The snapshot never changes admission.
-        let mut retry = if wake == Wake::SessionSweep
-            && multiple_batches
-            && let Some(client) = &connection
-            && let Some(live) = live_peer_hints(client, &mut pace, true).await
-        {
-            live.changed_peers(&configured.peer_app_ids, &admitted)
+        let recheck_sessions = wake == Wake::SessionSweep && multiple_batches;
+        let live = if recheck_sessions && let Some(client) = &connection {
+            live_peer_hints(client, &mut pace, true).await
         } else {
-            Vec::new()
+            None
         };
-        if retry.is_empty()
-            && connection.is_some()
-            && binding.signed.is_some()
-            && Instant::now() >= retry_due
+        let mut retry = live.as_ref().map_or_else(Vec::new, |live| {
+            live.changed_peers(&configured.peer_app_ids, &admitted)
+        });
+        let signed_retry =
+            binding.signed.is_some() && retry.is_empty() && Instant::now() >= retry_due;
+        // A full or missing snapshot can hide a rejoining peer. Use free
+        // places in this batch to recheck recently withdrawn manual routes.
+        let incomplete_hint = binding.signed.is_none()
+            && recheck_sessions
+            && live.as_ref().is_none_or(|live| live.at_capacity)
+            && retry.len() < veilclient::PNET_ADMISSION_BATCH_MAX_PEERS;
+        if (signed_retry || incomplete_hint)
+            && connection
+                .as_ref()
+                .is_some_and(|client| client.supports_pnet_admission_batch())
         {
             let now = Instant::now();
-            retry_due = now + PNET_RETRY_PERIOD;
-            retry = binding
+            if signed_retry {
+                retry_due = now + PNET_RETRY_PERIOD;
+            }
+            let recent = binding
                 .recent
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .retry_group(&configured.peer_app_ids, &admitted, now);
+                .retry_group(&configured.peer_app_ids, &admitted, now, &retry);
+            retry.extend(recent);
         }
         if !retry.is_empty()
             && let Some(client) = &connection
@@ -2022,11 +2055,11 @@ mod tests {
         recent.seen.insert([2; 32], now - PNET_RECENT_WINDOW);
         let live = HashMap::from([([1; 32], 0)]);
 
-        let batch = recent.retry_group(&peers, &live, now);
+        let batch = recent.retry_group(&peers, &live, now, &[]);
         assert_eq!(batch.len(), veilclient::PNET_ADMISSION_BATCH_MAX_PEERS);
         assert_eq!(batch[0].0, [3; 32]);
         assert_eq!(batch.last().unwrap().0, [66; 32]);
-        assert_eq!(recent.retry_group(&peers, &live, now)[0].0, [67; 32]);
+        assert_eq!(recent.retry_group(&peers, &live, now, &[])[0].0, [67; 32]);
         assert!(!recent.seen.contains_key(&[2; 32]));
         assert!(!recent.seen.contains_key(&[68; 32]));
     }
@@ -2172,6 +2205,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pnet_session_changes_recheck_routes_before_a_large_sweep_finishes() {
+        exercise_pnet_session_rejoin(false).await;
+    }
+
+    #[tokio::test]
+    async fn pnet_rechecks_recently_withdrawn_route_omitted_from_the_peer_list() {
+        exercise_pnet_session_rejoin(true).await;
+    }
+
+    async fn exercise_pnet_session_rejoin(capped_list: bool) {
         use std::sync::atomic::{AtomicBool, Ordering};
         use veil_ipc::{EventBus, IpcEndpoint, IpcServer, PeerListProvider, PnetStatusProvider};
         use veil_proto::{EventPayload, PeersListEntry, PeersListPayload, PnetStatusResultPayload};
@@ -2180,6 +2222,7 @@ mod tests {
         struct Session {
             active: AtomicBool,
             delay_next_hint: AtomicBool,
+            capped_list: AtomicBool,
             past_first_batch: Notify,
         }
         impl PeerListProvider for Session {
@@ -2187,6 +2230,26 @@ mod tests {
                 if self.delay_next_hint.swap(false, Ordering::Relaxed) {
                     std::thread::sleep(PNET_PEER_HINT_TIMEOUT + Duration::from_millis(100));
                     return PeersListPayload { peers: Vec::new() };
+                }
+                if self.capped_list.load(Ordering::Relaxed) {
+                    let peers = (0..veil_proto::MAX_PEERS_LIST_ENTRIES)
+                        .map(|index| {
+                            let mut node_id = [0xbb; 32];
+                            node_id[..2].copy_from_slice(&(index as u16).to_be_bytes());
+                            if index == 0 {
+                                node_id = [0; 32];
+                                node_id[1] = 3;
+                            }
+                            PeersListEntry {
+                                node_id,
+                                state: veil_proto::peer_state::ACTIVE,
+                                direction: veil_proto::peer_direction::INBOUND,
+                                transport: Vec::new(),
+                                caps: None,
+                            }
+                        })
+                        .collect();
+                    return PeersListPayload { peers };
                 }
                 let peers = self
                     .active
@@ -2224,6 +2287,7 @@ mod tests {
         let session = Arc::new(Session {
             active: AtomicBool::new(true),
             delay_next_hint: AtomicBool::new(false),
+            capped_list: AtomicBool::new(false),
             past_first_batch: Notify::new(),
         });
         let events = Arc::new(EventBus::new());
@@ -2295,7 +2359,10 @@ mod tests {
         );
 
         session.active.store(true, Ordering::Relaxed);
-        session.delay_next_hint.store(true, Ordering::Relaxed);
+        session.capped_list.store(capped_list, Ordering::Relaxed);
+        session
+            .delay_next_hint
+            .store(!capped_list, Ordering::Relaxed);
         assert_ne!(
             events.publish(EventPayload {
                 kind: SESSION_ADMITTED,
@@ -2311,6 +2378,13 @@ mod tests {
         .await
         .expect("route restoration did not use the session admission event");
         assert!(!session.delay_next_hint.load(Ordering::Relaxed));
+        assert_eq!(
+            state
+                .load()
+                .table
+                .lookup_egress(Ipv4Addr::new(10, 99, 0, 3).into()),
+            Decision::NoRoute
+        );
 
         updates.abort();
         assert!(updates.await.unwrap_err().is_cancelled());
