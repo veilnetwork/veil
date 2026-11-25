@@ -877,6 +877,32 @@ async fn query_pnet_legacy(
     (admitted, uncertain)
 }
 
+async fn wait_status_disconnect(client: Option<&VeilClient>) {
+    match client.and_then(VeilClient::pnet_status_disconnected) {
+        Some(disconnect) => disconnect.await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn query_status_connection(
+    client: &Arc<VeilClient>,
+    peers: &[(NodeId, [u8; 32])],
+    pace: &mut tokio::time::Interval,
+) -> (Option<HashMap<NodeId, u64>>, bool) {
+    let query = async {
+        if client.supports_pnet_admission_batch() {
+            (query_pnet_batch(client, peers, pace).await, false)
+        } else {
+            let (admitted, uncertain) = query_pnet_legacy(client, peers, pace).await;
+            (Some(admitted), uncertain)
+        }
+    };
+    tokio::select! {
+        _ = wait_status_disconnect(Some(client)) => (None, false),
+        result = query => result,
+    }
+}
+
 fn publish_routes(candidate: SharedState, state: &ArcSwap<SharedState>, route_changes: &Notify) {
     let peers_changed = candidate.peer_app_ids != state.load().peer_app_ids;
     tracing::info!(peers = candidate.table.peer_count(), "updated ogate routes");
@@ -1966,14 +1992,7 @@ async fn maintain_routes(
         let sessions_ready =
             may_recheck_sessions && session_due_at.is_some_and(|due| due <= now) || priority_ready;
         let wake = tokio::select! {
-            _ = async {
-                // Legacy queries clone the status client, but join their
-                // tasks before returning to this wait.
-                match connection.as_mut().and_then(Arc::get_mut) {
-                    Some(client) => client.wait_disconnected().await,
-                    None => std::future::pending().await,
-                }
-            } => Wake::StatusDisconnected,
+            _ = wait_status_disconnect(connection.as_deref()) => Wake::StatusDisconnected,
             _ = async {
                 if next_peer == 0 {
                     refresh.tick().await;
@@ -2360,12 +2379,8 @@ async fn maintain_routes(
         {
             // Older daemons use at most four paced unary queries per
             // priority round before the regular sweep resumes.
-            let (response, reconnect_legacy) = if client.supports_pnet_admission_batch() {
-                (query_pnet_batch(client, &retry, &mut pace).await, false)
-            } else {
-                let (results, uncertain) = query_pnet_legacy(client, &retry, &mut pace).await;
-                (Some(results), uncertain)
-            };
+            let (response, reconnect_legacy) =
+                query_status_connection(client, &retry, &mut pace).await;
             if client.is_disconnected() {
                 continue;
             }
@@ -2405,25 +2420,22 @@ async fn maintain_routes(
         let end;
         let results;
         if let Some(client) = &connection {
-            if client.supports_pnet_admission_batch() {
-                end = (next_peer + veilclient::PNET_ADMISSION_BATCH_MAX_PEERS).min(order.len());
-                results = query_pnet_batch(client, &order[next_peer..end], &mut pace).await;
-                if client.is_disconnected() {
-                    continue;
-                }
+            let limit = if client.supports_pnet_admission_batch() {
+                veilclient::PNET_ADMISSION_BATCH_MAX_PEERS
             } else {
-                end = (next_peer + legacy_group_limit).min(order.len());
-                let (legacy_results, uncertain) =
-                    query_pnet_legacy(client, &order[next_peer..end], &mut pace).await;
-                if client.is_disconnected() {
-                    continue;
-                }
-                if uncertain {
-                    connection = None;
-                    session_refresh = None;
-                }
-                results = Some(legacy_results);
+                legacy_group_limit
+            };
+            end = (next_peer + limit).min(order.len());
+            let (response, reconnect_legacy) =
+                query_status_connection(client, &order[next_peer..end], &mut pace).await;
+            if client.is_disconnected() {
+                continue;
             }
+            if reconnect_legacy {
+                connection = None;
+                session_refresh = None;
+            }
+            results = response;
         } else {
             end = 0;
             results = None;
@@ -3192,8 +3204,20 @@ mod tests {
 
     #[tokio::test]
     async fn pnet_routes_withdraw_when_idle_status_ipc_closes() {
-        use veil_ipc::{IpcEndpoint, IpcServer, PnetStatusProvider};
-        use veil_proto::PnetStatusResultPayload;
+        exercise_status_ipc_close(false).await;
+    }
+
+    #[tokio::test]
+    async fn pnet_routes_withdraw_when_status_ipc_closes_during_a_query() {
+        exercise_status_ipc_close(true).await;
+    }
+
+    async fn exercise_status_ipc_close(hold_reply: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{UnixListener, UnixStream};
+        use tokio::sync::oneshot;
+        use veil_ipc::{EventBus, IpcEndpoint, IpcServer, PnetStatusProvider};
+        use veil_proto::{EventPayload, HEADER_SIZE, LocalAppMsg, PnetStatusResultPayload, codec};
 
         struct Admission;
 
@@ -3213,6 +3237,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("ipc");
         let node_id = [1; 32];
+        let events = Arc::new(EventBus::new());
         let (stop, shutdown) = watch::channel(false);
         let mut server = IpcServer::new(
             IpcEndpoint::Unix(socket.clone()),
@@ -3220,7 +3245,8 @@ mod tests {
             Arc::new(veil_app::AppEndpointRegistry::new()),
             node_id,
         )
-        .with_pnet_status_provider(Arc::new(Admission));
+        .with_pnet_status_provider(Arc::new(Admission))
+        .with_event_bus(Arc::clone(&events));
         let server = tokio::spawn(async move { server.run().await.unwrap() });
         tokio::time::timeout(Duration::from_secs(2), async {
             while !socket.exists() {
@@ -3230,7 +3256,43 @@ mod tests {
         .await
         .unwrap();
 
-        let config = pnet_sweep_config(&socket, 2);
+        let proxy_socket = directory.path().join("status-proxy");
+        let listener = UnixListener::bind(&proxy_socket).unwrap();
+        let held_reply = Arc::new(Notify::new());
+        let held = Arc::clone(&held_reply);
+        let (close, closing) = oneshot::channel::<()>();
+        let proxy = tokio::spawn(async move {
+            let (front, _) = listener.accept().await.unwrap();
+            let backend = UnixStream::connect(&socket).await.unwrap();
+            let (mut front_rx, mut front_tx) = front.into_split();
+            let (mut back_rx, mut back_tx) = backend.into_split();
+            let replies = async {
+                let mut admission_replies = 0;
+                loop {
+                    let mut bytes = [0; HEADER_SIZE];
+                    back_rx.read_exact(&mut bytes).await.unwrap();
+                    let header = codec::decode_header(&bytes).unwrap();
+                    let mut body = vec![0; header.body_len as usize];
+                    back_rx.read_exact(&mut body).await.unwrap();
+                    if header.msg_type == LocalAppMsg::PnetAdmissionBatchResult as u16 {
+                        admission_replies += 1;
+                        if hold_reply && admission_replies == 2 {
+                            held.notify_one();
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                    front_tx.write_all(&bytes).await.unwrap();
+                    front_tx.write_all(&body).await.unwrap();
+                }
+            };
+            tokio::select! {
+                _ = tokio::io::copy(&mut front_rx, &mut back_tx) => {},
+                _ = replies => {},
+                _ = closing => {},
+            }
+        });
+
+        let config = pnet_sweep_config(&proxy_socket, 2);
         let configured = SharedState::build(&config).unwrap();
         let state = Arc::new(ArcSwap::from_pointee(
             configured.with_pnet_admissions(&HashMap::new()),
@@ -3260,12 +3322,27 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), wait_for_route_count(2))
             .await
             .unwrap();
-        stop.send(true).unwrap();
+        if hold_reply {
+            assert_ne!(
+                events.publish(EventPayload {
+                    kind: SESSION_ADMITTED,
+                    payload: Vec::new(),
+                }),
+                0
+            );
+            tokio::time::timeout(Duration::from_secs(2), held_reply.notified())
+                .await
+                .expect("gateway did not send another admission query");
+            assert_eq!(state.load().table.peer_count(), 2);
+        }
+        close.send(()).unwrap();
+        proxy.await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), wait_for_route_count(0))
             .await
-            .expect("routes stayed published until the next sweep after IPC closed");
+            .expect("routes stayed published after the status IPC closed");
         updates.abort();
         assert!(updates.await.unwrap_err().is_cancelled());
+        stop.send(true).unwrap();
         server.await.unwrap();
     }
 

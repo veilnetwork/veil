@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
 use veil_ipc::transport::{self, IpcReadHalf, IpcStream};
 use veilcore::proto::{
@@ -833,6 +833,7 @@ pub struct VeilClient {
     pub(crate) dispatch: Arc<Mutex<DispatchTable>>,
     /// Authentication token returned by the node in the HELLO_OK response.
     pub client_token: [u8; 16],
+    pnet_status_reader: Option<watch::Sender<()>>,
     /// handle to the dispatch reader
     /// task, aborted on `VeilClient` drop so the task does not
     /// linger on a closed IPC socket holding (now-dropped)
@@ -1297,7 +1298,14 @@ impl VeilClient {
         // on inbound-stream notifications (Phase 6.51).
         let dispatch_clone = Arc::clone(&dispatch);
         let writer_clone = writer.clone();
-        let reader_task_handle = tokio::spawn(reader_task(rh, dispatch_clone, writer_clone));
+        let (pnet_status_reader, reader_lifetime) =
+            (extra_flags & veil_proto::ipc::IPC_CAP_PNET_SESSION_HINTS != 0)
+                .then(|| watch::channel(()))
+                .unzip();
+        let reader_task_handle = tokio::spawn(async move {
+            let _reader_lifetime = reader_lifetime;
+            reader_task(rh, dispatch_clone, writer_clone).await;
+        });
 
         Ok(Self {
             writer,
@@ -1306,6 +1314,7 @@ impl VeilClient {
             pnet_admission_batch: hdr.flags & veil_proto::ipc::IPC_HELLO_OK_PNET_ADMISSION_BATCH
                 != 0,
             pnet_authority,
+            pnet_status_reader,
             reader_task: Some(reader_task_handle),
         })
     }
@@ -1323,12 +1332,29 @@ impl VeilClient {
         }
     }
 
+    /// Return a future that completes when either half of a P-Net status
+    /// connection stops. It can run alongside borrowed admission requests.
+    /// Available on clients opened with [`Self::connect_for_pnet_status`].
+    pub fn pnet_status_disconnected(&self) -> Option<impl std::future::Future<Output = ()> + '_> {
+        let reader = self.pnet_status_reader.as_ref()?;
+        Some(async move {
+            tokio::select! {
+                _ = reader.closed() => {},
+                _ = self.writer.tx.closed() => {},
+            }
+        })
+    }
+
     /// Whether either half of the local IPC connection has stopped.
     pub fn is_disconnected(&self) -> bool {
         self.reader_task
             .as_ref()
             .is_none_or(|reader| reader.is_finished())
             || self.writer.tx.is_closed()
+            || self
+                .pnet_status_reader
+                .as_ref()
+                .is_some_and(watch::Sender::is_closed)
     }
 
     /// Bind a local application endpoint and return an [`AppHandle`].
@@ -4259,6 +4285,7 @@ mod tests {
             reader_task: None,
             pnet_admission_batch: false,
             pnet_authority: None,
+            pnet_status_reader: None,
         };
         let event = |index: usize| VeilEvent {
             kind: veil_proto::event_kind::SESSIONS_CHANGED,
@@ -4305,6 +4332,7 @@ mod tests {
             reader_task: None,
             pnet_admission_batch: true,
             pnet_authority: None,
+            pnet_status_reader: None,
         };
         let peers = [[1; 32], [2; 32]];
         let respond = async {

@@ -994,9 +994,9 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   0.427 s and recovered in 0.55 s. A current-daemon run took 0.420
   and 0.55 s respectively. Every run kept its gateway process and
   TUN interfaces and delivered all 48 SDK messages exactly once.
-- While waiting between admission queries, the gateway also watches the
-  status IPC connection for closure. It withdraws routes and starts a
-  fresh admission sweep on a verified status connection. The app data
+- The gateway watches the status IPC connection for closure between and
+  during admission queries. It withdraws routes and starts a fresh
+  admission sweep on a verified status connection. The app data
   connection can stay bound while the status connection recovers.
 - In a paired Linux ARM64 run, a proxy closed only the gateway's status
   connection while an SDK flow ran between the daemons. Routes withdrew
@@ -1009,6 +1009,16 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   IPC, withdrawal took 0.088 s and bidirectional TUN traffic recovered in
   3.473 s after the proxy accepted status connections again. SDK receives
   continued during that outage as well.
+- In a follow-up Linux ARM64 comparison, the proxy held an admission
+  reply before closing only the status socket. The gateway interrupted
+  the outstanding request and withdrew routes in 0.134 s versus 4.953 s
+  in the control. Both runs denied tunnel probes while status was
+  unavailable. SDK receives continued, and the same TUN interfaces and
+  data IPC connection passed traffic after status was restored. The
+  same test held a unary reply with a pre-batch daemon and raw packet
+  IPC, yielding 0.086 s withdrawal. Signed policy with a held batch
+  reply withdrew in 0.115 s. Both runs kept their SDK flows and resumed
+  bidirectional traffic on their existing TUN interfaces.
 
 ### Remote session changes with pre-batch daemons
 
