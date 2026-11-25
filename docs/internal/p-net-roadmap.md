@@ -1114,6 +1114,21 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   route in 1.41 s using the legacy query. All seven runs recovered
   traffic on their original gateway and TUN interfaces and delivered
   all 336 SDK chat messages exactly once.
+- The gateway reads up to 64 buffered events before the next paced
+  admission request. The targeted hint queues admit only peers with
+  configured routes. A Unix IPC regression sends 256 unrelated private
+  session events ahead of a configured peer omitted from a full peer
+  snapshot. The gateway checks that peer promptly and only installs its
+  route after a positive daemon reply.
+- In four paired Linux ARM64 runs with 4,096 configured routes, a local
+  IPC proxy inserted the same burst before each targeted admission hint.
+  First-route timings overlapped at 0.575–0.580 s with the change and
+  0.558–0.596 s in the controls, measured after observed daemon admission.
+  All four runs restored traffic on their original TUN interfaces and
+  delivered at least 1,000 SDK messages in each direction. A separate
+  run with the pre-batch daemon used single-peer queries and raw packet
+  IPC, restored bidirectional TUN traffic, and reached the same SDK
+  delivery target.
 
 ### Emulated inter-site link
 

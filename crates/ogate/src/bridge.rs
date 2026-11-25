@@ -285,6 +285,7 @@ const PNET_QUERY_SPACING: Duration = Duration::from_millis(125);
 const PNET_RETRY_PERIOD: Duration = Duration::from_secs(1);
 const PNET_RECENT_WINDOW: Duration = Duration::from_secs(30);
 const PNET_SESSION_COALESCE: Duration = Duration::from_millis(100);
+const PNET_EVENT_DRAIN_LIMIT: usize = 64;
 const PNET_PRIORITY_RECHECK_SPACING: Duration = Duration::from_secs(1);
 const PNET_PEER_HINT_TIMEOUT: Duration = Duration::from_millis(250);
 
@@ -317,12 +318,42 @@ struct SessionRefresh {
 }
 
 impl SessionRefresh {
-    fn note_event(&mut self, event: VeilEvent) {
+    fn new(events: broadcast::Receiver<VeilEvent>) -> Self {
+        Self {
+            events,
+            pending: None,
+            session_count: None,
+            pending_loss: None,
+            pending_readmission: None,
+            next_priority_check: Instant::now(),
+            loss_cursor: None,
+            admission_hints: BTreeSet::new(),
+            withdrawal_hints: BTreeSet::new(),
+        }
+    }
+
+    fn drain_events(&mut self, configured: &[(NodeId, [u8; 32])]) {
+        for _ in 0..PNET_EVENT_DRAIN_LIMIT {
+            match self.events.try_recv() {
+                Ok(event) => self.note_event(event, configured),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => self.note_lag(),
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn note_event(&mut self, event: VeilEvent, configured: &[(NodeId, [u8; 32])]) {
         match event.kind {
             EVENTS_LAGGED => self.note_lag(),
             SESSION_ADMITTED => self.note_readmission(),
             PNET_SESSION_ADMITTED | PNET_SESSION_ENDED => {
-                if let Ok(peer) = event.payload.try_into() {
+                // A daemon can carry many private sessions unrelated to this
+                // gateway. Keep those peers out of its bounded hint queues.
+                if let Ok(peer) = event.payload.try_into()
+                    && configured
+                        .binary_search_by_key(&peer, |(id, _)| *id)
+                        .is_ok()
+                {
                     let due = self.session_event_due();
                     let (hints, pending) = if event.kind == PNET_SESSION_ENDED {
                         (&mut self.withdrawal_hints, &mut self.pending_loss)
@@ -1859,15 +1890,10 @@ async fn maintain_routes(
         PrioritySweep,
     }
     loop {
-        // The ordinary sweep is always ready between groups. Inspect a
-        // buffered session event before selecting another group so that
-        // coalescing starts promptly, even in a large table.
+        // Read a bounded group of buffered events before the next paced
+        // query. One event per query can delay a hint behind busy sessions.
         if let Some(refresh) = session_refresh.as_mut() {
-            match refresh.events.try_recv() {
-                Ok(event) => refresh.note_event(event),
-                Err(broadcast::error::TryRecvError::Lagged(_)) => refresh.note_lag(),
-                Err(_) => {}
-            }
+            refresh.drain_events(&configured.peer_app_ids);
         }
         let batched_admission = connection
             .as_ref()
@@ -1943,7 +1969,7 @@ async fn maintain_routes(
             match event {
                 Ok(event) => {
                     if let Some(refresh) = session_refresh.as_mut() {
-                        refresh.note_event(event);
+                        refresh.note_event(event, &configured.peer_app_ids);
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -2126,17 +2152,7 @@ async fn maintain_routes(
                     .await;
             if let Some(client) = &connection {
                 let batched_admission = client.supports_pnet_admission_batch();
-                session_refresh = Some(SessionRefresh {
-                    events: client.events_with_lag().await,
-                    pending: None,
-                    session_count: None,
-                    pending_loss: None,
-                    pending_readmission: None,
-                    next_priority_check: Instant::now(),
-                    loss_cursor: None,
-                    admission_hints: BTreeSet::new(),
-                    withdrawal_hints: BTreeSet::new(),
-                });
+                session_refresh = Some(SessionRefresh::new(client.events_with_lag().await));
                 let group_limit = if batched_admission {
                     veilclient::PNET_ADMISSION_BATCH_MAX_PEERS
                 } else {
@@ -2913,20 +2929,61 @@ mod tests {
     }
 
     #[test]
+    fn unconfigured_sessions_cannot_fill_either_targeted_hint_queue() {
+        let peer = [0xaa; 32];
+        let configured = [(peer, [1; 32])];
+        for (kind, check, admitted) in [
+            (
+                PNET_SESSION_ADMITTED,
+                PriorityCheck::Readmission,
+                HashMap::new(),
+            ),
+            (
+                PNET_SESSION_ENDED,
+                PriorityCheck::Withdrawal,
+                HashMap::from([(peer, 0)]),
+            ),
+        ] {
+            let (_, events) = broadcast::channel(1);
+            let mut refresh = SessionRefresh::new(events);
+            for index in 0..veil_proto::MAX_PEERS_LIST_ENTRIES {
+                let mut unrelated = [0xbb; 32];
+                unrelated[..2].copy_from_slice(&(index as u16).to_be_bytes());
+                refresh.note_event(
+                    VeilEvent {
+                        kind,
+                        payload: unrelated.to_vec(),
+                    },
+                    &configured,
+                );
+            }
+            assert!(refresh.pending.is_none());
+            refresh.note_event(
+                VeilEvent {
+                    kind,
+                    payload: peer.to_vec(),
+                },
+                &configured,
+            );
+            assert_eq!(
+                refresh.take_targeted_hints(check, &configured, &admitted, 1),
+                configured
+            );
+        }
+    }
+
+    #[test]
     fn withdrawal_and_readmission_share_the_early_check_interval() {
         let now = Instant::now();
         let next = now + PNET_PRIORITY_RECHECK_SPACING;
         let (_, events) = broadcast::channel(1);
         let mut refresh = SessionRefresh {
-            events,
             pending: Some(now),
             session_count: Some(2),
             pending_loss: Some(now),
             pending_readmission: Some(now),
             next_priority_check: next,
-            loss_cursor: None,
-            admission_hints: BTreeSet::new(),
-            withdrawal_hints: BTreeSet::new(),
+            ..SessionRefresh::new(events)
         };
         assert!(refresh.priority_check(Some(next)).is_none());
         assert!(matches!(
@@ -3146,7 +3203,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_targeted_hint_checks_a_new_peer_omitted_from_a_full_peer_list() {
+    async fn a_targeted_hint_checks_an_omitted_peer_after_unconfigured_session_events() {
         exercise_pnet_session_rejoin(SessionHintScenario::CappedFirstAdmission).await;
     }
 
@@ -3340,6 +3397,10 @@ mod tests {
         });
         let events = Arc::new(if matches!(scenario, SessionHintScenario::EventBusLag) {
             EventBus::with_capacity(1)
+        } else if first_admission {
+            // Keep the whole burst on the event bus so the test exercises
+            // the gateway's bounded hint queue, not IPC event loss.
+            EventBus::with_capacity(2 * veil_proto::MAX_PEERS_LIST_ENTRIES)
         } else {
             EventBus::new()
         });
@@ -3399,13 +3460,27 @@ mod tests {
                 );
             };
             assert_eq!(session.peer_checks.load(Ordering::Relaxed), 0);
+            for index in 0..veil_proto::MAX_PEERS_LIST_ENTRIES {
+                let mut unrelated = [0xbb; 32];
+                unrelated[..2].copy_from_slice(&(index as u16).to_be_bytes());
+                assert_ne!(
+                    events.publish(EventPayload {
+                        kind: PNET_SESSION_ADMITTED,
+                        payload: unrelated.to_vec(),
+                    }),
+                    0
+                );
+            }
             publish_hint();
-            let event = tokio::time::timeout(Duration::from_secs(2), existing_events.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(event.kind, SESSION_ADMITTED);
-            assert!(event.payload.is_empty());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                for _ in 0..=veil_proto::MAX_PEERS_LIST_ENTRIES {
+                    let event = existing_events.recv().await.unwrap();
+                    assert_eq!(event.kind, SESSION_ADMITTED);
+                    assert!(event.payload.is_empty());
+                }
+            })
+            .await
+            .unwrap();
             tokio::time::timeout(Duration::from_secs(2), async {
                 while session.peer_checks.load(Ordering::Relaxed) == 0 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
