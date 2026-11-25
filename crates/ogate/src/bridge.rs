@@ -258,7 +258,7 @@ const PNET_QUERY_SPACING: Duration = Duration::from_millis(125);
 const PNET_RETRY_PERIOD: Duration = Duration::from_secs(1);
 const PNET_RECENT_WINDOW: Duration = Duration::from_secs(30);
 const PNET_SESSION_COALESCE: Duration = Duration::from_millis(100);
-const PNET_WITHDRAWAL_RECHECK_SPACING: Duration = Duration::from_secs(1);
+const PNET_PRIORITY_RECHECK_SPACING: Duration = Duration::from_secs(1);
 const PNET_PEER_HINT_TIMEOUT: Duration = Duration::from_millis(250);
 
 fn pnet_session_refresh_spacing(peer_count: usize) -> Duration {
@@ -271,12 +271,19 @@ fn pnet_session_refresh_spacing(peer_count: usize) -> Duration {
         .min(PNET_REFRESH_PERIOD)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PriorityCheck {
+    Withdrawal,
+    Readmission,
+}
+
 struct SessionRefresh {
     events: mpsc::Receiver<VeilEvent>,
     pending: Option<Instant>,
     session_count: Option<u16>,
     pending_loss: Option<Instant>,
-    next_loss_check: Instant,
+    pending_readmission: Option<Instant>,
+    next_priority_check: Instant,
     loss_cursor: Option<NodeId>,
 }
 
@@ -286,9 +293,9 @@ impl SessionRefresh {
             let due = *self
                 .pending
                 .get_or_insert_with(|| Instant::now() + PNET_SESSION_COALESCE);
-            if event.kind == SESSIONS_CHANGED
-                && let Ok(bytes) = event.payload.try_into()
-            {
+            if event.kind == SESSION_ADMITTED {
+                self.pending_readmission.get_or_insert(due);
+            } else if let Ok(bytes) = event.payload.try_into() {
                 let count = u16::from_be_bytes(bytes);
                 if self
                     .session_count
@@ -299,6 +306,18 @@ impl SessionRefresh {
                 }
             }
         }
+    }
+
+    fn priority_check(&self, normal_due: Option<Instant>) -> Option<(Instant, PriorityCheck)> {
+        // Prefer the loss check when both hints coalesced into the same slot.
+        [
+            (self.pending_loss, PriorityCheck::Withdrawal),
+            (self.pending_readmission, PriorityCheck::Readmission),
+        ]
+        .into_iter()
+        .filter_map(|(due, check)| Some((due?.max(self.next_priority_check), check)))
+        .filter(|(due, _)| normal_due.is_none_or(|normal| *due < normal))
+        .min_by_key(|(due, _)| *due)
     }
 }
 
@@ -1564,7 +1583,7 @@ async fn maintain_routes(
         Policy,
         SessionEvent(Option<VeilEvent>),
         SessionSweep,
-        WithdrawalSweep,
+        PrioritySweep,
     }
     loop {
         // The ordinary sweep is always ready between groups. Inspect a
@@ -1580,19 +1599,18 @@ async fn maintain_routes(
         let session_due = session_refresh.as_ref().and_then(|refresh| refresh.pending);
         let session_due_at = session_due.map(|due| due.max(next_session_sweep));
         let may_recheck_sessions = multiple_batches || next_peer == 0;
-        let withdrawal_due = session_refresh.as_mut().and_then(|refresh| {
-            if !multiple_batches || admitted.is_empty() {
+        let priority_check = session_refresh.as_mut().and_then(|refresh| {
+            if admitted.is_empty() {
                 refresh.pending_loss = None;
             }
-            refresh
-                .pending_loss
-                .map(|due| due.max(refresh.next_loss_check))
-                .filter(|due| session_due_at.is_none_or(|normal| *due < normal))
+            multiple_batches
+                .then(|| refresh.priority_check(session_due_at))
+                .flatten()
         });
         let now = Instant::now();
-        let withdrawals_ready = withdrawal_due.is_some_and(|due| due <= now);
-        let sessions_ready = may_recheck_sessions && session_due_at.is_some_and(|due| due <= now)
-            || withdrawals_ready;
+        let priority_ready = priority_check.is_some_and(|(due, _)| due <= now);
+        let sessions_ready =
+            may_recheck_sessions && session_due_at.is_some_and(|due| due <= now) || priority_ready;
         let wake = tokio::select! {
             _ = async {
                 if next_peer == 0 {
@@ -1610,13 +1628,13 @@ async fn maintain_routes(
                     Some(due) => tokio::time::sleep_until(due).await,
                     None => std::future::pending().await,
                 }
-            }, if may_recheck_sessions && !withdrawals_ready => Wake::SessionSweep,
+            }, if may_recheck_sessions && !priority_ready => Wake::SessionSweep,
             _ = async {
-                match withdrawal_due {
-                    Some(due) => tokio::time::sleep_until(due).await,
+                match priority_check {
+                    Some((due, _)) => tokio::time::sleep_until(due).await,
                     None => std::future::pending().await,
                 }
-            } => Wake::WithdrawalSweep,
+            } => Wake::PrioritySweep,
             _ = async {
                 match hup.as_mut() {
                     Some(hup) => hup.recv().await,
@@ -1641,18 +1659,25 @@ async fn maintain_routes(
             }
             continue;
         }
-        if (wake == Wake::SessionSweep
-            || !multiple_batches && session_due.is_some_and(|due| due <= Instant::now()))
-            && let Some(refresh) = session_refresh.as_mut()
-        {
-            refresh.pending = None;
-            refresh.pending_loss = None;
-        }
-        if wake == Wake::WithdrawalSweep
-            && let Some(refresh) = session_refresh.as_mut()
-        {
-            refresh.pending_loss = None;
-            refresh.next_loss_check = Instant::now() + PNET_WITHDRAWAL_RECHECK_SPACING;
+        let priority = priority_check
+            .filter(|_| wake == Wake::PrioritySweep)
+            .map(|(_, check)| check);
+        if let Some(refresh) = session_refresh.as_mut() {
+            if wake == Wake::SessionSweep
+                || !multiple_batches && session_due.is_some_and(|due| due <= Instant::now())
+            {
+                refresh.pending = None;
+                refresh.pending_loss = None;
+                refresh.pending_readmission = None;
+            }
+            match priority {
+                Some(PriorityCheck::Withdrawal) => {
+                    refresh.pending_loss = None;
+                    refresh.next_priority_check = Instant::now() + PNET_PRIORITY_RECHECK_SPACING;
+                }
+                Some(PriorityCheck::Readmission) => refresh.pending_readmission = None,
+                None => {}
+            }
         }
         if wake == Wake::Reload {
             let new = match OgateConfig::from_path(&config_path) {
@@ -1810,7 +1835,8 @@ async fn maintain_routes(
                     pending: None,
                     session_count: None,
                     pending_loss: None,
-                    next_loss_check: Instant::now(),
+                    pending_readmission: None,
+                    next_priority_check: Instant::now(),
                     loss_cursor: None,
                 });
                 let order = admission_order
@@ -1831,7 +1857,7 @@ async fn maintain_routes(
         // Recheck one batch of likely session changes, then resume the full
         // sweep at the same cursor. The snapshot never changes admission.
         let recheck_sessions = wake == Wake::SessionSweep && multiple_batches;
-        let withdrawal = wake == Wake::WithdrawalSweep;
+        let withdrawal = priority == Some(PriorityCheck::Withdrawal);
         let need_snapshot = recheck_sessions
             || (withdrawal && admitted.len() > veilclient::PNET_ADMISSION_BATCH_MAX_PEERS);
         let live = if need_snapshot && let Some(client) = &connection {
@@ -1862,8 +1888,9 @@ async fn maintain_routes(
                 live.changed_peers(&configured.peer_app_ids, &admitted)
             })
         };
+        let readmission = priority == Some(PriorityCheck::Readmission);
         let signed_retry = binding.signed.is_some()
-            && !withdrawal
+            && priority.is_none()
             && retry.is_empty()
             && Instant::now() >= retry_due;
         // A full or missing snapshot can hide a rejoining peer. Use free
@@ -1872,7 +1899,7 @@ async fn maintain_routes(
             && recheck_sessions
             && live.as_ref().is_none_or(|live| live.at_capacity)
             && retry.len() < veilclient::PNET_ADMISSION_BATCH_MAX_PEERS;
-        if (signed_retry || incomplete_hint)
+        if (signed_retry || incomplete_hint || readmission)
             && connection
                 .as_ref()
                 .is_some_and(|client| client.supports_pnet_admission_batch())
@@ -1887,6 +1914,17 @@ async fn maintain_routes(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .retry_group(&configured.peer_app_ids, &admitted, now, &retry);
             retry.extend(recent);
+        }
+        // A readmission hint with no matching recent routes takes no IPC slot.
+        if readmission
+            && !retry.is_empty()
+            && let Some(refresh) = session_refresh.as_mut()
+        {
+            let now = Instant::now();
+            refresh.next_priority_check = now + PNET_PRIORITY_RECHECK_SPACING;
+            if binding.signed.is_some() {
+                retry_due = now + PNET_RETRY_PERIOD;
+            }
         }
         if !retry.is_empty()
             && let Some(client) = &connection
@@ -1904,7 +1942,7 @@ async fn maintain_routes(
                 None => connection = None,
             }
         }
-        if withdrawal && connection.is_some() {
+        if priority.is_some() && connection.is_some() {
             continue;
         }
         let end;
@@ -2413,6 +2451,32 @@ mod tests {
     }
 
     #[test]
+    fn withdrawal_and_readmission_share_the_early_check_interval() {
+        let now = Instant::now();
+        let next = now + PNET_PRIORITY_RECHECK_SPACING;
+        let (_, events) = mpsc::channel(1);
+        let mut refresh = SessionRefresh {
+            events,
+            pending: Some(now),
+            session_count: Some(2),
+            pending_loss: Some(now),
+            pending_readmission: Some(now),
+            next_priority_check: next,
+            loss_cursor: None,
+        };
+        assert!(refresh.priority_check(Some(next)).is_none());
+        assert!(matches!(
+            refresh.priority_check(None),
+            Some((due, PriorityCheck::Withdrawal)) if due == next
+        ));
+        refresh.pending_loss = None;
+        assert!(matches!(
+            refresh.priority_check(None),
+            Some((due, PriorityCheck::Readmission)) if due == next
+        ));
+    }
+
+    #[test]
     fn signed_retry_uses_bounded_round_robin_and_prunes_old_candidates() {
         let now = Instant::now();
         let peers: Vec<_> = (1..=67).map(|id| ([id; 32], [0; 32])).collect();
@@ -2787,6 +2851,7 @@ mod tests {
             configured.with_pnet_admissions(&HashMap::new()),
         ));
         let changes = Arc::new(Notify::new());
+        let recent = Arc::new(SyncMutex::new(RecentAdmissions::default()));
         let updates = tokio::spawn(maintain_routes(
             directory.path().join("unused.toml"),
             watch::channel(config).0,
@@ -2794,7 +2859,7 @@ mod tests {
             RouteBinding {
                 node_id: [0x01; 32],
                 signed: None,
-                recent: Arc::default(),
+                recent: Arc::clone(&recent),
             },
             configured,
             Arc::clone(&state),
@@ -2891,10 +2956,10 @@ mod tests {
             matches!(scenario, SessionHintScenario::Capped),
             Ordering::Relaxed,
         );
-        session.delay_next_hint.store(
-            matches!(scenario, SessionHintScenario::Delayed),
-            Ordering::Relaxed,
-        );
+        if matches!(scenario, SessionHintScenario::Delayed) {
+            recent.lock().unwrap().seen.clear();
+            session.delay_next_hint.store(true, Ordering::Relaxed);
+        }
         assert_ne!(
             events.publish(EventPayload {
                 kind: SESSION_ADMITTED,
@@ -2902,7 +2967,13 @@ mod tests {
             }),
             0
         );
-        tokio::time::timeout(PNET_REFRESH_PERIOD + Duration::from_secs(1), async {
+        let restore_deadline = match scenario {
+            SessionHintScenario::Capped
+            | SessionHintScenario::RapidWithdrawal
+            | SessionHintScenario::RapidDenseWithdrawal => Duration::from_secs(2),
+            _ => PNET_REFRESH_PERIOD + Duration::from_secs(1),
+        };
+        tokio::time::timeout(restore_deadline, async {
             while state.load().table.lookup_egress(address) != Decision::Forward(PEER) {
                 changes.notified().await;
             }

@@ -351,6 +351,30 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   4.46 s with the candidate, on the original TUN interfaces. The
   earlier withdrawal still left recovery dependent on the ordinary
   session snapshot's cooldown.
+- A committed session admission event can use the same early slot to
+  retry recently withdrawn routes while the snapshot is cooling down.
+  It checks only configured peers, uses the existing cache expiry and
+  round-robin cursor, and waits for a positive daemon admission reply.
+  Loss and readmission checks share one early round per second.
+  An empty retry group consumes no query slot. Local IPC tests cover
+  recovery during the cooldown, including when a truncated peer list
+  omits the rejoining peer.
+- In an alternating three-node Linux comparison with 4,096
+  configured routes, the gateway published the returning peer's
+  route 0.333 and 0.341 s after the stand observed readmission.
+  Controls based on `ec29eeee` took 1.15 and 2.82 s. The
+  bidirectional TUN check was separate. It took 0.51–3.08 s with
+  the change and 2.62–2.98 s with the control.
+- On the 66-session stand, eight comparable manual-policy runs and
+  one signed-policy run delivered all 587,948 UDP datagrams and all
+  864 SDK chat messages. The manual-policy bidirectional check
+  after readmission ranged from 0.33 to 2.84 s with the change and
+  0.40 to 2.94 s with the control. The signed-policy run recovered
+  in 0.34 s. Two additional attempts at separate timing did not
+  meet the stand deadlines for session establishment or warm-route
+  publication.
+  A separate run with a pre-batch daemon passed bidirectional
+  recovery and delivered all 48 SDK chat messages.
 - A matched Linux run reused the daemon, 48 authenticated identities and
   24 disjoint tables of 4,096 entries. Spokes initiated the sessions so
   their restarts could exercise route recovery without waiting for the
