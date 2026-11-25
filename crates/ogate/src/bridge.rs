@@ -1063,19 +1063,20 @@ async fn serve_link(
                                     // Pre-flush: if appending would cross the
                                     // threshold, flush the current batch FIRST,
                                     // then start a fresh batch with this packet.
-                                    if batches.peek_mut(&peer_nid)
+                                    if batches.peek(&peer_nid)
                                         .is_some_and(|batch| batch.len() + record_size > egress_flush_bytes)
                                         && let Some(envelope) = batches.take_peer(&peer_nid)
                                     {
                                         enqueue(&routing_config, peer_nid, peer_app_id, envelope, true).await;
                                     }
-                                    let pb = batches.get_or_create(peer_nid, peer_app_id);
-                                    if pb.is_empty() && batch_config.has_changed().unwrap_or(false) {
-                                        flush_after = Duration::from_micros(u64::from(
-                                            batch_config.borrow_and_update().batch.flush_after_us,
-                                        ));
-                                    }
-                                    pb.push_with_window(pkt, flush_after);
+                                    let pb = batches.push_packet(peer_nid, peer_app_id, pkt, || {
+                                        if batch_config.has_changed().unwrap_or(false) {
+                                            flush_after = Duration::from_micros(u64::from(
+                                                batch_config.borrow_and_update().batch.flush_after_us,
+                                            ));
+                                        }
+                                        flush_after
+                                    });
                                     if pb.should_flush(egress_flush_bytes)
                                         && let Some(envelope) = batches.take_peer(&peer_nid)
                                     {

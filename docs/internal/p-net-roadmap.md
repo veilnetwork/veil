@@ -777,6 +777,28 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   exchange and an SDK chat on the same daemon sessions. All 160 TCP
   round trips and all 96 SDK messages arrived without duplicates.
 
+#### Batch scheduling with many destinations
+
+- The egress loop caches the next batch deadline. Opening a batch can
+  advance it and removing the earliest batch allows the next lookup to
+  recompute it. A timer drain records the next remaining deadline during
+  its existing walk. Each batch keeps the deadline chosen at first push.
+- A macOS ARM64 replay alternated both implementations with 24, 256,
+  and 4,096 pending peers. Append plus deadline lookup took 35–41 ns
+  with 24 peers, versus 59–60 ns before. With 256 peers it took
+  90–92 ns, versus 290–310 ns. With 4,096 it took 1.43–1.44 µs,
+  versus approximately 5.70 µs. This measures scheduling in memory.
+- In four Linux runs, one TUN had 24 active peers with 4,096 configured
+  routes. Both gateways used an 8 ms batch window and delivered all
+  76,800 datagrams per run. The hub ogate used 0.39–0.41 CPU-s before
+  and 0.42–0.45 CPU-s with the cache during the eight-second send window.
+  These runs did not establish a reduction in total gateway CPU.
+- With 48 active peers, the two previous-build runs and one cache run
+  each delivered all 153,600 datagrams. They used 0.51–0.52 CPU-s on the
+  hub ogate. The other cache run delivered 150,386 datagrams and had
+  2,569 sends more than 5 ms behind schedule. The three complete
+  workloads had zero such late sends.
+
 ### Sustained Linux load
 
 - The stand uses two Linux ARM64 vCPUs, 14 nodes, and a 217,260-byte
