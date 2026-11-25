@@ -307,6 +307,22 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   equivalent intervals were 0.88 s for withdrawal and 6.63 s for
   bidirectional recovery. Both disconnect runs delivered all 48 SDK
   chat messages exactly once before the restart.
+- A session count hint can schedule an earlier admission batch while
+  the ordinary session snapshot is cooling down, when all installed
+  routes fit in one batch. This looks up the installed peers directly,
+  uses the shared IPC pace and runs at most once per second. Only the
+  daemon's admission reply changes routes. The pending snapshot and
+  full sweep still cover discovery and other session changes.
+- In a three-node Linux ARM64 test, a gateway with 4,096 configured
+  routes admitted a second peer just before losing its first session.
+  Alternating builds with the same daemon binaries, the two controls
+  withdrew the first route 4.80 and 4.78 s after the stand detected
+  the session loss. The updated gateway used one early admission batch
+  and withdrew it in 0.087 and 0.083 s. The second route passed
+  bidirectional traffic after withdrawal. Restarting the first peer
+  restored traffic on the same TUN interfaces. In each run and a
+  separate mixed-version run with a pre-batch daemon, all 48 SDK chat
+  messages sent before the disconnect arrived exactly once.
 - A matched Linux run reused the daemon, 48 authenticated identities and
   24 disjoint tables of 4,096 entries. Spokes initiated the sessions so
   their restarts could exercise route recovery without waiting for the

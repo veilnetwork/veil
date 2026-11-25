@@ -258,6 +258,7 @@ const PNET_QUERY_SPACING: Duration = Duration::from_millis(125);
 const PNET_RETRY_PERIOD: Duration = Duration::from_secs(1);
 const PNET_RECENT_WINDOW: Duration = Duration::from_secs(30);
 const PNET_SESSION_COALESCE: Duration = Duration::from_millis(100);
+const PNET_WITHDRAWAL_RECHECK_SPACING: Duration = Duration::from_secs(1);
 const PNET_PEER_HINT_TIMEOUT: Duration = Duration::from_millis(250);
 
 fn pnet_session_refresh_spacing(peer_count: usize) -> Duration {
@@ -273,13 +274,29 @@ fn pnet_session_refresh_spacing(peer_count: usize) -> Duration {
 struct SessionRefresh {
     events: mpsc::Receiver<VeilEvent>,
     pending: Option<Instant>,
+    session_count: Option<u16>,
+    pending_loss: Option<Instant>,
+    next_loss_check: Instant,
 }
 
 impl SessionRefresh {
     fn note_event(&mut self, event: VeilEvent) {
         if matches!(event.kind, SESSIONS_CHANGED | SESSION_ADMITTED) {
-            self.pending
+            let due = *self
+                .pending
                 .get_or_insert_with(|| Instant::now() + PNET_SESSION_COALESCE);
+            if event.kind == SESSIONS_CHANGED
+                && let Ok(bytes) = event.payload.try_into()
+            {
+                let count = u16::from_be_bytes(bytes);
+                if self
+                    .session_count
+                    .replace(count)
+                    .is_none_or(|previous| count < previous)
+                {
+                    self.pending_loss.get_or_insert(due);
+                }
+            }
         }
     }
 }
@@ -1508,6 +1525,7 @@ async fn maintain_routes(
         Policy,
         SessionEvent(Option<VeilEvent>),
         SessionSweep,
+        WithdrawalSweep,
     }
     loop {
         // The ordinary sweep is always ready between groups. Inspect a
@@ -1523,8 +1541,22 @@ async fn maintain_routes(
         let session_due = session_refresh.as_ref().and_then(|refresh| refresh.pending);
         let session_due_at = session_due.map(|due| due.max(next_session_sweep));
         let may_recheck_sessions = multiple_batches || next_peer == 0;
-        let sessions_ready =
-            may_recheck_sessions && session_due_at.is_some_and(|due| due <= Instant::now());
+        let withdrawal_due = session_refresh.as_mut().and_then(|refresh| {
+            if !multiple_batches
+                || admitted.is_empty()
+                || admitted.len() > veilclient::PNET_ADMISSION_BATCH_MAX_PEERS
+            {
+                refresh.pending_loss = None;
+            }
+            refresh
+                .pending_loss
+                .map(|due| due.max(refresh.next_loss_check))
+                .filter(|due| session_due_at.is_none_or(|normal| *due < normal))
+        });
+        let now = Instant::now();
+        let withdrawals_ready = withdrawal_due.is_some_and(|due| due <= now);
+        let sessions_ready = may_recheck_sessions && session_due_at.is_some_and(|due| due <= now)
+            || withdrawals_ready;
         let wake = tokio::select! {
             _ = async {
                 if next_peer == 0 {
@@ -1542,7 +1574,13 @@ async fn maintain_routes(
                     Some(due) => tokio::time::sleep_until(due).await,
                     None => std::future::pending().await,
                 }
-            }, if may_recheck_sessions => Wake::SessionSweep,
+            }, if may_recheck_sessions && !withdrawals_ready => Wake::SessionSweep,
+            _ = async {
+                match withdrawal_due {
+                    Some(due) => tokio::time::sleep_until(due).await,
+                    None => std::future::pending().await,
+                }
+            } => Wake::WithdrawalSweep,
             _ = async {
                 match hup.as_mut() {
                     Some(hup) => hup.recv().await,
@@ -1572,6 +1610,13 @@ async fn maintain_routes(
             && let Some(refresh) = session_refresh.as_mut()
         {
             refresh.pending = None;
+            refresh.pending_loss = None;
+        }
+        if wake == Wake::WithdrawalSweep
+            && let Some(refresh) = session_refresh.as_mut()
+        {
+            refresh.pending_loss = None;
+            refresh.next_loss_check = Instant::now() + PNET_WITHDRAWAL_RECHECK_SPACING;
         }
         if wake == Wake::Reload {
             let new = match OgateConfig::from_path(&config_path) {
@@ -1727,6 +1772,9 @@ async fn maintain_routes(
                 session_refresh = Some(SessionRefresh {
                     events: client.events().await,
                     pending: None,
+                    session_count: None,
+                    pending_loss: None,
+                    next_loss_check: Instant::now(),
                 });
                 let order = admission_order
                     .as_deref()
@@ -1751,9 +1799,30 @@ async fn maintain_routes(
         } else {
             None
         };
-        let mut retry = live.as_ref().map_or_else(Vec::new, |live| {
-            live.changed_peers(&configured.peer_app_ids, &admitted)
-        });
+        let mut retry = if wake == Wake::WithdrawalSweep {
+            // The count is only a wake hint. Revalidate the installed routes
+            // against the daemon even if a PEERS reply would omit them.
+            let peers = &configured.peer_app_ids;
+            let mut installed: Vec<_> = admitted
+                .keys()
+                .filter_map(|peer| {
+                    peers
+                        .binary_search_by_key(peer, |(id, _)| *id)
+                        .ok()
+                        .map(|index| peers[index])
+                })
+                .collect();
+            installed.sort_unstable_by_key(|(id, _)| *id);
+            tracing::trace!(
+                peers = installed.len(),
+                "rechecking P-Net routes after a session count decrease"
+            );
+            installed
+        } else {
+            live.as_ref().map_or_else(Vec::new, |live| {
+                live.changed_peers(&configured.peer_app_ids, &admitted)
+            })
+        };
         let signed_retry =
             binding.signed.is_some() && retry.is_empty() && Instant::now() >= retry_due;
         // A full or missing snapshot can hide a rejoining peer. Use free
@@ -1793,6 +1862,9 @@ async fn maintain_routes(
                 }
                 None => connection = None,
             }
+        }
+        if wake == Wake::WithdrawalSweep && connection.is_some() {
+            continue;
         }
         let end;
         let results;
@@ -2473,14 +2545,20 @@ mod tests {
         exercise_pnet_session_rejoin(SessionHintScenario::JoinBurst).await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sparse_withdrawals_recheck_during_the_snapshot_cooldown() {
+        exercise_pnet_session_rejoin(SessionHintScenario::RapidWithdrawal).await;
+    }
+
     enum SessionHintScenario {
         Delayed,
         Capped,
         JoinBurst,
+        RapidWithdrawal,
     }
 
     async fn exercise_pnet_session_rejoin(scenario: SessionHintScenario) {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use veil_ipc::{EventBus, IpcEndpoint, IpcServer, PeerListProvider, PnetStatusProvider};
         use veil_proto::{EventPayload, PeersListEntry, PeersListPayload, PnetStatusResultPayload};
 
@@ -2489,6 +2567,7 @@ mod tests {
         const END_JOINS: u16 = FIRST_JOIN + veilclient::PNET_ADMISSION_BATCH_MAX_PEERS as u16;
         struct Session {
             active: AtomicBool,
+            hints: AtomicUsize,
             delay_next_hint: AtomicBool,
             capped_list: AtomicBool,
             join_burst: AtomicBool,
@@ -2497,6 +2576,7 @@ mod tests {
         }
         impl PeerListProvider for Session {
             fn list_peers(&self) -> PeersListPayload {
+                self.hints.fetch_add(1, Ordering::Relaxed);
                 if self.delay_next_hint.swap(false, Ordering::Relaxed) {
                     std::thread::sleep(PNET_PEER_HINT_TIMEOUT + Duration::from_millis(100));
                     return PeersListPayload { peers: Vec::new() };
@@ -2577,6 +2657,7 @@ mod tests {
         let socket = directory.path().join("ipc");
         let session = Arc::new(Session {
             active: AtomicBool::new(true),
+            hints: AtomicUsize::new(0),
             delay_next_hint: AtomicBool::new(false),
             capped_list: AtomicBool::new(false),
             join_burst: AtomicBool::new(false),
@@ -2630,6 +2711,24 @@ mod tests {
             state.load().table.lookup_egress(address),
             Decision::Forward(PEER)
         );
+
+        if matches!(scenario, SessionHintScenario::RapidWithdrawal) {
+            let previous = session.hints.load(Ordering::Relaxed);
+            assert_ne!(
+                events.publish(EventPayload {
+                    kind: SESSIONS_CHANGED,
+                    payload: vec![0, 1],
+                }),
+                0
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while session.hints.load(Ordering::Relaxed) == previous {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the normal session snapshot was not requested");
+        }
 
         session.active.store(false, Ordering::Relaxed);
         session.join_burst.store(
