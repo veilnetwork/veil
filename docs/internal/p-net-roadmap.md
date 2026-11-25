@@ -827,6 +827,16 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   authenticated revision has reached durable storage, a local
   notification wakes the route updater between admission groups. The
   updater reads the protected store and checks the policy and admissions.
+- The subscriber uses the same verified-policy notification to bring its
+  pending poll forward when a locally installed revision expires sooner.
+  It keeps the minimum spacing between rounds. In two pairs of Linux
+  trials, an operator installed a signed policy with three seconds of
+  validity immediately after a normal poll. With the primary mirror
+  offline, the secondary supplied the newer 4,096-assignment revision.
+  Bidirectional traffic on the original TUN returned 4.56 and 5.39 s
+  after expiry with the update, versus 12.15 and 12.26 s in the control.
+  All four trials blocked the expired routes while the private session
+  stayed active.
 - The same three nodes ran two control and two candidate trials, with
   the previous daemon at the last subscriber. The TCP link between
   sites retained its 2 Mb/s, 60 ms one-way delay and 0.3% loss settings.

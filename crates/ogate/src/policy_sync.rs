@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, ensure};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout};
 use veil_identity::network_policy::{
@@ -278,14 +278,14 @@ async fn subscribe(policy: &Arc<SignedRoutes>, distribution: &Distribution<'_>) 
         return;
     }
 
-    let expiry = policy.updates();
+    let mut expiry = policy.updates();
     let phase = u64::from(u16::from_be_bytes([
         distribution.node[0],
         distribution.node[1],
     ]));
-    let window = poll_interval(*expiry.borrow(), unix_secs_now_u64(), phase);
-    let jitter = Duration::from_millis(phase % window.as_millis() as u64);
     let recovery = recovery_interval(phase);
+    let window = poll_interval(*expiry.borrow(), unix_secs_now_u64(), recovery);
+    let jitter = Duration::from_millis(phase % window.as_millis() as u64);
     let event_delay = Duration::from_millis(SESSION_POLL_DELAY_MS + phase % SESSION_POLL_DELAY_MS);
     let mut earliest = Instant::now();
     let mut next = earliest + jitter;
@@ -304,11 +304,12 @@ async fn subscribe(policy: &Arc<SignedRoutes>, distribution: &Distribution<'_>) 
         };
         let periodic = match wait_for_policy_poll(
             &mut client,
-            next,
+            &mut next,
             earliest,
             recovery,
             event_delay,
             reconnecting,
+            &mut expiry,
         )
         .await
         {
@@ -338,7 +339,7 @@ async fn subscribe(policy: &Arc<SignedRoutes>, distribution: &Distribution<'_>) 
         }
         reconnecting = client.is_disconnected();
         if periodic {
-            let delay = poll_interval(*expiry.borrow(), unix_secs_now_u64(), phase);
+            let delay = poll_interval(*expiry.borrow(), unix_secs_now_u64(), recovery);
             let now = Instant::now();
             next = started + delay;
             if next <= now {
@@ -356,25 +357,24 @@ enum PollWake {
 
 async fn wait_for_policy_poll(
     client: &mut VeilClient,
-    next: Instant,
+    next: &mut Instant,
     earliest: Instant,
     recovery: Duration,
     event_delay: Duration,
     reconnecting: bool,
+    expiry: &mut watch::Receiver<u64>,
 ) -> PollWake {
     let mut events = client.events().await;
-    let periodic = next.max(earliest);
-    let mut due = periodic;
     // A mirror may have been admitted before the reconnected subscriber
     // could listen. Treat IPC recovery like an admission wake hint.
-    if reconnecting
-        && let Some(early) =
-            expedited_poll(Instant::now() + event_delay, earliest, periodic, recovery)
-    {
-        due = early;
-    }
+    let mut requested = reconnecting.then(|| Instant::now() + event_delay);
+    advance_poll_for_expiry(next, expiry, recovery);
     let mut listen = true;
     loop {
+        let periodic = (*next).max(earliest);
+        let due = requested
+            .and_then(|requested| expedited_poll(requested, earliest, periodic, recovery))
+            .unwrap_or(periodic);
         tokio::select! {
             _ = client.wait_disconnected() => return PollWake::Disconnected,
             _ = sleep_until(due) => return if due == periodic {
@@ -382,17 +382,29 @@ async fn wait_for_policy_poll(
             } else {
                 PollWake::Expedited
             },
+            Ok(()) = expiry.changed() => advance_poll_for_expiry(next, expiry, recovery),
             event = events.recv(), if listen => match event {
                 Some(event) if event.kind == SESSION_ADMITTED => {
-                    if let Some(early) = expedited_poll(Instant::now() + event_delay, earliest, periodic, recovery) {
-                        due = due.min(early);
-                    }
+                    requested.get_or_insert_with(|| Instant::now() + event_delay);
                 }
                 Some(_) => {},
                 None => listen = false,
             },
         }
     }
+}
+
+fn advance_poll_for_expiry(
+    next: &mut Instant,
+    expiry: &mut watch::Receiver<u64>,
+    recovery: Duration,
+) {
+    // Only shorten the wait. A locally installed snapshot can expire
+    // before the timer computed from its predecessor, even without a
+    // session event. The caller still enforces its earliest next poll.
+    let valid_until = *expiry.borrow_and_update();
+    let delay = poll_interval(valid_until, unix_secs_now_u64(), recovery);
+    *next = (*next).min(Instant::now() + delay);
 }
 
 fn expedited_poll(
@@ -411,13 +423,13 @@ fn recovery_interval(phase: u64) -> Duration {
     Duration::from_millis(RECOVERY_POLL_MIN_MS + phase % RECOVERY_POLL_JITTER_MS)
 }
 
-fn poll_interval(valid_until: u64, now: u64, phase: u64) -> Duration {
+fn poll_interval(valid_until: u64, now: u64, recovery: Duration) -> Duration {
     if now == 0 {
         return POLL_INTERVAL;
     }
     let remaining = Duration::from_secs(valid_until.saturating_sub(now));
     // Start the recovery cadence near expiry and spread the load across nodes.
-    POLL_INTERVAL.min(remaining.saturating_add(recovery_interval(phase)))
+    POLL_INTERVAL.min(remaining.saturating_add(recovery))
 }
 
 struct Offer {
@@ -605,11 +617,36 @@ mod tests {
 
     #[test]
     fn recovery_polling_is_staggered_and_bounded() {
-        assert_eq!(poll_interval(90, 0, 0), POLL_INTERVAL);
-        assert_eq!(poll_interval(120, 100, 0), POLL_INTERVAL);
-        assert_eq!(poll_interval(102, 100, 0), Duration::from_secs(6));
-        assert_eq!(poll_interval(100, 100, 0), Duration::from_secs(4));
-        assert_eq!(poll_interval(90, 100, 1_999), Duration::from_millis(5_999));
+        let recovery = recovery_interval(0);
+        assert_eq!(poll_interval(90, 0, recovery), POLL_INTERVAL);
+        assert_eq!(poll_interval(120, 100, recovery), POLL_INTERVAL);
+        assert_eq!(poll_interval(102, 100, recovery), Duration::from_secs(6));
+        assert_eq!(poll_interval(100, 100, recovery), Duration::from_secs(4));
+        assert_eq!(
+            poll_interval(90, 100, recovery_interval(1_999)),
+            Duration::from_millis(5_999)
+        );
+    }
+
+    #[test]
+    fn policy_expiry_change_can_only_advance_the_pending_poll() {
+        let (installed, mut expiry) = watch::channel(u64::MAX);
+        let recovery = recovery_interval(0);
+        let original = Instant::now() + POLL_INTERVAL;
+        let mut deadline = original;
+        advance_poll_for_expiry(&mut deadline, &mut expiry, recovery);
+        assert_eq!(deadline, original);
+
+        installed.send_replace(1);
+        let before = Instant::now();
+        advance_poll_for_expiry(&mut deadline, &mut expiry, recovery);
+        assert!((before + recovery..=Instant::now() + recovery).contains(&deadline));
+        assert!(!expiry.has_changed().unwrap());
+
+        installed.send_replace(u64::MAX);
+        let earlier = deadline;
+        advance_poll_for_expiry(&mut deadline, &mut expiry, recovery);
+        assert_eq!(deadline, earlier);
     }
 
     #[test]

@@ -429,10 +429,12 @@ key offline. Receivers normally check for a higher revision every 15
 seconds over direct, authenticated P-Net sessions with the configured
 publishers. The first check is staggered across receivers. As the
 installed policy expires, receivers move toward staggered 4–6 second
-checks. Each receiver runs one round at a time. If its local daemon
-connection fails, the receiver retries that connection every 4–6
-seconds. After reconnecting it can check the configured publishers
-early when there is time for a separate check before the regular poll.
+checks. Installing a verified policy locally can bring the next check
+forward when the new policy expires sooner. Each receiver runs one
+round at a time. If its local daemon connection fails, the receiver
+retries that connection every 4–6 seconds. After reconnecting it can
+check the configured publishers early when there is time for a
+separate check before the regular poll.
 
 Each side requires current daemon-certified membership. A receiver
 verifies the owner's signature, validity and revision before storing
