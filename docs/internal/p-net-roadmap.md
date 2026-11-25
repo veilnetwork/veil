@@ -599,6 +599,27 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   code through one `write_all` call. The bytes and request ID match the
   existing IPC response format. Rate and source-identity errors retain
   their legacy zero request ID.
+- An IPC prototype borrowed the destination and data length from the
+  frame before taking a destination slot, leaving payload decoding to
+  the handler. In a macOS ARM64 process-local comparison, the median
+  cost of that step fell from 56.9 to 2.4 ns for 1,200 data bytes and
+  from 215.1 to 2.4 ns for 12,000 bytes. The decoder tests included
+  pre-reply-channel sends and truncated frames.
+- Two cold Linux ARM64 pairs used the same ogate, 24 gateways, 4,096
+  entries per gateway and two 32 Mb/s UDP flows over TCP. In the first
+  pair the control lost 12,670 of 165,326 datagrams and the prototype
+  lost 20,747 of 164,836. With the order reversed the control lost
+  13,090 of 165,749 and the prototype lost 5,160 of 164,442. Source IPC
+  job rejections accounted for 12,429 and 20,689 losses in the first
+  pair, and 12,903 and 4,867 in the second. Receiving sockets accounted
+  for the remaining losses in all four trials.
+- Each trial delivered all 200 SDK chat messages. The p99 towards the
+  hub rose from 617 to 633 ms and from 356 to 433 ms in the two pairs.
+  On both senders in each trial, receive-window-limited time increased
+  and send-buffer-limited time stayed flat. A mixed run with the
+  pre-batch daemon passed raw TUN traffic both ways and delivered all
+  48 SDK chat messages exactly once. The prototype was set aside after
+  the inconsistent UDP results and the higher chat p99 in both pairs.
 - A separate cold start ran the first end-to-end probes in groups of
   four before opening the UDP flows. All 24 paths answered in 12.52 s.
   The following 38 s sample lost 76 of 137,175 UDP datagrams, with one
