@@ -17,7 +17,7 @@
 //!
 //! On `ctrl_c` / `SIGTERM` all tasks exit and the function returns.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::ops::Bound::{Excluded, Unbounded};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -31,7 +31,9 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Mutex, Notify, broadcast, watch};
 use tokio::time::Instant;
 use veil_identity::network_policy::VerifiedRoutePolicy;
-use veil_proto::event_kind::{EVENTS_LAGGED, SESSION_ADMITTED, SESSIONS_CHANGED};
+use veil_proto::event_kind::{
+    EVENTS_LAGGED, PNET_SESSION_ADMITTED, SESSION_ADMITTED, SESSIONS_CHANGED,
+};
 use veil_util::unix_secs_now_u64;
 use veilclient::client::PnetStatus;
 use veilclient::{APP_IPC_SEND_PREFIX_BYTES, AppHandle, PnetAuthority, VeilClient, VeilEvent};
@@ -290,28 +292,76 @@ struct SessionRefresh {
     pending_readmission: Option<Instant>,
     next_priority_check: Instant,
     loss_cursor: Option<NodeId>,
+    admission_hints: BTreeSet<NodeId>,
 }
 
 impl SessionRefresh {
     fn note_event(&mut self, event: VeilEvent) {
-        if event.kind == EVENTS_LAGGED {
-            self.note_lag();
-        } else if matches!(event.kind, SESSIONS_CHANGED | SESSION_ADMITTED) {
-            let due = *self
-                .pending
-                .get_or_insert_with(|| Instant::now() + PNET_SESSION_COALESCE);
-            if event.kind == SESSION_ADMITTED {
-                self.pending_readmission.get_or_insert(due);
-            } else if let Ok(bytes) = event.payload.try_into() {
-                let count = u16::from_be_bytes(bytes);
-                if self
-                    .session_count
-                    .replace(count)
-                    .is_none_or(|previous| count < previous)
+        match event.kind {
+            EVENTS_LAGGED => self.note_lag(),
+            SESSION_ADMITTED => self.note_readmission(),
+            PNET_SESSION_ADMITTED => {
+                if let Ok(peer) = event.payload.try_into() {
+                    if self.admission_hints.len() < veil_proto::MAX_PEERS_LIST_ENTRIES {
+                        self.admission_hints.insert(peer);
+                    }
+                    self.note_readmission();
+                }
+            }
+            SESSIONS_CHANGED => {
+                let due = self.session_event_due();
+                if let Ok(count) = event.payload.try_into().map(u16::from_be_bytes)
+                    && self
+                        .session_count
+                        .replace(count)
+                        .is_none_or(|previous| count < previous)
                 {
                     self.pending_loss.get_or_insert(due);
                 }
             }
+            _ => {}
+        }
+    }
+
+    fn session_event_due(&mut self) -> Instant {
+        *self
+            .pending
+            .get_or_insert_with(|| Instant::now() + PNET_SESSION_COALESCE)
+    }
+
+    fn note_readmission(&mut self) {
+        let due = self.session_event_due();
+        self.pending_readmission.get_or_insert(due);
+    }
+
+    fn prioritize_admission_hints(
+        &mut self,
+        configured: &[(NodeId, [u8; 32])],
+        admitted: &HashMap<NodeId, u64>,
+        retry: &mut Vec<(NodeId, [u8; 32])>,
+        limit: usize,
+    ) {
+        // Keep withdrawals first. A targeted hint can then precede peers
+        // from a snapshot that might have omitted this newly admitted peer.
+        let withdrawals = retry.partition_point(|(id, _)| admitted.contains_key(id));
+        let mut hinted = Vec::new();
+        while hinted.len() < limit.saturating_sub(withdrawals)
+            && let Some(peer) = self.admission_hints.pop_first()
+        {
+            if !admitted.contains_key(&peer)
+                && let Ok(index) = configured.binary_search_by_key(&peer, |(id, _)| *id)
+            {
+                hinted.push(configured[index]);
+            }
+        }
+        if !hinted.is_empty() {
+            retry.retain(|candidate| !hinted.contains(candidate));
+            retry.splice(withdrawals..withdrawals, hinted);
+        }
+        if !self.admission_hints.is_empty() {
+            let due = Instant::now() + PNET_PRIORITY_RECHECK_SPACING;
+            self.pending.get_or_insert(due);
+            self.pending_readmission.get_or_insert(due);
         }
     }
 
@@ -419,7 +469,9 @@ async fn connect_pnet_status(
 ) -> Option<Arc<VeilClient>> {
     pace.tick().await;
     let connect = async {
-        let client = connect_for_routes(socket, authority.is_some()).await?;
+        let client = VeilClient::connect_for_pnet_status(socket, authority.is_some())
+            .await
+            .map_err(BridgeError::client)?;
         if authority.is_some_and(|expected| {
             client.pnet_authority() != Some(expected) || !client.supports_pnet_admission_batch()
         }) {
@@ -1713,6 +1765,9 @@ async fn maintain_routes(
         let session_due_at = session_due.map(|due| due.max(next_session_sweep));
         let may_recheck_sessions = multiple_batches || next_peer == 0;
         let priority_check = session_refresh.as_mut().and_then(|refresh| {
+            if !multiple_batches {
+                refresh.admission_hints.clear();
+            }
             if admitted.is_empty() {
                 refresh.pending_loss = None;
             }
@@ -1956,6 +2011,7 @@ async fn maintain_routes(
                     pending_readmission: None,
                     next_priority_check: Instant::now(),
                     loss_cursor: None,
+                    admission_hints: BTreeSet::new(),
                 });
                 let group_limit = if batched_admission {
                     veilclient::PNET_ADMISSION_BATCH_MAX_PEERS
@@ -2041,8 +2097,19 @@ async fn maintain_routes(
         };
         let legacy_snapshot_backlog =
             recheck_sessions && !batched_admission && retry.len() > priority_size;
-        retry.truncate(priority_size);
         let readmission = priority == Some(PriorityCheck::Readmission);
+        if (recheck_sessions || readmission)
+            && let Some(refresh) = session_refresh.as_mut()
+            && !refresh.admission_hints.is_empty()
+        {
+            refresh.prioritize_admission_hints(
+                &configured.peer_app_ids,
+                &admitted,
+                &mut retry,
+                priority_size,
+            );
+        }
+        retry.truncate(priority_size);
         let signed_retry = binding.signed.is_some()
             && priority.is_none()
             && retry.is_empty()
@@ -2684,6 +2751,7 @@ mod tests {
             pending_readmission: Some(now),
             next_priority_check: next,
             loss_cursor: None,
+            admission_hints: BTreeSet::new(),
         };
         assert!(refresh.priority_check(Some(next)).is_none());
         assert!(matches!(
@@ -2902,6 +2970,11 @@ mod tests {
         exercise_pnet_session_rejoin(SessionHintScenario::EventBusLag).await;
     }
 
+    #[tokio::test]
+    async fn a_targeted_hint_checks_a_new_peer_omitted_from_a_full_peer_list() {
+        exercise_pnet_session_rejoin(SessionHintScenario::CappedFirstAdmission).await;
+    }
+
     #[test]
     fn capped_withdrawal_candidates_rotate_without_repeating_a_prefix() {
         let limit = veilclient::PNET_ADMISSION_BATCH_MAX_PEERS;
@@ -2939,6 +3012,7 @@ mod tests {
         RapidWithdrawal,
         RapidDenseWithdrawal,
         EventBusLag,
+        CappedFirstAdmission,
     }
 
     async fn exercise_pnet_session_rejoin(scenario: SessionHintScenario) {
@@ -2951,6 +3025,7 @@ mod tests {
         const END_JOINS: u16 = FIRST_JOIN + veilclient::PNET_ADMISSION_BATCH_MAX_PEERS as u16;
         struct Session {
             active: AtomicBool,
+            peer_checks: AtomicUsize,
             other_admitted: u16,
             hints: AtomicUsize,
             delay_next_hint: AtomicBool,
@@ -3027,6 +3102,9 @@ mod tests {
         }
         impl PnetStatusProvider for Session {
             fn peer_status(&self, peer: &NodeId) -> PnetStatusResultPayload {
+                if *peer == PEER {
+                    self.peer_checks.fetch_add(1, Ordering::Relaxed);
+                }
                 if peer[..2] == 128_u16.to_be_bytes() {
                     self.past_first_batch.notify_one();
                 }
@@ -3060,12 +3138,14 @@ mod tests {
         } else {
             0
         };
+        let first_admission = matches!(scenario, SessionHintScenario::CappedFirstAdmission);
         let session = Arc::new(Session {
-            active: AtomicBool::new(true),
+            active: AtomicBool::new(!first_admission),
+            peer_checks: AtomicUsize::new(0),
             other_admitted,
             hints: AtomicUsize::new(0),
             delay_next_hint: AtomicBool::new(false),
-            capped_list: AtomicBool::new(false),
+            capped_list: AtomicBool::new(first_admission),
             join_burst: AtomicBool::new(false),
             first_changed: SyncMutex::new(None),
             past_first_batch: Notify::new(),
@@ -3117,6 +3197,38 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), session.past_first_batch.notified())
             .await
             .expect("the large sweep did not start");
+        let address = Ipv4Addr::new(10, 99, 0, 2).into();
+        if first_admission {
+            let existing_client = VeilClient::connect(&socket).await.unwrap();
+            let mut existing_events = existing_client.events().await;
+            let publish_hint = || {
+                assert_ne!(
+                    events.publish(EventPayload {
+                        kind: PNET_SESSION_ADMITTED,
+                        payload: PEER.to_vec(),
+                    }),
+                    0
+                );
+            };
+            assert_eq!(session.peer_checks.load(Ordering::Relaxed), 0);
+            publish_hint();
+            let event = tokio::time::timeout(Duration::from_secs(2), existing_events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(event.kind, SESSION_ADMITTED);
+            assert!(event.payload.is_empty());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while session.peer_checks.load(Ordering::Relaxed) == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("a capped peer list hid the targeted peer from admission checks");
+            assert_eq!(state.load().table.lookup_egress(address), Decision::NoRoute);
+            session.active.store(true, Ordering::Relaxed);
+            publish_hint();
+        }
         let initial_route_count = usize::from(other_admitted + 1);
         tokio::time::timeout(Duration::from_secs(2), async {
             while state.load().table.peer_count() != initial_route_count {
@@ -3125,7 +3237,6 @@ mod tests {
         })
         .await
         .expect("initial routes were not published");
-        let address = Ipv4Addr::new(10, 99, 0, 2).into();
         assert_eq!(
             state.load().table.lookup_egress(address),
             Decision::Forward(PEER)

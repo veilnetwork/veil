@@ -1557,10 +1557,18 @@ pub async fn register_connection_session(
             remote_identity.node_id.as_bytes(),
             &remote_identity.session_keys.session_id,
         ) {
-            runtime.event_bus.publish(veil_proto::EventPayload {
-                kind: veil_proto::event_kind::SESSION_ADMITTED,
-                payload: Vec::new(),
-            });
+            let event = if membership_expires.is_some() {
+                veil_proto::EventPayload {
+                    kind: veil_proto::event_kind::PNET_SESSION_ADMITTED,
+                    payload: peer_node_id.to_vec(),
+                }
+            } else {
+                veil_proto::EventPayload {
+                    kind: veil_proto::event_kind::SESSION_ADMITTED,
+                    payload: Vec::new(),
+                }
+            };
+            runtime.event_bus.publish(event);
         }
     }
     // A peer may reconnect just after a device was revoked. It missed the

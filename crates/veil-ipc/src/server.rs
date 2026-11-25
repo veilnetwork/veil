@@ -2641,15 +2641,21 @@ async fn handle_ipc_client(
                         None
                     }
                 };
-                if let Some(event) = event
-                    && write_frame_wh(
+                if let Some(mut event) = event {
+                    if event.kind == veil_proto::event_kind::PNET_SESSION_ADMITTED
+                        && hello.flags & veil_proto::ipc::IPC_CAP_PNET_SESSION_HINTS == 0
+                    {
+                        event.kind = veil_proto::event_kind::SESSION_ADMITTED;
+                        event.payload.clear();
+                    }
+                    if write_frame_wh(
                         &mut wh,
                         FrameFamily::LocalApp as u8,
                         LocalAppMsg::Event as u16,
                         &event.encode(),
-                    ).await.is_err()
-                {
-                    break;
+                    ).await.is_err() {
+                        break;
+                    }
                 }
             }
 

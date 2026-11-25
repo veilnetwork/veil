@@ -1073,6 +1073,29 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 - On a macOS loopback stand, the updated daemon and Veil v0.11.59
   validated each other's private membership. The updated SDK chat
   sample received 1,000 messages in each direction.
+- A gateway can request private-session admission hints with the peer
+  identifier on its local status connection. This lets it query a
+  configured peer omitted from a full 256-entry PeerList response.
+  The gateway keeps withdrawal candidates ahead of additions and
+  queries the identified peer at the existing IPC pace. Other clients
+  receive the generic admission event. A regression test with 4,096
+  configured routes verified that the hint schedules the query and
+  that the route is installed only after a positive daemon reply.
+- In alternating Linux ARM64 runs, a local IPC proxy substituted a
+  full 256-entry snapshot that omitted the one live peer in a
+  4,096-route configuration. With the same real daemons and peer
+  identities, the updated gateway queried the late peer by ID and
+  installed its first route in 0.576 and 0.584 s after observed
+  admission. Controls from `2c771be0` received the generic event
+  and took 6.04 and 6.11 s. A separate run with Veil v0.11.59
+  at the gateway installed and restored the route in 1.95 and
+  1.97 s using the legacy IPC query. Route withdrawal took 0.57 s
+  and 3.80 s in the two updated runs and about 0.60 s in the
+  controls. In a separate pair that kept the peer up for at least
+  9 s after admission, withdrawal took 0.58 s with the updated
+  gateway and 0.59 s with the control. All seven runs restored
+  bidirectional traffic on the original gateway and TUN interfaces
+  and delivered their 48 SDK chat messages exactly once.
 
 ### Emulated inter-site link
 

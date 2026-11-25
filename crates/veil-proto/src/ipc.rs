@@ -60,6 +60,8 @@ pub const IPC_HELLO_OK_PNET_ADMISSION_BATCH: u16 = 0x2000;
 pub const IPC_CAP_PNET_AUTHORITY: u32 = 128;
 /// A fixed-size authority trailer follows the ordinary HELLO_OK body.
 pub const IPC_HELLO_OK_PNET_AUTHORITY: u16 = 0x4000;
+/// Request peer identifiers on private-session admission events over local IPC.
+pub const IPC_CAP_PNET_SESSION_HINTS: u32 = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PnetTrustRoot {
@@ -6306,6 +6308,10 @@ pub mod event_kind {
     /// This IPC connection missed one or more events from the daemon.
     /// Empty payload. Consumers can refresh the state they track.
     pub const EVENTS_LAGGED: u8 = 8;
+    /// A completed private session presented a membership certificate.
+    /// Sent to local clients that request `IPC_CAP_PNET_SESSION_HINTS`.
+    /// Payload: `[u8; 32] peer_node_id`. Consumers still query admission.
+    pub const PNET_SESSION_ADMITTED: u8 = 9;
 }
 
 /// Payload [`crate::family::LocalAppMsg::Event`].

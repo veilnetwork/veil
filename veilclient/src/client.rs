@@ -1168,6 +1168,19 @@ impl VeilClient {
         .await
     }
 
+    /// Connect for local P-Net reconciliation and request targeted session
+    /// hints. Older daemons can connect and send the generic session event.
+    pub async fn connect_for_pnet_status(
+        socket_path: impl AsRef<Path>,
+        request_authority: bool,
+    ) -> Result<Self, ClientError> {
+        let mut flags = veil_proto::ipc::IPC_CAP_PNET_SESSION_HINTS;
+        if request_authority {
+            flags |= veil_proto::ipc::IPC_CAP_PNET_AUTHORITY;
+        }
+        Self::connect_inner(socket_path.as_ref(), flags).await
+    }
+
     pub fn pnet_authority(&self) -> Option<crate::PnetAuthority> {
         self.pnet_authority
     }
