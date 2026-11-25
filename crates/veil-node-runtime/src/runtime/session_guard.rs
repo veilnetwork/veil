@@ -73,6 +73,7 @@ impl Drop for CanonicalQuicOwner {
 
 pub struct SessionGuard {
     quic_owner: Option<CanonicalQuicOwner>,
+    pnet_session: bool,
     live_sessions: Arc<Mutex<BTreeMap<LinkId, SessionInfo>>>,
     link_id: LinkId,
     logger: Arc<NodeLogger>,
@@ -129,6 +130,7 @@ impl SessionGuard {
     ) -> Self {
         Self {
             quic_owner: None,
+            pnet_session: false,
             live_sessions,
             link_id,
             logger,
@@ -147,6 +149,11 @@ impl SessionGuard {
 
     pub(super) fn with_quic_owner(mut self, owner: CanonicalQuicOwner) -> Self {
         self.quic_owner = Some(owner);
+        self
+    }
+
+    pub(super) fn with_pnet_session(mut self, pnet_session: bool) -> Self {
+        self.pnet_session = pnet_session;
         self
     }
 }
@@ -358,6 +365,12 @@ impl Drop for SessionGuard {
         // us.  Still, keep it outside the map locks so a subscriber
         // observation re-entering our locks via a handler sees a
         // consistent state.
+        if self.pnet_session {
+            self.event_bus.publish(veil_proto::EventPayload {
+                kind: veil_proto::event_kind::PNET_SESSION_ENDED,
+                payload: self.peer_node_id.to_vec(),
+            });
+        }
         let count_u16 = new_count.min(u16::MAX as usize) as u16;
         self.event_bus.publish(veil_proto::EventPayload {
             kind: veil_proto::event_kind::SESSIONS_CHANGED,

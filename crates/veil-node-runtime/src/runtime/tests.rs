@@ -4331,30 +4331,41 @@ pub fn session_guard_drop_publishes_sessions_changed() {
     // Drop a freshly-built guard immediately so we test the publish
     // path in isolation (no insert path running here).
     let link_id = LinkId::new(42);
-    let guard = SessionGuard::new(
-        Arc::clone(&live_sessions),
-        link_id,
-        Arc::new(veil_observability::NodeLogger::new_noop()),
-        None,
-        [0u8; 32],
-        session_registry,
-        None,
-        sessions_per_ip,
-        [0u8; 32],
-        Arc::new(std::sync::RwLock::new(
-            veil_session::SessionTxRegistry::new(),
-        )),
-        None,
-        Arc::clone(&bus),
-        None,
-    );
-    drop(guard);
+    let peer = [0xab; 32];
+    for pnet_session in [false, true] {
+        let guard = SessionGuard::new(
+            Arc::clone(&live_sessions),
+            link_id,
+            Arc::new(veil_observability::NodeLogger::new_noop()),
+            None,
+            [0u8; 32],
+            Arc::clone(&session_registry),
+            None,
+            Arc::clone(&sessions_per_ip),
+            peer,
+            Arc::new(std::sync::RwLock::new(
+                veil_session::SessionTxRegistry::new(),
+            )),
+            None,
+            Arc::clone(&bus),
+            None,
+        )
+        .with_pnet_session(pnet_session);
+        drop(guard);
 
-    let event = rx.try_recv().expect("event published on guard drop");
-    assert_eq!(event.kind, event_kind::SESSIONS_CHANGED);
-    // BTreeMap was empty, remove of absent key still publishes
-    // count=0 (current live count) — that the contract.
-    assert_eq!(event.payload, 0u16.to_be_bytes().to_vec());
+        if pnet_session {
+            let targeted = rx.try_recv().expect("private session close event");
+            assert_eq!(targeted.kind, event_kind::PNET_SESSION_ENDED);
+            assert_eq!(targeted.payload, peer);
+        }
+        let event = rx.try_recv().expect("event published on guard drop");
+        assert_eq!(event.kind, event_kind::SESSIONS_CHANGED);
+        assert_eq!(event.payload, 0u16.to_be_bytes());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
 }
 
 // ── SessionGuard reaps its orphaned outbox sender on drop ───────

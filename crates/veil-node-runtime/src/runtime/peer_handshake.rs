@@ -1801,6 +1801,11 @@ pub async fn register_connection_session(
             runtime.event_bus,
             Some(runtime.outbound_connector_refresh),
         )
+        .with_pnet_session(
+            membership_expires.is_some()
+                && session_state == SessionState::Active
+                && !referral_session,
+        )
         .with_quic_owner(quic_owner),
     };
     // SessionGuard now owns the slot — disarm our IpSlotGuard so its

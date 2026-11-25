@@ -1096,6 +1096,24 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   gateway and 0.59 s with the control. All seven runs restored
   bidirectional traffic on the original gateway and TUN interfaces
   and delivered their 48 SDK chat messages exactly once.
+- On private session teardown, the daemon can name the peer to local
+  status subscribers that request session hints. The gateway checks an
+  installed route for that peer at the existing IPC pace, including
+  when the peer still appears in the snapshot. The normal session count
+  event also goes out. A regression test held a stale peer in a full
+  snapshot with 96 other admitted routes. The gateway kept the peer's
+  route while a replacement still qualified, then withdrew it after a
+  negative admission reply.
+- In paired Linux ARM64 runs with 4,096 configured routes, the IPC
+  proxy suppressed the generic final-session count change and kept
+  the retired peer in a full snapshot. The new gateway withdrew the
+  route 0.04 and 0.31 s after observed loss of daemon admission.
+  The controls from `6b91c3fd` took 3.53 and 3.55 s. With the normal
+  count event, the new gateway took 0.31 s and the control took
+  0.58 s. A run with Veil v0.11.59 at the gateway withdrew the
+  route in 1.41 s using the legacy query. All seven runs recovered
+  traffic on their original gateway and TUN interfaces and delivered
+  all 336 SDK chat messages exactly once.
 
 ### Emulated inter-site link
 

@@ -2642,11 +2642,15 @@ async fn handle_ipc_client(
                     }
                 };
                 if let Some(mut event) = event {
-                    if event.kind == veil_proto::event_kind::PNET_SESSION_ADMITTED
-                        && hello.flags & veil_proto::ipc::IPC_CAP_PNET_SESSION_HINTS == 0
-                    {
-                        event.kind = veil_proto::event_kind::SESSION_ADMITTED;
-                        event.payload.clear();
+                    if hello.flags & veil_proto::ipc::IPC_CAP_PNET_SESSION_HINTS == 0 {
+                        match event.kind {
+                            veil_proto::event_kind::PNET_SESSION_ENDED => continue,
+                            veil_proto::event_kind::PNET_SESSION_ADMITTED => {
+                                event.kind = veil_proto::event_kind::SESSION_ADMITTED;
+                                event.payload.clear();
+                            }
+                            _ => {}
+                        }
                     }
                     if write_frame_wh(
                         &mut wh,

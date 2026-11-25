@@ -60,7 +60,7 @@ pub const IPC_HELLO_OK_PNET_ADMISSION_BATCH: u16 = 0x2000;
 pub const IPC_CAP_PNET_AUTHORITY: u32 = 128;
 /// A fixed-size authority trailer follows the ordinary HELLO_OK body.
 pub const IPC_HELLO_OK_PNET_AUTHORITY: u16 = 0x4000;
-/// Request peer identifiers on private-session admission events over local IPC.
+/// Request peer identifiers on private-session events over local IPC.
 pub const IPC_CAP_PNET_SESSION_HINTS: u32 = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6312,6 +6312,11 @@ pub mod event_kind {
     /// Sent to local clients that request `IPC_CAP_PNET_SESSION_HINTS`.
     /// Payload: `[u8; 32] peer_node_id`. Consumers still query admission.
     pub const PNET_SESSION_ADMITTED: u8 = 9;
+    /// A private session ended. Sent only to local clients that request
+    /// `IPC_CAP_PNET_SESSION_HINTS`.
+    /// Payload: `[u8; 32] peer_node_id`. A replacement session can still
+    /// admit this peer, so consumers query admission before changing routes.
+    pub const PNET_SESSION_ENDED: u8 = 10;
 }
 
 /// Payload [`crate::family::LocalAppMsg::Event`].
