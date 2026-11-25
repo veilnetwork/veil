@@ -335,6 +335,22 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   restored traffic on the same TUN interfaces. In each run and a
   separate mixed-version run with a pre-batch daemon, all 48 SDK chat
   messages sent before the disconnect arrived exactly once.
+- A two-vCPU Linux ARM64 stand exercised 66 live authenticated
+  sessions on a single gateway with 4,096 configured routes. Each
+  run admitted a new peer, disconnected a different peer, and then
+  restored it. The four runs used the same daemon binaries and
+  identities and alternated the gateway builds in control, candidate,
+  candidate, control order (`6b1a26a9` and `ec29eeee`). Two
+  unaffected spokes sent 1,100-byte UDP datagrams at 16 Mb/s each
+  for 18 seconds per run, concurrent with bidirectional SDK chat.
+- After the daemon reported session loss, route withdrawal took 4.41
+  and 4.93 s with the control and 0.293 and 0.266 s with the candidate.
+  All 261,510 UDP datagrams and all 384 SDK chat messages arrived
+  exactly once. Bidirectional tunnel recovery after observed
+  readmission took 3.13 and 2.66 s with the control and 4.11 and
+  4.46 s with the candidate, on the original TUN interfaces. The
+  earlier withdrawal still left recovery dependent on the ordinary
+  session snapshot's cooldown.
 - A matched Linux run reused the daemon, 48 authenticated identities and
   24 disjoint tables of 4,096 entries. Spokes initiated the sessions so
   their restarts could exercise route recovery without waiting for the
