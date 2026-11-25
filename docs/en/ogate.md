@@ -309,9 +309,11 @@ The active count respects certificate and signed-policy deadlines even
 between admission sweeps. For signed mode, `policy_state` reports
 `current`, `outside_validity_window` or `unavailable`. The event includes
 the loaded revision and the effective route deadline when available.
-During IPC rebind, it reports zero active peers. These local reports
-contain only aggregates and policy metadata. Start ogate again to
-change the reporting interval.
+During data IPC rebind, it reports zero active peers. P-Net uses a
+separate status connection for admission. While that connection recovers,
+the data IPC link can report connected with zero active peers. These
+local reports contain only aggregates and policy metadata. Start ogate
+again to change the reporting interval.
 
 **Which setting wins** (highest to lowest):
 

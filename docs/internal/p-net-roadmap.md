@@ -994,6 +994,21 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   0.427 s and recovered in 0.55 s. A current-daemon run took 0.420
   and 0.55 s respectively. Every run kept its gateway process and
   TUN interfaces and delivered all 48 SDK messages exactly once.
+- While waiting between admission queries, the gateway also watches the
+  status IPC connection for closure. It withdraws routes and starts a
+  fresh admission sweep on a verified status connection. The app data
+  connection can stay bound while the status connection recovers.
+- In a paired Linux ARM64 run, a proxy closed only the gateway's status
+  connection while an SDK flow ran between the daemons. Routes withdrew
+  in 0.113 s with the change and 6.466 s in the control. Both runs
+  blocked tunnel probes during the outage. SDK receives continued, and
+  the original data connection and TUN interfaces carried packets again
+  after a fresh admission query. A separate test with signed policy
+  withdrew the route in 0.126 s and also kept the SDK flow and data IPC
+  connection during the outage. With a pre-batch daemon and raw packet
+  IPC, withdrawal took 0.088 s and bidirectional TUN traffic recovered in
+  3.473 s after the proxy accepted status connections again. SDK receives
+  continued during that outage as well.
 
 ### Remote session changes with pre-batch daemons
 

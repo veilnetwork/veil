@@ -1856,6 +1856,31 @@ fn apply_admissions(
     changed
 }
 
+fn clear_admissions(
+    configured: &SharedState,
+    admitted: &mut HashMap<NodeId, u64>,
+    binding: &RouteBinding,
+    state: &ArcSwap<SharedState>,
+    route_changes: &Notify,
+) {
+    if admitted.is_empty() {
+        return;
+    }
+    if binding.signed.is_none() {
+        binding
+            .recent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remember_peers(admitted.keys().copied(), Instant::now());
+    }
+    admitted.clear();
+    publish_routes(
+        configured.with_pnet_admissions(admitted),
+        state,
+        route_changes,
+    );
+}
+
 async fn maintain_routes(
     config_path: PathBuf,
     accepted: watch::Sender<OgateConfig>,
@@ -1888,8 +1913,20 @@ async fn maintain_routes(
         SessionEvent(Result<VeilEvent, broadcast::error::RecvError>),
         SessionSweep,
         PrioritySweep,
+        StatusDisconnected,
     }
     loop {
+        if connection
+            .as_ref()
+            .is_some_and(|client| client.is_disconnected())
+        {
+            clear_admissions(&configured, &mut admitted, &binding, &state, &route_changes);
+            connection = None;
+            session_refresh = None;
+            next_peer = 0;
+            next_session_sweep = Instant::now();
+            refresh.reset_immediately();
+        }
         // Read a bounded group of buffered events before the next paced
         // query. One event per query can delay a hint behind busy sessions.
         if let Some(refresh) = session_refresh.as_mut() {
@@ -1930,6 +1967,14 @@ async fn maintain_routes(
             may_recheck_sessions && session_due_at.is_some_and(|due| due <= now) || priority_ready;
         let wake = tokio::select! {
             _ = async {
+                // Legacy queries clone the status client, but join their
+                // tasks before returning to this wait.
+                match connection.as_mut().and_then(Arc::get_mut) {
+                    Some(client) => client.wait_disconnected().await,
+                    None => std::future::pending().await,
+                }
+            } => Wake::StatusDisconnected,
+            _ = async {
                 if next_peer == 0 {
                     refresh.tick().await;
                 }
@@ -1965,6 +2010,9 @@ async fn maintain_routes(
                 }
             } => Wake::Policy,
         };
+        if wake == Wake::StatusDisconnected {
+            continue;
+        }
         if let Wake::SessionEvent(event) = wake {
             match event {
                 Ok(event) => {
@@ -2318,6 +2366,9 @@ async fn maintain_routes(
                 let (results, uncertain) = query_pnet_legacy(client, &retry, &mut pace).await;
                 (Some(results), uncertain)
             };
+            if client.is_disconnected() {
+                continue;
+            }
             match response {
                 Some(results) => {
                     if apply_admissions(&retry, results, &mut admitted, &binding) {
@@ -2357,10 +2408,16 @@ async fn maintain_routes(
             if client.supports_pnet_admission_batch() {
                 end = (next_peer + veilclient::PNET_ADMISSION_BATCH_MAX_PEERS).min(order.len());
                 results = query_pnet_batch(client, &order[next_peer..end], &mut pace).await;
+                if client.is_disconnected() {
+                    continue;
+                }
             } else {
                 end = (next_peer + legacy_group_limit).min(order.len());
                 let (legacy_results, uncertain) =
                     query_pnet_legacy(client, &order[next_peer..end], &mut pace).await;
+                if client.is_disconnected() {
+                    continue;
+                }
                 if uncertain {
                     connection = None;
                     session_refresh = None;
@@ -2375,21 +2432,7 @@ async fn maintain_routes(
             connection = None;
             session_refresh = None;
             next_peer = 0;
-            if !admitted.is_empty() {
-                if binding.signed.is_none() {
-                    binding
-                        .recent
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remember_peers(admitted.keys().copied(), Instant::now());
-                }
-                admitted.clear();
-                publish_routes(
-                    configured.with_pnet_admissions(&admitted),
-                    &state,
-                    &route_changes,
-                );
-            }
+            clear_admissions(&configured, &mut admitted, &binding, &state, &route_changes);
             continue;
         };
         let group = &order[next_peer..end];
@@ -3145,6 +3188,85 @@ mod tests {
             exercise_pnet_sweep(34, true, SweepHint::None),
             exercise_pnet_sweep(1024, true, SweepHint::None)
         );
+    }
+
+    #[tokio::test]
+    async fn pnet_routes_withdraw_when_idle_status_ipc_closes() {
+        use veil_ipc::{IpcEndpoint, IpcServer, PnetStatusProvider};
+        use veil_proto::PnetStatusResultPayload;
+
+        struct Admission;
+
+        impl PnetStatusProvider for Admission {
+            fn peer_status(&self, peer: &NodeId) -> PnetStatusResultPayload {
+                PnetStatusResultPayload {
+                    admitted: true,
+                    has_cert: true,
+                    admin: false,
+                    valid_until_unix: 0,
+                    network_id: [1; 32],
+                    peer_node_id: *peer,
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("ipc");
+        let node_id = [1; 32];
+        let (stop, shutdown) = watch::channel(false);
+        let mut server = IpcServer::new(
+            IpcEndpoint::Unix(socket.clone()),
+            shutdown,
+            Arc::new(veil_app::AppEndpointRegistry::new()),
+            node_id,
+        )
+        .with_pnet_status_provider(Arc::new(Admission));
+        let server = tokio::spawn(async move { server.run().await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !socket.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let config = pnet_sweep_config(&socket, 2);
+        let configured = SharedState::build(&config).unwrap();
+        let state = Arc::new(ArcSwap::from_pointee(
+            configured.with_pnet_admissions(&HashMap::new()),
+        ));
+        let changed = Arc::new(Notify::new());
+        let updates = tokio::spawn(maintain_routes(
+            directory.path().join("unused.toml"),
+            watch::channel(config).0,
+            Arc::new(Mutex::new(None)),
+            RouteBinding {
+                node_id,
+                signed: None,
+                recent: Arc::new(SyncMutex::new(RecentAdmissions::default())),
+            },
+            configured,
+            Arc::clone(&state),
+            Arc::clone(&changed),
+        ));
+        let wait_for_route_count = |count| {
+            let (state, changed) = (&state, &changed);
+            async move {
+                while state.load().table.peer_count() != count {
+                    changed.notified().await;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), wait_for_route_count(2))
+            .await
+            .unwrap();
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), wait_for_route_count(0))
+            .await
+            .expect("routes stayed published until the next sweep after IPC closed");
+        updates.abort();
+        assert!(updates.await.unwrap_err().is_cancelled());
+        server.await.unwrap();
     }
 
     #[tokio::test]
