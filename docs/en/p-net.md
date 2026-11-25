@@ -195,11 +195,19 @@ allowlist. Regular DHT replication continues on its own schedule.
 `replicas_sent` counts peers for which a copy was queued. Verify receipt
 on the nodes that enforce access.
 
-`veil-cli node reload` carries live signed bans into the rebuilt DHT in
-memory, even with disk snapshots disabled. The daemon verifies each
-record under the active network trust settings and preserves its original
-DHT lifetime. After a full process restart the daemon needs a copy on disk
-or from another participant.
+With `persist_enabled = true` and `[dht].values_persist_path` set, the
+issuer saves its own signed bans in the adjacent `<snapshot-name>.pnet-bans`
+directory. `issuer_storage=saved` confirms that the issuer has a disk
+copy, including when `replicas_sent=0`. `issuer_storage=volatile` reports
+a write failure while the ban still applies in the running process.
+`issuer_storage=disabled` means the issuer has no configured persistent
+store. The issuer rechecks the network, signer and administrator
+allowlist before restoring its records on startup.
+
+`veil-cli node reload` also carries live signed bans into the rebuilt
+DHT in memory. It preserves their original DHT lifetime. After a full
+restart, received bans depend on the normal DHT snapshot or another
+participant that holds a copy.
 
 Confirm it landed on the receiving nodes:
 ```bash

@@ -10,6 +10,7 @@
 //! their bans stay node-local — preserving the user's explicit
 //! "publish-only-as-owner" constraint in open networks.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use veil_abuse::BanList;
@@ -127,6 +128,26 @@ pub struct PreparedBan {
     key: [u8; 32],
     blob: Vec<u8>,
     banned_node_id: [u8; 32],
+    issuer: [u8; 32],
+    issued_at: u64,
+    gate: Arc<NetworkAccessGate>,
+    storage_dir: Option<PathBuf>,
+}
+
+pub(crate) enum IssuerStorage {
+    Disabled,
+    Saved,
+    Volatile(String),
+}
+
+impl std::fmt::Display for IssuerStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("disabled"),
+            Self::Saved => f.write_str("saved"),
+            Self::Volatile(reason) => write!(f, "volatile ({reason})"),
+        }
+    }
 }
 
 impl PreparedBan {
@@ -134,24 +155,55 @@ impl PreparedBan {
     /// held here (the caller dropped the `NodeRuntime` mutex after `prepare`),
     /// so the multi-second iterative DHT walk does not serialise the runtime.
     pub async fn replicate(self) -> Result<usize, PublishBanError> {
-        let replicas_sent = self
+        self.replicate_with_storage()
+            .await
+            .map(|(replicas, _)| replicas)
+    }
+
+    pub(crate) async fn replicate_with_storage(
+        self,
+    ) -> Result<(usize, IssuerStorage), PublishBanError> {
+        let save = self.storage_dir.map(|dir| {
+            let key = self.key;
+            let bytes = self.blob.clone();
+            let gate = self.gate;
+            let issuer = self.issuer;
+            let issued_at = self.issued_at;
+            tokio::task::spawn_blocking(move || {
+                super::issued_bans::save(&dir, key, &bytes, issued_at, &gate, &issuer)
+            })
+        });
+        let replicas = self
             .dht
             .store_replicated(
                 self.key,
                 self.blob,
                 self.session_outbox as Arc<dyn veil_dht::FrameRouter>,
             )
-            .await
-            .map_err(|e| PublishBanError::Replication(format!("{e:?}")))?;
+            .await;
+        let storage = match save {
+            None => IssuerStorage::Disabled,
+            Some(save) => match save.await {
+                Ok(Ok(())) => IssuerStorage::Saved,
+                Ok(Err(error)) => IssuerStorage::Volatile(error.to_string()),
+                Err(error) => IssuerStorage::Volatile(format!("storage task failed: {error}")),
+            },
+        };
+        if matches!(storage, IssuerStorage::Volatile(_)) {
+            self.logger
+                .warn("network.ban.storage.failed", storage.to_string());
+        }
+        let replicas_sent = replicas.map_err(|e| PublishBanError::Replication(format!("{e:?}")))?;
         self.logger.info(
             "network.ban.published",
             format!(
-                "banned={} replicas_sent={}",
+                "banned={} replicas_sent={} issuer_storage={}",
                 veil_util::hex_short(&self.banned_node_id),
-                replicas_sent
+                replicas_sent,
+                storage
             ),
         );
-        Ok(replicas_sent)
+        Ok((replicas_sent, storage))
     }
 }
 
@@ -241,6 +293,10 @@ impl NodeRuntime {
             key,
             blob,
             banned_node_id,
+            issuer: admin_node_id,
+            issued_at: now_unix,
+            gate: Arc::clone(gate),
+            storage_dir: self.issued_bans_dir.clone(),
         })
     }
 
@@ -256,6 +312,52 @@ impl NodeRuntime {
         self.prepare_p_net_ban(banned_node_id, reason)?
             .replicate()
             .await
+    }
+
+    /// Restore locally authorized actions before listeners or connectors can
+    /// admit peers. The DHT cache and the disk record have different roles:
+    /// ordinary DHT entries age out, while the issuer can resume a ban that
+    /// its active authority still permits it to publish.
+    pub(super) async fn restore_issued_p_net_bans(&self) {
+        let (Some(dir), Some(gate)) = (self.issued_bans_dir.clone(), self.network_gate.clone())
+        else {
+            return;
+        };
+        let issuer = *self.identity.local_identity.node_id.as_bytes();
+        let logger = Arc::clone(&self.logger);
+        let verify = Arc::clone(&gate);
+        let loaded = tokio::task::spawn_blocking(move || {
+            super::issued_bans::load(&dir, &verify, &issuer, &logger)
+        })
+        .await;
+        let records = match loaded {
+            Ok(Ok(records)) => records,
+            Ok(Err(error)) => {
+                self.logger
+                    .warn("network.ban.storage.load_failed", error.to_string());
+                return;
+            }
+            Err(error) => {
+                self.logger
+                    .warn("network.ban.storage.load_failed", error.to_string());
+                return;
+            }
+        };
+        let total = records.len();
+        for (key, bytes) in records {
+            apply_verified_ban(&bytes, &self.ban_list, &self.session_tx_registry);
+            if self
+                .dht
+                .peek_value(&key)
+                .is_none_or(|value| !gate.verify_ban_record(&key, &value))
+            {
+                self.dht.store_local(key, bytes);
+            }
+        }
+        if total > 0 {
+            self.logger
+                .info("network.ban.storage.restored", format!("records={total}"));
+        }
     }
 
     /// Periodic background task: every `APPLY_INTERVAL_SECS` seconds
@@ -509,6 +611,68 @@ mod tests {
             assert_eq!(store.value, signed);
             runtime.stop().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn confirmed_issuer_storage_restores_only_locally_authorized_bans() {
+        let (dir, mut config) = admin_fixture(veil_cfg::NetworkMode::PrivateConfigured);
+        let config_path = dir.path().join("node.toml");
+        let snapshot = dir.path().join("dht-values.json");
+        config.persist_enabled = true;
+        config.dht.values_persist_path = Some(snapshot.to_string_lossy().into_owned());
+        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let storage_dir = super::super::issued_bans::storage_dir(&config).unwrap();
+        let mut runtime = NodeRuntime::start(&config_path, true).await.unwrap();
+        let target = [7; 32];
+        let key = ban_dht_key(&TEST_NETWORK_ID, &target);
+
+        std::fs::write(&storage_dir, b"storage collision").unwrap();
+        let (replicas, storage) = runtime
+            .prepare_p_net_ban(target, "blocked storage")
+            .unwrap()
+            .replicate_with_storage()
+            .await
+            .unwrap();
+        assert_eq!(replicas, 0);
+        assert!(matches!(storage, IssuerStorage::Volatile(_)));
+        assert!(lock!(runtime.ban_list).is_banned(&target));
+        assert!(runtime.dht.peek_value(&key).is_some());
+
+        std::fs::remove_file(&storage_dir).unwrap();
+        let (replicas, storage) = runtime
+            .prepare_p_net_ban(target, "saved before reply")
+            .unwrap()
+            .replicate_with_storage()
+            .await
+            .unwrap();
+        assert_eq!(replicas, 0);
+        assert!(matches!(storage, IssuerStorage::Saved));
+        let signed = runtime.dht.peek_value(&key).unwrap();
+        let file = storage_dir.join(format!("{}.pban", veil_util::bytes_to_hex(&key)));
+        assert_eq!(std::fs::read(&file).unwrap(), signed);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        runtime.stop().await.unwrap();
+        let _ = std::fs::remove_file(&snapshot);
+
+        let mut runtime = NodeRuntime::start(&config_path, true).await.unwrap();
+        assert!(lock!(runtime.ban_list).is_banned(&target));
+        assert_eq!(runtime.dht.peek_value(&key), Some(signed));
+        runtime.stop().await.unwrap();
+        let _ = std::fs::remove_file(&snapshot);
+
+        config.network.as_mut().unwrap().admin_node_ids = vec![veil_util::bytes_to_hex(&[9; 32])];
+        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let mut runtime = NodeRuntime::start(&config_path, true).await.unwrap();
+        assert!(!lock!(runtime.ban_list).is_banned(&target));
+        assert!(runtime.dht.peek_value(&key).is_none());
+        runtime.stop().await.unwrap();
     }
 
     #[test]

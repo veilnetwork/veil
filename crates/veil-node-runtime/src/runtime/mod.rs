@@ -23,6 +23,7 @@ mod identity_state;
 mod ip_slot;
 mod ipc_bridges;
 mod ipc_server;
+mod issued_bans;
 mod key_rotation;
 mod lifecycle;
 mod local_circuit_paths;
@@ -870,6 +871,7 @@ pub struct NodeRuntime {
     rtt_persist_path: Option<String>,
     /// Master switch for all on-disk persistence (mirrors `config.persist_enabled`).
     persist_enabled: bool,
+    issued_bans_dir: Option<std::path::PathBuf>,
     /// ranked list of known Gateway peers for multi-gateway failover.
     gateway_list: Arc<Mutex<veil_gateway::GatewayList>>,
     /// wall-clock instant when the ML-KEM decapsulation-key seed

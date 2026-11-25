@@ -879,6 +879,8 @@ impl NodeRuntime {
             // additional bans from the snapshot under the pinned trust root.
             self.restore_dht_values_snapshot(&config);
         }
+        self.issued_bans_dir = super::issued_bans::storage_dir(&config);
+        self.restore_issued_p_net_bans().await;
         self.apply_stored_p_net_bans();
         super::persistence::load_bans(&self.ban_list, &self.config_path);
         // `.max(1)` clamp makes the `.expect` unreachable here (same

@@ -2890,13 +2890,13 @@ async fn execute_admin_command(
             // holding the NodeRuntime mutex across the multi-second network walk.
             let prepared = { runtime.lock().await.prepare_p_net_ban(id, reason.clone()) };
             let result = match prepared {
-                Ok(prep) => prep.replicate().await,
+                Ok(prep) => prep.replicate_with_storage().await,
                 Err(e) => Err(e),
             };
             match result {
-                Ok(replicas) => Ok(AdminResult::Ack {
+                Ok((replicas, storage)) => Ok(AdminResult::Ack {
                     message: format!(
-                        "p-net ban issued for {node_id}; replicas_sent={replicas}; reason={reason}"
+                        "p-net ban issued for {node_id}; replicas_sent={replicas}; issuer_storage={storage}; reason={reason}"
                     ),
                 }),
                 Err(e) => Err(NodeError::AdminProtocol(format!("p-net ban failed: {e}"))),

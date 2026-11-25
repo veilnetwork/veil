@@ -1711,6 +1711,22 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   in-memory restore, the observer denied admission by the 3.27 s sample
   and the revoked tunnel stopped in both directions. The unaffected
   pair received all 200 tunnel probes and 48 SDK messages in each run.
+- When the issuer has a configured DHT values snapshot and persistence
+  enabled, it writes its own signed ban before acknowledging successful
+  issuer storage. The daemon saves one owner-only file per ban key. The
+  local disk write and DHT publication proceed independently. The CLI
+  reports the local storage result separately from queued network
+  replicas. Startup verifies the file key, network, issuer signature and
+  current administrator authorization before using the record.
+- On the same five-node Linux topology, the isolated issuer acknowledged
+  a ban with zero replicas. The test sent `SIGKILL` before the first DHT
+  snapshot, then restarted the issuer with its link still down. The
+  updated issuer restored the signed record before opening its listener.
+  After healing, the distant observer denied admission by the 3.26 s
+  sample and the revoked tunnel failed both probes. The `e0392fa9`
+  control restored no ban and still admitted the target at 12.21 s.
+  The unrelated pair received 200 tunnel probes and 48 SDK messages
+  in each run.
 
 #### Enforcing revocations on relayed application datagrams
 

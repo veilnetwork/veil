@@ -1480,6 +1480,7 @@ impl NodeRuntime {
             rtt_persist_path: config.routing.rtt_persist_path.clone(),
             // Master switch for all persistence.
             persist_enabled: config.persist_enabled,
+            issued_bans_dir: super::issued_bans::storage_dir(&config),
             // gateway list — same Arc shared with the dispatcher.
             gateway_list: Arc::clone(&shared_gateway_list),
             // record when the ML-KEM key was loaded so the admin
@@ -1639,6 +1640,7 @@ impl NodeRuntime {
         if config.persist_enabled {
             runtime.restore_dht_values_snapshot(&config);
         }
+        runtime.restore_issued_p_net_bans().await;
         if runtime.configured_private_network.is_some() {
             runtime.apply_stored_p_net_bans();
         }
