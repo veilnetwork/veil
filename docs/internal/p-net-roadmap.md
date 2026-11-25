@@ -308,11 +308,23 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   bidirectional recovery. Both disconnect runs delivered all 48 SDK
   chat messages exactly once before the restart.
 - A session count hint can schedule an earlier admission batch while
-  the ordinary session snapshot is cooling down, when all installed
-  routes fit in one batch. This looks up the installed peers directly,
-  uses the shared IPC pace and runs at most once per second. Only the
-  daemon's admission reply changes routes. The pending snapshot and
-  full sweep still cover discovery and other session changes.
+  the ordinary session snapshot is cooling down. If all installed
+  routes fit in one batch, the gateway looks them up directly. For
+  more than 64 installed routes, it asks for one peer snapshot and
+  checks installed peers absent from it. With a truncated or missing
+  snapshot, each new early check starts after the last candidate and
+  wraps around the table. The gateway schedules at most one early
+  round per second using the shared IPC pace. Only the daemon's
+  admission reply changes routes. The pending snapshot and full
+  sweep still cover discovery and the routes outside the early batch.
+- With 97 installed routes out of 4,096 configured, a local IPC
+  regression test withdraws one route within its 2 s deadline during
+  the ordinary snapshot cooldown. The other 96 stay installed. A
+  separate test checks that truncated snapshots advance through
+  successive batches and wrap around the table. A Linux ARM64 TUN
+  check with this change also passed session recovery on the same
+  interfaces and delivered all 48 SDK messages with both current and
+  pre-batch daemons.
 - In a three-node Linux ARM64 test, a gateway with 4,096 configured
   routes admitted a second peer just before losing its first session.
   Alternating builds with the same daemon binaries, the two controls

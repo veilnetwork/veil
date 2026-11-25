@@ -277,6 +277,7 @@ struct SessionRefresh {
     session_count: Option<u16>,
     pending_loss: Option<Instant>,
     next_loss_check: Instant,
+    loss_cursor: Option<NodeId>,
 }
 
 impl SessionRefresh {
@@ -469,6 +470,44 @@ impl LivePeerHints {
             .map(|index| configured[index])
             .collect()
     }
+}
+
+fn withdrawal_candidates(
+    configured: &[(NodeId, [u8; 32])],
+    admitted: &HashMap<NodeId, u64>,
+    live: Option<&LivePeerHints>,
+    cursor: Option<NodeId>,
+) -> Vec<(NodeId, [u8; 32])> {
+    let limit = veilclient::PNET_ADMISSION_BATCH_MAX_PEERS;
+    if admitted.len() <= limit {
+        let mut installed: Vec<_> = admitted
+            .keys()
+            .filter_map(|peer| {
+                configured
+                    .binary_search_by_key(peer, |(id, _)| *id)
+                    .ok()
+                    .map(|index| configured[index])
+            })
+            .collect();
+        installed.sort_unstable_by_key(|(id, _)| *id);
+        return installed;
+    }
+
+    // A truncated snapshot can omit live peers. Those peers are only
+    // scheduling candidates, and the cursor avoids recurring checks of
+    // the same prefix when loss events arrive during the normal cooldown.
+    let start = cursor.map_or(0, |cursor| {
+        configured.partition_point(|(id, _)| *id <= cursor)
+    });
+    configured[start..]
+        .iter()
+        .chain(&configured[..start])
+        .filter(|(id, _)| {
+            admitted.contains_key(id) && live.is_none_or(|list| !list.ids.contains(id))
+        })
+        .take(limit)
+        .copied()
+        .collect()
 }
 
 async fn live_peer_hints(
@@ -1542,10 +1581,7 @@ async fn maintain_routes(
         let session_due_at = session_due.map(|due| due.max(next_session_sweep));
         let may_recheck_sessions = multiple_batches || next_peer == 0;
         let withdrawal_due = session_refresh.as_mut().and_then(|refresh| {
-            if !multiple_batches
-                || admitted.is_empty()
-                || admitted.len() > veilclient::PNET_ADMISSION_BATCH_MAX_PEERS
-            {
+            if !multiple_batches || admitted.is_empty() {
                 refresh.pending_loss = None;
             }
             refresh
@@ -1775,6 +1811,7 @@ async fn maintain_routes(
                     session_count: None,
                     pending_loss: None,
                     next_loss_check: Instant::now(),
+                    loss_cursor: None,
                 });
                 let order = admission_order
                     .as_deref()
@@ -1794,37 +1831,41 @@ async fn maintain_routes(
         // Recheck one batch of likely session changes, then resume the full
         // sweep at the same cursor. The snapshot never changes admission.
         let recheck_sessions = wake == Wake::SessionSweep && multiple_batches;
-        let live = if recheck_sessions && let Some(client) = &connection {
-            live_peer_hints(client, &mut pace, true).await
+        let withdrawal = wake == Wake::WithdrawalSweep;
+        let need_snapshot = recheck_sessions
+            || (withdrawal && admitted.len() > veilclient::PNET_ADMISSION_BATCH_MAX_PEERS);
+        let live = if need_snapshot && let Some(client) = &connection {
+            live_peer_hints(client, &mut pace, recheck_sessions).await
         } else {
             None
         };
-        let mut retry = if wake == Wake::WithdrawalSweep {
-            // The count is only a wake hint. Revalidate the installed routes
-            // against the daemon even if a PEERS reply would omit them.
-            let peers = &configured.peer_app_ids;
-            let mut installed: Vec<_> = admitted
-                .keys()
-                .filter_map(|peer| {
-                    peers
-                        .binary_search_by_key(peer, |(id, _)| *id)
-                        .ok()
-                        .map(|index| peers[index])
-                })
-                .collect();
-            installed.sort_unstable_by_key(|(id, _)| *id);
+        let mut retry = if withdrawal {
+            // Both the count and peer list are hints. Check each candidate
+            // against the daemon's admission provider before changing routes.
+            let cursor = session_refresh
+                .as_ref()
+                .and_then(|refresh| refresh.loss_cursor);
+            let group =
+                withdrawal_candidates(&configured.peer_app_ids, &admitted, live.as_ref(), cursor);
+            if let Some((peer, _)) = group.last()
+                && let Some(refresh) = session_refresh.as_mut()
+            {
+                refresh.loss_cursor = Some(*peer);
+            }
             tracing::trace!(
-                peers = installed.len(),
-                "rechecking P-Net routes after a session count decrease"
+                peers = group.len(),
+                "rechecking P-Net routes after possible session loss"
             );
-            installed
+            group
         } else {
             live.as_ref().map_or_else(Vec::new, |live| {
                 live.changed_peers(&configured.peer_app_ids, &admitted)
             })
         };
-        let signed_retry =
-            binding.signed.is_some() && retry.is_empty() && Instant::now() >= retry_due;
+        let signed_retry = binding.signed.is_some()
+            && !withdrawal
+            && retry.is_empty()
+            && Instant::now() >= retry_due;
         // A full or missing snapshot can hide a rejoining peer. Use free
         // places in this batch to recheck recently withdrawn manual routes.
         let incomplete_hint = binding.signed.is_none()
@@ -1863,7 +1904,7 @@ async fn maintain_routes(
                 None => connection = None,
             }
         }
-        if wake == Wake::WithdrawalSweep && connection.is_some() {
+        if withdrawal && connection.is_some() {
             continue;
         }
         let end;
@@ -2550,11 +2591,45 @@ mod tests {
         exercise_pnet_session_rejoin(SessionHintScenario::RapidWithdrawal).await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dense_withdrawals_recheck_during_the_snapshot_cooldown() {
+        exercise_pnet_session_rejoin(SessionHintScenario::RapidDenseWithdrawal).await;
+    }
+
+    #[test]
+    fn capped_withdrawal_candidates_rotate_without_repeating_a_prefix() {
+        let limit = veilclient::PNET_ADMISSION_BATCH_MAX_PEERS;
+        let configured: Vec<_> = (0..200).map(|id| ([id; 32], [id; 32])).collect();
+        let admitted = configured.iter().map(|(id, _)| (*id, 0)).collect();
+        let capped = LivePeerHints {
+            at_capacity: true,
+            ids: configured[..10].iter().map(|(id, _)| *id).collect(),
+        };
+
+        let first = withdrawal_candidates(&configured, &admitted, Some(&capped), None);
+        assert_eq!(first.as_slice(), &configured[10..10 + limit]);
+        let second = withdrawal_candidates(
+            &configured,
+            &admitted,
+            Some(&capped),
+            first.last().map(|(peer, _)| *peer),
+        );
+        assert_eq!(second.as_slice(), &configured[10 + limit..10 + 2 * limit]);
+        let wrapped = withdrawal_candidates(
+            &configured,
+            &admitted,
+            None,
+            configured.last().map(|(peer, _)| *peer),
+        );
+        assert_eq!(wrapped.as_slice(), &configured[..limit]);
+    }
+
     enum SessionHintScenario {
         Delayed,
         Capped,
         JoinBurst,
         RapidWithdrawal,
+        RapidDenseWithdrawal,
     }
 
     async fn exercise_pnet_session_rejoin(scenario: SessionHintScenario) {
@@ -2567,6 +2642,7 @@ mod tests {
         const END_JOINS: u16 = FIRST_JOIN + veilclient::PNET_ADMISSION_BATCH_MAX_PEERS as u16;
         struct Session {
             active: AtomicBool,
+            other_admitted: u16,
             hints: AtomicUsize,
             delay_next_hint: AtomicBool,
             capped_list: AtomicBool,
@@ -2613,6 +2689,17 @@ mod tests {
                     })
                     .into_iter()
                     .collect();
+                peers.extend((3..3 + self.other_admitted).map(|host| {
+                    let mut node_id = [0; 32];
+                    node_id[..2].copy_from_slice(&host.to_be_bytes());
+                    PeersListEntry {
+                        node_id,
+                        state: veil_proto::peer_state::ACTIVE,
+                        direction: veil_proto::peer_direction::INBOUND,
+                        transport: Vec::new(),
+                        caps: None,
+                    }
+                }));
                 if self.join_burst.load(Ordering::Relaxed) {
                     peers.extend((FIRST_JOIN..END_JOINS).map(|host| {
                         let mut node_id = [0; 32];
@@ -2642,9 +2729,13 @@ mod tests {
                 if self.join_burst.load(Ordering::Relaxed) && (*peer == PEER || joining) {
                     self.first_changed.lock().unwrap().get_or_insert(*peer);
                 }
+                let retained =
+                    (3..3 + self.other_admitted).contains(&u16::from_be_bytes([peer[0], peer[1]]));
                 PnetStatusResultPayload {
-                    admitted: joining || *peer == PEER && self.active.load(Ordering::Relaxed),
-                    has_cert: joining || *peer == PEER,
+                    admitted: retained
+                        || joining
+                        || *peer == PEER && self.active.load(Ordering::Relaxed),
+                    has_cert: retained || joining || *peer == PEER,
                     admin: false,
                     valid_until_unix: 0,
                     network_id: [0x01; 32],
@@ -2655,8 +2746,14 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("ipc");
+        let other_admitted: u16 = if matches!(scenario, SessionHintScenario::RapidDenseWithdrawal) {
+            96
+        } else {
+            0
+        };
         let session = Arc::new(Session {
             active: AtomicBool::new(true),
+            other_admitted,
             hints: AtomicUsize::new(0),
             delay_next_hint: AtomicBool::new(false),
             capped_list: AtomicBool::new(false),
@@ -2706,18 +2803,29 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), session.past_first_batch.notified())
             .await
             .expect("the large sweep did not start");
+        let initial_route_count = usize::from(other_admitted + 1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.load().table.peer_count() != initial_route_count {
+                changes.notified().await;
+            }
+        })
+        .await
+        .expect("initial routes were not published");
         let address = Ipv4Addr::new(10, 99, 0, 2).into();
         assert_eq!(
             state.load().table.lookup_egress(address),
             Decision::Forward(PEER)
         );
 
-        if matches!(scenario, SessionHintScenario::RapidWithdrawal) {
+        if matches!(
+            scenario,
+            SessionHintScenario::RapidWithdrawal | SessionHintScenario::RapidDenseWithdrawal
+        ) {
             let previous = session.hints.load(Ordering::Relaxed);
             assert_ne!(
                 events.publish(EventPayload {
                     kind: SESSIONS_CHANGED,
-                    payload: vec![0, 1],
+                    payload: (other_admitted + 1).to_be_bytes().to_vec(),
                 }),
                 0
             );
@@ -2738,7 +2846,7 @@ mod tests {
         assert_ne!(
             events.publish(EventPayload {
                 kind: SESSIONS_CHANGED,
-                payload: vec![0, 0],
+                payload: other_admitted.to_be_bytes().to_vec(),
             }),
             0
         );
@@ -2749,6 +2857,9 @@ mod tests {
         })
         .await
         .expect("route withdrawal waited for the full admission sweep");
+        if other_admitted != 0 {
+            assert_eq!(state.load().table.peer_count(), usize::from(other_admitted));
+        }
         assert_eq!(
             state.load().table.lookup_ingress(&PEER, Some(address)),
             Decision::Unauthorized
@@ -2804,7 +2915,13 @@ mod tests {
                 .load()
                 .table
                 .lookup_egress(Ipv4Addr::new(10, 99, 0, 3).into()),
-            Decision::NoRoute
+            if other_admitted == 0 {
+                Decision::NoRoute
+            } else {
+                let mut peer = [0; 32];
+                peer[1] = 3;
+                Decision::Forward(peer)
+            }
         );
 
         updates.abort();
