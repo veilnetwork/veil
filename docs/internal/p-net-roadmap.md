@@ -1749,3 +1749,20 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   daemon restart on the same TUN. The receiving gateway counted four
   oversized sub-packets individually. A gateway with reporting disabled
   emitted no summary while discarding packets without a route.
+
+## 8. Check the fleet before a rolling deployment
+
+- The Ansible playbook verifies the candidate and signed local
+  membership for all selected hosts before publishing files or calling
+  systemd. It compares candidate configuration and certificate
+  fingerprints again before activating each host. Certificates are
+  installed at paths derived from their SHA-256 before the config
+  references them.
+- On an isolated two-host Ansible fixture with the real CLI and test
+  substitutes for systemd and the metrics endpoint, all 14 scenarios
+  passed. They included check mode, inventory limits, initial and repeat
+  deployment, signature and device mismatches on the second host, an
+  unreachable host, live config drift before activation, signed configs,
+  preserving configured discovery, and retry after a restart failure.
+  Rejection during the fleet-wide check preserved both hosts' live
+  files and made zero service calls.

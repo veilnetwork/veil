@@ -628,15 +628,37 @@ connectivity between hosts in different modes during the rollout.
 Before you run them, the controller needs:
 - `/tmp/pnet/owner.pub` and `/tmp/pnet/network_id.hex`
 - One cert per host at `/tmp/pnet/<cfg-name>.cert` (cfg-name = b1/b2/b3 +
-  n1..n5 — see the `inv_to_cfg` map in `deploy-pnet.yml`).
+  n1..n5 — see the `inv_to_cfg` role default).
 
 Keep the owner signing key on the issuer.
 
+The first play verifies the candidate configuration and membership
+certificate for every selected host, including when using `--limit`.
+The second play compares the candidate against its verified fingerprints
+and activates it one host at a time. The certificate is installed under
+a name containing its SHA-256 before the config points to it. Older
+certificate files can remain on disk.
+
+The managed hosts need Python 3.11 or later for the TOML check and a CLI
+that supports `network check-membership`. Set `pnet_cli` to use a
+separately installed verifier. The default role settings describe the
+bundled systemd unit. For a customized unit, use its service user,
+working directory and config validation environment.
+
+The playbook stops before activation if a candidate needs changes to
+a signed config or would replace an existing private authority.
+Use the signed-config or owner-rotation procedure for those changes.
+`pnet_mode=private_configured` selects configured-only discovery for a
+new deployment. Subsequent deployments preserve this discovery mode.
+
 ```bash
+# Verify the selected hosts without activating the candidates:
+ansible-playbook -i inventory.yml deploy-pnet.yml --check
+
 # Roll out:
 ansible-playbook -i inventory.yml deploy-pnet.yml
 
-# Revert (drops [network] block + cert, restarts in public mode):
+# Return to public mode:
 ansible-playbook -i inventory.yml revert-pnet.yml
 ```
 

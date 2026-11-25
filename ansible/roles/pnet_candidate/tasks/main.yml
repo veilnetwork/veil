@@ -1,0 +1,174 @@
+---
+
+- name: Read rollout authority on the controller
+  ansible.builtin.set_fact:
+    pnet_authority:
+      network_id: "{{ lookup('ansible.builtin.file', pnet_dir ~ '/network_id.hex') | trim }}"
+      owner_pubkey: "{{ lookup('ansible.builtin.file', pnet_dir ~ '/owner.pub') | trim }}"
+      owner_algo: "{{ pnet_owner_algo | default('ed25519') }}"
+      mode: "{{ pnet_mode | default('') }}"
+      admin_node_ids: "{{ admin_node_ids }}"
+  run_once: true
+  when: not pnet_apply
+
+- name: Clear the previous candidate result
+  ansible.builtin.set_fact:
+    pnet_candidate_error: ""
+
+- name: Prepare and verify a private candidate
+  block:
+    - name: Allocate private staging directory
+      ansible.builtin.tempfile:
+        prefix: ".pnet-preflight-"
+        state: directory
+      register: pnet_scratch
+      check_mode: false
+      changed_when: false
+
+    - name: Stage the selected member certificate
+      ansible.builtin.copy:
+        src: "{{ pnet_dir }}/{{ inv_to_cfg[inventory_hostname] }}.cert"
+        dest: "{{ pnet_scratch.path }}/candidate.cert"
+        mode: "0600"
+      check_mode: false
+      changed_when: false
+      diff: false
+
+    - name: Render candidate without changing the running configuration
+      ansible.builtin.script:
+        cmd: >-
+          {{ (role_path ~ '/files/stage-pnet-config.py') | quote }} {{ pnet_config | quote }}
+          {{ pnet_scratch.path | quote }} {{ cert_path | quote }}
+          {{ pnet_authority | to_json | quote }}
+        executable: "{{ pnet_python }}"
+      register: pnet_candidate
+      check_mode: false
+      changed_when: false
+
+    - name: Decode candidate fingerprints
+      ansible.builtin.set_fact:
+        pnet_fingerprints: "{{ pnet_candidate.stdout | from_json }}"
+
+    - name: Give the daemon group read-only access to the candidate
+      ansible.builtin.file:
+        path: "{{ pnet_scratch.path }}"
+        group: "{{ pnet_group }}"
+        mode: "u=rwX,g=rX,o="
+        recurse: true
+      check_mode: false
+      changed_when: false
+
+    - name: Verify candidate with Veil as the daemon user
+      become_user: "{{ pnet_user }}"
+      ansible.builtin.command:
+        argv:
+          - "{{ pnet_cli }}"
+          - --config
+          - "{{ pnet_scratch.path }}/{{ pnet_config | basename }}"
+          - network
+          - check-membership
+          - --certificate
+          - "{{ pnet_scratch.path }}/candidate.cert"
+        chdir: "{{ pnet_working_dir }}"
+      environment: "{{ pnet_cli_environment }}"
+      register: pnet_verification
+      check_mode: false
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Require a valid local membership certificate
+      ansible.builtin.assert:
+        that: pnet_verification.rc == 0
+        fail_msg: >-
+          Membership validation failed on {{ inventory_hostname }}.
+          Check the selected certificate, owner pin and node identity
+          using veil-cli network check-membership with the intended config.
+
+    - name: Remember the verified candidate for this playbook run
+      ansible.builtin.set_fact:
+        pnet_verified: "{{ pnet_fingerprints }}"
+      when: not pnet_apply
+
+    - name: Install the verified configuration
+      when: pnet_apply
+      block:
+        - name: Reject changes since fleet preflight
+          ansible.builtin.assert:
+            that:
+              - pnet_verified is defined
+              - pnet_verified == pnet_fingerprints
+            fail_msg: "P-Net inputs changed since preflight. Run the playbook again."
+
+        - name: Read live configuration fingerprint before publication
+          ansible.builtin.stat:
+            path: "{{ pnet_config }}"
+            checksum_algorithm: sha256
+          register: pnet_live
+
+        - name: Require the validated live configuration
+          ansible.builtin.assert:
+            that:
+              - pnet_live.stat.isreg | default(false)
+              - pnet_live.stat.checksum == pnet_verified.source
+            fail_msg: "Live node configuration changed before publication."
+
+        - name: Install the certificate at its verified path
+          ansible.builtin.copy:
+            remote_src: true
+            src: "{{ pnet_scratch.path }}/candidate.cert"
+            dest: "{{ pnet_verified.certificate_path }}"
+            owner: "{{ pnet_user }}"
+            group: "{{ pnet_group }}"
+            mode: "0644"
+          diff: false
+
+        - name: Publish the validated node configuration
+          ansible.builtin.copy:
+            remote_src: true
+            src: "{{ pnet_scratch.path }}/{{ pnet_config | basename }}"
+            dest: "{{ pnet_config }}"
+            owner: "{{ pnet_live.stat.uid }}"
+            group: "{{ pnet_live.stat.gid }}"
+            mode: "{{ pnet_live.stat.mode }}"
+          diff: false
+          no_log: true
+
+        - name: Restart Veil with the verified configuration
+          ansible.builtin.systemd_service:
+            name: veil.service
+            state: restarted
+
+        - name: Wait for Veil readiness before the next host
+          ansible.builtin.uri:
+            url: "{{ pnet_metrics_url }}"
+            status_code: 200
+            use_proxy: false
+            follow_redirects: none
+          register: pnet_health
+          until: pnet_health.status == 200
+          retries: 30
+          delay: 1
+
+        - name: Restart optional chat service after Veil
+          ansible.builtin.systemd_service:
+            name: chat-node.service
+            state: restarted
+          failed_when: false
+  rescue:
+    - name: Record stage failure after which the rollout must halt
+      ansible.builtin.set_fact:
+        pnet_candidate_error: "{{ ansible_failed_task.name }}"
+  always:
+    - name: Remove private staging directory
+      ansible.builtin.file:
+        path: "{{ pnet_scratch.path }}"
+        state: absent
+      when: pnet_scratch.path is defined
+      check_mode: false
+      changed_when: false
+
+- name: Require this host to complete its checks before rollout can continue
+  ansible.builtin.assert:
+    that: pnet_candidate_error == ""
+    fail_msg: "P-Net stopped on {{ inventory_hostname }} at {{ pnet_candidate_error }}."

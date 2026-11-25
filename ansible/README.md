@@ -12,7 +12,7 @@ Playbooks for deploying and operating veil nodes.
 | `deploy-chat.yml` | Spawn `chat_node` mesh-load workers. Requires `/tmp/testnet-configs/manifest.json` (host → node_id map). |
 | `deploy-chaos-ban.yml` | Install `chaos-ban-cycler.service` for stress-testing handshake/auto-ban paths. |
 | `deploy-logrotate.yml` | Install logrotate config for `/var/log/veil/*.log`. |
-| `deploy-pnet.yml` | **P-Net rollout** — copies a membership cert + adds `[network]` config block + restarts in private mode. See [`docs/en/p-net.md`](../docs/en/p-net.md) or [`docs/ru/p-net.md`](../docs/ru/p-net.md). |
+| `deploy-pnet.yml` | **P-Net rollout** — verifies membership on the selected inventory, installs each verified candidate and restarts one host at a time. See [`docs/en/p-net.md`](../docs/en/p-net.md) or [`docs/ru/p-net.md`](../docs/ru/p-net.md). |
 | `revert-pnet.yml` | **P-Net rollback** — removes cert + `[network]` block + restarts in public mode. Inverse of `deploy-pnet.yml`. |
 | `deploy-ogate.yml` | **ogate rollout** — TUN-based virtual LAN over the veil. Renders per-host `/etc/ogate/ogate.toml` from `manifest.json` + an in-playbook IP map, installs binary + systemd unit, rolling `serial: 1`. See [`docs/en/ogate.md`](../docs/en/ogate.md) / [`docs/ru/ogate.md`](../docs/ru/ogate.md). |
 | `remove-chat.yml` | Stop + disable + remove `chat-node` service + config (inverse of `deploy-chat.yml`; leaves binary). |
