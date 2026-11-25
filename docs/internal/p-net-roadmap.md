@@ -1614,6 +1614,31 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   session and delivered 10 of 10 tunnel probes through an inbound-only
   entry point listed solely in `[[bootstrap_peers]]`.
 
+#### Cutting inter-site paths under load
+
+- The eight-node signed topology ran two site links, each with 30 ms of
+  one-way delay and 20 Mbit/s per direction. The test sent 125 UDP
+  datagrams per second and probed both IP families in both directions.
+  The default daemon session timers were used. The first fault dropped
+  all packets in both directions on one site link while its daemon
+  session was still registered and the other link stayed live.
+- The four directions returned their first tunnel replies 1.57–1.76 s
+  after the first cut. The first seven seconds delivered 834 of 868 UDP
+  datagrams. The surviving link then delivered 3,907 of 3,926 datagrams
+  in the measured steady window. An unacknowledged SDK exchange started
+  during the cut delivered 17 of 24 messages to one endpoint and all
+  24 to the other. A fresh exchange over the surviving link delivered
+  all 48 messages.
+- After the second link was cut, both active routed admissions expired
+  within 15.96 s with local gateway IPC still connected. Explicit IPv4
+  and IPv6 probes failed in both directions. All 1,002 UDP datagrams
+  submitted in the measured interval after expiry were denied.
+- Restoring one link produced fresh signed proofs in 6.80 s. Replies
+  resumed in 6.77–7.00 s, with the original endpoint daemons, ogate
+  processes and TUN interfaces. The recovered path delivered all 1,036
+  steady-window UDP datagrams and all 48 SDK messages. No duplicate UDP
+  delivery was observed. This test used emulated site links on Linux.
+
 #### Faster recovery after policy expiry
 
 - Subscribers keep the staggered 15 s cadence while a snapshot has ample
