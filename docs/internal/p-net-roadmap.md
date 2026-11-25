@@ -1054,6 +1054,18 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   after expiry and reopening. The store refused a macOS extended ACL
   grant on an otherwise owner-only directory. Linux and macOS unit tests
   cover the same signed format, concurrent updates, and unsafe state.
+- ogate reuses signature verification and parsed assignments when the
+  protected store contains the exact same signed bytes under its pinned
+  owner. Every read still checks the directory, lock and snapshot file,
+  decodes the recovery envelope, and syncs the directory. Changed bytes
+  go through signature and revision checks. Mirrors share the verified
+  bytes between concurrent responses. A macOS ARM64 comparison with
+  Ed25519 measured 524.7 to 77.5 µs per protected reload for a
+  217,260-byte snapshot with 4,096 assignments, and 75.0 to 47.5 µs for
+  one assignment. On Linux, a gateway with that snapshot already cached
+  withdrew its routes when the snapshot file became group-readable.
+  Restoring owner-only permissions restored bidirectional traffic on
+  the same TUN interface.
 - Signed-mode ogate obtains a local IPC witness from the daemon's active
   private gate. The daemon verifies its local membership before
   advertising the network ID, owner algorithm and public-key fingerprint.
@@ -1139,6 +1151,11 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 - The final build installed identical signed bytes on all 32 simultaneously
   active subscribers in 0.763 seconds. The mirror processed those requests
   in groups of one and thirty-one.
+- The exact-byte policy cache passed a repeat with 32 resuming
+  subscribers. All installed the same 217,260-byte snapshot within
+  0.831 s, with p95 of 0.820 s and mirror batches of one and thirty-one.
+  The concurrent tunnel probe received all 416 ICMP replies and the
+  paced TCP flow averaged 10.14 Mb/s.
 - A subscriber on the previous build fetched the same maximum-size
   policy from the new mirror over obfs4 after its earlier snapshot expired.
   It kept the installed revision after the mirror banned its device.

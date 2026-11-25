@@ -152,7 +152,7 @@ struct WaitingRequest {
 
 struct PublishedSnapshot {
     policy: Arc<VerifiedRoutePolicy>,
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
 }
 
 struct AuthorizedSnapshot {

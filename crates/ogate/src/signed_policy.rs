@@ -16,11 +16,18 @@ use crate::routing::NodeId;
 /// bridge instance. The revision floor survives IPC reconnects.
 pub(crate) struct SignedRoutes {
     config: SignedPolicyConfig,
-    last: Mutex<Option<Arc<VerifiedRoutePolicy>>>,
+    last: Mutex<Option<ObservedPolicy>>,
     updates: watch::Sender<u64>,
     pub mirrors: Vec<NodeId>,
     pub publish: bool,
     pub root: PnetTrustRoot,
+}
+
+#[derive(Clone)]
+struct ObservedPolicy {
+    policy: Arc<VerifiedRoutePolicy>,
+    /// Exact signed bytes most recently loaded for this revision and owner pin.
+    signed: Option<Arc<[u8]>>,
 }
 
 impl SignedRoutes {
@@ -50,26 +57,33 @@ impl SignedRoutes {
     }
 
     pub fn refresh(&self) -> anyhow::Result<Arc<VerifiedRoutePolicy>> {
-        let mut last = self
-            .last
-            .lock()
-            .map_err(|_| anyhow::anyhow!("signed policy state lock failed"))?;
-        let store = RoutePolicyStore::open(&self.config.state_dir)?;
-        match store.try_load(&self.policy_authority()) {
-            Ok(offered) => self.observe(&mut last, offered),
-            Err(StoreError::Busy) => last.clone().ok_or_else(|| StoreError::Busy.into()),
-            Err(error) => Err(error.into()),
-        }
+        Ok(self.reload(true)?.policy)
     }
 
-    pub fn installed_bytes(&self) -> anyhow::Result<(Arc<VerifiedRoutePolicy>, Vec<u8>)> {
+    pub fn installed_bytes(&self) -> anyhow::Result<(Arc<VerifiedRoutePolicy>, Arc<[u8]>)> {
+        let observed = self.reload(false)?;
+        let bytes = observed
+            .signed
+            .ok_or_else(|| anyhow::anyhow!("signed policy bytes are unavailable"))?;
+        Ok((observed.policy, bytes))
+    }
+
+    fn reload(&self, allow_busy_cache: bool) -> anyhow::Result<ObservedPolicy> {
         let mut last = self
             .last
             .lock()
             .map_err(|_| anyhow::anyhow!("signed policy state lock failed"))?;
         let store = RoutePolicyStore::open(&self.config.state_dir)?;
-        let (offered, bytes) = store.try_load_signed(&self.policy_authority())?;
-        Ok((self.observe(&mut last, offered)?, bytes))
+        let previous = last.as_ref().and_then(|policy| policy.signed.as_deref());
+        match store.try_load_signed_update(&self.policy_authority(), previous) {
+            Ok(Some((offered, bytes))) => {
+                self.observe(&mut last, offered, Some(bytes.into()))?;
+            }
+            Ok(None) => {}
+            Err(StoreError::Busy) if allow_busy_cache => {}
+            Err(error) => return Err(error.into()),
+        }
+        last.clone().ok_or_else(|| StoreError::Busy.into())
     }
 
     pub fn verify_offer(&self, bytes: &[u8]) -> anyhow::Result<VerifiedRoutePolicy> {
@@ -85,11 +99,11 @@ impl SignedRoutes {
             .lock()
             .map_err(|_| anyhow::anyhow!("signed policy state lock failed"))?;
         if let Some(accepted) = last.as_ref() {
-            require_monotonic(accepted, &verified)?;
+            require_monotonic(&accepted.policy, &verified)?;
         }
         let store = RoutePolicyStore::open(&self.config.state_dir)?;
         let accepted = store.try_accept(bytes, &self.policy_authority())?;
-        Ok(self.observe(&mut last, accepted)?.revision)
+        self.observe(&mut last, accepted, None)
     }
 
     pub fn updates(&self) -> watch::Receiver<u64> {
@@ -98,21 +112,29 @@ impl SignedRoutes {
 
     fn observe(
         &self,
-        last: &mut Option<Arc<VerifiedRoutePolicy>>,
+        last: &mut Option<ObservedPolicy>,
         offered: VerifiedRoutePolicy,
-    ) -> anyhow::Result<Arc<VerifiedRoutePolicy>> {
-        if let Some(accepted) = last.as_ref() {
-            require_monotonic(accepted, &offered)?;
-            if offered.revision == accepted.revision {
-                return Ok(Arc::clone(accepted));
+        signed: Option<Arc<[u8]>>,
+    ) -> anyhow::Result<u64> {
+        if let Some(accepted) = last.as_mut() {
+            require_monotonic(&accepted.policy, &offered)?;
+            if offered.revision == accepted.policy.revision {
+                if signed.is_some() {
+                    accepted.signed = signed;
+                }
+                return Ok(accepted.policy.revision);
             }
         }
-        let offered = Arc::new(offered);
-        *last = Some(Arc::clone(&offered));
+        let revision = offered.revision;
+        let expiry = offered.valid_until_unix;
+        *last = Some(ObservedPolicy {
+            policy: Arc::new(offered),
+            signed,
+        });
         // This notification carries only the expiry of a verified, durable
         // snapshot. The route task still reloads the protected store.
-        self.updates.send_replace(offered.valid_until_unix);
-        Ok(offered)
+        self.updates.send_replace(expiry);
+        Ok(revision)
     }
 
     pub fn authenticate(

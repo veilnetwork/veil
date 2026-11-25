@@ -162,6 +162,29 @@ impl RoutePolicyStore {
         self.load_synced(authority)
     }
 
+    /// Read and verify a changed snapshot without waiting for the state lock.
+    /// `None` means the stored signed bytes matched `previous` exactly. Pass
+    /// only bytes already verified under the same authority. The protected
+    /// read and directory sync still apply to unchanged snapshots.
+    pub fn try_load_signed_update(
+        &self,
+        authority: &RoutePolicyAuthority<'_>,
+        previous: Option<&[u8]>,
+    ) -> Result<Option<(VerifiedRoutePolicy, Vec<u8>)>, StoreError> {
+        let _lock = self.try_lock()?;
+        let stored = self.read_locked()?;
+        let updated = if previous == Some(stored.signed.as_slice()) {
+            None
+        } else {
+            Some((
+                verify_route_policy(&stored.signed, authority)?,
+                stored.signed,
+            ))
+        };
+        self.directory.sync_all()?;
+        Ok(updated)
+    }
+
     fn load_synced(
         &self,
         authority: &RoutePolicyAuthority<'_>,
@@ -804,6 +827,63 @@ mod tests {
         let (accepted, bytes) = store.try_load_signed(&authority).unwrap();
         assert_eq!(accepted.revision, 2);
         assert_eq!(bytes, next);
+    }
+
+    #[test]
+    fn unchanged_signed_bytes_still_require_a_safe_unlocked_store() {
+        let dir = directory();
+        let path = dir.path().canonicalize().unwrap();
+        let key = veil_crypto::generate_keypair(ALGORITHM);
+        let authority = RoutePolicyAuthority {
+            network_id: NETWORK,
+            algorithm: ALGORITHM,
+            public_key: &key.public_key,
+        };
+        let expiry = veil_util::unix_secs_now_u64() + 600;
+        let first = signed(&key, 1, expiry, 2);
+        let latest = signed(&key, 2, expiry, 3);
+        let store = RoutePolicyStore::open(&path).unwrap();
+        store.accept(&first, &authority, true).unwrap();
+        let (_, verified_bytes) = store
+            .try_load_signed_update(&authority, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(verified_bytes, first);
+        assert!(
+            store
+                .try_load_signed_update(&authority, Some(&verified_bytes))
+                .unwrap()
+                .is_none()
+        );
+
+        let lock = store.lock(false).unwrap();
+        assert!(matches!(
+            store.try_load_signed_update(&authority, Some(&verified_bytes)),
+            Err(StoreError::Busy)
+        ));
+        drop(lock);
+        let snapshot = path.join(SNAPSHOT_FILE);
+        fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            store.try_load_signed_update(&authority, Some(&verified_bytes)),
+            Err(StoreError::UnsafeFile(_))
+        ));
+        fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o600)).unwrap();
+        store.try_accept(&latest, &authority).unwrap();
+        let (updated, bytes) = store
+            .try_load_signed_update(&authority, Some(&verified_bytes))
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.revision, 2);
+        assert_eq!(bytes, latest);
+
+        let mut corrupted = bytes.clone();
+        *corrupted.last_mut().unwrap() ^= 1;
+        fs::write(&snapshot, corrupted).unwrap();
+        assert!(matches!(
+            store.try_load_signed_update(&authority, Some(&bytes)),
+            Err(StoreError::Policy(RoutePolicyError::Signature(_)))
+        ));
     }
 
     #[test]
