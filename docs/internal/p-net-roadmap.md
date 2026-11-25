@@ -410,6 +410,45 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   needs investigation on the shared host. In a separate mixed-version
   run with a pre-batch daemon and 34 entries, the tunnel passed traffic
   in both directions and withdrew the route 1.142 s after disconnect.
+- Matching each chat sequence to its send time in the overloaded repeat
+  tied the high latencies to receive backlog on the transport shared with
+  the second UDP flow. For messages towards the hub that took at least
+  100 ms, the median peak receive queue within 125 ms of send was 357 kB
+  in the control and 1,032 kB with the early check. For messages taking
+  at most 30 ms, it was zero in both. Hub daemon threads also accumulated
+  more runnable wait during the high-latency periods. The control recorded
+  a median of 128 timed lookups per second in both latency groups, timing
+  one lookup in 32. The contribution of the early admission check to the
+  queue growth remains unresolved.
+- A transport pair held the authenticated identities, binaries, 24
+  disjoint 4,096-entry tables, and two 32 Mb/s UDP flows constant. The
+  first TCP sample lost 11,034 of 166,003 datagrams, including 94 drops
+  counted at receiving UDP sockets. Hub TCP receive queues exceeded
+  1 MB on both flows. The TCP repeat on the same sessions delivered all
+  166,926 datagrams, with receive queues below 32 kB. The hub recorded a
+  median of 128 timed lookups per second in both TCP samples, timing one
+  lookup in 32.
+- The first QUIC sample lost 526 of 166,982 UDP datagrams, matching the
+  local drops reported by the receiving application sockets on both
+  flows. These socket counters are independent of the TUN capture, which
+  also lost observations. The QUIC repeat delivered all 167,276 datagrams.
+  Both transports delivered all 200 SDK chat messages per sample. In the
+  first samples TCP and QUIC chat p99 towards the hub were 486 and 43 ms.
+  In the opposite direction they were 132 and 15 ms. In the repeats they
+  were 0.79 and 1.06 ms towards the hub, and 1.20 and 1.68 ms from the hub.
+  The QUIC trace recorded established parallel children and received
+  datagrams. Both transports used the existing private membership checks.
+- A reverse-order cold pair disabled runtime traces and admission timing.
+  QUIC delivered all 166,983 UDP datagrams and TCP all 167,275. Each
+  delivered all 200 chat messages. QUIC chat p99 was 23.95 ms towards
+  the hub and 23.82 ms in reverse. The TCP p99 was 2.65 and 2.23 ms.
+  Cold TCP congestion varied across the pairs. These short runs on one
+  two-vCPU host leave the effect of tracing and the transport choice
+  under reproducible saturation open.
+- A mixed-version QUIC pair with the pre-batch daemon used the legacy
+  single-peer admission query and passed real TUN traffic both ways.
+  Both directions delivered all 24 SDK chat messages. The current side
+  withdrew the route 1.404 s after the legacy session disconnected.
 - A separate cold start ran the first end-to-end probes in groups of
   four before opening the UDP flows. All 24 paths answered in 12.52 s.
   The following 38 s sample lost 76 of 137,175 UDP datagrams, with one
