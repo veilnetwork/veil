@@ -36,8 +36,8 @@ use crate::traits::FrameRouter;
 use crate::transport_cache::TransportCache;
 use veil_proto::codec::encode_header;
 use veil_proto::discovery::{
-    FindNodeV2Payload, FindNodeV2Response, FindValuePayload, ResolveTransportPayload,
-    ResolveTransportResponse,
+    FindNodeV2Payload, FindNodeV2Response, FindValuePayload, FindValueResponse,
+    ResolveTransportPayload, ResolveTransportResponse,
 };
 use veil_proto::family::{DiscoveryMsg, FrameFamily};
 use veil_proto::header::FrameHeader;
@@ -238,6 +238,20 @@ impl NetworkPeerQuerier {
         self.build_frame(DiscoveryMsg::FindValue, request_id, body)
     }
 
+    pub(crate) async fn find_value_reply(
+        &self,
+        peer_id: [u8; 32],
+        key: [u8; 32],
+    ) -> Option<FindValueResponse> {
+        let request_id = next_global_request_id();
+        let frame = self.build_find_value_frame(request_id, key);
+        let rx = self.outbox.send_request(peer_id, request_id, frame)?;
+        let Ok(Ok(Some(body))) = timeout(self.find_node_timeout, rx).await else {
+            return None;
+        };
+        FindValueResponse::decode(&body).ok()
+    }
+
     /// Send `ResolveTransport(node_id)` to `peer_id`; return the
     /// **verified** transport URL on success, `None` on timeout
     /// decode error, `not_found` reply, OR signature-verification
@@ -382,32 +396,15 @@ impl PeerQuerier for NetworkPeerQuerier {
         key: [u8; 32],
     ) -> Pin<Box<dyn Future<Output = FindValueResult> + Send + 'a>> {
         Box::pin(async move {
-            let request_id = next_global_request_id(); // see find_node for id-uniqueness rationale
-            let frame = self.build_find_value_frame(request_id, key);
-
-            let Some(rx) = self.outbox.send_request(peer_id, request_id, frame) else {
-                return FindValueResult::Nodes(vec![]);
-            };
-
-            let t = self.find_node_timeout;
-            match timeout(t, rx).await {
-                Ok(Ok(Some(body))) => {
-                    use veil_proto::discovery::FindValueResponse;
-                    match FindValueResponse::decode(&body) {
-                        Ok(FindValueResponse::Value(v)) => FindValueResult::Value(v),
-                        Ok(FindValueResponse::Nodes(nodes)) => {
-                            // C-06: the response now carries node_ids only (no
-                            // transports). Resolve each to a reachable Contact
-                            // via the PoW-gated ResolveTransport path, exactly
-                            // as find_node does — so the walk can still dial on.
-                            let node_ids: Vec<[u8; 32]> =
-                                nodes.into_iter().map(|n| n.node_id).collect();
-                            FindValueResult::Nodes(self.resolve_node_ids(peer_id, node_ids).await)
-                        }
-                        Err(_) => FindValueResult::Nodes(vec![]),
-                    }
+            match self.find_value_reply(peer_id, key).await {
+                Some(FindValueResponse::Value(v)) => FindValueResult::Value(v),
+                Some(FindValueResponse::Nodes(nodes)) => {
+                    // The walk uses PoW-gated transport lookups for the
+                    // node IDs returned in a referral list.
+                    let node_ids = nodes.into_iter().map(|node| node.node_id).collect();
+                    FindValueResult::Nodes(self.resolve_node_ids(peer_id, node_ids).await)
                 }
-                _ => FindValueResult::Nodes(vec![]),
+                None => FindValueResult::Nodes(vec![]),
             }
         })
     }

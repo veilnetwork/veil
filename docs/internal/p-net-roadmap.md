@@ -951,6 +951,41 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   places transport resolution proof-of-work among the active paths. The
   sample counts instruction addresses in the executing functions.
 
+#### ResolveTransport work during startup lookups
+
+- A prototype shared mining across simultaneous DHT queries for one
+  requester and target in the same time bucket. An ARM64 process test
+  sent 64 queries through separate queriers. The mock responder checked
+  every proof and unique request ID. With eight targets in the same
+  bucket, process CPU time dropped from 270 to 30 ms. With 64 distinct
+  targets both builds used 340 ms of CPU time.
+- Two alternating 48-session Linux ARM64 pairs offered 167,272 UDP
+  datagrams each at two times 32 Mb/s. The 46 other peer containers
+  used 12.53 and 13.42 CPU-seconds in the first ten seconds of the
+  controls and 13.03 and 12.42 with the shared proof jobs. The two
+  losses were 30,126 and 34,304 in the controls and 34,289 and
+  30,486 with sharing. Chat p99 towards the hub went from 1,077 to
+  258 ms and from 443 to 549 ms. In the return direction it went from
+  131 to 170 ms and from 156 to 192 ms. All 200 SDK messages arrived
+  in every run. The prototype was set aside after those results.
+- A direct `FIND_VALUE` for a connected peer's relay-directory record
+  now returns a miss as soon as the peer responds with referrals.
+  Previously it resolved their addresses before discarding the list.
+  The iterative walk still resolves the referrals it uses. A regression
+  test verified one request on a miss and value delivery on a hit.
+- With anonymity relaying disabled on the 48-session cold stand, the
+  single-hop change delivered all 200 SDK messages in both pairs. UDP
+  losses went from 31,046 to 28,184 and from 33,287 to 28,111. Chat
+  p99 towards the hub went from 892 to 2,055 ms and from 781 to
+  974 ms. The congestion on this stand remains open. The one-hop
+  regression test covers the avoided requests for a relay-directory
+  miss.
+- A separate Linux ARM64 run paired the one-hop build with a pre-batch
+  daemon and 34 configured routes. All 48 SDK messages arrived exactly
+  once. The bridge removed the route 0.863 s after disconnect and
+  passed bidirectional TUN probes 0.556 s after readmission on the same
+  interfaces.
+
 #### xVeil text delivery on a shared gateway
 
 - A two-vCPU Linux ARM64 hub served 24 gateways with disjoint 4,096-entry

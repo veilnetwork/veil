@@ -1743,7 +1743,6 @@ impl KademliaService {
         if peer_id == self.local_node_id() {
             return None;
         }
-        use crate::iterative::{FindValueResult, PeerQuerier};
         let timeout = Duration::from_millis(self.dht_config.find_node_timeout_ms);
         let querier = super::network_querier::NetworkPeerQuerier::with_cache(
             Arc::clone(&outbox),
@@ -1752,8 +1751,8 @@ impl KademliaService {
             Arc::clone(&self.transport_cache),
             self.local_node_id(),
         );
-        match querier.find_value(peer_id, key).await {
-            FindValueResult::Value(v) => {
+        match querier.find_value_reply(peer_id, key).await {
+            Some(FindValueResponse::Value(v)) => {
                 log::info!(
                     "dht.find_value_from_peer peer={} VALUE len={}",
                     veil_util::hex_short(&peer_id),
@@ -1761,7 +1760,7 @@ impl KademliaService {
                 );
                 Some(v)
             }
-            FindValueResult::Nodes(n) => {
+            Some(FindValueResponse::Nodes(n)) => {
                 log::info!(
                     "dht.find_value_from_peer peer={} NODES n={} (no value)",
                     veil_util::hex_short(&peer_id),
@@ -1769,6 +1768,7 @@ impl KademliaService {
                 );
                 None
             }
+            None => None,
         }
     }
 
@@ -2849,6 +2849,50 @@ mod tests {
             .find_value_from_peer(me, [0x42u8; 32], Arc::new(PanicRouter))
             .await;
         assert!(got.is_none(), "self query must short-circuit to None");
+    }
+
+    #[tokio::test]
+    async fn find_value_from_peer_does_not_resolve_referrals() {
+        struct OneHopReply(FindValueResponse);
+        impl FrameRouter for OneHopReply {
+            fn send_request(
+                &self,
+                peer: [u8; 32],
+                request_id: u32,
+                frame: Vec<u8>,
+            ) -> Option<tokio::sync::oneshot::Receiver<Option<Vec<u8>>>> {
+                use veil_proto::{HEADER_SIZE, codec, family::DiscoveryMsg};
+
+                assert_eq!(peer, [2; 32]);
+                let header = codec::decode_header(&frame[..HEADER_SIZE]).unwrap();
+                assert_eq!(header.request_id, request_id);
+                assert_eq!(header.msg_type, DiscoveryMsg::FindValue as u16);
+                let (send, receive) = tokio::sync::oneshot::channel();
+                send.send(Some(self.0.encode())).unwrap();
+                Some(receive)
+            }
+
+            fn peer_ids(&self) -> Vec<[u8; 32]> {
+                vec![[2; 32]]
+            }
+        }
+
+        let svc = make_test_kademlia_service([1; 32]);
+        let referral = veil_proto::discovery::NodeContact {
+            node_id: [3; 32],
+            transport: String::new(),
+        };
+        let router = Arc::new(OneHopReply(FindValueResponse::Nodes(vec![referral])));
+        assert_eq!(
+            svc.find_value_from_peer([2; 32], [4; 32], router).await,
+            None
+        );
+
+        let router = Arc::new(OneHopReply(FindValueResponse::Value(vec![5])));
+        assert_eq!(
+            svc.find_value_from_peer([2; 32], [4; 32], router).await,
+            Some(vec![5])
+        );
     }
 
     #[test]
