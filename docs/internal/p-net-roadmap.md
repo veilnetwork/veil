@@ -1671,11 +1671,31 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   reconnect catch-up. The revoked TUN path stopped in both directions,
   the unrevoked path stayed available, and all 48 SDK messages arrived
   exactly once.
-- If a local session queue is full, the replication task retries for the
-  same authenticated session up to three times within 15 seconds. Each
-  retry checks the current signed record and the session again. The retry
-  queue holds at most 256 entries and uses at most four of the eight
-  sends per tick.
+- Live-session forwarding runs separately from the DHT task that awaits
+  iterative lookups. If a local session queue is full, forwarding retries
+  for the same authenticated session with a delay that grows from one to
+  15 seconds. Each retry checks the current signed record and session. The
+  retry queue holds at most 256 entries and uses at most four of the eight
+  sends per tick. At capacity, a new failure replaces the retry with the
+  longest backoff. The evicted record remains eligible for ordinary DHT
+  republication. A regression held a real session queue full for 29
+  simulated seconds. A second session received its retry while the first
+  was backed off. The first received the ban on the next due retry.
+- A six-node Linux ARM64 stand used a two-second DHT republish interval,
+  a four-second added delay on traffic from a side neighbor of the middle
+  forwarder, and a configuration reload on that forwarder before the ban.
+  With `e4a8e516`, the enforcement node three sessions from the issuer
+  still admitted the revoked peer at the 25.19 s sample. With the separate
+  forwarding task, it denied admission by the 1.19 s sample. The revoked
+  tunnel stopped in both directions after the artificial delay was
+  removed. The unrevoked pair received all 120 concurrent tunnel probes
+  and 48 SDK messages exactly once.
+- In a five-node mixed-version run with the default DHT schedule, the
+  previous Veil v0.11.59 daemon issued the ban. Three sessions away,
+  the enforcement node denied admission by the 3.19 s sample and the
+  revoked tunnel stopped in both directions. The pair spanning the old
+  and new daemons received all 120 tunnel probes and 48 SDK messages
+  exactly once while the ban propagated.
 
 #### Enforcing revocations on relayed application datagrams
 

@@ -22,8 +22,8 @@ const BAN_CATCH_UP_MAX_CHECKS: usize = 32;
 const BAN_CATCH_UP_MAX_RECIPIENTS: usize = 8;
 const BAN_RETRY_PER_TICK: usize = BAN_CATCH_UP_MAX_RECIPIENTS / 2;
 const BAN_RETRY_CAPACITY: usize = 256;
-const BAN_RETRY_ATTEMPTS: u8 = 3;
-const BAN_RETRY_LIFETIME: Duration = Duration::from_secs(15);
+const BAN_RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const BAN_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(15);
 
 type SessionRegistration = ([u8; 32], [u8; 32]);
 
@@ -36,8 +36,8 @@ struct BanReplicaBatch<'a> {
 struct BanRetry {
     key: [u8; 32],
     registration: SessionRegistration,
-    deadline: Instant,
-    attempts_left: u8,
+    next_due: Instant,
+    backoff: Duration,
 }
 
 #[derive(Default)]
@@ -158,19 +158,30 @@ impl BanCatchUp {
     }
 
     fn defer_full_queue(&mut self, key: [u8; 32], registration: SessionRegistration, now: Instant) {
-        if self.retries.len() < BAN_RETRY_CAPACITY
-            && !self
+        if self
+            .retries
+            .iter()
+            .any(|retry| retry.key == key && retry.registration == registration)
+        {
+            return;
+        }
+        if self.retries.len() == BAN_RETRY_CAPACITY {
+            // Persistent congestion must leave room for new failures. The
+            // evicted record is still eligible for ordinary DHT republishing.
+            let (index, _) = self
                 .retries
                 .iter()
-                .any(|retry| retry.key == key && retry.registration == registration)
-        {
-            self.retries.push_back(BanRetry {
-                key,
-                registration,
-                deadline: now + BAN_RETRY_LIFETIME,
-                attempts_left: BAN_RETRY_ATTEMPTS,
-            });
+                .enumerate()
+                .max_by_key(|(_, retry)| (retry.backoff, retry.next_due))
+                .expect("retry queue at capacity");
+            self.retries.remove(index);
         }
+        self.retries.push_back(BanRetry {
+            key,
+            registration,
+            next_due: now + BAN_RETRY_INITIAL_BACKOFF,
+            backoff: BAN_RETRY_INITIAL_BACKOFF,
+        });
     }
 
     fn send_next_batch(
@@ -205,15 +216,16 @@ impl BanCatchUp {
         senders: &RwLock<SessionTxRegistry>,
         now: Instant,
     ) -> (usize, u64) {
-        self.retries.retain(|retry| retry.deadline > now);
-        let attempts = self.retries.len().min(BAN_RETRY_PER_TICK);
+        let mut attempts = 0;
         let mut sent = 0;
-        // Use the length at entry so a still-full queue is tried at most
-        // once in this tick. New publications share the remaining budget.
-        for _ in 0..attempts {
-            let Some(mut retry) = self.retries.pop_front() else {
+        // A backed-off peer must not block work for other sessions. Due
+        // entries rotate to the tail, and new publications use spare slots.
+        for _ in 0..BAN_RETRY_PER_TICK {
+            let Some(index) = self.retries.iter().position(|retry| retry.next_due <= now) else {
                 break;
             };
+            let mut retry = self.retries.remove(index).expect("retry index exists");
+            attempts += 1;
             let Some(value) = dht.peek_value(&retry.key) else {
                 continue;
             };
@@ -222,8 +234,9 @@ impl BanCatchUp {
             };
             match send_ban_replica(dht, bans, senders, &retry.registration, frame) {
                 Ok(()) => sent += 1,
-                Err(SendToError::Full) if retry.attempts_left > 1 => {
-                    retry.attempts_left -= 1;
+                Err(SendToError::Full) => {
+                    retry.backoff = (2 * retry.backoff).min(BAN_RETRY_MAX_BACKOFF);
+                    retry.next_due = now + retry.backoff;
                     self.retries.push_back(retry);
                 }
                 Err(_) => {}
@@ -450,6 +463,60 @@ impl NodeRuntime {
         true
     }
 
+    pub(super) fn spawn_p_net_ban_forwarding(&mut self) {
+        let (Some(shutdown_tx), Some(gate)) = (&self.shutdown_tx, &self.network_gate) else {
+            return;
+        };
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let network_id = gate.expected_network_id;
+        let dht = Arc::clone(&self.dht);
+        let bans = Arc::clone(&self.ban_list);
+        let session_outbox = Arc::clone(&self.session_outbox);
+        let session_senders = Arc::clone(&self.session_tx_registry);
+        let metrics = self.metrics.clone();
+        let logger = Arc::clone(&self.logger);
+        // Forwarding over live private sessions must keep ticking while the
+        // general DHT republisher awaits iterative network lookups.
+        let handle = supervised_spawn(
+            Arc::clone(&self.logger),
+            "p_net_ban_forwarding",
+            async move {
+                let mut catch_up = BanCatchUp::default();
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let record_sent = |event, sent| {
+                    if sent > 0 {
+                        if let Some(m) = &metrics {
+                            m.add_replicas_published(sent);
+                        }
+                        logger.info(event, format!("replicas_sent={sent}"));
+                    }
+                };
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        result = shutdown_rx.changed() => {
+                            if result.is_err() || *shutdown_rx.borrow() { break; }
+                        }
+                        _ = tick.tick() => {
+                            let now = Instant::now();
+                            catch_up.observe_sessions(&dht, &session_outbox, &bans, &network_id, now);
+                            let (attempts, retried) = catch_up.retry_full_queues(&dht, &bans, &session_senders, now);
+                            record_sent("network.ban.retry", retried);
+                            if let Some((event, sent)) = catch_up.send_next_batch(
+                                &dht, &bans, &session_senders, BAN_CATCH_UP_MAX_RECIPIENTS - attempts, now,
+                            ) {
+                                record_sent(event, sent);
+                            }
+                        }
+                    }
+                }
+            },
+        );
+        lock_tasks(&self.tasks).sessions.push(handle);
+    }
+
     pub fn spawn_dht_republish_task(&mut self, republish_interval: std::time::Duration) {
         let Some(shutdown_tx) = &self.shutdown_tx else {
             return;
@@ -457,9 +524,7 @@ impl NodeRuntime {
         let mut shutdown_rx = shutdown_tx.subscribe();
         let dht = Arc::clone(&self.dht);
         let network_gate = self.network_gate.clone();
-        let bans = Arc::clone(&self.ban_list);
         let session_outbox = Arc::clone(&self.session_outbox);
-        let session_senders = Arc::clone(&self.session_tx_registry);
         let metrics = self.metrics.clone();
         let logger = Arc::clone(&self.logger);
         // Poked by the suspension detector — see the select arm below.
@@ -467,7 +532,6 @@ impl NodeRuntime {
         let handle = supervised_spawn(Arc::clone(&self.logger), "dht_republish", async move {
             let interval = republish_interval;
             let mut scheduler = veil_dht::republish::RepublishScheduler::new();
-            let mut ban_catch_up = BanCatchUp::default();
             let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(1));
             tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -489,31 +553,6 @@ impl NodeRuntime {
                         scheduler = veil_dht::republish::RepublishScheduler::new();
                     }
                     _ = tick_interval.tick() => {
-                        if let Some(gate) = &network_gate {
-                            let now = Instant::now();
-                            ban_catch_up.observe_sessions(
-                                &dht, &session_outbox, &bans, &gate.expected_network_id, now,
-                            );
-                            let (attempts, retried) = ban_catch_up.retry_full_queues(
-                                &dht, &bans, &session_senders, now,
-                            );
-                            if retried > 0 {
-                                if let Some(m) = &metrics {
-                                    m.add_replicas_published(retried);
-                                }
-                                logger.info("network.ban.retry", format!("replicas_sent={retried}"));
-                            }
-                            if let Some((event, sent)) = ban_catch_up.send_next_batch(
-                                &dht, &bans, &session_senders, BAN_CATCH_UP_MAX_RECIPIENTS - attempts, now,
-                            ) {
-                                if sent > 0 {
-                                    if let Some(m) = &metrics {
-                                        m.add_replicas_published(sent);
-                                    }
-                                    logger.info(event, format!("replicas_sent={sent}"));
-                                }
-                            }
-                        }
                         // audit cycle-7 M4: enumerate KEYS only (32 B each) and
                         // fetch values lazily for the few keys actually due
                         // this tick. The previous `stored_entries()` pulled
@@ -613,10 +652,9 @@ mod tests {
     };
 
     use super::{
-        BAN_CATCH_UP_COOLDOWN, BAN_CATCH_UP_MAX_RECIPIENTS, BAN_RETRY_ATTEMPTS, BAN_RETRY_CAPACITY,
-        BAN_RETRY_LIFETIME, BAN_RETRY_PER_TICK, BanCatchUp, BanList, Duration, Instant,
-        KademliaService, Mutex, NetworkAccessGate, NodeRuntime, RwLock, SessionOutbox,
-        SessionTxRegistry, republishable_record_at,
+        BAN_CATCH_UP_COOLDOWN, BAN_CATCH_UP_MAX_RECIPIENTS, BAN_RETRY_CAPACITY, BAN_RETRY_PER_TICK,
+        BanCatchUp, BanList, Duration, Instant, KademliaService, Mutex, NetworkAccessGate,
+        NodeRuntime, RwLock, SessionOutbox, SessionTxRegistry, republishable_record_at,
     };
 
     struct TestGate;
@@ -728,16 +766,18 @@ mod tests {
     }
 
     #[test]
-    fn a_full_session_queue_retries_the_signed_ban_when_it_drains() {
+    fn a_session_queue_that_stays_full_sends_the_ban_once_it_drains() {
         let key = [7; 32];
         let peer = [8; 32];
         let owner = [9; 32];
+        let ready_peer = ([10; 32], [11; 32]);
         let mut dht = KademliaService::new([100; 32]);
         dht.set_network_auth_gate(std::sync::Arc::new(TestGate));
         dht.store_local(key, b"PBAN-verified".to_vec());
         let bans = Mutex::new(BanList::new());
         let mut senders = SessionTxRegistry::with_capacity(1);
         let mut rx = senders.register_owned(peer, owner);
+        let mut ready_rx = senders.register_owned(ready_peer.0, ready_peer.1);
         senders
             .send_to_owned_result(&peer, &owner, priority::INTERACTIVE, b"busy".to_vec())
             .unwrap();
@@ -754,15 +794,24 @@ mod tests {
         assert_eq!(catch_up.retries.len(), 1);
         catch_up.defer_full_queue(key, (peer, owner), now);
         let tick = Duration::from_secs(1);
+        for second in 1..29 {
+            let due = matches!(second, 1 | 3 | 7 | 15);
+            assert_eq!(
+                catch_up.retry_full_queues(&dht, &bans, &senders, now + second * tick),
+                (usize::from(due), 0),
+            );
+        }
+        // A backed-off entry at the front does not delay a due entry behind it.
+        catch_up.defer_full_queue(key, ready_peer, now + 28 * tick);
         assert_eq!(
-            catch_up.retry_full_queues(&dht, &bans, &senders, now + tick),
-            (1, 0)
+            catch_up.retry_full_queues(&dht, &bans, &senders, now + 29 * tick),
+            (1, 1)
         );
-        assert_eq!(catch_up.retries[0].attempts_left, BAN_RETRY_ATTEMPTS - 1);
+        assert_eq!(ready_rx.try_recv().unwrap().0, priority::BACKGROUND);
         assert_eq!(rx.try_recv().unwrap().1.as_ref(), b"busy");
 
         assert_eq!(
-            catch_up.retry_full_queues(&dht, &bans, &senders, now + 2 * tick),
+            catch_up.retry_full_queues(&dht, &bans, &senders, now + 30 * tick),
             (1, 1)
         );
         let (prio, frame) = rx.try_recv().unwrap();
@@ -800,21 +849,6 @@ mod tests {
         assert!(catch_up.retries.is_empty());
         assert!(rx.try_recv().is_err());
 
-        senders
-            .read()
-            .unwrap()
-            .send_to_owned_result(&peer, &owner, priority::INTERACTIVE, b"busy".to_vec())
-            .unwrap();
-        catch_up.defer_full_queue(key, (peer, owner), now);
-        for attempt in 1..=u32::from(BAN_RETRY_ATTEMPTS) {
-            assert_eq!(
-                catch_up.retry_full_queues(&dht, &bans, &senders, now + attempt * tick),
-                (1, 0)
-            );
-        }
-        assert!(catch_up.retries.is_empty());
-        rx.try_recv().unwrap();
-
         catch_up.defer_full_queue(key, (peer, owner), now);
         dht.store_local(key, b"PBAN-invalid".to_vec());
         assert_eq!(
@@ -824,21 +858,29 @@ mod tests {
         assert!(catch_up.retries.is_empty());
         assert!(rx.try_recv().is_err());
 
-        for i in 0..=BAN_RETRY_CAPACITY {
+        for i in 0..BAN_RETRY_CAPACITY {
             let mut distinct_key = key;
             distinct_key[..2].copy_from_slice(&(i as u16).to_le_bytes());
             catch_up.defer_full_queue(distinct_key, (peer, owner), now);
         }
         assert_eq!(catch_up.retries.len(), BAN_RETRY_CAPACITY);
+        // A newer ban remains eligible even when a stalled session has
+        // already filled every slot. Its retry is independent of the old work.
+        let new_key = [42; 32];
+        catch_up.retries[0].backoff *= 2;
+        let evicted = catch_up.retries[0].key;
+        catch_up.defer_full_queue(new_key, (peer, owner), now);
+        assert_eq!(catch_up.retries.len(), BAN_RETRY_CAPACITY);
+        assert!(catch_up.retries.iter().all(|retry| retry.key != evicted));
+        assert_eq!(catch_up.retries.back().unwrap().key, new_key);
         assert_eq!(
             catch_up.retry_full_queues(&dht, &bans, &senders, now + tick),
             (BAN_RETRY_PER_TICK, 0)
         );
         assert_eq!(
-            catch_up.retry_full_queues(&dht, &bans, &senders, now + BAN_RETRY_LIFETIME),
-            (0, 0)
+            catch_up.retries.len(),
+            BAN_RETRY_CAPACITY - BAN_RETRY_PER_TICK
         );
-        assert!(catch_up.retries.is_empty());
     }
 
     #[test]

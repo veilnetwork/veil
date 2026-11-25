@@ -290,6 +290,7 @@ impl NodeRuntime {
             }
         });
         lock_tasks(&self.tasks).sessions.push(handle);
+        self.spawn_p_net_ban_forwarding();
     }
 }
 
