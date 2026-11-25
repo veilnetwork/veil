@@ -12,6 +12,10 @@
 - Withdraw stale relay routes, steer ordered private traffic around a congested hop, and pace its return. Peers negotiate the optional congestion signal and can continue to use the established framing.
 - In an emulated two-link Linux test, tunnel replies returned within 1.8 s after the first link was cut. Losing both links expired routed admission in 16 s. Restoring one link recovered both IP families in about 7 s. Unacknowledged SDK messages sent during the interruption can be lost.
 
+### Security
+
+- Update `etherparse` to 0.20.4 to address RUSTSEC-2026-0596.
+
 ## v0.11.59 — 2026-11-24
 
 ### Fixed
