@@ -444,7 +444,7 @@ impl NodeRuntime {
             let handle = supervised_spawn(
                 Arc::clone(&self.logger),
                 "p_net_received_ban_storage",
-                writer.run(shutdown_tx.subscribe()),
+                writer.run(Arc::clone(&self.dht), shutdown_tx.subscribe()),
             );
             lock_tasks(&self.tasks).sessions.push(handle);
         }
@@ -796,6 +796,9 @@ mod tests {
         let (dir, mut config) = admin_fixture(veil_cfg::NetworkMode::PrivateConfigured);
         let config_path = dir.path().join("node.toml");
         let snapshot = dir.path().join("dht-values.json");
+        let log_file = dir.path().join("daemon.log");
+        config.global.logs = veil_cfg::LogsConfig::File;
+        config.global.log_file = Some(log_file.to_string_lossy().into_owned());
         config.persist_enabled = true;
         config.dht.values_persist_path = Some(snapshot.to_string_lossy().into_owned());
         std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
@@ -807,6 +810,7 @@ mod tests {
         let file = receiver_store.join(format!("{}.pban", veil_util::bytes_to_hex(&key)));
 
         let mut runtime = NodeRuntime::start(&config_path, true).await.unwrap();
+        std::fs::write(&receiver_store, b"temporary storage collision").unwrap();
         let _receiver = wlock!(runtime.session_tx_registry).register(target);
         runtime
             .dht
@@ -815,12 +819,23 @@ mod tests {
         assert!(lock!(runtime.ban_list).is_banned(&target));
         assert!(!veil_util::rlock!(runtime.session_tx_registry).has_session(&target));
         tokio::time::timeout(Duration::from_secs(5), async {
+            while !std::fs::read_to_string(&log_file)
+                .unwrap()
+                .contains("network.ban.received_storage.failed")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first disk write should fail");
+        std::fs::remove_file(&receiver_store).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
             while !file.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("received ban should be written by the background worker");
+        .expect("the writer should retry without another network STORE");
         let mut bytes = std::fs::read(&file).unwrap();
         assert_eq!(&bytes[12..], &record);
         runtime.stop().await.unwrap();

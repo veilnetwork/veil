@@ -1743,6 +1743,21 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   re-admitted the peer and its tunnel recovered within 1.31 s after
   readmission. The unaffected pair received all 200 tunnel probes and
   48 SDK messages in both runs.
+- A full write queue or a disk write error now leaves a pending entry
+  keyed by DHT key and record fingerprint. The writer loads up to 32
+  due entries per second, verifies the current signed copy against the
+  active network authority, and keeps the original receipt time.
+  Repeated write failures increase the retry interval from one second
+  to at most 30 seconds. Retry metadata shares the ban-list size cap.
+- On the five-node Linux ARM64 chain, both builds immediately denied
+  admission after receiving a ban while the receiver could not write.
+  The test stopped the receiver's source and restored disk access.
+  The updated receiver saved the record by the 1.14 s sample and
+  restored it before listening after a `SIGKILL`. Both tunnel
+  directions stayed blocked. The `4283ea12` control had no saved
+  copy at six seconds and re-admitted the peer after restart. The
+  unaffected pair delivered 200 tunnel probes and 48 SDK messages
+  in each run.
 
 #### Enforcing revocations on relayed application datagrams
 

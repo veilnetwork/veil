@@ -207,12 +207,14 @@ allowlist before restoring its records on startup.
 With the same settings, a receiver applies a verified ban immediately
 and queues it for the background writer. Completed copies are in
 `<snapshot-name>.pnet-received-bans`, recorded in the log as
-`network.ban.received_storage.saved`. On restart the receiver rechecks
-the signature and administrator authorization and uses the original
-receipt time for the remaining DHT lifetime. The background writer
-removes expired copies. A process crash before the write completes can
-still lose the local copy. The receiver can recover it from the DHT
-snapshot or another participant.
+`network.ban.received_storage.saved`. If the write queue is full or a
+write fails, the background writer can retry using the matching signed
+record in the local DHT. On restart the receiver rechecks the signature
+and administrator authorization and uses the original receipt time
+for the remaining DHT lifetime. The background writer removes expired
+copies. A process crash before the write completes can still lose the
+local copy. The receiver can recover it from the DHT snapshot or
+another participant.
 
 `veil-cli node reload` also carries live signed bans into the rebuilt
 DHT in memory. It preserves their original DHT lifetime.

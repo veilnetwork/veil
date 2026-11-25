@@ -1,6 +1,6 @@
 //! Persistence for verified P-Net bans received over the network.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -8,8 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 use veil_dht::NetworkAuthGate as _;
-use veil_dht::kademlia::{DEFAULT_TTL, DhtValueSnapshot};
+use veil_dht::kademlia::{DEFAULT_TTL, DhtValueSnapshot, KademliaService};
 use veil_identity::network_access::NetworkAccessGate;
 use veil_identity::network_ban::{MAX_BAN_BLOB_SIZE, decode_ban_blob};
 use veil_observability::NodeLogger;
@@ -23,6 +24,8 @@ use super::issued_bans::{
 const QUEUE_CAPACITY: usize = 256;
 const BATCH_SIZE: usize = 32;
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(120);
+const FIRST_RETRY: Duration = Duration::from_secs(1);
+const MAX_RETRY: Duration = Duration::from_secs(30);
 const RECEIVED_MAGIC: &[u8; 4] = b"PBR1";
 const TIMESTAMP_LEN: usize = 8;
 const FILE_LIMIT: usize = RECEIVED_MAGIC.len() + TIMESTAMP_LEN + MAX_BAN_BLOB_SIZE;
@@ -35,14 +38,104 @@ pub(super) fn storage_dir(config: &veil_cfg::Config) -> Option<PathBuf> {
 struct Receipt {
     key: [u8; 32],
     value: Vec<u8>,
+    stamp: ReceiptStamp,
+    next_backoff: Duration,
+}
+
+struct RetryRequest {
+    key: [u8; 32],
+    stamp: ReceiptStamp,
+    next_backoff: Duration,
+}
+
+enum WriteBatch {
+    Incoming(Vec<Receipt>),
+    Retry(Vec<RetryRequest>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ReceiptStamp {
     received_at: u64,
     fingerprint: blake3::Hash,
 }
 
+impl ReceiptStamp {
+    fn is_live(self, now: u64) -> bool {
+        now.saturating_sub(self.received_at) < DEFAULT_TTL.as_secs()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StorageStatus {
+    Queued,
+    Deferred { due: Instant, backoff: Duration },
+    Saved,
+}
+
+struct TrackedReceipt {
+    stamp: ReceiptStamp,
+    status: StorageStatus,
+}
+
 #[derive(Default)]
 struct QueueState {
-    known: HashMap<[u8; 32], (blake3::Hash, u64)>,
-    dropped: u64,
+    known: HashMap<[u8; 32], TrackedReceipt>,
+    scheduled: BTreeSet<(Instant, [u8; 32])>,
+    deferred: u64,
+    full: u64,
+}
+
+impl QueueState {
+    fn track(&mut self, key: [u8; 32], stamp: ReceiptStamp, status: StorageStatus) {
+        if let Some(previous) = self.known.insert(key, TrackedReceipt { stamp, status })
+            && let StorageStatus::Deferred { due, .. } = previous.status
+        {
+            self.scheduled.remove(&(due, key));
+        }
+        if let StorageStatus::Deferred { due, .. } = status {
+            self.scheduled.insert((due, key));
+        }
+    }
+
+    fn for_receipt(&mut self, receipt: &Receipt) -> Option<&mut TrackedReceipt> {
+        self.known
+            .get_mut(&receipt.key)
+            .filter(|tracked| tracked.stamp == receipt.stamp)
+    }
+
+    fn expire(&mut self, unix_now: u64) {
+        self.known
+            .retain(|_, tracked| tracked.stamp.is_live(unix_now));
+        self.scheduled
+            .retain(|(_, key)| self.known.contains_key(key));
+    }
+
+    fn take_retries(&mut self, now: Instant, unix_now: u64) -> Vec<RetryRequest> {
+        let mut ready = Vec::new();
+        while ready.len() < BATCH_SIZE
+            && let Some(&(due, key)) = self.scheduled.first()
+            && due <= now
+        {
+            self.scheduled.pop_first();
+            let Some(tracked) = self.known.get_mut(&key) else {
+                continue;
+            };
+            if !tracked.stamp.is_live(unix_now) {
+                self.known.remove(&key);
+                continue;
+            }
+            let StorageStatus::Deferred { backoff, .. } = tracked.status else {
+                continue;
+            };
+            tracked.status = StorageStatus::Queued;
+            ready.push(RetryRequest {
+                key,
+                stamp: tracked.stamp,
+                next_backoff: (backoff * 2).min(MAX_RETRY),
+            });
+        }
+        ready
+    }
 }
 
 pub(super) struct ReceivedBanSender {
@@ -54,43 +147,58 @@ pub(super) struct ReceivedBanSender {
 impl ReceivedBanSender {
     /// Called from the session dispatcher. No filesystem work runs here.
     pub(super) fn record(&self, key: [u8; 32], value: &[u8]) {
-        let now = unix_secs_now_u64();
-        let fingerprint = blake3::hash(value);
+        let stamp = ReceiptStamp {
+            received_at: unix_secs_now_u64(),
+            fingerprint: blake3::hash(value),
+        };
         let mut state = lock!(self.state);
-        if state.known.get(&key).is_some_and(|(known, stored_at)| {
-            *known == fingerprint && now.saturating_sub(*stored_at) < DEFAULT_TTL.as_secs()
+        if state.known.get(&key).is_some_and(|known| {
+            known.stamp.fingerprint == stamp.fingerprint && known.stamp.is_live(stamp.received_at)
         }) {
+            return;
+        }
+        if state.known.len() == MAX_BAN_LIST_SIZE && !state.known.contains_key(&key) {
+            state.full = state.full.saturating_add(1);
+            let full = state.full;
+            drop(state);
+            if full.is_power_of_two() {
+                self.logger.warn(
+                    "network.ban.received_storage.backlog_full",
+                    format!("dropped={full}"),
+                );
+            }
             return;
         }
         let permit = match self.tx.try_reserve() {
             Ok(permit) => permit,
             Err(mpsc::error::TrySendError::Closed(())) => return,
             Err(mpsc::error::TrySendError::Full(())) => {
-                state.dropped = state.dropped.saturating_add(1);
-                let dropped = state.dropped;
+                state.track(
+                    key,
+                    stamp,
+                    StorageStatus::Deferred {
+                        due: Instant::now() + FIRST_RETRY,
+                        backoff: FIRST_RETRY,
+                    },
+                );
+                state.deferred = state.deferred.saturating_add(1);
+                let deferred = state.deferred;
                 drop(state);
-                if dropped.is_power_of_two() {
+                if deferred.is_power_of_two() {
                     self.logger.warn(
-                        "network.ban.received_storage.queue_full",
-                        format!("dropped={dropped}"),
+                        "network.ban.received_storage.deferred",
+                        format!("queued_for_retry={deferred}"),
                     );
                 }
                 return;
             }
         };
-        if state.known.len() == MAX_BAN_LIST_SIZE && !state.known.contains_key(&key) {
-            state
-                .known
-                .retain(|_, (_, seen)| now.saturating_sub(*seen) < DEFAULT_TTL.as_secs());
-        }
-        if state.known.len() < MAX_BAN_LIST_SIZE || state.known.contains_key(&key) {
-            state.known.insert(key, (fingerprint, now));
-        }
+        state.track(key, stamp, StorageStatus::Queued);
         permit.send(Receipt {
             key,
             value: value.to_vec(),
-            received_at: now,
-            fingerprint,
+            stamp,
+            next_backoff: FIRST_RETRY,
         });
     }
 }
@@ -128,17 +236,25 @@ impl ReceivedBanWriter {
         )
     }
 
-    pub(super) async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
+    pub(super) async fn run(
+        mut self,
+        dht: Arc<KademliaService>,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
         let mut cleanup = tokio::time::interval_at(
             tokio::time::Instant::now() + CLEANUP_INTERVAL,
             CLEANUP_INTERVAL,
         );
         cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut retry = tokio::time::interval_at(Instant::now() + FIRST_RETRY, FIRST_RETRY);
+        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            let first = tokio::select! {
+            let has_retries = !lock!(self.state).scheduled.is_empty();
+            let batch = tokio::select! {
                 biased;
                 _ = shutdown.changed() => break,
                 _ = cleanup.tick() => {
+                    lock!(self.state).expire(unix_secs_now_u64());
                     let dir = self.dir.clone();
                     match tokio::task::spawn_blocking(move || prune_expired(&dir, unix_secs_now_u64())).await {
                         Ok(Ok(())) => {}
@@ -147,32 +263,74 @@ impl ReceivedBanWriter {
                     }
                     continue;
                 }
-                first = self.rx.recv() => first,
+                _ = retry.tick(), if has_retries => {
+                    let ready = lock!(self.state).take_retries(Instant::now(), unix_secs_now_u64());
+                    if ready.is_empty() { continue; }
+                    WriteBatch::Retry(ready)
+                }
+                first = self.rx.recv() => {
+                    let Some(first) = first else { break };
+                    let mut batch = Vec::with_capacity(BATCH_SIZE);
+                    batch.push(first);
+                    while batch.len() < BATCH_SIZE {
+                        let Ok(receipt) = self.rx.try_recv() else { break };
+                        batch.push(receipt);
+                    }
+                    WriteBatch::Incoming(batch)
+                }
             };
-            let Some(first) = first else { break };
-            let mut batch = Vec::with_capacity(BATCH_SIZE);
-            batch.push(first);
-            while batch.len() < BATCH_SIZE {
-                let Ok(receipt) = self.rx.try_recv() else {
-                    break;
-                };
-                batch.push(receipt);
-            }
             let dir = self.dir.clone();
             let gate = Arc::clone(&self.gate);
             let state = Arc::clone(&self.state);
             let logger = Arc::clone(&self.logger);
+            let dht = Arc::clone(&dht);
             let saved = tokio::task::spawn_blocking(move || {
-                let (saved, failed) = save_batch(&dir, &gate, batch);
-                for (receipt, error) in failed {
-                    let mut state = lock!(state);
-                    if state.known.get(&receipt.key)
-                        == Some(&(receipt.fingerprint, receipt.received_at))
-                    {
-                        state.known.remove(&receipt.key);
+                let batch = match batch {
+                    WriteBatch::Incoming(batch) => batch,
+                    WriteBatch::Retry(ready) => {
+                        load_retry_batch(&dht, &gate, &state, &logger, ready)
                     }
-                    drop(state);
-                    logger.warn("network.ban.received_storage.failed", error.to_string());
+                };
+                if batch.is_empty() {
+                    return 0;
+                }
+                let mut saved = 0;
+                let mut failed = 0;
+                let mut first_error = None;
+                let results = save_batch(&dir, &gate, &batch);
+                let mut state = lock!(state);
+                for (receipt, result) in batch.iter().zip(results) {
+                    match result {
+                        Ok(written) => {
+                            saved += usize::from(written);
+                            if let Some(tracked) = state.for_receipt(receipt) {
+                                tracked.status = StorageStatus::Saved;
+                            }
+                        }
+                        Err(error) => {
+                            failed += 1;
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                            if state.for_receipt(receipt).is_some() {
+                                state.track(
+                                    receipt.key,
+                                    receipt.stamp,
+                                    StorageStatus::Deferred {
+                                        due: Instant::now() + receipt.next_backoff,
+                                        backoff: receipt.next_backoff,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                drop(state);
+                if let Some(error) = first_error {
+                    logger.warn(
+                        "network.ban.received_storage.failed",
+                        format!("records={failed} error={error}"),
+                    );
                 }
                 saved
             })
@@ -189,6 +347,52 @@ impl ReceivedBanWriter {
             }
         }
     }
+}
+
+fn load_retry_batch(
+    dht: &KademliaService,
+    gate: &NetworkAccessGate,
+    state: &Mutex<QueueState>,
+    logger: &NodeLogger,
+    ready: Vec<RetryRequest>,
+) -> Vec<Receipt> {
+    let mut batch = Vec::with_capacity(ready.len());
+    let mut missing = 0;
+    for RetryRequest {
+        key,
+        stamp,
+        next_backoff,
+    } in ready
+    {
+        if let Some(value) = dht.peek_value(&key)
+            && blake3::hash(&value) == stamp.fingerprint
+            && gate.verify_ban_record(&key, &value)
+        {
+            batch.push(Receipt {
+                key,
+                value,
+                stamp,
+                next_backoff,
+            });
+            continue;
+        }
+        let mut state = lock!(state);
+        if state
+            .known
+            .get(&key)
+            .is_some_and(|tracked| tracked.stamp == stamp)
+        {
+            state.known.remove(&key);
+            missing += 1;
+        }
+    }
+    if missing > 0 {
+        logger.warn(
+            "network.ban.received_storage.retry_source_unavailable",
+            format!("records={missing}"),
+        );
+    }
+    batch
 }
 
 fn receipt_parts(bytes: &[u8]) -> Option<(u64, &[u8])> {
@@ -249,29 +453,23 @@ fn read_record(
     Ok(record)
 }
 
-fn save_batch(
-    dir: &Path,
-    gate: &NetworkAccessGate,
-    batch: Vec<Receipt>,
-) -> (usize, Vec<(Receipt, io::Error)>) {
+fn save_batch(dir: &Path, gate: &NetworkAccessGate, batch: &[Receipt]) -> Vec<io::Result<bool>> {
     let _storage = lock!(STORAGE);
     let prepared = ensure_directory(dir);
     let now = unix_secs_now_u64();
     let mut file_count = None;
-    let mut saved = 0;
-    let mut failed = Vec::new();
-    for receipt in batch {
-        let result = match &prepared {
-            Ok(()) => save_record(dir, gate, now, &receipt, &mut file_count),
-            Err(error) => Err(io::Error::other(error.to_string())),
-        };
-        match result {
-            Ok(true) => saved += 1,
-            Ok(false) => {}
-            Err(error) => failed.push((receipt, error)),
-        }
-    }
-    (saved, failed)
+    batch
+        .iter()
+        .map(|receipt| {
+            if !receipt.stamp.is_live(now) {
+                return Ok(false);
+            }
+            match &prepared {
+                Ok(()) => save_record(dir, gate, now, receipt, &mut file_count),
+                Err(error) => Err(io::Error::other(error.to_string())),
+            }
+        })
+        .collect()
 }
 
 fn save_record(
@@ -325,7 +523,7 @@ fn save_record(
     }
     let mut bytes = Vec::with_capacity(RECEIVED_MAGIC.len() + TIMESTAMP_LEN + receipt.value.len());
     bytes.extend_from_slice(RECEIVED_MAGIC);
-    bytes.extend_from_slice(&receipt.received_at.to_be_bytes());
+    bytes.extend_from_slice(&receipt.stamp.received_at.to_be_bytes());
     bytes.extend_from_slice(&receipt.value);
     veil_util::atomic_write_owner_only(&path, &bytes)?;
     if new_file && let Some(count) = file_count {
@@ -378,7 +576,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_full_write_queue_accepts_replays_of_dropped_records_after_draining() {
+    fn a_full_write_queue_keeps_a_retry_without_another_network_copy() {
         let gate = Arc::new(NetworkAccessGate {
             local_cert_blob: Vec::new(),
             expected_network_id: [1; 32],
@@ -387,7 +585,7 @@ mod tests {
             admin_node_ids: Default::default(),
         });
         let logger = Arc::new(NodeLogger::new_noop());
-        let (sender, mut writer) = ReceivedBanWriter::channel(PathBuf::new(), &gate, &logger);
+        let (sender, writer) = ReceivedBanWriter::channel(PathBuf::new(), &gate, &logger);
         for i in 0..QUEUE_CAPACITY {
             let mut key = [0; 32];
             key[..2].copy_from_slice(&(i as u16).to_be_bytes());
@@ -395,16 +593,26 @@ mod tests {
         }
         sender.record([0; 32], b"payload");
         assert_eq!(writer.rx.len(), QUEUE_CAPACITY);
-        assert_eq!(lock!(sender.state).dropped, 0);
+        assert_eq!(lock!(sender.state).deferred, 0);
 
-        let previously_dropped = [255; 32];
-        sender.record(previously_dropped, b"new payload");
-        assert_eq!(lock!(sender.state).dropped, 1);
-        assert!(!lock!(sender.state).known.contains_key(&previously_dropped));
-        writer.rx.try_recv().unwrap();
-        sender.record(previously_dropped, b"new payload");
+        let deferred_key = [255; 32];
+        sender.record(deferred_key, b"new payload");
         assert_eq!(writer.rx.len(), QUEUE_CAPACITY);
-        assert!(lock!(sender.state).known.contains_key(&previously_dropped));
+        let mut state = lock!(sender.state);
+        assert_eq!(state.deferred, 1);
+        let &(due, key) = state.scheduled.first().unwrap();
+        assert_eq!(key, deferred_key);
+        let received_at = state.known[&key].stamp.received_at;
+        assert!(
+            state
+                .take_retries(due - Duration::from_millis(1), received_at)
+                .is_empty()
+        );
+        let retry = state.take_retries(due, received_at).pop().unwrap();
+        assert_eq!(retry.key, deferred_key);
+        assert_eq!(retry.stamp.fingerprint, blake3::hash(b"new payload"));
+        assert_eq!(retry.stamp.received_at, received_at);
+        assert!(state.scheduled.is_empty());
     }
 
     #[test]
