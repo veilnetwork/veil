@@ -331,7 +331,7 @@ struct RecentAdmissions {
 }
 
 impl RecentAdmissions {
-    fn remember_withdrawal(&mut self, peer: NodeId, now: Instant) {
+    fn remember_peer(&mut self, peer: NodeId, now: Instant) {
         self.seen.insert(peer, now);
         if self.seen.len() > veil_proto::MAX_PEERS_LIST_ENTRIES
             && let Some(oldest) = self.seen.iter().min_by_key(|(_, when)| **when)
@@ -339,6 +339,20 @@ impl RecentAdmissions {
             let oldest_peer = *oldest.0;
             self.seen.remove(&oldest_peer);
         }
+    }
+
+    fn remember_peers(&mut self, peers: impl Iterator<Item = NodeId>, now: Instant) {
+        for peer in peers.take(veil_proto::MAX_PEERS_LIST_ENTRIES) {
+            self.remember_peer(peer, now);
+        }
+    }
+
+    fn current_hints(&self, now: Instant) -> HashSet<NodeId> {
+        self.seen
+            .iter()
+            .filter(|(_, seen)| now.duration_since(**seen) < PNET_RECENT_WINDOW)
+            .map(|(peer, _)| *peer)
+            .collect()
     }
 
     fn retry_group(
@@ -567,21 +581,42 @@ async fn live_peer_hints(
     })
 }
 
-fn prioritize_live_peers(
+fn prioritize_peers(
     order: &[(NodeId, [u8; 32])],
-    live: &HashSet<NodeId>,
+    priority: &HashSet<NodeId>,
+    sorted_by_node_id: bool,
 ) -> Option<Vec<(NodeId, [u8; 32])>> {
-    if live.is_empty() {
+    if priority.is_empty() {
         return None;
     }
-    // The session list is a bounded scheduling hint. Keep every configured
-    // peer in the sweep and require the same admission reply for all peers.
+    // Keep every configured peer in the sweep and preserve the relative
+    // order within each group. A sparse hint over a sorted configuration
+    // can find the priority entries directly and copy the remaining spans.
+    let indices: Vec<_> = if sorted_by_node_id && priority.len() <= order.len() / 8 {
+        let mut indices: Vec<_> = priority
+            .iter()
+            .filter_map(|peer| order.binary_search_by_key(peer, |(id, _)| *id).ok())
+            .collect();
+        indices.sort_unstable();
+        indices
+    } else {
+        order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (peer, _))| priority.contains(peer).then_some(index))
+            .collect()
+    };
+    if indices.is_empty() {
+        return None;
+    }
     let mut prioritized = Vec::with_capacity(order.len());
-    prioritized.extend(order.iter().copied().filter(|(id, _)| live.contains(id)));
-    if prioritized.is_empty() {
-        return None;
+    prioritized.extend(indices.iter().map(|&index| order[index]));
+    let mut start = 0;
+    for index in indices {
+        prioritized.extend_from_slice(&order[start..index]);
+        start = index + 1;
     }
-    prioritized.extend(order.iter().copied().filter(|(id, _)| !live.contains(id)));
+    prioritized.extend_from_slice(&order[start..]);
     Some(prioritized)
 }
 
@@ -1438,7 +1473,7 @@ async fn serve_link(
         RouteBinding {
             node_id: binding.node_id,
             signed,
-            recent,
+            recent: Arc::clone(&recent),
         },
         configured,
         Arc::clone(&state),
@@ -1466,6 +1501,19 @@ async fn serve_link(
     }
     routes.abort();
     let _ = routes.await;
+    if matches!(outcome, Ok(LinkExit::DaemonDisconnected))
+        && bridge.signed.is_none()
+        && bridge.accepted.borrow().pnet_required
+    {
+        let admitted = state.load();
+        recent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remember_peers(
+                admitted.peer_app_ids.iter().map(|(peer, _)| *peer),
+                Instant::now(),
+            );
+    }
     if let Some(task) = cert_broadcast_task {
         task.abort();
         let _ = task.await;
@@ -1578,7 +1626,7 @@ fn apply_admissions(
                 if !signed {
                     recent
                         .get_or_insert_with(&lock_recent)
-                        .remember_withdrawal(*peer, now);
+                        .remember_peer(*peer, now);
                 }
                 changed = true;
             }
@@ -1863,6 +1911,23 @@ async fn maintain_routes(
             connection =
                 connect_pnet_status(&config.socket_path, binding.node_id, authority, &mut pace)
                     .await;
+            let start_large_sweep = next_peer == 0
+                && configured.peer_app_ids.len() > veilclient::PNET_ADMISSION_BATCH_MAX_PEERS;
+            if connection.is_some() && start_large_sweep && binding.signed.is_none() {
+                let known = binding
+                    .recent
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .current_hints(Instant::now());
+                let order = admission_order
+                    .as_deref()
+                    .unwrap_or(&configured.peer_app_ids);
+                if let Some(prioritized) =
+                    prioritize_peers(order, &known, admission_order.is_none())
+                {
+                    admission_order = Some(prioritized);
+                }
+            }
             if let Some(client) = &connection
                 && client.supports_pnet_admission_batch()
             {
@@ -1878,10 +1943,10 @@ async fn maintain_routes(
                 let order = admission_order
                     .as_deref()
                     .unwrap_or(&configured.peer_app_ids);
-                if next_peer == 0
-                    && order.len() > veilclient::PNET_ADMISSION_BATCH_MAX_PEERS
+                if start_large_sweep
                     && let Some(live) = live_peer_hints(client, &mut pace, false).await
-                    && let Some(prioritized) = prioritize_live_peers(order, &live.ids)
+                    && let Some(prioritized) =
+                        prioritize_peers(order, &live.ids, admission_order.is_none())
                 {
                     admission_order = Some(prioritized);
                 }
@@ -2005,6 +2070,13 @@ async fn maintain_routes(
             session_refresh = None;
             next_peer = 0;
             if !admitted.is_empty() {
+                if binding.signed.is_none() {
+                    binding
+                        .recent
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remember_peers(admitted.keys().copied(), Instant::now());
+                }
                 admitted.clear();
                 publish_routes(
                     configured.with_pnet_admissions(&admitted),
@@ -2451,6 +2523,38 @@ mod tests {
     }
 
     #[test]
+    fn startup_priority_preserves_both_groups_and_ignores_unconfigured_peers() {
+        let sorted: Vec<_> = (0..96).map(|id| ([id; 32], [id + 1; 32])).collect();
+        let priority = HashSet::from([[7; 32], [73; 32], [92; 32], [220; 32]]);
+        let expected: Vec<_> = [sorted[7], sorted[73], sorted[92]]
+            .into_iter()
+            .chain(
+                sorted
+                    .iter()
+                    .copied()
+                    .filter(|(id, _)| !priority.contains(id)),
+            )
+            .collect();
+        assert_eq!(prioritize_peers(&sorted, &priority, true), Some(expected));
+        assert_eq!(
+            prioritize_peers(&sorted, &HashSet::from([[220; 32]]), true),
+            None
+        );
+
+        let mut reordered = sorted.clone();
+        reordered.swap(0, 92);
+        reordered.swap(1, 82);
+        let order = prioritize_peers(&reordered, &priority, false).unwrap();
+        assert_eq!(&order[..3], &[sorted[92], sorted[7], sorted[73]]);
+        assert!(
+            order[3..].iter().copied().eq(reordered
+                .iter()
+                .copied()
+                .filter(|(id, _)| !priority.contains(id)))
+        );
+    }
+
+    #[test]
     fn sparse_session_hints_match_dense_order_and_respect_a_full_snapshot() {
         fn id(index: u16) -> NodeId {
             let mut id = [0; 32];
@@ -2632,23 +2736,23 @@ mod tests {
     #[tokio::test]
     async fn pnet_routes_follow_daemon_admission_without_reload() {
         tokio::join!(
-            exercise_pnet_sweep(34, false, false),
-            exercise_pnet_sweep(256, false, false),
-            exercise_pnet_sweep(1024, false, false),
+            exercise_pnet_sweep(34, false, SweepHint::None),
+            exercise_pnet_sweep(256, false, SweepHint::None),
+            exercise_pnet_sweep(1024, false, SweepHint::None),
         );
     }
 
     #[tokio::test]
     async fn pnet_session_events_accelerate_route_withdrawal() {
         tokio::join!(
-            exercise_pnet_sweep(34, true, false),
-            exercise_pnet_sweep(1024, true, false)
+            exercise_pnet_sweep(34, true, SweepHint::None),
+            exercise_pnet_sweep(1024, true, SweepHint::None)
         );
     }
 
     #[tokio::test]
     async fn pnet_snapshot_prioritizes_live_peers_and_checks_unlisted_routes() {
-        exercise_pnet_sweep(1024, true, true).await;
+        exercise_pnet_sweep(1024, true, SweepHint::Snapshot).await;
     }
 
     fn pnet_sweep_config(socket: &Path, peer_count: u16) -> OgateConfig {
@@ -3037,7 +3141,18 @@ mod tests {
         server.await.unwrap();
     }
 
-    async fn exercise_pnet_sweep(peer_count: u16, publish_session_events: bool, hint_live: bool) {
+    #[tokio::test]
+    async fn pnet_prioritizes_a_recent_route_without_a_live_peer_snapshot() {
+        exercise_pnet_sweep(1024, true, SweepHint::Recent).await;
+    }
+
+    enum SweepHint {
+        None,
+        Snapshot,
+        Recent,
+    }
+
+    async fn exercise_pnet_sweep(peer_count: u16, publish_session_events: bool, hint: SweepHint) {
         use std::sync::atomic::{AtomicBool, Ordering};
         use veil_ipc::{EventBus, IpcEndpoint, IpcServer, PeerListProvider, PnetStatusProvider};
         use veil_proto::{EventPayload, PeersListEntry, PeersListPayload, PnetStatusResultPayload};
@@ -3099,7 +3214,7 @@ mod tests {
         )
         .with_pnet_status_provider(admission.clone())
         .with_event_bus(events.clone());
-        if hint_live {
+        if matches!(hint, SweepHint::Snapshot) {
             server = server.with_peer_list_provider(Arc::new(LivePeerHint));
         }
         let server = tokio::spawn(async move { server.run().await.unwrap() });
@@ -3119,6 +3234,10 @@ mod tests {
         let state = Arc::new(ArcSwap::from_pointee(initial));
         let changed = Arc::new(Notify::new());
         let peer = [0xaa; 32];
+        let mut recent = RecentAdmissions::default();
+        if matches!(hint, SweepHint::Recent) {
+            recent.remember_peer(peer, Instant::now());
+        }
         let address = Ipv4Addr::new(10, 99, 0, 2).into();
         assert_eq!(state.load().table.lookup_egress(address), Decision::NoRoute);
 
@@ -3129,7 +3248,7 @@ mod tests {
             RouteBinding {
                 node_id: [0x01; 32],
                 signed: None,
-                recent: Arc::default(),
+                recent: Arc::new(SyncMutex::new(recent)),
             },
             configured,
             Arc::clone(&state),
@@ -3145,7 +3264,7 @@ mod tests {
         })
         .await
         .expect("admission batches did not converge within the local query quota");
-        if hint_live {
+        if !matches!(hint, SweepHint::None) {
             assert_eq!(*admission.first.lock().unwrap(), Some(peer));
         }
         let admission_elapsed = started.elapsed();

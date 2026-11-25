@@ -267,8 +267,18 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 - On a new batch-capable status connection, ogate uses the bounded IPC
   session list to put live peers first in large admission sweeps. Every
   configured entry stays in the sweep and still requires its own positive
-  P-Net admission result. A missing list leaves the current sweep order
-  in use.
+  P-Net admission result. Manual gateways can also keep recently
+  admitted peer IDs when either IPC connection is lost. Those hints
+  expire after 30 seconds. A new sweep places currently observed live
+  peers first, then the recently admitted configured peers, and
+  checks each peer against the daemon's current admission result.
+  The recent hints also work with the legacy single-peer query.
+- An optimized macOS ARM64 microbenchmark with 4,096 entries and
+  48 live peers rebuilt the sorted check order in 4.65 µs, compared
+  with 107.42 µs before. With 256 live peers it took 11.00 instead of
+  95.16 µs. On an already rearranged order with 48 hints it took
+  53.64 instead of 101.47 µs. These timings cover the in-memory
+  selection and copying of the sweep order.
 - On the same 48 authenticated sessions, 24 gateways checked disjoint
   4,096-entry tables with both live peers at the end of each table. All
   routes appeared 2.56 s after launching the updated gateways, compared
@@ -956,6 +966,18 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   on the original gateway processes and TUN interfaces. Each run and
   a separate run with a pre-batch daemon delivered all 48 SDK chat
   messages sent before the restart.
+- In four Linux ARM64 runs with a pre-batch local daemon and 128
+  configured peers, the first admission sweep took about 16.3–16.5 s.
+  After restarting that daemon, the gateway with a recent hint
+  published the returning route in 2.28 s after observed readmission
+  in both runs. Controls based on `c97ce213` took 16.38 and 16.45 s.
+  Bidirectional TUN traffic returned in 2.52 s compared with
+  16.63–16.70 s. All runs kept the same gateway process and TUN
+  interfaces, and each delivered all 48 SDK messages sent before
+  the disconnect. A separate run with the current daemon and 4,096
+  configured peers published the route in 0.32 s and restored
+  bidirectional traffic in 0.56 s after observed readmission.
+  All 48 SDK messages arrived exactly once in that run as well.
 
 ### Emulated inter-site link
 
