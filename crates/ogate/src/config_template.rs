@@ -183,6 +183,11 @@ format = "text"
 # parent directory must exist.
 # file = "/var/log/ogate/ogate.log"
 
+# Optional aggregate route status and packet drop reports. Disabled when
+# omitted. Report intervals are set when ogate starts.
+# route_status_report_secs = 10
+# packet_drop_report_secs = 10
+
 # ─── tokio runtime ────────────────────────────────────────────────────
 
 [runtime]

@@ -299,6 +299,19 @@ file   = "/var/log/ogate.log"      # optional — defaults to stderr
 | `level` | `info` | The lowest level that gets logged. `off` turns the logger off completely — nothing is registered, so it costs nothing and stays totally silent. |
 | `format` | `text` | `text` = easy to read by eye; `json` = one structured event per line, for machines. |
 | `file` | (stderr) | Optional log file. New lines are *appended* (the file is created if it doesn't exist), and the parent directory has to exist already. Writing is non-blocking, so logging never stalls on slow disk I/O. |
+| `route_status_report_secs` | (disabled) | Interval in seconds for aggregate gateway status at level `info`. |
+| `packet_drop_report_secs` | (disabled) | Interval in seconds for local drop counts by reason at level `info`. |
+
+With `route_status_report_secs` enabled, the `ogate route status` event
+reports whether the data IPC link is connected. While connected, it
+reports the configured, published and currently active peer counts.
+The active count respects certificate and signed-policy deadlines even
+between admission sweeps. For signed mode, `policy_state` reports
+`current`, `outside_validity_window` or `unavailable`. The event includes
+the loaded revision and the effective route deadline when available.
+During IPC rebind, it reports zero active peers. These local reports
+contain only aggregates and policy metadata. Start ogate again to
+change the reporting interval.
 
 **Which setting wins** (highest to lowest):
 

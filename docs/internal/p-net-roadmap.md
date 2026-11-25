@@ -1749,6 +1749,14 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   daemon restart on the same TUN. The receiving gateway counted four
   oversized sub-packets individually. A gateway with reporting disabled
   emitted no summary while discarding packets without a route.
+- The optional `[logging].route_status_report_secs` setting reports IPC
+  connectivity, configured and active route counts, and signed policy
+  validity from the gateway's current routing table. A two-node Linux ARM64
+  stand distinguished remote route loss from local IPC loss and reported
+  policy expiry and renewal. Both recoveries kept the original TUN for
+  their respective runs. The peer with reporting disabled emitted no
+  status events. The SDK received 1,000 messages in each direction during
+  the manual routing run.
 
 ## 8. Check the fleet before a rolling deployment
 

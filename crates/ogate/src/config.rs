@@ -201,6 +201,10 @@ pub struct LoggingConfig {
     /// Emit reports for locally discarded packets at this cadence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub packet_drop_report_secs: Option<std::num::NonZeroU16>,
+
+    /// Emit an aggregate gateway route status at this cadence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_status_report_secs: Option<std::num::NonZeroU16>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]

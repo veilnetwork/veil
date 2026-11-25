@@ -110,6 +110,8 @@ pub struct SharedState {
     // Only finite deadlines need a wall-clock read on the packet path.
     pnet_expiries: HashMap<NodeId, u64>,
     policy_window: Option<(u64, u64)>,
+    policy_revision: Option<u64>,
+    configured_peers: usize,
     // Admission sweeps keep this marker. Reloaded address allocations get a new one.
     routing_config: Arc<()>,
     /// Configured virtual-iface MTU. Used by the ingress task to drop
@@ -127,11 +129,14 @@ impl SharedState {
             .map(|nid| (*nid, derive_app_id(nid, &cfg.network, &cfg.app)))
             .collect();
         peer_app_ids.sort_unstable_by_key(|(node_id, _)| *node_id);
+        let configured_peers = peer_app_ids.len();
         Ok(Self {
             table,
             peer_app_ids,
             pnet_expiries: HashMap::new(),
             policy_window: None,
+            policy_revision: None,
+            configured_peers,
             routing_config: Arc::new(()),
             mtu: cfg.mtu,
         })
@@ -176,6 +181,8 @@ impl SharedState {
             peer_app_ids,
             pnet_expiries,
             policy_window: self.policy_window,
+            policy_revision: self.policy_revision,
+            configured_peers: self.configured_peers,
             routing_config: Arc::clone(&self.routing_config),
             mtu: self.mtu,
         }
@@ -243,11 +250,24 @@ impl SharedState {
             return true;
         }
         let now = unix_secs_now_u64();
-        now != 0
-            && expiry.is_none_or(|until| now < until)
-            && self
-                .policy_window
-                .is_none_or(|(from, until)| now >= from && now < until)
+        now != 0 && expiry.is_none_or(|until| now < until) && self.policy_allows_at(now)
+    }
+
+    fn policy_allows_at(&self, now: u64) -> bool {
+        self.policy_window
+            .is_none_or(|(from, until)| now != 0 && now >= from && now < until)
+    }
+
+    fn active_peers_at(&self, now: u64) -> usize {
+        if !self.policy_allows_at(now) {
+            return 0;
+        }
+        let inactive = self
+            .pnet_expiries
+            .values()
+            .filter(|&&until| now == 0 || now >= until)
+            .count();
+        self.peer_app_ids.len() - inactive
     }
 }
 
@@ -1006,6 +1026,7 @@ struct Bridge {
     cert_message: Option<Arc<Vec<u8>>>,
     batching_enabled: bool,
     packet_drops: Option<Arc<PacketDrops>>,
+    route_status: Option<watch::Sender<Option<Arc<ArcSwap<SharedState>>>>>,
     signed: Option<Arc<SignedRoutes>>,
 }
 
@@ -1027,6 +1048,51 @@ fn reload_signal() -> Option<Signal> {
             tracing::warn!(%error, "SIGHUP handler install failed; reload disabled");
             None
         }
+    }
+}
+
+async fn report_route_status(
+    period: Duration,
+    config: watch::Receiver<OgateConfig>,
+    state: watch::Receiver<Option<Arc<ArcSwap<SharedState>>>>,
+) {
+    let mut ticks = tokio::time::interval(period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The initial bind can complete before this task is first polled.
+    ticks.tick().await;
+    loop {
+        ticks.tick().await;
+        if !tracing::enabled!(target: "ogate::status", tracing::Level::INFO) {
+            continue;
+        }
+        let (pnet_required, signed_policy) = {
+            let config = config.borrow();
+            (config.pnet_required, config.signed_policy.is_some())
+        };
+        let Some(state) = state.borrow().clone() else {
+            tracing::info!(target: "ogate::status", ipc_connected = false, pnet_required,
+                active_peers = 0, "ogate route status");
+            continue;
+        };
+        let routes = state.load();
+        let now = unix_secs_now_u64();
+        let policy_state = if !signed_policy {
+            None
+        } else if routes.policy_window.is_none() {
+            Some("unavailable")
+        } else if routes.policy_allows_at(now) {
+            Some("current")
+        } else {
+            Some("outside_validity_window")
+        };
+        tracing::info!(target: "ogate::status", ipc_connected = true, pnet_required,
+            configured_peers = routes.configured_peers,
+            published_peers = routes.peer_app_ids.len(),
+            active_peers = routes.active_peers_at(now),
+            policy_state,
+            policy_revision = routes.policy_revision,
+            route_valid_until_unix = routes.policy_window.map(|(_, until)| until),
+            "ogate route status");
     }
 }
 
@@ -1091,18 +1157,28 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
     tracing::info!(iface = %device.name(), "TUN device up");
     let (reader, writer) = device.split();
     let batching_enabled = cfg.batch.enabled;
-    let mut drop_reporter = tokio::task::JoinSet::new();
+    let mut reporters = tokio::task::JoinSet::new();
     let packet_drops = cfg.logging.packet_drop_report_secs.map(|seconds| {
         let counters = Arc::new(PacketDrops::default());
         let reporting = Arc::clone(&counters);
-        drop_reporter.spawn(async move {
+        reporters.spawn(async move {
             reporting
                 .report_every(Duration::from_secs(u64::from(seconds.get())))
                 .await;
         });
         counters
     });
-    let (accepted, _) = watch::channel(cfg);
+    let route_status_period = cfg.logging.route_status_report_secs;
+    let (accepted, accepted_config) = watch::channel(cfg);
+    let route_status = route_status_period.map(|seconds| {
+        let (status, snapshots) = watch::channel(None);
+        reporters.spawn(report_route_status(
+            Duration::from_secs(u64::from(seconds.get())),
+            accepted_config,
+            snapshots,
+        ));
+        status
+    });
     let bridge = Bridge {
         config_path,
         accepted,
@@ -1113,6 +1189,7 @@ pub async fn run(config_path: PathBuf, cfg: OgateConfig) -> Result<(), BridgeErr
         cert_message,
         batching_enabled,
         packet_drops,
+        route_status,
         signed,
     };
     let mut stopping = std::pin::pin!(wait_for_shutdown());
@@ -1159,6 +1236,9 @@ async fn serve_link(
         configured.clone()
     };
     let state = Arc::new(ArcSwap::from_pointee(initial_state));
+    if let Some(status) = &bridge.route_status {
+        status.send_replace(Some(Arc::clone(&state)));
+    }
     let endpoint_id = cfg.endpoint_id;
     let (app_sender, mut app_receiver) = handle.into_split();
     let app_sender = Arc::new(app_sender);
@@ -1600,6 +1680,9 @@ async fn serve_link(
         ),
     };
 
+    if let Some(status) = &bridge.route_status {
+        status.send_replace(None);
+    }
     if let Some(task) = policy_sync {
         task.abort();
         let _ = task.await;
@@ -1673,6 +1756,7 @@ async fn build_signed_update(
             .min(authority.local_valid_until_unix)
     };
     state.policy_window = Some((snapshot.valid_from_unix, until));
+    state.policy_revision = Some(snapshot.revision);
     Ok(Some((snapshot, state)))
 }
 
@@ -2542,6 +2626,38 @@ mod tests {
         let retired = configured.with_pnet_admissions(&HashMap::new());
         assert_eq!(retired.table.lookup_egress(address), Decision::NoRoute);
         assert_eq!(retired.app_id_for(&peer), None);
+    }
+
+    #[test]
+    fn reported_route_count_obeys_certificate_and_policy_deadlines() {
+        let mut config = cfg();
+        config.pnet_required = true;
+        config.peers.push(PeerEntry {
+            node_id: "bb".repeat(32),
+            addr_v4: Some(Ipv4Addr::new(10, 99, 0, 3)),
+            addr_v6: None,
+            name: None,
+        });
+        config.peers.push(PeerEntry {
+            node_id: "cc".repeat(32),
+            addr_v4: Some(Ipv4Addr::new(10, 99, 0, 4)),
+            addr_v6: None,
+            name: None,
+        });
+        let configured = SharedState::build(&config).unwrap();
+        let mut active =
+            configured.with_pnet_admissions(&HashMap::from([([0xaa; 32], 5), ([0xbb; 32], 0)]));
+        assert_eq!(active.configured_peers, 3);
+        assert_eq!(active.peer_app_ids.len(), 2);
+        assert_eq!(active.active_peers_at(4), 2);
+        assert_eq!(active.active_peers_at(5), 1);
+        assert_eq!(active.active_peers_at(0), 1);
+        active.policy_window = Some((3, 8));
+        assert_eq!(active.active_peers_at(0), 0);
+        assert_eq!(active.active_peers_at(2), 0);
+        assert_eq!(active.active_peers_at(3), 2);
+        assert_eq!(active.active_peers_at(5), 1);
+        assert_eq!(active.active_peers_at(8), 0);
     }
 
     #[test]
