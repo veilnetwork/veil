@@ -978,6 +978,22 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   configured peers published the route in 0.32 s and restored
   bidirectional traffic in 0.56 s after observed readmission.
   All 48 SDK messages arrived exactly once in that run as well.
+- The pre-batch admission path can use the daemon's existing PEERS
+  reply once at status connection startup. It checks the prioritized
+  prefix with the ordinary single-peer queries and publishes that
+  group's results before checking the rest of the table. An empty or
+  unavailable snapshot falls back to the configured sweep, with
+  recent route hints when available. The same pace and current
+  admission checks apply.
+- In alternating Linux ARM64 runs with the pre-batch daemon and 128
+  configured peers, the first route appeared 0.433 and 0.437 s after
+  launching the gateway, versus 16.40 and 16.62 s with controls
+  based on `2ec6e789`. Bidirectional recovery after observed
+  readmission took 0.56–0.61 s versus 2.50–2.51 s. With 4,096
+  configured peers, a pre-batch run published the first route in
+  0.427 s and recovered in 0.55 s. A current-daemon run took 0.420
+  and 0.55 s respectively. Every run kept its gateway process and
+  TUN interfaces and delivered all 48 SDK messages exactly once.
 
 ### Emulated inter-site link
 

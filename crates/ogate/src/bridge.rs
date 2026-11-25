@@ -1906,49 +1906,63 @@ async fn maintain_routes(
                 refresh.reset();
             }
         }
+        let mut legacy_group_limit = PNET_LEGACY_QUERY_GROUP;
         if connection.is_none() {
             let authority = binding.signed.as_ref().map(|(_, authority)| *authority);
             connection =
                 connect_pnet_status(&config.socket_path, binding.node_id, authority, &mut pace)
                     .await;
-            let start_large_sweep = next_peer == 0
-                && configured.peer_app_ids.len() > veilclient::PNET_ADMISSION_BATCH_MAX_PEERS;
-            if connection.is_some() && start_large_sweep && binding.signed.is_none() {
-                let known = binding
-                    .recent
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .current_hints(Instant::now());
-                let order = admission_order
-                    .as_deref()
-                    .unwrap_or(&configured.peer_app_ids);
-                if let Some(prioritized) =
-                    prioritize_peers(order, &known, admission_order.is_none())
-                {
-                    admission_order = Some(prioritized);
+            if let Some(client) = &connection {
+                let batched_admission = client.supports_pnet_admission_batch();
+                if batched_admission {
+                    session_refresh = Some(SessionRefresh {
+                        events: client.events().await,
+                        pending: None,
+                        session_count: None,
+                        pending_loss: None,
+                        pending_readmission: None,
+                        next_priority_check: Instant::now(),
+                        loss_cursor: None,
+                    });
                 }
-            }
-            if let Some(client) = &connection
-                && client.supports_pnet_admission_batch()
-            {
-                session_refresh = Some(SessionRefresh {
-                    events: client.events().await,
-                    pending: None,
-                    session_count: None,
-                    pending_loss: None,
-                    pending_readmission: None,
-                    next_priority_check: Instant::now(),
-                    loss_cursor: None,
-                });
-                let order = admission_order
-                    .as_deref()
-                    .unwrap_or(&configured.peer_app_ids);
-                if start_large_sweep
-                    && let Some(live) = live_peer_hints(client, &mut pace, false).await
-                    && let Some(prioritized) =
-                        prioritize_peers(order, &live.ids, admission_order.is_none())
-                {
-                    admission_order = Some(prioritized);
+                let group_limit = if batched_admission {
+                    veilclient::PNET_ADMISSION_BATCH_MAX_PEERS
+                } else {
+                    PNET_LEGACY_QUERY_GROUP
+                };
+                if next_peer == 0 && configured.peer_app_ids.len() > group_limit {
+                    let recent = if binding.signed.is_none() {
+                        binding
+                            .recent
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .current_hints(Instant::now())
+                    } else {
+                        HashSet::new()
+                    };
+                    // PEERS predates batch admission. Try it once on the new
+                    // status connection and use the result only for ordering.
+                    let live = live_peer_hints(client, &mut pace, false).await;
+                    for hints in std::iter::once(&recent).chain(live.as_ref().map(|live| &live.ids))
+                    {
+                        let order = admission_order
+                            .as_deref()
+                            .unwrap_or(&configured.peer_app_ids);
+                        if let Some(prioritized) =
+                            prioritize_peers(order, hints, admission_order.is_none())
+                        {
+                            if !batched_admission {
+                                // Publish results for a short priority prefix
+                                // before pacing queries to the rest of the table.
+                                legacy_group_limit = prioritized
+                                    .iter()
+                                    .take(group_limit)
+                                    .take_while(|(peer, _)| hints.contains(peer))
+                                    .count();
+                            }
+                            admission_order = Some(prioritized);
+                        }
+                    }
                 }
             }
         }
@@ -2053,7 +2067,7 @@ async fn maintain_routes(
                 end = (next_peer + veilclient::PNET_ADMISSION_BATCH_MAX_PEERS).min(order.len());
                 results = query_pnet_batch(client, &order[next_peer..end], &mut pace).await;
             } else {
-                end = (next_peer + PNET_LEGACY_QUERY_GROUP).min(order.len());
+                end = (next_peer + legacy_group_limit).min(order.len());
                 let (legacy_results, uncertain) =
                     query_pnet_legacy(client, &order[next_peer..end], &mut pace).await;
                 if uncertain {
