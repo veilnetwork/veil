@@ -1511,19 +1511,18 @@ impl FrameDispatcher {
             // AFTER releasing reg_guard (lock ordering: rtt_table must not be
             // acquired while session_tx_registry is held).
             let mut sent_hop: Option<[u8; 32]> = None;
-            let alternative = if carrier.is_none() && self.app_registry.peer_revocations_enabled() {
-                reg_guard.unpressured_relay_alternative(
+            let order = if carrier.is_none() && self.app_registry.peer_revocations_enabled() {
+                reg_guard.relay_order(
                     &candidates,
                     ordered,
                     private_ordered.then_some(&dst),
+                    total_wire_len,
                 )
             } else {
-                None
+                veil_types::RelayOrder::default()
             };
-            let order = alternative
-                .into_iter()
-                .chain((0..candidates.len()).filter(|index| Some(*index) != alternative));
-            for idx in order {
+            let mut paced_trial_sent = false;
+            for idx in order.indices(candidates.len()) {
                 let hop = candidates[idx];
                 if try_hop(hop) {
                     // record RTT of the selected route (pre-snapshotted above).
@@ -1558,12 +1557,14 @@ impl FrameDispatcher {
                         });
                     }
                     sent_hop = Some(hop);
+                    paced_trial_sent = order.is_trial(idx);
                     break;
                 }
             }
             if private_ordered {
                 let pressured = if let Some(hop) = sent_hop {
-                    reg_guard.relay_pressured(&hop, true, Some(&dst)) == Some(true)
+                    !paced_trial_sent
+                        && reg_guard.relay_pressured(&hop, true, Some(&dst)) == Some(true)
                 } else {
                     use veil_session::SendToError::Full;
                     let queue_full =

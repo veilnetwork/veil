@@ -1988,6 +1988,41 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   received all 24 messages each within 4.72 seconds. The shaped queue
   and all nine sessions were still active after the exchange.
 
+#### Pacing traffic when a congested route is retried
+
+- The first advisory implementation retried the preferred hop at full
+  rate after five seconds. Packet send times confirmed that the bursts
+  of delays over 100 ms recurred in the same seconds as the advisories.
+- An ordered private route now starts with a five-second hold and
+  resumes at 8 KiB/s in byte-spaced trials while a clear alternate is
+  carrying traffic. A trial carries up to 32 KiB of forwarded data.
+  The rate increases after at least a second of sampling and enough
+  traffic at the current rate. A renewed advisory after a trial doubles
+  the hold to at most 20 seconds. Each session keeps at most 64
+  destination records for received advisories, with at most 90 seconds
+  since the last advisory. When the remaining alternate disappears,
+  the original routing order continues to offer every eligible path.
+- With the 256 kbit/s cap moved to `R2.3→B` on the same eight-node
+  fixture, all 7,076 late-window packets arrived before the window
+  closed and 7,035 arrived within 100 ms. Their p99 was 6.10 ms.
+  Both branches carried regular traffic from 25 to 33 seconds after
+  the cap was removed. All 48 bidirectional SDK messages arrived under
+  the active cap. The initial switch still produced occasional delays
+  of several seconds.
+- A mixed stand used `564f3554` at the endpoints and on the alternate
+  branch. With batching off and a 43-second `R1.3→B` cap, all 17,049
+  late-window packets arrived before the window closed at 1.74 ms p99.
+  The two final links subsequently carried 7.76 and 7.58 MB in an
+  eight-second settled window. The endpoints then exchanged all
+  48 SDK messages.
+- Repeating the 23-second `R1.3→B` cap with batching and an active
+  SDK exchange lowered late-window p99 from 2.97 s on `564f3554` to
+  3.24 ms. Of 6,944 packets in that window, 6,941 arrived before it
+  closed and 6,904 arrived within 100 ms. All 48 SDK messages arrived
+  during shaping. Both branches carried regular traffic in the
+  25-to-33-second window after release. The longest delay was
+  8.02 seconds, near the first saturation advisory.
+
 #### Withdrawing a failed downstream route
 
 - The Linux ARM64 stand used two paths from `A` to `B`, each with three

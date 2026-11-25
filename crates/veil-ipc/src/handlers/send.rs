@@ -648,15 +648,18 @@ async fn forward_ordinary_family_copy(
     // chunks, never the call-control datagram lane. The encrypted
     // envelope has no media/application priority visible to relays.
     let eligible = hops.get(..3).unwrap_or(&hops);
-    let alternative = if ctx.app_registry.peer_revocations_enabled() {
-        reg.unpressured_relay_alternative(eligible, &device)
+    let order = if ctx.app_registry.peer_revocations_enabled() {
+        // Charge for the sealed payload and its relay framing. Large copies
+        // stay on the clear fallback while the preferred path is sampled.
+        reg.ordinary_relay_order(
+            eligible,
+            &device,
+            envelope.payload.len().saturating_add(256),
+        )
     } else {
-        None
+        veil_types::RelayOrder::default()
     };
-    let order = alternative
-        .into_iter()
-        .chain((0..eligible.len()).filter(|index| Some(*index) != alternative));
-    for index in order {
+    for index in order.indices(eligible.len()) {
         let hop = eligible[index];
         if tokio::time::Instant::now() >= family_deadline {
             return DirectAdmission::TimedOut;
@@ -2515,11 +2518,13 @@ async fn handle_ipc_send_inner(
             } else if !relay_realtime
                 && ctx.app_registry.peer_revocations_enabled()
                 && forced_relay_hops.len() > 1
-                && let Some(alternative) =
-                    reg.unpressured_relay_alternative(&forced_relay_hops, &send.dst_node_id)
-                && let Some(prefix) = forced_relay_hops.get_mut(..=alternative)
             {
-                prefix.rotate_right(1);
+                reg.ordinary_relay_order(
+                    &forced_relay_hops,
+                    &send.dst_node_id,
+                    body.len().saturating_add(256),
+                )
+                .apply(&mut forced_relay_hops);
             }
             if !forced_relay_hops.is_empty() {
                 use veil_proto::delivery::DeliveryEnvelope;

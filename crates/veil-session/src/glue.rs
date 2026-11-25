@@ -58,6 +58,15 @@ impl veil_types::FrameBroadcaster for SessionTxBroadcaster {
         rlock!(self.inner).unpressured_relay_alternative(ordered_hops, true, Some(destination))
     }
 
+    fn ordinary_relay_order(
+        &self,
+        hops: &[[u8; 32]],
+        destination: &[u8; 32],
+        wire_bytes: usize,
+    ) -> veil_types::RelayOrder {
+        rlock!(self.inner).relay_order(hops, true, Some(destination), wire_bytes)
+    }
+
     fn latest_tx_registration(&self) -> Option<u64> {
         Some(rlock!(self.inner).latest_registration())
     }

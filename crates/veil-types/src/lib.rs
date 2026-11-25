@@ -54,6 +54,46 @@ use serde::{Deserialize, Serialize};
 
 use std::sync::Arc;
 
+/// Ordering of the caller's existing relay candidates. A paced recovery
+/// trial tries the original first hop and keeps the clear fallback next.
+#[derive(Clone, Copy, Default)]
+pub struct RelayOrder {
+    fallback: Option<usize>,
+    trial: bool,
+}
+
+impl RelayOrder {
+    pub fn new(fallback: usize, trial: bool) -> Self {
+        Self {
+            fallback: Some(fallback),
+            trial,
+        }
+    }
+
+    pub fn is_trial(self, index: usize) -> bool {
+        self.trial && index == 0
+    }
+
+    pub fn indices(self, len: usize) -> impl Iterator<Item = usize> {
+        self.trial
+            .then_some(0)
+            .into_iter()
+            .chain(self.fallback)
+            .chain(
+                (0..len)
+                    .filter(move |&index| !self.is_trial(index) && self.fallback != Some(index)),
+            )
+    }
+
+    pub fn apply<T>(self, hops: &mut [T]) {
+        if let Some(fallback) = self.fallback
+            && let Some(prefix) = hops.get_mut(usize::from(self.trial)..=fallback)
+        {
+            prefix.rotate_right(1);
+        }
+    }
+}
+
 /// Session-tx fan-out surface. Implemented by veilcore's
 /// `Arc<Mutex<node::session::tx_registry::SessionTxRegistry>>` via a small
 /// adapter newtype in `node::session_glue`.
@@ -67,6 +107,18 @@ pub trait FrameBroadcaster: Send + Sync {
         _destination: &[u8; 32],
     ) -> Option<usize> {
         None
+    }
+
+    /// Order ordinary private routes using the size of the next send.
+    fn ordinary_relay_order(
+        &self,
+        hops: &[[u8; 32]],
+        destination: &[u8; 32],
+        _wire_bytes: usize,
+    ) -> RelayOrder {
+        self.unpressured_relay_alternative(hops, destination)
+            .map(|fallback| RelayOrder::new(fallback, false))
+            .unwrap_or_default()
     }
 
     /// Read-only endpoint readiness; never opens a connection or changes a

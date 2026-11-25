@@ -41,17 +41,19 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 
 use veil_cfg::NodeId;
-use veil_types::NodeIdBytes;
+use veil_types::{NodeIdBytes, RelayOrder};
 
 use super::priority_queue::INTERACTIVE;
 use crate::frame_outbox::{
     BuildSendError, FrameOutbox, FrameSender, frame_channel_with_source_activity,
 };
+
+use crate::route_pressure::RoutePressure;
 
 // A recreated registry for the same node must not reuse the witness of a
 // prior route lookup that is still in the endpoint's short-lived cache.
@@ -61,39 +63,6 @@ static NEXT_TX_REGISTRATION: AtomicU64 = AtomicU64::new(1);
 // their configured limit. Bound the watermarks by both size and frame count.
 const RELAY_PRESSURE_HIGH_FRAMES: usize = 32;
 const RELAY_PRESSURE_LOW_FRAMES: usize = 8;
-const ROUTE_PRESSURE_LIFETIME: Duration = Duration::from_secs(5);
-const ROUTE_PRESSURE_INTERVAL: Duration = Duration::from_secs(1);
-const ROUTE_PRESSURE_DESTINATIONS: usize = 64;
-
-#[derive(Debug, Default)]
-struct RoutePressure {
-    received: HashMap<NodeIdBytes, Instant>,
-    sent: HashMap<NodeIdBytes, Instant>,
-}
-
-fn record_pressure(
-    deadlines: &mut HashMap<NodeIdBytes, Instant>,
-    dst: NodeIdBytes,
-    now: Instant,
-    lifetime: Duration,
-) -> bool {
-    let until = now + lifetime;
-    if let Some(deadline) = deadlines.get_mut(&dst) {
-        if until.saturating_duration_since(*deadline) < ROUTE_PRESSURE_INTERVAL {
-            return false;
-        }
-        *deadline = until;
-        return true;
-    }
-    if deadlines.len() == ROUTE_PRESSURE_DESTINATIONS {
-        deadlines.retain(|_, deadline| *deadline > now);
-        if deadlines.len() == ROUTE_PRESSURE_DESTINATIONS {
-            return false;
-        }
-    }
-    deadlines.insert(dst, until);
-    true
-}
 
 /// A priority-tagged frame: `(priority, frame_bytes)`.
 ///
@@ -575,12 +544,7 @@ impl SessionTxRegistry {
         else {
             return false;
         };
-        record_pressure(
-            &mut veil_util::lock!(pressure).received,
-            dst,
-            Instant::now(),
-            ROUTE_PRESSURE_LIFETIME,
-        )
+        veil_util::lock!(pressure).receive(dst, Instant::now())
     }
 
     /// Reserve the next advisory slot for this peer and destination. The caller
@@ -594,12 +558,7 @@ impl SessionTxRegistry {
         else {
             return false;
         };
-        record_pressure(
-            &mut veil_util::lock!(pressure).sent,
-            dst,
-            Instant::now(),
-            ROUTE_PRESSURE_INTERVAL,
-        )
+        veil_util::lock!(pressure).reserve_notice(dst, Instant::now())
     }
 
     /// Capability and sender are read in one registry snapshot.
@@ -1143,10 +1102,7 @@ impl SessionTxRegistry {
         let entry = self.senders.get(peer)?;
         if let (Some(pressure), Some(dst)) = (entry.route_pressure.as_deref(), dst)
             && !entry.tx.is_closed()
-            && veil_util::lock!(pressure)
-                .received
-                .get(dst)
-                .is_some_and(|deadline| *deadline > Instant::now())
+            && veil_util::lock!(pressure).is_pressured(dst, Instant::now())
         {
             return Some(true);
         }
@@ -1167,9 +1123,9 @@ impl SessionTxRegistry {
         Some(pressured || (ordered && entry.tx.ordered_writer_pressured()))
     }
 
-    /// Return a live fallback's index when the preferred hop has local
-    /// outbound pressure. The caller retains its eligible routes and send
-    /// admission policy. An ordered send also considers its current writer.
+    /// Return a clear fallback's index when the preferred hop has outbound
+    /// pressure. Ordered sends can account for both the current writer and
+    /// a downstream advisory for the destination.
     pub fn unpressured_relay_alternative(
         &self,
         ordered_hops: &[NodeIdBytes],
@@ -1186,6 +1142,34 @@ impl SessionTxRegistry {
             .iter()
             .position(|peer| self.relay_pressured(peer, ordered, dst) == Some(false))
             .map(|index| index + 1)
+    }
+
+    /// Keep the clear fallback directly behind a paced trial. If there is
+    /// no clear fallback, the normal route order remains available.
+    pub fn relay_order(
+        &self,
+        hops: &[NodeIdBytes],
+        ordered: bool,
+        dst: Option<&NodeIdBytes>,
+        wire_bytes: usize,
+    ) -> RelayOrder {
+        let Some(fallback) = self.unpressured_relay_alternative(hops, ordered, dst) else {
+            return RelayOrder::default();
+        };
+        let preferred = &hops[0];
+        let trial = if ordered
+            && let Some(dst) = dst
+            && self.relay_pressured(preferred, true, None) == Some(false)
+            && let Some(pressure) = self
+                .senders
+                .get(preferred)
+                .and_then(|entry| entry.route_pressure.as_deref())
+        {
+            veil_util::lock!(pressure).reserve_trial(dst, Instant::now(), wire_bytes)
+        } else {
+            false
+        };
+        RelayOrder::new(fallback, trial)
     }
 
     /// Evict the `n` least-recently-active sessions to free memory.
@@ -1597,48 +1581,34 @@ mod tests {
     }
 
     #[test]
-    fn pressure_deadlines_are_bounded_and_renew_only_at_the_notice_interval() {
-        let mut deadlines = HashMap::new();
-        let now = Instant::now();
-        for index in 0..ROUTE_PRESSURE_DESTINATIONS {
-            assert!(record_pressure(
-                &mut deadlines,
-                [index as u8; 32],
-                now,
-                ROUTE_PRESSURE_LIFETIME
-            ));
-        }
-        let dst = [0; 32];
-        let extra = [255; 32];
-        let soon = now + ROUTE_PRESSURE_INTERVAL / 2;
-        assert!(!record_pressure(
-            &mut deadlines,
-            dst,
-            soon,
-            ROUTE_PRESSURE_LIFETIME
-        ));
-        assert!(!record_pressure(
-            &mut deadlines,
-            extra,
-            soon,
-            ROUTE_PRESSURE_LIFETIME
-        ));
-        assert_eq!(deadlines[&dst], now + ROUTE_PRESSURE_LIFETIME);
-        let renewed = now + ROUTE_PRESSURE_INTERVAL;
-        assert!(record_pressure(
-            &mut deadlines,
-            dst,
-            renewed,
-            ROUTE_PRESSURE_LIFETIME
-        ));
-        assert!(record_pressure(
-            &mut deadlines,
-            extra,
-            now + ROUTE_PRESSURE_LIFETIME,
-            ROUTE_PRESSURE_LIFETIME,
-        ));
-        assert_eq!(deadlines.len(), 2);
-        assert_eq!(deadlines[&dst], renewed + ROUTE_PRESSURE_LIFETIME);
+    fn recovery_trial_keeps_the_clear_fallback_and_only_spends_one_slot() {
+        use std::time::Duration;
+
+        let (preferred, closed, clear, dst) = ([1; 32], [2; 32], [3; 32], [4; 32]);
+        let owner = [11; 32];
+        let mut registry = SessionTxRegistry::new();
+        let _preference = registry.register_owned(preferred, owner);
+        let healthy = registry.register(clear);
+        registry.enable_route_pressure_owned(&preferred, &owner);
+        let pressure = registry.senders[&preferred]
+            .route_pressure
+            .as_deref()
+            .unwrap();
+        assert!(veil_util::lock!(pressure).receive(dst, Instant::now() - Duration::from_secs(6)));
+        let hops = [preferred, closed, clear];
+
+        let trial = registry.relay_order(&hops, true, Some(&dst), 8192);
+        assert!(trial.is_trial(0));
+        assert_eq!(trial.indices(hops.len()).collect::<Vec<_>>(), [0, 2, 1]);
+        let mut reordered = hops;
+        trial.apply(&mut reordered);
+        assert_eq!(reordered, [preferred, clear, closed]);
+
+        let next = registry.relay_order(&hops, true, Some(&dst), 8192);
+        assert_eq!(next.indices(hops.len()).collect::<Vec<_>>(), [2, 0, 1]);
+        drop(healthy);
+        let only = registry.relay_order(&hops, true, Some(&dst), 8192);
+        assert_eq!(only.indices(hops.len()).collect::<Vec<_>>(), [0, 1, 2]);
     }
 
     /// A full queue is load, and the caller can tell it from a dead session.
