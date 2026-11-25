@@ -620,6 +620,46 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   pre-batch daemon passed raw TUN traffic both ways and delivered all
   48 SDK chat messages exactly once. The prototype was set aside after
   the inconsistent UDP results and the higher chat p99 in both pairs.
+- An ordered session reader prototype appended body bytes directly to
+  pooled capacity after validating the header and reserving the global
+  body budget. The initialized length retained progress across
+  cancellation. The same frame length and deadlines bounded reads. A
+  macOS ARM64 in-memory comparison measured 525 to 408 ns per 12,000-byte
+  body and 1,108 to 823 ns per 61,440-byte body. Both readers took about
+  246 ns at 1,200 bytes.
+- On Linux ARM64, two pairs used 24 gateways, 4,096 entries each and two
+  32 Mb/s UDP flows over TCP. Cold losses increased from 10,221 of
+  165,607 datagrams to 16,718 of 164,020 in the first pair, and from
+  26,376 of 161,596 to 28,551 of 161,144 with the order reversed. IPC
+  job rejections accounted for 10,128, 16,541, 26,122 and 28,504 losses.
+  UDP receive socket drops accounted for the rest. Each trial delivered
+  all 200 SDK chat messages. Cold p99 towards the hub increased from
+  312 to 770 ms and from 566 to 1,345 ms. The prototype was set aside.
+- The four warm repeats delivered all 669,103 UDP datagrams. The hub
+  daemon's thread runnable wait totaled 10.90–20.14 s across threads per
+  cold sample and 2.38–3.49 s per warm sample. Peak TCP receive queues
+  ranged from 1.09 to 2.14 MB in the cold samples and from 10 to 42 kB
+  in the warm samples. Each warm repeat delivered all 200 SDK messages
+  with p99 below 1.25 ms. The prototype also passed raw TUN traffic both
+  ways with a pre-batch daemon and delivered all 48 SDK messages.
+- A cold Linux test kept the binaries fixed and changed the hub
+  container's cgroup CPU weight from 100 to 532 on the two-vCPU stand.
+  Hub thread runnable wait fell from 13.13 to 5.58 s and the peak TCP
+  receive queue fell from 1.79 MB to 104 kB. UDP losses fell from 7,234
+  to 60, with 7,232 and 60 respectively matching IPC job refusals. The
+  weighted trial sent 151,221 datagrams versus 165,447 in the control
+  at the same configured rates. Both delivered all 200 SDK messages.
+  Chat p99 changed from 482 to 144 ms towards the hub and from 116 to
+  183 ms in the opposite direction.
+- A reverse-order repeat used 32 Mb/s per flow with weight 532 and
+  29 Mb/s per flow with weight 100 to compensate for the first pair's
+  difference in actual offered load. Both delivered every datagram,
+  161,079 and 151,400 respectively. Peak hub TCP receive queues were
+  88 and 155 kB, and runnable wait totaled 3.54 and 6.00 s. Both
+  delivered all 200 SDK chat messages. The weighted run measured chat
+  p99 of 20 and 26 ms versus about 3 ms in both directions at the lower
+  rate. These samples leave the chat latency cost at equal offered load
+  open.
 - A separate cold start ran the first end-to-end probes in groups of
   four before opening the UDP flows. All 24 paths answered in 12.52 s.
   The following 38 s sample lost 76 of 137,175 UDP datagrams, with one
