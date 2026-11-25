@@ -751,6 +751,20 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   Peak source bursts were 793–818 and 933–1,046 datagrams per 100 ms,
   respectively. These differences in actual offer timing limit what the
   single higher-rate pair establishes about the transport choice.
+- A TCP-only follow-up at 128 Mb/s compared the 200 and 1,600 µs batch
+  windows on the two sending gateways in both orders. Each run first
+  sent 26 sparse tunnel pings on each measured path, then offered
+  334,546 datagrams with concurrent xVeil text traffic. The 200 µs runs
+  lost 2,365 and 2,248 datagrams. The 1,600 µs runs lost 4,044 and
+  3,579. The source IPC job counters registered 245–264 refusals at
+  200 µs and 324–369 at 1,600 µs. Each run delivered and confirmed all
+  96 xVeil messages.
+- Confirmation p95 went from 305 to 190 ms in the first pair and from
+  542 to 376 ms in the reverse pair. Delivery p95 went from 114 to
+  129 ms and from 332 to 182 ms. Before load, median ping RTT across the
+  paths ranged from 4.44 to 7.35 ms at 200 µs and 5.87 to 6.90 ms at
+  1,600 µs. Under load, the larger window raised ping p95 on both paths
+  in the first pair and lowered it on both paths in the reverse pair.
 
 ### Sustained Linux load
 
