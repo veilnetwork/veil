@@ -995,6 +995,28 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   and 0.55 s respectively. Every run kept its gateway process and
   TUN interfaces and delivered all 48 SDK messages exactly once.
 
+### Remote session changes with pre-batch daemons
+
+- The gateway listens for session changes on pre-batch daemons as
+  well. Between groups of the ordinary sweep, a session change can
+  trigger a bounded peer snapshot or a check of installed or recently
+  admitted routes. Each priority round checks up to four peers through
+  the existing single-peer admission query, paced at 125 ms per
+  request. Installing a route still requires confirmed admission.
+  The ordinary sweep resumes from its previous position.
+- In alternating Linux ARM64 runs with 128 configured peers and one
+  late-joining peer, the updated gateway installed the route in
+  4.13–4.17 s, withdrew it in 0.04–2.26 s, and restored it in
+  2.24–4.14 s. Controls based on `4cdaa0e3` took 13.99–14.09 s,
+  6.14–6.36 s, and 16.04–16.26 s respectively. Times start when
+  the stand observes the session state change through the daemon IPC.
+  A pre-batch run with 4,096 configured peers took 4.14 s, 2.20 s,
+  and 4.22 s respectively. A run with the current daemon and the same
+  number of configured peers took 0.57 s, 0.33 s, and 0.03 s.
+  All six runs restored bidirectional traffic on the same gateway and
+  TUN interfaces. Every run delivered its 48 SDK chat messages exactly
+  once before the remote disconnect.
+
 ### Emulated inter-site link
 
 - Three nodes spanned two emulated sites on one Linux ARM64 host. The

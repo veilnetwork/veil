@@ -253,6 +253,7 @@ const PNET_REFRESH_PERIOD: Duration = Duration::from_secs(5);
 const PNET_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const PNET_BATCH_RETRY_AFTER: Duration = Duration::from_secs(2);
 const PNET_LEGACY_QUERY_GROUP: usize = 16;
+const PNET_LEGACY_PRIORITY_GROUP: usize = 4;
 // Daemons admit 10 local queries per second per IPC client. Leave room for
 // other local queries and avoid consuming the burst quota at startup.
 const PNET_QUERY_SPACING: Duration = Duration::from_millis(125);
@@ -262,8 +263,8 @@ const PNET_SESSION_COALESCE: Duration = Duration::from_millis(100);
 const PNET_PRIORITY_RECHECK_SPACING: Duration = Duration::from_secs(1);
 const PNET_PEER_HINT_TIMEOUT: Duration = Duration::from_millis(250);
 
-fn pnet_session_refresh_spacing(peer_count: usize) -> Duration {
-    let batches = peer_count.div_ceil(veilclient::PNET_ADMISSION_BATCH_MAX_PEERS);
+fn pnet_session_refresh_spacing(peer_count: usize, group_size: usize) -> Duration {
+    let batches = peer_count.div_ceil(group_size);
     // Limit the extra work under continuous churn. Once a table needs half or
     // more of the regular sweep window, use the regular cadence.
     let batches = u32::try_from(batches).unwrap_or(u32::MAX);
@@ -361,6 +362,7 @@ impl RecentAdmissions {
         admitted: &HashMap<NodeId, u64>,
         now: Instant,
         selected: &[(NodeId, [u8; 32])],
+        limit: usize,
     ) -> Vec<(NodeId, [u8; 32])> {
         self.seen.retain(|peer, seen| {
             now.duration_since(*seen) < PNET_RECENT_WINDOW
@@ -378,7 +380,7 @@ impl RecentAdmissions {
                     .ok()
                     .map(|index| peers[index])
             })
-            .take(veilclient::PNET_ADMISSION_BATCH_MAX_PEERS.saturating_sub(selected.len()))
+            .take(limit.saturating_sub(selected.len()))
             .collect();
         if let Some((peer, _)) = group.last() {
             self.cursor = *peer;
@@ -511,8 +513,8 @@ fn withdrawal_candidates(
     admitted: &HashMap<NodeId, u64>,
     live: Option<&LivePeerHints>,
     cursor: Option<NodeId>,
+    limit: usize,
 ) -> Vec<(NodeId, [u8; 32])> {
-    let limit = veilclient::PNET_ADMISSION_BATCH_MAX_PEERS;
     if admitted.len() <= limit {
         let mut installed: Vec<_> = admitted
             .keys()
@@ -1678,8 +1680,18 @@ async fn maintain_routes(
         {
             refresh.note_event(event);
         }
-        let multiple_batches =
-            configured.peer_app_ids.len() > veilclient::PNET_ADMISSION_BATCH_MAX_PEERS;
+        let batched_admission = connection
+            .as_ref()
+            .is_none_or(|client| client.supports_pnet_admission_batch());
+        let (group_size, priority_size) = if batched_admission {
+            (
+                veilclient::PNET_ADMISSION_BATCH_MAX_PEERS,
+                veilclient::PNET_ADMISSION_BATCH_MAX_PEERS,
+            )
+        } else {
+            (PNET_LEGACY_QUERY_GROUP, PNET_LEGACY_PRIORITY_GROUP)
+        };
+        let multiple_batches = configured.peer_app_ids.len() > group_size;
         let session_due = session_refresh.as_ref().and_then(|refresh| refresh.pending);
         let session_due_at = session_due.map(|due| due.max(next_session_sweep));
         let may_recheck_sessions = multiple_batches || next_peer == 0;
@@ -1900,8 +1912,8 @@ async fn maintain_routes(
             continue;
         }
         if wake == Wake::SessionSweep {
-            next_session_sweep =
-                Instant::now() + pnet_session_refresh_spacing(configured.peer_app_ids.len());
+            next_session_sweep = Instant::now()
+                + pnet_session_refresh_spacing(configured.peer_app_ids.len(), group_size);
             if next_peer == 0 {
                 refresh.reset();
             }
@@ -1914,17 +1926,15 @@ async fn maintain_routes(
                     .await;
             if let Some(client) = &connection {
                 let batched_admission = client.supports_pnet_admission_batch();
-                if batched_admission {
-                    session_refresh = Some(SessionRefresh {
-                        events: client.events().await,
-                        pending: None,
-                        session_count: None,
-                        pending_loss: None,
-                        pending_readmission: None,
-                        next_priority_check: Instant::now(),
-                        loss_cursor: None,
-                    });
-                }
+                session_refresh = Some(SessionRefresh {
+                    events: client.events().await,
+                    pending: None,
+                    session_count: None,
+                    pending_loss: None,
+                    pending_readmission: None,
+                    next_priority_check: Instant::now(),
+                    loss_cursor: None,
+                });
                 let group_limit = if batched_admission {
                     veilclient::PNET_ADMISSION_BATCH_MAX_PEERS
                 } else {
@@ -1973,10 +1983,9 @@ async fn maintain_routes(
         // sweep at the same cursor. The snapshot never changes admission.
         let recheck_sessions = wake == Wake::SessionSweep && multiple_batches;
         let withdrawal = priority == Some(PriorityCheck::Withdrawal);
-        let need_snapshot = recheck_sessions
-            || (withdrawal && admitted.len() > veilclient::PNET_ADMISSION_BATCH_MAX_PEERS);
+        let need_snapshot = recheck_sessions || (withdrawal && admitted.len() > priority_size);
         let live = if need_snapshot && let Some(client) = &connection {
-            live_peer_hints(client, &mut pace, recheck_sessions).await
+            live_peer_hints(client, &mut pace, recheck_sessions && batched_admission).await
         } else {
             None
         };
@@ -1986,8 +1995,13 @@ async fn maintain_routes(
             let cursor = session_refresh
                 .as_ref()
                 .and_then(|refresh| refresh.loss_cursor);
-            let group =
-                withdrawal_candidates(&configured.peer_app_ids, &admitted, live.as_ref(), cursor);
+            let group = withdrawal_candidates(
+                &configured.peer_app_ids,
+                &admitted,
+                live.as_ref(),
+                cursor,
+                priority_size,
+            );
             if let Some((peer, _)) = group.last()
                 && let Some(refresh) = session_refresh.as_mut()
             {
@@ -2000,7 +2014,9 @@ async fn maintain_routes(
             group
         } else {
             live.as_ref().map_or_else(Vec::new, |live| {
-                live.changed_peers(&configured.peer_app_ids, &admitted)
+                let mut candidates = live.changed_peers(&configured.peer_app_ids, &admitted);
+                candidates.truncate(priority_size);
+                candidates
             })
         };
         let readmission = priority == Some(PriorityCheck::Readmission);
@@ -2013,12 +2029,8 @@ async fn maintain_routes(
         let incomplete_hint = binding.signed.is_none()
             && recheck_sessions
             && live.as_ref().is_none_or(|live| live.at_capacity)
-            && retry.len() < veilclient::PNET_ADMISSION_BATCH_MAX_PEERS;
-        if (signed_retry || incomplete_hint || readmission)
-            && connection
-                .as_ref()
-                .is_some_and(|client| client.supports_pnet_admission_batch())
-        {
+            && retry.len() < priority_size;
+        if (signed_retry || incomplete_hint || readmission) && connection.is_some() {
             let now = Instant::now();
             if signed_retry {
                 retry_due = now + PNET_RETRY_PERIOD;
@@ -2027,7 +2039,13 @@ async fn maintain_routes(
                 .recent
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .retry_group(&configured.peer_app_ids, &admitted, now, &retry);
+                .retry_group(
+                    &configured.peer_app_ids,
+                    &admitted,
+                    now,
+                    &retry,
+                    priority_size,
+                );
             retry.extend(recent);
         }
         // A readmission hint with no matching recent routes takes no IPC slot.
@@ -2044,7 +2062,15 @@ async fn maintain_routes(
         if !retry.is_empty()
             && let Some(client) = &connection
         {
-            match query_pnet_batch(client, &retry, &mut pace).await {
+            // Older daemons use at most four paced unary queries per
+            // priority round before the regular sweep resumes.
+            let (response, reconnect_legacy) = if client.supports_pnet_admission_batch() {
+                (query_pnet_batch(client, &retry, &mut pace).await, false)
+            } else {
+                let (results, uncertain) = query_pnet_legacy(client, &retry, &mut pace).await;
+                (Some(results), uncertain)
+            };
+            match response {
                 Some(results) => {
                     if apply_admissions(&retry, results, &mut admitted, &binding) {
                         publish_routes(
@@ -2055,6 +2081,13 @@ async fn maintain_routes(
                     }
                 }
                 None => connection = None,
+            }
+            if reconnect_legacy {
+                // Match the ordinary legacy sweep: invalidate unconfirmed
+                // routes in this group and discard potentially late replies.
+                connection = None;
+                session_refresh = None;
+                continue;
             }
         }
         if priority.is_some() && connection.is_some() {
@@ -2072,6 +2105,7 @@ async fn maintain_routes(
                     query_pnet_legacy(client, &order[next_peer..end], &mut pace).await;
                 if uncertain {
                     connection = None;
+                    session_refresh = None;
                 }
                 results = Some(legacy_results);
             }
@@ -2641,11 +2675,27 @@ mod tests {
         recent.seen.insert([2; 32], now - PNET_RECENT_WINDOW);
         let live = HashMap::from([([1; 32], 0)]);
 
-        let batch = recent.retry_group(&peers, &live, now, &[]);
+        let batch = recent.retry_group(
+            &peers,
+            &live,
+            now,
+            &[],
+            veilclient::PNET_ADMISSION_BATCH_MAX_PEERS,
+        );
         assert_eq!(batch.len(), veilclient::PNET_ADMISSION_BATCH_MAX_PEERS);
         assert_eq!(batch[0].0, [3; 32]);
         assert_eq!(batch.last().unwrap().0, [66; 32]);
-        assert_eq!(recent.retry_group(&peers, &live, now, &[])[0].0, [67; 32]);
+        assert_eq!(
+            recent.retry_group(
+                &peers,
+                &live,
+                now,
+                &[],
+                veilclient::PNET_ADMISSION_BATCH_MAX_PEERS
+            )[0]
+            .0,
+            [67; 32]
+        );
         assert!(!recent.seen.contains_key(&[2; 32]));
         assert!(!recent.seen.contains_key(&[68; 32]));
     }
@@ -2824,13 +2874,14 @@ mod tests {
             ids: configured[..10].iter().map(|(id, _)| *id).collect(),
         };
 
-        let first = withdrawal_candidates(&configured, &admitted, Some(&capped), None);
+        let first = withdrawal_candidates(&configured, &admitted, Some(&capped), None, limit);
         assert_eq!(first.as_slice(), &configured[10..10 + limit]);
         let second = withdrawal_candidates(
             &configured,
             &admitted,
             Some(&capped),
             first.last().map(|(peer, _)| *peer),
+            limit,
         );
         assert_eq!(second.as_slice(), &configured[10 + limit..10 + 2 * limit]);
         let wrapped = withdrawal_candidates(
@@ -2838,6 +2889,7 @@ mod tests {
             &admitted,
             None,
             configured.last().map(|(peer, _)| *peer),
+            limit,
         );
         assert_eq!(wrapped.as_slice(), &configured[..limit]);
     }
