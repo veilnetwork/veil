@@ -476,8 +476,26 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   209 ms towards the hub. On QUIC the hub received 96 of 100 probes with
   p99 of 2,255 ms among those received. The other endpoint received all
   100. These probes used `AppSender::send` without an end-to-end receipt.
-  The xVeil text outbox uses peer receipts and retries, which need a
-  separate workload to measure.
+- A separate Flutter test ran the xVeil `MessagingService` with its native
+  Veil client and in-memory journal backing. The two endpoints completed
+  the contact handshake before starting UDP. Each sent 48 text messages
+  on the direct private-network path, at five messages per second. The
+  Linux QUIC stand used 24 gateways with 4,096 entries each and two
+  32 Mb/s UDP flows. It delivered all 167,208 UDP datagrams. All 96 texts
+  appeared in recipient history exactly once and were marked delivered
+  at their senders. The test polled history every 50 ms and observed a
+  57 ms arrival p95 and 66 ms receipt p95 in both directions.
+- At the same offered rates on TCP, the xVeil test delivered and
+  confirmed all 96 messages. The arrival p95 was 54–55 ms and the
+  receipt p95 was 64–65 ms. The 260 missing UDP datagrams out of 167,061
+  matched the loss counts at the receiving application sockets.
+- At two 64 Mb/s UDP flows on TCP, the xVeil test again delivered and
+  confirmed all 96 texts, with no duplicate history entries. Arrival
+  p95 was 79 ms from the hub and 132 ms towards it. Receipt p95 was
+  144 ms and 132 ms respectively, and the longest receipt took 431 ms.
+  The UDP receivers got 330,010 of 332,171 datagrams and reported 58
+  local socket drops. This exercised the current direct xVeil path with
+  contact consent in place at the start of bulk traffic.
 - A separate cold start ran the first end-to-end probes in groups of
   four before opening the UDP flows. All 24 paths answered in 12.52 s.
   The following 38 s sample lost 76 of 137,175 UDP datagrams, with one
