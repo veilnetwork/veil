@@ -14,6 +14,7 @@ use std::path::Path;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use tokio::runtime::Builder;
 use veil_crypto::{generate_keypair, sign_message};
+use veil_identity::network_access::NetworkAccessGate;
 use veil_identity::network_cert::{
     canonical_cert_body, decode_cert_blob, encode_cert_blob, verify_membership_cert,
 };
@@ -21,6 +22,7 @@ use veil_types::{MEMBERSHIP_CERT_VERSION, MembershipCert, SignatureAlgorithm};
 
 use veil_cfg;
 use veil_node_runtime::admin as node;
+use veil_node_runtime::local_identity::HandshakeIdentity;
 
 use super::{
     cli::{NetworkArgs, NetworkCommand},
@@ -77,9 +79,70 @@ pub fn handle_network_command<I: CommandIo>(
             &network_id,
             member_node_id.as_deref(),
         ),
+        NetworkCommand::CheckMembership { certificate } => {
+            check_membership(context, certificate.as_deref())
+        }
         NetworkCommand::RoutePolicy { command } => super::network_policy_cmd::run(context, command),
         NetworkCommand::Ban { node_id, reason } => ban(context, node_id, reason),
     }
+}
+
+fn check_membership<I: CommandIo>(
+    context: &mut CommandContext<'_, I, impl super::handlers::ConfigOps>,
+    certificate: Option<&Path>,
+) -> veil_cfg::Result<()> {
+    let (_, mut config) = context.config().load_existing()?;
+    let private_required = || {
+        veil_cfg::ConfigError::ValidationFailed(
+            "[network].mode must be private or private_configured".into(),
+        )
+    };
+    let network = config.network.as_mut().ok_or_else(private_required)?;
+    if let Some(path) = certificate {
+        network.membership_cert = Some(
+            path.to_str()
+                .ok_or_else(|| {
+                    veil_cfg::ConfigError::ValidationFailed(
+                        "replacement certificate path must be UTF-8".into(),
+                    )
+                })?
+                .to_owned(),
+        );
+    }
+    let gate = NetworkAccessGate::from_config(network)
+        .map_err(|error| {
+            veil_cfg::ConfigError::ValidationFailed(format!("[network] gate load failed: {error}"))
+        })?
+        .ok_or_else(private_required)?;
+    // Apply the daemon's identity and configuration checks to the effective
+    // configuration, including a replacement certificate path if supplied.
+    let report = if config.global.strict_config_validation {
+        veil_cfg::validate_strict(&config)
+    } else {
+        veil_cfg::validate(&config)
+    };
+    if !report.is_valid() {
+        return Err(veil_cfg::ConfigError::ValidationFailed(
+            report.format_issues(),
+        ));
+    }
+    let identity = HandshakeIdentity::from_config(&config).map_err(map_node_error)?;
+    let cert = gate
+        .verify_peer(
+            Some(&gate.local_cert_blob),
+            identity.node_id.as_bytes(),
+            veil_util::unix_secs_now_u64(),
+        )
+        .map_err(|error| {
+            veil_cfg::ConfigError::ValidationFailed(format!(
+                "[network] local membership certificate: {error}"
+            ))
+        })?;
+    context.io.emit(OutputEvent::PnetMembershipVerified {
+        member_node_id: identity.node_id.to_string(),
+        valid_until_unix: (cert.valid_until_unix != 0).then_some(cert.valid_until_unix),
+    });
+    Ok(())
 }
 
 fn ban<I: CommandIo>(
@@ -515,6 +578,66 @@ mod tests {
             msg.contains("Cert verification failed"),
             "expected verification failure, got: {msg}"
         );
+    }
+
+    #[test]
+    fn membership_preflight_checks_replacement_without_installing_it() {
+        use veil_types::{NetworkConfig, NetworkMode};
+
+        let dir = tempdir().unwrap();
+        let owner_pub = dir.path().join("owner.pub");
+        let owner_priv = dir.path().join("owner.priv");
+        let installed = dir.path().join("member.cert");
+        let replacement = dir.path().join("replacement.cert");
+        let algo = SignatureAlgorithm::Ed25519;
+        let network_id = "11".repeat(32);
+        let mut identity = crate::test_support::valid_identity();
+        let node_id =
+            veil_cfg::NodeId::from_public_key(identity.algo, &identity.public_key).unwrap();
+        identity.node_id = Some(node_id);
+        let mut context = ctx();
+        gen_owner(&mut context, &owner_pub, &owner_priv, algo).unwrap();
+        for (cert, member) in [
+            (&installed, "22".repeat(32)),
+            (&replacement, node_id.to_hex()),
+        ] {
+            sign_member(
+                &mut context,
+                &owner_pub,
+                &owner_priv,
+                algo,
+                &network_id,
+                &member,
+                false,
+                30,
+                false,
+                cert,
+            )
+            .unwrap();
+        }
+        context.ops.loaded_config.identity = Some(identity);
+        context.ops.loaded_config.network = Some(NetworkConfig {
+            mode: NetworkMode::PrivateConfigured,
+            network_id: Some(network_id),
+            owner_pubkey: Some(fs::read_to_string(&owner_pub).unwrap().trim().to_owned()),
+            owner_algo: Some(algo),
+            membership_cert: Some(installed.to_str().unwrap().to_owned()),
+            ..NetworkConfig::default()
+        });
+        let before = fs::read(&installed).unwrap();
+        assert!(
+            check_membership(&mut context, None)
+                .unwrap_err()
+                .to_string()
+                .contains("cert is not for this peer")
+        );
+        context.io.output.clear();
+        check_membership(&mut context, Some(&replacement)).unwrap();
+        assert!(context.io.output.contains("P-Net membership verified"));
+        assert_eq!(fs::read(&installed).unwrap(), before);
+        assert!(check_membership(&mut context, None).is_err());
+        context.ops.loaded_config.network.as_mut().unwrap().mode = NetworkMode::Public;
+        assert!(check_membership(&mut context, Some(&replacement)).is_err());
     }
 
     #[test]

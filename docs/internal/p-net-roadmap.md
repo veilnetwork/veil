@@ -1707,6 +1707,20 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
 
 ## 7. Diagnose gateway admission
 
+- `veil-cli network check-membership` verifies the effective daemon
+  configuration and its local certificate against the pinned owner,
+  network ID and authenticated node ID. It also checks a replacement
+  certificate by path and emits its expiry in JSONL. The check uses the
+  daemon's startup configuration validation and its certificate gate
+  for peer admission. Both private modes are supported.
+- A macOS CLI run with real owner signatures covered the installed and
+  staged certificate, wrong member, owner and network, expiry, missing
+  and malformed files, and refusal with a public configuration. It
+  compared configuration and certificate bytes before and after each
+  read-only check. A foreground daemon with loopback listeners remained
+  healthy during a successful check and during refusal of another
+  device's certificate. Starting that daemon with the other certificate
+  also failed, and the stand processes exited.
 - `ogate check` reads local configuration, the protected signed policy
   when enabled, and the daemon's IPC status. An optional peer Node ID
   checks admission for one route or mirror. The diagnostic uses the

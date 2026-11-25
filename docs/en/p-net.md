@@ -217,6 +217,28 @@ the configured owner and membership settings. Older binaries require
 their existing `private` configuration. A node on such a binary can
 join the same network with a valid certificate from the same owner.
 
+## Check local membership before restart
+
+Run the preflight as the daemon user, from its working directory. It
+checks the node configuration and verifies that the local certificate
+matches the configured network, owner key and node ID, and is currently
+valid. The command works with both private modes while the daemon is
+stopped or running.
+
+```sh
+veil-cli --config /var/lib/veil/node.toml network check-membership
+veil-cli --config /var/lib/veil/node.toml network check-membership \
+  --certificate /var/lib/veil/staging/replacement.cert
+```
+
+The second invocation checks a replacement certificate in memory. For an
+owner rotation, pass the candidate config with the new owner pin. The
+preflight leaves configuration and certificate files untouched. Use
+`--output-format jsonl` before `network` for the
+`pnet_membership_verified` event. Its `valid_until_unix` is `null` for a
+certificate without expiry. Check live peer admission and reachability
+after the restart with `ogate check`.
+
 ## App-layer admission (ogate / oproxy)
 
 The daemon's P-Net gate decides whether a peer may open an OVL1 session
@@ -598,15 +620,17 @@ an independent management channel.
 
 ## Ansible rollout
 
-The repo ships two playbooks: `ansible/deploy-pnet.yml` switches a
+The repo ships two playbooks. `ansible/deploy-pnet.yml` switches a
 cluster to private mode, and `ansible/revert-pnet.yml` switches it back
-to public. Both run `serial: 1` — one host at a time — so the cluster
-keeps a quorum throughout and never goes fully dark.
+to public. Both process one host at a time. Plan for interrupted
+connectivity between hosts in different modes during the rollout.
 
 Before you run them, the controller needs:
-- `/tmp/pnet/owner.pub` + `/tmp/pnet/owner.priv` + `/tmp/pnet/network_id.hex`
+- `/tmp/pnet/owner.pub` and `/tmp/pnet/network_id.hex`
 - One cert per host at `/tmp/pnet/<cfg-name>.cert` (cfg-name = b1/b2/b3 +
   n1..n5 — see the `inv_to_cfg` map in `deploy-pnet.yml`).
+
+Keep the owner signing key on the issuer.
 
 ```bash
 # Roll out:

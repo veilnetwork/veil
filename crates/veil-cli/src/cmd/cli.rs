@@ -2141,6 +2141,12 @@ pub enum NetworkCommand {
         #[arg(long, value_name = "HEX64")]
         member_node_id: Option<String>,
     },
+    /// Check local private-network membership before starting the daemon.
+    CheckMembership {
+        /// Test a replacement certificate without installing it.
+        #[arg(long, value_name = "PATH")]
+        certificate: Option<PathBuf>,
+    },
     /// Sign, verify and install owner-authorized virtual address policies.
     RoutePolicy {
         #[command(subcommand)]

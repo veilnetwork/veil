@@ -54,6 +54,10 @@ pub enum OutputEvent {
     ValidationFixed {
         fixed: usize,
     },
+    PnetMembershipVerified {
+        member_node_id: String,
+        valid_until_unix: Option<u64>,
+    },
     ConfigValue {
         value: String,
     },
@@ -222,6 +226,15 @@ impl OutputEvent {
             OutputEvent::ValidationFixed { fixed } => {
                 render_text(ValidationFixedText { fixed: *fixed })
             }
+            OutputEvent::PnetMembershipVerified {
+                member_node_id,
+                valid_until_unix,
+            } => match valid_until_unix {
+                Some(expiry) => format!(
+                    "P-Net membership verified for {member_node_id} (expires at Unix time {expiry})\n"
+                ),
+                None => format!("P-Net membership verified for {member_node_id} (no expiry)\n"),
+            },
             OutputEvent::ConfigValue { value } => render_text(TextLine(value)),
             OutputEvent::SupportedAlgorithm(SupportedAlgorithmView { algorithm }) => {
                 render_text(TextLine(algorithm))
