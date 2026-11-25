@@ -32,7 +32,7 @@ use veil_proto::{
     pair_source_status, pair_target_status,
 };
 
-use crate::frame_io::{encode_reply_frame_id, write_frame_wh};
+use crate::frame_io::{encode_reply_frame_id, write_frame_wh, write_frame_wh_id};
 use crate::server::{IpcClientState, LoopReply};
 use crate::transport::IpcWriteHalf;
 use crate::{
@@ -154,6 +154,7 @@ pub(crate) async fn handle_get_peers(
     wh: &mut IpcWriteHalf,
     client_state: &mut IpcClientState,
     peer_list_provider: Option<&Arc<dyn PeerListProvider>>,
+    request_id: u32,
 ) -> std::io::Result<()> {
     if !client_state.allow_query() {
         return Ok(());
@@ -169,10 +170,11 @@ pub(crate) async fn handle_get_peers(
     if payload.peers.len() > veil_proto::MAX_PEERS_LIST_ENTRIES {
         payload.peers.truncate(veil_proto::MAX_PEERS_LIST_ENTRIES);
     }
-    write_frame_wh(
+    write_frame_wh_id(
         wh,
         FrameFamily::LocalApp as u8,
         LocalAppMsg::PeersList as u16,
+        request_id,
         &payload.encode(),
     )
     .await

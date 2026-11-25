@@ -92,6 +92,26 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   mixed-version run with a pre-batch daemon used the single-peer queries,
   passed traffic in both directions, and withdrew the disconnected
   peer's route.
+- A peer-list query triggered by a session event can retry once after
+  its 250 ms timeout. The retry uses the existing 125 ms query pace.
+  The daemon echoes the request ID in `PeersList`, so a late reply to
+  the first query cannot satisfy its replacement. An IPC test with a
+  delayed empty list reproduced the missed route restoration for a
+  table with 4,096 entries and passed with both changes. The peer list
+  schedules queries. Route admission still requires a current positive
+  membership result.
+- On two Linux ARM64 peers with real TUN interfaces, an IPC proxy
+  dropped the first peer-list reply after reconnect in each trial.
+  With 4,096 configured entries, route restoration after the daemon
+  reported admission took 6.42 s on the previous bridge and 5.59 s
+  with the retry. Both used the same older daemon. The candidate
+  retried on the same connection with a new request ID. Both trials
+  passed encrypted traffic in both directions after the restart and
+  rekey. The echo path for zero and nonzero request IDs is covered by
+  a separate Unix IPC test.
+- A separate mixed run used a pre-batch daemon with 34 configured
+  entries. The tunnel passed traffic in both directions, and the new
+  bridge removed the route 0.879 s after disconnect.
 - On three Linux ARM64 nodes with 1,024 routes per node and 32 Mb/s of
   offered UDP on the surviving link, three A/B runs measured route
   withdrawal of 1.72–1.94 s with session events and 3.75–3.78 s with the

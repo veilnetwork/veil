@@ -3664,7 +3664,7 @@ async fn handle_ipc_client(
                         .await?;
                     }
                     Ok(LocalAppMsg::GetPeers) => {
-                        handle_get_peers(&mut wh, &mut client_state, peer_list_provider.as_ref())
+                        handle_get_peers(&mut wh, &mut client_state, peer_list_provider.as_ref(), hdr.request_id)
                             .await?;
                     }
                     Ok(LocalAppMsg::PnetStatusQuery) => {

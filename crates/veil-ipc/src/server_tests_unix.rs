@@ -2894,6 +2894,30 @@ async fn send_ipc_frame_id(client: &mut UnixStream, msg_type: u16, request_id: u
     }
 }
 
+#[tokio::test]
+async fn peers_list_echoes_the_request_id_including_legacy_zero() {
+    let sock = temp_socket_path();
+    let (mut server, shutdown, _) = make_server(sock.clone());
+    let task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut client = connect_and_hello(&sock).await;
+
+    for id in [0, 123, 456] {
+        send_ipc_frame_id(&mut client, LocalAppMsg::GetPeers as u16, id, &[]).await;
+        let (header, body) =
+            tokio::time::timeout(Duration::from_secs(2), recv_ipc_frame(&mut client))
+                .await
+                .expect("peer-list reply did not arrive");
+        assert_eq!(header.msg_type, LocalAppMsg::PeersList as u16);
+        assert_eq!(header.request_id, id);
+        assert_eq!(body, veil_proto::PeersListPayload::default().encode());
+    }
+
+    drop(client);
+    shutdown.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
 /// Two requests on ONE connection: a slow LookupRelayKey (id 1, resolver
 /// sleeps 300 ms) then a fast GetNodeIdentity (id 2). With non-zero ids the
 /// slow arc is spawned off-loop, so the fast reply must arrive FIRST and

@@ -361,17 +361,28 @@ impl LivePeerHints {
 async fn live_peer_hints(
     client: &VeilClient,
     pace: &mut tokio::time::Interval,
+    retry_after_timeout: bool,
 ) -> Option<LivePeerHints> {
-    pace.tick().await;
-    let peers = match tokio::time::timeout(PNET_PEER_HINT_TIMEOUT, client.peers()).await {
-        Ok(Ok(peers)) => peers,
-        Ok(Err(error)) => {
-            tracing::debug!(%error, "P-Net session hint query failed");
-            return None;
-        }
-        Err(_) => {
-            tracing::debug!("P-Net session hint query timed out");
-            return None;
+    let mut retried = false;
+    let peers = loop {
+        pace.tick().await;
+        match tokio::time::timeout(PNET_PEER_HINT_TIMEOUT, client.peers()).await {
+            Ok(Ok(peers)) => break peers,
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "P-Net session hint query failed");
+                return None;
+            }
+            Err(_) if retry_after_timeout && !retried => {
+                // A missed hint after a session event can leave a rejoining
+                // peer waiting for the next full sweep. Repeat the hint at the
+                // existing query pace before resuming that sweep.
+                retried = true;
+                tracing::debug!("retrying P-Net session hint after timeout");
+            }
+            Err(_) => {
+                tracing::debug!("P-Net session hint query timed out");
+                return None;
+            }
         }
     };
     Some(LivePeerHints {
@@ -1532,7 +1543,7 @@ async fn maintain_routes(
                     .unwrap_or(&configured.peer_app_ids);
                 if next_peer == 0
                     && order.len() > veilclient::PNET_ADMISSION_BATCH_MAX_PEERS
-                    && let Some(live) = live_peer_hints(client, &mut pace).await
+                    && let Some(live) = live_peer_hints(client, &mut pace, false).await
                     && let Some(prioritized) = prioritize_live_peers(order, &live.ids)
                 {
                     admission_order = Some(prioritized);
@@ -1547,7 +1558,7 @@ async fn maintain_routes(
         let mut retry = if wake == Wake::SessionSweep
             && multiple_batches
             && let Some(client) = &connection
-            && let Some(live) = live_peer_hints(client, &mut pace).await
+            && let Some(live) = live_peer_hints(client, &mut pace, true).await
         {
             live.changed_peers(&configured.peer_app_ids, &admitted)
         } else {
@@ -2159,7 +2170,7 @@ mod tests {
         config
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pnet_session_changes_recheck_routes_before_a_large_sweep_finishes() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use veil_ipc::{EventBus, IpcEndpoint, IpcServer, PeerListProvider, PnetStatusProvider};
@@ -2168,10 +2179,15 @@ mod tests {
         const PEER: NodeId = [0xaa; 32];
         struct Session {
             active: AtomicBool,
+            delay_next_hint: AtomicBool,
             past_first_batch: Notify,
         }
         impl PeerListProvider for Session {
             fn list_peers(&self) -> PeersListPayload {
+                if self.delay_next_hint.swap(false, Ordering::Relaxed) {
+                    std::thread::sleep(PNET_PEER_HINT_TIMEOUT + Duration::from_millis(100));
+                    return PeersListPayload { peers: Vec::new() };
+                }
                 let peers = self
                     .active
                     .load(Ordering::Relaxed)
@@ -2207,6 +2223,7 @@ mod tests {
         let socket = directory.path().join("ipc");
         let session = Arc::new(Session {
             active: AtomicBool::new(true),
+            delay_next_hint: AtomicBool::new(false),
             past_first_batch: Notify::new(),
         });
         let events = Arc::new(EventBus::new());
@@ -2278,6 +2295,7 @@ mod tests {
         );
 
         session.active.store(true, Ordering::Relaxed);
+        session.delay_next_hint.store(true, Ordering::Relaxed);
         assert_ne!(
             events.publish(EventPayload {
                 kind: SESSION_ADMITTED,
@@ -2292,6 +2310,7 @@ mod tests {
         })
         .await
         .expect("route restoration did not use the session admission event");
+        assert!(!session.delay_next_hint.load(Ordering::Relaxed));
 
         updates.abort();
         assert!(updates.await.unwrap_err().is_cancelled());
