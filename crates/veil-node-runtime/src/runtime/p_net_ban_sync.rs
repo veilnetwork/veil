@@ -87,7 +87,9 @@ pub enum PublishBanError {
     NoGate,
     #[error("local cert decode failed: {0}")]
     BadLocalCert(String),
-    #[error("local node is not an admin — cert.admin = false")]
+    #[error(
+        "local P-Net administrator requires cert.admin = true and inclusion in any nonempty [network].admin_node_ids list"
+    )]
     NotAdmin,
     #[error("local identity signing key not available (Ed25519 falcon mode?)")]
     NoSigningKey,
@@ -139,18 +141,16 @@ impl PreparedBan {
 }
 
 impl NodeRuntime {
-    /// Author a signed `BanEntry`, store it locally, and apply it to the local
-    /// `BanList` — the synchronous half. Returns a [`PreparedBan`] whose
-    /// [`PreparedBan::replicate`] performs the async DHT fan-out. Split out
+    /// Author a signed `BanEntry` and apply it to the local `BanList`.
+    /// Returns a [`PreparedBan`] whose [`PreparedBan::replicate`] performs
+    /// the async DHT fan-out. Split out
     /// (audit cycle-6 T7) so the admin handler can drop the `NodeRuntime` lock
     /// before the network await. `publish_p_net_ban` chains both for callers
     /// that don't hold the lock.
     ///
-    /// Requires `[network].mode = "private"`, a local membership cert
-    /// flagged `admin: true`, and a live identity Ed25519 signing key
-    /// (the cert's `admin_pubkey` derives of it). All three pre-
-    /// conditions are static at startup, so failures here generally
-    /// indicate a misconfiguration rather than transient state.
+    /// Requires a private network, a local membership cert flagged
+    /// `admin: true`, inclusion in any configured admin allowlist, and a
+    /// live identity Ed25519 signing key.
     pub fn prepare_p_net_ban(
         &self,
         banned_node_id: [u8; 32],
@@ -159,7 +159,7 @@ impl NodeRuntime {
         let gate = self.network_gate.as_ref().ok_or(PublishBanError::NoGate)?;
         let local_cert = veil_identity::network_cert::decode_cert_blob(&gate.local_cert_blob)
             .map_err(|e| PublishBanError::BadLocalCert(e.to_string()))?;
-        if !local_cert.admin {
+        if !gate.is_admin(&local_cert) {
             return Err(PublishBanError::NotAdmin);
         }
         let sk = self
@@ -346,6 +346,79 @@ mod tests {
     use veil_identity::network_cert::{canonical_cert_body, encode_cert_blob};
     use veil_proto::discovery::StorePayload;
     use veil_types::{MEMBERSHIP_CERT_VERSION, MembershipCert, SignatureAlgorithm};
+
+    #[tokio::test]
+    async fn publishing_a_ban_checks_the_admin_allowlist_before_effects() {
+        use super::super::tests::runtime_config_with_listen;
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use veil_cfg::{BuiltinSeedPolicy, NetworkConfig, NetworkMode, NodeRole};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("network.cert");
+        let config_path = dir.path().join("node.toml");
+        let owner = SigningKey::from_bytes(&[1; 32]);
+        let network_id = [3; 32];
+        let mut config = runtime_config_with_listen();
+        config.peers.clear();
+        config.global.builtin_seed_policy = BuiltinSeedPolicy::Never;
+        let identity = config.identity.as_mut().unwrap();
+        identity.role = NodeRole::Leaf;
+        let local_id = *identity.node_id.unwrap().as_bytes();
+        let now = veil_util::unix_secs_now_u64();
+        let mut cert = MembershipCert {
+            version: MEMBERSHIP_CERT_VERSION,
+            network_id,
+            member_node_id: local_id,
+            issued_at_unix: now.saturating_sub(1),
+            valid_until_unix: now + 3600,
+            admin: true,
+            algo: SignatureAlgorithm::Ed25519,
+            owner_signature: Vec::new(),
+        };
+        cert.owner_signature = owner.sign(&canonical_cert_body(&cert)).to_bytes().to_vec();
+        std::fs::write(&cert_path, encode_cert_blob(&cert)).unwrap();
+        config.network = Some(NetworkConfig {
+            mode: NetworkMode::PrivateConfigured,
+            network_id: Some(veil_util::bytes_to_hex(&network_id)),
+            owner_pubkey: Some(STANDARD.encode(owner.verifying_key().to_bytes())),
+            owner_algo: Some(SignatureAlgorithm::Ed25519),
+            membership_cert: Some(cert_path.to_str().unwrap().to_owned()),
+            admin_node_ids: Vec::new(),
+        });
+        for (target, allowlist, permitted) in [
+            ([4; 32], vec![[9; 32]], false),
+            ([5; 32], vec![local_id], true),
+            ([6; 32], vec![], true),
+        ] {
+            config.network.as_mut().unwrap().admin_node_ids = allowlist
+                .iter()
+                .map(|id| veil_util::bytes_to_hex(id))
+                .collect();
+            std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+            let mut runtime = NodeRuntime::start(&config_path, true).await.unwrap();
+            let _outbox = wlock!(runtime.session_tx_registry).register(target);
+
+            let result = runtime.publish_p_net_ban(target, "test ban").await;
+            if permitted {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(PublishBanError::NotAdmin)));
+            }
+            assert_eq!(lock!(runtime.ban_list).is_banned(&target), permitted);
+            assert_eq!(
+                runtime
+                    .dht
+                    .peek_value(&ban_dht_key(&network_id, &target))
+                    .is_some(),
+                permitted
+            );
+            assert_eq!(
+                veil_util::rlock!(runtime.session_tx_registry).has_session(&target),
+                !permitted
+            );
+            runtime.stop().await.unwrap();
+        }
+    }
 
     #[test]
     fn incoming_ban_retires_the_sender_only_after_verification_and_storage() {

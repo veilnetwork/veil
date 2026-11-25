@@ -163,6 +163,11 @@ the handshake.
 veil-cli network ban <NODE_ID_HEX> --reason "spam"
 ```
 
+Add the issuing administrator's node ID to any nonempty
+`[network].admin_node_ids` lists on the issuer and the receivers. If
+the issuer's own list excludes it, the command returns an error before
+applying or publishing the ban.
+
 Here is what that command sets in motion. It travels over the local
 admin IPC socket (the private channel between the CLI and the running
 daemon) as an `AdminCommand::PNetBan`. The daemon signs a `BanEntry`
