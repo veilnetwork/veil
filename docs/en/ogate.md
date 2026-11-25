@@ -43,6 +43,19 @@ like this:
 
 If untrusted peers might be on the Veil network, use `authorized`.
 
+### Routed reachability diagnostics
+
+On Linux, macOS and FreeBSD, gateways with `pnet_required = true` and an
+explicit `peers` table can set `routed_membership_cert` to the path of their
+own Veil daemon's owner-signed membership certificate. Both gateways need
+the setting, `mode = "authorized"`, and a daemon that supports membership
+verification over local IPC. Restart the gateway after changing the path.
+
+At debug log level (`ogate -v up`), `verified routed P-Net reachability`
+records a fresh round trip authenticated as the configured peer. Each
+endpoint checks the other's certificate and the daemon's current bans.
+IP forwarding continues to require direct daemon admission.
+
 ## Platforms
 
 | Platform | TUN backend | Address setup |

@@ -39,11 +39,20 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   network or member was rejected, and a live ban took effect on the next
   query. The previous daemon completed the existing local IPC handshake
   without advertising certificate verification.
-- For a routed IP peer, verify possession of the certified identity and
-  current bidirectional reachability with a fresh challenge over the
-  authenticated app path. Bind the route to that proof and withdraw it on
-  expiry or loss of admission. Keep the direct status query for existing
-  callers and negotiate routed admission separately.
+- An opt-in gateway control endpoint exchanges fresh challenges with
+  configured peers. It checks the authenticated sender, both endpoint IDs,
+  the live nonce, and the current P-Net certificate before recording a
+  round trip. The next step is to bind IP route admission to that evidence
+  and withdraw it on expiry or loss of admission. Existing gateways use
+  the direct status query for IP routes.
+- In the isolated eight-node Linux ARM64 topology, A and B confirmed
+  reachability without a direct session with R1.1 and R2.3 down. A cold
+  run rejected a certificate for the wrong endpoint and a live ban
+  blocked renewal until it was lifted. A run with `9d4518b6` relay
+  daemons reconfirmed both directions 11.422 s after the failed neighbors
+  were withdrawn. The two gateways exchanged 48 SDK datagrams alongside
+  the probes. A current gateway paired with an older daemon continued
+  to pass direct TUN traffic, with five ICMP replies in each direction.
 
 ## 2. Qualify mixed versions and load
 

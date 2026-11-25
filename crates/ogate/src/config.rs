@@ -56,6 +56,11 @@ pub struct OgateConfig {
     #[serde(default)]
     pub pnet_required: bool,
 
+    /// Path to the local daemon's owner-signed membership certificate.
+    /// Enables diagnostics for authenticated reachability to configured peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed_membership_cert: Option<PathBuf>,
+
     /// Opt-in use of an installed owner-signed address snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_policy: Option<SignedPolicyConfig>,
@@ -365,6 +370,15 @@ impl OgateConfig {
         if !(1..=32_000).contains(&self.batch.flush_after_us) {
             return Err(ConfigError::Field(
                 "`batch.flush_after_us` must be in 1..=32000",
+            ));
+        }
+        if self.routed_membership_cert.is_some()
+            && (!self.pnet_required
+                || self.mode != AccessMode::Authorized
+                || self.signed_policy.is_some())
+        {
+            return Err(ConfigError::Field(
+                "routed_membership_cert requires pnet_required and authorized mode without a signed policy",
             ));
         }
         if let Some(policy) = &self.signed_policy {

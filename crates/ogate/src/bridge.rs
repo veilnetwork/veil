@@ -980,6 +980,9 @@ pub fn validate_reload(old: &OgateConfig, new: &OgateConfig) -> Result<(), &'sta
     if old.signed_policy != new.signed_policy {
         return Err("signed_policy");
     }
+    if old.routed_membership_cert != new.routed_membership_cert {
+        return Err("routed_membership_cert");
+    }
     // Routing and the batch flush window are intentionally reloadable.
     Ok(())
 }
@@ -1034,8 +1037,11 @@ async fn wait_to_rebind(
     }
 }
 
-async fn connect_for_routes(socket: &Path, signed: bool) -> Result<VeilClient, BridgeError> {
-    if signed {
+async fn connect_for_routes(
+    socket: &Path,
+    request_authority: bool,
+) -> Result<VeilClient, BridgeError> {
+    if request_authority {
         VeilClient::connect_with_pnet_authority(socket).await
     } else {
         VeilClient::connect(socket).await
@@ -1048,11 +1054,16 @@ async fn bind_ipc(
     expected: Option<Binding>,
     signed: Option<&SignedRoutes>,
 ) -> Result<BoundIpc, BridgeError> {
-    let client = connect_for_routes(&cfg.socket_path, signed.is_some()).await?;
-    let authority = signed
-        .map(|policy| policy.authenticate(client.pnet_authority(), unix_secs_now_u64()))
-        .transpose()
-        .map_err(BridgeError::Policy)?;
+    let request_authority = signed.is_some() || cfg.routed_membership_cert.is_some();
+    let client = connect_for_routes(&cfg.socket_path, request_authority).await?;
+    let authority = match signed {
+        Some(policy) => Some(
+            policy
+                .authenticate(client.pnet_authority(), unix_secs_now_u64())
+                .map_err(BridgeError::Policy)?,
+        ),
+        None => client.pnet_authority(),
+    };
     let node_id = client
         .node_identity()
         .await
@@ -1802,6 +1813,19 @@ async fn serve_link(
         Arc::clone(&state),
         route_changes,
     ));
+    let routed_proofs = cfg.routed_membership_cert.as_ref().and_then(|certificate| {
+        if let Some(authority) = authority.filter(|_| client.supports_pnet_member_verification()) {
+            Some(tokio::spawn(crate::routed_proofs::run(
+                bridge.accepted.subscribe(),
+                certificate.clone(),
+                binding.node_id,
+                authority,
+            )))
+        } else {
+            tracing::warn!("routed P-Net checks require membership verification from the daemon");
+            None
+        }
+    });
     let (outcome, ingress_finished, egress_finished) = tokio::select! {
         _ = stopping.as_mut() => (Ok(LinkExit::Shutdown), false, false),
         _ = client.wait_disconnected() => (Ok(LinkExit::DaemonDisconnected), false, false),
@@ -1822,6 +1846,10 @@ async fn serve_link(
         status.send_replace(None);
     }
     if let Some(task) = policy_sync {
+        task.abort();
+        let _ = task.await;
+    }
+    if let Some(task) = routed_proofs {
         task.abort();
         let _ = task.await;
     }
@@ -2740,6 +2768,7 @@ mod tests {
             logging: Default::default(),
             batch: Default::default(),
             pnet_required: false,
+            routed_membership_cert: None,
             signed_policy: None,
 
             app_cert_trusted_owner_pubkey: None,

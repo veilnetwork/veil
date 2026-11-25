@@ -68,6 +68,9 @@ tokio = { version = "1", features = [
 ] }
 bytes = "1"
 
+[target.'cfg(unix)'.dependencies]
+getrandom = "0.3"
+
 # Cross-platform TUN device: Linux / macOS / Windows.
 # FreeBSD is handled via the platform-specific freebsd module
 # (raw /dev/tun + ioctl), so the tun crate is excluded there.

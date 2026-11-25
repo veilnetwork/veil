@@ -51,6 +51,8 @@ mod packet_drops;
 mod pnet_check;
 #[cfg(unix)]
 mod policy_sync;
+#[cfg(unix)]
+mod routed_proofs;
 pub mod routing;
 #[cfg(unix)]
 mod signed_policy;

@@ -299,6 +299,7 @@ mod tests {
             logging: Default::default(),
             batch: Default::default(),
             pnet_required: false,
+            routed_membership_cert: None,
             signed_policy: None,
 
             app_cert_trusted_owner_pubkey: None,

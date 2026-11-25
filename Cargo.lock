@@ -2620,6 +2620,7 @@ dependencies = [
  "base64",
  "bytes",
  "clap",
+ "getrandom 0.3.4",
  "hex",
  "libc",
  "nix 0.29.0",
