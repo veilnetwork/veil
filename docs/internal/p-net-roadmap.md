@@ -723,6 +723,24 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   pre-batch daemon passed raw TUN traffic both ways and delivered all
   48 SDK chat messages exactly once. The prototype was set aside after
   the inconsistent UDP results and the higher chat p99 in both pairs.
+- A certificate lookup prototype scanned each private-admission batch under
+  one cache read lock. Peers with a cached certificate still went through
+  the live session, expiry and ban checks. In an optimized Linux ARM64
+  process benchmark using the daemon provider and encoding 64 results,
+  a batch with one cache hit took 896 ns versus 920 ns on the control.
+  With 64 hits it took 3.80 µs versus 3.65 µs.
+- Two cold pairs on the same two-vCPU Linux ARM64 stand ran in alternating
+  order, with 24 gateways, 4,096 entries each and two 32 Mb/s UDP flows
+  over TCP. Each run sent 167,272 datagrams. UDP losses rose from 17,303
+  to 22,192 in the first pair and from 20,655 to 20,709 in the second.
+  The sending daemons recorded 2,753 and 3,520 IPC job refusals in the
+  first pair and 3,316 and 3,411 in the second. These counts measure
+  requests, each of which can contain multiple datagrams.
+  Every run delivered all 200 SDK messages. The p99 towards the hub
+  rose from 589 to 783 ms and from 335 to 584 ms. Both senders used a
+  common start within each run. Actual send timing varied across runs.
+  The prototype was set aside after these mixed CPU results and higher
+  chat latency in both pairs.
 - An ordered session reader prototype appended body bytes directly to
   pooled capacity after validating the header and reserving the global
   body budget. The initialized length retained progress across
