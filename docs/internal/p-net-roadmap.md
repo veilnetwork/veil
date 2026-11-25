@@ -1766,3 +1766,21 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   preserving configured discovery, and retry after a restart failure.
   Rejection during the fleet-wide check preserved both hosts' live
   files and made zero service calls.
+- Two isolated two-node Linux ARM64 stands used Debian 12 and systemd
+  252. The playbook checked readiness through the actual daemons'
+  loopback metrics endpoints. The first pair ran the current daemon in
+  `private_configured`. The second used the previous v0.11.59 daemon
+  on one host, a separate current verifier selected through `pnet_cli`,
+  and `private` with unbatched TUN IPC.
+- On both stands, a valid certificate issued for the other node stopped
+  the play before activation. That refusal and a successful `--check`
+  preserved both configurations and the daemon and chat service
+  invocation IDs. The initial rollout changed both daemon and chat
+  invocations. systemd's monotonic timestamps confirmed the order of
+  daemon restarts.
+- Both pairs carried TUN probes in both directions after the switch.
+  A repeat deployment preserved the installed config bytes, both ogate
+  processes, and the TUN interface indices. Bidirectional tunnel probes
+  succeeded within 0.25 s and 0.19 s of the play finishing. Each pair
+  received at least 1,000 SDK messages in each direction before the
+  switch, after it, and after the repeat. All stand services exited.
