@@ -721,6 +721,37 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   stand, a ban withdrew the route in 4.78 s. While the sender kept
   running, the receiver's TUN counter stopped advancing after withdrawal.
 
+#### xVeil text delivery on a shared gateway
+
+- A two-vCPU Linux ARM64 hub served 24 gateways with disjoint 4,096-entry
+  tables and 48 authenticated sessions. Two xVeil test clients on macOS
+  used the verified `94babde1` FFI build and connected to the real hub
+  and one spoke. The test accepted contacts before load and used xVeil's
+  text, persistence, and delivery-confirmation paths. It observed each
+  message through the application store with a 50 ms polling interval.
+- Two 32 Mb/s UDP flows used the same start epoch and sent exactly
+  167,272 datagrams per trial over 23 s. An additional CPU worker had
+  the same 0.70 CPU quota for eight seconds and received 5.59–5.61 CPU-s.
+  The trials ran TCP, QUIC, QUIC, TCP with the same daemon and ogate
+  builds. All tunnel datagrams arrived, and xVeil delivered all 96
+  messages exactly once and confirmed each submission in every trial.
+- Application-observed delivery p95 was 58 ms for both TCP trials and
+  56–58 ms for QUIC. Confirmation p95 was 61–62 ms for TCP and 63–65 ms
+  for QUIC. In the same samples, the hub daemon used 3.99–4.05 CPU-s
+  with TCP and 5.07–5.12 CPU-s with QUIC. These measurements describe
+  one shared Linux host at 64 Mb/s of total tunnel traffic.
+- At two 64 Mb/s flows, both transports sent 334,546 UDP datagrams in
+  23 s. TCP lost 25,326 and QUIC lost 37,918. xVeil delivered and
+  confirmed all 96 messages in both runs. Delivery p95 rose to 1.02 s
+  with TCP and 3.12 s with QUIC, and confirmation p95 to 1.23 s and
+  3.30 s. Most of the delivery delay was in the spoke-to-hub direction,
+  which shared the transport with one of the two UDP flows.
+- The higher-rate pair had the same packet count and start schedule.
+  Senders ran at least 15 ms late for 660 TCP and 6,637 QUIC datagrams.
+  Peak source bursts were 793–818 and 933–1,046 datagrams per 100 ms,
+  respectively. These differences in actual offer timing limit what the
+  single higher-rate pair establishes about the transport choice.
+
 ### Sustained Linux load
 
 - The stand uses two Linux ARM64 vCPUs, 14 nodes, and a 217,260-byte
