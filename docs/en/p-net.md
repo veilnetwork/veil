@@ -318,7 +318,14 @@ assignment. You can run it alongside an existing gateway.
 Add `--peer NODE_ID` to check the local daemon's current admission for
 one route peer or configured mirror. An error prints the reason and
 returns a nonzero exit status. Use a tunnel probe to verify packet
-delivery and the mirror logs to check snapshot serving.
+delivery.
+
+Use `ogate check --config /etc/ogate/ogate.toml --mirror NODE_ID` to
+test snapshot serving directly. The check downloads the signed snapshot
+from one configured mirror, verifies its signature and validity, then
+compares it with the installed revision in read-only mode. It also works
+when the local snapshot has expired or omits the local device's virtual
+address. A successful check prints both revisions and the offered expiry.
 
 ### Operator flow
 

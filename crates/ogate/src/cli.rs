@@ -4,8 +4,8 @@
 //! * `up    --config <path>` — bring up the TUN bridge and run until SIGINT/SIGTERM.
 //! * `show  --config <path>` — print resolved config (computed app_ids, peer table)
 //!   without opening any device. Useful for debugging.
-//! * `check --config <path> [--peer <hex>]` — check the P-Net policy and
-//!   daemon admission without starting a bridge.
+//! * `check --config <path> [--peer <hex> | --mirror <hex>]` — check P-Net
+//!   admission or a policy mirror without starting a bridge.
 //! * `app-id --network <net> [--app <app>] --node-id <hex>` —
 //!   compute one peer's app_id without touching the daemon
 //!   (handy when bootstrapping config files).
@@ -52,6 +52,9 @@ pub enum Command {
         /// Also check current admission for one route peer or configured mirror.
         #[arg(long, value_name = "NODE_ID")]
         peer: Option<String>,
+        /// Fetch and verify the policy served by one configured mirror.
+        #[arg(long, value_name = "NODE_ID", conflicts_with = "peer")]
+        mirror: Option<String>,
     },
 
     /// Trigger a hot reload of the peer table in the running ogate
@@ -127,9 +130,9 @@ pub async fn run(
             show(&cfg);
         }
         #[cfg(unix)]
-        Command::Check { peer, .. } => {
+        Command::Check { peer, mirror, .. } => {
             let cfg = preloaded_cfg.ok_or("internal: Check without preloaded config")?;
-            crate::pnet_check::run(cfg, peer.as_deref())
+            crate::pnet_check::run(cfg, peer.as_deref(), mirror.as_deref())
                 .await
                 .map_err(|error| format!("{error:#}"))?;
         }

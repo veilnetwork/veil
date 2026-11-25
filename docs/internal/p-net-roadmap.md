@@ -1341,3 +1341,14 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   prefix mismatch. An admitted mirror with zero route assignments
   returned a successful admission. The manual mode check also worked
   against the pre-batch daemon while SDK traffic continued to work.
+- `ogate check --mirror` uses the existing policy stream and verifies the
+  returned snapshot against the local owner and revision floor. On Linux
+  it distinguished peer admission from a disabled mirror service and
+  reported an expired mirror snapshot, an older revision, and conflicting
+  contents at the same revision. It verified a newer 4,096-assignment
+  policy while the local one was expired, leaving the stored bytes
+  intact. The check also passed on an established bidirectional TUN and
+  when the installed policy omitted the local address assignment.
+- In a separate run of the automatic subscriber, the secondary mirror
+  restored bidirectional TUN traffic 5.04 s after policy expiry. A mixed
+  run with the pre-batch daemon delivered all 48 SDK messages once.

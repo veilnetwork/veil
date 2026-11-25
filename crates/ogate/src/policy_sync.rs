@@ -41,17 +41,20 @@ pub(crate) async fn run(
     node: NodeId,
     authority: PnetAuthority,
 ) {
-    let namespace = format!("pnet.{}", hex::encode(authority.root.network_id));
     let connection = Distribution {
         socket,
         node,
         authority,
-        namespace,
+        namespace: policy_namespace(authority),
     };
     tokio::join!(
         publish(&policy, &connection),
         subscribe(&policy, &connection)
     );
+}
+
+fn policy_namespace(authority: PnetAuthority) -> String {
+    format!("pnet.{}", hex::encode(authority.root.network_id))
 }
 
 struct Distribution<'a> {
@@ -550,6 +553,41 @@ async fn poll_mirrors(
     Ok(())
 }
 
+/// Read a configured mirror after the caller's initial admission check.
+pub(crate) async fn probe_mirror(
+    client: &VeilClient,
+    policy: &Arc<SignedRoutes>,
+    authority: PnetAuthority,
+    source: NodeId,
+) -> anyhow::Result<VerifiedRoutePolicyOffer> {
+    let namespace = policy_namespace(authority);
+    let app = client
+        .bind(&namespace, "route-policy-check", ENDPOINT)
+        .await
+        .context("cannot bind a temporary IPC endpoint for the mirror check")?;
+    let remote = veil_app::address::app_id(&source, &namespace, SERVICE);
+    // Every valid revision is greater than zero. Request the snapshot
+    // even at the local revision so the operator can compare contents.
+    let offer = fetch_offer(&app, Arc::clone(policy), source, remote, 0)
+        .await?
+        .context(
+            "mirror answered but offered no current policy; check the mirror's installed snapshot",
+        )?;
+    let admissions = client
+        .peer_pnet_admissions(&[source])
+        .await
+        .context("cannot recheck the mirror's P-Net admission after transfer")?;
+    let now = unix_secs_now_u64();
+    ensure!(
+        !client.is_disconnected()
+            && admissions
+                .into_iter()
+                .any(|entry| authorized(authority, entry, now)),
+        "mirror or local daemon lost P-Net admission during the policy check"
+    );
+    Ok(offer.verified)
+}
+
 async fn fetch_offer(
     app: &AppHandle,
     policy: Arc<SignedRoutes>,
@@ -565,7 +603,8 @@ async fn fetch_offer(
                 ENDPOINT,
                 (MAX_SIGNED_ROUTE_POLICY_BYTES + 4) as u32,
             )
-            .await?;
+            .await
+            .context("cannot open the mirror's policy stream; check publish = true and the remote ogate service")?;
         let mut request = [0; 12];
         request[..4].copy_from_slice(&REQUEST_MAGIC);
         request[4..].copy_from_slice(&revision.to_be_bytes());
@@ -588,7 +627,10 @@ async fn fetch_offer(
 }
 
 async fn read_snapshot(mut stream: impl AsyncRead + Unpin) -> anyhow::Result<Option<Vec<u8>>> {
-    let size = stream.read_u32().await? as usize;
+    let size = stream
+        .read_u32()
+        .await
+        .context("cannot read the mirror's policy response length")? as usize;
     if size == 0 {
         return Ok(None);
     }

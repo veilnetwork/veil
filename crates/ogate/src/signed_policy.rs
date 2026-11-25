@@ -159,7 +159,7 @@ impl SignedRoutes {
     }
 }
 
-fn require_monotonic(
+pub(crate) fn require_monotonic(
     accepted: &VerifiedRoutePolicy,
     offered: &VerifiedRoutePolicy,
 ) -> anyhow::Result<()> {
