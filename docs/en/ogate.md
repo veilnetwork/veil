@@ -366,6 +366,11 @@ Use an isolated VM or CPU allocation if the hub spends substantial time
 runnable while its TCP receive queues build. Recheck sender timing with the
 new placement. [24-gateway Linux measurements](../internal/p-net-roadmap.md#cpu-placement-during-cold-start)
 
+Include a simultaneous start or reconnect of the Veil peers in that test.
+On a two-vCPU stand, bulk traffic on two active tunnels still dropped packets
+while the other gateways were held back and their Veil sessions were already
+connected. [Gateway startup measurements](../internal/p-net-roadmap.md#starting-gateways-while-other-tunnels-carry-traffic)
+
 ## Rolling it out with Ansible
 
 The repo ships two playbooks: `ansible/deploy-ogate.yml` to roll `ogate`

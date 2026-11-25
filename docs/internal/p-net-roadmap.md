@@ -870,6 +870,50 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   it fell from 247 and 252 ms to 4.38 and 5.28 ms. These are sizing
   measurements for this particular shared host and offered load.
 
+#### Starting gateways while other tunnels carry traffic
+
+- Two pairs kept all 48 private TCP sessions authenticated on the same
+  two-vCPU Linux ARM64 VM. The hub shared both CPUs. The two sending
+  containers stayed on CPU 1 at weight 3,023, with the hub at weight
+  100. Two gateway pairs passed a TUN probe before the bulk traffic
+  began. The remaining 22 pairs then started together or in groups of
+  four every two seconds. The two live tunnels each offered 83,636 UDP
+  datagrams at 32 Mb/s. Their first two seconds both contained 7,273
+  datagrams in every trial, and at most four offers per trial were
+  at least 15 ms late.
+- In the first pair, simultaneous and staged startup lost 31,977 and
+  39,270 datagrams respectively. In the reverse-order pair the same
+  schedules lost 42,289 and 36,066. The sending daemons recorded
+  8,143 versus 10,038 and 11,054 versus 9,352 IPC job refusals. Each
+  trial delivered all 200 SDK chat messages with no duplicates.
+- With staged startup, p99 towards the hub increased from 1,178 to
+  1,391 ms and from 385 to 788 ms. In the opposite direction it
+  increased from 187 to 208 ms and from 207 to 218 ms. All hub
+  routes became visible 1.38 and 4.20 s after simultaneous dispatch,
+  compared with 26.67 and 10.91 s from the start of the staged
+  schedules. All 24 active TUN paths passed bidirectional probes
+  after each sample.
+
+- Two additional runs held the 22 other gateway pairs until 27 s after
+  the same traffic start. All 48 peer daemons and their private TCP
+  sessions were active during the sample. The earlier two tunnels
+  still lost 31,979 and 37,109 datagrams, with 8,412 and 9,319 source
+  IPC job refusals. Hub runnable wait was 20.90 and 20.91 s, and
+  the chat p99 towards the hub was 651 and 1,028 ms. The second
+  sample had 1,467 datagrams at least 15 ms late. The losses reproduced
+  with only the two measured gateway pairs running.
+- The next two runs also deferred 44 peer daemons until 27 s. The
+  kernel and the daemon both confirmed four admitted TCP sessions at
+  the start. Each run delivered all 167,272 datagrams and all 200 SDK
+  chat messages. The source IPC refusal and receiver socket drop
+  counters stayed at zero. Hub runnable wait fell to 3.43 and 3.56 s.
+  The chat p99 was 2.35 and 2.34 ms towards the hub and 2.05 and 1.82 ms
+  in the opposite direction. After the bulk traffic, all 44 deferred
+  peers joined and all 24 tunnels passed bidirectional probes by the
+  end of the run. Deferring those daemons also reduced runnable peer
+  processes on the shared VM during the sample. The check after their
+  join exercised route convergence and TUN connectivity.
+
 #### xVeil text delivery on a shared gateway
 
 - A two-vCPU Linux ARM64 hub served 24 gateways with disjoint 4,096-entry

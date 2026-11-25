@@ -370,6 +370,11 @@ RUST_LOG="ogate=debug,veilclient=info" sudo -u veil ogate up --config /etc/ogate
 очереди TCP, выделите под него отдельную ВМ или CPU и снова проверьте темп на
 отправителях. [Замеры Linux на 24 шлюзах](../internal/p-net-roadmap.md#cpu-placement-during-cold-start)
 
+Включите в проверку одновременный запуск или переподключение узлов Veil.
+На стенде с двумя vCPU два работающих туннеля теряли пакеты даже при
+отложенном запуске остальных шлюзов. Узлы Veil для этих шлюзов к тому
+моменту уже подключились. [Замеры запуска шлюзов](../internal/p-net-roadmap.md#starting-gateways-while-other-tunnels-carry-traffic)
+
 ## Раскатка через Ansible
 
 В репозитории лежат два плейбука: `ansible/deploy-ogate.yml` —
