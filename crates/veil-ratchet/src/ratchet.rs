@@ -411,7 +411,6 @@ impl RatchetCore {
             if holes.is_empty() {
                 self.tree_holes.remove(&header.dh_pk);
             }
-            self.check_tree_limits()?;
             return Ok(mk);
         }
 
@@ -455,7 +454,6 @@ impl RatchetCore {
                 .take_leaf(header.n)
                 .ok_or(RatchetError::MessageKeyUnavailable)?;
             self.nr = self.nr.max(header.n + 1);
-            self.check_tree_limits()?;
             return Ok(mk);
         }
 
@@ -579,17 +577,51 @@ impl RatchetCore {
         Ok(())
     }
 
-    /// Bound both individual trees and the complete receiving-key bank.
-    /// A failed check is rolled back with the unauthenticated trial state.
-    fn check_tree_limits(&self) -> Result<(), RatchetError> {
-        for holes in self.tree_holes.values() {
-            if holes.len() > MAX_TREE_NODES_PER_CHAIN {
-                return Err(RatchetError::TooManySkipped(holes.len()));
+    /// Commit bounded receiving trees after an AEAD-authenticated step. One
+    /// trial step only splits a bounded number of roots. At capacity, erase
+    /// banked gaps so new traffic can advance. The live chain's future keys
+    /// are never part of the bank.
+    pub(crate) fn trim_authenticated_tree_bank(&mut self) -> Result<(), RatchetError> {
+        let current = self.dh_pk_remote.filter(|_| self.recv_tree);
+        let mut total = 0;
+        let mut trimmed = false;
+        for (chain, holes) in &mut self.tree_holes {
+            let excess = holes.len().saturating_sub(MAX_TREE_NODES_PER_CHAIN);
+            if excess != 0 {
+                let end = if Some(*chain) == current {
+                    u64::from(self.nr)
+                } else {
+                    1u64 << 32
+                };
+                if holes.discard_below(end, excess) != excess {
+                    return Err(RatchetError::TooManySkipped(holes.len()));
+                }
+                trimmed = true;
             }
+            total += holes.len();
         }
-        let total: usize = self.tree_holes.values().map(Holes::len).sum();
-        if total > MAX_TREE_NODES_TOTAL {
-            return Err(RatchetError::TooManySkipped(total));
+        let mut excess = total.saturating_sub(MAX_TREE_NODES_TOTAL);
+        if excess != 0 {
+            // Prefer gaps in retired epochs before touching the live epoch.
+            for (chain, holes) in &mut self.tree_holes {
+                if Some(*chain) != current {
+                    excess -= holes.discard_below(1u64 << 32, excess);
+                    if excess == 0 {
+                        break;
+                    }
+                }
+            }
+            if let Some(holes) = current.and_then(|chain| self.tree_holes.get_mut(&chain)) {
+                excess -= holes.discard_below(u64::from(self.nr), excess);
+            }
+            if excess != 0 {
+                return Err(RatchetError::TooManySkipped(MAX_TREE_NODES_TOTAL + excess));
+            }
+            trimmed = true;
+        }
+        if trimmed {
+            self.tree_holes
+                .retain(|chain, holes| Some(*chain) == current || !holes.is_empty());
         }
         Ok(())
     }

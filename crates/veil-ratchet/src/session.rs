@@ -201,6 +201,7 @@ impl RatchetSession {
             )
             .map_err(|_| RatchetError::AuthFailed)?;
 
+        trial.trim_authenticated_tree_bank()?;
         self.core = trial;
         Ok(plaintext)
     }
@@ -1577,8 +1578,9 @@ mod tests {
     }
 
     #[test]
-    fn gaps_across_epochs_hit_the_total_tree_budget_without_mutating_state() {
+    fn authenticated_gaps_across_epochs_keep_advancing_at_the_total_tree_budget() {
         let (mut a, mut b, mut ar, mut br) = tree_pair();
+        let mut reached_cap = false;
         for _ in 0..10 {
             for _ in 0..80 {
                 let pos = a.send_position().unwrap();
@@ -1588,33 +1590,25 @@ mod tests {
                 })
                 .unwrap();
                 let frame = a.encrypt(b"sparse", AD).unwrap();
-                let before = b.export_state();
-                match b.decrypt(&frame, AD, &mut br) {
-                    Ok(_) => {
-                        let nodes: usize = b
-                            .core
-                            .parts()
-                            .tree
-                            .tree_holes
-                            .values()
-                            .map(Holes::len)
-                            .sum();
-                        assert!(nodes <= MAX_TREE_NODES_TOTAL);
-                    }
-                    Err(RatchetError::TooManySkipped(n)) => {
-                        assert!(n > MAX_TREE_NODES_TOTAL, "total budget, not one chain");
-                        assert_eq!(*b.export_state(), *before);
-                        RatchetSession::import_state(&before)
-                            .expect("last accepted state restores");
-                        return;
-                    }
-                    Err(error) => panic!("unexpected {error:?}"),
+                assert_eq!(b.decrypt(&frame, AD, &mut br).unwrap(), b"sparse");
+                let trees = b.core.parts().tree.tree_holes;
+                let total: usize = trees.values().map(Holes::len).sum();
+                assert!(total <= MAX_TREE_NODES_TOTAL);
+                assert!(
+                    trees
+                        .values()
+                        .all(|holes| holes.len() <= MAX_TREE_NODES_PER_CHAIN)
+                );
+                if !reached_cap && total == MAX_TREE_NODES_TOTAL {
+                    reached_cap = true;
+                    b = RatchetSession::import_state(&b.export_state())
+                        .expect("bounded state restores");
                 }
             }
             let reply = b.encrypt(b"turn", AD).unwrap();
             a.decrypt(&reply, AD, &mut ar).unwrap();
         }
-        panic!("cross-epoch node budget never reached");
+        assert!(reached_cap, "cross-epoch node budget never reached");
     }
 
     /// Version 1 — every stored conversation from before trees — is read as
@@ -1643,12 +1637,11 @@ mod tests {
         assert_eq!(b.decrypt(&f, AD, &mut br).expect("open"), b"z");
     }
 
-    /// Many separate runs of loss run into the node ceiling, and the frame
-    /// that would cross it is refused without moving the state.
     #[test]
-    fn separate_gaps_hit_the_node_ceiling_and_leave_the_state_untouched() {
+    fn a_full_receiving_tree_erases_old_gaps_only_after_authentication() {
         let (mut a, mut b, _ar, mut br) = tree_pair();
-        let mut refused = false;
+        let oldest = a.encrypt(b"oldest", AD).unwrap();
+        let mut exercised_full_bank = false;
         for _ in 0..400 {
             let pos = a.send_position().expect("chain");
             a.skip_send_to(crate::SendPosition {
@@ -1657,19 +1650,50 @@ mod tests {
             })
             .expect("skip");
             let f = a.encrypt(b"g", AD).expect("seal");
-            let before = b.export_state();
-            match b.decrypt(&f, AD, &mut br) {
-                Ok(_) => {}
-                Err(RatchetError::TooManySkipped(n)) => {
-                    assert!(n > crate::MAX_TREE_NODES_PER_CHAIN);
-                    assert_eq!(*b.export_state(), *before);
-                    refused = true;
-                    break;
-                }
-                Err(e) => panic!("unexpected {e}"),
+            let total: usize = b
+                .core
+                .parts()
+                .tree
+                .tree_holes
+                .values()
+                .map(Holes::len)
+                .sum();
+            if !exercised_full_bank && total == MAX_TREE_NODES_PER_CHAIN {
+                let before = b.export_state();
+                let mut forged = f.clone();
+                *forged.last_mut().unwrap() ^= 1;
+                assert_eq!(
+                    b.decrypt(&forged, AD, &mut br),
+                    Err(RatchetError::AuthFailed)
+                );
+                assert_eq!(*b.export_state(), *before);
+                exercised_full_bank = true;
             }
+            assert_eq!(b.decrypt(&f, AD, &mut br).unwrap(), b"g");
+            assert!(
+                b.core
+                    .parts()
+                    .tree
+                    .tree_holes
+                    .values()
+                    .all(|holes| holes.len() <= MAX_TREE_NODES_PER_CHAIN)
+            );
         }
-        assert!(refused, "400 separate gaps never reached the ceiling");
+        assert!(
+            exercised_full_bank,
+            "400 separate gaps never reached the ceiling"
+        );
+
+        let before = b.export_state();
+        assert!(
+            b.decrypt(&oldest, AD, &mut br).is_err(),
+            "the oldest gap was retired"
+        );
+        assert_eq!(*b.export_state(), *before);
+        let recent = a.encrypt(b"recent delay", AD).unwrap();
+        let fresh = a.encrypt(b"fresh", AD).unwrap();
+        assert_eq!(b.decrypt(&fresh, AD, &mut br).unwrap(), b"fresh");
+        assert_eq!(b.decrypt(&recent, AD, &mut br).unwrap(), b"recent delay");
     }
 
     /// The bank the host budgets is the GAPS, never the path to what is still

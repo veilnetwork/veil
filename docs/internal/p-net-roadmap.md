@@ -1919,6 +1919,40 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   both ordinary outboxes. Draining or cancelling the write removes
   that preference. A write marked as control leaves it unchanged.
 
+#### Constraining a downstream link while both paths stay connected
+
+- An eight-node Linux ARM64 stand ran both relay chains and the
+  cross-link between them. It sent 500 UDP datagrams per second with
+  a 1,016-byte payload from `A` to `B` over TUN. A token bucket limited
+  `R1.3→B` to 256 kbit/s for 23 seconds. All nine sessions remained live.
+  The preferred first hop at `A` stayed the same. `R1.2` sent part of the
+  traffic along the cross-link but kept sending to the constrained branch.
+- The `2fa15866` control delivered all 2,975 packets in its warm window.
+  Delivery fell to 46.76% in the first shaped window and 32.73% in the
+  later one. The late window's delivered packets had 5.50 s p95 delay.
+  `B` lost routed admission during the cap and reported that its tree
+  ratchet skipped-key budget was full. None of the 4,045 packets generated
+  in the measured portion of the first ten seconds after restoring capacity
+  reached TUN.
+- A receiving tree now discards banked gaps at its existing caps after
+  authenticating a new packet. Retired epochs are trimmed before the live
+  epoch for the conversation-wide cap. Future keys and the storage and
+  wire formats stay intact. Regression tests fill each cap across
+  authenticated traffic, reject a forged tag without changing state, and
+  check that the bounded state can be restored and receive again.
+- With updated endpoints, the same cap still caused loss and temporary
+  expiry of routed admission. The later shaped window delivered 58.77%,
+  with 14.96 s p95 for delivered packets. The receiver reported no full
+  ratchet bank. After restoring capacity, the first measured window
+  delivered 3,482 of 4,012 packets and the following window delivered
+  all 3,608 packets at 2.91 ms p95. All 48 SDK datagrams arrived. Choosing
+  a healthier route during the cap remains open.
+- With only the receiver's daemon updated, the equivalent `R2.3→B` cap
+  still left all nine sessions established and produced no receiver bank
+  overflow. The first measured window after releasing the cap delivered
+  all 4,050 packets at 3.53 ms p95. The following window delivered all
+  3,606 packets. All 48 SDK datagrams arrived across the mixed versions.
+
 #### Withdrawing a failed downstream route
 
 - The Linux ARM64 stand used two paths from `A` to `B`, each with three

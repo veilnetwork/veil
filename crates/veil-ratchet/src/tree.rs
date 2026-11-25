@@ -43,11 +43,8 @@ const INFO_TREE_RIGHT: &[u8] = b"veil.ratchet.v1.tree.1";
 /// How many subtree roots one chain may hold.
 ///
 /// A receiver in order holds about 32 (the path to the next index); each
-/// separate run of missing messages adds up to about 64. So this is roughly
-/// thirty independent gaps in one chain before a message is refused — a peer
-/// can only get here by genuinely losing that many separate runs, and only
-/// with frames that authenticate, because state from a failed tag is thrown
-/// away.
+/// separate run of missing messages adds up to about 64. Older gaps are
+/// discarded at the limit, after the new message authenticates.
 pub const MAX_TREE_NODES_PER_CHAIN: usize = 2_048;
 
 /// How many subtree roots one conversation may hold across all its chains.
@@ -156,6 +153,23 @@ impl Holes {
             .range(..index)
             .filter(|(s, (d, _))| u64::from(**s) + span(*d) <= u64::from(index))
             .count()
+    }
+
+    /// Erase up to `limit` of the lowest roots lying wholly below `end`.
+    /// Removing whole nodes leaves the future chain untouched and never
+    /// allocates replacement keys.
+    pub(crate) fn discard_below(&mut self, end: u64, limit: usize) -> usize {
+        let mut removed = 0;
+        while removed < limit
+            && self
+                .nodes
+                .first_key_value()
+                .is_some_and(|(&start, (depth, _))| u64::from(start) + span(*depth) <= end)
+        {
+            self.nodes.pop_first();
+            removed += 1;
+        }
+        removed
     }
 
     /// The node covering `index`, if any: `(start, depth)`.
