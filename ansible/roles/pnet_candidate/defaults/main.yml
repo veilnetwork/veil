@@ -7,6 +7,7 @@ pnet_user: veil
 pnet_group: veil
 pnet_python: python3
 pnet_cli_environment: {}
+pnet_min_membership_remaining_secs: 0
 pnet_metrics_url: http://127.0.0.1:19999/metrics
 inv_to_cfg:
   b1: b1

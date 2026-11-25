@@ -639,6 +639,15 @@ and activates it one host at a time. The certificate is installed under
 a name containing its SHA-256 before the config points to it. Older
 certificate files can remain on disk.
 
+Set `pnet_min_membership_remaining_secs` in the inventory to reserve
+time on expiring membership certificates for the rollout. The default
+`0` checks current validity. For a positive value, the playbook uses
+the verified expiry and the managed host clock at fleet preflight and
+again just before that host's activation. A verified nonexpiring
+certificate satisfies the lifetime check. If the check fails during
+activation, the play stops and earlier successful activations stay in
+place.
+
 After successful activation, the playbook records the configuration
 fingerprint and current systemd invocation in a root-only file under
 `/run`. A repeat keeps Veil and the optional chat service running when

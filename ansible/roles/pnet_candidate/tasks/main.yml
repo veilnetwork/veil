@@ -17,6 +17,14 @@
 
 - name: Prepare and verify a private candidate
   block:
+    - name: Validate the required membership lifetime
+      ansible.builtin.assert:
+        that:
+          - (pnet_min_membership_remaining_secs | string) == (pnet_min_membership_remaining_secs | int | string)
+          - pnet_min_membership_remaining_secs | int >= 0
+        fail_msg: "pnet_min_membership_remaining_secs must be a nonnegative whole number of seconds."
+        quiet: true
+
     - name: Allocate private staging directory
       ansible.builtin.tempfile:
         prefix: ".pnet-preflight-"
@@ -59,16 +67,14 @@
       changed_when: false
 
     - name: Verify candidate with Veil as the daemon user
+      vars:
+        output_args: "{{ ['--output-format', 'jsonl'] if (pnet_min_membership_remaining_secs | int > 0) else [] }}"
       become_user: "{{ pnet_user }}"
       ansible.builtin.command:
-        argv:
-          - "{{ pnet_cli }}"
-          - --config
-          - "{{ pnet_scratch.path }}/{{ pnet_config | basename }}"
-          - network
-          - check-membership
-          - --certificate
-          - "{{ pnet_scratch.path }}/candidate.cert"
+        argv: >-
+          {{ [pnet_cli] + output_args +
+             ['--config', pnet_scratch.path ~ '/' ~ (pnet_config | basename),
+              'network', 'check-membership', '--certificate', pnet_scratch.path ~ '/candidate.cert'] }}
         chdir: "{{ pnet_working_dir }}"
       environment: "{{ pnet_cli_environment }}"
       register: pnet_verification
@@ -84,6 +90,42 @@
           Membership validation failed on {{ inventory_hostname }}.
           Check the selected certificate, owner pin and node identity
           using veil-cli network check-membership with the intended config.
+
+    - name: Check that membership will last through rollout
+      when: pnet_min_membership_remaining_secs | int > 0
+      vars:
+        membership: "{{ pnet_verification.stdout | from_json }}"
+        expiry: "{{ membership.valid_until_unix }}"
+      block:
+        - name: Check the verified membership output
+          ansible.builtin.assert:
+            that:
+              - membership.type == 'pnet_membership_verified'
+              - expiry is defined
+              - expiry is none or (expiry is integer and expiry > 0)
+            fail_msg: "The Veil membership verifier did not report a valid expiry."
+            quiet: true
+
+        - name: Check the remaining lifetime of the expiring certificate
+          when: expiry is not none
+          block:
+            - name: Read the managed host clock
+              ansible.builtin.command:
+                argv: [date, '+%s']
+              register: pnet_clock
+              check_mode: false
+              changed_when: false
+
+            - name: Require the configured remaining membership lifetime
+              ansible.builtin.assert:
+                that:
+                  - pnet_clock.stdout is match('^[1-9][0-9]*\Z')
+                  - expiry - (pnet_clock.stdout | int) >= (pnet_min_membership_remaining_secs | int)
+                fail_msg: >-
+                  Membership on {{ inventory_hostname }} expires at Unix time {{ expiry }}.
+                  Rollout requires at least {{ pnet_min_membership_remaining_secs }} seconds
+                  of remaining validity. Check the host clock and renew the certificate if needed.
+                quiet: true
 
     - name: Remember the verified candidate for this playbook run
       ansible.builtin.set_fact:

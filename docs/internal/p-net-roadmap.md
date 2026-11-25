@@ -1798,6 +1798,12 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   and both TUN interfaces, and received all 90 tunnel replies per
   direction alongside SDK traffic. A limited run completed a renewal
   interrupted after file publication, restarting only the affected host.
+- An optional minimum remaining certificate lifetime is checked against
+  the managed host clock at both fleet preflight and per-host activation.
+  A two-node systemd stand refused a valid but short-lived certificate
+  before any changes. It also refused a later host that passed fleet
+  preflight but fell below the configured minimum before publication.
+  The later host kept its files and service invocations.
 
 ## 9. Verify the packet path after rollout
 
