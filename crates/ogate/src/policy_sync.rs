@@ -1,5 +1,6 @@
 //! Pull owner-signed policy snapshots over authenticated Veil application streams.
 
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,7 +13,7 @@ use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout};
 use veil_identity::network_policy::{
     MAX_SIGNED_ROUTE_POLICY_BYTES, VerifiedRoutePolicy, VerifiedRoutePolicyOffer,
 };
-use veil_proto::event_kind::{EVENTS_LAGGED, SESSION_ADMITTED};
+use veil_proto::event_kind::{EVENTS_LAGGED, PNET_SESSION_ADMITTED, SESSION_ADMITTED};
 use veil_util::unix_secs_now_u64;
 use veilclient::{
     AppHandle, PNET_ADMISSION_BATCH_MAX_PEERS, PnetAdmission, PnetAuthority, SenderProvenance,
@@ -65,15 +66,22 @@ struct Distribution<'a> {
 }
 
 impl Distribution<'_> {
-    async fn connect(&self) -> anyhow::Result<VeilClient> {
-        let client = VeilClient::connect_with_pnet_authority(self.socket).await?;
+    async fn connect(&self, subscriber: bool) -> anyhow::Result<VeilClient> {
+        let client = if subscriber {
+            VeilClient::connect_for_pnet_status(self.socket, true).await?
+        } else {
+            VeilClient::connect_with_pnet_authority(self.socket).await?
+        };
         ensure!(
             client.pnet_authority() == Some(self.authority)
                 && self.authority.is_current(unix_secs_now_u64()),
             "policy distribution IPC has a different or expired daemon authority"
         );
         ensure!(
-            client.node_identity().await?.node_id == self.node,
+            while_policy_ipc_connected(&client, client.node_identity())
+                .await?
+                .node_id
+                == self.node,
             "policy distribution IPC has a different daemon identity"
         );
         ensure!(
@@ -81,6 +89,22 @@ impl Distribution<'_> {
             "policy distribution IPC requires P-Net admission batches"
         );
         Ok(client)
+    }
+}
+
+async fn while_policy_ipc_connected<T, E>(
+    client: &VeilClient,
+    request: impl Future<Output = Result<T, E>>,
+) -> anyhow::Result<T>
+where
+    E: Into<anyhow::Error>,
+{
+    let Some(disconnected) = client.pnet_status_disconnected() else {
+        return request.await.map_err(Into::into);
+    };
+    tokio::select! {
+        _ = disconnected => anyhow::bail!("P-Net policy IPC disconnected"),
+        result = request => result.map_err(Into::into),
     }
 }
 
@@ -100,7 +124,7 @@ async fn serve_mirror(
     policy: &Arc<SignedRoutes>,
     distribution: &Distribution<'_>,
 ) -> anyhow::Result<()> {
-    let client = Arc::new(distribution.connect().await?);
+    let client = Arc::new(distribution.connect(false).await?);
     let mut app = client
         .bind_device_scoped(&distribution.namespace, SERVICE, ENDPOINT)
         .await?;
@@ -300,7 +324,7 @@ async fn subscribe(policy: &Arc<SignedRoutes>, distribution: &Distribution<'_>) 
     let mut reconnecting = false;
     let mut previous_poll: Option<(Arc<VeilClient>, broadcast::Receiver<VeilEvent>)> = None;
     while distribution.authority.is_current(unix_secs_now_u64()) {
-        let mut client = match distribution.connect().await {
+        let mut client = match distribution.connect(true).await {
             Ok(client) => client,
             Err(error) => {
                 tracing::debug!(%error, "P-Net policy subscriber IPC unavailable");
@@ -423,7 +447,10 @@ async fn wait_for_policy_poll(
 }
 
 fn is_mirror_poll_hint(event: &VeilEvent) -> bool {
-    matches!(event.kind, SESSION_ADMITTED | EVENTS_LAGGED)
+    matches!(
+        event.kind,
+        SESSION_ADMITTED | PNET_SESSION_ADMITTED | EVENTS_LAGGED
+    )
 }
 
 fn queued_mirror_poll_hint(events: &mut broadcast::Receiver<VeilEvent>) -> bool {
@@ -514,7 +541,8 @@ async fn poll_mirrors(
             .await??
             .revision
     };
-    let admissions = client.peer_pnet_admissions(mirrors).await?;
+    let admissions =
+        while_policy_ipc_connected(client, client.peer_pnet_admissions(mirrors)).await?;
     let now = unix_secs_now_u64();
     let active: Vec<_> = admissions
         .into_iter()
@@ -525,17 +553,20 @@ async fn poll_mirrors(
         return Ok(());
     }
     let app = Arc::new(
-        client
-            .bind(&distribution.namespace, "route-policy-fetch", ENDPOINT)
-            .await?,
+        while_policy_ipc_connected(
+            client,
+            client.bind(&distribution.namespace, "route-policy-fetch", ENDPOINT),
+        )
+        .await?,
     );
     let mut pending = JoinSet::new();
     for source in active {
         let app = Arc::clone(&app);
+        let client = Arc::clone(client);
         let policy = Arc::clone(policy);
         let remote = veil_app::address::app_id(&source, &distribution.namespace, SERVICE);
         pending.spawn(async move {
-            match fetch_offer(&app, policy, source, remote, revision).await {
+            match fetch_offer(&client, &app, policy, source, remote, revision).await {
                 Ok(offer) => offer,
                 Err(error) => {
                     tracing::debug!(%error, "P-Net policy mirror offer rejected");
@@ -556,7 +587,8 @@ async fn poll_mirrors(
         return Ok(());
     }
     let sources: Vec<_> = offers.iter().map(|offer| offer.source).collect();
-    let admissions = client.peer_pnet_admissions(&sources).await?;
+    let admissions =
+        while_policy_ipc_connected(client, client.peer_pnet_admissions(&sources)).await?;
     let now = unix_secs_now_u64();
     let mut selection = Selection::default();
     for (offer, admission) in offers.into_iter().zip(admissions.iter().copied()) {
@@ -606,7 +638,7 @@ pub(crate) async fn probe_mirror(
     let remote = veil_app::address::app_id(&source, &namespace, SERVICE);
     // Every valid revision is greater than zero. Request the snapshot
     // even at the local revision so the operator can compare contents.
-    let offer = fetch_offer(&app, Arc::clone(policy), source, remote, 0)
+    let offer = fetch_offer(client, &app, Arc::clone(policy), source, remote, 0)
         .await?
         .context(
             "mirror answered but offered no current policy; check the mirror's installed snapshot",
@@ -627,30 +659,34 @@ pub(crate) async fn probe_mirror(
 }
 
 async fn fetch_offer(
+    client: &VeilClient,
     app: &AppHandle,
     policy: Arc<SignedRoutes>,
     source: NodeId,
     remote: [u8; 32],
     revision: u64,
 ) -> anyhow::Result<Option<Offer>> {
-    let bytes = timeout(TRANSFER_TIMEOUT, async {
-        let mut stream = app
-            .open_stream(
-                source,
-                remote,
-                ENDPOINT,
-                (MAX_SIGNED_ROUTE_POLICY_BYTES + 4) as u32,
-            )
-            .await
-            .context("cannot open the mirror's policy stream; check publish = true and the remote ogate service")?;
-        let mut request = [0; 12];
-        request[..4].copy_from_slice(&REQUEST_MAGIC);
-        request[4..].copy_from_slice(&revision.to_be_bytes());
-        stream.write_all(&request).await?;
-        read_snapshot(&mut stream).await
+    let bytes = while_policy_ipc_connected(client, async {
+        timeout(TRANSFER_TIMEOUT, async {
+            let mut stream = app
+                .open_stream(
+                    source,
+                    remote,
+                    ENDPOINT,
+                    (MAX_SIGNED_ROUTE_POLICY_BYTES + 4) as u32,
+                )
+                .await
+                .context("cannot open the mirror's policy stream; check publish = true and the remote ogate service")?;
+            let mut request = [0; 12];
+            request[..4].copy_from_slice(&REQUEST_MAGIC);
+            request[4..].copy_from_slice(&revision.to_be_bytes());
+            stream.write_all(&request).await?;
+            read_snapshot(&mut stream).await
+        })
+        .await
+        .context("P-Net policy mirror transfer timed out")?
     })
-    .await
-    .context("P-Net policy mirror transfer timed out")??;
+    .await?;
     let Some(bytes) = bytes else {
         return Ok(None);
     };
@@ -755,6 +791,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closing_the_policy_ipc_interrupts_a_pending_admission_query() {
+        use tokio::net::UnixListener;
+        use veil_proto::ipc::IPC_HELLO_OK_PNET_ADMISSION_BATCH;
+        use veil_proto::{
+            AppIpcHelloOkPayload, FrameFamily, FrameHeader, HEADER_SIZE, IPC_PROTOCOL_VERSION,
+            LocalAppMsg, codec,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("ipc");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let daemon = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = [0; HEADER_SIZE];
+            stream.read_exact(&mut header).await.unwrap();
+            let hello = codec::decode_header(&header).unwrap();
+            assert_eq!(hello.msg_type, LocalAppMsg::AppHello as u16);
+            stream
+                .read_exact(&mut vec![0; hello.body_len as usize])
+                .await
+                .unwrap();
+            let reply = AppIpcHelloOkPayload {
+                version: IPC_PROTOCOL_VERSION,
+                client_token: [0; 16],
+            }
+            .encode();
+            let mut hello_ok =
+                FrameHeader::new(FrameFamily::LocalApp as u8, LocalAppMsg::AppHelloOk as u16);
+            hello_ok.flags = IPC_HELLO_OK_PNET_ADMISSION_BATCH;
+            hello_ok.body_len = reply.len() as u32;
+            stream
+                .write_all(&codec::encode_header(&hello_ok))
+                .await
+                .unwrap();
+            stream.write_all(&reply).await.unwrap();
+            stream.read_exact(&mut header).await.unwrap();
+            let query = codec::decode_header(&header).unwrap();
+            assert_eq!(query.msg_type, LocalAppMsg::PnetAdmissionBatchQuery as u16);
+            assert_eq!(query.body_len, 32);
+            stream.read_exact(&mut [0; 32]).await.unwrap();
+        });
+
+        let client = VeilClient::connect_for_pnet_status(&socket, false)
+            .await
+            .unwrap();
+        let peers = [[7; 32]];
+        let error = timeout(
+            Duration::from_secs(1),
+            while_policy_ipc_connected(&client, client.peer_pnet_admissions(&peers)),
+        )
+        .await
+        .expect("the pending poll kept waiting after IPC closed")
+        .unwrap_err();
+        assert!(error.to_string().contains("policy IPC disconnected"));
+        daemon.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_daemon_event_gap_advances_the_mirror_poll() {
         use veil_ipc::{EventBus, IpcEndpoint, IpcServer};
         use veil_proto::EventPayload;
@@ -825,6 +919,13 @@ mod tests {
         assert!(!queued_mirror_poll_hint(&mut events));
         publish.send(event(other)).unwrap();
         publish.send(event(SESSION_ADMITTED)).unwrap();
+        assert!(queued_mirror_poll_hint(&mut events));
+        publish
+            .send(VeilEvent {
+                kind: PNET_SESSION_ADMITTED,
+                payload: vec![7; 32],
+            })
+            .unwrap();
         assert!(queued_mirror_poll_hint(&mut events));
         for kind in [SESSION_ADMITTED, other, other] {
             publish.send(event(kind)).unwrap();

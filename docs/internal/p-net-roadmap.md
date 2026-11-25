@@ -1533,6 +1533,15 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   cadence. Reconnecting can trigger one early poll under the same
   spacing rule, including when the daemon admitted a mirror while the
   subscriber was disconnected.
+- Losing subscriber IPC interrupts pending admission queries and the
+  transfer of policy bytes. Signature verification and installation
+  finish within their poll round, and the next round applies the same
+  admission checks and conflict rules. In a paired Linux ARM64 test,
+  the proxy held policy stream data and closed only the subscriber IPC.
+  With one of two configured mirrors reachable, the candidate installed
+  the exact signed 4,096-assignment policy in 5.553 s versus 11.628 s
+  in the control. Both runs passed bidirectional TUN traffic on their
+  original interfaces and delivered SDK messages in both directions.
 - In two pairs of Linux trials, an IPC proxy refused new local connections
   after the initial poll. The private daemon admitted the secondary mirror
   while the subscriber could not reconnect. Once the proxy allowed new
