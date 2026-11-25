@@ -986,6 +986,41 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   passed bidirectional TUN probes 0.556 s after readmission on the same
   interfaces.
 
+#### Filtering DHT referrals before transport resolution
+
+- A prototype applied the strict XOR progress check to IDs from
+  iterative `FIND_NODE` and `FIND_VALUE` before resolving their transport
+  addresses. It used the proof-gated lookup and signed announcement for
+  closer referrals, included early rejections in the no-progress
+  diagnostic, and kept the direct bootstrap query's behavior.
+- A mock frame router returned a farther ID, the responder itself, and a
+  closer ID. Both walks sent a `ResolveTransport` request only for the
+  closer ID. The responder verified its proof. The direct bootstrap
+  query still resolved both referrals.
+- Two alternating pairs on the two-vCPU Linux ARM64 stand used 48
+  authenticated TCP sessions and offered 167,272 datagrams per run.
+  The 46 other peer containers used 12.92 and 12.72 CPU-seconds over
+  the first ten seconds of the controls and 13.08 and 12.71 with the
+  prototype. UDP losses changed from 31,553 to 28,717 and from 28,717
+  to 34,319. Chat p99 towards the hub changed from 478 to 786 ms and
+  from 771 to 820 ms. In the reverse direction it changed from 134
+  to 147 ms and from 149 to 184 ms. All 200 messages arrived without
+  duplicates in each run. The prototype was set aside after the
+  higher chat p99 in both pairs.
+- On a mixed-version stand with a pre-batch daemon, the prototype
+  delivered all 48 SDK messages exactly once. After a daemon restart,
+  bidirectional TUN probes passed 0.57 s after readmission on the same
+  interfaces.
+- A separate Linux ARM64 process benchmark measured the cost of
+  hashing 500,000 distinct nonces with one fixed requester, target and
+  time bucket. It compared the existing hash, one-shot hashing of a
+  prepared input buffer and cloning the BLAKE3 state after hashing the
+  common prefix. The two orders measured 52.5–52.7, 45.7–46.5 and
+  38.7–38.9 ms respectively. All variants produced identical digests
+  for 4,096 individually checked inputs and the same checksum over the
+  timed runs. Prefix reuse warrants a daemon-level experiment with
+  the same proof threshold and responder validation.
+
 #### xVeil text delivery on a shared gateway
 
 - A two-vCPU Linux ARM64 hub served 24 gateways with disjoint 4,096-entry
