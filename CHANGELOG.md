@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## v0.11.60 — 2026-11-26
+
+### P-Net
+
+- Reconcile ogate admission in paced batches and restore active routes after either endpoint or the local daemon reconnects. Routed private IPv4 and IPv6 can use authenticated gateway proofs across relays without a direct peer session.
+- Issue and mirror owner-signed address policies. Enforce expiry and revocation on both the daemon and the packet path, and support recovery through a pre-enrolled offline owner key.
+- Use configured private entry points, check membership and gateway admission locally, and verify fleet configuration and packet paths during rolling deployment.
+- Withdraw stale relay routes, steer ordered private traffic around a congested hop, and pace its return. Peers negotiate the optional congestion signal and can continue to use the established framing.
+- In an emulated two-link Linux test, tunnel replies returned within 1.8 s after the first link was cut. Losing both links expired routed admission in 16 s. Restoring one link recovered both IP families in about 7 s. Unacknowledged SDK messages sent during the interruption can be lost.
+
 ## v0.11.59 — 2026-11-24
 
 ### Fixed
