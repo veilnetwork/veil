@@ -5,7 +5,23 @@
 
 use std::sync::Arc;
 
+use veil_identity::network_access::NetworkAccessGate;
+use veil_identity::network_ban::BAN_BLOB_MAGIC;
+
 use super::{NodeRuntime, lock_tasks, supervised_spawn};
+
+fn republishable_record_at(
+    network_gate: Option<&NetworkAccessGate>,
+    key: &[u8; 32],
+    value: &[u8],
+    now_unix_ms: u64,
+) -> bool {
+    if value.starts_with(BAN_BLOB_MAGIC) {
+        return network_gate
+            .is_some_and(|gate| gate.verify_ban_record_at(key, value, now_unix_ms / 1_000));
+    }
+    NodeRuntime::is_republishable_dht_value_at(value, now_unix_ms)
+}
 
 impl NodeRuntime {
     /// Periodically republish locally-stored DHT entries to the K closest peers.
@@ -35,7 +51,7 @@ impl NodeRuntime {
         // `NetworkAuthGate` regardless of signed-STORE flags, so
         // republishing them propagates legitimate bans to peers that
         // joined after the original publish.
-        if value.len() >= 4 && &value[..4] == veil_identity::network_ban::BAN_BLOB_MAGIC {
+        if value.starts_with(BAN_BLOB_MAGIC) {
             return true;
         }
         magic == veil_discovery::directory::APP_ENDPOINT_DHT_MAGIC
@@ -107,7 +123,8 @@ impl NodeRuntime {
             || veil_proto::anycast::is_anycast_blob(value)
     }
 
-    /// Republish only records that are still valid at the current wall clock.
+    /// Check whether a DHT record is eligible for republication at this time.
+    /// P-Net bans require the network trust context in `republishable_record_at`.
     ///
     /// Most self-authenticating DHT types carry their own longer-lived
     /// lifecycle checks on resolve. `XS` is deliberately short-lived: sending
@@ -127,6 +144,9 @@ impl NodeRuntime {
     /// applies the receiver's rule first. `nickname_store_decision` is that
     /// rule, and it is the same call the STORE gate makes.
     pub fn is_republishable_dht_value_at(value: &[u8], now_unix_ms: u64) -> bool {
+        if value.starts_with(BAN_BLOB_MAGIC) {
+            return false;
+        }
         if value.get(..2) == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_SAMPLES_MAGIC[..])
         {
             return veil_crypto::space_discovery::decode_space_discovery_samples(value)
@@ -167,6 +187,7 @@ impl NodeRuntime {
         };
         let mut shutdown_rx = shutdown_tx.subscribe();
         let dht = Arc::clone(&self.dht);
+        let network_gate = self.network_gate.clone();
         let session_outbox = Arc::clone(&self.session_outbox);
         let metrics = self.metrics.clone();
         let logger = Arc::clone(&self.logger);
@@ -239,7 +260,7 @@ impl NodeRuntime {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
                                 .unwrap_or(0);
-                            if !Self::is_republishable_dht_value_at(&value, now_unix_ms) {
+                            if !republishable_record_at(network_gate.as_deref(), &key, &value, now_unix_ms) {
                                 continue;
                             }
                             // audit follow-up: capture the fan-out count for
@@ -284,10 +305,70 @@ impl NodeRuntime {
 
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{Signer, SigningKey};
     use veil_crypto::space_discovery::{SpaceDiscoveryRecord, SpaceDiscoveryRoute};
+    use veil_identity::network_ban::{ban_dht_key, canonical_ban_body, encode_ban_blob};
+    use veil_identity::network_cert::{canonical_cert_body, encode_cert_blob};
+    use veil_types::{
+        BAN_ENTRY_VERSION, BanEntry, MEMBERSHIP_CERT_VERSION, MembershipCert, SignatureAlgorithm,
+    };
 
-    use super::NodeRuntime;
+    use super::{NetworkAccessGate, NodeRuntime, republishable_record_at};
+
+    #[test]
+    fn p_net_ban_republish_rechecks_the_network_authority() {
+        let owner = SigningKey::from_bytes(&[1; 32]);
+        let admin = SigningKey::from_bytes(&[2; 32]);
+        let admin_pubkey = admin.verifying_key().to_bytes().to_vec();
+        let admin_node_id = *blake3::hash(&admin_pubkey).as_bytes();
+        let network_id = [3; 32];
+        let target = [4; 32];
+        let mut cert = MembershipCert {
+            version: MEMBERSHIP_CERT_VERSION,
+            network_id,
+            member_node_id: admin_node_id,
+            issued_at_unix: 10,
+            valid_until_unix: 30,
+            admin: true,
+            algo: SignatureAlgorithm::Ed25519,
+            owner_signature: Vec::new(),
+        };
+        cert.owner_signature = owner.sign(&canonical_cert_body(&cert)).to_bytes().to_vec();
+        let mut entry = BanEntry {
+            version: BAN_ENTRY_VERSION,
+            network_id,
+            banned_node_id: target,
+            reason: "test ban".into(),
+            issued_at_unix: 15,
+            admin_node_id,
+            admin_cert_blob: encode_cert_blob(&cert),
+            admin_pubkey,
+            admin_signature: Vec::new(),
+        };
+        entry.admin_signature = admin.sign(&canonical_ban_body(&entry)).to_bytes().to_vec();
+        let blob = encode_ban_blob(&entry);
+        let key = ban_dht_key(&network_id, &target);
+        let mut gate = NetworkAccessGate {
+            local_cert_blob: Vec::new(),
+            expected_network_id: network_id,
+            owner_algo: SignatureAlgorithm::Ed25519,
+            owner_pubkey_bytes: owner.verifying_key().to_bytes().to_vec(),
+            admin_node_ids: [admin_node_id].into(),
+        };
+
+        assert!(republishable_record_at(Some(&gate), &key, &blob, 29_999));
+        assert!(!republishable_record_at(Some(&gate), &key, &blob, 30_000));
+        assert!(!republishable_record_at(
+            Some(&gate),
+            &[5; 32],
+            &blob,
+            29_999
+        ));
+        assert!(!republishable_record_at(None, &key, &blob, 29_999));
+        assert!(!NodeRuntime::is_republishable_dht_value_at(&blob, 29_999));
+        gate.admin_node_ids = [[6; 32]].into();
+        assert!(!republishable_record_at(Some(&gate), &key, &blob, 29_999));
+    }
 
     #[test]
     fn expired_space_discovery_records_are_not_republished() {

@@ -1790,7 +1790,18 @@ impl KademliaService {
         if let Some(cached) = lock!(self.lookup_cache).get(&target) {
             return cached;
         }
+        let result = self.find_node_iterative_network_fresh(target, outbox).await;
+        // Cache empty results too to avoid repeating a walk in an isolated
+        // part of the overlay.
+        lock!(self.lookup_cache).insert(target, result.clone());
+        result
+    }
 
+    async fn find_node_iterative_network_fresh(
+        &self,
+        target: [u8; 32],
+        outbox: Arc<dyn FrameRouter>,
+    ) -> Vec<Contact> {
         // Taken before the routing lock: `peer_ids` reaches into the outbox's
         // own lock, and acquiring the two in one order here and the other order
         // anywhere else is how deadlocks are built.
@@ -1870,12 +1881,7 @@ impl KademliaService {
             self.local_node_id(),
         );
         let params = super::iterative::IterativeParams::from(&self.dht_config);
-        let result = super::iterative::find_node_iterative(target, seeds, &querier, &params).await;
-        // Cache the result (including empty-result negative caching —
-        // saves us from immediately re-walking when a target genuinely
-        // has no contacts in our reachable network slice).
-        lock!(self.lookup_cache).insert(target, result.clone());
-        result
+        super::iterative::find_node_iterative(target, seeds, &querier, &params).await
     }
 
     /// Store a value locally **and** replicate it to the K closest network peers.
@@ -1899,6 +1905,7 @@ impl KademliaService {
         value: Vec<u8>,
         outbox: Arc<dyn FrameRouter>,
     ) -> Result<usize, KademliaError> {
+        let is_p_net_ban = value.starts_with(b"PBAN");
         let values = if value.get(..2)
             == Some(&veil_crypto::space_discovery::SPACE_DISCOVERY_SAMPLES_MAGIC[..])
         {
@@ -1926,10 +1933,15 @@ impl KademliaService {
             return Ok(0);
         }
 
-        // Find K closest peers.
-        let closest = self
-            .find_node_iterative_network(key, Arc::clone(&outbox))
-            .await;
+        // A ban published while disconnected can have no recipients until
+        // a session joins. Each publication must consider the current peers.
+        let closest = if is_p_net_ban {
+            self.find_node_iterative_network_fresh(key, Arc::clone(&outbox))
+                .await
+        } else {
+            self.find_node_iterative_network(key, Arc::clone(&outbox))
+                .await
+        };
 
         // Send STORE to each of them via the outbox. Count successes for the
         // observability return value (operator-visible "did the fan-out actually
@@ -2640,6 +2652,32 @@ mod tests {
         fn peer_ids(&self) -> Vec<[u8; 32]> {
             self.peers.clone()
         }
+    }
+
+    #[tokio::test]
+    async fn ban_replication_finds_a_peer_after_an_empty_lookup() {
+        let key = [0x42; 32];
+        let peer = [0x33; 32];
+        let svc = make_test_kademlia_service([0x0A; 32]);
+        let offline = Arc::new(SilentRouter(Vec::new()));
+        assert!(
+            svc.find_node_iterative_network(key, offline)
+                .await
+                .is_empty()
+        );
+
+        let online = Arc::new(RecordingRouter {
+            peers: vec![peer],
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        assert_eq!(
+            svc.store_replicated(key, b"PBAN-test-record".to_vec(), online.clone())
+                .await
+                .unwrap(),
+            1
+        );
+        let store = veil_proto::family::DiscoveryMsg::Store as u16;
+        assert!(online.seen.lock().unwrap().contains(&(peer, store)));
     }
 
     /// The replica fan-out must NOT overreach. A peer the table has never heard

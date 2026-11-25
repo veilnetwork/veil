@@ -1592,6 +1592,25 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   The receiver restored the revocation again after a restart.
   A separate public-mode macOS loopback test with the previous daemon
   delivered 1,000 SDK chat messages in each direction.
+- Ban publications now find recipients using current sessions and
+  routing state. The ordinary DHT lookup cache can hold a negative
+  result for 30 seconds after a publication made without any peers.
+  Before scheduled republication, the publisher also verifies the
+  network and key binding, the owner's and administrator's signatures,
+  the administrator's certificate lifetime, and the local allowlist.
+- In an isolated three-node Linux ARM64 stand, the administrator
+  published while its two peers were offline and reported zero replicas.
+  With a 12-second test republish interval, the receiver admitted the
+  banned peer on rejoin and later withdrew admission. The previous
+  build took 35.0 s from admission and the updated build took 7.5 s.
+  The receiving IPC result retained the certificate metadata while
+  reporting admission denied. The other two nodes delivered all 48
+  SDK messages exactly once after the ban took effect. A control with
+  the default schedule kept the peer admitted for the full 12-second
+  observation window. Fast revocation catch-up on rejoin remains open.
+- With the pre-batch daemon as receiver, the same stand enforced the
+  ban after 56.1 s via its periodic local scan. The remaining peers
+  delivered all 48 SDK messages exactly once in that mixed-version run.
 
 #### Enforcing revocations on relayed application datagrams
 

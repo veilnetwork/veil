@@ -214,24 +214,21 @@ impl NetworkAccessGate {
         self.admin_node_ids.contains(&cert.member_node_id)
     }
 
-    /// Verify a P-Net ban blob at DHT-ingest time.
+    /// Verify a P-Net ban against this network's current trust policy.
     ///
     /// Order of checks (cheap first):
-    /// 1. Blob carries the `PBAN` magic prefix (caller already checked).
-    /// 2. Blob decodes to a `BanEntry`.
+    /// 1. Blob decodes to a `BanEntry`.
+    /// 2. DHT key matches `ban_dht_key(network_id, banned_node_id)`.
     /// 3. Cert + admin signature chain verifies against this network.
     /// 4. Admin cert's `member_node_id` is in the optional allowlist.
-    /// 5. DHT key matches `ban_dht_key(network_id, banned_node_id)` —
-    ///    prevents misfiled records from landing under a ban-key bucket.
-    fn verify_ban_blob_inner(&self, key: &[u8; 32], value: &[u8]) -> bool {
+    pub fn verify_ban_record_at(&self, key: &[u8; 32], value: &[u8], now_unix: u64) -> bool {
         let entry = match decode_ban_blob(value) {
             Ok(e) => e,
             Err(_) => return false,
         };
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        if &ban_dht_key(&self.expected_network_id, &entry.banned_node_id) != key {
+            return false;
+        }
         let admin_cert = match verify_ban_entry(
             &entry,
             &self.expected_network_id,
@@ -242,17 +239,13 @@ impl NetworkAccessGate {
             Ok(c) => c,
             Err(_) => return false,
         };
-        if !self.is_admin(&admin_cert) {
-            return false;
-        }
-        let derived_key = ban_dht_key(&self.expected_network_id, &entry.banned_node_id);
-        &derived_key == key
+        self.is_admin(&admin_cert)
     }
 }
 
 impl veil_dht::NetworkAuthGate for NetworkAccessGate {
     fn verify_ban_record(&self, key: &[u8; 32], value: &[u8]) -> bool {
-        self.verify_ban_blob_inner(key, value)
+        self.verify_ban_record_at(key, value, veil_util::unix_secs_now_u64())
     }
 }
 
