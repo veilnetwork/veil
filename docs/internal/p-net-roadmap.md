@@ -388,6 +388,28 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   when their entries are still awaiting cleanup. A macOS mixed-version
   run delivered 1,000 SDK messages in each direction in public mode and
   repeated the same delivery count with private membership enabled.
+- Private admission checks reject peers absent from the verified certificate
+  cache before acquiring the session registry or TX registry locks. Peers
+  with a cached certificate still go through the normal session owner,
+  expiry, and ban checks. The single-peer status query retains its public
+  session semantics. All batch entries still count against the lookup
+  budget, including misses.
+- Two Linux ARM64 pairs ran the same instrumented daemon with and without
+  the early check, reversing the trial order. The two-vCPU stand ran 24
+  gateways with 4,096 configured entries each and two 32 Mb/s UDP flows.
+  The p95 thread CPU time per sampled admission lookup fell from 1.25 to
+  1.04 µs in both pairs. The first pair delivered every UDP datagram. In
+  the reverse pair, the control lost 21,814 of 162,892 datagrams and the
+  early check lost 21,438 of 164,130. Neither sender reported a UDP socket
+  send error. Both variants still encountered TCP receive-window pressure
+  during cold startup.
+- Each of the four trials delivered all 200 SDK chat messages. Chat p99
+  increased from 6.4 to 10.4 ms towards the hub and from 6.6 to 29.8 ms
+  from the hub in the first pair. In the reverse pair it increased from
+  403 to 742 ms and from 170 to 233 ms respectively. The latency increase
+  needs investigation on the shared host. In a separate mixed-version
+  run with a pre-batch daemon and 34 entries, the tunnel passed traffic
+  in both directions and withdrew the route 1.142 s after disconnect.
 - A separate cold start ran the first end-to-end probes in groups of
   four before opening the UDP flows. All 24 paths answered in 12.52 s.
   The following 38 s sample lost 76 of 137,175 UDP datagrams, with one

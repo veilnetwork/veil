@@ -237,12 +237,18 @@ impl PnetStatusQueries {
     }
 
     pub(crate) fn admits(&self, peer: &[u8; 32]) -> bool {
-        let status = self.provider.peer_status(peer);
-        let now = veil_util::unix_secs_now_u64();
-        status.peer_node_id == *peer
+        self.admitted_until(peer, veil_util::unix_secs_now_u64)
+            .is_some()
+    }
+
+    fn admitted_until(&self, peer: &[u8; 32], now: impl FnOnce() -> u64) -> Option<u64> {
+        let status = self.provider.private_peer_status(peer)?;
+        let now = now();
+        (status.peer_node_id == *peer
             && status.admitted
             && status.has_cert
-            && (status.valid_until_unix == 0 || now != 0 && now < status.valid_until_unix)
+            && (status.valid_until_unix == 0 || now != 0 && now < status.valid_until_unix))
+            .then_some(status.valid_until_unix)
     }
 
     async fn wait_for_batch_budget(&self, peers: usize, deadline: Instant) -> bool {
@@ -322,14 +328,9 @@ impl PnetStatusQueries {
         let now = veil_util::unix_secs_now_u64();
         let mut reply = Vec::with_capacity(peers.len() * PnetAdmission::WIRE_SIZE);
         for peer in peers {
-            let status = self.provider.peer_status(peer);
-            let admitted = status.peer_node_id == *peer
-                && status.has_cert
-                && status.admitted
-                && (status.valid_until_unix == 0 || (now != 0 && now < status.valid_until_unix));
             let entry = PnetAdmission {
                 peer_node_id: *peer,
-                valid_until_unix: admitted.then_some(status.valid_until_unix),
+                valid_until_unix: self.admitted_until(peer, || now),
             };
             reply.extend_from_slice(&entry.encode());
         }

@@ -598,6 +598,17 @@ pub trait PnetStatusProvider: Send + Sync {
     /// * `valid_until_unix == 0` is the "no expiry" sentinel and MUST be
     ///   propagated verbatim (not rewritten to far-future).
     fn peer_status(&self, peer_node_id: &[u8; 32]) -> veil_proto::PnetStatusResultPayload;
+
+    /// Status for an operation that requires a verified membership certificate.
+    /// A provider can reject a certificate miss before inspecting sessions.
+    /// A returned status must satisfy the same contract as `peer_status`.
+    fn private_peer_status(
+        &self,
+        peer_node_id: &[u8; 32],
+    ) -> Option<veil_proto::PnetStatusResultPayload> {
+        let status = self.peer_status(peer_node_id);
+        status.has_cert.then_some(status)
+    }
 }
 
 /// `Arc<T>` proxy [`PnetStatusProvider`].
@@ -608,6 +619,13 @@ impl<T: PnetStatusProvider + ?Sized> PnetStatusProvider for std::sync::Arc<T> {
 
     fn peer_status(&self, peer_node_id: &[u8; 32]) -> veil_proto::PnetStatusResultPayload {
         (**self).peer_status(peer_node_id)
+    }
+
+    fn private_peer_status(
+        &self,
+        peer_node_id: &[u8; 32],
+    ) -> Option<veil_proto::PnetStatusResultPayload> {
+        (**self).private_peer_status(peer_node_id)
     }
 }
 

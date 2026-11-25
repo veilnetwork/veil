@@ -75,6 +75,22 @@ impl PnetStatusProvider for DaemonPnetStatus {
         self.authority
     }
 
+    fn private_peer_status(&self, peer_node_id: &[u8; 32]) -> Option<PnetStatusResultPayload> {
+        // Large configured route tables are mostly offline or uncertified.
+        // Avoid competing with active sessions for their registry locks on
+        // these misses. Release the cert read guard before the general query.
+        if !self
+            .verified_peer_certs
+            .read()
+            .ok()?
+            .contains_key(peer_node_id)
+        {
+            return None;
+        }
+        let status = self.peer_status(peer_node_id);
+        status.has_cert.then_some(status)
+    }
+
     fn peer_status(&self, peer_node_id: &[u8; 32]) -> PnetStatusResultPayload {
         let admitted = self.is_admitted(peer_node_id);
         let cert = self.verified_peer_certs.read().ok().and_then(|cached| {
@@ -236,17 +252,43 @@ mod tests {
     }
 
     #[test]
+    fn private_certificate_miss_does_not_wait_for_session_registry() {
+        let (status, _outbox) = provider(DEVICE, None);
+        assert!(status.peer_status(&DEVICE).admitted);
+        let sessions = lock!(status.sessions);
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let status = &status;
+            scope.spawn(move || {
+                tx.send(status.private_peer_status(&DEVICE).is_none())
+                    .unwrap();
+            });
+            let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+            drop(sessions);
+            assert_eq!(result, Ok(true));
+        });
+    }
+
+    #[test]
     fn pnet_ban_overrides_a_live_committed_session() {
         let (status, _outbox) = provider(DEVICE, None);
         let bans = Arc::new(Mutex::new(BanList::new()));
         let status = status.with_bans(Arc::clone(&bans));
         cache_cert(&status, 0);
         assert!(status.peer_status(&DEVICE).admitted);
+        assert_eq!(
+            status
+                .private_peer_status(&DEVICE)
+                .unwrap()
+                .valid_until_unix,
+            0
+        );
 
         bans.lock().unwrap().ban_manual(DEVICE, "test ban");
         let banned = status.peer_status(&DEVICE);
         assert!(banned.has_cert);
         assert!(!banned.admitted);
+        assert!(!status.private_peer_status(&DEVICE).unwrap().admitted);
         assert!(status.is_admitted(&DEVICE));
 
         bans.lock().unwrap().unban(&DEVICE);
@@ -263,14 +305,17 @@ mod tests {
         assert!(expired.has_cert);
         assert_eq!(expired.valid_until_unix, 1);
         assert!(!expired.admitted);
+        assert!(!status.private_peer_status(&DEVICE).unwrap().admitted);
     }
 
     #[test]
     fn old_committed_owner_cannot_admit_an_uncommitted_replacement() {
         let (p, _old) = provider(DEVICE, Some(IDENTITY));
+        cache_cert(&p, 0);
         let successor = [0x43; 32];
         let new = p.tx.write().unwrap().register_owned(DEVICE, successor);
         assert!(!p.is_admitted(&DEVICE));
+        assert!(!p.private_peer_status(&DEVICE).unwrap().admitted);
         assert!(!p.is_admitted(&IDENTITY));
 
         p.sessions
