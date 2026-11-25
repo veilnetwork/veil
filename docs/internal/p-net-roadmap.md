@@ -88,6 +88,21 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   remained active. A short successor policy carried live traffic before
   expiry and denied both families afterwards over the same links. All
   48 SDK datagrams arrived.
+- Routed probes now schedule due renewals ahead of an inactive roster.
+  When background work is due, it gets a turn after at most three
+  renewals. Those turns alternate between authenticated hints or recent
+  recovery and ordinary discovery when both are due. An unanswered nonce
+  can be retransmitted once with its original deadline. Each route still
+  needs a verified response to that nonce.
+- In a control run with `8ea4e743`, expanding the signed roster to 4,096
+  assignments caused a working route to expire after 18.5 s with all
+  configured surviving relay sessions still live. On the same topology,
+  the new scheduler reached a late gateway over IPv4 and IPv6 within
+  8.8 s of starting its bridge in the expanded roster. The two existing
+  gateways returned all 1,760 IPv4 pings over 80.9 s and each recorded
+  eight authenticated round trips by the end of the measurement. All
+  48 SDK datagrams arrived. A ban blocked only its target, and the target
+  passed IPv4 and IPv6 checks 5.1 s after the ban was lifted.
 
 ## 2. Qualify mixed versions and load
 

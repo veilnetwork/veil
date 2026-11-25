@@ -1,7 +1,6 @@
 //! Prove that a configured gateway can be reached over Veil's app path.
 
-use std::collections::{BTreeMap, HashMap};
-use std::ops::Bound::{Excluded, Unbounded};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,11 +26,14 @@ const VERSION: u8 = 1;
 const HEADER_SIZE: usize = 2 + 32 * 3;
 const ENDPOINT: u32 = 1;
 const PROBE_SPACING: Duration = Duration::from_millis(300);
+const RENEWAL_BURST: u8 = 3;
 const CHALLENGE_SPACING: Duration = Duration::from_millis(200);
 const PEER_ANSWER_SPACING: Duration = Duration::from_secs(1);
 const CHALLENGE_LIFETIME: Duration = Duration::from_secs(10);
 const RENEW_AFTER: Duration = Duration::from_secs(12);
 const ROUTE_LIFETIME: Duration = Duration::from_secs(18);
+const RENEW_RETRANSMIT_AFTER: Duration = Duration::from_secs(2);
+const RECOVERY_WINDOW: Duration = Duration::from_secs(36);
 const LOCAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const RETRY_AFTER: Duration = Duration::from_secs(5);
 
@@ -251,13 +253,91 @@ impl<'a> Proof<'a> {
 struct Challenge {
     nonce: Nonce,
     deadline: Instant,
+    retransmitted: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProbeKind {
+    Renewal,
+    Hint,
+    Discovery,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ScheduledProbe {
+    at: Instant,
+    kind: ProbeKind,
+}
+
+#[derive(Default)]
+struct ProbeSchedule {
+    renewals: BTreeSet<(Instant, NodeId)>,
+    hints: BTreeSet<(Instant, NodeId)>,
+    discovery: BTreeSet<(Instant, NodeId)>,
+    renewal_run: u8,
+    last_background_was_hint: bool,
+}
+
+impl ProbeSchedule {
+    fn queue(&mut self, kind: ProbeKind) -> &mut BTreeSet<(Instant, NodeId)> {
+        match kind {
+            ProbeKind::Renewal => &mut self.renewals,
+            ProbeKind::Hint => &mut self.hints,
+            ProbeKind::Discovery => &mut self.discovery,
+        }
+    }
+
+    fn rebuild(&mut self, peers: &BTreeMap<NodeId, Peer>) {
+        self.renewals.clear();
+        self.hints.clear();
+        self.discovery.clear();
+        for (&node, peer) in peers {
+            self.queue(peer.probe.kind).insert((peer.probe.at, node));
+        }
+    }
+
+    fn update(&mut self, node: NodeId, before: ScheduledProbe, after: ScheduledProbe) {
+        if before != after {
+            self.queue(before.kind).remove(&(before.at, node));
+            self.queue(after.kind).insert((after.at, node));
+        }
+    }
+
+    fn next(&mut self, now: Instant) -> Option<NodeId> {
+        fn due(queue: &BTreeSet<(Instant, NodeId)>, now: Instant) -> Option<NodeId> {
+            let &(at, node) = queue.first()?;
+            (at <= now).then_some(node)
+        }
+
+        let discovery = due(&self.discovery, now);
+        let hint = due(&self.hints, now);
+        if (self.renewal_run < RENEWAL_BURST || discovery.is_none() && hint.is_none())
+            && let Some(node) = due(&self.renewals, now)
+        {
+            self.renewal_run = (self.renewal_run + 1).min(RENEWAL_BURST);
+            return Some(node);
+        }
+        // Reserve a slot for background work. A stream of authenticated hints
+        // must also leave a turn for peers that have never exchanged traffic.
+        self.renewal_run = 0;
+        let next = if self.last_background_was_hint {
+            discovery.or(hint)
+        } else {
+            hint.or(discovery)
+        };
+        if let Some(node) = next {
+            self.last_background_was_hint = hint == Some(node);
+        }
+        next
+    }
 }
 
 struct Peer {
     app_id: AppId,
     assignment: Assignment,
     pending: Option<Challenge>,
-    probe_after: Instant,
+    last_confirmed: Option<Instant>,
+    probe: ScheduledProbe,
     answer_after: Instant,
 }
 
@@ -267,7 +347,11 @@ impl Peer {
             app_id,
             assignment,
             pending: None,
-            probe_after: now,
+            last_confirmed: None,
+            probe: ScheduledProbe {
+                at: now,
+                kind: ProbeKind::Discovery,
+            },
             answer_after: now,
         }
     }
@@ -283,8 +367,82 @@ impl Peer {
             return false;
         }
         self.pending = None;
-        self.probe_after = now + RENEW_AFTER;
+        self.last_confirmed = Some(now);
+        self.probe = ScheduledProbe {
+            at: now + RENEW_AFTER,
+            kind: ProbeKind::Renewal,
+        };
         true
+    }
+
+    fn discover_at(&mut self, at: Instant) {
+        self.probe = ScheduledProbe {
+            at,
+            kind: ProbeKind::Discovery,
+        };
+    }
+
+    fn defer_probe(&mut self) {
+        self.pending = None;
+        self.retry_at(Instant::now() + RETRY_AFTER);
+    }
+
+    fn recently_confirmed(&self, now: Instant) -> bool {
+        self.last_confirmed
+            .is_some_and(|at| now.saturating_duration_since(at) < RECOVERY_WINDOW)
+    }
+
+    fn retry_at(&mut self, at: Instant) {
+        if self.recently_confirmed(at) {
+            self.probe = ScheduledProbe {
+                at,
+                kind: ProbeKind::Hint,
+            };
+        } else {
+            self.discover_at(at);
+        }
+    }
+
+    fn hint(&mut self, now: Instant) {
+        if self.probe.kind != ProbeKind::Renewal
+            && self
+                .pending
+                .as_ref()
+                .is_none_or(|probe| probe.deadline <= now || !probe.retransmitted)
+        {
+            self.probe = ScheduledProbe {
+                at: now,
+                kind: ProbeKind::Hint,
+            };
+        }
+    }
+
+    fn outgoing_nonce(&mut self, now: Instant) -> anyhow::Result<Nonce> {
+        if self.probe.kind == ProbeKind::Hint
+            && let Some(challenge) = self.pending.as_mut()
+            && challenge.deadline > now
+            && !challenge.retransmitted
+        {
+            challenge.retransmitted = true;
+            let (nonce, deadline) = (challenge.nonce, challenge.deadline);
+            self.retry_at(deadline);
+            return Ok(nonce);
+        }
+        let mut nonce = Nonce::default();
+        getrandom::fill(&mut nonce)
+            .map_err(|error| anyhow::anyhow!("generate routed challenge: {error}"))?;
+        let deadline = now + CHALLENGE_LIFETIME;
+        self.pending = Some(Challenge {
+            nonce,
+            deadline,
+            retransmitted: false,
+        });
+        if self.recently_confirmed(now) {
+            self.retry_at(now + RENEW_RETRANSMIT_AFTER);
+        } else {
+            self.discover_at(deadline);
+        }
+        Ok(nonce)
     }
 }
 
@@ -454,7 +612,8 @@ async fn serve(
         gateway.reconcile(&configured, &mut peers);
         configured.policy_window
     };
-    let mut cursor = None;
+    let mut schedule = ProbeSchedule::default();
+    schedule.rebuild(&peers);
     let mut pace = interval(PROBE_SPACING);
     pace.set_missed_tick_behavior(MissedTickBehavior::Delay);
     tracing::info!("checking authenticated P-Net reachability");
@@ -469,8 +628,9 @@ async fn serve(
                             ensure!(node != gateway.node, "local routed membership revoked");
                             exchange.leases.revoke(&node);
                             if let Some(peer) = peers.get_mut(&node) {
-                                peer.pending = None;
-                                peer.probe_after = Instant::now() + RETRY_AFTER;
+                                let before = peer.probe;
+                                peer.defer_probe();
+                                schedule.update(node, before, peer.probe);
                             }
                         }
                     }
@@ -498,10 +658,11 @@ async fn serve(
                     let now = Instant::now();
                     for (node, peer) in &mut peers {
                         if peer.pending.is_none() && exchange.leases.active.contains_key(node) {
-                            peer.probe_after = now;
+                            peer.probe = ScheduledProbe { at: now, kind: ProbeKind::Renewal };
                         }
                     }
                 }
+                schedule.rebuild(&peers);
             }
             _ = pace.tick(), if !peers.is_empty() => {
                 if !exchange.leases.active.is_empty() {
@@ -509,22 +670,22 @@ async fn serve(
                     let unix = unix_secs_now_u64();
                     exchange.leases.retain(|_, proof| proof.allows_at(now, unix));
                 }
-                let next = cursor
-                    .and_then(|node| peers.range((Excluded(node), Unbounded)).next())
-                    .map(|(&node, _)| node)
-                    .or_else(|| peers.first_key_value().map(|(&node, _)| node));
-                if let Some(node) = next {
-                    cursor = Some(node);
+                if let Some(node) = schedule.next(Instant::now()) {
                     let peer = peers.get_mut(&node).expect("selected configured peer");
                     if current_roster(roster, &node, peer).is_some() {
+                        let before = peer.probe;
                         exchange.probe(node, peer).await?;
+                        schedule.update(node, before, peer.probe);
                     }
                 }
             }
             message = receiver.recv() => {
                 let message = message?.context("routed check endpoint closed")?;
-                if let Some(peer) = peers.get_mut(&message.src_node_id) {
+                let node = message.src_node_id;
+                if let Some(peer) = peers.get_mut(&node) {
+                    let before = peer.probe;
                     exchange.receive(&message, peer, roster).await?;
+                    schedule.update(node, before, peer.probe);
                 }
             }
         }
@@ -582,15 +743,10 @@ impl Exchange<'_> {
 
     async fn probe(&self, node: NodeId, peer: &mut Peer) -> anyhow::Result<()> {
         let now = Instant::now();
-        if peer.probe_after > now || !current(self.local_expiry) {
+        if peer.probe.at > now || !current(self.local_expiry) {
             return Ok(());
         }
-        let mut nonce = Nonce::default();
-        getrandom::fill(&mut nonce)
-            .map_err(|error| anyhow::anyhow!("generate routed challenge: {error}"))?;
-        let deadline = now + CHALLENGE_LIFETIME;
-        peer.pending = Some(Challenge { nonce, deadline });
-        peer.probe_after = deadline;
+        let nonce = peer.outgoing_nonce(now)?;
         self.send(node, peer.app_id, Kind::Challenge, nonce).await
     }
 
@@ -623,10 +779,12 @@ impl Exchange<'_> {
             Ok(Some(expiry)) => expiry,
             Ok(None) => {
                 self.leases.revoke(&node);
+                peer.defer_probe();
                 return Ok(());
             }
             Err(error) => {
                 self.leases.revoke(&node);
+                peer.defer_probe();
                 tracing::debug!(%error, "could not verify routed P-Net certificate");
                 return Ok(());
             }
@@ -640,7 +798,10 @@ impl Exchange<'_> {
         match proof.kind {
             Kind::Challenge => {
                 self.send(node, peer.app_id, Kind::Answer, proof.nonce)
-                    .await?
+                    .await?;
+                // An authenticated peer is ready to receive a challenge. Its
+                // request can order our queue but cannot admit an IP route.
+                peer.hint(Instant::now());
             }
             Kind::Answer if peer.accept_answer(&proof.nonce, Instant::now()) => {
                 let cert_until = match (self.local_expiry, expiry) {
@@ -703,11 +864,83 @@ mod tests {
         let mut peer = Peer::new([1; 32], Arc::new(AtomicBool::new(true)), now);
         let nonce = [2; 32];
         let deadline = now + CHALLENGE_LIFETIME;
-        peer.pending = Some(Challenge { nonce, deadline });
+        peer.pending = Some(Challenge {
+            nonce,
+            deadline,
+            retransmitted: false,
+        });
         assert!(!peer.accept_answer(&[3; 32], now));
         assert!(!peer.accept_answer(&nonce, deadline));
         assert!(peer.accept_answer(&nonce, now));
         assert!(!peer.accept_answer(&nonce, now));
+    }
+
+    #[test]
+    fn renewals_bypass_a_large_roster_with_turns_for_hints_and_discovery() {
+        let now = Instant::now();
+        let assignment = Arc::new(AtomicBool::new(true));
+        let mut peers = BTreeMap::new();
+        for index in 0u16..4_096 {
+            let mut node = [0; 32];
+            node[..2].copy_from_slice(&index.to_be_bytes());
+            peers.insert(node, Peer::new(node, Arc::clone(&assignment), now));
+        }
+        let late = [0xda; 32];
+        let mut peer = Peer::new(late, Arc::clone(&assignment), now);
+        peer.hint(now);
+        peers.insert(late, peer);
+        for byte in 0xf1..=0xf7 {
+            let node = [byte; 32];
+            let mut peer = Peer::new(node, Arc::clone(&assignment), now);
+            peer.probe.kind = ProbeKind::Renewal;
+            peers.insert(node, peer);
+        }
+
+        let mut schedule = ProbeSchedule::default();
+        schedule.rebuild(&peers);
+        for node in [
+            [0xf1; 32], [0xf2; 32], [0xf3; 32], late, [0xf4; 32], [0xf5; 32], [0xf6; 32], [0; 32],
+            [0xf7; 32],
+        ] {
+            assert_eq!(schedule.next(now), Some(node));
+            let peer = peers.get_mut(&node).unwrap();
+            let previous = peer.probe;
+            peer.discover_at(now + CHALLENGE_LIFETIME);
+            schedule.update(node, previous, peer.probe);
+        }
+    }
+
+    #[test]
+    fn authenticated_hint_retries_an_unanswered_nonce_once_without_extending_its_life() {
+        let now = Instant::now();
+        let mut peer = Peer::new([1; 32], Arc::new(AtomicBool::new(true)), now);
+        let nonce = peer.outgoing_nonce(now).unwrap();
+        let deadline = now + CHALLENGE_LIFETIME;
+        let heard_at = now + Duration::from_secs(1);
+        peer.hint(heard_at);
+        assert_eq!(peer.probe.at, heard_at);
+        assert_eq!(peer.outgoing_nonce(heard_at).unwrap(), nonce);
+        assert_eq!(peer.probe.at, deadline);
+        peer.hint(heard_at + Duration::from_secs(1));
+        assert_eq!(peer.probe.at, deadline);
+        assert!(!peer.accept_answer(&nonce, deadline));
+    }
+
+    #[test]
+    fn unanswered_renewal_gets_one_early_retransmit_and_bounded_recovery() {
+        let now = Instant::now();
+        let mut peer = Peer::new([1; 32], Arc::new(AtomicBool::new(true)), now);
+        let initial = peer.outgoing_nonce(now).unwrap();
+        assert!(peer.accept_answer(&initial, now));
+        let renew_at = now + RENEW_AFTER;
+        let renewal = peer.outgoing_nonce(renew_at).unwrap();
+        assert_eq!(peer.probe.at, renew_at + RENEW_RETRANSMIT_AFTER);
+        assert_eq!(peer.outgoing_nonce(peer.probe.at).unwrap(), renewal);
+        assert_eq!(peer.probe.at, renew_at + CHALLENGE_LIFETIME);
+        let recovery = peer.outgoing_nonce(peer.probe.at).unwrap();
+        assert_ne!(renewal, recovery);
+        peer.retry_at(now + RECOVERY_WINDOW);
+        assert!(peer.probe.kind == ProbeKind::Discovery);
     }
 
     #[test]
