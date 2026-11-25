@@ -1727,6 +1727,22 @@ sessions, IPC clients, and messenger traffic compatible throughout rollout.
   control restored no ban and still admitted the target at 12.21 s.
   The unrelated pair received 200 tunnel probes and 48 SDK messages
   in each run.
+- With the same opt-in persistence settings, recipients apply verified
+  bans immediately and enqueue the records for a background writer
+  with 256 pending slots. Local receipt time determines the remaining
+  DHT lifetime. The writer deletes expired copies during cleanup.
+  The receiver rechecks the record's trust chain before accepting it
+  on restart. It preserves the signed STORE format and emits a local
+  event when disk storage completes.
+- In the five-node Linux ARM64 chain, an observer received and applied
+  the ban. The test stopped its only neighbor holding a copy and sent
+  `SIGKILL` to the observer before its first DHT snapshot. The updated
+  observer restored the signed receipt before opening its listener and
+  denied admission through the five-second observation window. The
+  revoked tunnel still failed in both directions. The `2e92f72c` control
+  re-admitted the peer and its tunnel recovered within 1.31 s after
+  readmission. The unaffected pair received all 200 tunnel probes and
+  48 SDK messages in both runs.
 
 #### Enforcing revocations on relayed application datagrams
 

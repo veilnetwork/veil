@@ -435,6 +435,7 @@ impl NodeRuntime {
         } else {
             veil_session::SessionTxRegistry::with_capacity(config.session.tx_queue_depth)
         }));
+        let mut received_ban_writer = None;
         let dht = {
             let mut dht_cfg = config.dht.clone();
             if role == veil_cfg::NodeRole::Core && dht_cfg.k == veil_cfg::DhtConfig::default().k {
@@ -461,12 +462,13 @@ impl NodeRuntime {
                 svc.set_metrics(Arc::clone(m) as Arc<dyn veil_dht::DhtMetrics>);
             }
             if let Some(ref gate) = network_gate_arc {
-                super::p_net_ban_sync::configure_p_net_bans(
+                received_ban_writer = super::p_net_ban_sync::configure_p_net_bans(
                     &mut svc,
                     gate,
                     &ban_list,
                     &shared_session_tx_registry,
                     &logger,
+                    super::received_bans::storage_dir(&config),
                 );
             }
             Arc::new(svc)
@@ -1481,6 +1483,7 @@ impl NodeRuntime {
             // Master switch for all persistence.
             persist_enabled: config.persist_enabled,
             issued_bans_dir: super::issued_bans::storage_dir(&config),
+            received_ban_writer,
             // gateway list — same Arc shared with the dispatcher.
             gateway_list: Arc::clone(&shared_gateway_list),
             // record when the ML-KEM key was loaded so the admin
@@ -1641,6 +1644,7 @@ impl NodeRuntime {
             runtime.restore_dht_values_snapshot(&config);
         }
         runtime.restore_issued_p_net_bans().await;
+        runtime.restore_received_p_net_bans(&config).await;
         if runtime.configured_private_network.is_some() {
             runtime.apply_stored_p_net_bans();
         }

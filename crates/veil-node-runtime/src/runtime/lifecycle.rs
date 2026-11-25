@@ -752,12 +752,13 @@ impl NodeRuntime {
                 )));
             }
             if let Some(gate) = &self.network_gate {
-                super::p_net_ban_sync::configure_p_net_bans(
+                self.received_ban_writer = super::p_net_ban_sync::configure_p_net_bans(
                     &mut svc,
                     gate,
                     &self.ban_list,
                     &self.session_tx_registry,
                     &self.logger,
+                    super::received_bans::storage_dir(&config),
                 );
                 let keys = super::p_net_ban_sync::enforced_ban_keys(
                     &self.ban_list,
@@ -881,6 +882,7 @@ impl NodeRuntime {
         }
         self.issued_bans_dir = super::issued_bans::storage_dir(&config);
         self.restore_issued_p_net_bans().await;
+        self.restore_received_p_net_bans(&config).await;
         self.apply_stored_p_net_bans();
         super::persistence::load_bans(&self.ban_list, &self.config_path);
         // `.max(1)` clamp makes the `.expect` unreachable here (same

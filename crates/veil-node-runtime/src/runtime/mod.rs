@@ -44,6 +44,7 @@ mod persist_tasks;
 pub(crate) mod persistence;
 mod pex_runtime;
 mod push_tasks;
+mod received_bans;
 mod rendezvous_ad_binding;
 mod rendezvous_binder;
 mod rendezvous_order;
@@ -872,6 +873,7 @@ pub struct NodeRuntime {
     /// Master switch for all on-disk persistence (mirrors `config.persist_enabled`).
     persist_enabled: bool,
     issued_bans_dir: Option<std::path::PathBuf>,
+    received_ban_writer: Option<received_bans::ReceivedBanWriter>,
     /// ranked list of known Gateway peers for multi-gateway failover.
     gateway_list: Arc<Mutex<veil_gateway::GatewayList>>,
     /// wall-clock instant when the ML-KEM decapsulation-key seed

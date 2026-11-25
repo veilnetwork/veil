@@ -25,6 +25,7 @@ use veil_session::SessionTxRegistry;
 use veil_types::{BAN_ENTRY_VERSION, BanEntry};
 use veil_util::{lock, wlock};
 
+use super::received_bans::{ReceivedBanSender, ReceivedBanWriter};
 use super::{NodeRuntime, lock_tasks, supervised_spawn};
 
 /// Cap on the in-flight reason string before signing. The receiver
@@ -43,6 +44,7 @@ struct BanStoreGate {
     ban_list: Arc<Mutex<BanList>>,
     sessions: Arc<RwLock<SessionTxRegistry>>,
     logger: Arc<NodeLogger>,
+    received: Option<ReceivedBanSender>,
 }
 
 impl NetworkAuthGate for BanStoreGate {
@@ -51,9 +53,16 @@ impl NetworkAuthGate for BanStoreGate {
     }
 
     fn ban_stored(&self, value: &[u8]) {
-        if apply_verified_ban(value, &self.ban_list, &self.sessions) {
+        let Ok(entry) = decode_ban_blob(value) else {
+            return;
+        };
+        let key = ban_dht_key(&entry.network_id, &entry.banned_node_id);
+        if apply_ban_entry(entry, &self.ban_list, &self.sessions) {
             self.logger
                 .info("network.ban.applied", "applied=1 source=store");
+        }
+        if let Some(received) = &self.received {
+            received.record(key, value);
         }
     }
 }
@@ -64,13 +73,22 @@ pub(super) fn configure_p_net_bans(
     ban_list: &Arc<Mutex<BanList>>,
     sessions: &Arc<RwLock<SessionTxRegistry>>,
     logger: &Arc<NodeLogger>,
-) {
+    received_dir: Option<PathBuf>,
+) -> Option<ReceivedBanWriter> {
+    let (received, writer) = if let Some(dir) = received_dir {
+        let (sender, writer) = ReceivedBanWriter::channel(dir, gate, logger);
+        (Some(sender), Some(writer))
+    } else {
+        (None, None)
+    };
     dht.set_network_auth_gate(Arc::new(BanStoreGate {
         gate: Arc::clone(gate),
         ban_list: Arc::clone(ban_list),
         sessions: Arc::clone(sessions),
         logger: Arc::clone(logger),
+        received,
     }));
+    writer
 }
 
 pub(super) fn guard_private_app_datagrams(
@@ -360,6 +378,42 @@ impl NodeRuntime {
         }
     }
 
+    pub(super) async fn restore_received_p_net_bans(&self, config: &veil_cfg::Config) {
+        let (Some(dir), Some(gate)) = (
+            super::received_bans::storage_dir(config),
+            self.network_gate.clone(),
+        ) else {
+            return;
+        };
+        let logger = Arc::clone(&self.logger);
+        let records =
+            tokio::task::spawn_blocking(move || super::received_bans::load(&dir, &gate, &logger))
+                .await;
+        match records {
+            Ok(Ok(records)) => {
+                let count = records.len();
+                for record in &records {
+                    apply_verified_ban(&record.value, &self.ban_list, &self.session_tx_registry);
+                }
+                self.dht.restore_values(records);
+                if count > 0 {
+                    self.logger.info(
+                        "network.ban.received_storage.restored",
+                        format!("records={count}"),
+                    );
+                }
+            }
+            Ok(Err(error)) => self.logger.warn(
+                "network.ban.received_storage.load_failed",
+                error.to_string(),
+            ),
+            Err(error) => self.logger.warn(
+                "network.ban.received_storage.load_failed",
+                error.to_string(),
+            ),
+        }
+    }
+
     /// Periodic background task: every `APPLY_INTERVAL_SECS` seconds
     /// scan the local DHT store for PBAN-prefixed values, verify each,
     /// and apply to `BanList`. Idempotent — re-running on already-banned
@@ -386,6 +440,14 @@ impl NodeRuntime {
         let Some(shutdown_tx) = &self.shutdown_tx else {
             return;
         };
+        if let Some(writer) = self.received_ban_writer.take() {
+            let handle = supervised_spawn(
+                Arc::clone(&self.logger),
+                "p_net_received_ban_storage",
+                writer.run(shutdown_tx.subscribe()),
+            );
+            lock_tasks(&self.tasks).sessions.push(handle);
+        }
         let mut shutdown_rx = shutdown_tx.subscribe();
         let dht = Arc::clone(&self.dht);
         let ban_list = Arc::clone(&self.ban_list);
@@ -442,6 +504,14 @@ fn apply_verified_ban(
     let Ok(entry) = decode_ban_blob(value) else {
         return false;
     };
+    apply_ban_entry(entry, ban_list, sessions)
+}
+
+fn apply_ban_entry(
+    entry: BanEntry,
+    ban_list: &Mutex<BanList>,
+    sessions: &RwLock<SessionTxRegistry>,
+) -> bool {
     let mut bans = lock!(ban_list);
     if bans
         .get(&entry.banned_node_id)
@@ -675,14 +745,12 @@ mod tests {
         runtime.stop().await.unwrap();
     }
 
-    #[test]
-    fn incoming_ban_retires_the_sender_only_after_verification_and_storage() {
+    fn signed_ban_fixture(target: [u8; 32]) -> (BanEntry, Arc<NetworkAccessGate>) {
         let owner = SigningKey::from_bytes(&[1; 32]);
         let admin = SigningKey::from_bytes(&[2; 32]);
         let admin_pubkey = admin.verifying_key().to_bytes().to_vec();
         let admin_node_id = *blake3::hash(&admin_pubkey).as_bytes();
         let network_id = [3; 32];
-        let target = [4; 32];
         let now = veil_util::unix_secs_now_u64();
         let mut cert = MembershipCert {
             version: MEMBERSHIP_CERT_VERSION,
@@ -706,7 +774,6 @@ mod tests {
             admin_pubkey,
             admin_signature: Vec::new(),
         };
-        let key = ban_dht_key(&network_id, &target);
         let gate = Arc::new(NetworkAccessGate {
             local_cert_blob: Vec::new(),
             expected_network_id: network_id,
@@ -714,6 +781,104 @@ mod tests {
             owner_pubkey_bytes: owner.verifying_key().to_bytes().to_vec(),
             admin_node_ids: [admin_node_id].into(),
         });
+        entry.admin_signature = admin
+            .sign(&veil_identity::network_ban::canonical_ban_body(&entry))
+            .to_bytes()
+            .to_vec();
+        (entry, gate)
+    }
+
+    #[tokio::test]
+    async fn received_records_restore_without_a_snapshot_and_keep_their_age() {
+        use std::time::Duration;
+        use veil_dht::kademlia::DEFAULT_TTL;
+
+        let (dir, mut config) = admin_fixture(veil_cfg::NetworkMode::PrivateConfigured);
+        let config_path = dir.path().join("node.toml");
+        let snapshot = dir.path().join("dht-values.json");
+        config.persist_enabled = true;
+        config.dht.values_persist_path = Some(snapshot.to_string_lossy().into_owned());
+        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let receiver_store = super::super::received_bans::storage_dir(&config).unwrap();
+        let target = [10; 32];
+        let (entry, _) = signed_ban_fixture(target);
+        let key = ban_dht_key(&TEST_NETWORK_ID, &target);
+        let record = encode_ban_blob(&entry);
+        let file = receiver_store.join(format!("{}.pban", veil_util::bytes_to_hex(&key)));
+
+        let mut runtime = NodeRuntime::start(&config_path, true).await.unwrap();
+        let _receiver = wlock!(runtime.session_tx_registry).register(target);
+        runtime
+            .dht
+            .handle_store(StorePayload::unsigned(key, record.clone()))
+            .unwrap();
+        assert!(lock!(runtime.ban_list).is_banned(&target));
+        assert!(!veil_util::rlock!(runtime.session_tx_registry).has_session(&target));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !file.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("received ban should be written by the background worker");
+        let mut bytes = std::fs::read(&file).unwrap();
+        assert_eq!(&bytes[12..], &record);
+        runtime.stop().await.unwrap();
+
+        let aged = veil_util::unix_secs_now_u64() - 120;
+        bytes[4..12].copy_from_slice(&aged.to_be_bytes());
+        // Give each restart an empty DHT-snapshot path and copy just the
+        // receipt. A graceful flush from the prior process cannot race it.
+        config.dht.values_persist_path =
+            Some(dir.path().join("aged.json").to_string_lossy().into_owned());
+        let aged_store = super::super::received_bans::storage_dir(&config).unwrap();
+        veil_util::create_dir_owner_only(&aged_store).unwrap();
+        veil_util::atomic_write_owner_only(&aged_store.join(file.file_name().unwrap()), &bytes)
+            .unwrap();
+        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let mut runtime = NodeRuntime::start(&config_path, true).await.unwrap();
+        assert!(lock!(runtime.ban_list).is_banned(&target));
+        assert_eq!(
+            runtime.dht.peek_value(&key).as_deref(),
+            Some(record.as_slice())
+        );
+        let saved = runtime
+            .dht
+            .snapshot_values()
+            .into_iter()
+            .find(|entry| entry.key == key)
+            .unwrap();
+        assert!(
+            saved.age_secs >= 120,
+            "restored DHT age was {} seconds",
+            saved.age_secs
+        );
+        runtime.stop().await.unwrap();
+
+        let expired = veil_util::unix_secs_now_u64() - DEFAULT_TTL.as_secs();
+        bytes[4..12].copy_from_slice(&expired.to_be_bytes());
+        config.dht.values_persist_path = Some(
+            dir.path()
+                .join("expired.json")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let expired_store = super::super::received_bans::storage_dir(&config).unwrap();
+        veil_util::create_dir_owner_only(&expired_store).unwrap();
+        veil_util::atomic_write_owner_only(&expired_store.join(file.file_name().unwrap()), &bytes)
+            .unwrap();
+        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let mut runtime = NodeRuntime::start(&config_path, true).await.unwrap();
+        assert!(!lock!(runtime.ban_list).is_banned(&target));
+        assert!(runtime.dht.peek_value(&key).is_none());
+        runtime.stop().await.unwrap();
+    }
+
+    #[test]
+    fn incoming_ban_retires_the_sender_only_after_verification_and_storage() {
+        let target = [4; 32];
+        let (mut entry, gate) = signed_ban_fixture(target);
+        let key = ban_dht_key(&TEST_NETWORK_ID, &target);
         let logger = Arc::new(NodeLogger::new_noop());
         let bans = Arc::new(Mutex::new(BanList::new()));
         lock!(bans).ban(
@@ -724,11 +889,7 @@ mod tests {
         let sessions = Arc::new(RwLock::new(SessionTxRegistry::new()));
         let _outbox = wlock!(sessions).register(target);
         let mut dht = KademliaService::new([5; 32]);
-        configure_p_net_bans(&mut dht, &gate, &bans, &sessions, &logger);
-        entry.admin_signature = admin
-            .sign(&veil_identity::network_ban::canonical_ban_body(&entry))
-            .to_bytes()
-            .to_vec();
+        assert!(configure_p_net_bans(&mut dht, &gate, &bans, &sessions, &logger, None).is_none());
         let value = encode_ban_blob(&entry);
 
         entry.admin_signature[0] ^= 1;
@@ -746,7 +907,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        configure_p_net_bans(&mut small, &gate, &bans, &sessions, &logger);
+        assert!(configure_p_net_bans(&mut small, &gate, &bans, &sessions, &logger, None).is_none());
         small
             .handle_store(StorePayload::unsigned(key, value.clone()))
             .unwrap();

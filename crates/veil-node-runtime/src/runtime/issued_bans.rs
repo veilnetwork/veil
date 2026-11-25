@@ -17,16 +17,20 @@ use veil_util::lock;
 static STORAGE: Mutex<()> = Mutex::new(());
 
 pub(super) fn storage_dir(config: &veil_cfg::Config) -> Option<PathBuf> {
+    sibling_storage_dir(config, ".pnet-bans")
+}
+
+pub(super) fn sibling_storage_dir(config: &veil_cfg::Config, suffix: &str) -> Option<PathBuf> {
     if !config.persist_enabled {
         return None;
     }
     let snapshot = Path::new(config.dht.values_persist_path.as_deref()?);
     let mut name = snapshot.file_name()?.to_os_string();
-    name.push(".pnet-bans");
+    name.push(suffix);
     Some(snapshot.with_file_name(name))
 }
 
-fn directory_exists(dir: &Path) -> io::Result<bool> {
+pub(super) fn directory_exists(dir: &Path) -> io::Result<bool> {
     let metadata = match fs::symlink_metadata(dir) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -45,19 +49,14 @@ fn directory_exists(dir: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
-fn entry_key(path: &Path) -> Option<[u8; 32]> {
+pub(super) fn entry_key(path: &Path) -> Option<[u8; 32]> {
     if path.extension()?.to_str()? != "pban" {
         return None;
     }
     veil_util::hex_to_array::<32>(path.file_stem()?.to_str()?).ok()
 }
 
-fn owned_record(
-    path: &Path,
-    key: &[u8; 32],
-    gate: &NetworkAccessGate,
-    issuer: &[u8; 32],
-) -> io::Result<Option<(u64, Vec<u8>)>> {
+pub(super) fn open_record(path: &Path) -> io::Result<Option<fs::File>> {
     if !fs::symlink_metadata(path)?.is_file() {
         return Ok(None);
     }
@@ -69,12 +68,27 @@ fn owned_record(
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
+    Ok(file.metadata()?.is_file().then_some(file))
+}
+
+pub(super) fn read_record_bytes(path: &Path, limit: usize) -> io::Result<Option<Vec<u8>>> {
+    let Some(file) = open_record(path)? else {
         return Ok(None);
-    }
+    };
     let mut bytes = Vec::new();
-    file.take(MAX_BAN_BLOB_SIZE as u64 + 1)
-        .read_to_end(&mut bytes)?;
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    Ok((bytes.len() <= limit).then_some(bytes))
+}
+
+fn owned_record(
+    path: &Path,
+    key: &[u8; 32],
+    gate: &NetworkAccessGate,
+    issuer: &[u8; 32],
+) -> io::Result<Option<(u64, Vec<u8>)>> {
+    let Some(bytes) = read_record_bytes(path, MAX_BAN_BLOB_SIZE)? else {
+        return Ok(None);
+    };
     let Ok(record) = decode_ban_blob(&bytes) else {
         return Ok(None);
     };
@@ -82,6 +96,16 @@ fn owned_record(
         (record.admin_node_id == *issuer && gate.verify_ban_record(key, &bytes))
             .then_some((record.issued_at_unix, bytes)),
     )
+}
+
+pub(super) fn ensure_directory(dir: &Path) -> io::Result<()> {
+    if !directory_exists(dir)? {
+        veil_util::create_dir_owner_only(dir)?;
+        if !directory_exists(dir)? {
+            return Err(io::Error::other("P-Net ban storage could not be created"));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn save(
@@ -93,12 +117,7 @@ pub(super) fn save(
     issuer: &[u8; 32],
 ) -> io::Result<()> {
     let _storage = lock!(STORAGE);
-    if !directory_exists(dir)? {
-        veil_util::create_dir_owner_only(dir)?;
-        if !directory_exists(dir)? {
-            return Err(io::Error::other("P-Net ban storage could not be created"));
-        }
-    }
+    ensure_directory(dir)?;
     let path = dir.join(format!("{}.pban", veil_util::bytes_to_hex(&key)));
     match owned_record(&path, &key, gate, issuer) {
         Ok(Some((previous, _))) if previous > issued_at => return Ok(()),
